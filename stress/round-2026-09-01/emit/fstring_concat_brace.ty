@@ -1,0 +1,6 @@
+def main() -> None:
+    let x: int = 5
+    print("{" f"{x}" "}")
+    print("a{b" f"={x}")
+
+main()

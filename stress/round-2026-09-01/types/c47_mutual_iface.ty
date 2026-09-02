@@ -1,0 +1,18 @@
+interface A:
+    def to_b(self) -> B
+interface B:
+    def to_a(self) -> A
+
+class X:
+    v: int
+impl X:
+    def to_b(self) -> X:
+        return self
+    def to_a(self) -> X:
+        return self
+
+def f(a: A) -> A:
+    return a.to_b().to_a()
+
+def main() -> None:
+    print(f(X(v=1)))

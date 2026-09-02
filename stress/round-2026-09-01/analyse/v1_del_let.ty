@@ -1,0 +1,7 @@
+def f() -> int:
+    let x: int = 1
+    del x
+    let x: int = 2
+    return x
+
+print(f())

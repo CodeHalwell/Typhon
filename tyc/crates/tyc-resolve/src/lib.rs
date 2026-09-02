@@ -861,6 +861,13 @@ struct Resolver<'a> {
     /// minimal form here unblocks the heterogeneous-error /
     /// `_load_or_default(...)` workaround R2-7 / R3-8 documented.
     uninit_let_spans: std::collections::HashSet<(usize, usize)>,
+    /// Spans of PEP 695 type-parameter bindings (`class Box[T]:`,
+    /// `impl[T] Box[T]:`, `def f[T](...)`). They are declared into the
+    /// class / function scope like ordinary names, but unlike a class
+    /// attribute they *are* visible from the methods inside a generic class
+    /// (PEP 695 gives them their own annotation scope), so the class-scope
+    /// skip in `report_unknown_names` must let them through.
+    type_param_spans: std::collections::HashSet<(usize, usize)>,
     /// `(declaration span, write span)` pairs where a `global` / `nonlocal`
     /// redirected write consumed an uninitialised-`let` marker, i.e. *was*
     /// the initialiser. The redirect path pushes no binding, so unlike
@@ -921,6 +928,7 @@ impl<'a> Resolver<'a> {
             preprocessed_line_starts: std::cell::OnceCell::new(),
             in_pattern: 0,
             uninit_let_spans: std::collections::HashSet::new(),
+            type_param_spans: std::collections::HashSet::new(),
             outer_initialiser_spans: std::collections::HashSet::new(),
             params_with_explicit_rebind: std::collections::HashSet::new(),
             loop_body_depth: 0,
@@ -1262,9 +1270,31 @@ impl<'a> Resolver<'a> {
             // the build.
             let mut found = false;
             let mut wildcard_in_scope = false;
+            // Python's scoping rule: a class body is NOT an enclosing scope
+            // for the functions (methods, lambdas) defined inside it — a
+            // method reading a class attribute by bare name raises
+            // `NameError` at runtime. So when the reference sits in a
+            // function scope, class scopes on the chain are skipped.
+            // Comprehension scopes keep the lenient walk: their first
+            // iterable is evaluated in the class body itself.
+            let origin_is_function = self.scopes[r.scope].kind == ScopeKind::Function;
             let mut current = Some(r.scope);
             while let Some(id) = current {
                 let scope = &self.scopes[id];
+                if origin_is_function && id != r.scope && scope.kind == ScopeKind::Class {
+                    // Only the class's PEP 695 type parameters are visible
+                    // from inside its methods.
+                    if scope
+                        .bindings
+                        .iter()
+                        .any(|b| b.name == r.name && self.type_param_spans.contains(&b.span))
+                    {
+                        found = true;
+                        break;
+                    }
+                    current = scope.parent;
+                    continue;
+                }
                 if scope.bindings.iter().any(|b| b.name == r.name) {
                     found = true;
                     break;
@@ -2307,8 +2337,19 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             }
         }
         Stmt::AugAssign(a) => {
-            walk_expr(r, scope, &a.target);
             walk_expr(r, scope, &a.value);
+            // `x += 1` rebinds `x` exactly as `x = x + 1` does, so a bare-name
+            // target goes through the same declaration path as a plain
+            // assignment — which is what fires `tyc::immutable_assign` on a
+            // `let` (or an un-`mut` parameter) and routes a `global` /
+            // `nonlocal` write to the binding it names. It was walked as a
+            // *read* before, so `let x = 1; x += 1` compiled clean.
+            if matches!(a.target.as_ref(), Expr::Name(_)) {
+                let default_val = r.scopes[scope].kind == ScopeKind::Module;
+                declare_target(r, scope, &a.target, default_val, None);
+            } else {
+                walk_expr(r, scope, &a.target);
+            }
         }
         Stmt::Return(ret) => {
             if let Some(v) = &ret.value {
@@ -2422,10 +2463,31 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             }
         }
         Stmt::Try(t) => {
+            // The `try` body and each `except` handler are alternative arms,
+            // like `if` / `elif` / `else` and `match` cases: a `let msg` in
+            // one handler must not shadow a `let msg` in the next, and a
+            // handler's assignment to a declare-only `let n: int` is the
+            // initialiser on *its* path (`try: n = int(s) except ValueError:
+            // n = 0` is the documented declare-then-assign idiom). Same
+            // drain / restore and uninit snapshot / union as `Stmt::If`.
+            let pre_len = r.scopes[scope].bindings.len();
+            let mut arm_bindings: Vec<Binding> = Vec::new();
+            let initial_uninit = r.uninit_let_spans.clone();
+            let mut union_initialised: std::collections::HashSet<(usize, usize)> =
+                std::collections::HashSet::new();
             for s in &t.body {
                 walk_stmt(r, scope, s);
             }
+            for span in initial_uninit.difference(&r.uninit_let_spans) {
+                union_initialised.insert(*span);
+            }
+            // Bindings made by the `try` body stay live for the `else` /
+            // `finally` clauses and the code after the statement, so they
+            // are kept in place; only the handlers are drained.
+            let body_len = r.scopes[scope].bindings.len();
+            let _ = pre_len;
             for h in &t.handlers {
+                r.uninit_let_spans = initial_uninit.clone();
                 let ast::ExceptHandler::ExceptHandler(h) = h;
                 if let Some(typ) = &h.type_ {
                     walk_expr(r, scope, typ);
@@ -2446,7 +2508,17 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
                 for s in &h.body {
                     walk_stmt(r, scope, s);
                 }
+                for span in initial_uninit.difference(&r.uninit_let_spans) {
+                    union_initialised.insert(*span);
+                }
+                let drained: Vec<Binding> = r.scopes[scope].bindings.drain(body_len..).collect();
+                arm_bindings.extend(drained);
             }
+            r.uninit_let_spans = initial_uninit;
+            for span in &union_initialised {
+                r.uninit_let_spans.remove(span);
+            }
+            r.scopes[scope].bindings.extend(arm_bindings);
             for s in &t.orelse {
                 walk_stmt(r, scope, s);
             }
@@ -2761,6 +2833,7 @@ fn declare_type_params(r: &mut Resolver, scope: ScopeId, type_params: Option<&as
             range.start().to_usize(),
             range.start().to_usize() + name.len(),
         );
+        r.type_param_spans.insert(span);
         r.declare(scope, name, BindingKind::Value, Mutability::Let, span);
     }
 }
@@ -3412,6 +3485,103 @@ mod tests {
         d.errors()
             .iter()
             .any(|e| matches!(e, TycError::ImmutableAssign { .. }))
+    }
+
+    /// `x += 1` rebinds `x`, so it is subject to the `let` contract exactly
+    /// like `x = x + 1` — for locals, un-`mut` parameters and `global` writes.
+    #[test]
+    fn augmented_assignment_to_a_let_is_an_immutable_assign() {
+        for src in [
+            "def f() -> int:\n    let x: int = 1\n    x += 1\n    return x\n",
+            "def g(n: int) -> int:\n    n += 1\n    return n\n",
+            "let LIMIT: int = 10\ndef bump() -> None:\n    global LIMIT\n    LIMIT += 1\n",
+        ] {
+            let (_, d) = resolve(src);
+            assert!(
+                has_immutable_assign(&d),
+                "expected immutable_assign for:\n{src}"
+            );
+        }
+        let (_, d) = resolve("def h() -> int:\n    mut y: int = 1\n    y += 1\n    return y\n");
+        assert!(!has_immutable_assign(&d), "a `mut` may be augmented");
+        // A loop target is an immutable binding too (plain `x = x + 1` inside
+        // the body is already rejected), so the augmented form matches.
+        let (_, d) = resolve("def k(xs: list[int]) -> None:\n    for x in xs:\n        x += 1\n");
+        assert!(has_immutable_assign(&d), "a loop target is a `let`");
+    }
+
+    /// `try` / `except` arms are alternatives, like `if` / `elif`: a `let` in
+    /// two handlers does not shadow, and a handler's assignment initialises a
+    /// declare-only `let` on its path.
+    #[test]
+    fn try_handlers_are_sibling_arms() {
+        let src = "\
+def f(s: str) -> str:
+    try:
+        return str(int(s))
+    except ValueError:
+        let msg: str = \"value\"
+        return msg
+    except TypeError:
+        let msg: str = \"type\"
+        return msg
+
+def g(s: str) -> int:
+    let n: int
+    try:
+        n = int(s)
+    except ValueError:
+        n = 0
+    return n
+";
+        let (_, d) = resolve(src);
+        assert!(
+            !d.has_errors(),
+            "handlers must not shadow / re-assign: {d:?}"
+        );
+    }
+
+    /// A class body is not an enclosing scope for the methods inside it: a
+    /// bare reference to a class attribute from a method is a `NameError` at
+    /// runtime, while the class's PEP 695 type parameters stay visible.
+    #[test]
+    fn class_scope_names_are_not_visible_from_methods_but_type_params_are() {
+        let bad = "\
+plain class Registry:
+    LIMIT: int = 10
+
+impl Registry:
+    def check(self, n: int) -> bool:
+        return n < LIMIT
+";
+        let (_, d) = resolve(bad);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UnknownName { .. })),
+            "bare class-attribute read must be unknown: {d:?}"
+        );
+        let good = "\
+class Box[T]:
+    value: T
+
+impl[T] Box[T]:
+    def get(self) -> T:
+        let v: T = self.value
+        return v
+
+plain class Registry:
+    LIMIT: int = 10
+
+impl Registry:
+    def check(self, n: int) -> bool:
+        return n < self.LIMIT
+";
+        let (_, d) = resolve(good);
+        assert!(
+            !d.has_errors(),
+            "type params and self-qualified reads stay clean: {d:?}"
+        );
     }
 
     /// F25: the sequential-loop carve-out keyed on the declaration span

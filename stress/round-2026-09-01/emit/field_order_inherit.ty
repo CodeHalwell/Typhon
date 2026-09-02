@@ -1,0 +1,10 @@
+class A:
+    x: int = 0
+
+class B(A):
+    y: int
+
+def main() -> None:
+    print(B(x=1, y=2))
+
+main()

@@ -1,0 +1,5 @@
+def f(v: int) -> int:
+    let value: int = 1
+    match v:
+        case value:
+            return value

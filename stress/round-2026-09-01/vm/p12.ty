@@ -1,0 +1,101 @@
+import datetime
+from datetime import date, timedelta
+import time
+import os
+import pathlib
+from pathlib import Path
+
+dt: datetime.datetime = datetime.datetime(2024, 2, 29, 13, 5, 9, 123456)
+d0: date = date(2024, 1, 31)
+td: timedelta = timedelta(days=1, hours=2, minutes=3, seconds=4.5)
+print("DT1", dt, repr(dt), dt.isoformat(), dt.date(), dt.time(), dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, dt.microsecond, dt.weekday(), dt.isoweekday(), dt.timetuple()[:6], dt.toordinal(), dt.timestamp(), dt.replace(year=2028), dt.replace(microsecond=0), str(dt.replace(microsecond=0)), dt.strftime("%Y-%m-%d %H:%M:%S"), dt.strftime("%d/%m/%y %I:%M %p"), dt.strftime("%A %B %j %U %W %a %b %f %%"), dt.strftime("%c") if False else "skip", dt.strftime("%x %X") if False else "skip", dt.strftime("%z|%Z|%s") if False else "skip", dt.strftime("%G-W%V-%u"), dt.strftime("%e|%-d|%-m") if False else "skip", dt.isocalendar(), tuple(dt.isocalendar()), dt.ctime())
+print("DT2", d0, repr(d0), d0 + timedelta(days=1), d0 - timedelta(days=31), d0.replace(day=1), d0.isoformat(), d0.strftime("%Y%m%d"), d0.weekday(), d0.isoformat(), date(2024, 3, 1) - date(2024, 2, 1), (date(2024, 3, 1) - date(2024, 2, 1)).days, d0 < date(2025, 1, 1), d0 == date(2024, 1, 31), date.fromisoformat("2023-12-25"), date.fromordinal(738000), date(2024, 12, 31).timetuple().tm_yday, str(date(1, 1, 1)), date.min, date.max, d0.year, min(d0, date(2020, 1, 1)), sorted([date(2024, 5, 1), d0]), date(2024, 2, 29).replace(year=2023) if False else "skip", d0.ctime(), date.today() > date(2020, 1, 1), (date.today() - date.today()).days)
+print("DT3", td, repr(td), td.days, td.seconds, td.microseconds, td.total_seconds(), td * 2, td / 2, td // 2, td // timedelta(hours=1), td % timedelta(hours=1), -td, abs(-td), td + td, td - timedelta(days=2), timedelta(seconds=90061), timedelta(milliseconds=1500), timedelta(weeks=1), timedelta(), timedelta(days=-1), timedelta(days=-1, seconds=1), timedelta(seconds=-1), str(timedelta(seconds=-1)), timedelta(hours=25), timedelta(microseconds=1), str(timedelta(days=2, microseconds=5)), timedelta(days=1) == timedelta(hours=24), timedelta(days=1) > timedelta(hours=23), timedelta(seconds=3600) / timedelta(seconds=60), timedelta(hours=1.5), timedelta(days=0.5), timedelta(minutes=1, seconds=-1), td.resolution if False else "skip", timedelta.max if False else "skip", sum([timedelta(seconds=1)] * 3, timedelta()), bool(timedelta()), bool(timedelta(1)), repr(timedelta(0)), repr(timedelta(seconds=1.5)), repr(timedelta(days=1, seconds=1, microseconds=1)), repr(timedelta(weeks=2)), repr(timedelta(days=-2)))
+try:
+    datetime.datetime(2023, 2, 29)
+except ValueError as e:
+    print("DT5", e)
+try:
+    datetime.datetime(2024, 13, 1)
+except ValueError as e:
+    print("DT6", e)
+try:
+    datetime.datetime.fromisoformat("bad")
+except ValueError as e:
+    print("DT7", e)
+try:
+    datetime.datetime.strptime("x", "%Y")
+except ValueError as e:
+    print("DT8", e)
+print("TM1", time.gmtime(0)[:6], time.gmtime(86400 * 365)[:8], time.strftime("%Y-%m-%d", time.gmtime(0)), time.strftime("%H:%M:%S", time.gmtime(3661)), time.time() > 1.7e9, type(time.time()).__name__, time.monotonic() >= 0, time.perf_counter() >= 0, time.process_time() >= 0, time.time_ns() > 0, time.monotonic_ns() >= 0, time.perf_counter_ns() >= 0, time.sleep(0), time.localtime().tm_year >= 2024, time.mktime(time.gmtime(0)) is not None, time.asctime(time.gmtime(0)), time.ctime(0) is not None, time.gmtime(0).tm_wday, time.gmtime(0).tm_yday, time.gmtime(0).tm_isdst, time.struct_time((2024, 1, 1, 0, 0, 0, 0, 1, 0)).tm_year, time.timezone is not None, time.strptime("2024-01-02", "%Y-%m-%d")[:3], time.strftime("%j %U %a %A %b %B %p", time.gmtime(0)), time.strftime("%%|%y|%e|%C", time.gmtime(0)), len(time.strftime("%c", time.gmtime(0))) > 0, time.strftime("%s", time.gmtime(0)) if False else "skip", time.get_clock_info("monotonic").monotonic, time.gmtime(1e9), time.gmtime(-1)[:6], time.gmtime(2**31)[:6], time.gmtime(0.5)[:6], time.gmtime(1.9999)[:6])
+tmp: str = "/tmp/claude-0/-home-user-Typhon/cc16f461-ddff-5c1b-8a56-a4556c5e7a41/scratchpad/review-vm/work/p12/tmpdir"
+os.makedirs(tmp, exist_ok=True)
+p: Path = Path(tmp) / "sub" / "file.txt"
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text("héllo\nwörld\n")
+print("PL1", p.name, p.stem, p.suffix, p.suffixes, p.parent.name, p.parts[-2:], p.exists(), p.is_file(), p.is_dir(), p.parent.is_dir(), p.read_text(), repr(p.read_text()), p.read_bytes(), len(p.read_bytes()), p.stat().st_size, p.with_suffix(".md").name, p.with_name("x.y").name, p.with_stem("q").name, Path("a/b/c.tar.gz").suffixes, Path("a/b/c.tar.gz").stem, Path("/a/b").is_absolute(), Path("a/b").is_absolute(), Path("a/b").parent, Path("a").parent, Path("/").parent, Path("a/b/../c"), Path("a//b"), Path("./a"), Path("a/./b"), Path(""), Path("."), Path("a/b").parts, Path("/a/b").parts, Path("/a/b").anchor, Path("a/b").root, Path("/a/b").root, Path("a/b").as_posix(), str(Path("a") / "b" / "c"), Path("a") / Path("b"), "a" / Path("b"), Path("a").joinpath("b", "c"), Path("/a/b/c").relative_to("/a"), Path("a/b").match("*.py"), Path("a/b.py").match("*.py"), Path("a/b.py").match("a/*.py"), Path("a/b.py").match("**/*.py") if False else "skip", Path("a/b") == Path("a/b"), Path("a/b") == Path("a//b"), Path("a") == "a", hash(Path("a")) == hash(Path("a")), sorted([Path("b"), Path("a")]), Path("a") < Path("b"), repr(Path("a/b")), str(Path("a/b")), f"{Path('a')}", [Path("x")], Path("~").expanduser() != Path("~"), Path.home().is_absolute(), Path.cwd().is_absolute(), Path("/a/b.c").name, Path("/a/b.c").stem, Path("b.").suffix, Path(".b").suffix, Path(".b").stem, Path("a.b.c").with_suffix(""), Path("a").with_suffix(".x"), Path("a/b").name, Path("a/").name, Path("/").name, Path("/").stem, Path("a").suffix, Path("a/b").parents[0], list(Path("a/b/c").parents), len(Path("/a/b").parents), Path("a/b").is_relative_to("a"), Path("a/b").is_relative_to("b"), Path("/a/b").resolve() if False else "skip")
+(Path(tmp) / "sub" / "z.py").write_text("x")
+(Path(tmp) / "sub" / "a.py").write_text("yy")
+(Path(tmp) / "sub" / "deep").mkdir()
+(Path(tmp) / "sub" / "deep" / "n.py").write_text("")
+print("PL2", sorted(q.name for q in (Path(tmp) / "sub").iterdir()), sorted(q.name for q in (Path(tmp) / "sub").glob("*.py")), sorted(str(q.relative_to(tmp)) for q in Path(tmp).rglob("*.py")), sorted(str(q.relative_to(tmp)) for q in Path(tmp).glob("**/*.py")), sorted(os.listdir(Path(tmp) / "sub")), [len(x) for x in os.walk(tmp)][:1], sorted(f for _, _, fs in os.walk(tmp) for f in fs), os.path.getsize(p), os.path.exists(p), os.path.isfile(str(p)), Path(tmp, "sub", "file.txt").exists(), (Path(tmp) / "nope").exists(), (Path(tmp) / "sub" / "a.py").read_text(), (Path(tmp) / "sub" / "n.py").exists())
+(Path(tmp) / "sub" / "a.py").unlink()
+os.remove(Path(tmp) / "sub" / "z.py")
+(Path(tmp) / "sub" / "deep" / "n.py").rename(Path(tmp) / "sub" / "m.py")
+os.rename(Path(tmp) / "sub" / "m.py", Path(tmp) / "sub" / "k.py")
+(Path(tmp) / "sub" / "copy.txt").write_text((Path(tmp) / "sub" / "file.txt").read_text())
+os.makedirs(Path(tmp) / "x" / "y", exist_ok=True)
+os.rmdir(Path(tmp) / "sub" / "deep")
+print("PL3", sorted(q.name for q in (Path(tmp) / "sub").iterdir()), (Path(tmp) / "sub" / "copy.txt").read_text() == p.read_text(), os.path.isdir(Path(tmp) / "x" / "y"), (Path(tmp) / "sub" / "a.py").exists())
+with open(p, "a") as f:
+    f.write("more\n")
+    print("line via print", file=f)
+    f.writelines(["a\n", "b\n"])
+with open(p) as f:
+    print("IO1", repr(f.read(3)), repr(f.readline()), f.tell(), repr(f.readline()), repr(f.readlines()), repr(f.read()), f.closed, f.name == str(p), f.mode, f.encoding.lower() if False else "skip")
+print("IO2", f.closed)
+with open(p, "r") as f:
+    print("IO3", [repr(line) for line in f], sum(1 for _ in open(p)))
+with open(p, "rb") as fb:
+    data: bytes = fb.read()
+    print("IO4", data[:6], len(data), data.count(b"\n"), data.splitlines()[:2], data.decode()[:5])
+with open(p, "w") as f:
+    n: int = f.write("over\r\nwritten\n")
+print("IO5", n, repr(p.read_text()), repr(p.read_bytes()), repr(open(p, newline="").read()), repr(open(p, "rb").read()))
+with open(p, "w", newline="") as f:
+    f.write("a\r\nb\n")
+print("IO6", repr(p.read_bytes()), repr(open(p).read()), repr(open(p, newline="\n").read()) if False else "skip")
+with open(p, "w+") as f:
+    f.write("hello")
+    f.seek(0)
+    print("IO7", repr(f.read()), f.seek(1), f.read(2), f.seek(0, 2), f.tell(), f.truncate(2), f.seek(0), f.read())
+with open(p, "wb") as fb2:
+    fb2.write(b"\x00\xff\n")
+    fb2.write(bytes([1, 2]))
+print("IO8", repr(p.read_bytes()), open(p, "rb").read(1), open(p, "rb").readline())
+try:
+    open(Path(tmp) / "nope" / "x")
+except FileNotFoundError as e:
+    print("IO9", type(e).__name__, e.errno, e.strerror, e.filename == str(Path(tmp) / "nope" / "x"))
+try:
+    open(tmp)
+except IsADirectoryError as e:
+    print("IO10", type(e).__name__, e.errno)
+try:
+    p.write_text(123)
+except TypeError as e:
+    print("IO11", str(e)[:20])
+try:
+    with open(p, "r") as f:
+        f.write("x")
+except OSError as e:
+    print("IO12", type(e).__name__, str(e)[:30])
+try:
+    (Path(tmp) / "sub").mkdir()
+except FileExistsError as e:
+    print("IO13", type(e).__name__, e.errno)
+try:
+    os.remove(Path(tmp) / "nope")
+except FileNotFoundError as e:
+    print("IO14", type(e).__name__, e.errno)
+print("END", os.path.exists(tmp))

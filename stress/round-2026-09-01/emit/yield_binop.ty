@@ -1,0 +1,15 @@
+from collections.abc import Generator
+
+def acc() -> Generator[int, int, None]:
+    mut total: int = 0
+    while True:
+        let got: int = (yield total) + 1
+        total = total + got
+
+def main() -> None:
+    let g: Generator[int, int, None] = acc()
+    print(next(g))
+    print(g.send(5))
+    print(g.send(10))
+
+main()

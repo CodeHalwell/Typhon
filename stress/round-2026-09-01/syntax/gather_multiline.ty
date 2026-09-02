@@ -1,0 +1,22 @@
+import asyncio
+
+async def fa(x: int, y: int) -> int:
+    return x + y
+
+async def fb() -> int:
+    return 2
+
+async def load() -> int:
+    gather:
+        a = fa(
+            1,
+            2,
+        )
+        b = fb()
+    return a + b
+
+def main() -> None:
+    print(asyncio.run(load()))
+
+if __name__ == "__main__":
+    main()

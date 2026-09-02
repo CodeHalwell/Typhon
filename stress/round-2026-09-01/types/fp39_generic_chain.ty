@@ -1,0 +1,17 @@
+def first[T](xs: list[T]) -> T?:
+    if len(xs) == 0:
+        return None
+    return xs[0]
+
+def head[T](xs: list[T]) -> T:
+    guard v = first(xs) else:
+        raise ValueError("empty")
+    return v
+
+def main() -> None:
+    let n: int = head([1, 2])
+    let s: str = head(["a"])
+    print(n + 1, s.upper())
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,95 @@
+class W0:
+    x: int
+class W1:
+    x: int
+class W2:
+    x: int
+class W3:
+    x: int
+type U = W0 | W1 | W2 | W3
+
+def f(a0: U, a1: U, a2: U, a3: U, a4: U, a5: U, a6: U, a7: U, a8: U, a9: U) -> int:
+    match (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9):
+        case (W0(), _, _, _, _, _, _, _, _, _):
+            return 0
+        case (W1(), _, _, _, _, _, _, _, _, _):
+            return 1
+        case (W2(), _, _, _, _, _, _, _, _, _):
+            return 2
+        case (W3(), _, _, _, _, _, _, _, _, _):
+            return 3
+        case (_, W0(), _, _, _, _, _, _, _, _):
+            return 4
+        case (_, W1(), _, _, _, _, _, _, _, _):
+            return 5
+        case (_, W2(), _, _, _, _, _, _, _, _):
+            return 6
+        case (_, W3(), _, _, _, _, _, _, _, _):
+            return 7
+        case (_, _, W0(), _, _, _, _, _, _, _):
+            return 8
+        case (_, _, W1(), _, _, _, _, _, _, _):
+            return 9
+        case (_, _, W2(), _, _, _, _, _, _, _):
+            return 10
+        case (_, _, W3(), _, _, _, _, _, _, _):
+            return 11
+        case (_, _, _, W0(), _, _, _, _, _, _):
+            return 12
+        case (_, _, _, W1(), _, _, _, _, _, _):
+            return 13
+        case (_, _, _, W2(), _, _, _, _, _, _):
+            return 14
+        case (_, _, _, W3(), _, _, _, _, _, _):
+            return 15
+        case (_, _, _, _, W0(), _, _, _, _, _):
+            return 16
+        case (_, _, _, _, W1(), _, _, _, _, _):
+            return 17
+        case (_, _, _, _, W2(), _, _, _, _, _):
+            return 18
+        case (_, _, _, _, W3(), _, _, _, _, _):
+            return 19
+        case (_, _, _, _, _, W0(), _, _, _, _):
+            return 20
+        case (_, _, _, _, _, W1(), _, _, _, _):
+            return 21
+        case (_, _, _, _, _, W2(), _, _, _, _):
+            return 22
+        case (_, _, _, _, _, W3(), _, _, _, _):
+            return 23
+        case (_, _, _, _, _, _, W0(), _, _, _):
+            return 24
+        case (_, _, _, _, _, _, W1(), _, _, _):
+            return 25
+        case (_, _, _, _, _, _, W2(), _, _, _):
+            return 26
+        case (_, _, _, _, _, _, W3(), _, _, _):
+            return 27
+        case (_, _, _, _, _, _, _, W0(), _, _):
+            return 28
+        case (_, _, _, _, _, _, _, W1(), _, _):
+            return 29
+        case (_, _, _, _, _, _, _, W2(), _, _):
+            return 30
+        case (_, _, _, _, _, _, _, W3(), _, _):
+            return 31
+        case (_, _, _, _, _, _, _, _, W0(), _):
+            return 32
+        case (_, _, _, _, _, _, _, _, W1(), _):
+            return 33
+        case (_, _, _, _, _, _, _, _, W2(), _):
+            return 34
+        case (_, _, _, _, _, _, _, _, W3(), _):
+            return 35
+        case (_, _, _, _, _, _, _, _, _, W0()):
+            return 36
+        case (_, _, _, _, _, _, _, _, _, W1()):
+            return 37
+        case (_, _, _, _, _, _, _, _, _, W2()):
+            return 38
+        case (_, _, _, _, _, _, _, _, _, W3()):
+            return 39
+
+def main() -> None:
+    print(f(W0(x=1), W0(x=1), W0(x=1), W0(x=1), W0(x=1), W0(x=1), W0(x=1), W0(x=1), W0(x=1), W0(x=1)))

@@ -55,7 +55,7 @@
 /// span a newline (per Python's grammar) and are reset at end-of-line;
 /// triple-quoted forms persist across lines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StringMode {
+pub enum StringMode {
     Single,
     Double,
     TripleSingle,
@@ -88,7 +88,7 @@ impl StringMode {
 
 /// What one source byte lexically is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ByteKind {
+pub enum ByteKind {
     /// Structural code — the only place a rewrite may safely fire.
     Code,
     /// Inside a string literal (opening / closing quotes included).
@@ -453,7 +453,7 @@ pub(crate) fn scan_line(line: &str, in_string: &mut Option<StringMode>) -> LineS
 /// rewrite pass needs to tell structural code from string / f-string-field
 /// content without maintaining its own — necessarily PEP 701-incomplete —
 /// scanner. Positions not written by the scan default to [`ByteKind::Code`].
-pub(crate) fn scan_line_kinds(line: &str, in_string: &mut Option<StringMode>) -> Vec<ByteKind> {
+pub fn scan_line_kinds(line: &str, in_string: &mut Option<StringMode>) -> Vec<ByteKind> {
     let mut depth = 0i32;
     let mut kinds = vec![ByteKind::Code; line.len()];
     scan_line_core(line, in_string, &mut depth, |i, kind, _d| {

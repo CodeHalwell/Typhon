@@ -1,0 +1,24 @@
+class Animal:
+    name: str
+class Dog(Animal):
+    breed: str
+
+impl Dog:
+    def bark(self) -> str:
+        return "woof"
+
+def f(x: Dog) -> str:
+    if isinstance(x, Animal):
+        return x.bark()
+    return ""
+
+def g(x: Animal | None) -> str:
+    if isinstance(x, Dog):
+        return x.bark()
+    return "no"
+
+def main() -> None:
+    print(f(Dog(name="a", breed="b")), g(None))
+
+if __name__ == "__main__":
+    main()

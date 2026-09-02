@@ -2345,15 +2345,88 @@ fn rewrite_mutable_field_defaults(body: &mut [Stmt]) -> bool {
             continue;
         }
         let Some(value) = &a.value else { continue };
-        let Some(factory_name) = mutable_default_factory(value) else {
+        let factory = if let Some(factory_name) = mutable_default_factory(value) {
+            make_name_load(factory_name)
+        } else if is_constant_mutable_literal(value) {
+            // `xs: list[int] = [1, 2]` — `@dataclass` rejects any default whose
+            // type is unhashable, not just the empty ones, so a non-empty
+            // literal fails at import time with the same `ValueError` the
+            // empty-literal rewrite above exists to avoid. A fresh copy per
+            // instance is also what the VM gives such a field. Only a literal
+            // built purely from constants is wrapped: a lambda defined in a
+            // class body cannot see class-scope names, so `[SIZE]` (with
+            // `SIZE` a class attribute) is left exactly as written.
+            make_lambda_returning(value.as_ref().clone())
+        } else {
             continue;
         };
-        a.value = Some(Box::new(make_dataclasses_field_default_factory(
-            factory_name,
-        )));
+        a.value = Some(Box::new(make_dataclasses_field_default_factory(factory)));
         changed = true;
     }
     changed
+}
+
+/// A non-empty `list` / `dict` / `set` display whose every element (and, for a
+/// dict, every key and value) is itself a constant or a display of constants —
+/// so wrapping it in `lambda: <literal>` cannot change what it evaluates to.
+fn is_constant_mutable_literal(value: &Expr) -> bool {
+    match value {
+        Expr::List(l) => !l.elts.is_empty() && l.elts.iter().all(is_constant_tree),
+        Expr::Set(s) => !s.elts.is_empty() && s.elts.iter().all(is_constant_tree),
+        Expr::Dict(d) => {
+            !d.items.is_empty()
+                && d.items.iter().all(|item| {
+                    item.key.as_ref().is_some_and(is_constant_tree) && is_constant_tree(&item.value)
+                })
+        }
+        _ => false,
+    }
+}
+
+/// A literal constant, or a `list` / `tuple` / `set` / `dict` display (or a
+/// negated number) built only from such constants.
+fn is_constant_tree(value: &Expr) -> bool {
+    match value {
+        Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::BytesLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::NoneLiteral(_)
+        | Expr::EllipsisLiteral(_) => true,
+        Expr::UnaryOp(u) => {
+            matches!(
+                u.op,
+                ruff_python_ast::UnaryOp::USub | ruff_python_ast::UnaryOp::UAdd
+            ) && is_constant_tree(&u.operand)
+        }
+        Expr::List(l) => l.elts.iter().all(is_constant_tree),
+        Expr::Tuple(t) => t.elts.iter().all(is_constant_tree),
+        Expr::Set(s) => s.elts.iter().all(is_constant_tree),
+        Expr::Dict(d) => d.items.iter().all(|item| {
+            item.key.as_ref().is_some_and(is_constant_tree) && is_constant_tree(&item.value)
+        }),
+        _ => false,
+    }
+}
+
+/// `lambda: <body>` — a zero-argument factory around an expression.
+fn make_lambda_returning(body: Expr) -> Expr {
+    Expr::Lambda(ruff_python_ast::ExprLambda {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        parameters: None,
+        body: Box::new(body),
+    })
+}
+
+/// A `Load`-context name reference.
+fn make_name_load(name: &str) -> Expr {
+    Expr::Name(ExprName {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        id: Name::new(name),
+        ctx: ExprContext::Load,
+    })
 }
 
 /// If `value` is one of the recognised mutable-default expressions,
@@ -2382,25 +2455,14 @@ fn mutable_default_factory(value: &Expr) -> Option<&'static str> {
     }
 }
 
-/// Build `dataclasses.field(default_factory=<factory_name>)`.
-fn make_dataclasses_field_default_factory(factory_name: &str) -> Expr {
-    let dataclasses_name = Expr::Name(ExprName {
-        range: TextRange::default(),
-        node_index: AtomicNodeIndex::NONE,
-        id: Name::new("dataclasses"),
-        ctx: ExprContext::Load,
-    });
+/// Build `dataclasses.field(default_factory=<factory>)`.
+fn make_dataclasses_field_default_factory(factory_ref: Expr) -> Expr {
+    let dataclasses_name = make_name_load("dataclasses");
     let field_attr = Expr::Attribute(ExprAttribute {
         range: TextRange::default(),
         node_index: AtomicNodeIndex::NONE,
         value: Box::new(dataclasses_name),
         attr: make_identifier("field"),
-        ctx: ExprContext::Load,
-    });
-    let factory_ref = Expr::Name(ExprName {
-        range: TextRange::default(),
-        node_index: AtomicNodeIndex::NONE,
-        id: Name::new(factory_name),
         ctx: ExprContext::Load,
     });
     Expr::Call(ExprCall {
@@ -4056,7 +4118,14 @@ fn inherit_parent_fields(body: Vec<Stmt>) -> Vec<Stmt> {
                 let mut fields: Vec<Stmt> = Vec::new();
                 for member in &c.body {
                     if let Stmt::AnnAssign(a) = member {
-                        if matches!(a.target.as_ref(), Expr::Name(_)) {
+                        // A `ClassVar` is a class attribute, not a field:
+                        // `@dataclass` skips it, and re-declaring it on the
+                        // child would fork the shared object (a registry
+                        // `ClassVar[dict] = {}` became a fresh dict per
+                        // subclass). Leave it on the parent only.
+                        if matches!(a.target.as_ref(), Expr::Name(_))
+                            && !is_classvar_annotation(&a.annotation)
+                        {
                             fields.push(member.clone());
                         }
                     }
@@ -4499,6 +4568,36 @@ mod tests {
         assert!(
             out.contains("default_factory=list"),
             "an ordinary mutable default must still become a factory; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn non_empty_constant_mutable_default_becomes_a_lambda_factory() {
+        // `@dataclass` rejects every unhashable default, not only the empty
+        // literals, so `[1, 2]` / `{"a": 1}` / `{1}` fail at import time unless
+        // they become factories too.
+        let src = "class A:\n    xs: list[int] = [1, 2]\n    d: dict[str, int] = {\"a\": 1}\n    s: set[int] = {1, -2}\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            out.contains("default_factory=lambda: [1, 2]"),
+            "non-empty list default must become a lambda factory; got:\n{out}"
+        );
+        assert!(
+            out.contains("default_factory=lambda: {\"a\": 1}")
+                || out.contains("default_factory=lambda: {'a': 1}"),
+            "non-empty dict default must become a lambda factory; got:\n{out}"
+        );
+        assert!(
+            out.contains("default_factory=lambda: {1, -2}"),
+            "non-empty set default must become a lambda factory; got:\n{out}"
+        );
+        // A literal that names anything is left alone: a class-body lambda
+        // cannot see class-scope names, so the rewrite would change meaning.
+        let src = "class B:\n    SIZE: ClassVar[int] = 3\n    xs: list[int] = [SIZE]\n    ys: list[int] = [f()]\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            !out.contains("default_factory"),
+            "a literal with a name inside must not be wrapped; got:\n{out}"
         );
     }
 

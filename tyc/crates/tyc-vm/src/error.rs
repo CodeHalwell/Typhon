@@ -102,6 +102,42 @@ pub fn attribute_error(msg: impl Into<String>) -> Unwind {
 pub fn key_error(msg: impl Into<String>) -> Unwind {
     Unwind::Exception(VmException::new("KeyError", msg))
 }
+
+/// `KeyError(key)` for a missing mapping key. The exception *value* carries
+/// the key itself as `args[0]` (so `e.args[0] == "k"` holds) while the
+/// message — what the traceback and `str(e)` show — is the key's repr, as in
+/// CPython (`KeyError: 'k'`). The previous shape stored the repr string as
+/// the argument, so `e.args[0]` was `"'k'"` and `str(e)` double-quoted it.
+pub fn key_error_for(key: &Value) -> Unwind {
+    let repr = key.py_repr();
+    Unwind::Exception(
+        VmException::new("KeyError", repr.clone()).with_value(Value::Exception {
+            kind: std::rc::Rc::new("KeyError".to_owned()),
+            message: std::rc::Rc::new(repr),
+            args: std::rc::Rc::new(vec![key.clone()]),
+        }),
+    )
+}
+
+/// `SystemExit` as raised by `sys.exit()` / `exit()` / `quit()`. It is an
+/// ordinary exception value — `finally` blocks run, `except SystemExit`
+/// catches it, `except Exception` does not — and `run_source` turns an
+/// uncaught one into the process exit status the way CPython does: no
+/// argument or `None` → 0, an `int` → that code, anything else → printed to
+/// stderr with status 1.
+pub fn system_exit(args: Vec<Value>) -> Unwind {
+    let message = match args.first() {
+        None | Some(Value::None) => String::new(),
+        Some(v) => v.py_str(),
+    };
+    Unwind::Exception(VmException::new("SystemExit", message.clone()).with_value(
+        Value::Exception {
+            kind: std::rc::Rc::new("SystemExit".to_owned()),
+            message: std::rc::Rc::new(message),
+            args: std::rc::Rc::new(args),
+        },
+    ))
+}
 pub fn index_error(msg: impl Into<String>) -> Unwind {
     Unwind::Exception(VmException::new("IndexError", msg))
 }

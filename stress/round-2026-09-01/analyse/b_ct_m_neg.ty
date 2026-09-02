@@ -1,0 +1,2 @@
+comptime let M: int = -(-9223372036854775807 - 1)
+print(M)

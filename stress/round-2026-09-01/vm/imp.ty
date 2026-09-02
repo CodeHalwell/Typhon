@@ -1,0 +1,2 @@
+import configparser
+print("ok configparser")

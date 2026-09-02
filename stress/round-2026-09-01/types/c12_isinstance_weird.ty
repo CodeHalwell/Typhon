@@ -1,0 +1,13 @@
+def f(x: int | str) -> int:
+    if isinstance(x, 5):
+        return 1
+    if isinstance(x, x):
+        return 2
+    if isinstance(x, "int"):
+        return 3
+    if isinstance(x, int | str):
+        return 4
+    return 0
+
+def main() -> None:
+    print(f(1))

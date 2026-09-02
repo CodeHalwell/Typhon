@@ -1,0 +1,18 @@
+class Foo:
+    x: int
+
+def pick(x: int?) -> int:
+    guard v = x else: return 0
+    return v
+
+def f(o: Foo) -> int:
+    unsafe:
+        let v = o.missing_attr
+        let n: int = int(v)
+    return n
+
+def main() -> None:
+    print(pick(None), pick(3))
+
+if __name__ == "__main__":
+    main()

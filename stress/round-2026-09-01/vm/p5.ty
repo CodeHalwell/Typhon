@@ -1,0 +1,409 @@
+import sys
+import json
+
+class! AppError(Exception):
+    code: int
+    msg: str
+
+impl AppError:
+    def __str__(self) -> str:
+        return f"AppError[{self.code}]: {self.msg}"
+
+class! PlainErr(Exception):
+    pass
+
+class! SubErr(PlainErr):
+    pass
+
+def f1() -> str:
+    try:
+        return "try"
+    finally:
+        print("E1 finally runs")
+
+def f2() -> str:
+    try:
+        return "try"
+    finally:
+        return "finally"
+
+def f3() -> str:
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        return "except"
+    finally:
+        print("E3 finally")
+
+def f4() -> str:
+    mut out: str = ""
+    try:
+        out += "t"
+    except ValueError:
+        out += "e"
+    else:
+        out += "l"
+    finally:
+        out += "f"
+    return out
+
+def f5() -> str:
+    mut out: str = ""
+    for i in range(3):
+        try:
+            if i == 1:
+                continue
+            if i == 2:
+                break
+            out += str(i)
+        finally:
+            out += "f"
+    return out
+
+def f6() -> None:
+    try:
+        try:
+            raise ValueError("inner")
+        except ValueError as e:
+            raise KeyError("outer")
+    except KeyError as e2:
+        print("E6", repr(e2), e2, str(e2), e2.args, repr(e2.__context__), e2.__cause__)
+
+def f7() -> None:
+    try:
+        try:
+            raise ValueError("v")
+        except ValueError:
+            raise
+    except ValueError as e:
+        print("E7", repr(e), type(e).__name__, e.args)
+
+def f8() -> None:
+    try:
+        {}["k"]
+    except KeyError as e:
+        print("E8", e, repr(e), str(e), e.args)
+    try:
+        {}[("a", 1)]
+    except KeyError as e:
+        print("E8b", e, repr(e))
+    try:
+        {}[1]
+    except KeyError as e:
+        print("E8c", e, repr(e))
+    try:
+        raise KeyError("a", "b")
+    except KeyError as e:
+        print("E8d", e, repr(e), e.args)
+    try:
+        raise KeyError()
+    except KeyError as e:
+        print("E8e", repr(e), str(e) == "", e.args)
+
+def f9() -> None:
+    let probes: list[str] = []
+    unsafe:
+        let dyn_s = json.loads('"a"')
+        let dyn_i = json.loads('1')
+        let dyn_n = json.loads('null')
+        let dyn_l = json.loads('[1, 2]')
+        let dyn_f = json.loads('1.5')
+        let dyn_d = json.loads('{}')
+    let zero: int = 0
+    let fzero: float = 0.0
+    try:
+        [1][5]
+    except IndexError as e:
+        probes.append(str(e))
+    let tt: tuple[int, ...] = (1,)
+    try:
+        tt[5]
+    except IndexError as e:
+        probes.append(str(e))
+    try:
+        "ab"[5]
+    except IndexError as e:
+        probes.append(str(e))
+    try:
+        [].pop()
+    except IndexError as e:
+        probes.append(str(e))
+    try:
+        [1].pop(3)
+    except IndexError as e:
+        probes.append(str(e))
+    try:
+        int("x1")
+    except ValueError as e:
+        probes.append(str(e))
+    try:
+        int("")
+    except ValueError as e:
+        probes.append(str(e))
+    try:
+        float("abc")
+    except ValueError as e:
+        probes.append(str(e))
+    try:
+        [1, 2].index(9)
+    except ValueError as e:
+        probes.append(str(e))
+    try:
+        [1].remove(9)
+    except ValueError as e:
+        probes.append(str(e))
+    try:
+        1 / zero
+    except ZeroDivisionError as e:
+        probes.append(str(e))
+    try:
+        1 // zero
+    except ZeroDivisionError as e:
+        probes.append(str(e))
+    try:
+        1 % zero
+    except ZeroDivisionError as e:
+        probes.append(str(e))
+    try:
+        1.0 / zero
+    except ZeroDivisionError as e:
+        probes.append(str(e))
+    try:
+        1.0 // fzero
+    except ZeroDivisionError as e:
+        probes.append(str(e))
+    try:
+        1.5 % zero
+    except ZeroDivisionError as e:
+        probes.append(str(e))
+    try:
+        divmod(1, zero)
+    except ZeroDivisionError as e:
+        probes.append(str(e))
+    try:
+        divmod(1.0, zero)
+    except ZeroDivisionError as e:
+        probes.append(str(e))
+    try:
+        zero ** -1
+    except ZeroDivisionError as e:
+        probes.append(str(e))
+    try:
+        assert False, "amsg"
+    except AssertionError as e:
+        probes.append(str(e) + "|" + repr(e))
+    try:
+        assert False
+    except AssertionError as e:
+        probes.append(str(e) + "|" + repr(e))
+    try:
+        next(iter([]))
+    except StopIteration as e:
+        probes.append(str(e) + "|" + repr(e))
+    try:
+        dyn_s + dyn_i
+    except TypeError as e:
+        probes.append(str(e))
+    try:
+        dyn_i + dyn_s
+    except TypeError as e:
+        probes.append(str(e))
+    try:
+        len(dyn_i)
+    except TypeError as e:
+        probes.append(str(e))
+    try:
+        dyn_n + dyn_i
+    except TypeError as e:
+        probes.append(str(e))
+    try:
+        dyn_l < dyn_s
+    except TypeError as e:
+        probes.append(str(e))
+    try:
+        dyn_d[dyn_l] = 1
+    except TypeError as e:
+        probes.append(str(e))
+    try:
+        int(dyn_n)
+    except TypeError as e:
+        probes.append(str(e))
+    try:
+        dyn_s.foo()
+    except AttributeError as e:
+        probes.append(str(e))
+    try:
+        dyn_i.foo
+    except AttributeError as e:
+        probes.append(str(e))
+    try:
+        dyn_n.foo
+    except AttributeError as e:
+        probes.append(str(e))
+    try:
+        sorted([dyn_i, dyn_s])
+    except TypeError as e:
+        probes.append(str(e))
+    try:
+        max([])
+    except ValueError as e:
+        probes.append(str(e))
+    try:
+        {}.pop("k")
+    except KeyError as e:
+        probes.append(str(e))
+    try:
+        {1}.remove(2)
+    except KeyError as e:
+        probes.append(str(e))
+    try:
+        chr(-1)
+    except ValueError as e:
+        probes.append(str(e))
+    try:
+        ord("ab")
+    except TypeError as e:
+        probes.append(str(e))
+    try:
+        int(1e400) if False else int(float("inf"))
+    except OverflowError as e:
+        probes.append(str(e))
+    try:
+        int(float("nan"))
+    except ValueError as e:
+        probes.append(str(e))
+    try:
+        round(float("nan"))
+    except ValueError as e:
+        probes.append(str(e))
+    try:
+        round(float("inf"))
+    except OverflowError as e:
+        probes.append(str(e))
+    try:
+        dyn_l[1:2] = dyn_i
+    except TypeError as e:
+        probes.append(str(e))
+    try:
+        dyn_i.append
+    except AttributeError as e:
+        probes.append(str(e))
+    try:
+        dyn_s * dyn_f
+    except TypeError as e:
+        probes.append(str(e))
+    try:
+        dyn_l[dyn_f]
+    except TypeError as e:
+        probes.append(str(e))
+    try:
+        dyn_s < dyn_i
+    except TypeError as e:
+        probes.append(str(e))
+    try:
+        dyn_d.foo
+    except AttributeError as e:
+        probes.append(str(e))
+    try:
+        "abc".index("z")
+    except ValueError as e:
+        probes.append(str(e))
+    try:
+        "é".encode("ascii")
+    except UnicodeEncodeError as e:
+        probes.append(str(e))
+    try:
+        raise AppError(code=3, msg="bad")
+    except AppError as e:
+        probes.append(str(e) + "|" + repr(e) + "|" + str(e.args))
+    try:
+        raise SubErr("sub")
+    except PlainErr as e:
+        probes.append(str(e) + "|" + repr(e) + "|" + type(e).__name__)
+    try:
+        raise ValueError("a", 2)
+    except ValueError as e:
+        probes.append(str(e) + "|" + repr(e) + "|" + str(e.args))
+    try:
+        raise ValueError
+    except ValueError as e:
+        probes.append(str(e) + "|" + repr(e) + "|" + str(e.args))
+    try:
+        raise Exception("x")
+    except (KeyError, Exception) as e:
+        probes.append(type(e).__name__)
+    try:
+        raise OSError(2, "No such file")
+    except OSError as e:
+        probes.append(str(e) + "|" + repr(e))
+    try:
+        open("/nonexistent/zzz")
+    except FileNotFoundError as e:
+        probes.append(str(e))
+    except OSError as e:
+        probes.append("OS:" + str(e))
+    try:
+        raise RuntimeError("r") from ValueError("v")
+    except RuntimeError as e:
+        probes.append(repr(e.__cause__))
+    try:
+        raise NotImplementedError
+    except NotImplementedError as e:
+        probes.append(repr(e))
+    try:
+        raise ExceptionGroup("g", [ValueError(1), TypeError(2)])
+    except ExceptionGroup as e:
+        probes.append(str(e) + "|" + repr(e) + "|" + str(len(e.exceptions)))
+    for i, p in enumerate(probes):
+        print(f"E9.{i}", p)
+
+print("E1", f1())
+print("E2", f2())
+print("E3", f3())
+print("E4", f4())
+print("E5", f5())
+f6()
+f7()
+f8()
+f9()
+try:
+    sys.exit("bye")
+except SystemExit as e:
+    print("E10", repr(e), e.code, str(e), e.args)
+try:
+    sys.exit()
+except SystemExit as e:
+    print("E11", repr(e), e.code, e.args)
+try:
+    sys.exit(3)
+except SystemExit as e:
+    print("E12", repr(e), e.code)
+try:
+    raise SystemExit(None)
+except BaseException as e:
+    print("E13", repr(e), isinstance(e, Exception))
+try:
+    exit(2)
+except SystemExit as e:
+    print("E14", e.code)
+try:
+    raise KeyboardInterrupt
+except Exception:
+    print("E15 wrong")
+except BaseException as e:
+    print("E15", repr(e))
+def gen_err() -> None:
+    try:
+        raise ValueError("x")
+    except ValueError:
+        pass
+    print("E16", sys.exc_info()[0])
+gen_err()
+print("E17", ValueError("a") == ValueError("a"), ValueError.__name__, issubclass(KeyError, LookupError), issubclass(IndexError, LookupError), issubclass(FileNotFoundError, OSError), issubclass(ZeroDivisionError, ArithmeticError), issubclass(OverflowError, ArithmeticError), issubclass(UnicodeDecodeError, ValueError), issubclass(StopIteration, Exception), issubclass(SystemExit, Exception), issubclass(KeyboardInterrupt, Exception), issubclass(GeneratorExit, Exception), issubclass(RecursionError, RuntimeError), issubclass(NotImplementedError, RuntimeError), issubclass(ModuleNotFoundError, ImportError), issubclass(TimeoutError, OSError), issubclass(PermissionError, OSError), issubclass(BrokenPipeError, ConnectionError), issubclass(AppError, Exception), issubclass(bool, int), ValueError("x").args, BaseException("a", "b").args, str(Exception()), repr(Exception()), str(Exception("a")), str(Exception("a", "b")), repr(Exception("a", "b")), str(Exception(1)), repr(Exception(None)), repr(TypeError("t")), str(KeyError("k")), str(IndexError("i")), repr(OSError("o")), str(OSError(1, "a")), str(OSError(1, "a", "f")), str(OSError("a", "b", "c", "d")))
+def recurse(n: int) -> int:
+    return recurse(n + 1)
+try:
+    recurse(0)
+except RecursionError as e:
+    print("E18", type(e).__name__, str(e)[:30])
+raise AppError(code=7, msg="final")

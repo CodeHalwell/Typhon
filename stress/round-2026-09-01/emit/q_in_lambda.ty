@@ -1,0 +1,13 @@
+from collections.abc import Callable
+
+def parse(s: str) -> Result[int, str]:
+    return Ok(int(s))
+
+def f(s: str) -> Result[int, str]:
+    let g: Callable[[], int] = lambda: parse(s)? + 1
+    return Ok(g())
+
+def main() -> None:
+    print(f("2"))
+
+main()

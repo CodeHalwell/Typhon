@@ -1,0 +1,9 @@
+def ident[T](x: T) -> T:
+    return 42
+
+def main() -> None:
+    let s: str = ident("hello")
+    print(s.upper())
+
+if __name__ == "__main__":
+    main()

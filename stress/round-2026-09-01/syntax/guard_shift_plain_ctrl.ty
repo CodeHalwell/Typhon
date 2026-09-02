@@ -1,0 +1,14 @@
+def pick(x: int?) -> int:
+    if x is None:
+        return 0
+    return x
+
+plain class Bag:
+    items: list[str]
+
+def main() -> None:
+    let b: Bag = Bag()
+    print(pick(None), pick(3), type(b).__name__)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,20 @@
+def main() -> None:
+    let d: dict[str, int] = {"it's": 1, "k": 2}
+    let w: int = 6
+    let x: int = 7
+    print(f"{d["it's"]}")
+    print(f"{d['k']:>{w}}|")
+    print(f"{x!r:>10}|")
+    print(f"{x=}")
+    print(f"{ {1, 2} }")
+    print(f"{f'{x}'}")
+    print(f"{x:{'>'}{w}}|")
+    print(f"a{{b}}c{x}")
+    print(f"{'a' 'b'}")
+    print(f"{x:,}")
+    print(f"""multi
+line {x} "q" 'q'""")
+    print(f"{x:{{}}>3}|" if False else "skip")
+    print(f'{d["k"]}', f"{d['k']!r:>4}|")
+
+main()

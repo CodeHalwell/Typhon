@@ -1,0 +1,21 @@
+class Base:
+    pass
+
+def pick(x: int?) -> int:
+    guard v = x else: return 0
+    return v
+
+class P frozen:
+    x: int
+
+def main() -> None:
+    let p: P = P(x=1)
+    print(pick(None), pick(3), p)
+    try:
+        p.x = 2
+        print("MUTATED", p.x)
+    except Exception as e:
+        print("frozen ok", type(e).__name__)
+
+if __name__ == "__main__":
+    main()

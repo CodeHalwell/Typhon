@@ -1,0 +1,153 @@
+
+try:
+    print("X000", "hello".isidentifier(), "1x".isidentifier(), "_".isidentifier())
+except Exception as _e:
+    print("X000", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X001", "abc".isascii(), "é".isascii())
+except Exception as _e:
+    print("X001", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X002", "abc".isprintable(), "a\nb".isprintable(), "".isprintable())
+except Exception as _e:
+    print("X002", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X003", "a {x}".format_map({"x": 1}))
+except Exception as _e:
+    print("X003", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X004", str.maketrans("ab", "xy"), "abc".translate(str.maketrans("ab", "xy")))
+except Exception as _e:
+    print("X004", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X005", "abc".translate(str.maketrans("a", "b", "c")))
+except Exception as _e:
+    print("X005", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X006", "a".center(4, "*"), "a".ljust(3, "-"), "a".rjust(3, "-"))
+except Exception as _e:
+    print("X006", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X007", "ab".encode("utf-16"), "ab".encode("utf-16-le"), "ab".encode("utf-32"), "ab".encode("latin-1"), "ab".encode("cp1252"))
+except Exception as _e:
+    print("X007", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X008", "é".encode("ascii", "ignore"), "é".encode("ascii", "replace"), "é".encode("ascii", "xmlcharrefreplace"), "é".encode("ascii", "backslashreplace"))
+except Exception as _e:
+    print("X008", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X009", b"\xff".decode("utf-8", "replace"), b"\xff".decode("utf-8", "ignore"), b"\xffabc".decode("utf-8", "backslashreplace"))
+except Exception as _e:
+    print("X009", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X010", b"h\xe9llo".decode("latin-1"), b"\xff\xfeh\x00i\x00".decode("utf-16"))
+except Exception as _e:
+    print("X010", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X011", "abc".encode("ascii"), "😀".encode("utf-16"), "😀".encode("utf-32-be"))
+except Exception as _e:
+    print("X011", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X012", "ǆemal".title(), "ß".title(), "ß".capitalize(), "ǆ".capitalize(), "ß".swapcase(), "İ".swapcase(), "ǅ".swapcase())
+except Exception as _e:
+    print("X012", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X013", "²".isdigit(), "²".isdecimal(), "²".isnumeric(), "½".isnumeric(), "½".isdigit(), "٣".isdigit(), "٣".isdecimal(), "Ⅷ".isnumeric())
+except Exception as _e:
+    print("X013", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X014", "1st".istitle(), "Hello World".istitle(), "Hello world".istitle(), "HELLO".istitle(), "".istitle())
+except Exception as _e:
+    print("X014", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X015", "ǅ".isalpha(), "​".isspace(), "​".isprintable())
+except Exception as _e:
+    print("X015", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X016", "42".zfill(5), "-42".zfill(5), "+42".zfill(5), "-".zfill(3), "".zfill(2), "abc".zfill(2), "-42".zfill(2), "+".zfill(1))
+except Exception as _e:
+    print("X016", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X017", "ab".center(5), "ab".center(6), "abc".center(6), "abc".center(4), "a".center(4, "*"), "ab".center(5, "*"), "ab".center(7, "-"), "abc".center(2), "".center(3, "x"))
+except Exception as _e:
+    print("X017", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X018", "a\tb".expandtabs(), "a\tb".expandtabs(4), "ab\tc".expandtabs(4), "\t".expandtabs(0), "a\nb\tc".expandtabs(4), "abcd\tef".expandtabs(4), "a\tb\tc".expandtabs(3), "\t\t".expandtabs(2))
+except Exception as _e:
+    print("X018", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X019", "a  b   c ".split(), " a b ".split(None, 1), "a  b   c".split(" "), "a,b,,c".split(","), "a,b,c".split(",", 1), "a,b,c".rsplit(",", 1), " a b c ".rsplit(None, 1), "".split(), "".split(","), " ".split(" "), "a\x1cb\x1dc".split(), "a\n\nb".split("\n"))
+except Exception as _e:
+    print("X019", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X020", "a,b,c".partition(","), "abc".partition(","), "a,b,c".rpartition(","), "abc".rpartition(","), "aaa".partition("a"), "aaa".rpartition("a"), "a..b".partition(".."))
+except Exception as _e:
+    print("X020", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X021", "xxhixx".strip("x"), "xyxhixyx".strip("xy"), "  hi  ".strip(), "hi".strip(""), "\t\n hi  ".strip(), "hi​".strip(), "www.example.com".lstrip("cmowz."), "mississippi".rstrip("ipz"), "aaa".strip("a"))
+except Exception as _e:
+    print("X021", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X022", "aaaa".count("aa"), "aaaa".count("a", 1), "aaaa".count("a", 1, 3), "aaaa".count(""), "".count(""), "abc".count("", 10), "abc".count("x"), "ababab".count("aba"), "aaa".count("a", -2), "abc".count("", 3), "abc".count("", 4))
+except Exception as _e:
+    print("X022", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X023", "aaa".replace("a", "b", 0), "aaa".replace("a", "b", 2), "aaa".replace("a", "b", -1), "abc".replace("", "-"), "abc".replace("", "-", 2), "".replace("", "x"), "aaa".replace("aa", "b"), "ab".replace("a", "aa"))
+except Exception as _e:
+    print("X023", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X024", "abc".find("c", -1), "abc".find("", 3), "abc".find("", 4), "abc".rfind(""), "abcabc".rfind("bc", 0, 5), "abc".index("b", 1, 2), "aXbXc".find("X", 2), "abc".find("abcd"), "".find(""), "abc".find("c", 1, -1), "héllo".find("l"), "héllo".rfind("l"), "héllo".index("o"))
+except Exception as _e:
+    print("X024", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X025", "ab" * 3, "ab" * 0, "ab" * -1, 3 * "ab", "abc"[::-1], "abc"[1:], "abc"[:-1], "abc"[5:], "abc"[-5:], "abc"[::2], "abcdef"[::-2], "abcdef"[5:1:-1], "abcdef"[-1:-4:-1], "abc"[1:1], "abc"[2:1])
+except Exception as _e:
+    print("X025", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X026", "Hello"[0], "Hello"[-1], "héllo"[1], "😀a"[0], "😀a"[1], len("😀"), ord("😀"), chr(128512), repr(chr(0)), ord("\U0010FFFF"), "a😀b"[::-1])
+except Exception as _e:
+    print("X026", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X027", repr("it's"), repr('say "hi"'), repr("it's \"both\""), repr("a\\b"), repr("tab\there"), repr("nl\n"), repr("\x00"), repr("\x7f"), repr("é"), repr("😀"), repr("​"), repr(" "), repr(" "), repr("\x1b[0m"), repr("\r"), repr("\v\f\a\b"), repr("͸"), repr("﻿"), repr("́"), repr("­"), repr("\U000E0001"))
+except Exception as _e:
+    print("X027", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X028", ascii("é"), ascii("😀"), ascii("a\nb"), ascii("it's"), ascii([1, "é"]), ascii(" "), ascii("\x7f"), ascii("\x80"), ascii("￿"), ascii("\U00010000"))
+except Exception as _e:
+    print("X028", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X029", "a b c".split(" ", 0), "a b c".split(None, 0), "a b c".rsplit(" ", 0), "  a".split(None, -1), "a".split("a"), "aXXb".split("X"), "abc".rsplit("b"), "a  b".rsplit(None), "\n a \n b \n".split(), "\n a \n b \n".splitlines(), "a\r\nb\rc\nd".splitlines(), "a\r\nb".splitlines(True), "".splitlines(), "\n".splitlines(), "a\n".splitlines(), "a\n\n".splitlines())
+except Exception as _e:
+    print("X029", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X030", ",".join(["a", "b"]), "".join([]), "-".join("abc"), ", ".join(map(str, [1, 2])), "x".join(["", ""]), ",".join(("a",)), "".join(reversed("abc")), "".join(sorted("cba")))
+except Exception as _e:
+    print("X030", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X031", "hello".startswith("he"), "hello".startswith("lo", 3), "hello".startswith("", 10), "hello".endswith("lo", 0, 3), "hello".startswith(("x", "he")), "hello".endswith(("x", "lo")), "hello".startswith("h", -5), "hello".startswith("h", -100, 1), "hello".endswith("o", -1), "hello".endswith("", 100), "hello".startswith("hello", 0, -1), "hello".startswith("hell", 0, -1))
+except Exception as _e:
+    print("X031", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X032", "abc" < "abd", "abc" < "abcd", "Z" < "a", "é" > "z", "" < "a", "10" < "9", max("hello"), min("hello"), sorted("hello"), "" in "abc", "ab" in "ba")
+except Exception as _e:
+    print("X032", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X033", str(b"hi"), str(b"h\xe9"), str(bytes([104, 105])), str(bytearray(b"ab")), bytes(3), bytes([255, 0]), b"abc"[0], b"abc"[1:], b"abc" + b"d", b"a" * 3, b"abc".upper(), b"a,b".split(b","), b"  a ".strip(), b"abc".hex(), bytes.fromhex("6162"), b"abc".decode("ascii"), list(b"ab"), b"a" in b"abc", 97 in b"abc", b"abc" < b"abd", b"abc" == "abc", bytes("é", "utf-8"), b"a\x00b", repr(b"'"), repr(b'"'), repr(b"'\""), repr(b"\\"), repr(b"\t\n\r"), repr(b"\x7f\x80\xff"))
+except Exception as _e:
+    print("X033", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X034", bytearray(b"ab"), bytearray(3), bytearray([1, 2]), bytearray(b"ab").upper(), bytes(bytearray(b"x")), b"abc".replace(b"b", b"x"), b"a b".split(), b"abc".startswith(b"a"), b"abc".find(b"c"), b"abc".index(b"b"), b"ABC".lower(), b"abc".isalpha(), b"12".isdigit(), b" ".isspace(), b"abc".title(), b"a-b".partition(b"-"), b"abc".endswith(b"c"), b"abc".count(b"b"), b"abc".rjust(5), b"abc".zfill(5), b"abc".center(7, b"*"), b"abc".ljust(5, b"."), b"a\nb".splitlines(), b"abc".join([b"x", b"y"]), bytes.fromhex("61 62"), b"abc".hex(":"), b"abc".hex(":", 2))
+except Exception as _e:
+    print("X034", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X035", "%s" % "x", "%d items" % 5, "%(a)s-%(b)d" % {"a": "x", "b": 3}, "%.3d" % 5, "%03d" % 5, "%+.2f" % 1.5, "%5.1f%%" % 99.5, "%c" % 65, "%c" % "z", "%r" % "s", "%a" % "é", "%i" % 3, "%u" % 3, "%o" % 8, "%x" % 255, "%X" % 255, "%e" % 1.5, "%g" % 0.00001, "%G" % 1e20, "%%")
+except Exception as _e:
+    print("X035", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X036", "{} {}".format(1, 2), "{1} {0}".format(1, 2), "{a} {b}".format(a=1, b=2), "{0[1]} {0[0]}".format([1, 2]), "{0.real}".format(3), "{:>5}|{:<5}|{:^5}".format(1, 2, 3), "{:{}}".format(3, 5), "{:{w}.{p}f}".format(3.14159, w=8, p=2), "{{}} {}".format(1), "{!r} {!s} {!a}".format("x", "y", "ü"), "{d[k]}".format(d={"k": 1}), "{0!r:>6}".format("a"), "{:,}".format(1234567), "{:_}".format(1234567), "{:08.3f}".format(3.14159), "{:%}".format(0.5), "{:e}".format(12345.678), "{:g}".format(0.0001), "{:#x}".format(255), "{:b}".format(5), "{:o}".format(8), "{:c}".format(65), "{:n}".format(1234), "{:.3}".format("abcdef"), "{:s}".format("x"), "{:10}".format("x"), "{:10}".format(1), "{:10}".format(1.5), "{:<10}".format(1), "{:^10}".format("mid"), "{:*^10}".format("mid"), "{:=+10}".format(5), "{:010}".format(-5), "{: }".format(5), "{:+}".format(5), "{:-}".format(5))
+except Exception as _e:
+    print("X036", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X037", f"{'hi':.1}", f"{'hello':.3}", f"{'hi':6.1}|", f"{1234567.891:,}", f"{1.5:10}|", f"{3.14159:.3}", f"{3.0:.3}", f"{1234567:_x}", f"{1234567:_b}", f"{1234567:,d}", f"{0.5:.1}", f"{1.0:.1}", f"{12.0:.2}", f"{0.001:.2}", f"{1.5:10.3}|", f"{1e16:.3}", f"{123.456:.0}", f"{0.0:.3}", f"{2.5e-5:.3}", f"{1e-4:.3}", f"{3.0:#g}", f"{3:#.3g}", f"{3.0:#.0f}", f"{3:#.0e}", f"{3.5:#}", f"{'ü'!a}", f"{3.14!r:>8}", f"{'x'!r:>5}", f"{None!s:>6}", f"{1e300:,.0f}"[:5], f"{-1234.5:,.0f}", f"{12345.6789:,.2f}", f"{2**64:,}", f"{-2**64:_}", f"{1234.5:_.1f}", f"{0.000001234:.2e}", f"{123456789:.2e}", f"{1234.5678:.2g}", f"{0.00001234:g}", f"{1e-5:g}", f"{100000.0:g}", f"{1000000.0:g}", f"{123456.789:g}", f"{1234567.0:g}", f"{0.1:.20g}", f"{1/3:.17g}", f"{2.5:.0f}", f"{3.5:.0f}", f"{-2.5:.0f}", f"{0.125:.2f}", f"{0.375:.2f}", f"{1e21:f}"[:8], f"{1e21:.0f}"[:8], f"{float('nan'):>8}|", f"{float('inf'):<8}|", f"{-float('inf'):^9}|", f"{float('nan'):08}", f"{float('inf'):+}", f"{-0.0:+}", f"{0.0:+}", f"{-0.0:}", f"{-0.0: }", f"{5:+}", f"{-5: }", f"{5: }", f"{True}", f"{True:d}", f"{True:5}|", f"{True:>5}|", f"{None}", f"{None:>6}|" if False else "skip", f"{[1,2]}", f"{{{1}}}", f"{'a':}", f"{1:}", f"{1.0:}", f"{'%'}", f"{'{}'}", f"{1:c}", f"{65:c}", f"{0x1F600:c}")
+except Exception as _e:
+    print("X037", "ERR", type(_e).__name__, str(_e)[:70])

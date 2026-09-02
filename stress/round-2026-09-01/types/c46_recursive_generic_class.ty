@@ -1,0 +1,8 @@
+class Tree[T]:
+    value: T
+    kids: list[Tree[Tree[T]]]
+
+def main() -> None:
+    let t: Tree[int] = Tree(value=1, kids=[])
+    let u: Tree[str] = t
+    print(u)

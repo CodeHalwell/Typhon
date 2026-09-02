@@ -1,0 +1,26 @@
+import asyncio
+
+
+async def a() -> int:
+    return 1
+
+
+async def b() -> int:
+    return 2
+
+
+async def main() -> None:
+    gather:
+        x = a()
+        y = b()
+    print(x + y)
+
+
+with open("a") as f?, open("b") as g?:
+    print(f, g)
+else:
+    print("no")
+
+
+let z: int = "oops"
+let w: str = 42

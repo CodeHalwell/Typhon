@@ -799,34 +799,11 @@ pub fn preprocess_opts_mapped(
                 }
             }
 
-            // ── `guard NAME = EXPR else: BODY` (single-line) ────────────────
-            // Lowers to a None-check + an early-return body + a `let`
-            // binding of the narrowed value. Stashes EXPR in a per-line
-            // temp so the narrowing applies to the binding (the checker
-            // can only narrow Name expressions, not arbitrary call
-            // results).
-            //
-            //   guard w = weight else: return
-            //
-            //   →   let __typhon_guard_<N> = (weight)
-            //       if __typhon_guard_<N> is None: return
-            //       let w = __typhon_guard_<N>
-            //
-            // Only the single-line form is recognised; multi-line guards
-            // (`else:\n    return`) are deferred.
-            if rest.starts_with("guard ") {
-                if let Some(rewritten) = expand_guard_one_liner(rest, indent, line_index) {
-                    let (rewritten, marks) = rewrite_optionals(&rewritten, &mut in_string);
-                    for col in marks {
-                        optionals.push(StrippedOptional {
-                            line_index,
-                            python_col: col,
-                        });
-                    }
-                    python_source.push_str(&rewritten);
-                    continue;
-                }
-            }
+            // `guard NAME = EXPR else: BODY` (single-line) is lowered by the
+            // `expand_multiline_guards` pre-pass, which every pipeline runs
+            // before this loop. It must not be expanded here: this loop's
+            // side tables are keyed by input line index, and a rewrite that
+            // changes the line count desynchronises all of them.
 
             // ── `enum ClassName:` → `class ClassName(enum.Enum):` ───────────
             // The header is rewritten and the body indent recorded so the
@@ -1251,10 +1228,11 @@ fn strip_pub_prefixes(
         if is_pub_star_line(rest) {
             pub_star_lines.push(line_index);
             // Replace with a blank line so line numbers stay aligned
-            // and the rest of the pipeline ignores it.
-            if line.ends_with('\n') {
-                out.push('\n');
-            }
+            // and the rest of the pipeline ignores it. The newline is
+            // pushed even when the source's last line lacked one: the
+            // marker's line must still exist for the re-export
+            // synthesis, which addresses it by index.
+            out.push('\n');
             continue;
         }
         if let Some(after_pub) = rest.strip_prefix("pub ") {
@@ -2694,7 +2672,10 @@ fn rewrite_unsafe_block_line(rest: &str) -> Option<String> {
     // Strip a trailing newline so we can re-attach exactly one.
     let raw = rest.trim_end_matches(['\n', '\r']);
     let terminator = &rest[raw.len()..];
-    let body = raw.strip_prefix("unsafe")?.trim_start();
+    // A trailing `# comment` after the colon is allowed (and dropped — the
+    // rewritten line carries the `__typhon_unsafe__` marker comment instead).
+    let (code, _comment) = split_trailing_comment(raw);
+    let body = code.trim_end().strip_prefix("unsafe")?.trim_start();
     if !body.ends_with(':') {
         return None;
     }
@@ -6619,7 +6600,23 @@ pub fn expand_multiline_guards_mapped(source: &str) -> (String, Vec<usize>) {
         };
         let trimmed = after_guard.trim_end();
         let Some(head) = trimmed.strip_suffix("else:") else {
-            // Either single-line form or unrecognised — leave it alone.
+            // The single-line form, `guard NAME = EXPR else: BODY`, lowers
+            // to three lines *here*, in a mapped pre-pass, rather than
+            // inside `preprocess`'s main loop: that loop records every
+            // line-indexed side table (`frozen` classes, `unsafe:` blocks,
+            // stripped keywords) against its *input* line numbers, so a
+            // pass that emits three lines for one there silently shifted
+            // every later entry — a `class P frozen:` after a one-line
+            // guard lost its `frozen`, and `tyc fmt` rewrote the file.
+            if let Some(lowered) = expand_guard_one_liner(body, header_indent, i) {
+                for lowered_line in lowered.split_inclusive('\n') {
+                    out.mark(i);
+                    out.push_str(lowered_line);
+                }
+                i += 1;
+                continue;
+            }
+            // Unrecognised — leave it alone.
             out.push_str(line);
             i += 1;
             continue;
@@ -8221,17 +8218,23 @@ fn expand_pipes_in_subexpressions(code: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
+        // Copy one whole UTF-8 character. Pushing `b as char` re-encoded
+        // every non-ASCII byte as its own Latin-1 code point, so any line
+        // containing both `|>` and a non-ASCII character came out mojibaked
+        // (`"café" |> str.upper()` printed `CAFÃ©`).
+        let char_len = utf8_char_len(bytes, i);
         if let Some(q) = in_str {
-            out.push(b as char);
+            out.push_str(&code[i..i + char_len]);
             if b == b'\\' && i + 1 < bytes.len() {
-                out.push(bytes[i + 1] as char);
-                i += 2;
+                let next_len = utf8_char_len(bytes, i + 1);
+                out.push_str(&code[i + 1..i + 1 + next_len]);
+                i += 1 + next_len;
                 continue;
             }
             if b == q {
                 in_str = None;
             }
-            i += 1;
+            i += char_len;
             continue;
         }
         if b == b'"' || b == b'\'' {
@@ -8292,8 +8295,8 @@ fn expand_pipes_in_subexpressions(code: &str) -> String {
             i = j;
             continue;
         }
-        out.push(b as char);
-        i += 1;
+        out.push_str(&code[i..i + char_len]);
+        i += char_len;
     }
     out
 }
@@ -8308,6 +8311,19 @@ fn expand_pipes_in_subexpressions(code: &str) -> String {
 ///
 /// Lines that begin mid-string (e.g. triple-quoted continuation) are
 /// passed through verbatim so we don't perturb string contents.
+/// Split a physical line into its code portion and its trailing `#`
+/// comment (comment marker included), honouring string literals.
+fn split_trailing_comment(line: &str) -> (&str, Option<&str>) {
+    let mut state: Option<StringMode> = None;
+    let code_end = scan_line_code_end(line, &mut state);
+    let tail = line[code_end..].trim_start();
+    if tail.starts_with('#') {
+        (&line[..code_end], Some(tail.trim_end()))
+    } else {
+        (line, None)
+    }
+}
+
 fn join_pipe_continuations(source: &str) -> (String, Vec<usize>) {
     let mut out = MappedOut::with_capacity(source.len());
     // (line_without_terminator, terminator, first source line folded in)
@@ -8353,8 +8369,17 @@ fn join_pipe_continuations(source: &str) -> (String, Vec<usize>) {
             if let Some((prev_line, prev_term, prev_src)) = buffered.take() {
                 // Drop the terminator on the previous line and the
                 // leading whitespace on this one, joining with a single
-                // space so existing tokenization keeps working.
-                let joined = format!("{} {}", prev_line, trimmed);
+                // space so existing tokenization keeps working. A trailing
+                // `# comment` on either side is lifted out and re-attached
+                // after the join — glued in place it would swallow every
+                // later `|> step` into the comment.
+                let (prev_code, prev_comment) = split_trailing_comment(&prev_line);
+                let (this_code, this_comment) = split_trailing_comment(trimmed);
+                let mut joined = format!("{} {}", prev_code.trim_end(), this_code.trim_end());
+                for comment in [prev_comment, this_comment].into_iter().flatten() {
+                    joined.push_str("  ");
+                    joined.push_str(comment);
+                }
                 buffered = Some((joined, prev_term, prev_src));
             }
         } else {
@@ -12443,12 +12468,115 @@ def f(x: int?) -> int:
     }
 
     #[test]
-    fn expand_multiline_guards_leaves_single_line_form_alone() {
-        // Single-line form is handled inside `preprocess`; this pre-pass
-        // must not touch it.
+    fn expand_multiline_guards_lowers_single_line_form() {
+        // The single-line form is lowered by this mapped pre-pass, not by
+        // `preprocess`'s main loop: that loop's side tables are keyed by
+        // input line index, so a one-line guard expanding to three lines
+        // there shifted every later `frozen` / `unsafe:` / stripped-keyword
+        // record.
         let src = "def f(x: int?) -> int:\n    guard v = x else: return 0\n    return v\n";
-        let out = expand_multiline_guards(src);
-        assert_eq!(out, src);
+        let (out, map) = expand_multiline_guards_mapped(src);
+        assert_eq!(
+            out,
+            "def f(x: int?) -> int:\n    let __typhon_guard_1 = (x)\n    \
+             if __typhon_guard_1 is None: return 0\n    let v = __typhon_guard_1\n    return v\n"
+        );
+        // All three lowered lines map back to the guard's source line.
+        assert_eq!(map, vec![0, 1, 1, 1, 2]);
+        // And `preprocess` itself now leaves a one-line guard alone.
+        let prep = preprocess(src);
+        assert!(prep.python_source.contains("guard v = x else: return 0"));
+    }
+
+    #[test]
+    fn frozen_class_after_single_line_guard_keeps_frozen() {
+        // Regression: the guard one-liner used to add two lines inside the
+        // main loop, so `frozen_class_lines` pointed two lines too early and
+        // `class P frozen:` silently lost its `frozen`.
+        let src = "\
+def pick(x: int?) -> int:
+    guard v = x else: return 0
+    return v
+
+class P frozen:
+    x: int
+
+def f() -> None:
+    unsafe:
+        let y = 1
+";
+        let prep = preprocess(&expand_multiline_guards(src));
+        let lines: Vec<&str> = prep.python_source.lines().collect();
+        assert_eq!(prep.frozen_class_lines.len(), 1, "{prep:?}");
+        let frozen_line = prep.frozen_class_lines[0];
+        assert!(
+            lines[frozen_line].starts_with("class P"),
+            "frozen index {frozen_line} points at {:?}",
+            lines[frozen_line]
+        );
+        assert_eq!(prep.unsafe_lines.len(), 1);
+        assert!(
+            lines[prep.unsafe_lines[0]].contains("__typhon_unsafe__"),
+            "unsafe index points at {:?}",
+            lines[prep.unsafe_lines[0]]
+        );
+    }
+
+    #[test]
+    fn pipe_rewrite_preserves_non_ascii_text() {
+        // `expand_pipes_in_subexpressions` re-encoded every byte as a
+        // Latin-1 char, so a non-ASCII literal on a `|>` line was mojibaked.
+        let src = "s: str = (\"café ☃\" |> str.upper())\n";
+        let out = expand_pipes(src);
+        assert!(out.contains("\"café ☃\""), "got: {out}");
+        assert!(out.contains("str.upper(\"café ☃\")"), "got: {out}");
+    }
+
+    #[test]
+    fn pipe_continuation_comments_do_not_swallow_later_steps() {
+        let src = "\
+r: int = (
+    1
+    |> f()  # add one
+    |> g()
+)
+";
+        let out = expand_pipes(src);
+        assert!(
+            out.contains("g(f(1))"),
+            "the second step must survive the comment: {out}"
+        );
+        assert!(
+            out.contains("# add one"),
+            "the comment itself is kept: {out}"
+        );
+    }
+
+    #[test]
+    fn unsafe_block_header_accepts_trailing_comment() {
+        let src = "def load() -> int:\n    unsafe:  # boundary\n        let v = 1\n    return 1\n";
+        let prep = preprocess(src);
+        assert!(
+            prep.python_source.contains("if True:  # __typhon_unsafe__"),
+            "got: {}",
+            prep.python_source
+        );
+        assert_eq!(prep.unsafe_lines, vec![1]);
+    }
+
+    #[test]
+    fn pub_star_without_trailing_newline_keeps_its_line() {
+        // A `pub *` on the last line of a file with no terminating newline
+        // must still occupy a line, or the re-export synthesis (which
+        // addresses the marker by line index) finds nothing to replace.
+        let prep = preprocess("pub def hello() -> None:\n    pass\npub *");
+        assert_eq!(prep.pub_star_lines, vec![2]);
+        assert_eq!(
+            prep.python_source.lines().count(),
+            3,
+            "{:?}",
+            prep.python_source
+        );
     }
 
     #[test]

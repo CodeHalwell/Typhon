@@ -1,0 +1,5 @@
+print(list(zip([1, 2], "ab", strict=True)))
+try:
+    list(zip([1, 2], "abc", strict=True))
+except ValueError as e:
+    print("err", e)

@@ -1,0 +1,14 @@
+from typing import ClassVar
+
+class A:
+    registry: ClassVar[dict[str, int]] = {}
+    x: int
+
+class B(A):
+    y: int
+
+def main() -> None:
+    A.registry["k"] = 1
+    print(A.registry is B.registry, B.registry, len(B.registry))
+
+main()

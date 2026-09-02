@@ -179,7 +179,7 @@ class ApiUser(BaseModel):
 
 #### Mutable field defaults
 
-`@dataclass` rejects bare mutable literals at class-definition time (`tags: list[str] = []` raises `ValueError` in Python). Typhon rewrites every `field: T = [] | {} | set() | list() | dict()` on a class that emits as a dataclass into `dataclasses.field(default_factory=<ctor>)` at desugar time, so the literal form just works:
+`@dataclass` rejects bare mutable literals at class-definition time (`tags: list[str] = []` raises `ValueError` in Python). Typhon rewrites every `field: T = [] | {} | set() | list() | dict()` on a class that emits as a dataclass into `dataclasses.field(default_factory=<ctor>)` at desugar time, so the literal form just works. A non-empty `list` / `dict` / `set` display built only from constants (`xs: list[int] = [1, 2]`, `d: dict[str, int] = {"a": 1}`) is rewritten the same way, to `dataclasses.field(default_factory=lambda: [1, 2])` — `@dataclass` rejects those too, since it refuses any unhashable default. A display that names something (`[SIZE]`, `[f()]`) is left exactly as written, because a class-body `lambda` cannot see class-scope names:
 
 ```python
 # Typhon

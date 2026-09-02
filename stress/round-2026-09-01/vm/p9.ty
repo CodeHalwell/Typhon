@@ -1,0 +1,164 @@
+import sys
+import dataclasses
+from dataclasses import dataclass, field, asdict
+from collections import Counter, deque, defaultdict, OrderedDict, namedtuple
+import heapq
+import os
+import functools
+
+print("P1", 1, "a", None, True, 1.0, [1], sep="|", end="!\n")
+print("P2", sep="", end="")
+print()
+print("P3", "a", "b", sep="")
+print("P4", end="")
+print("x", file=sys.stdout)
+print("P5", "err", file=sys.stderr)
+print("P6", flush=True)
+sys.stdout.write("P7 write\n")
+n: int = sys.stdout.write("P8\n")
+print("P9", n)
+print("P10", repr(sys.stdout.write("")))
+sys.stdout.flush()
+print("Q1", 1 < 2 < 3, 1 < 3 < 2, 1 == 1.0 == True, "a" < "b" < "c", 1 < 2 > 1, 5 > 3 > 3, (1 < 2) == True, 1 is 1, "a" is "a", None is None, [] is [], 1000 is 1000, [] == [], 1 is not 2, None is not None, () is (), "" is "", 0 is False, 1 == True, 1 is True, not None, not 0, not [], not "a", not not 5)
+x: int = 5
+x += 2
+x *= 3
+x //= 4
+x **= 2
+x %= 7
+x <<= 2
+x >>= 1
+x |= 8
+x &= 12
+x ^= 5
+x -= 1
+print("Q2", x)
+fl: float = 10.0
+fl /= 4
+fl //= 1
+fl **= 0.5
+print("Q3", fl, 7 / 2, 8 / 2, 1 / 3 * 3, 2 ** 0.5 ** 2, -2 ** 0.5, (-8) ** (1 / 3), 1e308 * 10, -1e308 * 10, 0.1 + 0.2 == 0.3, 0.1 + 0.2 - 0.3, 1 - 0.9, 100 * 1.1, 3.0 * 1.1, 1.1 * 1.1, 0.1 * 0.1, 1 / 10, 10 / 3, 2 / 3 + 1 / 3, 9007199254740993 + 0.0, 2**53 + 1.0, float(2**53 + 1), int(2.0**63), int(-2.0**63), int(1e20), int(1.5e19), float(10**308), float(10**309 // 10), 10**309 > 1e308, 10**309 == float("inf"), 2**1024 > float("inf"), float(2**1023 * 2 - 1) if False else "skip")
+lst: list[int] = [1, 2, 3]
+lst2: list[int] = lst
+lst2 += [4]
+lst3: list[int] = lst + [5]
+t: tuple[int, ...] = (1, 2)
+t2: tuple[int, ...] = t
+t2 += (3,)
+s: str = "a"
+s2: str = s
+s2 += "b"
+print("Q4", lst, lst2, lst3, lst is lst2, t, t2, s, s2)
+d: dict[str, list[int]] = {"k": [1]}
+d["k"] += [2]
+d["k"].append(3)
+d2: dict[str, int] = {}
+d2["a"] = d2.get("a", 0) + 1
+d2["a"] += 1
+print("Q5", d, d2, len(d2))
+mut cnt: int = 0
+def bump() -> int:
+    global cnt
+    cnt += 1
+    return cnt
+def outer() -> str:
+    mut v: str = "o"
+    def inner() -> None:
+        nonlocal v
+        v += "i"
+    inner()
+    inner()
+    return v
+print("Q6", bump(), bump(), cnt, outer())
+for i in range(3):
+    pass
+else:
+    print("Q7 for-else", i)
+for i in range(3):
+    if i == 1:
+        break
+else:
+    print("Q7 not printed")
+mut w: int = 0
+while w < 2:
+    w += 1
+else:
+    print("Q8 while-else", w)
+while True:
+    w += 1
+    if w > 5:
+        break
+else:
+    print("Q8 not printed")
+print("Q9", [y := 5, y ** 2], y, (z := 10) + z, [w2 for w2 in range(3) if (w3 := w2 * 2) > 1], w3)
+if (n2 := len("abc")) > 2:
+    print("Q10", n2)
+print("Q11", id(1) == id(1), id("a") == id("a"), id([]) == id([]), type(id(1)).__name__, hash(1) == hash(1.0), hash(True) == hash(1), hash("") == 0, hash(()) == hash(()), hash((1, 2)) != hash((2, 1)), hash(frozenset()) == hash(frozenset()), hash(None) is not None, hash(0) == hash(-0.0), hash(2**61 - 1) == hash(2.0**61 - 1) if False else "skip", hash(1.5) == hash(1.5), hash(-1), hash(-2), hash(0), hash(1), hash(2**61), hash(2**61 - 1), hash(2**62), hash(-2**61), hash(1.0), hash(2.5), hash(0.5), hash(float("inf")), hash(-float("inf")), hash(True), hash(False), hash(10**20), hash(-10**20), hash(123456789), hash((1, 2)), hash((1, 2, 3)), hash(()), hash((1,)), hash(("a",)) == hash(("a",)), hash(frozenset([1, 2])), hash(frozenset()), hash(frozenset([1])), hash(1j), hash(2 + 1j))
+@dataclass
+class DC:
+    a: int
+    b: str = "x"
+    c: list[int] = field(default_factory=list)
+
+@dataclass(order=True, frozen=True)
+class Ver:
+    major: int
+    minor: int = 0
+
+@dataclass(eq=False)
+class NoEq:
+    v: int
+
+@dataclass(repr=False)
+class NoRepr:
+    v: int
+
+class Plain:
+    n: int
+
+impl Plain:
+    def __post_init__(self) -> None:
+        self.n += 1
+
+dc: DC = DC(1)
+print("Q12", dc, repr(dc), asdict(dc), dc == DC(1), dc == DC(1, "x", []), DC(1) != DC(2), hash(Ver(1)) == hash(Ver(1)), {Ver(1): "v"}[Ver(1)], NoEq(1) == NoEq(1), NoEq(1) != NoEq(1), repr(NoRepr(1))[:8], Plain(n=1).n, asdict(DC(1, c=[1, 2]))["c"] is not None, DC.__dataclass_fields__.keys() if False else "skip", dc.__dict__ if False else "skip", str(dc), f"{dc}", "%s" % dc, "%r" % dc, [dc], (dc,), {"k": dc}, DC(a=1, c=[9]).c, DC(1).c is DC(1).c, DC(1).c == DC(1).c)
+try:
+    v: Ver = Ver(1)
+    v.major = 5
+except dataclasses.FrozenInstanceError as e:
+    print("Q13", type(e).__name__, e)
+print("Q17", Counter("abracadabra"), Counter("abracadabra").most_common(2), list(Counter("aab").elements()), Counter("ab")["z"], Counter("aab").most_common(), Counter({"a": 3, "b": 3, "c": 1}).most_common(2), Counter("aab") == Counter({"a": 2, "b": 1}), Counter(a=1, b=2), Counter(), Counter("aab").keys(), sorted(Counter("aab").items()), Counter("aab").subtract("a") if False else "skip", dict(Counter("aab")), Counter("aab").update("bb") if False else "skip", sum(Counter("aab").values()), Counter([3, 1, 2, 1]), Counter(["b", "a", "b"]).most_common(), Counter("mississippi").most_common(3), Counter(x for x in [1, 2, 2]), Counter({"x": 0}), Counter({"x": 0}) == Counter(), str(Counter()), repr(Counter({"a": 1})))
+dq: deque[int] = deque([1, 2, 3], maxlen=3)
+dq.append(4)
+dq.appendleft(0)
+print("Q18", dq, list(dq), dq[0], dq[-1], len(dq), dq.maxlen, deque([1, 2]).rotate(1) if False else "skip", deque(), deque("ab"), repr(deque([1], maxlen=5)), deque([1, 2, 3]).pop(), deque([1, 2, 3]).popleft(), 2 in deque([1, 2]), deque([1, 2]) == deque([1, 2]), deque([1]) + deque([2]), deque([1]) * 2, list(reversed(deque([1, 2]))), deque([3, 1, 2]).index(1), deque([1, 2, 1]).count(1), deque(range(5), 3), deque([1, 2, 3], 3).extend([4, 5]) if False else "skip", bool(deque()), str(deque([1])), deque([1, 2])[1], deque(maxlen=0), list(deque([1, 2, 3], maxlen=2)))
+dq2: deque[int] = deque([1, 2, 3, 4])
+dq2.rotate(1)
+dq3: deque[int] = deque([1, 2, 3, 4])
+dq3.rotate(-1)
+dq3.extendleft([9, 8])
+dq3.remove(9)
+dq3.reverse()
+dq3.insert(1, 7)
+print("Q19", dq2, dq3, dq3.copy(), dq3 == dq3.copy(), dq3.clear(), dq3)
+dd: defaultdict[str, list[int]] = defaultdict(list)
+dd["a"].append(1)
+dd["b"]
+dd2: defaultdict[str, int] = defaultdict(int)
+dd2["x"] += 1
+dd3 = defaultdict(lambda: "dflt")
+print("Q20", dd, dict(dd), repr(dd), dd2, dd2["y"], dd2, "z" in dd2, dd2.get("q"), dd3["k"], dd3, len(dd3), defaultdict(int, {"a": 1}), defaultdict(None) if False else "skip", dd.default_factory is list, sorted(dd.keys()), dd == {"a": [1], "b": []}, str(dd2))
+od: OrderedDict[str, int] = OrderedDict([("a", 1), ("b", 2), ("c", 3)])
+od.move_to_end("a")
+od.move_to_end("c", last=False)
+print("Q21", od, repr(od), list(od), od.popitem(), od.popitem(last=False), od, od == OrderedDict([("b", 2)]), od == {"b": 2}, OrderedDict(a=1) == OrderedDict(a=1), OrderedDict([("a", 1), ("b", 2)]) == OrderedDict([("b", 2), ("a", 1)]), dict(od), str(OrderedDict()), OrderedDict({"x": 1}))
+Point = namedtuple("Point", ["x", "y"])
+P3 = namedtuple("P3", "x y z", defaults=[0])
+p: Point = Point(1, 2)
+print("Q22", p, repr(p), p.x, p[1], p == (1, 2), p._asdict(), p._replace(x=9), Point._fields, P3(1, 2), P3._field_defaults if False else "skip", tuple(p), list(p), len(p), max(p), p + (3,), p * 2, Point(x=1, y=2), Point._make([3, 4]), str(p), f"{p}", "%s" % (p,), {p: 1}[Point(1, 2)], sorted([Point(2, 1), Point(1, 9)]), p < Point(1, 3), isinstance(p, tuple), type(p).__name__, Point.__name__, [x * 2 for x in p], dict(zip(Point._fields, p)))
+h: list[int] = [5, 3, 8, 1]
+heapq.heapify(h)
+heapq.heappush(h, 0)
+print("Q30", h, heapq.heappop(h), h, heapq.nsmallest(2, [5, 1, 3]), heapq.nlargest(2, [5, 1, 3]), heapq.heappushpop(h, 2), heapq.heapreplace(h, 9), h, heapq.nsmallest(2, ["bb", "a", "ccc"], key=len), heapq.nlargest(1, [(1, "a"), (1, "b")]), list(heapq.merge([1, 3], [2, 4])), heapq.nsmallest(0, [1]), heapq.nlargest(5, [1, 2]), sorted(h) == [heapq.heappop(h) for _ in range(len(h))])
+print("Q31", os.path.join("a", "b"), os.path.join("a/", "b"), os.path.join("a", "/b"), os.path.join("a", "b", ""), os.path.basename("/a/b.txt"), os.path.dirname("/a/b.txt"), os.path.splitext("a/b.tar.gz"), os.path.splitext(".bashrc"), os.path.split("/a/b"), os.path.isabs("/a"), os.path.isabs("a"), os.path.normpath("a//b/../c/./d"), os.path.normpath(""), os.path.expanduser("~") != "~", os.sep, os.linesep == "\n", os.path.exists("/"), os.path.isdir("/"), os.path.isfile("/"), os.getcwd() != "", os.environ.get("HOME") is not None, os.getenv("NOPE_XYZ"), os.getenv("NOPE_XYZ", "d"), "PATH" in os.environ, os.name, os.path.splitext("a.b/c"), os.path.commonpath(["/a/b", "/a/c"]), os.path.relpath("/a/b", "/a"), os.path.abspath("/a/../b"), os.path.basename("a/"), os.path.dirname("a"), os.path.join("", "a"), os.path.join("a", ""), os.path.splitext("a."), os.path.splitext("a"), os.path.splitext("..a"), os.path.getsize("/dev/null") if False else "skip", os.cpu_count() is not None, os.getpid() > 0, os.path.realpath("/") == "/", os.curdir, os.pardir, os.pathsep, os.extsep, os.altsep, os.devnull)
+print("Q32", sys.maxsize, sys.version_info[0], sys.version_info >= (3, 13), sys.version_info.major, sys.platform, sys.byteorder, sys.argv[0].endswith(("main.py", "main.ty")), len(sys.argv), sys.getrecursionlimit(), sys.float_info.max, sys.float_info.epsilon, sys.float_info.dig, sys.int_info.bits_per_digit, sys.maxunicode, sys.executable != "", sys.path is not None, sys.modules is not None, sys.getsizeof(1) > 0, sys.hash_info.width, sys.stdin is not None, sys.stderr is not None, sys.implementation.name, sys.flags.optimize, sys.getdefaultencoding(), sys.stdout.encoding, sys.intern("a") == "a", sys.exc_info(), sys.api_version > 0 if False else "skip", sys.copyright[:6], sys.prefix != "", sys.orig_argv is not None, sys.builtin_module_names is not None, sys.float_repr_style)

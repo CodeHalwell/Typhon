@@ -1,0 +1,16 @@
+def check(n: int) -> Result[bool, str]:
+	return Ok(n > 1)
+
+def pick(a: int) -> Result[str, str]:
+	if a == 0:
+		return Ok("zero")
+	elif check(a)?:
+		return Ok("big")
+	else:
+		return Ok("one")
+
+def main() -> None:
+	print(pick(0), pick(1), pick(5))
+
+if __name__ == "__main__":
+	main()

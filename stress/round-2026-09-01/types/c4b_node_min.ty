@@ -1,0 +1,21 @@
+class Node[T]:
+    value: T
+    next: Node[T]?
+
+impl[T] Node[T]:
+    def last(self) -> Node[T]:
+        mut cur: Node[T] = self
+        while cur.next is not None:
+            cur = cur.next
+        return cur
+    def me(self) -> Node[T]:
+        return self
+    def maybe(self) -> Node[T]?:
+        return self
+
+def main() -> None:
+    let n: Node[int] = Node(value=1, next=Node(value=2, next=None))
+    print(n.last().value + 1)
+
+if __name__ == "__main__":
+    main()

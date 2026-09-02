@@ -1,0 +1,15 @@
+from typing import Iterator
+def gen() -> Iterator[int]:
+    yield 1
+it = iter([1])
+print("N1", next(it), next(it, "dflt"), next(it, None))
+g = gen()
+print("N2", next(g), next(g, "gdflt"))
+m = map(str, [1])
+print("N3", next(m), next(m, "mdflt"))
+print("N4", next(iter([]), 0), next(iter(""), "e"), next(iter({}), None), next(filter(None, []), "f"), next(zip(), "z") if False else "skip", next(iter(range(0)), -1), next(reversed([]), "r"), next(enumerate([]), "en"))
+print("N5", next((x for x in [1, 2] if x > 5), "none"), next((x for x in [1, 2] if x > 1), "none"))
+try:
+    next(iter([]))
+except StopIteration:
+    print("N6 stop")

@@ -1,0 +1,18 @@
+def parse(s: str) -> int:
+    return int(s)
+
+def f(s: str) -> int:
+    mut v: int? = None
+    try:
+        v = parse(s)
+    except ValueError:
+        v = None
+    if v is not None:
+        return v + 1
+    return 0
+
+def main() -> None:
+    print(f("3"))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,11 @@
+import enum
+
+enum Color(enum.Enum):
+    RED
+    GREEN
+
+def main() -> None:
+    print(Color.RED)
+
+if __name__ == "__main__":
+    main()

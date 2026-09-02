@@ -1,0 +1,15 @@
+mut _i: int = 0
+
+def next_line() -> str?:
+    global _i
+    _i += 1
+    if _i > 3:
+        return None
+    return f"line{_i}"
+
+def main() -> None:
+    while (line := next_line()) is not None:
+        print(line.upper())
+
+if __name__ == "__main__":
+    main()

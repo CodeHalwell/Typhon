@@ -1,0 +1,11 @@
+def first[T = int](xs: list[T]) -> T:
+    return xs[0]
+
+class Box[T = str]:
+    value: T
+
+def main() -> None:
+    print(first.__type_params__[0].__default__, Box.__type_params__[0].__default__)
+    print(first([1, 2]))
+
+main()

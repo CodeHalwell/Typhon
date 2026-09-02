@@ -1,0 +1,17 @@
+class Svc:
+    n: int
+
+impl Svc:
+    def run(self, times: int) -> int:
+        return self.n * times
+
+def f(a: int, b: str = "x") -> str:
+    return b * a
+
+def main() -> None:
+    print(f(a="s"))
+    print(f(2, b=3))
+    print(Svc(n=1).run(times="t"))
+
+if __name__ == "__main__":
+    main()

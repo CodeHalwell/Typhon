@@ -1,0 +1,2 @@
+comptime let R: str = "a\x00b"
+print(len(R))

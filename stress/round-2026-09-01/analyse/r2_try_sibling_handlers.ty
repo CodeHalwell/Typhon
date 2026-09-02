@@ -1,0 +1,11 @@
+def f(s: str) -> str:
+    try:
+        return str(int(s))
+    except ValueError:
+        let msg: str = "value"
+        return msg
+    except TypeError:
+        let msg: str = "type"
+        return msg
+
+print(f("1"))

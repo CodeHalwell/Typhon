@@ -1,0 +1,27 @@
+import sys
+from typing import NoReturn
+
+def die(msg: str) -> NoReturn:
+    print(msg)
+    sys.exit(1)
+
+def a(c: bool) -> int:
+    if c:
+        return 1
+    raise SystemExit(1)
+
+def b(c: bool) -> int:
+    if c:
+        return 1
+    die("no")
+
+def d(c: bool) -> int:
+    if c:
+        return 1
+    assert False, "unreachable"
+
+def main() -> None:
+    print(a(True) + b(True) + d(True))
+
+if __name__ == "__main__":
+    main()

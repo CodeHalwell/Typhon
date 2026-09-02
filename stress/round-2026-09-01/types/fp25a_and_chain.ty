@@ -1,0 +1,15 @@
+class Inner:
+    c: int?
+class Outer:
+    b: Inner?
+
+def f(a: Outer) -> int:
+    if a.b is not None and a.b.c is not None:
+        return a.b.c + 1
+    return 0
+
+def main() -> None:
+    print(f(Outer(b=Inner(c=1))))
+
+if __name__ == "__main__":
+    main()

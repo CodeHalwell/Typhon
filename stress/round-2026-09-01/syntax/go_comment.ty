@@ -1,0 +1,18 @@
+import asyncio
+
+async def work(a: int, b: int) -> int:
+    return a + b
+
+async def run() -> None:
+    go work(
+        1,  # first
+        2,
+    ) -> task
+    let r: int = await task
+    print(r)
+
+def main() -> None:
+    asyncio.run(run())
+
+if __name__ == "__main__":
+    main()

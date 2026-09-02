@@ -1,0 +1,12 @@
+def f(x: int | str) -> str:
+    if isinstance(x, bool):
+        return "b"
+    if not isinstance(x, int):
+        return x.upper()
+    return str(x + 1)
+
+def main() -> None:
+    print(f(True))
+
+if __name__ == "__main__":
+    main()

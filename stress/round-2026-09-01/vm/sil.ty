@@ -1,0 +1,81 @@
+import json
+plain class R:
+    n: int = 0
+impl R:
+    def __init__(self, n: int) -> None:
+        self.n = n
+    def __repr__(self) -> str:
+        return f"R<{self.n}>"
+    def __str__(self) -> str:
+        return f"Rs{self.n}"
+
+def main() -> None:
+    let r: R = R(1)
+    print("S1", "%s" % r, "%r" % r, "%s" % (r,), "%r" % (r,), "%s|%s" % (r, 1), "%r|%s" % (r, r), "%5s" % (r,), "{}".format(r), "{!r}".format(r) if False else "skip", "{0}".format(r))
+    unsafe:
+        let xs = json.loads("[]")
+        let lst = json.loads("[1, 2]")
+        let f = json.loads("1.5")
+    try:
+        print("S2", xs.pop())
+    except IndexError as e:
+        print("S2", "IndexError", e)
+    try:
+        print("S3", lst[f])
+    except TypeError as e:
+        print("S3", "TypeError", e)
+    try:
+        print("S4", "é".encode("ascii"))
+    except UnicodeEncodeError as e:
+        print("S4", "UnicodeEncodeError", e)
+    try:
+        print("S5", round(float("nan")))
+    except ValueError as e:
+        print("S5", "ValueError", e)
+    try:
+        print("S6", round(float("inf")))
+    except OverflowError as e:
+        print("S6", "OverflowError", e)
+    try:
+        {"a": 1}.pop("k")
+    except KeyError as e:
+        print("S7", e, repr(e), e.args)
+    try:
+        {1}.remove(2)
+    except KeyError as e:
+        print("S8", e, repr(e), e.args)
+    try:
+        {"a": 1}["k"]
+    except KeyError as e:
+        print("S9", e, e.args[0] == "k", repr(e.args[0]))
+    print("S10", str(ValueError()), str(StopIteration()), str(AssertionError()), repr(str(KeyError())), str(Exception()), str(RuntimeError()), str(TypeError()) == "")
+    try:
+        int("x1")
+    except ValueError as e:
+        print("S11", e)
+    try:
+        [1, 2].index(9)
+    except ValueError as e:
+        print("S12", e)
+    try:
+        {}.pop("z")
+    except KeyError as e:
+        print("S13", e)
+    try:
+        max([])
+    except ValueError as e:
+        print("S14", e)
+    try:
+        int(float("nan"))
+    except ValueError as e:
+        print("S15", e)
+    try:
+        int(float("inf"))
+    except OverflowError as e:
+        print("S16", e)
+    try:
+        print("S17", (1).__class__.__name__ if False else "skip", "abc".__len__() if False else "skip")
+    except AttributeError as e:
+        print("S17", e)
+
+main()

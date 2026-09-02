@@ -1,0 +1,41 @@
+import datetime
+import logging
+import pathlib
+from typing import Iterator
+
+logger: logging.Logger = logging.getLogger("t")
+REGISTRY: list[int] = []
+
+plain class Counter:
+    n: int = 0
+
+@pure
+def stamp() -> str:
+    return datetime.datetime.now().isoformat()
+
+@pure
+def register(x: int) -> int:
+    REGISTRY.append(x)
+    return len(REGISTRY)
+
+@pure
+def take(it: Iterator[int]) -> int:
+    return next(it)
+
+@pure
+def read(p: str) -> str:
+    return pathlib.Path(p).read_text()
+
+@pure
+def log_it(x: int) -> int:
+    logger.warning("x=%d", x)
+    return x
+
+@pure
+def bump(c: Counter) -> int:
+    c.n = c.n + 1
+    return c.n
+
+@pure
+def today() -> str:
+    return datetime.date.today().isoformat()

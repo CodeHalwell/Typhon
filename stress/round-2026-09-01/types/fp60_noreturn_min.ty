@@ -1,0 +1,17 @@
+import sys
+from typing import NoReturn
+
+def usage() -> NoReturn:
+    print("usage: prog FILE")
+    sys.exit(2)
+
+def parse(args: list[str]) -> str:
+    if len(args) > 1:
+        return args[1]
+    usage()
+
+def main() -> None:
+    print(parse(["p", "f"]))
+
+if __name__ == "__main__":
+    main()

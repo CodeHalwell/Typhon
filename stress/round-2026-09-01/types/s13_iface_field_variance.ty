@@ -1,0 +1,24 @@
+class Animal:
+    name: str
+class Dog(Animal):
+    breed: str
+class Cat(Animal):
+    lives: int
+
+interface HasAnimals:
+    animals: list[Animal]
+
+class Kennel:
+    animals: list[Dog]
+
+def add_cat(h: HasAnimals) -> None:
+    h.animals.append(Cat(name="c", lives=9))
+
+def main() -> None:
+    let k: Kennel = Kennel(animals=[Dog(name="d", breed="b")])
+    add_cat(k)
+    for d in k.animals:
+        print(d.breed.upper())
+
+if __name__ == "__main__":
+    main()

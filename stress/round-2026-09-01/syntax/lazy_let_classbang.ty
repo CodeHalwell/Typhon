@@ -1,0 +1,22 @@
+class Base:
+    pass
+
+mut CALLS: int = 0
+
+def compute() -> int:
+    global CALLS
+    CALLS += 1
+    return 42
+
+class! Holder(Base):
+    name: str
+    lazy let value: int = compute()
+
+def main() -> None:
+    print("calls before construct:", CALLS)
+    let h: Holder = Holder(name="x")
+    print("calls after construct:", CALLS)
+    print(h.value, "calls after access:", CALLS)
+
+if __name__ == "__main__":
+    main()

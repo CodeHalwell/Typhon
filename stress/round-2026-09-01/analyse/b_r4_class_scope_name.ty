@@ -1,0 +1,7 @@
+plain class Registry:
+    LIMIT: int = 10
+
+    def check(self, n: int) -> bool:
+        return n < LIMIT
+
+print(Registry().check(3))

@@ -1,0 +1,10 @@
+def parse(s: str) -> Result[int, str]:
+    return Ok(int(s))
+
+
+def twice(s: str) -> Result[int, str]:
+    let n: int = parse(s)?
+    return Ok(n * 2)
+
+
+let z: int = "oops"

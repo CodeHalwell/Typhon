@@ -1,0 +1,7 @@
+def main() -> None:
+    let a: list[int] = [9]
+    let b: list[int] = [1, 2]
+    let c: bool = False
+    print([*(a if c else b)], (*(a if c else b),), {*(a if c else b)})
+
+main()

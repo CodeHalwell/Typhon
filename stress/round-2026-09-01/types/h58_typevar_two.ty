@@ -1,0 +1,14 @@
+def push[T](x: T, xs: list[T]) -> None:
+    xs.append(x)
+
+def push2[T](xs: list[T], x: T) -> None:
+    xs.append(x)
+
+def main() -> None:
+    let ints: list[int] = [1]
+    push("s", ints)
+    push2(ints, "t")
+    print(ints[1] + 1)
+
+if __name__ == "__main__":
+    main()

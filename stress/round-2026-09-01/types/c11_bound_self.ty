@@ -1,0 +1,8 @@
+def f[T: T](x: T) -> T:
+    return x
+
+def g[T: list[T]](x: T) -> T:
+    return x
+
+def main() -> None:
+    print(f(1), g([1]))

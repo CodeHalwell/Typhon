@@ -1,0 +1,13 @@
+class A:
+    x: int
+class B(A):
+    x: str
+
+def f(a: A) -> int:
+    return a.x + 1
+
+def main() -> None:
+    print(f(B(x="s")))
+
+if __name__ == "__main__":
+    main()

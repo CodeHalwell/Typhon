@@ -1,0 +1,12 @@
+def lookup() -> dict[str, Result[int, str]]:
+    return {"a": Ok(1)}
+
+def run() -> Result[int, str]:
+    let results: dict[str, Result[int, str]] = lookup()
+    return Ok(results["a"]? + 1)
+
+def main() -> None:
+    print(run())
+
+if __name__ == "__main__":
+    main()

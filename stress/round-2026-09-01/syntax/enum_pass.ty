@@ -1,0 +1,8 @@
+enum Empty:
+    pass
+
+def main() -> None:
+    print(len(list(Empty)))
+
+if __name__ == "__main__":
+    main()

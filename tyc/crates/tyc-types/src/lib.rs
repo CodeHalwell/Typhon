@@ -810,6 +810,26 @@ fn is_dynamic_type(t: &Type) -> bool {
 /// asyncio entry-points that accept coroutines as direct arguments.
 /// Used by the `missing_await` check (FINDINGS #49) to suppress
 /// false positives on the canonical `asyncio.run(coro())` pattern.
+/// Whether the callee of `call` is a known `async def`: a module-level async
+/// function called by bare name, or an `async def` method called on a
+/// receiver whose class shape is known.
+fn callee_is_async(c: &Checker, call: &ruff_python_ast::ExprCall) -> bool {
+    match call.func.as_ref() {
+        Expr::Name(n) => c.async_functions.contains(n.id.as_str()),
+        Expr::Attribute(a) => {
+            let recv = infer_expr_readonly(c, &a.value);
+            let class_name = match recv.strip_none() {
+                Type::Class(name) => name,
+                Type::Generic(name, _) => name,
+                _ => return false,
+            };
+            c.find_method(&class_name, a.attr.as_str())
+                .is_some_and(|sig| sig.is_async)
+        }
+        _ => false,
+    }
+}
+
 fn call_targets_coro_acceptor(call: &ruff_python_ast::ExprCall) -> bool {
     let Expr::Attribute(a) = call.func.as_ref() else {
         return false;
@@ -1809,6 +1829,15 @@ pub fn type_from_annotation_with_params(
             Expr::Name(n) => Type::Class(format!("{}.{}", n.id.as_str(), a.attr.as_str())),
             _ => Type::Unknown,
         },
+        // `isinstance(x, (int, str))` — a tuple of classes is the union of
+        // its members. (No annotation is a tuple, so this arm only serves
+        // the narrowing helpers.)
+        Expr::Tuple(t) => Type::union_of(
+            t.elts
+                .iter()
+                .map(|e| type_from_annotation_with_params(e, classes, type_params))
+                .collect(),
+        ),
         _ => Type::Unknown,
     }
 }
@@ -12683,6 +12712,9 @@ fn check_function(
     if !name.starts_with("__typhon_")
         && returns.is_some()
         && return_type_requires_value(&ret_type)
+        // A `-> NoReturn` body never returns a value by definition; the
+        // contract is that it always raises or exits.
+        && !is_noreturn_type(&ret_type)
         && !body_has_yield(body)
         && !body_is_stub(body)
         && !body_always_exits_aware(c, body)
@@ -13656,9 +13688,60 @@ fn body_always_exits_aware(c: &Checker, stmts: &[Stmt]) -> bool {
     stmts.last().is_some_and(|s| stmt_always_exits_aware(c, s))
 }
 
+/// A call that never returns: `sys.exit(...)`, `exit()`, `quit()`,
+/// `os._exit(...)`, `os.abort()`, or a project function declared
+/// `-> NoReturn` / `-> Never`.
+fn call_never_returns(c: &Checker, expr: &Expr) -> bool {
+    let Expr::Call(call) = expr else {
+        return false;
+    };
+    match call.func.as_ref() {
+        Expr::Name(n) => {
+            let name = n.id.as_str();
+            if matches!(name, "exit" | "quit") {
+                return true;
+            }
+            matches!(
+                c.function_signatures.get(name),
+                Some(Type::Function { ret, .. }) if is_noreturn_type(ret)
+            )
+        }
+        Expr::Attribute(a) => {
+            let module = match a.value.as_ref() {
+                Expr::Name(m) => m.id.as_str(),
+                _ => return false,
+            };
+            matches!(
+                (module, a.attr.as_str()),
+                ("sys", "exit") | ("os", "_exit") | ("os", "abort")
+            )
+        }
+        _ => false,
+    }
+}
+
+/// `NoReturn` / `Never` (bare or `typing.`-qualified) as a return type.
+fn is_noreturn_type(t: &Type) -> bool {
+    matches!(
+        t,
+        Type::Class(name) if matches!(
+            name.as_str(),
+            "NoReturn" | "Never" | "typing.NoReturn" | "typing.Never"
+        )
+    )
+}
+
 fn stmt_always_exits_aware(c: &Checker, stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Return(_) | Stmt::Raise(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
+        // A call to something that never returns ends the path as surely as
+        // `raise`: `usage()` declared `-> NoReturn`, or `sys.exit(2)`.
+        Stmt::Expr(e) => call_never_returns(c, &e.value),
+        // `assert False` always raises.
+        Stmt::Assert(a) => matches!(
+            a.test.as_ref(),
+            Expr::BooleanLiteral(lit) if !lit.value
+        ),
         Stmt::If(s) => {
             // `if True:` (constant-True test) is unconditional flow —
             // the body always runs, so it exits iff the body exits. The
@@ -15482,6 +15565,73 @@ fn extract_generator_return_type(typ: &Type) -> Option<Type> {
 /// checker tracks them as the async function's declared return type,
 /// not as `Awaitable[T]`), so this path is the typed-callable hole that
 /// R3-1 documents.
+/// Report a possibly-`None` operand of an arithmetic or ordering operator.
+///
+/// A bare name reports as `tyc::nullable_use` at error level (the value can
+/// be narrowed with `if x is not None:`). An attribute path (`self.count + 1`)
+/// goes through the warn-level attribute-rooted form added in alpha.7, since
+/// a field can be populated in practice without the checker seeing it.
+/// Any other shape — `d.get(k) + 1`, `xs[0] * 2`, `find(x) < 3` — is the
+/// classic unguarded-`None` bug and reports at error level under a display
+/// name derived from the expression.
+fn report_nullable_operand(c: &mut Checker, expr: &Expr, ty: &Type) {
+    if c.unsafe_depth > 0 {
+        return;
+    }
+    let span = (
+        expr.range().start().to_usize(),
+        expr.range().end().to_usize(),
+    );
+    match expr {
+        Expr::Name(n) => {
+            let span = (
+                n.range.start().to_usize(),
+                n.range.start().to_usize() + n.id.as_str().len(),
+            );
+            c.nullable_use(n.id.as_str(), ty, span);
+        }
+        Expr::Attribute(_) => {
+            if let Some(path) = attr_path_of(expr) {
+                c.nullable_attr_use(&path, ty, span);
+            }
+        }
+        other => {
+            let display = match other {
+                Expr::Call(call) => match call.func.as_ref() {
+                    Expr::Attribute(a) => format!("{}(...)", a.attr.as_str()),
+                    Expr::Name(n) => format!("{}(...)", n.id.as_str()),
+                    _ => "the call result".to_owned(),
+                },
+                Expr::Subscript(sub) => match sub.value.as_ref() {
+                    Expr::Name(n) => format!("{}[...]", n.id.as_str()),
+                    _ => "the subscript".to_owned(),
+                },
+                _ => "the expression".to_owned(),
+            };
+            c.nullable_use(&display, ty, span);
+        }
+    }
+}
+
+/// The element type a freshly-built container adopts: the annotated element
+/// type when the inferred one is assignable to it (and neither side is
+/// unknown or a free type parameter), otherwise the inferred type — which then
+/// surfaces the genuine mismatch at the assignment.
+fn widen_fresh_element(c: &Checker, inferred: Type, expected: Option<&Type>) -> Type {
+    match expected {
+        Some(exp)
+            if !matches!(exp, Type::Unknown | Type::Any)
+                && !matches!(inferred, Type::Unknown)
+                && !mentions_type_param(exp)
+                && exp != &inferred
+                && c.is_assignable(exp, &inferred) =>
+        {
+            exp.clone()
+        }
+        _ => inferred,
+    }
+}
+
 fn unwrap_awaitable(typ: &Type, user_classes: &[String]) -> Option<Type> {
     let Type::Generic(name, args) = typ else {
         return None;
@@ -15518,6 +15668,15 @@ fn refine_isinstance_target(current: &Type, narrowed_to: &Type) -> Type {
 }
 
 fn strip_variant(typ: &Type, variant: &Type) -> Type {
+    // A union variant (`isinstance(x, (A, B))` on the negative branch)
+    // removes each of its members.
+    if let Type::Union(members) = variant {
+        let mut out = typ.clone();
+        for m in members {
+            out = strip_variant(&out, m);
+        }
+        return out;
+    }
     if let Type::Union(xs) = typ {
         let kept: Vec<Type> = xs.iter().filter(|t| *t != variant).cloned().collect();
         Type::union_of(kept)
@@ -15968,13 +16127,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             // `if x is not None:`.
             for (side, ty) in [(b.left.as_ref(), &l), (b.right.as_ref(), &r)] {
                 if ty.is_nullable() {
-                    if let Expr::Name(n) = side {
-                        let span = (
-                            n.range.start().to_usize(),
-                            n.range.start().to_usize() + n.id.as_str().len(),
-                        );
-                        c.nullable_use(n.id.as_str(), ty, span);
-                    }
+                    report_nullable_operand(c, side, ty);
                 }
             }
             let l_stripped = l.strip_none();
@@ -16178,7 +16331,40 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             }
         }
         Expr::BoolOp(b) => infer_bool_op(c, b),
-        Expr::Compare(_) => Type::Bool,
+        Expr::Compare(cmp) => {
+            // Operands are inferred (so their own diagnostics fire) and an
+            // ordering comparison (`<`, `<=`, `>`, `>=`) or membership test
+            // on a possibly-`None` operand is reported: CPython raises
+            // `TypeError: '<' not supported between 'NoneType' and 'int'`.
+            // Equality and identity (`==`, `!=`, `is`, `is not`) accept
+            // `None` on either side and are left alone.
+            let left_ty = infer_expr(c, &cmp.left);
+            let mut operand_tys: Vec<(&Expr, Type)> = vec![(cmp.left.as_ref(), left_ty)];
+            for comparator in cmp.comparators.iter() {
+                let ty = infer_expr(c, comparator);
+                operand_tys.push((comparator, ty));
+            }
+            for (i, op) in cmp.ops.iter().enumerate() {
+                let ordering = matches!(
+                    op,
+                    ruff_python_ast::CmpOp::Lt
+                        | ruff_python_ast::CmpOp::LtE
+                        | ruff_python_ast::CmpOp::Gt
+                        | ruff_python_ast::CmpOp::GtE
+                );
+                if !ordering {
+                    continue;
+                }
+                for idx in [i, i + 1] {
+                    if let Some((expr, ty)) = operand_tys.get(idx) {
+                        if ty.is_nullable() {
+                            report_nullable_operand(c, expr, ty);
+                        }
+                    }
+                }
+            }
+            Type::Bool
+        }
         Expr::UnaryOp(u) => {
             let operand = infer_expr(c, &u.operand);
             match u.op {
@@ -16893,6 +17079,21 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                                 }
                             }
                         }
+                    }
+                    // Calling an `async def` without `await` yields a coroutine,
+                    // not the declared return type — `let s: str = fetch(3)`
+                    // used to type-check and then crash on `s.upper()`. Wrap
+                    // the result unless this call is the operand of `await`
+                    // (or an argument to a coroutine-accepting API such as
+                    // `asyncio.gather`, which bumps the same counter). In a
+                    // *sync* function the bare call is already reported as
+                    // `tyc::missing_await`; the wrapper is what keeps the
+                    // value from masquerading as `T` in an async one.
+                    if c.inside_await == 0
+                        && !matches!(result, Type::Unknown | Type::Any)
+                        && callee_is_async(c, call)
+                    {
+                        return Type::Generic("Coroutine".into(), vec![result]);
                     }
                     result
                 }
@@ -18008,6 +18209,12 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
             c.env.leave();
             c.env.restore_scope_narrowings(comp_saved);
+            // A comprehension builds a *fresh* list, so — like a list literal —
+            // it takes the annotated element type whenever every element fits
+            // it: `let xs: list[object] = [a.name for a in agents]` is sound
+            // (nothing else aliases the new list), and rejecting it on
+            // invariance was a false positive the literal form never had.
+            let elt = widen_fresh_element(c, elt, elt_expected.as_ref());
             Type::Generic("list".into(), vec![elt])
         }
         Expr::SetComp(comp) => {
@@ -18021,6 +18228,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
             c.env.leave();
             c.env.restore_scope_narrowings(comp_saved);
+            let elt = widen_fresh_element(c, elt, elt_expected.as_ref());
             Type::Generic("set".into(), vec![elt])
         }
         Expr::Generator(comp) => {
@@ -21241,6 +21449,197 @@ def f(x: int | None) -> int:
 ";
         let d = check(src);
         assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    /// An un-awaited call to an `async def` inside another `async def` is a
+    /// coroutine, not the declared return type: `let s: str = fetch(3)`
+    /// type-checked and then crashed on `s.upper()` under both surfaces.
+    #[test]
+    fn unawaited_async_call_is_a_coroutine_not_its_return_type() {
+        let src = "\
+import asyncio
+
+async def fetch(x: int) -> str:
+    await asyncio.sleep(0)
+    return str(x)
+
+async def run() -> None:
+    let u: str = fetch(3)
+    print(u)
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "a coroutine bound to `str` must be a type mismatch: {d:?}"
+        );
+        // The awaited forms — direct, stored-then-awaited, and passed to a
+        // coroutine-accepting API — are untouched.
+        let ok = "\
+import asyncio
+
+async def fetch(x: int) -> str:
+    await asyncio.sleep(0)
+    return str(x)
+
+async def run() -> None:
+    let a: str = await fetch(1)
+    let pending = fetch(2)
+    let b: str = await pending
+    let both = await asyncio.gather(fetch(3), fetch(4))
+    print(a, b, both)
+";
+        let d = check(ok);
+        assert!(!d.has_errors(), "awaited forms must stay clean: {d:?}");
+    }
+
+    /// The nullable-operand check was gated on a bare `Name`, so the single
+    /// most common unguarded-`None` shape — `d.get(k) + 1` — and every
+    /// ordering comparison passed silently. Now every arithmetic operand
+    /// shape and the operands of `<`/`<=`/`>`/`>=` are reported; equality and
+    /// identity still accept `None`.
+    #[test]
+    fn nullable_operands_of_any_shape_are_reported() {
+        let src = "\
+def lookup(k: str) -> int | None:
+    return None if k == \"\" else 1
+
+def main() -> None:
+    let counts: dict[str, int] = {\"a\": 1}
+    let total: int = counts.get(\"b\") + 1
+    let ordered: bool = lookup(\"x\") < 3
+    let xs: list[int | None] = [1, None]
+    let doubled: int = xs[0] * 2
+    print(total, ordered, doubled)
+";
+        let d = check(src);
+        let n = d
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::NullableUse { .. }))
+            .count();
+        assert_eq!(n, 3, "three nullable operands expected: {d:?}");
+        let fine = "\
+def lookup(k: str) -> int | None:
+    return None if k == \"\" else 1
+
+def main() -> None:
+    let eq: bool = lookup(\"x\") == 1
+    let ident: bool = lookup(\"x\") is None
+    print(eq, ident)
+";
+        let d = check(fine);
+        assert!(!d.has_errors(), "equality / identity accept None: {d:?}");
+    }
+
+    /// `sys.exit(...)` and a call to a `-> NoReturn` function end a path as
+    /// surely as `raise`; neither the caller nor the `NoReturn` body itself
+    /// is missing a return.
+    #[test]
+    fn noreturn_calls_and_sys_exit_are_definite_exits() {
+        let src = "\
+import sys
+from typing import NoReturn
+
+def usage() -> NoReturn:
+    print(\"usage: prog FILE\")
+    sys.exit(2)
+
+def parse(args: list[str]) -> str:
+    if len(args) > 1:
+        return args[1]
+    usage()
+
+def other(flag: bool) -> int:
+    if flag:
+        return 1
+    sys.exit(3)
+
+def asserted(flag: bool) -> int:
+    if flag:
+        return 1
+    assert False
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "no missing_return expected: {d:?}");
+    }
+
+    /// A comprehension builds a fresh container, so it adopts the annotated
+    /// element type when every element fits it — the list-literal form
+    /// always did, and rejecting `[a.name for a in agents]` against
+    /// `list[object]` on invariance was a false positive.
+    #[test]
+    fn fresh_comprehension_adopts_the_annotated_element_type() {
+        let src = "\
+class Agent:
+    name: str
+
+def names(agents: list[Agent]) -> None:
+    let t1: list[object] = [a.name for a in agents]
+    let t2: list[object] = [a for a in agents]
+    let t3: set[float] = {n for n in [1, 2]}
+    print(t1, t2, t3)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "widening to the annotated element type: {d:?}"
+        );
+        // A genuinely wrong element type is still a mismatch.
+        let bad = "\
+def names(xs: list[str]) -> None:
+    let t: list[int] = [x for x in xs]
+    print(t)
+";
+        assert!(
+            check(bad).has_errors(),
+            "list[str] elements into list[int] must fail"
+        );
+    }
+
+    /// `isinstance(x, (A, B))` narrows to `A | B` on the positive branch and
+    /// removes both members on the negative one.
+    #[test]
+    fn isinstance_with_a_tuple_of_classes_narrows_both_branches() {
+        let src = "\
+def f(x: int | str | list[int]) -> int:
+    if isinstance(x, (int, str)):
+        return len(str(x))
+    return x[0]
+
+def g(x: str | bytes | int) -> str:
+    if isinstance(x, (str, bytes)):
+        return \"sb\"
+    return str(x + 1)
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "tuple isinstance must narrow: {d:?}");
+        // The positive branch is `int | str`, not `int`: a method only `int`
+        // has must be rejected there. (Attribute access is checked per union
+        // member; subscripting a union is not, so `x[0]` would prove nothing.)
+        let positive_is_the_union = "\
+def f(x: int | str | list[int]) -> int:
+    if isinstance(x, (int, str)):
+        return x.bit_length()
+    return x[0]
+";
+        assert!(
+            check(positive_is_the_union).has_errors(),
+            "str has no bit_length, so the positive branch must still be int | str"
+        );
+        // The negative branch is `list[int]` — neither the original union nor
+        // Unknown — so a `str` method must be rejected there.
+        let negative_is_the_remainder = "\
+def f(x: int | str | list[int]) -> int:
+    if isinstance(x, (int, str)):
+        return len(str(x))
+    return len(x.upper())
+";
+        assert!(
+            check(negative_is_the_remainder).has_errors(),
+            "list[int] has no upper, so the negative branch must be the remainder"
+        );
     }
 
     #[test]

@@ -1,0 +1,11 @@
+import json
+
+def main() -> None:
+    let data = json.loads("[1, 2, 3]")
+    mut total: int = 0
+    for x in data as! list[int]:
+        total += x
+    print(total)
+
+if __name__ == "__main__":
+    main()

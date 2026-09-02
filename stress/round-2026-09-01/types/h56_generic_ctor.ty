@@ -1,0 +1,12 @@
+class Box[T]:
+    value: T
+
+def main() -> None:
+    let b: Box[int] = Box(value="s")
+    print(b.value + 1)
+    let c = Box(value="s")
+    let n: int = c.value
+    print(n + 1)
+
+if __name__ == "__main__":
+    main()

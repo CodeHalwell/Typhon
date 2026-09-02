@@ -1,0 +1,7 @@
+def f(xs: list[int]) -> int:
+    let last: int
+    for x in xs:
+        last = x
+    return last
+
+print(f([]))

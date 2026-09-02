@@ -1,0 +1,6 @@
+def main() -> None:
+    let s: str = "a\n\x00b"
+    let t: str = "x\x00y"
+    print(len(s), repr(s), len(t), repr(t))
+
+main()

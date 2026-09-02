@@ -1,0 +1,10 @@
+print("Z1", list(zip([1, 2], "ab", strict=True)))
+print("Z2", list(zip([1, 2, 3], "ab")))
+print("Z3", list(zip([1])))
+print("Z4", list(zip(*[(1, 2), (3, 4)])))
+print("Z5", dict(zip("ab", range(2))))
+try:
+    list(zip([1, 2], "abc", strict=True))
+except ValueError as e:
+    print("Z6", e)
+print("Z7", list(zip()))

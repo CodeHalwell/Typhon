@@ -1,0 +1,14 @@
+interface Functor[F]:
+    def fmap(self, f: F) -> Functor[F]
+
+class Box[T]:
+    v: T
+impl[T] Box[T]:
+    def fmap(self, f: T) -> Box[T]:
+        return self
+
+def g(x: Functor[int]) -> int:
+    return 1
+
+def main() -> None:
+    print(g(Box(v=1)))

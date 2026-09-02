@@ -1,0 +1,44 @@
+def parse(s: str) -> Result[int, str]:
+    if s.isdigit():
+        return Ok(int(s))
+    return Err(f"bad: {s}")
+
+def a(s: str, t: str) -> Result[int, str]:
+    return Ok(parse(s)? + parse(t)?)
+
+def w(xs: list[str]) -> Result[int, str]:
+    mut i: int = 0
+    mut total: int = 0
+    while parse(xs[i])? < 3:
+        total += parse(xs[i])?
+        i += 1
+    return Ok(total)
+
+def attr(s: str) -> Result[int, str]:
+    return Ok(parse(s)?.bit_length())
+
+def fstr(s: str) -> Result[str, str]:
+    return Ok(f"v={parse(s)?}")
+
+def neg(s: str) -> Result[int, str]:
+    return Ok(-parse(s)?)
+
+def nested(s: str) -> Result[int, str]:
+    return Ok(parse(str(parse(s)?))?)
+
+def cond(s: str) -> Result[str, str]:
+    if parse(s)? > 5:
+        return Ok("big")
+    elif parse(s)? > 2:
+        return Ok("mid")
+    return Ok("small")
+
+def sub(s: str) -> Result[int, str]:
+    let xs: list[int] = [10, 20, 30]
+    return Ok(xs[parse(s)?] * 2)
+
+def main() -> None:
+    print(a("1", "2"), a("x", "2"), w(["1", "2", "5"]), w(["1", "x"]))
+    print(attr("8"), fstr("4"), fstr("y"), neg("3"), nested("5"), cond("9"), cond("3"), cond("x"), sub("1"))
+
+main()

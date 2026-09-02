@@ -1,0 +1,19 @@
+class MyErr:
+    code: int
+
+def g() -> Result[int, str]:
+    return Err("bad")
+
+def f() -> Result[int, MyErr]:
+    let v: int = g()?
+    return Ok(v)
+
+def main() -> None:
+    match f():
+        case Ok(v):
+            print(v)
+        case Err(e):
+            print(e.code + 1)
+
+if __name__ == "__main__":
+    main()

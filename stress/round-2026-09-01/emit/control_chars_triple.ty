@@ -1,0 +1,5 @@
+def main() -> None:
+    let s: str = "a\n\x0b\x0c\x1c\x1d\x1e\x85  \x7f\x01b"
+    print(len(s), [hex(ord(c)) for c in s])
+
+main()

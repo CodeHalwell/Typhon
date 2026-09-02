@@ -1,0 +1,8 @@
+def f(s: str?) -> int:
+    return int(s)
+
+def main() -> None:
+    print(f(None))
+
+if __name__ == "__main__":
+    main()

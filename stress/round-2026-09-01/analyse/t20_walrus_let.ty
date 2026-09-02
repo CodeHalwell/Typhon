@@ -1,0 +1,5 @@
+def f() -> int:
+    let n: int = 1
+    if (n := 2) > 0:
+        return n
+    return 0

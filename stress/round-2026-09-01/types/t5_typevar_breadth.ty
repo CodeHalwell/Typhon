@@ -1,0 +1,17 @@
+def f[T: int](x: T) -> str:
+    return x.upper()
+
+def g[T](x: T) -> None:
+    let y: int = x
+    print(y + 1)
+
+def h[T](x: T) -> list[T]:
+    return [1, 2]
+
+def main() -> None:
+    g("s")
+    let names: list[str] = h("a")
+    print(names[0].upper())
+
+if __name__ == "__main__":
+    main()

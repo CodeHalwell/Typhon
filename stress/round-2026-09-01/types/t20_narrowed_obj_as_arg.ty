@@ -1,0 +1,17 @@
+class Box:
+    val: int?
+
+def reset(b: Box) -> None:
+    b.val = None
+
+def f(b: Box) -> int:
+    if b.val is None:
+        return 0
+    reset(b)
+    return b.val + 1
+
+def main() -> None:
+    print(f(Box(val=1)))
+
+if __name__ == "__main__":
+    main()

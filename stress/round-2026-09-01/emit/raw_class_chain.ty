@@ -1,0 +1,23 @@
+from typing import ClassVar
+
+plain class Base:
+    pass
+
+impl Base:
+    def __init__(self) -> None:
+        print("base init")
+
+class! Child(Base):
+    tag: ClassVar[str] = "child"
+    a: int
+    b: int = 2
+
+class! Grand(Child):
+    c: str
+
+def main() -> None:
+    let ch: Child = Child(1)
+    let g: Grand = Grand(1, "x")
+    print(ch.a, ch.b, g.a, g.b, g.c, Grand.tag, Child.tag)
+
+main()

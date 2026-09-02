@@ -1,0 +1,13 @@
+class Box:
+    val: int?
+
+def f(b: Box?) -> int:
+    if b is not None and b.val is not None:
+        return b.val + 1
+    return 0
+
+def main() -> None:
+    print(f(Box(val=1)))
+
+if __name__ == "__main__":
+    main()

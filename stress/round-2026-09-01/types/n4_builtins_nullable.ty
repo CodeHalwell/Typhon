@@ -1,0 +1,17 @@
+def f(x: int?, xs: list[int]?, s: str?, fl: float?) -> None:
+    print(float(s))
+    print(abs(x))
+    print(sorted(xs))
+    print(list(xs))
+    print(sum(xs))
+    print(max(xs))
+    print(round(fl))
+    print(list(range(x)))
+    print(list(enumerate(xs)))
+    print(str(x), bool(x), repr(x))
+
+def main() -> None:
+    f(None, None, None, None)
+
+if __name__ == "__main__":
+    main()

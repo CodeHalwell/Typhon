@@ -1,0 +1,5 @@
+def f() -> int:
+    let x: int = 1
+    x -= 1
+    x *= 7
+    return x

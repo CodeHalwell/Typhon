@@ -1,0 +1,25 @@
+import asyncio
+import json
+
+freeze let CFG = {"a": [1, 2], "b": {"c": {3}}}
+
+lazy let BIG: int = 41 + 1
+
+async def work() -> int:
+    await asyncio.sleep(0)
+    return 1
+
+async def amain() -> None:
+    go work() -> t
+    let r: int = await t
+    print(r)
+
+def parse(s: str) -> Result[int, str]:
+    return Ok(int(s))
+
+def main() -> None:
+    let d = json.loads('{"k": 1}') as! dict[str, int]
+    print(d, CFG, BIG, parse("1"))
+    asyncio.run(amain())
+
+main()

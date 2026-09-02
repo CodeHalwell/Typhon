@@ -1,0 +1,10 @@
+class P:
+    x: int
+
+class C:
+    p: P = P(x=1)
+
+def main() -> None:
+    print(C())
+
+main()

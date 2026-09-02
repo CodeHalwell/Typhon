@@ -1,0 +1,6 @@
+def f(c: bool) -> int:
+    if c:
+        let x: int = 1
+    return x
+
+print(f(False))

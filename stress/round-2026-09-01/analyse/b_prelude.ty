@@ -1,0 +1,38 @@
+from typing import Callable
+
+def a() -> None:
+    print("functools", functools.reduce(lambda x, y: x + y, [1, 2]))
+
+def b() -> None:
+    print("dataclasses", dataclasses.is_dataclass(1))
+
+def c() -> None:
+    print("enum", enum.auto)
+
+def d() -> None:
+    print("BaseModel", BaseModel)
+
+def e() -> None:
+    print("NewType", NewType)
+
+def f() -> None:
+    print("typhon_runtime", typhon_runtime)
+
+def g() -> None:
+    print("runtime_checkable", runtime_checkable)
+
+def h() -> None:
+    print("dataclass", dataclass)
+
+def i() -> None:
+    print("env", env("HOME", "x"))
+
+def main() -> None:
+    let fns: list[Callable[[], None]] = [a, b, c, d, e, f, g, h, i]
+    for fn in fns:
+        try:
+            fn()
+        except NameError as err:
+            print("NameError:", err)
+
+main()

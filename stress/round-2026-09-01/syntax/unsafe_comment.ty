@@ -1,0 +1,13 @@
+import json
+
+def load(s: str) -> int:
+    unsafe:  # boundary: json returns Any
+        let v = json.loads(s)
+        let n: int = int(v)
+    return n
+
+def main() -> None:
+    print(load("5"))
+
+if __name__ == "__main__":
+    main()

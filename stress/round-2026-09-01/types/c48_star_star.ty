@@ -1,0 +1,9 @@
+def f(xs: list[int]) -> int:
+    match xs:
+        case [*a, *b]:
+            return 1
+        case _:
+            return 0
+
+def main() -> None:
+    print(f([1]))

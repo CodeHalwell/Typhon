@@ -1,0 +1,15 @@
+from collections.abc import Generator
+
+def gen() -> Generator[int, int, None]:
+    let pair: tuple[int, int] = ((yield 1), 2)
+    print(pair)
+
+def main() -> None:
+    let g: Generator[int, int, None] = gen()
+    next(g)
+    try:
+        g.send(7)
+    except StopIteration:
+        pass
+
+main()

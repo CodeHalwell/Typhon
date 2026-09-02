@@ -1,0 +1,19 @@
+class Circle:
+    r: float
+class Square:
+    s: float
+type Shape = Circle | Square
+
+def area(s: Shape) -> float:
+    match s:
+        case Circle(r) if r > 0:
+            return 3.14 * r * r
+        case Square(s):
+            return s * s
+
+def main() -> None:
+    let a: float = area(Circle(r=-1.0))
+    print(a + 1.0)
+
+if __name__ == "__main__":
+    main()

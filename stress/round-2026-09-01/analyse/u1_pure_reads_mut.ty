@@ -1,0 +1,13 @@
+mut COUNTER: int = 0
+
+@pure
+def offset(x: int) -> int:
+    return x + COUNTER
+
+def tick() -> None:
+    global COUNTER
+    COUNTER += 1
+
+print(offset(1))
+tick()
+print(offset(1))

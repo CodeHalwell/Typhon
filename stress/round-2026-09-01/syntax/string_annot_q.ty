@@ -1,0 +1,10 @@
+class Node:
+    value: int
+    next: "Node?" = None
+
+def main() -> None:
+    let n: Node = Node(value=1)
+    print(n.value, n.next)
+
+if __name__ == "__main__":
+    main()

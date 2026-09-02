@@ -1,0 +1,16 @@
+def f() -> Result[int, str]:
+    return Ok(1)
+
+def g(x: int) -> Result[int, str]:
+    return Ok(x + 1)
+
+def run() -> Result[int, str]:
+    with a = f()?:
+        with b = g(a)?:
+            return Ok(a + b)
+
+def main() -> None:
+    print(run())
+
+if __name__ == "__main__":
+    main()

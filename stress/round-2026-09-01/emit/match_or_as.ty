@@ -1,0 +1,14 @@
+class Circle:
+    r: float
+
+class Square:
+    s: float
+
+type Shape = Circle | Square
+
+def name(sh: Shape) -> str:
+    match sh:
+        case (Circle() as c) | (Square() as c):
+            return type(c).__name__
+
+print(name(Circle(r=1.0)), name(Square(s=2.0)))

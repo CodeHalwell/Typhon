@@ -1,0 +1,7 @@
+def main() -> None:
+    let x: float = 3.14159
+    let d: dict[str, int] = {"a-b": 1}
+    print(f"{f'{x:.2f}'}|{f'{d["a-b"]}'}|")
+    print(f"{x:.2f}")
+
+main()

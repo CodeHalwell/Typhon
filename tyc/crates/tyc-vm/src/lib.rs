@@ -219,6 +219,34 @@ pub fn run_source(
     match interp.run_module(&module) {
         Ok(()) => Ok(0),
         Err(Unwind::Return(_)) => Ok(0),
+        Err(Unwind::Exception(exc)) if exc.kind == "SystemExit" => {
+            // CPython: `SystemExit(None)` / no argument → 0; an int → that
+            // status; anything else is printed to stderr and the status is 1.
+            let code = match &exc.value {
+                Some(Value::Exception { args, .. }) => match args.first() {
+                    None | Some(Value::None) => 0,
+                    Some(Value::Int(i)) => {
+                        i.to_i64()
+                            .unwrap_or(1)
+                            .clamp(i32::MIN as i64, i32::MAX as i64) as i32
+                    }
+                    Some(Value::Bool(b)) => *b as i32,
+                    Some(other) => {
+                        eprintln!("{}", other.py_str());
+                        1
+                    }
+                },
+                _ => {
+                    if !exc.message.is_empty() {
+                        eprintln!("{}", exc.message);
+                        1
+                    } else {
+                        0
+                    }
+                }
+            };
+            Ok(code)
+        }
         Err(Unwind::Exception(exc)) => {
             eprintln!("Traceback (most recent call last):");
             // Frames accumulate innermost-first as the exception bubbles
@@ -1463,8 +1491,306 @@ def main() -> None:
     let d: dict[str, object] = u.model_dump()
     if d["name"] != "Ada":
         raise ValueError("model_dump wrong")
-    if u.model_dump_json() != "{\"id\": 1, \"name\": \"Ada\", \"active\": true}":
+    # pydantic serialises compactly — `,` and `:` with no spaces.
+    if u.model_dump_json() != "{\"id\":1,\"name\":\"Ada\",\"active\":true}":
         raise ValueError("model_dump_json wrong: " + u.model_dump_json())
+    # `str()` is pydantic's space-joined field list; `repr()` is the
+    # constructor form. Neither leaks the `model_config` class attribute.
+    if str(u) != "id=1 name='Ada' active=True":
+        raise ValueError("model str wrong: " + str(u))
+    if repr(u) != "User(id=1, name='Ada', active=True)":
+        raise ValueError("model repr wrong: " + repr(u))
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// `json.loads` decodes UTF-8 and `\uXXXX` escapes (surrogate pairs
+    /// included), accepts the non-finite constants CPython accepts, and
+    /// raises a `JSONDecodeError` carrying CPython's message and character
+    /// position — catchable both as `json.JSONDecodeError` and `ValueError`.
+    #[test]
+    fn json_loads_matches_cpython() {
+        let src = r#"
+import json
+
+def expect_error(doc: str, msg: str, pos: int, lineno: int, colno: int) -> None:
+    try:
+        json.loads(doc)
+    except json.JSONDecodeError as e:
+        if e.msg != msg or e.pos != pos or e.lineno != lineno or e.colno != colno:
+            raise ValueError(f"{doc!r}: got {e.msg!r} {e.pos} {e.lineno} {e.colno}")
+        if str(e) != f"{msg}: line {lineno} column {colno} (char {pos})":
+            raise ValueError("str(e) wrong: " + str(e))
+        return
+    raise ValueError(f"{doc!r} did not raise")
+
+def main() -> None:
+    if json.loads("\"h\u00e9llo \u2603\"") != "héllo ☃":
+        raise ValueError("utf-8 passthrough")
+    if json.loads("\"caf\\u00e9 \\ud83d\\ude00\"") != "café 😀":
+        raise ValueError("unicode escapes")
+    if json.loads("[1.0, 2.5e0, -0.0, 10000000000000000000000, 1e999]") != [1.0, 2.5, -0.0, 10000000000000000000000, float("inf")]:
+        raise ValueError("numbers")
+    let nan: list[float] = json.loads("[NaN, Infinity, -Infinity]")
+    if not (nan[0] != nan[0] and nan[1] == float("inf") and nan[2] == float("-inf")):
+        raise ValueError("constants")
+    if json.loads("{\"a\": [1, {\"b\": null}], \"c\": true}") != {"a": [1, {"b": None}], "c": True}:
+        raise ValueError("nested")
+    expect_error("x", "Expecting value", 0, 1, 1)
+    expect_error("", "Expecting value", 0, 1, 1)
+    expect_error("[1,", "Expecting value", 3, 1, 4)
+    expect_error("[1,]", "Illegal trailing comma before end of array", 2, 1, 3)
+    expect_error("{\"a\" 1}", "Expecting ':' delimiter", 5, 1, 6)
+    expect_error("{\"a\": 1,}", "Illegal trailing comma before end of object", 7, 1, 8)
+    expect_error("{\"a\":1 \"b\":2}", "Expecting ',' delimiter", 7, 1, 8)
+    expect_error("\"abc", "Unterminated string starting at", 0, 1, 1)
+    expect_error("[1] x", "Extra data", 4, 1, 5)
+    expect_error("{1: 2}", "Expecting property name enclosed in double quotes", 1, 1, 2)
+    expect_error("nul", "Expecting value", 0, 1, 1)
+    expect_error("\"a\\qb\"", "Invalid \\escape", 2, 1, 3)
+    expect_error("\"a\\u12G4\"", "Invalid \\uXXXX escape", 3, 1, 4)
+    expect_error("\"a\nb\"", "Invalid control character at", 2, 1, 3)
+    expect_error("  \n  [1, \n 2, }", "Expecting value", 14, 3, 5)
+    expect_error("01", "Extra data", 1, 1, 2)
+    expect_error("-", "Expecting value", 0, 1, 1)
+    # A JSONDecodeError is a ValueError.
+    try:
+        json.loads("{")
+    except ValueError:
+        pass
+    # ... and the qualified form matches by class identity.
+    try:
+        json.loads("[")
+    except (KeyError, json.JSONDecodeError):
+        pass
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// `json.dumps` honours `ensure_ascii` (on by default), `separators`,
+    /// `indent` (int or str), `sort_keys` and `allow_nan`, coerces scalar keys
+    /// and raises CPython's `TypeError` for anything else.
+    #[test]
+    fn json_dumps_matches_cpython() {
+        let src = r#"
+import json
+
+def main() -> None:
+    if json.dumps({"k": 1.0, "s": "é\n\x01☃😀", "n": None, "t": (1, 2), "b": False}) != "{\"k\": 1.0, \"s\": \"\\u00e9\\n\\u0001\\u2603\\ud83d\\ude00\", \"n\": null, \"t\": [1, 2], \"b\": false}":
+        raise ValueError("default: " + json.dumps({"k": 1.0, "s": "é\n\x01☃😀", "n": None, "t": (1, 2), "b": False}))
+    if json.dumps("é", ensure_ascii=False) != "\"é\"":
+        raise ValueError("ensure_ascii=False")
+    if json.dumps({"a": 1}, separators=(",", ":")) != "{\"a\":1}":
+        raise ValueError("separators")
+    if json.dumps([1, {"a": []}], indent=2) != "[\n  1,\n  {\n    \"a\": []\n  }\n]":
+        raise ValueError("indent: " + json.dumps([1, {"a": []}], indent=2))
+    if json.dumps([[]], indent="\t") != "[\n\t[]\n]":
+        raise ValueError("str indent")
+    if json.dumps([], indent=2) != "[]" or json.dumps({}, indent=2) != "{}":
+        raise ValueError("empty with indent")
+    if json.dumps({"b": {"c": 1}, "a": 2}, sort_keys=True) != "{\"a\": 2, \"b\": {\"c\": 1}}":
+        raise ValueError("sort_keys")
+    if json.dumps({1: "a", 2.5: "b", None: "d"}) != "{\"1\": \"a\", \"2.5\": \"b\", \"null\": \"d\"}":
+        raise ValueError("key coercion: " + json.dumps({1: "a", 2.5: "b", None: "d"}))
+    if json.dumps(float("inf")) != "Infinity" or json.dumps(1e16) != "1e+16":
+        raise ValueError("floats")
+    try:
+        json.dumps({"a": {1, 2}})
+        raise ValueError("set accepted")
+    except TypeError as e:
+        if str(e) != "Object of type set is not JSON serializable":
+            raise ValueError("set message: " + str(e))
+    try:
+        json.dumps({(1, 2): 3})
+        raise ValueError("tuple key accepted")
+    except TypeError as e:
+        if str(e) != "keys must be str, int, float, bool or None, not tuple":
+            raise ValueError("key message: " + str(e))
+    try:
+        json.dumps(float("nan"), allow_nan=False)
+        raise ValueError("nan accepted")
+    except ValueError as e:
+        if str(e) != "Out of range float values are not JSON compliant: nan":
+            raise ValueError("nan message: " + str(e))
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// `dataclasses.asdict` / `astuple` recurse in declaration order (the
+    /// previous implementation iterated an unordered map, so the output
+    /// changed between runs), and `fields` / `is_dataclass` / `replace` exist.
+    #[test]
+    fn dataclasses_reflection_matches_cpython() {
+        let src = r#"
+import dataclasses
+
+class Address:
+    street: str
+    city: str
+
+class Person:
+    name: str
+    age: int
+    address: Address
+    tags: list[str] = []
+
+def main() -> None:
+    let p: Person = Person(name="Alice", age=30, address=Address(street="1 Main", city="X"), tags=["a"])
+    let d: dict[str, object] = dataclasses.asdict(p)
+    if str(d) != "{'name': 'Alice', 'age': 30, 'address': {'street': '1 Main', 'city': 'X'}, 'tags': ['a']}":
+        raise ValueError("asdict: " + str(d))
+    let t: tuple[object, ...] = dataclasses.astuple(p)
+    if str(t) != "('Alice', 30, ('1 Main', 'X'), ['a'])":
+        raise ValueError("astuple: " + str(t))
+    let names: list[str] = [f.name for f in dataclasses.fields(p)]
+    if names != ["name", "age", "address", "tags"]:
+        raise ValueError("fields")
+    let types: list[str] = [str(f.type) for f in dataclasses.fields(Address)]
+    if types != ["str", "str"]:
+        raise ValueError("field types: " + str(types))
+    if not dataclasses.is_dataclass(p) or not dataclasses.is_dataclass(Person) or dataclasses.is_dataclass(42):
+        raise ValueError("is_dataclass")
+    let q: Person = dataclasses.replace(p, age=31)
+    if q.age != 31 or q.name != "Alice" or p.age != 30:
+        raise ValueError("replace")
+    try:
+        dataclasses.replace(p, nope=1)
+        raise ValueError("replace accepted unknown field")
+    except TypeError as e:
+        if str(e) != "Person.__init__() got an unexpected keyword argument 'nope'":
+            raise ValueError("replace message: " + str(e))
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// The long tail of builtin behaviour that real programs hit: `sys.exit`
+    /// raising a catchable `SystemExit` (with `finally` running), `next`'s
+    /// default, `enumerate`'s start, `list.index` bounds, `bool` bitwise
+    /// results, `KeyError` payloads, `int()` error text, `%s` dispatching a
+    /// user `__repr__`, and format specs without a presentation type.
+    #[test]
+    fn builtin_long_tail_matches_cpython() {
+        let src = r#"
+import sys
+
+plain class R:
+    n: int = 0
+
+impl R:
+    def __init__(self, n: int) -> None:
+        self.n = n
+
+    def __repr__(self) -> str:
+        return f"R<{self.n}>"
+
+def main() -> None:
+    let it = iter([1])
+    next(it)
+    if next(it, "done") != "done":
+        raise ValueError("next default")
+    if list(enumerate("ab", 1)) != [(1, "a"), (2, "b")]:
+        raise ValueError("enumerate start")
+    if [1, 2, 3, 2].index(2, 2) != 3 or [1, 2, 3].index(3, -1) != 2:
+        raise ValueError("list.index bounds")
+    try:
+        [1].index(5)
+        raise ValueError("index accepted")
+    except ValueError as e:
+        if str(e) != "5 is not in list":
+            raise ValueError("index message: " + str(e))
+    if (True & False) is not False or (True | False) is not True or (True ^ True) is not False:
+        raise ValueError("bool bitwise")
+    try:
+        let d: dict[str, int] = {"a": 1}
+        print(d["k"])
+    except KeyError as e:
+        if e.args[0] != "k" or str(e) != "'k'":
+            raise ValueError("KeyError payload: " + str(e) + " " + str(e.args))
+    try:
+        {"a": 1}.pop("zz")
+    except KeyError as e:
+        if str(e) != "'zz'":
+            raise ValueError("pop KeyError: " + str(e))
+    try:
+        int("x1")
+    except ValueError as e:
+        if str(e) != "invalid literal for int() with base 10: 'x1'":
+            raise ValueError("int message: " + str(e))
+    if "%s %r" % (R(1), R(2)) != "R<1> R<2>":
+        raise ValueError("printf dispatch: " + ("%s %r" % (R(1), R(2))))
+    if f"{1234567.891:,}|{1.5:10}|{3.14159:.3}|{1e16:.3}|{3.0:.3}|{-0.0:+}" != "1,234,567.891|       1.5|3.14|1e+16|3.0|-0.0":
+        raise ValueError("float spec: " + f"{1234567.891:,}|{1.5:10}|{3.14159:.3}|{1e16:.3}|{3.0:.3}|{-0.0:+}")
+    if f"{'hello':.3}|{'hi':6.1}|" != "hel|h     |":
+        raise ValueError("str precision: " + f"{'hello':.3}|{'hi':6.1}|")
+    try:
+        try:
+            sys.exit("fatal")
+        finally:
+            print("cleanup")
+    except SystemExit as e:
+        if str(e) != "fatal":
+            raise ValueError("SystemExit payload")
+    try:
+        exit(3)
+    except SystemExit:
+        pass
+    try:
+        try:
+            sys.exit(2)
+        except Exception:
+            raise ValueError("SystemExit must not be an Exception")
+    except SystemExit:
+        pass
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// An uncaught `SystemExit` becomes the process exit status: an int is
+    /// the code, no argument is 0, anything else prints and exits 1.
+    #[test]
+    fn uncaught_system_exit_maps_to_exit_status() {
+        assert_eq!(run_capturing("import sys\nsys.exit(5)\n").unwrap(), 5);
+        assert_eq!(run_capturing("import sys\nsys.exit()\n").unwrap(), 0);
+        assert_eq!(run_capturing("raise SystemExit\n").unwrap(), 0);
+        assert_eq!(
+            run_capturing("import sys\nsys.exit(\"bad config\")\n").unwrap(),
+            1
+        );
+    }
+
+    /// `except` over an attribute-qualified exception class matches — a
+    /// module-exported native constructor (`asyncio.CancelledError`) or a
+    /// VM-synthesised class (`json.JSONDecodeError`) — and `CancelledError`
+    /// escapes `except Exception` as it does in CPython.
+    #[test]
+    fn qualified_except_clauses_match() {
+        let src = r#"
+import asyncio
+
+def main() -> None:
+    try:
+        raise asyncio.TimeoutError()
+    except asyncio.TimeoutError:
+        pass
+    try:
+        raise asyncio.TimeoutError()
+    except TimeoutError:
+        pass
+    mut escaped: bool = False
+    try:
+        try:
+            raise asyncio.CancelledError()
+        except Exception:
+            raise ValueError("CancelledError must not be an Exception")
+    except asyncio.CancelledError:
+        escaped = True
+    if not escaped:
+        raise ValueError("not escaped")
 main()
 "#;
         assert_eq!(run_capturing(src).unwrap(), 0);

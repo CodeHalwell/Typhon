@@ -10,8 +10,8 @@ sidebar:
 | Code | Meaning |
 |------|---------|
 | 0 | Success. |
-| 1 | CLI / invocation error — invalid arguments, missing manifest, unknown command, missing required tool (e.g. `uv` not installed for `tyc add`). |
-| 2 | Compile-time error — at least one error-severity diagnostic was emitted. |
+| 1 | Compile-time or run-time failure — at least one error-severity diagnostic, a `tyc fmt --check` that would reformat, an unknown `tyc explain` code, a missing file or required tool (e.g. `uv` not installed for `tyc add`), or a program that exited non-zero under `tyc run`. |
+| 2 | Invocation error — invalid arguments or an unknown subcommand (reported by the argument parser). |
 | 130 | Interrupted (`Ctrl-C` / `SIGINT`). |
 
 ## Per-command notes

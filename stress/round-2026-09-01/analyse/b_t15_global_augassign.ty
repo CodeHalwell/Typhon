@@ -1,0 +1,8 @@
+let LIMIT: int = 10
+
+def bump() -> None:
+    global LIMIT
+    LIMIT += 1
+
+bump()
+print(LIMIT)

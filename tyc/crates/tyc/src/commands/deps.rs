@@ -372,9 +372,20 @@ pub fn bootstrap_python_env_with(
 /// via [`render_pyproject`].
 fn merge_pyproject(project_root: &Path, config: &TyphonConfig) -> Result<()> {
     let path = project_root.join("pyproject.toml");
+    // A symlinked `pyproject.toml` in an untrusted checkout would otherwise
+    // have its *target* rewritten with `typhon.toml`-derived content.
+    // `atomic_write` refuses symlinks; check up front so the message names
+    // the manifest rather than a temp file.
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(miette!(
+            "refusing to update {}: it is a symlink (resolve or remove it first)",
+            path.display()
+        ));
+    }
     if !path.exists() {
         let text = render_pyproject(config);
-        std::fs::write(&path, text).map_err(|e| miette!("cannot write {}: {e}", path.display()))?;
+        tyc_format::atomic_write(&path, text.as_bytes())
+            .map_err(|e| miette!("cannot write {}: {e}", path.display()))?;
         return Ok(());
     }
 
@@ -386,7 +397,7 @@ fn merge_pyproject(project_root: &Path, config: &TyphonConfig) -> Result<()> {
 
     apply_owned_keys(&mut doc, config);
 
-    std::fs::write(&path, doc.to_string())
+    tyc_format::atomic_write(&path, doc.to_string().as_bytes())
         .map_err(|e| miette!("cannot write {}: {e}", path.display()))
 }
 
@@ -529,6 +540,26 @@ fn has_uv() -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// A symlinked `pyproject.toml` in a checkout must not have its target
+    /// rewritten with `typhon.toml`-derived content.
+    #[cfg(unix)]
+    #[test]
+    fn merge_pyproject_refuses_symlink() {
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim.toml");
+        std::fs::write(&victim, "[tool.mine]\nx = 1\n").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(&victim, tmp.path().join("pyproject.toml")).unwrap();
+        let config = crate::config::TyphonConfig::default();
+        let err = super::merge_pyproject(tmp.path(), &config)
+            .expect_err("a symlinked pyproject.toml must be refused");
+        assert!(format!("{err:?}").contains("symlink"), "{err:?}");
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "[tool.mine]\nx = 1\n"
+        );
+    }
+
     use super::*;
 
     #[test]

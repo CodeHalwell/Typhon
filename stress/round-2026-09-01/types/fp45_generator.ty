@@ -1,0 +1,15 @@
+from typing import Iterator
+
+def evens(n: int) -> Iterator[int]:
+    for i in range(n):
+        if i % 2 == 0:
+            yield i
+
+def main() -> None:
+    let xs: list[int] = list(evens(5))
+    print(xs, sum(evens(5)), max(evens(5)))
+    for e in evens(3):
+        print(e + 1)
+
+if __name__ == "__main__":
+    main()

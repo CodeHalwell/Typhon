@@ -1,0 +1,9 @@
+comptime let A: float = 7.0 // 0.1
+comptime let B: bool = [1, 2] == [1, 2]
+comptime let C: str = str(1e16)
+comptime let E: float = 7.0 % 0.1
+comptime let F: str = str(int)
+comptime let G: bool = (1, 2) == (1, 2)
+comptime let H: str = str(1e-5)
+comptime let I: str = str(123456789012345678.0)
+print(A, B, C, E, F, G, H, I)

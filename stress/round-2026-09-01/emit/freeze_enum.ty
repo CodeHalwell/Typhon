@@ -1,0 +1,10 @@
+enum Mode:
+    FAST
+    SLOW
+
+freeze let CFG = {"mode": Mode.FAST, "n": 1, "xs": [1, [2, 3]]}
+
+def main() -> None:
+    print(CFG["mode"], CFG["n"], CFG["xs"], type(CFG["xs"]).__name__)
+
+main()

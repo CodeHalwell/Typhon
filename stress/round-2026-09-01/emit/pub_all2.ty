@@ -1,0 +1,16 @@
+"""Doc."""
+import os
+
+pub let A: int = 1
+
+pub class K:
+    x: int
+
+pub def f() -> int:
+    return 2
+
+def main() -> None:
+    print(A, K(x=1), f(), os.getcwd() != "")
+
+if __name__ == "__main__":
+    main()

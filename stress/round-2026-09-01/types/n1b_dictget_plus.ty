@@ -1,0 +1,7 @@
+def main() -> None:
+    let counts: dict[str, int] = {"a": 1}
+    let total: int = counts.get("b") + 1
+    print(total)
+
+if __name__ == "__main__":
+    main()

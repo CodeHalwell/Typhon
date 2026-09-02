@@ -1,0 +1,4 @@
+def f(v: float) -> str:
+    return f"{v:{prec}f}"
+
+print(f(1.5))

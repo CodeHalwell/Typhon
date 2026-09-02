@@ -1,0 +1,12 @@
+class Inner:
+    v: int
+
+class Outer:
+    name: str
+    inner: Inner
+
+def main() -> None:
+    let o: Outer = {"name": "a", "inner": {"v": 1}}
+    print(o, o.inner.v)
+
+main()

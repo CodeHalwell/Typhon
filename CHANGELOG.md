@@ -176,6 +176,203 @@ additive docs-site pages / CLI-entrypoint smoke tests.
   keys; `docs/diagnostics/README.md`'s `freeze_not_freezable` link points at its
   own page; `CLAUDE.md` / `CONTRIBUTING.md` describe all five CI jobs.
 
+### 2026-09-01 beta-readiness review — 35 verified defects fixed
+
+A second, broader review (`docs/beta-readiness-review-2026-09-01.md`: the five
+gates run locally, both corpora type-checked and executed both ways, six
+parallel adversarial reviewers each required to reproduce every finding
+against the release binary) found about 120 defects and this change fixes 35
+of them, each with a regression test. The reproductions are committed as
+`stress/round-2026-09-01/`. Nine long-standing differential-baseline entries
+(three curated examples among them) stop diverging and are burned down; the
+new probe round pins its still-open divergences in the same baseline, so the
+list is now an honest picture of the VM's remaining gaps. Every fix below is
+additive on correct programs except the one marked **narrowing**.
+
+#### Fixed — miscompilations (`tyc build` exit 0, wrong program)
+
+- **A one-line `guard … else: …` desynchronised every line-indexed side
+  table.** The main preprocessor loop expanded it to three lines *after* the
+  `class … frozen` / `unsafe:` / `lazy let` side tables had been keyed by line
+  number, so a later `class P frozen:` silently lost `frozen`, `unsafe:` blocks
+  stopped being recognised and `tyc fmt` rewrote the file. The one-liner is now
+  lowered in the mapped `expand_multiline_guards` pre-pass, before any table is
+  built, and the main-loop branch is gone.
+- **`|>` pipelines:** a `# comment` on a continuation line swallowed every
+  later step (comments are lifted out of the join and re-attached), and any
+  pipe line containing a non-ASCII character was rewritten byte-by-byte
+  (`"café"` → `CAFÃ©`); whole UTF-8 characters are copied now.
+- **`yield` lost its parentheses as an operand** — `(yield t) + 1` emitted
+  `yield (t + 1)`, and `yield` inside a tuple, call argument or `return` was
+  regrouped the same way. It is emitted bare only as a whole statement or the
+  right-hand side of an assignment, and parenthesised everywhere else.
+- **`case (x,):` emitted as `case (x):`** — a one-element tuple pattern became
+  a capture pattern that matched everything. The trailing comma is kept.
+- **The default `[emit] format = true` spacing pass rewrote string contents:**
+  a nested f-string format spec (`:.2f` → `: .2f`) and a PEP 701 same-quote
+  field (`d["a:b"]` → `d["a: b"]`). The pass now masks string bytes through
+  the shared PEP 701-aware `lexmask` scanner (comments stay unmasked).
+- **`ClassVar` fields were cloned into every dataclass subclass**, forking a
+  shared registry into one copy per class. They stay on the parent.
+- **Non-finite float literals:** `1e400` emitted the bare name `inf`
+  (`NameError` at import) and `1e400j` emitted `infj`; they emit
+  `float("inf")` / `complex(...)`. A NUL (or any other C0 control except
+  `\n` `\t` `\r`) inside a triple-quoted string was written raw (`SyntaxError`
+  at import); it is escaped.
+- **Valid programs rejected by the post-emit parse gate:** `[*(a or b)]`,
+  `{**(a if c else b)}`, `case (A() as x) | (B() as x)` and a literal brace
+  next to an f-string part (`"{" f"{x}"`). Precedence guards and brace
+  doubling were added.
+- **A non-empty mutable field default survived to `@dataclass`.** The
+  mutable-default rewrite only recognised the empty forms (`[]`, `{}`,
+  `set()`, …), but `@dataclass` rejects *every* unhashable default, so
+  `xs: list[int] = [1, 2]` was a `ValueError` at import while `tyc run`
+  happily ran the program. A non-empty `list` / `dict` / `set` display built
+  only from constants is now rewritten to
+  `dataclasses.field(default_factory=lambda: [1, 2])` — one fresh copy per
+  instance on both surfaces. A display that names anything (`[SIZE]`,
+  `[f()]`) is deliberately left alone: a class-body lambda cannot see
+  class-scope names. A dataclass-*instance* default (`p: P = P(x=1)`) is
+  still open and listed in the review.
+
+#### Fixed — preprocessor robustness
+
+- `unsafe:  # comment` was a parse error (the comment is stripped before the
+  header check), and `pub *` on a final line with no trailing newline emitted
+  `__all__` but no re-export — `tyc fmt` then produced an empty file. The
+  marker's line is always kept.
+
+#### Fixed — type checker and resolver
+
+- **An un-awaited call to an `async def` inside another `async def` was typed
+  as its return type** (`let s: str = fetch(3)` passed and crashed on
+  `s.upper()`). It is now `Coroutine[T]`; `await` unwraps it and every
+  coroutine-accepting API (`gather`, `create_task`, `go`) is untouched.
+  Narrowing on already-crashing code.
+- **The nullable-operand check was gated on a bare name.** `d.get(k) + 1`,
+  `xs[0] * 2` and `lookup(x) < 3` passed silently and raised `TypeError` at
+  runtime. Every operand shape is now reported, ordering comparisons included;
+  an attribute-rooted operand reports at the `[strictness] nullable-use`
+  level (warn by default), like the alpha.7 nullable-field check. Narrowing
+  on already-crashing code.
+- **`isinstance(x, (A, B))` narrowed to `Unknown`** on the positive branch
+  (unsound) and did not narrow the negative branch at all (a false positive
+  on the remainder). A tuple of classes is a union on both branches.
+- **`sys.exit(...)`, `exit()`, `assert False` and a call to a `-> NoReturn`
+  function are now exits** for `missing_return` — including inside the
+  `NoReturn` body itself — so a function ending in one no longer needs a dead
+  `return`. Relaxation.
+- **A fresh comprehension is accepted against a wider annotation**
+  (`let names: list[object] = [a.name for a in agents]`) exactly as the list
+  literal already was: the comprehension adopts the annotated element type
+  when every element fits. Relaxation.
+- **`x += 1` bypassed the `let` contract** for locals, parameters and
+  `global` / `nonlocal` writes: `let n = 0; n += 1` was accepted while
+  `n = n + 1` was correctly rejected. Augmented assignment now goes through
+  the same path. **Narrowing on code that ran correctly** — declare the
+  binding `mut`, which is what the same program written as `n = n + 1` already
+  required. One stress probe (`round-2026-05-23-drift-round-4/probes.ty`,
+  `let x; x += 10`) now fails as intended.
+- **`try` / `except` handlers are sibling arms** like `if` / `match` branches:
+  two handlers declaring the same `let`, or a handler that initialises a
+  declare-only `let`, are no longer `immutable_assign` false positives.
+  Relaxation.
+- **Class-body names were visible from methods and lambdas.** `return n <
+  LIMIT` inside a method type-checked against the class attribute `LIMIT` and
+  raised `NameError` at runtime (Python skips the class scope from a function
+  body). Class scopes are now skipped for function-origin references; PEP 695
+  type parameters declared on the class stay visible. Narrowing on
+  already-crashing code.
+
+#### Fixed — VM ↔ CPython parity (`tyc run`)
+
+- **`json` rewritten to CPython's contract.** `json.loads` re-encoded each
+  UTF-8 byte as its own character (`"héllo"` → `hÃ©llo`), rejected every `\u`
+  escape, accepted raw control characters, rejected `NaN` / `Infinity`, and
+  raised a bare `ValueError` with a private message — `except
+  json.JSONDecodeError` never caught it. The decoder now produces CPython's
+  messages and character positions, handles surrogate pairs, and raises a
+  real `json.JSONDecodeError` (a `ValueError` subclass) exported from the
+  module. `json.dumps` honours `ensure_ascii` (on by default), `separators`,
+  `allow_nan` and `indent=0`, and raises `TypeError` for an unserialisable
+  value instead of embedding its repr.
+- **pydantic parity:** `model_dump_json()` is compact like pydantic's;
+  `str(model)` / `repr(model)` no longer leak `model_config`.
+- **`dataclasses` parity:** `asdict` iterated an unordered map (its output
+  changed between runs) and did not recurse; `astuple`, `fields`,
+  `is_dataclass` and `replace` were missing. All five are implemented in
+  declaration order; `fields(...)` carries the annotation text as `Field.type`.
+- **`except json.JSONDecodeError:` / `except asyncio.CancelledError:` — any
+  attribute-qualified exception class — never matched.** Qualified handlers
+  are resolved by class identity or native kind. `asyncio.TimeoutError`,
+  `CancelledError`, `InvalidStateError`, `QueueEmpty` and `QueueFull` were
+  missing; `CancelledError` escapes `except Exception` as in CPython.
+- **`sys.exit` called `process::exit`** — no `finally`, no `except
+  SystemExit`, and `sys.exit("msg")` exited 0 without printing. It raises
+  `SystemExit`; an uncaught one maps to CPython's status (`None` → 0, an int →
+  that code, anything else → printed to stderr, status 1). `exit()` / `quit()`
+  exist.
+- **Long-tail builtins:** `next(it, default)` ignored the default;
+  `enumerate(xs, 1)` ignored the start; `list.index(x, start, stop)` ignored
+  the bounds; `True & False` was `0` (bool bitwise ops stay `bool`);
+  `KeyError` payloads (`e.args[0]` was the string `"'k'"`, `pop` reported
+  `'Str("k")'`); `int("x")`'s message; `"%s" % obj` ignored a user
+  `__repr__` / `__str__`; the `as!` failure message printed `int` where the
+  compiled runtime prints `<class 'int'>`.
+- **Format specs:** `f"{1.5:10}"` gave `1.500000` (a no-type float spec is
+  `repr`), `f"{3.14159:.3}"` gave `3.142` (significant digits, not decimals),
+  and `f"{'hello':.3}"` ignored the precision.
+- **`3 * [0]` / `2 * (1, 2)` raised `TypeError`** — only `seq * n` was
+  implemented — and so did `True * [1]`. Both operand orders and `bool`
+  counts work. `[1] * (2 ** 63)` raised `MemoryError` where CPython raises
+  `OverflowError` (the count is bounded by `isize::MAX`, not `usize::MAX`),
+  and a repeat whose total fits an index but not the machine
+  (`[1, 1] * (2 ** 40)`) aborted the process on allocation failure: the
+  `list` / `tuple` allocation now goes through `try_reserve_exact` and
+  surfaces as a catchable `MemoryError`.
+- **`list(zip())` yielded `()` forever** until the process was OOM-killed —
+  the loop over zero inner iterators was vacuously satisfied. It is exhausted
+  immediately. `zip(..., strict=True)` reports CPython's wording (`zip()
+  argument 2 is longer than argument 1`, `... shorter than arguments 1-2`)
+  instead of a private message.
+
+#### Security / robustness
+
+- **`tyc build --no-sync` wrote through symlinks.** A pre-planted
+  `build/main.py -> <victim>`, a symlinked `build/` or `.sourcemaps/`
+  directory, or a symlinked `pyproject.toml` all received attacker-controlled
+  bytes outside the project — under the exact flags `SECURITY.md` recommends
+  for building untrusted code. `atomic_write` refuses a symlink target; every
+  artifact destination is confined to the canonical project root before it is
+  written; `pyproject.toml` merges are atomic and refuse links.
+- **`tyc fmt src/` / `tyc check src/` followed symlinks out of the tree**
+  (formatting the link targets in place; walking `/usr`). A link that
+  resolves outside the walk root is skipped with a warning.
+- **`tyc build --check` wrote `pyproject.toml`** and, without `--no-sync`,
+  ran `uv sync`. The dry run skips the environment bootstrap entirely.
+- **`tyc profile` → `[optimise] pgo-memoise` never promoted anything:** the
+  profile records `__main__.fib`, the pass looked for `main.fib`. The entry
+  module accepts both spellings.
+
+#### Docs
+
+- `SECURITY.md` / `CONTRIBUTING.md` no longer say "currently `v1.0.0-alpha`";
+  the bundled skill's `[strictness] nullable-use` default is `"warn"`, its VM
+  integer row says arbitrary precision (not `i64`), and two stale HKT lines
+  are gone; the docs-site exit-code table had its rows inverted (1 is a
+  compile / run failure, 2 an invocation error) and the installer pin syntax
+  is `--version=`; cookbook example counts corrected; `docs/language.md`
+  describes the widened mutable-default rewrite; the `nullable_use`,
+  `missing_return`, `unknown_name` and `immutable_assign` diagnostic pages
+  gained sections for the checker changes above.
+
+Deferred (all reproduced, all listed with severities in the review): the
+remaining preprocessor line-count desyncs, unchecked container-method
+arguments and lambda bodies in the checker, the `class!` grandchild
+inheritance hole, the VM's eager generator expressions and thin `re` /
+`collections` / `datetime` / `pathlib` shims, `tyc migrate` panics on
+non-ASCII, and the quadratic `tyc check` on very large modules.
+
 ## 1.0.0-alpha.9 — 2026-08-21 — maintenance: secret-name lint expansion, allocation reductions & dependency wave
 
 A maintenance release on top of alpha.8: a large widening of the **warn-level**

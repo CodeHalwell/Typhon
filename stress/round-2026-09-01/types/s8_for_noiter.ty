@@ -1,0 +1,9 @@
+class Bag:
+    n: int
+
+def main() -> None:
+    for x in Bag(n=1):
+        print(x)
+
+if __name__ == "__main__":
+    main()

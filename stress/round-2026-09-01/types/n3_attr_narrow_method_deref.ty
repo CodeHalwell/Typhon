@@ -1,0 +1,26 @@
+class Box:
+    val: int?
+
+def clear(b: Box) -> None:
+    b.val = None
+
+impl Box:
+    def go(self) -> int:
+        if self.val is None:
+            return 0
+        clear(self)
+        return self.val.bit_length()
+
+def alias(a: Box, b: Box) -> int:
+    if a.val is None:
+        return 0
+    b.val = None
+    return a.val.bit_length()
+
+def main() -> None:
+    print(Box(val=1).go())
+    let x: Box = Box(val=1)
+    print(alias(x, x))
+
+if __name__ == "__main__":
+    main()

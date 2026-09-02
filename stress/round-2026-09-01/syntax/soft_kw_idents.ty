@@ -1,0 +1,18 @@
+import re
+
+def main() -> None:
+    let = 1
+    print(let)
+    mut = [1, 2]
+    mut.append(3)
+    print(mut, mut[0])
+    let match = re.match(r"a", "abc")
+    print(match is not None)
+    let pub: int = 2
+    let impl: int = 3
+    let go: int = 4
+    let gather: int = 5
+    print(pub + impl + go + gather)
+
+if __name__ == "__main__":
+    main()

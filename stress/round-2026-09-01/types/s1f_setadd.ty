@@ -1,0 +1,7 @@
+def main() -> None:
+    let ss: set[int] = {1}
+    ss.add("x")
+    print(len(ss))
+
+if __name__ == "__main__":
+    main()

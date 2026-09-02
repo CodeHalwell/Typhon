@@ -1,0 +1,20 @@
+def f(x: str | bytes | int) -> str:
+    if isinstance(x, (str, bytes)):
+        return "sb"
+    return str(x + 1)
+
+def g(x: int | str | None) -> str:
+    if isinstance(x, (int, str)):
+        return str(x)
+    return "none"
+
+def h(x: int | str | list[int]) -> int:
+    if isinstance(x, (int, str)):
+        return len(str(x))
+    return x[0]
+
+def main() -> None:
+    print(f(1), g(None), h([1]))
+
+if __name__ == "__main__":
+    main()

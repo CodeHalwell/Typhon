@@ -1,0 +1,11 @@
+class C:
+    x: int
+type S = C | S
+
+def f(s: S) -> int:
+    match s:
+        case C(x):
+            return x
+
+def main() -> None:
+    print(f(C(x=1)))

@@ -1,0 +1,10 @@
+from typing import Callable
+f: Callable[[], int] = lambda x=5: x
+g: Callable[[int], int] = lambda x, y=10: x + y
+print("L1", f(), g(1))
+fns: list[Callable[[], int]] = [lambda i=i: i for i in range(3)]
+print("L2", [fn() for fn in fns])
+h = lambda *a, **k: (a, k)
+print("L3", h(1, 2, z=3))
+k = lambda: None
+print("L4", k(), (lambda a, b: a * b)(3, 4), (lambda: 42)(), sorted([3, 1, 2], key=lambda v: -v), list(map(lambda s: s.upper(), ["a"])))

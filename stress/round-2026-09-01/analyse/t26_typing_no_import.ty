@@ -1,0 +1,7 @@
+def apply(f: Callable[[int], int], x: int) -> int:
+    return f(x)
+
+def total(xs: Iterable[int]) -> int:
+    return functools.reduce(lambda a, b: a + b, xs, 0)
+
+print(apply(lambda v: v + 1, 1), total([1, 2]))

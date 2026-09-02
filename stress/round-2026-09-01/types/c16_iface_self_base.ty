@@ -1,0 +1,14 @@
+interface A(A):
+    def f(self) -> int
+
+class X:
+    v: int
+impl X:
+    def f(self) -> int:
+        return self.v
+
+def g(a: A) -> int:
+    return a.f()
+
+def main() -> None:
+    print(g(X(v=1)))

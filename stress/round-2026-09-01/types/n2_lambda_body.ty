@@ -1,0 +1,13 @@
+from typing import Callable
+
+def apply(f: Callable[[int], int], v: int) -> int:
+    return f(v)
+
+def main() -> None:
+    let g: Callable[[], int] = lambda: "s".nope()
+    let h: Callable[[], int] = lambda: "str"
+    print(apply(lambda x: x.upper(), 3))
+    print(h() + 1)
+
+if __name__ == "__main__":
+    main()

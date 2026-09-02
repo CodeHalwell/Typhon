@@ -1,0 +1,17 @@
+import asyncio
+
+async def f1() -> int:
+    return 1
+
+async def f2() -> int:
+    return 2
+
+async def load() -> int:
+    gather: a = f1(); b = f2()
+    return a + b
+
+def main() -> None:
+    print(asyncio.run(load()))
+
+if __name__ == "__main__":
+    main()

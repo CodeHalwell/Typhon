@@ -1,0 +1,8 @@
+def f() -> str:
+    try:
+        int("x")
+    except ValueError as e:
+        pass
+    return str(e)
+
+print(f())

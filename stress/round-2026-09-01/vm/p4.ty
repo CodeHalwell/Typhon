@@ -1,0 +1,159 @@
+class Point:
+    x: int
+    y: int = 0
+
+impl Point:
+    def __str__(self) -> str:
+        return f"P({self.x},{self.y})"
+
+class Point3(Point):
+    z: int = 0
+
+class Frozen frozen:
+    a: int
+    b: str = "x"
+
+plain class Bag:
+    count: int = 0
+    items: list[str] = []
+
+class Animal:
+    name: str
+
+impl Animal:
+    def speak(self) -> str:
+        return "..."
+    def intro(self) -> str:
+        return f"{self.name} says {self.speak()}"
+    @classmethod
+    def make(cls, n: str) -> "Animal":
+        return cls(name=n)
+    @staticmethod
+    def kind() -> str:
+        return "animal"
+
+class Dog(Animal):
+    tricks: int = 0
+
+impl Dog:
+    def speak(self) -> str:
+        return "woof"
+    def intro(self) -> str:
+        return super().intro() + "!"
+
+class Cat(Animal):
+    pass
+
+impl Cat:
+    def speak(self) -> str:
+        return "meow"
+
+plain class Counter:
+    n: int = 0
+
+impl Counter:
+    def __init__(self, start: int = 0) -> None:
+        self.n = start
+    def __call__(self, k: int) -> int:
+        self.n += k
+        return self.n
+    def __repr__(self) -> str:
+        return f"Counter({self.n})"
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, Counter) and other.n == self.n
+    def __hash__(self) -> int:
+        return hash(self.n)
+    def __lt__(self, other: "Counter") -> bool:
+        return self.n < other.n
+    def __bool__(self) -> bool:
+        return self.n != 0
+    def __len__(self) -> int:
+        return abs(self.n)
+    def __contains__(self, k: int) -> bool:
+        return k == self.n
+    def __iter__(self) -> "Counter":
+        return self
+    def __next__(self) -> int:
+        if self.n >= 3:
+            raise StopIteration
+        self.n += 1
+        return self.n
+    def __getitem__(self, i: int) -> int:
+        return self.n * i
+    def __neg__(self) -> "Counter":
+        return Counter(-self.n)
+    def __add__(self, other: int) -> "Counter":
+        return Counter(self.n + other)
+    def __radd__(self, other: int) -> "Counter":
+        return Counter(other + self.n)
+    def __iadd__(self, other: int) -> "Counter":
+        self.n += other * 10
+        return self
+    def __format__(self, spec: str) -> str:
+        return f"<{self.n}:{spec}>"
+
+plain class Temp:
+    _c: float = 0.0
+
+impl Temp:
+    def __init__(self, c: float) -> None:
+        self._c = c
+    @property
+    def f(self) -> float:
+        return self._c * 9 / 5 + 32
+    @f.setter
+    def f(self, v: float) -> None:
+        self._c = (v - 32) * 5 / 9
+
+plain class Dyn:
+    pass
+
+impl Dyn:
+    def __getattr__(self, name: str) -> str:
+        return f"dyn:{name}"
+
+plain class Guard:
+    log: list[str] = []
+
+impl Guard:
+    def __init__(self) -> None:
+        object.__setattr__(self, "log", [])
+    def __setattr__(self, name: str, value: object) -> None:
+        self.log.append(name)
+        object.__setattr__(self, name, value)
+
+class Base:
+    v: int
+
+impl Base:
+    def __post_init__(self) -> None:
+        self.v = self.v * 2
+
+def main() -> None:
+    let p: Point = Point(x=1)
+    let p3: Point3 = Point3(x=1, y=2, z=3)
+    print("O1", p, repr(p), p3, repr(p3), p == Point(x=1, y=0), p == p3, Point(x=1) == Point3(x=1), p3 == Point3(x=1, y=2, z=3), p != p3, str(Frozen(a=1)), repr(Frozen(a=1)), Frozen(a=1) == Frozen(a=1), hash(Frozen(a=1)) == hash(Frozen(a=1)), {Frozen(a=1): 1}[Frozen(a=1)])
+    let b1: Bag = Bag()
+    let b2: Bag = Bag()
+    b1.items.append("x")
+    print("O2", b1.items, b2.items, b1.items is b2.items, Bag.count, b1.count, repr(b1)[:5], str(b1)[:5])
+    let d: Dog = Dog(name="Rex")
+    print("O3", d.intro(), Cat(name="Tom").intro(), Animal(name="A").intro(), Dog.make("Fido").intro(), type(Dog.make("Fido")).__name__, Dog.kind(), d.kind(), Animal.kind(), isinstance(d, Animal), isinstance(d, Cat), type(d) == Dog, type(d) is Dog, type(d) == Animal, d.__class__.__name__, Dog.__name__, Dog.__mro__[1].__name__ if False else "skip", d.tricks)
+    let c: Counter = Counter(2)
+    let c2: Counter = c + 3
+    let c3: Counter = 10 + c
+    print("O4", c, c2, c3, -c, c(5), c, c == Counter(7), c != Counter(7), c == 7, hash(c) == hash(7), Counter(1) < Counter(2), sorted([Counter(3), Counter(1)]), bool(Counter(0)), bool(Counter(1)), len(Counter(-4)), 7 in c, 8 in c, c[3], f"{c}", f"{c:xyz}", format(c, "q"), "{}".format(c), "{:z}".format(c), str(c), [c] == [Counter(7)], c in [Counter(7)], Counter(7) in {c}, {c: 1}[Counter(7)], max(Counter(1), Counter(5)), min([Counter(4), Counter(2)]), Counter(2) > Counter(1))
+    c += 1
+    print("O5", c, list(Counter(0)), [x * 2 for x in Counter(1)], sum(Counter(0)), list(iter(Counter(2))), next(iter(Counter(0))), any(Counter(2)), all(Counter(0)), sorted(Counter(0)), "..".join(str(v) for v in Counter(1)))
+    let t: Temp = Temp(100.0)
+    print("O6", t.f)
+    t.f = 32.0
+    print("O7", t._c, t.f, Dyn().foo, Dyn().bar, getattr(Dyn(), "zz"), hasattr(Dyn(), "anything"), getattr(p, "x"), getattr(p, "nope", "dflt"), hasattr(p, "x"), hasattr(p, "nope"))
+    let g: Guard = Guard()
+    g.a = 1
+    g.b = 2
+    print("O8", g.log, g.a, g.b, Base(v=4).v, Base(v=4))
+    print("O9", Point.__name__, str(Point)[:16], repr(Point)[:16], type(Point).__name__, type(type(p)).__name__, Point.__dict__ is not None if False else "skip", vars(p) if False else "skip", p.__dict__ if False else "skip", isinstance(p, object), isinstance(Point, type), isinstance(1, object), callable(Point), callable(p), callable(c), callable(len), callable(1))
+    print("O10", isinstance(True, int), isinstance(1, bool), isinstance(1, float), isinstance(1.0, int), isinstance(True, (str, int)), isinstance("s", (int, str)), isinstance(None, type(None)), isinstance([], (list, tuple)), isinstance((), list), type(1) == type(True), type(True) == bool, type(1) is int, type(1.0) is float, type("") is str, type([]) is list, type(None).__name__, type(len).__name__, type(main).__name__, type(Point).__name__, type(c.__call__).__name__ if False else "skip", type(print).__name__, type(lambda: 0).__name__, type(range(1)).__name__, type(iter([])).__name__, type(zip()).__name__, type(enumerate([])).__name__, type(map(str, [])).__name__, type(filter(None, [])).__name__, type(reversed([])).__name__, type((x for x in [])).__name__, type({}.keys()).__name__, type({}.items()).__name__, type({}.values()).__name__, type(b"").__name__, type(1j).__name__, type(NotImplemented).__name__, type(Ellipsis).__name__, type(...).__name__, type(object()).__name__, type(Exception()).__name__, type(ValueError("x")).__name__, type(type).__name__, type(object).__name__, type(int).__name__)
+
+main()

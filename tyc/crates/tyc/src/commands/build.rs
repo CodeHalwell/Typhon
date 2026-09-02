@@ -293,7 +293,18 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // still merging the manifest, so stress harnesses and REPL-like
     // iteration don't pay the per-invocation reprovision cost.
     let skip_sync = args.no_sync || std::env::var_os("TYC_NO_SYNC").is_some_and(|v| v == "1");
-    crate::commands::deps::bootstrap_python_env_with(&config_dir, &config, skip_sync)?;
+    // `--check` is documented as a dry run that touches nothing on disk. The
+    // environment bootstrap writes `pyproject.toml` and (without `--no-sync`)
+    // runs `uv sync`, creating `.venv` and `uv.lock` — so it is skipped in
+    // check mode and reported like every other write.
+    if args.check {
+        println!(
+            "would update {}",
+            display_relative(&config_dir.join("pyproject.toml"), &config_dir)
+        );
+    } else {
+        crate::commands::deps::bootstrap_python_env_with(&config_dir, &config, skip_sync)?;
+    }
 
     // Phase 1: type-check all files first and fail fast on errors.
     let mut db = TycDatabase::new();
@@ -1203,6 +1214,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| miette!("cannot create '{}': {e}", parent.display()))?;
             }
+            confine_output_path(&project_root, &out_file)?;
 
             tyc_format::atomic_write(&out_file, python_src.as_bytes())
                 .map_err(|e| miette!("cannot write '{}': {e}", out_file.display()))?;
@@ -1250,6 +1262,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| miette!("cannot create '{}': {e}", parent.display()))?;
             }
+            confine_output_path(&project_root, &map_path)?;
             tyc_format::atomic_write(&map_path, map_body.as_bytes())
                 .map_err(|e| miette!("cannot write '{}': {e}", map_path.display()))?;
         }
@@ -1310,6 +1323,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| miette!("cannot create '{}': {e}", parent.display()))?;
             }
+            confine_output_path(&project_root, &dest)?;
             std::fs::copy(path, &dest).map_err(|e| {
                 miette!(
                     "cannot copy '{}' → '{}': {e}",
@@ -1436,6 +1450,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| miette!("cannot create '{}': {e}", parent.display()))?;
             }
+            confine_output_path(&project_root, &out_file)?;
             tyc_format::atomic_write(&out_file, stub_text.as_bytes())
                 .map_err(|e| miette!("cannot write '{}': {e}", out_file.display()))?;
         }
@@ -1481,6 +1496,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 .map_err(|e| miette!("cannot create '{}': {e}", runtime_dir.display()))?;
             for (name, body) in files {
                 let path = runtime_dir.join(name);
+                confine_output_path(&project_root, &path)?;
                 tyc_format::atomic_write(&path, body.as_bytes())
                     .map_err(|e| miette!("cannot write '{}': {e}", path.display()))?;
             }
@@ -1613,6 +1629,44 @@ fn inject_cross_module_ext_imports(
 /// Render `path` as a project-root-relative display string when possible,
 /// falling back to the absolute path. Used by the `--check` dry-run mode
 /// to keep `would write …` lines readable.
+/// Refuse an output destination that a checked-out tree could redirect.
+///
+/// `tyc build` writes into `out_dir` — a directory the project controls and
+/// git preserves symlinks in — so a pre-planted link (`build/main.py`,
+/// `build/.sourcemaps/`, or `build/` itself pointing outside the project)
+/// would turn the build into a write to an arbitrary path the user can
+/// write. Every artifact destination therefore goes through here first: the
+/// leaf must not be a symlink (`atomic_write` refuses those too) and its
+/// parent directory, once it exists, must resolve inside the canonical
+/// project root.
+fn confine_output_path(project_root: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    if std::fs::symlink_metadata(dest).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(miette!(
+            "refusing to write '{}': it is a symlink (remove it and rebuild)",
+            dest.display()
+        ));
+    }
+    let root = std::fs::canonicalize(project_root).map_err(|e| {
+        miette!(
+            "cannot resolve project root '{}': {e}",
+            project_root.display()
+        )
+    })?;
+    if let Some(parent_dir) = dest.parent() {
+        let parent = std::fs::canonicalize(parent_dir)
+            .map_err(|e| miette!("cannot resolve '{}': {e}", parent_dir.display()))?;
+        if !parent.starts_with(&root) {
+            return Err(miette!(
+                "refusing to write '{}': its directory resolves to '{}', outside the project root '{}'",
+                dest.display(),
+                parent.display(),
+                root.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn display_relative(path: &std::path::Path, project_root: &std::path::Path) -> String {
     path.strip_prefix(project_root)
         .map(|p| p.to_string_lossy().into_owned())
@@ -5160,6 +5214,91 @@ let pet: Animal = Dog(name=\"Rex\")
         assert!(
             !out_dir.join(".sourcemaps").join("main.py.map").exists(),
             "--check must not write .py.map sidecar"
+        );
+    }
+
+    /// `--check` is a dry run: it must not bootstrap the Python environment
+    /// either (which wrote `pyproject.toml` and, without `--no-sync`, ran
+    /// `uv sync`).
+    #[test]
+    fn build_check_does_not_write_pyproject() {
+        let tmp = tempfile::tempdir().unwrap();
+        scaffold(tmp.path(), "let x: int = 1\n");
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+            check: true,
+            no_sync: true,
+            with_ty: false,
+            optimise: false,
+        })
+        .unwrap();
+        assert!(
+            !tmp.path().join("pyproject.toml").exists(),
+            "--check must not write pyproject.toml"
+        );
+    }
+
+    /// A symlink pre-planted at an artifact path must not redirect the
+    /// write: a checkout can carry `build/main.py -> <anything the user can
+    /// write>` and git preserves it.
+    #[cfg(unix)]
+    #[test]
+    fn build_refuses_symlinked_artifact_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, out_dir) = scaffold(tmp.path(), "let x: int = 1\n");
+        let victim = tmp.path().join("victim.txt");
+        std::fs::write(&victim, "PRECIOUS\n").unwrap();
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::os::unix::fs::symlink(&victim, out_dir.join("main.py")).unwrap();
+        let err = run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+            check: false,
+            no_sync: true,
+            with_ty: false,
+            optimise: false,
+        })
+        .expect_err("a symlinked destination must fail the build");
+        assert!(
+            format!("{err:?}").contains("symlink"),
+            "error should name the symlink; got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "PRECIOUS\n",
+            "the link target must be untouched"
+        );
+    }
+
+    /// A symlinked output *directory* that resolves outside the project must
+    /// be refused too — every emitted file would otherwise land outside.
+    #[cfg(unix)]
+    #[test]
+    fn build_refuses_output_dir_escaping_project() {
+        let outside = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, out_dir) = scaffold(tmp.path(), "let x: int = 1\n");
+        std::os::unix::fs::symlink(outside.path(), &out_dir).unwrap();
+        let err = run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+            check: false,
+            no_sync: true,
+            with_ty: false,
+            optimise: false,
+        })
+        .expect_err("an escaping output directory must fail the build");
+        assert!(
+            format!("{err:?}").contains("outside the project root"),
+            "error should explain the escape; got {err:?}"
+        );
+        assert!(
+            !outside.path().join("main.py").exists(),
+            "nothing may be written outside the project"
         );
     }
 

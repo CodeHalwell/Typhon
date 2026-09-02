@@ -594,6 +594,62 @@ fn apply_simple_style_rules_with_paren_depth(
     line: &str,
     initial_paren_depth: i32,
 ) -> (String, i32) {
+    // Classify every byte with the preprocessor's shared, PEP 701-aware
+    // scanner and hide every string literal — quotes included — and every
+    // f-string replacement field behind a placeholder character before the
+    // spacing rules run. The rules then see only code (and comments, whose
+    // own `#` spacing rule still applies), and the hidden characters are
+    // restored one-for-one afterwards.
+    //
+    // The rule engine's own quote tracking below predates PEP 701 and cannot
+    // tell a nested same-quote f-string field (`f"{d["a:b"]}"`) or a format
+    // spec (`f"{x:.2f}"`) from code: it rewrote `d["a:b"]` to `d["a: b"]`
+    // (a `KeyError` at runtime) and `:.2f` to `: .2f` (a different format —
+    // the sign-aware space flag). The masking makes the engine's quote logic
+    // unreachable rather than trying to teach it the grammar.
+    const PLACEHOLDER: char = '\u{E000}';
+    let mut in_string: Option<tyc_syntax::lexmask::StringMode> = None;
+    let kinds = tyc_syntax::lexmask::scan_line_kinds(line, &mut in_string);
+    let mut masked = String::with_capacity(line.len());
+    let mut hidden: Vec<char> = Vec::new();
+    for (offset, ch) in line.char_indices() {
+        let is_code = kinds.get(offset).is_none_or(|k| {
+            matches!(
+                k,
+                tyc_syntax::lexmask::ByteKind::Code | tyc_syntax::lexmask::ByteKind::Comment
+            )
+        });
+        if is_code {
+            masked.push(ch);
+        } else {
+            masked.push(PLACEHOLDER);
+            hidden.push(ch);
+        }
+    }
+    let (styled, depth) = apply_simple_style_rules_unmasked(&masked, initial_paren_depth);
+    if hidden.is_empty() {
+        return (styled, depth);
+    }
+    let mut restored = String::with_capacity(styled.len());
+    let mut hidden = hidden.into_iter();
+    for ch in styled.chars() {
+        if ch == PLACEHOLDER {
+            // The engine only ever adds or removes whitespace, so every
+            // placeholder survives in order.
+            restored.push(hidden.next().unwrap_or(PLACEHOLDER));
+        } else {
+            restored.push(ch);
+        }
+    }
+    (restored, depth)
+}
+
+/// The spacing-rule engine proper. Operates on a line whose string,
+/// f-string-field and comment bytes have already been replaced by a
+/// placeholder character (see [`apply_simple_style_rules_with_paren_depth`]);
+/// its own quote tracking is kept for the case of a placeholder-free line but
+/// is no longer what keeps the rules out of literals.
+fn apply_simple_style_rules_unmasked(line: &str, initial_paren_depth: i32) -> (String, i32) {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
     let mut quote: Option<char> = None;
@@ -1284,14 +1340,24 @@ pub fn format_file(path: &Path) -> Result<bool, TycError> {
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
-    // Resolve symlinks so we rename over the *real* file. A bare `fs::write`
-    // followed the link and preserved it; renaming over the link path would
-    // instead replace the symlink with a regular file. Canonicalising and
-    // renaming over the target keeps the link intact (it still points at the
-    // freshly-written target). Falls back to the path itself if it can't be
-    // resolved (e.g. a broken link) — writing through then behaves like the
-    // previous in-place write.
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    // Refuse to write through a symlink. This used to canonicalise the path
+    // and rename over the *resolved* file so a user's own link stayed intact
+    // — but every caller writes into a tree it did not author (`tyc fmt` on
+    // a checkout, `tyc build` into `build/`), and git preserves symlinks, so
+    // a pre-planted `build/main.py -> ~/.ssh/authorized_keys` (or a linked
+    // `build/` directory) turned a build into an arbitrary file write
+    // outside the project, even under `--no-sync` / `TYC_NO_INTROSPECT`.
+    // A link at the destination is an error the caller reports; nothing is
+    // written and the link is left as it was.
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::other(format!(
+                "refusing to write through symlink '{}'",
+                path.display()
+            )));
+        }
+    }
+    let target = path.to_path_buf();
 
     let dir = target.parent().unwrap_or_else(|| Path::new("."));
     let file_name = target
@@ -1379,6 +1445,29 @@ mod tests {
                 "the walrus must not be split; got {out:?}"
             );
         }
+    }
+
+    #[test]
+    fn nested_fstring_fields_and_format_specs_are_left_alone() {
+        // PEP 701 same-quote nested fields and format specs are not code the
+        // spacing rules may touch: `d["a:b"]` must not become `d["a: b"]`
+        // (a `KeyError`) and `:.2f` must not become `: .2f` (a different
+        // format). The engine's own scanner could not tell; the lexmask can.
+        for src in [
+            "print(f\"{d[\"content-type\"]} {d[\"a,b\"]} {d[\"a:b\"]} {d[\"x+y\"]}\")\n",
+            "print(f\"{f'{x:.2f}'}|\")\n",
+            "print(f\"{x:.2f} {y:>8,} {z!r:^10}\")\n",
+            // (One space before an inline comment: the engine collapses
+            // internal space runs; PEP 8's two is ruff's job.)
+            "s = \"a,b:c=d->e\" # x,y:z\n",
+            "t = 'it''s' # don't\n",
+        ] {
+            let (out, _) = normalise_whitespace_with_map(src);
+            assert_eq!(out, src, "string / f-string contents must survive verbatim");
+        }
+        // Ordinary code around a literal is still normalised.
+        let (out, _) = normalise_whitespace_with_map("x={\"a:b\":1,\"c\":2}\n");
+        assert_eq!(out, "x = {\"a:b\": 1, \"c\": 2}\n");
     }
 
     #[test]

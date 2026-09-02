@@ -1,0 +1,19 @@
+import asyncio
+
+order: list[str] = []
+
+@gatherable
+async def fetch(tag: str) -> str:
+    await asyncio.sleep(0)
+    return tag
+
+async def run() -> None:
+    async def fetch(tag: str) -> str:
+        await asyncio.sleep(0.05 if tag == "a" else 0.0)
+        order.append(tag)
+        return tag
+    let a: str = await fetch("a")
+    let b: str = await fetch("b")
+    print(order, a, b)
+
+asyncio.run(run())

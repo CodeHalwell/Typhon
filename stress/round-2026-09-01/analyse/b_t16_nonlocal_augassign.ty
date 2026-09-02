@@ -1,0 +1,9 @@
+def outer() -> int:
+    let x: int = 1
+    def inner() -> None:
+        nonlocal x
+        x += 5
+    inner()
+    return x
+
+print(outer())

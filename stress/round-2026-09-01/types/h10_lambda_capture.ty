@@ -1,0 +1,19 @@
+from typing import Callable
+
+class Box:
+    val: int?
+
+impl Box:
+    def make(self) -> Callable[[], int]:
+        if self.val is None:
+            return lambda: 0
+        let f: Callable[[], int] = lambda: self.val + 1
+        self.val = None
+        return f
+
+def main() -> None:
+    let b: Box = Box(val=1)
+    print(b.make()())
+
+if __name__ == "__main__":
+    main()

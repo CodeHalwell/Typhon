@@ -1,0 +1,19 @@
+class Basket:
+    items: list[int]
+
+impl Basket:
+    def add(self, label: str) -> None:
+        self.items.append(label)
+    def total(self) -> int:
+        mut t: int = 0
+        for i in self.items:
+            t += i
+        return t
+
+def main() -> None:
+    let b: Basket = Basket(items=[1])
+    b.add("apple")
+    print(b.total())
+
+if __name__ == "__main__":
+    main()

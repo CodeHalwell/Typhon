@@ -1,0 +1,23 @@
+class Animal:
+    name: str
+class Dog(Animal):
+    breed: str
+
+interface Handler:
+    def handle(self, a: Animal) -> str
+
+class DogHandler:
+    tag: str
+
+impl DogHandler:
+    def handle(self, a: Dog) -> str:
+        return a.breed
+
+def run(h: Handler) -> str:
+    return h.handle(Animal(name="x"))
+
+def main() -> None:
+    print(run(DogHandler(tag="t")).upper())
+
+if __name__ == "__main__":
+    main()

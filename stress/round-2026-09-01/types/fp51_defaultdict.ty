@@ -1,0 +1,13 @@
+from collections import defaultdict, Counter
+
+def main() -> None:
+    let groups: dict[str, list[int]] = {}
+    groups.setdefault("a", []).append(1)
+    let dd: defaultdict[str, list[int]] = defaultdict(list)
+    dd["x"].append(2)
+    let c: Counter[str] = Counter("hello")
+    let top: list[tuple[str, int]] = c.most_common(1)
+    print(groups, dict(dd), top)
+
+if __name__ == "__main__":
+    main()

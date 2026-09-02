@@ -1,7 +1,7 @@
 # Contributing to Typhon
 
 Thanks for your interest in Typhon! It's an early-stage project (currently
-`v1.0.0-alpha`), so contributions, bug reports, and language feedback are all
+the `v1.0.0-alpha.x` series), so contributions, bug reports, and language feedback are all
 welcome.
 
 ## Ground rules

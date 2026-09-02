@@ -1,0 +1,514 @@
+import datetime
+from datetime import date, timedelta
+import time
+dt: datetime.datetime = datetime.datetime(2024, 2, 29, 13, 5, 9, 123456)
+d0: date = date(2024, 1, 31)
+td: timedelta = timedelta(days=1, hours=2, minutes=3, seconds=4.5)
+try:
+    print("X000", dt)
+except Exception as _e:
+    print("X000", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X001", repr(dt))
+except Exception as _e:
+    print("X001", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X002", dt.isoformat())
+except Exception as _e:
+    print("X002", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X003", dt.isoformat(" "))
+except Exception as _e:
+    print("X003", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X004", dt.isoformat(sep=" "))
+except Exception as _e:
+    print("X004", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X005", dt.isoformat(timespec="seconds"))
+except Exception as _e:
+    print("X005", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X006", dt.isoformat(timespec="milliseconds"))
+except Exception as _e:
+    print("X006", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X007", dt.date())
+except Exception as _e:
+    print("X007", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X008", dt.time())
+except Exception as _e:
+    print("X008", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X009", dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, dt.microsecond)
+except Exception as _e:
+    print("X009", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X010", dt.weekday(), dt.isoweekday())
+except Exception as _e:
+    print("X010", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X011", dt.timetuple()[:6])
+except Exception as _e:
+    print("X011", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X012", dt.toordinal())
+except Exception as _e:
+    print("X012", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X013", dt.timestamp())
+except Exception as _e:
+    print("X013", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X014", dt.replace(year=2028))
+except Exception as _e:
+    print("X014", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X015", dt.replace(microsecond=0))
+except Exception as _e:
+    print("X015", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X016", dt.strftime("%Y-%m-%d %H:%M:%S"))
+except Exception as _e:
+    print("X016", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X017", dt.strftime("%d/%m/%y %I:%M %p"))
+except Exception as _e:
+    print("X017", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X018", dt.strftime("%A %B %j %U %W %a %b %f %%"))
+except Exception as _e:
+    print("X018", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X019", dt.strftime("%G-W%V-%u"))
+except Exception as _e:
+    print("X019", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X020", dt.strftime("%H:%M:%S.%f"))
+except Exception as _e:
+    print("X020", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X021", dt.strftime("%Y%m%dT%H%M%S"))
+except Exception as _e:
+    print("X021", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X022", dt.strftime("%b %d, %Y"))
+except Exception as _e:
+    print("X022", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X023", dt.strftime("%-d") if False else "skip")
+except Exception as _e:
+    print("X023", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X024", dt.isocalendar())
+except Exception as _e:
+    print("X024", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X025", tuple(dt.isocalendar()))
+except Exception as _e:
+    print("X025", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X026", dt.ctime())
+except Exception as _e:
+    print("X026", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X027", dt.tzinfo)
+except Exception as _e:
+    print("X027", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X028", dt.utcoffset())
+except Exception as _e:
+    print("X028", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X029", dt.astimezone(datetime.timezone.utc).isoformat() if False else "skip-local")
+except Exception as _e:
+    print("X029", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X030", d0, repr(d0))
+except Exception as _e:
+    print("X030", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X031", d0 + timedelta(days=1))
+except Exception as _e:
+    print("X031", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X032", d0 - timedelta(days=31))
+except Exception as _e:
+    print("X032", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X033", d0.replace(day=1))
+except Exception as _e:
+    print("X033", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X034", d0.isoformat())
+except Exception as _e:
+    print("X034", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X035", d0.strftime("%Y%m%d"))
+except Exception as _e:
+    print("X035", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X036", d0.weekday())
+except Exception as _e:
+    print("X036", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X037", date(2024, 3, 1) - date(2024, 2, 1))
+except Exception as _e:
+    print("X037", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X038", (date(2024, 3, 1) - date(2024, 2, 1)).days)
+except Exception as _e:
+    print("X038", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X039", d0 < date(2025, 1, 1), d0 == date(2024, 1, 31))
+except Exception as _e:
+    print("X039", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X040", date.fromisoformat("2023-12-25"))
+except Exception as _e:
+    print("X040", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X041", date.fromordinal(738000))
+except Exception as _e:
+    print("X041", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X042", date(2024, 12, 31).timetuple().tm_yday)
+except Exception as _e:
+    print("X042", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X043", str(date(1, 1, 1)), date.min, date.max)
+except Exception as _e:
+    print("X043", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X044", min(d0, date(2020, 1, 1)), sorted([date(2024, 5, 1), d0]))
+except Exception as _e:
+    print("X044", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X045", d0.ctime())
+except Exception as _e:
+    print("X045", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X046", date.today() > date(2020, 1, 1))
+except Exception as _e:
+    print("X046", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X047", (date.today() - date.today()).days)
+except Exception as _e:
+    print("X047", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X048", date.today() == datetime.datetime.now().date())
+except Exception as _e:
+    print("X048", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X049", td, repr(td))
+except Exception as _e:
+    print("X049", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X050", td.days, td.seconds, td.microseconds, td.total_seconds())
+except Exception as _e:
+    print("X050", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X051", td * 2, td / 2, td // 2)
+except Exception as _e:
+    print("X051", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X052", td // timedelta(hours=1), td % timedelta(hours=1))
+except Exception as _e:
+    print("X052", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X053", -td, abs(-td), td + td, td - timedelta(days=2))
+except Exception as _e:
+    print("X053", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X054", timedelta(seconds=90061), timedelta(milliseconds=1500), timedelta(weeks=1), timedelta())
+except Exception as _e:
+    print("X054", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X055", timedelta(days=-1), timedelta(days=-1, seconds=1), timedelta(seconds=-1), str(timedelta(seconds=-1)))
+except Exception as _e:
+    print("X055", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X056", timedelta(hours=25), timedelta(microseconds=1), str(timedelta(days=2, microseconds=5)))
+except Exception as _e:
+    print("X056", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X057", timedelta(days=1) == timedelta(hours=24), timedelta(days=1) > timedelta(hours=23))
+except Exception as _e:
+    print("X057", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X058", timedelta(seconds=3600) / timedelta(seconds=60))
+except Exception as _e:
+    print("X058", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X059", timedelta(hours=1.5), timedelta(days=0.5), timedelta(minutes=1, seconds=-1))
+except Exception as _e:
+    print("X059", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X060", sum([timedelta(seconds=1)] * 3, timedelta()))
+except Exception as _e:
+    print("X060", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X061", bool(timedelta()), bool(timedelta(1)))
+except Exception as _e:
+    print("X061", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X062", repr(timedelta(0)), repr(timedelta(seconds=1.5)), repr(timedelta(days=1, seconds=1, microseconds=1)), repr(timedelta(weeks=2)), repr(timedelta(days=-2)))
+except Exception as _e:
+    print("X062", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X063", dt + td, dt - td)
+except Exception as _e:
+    print("X063", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X064", dt - datetime.datetime(2024, 1, 1))
+except Exception as _e:
+    print("X064", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X065", (dt - datetime.datetime(2024, 1, 1)).total_seconds())
+except Exception as _e:
+    print("X065", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X066", dt > datetime.datetime(2024, 1, 1), dt == datetime.datetime(2024, 2, 29, 13, 5, 9, 123456))
+except Exception as _e:
+    print("X066", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X067", datetime.datetime.fromisoformat("2024-01-02T03:04:05"))
+except Exception as _e:
+    print("X067", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X068", datetime.datetime.fromisoformat("2024-01-02 03:04:05.123"))
+except Exception as _e:
+    print("X068", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X069", datetime.datetime.fromisoformat("2024-01-02"))
+except Exception as _e:
+    print("X069", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X070", datetime.datetime.fromisoformat("2024-01-02T03:04:05+00:00"))
+except Exception as _e:
+    print("X070", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X071", datetime.datetime.fromisoformat("2024-01-02T03:04:05Z"))
+except Exception as _e:
+    print("X071", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X072", datetime.datetime.strptime("2024-03-04 05:06", "%Y-%m-%d %H:%M"))
+except Exception as _e:
+    print("X072", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X073", datetime.datetime.strptime("04/03/24", "%d/%m/%y"))
+except Exception as _e:
+    print("X073", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X074", datetime.datetime.strptime("Mar 4 2024", "%b %d %Y"))
+except Exception as _e:
+    print("X074", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X075", datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc))
+except Exception as _e:
+    print("X075", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X076", datetime.datetime.fromtimestamp(1700000000, tz=datetime.timezone.utc))
+except Exception as _e:
+    print("X076", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X077", datetime.datetime.fromtimestamp(1700000000.5, tz=datetime.timezone.utc).isoformat())
+except Exception as _e:
+    print("X077", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X078", datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc))
+except Exception as _e:
+    print("X078", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X079", datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc).isoformat())
+except Exception as _e:
+    print("X079", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X080", repr(datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)))
+except Exception as _e:
+    print("X080", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X081", datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc).timestamp())
+except Exception as _e:
+    print("X081", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X082", datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone(timedelta(hours=2))))
+except Exception as _e:
+    print("X082", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X083", datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone(timedelta(hours=2))).isoformat())
+except Exception as _e:
+    print("X083", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X084", datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone(timedelta(hours=2))).utcoffset())
+except Exception as _e:
+    print("X084", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X085", datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone(timedelta(hours=2))).astimezone(datetime.timezone.utc))
+except Exception as _e:
+    print("X085", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X086", datetime.datetime(2024, 1, 1, 12, tzinfo=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M %Z %z"))
+except Exception as _e:
+    print("X086", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X087", str(datetime.timezone.utc), repr(datetime.timezone.utc), str(datetime.timezone(timedelta(hours=-5))))
+except Exception as _e:
+    print("X087", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X088", datetime.datetime.min, datetime.datetime.max)
+except Exception as _e:
+    print("X088", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X089", datetime.datetime.now() > datetime.datetime(2020, 1, 1))
+except Exception as _e:
+    print("X089", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X090", datetime.datetime.now(datetime.timezone.utc).tzinfo is not None)
+except Exception as _e:
+    print("X090", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X091", datetime.datetime.now(datetime.UTC).tzinfo is not None)
+except Exception as _e:
+    print("X091", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X092", datetime.datetime.combine(d0, datetime.time(1, 2)))
+except Exception as _e:
+    print("X092", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X093", datetime.time(1, 2, 3), repr(datetime.time(1, 2)))
+except Exception as _e:
+    print("X093", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X094", datetime.time(23, 59).isoformat(), datetime.time(1, 2, 3, 400000).isoformat(), str(datetime.time()))
+except Exception as _e:
+    print("X094", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X095", datetime.time(12).strftime("%H:%M %p"))
+except Exception as _e:
+    print("X095", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X096", datetime.datetime(2024, 1, 1) + timedelta(days=366))
+except Exception as _e:
+    print("X096", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X097", datetime.datetime(2024, 1, 1, 0, 0, 0).strftime("%Y-%m-%dT%H:%M:%S.%fZ"))
+except Exception as _e:
+    print("X097", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X098", datetime.datetime(2024, 1, 31) + timedelta(days=30))
+except Exception as _e:
+    print("X098", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X099", datetime.datetime(2024, 1, 1) - datetime.datetime(2023, 12, 31, 23))
+except Exception as _e:
+    print("X099", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X100", datetime.MINYEAR, datetime.MAXYEAR)
+except Exception as _e:
+    print("X100", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X101", datetime.datetime(2024, 1, 1, 0, 0, 0, 5).isoformat())
+except Exception as _e:
+    print("X101", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X102", datetime.datetime(2024, 1, 1, 0, 0, 0, 5000).isoformat())
+except Exception as _e:
+    print("X102", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X103", datetime.datetime(2023, 2, 29))
+except Exception as _e:
+    print("X103", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X104", datetime.datetime(2024, 13, 1))
+except Exception as _e:
+    print("X104", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X105", datetime.datetime.fromisoformat("bad"))
+except Exception as _e:
+    print("X105", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X106", datetime.datetime.strptime("x", "%Y"))
+except Exception as _e:
+    print("X106", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X107", datetime.datetime(2024, 1, 1) - datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc))
+except Exception as _e:
+    print("X107", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X108", time.gmtime(0)[:6])
+except Exception as _e:
+    print("X108", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X109", time.gmtime(86400 * 365)[:8])
+except Exception as _e:
+    print("X109", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X110", time.strftime("%Y-%m-%d", time.gmtime(0)))
+except Exception as _e:
+    print("X110", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X111", time.strftime("%H:%M:%S", time.gmtime(3661)))
+except Exception as _e:
+    print("X111", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X112", time.time() > 1.7e9, type(time.time()).__name__)
+except Exception as _e:
+    print("X112", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X113", time.monotonic() >= 0, time.perf_counter() >= 0, time.process_time() >= 0)
+except Exception as _e:
+    print("X113", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X114", time.time_ns() > 0, time.monotonic_ns() >= 0, time.perf_counter_ns() >= 0)
+except Exception as _e:
+    print("X114", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X115", time.sleep(0))
+except Exception as _e:
+    print("X115", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X116", time.localtime().tm_year >= 2024)
+except Exception as _e:
+    print("X116", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X117", time.mktime(time.gmtime(0)) is not None)
+except Exception as _e:
+    print("X117", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X118", time.asctime(time.gmtime(0)))
+except Exception as _e:
+    print("X118", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X119", time.ctime(0) is not None)
+except Exception as _e:
+    print("X119", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X120", time.gmtime(0).tm_wday, time.gmtime(0).tm_yday, time.gmtime(0).tm_isdst)
+except Exception as _e:
+    print("X120", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X121", time.struct_time((2024, 1, 1, 0, 0, 0, 0, 1, 0)).tm_year)
+except Exception as _e:
+    print("X121", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X122", time.timezone is not None)
+except Exception as _e:
+    print("X122", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X123", time.strptime("2024-01-02", "%Y-%m-%d")[:3])
+except Exception as _e:
+    print("X123", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X124", time.strftime("%j %U %a %A %b %B %p", time.gmtime(0)))
+except Exception as _e:
+    print("X124", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X125", time.gmtime(1e9))
+except Exception as _e:
+    print("X125", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X126", time.gmtime(-1)[:6], time.gmtime(2**31)[:6], time.gmtime(0.5)[:6], time.gmtime(1.9999)[:6])
+except Exception as _e:
+    print("X126", "ERR", type(_e).__name__, str(_e)[:70])

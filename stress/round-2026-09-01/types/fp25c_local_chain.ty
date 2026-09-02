@@ -1,0 +1,20 @@
+class Inner:
+    c: int?
+class Outer:
+    b: Inner?
+
+def f(a: Outer?) -> int:
+    if a is not None and a.b is not None:
+        return len(a.b.c or [])
+    return 0
+
+def h(a: Outer?) -> int:
+    if a is not None and a.b is not None and a.b.c is not None:
+        return a.b.c
+    return 0
+
+def main() -> None:
+    print(f(None), h(None))
+
+if __name__ == "__main__":
+    main()

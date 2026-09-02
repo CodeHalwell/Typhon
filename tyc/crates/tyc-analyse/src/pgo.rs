@@ -54,7 +54,20 @@ pub fn pgo_memoise_targets(
     let mut out: Vec<String> = Vec::new();
     for name in candidate_fn_names {
         let qualified = format!("{}.{}", module_name, name);
-        let sample = profile.get(&qualified).or_else(|| profile.get(name));
+        // `tyc profile` records `fn.__module__`, and the entry module runs as
+        // `__main__` — so a profile a user actually generates keys the entry
+        // module's functions as `__main__.<fn>`, never `main.<fn>`. Accept
+        // that spelling for the entry module (and only there: a `__main__`
+        // sample can only have come from the script that was run).
+        let script_qualified = format!("__main__.{}", name);
+        let sample = profile
+            .get(&qualified)
+            .or_else(|| {
+                (module_name == "main")
+                    .then(|| profile.get(&script_qualified))
+                    .flatten()
+            })
+            .or_else(|| profile.get(name));
         if sample.is_some_and(|s| s.calls >= min_calls) {
             out.push(name.clone());
         }
@@ -315,6 +328,23 @@ mod tests {
             pgo_memoise_targets(&profile, "util", &candidates, 100).is_empty(),
             "different module must not match"
         );
+    }
+
+    /// A profile written by `tyc profile` keys the entry module's functions
+    /// as `__main__.<fn>` (that is what `fn.__module__` reads when the script
+    /// is run), so the round trip never promoted anything until the entry
+    /// module accepted that spelling. Other modules must not: a
+    /// `__main__.helper` sample says nothing about `util.helper`.
+    #[test]
+    fn pgo_targets_accept_dunder_main_for_the_entry_module() {
+        let mut profile = HashMap::new();
+        profile.insert("__main__.fib".to_string(), sample(1000));
+        let candidates = vec!["fib".to_string()];
+        assert_eq!(
+            pgo_memoise_targets(&profile, "main", &candidates, 100),
+            vec!["fib"]
+        );
+        assert!(pgo_memoise_targets(&profile, "util", &candidates, 100).is_empty());
     }
 
     #[test]

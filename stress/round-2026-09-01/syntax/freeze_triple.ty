@@ -1,0 +1,9 @@
+freeze let BANNER = """
+hello
+"""
+
+def main() -> None:
+    print(BANNER.strip())
+
+if __name__ == "__main__":
+    main()

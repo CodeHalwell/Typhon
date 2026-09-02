@@ -133,12 +133,34 @@ pub fn collect_py_files(root: &Path) -> Result<Vec<PathBuf>> {
 /// `.X` directory. Files are still matched by extension.
 fn collect_with_ext_filtered(root: &Path, ext: &str, acc: &mut Vec<PathBuf>) -> Result<()> {
     let mut visited = HashSet::new();
-    collect_with_ext_impl(root, ext, acc, &mut visited, true)
+    let base = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    collect_with_ext_impl(root, &base, ext, acc, &mut visited, true)
 }
 
 fn collect_with_ext(root: &Path, ext: &str, acc: &mut Vec<PathBuf>) -> Result<()> {
     let mut visited = HashSet::new();
-    collect_with_ext_impl(root, ext, acc, &mut visited, false)
+    let base = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    collect_with_ext_impl(root, &base, ext, acc, &mut visited, false)
+}
+
+/// Whether `path` is a symlink whose target resolves outside `base` (the
+/// canonical root of the walk). A checked-out tree can carry a symlink to
+/// anywhere the user can read or write — `src/linked.ty -> ~/.bashrc` — and
+/// git preserves it, so `tyc fmt src/` would rewrite the target and
+/// `tyc check src/` would walk it. Links that stay inside the tree (a shared
+/// source directory) are still followed; links that leave it are skipped.
+fn symlink_escapes(path: &Path, base: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.file_type().is_symlink() {
+        return false;
+    }
+    match std::fs::canonicalize(path) {
+        Ok(target) => !target.starts_with(base),
+        // A dangling link resolves nowhere useful; skip it either way.
+        Err(_) => true,
+    }
 }
 
 /// Shared source-tree walk behind [`collect_with_ext`] and
@@ -160,11 +182,19 @@ fn collect_with_ext(root: &Path, ext: &str, acc: &mut Vec<PathBuf>) -> Result<()
 /// of once per link.
 fn collect_with_ext_impl(
     root: &Path,
+    base: &Path,
     ext: &str,
     acc: &mut Vec<PathBuf>,
     visited: &mut HashSet<PathBuf>,
     filtered: bool,
 ) -> Result<()> {
+    if symlink_escapes(root, base) {
+        eprintln!(
+            "warning: skipping '{}': symlink resolves outside the source tree",
+            root.display()
+        );
+        return Ok(());
+    }
     if root.is_file() {
         if root.extension().map(|e| e == ext).unwrap_or(false) {
             acc.push(root.to_path_buf());
@@ -200,7 +230,7 @@ fn collect_with_ext_impl(
                     }
                 }
             }
-            collect_with_ext_impl(&path, ext, acc, visited, filtered)?;
+            collect_with_ext_impl(&path, base, ext, acc, visited, filtered)?;
         }
     }
     Ok(())
@@ -497,6 +527,41 @@ fn merge_pub_visible(
 
 #[cfg(test)]
 mod tests {
+    /// A symlink under `src/` that resolves outside the tree is skipped (so
+    /// `tyc fmt src/` cannot rewrite a file outside the project and
+    /// `tyc check src/` cannot be pointed at `/usr`), while a link that
+    /// stays inside the tree is still followed.
+    #[cfg(unix)]
+    #[test]
+    fn collector_skips_symlinks_that_leave_the_tree() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("ext.ty"), "let x: int = 1\n").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("inner")).unwrap();
+        std::fs::write(src.join("inner").join("real.ty"), "let y: int = 2\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), src.join("linkdir")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("ext.ty"), src.join("linkfile.ty")).unwrap();
+        std::os::unix::fs::symlink(src.join("inner"), src.join("alias")).unwrap();
+        let files = super::collect_ty_files(&src).unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.strip_prefix(&src).unwrap().to_string_lossy().into_owned())
+            .collect();
+        // Whichever path reached `real.ty` first (`alias/` sorts before
+        // `inner/`) is the one listed; the point is that it is listed once.
+        assert!(names.iter().any(|n| n.ends_with("real.ty")), "{names:?}");
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.starts_with("linkdir") || n == "linkfile.ty"),
+            "escaping links must be skipped: {names:?}"
+        );
+        // The in-tree alias resolves to a directory already visited, so it
+        // is deduplicated rather than listed twice — but never rejected.
+        assert_eq!(names.iter().filter(|n| n.ends_with("real.ty")).count(), 1);
+    }
+
     use super::*;
     use crate::config::TyphonConfig;
 

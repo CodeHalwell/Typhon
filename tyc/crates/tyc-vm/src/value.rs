@@ -1141,6 +1141,12 @@ pub struct Class {
 pub struct ClassField {
     pub name: String,
     pub default: Option<Value>,
+    /// The field's annotation as source text (`int`, `list[str]`,
+    /// `Address | None`), when the class body declared one. Surfaced by
+    /// `dataclasses.fields(...)` as `Field.type` — the emitted Python runs
+    /// under `from __future__ import annotations`, so CPython's `Field.type`
+    /// is that same string.
+    pub annotation: Option<String>,
 }
 
 pub struct Instance {
@@ -1678,10 +1684,12 @@ impl Value {
                     "Python int too large to convert to C int",
                 ))
             }),
-            Value::Str(s) => s
-                .trim()
-                .parse::<i64>()
-                .map_err(|_| value_error(format!("invalid literal for int(): {:?}", s.as_str()))),
+            Value::Str(s) => s.trim().parse::<i64>().map_err(|_| {
+                value_error(format!(
+                    "invalid literal for int() with base 10: {}",
+                    Value::Str(s.clone()).py_repr()
+                ))
+            }),
             _ => Err(type_error(format!(
                 "int() argument must be a string or a number, not '{}'",
                 self.type_name()
@@ -1702,10 +1710,12 @@ impl Value {
             // and CPython raises `OverflowError` / `ValueError` here — so
             // convert exactly and reject what has no integer value.
             Value::Float(x) => float_to_bigint(*x),
-            Value::Str(s) => s
-                .trim()
-                .parse::<BigInt>()
-                .map_err(|_| value_error(format!("invalid literal for int(): {:?}", s.as_str()))),
+            Value::Str(s) => s.trim().parse::<BigInt>().map_err(|_| {
+                value_error(format!(
+                    "invalid literal for int() with base 10: {}",
+                    Value::Str(s.clone()).py_repr()
+                ))
+            }),
             _ => Err(type_error(format!(
                 "int() argument must be a string or a number, not '{}'",
                 self.type_name()
@@ -1848,6 +1858,7 @@ impl Value {
             // instance: the message/args, not `ClassName('msg')`.
             Value::Instance(i) => match exception_instance_args(i) {
                 Some(args) => exception_instance_str(i, &args),
+                None if class_is_pydantic_model(&i.class) => model_instance_str(i),
                 None => instance_repr(i),
             },
             // Match the dataclass-default `repr` shape that
@@ -2151,23 +2162,61 @@ fn instance_repr_inner(inst: &Instance) -> String {
         }
     }
     let mut parts: Vec<String> = Vec::with_capacity(fields.len());
-    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for cf in &inst.class.fields {
         if let Some(v) = fields.get(&cf.name) {
             parts.push(format!("{}={}", cf.name, v.py_repr()));
-            seen.insert(cf.name.as_str());
         }
     }
-    // Any extra attributes not declared as class fields, in name order.
-    let mut extras: Vec<(&String, &Value)> = fields
-        .iter()
-        .filter(|(k, _)| !seen.contains(k.as_str()))
-        .collect();
-    extras.sort_by(|a, b| a.0.cmp(b.0));
-    for (k, v) in extras {
-        parts.push(format!("{}={}", k, v.py_repr()));
+    // A dataclass (or pydantic model) repr shows its declared fields and
+    // nothing else — not class attributes copied onto the instance (a
+    // `model`'s `model_config` leaked into every repr before this) and not
+    // attributes assigned later. Only a class with no declared fields at all
+    // (a `plain class` with a hand-written `__init__`) falls back to listing
+    // whatever the instance carries, in name order.
+    if inst.class.fields.is_empty() {
+        let mut extras: Vec<(&String, &Value)> = fields.iter().collect();
+        extras.sort_by(|a, b| a.0.cmp(b.0));
+        for (k, v) in extras {
+            parts.push(format!("{}={}", k, v.py_repr()));
+        }
     }
     format!("{}({})", inst.class.name, parts.join(", "))
+}
+
+/// `str()` of a pydantic `model` instance: `BaseModel.__str__` renders the
+/// fields space-separated with no class name — `id=2 name='Grace' age=None`.
+fn model_instance_str(inst: &Instance) -> String {
+    let fields = inst.fields.borrow();
+    let parts: Vec<String> = inst
+        .class
+        .fields
+        .iter()
+        .filter_map(|cf| {
+            fields
+                .get(&cf.name)
+                .map(|v| format!("{}={}", cf.name, v.py_repr()))
+        })
+        .collect();
+    parts.join(" ")
+}
+
+/// Whether a class was declared with Typhon's `model` keyword (a pydantic
+/// `BaseModel` subclass). The interpreter stamps the marker at class-definition
+/// time; it inherits along with the other class attributes.
+pub fn class_is_pydantic_model(class: &Class) -> bool {
+    class
+        .class_attrs
+        .borrow()
+        .contains_key("__typhon_pydantic_model__")
+}
+
+/// Whether a class is a dataclass — Typhon's default `class` (and `class …
+/// frozen`) — as `dataclasses.is_dataclass` reports it.
+pub fn class_is_dataclass(class: &Class) -> bool {
+    class
+        .class_attrs
+        .borrow()
+        .contains_key("__typhon_dataclass__")
 }
 
 /// CPython-compatible `repr(float)`. Produces the shortest string that
@@ -2506,6 +2555,7 @@ mod tests {
                 .map(|n| ClassField {
                     name: (*n).to_owned(),
                     default: Option::None,
+                    annotation: Option::None,
                 })
                 .collect(),
             class_attrs: RefCell::new(HashMap::new()),

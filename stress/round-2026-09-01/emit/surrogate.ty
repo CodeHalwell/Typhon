@@ -1,0 +1,5 @@
+def main() -> None:
+    let s: str = "\ud800"
+    print(len(s))
+
+main()

@@ -1,0 +1,8 @@
+def f(x: int) -> float:
+    let a: float = x / 0
+    let b: int = x // 0
+    let c: float = x % -0.0
+    let d: float = x / (0)
+    let e: float = x / (1 - 1)
+    let g: int = x // 0b0
+    return a + b + c + d + e + g

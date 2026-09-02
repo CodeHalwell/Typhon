@@ -1,0 +1,31 @@
+class C0:
+    f0: int
+class C1(C0):
+    f1: int
+class C2(C1):
+    f2: int
+class C3(C2):
+    f3: int
+class C4(C3):
+    f4: int
+class C5(C4):
+    f5: int
+class C6(C5):
+    f6: int
+class C7(C6):
+    f7: int
+class C8(C7):
+    f8: int
+class C9(C8):
+    f9: int
+class C10(C9):
+    f10: int
+class C11(C10):
+    f11: int
+
+def main() -> None:
+    let c: C0 = C11(f0=0, f1=1, f2=2, f3=3, f4=4, f5=5, f6=6, f7=7, f8=8, f9=9, f10=10, f11=11)
+    print(c.f0)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,22 @@
+class Cons[T]:
+    head: T
+    tail: LL[T]
+
+class Nil:
+    pass
+
+type LL[T] = Cons[T] | Nil
+
+impl[T] LL[T]:
+    def length(self) -> int:
+        match self:
+            case Cons(_, t):
+                return 1 + t.length()
+            case Nil():
+                return 0
+
+def main() -> None:
+    let l: LL[int] = Cons(head=1, tail=Cons(head=2, tail=Nil()))
+    print(l.length())
+
+main()

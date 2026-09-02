@@ -1,0 +1,9 @@
+def f(s: str) -> int:
+    let n: int
+    try:
+        n = int(s)
+    except ValueError:
+        n = 0
+    return n
+
+print(f("x"))

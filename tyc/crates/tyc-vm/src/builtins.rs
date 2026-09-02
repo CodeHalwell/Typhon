@@ -897,15 +897,21 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("enumerate", |i, args| {
+        let mut args = args.into_iter();
         let iterable = args
-            .into_iter()
             .next()
             .ok_or_else(|| type_error("enumerate() requires an iterable"))?;
+        // The positional `start` (`enumerate(xs, 1)`); the keyword form is
+        // decoded in `call_with_kwargs`.
+        let start = match args.next() {
+            Some(v) => v.to_int()?,
+            None => 0,
+        };
         let inner = i.make_iter(iterable)?;
         if let Value::Iter(it) = inner {
             Ok(Value::Iter(Rc::new(RefCell::new(IterState::Enumerate {
                 inner: it,
-                index: 0,
+                index: start,
             }))))
         } else {
             unreachable!()
@@ -985,13 +991,16 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("next", |i, args| {
+        let mut args = args.into_iter();
         let it = args
-            .into_iter()
             .next()
             .ok_or_else(|| type_error("next() requires an iterator"))?;
+        // `next(it, default)` returns `default` on exhaustion instead of
+        // raising `StopIteration`.
+        let default = args.next();
         match i.iter_next(&it)? {
             Some(v) => Ok(v),
-            None => Err(stop_iteration()),
+            None => default.ok_or_else(stop_iteration),
         }
     });
 
@@ -1288,6 +1297,16 @@ pub fn install(interp: &mut Interpreter) {
     });
     root.set("Ok", Value::Native(Rc::new(ok_ctor)));
     root.set("Err", Value::Native(Rc::new(err_ctor)));
+    // `exit()` / `quit()` (the `site` module's helpers) raise `SystemExit`
+    // exactly like `sys.exit()`.
+    for name in ["exit", "quit"] {
+        root.set(
+            name,
+            Value::Native(Rc::new(NativeFn::new(name, |_i, args| {
+                Err(crate::error::system_exit(args))
+            }))),
+        );
+    }
     // `try_result(thunk[, on_err])` — exception→Result bridging combinator,
     // available as a prelude name and re-exported from the typhon_runtime
     // module shim below.
@@ -2920,10 +2939,7 @@ fn make_sys_module(interp: &Interpreter) -> Value {
             ),
             (
                 "exit",
-                nf("exit", |_i, args| {
-                    let code = args.first().map(|v| v.to_int().unwrap_or(0)).unwrap_or(0);
-                    std::process::exit(code as i32);
-                }),
+                nf("exit", |_i, args| Err(crate::error::system_exit(args))),
             ),
             ("stdout", make_std_stream("sys.stdout", false)),
             ("stderr", make_std_stream("sys.stderr", true)),
@@ -2970,12 +2986,15 @@ fn make_json_module() -> Value {
             (
                 "dumps",
                 nf("dumps", |_i, args| {
-                    Ok(Value::Str(Rc::new(json_dumps(
+                    Ok(Value::Str(Rc::new(json_dumps_with(
                         single(&args, "dumps")?,
-                        false,
-                    ))))
+                        &JsonDumpOpts::defaults(),
+                    )?)))
                 }),
             ),
+            // The exception class `loads` raises — exported so
+            // `except json.JSONDecodeError` matches by identity.
+            ("JSONDecodeError", Value::Class(json_decode_error_class())),
             (
                 "loads",
                 nf("loads", |_i, args| {
@@ -2999,7 +3018,7 @@ fn make_json_module() -> Value {
                     if args.len() < 2 {
                         return Err(crate::error::type_error("dump() requires (obj, fp)"));
                     }
-                    let serialised = json_dumps(&args[0], false);
+                    let serialised = json_dumps_with(&args[0], &JsonDumpOpts::defaults())?;
                     let fp = args[1].clone();
                     let write = interp.get_attr(&fp, "write")?;
                     interp.call_value(write, vec![Value::Str(Rc::new(serialised))], &[])?;
@@ -4478,9 +4497,32 @@ fn make_asyncio_module() -> Value {
         Ok(cm)
     });
     let queue = nf("Queue", |_i, args| Ok(make_asyncio_queue(&args, &[])));
+    // The exception classes `asyncio` re-exports or defines. `TimeoutError`
+    // has been the builtin since 3.11; `CancelledError` derives from
+    // `BaseException`; `QueueEmpty` / `QueueFull` are what `Queue.get_nowait`
+    // / `put_nowait` raise. Each constructs the same `Value::Exception` shape
+    // the builtin constructors do, so `except asyncio.X` matches by kind.
+    let exc_ctor = |kind: &'static str| -> (&'static str, Value) {
+        (
+            kind,
+            Value::Native(Rc::new(NativeFn::new(kind, move |_i, args| {
+                let msg = args.first().map(|v| v.py_str()).unwrap_or_default();
+                Ok(Value::Exception {
+                    kind: Rc::new(kind.to_owned()),
+                    message: Rc::new(msg),
+                    args: Rc::new(args),
+                })
+            }))),
+        )
+    };
     make_module(
         "asyncio",
         vec![
+            exc_ctor("TimeoutError"),
+            exc_ctor("CancelledError"),
+            exc_ctor("InvalidStateError"),
+            exc_ctor("QueueEmpty"),
+            exc_ctor("QueueFull"),
             (
                 "run",
                 nf("run", |i, args| {
@@ -5552,15 +5594,77 @@ fn make_dataclasses_module() -> Value {
     });
     let asdict = nf("asdict", |_i, args| {
         let v = single(&args, "asdict")?;
-        if let Value::Instance(inst) = v {
-            let mut map: DictMap = IndexMap::new();
-            for (k, val) in inst.fields.borrow().iter() {
-                map.insert(HashKey::Str(Rc::new(k.clone())), val.clone());
+        match v {
+            Value::Instance(inst) if crate::value::class_is_dataclass(&inst.class) => {
+                Ok(dataclass_convert(v, false))
             }
-            Ok(Value::Dict(Rc::new(RefCell::new(map))))
-        } else {
-            Err(type_error("asdict() requires a dataclass instance"))
+            _ => Err(type_error(
+                "asdict() should be called on dataclass instances",
+            )),
         }
+    });
+    let astuple = nf("astuple", |_i, args| {
+        let v = single(&args, "astuple")?;
+        match v {
+            Value::Instance(inst) if crate::value::class_is_dataclass(&inst.class) => {
+                Ok(dataclass_convert(v, true))
+            }
+            _ => Err(type_error(
+                "astuple() should be called on dataclass instances",
+            )),
+        }
+    });
+    let is_dataclass = nf("is_dataclass", |_i, args| {
+        let v = single(&args, "is_dataclass")?;
+        Ok(Value::Bool(match v {
+            Value::Instance(inst) => crate::value::class_is_dataclass(&inst.class),
+            Value::Class(class) => crate::value::class_is_dataclass(class),
+            _ => false,
+        }))
+    });
+    let fields = nf("fields", |_i, args| {
+        let v = single(&args, "fields")?;
+        let class = match v {
+            Value::Instance(inst) if crate::value::class_is_dataclass(&inst.class) => {
+                inst.class.clone()
+            }
+            Value::Class(class) if crate::value::class_is_dataclass(class) => class.clone(),
+            _ => {
+                return Err(type_error(
+                    "must be called with a dataclass type or instance",
+                ))
+            }
+        };
+        let field_class = dataclass_field_class();
+        let items: Vec<Value> = class
+            .fields
+            .iter()
+            .map(|f| {
+                let mut attrs: HashMap<String, Value> = HashMap::new();
+                attrs.insert("name".to_owned(), Value::Str(Rc::new(f.name.clone())));
+                attrs.insert(
+                    "type".to_owned(),
+                    f.annotation
+                        .as_ref()
+                        .map(|a| Value::Str(Rc::new(a.clone())))
+                        .unwrap_or(Value::None),
+                );
+                attrs.insert(
+                    "default".to_owned(),
+                    f.default.clone().unwrap_or(Value::None),
+                );
+                Value::Instance(Rc::new(crate::value::Instance {
+                    class: field_class.clone(),
+                    fields: RefCell::new(attrs),
+                }))
+            })
+            .collect();
+        Ok(Value::Tuple(Rc::new(items)))
+    });
+    // `replace(obj, **changes)` — the keyword-carrying call is routed through
+    // `call_with_kwargs`; the bare positional form is a copy.
+    let replace = nf("dataclasses.replace", |interp, args| {
+        dataclass_replace(interp, args, &[])
     });
     make_module(
         "dataclasses",
@@ -5568,8 +5672,127 @@ fn make_dataclasses_module() -> Value {
             ("dataclass", dataclass),
             ("field", field),
             ("asdict", asdict),
+            ("astuple", astuple),
+            ("fields", fields),
+            ("is_dataclass", is_dataclass),
+            ("replace", replace),
         ],
     )
+}
+
+/// `dataclasses.asdict` / `astuple` value conversion: a dataclass instance
+/// becomes a dict (or tuple) of its fields in declaration order, containers
+/// are rebuilt with converted elements, and everything else is copied as is.
+/// Recursion follows CPython's `_asdict_inner` — nested dataclasses, lists,
+/// tuples and dict values are all converted.
+fn dataclass_convert(v: &Value, as_tuple: bool) -> Value {
+    match v {
+        Value::Instance(inst) if crate::value::class_is_dataclass(&inst.class) => {
+            let fields = inst.fields.borrow();
+            let values = inst
+                .class
+                .fields
+                .iter()
+                .filter_map(|f| fields.get(&f.name).map(|x| (f.name.clone(), x)));
+            if as_tuple {
+                Value::Tuple(Rc::new(
+                    values.map(|(_, x)| dataclass_convert(x, true)).collect(),
+                ))
+            } else {
+                let mut map: DictMap = IndexMap::new();
+                for (name, x) in values {
+                    map.insert(HashKey::Str(Rc::new(name)), dataclass_convert(x, false));
+                }
+                Value::Dict(Rc::new(RefCell::new(map)))
+            }
+        }
+        Value::List(l) => Value::List(Rc::new(RefCell::new(
+            l.borrow()
+                .iter()
+                .map(|x| dataclass_convert(x, as_tuple))
+                .collect(),
+        ))),
+        Value::Tuple(t) => Value::Tuple(Rc::new(
+            t.iter().map(|x| dataclass_convert(x, as_tuple)).collect(),
+        )),
+        Value::Dict(d) => {
+            let mut map: DictMap = IndexMap::new();
+            for (k, x) in d.borrow().iter() {
+                map.insert(k.clone(), dataclass_convert(x, as_tuple));
+            }
+            Value::Dict(Rc::new(RefCell::new(map)))
+        }
+        other => other.clone(),
+    }
+}
+
+/// `dataclasses.replace(obj, **changes)`: a new instance of the same class
+/// built through the ordinary constructor path (so `__post_init__` runs, as
+/// in CPython) from the current field values with `changes` applied. An
+/// unknown field name raises CPython's `TypeError`.
+pub(crate) fn dataclass_replace(
+    interp: &mut Interpreter,
+    args: Vec<Value>,
+    changes: &[(String, Value)],
+) -> Result<Value, Unwind> {
+    let inst = match args.first() {
+        Some(Value::Instance(inst)) if crate::value::class_is_dataclass(&inst.class) => {
+            inst.clone()
+        }
+        _ => {
+            return Err(type_error(
+                "replace() should be called on dataclass instances",
+            ))
+        }
+    };
+    let class = inst.class.clone();
+    let mut kwargs: Vec<(String, Value)> = {
+        let fields = inst.fields.borrow();
+        class
+            .fields
+            .iter()
+            .filter_map(|f| fields.get(&f.name).map(|v| (f.name.clone(), v.clone())))
+            .collect()
+    };
+    for (k, v) in changes {
+        match kwargs.iter_mut().find(|(name, _)| name == k) {
+            Some(slot) => slot.1 = v.clone(),
+            None => {
+                return Err(type_error(format!(
+                    "{}.__init__() got an unexpected keyword argument '{}'",
+                    class.name, k
+                )))
+            }
+        }
+    }
+    interp.instantiate(&class, vec![], &kwargs)
+}
+
+thread_local! {
+    /// The `dataclasses.Field` stand-in `fields()` returns: `name`, `type`
+    /// (annotation text) and `default`.
+    static DATACLASS_FIELD_CLASS: Rc<crate::value::Class> = Rc::new(crate::value::Class {
+        name: "Field".to_owned(),
+        methods: RefCell::new(HashMap::new()),
+        fields: ["name", "type", "default"]
+            .iter()
+            .map(|n| crate::value::ClassField {
+                name: (*n).to_owned(),
+                default: None,
+                annotation: None,
+            })
+            .collect(),
+        class_attrs: RefCell::new(HashMap::new()),
+        bases: vec![],
+        properties: RefCell::new(HashSet::new()),
+        classmethods: RefCell::new(HashSet::new()),
+        is_exception: false,
+        is_protocol: false,
+    });
+}
+
+fn dataclass_field_class() -> Rc<crate::value::Class> {
+    DATACLASS_FIELD_CLASS.with(|c| c.clone())
 }
 
 /// `pathlib` shim.
@@ -6890,14 +7113,32 @@ fn list_method(
             Ok(Value::None)
         }
         "index" => {
-            let target = single(args, "index")?.clone();
+            // `list.index(x[, start[, stop]])` — the bounds are clamped like
+            // a slice (negatives count from the end).
+            let target = args
+                .first()
+                .ok_or_else(|| type_error("index expected at least 1 argument, got 0"))?
+                .clone();
             let items = l.borrow().clone();
-            for (i, v) in items.iter().enumerate() {
+            let len = items.len() as i64;
+            let clamp = |raw: i64| -> usize {
+                let v = if raw < 0 { raw + len } else { raw };
+                v.clamp(0, len) as usize
+            };
+            let start = match args.get(1) {
+                Some(v) => clamp(v.to_int()?),
+                None => 0,
+            };
+            let stop = match args.get(2) {
+                Some(v) => clamp(v.to_int()?),
+                None => items.len(),
+            };
+            for (i, v) in items.iter().enumerate().take(stop).skip(start) {
                 if interp.values_equal(v, &target)? {
                     return Ok(Value::Int(VmInt::from(i as i64)));
                 }
             }
-            Err(value_error("list.index(x): x not in list"))
+            Err(value_error(format!("{} is not in list", target.py_repr())))
         }
         "count" => {
             let target = single(args, "count")?.clone();
@@ -7115,7 +7356,7 @@ fn dict_method(
             // keys (matches CPython `dict.pop` semantics).
             match d.borrow_mut().shift_remove(&k) {
                 Some(v) => Ok(v),
-                None => default.ok_or_else(|| key_error(format!("{:?}", k))),
+                None => default.ok_or_else(|| crate::error::key_error_for(&k.clone().into_value())),
             }
         }
         "update" => {
@@ -7291,7 +7532,7 @@ fn set_method(
             let k = single(args, name)?.to_hash_key()?;
             let removed = s.borrow_mut().remove(&k);
             if name == "remove" && !removed {
-                return Err(key_error(format!("{:?}", k)));
+                return Err(crate::error::key_error_for(&k.clone().into_value()));
             }
             Ok(Value::None)
         }
@@ -7440,148 +7681,331 @@ fn num_method(v: &Value, name: &str, args: &[Value]) -> Result<Value, Unwind> {
 
 // ── JSON ───────────────────────────────────────────────────────────────────
 
-/// `json.dumps(v, indent=n)` — pretty-printed with `n`-space indentation.
-fn json_dumps_indent(v: &Value, indent: usize, level: usize, sort: bool) -> String {
-    let pad = " ".repeat(indent * (level + 1));
-    let close_pad = " ".repeat(indent * level);
+// ── json ─────────────────────────────────────────────────────────────────────
+//
+// `json.dumps` / `json.loads` are modelled on CPython's `json` package closely
+// enough that a program's stdout does not depend on which execution surface
+// ran it: the encoder honours `indent`, `separators`, `sort_keys`,
+// `ensure_ascii` and `allow_nan` and raises the same `TypeError` /
+// `ValueError` CPython does; the decoder reports the same `JSONDecodeError`
+// messages at the same (character-indexed) positions, decodes `\uXXXX`
+// escapes and surrogate pairs, rejects raw control characters, and accepts
+// `NaN` / `Infinity` / `-Infinity`. Earlier versions pushed each UTF-8 *byte*
+// of a decoded string as its own character (`"héllo"` came back as `hÃ©llo`),
+// rejected every `\u` escape, and raised a bare `ValueError` with a private
+// message — a program catching `json.JSONDecodeError` never caught it.
+
+/// Encoder options: the `json.dumps` keyword arguments the VM honours, plus one
+/// internal switch pydantic's `model_dump_json` needs.
+#[derive(Clone, Debug)]
+pub struct JsonDumpOpts {
+    /// `None` renders on one line. `Some(unit)` renders one element per line,
+    /// each nesting level prefixed by one more copy of `unit` (CPython accepts
+    /// an `int` count of spaces or a string).
+    pub indent: Option<String>,
+    pub sort_keys: bool,
+    /// Escape every non-ASCII character as `\uXXXX` — CPython's default.
+    pub ensure_ascii: bool,
+    /// Render `nan` / `inf` as `NaN` / `Infinity`; `false` raises `ValueError`.
+    pub allow_nan: bool,
+    pub item_sep: String,
+    pub key_sep: String,
+    /// Serialise a user instance's declared fields as an object instead of
+    /// raising `TypeError`. `json.dumps` never does this — CPython raises
+    /// "Object of type X is not JSON serializable" — but pydantic's
+    /// `model_dump_json` renders nested models that way.
+    pub instances_as_objects: bool,
+}
+
+impl JsonDumpOpts {
+    /// `json.dumps(obj)` with no keyword arguments.
+    pub fn defaults() -> Self {
+        Self {
+            indent: None,
+            sort_keys: false,
+            ensure_ascii: true,
+            allow_nan: true,
+            item_sep: ", ".to_owned(),
+            key_sep: ": ".to_owned(),
+            instances_as_objects: false,
+        }
+    }
+
+    /// pydantic's `model_dump_json()`: compact separators, UTF-8 passthrough,
+    /// nested models rendered as objects.
+    pub fn pydantic_compact() -> Self {
+        Self {
+            indent: None,
+            sort_keys: false,
+            ensure_ascii: false,
+            allow_nan: true,
+            item_sep: ",".to_owned(),
+            key_sep: ":".to_owned(),
+            instances_as_objects: true,
+        }
+    }
+}
+
+/// Decode the keyword arguments of `json.dumps` / `json.dump`.
+///
+/// Mirrors CPython: an `indent` switches the default item separator from
+/// `", "` to `","` unless `separators` is given explicitly; `default=`,
+/// `cls=`, `skipkeys=` and `check_circular=` are accepted and ignored (the VM
+/// has no encoder subclassing and detects no cycles).
+pub fn json_dump_opts_from_kwargs(
+    interp: &mut Interpreter,
+    kwargs: &[(String, Value)],
+) -> Result<JsonDumpOpts, Unwind> {
+    let mut opts = JsonDumpOpts::defaults();
+    let mut explicit_separators = false;
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "indent" => {
+                opts.indent = match v {
+                    Value::None => None,
+                    Value::Int(_) => {
+                        let n = v.to_int()?.max(0) as usize;
+                        Some(" ".repeat(n))
+                    }
+                    Value::Str(s) => Some((**s).clone()),
+                    other => {
+                        return Err(type_error(format!(
+                            "indent must be an int, a str or None, not {}",
+                            other.type_name()
+                        )))
+                    }
+                };
+            }
+            "sort_keys" => opts.sort_keys = interp.is_truthy(v)?,
+            "ensure_ascii" => opts.ensure_ascii = interp.is_truthy(v)?,
+            "allow_nan" => opts.allow_nan = interp.is_truthy(v)?,
+            "separators" => {
+                let parts: Vec<Value> = match v {
+                    Value::None => continue,
+                    Value::Tuple(t) => (**t).clone(),
+                    Value::List(l) => l.borrow().clone(),
+                    other => {
+                        return Err(type_error(format!(
+                            "separators must be a (item, key) pair, not {}",
+                            other.type_name()
+                        )))
+                    }
+                };
+                match (parts.first(), parts.get(1), parts.len()) {
+                    (Some(Value::Str(item)), Some(Value::Str(key)), 2) => {
+                        opts.item_sep = (**item).clone();
+                        opts.key_sep = (**key).clone();
+                        explicit_separators = true;
+                    }
+                    _ => return Err(type_error("separators must be a pair of two strings")),
+                }
+            }
+            "default" | "cls" | "skipkeys" | "check_circular" => {}
+            other => {
+                return Err(type_error(format!(
+                    "dumps() got an unexpected keyword argument '{other}'"
+                )))
+            }
+        }
+    }
+    if opts.indent.is_some() && !explicit_separators {
+        opts.item_sep = ",".to_owned();
+    }
+    Ok(opts)
+}
+
+/// `json.dumps(v)` with the given options. Errors are the exceptions CPython
+/// raises: `TypeError` for an unserialisable value or key, `ValueError` for a
+/// non-finite float under `allow_nan=False`.
+pub fn json_dumps_with(v: &Value, opts: &JsonDumpOpts) -> Result<String, Unwind> {
+    let mut out = String::new();
+    json_write(v, opts, 0, &mut out)?;
+    Ok(out)
+}
+
+/// Serialise a pydantic `model` instance the way `model_dump_json()` does.
+pub fn json_dumps_model(v: &Value) -> Result<String, Unwind> {
+    json_dumps_with(v, &JsonDumpOpts::pydantic_compact())
+}
+
+fn json_newline(opts: &JsonDumpOpts, level: usize, out: &mut String) {
+    if let Some(unit) = &opts.indent {
+        out.push('\n');
+        for _ in 0..level {
+            out.push_str(unit);
+        }
+    }
+}
+
+fn json_write(
+    v: &Value,
+    opts: &JsonDumpOpts,
+    level: usize,
+    out: &mut String,
+) -> Result<(), Unwind> {
     match v {
+        Value::None => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Int(i) => out.push_str(&i.to_string()),
+        Value::Float(x) => out.push_str(&json_float(*x, opts.allow_nan)?),
+        Value::Str(s) => json_string_into(s, opts.ensure_ascii, out),
         Value::List(l) => {
             let items = l.borrow();
-            if items.is_empty() {
-                return "[]".into();
-            }
-            let body: Vec<String> = items
-                .iter()
-                .map(|x| format!("{}{}", pad, json_dumps_indent(x, indent, level + 1, sort)))
-                .collect();
-            format!("[\n{}\n{}]", body.join(",\n"), close_pad)
+            json_write_seq(&items, opts, level, out)?;
         }
-        Value::Tuple(t) => {
-            if t.is_empty() {
-                return "[]".into();
-            }
-            let body: Vec<String> = t
-                .iter()
-                .map(|x| format!("{}{}", pad, json_dumps_indent(x, indent, level + 1, sort)))
-                .collect();
-            format!("[\n{}\n{}]", body.join(",\n"), close_pad)
-        }
+        Value::Tuple(t) => json_write_seq(t, opts, level, out)?,
         Value::Dict(d) => {
             let d = d.borrow();
-            let entries: Vec<(HashKey, Value)> = d
-                .iter()
-                .filter(|(k, _)| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            if entries.is_empty() {
-                return "{}".into();
+            // (sort key, rendered key, value). Sorting uses the original
+            // string key, as CPython's `sorted(dct.items())` does — the
+            // rendered form would order `"é"` before `"z"`.
+            let mut entries: Vec<(String, String, &Value)> = Vec::with_capacity(d.len());
+            for (k, val) in d.iter() {
+                // The `__typhon_frozen__` sentinel a `freeze let` inserts is
+                // not part of the value.
+                if matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__") {
+                    continue;
+                }
+                let key_value = k.clone().into_value();
+                let rendered = json_key(&key_value, opts)?;
+                let sort_key = match &key_value {
+                    Value::Str(s) => (**s).clone(),
+                    _ => rendered.clone(),
+                };
+                entries.push((sort_key, rendered, val));
             }
-            let mut body: Vec<(String, String)> = entries
-                .iter()
-                .map(|(k, val)| {
-                    (
-                        json_dumps_key(&k.clone().into_value()),
-                        json_dumps_indent(val, indent, level + 1, sort),
-                    )
-                })
-                .collect();
-            if sort {
-                body.sort_by(|a, b| a.0.cmp(&b.0));
+            if opts.sort_keys {
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
             }
-            let body: Vec<String> = body
-                .iter()
-                .map(|(k, val)| format!("{}{}: {}", pad, k, val))
-                .collect();
-            format!("{{\n{}\n{}}}", body.join(",\n"), close_pad)
+            let pairs: Vec<(String, &Value)> =
+                entries.into_iter().map(|(_, k, v)| (k, v)).collect();
+            json_write_object(&pairs, opts, level, out)?;
         }
-        other => json_dumps(other, sort),
+        Value::Instance(inst) if opts.instances_as_objects && !inst.class.fields.is_empty() => {
+            let fields = inst.fields.borrow();
+            let mut pairs: Vec<(String, &Value)> = Vec::with_capacity(inst.class.fields.len());
+            for f in &inst.class.fields {
+                if let Some(val) = fields.get(&f.name) {
+                    pairs.push((json_string(&f.name, opts.ensure_ascii), val));
+                }
+            }
+            json_write_object(&pairs, opts, level, out)?;
+        }
+        other => {
+            return Err(type_error(format!(
+                "Object of type {} is not JSON serializable",
+                other.type_name()
+            )))
+        }
     }
+    Ok(())
 }
 
-/// Public wrapper so `interp.rs` (`model_dump_json`) can reuse the serializer.
-pub fn json_dumps_pub(v: &Value) -> String {
-    json_dumps(v, false)
+fn json_write_seq(
+    items: &[Value],
+    opts: &JsonDumpOpts,
+    level: usize,
+    out: &mut String,
+) -> Result<(), Unwind> {
+    if items.is_empty() {
+        out.push_str("[]");
+        return Ok(());
+    }
+    out.push('[');
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push_str(&opts.item_sep);
+        }
+        json_newline(opts, level + 1, out);
+        json_write(item, opts, level + 1, out)?;
+    }
+    json_newline(opts, level, out);
+    out.push(']');
+    Ok(())
 }
 
-fn json_dumps(v: &Value, sort: bool) -> String {
-    match v {
-        Value::None => "null".into(),
-        Value::Bool(b) => if *b { "true" } else { "false" }.into(),
-        Value::Int(i) => i.to_string(),
-        Value::Float(x) => json_float(*x),
-        Value::Str(s) => json_string(s),
-        Value::List(l) => {
-            let items: Vec<String> = l.borrow().iter().map(|x| json_dumps(x, sort)).collect();
-            format!("[{}]", items.join(", "))
-        }
-        Value::Tuple(t) => {
-            let items: Vec<String> = t.iter().map(|x| json_dumps(x, sort)).collect();
-            format!("[{}]", items.join(", "))
-        }
-        Value::Dict(d) => {
-            // Filter the `__typhon_frozen__` sentinel a `freeze let`
-            // inserts (review thread copilot on PR #147 — otherwise
-            // `json.dump(frozen_dict, fp)` leaks the marker into the
-            // emitted JSON).
-            let mut pairs: Vec<(String, String)> = d
-                .borrow()
-                .iter()
-                .filter(|(k, _)| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
-                .map(|(k, v)| (json_dumps_key(&k.clone().into_value()), json_dumps(v, sort)))
-                .collect();
-            if sort {
-                pairs.sort_by(|a, b| a.0.cmp(&b.0));
-            }
-            let items: Vec<String> = pairs.iter().map(|(k, v)| format!("{}: {}", k, v)).collect();
-            format!("{{{}}}", items.join(", "))
-        }
-        other => json_string(&other.py_repr()),
+fn json_write_object(
+    pairs: &[(String, &Value)],
+    opts: &JsonDumpOpts,
+    level: usize,
+    out: &mut String,
+) -> Result<(), Unwind> {
+    if pairs.is_empty() {
+        out.push_str("{}");
+        return Ok(());
     }
+    out.push('{');
+    for (i, (key, val)) in pairs.iter().enumerate() {
+        if i > 0 {
+            out.push_str(&opts.item_sep);
+        }
+        json_newline(opts, level + 1, out);
+        out.push_str(key);
+        out.push_str(&opts.key_sep);
+        json_write(val, opts, level + 1, out)?;
+    }
+    json_newline(opts, level, out);
+    out.push('}');
+    Ok(())
 }
 
 /// Render a dict key as a JSON object key (always a quoted string).
 ///
-/// CPython coerces scalar dict keys to strings (`json.dumps({1: "a"})` →
-/// `{"1": "a"}`, `True` → `"true"`, `None` → `"null"`, floats via `repr`),
-/// which keeps the output valid JSON. Previously the VM emitted keys via the
-/// value serializer, producing unquoted (invalid) keys like `{1: "a"}`.
-fn json_dumps_key(v: &Value) -> String {
-    match v {
-        Value::Str(s) => json_string(s),
-        Value::Int(i) => json_string(&i.to_string()),
-        Value::Bool(b) => json_string(if *b { "true" } else { "false" }),
-        Value::Float(x) => json_string(&json_float(*x)),
-        Value::None => json_string("null"),
-        // Non-scalar keys aren't valid JSON keys in CPython either (it raises
-        // TypeError); fall back to the repr string so we at least stay
-        // syntactically valid rather than emitting a bare object/array key.
-        other => json_string(&other.py_repr()),
-    }
+/// CPython coerces scalar keys to strings (`json.dumps({1: "a"})` →
+/// `{"1": "a"}`, `True` → `"true"`, `None` → `"null"`, floats via `repr`) and
+/// raises `TypeError` for anything else.
+fn json_key(v: &Value, opts: &JsonDumpOpts) -> Result<String, Unwind> {
+    Ok(match v {
+        Value::Str(s) => json_string(s, opts.ensure_ascii),
+        Value::Int(i) => json_string(&i.to_string(), true),
+        Value::Bool(b) => json_string(if *b { "true" } else { "false" }, true),
+        Value::Float(x) => json_string(&json_float(*x, opts.allow_nan)?, true),
+        Value::None => json_string("null", true),
+        other => {
+            return Err(type_error(format!(
+                "keys must be str, int, float, bool or None, not {}",
+                other.type_name()
+            )))
+        }
+    })
 }
 
 /// Render a float as a JSON number token, matching CPython's `json` encoder.
 ///
-/// Finite values use the VM's canonical formatter (shortest round-trip, keeps a
-/// trailing `.0`, so `1.0` stays `1.0` rather than Rust `Display`'s `1`).
-/// Non-finite values use CPython's `json.dumps` spellings (`NaN`, `Infinity`,
-/// `-Infinity`) rather than Python `repr`'s `nan` / `inf` / `-inf`, which are
-/// not valid JSON tokens.
-fn json_float(x: f64) -> String {
-    if x.is_nan() {
-        "NaN".to_string()
-    } else if x.is_infinite() {
-        if x > 0.0 {
-            "Infinity".to_string()
-        } else {
-            "-Infinity".to_string()
+/// Finite values use the VM's canonical formatter (shortest round-trip, keeps
+/// a trailing `.0`, so `1.0` stays `1.0`). Non-finite values use CPython's
+/// `json.dumps` spellings (`NaN`, `Infinity`, `-Infinity`) — or raise
+/// `ValueError` when `allow_nan` is off.
+fn json_float(x: f64, allow_nan: bool) -> Result<String, Unwind> {
+    if x.is_nan() || x.is_infinite() {
+        if !allow_nan {
+            return Err(value_error(format!(
+                "Out of range float values are not JSON compliant: {}",
+                Value::Float(x).py_repr()
+            )));
         }
-    } else {
-        Value::Float(x).py_str()
+        return Ok(if x.is_nan() {
+            "NaN".to_owned()
+        } else if x > 0.0 {
+            "Infinity".to_owned()
+        } else {
+            "-Infinity".to_owned()
+        });
     }
+    Ok(Value::Float(x).py_str())
 }
 
-fn json_string(s: &str) -> String {
+fn json_string(s: &str, ensure_ascii: bool) -> String {
     let mut out = String::with_capacity(s.len() + 2);
+    json_string_into(s, ensure_ascii, &mut out);
+    out
+}
+
+/// Quote a string the way CPython's encoder does: `"`, `\` and the named
+/// control escapes (`\b \f \n \r \t`), other control characters as `\u00XX`,
+/// and — under `ensure_ascii` — every character outside printable ASCII as
+/// `\uXXXX` (a UTF-16 surrogate pair beyond the BMP).
+fn json_string_into(s: &str, ensure_ascii: bool, out: &mut String) {
     out.push('"');
     for c in s.chars() {
         match c {
@@ -7590,80 +8014,209 @@ fn json_string(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
             c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if ensure_ascii && (c as u32) > 0x7e => {
+                let cp = c as u32;
+                if cp > 0xFFFF {
+                    let v = cp - 0x10000;
+                    let high = 0xD800 + (v >> 10);
+                    let low = 0xDC00 + (v & 0x3FF);
+                    out.push_str(&format!("\\u{high:04x}\\u{low:04x}"));
+                } else {
+                    out.push_str(&format!("\\u{cp:04x}"));
+                }
+            }
             c => out.push(c),
         }
     }
     out.push('"');
-    out
+}
+
+thread_local! {
+    /// The one `json.JSONDecodeError` class per interpreter thread. It is both
+    /// what the decoder raises and what the `json` module exports, so
+    /// `except json.JSONDecodeError` matches by class identity while
+    /// `except ValueError` matches through the recorded builtin base.
+    static JSON_DECODE_ERROR_CLASS: Rc<crate::value::Class> = {
+        let mut attrs: HashMap<String, Value> = HashMap::new();
+        attrs.insert(
+            "__typhon_exc_bases__".to_owned(),
+            Value::Tuple(Rc::new(vec![Value::Str(Rc::new("ValueError".to_owned()))])),
+        );
+        Rc::new(crate::value::Class {
+            name: "JSONDecodeError".to_owned(),
+            methods: RefCell::new(HashMap::new()),
+            fields: vec![],
+            class_attrs: RefCell::new(attrs),
+            bases: vec![],
+            properties: RefCell::new(HashSet::new()),
+            classmethods: RefCell::new(HashSet::new()),
+            is_exception: true,
+            is_protocol: false,
+        })
+    };
+}
+
+fn json_decode_error_class() -> Rc<crate::value::Class> {
+    JSON_DECODE_ERROR_CLASS.with(|c| c.clone())
+}
+
+/// CPython's `(lineno, colno)` for a character offset into `doc`:
+/// `lineno = doc.count('\n', 0, pos) + 1`, `colno = pos - doc.rfind('\n', 0, pos)`
+/// (so a first-line offset is 1-based).
+fn json_line_col(chars: &[char], pos: usize) -> (usize, usize) {
+    let upto = &chars[..pos.min(chars.len())];
+    let lineno = upto.iter().filter(|c| **c == '\n').count() + 1;
+    let colno = match upto.iter().rposition(|c| *c == '\n') {
+        Some(idx) => pos - idx,
+        None => pos + 1,
+    };
+    (lineno, colno)
+}
+
+/// Build `json.JSONDecodeError(msg, doc, pos)` — a `ValueError` subclass whose
+/// `str()` is `"{msg}: line {lineno} column {colno} (char {pos})"` and which
+/// carries `msg` / `doc` / `pos` / `lineno` / `colno`. `pos` is a character
+/// index, as in CPython.
+pub fn json_decode_error(msg: &str, doc: &str, pos: usize) -> Unwind {
+    let chars: Vec<char> = doc.chars().collect();
+    let (lineno, colno) = json_line_col(&chars, pos);
+    let full = format!("{msg}: line {lineno} column {colno} (char {pos})");
+    let mut fields: HashMap<String, Value> = HashMap::new();
+    fields.insert(
+        "args".to_owned(),
+        Value::Tuple(Rc::new(vec![Value::Str(Rc::new(full.clone()))])),
+    );
+    fields.insert("msg".to_owned(), Value::Str(Rc::new(msg.to_owned())));
+    fields.insert("doc".to_owned(), Value::Str(Rc::new(doc.to_owned())));
+    fields.insert("pos".to_owned(), Value::Int(VmInt::from(pos)));
+    fields.insert("lineno".to_owned(), Value::Int(VmInt::from(lineno)));
+    fields.insert("colno".to_owned(), Value::Int(VmInt::from(colno)));
+    let inst = Value::Instance(Rc::new(crate::value::Instance {
+        class: json_decode_error_class(),
+        fields: RefCell::new(fields),
+    }));
+    Unwind::Exception(crate::error::VmException::new("JSONDecodeError", full).with_value(inst))
 }
 
 fn json_loads(s: &str) -> Result<Value, Unwind> {
     let mut p = JsonParser {
-        src: s.as_bytes(),
+        doc: s,
+        chars: s.chars().collect(),
         pos: 0,
     };
     p.skip_ws();
-    let v = p.parse()?;
+    let v = p.parse_value()?;
     p.skip_ws();
-    if p.pos < p.src.len() {
-        return Err(value_error("extra data in JSON input"));
+    if p.pos < p.chars.len() {
+        return Err(p.err("Extra data", p.pos));
     }
     Ok(v)
 }
 
+/// A recursive-descent decoder over the document's characters, so every
+/// reported position is the character index CPython reports.
 struct JsonParser<'a> {
-    src: &'a [u8],
+    doc: &'a str,
+    chars: Vec<char>,
     pos: usize,
 }
 
-impl<'a> JsonParser<'a> {
+impl JsonParser<'_> {
+    fn err(&self, msg: &str, pos: usize) -> Unwind {
+        json_decode_error(msg, self.doc, pos)
+    }
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.pos).copied()
+    }
+    /// JSON whitespace is exactly ` \t\n\r` — not Python's `str.isspace()`.
     fn skip_ws(&mut self) {
-        while self.pos < self.src.len() && self.src[self.pos].is_ascii_whitespace() {
+        while matches!(self.peek(), Some(' ' | '\t' | '\n' | '\r')) {
             self.pos += 1;
         }
     }
-    fn parse(&mut self) -> Result<Value, Unwind> {
-        self.skip_ws();
-        if self.pos >= self.src.len() {
-            return Err(value_error("unexpected end of JSON input"));
-        }
-        match self.src[self.pos] {
-            b'{' => self.parse_object(),
-            b'[' => self.parse_array(),
-            b'"' => self.parse_string().map(|s| Value::Str(Rc::new(s))),
-            b't' | b'f' => self.parse_bool(),
-            b'n' => self.parse_null(),
-            c if c == b'-' || c.is_ascii_digit() => self.parse_number(),
-            c => Err(value_error(format!(
-                "unexpected char '{}' in JSON",
-                c as char
-            ))),
+    fn starts_with(&self, lit: &str) -> bool {
+        lit.chars()
+            .enumerate()
+            .all(|(i, c)| self.chars.get(self.pos + i) == Some(&c))
+    }
+    fn parse_value(&mut self) -> Result<Value, Unwind> {
+        let Some(c) = self.peek() else {
+            return Err(self.err("Expecting value", self.pos));
+        };
+        match c {
+            '{' => self.parse_object(),
+            '[' => self.parse_array(),
+            '"' => self.parse_string().map(|s| Value::Str(Rc::new(s))),
+            'n' if self.starts_with("null") => {
+                self.pos += 4;
+                Ok(Value::None)
+            }
+            't' if self.starts_with("true") => {
+                self.pos += 4;
+                Ok(Value::Bool(true))
+            }
+            'f' if self.starts_with("false") => {
+                self.pos += 5;
+                Ok(Value::Bool(false))
+            }
+            'N' if self.starts_with("NaN") => {
+                self.pos += 3;
+                Ok(Value::Float(f64::NAN))
+            }
+            'I' if self.starts_with("Infinity") => {
+                self.pos += 8;
+                Ok(Value::Float(f64::INFINITY))
+            }
+            '-' if self.starts_with("-Infinity") => {
+                self.pos += 9;
+                Ok(Value::Float(f64::NEG_INFINITY))
+            }
+            '-' | '0'..='9' => self.parse_number(),
+            _ => Err(self.err("Expecting value", self.pos)),
         }
     }
     fn parse_object(&mut self) -> Result<Value, Unwind> {
         self.pos += 1; // {
         let mut map: DictMap = IndexMap::new();
         self.skip_ws();
-        if self.peek() == Some(b'}') {
+        if self.peek() == Some('}') {
             self.pos += 1;
             return Ok(Value::Dict(Rc::new(RefCell::new(map))));
         }
         loop {
-            self.skip_ws();
+            if self.peek() != Some('"') {
+                return Err(self.err(
+                    "Expecting property name enclosed in double quotes",
+                    self.pos,
+                ));
+            }
             let key = self.parse_string()?;
             self.skip_ws();
-            self.expect(b':')?;
-            let value = self.parse()?;
+            if self.peek() != Some(':') {
+                return Err(self.err("Expecting ':' delimiter", self.pos));
+            }
+            self.pos += 1;
+            self.skip_ws();
+            let value = self.parse_value()?;
             map.insert(HashKey::Str(Rc::new(key)), value);
             self.skip_ws();
             match self.peek() {
-                Some(b',') => self.pos += 1,
-                Some(b'}') => {
+                Some('}') => {
                     self.pos += 1;
                     break;
                 }
-                _ => return Err(value_error("expected ',' or '}' in JSON object")),
+                Some(',') => {
+                    let comma = self.pos;
+                    self.pos += 1;
+                    self.skip_ws();
+                    if self.peek() == Some('}') {
+                        return Err(self.err("Illegal trailing comma before end of object", comma));
+                    }
+                }
+                _ => return Err(self.err("Expecting ',' delimiter", self.pos)),
             }
         }
         Ok(Value::Dict(Rc::new(RefCell::new(map))))
@@ -7672,118 +8225,162 @@ impl<'a> JsonParser<'a> {
         self.pos += 1; // [
         let mut out = Vec::new();
         self.skip_ws();
-        if self.peek() == Some(b']') {
+        if self.peek() == Some(']') {
             self.pos += 1;
             return Ok(Value::List(Rc::new(RefCell::new(out))));
         }
         loop {
-            out.push(self.parse()?);
+            out.push(self.parse_value()?);
             self.skip_ws();
             match self.peek() {
-                Some(b',') => self.pos += 1,
-                Some(b']') => {
+                Some(']') => {
                     self.pos += 1;
                     break;
                 }
-                _ => return Err(value_error("expected ',' or ']' in JSON array")),
+                Some(',') => {
+                    let comma = self.pos;
+                    self.pos += 1;
+                    self.skip_ws();
+                    if self.peek() == Some(']') {
+                        return Err(self.err("Illegal trailing comma before end of array", comma));
+                    }
+                }
+                _ => return Err(self.err("Expecting ',' delimiter", self.pos)),
             }
         }
         Ok(Value::List(Rc::new(RefCell::new(out))))
     }
+    /// Four hex digits of a `\uXXXX` escape. `err_pos` is where CPython points
+    /// on failure: the `u` after the backslash.
+    fn parse_hex4(&mut self, err_pos: usize) -> Result<u32, Unwind> {
+        let mut cp: u32 = 0;
+        for i in 0..4 {
+            let digit = self
+                .chars
+                .get(self.pos + i)
+                .and_then(|c| c.to_digit(16))
+                .ok_or_else(|| self.err("Invalid \\uXXXX escape", err_pos))?;
+            cp = (cp << 4) | digit;
+        }
+        self.pos += 4;
+        Ok(cp)
+    }
     fn parse_string(&mut self) -> Result<String, Unwind> {
-        self.expect(b'"')?;
+        let start = self.pos; // the opening quote
+        self.pos += 1;
         let mut out = String::new();
-        while let Some(c) = self.peek() {
-            if c == b'"' {
-                self.pos += 1;
-                return Ok(out);
-            }
-            if c == b'\\' {
-                self.pos += 1;
-                match self.peek() {
-                    Some(b'"') => out.push('"'),
-                    Some(b'\\') => out.push('\\'),
-                    Some(b'/') => out.push('/'),
-                    Some(b'n') => out.push('\n'),
-                    Some(b'r') => out.push('\r'),
-                    Some(b't') => out.push('\t'),
-                    _ => return Err(value_error("bad escape in JSON string")),
+        loop {
+            let Some(c) = self.peek() else {
+                return Err(self.err("Unterminated string starting at", start));
+            };
+            match c {
+                '"' => {
+                    self.pos += 1;
+                    return Ok(out);
                 }
-                self.pos += 1;
-                continue;
+                '\\' => {
+                    let backslash = self.pos;
+                    self.pos += 1;
+                    let Some(esc) = self.peek() else {
+                        return Err(self.err("Unterminated string starting at", start));
+                    };
+                    match esc {
+                        '"' => out.push('"'),
+                        '\\' => out.push('\\'),
+                        '/' => out.push('/'),
+                        'b' => out.push('\u{8}'),
+                        'f' => out.push('\u{c}'),
+                        'n' => out.push('\n'),
+                        'r' => out.push('\r'),
+                        't' => out.push('\t'),
+                        'u' => {
+                            self.pos += 1;
+                            let mut cp = self.parse_hex4(backslash + 1)?;
+                            // A high surrogate followed by a `\uDC00–\uDFFF`
+                            // escape is one astral character.
+                            if (0xD800..0xDC00).contains(&cp) && self.starts_with("\\u") {
+                                let save = self.pos;
+                                self.pos += 2;
+                                let low = self.parse_hex4(save + 1)?;
+                                if (0xDC00..0xE000).contains(&low) {
+                                    cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                                } else {
+                                    // Not a pair: leave the second escape to be
+                                    // decoded on its own.
+                                    self.pos = save;
+                                }
+                            }
+                            // A lone surrogate has no `char`; CPython keeps it
+                            // as an unpaired code unit, which cannot be printed
+                            // either — U+FFFD is the closest representable value.
+                            out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                            continue;
+                        }
+                        _ => return Err(self.err("Invalid \\escape", backslash)),
+                    }
+                    self.pos += 1;
+                }
+                c if (c as u32) < 0x20 => {
+                    return Err(self.err("Invalid control character at", self.pos));
+                }
+                c => {
+                    out.push(c);
+                    self.pos += 1;
+                }
             }
-            out.push(c as char);
-            self.pos += 1;
         }
-        Err(value_error("unterminated string"))
     }
-    fn parse_bool(&mut self) -> Result<Value, Unwind> {
-        if self.src[self.pos..].starts_with(b"true") {
-            self.pos += 4;
-            return Ok(Value::Bool(true));
-        }
-        if self.src[self.pos..].starts_with(b"false") {
-            self.pos += 5;
-            return Ok(Value::Bool(false));
-        }
-        Err(value_error("expected boolean"))
-    }
-    fn parse_null(&mut self) -> Result<Value, Unwind> {
-        if self.src[self.pos..].starts_with(b"null") {
-            self.pos += 4;
-            return Ok(Value::None);
-        }
-        Err(value_error("expected null"))
-    }
+    /// CPython's number grammar: `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)?`.
+    /// A leading zero, a bare `.` or a dangling exponent stop the number and
+    /// are reported by the caller as `Extra data` / a delimiter error, exactly
+    /// as CPython's scanner leaves them.
     fn parse_number(&mut self) -> Result<Value, Unwind> {
         let start = self.pos;
-        if self.peek() == Some(b'-') {
+        if self.peek() == Some('-') {
             self.pos += 1;
         }
-        while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
-            self.pos += 1;
+        match self.peek() {
+            Some('0') => self.pos += 1,
+            Some('1'..='9') => {
+                while matches!(self.peek(), Some('0'..='9')) {
+                    self.pos += 1;
+                }
+            }
+            _ => return Err(self.err("Expecting value", start)),
         }
         let mut is_float = false;
-        if self.peek() == Some(b'.') {
+        if self.peek() == Some('.') && matches!(self.chars.get(self.pos + 1), Some('0'..='9')) {
             is_float = true;
             self.pos += 1;
-            while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+            while matches!(self.peek(), Some('0'..='9')) {
                 self.pos += 1;
             }
         }
-        if matches!(self.peek(), Some(b'e') | Some(b'E')) {
-            is_float = true;
-            self.pos += 1;
-            if matches!(self.peek(), Some(b'+') | Some(b'-')) {
-                self.pos += 1;
+        if matches!(self.peek(), Some('e' | 'E')) {
+            let mut look = self.pos + 1;
+            if matches!(self.chars.get(look), Some('+' | '-')) {
+                look += 1;
             }
-            while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
-                self.pos += 1;
+            if matches!(self.chars.get(look), Some('0'..='9')) {
+                is_float = true;
+                self.pos = look;
+                while matches!(self.peek(), Some('0'..='9')) {
+                    self.pos += 1;
+                }
             }
         }
-        let slice = std::str::from_utf8(&self.src[start..self.pos])
-            .map_err(|_| value_error("invalid number"))?;
+        let text: String = self.chars[start..self.pos].iter().collect();
         if is_float {
+            // Rust's parser saturates to ±inf on overflow, as `float()` does.
             Ok(Value::Float(
-                slice.parse().map_err(|_| value_error("bad number"))?,
+                text.parse::<f64>()
+                    .map_err(|_| self.err("Expecting value", start))?,
             ))
         } else {
             Ok(Value::Int(VmInt::from(
-                slice
-                    .parse::<num_bigint::BigInt>()
-                    .map_err(|_| value_error("bad number"))?,
+                text.parse::<num_bigint::BigInt>()
+                    .map_err(|_| self.err("Expecting value", start))?,
             )))
-        }
-    }
-    fn peek(&self) -> Option<u8> {
-        self.src.get(self.pos).copied()
-    }
-    fn expect(&mut self, byte: u8) -> Result<(), Unwind> {
-        if self.peek() == Some(byte) {
-            self.pos += 1;
-            Ok(())
-        } else {
-            Err(value_error(format!("expected '{}'", byte as char)))
         }
     }
 }
@@ -7895,9 +8492,30 @@ pub fn call_with_kwargs(
                     Ok(out)
                 })
                 .collect::<Result<_, _>>()?;
-            let len = columns.first().map(|c| c.len()).unwrap_or(0);
+            // CPython names the offending argument: the first iterable to run
+            // dry decides the verb — if it is argument 1, the first later
+            // iterable that still has items is "longer"; otherwise the dry one
+            // is "shorter than argument(s) 1[-i]".
+            let len = columns.iter().map(|c| c.len()).min().unwrap_or(0);
             if columns.iter().any(|c| c.len() != len) {
-                return Err(value_error("zip() argument lengths differ (strict=True)"));
+                let dry = columns.iter().position(|c| c.len() == len).unwrap_or(0);
+                let (verb, arg) = if dry == 0 {
+                    (
+                        "longer",
+                        columns.iter().position(|c| c.len() > len).unwrap_or(1),
+                    )
+                } else {
+                    ("shorter", dry)
+                };
+                let others = if arg == 1 {
+                    " ".to_string()
+                } else {
+                    "s 1-".to_string()
+                };
+                return Err(value_error(format!(
+                    "zip() argument {} is {verb} than argument{others}{arg}",
+                    arg + 1
+                )));
             }
             let mut rows: Vec<Value> = Vec::with_capacity(len);
             for row in 0..len {
@@ -8071,27 +8689,27 @@ pub fn call_with_kwargs(
             }
             Ok(default.unwrap_or(Value::None))
         }
-        // `json.dumps(obj, indent=n, sort_keys=...)` — honour the common
-        // `indent` kwarg for pretty-printing (others are accepted/ignored).
+        // `dataclasses.replace(obj, field=value, …)`.
+        "dataclasses.replace" => dataclass_replace(interp, args, kwargs),
+        // `json.dumps(obj, indent=…, sort_keys=…, ensure_ascii=…,
+        // separators=…, allow_nan=…)` — the encoder options CPython honours.
         "dumps" => {
             let obj = args
                 .first()
                 .ok_or_else(|| type_error("dumps() missing argument"))?;
-            let mut indent: Option<usize> = None;
-            let mut sort_keys = false;
-            for (k, v) in kwargs {
-                if k == "indent" {
-                    if let Value::Int(_) = v {
-                        indent = v.to_int().ok().filter(|n| *n > 0).map(|n| n as usize);
-                    }
-                } else if k == "sort_keys" {
-                    sort_keys = interp.is_truthy(v)?;
-                }
+            let opts = json_dump_opts_from_kwargs(interp, kwargs)?;
+            Ok(Value::Str(Rc::new(json_dumps_with(obj, &opts)?)))
+        }
+        // `json.dump(obj, fp, **same options)`.
+        "dump" => {
+            if args.len() < 2 {
+                return Err(type_error("dump() requires (obj, fp)"));
             }
-            match indent {
-                Some(n) => Ok(Value::Str(Rc::new(json_dumps_indent(obj, n, 0, sort_keys)))),
-                None => Ok(Value::Str(Rc::new(json_dumps(obj, sort_keys)))),
-            }
+            let opts = json_dump_opts_from_kwargs(interp, kwargs)?;
+            let serialised = json_dumps_with(&args[0], &opts)?;
+            let write = interp.get_attr(&args[1], "write")?;
+            interp.call_value(write, vec![Value::Str(Rc::new(serialised))], &[])?;
+            Ok(Value::None)
         }
         // `dict(a=1, b=2)` and `dict(other, c=3)` — keyword pairs become entries.
         "dict" => {

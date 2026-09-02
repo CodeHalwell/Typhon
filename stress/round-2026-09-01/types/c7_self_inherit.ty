@@ -1,0 +1,6 @@
+class A(A):
+    x: int
+
+def main() -> None:
+    let a: A = A(x=1)
+    print(a.q)

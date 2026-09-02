@@ -1,0 +1,6 @@
+def main() -> None:
+    let x: float = 1e400
+    let y: float = -1e400
+    print(x, y, x > 1e308)
+
+main()

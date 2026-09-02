@@ -1,0 +1,8 @@
+def a() -> int:
+    return 1
+
+def f() -> None:
+    let _: int = a()
+    let _: int = a()
+
+f()

@@ -1,0 +1,7 @@
+comptime let S: str = env("TY_S", "it's \"q\" \\ {brace} \n end")
+comptime let T: str = env("TY_T", "line1\nline2\ttab é")
+
+def main() -> None:
+    print(repr(S), repr(T))
+
+main()

@@ -1,0 +1,7 @@
+def main() -> None:
+    let nested: dict[str, list[int]] = {"k": [1]}
+    nested["k"].append("z")
+    print(nested["k"][1] + 1)
+
+if __name__ == "__main__":
+    main()

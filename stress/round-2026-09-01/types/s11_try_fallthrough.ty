@@ -1,0 +1,16 @@
+def f(s: str) -> int:
+    try:
+        return int(s)
+    except ValueError:
+        pass
+
+def g(xs: list[int]) -> int:
+    for x in xs:
+        return x
+
+def main() -> None:
+    print(f("x") + 1)
+    print(g([]) + 1)
+
+if __name__ == "__main__":
+    main()

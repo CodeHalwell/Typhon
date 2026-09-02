@@ -1,0 +1,13 @@
+from typing import Callable
+
+interface Functor[F[_]]:
+    def fmap[A, B](self, fa: F[A], f: Callable[[A], B]) -> F[B]
+
+class! ListF[F[_]](object):
+    pass
+
+def main() -> None:
+    print("ok")
+
+if __name__ == "__main__":
+    main()

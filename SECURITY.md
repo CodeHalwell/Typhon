@@ -1,6 +1,6 @@
 # Security Policy
 
-Typhon is pre-1.0 (currently `v1.0.0-alpha`). We take security reports
+Typhon is pre-1.0 (currently the `v1.0.0-alpha.x` series). We take security reports
 seriously and will respond as quickly as we can.
 
 ## Reporting a vulnerability

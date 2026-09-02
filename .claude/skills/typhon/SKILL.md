@@ -150,7 +150,7 @@ The 30-second mental model. Every later section in this skill is detail under on
 | Result chain | `with a = f()?, b = g()?: ...  else err: ...` | sequenced if-isinstance ladder |
 | Generic fn | `def first[T](xs: list[T]) -> T?:` | same (PEP 695) |
 | Generic class | `class Box[T]: value: T` / `impl[T] Box[T]:` | preserved (PEP 695) |
-| HKT scaffold (v0.5.0) | `class Functor[F[_]]:` | parsed; staged for unification |
+| HKT (v0.5.0 scaffold; unification landed v1.0.0-alpha) | `class Functor[F[_]]:` | preserved (PEP 695); `F[A]` unifies against a concrete head |
 | Interface | `interface Drawable: def draw(self) -> None` | `class Drawable(Protocol): ...` |
 | Pipe | `a \|> f() \|> g(arg)` | `g(f(a), arg)` |
 | Guard | `guard x = expr else: return ...` | `if expr is None: return ...; x = expr` |
@@ -319,7 +319,7 @@ The resolver tracks each uninitialised `let` declaration's span; the first subse
 
 | Type | Notes |
 |---|---|
-| `int` | Arbitrary precision (matches CPython). VM today uses `i64`. |
+| `int` | Arbitrary precision (matches CPython). The VM's `VmInt` keeps `i64`-sized values inline and promotes to a `BigInt` on overflow (v0.8.0 / v1.0.0-alpha.5). |
 | `float` | 64-bit IEEE 754. |
 | `bool` | **Subtype of `int`** (v0.4.0). `let x: int = True` type-checks; `let b: bool = 1` does not — assignability is one-way. |
 | `str`, `bytes` | Identical to Python. |
@@ -653,7 +653,7 @@ A focused hardening pass on top of alpha.3. **No new syntax; no previously-*corr
 
 - **H5 — scope-blind class unification closed at the declaration boundary** (the one HIGH finding `RELEASE_READINESS_REVIEW.md` deferred). The v0.15.0 qualified↔bare tail-unification let a *locally declared* class satisfy a same-named class from another module (a user `class Response:` type-checked into an `httpx.Response`-typed slot, and vice versa). `is_assignable` now refuses that unification when the bare side names a class declared in the module being checked and the qualified side's declaration — resolved through its **exact** module key, never the ambiguous reverse scan that sank the first fix attempt — has a different shape. The guard is evidence-gated and degrades to the previous permissive unification on any uncertainty (unresolvable module, unknown shape, facade re-export with an equivalent shape, interfaces, bare names of unknown provenance such as provider return types), so the example/stress corpus is byte-identically unchanged. Four regression tests cover both rejection directions plus the facade-equivalence and unknown-provenance carve-outs.
 - **Secret-name diagnostics match longest-first** — the keyword tables behind `contains_secret_literal` (`tyc-analyse`) and the `tyc build` secret-suffix scan ordered the bare `KEY` ahead of `APIKEY`, so a name like `KEY_APIKEY` matched the shorter `KEY` and reported the less-specific suffix. `APIKEY` now precedes `KEY`, restoring the intended longest-first heuristic.
-- **Supply-chain & packaging** — every third-party GitHub Action across the workflows is SHA-pinned (Dependabot's `github-actions` ecosystem keeps the pins fresh), with a dispatch-only `normalize-release-flags` workflow to retro-flag hyphenated release tags as pre-releases; `install.sh` / `install.ps1` resolve "latest" via the release *list* (`/releases?per_page=1`, pre-releases included) instead of `/releases/latest` (which excludes them), so a default install no longer silently fetches older binaries; and a round of dependency / advisory bumps lands (`crossbeam-epoch` 0.9.18 → 0.9.20 for RUSTSEC-2026-0204, `regex` 1.12.4, `memchr` 2.8.2, `compact_str` 0.9.1).
+- **Supply-chain & packaging** — every third-party GitHub Action across the workflows is SHA-pinned (Dependabot's `github-actions` ecosystem keeps the pins fresh), with a dispatch-only `normalize-release-flags` workflow to retro-flag hyphenated release tags as pre-releases; `install.sh` / `install.ps1` resolve "latest" via the release *list* (`/releases?per_page=5`, drafts filtered, pre-releases included) instead of `/releases/latest` (which excludes them), so a default install no longer silently fetches older binaries; and a round of dependency / advisory bumps lands (`crossbeam-epoch` 0.9.18 → 0.9.20 for RUSTSEC-2026-0204, `regex` 1.12.4, `memchr` 2.8.2, `compact_str` 0.9.1).
 
 ### v1.0.0-alpha.3 — release-readiness remediation: licensing, packaging & robustness
 
@@ -949,7 +949,6 @@ The big v0.8.1 → v0.9.0 sweep. Closes 32 of 36 findings from a v0.8.1 stress s
 - **`from typing import List` / `Dict` / `Tuple` etc.** is rejected — use lowercase builtins.
 - **Bounded TypeVars** parse; multi-argument constraint solving is partial.
 - **PEP 612 `ParamSpec`** is not modelled — annotate decorator layers with `Callable[..., Any]`.
-- **Full HKT unification** is in progress; the parser accepts `F[_]` but checker treatment is staged.
 
 ---
 
@@ -1346,7 +1345,7 @@ no-implicit-any = true           # reserved for forward compat; today the check 
 unused-import = "warn"           # default "warn" (since v0.8.0); or "error" | "off"
 exhaustive-match = "error"
 methods-in-class-body = "warn"   # or "error" (break CI) | "off"
-nullable-use = "error"           # severity for tyc::nullable_use; or "warn" | "off"
+nullable-use = "warn"            # severity of the attribute-rooted tyc::nullable_use form (`self.conn.execute()`); "error" promotes it, "off" drops it. The bare-name form is always an error.
 require-with = "warn"            # severity for tyc::resource_not_managed
 blocking-in-async = "warn"       # severity for tyc::blocking_in_async
 stub-check = "error"             # severity for tyc::stub_mismatch

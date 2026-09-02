@@ -1,0 +1,15 @@
+def f() -> Result[int, str]:
+    return Ok(1)
+
+def g() -> Result[int, str]:
+    return Ok(2)
+
+def two() -> Result[int, str]:
+    let a: int = f()?; let b: int = g()?
+    return Ok(a + b)
+
+def main() -> None:
+    print(two())
+
+if __name__ == "__main__":
+    main()

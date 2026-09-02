@@ -1,0 +1,63 @@
+class C0:
+    f0: int
+class C1(C0):
+    f1: int
+class C2(C1):
+    f2: int
+class C3(C2):
+    f3: int
+class C4(C3):
+    f4: int
+class C5(C4):
+    f5: int
+class C6(C5):
+    f6: int
+class C7(C6):
+    f7: int
+class C8(C7):
+    f8: int
+class C9(C8):
+    f9: int
+class C10(C9):
+    f10: int
+class C11(C10):
+    f11: int
+class C12(C11):
+    f12: int
+class C13(C12):
+    f13: int
+class C14(C13):
+    f14: int
+class C15(C14):
+    f15: int
+class C16(C15):
+    f16: int
+class C17(C16):
+    f17: int
+class C18(C17):
+    f18: int
+class C19(C18):
+    f19: int
+class C20(C19):
+    f20: int
+class C21(C20):
+    f21: int
+class C22(C21):
+    f22: int
+class C23(C22):
+    f23: int
+class C24(C23):
+    f24: int
+class C25(C24):
+    f25: int
+class C26(C25):
+    f26: int
+class C27(C26):
+    f27: int
+
+def main() -> None:
+    let c: C0 = C27(f0=0, f1=1, f2=2, f3=3, f4=4, f5=5, f6=6, f7=7, f8=8, f9=9, f10=10, f11=11, f12=12, f13=13, f14=14, f15=15, f16=16, f17=17, f18=18, f19=19, f20=20, f21=21, f22=22, f23=23, f24=24, f25=25, f26=26, f27=27)
+    print(c.f0)
+
+if __name__ == "__main__":
+    main()

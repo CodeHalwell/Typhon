@@ -1,0 +1,5 @@
+def main() -> None:
+    let z: complex = 1e400j
+    print(z)
+
+main()

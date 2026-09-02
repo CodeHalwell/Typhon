@@ -44,6 +44,12 @@ pub struct Emitter {
     /// extra blank line.  Reset to `false` after emitting a non-block stmt
     /// at indent 0.
     prev_top_level_was_block: bool,
+    /// Set by the statement emitters for the one position where a bare
+    /// `yield` is valid Python — the whole right-hand side of an assignment
+    /// or the whole expression statement. Consumed (reset) by the very next
+    /// `emit_expr` call, so a `yield` nested anywhere deeper is emitted
+    /// parenthesised: `(yield x) + 1`, `f((yield x))`, `return (yield x)`.
+    bare_yield_ok: bool,
     /// Stack of outer-quote characters for currently-active f-strings. When
     /// we emit a `StringLiteral` while one is non-empty, the literal must
     /// be wrapped in a quote character that differs from the f-string's
@@ -82,6 +88,7 @@ impl Emitter {
             line_offsets: Vec::new(),
             suppress_mutability: false,
             prev_top_level_was_block: false,
+            bare_yield_ok: false,
             fstring_quote_stack: Vec::new(),
             target_minor: 0,
             source: None,
@@ -554,6 +561,7 @@ impl Emitter {
                     first = false;
                 }
                 self.write(" = ");
+                self.bare_yield_ok = true;
                 self.emit_expr(&a.value);
                 self.newline();
             }
@@ -564,6 +572,7 @@ impl Emitter {
                 self.write(" ");
                 self.write(op_symbol(&a.op));
                 self.write("= ");
+                self.bare_yield_ok = true;
                 self.emit_expr(&a.value);
                 self.newline();
             }
@@ -585,6 +594,7 @@ impl Emitter {
                 self.emit_expr(&a.annotation);
                 if let Some(val) = &a.value {
                     self.write(" = ");
+                    self.bare_yield_ok = true;
                     self.emit_expr(val);
                 }
                 self.newline();
@@ -809,6 +819,7 @@ impl Emitter {
 
             Stmt::Expr(e) => {
                 self.fill("");
+                self.bare_yield_ok = true;
                 self.emit_expr(&e.value);
                 self.newline();
             }
@@ -947,6 +958,9 @@ impl Emitter {
     }
 
     pub fn emit_expr(&mut self, node: &Expr) {
+        // Only the outermost expression of a statement may be a bare
+        // `yield`; anything reached recursively from here is nested.
+        let bare_yield_ok = std::mem::take(&mut self.bare_yield_ok);
         match node {
             Expr::BoolOp(b) => {
                 let op = match b.op {
@@ -1089,8 +1103,13 @@ impl Emitter {
                         self.write(": ");
                         self.emit_expr(&item.value);
                     } else {
+                        // `**` unpacking, like `*`, takes a `bitwise_or`
+                        // operand — `{**(a if c else b)}` needs its parens.
                         self.write("**");
-                        self.emit_expr(&item.value);
+                        self.emit_operand_above(
+                            &item.value,
+                            bin_op_precedence(&Operator::BitOr) - 1,
+                        );
                     }
                     first = false;
                 }
@@ -1173,17 +1192,35 @@ impl Emitter {
                 }
             }
 
+            // A `yield` is only a valid bare operand as the whole RHS of an
+            // assignment or the whole expression statement. Everywhere else
+            // Python needs parentheses: `(yield total) + 1` re-emitted as
+            // `yield total + 1` is `yield (total + 1)` — a different program
+            // that parses cleanly — and `f(yield x)` / `return yield x` /
+            // `((yield 1), 2)` are outright syntax errors.
             Expr::Yield(y) => {
+                if !bare_yield_ok {
+                    self.write("(");
+                }
                 self.write("yield");
                 if let Some(val) = &y.value {
                     self.write(" ");
                     self.emit_expr(val);
                 }
+                if !bare_yield_ok {
+                    self.write(")");
+                }
             }
 
             Expr::YieldFrom(y) => {
+                if !bare_yield_ok {
+                    self.write("(");
+                }
                 self.write("yield from ");
                 self.emit_expr(&y.value);
+                if !bare_yield_ok {
+                    self.write(")");
+                }
             }
 
             Expr::Compare(c) => {
@@ -1259,7 +1296,11 @@ impl Emitter {
                 for part in fs.value.iter() {
                     match part {
                         FStringPart::Literal(lit) => {
-                            self.write(&escape_python_string_with_quote(lit.as_str(), outer));
+                            // An implicitly-concatenated plain string part
+                            // (`"{" f"{x}"`) is re-emitted inside one f-string,
+                            // so its braces must be doubled like any other
+                            // f-string literal text.
+                            self.write(&escape_python_fstring_literal(lit.as_str(), outer));
                         }
                         FStringPart::FString(inner) => {
                             for elem in &inner.elements {
@@ -1392,27 +1433,36 @@ impl Emitter {
                     // than `1.0`, which then loads as int at runtime and
                     // breaks isinstance(x, float), JSON output, repr, etc.
                     // Use Debug formatting so 1.0 stays "1.0".
-                    if f.is_infinite() {
-                        if *f < 0.0 {
-                            self.write("-inf");
-                        } else {
-                            self.write("inf");
-                        }
-                    } else if f.is_nan() {
-                        self.write("nan");
+                    //
+                    // A literal that overflowed to infinity in the parser
+                    // (`1e400`) has no finite spelling; `inf` / `nan` are not
+                    // Python names, so emit the `float(...)` call instead.
+                    if f.is_infinite() || f.is_nan() {
+                        self.write(&non_finite_float_source(*f));
                     } else {
                         let mut buf = ryu::Buffer::new();
                         self.write(buf.format(*f));
                     }
                 }
                 Number::Complex { real, imag } => {
-                    let mut buf = ryu::Buffer::new();
-                    if *real != 0.0 {
-                        self.write(buf.format(*real));
-                        self.write("+");
+                    if !real.is_finite() || !imag.is_finite() {
+                        // `1e400j` parses to an infinite imaginary part; spell
+                        // it as a constructor call rather than the invalid
+                        // `infj`.
+                        self.write(&format!(
+                            "complex({}, {})",
+                            finite_or_call(*real),
+                            finite_or_call(*imag)
+                        ));
+                    } else {
+                        let mut buf = ryu::Buffer::new();
+                        if *real != 0.0 {
+                            self.write(buf.format(*real));
+                            self.write("+");
+                        }
+                        self.write(buf.format(*imag));
+                        self.write("j");
                     }
-                    self.write(buf.format(*imag));
-                    self.write("j");
                 }
             },
 
@@ -1535,8 +1585,10 @@ impl Emitter {
             }
 
             Expr::Starred(s) => {
+                // `*` unpacking takes a `bitwise_or` operand: `[*(a or b)]`
+                // must keep its parens, or Python reads `*a or b` and fails.
                 self.write("*");
-                self.emit_expr(&s.value);
+                self.emit_operand_above(&s.value, bin_op_precedence(&Operator::BitOr) - 1);
             }
 
             Expr::Name(n) => {
@@ -1821,6 +1873,12 @@ impl Emitter {
                     self.emit_pattern(p);
                     first = false;
                 }
+                // `case (x,):` is a one-element sequence pattern; without the
+                // trailing comma `case (x):` is the capture pattern `x`, which
+                // matches *anything* — a different program that parses.
+                if use_parens && seq.patterns.len() == 1 {
+                    self.write(",");
+                }
                 self.write(close);
             }
             Pattern::MatchMapping(m) => {
@@ -1894,7 +1952,17 @@ impl Emitter {
                     if !first {
                         self.write(" | ");
                     }
+                    // `as` binds looser than `|`: `(A() as x) | (B() as x)`
+                    // loses its meaning (and does not parse) without the
+                    // parens around each alternative.
+                    let needs_parens = matches!(p, Pattern::MatchAs(a) if a.pattern.is_some());
+                    if needs_parens {
+                        self.write("(");
+                    }
                     self.emit_pattern(p);
+                    if needs_parens {
+                        self.write(")");
+                    }
                     first = false;
                 }
             }
@@ -1966,6 +2034,28 @@ fn op_symbol(op: &Operator) -> &'static str {
 /// so that an arithmetic-unary left operand of `**` is wrapped in parens.
 /// Python parses `-x ** 2` as `-(x ** 2)`, so the AST shape
 /// `BinOp(Pow, UnaryOp(USub, x), 2)` must round-trip as `(-x) ** 2`.
+/// Python source for a non-finite float: `float("inf")`, `-float("inf")`,
+/// `float("nan")`.
+fn non_finite_float_source(f: f64) -> String {
+    if f.is_nan() {
+        "float(\"nan\")".to_owned()
+    } else if f < 0.0 {
+        "-float(\"inf\")".to_owned()
+    } else {
+        "float(\"inf\")".to_owned()
+    }
+}
+
+/// A finite float as a literal, a non-finite one as its `float(...)` call.
+fn finite_or_call(f: f64) -> String {
+    if f.is_finite() {
+        let mut buf = ryu::Buffer::new();
+        buf.format(f).to_owned()
+    } else {
+        non_finite_float_source(f)
+    }
+}
+
 fn bin_op_precedence(op: &Operator) -> u8 {
     match op {
         Operator::Pow => 14,
@@ -2146,6 +2236,13 @@ fn escape_triple_quoted_string(s: &str, quote: char) -> String {
     while let Some(ch) = chars.next() {
         if ch == '\\' {
             out.push_str("\\\\");
+            run = 0;
+        } else if (ch as u32) < 0x20 && ch != '\n' && ch != '\t' && ch != '\r' {
+            // A raw NUL is a hard `SyntaxError` ("source code cannot contain
+            // null bytes") and the other C0 controls are invisible in the
+            // emitted file; escape them. Newlines and tabs stay verbatim so
+            // the multiline structure is preserved.
+            out.push_str(&format!("\\x{:02x}", ch as u32));
             run = 0;
         } else if ch == '\r' {
             // A raw CR inside a triple-quoted literal is silently deleted by
@@ -2596,6 +2693,118 @@ mod tests {
         let src = "x: int = 1\n";
         let out = round_trip(src);
         assert!(out.contains("x: int = 1"), "got: {}", out);
+    }
+
+    /// A `yield` is a bare operand only as the whole RHS of an assignment or
+    /// the whole expression statement; nested anywhere else it must keep its
+    /// parentheses, or the emitted program means something different
+    /// (`(yield t) + 1` vs `yield (t + 1)`) or does not parse at all.
+    #[test]
+    fn nested_yield_keeps_its_parentheses() {
+        let out = round_trip(
+            "def g():\n    got = (yield total) + 1\n    pair = ((yield 1), 2)\n    \
+             print((yield 2))\n    return (yield 3)\n    x = yield 4\n    yield 5\n    \
+             y = yield from z\n    w = f(a, (yield from z))\n",
+        );
+        assert!(out.contains("got = (yield total) + 1"), "got: {out}");
+        assert!(out.contains("pair = ((yield 1), 2)"), "got: {out}");
+        assert!(out.contains("print((yield 2))"), "got: {out}");
+        assert!(out.contains("return (yield 3)"), "got: {out}");
+        assert!(
+            out.contains("x = yield 4\n"),
+            "bare RHS yield must stay bare: {out}"
+        );
+        assert!(
+            out.contains("    yield 5\n"),
+            "statement yield must stay bare: {out}"
+        );
+        assert!(out.contains("y = yield from z\n"), "got: {out}");
+        assert!(out.contains("w = f(a, (yield from z))"), "got: {out}");
+    }
+
+    /// `case (x,):` is a one-element sequence pattern. Dropping the trailing
+    /// comma turns it into the capture pattern `(x)`, which matches anything.
+    #[test]
+    fn one_element_tuple_pattern_keeps_trailing_comma() {
+        // The bracket choice is recovered from the original source, which
+        // `tyc build` always attaches — so emit with the source present.
+        let src = "match v:\n    case (x,):\n        pass\n    case [y]:\n        pass\n";
+        let parsed = parse_module(src).expect("parse failed");
+        let mut emitter = super::Emitter::new();
+        emitter.set_source(std::sync::Arc::from(src));
+        emitter.emit_mod(parsed.syntax());
+        let out = emitter.finish();
+        assert!(out.contains("case (x,):"), "got: {out}");
+        assert!(out.contains("case [y]:"), "got: {out}");
+    }
+
+    /// `*` / `**` unpacking take a `bitwise_or` operand; a lower-precedence
+    /// operand (boolean, conditional) must keep its parentheses.
+    #[test]
+    fn unpacking_operands_below_bitwise_or_are_parenthesised() {
+        let out = round_trip(
+            "a = [*(b or c)]\nd = [*(e if f else g)]\nh = {**(i if j else k)}\nl = [*m, *n[0]]\n",
+        );
+        assert!(out.contains("[*(b or c)]"), "got: {out}");
+        assert!(out.contains("[*(e if f else g)]"), "got: {out}");
+        assert!(out.contains("{**(i if j else k)}"), "got: {out}");
+        assert!(
+            out.contains("[*m, *n[0]]"),
+            "plain operands stay bare: {out}"
+        );
+    }
+
+    /// `as` binds looser than `|` in a pattern, so each `pat as name`
+    /// alternative of an or-pattern needs its own parentheses.
+    #[test]
+    fn match_as_inside_match_or_is_parenthesised() {
+        let out = round_trip(
+            "match v:\n    case (A() as x) | (B() as x):\n        pass\n    case C() | D():\n        pass\n",
+        );
+        assert!(out.contains("case (A() as x) | (B() as x):"), "got: {out}");
+        assert!(out.contains("case C() | D():"), "got: {out}");
+    }
+
+    /// `1e400` overflows to infinity in the parser. `inf` is not a Python
+    /// name, so the literal has to come back as a `float(...)` call.
+    #[test]
+    fn non_finite_float_literals_emit_constructor_calls() {
+        let out = round_trip("x = 1e400\ny = -1e400\nz = 1e400j\n");
+        assert!(out.contains("x = float(\"inf\")"), "got: {out}");
+        assert!(out.contains("y = -float(\"inf\")"), "got: {out}");
+        assert!(
+            out.contains("z = complex(0.0, float(\"inf\"))"),
+            "got: {out}"
+        );
+    }
+
+    /// A NUL in a string that takes the triple-quoted path must be escaped —
+    /// CPython refuses source containing a raw NUL byte.
+    #[test]
+    fn triple_quoted_nul_is_escaped() {
+        assert_eq!(escape_triple_quoted_string("a\n\u{0}b", '"'), "a\n\\x00b");
+        assert_eq!(escape_triple_quoted_string("a\n\u{1b}b", '"'), "a\n\\x1bb");
+        // Newline and tab stay verbatim.
+        assert_eq!(escape_triple_quoted_string("a\n\tb", '"'), "a\n\tb");
+    }
+
+    /// An implicitly concatenated plain string beside an f-string is
+    /// re-emitted as f-string text, so its braces must be doubled.
+    #[test]
+    fn plain_string_part_of_fstring_doubles_braces() {
+        let out = round_trip("s = \"{\" f\"{x}\"\n");
+        assert!(
+            out.contains("{{"),
+            "the literal brace must be doubled; got: {out}"
+        );
+    }
+
+    /// A walrus as a binary-operator operand needs its parentheses.
+    #[test]
+    fn walrus_operand_keeps_parentheses() {
+        let out = round_trip("y = (x := 1) + 2\nz = not (w := f())\n");
+        assert!(out.contains("y = (x := 1) + 2"), "got: {out}");
+        assert!(out.contains("z = not (w := f())"), "got: {out}");
     }
 
     #[test]

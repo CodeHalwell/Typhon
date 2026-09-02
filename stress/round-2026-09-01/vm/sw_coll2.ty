@@ -1,0 +1,97 @@
+from collections import Counter, deque, defaultdict, OrderedDict, namedtuple
+try:
+    print("X000", Counter({"a": 3, "b": 3, "c": 1}))
+except Exception as _e:
+    print("X000", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X001", Counter({"a": 3, "b": 3, "c": 1}).most_common(2))
+except Exception as _e:
+    print("X001", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X002", Counter("abracadabra"))
+except Exception as _e:
+    print("X002", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X003", Counter([3, 1, 2, 1]))
+except Exception as _e:
+    print("X003", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X004", Counter("ab")["z"])
+except Exception as _e:
+    print("X004", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X005", Counter("ab").get("z", 0))
+except Exception as _e:
+    print("X005", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X006", Counter("aab") + Counter("b"))
+except Exception as _e:
+    print("X006", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X007", Counter() == {}, Counter({"x": 0}) == Counter(), Counter("a") == {"a": 1})
+except Exception as _e:
+    print("X007", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X008", str(Counter()), repr(Counter("a")), type(Counter("a")).__name__, isinstance(Counter(), dict))
+except Exception as _e:
+    print("X008", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X009", deque([1, 2, 3]))
+except Exception as _e:
+    print("X009", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X010", repr(deque([1])), str(deque([1])), type(deque()).__name__)
+except Exception as _e:
+    print("X010", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X011", deque([1, 2, 3], maxlen=2))
+except Exception as _e:
+    print("X011", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X012", deque([1, 2, 3], 2))
+except Exception as _e:
+    print("X012", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X013", list(deque([1, 2, 3], 2)))
+except Exception as _e:
+    print("X013", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X014", deque([1, 2, 3]) == [1, 2, 3])
+except Exception as _e:
+    print("X014", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X015", OrderedDict([("a", 1), ("b", 2)]))
+except Exception as _e:
+    print("X015", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X016", repr(OrderedDict()), type(OrderedDict()).__name__)
+except Exception as _e:
+    print("X016", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X017", OrderedDict([("a", 1), ("b", 2)]) == OrderedDict([("b", 2), ("a", 1)]))
+except Exception as _e:
+    print("X017", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X018", OrderedDict([("a", 1), ("b", 2)]) == {"b": 2, "a": 1})
+except Exception as _e:
+    print("X018", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X019", OrderedDict(a=1))
+except Exception as _e:
+    print("X019", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X020", defaultdict(int) == {}, defaultdict(list, {"a": [1]}) == {"a": [1]})
+except Exception as _e:
+    print("X020", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X021", repr(defaultdict(int, {"a": 1})))
+except Exception as _e:
+    print("X021", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X022", namedtuple("P", ["x", "y"])(1, 2))
+except Exception as _e:
+    print("X022", "ERR", type(_e).__name__, str(_e)[:70])
+try:
+    print("X023", repr(namedtuple("P", "x y")(1, 2)), namedtuple("P", "x y")(1, 2).x)
+except Exception as _e:
+    print("X023", "ERR", type(_e).__name__, str(_e)[:70])

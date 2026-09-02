@@ -1,0 +1,40 @@
+import datetime
+import logging
+from typing import Iterator
+
+logger: logging.Logger = logging.getLogger("t")
+REGISTRY: list[int] = []
+
+def stamp() -> str:
+    return datetime.datetime.now().isoformat()
+
+def register(x: int) -> int:
+    REGISTRY.append(x)
+    return len(REGISTRY)
+
+def make(n: int) -> list[int]:
+    return [i for i in range(n)]
+
+def evens(n: int) -> Iterator[int]:
+    return filter(lambda v: v % 2 == 0, range(n))
+
+def log_and_double(x: int) -> int:
+    logger.warning("doubling %d", x)
+    return x * 2
+
+def main() -> None:
+    let a: str = stamp()
+    mut spin: int = 0
+    while spin < 300000:
+        spin += 1
+    print("stamp identical:", stamp() == a)
+    print("register:", register(1), register(1))
+    let m1: list[int] = make(3)
+    m1.append(99)
+    print("make(3) again:", make(3))
+    print("evens:", list(evens(6)), list(evens(6)))
+    logging.basicConfig(level=logging.WARNING, format="%(message)s")
+    log_and_double(4)
+    log_and_double(4)
+
+main()

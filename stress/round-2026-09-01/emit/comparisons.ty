@@ -1,0 +1,10 @@
+def main() -> None:
+    let a: bool = False
+    let b: list[bool] = [True]
+    let c: int = 1
+    print(not a in b, (not a) in b, a < (c < 2), (c == 1) == True, c is not None)
+    print(1 < 2 < 3, (1 < 2) < 3, -2 ** 2, (-2) ** 2, 2 ** -1, 2 ** 3 ** 2, (2 ** 3) ** 2)
+    print(not (a or c), (not a) or c, a if c else (c if a else 5), (a if c else c) if a else 9)
+    print(-(1 + 2), -(1) + 2, (c + 1) * 2, c + (1 * 2), (c - 1) - 1, c - (1 - 1), 8 / (2 / 2))
+
+main()

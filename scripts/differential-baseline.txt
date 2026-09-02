@@ -11,6 +11,10 @@
 # means deleting lines from this file — the gate also fails when a
 # listed unit stops diverging, so the list cannot rot.
 #
+# Triage a single entry with:
+#     scripts/vm-differential.sh --filter '<unit>' --keep
+# then diff cpy.out / vm.out (and read vm.err) in the kept workdir.
+#
 # ENVIRONMENT-SENSITIVE: each unit's classification (ok / diverge /
 # vacuous) depends on which third-party packages the ambient
 # python3.13 can import — e.g. every `model` class needs pydantic at
@@ -23,15 +27,12 @@
 # rather than failed; affected non-baseline units may show up as new
 # divergences the recording environment would not produce.
 #
-# Generated 2026-07-29 against tyc 1.0.0-alpha.6
+# Generated 2026-09-01 against tyc 1.0.0-alpha.9
 # Scope: all
 #
-examples/06-classes-and-models/classes_and_models.ty
 examples/17-file-io-json/json_files.ty
 examples/21-cli-tool/todo_cli.ty
 examples/57-iterators-generators/iterators.ty
-examples/59-boundary-casts/boundary_casts.ty
-examples/60-rescue-boundaries/rescue.ty
 examples/apps/02-trading-engine/
 examples/apps/03-ml-orchestrator/
 examples/apps/04-event-sourced-banking/
@@ -47,7 +48,6 @@ stress/round-2026-05-19/cases/66_lazy_let.ty
 stress/round-2026-05-19/cases/67_lazy_let_call.ty
 stress/round-2026-05-19/cases/83_override_decorator.ty
 stress/round-2026-05-19/cases/92_typeguard.ty
-stress/round-2026-05-20-exploration/01-syntax-edge/16-model-pydantic.ty
 stress/round-2026-05-20-exploration/01-syntax-edge/18-lazy-let-module.ty
 stress/round-2026-05-20-exploration/02-io-heavy/01-file-roundtrip.ty
 stress/round-2026-05-20-exploration/02-io-heavy/02-csv-process.ty
@@ -78,15 +78,12 @@ stress/round-2026-05-21/02-io/06-pathlib.ty
 stress/round-2026-05-21/02-io/08-threading.ty
 stress/round-2026-05-21/04-ai-llm/03-tool-use.ty
 stress/round-2026-05-21/04-ai-llm/04-structured-output.ty
-stress/round-2026-05-21/06-api/01-mini-router.ty
-stress/round-2026-05-21/06-api/02-validation-chain.ty
 stress/round-2026-05-21/08-meta-stress/19-bytes-and-bin.ty
 stress/round-2026-05-22/01-language-edge/04-pub-export-list.ty
 stress/round-2026-05-22/01-language-edge/22-from-future-imports.ty
 stress/round-2026-05-22/02-io/01-file-csv-json-roundtrip.ty
 stress/round-2026-05-22/02-io/02-pathlib-walking.ty
 stress/round-2026-05-22/02-io/03-sqlite-orm.ty
-stress/round-2026-05-22/02-io/06-json-streaming-parser.ty
 stress/round-2026-05-22/02-io/07-async-file-context.ty
 stress/round-2026-05-22/04-ai-llm/02-structured-output-validation.ty
 stress/round-2026-05-22/05-agents/01-react-agent.ty
@@ -130,7 +127,6 @@ stress/round-2026-06-21/repros/26-freeze-let.ty
 stress/round-2026-06-21/repros/33-decimal-fraction.ty
 stress/round-2026-06-21/repros/34-bytes-bytearray.ty
 stress/round-2026-06-21/repros/35-set-algebra.ty
-stress/round-2026-06-21/repros/36-model-validation.ty
 stress/round-2026-06-21/repros/40-dict-views-merge.ty
 stress/round-2026-06-21/repros/52-user-decorators.ty
 stress/round-2026-06-21/repros/70-namedtuple.ty
@@ -145,6 +141,57 @@ stress/round-2026-06-21/repros/96-nested-context-managers.ty
 stress/round-2026-06-21/repros/98-async-generators.ty
 stress/round-2026-06-21/repros/99-singledispatch.ty
 stress/round-2026-06-21/third-party-wide/must_pass/38-pyyaml.ty
+stress/round-2026-09-01/analyse/b_prelude.ty
+stress/round-2026-09-01/analyse/p_memo.ty
+stress/round-2026-09-01/analyse/s1_pure_verdicts.ty
+stress/round-2026-09-01/analyse/s4_resource.ty
+stress/round-2026-09-01/analyse/t23_import_only_in_spec.ty
+stress/round-2026-09-01/emit/dataclass_default_instance.ty
+stress/round-2026-09-01/emit/enum_doc_methods.ty
+stress/round-2026-09-01/emit/freeze_enum.ty
+stress/round-2026-09-01/emit/go_sync.ty
+stress/round-2026-09-01/emit/lazy_format.ty
+stress/round-2026-09-01/emit/lazy_let_impl.ty
+stress/round-2026-09-01/emit/numerics.ty
+stress/round-2026-09-01/emit/rt_all.ty
+stress/round-2026-09-01/emit/slices.ty
+stress/round-2026-09-01/emit/typevar_default.ty
+stress/round-2026-09-01/emit/yield_binop.ty
+stress/round-2026-09-01/emit/yield_callarg.ty
+stress/round-2026-09-01/emit/yield_return.ty
+stress/round-2026-09-01/emit/yield_ternary_else.ty
+stress/round-2026-09-01/emit/yield_tuple.ty
+stress/round-2026-09-01/syntax/enum_dup_base.ty
+stress/round-2026-09-01/types/c48_star_star.ty
+stress/round-2026-09-01/types/h30_async_iface.ty
+stress/round-2026-09-01/types/h34_frozen_iface.ty
+stress/round-2026-09-01/types/h89_slots_attr.ty
+stress/round-2026-09-01/types/s112_posonly.ty
+stress/round-2026-09-01/vm/dyn.ty
+stress/round-2026-09-01/vm/fmtinst.ty
+stress/round-2026-09-01/vm/fsum.ty
+stress/round-2026-09-01/vm/hsh.ty
+stress/round-2026-09-01/vm/ienum.ty
+stress/round-2026-09-01/vm/imp.ty
+stress/round-2026-09-01/vm/jsn.ty
+stress/round-2026-09-01/vm/lam.ty
+stress/round-2026-09-01/vm/mini.ty
+stress/round-2026-09-01/vm/nxt.ty
+stress/round-2026-09-01/vm/p1.ty
+stress/round-2026-09-01/vm/p10.ty
+stress/round-2026-09-01/vm/p12.ty
+stress/round-2026-09-01/vm/p13.ty
+stress/round-2026-09-01/vm/p2.ty
+stress/round-2026-09-01/vm/p5.ty
+stress/round-2026-09-01/vm/p6.ty
+stress/round-2026-09-01/vm/p8.ty
+stress/round-2026-09-01/vm/pth.ty
+stress/round-2026-09-01/vm/sil.ty
+stress/round-2026-09-01/vm/sw_coll2.ty
+stress/round-2026-09-01/vm/sw_dt.ty
+stress/round-2026-09-01/vm/sw_num.ty
+stress/round-2026-09-01/vm/sw_path.ty
+stress/round-2026-09-01/vm/sw_str.ty
 stress/tests/101_lazy_let_circular.ty
 stress/tests/111_exception_chain.ty
 stress/tests/14_go_spawn.ty

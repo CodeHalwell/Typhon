@@ -976,6 +976,7 @@ impl Interpreter {
                             fields.push(ClassField {
                                 name: n.id.as_str().to_owned(),
                                 default,
+                                annotation: Some(format_cast_type(&a.annotation)),
                             });
                         }
                     }
@@ -1075,6 +1076,15 @@ impl Interpreter {
                 "__typhon_exc_bases__".to_owned(),
                 Value::Tuple(Rc::new(builtin_exc_bases)),
             );
+        }
+        // Class-kind markers, read back by `dataclasses.is_dataclass` /
+        // `asdict` and by the pydantic `str()` / `model_dump` paths. Like the
+        // other `__typhon_*` class attributes they never reach an instance.
+        if is_dataclass {
+            class_attrs.insert("__typhon_dataclass__".to_owned(), Value::Bool(true));
+        }
+        if is_pydantic_model {
+            class_attrs.insert("__typhon_pydantic_model__".to_owned(), Value::Bool(true));
         }
 
         let class = Rc::new(Class {
@@ -2338,7 +2348,7 @@ impl Interpreter {
                 return Err(type_error(format!(
                     "as! cast failed: value of type {} does not match {}",
                     value.type_name(),
-                    format_cast_type(tp),
+                    format_cast_type_display(tp),
                 )));
             }
         }
@@ -3077,7 +3087,7 @@ impl Interpreter {
         Ok(())
     }
 
-    fn instantiate(
+    pub(crate) fn instantiate(
         &mut self,
         class: &Rc<Class>,
         args: Vec<Value>,
@@ -3121,18 +3131,15 @@ impl Interpreter {
             class: class.clone(),
             fields: RefCell::new(HashMap::new()),
         });
-        // Initialise class-level attributes that aren't methods. Skip the
-        // internal enum sentinels so they don't leak onto instances, and
-        // skip *functions*: in CPython a function class-attribute is a
-        // descriptor that binds through the class at lookup time (this is
-        // how cross-module `extend` patches dispatch) — snapshotting it
-        // into the instance would freeze an unbound copy.
+        // Initialise class-level attributes that aren't methods. Skip every
+        // internal `__typhon_*` marker (enum sentinels, property setters,
+        // recorded exception bases, class-kind markers) so none leaks onto
+        // an instance, and skip *functions*: in CPython a function
+        // class-attribute is a descriptor that binds through the class at
+        // lookup time (this is how cross-module `extend` patches dispatch) —
+        // snapshotting it into the instance would freeze an unbound copy.
         for (k, v) in class.class_attrs.borrow().iter() {
-            if is_enum_sentinel(k)
-                || k.starts_with("__typhon_setter__")
-                || k == "__typhon_exc_bases__"
-                || matches!(v, Value::Function(_))
-            {
+            if k.starts_with("__typhon_") || matches!(v, Value::Function(_)) {
                 continue;
             }
             instance.fields.borrow_mut().insert(k.clone(), v.clone());
@@ -3592,6 +3599,11 @@ impl Interpreter {
                 let exp = b.to_u32().ok_or_else(overflow)?;
                 return Ok(Int(a.pow(exp)));
             }
+            // `bool & bool` / `|` / `^` stay `bool` in CPython (`True & False`
+            // is `False`, not `0`); every other bool operand promotes to int.
+            (Bool(a), BitOr, Bool(b)) => return Ok(Bool(a | b)),
+            (Bool(a), BitAnd, Bool(b)) => return Ok(Bool(a & b)),
+            (Bool(a), BitXor, Bool(b)) => return Ok(Bool(a ^ b)),
             (Int(a), BitOr, Int(b)) => return Ok(Int(a.bitor(b))),
             (Int(a), BitAnd, Int(b)) => return Ok(Int(a.bitand(b))),
             (Int(a), BitXor, Int(b)) => return Ok(Int(a.bitxor(b))),
@@ -3711,7 +3723,7 @@ impl Interpreter {
                 Tuple(t) => t.as_ref().clone(),
                 other => vec![other.clone()],
             };
-            return Ok(Str(Rc::new(printf_format(fmt, &values)?)));
+            return Ok(Str(Rc::new(printf_format(self, fmt, &values)?)));
         }
 
         // PEP 461: bytes printf-style `%` formatting (`b"%d items" % 5`,
@@ -3737,7 +3749,7 @@ impl Interpreter {
                     other => other,
                 })
                 .collect();
-            let formatted = printf_format(&decoded_fmt, &decoded_values)?;
+            let formatted = printf_format(self, &decoded_fmt, &decoded_values)?;
             let out: Vec<u8> = formatted.chars().map(|c| c as u32 as u8).collect();
             return Ok(Bytes(Rc::new(out)));
         }
@@ -3786,21 +3798,27 @@ impl Interpreter {
             out.extend(b.iter().cloned());
             return Ok(Tuple(Rc::new(out)));
         }
-        if let (List(a), Mult, Int(n)) = (l, op, r) {
-            let n = repeat_count_checked(a.borrow().len(), n, repeated_out_of_memory())?;
-            let mut out = Vec::with_capacity(a.borrow().len().saturating_mul(n));
-            for _ in 0..n {
-                out.extend(a.borrow().iter().cloned());
+        // Repetition works in both operand orders (`[0] * 3` and `3 * [0]`),
+        // and a `bool` count is an int (`True * [1] == [1]`), as in CPython.
+        if matches!(op, Mult) {
+            let (seq, n) = match (l, r) {
+                (List(_) | Tuple(_), Int(n)) => (l, n.clone()),
+                (List(_) | Tuple(_), Bool(b)) => (l, VmInt::from(i64::from(*b))),
+                (Int(n), List(_) | Tuple(_)) => (r, n.clone()),
+                (Bool(b), List(_) | Tuple(_)) => (r, VmInt::from(i64::from(*b))),
+                _ => (l, VmInt::from(0)),
+            };
+            match seq {
+                List(a) => {
+                    let out = repeat_elements(&a.borrow(), &n)?;
+                    return Ok(List(Rc::new(RefCell::new(out))));
+                }
+                Tuple(a) => {
+                    let out = repeat_elements(a, &n)?;
+                    return Ok(Tuple(Rc::new(out)));
+                }
+                _ => {}
             }
-            return Ok(List(Rc::new(RefCell::new(out))));
-        }
-        if let (Tuple(a), Mult, Int(n)) = (l, op, r) {
-            let n = repeat_count_checked(a.len(), n, repeated_out_of_memory())?;
-            let mut out = Vec::with_capacity(a.len().saturating_mul(n));
-            for _ in 0..n {
-                out.extend(a.iter().cloned());
-            }
-            return Ok(Tuple(Rc::new(out)));
         }
 
         // Sets.
@@ -3951,7 +3969,7 @@ impl Interpreter {
                 let name = match key {
                     Value::Str(s) => s.as_str().to_owned(),
                     _ => {
-                        return Err(key_error(key.py_repr()));
+                        return Err(crate::error::key_error_for(key));
                     }
                 };
                 self.enum_lookup_by_name(c, &name)
@@ -3998,7 +4016,7 @@ impl Interpreter {
                 d.borrow()
                     .get(&k)
                     .cloned()
-                    .ok_or_else(|| key_error(key.py_repr()))
+                    .ok_or_else(|| crate::error::key_error_for(key))
             }
             Value::Bytes(b) => {
                 let i = key.to_int()?;
@@ -4179,7 +4197,7 @@ impl Interpreter {
                 d.borrow_mut()
                     .shift_remove(&k)
                     .map(|_| ())
-                    .ok_or_else(|| key_error(key.py_repr()))
+                    .ok_or_else(|| crate::error::key_error_for(key))
             }
             // `del obj[key]` → `obj.__delitem__(key)`.
             Value::Instance(i) => {
@@ -4325,7 +4343,9 @@ impl Interpreter {
                         }
                         let dict = Value::Dict(Rc::new(RefCell::new(map)));
                         if as_json {
-                            Ok(Value::Str(Rc::new(crate::builtins::json_dumps_pub(&dict))))
+                            Ok(Value::Str(Rc::new(crate::builtins::json_dumps_model(
+                                &dict,
+                            )?)))
                         } else {
                             Ok(dict)
                         }
@@ -5056,6 +5076,13 @@ impl Interpreter {
                 None => Ok(None),
             },
             Recurse::Zip(inners) => {
+                // `zip()` with no iterables is exhausted immediately in CPython.
+                // Without this guard the loop below is vacuously satisfied and
+                // yields `()` forever — `list(zip())` then grows until the
+                // process is OOM-killed.
+                if inners.is_empty() {
+                    return Ok(None);
+                }
                 let mut out = Vec::with_capacity(inners.len());
                 for i in &inners {
                     match self.iter_next(&Value::Iter(i.clone()))? {
@@ -5608,9 +5635,32 @@ impl Interpreter {
             }
             return Ok(false);
         }
-        // Bare `except:` already returned true.
-        let _ = self.eval_expr(type_expr, env);
-        Ok(false)
+        // An attribute-qualified class — `except json.JSONDecodeError`,
+        // `except asyncio.CancelledError`, `except errors.AppError` — resolves
+        // to whatever the module exports: a user (or VM-synthesised) class,
+        // matched by identity / MRO / recorded builtin base, or a native
+        // exception constructor, matched by the kind it constructs. Anything
+        // that fails to evaluate does not match (CPython would raise at the
+        // handler; the VM stays lenient).
+        match self.eval_expr(type_expr, env) {
+            Ok(Value::Class(target)) => {
+                if target.name == exc.kind || builtin_exc_is_a(&exc.kind, &target.name) {
+                    return Ok(true);
+                }
+                if let Some(Value::Instance(inst)) = &exc.value {
+                    if class_is_subclass(&inst.class, &target)
+                        || class_has_builtin_exc_base(&inst.class, &target.name)
+                    {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            Ok(Value::Native(nf)) => {
+                Ok(nf.name == exc.kind || builtin_exc_is_a(&exc.kind, nf.name))
+            }
+            _ => Ok(false),
+        }
     }
 
     pub(crate) fn value_to_exception(&self, v: Value) -> Unwind {
@@ -6281,7 +6331,7 @@ pub(crate) fn translate_bytes_format(fmt: &str) -> String {
     out
 }
 
-fn printf_format(fmt: &str, values: &[Value]) -> Result<String, Unwind> {
+fn printf_format(interp: &mut Interpreter, fmt: &str, values: &[Value]) -> Result<String, Unwind> {
     let chars: Vec<char> = fmt.chars().collect();
     let mut out = String::new();
     let mut i = 0usize;
@@ -6357,16 +6407,18 @@ fn printf_format(fmt: &str, values: &[Value]) -> Result<String, Unwind> {
 
         let body: String = match conv {
             's' => {
-                let v = next_arg(&mut arg)?;
-                let mut s = v.py_str();
+                // Through the interpreter so a user `__str__` / `__repr__`
+                // is honoured, as `str()` / f-strings already do.
+                let v = next_arg(&mut arg)?.clone();
+                let mut s = interp.str_of(&v)?;
                 if let Some(p) = precision {
                     s = s.chars().take(p).collect();
                 }
                 s
             }
             'r' => {
-                let v = next_arg(&mut arg)?;
-                let mut s = v.py_repr();
+                let v = next_arg(&mut arg)?.clone();
+                let mut s = interp.repr_of(&v)?;
                 if let Some(p) = precision {
                     s = s.chars().take(p).collect();
                 }
@@ -6495,12 +6547,33 @@ fn repeat_count(n: &VmInt) -> Result<usize, Unwind> {
     if n.is_negative() {
         return Ok(0);
     }
-    n.to_usize().ok_or_else(|| {
-        Unwind::Exception(VmException::new(
-            "OverflowError",
-            "cannot fit 'int' into an index-sized integer",
-        ))
-    })
+    // An index-sized integer is `Py_ssize_t`, i.e. `isize`, so `2 ** 63` is
+    // already too big even though it fits a `usize`.
+    n.to_usize()
+        .filter(|count| *count <= isize::MAX as usize)
+        .ok_or_else(|| {
+            Unwind::Exception(VmException::new(
+                "OverflowError",
+                "cannot fit 'int' into an index-sized integer",
+            ))
+        })
+}
+
+/// `seq * n` for a `list` / `tuple`: the element vector repeated `n` times.
+/// The total length is size-checked first (`MemoryError`, as CPython), and the
+/// backing allocation goes through `try_reserve_exact` so a count that fits an
+/// index but not the machine (`[1, 1] * (2 ** 40)`) also surfaces as a
+/// catchable `MemoryError` instead of aborting the process.
+fn repeat_elements(elems: &[Value], n: &VmInt) -> Result<Vec<Value>, Unwind> {
+    let count = repeat_count_checked(elems.len(), n, repeated_out_of_memory())?;
+    let total = elems.len().saturating_mul(count);
+    let mut out: Vec<Value> = Vec::new();
+    out.try_reserve_exact(total)
+        .map_err(|_| repeated_out_of_memory())?;
+    for _ in 0..count {
+        out.extend(elems.iter().cloned());
+    }
+    Ok(out)
 }
 
 /// Like [`repeat_count`], but also rejects a repetition whose *total* size
@@ -7119,10 +7192,52 @@ fn exc_fallback_args(message: &str) -> Vec<Value> {
 /// Render a `as!` type-descriptor AST back to a readable string for the
 /// `TypeError` message (`dict[str, int]`, `int | None`, `list[int]`). Kept
 /// close to the `str(tp)` text the compile path's `cast.py` produces.
-fn format_cast_type(tp: &Expr) -> String {
+/// `str(tp)` of an `as!` target, matching the compiled runtime's
+/// `_format_type` in the failure message: a bare class renders as
+/// `<class 'int'>` (a builtin) or `<class '__main__.User'>` (a user class);
+/// a parametric or union type renders as its annotation text
+/// (`dict[str, int]`, `int | None`), which is what `str()` of a
+/// `types.GenericAlias` / `types.UnionType` gives.
+fn format_cast_type_display(tp: &Expr) -> String {
+    const BUILTIN_TYPES: &[&str] = &[
+        "int",
+        "float",
+        "str",
+        "bool",
+        "bytes",
+        "bytearray",
+        "list",
+        "dict",
+        "set",
+        "frozenset",
+        "tuple",
+        "object",
+        "complex",
+        "type",
+        "range",
+        "slice",
+        "memoryview",
+    ];
+    match tp {
+        Expr::Name(n) => {
+            let name = n.id.as_str();
+            if BUILTIN_TYPES.contains(&name) {
+                format!("<class '{name}'>")
+            } else {
+                format!("<class '__main__.{name}'>")
+            }
+        }
+        other => format_cast_type(other),
+    }
+}
+
+/// Render a type expression as annotation source text.
+pub(crate) fn format_cast_type(tp: &Expr) -> String {
     match tp {
         Expr::NoneLiteral(_) => "None".to_owned(),
         Expr::Name(n) => n.id.as_str().to_owned(),
+        // A quoted (forward-reference) annotation is its own text.
+        Expr::StringLiteral(sl) => sl.value.to_str().to_owned(),
         Expr::Attribute(a) => format!("{}.{}", format_cast_type(&a.value), a.attr.as_str()),
         Expr::EllipsisLiteral(_) => "...".to_owned(),
         Expr::BinOp(b) if matches!(b.op, Operator::BitOr) => {
@@ -7162,6 +7277,10 @@ pub fn builtin_exc_is_a(kind: &str, target: &str) -> bool {
                 | "KeyboardInterrupt"
                 | "SystemExit"
                 | "GeneratorExit"
+                // `asyncio.CancelledError` derives from `BaseException` since
+                // Python 3.8, so `except Exception` does not swallow a
+                // cancellation.
+                | "CancelledError"
                 // PEP 654: `BaseExceptionGroup` derives from `BaseException`
                 // only — `except Exception` must not catch it. Its
                 // `ExceptionGroup` sibling *does* derive from `Exception` and
@@ -7179,7 +7298,7 @@ pub fn builtin_exc_is_a(kind: &str, target: &str) -> bool {
             "ModuleNotFoundError" => "ImportError",
             "RecursionError" | "NotImplementedError" => "RuntimeError",
             "UnboundLocalError" => "NameError",
-            "UnicodeError" => "ValueError",
+            "UnicodeError" | "JSONDecodeError" => "ValueError",
             "UnicodeDecodeError" | "UnicodeEncodeError" | "UnicodeTranslateError" => "UnicodeError",
             "FileNotFoundError" | "FileExistsError" | "PermissionError" | "IsADirectoryError"
             | "NotADirectoryError" | "InterruptedError" | "TimeoutError" | "BlockingIOError"
@@ -7570,6 +7689,20 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
                         let upper = matches!(typ, Some('G'));
                         format_g(abs, sig, upper)
                     }
+                    // No presentation type: without a precision this is
+                    // `repr(x)` (`f"{1.5:10}"` → `1.5`, not `1.500000`); with
+                    // one it is `g`-style significant digits that always keep
+                    // at least one digit after the point (`f"{3.0:.3}"` → `3.0`).
+                    None if precision.is_none() => Value::Float(abs).py_repr(),
+                    None => {
+                        let sig = if p == 0 { 1 } else { p };
+                        let g = format_g(abs, sig, false);
+                        if g.contains(['.', 'e', 'n', 'i']) {
+                            g
+                        } else {
+                            format!("{g}.0")
+                        }
+                    }
                     _ => format!("{:.*}", p, abs),
                 }
             };
@@ -7644,7 +7777,14 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
         Value::Bool(b) => {
             buf = (*b as i64).to_string();
         }
-        _ => buf = default.to_owned(),
+        _ => {
+            // A precision on a string is a maximum length (`f"{'hello':.3}"`
+            // → `hel`).
+            buf = match (value, precision) {
+                (Value::Str(_), Some(p)) => default.chars().take(p).collect(),
+                _ => default.to_owned(),
+            };
+        }
     }
 
     // Apply width: combine sign + prefix + body, then pad.
@@ -7900,6 +8040,73 @@ result = (calls, xs[0])
                     assert_eq!(e.message, msg, "src={src}");
                 }
                 other => panic!("expected {kind} for {src}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn sequence_repetition_is_reflected_and_index_bounded() {
+        // `n * seq` is the same as `seq * n`, and a bool count is an int.
+        let src = "\
+a = 3 * [0]
+b = 2 * (1, 2)
+c = True * [1]
+d = [1] * True
+e = 0 * [1, 2]
+";
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert_eq!(interp.root.get("a").unwrap().py_repr(), "[0, 0, 0]");
+        assert_eq!(interp.root.get("b").unwrap().py_repr(), "(1, 2, 1, 2)");
+        assert_eq!(interp.root.get("c").unwrap().py_repr(), "[1]");
+        assert_eq!(interp.root.get("d").unwrap().py_repr(), "[1]");
+        assert_eq!(interp.root.get("e").unwrap().py_repr(), "[]");
+
+        // A count that fits a `usize` but not a `Py_ssize_t` is an
+        // OverflowError, as in CPython — not a MemoryError.
+        let (_i, res) = parse_and_run("r = [1] * (2 ** 63)");
+        match res.expect_err("count above isize::MAX must raise") {
+            Unwind::Exception(e) => {
+                assert_eq!(e.kind, "OverflowError");
+                assert_eq!(e.message, "cannot fit 'int' into an index-sized integer");
+            }
+            other => panic!("expected OverflowError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zip_with_no_iterables_is_empty_and_strict_names_the_argument() {
+        // `zip()` is exhausted immediately; the loop over zero inner iterators
+        // used to be vacuously satisfied and yield `()` forever.
+        let (interp, res) = parse_and_run("r = list(zip())");
+        res.unwrap();
+        assert_eq!(interp.root.get("r").unwrap().py_repr(), "[]");
+
+        for (src, msg) in [
+            (
+                "r = list(zip([1, 2], \"abc\", strict=True))",
+                "zip() argument 2 is longer than argument 1",
+            ),
+            (
+                "r = list(zip([1, 2, 3], \"ab\", strict=True))",
+                "zip() argument 2 is shorter than argument 1",
+            ),
+            (
+                "r = list(zip([1], [1], [1, 2], strict=True))",
+                "zip() argument 3 is longer than arguments 1-2",
+            ),
+            (
+                "r = list(zip([1, 2], [1, 2], [1], strict=True))",
+                "zip() argument 3 is shorter than arguments 1-2",
+            ),
+        ] {
+            let (_i, res) = parse_and_run(src);
+            match res.expect_err("strict zip over unequal lengths must raise") {
+                Unwind::Exception(e) => {
+                    assert_eq!(e.kind, "ValueError", "src={src}");
+                    assert_eq!(e.message, msg, "src={src}");
+                }
+                other => panic!("expected ValueError for {src}, got {other:?}"),
             }
         }
     }
