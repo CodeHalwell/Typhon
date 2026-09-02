@@ -304,6 +304,14 @@ without any `.py` emission. `tyc run --compile` now spawns
 `python -m <pkg>.main` instead of `python build/main.py` so relative
 imports in the entry point resolve correctly.
 
+Since v1.0.0-beta.1 `from repo import users` — reaching a submodule through
+its package, rather than naming it in full — loads `repo.users` when the
+package has no such attribute, exactly as CPython's import system does; a
+name the package genuinely lacks raises `ImportError`, not
+`AttributeError`. A bare-file invocation whose adjacent package imports
+something the VM does not model takes the compiled fallback, package and
+all.
+
 ## Comptime, freeze, lazy
 
 - `comptime let X = ...` inlines in the VM via the substitution pass

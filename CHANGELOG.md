@@ -288,6 +288,16 @@ error message already listed it — and `itertools.permutations` /
 `combinations` / `combinations_with_replacement` accepted a negative `r`,
 silently yielding plausible nonsense where CPython raises.
 
+**`from pkg import submodule` never worked in the VM.** The most common way
+to reach into a package raised `AttributeError: module 'pkg' has no attribute
+'store'` under `tyc run` on a program `tyc build` compiles and runs — the VM
+looked the name up on the package object and stopped there, where CPython
+imports `pkg.store` when the attribute is absent. It imports it now, and
+stamps it onto the package so a later `pkg.store` resolves without
+re-importing. A name the package genuinely does not have raises `ImportError`
+with CPython's message rather than `AttributeError`, which is the type an
+`except ImportError` around an optional dependency is written to catch.
+
 **A prelude name that only the VM could resolve.** `BaseModel` and
 `NewType` resolve without an import — the `model` and `newtype` lowerings
 introduce them — so naming either directly passes `tyc check`. Their

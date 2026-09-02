@@ -1069,6 +1069,7 @@ impl Interpreter {
         // module's own package — rather than always against
         // `source_root` — is what lets a relative import work below
         // the top level of a project.
+        let mut resolved_name = module_name.clone();
         let module = if im.level > 0 {
             let base = self.relative_import_base(im.level);
             if module_name.is_empty() {
@@ -1087,7 +1088,8 @@ impl Interpreter {
                 }
                 return Ok(());
             }
-            self.import_module(&join_module(&base, &module_name))?
+            resolved_name = join_module(&base, &module_name);
+            self.import_module(&resolved_name)?
         } else {
             self.import_module(&module_name)?
         };
@@ -1109,7 +1111,47 @@ impl Interpreter {
                 }
                 continue;
             }
-            let val = self.get_attr(&module, attr)?;
+            // `from pkg import submodule`: CPython looks for the attribute
+            // first and *imports* `pkg.submodule` when the package has not
+            // bound one, which is the whole reason the idiom works. The
+            // loaded module is stamped onto the package too, so a later
+            // `pkg.submodule` resolves without re-importing.
+            let val = match self.get_attr(&module, attr) {
+                Ok(v) => v,
+                Err(missing) => {
+                    let Value::Module(package) = &module else {
+                        return Err(missing);
+                    };
+                    let submodule = format!("{resolved_name}.{attr}");
+                    match self.import_module(&submodule) {
+                        Ok(sub) => {
+                            package
+                                .members
+                                .borrow_mut()
+                                .insert(attr.to_owned(), sub.clone());
+                            sub
+                        }
+                        // A name a module does not have is an `ImportError`
+                        // here, not the `AttributeError` a plain attribute
+                        // read would give — that is the type `except
+                        // ImportError` around an optional dependency
+                        // catches.
+                        Err(_) => {
+                            let file = match package.members.borrow().get("__file__") {
+                                Some(Value::Str(path)) => format!(" ({path})"),
+                                _ => String::new(),
+                            };
+                            return Err(Unwind::Exception(VmException::new(
+                                "ImportError",
+                                format!(
+                                    "cannot import name '{attr}' from '{}'{file}",
+                                    package.name
+                                ),
+                            )));
+                        }
+                    }
+                }
+            };
             let bind = alias
                 .asname
                 .as_ref()

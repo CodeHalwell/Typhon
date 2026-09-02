@@ -1288,6 +1288,46 @@ fn run_scans_an_adjacent_package_for_unmodelled_imports() {
 }
 
 #[test]
+fn vm_imports_a_submodule_through_its_package() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "from pkg import store\nfrom pkg.inner import deep\n\n\ndef main() -> None:\n    print(store.name(), deep.value())\n    try:\n        from pkg import nope\n    except ImportError as e:\n        print(\"ImportError\", str(e)[:44])\n\n\nmain()\n",
+    );
+    let pkg = tmp.path().join("src").join("pkg");
+    std::fs::create_dir_all(pkg.join("inner")).unwrap();
+    std::fs::write(pkg.join("__init__.ty"), "").unwrap();
+    std::fs::write(
+        pkg.join("store.ty"),
+        "def name() -> str:\n    return \"store\"\n",
+    )
+    .unwrap();
+    std::fs::write(pkg.join("inner").join("__init__.ty"), "").unwrap();
+    std::fs::write(
+        pkg.join("inner").join("deep.ty"),
+        "def value() -> int:\n    return 7\n",
+    )
+    .unwrap();
+    let out = tyc()
+        .arg("run")
+        .arg("--no-fallback")
+        .arg(tmp.path())
+        .env("TYC_NO_SYNC", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("store 7"),
+        "`from pkg import submodule` should load the submodule:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("ImportError cannot import name 'nope' from 'pkg'"),
+        "a name the package does not have is an ImportError, not an AttributeError:\n{stdout}"
+    );
+}
+
+#[test]
 fn build_fails_on_type_error() {
     let tmp = tempfile::tempdir().unwrap();
     scaffold(tmp.path(), "let x: int = \"wrong type\"\n");
