@@ -414,8 +414,9 @@ with every gate green at each step.
 
 ### What is still open
 
-- **The 9 remaining differential entries.** Each is a VM bug and the file
-  names them. Four clusters remain. *Concurrency ordering* (`p8`,
+- **The 7 remaining differential entries**, down from 167 at the start of
+  the review. Every one left is an inherent limitation rather than an
+  oversight, and the file names them. *Concurrency ordering* (`p8`,
   `14_go_spawn`, `02-multi-agent`): the VM runs coroutines sequentially, so
   interleaved output from `gather:` and `go` differs — inherent to the
   design and documented in `docs/vm.md`. *Pydantic validation* (three
@@ -426,18 +427,23 @@ with every gate green at each step.
   result is whatever the sort algorithm's internals do with that —
   CPython's Timsort gives `[1, nan, 3]` where Rust's merge sort gives
   `[nan, 1, 3]`. Matching it means porting `listsort.c`; the rest of the
-  line agrees. *Prelude and type-parameter reflection* (`b_prelude`, where
-  the VM resolves prelude names CPython raises `NameError` for, and
-  `typevar_default`, which reads PEP 696 `__default__` off
-  `__type_params__` — the VM erases type parameters at definition time).
-  None of them is a *silent* wrong answer on the compiled path — they are
-  VM-only.
+  line agrees. None of them is a *silent* wrong answer on the compiled
+  path — they are VM-only.
 
-  The deep-Unicode and numeric clusters are closed: `p1`, `p2`, `p12` and
-  `sw_str` now agree, taking the format-spec mini-language, the character
-  properties behind `isdigit` / `isprintable` / `title`, the missing
-  two-thirds of the `bytes` method surface, the `cp1252` codec and the
-  printf-style operator's `%u` / `%a` / integer precision with them.
+  The deep-Unicode, numeric and reflection clusters are closed: `p1`, `p2`,
+  `p12`, `sw_str`, `b_prelude` and `typevar_default` now agree, taking the
+  format-spec mini-language, the character properties behind `isdigit` /
+  `isprintable` / `title`, the missing two-thirds of the `bytes` method
+  surface, the `cp1252` codec, the printf-style operator's `%u` / `%a` /
+  integer precision, the module-qualified class repr and PEP 695
+  `__type_params__` (with PEP 696 defaults) with them.
+
+  One related gap is deliberately left open: a *shim* class still reprs
+  without a module (`<class 'Counter'>`, not `<class
+  'collections.Counter'>`). The VM's name for a shim class is not always
+  CPython's — `pathlib.Path` is modelled as `PosixPath` — so stamping a
+  module onto them would assert something untrue rather than close the
+  gap.
 - ~~**`tyc run --compile <file>` diagnostics name the scaffold.**~~ Closed:
   the staged build reports diagnostics under the path the user gave, and
   the scaffold turns on `traceback-remap`, so an uncaught exception's

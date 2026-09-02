@@ -211,6 +211,29 @@ more `bool`-is-an-`int` gaps went with them: `divmod(True, 2)` returned the
 float pair `(0.0, 1.0)`, and `round(True)` raised. **The differential
 baseline falls to 9.**
 
+**Two kinds of reflection the VM answered wrongly.** A class object reprs
+with the module its body ran in — CPython writes `<class '__main__.User'>`
+where the VM wrote `<class 'User'>`, so any program printing a class or a
+`type(x)` disagreed. The module was already recorded (it is what
+`object.__repr__` uses); the class repr consults it now, and a stdlib shim's
+classes stay bare rather than claiming the caller's module. `BaseModel`,
+`enum.auto` and `NewType` — three prelude names the VM models as
+placeholders — print with the module and the *kind* CPython gives them
+(`<class 'pydantic.main.BaseModel'>`, `<class 'enum.auto'>`,
+`<class 'typing.NewType'>`).
+
+PEP 695 type parameters were erased at definition time, so
+`__type_params__` was the empty tuple for *every* function and class,
+generic or not, and a PEP 696 default was unreachable. Each parameter is a
+real object now — `TypeVar`, `ParamSpec` or `TypeVarTuple`, carrying its
+`__name__`, `__bound__`, `__constraints__`, `__default__` and
+`has_default()`, and reprs bare as an inferred-variance parameter does. A
+non-generic function or class still reports `()`. **The differential
+baseline falls to 7, and every entry left is an inherent design
+limitation** — the sequential coroutine scheduler (3), the VM's
+non-validating pydantic stand-in (3), and one line whose value depends on
+which sort algorithm sees an all-false comparator.
+
 **A prelude name that only the VM could resolve.** `BaseModel` and
 `NewType` resolve without an import — the `model` and `newtype` lowerings
 introduce them — so naming either directly passes `tyc check`. Their

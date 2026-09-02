@@ -1325,6 +1325,11 @@ impl Interpreter {
         // later walk (the analysis stamps node indices onto its `Name` nodes).
         let slot_info = Rc::new(crate::slots::SlotInfo::analyze(&f.parameters, &body));
         let generator = generator_kind(f.is_async, &body);
+        let mut attrs: HashMap<String, Value> = HashMap::new();
+        if f.type_params.is_some() {
+            let params = self.build_type_params(f.type_params.as_deref(), env)?;
+            attrs.insert("__type_params__".to_owned(), params);
+        }
         Ok(Function {
             name: f.name.as_str().to_owned(),
             params: f.parameters.clone(),
@@ -1337,8 +1342,64 @@ impl Interpreter {
             source: self.current_source.clone(),
             slot_info,
             generator,
-            attrs: RefCell::new(HashMap::new()),
+            attrs: RefCell::new(attrs),
         })
+    }
+
+    /// The `__type_params__` tuple for a PEP 695 parameter list. Every entry
+    /// is a real `TypeVar` / `TypeVarTuple` / `ParamSpec` object, with the
+    /// bound, constraints and PEP 696 default the source gave it — the type
+    /// checker erases them, but a program can still read them back.
+    fn build_type_params(
+        &mut self,
+        params: Option<&ast::TypeParams>,
+        env: &EnvRef,
+    ) -> Result<Value, Unwind> {
+        let Some(params) = params else {
+            return Ok(Value::Tuple(Rc::new(Vec::new())));
+        };
+        let mut out = Vec::with_capacity(params.len());
+        for p in params.iter() {
+            let (kind, name, bound, default) = match p {
+                ast::TypeParam::TypeVar(t) => (
+                    "TypeVar",
+                    t.name.as_str(),
+                    t.bound.as_deref(),
+                    t.default.as_deref(),
+                ),
+                ast::TypeParam::TypeVarTuple(t) => {
+                    ("TypeVarTuple", t.name.as_str(), None, t.default.as_deref())
+                }
+                ast::TypeParam::ParamSpec(t) => {
+                    ("ParamSpec", t.name.as_str(), None, t.default.as_deref())
+                }
+            };
+            let mut args = vec![Value::Str(Rc::new(name.to_owned()))];
+            let mut kwargs: Vec<(String, Value)> = Vec::new();
+            // `[T: (int, str)]` is a constraint *tuple*; anything else is a
+            // bound, which is where CPython puts it too.
+            if let Some(b) = bound {
+                match b {
+                    Expr::Tuple(t) => {
+                        for element in &t.elts {
+                            args.push(self.eval_expr(element, env)?);
+                        }
+                    }
+                    other => kwargs.push(("bound".to_owned(), self.eval_expr(other, env)?)),
+                }
+            }
+            if let Some(d) = default {
+                kwargs.push(("default".to_owned(), self.eval_expr(d, env)?));
+            }
+            // PEP 695 parameters always infer their variance, which is what
+            // makes them repr bare (`T`) rather than `~T`.
+            if kind != "TypeVarTuple" {
+                kwargs.push(("infer_variance".to_owned(), Value::Bool(true)));
+            }
+            let class = crate::builtins::type_param_class(self, kind)?;
+            out.push(self.call_value(class, args, &kwargs)?);
+        }
+        Ok(Value::Tuple(Rc::new(out)))
     }
 
     fn build_class(&mut self, c: &ast::StmtClassDef, env: &EnvRef) -> Result<Rc<Class>, Unwind> {
@@ -1796,6 +1857,12 @@ impl Interpreter {
             "__typhon_module__".to_owned(),
             Value::Str(Rc::new(self.current_module_name.clone())),
         );
+        // Only a *generic* class carries the attribute, as in CPython, so a
+        // plain class's `__dict__` is not given a spurious entry.
+        if c.type_params.is_some() {
+            let params = self.build_type_params(c.type_params.as_deref(), env)?;
+            class_attrs.insert("__type_params__".to_owned(), params);
+        }
         // `@runtime_checkable` opts a Protocol into `isinstance`. CPython
         // stamps exactly this attribute, and refuses the check without it.
         if c.decorator_list
@@ -6243,6 +6310,16 @@ impl Interpreter {
                     out.push(crate::builtins::make_builtin_type("object"));
                     return Ok(Value::Tuple(Rc::new(out)));
                 }
+                // `Cls.__type_params__` — the PEP 695 parameter objects, or
+                // the empty tuple for a class that has none.
+                if attr == "__type_params__" {
+                    return Ok(class
+                        .class_attrs
+                        .borrow()
+                        .get("__type_params__")
+                        .cloned()
+                        .unwrap_or_else(|| Value::Tuple(Rc::new(Vec::new()))));
+                }
                 // `Cls.__doc__` — the class body's leading string literal,
                 // recorded at class creation, or `None`.
                 if attr == "__doc__" {
@@ -6430,13 +6507,16 @@ impl Interpreter {
             Value::Function(f) if attr == "__name__" || attr == "__qualname__" => {
                 Ok(Value::Str(Rc::new(f.name.clone())))
             }
-            // PEP 695: a function's own type parameters. The VM erases them
-            // at definition time, so the tuple is empty — which is what
-            // CPython reports for every non-generic function, and the only
-            // thing a runtime consumer can act on either way.
-            Value::Function(_) | Value::Native(_) if attr == "__type_params__" => {
-                Ok(Value::Tuple(Rc::new(Vec::new())))
-            }
+            // PEP 695: a function's own type parameters, stamped at def time
+            // by `build_type_params`. A non-generic function reports the empty
+            // tuple, as CPython does.
+            Value::Function(f) if attr == "__type_params__" => Ok(f
+                .attrs
+                .borrow()
+                .get("__type_params__")
+                .cloned()
+                .unwrap_or_else(|| Value::Tuple(Rc::new(Vec::new())))),
+            Value::Native(_) if attr == "__type_params__" => Ok(Value::Tuple(Rc::new(Vec::new()))),
             Value::Function(f) if attr == "__dict__" => {
                 let mut map = crate::value::DictMap::new();
                 for (k, v) in f.attrs.borrow().iter() {

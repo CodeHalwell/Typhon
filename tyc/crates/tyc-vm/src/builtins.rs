@@ -2417,6 +2417,7 @@ mod shims {
     pub const FUNCTOOLS_EXTRA: &str = include_str!("shims/functools_extra.py");
     pub const BYTEARRAY: &str = include_str!("shims/bytearray.py");
     pub const LAZY: &str = include_str!("shims/lazy.py");
+    pub const TYPEPARAMS: &str = include_str!("shims/typeparams.py");
 }
 
 fn compile_helpers(interp: &mut Interpreter, source: &str) -> Result<Vec<(String, Value)>, Unwind> {
@@ -2489,7 +2490,13 @@ fn compile_shim(
     for (name, value) in seed {
         env.set(name, value);
     }
-    interp.exec_block(&module.body, &env)?;
+    // A shim's classes must not be stamped with the *caller's* module: they
+    // would then repr as `<class '__main__.Path'>`. An empty module name
+    // leaves them bare, which is what the VM printed before shims had one.
+    let outer_module = std::mem::take(&mut interp.current_module_name);
+    let result = interp.exec_block(&module.body, &env);
+    interp.current_module_name = outer_module;
+    result?;
     Ok((env.snapshot(), env))
 }
 
@@ -2633,6 +2640,36 @@ fn compile_helper(interp: &mut Interpreter, source: &str, name: &str) -> Result<
         .find(|(k, _)| k == name)
         .map(|(_, v)| v)
         .ok_or_else(|| type_error(format!("stdlib shim did not define '{name}'")))
+}
+
+/// The PEP 695 / PEP 696 type-parameter classes, compiled once. `TypeVar`,
+/// `ParamSpec`, `TypeVarTuple` and the `NoDefault` sentinel have to come from
+/// a *single* compilation, because `has_default()` tests identity against
+/// that sentinel.
+pub(crate) fn type_param_class(interp: &mut Interpreter, name: &str) -> Result<Value, Unwind> {
+    const KEY: &str = "__typhon_typeparams__";
+    let module = match interp.module_cache.get(KEY) {
+        Some(v) => v.clone(),
+        None => {
+            let members = compile_helpers(interp, shims::TYPEPARAMS)?;
+            let entries: Vec<(&str, Value)> = members
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.clone()))
+                .collect();
+            let m = make_module("typing", entries);
+            interp.module_cache.insert(KEY.to_owned(), m.clone());
+            m
+        }
+    };
+    match &module {
+        Value::Module(m) => m
+            .members
+            .borrow()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| type_error(format!("type-parameter shim did not define '{name}'"))),
+        _ => Err(type_error("type-parameter shim is not a module")),
+    }
 }
 
 /// Compile (once, memoised in `module_cache`) and return a synthesised helper
@@ -7242,11 +7279,17 @@ fn deep_freeze_value(v: Value) -> Result<Value, Unwind> {
 /// must run via `tyc run --compile`. Without this shim, even declaring
 /// (not instantiating) a `model` class makes the file unrunnable in the VM.
 fn make_pydantic_module() -> Value {
+    // The module is pydantic's own, so `print(BaseModel)` reads as it does
+    // under CPython rather than as a bare `<class 'BaseModel'>`.
+    let base_model_attrs = HashMap::from([(
+        "__typhon_module__".to_owned(),
+        Value::Str(Rc::new("pydantic.main".to_owned())),
+    )]);
     let base_model = Value::Class(Rc::new(crate::value::Class {
         name: "BaseModel".to_owned(),
         methods: std::cell::RefCell::new(HashMap::new()),
         fields: vec![],
-        class_attrs: std::cell::RefCell::new(HashMap::new()),
+        class_attrs: std::cell::RefCell::new(base_model_attrs),
         bases: vec![],
         properties: std::cell::RefCell::new(std::collections::HashSet::new()),
         classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),

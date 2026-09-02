@@ -241,6 +241,14 @@ package (`pydantic` has the placeholder above; `numpy`, `requests`,
   `str.upper(s)`, `dict.get(d, k)`, `list.count(xs, x)` (v1.0.0-beta.1),
   plus the classmethods `int.from_bytes` and `bytes.fromhex`.
 - `float.hex()` and `int` / `float` `as_integer_ratio()` (v1.0.0-beta.1).
+- Reflection (v1.0.0-beta.1): a class object reprs with the module its body
+  ran in (`<class '__main__.User'>`), and PEP 695 type parameters are real
+  `TypeVar` / `ParamSpec` / `TypeVarTuple` objects on `__type_params__`,
+  carrying `__name__`, `__bound__`, `__constraints__`, `__default__` (PEP
+  696) and `has_default()`. A non-generic function or class reports `()`.
+  A stdlib shim's classes repr without a module: the VM's name for one is
+  not always CPython's (`pathlib.Path` is modelled as `PosixPath`), so
+  qualifying them would assert something untrue.
 - `str.format` handles the `!r` / `!s` / `!a` conversions and the
   `{0.attr}` / `{name[key]}` accessors (v1.0.0-beta.1); `str.center`
   biases its extra pad character the way CPython does.

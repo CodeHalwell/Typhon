@@ -714,9 +714,14 @@ pub fn native_repr(name: &str) -> String {
         || name.ends_with("Exception")
         || name.ends_with("Warning");
     if is_type {
-        format!("<class '{name}'>")
-    } else {
-        format!("<built-in function {name}>")
+        return format!("<class '{name}'>");
+    }
+    // Two prelude names the VM models as natives are *classes* in CPython,
+    // and print with the module that defines them.
+    match name {
+        "enum.auto" => "<class 'enum.auto'>".to_owned(),
+        "NewType" => "<class 'typing.NewType'>".to_owned(),
+        _ => format!("<built-in function {name}>"),
     }
 }
 
@@ -2544,7 +2549,7 @@ impl Value {
                     receiver.py_repr()
                 )
             }
-            Value::Class(c) => format!("<class '{}'>", c.name),
+            Value::Class(c) => class_repr(c),
             // `str(exc)` differs from `repr(exc)` for a field-less exception
             // instance: the message/args, not `ClassName('msg')`.
             Value::Instance(i) => match exception_instance_args(i) {
@@ -2929,6 +2934,17 @@ fn instance_repr_inner(inst: &Instance) -> String {
         return object_default_repr(inst);
     }
     format!("{}({})", inst.class.name, parts.join(", "))
+}
+
+/// `repr()` of a class object. CPython qualifies it with the module the class
+/// body ran in — `<class '__main__.User'>`, not `<class 'User'>` — which the
+/// VM records as `__typhon_module__`. A stdlib shim's classes carry no module
+/// (CPython's name for them is not the shim's), so those stay bare.
+pub fn class_repr(class: &Class) -> String {
+    match class.class_attrs.borrow().get("__typhon_module__") {
+        Some(Value::Str(m)) if !m.is_empty() => format!("<class '{m}.{}'>", class.name),
+        _ => format!("<class '{}'>", class.name),
+    }
 }
 
 /// `object.__repr__`: `<module.Class object at 0x…>`. The module is the one

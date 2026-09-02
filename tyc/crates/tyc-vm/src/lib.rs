@@ -2679,6 +2679,80 @@ main()
     }
 
     #[test]
+    fn vm_type_parameter_and_class_reflection_match_cpython() {
+        let src = r#"
+
+def first[T = int](xs: list[T]) -> T:
+    return xs[0]
+
+
+def pair[K, V](k: K, v: V) -> tuple[K, V]:
+    return (k, v)
+
+
+def variadic[*Ts, **P]() -> None:
+    return None
+
+
+class Box[T = str]:
+    value: T
+
+
+class Bounded[T: int]:
+    value: T
+
+
+class Constrained[T: (int, str)]:
+    value: T
+
+
+class Plain:
+    a: int
+
+
+def plain(a: int) -> int:
+    return a
+
+
+def check(label: str, got: str, want: str) -> None:
+    if got != want:
+        raise ValueError(f"{label}: got {got!r}, want {want!r}")
+
+
+def main() -> None:
+    # PEP 695 parameters are real objects, and PEP 696 defaults read back.
+    check("fn-params", str(first.__type_params__), "(T,)")
+    check("cls-params", str(Box.__type_params__), "(T,)")
+    check("fn-default", str(first.__type_params__[0].__default__), "<class 'int'>")
+    check("cls-default", str(Box.__type_params__[0].__default__), "<class 'str'>")
+    check("has-default", f"{first.__type_params__[0].has_default()}", "True")
+    check("name", first.__type_params__[0].__name__, "T")
+    check("two", str(pair.__type_params__), "(K, V)")
+    check("no-default", f"{pair.__type_params__[0].has_default()}", "False")
+    check("nodefault-repr", repr(pair.__type_params__[0].__default__), "typing.NoDefault")
+    check("bound", str(Bounded.__type_params__[0].__bound__), "<class 'int'>")
+    check(
+        "constraints",
+        str(Constrained.__type_params__[0].__constraints__),
+        "(<class 'int'>, <class 'str'>)",
+    )
+    check("variadic", str(variadic.__type_params__), "(Ts, P)")
+    # A non-generic function or class reports the empty tuple, not an error.
+    check("plain-fn", str(plain.__type_params__), "()")
+    check("plain-cls", str(Plain.__type_params__), "()")
+
+    # A class object reprs with the module its body ran in.
+    check("cls-repr", str(Plain), "<class '__main__.Plain'>")
+    check("type-of", str(type(Plain(a=1))), "<class '__main__.Plain'>")
+    print("ok")
+
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn vm_unicode_properties_bytes_and_printf_match_cpython() {
         let src = r#"
 def check(label: str, got: str, want: str) -> None:
