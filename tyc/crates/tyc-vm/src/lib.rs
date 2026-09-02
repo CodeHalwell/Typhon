@@ -2602,6 +2602,54 @@ main()
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
 
+    /// `os.access` honours the requested mode, `os.truncate` grows a file
+    /// with NULs, and a lone UTF-16 surrogate goes through the decode error
+    /// handler instead of always raising.
+    #[test]
+    fn vm_access_truncate_and_utf16_error_handlers() {
+        let src = r#"
+import os
+
+def main() -> None:
+    let d: str = "/tmp/zz_vm_access_probe"
+    os.makedirs(d, exist_ok=True)
+    let f: str = d + "/plain.txt"
+    with open(f, "w") as fh:
+        fh.write("abc")
+    os.chmod(f, 0o644)
+    if not os.access(f, os.F_OK) or not os.access(f, os.R_OK):
+        raise ValueError("an existing readable file should answer F_OK / R_OK")
+    if os.access(f, os.X_OK):
+        raise ValueError("a 0o644 file is not executable, even for root")
+    if os.access(d + "/nope", os.F_OK):
+        raise ValueError("a missing path answers False")
+
+    os.truncate(f, 6)
+    if os.path.getsize(f) != 6 or open(f, "rb").read() != b"abc\x00\x00\x00":
+        raise ValueError("truncate should grow with NULs")
+    os.truncate(f, 2)
+    if open(f, "rb").read() != b"ab":
+        raise ValueError("truncate should shrink")
+
+    let bad: bytes = b"\x00\xd8A\x00"
+    if bad.decode("utf-16-le", "ignore") != "A":
+        raise ValueError("ignore handler wrong")
+    if bad.decode("utf-16-le", "replace") != "\ufffdA":
+        raise ValueError("replace handler wrong")
+    if bad.decode("utf-16-le", "backslashreplace") != "\\x00\\xd8A":
+        raise ValueError("backslashreplace handler wrong")
+    try:
+        let _ = bad.decode("utf-16-le")
+        raise ValueError("strict should raise")
+    except UnicodeDecodeError as e:
+        if "position 0-1" not in str(e):
+            raise ValueError(f"strict message should name the span: {e}")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
     #[test]
     fn vm_property_setter_and_dir() {
         let src = r#"

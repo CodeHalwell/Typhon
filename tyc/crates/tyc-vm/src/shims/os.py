@@ -384,11 +384,35 @@ def urandom(n):
 
 
 def access(path, mode, *, dir_fd=None, effective_ids=False, follow_symlinks=True):
+    # `access(2)`: existence alone answers `F_OK`; the rest is the
+    # owner/group/other triad of the mode bits against the calling user.
+    # Answering `True` for any existing path made
+    # `os.access(f, os.X_OK)` pick a non-executable file.
     try:
-        _fs_stat(path, follow_symlinks)
+        st = _fs_stat(path, follow_symlinks)
     except OSError:
         return False
-    return True
+    if mode == F_OK:
+        return True
+    st_mode, st_uid, st_gid = st[0], st[4], st[5]
+    if _fs_getuid() == 0:
+        # root bypasses read and write checks; execute still needs a bit set
+        # somewhere, as the kernel requires.
+        return mode & X_OK == 0 or st_mode & 0o111 != 0
+    if _fs_getuid() == st_uid:
+        bits = (st_mode >> 6) & 7
+    elif _fs_getgid() == st_gid:
+        bits = (st_mode >> 3) & 7
+    else:
+        bits = st_mode & 7
+    want = 0
+    if mode & R_OK:
+        want = want | 4
+    if mode & W_OK:
+        want = want | 2
+    if mode & X_OK:
+        want = want | 1
+    return bits & want == want
 
 
 def chmod(path, mode, *, dir_fd=None, follow_symlinks=True):
@@ -408,8 +432,13 @@ def readlink(path, *, dir_fd=None):
 
 
 def truncate(path, length):
+    # Growing a file pads it with NULs; slicing alone left it unchanged.
     data = _fs_read(path)
-    _fs_write(path, data[:length], "w")
+    if length > len(data):
+        data = data + b"\x00" * (length - len(data))
+    else:
+        data = data[:length]
+    _fs_write(path, data, "w")
 
 
 def strerror(code):

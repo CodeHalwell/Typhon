@@ -1126,6 +1126,71 @@ fn single_file_compile_reports_the_user_s_own_path() {
     );
 }
 
+/// A bare `.ty` file that imports a sibling is a program the VM runs on its
+/// own — the import scan must not read `helper` as an unmodelled external
+/// module and send it down the compiled path, which used to stage only the
+/// entry and then fail on the very import the VM resolves.
+#[test]
+fn run_resolves_sibling_modules_beside_a_bare_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("helper.ty"),
+        "pub def greet(name: str) -> str:\n    return f\"hi {name}\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("prog.ty"),
+        "from helper import greet\n\ndef main() -> None:\n    print(greet(\"ada\"))\n\nmain()\n",
+    )
+    .unwrap();
+    let out = tyc()
+        .arg("run")
+        .arg(tmp.path().join("prog.ty"))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("hi ada"),
+        "sibling import should just run:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("not modelled"),
+        "a sibling module is not an unmodelled import:\n{stderr}"
+    );
+}
+
+/// `--temp` builds into a scratch directory outside the project, which the
+/// output confinement check has to allow — it exists to stop a checked-out
+/// tree redirecting the *default* `out`, not to veto a destination the
+/// caller named.
+#[test]
+fn run_compile_temp_builds_outside_the_project_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "def main() -> None:\n    print(\"temp ok\")\n\nmain()\n",
+    );
+    let out = tyc()
+        .arg("run")
+        .arg("--compile")
+        .arg("--temp")
+        .arg(tmp.path())
+        .env("TYC_NO_SYNC", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("temp ok"),
+        "--temp should build and run:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("outside"),
+        "the scratch build directory must not be refused:\n{stderr}"
+    );
+}
+
 #[test]
 fn build_fails_on_type_error() {
     let tmp = tempfile::tempdir().unwrap();

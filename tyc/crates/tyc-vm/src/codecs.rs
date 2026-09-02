@@ -373,19 +373,43 @@ pub fn decode(bytes: &[u8], encoding: &str, errors: &str) -> Result<String, Unwi
                 });
                 i += 2;
             }
-            for r in char::decode_utf16(units.iter().copied()) {
-                match r {
-                    Ok(c) => out.push(c),
-                    Err(_) => {
-                        return Err(Unwind::Exception(VmException::new(
-                            "UnicodeDecodeError",
-                            format!(
-                                "'{}' codec can't decode bytes: illegal UTF-16 surrogate",
-                                label_codec.label()
-                            ),
-                        )))
+            // Decoded unit by unit rather than through `char::decode_utf16`
+            // so a lone surrogate carries its byte span: the error handler
+            // needs it, and `ignore` / `replace` / `backslashreplace` were
+            // raising instead of applying.
+            let mut u = 0usize;
+            while u < units.len() {
+                let unit = units[u];
+                let high = (0xD800..0xDC00).contains(&unit);
+                let low = (0xDC00..0xE000).contains(&unit);
+                if high && u + 1 < units.len() && (0xDC00..0xE000).contains(&units[u + 1]) {
+                    let scalar = 0x1_0000
+                        + ((u32::from(unit) - 0xD800) << 10)
+                        + (u32::from(units[u + 1]) - 0xDC00);
+                    if let Some(c) = char::from_u32(scalar) {
+                        out.push(c);
                     }
+                    u += 2;
+                    continue;
                 }
+                if !high && !low {
+                    if let Some(c) = char::from_u32(u32::from(unit)) {
+                        out.push(c);
+                    }
+                    u += 1;
+                    continue;
+                }
+                let start = offset + u * 2;
+                handle_decode_error(
+                    label_codec,
+                    bytes,
+                    start,
+                    start + 2,
+                    "illegal UTF-16 surrogate",
+                    errors,
+                    &mut out,
+                )?;
+                u += 1;
             }
             if i < data.len() {
                 handle_decode_error(

@@ -133,6 +133,16 @@ pub fn run(args: RunArgs) -> Result<()> {
             .map_err(|e| miette!("cannot create temp scaffold src/: {e}"))?;
         std::fs::copy(&src_file, scaffold.path().join("src").join("main.ty"))
             .map_err(|e| miette!("cannot stage '{}': {}", src_file.display(), e))?;
+        // The modules the script imports from beside itself come too — the
+        // VM loads them on demand, so a compiled run that omitted them would
+        // fail on an import the VM resolves.
+        for sibling in sibling_modules(&src_file) {
+            let Some(name) = sibling.file_name() else {
+                continue;
+            };
+            std::fs::copy(&sibling, scaffold.path().join("src").join(name))
+                .map_err(|e| miette!("cannot stage '{}': {}", sibling.display(), e))?;
+        }
         let name = src_file
             .file_stem()
             .and_then(|n| n.to_str())
@@ -421,6 +431,16 @@ fn unmodelled_imports(path: &std::path::Path, entry: &std::path::Path) -> Option
             files.push(p);
         }
     }
+    // A bare file outside a project has only itself in scope, but the VM
+    // still loads `.ty` modules sitting beside it. Without them here, a
+    // `from helper import …` looked like an unmodelled external module and
+    // sent a perfectly runnable program down the compiled path — which then
+    // failed, since the scaffold stages only the entry.
+    for sibling in sibling_modules(entry) {
+        if !files.contains(&sibling) {
+            files.push(sibling);
+        }
+    }
     // A sibling `.ty` is a module of this project, not an external import.
     let project_roots: std::collections::HashSet<String> = files
         .iter()
@@ -465,6 +485,38 @@ fn unmodelled_imports(path: &std::path::Path, entry: &std::path::Path) -> Option
     } else {
         Some(missing.into_iter().collect())
     }
+}
+
+/// The `.ty` files beside `entry` that the program reaches by import,
+/// transitively — the modules the VM would load on demand.
+///
+/// Only plain siblings resolve here (`from helper import x` →
+/// `<entry dir>/helper.ty`); a package directory is recognised separately by
+/// its `__init__.ty`, and a project invocation has already widened to the
+/// whole `src` tree.
+fn sibling_modules(entry: &std::path::Path) -> Vec<PathBuf> {
+    let Some(dir) = entry.parent() else {
+        return Vec::new();
+    };
+    let mut seen: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    let mut queue: Vec<PathBuf> = vec![entry.to_path_buf()];
+    while let Some(file) = queue.pop() {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let expanded = tyc_syntax::preprocess::expand_all(&text);
+        let prep = tyc_syntax::preprocess::preprocess(&expanded);
+        let Ok(parsed) = tyc_syntax::parse_module(&prep.python_source) else {
+            continue;
+        };
+        for root in tyc_resolve::collect_imported_roots(&parsed.into_syntax()) {
+            let candidate = dir.join(format!("{root}.ty"));
+            if candidate.is_file() && seen.insert(candidate.clone()) {
+                queue.push(candidate);
+            }
+        }
+    }
+    seen.into_iter().collect()
 }
 
 /// Decide which path(s) the pre-run `tyc check` should cover.

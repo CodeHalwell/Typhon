@@ -187,6 +187,11 @@ pub fn run(args: BuildArgs) -> Result<()> {
 
     // Resolve --out relative to project_root so `tyc build path/to/proj -o build`
     // writes to `path/to/proj/build` rather than the caller's cwd.
+    // An explicit `--out` is the caller's own choice of destination (and is
+    // how `tyc run --temp` hands the build a scratch directory); the default
+    // comes from `typhon.toml`, which a checked-out tree controls. That is
+    // the difference `confine_root` below turns on.
+    let out_is_explicit = args.out.is_some();
     let out_dir = match args.out {
         Some(out) => {
             if out.is_absolute() {
@@ -196,6 +201,22 @@ pub fn run(args: BuildArgs) -> Result<()> {
             }
         }
         None => config_dir.join(&config.project.out),
+    };
+    // Where artifacts must land. For a repo-controlled `out`, that is the
+    // project root: a `build/` symlink planted in git would otherwise
+    // redirect the whole build outside it. For an explicit `--out` the user
+    // named the destination, so the out directory itself is the boundary —
+    // still enough to catch a symlink *inside* the output tree, and without
+    // it `tyc run --compile --temp` could never write its scratch build.
+    let (confine_root, confine_label) = if out_is_explicit {
+        std::fs::create_dir_all(&out_dir)
+            .map_err(|e| miette!("cannot create '{}': {e}", out_dir.display()))?;
+        (
+            std::fs::canonicalize(&out_dir).unwrap_or_else(|_| out_dir.clone()),
+            "the output directory",
+        )
+    } else {
+        (project_root.clone(), "the project root")
     };
 
     let do_format = config.emit.format && !args.no_format;
@@ -1270,7 +1291,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| miette!("cannot create '{}': {e}", parent.display()))?;
             }
-            confine_output_path(&project_root, &out_file)?;
+            confine_output_path(&confine_root, confine_label, &out_file)?;
 
             tyc_format::atomic_write(&out_file, python_src.as_bytes())
                 .map_err(|e| miette!("cannot write '{}': {e}", out_file.display()))?;
@@ -1326,7 +1347,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| miette!("cannot create '{}': {e}", parent.display()))?;
             }
-            confine_output_path(&project_root, &map_path)?;
+            confine_output_path(&confine_root, confine_label, &map_path)?;
             tyc_format::atomic_write(&map_path, map_body.as_bytes())
                 .map_err(|e| miette!("cannot write '{}': {e}", map_path.display()))?;
         }
@@ -1387,7 +1408,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| miette!("cannot create '{}': {e}", parent.display()))?;
             }
-            confine_output_path(&project_root, &dest)?;
+            confine_output_path(&confine_root, confine_label, &dest)?;
             std::fs::copy(path, &dest).map_err(|e| {
                 miette!(
                     "cannot copy '{}' → '{}': {e}",
@@ -1518,7 +1539,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| miette!("cannot create '{}': {e}", parent.display()))?;
             }
-            confine_output_path(&project_root, &out_file)?;
+            confine_output_path(&confine_root, confine_label, &out_file)?;
             tyc_format::atomic_write(&out_file, stub_text.as_bytes())
                 .map_err(|e| miette!("cannot write '{}': {e}", out_file.display()))?;
         }
@@ -1564,7 +1585,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 .map_err(|e| miette!("cannot create '{}': {e}", runtime_dir.display()))?;
             for (name, body) in files {
                 let path = runtime_dir.join(name);
-                confine_output_path(&project_root, &path)?;
+                confine_output_path(&confine_root, confine_label, &path)?;
                 tyc_format::atomic_write(&path, body.as_bytes())
                     .map_err(|e| miette!("cannot write '{}': {e}", path.display()))?;
             }
@@ -1707,27 +1728,28 @@ fn inject_cross_module_ext_imports(
 /// leaf must not be a symlink (`atomic_write` refuses those too) and its
 /// parent directory, once it exists, must resolve inside the canonical
 /// project root.
-fn confine_output_path(project_root: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+fn confine_output_path(
+    root: &std::path::Path,
+    root_label: &str,
+    dest: &std::path::Path,
+) -> Result<()> {
     if std::fs::symlink_metadata(dest).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(miette!(
             "refusing to write '{}': it is a symlink (remove it and rebuild)",
             dest.display()
         ));
     }
-    let root = std::fs::canonicalize(project_root).map_err(|e| {
-        miette!(
-            "cannot resolve project root '{}': {e}",
-            project_root.display()
-        )
-    })?;
+    let root = std::fs::canonicalize(root)
+        .map_err(|e| miette!("cannot resolve output root '{}': {e}", root.display()))?;
     if let Some(parent_dir) = dest.parent() {
         let parent = std::fs::canonicalize(parent_dir)
             .map_err(|e| miette!("cannot resolve '{}': {e}", parent_dir.display()))?;
         if !parent.starts_with(&root) {
             return Err(miette!(
-                "refusing to write '{}': its directory resolves to '{}', outside the project root '{}'",
+                "refusing to write '{}': its directory resolves to '{}', outside {} '{}'",
                 dest.display(),
                 parent.display(),
+                root_label,
                 root.display()
             ));
         }
