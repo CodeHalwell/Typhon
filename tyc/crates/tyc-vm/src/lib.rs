@@ -2572,6 +2572,36 @@ main()
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
 
+    /// A bound method reprs as CPython's does — the class the method is
+    /// defined on, and the receiver through its own `__repr__`.
+    #[test]
+    fn vm_bound_method_repr() {
+        let src = r#"
+from pathlib import Path
+
+class Base:
+    n: int
+impl Base:
+    def bump(self) -> int:
+        return self.n + 1
+    def __repr__(self) -> str:
+        return f"Base<{self.n}>"
+
+class Derived(Base):
+    pass
+
+def main() -> None:
+    if str(Derived(n=1).bump) != "<bound method Base.bump of Base<1>>":
+        raise ValueError(f"wrong: {Derived(n=1).bump}")
+    let p: Path = Path("/tmp")
+    if str(p.iterdir) != "<bound method Path.iterdir of PosixPath('/tmp')>":
+        raise ValueError(f"path method repr wrong: {p.iterdir}")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
     #[test]
     fn vm_property_setter_and_dir() {
         let src = r#"

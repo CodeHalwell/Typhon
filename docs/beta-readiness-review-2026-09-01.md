@@ -393,7 +393,7 @@ with every gate green at each step.
    `functools` / `sys` / `typing` gaps), and the object model gained
    `NamedTuple` / `TypedDict` semantics, `issubclass`, function
    `__dict__`, identity-hashable classes and per-module dunders. **The
-   differential baseline is down from 167 entries to 14**, and the six
+   differential baseline is down from 167 entries to 13**, and the six
    diverging curated examples are gone.
 5. **Gates.** The differential job now also byte-compiles every emitted
    `.py` with `compileall` — an *emitter* verdict that is never baselined,
@@ -414,7 +414,7 @@ with every gate green at each step.
 
 ### What is still open
 
-- **The 14 remaining differential entries.** Each is a VM bug and the file
+- **The 13 remaining differential entries.** Each is a VM bug and the file
   names them. Four clusters remain. *Concurrency ordering* (`p8`,
   `14_go_spawn`, `02-multi-agent`): the VM runs coroutines sequentially, so
   interleaved output from `gather:` and `go` differs — inherent to the
@@ -424,7 +424,7 @@ with every gate green at each step.
   match. *Deep Unicode and codecs* (`p2`, `sw_str`): casing beyond simple
   fold, and the `utf-16` / `cp1252` codecs. *Numeric and stdlib corners*
   (`p1` format specs for `_`-grouped hex/binary and `#`/`g`, `p12` binary
-  IO, `p13` complex and `math` last-bit differences, `sw_path`,
+  IO, `p13` complex and `math` last-bit differences,
   `typevar_default`'s PEP 696 `__default__`, and `b_prelude`, where the
   VM resolves prelude names CPython raises `NameError` for). None of them
   is a *silent* wrong answer on the compiled path — they are VM-only.

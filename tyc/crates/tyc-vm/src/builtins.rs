@@ -3613,8 +3613,9 @@ fn filename_repr(interp: &mut Interpreter, v: &Value) -> Result<String, Unwind> 
 
 /// `os.fspath(v)`: a str as is, bytes decoded, an object with `__fspath__`
 /// (a `Path`) through it. Returns the path together with the display form
-/// CPython puts in an `OSError` — the argument's repr, so a `Path` given to
-/// a raw `os` function shows as `PosixPath('…')` while a str shows quoted.
+/// CPython puts in an `OSError` — the *filesystem* path, quoted, whatever
+/// the argument's own type: `os.remove(Path("/nope"))` reports
+/// `[Errno 2] No such file or directory: '/nope'`, not `PosixPath('/nope')`.
 pub(crate) fn fspath_pair(interp: &mut Interpreter, v: &Value) -> Result<(String, String), Unwind> {
     match v {
         Value::Str(s) => Ok(((**s).clone(), crate::value::python_repr_str(s))),
@@ -3639,7 +3640,7 @@ pub(crate) fn fspath_pair(interp: &mut Interpreter, v: &Value) -> Result<(String
             )?;
             match r {
                 Value::Str(s) => {
-                    let display = interp.repr_of(v)?;
+                    let display = crate::value::python_repr_str(&s);
                     Ok(((*s).clone(), display))
                 }
                 other => Err(type_error(format!(

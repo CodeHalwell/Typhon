@@ -2529,7 +2529,21 @@ impl Value {
             }
             Value::Native(n) => native_repr(n.name),
             Value::Function(func) => format!("<function {}>", func.name),
-            Value::BoundMethod { function, .. } => format!("<bound method {}>", function.name),
+            // CPython names the class the method was found on and reprs
+            // the receiver: `<bound method Path.iterdir of PosixPath('/t')>`.
+            Value::BoundMethod { function, receiver } => {
+                let owner = match receiver.as_ref() {
+                    Value::Instance(i) => format!("{}.", i.class.name),
+                    Value::Class(c) => format!("{}.", c.name),
+                    _ => String::new(),
+                };
+                format!(
+                    "<bound method {}{} of {}>",
+                    owner,
+                    function.name,
+                    receiver.py_repr()
+                )
+            }
             Value::Class(c) => format!("<class '{}'>", c.name),
             // `str(exc)` differs from `repr(exc)` for a field-less exception
             // instance: the message/args, not `ClassName('msg')`.

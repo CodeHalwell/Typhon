@@ -123,8 +123,15 @@ decimal digits and digit-group underscores (and reject the misplaced
 ones CPython rejects) and take a bytes-like; `bool` orders against
 `float`; `pow(a, -e, m)` computes the modular inverse; and a complex
 formats its components with the spec (`f"{1+2j:.1f}"` → `1.0+2.0j`).
-**The
-differential baseline falls from 167 entries to 14.**
+A tenth took the `pathlib`
+surface: a bound method reprs as CPython's does (the class it is *defined*
+on, and the receiver through its own `__repr__`, so `Path("/t").iterdir`
+reads `<bound method Path.iterdir of PosixPath('/t')>`), the shim gained
+the `Path` / `PosixPath` split that name comes from, and an `OSError` from
+an `os` call reports the filesystem path rather than `PosixPath('…')` —
+while `shutil.rmtree` re-points its error at the argument it was given, as
+CPython's does. **The
+differential baseline falls from 167 entries to 13.**
 
 **A staged script is reported as the script.** `tyc run --compile <file>`
 (and the automatic fallback, which now fires whenever a program imports
@@ -554,7 +561,7 @@ additive on correct programs except the one marked **narrowing**.
 
 Everything that review deferred is closed by the beta wave above, except
 the VM's eager generator expressions and the thin `re` shim, which remain
-in `scripts/differential-baseline.txt` — the 14 entries there are the
+in `scripts/differential-baseline.txt` — the 13 entries there are the
 honest list of what the VM still gets wrong, and each one is a bug.
 
 ## 1.0.0-alpha.9 — 2026-08-21 — maintenance: secret-name lint expansion, allocation reductions & dependency wave

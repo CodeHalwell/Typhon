@@ -123,7 +123,10 @@ def rmtree(path, ignore_errors=False, onerror=None, *, onexc=None, dir_fd=None):
     try:
         st = os.lstat(path)
     except OSError as e:
-        handle(os.lstat, path, e)
+        # CPython's `rmtree` re-points the error at the argument it was
+        # given, so a `Path` reports as `PosixPath('x')` where the `os`
+        # call underneath reports the plain `'x'`.
+        handle(os.lstat, path, OSError(e.errno, e.strerror, path))
         return
     if (st.st_mode & 0o170000) != 0o040000:
         try:

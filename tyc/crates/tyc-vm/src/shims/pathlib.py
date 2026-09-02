@@ -425,7 +425,12 @@ def _match_parts(parts, i, pats, j):
 PurePath = PurePosixPath
 
 
-class PosixPath(PurePosixPath):
+# CPython puts the filesystem methods on `Path` and makes `PosixPath` the
+# concrete subclass, which is what a bound method's repr names
+# (`<bound method Path.iterdir of PosixPath('/t')>`). The module-level
+# `Path` is rebound to `PosixPath` at the bottom, so `Path(...)` still
+# constructs the concrete class exactly as CPython's `Path.__new__` does.
+class Path(PurePosixPath):
     @classmethod
     def cwd(cls):
         return cls(os.getcwd())
@@ -675,6 +680,10 @@ class PosixPath(PurePosixPath):
 
     def group(self, *, follow_symlinks=True):
         return os.getlogin()
+
+
+class PosixPath(Path):
+    pass
 
 
 Path = PosixPath

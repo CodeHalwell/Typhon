@@ -4883,6 +4883,12 @@ impl Interpreter {
             // the mapping it wraps, so only its `repr` names the proxy.
             return self.repr_of_depth_inner(v, 0, true);
         }
+        // A bound method has no `__str__` of its own: `str(m)` is `repr(m)`,
+        // which names the receiver — and that needs the interpreter, since
+        // the receiver may have a user `__repr__`.
+        if matches!(v, Value::BoundMethod { .. }) {
+            return self.repr_of(v);
+        }
         if let Some(r) = self.call_dunder0(v, "__str__")? {
             return require_str_return(r, "__str__");
         }
@@ -4897,6 +4903,33 @@ impl Interpreter {
     /// CPython `<Class.NAME: value>` form.
     pub fn repr_of(&mut self, v: &Value) -> Result<String, Unwind> {
         self.repr_of_depth(v, 0)
+    }
+
+    /// The name of the class a bound method was found on — CPython reports
+    /// the *defining* class, so a `PosixPath`'s inherited `iterdir` is
+    /// `Path.iterdir`.
+    fn defining_class_name(&self, receiver: &Value, function: &Rc<Function>) -> Option<String> {
+        fn walk(class: &Rc<Class>, function: &Rc<Function>) -> Option<String> {
+            // Depth-first through the bases first: the *most general* class
+            // that still defines this exact function is the one CPython
+            // names, since the derived class inherited it from there.
+            for base in &class.bases {
+                if let Some(found) = walk(base, function) {
+                    return Some(found);
+                }
+            }
+            let own = class
+                .methods
+                .borrow()
+                .values()
+                .any(|m| Rc::ptr_eq(m, function));
+            own.then(|| class.name.clone())
+        }
+        match receiver {
+            Value::Instance(i) => walk(&i.class, function),
+            Value::Class(c) => walk(c, function),
+            _ => None,
+        }
     }
 
     /// Whether a value is a container whose elements must be rendered through
@@ -4941,6 +4974,21 @@ impl Interpreter {
             .to_string());
         }
         match v {
+            // `<bound method Path.iterdir of PosixPath('/t')>` — the class
+            // the method is *defined* on, and the receiver's own repr
+            // (which may be a user `__repr__`, hence the interpreter).
+            Value::BoundMethod { receiver, function } => {
+                let owner = self
+                    .defining_class_name(receiver, function)
+                    .map(|c| format!("{c}."))
+                    .unwrap_or_default();
+                Ok(format!(
+                    "<bound method {}{} of {}>",
+                    owner,
+                    function.name,
+                    self.repr_of_depth(receiver, depth + 1)?
+                ))
+            }
             Value::List(l) => {
                 // Clone the element handles out before recursing so the
                 // RefCell borrow isn't held across `repr_of` calls (which
