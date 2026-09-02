@@ -104,13 +104,12 @@ Shipped:
 
 Deferred:
 
-- ⏳ Richer comptime: broader stdlib in the sandbox, `for` loops in `comptime def`, types as values.
+- ⏳ Richer comptime: broader stdlib in the sandbox, `for` loops in `comptime def`. (Types as values shipped in v0.5.0; container literals and pure string methods in v0.3.1.)
 - ⏳ Full structural subtyping with proper variance and bounded higher-kinded forms.
 - ⏳ `ty` integration **Phase 2** as an embedded in-process library sharing the Salsa db (today: Phase 1 ships the subprocess path via `[checker] external = "ty"` / `tyc ty`, v0.12.0). Phase 2 was prototyped and proven feasible but **is not shipped** — it needs a git dependency that the project's `cargo deny` policy disallows.
 - ⏳ A Typhon-native source-mapping debugger UI (today: `pdb` launcher with `--break TY:LINE` translation).
 - ⏳ Broader `tyc::python_semantic_drift` audit beyond the `or`/`and` and generator → `Iterable` cases already fixed.
 - ⏳ Corpus round-trip sweep across third-party Python projects.
-- ⏳ `[emit] model-extra` knob to relax Pydantic `extra="forbid"`.
 - ⏳ Async public-API stability rules if async inference is ever added.
 
 ## Scope-cutting rule

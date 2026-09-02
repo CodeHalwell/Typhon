@@ -252,6 +252,51 @@ When the boundary is a *single* call and you don't need to distinguish exception
 
 It runs the thunk and returns `Ok(result)`; on any exception it returns `Err(on_err(exc))`, or `Err(exc)` — the raw exception, giving `Result[T, Exception]` — when the mapper is omitted. The result is a genuine, typed `Result` (`T` inferred from the thunk, `E` from the mapper), so a wrong return annotation still fires `tyc::type_mismatch`. Reach for the explicit multi-`except` shim when you map distinct exception types to distinct errors; reach for `try_result` for the common single-boundary case. See [`try_result`](/Typhon/reference/result/#bridging-a-boundary-with-try_result).
 
+### `rescue` — the same bridge without the lambdas
+
+`rescue` (v1.0.0-alpha) says the same thing with no lambdas, no `try`, and no `except`. The **postfix** form guards one expression and propagates the mapped error exactly like `?`; the **block** form maps any exception raised across a whole suite:
+
+<Tabs syncKey="lang">
+  <TabItem label="Typhon">
+    ```python
+    def parse_port(raw: str) -> Result[int, str]:
+        let n: int = int(raw) rescue e: f"bad port: {e}"      # postfix
+        return Ok(n)
+
+    def load_config(text: str) -> Result[Config, str]:
+        rescue e: f"bad config: {e}":                          # block
+            let data: dict[str, str] = json.loads(text) as! dict[str, str]
+            return Ok(Config(host=data["host"], port=parse_port(data["port"])?))
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    from typhon_runtime import try_result
+    from typhon_runtime import Err as __typhon_Err__
+    from typhon_runtime.cast import checked_cast as __typhon_checked_cast__
+
+    def parse_port(raw: str) -> Result[int, str]:
+        __typhon_q_0__ = try_result(lambda: int(raw), lambda e: f"bad port: {e}")
+        if isinstance(__typhon_q_0__, __typhon_Err__):
+            return __typhon_q_0__
+        n: int = __typhon_q_0__.value
+        return Ok(n)
+
+    def load_config(text: str) -> Result[Config, str]:
+        try:
+            data: dict[str, str] = __typhon_checked_cast__(json.loads(text), dict[str, str])
+            __typhon_qi_0__ = parse_port(data["port"])
+            if isinstance(__typhon_qi_0__, __typhon_Err__):
+                return __typhon_qi_0__
+            return Ok(Config(host=data["host"], port=__typhon_qi_0__.value))
+        except Exception as e:
+            return Err(f"bad config: {e}")
+    ```
+  </TabItem>
+</Tabs>
+
+Postfix `rescue` is sugar for `try_result(lambda: EXPR, lambda e: ERR)?`, so the enclosing function must return a compatible `Result`; the block form lowers to `try` / `except Exception as e: return Err(ERR)`. In both, the mapped error is checked against the function's declared error type (`tyc::result_error_mismatch`), and both run identically under `tyc run` and `tyc build`. See the [reference](/Typhon/reference/result/#bridging-exceptions-try_result-and-rescue) and [how it lowers](/Typhon/lowering/result/#rescue).
+
 ## What gets emitted
 
 `Result`, `Ok`, and `Err` are emitted as tagged dataclasses in a generated `typhon_runtime.py` module that sits in your output tree:
@@ -464,7 +509,7 @@ The checker counts variants and refuses to compile with `tyc::non_exhaustive_mat
 - `?` propagates errors with one character; the checker enforces compatible return types.
 - `with`-chains sequence `Result`-producing calls with a single failure-handling site.
 - Errors emit as small dataclasses in a generated `typhon_runtime.py` — no PyPI runtime.
-- Wrap exception-raising library calls in a `try` shim — or `try_result` for a single boundary call — and lift them into `Result`.
+- Wrap exception-raising library calls in a `try` shim — or `try_result` / the lambda-free `rescue` sugar for a single boundary — and lift them into `Result`.
 - Leave the `Result` world deliberately with the unwrap/query family (`.unwrap_or`, `.expect`, `.ok`, `.is_ok`, …); the method surface is closed, so typos are caught at check time.
 
 ## Where next

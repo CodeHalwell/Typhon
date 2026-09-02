@@ -1920,6 +1920,195 @@ pub enum TycError {
 }
 
 impl TycError {
+    /// The source text and span a diagnostic is anchored to, when it carries
+    /// one, for callers that relocate diagnostics from the preprocessed
+    /// buffer back onto the `.ty` text the user wrote.
+    /// The text a diagnostic's span indexes into, when it carries one.
+    pub fn source_text(&self) -> Option<&str> {
+        match self {
+            Self::Parse { src, span, .. }
+            | Self::FrozenAssign { src, span, .. }
+            | Self::MissingFieldInit { src, span, .. }
+            | Self::UnknownName { src, span, .. }
+            | Self::SelfOutsideImpl { src, span, .. }
+            | Self::TypeVarImportRejected { src, span, .. }
+            | Self::TypingAliasDeprecated { src, span, .. }
+            | Self::UnknownKwarg { src, span, .. }
+            | Self::MissingReturn { src, span, .. }
+            | Self::MissingInitialiser { src, span, .. }
+            | Self::ImplicitAny { src, span, .. }
+            | Self::NoBlockShadow { src, span, .. }
+            | Self::TypeMismatch { src, span, .. }
+            | Self::TypeReassignMismatch { src, span, .. }
+            | Self::OperatorTypeMismatch { src, span, .. }
+            | Self::TupleIndexOutOfRange { src, span, .. }
+            | Self::NullableUse { src, span, .. }
+            | Self::ResultErrorMismatch { src, span, .. }
+            | Self::WrongArgCount { src, span, .. }
+            | Self::MissingArgument { src, span, .. }
+            | Self::NotCallable { src, span, .. }
+            | Self::GeneratorReturnType { src, span, .. }
+            | Self::ManualInit { src, span, .. }
+            | Self::FieldDefaultOrdering { src, span, .. }
+            | Self::MissingAwait { src, span, .. }
+            | Self::NonExhaustiveMatch { src, span, .. }
+            | Self::InvalidQuestionOp { src, span, .. }
+            | Self::UnusedImport { src, span, .. }
+            | Self::LazyUsage { src, span, .. }
+            | Self::ExtendBuiltin { src, span, .. }
+            | Self::StdlibModuleShadow { src, span, .. }
+            | Self::UnsafeValueLeak { src, span, .. }
+            | Self::StubMismatch { src, span, .. }
+            | Self::ImpurePureFn { src, span, .. }
+            | Self::InterfaceIsinstance { src, span, .. }
+            | Self::InterfaceNotConforming { src, span, .. }
+            | Self::TypeVarBoundViolation { src, span, .. }
+            | Self::KindMismatch { src, span, .. }
+            | Self::AttributeNotFound { src, span, .. }
+            | Self::MethodInClassBody { src, span, .. }
+            | Self::ClassAttrShadowsSlot { src, span, .. }
+            | Self::MissingAnnotation { src, span, .. }
+            | Self::MissingBindingKind { src, span, .. }
+            | Self::AutoGatherMissed { src, span, .. }
+            | Self::GatherOpportunity { src, span, .. }
+            | Self::PerfMembershipInLoop { src, span, .. }
+            | Self::PerfListShiftInLoop { src, span, .. }
+            | Self::PerfStrConcatInLoop { src, span, .. }
+            | Self::PerfSortInLoop { src, span, .. }
+            | Self::PerfSortedFirst { src, span, .. }
+            | Self::PerfKeysMembership { src, span, .. }
+            | Self::LazyImportOpportunity { src, span, .. }
+            | Self::ParallelOpportunity { src, span, .. }
+            | Self::SharedMutAcrossTasks { src, span, .. }
+            | Self::MainNotCalled { src, span, .. }
+            | Self::UnknownModule { src, span, .. }
+            | Self::DuplicateClass { src, span, .. }
+            | Self::DuplicateMethod { src, span, .. }
+            | Self::ImplUnknownClass { src, span, .. }
+            | Self::CyclicTypeAlias { src, span, .. }
+            | Self::BlockingInAsync { src, span, .. }
+            | Self::ResourceNotManaged { src, span, .. }
+            | Self::DivByZeroLiteral { src, span, .. }
+            | Self::NewtypeViolation { src, span, .. }
+            | Self::FreezeNotFreezable { src, span, .. }
+            | Self::NewtypeInvalidBase { src, span, .. }
+            | Self::UseOfUninitialised { src, span, .. }
+            | Self::PubNameCollision { src, span, .. }
+            | Self::PubStarOutsideInit { src, span, .. }
+            | Self::AsyncWithoutAwait { src, span, .. }
+            | Self::OrphanPyImport { src, span, .. }
+            | Self::PythonSemanticDrift { src, span, .. }
+            | Self::SecretLiteralInline { src, span, .. }
+            | Self::EmptyCollectionNoAnnotation { src, span, .. }
+            | Self::TypingAliasInAnnotation { src, span, .. }
+            | Self::MutableDefaultParam { src, span, .. }
+            | Self::IsLiteralComparison { src, span, .. }
+            | Self::IncompatibleOverride { src, span, .. }
+            | Self::LoopClosureCapture { src, span, .. }
+            | Self::FrozenInheritanceConflict { src, span, .. }
+            | Self::RaiseNonException { src, span, .. }
+            | Self::NotAContextManager { src, span, .. }
+            | Self::ReturnInExceptStar { src, span, .. } => {
+                let _ = span;
+                Some(src.inner().as_str())
+            }
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
+    pub fn source_and_span_mut(&mut self) -> Option<(&mut NamedSource<String>, &mut SourceSpan)> {
+        match self {
+            Self::Parse { src, span, .. }
+            | Self::FrozenAssign { src, span, .. }
+            | Self::MissingFieldInit { src, span, .. }
+            | Self::UnknownName { src, span, .. }
+            | Self::SelfOutsideImpl { src, span, .. }
+            | Self::TypeVarImportRejected { src, span, .. }
+            | Self::TypingAliasDeprecated { src, span, .. }
+            | Self::UnknownKwarg { src, span, .. }
+            | Self::MissingReturn { src, span, .. }
+            | Self::MissingInitialiser { src, span, .. }
+            | Self::ImplicitAny { src, span, .. }
+            | Self::NoBlockShadow { src, span, .. }
+            | Self::TypeMismatch { src, span, .. }
+            | Self::TypeReassignMismatch { src, span, .. }
+            | Self::OperatorTypeMismatch { src, span, .. }
+            | Self::TupleIndexOutOfRange { src, span, .. }
+            | Self::NullableUse { src, span, .. }
+            | Self::ResultErrorMismatch { src, span, .. }
+            | Self::WrongArgCount { src, span, .. }
+            | Self::MissingArgument { src, span, .. }
+            | Self::NotCallable { src, span, .. }
+            | Self::GeneratorReturnType { src, span, .. }
+            | Self::ManualInit { src, span, .. }
+            | Self::FieldDefaultOrdering { src, span, .. }
+            | Self::MissingAwait { src, span, .. }
+            | Self::NonExhaustiveMatch { src, span, .. }
+            | Self::InvalidQuestionOp { src, span, .. }
+            | Self::UnusedImport { src, span, .. }
+            | Self::LazyUsage { src, span, .. }
+            | Self::ExtendBuiltin { src, span, .. }
+            | Self::StdlibModuleShadow { src, span, .. }
+            | Self::UnsafeValueLeak { src, span, .. }
+            | Self::StubMismatch { src, span, .. }
+            | Self::ImpurePureFn { src, span, .. }
+            | Self::InterfaceIsinstance { src, span, .. }
+            | Self::InterfaceNotConforming { src, span, .. }
+            | Self::TypeVarBoundViolation { src, span, .. }
+            | Self::KindMismatch { src, span, .. }
+            | Self::AttributeNotFound { src, span, .. }
+            | Self::MethodInClassBody { src, span, .. }
+            | Self::ClassAttrShadowsSlot { src, span, .. }
+            | Self::MissingAnnotation { src, span, .. }
+            | Self::MissingBindingKind { src, span, .. }
+            | Self::AutoGatherMissed { src, span, .. }
+            | Self::GatherOpportunity { src, span, .. }
+            | Self::PerfMembershipInLoop { src, span, .. }
+            | Self::PerfListShiftInLoop { src, span, .. }
+            | Self::PerfStrConcatInLoop { src, span, .. }
+            | Self::PerfSortInLoop { src, span, .. }
+            | Self::PerfSortedFirst { src, span, .. }
+            | Self::PerfKeysMembership { src, span, .. }
+            | Self::LazyImportOpportunity { src, span, .. }
+            | Self::ParallelOpportunity { src, span, .. }
+            | Self::SharedMutAcrossTasks { src, span, .. }
+            | Self::MainNotCalled { src, span, .. }
+            | Self::UnknownModule { src, span, .. }
+            | Self::DuplicateClass { src, span, .. }
+            | Self::DuplicateMethod { src, span, .. }
+            | Self::ImplUnknownClass { src, span, .. }
+            | Self::CyclicTypeAlias { src, span, .. }
+            | Self::BlockingInAsync { src, span, .. }
+            | Self::ResourceNotManaged { src, span, .. }
+            | Self::DivByZeroLiteral { src, span, .. }
+            | Self::NewtypeViolation { src, span, .. }
+            | Self::FreezeNotFreezable { src, span, .. }
+            | Self::NewtypeInvalidBase { src, span, .. }
+            | Self::UseOfUninitialised { src, span, .. }
+            | Self::PubNameCollision { src, span, .. }
+            | Self::PubStarOutsideInit { src, span, .. }
+            | Self::AsyncWithoutAwait { src, span, .. }
+            | Self::OrphanPyImport { src, span, .. }
+            | Self::PythonSemanticDrift { src, span, .. }
+            | Self::SecretLiteralInline { src, span, .. }
+            | Self::EmptyCollectionNoAnnotation { src, span, .. }
+            | Self::TypingAliasInAnnotation { src, span, .. }
+            | Self::MutableDefaultParam { src, span, .. }
+            | Self::IsLiteralComparison { src, span, .. }
+            | Self::IncompatibleOverride { src, span, .. }
+            | Self::LoopClosureCapture { src, span, .. }
+            | Self::FrozenInheritanceConflict { src, span, .. }
+            | Self::RaiseNonException { src, span, .. }
+            | Self::NotAContextManager { src, span, .. }
+            | Self::ReturnInExceptStar { src, span, .. } => Some((src, span)),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+}
+
+impl TycError {
     /// Construct a [`TycError::Io`] from a [`std::io::Error`].
     pub fn io(path: impl Into<String>, cause: &dyn std::error::Error) -> Self {
         Self::Io {
@@ -3528,6 +3717,18 @@ pub struct Diagnostics {
     warnings: Vec<TycError>,
 }
 
+/// Byte offset of the start of every line in `text` (always at least one
+/// entry, for the first line).
+fn line_starts(text: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'\n' && i + 1 < text.len() {
+            starts.push(i + 1);
+        }
+    }
+    starts
+}
+
 impl Diagnostics {
     pub fn new() -> Self {
         Self::default()
@@ -3552,6 +3753,68 @@ impl Diagnostics {
 
     pub fn errors(&self) -> &[TycError] {
         &self.errors
+    }
+
+    /// Relocate every diagnostic anchored to `expanded` (the preprocessed
+    /// buffer the parser and checker saw) onto `original` (the `.ty` text the
+    /// user wrote), through `line_map[expanded_line] = original_line`.
+    ///
+    /// Sugar expansion inserts and removes lines, so a byte offset into the
+    /// expanded buffer names the wrong line of the file — every diagnostic
+    /// below a `?`, `gather:` or `with`-chain expansion reported the
+    /// preprocessed buffer's line number, and the LSP could publish a range
+    /// past the end of the document. The column is carried across unchanged
+    /// (rewritten lines shift by at most a keyword) and clamped to the target
+    /// line; a span that would run past the end of its line is shortened.
+    /// Diagnostics already anchored to a different text (the `?` validator
+    /// reports against the original source) are left alone.
+    pub fn remap_lines(
+        &mut self,
+        expanded: &str,
+        line_map: &[usize],
+        original_name: &str,
+        original: &str,
+    ) {
+        if line_map.is_empty() || expanded == original {
+            return;
+        }
+        let expanded_starts = line_starts(expanded);
+        let original_starts = line_starts(original);
+        let original_line_len = |line: usize| -> usize {
+            let start = original_starts[line];
+            let end = original_starts
+                .get(line + 1)
+                .copied()
+                .unwrap_or(original.len());
+            original[start..end].trim_end_matches(['\n', '\r']).len()
+        };
+        for err in self.errors.iter_mut().chain(self.warnings.iter_mut()) {
+            let Some((src, span)) = err.source_and_span_mut() else {
+                continue;
+            };
+            if src.inner().as_str() != expanded {
+                continue;
+            }
+            let offset = span.offset().min(expanded.len());
+            let line = match expanded_starts.binary_search(&offset) {
+                Ok(l) => l,
+                Err(l) => l.saturating_sub(1),
+            };
+            let col = offset - expanded_starts[line];
+            let target = line_map
+                .get(line)
+                .copied()
+                .unwrap_or(line)
+                .min(original_starts.len().saturating_sub(1));
+            let width = original_line_len(target);
+            let new_col = col.min(width);
+            let new_len = span.len().clamp(1, (width - new_col).max(1));
+            *src = NamedSource::new(original_name, original.to_owned());
+            *span = SourceSpan::new(
+                SourceOffset::from(original_starts[target] + new_col),
+                new_len,
+            );
+        }
     }
 
     pub fn warnings(&self) -> &[TycError] {
@@ -4790,6 +5053,45 @@ fn dedup_vec(v: &mut Vec<TycError>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remap_lines_moves_a_diagnostic_onto_the_original_line() {
+        // The expanded buffer has two synthesised lines (a temp binding and
+        // its guard) before the user's statement; the map says every expanded
+        // line 1..=3 came from original line 1.
+        let original = "def f() -> int:\n    let x: int = g()?\n    return x\n";
+        let expanded = "def f() -> int:\n    __q = g()\n    if isinstance(__q, Err):\n        return __q\n    x: int = __q.value\n    return x\n";
+        let line_map = vec![0, 1, 1, 1, 1, 2];
+        // `return x` sits on expanded line 5 (offset of its `x`).
+        let offset = expanded.rfind("return x").unwrap() + "return ".len();
+        let mut diags = super::Diagnostics::new();
+        diags.push_error(super::TycError::nullable_use(
+            "x", "int", "f.ty", expanded, offset, 1,
+        ));
+        // Anchored to the original text already: must be left alone.
+        diags.push_warning(super::TycError::nullable_use(
+            "y", "int", "f.ty", original, 4, 1,
+        ));
+        diags.remap_lines(expanded, &line_map, "f.ty", original);
+        let e = &diags.errors()[0];
+        assert_eq!(e.source_text(), Some(original));
+        let (_, span) = e
+            .clone()
+            .source_and_span_mut()
+            .map(|(s, sp)| (s.clone(), *sp))
+            .unwrap();
+        // Original line 2 is `    return x`; the column (11) is carried across.
+        let line2 = original.find("    return x").unwrap();
+        assert_eq!(span.offset(), line2 + "    return ".len());
+        assert_eq!(span.len(), 1);
+        let w = &diags.warnings()[0];
+        let (_, wspan) = w
+            .clone()
+            .source_and_span_mut()
+            .map(|(s, sp)| (s.clone(), *sp))
+            .unwrap();
+        assert_eq!(wspan.offset(), 4);
+    }
+
     use super::*;
 
     // ── TycError constructor correctness ─────────────────────────────────────

@@ -6,7 +6,7 @@ sidebar:
 ---
 
 ```
-tyc ty [--out DIR] [--watch] [--ty-bin BIN] [-- TY_FLAGS...]
+tyc ty [PATH] [--out DIR] [--ty-bin BIN] [--no-build] [--watch] [--raw] [-- TY_FLAGS...]
 ```
 
 Builds the project and runs Astral's [`ty`](https://github.com/astral-sh/ty) type checker against the emitted Python. Useful as a second-opinion typing pass for the corners of the typing spec Typhon's checker doesn't try to cover.
@@ -26,6 +26,7 @@ tyc ty                          # one-shot
 tyc ty --out build/             # explicit out dir
 tyc ty --watch                  # re-runs on .ty / .dty changes
 tyc ty -- --strict              # forward flags to `ty check`
+tyc ty --raw                    # forward ty's output verbatim (no .py → .ty re-attribution)
 ```
 
 ## What it covers
@@ -47,6 +48,7 @@ It's complementary to `tyc check`, not a replacement.
 | `--ty-bin BIN` | Path to the `ty` executable (default: `ty`). |
 | `--no-build` | Skip the build step; requires `--out`. |
 | `--watch` | Watch source and re-run on `.ty` / `.dty` changes. |
+| `--raw` | Forward `ty`'s output verbatim. By default `path.py:line[:col]` prefixes are rewritten to the originating `.ty` location via the `.py.map` sidecars. |
 
 Anything after `--` is forwarded to `ty check` verbatim.
 

@@ -11,11 +11,11 @@ Typhon ships a single binary, `tyc`, that handles every stage of the workflow. S
 | `tyc build` | Full pipeline: parse, check, analyse, desugar, emit, format. Also bootstraps the Python environment — merges the owned keys (`[project] name/version/requires-python/dependencies`, plus `[dependency-groups].dev` when `[dev-dependencies]` is non-empty) into `pyproject.toml` (preserving any user-managed `[tool.*]` / other `[project]` keys) and runs `uv sync` so `.venv` is ready. `uv sync` failure is downgraded to a warning. `--check` is a dry-run mode that lists every file that *would* be written without touching disk. |
 | `tyc check` | Up to analyser, no emit. Used by CI. |
 | `tyc fmt` | Format `.ty` source. The pipeline runs a Typhon-aware whitespace normaliser first (collapsing interior whitespace, tidying bracket/comma spacing, expanding leading tabs, normalising line-endings) and then, when the post-normalised buffer contains no Typhon-only tokens, pipes it through `ruff format` for the spacing rules around `:`, `=`, and `->`. If `ruff` is missing on `PATH` or fails, the in-process output is kept. |
-| `tyc lsp` | Run as a Language Server. |
+| `tyc lsp` | Run as a Language Server on stdio. `--log-level {error,warn,info,debug}` (default `info`) sets the threshold for the status messages forwarded to the editor over `window/logMessage`; `--stdio` is accepted as a no-op for `vscode-languageclient`. |
 | `tyc init` | Scaffold a new project: `typhon.toml`, `src/`, `tests/`. The generated `src/main.ty` includes a frozen dataclass, an `impl` block, a `mut` binding, and a `Result`/`?`/`match` example; the generated `typhon.toml` ships every `[strictness]` / `[emit]` key with a comment. |
 | `tyc install skill` | Write the embedded `typhon` Claude skill (`SKILL.md` + sibling reference docs + the `references/` example programs) into `.claude/skills/typhon/` of the current project. The skill is bundled into the binary at build time, so it works offline. `--force` overwrites an existing copy, `--dir PATH` targets another root, `--list` previews the files without writing. |
-| `tyc trace` | Map a Python traceback back to Typhon source via `.py.map` files. |
-| `tyc profile` | Instrument emitted code for hot-function detection (advanced, opt-in). |
+| `tyc trace` | Map a Python traceback (a file argument, or stdin when omitted) back to Typhon source via `.py.map` files. `--map-dir DIR` adds a directory to search for sidecars; by default each frame's map is located from its own `.py` path (`<dir>/.sourcemaps/<rel>.py.map`, then a legacy adjacent `.py.map`). |
+| `tyc profile` | Build, then instrument every top-level function in the emitted code for hot-function detection (advanced, opt-in). `--out DIR` overrides the build directory. See [`tyc profile`](#tyc-profile) for the round trip into `[strictness] pgo-memoise`. |
 | `tyc migrate` | Convert typed Python (`.py`) to Typhon (`.ty`): rewrites `Optional[T]`/`T \| None` → `T?`, adds `let`/`mut` to module-level annotated assigns *and* function-body plain assignments, strips `@dataclass` decorators. |
 | `tyc ty` | Build the project and run Astral's `ty` checker against the emitted Python. Requires `ty` on `PATH` (`pip install ty`). Supports `--watch` for continuous feedback. |
 | `tyc stubtest` | Build the project and run `python -m mypy.stubtest` against every emitted `.pyi` stub. Complements `tyc check --stubs` (which performs an AST diff) by catching dynamically-created attributes the AST cannot see. Requires `mypy` in the chosen interpreter (`pip install mypy`). |
@@ -78,12 +78,48 @@ step required.
 | `--out DIR` / `-o` | Override the `[project] out` directory. Relative paths resolve against the project root. |
 | `--no-format` | Skip the `ruff format` post-process. |
 | `--check` | Dry-run: list every file that *would* be created or overwritten without touching disk. The full pipeline still runs, so type errors continue to surface. |
+| `--no-sync` | Skip the `uv sync` step; `pyproject.toml` is still merged so the next regular build picks the manifest up. Also honoured via `TYC_NO_SYNC=1`. |
 | `--optimise` / `-O` (alias `--optimize`) | Apply `[optimise] level = 1` for this invocation — flip the default of `auto-memoise`, `auto-gather`, `auto-parallel`, and `pgo-memoise` to on. Overrides a config `level = 0`, but an explicit `[strictness]` entry for any of those knobs still wins (so `-O` never silently re-enables a knob you set to `false` by hand). See [`[optimise]`](configuration.md#optimise). |
 | `--with-ty` (v0.12.0) | After a successful emit, run Astral's `ty` over the emitted Python (typeshed-backed second-stage check) and re-attribute its diagnostics to the `.ty` source. `ty` errors fail the build. Equivalent to setting `[checker] external = "ty"` for one invocation; requires `ty` on `PATH`. |
 
 When `[checker] external = "ty"` is set in `typhon.toml` (see [configuration.md](configuration.md#checker)), the same `ty` pass runs automatically after every `tyc build`. `tyc check --with-ty` works too — since `check` is normally emit-free, it builds to a throwaway directory first. This is the only path that type-checks against **typeshed**, so it catches misuse of C-extension and stdlib APIs that runtime venv introspection can't model (e.g. `os.path.join(1, 2)`). See [`tyc ty`](#tyc-ty) and [ty-integration.md](ty-integration.md).
 
 > **Third-party argument-type checking (v0.12.0).** Independently of `ty`, `tyc build` / `tyc check` now type-check the *arguments* to fully-typed third-party functions and constructors via venv signature introspection (not just their arity) — a wrong-typed argument fires `tyc::type_mismatch`. A declared dependency that's imported but can't be introspected surfaces the `unintrospectable-dependency` warning (`[strictness] unintrospectable-dependency`, default `"warn"`).
+
+## `tyc check`, `tyc fmt`, `tyc init`, `tyc lsp`, `tyc trace`
+
+The remaining daily-loop commands have small flag sets:
+
+| Command | Flag | Effect |
+|---------|------|--------|
+| `tyc check [PATH]...` | `--stubs` | Also parse + type-check every `.dty` under the checked paths and diff each stub's surface against its sibling `.ty` (preferred) or `.py` implementation; findings surface as `tyc::stub_mismatch` at the `[strictness] stub-check` severity (default `"error"`). |
+| | `--with-ty` | Build to a throwaway directory and run Astral's `ty` over it (see [`tyc build`](#tyc-build)). |
+| `tyc fmt [PATH]...` | `--check` / `-c` | Exit non-zero if any file would change; write nothing. The only `fmt` flag — there is no `--diff` / `--quiet`. `tyc fmt` collects `.ty` files only (`.dty` stubs are not formatted). |
+| `tyc init [NAME]` | `--dir DIR` / `-d` | Directory to initialise (default `.`). With `NAME`, the scaffold lands in `<DIR>/<NAME>/`; without it, `DIR` itself is initialised and its basename becomes the project name. |
+| `tyc lsp` | `--log-level LEVEL` | `error` / `warn` / `info` (default) / `debug` — threshold for status messages forwarded over `window/logMessage`. `--stdio` is accepted as a no-op. |
+| `tyc trace [TRACEBACK]` | `--map-dir DIR` | Extra directory to search for `.py.map` sidecars (`<DIR>/.sourcemaps/<file>.py.map`, then `<DIR>/<file>.py.map`). Without a `TRACEBACK` argument the traceback is read from stdin. |
+
+The binary has no global flags beyond `--help` / `--version`: no `--quiet`, `--verbose`, `--color`, or `--manifest` (every command discovers `typhon.toml` by walking up from the path it was given).
+
+## `tyc profile`
+
+Runs the normal `tyc build`, then rewrites every emitted `.py` so each **top-level** `def` / `async def` (not methods, not nested functions, not the generated `typhon_runtime/` helpers) is wrapped in a lightweight timing decorator, and drops a `typhon_profile.py` helper next to the emitted code. `tyc profile` does **not** run the program: you run the instrumented entry point yourself with a representative workload, and on interpreter exit an `atexit` hook writes `typhon-profile.json` — a JSON object keyed `"<module>.<qualname>"` (`fn.__module__` + `fn.__qualname__`) with `{"calls": N, "total_seconds": F}` values.
+
+```bash
+tyc profile                          # instrumented build → build/ (or --out DIR)
+python build/main.py --bench         # run from the project root; typhon-profile.json is written on exit
+tyc build                            # [strictness] pgo-memoise = true promotes hot pure fns to @functools.cache
+```
+
+| Flag | Effect |
+|------|--------|
+| `--out DIR` / `-o` | Output directory for the instrumented build, forwarded to `tyc build`. |
+
+Round-trip rules worth knowing:
+
+- **Run from the project root.** The profile is written to the process's working directory (override with the `TYPHON_PROFILE_OUT` environment variable), while `tyc build` reads `typhon-profile.json` from the directory that holds `typhon.toml`.
+- **Keys match per module.** A `users.find_user` sample only promotes `find_user` in `src/users.ty`. The entry module runs as `__main__`, so its functions are recorded as `__main__.<fn>`; both that spelling and `main.<fn>` are accepted for `src/main.ty`, so the default layout round-trips out of the box. A bare `<fn>` key (no module qualifier) matches by name as a fallback for profiles produced by other tools.
+- **Only inferred-pure functions are promoted**, and only when their recorded call count meets `[strictness] pgo-min-calls` (default 100). A function already carrying `@memo` is never double-decorated. A missing profile is neither an error nor a warning — PGO is best-effort and simply promotes nothing.
 
 ## `tyc explain`
 
@@ -254,6 +290,7 @@ tyc debug --break src/main.ty:42 --break src/lib/io.ty:7
 | `--debugger MODULE` | Module to launch under `python -m` (default `pdb`; e.g. `pudb`, `ipdb`, `debugpy`) |
 | `--break TY:LINE` | Set a breakpoint at `<ty-file>:<line>` (Windows-style `C:\foo.ty:10` and POSIX paths both work — the line number is parsed from the segment after the last `:`). Repeatable. Lines that don't appear in the `.py.map` table surface a warning and are skipped. |
 | `--no-build` | Skip rebuilding; assume `build/` is current |
+| `--raw-pdb` | Launch `python -m pdb` directly, without the Typhon-aware `pdb.Pdb` subclass (v0.5.0) whose `do_list` / `do_where` / prompt read `.ty` coordinates. Only meaningful with `--debugger pdb` (the default); another debugger disables the wrapper automatically |
 
 ## `tyc run`
 
@@ -323,7 +360,7 @@ tyc sync
 tyc sync --dry-run
 ```
 
-`--no-sync` on `tyc add` / `tyc remove` skips the `uv` install step — useful for batching edits and running `tyc sync` once at the end.
+`--no-sync` on `tyc add` / `tyc remove` skips the `uv` install step — useful for batching edits and running `tyc sync` once at the end. `--dev` on either targets `[dev-dependencies]`, and `--dir DIR` (default `.`) selects the project whose `typhon.toml` to edit; `tyc sync` takes the project directory as its positional argument instead.
 
 ## CI integration
 

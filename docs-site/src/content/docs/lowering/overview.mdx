@@ -22,7 +22,7 @@ Typhon is a compile-to-Python language. Each Typhon construct lowers to an expli
     ▼ tyc-emit       (Python source + .py.map)
     ▼ tyc-format     (ruff format post-process)
     ▼
-    .py + .py.map + (typhon_runtime/*.py if used)
+    .py + .sourcemaps/*.py.map + (typhon_runtime/*.py if used)
 ```
 
 See [Architecture Overview](/Typhon/internals/architecture/) for the compiler internals.
@@ -34,7 +34,7 @@ See [Architecture Overview](/Typhon/internals/architecture/) for the compiler in
     `class User:` → `@dataclass(slots=True)`. `model User:` → Pydantic `BaseModel`. `class!` → bare class with synthesised `__init__`. [Details →](/Typhon/lowering/classes/)
   </Card>
   <Card title="Result → typhon_runtime" icon="rocket">
-    `Result[T, E]`, `Ok`, `Err` lower to frozen dataclasses in a generated `typhon_runtime` module. `?` lowers to inline `isinstance(_t, Err): return _t`. [Details →](/Typhon/lowering/result/)
+    `Result[T, E]`, `Ok`, `Err` lower to frozen dataclasses in a generated `typhon_runtime` module. `?` lowers to inline `isinstance(_t, Err): return _t`. The `rescue` boundary sugar lowers to `try_result(...)?` (postfix) or a `try` / `except … return Err(...)` block. [Details →](/Typhon/lowering/result/)
   </Card>
   <Card title="gather: → TaskGroup" icon="forward-slash">
     `gather:` lowers to `asyncio.TaskGroup`. `gather(strategy="best-effort"):` lowers to `asyncio.gather(..., return_exceptions=True)`. [Details →](/Typhon/lowering/gather/)
@@ -69,11 +69,12 @@ Three rules guide every lowering decision:
 When you `tyc build`, the emitted tree contains:
 
 - **`build/<your modules>.py`** — your compiled source.
-- **`build/<your modules>.py.map`** — source maps.
+- **`build/.sourcemaps/<your modules>.py.map`** — source maps (moved under `.sourcemaps/` in v0.6.1; the legacy adjacent layout is still readable).
 - **`build/typhon_runtime/`** — only when you use features that need it:
-  - `result.py` — `Ok`, `Err`, `Result` aliases.
+  - `result.py` — `Ok`, `Err`, `Result` + combinators and `try_result`.
   - `tasks.py` — `spawn(coro)` with the strong-ref `_BACKGROUND` set.
   - `lazy.py` — `lazy_let(lambda: ...)` + the `_LazyValue` proxy.
+  - `freeze.py`, `cast.py`, `parallel.py`, `traceback.py`, `stdlib.py` — `freeze let`, `as!`, auto-parallel, `[emit] traceback-remap`, and internal helpers. See [The typhon_runtime module](/Typhon/lowering/runtime/).
 - **`build/<your modules>.pyi`** — for every `.dty` you wrote.
 
 Nothing else. No `__pycache__/` (Python creates that at runtime), no Cargo artefacts, no Typhon-marker files.

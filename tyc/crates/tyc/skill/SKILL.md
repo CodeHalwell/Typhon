@@ -1417,7 +1417,7 @@ See [CLI.md](CLI.md) and `docs/cli.md` for the full surface. The most-used comma
 | `tyc lsp` | LSP on stdio (diagnostics, hover, go-to-def, member completions via venv introspection, from-import members from sibling files, "Remove unused import"; v0.12.0 also surfaces live third-party arg/type diagnostics via `tyc-venv`) | editor |
 | `tyc init NAME` | scaffold `typhon.toml`, `src/`, `tests/` with a worked `main.ty` (frozen dataclass + `impl` + `Result`/`?`/`match`) | new project |
 | `tyc trace traceback.txt` | map Python frames back to `.ty` via `.py.map` v2 | debugging emitted code |
-| `tyc profile` | instrument top-level fns with call-count + wall-clock; writes `typhon-profile.json` on interpreter exit | feeds `pgo-memoise` |
+| `tyc profile` | build, then instrument every top-level fn with call-count + wall-clock (it does not run the program — you run the instrumented build from the project root, and `typhon-profile.json` is written on interpreter exit; the entry module's functions record as `__main__.<fn>`, accepted alongside `main.<fn>` for `src/main.ty`) | feeds `pgo-memoise` |
 | `tyc migrate src/app.py` | typed Python → Typhon: rewrites `Optional[T]`/`T \| None` → `T?`, `Generic[T]` → PEP 695, `NewType` → `newtype`, `Protocol` → `interface`, drops `@dataclass`/`@dataclass(frozen=True)`, adds `let`/`mut` to module-level annotated assigns | `--check` for CI |
 | `tyc ty` | builds, then runs Astral's `ty` checker over emitted Python with `.ty` path attribution via `.py.map` (v0.5.0). The same pass runs automatically when `[checker] external = "ty"` or `--with-ty` is set on build/check (v0.12.0) | second-opinion type-checking; needs `pip install ty` |
 | `tyc stubtest` | builds, then runs `python -m mypy.stubtest` against every emitted `.pyi` | runtime probe complementing `tyc check --stubs` |
@@ -1440,6 +1440,10 @@ Notable flags:
 - `tyc ty --watch` / `tyc ty --out DIR` / `tyc ty -- --strict` / `tyc ty --raw`
 - `tyc repl --load src/lib.ty` / `tyc repl --python python3.13`
 - `tyc debug --entry api.py --debugger pudb --break src/main.ty:42` / `tyc debug --raw-pdb`
+- `tyc lsp --log-level debug` — threshold (`error` / `warn` / `info` / `debug`, default `info`) for the status messages forwarded to the editor over `window/logMessage`.
+- `tyc trace err.log --map-dir DIR` — extra directory to search for `.py.map` sidecars; with no file argument, `tyc trace` reads the traceback from stdin.
+- `tyc fmt --check src/` (`-c`) — exit non-zero if anything would change; `fmt`'s only flag.
+- `tyc init NAME --dir DIR` (`-d`) — scaffold into `<DIR>/<NAME>/`; `tyc add` / `tyc remove --dir DIR` edit another project's `typhon.toml`.
 - `tyc add --dev pytest@8.2` / `tyc add --no-sync` / `tyc sync --dry-run`
 
 `tyc repl` quirks: each prompt re-executes the entire accumulated session (pure-scratch semantics, side effects fire once per prompt), multi-line blocks end on the first blank line, no readline/arrow-key support yet. Bare single-line expressions auto-print their `repr(...)` — `>>> 1 + 1` prints `2`.
@@ -1586,7 +1590,7 @@ Consumers:
 
 ## 19. Diagnostics catalog (top tier)
 
-The recurring diagnostic codes and what they actually mean. **See [DIAGNOSTICS.md](DIAGNOSTICS.md) for the exhaustive 88-code reference** — what follows is the daily-driver subset.
+The recurring diagnostic codes and what they actually mean. **See [DIAGNOSTICS.md](DIAGNOSTICS.md) for the exhaustive reference** (`tyc explain --list` prints all 90 codes the compiler ships as of v1.0.0-alpha.9) — what follows is the daily-driver subset.
 
 | Code | Meaning | Fix |
 |---|---|---|

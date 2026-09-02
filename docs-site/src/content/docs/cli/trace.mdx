@@ -6,10 +6,10 @@ sidebar:
 ---
 
 ```
-tyc trace TRACEBACK_FILE [--map-dir DIR]
+tyc trace [TRACEBACK_FILE] [--map-dir DIR]
 ```
 
-Reads a Python traceback file, locates the matching `.py.map` v2 source maps, and rewrites `File "build/main.py", line N` frames to `File "src/main.ty", line M`.
+Reads a Python traceback (from the given file, or from stdin when the argument is omitted), locates the matching `.py.map` v2 source maps, and rewrites `File "build/main.py", line N` frames to `File "src/main.ty", line M`.
 
 ## Examples
 
@@ -17,8 +17,8 @@ Reads a Python traceback file, locates the matching `.py.map` v2 source maps, an
 python build/main.py 2>err.log
 tyc trace err.log
 
-# Or pipe directly:
-python build/main.py 2>&1 | tyc trace -
+# Or pipe directly (no argument → read stdin):
+python build/main.py 2>&1 | tyc trace
 ```
 
 ## What it does
@@ -41,13 +41,14 @@ The output looks like a normal Python traceback, but the frames are `.ty` paths 
 
 | Flag | Default | Effect |
 |------|---------|--------|
-| `--map-dir DIR` | `build/` | Where to look for `.py.map` files. |
-| `--no-color` | off | Disable ANSI colour. |
+| `--map-dir DIR` | — | Extra directory to search for `.py.map` files (`<DIR>/.sourcemaps/<file>.py.map`, then the legacy adjacent `<DIR>/<file>.py.map`). Without it, each frame's map is located from the frame's own `.py` path: `<dir>/.sourcemaps/<rel>.py.map`, walking up to the build root, then a legacy `<file>.py.map` next to the `.py`. |
+
+There is no `--no-color` flag; the remapped traceback is printed as plain text.
 
 ## Limitations
 
 - Works per-statement (the `.py.map` v2 granularity). Column-level remapping is a future enhancement.
-- Only remaps frames whose Python file is under the configured `build/` dir. External frames (stdlib, third-party packages) are left alone.
+- Only frames whose `.py` has a `.py.map` sidecar are rewritten; stdlib and third-party frames are left alone.
 
 ## A worked example
 

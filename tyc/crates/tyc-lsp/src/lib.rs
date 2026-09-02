@@ -311,8 +311,8 @@ impl Backend {
         // Its severity twin, for the `apply_severity_overrides` pass.
         let severity_overrides_cache_arc = Arc::clone(&self.severity_overrides_cache);
 
-        let text_for_check = text.clone();
         let uri_str_for_check = uri_str.clone();
+        let text_for_check = text.clone();
         let result = tokio::task::spawn_blocking(move || {
             // Hold the mutex only for the duration of the salsa call.
             let mut db = db.blocking_lock();
@@ -510,13 +510,22 @@ impl Backend {
                     pub_names: prep_full.pub_names.clone(),
                     has_pub_star: !prep_full.pub_star_lines.is_empty(),
                 };
-                diags.extend(tyc_analyse::editor_lint_diagnostics(
+                let mut lint_diags = tyc_analyse::editor_lint_diagnostics(
                     &parsed.into_syntax(),
                     &uri_str_for_check,
                     &mapping_source,
                     opts,
                     &perf_ctx,
-                ));
+                );
+                // Same relocation the shared pipeline applies to its own
+                // diagnostics: report the editor's line, not the buffer's.
+                lint_diags.remap_lines(
+                    &mapping_source,
+                    &prep_full.line_map,
+                    &uri_str_for_check,
+                    &text_for_check,
+                );
+                diags.extend(lint_diags);
             }
             (diags, mapping_source)
         })
@@ -4174,9 +4183,14 @@ fn first_label(err: &TycError) -> Option<LabeledSpan> {
 /// diagnostic variant keeps published LSP ranges aligned with the editor
 /// buffer instead of drifting by a column or two after `val` is removed.
 fn diagnostic_source<'a>(err: &TycError, original: &'a str, preprocessed: &'a str) -> &'a str {
+    // A diagnostic already relocated onto the editor buffer
+    // (`Diagnostics::remap_lines`, run by the shared check pipeline) carries
+    // that text; so do the `?` / `lazy` validators, which run before any sugar
+    // expansion. Everything else is anchored to the preprocessed buffer.
+    if err.source_text() == Some(original) {
+        return original;
+    }
     match err {
-        // Both validators run against the original Typhon source, before any
-        // sugar expansion, so their byte offsets refer to the editor buffer.
         TycError::InvalidQuestionOp { .. } | TycError::LazyUsage { .. } => original,
         _ => preprocessed,
     }

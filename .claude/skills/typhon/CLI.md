@@ -65,7 +65,10 @@ Parse and pretty-print `.ty` source in place. Wraps `ruff format` applied to a T
 ```bash
 tyc fmt src/
 tyc fmt src/main.ty
+tyc fmt --check src/         # -c: exit non-zero if anything would change; write nothing (CI mode)
 ```
+
+`--check` / `-c` is the only flag — there is no `--diff` or `--quiet`. `tyc fmt` collects `.ty` files only; `.dty` stubs are not formatted.
 
 In-process whitespace pass handles: trailing spaces, final newline, leading-tab expansion, line-ending normalisation, and **five PEP 8 spacing rules** (v0.3.0): space after `:`, spaces around `->`, space after `,`, single-space around binary `+`/`-` and top-level `=`, two blank lines before top-level `def`/`class`/`async def`. Falls back silently to in-process output on `ruff` failure.
 
@@ -73,7 +76,13 @@ Scientific-notation literals (`1e-12`, `2.5E+7`, `1.0e-12`) survive the whitespa
 
 ### `tyc lsp`
 
-Run on stdio as a Language Server. Features today (verify against current code if it matters — the LSP grows):
+Run on stdio as a Language Server.
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--log-level LEVEL` | `info` | Threshold for the status messages the server forwards to the editor over `window/logMessage`: `error` / `warn` / `info` / `debug` |
+
+`--stdio` is accepted and ignored (`vscode-languageclient` appends it unconditionally; stdio is the only transport). Features today (verify against current code if it matters — the LSP grows):
 
 - Diagnostics on `did_open` / `did_change`.
 - Position-based hover (binding kind + mutability + signature; surfaces venv introspection failure reasons in v0.3.1).
@@ -85,11 +94,11 @@ Run on stdio as a Language Server. Features today (verify against current code i
 - Semantic tokens: `newtype` paints as `class` at declaration and references (v0.6.0); class-body fields paint as `property` (v0.6.0).
 - "Remove unused import" code action.
 
-Editor wiring: `editors/vscode/` ships a reference extension (v0.2.0 as of v0.9.0). Any LSP-aware editor can attach `tyc lsp` directly.
+Editor wiring: `editors/vscode/` ships a reference extension (v0.2.3). Any LSP-aware editor can attach `tyc lsp` directly. The server does not provide `textDocument/formatting` — run `tyc fmt` from a pre-commit hook or an editor task.
 
-### `tyc init NAME`
+### `tyc init [NAME] [--dir DIR]`
 
-Scaffold a new project:
+Scaffold a new project. With `NAME`, the scaffold lands in `<DIR>/<NAME>/` (`--dir` / `-d` defaults to `.`); without it, `DIR` itself is initialised and its basename becomes the project name:
 
 ```
 NAME/
@@ -99,7 +108,7 @@ NAME/
 └── tests/
 ```
 
-The default `typhon.toml` enables `[strictness] no-implicit-any = true`, `unused-import = "error"`, `exhaustive-match = "error"`, and `[emit] format = true`.
+The default `typhon.toml` enables `[strictness] no-implicit-any = true`, `unused-import = "warn"`, `exhaustive-match = "error"`, `methods-in-class-body = "warn"`, `suggest-gather = true`, `require-with = "warn"`, `blocking-in-async = "warn"`, `allow-secret-comptime = false`, and `[emit] format = true`, with every other `[strictness]` / `[emit]` key present as a comment.
 
 ---
 
@@ -139,27 +148,39 @@ See [RUNTIME.md](RUNTIME.md) for the VM's full feature surface and the fallback 
 
 ## Debugging emitted code
 
-### `tyc trace TRACEBACK_FILE`
+### `tyc trace [TRACEBACK_FILE] [--map-dir DIR]`
 
-Read a captured Python traceback and rewrite frames back to `.ty` source via the `.py.map` sidecars.
+Read a captured Python traceback (from the file, or from stdin when the argument is omitted) and rewrite frames back to `.ty` source via the `.py.map` sidecars.
 
 ```bash
 python build/main.py 2> err.log
 tyc trace err.log
+python build/main.py 2>&1 | tyc trace            # no argument → stdin
+tyc trace err.log --map-dir dist/                # sidecars live somewhere else
 ```
 
-Use after a production / CI failure where you only have the traceback. Pair with `tyc debug` for live stepping. Paths with spaces use a longest-candidate walk-left lookup (v0.5.0). Cached per-line.
+| Flag | Purpose |
+|---|---|
+| `--map-dir DIR` | Extra directory to search for sidecars (`<DIR>/.sourcemaps/<file>.py.map`, then the legacy adjacent `<DIR>/<file>.py.map`). By default each frame's map is located from its own `.py` path: `<dir>/.sourcemaps/<rel>.py.map` walking up to the build root, then a legacy `<file>.py.map` beside the `.py` |
 
-### `tyc profile`
+There is no `--no-color` flag; output is plain text. Use after a production / CI failure where you only have the traceback. Pair with `tyc debug` for live stepping. Paths with spaces use a longest-candidate walk-left lookup (v0.5.0). Cached per-line.
 
-Builds, then instruments every top-level function with call-count + wall-clock sampling. Writes `typhon-profile.json` on interpreter exit. Feeds `[strictness] pgo-memoise`:
+### `tyc profile [PATH] [--out DIR]`
+
+Builds, then rewrites every emitted `.py` so each **top-level** `def` / `async def` (not methods, not nested functions, not the generated `typhon_runtime/` helpers) is wrapped in a call-count + wall-clock timing decorator, dropping a `typhon_profile.py` helper next to the emitted code. `tyc profile` does **not** run the program and takes no program arguments — you run the instrumented entry point yourself; on interpreter exit an `atexit` hook writes `typhon-profile.json`, a JSON object keyed `"<module>.<qualname>"` (`fn.__module__` + `fn.__qualname__`) with `{"calls": N, "total_seconds": F}` values. Feeds `[strictness] pgo-memoise`:
 
 ```bash
-tyc profile -- some-realistic-workload
-# → typhon-profile.json
-# Now enable [strictness] pgo-memoise = true and `tyc build` will
-# promote hot pure functions to @functools.cache.
+tyc profile                          # instrumented build → build/ (or --out DIR)
+python build/main.py --bench         # run from the project root; typhon-profile.json written on exit
+tyc build                            # with [strictness] pgo-memoise = true (or [optimise] level = 1),
+                                     # hot pure functions are promoted to @functools.cache
 ```
+
+| Flag | Purpose |
+|---|---|
+| `--out DIR` / `-o` | Output directory for the instrumented build, forwarded to `tyc build` |
+
+Round-trip rules: run the instrumented program **from the project root** — the profile lands in the process's working directory (override with `TYPHON_PROFILE_OUT`) and `tyc build` reads `typhon-profile.json` from the directory holding `typhon.toml`. Keys match **per module**: `users.find_user` promotes `find_user` in `src/users.ty` only; the entry module runs as `__main__`, so its functions are recorded as `__main__.<fn>`, and both that spelling and `main.<fn>` are accepted for `src/main.ty` (a bare `<fn>` key matches by name as a fallback for other profilers). Only inferred-pure functions whose call count meets `pgo-min-calls` (default 100) are promoted; a function already carrying `@memo` is never double-decorated. A missing profile is neither an error nor a warning — PGO is best-effort.
 
 ### `tyc debug`
 
@@ -207,10 +228,10 @@ Convert typed Python (`.py`) → Typhon (`.ty`) in one pass:
 
 ```bash
 tyc migrate src/app.py            # writes src/app.ty alongside src/app.py
-tyc migrate --check src/app.py    # preview to stdout, exit 0 if already Typhon-compatible
+tyc migrate --check src/app.py    # preview: print the migrated source to stdout, write nothing
 ```
 
-`--check` is useful in CI to confirm a `.py` file is migration-ready. After migration, run `tyc check src/` and fix the remaining diagnostics manually — the migration can't infer `let`/`mut` inside function bodies (everything starts as `let`; mark accumulators / counters as `mut`).
+`--check` is a **preview**, not a diff: it prints the migrated source (one block per file) and exits 0 whenever the migration itself succeeds — there is no "changes needed" exit code. To gate CI, diff the preview against a checked-in `.ty`. After migration, run `tyc check src/` and fix the remaining diagnostics manually — typically design-level issues (`try/except` shapes, framework bases), since function-body locals already receive `let` / `mut` (the `mut` promotion is a file-wide over-approximation worth a review on large ports).
 
 The third-party-corpus sweep at `stress/third-party-py-corpus/` round-trips representative fixtures through `tyc migrate` + `tyc check` in CI; the opt-in nightly `stress/pypi-sweep/sweep.py` pip-installs `attrs` / `click` / a small Pydantic-using package and round-trips them.
 
@@ -321,7 +342,7 @@ For exploratory typing, paired with `tyc check src/` in a watcher, is usually a 
 
 ## Package management (`uv` surface)
 
-### `tyc add PACKAGE[@VERSION]`
+### `tyc add PACKAGE[@VERSION]...`
 
 Rewrite `[dependencies]` / `[dev-dependencies]` in `typhon.toml`, then shell out to `uv` for the install.
 
@@ -330,7 +351,14 @@ tyc add requests                  # bare name → "*" (any version)
 tyc add requests@2.31             # → ">=2.31" (semver-prefix conversion)
 tyc add --dev pytest@8.2          # under [dev-dependencies]
 tyc add --no-sync foo bar baz     # batch edits; finish with `tyc sync`
+tyc add --dir ../other rich       # edit another project's typhon.toml (default: .)
 ```
+
+| Flag | Purpose |
+|---|---|
+| `--dev` | Target `[dev-dependencies]` instead of `[dependencies]` (also on `tyc remove`) |
+| `--no-sync` | Skip the `uv` install step (also on `tyc remove`) |
+| `--dir DIR` | Project directory whose `typhon.toml` to edit, default `.` (also on `tyc remove`; `tyc sync` takes the project directory as its positional `PATH`) |
 
 If `uv` is missing, `tyc add` still rewrites the manifest and prints an "install uv" message.
 
@@ -422,5 +450,6 @@ For `tyc run` / `tyc debug`, the child's exit code propagates verbatim.
 | `TYPHON_VERSION` | Used by `install.sh` / `install.ps1` to pin a release tag (default: latest) |
 | `TYPHON_INSTALL_DIR` | Used by installers to override the install location |
 | `TYC_SKIP_CHECK=1` | Skip the pre-VM static check in `tyc run` (v0.3.1) — does NOT affect `--compile` mode |
-| `TYC_NO_SYNC=1` | Equivalent to `--no-sync` on `tyc build` and `tyc add`/`tyc remove` |
+| `TYC_NO_SYNC=1` | Equivalent to `--no-sync` on `tyc build` (`tyc add` / `tyc remove` only honour the explicit `--no-sync` flag) |
+| `TYPHON_PROFILE_OUT` | Read by the program `tyc profile` instrumented, at run time: where to write the profile (default `typhon-profile.json` in the working directory) |
 | `TYC_NO_INTROSPECT=1` | (v1.0.0-alpha.3) Disable venv dependency introspection in `tyc check` / `tyc build` / the LSP — a kill-switch for the "opening a project imports its dependencies" trust boundary. Third-party calls degrade to permissive `Unknown`. See `SECURITY.md`. |

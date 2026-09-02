@@ -60,6 +60,9 @@ The `tyc` binary is the compiler, formatter, language server, REPL, migrator, de
   <Card title="tyc add / remove / sync" icon="seti:config">
     Package-manager surface over `uv`. [Reference →](/Typhon/cli/packages/)
   </Card>
+  <Card title="tyc install skill" icon="download">
+    Write the embedded `typhon` Claude skill into a project's `.claude/skills/typhon/`. [Reference →](#tyc-install-skill)
+  </Card>
 </CardGrid>
 
 ## Typical workflow
@@ -96,26 +99,36 @@ For projects shipping `.dty` stubs, add `tyc check --stubs` to catch drift, and 
 | Flag | Effect |
 |------|--------|
 | `--help` / `-h` | Print help for a command. |
-| `--version` / `-V` | Print `tyc` version. |
-| `--quiet` / `-q` | Suppress non-error output. |
-| `--verbose` / `-v` | More logging; repeat `-vv` for max. |
-| `--manifest PATH` | Override the path to `typhon.toml`. |
-| `--color {auto,always,never}` | Control miette ANSI output. |
+| `--version` / `-V` | Print `tyc` version (also accepted after any subcommand). |
 
-Per-command flags are documented on each command's page.
+Those two are the only global flags. There is no `--quiet` / `--verbose` / `--color` switch — diagnostics always render through miette with its built-in ANSI heuristics — and no `--manifest` override: every command discovers `typhon.toml` by walking up from the path it was given (pass a project directory to target a different project). Per-command flags are documented on each command's page; the one logging knob is [`tyc lsp --log-level`](/Typhon/cli/lsp/).
 
 ## Exit codes
 
 | Code | Meaning |
 |------|---------|
 | 0 | Success. |
-| 1 | Error — invalid input, missing manifest, unknown command. |
-| 2 | Compile-time error — diagnostics emitted. |
+| 1 | Failure — at least one error-severity diagnostic, invalid input, a missing manifest or required tool, or a `tyc fmt --check` that would reformat. |
+| 2 | Invocation error — bad arguments or an unknown subcommand (reported by the argument parser). |
 | 130 | Interrupted (Ctrl-C). |
 
 `tyc run` propagates the child program's exit code instead of overriding (the VM exits with the script's terminating exit code; `--compile` mode propagates the child Python's exit code).
 
 See [Exit Codes](/Typhon/cli/exit-codes/) for the full table.
+
+## `tyc install skill`
+
+```
+tyc install skill [--dir DIR] [--force] [--list]
+```
+
+Writes the embedded `typhon` Claude skill — `SKILL.md`, its sibling reference files, and the `references/` example programs — into `<DIR>/.claude/skills/typhon/` (default: the current directory). The skill is compiled into the binary, so the command works offline and always matches the `tyc` you ran.
+
+| Flag | Effect |
+|------|--------|
+| `--dir DIR` (`-d`) | Project root to install into. Default `.`. |
+| `--force` | Overwrite an existing copy. Without it the command refuses when `.claude/skills/typhon/SKILL.md` already exists, so a customised copy is never clobbered. |
+| `--list` | Print the files that would be written, then exit without touching disk. |
 
 ## Where next
 

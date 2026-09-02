@@ -168,6 +168,13 @@ pub struct PreprocessResult {
     /// recorded indices still point at the same headers in the sanitised
     /// buffer the remap operates on.
     pub impl_distributed_lines: Vec<usize>,
+    /// `python_source` line → line of the text the *whole* pipeline started
+    /// from (both 0-based), when the caller composed the sugar chain's table
+    /// with the preprocessor's own (see [`preprocess_mapped`]). Empty means
+    /// "identity" — the caller ran no line-changing pass, or did not record
+    /// one. Consumers that report line numbers to the user
+    /// (`Diagnostics::remap_lines`) read this table.
+    pub line_map: Vec<usize>,
 }
 
 impl PreprocessResult {
@@ -288,7 +295,20 @@ pub fn preprocess_opts(source: &str, opts: PreprocessOptions) -> PreprocessResul
 /// once per union variant. Callers that need `.ty`-accurate line numbers (the
 /// `.py.map` writer) must compose this table with the sugar chain's.
 pub fn preprocess_mapped(source: &str) -> (PreprocessResult, Vec<usize>) {
-    preprocess_opts_mapped(source, PreprocessOptions::default())
+    let (mut result, map) = preprocess_opts_mapped(source, PreprocessOptions::default());
+    result.line_map = map.clone();
+    (result, map)
+}
+
+/// Run the full sugar chain ([`expand_sugar_mapped`]) and then [`preprocess`],
+/// leaving `PreprocessResult::line_map` as the composed `python_source line →
+/// original line` table — the one a diagnostic renderer needs to report the
+/// line the user wrote rather than the preprocessed buffer's.
+pub fn expand_and_preprocess_mapped(source: &str, rewrite_lazy_imports: bool) -> PreprocessResult {
+    let (expanded, expanded_to_source) = expand_sugar_mapped(source, rewrite_lazy_imports);
+    let (mut result, prep_to_expanded) = preprocess_mapped(&expanded);
+    result.line_map = compose_line_maps(&prep_to_expanded, &expanded_to_source);
+    result
 }
 
 /// [`preprocess_opts`] plus the line table described on [`preprocess_mapped`].
@@ -296,6 +316,9 @@ pub fn preprocess_opts_mapped(
     source: &str,
     opts: PreprocessOptions,
 ) -> (PreprocessResult, Vec<usize>) {
+    // See `expand_typed_let_unpack_mapped`: BOM dropped, final newline ensured.
+    let normalised = normalise_source_text(source);
+    let source: &str = &normalised;
     // Pre-pass: walk every line, strip a leading `pub ` modifier (at
     // module level — i.e. zero indentation), record the declared name,
     // and feed the rest of the pipeline a source string with `pub ` no
@@ -357,6 +380,10 @@ pub fn preprocess_opts_mapped(
     // depth left over from earlier `freeze let` lines; when it returns to
     // zero we close the call by appending `)` to the current line.
     let mut freeze_let_depth: i32 = 0;
+    // A `freeze let` whose RHS opens a triple-quoted string that closes on a
+    // later line: the closing `)` of `__typhon_freeze__(` must follow the
+    // line that closes the string, not the header line.
+    let mut freeze_let_open_string = false;
 
     // ── `enum Name:` body tracking ────────────────────────────────────────
     // When an `enum Name:` header is seen we record the header's indent. Every
@@ -389,7 +416,9 @@ pub fn preprocess_opts_mapped(
             // closes the body nor is a member — emit it verbatim and continue.
             if let Some(header_indent) = enum_header_indent {
                 let is_blank = rest.trim_end_matches(['\n', '\r']).is_empty();
-                if is_blank {
+                // A blank or comment-only line — at any column, a column-zero
+                // `# note` included — is layout inside the body, not its end.
+                if is_blank || rest.trim_start().starts_with('#') {
                     python_source.push_str(line);
                     continue;
                 }
@@ -405,8 +434,15 @@ pub fn preprocess_opts_mapped(
                 if indent_len > header_indent {
                     // Member line. Bare `MEMBER` → `MEMBER = enum.auto()`;
                     // `MEMBER = value` and any non-member statement (e.g. a
-                    // docstring or `pass`) are left untouched.
-                    let body = rest.trim_end_matches(['\n', '\r']);
+                    // docstring or `pass`) are left untouched. A trailing
+                    // `# comment` is set aside and re-attached after the
+                    // generated `= enum.auto()`.
+                    let full = rest.trim_end_matches(['\n', '\r']);
+                    let code_len = mask
+                        .line_code_end(line_index)
+                        .saturating_sub(indent_len)
+                        .min(full.len());
+                    let body = full[..code_len].trim_end();
                     let trailing = &rest[body.len()..];
                     // A physical line that continues an open bracket (or a
                     // backslash) is not a statement at all — its leading
@@ -422,7 +458,8 @@ pub fn preprocess_opts_mapped(
                             .next()
                             .map(|c| c.is_ascii_alphabetic() || c == '_')
                             .unwrap_or(false)
-                        && body.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                        && body.chars().all(|c| c.is_alphanumeric() || c == '_')
+                        && !is_python_keyword(body);
                     if is_bare_member {
                         stripped.push(StrippedKeyword {
                             line_index,
@@ -466,12 +503,18 @@ pub fn preprocess_opts_mapped(
                         // (`<comment>` or empty) so we can place the
                         // closing `)` between them on the single-line
                         // case.
+                        let string_continues = mask.line_entry_string(line_index + 1).is_some();
                         let new_line = if wrap.residual > 0 {
                             freeze_let_depth = wrap.residual;
                             // Comment-on-open-line is rejected by
                             // wrap_freeze_let_with_depth in the
                             // multi-line case, so `tail` is empty here.
                             debug_assert!(wrap.tail.is_empty());
+                            format!("{}let {}\n", indent, wrap.head)
+                        } else if string_continues {
+                            // The RHS is a triple-quoted string that runs on;
+                            // close the call on the line that closes it.
+                            freeze_let_open_string = true;
                             format!("{}let {}\n", indent, wrap.head)
                         } else {
                             format!("{}let {}){}\n", indent, wrap.head, wrap.tail)
@@ -588,7 +631,7 @@ pub fn preprocess_opts_mapped(
             };
             if let Some(after_impl) = after_impl_kw {
                 let first = after_impl.as_bytes().first().copied().unwrap_or(0);
-                if first.is_ascii_alphanumeric() || first == b'_' || first == b'[' {
+                if is_ident_byte(first) || first == b'[' {
                     if let Some(class_header) = make_impl_class_line(after_impl) {
                         stripped.push(StrippedKeyword {
                             line_index,
@@ -617,8 +660,7 @@ pub fn preprocess_opts_mapped(
             // to drive call-site rewriting.
             if rest.starts_with("extend ")
                 && rest.len() > "extend ".len()
-                && (rest.as_bytes()["extend ".len()].is_ascii_alphanumeric()
-                    || rest.as_bytes()["extend ".len()] == b'_')
+                && is_ident_byte(rest.as_bytes()["extend ".len()])
             {
                 let after_extend = &rest["extend ".len()..];
                 let target = extract_extend_target(after_extend);
@@ -648,8 +690,7 @@ pub fn preprocess_opts_mapped(
             // ── `interface Name:` → `class Name(Protocol):` ─────────────────
             if rest.starts_with("interface ")
                 && rest.len() > "interface ".len()
-                && (rest.as_bytes()["interface ".len()].is_ascii_alphanumeric()
-                    || rest.as_bytes()["interface ".len()] == b'_')
+                && is_ident_byte(rest.as_bytes()["interface ".len()])
             {
                 let after_iface = &rest["interface ".len()..];
                 if let Some(class_header) = make_interface_class_line(after_iface) {
@@ -726,8 +767,7 @@ pub fn preprocess_opts_mapped(
             // exactly as written — no `__init__` is synthesised.
             if rest.starts_with("plain class ")
                 && rest.len() > "plain class ".len()
-                && (rest.as_bytes()["plain class ".len()].is_ascii_alphanumeric()
-                    || rest.as_bytes()["plain class ".len()] == b'_')
+                && is_ident_byte(rest.as_bytes()["plain class ".len()])
             {
                 stripped.push(StrippedKeyword {
                     line_index,
@@ -753,8 +793,7 @@ pub fn preprocess_opts_mapped(
             // on this class.
             if rest.starts_with("class! ")
                 && rest.len() > "class! ".len()
-                && (rest.as_bytes()["class! ".len()].is_ascii_alphanumeric()
-                    || rest.as_bytes()["class! ".len()] == b'_')
+                && is_ident_byte(rest.as_bytes()["class! ".len()])
             {
                 stripped.push(StrippedKeyword {
                     line_index,
@@ -812,8 +851,7 @@ pub fn preprocess_opts_mapped(
             // (via the synthesised marker import) when any enum is present.
             if rest.starts_with("enum ")
                 && rest.len() > "enum ".len()
-                && (rest.as_bytes()["enum ".len()].is_ascii_alphanumeric()
-                    || rest.as_bytes()["enum ".len()] == b'_')
+                && is_ident_byte(rest.as_bytes()["enum ".len()])
             {
                 let after_enum = &rest["enum ".len()..]; // e.g. "Shape:\n"
                 if let Some(class_body) = make_enum_class_line(after_enum) {
@@ -838,8 +876,7 @@ pub fn preprocess_opts_mapped(
             // ── `model ClassName:` → `class ClassName(BaseModel):` ──────────
             if rest.starts_with("model ")
                 && rest.len() > "model ".len()
-                && (rest.as_bytes()["model ".len()].is_ascii_alphanumeric()
-                    || rest.as_bytes()["model ".len()] == b'_')
+                && is_ident_byte(rest.as_bytes()["model ".len()])
             {
                 let after_model = &rest["model ".len()..]; // e.g. "User:\n"
                                                            // Find the `:` that opens the class body (last `:` not inside
@@ -943,6 +980,14 @@ pub fn preprocess_opts_mapped(
             // the AST.
 
             stripped_line.unwrap_or_else(|| line.to_owned())
+        } else if freeze_let_open_string && mask.line_entry_string(line_index + 1).is_none() {
+            // This line closes the `freeze let` RHS string: append the `)`
+            // that closes `__typhon_freeze__(` right after the code portion.
+            freeze_let_open_string = false;
+            let no_nl = line.trim_end_matches(['\n', '\r']);
+            let code_end = mask.line_code_end(line_index).min(no_nl.len());
+            let code = no_nl[..code_end].trim_end();
+            format!("{}){}{}", code, &no_nl[code.len()..], &line[no_nl.len()..])
         } else {
             line.to_owned()
         };
@@ -994,6 +1039,7 @@ pub fn preprocess_opts_mapped(
         pub_names,
         pub_star_lines,
         impl_distributed_lines,
+        line_map: Vec::new(),
     };
     (result, line_map)
 }
@@ -1861,7 +1907,7 @@ fn is_simple_identifier(s: &str) -> bool {
     if !(first.is_ascii_alphabetic() || first == '_') {
         return false;
     }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    chars.all(|c| c.is_alphanumeric() || c == '_')
 }
 
 /// If `line` is a `def NAME(...) -> TYPE` declaration with no body
@@ -2055,6 +2101,12 @@ fn expand_impl_sealed_unions(source: &str) -> (String, Vec<usize>, Vec<usize>) {
                     probe += 1;
                     continue;
                 }
+                // A comment-only line — a column-zero `# note` included — is
+                // layout inside the body, not a dedent that ends it.
+                if candidate.trim_start().starts_with('#') {
+                    probe += 1;
+                    continue;
+                }
                 let cand_indent = candidate
                     .find(|c: char| !c.is_whitespace())
                     .unwrap_or(candidate.len());
@@ -2149,9 +2201,7 @@ fn collect_sealed_union_aliases_from_text(
             None => continue,
         };
         // Skip the optional `[T,…]` type-param list after the alias name.
-        let name_end = after
-            .bytes()
-            .position(|b| !(b.is_ascii_alphanumeric() || b == b'_'));
+        let name_end = after.bytes().position(|b| !(is_ident_byte(b)));
         let name_end = match name_end {
             Some(p) if p > 0 => p,
             _ => continue,
@@ -2199,7 +2249,7 @@ fn collect_sealed_union_aliases_from_text(
                 let p = p.trim();
                 let head_end = p
                     .bytes()
-                    .position(|b| !(b.is_ascii_alphanumeric() || b == b'_'))
+                    .position(|b| !(is_ident_byte(b)))
                     .unwrap_or(p.len());
                 p[..head_end].to_owned()
             })
@@ -2279,9 +2329,7 @@ fn parse_impl_header_target(after_impl: &str) -> Option<ImplHeaderTarget> {
         (None, after_impl.trim_start())
     };
     // Target name = identifier chars from the start of after_tps.
-    let name_end = after_tps
-        .bytes()
-        .position(|b| !(b.is_ascii_alphanumeric() || b == b'_'))?;
+    let name_end = after_tps.bytes().position(|b| !(is_ident_byte(b)))?;
     if name_end == 0 {
         return None;
     }
@@ -2339,86 +2387,44 @@ fn strip_hkt_markers_in_class_headers(source: &str) -> (String, Vec<usize>) {
         out.mark(line_index);
         let pre_string = in_string;
         let raw = line.trim_end_matches(['\n', '\r']);
-        let _code_end = scan_line_code_end(raw, &mut in_string);
+        let code_end = scan_line_code_end(raw, &mut in_string);
         if pre_string.is_some() {
             out.push_str(line);
             continue;
         }
         let indent_len = raw.find(|c: char| !c.is_whitespace()).unwrap_or(raw.len());
         let rest = &raw[indent_len..];
-        if !rest.starts_with("class ") {
+        // Every header that may carry a PEP 695 parameter list: `class X[…]:`,
+        // `class! X[…]:`, `plain class X[…]:`, `model X[…]:`,
+        // `interface X[…]:`, and `impl[…] X[…]:`. A marker never appears in a
+        // body line, so only headers are rewritten.
+        let is_header = [
+            "class ",
+            "class!",
+            "plain class ",
+            "model ",
+            "interface ",
+            "impl[",
+            "impl ",
+        ]
+        .iter()
+        .any(|kw| rest.starts_with(kw));
+        // Quick exit: no `[_]` marker in the code portion — leave the line
+        // alone so round-tripping stays exact for the common case.
+        let code = &raw[..code_end.min(raw.len())];
+        if !is_header || !code.contains("[_]") {
             out.push_str(line);
             continue;
         }
-        // Find the first `[` after `class NAME`. Walk past the name
-        // (identifier characters only) to land on the optional
-        // type-parameter bracket.
-        let after_class = &rest["class ".len()..];
-        let name_end = match after_class
-            .bytes()
-            .position(|b| !(b.is_ascii_alphanumeric() || b == b'_'))
-        {
-            Some(p) if p > 0 => p,
-            _ => {
-                out.push_str(line);
-                continue;
-            }
-        };
-        let after_name = &after_class[name_end..];
-        if !after_name.starts_with('[') {
-            out.push_str(line);
-            continue;
-        }
-        // Match the closing `]` at depth 0.
-        let bytes = after_name.as_bytes();
-        let mut depth = 0i32;
-        let mut close = None;
-        for (i, &b) in bytes.iter().enumerate() {
-            match b {
-                b'[' => depth += 1,
-                b']' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        close = Some(i);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let close = match close {
-            Some(p) => p,
-            None => {
-                out.push_str(line);
-                continue;
-            }
-        };
-        let inside = &after_name[1..close]; // exclusive of outer `[`/`]`
-                                            // Quick exit: no `[_]` marker at all — leave the line alone so
-                                            // round-tripping stays exact for the common case.
-        if !inside.contains("[_]") {
-            out.push_str(line);
-            continue;
-        }
-        let rewritten_inside = strip_hkt_markers_in_param_list(inside);
-        if rewritten_inside == inside {
-            out.push_str(line);
-            continue;
-        }
-        // Reassemble: indent + `class NAME` + `[REWRITTEN]` + tail.
-        // `after_name` starts at the `[`, so `close` is the byte index of
-        // the matching `]` within `after_name`. The absolute position of
-        // that `]` in `raw` is `head_end + close`.
-        let head_end = indent_len + "class ".len() + name_end; // points at `[`
-        let close_byte = head_end + close; // absolute index of `]`
-        out.push_str(&raw[..head_end]);
-        out.push('[');
-        out.push_str(&rewritten_inside);
-        out.push(']');
-        out.push_str(&raw[close_byte + 1..]);
+        // Drop every `Name[_]` marker in the header's code portion — the
+        // type-parameter list, a base list (`class! ListF[F[_]](object):`),
+        // and the target of an `impl[F[_]] Functor[F[_]]:` alike. `[_]` is
+        // not valid Python anywhere, so nothing else can match.
+        let rewritten = strip_all_hkt_markers(code);
+        out.push_str(&rewritten);
+        out.push_str(&raw[code_end.min(raw.len())..]);
         // Preserve the original terminator (CRLF or LF or none).
-        let term = &line[raw.len()..];
-        out.push_str(term);
+        out.push_str(&line[raw.len()..]);
     }
     out.finish()
 }
@@ -2426,46 +2432,30 @@ fn strip_hkt_markers_in_class_headers(source: &str) -> (String, Vec<usize>) {
 /// Walk a comma-separated PEP-695 type-parameter list and drop any `[_]`
 /// kind-marker that immediately follows a parameter name. Bound
 /// annotations (`T: Bound`) and bare names pass through unchanged.
-fn strip_hkt_markers_in_param_list(inside: &str) -> String {
-    // Bracket-aware top-level comma split. Whitespace inside each piece
-    // is preserved so the output reads naturally.
-    let mut out = String::with_capacity(inside.len());
-    let parts = split_top_level_commas_lite(inside);
-    for (i, raw_part) in parts.iter().enumerate() {
-        let part = raw_part.trim();
-        // Match `Name[_]` (optionally followed by `: Bound` / `= Default`).
-        // We only strip the `[_]` token; everything before/after is kept.
-        let stripped = strip_one_hkt_marker(part);
-        if i > 0 {
-            out.push_str(", ");
+/// Drop every `Name[_]` kind marker in `code` (the `[_]` that directly follows
+/// an identifier, optional whitespace allowed), wherever it sits — a
+/// type-parameter list, a base list, or an `impl[…]` target.
+fn strip_all_hkt_markers(code: &str) -> String {
+    let mask = compute_in_string_mask(code);
+    let bytes = code.as_bytes();
+    let mut out = String::with_capacity(code.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if !mask[i] && bytes[i..].starts_with(b"[_]") {
+            let before = out.trim_end();
+            if before.bytes().last().is_some_and(is_ident_byte) {
+                let keep = before.len();
+                out.truncate(keep);
+                i += 3;
+                continue;
+            }
         }
-        out.push_str(&stripped);
+        // Copy one full UTF-8 character.
+        let ch_len = code[i..].chars().next().map_or(1, char::len_utf8);
+        out.push_str(&code[i..i + ch_len]);
+        i += ch_len;
     }
     out
-}
-
-/// For a single parameter slot, drop a trailing `[_]` kind marker that
-/// follows the parameter's identifier. Returns the slot unchanged if no
-/// marker is present.
-fn strip_one_hkt_marker(slot: &str) -> String {
-    // Find the identifier end (first non-id char).
-    let id_end = slot
-        .bytes()
-        .position(|b| !(b.is_ascii_alphanumeric() || b == b'_'))
-        .unwrap_or(slot.len());
-    if id_end == 0 {
-        return slot.to_owned();
-    }
-    let head = &slot[..id_end];
-    let tail = &slot[id_end..];
-    // Optional whitespace, then `[_]`, then whatever follows.
-    let after_ws = tail.trim_start();
-    let ws_len = tail.len() - after_ws.len();
-    if let Some(after_marker) = after_ws.strip_prefix("[_]") {
-        format!("{}{}{}", head, &tail[..ws_len], after_marker)
-    } else {
-        slot.to_owned()
-    }
 }
 
 /// Strip the `frozen` modifier from a `class NAME frozen:` or
@@ -2479,9 +2469,7 @@ fn strip_frozen_modifier(rest: &str) -> Option<String> {
     // Walk after `class ` to find the end of the class name (first non-id
     // character). Everything up through the name is the prefix we keep.
     let after_class = rest.strip_prefix("class ")?;
-    let name_end = after_class
-        .bytes()
-        .position(|b| !(b.is_ascii_alphanumeric() || b == b'_'))?;
+    let name_end = after_class.bytes().position(|b| !(is_ident_byte(b)))?;
     if name_end == 0 {
         return None;
     }
@@ -2525,7 +2513,7 @@ fn strip_frozen_modifier(rest: &str) -> Option<String> {
     // Reject `frozen` followed by an identifier character (e.g. `frozenset`)
     // so the modifier match is unambiguous.
     if let Some(next) = rest_after_mod.bytes().next() {
-        if next.is_ascii_alphanumeric() || next == b'_' {
+        if is_ident_byte(next) {
             return None;
         }
     }
@@ -2543,9 +2531,7 @@ fn strip_frozen_modifier(rest: &str) -> Option<String> {
 /// line untouched).
 fn reinsert_frozen_modifier(content: &str) -> Option<String> {
     let after_class = content.strip_prefix("class ")?;
-    let name_end = after_class
-        .bytes()
-        .position(|b| !(b.is_ascii_alphanumeric() || b == b'_'))?;
+    let name_end = after_class.bytes().position(|b| !(is_ident_byte(b)))?;
     if name_end == 0 {
         return None;
     }
@@ -2695,6 +2681,48 @@ fn rewrite_unsafe_block_line(rest: &str) -> Option<String> {
 /// Returns `None` when the line doesn't look like a class header (no `:`).
 /// An explicit base list (`enum X(int):`) is preserved by appending
 /// `enum.Enum` — but the canonical form has no bases.
+/// Python's reserved words, which can never be an enum member name.
+fn is_python_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "False"
+            | "None"
+            | "True"
+            | "and"
+            | "as"
+            | "assert"
+            | "async"
+            | "await"
+            | "break"
+            | "class"
+            | "continue"
+            | "def"
+            | "del"
+            | "elif"
+            | "else"
+            | "except"
+            | "finally"
+            | "for"
+            | "from"
+            | "global"
+            | "if"
+            | "import"
+            | "in"
+            | "is"
+            | "lambda"
+            | "nonlocal"
+            | "not"
+            | "or"
+            | "pass"
+            | "raise"
+            | "return"
+            | "try"
+            | "while"
+            | "with"
+            | "yield"
+    )
+}
+
 fn make_enum_class_line(after_enum: &str) -> Option<String> {
     let mut depth = 0i32;
     let mut colon_pos = None;
@@ -2711,11 +2739,62 @@ fn make_enum_class_line(after_enum: &str) -> Option<String> {
     }
     let colon_pos = colon_pos?;
     let name = after_enum[..colon_pos].trim_end();
-    let tail = &after_enum[colon_pos..]; // ":\n" or ":"
+    // `enum Color: RED; GREEN; BLUE` — the cheat-sheet one-liner. Each bare
+    // member on the header line becomes `MEMBER = enum.auto()`, joined with
+    // `;` so the header stays one physical line (the main loop is
+    // line-preserving); `NAME = value` and `pass` are kept as written.
+    let tail_owned;
+    let tail: &str = {
+        let raw_tail = &after_enum[colon_pos..];
+        let (inline, newline) = match raw_tail.find(['\n', '\r']) {
+            Some(nl) => (&raw_tail[1..nl], &raw_tail[nl..]),
+            None => (&raw_tail[1..], ""),
+        };
+        if inline.trim().is_empty() {
+            raw_tail
+        } else {
+            let members: Vec<String> = inline
+                .split(';')
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(|m| {
+                    let bare = m.chars().all(|c| c.is_alphanumeric() || c == '_')
+                        && m.chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                        && !is_python_keyword(m);
+                    if bare {
+                        format!("{m} = enum.auto()")
+                    } else {
+                        m.to_owned()
+                    }
+                })
+                .collect();
+            tail_owned = format!(": {}{}", members.join("; "), newline);
+            &tail_owned
+        }
+    };
     let new_name = if let Some(stripped) = name.strip_suffix(')') {
         let trimmed = stripped.trim_end();
+        // An explicit enum-family base (`enum Color(enum.Enum):`,
+        // `enum Level(IntEnum):`) already makes this an Enum; appending
+        // `enum.Enum` again gave CPython a duplicate base (`TypeError`).
+        let has_enum_base = trimmed
+            .rsplit_once('(')
+            .map(|(_, bases)| bases)
+            .unwrap_or("")
+            .split(',')
+            .map(|b| b.trim().rsplit('.').next().unwrap_or(""))
+            .any(|b| {
+                matches!(
+                    b,
+                    "Enum" | "IntEnum" | "StrEnum" | "Flag" | "IntFlag" | "ReprEnum"
+                )
+            });
         if trimmed.ends_with('(') {
             format!("{trimmed}enum.Enum)")
+        } else if has_enum_base {
+            format!("{trimmed})")
         } else {
             format!("{trimmed}, enum.Enum)")
         }
@@ -2751,10 +2830,21 @@ fn make_model_class_line(after_model: &str) -> Option<String> {
                                           // into the list.  Otherwise wrap with `(BaseModel)`.
     let new_name = if let Some(stripped) = name.strip_suffix(')') {
         // If the class had an empty base list `()`, stripped ends with `(`
-        // and we must not emit the separating `, `.
+        // and we must not emit the separating `, `. An explicit `BaseModel`
+        // base (`model X(BaseModel):`, `model X(pydantic.BaseModel):`) is
+        // already the model base — appending it again gave CPython a
+        // duplicate base (`TypeError`).
         let trimmed = stripped.trim_end();
+        let has_model_base = trimmed
+            .rsplit_once('(')
+            .map(|(_, bases)| bases)
+            .unwrap_or("")
+            .split(',')
+            .any(|b| b.trim().rsplit('.').next() == Some("BaseModel"));
         if trimmed.ends_with('(') {
             format!("{trimmed}BaseModel)")
+        } else if has_model_base {
+            format!("{trimmed})")
         } else {
             format!("{trimmed}, BaseModel)")
         }
@@ -3650,8 +3740,7 @@ fn questionmark_in_unhoistable_position(code: &str, q_idx: usize) -> Option<&'st
         if !code.is_char_boundary(idx) {
             return false;
         }
-        let prev_ok =
-            idx == 0 || !(bytes[idx - 1].is_ascii_alphanumeric() || bytes[idx - 1] == b'_');
+        let prev_ok = idx == 0 || !(is_ident_byte(bytes[idx - 1]));
         prev_ok
             && code[idx..].starts_with(kw)
             && code[idx + kw.len()..]
@@ -3768,7 +3857,7 @@ fn questionmark_precedes_ternary(code: &str, q_idx: usize) -> bool {
                 return false;
             }
             let prev = bytes[idx - 1];
-            !(prev.is_ascii_alphanumeric() || prev == b'_')
+            !(is_ident_byte(prev))
                 && code[idx..].starts_with(kw)
                 && code[idx + kw.len()..]
                     .chars()
@@ -3912,8 +4001,12 @@ fn is_word_for(bytes: &[u8], i: usize) -> bool {
     prev_ok && next_ok
 }
 
+/// Is `b` a byte that can occur inside a Python identifier? ASCII letters,
+/// digits and `_` — plus every non-ASCII byte: the scanners work on UTF-8
+/// bytes, and a non-ASCII letter (`café`, `größe`) is spelled with bytes
+/// `>= 0x80`, which can never be an operator or a bracket.
 fn is_ident_byte(b: u8) -> bool {
-    b == b'_' || b.is_ascii_alphanumeric()
+    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
 }
 
 /// Return `true` when `ret` is the `Result` identifier (bare or subscripted).
@@ -4173,19 +4266,33 @@ fn rewrite_one_checked_cast(source: &str) -> Option<Splice> {
             while type_start < bytes.len() && matches!(bytes[type_start], b' ' | b'\t') {
                 type_start += 1;
             }
-            if let Some(type_end) = find_cast_type_end(bytes, &skip, type_start) {
+            if let Some(mut type_end) = find_cast_type_end(bytes, &skip, type_start) {
+                // `EXPR as! T?` casts to the nullable type. The cast returns a
+                // value, never a `Result`, so a `?` here can only be the
+                // nullable marker — fold it into the target as `T | None`
+                // rather than leaving a stray `?` for the propagation pass.
+                let nullable = type_end < bytes.len() && !skip[type_end] && bytes[type_end] == b'?';
+                if nullable {
+                    type_end += 1;
+                }
                 if expr_start < i
                     && source.is_char_boundary(expr_start)
                     && source.is_char_boundary(type_end)
                 {
                     let expr_text = source[expr_start..i].trim();
-                    let type_text = source[type_start..type_end].trim();
+                    let type_text = source[type_start..type_end]
+                        .trim()
+                        .trim_end_matches('?')
+                        .trim_end();
                     if !expr_text.is_empty() && !type_text.is_empty() {
-                        let mut repl = String::with_capacity(expr_text.len() + 32);
+                        let mut repl = String::with_capacity(expr_text.len() + 40);
                         repl.push_str("__typhon_checked_cast__(");
                         repl.push_str(expr_text);
                         repl.push_str(", ");
                         repl.push_str(type_text);
+                        if nullable {
+                            repl.push_str(" | None");
+                        }
                         repl.push(')');
                         return Some(Splice {
                             start: expr_start,
@@ -4241,6 +4348,18 @@ fn find_cast_expr_start(bytes: &[u8], skip: &[bool], as_pos: usize) -> usize {
                 raw_start = j + 1;
                 break;
             }
+            // The `in` of a `for` header (or a containment test) opens the
+            // slot the cast occupies: `for x in data as! list[int]:` casts
+            // `data`, not `for x in data`.
+            b'n' if depth == 0
+                && j >= 2
+                && bytes[j - 1] == b'i'
+                && bytes[j - 2].is_ascii_whitespace()
+                && bytes.get(j + 1).is_some_and(u8::is_ascii_whitespace) =>
+            {
+                raw_start = j + 1;
+                break;
+            }
             _ => {}
         }
     }
@@ -4289,6 +4408,11 @@ fn strip_leading_value_keyword(bytes: &[u8], start: usize, as_pos: usize) -> usi
         b"while ",
         b"assert ",
         b"raise ",
+        b"with ",
+        b"match ",
+        b"del ",
+        b"not ",
+        b"await ",
     ] {
         if as_pos - s >= kw.len() && &bytes[s..s + kw.len()] == kw {
             return s + kw.len();
@@ -4310,10 +4434,7 @@ fn find_cast_type_end(bytes: &[u8], skip: &[bool], type_start: usize) -> Option<
             i += 1;
         }
         let name_start = i;
-        while i < len
-            && !skip[i]
-            && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'.')
-        {
+        while i < len && !skip[i] && (is_ident_byte(bytes[i]) || bytes[i] == b'.') {
             i += 1;
         }
         if i == name_start {
@@ -4468,7 +4589,7 @@ fn try_rewrite_rescue_at(
     let name_start = p;
     if p < bytes.len() && (bytes[p].is_ascii_alphabetic() || bytes[p] == b'_') {
         p += 1;
-        while p < bytes.len() && (bytes[p].is_ascii_alphanumeric() || bytes[p] == b'_') {
+        while p < bytes.len() && (is_ident_byte(bytes[p])) {
             p += 1;
         }
     } else {
@@ -4667,7 +4788,9 @@ fn expand_rescue_blocks_once(source: &str) -> (String, Vec<usize>) {
                 let lr = lines[j].trim_end_matches(['\n', '\r']);
                 let in_str_before = suite_state.is_some();
                 let _ = scan_line_code_end(lr, &mut suite_state);
-                let is_blank = lr.trim().is_empty();
+                // A comment-only line (a column-zero `# note` included) is
+                // layout inside the suite, like a blank line.
+                let is_blank = lr.trim().is_empty() || lr.trim_start().starts_with('#');
                 let l_indent = lr.find(|c: char| !c.is_whitespace()).unwrap_or(lr.len());
                 if !in_str_before && !is_blank && l_indent <= indent_len {
                     break; // dedented to/below the header — the suite has ended
@@ -4733,7 +4856,7 @@ fn parse_rescue_block_header(body: &str) -> Option<(String, String)> {
         return None;
     }
     let mut k = 1;
-    while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
+    while k < bytes.len() && (is_ident_byte(bytes[k])) {
         k += 1;
     }
     let name = &rest[..k];
@@ -4780,7 +4903,25 @@ pub fn expand_typed_let_unpack(source: &str) -> String {
 }
 
 /// [`expand_typed_let_unpack`] plus an output-line → input-line table.
+/// The text every pipeline actually works on: without a leading UTF-8
+/// byte-order mark, and ending in a newline.
+fn normalise_source_text(source: &str) -> std::borrow::Cow<'_, str> {
+    let stripped = source.strip_prefix('\u{feff}').unwrap_or(source);
+    if stripped.is_empty() || stripped.ends_with('\n') {
+        std::borrow::Cow::Borrowed(stripped)
+    } else {
+        std::borrow::Cow::Owned(format!("{stripped}\n"))
+    }
+}
+
 pub fn expand_typed_let_unpack_mapped(source: &str) -> (String, Vec<usize>) {
+    // Every sugar chain starts here; a UTF-8 byte-order mark left on the
+    // first line would be pushed *below* an injected runtime import by a
+    // later pass and become a stray token mid-file, and a final line with no
+    // terminator would have generated code glued onto it. Both are
+    // normalised once, up front (adding a terminator does not add a line).
+    let normalised = normalise_source_text(source);
+    let source: &str = &normalised;
     let mut out = MappedOut::with_capacity(source.len());
     let mut counter: usize = 0;
     let mut in_string: Option<StringMode> = None;
@@ -5194,11 +5335,26 @@ fn expand_lazy_imports_with(source: &str, rewrite_imports: bool) -> (String, Vec
         // so a `lazy let` inside is recognised as a class-body binding.
         // The body of the block sits at a deeper indent than `indent_len`,
         // so subsequent lines compare against `indent_len`.
-        if let Some(rest) = trimmed.strip_prefix("class ") {
+        // Every header that lowers to a class body counts: `class X:`,
+        // `class! X:`, `plain class X:`, `model X:`, `interface X:`, and the
+        // generic `impl[T] X[T]:` alongside `impl X:`. Missing `class!` here
+        // made a `lazy let` inside a raw class fall through unchanged, where
+        // the `let` strip then turned it into an *eager* dataclass field
+        // default — evaluated once, at class creation.
+        let class_header = trimmed
+            .strip_prefix("class ")
+            .or_else(|| trimmed.strip_prefix("class!"))
+            .or_else(|| trimmed.strip_prefix("plain class "))
+            .or_else(|| trimmed.strip_prefix("model "))
+            .or_else(|| trimmed.strip_prefix("interface "));
+        if let Some(rest) = class_header {
             if rest.contains(':') {
                 block_stack.push((indent_len, true));
             }
-        } else if let Some(rest) = trimmed.strip_prefix("impl ") {
+        } else if let Some(rest) = trimmed
+            .strip_prefix("impl ")
+            .or_else(|| trimmed.strip_prefix("impl["))
+        {
             if rest.contains(':') {
                 block_stack.push((indent_len, true));
             }
@@ -5798,13 +5954,19 @@ fn expand_question_ops_inner(source: &str) -> (String, Vec<usize>) {
                 // where `?` is nullable-type sugar (`type Maybe = int?` ⇒
                 // `type Maybe = int | None`).
                 Some(l) => {
+                    // `pub` stacks with `type` / `newtype`; look past it.
+                    let l = l.trim_start().strip_prefix("pub ").unwrap_or(l);
                     let first = first_word(l);
                     first.as_deref() != Some("type") && first.as_deref() != Some("newtype")
                 }
-                // No assignment → either a type annotation (`let x: T?`) on
-                // its own line, or a bare statement form the inline-`?` pass
-                // should have handled. Leave the line untouched.
-                None => false,
+                // No assignment → a type annotation (`let x: T?`) on its own
+                // line is left alone, but a `return` / `yield` value is value
+                // position (`return xs[0]?`, `yield cache[k]?`).
+                None => {
+                    rhs.starts_with("return ")
+                        || rhs.starts_with("yield ")
+                        || rhs.starts_with("yield from ")
+                }
             };
             if !is_value_position {
                 // No assignment AND no value-position keyword → leave alone
@@ -5934,12 +6096,241 @@ pub fn expand_compound_question_headers(source: &str) -> String {
     expand_compound_question_headers_mapped(source).0
 }
 
+/// The full sugar-expansion chain every surface runs before [`preprocess`],
+/// with the composed `output line → input line` table. `rewrite_lazy_imports`
+/// selects [`expand_lazy_imports_mapped`] (pre-3.15 targets, `tyc check`) or
+/// [`expand_lazy_lets_mapped`] (3.15+ builds, the VM) as the lazy pass.
+pub fn expand_sugar_mapped(source: &str, rewrite_lazy_imports: bool) -> (String, Vec<usize>) {
+    fn step(stage: &mut (String, Vec<usize>), pass: fn(&str) -> (String, Vec<usize>)) {
+        let (text, map) = pass(&stage.0);
+        stage.1 = compose_line_maps(&map, &stage.1);
+        stage.0 = text;
+    }
+    let mut stage = expand_typed_let_unpack_mapped(source);
+    if rewrite_lazy_imports {
+        step(&mut stage, expand_lazy_imports_mapped);
+    } else {
+        step(&mut stage, expand_lazy_lets_mapped);
+    }
+    step(&mut stage, expand_multiline_guards_mapped);
+    step(&mut stage, expand_gather_blocks_mapped);
+    step(&mut stage, expand_go_calls_mapped);
+    step(&mut stage, expand_with_chains_mapped);
+    step(&mut stage, expand_pipes_mapped);
+    step(&mut stage, expand_compound_question_headers_mapped);
+    step(&mut stage, expand_inline_question_ops_mapped);
+    step(&mut stage, expand_question_ops_mapped);
+    stage
+}
+
+/// [`expand_sugar_mapped`] without the line table.
+pub fn expand_sugar(source: &str, rewrite_lazy_imports: bool) -> String {
+    expand_sugar_mapped(source, rewrite_lazy_imports).0
+}
+
+/// The compound-statement keywords whose one-line form (`if C: S`) is
+/// expanded by [`expand_question_one_liners`].
+const ONE_LINER_HEADERS: &[&str] = &[
+    "if ", "elif ", "else", "for ", "while ", "with ", "try", "except", "finally", "def ",
+    "async ", "case ", "match ",
+];
+
+/// Does the code portion of a line carry a *propagating* `)?` outside any
+/// string literal? (`T?` nullable sugar never follows a `)`.)
+fn code_has_propagation_q(code: &str) -> bool {
+    let mask = compute_in_string_mask(code);
+    let bytes = code.as_bytes();
+    (1..bytes.len()).any(|i| {
+        if bytes[i] != b'?' || mask[i] || mask[i - 1] {
+            return false;
+        }
+        let prev = bytes[i - 1];
+        prev == b')'
+            || ((prev == b']' || is_ident_byte(prev))
+                && !question_is_type_position(code, i, &mask)
+                && operand_start(code, i).is_some())
+    })
+}
+
+/// Byte position of the colon that ends a compound header, when `code` is a
+/// one-line compound statement (`if flag: x = f()?`): the first `:` at
+/// bracket depth zero outside strings that is not part of `:=` and is followed
+/// by further code. A header colon at end of line (an ordinary block header)
+/// yields `None`.
+fn one_liner_header_colon(code: &str) -> Option<usize> {
+    let trimmed = code.trim_start();
+    if !ONE_LINER_HEADERS.iter().any(|kw| trimmed.starts_with(kw)) {
+        return None;
+    }
+    // `else`, `try`, `finally` (and `except`) must be the whole keyword, not a
+    // prefix of an identifier such as `elsewhere = f()?`.
+    let head_ok = trimmed
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .next()
+        .is_some_and(|w| {
+            matches!(
+                w,
+                "if" | "elif"
+                    | "else"
+                    | "for"
+                    | "while"
+                    | "with"
+                    | "try"
+                    | "except"
+                    | "finally"
+                    | "def"
+                    | "async"
+                    | "case"
+                    | "match"
+            )
+        });
+    if !head_ok {
+        return None;
+    }
+    let mask = compute_in_string_mask(code);
+    let bytes = code.as_bytes();
+    let mut depth = 0i32;
+    for i in 0..bytes.len() {
+        if mask[i] {
+            continue;
+        }
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b':' if depth == 0 => {
+                if bytes.get(i + 1) == Some(&b'=') {
+                    continue;
+                }
+                let rest = code[i + 1..].trim();
+                return if rest.is_empty() { None } else { Some(i) };
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Positions of the top-level `;` statement separators in `code`, outside
+/// strings and brackets.
+fn top_level_semicolons(code: &str) -> Vec<usize> {
+    let mask = compute_in_string_mask(code);
+    let bytes = code.as_bytes();
+    let mut depth = 0i32;
+    let mut out = Vec::new();
+    for i in 0..bytes.len() {
+        if mask[i] {
+            continue;
+        }
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b';' if depth == 0 => out.push(i),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Put every statement that carries a propagating `?` on its own line, at its
+/// own nesting: a one-line compound statement (`if flag: x = parse(s)?`,
+/// `for s in xs: total += parse(s)?`) becomes a header plus an indented body,
+/// and `;`-joined statements (`let a: int = f()?; let b: int = g()?`) are
+/// split onto separate lines.
+///
+/// The `?` lowerings hoist a temp binding and an `Err` guard onto the lines
+/// *before* the statement, at the statement's indentation. On a one-liner that
+/// put the fallible call above the header — evaluated unconditionally, once,
+/// outside the loop — and on a `;` line it swallowed the whole line as one
+/// statement. Splitting first is semantics-preserving (the forms are
+/// equivalent by definition), so the existing lowerings then land inside the
+/// right block. Lines without a propagating `?` are left exactly as written.
+pub fn expand_question_one_liners(source: &str) -> String {
+    expand_question_one_liners_mapped(source).0
+}
+
+/// [`expand_question_one_liners`] plus an output-line → input-line table.
+pub fn expand_question_one_liners_mapped(source: &str) -> (String, Vec<usize>) {
+    let mut out = MappedOut::with_capacity(source.len() + 64);
+    let mut in_string: Option<StringMode> = None;
+    for (line_index, line) in source.split_inclusive('\n').enumerate() {
+        out.mark(line_index);
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let pre_string = in_string;
+        let code_end = scan_line_code_end(raw, &mut in_string);
+        if pre_string.is_some() {
+            out.push_str(line);
+            continue;
+        }
+        let code = raw[..code_end].trim_end();
+        // The trailing comment keeps the whitespace that separated it.
+        let comment = raw[code.len()..].trim_end();
+        let nl = if line.ends_with('\n') { "\n" } else { "" };
+        if !code_has_propagation_q(code) {
+            out.push_str(line);
+            continue;
+        }
+        let indent_len = code.len() - code.trim_start().len();
+        let indent = &code[..indent_len];
+        let unit = if indent.contains('\t') { "\t" } else { "    " };
+
+        // Statements to emit, each already carrying its indentation.
+        let mut pieces: Vec<String> = Vec::new();
+        let (header, body) = match one_liner_header_colon(code) {
+            Some(colon) => (Some(&code[..=colon]), code[colon + 1..].trim().to_owned()),
+            None => (None, code.trim_start().to_owned()),
+        };
+        let body_indent = match header {
+            Some(h) => {
+                pieces.push(format!("{h}{comment}"));
+                format!("{indent}{unit}")
+            }
+            None => indent.to_owned(),
+        };
+        let semis = top_level_semicolons(&body);
+        if semis.is_empty() {
+            pieces.push(format!("{body_indent}{body}"));
+        } else {
+            let mut start = 0;
+            for pos in semis.iter().copied().chain(std::iter::once(body.len())) {
+                let stmt = body[start..pos.min(body.len())].trim();
+                if !stmt.is_empty() {
+                    pieces.push(format!("{body_indent}{stmt}"));
+                }
+                start = (pos + 1).min(body.len());
+            }
+        }
+        if header.is_none() && semis.is_empty() {
+            out.push_str(line);
+            continue;
+        }
+        if header.is_none() {
+            // The comment stays on the last of the split statements.
+            if let Some(last) = pieces.last_mut() {
+                last.push_str(comment);
+            }
+        }
+        let count = pieces.len();
+        for (k, piece) in pieces.into_iter().enumerate() {
+            out.push_str(&piece);
+            if k + 1 < count {
+                out.push('\n');
+            } else {
+                out.push_str(nl);
+            }
+        }
+    }
+    out.finish()
+}
+
 /// [`expand_compound_question_headers`] plus an output-line → input-line
 /// table.
 pub fn expand_compound_question_headers_mapped(source: &str) -> (String, Vec<usize>) {
+    // One-line compound statements (`while f()?: n += 1`) must be header +
+    // body before the header rewrite can see the condition on its own.
+    let (current, map) = expand_question_one_liners_mapped(source);
     // Fixpoint: rewriting an outer `elif` can expose a nested one.
-    let mut current = source.to_owned();
-    let mut map = identity_line_map(text_line_count(source));
+    let mut current = current;
+    let mut map = map;
     for _ in 0..64 {
         match rewrite_first_compound_question_header(&current) {
             Some((next, step_map)) => {
@@ -5985,7 +6376,27 @@ fn rewrite_first_compound_question_header(source: &str) -> Option<(String, Vec<u
             continue;
         }
         let indent = indent_width(line);
-        let pad = " ".repeat(indent);
+        // Reproduce the header's own leading whitespace (tabs included) and
+        // derive the file's indentation step from the first body line, so a
+        // 2-space or tab-indented file nests correctly: the generated lines
+        // must sit exactly one step inside the header, not four spaces.
+        let pad = line[..indent].to_owned();
+        let is_comment_line = |l: &str| l.trim_start().starts_with('#');
+        let body_indent = lines[i + 1..]
+            .iter()
+            .enumerate()
+            .find(|(k, l)| {
+                !mask.line_starts_in_string(i + 1 + k)
+                    && !l.trim().is_empty()
+                    && !is_comment_line(l)
+                    && indent_width(l) > indent
+            })
+            .map(|(_, l)| l[..indent_width(l)].to_owned());
+        let unit = match &body_indent {
+            Some(b) if b.starts_with(&pad) && b.len() > pad.len() => b[pad.len()..].to_owned(),
+            _ if pad.contains('\t') => "\t".to_owned(),
+            _ => "    ".to_owned(),
+        };
         let keyword_len = if is_elif {
             "elif ".len()
         } else {
@@ -6006,7 +6417,9 @@ fn rewrite_first_compound_question_header(source: &str) -> Option<(String, Vec<u
         let mut end = i + 1;
         while end < lines.len() {
             let l = lines[end];
-            if mask.line_starts_in_string(end) || l.trim().is_empty() {
+            // Blank and comment-only lines (a column-zero `# note` included)
+            // are layout inside the block, never the dedent that ends it.
+            if mask.line_starts_in_string(end) || l.trim().is_empty() || is_comment_line(l) {
                 end += 1;
                 continue;
             }
@@ -6023,6 +6436,39 @@ fn rewrite_first_compound_question_header(source: &str) -> Option<(String, Vec<u
             break;
         }
 
+        // A `while … else:` arm runs when the condition becomes false — which
+        // after the rewrite is exactly the `if not (COND):` branch. Move the
+        // arm's body in there (ahead of the `break`); left where it was, it
+        // would hang off `while True:` and never run, because the rewritten
+        // loop only ever exits through `break`.
+        let mut else_body: Vec<(usize, &str)> = Vec::new();
+        let mut else_end = end;
+        if is_while
+            && end < lines.len()
+            && !mask.line_starts_in_string(end)
+            && indent_width(lines[end]) == indent
+            && lines[end].trim_start().starts_with("else")
+            && lines[end].trim_start()["else".len()..]
+                .trim_start()
+                .starts_with(':')
+        {
+            let mut k = end + 1;
+            while k < lines.len() {
+                let l = lines[k];
+                if mask.line_starts_in_string(k)
+                    || l.trim().is_empty()
+                    || is_comment_line(l)
+                    || indent_width(l) > indent
+                {
+                    else_body.push((k, l));
+                    k += 1;
+                } else {
+                    break;
+                }
+            }
+            else_end = k;
+        }
+
         let mut out: Vec<String> = lines[..i].iter().map(|s| (*s).to_owned()).collect();
         // Provenance runs in lock-step with `out`: the synthesised header
         // lines belong to the `elif` / `while` the user wrote, and every
@@ -6030,15 +6476,24 @@ fn rewrite_first_compound_question_header(source: &str) -> Option<(String, Vec<u
         let mut src: Vec<usize> = (0..i).collect();
         if is_elif {
             out.push(format!("{pad}else:"));
-            out.push(format!("{pad}    if {cond}:{trailing}"));
+            out.push(format!("{pad}{unit}if {cond}:{trailing}"));
             src.push(i);
             src.push(i);
         } else {
             out.push(format!("{pad}while True:"));
-            out.push(format!("{pad}    if not ({cond}):{trailing}"));
-            out.push(format!("{pad}        break"));
+            out.push(format!("{pad}{unit}if not ({cond}):{trailing}"));
             src.push(i);
             src.push(i);
+            for (idx, l) in &else_body {
+                // The arm's body moves one step deeper (under the `if not`).
+                src.push(*idx);
+                if mask.line_starts_in_string(*idx) || l.trim().is_empty() {
+                    out.push((*l).to_owned());
+                } else {
+                    out.push(format!("{unit}{l}"));
+                }
+            }
+            out.push(format!("{pad}{unit}{unit}break"));
             src.push(i);
         }
         for (j, l) in lines[i + 1..end].iter().enumerate() {
@@ -6048,13 +6503,13 @@ fn rewrite_first_compound_question_header(source: &str) -> Option<(String, Vec<u
             if mask.line_starts_in_string(idx) || l.trim().is_empty() {
                 out.push((*l).to_owned());
             } else if is_elif {
-                out.push(format!("    {l}"));
+                out.push(format!("{unit}{l}"));
             } else {
                 out.push((*l).to_owned());
             }
         }
-        out.extend(lines[end..].iter().map(|s| (*s).to_owned()));
-        src.extend(end..lines.len());
+        out.extend(lines[else_end..].iter().map(|s| (*s).to_owned()));
+        src.extend(else_end..lines.len());
         let text = out.join("\n");
         // `split('\n')` yields one more element than `split_inclusive` when
         // the text ends in a newline (the trailing empty piece). Trim the
@@ -6109,6 +6564,17 @@ pub fn expand_inline_question_ops(source: &str) -> String {
 
 /// [`expand_inline_question_ops`] plus an output-line → input-line table.
 pub fn expand_inline_question_ops_mapped(source: &str) -> (String, Vec<usize>) {
+    // Every pipeline runs this pass, so it is where a one-line compound
+    // statement or a `;`-joined line carrying a `?` is split first (a no-op
+    // when the compound-header rewrite already ran). The lift below places
+    // its guard at the statement's own indentation, which is only right once
+    // each statement owns a line.
+    let (split, split_map) = expand_question_one_liners_mapped(source);
+    let (text, map) = expand_inline_question_ops_split(&split);
+    (text, compose_line_maps(&map, &split_map))
+}
+
+fn expand_inline_question_ops_split(source: &str) -> (String, Vec<usize>) {
     let mut out = MappedOut::with_capacity(source.len() + 64);
     let mut counter = 0usize;
     let mut in_string: Option<StringMode> = None;
@@ -6173,19 +6639,13 @@ fn rewrite_inline_question_ops_one_line(
     let mut current = content.to_owned();
 
     while let Some(q_pos) = find_first_inline_propagation_q(&current) {
-        let close_paren = q_pos - 1;
-        let open = match find_matching_open_paren(&current, close_paren) {
-            Some(o) => o,
-            None => break,
-        };
-        let call_start = find_callable_start(&current, open);
-        if call_start == open {
-            // The `(` has no callable to its left — this is a
-            // parenthesised expression like `(a + b)?`, not a call.
-            // Skipping keeps the diagnostic crisp instead of emitting
-            // a `(a + b).value` that runs but means the wrong thing.
+        // The operand is a call, a subscript or a dotted name; a
+        // parenthesised expression (`(a + b)?`) is skipped so the diagnostic
+        // stays crisp instead of emitting an `(a + b).value` that runs but
+        // means the wrong thing.
+        let Some(call_start) = operand_start(&current, q_pos) else {
             break;
-        }
+        };
         let call_text = current[call_start..q_pos].to_owned();
 
         // Use a distinct prefix from the end-of-line pass's
@@ -6233,15 +6693,27 @@ fn find_first_inline_propagation_q(s: &str) -> Option<usize> {
     // state on each individual quote and unmask a `?` that lives inside
     // the literal. Gemini review on PR #96.
     let in_str_mask = compute_in_string_mask(s);
-    for i in 0..bytes.len() {
-        if in_str_mask[i] {
+    for i in 1..bytes.len() {
+        if in_str_mask[i] || bytes[i] != b'?' || in_str_mask[i - 1] {
             continue;
         }
-        if bytes[i] == b'?' && i > 0 && bytes[i - 1] == b')' && !in_str_mask[i - 1] {
-            let is_trailing = i + 1 >= trimmed_end;
-            if !is_trailing || trailing_q_has_binary_prefix(s, i, &in_str_mask) {
-                return Some(i);
-            }
+        let prev = bytes[i - 1];
+        let after_call = prev == b')';
+        // A subscript or a bare name may also be propagated (`d[k]? + 1`,
+        // `self.cache? or default`) — but only in value position; after a
+        // `]` or an identifier the same `?` is more often `T?` sugar.
+        let after_operand = prev == b']' || is_ident_byte(prev);
+        let propagating =
+            after_call || (after_operand && !question_is_type_position(s, i, &in_str_mask));
+        if !propagating {
+            continue;
+        }
+        if operand_start(s, i).is_none() {
+            continue;
+        }
+        let is_trailing = i + 1 >= trimmed_end;
+        if !is_trailing || trailing_q_has_binary_prefix(s, i, &in_str_mask) {
+            return Some(i);
         }
     }
     None
@@ -6253,15 +6725,10 @@ fn find_first_inline_propagation_q(s: &str) -> Option<usize> {
 /// Walks left from the matching `(` over the callable, then looks for a
 /// top-level binary operator between the value start and that call.
 fn trailing_q_has_binary_prefix(s: &str, q_pos: usize, in_str_mask: &[bool]) -> bool {
-    let close_paren = q_pos - 1;
-    let Some(open) = find_matching_open_paren(s, close_paren) else {
-        return false;
-    };
-    let call_start = find_callable_start(s, open);
-    if call_start == open {
+    let Some(call_start) = operand_start(s, q_pos) else {
         // `(a + b)?` — a parenthesised expression, not a call. Leave it.
         return false;
-    }
+    };
     // The value begins after an assignment `=`, a `return`/`yield` keyword, or
     // the first non-whitespace char. Anything between there and `call_start`
     // that contains a top-level operator means the call is a sub-operand.
@@ -6302,30 +6769,216 @@ fn trailing_q_has_binary_prefix(s: &str, q_pos: usize, in_str_mask: &[bool]) -> 
 /// Walk backwards from `close_pos` (position of `)`) to find the matching
 /// `(`. Skips parens inside string literals (scanned forwards once to
 /// build a string-range mask).
-fn find_matching_open_paren(s: &str, close_pos: usize) -> Option<usize> {
+/// Walk backwards from `close_pos` (position of a `close` byte) to find the
+/// matching `open` byte, ignoring brackets inside string literals.
+fn find_matching_open(s: &str, close_pos: usize, open: u8, close: u8) -> Option<usize> {
     let bytes = s.as_bytes();
-    // Mark every byte that's inside a string literal so the depth
-    // counter doesn't count parens inside `"f(("`.
     let in_str_mask = compute_in_string_mask(s);
     let mut depth: i32 = 0;
     let mut i = close_pos;
     loop {
         if !in_str_mask[i] {
-            match bytes[i] {
-                b')' => depth += 1,
-                b'(' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(i);
-                    }
+            if bytes[i] == close {
+                depth += 1;
+            } else if bytes[i] == open {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
                 }
-                _ => {}
             }
         }
         if i == 0 {
             return None;
         }
         i -= 1;
+    }
+}
+
+/// Is the `?` at `q_pos` nullable-type sugar (`T?`) rather than a propagating
+/// operator? A `?` is in *type position* when the line is a `type` / `newtype`
+/// alias, when it sits in a `def` header (a parameter or return annotation),
+/// when it completes an `as!` cast target, or when it lies in the annotation
+/// of an annotated binding (`let x: T? = …`, `field: T?`) — between the first
+/// top-level `:` and the top-level `=`. Everything else — the right-hand side
+/// of an assignment, a call argument, a `return` value, an operand — is value
+/// position.
+fn question_is_type_position(code: &str, q_pos: usize, mask: &[bool]) -> bool {
+    let trimmed = code.trim_start();
+    // `pub` is a visibility modifier that stacks with `type` / `newtype` /
+    // `def`; look past it (`pub type Pick = Callable[[A], B?]`).
+    let after_pub = trimmed.strip_prefix("pub ").unwrap_or(trimmed).trim_start();
+    let head = after_pub
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .next()
+        .unwrap_or("");
+    if matches!(head, "type" | "newtype") {
+        return true;
+    }
+    if after_pub.starts_with("def ") || after_pub.starts_with("async def ") {
+        // Everything up to the header's colon is signature; a one-line body
+        // after it is value position.
+        return match last_top_level_colon(code, mask) {
+            Some(colon) => q_pos < colon,
+            None => true,
+        };
+    }
+    // A return annotation — including the `) -> T?:` line that closes a
+    // multi-line `def` header, which has no `def` of its own.
+    if let Some(arrow) = code[..q_pos].rfind("->") {
+        if !mask[arrow] && !code[arrow + 2..q_pos].contains(':') {
+            return true;
+        }
+    }
+    if let Some(cast) = code[..q_pos].rfind("as!") {
+        let between = &code[cast + 3..q_pos];
+        if between
+            .chars()
+            .all(|c| c.is_alphanumeric() || " _[].,|".contains(c))
+        {
+            return true;
+        }
+    }
+    if let Some((colon, eq)) = annotation_span(code, mask) {
+        if q_pos > colon && eq.is_none_or(|e| q_pos < e) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The last `:` at bracket depth zero outside strings (a `def` header's colon).
+fn last_top_level_colon(code: &str, mask: &[bool]) -> Option<usize> {
+    let bytes = code.as_bytes();
+    let mut depth = 0i32;
+    let mut last = None;
+    for i in 0..bytes.len() {
+        if mask[i] {
+            continue;
+        }
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b':' if depth == 0 && bytes.get(i + 1) != Some(&b'=') => last = Some(i),
+            _ => {}
+        }
+    }
+    last
+}
+
+/// For an annotated binding (`let x: T = v`, `mut x: T`, `field: T = v`,
+/// `self.x: T = v`), the byte positions of the annotation's `:` and of the
+/// top-level `=` that ends it (`None` when there is no initialiser). `None`
+/// altogether when the text before the first top-level `:` is not a plain
+/// binding target — a compound header (`if x?:`), a lambda, a dict display.
+fn annotation_span(code: &str, mask: &[bool]) -> Option<(usize, Option<usize>)> {
+    let bytes = code.as_bytes();
+    let mut depth = 0i32;
+    let mut colon = None;
+    for i in 0..bytes.len() {
+        if mask[i] {
+            continue;
+        }
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b':' if depth == 0 => {
+                if bytes.get(i + 1) == Some(&b'=') {
+                    return None;
+                }
+                colon = Some(i);
+                break;
+            }
+            b'=' if depth == 0 => return None,
+            _ => {}
+        }
+    }
+    let colon = colon?;
+    let target = code[..colon].trim();
+    let target = ["pub ", "comptime ", "freeze ", "lazy ", "let ", "mut "]
+        .iter()
+        .fold(target, |t, kw| {
+            t.strip_prefix(kw).map(str::trim_start).unwrap_or(t)
+        });
+    if target.is_empty()
+        || !target
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+        || target.chars().next().is_some_and(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    // The initialiser's `=`: a lone `=` at depth zero after the colon.
+    let mut depth = 0i32;
+    let mut i = colon + 1;
+    while i < bytes.len() {
+        if !mask[i] {
+            match bytes[i] {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                b'=' if depth == 0 => {
+                    let prev = bytes[i - 1];
+                    let next = bytes.get(i + 1).copied();
+                    if !matches!(prev, b'=' | b'!' | b'<' | b'>' | b':') && next != Some(b'=') {
+                        return Some((colon, Some(i)));
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    Some((colon, None))
+}
+
+/// Start of the operand a propagating `?` at `q_pos` applies to: the callable
+/// of a call (`f(x)?`), the receiver of a subscript (`d[k]?`), or a dotted
+/// name (`self.cache?`). `None` when the `?` follows a parenthesised
+/// expression rather than a call (`(a + b)?` — left alone so the diagnostic
+/// stays crisp) or nothing recognisable.
+fn operand_start(s: &str, q_pos: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if q_pos == 0 {
+        return None;
+    }
+    match bytes[q_pos - 1] {
+        b')' => {
+            let open = find_matching_open(s, q_pos - 1, b'(', b')')?;
+            let start = find_callable_start(s, open);
+            (start != open).then_some(start)
+        }
+        b']' => {
+            let open = find_matching_open(s, q_pos - 1, b'[', b']')?;
+            let start = find_callable_start(s, open);
+            (start != open).then_some(start)
+        }
+        b if is_ident_byte(b) => {
+            let mut i = q_pos - 1;
+            while i > 0 && (is_ident_byte(bytes[i - 1]) || bytes[i - 1] == b'.') {
+                i -= 1;
+            }
+            let word = &s[i..q_pos];
+            // A keyword or literal is not an operand (`None?`, `True?`).
+            let bare = word.rsplit('.').next().unwrap_or(word);
+            if matches!(
+                bare,
+                "None"
+                    | "True"
+                    | "False"
+                    | "return"
+                    | "yield"
+                    | "not"
+                    | "and"
+                    | "or"
+                    | "in"
+                    | "is"
+                    | "lambda"
+            ) || bare.chars().next().is_some_and(|c| c.is_ascii_digit())
+            {
+                return None;
+            }
+            Some(i)
+        }
+        _ => None,
     }
 }
 
@@ -6344,7 +6997,7 @@ fn find_callable_start(s: &str, open_pos: usize) -> usize {
         if in_str_mask[i - 1] {
             break;
         }
-        if b.is_ascii_alphanumeric() || b == b'_' || b == b'.' {
+        if is_ident_byte(b) || b == b'.' {
             i -= 1;
             continue;
         }
@@ -6832,6 +7485,21 @@ pub fn expand_with_chains(source: &str) -> String {
 
 /// [`expand_with_chains`] plus an output-line → input-line table.
 pub fn expand_with_chains_mapped(source: &str) -> (String, Vec<usize>) {
+    // A chain nested inside another chain's success body is only visible
+    // once the outer chain has been rendered, so run to a fixpoint (bounded).
+    let (mut current, mut map) = expand_with_chains_once_mapped(source);
+    for _ in 0..16 {
+        let (next, step) = expand_with_chains_once_mapped(&current);
+        if next == current {
+            break;
+        }
+        map = compose_line_maps(&step, &map);
+        current = next;
+    }
+    (current, map)
+}
+
+fn expand_with_chains_once_mapped(source: &str) -> (String, Vec<usize>) {
     let mut out = MappedOut::with_capacity(source.len());
     let mut counter: usize = 0;
     let lines: Vec<&str> = source.split_inclusive('\n').collect();
@@ -7104,7 +7772,7 @@ fn collect_chain(
         // The same flag is handed to `render_chain`, so the boundary test and
         // the re-indent can never disagree about which lines are content.
         let starts_in_string = mask.line_starts_in_string(idx);
-        if !starts_in_string && !raw.trim().is_empty() {
+        if !starts_in_string && !raw.trim().is_empty() && !raw.trim_start().starts_with('#') {
             let indent_len = raw.find(|c: char| !c.is_whitespace()).unwrap_or(raw.len());
             if indent_len <= chain_indent.len() {
                 break;
@@ -7154,7 +7822,7 @@ fn collect_chain(
                 let l = lines[idx];
                 let r = l.trim_end_matches(['\n', '\r']);
                 let starts_in_string = mask.line_starts_in_string(idx);
-                if !starts_in_string && !r.trim().is_empty() {
+                if !starts_in_string && !r.trim().is_empty() && !r.trim_start().starts_with('#') {
                     let ind = r.find(|c: char| !c.is_whitespace()).unwrap_or(r.len());
                     if ind <= chain_indent.len() {
                         break;
@@ -7201,7 +7869,7 @@ fn parse_else_var(header: &str) -> Option<String> {
         {
             return None;
         }
-        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        if !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
             return None;
         }
         Some(name.to_owned())
@@ -7291,7 +7959,7 @@ fn utf8_char_len(bytes: &[u8], i: usize) -> usize {
 }
 
 fn is_ident_continuation(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
+    is_ident_byte(b)
 }
 
 fn render_chain(
@@ -7498,6 +8166,28 @@ pub fn expand_gather_blocks_mapped(source: &str) -> (String, Vec<usize>) {
         let header_indent = &raw[..indent_len];
         let body = &raw[indent_len..];
 
+        if let Some((strategy, stmts)) = parse_inline_gather_header(body) {
+            let bindings: Option<Vec<GatherBinding>> = stmts
+                .iter()
+                .map(|stmt| {
+                    let eq = find_assignment_eq(stmt)?;
+                    let name = stmt[..eq].trim().to_owned();
+                    let expr = strip_leading_await(stmt[eq + 1..].trim());
+                    (is_python_ident(&name) && !expr.is_empty()).then_some(GatherBinding {
+                        name,
+                        expr,
+                        src_line: i,
+                    })
+                })
+                .collect();
+            if let Some(bindings) = bindings {
+                let (rendered, rendered_src) =
+                    render_gather_block(&bindings, header_indent, strategy, &mut counter);
+                out.push_mapped(&rendered, &rendered_src);
+                i += 1;
+                continue;
+            }
+        }
         let parsed = parse_gather_header(body);
         if let Some(strategy) = parsed {
             if let Some((bindings, consumed)) =
@@ -7539,6 +8229,32 @@ fn strip_trailing_comment_outside_strings(s: &str) -> &str {
 
 /// Parse a `gather:` or `gather(strategy="..."):` header line, returning the
 /// chosen strategy when the syntax is well-formed.
+/// A `gather:` header that carries its bindings inline
+/// (`gather: a = f1(); b = f2()`) — the cheat-sheet one-liner. Returns the
+/// strategy and the `;`-separated statements after the colon.
+fn parse_inline_gather_header(body: &str) -> Option<(GatherStrategy, Vec<&str>)> {
+    let body = strip_trailing_comment_outside_strings(body).trim_end();
+    let header_end = if body.starts_with("gather:") {
+        "gather:".len()
+    } else if body.starts_with("gather(") {
+        // `gather(strategy="…"): a = f(); b = g()`
+        body.find("):")? + 2
+    } else {
+        return None;
+    };
+    let inline = body[header_end..].trim();
+    if inline.is_empty() {
+        return None;
+    }
+    let strategy = parse_gather_header(&body[..header_end])?;
+    let stmts: Vec<&str> = inline
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    (!stmts.is_empty()).then_some((strategy, stmts))
+}
+
 fn parse_gather_header(body: &str) -> Option<GatherStrategy> {
     // Strip a trailing `# comment`. Every other block header in the language
     // tolerates one, and Python does; `gather:  # run concurrently` was a hard
@@ -7592,7 +8308,7 @@ fn collect_gather_bindings(
     start: usize,
     header_indent: &str,
 ) -> Option<(Vec<GatherBinding>, usize)> {
-    let mut bindings = Vec::new();
+    let mut bindings: Vec<GatherBinding> = Vec::new();
     let mut idx = start + 1;
 
     while idx < lines.len() {
@@ -7608,6 +8324,28 @@ fn collect_gather_bindings(
             continue;
         }
         let line_indent = raw.find(|c: char| !c.is_whitespace()).unwrap_or(raw.len());
+        // A physical line that continues an open bracket belongs to the
+        // previous binding's expression (`a = fa(\n    1,\n    2,\n)`): fold
+        // its code onto that expression instead of reading it as a binding.
+        if !mask.is_logical_line_start(idx) {
+            let code_end = mask.line_code_end(idx).min(raw.len());
+            let piece = raw[..code_end].trim();
+            if let Some(last) = bindings.last_mut() {
+                if !piece.is_empty() {
+                    last.expr.push(' ');
+                    last.expr.push_str(piece);
+                }
+                idx += 1;
+                continue;
+            }
+            return None;
+        }
+        // A comment-only line inside the block is layout, not a binding, and
+        // does not end the block — even at column zero.
+        if raw.trim_start().starts_with('#') {
+            idx += 1;
+            continue;
+        }
         if line_indent <= header_indent.len() {
             break;
         }
@@ -7685,7 +8423,7 @@ fn expr_references_identifier(expr: &str, name: &str) -> bool {
         return false;
     }
     let mask = LexMask::new(expr);
-    let is_id_char = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let is_id_char = |b: u8| is_ident_byte(b);
     let mut i = 0;
     while i + n <= bytes.len() {
         if &bytes[i..i + n] == needle && (i..i + n).all(|k| mask.is_code(k)) {
@@ -8036,9 +8774,12 @@ fn join_go_continuations(source: &str) -> (String, Vec<usize>) {
 
         if buffered.is_some() && paren_depth > 0 {
             // Continuation of the buffered `go` line — glue the trimmed
-            // text on with a single space so existing tokenisation keeps
-            // working.
-            let trimmed = raw.trim_start();
+            // *code* on with a single space so existing tokenisation keeps
+            // working. A trailing `# comment` on the continuation line would
+            // otherwise swallow everything glued after it.
+            let mut probe = pre_string;
+            let code_end = scan_line_code_end(raw, &mut probe).min(raw.len());
+            let trimmed = raw[..code_end].trim();
             if let Some((prev_line, prev_term, prev_src)) = buffered.take() {
                 let joined = if trimmed.is_empty() {
                     prev_line
@@ -8050,9 +8791,34 @@ fn join_go_continuations(source: &str) -> (String, Vec<usize>) {
         } else {
             // Flush any prior buffered line (its parens balanced — emit
             // as-is so the existing `go` pass sees the joined form), and
-            // start a fresh buffer for this line.
+            // start a fresh buffer for this line. When the line opens a
+            // bracket that a later line closes, its own trailing comment is
+            // dropped from the buffer for the same reason as above.
             flush(&mut buffered, &mut out);
-            buffered = Some((raw.to_owned(), terminator.to_owned(), line_index));
+            let mut probe = pre_string;
+            let code_end = scan_line_code_end(raw, &mut probe).min(raw.len());
+            let opens_bracket = {
+                let code = &raw[..code_end];
+                let m = compute_in_string_mask(code);
+                let mut d = 0i32;
+                for (k, b) in code.bytes().enumerate() {
+                    if m[k] {
+                        continue;
+                    }
+                    match b {
+                        b'(' | b'[' | b'{' => d += 1,
+                        b')' | b']' | b'}' => d -= 1,
+                        _ => {}
+                    }
+                }
+                d > 0
+            };
+            let first = if opens_bracket && raw.trim_start().starts_with("go ") {
+                raw[..code_end].trim_end().to_owned()
+            } else {
+                raw.to_owned()
+            };
+            buffered = Some((first, terminator.to_owned(), line_index));
         }
 
         // Update paren_depth based on this line's raw bytes, skipping
@@ -8592,6 +9358,43 @@ fn rewrite_pipe_line(code: &str, pipes: &[usize]) -> Option<String> {
 /// `:=` is an *expression* operator, not a statement-level assignment, so
 /// it is treated as part of the chain LHS rather than a prefix.
 fn split_pipe_prefix(s: &str) -> (&str, &str) {
+    let (statement_prefix, rest) = split_pipe_statement_prefix(s);
+    // `lambda v: v |> f()` (bare or after `g = `) — the chain is the lambda's
+    // *body*; the head up to the lambda's colon is part of the prefix, so the
+    // result is `lambda v: f(v)`, not `f(lambda v: v)`.
+    let lambda_head = split_lambda_head(rest);
+    let prefix_len = statement_prefix.len() + lambda_head;
+    (&s[..prefix_len], &s[prefix_len..])
+}
+
+/// Length of a leading `lambda params:` head (colon and following spaces
+/// included), or 0 when `s` does not start with a lambda.
+fn split_lambda_head(s: &str) -> usize {
+    if !(s.starts_with("lambda ") || s.starts_with("lambda:")) {
+        return 0;
+    }
+    let mask = compute_in_string_mask(s);
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    for i in 0..bytes.len() {
+        if mask[i] {
+            continue;
+        }
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b':' if depth == 0 && bytes.get(i + 1) != Some(&b'=') => {
+                let after = &s[i + 1..];
+                let trim_start = after.len() - after.trim_start().len();
+                return i + 1 + trim_start;
+            }
+            _ => {}
+        }
+    }
+    0
+}
+
+fn split_pipe_statement_prefix(s: &str) -> (&str, &str) {
     // `return ` or `return\t`.
     if let Some(rest) = s.strip_prefix("return ") {
         return (&s[..s.len() - rest.len()], rest);
@@ -8681,10 +9484,45 @@ fn find_statement_assignment_end(s: &str) -> Option<usize> {
 ///
 /// Returns `None` for shapes the rewriter does not understand (e.g. lambda or
 /// non-call expressions on the RHS).
+/// Byte position of a top-level ` as! ` operator in `s` (outside strings and
+/// brackets), pointing at the `as!` token.
+fn find_top_level_cast(s: &str) -> Option<usize> {
+    let mask = compute_in_string_mask(s);
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        if !mask[i] {
+            match bytes[i] {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                b'a' if depth == 0
+                    && &bytes[i..i + 3] == b"as!"
+                    && i > 0
+                    && bytes[i - 1].is_ascii_whitespace()
+                    && bytes[i + 3].is_ascii_whitespace() =>
+                {
+                    return Some(i)
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 fn apply_pipe_call(acc: &str, rhs: &str) -> Option<String> {
     let rhs = rhs.trim();
     if rhs.is_empty() {
         return None;
+    }
+    // `x |> f() as! T` casts the piped call's *result*: split the cast off,
+    // rewrite the call, and re-attach the cast.
+    if let Some(cast_at) = find_top_level_cast(rhs) {
+        let (call_part, cast_part) = (rhs[..cast_at].trim_end(), &rhs[cast_at..]);
+        let applied = apply_pipe_call(acc, call_part)?;
+        return Some(format!("{applied} {cast_part}"));
     }
 
     // The RHS is either a bare callable (no parens) or a call shape
@@ -8827,7 +9665,7 @@ fn is_method_call_head(s: &str) -> bool {
     if !(first.is_ascii_alphabetic() || first == '_') {
         return false;
     }
-    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if !chars.all(|c| c.is_alphanumeric() || c == '_') {
         return false;
     }
     // Receiver: a string/bytes literal (quoted, possibly with a
@@ -8854,7 +9692,7 @@ fn is_dotted_callable(s: &str) -> bool {
             continue;
         }
         if started_segment {
-            if !(c.is_ascii_alphanumeric() || c == '_') {
+            if !(c.is_alphanumeric() || c == '_') {
                 return false;
             }
         } else if !(c.is_ascii_alphabetic() || c == '_') {
@@ -9061,6 +9899,537 @@ else:
         assert!(
             out.contains("        out = \"small-b\""),
             "the else arm must be re-indented into the new else; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn subscript_and_name_operands_propagate_in_value_position() {
+        // `results["a"]? + 1` used to survive to the nullable-sugar pass and
+        // become `results["a"] | None + 1` — type-checked, crashed.
+        let src = "def run() -> Result[int, str]:\n    return Ok(results[\"a\"]? + 1)\n";
+        let out = expand_question_ops(&expand_inline_question_ops(src));
+        assert!(
+            out.contains("    __typhon_qi_0__ = results[\"a\"]\n")
+                && out.contains("return Ok(__typhon_qi_0__.value + 1)"),
+            "subscript operand must be lifted; got:\n{out}"
+        );
+        let src = "def run() -> Result[int, str]:\n    let v: int = self.cache? + other\n    return Ok(v)\n";
+        let out = expand_question_ops(&expand_inline_question_ops(src));
+        assert!(
+            out.contains("    __typhon_qi_0__ = self.cache\n"),
+            "dotted-name operand must be lifted; got:\n{out}"
+        );
+        // Trailing forms go through the end-of-line pass.
+        let src = "def run() -> Result[int, str]:\n    return xs[0]?\n";
+        let out = expand_question_ops(&expand_inline_question_ops(src));
+        assert!(
+            out.contains("    __typhon_q_0__ = xs[0]\n")
+                && out.contains("    return __typhon_q_0__.value"),
+            "trailing subscript propagation in a return; got:\n{out}"
+        );
+        // Type positions are untouched: annotations, def headers, casts,
+        // aliases, quoted annotations.
+        // `as! int?` is a nullable cast target: the propagation passes leave
+        // it, and the cast lowering folds the `?` into `int | None`.
+        let cast = "let v = json.loads(s) as! int?\n";
+        assert_eq!(expand_inline_question_ops(cast), cast);
+        let lowered = expand_question_ops(cast);
+        assert!(
+            lowered.contains("let v = __typhon_checked_cast__(json.loads(s), int | None)\n")
+                && !lowered.contains("__typhon_q_"),
+            "nullable cast target; got:\n{lowered}"
+        );
+        for line in [
+            "pub type Pick = Callable[[list[Upstream]], Upstream?]\n",
+            "pub newtype Id = int?\n",
+            "pub def g(a: int?) -> str?:\n    return None\n",
+            ") -> SweepResult?:\n",
+            "    ) -> list[str]?:  # multi-line header close\n",
+            "let m: dict[str, int]? = {}\n",
+            "next: \"Node?\" = None\n",
+            "value: int?\n",
+            "def f(a: int?, b: list[str]?) -> str?:\n    return None\n",
+            "type Maybe = int?\n",
+            "mut cur: Node? = head\n",
+            "    self.next: Node? = None\n",
+        ] {
+            let out = expand_question_ops(&expand_inline_question_ops(line));
+            assert_eq!(out, line, "type position must be left alone: {line:?}");
+        }
+        // A compound header with a subscript condition is rewritten too.
+        let src = "while cache[k]?:\n    step()\n";
+        let out = expand_compound_question_headers(src);
+        assert!(
+            out.starts_with("while True:\n    if not (cache[k]?):"),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn checked_cast_in_a_for_header_casts_only_the_iterable() {
+        let src = "for x in data as! list[int]:\n    total += x\n";
+        let out = expand_checked_casts(src);
+        assert_eq!(
+            out.lines().nth(1),
+            Some("for x in __typhon_checked_cast__(data, list[int]):"),
+            "got:\n{out}"
+        );
+        for (src, want) in [
+            (
+                "if payload as! dict[str, int]:\n    pass\n",
+                "if __typhon_checked_cast__(payload, dict[str, int]):",
+            ),
+            (
+                "with open(p) as! IO:\n    pass\n",
+                "with __typhon_checked_cast__(open(p), IO):",
+            ),
+            (
+                "del cache[k] as! int\n",
+                "del __typhon_checked_cast__(cache[k], int)",
+            ),
+        ] {
+            let out = expand_checked_casts(src);
+            assert_eq!(out.lines().nth(1), Some(want), "got:\n{out}");
+        }
+    }
+
+    #[test]
+    fn enum_with_an_explicit_enum_base_does_not_duplicate_it() {
+        assert_eq!(
+            make_enum_class_line("Color(enum.Enum):\n").as_deref(),
+            Some("Color(enum.Enum):\n")
+        );
+        assert_eq!(
+            make_enum_class_line("Level(IntEnum):\n").as_deref(),
+            Some("Level(IntEnum):\n")
+        );
+        // A non-enum base still gets `enum.Enum` appended; the bare form too.
+        assert_eq!(
+            make_enum_class_line("Mixed(int):\n").as_deref(),
+            Some("Mixed(int, enum.Enum):\n")
+        );
+        assert_eq!(
+            make_enum_class_line("Plain:\n").as_deref(),
+            Some("Plain(enum.Enum):\n")
+        );
+    }
+
+    #[test]
+    fn gather_block_tolerates_comments_and_multi_line_calls() {
+        let src = "\
+async def load() -> int:
+    gather:
+        # run both concurrently
+        a = fa(
+            1,
+            2,
+        )
+# a column-zero note
+        b = fb()
+    return a + b
+";
+        let out = expand_gather_blocks(src);
+        assert!(
+            !out.contains("gather:"),
+            "the block must be lowered despite the comment and the multi-line call; got:\n{out}"
+        );
+        assert!(
+            out.contains("fa( 1, 2, )") || out.contains("fa(1, 2)") || out.contains("fa( 1, 2,)"),
+            "the multi-line call must be folded into one expression; got:\n{out}"
+        );
+        assert!(out.contains("fb()"), "got:\n{out}");
+    }
+
+    #[test]
+    fn enum_bodies_tolerate_comments_and_the_one_liner_form() {
+        let src = "enum Color:\n    RED  # the primary\n# column-zero comment\n    GREEN\n\ndef f() -> None:\n    pass\n";
+        let out = preprocess(src).python_source;
+        assert!(
+            out.contains("    RED = enum.auto()  # the primary\n")
+                && out.contains("    GREEN = enum.auto()\n"),
+            "members after a comment line must still be members; got:\n{out}"
+        );
+        let out = preprocess("enum Color: RED; GREEN; BLUE\n").python_source;
+        assert_eq!(
+            out,
+            "class Color(enum.Enum): RED = enum.auto(); GREEN = enum.auto(); BLUE = enum.auto()\n"
+        );
+        let out = preprocess("enum Empty:\n    pass\n").python_source;
+        assert!(
+            out.contains("    pass\n") && !out.contains("pass = enum.auto()"),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn go_continuation_lines_drop_their_trailing_comments() {
+        let src = "async def run() -> None:\n    go work(\n        1,  # first\n        2,\n    ) -> task\n    let r: int = await task\n";
+        let out = expand_go_calls(src);
+        assert!(
+            !out.contains("# first 2"),
+            "a comment on a continuation line must not swallow the rest; got:\n{out}"
+        );
+        assert!(
+            out.contains("work(1, 2") || out.contains("work( 1, 2"),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn pipe_chain_inside_a_lambda_body_and_before_a_cast() {
+        let out = expand_pipes("g = lambda v: v |> f()\n");
+        assert_eq!(out, "g = lambda v: f(v)\n");
+        let out = expand_pipes("let n = json.loads(\"1\") |> f() as! int\n");
+        assert_eq!(out, "let n = f(json.loads(\"1\")) as! int\n");
+        let out = expand_pipes(&expand_multiline_guards(
+            "def run(x: int) -> int:\n    guard v = x |> f() else: return -1\n    return v\n",
+        ));
+        assert!(
+            out.contains("f(x)") && !out.contains("|>"),
+            "the guard's value expression must be piped; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn distributed_impl_body_survives_a_column_zero_comment() {
+        let src = "\
+type Shape = A | B
+
+class A:
+    x: int
+
+class B:
+    y: int
+
+impl Shape:
+    def f(self) -> int:
+        return 1
+# column-zero comment inside the impl body
+    def g(self) -> int:
+        return 2
+";
+        let out = preprocess(src).python_source;
+        // Both methods must reach both variants.
+        assert_eq!(out.matches("def g(self) -> int:").count(), 2, "got:\n{out}");
+        assert_eq!(out.matches("def f(self) -> int:").count(), 2, "got:\n{out}");
+    }
+
+    #[test]
+    fn freeze_let_over_a_multi_line_string_closes_after_the_string() {
+        let src = "freeze let BANNER = \"\"\"\nhello\n\"\"\"\n\ndef main() -> None:\n    print(BANNER.strip())\n";
+        let out = preprocess(src).python_source;
+        assert!(
+            out.starts_with("let BANNER = __typhon_freeze__(\"\"\"\nhello\n\"\"\")\n")
+                || out.starts_with("BANNER = __typhon_freeze__(\"\"\"\nhello\n\"\"\")\n"),
+            "the closing paren must follow the closing quotes; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn gather_one_liner_lowers_like_the_block_form() {
+        let src = "async def load() -> int:\n    gather: a = f1(); b = f2()\n    return a + b\n";
+        let out = expand_gather_blocks(src);
+        assert!(!out.contains("gather:"), "got:\n{out}");
+        assert!(out.contains("f1()") && out.contains("f2()"), "got:\n{out}");
+        let block = "async def load() -> int:\n    gather:\n        a = f1()\n        b = f2()\n    return a + b\n";
+        assert_eq!(
+            expand_gather_blocks(block),
+            out,
+            "the one-liner must lower exactly like the block"
+        );
+    }
+
+    #[test]
+    fn a_leading_byte_order_mark_is_ignored() {
+        let src = "\u{feff}pub let X: int = 1\nlet y: int? = X\n";
+        let out = preprocess(&expand_sugar(src, true)).python_source;
+        assert!(
+            !out.starts_with('\u{feff}')
+                && !out.starts_with("pub ")
+                && out.contains("X: int = 1\n"),
+            "the BOM and the `pub` marker must both be handled; got:\n{out:?}"
+        );
+        assert!(out.contains("y: int | None = X"), "got:\n{out:?}");
+    }
+
+    #[test]
+    fn model_with_an_explicit_base_model_does_not_duplicate_it() {
+        assert_eq!(
+            make_model_class_line("User(BaseModel):\n").as_deref(),
+            Some("User(BaseModel):\n")
+        );
+        assert_eq!(
+            make_model_class_line("User(pydantic.BaseModel):\n").as_deref(),
+            Some("User(pydantic.BaseModel):\n")
+        );
+        assert_eq!(
+            make_model_class_line("User(Mixin):\n").as_deref(),
+            Some("User(Mixin, BaseModel):\n")
+        );
+    }
+
+    #[test]
+    fn rescue_block_suite_survives_a_column_zero_comment() {
+        let src = "\
+def load(p: str) -> Result[str, str]:
+    rescue e: str(e):
+        let text: str = read(p)
+# a column-zero note inside the suite
+        return Ok(text)
+";
+        let out = expand_rescue_blocks(src);
+        assert!(
+            out.contains("return Ok(text)") && out.contains("try:") && !out.contains("rescue e"),
+            "the whole suite must be lowered; got:\n{out}"
+        );
+        // Both suite statements end up inside the `try:` (deeper than the header).
+        let try_indent = out
+            .lines()
+            .find(|l| l.trim_start().starts_with("try:"))
+            .map(|l| l.len() - l.trim_start().len())
+            .unwrap();
+        let ret = out.lines().find(|l| l.contains("return Ok(text)")).unwrap();
+        assert!(
+            ret.len() - ret.trim_start().len() > try_indent,
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn nested_with_chains_and_comments_inside_a_chain_body() {
+        let src = "\
+def run() -> Result[int, str]:
+    with a = f()?:
+        # inner chain
+        with b = g(a)?:
+# column-zero note
+            return Ok(a + b)
+";
+        let out = expand_with_chains(src);
+        assert!(
+            !out.contains("with "),
+            "both chains must be lowered; got:\n{out}"
+        );
+        assert!(out.contains("return Ok(a + b)"), "got:\n{out}");
+    }
+
+    #[test]
+    fn hkt_markers_are_stripped_from_every_class_like_header() {
+        let src = "\
+interface Functor[F[_]]:
+    def fmap[A, B](self, fa: F[A], f: Callable[[A], B]) -> F[B]
+
+class! ListF[F[_]](object):
+    pass
+
+impl[F[_]] Functor[F[_]]:
+    def x(self) -> int:
+        return 1
+
+class Pair[F[_], A]:
+    value: F[A]
+";
+        let out = preprocess(src).python_source;
+        assert!(!out.contains("[_]"), "no marker may survive; got:\n{out}");
+        assert!(out.contains("Pair[F, A]"), "got:\n{out}");
+    }
+
+    #[test]
+    fn non_ascii_identifiers_survive_every_scanner() {
+        let src = "\
+class Café:
+    größe: int
+
+enum Größe: KLEIN; GROSS
+
+def f(x: int) -> int:
+    return x + 1
+
+def main() -> None:
+    let café: Café = Café(größe=1)
+    let größe: int = café.größe |> f()
+    let ergebnis: Result[int, str] = Ok(größe)
+    let wert: int = ergebnis?
+    print(wert, Größe.KLEIN, größe as! int)
+";
+        let out = preprocess(&expand_sugar(src, true)).python_source;
+        assert!(out.contains("class Café"), "class header; got:\n{out}");
+        assert!(
+            out.contains("class Größe(enum.Enum): KLEIN = enum.auto(); GROSS = enum.auto()"),
+            "enum one-liner; got:\n{out}"
+        );
+        assert!(out.contains("f(café.größe)"), "pipe; got:\n{out}");
+        assert!(
+            out.contains("__typhon_q_0__ = ergebnis"),
+            "propagation; got:\n{out}"
+        );
+        assert!(
+            out.contains("__typhon_checked_cast__(größe, int)"),
+            "cast; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn compound_question_rewrite_tolerates_column_zero_comments() {
+        let src = "\
+def pick(a: int) -> Result[str, str]:
+    if a == 0:
+        return Ok(\"zero\")
+    elif check(a)?:
+# note at column zero
+        return Ok(\"big\")
+    else:
+        return Ok(\"one\")
+";
+        let out = expand_compound_question_headers(src);
+        assert!(
+            out.contains("    else:\n        if check(a)?:\n"),
+            "the elif must still be rewritten; got:\n{out}"
+        );
+        assert!(
+            out.contains("return Ok(\"big\")") && out.contains("            return Ok(\"one\")"),
+            "both arms must move inside the new else; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_missing_final_newline_does_not_glue_generated_code() {
+        let src = "def run() -> Result[int, str]:\n    with a = f()?:\n        return Ok(a)";
+        let out = expand_sugar(src, true);
+        assert!(out.ends_with('\n'), "got:\n{out:?}");
+        assert!(
+            crate::parse_module(&preprocess(&out).python_source).is_ok(),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn one_line_compound_body_with_question_is_split_before_lowering() {
+        // `if flag: x = parse("")?` used to hoist the fallible call above the
+        // header — evaluated unconditionally. The one-liner is split into a
+        // header and an indented body first, so the guard lands in the body.
+        let src = "\
+def maybe(flag: bool) -> Result[int, str]:
+    mut x: int = 0
+    if flag: x = parse(\"\")?
+    for s in xs: total = total + parse(s)?
+    return Ok(x)
+";
+        let out = expand_question_ops(&expand_inline_question_ops(src));
+        assert!(
+            out.contains("    if flag:\n        __typhon_q_0__ = parse(\"\")\n"),
+            "the temp must sit inside the if body; got:\n{out}"
+        );
+        assert!(
+            out.contains("    for s in xs:\n        __typhon_qi_0__ = parse(s)\n"),
+            "the loop-body guard must sit inside the loop; got:\n{out}"
+        );
+        // Without a propagating `?` a one-liner is left exactly as written.
+        let plain = "if flag: x = 1\nfor s in xs: total += 1\nd = {a: b}; y = xs[1:2]\n";
+        assert_eq!(expand_question_one_liners(plain), plain);
+        // Colons inside brackets, a lambda in the condition, `:=` and a
+        // trailing comment do not confuse the header split.
+        let tricky = "if (lambda: 1)() and {1: 2}[1] and (n := xs[0:1]): x = f()?  # a: b\n";
+        let out = expand_question_one_liners(tricky);
+        assert_eq!(
+            out, "if (lambda: 1)() and {1: 2}[1] and (n := xs[0:1]):  # a: b\n    x = f()?\n",
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn semicolon_joined_statements_with_question_are_split() {
+        let src = "def two() -> Result[int, str]:\n    let a: int = f()?; let b: int = g()?\n    return Ok(a + b)\n";
+        let out = expand_question_one_liners(src);
+        assert_eq!(
+            out,
+            "def two() -> Result[int, str]:\n    let a: int = f()?\n    let b: int = g()?\n    return Ok(a + b)\n"
+        );
+        let lowered = expand_question_ops(&expand_inline_question_ops(src));
+        assert!(
+            lowered.contains("    __typhon_q_0__ = f()\n")
+                && lowered.contains("    __typhon_q_1__ = g()\n"),
+            "each statement lowers on its own; got:\n{lowered}"
+        );
+    }
+
+    #[test]
+    fn compound_question_rewrite_keeps_the_file_indentation_unit() {
+        // 2-space indentation: the generated `if not (...)` must be one step
+        // inside the loop, and `break` one step inside that — not 4 and 8.
+        let src = "\
+def run() -> Result[int, str]:
+  mut n: int = 0
+  while step(n)?:
+    n += 1
+  return Ok(n)
+";
+        let out = expand_compound_question_headers(src);
+        assert!(
+            out.contains("  while True:\n    if not (step(n)?):\n      break\n    n += 1\n"),
+            "2-space nesting; got:\n{out}"
+        );
+        // Tabs: the header's own whitespace is reproduced, never spaces.
+        let src = "\
+def pick(a: int) -> Result[str, str]:
+\tif a == 0:
+\t\treturn Ok(\"zero\")
+\telif check(a)?:
+\t\treturn Ok(\"big\")
+\telse:
+\t\treturn Ok(\"one\")
+";
+        let out = expand_compound_question_headers(src);
+        assert!(
+            out.contains("\telse:\n\t\tif check(a)?:\n\t\t\treturn Ok(\"big\")\n\t\telse:\n\t\t\treturn Ok(\"one\")\n"),
+            "tab nesting; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn while_else_arm_survives_the_compound_question_rewrite() {
+        // The `else` arm of a `while` runs when the condition becomes false,
+        // which after the rewrite is the `if not (...)` branch; it must move
+        // there instead of dangling off `while True:` (where it never ran).
+        let src = "\
+while step(n)?:
+    n += 1
+else:
+    print(\"done\")
+after()
+";
+        let out = expand_compound_question_headers(src);
+        assert_eq!(
+            out,
+            "while True:\n    if not (step(n)?):\n        print(\"done\")\n        break\n    n += 1\nafter()\n",
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn lazy_let_inside_raw_and_plain_class_bodies_is_a_cached_property() {
+        for header in [
+            "class! Holder(Base):",
+            "plain class Holder:",
+            "class Holder frozen:",
+            "model Holder:",
+        ] {
+            let src = format!("{header}\n    name: str\n    lazy let value: int = compute()\n");
+            let out = expand_lazy_lets(&src);
+            assert!(
+                out.contains("_typhon_cached_property") && out.contains("def value(self) -> int:"),
+                "{header}: lazy let must lower to a cached property, not an eager field; got:\n{out}"
+            );
+            assert!(
+                !out.contains("lazy let"),
+                "{header}: no `lazy let` may survive; got:\n{out}"
+            );
+        }
+        let src = "impl[T] Box[T]:\n    lazy let size: int = compute()\n";
+        let out = expand_lazy_lets(src);
+        assert!(
+            out.contains("_typhon_cached_property"),
+            "generic impl body; got:\n{out}"
         );
     }
 

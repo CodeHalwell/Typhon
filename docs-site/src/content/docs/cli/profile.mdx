@@ -6,40 +6,48 @@ sidebar:
 ---
 
 ```
-tyc profile [--out FILE] [-- ARGS...]
+tyc profile [PATH] [--out DIR]
 ```
 
-Builds the project with instrumentation that records every top-level function's call count and wall-clock time. On interpreter exit, writes the data to `typhon-profile.json`. Used by `[strictness] pgo-memoise` to drive PGO-guided cache injection.
+Runs the normal `tyc build` pipeline, then post-processes every emitted `.py` so each top-level function records its call count and cumulative wall-clock time. When the instrumented program exits, an `atexit` hook writes the counters to `typhon-profile.json`. That file feeds [`[strictness] pgo-memoise`](/Typhon/configuration/strictness/#pgo-memoise), which promotes hot pure functions to `@functools.cache` on the next build.
+
+`tyc profile` does **not** run the program — it only produces the instrumented build. You run the emitted entry point yourself with a representative workload.
 
 ## Examples
 
 ```bash
-tyc profile -- --representative-args
-# runs the program; on exit, writes typhon-profile.json
+tyc profile                          # instrumented build → build/
+python build/main.py --bench         # run it; typhon-profile.json is written on exit
+tyc build                            # with pgo-memoise = true, hot pure fns are now cached
 
-tyc profile --out /tmp/profile.json -- --bench
+tyc profile --out dist/              # instrument into dist/ instead of the configured out dir
+TYPHON_PROFILE_OUT=/tmp/p.json python build/main.py   # write the profile somewhere else
 ```
+
+Run the instrumented program **from the project root**: the profile is written to the process's working directory (or to `TYPHON_PROFILE_OUT`), and `tyc build` reads `typhon-profile.json` from the directory that holds `typhon.toml`.
 
 ## What the profile contains
 
-A JSON object keyed by qualified function name:
+A JSON object keyed by `<module>.<qualname>`, exactly as Python's `fn.__module__` and `fn.__qualname__` report them:
 
 ```json
 {
-  "src/main.py:parse_port": {
+  "__main__.parse_port": {
     "calls": 12483,
-    "wall_clock_ns": 8429311
+    "total_seconds": 0.0084
   },
-  "src/users.py:find_user": {
+  "users.find_user": {
     "calls": 4521,
-    "wall_clock_ns": 124883201
+    "total_seconds": 0.1249
   }
 }
 ```
 
+The entry module runs as `__main__`, so its functions are recorded as `__main__.<fn>`; every other module is keyed by its dotted module name (`pkg.sub.helpers.<fn>`).
+
 ## Using the profile
 
-Enable PGO in `typhon.toml`:
+Enable PGO in `typhon.toml` (or set [`[optimise] level = 1`](/Typhon/configuration/overview/#optimise), which flips the default):
 
 ```toml
 [strictness]
@@ -47,39 +55,37 @@ pgo-memoise = true
 pgo-min-calls = 100         # threshold; default 100
 ```
 
-On the next `tyc build`, every `@pure`-eligible function whose call count meets `pgo-min-calls` is promoted to `@functools.cache` — even if you didn't write `@memo`. This complements `auto-memoise` (which caches *every* pure function regardless of hot-ness).
+On the next `tyc build`, every function that passes the purity analysis and whose recorded call count meets `pgo-min-calls` is promoted to `@functools.cache` — even if you didn't write `@memo`. This complements `auto-memoise` (which caches *every* pure function regardless of hot-ness). A function already carrying `@memo` is never double-decorated.
+
+The match is per module: a `users.find_user` sample only ever promotes `find_user` in `src/users.ty`, never a same-named function elsewhere. For the entry module both the `__main__.<fn>` spelling the profiler writes and the `main.<fn>` spelling are accepted, so the round trip works for `src/main.ty` out of the box. A bare `<fn>` key with no module qualifier matches by name, as a fallback for profiles produced by other tools.
 
 ## Missing profile file
 
-Not an error. PGO is best-effort:
-
-```
-tyc build
-# warning: pgo-memoise enabled, but typhon-profile.json is missing — no PGO applied
-```
+Not an error — and not a warning either; PGO is best-effort. With `pgo-memoise = true` and no `typhon-profile.json`, `tyc build` simply promotes nothing and falls through to the explicit `@memo` / `auto-memoise` paths.
 
 ## Recommended workflow
 
 1. Write a "representative" entry point (e.g. a benchmark or a CLI invocation that exercises hot paths).
-2. `tyc profile -- <args>`.
-3. Commit `typhon-profile.json` (or generate in CI).
+2. `tyc profile`, then run the instrumented program from the project root.
+3. Commit `typhon-profile.json` (or generate it in CI).
 4. `tyc build` with `pgo-memoise = true`.
 
-The PGO is purely additive — functions promoted by PGO behave the same as ones you marked `@memo` manually. They get cached; their purity is verified at build time.
+PGO is purely additive — functions promoted by PGO behave the same as ones you marked `@memo` manually. They get cached; their purity is verified at build time.
 
 ## What's profiled
 
-Currently: every top-level `def` in the project's modules (not class methods; not closures inside other functions). Future work may broaden the surface.
+Every top-level `def` / `async def` in the project's emitted modules — not class or `impl` methods, not closures inside other functions, and not the generated `typhon_runtime/` helpers. Broadening the surface is a follow-up.
 
 ## Flags
 
 | Flag | Default | Effect |
 |------|---------|--------|
-| `--out FILE` | `typhon-profile.json` | Where to write the profile data. |
-| `--entry FILE` | `main.py` | Entry-point to profile. |
-| `--python PATH` | `python3` | Interpreter. |
+| `PATH` | `.` | Project directory. |
+| `--out DIR` (`-o`) | `[project] out` | Output directory for the instrumented build, forwarded to `tyc build`. |
+
+Where the profile lands is controlled at run time by the `TYPHON_PROFILE_OUT` environment variable (default `typhon-profile.json` in the working directory), not by a `tyc profile` flag.
 
 ## Where next
 
 - [`@pure` and `@memo`](/Typhon/reference/pure-memo/) — the purity check used for PGO eligibility.
-- [`[strictness] pgo-memoise`](/Typhon/configuration/strictness/) — config knob.
+- [`[strictness] pgo-memoise`](/Typhon/configuration/strictness/#pgo-memoise) — config knob.

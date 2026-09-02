@@ -425,6 +425,15 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
                     }
                 })
         }
+        // A `str` is an iterable (and a sequence) of one-character `str`s and
+        // `bytes` one of `int`s, so each satisfies the read-only protocols
+        // when the element type does (`"".join("abc")`, `set(b"ab")`).
+        (Type::Generic(an, aa), Type::Str) if is_read_view_abc(an) && aa.len() == 1 => {
+            assignable(&aa[0], &Type::Str)
+        }
+        (Type::Generic(an, aa), Type::Bytes) if is_read_view_abc(an) && aa.len() == 1 => {
+            assignable(&aa[0], &Type::Int)
+        }
         // Bare (unparameterized) `Ok` or `Err` is assignable to `Result[T, E]`
         // without parameter checking. This arises when the `?` operator expands
         // into `if isinstance(x, Err): return x`, and the isinstance-narrowing
@@ -2669,14 +2678,78 @@ impl TypeEnv {
 /// conservative direction: the assignment falls through to the ordinary
 /// nominal check rather than being waved through.
 const READ_VIEW_LATTICE: &[(&str, &[&str])] = &[
-    ("Sequence", &["list", "tuple"]),
-    ("Reversible", &["list", "tuple"]),
-    ("Iterable", &["list", "tuple", "set", "frozenset"]),
-    ("Collection", &["list", "tuple", "set", "frozenset"]),
-    ("Container", &["list", "tuple", "set", "frozenset"]),
-    // `Iterator` intentionally has no built-in members.
-    ("Iterator", &[]),
+    ("Sequence", &["list", "tuple", "deque", "range", "Sequence"]),
+    (
+        "Reversible",
+        &["list", "tuple", "deque", "range", "Sequence", "Reversible"],
+    ),
+    // Every iterable: the concrete containers, the dict views (iterating a
+    // `dict` itself yields its keys, which is what `dict[K, V]`'s first
+    // parameter is), the read-only ABCs, and the iterators (an iterator is an
+    // iterable of itself — `", ".join(x for x in xs)` is the everyday case).
+    (
+        "Iterable",
+        &[
+            "list",
+            "tuple",
+            "set",
+            "frozenset",
+            "deque",
+            "range",
+            "dict",
+            "KeysView",
+            "ValuesView",
+            "ItemsView",
+            "Sequence",
+            "Collection",
+            "Iterable",
+            "Iterator",
+            "Generator",
+        ],
+    ),
+    (
+        "Collection",
+        &[
+            "list",
+            "tuple",
+            "set",
+            "frozenset",
+            "deque",
+            "range",
+            "dict",
+            "KeysView",
+            "ValuesView",
+            "ItemsView",
+            "Sequence",
+            "Collection",
+        ],
+    ),
+    (
+        "Container",
+        &[
+            "list",
+            "tuple",
+            "set",
+            "frozenset",
+            "deque",
+            "range",
+            "dict",
+            "KeysView",
+            "ItemsView",
+            "Sequence",
+            "Collection",
+            "Container",
+        ],
+    ),
+    // No built-in *container* is an `Iterator`; only iterators and generators
+    // are (`for` over a list calls `iter()` first, `next(xs)` does not).
+    ("Iterator", &["Iterator", "Generator"]),
 ];
+
+/// True when `abc` names one of the read-only iteration protocols above.
+fn is_read_view_abc(abc: &str) -> bool {
+    READ_VIEW_LATTICE.iter().any(|(name, _)| *name == abc)
+}
 
 /// True when `container` satisfies the read-only ABC `abc`.
 fn read_view_head_accepts(abc: &str, container: &str) -> bool {
@@ -2815,6 +2888,15 @@ struct Checker<'a> {
     /// `Expr::Attribute` resolution can look up what interface a `T: Iface`
     /// parameter conforms to.
     active_typevar_bounds: HashMap<String, Type>,
+    /// The PEP 695 type parameters of the function body currently being
+    /// checked (`def first[T](xs: list[T]) -> T`). Inside that body a `T` is
+    /// *opaque*: the only values of type `T` are the ones the caller passed
+    /// in, so `return 42` against `-> T`, or `let s: str = x` for `x: T`, is a
+    /// `tyc::type_mismatch` — exactly the two crashes a caller sees when the
+    /// binding is not what the signature promised. At a call site of the
+    /// generic (outside its body) the same `T` stays permissive, because the
+    /// unifier binds it from the arguments.
+    active_type_params: Vec<String>,
     /// Sealed union declarations: name → ordered list of variant class names.
     /// Populated from `type Foo = A | B | C` statements in the first pass.
     sealed_unions: HashMap<String, Vec<String>>,
@@ -2892,6 +2974,13 @@ struct Checker<'a> {
     /// as written in the source (`class Dog(Animal):` → `{"Dog": ["Animal"]}`).
     /// Used by `class_inherits_from` to resolve nominal subtype relationships.
     class_parents: HashMap<String, Vec<String>>,
+    /// The last segment of every declared base, per class — `enum.StrEnum`
+    /// records `StrEnum`, `list[int]` records `list`. `class_parents` maps a
+    /// dotted base to an opaque marker on purpose (an unknown foreign base
+    /// keeps the hierarchy "not fully known"), so this is the only place a
+    /// builtin-derived class (`class Colour(enum.StrEnum)` *is a* `str`) can
+    /// be recognised without disturbing that guard rail.
+    class_base_tails: HashMap<String, Vec<String>>,
     /// Names of classes DEFINED in this module via a real `class` statement
     /// (not imported by name, not seeded from a venv shape). Lets a check
     /// reason about a class's full ancestry with certainty — e.g.
@@ -3220,6 +3309,7 @@ impl<'a> Checker<'a> {
             in_generator: false,
             function_type_bounds: HashMap::new(),
             active_typevar_bounds: HashMap::new(),
+            active_type_params: Vec::new(),
             interfaces: HashMap::new(),
             class_shapes: HashMap::new(),
             class_type_params: HashMap::new(),
@@ -3227,6 +3317,7 @@ impl<'a> Checker<'a> {
             class_param_variance: HashMap::new(),
             frozen_classes: std::collections::HashSet::new(),
             class_parents: HashMap::new(),
+            class_base_tails: HashMap::new(),
             local_classes: std::collections::HashSet::new(),
             self_attrs: HashMap::new(),
             unsafe_depth: 0,
@@ -3352,9 +3443,111 @@ impl<'a> Checker<'a> {
         result
     }
 
+    /// Inside a generic function body its own type parameters are opaque:
+    /// `T` accepts only `T` (plus the permissive `Any` / `Unknown`), and a
+    /// `T`-typed value flows only into `T`, `object`, or — for a bounded
+    /// `T: Base` — anything its bound flows into. `None` means "not an opaque
+    /// position, decide as usual". Only *this* body's parameters are opaque:
+    /// a callee's `U` (or a recursive call's re-instantiation) stays
+    /// permissive because the unifier binds it from the arguments, and a
+    /// constrained parameter (`T: (int, str)`) stays permissive because the
+    /// body legitimately works with whichever constraint was chosen.
+    fn opaque_typevar_verdict(&self, expected: &Type, actual: &Type) -> Option<bool> {
+        if self.active_type_params.is_empty() {
+            return None;
+        }
+        // An annotation resolved without the parameter list in scope spells
+        // the same parameter as `Class("T")`; read both spellings as the
+        // type variable so `let y: T = x` (for `x: T`) is `T` against `T`.
+        let normalise = |t: &Type| -> Type {
+            match t {
+                Type::Class(name) if self.active_type_params.iter().any(|p| p == name) => {
+                    Type::TypeVar(name.clone())
+                }
+                other => other.clone(),
+            }
+        };
+        let (expected_n, actual_n) = (normalise(expected), normalise(actual));
+        let (expected, actual) = (&expected_n, &actual_n);
+        let opaque = |t: &Type| match t {
+            Type::TypeVar(name) => {
+                self.active_type_params.iter().any(|p| p == name)
+                    && !matches!(
+                        self.active_typevar_bounds.get(name),
+                        Some(Type::Union(_)) | Some(Type::Generic(..))
+                    )
+            }
+            _ => false,
+        };
+        match (expected, actual) {
+            (Type::TypeVar(e), Type::TypeVar(a)) if opaque(expected) || opaque(actual) => {
+                Some(e == a)
+            }
+            (Type::TypeVar(_), other) if opaque(expected) => Some(matches!(
+                other,
+                Type::Any | Type::Unknown | Type::TypeConstructor(..)
+            )),
+            (other, Type::TypeVar(name)) if opaque(actual) => {
+                if matches!(other, Type::Any | Type::Unknown | Type::TypeConstructor(..))
+                    || is_object_type(other)
+                {
+                    return Some(true);
+                }
+                // A union target accepts `T` when one of its members does
+                // (`T | None` for a `T` value is the everyday case).
+                if let Type::Union(members) = other {
+                    return Some(members.iter().any(|m| {
+                        matches!(m, Type::TypeVar(n) if n == name)
+                            || self
+                                .active_typevar_bounds
+                                .get(name)
+                                .is_some_and(|b| self.is_assignable(m, b))
+                    }));
+                }
+                Some(
+                    self.active_typevar_bounds
+                        .get(name)
+                        .is_some_and(|bound| self.is_assignable(other, bound)),
+                )
+            }
+            _ => None,
+        }
+    }
+
     fn is_assignable_inner(&self, expected: &Type, actual: &Type) -> bool {
+        if let Some(verdict) = self.opaque_typevar_verdict(expected, actual) {
+            return verdict;
+        }
         if assignable(expected, actual) {
             return true;
+        }
+        // A user class deriving from a builtin *is* that builtin: a
+        // `class Colour(StrEnum)` member is a `str` (`",".join(Colour)` works),
+        // an `IntEnum` member is an `int`. Only the declared-base chain is
+        // consulted, so an unrelated class stays a mismatch.
+        if let Type::Class(name) = actual {
+            let derives = |bases: &[&str]| self.class_derives_from_builtin(name, bases);
+            match expected {
+                Type::Str if derives(&["str", "StrEnum", "enum.StrEnum"]) => return true,
+                Type::Int
+                    if derives(&["int", "IntEnum", "enum.IntEnum", "IntFlag", "enum.IntFlag"]) =>
+                {
+                    return true
+                }
+                Type::Float
+                    if derives(&[
+                        "float",
+                        "int",
+                        "IntEnum",
+                        "enum.IntEnum",
+                        "IntFlag",
+                        "enum.IntFlag",
+                    ]) =>
+                {
+                    return true
+                }
+                _ => {}
+            }
         }
         // Higher-kinded positions are unbound until call-site inference
         // binds them. A formal `F[A]` (a `Generic` whose head is a
@@ -3749,6 +3942,16 @@ impl<'a> Checker<'a> {
             let exp_name = exp_head.as_str();
             if exp_args.len() == 1 && matches!(exp_name, "Iterator" | "Iterable") {
                 if let Type::Class(act_name) | Type::Generic(act_name, _) = actual {
+                    // An `enum` class iterates over its members (`",".join(Colour)`
+                    // for a `StrEnum`), and a member of a `str`-derived enum is
+                    // itself a `str`, so either is an `Iterable[T]` when the member
+                    // type is.
+                    if exp_name == "Iterable"
+                        && self.enums.contains_key(act_name.as_str())
+                        && self.is_assignable(&exp_args[0], &Type::Class(act_name.clone()))
+                    {
+                        return true;
+                    }
                     // `Iterator[T]` needs `__next__(self) -> T` AND `__iter__`
                     // — a `__next__`-only class is not iterable (`iter(obj)` /
                     // `for x in obj` require `__iter__`; the standard iterator
@@ -4204,19 +4407,33 @@ impl<'a> Checker<'a> {
             n == iface_name || n == iface_bare
         };
         for (m, iface_sig) in &iface_shape.methods {
+            // Skip the return check when the interface method returns the same
+            // interface type to avoid infinite recursion for self-referential
+            // interfaces (e.g. `def next(self) -> Node`).
+            let iface_ret = if iface_subst.is_empty() {
+                iface_sig.return_type.clone()
+            } else {
+                substitute_typevars(&iface_sig.return_type, iface_subst)
+            };
             match self.find_method(cls_name, m) {
                 Some(cls_sig) if cls_sig.arity == iface_sig.arity => {
+                    // `async def` is part of the contract in both directions: a
+                    // caller `await`s an interface coroutine method (an `int`
+                    // from a sync implementation crashes) and calls a sync one
+                    // directly (a coroutine from an async implementation never
+                    // runs).
+                    if cls_sig.is_async != iface_sig.is_async {
+                        return false;
+                    }
+                    // A `@property` is read as a value, a plain method is
+                    // called; an implementation that swaps one for the other
+                    // does not provide the member as written.
+                    if cls_sig.is_property != iface_sig.is_property {
+                        return false;
+                    }
                     // Both return types must be known to enforce compatibility.
                     // Unknown return type on either side is treated as compatible
                     // so unannotated methods don't block conformance.
-                    // Skip the check when the interface method returns the same
-                    // interface type to avoid infinite recursion for
-                    // self-referential interfaces (e.g. `def next(self) -> Node`).
-                    let iface_ret = if iface_subst.is_empty() {
-                        iface_sig.return_type.clone()
-                    } else {
-                        substitute_typevars(&iface_sig.return_type, iface_subst)
-                    };
                     if iface_ret != Type::Unknown
                         && cls_sig.return_type != Type::Unknown
                         && !is_self_ref(&iface_ret)
@@ -4252,6 +4469,15 @@ impl<'a> Checker<'a> {
                         }
                     }
                 }
+                // A `@property` member is also satisfied by a plain field of the
+                // right type — reading either yields the value.
+                None if iface_sig.is_property => match self.find_field(cls_name, m) {
+                    Some(cls_type)
+                        if iface_ret == Type::Unknown
+                            || is_self_ref(&iface_ret)
+                            || self.is_assignable(&iface_ret, cls_type) => {}
+                    _ => return false,
+                },
                 _ => return false,
             }
         }
@@ -4264,7 +4490,15 @@ impl<'a> Checker<'a> {
             match self.find_field(cls_name, f) {
                 Some(cls_type) if self.is_assignable(&iface_type, cls_type) => {}
                 Some(_) => return false, // field present but wrong type
-                None if self.find_method(cls_name, f).is_some_and(|s| s.arity == 0) => {} // property-like method satisfies field
+                // A `@property` of the right type satisfies a field — reading
+                // it yields the value. A plain zero-argument *method* does not:
+                // `obj.f` would be a bound method where the interface promised
+                // the value itself.
+                None if self.find_method(cls_name, f).is_some_and(|s| {
+                    s.is_property
+                        && (s.return_type == Type::Unknown
+                            || self.is_assignable(&iface_type, &s.return_type))
+                }) => {}
                 None => return false,
             }
         }
@@ -4326,6 +4560,30 @@ impl<'a> Checker<'a> {
     /// Return `true` when `child` transitively inherits from `parent` via the
     /// `class_parents` map built during the first collection pass.  Uses an
     /// iterative depth-first search to avoid stack overflow on deep hierarchies.
+    /// `true` when `class_name`, or a user class in its declared parent chain,
+    /// lists one of `tails` (a builtin such as `str`, or `StrEnum`) among its
+    /// bases — see `class_base_tails`.
+    fn class_derives_from_builtin(&self, class_name: &str, tails: &[&str]) -> bool {
+        let mut stack: Vec<&str> = vec![class_name];
+        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        while let Some(name) = stack.pop() {
+            if !visited.insert(name) {
+                continue;
+            }
+            if self
+                .class_base_tails
+                .get(name)
+                .is_some_and(|bases| bases.iter().any(|b| tails.contains(&b.as_str())))
+            {
+                return true;
+            }
+            if let Some(parents) = self.class_parents.get(name) {
+                stack.extend(parents.iter().map(String::as_str));
+            }
+        }
+        false
+    }
+
     fn class_inherits_from(&self, child: &str, parent: &str) -> bool {
         let mut stack: Vec<&str> = vec![child];
         let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -7920,6 +8178,17 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                         _ => "__typhon_unknown_base__".to_owned(),
                     })
                     .collect();
+                let tails: Vec<String> = cd
+                    .bases()
+                    .iter()
+                    .filter_map(base_last_segment)
+                    .map(str::to_owned)
+                    .collect();
+                if tails.is_empty() {
+                    c.class_base_tails.remove(name);
+                } else {
+                    c.class_base_tails.insert(name.to_owned(), tails);
+                }
                 if !parents.is_empty() {
                     c.class_parents.insert(name.to_owned(), parents);
                 } else {
@@ -9986,6 +10255,11 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
                 }
             }
             let recv = infer_expr_readonly(c, &a.value);
+            // Builtin container methods carry a real signature (`d.get(k)` is
+            // `V | None`, `xs.pop()` is `T`), so a wrapping call sees it.
+            if let Some(method_type) = builtin_generic_method(&recv, a.attr.as_str()) {
+                return method_type;
+            }
             match &recv {
                 Type::Class(class_name) | Type::Generic(class_name, _) => {
                     if let Some(field_ty) = c.find_field(class_name, a.attr.as_str()) {
@@ -10069,6 +10343,39 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
                     return Type::Generic("Result".into(), vec![ok_ty, err_ty]);
                 }
             }
+            // `<dict[K, V]>.get(k, default)` is `V | type(default)` — never
+            // `None` — exactly as the main inference path types it (FINDINGS
+            // #71); the one-argument signature's `V | None` must not leak in
+            // here either, or a read-only consumer (the builtin-argument
+            // check, a `match` subject) would call `int(d.get(k, 0))` nullable.
+            if let Expr::Attribute(attr) = call.func.as_ref() {
+                if attr.attr.as_str() == "get" {
+                    let default_expr: Option<&Expr> = match call.arguments.args.len() {
+                        2 => Some(&call.arguments.args[1]),
+                        1 => call
+                            .arguments
+                            .keywords
+                            .iter()
+                            .find(|k| k.arg.as_ref().is_some_and(|i| i.as_str() == "default"))
+                            .map(|k| &k.value),
+                        _ => None,
+                    };
+                    if let Some(default_expr) = default_expr {
+                        if let Type::Generic(head, dict_args) = infer_expr_readonly(c, &attr.value)
+                        {
+                            if head == "dict" && dict_args.len() == 2 {
+                                let v = dict_args[1].clone();
+                                let default_ty = infer_expr_readonly(c, default_expr);
+                                return if assignable(&v, &default_ty) {
+                                    v
+                                } else {
+                                    Type::union_of(vec![v, default_ty])
+                                };
+                            }
+                        }
+                    }
+                }
+            }
             // Resolve the callee's return type so chained call
             // expressions (`get_client().method(...)`) can walk
             // through. A constructor call returning `Type::Class(_)`
@@ -10089,7 +10396,16 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
         // subscript fired missing_return).
         Expr::Subscript(s) => {
             let recv = infer_expr_readonly(c, &s.value);
+            // A slice yields the container itself (`xs[::-1]` on a
+            // `list[int]` is still a `list[int]`), never an element —
+            // returning the element type here made `iter(xs[::-1])` look
+            // like `iter(int)` to the builtin-argument check.
+            if matches!(s.slice.as_ref(), Expr::Slice(_)) {
+                return subscript_slice_type(&recv).unwrap_or(Type::Unknown);
+            }
             match recv {
+                Type::Str => Type::Str,
+                Type::Bytes => Type::Int,
                 Type::Generic(name, args) => match name.as_str() {
                     "list" | "Sequence" | "MutableSequence" | "deque" | "set" | "frozenset"
                     | "Iterable" | "Iterator"
@@ -10118,6 +10434,101 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
             t.elts.iter().map(|e| infer_expr_readonly(c, e)).collect(),
         ),
         _ => Type::Unknown,
+    }
+}
+
+/// What a CPython builtin's *first positional argument* must be, for the
+/// handful of builtins whose misuse is both everyday and a guaranteed
+/// `TypeError`: `int(d.get("n"))` on a possibly-missing key, `len(count)`,
+/// `sorted(total)`. Returns `None` for a builtin this table does not cover
+/// (or a call shape it cannot judge — `min(a, b)` / `max(a, b)` / the
+/// two-argument `iter(callable, sentinel)` take scalars, so only the
+/// single-argument forms are checked).
+fn builtin_accepted_first_argument(name: &str, positional: usize) -> Option<Type> {
+    let iterable = Type::Class("Iterable".into());
+    match name {
+        "int" | "float" => Some(Type::union_of(vec![
+            Type::Int,
+            Type::Float,
+            Type::Str,
+            Type::Bytes,
+        ])),
+        "len" | "sorted" | "reversed" | "sum" | "any" | "all" | "enumerate" | "list" | "tuple"
+        | "set" | "frozenset" => Some(iterable),
+        "min" | "max" | "iter" if positional == 1 => Some(iterable),
+        "chr" => Some(Type::Int),
+        "ord" => Some(Type::union_of(vec![Type::Str, Type::Bytes])),
+        "abs" | "round" => Some(Type::union_of(vec![Type::Int, Type::Float])),
+        _ => None,
+    }
+}
+
+/// `true` when `actual` can never be accepted by `name`'s first parameter —
+/// a scalar where an iterable is required, a container where a number or
+/// string is. Anything not provably wrong (a user class that may define the
+/// relevant dunder, `Unknown`, a type variable) is left alone.
+fn builtin_first_argument_definitely_rejected(name: &str, actual: &Type) -> bool {
+    let scalar = matches!(
+        actual,
+        Type::Int | Type::Float | Type::Bool | Type::None | Type::Function { .. }
+    );
+    let container_or_callable = matches!(
+        actual,
+        Type::Generic(..) | Type::Function { .. } | Type::None
+    );
+    match name {
+        "int" | "float" => container_or_callable,
+        "len" | "sorted" | "reversed" | "sum" | "any" | "all" | "enumerate" | "list" | "tuple"
+        | "set" | "frozenset" | "min" | "max" | "iter" => scalar,
+        "chr" => matches!(actual, Type::Str | Type::Bytes | Type::Float) || container_or_callable,
+        "ord" => scalar || matches!(actual, Type::Generic(..)),
+        "abs" | "round" => matches!(actual, Type::Str | Type::Bytes) || container_or_callable,
+        _ => false,
+    }
+}
+
+/// Check the first positional argument of a covered builtin call (see
+/// [`builtin_accepted_first_argument`]). A possibly-`None` argument is the
+/// `nullable_use` shape the rest of the checker reports for an unguarded
+/// optional; a definitely-wrong type is a `type_mismatch`. Skipped when the
+/// name is shadowed by a user binding, inside `unsafe:`, or when the argument
+/// type is not known well enough to judge.
+fn check_builtin_first_argument(
+    c: &mut Checker,
+    fn_name: &ruff_python_ast::ExprName,
+    pos_args: &[Expr],
+) {
+    let name = fn_name.id.as_str();
+    if c.unsafe_depth > 0 || c.env.lookup(name).is_some() {
+        return;
+    }
+    let Some(first) = pos_args.first() else {
+        return;
+    };
+    if matches!(first, Expr::Starred(_)) {
+        return;
+    }
+    let Some(accepted) = builtin_accepted_first_argument(name, pos_args.len()) else {
+        return;
+    };
+    let actual = infer_expr_readonly(c, first);
+    if matches!(actual, Type::Unknown | Type::Any | Type::TypeVar(_)) {
+        return;
+    }
+    let span = (
+        first.range().start().to_usize(),
+        first.range().end().to_usize(),
+    );
+    if actual.is_nullable() && !matches!(actual, Type::None) {
+        if let Expr::Name(n) = first {
+            c.nullable_use(n.id.as_str(), &accepted, span);
+        } else {
+            c.mismatch(&accepted, &actual, span);
+        }
+        return;
+    }
+    if builtin_first_argument_definitely_rejected(name, &actual) {
+        c.mismatch(&accepted, &actual, span);
     }
 }
 
@@ -12127,6 +12538,15 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // that mutates a narrowed variable (`except: x = None`) is reflected
             // downstream — restoring only `body_end` would silently drop it.
             let mut post_states: Vec<TypeEnv> = Vec::new();
+            // A name the body *rebinds* may hold any of the values assigned
+            // along the way when a handler runs — the raise can happen between
+            // any two statements — so even its pre-`try` narrowing is not a
+            // fact the handler may rely on (`x: int | None` narrowed to `int`,
+            // then `x = None` in the body, is `None` in `except`). Widen every
+            // such name to its declared type on entry to each handler; the
+            // same goes for attribute paths the body assigns.
+            let mut body_writes = LoopReassigned::default();
+            collect_reassigned_names(&t.body, &mut body_writes);
             for h in &t.handlers {
                 let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
                 // Enter the handler with the pre-`try` narrowings (keeping any
@@ -12134,6 +12554,12 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 // the body established, which a raise may have skipped.
                 c.env.restore(body_end.clone());
                 c.env.reset_narrowings_to(&pre_try);
+                for name in &body_writes.names {
+                    c.env.widen_to_declared(name);
+                }
+                for path in &body_writes.attrs {
+                    c.env.clear_attr_narrowing(path);
+                }
                 for s in &h.body {
                     check_stmt(c, s);
                 }
@@ -12562,6 +12988,17 @@ fn check_function(
         .get(name)
         .cloned()
         .unwrap_or_default();
+    // The body's own type parameters are opaque inside it (see
+    // `active_type_params`). Compiler-synthesised helpers keep the permissive
+    // reading — their bodies are generated, not user-written.
+    let saved_type_params = std::mem::replace(
+        &mut c.active_type_params,
+        if name.starts_with("__typhon_") {
+            Vec::new()
+        } else {
+            type_params.to_vec()
+        },
+    );
     // Snapshot the narrowed state of every enclosing scope (module globals and
     // any outer-function locals). A narrowing applied inside this body to an
     // enclosing binding (`if CACHE is None: return; use(CACHE)`) must hold for
@@ -12736,6 +13173,7 @@ fn check_function(
     c.current_return = saved_return;
     c.unsafe_origin_bindings = saved_unsafe_origins;
     c.active_typevar_bounds = saved_bounds;
+    c.active_type_params = saved_type_params;
     c.in_sync_function = saved_in_sync;
     c.in_async_function = saved_in_async;
     c.in_generator = saved_in_generator;
@@ -14798,6 +15236,38 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
             // isinstance(x, T)
             if let Expr::Name(fn_name) = call.func.as_ref() {
                 let pos_args = &call.arguments.args;
+                // A user-defined type guard: `def is_str_list(xs: list[object])
+                // -> TypeGuard[list[str]]`. In the true branch of
+                // `if is_str_list(xs):` the first argument *is* the guarded
+                // type (PEP 647). `TypeIs[T]` (PEP 742) additionally narrows
+                // the false branch by removing `T`; `TypeGuard` says nothing
+                // about it.
+                if let Some(Type::Function { ret, .. }) =
+                    c.function_signatures.get(fn_name.id.as_str())
+                {
+                    if let Type::Generic(head, guard_args) = ret.as_ref() {
+                        if (head == "TypeGuard" || head == "TypeIs") && guard_args.len() == 1 {
+                            if let Some(Expr::Name(target)) = pos_args.first() {
+                                if let Some(b) = c.env.lookup(target.id.as_str()) {
+                                    let replacement = if !negate {
+                                        Some(guard_args[0].clone())
+                                    } else if head == "TypeIs" {
+                                        Some(strip_variant(&b.narrowed, &guard_args[0]))
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(replacement) = replacement {
+                                        out.push(Narrowing {
+                                            name: target.id.as_str().to_owned(),
+                                            attr_path: None,
+                                            replacement,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 if fn_name.id.as_str() == "isinstance" && pos_args.len() == 2 {
                     if let Expr::Name(target) = &pos_args[0] {
                         let new_type = type_from_annotation(&pos_args[1], &c.classes);
@@ -15222,10 +15692,114 @@ fn emit_builtin_attr_not_found(
     ));
 }
 
+/// Signatures for the element-typed methods of the builtin containers, so
+/// `xs.append("str")` on a `list[int]`, `s.add(1)` on a `set[str]` or
+/// `d.setdefault(1, …)` on a `dict[str, int]` is a `tyc::type_mismatch` at the
+/// call instead of a silently corrupted container. Every entry mirrors the
+/// CPython signature: the checked parameters are the ones that take an element
+/// (or key / value); anything else (`key=` / `reverse=` on `sort`, the index
+/// on `pop`, the iterable on `extend` / `update`) is left `variadic` so the
+/// arity rule stays permissive. Return types follow CPython (`None` for the
+/// in-place mutators, `T` for `pop`, `int` for `index` / `count`).
+fn builtin_container_mutator(head: &str, attr: &str, args: &[Type]) -> Option<Type> {
+    let sig = |params: Vec<Type>, ret: Type, variadic: bool| {
+        Some(Type::Function {
+            params,
+            ret: Box::new(ret),
+            variadic,
+            min_params: None,
+        })
+    };
+    match (head, attr, args) {
+        ("list", "append", [t]) => sig(vec![t.clone()], Type::None, false),
+        ("list", "insert", [t]) => sig(vec![Type::Int, t.clone()], Type::None, false),
+        ("list", "remove", [t]) => sig(vec![t.clone()], Type::None, false),
+        ("list", "index", [t]) => sig(vec![t.clone()], Type::Int, true),
+        ("list", "count", [t]) => sig(vec![t.clone()], Type::Int, false),
+        ("list", "pop", [t]) => sig(vec![], t.clone(), true),
+        ("list", "extend", [_]) => sig(vec![Type::Unknown], Type::None, false),
+        ("list", "clear", [_]) | ("list", "reverse", [_]) => sig(vec![], Type::None, false),
+        ("list", "sort", [_]) => sig(vec![], Type::None, true),
+        ("list", "copy", [t]) => sig(vec![], Type::Generic("list".into(), vec![t.clone()]), false),
+        ("set", "add", [t]) | ("set", "discard", [t]) | ("set", "remove", [t]) => {
+            sig(vec![t.clone()], Type::None, false)
+        }
+        ("set", "pop", [t]) => sig(vec![], t.clone(), false),
+        ("set", "clear", [_]) => sig(vec![], Type::None, false),
+        ("set", "update", [_]) => sig(vec![], Type::None, true),
+        ("set", "copy", [t]) => sig(vec![], Type::Generic("set".into(), vec![t.clone()]), false),
+        ("set", "issubset", [_]) | ("set", "issuperset", [_]) | ("set", "isdisjoint", [_]) => {
+            sig(vec![Type::Unknown], Type::Bool, false)
+        }
+        ("dict", "setdefault", [k, v]) => sig(vec![k.clone()], v.clone(), true),
+        ("dict", "pop", [k, v]) => sig(vec![k.clone()], v.clone(), true),
+        ("dict", "clear", [_, _]) => sig(vec![], Type::None, false),
+        ("dict", "update", [_, _]) => sig(vec![], Type::None, true),
+        ("dict", "copy", [k, v]) => sig(
+            vec![],
+            Type::Generic("dict".into(), vec![k.clone(), v.clone()]),
+            false,
+        ),
+        _ => None,
+    }
+}
+
+/// Signatures for the `str` methods, so `", ".join([1, 2])` is a
+/// `tyc::type_mismatch` at the call and `s.split(",")` is a `list[str]` rather
+/// than `Unknown`. Checked parameters are the ones whose misuse is a certain
+/// `TypeError` (`join`'s iterable of `str`, `replace`'s two strings, the width
+/// of `center` / `zfill`, the affix of `removeprefix`); optional trailing
+/// parameters (`start` / `end`, `count`, `maxsplit`, `chars`) are left
+/// `variadic` so the arity rule stays permissive. `startswith` / `endswith`
+/// take a `str` *or a tuple of them*, so their affix stays unchecked.
+fn builtin_str_method(attr: &str) -> Option<Type> {
+    let sig = |params: Vec<Type>, ret: Type, variadic: bool| {
+        Some(Type::Function {
+            params,
+            ret: Box::new(ret),
+            variadic,
+            min_params: None,
+        })
+    };
+    let list_str = || Type::Generic("list".into(), vec![Type::Str]);
+    match attr {
+        "upper" | "lower" | "title" | "capitalize" | "casefold" | "swapcase" => {
+            sig(vec![], Type::Str, false)
+        }
+        "strip" | "lstrip" | "rstrip" | "format" | "expandtabs" => sig(vec![], Type::Str, true),
+        "replace" => sig(vec![Type::Str, Type::Str], Type::Str, true),
+        "removeprefix" | "removesuffix" => sig(vec![Type::Str], Type::Str, false),
+        "center" | "ljust" | "rjust" => sig(vec![Type::Int], Type::Str, true),
+        "zfill" => sig(vec![Type::Int], Type::Str, false),
+        "join" => sig(
+            vec![Type::Generic("Iterable".into(), vec![Type::Str])],
+            Type::Str,
+            false,
+        ),
+        "split" | "rsplit" | "splitlines" => sig(vec![], list_str(), true),
+        "partition" | "rpartition" => sig(
+            vec![Type::Str],
+            Type::Generic("tuple".into(), vec![Type::Str, Type::Str, Type::Str]),
+            false,
+        ),
+        "find" | "rfind" | "index" | "rindex" | "count" => sig(vec![Type::Str], Type::Int, true),
+        "startswith" | "endswith" => sig(vec![Type::Unknown], Type::Bool, true),
+        "isdigit" | "isalpha" | "isalnum" | "isspace" | "isupper" | "islower" | "istitle"
+        | "isnumeric" | "isdecimal" | "isidentifier" | "isprintable" | "isascii" => {
+            sig(vec![], Type::Bool, false)
+        }
+        "encode" => sig(vec![], Type::Bytes, true),
+        _ => None,
+    }
+}
+
 fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
     let Type::Generic(head, args) = recv else {
         return None;
     };
+    if let Some(sig) = builtin_container_mutator(head, attr, args) {
+        return Some(sig);
+    }
     match (head.as_str(), attr, args.as_slice()) {
         ("dict", "get", [k, v]) => {
             // `d.get(k)` → V?  ;  `d.get(k, default)` → also typed as V?
@@ -15986,6 +16560,37 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
     result
 }
 
+/// The structural type of a lambda with no expected `Callable` to check it
+/// against: its *arity* (so a call site expecting `Callable[[int, int], int]`
+/// rejects `lambda x: x` at check time instead of TypeError-ing at runtime)
+/// with `Unknown` parameter and return types, since a lambda carries no
+/// annotations. `params` lists every positional parameter; a defaulted tail
+/// is recorded through `min_params` (exactly as `def` signatures do), so
+/// `lambda x, y=1: …` satisfies both `Callable[[int], R]` and
+/// `Callable[[int, int], R]`. Only `*args` makes the lambda variadic —
+/// `**kwargs` never absorbs a positional argument.
+fn lambda_structural_type(lam: &ruff_python_ast::ExprLambda) -> Type {
+    let (n, required, variadic) = match lam.parameters.as_deref() {
+        Some(p) => {
+            let positional = p.posonlyargs.len() + p.args.len();
+            let required = p
+                .posonlyargs
+                .iter()
+                .chain(p.args.iter())
+                .take_while(|a| a.default.is_none())
+                .count();
+            (positional, required, p.vararg.is_some())
+        }
+        None => (0, 0, false),
+    };
+    Type::Function {
+        params: vec![Type::Unknown; n],
+        ret: Box::new(Type::Unknown),
+        variadic,
+        min_params: (required < n).then_some(required),
+    }
+}
+
 fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type {
     match expr {
         Expr::BooleanLiteral(_) => Type::Bool,
@@ -16015,6 +16620,96 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
         }
         Expr::BytesLiteral(_) => Type::Bytes,
         Expr::NoneLiteral(_) => Type::None,
+        // A lambda in a position whose expected type is a `Callable` — a
+        // `Callable[[…], R]` parameter, an annotated `let`, a declared return —
+        // is checked *against that contract*: each positional parameter is
+        // bound to the corresponding expected parameter type, the body is
+        // inferred (so its own diagnostics surface: a misspelt attribute, a
+        // method that does not exist on the parameter's type), and the body's
+        // type must be assignable to `R`. Without an expected `Callable` the
+        // lambda keeps its structural shape from `infer_expr` (parameters
+        // `Unknown`), because a lambda has no annotations of its own.
+        Expr::Lambda(lam) => {
+            let expected_fn = match expected.map(|t| c.unwrap_alias(t)) {
+                Some(Type::Function { params, ret, .. }) => Some((params, *ret)),
+                _ => None,
+            };
+            let shape = lambda_structural_type(lam);
+            let Some((exp_params, exp_ret)) = expected_fn else {
+                return shape;
+            };
+            let (variadic, min_params) = match &shape {
+                Type::Function {
+                    variadic,
+                    min_params,
+                    ..
+                } => (*variadic, *min_params),
+                _ => (false, None),
+            };
+            let mut bound_params: Vec<Type> = Vec::new();
+            c.env.enter();
+            if let Some(params) = lam.parameters.as_deref() {
+                let positional = params.posonlyargs.iter().chain(params.args.iter());
+                for (i, pwd) in positional.enumerate() {
+                    let ty = exp_params.get(i).cloned().unwrap_or(Type::Unknown);
+                    bound_params.push(ty.clone());
+                    let name = pwd.parameter.name.as_str();
+                    let start = pwd.parameter.name.range.start().to_usize();
+                    c.env.declare(TypeBinding {
+                        name: name.to_owned(),
+                        declared: ty.clone(),
+                        narrowed: ty,
+                        span: (start, start + name.len()),
+                        from_unsafe: c.unsafe_depth > 0,
+                    });
+                }
+                // Keyword-only, `*args` and `**kwargs` parameters have no
+                // positional slot in a `Callable` to take a type from.
+                let rest = params
+                    .kwonlyargs
+                    .iter()
+                    .map(|pwd| &pwd.parameter)
+                    .chain(params.vararg.iter().map(|p| p.as_ref()))
+                    .chain(params.kwarg.iter().map(|p| p.as_ref()));
+                for param in rest {
+                    let name = param.name.as_str();
+                    let start = param.name.range.start().to_usize();
+                    c.env.declare(TypeBinding {
+                        name: name.to_owned(),
+                        declared: Type::Unknown,
+                        narrowed: Type::Unknown,
+                        span: (start, start + name.len()),
+                        from_unsafe: c.unsafe_depth > 0,
+                    });
+                }
+            }
+            let body_ty = infer_expr_ctx(c, &lam.body, Some(&exp_ret));
+            c.env.leave();
+            // The body must produce what the contract promises. Report it on
+            // the body and hand back the *expected* return so the enclosing
+            // assignability check does not report the same span twice.
+            let ret = if !matches!(exp_ret, Type::Unknown | Type::Any)
+                && !matches!(body_ty, Type::Unknown)
+                && !c.is_assignable(&exp_ret, &body_ty)
+            {
+                let span = (
+                    lam.body.range().start().to_usize(),
+                    lam.body.range().end().to_usize(),
+                );
+                c.mismatch(&exp_ret, &body_ty, span);
+                exp_ret
+            } else if matches!(body_ty, Type::Unknown) {
+                exp_ret
+            } else {
+                body_ty
+            };
+            Type::Function {
+                params: bound_params,
+                ret: Box::new(ret),
+                variadic,
+                min_params,
+            }
+        }
         // Walrus `(target := value)` — bind `target` in the current scope to
         // the value's type and evaluate to that type. Without this arm the
         // binding was invisible to the checker (every read of `target`
@@ -16077,40 +16772,6 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 }
             }
             Type::Str
-        }
-        // Lambdas carry their *arity* into the type so a call site
-        // expecting `Callable[[int, int], int]` rejects `lambda x: x`
-        // at check time instead of TypeError-ing at runtime. Parameter
-        // and return types stay `Unknown` (no annotations on lambdas);
-        // defaults or `*args` / `**kwargs` mark the function variadic so
-        // optional-argument lambdas keep matching any arity.
-        Expr::Lambda(lam) => {
-            let (n, variadic) = match lam.parameters.as_deref() {
-                Some(p) => {
-                    let required = p
-                        .posonlyargs
-                        .iter()
-                        .chain(p.args.iter())
-                        .filter(|a| a.default.is_none())
-                        .count();
-                    let has_optional = p
-                        .posonlyargs
-                        .iter()
-                        .chain(p.args.iter())
-                        .any(|a| a.default.is_some());
-                    (
-                        required,
-                        has_optional || p.vararg.is_some() || p.kwarg.is_some(),
-                    )
-                }
-                None => (0, false),
-            };
-            Type::Function {
-                params: vec![Type::Unknown; n],
-                ret: Box::new(Type::Unknown),
-                variadic,
-                min_params: None,
-            }
         }
         Expr::Name(n) => {
             if let Some(b) = c.env.lookup(n.id.as_str()) {
@@ -16578,6 +17239,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         }
                     }
                 }
+                check_builtin_first_argument(c, fn_name, pos_args);
             }
 
             // Phase E: blocking-in-async call detection. When the
@@ -17198,12 +17860,25 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                             || (!c.is_plain_class(&name)
                                 && !c.is_raw_class(&name)
                                 && c.class_hierarchy_fully_known(&name));
-                        // `kwonly_names` matters as much as `param_names`
-                        // here: a `model` class files every field as
-                        // keyword-only (Pydantic's `__init__` is `**data`), so
-                        // reading only `param_names` would skip the check for
-                        // exactly the classes that need it.
-                        if !info.param_names.is_empty()
+                        // A `plain class` gets no generated constructor: its
+                        // annotations are not `__init__` parameters. Without a
+                        // hand-written `__init__` it is `object.__init__` —
+                        // zero arguments — so `Bag()` is right and `Bag(1)` is
+                        // the TypeError; with one, its own signature governs
+                        // (checked through the method arity path, not the
+                        // field list). `class!` keeps the field check: its
+                        // `__init__` is synthesised from the fields.
+                        let user_init = c.find_method(&name, "__init__").is_some();
+                        if c.is_plain_class(&name) {
+                            if !user_init
+                                && (!pos_args.is_empty() || kw_args.iter().any(|k| k.arg.is_some()))
+                            {
+                                c.wrong_args(&name, 0, pos_args.len() + kw_args.len(), call_span);
+                            }
+                        } else if user_init && c.is_raw_class(&name) {
+                            // A hand-written `__init__` on a `class!` need not
+                            // mirror the fields; leave the arity to it.
+                        } else if !info.param_names.is_empty()
                             || !info.kwonly_names.is_empty()
                             || shape_is_authoritative
                         {
@@ -17806,6 +18481,9 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     Type::Unknown
                 }
                 Type::Str => {
+                    if let Some(sig) = builtin_str_method(attr_name) {
+                        return sig;
+                    }
                     if !is_known_primitive_attr("str", attr_name)
                         && !is_user_builtin_extension(c, "str", attr_name)
                     {
@@ -19083,6 +19761,17 @@ fn check_override_compatibility(c: &mut Checker, body: &[Stmt]) {
 
 /// `true` when any base of `cd` is one of the standard enum bases (bare or
 /// `enum.`-qualified) — the shape the `enum Name:` keyword desugars to.
+/// The last name segment of a base-class expression: `Base` → `Base`,
+/// `enum.StrEnum` → `StrEnum`, `Generic[T]` → `Generic`.
+fn base_last_segment(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Name(n) => Some(n.id.as_str()),
+        Expr::Attribute(a) => Some(a.attr.as_str()),
+        Expr::Subscript(s) => base_last_segment(&s.value),
+        _ => None,
+    }
+}
+
 fn class_has_enum_family_base(cd: &ruff_python_ast::StmtClassDef) -> bool {
     fn last_segment(e: &Expr) -> Option<&str> {
         match e {
@@ -21639,6 +22328,513 @@ def f(x: int | str | list[int]) -> int:
         assert!(
             check(negative_is_the_remainder).has_errors(),
             "list[int] has no upper, so the negative branch must be the remainder"
+        );
+    }
+
+    /// A name the `try` body rebinds is widened on entry to each handler:
+    /// the raise may have happened after the rebind, so neither the body's
+    /// narrowing nor the pre-`try` one holds there.
+    #[test]
+    fn except_handler_widens_names_the_try_body_rebinds() {
+        let unsound = "\
+def risky() -> None:
+    pass
+
+def f(x: int | None) -> int:
+    if x is None:
+        return 0
+    try:
+        x = None
+        risky()
+    except ValueError:
+        return x + 1
+    return 1
+";
+        assert!(
+            check(unsound).has_errors(),
+            "x may be None in the handler after the body rebinds it"
+        );
+        // A rebind to a value of the declared type is still fine to use.
+        let ok = "\
+def risky() -> None:
+    pass
+
+def g(x: int) -> int:
+    try:
+        x = 2
+        risky()
+    except ValueError:
+        return x + 1
+    return x
+";
+        let d = check(ok);
+        assert!(!d.has_errors(), "declared int stays usable: {d:?}");
+    }
+
+    /// A lambda's defaulted tail widens the `Callable` shapes it satisfies,
+    /// exactly like a `def`'s; `**kwargs` does not absorb positionals.
+    #[test]
+    fn lambda_shape_honours_defaults_and_kwargs() {
+        let ok = "\
+def apply1(f: Callable[[int], int], x: int) -> int:
+    return f(x)
+
+def apply2(f: Callable[[int, int], int], x: int) -> int:
+    return f(x, x)
+
+def main() -> None:
+    print(apply1(lambda a, b=1: a + b, 2))
+    print(apply2(lambda a, b=1: a + b, 2))
+";
+        let d = check(ok);
+        assert!(
+            !d.has_errors(),
+            "defaulted lambda tail must satisfy both shapes: {d:?}"
+        );
+        let bad = "\
+def apply1(f: Callable[[int], int], x: int) -> int:
+    return f(x)
+
+def main() -> None:
+    print(apply1(lambda **kw: 1, 2))
+";
+        assert!(
+            check(bad).has_errors(),
+            "a **kwargs-only lambda cannot take the positional the Callable passes"
+        );
+    }
+
+    /// A lambda passed where a `Callable` is expected is checked against
+    /// that contract: parameter types flow into the body, and the body's
+    /// type must match the declared return.
+    #[test]
+    fn lambda_body_is_checked_against_the_expected_callable() {
+        let bad_attr = "\
+class Item:
+    name: str
+
+def pick(items: list[Item], key: Callable[[Item], str]) -> str:
+    return key(items[0])
+
+def main() -> None:
+    print(pick([Item(name=\"a\")], lambda it: it.nmae))
+";
+        assert!(
+            check(bad_attr).has_errors(),
+            "a misspelt attribute inside the lambda body must be reported"
+        );
+        let bad_ret = "\
+def apply(f: Callable[[int], str], x: int) -> str:
+    return f(x)
+
+def main() -> None:
+    print(apply(lambda n: n + 1, 2))
+";
+        assert!(
+            check(bad_ret).has_errors(),
+            "an int-valued body does not satisfy Callable[[int], str]"
+        );
+        let ok = "\
+class Item:
+    name: str
+
+def pick(items: list[Item], key: Callable[[Item], str]) -> str:
+    return key(items[0])
+
+def apply(f: Callable[[int], str], x: int) -> str:
+    return f(x)
+
+def main() -> None:
+    print(pick([Item(name=\"a\")], lambda it: it.name))
+    print(apply(lambda n: str(n + 1), 2))
+    let g: Callable[[int], int] = lambda v: v * 2
+    print(g(3))
+";
+        let d = check(ok);
+        assert!(!d.has_errors(), "well-typed lambda bodies pass: {d:?}");
+    }
+
+    /// Element-typed container methods check their arguments.
+    #[test]
+    fn container_mutators_check_element_types() {
+        for (src, what) in [
+            (
+                "def f(xs: list[int]) -> None:\n    xs.append(\"s\")\n",
+                "list.append",
+            ),
+            (
+                "def f(xs: list[int]) -> None:\n    xs.insert(0, \"s\")\n",
+                "list.insert",
+            ),
+            ("def f(s: set[str]) -> None:\n    s.add(1)\n", "set.add"),
+            (
+                "def f(d: dict[str, int]) -> None:\n    d.setdefault(1, 2)\n",
+                "dict.setdefault key",
+            ),
+            (
+                "def f(xs: list[int]) -> str:\n    return xs.pop()\n",
+                "list.pop returns the element type",
+            ),
+        ] {
+            assert!(check(src).has_errors(), "{what} must be rejected");
+        }
+        let ok = "\
+def f(xs: list[int], s: set[str], d: dict[str, list[int]]) -> int:
+    xs.append(1)
+    xs.insert(0, 2)
+    xs.extend([3, 4])
+    xs.sort(reverse=True)
+    s.add(\"a\")
+    s.update([\"b\"])
+    d.setdefault(\"k\", []).append(1)
+    let n: int = xs.pop() + xs.count(1) + xs.index(2)
+    let copy: list[int] = xs.copy()
+    return n + len(copy)
+";
+        let d = check(ok);
+        assert!(!d.has_errors(), "well-typed container use passes: {d:?}");
+    }
+
+    /// Inside a generic body its own type parameter is opaque: only a `T`
+    /// flows into `T`, and a `T` flows only into `T` (or its bound / object).
+    #[test]
+    fn type_parameters_are_opaque_inside_their_own_body() {
+        let holes = [
+            ("def ident[T](x: T) -> T:\n    return 42\n", "int into T"),
+            ("def to_int[T](x: T) -> int:\n    return x\n", "T into int"),
+            (
+                "def ident[T](x: T) -> T:\n    let s: str = x\n    return x\n",
+                "T into a str binding",
+            ),
+        ];
+        for (src, what) in holes {
+            assert!(check(src).has_errors(), "{what} must be rejected");
+        }
+        let ok = "\
+class Base:
+    n: int
+
+def first[T](xs: list[T]) -> T:
+    return xs[0]
+
+def pick[T](a: T, b: T, c: bool) -> T:
+    return a if c else b
+
+def wrap[T](x: T) -> list[T]:
+    return [x]
+
+def opt[T](x: T | None, d: T) -> T:
+    return d if x is None else x
+
+def twice[T](f: Callable[[T], T], x: T) -> T:
+    return f(f(x))
+
+def ident[T](x: T) -> T:
+    return x
+
+def chain[T](x: T) -> T:
+    return ident(x)
+
+def as_object[T](x: T) -> object:
+    return x
+
+def via_bound[T: Base](x: T) -> Base:
+    return x
+
+def maybe[T](x: T) -> T | None:
+    return x
+
+def main() -> None:
+    print(first([1]), pick(1, 2, True), wrap(\"a\"), opt(None, 3), twice(lambda v: v, 1), chain(5))
+    print(as_object(1), via_bound(Base(n=1)).n, maybe(2))
+";
+        let d = check(ok);
+        assert!(!d.has_errors(), "legitimate generic bodies pass: {d:?}");
+    }
+
+    /// `async` and `@property` are part of an interface member's contract.
+    #[test]
+    fn interface_conformance_checks_async_and_property() {
+        let sync_for_async = "\
+interface Fetcher:
+    async def fetch(self) -> int
+
+class Sync:
+    n: int
+
+impl Sync:
+    def fetch(self) -> int:
+        return self.n
+
+def use(f: Fetcher) -> None:
+    pass
+
+def main() -> None:
+    use(Sync(n=1))
+";
+        assert!(
+            check(sync_for_async).has_errors(),
+            "a sync method does not implement an async interface method"
+        );
+        let method_for_property = "\
+interface Shape:
+    @property
+    def area(self) -> float
+
+class Sq:
+    side: float
+
+impl Sq:
+    def area(self) -> float:
+        return self.side * self.side
+
+def use(s: Shape) -> float:
+    return s.area
+
+def main() -> None:
+    print(use(Sq(side=2.0)))
+";
+        assert!(
+            check(method_for_property).has_errors(),
+            "a plain method does not implement a @property member"
+        );
+        let method_for_field = "\
+interface Named:
+    name: str
+
+class Thing:
+    n: int
+
+impl Thing:
+    def name(self) -> str:
+        return \"t\"
+
+def use(x: Named) -> str:
+    return x.name
+
+def main() -> None:
+    print(use(Thing(n=1)))
+";
+        assert!(
+            check(method_for_field).has_errors(),
+            "a zero-argument method does not implement a field"
+        );
+        let ok = "\
+import asyncio
+
+interface Fetcher:
+    async def fetch(self) -> int
+
+interface Shape:
+    @property
+    def area(self) -> float
+
+interface Named:
+    name: str
+
+class Async:
+    n: int
+
+impl Async:
+    async def fetch(self) -> int:
+        await asyncio.sleep(0)
+        return self.n
+
+class Sq:
+    side: float
+
+impl Sq:
+    @property
+    def area(self) -> float:
+        return self.side * self.side
+
+class Flat:
+    area: float
+
+class Thing:
+    name: str
+
+class Prop:
+    n: int
+
+impl Prop:
+    @property
+    def name(self) -> str:
+        return \"p\"
+
+def use_f(f: Fetcher) -> None:
+    pass
+
+def use_s(s: Shape) -> float:
+    return s.area
+
+def use_n(x: Named) -> str:
+    return x.name
+
+def main() -> None:
+    use_f(Async(n=1))
+    print(use_s(Sq(side=2.0)), use_s(Flat(area=1.0)))
+    print(use_n(Thing(name=\"a\")), use_n(Prop(n=1)))
+";
+        let d = check(ok);
+        assert!(!d.has_errors(), "conforming implementations pass: {d:?}");
+    }
+
+    /// The first argument of the everyday builtins is checked for nullability
+    /// and for definitely-wrong types.
+    #[test]
+    fn builtin_first_argument_is_checked() {
+        for (src, what) in [
+            (
+                "def f(d: dict[str, str]) -> int:\n    return int(d.get(\"n\"))\n",
+                "int() of a possibly-None value",
+            ),
+            (
+                "def f(n: int) -> int:\n    return len(n)\n",
+                "len() of an int",
+            ),
+            (
+                "def f(n: float) -> list[int]:\n    return sorted(n)\n",
+                "sorted() of a float",
+            ),
+            (
+                "def f(xs: list[int]) -> int:\n    return int(xs)\n",
+                "int() of a list",
+            ),
+            (
+                "def f(s: str) -> str:\n    return chr(s)\n",
+                "chr() of a str",
+            ),
+            (
+                "def f(xs: list[int] | None) -> int:\n    return sum(xs)\n",
+                "sum() of a nullable list",
+            ),
+        ] {
+            assert!(check(src).has_errors(), "{what} must be rejected");
+        }
+        let ok = "\
+class Money:
+    cents: int
+
+def f(d: dict[str, str], xs: list[int], s: str, m: Money, n: int, w: str | None, b: bytes) -> None:
+    print(int(d.get(\"n\", \"0\")), int(\"3\"), int(2.5), float(n), len(xs), len(s))
+    print(sorted(xs), sum(xs), min(1, 2), max(xs), any(xs), list(s), set(xs))
+    print(chr(65), ord(\"a\"), abs(-1), round(2.5), round(1.234, 2))
+    print(int(m), len(m), iter(xs), min(xs), int(n), sum([1.5]))
+    print(iter(xs[::-1]), sorted(xs[1:]), len(s[1:]), ord(s[0]), int(s[-1]), chr(b[0]), len(b[1:]))
+    if w is not None:
+        print(int(w))
+";
+        let d = check(ok);
+        assert!(!d.has_errors(), "well-typed builtin calls pass: {d:?}");
+    }
+
+    /// `str` methods carry real signatures: element-checked `join`, typed
+    /// results for `split` / `find` / `startswith`.
+    #[test]
+    fn str_methods_are_typed() {
+        for (src, what) in [
+            (
+                "def f(xs: list[int]) -> str:\n    return \", \".join(xs)\n",
+                "join over list[int]",
+            ),
+            (
+                "def f(s: str) -> str:\n    return s.replace(1, \"x\")\n",
+                "replace with an int pattern",
+            ),
+            (
+                "def f(s: str) -> int:\n    return s.split(\",\")\n",
+                "split is a list[str], not an int",
+            ),
+            (
+                "def f(s: str) -> str:\n    return s.zfill(\"8\")\n",
+                "zfill takes an int",
+            ),
+        ] {
+            assert!(check(src).has_errors(), "{what} must be rejected");
+        }
+        let ok = "\
+def f(s: str, names: list[str], parts: tuple[str, str], d: dict[str, int]) -> None:
+    let joined: str = \", \".join(names) + \"\".join(str(n) for n in [1, 2]) + \"-\".join(parts)
+    let keys: str = \" \".join(d.keys()) + \" \".join(sorted(names))
+    let words: list[str] = s.split() + s.split(\",\", 1) + s.splitlines()
+    let n: int = s.find(\"x\") + s.count(\"a\", 1) + s.index(\"b\", 0, 3)
+    let ok: bool = s.startswith(\"a\") or s.endswith((\"x\", \"y\")) or s.isdigit()
+    let t: str = s.strip().upper().replace(\"a\", \"b\", 1).center(10, \"*\").zfill(3)
+    let head, sep, tail = s.partition(\":\")
+    let b: bytes = s.encode() + s.encode(\"utf-8\", errors=\"ignore\")
+    print(joined, keys, words, n, ok, t, head, sep, tail, b)
+";
+        let d = check(ok);
+        assert!(!d.has_errors(), "well-typed str method use passes: {d:?}");
+    }
+
+    /// A `TypeGuard[T]` / `TypeIs[T]` function narrows its argument.
+    #[test]
+    fn type_guard_functions_narrow_their_argument() {
+        let src = "\
+from typing import TypeGuard, TypeIs
+
+def is_str_list(xs: list[object]) -> TypeGuard[list[str]]:
+    return all(isinstance(x, str) for x in xs)
+
+def is_int(x: int | str) -> TypeIs[int]:
+    return isinstance(x, int)
+
+def join_all(xs: list[object]) -> str:
+    if is_str_list(xs):
+        return \",\".join(xs)
+    return \"\"
+
+def describe(x: int | str) -> str:
+    if is_int(x):
+        return str(x + 1)
+    return x.upper()
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "guards must narrow: {d:?}");
+        let unguarded = "\
+def join_all(xs: list[object]) -> str:
+    return \",\".join(xs)
+";
+        assert!(
+            check(unguarded).has_errors(),
+            "without the guard list[object] is not an Iterable[str]"
+        );
+    }
+
+    /// A `plain class` has no generated constructor: zero arguments without an
+    /// `__init__`, its own signature with one.
+    #[test]
+    fn plain_class_constructor_takes_no_field_arguments() {
+        let ok = "\
+plain class Bag:
+    items: list[str]
+
+plain class Box:
+    n: int
+
+    def __init__(self, n: int) -> None:
+        self.n = n
+
+def main() -> None:
+    let b: Bag = Bag()
+    let x: Box = Box(3)
+    print(type(b).__name__, x.n)
+";
+        let d = check_class_kinds(ok);
+        assert!(!d.has_errors(), "plain constructors: {d:?}");
+        let bad = "\
+plain class Bag:
+    items: list[str]
+
+def main() -> None:
+    let b: Bag = Bag([\"x\"])
+    print(b)
+";
+        assert!(
+            check_class_kinds(bad).has_errors(),
+            "object.__init__ takes no arguments"
         );
     }
 
@@ -29027,10 +30223,12 @@ let p: Owner = Person(pet=Dog(name=\"Fido\"))
     }
 
     #[test]
-    fn interface_field_satisfied_by_zero_arity_method_passes() {
-        // A zero-argument method (property-like) may satisfy an interface field.
-        // In Typhon's class shape, `def name(self)` records arity 0 (self excluded).
-        let src = "\
+    fn interface_field_satisfied_by_property_not_by_plain_method() {
+        // Reading `d.name` through `Named` must yield the `str` the interface
+        // promises. A `@property` does; a plain zero-argument method yields a
+        // bound method instead (so `d.name.upper()` raises AttributeError and
+        // `print(d.name)` prints `<bound method …>`), and no longer conforms.
+        let plain = "\
 interface Named:
     name: str
 
@@ -29040,10 +30238,25 @@ class Dog:
 
 let d: Named = Dog()
 ";
-        let d = check(src);
+        assert!(
+            check(plain).has_errors(),
+            "a plain zero-arity method must not satisfy an interface field"
+        );
+        let property = "\
+interface Named:
+    name: str
+
+class Dog:
+    @property
+    def name(self) -> str:
+        return \"Fido\"
+
+let d: Named = Dog()
+";
+        let d = check(property);
         assert!(
             !d.has_errors(),
-            "zero-arity method should satisfy interface field; errors: {:?}",
+            "a @property of the right type satisfies the field; errors: {:?}",
             d.errors()
         );
     }

@@ -189,7 +189,7 @@ All standard literals, including f-strings with `{x:.2f}` width / precision / co
 
 Full `if`/`elif`/`else`/`while`/`for`/`break`/`continue`/`return`/`pass`. `match` with literal / capture / wildcard / sequence / class patterns, including native `Ok(x)` / `Err(e)` matching. Arm bodies execute against the parent env (v0.3.1 N9 fix — pattern captures lift into the parent env on accept, matching CPython).
 
-Functions with positional/keyword/default/`*args`/`**kwargs`/closures, recursion (1000-frame default since v0.8.0; configurable). Classes with annotated-field constructor synth, explicit `__init__`, methods (in `class` body or sibling `impl Foo:`), single and multi-level inheritance (fields accumulate across the full MRO, v0.11.0). `enum Name:` declarations resolve natively against the VM's `enum` shim (v0.11.0).
+Functions with positional/keyword/default/`*args`/`**kwargs`/closures, recursion (a fixed 1000-frame limit since v0.8.0, matching CPython's default `sys.getrecursionlimit()`; **not configurable** — no public setter on the `Interpreter`, no `sys.setrecursionlimit` in the shim — exceeding it raises `RecursionError`). Classes with annotated-field constructor synth, explicit `__init__`, methods (in `class` body or sibling `impl Foo:`), single and multi-level inheritance (fields accumulate across the full MRO, v0.11.0). `enum Name:` declarations resolve natively against the VM's `enum` shim (v0.11.0).
 
 Decorators: `@pure`, `@dataclass`, `@gatherable`, `@override`, `@final`, `@staticmethod` (no-ops); `@memo` / `@cache` / `@lru_cache` (value-keyed memoisation). **`@property` getters fire on attribute read and `@classmethod` binds `cls` (v0.10.0)** — both inherited through bases, with the descriptor marker cleared on override.
 
@@ -211,8 +211,8 @@ Built-in method dispatch on `str` / `bytes` (v0.11.0) / `list` / `dict` (incl. `
 | Module | Surface |
 |---|---|
 | `math` | `pi`, `e`, `inf`, `nan`, `sqrt`, `floor`, `ceil`, `log` (with base), `log2`, `log10`, `exp`, `sin`, `cos`, `tan`, `pow`, `fabs`. v0.10.0: `gcd`, `lcm`, `factorial`, `isqrt`, `comb`, `perm` (reject non-int args). v0.12.0: `isnan`, `isinf`, `isfinite` |
-| `os` | `getenv`, `environ`, `path.exists`, `path.isfile`, `path.isdir` |
-| `sys` | `argv`, `platform`, `version`, `exit(code)` |
+| `os` / `os.path` | `getenv`, `environ`, `path.exists`, `path.isfile`, `path.isdir`. `import os.path` resolves to the same shim |
+| `sys` | `argv`, `platform`, `version`, `exit(code)`, `stdout`, `stderr`. No `setrecursionlimit` / `getrecursionlimit` |
 | `json` | `dumps`, `loads` (full JSON 7159 surface). `json.load(f)` / `json.dump(obj, f)` ride on top of `open()` since v0.9.0. v0.10.0: `dumps(indent=…)`. v0.12.0: `dumps(sort_keys=True)` |
 | `time` | `time()`, `sleep()`, `monotonic()` (fixed in v0.10.0), `perf_counter()` / `process_time()` (v0.10.0) |
 | `datetime` (v0.11.0) | `datetime(y, mo, d, …)`, `.now()`, `.fromisoformat()`, `.isoformat()`, `+ timedelta`, comparisons; `timedelta(seconds=…)` arithmetic. **Naïve / UTC only** — tz-aware arithmetic still needs `--compile` |
@@ -220,6 +220,9 @@ Built-in method dispatch on `str` / `bytes` (v0.11.0) / `list` / `dict` (incl. `
 | `random` | `random()`, `seed(n)`, `getrandbits`, `randint`, `randrange`, `uniform`, `gauss`, `choice`, `shuffle`, `sample` — a **CPython-compatible MT19937** (follows `random.py` / `_randommodule.c`), so `random.seed(n)` yields a **byte-identical sequence** under `tyc run` and `tyc build` + CPython. Unseeded, it seeds from OS-derived entropy like CPython does at import, so each run differs (v1.0.0-alpha.8; previously a fixed constant, which made `tyc run` repeatable where CPython is not). String / bytes / float seeds are rejected — use `tyc run --compile`. **Not** cryptographic: use `secrets` |
 | `re` (v0.8.0) | `match`, `search`, `findall`, `sub`, `split`, `compile`. `match` is anchored at the start of the string. Some flag arguments accepted but ignored |
 | `typing` (v0.8.0) | Generic constructors are runtime no-ops; type-only imports are stripped by the desugar pre-pass |
+| `collections.abc` | The abstract container types (`Callable`, `Iterable`, `Iterator`, `Generator`, `Sequence`, `Mapping`, `MutableMapping`, `Set`, `Hashable`, `Awaitable`, `Coroutine`, `AsyncIterator`, the `*View`s, …) as identity natives — annotation-only at runtime, like the `typing` shim |
+| `abc` (v0.15.6) | `ABC`, `ABCMeta`, `abstractmethod`, `abstractclassmethod`, `abstractstaticmethod`, `abstractproperty`, `update_abstractmethods` as identity natives; a non-class base such as `ABC` is ignored at class creation, so `class H(ABC): @abstractmethod def handle(...)` runs |
+| `asyncio` | Cooperative-sequential shim: `run`, `gather` (incl. `return_exceptions=True`), `TaskGroup` (`create_task`, `__aenter__` / `__aexit__`), `sleep` (real wall-clock), `timeout` (checked at scope exit), `Queue` (fails loudly instead of deadlocking), and the exception classes (`TimeoutError`, `CancelledError`, …). Coroutines are forced to completion at their `await` — see §2.5 for the interleaving caveat |
 | `collections` (v0.8.0) | `OrderedDict`, `defaultdict`, `Counter`, `namedtuple`. **`collections.deque`** added in v0.9.0 — rides on `Value::List` via new `popleft` / `appendleft` / `extendleft` / `rotate` list methods. v0.11.0: `defaultdict(factory)` actually invokes the factory on missing-key access via subscript `__missing__` (`dd[k] += 1` works) |
 | `functools` (v0.8.0) | `lru_cache`, `cache`, `cached_property`, `reduce`, `partial` |
 | `itertools` (v0.8.0) | `chain`, `count`, `cycle`, `accumulate`, `combinations`, `permutations`, `product`, `islice`, `takewhile`, `dropwhile`, `groupby` (honours `key=` since v0.11.0) |
@@ -228,7 +231,9 @@ Built-in method dispatch on `str` / `bytes` (v0.11.0) / `list` / `dict` (incl. `
 | `heapq` (v0.9.0) | `heappush`, `heappop`, `heapify`, `heappushpop`, `heapreplace`, `nsmallest`, `nlargest` |
 | `contextlib` (v0.9.0) | `@contextmanager` identity decorator; `with` block honours the wrapped `__enter__` / `__exit__` shape |
 | `pydantic` (v0.9.0) | `BaseModel` placeholder so declaring a `model` doesn't `ImportError` (full validation still requires `--compile`) |
-| `typhon_runtime` | `Ok`, `Err`, `tasks.spawn` (synchronous shim), `lazy.lazy_let`, `lazy.lazy_import`. `Ok` / `Err` carry bound `.map` / `.map_err` / `.and_then` / `.or_else` combinators since v0.9.0 |
+| `typhon_runtime` (and `typhon_runtime.*`) | `Ok`, `Err`, `tasks.spawn` (synchronous shim), `lazy.lazy_let`, `lazy.lazy_import`. `Ok` / `Err` carry bound `.map` / `.map_err` / `.and_then` / `.or_else` combinators since v0.9.0. Submodule imports (`from typhon_runtime.freeze import deep_freeze`) resolve to the matching submodule |
+
+`enum` is resolved separately by the interpreter (it backs the `enum` keyword), not through this table. Any other module raises `ImportError` with a pointer to `--compile`.
 
 ### 2.4a Built-in builtins surface (v0.9.0 → v0.12.0 additions)
 
@@ -266,7 +271,7 @@ The VM walks the project source root and loads sibling `.ty` modules on demand. 
 
 ### 2.6 Fallback rule
 
-`tyc run` falls back to `--compile` (alias `--no-vm`) whenever the program imports a module the VM can't speak natively. The VM raises `ImportError` with a pointer to `--compile`.
+`tyc run` does **not** fall back to the compiled path on its own: when the program imports a module the VM can't speak natively, the VM raises `ImportError` with a pointer to `--compile` (alias `--no-vm`), and you re-run with that flag.
 
 As of **v0.3.1**, `tyc run` (VM mode) gates on the static `tyc check` pipeline first — unresolved names, type mismatches, and arity errors fail the same way `tyc check` would. Set `TYC_SKIP_CHECK=1` to bypass for stress harnesses; `--compile` has no equivalent bypass because the build pipeline always type-checks.
 

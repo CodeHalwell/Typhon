@@ -102,14 +102,12 @@ unsafe impl salsa::Update for ArcPreprocessResult {
 #[salsa::tracked]
 pub fn preprocessed_full(db: &dyn salsa::Database, file: SourceFile) -> ArcPreprocessResult {
     let text = file.text(db);
-    let expanded = expand_question_ops(&expand_inline_question_ops(
-        &expand_compound_question_headers(&expand_pipes(&expand_with_chains(&expand_go_calls(
-            &expand_gather_blocks(&expand_multiline_guards(&expand_lazy_lets(
-                &expand_typed_let_unpack(text),
-            ))),
-        )))),
-    ));
-    ArcPreprocessResult(Arc::new(preprocess(&expanded)))
+    // The mapped chain leaves `line_map` (preprocessed line → `.ty` line) on
+    // the result, which `check_pipeline` uses to report the line the user
+    // wrote rather than the preprocessed buffer's.
+    ArcPreprocessResult(Arc::new(
+        tyc_syntax::preprocess::expand_and_preprocess_mapped(text, false),
+    ))
 }
 
 /// Tracked query: the names declared at the top level of the module.
@@ -743,11 +741,12 @@ fn check_pipeline(
         Ok(p) => p.into_syntax(),
         Err(e) => {
             diags.push_error(TycError::parse(
-                path,
+                path.clone(),
                 prep.python_source.clone(),
                 e.to_string(),
                 usize::from(e.location.start()),
             ));
+            diags.remap_lines(&prep.python_source, &prep.line_map, &path, &text);
             return diags;
         }
     };
@@ -792,7 +791,7 @@ fn check_pipeline(
     // in-module-only pass (`check_module_with`).
     let external = shapes_by_module.map(|s| build_external_shapes(&resolved_arc, s));
     let type_diags = check_module_with_imports(
-        path,
+        path.clone(),
         &prep.python_source,
         &resolved_arc,
         &module,
@@ -802,6 +801,10 @@ fn check_pipeline(
         external.as_ref(),
     );
     diags.extend(type_diags);
+
+    // Every diagnostic above is anchored to the preprocessed buffer; report
+    // it against the `.ty` text and line the user actually wrote.
+    diags.remap_lines(&prep.python_source, &prep.line_map, &path, &text);
 
     diags
 }

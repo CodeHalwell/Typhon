@@ -6,7 +6,7 @@ sidebar:
 ---
 
 ```
-tyc lsp
+tyc lsp [--log-level LEVEL]
 ```
 
 Runs Typhon as an LSP server, speaking the standard LSP protocol over stdio. Used by editors (VS Code, Neovim, Helix, Zed, Emacs, Sublime).
@@ -19,6 +19,14 @@ tyc lsp     # speaks LSP on stdio; typically invoked by an editor
 
 You usually do not run this by hand — the editor extension does. See [Editor Setup](/Typhon/getting-started/editor-setup/).
 
+## Flags
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--log-level LEVEL` | `info` | Severity threshold for the status messages the server forwards to the editor over `window/logMessage`. One of `error`, `warn`, `info`, `debug`. |
+
+`--stdio` is also accepted (and ignored) because `vscode-languageclient` appends it unconditionally; stdio is the only transport.
+
 ## Capabilities
 
 | Capability | Status |
@@ -28,13 +36,13 @@ You usually do not run this by hand — the editor extension does. See [Editor S
 | `textDocument/definition` (in-file + cross-file via `resolved_module`) | ✅ |
 | `textDocument/completion` (bindings + keywords + builtins) | ✅ |
 | `textDocument/codeAction` ("Remove unused import") | ✅ |
-| `textDocument/formatting` (via `tyc fmt`) | ✅ |
+| `textDocument/semanticTokens/full` (`newtype` painted as `class`, class-body fields as `property`) | ✅ |
+| `textDocument/formatting` | ⏳ not provided — run [`tyc fmt`](/Typhon/cli/fmt/) |
 | `textDocument/documentSymbol` | ⏳ planned |
 | `workspace/symbol` | ⏳ planned |
 | `textDocument/references` | ⏳ planned |
 | `textDocument/rename` | ⏳ planned |
 | `textDocument/inlayHint` | ⏳ planned |
-| `textDocument/semanticTokens` | ⏳ planned |
 
 ## How it works
 
@@ -77,7 +85,7 @@ The LSP picks up project settings from `typhon.toml` automatically (it walks up 
 
 - **LSP doesn't start.** Check that `tyc` is on the PATH the *editor process* sees. Set `typhon.lsp.path` to an absolute path if needed.
 - **Stale diagnostics.** Save the file (or close-and-reopen). If still stale, check the trace logs.
-- **Slow completion.** Completion latency is bounded by the Salsa check time for the active file. Profile with `--verbose` to find slow queries.
+- **Slow completion.** Completion latency is bounded by the Salsa check time for the active file. Start the server with `--log-level debug` to see its status messages in the editor's output channel.
 
 ## Where next
 

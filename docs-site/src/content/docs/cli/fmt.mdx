@@ -54,9 +54,9 @@ If `ruff` is absent, returns non-zero, or the buffer still contains a Typhon-onl
 
 | Flag | Effect |
 |------|--------|
-| `--check` | Exit 1 if any file would change. No writes. |
-| `--diff` | Print a unified diff instead of writing. |
-| `--quiet` | Suppress per-file output. |
+| `--check` (`-c`) | Exit 1 if any file would change. No writes. |
+
+`--check` is the only flag. There is no `--diff` or `--quiet`; to see what would change, run `tyc fmt --check`, or format a copy and `diff` it against the original.
 
 ## CI integration
 
@@ -81,7 +81,7 @@ repos:
 
 ## What about `tyc fmt` on `.dty`?
 
-Yes — `.dty` files format with the same rules. The bodies are signatures, but the lexer / printer treat them like `.ty`.
+Not today — `tyc fmt` collects `.ty` files only; a `.dty` path, or the `.dty` files under a directory, are skipped untouched. Stubs are short signature lists, so hand-formatting them is cheap, and `tyc check --stubs` still validates them.
 
 ## Where next
 

@@ -14,6 +14,9 @@ unused-import = "warn"
 exhaustive-match = "error"
 methods-in-class-body = "warn"
 nullable-use = "warn"
+require-with = "warn"
+blocking-in-async = "warn"
+stub-check = "error"
 unintrospectable-dependency = "warn"
 suggest-gather = true
 suggest-perf = true
@@ -40,9 +43,12 @@ allow-secret-comptime = false
 | `exhaustive-match` | `"error"` \| `"warn"` \| `"off"` | `"error"` | Severity for non-exhaustive `match` over sealed unions. |
 | `nullable-use` | `"error"` \| `"warn"` \| `"off"` | `"warn"` | Severity for the *attribute-rooted* form of [`tyc::nullable_use`](/Typhon/diagnostics/nullability/) — dereferencing a possibly-`None` field (`self.db.host` where `db: Db?`). Introduced at `"warn"` because the check never ran before v1.0.0-alpha.7; promote to `"error"` once your code is clean. The bare-name form is always an error and is not governed by this knob. |
 | `methods-in-class-body` | `"error"` \| `"warn"` \| `"off"` | `"warn"` | Severity for [`tyc::method_in_class_body`](/Typhon/diagnostics/class-errors/) — Rule 4: methods live in `impl Name:`, not the class body. Default `"warn"` matches every other nudge diagnostic; promote to `"error"` once a codebase has finished migrating off in-body methods. `"off"` suppresses it entirely. |
+| `require-with` | `"error"` \| `"warn"` \| `"off"` | `"warn"` | Severity for [`tyc::resource_not_managed`](/Typhon/diagnostics/compile-errors/) — a call to a known resource-returning function (`open`, `socket.socket`, `sqlite3.connect`, `tempfile.*`) bound to a variable outside a `with` statement. `"error"` promotes it once a codebase has paid down the migration; `"off"` drops it. |
+| `blocking-in-async` | `"error"` \| `"warn"` \| `"off"` | `"warn"` | Severity for [`tyc::blocking_in_async`](/Typhon/diagnostics/async-errors/) — a direct call to a known-blocking stdlib function (`time.sleep`, `requests.get`, `subprocess.run`, `socket.recv`, …) inside an `async def`. `"error"` promotes it for codebases that have finished moving to async-aware libraries; `"off"` suppresses it. |
+| `stub-check` | `"error"` \| `"warn"` \| `"off"` | `"error"` | Severity for [`tyc::stub_mismatch`](/Typhon/diagnostics/stub-errors/) from `tyc check --stubs` — a `.dty` stub whose surface diverges from its sibling `.ty` / `.py` implementation. `"error"` (default) fails the check; `"warn"` surfaces drift without blocking CI; `"off"` drops the findings. |
 | `unintrospectable-dependency` | `"warn"` \| `"error"` \| `"off"` | `"warn"` | Severity when a declared dependency is imported but cannot be introspected (no reachable `.venv` / `python3`, not installed, or no introspectable signatures). `"warn"` surfaces it; `"error"` CI-gates; `"off"` restores the old silent skip. |
-| `suggest-gather` | bool | `true` | Emit the advice-level [`tyc::gather_opportunity`](/Typhon/diagnostics/) hint when 2+ adjacent independent awaited calls could be wrapped in a `gather:` block. Never rewrites, never blocks a build. |
-| `suggest-perf` | bool | `true` | Emit the advice-level `tyc::perf_*` micro-optimisation family (six lints) plus [`tyc::lazy_import_opportunity`](/Typhon/diagnostics/). Never rewrites, never blocks a build. |
+| `suggest-gather` | bool | `true` | Emit the advice-level [`tyc::gather_opportunity`](/Typhon/diagnostics/async-errors/#tycgather_opportunity-advice) hint when 2+ adjacent independent awaited calls could be wrapped in a `gather:` block. Never rewrites, never blocks a build. |
+| `suggest-perf` | bool | `true` | Emit the advice-level `tyc::perf_*` micro-optimisation family (six lints) plus [`tyc::lazy_import_opportunity`](/Typhon/pitfalls/performance/#automatic-performance-advice). Never rewrites, never blocks a build. |
 | `suggest-parallel` | bool | `true` | Emit the advice-level `tyc::parallel_opportunity` / `tyc::shared_mut_across_tasks` hints. Both additionally require `[python] free-threaded = true` to fire. Never rewrites, never blocks a build. |
 | `auto-memoise` | bool | `false` | Insert `@functools.cache` on every function the analyser infers as pure. **Off by default — caches extend lifetimes invisibly.** |
 | `auto-gather` | bool | `false` | Fold straight-line independent `await` runs into `asyncio.TaskGroup`, but only for `@gatherable`-decorated callees (same-module or imported from another project module). |
@@ -116,6 +122,43 @@ Clear the warning by making the dependency introspectable — install it (`uv sy
 <Aside type="note">
   Compiler-bundled stubs (e.g. `httpx`, `requests`) suppress this warning for those libraries with no `.venv` needed — their signatures ship with the compiler.
 </Aside>
+
+## `require-with`
+
+Severity for `tyc::resource_not_managed`: a bare assignment of `open(...)`, `socket.socket(...)`, `sqlite3.connect(...)`, or a `tempfile.*` factory that is not wrapped in a `with` statement leaves cleanup to the garbage collector.
+
+```python
+let f = open("data.txt")          # ⚠️ tyc::resource_not_managed
+```
+
+- `"warn"` (default) — visible without breaking CI.
+- `"error"` — promote once the codebase has migrated to `with` (or an explicit `try` / `finally`).
+- `"off"` — drop the diagnostic.
+
+Bodies of `@contextmanager` / `@asynccontextmanager` factories are exempt — acquiring the resource is their job.
+
+## `blocking-in-async`
+
+Severity for `tyc::blocking_in_async`: a direct call to a known-blocking stdlib function (`time.sleep`, `requests.get` / `post` / …, `urllib.request.urlopen`, `subprocess.run` / `call` / `check_output`, `input`, `socket.recv`) inside an `async def` stalls the event loop.
+
+```python
+async def poll() -> None:
+    time.sleep(1)                 # ⚠️ tyc::blocking_in_async — use `await asyncio.sleep(1)`
+```
+
+- `"warn"` (default) — surfaces the issue without breaking CI.
+- `"error"` — promote once the codebase has moved to async-aware libraries (`httpx` for `requests`, `asyncio.sleep` for `time.sleep`, `asyncio.to_thread(...)` around the rest).
+- `"off"` — suppress it.
+
+Calls inside an `unsafe:` block are not reported.
+
+## `stub-check`
+
+Severity for `tyc::stub_mismatch`, produced by [`tyc check --stubs`](/Typhon/cli/check/) when a `.dty` stub's surface (missing-in-implementation / missing-in-stub / signature mismatch) diverges from its sibling `.ty` or `.py` implementation.
+
+- `"error"` (default) — stub drift fails the check; right for projects that version their stubs alongside the code.
+- `"warn"` — drift is reported but does not break CI; useful mid-migration.
+- `"off"` — stubs are still parsed and type-checked, but mismatches are dropped.
 
 ## `suggest-gather`
 
@@ -199,7 +242,9 @@ Any other value is rejected at config load.
 
 When `true`, `tyc build` reads `typhon-profile.json` (from a prior [`tyc profile`](/Typhon/cli/profile/) run) and promotes every pure function whose observed call count meets `pgo-min-calls` to `@functools.cache`, even if the user did not write `@memo`. Complements `auto-memoise` (which caches every pure function regardless of profile data).
 
-Missing profile file is not an error — PGO is best-effort.
+Missing profile file is not an error — PGO is best-effort: nothing is promoted and nothing is reported.
+
+The round trip has three moving parts worth knowing. `tyc profile` only *produces* an instrumented build — you run it yourself, from the project root, because the profile is written to the process's working directory (or `TYPHON_PROFILE_OUT`) while `tyc build` reads `typhon-profile.json` from the directory holding `typhon.toml`. Only top-level `def` / `async def` are instrumented (not methods or nested functions), and only functions that pass the purity analysis are candidates. Profile keys are matched per module (`users.find_user` promotes `find_user` in `src/users.ty` only); the entry module records as `__main__.<fn>`, which is accepted alongside `main.<fn>` for `src/main.ty`, so the default layout round-trips out of the box. See [`tyc profile`](/Typhon/cli/profile/).
 
 ## `allow-secret-comptime`
 
@@ -211,7 +256,7 @@ Setting this to `true` disables the warning, which is useful when the literal is
 
 ## Always-on advisory lints
 
-A handful of advisory lints fire at **warn** level without a dedicated `[strictness]` knob — they ride the project's global severity rather than being individually configurable. They're listed here so you know they exist; the full semantics live in the [diagnostics catalog](/Typhon/diagnostics/).
+A handful of advisory lints fire at **warn** level without a dedicated `[strictness]` knob — they ride the project's global severity rather than being individually configurable. They're listed here so you know they exist; the full semantics live in the [diagnostics catalog](/Typhon/diagnostics/reading/).
 
 | Lint | Default | Flags |
 |------|---------|-------|

@@ -20,9 +20,10 @@ use tyc_emit::{compare_modules, StubTestKind};
 use tyc_resolve::check_unknown_modules;
 use tyc_resolve::{check_unknown_modules_with, ImportVettingContext};
 use tyc_syntax::preprocess::{
-    expand_compound_question_headers, expand_gather_blocks, expand_go_calls,
+    compose_line_maps, expand_compound_question_headers, expand_gather_blocks, expand_go_calls,
     expand_inline_question_ops, expand_lazy_imports, expand_multiline_guards, expand_pipes,
-    expand_question_ops, expand_typed_let_unpack, expand_with_chains, preprocess,
+    expand_question_ops, expand_sugar_mapped, expand_typed_let_unpack, expand_with_chains,
+    preprocess, preprocess_mapped,
 };
 
 use crate::commands::util::{apply_strictness, collect_dty_files, collect_ty_files};
@@ -909,8 +910,9 @@ fn run_secondary_passes(
     lint_opts: tyc_analyse::LintOptions,
 ) -> Diagnostics {
     let mut diags = Diagnostics::new();
-    let expanded = expand_for_check(source);
-    let prep = preprocess(&expanded);
+    let (expanded, expanded_to_source) = expand_sugar_mapped(source, true);
+    let (mut prep, prep_to_expanded) = preprocess_mapped(&expanded);
+    prep.line_map = compose_line_maps(&prep_to_expanded, &expanded_to_source);
 
     // `pub *` outside `__init__.ty` is a no-op with confusing intent.
     // Surface the advice in `tyc check` (mirroring `tyc build`) so CI
@@ -992,6 +994,10 @@ fn run_secondary_passes(
         let module_diags = check_unknown_modules_with(path, &prep.python_source, &module, ctx);
         diags.extend(module_diags);
     }
+
+    // Everything above is anchored to the preprocessed buffer; report it
+    // against the `.ty` text and line the user wrote.
+    diags.remap_lines(&prep.python_source, &prep.line_map, path, source);
 
     diags
 }

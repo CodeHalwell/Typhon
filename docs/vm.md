@@ -43,8 +43,10 @@ tyc run --compile --temp      # legacy with ephemeral build dir
   `return`, `pass`, `match` (literal / capture / wildcard / sequence /
   class patterns including the native `Ok(x)` / `Err(e)` cases).
 - Functions: positional, keyword, default, `*args`, `**kwargs`, closures,
-  recursion (1000-frame default depth since v0.8.0 to match CPython,
-  configurable on the `Interpreter`).
+  recursion (a fixed 1000-frame limit since v0.8.0, matching CPython's
+  default `sys.getrecursionlimit()`; it is **not** configurable — the
+  `Interpreter`'s depth field has no public setter and the VM's `sys` shim
+  has no `setrecursionlimit` — and exceeding it raises `RecursionError`).
 - Classes: annotated fields (constructor synthesised at instantiation),
   explicit `__init__`, methods declared inside `class` body, methods
   declared in a sibling `impl Foo:` block (merged on the fly), single
@@ -101,8 +103,8 @@ hashing.
 | Module | What you get |
 |---|---|
 | `math` | `pi`, `e`, `inf`, `nan`, `sqrt`, `floor`, `ceil`, `log` (with base), `log2`, `log10`, `exp`, `sin`, `cos`, `tan`, `pow`, `fabs`. v0.10.0: `gcd`, `lcm`, `factorial`, `isqrt`, `comb`, `perm` (all reject non-integer args) |
-| `os` | `getenv`, `environ`, `os.path.exists`, `isfile`, `isdir` |
-| `sys` | `argv`, `platform`, `version`, `exit(code)` |
+| `os` / `os.path` | `getenv`, `environ`, `os.path.exists`, `isfile`, `isdir`. `import os.path` resolves to the same shim |
+| `sys` | `argv`, `platform`, `version`, `exit(code)`, `stdout`, `stderr`. No `setrecursionlimit` / `getrecursionlimit` |
 | `json` | `dumps`, `loads` (full JSON 7159 surface). v0.10.0: `dumps(indent=…)` pretty-prints |
 | `time` | `time()`, `sleep()`, `monotonic()`. v0.10.0: `perf_counter()`, `process_time()` |
 | `random` | `random()`, `seed(n)`, `getrandbits`, `randint`, `randrange`, `uniform`, `gauss`, `choice`, `shuffle`, `sample` — a **CPython-compatible MT19937**, following `random.py` / `_randommodule.c`, so `random.seed(n)` produces a **byte-identical sequence** under `tyc run` and under `tyc build` + CPython. An *unseeded* program seeds from OS-derived entropy, as CPython does at import, so it draws a different sequence on every run (v1.0.0-alpha.8 — before that the default was a fixed constant, making `tyc run` repeatable where CPython is not). `seed()` / `seed(None)` reseeds from entropy; string / bytes / float seeds are rejected (CPython hashes them through SHA-512) — use `tyc run --compile` for those. NOT cryptographic on either surface: use `secrets` |
@@ -110,6 +112,9 @@ hashing.
 | `datetime` (v0.11.0) | `datetime.datetime(y, mo, d, ...)`, `.now()`, `.fromisoformat(...)`, `.isoformat()`, `+ timedelta`, comparisons, `timedelta(seconds=...)` arithmetic. Naïve / UTC only; tz-aware arithmetic needs `--compile` |
 | `re` (v0.8.0, capture groups in v0.11.0) | `match`, `search`, `findall`, `sub`, `split`, `compile`. `match` is anchored at the start of the string. Some flag arguments (`re.MULTILINE`, etc.) are accepted but ignored — `tyc::python_semantic_drift` warns when the impact would change behaviour. v0.11.0: `re.Match.group(n)` / `.groups()` / `.groupdict()` return real capture groups (prior shim returned the whole match for every index) |
 | `typing` (v0.8.0) | Generic constructors used at runtime are no-ops; `Callable`, `List`, etc. are accepted in import position and ignored at runtime. Type-only imports are stripped by the desugar pre-pass |
+| `collections.abc` | The abstract container types (`Callable`, `Iterable`, `Iterator`, `Generator`, `Sequence`, `Mapping`, `MutableMapping`, `Set`, `Hashable`, `Awaitable`, `Coroutine`, `AsyncIterator`, the `*View`s, …) as identity natives — annotation-only at runtime, mirroring the `typing` shim |
+| `abc` (v0.15.6) | `ABC`, `ABCMeta`, `abstractmethod`, `abstractclassmethod`, `abstractstaticmethod`, `abstractproperty`, `update_abstractmethods` — identity natives; a non-class base such as `ABC` is ignored at class creation, so `class H(ABC): @abstractmethod def handle(...)` runs |
+| `asyncio` | The cooperative-sequential shim: `run`, `gather` (incl. `return_exceptions=True`), `TaskGroup` (`create_task`, `__aenter__` / `__aexit__`), `sleep` (real wall-clock), `timeout` (checked at scope exit), `Queue` (fails loudly instead of deadlocking), and the exception classes (`TimeoutError`, `CancelledError`, …). Coroutines are forced to completion at their `await` — see "What the VM does not support yet" below for the interleaving caveat |
 | `collections` (v0.8.0, defaultdict in v0.11.0) | `OrderedDict`, `defaultdict` (v0.11.0: `factory` is actually invoked on missing-key access via the subscript `__missing__` hook, so `dd[k] += 1` works), `Counter`, `namedtuple` |
 | `functools` (v0.8.0) | `lru_cache`, `cache`, `cached_property`, `reduce`, `partial` |
 | `itertools` (v0.8.0) | `chain`, `count`, `cycle` (materialise a bounded prefix), `accumulate`, `combinations`, `permutations`, `product`, `islice`, `takewhile`, `dropwhile`, `groupby` |
@@ -119,9 +124,9 @@ hashing.
 | `heapq` (v0.9.0) | `heappush`, `heappop`, `heapify`, `heappushpop`, `heapreplace`, `nsmallest`, `nlargest` |
 | `contextlib` (v0.9.0) | `@contextmanager` identity decorator and `contextmanager`-decorated factories. `with` block honours the wrapped `__enter__` / `__exit__` shape |
 | `pydantic` (v0.9.0, expanded v0.10.0) | `BaseModel` is a placeholder so declaring a `model` doesn't `ImportError`. Since v0.10.0 `Model.model_validate(mapping)` constructs an instance from a dict, `inst.model_dump()` returns a dict of fields in declaration order, and `model_dump_json()` the JSON form — flat `model` classes are usable under `tyc run`. Nested-model validation is not type-directed yet; deeply-nested models still need `--compile` |
-| `typhon_runtime` | `Ok`, `Err`, `tasks.spawn`, `lazy.lazy_let`, `lazy.lazy_import` — the `spawn` shim runs synchronously. `Ok` / `Err` carry bound `.map` / `.map_err` / `.and_then` / `.or_else` combinators since v0.9.0 |
+| `typhon_runtime` (and `typhon_runtime.*`) | `Ok`, `Err`, `tasks.spawn`, `lazy.lazy_let`, `lazy.lazy_import` — the `spawn` shim runs synchronously. `Ok` / `Err` carry bound `.map` / `.map_err` / `.and_then` / `.or_else` combinators since v0.9.0. Submodule imports (`from typhon_runtime.freeze import deep_freeze`) resolve to the matching submodule |
 
-Any other module raises `ImportError` with a pointer to `--compile`.
+`enum` is resolved separately by the interpreter (it backs the `enum` keyword), not through the module table. Any other module raises `ImportError` with a pointer to `--compile` — `tyc run` does not fall back to the compiled path on its own.
 
 ### Built-in methods on values
 

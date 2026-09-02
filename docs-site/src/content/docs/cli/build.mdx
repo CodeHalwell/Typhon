@@ -6,7 +6,7 @@ sidebar:
 ---
 
 ```
-tyc build [--out DIR] [--no-format] [--check] [--optimise]
+tyc build [PATH] [--out DIR] [--no-format] [--check] [--no-sync] [--with-ty] [--optimise]
 ```
 
 Runs the full compilation pipeline and writes the emitted Python to the output directory (default `build/`, configurable via `[project] out`).
@@ -19,6 +19,8 @@ tyc build --out dist/           # → dist/ instead
 tyc build --no-format           # skip the ruff format post-process
 tyc build --check               # dry-run: list every file that would be written
 tyc build -O                    # apply [optimise] level = 1 for this invocation
+tyc build --no-sync             # skip `uv sync` (also TYC_NO_SYNC=1); pyproject.toml is still merged
+tyc build --with-ty             # then run Astral's `ty` over the emitted Python
 ```
 
 ## What it produces
@@ -28,14 +30,20 @@ For a project with `src/main.ty` and `src/users.ty`:
 ```
 build/
 ├── main.py
-├── main.py.map               # source map v2
 ├── users.py
-├── users.py.map
-└── typhon_runtime/           # only if Result / go / lazy let are used
+├── .sourcemaps/
+│   ├── main.py.map           # source map v2 (under .sourcemaps/ since v0.6.1)
+│   └── users.py.map
+└── typhon_runtime/           # only if Result / go / lazy let / freeze let / as! / auto-parallel are used
     ├── __init__.py
     ├── result.py
     ├── tasks.py
-    └── lazy.py
+    ├── lazy.py
+    ├── parallel.py
+    ├── freeze.py
+    ├── cast.py
+    ├── traceback.py
+    └── stdlib.py
 ```
 
 And, if you have `.dty` stubs:
@@ -65,6 +73,8 @@ Each stage is a Salsa query; on incremental rebuilds, only invalidated outputs a
 | `--out DIR` (`-o`) | Override the `[project] out` directory. Relative paths resolve against the project root. |
 | `--no-format` | Skip the `ruff format` post-process. |
 | `--check` | Dry-run mode. The full pipeline still runs (so type errors continue to surface), but no files are written — instead, every file that *would* be created or overwritten is listed. Useful for previewing the effect of a `class-default` or `skip-decoration-bases` change before committing to disk. |
+| `--no-sync` | Skip the `uv sync` step; `pyproject.toml` is still merged so the next regular build picks the manifest up. Also honoured via `TYC_NO_SYNC=1`. |
+| `--with-ty` | After a successful build, run Astral's `ty` over the emitted Python as a typeshed-backed second-stage check — the same behaviour as [`[checker] external = "ty"`](/Typhon/configuration/overview/#checker), for one invocation. `ty` errors fail the build. Requires `ty` on `PATH`. |
 | `--optimise` / `-O` (alias `--optimize`) | Apply [`[optimise] level = 1`](/Typhon/configuration/overview/#optimise) for this invocation — flips the default of `auto-memoise`, `auto-gather`, `auto-parallel`, and `pgo-memoise` to on. Overrides a config `level = 0`, but an explicit [`[strictness]`](/Typhon/configuration/strictness/) entry for any of those knobs still wins. |
 
 ## `.py` files alongside `.ty`
@@ -73,7 +83,7 @@ Plain `.py` files in `src/` are copied verbatim into the build output (skipping 
 
 ## When the build fails
 
-If any error-severity diagnostic fires during check or analyse, the build does not produce output. The diagnostics are emitted to stderr and the process exits 2.
+If any error-severity diagnostic fires during check or analyse, the build does not produce output. The diagnostics are emitted to stderr and the process exits 1.
 
 You can run `tyc check` first to fail-fast in CI without producing partial artefacts.
 

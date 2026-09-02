@@ -466,7 +466,7 @@ pub fn scan_line_kinds(line: &str, in_string: &mut Option<StringMode>) -> Vec<By
 
 /// A whole-buffer lexical mask: byte kinds, bracket depths, and the derived
 /// per-line facts every block-structure pass needs.
-pub(crate) struct LexMask {
+pub struct LexMask {
     kinds: Vec<ByteKind>,
     depths: Vec<i32>,
     line_start: Vec<usize>,
@@ -480,7 +480,7 @@ pub(crate) struct LexMask {
 impl LexMask {
     /// Scan `source` once. Lines are indexed the way the preprocessor
     /// indexes them everywhere else — `source.split_inclusive('\n')`.
-    pub(crate) fn new(source: &str) -> LexMask {
+    pub fn new(source: &str) -> LexMask {
         let mut kinds = vec![ByteKind::Code; source.len()];
         let mut depths = vec![0i32; source.len()];
         let mut line_start = Vec::new();
@@ -568,7 +568,7 @@ impl LexMask {
     /// `true` when line `line` *begins* inside a triple-quoted string, so its
     /// leading whitespace is string content rather than indentation. Such a
     /// line is never a block boundary and must never be re-indented.
-    pub(crate) fn line_starts_in_string(&self, line: usize) -> bool {
+    pub fn line_starts_in_string(&self, line: usize) -> bool {
         self.line_entry_string(line).is_some()
     }
 
@@ -585,7 +585,7 @@ impl LexMask {
     /// Byte offset, relative to the start of line `line`, at which its code
     /// portion ends — the offset of a trailing `#` comment, or the length of
     /// the line's content (excluding the line terminator) when there is none.
-    pub(crate) fn line_code_end(&self, line: usize) -> usize {
+    pub fn line_code_end(&self, line: usize) -> usize {
         self.line_code_end.get(line).copied().unwrap_or(0)
     }
 
