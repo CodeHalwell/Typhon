@@ -31,16 +31,12 @@
 # Scope: all
 #
 examples/17-file-io-json/json_files.ty
-examples/apps/12-static-site-gen/
 stress/round-2026-05-19/cases/10_raise_from.ty
 stress/round-2026-05-19/cases/29_bytes_ops.ty
 stress/round-2026-05-19/cases/31_protocol_runtime.ty
 stress/round-2026-05-19/cases/66_lazy_let.ty
 stress/round-2026-05-19/cases/67_lazy_let_call.ty
 stress/round-2026-05-20-exploration/01-syntax-edge/18-lazy-let-module.ty
-stress/round-2026-05-20-exploration/02-io-heavy/06-sqlite-crud.ty
-stress/round-2026-05-20-exploration/02-io-heavy/07-threading.ty
-stress/round-2026-05-20-exploration/02-io-heavy/08-subprocess.ty
 stress/round-2026-05-20-exploration/04-ai-llm/03-llm-tools-sealed.ty
 stress/round-2026-05-20-exploration/04-ai-llm/05-llm-structured-out.ty
 stress/round-2026-05-20-exploration/05-agents/01-react-agent.ty
@@ -48,14 +44,11 @@ stress/round-2026-05-20-exploration/05-agents/02-multi-agent.ty
 stress/round-2026-05-20-exploration/05-agents/03-agent-state-machine.ty
 stress/round-2026-05-20-exploration/08-meta-stress/01-paren-precedence.ty
 stress/round-2026-05-20/cases/63_async_context.ty
-stress/round-2026-05-21/02-io/04-sqlite.ty
 stress/round-2026-05-21/02-io/05-regex.ty
-stress/round-2026-05-21/02-io/08-threading.ty
 stress/round-2026-05-21/04-ai-llm/03-tool-use.ty
 stress/round-2026-05-21/04-ai-llm/04-structured-output.ty
 stress/round-2026-05-21/08-meta-stress/19-bytes-and-bin.ty
 stress/round-2026-05-22/01-language-edge/04-pub-export-list.ty
-stress/round-2026-05-22/02-io/03-sqlite-orm.ty
 stress/round-2026-05-22/02-io/07-async-file-context.ty
 stress/round-2026-05-22/04-ai-llm/02-structured-output-validation.ty
 stress/round-2026-05-22/05-agents/01-react-agent.ty
@@ -63,9 +56,7 @@ stress/round-2026-05-22/05-agents/04-tool-dispatch-sealed.ty
 stress/round-2026-05-22/05-agents/05-tool-dispatch-fixed.ty
 stress/round-2026-05-22/08-meta-stress/15-async-context-manager.ty
 stress/round-2026-05-22/08-meta-stress/16-decorator-order.ty
-stress/round-2026-05-22/09-error-quality/02-blocking-in-async.ty
 stress/round-2026-06-16/mfproj/
-stress/round-2026-06-16/repros/a06_numeric.ty
 stress/round-2026-06-16/repros/e01_more_exceptions.ty
 stress/round-2026-06-16/repros/f08_str_format_advanced.ty
 stress/round-2026-06-16/repros/k04_bytearray.ty
@@ -74,11 +65,7 @@ stress/round-2026-06-16/repros/w02_pydantic_validate.ty
 stress/round-2026-06-21/repros/104-printf-formatting.ty
 stress/round-2026-06-21/repros/107-flag-enums.ty
 stress/round-2026-06-21/repros/127-asyncio-queue.ty
-stress/round-2026-06-21/repros/128-decimal-context.ty
-stress/round-2026-06-21/repros/129-struct.ty
-stress/round-2026-06-21/repros/130-string-template.ty
 stress/round-2026-06-21/repros/26-freeze-let.ty
-stress/round-2026-06-21/repros/33-decimal-fraction.ty
 stress/round-2026-06-21/repros/34-bytes-bytearray.ty
 stress/round-2026-06-21/repros/35-set-algebra.ty
 stress/round-2026-06-21/repros/40-dict-views-merge.ty
@@ -87,9 +74,7 @@ stress/round-2026-06-21/repros/75-enum-methods.ty
 stress/round-2026-06-21/repros/91-multiple-inheritance.ty
 stress/round-2026-06-21/repros/98-async-generators.ty
 stress/round-2026-06-21/repros/99-singledispatch.ty
-stress/round-2026-06-21/third-party-wide/must_pass/38-pyyaml.ty
 stress/round-2026-09-01/analyse/b_prelude.ty
-stress/round-2026-09-01/analyse/p_memo.ty
 stress/round-2026-09-01/analyse/s4_resource.ty
 stress/round-2026-09-01/emit/enum_doc_methods.ty
 stress/round-2026-09-01/emit/numerics.ty
@@ -99,7 +84,6 @@ stress/round-2026-09-01/emit/typevar_default.ty
 stress/round-2026-09-01/types/c48_star_star.ty
 stress/round-2026-09-01/types/s112_posonly.ty
 stress/round-2026-09-01/vm/ienum.ty
-stress/round-2026-09-01/vm/imp.ty
 stress/round-2026-09-01/vm/jsn.ty
 stress/round-2026-09-01/vm/p1.ty
 stress/round-2026-09-01/vm/p12.ty

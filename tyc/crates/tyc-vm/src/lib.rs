@@ -479,12 +479,52 @@ fn flush_open_files(interp: &mut Interpreter) {
     }
 }
 
+/// True when the in-process VM can serve `name` without CPython.
+///
+/// `tyc run` uses this to stay a drop-in: a program importing anything
+/// outside the modelled set takes the compiled path instead of dying with
+/// `ModuleNotFoundError` on code `tyc build` runs fine.
+pub fn models_module(name: &str) -> bool {
+    crate::builtins::models_module(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn run_capturing(source: &str) -> Result<i32, VmError> {
         run_source(source, None, &[])
+    }
+
+    /// The declared list and the resolver must agree: a name in the list
+    /// that no longer resolves would send `tyc run` into the VM for a
+    /// module it cannot serve, and one the resolver serves but the list
+    /// omits would send it to CPython for no reason.
+    #[test]
+    fn vm_modelled_modules_all_resolve() {
+        for name in crate::builtins::MODELLED_MODULE_ROOTS {
+            let src = format!("import {name}\n");
+            assert_eq!(
+                run_capturing(&src).unwrap_or(1),
+                0,
+                "`import {name}` must resolve in the VM — it is in MODELLED_MODULE_ROOTS"
+            );
+        }
+        for absent in [
+            "sqlite3",
+            "subprocess",
+            "threading",
+            "decimal",
+            "yaml",
+            "numpy",
+        ] {
+            assert!(
+                !models_module(absent),
+                "`{absent}` is not modelled, so `tyc run` must take the compiled path"
+            );
+        }
+        assert!(models_module("os.path"), "a submodule follows its root");
+        assert!(models_module("collections.abc"));
     }
 
     #[test]

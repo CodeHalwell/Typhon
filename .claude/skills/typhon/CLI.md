@@ -122,19 +122,30 @@ Execute a Typhon program. **Default mode: the in-process tree-walking VM (`tyc-v
 tyc run                              # VM, resolves src/main.ty
 tyc run src/cli.ty                   # VM on a specific file
 tyc run -- --port 8080 ./input.csv   # forward args to sys.argv
-tyc run --compile                    # build-then-exec via CPython
+tyc run --compile                    # force build-then-exec via CPython
+tyc run --no-fallback                # require the VM; do not fall back
 tyc run --compile --temp -- --port 8080
 ```
 
 | Flag | Mode | Purpose |
 |---|---|---|
-| `--compile` (alias `--no-vm`) | switch | Build → exec CPython instead of using the VM. Use for programs that import unsupported libraries (numpy, requests, etc.) |
+| `--compile` (alias `--no-vm`) | switch | Force build → exec CPython instead of using the VM |
+| `--no-fallback` | vm-only | Fail with the VM's `ModuleNotFoundError` instead of taking the compiled path for an unmodelled import |
 | `--entry FILE` | compile-only | Entry-point relative to build dir (default `main.py`) |
-| `--python PATH` | compile-only | Python interpreter (default `python3`) |
+| `--python PATH` | both | Interpreter for the compiled path. Default: project `.venv` → `python3.<minor>` for `[python] target` → `python3` |
 | `--temp` / `-t` | compile-only | Build into a tempdir deleted on exit; mutually exclusive with `--no-build` |
 | `--no-build` | compile-only | Skip rebuild; assume persistent `build/` is current |
 
 Compile-only flags are rejected by clap unless `--compile` is also passed. The script's exit code propagates verbatim.
+
+**v1.0.0-beta.1 — automatic fallback.** `tyc run` scans the program's
+imports *before* executing anything. An import the VM does not model
+(`sqlite3`, `subprocess`, `numpy`, …) prints a `note:` and takes the
+`--compile` path, so `tyc run` is a real drop-in for `tyc build` +
+CPython rather than failing where the compiled path works. Nothing
+half-executes and restarts. `--no-fallback` refuses instead.
+Build *progress* now goes to stderr, so the program's stdout is the
+program's alone.
 
 **v0.3.1:** `tyc run` (VM mode) gates on the static `tyc check` pipeline first — unresolved names, type mismatches, and arity errors fail the same way `tyc check` would. Set `TYC_SKIP_CHECK=1` to bypass. `--compile` mode always gates on the full `tyc build` pipeline (no equivalent bypass).
 

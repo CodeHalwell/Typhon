@@ -244,7 +244,12 @@ Built-in method dispatch on `str` / `bytes` (v0.11.0) / `list` / `dict` (incl. `
 | `__future__` (v1.0.0-beta.1) | The feature flags, so `from __future__ import annotations` imports rather than raising |
 | `typhon_runtime` (and `typhon_runtime.*`) | `Ok`, `Err`, `tasks.spawn` (synchronous shim), `lazy.lazy_let`, `lazy.lazy_import`. `Ok` / `Err` carry bound `.map` / `.map_err` / `.and_then` / `.or_else` combinators since v0.9.0. Submodule imports (`from typhon_runtime.freeze import deep_freeze`) resolve to the matching submodule |
 
-`enum` is resolved separately by the interpreter (it backs the `enum` keyword), not through this table. Any other module raises `ModuleNotFoundError`; reach for `tyc run --compile`.
+`enum` is resolved separately by the interpreter (it backs the `enum` keyword), not through this table.
+
+**Anything outside this set takes the compiled path automatically**
+(v1.0.0-beta.1): `tyc run` scans the program's imports before executing
+anything, prints a `note:` naming the unmodelled module, and runs the
+program through `tyc build` + CPython. `--no-fallback` refuses instead.
 
 Deliberately **not** modelled (they need a real CPython runtime, not a
 shim): `sqlite3`, `subprocess`, `threading` / `multiprocessing`, `socket`

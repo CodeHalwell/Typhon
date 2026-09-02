@@ -2449,6 +2449,59 @@ fn defaultdict_class(interp: &mut Interpreter) -> Result<Value, Unwind> {
 
 // ── Module resolution ──────────────────────────────────────────────────────
 
+/// Every module `resolve_module` below can hand back, by top-level name.
+///
+/// `tyc run` consults this *before* executing anything: a program that
+/// imports something outside this set is run through the compiled path
+/// instead, so the VM stays a drop-in rather than failing where
+/// `tyc build` + CPython succeeds. Keeping it a plain list (rather than
+/// probing `resolve_module`, which has to build the module to answer)
+/// means the check costs nothing; `vm_modelled_modules_all_resolve` holds
+/// the two in sync.
+pub const MODELLED_MODULE_ROOTS: &[&str] = &[
+    "__future__",
+    "abc",
+    "argparse",
+    "asyncio",
+    "base64",
+    "bisect",
+    "collections",
+    "contextlib",
+    "csv",
+    "dataclasses",
+    "datetime",
+    "enum",
+    "functools",
+    "glob",
+    "hashlib",
+    "heapq",
+    "io",
+    "itertools",
+    "json",
+    "math",
+    "operator",
+    "os",
+    "pathlib",
+    "posixpath",
+    "pydantic",
+    "random",
+    "re",
+    "shutil",
+    "string",
+    "sys",
+    "tempfile",
+    "time",
+    "typhon_runtime",
+    "typing",
+];
+
+/// True when the VM can serve `name` (or the package it belongs to)
+/// without falling back to CPython.
+pub fn models_module(name: &str) -> bool {
+    let root = name.split('.').next().unwrap_or(name);
+    MODELLED_MODULE_ROOTS.contains(&root)
+}
+
 pub fn resolve_module(interp: &mut Interpreter, name: &str) -> Result<Value, Unwind> {
     match name {
         "typhon_runtime" => Ok(make_typhon_runtime_module(interp)),

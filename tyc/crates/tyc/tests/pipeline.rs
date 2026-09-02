@@ -770,6 +770,77 @@ fn vm_run_resolves_siblings_and_binds_sealed_union_alias() {
 }
 
 #[test]
+fn tyc_run_falls_back_to_the_compiled_path_for_an_unmodelled_module() {
+    // The VM models a documented subset of the stdlib. `tyc run` is
+    // contractually a drop-in for `tyc build` + CPython, so a program
+    // importing something outside that subset must run, not die with
+    // `ModuleNotFoundError` on code the compiled path handles.
+    let project = tempfile::tempdir().unwrap();
+    let script = project.path().join("uses_sqlite.ty");
+    std::fs::write(
+        &script,
+        "import sqlite3\n\n\
+         def main() -> None:\n    \
+             with sqlite3.connect(\":memory:\") as conn:\n        \
+                 let cur = conn.cursor()\n        \
+                 cur.execute(\"CREATE TABLE t (x INTEGER)\")\n        \
+                 cur.execute(\"INSERT INTO t VALUES (42)\")\n        \
+                 for row in cur.execute(\"SELECT x FROM t\"):\n            \
+                     print(row[0])\n\n\
+         main()\n",
+    )
+    .unwrap();
+
+    let out = tyc().arg("run").arg(&script).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "tyc run must fall back rather than fail:\n{stderr}{stdout}"
+    );
+    assert!(
+        stdout.contains("42"),
+        "the program must actually run:\n{stderr}{stdout}"
+    );
+    assert!(
+        stderr.contains("not modelled by the in-process VM"),
+        "the fallback must say why it happened:\n{stderr}"
+    );
+
+    // `--no-fallback` keeps the VM's own failure, for a hermetic run or to
+    // find out whether the VM covers a program's imports.
+    let strict = tyc()
+        .arg("run")
+        .arg("--no-fallback")
+        .arg(&script)
+        .output()
+        .unwrap();
+    let strict_err = String::from_utf8_lossy(&strict.stderr);
+    assert!(
+        strict_err.contains("No module named 'sqlite3'"),
+        "--no-fallback must surface the VM's ModuleNotFoundError:\n{strict_err}"
+    );
+
+    // A program whose imports the VM *does* model must not be diverted.
+    let plain = project.path().join("plain.ty");
+    std::fs::write(
+        &plain,
+        "import json\n\ndef main() -> None:\n    print(json.dumps({\"a\": 1}))\n\nmain()\n",
+    )
+    .unwrap();
+    let out = tyc().arg("run").arg(&plain).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("not modelled"),
+        "a modelled-import program must stay in the VM:\n{stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("{\"a\": 1}"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn vm_binds_module_dunders_like_cpython() {
     // CPython gives every module its own `__name__`, `__doc__` and
     // `__file__`. The VM bound `__name__` only on the entry module, so an

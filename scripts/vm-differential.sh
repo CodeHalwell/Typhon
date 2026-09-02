@@ -278,8 +278,14 @@ TOML
     ccode=$?
 
     # -- 3. VM side ----------------------------------------------------------
-    ( cd "$work" && "${common_env[@]}" TYC_NO_INTROSPECT=1 \
-        timeout "$TIMEOUT" "$TYC" run "$vm_target" \
+    # `TYC_NO_SYNC=1` matches the build side: `tyc run` falls back to the
+    # compiled path for a program importing a module the VM does not model,
+    # and that fallback would otherwise `uv sync` the project — giving the
+    # VM side a populated `.venv` the CPython side never had, so the two
+    # would differ on the *environment* rather than on semantics.
+    # `PYTHON313` is exported so the fallback execs the same interpreter.
+    ( cd "$work" && "${common_env[@]}" TYC_NO_SYNC=1 TYC_NO_INTROSPECT=1 \
+        timeout "$TIMEOUT" "$TYC" run --python "$PYTHON313" "$vm_target" \
         </dev/null >vm.out 2>vm.err )
     vcode=$?
 
@@ -321,8 +327,8 @@ TOML
             printf '%s\t%s\t%s\n' "nondeterministic" "$unit" "CPython disagrees with itself"
             return
         fi
-        ( cd "$work" && "${common_env[@]}" TYC_NO_INTROSPECT=1 \
-            timeout "$TIMEOUT" "$TYC" run "$vm_target" \
+        ( cd "$work" && "${common_env[@]}" TYC_NO_SYNC=1 TYC_NO_INTROSPECT=1 \
+            timeout "$TIMEOUT" "$TYC" run --python "$PYTHON313" "$vm_target" \
             </dev/null >vm2.out 2>/dev/null )
         v2code=$?
         if ! cmp -s "$work/vm.out" "$work/vm2.out" || [ "$vcode" != "$v2code" ]; then

@@ -150,15 +150,24 @@ since v1.0.0-beta.1 — before that each built an opaque instance, so
 | `__future__` (v1.0.0-beta.1) | The feature flags, so `from __future__ import annotations` imports rather than raising |
 | `typhon_runtime` (and `typhon_runtime.*`) | `Ok`, `Err`, `tasks.spawn`, `lazy.lazy_let`, `lazy.lazy_import` — the `spawn` shim runs synchronously. `Ok` / `Err` carry bound `.map` / `.map_err` / `.and_then` / `.or_else` combinators since v0.9.0. Submodule imports (`from typhon_runtime.freeze import deep_freeze`) resolve to the matching submodule |
 
-`enum` is resolved separately by the interpreter (it backs the `enum` keyword), not through the module table. Any other module raises `ModuleNotFoundError` — `tyc run` does not fall back to the compiled path on its own, so reach for `tyc run --compile` (or `tyc build`) when a program needs one.
+`enum` is resolved separately by the interpreter (it backs the `enum` keyword), not through the module table.
+
+**Anything outside this set takes the compiled path automatically**
+(v1.0.0-beta.1). `tyc run` scans the program's imports *before* executing
+anything; if one names a module the VM does not model, it prints a `note:`
+saying which, then builds the project and runs it under CPython — exactly
+what `tyc run --compile` does. Nothing half-executes and restarts, so the
+program's output and exit code are the compiled path's. `--no-fallback`
+turns the scan into a hard failure instead (the VM's own
+`ModuleNotFoundError`), which is what you want for a hermetic run or to
+find out whether the VM covers a program.
 
 Modules the VM deliberately does **not** model, because they need a real
 CPython runtime rather than a shim: `sqlite3`, `subprocess`, `threading`
 / `multiprocessing`, `socket` / `urllib` / `http`, `ctypes`, `decimal`,
 `fractions`, `logging`, `configparser`, `struct`, and every third-party
 package (`pydantic` has the placeholder above; `numpy`, `requests`,
-`yaml`, … do not). A program that imports one runs under `tyc build` and
-`tyc run --compile`; only the in-process VM declines it.
+`yaml`, … do not). Importing one is not an error — it is a slower run.
 
 ### Built-in methods on values
 

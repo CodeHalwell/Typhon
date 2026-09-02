@@ -21,7 +21,7 @@ Typhon ships a single binary, `tyc`, that handles every stage of the workflow. S
 | `tyc stubtest` | Build the project and run `python -m mypy.stubtest` against every emitted `.pyi` stub. Complements `tyc check --stubs` (which performs an AST diff) by catching dynamically-created attributes the AST cannot see. Requires `mypy` in the chosen interpreter (`pip install mypy`). |
 | `tyc repl` | Interactive Typhon evaluator. Reads `.ty` source one block at a time, compiles it through the full pipeline, and executes the result with a Python interpreter. |
 | `tyc debug` | Build the project and launch the emitted Python under a debugger (default `pdb`). Repeatable `--break <ty-file>:<line>` flags translate Typhon source locations through the v2 `.py.map` and inject `-c "break …"` into the debugger session, so breakpoints set on `.ty` lines fire on the corresponding emitted Python lines. |
-| `tyc run` | Execute a Typhon program. By default uses the in-process tree-walking VM ([docs/vm.md](vm.md)) — no `.py` is written, no CPython is spawned. `--compile` (alias `--no-vm`) falls back to the legacy build-then-exec path; pair with `--temp` to build into a tempdir that is removed on exit. |
+| `tyc run` | Execute a Typhon program. By default uses the in-process tree-walking VM ([docs/vm.md](vm.md)) — no `.py` is written, no CPython is spawned; a program importing a module the VM does not model takes the compiled path automatically (`--no-fallback` to refuse). `--compile` (alias `--no-vm`) forces the build-then-exec path; pair with `--temp` to build into a tempdir that is removed on exit. |
 | `tyc explain <code>` | Print the diagnostic catalog entry for a `tyc::` code (mirrors `rustc --explain`). Accepts the short form (`immutable_assign`) or the fully-qualified `tyc::immutable_assign`. Use `tyc explain --list` to print every code the explainer knows about. Every catalog page also lives at `docs/diagnostics/<code>.md` and is linked from the `url(...)` clause on each diagnostic. |
 | `tyc cheatsheet` | Print the 30-second Typhon cheat sheet (from [docs/cheatsheet.md](cheatsheet.md)) to stdout. Handy when you need a syntax refresher without leaving the terminal. |
 | `tyc add` / `tyc remove` / `tyc sync` | Lightweight package-manager surface over `uv`: rewrite `[dependencies]` / `[dev-dependencies]` in `typhon.toml` and run `uv sync` to install. |
@@ -297,7 +297,9 @@ tyc debug --break src/main.ty:42 --break src/lib/io.ty:7
 Executes a Typhon program. Two execution modes:
 
 - **VM (default).** Runs the source in the in-process tree-walking interpreter from `tyc-vm`. No `.py` is written, no CPython is spawned. See [docs/vm.md](vm.md) for the supported feature surface.
-- **`--compile`** (alias `--no-vm`). Falls back to the legacy "build then exec CPython" path — required when your program imports CPython libraries the VM doesn't speak natively (`numpy`, `requests`, `pandas`, …).
+- **`--compile`** (alias `--no-vm`). Uses the "build then exec CPython" path explicitly.
+
+**Automatic fallback (v1.0.0-beta.1).** `tyc run` scans the program's imports *before* executing anything. If one names a module the VM does not model (`sqlite3`, `subprocess`, `numpy`, …) it prints a `note:` saying which, then takes the `--compile` path — so a program never dies with `ModuleNotFoundError` on code `tyc build` runs fine, and never half-executes before switching. `--no-fallback` turns that into a hard failure instead, for a hermetic run or to find out whether the VM covers a program.
 
 Both modes type-check before executing. VM mode runs `tyc check` directly; `--compile` mode runs the full `tyc build` pipeline (which includes the check). The VM used to skip the static pass and crash with a Python-style `NameError` on programs that should have surfaced `tyc::unknown_name`; v0.3.1 gates VM execution behind the check pipeline, so unresolved names / type errors / arity mismatches fail the same way they would under `tyc check` or `tyc build`. The `TYC_SKIP_CHECK=1` env var disables the pre-VM check for the rare case where you want the legacy run-only-the-VM behaviour (mostly: probing the VM against deliberately-broken inputs in stress harnesses). `--compile` has no equivalent bypass — the build pipeline always type-checks.
 
@@ -321,8 +323,12 @@ tyc run src/cli.ty
 # Forward args to the script after `--` (populates sys.argv):
 tyc run -- --port 8080 ./input.csv
 
-# Fall back to compile-and-exec when the VM can't handle an import:
+# Force the compile-and-exec path (the VM takes it automatically for an
+# import it cannot model):
 tyc run --compile
+
+# …or require the VM, failing instead of falling back:
+tyc run --no-fallback
 
 # Compile mode with an ephemeral build dir:
 tyc run --compile --temp -- --port 8080
@@ -334,8 +340,9 @@ tyc run --compile --entry api.py
 | Flag | Mode | Purpose |
 |------|------|---------|
 | `--compile` (alias `--no-vm`) | switch | Build to `.py` and exec CPython instead of using the VM |
+| `--no-fallback` | vm | Fail with the VM's own `ModuleNotFoundError` instead of taking the compiled path for an unmodelled import |
 | `--entry FILE` | compile | Entry-point file relative to the build dir (default `main.py`) |
-| `--python PATH` | compile | Python interpreter (default `python3`) |
+| `--python PATH` | both | Python interpreter. Defaults to the project's `.venv`, else `python3.<minor>` for `[python] target`, else `python3` — a project targeting 3.13+ must not be run by whatever `python3` is first on `PATH`, since the emitted PEP 695 syntax is a `SyntaxError` on 3.11 |
 | `--temp` / `-t` | compile | Build into a tempdir that is deleted on exit; mutually exclusive with `--no-build` |
 | `--no-build` | compile | Skip rebuilding; assume the persistent `build/` is current |
 

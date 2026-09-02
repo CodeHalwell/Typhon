@@ -228,7 +228,13 @@ pub fn run(args: BuildArgs) -> Result<()> {
     let ty_files = collect_ty_files(&src_dir)?;
 
     if ty_files.is_empty() {
-        println!("no .ty files found in '{}'", src_dir.display());
+        // Build *progress* goes to stderr, as every compiler's does: the
+        // program's own stdout must stay the program's. `tyc run --compile`
+        // (and the automatic fallback to it) execs the built program in the
+        // same terminal, so a "built 1 file(s)" line on stdout would land in
+        // the middle of that program's output. Diagnostics already went to
+        // stderr; this makes the whole non-data surface consistent.
+        eprintln!("no .ty files found in '{}'", src_dir.display());
         return Ok(());
     }
 
@@ -298,7 +304,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // runs `uv sync`, creating `.venv` and `uv.lock` — so it is skipped in
     // check mode and reported like every other write.
     if args.check {
-        println!(
+        eprintln!(
             "would update {}",
             display_relative(&config_dir.join("pyproject.toml"), &config_dir)
         );
@@ -1231,7 +1237,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         let out_file = out_dir.join(rel).with_extension("py");
 
         if check_mode {
-            println!("would write {}", display_relative(&out_file, &project_root));
+            eprintln!("would write {}", display_relative(&out_file, &project_root));
             would_write_count += 1;
         } else {
             if let Some(parent) = out_file.parent() {
@@ -1278,7 +1284,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             &preprocessed_to_ty,
         );
         if check_mode {
-            println!("would write {}", display_relative(&map_path, &project_root));
+            eprintln!("would write {}", display_relative(&map_path, &project_root));
             would_write_count += 1;
             let _ = map_body;
         } else {
@@ -1340,7 +1346,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             continue;
         }
         if check_mode {
-            println!("would write {}", display_relative(&dest, &project_root));
+            eprintln!("would write {}", display_relative(&dest, &project_root));
             would_write_count += 1;
         } else {
             if let Some(parent) = dest.parent() {
@@ -1359,7 +1365,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         py_copied += 1;
     }
     if py_copied > 0 && !check_mode {
-        println!("copied {} .py file(s)", py_copied);
+        eprintln!("copied {} .py file(s)", py_copied);
     }
 
     // Phase 5.4 orphan-import warning: scan every `.ty` source for
@@ -1470,7 +1476,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             .map_err(|_| miette!("'{}' is outside the source directory", path.display()))?;
         let out_file = out_dir.join(rel).with_extension("pyi");
         if check_mode {
-            println!("would write {}", display_relative(&out_file, &project_root));
+            eprintln!("would write {}", display_relative(&out_file, &project_root));
             would_write_count += 1;
             let _ = stub_text;
         } else {
@@ -1485,7 +1491,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         stubs_emitted += 1;
     }
     if stubs_emitted > 0 && !check_mode {
-        println!("emitted {} stub(s) (.pyi)", stubs_emitted);
+        eprintln!("emitted {} stub(s) (.pyi)", stubs_emitted);
     }
 
     // Emit the typhon_runtime helper alongside the Python output when any
@@ -1514,7 +1520,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         if check_mode {
             for (name, _body) in files {
                 let path = runtime_dir.join(name);
-                println!("would write {}", display_relative(&path, &project_root));
+                eprintln!("would write {}", display_relative(&path, &project_root));
                 would_write_count += 1;
             }
         } else {
@@ -1528,17 +1534,17 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 tyc_format::atomic_write(&path, body.as_bytes())
                     .map_err(|e| miette!("cannot write '{}': {e}", path.display()))?;
             }
-            println!("wrote typhon_runtime/ → '{}'", runtime_dir.display());
+            eprintln!("wrote typhon_runtime/ → '{}'", runtime_dir.display());
         }
     }
 
     if check_mode {
-        println!(
+        eprintln!(
             "would write {} file(s) (no changes made)",
             would_write_count
         );
     } else {
-        println!("built {} file(s) → '{}'", emitted, out_dir.display());
+        eprintln!("built {} file(s) → '{}'", emitted, out_dir.display());
     }
     // R3 frontier: fail the build when `pub *` aggregated colliding
     // re-exports. The diagnostics were already printed to stderr in
@@ -1564,7 +1570,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         } else {
             "[checker] external = \"ty\""
         };
-        println!("running `ty` over emitted Python ({reason})…");
+        eprintln!("running `ty` over emitted Python ({reason})…");
         crate::commands::ty::run_ty_check(
             &project_root,
             &out_dir,

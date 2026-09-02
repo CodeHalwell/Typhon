@@ -544,6 +544,88 @@ pub fn check_unknown_modules(
 /// Batched variant of [`check_unknown_modules`]. Identical semantics
 /// but reuses a caller-built [`ImportVettingContext`] so the project
 /// and dependency HashSets aren't reconstructed per file.
+/// Every absolute module a source imports, as its **top-level** name
+/// (`os.path` → `os`). Relative imports are excluded: they name a sibling
+/// in the project, not an external module.
+///
+/// Used by `tyc run` to decide, before executing anything, whether the
+/// program needs a module the VM does not model — see the fallback in
+/// `commands::run`.
+pub fn collect_imported_roots(
+    module: &ruff_python_ast::ModModule,
+) -> std::collections::BTreeSet<String> {
+    use ruff_python_ast::Stmt;
+
+    fn root_of(name: &str) -> Option<String> {
+        let root = name.split('.').next().unwrap_or(name);
+        if root.is_empty() {
+            None
+        } else {
+            Some(root.to_owned())
+        }
+    }
+
+    fn walk(stmts: &[Stmt], out: &mut std::collections::BTreeSet<String>) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Import(imp) => {
+                    for alias in &imp.names {
+                        if let Some(root) = root_of(alias.name.as_str()) {
+                            out.insert(root);
+                        }
+                    }
+                }
+                Stmt::ImportFrom(imp) => {
+                    if imp.level > 0 {
+                        continue;
+                    }
+                    if let Some(name) = imp.module.as_ref() {
+                        if let Some(root) = root_of(name.as_str()) {
+                            out.insert(root);
+                        }
+                    }
+                }
+                Stmt::FunctionDef(f) => walk(&f.body, out),
+                Stmt::ClassDef(c) => walk(&c.body, out),
+                Stmt::If(s) => {
+                    walk(&s.body, out);
+                    for c in &s.elif_else_clauses {
+                        walk(&c.body, out);
+                    }
+                }
+                Stmt::Try(s) => {
+                    walk(&s.body, out);
+                    walk(&s.orelse, out);
+                    walk(&s.finalbody, out);
+                    for handler in &s.handlers {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = handler;
+                        walk(&h.body, out);
+                    }
+                }
+                Stmt::For(s) => {
+                    walk(&s.body, out);
+                    walk(&s.orelse, out);
+                }
+                Stmt::While(s) => {
+                    walk(&s.body, out);
+                    walk(&s.orelse, out);
+                }
+                Stmt::With(s) => walk(&s.body, out),
+                Stmt::Match(s) => {
+                    for case in &s.cases {
+                        walk(&case.body, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut out = std::collections::BTreeSet::new();
+    walk(&module.body, &mut out);
+    out
+}
+
 pub fn check_unknown_modules_with(
     path: &str,
     source: &str,
