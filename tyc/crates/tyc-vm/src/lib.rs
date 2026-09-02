@@ -2690,6 +2690,7 @@ import base64
 import collections
 import contextlib
 import csv
+import datetime
 import hashlib
 import io
 import itertools
@@ -2851,6 +2852,41 @@ def main() -> None:
             raise ValueError(label + " should refuse a negative r")
         except ValueError as e:
             check("negative-" + label, str(e), "r must be non-negative")
+
+    # An append-mode seek *past* the end still writes at EOF, gap and all.
+    with open("ap.txt", "w") as aw:
+        aw.write("abc")
+    with open("ap.txt", "a+") as af:
+        af.seek(10)
+        af.write("X")
+        check("append-past-eof-tell", str(af.tell()), "4")
+    check("append-past-eof", str(open("ap.txt", "rb").read()), "b'abcX'")
+
+    # `PurePath.match` / `full_match` honour `case_sensitive` too.
+    check("match-nocase", f"{pathlib.PurePosixPath('item.txt').match('*.TXT', case_sensitive=False)}", "True")
+    check("match-case", f"{pathlib.PurePosixPath('item.txt').match('*.TXT')}", "False")
+    check("fullmatch-nocase", f"{pathlib.PurePosixPath('a/item.txt').full_match('**/*.TXT', case_sensitive=False)}", "True")
+
+    # A fixed-offset `fromutc` only accepts a datetime it owns.
+    let tz = datetime.timezone(datetime.timedelta(hours=2))
+    try:
+        let _ = tz.fromutc(datetime.datetime(2020, 1, 1))
+        raise ValueError("fromutc should refuse a naive datetime")
+    except ValueError as e:
+        check("fromutc-naive", str(e), "fromutc: dt.tzinfo is not self")
+    check("fromutc-own", str(tz.fromutc(datetime.datetime(2020, 1, 1, tzinfo=tz))), "2020-01-01 02:00:00+02:00")
+
+    # `os.path` keeps a bytes path in bytes, high bytes included.
+    check("bytes-join", str(os.path.join(b"/tmp", b"x")), "b'/tmp/x'")
+    check("bytes-split", str(os.path.split(b"/a/b")), "(b'/a', b'b')")
+    check("bytes-normpath", str(os.path.normpath(b"/a/../b//c")), "b'/b/c'")
+    check("bytes-highbyte", str(os.path.basename(b"/a/\xff\xfe")), "b'\\xff\\xfe'")
+    check("bytes-isabs", f"{os.path.isabs(b'/tmp')}", "True")
+    try:
+        let _ = os.path.join(b"/a", "b")
+        raise ValueError("mixing str and bytes should be refused")
+    except TypeError as e:
+        check("bytes-mix", str(e), "Can't mix strings and bytes in path components")
     print("ok")
 
 

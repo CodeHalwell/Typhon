@@ -12,20 +12,68 @@ devnull = "/dev/null"
 
 
 def _check(s):
+    """A `str` view of a path argument.
+
+    A `bytes` path decodes through latin-1, which is a byte-for-byte
+    bijection: the ASCII separators and dots this module inspects are
+    unchanged, and `_restore` encodes the result back to the exact original
+    bytes. (A *non-ASCII* current directory mixed into a bytes result is the
+    one place that cannot round-trip, since the cwd arrives as text.)
+    """
     if isinstance(s, str):
         return s
+    if isinstance(s, (bytes, bytearray)):
+        return bytes(s).decode("latin-1")
     return _fspath(s)
 
 
+def _holds_bytes(value):
+    if isinstance(value, (bytes, bytearray)):
+        return True
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            if isinstance(item, (bytes, bytearray)):
+                return True
+    return False
+
+
+def _restore(value):
+    """Put a `str` result back into the caller's `bytes` flavour."""
+    if isinstance(value, str):
+        return value.encode("latin-1")
+    if isinstance(value, tuple):
+        return tuple(_restore(v) for v in value)
+    if isinstance(value, list):
+        return [_restore(v) for v in value]
+    return value
+
+
+def _bytes_aware(fn):
+    """Let a path function take `bytes`, as CPython's `posixpath` does."""
+    def wrapper(*args, **kwargs):
+        for a in args:
+            if _holds_bytes(a):
+                return _restore(fn(*args, **kwargs))
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+@_bytes_aware
 def normcase(s):
     return _check(s)
 
 
+@_bytes_aware
 def isabs(s):
     return _check(s).startswith("/")
 
 
+@_bytes_aware
 def join(a, *p):
+    let_bytes = _holds_bytes(a)
+    for b in p:
+        if _holds_bytes(b) != let_bytes:
+            raise TypeError("Can't mix strings and bytes in path components")
     a = _check(a)
     path = a
     for b in p:
@@ -39,6 +87,7 @@ def join(a, *p):
     return path
 
 
+@_bytes_aware
 def split(p):
     p = _check(p)
     i = p.rfind("/") + 1
@@ -48,6 +97,7 @@ def split(p):
     return head, tail
 
 
+@_bytes_aware
 def splitext(p):
     p = _check(p)
     sep_index = p.rfind("/")
@@ -61,11 +111,13 @@ def splitext(p):
     return p, p[:0]
 
 
+@_bytes_aware
 def splitdrive(p):
     p = _check(p)
     return p[:0], p
 
 
+@_bytes_aware
 def splitroot(p):
     p = _check(p)
     if p[:1] != "/":
@@ -76,12 +128,14 @@ def splitroot(p):
         return "", "//", p[2:]
 
 
+@_bytes_aware
 def basename(p):
     p = _check(p)
     i = p.rfind("/") + 1
     return p[i:]
 
 
+@_bytes_aware
 def dirname(p):
     p = _check(p)
     i = p.rfind("/") + 1
@@ -91,6 +145,7 @@ def dirname(p):
     return head
 
 
+@_bytes_aware
 def normpath(path):
     path = _check(path)
     if path == "":
@@ -113,6 +168,7 @@ def normpath(path):
     return path or "."
 
 
+@_bytes_aware
 def abspath(path):
     path = _check(path)
     if not path.startswith("/"):
@@ -120,6 +176,7 @@ def abspath(path):
     return normpath(path)
 
 
+@_bytes_aware
 def realpath(filename, *, strict=False):
     filename = _check(filename)
     if strict and not lexists(filename):
@@ -127,6 +184,7 @@ def realpath(filename, *, strict=False):
     return _fs_realpath(filename)
 
 
+@_bytes_aware
 def commonprefix(m):
     if not m:
         return ""
@@ -140,6 +198,7 @@ def commonprefix(m):
     return s1
 
 
+@_bytes_aware
 def relpath(path, start=None):
     path = _check(path)
     if not path:
@@ -157,6 +216,7 @@ def relpath(path, start=None):
     return join(*rel_list)
 
 
+@_bytes_aware
 def commonpath(paths):
     paths = tuple(_check(p) for p in paths)
     if not paths:
@@ -178,6 +238,7 @@ def commonpath(paths):
     return prefix + "/".join(common)
 
 
+@_bytes_aware
 def expanduser(path):
     path = _check(path)
     if not path.startswith("~"):
@@ -194,6 +255,7 @@ def expanduser(path):
     return (userhome + path[i:]) or "/"
 
 
+@_bytes_aware
 def expandvars(path):
     path = _check(path)
     if "$" not in path:

@@ -386,7 +386,7 @@ class PurePosixPath:
                 pat = "*"
             if pat == part and pat in ("/", "//"):
                 continue
-            if not _fnmatch(part, pat):
+            if not _fnmatch(part, pat, case_sensitive):
                 return False
         return True
 
@@ -401,10 +401,10 @@ class PurePosixPath:
         if pattern._root:
             pat_parts = pat_parts[1:]
             parts = parts[1:]
-        return _match_parts(parts, 0, pat_parts, 0)
+        return _match_parts(parts, 0, pat_parts, 0, case_sensitive)
 
 
-def _match_parts(parts, i, pats, j):
+def _match_parts(parts, i, pats, j, case_sensitive=None):
     while j < len(pats):
         pat = pats[j]
         if pat == "**":
@@ -413,13 +413,13 @@ def _match_parts(parts, i, pats, j):
                 return True
             k = i
             while k <= len(parts):
-                if _match_parts(parts, k, pats, j):
+                if _match_parts(parts, k, pats, j, case_sensitive):
                     return True
                 k += 1
             return False
         if i >= len(parts):
             return False
-        if not _fnmatch(parts[i], pat):
+        if not _fnmatch(parts[i], pat, case_sensitive):
             return False
         i += 1
         j += 1

@@ -512,6 +512,13 @@ class timezone(tzinfo):
         return None
 
     def fromutc(self, dt):
+        # A fixed-offset conversion is only meaningful for a datetime this
+        # timezone already owns; anything else is ambiguous, and CPython
+        # refuses it rather than relabel the result.
+        if not isinstance(dt, datetime):
+            raise TypeError("fromutc() requires a datetime argument")
+        if dt.tzinfo is not self:
+            raise ValueError("fromutc: dt.tzinfo is not self")
         return dt + self._offset
 
     def _name_from_offset(self, delta):

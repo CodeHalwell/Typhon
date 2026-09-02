@@ -192,14 +192,16 @@ class _TextStream(TextIOBase):
             raise TypeError(self._write_type_message % type(s).__name__)
         self._load()
         text = self._translate_out(s)
-        # Writing past end-of-file leaves a NUL-filled gap, not a shortened
-        # buffer: `seek(5)` then `write("X")` on `"abc"` gives `abc\0\0X`.
-        if self._pos > len(self._buf):
-            self._buf = self._buf + "\x00" * (self._pos - len(self._buf))
         if self._append:
             # An `O_APPEND` write always lands at end-of-file, whatever the
-            # cursor says; a seek only moves where the next read starts.
+            # cursor says; a seek only moves where the next read starts. That
+            # includes a seek *past* the end, which leaves no gap at all.
             self._pos = len(self._buf)
+        elif self._pos > len(self._buf):
+            # Writing past end-of-file leaves a NUL-filled gap, not a
+            # shortened buffer: `seek(5)` then `write("X")` on `"abc"` gives
+            # `abc\0\0X`.
+            self._buf = self._buf + "\x00" * (self._pos - len(self._buf))
         if self._pos == len(self._buf):
             self._buf = self._buf + text
         else:
@@ -442,14 +444,19 @@ class _BytesStream(BufferedIOBase):
         if not isinstance(data, bytes):
             raise TypeError("a bytes-like object is required, not '%s'" % type(data).__name__)
         self._load()
-        # Writing past end-of-file leaves a NUL-filled gap, not a shortened
-        # buffer: `seek(5)` then `write(b"X")` on `b"abc"` gives `abc\0\0X`.
-        if self._pos > len(self._buf):
-            self._buf = self._buf + b"\x00" * (self._pos - len(self._buf))
         # An `O_APPEND` write always lands at end-of-file, whatever the cursor
-        # says. CPython's buffered layer still advances `tell()` from wherever
-        # the cursor was until the next flush, so leave `_pos` alone.
-        start = len(self._buf) if self._append else self._pos
+        # says — a seek past the end included, which is why the NUL gap below
+        # must not be filled in for one. CPython's buffered layer still
+        # advances `tell()` from wherever the cursor was, so leave `_pos`.
+        if self._append:
+            start = len(self._buf)
+        else:
+            # Writing past end-of-file leaves a NUL-filled gap, not a
+            # shortened buffer: `seek(5)` then `write(b"X")` on `b"abc"` gives
+            # `abc\0\0X`.
+            if self._pos > len(self._buf):
+                self._buf = self._buf + b"\x00" * (self._pos - len(self._buf))
+            start = self._pos
         if start == len(self._buf):
             self._buf = self._buf + data
         else:

@@ -298,6 +298,19 @@ re-importing. A name the package genuinely does not have raises `ImportError`
 with CPython's message rather than `AttributeError`, which is the type an
 `except ImportError` around an optional dependency is written to catch.
 
+A last pass over the same shims: an append-mode stream seeked *past* the end
+filled the gap with NULs before honouring the append, so `a+` plus
+`seek(10)` plus `write("X")` grew the file instead of appending to it — the
+`O_APPEND` reset now comes first, and the sparse-write padding applies only
+where the cursor really is the write position. `PurePath.match` and
+`full_match` discarded `case_sensitive` even after `glob` learned it.
+`timezone.fromutc` relabelled a datetime belonging to another timezone
+instead of refusing it. And `os.path` dropped `bytes` paths entirely
+(`os.path.join(b"/tmp", b"x")` raised `TypeError`) — the pure path functions
+round-trip them through latin-1 now, which is a byte-for-byte bijection over
+the ASCII separators they inspect, and `join` refuses a str/bytes mixture as
+CPython does.
+
 **A prelude name that only the VM could resolve.** `BaseModel` and
 `NewType` resolve without an import — the `model` and `newtype` lowerings
 introduce them — so naming either directly passes `tyc check`. Their
