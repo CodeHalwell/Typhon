@@ -2678,6 +2678,81 @@ main()
     }
 
     #[test]
+    fn vm_directory_modes_append_writes_and_metadata_copies() {
+        let src = r#"
+import argparse
+import os
+import shutil
+import tempfile
+
+def main() -> None:
+    let base: str = tempfile.mkdtemp()
+
+    # `os.mkdir` applies the mode it is given; `tempfile` leans on that for
+    # owner-only temporary directories. 0o700 survives any umask.
+    let private: str = base + "/private"
+    os.mkdir(private, 0o700)
+    if os.stat(private).st_mode & 0o777 != 0o700:
+        raise ValueError("os.mkdir must honour its mode argument")
+    os.makedirs(base + "/deep/leaf", 0o700)
+    if os.stat(base + "/deep/leaf").st_mode & 0o777 != 0o700:
+        raise ValueError("makedirs applies the mode to the leaf")
+    if os.stat(tempfile.mkdtemp()).st_mode & 0o777 != 0o700:
+        raise ValueError("mkdtemp is owner-only")
+
+    # An append-mode write lands at end-of-file however the cursor moved.
+    let text: str = base + "/t.txt"
+    with open(text, "w") as w:
+        w.write("abc")
+    with open(text, "a+") as f:
+        f.seek(0)
+        if f.read() != "abc":
+            raise ValueError("a+ should read from the start after a seek")
+        f.seek(0)
+        f.write("X")
+        if f.tell() != 4:
+            raise ValueError("a text tell should follow the append")
+    if open(text).read() != "abcX":
+        raise ValueError("a seek must not redirect an append-mode write")
+
+    let raw: str = base + "/b.bin"
+    with open(raw, "wb") as wb:
+        wb.write(b"abc")
+    with open(raw, "ab+") as fb:
+        fb.seek(0)
+        fb.write(b"X")
+    if open(raw, "rb").read() != b"abcX":
+        raise ValueError("binary append writes go to the end too")
+
+    # `copy2` keeps the source timestamps; `copy` deliberately does not.
+    let s: str = base + "/src.txt"
+    with open(s, "w") as sw:
+        sw.write("hello")
+    os.utime(s, (100000.0, 100000.0))
+    shutil.copy2(s, base + "/two.txt")
+    if os.stat(base + "/two.txt").st_mtime != 100000.0:
+        raise ValueError("copy2 must preserve mtime")
+    shutil.copy(s, base + "/three.txt")
+    if os.stat(base + "/three.txt").st_mtime == 100000.0:
+        raise ValueError("plain copy leaves a fresh mtime")
+
+    # A greedy `nargs="*"` must leave the values a later positional needs.
+    let p = argparse.ArgumentParser(prog="p")
+    p.add_argument("files", nargs="*")
+    p.add_argument("dest")
+    let one = p.parse_args(["out"])
+    if vars(one) != {"files": [], "dest": "out"}:
+        raise ValueError(f"greedy star swallowed dest: {vars(one)}")
+    let many = p.parse_args(["a", "b", "out"])
+    if vars(many) != {"files": ["a", "b"], "dest": "out"}:
+        raise ValueError(f"star should keep the rest: {vars(many)}")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn vm_property_setter_and_dir() {
         let src = r#"
 class Temp:

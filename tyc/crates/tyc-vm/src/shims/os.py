@@ -239,7 +239,7 @@ def scandir(path="."):
 
 
 def mkdir(path, mode=0o777, *, dir_fd=None):
-    _fs_mkdir(path)
+    _fs_mkdir(path, mode)
 
 
 def makedirs(name, mode=0o777, exist_ok=False):
@@ -255,7 +255,7 @@ def makedirs(name, mode=0o777, exist_ok=False):
         if tail == curdir:
             return
     try:
-        _fs_mkdir(name)
+        _fs_mkdir(name, mode)
     except OSError:
         if not exist_ok or not path.isdir(name):
             raise
@@ -420,7 +420,18 @@ def chmod(path, mode, *, dir_fd=None, follow_symlinks=True):
 
 
 def utime(path, times=None, *, ns=None, dir_fd=None, follow_symlinks=True):
-    _fs_touch(path)
+    if ns is not None:
+        if times is not None:
+            raise ValueError("utime: you may specify either 'times' or 'ns' but not both")
+        atime_ns, mtime_ns = ns
+    elif times is not None:
+        atime, mtime = times
+        atime_ns = int(atime * 1000000000)
+        mtime_ns = int(mtime * 1000000000)
+    else:
+        _fs_touch(path)
+        return
+    _fs_touch(path, atime_ns, mtime_ns)
 
 
 def symlink(src, dst, target_is_directory=False, *, dir_fd=None):

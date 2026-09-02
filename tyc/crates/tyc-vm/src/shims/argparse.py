@@ -15,6 +15,18 @@ REMAINDER = "..."
 PARSER = "A..."
 
 
+def _min_values(action):
+    """Values `action` must consume for the parse to succeed."""
+    if action.action == "parsers":
+        return 1 if action.required else 0
+    n = action.nargs
+    if n is None or n == ONE_OR_MORE:
+        return 1
+    if isinstance(n, int):
+        return n
+    return 0
+
+
 class ArgumentError(Exception):
     def __init__(self, argument, message):
         self.argument_name = argument
@@ -749,6 +761,9 @@ class ArgumentParser:
         positionals = [a for a in self._actions if not a.option_strings]
         seen = set()
         extras = []
+        # Positional values are gathered into one flat list. CPython instead
+        # matches each *contiguous run* of them, so positionals interleaved
+        # with options (`a --flag b c`) are grouped differently there.
         pos_values = []
         i = 0
         stop_options = False
@@ -788,8 +803,18 @@ class ArgumentParser:
             pos_values.append(arg)
             i += 1
         consumed = 0
-        for a in positionals:
+        for index, a in enumerate(positionals):
             remaining = pos_values[consumed:]
+            # CPython matches every positional's `nargs` against argv in one
+            # regular expression, so a greedy `?`/`*`/`+`/`...` gives back
+            # whatever the positionals after it still need. Hold that many
+            # values in reserve rather than swallowing them here.
+            reserve = 0
+            for later in positionals[index + 1:]:
+                reserve += _min_values(later)
+            available = len(remaining) - reserve
+            if available < 0:
+                available = 0
             if a.action == "parsers":
                 if not remaining:
                     if a.required:
@@ -815,14 +840,14 @@ class ArgumentParser:
                 vals = remaining[:1]
                 consumed += 1
             elif n == OPTIONAL:
-                if not remaining:
+                if not available:
                     self._store(ns, a, None)
                     seen.add(id(a))
                     continue
                 vals = remaining[:1]
                 consumed += 1
             elif n == ZERO_OR_MORE:
-                vals = remaining
+                vals = remaining[:available]
                 consumed += len(vals)
                 if not vals and a.default is not None:
                     seen.add(id(a))
@@ -830,10 +855,12 @@ class ArgumentParser:
             elif n == ONE_OR_MORE:
                 if not remaining:
                     continue
-                vals = remaining
+                # `+` still takes one value even when a later positional then
+                # goes unfilled: CPython reports only the later one missing.
+                vals = remaining[:available] if available else remaining[:1]
                 consumed += len(vals)
             elif n == REMAINDER:
-                vals = remaining
+                vals = remaining[:available]
                 consumed += len(vals)
             elif isinstance(n, int):
                 if len(remaining) < n:
@@ -843,7 +870,7 @@ class ArgumentParser:
                 vals = remaining[:n]
                 consumed += n
             else:
-                vals = remaining
+                vals = remaining[:available]
                 consumed += len(vals)
             seen.add(id(a))
             self._store(ns, a, self._convert(a, vals))

@@ -46,7 +46,11 @@ def copymode(src, dst, *, follow_symlinks=True):
 
 
 def copystat(src, dst, *, follow_symlinks=True):
-    copymode(src, dst)
+    st = os.stat(src)
+    os.chmod(dst, st.st_mode & 0o7777)
+    # `copy2` is `copy` plus metadata, and the timestamps are the metadata
+    # callers actually notice: without them the copy looks freshly written.
+    os.utime(dst, ns=(st.st_atime_ns, st.st_mtime_ns))
 
 
 def copy(src, dst, *, follow_symlinks=True):

@@ -133,6 +133,28 @@ while `shutil.rmtree` re-points its error at the argument it was given, as
 CPython's does. **The
 differential baseline falls from 167 entries to 13.**
 
+**Shims that were quietly lax about the filesystem.** A read-through of the
+VM's stdlib shims turned up a run of fidelity gaps with real consequences.
+`tempfile.mkstemp` and `NamedTemporaryFile` created their file through an
+exclusive-create that left the mode to the umask — 0644 under the usual
+022, where CPython guarantees 0600 — and `os.mkdir(path, mode)` discarded
+its mode outright, so `mkdtemp` and `TemporaryDirectory` were readable by
+every local user too. Both apply the mode in the creating syscall now,
+rather than for a window afterwards. A file opened `a` or `a+` seeked to
+the end only once, so a `seek(0)` followed by a write overwrote the start
+instead of appending; an append-mode write always lands at end-of-file now,
+whatever the cursor says. `shutil.copytree(..., symlinks=True)` tested
+`os.path.isdir` first, which resolves a link, so a symlink to a directory
+was copied *through* and a cycle recursed forever, and `copystat` copied
+permission bits only — leaving `copy2` with a fresh mtime — because
+`os.utime` ignored the times it was given. `base64.b64decode(...,
+validate=True)` never passed the flag on, so strict mode was the permissive
+one. And an `argparse` positional with `nargs` of `*`, `?`, `+` or
+`REMAINDER` swallowed everything in front of it, where CPython matches all
+the positionals in one pass and hands back whatever the later ones still
+need: `files` with `nargs="*"` ahead of a required `dest` failed on every
+one-argument command line.
+
 **A prelude name that only the VM could resolve.** `BaseModel` and
 `NewType` resolve without an import — the `model` and `newtype` lowerings
 introduce them — so naming either directly passes `tyc check`. Their

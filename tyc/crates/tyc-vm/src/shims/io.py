@@ -140,6 +140,7 @@ class _TextStream(TextIOBase):
         IOBase.__init__(self)
         self._buf = ""
         self._pos = 0
+        self._append = False
         self._newline = newline
         # Line terminators `readline` recognises.
         if newline is None or newline == "":
@@ -190,6 +191,10 @@ class _TextStream(TextIOBase):
             raise TypeError(self._write_type_message % type(s).__name__)
         self._load()
         text = self._translate_out(s)
+        if self._append:
+            # An `O_APPEND` write always lands at end-of-file, whatever the
+            # cursor says; a seek only moves where the next read starts.
+            self._pos = len(self._buf)
         if self._pos == len(self._buf):
             self._buf = self._buf + text
         else:
@@ -368,6 +373,7 @@ class _BytesStream(BufferedIOBase):
         IOBase.__init__(self)
         self._buf = b""
         self._pos = 0
+        self._append = False
         self._dirty = False
 
     def readable(self):
@@ -414,10 +420,14 @@ class _BytesStream(BufferedIOBase):
         if not isinstance(data, bytes):
             raise TypeError("a bytes-like object is required, not '%s'" % type(data).__name__)
         self._load()
-        if self._pos == len(self._buf):
+        # An `O_APPEND` write always lands at end-of-file, whatever the cursor
+        # says. CPython's buffered layer still advances `tell()` from wherever
+        # the cursor was until the next flush, so leave `_pos` alone.
+        start = len(self._buf) if self._append else self._pos
+        if start == len(self._buf):
             self._buf = self._buf + data
         else:
-            self._buf = self._buf[:self._pos] + data + self._buf[self._pos + len(data):]
+            self._buf = self._buf[:start] + data + self._buf[start + len(data):]
         self._pos += len(data)
         self._dirty = True
         return len(data)
@@ -592,6 +602,7 @@ def open(file, mode="r", buffering=-1, encoding=None, errors=None, newline=None,
             file_mode = "rb"
         f = _BinaryFile(path, file_mode, readable, writable, raw, dirty, kind)
         if appending:
+            f._append = True
             f._pos = len(raw)
     else:
         if encoding is None:
@@ -600,6 +611,7 @@ def open(file, mode="r", buffering=-1, encoding=None, errors=None, newline=None,
             errors = "strict"
         f = TextIOWrapper(path, mode, encoding, errors, newline, readable, writable, raw, dirty)
         if appending:
+            f._append = True
             f._load()
             f._pos = len(f._buf)
     _open_files.append(f)

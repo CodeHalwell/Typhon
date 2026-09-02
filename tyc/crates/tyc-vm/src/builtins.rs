@@ -3944,6 +3944,16 @@ fn path_arg(
     fspath_pair(interp, v)
 }
 
+/// A `SystemTime` `ns` nanoseconds from the Unix epoch, either side of it.
+fn nanos_since_epoch(ns: i64) -> std::time::SystemTime {
+    let step = std::time::Duration::from_nanos(ns.unsigned_abs());
+    if ns >= 0 {
+        std::time::UNIX_EPOCH + step
+    } else {
+        std::time::UNIX_EPOCH - step
+    }
+}
+
 #[cfg(unix)]
 fn stat_tuple(m: &std::fs::Metadata) -> Value {
     use std::os::unix::fs::MetadataExt;
@@ -4134,7 +4144,18 @@ fn fs_natives() -> Vec<(&'static str, Value)> {
             "_fs_mkdir",
             nf("_fs_mkdir", |i, args| {
                 let (path, display) = path_arg(i, &args, 0, "mkdir")?;
-                std::fs::create_dir(&path).map_err(|e| fs_unwind(&display, e))?;
+                let mut builder = std::fs::DirBuilder::new();
+                builder.recursive(false);
+                // A directory mode may be requested (`tempfile` guarantees
+                // 0700); applying it in the `mkdir` call itself avoids the
+                // window a create-then-chmod would leave open. The kernel
+                // masks it with the umask, exactly as CPython's does.
+                #[cfg(unix)]
+                if let Some(mode) = args.get(1).and_then(|v| v.to_int().ok()) {
+                    use std::os::unix::fs::DirBuilderExt;
+                    builder.mode(mode as u32);
+                }
+                builder.create(&path).map_err(|e| fs_unwind(&display, e))?;
                 Ok(Value::None)
             }),
         ),
@@ -4227,13 +4248,32 @@ fn fs_natives() -> Vec<(&'static str, Value)> {
             nf("_fs_touch", |i, args| {
                 let (path, display) = path_arg(i, &args, 0, "touch")?;
                 let p = std::path::Path::new(&path);
-                let result = if p.exists() {
-                    std::fs::OpenOptions::new()
-                        .write(true)
-                        .open(p)
-                        .and_then(|f| f.set_modified(std::time::SystemTime::now()))
-                } else {
-                    std::fs::File::create(p).map(|_| ())
+                // `os.utime` names the timestamps in nanoseconds; without them
+                // the file is stamped `now`, which is what `Path.touch` wants.
+                let times = match (
+                    args.get(1).and_then(|v| v.to_int().ok()),
+                    args.get(2).and_then(|v| v.to_int().ok()),
+                ) {
+                    (Some(a), Some(m)) => Some((a, m)),
+                    _ => None,
+                };
+                if !p.exists() {
+                    std::fs::File::create(p).map_err(|e| fs_unwind(&display, e))?;
+                }
+                // A directory can never be opened for writing, and its
+                // timestamps are still settable through a read-only handle.
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(p)
+                    .or_else(|_| std::fs::File::open(p))
+                    .map_err(|e| fs_unwind(&display, e))?;
+                let result = match times {
+                    Some((a, m)) => file.set_times(
+                        std::fs::FileTimes::new()
+                            .set_accessed(nanos_since_epoch(a))
+                            .set_modified(nanos_since_epoch(m)),
+                    ),
+                    None => file.set_modified(std::time::SystemTime::now()),
                 };
                 result.map_err(|e| fs_unwind(&display, e))?;
                 Ok(Value::None)
