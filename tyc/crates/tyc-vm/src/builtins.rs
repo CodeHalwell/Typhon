@@ -314,6 +314,15 @@ pub fn install(interp: &mut Interpreter) {
         let v = single(&args, "int")?;
         // A user `__int__` (then `__index__`) — CPython's conversion
         // protocol, and how `int()` reaches a `lazy let` proxy.
+        // `int(bytearray(b"7"))` — a bytes-like converts like `bytes`.
+        let bytes_like;
+        let v = match bytearray_bytes(v) {
+            Some(raw) => {
+                bytes_like = Value::Bytes(Rc::new(raw));
+                &bytes_like
+            }
+            None => v,
+        };
         if let Value::Instance(_) = v {
             let v = v.clone();
             for dunder in ["__int__", "__index__"] {
@@ -482,8 +491,16 @@ pub fn install(interp: &mut Interpreter) {
                     return Err(value_error("pow() 3rd argument cannot be 0"));
                 }
                 if exp.is_negative() {
-                    return Err(value_error(
-                        "pow() 2nd argument cannot be negative when 3rd argument specified",
+                    // Python 3.8+: a negative exponent raises the modular
+                    // *inverse* of the base to `-exp`, and reports a base
+                    // with no inverse rather than refusing outright.
+                    let inverse = modular_inverse(&base.as_bigint(), &modv.as_bigint())
+                        .ok_or_else(|| {
+                            value_error("base is not invertible for the given modulus")
+                        })?;
+                    let positive = exp.abs();
+                    return Ok(Value::Int(
+                        VmInt::from_bigint(inverse).modpow(&positive, modv),
                     ));
                 }
                 return Ok(Value::Int(base.modpow(exp, modv)));
@@ -547,6 +564,15 @@ pub fn install(interp: &mut Interpreter) {
         let v = single(&args, "float")?;
         // A user `__float__` (then `__index__`), as CPython's conversion
         // protocol prescribes.
+        // `int(bytearray(b"7"))` — a bytes-like converts like `bytes`.
+        let bytes_like;
+        let v = match bytearray_bytes(v) {
+            Some(raw) => {
+                bytes_like = Value::Bytes(Rc::new(raw));
+                &bytes_like
+            }
+            None => v,
+        };
         if let Value::Instance(_) = v {
             let v = v.clone();
             for dunder in ["__float__", "__index__"] {
@@ -1989,6 +2015,50 @@ fn based_int_repr(args: &[Value], name: &str, radix: u32, prefix: &str) -> Resul
         "{sign}{prefix}{}",
         vi.abs().to_str_radix(radix)
     ))))
+}
+
+/// The bytes behind a `bytearray` shim instance (its `_data` list of ints),
+/// so the conversions that accept a bytes-like see one.
+pub(crate) fn bytearray_bytes(v: &Value) -> Option<Vec<u8>> {
+    let Value::Instance(inst) = v else {
+        return None;
+    };
+    if inst.class.name != "bytearray" {
+        return None;
+    }
+    let data = match inst.fields.borrow().get("_data") {
+        Some(Value::List(d)) => d.clone(),
+        _ => return None,
+    };
+    let raw = data.borrow().clone();
+    raw.iter()
+        .map(|b| b.to_int().ok().map(|n| n as u8))
+        .collect()
+}
+
+/// The modular inverse of `a` mod `m` by the extended Euclidean algorithm,
+/// or `None` when `gcd(a, m) != 1`. Backs Python 3.8+'s `pow(a, -e, m)`.
+fn modular_inverse(a: &num_bigint::BigInt, m: &num_bigint::BigInt) -> Option<num_bigint::BigInt> {
+    use num_bigint::BigInt;
+    use num_integer::Integer;
+    use num_traits::{One, Signed, Zero};
+    let m_abs = m.abs();
+    if m_abs.is_one() {
+        return Some(BigInt::zero());
+    }
+    let (mut old_r, mut r) = (a.mod_floor(&m_abs), m_abs.clone());
+    let (mut old_s, mut s) = (BigInt::one(), BigInt::zero());
+    while !r.is_zero() {
+        let q = &old_r / &r;
+        let new_r = &old_r - &q * &r;
+        old_r = std::mem::replace(&mut r, new_r);
+        let new_s = &old_s - &q * &s;
+        old_s = std::mem::replace(&mut s, new_s);
+    }
+    if !old_r.is_one() {
+        return None;
+    }
+    Some(old_s.mod_floor(&m_abs))
 }
 
 fn value_len(v: &Value) -> Result<usize, Unwind> {

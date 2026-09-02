@@ -2280,6 +2280,10 @@ impl Value {
             (Bool(a), Bool(b)) => a.partial_cmp(b),
             (Bool(a), Int(b)) => VmInt::from(*a as i64).partial_cmp(b),
             (Int(a), Bool(b)) => a.partial_cmp(&VmInt::from(*b as i64)),
+            // `bool` is an `int` in CPython, so it orders against floats too
+            // — `sorted([True, False, 0.5])` needs this.
+            (Bool(a), Float(b)) => f64::from(*a).partial_cmp(b),
+            (Float(a), Bool(b)) => a.partial_cmp(&f64::from(*b)),
             (Str(a), Str(b)) => a.partial_cmp(b),
             // `bytes` is ordered in CPython (lexicographic over the byte
             // values). Without this arm every bytes pair was "incomparable",
@@ -2332,7 +2336,15 @@ impl Value {
                     "Python int too large to convert to C int",
                 ))
             }),
-            Value::Str(s) => s.trim().parse::<i64>().map_err(|_| {
+            // `int(b"12")` / `float(b"1.5")` — CPython parses a
+            // bytes-like the same way it parses a string.
+            Value::Bytes(b) => parse_decimal_str::<i64>(&String::from_utf8_lossy(b)).map_err(|_| {
+                value_error(format!(
+                    "invalid literal for int() with base 10: {}",
+                    Value::Bytes(b.clone()).py_repr()
+                ))
+            }),
+            Value::Str(s) => parse_decimal_str::<i64>(s).map_err(|_| {
                 value_error(format!(
                     "invalid literal for int() with base 10: {}",
                     Value::Str(s.clone()).py_repr()
@@ -2365,7 +2377,15 @@ impl Value {
             // and CPython raises `OverflowError` / `ValueError` here — so
             // convert exactly and reject what has no integer value.
             Value::Float(x) => float_to_bigint(*x),
-            Value::Str(s) => s.trim().parse::<BigInt>().map_err(|_| {
+            Value::Bytes(b) => {
+                parse_decimal_str::<BigInt>(&String::from_utf8_lossy(b)).map_err(|_| {
+                    value_error(format!(
+                        "invalid literal for int() with base 10: {}",
+                        Value::Bytes(b.clone()).py_repr()
+                    ))
+                })
+            }
+            Value::Str(s) => parse_decimal_str::<BigInt>(s).map_err(|_| {
                 value_error(format!(
                     "invalid literal for int() with base 10: {}",
                     Value::Str(s.clone()).py_repr()
@@ -2393,7 +2413,15 @@ impl Value {
             Value::Float(x) => Ok(*x),
             Value::Int(i) => Ok(i.to_f64()),
             Value::Bool(b) => Ok(*b as i64 as f64),
-            Value::Str(s) => s.trim().parse::<f64>().map_err(|_| {
+            Value::Bytes(b) => {
+                parse_decimal_str::<f64>(&String::from_utf8_lossy(b)).map_err(|_| {
+                    value_error(format!(
+                        "could not convert string to float: {}",
+                        Value::Bytes(b.clone()).py_repr()
+                    ))
+                })
+            }
+            Value::Str(s) => parse_decimal_str::<f64>(s).map_err(|_| {
                 value_error(format!(
                     "could not convert string to float: {}",
                     Value::Str(s.clone()).py_repr()
@@ -2976,6 +3004,101 @@ fn format_complex(re: f64, im: f64) -> String {
     }
 }
 
+/// The code point of `0` in each Unicode decimal-digit (`Nd`) block, from
+/// the Unicode data CPython itself uses (generated with `unicodedata`).
+/// Every block is exactly ten consecutive code points, so a character's
+/// digit value is its offset from the block's zero.
+const DECIMAL_DIGIT_BLOCKS: &[u32] = &[
+    0x0030, 0x0660, 0x06F0, 0x07C0, 0x0966, 0x09E6, 0x0A66, 0x0AE6, 0x0B66, 0x0BE6, 0x0C66, 0x0CE6,
+    0x0D66, 0x0DE6, 0x0E50, 0x0ED0, 0x0F20, 0x1040, 0x1090, 0x17E0, 0x1810, 0x1946, 0x19D0, 0x1A80,
+    0x1A90, 0x1B50, 0x1BB0, 0x1C40, 0x1C50, 0xA620, 0xA8D0, 0xA900, 0xA9D0, 0xA9F0, 0xAA50, 0xABF0,
+    0xFF10, 0x104A0, 0x10D30, 0x11066, 0x110F0, 0x11136, 0x111D0, 0x112F0, 0x11450, 0x114D0,
+    0x11650, 0x116C0, 0x11730, 0x118E0, 0x11950, 0x11C50, 0x11D50, 0x11DA0, 0x11F50, 0x16A60,
+    0x16AC0, 0x16B50, 0x1D7CE, 0x1D7D8, 0x1D7E2, 0x1D7EC, 0x1D7F6, 0x1E140, 0x1E2F0, 0x1E4F0,
+    0x1E950, 0x1FBF0,
+];
+
+/// The decimal value of a Unicode digit character, as CPython's `int()` /
+/// `float()` accept: ASCII plus every `Nd` block, so `int("１２３")` is 123
+/// and `int("٣")` is 3.
+pub fn unicode_decimal_digit(c: char) -> Option<u32> {
+    if c.is_ascii_digit() {
+        return Some(c as u32 - u32::from(b'0'));
+    }
+    let cp = c as u32;
+    DECIMAL_DIGIT_BLOCKS
+        .iter()
+        .find(|&&zero| cp >= zero && cp < zero + 10)
+        .map(|&zero| cp - zero)
+}
+
+/// `s` with every Unicode decimal digit folded to its ASCII counterpart,
+/// or `None` when it holds no non-ASCII digit (the overwhelmingly common
+/// case, which then needs no allocation).
+pub fn fold_unicode_digits(s: &str) -> Option<String> {
+    if s.is_ascii() {
+        return None;
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut folded = false;
+    for c in s.chars() {
+        match unicode_decimal_digit(c) {
+            Some(d) if !c.is_ascii() => {
+                out.push(char::from(b'0' + d as u8));
+                folded = true;
+            }
+            _ => out.push(c),
+        }
+    }
+    if folded {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// `str::parse` over a Python numeric literal: leading / trailing
+/// whitespace is stripped, and Unicode decimal digits are folded to ASCII
+/// first, so `int("１２３")` and `float("１.５")` work as they do in CPython.
+fn parse_decimal_str<T: std::str::FromStr>(s: &str) -> Result<T, T::Err> {
+    let trimmed = s.trim();
+    let folded = fold_unicode_digits(trimmed);
+    let text = folded.as_deref().unwrap_or(trimmed);
+    match strip_python_underscores(text) {
+        Some(clean) => clean.parse::<T>(),
+        // Python allows a single `_` only *between* digits (`1_000.5` yes,
+        // `1__0` / `_1` / `1_` no). `num-bigint` accepts the invalid forms
+        // and `f64` rejects the valid one, so both are settled here; a
+        // string no parser accepts produces the right error type.
+        None => "\u{0}".parse::<T>(),
+    }
+}
+
+/// `s` without its Python digit-group underscores, or `None` when one of
+/// them is not between two digits.
+fn strip_python_underscores(s: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if !s.contains('_') {
+        return Some(std::borrow::Cow::Borrowed(s));
+    }
+    let bytes = s.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        if *b != b'_' {
+            continue;
+        }
+        let prev = i.checked_sub(1).map(|p| bytes[p]);
+        let next = bytes.get(i + 1).copied();
+        if !prev.is_some_and(|c| c.is_ascii_digit()) || !next.is_some_and(|c| c.is_ascii_digit()) {
+            return None;
+        }
+    }
+    Some(std::borrow::Cow::Owned(s.replace('_', "")))
+}
+
+/// `str(x)` for a float, for callers outside this module.
+pub fn float_str(x: f64) -> String {
+    format_float(x)
+}
+
 fn format_float(x: f64) -> String {
     if x.is_nan() {
         return "nan".into();
@@ -2997,19 +3120,80 @@ fn format_float(x: f64) -> String {
     // a trailing `.0`. CPython's `repr` switches to scientific notation
     // based on the decimal exponent of the most-significant digit, so we
     // derive that exponent and reformat to match.
-    let mag = x.abs();
-    let exp10 = mag.log10().floor() as i32;
+    // The exponent comes from the shortest round-tripping form itself, not
+    // from `log10`: `9999999999999998.0_f64.log10()` rounds up to exactly
+    // 16.0, which pushed a value CPython prints in full into scientific
+    // notation.
+    let sci = format!("{:e}", x);
+    let exp10: i32 = sci
+        .split_once('e')
+        .and_then(|(_, e)| e.parse().ok())
+        .unwrap_or(0);
 
     if !(-4..16).contains(&exp10) {
         return format_float_scientific(x);
     }
 
-    let s = format!("{}", x);
+    let s = tie_break_even(&format!("{}", x), x);
     if s.contains('.') || s.contains('e') || s.contains('E') {
         s
     } else {
         format!("{}.0", s)
     }
+}
+
+/// CPython's shortest float repr breaks an *exact* tie toward the even last
+/// digit; Rust's Ryū picks the larger one, so `1e15 + 0.3` — exactly
+/// `1000000000000000.25` — printed as `…0.3` under `tyc run` and `…0.2`
+/// after `tyc build`.
+///
+/// The tie has to be established, not guessed: `3.3000000000000003` also has
+/// a neighbour that round-trips, but it is genuinely the closer of the two
+/// and both surfaces print it. So compare against the double's exact decimal
+/// expansion and only swap when the digit after the repr's last is a `5`
+/// with nothing but zeros behind it.
+fn tie_break_even(s: &str, x: f64) -> String {
+    let digits: Vec<u8> = s.bytes().filter(u8::is_ascii_digit).collect();
+    // A tie needs the full 17 significant digits, and only an odd last digit
+    // can be replaced by an even neighbour.
+    if digits.len() < 16 || (digits[digits.len() - 1] - b'0').is_multiple_of(2) {
+        return s.to_owned();
+    }
+    let significant = digits.iter().skip_while(|d| **d == b'0').count();
+    // A double's exact decimal expansion is finite, and only one that
+    // *terminates* in a `5` can be a tie — 80 significant digits is far more
+    // than such a value needs.
+    let exact = format!("{:.*e}", 80, x.abs());
+    let mantissa: Vec<u8> = exact[..exact.find('e').unwrap_or(exact.len())]
+        .bytes()
+        .filter(u8::is_ascii_digit)
+        .collect();
+    if mantissa.len() <= significant
+        || mantissa[significant] != b'5'
+        || mantissa[significant + 1..].iter().any(|d| *d != b'0')
+    {
+        return s.to_owned();
+    }
+    let mantissa_end = s.find(['e', 'E']).unwrap_or(s.len());
+    let Some(last) = s[..mantissa_end].rfind(|c: char| c.is_ascii_digit()) else {
+        return s.to_owned();
+    };
+    let digit = s.as_bytes()[last];
+    // The last digit is odd, so both neighbours are digits and both even;
+    // whichever round-trips is the one CPython prints.
+    for neighbour in [digit + 1, digit - 1] {
+        let mut candidate = String::with_capacity(s.len());
+        candidate.push_str(&s[..last]);
+        candidate.push(neighbour as char);
+        candidate.push_str(&s[last + 1..]);
+        if candidate
+            .parse::<f64>()
+            .is_ok_and(|v| v.to_bits() == x.to_bits())
+        {
+            return candidate;
+        }
+    }
+    s.to_owned()
 }
 
 /// Format a float in CPython's scientific-notation style: shortest
@@ -3026,6 +3210,7 @@ fn format_float_scientific(x: f64) -> String {
     };
     let exp: i32 = exp_str.parse().unwrap_or(0);
     let sign = if exp < 0 { '-' } else { '+' };
+    let mantissa = tie_break_even(mantissa, x);
     format!("{}e{}{:02}", mantissa, sign, exp.abs())
 }
 

@@ -113,8 +113,18 @@ the VM resolved it fine — a multi-file layout `tyc check` accepts could
 not be run at all after building. Alongside it, a plain `enum.Flag`
 combines into the composite pseudo-members CPython synthesises and
 `auto()` in a flag enum numbers by bit, `model_validate` builds nested
-models from nested mappings (and `model_validate_json` exists). **The
-differential baseline falls from 167 entries to 15.**
+models from nested mappings (and `model_validate_json` exists). A ninth
+took the numeric surface: the shortest float repr breaks an exact tie
+toward the even last digit as CPython's does (`1e15 + 0.3` printed
+`…0.3` under `tyc run` and `…0.2` after `tyc build`) and picks
+fixed-point notation from the true exponent rather than `log10`, which
+rounds up at `9999999999999998.0`; `int()` / `float()` accept Unicode
+decimal digits and digit-group underscores (and reject the misplaced
+ones CPython rejects) and take a bytes-like; `bool` orders against
+`float`; `pow(a, -e, m)` computes the modular inverse; and a complex
+formats its components with the spec (`f"{1+2j:.1f}"` → `1.0+2.0j`).
+**The
+differential baseline falls from 167 entries to 14.**
 
 **Checking a module is linear in its definitions again.** Every branch,
 `try` and loop clones the whole `TypeEnv`, and each clone deep-copied every
@@ -536,7 +546,7 @@ additive on correct programs except the one marked **narrowing**.
 
 Everything that review deferred is closed by the beta wave above, except
 the VM's eager generator expressions and the thin `re` shim, which remain
-in `scripts/differential-baseline.txt` — the 15 entries there are the
+in `scripts/differential-baseline.txt` — the 14 entries there are the
 honest list of what the VM still gets wrong, and each one is a bug.
 
 ## 1.0.0-alpha.9 — 2026-08-21 — maintenance: secret-name lint expansion, allocation reductions & dependency wave

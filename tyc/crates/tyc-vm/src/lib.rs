@@ -2526,6 +2526,52 @@ main()
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
 
+    /// Numeric conversions and reprs the differential harness caught: the
+    /// shortest-repr tie break, Unicode digits, digit-group underscores,
+    /// bytes-like conversion, `bool` against `float`, the modular inverse
+    /// form of `pow`, and a complex format spec.
+    #[test]
+    fn vm_numeric_conversion_and_repr_parity() {
+        let src = r#"
+def probe(fn: object, arg: object) -> str:
+    try:
+        return str(fn(arg))
+    except Exception as e:
+        return type(e).__name__
+
+def main() -> None:
+    # `1e15 + 0.3` is exactly `1000000000000000.25`: an exact tie, which
+    # CPython breaks toward the even last digit.
+    if str(1e15 + 0.3) != "1000000000000000.2":
+        raise ValueError(f"tie break wrong: {1e15 + 0.3}")
+    # ...but `1.1 * 3` is not a tie, and its odd last digit stands.
+    if str(1.1 * 3) != "3.3000000000000003":
+        raise ValueError(f"non-tie must not be rounded: {1.1 * 3}")
+    if str(9999999999999998.0) != "9999999999999998.0" or str(1e16) != "1e+16":
+        raise ValueError("scientific-notation threshold wrong")
+    if int("１２３") != 123 or int("٣") != 3 or float("１.５") != 1.5:
+        raise ValueError("Unicode decimal digits should convert")
+    if float("1_000.5") != 1000.5 or int("1_0") != 10:
+        raise ValueError("digit-group underscores should convert")
+    for bad in ["1__0", "_1", "1_"]:
+        if probe(int, bad) != "ValueError":
+            raise ValueError(f"misplaced underscore should be rejected: {bad}")
+    if int(b"12") != 12 or float(b"1.5") != 1.5 or int(bytearray(b"7")) != 7:
+        raise ValueError("a bytes-like should convert like a string")
+    if sorted([True, False, 0.5]) != [False, 0.5, True]:
+        raise ValueError("bool should order against float")
+    if pow(3, -1, 7) != 5 or pow(2, -2, 9) != 7:
+        raise ValueError("modular inverse wrong")
+    if probe(int, "x") != "ValueError":
+        raise ValueError("a non-numeric string is still rejected")
+    if f"{1 + 2j:.1f}" != "1.0+2.0j" or f"{1 - 2j:.2f}" != "1.00-2.00j":
+        raise ValueError(f"complex format spec wrong: {1 + 2j:.1f}")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
     #[test]
     fn vm_property_setter_and_dir() {
         let src = r#"

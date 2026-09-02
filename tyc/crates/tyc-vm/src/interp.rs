@@ -11051,6 +11051,19 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
     if spec.is_empty() {
         return Ok(default.to_owned());
     }
+    // A complex formats its two components with the spec and joins them —
+    // `format(1+2j, ".1f")` is `1.0+2.0j`, with no parentheses. The
+    // imaginary part always carries a sign.
+    if let Value::Complex(re, im) = value {
+        let real = format_with_spec(&Value::Float(*re), &crate::value::float_str(*re), spec)?;
+        let imag = format_with_spec(&Value::Float(*im), &crate::value::float_str(*im), spec)?;
+        let joiner = if imag.starts_with('-') || imag.starts_with('+') {
+            ""
+        } else {
+            "+"
+        };
+        return Ok(format!("{real}{joiner}{imag}j"));
+    }
     // Implements a useful subset of Python's PEP 3101 format mini-language:
     //   [[fill]align][sign][#][0][width][,][.precision][type]
     // Notable for FINDINGS #20: zero-pad (`0`) and alternate-form (`#`,
