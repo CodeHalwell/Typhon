@@ -6650,19 +6650,42 @@ fn expand_inline_question_ops_split(source: &str) -> (String, Vec<usize>) {
     let mut counter = 0usize;
     let mut in_string: Option<StringMode> = None;
     let mut needs_err_alias_import = false;
-    let entry_brackets = q_contexts(source);
+    let contexts = q_contexts(source);
+
+    // A propagating `?` lifts a guard statement above the statement it sits
+    // in. On a continuation line that guard cannot go where the `?` is —
+    // there is an open bracket across the left edge, so a statement there is
+    // a syntax error. The physical lines of one logical statement are
+    // therefore buffered, and every guard the statement lifts is emitted
+    // above its FIRST line. Hoisting an argument out of a call is the same
+    // rewrite the single-line path already performs, and doing it for each
+    // `?` left to right preserves Python's argument evaluation order.
+    //
+    // Without this, a `?` inside a wrapped call (`add(\n  p("a")?, p("b")?\n)`)
+    // produced a guard spliced into the middle of an argument list, and the
+    // parse error the user saw named neither the line nor the construct.
+    let mut pending: Vec<String> = Vec::new();
+    let mut buffered: Vec<String> = Vec::new();
+    let mut buf_start = 0usize;
 
     for (line_index, line) in source.split_inclusive('\n').enumerate() {
-        out.mark(line_index);
         let raw = line.trim_end_matches(['\n', '\r']);
         let pre_string = in_string;
         let code_end = scan_line_code_end(raw, &mut in_string);
-        let carried = entry_brackets.get(line_index).copied().unwrap_or_default();
+        let ctx = contexts.get(line_index).copied().unwrap_or_default();
+
+        // Flush the previous statement once this line starts a new one.
+        if ctx.head.is_none() && !buffered.is_empty() {
+            flush_lifted_statement(&mut out, &mut pending, &mut buffered, buf_start);
+        }
+        if buffered.is_empty() {
+            buf_start = line_index;
+        }
 
         // Lines that begin inside a triple-quoted string have no
         // executable code on this row — emit verbatim.
         if pre_string.is_some() {
-            out.push_str(line);
+            buffered.push(line.to_owned());
             continue;
         }
 
@@ -6670,28 +6693,63 @@ fn expand_inline_question_ops_split(source: &str) -> (String, Vec<usize>) {
         let comment = &raw[code_end..];
         let nl = if line.ends_with('\n') { "\n" } else { "" };
 
-        match rewrite_inline_question_ops_one_line(content, &mut counter, carried) {
+        match rewrite_inline_question_ops_one_line(content, &mut counter, ctx) {
             Some((rewritten, lifted)) => {
-                for l in lifted {
-                    out.push_str(&l);
-                    out.push('\n');
+                // A guard lifted off a continuation line is re-indented to
+                // the statement's own indentation, since that is where it
+                // will be emitted. The shift is applied to the whole guard,
+                // not line by line: it is an `if` over a `return`, and
+                // flattening the body to the header's column leaves the
+                // `if` with no suite.
+                match ctx.head {
+                    Some(head) => {
+                        let head_indent = &head[..head.len() - head.trim_start().len()];
+                        let from = lifted
+                            .first()
+                            .map(|l| &l[..l.len() - l.trim_start().len()])
+                            .unwrap_or("");
+                        for l in &lifted {
+                            pending.push(match l.strip_prefix(from) {
+                                Some(rest) => format!("{head_indent}{rest}"),
+                                None => l.clone(),
+                            });
+                        }
+                    }
+                    None => pending.extend(lifted),
                 }
-                out.push_str(&rewritten);
-                out.push_str(comment);
-                out.push_str(nl);
+                buffered.push(format!("{rewritten}{comment}{nl}"));
                 needs_err_alias_import = true;
             }
-            None => {
-                out.push_str(line);
-            }
+            None => buffered.push(line.to_owned()),
         }
     }
+    flush_lifted_statement(&mut out, &mut pending, &mut buffered, buf_start);
 
     let (text, map) = out.finish();
     if needs_err_alias_import {
         prepend_typhon_err_alias_import_mapped(text, map)
     } else {
         (text, map)
+    }
+}
+
+/// Emit one buffered logical statement: the guards it lifted first, then its
+/// own physical lines. Every emitted line maps back to the line the
+/// statement opened on, so a traceback still points at the user's source.
+fn flush_lifted_statement(
+    out: &mut MappedOut,
+    pending: &mut Vec<String>,
+    buffered: &mut Vec<String>,
+    buf_start: usize,
+) {
+    out.mark(buf_start);
+    for l in pending.drain(..) {
+        out.push_str(&l);
+        out.push('\n');
+    }
+    for (k, l) in buffered.drain(..).enumerate() {
+        out.mark(buf_start + k);
+        out.push_str(&l);
     }
 }
 
@@ -6786,7 +6844,12 @@ fn find_first_inline_propagation_q(s: &str, ctx: QContext<'_>) -> Option<usize> 
             continue;
         }
         let is_trailing = i + 1 >= trimmed_end;
-        if !is_trailing || trailing_q_has_binary_prefix(s, i, &in_str_mask) {
+        // A `?` at the end of a CONTINUATION line does not end the
+        // statement — the statement carries on inside the open bracket — so
+        // the end-of-line pass, which rewrites a whole statement, cannot
+        // own it. The inline lift can: it hoists the guard above the
+        // statement and leaves the value in place.
+        if !is_trailing || ctx.head.is_some() || trailing_q_has_binary_prefix(s, i, &in_str_mask) {
             return Some(i);
         }
     }
@@ -12733,6 +12796,48 @@ def f() -> None:
             "expected no errors, got: {:?}",
             errs.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn propagation_inside_a_wrapped_call_lifts_above_the_statement() {
+        // A `?` on a continuation line cannot lift its guard where it sits:
+        // there is an open bracket across the line's left edge, so a
+        // statement there is a syntax error. The guard goes above the whole
+        // statement instead — the same hoist the single-line path does, and
+        // in left-to-right order, so Python's argument evaluation order is
+        // unchanged. Before this, a wrapped call carrying a `?` produced a
+        // parse error naming neither the line nor the construct.
+        let cases = [
+            // Interior `?`, one per argument.
+            "def go() -> Result[int, str]:\n    let t: int = add(\n        p(\"a\")?, p(\"b\")?\n    )\n    return Ok(t)\n",
+            // A `?` that ends a continuation line — the end-of-line pass
+            // cannot own it, because the statement carries on.
+            "def go() -> Result[int, str]:\n    let t: int = sum([\n        p(\"a\")?\n    ])\n    return Ok(t)\n",
+            // Comments on the continuation lines survive.
+            "def go() -> Result[int, str]:\n    let t: int = sum([\n        p(\"a\")?,  # first\n        p(\"b\")?,\n    ])\n    return Ok(t)\n",
+        ];
+        for src in cases {
+            let out = expand_sugar(src, true);
+            assert!(
+                out.contains("__typhon_qi_"),
+                "the `?` must still lower:\n{src}-> {out}"
+            );
+            let prep = preprocess(&out);
+            assert!(
+                crate::parse_module(&prep.python_source).is_ok(),
+                "a wrapped call carrying `?` must parse:\n{src}-> {out}"
+            );
+            // The guard lands at the statement's own indentation, above it.
+            let guard = out.find("    __typhon_qi_0__ = ").expect(&out);
+            let stmt = out.find("let t: int").expect(&out);
+            assert!(guard < stmt, "the guard must precede the statement:\n{out}");
+        }
+        // The comment on a continuation line is not swallowed.
+        let commented = expand_sugar(
+            "def go() -> Result[int, str]:\n    let t: int = sum([\n        p(\"a\")?,  # first\n    ])\n    return Ok(t)\n",
+            true,
+        );
+        assert!(commented.contains("# first"), "comment lost:\n{commented}");
     }
 
     #[test]

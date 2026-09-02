@@ -536,6 +536,13 @@ with every gate green at each step.
   ones are gone. **1,110 of 1,114 files now migrate to source that parses**,
   up from 1,036; the four that do not are deeply metaprogrammed.
 
+  The same sweep exposed the converse of the signature bug — a `?` on the
+  *continuation* line of a wrapped call or list, which could not compile at
+  all because the guard it lifts has nowhere to go inside an open bracket.
+  The lift now buffers a logical statement and raises every guard above its
+  first line, so `sum([\n    parse(a)?,\n    parse(b)?,\n])` works, keeps
+  its comments, and evaluates its arguments in the same order.
+
   One thing the sweep surfaced is left open: `Alias = dict[str, int | None]`
   — a plain assignment used as a type alias — fires `tyc::nullable_use`,
   because the checker reads the subscript's arguments as values. That is

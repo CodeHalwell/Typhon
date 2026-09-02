@@ -417,6 +417,31 @@ from — `Provider = Callable[[str, int?], int]`, Python's legacy type-alias
 form, used to *build* and then fail at import with a `return` outside a
 function.
 
+**`?` inside a wrapped call now works.** The same audit turned up the
+converse of the signature bug: a propagation operator on the *continuation*
+line of a multi-line call or list.
+
+```typhon
+let t: int = sum([
+    parse(a)?,  # first
+    parse(b)?,
+])
+```
+
+That could not compile. The lift a `?` performs puts a guard statement
+above the expression, and on a continuation line there is nowhere to put
+one — an open bracket sits across the line's left edge — so the pass
+spliced an `if` into the middle of an argument list and the user got
+"Expected `else`, found `:`", naming neither the line nor the construct.
+The lift now buffers a logical statement's physical lines and emits every
+guard it raises above the statement's *first* line, at that line's
+indentation. It is the same hoist the single-line path has always done, in
+the same left-to-right order, so argument evaluation order is unchanged;
+comments on the continuation lines survive, because the physical lines are
+re-emitted rather than joined. A trailing `?` on a continuation line
+(`sum([\n    parse(a)?\n])`) goes to the same lift, since the end-of-line
+pass rewrites whole statements and that line does not end one.
+
 **Four more in `tyc migrate` itself, three of them corruption.** The
 rewrite loop counted brackets but tracked no strings, so docstring prose
 was read as code: a bullet whose item was `like:` on its own line came back
