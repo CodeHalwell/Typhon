@@ -1004,6 +1004,24 @@ class-default = "plain"   # error: expected `dataclass` | `pydantic`
 
 **Fix:** Use one of the allowed values listed in the error message.
 
+### `tyc::invalid_pattern` — error
+
+A `match` pattern the Python **grammar** accepts but the CPython
+**compiler** rejects, so the emitted `.py` raises `SyntaxError` on import.
+Two shapes: two `*rest` captures in one sequence pattern, and the same
+capture name bound twice in one pattern.
+
+```typhon
+case [*a, *b]:     # error: a sequence pattern may bind at most one `*rest`
+case [a, a]:       # error: `a` is captured twice in the same pattern
+```
+
+Alternatives of a `|` pattern bind on their own paths, so `case [a] | (a,):`
+is legal (and CPython *requires* both sides to bind the same names).
+
+**Fix:** Keep one `*rest`; rename the duplicate capture and compare in a
+guard (`case [a, b] if a == b:`) if equality was what you meant.
+
 ### `tyc::stub_mismatch` — error (controlled by `[strictness] stub-check`)
 
 `tyc check --stubs` finds a mismatch between a `.dty` stub and its implementation module.
@@ -1172,7 +1190,7 @@ Standard values for severity keys are `"off"`, `"warn"`, `"error"`. The `suggest
 
 ## Severity-only summary
 
-**Errors** (block the build by default): `arg_count`, `attribute_not_found`, `comptime`, `cyclic_type_alias`, `div_by_zero_literal`, `duplicate_class`, `duplicate_method`, `extend_builtin`, `field_default_ordering`, `frozen_assign`, `generator_return_type`, `generic`, `immutable_assign`, `impl_unknown_class`, `implicit_any`, `impure_pure_fn`, `interface_isinstance`, `interface_not_conforming`, `invalid_config_value`, `invalid_question_op`, `io`, `lazy_usage`, `manual_init`, `method_in_class_body` (default warn but commonly bumped), `missing_annotation`, `missing_argument`, `missing_await`, `missing_binding_kind`, `missing_field_init`, `missing_initialiser`, `missing_return`, `newtype_violation`, `no_block_shadow`, `non_exhaustive_match`, `not_callable`, `nullable_use`, `operator_type_mismatch`, `parse`, `pattern_shadows_outer`, `pub_name_collision`, `result_error_mismatch`, `return_in_except_star`, `self_outside_impl`, `stub_mismatch`, `tuple_index_out_of_range`, `type_mismatch`, `typevar_bound`, `typevar_import_rejected`, `typing_alias_deprecated`, `unknown_kwarg`, `unknown_module`, `unknown_name`, `unsafe_value_leak`, `unused_import`, `use_of_uninitialised`.
+**Errors** (block the build by default): `arg_count`, `attribute_not_found`, `comptime`, `cyclic_type_alias`, `div_by_zero_literal`, `duplicate_class`, `duplicate_method`, `extend_builtin`, `field_default_ordering`, `frozen_assign`, `generator_return_type`, `generic`, `immutable_assign`, `impl_unknown_class`, `implicit_any`, `impure_pure_fn`, `interface_isinstance`, `interface_not_conforming`, `invalid_config_value`, `invalid_pattern`, `invalid_question_op`, `io`, `lazy_usage`, `manual_init`, `method_in_class_body` (default warn but commonly bumped), `missing_annotation`, `missing_argument`, `missing_await`, `missing_binding_kind`, `missing_field_init`, `missing_initialiser`, `missing_return`, `newtype_violation`, `no_block_shadow`, `non_exhaustive_match`, `not_callable`, `nullable_use`, `operator_type_mismatch`, `parse`, `pattern_shadows_outer`, `pub_name_collision`, `result_error_mismatch`, `return_in_except_star`, `self_outside_impl`, `stub_mismatch`, `tuple_index_out_of_range`, `type_mismatch`, `typevar_bound`, `typevar_import_rejected`, `typing_alias_deprecated`, `unknown_kwarg`, `unknown_module`, `unknown_name`, `unsafe_value_leak`, `unused_import`, `use_of_uninitialised`.
 
 **Warnings**: `async_without_await`, `class_attr_shadows_slot`, `blocking_in_async`, `contains_secret_literal`, `orphan_py_import`, `python_semantic_drift`, `resource_not_managed`, `stdlib_module_shadow`.
 

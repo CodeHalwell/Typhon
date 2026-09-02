@@ -94,6 +94,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "interface_isinstance",
         "interface_not_conforming",
         "invalid_config_value",
+        "invalid_pattern",
         "invalid_question_op",
         "io",
         "lazy_import_opportunity",
@@ -227,6 +228,7 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         "invalid_config_value" => {
             include_str!("../../../../../docs/diagnostics/invalid_config_value.md")
         }
+        "invalid_pattern" => include_str!("../../../../../docs/diagnostics/invalid_pattern.md"),
         "invalid_question_op" => {
             include_str!("../../../../../docs/diagnostics/invalid_question_op.md")
         }

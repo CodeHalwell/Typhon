@@ -1586,6 +1586,27 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A `match` pattern the Python grammar accepts but the CPython
+    /// *compiler* rejects: two `*rest` captures in one sequence pattern,
+    /// or the same capture name bound twice in one pattern. The emitted
+    /// `.py` is then not valid Python at all — `tyc build` reported
+    /// success and wrote a file that fails to import — so this is an
+    /// error even though nothing about it is type-related.
+    #[error("invalid `match` pattern: {reason}")]
+    #[diagnostic(
+        code(tyc::invalid_pattern),
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/invalid_pattern.md"),
+        help("{fix}")
+    )]
+    InvalidPattern {
+        reason: String,
+        fix: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("rejected by the Python compiler")]
+        span: SourceSpan,
+    },
+
     /// Two sibling modules aggregated by a `pub *` re-export in
     /// `__init__.ty` both expose the same name. The synthesised
     /// `from .a import X` + `from .b import X` would silently shadow
@@ -2048,6 +2069,7 @@ impl TycError {
             | Self::NewtypeInvalidBase { src, span, .. }
             | Self::UseOfUninitialised { src, span, .. }
             | Self::PossiblyUnbound { src, span, .. }
+            | Self::InvalidPattern { src, span, .. }
             | Self::GoOutsideAsync { src, span, .. }
             | Self::PubNameCollision { src, span, .. }
             | Self::PubStarOutsideInit { src, span, .. }
@@ -2143,6 +2165,7 @@ impl TycError {
             | Self::NewtypeInvalidBase { src, span, .. }
             | Self::UseOfUninitialised { src, span, .. }
             | Self::PossiblyUnbound { src, span, .. }
+            | Self::InvalidPattern { src, span, .. }
             | Self::GoOutsideAsync { src, span, .. }
             | Self::PubNameCollision { src, span, .. }
             | Self::PubStarOutsideInit { src, span, .. }
@@ -3418,6 +3441,24 @@ impl TycError {
         Self::PossiblyUnbound {
             name: name.into(),
             reason: reason.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::InvalidPattern`] error for a `match`
+    /// pattern the CPython compiler rejects.
+    pub fn invalid_pattern(
+        reason: impl Into<String>,
+        fix: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::InvalidPattern {
+            reason: reason.into(),
+            fix: fix.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

@@ -20825,6 +20825,28 @@ fn check_pattern_class_fields(c: &mut Checker, pattern: &Pattern) {
             }
         }
         Pattern::MatchSequence(seq) => {
+            // CPython's *compiler* (not its grammar) rejects a second
+            // `*rest` in one sequence pattern: "multiple starred names in
+            // sequence pattern". The parser accepts it, so `tyc build`
+            // reported success and wrote a `.py` that cannot even be
+            // imported. Reject it here instead.
+            let stars: Vec<&Pattern> = seq
+                .patterns
+                .iter()
+                .filter(|p| matches!(p, Pattern::MatchStar(_)))
+                .collect();
+            if stars.len() > 1 {
+                let extra = stars[1];
+                c.diagnostics.push_error(TycError::invalid_pattern(
+                    "a sequence pattern may bind at most one `*rest`",
+                    "keep the first `*rest` and match the remaining elements \
+                     positionally, or split the case in two",
+                    c.path.clone(),
+                    c.source,
+                    extra.range().start().to_usize(),
+                    (extra.range().end().to_usize() - extra.range().start().to_usize()).max(1),
+                ));
+            }
             for p in &seq.patterns {
                 check_pattern_class_fields(c, p);
             }
@@ -20836,6 +20858,105 @@ fn check_pattern_class_fields(c: &mut Checker, pattern: &Pattern) {
         }
         _ => {}
     }
+    // The same capture name twice in one pattern is also a compile error in
+    // CPython ("multiple assignments to name … in pattern"), and equally
+    // produces a `.py` that will not import.
+    if let Some((name, span)) = duplicate_pattern_capture(pattern) {
+        c.diagnostics.push_error(TycError::invalid_pattern(
+            format!("`{name}` is captured twice in the same pattern"),
+            "rename one of the captures — a pattern binds each name once",
+            c.path.clone(),
+            c.source,
+            span.0,
+            span.1,
+        ));
+    }
+}
+
+/// The first capture name bound more than once anywhere in `pattern`,
+/// with the span of its second occurrence.
+///
+/// Only called on the *top* of each `case` pattern (the recursive walk in
+/// [`check_pattern_class_fields`] re-enters through the same door, so the
+/// check is scoped to the whole pattern exactly once per case). `MatchOr`
+/// alternatives are checked independently: `case [a] | (a,):` binds `a` once
+/// on each path and is legal.
+fn duplicate_pattern_capture(pattern: &Pattern) -> Option<(String, (usize, usize))> {
+    fn walk(
+        p: &Pattern,
+        seen: &mut HashMap<String, ()>,
+        found: &mut Option<(String, (usize, usize))>,
+    ) {
+        if found.is_some() {
+            return;
+        }
+        fn note(
+            name: &str,
+            range: TextRange,
+            seen: &mut HashMap<String, ()>,
+            found: &mut Option<(String, (usize, usize))>,
+        ) {
+            if seen.insert(name.to_owned(), ()).is_some() && found.is_none() {
+                *found = Some((
+                    name.to_owned(),
+                    (
+                        range.start().to_usize(),
+                        (range.end().to_usize() - range.start().to_usize()).max(1),
+                    ),
+                ));
+            }
+        }
+        match p {
+            Pattern::MatchAs(a) => {
+                if let Some(inner) = &a.pattern {
+                    walk(inner, seen, found);
+                }
+                if let Some(name) = &a.name {
+                    note(name.as_str(), name.range, seen, found);
+                }
+            }
+            Pattern::MatchStar(st) => {
+                if let Some(name) = &st.name {
+                    note(name.as_str(), name.range, seen, found);
+                }
+            }
+            Pattern::MatchSequence(seq) => {
+                for inner in &seq.patterns {
+                    walk(inner, seen, found);
+                }
+            }
+            Pattern::MatchMapping(m) => {
+                for inner in &m.patterns {
+                    walk(inner, seen, found);
+                }
+                if let Some(rest) = &m.rest {
+                    note(rest.as_str(), rest.range, seen, found);
+                }
+            }
+            Pattern::MatchClass(mc) => {
+                for inner in &mc.arguments.patterns {
+                    walk(inner, seen, found);
+                }
+                for kw in &mc.arguments.keywords {
+                    walk(&kw.pattern, seen, found);
+                }
+            }
+            // Each alternative binds its own names, so they do not collide
+            // with one another — CPython requires them to bind the *same*
+            // set, which is the opposite rule.
+            Pattern::MatchOr(o) => {
+                for inner in &o.patterns {
+                    let mut branch: HashMap<String, ()> = HashMap::new();
+                    walk(inner, &mut branch, found);
+                }
+            }
+            Pattern::MatchValue(_) | Pattern::MatchSingleton(_) => {}
+        }
+    }
+    let mut seen = HashMap::new();
+    let mut found = None;
+    walk(pattern, &mut seen, &mut found);
+    found
 }
 
 /// Declare pattern-bound names in the current scope as `Type::Unknown`, so
@@ -23699,6 +23820,63 @@ async def main() -> None:
             assert!(
                 !d.errors().iter().any(|e| matches!(e, TycError::GoOutsideAsync { .. })),
                 "{src}: {:?}",
+                d.errors()
+            );
+        }
+    }
+
+    #[test]
+    fn patterns_cpython_cannot_compile_are_rejected() {
+        // The Python *grammar* accepts these; the CPython *compiler* does
+        // not. `tyc build` reported success and wrote a `.py` that fails to
+        // import — the differential harness's compile gate caught it.
+        let two_stars = "\
+def f(xs: list[int]) -> int:
+    match xs:
+        case [*a, *b]:
+            return 1
+        case _:
+            return 0
+";
+        let d = check(two_stars);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| format!("{e:?}").contains("InvalidPattern")),
+            "two `*rest` captures must be rejected: {:?}",
+            d.errors()
+        );
+
+        let dup = "\
+def f(xs: list[int]) -> int:
+    match xs:
+        case [a, a]:
+            return a
+        case _:
+            return 0
+";
+        assert!(
+            check(dup)
+                .errors()
+                .iter()
+                .any(|e| format!("{e:?}").contains("InvalidPattern")),
+            "a name captured twice in one pattern must be rejected"
+        );
+
+        // Legal shapes must stay legal: one `*rest`, and the same name in
+        // different `|` alternatives (CPython *requires* the alternatives to
+        // bind the same set).
+        for ok in [
+            "def f(xs: list[int]) -> int:\n    match xs:\n        case [a, *rest]:\n            return a + len(rest)\n        case _:\n            return 0\n",
+            "def f(xs: list[int]) -> int:\n    match xs:\n        case [a] | [a, _]:\n            return a\n        case _:\n            return 0\n",
+            "def f(d: dict[str, int]) -> int:\n    match d:\n        case {\"k\": v, **rest}:\n            return v + len(rest)\n        case _:\n            return 0\n",
+        ] {
+            let d = check(ok);
+            assert!(
+                !d.errors()
+                    .iter()
+                    .any(|e| format!("{e:?}").contains("InvalidPattern")),
+                "legal pattern rejected: {ok}\n{:?}",
                 d.errors()
             );
         }

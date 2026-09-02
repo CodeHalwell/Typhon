@@ -139,6 +139,18 @@ jobs:
     # scripts/differential-baseline.txt; the job fails on a NEW divergence and
     # equally on a baseline entry that has stopped diverging, so the expectations
     # file can only shrink. Every line in it is a VM bug.
+    #
+    # The same pass carries two more gates, because it already builds every
+    # unit:
+    #   * every emitted `.py` is byte-compiled with `compileall`, so an
+    #     emitter bug in a module no code path imports still fails the build
+    #     (`noncompiling` — an EMITTER bug, never baselined); and
+    #   * units that do not survive `tyc build` are pinned in
+    #     scripts/nobuild-baseline.txt. Most are diagnostic probes written to
+    #     be rejected, so that list is not a burn-down — but it fails in both
+    #     directions, so a unit that stops building is caught as a regression
+    #     and one that starts building is caught as a diagnostic that stopped
+    #     firing.
 
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0

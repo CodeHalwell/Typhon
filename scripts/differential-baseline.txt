@@ -81,7 +81,6 @@ stress/round-2026-09-01/emit/numerics.ty
 stress/round-2026-09-01/emit/rt_all.ty
 stress/round-2026-09-01/emit/slices.ty
 stress/round-2026-09-01/emit/typevar_default.ty
-stress/round-2026-09-01/types/c48_star_star.ty
 stress/round-2026-09-01/types/s112_posonly.ty
 stress/round-2026-09-01/vm/ienum.ty
 stress/round-2026-09-01/vm/jsn.ty

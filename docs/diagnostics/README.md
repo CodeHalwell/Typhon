@@ -39,6 +39,7 @@ straight from a failed build to the corresponding documentation.
 - [`tyc::interface_isinstance`](./interface_isinstance.md) — `isinstance(x, Interface)` without `@runtime_checkable` opt-in.
 - [`tyc::interface_not_conforming`](./interface_not_conforming.md) — value doesn't structurally conform to interface.
 - [`tyc::invalid_config_value`](./invalid_config_value.md) — `typhon.toml` value outside the allowed enumeration.
+- [`tyc::invalid_pattern`](./invalid_pattern.md) — a `match` pattern the Python grammar accepts but the CPython compiler rejects (two `*rest` captures, a name captured twice), so the emitted `.py` would not import.
 - [`tyc::invalid_question_op`](./invalid_question_op.md) — `?` outside a `Result`-returning function, or inside a comprehension.
 - [`tyc::io`](./io.md) — source file could not be read.
 - [`tyc::is_literal_comparison`](./is_literal_comparison.md) — warning: `is` / `is not` against a literal compares identity, not value.

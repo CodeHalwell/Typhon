@@ -119,6 +119,36 @@ class Square:
 
 Every `match s: ...` in the project now fails with `tyc::non_exhaustive_match` until updated. That's the feature.
 
+## `tyc::invalid_pattern`
+
+A pattern the Python **grammar** accepts but the CPython **compiler**
+rejects. Without this check `tyc build` reported success and wrote a `.py`
+that raised `SyntaxError` the moment anything imported it.
+
+```python
+match xs:
+    case [*a, *b]:      # tyc::invalid_pattern — at most one `*rest`
+        ...
+    case [a, a]:        # tyc::invalid_pattern — `a` captured twice
+        ...
+```
+
+A sequence pattern binds at most one `*rest` (two would have no unique
+split point), and a pattern binds each name once — `[a, a]` does not mean
+"these two are equal". Rename the capture and compare in a guard:
+
+```python
+match xs:
+    case [first, *rest]:
+        ...
+    case [a, b] if a == b:
+        ...
+```
+
+Alternatives of a `|` pattern are checked independently, since each binds
+on its own path: `case [a] | (a,):` is legal, and CPython *requires* both
+sides to bind the same set of names.
+
 ## Where next
 
 - [Sealed Unions](/Typhon/types/sealed-unions/) — the type-system reference.
