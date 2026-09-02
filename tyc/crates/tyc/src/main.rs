@@ -6,6 +6,7 @@
 mod cli;
 mod commands;
 mod config;
+mod signals;
 
 use miette::Result;
 
@@ -20,6 +21,7 @@ use miette::Result;
 const WORKER_STACK_SIZE: usize = 256 * 1024 * 1024;
 
 fn main() -> Result<()> {
+    signals::restore_sigpipe_default();
     let worker = std::thread::Builder::new()
         .name("tyc-main".to_owned())
         .stack_size(WORKER_STACK_SIZE)

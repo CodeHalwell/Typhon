@@ -156,9 +156,14 @@ auto-parallel = false       # …but this explicit entry keeps auto-parallel off
 
 > **`TYC_NO_INTROSPECT=1`** (v1.0.0-alpha.3) — an environment kill-switch that disables venv
 > dependency introspection entirely in `tyc check` / `tyc build` / the LSP. Third-party calls
-> then degrade to a permissive `Unknown` (their arity/type checks are skipped, and the
-> `unintrospectable-dependency` warning is suppressed). It exists for the "opening a project
-> imports its dependencies" trust boundary — see [`SECURITY.md`](../SECURITY.md).
+> then degrade to a permissive `Unknown` (their arity/type checks are skipped). It exists for
+> the "opening a project imports its dependencies" trust boundary — see
+> [`SECURITY.md`](../SECURITY.md).
+>
+> Because the skipped coverage is then deliberate, `unintrospectable-dependency = "error"`
+> **downgrades to a warning** while the variable is set (v1.0.0-beta.1), with a `note:` saying
+> why. Failing the build for the introspection the user just turned off would make the
+> kill-switch unusable in a CI job that gates on the strict setting.
 
 ### `[env]`
 

@@ -51,6 +51,10 @@ salsa = "0.26"
 tower-lsp-server = "0.23"
 tokio = { version = "1", features = ["full"] }
 
+# Unix signal defaults (see `tyc::signals`) — a CLI must die on SIGPIPE
+# rather than panic when its stdout is closed by `| head`.
+libc = "0.2"
+
 # File watching (used by `tyc ty --watch`)
 notify = { version = "8", default-features = false, features = ["macos_kqueue"] }
 

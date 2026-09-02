@@ -2033,6 +2033,7 @@ version = "1.0.0-alpha.9"
 dependencies = [
  "clap",
  "itoa",
+ "libc",
  "miette",
  "notify",
  "ruff_python_ast",

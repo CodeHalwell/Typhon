@@ -21,6 +21,7 @@
 //! coverage.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use ruff_python_ast::{Expr, MatchCase, ModModule, Number, Operator, Pattern, Stmt, StmtAssign};
 use ruff_text_size::{Ranged, TextRange};
@@ -2484,11 +2485,20 @@ struct TypeBinding {
     from_unsafe: bool,
 }
 
+/// One scope's bindings. Held behind an `Rc` so cloning a whole `TypeEnv`
+/// — which every branch, `try` and loop does, several times per statement —
+/// costs one pointer bump per scope instead of a deep copy of every binding
+/// in the module. A scope is deep-copied only when it is actually written
+/// (`Rc::make_mut`), which for a function body means its own frame and not
+/// the module's. Before this, checking a module was quadratic in its
+/// top-level definitions: 4 000 one-`if` functions took 35 s.
+type ScopeMap = Rc<HashMap<String, TypeBinding>>;
+
 /// Type-environment stack — a map of name → TypeBinding per scope.
 #[derive(Debug, Default, Clone)]
 struct TypeEnv {
     /// `scopes[i].get(name)` → binding.
-    scopes: Vec<HashMap<String, TypeBinding>>,
+    scopes: Vec<ScopeMap>,
     /// Flow-sensitive narrowings keyed by attribute access path
     /// (`"self.value"`, `"b.value"`). Lets `if self.x is None: return …`
     /// narrow `self.x` to non-`None` for the rest of the block. Cleared
@@ -2499,14 +2509,14 @@ struct TypeEnv {
 
 impl TypeEnv {
     fn enter(&mut self) {
-        self.scopes.push(HashMap::new());
+        self.scopes.push(Rc::new(HashMap::new()));
     }
     fn leave(&mut self) {
         self.scopes.pop();
     }
     fn declare(&mut self, b: TypeBinding) {
         if let Some(top) = self.scopes.last_mut() {
-            top.insert(b.name.clone(), b);
+            Rc::make_mut(top).insert(b.name.clone(), b);
         }
     }
     fn lookup(&self, name: &str) -> Option<&TypeBinding> {
@@ -2517,13 +2527,22 @@ impl TypeEnv {
         }
         None
     }
+    /// The index of the innermost scope holding `name`. Resolving read-only
+    /// first is what lets a mutation `make_mut` exactly one scope.
+    fn scope_of(&self, name: &str) -> Option<usize> {
+        self.scopes.iter().rposition(|s| s.contains_key(name))
+    }
     /// Apply a narrowing within the topmost frame for the given name.
     fn narrow(&mut self, name: &str, new_type: Type) {
-        for scope in self.scopes.iter_mut().rev() {
-            if let Some(b) = scope.get_mut(name) {
-                b.narrowed = new_type;
-                return;
-            }
+        let Some(idx) = self.scope_of(name) else {
+            return;
+        };
+        // Writing the same type back would deep-copy the scope for nothing.
+        if self.scopes[idx].get(name).map(|b| &b.narrowed) == Some(&new_type) {
+            return;
+        }
+        if let Some(b) = Rc::make_mut(&mut self.scopes[idx]).get_mut(name) {
+            b.narrowed = new_type;
         }
     }
     /// Reset `name`'s narrowing back to its declared type. Used to invalidate a
@@ -2532,13 +2551,17 @@ impl TypeEnv {
     /// is whatever the previous iteration's bottom assigned, not the pre-loop
     /// narrowed value.
     fn widen_to_declared(&mut self, name: &str) {
-        for scope in self.scopes.iter_mut().rev() {
-            if let Some(b) = scope.get_mut(name) {
-                if b.narrowed != b.declared {
-                    b.narrowed = b.declared.clone();
-                }
-                return;
-            }
+        let Some(idx) = self.scope_of(name) else {
+            return;
+        };
+        if self.scopes[idx]
+            .get(name)
+            .is_none_or(|b| b.narrowed == b.declared)
+        {
+            return;
+        }
+        if let Some(b) = Rc::make_mut(&mut self.scopes[idx]).get_mut(name) {
+            b.narrowed = b.declared.clone();
         }
     }
     fn snapshot(&self) -> TypeEnv {
@@ -2554,27 +2577,31 @@ impl TypeEnv {
     /// into the *next* function (an unsound accept) or out of a nested `def`
     /// (a false positive). `check_function` snapshots on entry and restores on
     /// exit so a narrowing applies within the body but never escapes it.
-    fn snapshot_scope_narrowings(&self) -> Vec<Vec<(String, Type)>> {
-        self.scopes
-            .iter()
-            .map(|s| {
-                s.iter()
-                    .map(|(k, b)| (k.clone(), b.narrowed.clone()))
-                    .collect()
-            })
-            .collect()
+    fn snapshot_scope_narrowings(&self) -> Vec<ScopeMap> {
+        self.scopes.clone()
     }
     /// Restore the narrowed types captured by
     /// [`snapshot_scope_narrowings`](Self::snapshot_scope_narrowings). The
     /// snapshot is taken before the body's scope is pushed and restored after
     /// it is popped, so the scope stack has the same shape and `zip` aligns
     /// each saved frame with its live counterpart.
-    fn restore_scope_narrowings(&mut self, snap: Vec<Vec<(String, Type)>>) {
+    fn restore_scope_narrowings(&mut self, snap: Vec<ScopeMap>) {
         for (scope, saved) in self.scopes.iter_mut().zip(snap) {
-            for (name, narrowed) in saved {
-                if let Some(b) = scope.get_mut(&name) {
-                    b.narrowed = narrowed;
-                }
+            // Untouched scope: the body never wrote it, so there is nothing
+            // to undo. This is the common case for every scope outside the
+            // function's own frame, and it keeps the restore O(1) there.
+            if Rc::ptr_eq(scope, &saved) {
+                continue;
+            }
+            let live = Rc::make_mut(scope);
+            for (name, b) in live.iter_mut() {
+                // A binding the snapshot knew: restore its narrowing.
+                // One the body introduced: widen it to its declared type,
+                // which is the state an un-narrowed binding has.
+                b.narrowed = match saved.get(name) {
+                    Some(sb) => sb.narrowed.clone(),
+                    None => b.declared.clone(),
+                };
             }
         }
     }
@@ -2616,11 +2643,21 @@ impl TypeEnv {
         if rebound.is_empty() {
             return;
         }
-        if let Some(globals) = self.scopes.first_mut() {
-            for (name, b) in globals.iter_mut() {
-                if rebound.contains(name) && b.narrowed != b.declared {
-                    b.narrowed = b.declared.clone();
-                }
+        let Some(globals) = self.scopes.first_mut() else {
+            return;
+        };
+        // Read-only first: the module scope is the largest one, and the
+        // overwhelmingly common case is that nothing needs widening — do
+        // not deep-copy it to discover that.
+        let needs_reset = globals
+            .iter()
+            .any(|(name, b)| rebound.contains(name) && b.narrowed != b.declared);
+        if !needs_reset {
+            return;
+        }
+        for (name, b) in Rc::make_mut(globals).iter_mut() {
+            if rebound.contains(name) && b.narrowed != b.declared {
+                b.narrowed = b.declared.clone();
             }
         }
     }
@@ -2640,7 +2677,21 @@ impl TypeEnv {
     fn reset_narrowings_to(&mut self, base: &TypeEnv) {
         for (i, scope) in self.scopes.iter_mut().enumerate() {
             let base_scope = base.scopes.get(i);
-            for (name, b) in scope.iter_mut() {
+            // Identical scope objects already agree on every narrowing.
+            if base_scope.is_some_and(|b| Rc::ptr_eq(scope, b)) {
+                continue;
+            }
+            let differs =
+                scope
+                    .iter()
+                    .any(|(name, b)| match base_scope.and_then(|s| s.get(name)) {
+                        Some(bb) => bb.narrowed != b.narrowed,
+                        None => b.narrowed != b.declared,
+                    });
+            if !differs {
+                continue;
+            }
+            for (name, b) in Rc::make_mut(scope).iter_mut() {
                 match base_scope.and_then(|s| s.get(name)) {
                     Some(bb) => b.narrowed = bb.narrowed.clone(),
                     None => b.narrowed = b.declared.clone(),
@@ -2660,7 +2711,19 @@ impl TypeEnv {
     fn intersect_narrowings(&mut self, other: &TypeEnv) {
         for (i, scope) in self.scopes.iter_mut().enumerate() {
             let other_scope = other.scopes.get(i);
-            for (name, b) in scope.iter_mut() {
+            if other_scope.is_some_and(|o| Rc::ptr_eq(scope, o)) {
+                continue;
+            }
+            let widens = scope.iter().any(|(name, b)| {
+                b.narrowed != b.declared
+                    && !other_scope
+                        .and_then(|s| s.get(name))
+                        .is_some_and(|ob| ob.narrowed == b.narrowed)
+            });
+            if !widens {
+                continue;
+            }
+            for (name, b) in Rc::make_mut(scope).iter_mut() {
                 let agree = other_scope
                     .and_then(|s| s.get(name))
                     .is_some_and(|ob| ob.narrowed == b.narrowed);
@@ -2700,25 +2763,48 @@ impl TypeEnv {
             let Some(after_scope) = after.scopes.get(i) else {
                 continue;
             };
-            for (name, ab) in after_scope {
-                // `finally` affected this binding if it *assigned* to it — even
-                // to a value of the same type as the conservative entry view, a
-                // write a `before`/`after` type comparison alone cannot see —
-                // or if it moved the narrowed type (a guard, an invalidating
-                // call). Either way `finally`'s result, not the stronger
-                // post-`try` narrowing, is what a normal exit carries downstream.
-                let changed = assigned.names.contains(name)
+            // `finally` never wrote this scope, so it has no delta to
+            // overlay. Identity is exact for *types*, but a same-type
+            // reassignment moves no type at all — the shared allocation
+            // cannot see it — so a name `finally` assigned in this scope
+            // still has to go through the comparison below.
+            let assigned_here = assigned
+                .names
+                .iter()
+                .any(|n| after_scope.contains_key(n.as_str()));
+            if !assigned_here && before_scope.is_some_and(|b| Rc::ptr_eq(b, after_scope)) {
+                continue;
+            }
+            // `finally` affected a binding if it *assigned* to it — even to a
+            // value of the same type as the conservative entry view, a write a
+            // `before`/`after` type comparison alone cannot see — or if it
+            // moved the narrowed type (a guard, an invalidating call). Either
+            // way `finally`'s result, not the stronger post-`try` narrowing,
+            // is what a normal exit carries downstream.
+            let changed_of = |name: &String, ab: &TypeBinding| -> bool {
+                assigned.names.contains(name.as_str())
                     || before_scope
                         .and_then(|s| s.get(name))
                         .map(|bb| &bb.narrowed)
-                        != Some(&ab.narrowed);
-                if let Some(b) = scope.get_mut(name) {
+                        != Some(&ab.narrowed)
+            };
+            let has_delta = after_scope.iter().any(|(name, ab)| match scope.get(name) {
+                Some(b) => changed_of(name, ab) && b.narrowed != ab.narrowed,
+                None => true,
+            });
+            if !has_delta {
+                continue;
+            }
+            let live = Rc::make_mut(scope);
+            for (name, ab) in after_scope.iter() {
+                let changed = changed_of(name, ab);
+                if let Some(b) = live.get_mut(name) {
                     if changed {
                         b.narrowed = ab.narrowed.clone();
                     }
                 } else {
                     // A name `finally` introduced — keep it visible downstream.
-                    scope.insert(name.clone(), ab.clone());
+                    live.insert(name.clone(), ab.clone());
                 }
             }
         }
@@ -23616,6 +23702,84 @@ async def main() -> None:
                 d.errors()
             );
         }
+    }
+
+    #[test]
+    fn env_snapshots_share_untouched_scopes() {
+        // Checking a module clones the whole `TypeEnv` on every branch,
+        // `try` and loop. When each clone deep-copied every binding, a
+        // module was quadratic in its top-level definitions — 4 000
+        // one-`if` functions took 35 s. Scopes are copy-on-write now, so a
+        // snapshot shares them until something writes.
+        let mut env = TypeEnv::default();
+        env.enter();
+        env.declare(TypeBinding {
+            name: "g".into(),
+            declared: Type::optional(Type::Int),
+            narrowed: Type::optional(Type::Int),
+            span: (0, 0),
+            from_unsafe: false,
+        });
+        env.enter();
+        let snap = env.snapshot();
+        assert!(
+            env.scopes
+                .iter()
+                .zip(&snap.scopes)
+                .all(|(a, b)| Rc::ptr_eq(a, b)),
+            "an untouched snapshot must share every scope"
+        );
+        // Writing the inner scope copies only that one.
+        env.declare(TypeBinding {
+            name: "local".into(),
+            declared: Type::Int,
+            narrowed: Type::Int,
+            span: (0, 0),
+            from_unsafe: false,
+        });
+        assert!(
+            Rc::ptr_eq(&env.scopes[0], &snap.scopes[0]),
+            "the module scope must stay shared when only a local is declared"
+        );
+        assert!(
+            !Rc::ptr_eq(&env.scopes[1], &snap.scopes[1]),
+            "the written scope must have been copied"
+        );
+        // Re-narrowing to the type a binding already has is a no-op, so it
+        // must not copy the scope either.
+        let before = env.scopes[0].clone();
+        env.narrow("g", Type::optional(Type::Int));
+        assert!(
+            Rc::ptr_eq(&env.scopes[0], &before),
+            "a narrowing that changes nothing must not copy the scope"
+        );
+        env.narrow("g", Type::Int);
+        assert!(
+            !Rc::ptr_eq(&env.scopes[0], &before),
+            "a real narrowing must copy the scope it writes"
+        );
+        assert_eq!(env.lookup("g").map(|b| b.narrowed.clone()), Some(Type::Int));
+    }
+
+    #[test]
+    fn a_function_body_narrowing_does_not_escape_into_the_next_function() {
+        // The copy-on-write scopes changed how `check_function` restores
+        // narrowings; the guarantee they exist for must still hold.
+        let src = "\
+def a(x: int | None) -> int:
+    if x is None:
+        return 0
+    return x
+
+def b(x: int | None) -> int:
+    return x
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "`b` must not inherit `a`'s narrowing of `x`: {:?}",
+            d.errors()
+        );
     }
 
     #[test]

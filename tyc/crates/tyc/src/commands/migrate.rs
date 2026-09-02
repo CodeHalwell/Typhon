@@ -357,49 +357,65 @@ fn lines_starting_inside_string(lines: &[&str]) -> Vec<bool> {
     const SQ3: &str = "'''";
     let mut out = Vec::with_capacity(lines.len());
     let mut delim: Option<&'static str> = None;
+    // Scanning advances by *characters*, not bytes: a docstring holding any
+    // non-ASCII character (CPython's own stdlib does) used to land `i`
+    // mid-codepoint and panic the whole migrate run on the next `line[i..]`.
+    let step =
+        |line: &str, i: usize| -> usize { line[i..].chars().next().map_or(1, char::len_utf8) };
     for line in lines {
         out.push(delim.is_some());
-        let bytes = line.as_bytes();
         let mut i = 0usize;
-        while i < bytes.len() {
+        while i < line.len() {
+            let rest = &line[i..];
+            let ch = rest.chars().next().expect("i is a char boundary");
             match delim {
                 Some(d) => {
-                    if line[i..].starts_with(d) {
+                    if rest.starts_with(d) {
                         delim = None;
-                        i += 3;
+                        i += d.len();
                         continue;
                     }
                 }
                 None => {
-                    if bytes[i] == b'#' {
+                    if ch == '#' {
                         break;
                     }
-                    if line[i..].starts_with(DQ3) {
+                    if rest.starts_with(DQ3) {
                         delim = Some(DQ3);
-                        i += 3;
+                        i += DQ3.len();
                         continue;
                     }
-                    if line[i..].starts_with(SQ3) {
+                    if rest.starts_with(SQ3) {
                         delim = Some(SQ3);
-                        i += 3;
+                        i += SQ3.len();
                         continue;
                     }
                     // A single-quoted literal cannot span lines; skip over it
                     // so a triple delimiter inside one is not mistaken for a
                     // real one.
-                    if bytes[i] == b'"' || bytes[i] == b'\'' {
-                        let q = bytes[i];
-                        i += 1;
-                        while i < bytes.len() && bytes[i] != q {
-                            if bytes[i] == b'\\' {
-                                i += 1;
+                    if ch == '"' || ch == '\'' {
+                        i += ch.len_utf8();
+                        while i < line.len() {
+                            let c = line[i..].chars().next().expect("i is a char boundary");
+                            if c == '\\' {
+                                i += c.len_utf8();
+                                if i < line.len() {
+                                    i += step(line, i);
+                                }
+                                continue;
                             }
-                            i += 1;
+                            if c == ch {
+                                break;
+                            }
+                            i += c.len_utf8();
                         }
                     }
                 }
             }
-            i += 1;
+            if i >= line.len() {
+                break;
+            }
+            i += step(line, i);
         }
     }
     out
@@ -614,11 +630,25 @@ fn move_methods_to_impl(source: &str) -> String {
         while others_trimmed.last().is_some_and(|l| l.trim().is_empty()) {
             others_trimmed.pop();
         }
+        // A body of nothing but comments is not a suite: Python needs a
+        // statement, so `class D:` followed only by `# note` is a parse
+        // error on the migrator's own output. Keep the comments and add the
+        // `pass` they cannot stand in for.
+        let body_has_statement = others_trimmed.iter().any(|l| {
+            let t = l.trim_start();
+            !t.is_empty() && !t.starts_with('#')
+        });
         if others_trimmed.is_empty() {
             out.push_str("    pass\n");
         } else {
             for l in &others_trimmed {
                 out.push_str(l);
+            }
+            if !body_has_statement {
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str("    pass\n");
             }
         }
         out.push('\n');
@@ -3187,6 +3217,52 @@ class Vec:
         assert!(
             out.contains("newtype User_ID = int"),
             "rewrite must work with a trailing real comment; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn non_ascii_in_a_docstring_does_not_panic() {
+        // The string scan advanced by bytes, so a non-ASCII character in a
+        // docstring left the index mid-codepoint and panicked the whole run
+        // on the next slice. CPython's own stdlib migrates through here.
+        let src = "class C:\n    \"\"\"Doc with \u{e9} accent \u{2014} and a dash.\"\"\"\n\n    def f(self) -> int:\n        return 1\n";
+        let out = migrate_source(src);
+        assert!(
+            out.contains("Doc with \u{e9} accent"),
+            "the docstring must survive intact; got:\n{out}"
+        );
+        assert!(
+            out.contains("impl C:"),
+            "the method must still move to an impl block; got:\n{out}"
+        );
+        // Emoji (4-byte) and a quote-adjacent accent, in one line each.
+        let tricky = "class D:\n    \"\"\"\u{1f600}\"\"\"\n    x: int = 1\n\n    def g(self) -> int:\n        return self.x\n";
+        assert!(migrate_source(tricky).contains("impl D:"));
+    }
+
+    #[test]
+    fn comment_only_class_body_keeps_a_pass() {
+        // Every statement moved to the `impl` block and only a comment was
+        // left behind — which is not a suite, so the migrator's own output
+        // failed to parse ("Expected an indented block after `class`").
+        let src =
+            "class D:\n    # only a comment here\n    def g(self) -> int:\n        return 2\n";
+        let out = migrate_source(src);
+        assert!(
+            out.contains("    # only a comment here"),
+            "the comment must be kept; got:\n{out}"
+        );
+        assert!(
+            out.contains("    pass"),
+            "a comment-only body needs a `pass`; got:\n{out}"
+        );
+        assert!(out.contains("impl D:"), "{out}");
+        // A body with a real statement must NOT gain a spurious `pass`.
+        let with_field = "class E:\n    # a note\n    x: int = 1\n    def g(self) -> int:\n        return self.x\n";
+        let out = migrate_source(with_field);
+        assert!(
+            !out.contains("pass"),
+            "a body that already has a statement must not gain `pass`; got:\n{out}"
         );
     }
 }

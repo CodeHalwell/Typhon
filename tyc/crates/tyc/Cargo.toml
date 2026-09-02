@@ -35,6 +35,9 @@ tyc-vm          = { workspace = true }
 tyc-venv          = { path = "../tyc-venv" }
 tempfile        = { workspace = true }
 notify          = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 itoa = "1.0.18"
 
 [dev-dependencies]
