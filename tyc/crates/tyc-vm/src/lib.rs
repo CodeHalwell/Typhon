@@ -3482,6 +3482,14 @@ BASE = "/tmp/zz_probe_fs"
 shutil.rmtree(BASE, ignore_errors=True)
 os.makedirs(BASE)
 os.chdir(BASE)
+# Fixtures for the probes whose *kind* of failure must not depend on who
+# is running the suite: unlinking a directory, rmdir-ing a file and
+# rmdir-ing a non-empty directory all report the type error only when the
+# caller may write the parent. Probing `/tmp` and `/etc/passwd` instead
+# reported those as root and `PermissionError` as anyone else.
+os.makedirs("zz_env/full")
+Path("zz_env/full/inner").write_text("x")
+Path("zz_env/file").write_text("abc")
 
 # ---- pure paths
 for spec in ["a//b/./c/", "", ".", "/", "//x/y", "///x", "a/../b", "a/b/", "./a", "/a/b.tar.gz", ".bashrc", "a.", "a..b", "..", "a/..", "c:/x"]:
@@ -3532,8 +3540,8 @@ show("O19", lambda: Path("/tmp/zz_definitely_missing/q").unlink())
 show("O20", lambda: Path("/tmp/zz_definitely_missing/q").rmdir())
 show("O22", lambda: list(Path("/tmp/zz_definitely_missing/q").iterdir()))
 show("O23", lambda: Path("/tmp/zz_definitely_missing/q").rename("/tmp/zz2"))
-show("O24", lambda: Path("/tmp").unlink())
-show("O25", lambda: Path("/etc/passwd").rmdir())
+show("O24", lambda: Path("zz_env/full").unlink())
+show("O25", lambda: Path("zz_env/file").rmdir())
 show("O26", lambda: Path("/tmp").write_text(5))
 show("O27", lambda: Path("/tmp/zz_definitely_missing/q").touch())
 try:
@@ -3544,7 +3552,7 @@ mut e = OSError(2, "msg", "f"); emit("O30", e, e.args, e.errno, e.strerror, e.fi
 e = OSError("one"); emit("O31", e, e.args, e.errno, e.strerror, e.filename)
 e = OSError(2, "msg"); emit("O32", e, e.args, e.errno, e.filename)
 e = FileNotFoundError(2, "No such file or directory", "x"); emit("O33", e, isinstance(e, OSError))
-st = Path("/etc/passwd").stat(); emit("O34", type(st).__name__, st.st_size > 0, isinstance(st.st_mtime, float), isinstance(st.st_size, int), st.st_mode & 0o170000 == 0o100000, len(st), st[6] == st.st_size)
+st = Path("zz_env/file").stat(); emit("O34", type(st).__name__, st.st_size > 0, isinstance(st.st_mtime, float), isinstance(st.st_size, int), st.st_mode & 0o170000 == 0o100000, len(st), st[6] == st.st_size)
 
 # ---- open / files
 for f in [lambda: open("/nonexistent_zz/x"), lambda: open("/tmp"), lambda: open("/tmp/x.txt", "q"), lambda: open(5.5), lambda: open("/nonexistent_zz/x", "w"), lambda: open("/etc/passwd", "rb").read(0), lambda: open("/etc/passwd", "rw"), lambda: open("/etc/passwd", "rb", encoding="utf-8")]:
@@ -3617,8 +3625,8 @@ show("P9", lambda: os.makedirs("/tmp"))
 show("P10", lambda: os.makedirs("/tmp", exist_ok=True))
 show("P11", lambda: os.path.getsize("/nonexistent_zz"))
 show("P12", lambda: os.stat("/nonexistent_zz"))
-show("P13", lambda: os.rmdir("/tmp"))
-show("P14", lambda: os.remove("/tmp"))
+show("P13", lambda: os.rmdir("zz_env/full"))
+show("P14", lambda: os.remove("zz_env/full"))
 show("P15", lambda: os.listdir("/etc/passwd"))
 show("P16", lambda: os.path.getsize(Path("/nonexistent_zz")))
 emit("P17", os.getcwd() == BASE, os.path.isdir("."), os.path.isfile("f1.txt"), os.path.exists("nope"), os.path.getsize("f1.txt"), os.getenv("HOME") == os.environ["HOME"], os.getenv("ZZ_NOPE", "dflt"), isinstance(os.getpid(), int), os.cpu_count() >= 1, os.system("exit 3"), os.path.samefile("f1.txt", "./f1.txt"), os.strerror(2), os.access("f1.txt", os.R_OK), os.access("nope", os.F_OK))
@@ -3719,8 +3727,8 @@ O19 FileNotFoundError [Errno 2] No such file or directory: '/tmp/zz_definitely_m
 O20 FileNotFoundError [Errno 2] No such file or directory: '/tmp/zz_definitely_missing/q'
 O22 FileNotFoundError [Errno 2] No such file or directory: '/tmp/zz_definitely_missing/q'
 O23 FileNotFoundError [Errno 2] No such file or directory: '/tmp/zz_definitely_missing/q' -> '/tmp/zz2'
-O24 IsADirectoryError [Errno 21] Is a directory: '/tmp'
-O25 NotADirectoryError [Errno 20] Not a directory: '/etc/passwd'
+O24 IsADirectoryError [Errno 21] Is a directory: 'zz_env/full'
+O25 NotADirectoryError [Errno 20] Not a directory: 'zz_env/file'
 O26 TypeError data must be str, not int
 O27 FileNotFoundError [Errno 2] No such file or directory: '/tmp/zz_definitely_missing/q'
 O29 FileNotFoundError [Errno 2] No such file or directory: '/tmp/zz_definitely_missing/q' 2 No such file or directory /tmp/zz_definitely_missing/q (2, 'No such file or directory')
@@ -3728,7 +3736,7 @@ O30 [Errno 2] msg: 'f' (2, 'msg') 2 msg f FileNotFoundError
 O31 one ('one',) None None None
 O32 [Errno 2] msg (2, 'msg') 2 None
 O33 [Errno 2] No such file or directory: 'x' True
-O34 stat_result False True True True 10 True
+O34 stat_result True True True True 10 True
 F FileNotFoundError [Errno 2] No such file or directory: '/nonexistent_zz/x'
 F IsADirectoryError [Errno 21] Is a directory: '/tmp'
 F ValueError invalid mode: 'q'
@@ -3767,7 +3775,7 @@ T19 new!
 T20 bc 3
 T21 0
 T22 9 unflushed
-T23 [] ['f1.txt', 'f2.bin', 'f3.txt', 'f4.txt', 'f5.txt']
+T23 [] ['f1.txt', 'f2.bin', 'f3.txt', 'f4.txt', 'f5.txt', 'zz_env']
 T24 'hello-there\\n1 2!'
 I1 a b
 cd
@@ -3803,8 +3811,8 @@ P9 FileExistsError [Errno 17] File exists: '/tmp'
 P10 None
 P11 FileNotFoundError [Errno 2] No such file or directory: '/nonexistent_zz'
 P12 FileNotFoundError [Errno 2] No such file or directory: '/nonexistent_zz'
-P13 OSError [Errno 39] Directory not empty: '/tmp'
-P14 IsADirectoryError [Errno 21] Is a directory: '/tmp'
+P13 OSError [Errno 39] Directory not empty: 'zz_env/full'
+P14 IsADirectoryError [Errno 21] Is a directory: 'zz_env/full'
 P15 NotADirectoryError [Errno 20] Not a directory: '/etc/passwd'
 P16 FileNotFoundError [Errno 2] No such file or directory: '/nonexistent_zz'
 P17 True True True False 0 True dflt True True 768 True No such file or directory True False
