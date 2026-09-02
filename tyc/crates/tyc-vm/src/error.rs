@@ -120,6 +120,7 @@ pub fn key_error_for(key: &Value) -> Unwind {
             kind: std::rc::Rc::new("KeyError".to_owned()),
             message: std::rc::Rc::new(repr),
             args: std::rc::Rc::new(vec![key.clone()]),
+            chain: None,
         }),
     )
 }
@@ -140,6 +141,7 @@ pub fn system_exit(args: Vec<Value>) -> Unwind {
             kind: std::rc::Rc::new("SystemExit".to_owned()),
             message: std::rc::Rc::new(message),
             args: std::rc::Rc::new(args),
+            chain: None,
         },
     ))
 }

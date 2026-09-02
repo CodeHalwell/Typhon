@@ -1617,6 +1617,7 @@ pub fn install(interp: &mut Interpreter) {
                 kind: Rc::new(n.clone()),
                 message: Rc::new(msg),
                 args: Rc::new(args),
+                chain: None,
             })
         });
         root.set(name, Value::Native(Rc::new(ctor)));
@@ -2737,6 +2738,7 @@ fn try_result_native() -> Value {
                             kind: Rc::new(exc.kind.clone()),
                             message: Rc::new(exc.message.clone()),
                             args: Rc::new(exc_args),
+                            chain: None,
                         }
                     }
                 };
@@ -3592,6 +3594,7 @@ pub(crate) fn os_error_value(
             Value::Int(VmInt::from(errno)),
             Value::Str(Rc::new(strerror.to_owned())),
         ]),
+        chain: None,
     }
 }
 
@@ -4472,6 +4475,7 @@ fn make_sys_module(interp: &Interpreter) -> Value {
                         kind: Rc::new(exc.kind.clone()),
                         message: Rc::new(exc.message.clone()),
                         args: Rc::new(vec![Value::Str(Rc::new(exc.message.clone()))]),
+                        chain: None,
                     });
                     // Slot 0 is the exception *type*: the raised instance's
                     // own class when there is one, else the builtin type
@@ -5725,6 +5729,7 @@ fn make_re_module() -> Value {
         Value::Instance(Rc::new(crate::value::Instance {
             class: cls,
             fields: RefCell::new(attrs),
+            chain: RefCell::new(None),
         }))
     }
     // Build a match object from a `regex::Captures`. Group 0 is the whole
@@ -5850,6 +5855,7 @@ fn make_re_module() -> Value {
         Value::Instance(Rc::new(crate::value::Instance {
             class: cls,
             fields: RefCell::new(attrs),
+            chain: RefCell::new(None),
         }))
     }
     make_module(
@@ -6053,6 +6059,7 @@ fn exception_unwind_value(e: &crate::error::VmException) -> Value {
         } else {
             vec![Value::Str(Rc::new(e.message.clone()))]
         }),
+        chain: None,
     })
 }
 
@@ -6293,6 +6300,7 @@ fn make_asyncio_module() -> Value {
                     kind: Rc::new(kind.to_owned()),
                     message: Rc::new(msg),
                     args: Rc::new(args),
+                    chain: None,
                 })
             }))),
         )
@@ -6905,6 +6913,7 @@ fn deep_freeze_value(v: Value) -> Result<Value, Unwind> {
             Ok(Value::Instance(Rc::new(crate::value::Instance {
                 class: inst.class.clone(),
                 fields: RefCell::new(new_fields),
+                chain: RefCell::new(None),
             })))
         }
         Value::ResultOk(v) => Ok(Value::ResultOk(Box::new(deep_freeze_value(*v)?))),
@@ -7078,6 +7087,7 @@ pub(crate) fn native_object(class_name: &str, fields: Vec<(&str, Value)>) -> Val
     Value::Instance(Rc::new(crate::value::Instance {
         class: cls,
         fields: RefCell::new(fields),
+        chain: RefCell::new(None),
     }))
 }
 
@@ -7269,11 +7279,28 @@ fn make_functools_module(interp: &mut Interpreter) -> Value {
     let cached_property = nf("cached_property", |_i, args| {
         Ok(args.into_iter().next().unwrap_or(Value::None))
     });
-    let wraps = nf("wraps", |_i, _args| {
-        // Returns a decorator that's an identity function.
+    // `@functools.wraps(fn)` copies the wrapped function's identity onto
+    // the wrapper. As a pure identity it left `wrapper.__name__` as
+    // `"wrapper"`, so any program printing a decorated function's name
+    // disagreed with the compiled path.
+    let wraps = nf("wraps", |_i, args| {
+        let wrapped = args.into_iter().next().unwrap_or(Value::None);
         Ok(Value::Native(Rc::new(NativeFn::new(
             "wraps_inner",
-            |_i, args| Ok(args.into_iter().next().unwrap_or(Value::None)),
+            move |i, args| {
+                let wrapper = args.into_iter().next().unwrap_or(Value::None);
+                if let Value::Function(f) = &wrapper {
+                    for name in ["__name__", "__qualname__", "__doc__", "__module__"] {
+                        if let Ok(v) = i.get_attr(&wrapped, name) {
+                            f.attrs.borrow_mut().insert(name.to_owned(), v);
+                        }
+                    }
+                    f.attrs
+                        .borrow_mut()
+                        .insert("__wrapped__".to_owned(), wrapped.clone());
+                }
+                Ok(wrapper)
+            },
         ))))
     });
     let mut entries = vec![
@@ -7391,6 +7418,7 @@ fn make_dataclasses_module() -> Value {
                 Value::Instance(Rc::new(crate::value::Instance {
                     class: field_class.clone(),
                     fields: RefCell::new(attrs),
+                    chain: RefCell::new(None),
                 }))
             })
             .collect();
@@ -7425,6 +7453,7 @@ fn exception_ctor(name: &'static str) -> Value {
             kind: Rc::new(name.to_owned()),
             message: Rc::new(msg),
             args: Rc::new(args),
+            chain: None,
         })
     })))
 }
@@ -9892,6 +9921,7 @@ pub fn json_decode_error(msg: &str, doc: &str, pos: usize) -> Unwind {
     let inst = Value::Instance(Rc::new(crate::value::Instance {
         class: json_decode_error_class(),
         fields: RefCell::new(fields),
+        chain: RefCell::new(None),
     }));
     Unwind::Exception(crate::error::VmException::new("JSONDecodeError", full).with_value(inst))
 }
@@ -10677,6 +10707,7 @@ pub fn call_with_kwargs(
                             kind: Rc::new(e.kind.clone()),
                             message: Rc::new(e.message.clone()),
                             args: Rc::new(vec![Value::Str(Rc::new(e.message.clone()))]),
+                            chain: None,
                         });
                         out.push(v);
                     }

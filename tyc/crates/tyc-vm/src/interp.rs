@@ -1146,6 +1146,21 @@ impl Interpreter {
                 };
             }
         };
+        // `raise X from Y` records `Y` as `X.__cause__` (PEP 3134) and sets
+        // `__suppress_context__`. `raise X from None` records a `None` cause,
+        // which is how CPython suppresses the implicit context.
+        let exc = match &r.cause {
+            Some(c) => {
+                let cause = self.eval_expr(c, env)?;
+                let cause = match cause {
+                    Value::Native(_) => self.call_value(cause, vec![], &[])?,
+                    Value::Class(ref cls) => self.instantiate(cls, vec![], &[])?,
+                    other => other,
+                };
+                crate::value::with_exception_cause(exc, cause)
+            }
+            None => exc,
+        };
         Err(self.value_to_exception(exc))
     }
 
@@ -1521,22 +1536,30 @@ impl Interpreter {
                     for deco in f.decorator_list.iter().rev() {
                         v = self.apply_decorator(deco, v, &body_env)?;
                     }
-                    if let Value::Function(f) = &v {
+                    // The class body binds the decorator's *result* to the
+                    // `def`'s own name — CPython does not consult the
+                    // returned function's `__name__`. Registering under the
+                    // wrapper's name instead meant any decorator returning a
+                    // differently-named function (every `@functools.wraps`
+                    // wrapper, spelled `def wrapper(...)`) hid the method:
+                    // `obj.greet()` raised `attribute not found`.
+                    let declared = f.name.as_str().to_owned();
+                    if let Value::Function(func) = &v {
                         if is_property {
-                            properties.insert(f.name.clone());
+                            properties.insert(declared.clone());
                         }
                         if is_cached_property {
                             class_attrs.insert(
-                                format!("__typhon_cached_prop__{}", f.name),
+                                format!("__typhon_cached_prop__{declared}"),
                                 Value::Bool(true),
                             );
                         }
                         if is_classmethod {
-                            classmethods.insert(f.name.clone());
+                            classmethods.insert(declared.clone());
                         }
-                        methods.insert(f.name.clone(), f.clone());
+                        methods.insert(declared, func.clone());
                     } else {
-                        class_attrs.insert(f.name.as_str().into(), v);
+                        class_attrs.insert(declared, v);
                     }
                 }
                 Stmt::AnnAssign(a) => {
@@ -2376,6 +2399,7 @@ impl Interpreter {
                 let member = Value::Instance(Rc::new(Instance {
                     class: class.clone(),
                     fields: RefCell::new(fields),
+                    chain: RefCell::new(None),
                 }));
                 attrs.insert(name.clone(), member.clone());
                 member_list.push(member);
@@ -4353,6 +4377,7 @@ impl Interpreter {
             let instance = Rc::new(Instance {
                 class: class.clone(),
                 fields: RefCell::new(crate::value::FieldMap::new()),
+                chain: RefCell::new(None),
             });
             instance
                 .fields
@@ -4363,6 +4388,7 @@ impl Interpreter {
         let instance = Rc::new(Instance {
             class: class.clone(),
             fields: RefCell::new(crate::value::FieldMap::new()),
+            chain: RefCell::new(None),
         });
         // Initialise class-level attributes that aren't methods. Skip every
         // internal `__typhon_*` marker (enum sentinels, property setters,
@@ -5720,6 +5746,26 @@ impl Interpreter {
                 _ => {}
             }
         }
+        // PEP 3134 chaining slots. CPython keeps `__cause__` / `__context__`
+        // out of an exception's `__dict__`, and both exception shapes (a
+        // built-in `Value::Exception` and a user exception `Instance`) answer
+        // them, so they are resolved before the per-shape attribute paths.
+        if matches!(attr, "__cause__" | "__context__" | "__suppress_context__") {
+            if let Some(v) = crate::value::exception_chain_attr(value, attr) {
+                return Ok(v);
+            }
+        }
+        // `x.__class__` is an *attribute*, not a method: `(1 + 2).__class__`
+        // is the `int` type object. Returning a bound method made
+        // `(1 + 2).__class__.__name__` read `"method"`.
+        if attr == "__class__" {
+            if let Value::Instance(inst) = value {
+                return Ok(Value::Class(inst.class.clone()));
+            }
+            if !matches!(value, Value::Class(_) | Value::Module(_)) {
+                return Ok(crate::builtins::make_builtin_type(value.type_name()));
+            }
+        }
         // `int` / `float` carry the `numbers` tower's read-only components.
         // `int` is exactly its own numerator over 1; `float` has no
         // numerator/denominator, matching CPython.
@@ -6028,6 +6074,15 @@ impl Interpreter {
                     m.name, attr
                 )))
             }
+            // Whatever was attached to the function's own `__dict__` wins —
+            // that is how `functools.wraps` makes a wrapper report the
+            // wrapped function's `__name__`.
+            Value::Function(f) if f.attrs.borrow().contains_key(attr) => Ok(f
+                .attrs
+                .borrow()
+                .get(attr)
+                .cloned()
+                .expect("checked by the guard")),
             // `func.__name__` / `func.__qualname__`.
             Value::Function(f) if attr == "__name__" || attr == "__qualname__" => {
                 Ok(Value::Str(Rc::new(f.name.clone())))
@@ -6039,13 +6094,6 @@ impl Interpreter {
             Value::Function(_) | Value::Native(_) if attr == "__type_params__" => {
                 Ok(Value::Tuple(Rc::new(Vec::new())))
             }
-            // …then whatever was attached to the function's own `__dict__`.
-            Value::Function(f) if f.attrs.borrow().contains_key(attr) => Ok(f
-                .attrs
-                .borrow()
-                .get(attr)
-                .cloned()
-                .expect("checked by the guard")),
             Value::Function(f) if attr == "__dict__" => {
                 let mut map = crate::value::DictMap::new();
                 for (k, v) in f.attrs.borrow().iter() {
@@ -6236,6 +6284,7 @@ impl Interpreter {
                 kind,
                 message,
                 args,
+                ..
             } => match attr {
                 "args" => {
                     if args.is_empty() && !message.is_empty() {
@@ -6277,9 +6326,6 @@ impl Interpreter {
                 "message" if crate::value::is_exception_group_kind(kind.as_str()) => {
                     Ok(Value::Str(message.clone()))
                 }
-                // `__cause__` / `__context__` are not tracked yet; expose None
-                // so the common introspection (`e.__cause__ is None`) works.
-                "__cause__" | "__context__" => Ok(Value::None),
                 _ => Err(attribute_error(format!(
                     "'{}' has no attribute '{}'",
                     kind, attr
@@ -7159,16 +7205,7 @@ impl Interpreter {
                                 // instance to the handler name so that
                                 // `e.code` / `e.message` work. Otherwise fall
                                 // back to the bare `Value::Exception` summary.
-                                let value = match &exc.value {
-                                    Some(v @ (Value::Instance(_) | Value::Exception { .. })) => {
-                                        v.clone()
-                                    }
-                                    _ => Value::Exception {
-                                        kind: Rc::new(exc.kind.clone()),
-                                        message: Rc::new(exc.message.clone()),
-                                        args: Rc::new(exc_fallback_args(&exc.message)),
-                                    },
-                                };
+                                let value = exception_binding_value(&exc);
                                 if let Some(name) = &h.name {
                                     env.set(name.as_str(), value);
                                 }
@@ -7193,6 +7230,7 @@ impl Interpreter {
                     self.active_exceptions.push(exc.clone());
                     let result = self.exec_block(&h.body, env);
                     self.active_exceptions.pop();
+                    let result = chain_context(result, &exc);
                     if let Err(Unwind::Yield(v)) = result {
                         // Suspended inside the handler: the bound name stays
                         // live for the resumed body.
@@ -7220,7 +7258,15 @@ impl Interpreter {
                             self.record_suspend(ResumeFrame::TryFinally { pending });
                             Err(Unwind::Yield(v))
                         }
-                        Err(e) => Err(e),
+                        // `finally` raising while another exception was on
+                        // its way out: the interrupted one becomes the new
+                        // exception's `__context__`, and the new one wins.
+                        Err(e) => match &pending {
+                            Err(Unwind::Exception(interrupted)) => {
+                                chain_context(Err(e), interrupted)
+                            }
+                            _ => Err(e),
+                        },
                     };
                 }
             };
@@ -7288,6 +7334,7 @@ impl Interpreter {
                 kind: Rc::new(exc.kind.clone()),
                 message: Rc::new(exc.message.clone()),
                 args: Rc::new(exc_fallback_args(&exc.message)),
+                chain: None,
             },
         };
         let was_group = crate::value::exception_group_subs(&raised_value).is_some();
@@ -7369,6 +7416,7 @@ impl Interpreter {
                         kind: Rc::new(e.kind.clone()),
                         message: Rc::new(e.message.clone()),
                         args: Rc::new(exc_fallback_args(&e.message)),
+                        chain: None,
                     });
                     if e.star_handler_reraise
                         && crate::value::exception_values_identical(&value, &matched)
@@ -7725,6 +7773,7 @@ impl Interpreter {
                                 kind: Rc::new(exc.kind.clone()),
                                 message: Rc::new(exc.message.clone()),
                                 args: Rc::new(exc_fallback_args(&exc.message)),
+                                chain: None,
                             },
                         };
                         let etype = match &exc.value {
@@ -9312,6 +9361,7 @@ pub(crate) fn stop_iteration_for(it: &Value) -> Unwind {
                     kind: Rc::new("StopIteration".to_owned()),
                     message: Rc::new(message),
                     args: Rc::new(vec![v]),
+                    chain: None,
                 }),
             )
         }
@@ -10090,6 +10140,43 @@ fn as_set_operand(v: &Value) -> Result<Option<std::collections::HashSet<HashKey>
             Ok(Some(out))
         }
         _ => Ok(None),
+    }
+}
+
+/// The exception *value* an `except … as e` handler binds: the object the
+/// raise carried, or a `Value::Exception` summary synthesised from a
+/// VM-raised error that carries none.
+fn exception_binding_value(exc: &VmException) -> Value {
+    match &exc.value {
+        Some(v @ (Value::Instance(_) | Value::Exception { .. })) => v.clone(),
+        _ => Value::Exception {
+            kind: Rc::new(exc.kind.clone()),
+            message: Rc::new(exc.message.clone()),
+            args: Rc::new(exc_fallback_args(&exc.message)),
+            chain: None,
+        },
+    }
+}
+
+/// PEP 3134 implicit chaining: an exception that escapes an `except` handler
+/// — or a `finally` that runs while another exception is propagating —
+/// records the exception it interrupted as its `__context__`. CPython does
+/// this at raise time; doing it as the exception leaves the handler covers
+/// both an explicit `raise` and an error the handler body ran into.
+fn chain_context(result: Result<(), Unwind>, interrupted: &VmException) -> Result<(), Unwind> {
+    match result {
+        Err(Unwind::Exception(mut exc)) => {
+            let value = exc
+                .value
+                .take()
+                .unwrap_or_else(|| exception_binding_value(&exc));
+            exc.value = Some(crate::value::with_exception_context(
+                value,
+                exception_binding_value(interrupted),
+            ));
+            Err(Unwind::Exception(exc))
+        }
+        other => other,
     }
 }
 

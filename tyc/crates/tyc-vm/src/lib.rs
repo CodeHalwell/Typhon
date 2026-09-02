@@ -2099,6 +2099,80 @@ main()
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
 
+    /// PEP 3134 chaining: `raise X from Y` records `__cause__`, an exception
+    /// escaping a handler records the one it interrupted as `__context__`,
+    /// `from None` suppresses the context, and a fresh exception has neither.
+    #[test]
+    fn vm_exception_chaining() {
+        let src = r#"
+class AppError(Exception):
+    pass
+
+def main() -> None:
+    try:
+        try:
+            raise ValueError("inner")
+        except ValueError as inner:
+            raise RuntimeError("wrapper") from inner
+    except RuntimeError as e:
+        if repr(e.__cause__) != "ValueError('inner')":
+            raise ValueError("explicit cause wrong")
+        if repr(e.__context__) != "ValueError('inner')":
+            raise ValueError("implicit context wrong")
+        if not e.__suppress_context__:
+            raise ValueError("from-clause should suppress context")
+
+    try:
+        try:
+            raise KeyError("k")
+        except KeyError:
+            raise AppError("app")
+    except AppError as e:
+        if repr(e.__context__) != "KeyError('k')" or e.__cause__ is not None:
+            raise ValueError("user exception chaining wrong")
+        if e.__suppress_context__:
+            raise ValueError("plain raise should not suppress context")
+
+    try:
+        try:
+            raise ValueError("v")
+        except ValueError:
+            raise TypeError("t") from None
+    except TypeError as e:
+        if e.__cause__ is not None or not e.__suppress_context__:
+            raise ValueError("from None wrong")
+
+    # An error the handler body runs into chains just like an explicit raise.
+    try:
+        try:
+            raise ValueError("first")
+        except ValueError:
+            let _bad: int = int("nope")
+    except ValueError as e:
+        if repr(e.__context__) != "ValueError('first')":
+            raise ValueError("native error context wrong")
+
+    # `finally` raising over a propagating exception chains it too.
+    try:
+        try:
+            raise ValueError("pending")
+        finally:
+            raise RuntimeError("from finally")
+    except RuntimeError as e:
+        if repr(e.__context__) != "ValueError('pending')":
+            raise ValueError("finally context wrong")
+
+    let fresh: ValueError = ValueError("fresh")
+    if fresh.__cause__ is not None or fresh.__context__ is not None:
+        raise ValueError("fresh exception should have no chain")
+    if fresh.__suppress_context__:
+        raise ValueError("fresh exception should not suppress context")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
     #[test]
     fn vm_property_setter_and_dir() {
         let src = r#"

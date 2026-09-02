@@ -1108,6 +1108,7 @@ pub fn make_exception_group(kind: &str, message: &str, subs: Vec<Value>, as_tupl
         kind: Rc::new(kind.to_owned()),
         message: Rc::new(message.to_owned()),
         args: Rc::new(vec![Value::Str(Rc::new(message.to_owned())), subs_value]),
+        chain: None,
     }
 }
 
@@ -1152,6 +1153,101 @@ pub fn exception_group_kind_for(members: &[Value]) -> &'static str {
     } else {
         "BaseExceptionGroup"
     }
+}
+
+/// The PEP 3134 chaining state attached to an exception value, if any.
+/// Handles both exception shapes: the built-in `Value::Exception` and a
+/// user-defined exception `Instance`.
+pub fn exception_chain(v: &Value) -> Option<Rc<ExcChain>> {
+    match v {
+        Value::Exception { chain, .. } => chain.clone(),
+        Value::Instance(i) => i.chain.borrow().clone(),
+        _ => None,
+    }
+}
+
+/// Whether `v` is an exception value at all — the two shapes a raise can
+/// produce, a built-in `Value::Exception` and an instance of a user class
+/// deriving from `Exception`.
+pub fn is_exception_value(v: &Value) -> bool {
+    match v {
+        Value::Exception { .. } => true,
+        Value::Instance(i) => i.class.is_exception,
+        _ => false,
+    }
+}
+
+/// Read one of `__cause__` / `__context__` / `__suppress_context__` off an
+/// exception value. An unchained exception answers `None` / `False`, which is
+/// what CPython gives a freshly constructed one.
+pub fn exception_chain_attr(v: &Value, attr: &str) -> Option<Value> {
+    if !is_exception_value(v) {
+        return None;
+    }
+    let chain = exception_chain(v);
+    match attr {
+        "__cause__" => Some(chain.and_then(|c| c.cause.clone()).unwrap_or(Value::None)),
+        "__context__" => Some(chain.and_then(|c| c.context.clone()).unwrap_or(Value::None)),
+        "__suppress_context__" => Some(Value::Bool(chain.is_some_and(|c| c.suppress_context))),
+        _ => None,
+    }
+}
+
+fn update_exception_chain(v: Value, edit: impl FnOnce(&mut ExcChain)) -> Value {
+    match v {
+        Value::Exception {
+            kind,
+            message,
+            args,
+            chain,
+        } => {
+            let mut next = chain.map(|c| (*c).clone()).unwrap_or_default();
+            edit(&mut next);
+            Value::Exception {
+                kind,
+                message,
+                args,
+                chain: Some(Rc::new(next)),
+            }
+        }
+        Value::Instance(i) => {
+            let mut next = i
+                .chain
+                .borrow()
+                .as_ref()
+                .map(|c| (**c).clone())
+                .unwrap_or_default();
+            edit(&mut next);
+            *i.chain.borrow_mut() = Some(Rc::new(next));
+            Value::Instance(i)
+        }
+        other => other,
+    }
+}
+
+/// Record `raise X from cause`: sets `__cause__`, and with it the
+/// `__suppress_context__` flag CPython sets on the same statement.
+/// `raise X from None` passes `Value::None` and just suppresses the context.
+pub fn with_exception_cause(v: Value, cause: Value) -> Value {
+    update_exception_chain(v, |c| {
+        c.cause = Some(cause);
+        c.suppress_context = true;
+    })
+}
+
+/// Record the exception that was being handled when this one was raised
+/// (`__context__`). Never overwrites a context already set, and never chains
+/// an exception to itself — both would build a cycle CPython does not.
+pub fn with_exception_context(v: Value, context: Value) -> Value {
+    if exception_values_identical(&v, &context) {
+        return v;
+    }
+    if let Some(chain) = exception_chain(&v) {
+        if chain.context.is_some() {
+            return v;
+        }
+    }
+    update_exception_chain(v, |c| c.context = Some(context))
 }
 
 /// Object identity (`is`) for exception values. Clones of one raised
@@ -1211,6 +1307,19 @@ pub fn project_exception_group(orig: &Value, keep: &[Value]) -> Option<Value> {
     }
 }
 
+/// PEP 3134 exception-chaining state carried by an exception *value*.
+///
+/// `cause` is what `raise X from Y` records (`__cause__`, which also implies
+/// `__suppress_context__`); `context` is the exception that was being handled
+/// when this one was raised (`__context__`). Both hold the chained exception
+/// *value*, so `e.__cause__.args` works.
+#[derive(Clone, Default)]
+pub struct ExcChain {
+    pub cause: Option<Value>,
+    pub context: Option<Value>,
+    pub suppress_context: bool,
+}
+
 #[derive(Clone)]
 pub enum Value {
     None,
@@ -1262,6 +1371,10 @@ pub enum Value {
         kind: RcStr,
         message: RcStr,
         args: Rc<Vec<Value>>,
+        /// PEP 3134 chaining state (`__cause__` / `__context__`), `None`
+        /// until something chains onto this exception. Exception values are
+        /// copied freely, so the chain rides along with every clone.
+        chain: Option<Rc<ExcChain>>,
     },
     /// Iterator state — opaque to the AST walker; consumed by `next`.
     Iter(Rc<RefCell<IterState>>),
@@ -1494,6 +1607,10 @@ pub type FieldMap = IndexMap<String, Value>;
 pub struct Instance {
     pub class: Rc<Class>,
     pub fields: RefCell<FieldMap>,
+    /// PEP 3134 chaining state for a user-defined exception instance. Kept
+    /// out of `fields` because CPython holds `__cause__` / `__context__` in
+    /// slots, not in `__dict__` — `vars(e)` must not show them.
+    pub chain: RefCell<Option<Rc<ExcChain>>>,
 }
 
 // Hand-written so `HashKey::Class` can `#[derive(Debug)]` without pulling
@@ -1682,6 +1799,7 @@ impl fmt::Debug for Value {
                 kind,
                 message,
                 args,
+                ..
             } => {
                 if args.is_empty() {
                     if message.is_empty() {
@@ -2310,6 +2428,7 @@ impl Value {
                 kind,
                 message,
                 args,
+                ..
             } => match args.len() {
                 // `str(ExceptionGroup("g", [e]))` is `"g (1 sub-exception)"`,
                 // not the generic multi-arg tuple form below.
@@ -2392,6 +2511,7 @@ impl Value {
                 kind,
                 args,
                 message,
+                ..
             } => {
                 if args.is_empty() && !message.is_empty() {
                     return format!("{}({})", kind, python_repr_str(message));
@@ -3067,6 +3187,7 @@ mod tests {
         Value::Instance(Rc::new(Instance {
             class: class.clone(),
             fields: RefCell::new(map),
+            chain: RefCell::new(None),
         }))
     }
 

@@ -65,8 +65,17 @@ last-mile-builtin gaps: a module-level `lazy let` now defers to first
 *use* (running its initialiser at the binding raised `NameError` when the
 helper was defined lower in the file), `%(key)s` printf conversions read
 a mapping, `sys.modules` always carries `__main__`, and `eval` of a
-single expression exists. **The
-differential baseline falls from 167 entries to 43.**
+single expression exists. A fifth took decorators and exception chaining:
+`functools.wraps` copies the wrapped function's `__name__` / `__qualname__`
+/ `__doc__` / `__module__` and sets `__wrapped__`, a decorated *method* is
+registered under the name it was declared with rather than the wrapper's
+(so `@log def greet` stayed callable as `greet`), `x.__class__` reads as
+the type object it is instead of a bound method, and PEP 3134 chaining is
+real — `raise X from Y` records `__cause__` and `__suppress_context__`,
+an exception leaving an `except` handler or raised by a `finally` records
+the one it interrupted as `__context__`, and an unchained exception
+answers `None` / `False` as CPython's does. **The
+differential baseline falls from 167 entries to 36.**
 
 **Checking a module is linear in its definitions again.** Every branch,
 `try` and loop clones the whole `TypeEnv`, and each clone deep-copied every
@@ -488,7 +497,7 @@ additive on correct programs except the one marked **narrowing**.
 
 Everything that review deferred is closed by the beta wave above, except
 the VM's eager generator expressions and the thin `re` shim, which remain
-in `scripts/differential-baseline.txt` — the 43 entries there are the
+in `scripts/differential-baseline.txt` — the 36 entries there are the
 honest list of what the VM still gets wrong, and each one is a bug.
 
 ## 1.0.0-alpha.9 — 2026-08-21 — maintenance: secret-name lint expansion, allocation reductions & dependency wave

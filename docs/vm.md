@@ -57,7 +57,11 @@ tyc run --compile --temp      # legacy with ephemeral build dir
   Other decorators run as regular function calls.
 - Error handling: `try` / `except T as e` / `else` / `finally`, `raise`,
   the `Result[T, E]` ADT with native `Ok(...)`, `Err(...)`, and the `?`
-  propagation operator.
+  propagation operator. PEP 3134 chaining is tracked: `raise X from Y`
+  sets `__cause__` (and `__suppress_context__`), an exception leaving an
+  `except` handler — or raised by a `finally` over one still propagating —
+  records the interrupted exception as its `__context__`, and an unchained
+  exception answers `None` / `False`.
 - Imports: `import`, `from ... import`, `as` aliasing, dotted module
   access. The full list of modules the VM can resolve natively is below.
 - Comprehensions: list, set, dict, generator (eagerly materialised in v1).
