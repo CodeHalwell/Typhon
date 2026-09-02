@@ -514,7 +514,7 @@ impl TyphonConfig {
         // (`"WARN"`) used to be silently ignored, reverting to the default —
         // so a user who believed they had CI-gated a check actually had it
         // off. Surface it instead.
-        const ALLOWED_SEVERITIES: [&str; 3] = ["off", "warn", "error"];
+        use tyc_diagnostics::ALLOWED_SEVERITIES;
         let severities = [
             ("unused-import", &self.strictness.unused_import),
             ("exhaustive-match", &self.strictness.exhaustive_match),

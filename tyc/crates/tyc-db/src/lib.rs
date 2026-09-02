@@ -1188,6 +1188,51 @@ mod tests {
         assert!(resp.methods.contains_key("json"), "Response.json modeled");
         assert!(resp.partial, "bundled shapes must be marked partial");
         assert!(shapes.contains_key("requests"), "requests stub seeded");
+
+        // `Response.url` is an `httpx.URL`, not a `str` — the stub typed it
+        // as `str`, so `resp.url.host` was rejected and
+        // `resp.url.startswith(...)` (which crashes at runtime) was accepted.
+        assert_eq!(
+            resp.fields.get("url").map(|t| format!("{t:?}")),
+            Some("Class(\"httpx.URL\")".to_owned()),
+            "Response.url must be typed as httpx.URL"
+        );
+        assert!(
+            httpx.class_shapes.contains_key("URL"),
+            "the URL class it refers to must be modeled too"
+        );
+        // httpx 0.28 removed `proxies=` and `app=`; accepting them let a
+        // call that raises `TypeError` at runtime pass `tyc check`.
+        for client in ["Client", "AsyncClient"] {
+            let shape = httpx
+                .class_shapes
+                .get(client)
+                .unwrap_or_else(|| panic!("httpx.{client} shape"));
+            for removed in ["proxies", "app"] {
+                assert!(
+                    !shape.fields.contains_key(removed),
+                    "httpx.{client} must not accept the removed `{removed}=` kwarg"
+                );
+            }
+            assert!(
+                shape.fields.contains_key("proxy"),
+                "httpx.{client} keeps the replacement `proxy=`"
+            );
+        }
+        // The exception hierarchy `raise_for_status` / a transport failure
+        // raises has to exist for `except httpx.HTTPStatusError` to check.
+        for exc in [
+            "HTTPError",
+            "HTTPStatusError",
+            "RequestError",
+            "TimeoutException",
+            "ConnectError",
+        ] {
+            assert!(
+                httpx.class_shapes.contains_key(exc),
+                "httpx.{exc} must be modeled"
+            );
+        }
     }
 
     #[test]

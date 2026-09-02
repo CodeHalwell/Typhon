@@ -65,7 +65,8 @@
         "typhon.server.path": {
           "type": "string",
           "default": "tyc",
-          "description": "Path to the `tyc` binary. Use an absolute path if `tyc` is not on PATH."
+          "scope": "machine-overridable",
+          "description": "Path to the `tyc` binary. Use an absolute path if `tyc` is not on PATH. Machine-overridable: a workspace cannot set it, so opening a cloned repository never redirects the extension at an executable that repository ships."
         },
         "typhon.server.arguments": {
           "type": "array",
@@ -75,7 +76,8 @@
           "items": {
             "type": "string"
           },
-          "description": "Arguments passed to the `tyc` binary to start the language server."
+          "scope": "machine-overridable",
+          "description": "Arguments passed to the `tyc` binary to start the language server. Machine-overridable for the same reason as `typhon.server.path` — it is part of the command line the extension executes."
         },
         "typhon.server.enable": {
           "type": "boolean",

@@ -6062,6 +6062,19 @@ mod tests {
 /// in a crate both surfaces already depend on.
 ///
 /// An empty string means "not configured" and takes the diagnostic's default.
+/// The `[strictness]` severity values `tyc check` / `tyc build` accept. A
+/// value outside this set is a hard config error on the CLI, so no surface
+/// may quietly honour one: shared here so the language server applies the
+/// same rule instead of passing an unrecognised string through.
+pub const ALLOWED_SEVERITIES: [&str; 3] = ["off", "warn", "error"];
+
+/// True when `value` is a severity the CLI would accept, or the empty
+/// string that means "not configured".
+pub fn is_valid_severity(value: &str) -> bool {
+    let v = value.trim();
+    v.is_empty() || ALLOWED_SEVERITIES.contains(&v)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SeverityOverrides {
     /// `"warn"` (default) | `"error"` | `"off"`.

@@ -2241,12 +2241,22 @@ fn read_severity_overrides(root: &std::path::Path) -> tyc_diagnostics::SeverityO
     let Some(strictness) = parsed.get("strictness").and_then(|s| s.as_table()) else {
         return out;
     };
+    // A value the CLI rejects (`"eror"`, `"WARN"`) must not be honoured
+    // here either: `tyc check` refuses to run with it, so silently taking
+    // it in the editor is exactly the CLI/LSP disagreement the severity
+    // plumbing exists to prevent. An invalid value falls back to the
+    // diagnostic's default, which is the state the project is really in
+    // until the manifest is fixed.
     let read = |key: &str| -> String {
-        strictness
+        let raw = strictness
             .get(key)
             .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_owned()
+            .unwrap_or_default();
+        if tyc_diagnostics::is_valid_severity(raw) {
+            raw.to_owned()
+        } else {
+            String::new()
+        }
     };
     out.unused_import = read("unused-import");
     out.methods_in_class_body = read("methods-in-class-body");
@@ -4278,6 +4288,36 @@ mod tests {
         assert!(overrides.unused_import.is_empty());
         assert!(overrides.nullable_use.is_empty());
         assert!(overrides.exhaustive_match.is_empty());
+    }
+
+    #[test]
+    fn read_severity_overrides_ignores_values_the_cli_rejects() {
+        // `tyc check` refuses to run with an unknown `[strictness]`
+        // severity, so the editor must not quietly honour one — otherwise a
+        // typo silences a check in the editor while CI still fails on it.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname = \"x\"\nsrc = \"src\"\n\
+             [strictness]\n\
+             unused-import = \"eror\"\n\
+             nullable-use = \"WARN\"\n\
+             require-with = \"error\"\n",
+        )
+        .unwrap();
+        let overrides = read_severity_overrides(tmp.path());
+        assert!(
+            overrides.unused_import.is_empty(),
+            "a typo must fall back to the default, not be honoured"
+        );
+        assert!(
+            overrides.nullable_use.is_empty(),
+            "severity values are case-sensitive on the CLI, so they are here too"
+        );
+        assert_eq!(
+            overrides.require_with, "error",
+            "a valid value alongside an invalid one still applies"
+        );
     }
 
     #[test]

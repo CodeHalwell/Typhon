@@ -1378,18 +1378,29 @@ pub fn run(args: BuildArgs) -> Result<()> {
         }
     }
     for (path, source) in &sources {
+        // The two scans below overlap: `from .helper import …` in a
+        // top-level module is *both* an over-deep relative import and an
+        // orphaned sibling `.py`, and reporting the same line twice reads
+        // like two separate problems. Report each import once.
+        let mut reported: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut warn_once = |snippet: String, offset: usize, length: usize| {
+            if !reported.insert(offset) {
+                return;
+            }
+            let warn = TycError::orphan_py_import(
+                snippet,
+                path.to_string_lossy().into_owned(),
+                source.clone(),
+                offset,
+                length,
+            );
+            eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn)));
+        };
         // Relative imports that escape the source root (`from ..x import …`
         // from a top-level module) crash at import — surface them here.
         if let Some(depth) = module_depth_below(path, &src_dir) {
             for (snippet, offset, length) in scan_overdeep_relative_imports(source, depth) {
-                let warn = TycError::orphan_py_import(
-                    snippet,
-                    path.to_string_lossy().into_owned(),
-                    source.clone(),
-                    offset,
-                    length,
-                );
-                eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn)));
+                warn_once(snippet, offset, length);
             }
         }
         for (module_name, snippet, offset, length) in scan_relative_py_imports(source) {
@@ -1406,14 +1417,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 walker = dir.parent();
             }
             if found_orphan_parent {
-                let warn = TycError::orphan_py_import(
-                    snippet,
-                    path.to_string_lossy().into_owned(),
-                    source.clone(),
-                    offset,
-                    length,
-                );
-                eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn)));
+                warn_once(snippet, offset, length);
             }
         }
     }
