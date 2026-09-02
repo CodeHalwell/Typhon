@@ -273,7 +273,7 @@ membership; a full `bytearray` (mutable, CPython `repr`,
 unhashable, `fromhex`) and `x in b"…"` containment; `float.hex()` /
 `as_integer_ratio()`; `str.format` `!r` / `!s` / `!a` conversions and
 `{0.attr}` / `{name[key]}` accessors; CPython's `str.center` padding
-bias; `Cls.__doc__` / `Cls.__mro__` / `fn.__type_params__`; the rest of
+bias; `Cls.__doc__` / `Cls.__mro__`; the rest of
 the builtin exception hierarchy (`BrokenPipeError`, `BlockingIOError`,
 `MemoryError`, …); `issubclass`; `str.isascii` / `isidentifier` /
 `isprintable`; the `numbers` tower on `int` / `float` (`real`, `imag`,
@@ -282,6 +282,29 @@ unbound method form of every builtin type (`str.upper(s)`,
 `dict.get(d, k)`); function objects carrying their own `__dict__`; class
 objects hashable by identity (type-keyed registries); `class X(NamedTuple)`
 being a real tuple and `class X(TypedDict)` constructing a plain `dict`.
+
+**v1.0.0-beta.1 string, bytes and reflection surface.** The character
+properties Python exposes and Rust's std does not: `isdigit` / `isdecimal` /
+`isnumeric` are three separate questions (`"²"` is a digit but not a decimal,
+`"½"` is numeric but neither), `isprintable` drives both the predicate and
+`repr()`'s escaping (a zero-width space reprs as `'\u200b'`, not invisibly),
+Python's whitespace covers `\x1c`-`\x1f` for `split` / `strip` / `isspace`,
+and `title` / `capitalize` use the *titlecase* mapping (`ǆ` → `ǅ`, `ß` →
+`Ss`) while `swapcase` takes a mapping's full expansion. All five tables are
+generated from the hosting CPython by `scripts/gen-unicode-props.py`.
+`bytes` carries CPython's whole method surface, ASCII-only, including
+`hex(sep, group)`. The printf-style operator has `%u`, `%a`, `#` on floats
+and a precision-as-digit-count on integers; `str.format`'s nested spec
+fields (`"{:{}}".format(3, 5)`) share the outer auto-numbering; the
+no-presentation-type float spec switches to an exponent one decade before
+`g` does; and `cp1252` joins the codecs. A NaN comparison answers `False`
+rather than raising, so `max(1, nan)` / `sorted([3, nan, 1])` behave.
+A class object reprs with the module its body ran in
+(`<class '__main__.User'>`); a stdlib shim's classes stay bare. PEP 695
+type parameters are real objects on `__type_params__` — `TypeVar` /
+`ParamSpec` / `TypeVarTuple` with `__name__`, `__bound__`,
+`__constraints__`, PEP 696 `__default__` and `has_default()` — and a
+non-generic function or class reports `()`.
 
 ### 2.4a Built-in builtins surface (v0.9.0 → v0.12.0 additions)
 

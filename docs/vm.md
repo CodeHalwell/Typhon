@@ -146,7 +146,7 @@ since v1.0.0-beta.1 — before that each built an opaque instance, so
 | `collections.deque` (v0.9.0) | Rides on `Value::List` via new `popleft` / `appendleft` / `extendleft` / `rotate` list methods. Graph / BFS / queue algorithms work end-to-end |
 | `heapq` (v0.9.0) | `heappush`, `heappop`, `heapify`, `heappushpop`, `heapreplace`, `nsmallest`, `nlargest` |
 | `contextlib` (v0.9.0) | `@contextmanager` identity decorator and `contextmanager`-decorated factories. `with` block honours the wrapped `__enter__` / `__exit__` shape. v1.0.0-beta.1: `@asynccontextmanager` really drives its generator (it was an identity decorator, so `async with` raised), plus `suppress`, `nullcontext`, `closing`, `redirect_stdout`, `redirect_stderr`, `ExitStack` |
-| `pydantic` (v0.9.0, expanded v0.10.0) | `BaseModel` is a placeholder so declaring a `model` doesn't `ImportError`. Since v0.10.0 `Model.model_validate(mapping)` constructs an instance from a dict, `inst.model_dump()` returns a dict of fields in declaration order, and `model_dump_json()` the JSON form — flat `model` classes are usable under `tyc run`. Nested-model validation is not type-directed yet; deeply-nested models still need `--compile` |
+| `pydantic` (v0.9.0, expanded v0.10.0 and v1.0.0-beta.1) | `BaseModel` is a placeholder so declaring a `model` doesn't `ImportError`. `Model.model_validate(mapping)` constructs an instance from a dict — annotated sub-models included, recursively, since v1.0.0-beta.1, alongside `model_validate_json` — `inst.model_dump()` returns a dict of the fields in declaration order (unwrapping nested models back to dicts, as pydantic's does), and `model_dump_json()` the JSON form. It does not *validate*: a field of the wrong type is stored as given rather than raising `ValidationError` |
 | `io` (v1.0.0-beta.1) | `open` and the file objects behind it (`TextIOWrapper`, `BufferedReader` / `BufferedWriter`, `FileIO`), `StringIO`, `BytesIO`, `SEEK_*`, `UnsupportedOperation`. Modes, encodings, newline translation, `seek` / `tell` / `truncate` / `flush`, iteration by line, and the CPython error messages for a closed or wrong-mode file |
 | `shutil` (v1.0.0-beta.1) | `copy`, `copy2`, `copyfile`, `copytree`, `move`, `rmtree`, `which`, `disk_usage`, `SameFileError` |
 | `tempfile` (v1.0.0-beta.1) | `mkdtemp`, `mkstemp`, `gettempdir`, `NamedTemporaryFile`, `TemporaryDirectory`, `TemporaryFile` |
@@ -414,8 +414,11 @@ message:
   properly since v1.0.0-beta.1 — the VM hands back the same
   materialise-on-first-use proxy the emitted runtime does, rather than
   running the initialiser at the binding.)
-- **Nested-model `pydantic.model_validate`** is not type-directed — a
-  nested dict stays a dict; deeply-nested models need `tyc build`.
+- **Pydantic *validation*.** `model_validate` builds the model — nested
+  models included, since v1.0.0-beta.1, and `model_dump` unwraps them back
+  to nested dicts — but it does not *validate*: a field of the wrong type
+  is stored as given rather than raising `ValidationError`. A program whose
+  output is pydantic's own error text needs `tyc build`.
 
 If your program needs any of these, run with `--compile` for now.
 

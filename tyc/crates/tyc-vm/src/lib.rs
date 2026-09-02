@@ -2521,6 +2521,10 @@ def main() -> None:
     let q: Person = Person.model_validate_json('{"name": "Bob", "address": null}')
     if q.name != "Bob" or q.address is not None:
         raise ValueError("model_validate_json wrong")
+    # `model_dump` unwraps the nested model again, as pydantic's does.
+    let dumped = p.model_dump()
+    if str(dumped) != "{'name': 'Ada', 'address': {'city': 'London'}, 'tags': ['x']}":
+        raise ValueError(f"model_dump should recurse, got {dumped}")
 
 main()
 "#;

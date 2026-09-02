@@ -234,6 +234,14 @@ limitation** — the sequential coroutine scheduler (3), the VM's
 non-validating pydantic stand-in (3), and one line whose value depends on
 which sort algorithm sees an all-false comparator.
 
+**Docs that had fallen behind the VM.** `model_dump` did not recurse, so a
+nested model came back as a model object where pydantic gives a nested dict;
+it does now. The VM reference and the published site still listed
+nested-model `model_validate` and `@contextmanager` bodies inside `with` as
+unsupported, both of which have worked since earlier in this cycle — the
+real remaining pydantic gap is *validation*, which the VM does not do at
+all, and that is what they say now.
+
 **A prelude name that only the VM could resolve.** `BaseModel` and
 `NewType` resolve without an import — the `model` and `newtype` lowerings
 introduce them — so naming either directly passes `tyc check`. Their

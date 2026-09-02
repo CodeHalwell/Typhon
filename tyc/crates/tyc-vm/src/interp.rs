@@ -6217,7 +6217,10 @@ impl Interpreter {
                         let fields = inst.fields.borrow();
                         for field in &inst.class.fields {
                             if let Some(v) = fields.get(&field.name) {
-                                map.insert(HashKey::Str(Rc::new(field.name.clone())), v.clone());
+                                map.insert(
+                                    HashKey::Str(Rc::new(field.name.clone())),
+                                    model_dump_value(v),
+                                );
                             }
                         }
                         let dict = Value::Dict(Rc::new(RefCell::new(map)));
@@ -8632,6 +8635,38 @@ fn decorator_simple_name(e: &Expr) -> Option<String> {
 /// *new* class, so `cls` names the pre-slots class: `type(self) is cls` never
 /// holds, and for a non-field name the `super(cls, self)` call itself fails
 /// with a TypeError — reproduced here because programs observe it.
+/// `model_dump` is recursive: a nested model becomes a nested dict, and so
+/// does one inside a list, tuple or dict, exactly as pydantic's does.
+fn model_dump_value(v: &Value) -> Value {
+    match v {
+        Value::Instance(inner) if crate::value::class_is_pydantic_model(&inner.class) => {
+            let mut map: DictMap = IndexMap::new();
+            let fields = inner.fields.borrow();
+            for field in &inner.class.fields {
+                if let Some(f) = fields.get(&field.name) {
+                    map.insert(
+                        HashKey::Str(Rc::new(field.name.clone())),
+                        model_dump_value(f),
+                    );
+                }
+            }
+            Value::Dict(Rc::new(RefCell::new(map)))
+        }
+        Value::List(items) => Value::List(Rc::new(RefCell::new(
+            items.borrow().iter().map(model_dump_value).collect(),
+        ))),
+        Value::Tuple(items) => Value::Tuple(Rc::new(items.iter().map(model_dump_value).collect())),
+        Value::Dict(d) => {
+            let mut map: DictMap = IndexMap::new();
+            for (k, item) in d.borrow().iter() {
+                map.insert(k.clone(), model_dump_value(item));
+            }
+            Value::Dict(Rc::new(RefCell::new(map)))
+        }
+        other => other.clone(),
+    }
+}
+
 pub(crate) fn frozen_dataclass_error(class: &Rc<Class>, attr: &str, verb: &str) -> Option<Unwind> {
     fn nearest_frozen(c: &Rc<Class>) -> Option<Rc<Class>> {
         if crate::value::class_is_dataclass(c)
