@@ -347,6 +347,20 @@ argv, no stdin, a traceback fixture), and every one of the remaining 26
 reproduces a limitation the beta-readiness review already lists. Nothing
 unknown was hiding there — but nothing was watching either.
 
+**`tyc::invalid_question_op` now fires where its own documentation says it
+does.** The check recognised only a `?` that followed a closing
+parenthesis, so two shapes the doc page describes fell straight through it.
+A `?` on a bare name in a function that does not return `Result` —
+`return x?`, which is the doc page's *first example* — surfaced as a
+`tyc::type_mismatch` naming a synthesised `Err[…]`. And `[x? for x in xs]`
+produced `tyc::unknown_name: cannot find 'x' in scope`, against rewritten
+text the user never wrote, which is precisely the confusion the
+comprehension carve-out exists to prevent. The validator asks the shared
+classifier now — the one the lowering itself uses to tell a propagation
+from the nullable suffix `T?` — so the check and the rewrite cannot
+disagree about a given `?`. No corpus unit changes verdict: every program
+this newly rejects was already rejected, with a worse message.
+
 **A diagnostic could be rendered against the wrong buffer.** Found by
 sweeping `tyc check` over the corpus and asking, of every diagnostic, only
 that its anchor line exist and not be blank. One unit failed

@@ -15,6 +15,15 @@ Fires in two situations:
 Since v0.9.0 the help text mentions both causes explicitly so the
 diagnostic is actionable in either situation.
 
+Which `?` counts as the propagation operator — rather than the nullable
+type suffix `T?` — is decided by the same classifier the lowering itself
+uses, so the check and the rewrite can never disagree. Earlier releases
+recognised only a `?` that followed a closing parenthesis, which left the
+first example below (a `?` on a bare name) outside the check entirely: it
+surfaced as a `tyc::type_mismatch` naming a synthesised `Err[…]` instead.
+A `?` on a bare name inside a comprehension had the same gap and produced
+a `tyc::unknown_name` against text the user never wrote.
+
 ## Example — Result-return cause
 
 ```ty

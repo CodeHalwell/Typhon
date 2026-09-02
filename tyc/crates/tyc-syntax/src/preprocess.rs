@@ -3479,8 +3479,12 @@ pub fn validate_question_ops(source: &str) -> Vec<QuestionOpError> {
     let mut in_string: Option<StringMode> = None;
     // Running byte offset of the start of the current line in `source`.
     let mut byte_offset: usize = 0;
+    // Per-line bracket / logical-head context, so the shared `?` classifier
+    // reads a continuation line the same way the lowering does.
+    let contexts = q_contexts(source);
 
     for (line_index, line) in source.split_inclusive('\n').enumerate() {
+        let line_ctx = contexts.get(line_index).copied().unwrap_or_default();
         let raw = line.trim_end_matches(['\n', '\r']);
 
         let pre_string = in_string;
@@ -3548,7 +3552,7 @@ pub fn validate_question_ops(source: &str) -> Vec<QuestionOpError> {
         // syntactic carve-out is no longer needed. Validate the same
         // scope rules as the end-of-line case (`?` only valid inside a
         // function returning `Result[T, E]`). O17 / FINDINGS #66.
-        for offset in find_mid_expression_questionmarks(code) {
+        for offset in find_mid_expression_questionmarks(code, line_ctx) {
             let q_offset = byte_offset + offset;
             // N2 (2026-05-22): `?` inside a comprehension body would lift
             // the call out to a temp *before* the comprehension's `for`
@@ -3605,8 +3609,11 @@ pub fn validate_question_ops(source: &str) -> Vec<QuestionOpError> {
         // Detect `)?` — the `?` error-propagation operator.  The same pattern
         // `expand_question_ops` uses: last code char is `?`, char before is `)`.
         // This check runs for ALL lines, including `)…` continuation lines.
-        if let Some(before_q) = code.strip_suffix('?') {
-            if before_q.ends_with(')') {
+        if !code.is_empty()
+            && code.ends_with('?')
+            && is_propagating_q(code, code.len() - 1, line_ctx)
+        {
+            {
                 // Byte offset of the `?` in the original source.
                 let q_offset = byte_offset + code.len() - 1;
                 // A trailing `)?` inside a lambda body / ternary arm / and-or
@@ -3663,7 +3670,30 @@ pub fn validate_question_ops(source: &str) -> Vec<QuestionOpError> {
 /// current desugar pass only handles end-of-statement `?`, so anything
 /// else produces a confusing parse error against the lowered Python.
 /// FINDINGS #66.
-fn find_mid_expression_questionmarks(code: &str) -> Vec<usize> {
+/// Is the `?` at byte `i` in `code` the propagation operator rather than
+/// nullable-type sugar?
+///
+/// Delegates to the classifier the lowering itself uses, so the validator
+/// and the rewrite can never disagree about a given `?`. Reading only `)?`
+/// as propagation — as this used to — left `[parse(s)? for s in xs]` and
+/// `let v: int = a?` outside the validator entirely, and the user got a
+/// `tyc::unknown_name` against rewritten text they never wrote, or a
+/// `tyc::type_mismatch` naming a synthesised `Err[…]`, instead of the
+/// targeted message that already exists for both.
+fn is_propagating_q(code: &str, i: usize, ctx: QContext<'_>) -> bool {
+    let bytes = code.as_bytes();
+    let prev = bytes[i - 1];
+    if prev == b')' {
+        return true;
+    }
+    if !(prev == b']' || is_ident_byte(prev)) {
+        return false;
+    }
+    let mask = compute_in_string_mask(code);
+    !question_is_type_position(code, i, &mask, ctx) && operand_start(code, i).is_some()
+}
+
+fn find_mid_expression_questionmarks(code: &str, ctx: QContext<'_>) -> Vec<usize> {
     let mut out = Vec::new();
     let bytes = code.as_bytes();
     let trimmed_end = code.trim_end_matches([' ', '\t']).len();
@@ -3716,7 +3746,7 @@ fn find_mid_expression_questionmarks(code: &str) -> Vec<usize> {
             i += 1;
             continue;
         }
-        if b == b'?' && i > 0 && bytes[i - 1] == b')' {
+        if b == b'?' && i > 0 && is_propagating_q(code, i, ctx) {
             // Inside a single-line `with`-chain, `)?,` and `)?:` are
             // binding terminators handled by `expand_with_chains`.
             if is_with_chain_line
@@ -12993,11 +13023,53 @@ def f() -> None:
 
     #[test]
     fn question_op_nullable_sugar_not_flagged() {
-        // `str?` ends with `?` but the char before is `r`, not `)`, so it is
-        // type-sugar, not the propagation operator.
-        let src = "val x: str? = None\n";
-        let errs = validate_question_ops(src);
-        assert!(errs.is_empty(), "nullable sugar must not be flagged");
+        // `str?` ends with `?` but it closes an annotation, so it is
+        // type-sugar rather than the propagation operator. The validator
+        // asks the same classifier the lowering does, so the two can never
+        // disagree about which of the two a given `?` is.
+        for src in [
+            "let x: str? = None\n",
+            "mut x: str? = None\n",
+            "type Maybe = int?\n",
+            "class C:\n    tag: str?\n",
+            "def f(\n    a: int? = None, b: int? = None\n) -> None:\n    pass\n",
+            "from typing import Callable\ntype P = Callable[\n    [str, int?], int\n]\n",
+        ] {
+            let errs = validate_question_ops(src);
+            assert!(
+                errs.is_empty(),
+                "nullable sugar must not be flagged in {src:?}: {:?}",
+                errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn question_op_on_a_bare_name_is_validated_too() {
+        // Reading only `)?` as the propagation operator left two shapes
+        // outside the validator entirely, and the user got a confusing
+        // downstream error instead of the targeted message that already
+        // existed: a `?` on a bare name in a function that does not return
+        // `Result` (which surfaced as a `type_mismatch` naming a
+        // synthesised `Err[…]`), and a `?` inside a comprehension (a
+        // `tyc::unknown_name` against rewritten text they never wrote).
+        let bare = validate_question_ops(
+            "def f(a: Result[int, str]) -> int:\n    let v: int = a?\n    return v\n",
+        );
+        assert_eq!(bare.len(), 1, "{bare:?}");
+        assert!(bare[0].message.contains("returning `int`"), "{bare:?}");
+
+        let comp = validate_question_ops(
+            "def f(xs: list[Result[int, str]]) -> Result[list[int], str]:\n    return Ok([x? for x in xs])\n",
+        );
+        assert_eq!(comp.len(), 1, "{comp:?}");
+        assert!(comp[0].message.contains("comprehension"), "{comp:?}");
+
+        // A propagation in a function that DOES return Result stays clean.
+        let ok = validate_question_ops(
+            "def f(a: Result[int, str]) -> Result[int, str]:\n    let v: int = a?\n    return Ok(v)\n",
+        );
+        assert!(ok.is_empty(), "{ok:?}");
     }
 
     #[test]
