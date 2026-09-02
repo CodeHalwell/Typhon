@@ -564,6 +564,7 @@ pub fn run(args: CheckArgs) -> Result<()> {
                 no_sync: true,
                 with_ty: true,
                 optimise: false,
+                source_label: None,
             })?;
         }
     }

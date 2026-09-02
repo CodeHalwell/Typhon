@@ -81,6 +81,13 @@ pub struct BuildArgs {
     /// so `-O` never overrides a knob you set by hand.
     #[arg(short = 'O', long = "optimise", visible_alias = "optimize")]
     pub optimise: bool,
+
+    /// Report diagnostics under this name instead of the file they came
+    /// from. `tyc run --compile <file>` stages the script into a temp
+    /// scaffold, so without it the user is pointed at
+    /// `/tmp/tyc-script-…/src/main.ty` rather than their own file.
+    #[arg(skip)]
+    pub source_label: Option<String>,
 }
 
 pub fn run(args: BuildArgs) -> Result<()> {
@@ -431,7 +438,10 @@ pub fn run(args: BuildArgs) -> Result<()> {
     }
 
     // Apply strictness rules (e.g. promote unused-import warnings to errors).
-    let all_phase1_diags = apply_strictness(all_phase1_diags, &config);
+    let mut all_phase1_diags = apply_strictness(all_phase1_diags, &config);
+    if let Some(label) = &args.source_label {
+        all_phase1_diags.rename_source(label);
+    }
 
     // Emit warnings even when there are no errors so they are always visible.
     for warn in all_phase1_diags.warnings() {
@@ -1286,13 +1296,21 @@ pub fn run(args: BuildArgs) -> Result<()> {
             .join(".sourcemaps")
             .join(rel)
             .with_extension("py.map");
-        let source_rel = escape_json_path(
-            &path
+        // The remapper joins this with the source root, so the *absolute*
+        // form of a `source_label` (a script staged by `tyc run --compile
+        // <file>`) wins outright and the traceback names the user's own
+        // file rather than the scaffold's copy of it.
+        let source_rel = escape_json_path(&match &args.source_label {
+            Some(label) => std::path::Path::new(label)
+                .canonicalize()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| label.clone()),
+            None => path
                 .strip_prefix(&src_dir)
                 .unwrap_or(path)
                 .display()
                 .to_string(),
-        );
+        });
         let map_body = build_source_map_v2(
             &source_rel,
             &prep.python_source,
@@ -4280,6 +4298,7 @@ mod tests {
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .expect("build must succeed despite the stdlib-shadow warning");
         assert!(
@@ -4300,6 +4319,7 @@ mod tests {
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         assert!(
@@ -4321,6 +4341,7 @@ mod tests {
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         assert!(
@@ -4341,6 +4362,7 @@ mod tests {
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         });
         assert!(result.is_err(), "build should fail on type mismatch");
     }
@@ -4384,6 +4406,7 @@ mod tests {
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let init_py =
@@ -4432,6 +4455,7 @@ mod tests {
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4457,6 +4481,7 @@ mod tests {
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         // Phase 3 made `typhon_runtime` a package (with submodules `tasks`
@@ -4503,6 +4528,7 @@ async def load(id: int) -> None:
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4537,6 +4563,7 @@ let result: int = 3 |> double |> inc
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4566,6 +4593,7 @@ let result: int = 3 |> double |> inc
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4632,6 +4660,7 @@ class Foo:
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4659,6 +4688,7 @@ class Foo:
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4720,6 +4750,7 @@ def area(s: Shape) -> float:
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4755,6 +4786,7 @@ def area(s: Shape) -> float:
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         });
         // Verify the failure is specifically a type-checking error, not a
         // configuration or I/O error, by checking the returned error message.
@@ -4783,6 +4815,7 @@ def fib(n: int) -> int:
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4819,6 +4852,7 @@ let pet: Animal = Dog(name=\"Rex\")
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         });
         // Verify the failure is specifically a type-checking error (structural
         // conformance failure), not a configuration or I/O error.
@@ -4850,6 +4884,7 @@ def hot(n: int) -> int:
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4883,6 +4918,7 @@ def cold(n: int) -> int:
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4924,6 +4960,7 @@ def cold(n: int) -> int:
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4959,6 +4996,7 @@ async def load() -> int:
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -4995,6 +5033,7 @@ async def load() -> int:
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -5033,6 +5072,7 @@ async def load() -> int:
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -5077,6 +5117,7 @@ async def load() -> int:
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -5143,6 +5184,7 @@ async def load(uid: int) -> int:
             no_sync: true,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -5186,6 +5228,7 @@ async def load(uid: int) -> int:
             no_sync: true,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -5245,6 +5288,7 @@ async def load(uid: int) -> int:
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let map_path = out_dir.join(".sourcemaps").join("main.py.map");
@@ -5294,6 +5338,7 @@ let pet: Animal = Dog(name=\"Rex\")
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -5323,6 +5368,7 @@ let pet: Animal = Dog(name=\"Rex\")
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         assert!(
@@ -5360,6 +5406,7 @@ let pet: Animal = Dog(name=\"Rex\")
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         assert!(
@@ -5386,6 +5433,7 @@ let pet: Animal = Dog(name=\"Rex\")
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         assert!(
@@ -5413,6 +5461,7 @@ let pet: Animal = Dog(name=\"Rex\")
             no_sync: true,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         assert!(
@@ -5441,6 +5490,7 @@ let pet: Animal = Dog(name=\"Rex\")
             no_sync: true,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .expect_err("a symlinked destination must fail the build");
         assert!(
@@ -5471,6 +5521,7 @@ let pet: Animal = Dog(name=\"Rex\")
             no_sync: true,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .expect_err("an escaping output directory must fail the build");
         assert!(
@@ -5495,6 +5546,7 @@ let pet: Animal = Dog(name=\"Rex\")
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         })
         .unwrap();
         assert!(!out_dir.join("main.py").exists());
@@ -5513,6 +5565,7 @@ let pet: Animal = Dog(name=\"Rex\")
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         });
         assert!(
             result.is_err(),
@@ -5553,6 +5606,7 @@ let pet: Animal = Dog(name=\"Rex\")
             no_sync: false,
             with_ty: false,
             optimise: false,
+            source_label: None,
         });
         std::env::remove_var("FAKE_API_KEY");
         assert!(

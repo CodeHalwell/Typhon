@@ -112,6 +112,7 @@ pub fn run(args: RunArgs) -> Result<()> {
     // this shape outright; the scaffold makes it just work.
     let mut _scaffold_guard: Option<TempDir> = None;
     let mut scaffold_no_sync = false;
+    let mut source_label: Option<String> = None;
     if args.path.is_file() {
         if args.no_build {
             return Err(miette!(
@@ -137,13 +138,20 @@ pub fn run(args: RunArgs) -> Result<()> {
             .and_then(|n| n.to_str())
             .unwrap_or("script")
             .replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '_', "-");
+        // `traceback-remap` is default-off for projects (it costs an import
+        // in the entry module), but a staged script has no build directory
+        // the user can inspect: without it an uncaught exception's traceback
+        // names `/tmp/tyc-script-…/build/main.py` lines they cannot read.
         std::fs::write(
             scaffold.path().join("typhon.toml"),
             format!(
-                "[project]\nname = \"{name}\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"build\"\n\n[python]\ntarget = \"3.13\"\n"
+                "[project]\nname = \"{name}\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"build\"\n\n[python]\ntarget = \"3.13\"\n\n[emit]\ntraceback-remap = true\n"
             ),
         )
         .map_err(|e| miette!("cannot write temp typhon.toml: {e}"))?;
+        // Diagnostics from the build must name the file the user ran, not
+        // the staged copy inside the scaffold.
+        source_label = Some(args.path.display().to_string());
         args.path = scaffold.path().to_path_buf();
         args.temp = true;
         scaffold_no_sync = true;
@@ -206,6 +214,7 @@ pub fn run(args: RunArgs) -> Result<()> {
             no_sync: scaffold_no_sync,
             with_ty: false,
             optimise: false,
+            source_label: source_label.clone(),
         })?;
     }
 

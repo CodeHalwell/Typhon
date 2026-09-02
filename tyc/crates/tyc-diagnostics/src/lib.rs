@@ -3951,6 +3951,19 @@ impl Diagnostics {
         }
     }
 
+    /// Report every diagnostic under `name` instead of the file it was
+    /// produced from. `tyc run --compile <file>` stages the script into a
+    /// temp scaffold, so without this the user is pointed at
+    /// `/tmp/tyc-script-…/src/main.ty` rather than their own file.
+    pub fn rename_source(&mut self, name: &str) {
+        for err in self.errors.iter_mut().chain(self.warnings.iter_mut()) {
+            let Some((src, _)) = err.source_and_span_mut() else {
+                continue;
+            };
+            *src = NamedSource::new(name, src.inner().clone());
+        }
+    }
+
     pub fn warnings(&self) -> &[TycError] {
         &self.warnings
     }

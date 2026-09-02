@@ -126,6 +126,14 @@ formats its components with the spec (`f"{1+2j:.1f}"` → `1.0+2.0j`).
 **The
 differential baseline falls from 167 entries to 14.**
 
+**A staged script is reported as the script.** `tyc run --compile <file>`
+(and the automatic fallback, which now fires whenever a program imports
+something the VM does not model) stages the source into a temp project, so
+every diagnostic named `/tmp/tyc-script-…/src/main.ty` and every traceback
+named `/tmp/tyc-script-…/build/main.py`. Diagnostics now carry the path
+the user gave, and the scaffold enables `traceback-remap`, so an uncaught
+exception points at the user's own `.ty` file and lines.
+
 **Checking a module is linear in its definitions again.** Every branch,
 `try` and loop clones the whole `TypeEnv`, and each clone deep-copied every
 binding in every scope, so a module was quadratic in its top-level

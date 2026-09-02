@@ -428,11 +428,13 @@ with every gate green at each step.
   `typevar_default`'s PEP 696 `__default__`, and `b_prelude`, where the
   VM resolves prelude names CPython raises `NameError` for). None of them
   is a *silent* wrong answer on the compiled path — they are VM-only.
-- **`tyc run --compile <file>` diagnostics name the scaffold.** The
-  single-file compile path stages the source into a temp project, so a
-  diagnostic from the build reports `/tmp/tyc-script-…/src/main.ty` rather
-  than the file the user named. Cosmetic, pre-existing, and now more
-  visible because the automatic fallback uses that path.
+- ~~**`tyc run --compile <file>` diagnostics name the scaffold.**~~ Closed:
+  the staged build reports diagnostics under the path the user gave, and
+  the scaffold turns on `traceback-remap`, so an uncaught exception's
+  traceback names the user's own `.ty` file and lines too (rather than
+  `/tmp/tyc-script-…/build/main.py`). A script with no
+  `if __name__ == "__main__":` guard still shows the emitted Python — the
+  remapper hooks that block, as `docs/configuration.md` says.
 - **The open type-system frontier** in `TYPE_SYSTEM_FRONTIER.md`
   (embedded `ty` Phase 2, accumulator-loop parallelisation) is unchanged
   and remains post-beta.

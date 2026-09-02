@@ -1100,6 +1100,32 @@ fn build_flattens_relative_imports_in_a_flat_source_root() {
     );
 }
 
+/// `tyc run --compile <file>` stages the script into a temp scaffold, so
+/// without a label the user is pointed at `/tmp/tyc-script-…/src/main.ty`
+/// for a diagnostic in a file they can see right there.
+#[test]
+fn single_file_compile_reports_the_user_s_own_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = tmp.path().join("scriptish.ty");
+    std::fs::write(&script, "let x: int = \"not an int\"\n").unwrap();
+    let out = tyc()
+        .arg("run")
+        .arg("--compile")
+        .arg("--temp")
+        .arg(&script)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("scriptish.ty"),
+        "diagnostics should name the script, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("tyc-script-"),
+        "the temp scaffold path must not leak into diagnostics:\n{stderr}"
+    );
+}
+
 #[test]
 fn build_fails_on_type_error() {
     let tmp = tempfile::tempdir().unwrap();
