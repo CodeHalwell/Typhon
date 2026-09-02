@@ -57,7 +57,10 @@ def mkstemp(suffix=None, prefix=None, dir=None, text=False):
         name = _random_name()
         file = os.path.join(dir, prefix + name + suffix)
         try:
-            _fs_write(file, b"", "x")
+            # 0600 at creation, as CPython's `mkstemp` guarantees — a
+            # create-then-chmod would leave the file world-readable for a
+            # moment, and under a 022 umask it stayed 0644 outright.
+            _fs_write(file, b"", "x", 0o600)
         except FileExistsError:
             continue
         return os._register_fd(file), os.path.abspath(file)
@@ -148,7 +151,8 @@ def NamedTemporaryFile(mode="w+b", buffering=-1, encoding=None, newline=None, su
             continue
         break
     file = os.path.abspath(file)
-    _fs_write(file, b"", "x")
+    # Owner-only, like `mkstemp` above and like CPython.
+    _fs_write(file, b"", "x", 0o600)
     f = open(file, mode, buffering, encoding, errors, newline)
     return _TemporaryFileWrapper(f, file, delete, delete_on_close)
 

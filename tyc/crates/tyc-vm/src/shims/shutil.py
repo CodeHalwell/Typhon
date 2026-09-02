@@ -96,7 +96,13 @@ def copytree(src, dst, symlinks=False, ignore=None, copy_function=copy2, ignore_
         srcname = os.path.join(src, name)
         dstname = os.path.join(dst, name)
         try:
-            if os.path.isdir(srcname):
+            # A symlink is recreated, not followed, when `symlinks=True` —
+            # `os.path.isdir` resolves the link, so a link to a directory
+            # was copied through, dragging in files from outside the tree
+            # (and recursing forever on a cycle).
+            if symlinks and os.path.islink(srcname):
+                os.symlink(os.readlink(srcname), dstname)
+            elif os.path.isdir(srcname):
                 copytree(srcname, dstname, symlinks, ignore, copy_function, ignore_dangling_symlinks, dirs_exist_ok)
             else:
                 copy_function(srcname, dstname)

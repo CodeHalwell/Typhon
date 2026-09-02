@@ -2608,7 +2608,10 @@ main()
     #[test]
     fn vm_access_truncate_and_utf16_error_handlers() {
         let src = r#"
+import base64
 import os
+import shutil
+import tempfile
 
 def main() -> None:
     let d: str = "/tmp/zz_vm_access_probe"
@@ -2638,6 +2641,30 @@ def main() -> None:
         raise ValueError("replace handler wrong")
     if bad.decode("utf-16-le", "backslashreplace") != "\\x00\\xd8A":
         raise ValueError("backslashreplace handler wrong")
+
+    # `mkstemp` / `NamedTemporaryFile` are owner-only at creation, `base64`
+    # honours `validate=`, and `copytree(symlinks=True)` recreates a link
+    # rather than copying through it.
+    let fd_path = tempfile.mkstemp()
+    os.close(fd_path[0])
+    if os.stat(fd_path[1]).st_mode & 0o777 != 0o600:
+        raise ValueError("mkstemp should be 0600")
+    if base64.b64decode(b"YWJj====") != b"abc":
+        raise ValueError("lax base64 should ignore excess padding")
+    for bad_b64 in [b"YWJj====", b"YW!j"]:
+        try:
+            let _ = base64.b64decode(bad_b64, validate=True)
+            raise ValueError("validate=True should reject it")
+        except ValueError as e:
+            if type(e).__name__ != "Error":
+                raise ValueError(f"expected binascii.Error, got {type(e).__name__}")
+    let tree: str = tempfile.mkdtemp()
+    os.makedirs(tree + "/src/inner", exist_ok=True)
+    os.makedirs(tree + "/outside", exist_ok=True)
+    os.symlink(tree + "/outside", tree + "/src/link")
+    shutil.copytree(tree + "/src", tree + "/dst", symlinks=True)
+    if not os.path.islink(tree + "/dst/link"):
+        raise ValueError("copytree(symlinks=True) must recreate the link")
     try:
         let _ = bad.decode("utf-16-le")
         raise ValueError("strict should raise")

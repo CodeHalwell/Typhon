@@ -4073,7 +4073,19 @@ fn fs_natives() -> Vec<(&'static str, Value)> {
                         .append(true)
                         .open(&path)
                         .and_then(|mut f| f.write_all(&data)),
-                    "x" => std::fs::File::create_new(&path).and_then(|mut f| f.write_all(&data)),
+                    // `x` is exclusive *create*. A private mode may be
+                    // requested (`tempfile` guarantees 0600); setting it in
+                    // the open avoids the window a create-then-chmod leaves.
+                    "x" => {
+                        let mut opts = std::fs::OpenOptions::new();
+                        opts.write(true).create_new(true);
+                        #[cfg(unix)]
+                        if let Some(mode) = args.get(3).and_then(|v| v.to_int().ok()) {
+                            use std::os::unix::fs::OpenOptionsExt;
+                            opts.mode(mode as u32);
+                        }
+                        opts.open(&path).and_then(|mut f| f.write_all(&data))
+                    }
                     _ => std::fs::write(&path, &data),
                 };
                 result.map_err(|e| fs_unwind(&display, e))?;

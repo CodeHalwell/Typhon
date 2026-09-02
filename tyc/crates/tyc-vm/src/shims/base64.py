@@ -1,5 +1,11 @@
 # `base64` — the RFC 4648 encodings over `bytes`.
 
+
+class Error(ValueError):
+    """What CPython's `base64` raises: `binascii.Error`, a `ValueError`
+    subclass, so `except ValueError` catches it either way."""
+
+
 _B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 _B64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 _B32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
@@ -42,13 +48,23 @@ def _encode(data, alphabet, pad):
     return "".join(out).encode("ascii")
 
 
-def _decode(data, alphabet):
+def _decode(data, alphabet, validate=False):
     if isinstance(data, bytes):
         data = data.decode("ascii")
-    data = data.replace("\n", "").replace("\r", "")
+    if validate:
+        # Strict mode rejects what the permissive default discards: any
+        # character outside the alphabet, and padding beyond the two `=`
+        # a final quantum can carry.
+        for ch in data:
+            if ch not in alphabet and ch != "=":
+                raise Error("Only base64 data is allowed")
+        if data.count("=") > 2 or ("=" in data and not data.endswith("=")):
+            raise Error("Excess padding not allowed")
+    else:
+        data = data.replace("\n", "").replace("\r", "")
     stripped = data.rstrip("=")
     if (len(data) % 4) != 0:
-        raise ValueError("Invalid base64-encoded string")
+        raise Error("Invalid base64-encoded string: number of data characters (%d) cannot be 1 more than a multiple of 4" % len(stripped))
     index = {}
     i = 0
     for ch in alphabet:
@@ -59,7 +75,7 @@ def _decode(data, alphabet):
     out = []
     for ch in stripped:
         if ch not in index:
-            raise ValueError("Invalid base64-encoded string")
+            raise Error("Invalid base64-encoded string")
         bits = (bits << 6) | index[ch]
         nbits += 6
         if nbits >= 8:
@@ -83,7 +99,7 @@ def b64decode(s, altchars=None, validate=False):
             s = s.replace(altchars[0:1], b"+").replace(altchars[1:2], b"/")
         else:
             s = s.replace(chr(altchars[0]), "+").replace(chr(altchars[1]), "/")
-    return _decode(s, _B64)
+    return _decode(s, _B64, validate)
 
 
 def urlsafe_b64encode(s):
