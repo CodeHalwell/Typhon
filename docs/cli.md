@@ -71,7 +71,13 @@ Python environment for the project:
 
 The intent is that `tyc build` followed by `python build/main.py` works
 out of the box on a freshly cloned project, no separate `tyc sync`
-step required.
+step required. That holds for a flat source root even when its modules
+import each other with `from .sibling import x`: the emitted `build/`
+directory is not a package, so those imports are emitted absolute
+(`from sibling import x`), which is what `python build/main.py` — where
+`build/` is `sys.path[0]` — resolves. A source root that *is* a package
+(it has an `__init__.ty`) keeps its relative imports and is run as a
+module instead; see the multi-file note under `tyc run` below.
 
 | Flag | Effect |
 |------|--------|

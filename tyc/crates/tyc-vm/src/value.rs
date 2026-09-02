@@ -759,6 +759,43 @@ pub fn slice_repr(items: &[Value]) -> String {
 /// members genuine `str` / `int` subclasses, so equality, ordering,
 /// hashing, and `str()` all flow through the value; plain `Enum` members
 /// intentionally return `None` here (`Color.RED == 1` is False).
+/// Whether `class` is a plain `enum.Flag` subclass — one whose members
+/// combine into composite pseudo-members under `|` / `&` / `^` / `~` but,
+/// unlike `IntFlag`, are *not* ints. `IntFlag` deliberately answers `false`
+/// here: its members already flow through their int mixin.
+pub fn is_plain_flag_class(class: &Rc<Class>) -> bool {
+    fn marker(class: &Rc<Class>) -> Option<&'static str> {
+        if class
+            .class_attrs
+            .borrow()
+            .contains_key("__typhon_enum_base__")
+        {
+            return match class.name.as_str() {
+                "Flag" => Some("Flag"),
+                "IntFlag" => Some("IntFlag"),
+                _ => None,
+            };
+        }
+        class.bases.iter().find_map(marker)
+    }
+    marker(class) == Some("Flag")
+}
+
+/// The integer a `Flag` member carries, if it is one.
+pub fn flag_member_bits(v: &Value) -> Option<i64> {
+    let Value::Instance(inst) = v else {
+        return None;
+    };
+    if !is_plain_flag_class(&inst.class) {
+        return None;
+    }
+    match inst.fields.borrow().get("_value_") {
+        Some(Value::Int(i)) => i.to_i64(),
+        Some(Value::Bool(b)) => Some(i64::from(*b)),
+        _ => None,
+    }
+}
+
 pub fn enum_mixin_value(v: &Value) -> Option<Value> {
     fn mixin_base(class: &Rc<Class>) -> bool {
         let is_marker = class

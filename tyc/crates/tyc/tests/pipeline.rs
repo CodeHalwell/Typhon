@@ -1070,6 +1070,36 @@ fn build_produces_py_file_from_simple_source() {
     );
 }
 
+/// A flat source root is not a package, so a sibling import emits as
+/// absolute: `python build/main.py` puts `build/` on `sys.path`, and the
+/// relative form would fail there with "attempted relative import with no
+/// known parent package" — while the VM resolves it, splitting the two
+/// surfaces on a layout `tyc check` accepts.
+#[test]
+fn build_flattens_relative_imports_in_a_flat_source_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "from .models import Point\n\ndef main() -> None:\n    print(Point(x=1, y=2))\n\nmain()\n",
+    );
+    std::fs::write(
+        tmp.path().join("src").join("models.ty"),
+        "pub class Point:\n    x: int\n    y: int\n",
+    )
+    .unwrap();
+    let status = tyc().arg("build").arg(tmp.path()).status().unwrap();
+    assert!(status.success(), "tyc build should succeed");
+    let emitted = std::fs::read_to_string(tmp.path().join("build").join("main.py")).unwrap();
+    assert!(
+        emitted.contains("from models import Point"),
+        "sibling import should emit absolute, got:\n{emitted}"
+    );
+    assert!(
+        !emitted.contains("from .models"),
+        "the relative form must not survive:\n{emitted}"
+    );
+}
+
 #[test]
 fn build_fails_on_type_error() {
     let tmp = tempfile::tempdir().unwrap();

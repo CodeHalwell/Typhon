@@ -225,6 +225,10 @@ pub fn run(args: BuildArgs) -> Result<()> {
         ));
     }
 
+    // Whether the source root is itself a Python package. A package root
+    // emits an `__init__.py` and is run as a module (`python -m pkg.main`),
+    // so its modules keep their relative imports; a flat root does not.
+    let src_root_is_package = src_dir.join("__init__.ty").exists();
     let ty_files = collect_ty_files(&src_dir)?;
 
     if ty_files.is_empty() {
@@ -1116,7 +1120,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             line_byte_starts(&prep.python_source, &prep.frozen_class_lines);
         let plain_class_line_starts =
             line_byte_starts(&prep.python_source, &prep.plain_class_lines);
-        let desugar_output = desugar_module_with(
+        let mut desugar_output = desugar_module_with(
             &module,
             DesugarOptions {
                 memoise_functions: memoise_targets,
@@ -1139,6 +1143,18 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // lower PEP 695 syntax for targets < 3.12 (FINDINGS #47).
         // Anything we can't parse falls back to `0` (no lowering),
         // matching the previous default.
+        // A module sitting directly in a *non-package* source root emits
+        // `from models import X`, not `from .models import X`. The build
+        // directory is what `python build/main.py` (and `tyc run --compile`)
+        // puts on `sys.path`, so the relative form fails there with
+        // "attempted relative import with no known parent package" — while
+        // the VM resolves it fine, which split the two surfaces on a layout
+        // `tyc check` accepts. A source root that *is* a package (it has an
+        // `__init__.ty`) emits an `__init__.py` and is run as a package, so
+        // its relative imports stay.
+        if !src_root_is_package && path.parent() == Some(src_dir.as_path()) {
+            flatten_root_relative_imports(&mut desugar_output.module.body);
+        }
         let target_minor = parse_python_minor(&config.python.target);
         // Pass the preprocessed source so the printer can recover
         // stylistic choices the AST collapses — currently the bracket
@@ -1917,6 +1933,51 @@ fn replace_line(source: &str, line_idx: usize, replacement: &str) -> String {
 }
 
 /// Compute the effective public surface of a package directory.
+/// Rewrite `from .sibling import X` to `from sibling import X` throughout a
+/// statement list (recursing into every nested body). Only the single-dot
+/// form with a named module is touched: `from . import x` and any deeper
+/// `..` form addresses a package this layout does not have.
+fn flatten_root_relative_imports(body: &mut [ruff_python_ast::Stmt]) {
+    use ruff_python_ast::Stmt;
+    for stmt in body.iter_mut() {
+        match stmt {
+            Stmt::ImportFrom(i) if i.level == 1 && i.module.is_some() => i.level = 0,
+            Stmt::FunctionDef(f) => flatten_root_relative_imports(&mut f.body),
+            Stmt::ClassDef(c) => flatten_root_relative_imports(&mut c.body),
+            Stmt::If(i) => {
+                flatten_root_relative_imports(&mut i.body);
+                for clause in i.elif_else_clauses.iter_mut() {
+                    flatten_root_relative_imports(&mut clause.body);
+                }
+            }
+            Stmt::For(f) => {
+                flatten_root_relative_imports(&mut f.body);
+                flatten_root_relative_imports(&mut f.orelse);
+            }
+            Stmt::While(w) => {
+                flatten_root_relative_imports(&mut w.body);
+                flatten_root_relative_imports(&mut w.orelse);
+            }
+            Stmt::With(w) => flatten_root_relative_imports(&mut w.body),
+            Stmt::Try(t) => {
+                flatten_root_relative_imports(&mut t.body);
+                flatten_root_relative_imports(&mut t.orelse);
+                flatten_root_relative_imports(&mut t.finalbody);
+                for handler in t.handlers.iter_mut() {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = handler;
+                    flatten_root_relative_imports(&mut h.body);
+                }
+            }
+            Stmt::Match(m) => {
+                for case in m.cases.iter_mut() {
+                    flatten_root_relative_imports(&mut case.body);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Walks `__init__.ty`'s top-level `pub` names, then — if that
 /// `__init__.ty` itself contains a `pub *` marker — recurses into
 /// every direct sub-package and direct .ty sibling at one level

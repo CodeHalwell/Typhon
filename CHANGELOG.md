@@ -105,8 +105,16 @@ seventeen dunders the emitted runtime already had. `tyc run`'s
 unmodelled-import scan also ran the wrong preprocessing chain, so a file
 using `as!`, `?`, `|>` or `gather:` failed to parse there and was skipped
 — silently disabling the fall-back-to-CPython guarantee for exactly the
-programs most likely to need it. **The
-differential baseline falls from 167 entries to 19.**
+programs most likely to need it. An eighth wave took the last of the
+cross-surface splits: a flat source root's `from .sibling import x` now
+emits absolute, because `build/` is not a package and `python
+build/main.py` (and `tyc run --compile`) died on the relative form while
+the VM resolved it fine — a multi-file layout `tyc check` accepts could
+not be run at all after building. Alongside it, a plain `enum.Flag`
+combines into the composite pseudo-members CPython synthesises and
+`auto()` in a flag enum numbers by bit, `model_validate` builds nested
+models from nested mappings (and `model_validate_json` exists). **The
+differential baseline falls from 167 entries to 15.**
 
 **Checking a module is linear in its definitions again.** Every branch,
 `try` and loop clones the whole `TypeEnv`, and each clone deep-copied every
@@ -528,7 +536,7 @@ additive on correct programs except the one marked **narrowing**.
 
 Everything that review deferred is closed by the beta wave above, except
 the VM's eager generator expressions and the thin `re` shim, which remain
-in `scripts/differential-baseline.txt` — the 19 entries there are the
+in `scripts/differential-baseline.txt` — the 15 entries there are the
 honest list of what the VM still gets wrong, and each one is a bug.
 
 ## 1.0.0-alpha.9 — 2026-08-21 — maintenance: secret-name lint expansion, allocation reductions & dependency wave

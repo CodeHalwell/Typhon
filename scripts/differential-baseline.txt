@@ -30,14 +30,10 @@
 # Generated 2026-09-02 against tyc 1.0.0-alpha.9
 # Scope: all
 #
-examples/17-file-io-json/json_files.ty
 stress/round-2026-05-20-exploration/04-ai-llm/05-llm-structured-out.ty
 stress/round-2026-05-20-exploration/05-agents/02-multi-agent.ty
 stress/round-2026-05-21/04-ai-llm/04-structured-output.ty
 stress/round-2026-05-22/04-ai-llm/02-structured-output-validation.ty
-stress/round-2026-06-16/mfproj/
-stress/round-2026-06-16/repros/w02_pydantic_validate.ty
-stress/round-2026-06-21/repros/107-flag-enums.ty
 stress/round-2026-09-01/analyse/b_prelude.ty
 stress/round-2026-09-01/emit/typevar_default.ty
 stress/round-2026-09-01/vm/p1.ty

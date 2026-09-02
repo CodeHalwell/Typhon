@@ -10153,6 +10153,18 @@ pub fn json_decode_error(msg: &str, doc: &str, pos: usize) -> Unwind {
     Unwind::Exception(crate::error::VmException::new("JSONDecodeError", full).with_value(inst))
 }
 
+/// `json.loads` over a `Value` argument, for callers outside this module.
+pub(crate) fn json_loads_value(_interp: &mut Interpreter, raw: &Value) -> Result<Value, Unwind> {
+    match raw {
+        Value::Str(s) => json_loads(s),
+        Value::Bytes(b) => json_loads(&String::from_utf8_lossy(b)),
+        other => Err(type_error(format!(
+            "the JSON object must be str, bytes or bytearray, not {}",
+            other.type_display_name()
+        ))),
+    }
+}
+
 fn json_loads(s: &str) -> Result<Value, Unwind> {
     let mut p = JsonParser {
         doc: s,

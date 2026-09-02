@@ -2349,6 +2349,102 @@ impl Interpreter {
         ))))
     }
 
+    /// Coerce a raw (JSON-shaped) value to a declared field type the way
+    /// pydantic's `model_validate` does: a mapping for a model-typed field
+    /// becomes that model, recursively, and a list of mappings becomes a
+    /// list of them. Anything the annotation does not name a model for is
+    /// passed through untouched — the VM does not otherwise validate.
+    fn coerce_model_field(&mut self, annotation: &str, value: Value) -> Result<Value, Unwind> {
+        let ann = strip_optional_annotation(annotation);
+        // `list[Model]` / `Model[]`-shaped containers coerce element-wise.
+        if let Some(inner) = ann
+            .strip_prefix("list[")
+            .or_else(|| ann.strip_prefix("List["))
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            if let Value::List(items) = &value {
+                let raw = items.borrow().clone();
+                let mut out = Vec::with_capacity(raw.len());
+                for item in raw {
+                    out.push(self.coerce_model_field(inner, item)?);
+                }
+                return Ok(Value::List(Rc::new(RefCell::new(out))));
+            }
+            return Ok(value);
+        }
+        let Value::Dict(_) = &value else {
+            return Ok(value);
+        };
+        // The annotation has to name a model class in scope for this to be
+        // a model field at all.
+        let Some(Value::Class(target)) = self.root.get(ann) else {
+            return Ok(value);
+        };
+        if target.fields.is_empty() && !crate::value::class_is_pydantic_model(&target) {
+            return Ok(value);
+        }
+        let validate = self.get_attr(&Value::Class(target), "model_validate")?;
+        self.call_value(validate, vec![value], &[])
+    }
+
+    /// The `Flag` member for a bit pattern: the declared member when one
+    /// matches exactly, otherwise the composite pseudo-member CPython
+    /// synthesises — `.name` is the set bits' names joined with `|`
+    /// (`None` when no bit is set), and `repr` is `<Style.BOLD|UNDERLINE: 5>`.
+    fn flag_member_for(class: &Rc<Class>, bits: i64) -> Value {
+        let members = Self::enum_members(class).unwrap_or_default();
+        for m in &members {
+            if crate::value::flag_member_bits(m) == Some(bits) {
+                return m.clone();
+            }
+        }
+        let mut names: Vec<String> = Vec::new();
+        for m in &members {
+            let Some(mb) = crate::value::flag_member_bits(m) else {
+                continue;
+            };
+            if mb != 0 && bits & mb == mb {
+                if let Value::Instance(i) = m {
+                    if let Some(Value::Str(n)) = i.fields.borrow().get("_name_") {
+                        names.push((**n).clone());
+                    }
+                }
+            }
+        }
+        let name = if names.is_empty() {
+            Value::None
+        } else {
+            Value::Str(Rc::new(names.join("|")))
+        };
+        let value = Value::Int(crate::value::VmInt::from(bits));
+        let mut fields: crate::value::FieldMap = crate::value::FieldMap::new();
+        fields.insert("name".to_owned(), name.clone());
+        fields.insert("_name_".to_owned(), name);
+        fields.insert("value".to_owned(), value.clone());
+        fields.insert("_value_".to_owned(), value);
+        Value::Instance(Rc::new(Instance {
+            class: class.clone(),
+            fields: RefCell::new(fields),
+            chain: RefCell::new(None),
+        }))
+    }
+
+    /// Whether `class` is a `Flag` or `IntFlag` subclass — the two whose
+    /// `auto()` members are numbered by bit rather than by increment.
+    fn is_flag_class(class: &Rc<Class>) -> bool {
+        fn marker(class: &Rc<Class>) -> bool {
+            if class
+                .class_attrs
+                .borrow()
+                .contains_key("__typhon_enum_base__")
+            {
+                return matches!(class.name.as_str(), "Flag" | "IntFlag");
+            }
+            class.bases.iter().any(marker)
+        }
+        marker(class)
+    }
+
     fn is_enum_member(value: &Value) -> bool {
         if let Value::Instance(i) = value {
             return Self::is_enum_class(&i.class) && i.fields.borrow().contains_key("_name_");
@@ -2360,6 +2456,9 @@ impl Interpreter {
     /// instances. The source order is taken from the class body so
     /// iteration matches CPython.
     fn materialise_enum_members(&mut self, class: &Rc<Class>, c: &ast::StmtClassDef) {
+        // `Flag` and `IntFlag` number their `auto()` members by bit. Read
+        // before the `class_attrs` borrow below, which this walk shares.
+        let is_flag = Self::is_flag_class(class);
         // Collect member names in source order (each `NAME = value`
         // assignment in the class body, excluding dunders).
         let mut order: Vec<String> = Vec::new();
@@ -2392,9 +2491,19 @@ impl Interpreter {
                 }
                 // `enum.auto()` → previous value + 1; an explicit integer
                 // value advances the counter so following `auto()`s continue
-                // from it.
+                // from it. In a `Flag` / `IntFlag` each `auto()` is instead
+                // the next *bit* — `A, B, C = 1, 2, 4` — because members
+                // combine bitwise.
                 let raw = if Self::is_enum_auto(&raw) {
-                    last_value += 1;
+                    last_value = if is_flag {
+                        if last_value <= 0 {
+                            1
+                        } else {
+                            last_value << 1
+                        }
+                    } else {
+                        last_value + 1
+                    };
                     Value::Int(VmInt::from(last_value))
                 } else {
                     if let Value::Int(i) = &raw {
@@ -3521,6 +3630,14 @@ impl Interpreter {
                 ))),
             },
             Value::Instance(i) => {
+                // `Style.BOLD in style` — a plain `Flag` member contains
+                // another when its bits are a superset.
+                if let (Some(cb), Some(ib)) = (
+                    crate::value::flag_member_bits(container),
+                    crate::value::flag_member_bits(item),
+                ) {
+                    return Ok(ib != 0 && cb & ib == ib);
+                }
                 // `x in obj` → obj.__contains__(x).
                 if let Some(m) = self.find_method(&i.class, "__contains__") {
                     let res = self.call_value(
@@ -5323,6 +5440,27 @@ impl Interpreter {
             }
         }
 
+        // A plain `enum.Flag` combines into composite pseudo-members —
+        // `Style.BOLD | Style.UNDERLINE` is a `Style`, not an int (which is
+        // what `IntFlag` gives, through the mixin path just below).
+        if matches!(op, BitOr | BitAnd | BitXor) {
+            if let (Value::Instance(li), Value::Instance(ri)) = (l, r) {
+                if Rc::ptr_eq(&li.class, &ri.class) {
+                    if let (Some(lb), Some(rb)) = (
+                        crate::value::flag_member_bits(l),
+                        crate::value::flag_member_bits(r),
+                    ) {
+                        let bits = match op {
+                            BitOr => lb | rb,
+                            BitAnd => lb & rb,
+                            _ => lb ^ rb,
+                        };
+                        return Ok(Self::flag_member_for(&li.class, bits));
+                    }
+                }
+            }
+        }
+
         // Value-mixin enum members (`StrEnum` / `IntEnum` / `IntFlag`)
         // participate in arithmetic / concatenation as their underlying
         // value (they're genuine str / int subclasses in CPython):
@@ -6097,6 +6235,21 @@ impl Interpreter {
                 // Pydantic `model` class methods: `Model.model_validate(dict)`
                 // builds an instance from a mapping (validation is not modelled;
                 // it maps fields to constructor kwargs).
+                // `Model.model_validate_json(text)` is `model_validate` over
+                // the parsed JSON.
+                if attr == "model_validate_json" {
+                    let cls = Value::Class(class.clone());
+                    let nf = NativeFn::new("model_validate_json", move |interp, args| {
+                        let raw = args
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| type_error("model_validate_json() requires a string"))?;
+                        let parsed = crate::builtins::json_loads_value(interp, &raw)?;
+                        let validate = interp.get_attr(&cls, "model_validate")?;
+                        interp.call_value(validate, vec![parsed], &[])
+                    });
+                    return Ok(Value::Native(Rc::new(nf)));
+                }
                 if attr == "model_validate" {
                     let cls = class.clone();
                     let nf = NativeFn::new("model_validate", move |interp, args| {
@@ -6107,7 +6260,7 @@ impl Interpreter {
                         let Value::Dict(d) = arg else {
                             return Err(type_error("model_validate() expects a dict"));
                         };
-                        let kwargs: Vec<(String, Value)> = d
+                        let raw: Vec<(String, Value)> = d
                             .borrow()
                             .iter()
                             .filter_map(|(k, v)| match k {
@@ -6115,6 +6268,22 @@ impl Interpreter {
                                 _ => None,
                             })
                             .collect();
+                        // Pydantic builds nested models from nested mappings,
+                        // so a `address: Address?` field handed a dict must
+                        // come back as an `Address`, not the dict.
+                        let mut kwargs: Vec<(String, Value)> = Vec::with_capacity(raw.len());
+                        for (name, value) in raw {
+                            let annotation = cls
+                                .fields
+                                .iter()
+                                .find(|f| f.name == name)
+                                .and_then(|f| f.annotation.clone());
+                            let value = match annotation {
+                                Some(ann) => interp.coerce_model_field(&ann, value)?,
+                                None => value,
+                            };
+                            kwargs.push((name, value));
+                        }
                         interp.instantiate(&cls, vec![], &kwargs)
                     });
                     return Ok(Value::Native(Rc::new(nf)));
@@ -10593,6 +10762,29 @@ pub(crate) fn format_cast_type(tp: &Expr) -> String {
 /// [`Interpreter::enum_members`] for the builtins agent.
 pub(crate) fn enum_members_pub(class: &Rc<Class>) -> Option<Vec<Value>> {
     Interpreter::enum_members(class)
+}
+
+/// The non-optional core of an annotation's source text: `Address?`,
+/// `Address | None`, `Optional[Address]` and `None | Address` all name
+/// `Address`.
+fn strip_optional_annotation(annotation: &str) -> &str {
+    let ann = annotation.trim();
+    if let Some(rest) = ann
+        .strip_prefix("Optional[")
+        .and_then(|r| r.strip_suffix(']'))
+    {
+        return rest.trim();
+    }
+    if let Some(rest) = ann.strip_suffix('?') {
+        return rest.trim();
+    }
+    if let Some(rest) = ann.strip_suffix("| None") {
+        return rest.trim();
+    }
+    if let Some(rest) = ann.strip_prefix("None |") {
+        return rest.trim();
+    }
+    ann
 }
 
 /// `len(range(start, stop, step))`.

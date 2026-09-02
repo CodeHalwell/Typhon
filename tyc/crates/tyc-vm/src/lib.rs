@@ -2462,6 +2462,70 @@ main()
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
 
+    /// A plain `enum.Flag` combines into composite pseudo-members, and
+    /// `auto()` in a flag enum numbers by bit rather than by increment.
+    #[test]
+    fn vm_flag_enum_composites() {
+        let src = r#"
+from enum import Flag, IntFlag, auto
+
+class Style(Flag):
+    BOLD = auto()
+    ITALIC = auto()
+    UNDERLINE = auto()
+
+class Permission(IntFlag):
+    READ = 1
+    WRITE = 2
+    EXECUTE = 4
+
+def main() -> None:
+    if Style.UNDERLINE.value != 4:
+        raise ValueError(f"auto() in a Flag numbers by bit: {Style.UNDERLINE.value}")
+    let style: Style = Style.BOLD | Style.UNDERLINE
+    if style.value != 5 or style.name != "BOLD|UNDERLINE":
+        raise ValueError(f"composite wrong: {style.name} {style.value}")
+    if Style.BOLD not in style or Style.ITALIC in style:
+        raise ValueError("flag containment wrong")
+    if (Style.BOLD & Style.ITALIC).value != 0:
+        raise ValueError("empty composite wrong")
+    let full: Permission = Permission.READ | Permission.WRITE | Permission.EXECUTE
+    if int(full) != 7 or Permission.READ not in full:
+        raise ValueError("IntFlag still combines through its int mixin")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// `model_validate` builds nested models from nested mappings, and
+    /// `model_validate_json` parses first — pydantic's behaviour.
+    #[test]
+    fn vm_model_validate_builds_nested_models() {
+        let src = r#"
+model Address:
+    city: str
+
+model Person:
+    name: str
+    address: Address?
+    tags: list[str] = []
+
+def main() -> None:
+    let p: Person = Person.model_validate(
+        {"name": "Ada", "address": {"city": "London"}, "tags": ["x"]}
+    )
+    if p.address is None or p.address.city != "London":
+        raise ValueError("nested mapping should become a nested model")
+    let q: Person = Person.model_validate_json('{"name": "Bob", "address": null}')
+    if q.name != "Bob" or q.address is not None:
+        raise ValueError("model_validate_json wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
     #[test]
     fn vm_property_setter_and_dir() {
         let src = r#"
