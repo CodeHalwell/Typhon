@@ -3309,6 +3309,11 @@ pub struct ArityInfo {
     /// posonlyargs + args. Kw-only params don't count. `None` for
     /// `*args` functions, which accept unbounded positionals.
     pub max_positional: Option<usize>,
+    /// How many leading entries of `param_names` sit before a `/` and are
+    /// therefore positional-*only*. A keyword of that name never binds such
+    /// a parameter: with `**kwargs` it lands there instead, and without one
+    /// CPython rejects the call outright.
+    pub posonly_count: usize,
     /// Names of kw-only parameters (after `*` or `*args`).
     pub kwonly_names: Vec<String>,
     /// Kw-only names that don't have a default value.
@@ -9980,6 +9985,9 @@ fn strip_receiver_from_arity(mut info: ArityInfo) -> ArityInfo {
     }
     info.min_positional = info.min_positional.saturating_sub(1);
     info.max_positional = info.max_positional.map(|n| n.saturating_sub(1));
+    // The receiver slot that just went is itself positional-only whenever
+    // any slot is (`self` always precedes a `/`).
+    info.posonly_count = info.posonly_count.saturating_sub(1);
     info
 }
 
@@ -10205,6 +10213,7 @@ fn class_constructor_arity_for(shape: &InterfaceShape, class_name: Option<&str>)
             min_positional: 0,
             required_positional: Vec::new(),
             max_positional: Some(0),
+            posonly_count: 0,
             kwonly_names: shape.field_order.clone(),
             kwonly_required: shape
                 .field_order
@@ -10224,6 +10233,7 @@ fn class_constructor_arity_for(shape: &InterfaceShape, class_name: Option<&str>)
         min_positional,
         required_positional,
         max_positional: Some(max_positional),
+        posonly_count: 0,
         kwonly_names: Vec::new(),
         kwonly_required: Vec::new(),
         has_kwarg: false,
@@ -10858,10 +10868,17 @@ fn check_arity_with_info(
         }
     }
 
-    // Rule 2: a positional-bound name can't also appear as a kw.
+    // Rule 2: a positional-bound name can't also appear as a kw — except
+    // for a positional-only parameter, whose name is free for `**kwargs`
+    // to take (`def update(self, other, /, **kw)` accepts `other=1`).
     let filled_positionally = pos_args.len().min(info.param_names.len());
+    let conflict_from = if info.has_kwarg {
+        info.posonly_count.min(filled_positionally)
+    } else {
+        0
+    };
     for name in &named_kwargs {
-        if info.param_names[..filled_positionally]
+        if info.param_names[conflict_from..filled_positionally]
             .iter()
             .any(|p| p == name)
         {
@@ -11033,6 +11050,7 @@ fn arity_info_from_parameters_with_returns(
         min_positional,
         required_positional,
         max_positional,
+        posonly_count: parameters.posonlyargs.len(),
         kwonly_names,
         kwonly_required,
         has_kwarg: parameters.kwarg.is_some(),
@@ -24309,6 +24327,21 @@ let r: int = add(1)
             "got {}",
             msg
         );
+    }
+
+    /// A parameter before `/` is positional-*only*, so its name is free for
+    /// `**kwargs` to take: `g(1, a=2)` binds `a` positionally and puts the
+    /// keyword in `kw`, exactly as CPython does. The arity check used to
+    /// read that as a positional/keyword conflict and reject the call.
+    #[test]
+    fn positional_only_name_is_free_for_kwargs() {
+        let src = "\
+def g(a: int, /, **kw: int) -> int:
+    return a + len(kw)
+
+let r: int = g(1, a=2)
+";
+        assert!(!check(src).has_errors());
     }
 
     #[test]

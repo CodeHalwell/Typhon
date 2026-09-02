@@ -1232,6 +1232,7 @@ fn arity_info_from_params(
     let mut kwonly_required: Vec<String> = Vec::new();
     let mut has_kwarg = false;
     let mut has_vararg = false;
+    let mut posonly_count = 0usize;
     for p in params {
         let ty = param_type_from(p);
         match p.kind.as_str() {
@@ -1245,6 +1246,9 @@ fn arity_info_from_params(
                 }
             }
             _ => {
+                if p.kind == "positional_only" {
+                    posonly_count += 1;
+                }
                 param_names.push(p.name.clone());
                 param_types.push(ty);
                 required_positional.push(!p.has_default);
@@ -1263,6 +1267,7 @@ fn arity_info_from_params(
         min_positional,
         required_positional,
         max_positional,
+        posonly_count,
         kwonly_names,
         kwonly_required,
         has_kwarg,

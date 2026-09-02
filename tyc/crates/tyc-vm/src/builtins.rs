@@ -949,6 +949,23 @@ pub fn install(interp: &mut Interpreter) {
         // pass has run — otherwise it would still be its name-string
         // fallback and the test would silently return the wrong result.
         let cls = i.force_alias(&args[1]);
+        // A `@runtime_checkable` Protocol is matched *structurally* — the
+        // value has to answer every member the protocol declares — and a
+        // Protocol without the decorator is not usable here at all, both as
+        // in CPython.
+        for target in protocol_targets(&cls) {
+            if let Value::Class(p) = &target {
+                if !p.class_attrs.borrow().contains_key("_is_runtime_protocol") {
+                    return Err(type_error(
+                        "Instance and class checks can only be used with @runtime_checkable protocols",
+                    ));
+                }
+                let members: Vec<String> = p.methods.borrow().keys().cloned().collect();
+                if members.iter().all(|m| i.get_attr(val, m.as_str()).is_ok()) {
+                    return Ok(Value::Bool(true));
+                }
+            }
+        }
         Ok(Value::Bool(is_instance_of(val, &cls)))
     });
 
@@ -1235,7 +1252,7 @@ pub fn install(interp: &mut Interpreter) {
     native!("chr", |_i, args| {
         let n = single(&args, "chr")?.to_int()?;
         let c = char::from_u32(n as u32)
-            .ok_or_else(|| value_error(format!("chr() arg not in range: {n}")))?;
+            .ok_or_else(|| value_error("chr() arg not in range(0x110000)"))?;
         Ok(Value::Str(Rc::new(c.to_string())))
     });
     native!("ord", |_i, args| {
@@ -1245,7 +1262,10 @@ pub fn install(interp: &mut Interpreter) {
                 let mut it = s.chars();
                 match (it.next(), it.next()) {
                     (Some(c), None) => Ok(Value::Int(VmInt::from(c as i64))),
-                    _ => Err(type_error("ord() expected a single-character string")),
+                    _ => Err(type_error(format!(
+                        "ord() expected a character, but string of length {} found",
+                        s.chars().count()
+                    ))),
                 }
             }
             _ => Err(type_error("ord() expected a string")),
@@ -1312,13 +1332,12 @@ pub fn install(interp: &mut Interpreter) {
                     }
                 }
                 // round(x) -> int, round-half-to-even.
-                _ => {
-                    let r = round_half_even(x);
-                    Ok(Value::Int(VmInt::from(
-                        <num_bigint::BigInt as num_traits::FromPrimitive>::from_f64(r)
-                            .unwrap_or_else(|| num_bigint::BigInt::from(r as i64)),
-                    )))
-                }
+                // NaN and infinity have no integer value: CPython raises
+                // `ValueError` / `OverflowError`, where a saturating cast
+                // silently returned 0 / `i64::MAX`.
+                _ => Ok(Value::Int(VmInt::from_bigint(
+                    Value::Float(round_half_even(x)).to_bigint()?,
+                ))),
             }
         }
         _ => Err(type_error("round() expected a number")),
@@ -1587,30 +1606,30 @@ pub fn install(interp: &mut Interpreter) {
             // subclass its errno names (`OSError(2, …)` is a
             // FileNotFoundError).
             if is_os_error_kind(&n) && args.len() >= 2 {
-                if let Value::Int(code) = &args[0] {
-                    let errno = code.to_i64().unwrap_or(0);
-                    let strerror = args[1].py_str();
-                    let filename = match args.get(2) {
-                        Some(Value::None) | None => None,
-                        Some(v) => Some(filename_repr(i, v)?),
-                    };
-                    let filename2 = match args.get(4) {
-                        Some(Value::None) | None => None,
-                        Some(v) => Some(filename_repr(i, v)?),
-                    };
-                    let kind = if matches!(n.as_str(), "OSError" | "IOError" | "EnvironmentError") {
-                        os_error_kind(errno)
-                    } else {
-                        n.as_str()
-                    };
-                    return Ok(os_error_value(
-                        kind,
-                        errno,
-                        &strerror,
-                        filename.as_deref(),
-                        filename2.as_deref(),
-                    ));
-                }
+                let strerror = args[1].py_str();
+                let filename = match args.get(2) {
+                    Some(Value::None) | None => None,
+                    Some(v) => Some(filename_repr(i, v)?),
+                };
+                let filename2 = match args.get(4) {
+                    Some(Value::None) | None => None,
+                    Some(v) => Some(filename_repr(i, v)?),
+                };
+                // A bare `OSError` with an integer errno becomes the subclass
+                // that errno names; any other errno keeps the class asked for.
+                let kind = match (&args[0], n.as_str()) {
+                    (Value::Int(code), "OSError" | "IOError" | "EnvironmentError") => {
+                        os_error_kind(code.to_i64().unwrap_or(0))
+                    }
+                    _ => n.as_str(),
+                };
+                return Ok(os_error_value_of(
+                    kind,
+                    args[0].clone(),
+                    &strerror,
+                    filename.as_deref(),
+                    filename2.as_deref(),
+                ));
             }
             let msg = args.first().map(|v| v.py_str()).unwrap_or_default();
             Ok(Value::Exception {
@@ -2051,7 +2070,11 @@ pub(crate) fn is_subclass_of(sub: &Value, cls: &Value) -> bool {
         // models builtin exception types by name), so relate them through
         // the same hierarchy `except` uses.
         Value::Native(n) => {
-            n.name == want || want == "object" || crate::interp::builtin_exc_is_a(n.name, &want)
+            n.name == want
+                || want == "object"
+                // `bool` really is a subclass of `int` in CPython.
+                || (n.name == "bool" && want == "int")
+                || crate::interp::builtin_exc_is_a(n.name, &want)
         }
         Value::Str(s) => {
             s.as_str() == want
@@ -2059,6 +2082,16 @@ pub(crate) fn is_subclass_of(sub: &Value, cls: &Value) -> bool {
                 || crate::interp::builtin_exc_is_a(s.as_str(), &want)
         }
         _ => false,
+    }
+}
+
+/// The Protocol classes among an `isinstance` target (which may be a tuple
+/// of alternatives). Empty when nothing in the target is a Protocol.
+fn protocol_targets(cls: &Value) -> Vec<Value> {
+    match cls {
+        Value::Tuple(t) => t.iter().flat_map(protocol_targets).collect(),
+        Value::Class(c) if crate::interp::class_is_protocol_pub(c) => vec![cls.clone()],
+        _ => Vec::new(),
     }
 }
 
@@ -2131,6 +2164,13 @@ fn class_in_chain(c: &Rc<crate::value::Class>, name: &str) -> bool {
             return true;
         }
     }
+    // A builtin *exception* base (`class AppError(ValueError)`, or the
+    // synthesised `json.JSONDecodeError`) is recorded by name as well, and
+    // `isinstance` has to see through the builtin hierarchy above it —
+    // `except` already does.
+    if crate::interp::class_has_builtin_exc_base(c, name) {
+        return true;
+    }
     c.bases.iter().any(|b| class_in_chain(b, name))
 }
 
@@ -2159,7 +2199,7 @@ fn reduce_minmax(
     let mut iter = candidates.into_iter();
     let mut best = iter.next().ok_or_else(|| {
         value_error(format!(
-            "{}() arg is an empty sequence",
+            "{}() iterable argument is empty",
             if want_min { "min" } else { "max" }
         ))
     })?;
@@ -2495,6 +2535,14 @@ class _DefaultDict:
         if key in self._data:
             return self._data[key]
         return default
+    def __eq__(self, other):
+        if isinstance(other, _DefaultDict):
+            return self._data == other._data
+        return self._data == other
+    def __ne__(self, other):
+        if isinstance(other, _DefaultDict):
+            return self._data != other._data
+        return self._data != other
 "#;
 
 /// The `_NamedTupleBase` template from the `collections` shim, cached.
@@ -3578,7 +3626,27 @@ pub(crate) fn os_error_value(
     filename: Option<&str>,
     filename2: Option<&str>,
 ) -> Value {
-    let mut message = format!("[Errno {errno}] {strerror}");
+    os_error_value_of(
+        kind,
+        Value::Int(VmInt::from(errno)),
+        strerror,
+        filename,
+        filename2,
+    )
+}
+
+/// As `os_error_value`, but for an errno CPython never interpreted: it maps
+/// 2–5 constructor arguments onto `(errno, strerror, filename, winerror,
+/// filename2)` whatever their types, so `OSError('a', 'b', 'c')` still reads
+/// `[Errno a] b: 'c'`. Only an *integer* errno selects a concrete subclass.
+pub(crate) fn os_error_value_of(
+    kind: &str,
+    errno: Value,
+    strerror: &str,
+    filename: Option<&str>,
+    filename2: Option<&str>,
+) -> Value {
+    let mut message = format!("[Errno {}] {strerror}", errno.py_str());
     if let Some(f) = filename {
         message.push_str(": ");
         message.push_str(f);
@@ -3590,10 +3658,7 @@ pub(crate) fn os_error_value(
     Value::Exception {
         kind: Rc::new(kind.to_owned()),
         message: Rc::new(message),
-        args: Rc::new(vec![
-            Value::Int(VmInt::from(errno)),
-            Value::Str(Rc::new(strerror.to_owned())),
-        ]),
+        args: Rc::new(vec![errno, Value::Str(Rc::new(strerror.to_owned()))]),
         chain: None,
     }
 }
@@ -4373,9 +4438,12 @@ pub(crate) fn sys_modules_dict(interp: &Interpreter) -> Value {
     // CPython always has the entry module here, under the name it runs as.
     // A program checking `"__main__" in sys.modules` (or reaching for it to
     // find its own globals) got a `KeyError`.
+    // Its namespace is the interpreter's globals, live — so
+    // `sys.modules[__name__].__all__` (the list `pub` synthesises) and any
+    // other module-level name read back through it.
     map.insert(
         HashKey::Str(Rc::new("__main__".to_owned())),
-        make_module("__main__", vec![]),
+        make_module_env("__main__", vec![], interp.root.clone()),
     );
     let mut names: Vec<&String> = interp
         .module_cache
@@ -8208,6 +8276,27 @@ fn str_method(
             let (pos_args, kwargs) = split_kwargs(args);
             return str_format(interp, s, pos_args, &kwargs);
         }
+        // `str.format_map(m)` is `format(**m)` without copying the mapping —
+        // and, unlike `format`, it accepts non-string keys, which simply
+        // never match a field name.
+        "format_map" => {
+            let mapping = single(args, "format_map")?;
+            let Value::Dict(d) = mapping else {
+                return Err(type_error(format!(
+                    "format_map() argument must be a mapping, not {}",
+                    mapping.type_name()
+                )));
+            };
+            let kwargs: Vec<(String, Value)> = d
+                .borrow()
+                .iter()
+                .filter_map(|(k, v)| match k {
+                    HashKey::Str(name) => Some(((**name).clone(), v.clone())),
+                    _ => None,
+                })
+                .collect();
+            return str_format(interp, s, &[], &kwargs);
+        }
         "encode" => {
             // Keywords arrive as a trailing sentinel (see `splitlines`).
             let (args, kw) = split_kwargs(args);
@@ -8436,6 +8525,15 @@ fn str_format(
                         return Err(value_error(format!("Unknown conversion specifier {other}")))
                     }
                     None => (value, false),
+                };
+
+                // A nested replacement field inside the spec itself —
+                // `{n:>{w}}` — is resolved against the same arguments
+                // before the spec is applied.
+                let spec = if spec.contains('{') {
+                    str_format(interp, &spec, pos_args, kwargs)?.py_str()
+                } else {
+                    spec
                 };
 
                 // A user `__format__(self, spec)` controls its own
@@ -8846,8 +8944,15 @@ fn list_method(
                 .map(|v| v.to_int())
                 .transpose()?
                 .unwrap_or(l.len() as i64 - 1);
-            let i = normalize_index(idx, l.len())
-                .ok_or_else(|| index_error("pop index out of range"))?;
+            // CPython distinguishes the two failures: popping an empty
+            // list says so, a bad index on a non-empty one is out of range.
+            let i = normalize_index(idx, l.len()).ok_or_else(|| {
+                index_error(if l.is_empty() {
+                    "pop from empty list"
+                } else {
+                    "pop index out of range"
+                })
+            })?;
             Ok(l.remove(i))
         }
         "remove" => {
@@ -9470,26 +9575,67 @@ fn num_method(v: &Value, name: &str, args: &[Value]) -> Result<Value, Unwind> {
             let count: u32 = bytes.iter().map(|b| b.count_ones()).sum();
             Ok(Value::Int(VmInt::from(count)))
         }
-        // `(n).to_bytes(length, byteorder="big")` — non-negative ints.
+        // `(n).to_bytes(length=1, byteorder="big", *, signed=False)`. All
+        // three are keyword-capable, and `signed=True` encodes a negative
+        // int in two's complement, as CPython does.
         (Value::Int(i), "to_bytes") => {
-            if i.is_negative() {
-                return Err(value_error("to_bytes: negative ints not supported"));
-            }
-            let length = match args.first() {
+            let (pos, kw) = split_kwargs(args);
+            let kwarg = |name: &str| kw.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+            let length = match pos.first().cloned().or_else(|| kwarg("length")) {
                 Some(n) => n.to_int()?.max(0) as usize,
                 None => 1,
             };
-            let big_endian = match args.get(1) {
+            let big_endian = match pos.get(1).cloned().or_else(|| kwarg("byteorder")) {
                 Some(Value::Str(s)) => s.as_str() != "little",
                 _ => true,
             };
-            let (_, mut raw) = i.as_bigint().to_bytes_be();
-            if raw.len() > length {
-                return Err(value_error("int too big to convert"));
-            }
-            // Left-pad with zero bytes to the requested length.
-            let mut out = vec![0u8; length - raw.len()];
-            out.append(&mut raw);
+            let signed = kwarg("signed").map(|v| v.truthy()).unwrap_or(false);
+            let value = i.as_bigint().into_owned();
+            let mut out = if signed {
+                if length == 0 {
+                    return Err(crate::error::Unwind::Exception(
+                        crate::error::VmException::new("OverflowError", "int too big to convert"),
+                    ));
+                }
+                // Two's complement over exactly `length` bytes: encode
+                // `value mod 2^(8*length)` and check it fits back signed.
+                let modulus = num_bigint::BigInt::from(1) << (8 * length);
+                let half = num_bigint::BigInt::from(1) << (8 * length - 1);
+                if value >= half || value < -half.clone() {
+                    return Err(crate::error::Unwind::Exception(
+                        crate::error::VmException::new("OverflowError", "int too big to convert"),
+                    ));
+                }
+                let wrapped = if value.sign() == num_bigint::Sign::Minus {
+                    value + modulus
+                } else {
+                    value
+                };
+                let (_, raw) = wrapped.to_bytes_be();
+                let mut out = vec![0u8; length.saturating_sub(raw.len())];
+                out.extend_from_slice(&raw[raw.len().saturating_sub(length)..]);
+                out
+            } else {
+                if i.is_negative() {
+                    return Err(crate::error::Unwind::Exception(
+                        crate::error::VmException::new(
+                            "OverflowError",
+                            "can't convert negative int to unsigned",
+                        ),
+                    ));
+                }
+                let (_, raw) = value.to_bytes_be();
+                // `BigInt::to_bytes_be` renders zero as a single 0 byte.
+                let raw = if raw == [0] { Vec::new() } else { raw };
+                if raw.len() > length {
+                    return Err(crate::error::Unwind::Exception(
+                        crate::error::VmException::new("OverflowError", "int too big to convert"),
+                    ));
+                }
+                let mut out = vec![0u8; length - raw.len()];
+                out.extend_from_slice(&raw);
+                out
+            };
             if !big_endian {
                 out.reverse();
             }
@@ -10386,8 +10532,9 @@ pub fn call_with_kwargs(
                 }
             }
             if candidates.is_empty() {
-                return default
-                    .ok_or_else(|| value_error(format!("{}() arg is an empty sequence", n.name)));
+                return default.ok_or_else(|| {
+                    value_error(format!("{}() iterable argument is empty", n.name))
+                });
             }
             let mut best = candidates[0].clone();
             let mut best_key = match &key_fn {

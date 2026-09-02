@@ -61,7 +61,10 @@ tyc run --compile --temp      # legacy with ephemeral build dir
   sets `__cause__` (and `__suppress_context__`), an exception leaving an
   `except` handler — or raised by a `finally` over one still propagating —
   records the interrupted exception as its `__context__`, and an unchained
-  exception answers `None` / `False`.
+  exception answers `None` / `False`. `hasattr` on a builtin value reads a
+  per-type dunder table taken from CPython (`hasattr(5, "__len__")` is
+  `False`), which is also how a `@runtime_checkable` Protocol matches
+  structurally under `isinstance`.
 - Imports: `import`, `from ... import`, `as` aliasing, dotted module
   access. The full list of modules the VM can resolve natively is below.
 - Comprehensions: list, set, dict, generator (eagerly materialised in v1).

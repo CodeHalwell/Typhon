@@ -21,7 +21,8 @@ use ruff_python_ast::{
 use crate::env::{Env, EnvRef};
 use crate::error::{
     attribute_error, index_error, key_error, name_error, not_implemented, type_error, value_error,
-    zero_division, zero_division_floor_mod, zero_division_negative_power, Unwind, VmException,
+    zero_division, zero_division_floor_mod, zero_division_named, zero_division_negative_power,
+    Unwind, VmException,
 };
 use crate::value::{
     Class, ClassField, DictMap, Function, GenExprState, GeneratorKind, GeneratorState, HashKey,
@@ -1795,6 +1796,14 @@ impl Interpreter {
             "__typhon_module__".to_owned(),
             Value::Str(Rc::new(self.current_module_name.clone())),
         );
+        // `@runtime_checkable` opts a Protocol into `isinstance`. CPython
+        // stamps exactly this attribute, and refuses the check without it.
+        if c.decorator_list
+            .iter()
+            .any(|d| rightmost_name(&d.expression).as_deref() == Some("runtime_checkable"))
+        {
+            class_attrs.insert("_is_runtime_protocol".to_owned(), Value::Bool(true));
+        }
         let class = Rc::new(Class {
             name: c.name.as_str().to_owned(),
             methods: RefCell::new(methods),
@@ -4242,14 +4251,40 @@ impl Interpreter {
         // exactly once across all calls (matching Python's "default value
         // computed at def time" semantics, including the classic mutable-
         // default gotcha).
+        // A parameter before `/` cannot be filled by keyword. Without a
+        // `**kwargs` to absorb it, CPython names every such argument in one
+        // error — and does so before reporting the parameter as missing.
+        let posonly_count = params.posonlyargs.len();
+        if posonly_count > 0 && params.kwarg.is_none() {
+            let clashes: Vec<&str> = params
+                .posonlyargs
+                .iter()
+                .map(|p| p.parameter.name.as_str())
+                .filter(|name| kwargs_left.contains_key(*name))
+                .collect();
+            if !clashes.is_empty() {
+                return Err(type_error(format!(
+                    "{}() got some positional-only arguments passed as keyword arguments: '{}'",
+                    f.name,
+                    clashes.join("', '")
+                )));
+            }
+        }
+
         let mut pos_iter = all_pos.into_iter();
         let mut defaults_iter = f.defaults.iter();
-        for p in &positional {
+        for (index, p) in positional.iter().enumerate() {
             let name = p.parameter.name.as_str();
             let default = defaults_iter.next().and_then(|d| d.clone());
+            let by_keyword = if index < posonly_count {
+                // Positional-only: a same-named keyword belongs to `**kwargs`.
+                None
+            } else {
+                kwargs_left.shift_remove(name)
+            };
             if let Some(v) = pos_iter.next() {
                 env.set(name, v);
-            } else if let Some(v) = kwargs_left.shift_remove(name) {
+            } else if let Some(v) = by_keyword {
                 env.set(name, v);
             } else if let Some(v) = default {
                 env.set(name, v);
@@ -4686,7 +4721,10 @@ impl Interpreter {
             return Ok(s);
         }
         if Self::is_container(v) {
-            return self.repr_of(v);
+            // `str(x)` and `repr(x)` agree for every container except a
+            // frozen dict: CPython's `mappingproxy` delegates `__str__` to
+            // the mapping it wraps, so only its `repr` names the proxy.
+            return self.repr_of_depth_inner(v, 0, true);
         }
         if let Some(r) = self.call_dunder0(v, "__str__")? {
             return require_str_return(r, "__str__");
@@ -4721,6 +4759,18 @@ impl Interpreter {
     /// the same for direct self-reference) so self-referential containers
     /// don't blow the stack.
     fn repr_of_depth(&mut self, v: &Value, depth: usize) -> Result<String, Unwind> {
+        self.repr_of_depth_inner(v, depth, false)
+    }
+
+    /// `unwrap_frozen` renders a frozen dict as the plain mapping it wraps —
+    /// the `str()` form. It applies to this value only; nested values always
+    /// render as reprs.
+    fn repr_of_depth_inner(
+        &mut self,
+        v: &Value,
+        depth: usize,
+        unwrap_frozen: bool,
+    ) -> Result<String, Unwind> {
         const MAX_REPR_DEPTH: usize = 100;
         if depth >= MAX_REPR_DEPTH {
             // CPython renders a self-referential container with a kind-specific
@@ -4780,8 +4830,9 @@ impl Interpreter {
                     })
                     .map(|(k, val)| (k.clone(), val.clone()))
                     .collect();
+                let wrap = is_frozen && !unwrap_frozen;
                 let mut s = String::new();
-                if is_frozen {
+                if wrap {
                     s.push_str("mappingproxy({");
                 } else {
                     s.push('{');
@@ -4794,7 +4845,7 @@ impl Interpreter {
                     s.push_str(": ");
                     s.push_str(&self.repr_of_depth(val, depth + 1)?);
                 }
-                if is_frozen {
+                if wrap {
                     s.push_str("})");
                 } else {
                     s.push('}');
@@ -4907,7 +4958,9 @@ impl Interpreter {
             (Int(a), Div, Int(b)) => return Ok(Float(a.to_f64() / b.to_f64())),
             (Int(_), FloorDiv, Int(b)) if b.is_zero() => return Err(zero_division_floor_mod()),
             (Int(a), FloorDiv, Int(b)) => return Ok(Int(a.div_floor(b))),
-            (Int(_), Mod, Int(b)) if b.is_zero() => return Err(zero_division_floor_mod()),
+            (Int(_), Mod, Int(b)) if b.is_zero() => {
+                return Err(zero_division_named("integer modulo by zero"))
+            }
             (Int(a), Mod, Int(b)) => return Ok(Int(a.mod_floor(b))),
             (Int(a), Pow, Int(b)) => {
                 if b.is_negative() {
@@ -4952,12 +5005,12 @@ impl Interpreter {
             (Float(a), Mult, Float(b)) => return Ok(Float(a * b)),
             (Float(a), Div, Float(b)) => {
                 if *b == 0.0 {
-                    return Err(zero_division());
+                    return Err(zero_division_named("float division by zero"));
                 }
                 return Ok(Float(a / b));
             }
             (Float(_), FloorDiv, Float(b)) if *b == 0.0 => {
-                return Err(zero_division_floor_mod());
+                return Err(zero_division_named("float floor division by zero"));
             }
             // Float `//` and `%` share CPython's `float_divmod`. `floor(a/b)`
             // is NOT equivalent: `7.0 / 0.1 == 70.00000000000001`, so
@@ -4965,7 +5018,9 @@ impl Interpreter {
             // algorithm gives 69.0. Likewise `%` must carry the divisor's sign
             // even on a zero result (`-3.0 % 3.0 == 0.0`, `7.0 % -7.0 == -0.0`).
             (Float(a), FloorDiv, Float(b)) => return Ok(Float(float_divmod(*a, *b).0)),
-            (Float(_), Mod, Float(b)) if *b == 0.0 => return Err(zero_division_floor_mod()),
+            (Float(_), Mod, Float(b)) if *b == 0.0 => {
+                return Err(zero_division_named("float modulo by zero"))
+            }
             (Float(a), Mod, Float(b)) => return Ok(Float(float_divmod(*a, *b).1)),
             (Float(a), Pow, Float(b)) => {
                 // `0.0 ** -n` is a ZeroDivisionError in CPython, not `inf`.
@@ -6594,8 +6649,11 @@ impl Interpreter {
         if step_i == 0 {
             return Err(value_error("slice step cannot be zero"));
         }
-        // Materialise the RHS.
-        let it = self.make_iter(value)?;
+        // Materialise the RHS. CPython reports a non-iterable right-hand
+        // side of *any* slice assignment with one message.
+        let it = self
+            .make_iter(value)
+            .map_err(|_| type_error("must assign iterable to extended slice"))?;
         let mut repl: Vec<Value> = Vec::new();
         while let Some(v) = self.iter_next(&it)? {
             repl.push(v);
@@ -8494,6 +8552,59 @@ fn intern_method_name(name: &str) -> &'static str {
 /// builtin method, plus the handful of builtin classmethods. `None` when
 /// `ty` is not a builtin type name or `attr` is not one of its methods, so
 /// the caller falls through to the normal attribute error.
+/// CPython's `float.fromhex` grammar: `[sign] ['0x'] hexdigits ['.' hexdigits]
+/// ['p' [sign] decdigits]`, plus `inf` / `infinity` / `nan`. Returns `None`
+/// for anything else, which the caller reports as CPython's `ValueError`.
+fn parse_hex_float(text: &str) -> Option<f64> {
+    let t = text.trim();
+    let (sign, rest) = match t.strip_prefix('-') {
+        Some(r) => (-1.0f64, r),
+        None => (1.0f64, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let lower = rest.to_ascii_lowercase();
+    match lower.as_str() {
+        "inf" | "infinity" => return Some(sign * f64::INFINITY),
+        "nan" => return Some(f64::NAN),
+        _ => {}
+    }
+    let body = lower.strip_prefix("0x").unwrap_or(&lower);
+    // Split off the binary exponent, then the fractional part.
+    let (digits, exp) = match body.split_once('p') {
+        Some((d, e)) => (d, e.parse::<i32>().ok()?),
+        None => (body, 0),
+    };
+    let (int_part, frac_part) = match digits.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (digits, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    // Mantissa as an exact integer, with the fraction folded into the
+    // exponent — `0x1.8p1` is `0x18 * 2^(1 - 4)`.
+    let mut mantissa = num_bigint::BigInt::from(0);
+    for c in int_part.chars().chain(frac_part.chars()) {
+        mantissa = mantissa * 16 + num_bigint::BigInt::from(c.to_digit(16)?);
+    }
+    let shift = exp.checked_sub(4i32.checked_mul(i32::try_from(frac_part.len()).ok()?)?)?;
+    use num_traits::ToPrimitive;
+    Some(sign * scale_pow2(mantissa.to_f64()?, shift))
+}
+
+/// `m * 2^k`, stepped so a large `k` cannot overflow the intermediate
+/// `2^k` for a result that is itself finite (and the mirror for underflow).
+fn scale_pow2(mut m: f64, mut k: i32) -> f64 {
+    while k > 512 && m.is_finite() && m != 0.0 {
+        m *= 2f64.powi(512);
+        k -= 512;
+    }
+    while k < -512 && m != 0.0 {
+        m *= 2f64.powi(-512);
+        k += 512;
+    }
+    m * 2f64.powi(k)
+}
+
 fn builtin_type_method(ty: &'static str, attr: &str) -> Option<Value> {
     let probe = match ty {
         "str" => Value::Str(Rc::new(String::new())),
@@ -8541,6 +8652,23 @@ fn builtin_type_method(ty: &'static str, attr: &str) -> Option<Value> {
             },
         ))));
     }
+    // `float.fromhex("0x1.8p1")` is a classmethod: the unbound-method form
+    // below would take the hex *string* as the receiver and dispatch to
+    // `str`, which has no `fromhex`.
+    if ty == "float" && attr == "fromhex" {
+        return Some(Value::Native(Rc::new(NativeFn::new(
+            "fromhex",
+            |_i, args| {
+                let text = match args.first() {
+                    Some(Value::Str(s)) => (**s).clone(),
+                    _ => return Err(type_error("fromhex() argument must be str")),
+                };
+                parse_hex_float(&text)
+                    .map(Value::Float)
+                    .ok_or_else(|| value_error("invalid hexadecimal floating-point string"))
+            },
+        ))));
+    }
     // `int.from_bytes(bytes, byteorder="big", *, signed=False)` is a
     // classmethod, so it has no receiver to probe for.
     if ty == "int" && attr == "from_bytes" {
@@ -8558,7 +8686,6 @@ fn builtin_type_method(ty: &'static str, attr: &str) -> Option<Value> {
                     .find(|(k, _)| k == "signed")
                     .map(|(_, v)| v.truthy())
                     .unwrap_or(false);
-                let _ = signed;
                 let raw = match args.first() {
                     Some(Value::Bytes(b)) => (**b).clone(),
                     Some(Value::List(l)) => l
@@ -8578,9 +8705,15 @@ fn builtin_type_method(ty: &'static str, attr: &str) -> Option<Value> {
                 if !big_endian {
                     raw.reverse();
                 }
+                let width = raw.len();
                 let mut acc = num_bigint::BigInt::from(0);
                 for byte in raw {
                     acc = (acc << 8) + num_bigint::BigInt::from(byte);
+                }
+                // `signed=True` reads the bytes as two's complement, so a
+                // set top bit means `acc - 2^(8*len)`.
+                if signed && width > 0 && acc >= (num_bigint::BigInt::from(1) << (8 * width - 1)) {
+                    acc -= num_bigint::BigInt::from(1) << (8 * width);
                 }
                 Ok(Value::Int(crate::value::VmInt::from_bigint(acc)))
             },
@@ -8598,9 +8731,8 @@ fn builtin_type_method(ty: &'static str, attr: &str) -> Option<Value> {
 
 fn builtin_has_attr(value: &Value, attr: &str) -> bool {
     if attr.starts_with("__") && attr.ends_with("__") {
-        // Only the dunders every builtin value actually implements — so
-        // `hasattr(5, "__fspath__")` is False, as in CPython.
-        return matches!(
+        // Dunders every builtin value carries.
+        if matches!(
             attr,
             "__class__"
                 | "__doc__"
@@ -8614,50 +8746,7 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                 | "__le__"
                 | "__gt__"
                 | "__ge__"
-                | "__bool__"
-                | "__len__"
-                | "__contains__"
-                | "__getitem__"
-                | "__setitem__"
-                | "__delitem__"
-                | "__iter__"
-                | "__next__"
-                | "__reversed__"
-                | "__add__"
-                | "__radd__"
-                | "__iadd__"
-                | "__sub__"
-                | "__rsub__"
-                | "__mul__"
-                | "__rmul__"
-                | "__imul__"
-                | "__truediv__"
-                | "__rtruediv__"
-                | "__floordiv__"
-                | "__rfloordiv__"
-                | "__mod__"
-                | "__rmod__"
-                | "__pow__"
-                | "__rpow__"
-                | "__divmod__"
-                | "__neg__"
-                | "__pos__"
-                | "__abs__"
-                | "__invert__"
-                | "__and__"
-                | "__or__"
-                | "__xor__"
-                | "__lshift__"
-                | "__rshift__"
-                | "__int__"
-                | "__float__"
-                | "__index__"
-                | "__round__"
-                | "__trunc__"
-                | "__floor__"
-                | "__ceil__"
                 | "__sizeof__"
-                | "__getnewargs__"
                 | "__reduce__"
                 | "__init__"
                 | "__new__"
@@ -8667,7 +8756,155 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                 | "__delattr__"
                 | "__subclasshook__"
                 | "__init_subclass__"
-        );
+        ) {
+            return true;
+        }
+        // The rest are per-type in CPython — `hasattr(5, "__len__")` and
+        // `hasattr('s', '__int__')` are both False — and a structural
+        // `@runtime_checkable` Protocol check reads exactly this table.
+        return match attr {
+            "__floordiv__" | "__rfloordiv__" | "__divmod__" | "__int__" | "__float__"
+            | "__round__" | "__trunc__" | "__floor__" | "__ceil__" => {
+                matches!(value, Value::Int(_) | Value::Bool(_) | Value::Float(_))
+            }
+            "__radd__" | "__truediv__" | "__rtruediv__" | "__pow__" | "__rpow__" | "__neg__"
+            | "__pos__" | "__abs__" => {
+                matches!(
+                    value,
+                    Value::Int(_) | Value::Bool(_) | Value::Float(_) | Value::Complex(..)
+                )
+            }
+            "__invert__" | "__lshift__" | "__rshift__" | "__index__" => {
+                matches!(value, Value::Int(_) | Value::Bool(_))
+            }
+            "__add__" | "__mul__" | "__rmul__" => {
+                matches!(
+                    value,
+                    Value::Str(_)
+                        | Value::Bytes(_)
+                        | Value::List(_)
+                        | Value::Tuple(_)
+                        | Value::Int(_)
+                        | Value::Bool(_)
+                        | Value::Float(_)
+                        | Value::Complex(..)
+                )
+            }
+            "__mod__" | "__rmod__" => {
+                matches!(
+                    value,
+                    Value::Str(_)
+                        | Value::Bytes(_)
+                        | Value::Int(_)
+                        | Value::Bool(_)
+                        | Value::Float(_)
+                )
+            }
+            "__sub__" | "__rsub__" => {
+                matches!(
+                    value,
+                    Value::Set(_)
+                        | Value::Int(_)
+                        | Value::Bool(_)
+                        | Value::Float(_)
+                        | Value::Complex(..)
+                        | Value::DictView { .. }
+                )
+            }
+            "__and__" | "__xor__" => {
+                matches!(
+                    value,
+                    Value::Set(_) | Value::Int(_) | Value::Bool(_) | Value::DictView { .. }
+                )
+            }
+            "__len__" | "__contains__" => {
+                matches!(
+                    value,
+                    Value::Str(_)
+                        | Value::Bytes(_)
+                        | Value::List(_)
+                        | Value::Tuple(_)
+                        | Value::Dict(_)
+                        | Value::Set(_)
+                        | Value::Range { .. }
+                        | Value::DictView { .. }
+                )
+            }
+            "__setitem__" | "__delitem__" => {
+                matches!(value, Value::List(_) | Value::Dict(_))
+            }
+            "__iadd__" | "__imul__" => {
+                matches!(value, Value::List(_))
+            }
+            "__getnewargs__" => {
+                matches!(
+                    value,
+                    Value::Str(_)
+                        | Value::Bytes(_)
+                        | Value::Tuple(_)
+                        | Value::Int(_)
+                        | Value::Bool(_)
+                        | Value::Float(_)
+                        | Value::Complex(..)
+                )
+            }
+            "__bool__" => {
+                matches!(
+                    value,
+                    Value::Range { .. }
+                        | Value::Int(_)
+                        | Value::Bool(_)
+                        | Value::Float(_)
+                        | Value::Complex(..)
+                        | Value::None
+                )
+            }
+            "__or__" => {
+                matches!(
+                    value,
+                    Value::Dict(_)
+                        | Value::Set(_)
+                        | Value::Int(_)
+                        | Value::Bool(_)
+                        | Value::DictView { .. }
+                )
+            }
+            "__iter__" => {
+                matches!(
+                    value,
+                    Value::Str(_)
+                        | Value::Bytes(_)
+                        | Value::List(_)
+                        | Value::Tuple(_)
+                        | Value::Dict(_)
+                        | Value::Set(_)
+                        | Value::Range { .. }
+                        | Value::Iter(_)
+                        | Value::DictView { .. }
+                )
+            }
+            "__getitem__" => {
+                matches!(
+                    value,
+                    Value::Str(_)
+                        | Value::Bytes(_)
+                        | Value::List(_)
+                        | Value::Tuple(_)
+                        | Value::Dict(_)
+                        | Value::Range { .. }
+                )
+            }
+            "__reversed__" => {
+                matches!(
+                    value,
+                    Value::List(_) | Value::Dict(_) | Value::Range { .. } | Value::DictView { .. }
+                )
+            }
+            "__next__" => {
+                matches!(value, Value::Iter(_))
+            }
+            _ => false,
+        };
     }
     match value {
         Value::Str(_) => matches!(
@@ -8681,6 +8918,7 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                 | "expandtabs"
                 | "find"
                 | "format"
+                | "format_map"
                 | "index"
                 | "isalnum"
                 | "isalpha"
@@ -10943,6 +11181,11 @@ fn package_of_module(name: &str, is_package_init: bool) -> Vec<String> {
 
 /// True when `cls` is (or inherits) the `Protocol` marker the VM installs for
 /// `interface` declarations.
+/// [`class_is_protocol`] for the builtins agent's `isinstance`.
+pub(crate) fn class_is_protocol_pub(cls: &Rc<crate::value::Class>) -> bool {
+    class_is_protocol(cls)
+}
+
 fn class_is_protocol(cls: &Rc<crate::value::Class>) -> bool {
     cls.is_protocol || cls.name == "Protocol" || cls.bases.iter().any(class_is_protocol)
 }

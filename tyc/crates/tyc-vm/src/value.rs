@@ -1848,6 +1848,35 @@ fn float_to_bigint(x: f64) -> Result<BigInt, Unwind> {
     })
 }
 
+/// A dict's `{k: v, …}` rendering. `wrap_frozen` adds the `mappingproxy(…)`
+/// wrapper a `freeze`-marked dict shows under `repr` — CPython's proxy
+/// delegates `__str__` to the mapping it wraps, so only `repr` names it.
+fn dict_render(v: &Value, wrap_frozen: bool) -> String {
+    let Value::Dict(d) = v else {
+        return String::new();
+    };
+    let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
+    let wrap = wrap_frozen && matches!(d.borrow().get(&frozen_key), Some(Value::Bool(true)));
+    let d = d.borrow();
+    let mut s = String::new();
+    s.push_str(if wrap { "mappingproxy({" } else { "{" });
+    let mut emitted = 0usize;
+    for (k, v) in d.iter() {
+        if matches!(k, HashKey::Str(name) if name.as_str() == "__typhon_frozen__") {
+            continue;
+        }
+        if emitted > 0 {
+            s.push_str(", ");
+        }
+        s.push_str(&k.clone().into_value().py_repr());
+        s.push_str(": ");
+        s.push_str(&v.py_repr());
+        emitted += 1;
+    }
+    s.push_str(if wrap { "})" } else { "}" });
+    s
+}
+
 impl Value {
     pub fn type_name(&self) -> &'static str {
         match self {
@@ -2232,7 +2261,7 @@ impl Value {
                 ))
             }),
             _ => Err(type_error(format!(
-                "int() argument must be a string or a number, not '{}'",
+                "int() argument must be a string, a bytes-like object or a real number, not '{}'",
                 self.type_name()
             ))),
         }
@@ -2258,7 +2287,7 @@ impl Value {
                 ))
             }),
             _ => Err(type_error(format!(
-                "int() argument must be a string or a number, not '{}'",
+                "int() argument must be a string, a bytes-like object or a real number, not '{}'",
                 self.type_name()
             ))),
         }
@@ -2271,8 +2300,8 @@ impl Value {
             Value::Bool(b) => Ok(*b as i64 as f64),
             Value::Str(s) => s.trim().parse::<f64>().map_err(|_| {
                 value_error(format!(
-                    "could not convert string to float: {:?}",
-                    s.as_str()
+                    "could not convert string to float: {}",
+                    Value::Str(s.clone()).py_repr()
                 ))
             }),
             _ => Err(type_error(format!(
@@ -2322,36 +2351,7 @@ impl Value {
                 s.push(')');
                 s
             }
-            Value::Dict(d) => {
-                let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
-                let is_frozen = matches!(d.borrow().get(&frozen_key), Some(Value::Bool(true)));
-                let d = d.borrow();
-                let mut s = String::new();
-                if is_frozen {
-                    s.push_str("mappingproxy({");
-                } else {
-                    s.push('{');
-                }
-                let mut emitted = 0usize;
-                for (k, v) in d.iter() {
-                    if matches!(k, HashKey::Str(name) if name.as_str() == "__typhon_frozen__") {
-                        continue;
-                    }
-                    if emitted > 0 {
-                        s.push_str(", ");
-                    }
-                    s.push_str(&k.clone().into_value().py_repr());
-                    s.push_str(": ");
-                    s.push_str(&v.py_repr());
-                    emitted += 1;
-                }
-                if is_frozen {
-                    s.push_str("})");
-                } else {
-                    s.push('}');
-                }
-                s
-            }
+            Value::Dict(_) => dict_render(self, false),
             Value::Set(set) => {
                 let s = set.borrow();
                 let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
@@ -2500,6 +2500,7 @@ impl Value {
     pub fn py_repr(&self) -> String {
         match self {
             Value::Str(s) => python_repr_str(s.as_str()),
+            Value::Dict(_) => dict_render(self, true),
             // `repr(exc)` keeps the `ClassName('msg')` form even though
             // `str(exc)` (py_str) renders just the message.
             Value::Instance(i) => instance_repr(i),

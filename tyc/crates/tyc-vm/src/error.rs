@@ -152,12 +152,17 @@ pub fn zero_division() -> Unwind {
     Unwind::Exception(VmException::new("ZeroDivisionError", "division by zero"))
 }
 
+/// CPython names the operation *and* the operand type in every other
+/// `ZeroDivisionError`: `1//0` is "integer division or modulo by zero",
+/// `1%0` "integer modulo by zero", and the float forms are "float division
+/// by zero" / "float floor division by zero" / "float modulo by zero".
+pub fn zero_division_named(what: &'static str) -> Unwind {
+    Unwind::Exception(VmException::new("ZeroDivisionError", what))
+}
+
 /// CPython's message for `//` and `%` by zero differs from true division's.
 pub fn zero_division_floor_mod() -> Unwind {
-    Unwind::Exception(VmException::new(
-        "ZeroDivisionError",
-        "integer division or modulo by zero",
-    ))
+    zero_division_named("integer division or modulo by zero")
 }
 
 /// CPython's message for a zero base raised to a negative power

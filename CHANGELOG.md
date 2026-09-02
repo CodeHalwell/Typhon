@@ -74,8 +74,25 @@ the type object it is instead of a bound method, and PEP 3134 chaining is
 real — `raise X from Y` records `__cause__` and `__suppress_context__`,
 an exception leaving an `except` handler or raised by a `finally` records
 the one it interrupted as `__context__`, and an unchained exception
-answers `None` / `False` as CPython's does. **The
-differential baseline falls from 167 entries to 36.**
+answers `None` / `False` as CPython's does. A sixth went after the object
+model and the messages: the builtin-value dunder table is per-type now, as
+CPython's is (`hasattr(5, "__len__")` and `hasattr("s", "__int__")` were
+both `True`), which is also what makes a `@runtime_checkable` Protocol
+match structurally under `isinstance`; a parameter before `/` no longer
+binds by keyword (with `**kwargs` the keyword lands there, without one the
+call is rejected as CPython rejects it); `sys.modules["__main__"]` is the
+running module's own namespace, so the `__all__` that `pub` synthesises
+reads back; a frozen dict's `str()` is the mapping it wraps while its
+`repr()` names the `mappingproxy`; a replacement field nested in a format
+spec (`{n:>{w}}`) resolves; and a batch of conversions and messages came
+into line — `float.fromhex`, `str.format_map`, signed `int.to_bytes` /
+`int.from_bytes`, `issubclass(bool, int)`, `OSError` with a non-integer
+errno, `defaultdict` equality with a plain dict, `isinstance` through a
+builtin exception base (`json.JSONDecodeError` is a `ValueError`), and
+CPython's exact wording for the `ZeroDivisionError` family, `round(nan)` /
+`round(inf)`, `float("abc")`, `chr` / `ord`, `min` / `max` on an empty
+iterable, and `list.pop`. **The
+differential baseline falls from 167 entries to 25.**
 
 **Checking a module is linear in its definitions again.** Every branch,
 `try` and loop clones the whole `TypeEnv`, and each clone deep-copied every
@@ -497,7 +514,7 @@ additive on correct programs except the one marked **narrowing**.
 
 Everything that review deferred is closed by the beta wave above, except
 the VM's eager generator expressions and the thin `re` shim, which remain
-in `scripts/differential-baseline.txt` — the 36 entries there are the
+in `scripts/differential-baseline.txt` — the 25 entries there are the
 honest list of what the VM still gets wrong, and each one is a bug.
 
 ## 1.0.0-alpha.9 — 2026-08-21 — maintenance: secret-name lint expansion, allocation reductions & dependency wave

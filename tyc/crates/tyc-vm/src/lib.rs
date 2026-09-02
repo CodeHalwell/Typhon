@@ -2173,6 +2173,179 @@ main()
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
 
+    /// The builtin-value dunder table is per-type, as CPython's is: an int
+    /// has no `__len__`, a str no `__int__`, a set no `__getitem__`. A
+    /// `@runtime_checkable` Protocol reads the same table structurally.
+    #[test]
+    fn vm_builtin_dunder_table_and_runtime_protocols() {
+        let src = r#"
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class Sized(Protocol):
+    def __len__(self) -> int: ...
+
+class Box:
+    n: int
+impl Box:
+    def __len__(self) -> int:
+        return self.n
+
+def main() -> None:
+    let probes: list[bool] = [
+        hasattr(5, "__len__"),
+        hasattr("s", "__int__"),
+        hasattr([], "__bool__"),
+        hasattr(set(), "__getitem__"),
+        hasattr(1.5, "__index__"),
+    ]
+    if any(probes):
+        raise ValueError(f"builtin dunder table too permissive: {probes}")
+    let present: list[bool] = [
+        hasattr({}, "__reversed__"),
+        hasattr(5, "__index__"),
+        hasattr("s", "__len__"),
+        hasattr(5, "__float__"),
+    ]
+    if not all(present):
+        raise ValueError(f"builtin dunder table too strict: {present}")
+    if not isinstance([1], Sized) or not isinstance(Box(n=2), Sized):
+        raise ValueError("runtime_checkable protocol should match structurally")
+    if isinstance(5, Sized):
+        raise ValueError("an int is not Sized")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// A parameter before `/` never binds by keyword: with `**kwargs` the
+    /// keyword lands there, and without one CPython rejects the call.
+    #[test]
+    fn vm_positional_only_parameters() {
+        let src = r#"
+def g(a: int, /, **kw: int) -> str:
+    return f"{a} {sorted(kw.items())}"
+
+def h(x: int, /, y: int = 5) -> int:
+    return x + y
+
+def only(a: int, /, b: int) -> int:
+    return a + b
+
+def main() -> None:
+    if g(1, a=2) != "1 [('a', 2)]":
+        raise ValueError("positional-only name should reach **kwargs")
+    if h(1) != 6 or h(1, 2) != 3 or h(1, y=3) != 4:
+        raise ValueError("positional-or-keyword binding wrong")
+    try:
+        let _ = only(a=1, b=2)
+        raise ValueError("expected a TypeError")
+    except TypeError as e:
+        if "positional-only arguments passed as keyword arguments: 'a'" not in str(e):
+            raise ValueError(f"wrong message: {e}")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// A batch of exception messages and conversions the differential
+    /// harness caught the VM wording differently from CPython.
+    #[test]
+    fn vm_cpython_error_message_parity() {
+        let src = r#"
+def message(thunk: object) -> str:
+    try:
+        let _ = thunk()
+        return "<no error>"
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+
+def main() -> None:
+    let cases: list[tuple[object, str]] = [
+        (lambda: 1 / 0, "ZeroDivisionError: division by zero"),
+        (lambda: 1 // 0, "ZeroDivisionError: integer division or modulo by zero"),
+        (lambda: 1 % 0, "ZeroDivisionError: integer modulo by zero"),
+        (lambda: 1.0 / 0, "ZeroDivisionError: float division by zero"),
+        (lambda: 1.0 // 0, "ZeroDivisionError: float floor division by zero"),
+        (lambda: 1.0 % 0, "ZeroDivisionError: float modulo by zero"),
+        (lambda: round(float("nan")), "ValueError: cannot convert float NaN to integer"),
+        (lambda: round(float("inf")), "OverflowError: cannot convert float infinity to integer"),
+        (lambda: float("abc"), "ValueError: could not convert string to float: 'abc'"),
+        (lambda: chr(-1), "ValueError: chr() arg not in range(0x110000)"),
+        (lambda: ord("ab"), "TypeError: ord() expected a character, but string of length 2 found"),
+        (lambda: max([]), "ValueError: max() iterable argument is empty"),
+        (lambda: [].pop(), "IndexError: pop from empty list"),
+        (lambda: [1].pop(5), "IndexError: pop index out of range"),
+    ]
+    for thunk, want in cases:
+        let got: str = message(thunk)
+        if got != want:
+            raise ValueError(f"got {got!r}, want {want!r}")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// Conversions, formatting and containment the same sweep turned up.
+    #[test]
+    fn vm_stdlib_conversion_parity() {
+        let src = r#"
+import json
+from collections import defaultdict
+
+def main() -> None:
+    if float.fromhex("0x1.8p1") != 3.0 or float.fromhex("-0x1p-1") != -0.5:
+        raise ValueError("float.fromhex wrong")
+    if "a {x} {x}".format_map({"x": 1}) != "a 1 1":
+        raise ValueError("str.format_map wrong")
+    if "{n:>{w}}".format(n=42, w=8) != "      42":
+        raise ValueError("nested format spec wrong")
+    if (-1).to_bytes(2, "big", signed=True) != b"\xff\xff":
+        raise ValueError("signed to_bytes wrong")
+    if (255).to_bytes() != b"\xff" or (255).to_bytes(length=2, byteorder="big") != b"\x00\xff":
+        raise ValueError("to_bytes defaults wrong")
+    if int.from_bytes(b"\xff", "big", signed=True) != -1:
+        raise ValueError("signed from_bytes wrong")
+    if not issubclass(bool, int):
+        raise ValueError("bool is a subclass of int")
+    if str(OSError("a", "b", "c", "d")) != "[Errno a] b: 'c'":
+        raise ValueError(f"OSError str wrong: {OSError('a', 'b', 'c', 'd')}")
+    if defaultdict(int) != {} or defaultdict(list, {"a": [1]}) != {"a": [1]}:
+        raise ValueError("defaultdict equality wrong")
+    try:
+        let _ = json.loads("{,}")
+    except ValueError as e:
+        if type(e).__name__ != "JSONDecodeError":
+            raise ValueError("JSONDecodeError should be a ValueError")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// `freeze let` builds a `mappingproxy`, whose `str()` is the mapping it
+    /// wraps and whose `repr()` names the proxy — CPython's split.
+    #[test]
+    fn vm_frozen_dict_str_and_repr() {
+        let src = r#"
+freeze let CONFIG = {"limits": {"max": 100}}
+
+def main() -> None:
+    if str(CONFIG["limits"]) != "{'max': 100}":
+        raise ValueError(f"str wrong: {CONFIG['limits']}")
+    if repr(CONFIG["limits"]) != "mappingproxy({'max': 100})":
+        raise ValueError(f"repr wrong: {CONFIG['limits']!r}")
+    if str(CONFIG) != "{'limits': mappingproxy({'max': 100})}":
+        raise ValueError(f"nested str wrong: {CONFIG}")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
     #[test]
     fn vm_property_setter_and_dir() {
         let src = r#"

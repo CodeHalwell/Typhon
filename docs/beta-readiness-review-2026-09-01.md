@@ -393,7 +393,7 @@ with every gate green at each step.
    `functools` / `sys` / `typing` gaps), and the object model gained
    `NamedTuple` / `TypedDict` semantics, `issubclass`, function
    `__dict__`, identity-hashable classes and per-module dunders. **The
-   differential baseline is down from 167 entries to 36**, and the six
+   differential baseline is down from 167 entries to 25**, and the six
    diverging curated examples are gone.
 5. **Gates.** The differential job now also byte-compiles every emitted
    `.py` with `compileall` — an *emitter* verdict that is never baselined,
