@@ -65,6 +65,10 @@ class Random:
                 x = ((1000003 * x) ^ c) & 0xFFFFFFFFFFFFFFFF
             x ^= len(a)
             a = -2 if x == -1 else x
+        elif isinstance(a, bytearray):
+            # Listed in the error message below, so it had better be accepted:
+            # CPython seeds from a `bytearray` through the same path as `bytes`.
+            a = bytes(a)
         elif not (a is None or isinstance(a, (int, float, str, bytes))):
             raise TypeError("The only supported seed types are:\n"
                             "None, int, float, str, bytes, and bytearray.")

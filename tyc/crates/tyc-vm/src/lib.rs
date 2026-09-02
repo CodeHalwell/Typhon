@@ -2692,8 +2692,10 @@ import contextlib
 import csv
 import hashlib
 import io
+import itertools
 import os
 import pathlib
+import random
 import shutil
 import tempfile
 
@@ -2832,6 +2834,23 @@ def main() -> None:
     check("blake2b", hashlib.blake2b(b"").hexdigest()[:16], "786a02f742015903")
     check("blake2s", hashlib.blake2s(b"").hexdigest()[:16], "69217a3079908094")
     check("blake2b-block", hashlib.blake2b(b"x" * 128).hexdigest()[:16], hashlib.new("blake2b", b"x" * 128).hexdigest()[:16])
+
+    # `bytearray` is bytes-like everywhere CPython says it is, and the
+    # combinatorics iterators refuse a negative selection length.
+    check("hash-bytearray", hashlib.sha256(bytearray(b"abc")).hexdigest()[:16], "ba7816bf8f01cfea")
+    let seeded = random.Random()
+    seeded.seed(bytearray(b"seed"), version=2)
+    let plain = random.Random()
+    plain.seed(b"seed", version=2)
+    check("seed-bytearray", str(seeded.random()), str(plain.random()))
+    for label, fn in [("permutations", itertools.permutations),
+                      ("combinations", itertools.combinations),
+                      ("cwr", itertools.combinations_with_replacement)]:
+        try:
+            let _ = list(fn("abc", -1))
+            raise ValueError(label + " should refuse a negative r")
+        except ValueError as e:
+            check("negative-" + label, str(e), "r must be non-negative")
     print("ok")
 
 

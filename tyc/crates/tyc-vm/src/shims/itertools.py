@@ -242,6 +242,8 @@ def permutations(iterable, r=None):
     pool = tuple(iterable)
     n = len(pool)
     r = n if r is None else r
+    if r < 0:
+        raise ValueError("r must be non-negative")
     if r > n:
         return
     indices = list(range(n))
@@ -267,6 +269,8 @@ def permutations(iterable, r=None):
 def combinations(iterable, r):
     pool = tuple(iterable)
     n = len(pool)
+    if r < 0:
+        raise ValueError("r must be non-negative")
     if r > n:
         return
     indices = list(range(r))
@@ -288,6 +292,8 @@ def combinations(iterable, r):
 def combinations_with_replacement(iterable, r):
     pool = tuple(iterable)
     n = len(pool)
+    if r < 0:
+        raise ValueError("r must be non-negative")
     if not n and r:
         return
     indices = [0] * r

@@ -29,6 +29,10 @@ class _Hash:
     def update(self, data):
         if isinstance(data, str):
             raise TypeError("Strings must be encoded before hashing")
+        # `bytearray` supports the buffer protocol, so CPython hashes it
+        # exactly as it hashes `bytes`.
+        if isinstance(data, bytearray):
+            data = bytes(data)
         if not isinstance(data, bytes):
             raise TypeError("object supporting the buffer API required")
         self._data = self._data + data

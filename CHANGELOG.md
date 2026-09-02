@@ -282,6 +282,12 @@ the POSIX layout, so no Windows build could ever find one; and an adjacent
 something the VM does not model took the VM anyway and died there instead of
 compiling.
 
+Three more in the same sweep: `hashlib` and `random.seed` rejected a
+`bytearray` — the buffer protocol makes it bytes-like, and `random`'s own
+error message already listed it — and `itertools.permutations` /
+`combinations` / `combinations_with_replacement` accepted a negative `r`,
+silently yielding plausible nonsense where CPython raises.
+
 **A prelude name that only the VM could resolve.** `BaseModel` and
 `NewType` resolve without an import — the `model` and `newtype` lowerings
 introduce them — so naming either directly passes `tyc check`. Their
