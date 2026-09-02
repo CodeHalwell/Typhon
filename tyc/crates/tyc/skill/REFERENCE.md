@@ -439,11 +439,11 @@ print("untyped".slug())              # AttributeError at runtime — no static `
 
 ```python
 # Emitted Python (sketch)
-def __typhon_ext_str__slug(self: str) -> str:
+def __typhon_ext_str__slug__(self: str) -> str:
     return self.strip().lower().replace(" ", "-")
 
 title: str = "Hello World"
-print(__typhon_ext_str__slug(title))
+print(__typhon_ext_str__slug__(title))
 print("untyped".slug())              # untouched; falls back to native attribute lookup
 ```
 

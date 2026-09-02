@@ -22,6 +22,11 @@ pub enum Unwind {
     /// Compiler-internal sentinel for `?` short-circuit when the call site
     /// isn't inside a function (should never happen with valid Typhon).
     QuestionMark(Value),
+    /// A lazy generator body suspending at a `yield` — carries the yielded
+    /// value. Every enclosing construct records its resume frame as this
+    /// passes through, and `Interpreter::generator_resume` catches it at the
+    /// generator's frame boundary. It never crosses a function call.
+    Yield(Value),
 }
 
 #[derive(Debug, Clone)]

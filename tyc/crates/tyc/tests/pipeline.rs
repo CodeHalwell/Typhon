@@ -770,6 +770,61 @@ fn vm_run_resolves_siblings_and_binds_sealed_union_alias() {
 }
 
 #[test]
+fn vm_binds_module_dunders_like_cpython() {
+    // CPython gives every module its own `__name__`, `__doc__` and
+    // `__file__`. The VM bound `__name__` only on the entry module, so an
+    // imported sibling saw the entry's `"__main__"` and its
+    // `if __name__ == "__main__":` block ran under `tyc run` but not after
+    // `tyc build` — and `__doc__` was missing everywhere.
+    let project = tempfile::tempdir().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        project.path().join("typhon.toml"),
+        "[project]\nname = \"u\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+         [python]\ntarget = \"3.13\"\n[emit]\nformat = false\n[strictness]\n[env]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("sib.ty"),
+        "\"\"\"Sibling doc.\"\"\"\n\n\
+         print(\"sib\", __name__)\n\
+         if __name__ == \"__main__\":\n    print(\"SHOULD NOT RUN\")\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("main.ty"),
+        "\"\"\"Main doc.\"\"\"\n\
+         import sib\n\n\
+         print(\"main\", __name__, __doc__, sib.__doc__, sib.__name__)\n",
+    )
+    .unwrap();
+    let out = tyc().arg("run").arg(project.path()).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.status.success(),
+        "tyc run must succeed, got: {combined}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("sib sib\n"),
+        "an imported module's `__name__` is its own module name, got: {combined}"
+    );
+    assert!(
+        !stdout.contains("SHOULD NOT RUN"),
+        "an imported module's main-guard must stay shut, got: {combined}"
+    );
+    assert!(
+        stdout.contains("main __main__ Main doc. Sibling doc. sib"),
+        "module dunders must match CPython, got: {combined}"
+    );
+}
+
+#[test]
 fn pub_enum_parses_checks_and_exports() {
     // `pub enum` must parse (it was a hard parse error), check clean, and
     // contribute its name to the synthesised `__all__`.

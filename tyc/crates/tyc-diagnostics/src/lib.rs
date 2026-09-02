@@ -1532,6 +1532,30 @@ pub enum TycError {
         decl_span: SourceSpan,
     },
 
+    /// `go f(x)` spawns a task on the *running* event loop. Module-level
+    /// code runs at import with none — so a `go` there, or a module-level
+    /// call to a sync function that spawns, raised `RuntimeError: no
+    /// running event loop` at the call and left the coroutine never
+    /// awaited.
+    #[error("`go` needs a running event loop — `{callee}` is spawned from module-level code, where none is running")]
+    #[diagnostic(
+        code(tyc::go_outside_async),
+        url(
+            "https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/go_outside_async.md"
+        ),
+        help(
+            "move the `go` into an `async def` (and drive it with `asyncio.run(...)`), \
+             or call `asyncio.run({callee}(...))` to run the coroutine to completion here"
+        )
+    )]
+    GoOutsideAsync {
+        callee: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("runs at import time, with no event loop")]
+        span: SourceSpan,
+    },
+
     /// An ordinary function-local name is read where the
     /// definite-assignment pass cannot see an assignment on every path
     /// that reaches it — or can see that *no* assignment does (a read
@@ -2024,6 +2048,7 @@ impl TycError {
             | Self::NewtypeInvalidBase { src, span, .. }
             | Self::UseOfUninitialised { src, span, .. }
             | Self::PossiblyUnbound { src, span, .. }
+            | Self::GoOutsideAsync { src, span, .. }
             | Self::PubNameCollision { src, span, .. }
             | Self::PubStarOutsideInit { src, span, .. }
             | Self::AsyncWithoutAwait { src, span, .. }
@@ -2118,6 +2143,7 @@ impl TycError {
             | Self::NewtypeInvalidBase { src, span, .. }
             | Self::UseOfUninitialised { src, span, .. }
             | Self::PossiblyUnbound { src, span, .. }
+            | Self::GoOutsideAsync { src, span, .. }
             | Self::PubNameCollision { src, span, .. }
             | Self::PubStarOutsideInit { src, span, .. }
             | Self::AsyncWithoutAwait { src, span, .. }
@@ -3359,6 +3385,22 @@ impl TycError {
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(use_offset), use_length),
             decl_span: SourceSpan::new(SourceOffset::from(decl_offset), decl_length),
+        }
+    }
+
+    /// Construct a [`TycError::GoOutsideAsync`] error for a `go` spawn that
+    /// sits outside any `async def`.
+    pub fn go_outside_async(
+        callee: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::GoOutsideAsync {
+            callee: callee.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
         }
     }
 

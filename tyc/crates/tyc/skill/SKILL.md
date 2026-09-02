@@ -138,7 +138,7 @@ The 30-second mental model. Every later section in this skill is detail under on
 | Enum (v0.11.0) | `enum Color: RED; GREEN` / `enum C: RED = 1` | `class Color(enum.Enum): RED = enum.auto(); ...` (`import enum` injected) |
 | Methods | `impl User: def display(self) -> str: ...` | merged into the class body |
 | Extend foreign class | `extend User: def x(self) -> int: ...` | merged at desugar |
-| Extend built-in | `extend str: def slug(self) -> str: ...` | extracted to `__typhon_ext_str__slug` free fn + call-site rewrites |
+| Extend built-in | `extend str: def slug(self) -> str: ...` | extracted to `__typhon_ext_str__slug__` free fn + call-site rewrites |
 | Sealed union | `type Shape = Circle \| Rectangle` | `Shape = Circle \| Rectangle` (just a type alias) |
 | `impl` on sealed union (v0.6.0) | `impl Shape: def area(self) -> float: ...` | distributes the method to every variant |
 | Exhaustive match | `match s: case Circle(r): ...` (no `_` needed) | vanilla Python `match` |
@@ -488,7 +488,7 @@ enum Color:                       # → class Color(enum.Enum):
 - `impl[T] ClassName[T]:` introduces type parameters scoped over the methods; methods may add their own (`def map[U](...)`).
 - `impl OtherType:` on an **alias** of a sealed union distributes the methods to every variant (v0.6.0). Duplicate-method check fires when the same method exists on both `impl Union:` and `impl Variant:`.
 - `extend ClassName:` is `impl`'s twin for cross-module method addition. Same merge semantics.
-- `extend BUILTIN:` (`str`, `list`, `int`, `dict`, …) extracts each method to a module-level free function `__typhon_ext_<TYPE>__<METHOD>`, and rewrites `x.method(...)` to the free-function call **whenever the receiver `x` is statically annotated as that built-in**. No monkey-patching — un-annotated receivers still raise `AttributeError` at runtime. `extend list[int]:` (parametric target) fires `tyc::extend_builtin` — drop the brackets. **As of v0.15.5, `extend BUILTIN:` crosses module boundaries** — importing a module that declares `extend str: def slug(...)` makes `title.slug()` resolve in the consumer (the type checker, build/codegen, and VM all propagate the extension registry). In earlier releases this was module-local; the free-function workaround (`pub def to_slug(s: str) -> str: …`) still works but is no longer necessary.
+- `extend BUILTIN:` (`str`, `list`, `int`, `dict`, …) extracts each method to a module-level free function `__typhon_ext_<TYPE>__<METHOD>__`, and rewrites `x.method(...)` to the free-function call **whenever the receiver `x` is statically annotated as that built-in**. No monkey-patching — un-annotated receivers still raise `AttributeError` at runtime. `extend list[int]:` (parametric target) fires `tyc::extend_builtin` — drop the brackets. **As of v0.15.5, `extend BUILTIN:` crosses module boundaries** — importing a module that declares `extend str: def slug(...)` makes `title.slug()` resolve in the consumer (the type checker, build/codegen, and VM all propagate the extension registry). In earlier releases this was module-local; the free-function workaround (`pub def to_slug(s: str) -> str: …`) still works but is no longer necessary.
 
 ### 5.9 `unsafe:` boundary
 
@@ -1599,6 +1599,7 @@ The recurring diagnostic codes and what they actually mean. **See [DIAGNOSTICS.m
 | `tyc::immutable_assign` | Reassigning a `let` binding | Change to `mut`, or extract a new `let` |
 | `tyc::missing_initialiser` | `let NAME: T` written that is never assigned | Initialise inline, or assign on every non-diverging path |
 | `tyc::use_of_uninitialised` | (v0.7.0) Read of `let NAME: T` on a path that didn't assign | Initialise inline, or assign in every non-diverging arm |
+| `tyc::go_outside_async` | `go f(x)` reached from module-level code (directly or via a sync function called at module level) — no running event loop, `RuntimeError` at the call | Move the `go` into an `async def` driven by `asyncio.run(...)`, or `asyncio.run(f(x))` |
 | `tyc::possibly_unbound` | (warning) Ordinary local read on a path that may not — or provably does not — assign it (`if` without `else`, after `del`, `except … as e` after the handler, loop target after a possibly-empty loop) | Assign a default before the branch / loop, or `return` in the arm that has nothing to assign |
 | `tyc::no_block_shadow` | Inner `let`/`mut` would shadow an outer binding | Rename inner binding (no block scope in Python) |
 | `tyc::pattern_shadows_outer` | `case Wrap(value):` against outer `let value` | Rename the capture (`case Wrap(inner):`) |

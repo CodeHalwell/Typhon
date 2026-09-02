@@ -819,6 +819,74 @@ fn is_dynamic_type(t: &Type) -> bool {
 /// asyncio entry-points that accept coroutines as direct arguments.
 /// Used by the `missing_await` check (FINDINGS #49) to suppress
 /// false positives on the canonical `asyncio.run(coro())` pattern.
+/// `Some(spawned callee)` when a function body spawns a task with `go` in
+/// its own statements (nested `def`s are separate frames).
+fn body_spawns_task(body: &[Stmt]) -> Option<String> {
+    struct V {
+        found: Option<String>,
+    }
+    impl ruff_python_ast::visitor::Visitor<'_> for V {
+        fn visit_stmt(&mut self, s: &Stmt) {
+            if self.found.is_some() || matches!(s, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+                return;
+            }
+            ruff_python_ast::visitor::walk_stmt(self, s);
+        }
+        fn visit_expr(&mut self, e: &Expr) {
+            if self.found.is_some() {
+                return;
+            }
+            if let Expr::Call(call) = e {
+                if let Some(callee) = task_spawn_callee(call) {
+                    self.found = Some(callee);
+                    return;
+                }
+            }
+            ruff_python_ast::visitor::walk_expr(self, e);
+        }
+    }
+    let mut v = V { found: None };
+    for s in body {
+        ruff_python_ast::visitor::walk_stmt(&mut v, s);
+        if v.found.is_some() {
+            break;
+        }
+    }
+    v.found
+}
+
+/// `Some(callee)` when `call` is the lowered `go` form
+/// `typhon_runtime.tasks.spawn(<callee>(...))`; the callee is rendered for
+/// the diagnostic (`fetch`, `client.get`, or `the coroutine`).
+fn task_spawn_callee(call: &ruff_python_ast::ExprCall) -> Option<String> {
+    let Expr::Attribute(spawn) = call.func.as_ref() else {
+        return None;
+    };
+    if spawn.attr.as_str() != "spawn" {
+        return None;
+    }
+    let Expr::Attribute(tasks) = spawn.value.as_ref() else {
+        return None;
+    };
+    if tasks.attr.as_str() != "tasks"
+        || !matches!(tasks.value.as_ref(), Expr::Name(n) if n.id.as_str() == "typhon_runtime")
+    {
+        return None;
+    }
+    let callee = match call.arguments.args.first() {
+        Some(Expr::Call(inner)) => match inner.func.as_ref() {
+            Expr::Name(n) => n.id.as_str().to_owned(),
+            Expr::Attribute(a) => match a.value.as_ref() {
+                Expr::Name(base) => format!("{}.{}", base.id.as_str(), a.attr.as_str()),
+                _ => a.attr.as_str().to_owned(),
+            },
+            _ => "the coroutine".to_owned(),
+        },
+        _ => "the coroutine".to_owned(),
+    };
+    Some(callee)
+}
+
 /// Whether the callee of `call` is a known `async def`: a module-level async
 /// function called by bare name, or an `async def` method called on a
 /// receiver whose class shape is known.
@@ -948,9 +1016,23 @@ fn contains_free_typevar(ty: &Type) -> bool {
 /// are the non-generic constructor path's responsibility, out of scope
 /// here). Assignability uses the normal [`Checker::is_assignable`] rule
 /// so int→float widening, None→optional, and subclassing still pass.
+/// The order positional constructor arguments fill a class's fields: the
+/// declared order for a dataclass, and — for a `class!`, whose `__init__`
+/// the desugarer synthesises — the required fields first, then the
+/// defaulted ones.
+fn constructor_positional_order(c: &Checker, name: &str, shape: &InterfaceShape) -> Vec<String> {
+    if !c.is_raw_class(name) {
+        return shape.field_order.clone();
+    }
+    let mut order = shape.field_order.clone();
+    order.sort_by_key(|field| shape.field_defaults.contains(field));
+    order
+}
+
 fn check_generic_constructor_args(
     c: &mut Checker,
     shape: &InterfaceShape,
+    positional_order: &[String],
     bindings: &HashMap<String, Type>,
     pos_args: &[Expr],
     kw_args: &[ruff_python_ast::Keyword],
@@ -961,7 +1043,7 @@ fn check_generic_constructor_args(
             // `*iter` unpack — can't map to a specific field.
             continue;
         }
-        let Some(field_name) = shape.field_order.get(idx) else {
+        let Some(field_name) = positional_order.get(idx) else {
             continue;
         };
         let Some(field_ty) = shape.fields.get(field_name) else {
@@ -1032,9 +1114,14 @@ fn check_one_generic_ctor_arg(
 /// shape it can't fully model. The two helpers target disjoint field kinds
 /// (concrete here, type-parameter there), so a generic class running both
 /// checks never double-reports.
+///
+/// `positional_order` is the order positional arguments fill fields — see
+/// [`constructor_positional_order`]; for a `class!` it is required-first,
+/// not declaration order.
 fn check_concrete_constructor_args(
     c: &mut Checker,
     shape: &InterfaceShape,
+    positional_order: &[String],
     pos_args: &[Expr],
     kw_args: &[ruff_python_ast::Keyword],
 ) {
@@ -1042,7 +1129,7 @@ fn check_concrete_constructor_args(
         if matches!(arg, Expr::Starred(_)) {
             continue;
         }
-        let Some(field_name) = shape.field_order.get(idx) else {
+        let Some(field_name) = positional_order.get(idx) else {
             continue;
         };
         let Some(field_ty) = shape.fields.get(field_name).cloned() else {
@@ -1178,7 +1265,8 @@ fn check_explicit_typearg_constructor(
         })
         .map(|(i, _)| i)
         .collect();
-    check_generic_constructor_args(c, &shape, &bindings, pos_args, kw_args);
+    let positional_order = constructor_positional_order(c, &name, &shape);
+    check_generic_constructor_args(c, &shape, &positional_order, &bindings, pos_args, kw_args);
     for (i, arg) in pos_args.iter().enumerate() {
         if !typevar_field_idxs.contains(&i) {
             let _ = infer_expr(c, arg);
@@ -2870,6 +2958,15 @@ struct Checker<'a> {
     /// (`time.sleep`, `requests.get`, …) that should be wrapped in
     /// `await asyncio.to_thread(...)` instead.
     in_async_function: bool,
+    /// Number of `async def` bodies lexically enclosing the current point
+    /// (a sync `def` nested in an `async def` still counts as inside one:
+    /// a running loop may exist when it is called).
+    async_enclosing_depth: u32,
+    /// Top-level sync functions whose body spawns a task with `go`
+    /// (directly, not in a nested def), mapped to the spawned callee's
+    /// name. Calling one from module-level code runs the spawn with no
+    /// event loop.
+    sync_spawners: HashMap<String, String>,
     /// True while we are checking the body of a generator function
     /// (any `def f() -> Iterator[T]` / `Generator[Y, S, R]` whose body
     /// contains `yield` / `yield from`). Inside a generator, `return`
@@ -3307,6 +3404,8 @@ impl<'a> Checker<'a> {
             in_question_temp_rhs: false,
             in_sync_function: false,
             in_async_function: false,
+            async_enclosing_depth: 0,
+            sync_spawners: HashMap::new(),
             in_generator: false,
             function_type_bounds: HashMap::new(),
             active_typevar_bounds: HashMap::new(),
@@ -8622,6 +8721,8 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
             // alongside the body walk.
             if f.is_async {
                 c.async_functions.insert(f.name.as_str().to_owned());
+            } else if let Some(callee) = body_spawns_task(&f.body) {
+                c.sync_spawners.insert(f.name.as_str().to_owned(), callee);
             }
             // Also extract any declared TypeVar bounds so they can be checked
             // at call sites.
@@ -9953,6 +10054,29 @@ fn missing_required_params(
         }
     }
     missing
+}
+
+/// Stable-partition an arity model so required positional parameters come
+/// before defaulted ones — the shape a synthesised `class!` constructor has.
+fn required_first(info: ArityInfo) -> ArityInfo {
+    let mut order: Vec<usize> = (0..info.param_names.len()).collect();
+    order.sort_by_key(|&i| !info.required_positional.get(i).copied().unwrap_or(true));
+    let pick = |v: &[String]| -> Vec<String> { order.iter().map(|&i| v[i].clone()).collect() };
+    let param_names = pick(&info.param_names);
+    let param_types: Vec<Type> = order
+        .iter()
+        .map(|&i| info.param_types.get(i).cloned().unwrap_or(Type::Unknown))
+        .collect();
+    let required_positional: Vec<bool> = order
+        .iter()
+        .map(|&i| info.required_positional.get(i).copied().unwrap_or(true))
+        .collect();
+    ArityInfo {
+        param_names,
+        param_types,
+        required_positional,
+        ..info
+    }
 }
 
 fn class_constructor_arity(shape: &InterfaceShape) -> ArityInfo {
@@ -13007,6 +13131,9 @@ fn check_function(
     c.in_sync_function = !is_async;
     let saved_in_async = c.in_async_function;
     c.in_async_function = is_async;
+    if is_async {
+        c.async_enclosing_depth += 1;
+    }
     // Track whether the current function body is a generator so the
     // return-statement validator can skip the usual assignability
     // check (FINDINGS O6): inside a generator, `return` raises
@@ -13209,6 +13336,9 @@ fn check_function(
     c.active_typevar_bounds = saved_bounds;
     c.active_type_params = saved_type_params;
     c.in_sync_function = saved_in_sync;
+    if is_async {
+        c.async_enclosing_depth -= 1;
+    }
     c.in_async_function = saved_in_async;
     c.in_generator = saved_in_generator;
 }
@@ -17916,6 +18046,32 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     }
                 }
             }
+            // `go f(x)` lowers to `typhon_runtime.tasks.spawn(f(x))`, which
+            // needs a *running* event loop. Module-level code runs at import
+            // with none, so a spawn there — or a module-level call to a sync
+            // function that spawns — raised `RuntimeError` at runtime. A
+            // spawn inside a sync `def` is left alone: the function may well
+            // be called from a coroutine.
+            let at_module_level = c.current_return.is_none() && c.async_enclosing_depth == 0;
+            if at_module_level && c.unsafe_depth == 0 {
+                let offender = task_spawn_callee(call).or_else(|| match call.func.as_ref() {
+                    Expr::Name(n) => c
+                        .sync_spawners
+                        .get(n.id.as_str())
+                        .map(|spawned| format!("{spawned} (via {})", n.id.as_str())),
+                    _ => None,
+                });
+                if let Some(callee) = offender {
+                    let span = (call.range.start().to_usize(), call.range.end().to_usize());
+                    c.diagnostics.push_error(TycError::go_outside_async(
+                        callee,
+                        c.path.clone(),
+                        c.source,
+                        span.0,
+                        span.1.saturating_sub(span.0).max(1),
+                    ));
+                }
+            }
             let suppresses_missing_await = call_targets_coro_acceptor(call);
 
             // Argument access check on the receiver (for things like x.foo()
@@ -18458,7 +18614,15 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         // `TypeError: missing 1 required positional argument`.
                         // The shape here is `effective_class_shape`, so the
                         // arity sees inherited parent fields too.
-                        let info = class_constructor_arity(&shape);
+                        let mut info = class_constructor_arity(&shape);
+                        // A `class!` constructor is synthesised by the desugarer
+                        // with the required fields first and the defaulted ones
+                        // after (Python forbids a defaulted positional before a
+                        // required one, and an inherited default may precede a
+                        // subclass's required field). Model the same order.
+                        if c.is_raw_class(&name) {
+                            info = required_first(info);
+                        }
                         // Run the arity check when the shape is authoritative
                         // for the constructor — even with zero fields, so
                         // `ZeroFieldClass(1)` / `Session(1)` is caught as
@@ -18539,7 +18703,14 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         // from a venv-introspected third-party `__init__`.
                         // Type-parameter fields on a generic class are handled
                         // separately below by `check_generic_constructor_args`.
-                        check_concrete_constructor_args(c, &shape, pos_args, kw_args);
+                        let positional_order = constructor_positional_order(c, &name, &shape);
+                        check_concrete_constructor_args(
+                            c,
+                            &shape,
+                            &positional_order,
+                            pos_args,
+                            kw_args,
+                        );
                     }
                     if let Some(tparams) = c.class_type_params.get(&name).cloned() {
                         let mut bindings: HashMap<String, Type> = HashMap::new();
@@ -18583,12 +18754,16 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         // bindings (inserted above) win because
                         // `bind_field_typevars` only fills vacant slots.
                         let class_shape = c.class_shapes.get(&name).cloned();
+                        let positional_order: Vec<String> = class_shape
+                            .as_ref()
+                            .map(|shape| constructor_positional_order(c, &name, shape))
+                            .unwrap_or_default();
                         if let Some(shape) = class_shape.clone() {
                             for (idx, arg) in pos_args.iter().enumerate() {
                                 if matches!(arg, Expr::Starred(_)) {
                                     continue;
                                 }
-                                if let Some(field_name) = shape.field_order.get(idx) {
+                                if let Some(field_name) = positional_order.get(idx) {
                                     if let Some(field_ty) = shape.fields.get(field_name).cloned() {
                                         let arg_ty = infer_expr(c, arg);
                                         bind_field_typevars(&field_ty, &arg_ty, &mut bindings);
@@ -18611,7 +18786,14 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         // fires when a type parameter is actually pinned
                         // — see `check_generic_constructor_args`.
                         if let Some(shape) = class_shape {
-                            check_generic_constructor_args(c, &shape, &bindings, pos_args, kw_args);
+                            check_generic_constructor_args(
+                                c,
+                                &shape,
+                                &positional_order,
+                                &bindings,
+                                pos_args,
+                                kw_args,
+                            );
                         }
                         let args: Vec<Type> = tparams
                             .iter()
@@ -23404,6 +23586,111 @@ async def main() -> None:
                 d.warnings()
             );
         }
+    }
+
+    #[test]
+    fn go_outside_async_fires_only_from_module_level_code() {
+        // Module-level spawn, and a module-level call to a sync function
+        // that spawns: no event loop is running at import time.
+        for src in [
+            "async def work() -> None:\n    pass\n\ntyphon_runtime.tasks.spawn(work())\n",
+            "async def work() -> None:\n    pass\n\ndef kick() -> None:\n    typhon_runtime.tasks.spawn(work())\n\nkick()\n",
+        ] {
+            let d = check(src);
+            assert!(
+                d.errors().iter().any(|e| matches!(e, TycError::GoOutsideAsync { .. })),
+                "{src}: {:?}",
+                d.errors()
+            );
+        }
+        // A spawn inside a sync def that is only called from a coroutine, or
+        // inside an async def, is fine.
+        for src in [
+            "async def work() -> None:\n    pass\n\ndef kick() -> None:\n    typhon_runtime.tasks.spawn(work())\n\nasync def main() -> None:\n    kick()\n",
+            "async def work() -> None:\n    pass\n\nasync def main() -> None:\n    typhon_runtime.tasks.spawn(work())\n",
+        ] {
+            let d = check(src);
+            assert!(
+                !d.errors().iter().any(|e| matches!(e, TycError::GoOutsideAsync { .. })),
+                "{src}: {:?}",
+                d.errors()
+            );
+        }
+    }
+
+    #[test]
+    fn raw_class_chain_constructor_takes_required_fields_first() {
+        // The desugarer synthesises `Grand.__init__(self, a, c, b=2)`: the
+        // inherited default moves behind the subclass's required field.
+        let src = "\
+class Base:
+    pass
+
+class! Child(Base):
+    a: int
+    b: int = 2
+
+class! Grand(Child):
+    c: str
+
+def main() -> None:
+    let g: Grand = Grand(1, \"x\")
+    let h: Grand = Grand(1, \"x\", 3)
+    let k: Grand = Grand(a=1, c=\"x\")
+    print(g.a, g.b, g.c, h.b, k.c)
+";
+        let d = check_class_kinds(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+        let bad = "\
+class Base:
+    pass
+
+class! Child(Base):
+    a: int
+    b: int = 2
+
+class! Grand(Child):
+    c: str
+
+def main() -> None:
+    let g: Grand = Grand(1, 2)
+";
+        assert!(
+            check_class_kinds(bad).has_errors(),
+            "the second positional is `c: str`"
+        );
+        // Same chain, but rooted at a `plain class` with an `impl` block and
+        // carrying a `ClassVar` on the middle class -- the shape that reaches
+        // the *concrete* constructor-argument check rather than the generic
+        // one. Both must agree on the required-first positional order.
+        let concrete = "\
+from typing import ClassVar
+
+plain class Base:
+    pass
+
+impl Base:
+    def __init__(self) -> None:
+        pass
+
+class! Child(Base):
+    tag: ClassVar[str] = \"child\"
+    a: int
+    b: int = 2
+
+class! Grand(Child):
+    c: str
+
+def main() -> None:
+    let g: Grand = Grand(1, \"x\")
+    print(g.a, g.b, g.c, Grand.tag)
+";
+        let d = check_class_kinds(concrete);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+        assert!(
+            check_class_kinds(&concrete.replace("Grand(1, \"x\")", "Grand(1, 2)")).has_errors(),
+            "the second positional is still `c: str` on the concrete path"
+        );
     }
 
     #[test]

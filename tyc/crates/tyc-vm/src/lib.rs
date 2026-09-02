@@ -25,10 +25,13 @@ pub mod builtins;
 /// Generated Unicode case-folding tables for `str.casefold()` — see the module
 /// header and `scripts/gen-casefold.py`.
 mod casefold_data;
+pub mod codecs;
 pub mod env;
 pub mod error;
 pub mod ffi;
+pub mod hashes;
 pub mod interp;
+pub mod pyhash;
 pub mod slots;
 pub mod value;
 
@@ -180,6 +183,11 @@ pub fn run_source(
     }
 
     let mut interp = Interpreter::new();
+    interp.lazy_import_aliases = prep
+        .lazy_imports
+        .iter()
+        .map(|li| (li.module.clone(), li.alias.clone()))
+        .collect();
     // Source info for traceback frames: file name + line table over the
     // preprocessed source (line-preserving for ordinary statements, so
     // frame numbers match the user's .ty lines).
@@ -209,6 +217,15 @@ pub fn run_source(
         "__name__",
         Value::Str(std::rc::Rc::new("__main__".to_string())),
     );
+    // …and `__doc__`, which CPython binds on every module: the leading
+    // string literal, or `None`.
+    interp.root.set(
+        "__doc__",
+        match crate::interp::module_docstring(&module) {
+            Some(doc) => Value::Str(std::rc::Rc::new(doc)),
+            None => Value::None,
+        },
+    );
     if let Some(p) = origin {
         interp.root.set(
             "__file__",
@@ -216,7 +233,11 @@ pub fn run_source(
         );
     }
 
-    match interp.run_module(&module) {
+    let run_result = interp.run_module(&module);
+    // CPython flushes every file object still open when the interpreter
+    // finalises them; the `io` shim keeps that list.
+    flush_open_files(&mut interp);
+    match run_result {
         Ok(()) => Ok(0),
         Err(Unwind::Return(_)) => Ok(0),
         Err(Unwind::Exception(exc)) if exc.kind == "SystemExit" => {
@@ -279,7 +300,7 @@ pub fn run_source(
             }
             Ok(1)
         }
-        Err(Unwind::Break | Unwind::Continue | Unwind::QuestionMark(_)) => {
+        Err(Unwind::Break | Unwind::Continue | Unwind::QuestionMark(_) | Unwind::Yield(_)) => {
             Err(VmError::runtime("unexpected control-flow at module level"))
         }
     }
@@ -444,6 +465,17 @@ fn inject_vm_cross_module_ext_imports(
 
     for (i, stmt) in injected.into_iter().enumerate() {
         module.body.insert(insert_pos + i, stmt);
+    }
+}
+
+/// Flush the `io` shim's still-open file objects (a no-op when the program
+/// never opened a file).
+fn flush_open_files(interp: &mut Interpreter) {
+    let Some(io) = interp.module_cache.get("__builtin__:io").cloned() else {
+        return;
+    };
+    if let Ok(flush) = interp.get_attr(&io, "_flush_all") {
+        let _ = interp.call_value(flush, vec![], &[]);
     }
 }
 
@@ -1329,7 +1361,7 @@ print(d.breed)
         // fail at runtime with AttributeError. The VM now runs the same
         // desugar + extend-builtin extraction passes as `tyc build`, so
         // call sites like `"Hello".slug()` rewrite to the lifted free
-        // function `__typhon_ext_str__slug("Hello")`.
+        // function `__typhon_ext_str__slug__("Hello")`.
         let src = r#"
 extend str:
     def slug(self) -> str:
@@ -1344,23 +1376,42 @@ print(s.slug())
     #[test]
     fn lazy_let_inside_class_resolves() {
         // FINDINGS #26: `lazy let` inside a class body lowers (in the
-        // preprocessor) to a `@cached_property` method, with a hidden
-        // `from functools import cached_property as _typhon_cached_property`
-        // import injected at module top. The functools shim now exposes
-        // `cached_property` as an identity decorator so the import
-        // resolves and the method is registered as a regular method on
-        // the class. Limitation: callers must invoke as `obj.name()`
-        // rather than `obj.name` because the VM has no descriptor
-        // protocol — documented at the cached_property registration
-        // site in builtins.rs.
+        // preprocessor) to a `@_typhon_cached_property` method, with a
+        // hidden `from functools import cached_property as
+        // _typhon_cached_property` import injected at module top. The VM
+        // models `functools.cached_property` faithfully: the attribute is
+        // read *without* a call, the body runs once per instance on first
+        // access and the value is cached in the instance dict, and calling
+        // the cached value is the ordinary `'int' object is not callable`
+        // TypeError. Expectations pinned against CPython 3.13.
         let src = r#"
+calls: list[int] = []
+
+def compute(n: int) -> int:
+    calls.append(n)
+    return n * 2
+
 class Counter:
     n: int
 
-    lazy let doubled: int = self.n * 2
+    lazy let doubled: int = compute(self.n)
 
 let c = Counter(n=21)
-print(c.doubled())
+if len(calls) != 0:
+    raise ValueError("lazy let computed eagerly at construction")
+if c.doubled != 42:
+    raise ValueError("wrong value: " + str(c.doubled))
+if c.doubled != 42:
+    raise ValueError("wrong value on second access")
+if len(calls) != 1:
+    raise ValueError("cached_property body ran " + str(len(calls)) + " times")
+try:
+    c.doubled()
+except TypeError as e:
+    if str(e) != "'int' object is not callable":
+        raise ValueError("unexpected message: " + str(e))
+else:
+    raise ValueError("calling the cached value did not raise")
 "#;
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
@@ -2516,6 +2567,831 @@ if abs(math.dist([0,0],[3,4]) - 5.0) > 1e-10:
     }
 
     #[test]
+    fn class_kinds_hash_eq_frozen_slots_match_cpython() {
+        // Dict/set keys honour a user `__hash__` / `__eq__`; a non-frozen
+        // dataclass is unhashable; a frozen one hashes like its field tuple;
+        // a plain class hashes and compares by identity, takes no
+        // constructor arguments and gets `object.__repr__`; `hash()` of the
+        // builtin types is CPython's (PYTHONHASHSEED=0 for str/bytes);
+        // frozen / slots enforcement and the generated `__init__` argument
+        // errors carry CPython 3.13's exact messages. Every expected line
+        // was printed by `PYTHONHASHSEED=0 python3.13` on the equivalent
+        // program (`@dataclass(slots=True[, frozen=True])` classes).
+        let src = r#"
+import dataclasses
+from dataclasses import FrozenInstanceError
+
+class Pt frozen:
+    x: int
+    y: int
+
+class Mut:
+    x: int
+
+plain class CI:
+    s: str = ""
+
+impl CI:
+    def __init__(self, s: str) -> None:
+        self.s = s
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, CI) and other.s.lower() == self.s.lower()
+    def __hash__(self) -> int:
+        return hash(self.s.lower())
+    def __repr__(self) -> str:
+        return f"CI({self.s!r})"
+
+plain class Bag:
+    items: list[str]
+    count: int = 0
+
+plain class Node:
+    v: int = 0
+
+impl Node:
+    def __init__(self, v: int) -> None:
+        self.v = v
+
+class P3:
+    x: int
+    y: int
+    z: int = 0
+
+class Q4:
+    a: int
+    b: int
+    c: int
+    d: int
+
+class E0:
+    pass
+
+out: list[str] = []
+
+def emit(*parts: object) -> None:
+    out.append(" ".join(str(p) for p in parts))
+
+def show(label: str, f: object) -> None:
+    try:
+        emit(label, f())
+    except Exception as e:
+        emit(label, type(e).__name__, e)
+
+def main() -> None:
+    d = {CI("A"): 1}
+    emit("H1", d[CI("a")], CI("a") in d, CI("A") in {CI("a")}, len({CI("a"), CI("A")}), d.get(CI("a")), d.pop(CI("A")), d)
+    s = {CI("x")}
+    s.add(CI("X"))
+    s.discard(CI("x"))
+    emit("H2", s, [CI("a")] == [CI("A")], ([CI("a")], 1) == ([CI("A")], 1), {"k": CI("a")} == {"k": CI("A")})
+    emit("H3", hash(Pt(1, 2)) == hash((1, 2)), {Pt(1, 2): "v"}[Pt(1, 2)], len({Pt(1, 2), Pt(1, 2)}), Pt(1, 2) == Pt(1, 2), Pt(1, 2) != Pt(1, 3))
+    show("H4", lambda: hash(Mut(1)))
+    show("H5", lambda: {Mut(1): 1})
+    show("H6", lambda: {Mut(1)})
+    emit("H7", Mut(1) == Mut(1), Mut(1) in [Mut(1)], [Mut(1)].index(Mut(1)))
+    n1 = Node(1)
+    n2 = Node(1)
+    emit("H8", n1 == n2, n1 == n1, n1 != n2, len({n1, n2}), n1 in {n1}, n2 in {n1}, [n1] == [n1], [n1] == [n2])
+    emit("H9", hash(None), hash(True), hash(1), hash(-1), hash(2**61), hash(1.5), hash(-2.0), hash((1, 2)), hash(()), hash("abc"), hash(b"ab"), hash(frozenset({1, 2})), hash(complex(1, 2)), hash(range(5)), hash(2**100))
+    p = Pt(1, 2)
+    show("F1", lambda: setattr(p, "x", 5))
+    show("F2", lambda: setattr(p, "z", 5))
+    def delx() -> None:
+        del p.x
+    show("F3", delx)
+    try:
+        p.x = 9
+    except AttributeError as e:
+        emit("F4", type(e).__name__, e, isinstance(e, FrozenInstanceError), isinstance(e, AttributeError))
+    emit("F5", p, dataclasses.replace(p, y=7))
+    m = Mut(1)
+    m.x = 2
+    show("S1", lambda: setattr(m, "y", 3))
+    emit("S2", m)
+    b = Bag()
+    emit("P1", type(b).__name__, Bag.count, b.count, hasattr(b, "items"))
+    show("P2", lambda: b.items)
+    show("P3", lambda: Bag(1))
+    show("P4", lambda: Bag(items=[]))
+    b.items = ["x"]
+    emit("P5", b.items, repr(b).startswith("<__main__.Bag object at 0x"), str(b) == repr(b))
+    show("D1", lambda: P3())
+    show("D2", lambda: P3(1))
+    show("D3", lambda: P3(1, 2, 3, 4))
+    show("D4", lambda: P3(1, q=2))
+    show("D5", lambda: P3(1, 2, x=1))
+    show("D6", lambda: P3(1, 2, 3, 4, q=1))
+    show("D7", lambda: P3(y=2, z=3))
+    show("D8", lambda: Q4())
+    show("D9", lambda: Q4(1))
+    show("D10", lambda: E0(1))
+    emit("D11", P3(1, 2), P3(1, y=2, z=5), Q4(1, 2, 3, 4))
+    def m1(v: object) -> str:
+        match v:
+            case Pt(a, b, c):
+                return "3"
+            case Pt(a, b):
+                return f"2:{a},{b}"
+        return "none"
+    show("M1", lambda: m1(Pt(1, 2)))
+    def m2(v: object) -> str:
+        match v:
+            case Bag(a):
+                return "1"
+        return "none"
+    show("M2", lambda: m2(Bag()))
+    def m3(v: object) -> str:
+        match v:
+            case Pt(a, y=bb):
+                return f"{a},{bb}"
+        return "none"
+    emit("M3", m3(Pt(4, 5)), m3(Bag()))
+
+main()
+
+expected = """H1 1 True True 1 1 1 {}
+H2 set() True True True
+H3 True v 1 True True
+H4 TypeError unhashable type: 'Mut'
+H5 TypeError unhashable type: 'Mut'
+H6 TypeError unhashable type: 'Mut'
+H7 True True 0
+H8 False True True 2 True False True False
+H9 4238894112 1 1 -2 1 1152921504606846977 -2 -3550055125485641917 5740354900026072187 -4594863902769663758 6148830537548944441 -1826646154956904602 2000007 5795932985296280846 549755813888
+F1 FrozenInstanceError cannot assign to field 'x'
+F2 TypeError super(type, obj): obj (instance of Pt) is not an instance or subtype of type (Pt).
+F3 FrozenInstanceError cannot delete field 'x'
+F4 FrozenInstanceError cannot assign to field 'x' True True
+F5 Pt(x=1, y=2) Pt(x=1, y=7)
+S1 AttributeError 'Mut' object has no attribute 'y' and no __dict__ for setting new attributes
+S2 Mut(x=2)
+P1 Bag 0 0 False
+P2 AttributeError 'Bag' object has no attribute 'items'
+P3 TypeError Bag() takes no arguments
+P4 TypeError Bag() takes no arguments
+P5 ['x'] True True
+D1 TypeError P3.__init__() missing 2 required positional arguments: 'x' and 'y'
+D2 TypeError P3.__init__() missing 1 required positional argument: 'y'
+D3 TypeError P3.__init__() takes from 3 to 4 positional arguments but 5 were given
+D4 TypeError P3.__init__() got an unexpected keyword argument 'q'
+D5 TypeError P3.__init__() got multiple values for argument 'x'
+D6 TypeError P3.__init__() got an unexpected keyword argument 'q'
+D7 TypeError P3.__init__() missing 1 required positional argument: 'x'
+D8 TypeError Q4.__init__() missing 4 required positional arguments: 'a', 'b', 'c', and 'd'
+D9 TypeError Q4.__init__() missing 3 required positional arguments: 'b', 'c', and 'd'
+D10 TypeError E0.__init__() takes 1 positional argument but 2 were given
+D11 P3(x=1, y=2, z=0) P3(x=1, y=2, z=5) Q4(a=1, b=2, c=3, d=4)
+M1 TypeError Pt() accepts 2 positional sub-patterns (3 given)
+M2 TypeError Bag() accepts 0 positional sub-patterns (1 given)
+M3 4,5 none""".split("\n")
+for i, (got, want) in enumerate(zip(out, expected)):
+    if got != want:
+        raise AssertionError(f"line {i}: got {got!r}, want {want!r}")
+if len(out) != len(expected):
+    raise AssertionError(f"{len(out)} lines, want {len(expected)}")
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn random_module_matches_cpython_sequences_and_errors() {
+        // `random`: seeded module-level and `Random`-instance sequences (int, str,
+        // bytes, float and big-int seeds), every distribution, `getstate` /
+        // `setstate`, `sample(counts=)`, `choices`, subclassing, and the exact
+        // error messages — expected text printed by python3.13 on this program.
+        let src = r#"
+out: list[str] = []
+
+def emit(*parts: object) -> None:
+    out.append(" ".join(str(p) for p in parts))
+
+import random
+
+def show(label: str, f: object) -> None:
+    try:
+        emit(label, repr(f()))
+    except Exception as e:
+        emit(label, type(e).__name__, e)
+
+random.seed(7)
+emit("R1", random.random(), random.random(), random.randint(1, 6), random.randrange(10), random.randrange(5, 50, 5), random.uniform(1.5, 2.5))
+emit("R2", random.choice([1, 2, 3, 4]), random.getrandbits(10), random.getrandbits(70), random.getrandbits(0))
+xs = list(range(10))
+random.shuffle(xs)
+emit("R3", xs, random.sample(range(100), 5), random.sample([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30], 8))
+emit("R4", random.gauss(0, 1), random.gauss(0, 1), random.gauss(), random.normalvariate(1, 2), random.expovariate(1.5), random.triangular(1, 3), random.triangular(1, 3, 2.5))
+emit("R5", random.choices("abc", k=5), random.choices([1, 2, 3], weights=[1, 1, 8], k=6), random.choices([1, 2], cum_weights=[1, 3], k=4))
+emit("R6", random.lognormvariate(0, 1), random.betavariate(2, 3), random.gammavariate(2.5, 1.0), random.gammavariate(1.0, 2.0), random.gammavariate(0.5, 1.0), random.paretovariate(2), random.weibullvariate(1, 2), random.vonmisesvariate(0, 1), random.vonmisesvariate(0, 1e-7))
+r = random.Random(7)
+emit("R7", r.random(), r.randint(1, 100), r.getrandbits(40), r.choice("xyz"))
+r2 = random.Random(7)
+emit("R8", r2.random() == 0.32383276483316237, r2.getstate()[0], len(r2.getstate()[1]), r2.getstate()[2])
+st = r2.getstate()
+a = r2.random(); r2.setstate(st); b = r2.random()
+emit("R9", a == b, a)
+random.seed("hello"); emit("R10", random.random(), random.randbytes(4))
+random.seed(b"hello"); emit("R11", random.random())
+random.seed(2.5); emit("R12", random.random())
+random.seed(-9); emit("R13", random.random())
+random.seed(2 ** 70); emit("R14", random.random())
+random.seed(0); emit("R15", random.random(), random.gauss(), random.gauss())
+random.seed(0); emit("R16", random.gauss(), random.random(), random.gauss())
+random.seed(12345); emit("R17", [random.randint(0, 2 ** 40) for _ in range(3)], random.sample(range(2 ** 40), 2), random.randrange(2 ** 64 + 5))
+show("E1", lambda: random.randrange(0))
+show("E2", lambda: random.randrange(5, 5))
+show("E3", lambda: random.randrange(5, 1, 2))
+show("E4", lambda: random.randrange(1, 5, 0))
+show("E5", lambda: random.randrange(1.5))
+show("E6", lambda: random.randint(5, 1))
+show("E7", lambda: random.randrange(5, None, 2))
+show("E8", lambda: random.choice([]))
+show("E9", lambda: random.sample({1, 2}, 1))
+show("E10", lambda: random.sample([1, 2], 3))
+show("E11", lambda: random.getrandbits(-1))
+show("E12", lambda: random.seed([1]))
+show("E13", lambda: random.choices([1, 2], [1, 2, 3]))
+show("E14", lambda: random.choices([1, 2], 3))
+show("E15", lambda: random.gammavariate(0, 1))
+show("E16", lambda: random.sample([1, 2, 3], 2, counts=[1, 1]))
+random.seed(3); emit("R18", random.sample([1, 2, 3], 4, counts=[2, 1, 3]), random.binomialvariate(5, 0.3), random.binomialvariate(1, 0.5), random.binomialvariate(7, 0.8))
+class Sub(random.Random):
+    pass
+s = Sub(99)
+emit("R19", s.random(), s.randint(1, 10), isinstance(s, random.Random))
+
+expected = """R1 0.32383276483316237 0.15084917392450192 6 0 10 2.3212742919913083
+R2 1 374 1070981047564691937373 0
+R3 [1, 2, 4, 6, 5, 9, 7, 0, 3, 8] [70, 54, 7, 72, 15] [8, 21, 29, 19, 2, 27, 25, 13]
+R4 0.6728571905145633 0.2167066023245946 -0.5011069926874049 0.3959723340256104 0.5640647937702591 2.062191146355306 2.430387389584938
+R5 ['a', 'b', 'a', 'a', 'c'] [3, 3, 3, 3, 3, 3] [2, 2, 1, 1]
+R6 1.6868345025778617 0.3533734146759453 3.119772354676761 1.4346044809702374 0.038144116028092784 3.8711511433769172 0.740040315369941 2.896946289183157 4.958024904289246
+R7 0.32383276483316237 20 714660325134 x
+R8 True 3 625 None
+R9 True 0.15084917392450192
+R10 0.3537754404730722 b'\\xcfa\\xc7\\xa9'
+R11 0.3537754404730722
+R12 0.41877545666909954
+R13 0.46300735781502145
+R14 0.2327882718301838
+R15 0.8444218515250481 0.05219198828260849 -1.0434089742005737
+R16 0.9417154046806644 0.420571580830845 -1.3965781047011498
+R17 [593537256020, 960208693573, 821033197451] [573090097483, 410397959609] 13565560346403939986
+E1 ValueError empty range for randrange()
+E2 ValueError empty range in randrange(5, 5)
+E3 ValueError empty range in randrange(5, 1, 2)
+E4 ValueError zero step for randrange()
+E5 TypeError 'float' object cannot be interpreted as an integer
+E6 ValueError empty range in randrange(5, 2)
+E7 TypeError Missing a non-None stop argument
+E8 IndexError Cannot choose from an empty sequence
+E9 TypeError Population must be a sequence.  For dicts or sets, use sorted(d).
+E10 ValueError Sample larger than population or is negative
+E11 ValueError number of bits must be non-negative
+E12 TypeError The only supported seed types are:
+None, int, float, str, bytes, and bytearray.
+E13 ValueError The number of weights does not match the population
+E14 TypeError The number of choices must be a keyword argument: k=3
+E15 ValueError gammavariate: alpha and beta must be > 0.0
+E16 ValueError The number of counts does not match the population
+R18 [1, 3, 3, 3] 2 0 5
+R19 0.40397807494366633 4 True"""
+got = "\n".join(out)
+if got != expected:
+    raise AssertionError("mismatch:\n" + got + "\n--- want ---\n" + expected)
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn hashlib_module_matches_cpython() {
+        // `hashlib`: md5 / sha1 / sha256 / sha512 digests, incremental `update`,
+        // `copy`, sizes, `new`, and the CPython error messages for a str or a
+        // non-buffer input — expected text printed by python3.13 on this program.
+        let src = r#"
+out: list[str] = []
+
+def emit(*parts: object) -> None:
+    out.append(" ".join(str(p) for p in parts))
+
+import hashlib
+
+def show(label: str, f: object) -> None:
+    try:
+        emit(label, repr(f()))
+    except Exception as e:
+        emit(label, type(e).__name__, e)
+
+emit("H1", hashlib.md5(b"abc").hexdigest(), hashlib.sha1(b"abc").hexdigest())
+emit("H2", hashlib.sha256(b"abc").hexdigest(), hashlib.sha512(b"").hexdigest()[:32])
+h = hashlib.sha256()
+h.update(b"ab")
+h.update(b"c")
+emit("H3", h.hexdigest() == hashlib.sha256(b"abc").hexdigest(), h.name, h.digest_size, h.block_size, hashlib.sha512().block_size, hashlib.md5().digest_size)
+c = h.copy()
+c.update(b"d")
+emit("H4", h.hexdigest()[:8], c.hexdigest()[:8], hashlib.sha256(b"abcd").hexdigest()[:8], len(h.digest()), hashlib.new("md5", b"x").hexdigest())
+emit("H5", hashlib.sha256("typhon".encode("utf-8")).hexdigest(), sorted(hashlib.algorithms_guaranteed & {"md5", "sha256"}))
+show("E1", lambda: hashlib.sha256("abc"))
+show("E2", lambda: hashlib.sha256(123))
+show("E3", lambda: hashlib.new("nope"))
+
+expected = """H1 900150983cd24fb0d6963f7d28e17f72 a9993e364706816aba3e25717850c26c9cd0d89d
+H2 ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad cf83e1357eefb8bdf1542850d66d8007
+H3 True sha256 32 64 128 16
+H4 ba7816bf 88d4266f 88d4266f 32 9dd4e461268c8034f5c8564e155c67a6
+H5 b1fc1c68a28135561cdb827e85081055da92f15662d9c33466d153b4e8e9a7b4 ['md5', 'sha256']
+E1 TypeError Strings must be encoded before hashing
+E2 TypeError object supporting the buffer API required
+E3 ValueError unsupported hash type nope"""
+got = "\n".join(out)
+if got != expected:
+    raise AssertionError("mismatch:\n" + got + "\n--- want ---\n" + expected)
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn filesystem_modules_match_cpython() {
+        // `pathlib` (pure and concrete), `open` / file objects, `io.StringIO` /
+        // `BytesIO`, `os` / `os.path`, `glob`, `shutil` and `tempfile`, with
+        // CPython's `OSError` messages and attributes — expected text printed by
+        // python3.13 on this program (which works under /tmp/zz_probe_fs).
+        let src = r#"
+__lines: list[str] = []
+
+def emit(*parts: object) -> None:
+    __lines.append(" ".join(str(p) for p in parts))
+
+import os
+import io
+import shutil
+import tempfile
+import glob
+from pathlib import Path, PurePosixPath
+
+def show(label: str, f: object) -> None:
+    try:
+        emit(label, repr(f()))
+    except Exception as e:
+        emit(label, type(e).__name__, e)
+
+BASE = "/tmp/zz_probe_fs"
+shutil.rmtree(BASE, ignore_errors=True)
+os.makedirs(BASE)
+os.chdir(BASE)
+
+# ---- pure paths
+for spec in ["a//b/./c/", "", ".", "/", "//x/y", "///x", "a/../b", "a/b/", "./a", "/a/b.tar.gz", ".bashrc", "a.", "a..b", "..", "a/..", "c:/x"]:
+    pp = Path(spec)
+    emit("PP", repr(spec), str(pp), pp.parts, repr(pp.name), repr(pp.suffix), pp.suffixes, repr(pp.stem), str(pp.parent), repr(pp.anchor), repr(pp.root), pp.is_absolute(), [str(x) for x in pp.parents])
+emit("PJ", Path("a", "b", "/c", "d"), Path("a", Path("b")), Path("a") / "b" / "c", "x" / Path("y"), Path("a").joinpath("b", "c"), Path("/a") / "/b", Path("a") / "")
+show("W1", lambda: Path("a/b.txt").with_name("c.md"))
+show("W2", lambda: Path("a/b.txt").with_suffix(".md"))
+show("W3", lambda: Path("a/b.txt").with_suffix(""))
+show("W4", lambda: Path("a/b").with_suffix(".x"))
+show("W5", lambda: Path("a/b.txt").with_stem("q"))
+show("W6", lambda: Path("a/b.txt").with_name(""))
+show("W7", lambda: Path("a/b.txt").with_name("x/y"))
+show("W8", lambda: Path("/").with_name("x"))
+show("W9", lambda: Path("a/b.txt").with_suffix("txt"))
+show("W10", lambda: Path("a/b.txt").with_suffix("."))
+show("W11", lambda: Path("a").with_suffix(".x/y"))
+show("W12", lambda: Path("a/b.tar.gz").with_suffix(".zip"))
+show("R1", lambda: Path("/a/b/c").relative_to("/a"))
+show("R2", lambda: Path("/a/b/c").relative_to("/x"))
+show("R3", lambda: Path("a/b").relative_to("a/b"))
+show("R4", lambda: Path("/a/b").relative_to("/a/b/c", walk_up=True))
+show("R5", lambda: Path("/a/b").relative_to("c"))
+show("R6", lambda: (Path("/a/b").is_relative_to("/a"), Path("/a/b").is_relative_to("/x")))
+show("M1", lambda: (Path("a/b.py").match("*.py"), Path("a/b.py").match("a/*.py"), Path("/a/b.py").match("/*.py"), Path("a/b.py").match("b.py"), Path("a/b/c.py").match("a/*.py"), Path("a/b/c.py").match("**/*.py"), Path("a/b/c.py").full_match("**/*.py"), Path("a/b/c.py").full_match("a/**"), Path("a/b/c.py").match("*.PY"), Path("a/b/c.py").match("a/**/c.py"), Path("/a/b.py").match("*.py"), Path("/a/b.py").match("a/b.py"), Path("a/b.py").match("/a/b.py"), Path("a/b/c.py").full_match("*/c.py"), Path("a/b/c.py").full_match("*/*/c.py"), Path("a/b/c.py").match("[ab]/c.py"), Path("a.b").match("a?b"), Path("x.py").match("*.p[xy]")))
+show("M2", lambda: Path("a").match(""))
+show("M3", lambda: Path("a").glob(""))
+show("M4", lambda: list(Path("/nonexistent_dir_zz").glob("*")))
+show("O1", lambda: sorted([Path("a-b"), Path("a/b"), Path("a"), Path("a.b"), Path("/z"), Path("b")]))
+show("O2", lambda: (Path("a/b") < Path("a-b"), Path("a") == Path("./a"), Path("a") == "a", hash(Path("a")) == hash(Path("./a")), Path("a") != Path("A")))
+show("O3", lambda: Path("a") / 5)
+show("O4", lambda: 5 / Path("a"))
+show("O5", lambda: Path(5))
+show("O6", lambda: (repr(Path("it's")), str(Path("a\\b")), Path("a b"), os.fspath(Path("q")), Path("a").as_posix(), Path("/a/b c").as_uri()))
+show("O7", lambda: Path("a/b").parents[0:2])
+show("O8", lambda: (Path("a/b/c").parents[-1], Path("a/b/c").parents[5]))
+show("O9", lambda: (repr(Path("a").parents), len(Path("/a/b").parents), list(Path("/a/b").parents)))
+show("O10", lambda: (type(Path("x")).__name__, PurePosixPath("x/y").name, isinstance(Path("x"), PurePosixPath), Path("x") == PurePosixPath("x")))
+show("O11", lambda: Path("~/x").expanduser() == Path(os.environ["HOME"]) / "x")
+show("O12", lambda: (str(Path.home()) == os.environ["HOME"], str(Path.cwd()) == os.getcwd(), Path("rel").absolute() == Path.cwd() / "rel"))
+show("O13", lambda: (Path("a/../b/./c").resolve() == Path.cwd() / "b/c", Path("/nonexistent/../x").resolve()))
+show("O14", lambda: Path("/tmp/zz_definitely_missing/q").stat())
+show("O15", lambda: Path("/tmp/zz_definitely_missing/q").mkdir())
+show("O16", lambda: Path("/tmp").mkdir())
+show("O17", lambda: Path("/tmp/zz_definitely_missing/q").read_text())
+show("O18", lambda: Path("/tmp").read_text())
+show("O19", lambda: Path("/tmp/zz_definitely_missing/q").unlink())
+show("O20", lambda: Path("/tmp/zz_definitely_missing/q").rmdir())
+show("O22", lambda: list(Path("/tmp/zz_definitely_missing/q").iterdir()))
+show("O23", lambda: Path("/tmp/zz_definitely_missing/q").rename("/tmp/zz2"))
+show("O24", lambda: Path("/tmp").unlink())
+show("O25", lambda: Path("/etc/passwd").rmdir())
+show("O26", lambda: Path("/tmp").write_text(5))
+show("O27", lambda: Path("/tmp/zz_definitely_missing/q").touch())
+try:
+    open("/tmp/zz_definitely_missing/q")
+except OSError as e:
+    emit("O29", type(e).__name__, e, e.errno, e.strerror, e.filename, e.args)
+mut e = OSError(2, "msg", "f"); emit("O30", e, e.args, e.errno, e.strerror, e.filename, type(e).__name__)
+e = OSError("one"); emit("O31", e, e.args, e.errno, e.strerror, e.filename)
+e = OSError(2, "msg"); emit("O32", e, e.args, e.errno, e.filename)
+e = FileNotFoundError(2, "No such file or directory", "x"); emit("O33", e, isinstance(e, OSError))
+st = Path("/etc/passwd").stat(); emit("O34", type(st).__name__, st.st_size > 0, isinstance(st.st_mtime, float), isinstance(st.st_size, int), st.st_mode & 0o170000 == 0o100000, len(st), st[6] == st.st_size)
+
+# ---- open / files
+for f in [lambda: open("/nonexistent_zz/x"), lambda: open("/tmp"), lambda: open("/tmp/x.txt", "q"), lambda: open(5.5), lambda: open("/nonexistent_zz/x", "w"), lambda: open("/etc/passwd", "rb").read(0), lambda: open("/etc/passwd", "rw"), lambda: open("/etc/passwd", "rb", encoding="utf-8")]:
+    show("F", f)
+mut p = Path("zz_probe.txt"); n = p.write_text("a\nb\n"); emit("T1", n, p.read_text(), p.read_bytes(), p.write_text("x\r\ny\n", newline=""), p.read_bytes(), p.write_text("l1\nl2", newline="\r\n"), p.read_bytes(), p.read_text(), p.read_text(newline=""))
+emit("T2", p.stat().st_size, p.exists(), p.is_file(), p.is_dir(), p.is_symlink(), p.samefile("zz_probe.txt"))
+q = p.rename("zz_probe2.txt"); emit("T3", q, q.exists(), p.exists()); q.unlink(); show("T4", lambda: q.unlink()); emit("T5", q.unlink(missing_ok=True))
+with open("f1.txt", "w") as f:
+    emit("T6", f.write("héllo\nwörld"), f.mode, f.name, f.encoding, f.closed, repr(f), f.writable(), f.readable())
+emit("T7", f.closed, open("f1.txt").read(), open("f1.txt", encoding="latin-1").read(), open("f1.txt", "rb").read())
+with open("f1.txt") as f:
+    emit("T8", f.readline(), f.readline(), f.readline(), f.tell(), f.seek(0), f.read(3), list(f))
+with open("f1.txt", "a") as f:
+    f.write("\nmore")
+emit("T9", open("f1.txt").readlines(), open("f1.txt").read().splitlines())
+with open("f2.bin", "wb") as f:
+    emit("T10", f.write(b"\x00\x01ab"), repr(f)[:30], f.mode)
+with open("f2.bin", "rb") as f:
+    emit("T11", f.read(2), f.read(), f.tell(), f.seek(1), f.read(1), f.readable(), f.writable())
+show("T12", lambda: open("f2.bin", "rb").write(b"x"))
+show("T13", lambda: open("f1.txt", "w").read())
+mut f = open("f1.txt"); f.close(); show("T14", lambda: f.read()); show("T14b", lambda: f.write("x"))
+with open("f3.txt", "w", encoding="ascii") as f:
+    show("T15", lambda: f.write("é"))
+show("T16", lambda: open("f2.bin", "r", encoding="ascii").read())
+emit("T17", repr(open("f2.bin", "r", encoding="latin-1").read()), repr(open("f2.bin", errors="replace").read()))
+with open("f4.txt", "x") as f:
+    f.write("new")
+show("T18", lambda: open("f4.txt", "x"))
+with open("f4.txt", "r+") as f:
+    f.seek(0, 2); f.write("!"); f.seek(0); emit("T19", f.read())
+with open("f4.txt", "w+") as f:
+    f.write("abc"); f.seek(1); emit("T20", f.read(), f.tell())
+f = open("f5.txt", "w"); f.write("unflushed")
+emit("T21", os.path.getsize("f5.txt"))
+f.flush(); emit("T22", os.path.getsize("f5.txt"), open("f5.txt").read())
+emit("T23", list(open("f1.txt")), sorted(os.listdir(".")))
+with open("f6.txt", "w") as f:
+    print("hello", "there", sep="-", file=f)
+    print(1, 2, end="!", file=f)
+emit("T24", repr(open("f6.txt").read()))
+
+unsafe:
+    mut sio = io.StringIO("ab\ncd\n")
+    emit("I1", sio.read(1), sio.read(), sio.tell(), sio.seek(0), sio.readline(), sio.readlines(), sio.getvalue(), sio.write("X"), sio.getvalue(), sio.tell())
+    sio = io.StringIO(); sio.write("hello\nworld"); emit("I2", sio.getvalue(), list(io.StringIO("a\nb\n")), sio.closed, repr(sio)[:20], sio.seek(0, 2), sio.tell(), sio.truncate(3), sio.getvalue())
+    show("I3", lambda: io.StringIO(5))
+    show("I4", lambda: io.StringIO("x").write(5))
+    sio.close(); show("I5", lambda: sio.getvalue()); show("I5b", lambda: sio.read())
+    with io.StringIO("q") as sf: emit("I6", sf.read(), sf.closed)
+    emit("I7", sf.closed)
+    bio = io.BytesIO(b"ab\ncd"); emit("I8", bio.read(1), bio.read(), bio.getvalue(), bio.seek(0), bio.readline(), bio.write(b"Z"), bio.getvalue(), bio.tell(), list(io.BytesIO(b"1\n2")))
+    show("I9", lambda: io.BytesIO("x"))
+    show("I10", lambda: io.BytesIO(b"x").write("s"))
+    sio = io.StringIO("abc"); emit("I11", sio.seek(1), sio.read(), sio.seek(0), sio.write("Z"), sio.getvalue(), sio.read(), io.StringIO("a\r\nb").readlines(), io.StringIO("a\r\nb", newline="").readlines(), io.StringIO("x").readable(), io.StringIO("x").writable(), io.StringIO("x").seekable())
+    emit("I12", isinstance(sio, io.IOBase), isinstance(sio, io.TextIOBase), io.StringIO.__name__, type(sio).__name__, io.StringIO("a").encoding)
+    out = io.StringIO(); print("x", 1, file=out); emit("I13", repr(out.getvalue()))
+
+
+# ---- os / os.path
+emit("P1", os.path.join("a", "b", "/c", "d"), os.path.join("a/", "b"), os.path.join("a", ""), os.path.split("a/b/c"), os.path.split("a"), os.path.split("/a"), os.path.splitext("f.tar.gz"), os.path.splitext(".bashrc"), os.path.splitext("a/b.c/d"), os.path.basename("a/b/"), os.path.dirname("a/b/"), os.path.normpath("a//b/../c/./d/"), os.path.normpath("/../a"), os.path.normpath(""), os.path.isabs("/a"), os.path.relpath("/a/b/c", "/a/d"), os.path.commonpath(["/a/b/c", "/a/b/d"]), os.path.commonprefix(["abc", "abd"]), os.path.expanduser("~/x") == os.environ["HOME"].rstrip("/") + "/x", os.path.abspath("x") == os.getcwd() + "/x", os.sep, os.pathsep, os.linesep == "\n", os.name, os.curdir, os.pardir, os.extsep, os.altsep, os.devnull)
+show("P2", lambda: os.path.commonpath(["/a", "b"]))
+show("P3", lambda: os.path.relpath(""))
+show("P4", lambda: os.listdir("/nonexistent_zz"))
+show("P5", lambda: os.remove("/nonexistent_zz"))
+show("P6", lambda: os.mkdir("/tmp"))
+show("P7", lambda: os.rmdir("/nonexistent_zz"))
+show("P8", lambda: os.rename("/nonexistent_zz", "/tmp/q"))
+show("P9", lambda: os.makedirs("/tmp"))
+show("P10", lambda: os.makedirs("/tmp", exist_ok=True))
+show("P11", lambda: os.path.getsize("/nonexistent_zz"))
+show("P12", lambda: os.stat("/nonexistent_zz"))
+show("P13", lambda: os.rmdir("/tmp"))
+show("P14", lambda: os.remove("/tmp"))
+show("P15", lambda: os.listdir("/etc/passwd"))
+show("P16", lambda: os.path.getsize(Path("/nonexistent_zz")))
+emit("P17", os.getcwd() == BASE, os.path.isdir("."), os.path.isfile("f1.txt"), os.path.exists("nope"), os.path.getsize("f1.txt"), os.getenv("HOME") == os.environ["HOME"], os.getenv("ZZ_NOPE", "dflt"), isinstance(os.getpid(), int), os.cpu_count() >= 1, os.system("exit 3"), os.path.samefile("f1.txt", "./f1.txt"), os.strerror(2), os.access("f1.txt", os.R_OK), os.access("nope", os.F_OK))
+
+# ---- directory tree: glob, walk, shutil
+d = Path("tree")
+d.mkdir(); (d / "sub").mkdir(); (d / "sub" / "deep").mkdir(parents=True, exist_ok=True); (d / "a.py").write_text("1"); (d / "sub" / "b.py").write_text("2"); (d / "sub" / "deep" / "c.txt").write_text("3"); (d / ".hidden").write_text("")
+rel = lambda xs: sorted(str(x.relative_to(d)) for x in xs)
+emit("G1", rel(d.glob("*")), rel(d.glob("*.py")), rel(d.rglob("*.py")), rel(d.glob("**/*.py")), rel(d.glob("**/")), rel(d.rglob("*")), rel(d.glob("sub/*")), rel(d.glob("*/")), rel(d.glob("**")), rel(d.glob("sub/deep/c.txt")), rel(d.glob("nope/*")), rel(d.rglob("deep")))
+emit("G2", rel(d.iterdir()), [(str(Path(r).relative_to(d)), sorted(ds), sorted(fs)) for r, ds, fs in os.walk(d)], sorted(os.listdir(d)))
+emit("G3", [(str(r.relative_to(d)), sorted(ds), sorted(fs)) for r, ds, fs in d.walk()], [(str(Path(r).relative_to(d)), sorted(ds), sorted(fs)) for r, ds, fs in os.walk(d, topdown=False)])
+show("G4", lambda: d.rmdir())
+show("G5", lambda: (d / "a.py").mkdir())
+show("G6", lambda: (d / "sub" / "deep" / "c.txt").touch())
+emit("G7", sorted(glob.glob("tree/*.py")), sorted(glob.glob("tree/**/*.py", recursive=True)), sorted(glob.glob("*.py", root_dir="tree")), sorted(glob.glob("tree/*")), glob.glob("tree/nope*"), sorted(glob.glob("tree/**", recursive=True)), glob.escape("a[b]*"), sorted(glob.glob("tree/.*")), sorted(glob.glob("tree/*", include_hidden=True)), glob.glob("tree"), glob.glob("tree/"))
+emit("S1", shutil.copy("tree/a.py", "copy.py"), shutil.copy("tree/a.py", "tree/sub"), shutil.copyfile("tree/a.py", "cf.py"), shutil.copy2("tree/a.py", "c2.py"), open("copy.py").read())
+emit("S2", shutil.copytree("tree", "tree2"), sorted(os.listdir("tree2")), shutil.move("tree2", "moved"), os.path.isdir("moved"), shutil.move("cf.py", "moved"), sorted(os.listdir("moved")))
+show("S3", lambda: shutil.copyfile("nope", "x"))
+show("S4", lambda: shutil.copytree("tree", "moved"))
+show("S5", lambda: shutil.copy("tree", "x"))
+show("S6", lambda: shutil.rmtree("tree/a.py"))
+show("S7", lambda: shutil.copyfile("tree/a.py", "tree/a.py"))
+emit("S8", shutil.which("python3.13") is not None, shutil.which("definitely_not_a_cmd_zz"), shutil.rmtree("moved"), os.path.exists("moved"))
+show("S9", lambda: shutil.rmtree(Path("nope_dir")))
+shutil.rmtree(d); emit("S10", d.exists())
+
+# ---- tempfile
+td = tempfile.mkdtemp(); emit("X1", td.startswith(tempfile.gettempdir() + "/tmp"), len(os.path.basename(td)), os.path.isdir(td)); os.rmdir(td)
+with tempfile.TemporaryDirectory() as t: emit("X2", os.path.isdir(t), type(t).__name__, t.startswith("/tmp/tmp"))
+emit("X3", os.path.exists(t))
+fd, fp = tempfile.mkstemp(suffix=".txt"); emit("X4", type(fd).__name__, fp.endswith(".txt"), os.path.isfile(fp)); os.close(fd); os.remove(fp)
+with tempfile.NamedTemporaryFile(mode="w+", suffix=".log", delete=False) as f: f.write("hi"); f.seek(0); emit("X5", f.read(), f.name.endswith(".log"), os.path.isfile(f.name), type(f).__name__)
+emit("X6", os.path.isfile(f.name)); os.remove(f.name)
+with tempfile.NamedTemporaryFile() as f: nm = f.name; emit("X7", os.path.isfile(nm), f.mode)
+emit("X8", os.path.isfile(nm), tempfile.gettempdir(), tempfile.tempdir)
+os.chdir("/tmp")
+shutil.rmtree(BASE)
+emit("DONE", os.path.exists(BASE))
+
+expected = """PP 'a//b/./c/' a/b/c ('a', 'b', 'c') 'c' '' [] 'c' a/b '' '' False ['a/b', 'a', '.']
+PP '' . () '' '' [] '' . '' '' False []
+PP '.' . () '' '' [] '' . '' '' False []
+PP '/' / ('/',) '' '' [] '' / '/' '/' True []
+PP '//x/y' //x/y ('//', 'x', 'y') 'y' '' [] 'y' //x '//' '//' True ['//x', '//']
+PP '///x' /x ('/', 'x') 'x' '' [] 'x' / '/' '/' True ['/']
+PP 'a/../b' a/../b ('a', '..', 'b') 'b' '' [] 'b' a/.. '' '' False ['a/..', 'a', '.']
+PP 'a/b/' a/b ('a', 'b') 'b' '' [] 'b' a '' '' False ['a', '.']
+PP './a' a ('a',) 'a' '' [] 'a' . '' '' False ['.']
+PP '/a/b.tar.gz' /a/b.tar.gz ('/', 'a', 'b.tar.gz') 'b.tar.gz' '.gz' ['.tar', '.gz'] 'b.tar' /a '/' '/' True ['/a', '/']
+PP '.bashrc' .bashrc ('.bashrc',) '.bashrc' '' [] '.bashrc' . '' '' False ['.']
+PP 'a.' a. ('a.',) 'a.' '' [] 'a.' . '' '' False ['.']
+PP 'a..b' a..b ('a..b',) 'a..b' '.b' ['.', '.b'] 'a.' . '' '' False ['.']
+PP '..' .. ('..',) '..' '' [] '..' . '' '' False ['.']
+PP 'a/..' a/.. ('a', '..') '..' '' [] '..' a '' '' False ['a', '.']
+PP 'c:/x' c:/x ('c:', 'x') 'x' '' [] 'x' c: '' '' False ['c:', '.']
+PJ /c/d a/b a/b/c x/y a/b/c /b a
+W1 PosixPath('a/c.md')
+W2 PosixPath('a/b.md')
+W3 PosixPath('a/b')
+W4 PosixPath('a/b.x')
+W5 PosixPath('a/q.txt')
+W6 ValueError Invalid name ''
+W7 ValueError Invalid name 'x/y'
+W8 ValueError PosixPath('/') has an empty name
+W9 ValueError Invalid suffix 'txt'
+W10 ValueError Invalid suffix '.'
+W11 ValueError Invalid name 'a.x/y'
+W12 PosixPath('a/b.tar.zip')
+R1 PosixPath('b/c')
+R2 ValueError '/a/b/c' is not in the subpath of '/x'
+R3 PosixPath('.')
+R4 PosixPath('..')
+R5 ValueError '/a/b' is not in the subpath of 'c'
+R6 (True, False)
+M1 (True, True, False, True, False, True, True, True, False, True, True, True, False, False, True, True, True, True)
+M2 ValueError empty pattern
+M3 ValueError Unacceptable pattern: PosixPath('.')
+M4 []
+O1 [PosixPath('/z'), PosixPath('a'), PosixPath('a/b'), PosixPath('a-b'), PosixPath('a.b'), PosixPath('b')]
+O2 (True, True, False, True, True)
+O3 TypeError unsupported operand type(s) for /: 'PosixPath' and 'int'
+O4 TypeError unsupported operand type(s) for /: 'int' and 'PosixPath'
+O5 TypeError argument should be a str or an os.PathLike object where __fspath__ returns a str, not 'int'
+O6 ('PosixPath("it\\'s")', 'a\\\\b', PosixPath('a b'), 'q', 'a', 'file:///a/b%20c')
+O7 (PosixPath('a'), PosixPath('.'))
+O8 IndexError 5
+O9 ('<PosixPath.parents>', 2, [PosixPath('/a'), PosixPath('/')])
+O10 ('PosixPath', 'y', True, True)
+O11 True
+O12 (True, True, True)
+O13 (True, PosixPath('/x'))
+O14 FileNotFoundError [Errno 2] No such file or directory: '/tmp/zz_definitely_missing/q'
+O15 FileNotFoundError [Errno 2] No such file or directory: '/tmp/zz_definitely_missing/q'
+O16 FileExistsError [Errno 17] File exists: '/tmp'
+O17 FileNotFoundError [Errno 2] No such file or directory: '/tmp/zz_definitely_missing/q'
+O18 IsADirectoryError [Errno 21] Is a directory: '/tmp'
+O19 FileNotFoundError [Errno 2] No such file or directory: '/tmp/zz_definitely_missing/q'
+O20 FileNotFoundError [Errno 2] No such file or directory: '/tmp/zz_definitely_missing/q'
+O22 FileNotFoundError [Errno 2] No such file or directory: '/tmp/zz_definitely_missing/q'
+O23 FileNotFoundError [Errno 2] No such file or directory: '/tmp/zz_definitely_missing/q' -> '/tmp/zz2'
+O24 IsADirectoryError [Errno 21] Is a directory: '/tmp'
+O25 NotADirectoryError [Errno 20] Not a directory: '/etc/passwd'
+O26 TypeError data must be str, not int
+O27 FileNotFoundError [Errno 2] No such file or directory: '/tmp/zz_definitely_missing/q'
+O29 FileNotFoundError [Errno 2] No such file or directory: '/tmp/zz_definitely_missing/q' 2 No such file or directory /tmp/zz_definitely_missing/q (2, 'No such file or directory')
+O30 [Errno 2] msg: 'f' (2, 'msg') 2 msg f FileNotFoundError
+O31 one ('one',) None None None
+O32 [Errno 2] msg (2, 'msg') 2 None
+O33 [Errno 2] No such file or directory: 'x' True
+O34 stat_result False True True True 10 True
+F FileNotFoundError [Errno 2] No such file or directory: '/nonexistent_zz/x'
+F IsADirectoryError [Errno 21] Is a directory: '/tmp'
+F ValueError invalid mode: 'q'
+F TypeError expected str, bytes or os.PathLike object, not float
+F FileNotFoundError [Errno 2] No such file or directory: '/nonexistent_zz/x'
+F b''
+F ValueError must have exactly one of create/read/write/append mode
+F ValueError binary mode doesn't take an encoding argument
+T1 4 a
+b
+ b'a\\nb\\n' 5 b'x\\r\\ny\\n' 5 b'l1\\r\\nl2' l1
+l2 l1\r
+l2
+T2 6 True True False False True
+T3 zz_probe2.txt True False
+T4 FileNotFoundError [Errno 2] No such file or directory: 'zz_probe2.txt'
+T5 None
+T6 11 w f1.txt utf-8 False <_io.TextIOWrapper name='f1.txt' mode='w' encoding='utf-8'> True False
+T7 True héllo
+wörld hÃ©llo
+wÃ¶rld b'h\\xc3\\xa9llo\\nw\\xc3\\xb6rld'
+T8 héllo
+ wörld  13 0 hél ['lo\\n', 'wörld']
+T9 ['héllo\\n', 'wörld\\n', 'more'] ['héllo', 'wörld', 'more']
+T10 4 <_io.BufferedWriter name='f2.b wb
+T11 b'\\x00\\x01' b'ab' 4 1 b'\\x01' True False
+T12 UnsupportedOperation write
+T13 UnsupportedOperation not readable
+T14 ValueError I/O operation on closed file.
+T14b ValueError I/O operation on closed file.
+T15 UnicodeEncodeError 'ascii' codec can't encode character '\\xe9' in position 0: ordinal not in range(128)
+T16 '\\x00\\x01ab'
+T17 '\\x00\\x01ab' '\\x00\\x01ab'
+T18 FileExistsError [Errno 17] File exists: 'f4.txt'
+T19 new!
+T20 bc 3
+T21 0
+T22 9 unflushed
+T23 [] ['f1.txt', 'f2.bin', 'f3.txt', 'f4.txt', 'f5.txt']
+T24 'hello-there\\n1 2!'
+I1 a b
+cd
+ 6 0 ab
+ ['cd\\n'] ab
+cd
+ 1 ab
+cd
+X 7
+I2 hello
+world ['a\\n', 'b\\n'] False <_io.StringIO object 11 11 3 hel
+I3 TypeError initial_value must be str or None, not int
+I4 TypeError string argument expected, got 'int'
+I5 ValueError I/O operation on closed file
+I5b ValueError I/O operation on closed file
+I6 q False
+I7 True
+I8 b'a' b'b\\ncd' b'ab\\ncd' 0 b'ab\\n' 1 b'ab\\nZd' 4 [b'1\\n', b'2']
+I9 TypeError a bytes-like object is required, not 'str'
+I10 TypeError a bytes-like object is required, not 'str'
+I11 1 bc 0 1 Zbc bc ['a\\r\\n', 'b'] ['a\\r\\n', 'b'] True True True
+I12 True True StringIO StringIO None
+I13 'x 1\\n'
+P1 /c/d a/b a/ ('a/b', 'c') ('', 'a') ('/', 'a') ('f.tar', '.gz') ('.bashrc', '') ('a/b.c/d', '')  a/b a/c/d /a . True ../b/c /a/b ab True True / : True posix . .. . None /dev/null
+P2 ValueError Can't mix absolute and relative paths
+P3 ValueError no path specified
+P4 FileNotFoundError [Errno 2] No such file or directory: '/nonexistent_zz'
+P5 FileNotFoundError [Errno 2] No such file or directory: '/nonexistent_zz'
+P6 FileExistsError [Errno 17] File exists: '/tmp'
+P7 FileNotFoundError [Errno 2] No such file or directory: '/nonexistent_zz'
+P8 FileNotFoundError [Errno 2] No such file or directory: '/nonexistent_zz' -> '/tmp/q'
+P9 FileExistsError [Errno 17] File exists: '/tmp'
+P10 None
+P11 FileNotFoundError [Errno 2] No such file or directory: '/nonexistent_zz'
+P12 FileNotFoundError [Errno 2] No such file or directory: '/nonexistent_zz'
+P13 OSError [Errno 39] Directory not empty: '/tmp'
+P14 IsADirectoryError [Errno 21] Is a directory: '/tmp'
+P15 NotADirectoryError [Errno 20] Not a directory: '/etc/passwd'
+P16 FileNotFoundError [Errno 2] No such file or directory: '/nonexistent_zz'
+P17 True True True False 0 True dflt True True 768 True No such file or directory True False
+G1 ['.hidden', 'a.py', 'sub'] ['a.py'] ['a.py', 'sub/b.py'] ['a.py', 'sub/b.py'] ['.', 'sub', 'sub/deep'] ['.hidden', 'a.py', 'sub', 'sub/b.py', 'sub/deep', 'sub/deep/c.txt'] ['sub/b.py', 'sub/deep'] ['sub'] ['.', '.hidden', 'a.py', 'sub', 'sub/b.py', 'sub/deep', 'sub/deep/c.txt'] ['sub/deep/c.txt'] [] ['sub/deep']
+G2 ['.hidden', 'a.py', 'sub'] [('.', ['sub'], ['.hidden', 'a.py']), ('sub', ['deep'], ['b.py']), ('sub/deep', [], ['c.txt'])] ['.hidden', 'a.py', 'sub']
+G3 [('.', ['sub'], ['.hidden', 'a.py']), ('sub', ['deep'], ['b.py']), ('sub/deep', [], ['c.txt'])] [('sub/deep', [], ['c.txt']), ('sub', ['deep'], ['b.py']), ('.', ['sub'], ['.hidden', 'a.py'])]
+G4 OSError [Errno 39] Directory not empty: 'tree'
+G5 FileExistsError [Errno 17] File exists: 'tree/a.py'
+G6 None
+G7 ['tree/a.py'] ['tree/a.py', 'tree/sub/b.py'] ['a.py'] ['tree/a.py', 'tree/sub'] [] ['tree/', 'tree/a.py', 'tree/sub', 'tree/sub/b.py', 'tree/sub/deep', 'tree/sub/deep/c.txt'] a[[]b][*] ['tree/.hidden'] ['tree/.hidden', 'tree/a.py', 'tree/sub'] ['tree'] ['tree/']
+S1 copy.py tree/sub/a.py cf.py c2.py 1
+S2 tree2 ['.hidden', 'a.py', 'sub'] moved True moved/cf.py ['.hidden', 'a.py', 'cf.py', 'sub']
+S3 FileNotFoundError [Errno 2] No such file or directory: 'nope'
+S4 FileExistsError [Errno 17] File exists: 'moved'
+S5 IsADirectoryError [Errno 21] Is a directory: 'tree'
+S6 NotADirectoryError [Errno 20] Not a directory: 'tree/a.py'
+S7 SameFileError 'tree/a.py' and 'tree/a.py' are the same file
+S8 True None None False
+S9 FileNotFoundError [Errno 2] No such file or directory: PosixPath('nope_dir')
+S10 False
+X1 True 11 True
+X2 True str True
+X3 False
+X4 int True True
+X5 hi True True _TemporaryFileWrapper
+X6 True
+X7 True rb+
+X8 False /tmp /tmp
+DONE False"""
+got = "\n".join(__lines)
+if got != expected:
+    raise AssertionError("mismatch:\n" + got + "\n--- want ---\n" + expected)
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn codecs_slices_and_bytes_find_match_cpython() {
+        // `str.encode` / `bytes.decode` / `str(bytes, enc)` / `bytes(str, enc)` with
+        // the CPython error handlers and messages, `slice` objects, and
+        // `bytes.find(sub, start, end)` — expected text printed by python3.13.
+        let src = r#"
+__lines: list[str] = []
+
+def emit(*parts: object) -> None:
+    __lines.append(" ".join(str(p) for p in parts))
+
+def show(label: str, f: object) -> None:
+    try:
+        emit(label, repr(f()))
+    except Exception as e:
+        emit(label, type(e).__name__, e)
+
+show("C1", lambda: "héllo".encode("utf-8"))
+show("C2", lambda: "héllo".encode("ascii"))
+show("C3", lambda: "héllo".encode("ascii", "ignore"))
+show("C4", lambda: "héllo".encode("ascii", errors="replace"))
+show("C5", lambda: "héllo".encode(encoding="ascii", errors="backslashreplace"))
+show("C6", lambda: "héllo".encode("latin-1"))
+show("C7", lambda: "日本".encode("latin-1"))
+show("C8", lambda: "hi".encode("utf-16"))
+show("C12", lambda: "x".encode("nope"))
+show("C13", lambda: b"\xff\xfeh\x00i\x00".decode("utf-16"))
+show("C14", lambda: b"h\xc3\xa9".decode("utf-8"))
+show("C15", lambda: b"h\xff".decode("utf-8"))
+show("C16", lambda: b"h\xc3".decode("utf-8"))
+show("C17", lambda: b"\xc3\x28".decode("utf-8"))
+show("C18", lambda: b"h\xff".decode("utf-8", "ignore"))
+show("C19", lambda: b"h\xff".decode("utf-8", errors="replace"))
+show("C20", lambda: b"h\xff".decode(encoding="utf-8", errors="backslashreplace"))
+show("C21", lambda: b"h\xe9".decode("latin-1"))
+show("C22", lambda: b"h\xe9".decode("ascii"))
+show("C24", lambda: "x".encode("UTF8") + "y".encode("Utf_8") + "z".encode("latin1") + "w".encode("ISO-8859-1") + "v".encode("us-ascii") + "t".encode("utf-8-sig"))
+show("C25", lambda: b"\xef\xbb\xbfhi".decode("utf-8-sig"))
+show("C31", lambda: b"ab\xff\xfecd".decode("utf-8", "replace"))
+show("C32", lambda: b"\xe9".decode())
+show("C33", lambda: "é".encode())
+show("C37", lambda: b"h\x00i\x00".decode("utf-16-le") + b"\x00h\x00i".decode("utf-16-be"))
+show("C38", lambda: b"h\x00i".decode("utf-16"))
+show("C40", lambda: str(b"h\xe9", "latin-1") + str(b"ok", encoding="ascii"))
+show("C41", lambda: bytes("é", "utf-8") + bytes("é", "latin-1"))
+show("C43", lambda: bytes("é"))
+show("C44", lambda: (b"abcabc".find(b"c", 3), b"abcabc".find(b"c", 3, 5), b"abcabc".index(b"a", 1), b"abc".find(b"z", 1)))
+show("C45", lambda: b"abcabc".index(b"z", 1))
+show("C46", lambda: (repr(slice(1, 5, 2)), slice(3).start, slice(3).stop, slice(1, 5, 2).indices(10), slice(-1).indices(5), slice(None, None, -1).indices(4), type(slice(1, 2)).__name__, isinstance(slice(1, 2), tuple), isinstance(slice(1, 2), slice), slice(None).indices(3), slice(2, 100).indices(5)))
+show("C47", lambda: slice(1, 2, 0).indices(5))
+show("C48", lambda: (hasattr(5, "__fspath__"), hasattr("s", "__len__"), hasattr(5, "nope")))
+
+expected = """C1 b'h\\xc3\\xa9llo'
+C2 UnicodeEncodeError 'ascii' codec can't encode character '\\xe9' in position 1: ordinal not in range(128)
+C3 b'hllo'
+C4 b'h?llo'
+C5 b'h\\\\xe9llo'
+C6 b'h\\xe9llo'
+C7 UnicodeEncodeError 'latin-1' codec can't encode characters in position 0-1: ordinal not in range(256)
+C8 b'\\xff\\xfeh\\x00i\\x00'
+C12 LookupError unknown encoding: nope
+C13 'hi'
+C14 'hé'
+C15 UnicodeDecodeError 'utf-8' codec can't decode byte 0xff in position 1: invalid start byte
+C16 UnicodeDecodeError 'utf-8' codec can't decode byte 0xc3 in position 1: unexpected end of data
+C17 UnicodeDecodeError 'utf-8' codec can't decode byte 0xc3 in position 0: invalid continuation byte
+C18 'h'
+C19 'h�'
+C20 'h\\\\xff'
+C21 'hé'
+C22 UnicodeDecodeError 'ascii' codec can't decode byte 0xe9 in position 1: ordinal not in range(128)
+C24 b'xyzwv\\xef\\xbb\\xbft'
+C25 'hi'
+C31 'ab��cd'
+C32 UnicodeDecodeError 'utf-8' codec can't decode byte 0xe9 in position 0: unexpected end of data
+C33 b'\\xc3\\xa9'
+C37 'hihi'
+C38 UnicodeDecodeError 'utf-16-le' codec can't decode byte 0x69 in position 2: truncated data
+C40 'héok'
+C41 b'\\xc3\\xa9\\xe9'
+C43 TypeError string argument without an encoding
+C44 (5, -1, 3, -1)
+C45 ValueError subsection not found
+C46 ('slice(1, 5, 2)', None, 3, (1, 5, 2), (0, 4, 1), (3, -1, -1), 'slice', False, True, (0, 3, 1), (2, 5, 1))
+C47 ValueError slice step cannot be zero
+C48 (False, True, False)"""
+got = "\n".join(__lines)
+if got != expected:
+    raise AssertionError("mismatch:\n" + got + "\n--- want ---\n" + expected)
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn counter_most_common_and_elements() {
         // gap 2: Counter.most_common() and Counter.elements() must work.
         let src = r#"
@@ -2528,9 +3404,17 @@ if mc[0][0] != "a" or mc[0][1] != 3:
     raise ValueError("most_common top entry wrong")
 if mc[1][0] != "b" or mc[1][1] != 2:
     raise ValueError("most_common second entry wrong")
-elems = c.elements()
+elems = list(c.elements())
 if len(elems) != 6:
     raise ValueError("elements() total count wrong")
+if elems != ["a", "a", "a", "b", "b", "c"]:
+    raise ValueError("elements() order wrong: " + str(elems))
+try:
+    len(c.elements())
+except TypeError:
+    pass
+else:
+    raise ValueError("elements() must be an iterator (CPython: itertools.chain), not a sequence")
 "#;
         assert_eq!(run_capturing(src).unwrap(), 0);
     }

@@ -900,14 +900,27 @@ impl Emitter {
                         self.write(": ");
                         self.emit_expr(bound);
                     }
+                    // PEP 696 default (`[T = int]`), Python 3.13+.
+                    if let Some(default) = &t.default {
+                        self.write(" = ");
+                        self.emit_expr(default);
+                    }
                 }
                 TypeParam::ParamSpec(p) => {
                     self.write("**");
                     self.write(p.name.as_str());
+                    if let Some(default) = &p.default {
+                        self.write(" = ");
+                        self.emit_expr(default);
+                    }
                 }
                 TypeParam::TypeVarTuple(t) => {
                     self.write("*");
                     self.write(t.name.as_str());
+                    if let Some(default) = &t.default {
+                        self.write(" = ");
+                        self.emit_expr(default);
+                    }
                 }
             }
         }
@@ -3136,6 +3149,24 @@ mod tests {
             !after_eq.contains('\n') || after_eq.trim_end().ends_with('"'),
             "raw newline inside emitted string literal: {:?}",
             out
+        );
+    }
+
+    #[test]
+    fn pep_696_type_parameter_defaults_are_emitted() {
+        use crate::emit_python;
+        let parsed = tyc_syntax::parse_module(
+            "def first[T = int](xs: list[T]) -> T:\n    return xs[0]\n\nclass Box[T = str, *Ts = *tuple[int]]:\n    value: T\n",
+        )
+        .expect("parse failed");
+        let out = emit_python(parsed.syntax());
+        assert!(
+            out.contains("def first[T = int](xs: list[T]) -> T:"),
+            "{out}"
+        );
+        assert!(
+            out.contains("class Box[T = str, *Ts = *tuple[int]]:"),
+            "{out}"
         );
     }
 

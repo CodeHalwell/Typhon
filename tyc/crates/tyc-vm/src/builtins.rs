@@ -10,9 +10,7 @@ use std::rc::Rc;
 
 use indexmap::IndexMap;
 
-use crate::error::{
-    attribute_error, index_error, key_error, stop_iteration, type_error, value_error, Unwind,
-};
+use crate::error::{attribute_error, index_error, key_error, type_error, value_error, Unwind};
 use crate::interp::{normalize_index, Interpreter};
 use crate::value::{DictMap, HashKey, IterState, Module, NativeFn, Value, VmInt};
 
@@ -270,7 +268,33 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("str", |interp, args| {
-        Ok(Value::Str(Rc::new(match args.first() {
+        let (pos, kw) = split_kwargs(&args);
+        // `str(bytes, encoding[, errors])` decodes.
+        if let Some(Value::Bytes(b)) = pos.first() {
+            let encoding = pos.get(1).cloned().or_else(|| {
+                kw.iter()
+                    .find(|(k, _)| k == "encoding")
+                    .map(|(_, v)| v.clone())
+            });
+            if let Some(enc) = encoding {
+                let errors = pos
+                    .get(2)
+                    .cloned()
+                    .or_else(|| {
+                        kw.iter()
+                            .find(|(k, _)| k == "errors")
+                            .map(|(_, v)| v.clone())
+                    })
+                    .map(|v| v.py_str())
+                    .unwrap_or_else(|| "strict".to_owned());
+                return Ok(Value::Str(Rc::new(crate::codecs::decode(
+                    b,
+                    &enc.py_str(),
+                    &errors,
+                )?)));
+            }
+        }
+        Ok(Value::Str(Rc::new(match pos.first() {
             Some(v) => interp.str_of(v)?,
             None => String::new(),
         })))
@@ -353,13 +377,38 @@ pub fn install(interp: &mut Interpreter) {
         Ok(Value::Int(VmInt::from(v.to_bigint()?)))
     });
 
-    native!("divmod", |_i, args| {
+    native!("divmod", |interp, args| {
         let a = args
             .first()
             .ok_or_else(|| type_error("divmod expected 2 arguments"))?;
         let b = args
             .get(1)
             .ok_or_else(|| type_error("divmod expected 2 arguments"))?;
+        // A user `__divmod__` (or reflected `__rdivmod__`) wins.
+        if let Value::Instance(inst) = a {
+            if let Some(m) = interp.find_method(&inst.class, "__divmod__") {
+                return interp.call_value(
+                    Value::BoundMethod {
+                        receiver: Box::new(a.clone()),
+                        function: m,
+                    },
+                    vec![b.clone()],
+                    &[],
+                );
+            }
+        }
+        if let Value::Instance(inst) = b {
+            if let Some(m) = interp.find_method(&inst.class, "__rdivmod__") {
+                return interp.call_value(
+                    Value::BoundMethod {
+                        receiver: Box::new(b.clone()),
+                        function: m,
+                    },
+                    vec![a.clone()],
+                    &[],
+                );
+            }
+        }
         match (a, b) {
             (Value::Int(x), Value::Int(y)) => {
                 if y.is_zero() {
@@ -542,7 +591,17 @@ pub fn install(interp: &mut Interpreter) {
             .py_str();
         match &obj {
             Value::Instance(inst) => {
-                if inst.fields.borrow_mut().remove(name.as_str()).is_none() {
+                if let Some(err) =
+                    crate::interp::frozen_dataclass_error(&inst.class, &name, "delete")
+                {
+                    return Err(err);
+                }
+                if inst
+                    .fields
+                    .borrow_mut()
+                    .shift_remove(name.as_str())
+                    .is_none()
+                {
                     return Err(attribute_error(format!(
                         "'{}' object has no attribute '{}'",
                         inst.class.name, name
@@ -645,6 +704,34 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("bytes", |i, args| {
+        let (pos, kw) = split_kwargs(&args);
+        // `bytes(str, encoding[, errors])` encodes.
+        if let Some(Value::Str(text)) = pos.first() {
+            let encoding = pos.get(1).cloned().or_else(|| {
+                kw.iter()
+                    .find(|(k, _)| k == "encoding")
+                    .map(|(_, v)| v.clone())
+            });
+            let Some(enc) = encoding else {
+                return Err(type_error("string argument without an encoding"));
+            };
+            let errors = pos
+                .get(2)
+                .cloned()
+                .or_else(|| {
+                    kw.iter()
+                        .find(|(k, _)| k == "errors")
+                        .map(|(_, v)| v.clone())
+                })
+                .map(|v| v.py_str())
+                .unwrap_or_else(|| "strict".to_owned());
+            return Ok(Value::Bytes(Rc::new(crate::codecs::encode(
+                text,
+                &enc.py_str(),
+                &errors,
+            )?)));
+        }
+        let args = pos.to_vec();
         match args.into_iter().next() {
             None => Ok(Value::Bytes(Rc::new(Vec::new()))),
             Some(Value::Bytes(b)) => Ok(Value::Bytes(b)),
@@ -676,7 +763,9 @@ pub fn install(interp: &mut Interpreter) {
         if let Some(v) = args.into_iter().next() {
             let it = i.make_iter(v)?;
             while let Some(x) = i.iter_next(&it)? {
-                out.insert(x.to_hash_key()?);
+                let k = i.hash_key(&x)?;
+                let k = i.settle_key_in_set(&out, k)?;
+                out.insert(k);
             }
         }
         Ok(Value::Set(Rc::new(RefCell::new(out))))
@@ -701,7 +790,9 @@ pub fn install(interp: &mut Interpreter) {
                     let kit = i.make_iter(keys)?;
                     while let Some(k) = i.iter_next(&kit)? {
                         let val = i.subscript(&v, &k)?;
-                        map.insert(k.to_hash_key()?, val);
+                        let key = i.hash_key(&k)?;
+                        let key = i.settle_key_in_map(&map, key)?;
+                        map.insert(key, val);
                     }
                     return Ok(Value::Dict(Rc::new(RefCell::new(map))));
                 }
@@ -710,7 +801,9 @@ pub fn install(interp: &mut Interpreter) {
             while let Some(pair) = i.iter_next(&it)? {
                 match pair {
                     Value::Tuple(t) if t.len() == 2 => {
-                        map.insert(t[0].to_hash_key()?, t[1].clone());
+                        let key = i.hash_key(&t[0])?;
+                        let key = i.settle_key_in_map(&map, key)?;
+                        map.insert(key, t[1].clone());
                     }
                     _ => return Err(type_error("dict update expected a sequence of pairs")),
                 }
@@ -719,12 +812,37 @@ pub fn install(interp: &mut Interpreter) {
         Ok(Value::Dict(Rc::new(RefCell::new(map))))
     });
 
+    // `slice(stop)` / `slice(start, stop[, step])` — the same marker tuple the
+    // subscript syntax builds, so `isinstance(x, slice)`, `.start` and
+    // `.indices()` work on both.
+    native!("slice", |_i, args| {
+        let (start, stop, step) = match args.len() {
+            1 => (Value::None, args[0].clone(), Value::None),
+            2 => (args[0].clone(), args[1].clone(), Value::None),
+            3 => (args[0].clone(), args[1].clone(), args[2].clone()),
+            0 => return Err(type_error("slice expected at least 1 argument, got 0")),
+            n => {
+                return Err(type_error(format!(
+                    "slice expected at most 3 arguments, got {n}"
+                )))
+            }
+        };
+        Ok(Value::Tuple(Rc::new(vec![
+            Value::Str(Rc::new("__slice__".into())),
+            start,
+            stop,
+            step,
+        ])))
+    });
+
     native!("frozenset", |i, args| {
         let mut out = HashSet::new();
         if let Some(v) = args.into_iter().next() {
             let it = i.make_iter(v)?;
             while let Some(x) = i.iter_next(&it)? {
-                out.insert(x.to_hash_key()?);
+                let k = i.hash_key(&x)?;
+                let k = i.settle_key_in_set(&out, k)?;
+                out.insert(k);
             }
         }
         // Insert the `__typhon_frozen__` sentinel so that repr(), py_str(),
@@ -835,18 +953,11 @@ pub fn install(interp: &mut Interpreter) {
         // the floor, so the call returned a total short by exactly `start`
         // with no error. (The keyword form `sum(xs, start=n)` is handled on
         // the kwargs path.)
-        let mut acc = match args.next() {
-            Some(start) => start,
-            None => Value::Int(VmInt::from(0)),
-        };
+        let start = args.next().unwrap_or(Value::Int(VmInt::from(0)));
         if args.next().is_some() {
             return Err(type_error("sum() takes at most 2 arguments"));
         }
-        let it = i.make_iter(iterable)?;
-        while let Some(v) = i.iter_next(&it)? {
-            acc = i.binop(&acc, ruff_python_ast::Operator::Add, &v)?;
-        }
-        Ok(acc)
+        builtin_sum(i, iterable, start)
     });
 
     native!("sorted", |i, args| {
@@ -883,17 +994,26 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("reversed", |i, args| {
-        let it = i.make_iter(
-            args.into_iter()
-                .next()
-                .ok_or_else(|| type_error("reversed() requires an iterable"))?,
-        )?;
+        let seq = args
+            .into_iter()
+            .next()
+            .ok_or_else(|| type_error("reversed() requires an iterable"))?;
+        // A user `__reversed__` wins (CPython protocol).
+        if let Value::Instance(_) = &seq {
+            if let Some(r) = i.call_dunder0(&seq, "__reversed__")? {
+                return i.make_iter(r);
+            }
+        }
+        let it = i.make_iter(seq)?;
         let mut out: Vec<Value> = Vec::new();
         while let Some(v) = i.iter_next(&it)? {
             out.push(v);
         }
         out.reverse();
-        Ok(Value::List(Rc::new(RefCell::new(out))))
+        Ok(Value::Iter(Rc::new(RefCell::new(IterState::Reversed {
+            items: Rc::new(out),
+            index: 0,
+        }))))
     });
 
     native!("enumerate", |i, args| {
@@ -995,12 +1115,41 @@ pub fn install(interp: &mut Interpreter) {
         let it = args
             .next()
             .ok_or_else(|| type_error("next() requires an iterator"))?;
+        // A user iterator object (a class with `__next__`) is stepped through
+        // its own `__next__`; StopIteration propagates as it would in CPython.
+        if let Value::Instance(inst) = &it {
+            if i.find_method(&inst.class, "__next__").is_some() {
+                let default = args.next();
+                return match i.call_dunder0(&it, "__next__") {
+                    Ok(Some(v)) => Ok(v),
+                    Ok(None) => Err(crate::error::stop_iteration()),
+                    Err(Unwind::Exception(e)) if e.kind == "StopIteration" && default.is_some() => {
+                        Ok(default.unwrap_or(Value::None))
+                    }
+                    Err(e) => Err(e),
+                };
+            }
+            return Err(type_error(format!(
+                "'{}' object is not an iterator",
+                inst.class.name
+            )));
+        }
+        if !matches!(it, Value::Iter(_)) {
+            return Err(type_error(format!(
+                "'{}' object is not an iterator",
+                it.type_name()
+            )));
+        }
         // `next(it, default)` returns `default` on exhaustion instead of
-        // raising `StopIteration`.
+        // raising `StopIteration` (which carries a finished generator's
+        // `return` value as `.value`).
         let default = args.next();
         match i.iter_next(&it)? {
             Some(v) => Ok(v),
-            None => default.ok_or_else(stop_iteration),
+            None => match default {
+                Some(d) => Ok(d),
+                None => Err(crate::interp::stop_iteration_for(&it)),
+            },
         }
     });
 
@@ -1140,32 +1289,10 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("hash", |i, args| {
+        // CPython's algorithms for the builtin types; the user `__hash__` /
+        // dataclass / identity protocol for instances (`hash_value`).
         let v = single(&args, "hash")?;
-        // A user-defined `__hash__` wins over the structural hash key.
-        if let Value::Instance(inst) = v {
-            if let Some(m) = i.find_method(&inst.class, "__hash__") {
-                let r = i.call_value(
-                    Value::BoundMethod {
-                        receiver: Box::new(v.clone()),
-                        function: m,
-                    },
-                    vec![],
-                    &[],
-                )?;
-                return match r {
-                    Value::Int(_) => Ok(r),
-                    other => Err(type_error(format!(
-                        "__hash__ method should return an integer, not {}",
-                        other.type_name()
-                    ))),
-                };
-            }
-        }
-        let key = v.to_hash_key()?;
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        key.hash(&mut h);
-        Ok(Value::Int(VmInt::from(h.finish() as i64)))
+        Ok(Value::Int(VmInt::from(i.hash_value(v)?)))
     });
 
     native!("id", |_i, args| {
@@ -1202,16 +1329,12 @@ pub fn install(interp: &mut Interpreter) {
         )))
     });
 
-    native!("open", |_i, args| {
-        let path = args
-            .first()
-            .ok_or_else(|| type_error("open() requires a path"))?
-            .py_str();
-        let mode = args
-            .get(1)
-            .map(|v| v.py_str())
-            .unwrap_or_else(|| "r".into());
-        crate::ffi::open_file(&path, &mode)
+    // `open` is `io.open`: the file object model lives in the `io` shim.
+    native!("open", |i, args| {
+        let (pos, kw) = split_kwargs(&args);
+        let io = make_io_module(i)?;
+        let open_fn = i.get_attr(&io, "open")?;
+        i.call_value(open_fn, pos.to_vec(), &kw)
     });
 
     // `@property`, `@classmethod`, `@staticmethod`: the VM has no
@@ -1242,6 +1365,7 @@ pub fn install(interp: &mut Interpreter) {
         Ok(Value::Module(Rc::new(Module {
             name: "<super>".to_owned(),
             members: std::cell::RefCell::new(members),
+            env: None,
         })))
     });
 
@@ -1366,7 +1490,38 @@ pub fn install(interp: &mut Interpreter) {
         "PendingDeprecationWarning",
     ] {
         let n = name.to_owned();
-        let ctor = NativeFn::new(Box::leak(n.clone().into_boxed_str()), move |_i, args| {
+        let ctor = NativeFn::new(Box::leak(n.clone().into_boxed_str()), move |i, args| {
+            // `OSError(errno, strerror[, filename[, winerror[, filename2]]])`:
+            // `args` keeps the first two, the message is
+            // `[Errno N] strerror: 'filename'`, and a bare `OSError` picks the
+            // subclass its errno names (`OSError(2, …)` is a
+            // FileNotFoundError).
+            if is_os_error_kind(&n) && args.len() >= 2 {
+                if let Value::Int(code) = &args[0] {
+                    let errno = code.to_i64().unwrap_or(0);
+                    let strerror = args[1].py_str();
+                    let filename = match args.get(2) {
+                        Some(Value::None) | None => None,
+                        Some(v) => Some(filename_repr(i, v)?),
+                    };
+                    let filename2 = match args.get(4) {
+                        Some(Value::None) | None => None,
+                        Some(v) => Some(filename_repr(i, v)?),
+                    };
+                    let kind = if matches!(n.as_str(), "OSError" | "IOError" | "EnvironmentError") {
+                        os_error_kind(errno)
+                    } else {
+                        n.as_str()
+                    };
+                    return Ok(os_error_value(
+                        kind,
+                        errno,
+                        &strerror,
+                        filename.as_deref(),
+                        filename2.as_deref(),
+                    ));
+                }
+            }
             let msg = args.first().map(|v| v.py_str()).unwrap_or_default();
             Ok(Value::Exception {
                 kind: Rc::new(n.clone()),
@@ -1473,6 +1628,190 @@ pub fn install(interp: &mut Interpreter) {
             ))))
         }))),
     );
+}
+
+/// `sum(iterable, start)` with CPython 3.12+'s numeric paths: exact integer
+/// accumulation, then — once the running total is a float — Neumaier
+/// compensated summation of float items (`sum([0.1] * 10) == 1.0`), with
+/// small ints folded in uncompensated exactly as `builtin_sum_impl` does.
+/// Anything else falls back to `+`.
+fn builtin_sum(i: &mut Interpreter, iterable: Value, start: Value) -> Result<Value, Unwind> {
+    match &start {
+        Value::Str(_) => {
+            return Err(type_error(
+                "sum() can't sum strings [use ''.join(seq) instead]",
+            ))
+        }
+        Value::Bytes(_) => {
+            return Err(type_error(
+                "sum() can't sum bytes [use b''.join(seq) instead]",
+            ))
+        }
+        _ => {}
+    }
+    let it = i.make_iter(iterable)?;
+    let mut result = start;
+    loop {
+        if let Value::Float(f0) = result {
+            let mut f_result = f0;
+            let mut c = 0.0f64;
+            loop {
+                let Some(item) = i.iter_next(&it)? else {
+                    // Don't let the compensation turn an infinite / overflowed
+                    // sum into a NaN.
+                    if c != 0.0 && c.is_finite() {
+                        f_result += c;
+                    }
+                    return Ok(Value::Float(f_result));
+                };
+                match &item {
+                    Value::Float(x) => {
+                        let x = *x;
+                        let t = f_result + x;
+                        if f_result.abs() >= x.abs() {
+                            c += (f_result - t) + x;
+                        } else {
+                            c += (x - t) + f_result;
+                        }
+                        f_result = t;
+                    }
+                    Value::Int(n) if n.to_i64().is_some() => {
+                        f_result += n.to_i64().unwrap_or(0) as f64;
+                    }
+                    Value::Bool(b) => {
+                        f_result += *b as i64 as f64;
+                    }
+                    _ => {
+                        if c != 0.0 && c.is_finite() {
+                            f_result += c;
+                        }
+                        result = i.binop(
+                            &Value::Float(f_result),
+                            ruff_python_ast::Operator::Add,
+                            &item,
+                        )?;
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        let Some(item) = i.iter_next(&it)? else {
+            return Ok(result);
+        };
+        result = i.binop(&result, ruff_python_ast::Operator::Add, &item)?;
+    }
+}
+
+/// CPython's `math_1` error contract for a one-argument float function: a NaN
+/// result from a non-NaN argument is a domain error, an infinite result from a
+/// finite argument is a range error (or a domain error for functions that
+/// cannot overflow, such as `log(0)`).
+fn math_1(x: f64, r: f64, can_overflow: bool) -> Result<Value, Unwind> {
+    if r.is_nan() && !x.is_nan() {
+        return Err(value_error("math domain error"));
+    }
+    if r.is_infinite() && x.is_finite() {
+        if can_overflow {
+            return Err(Unwind::Exception(crate::error::VmException::new(
+                "OverflowError",
+                "math range error",
+            )));
+        }
+        return Err(value_error("math domain error"));
+    }
+    Ok(Value::Float(r))
+}
+
+/// A `math` module argument as a float, with CPython's error for an int too
+/// large to convert.
+fn math_arg(v: &Value) -> Result<f64, Unwind> {
+    match v {
+        Value::Int(n) => {
+            let f = n.to_f64();
+            if f.is_infinite() {
+                return Err(Unwind::Exception(crate::error::VmException::new(
+                    "OverflowError",
+                    "int too large to convert to float",
+                )));
+            }
+            Ok(f)
+        }
+        Value::Float(x) => Ok(*x),
+        Value::Bool(b) => Ok(*b as i64 as f64),
+        Value::Instance(_) => v.to_float(),
+        other => Err(type_error(format!(
+            "must be real number, not {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// `math.fsum`: Shewchuk's exactly-rounded summation, ported from CPython's
+/// `math_fsum` (partials array + final correctly-rounded collapse).
+fn math_fsum(xs: &[f64]) -> Result<f64, Unwind> {
+    let mut partials: Vec<f64> = Vec::new();
+    let mut special_sum = 0.0f64;
+    let mut inf_sum = 0.0f64;
+    for &x0 in xs {
+        let mut x = x0;
+        if !x.is_finite() {
+            if x.is_infinite() {
+                inf_sum += x;
+            }
+            special_sum += x;
+            continue;
+        }
+        let mut i = 0usize;
+        for j in 0..partials.len() {
+            let mut y = partials[j];
+            if x.abs() < y.abs() {
+                std::mem::swap(&mut x, &mut y);
+            }
+            let hi = x + y;
+            let lo = y - (hi - x);
+            if lo != 0.0 {
+                partials[i] = lo;
+                i += 1;
+            }
+            x = hi;
+        }
+        partials.truncate(i);
+        partials.push(x);
+    }
+    if special_sum != 0.0 {
+        if inf_sum.is_nan() {
+            return Err(value_error("-inf + inf in fsum"));
+        }
+        return Ok(special_sum);
+    }
+    let mut n = partials.len();
+    if n == 0 {
+        return Ok(0.0);
+    }
+    n -= 1;
+    let mut hi = partials[n];
+    let mut lo = 0.0f64;
+    while n > 0 {
+        let x = hi;
+        n -= 1;
+        let y = partials[n];
+        hi = x + y;
+        let yr = hi - x;
+        lo = y - yr;
+        if lo != 0.0 {
+            break;
+        }
+    }
+    if n > 0 && ((lo < 0.0 && partials[n - 1] < 0.0) || (lo > 0.0 && partials[n - 1] > 0.0)) {
+        let y = lo * 2.0;
+        let x = hi + y;
+        let yr = x - hi;
+        if y == yr {
+            hi = x;
+        }
+    }
+    Ok(hi)
 }
 
 fn single<'a>(args: &'a [Value], name: &str) -> Result<&'a Value, Unwind> {
@@ -1621,9 +1960,13 @@ pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
         ("str", Value::Str(_)) => true,
         ("bytes", Value::Bytes(_)) => true,
         ("list", Value::List(_)) => true,
-        ("tuple", Value::Tuple(_)) => true,
+        ("tuple", Value::Tuple(t)) => !crate::value::is_slice_marker(t),
+        ("slice", Value::Tuple(t)) => crate::value::is_slice_marker(t),
         ("dict", Value::Dict(_)) => true,
         ("set", Value::Set(_)) => true,
+        ("frozenset", Value::Set(_)) => true,
+        ("range", Value::Range { .. }) => true,
+        ("complex", Value::Complex(..)) => true,
         ("Ok", Value::ResultOk(_)) => true,
         ("Err", Value::ResultErr(_)) => true,
         // Exception kind match — exact, or through the builtin exception
@@ -1650,6 +1993,13 @@ pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
 fn class_in_chain(c: &Rc<crate::value::Class>, name: &str) -> bool {
     if c.name == name {
         return true;
+    }
+    // A builtin base (`class Counter(dict)`) is a native, not a `Class`, so
+    // `build_class` records its name instead of keeping it in `bases`.
+    if let Some(Value::Tuple(names)) = c.class_attrs.borrow().get("__typhon_builtin_bases__") {
+        if names.iter().any(|n| n.py_str() == name) {
+            return true;
+        }
     }
     c.bases.iter().any(|b| class_in_chain(b, name))
 }
@@ -1712,7 +2062,47 @@ fn reduce_minmax(
 
 /// Compile `source` in a fresh child of `interp.root` and return the named
 /// top-level bindings (classes / functions) it produced.
+/// Stdlib shims written in Python — interpreted by the VM itself, so they get
+/// dunder dispatch, inheritance and lazy generators for free. Each file is
+/// plain CPython-valid Python validated against the real module.
+mod shims {
+    pub const DATETIME: &str = include_str!("shims/datetime.py");
+    pub const TIME_EXTRAS: &str = include_str!("shims/time_extras.py");
+    pub const ARGPARSE: &str = include_str!("shims/argparse.py");
+    pub const COLLECTIONS: &str = include_str!("shims/collections.py");
+    pub const ITERTOOLS: &str = include_str!("shims/itertools.py");
+    pub const RANDOM: &str = include_str!("shims/random.py");
+    pub const HASHLIB: &str = include_str!("shims/hashlib.py");
+    pub const IO: &str = include_str!("shims/io.py");
+    pub const POSIXPATH: &str = include_str!("shims/posixpath.py");
+    pub const OS: &str = include_str!("shims/os.py");
+    pub const PATHLIB: &str = include_str!("shims/pathlib.py");
+    pub const SHUTIL: &str = include_str!("shims/shutil.py");
+    pub const TEMPFILE: &str = include_str!("shims/tempfile.py");
+    pub const GLOB: &str = include_str!("shims/glob.py");
+}
+
 fn compile_helpers(interp: &mut Interpreter, source: &str) -> Result<Vec<(String, Value)>, Unwind> {
+    compile_helpers_seeded(interp, source, Vec::new())
+}
+
+/// Compile `source` with `seed` bindings visible to it (natives a shim needs
+/// that are not importable, such as the raw `time()` clock).
+fn compile_helpers_seeded(
+    interp: &mut Interpreter,
+    source: &str,
+    seed: Vec<(&str, Value)>,
+) -> Result<Vec<(String, Value)>, Unwind> {
+    compile_shim(interp, source, seed).map(|(members, _)| members)
+}
+
+/// Run a Python shim in a fresh module namespace seeded with `seed`;
+/// returns the resulting bindings and the namespace itself.
+fn compile_shim(
+    interp: &mut Interpreter,
+    source: &str,
+    seed: Vec<(&str, Value)>,
+) -> Result<(Vec<(String, Value)>, crate::env::EnvRef), Unwind> {
     use tyc_syntax::preprocess;
     let expanded = preprocess::expand_question_ops(&preprocess::expand_inline_question_ops(
         // Shared with the CLI: the VM omitted both of these, so an
@@ -1734,12 +2124,169 @@ fn compile_helpers(interp: &mut Interpreter, source: &str) -> Result<Vec<(String
         ))
     })?;
     let mut module = parsed.into_syntax();
-    let desugar_out = tyc_desugar::desugar_module(&module);
+    // Shim sources are plain Python validated against CPython: every class
+    // is emitted exactly as written (no `@dataclass` decoration, no
+    // synthesised `__init__`), so the VM's dataclass semantics — slots
+    // enforcement, field-tuple hashing, generated constructors — never
+    // apply to a helper class CPython would run as a bare class.
+    let plain_class_lines: Vec<usize> = prep
+        .python_source
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.trim_start().starts_with("class "))
+        .map(|(i, _)| i)
+        .collect();
+    let desugar_out = tyc_desugar::desugar_module_with(
+        &module,
+        tyc_desugar::DesugarOptions {
+            plain_class_line_starts: preprocess::line_byte_starts(
+                &prep.python_source,
+                &plain_class_lines,
+            ),
+            ..Default::default()
+        },
+    );
     module = desugar_out.module;
 
-    let env = crate::env::Env::new_child(&interp.root);
+    let env = crate::env::Env::new_module(&interp.root);
+    for (name, value) in seed {
+        env.set(name, value);
+    }
     interp.exec_block(&module.body, &env)?;
-    Ok(env.snapshot())
+    Ok((env.snapshot(), env))
+}
+
+/// A module whose members are the top-level bindings of a Python shim.
+fn module_from_shim(interp: &mut Interpreter, name: &str, source: &str) -> Result<Value, Unwind> {
+    let (members, env) = compile_shim(interp, source, Vec::new())?;
+    let entries: Vec<(&str, Value)> = members
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.clone()))
+        .collect();
+    Ok(make_module_env(name, entries, env))
+}
+
+fn make_datetime_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
+    module_from_shim(interp, "datetime", shims::DATETIME)
+}
+
+fn make_argparse_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
+    module_from_shim(interp, "argparse", shims::ARGPARSE)
+}
+
+fn make_itertools_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
+    module_from_shim(interp, "itertools", shims::ITERTOOLS)
+}
+
+/// `collections`: the Python shim (Counter / deque / OrderedDict / ChainMap)
+/// plus the native `defaultdict` and a `namedtuple` factory that builds a real
+/// class named after the type from the shim's `_NamedTupleBase` template.
+fn make_collections_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
+    let members = compile_helpers(interp, shims::COLLECTIONS)?;
+    let mut entries: Vec<(&str, Value)> = Vec::new();
+    let mut template: Option<Rc<crate::value::Class>> = None;
+    for (k, v) in &members {
+        if k == "_NamedTupleBase" {
+            if let Value::Class(c) = v {
+                template = Some(c.clone());
+            }
+        }
+        if !k.starts_with('_') {
+            entries.push((k.as_str(), v.clone()));
+        }
+    }
+    let Some(template) = template else {
+        return Err(type_error(
+            "internal: collections shim did not define _NamedTupleBase",
+        ));
+    };
+    let namedtuple = nf("namedtuple", move |i, args| {
+        let (pos, kw) = split_kwargs(&args);
+        let typename = pos
+            .first()
+            .ok_or_else(|| type_error("namedtuple() missing required argument: 'typename'"))?
+            .py_str();
+        let field_names = pos
+            .get(1)
+            .ok_or_else(|| type_error("namedtuple() missing required argument: 'field_names'"))?
+            .clone();
+        let fields: Vec<String> = match &field_names {
+            Value::Str(s) => s
+                .replace(',', " ")
+                .split_whitespace()
+                .map(String::from)
+                .collect(),
+            other => {
+                let it = i.make_iter(other.clone())?;
+                let mut out = Vec::new();
+                while let Some(v) = i.iter_next(&it)? {
+                    out.push(v.py_str());
+                }
+                out
+            }
+        };
+        let mut defaults: Vec<Value> = Vec::new();
+        if let Some((_, d)) = kw.iter().find(|(k, _)| k == "defaults") {
+            if !matches!(d, Value::None) {
+                let it = i.make_iter(d.clone())?;
+                while let Some(v) = i.iter_next(&it)? {
+                    defaults.push(v);
+                }
+            }
+        }
+        if defaults.len() > fields.len() {
+            return Err(type_error("Got more default values than field names"));
+        }
+        let mut field_defaults: DictMap = IndexMap::new();
+        let offset = fields.len() - defaults.len();
+        for (name, d) in fields[offset..].iter().zip(defaults) {
+            field_defaults.insert(HashKey::Str(Rc::new(name.clone())), d);
+        }
+        let mut class_attrs: HashMap<String, Value> = HashMap::new();
+        class_attrs.insert(
+            "_fields".to_owned(),
+            Value::Tuple(Rc::new(
+                fields
+                    .iter()
+                    .map(|f| Value::Str(Rc::new(f.clone())))
+                    .collect(),
+            )),
+        );
+        class_attrs.insert(
+            "_field_defaults".to_owned(),
+            Value::Dict(Rc::new(RefCell::new(field_defaults))),
+        );
+        let cls = Rc::new(crate::value::Class {
+            name: typename,
+            methods: RefCell::new(template.methods.borrow().clone()),
+            fields: vec![],
+            class_attrs: RefCell::new(class_attrs),
+            bases: vec![template.clone()],
+            properties: RefCell::new(template.properties.borrow().clone()),
+            classmethods: RefCell::new(template.classmethods.borrow().clone()),
+            is_exception: false,
+            is_protocol: false,
+        });
+        Ok(Value::Class(cls))
+    });
+    entries.push(("namedtuple", namedtuple));
+    entries.push(("abc", make_collections_abc_module()));
+    let defaultdict = nf("defaultdict", |i, mut args| {
+        // `defaultdict(factory[, mapping])` constructs a synthesised mapping
+        // instance whose `__missing__` calls `factory()` to materialise a
+        // default for absent keys (foundation `__missing__` hook). The
+        // backing store is a plain dict held in `self._data`.
+        let factory = if args.is_empty() {
+            Value::None
+        } else {
+            args.remove(0)
+        };
+        let cls = defaultdict_class(i)?;
+        let initial = args.into_iter().next().unwrap_or(Value::None);
+        i.call_value(cls, vec![factory, initial], &[])
+    });
+    entries.push(("defaultdict", defaultdict));
+    Ok(make_module("collections", entries))
 }
 
 /// Compile `source`, then look up a single named binding from it.
@@ -1772,6 +2319,7 @@ fn cached_helper_class(
 /// hook invokes when `__getitem__` raises `KeyError`.
 const DEFAULTDICT_SRC: &str = r#"
 class _DefaultDict:
+    __typhon_builtin_bases__ = ("dict", "defaultdict")
     def __init__(self, default_factory, initial):
         self._data = {}
         self._factory = default_factory
@@ -1787,9 +2335,13 @@ class _DefaultDict:
     def __missing__(self, key):
         if self._factory is None:
             raise KeyError(key)
-        return self._factory()
+        value = self._factory()
+        self._data[key] = value
+        return value
     def __contains__(self, key):
         return key in self._data
+    def __repr__(self):
+        return "defaultdict(%r, %r)" % (self._factory, self._data)
     def __len__(self):
         return len(self._data)
     def __iter__(self):
@@ -1815,151 +2367,27 @@ fn defaultdict_class(interp: &mut Interpreter) -> Result<Value, Unwind> {
     )
 }
 
-/// Source for the native `datetime` module: `date`, `datetime`, `timedelta`.
-/// Date math uses a proleptic-Gregorian ordinal (`_ordinal`) so `date - date`
-/// and `datetime + timedelta(days=…)` are exact. Arithmetic flows through the
-/// `__add__` / `__sub__` dunders the foundation dispatches on instances.
-const DATETIME_SRC: &str = r#"
-def _is_leap(y):
-    return y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)
-
-def _days_in_month(y, m):
-    if m == 2:
-        if _is_leap(y):
-            return 29
-        return 28
-    if m == 1 or m == 3 or m == 5 or m == 7 or m == 8 or m == 10 or m == 12:
-        return 31
-    return 30
-
-def _to_ordinal(y, m, d):
-    n = 0
-    yy = 1
-    while yy < y:
-        if _is_leap(yy):
-            n = n + 366
-        else:
-            n = n + 365
-        yy = yy + 1
-    mm = 1
-    while mm < m:
-        n = n + _days_in_month(y, mm)
-        mm = mm + 1
-    return n + d
-
-def _from_ordinal(n):
-    y = 1
-    while True:
-        if _is_leap(y):
-            ydays = 366
-        else:
-            ydays = 365
-        if n > ydays:
-            n = n - ydays
-            y = y + 1
-        else:
-            break
-    m = 1
-    while n > _days_in_month(y, m):
-        n = n - _days_in_month(y, m)
-        m = m + 1
-    return (y, m, n)
-
-def _pad2(n):
-    s = str(n)
-    if len(s) < 2:
-        return "0" + s
-    return s
-
-class timedelta:
-    def __init__(self, days=0, seconds=0, minutes=0, hours=0, weeks=0):
-        self.days = days + weeks * 7
-        self.seconds = seconds + minutes * 60 + hours * 3600
-    def total_seconds(self):
-        return self.days * 86400 + self.seconds
-    def __repr__(self):
-        return "datetime.timedelta(days=" + str(self.days) + ")"
-
-class date:
-    def __init__(self, year, month, day):
-        self.year = year
-        self.month = month
-        self.day = day
-    def _ordinal(self):
-        return _to_ordinal(self.year, self.month, self.day)
-    def isoformat(self):
-        return str(self.year) + "-" + _pad2(self.month) + "-" + _pad2(self.day)
-    def __sub__(self, other):
-        return timedelta(days=self._ordinal() - other._ordinal())
-    def __add__(self, other):
-        ymd = _from_ordinal(self._ordinal() + other.days)
-        return date(ymd[0], ymd[1], ymd[2])
-    def __repr__(self):
-        return "datetime.date(" + str(self.year) + ", " + str(self.month) + ", " + str(self.day) + ")"
-    def __str__(self):
-        return self.isoformat()
-
-class datetime:
-    def __init__(self, year, month, day, hour=0, minute=0, second=0, microsecond=0):
-        self.year = year
-        self.month = month
-        self.day = day
-        self.hour = hour
-        self.minute = minute
-        self.second = second
-        self.microsecond = microsecond
-    def date(self):
-        return date(self.year, self.month, self.day)
-    def _ordinal(self):
-        return _to_ordinal(self.year, self.month, self.day)
-    def isoformat(self):
-        return (str(self.year) + "-" + _pad2(self.month) + "-" + _pad2(self.day)
-                + "T" + _pad2(self.hour) + ":" + _pad2(self.minute) + ":" + _pad2(self.second))
-    def __add__(self, other):
-        total_secs = self.hour * 3600 + self.minute * 60 + self.second + other.seconds
-        extra_days = total_secs // 86400
-        rem = total_secs % 86400
-        ymd = _from_ordinal(self._ordinal() + other.days + extra_days)
-        return datetime(ymd[0], ymd[1], ymd[2], rem // 3600, (rem % 3600) // 60, rem % 60)
-    def __sub__(self, other):
-        d = self._ordinal() - other._ordinal()
-        s = (self.hour * 3600 + self.minute * 60 + self.second
-             - other.hour * 3600 - other.minute * 60 - other.second)
-        return timedelta(days=d, seconds=s)
-    def __repr__(self):
-        return ("datetime.datetime(" + str(self.year) + ", " + str(self.month) + ", "
-                + str(self.day) + ", " + str(self.hour) + ", " + str(self.minute) + ")")
-"#;
-
-fn make_datetime_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
-    let members = compile_helpers(interp, DATETIME_SRC)?;
-    let wanted = ["date", "datetime", "timedelta"];
-    let entries: Vec<(&str, Value)> = wanted
-        .iter()
-        .filter_map(|&n| {
-            members
-                .iter()
-                .find(|(k, _)| k == n)
-                .map(|(_, v)| (n, v.clone()))
-        })
-        .collect();
-    Ok(make_module("datetime", entries))
-}
-
 // ── Module resolution ──────────────────────────────────────────────────────
 
 pub fn resolve_module(interp: &mut Interpreter, name: &str) -> Result<Value, Unwind> {
     match name {
         "typhon_runtime" => Ok(make_typhon_runtime_module(interp)),
         "math" => Ok(make_math_module()),
-        "os" | "os.path" => Ok(make_os_module()),
+        "os" => make_os_module(interp),
+        "os.path" | "posixpath" => os_path_module(interp),
+        "io" => make_io_module(interp),
+        "shutil" => make_shutil_module(interp),
+        "tempfile" => make_tempfile_module(interp),
+        "glob" => make_glob_module(interp),
         "sys" => Ok(make_sys_module(interp)),
         "json" => Ok(make_json_module()),
-        "time" => Ok(make_time_module()),
-        "random" => Ok(make_random_module()),
+        "time" => make_time_module(interp),
+        "argparse" => make_argparse_module(interp),
+        "random" => make_random_module(interp),
+        "hashlib" => make_hashlib_module(interp),
         "typing" => Ok(make_typing_module()),
         "re" => Ok(make_re_module()),
-        "collections" => Ok(make_collections_module()),
+        "collections" => make_collections_module(interp),
         // `from collections.abc import Callable / Iterator / ...` — the
         // canonical home for the abstract container types. Annotation-only
         // at runtime, so identity natives (mirroring the `typing` shim)
@@ -1976,7 +2404,7 @@ pub fn resolve_module(interp: &mut Interpreter, name: &str) -> Result<Value, Unw
         // CORRECTNESS depends on interleaving need `tyc run --compile`.
         "asyncio" => Ok(make_asyncio_module()),
         "functools" => Ok(make_functools_module()),
-        "itertools" => Ok(make_itertools_module()),
+        "itertools" => make_itertools_module(interp),
         "dataclasses" => Ok(make_dataclasses_module()),
         "pathlib" => make_pathlib_module(interp),
         "datetime" => make_datetime_module(interp),
@@ -2000,13 +2428,14 @@ pub fn resolve_module(interp: &mut Interpreter, name: &str) -> Result<Value, Unw
             }
             Ok(root)
         }
+        // CPython's exception for a module the VM does not model (it has a
+        // small native stdlib; `tyc run --compile` runs the full
+        // interpreter): same type, same message, so `except ImportError`
+        // and printed messages agree with `tyc build && python`.
         _ => Err(crate::error::Unwind::Exception(
             crate::error::VmException::new(
-                "ImportError",
-                format!(
-                    "tyc-vm cannot import '{name}': only a small native stdlib is available. \
-                     Run with `tyc run --compile` to use the full Python interpreter."
-                ),
+                "ModuleNotFoundError",
+                format!("No module named '{name}'"),
             ),
         )),
     }
@@ -2020,6 +2449,21 @@ fn make_module(name: &str, entries: Vec<(&str, Value)>) -> Value {
     Value::Module(Rc::new(Module {
         name: name.to_owned(),
         members: RefCell::new(map),
+        env: None,
+    }))
+}
+
+/// [`make_module`] for a module whose body the VM executed: keeps the
+/// namespace so later rebinding of its globals stays visible.
+fn make_module_env(name: &str, entries: Vec<(&str, Value)>, env: crate::env::EnvRef) -> Value {
+    let mut map = HashMap::new();
+    for (k, v) in entries {
+        map.insert(k.to_owned(), v);
+    }
+    Value::Module(Rc::new(Module {
+        name: name.to_owned(),
+        members: RefCell::new(map),
+        env: Some(env),
     }))
 }
 
@@ -2325,7 +2769,19 @@ fn make_math_module() -> Value {
             (
                 "sqrt",
                 nf("sqrt", |_i, args| {
-                    Ok(Value::Float(single(&args, "sqrt")?.to_float()?.sqrt()))
+                    let x = math_arg(single(&args, "sqrt")?)?;
+                    math_1(x, x.sqrt(), false)
+                }),
+            ),
+            (
+                "fsum",
+                nf("fsum", |i, args| {
+                    let it = i.make_iter(single(&args, "fsum")?.clone())?;
+                    let mut xs = Vec::new();
+                    while let Some(v) = i.iter_next(&it)? {
+                        xs.push(math_arg(&v)?);
+                    }
+                    Ok(Value::Float(math_fsum(&xs)?))
                 }),
             ),
             // `floor` / `ceil` / `trunc` all return a Python `int`, which is
@@ -2443,27 +2899,65 @@ fn make_math_module() -> Value {
             (
                 "log",
                 nf("log", |_i, args| {
-                    let x = args
-                        .first()
-                        .ok_or_else(|| type_error("log() needs an arg"))?
-                        .to_float()?;
-                    let base = match args.get(1) {
-                        Some(b) => b.to_float()?,
-                        None => std::f64::consts::E,
-                    };
-                    Ok(Value::Float(x.log(base)))
+                    // `math.log(x[, base])`: CPython takes the natural log of
+                    // each operand (a huge int through its bit length) and
+                    // divides; `log(0)` / `log(-x)` are domain errors and a
+                    // base of 1 is a float division by zero.
+                    fn ln_of(v: &Value) -> Result<f64, Unwind> {
+                        if let Value::Int(n) = v {
+                            if n.is_negative() || n.is_zero() {
+                                return Err(value_error("math domain error"));
+                            }
+                            let f = n.to_f64();
+                            if f.is_infinite() {
+                                // ln(n) = ln(n / 2^k) + k·ln 2 for a bignum.
+                                let bits = n.bits();
+                                let shift = bits.saturating_sub(53) as usize;
+                                let top = n.shr(shift).to_f64();
+                                return Ok(top.ln() + shift as f64 * std::f64::consts::LN_2);
+                            }
+                            return Ok(f.ln());
+                        }
+                        let x = math_arg(v)?;
+                        if x.is_nan() {
+                            return Ok(x);
+                        }
+                        if x <= 0.0 {
+                            return Err(value_error("math domain error"));
+                        }
+                        Ok(x.ln())
+                    }
+                    let x = ln_of(
+                        args.first()
+                            .ok_or_else(|| type_error("log() needs an arg"))?,
+                    )?;
+                    match args.get(1) {
+                        Some(b) => {
+                            let den = ln_of(b)?;
+                            if den == 0.0 {
+                                return Err(Unwind::Exception(crate::error::VmException::new(
+                                    "ZeroDivisionError",
+                                    "float division by zero",
+                                )));
+                            }
+                            Ok(Value::Float(x / den))
+                        }
+                        None => Ok(Value::Float(x)),
+                    }
                 }),
             ),
             (
                 "log2",
                 nf("log2", |_i, args| {
-                    Ok(Value::Float(single(&args, "log2")?.to_float()?.log2()))
+                    let x = math_arg(single(&args, "log2")?)?;
+                    math_1(x, x.log2(), false)
                 }),
             ),
             (
                 "log10",
                 nf("log10", |_i, args| {
-                    Ok(Value::Float(single(&args, "log10")?.to_float()?.log10()))
+                    let x = math_arg(single(&args, "log10")?)?;
+                    math_1(x, x.log10(), false)
                 }),
             ),
             (
@@ -2471,7 +2965,8 @@ fn make_math_module() -> Value {
                 nf("expm1", |_i, args| {
                     // exp(x) - 1 with better precision near 0, matching
                     // CPython math.expm1.
-                    Ok(Value::Float(single(&args, "expm1")?.to_float()?.exp_m1()))
+                    let x = math_arg(single(&args, "expm1")?)?;
+                    math_1(x, x.exp_m1(), true)
                 }),
             ),
             (
@@ -2479,44 +2974,51 @@ fn make_math_module() -> Value {
                 nf("log1p", |_i, args| {
                     // log(1 + x) with better precision near 0, matching
                     // CPython math.log1p.
-                    Ok(Value::Float(single(&args, "log1p")?.to_float()?.ln_1p()))
+                    let x = math_arg(single(&args, "log1p")?)?;
+                    math_1(x, x.ln_1p(), false)
                 }),
             ),
             (
                 "exp",
                 nf("exp", |_i, args| {
-                    Ok(Value::Float(single(&args, "exp")?.to_float()?.exp()))
+                    let x = math_arg(single(&args, "exp")?)?;
+                    math_1(x, x.exp(), true)
                 }),
             ),
             // ── trig ──────────────────────────────────────────────────────────
             (
                 "sin",
                 nf("sin", |_i, args| {
-                    Ok(Value::Float(single(&args, "sin")?.to_float()?.sin()))
+                    let x = math_arg(single(&args, "sin")?)?;
+                    math_1(x, x.sin(), false)
                 }),
             ),
             (
                 "cos",
                 nf("cos", |_i, args| {
-                    Ok(Value::Float(single(&args, "cos")?.to_float()?.cos()))
+                    let x = math_arg(single(&args, "cos")?)?;
+                    math_1(x, x.cos(), false)
                 }),
             ),
             (
                 "tan",
                 nf("tan", |_i, args| {
-                    Ok(Value::Float(single(&args, "tan")?.to_float()?.tan()))
+                    let x = math_arg(single(&args, "tan")?)?;
+                    math_1(x, x.tan(), false)
                 }),
             ),
             (
                 "asin",
                 nf("asin", |_i, args| {
-                    Ok(Value::Float(single(&args, "asin")?.to_float()?.asin()))
+                    let x = math_arg(single(&args, "asin")?)?;
+                    math_1(x, x.asin(), false)
                 }),
             ),
             (
                 "acos",
                 nf("acos", |_i, args| {
-                    Ok(Value::Float(single(&args, "acos")?.to_float()?.acos()))
+                    let x = math_arg(single(&args, "acos")?)?;
+                    math_1(x, x.acos(), false)
                 }),
             ),
             (
@@ -2589,15 +3091,26 @@ fn make_math_module() -> Value {
             (
                 "pow",
                 nf("pow", |_i, args| {
-                    let a = args
-                        .first()
-                        .ok_or_else(|| type_error("pow() needs args"))?
-                        .to_float()?;
-                    let b = args
-                        .get(1)
-                        .ok_or_else(|| type_error("pow() needs args"))?
-                        .to_float()?;
-                    Ok(Value::Float(a.powf(b)))
+                    let a = math_arg(args.first().ok_or_else(|| type_error("pow() needs args"))?)?;
+                    let b = math_arg(args.get(1).ok_or_else(|| type_error("pow() needs args"))?)?;
+                    let r = a.powf(b);
+                    // CPython's `math_pow`: a NaN from non-NaN operands (a
+                    // negative base with a fractional exponent) is a domain
+                    // error; an overflow is a range error, except that a zero
+                    // base with a negative exponent is a domain error too.
+                    if r.is_nan() && !a.is_nan() && !b.is_nan() {
+                        return Err(value_error("math domain error"));
+                    }
+                    if r.is_infinite() && a.is_finite() && b.is_finite() {
+                        if a == 0.0 {
+                            return Err(value_error("math domain error"));
+                        }
+                        return Err(Unwind::Exception(crate::error::VmException::new(
+                            "OverflowError",
+                            "math range error",
+                        )));
+                    }
+                    Ok(Value::Float(r))
                 }),
             ),
             // ── integer-domain (return int) ───────────────────────────────────
@@ -2683,235 +3196,934 @@ fn make_math_module() -> Value {
     )
 }
 
-fn make_os_module() -> Value {
-    let environ = nf("environ", |_i, _args| Ok(Value::None));
-    let _ = environ;
-    let env_dict = {
-        let mut m: DictMap = IndexMap::new();
-        for (k, v) in std::env::vars() {
-            m.insert(HashKey::Str(Rc::new(k)), Value::Str(Rc::new(v)));
+// ── Filesystem natives shared by the `os` / `io` / `pathlib` / `shutil` /
+// `tempfile` / `glob` shims ────────────────────────────────────────────────
+
+/// How an `OSError` names a filename argument: a str quoted, any other
+/// object by its repr.
+fn filename_repr(interp: &mut Interpreter, v: &Value) -> Result<String, Unwind> {
+    match v {
+        Value::Str(s) => Ok(crate::value::python_repr_str(s)),
+        other => interp.repr_of(other),
+    }
+}
+
+/// `os.fspath(v)`: a str as is, bytes decoded, an object with `__fspath__`
+/// (a `Path`) through it. Returns the path together with the display form
+/// CPython puts in an `OSError` — the argument's repr, so a `Path` given to
+/// a raw `os` function shows as `PosixPath('…')` while a str shows quoted.
+pub(crate) fn fspath_pair(interp: &mut Interpreter, v: &Value) -> Result<(String, String), Unwind> {
+    match v {
+        Value::Str(s) => Ok(((**s).clone(), crate::value::python_repr_str(s))),
+        Value::Bytes(b) => {
+            let s = String::from_utf8_lossy(b).into_owned();
+            Ok((s, v.py_repr()))
         }
-        Value::Dict(Rc::new(RefCell::new(m)))
-    };
-    make_module(
-        "os",
-        vec![
-            (
-                "getenv",
-                nf("getenv", |_i, args| {
-                    let key = single(&args, "getenv")?.py_str();
-                    Ok(std::env::var(&key)
-                        .map(|v| Value::Str(Rc::new(v)))
-                        .unwrap_or_else(|_| args.get(1).cloned().unwrap_or(Value::None)))
-                }),
-            ),
-            ("environ", env_dict),
-            (
-                "path",
-                make_module(
-                    "os.path",
-                    vec![
-                        (
-                            "exists",
-                            nf("exists", |_i, args| {
-                                let path = single(&args, "exists")?.py_str();
-                                Ok(Value::Bool(std::path::Path::new(&path).exists()))
-                            }),
-                        ),
-                        (
-                            "isfile",
-                            nf("isfile", |_i, args| {
-                                let path = single(&args, "isfile")?.py_str();
-                                Ok(Value::Bool(std::path::Path::new(&path).is_file()))
-                            }),
-                        ),
-                        (
-                            "isdir",
-                            nf("isdir", |_i, args| {
-                                let path = single(&args, "isdir")?.py_str();
-                                Ok(Value::Bool(std::path::Path::new(&path).is_dir()))
-                            }),
-                        ),
-                        (
-                            "join",
-                            nf("join", |_i, args| {
-                                let mut buf = std::path::PathBuf::new();
-                                for a in &args {
-                                    buf.push(a.py_str());
-                                }
-                                Ok(Value::Str(Rc::new(buf.to_string_lossy().into_owned())))
-                            }),
-                        ),
-                        (
-                            "basename",
-                            nf("basename", |_i, args| {
-                                let path = single(&args, "basename")?.py_str();
-                                let name = std::path::Path::new(&path)
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                                    .unwrap_or_default();
-                                Ok(Value::Str(Rc::new(name)))
-                            }),
-                        ),
-                        (
-                            "dirname",
-                            nf("dirname", |_i, args| {
-                                let path = single(&args, "dirname")?.py_str();
-                                let dir = std::path::Path::new(&path)
-                                    .parent()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                                    .unwrap_or_default();
-                                Ok(Value::Str(Rc::new(dir)))
-                            }),
-                        ),
-                    ],
-                ),
-            ),
-            (
-                "getcwd",
-                nf("getcwd", |_i, _args| {
-                    let cwd = std::env::current_dir()
-                        .map_err(|e| os_error(format!("getcwd failed: {e}")))?;
-                    Ok(Value::Str(Rc::new(cwd.to_string_lossy().into_owned())))
-                }),
-            ),
-            (
-                "remove",
-                nf("remove", |_i, args| {
-                    let path = single(&args, "remove")?.py_str();
-                    std::fs::remove_file(&path).map_err(|e| fs_unwind(&path, e))?;
-                    Ok(Value::None)
-                }),
-            ),
-            (
-                "unlink",
-                nf("unlink", |_i, args| {
-                    let path = single(&args, "unlink")?.py_str();
-                    std::fs::remove_file(&path).map_err(|e| fs_unwind(&path, e))?;
-                    Ok(Value::None)
-                }),
-            ),
-            (
-                "rmdir",
-                nf("rmdir", |_i, args| {
-                    let path = single(&args, "rmdir")?.py_str();
-                    std::fs::remove_dir(&path).map_err(|e| fs_unwind(&path, e))?;
-                    Ok(Value::None)
-                }),
-            ),
-            (
-                "mkdir",
-                nf("mkdir", |_i, args| {
-                    let path = single(&args, "mkdir")?.py_str();
-                    std::fs::create_dir(&path).map_err(|e| fs_unwind(&path, e))?;
-                    Ok(Value::None)
-                }),
-            ),
-            (
-                "makedirs",
-                nf("makedirs", |_i, args| {
-                    // Kwargs arrive via the sentinel forwarded by
-                    // `call_with_kwargs` ("makedirs" arm).
-                    let (pos, kw) = split_kwargs(&args);
-                    let path = pos
-                        .first()
-                        .ok_or_else(|| type_error("makedirs() needs a path"))?
-                        .py_str();
-                    let exist_ok = kw
-                        .iter()
-                        .find(|(k, _)| k == "exist_ok")
-                        .map(|(_, v)| v.truthy())
-                        // Positional form: makedirs(path, mode, exist_ok).
-                        .or_else(|| pos.get(2).map(|v| v.truthy()))
-                        .unwrap_or(false);
-                    // CPython raises FileExistsError for an existing leaf
-                    // unless exist_ok=True.
-                    if !exist_ok && std::path::Path::new(&path).exists() {
-                        return Err(fs_unwind(
-                            &path,
-                            std::io::Error::from(std::io::ErrorKind::AlreadyExists),
-                        ));
-                    }
-                    std::fs::create_dir_all(&path).map_err(|e| fs_unwind(&path, e))?;
-                    Ok(Value::None)
-                }),
-            ),
-            (
-                "rename",
-                nf("rename", |_i, args| {
-                    let src = args
-                        .first()
-                        .ok_or_else(|| type_error("rename() needs src and dst"))?
-                        .py_str();
-                    let dst = args
-                        .get(1)
-                        .ok_or_else(|| type_error("rename() needs src and dst"))?
-                        .py_str();
-                    std::fs::rename(&src, &dst).map_err(|e| fs_unwind(&src, e))?;
-                    Ok(Value::None)
-                }),
-            ),
-            (
-                "listdir",
-                nf("listdir", |_i, args| {
-                    let path = args
-                        .first()
-                        .map(|v| v.py_str())
-                        .unwrap_or_else(|| ".".to_owned());
-                    let mut names: Vec<Value> = Vec::new();
-                    for entry in std::fs::read_dir(&path).map_err(|e| fs_unwind(&path, e))? {
-                        let entry = entry.map_err(|e| fs_unwind(&path, e))?;
-                        names.push(Value::Str(Rc::new(
-                            entry.file_name().to_string_lossy().into_owned(),
-                        )));
-                    }
-                    Ok(Value::List(Rc::new(RefCell::new(names))))
-                }),
-            ),
-        ],
+        Value::Instance(inst) => {
+            let Some(m) = interp.find_method(&inst.class, "__fspath__") else {
+                return Err(type_error(format!(
+                    "expected str, bytes or os.PathLike object, not {}",
+                    inst.class.name
+                )));
+            };
+            let r = interp.call_value(
+                Value::BoundMethod {
+                    receiver: Box::new(v.clone()),
+                    function: m,
+                },
+                vec![],
+                &[],
+            )?;
+            match r {
+                Value::Str(s) => {
+                    let display = interp.repr_of(v)?;
+                    Ok(((*s).clone(), display))
+                }
+                other => Err(type_error(format!(
+                    "expected {}.__fspath__() to return str or bytes, not {}",
+                    inst.class.name,
+                    other.type_name()
+                ))),
+            }
+        }
+        other => Err(type_error(format!(
+            "expected str, bytes or os.PathLike object, not {}",
+            other.type_name()
+        ))),
+    }
+}
+
+pub(crate) fn fspath_of(interp: &mut Interpreter, v: &Value) -> Result<String, Unwind> {
+    fspath_pair(interp, v).map(|(p, _)| p)
+}
+
+/// The exception kinds that carry `errno` / `strerror` / `filename`.
+pub(crate) fn is_os_error_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "OSError"
+            | "IOError"
+            | "EnvironmentError"
+            | "FileNotFoundError"
+            | "FileExistsError"
+            | "PermissionError"
+            | "IsADirectoryError"
+            | "NotADirectoryError"
+            | "InterruptedError"
+            | "TimeoutError"
+            | "BlockingIOError"
+            | "ChildProcessError"
+            | "ProcessLookupError"
+            | "ConnectionError"
+            | "BrokenPipeError"
+            | "ConnectionResetError"
+            | "ConnectionRefusedError"
+            | "ConnectionAbortedError"
     )
 }
 
-/// Map an `std::io::Error` from a filesystem builtin onto the matching
-/// Python exception type (`FileNotFoundError` / `PermissionError` /
-/// `FileExistsError` / generic `OSError`) so user `except` arms narrow the
-/// same way they do under CPython.
-fn fs_unwind(path: &str, e: std::io::Error) -> Unwind {
-    use std::io::ErrorKind;
-    let kind = match e.kind() {
-        ErrorKind::NotFound => "FileNotFoundError",
-        ErrorKind::PermissionDenied => "PermissionError",
-        ErrorKind::AlreadyExists => "FileExistsError",
+/// `OSError(errno, …)` maps itself onto the matching subclass.
+pub(crate) fn os_error_kind(errno: i64) -> &'static str {
+    match errno {
+        2 => "FileNotFoundError",
+        17 => "FileExistsError",
+        21 => "IsADirectoryError",
+        20 => "NotADirectoryError",
+        1 | 13 => "PermissionError",
+        3 => "ProcessLookupError",
+        4 => "InterruptedError",
+        10 => "ChildProcessError",
+        11 | 115 => "BlockingIOError",
+        32 => "BrokenPipeError",
+        103 => "ConnectionAbortedError",
+        104 => "ConnectionResetError",
+        111 => "ConnectionRefusedError",
+        110 => "TimeoutError",
         _ => "OSError",
-    };
-    Unwind::Exception(crate::error::VmException::new(
-        kind,
-        format!("{e}: '{path}'"),
-    ))
+    }
 }
 
-fn os_error(msg: String) -> Unwind {
-    Unwind::Exception(crate::error::VmException::new("OSError", msg))
+/// `os.strerror`.
+pub(crate) fn strerror_text(errno: i64) -> String {
+    match errno {
+        1 => "Operation not permitted",
+        2 => "No such file or directory",
+        3 => "No such process",
+        4 => "Interrupted system call",
+        5 => "Input/output error",
+        9 => "Bad file descriptor",
+        11 => "Resource temporarily unavailable",
+        12 => "Cannot allocate memory",
+        13 => "Permission denied",
+        17 => "File exists",
+        20 => "Not a directory",
+        21 => "Is a directory",
+        22 => "Invalid argument",
+        24 => "Too many open files",
+        28 => "No space left on device",
+        32 => "Broken pipe",
+        36 => "File name too long",
+        39 => "Directory not empty",
+        110 => "Connection timed out",
+        111 => "Connection refused",
+        _ => return format!("Unknown error {errno}"),
+    }
+    .to_owned()
 }
 
-/// fnmatch-style single-component wildcard match: `*` (any run) and `?`
-/// (single char). Backs the VM `Path.glob` shim.
-fn glob_match(pat: &str, name: &str) -> bool {
-    fn inner(p: &[char], n: &[char]) -> bool {
-        match (p.first(), n.first()) {
-            (None, None) => true,
-            (Some('*'), _) => {
-                // `*` matches empty, or consumes one char of the name.
-                inner(&p[1..], n) || (!n.is_empty() && inner(p, &n[1..]))
-            }
-            (Some('?'), Some(_)) => inner(&p[1..], &n[1..]),
-            (Some(pc), Some(nc)) if pc == nc => inner(&p[1..], &n[1..]),
-            _ => false,
+/// An `OSError`-family value in CPython's shape: `args == (errno, strerror)`,
+/// `str()` is `[Errno N] strerror: 'filename'` (`-> 'filename2'` for the
+/// two-path calls). The filename display strings are already reprs.
+pub(crate) fn os_error_value(
+    kind: &str,
+    errno: i64,
+    strerror: &str,
+    filename: Option<&str>,
+    filename2: Option<&str>,
+) -> Value {
+    let mut message = format!("[Errno {errno}] {strerror}");
+    if let Some(f) = filename {
+        message.push_str(": ");
+        message.push_str(f);
+        if let Some(f2) = filename2 {
+            message.push_str(" -> ");
+            message.push_str(f2);
         }
     }
-    let p: Vec<char> = pat.chars().collect();
-    let n: Vec<char> = name.chars().collect();
-    inner(&p, &n)
+    Value::Exception {
+        kind: Rc::new(kind.to_owned()),
+        message: Rc::new(message),
+        args: Rc::new(vec![
+            Value::Int(VmInt::from(errno)),
+            Value::Str(Rc::new(strerror.to_owned())),
+        ]),
+    }
+}
+
+pub(crate) fn os_error_unwind(
+    errno: i64,
+    strerror: &str,
+    filename: Option<&str>,
+    filename2: Option<&str>,
+) -> Unwind {
+    let v = os_error_value(os_error_kind(errno), errno, strerror, filename, filename2);
+    let Value::Exception { kind, message, .. } = &v else {
+        unreachable!()
+    };
+    Unwind::Exception(
+        crate::error::VmException::new(kind.as_str(), (**message).clone()).with_value(v),
+    )
+}
+
+/// Undo a Python string repr (`'a\'b'` → `a'b`) for `OSError.filename`.
+fn unrepr_str(text: &str) -> Option<String> {
+    let quote = text.chars().next()?;
+    if quote != '\'' && quote != '"' || !text.ends_with(quote) || text.len() < 2 {
+        return None;
+    }
+    let inner = &text[1..text.len() - 1];
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next()? {
+            'n' => out.push('\n'),
+            't' => out.push('\t'),
+            'r' => out.push('\r'),
+            '\\' => out.push('\\'),
+            '\'' => out.push('\''),
+            '"' => out.push('"'),
+            'x' => {
+                let h: String = chars.by_ref().take(2).collect();
+                out.push(char::from_u32(u32::from_str_radix(&h, 16).ok()?)?);
+            }
+            'u' => {
+                let h: String = chars.by_ref().take(4).collect();
+                out.push(char::from_u32(u32::from_str_radix(&h, 16).ok()?)?);
+            }
+            'U' => {
+                let h: String = chars.by_ref().take(8).collect();
+                out.push(char::from_u32(u32::from_str_radix(&h, 16).ok()?)?);
+            }
+            other => {
+                out.push('\\');
+                out.push(other);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// `OSError.filename` / `filename2`, recovered from the message the VM built
+/// (`[Errno N] strerror: 'name' -> 'name2'`).
+pub(crate) fn os_error_filename(message: &str, second: bool) -> Value {
+    let Some(rest) = message.strip_prefix("[Errno ") else {
+        return Value::None;
+    };
+    let Some(idx) = rest.find("] ") else {
+        return Value::None;
+    };
+    let rest = &rest[idx + 2..];
+    // The filename part starts at the first ": " followed by a repr.
+    let mut start = None;
+    let mut search = 0;
+    while let Some(pos) = rest[search..].find(": ") {
+        let candidate = &rest[search + pos + 2..];
+        if candidate.starts_with('\'')
+            || candidate.starts_with('"')
+            || candidate
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_uppercase())
+                && candidate.contains('(')
+        {
+            start = Some(search + pos + 2);
+            break;
+        }
+        search += pos + 2;
+    }
+    let Some(start) = start else {
+        return Value::None;
+    };
+    let names = &rest[start..];
+    let (first, second_name) = match names.rfind("' -> ") {
+        Some(p) => (&names[..p + 1], Some(&names[p + 5..])),
+        None => (names, None),
+    };
+    let chosen = if second { second_name } else { Some(first) };
+    match chosen {
+        Some(text) => match unrepr_str(text) {
+            Some(s) => Value::Str(Rc::new(s)),
+            None => Value::Str(Rc::new(text.to_owned())),
+        },
+        None => Value::None,
+    }
+}
+
+/// `strerror` for an `io::Error`: its message with Rust's " (os error N)"
+/// suffix removed.
+fn strerror_of(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match text.find(" (os error ") {
+        Some(i) => text[..i].to_owned(),
+        None => text,
+    }
+}
+
+fn errno_of(e: &std::io::Error) -> i64 {
+    if let Some(n) = e.raw_os_error() {
+        return n as i64;
+    }
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::NotFound => 2,
+        ErrorKind::PermissionDenied => 13,
+        ErrorKind::AlreadyExists => 17,
+        ErrorKind::InvalidInput => 22,
+        _ => 5,
+    }
+}
+
+/// Map an `std::io::Error` from a filesystem native onto CPython's
+/// exception: the errno-selected `OSError` subclass with the
+/// `[Errno N] strerror: 'path'` message. `display` is the path's repr.
+pub(crate) fn fs_unwind(display: &str, e: std::io::Error) -> Unwind {
+    let errno = errno_of(&e);
+    let strerror = if e.raw_os_error().is_some() {
+        strerror_of(&e)
+    } else {
+        strerror_text(errno)
+    };
+    os_error_unwind(errno, &strerror, Some(display), None)
+}
+
+fn fs_unwind2(display_src: &str, display_dst: &str, e: std::io::Error) -> Unwind {
+    let errno = errno_of(&e);
+    let strerror = if e.raw_os_error().is_some() {
+        strerror_of(&e)
+    } else {
+        strerror_text(errno)
+    };
+    os_error_unwind(errno, &strerror, Some(display_src), Some(display_dst))
+}
+
+fn path_arg(
+    interp: &mut Interpreter,
+    args: &[Value],
+    idx: usize,
+    fname: &str,
+) -> Result<(String, String), Unwind> {
+    let v = args
+        .get(idx)
+        .ok_or_else(|| type_error(format!("{fname}() missing required argument")))?;
+    fspath_pair(interp, v)
+}
+
+#[cfg(unix)]
+fn stat_tuple(m: &std::fs::Metadata) -> Value {
+    use std::os::unix::fs::MetadataExt;
+    let int = |n: i64| Value::Int(VmInt::from(n));
+    let secs = |s: i64, ns: i64| Value::Float(s as f64 + ns as f64 * 1e-9);
+    Value::Tuple(Rc::new(vec![
+        int(m.mode() as i64),
+        int(m.ino() as i64),
+        int(m.dev() as i64),
+        int(m.nlink() as i64),
+        int(m.uid() as i64),
+        int(m.gid() as i64),
+        int(m.size() as i64),
+        int(m.atime()),
+        int(m.mtime()),
+        int(m.ctime()),
+        secs(m.atime(), m.atime_nsec()),
+        secs(m.mtime(), m.mtime_nsec()),
+        secs(m.ctime(), m.ctime_nsec()),
+        int(m.atime() * 1_000_000_000 + m.atime_nsec()),
+        int(m.mtime() * 1_000_000_000 + m.mtime_nsec()),
+        int(m.ctime() * 1_000_000_000 + m.ctime_nsec()),
+        int(m.blksize() as i64),
+        int(m.blocks() as i64),
+    ]))
+}
+
+#[cfg(not(unix))]
+fn stat_tuple(m: &std::fs::Metadata) -> Value {
+    let int = |n: i64| Value::Int(VmInt::from(n));
+    let when = |t: std::io::Result<std::time::SystemTime>| -> (i64, i64) {
+        t.ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| (d.as_secs() as i64, d.subsec_nanos() as i64))
+            .unwrap_or((0, 0))
+    };
+    let (a, an) = when(m.accessed());
+    let (mt, mn) = when(m.modified());
+    let (c, cn) = when(m.created());
+    let mode: i64 = if m.is_dir() { 0o040755 } else { 0o100644 };
+    Value::Tuple(Rc::new(vec![
+        int(mode),
+        int(0),
+        int(0),
+        int(1),
+        int(0),
+        int(0),
+        int(m.len() as i64),
+        int(a),
+        int(mt),
+        int(c),
+        Value::Float(a as f64 + an as f64 * 1e-9),
+        Value::Float(mt as f64 + mn as f64 * 1e-9),
+        Value::Float(c as f64 + cn as f64 * 1e-9),
+        int(a * 1_000_000_000 + an),
+        int(mt * 1_000_000_000 + mn),
+        int(c * 1_000_000_000 + cn),
+        int(4096),
+        int(m.len() as i64 / 512),
+    ]))
+}
+
+/// Lexical `os.path.normpath(os.path.abspath(p))`, the non-strict
+/// `realpath` fallback for a path that does not exist.
+fn lexical_abspath(path: &str) -> String {
+    let mut full = if path.starts_with('/') {
+        path.to_owned()
+    } else {
+        let cwd = std::env::current_dir()
+            .map(|c| c.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "/".to_owned());
+        format!("{cwd}/{path}")
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    let owned = std::mem::take(&mut full);
+    for comp in owned.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    format!("/{}", parts.join("/"))
+}
+
+/// The `_fs_*` natives every filesystem shim is seeded with.
+fn fs_natives() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "_fspath",
+            nf("_fspath", |i, args| {
+                let v = single(&args, "fspath")?;
+                match v {
+                    Value::Bytes(_) => Ok(v.clone()),
+                    _ => Ok(Value::Str(Rc::new(fspath_of(i, v)?))),
+                }
+            }),
+        ),
+        (
+            "_fs_read",
+            nf("_fs_read", |i, args| {
+                let (path, display) = path_arg(i, &args, 0, "read")?;
+                std::fs::read(&path)
+                    .map(|b| Value::Bytes(Rc::new(b)))
+                    .map_err(|e| fs_unwind(&display, e))
+            }),
+        ),
+        (
+            "_fs_write",
+            nf("_fs_write", |i, args| {
+                let (path, display) = path_arg(i, &args, 0, "write")?;
+                let data: Vec<u8> = match args.get(1) {
+                    Some(Value::Bytes(b)) => (**b).clone(),
+                    Some(Value::Str(s)) => s.as_bytes().to_vec(),
+                    _ => return Err(type_error("a bytes-like object is required")),
+                };
+                let mode = args
+                    .get(2)
+                    .map(|v| v.py_str())
+                    .unwrap_or_else(|| "w".into());
+                use std::io::Write;
+                let result = match mode.as_str() {
+                    "a" => std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                        .and_then(|mut f| f.write_all(&data)),
+                    "x" => std::fs::File::create_new(&path).and_then(|mut f| f.write_all(&data)),
+                    _ => std::fs::write(&path, &data),
+                };
+                result.map_err(|e| fs_unwind(&display, e))?;
+                Ok(Value::None)
+            }),
+        ),
+        (
+            "_fs_exists",
+            nf("_fs_exists", |i, args| {
+                let (path, _) = path_arg(i, &args, 0, "exists")?;
+                Ok(Value::Bool(std::path::Path::new(&path).exists()))
+            }),
+        ),
+        (
+            "_fs_stat",
+            nf("_fs_stat", |i, args| {
+                let (path, display) = path_arg(i, &args, 0, "stat")?;
+                let follow = args.get(1).map(|v| v.truthy()).unwrap_or(true);
+                let meta = if follow {
+                    std::fs::metadata(&path)
+                } else {
+                    std::fs::symlink_metadata(&path)
+                };
+                meta.map(|m| stat_tuple(&m))
+                    .map_err(|e| fs_unwind(&display, e))
+            }),
+        ),
+        (
+            "_fs_listdir",
+            nf("_fs_listdir", |i, args| {
+                let (path, display) = match args.first() {
+                    Some(v) => fspath_pair(i, v)?,
+                    None => (".".to_owned(), "'.'".to_owned()),
+                };
+                let mut names: Vec<Value> = Vec::new();
+                for entry in std::fs::read_dir(&path).map_err(|e| fs_unwind(&display, e))? {
+                    let entry = entry.map_err(|e| fs_unwind(&display, e))?;
+                    names.push(Value::Str(Rc::new(
+                        entry.file_name().to_string_lossy().into_owned(),
+                    )));
+                }
+                Ok(Value::List(Rc::new(RefCell::new(names))))
+            }),
+        ),
+        (
+            "_fs_mkdir",
+            nf("_fs_mkdir", |i, args| {
+                let (path, display) = path_arg(i, &args, 0, "mkdir")?;
+                std::fs::create_dir(&path).map_err(|e| fs_unwind(&display, e))?;
+                Ok(Value::None)
+            }),
+        ),
+        (
+            "_fs_rmdir",
+            nf("_fs_rmdir", |i, args| {
+                let (path, display) = path_arg(i, &args, 0, "rmdir")?;
+                std::fs::remove_dir(&path).map_err(|e| fs_unwind(&display, e))?;
+                Ok(Value::None)
+            }),
+        ),
+        (
+            "_fs_unlink",
+            nf("_fs_unlink", |i, args| {
+                let (path, display) = path_arg(i, &args, 0, "unlink")?;
+                std::fs::remove_file(&path).map_err(|e| fs_unwind(&display, e))?;
+                Ok(Value::None)
+            }),
+        ),
+        (
+            "_fs_rename",
+            nf("_fs_rename", |i, args| {
+                let (src, dsrc) = path_arg(i, &args, 0, "rename")?;
+                let (dst, ddst) = path_arg(i, &args, 1, "rename")?;
+                std::fs::rename(&src, &dst).map_err(|e| fs_unwind2(&dsrc, &ddst, e))?;
+                Ok(Value::None)
+            }),
+        ),
+        (
+            "_fs_getcwd",
+            nf("_fs_getcwd", |_i, _args| {
+                let cwd = std::env::current_dir().map_err(|e| fs_unwind("'.'", e))?;
+                Ok(Value::Str(Rc::new(cwd.to_string_lossy().into_owned())))
+            }),
+        ),
+        (
+            "_fs_chdir",
+            nf("_fs_chdir", |i, args| {
+                let (path, display) = path_arg(i, &args, 0, "chdir")?;
+                std::env::set_current_dir(&path).map_err(|e| fs_unwind(&display, e))?;
+                Ok(Value::None)
+            }),
+        ),
+        (
+            "_fs_realpath",
+            nf("_fs_realpath", |i, args| {
+                let (path, _) = path_arg(i, &args, 0, "realpath")?;
+                let resolved = match std::fs::canonicalize(&path) {
+                    Ok(p) => p.to_string_lossy().into_owned(),
+                    Err(_) => lexical_abspath(&path),
+                };
+                Ok(Value::Str(Rc::new(resolved)))
+            }),
+        ),
+        (
+            "_fs_readlink",
+            nf("_fs_readlink", |i, args| {
+                let (path, display) = path_arg(i, &args, 0, "readlink")?;
+                std::fs::read_link(&path)
+                    .map(|p| Value::Str(Rc::new(p.to_string_lossy().into_owned())))
+                    .map_err(|e| fs_unwind(&display, e))
+            }),
+        ),
+        (
+            "_fs_symlink",
+            nf("_fs_symlink", |i, args| {
+                let (src, _) = path_arg(i, &args, 0, "symlink")?;
+                let (dst, ddst) = path_arg(i, &args, 1, "symlink")?;
+                #[cfg(unix)]
+                {
+                    std::os::unix::fs::symlink(&src, &dst).map_err(|e| fs_unwind(&ddst, e))?;
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = (src, ddst);
+                    return Err(os_error("symlink is unsupported on this platform".into()));
+                }
+                Ok(Value::None)
+            }),
+        ),
+        (
+            "_fs_home",
+            nf("_fs_home", |_i, _args| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_owned());
+                Ok(Value::Str(Rc::new(home)))
+            }),
+        ),
+        (
+            "_fs_touch",
+            nf("_fs_touch", |i, args| {
+                let (path, display) = path_arg(i, &args, 0, "touch")?;
+                let p = std::path::Path::new(&path);
+                let result = if p.exists() {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(p)
+                        .and_then(|f| f.set_modified(std::time::SystemTime::now()))
+                } else {
+                    std::fs::File::create(p).map(|_| ())
+                };
+                result.map_err(|e| fs_unwind(&display, e))?;
+                Ok(Value::None)
+            }),
+        ),
+        (
+            "_fs_copyfile",
+            nf("_fs_copyfile", |i, args| {
+                let (src, dsrc) = path_arg(i, &args, 0, "copyfile")?;
+                let (dst, ddst) = path_arg(i, &args, 1, "copyfile")?;
+                // Errors on the source (missing, a directory) name the source;
+                // everything after that names the destination.
+                if std::path::Path::new(&src).is_dir() {
+                    return Err(os_error_unwind(21, "Is a directory", Some(&dsrc), None));
+                }
+                let data = std::fs::read(&src).map_err(|e| fs_unwind(&dsrc, e))?;
+                std::fs::write(&dst, &data).map_err(|e| fs_unwind(&ddst, e))?;
+                Ok(Value::None)
+            }),
+        ),
+        (
+            "_fs_samefile",
+            nf("_fs_samefile", |i, args| {
+                let (a, da) = path_arg(i, &args, 0, "samefile")?;
+                let (b, db) = path_arg(i, &args, 1, "samefile")?;
+                let ma = std::fs::metadata(&a).map_err(|e| fs_unwind(&da, e))?;
+                let mb = std::fs::metadata(&b).map_err(|e| fs_unwind(&db, e))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    Ok(Value::Bool(ma.dev() == mb.dev() && ma.ino() == mb.ino()))
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = (ma, mb);
+                    Ok(Value::Bool(
+                        std::fs::canonicalize(&a).ok() == std::fs::canonicalize(&b).ok(),
+                    ))
+                }
+            }),
+        ),
+        (
+            "_fs_chmod",
+            nf("_fs_chmod", |i, args| {
+                let (path, display) = path_arg(i, &args, 0, "chmod")?;
+                let mode = args
+                    .get(1)
+                    .map(|v| v.to_int())
+                    .transpose()?
+                    .unwrap_or(0o644);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode as u32))
+                        .map_err(|e| fs_unwind(&display, e))?;
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = (path, display, mode);
+                }
+                Ok(Value::None)
+            }),
+        ),
+        (
+            "_fs_getpid",
+            nf("_fs_getpid", |_i, _args| {
+                Ok(Value::Int(VmInt::from(std::process::id() as i64)))
+            }),
+        ),
+        (
+            "_fs_getppid",
+            nf("_fs_getppid", |_i, _args| {
+                let ppid = std::fs::read_to_string("/proc/self/stat")
+                    .ok()
+                    .and_then(|s| {
+                        let after = s.rfind(')')?;
+                        s[after + 1..]
+                            .split_whitespace()
+                            .nth(1)?
+                            .parse::<i64>()
+                            .ok()
+                    })
+                    .unwrap_or(1);
+                Ok(Value::Int(VmInt::from(ppid)))
+            }),
+        ),
+        (
+            "_fs_getuid",
+            nf("_fs_getuid", |_i, _args| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    let uid = std::fs::metadata("/proc/self")
+                        .map(|m| m.uid())
+                        .unwrap_or(0);
+                    Ok(Value::Int(VmInt::from(uid as i64)))
+                }
+                #[cfg(not(unix))]
+                {
+                    Ok(Value::Int(VmInt::from(0)))
+                }
+            }),
+        ),
+        (
+            "_fs_getgid",
+            nf("_fs_getgid", |_i, _args| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    let gid = std::fs::metadata("/proc/self")
+                        .map(|m| m.gid())
+                        .unwrap_or(0);
+                    Ok(Value::Int(VmInt::from(gid as i64)))
+                }
+                #[cfg(not(unix))]
+                {
+                    Ok(Value::Int(VmInt::from(0)))
+                }
+            }),
+        ),
+        (
+            "_fs_cpu_count",
+            nf("_fs_cpu_count", |_i, _args| {
+                let n = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1);
+                Ok(Value::Int(VmInt::from(n as i64)))
+            }),
+        ),
+        (
+            "_fs_system",
+            nf("_fs_system", |_i, args| {
+                let cmd = single(&args, "system")?.py_str();
+                let status = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&cmd)
+                    .status()
+                    .map_err(|e| fs_unwind("'sh'", e))?;
+                // POSIX wait status: the exit code in the high byte.
+                let code = status.code().unwrap_or(1) as i64;
+                Ok(Value::Int(VmInt::from(code << 8)))
+            }),
+        ),
+        (
+            "_fs_urandom",
+            nf("_fs_urandom", |_i, args| {
+                use std::hash::{BuildHasher, Hasher};
+                let n = single(&args, "urandom")?.to_int()?.max(0) as usize;
+                let mut out = Vec::with_capacity(n);
+                while out.len() < n {
+                    let word = std::collections::hash_map::RandomState::new()
+                        .build_hasher()
+                        .finish();
+                    out.extend_from_slice(&word.to_le_bytes());
+                }
+                out.truncate(n);
+                Ok(Value::Bytes(Rc::new(out)))
+            }),
+        ),
+        (
+            "_fs_tempdir",
+            nf("_fs_tempdir", |_i, _args| {
+                for var in ["TMPDIR", "TEMP", "TMP"] {
+                    if let Ok(dir) = std::env::var(var) {
+                        if !dir.is_empty() && std::path::Path::new(&dir).is_dir() {
+                            return Ok(Value::Str(Rc::new(dir.trim_end_matches('/').to_owned())));
+                        }
+                    }
+                }
+                for dir in ["/tmp", "/var/tmp", "/usr/tmp"] {
+                    if std::path::Path::new(dir).is_dir() {
+                        return Ok(Value::Str(Rc::new(dir.to_owned())));
+                    }
+                }
+                Ok(Value::Str(Rc::new(
+                    std::env::current_dir()
+                        .map(|c| c.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| ".".to_owned()),
+                )))
+            }),
+        ),
+        (
+            "_fs_disk_usage",
+            nf("_fs_disk_usage", |_i, _args| {
+                Ok(Value::Tuple(Rc::new(vec![
+                    Value::Int(VmInt::from(0)),
+                    Value::Int(VmInt::from(0)),
+                ])))
+            }),
+        ),
+        (
+            "_fs_strerror",
+            nf("_fs_strerror", |_i, args| {
+                let code = single(&args, "strerror")?.to_int()?;
+                Ok(Value::Str(Rc::new(strerror_text(code))))
+            }),
+        ),
+    ]
+}
+
+/// A module built from a Python shim once per VM run.
+fn cached_shim_module(
+    interp: &mut Interpreter,
+    key: &str,
+    build: impl FnOnce(&mut Interpreter) -> Result<Value, Unwind>,
+) -> Result<Value, Unwind> {
+    let cache_key = format!("__builtin__:{key}");
+    if let Some(v) = interp.module_cache.get(&cache_key) {
+        return Ok(v.clone());
+    }
+    let v = build(interp)?;
+    interp.module_cache.insert(cache_key, v.clone());
+    Ok(v)
+}
+
+fn module_from_members(
+    name: &str,
+    members: Vec<(String, Value)>,
+    env: crate::env::EnvRef,
+) -> Value {
+    let entries: Vec<(&str, Value)> = members
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.clone()))
+        .collect();
+    make_module_env(name, entries, env)
+}
+
+fn public_members(members: Vec<(String, Value)>) -> Vec<(String, Value)> {
+    members
+        .into_iter()
+        .filter(|(k, _)| !k.starts_with("_fs_") && k != "_fspath" && k != "_environ")
+        .collect()
+}
+
+fn make_os_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
+    cached_shim_module(interp, "os", |interp| {
+        let env_dict = {
+            let mut m: DictMap = IndexMap::new();
+            for (k, v) in std::env::vars() {
+                m.insert(HashKey::Str(Rc::new(k)), Value::Str(Rc::new(v)));
+            }
+            Value::Dict(Rc::new(RefCell::new(m)))
+        };
+        let mut seed = fs_natives();
+        seed.push(("_environ", env_dict.clone()));
+        let (path_members, path_env) = compile_shim(interp, shims::POSIXPATH, seed)?;
+        let path_module = module_from_members("posixpath", public_members(path_members), path_env);
+        let mut seed = fs_natives();
+        seed.push(("path", path_module.clone()));
+        seed.push(("environ", env_dict));
+        let (members, env) = compile_shim(interp, shims::OS, seed)?;
+        let mut members = public_members(members);
+        members.push(("path".to_owned(), path_module));
+        Ok(module_from_members("os", members, env))
+    })
+}
+
+fn os_path_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
+    let os = make_os_module(interp)?;
+    interp.get_attr(&os, "path")
+}
+
+fn make_io_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
+    cached_shim_module(interp, "io", |interp| {
+        let (members, env) = compile_shim(interp, shims::IO, fs_natives())?;
+        Ok(module_from_members("io", public_members(members), env))
+    })
+}
+
+fn make_pathlib_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
+    cached_shim_module(interp, "pathlib", |interp| {
+        let os = make_os_module(interp)?;
+        let mut seed = fs_natives();
+        seed.push(("os", os));
+        let (members, env) = compile_shim(interp, shims::PATHLIB, seed)?;
+        Ok(module_from_members("pathlib", public_members(members), env))
+    })
+}
+
+fn pathlib_fnmatch(interp: &mut Interpreter) -> Result<Value, Unwind> {
+    let pathlib = make_pathlib_module(interp)?;
+    interp.get_attr(&pathlib, "_fnmatch")
+}
+
+fn make_shutil_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
+    cached_shim_module(interp, "shutil", |interp| {
+        let os = make_os_module(interp)?;
+        let fnmatch = pathlib_fnmatch(interp)?;
+        let mut seed = fs_natives();
+        seed.push(("os", os));
+        seed.push(("_pathlib_fnmatch", fnmatch));
+        let (members, env) = compile_shim(interp, shims::SHUTIL, seed)?;
+        Ok(module_from_members("shutil", public_members(members), env))
+    })
+}
+
+fn make_tempfile_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
+    cached_shim_module(interp, "tempfile", |interp| {
+        let os = make_os_module(interp)?;
+        let shutil = make_shutil_module(interp)?;
+        let random = interp.import_module("random")?;
+        let mut seed = fs_natives();
+        seed.push(("os", os));
+        seed.push(("shutil", shutil));
+        seed.push(("random", random));
+        let (members, env) = compile_shim(interp, shims::TEMPFILE, seed)?;
+        Ok(module_from_members(
+            "tempfile",
+            public_members(members),
+            env,
+        ))
+    })
+}
+
+fn make_glob_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
+    cached_shim_module(interp, "glob", |interp| {
+        let os = make_os_module(interp)?;
+        let fnmatch = pathlib_fnmatch(interp)?;
+        let mut seed = fs_natives();
+        seed.push(("os", os));
+        seed.push(("_pathlib_fnmatch", fnmatch));
+        let (members, env) = compile_shim(interp, shims::GLOB, seed)?;
+        Ok(module_from_members("glob", public_members(members), env))
+    })
 }
 
 fn make_sys_module(interp: &Interpreter) -> Value {
@@ -2943,6 +4155,102 @@ fn make_sys_module(interp: &Interpreter) -> Value {
             ),
             ("stdout", make_std_stream("sys.stdout", false)),
             ("stderr", make_std_stream("sys.stderr", true)),
+            ("stdin", make_stdin_stream()),
+            ("maxsize", Value::Int(VmInt::from(i64::MAX))),
+            (
+                "version_info",
+                Value::Tuple(Rc::new(vec![
+                    Value::Int(VmInt::from(3)),
+                    Value::Int(VmInt::from(13)),
+                    Value::Int(VmInt::from(0)),
+                    Value::Str(Rc::new("final".to_owned())),
+                    Value::Int(VmInt::from(0)),
+                ])),
+            ),
+            ("byteorder", Value::Str(Rc::new("little".to_owned()))),
+            (
+                "getrecursionlimit",
+                nf("getrecursionlimit", |i, _args| {
+                    Ok(Value::Int(VmInt::from(i.max_stack_depth as i64)))
+                }),
+            ),
+            (
+                "setrecursionlimit",
+                nf("setrecursionlimit", |i, args| {
+                    let n = single(&args, "setrecursionlimit")?.to_int()?;
+                    if n < 1 {
+                        return Err(value_error(
+                            "recursion limit must be greater or equal than 1",
+                        ));
+                    }
+                    i.max_stack_depth = n as usize;
+                    Ok(Value::None)
+                }),
+            ),
+        ],
+    )
+}
+
+/// `sys.stdin`: `read` / `readline` / `readlines` over the process's stdin,
+/// and iteration line by line (`for line in sys.stdin`).
+fn make_stdin_stream() -> Value {
+    fn read_line() -> Result<Option<String>, Unwind> {
+        let mut s = String::new();
+        let n = std::io::stdin().read_line(&mut s).map_err(|e| {
+            crate::error::Unwind::Exception(crate::error::VmException::new(
+                "OSError",
+                format!("{e}"),
+            ))
+        })?;
+        if n == 0 {
+            return Ok(None);
+        }
+        Ok(Some(s))
+    }
+    let read = nf("read", |_i, _args| {
+        use std::io::Read;
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s).map_err(|e| {
+            crate::error::Unwind::Exception(crate::error::VmException::new(
+                "OSError",
+                format!("{e}"),
+            ))
+        })?;
+        Ok(Value::Str(Rc::new(s)))
+    });
+    let readline = nf("readline", |_i, _args| {
+        Ok(Value::Str(Rc::new(read_line()?.unwrap_or_default())))
+    });
+    let readlines = nf("readlines", |_i, _args| {
+        let mut out = Vec::new();
+        while let Some(line) = read_line()? {
+            out.push(Value::Str(Rc::new(line)));
+        }
+        Ok(Value::List(Rc::new(RefCell::new(out))))
+    });
+    let iter = nf("__iter__", |_i, _args| {
+        let mut out = Vec::new();
+        while let Some(line) = read_line()? {
+            out.push(Value::Str(Rc::new(line)));
+        }
+        Ok(Value::Iter(Rc::new(RefCell::new(IterState::List {
+            items: Rc::new(RefCell::new(out)),
+            index: 0,
+        }))))
+    });
+    native_object(
+        "TextIOWrapper",
+        vec![
+            ("read", read),
+            ("readline", readline),
+            ("readlines", readlines),
+            ("__iter__", iter),
+            (
+                "fileno",
+                nf("fileno", |_i, _args| Ok(Value::Int(VmInt::from(0)))),
+            ),
+            ("isatty", nf("isatty", |_i, _args| Ok(Value::Bool(false)))),
+            ("close", nf("close", |_i, _args| Ok(Value::None))),
         ],
     )
 }
@@ -3029,20 +4337,55 @@ fn make_json_module() -> Value {
     )
 }
 
-fn make_time_module() -> Value {
-    make_module(
+fn make_time_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
+    let time_fn = nf("time", |_i, _args| {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        Ok(Value::Float(t))
+    });
+    // The calendar side (`struct_time`, `gmtime`, `strftime`, `strptime`, …)
+    // is a Python shim that only needs the raw clock.
+    let extras =
+        compile_helpers_seeded(interp, shims::TIME_EXTRAS, vec![("time", time_fn.clone())])?;
+    let mut entries: Vec<(&str, Value)> = vec![
+        ("time", time_fn),
+        (
+            "time_ns",
+            nf("time_ns", |_i, _args| {
+                let ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                Ok(Value::Int(VmInt::from(num_bigint::BigInt::from(ns))))
+            }),
+        ),
+        (
+            "monotonic_ns",
+            nf("monotonic_ns", |_i, _args| {
+                Ok(Value::Int(VmInt::from((monotonic_secs() * 1e9) as i64)))
+            }),
+        ),
+        (
+            "perf_counter_ns",
+            nf("perf_counter_ns", |_i, _args| {
+                Ok(Value::Int(VmInt::from((monotonic_secs() * 1e9) as i64)))
+            }),
+        ),
+        (
+            "process_time_ns",
+            nf("process_time_ns", |_i, _args| {
+                Ok(Value::Int(VmInt::from((monotonic_secs() * 1e9) as i64)))
+            }),
+        ),
+    ];
+    for (k, v) in &extras {
+        entries.push((k.as_str(), v.clone()));
+    }
+    let module = make_module(
         "time",
         vec![
-            (
-                "time",
-                nf("time", |_i, _args| {
-                    let t = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs_f64())
-                        .unwrap_or(0.0);
-                    Ok(Value::Float(t))
-                }),
-            ),
             (
                 "sleep",
                 nf("sleep", |_i, args| {
@@ -3070,7 +4413,14 @@ fn make_time_module() -> Value {
                 }),
             ),
         ],
-    )
+    );
+    if let Value::Module(m) = &module {
+        let mut members = m.members.borrow_mut();
+        for (k, v) in entries {
+            members.insert(k.to_owned(), v);
+        }
+    }
+    Ok(module)
 }
 
 /// Seconds since the first call (a fixed reference point), so `monotonic`,
@@ -3082,7 +4432,7 @@ fn monotonic_secs() -> f64 {
     START.get_or_init(Instant::now).elapsed().as_secs_f64()
 }
 
-fn make_random_module() -> Value {
+fn make_random_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
     use std::cell::RefCell;
     /// A non-deterministic seed, standing in for the OS entropy CPython
     /// seeds from. Shared by the unseeded default and `seed()` / `seed(None)`.
@@ -3091,9 +4441,9 @@ fn make_random_module() -> Value {
     /// hash-randomisation source: its keys come from OS randomness once per
     /// process, and each instantiation yields a different pair, so it varies
     /// across processes *and* across threads within one process — which
-    /// matters because the RNG below is a `thread_local`. Wall-clock nanos
-    /// are XORed in as a second source, so a platform whose clock is coarse
-    /// (Windows ticks at ~15ms, which alone would collide across fast
+    /// matters because the RNG states below are `thread_local`. Wall-clock
+    /// nanos are XORed in as a second source, so a platform whose clock is
+    /// coarse (Windows ticks at ~15ms, which alone would collide across fast
     /// successive runs) cannot by itself make two seeds equal. XOR keeps the
     /// result at least as unpredictable as the stronger of the two.
     ///
@@ -3110,34 +4460,25 @@ fn make_random_module() -> Value {
             .unwrap_or(0);
         os_derived ^ nanos
     }
-    // CPython-compatible MT19937 so seeded programs produce IDENTICAL
-    // sequences under `tyc run` and `tyc build && python` — random(),
-    // getrandbits/_randbelow (which back randint / randrange / choice /
-    // shuffle / sample), uniform, and gauss all follow CPython's
-    // random.py / _randommodule.c to the letter.
+    // CPython-compatible MT19937 (`_random.Random`) so seeded programs
+    // produce IDENTICAL sequences under `tyc run` and `tyc build && python`.
+    // The Python-level algorithms (randrange, choice, shuffle, sample, the
+    // distributions) live in `shims/random.py`, transcribed from random.py;
+    // the natives below are `_random.Random`'s methods plus fast paths for
+    // the hottest module-level functions on state slot 0.
     struct Mt19937 {
         mt: [u32; 624],
         index: usize,
-        gauss_next: Option<f64>,
     }
     impl Mt19937 {
         fn new() -> Self {
             let mut s = Self {
                 mt: [0u32; 624],
                 index: 625,
-                gauss_next: None,
             };
-            // CPython seeds from urandom at import, so an *unseeded*
-            // program draws a different sequence on every run. A fixed
-            // default would make `tyc run` deterministic exactly where
-            // `tyc build && python` is not — a VM/CPython divergence in
-            // its own right, and one that flakes the T0.2 differential
-            // gate: the VM agrees with itself every time while CPython
-            // does not, so the harness's self-nondeterminism filter only
-            // catches it when CPython happens to repeat itself. Seed from
-            // entropy to match. An explicit `random.seed(n)` still
-            // reseeds deterministically, so seeded reproducibility across
-            // both surfaces is unaffected.
+            // CPython seeds from urandom at construction, so an *unseeded*
+            // generator draws a different sequence on every run; an explicit
+            // seed reseeds deterministically.
             s.seed_int(&num_bigint::BigInt::from(entropy_seed()));
             s
         }
@@ -3219,18 +4560,36 @@ fn make_random_module() -> Value {
             let b = (self.genrand_u32() >> 6) as f64;
             (a * 67108864.0 + b) / 9007199254740992.0
         }
-        /// `getrandbits(k)` for k <= 64 (covers every stdlib consumer the
-        /// VM models; Python's small-int fast path uses the same word
-        /// order).
-        fn getrandbits(&mut self, k: u32) -> u64 {
+        /// `getrandbits(k)` for any `k >= 0`: 32-bit words drawn
+        /// little-endian, the last truncated — `_random.Random.getrandbits`.
+        fn getrandbits(&mut self, k: u64) -> num_bigint::BigInt {
+            if k == 0 {
+                return num_bigint::BigInt::from(0);
+            }
+            if k <= 32 {
+                return num_bigint::BigInt::from(self.genrand_u32() >> (32 - k as u32));
+            }
+            let words = ((k - 1) / 32 + 1) as usize;
+            let mut buf: Vec<u32> = Vec::with_capacity(words);
+            let mut remaining = k;
+            for _ in 0..words {
+                let mut r = self.genrand_u32();
+                if remaining < 32 {
+                    r >>= 32 - remaining as u32;
+                }
+                buf.push(r);
+                remaining = remaining.saturating_sub(32);
+            }
+            num_bigint::BigInt::from(num_bigint::BigUint::from_slice(&buf))
+        }
+        /// `getrandbits(k)` for `k <= 64`, on the machine word.
+        fn getrandbits_u64(&mut self, k: u32) -> u64 {
             if k == 0 {
                 return 0;
             }
             if k <= 32 {
                 return (self.genrand_u32() >> (32 - k)) as u64;
             }
-            // Little-endian words, last word truncated — matches
-            // _random.Random.getrandbits for multi-word sizes.
             let low = self.genrand_u32() as u64;
             let hi_bits = k - 32;
             let high = (self.genrand_u32() >> (32 - hi_bits)) as u64;
@@ -3242,9 +4601,9 @@ fn make_random_module() -> Value {
                 return 0;
             }
             let k = 64 - n.leading_zeros();
-            let mut r = self.getrandbits(k);
+            let mut r = self.getrandbits_u64(k);
             while r >= n {
-                r = self.getrandbits(k);
+                r = self.getrandbits_u64(k);
             }
             r
         }
@@ -3266,287 +4625,350 @@ fn make_random_module() -> Value {
                 words.push(0);
             }
             self.init_by_array(&words);
-            self.gauss_next = None;
+        }
+        /// `Random.seed(a)` (version 2): `None` draws from entropy, an int
+        /// seeds by absolute value, a float by its hash, and str / bytes by
+        /// `int.from_bytes(a + sha512(a).digest())`.
+        fn seed_value(&mut self, v: &Value) -> Result<(), Unwind> {
+            match v {
+                Value::None => self.seed_int(&num_bigint::BigInt::from(entropy_seed())),
+                Value::Int(n) => self.seed_int(&n.to_bigint()),
+                Value::Bool(b) => self.seed_int(&num_bigint::BigInt::from(*b as i64)),
+                Value::Float(f) => self.seed_int(&num_bigint::BigInt::from(
+                    crate::pyhash::float_hash(*f) as u64,
+                )),
+                Value::Str(s) => self.seed_bytes(s.as_bytes()),
+                Value::Bytes(b) => self.seed_bytes(b),
+                _ => {
+                    return Err(type_error(
+                        "The only supported seed types are:\nNone, int, float, str, bytes, and bytearray.",
+                    ))
+                }
+            }
+            Ok(())
+        }
+        fn seed_bytes(&mut self, a: &[u8]) {
+            let mut material = a.to_vec();
+            material.extend(crate::hashes::sha512(a));
+            let n = num_bigint::BigInt::from_bytes_be(num_bigint::Sign::Plus, &material);
+            self.seed_int(&n);
+        }
+        /// `_random.Random.getstate()`: the 624 state words plus the index.
+        fn state_value(&self) -> Value {
+            let mut items: Vec<Value> = self
+                .mt
+                .iter()
+                .map(|w| Value::Int(VmInt::from(*w as i64)))
+                .collect();
+            items.push(Value::Int(VmInt::from(self.index as i64)));
+            Value::Tuple(Rc::new(items))
+        }
+        fn set_state(&mut self, state: &Value) -> Result<(), Unwind> {
+            let Value::Tuple(items) = state else {
+                return Err(type_error("state vector must be a tuple"));
+            };
+            if items.len() != 625 {
+                return Err(value_error("state vector is the wrong size"));
+            }
+            for (slot, item) in self.mt.iter_mut().zip(items.iter()) {
+                let word = item.to_int()?;
+                if !(0..=u32::MAX as i64).contains(&word) {
+                    return Err(Unwind::Exception(crate::error::VmException::new(
+                        "OverflowError",
+                        "Python int too large to convert to C unsigned long",
+                    )));
+                }
+                *slot = word as u32;
+            }
+            let index = items[624].to_int()?;
+            if !(0..=624).contains(&index) {
+                return Err(value_error("invalid state"));
+            }
+            self.index = index as usize;
+            Ok(())
         }
     }
     thread_local! {
-        static MT: RefCell<Mt19937> = RefCell::new(Mt19937::new());
+        static RNGS: RefCell<Vec<Mt19937>> = const { RefCell::new(Vec::new()) };
     }
-    fn with_mt<R>(f: impl FnOnce(&mut Mt19937) -> R) -> R {
-        MT.with(|m| f(&mut m.borrow_mut()))
+    /// Run `f` on state slot `id`, creating (entropy-seeded) slots on demand.
+    fn with_rng<R>(id: usize, f: impl FnOnce(&mut Mt19937) -> R) -> R {
+        RNGS.with(|r| {
+            let mut states = r.borrow_mut();
+            while states.len() <= id {
+                states.push(Mt19937::new());
+            }
+            f(&mut states[id])
+        })
     }
-    make_module(
-        "random",
-        vec![
-            (
-                "random",
-                nf("random", |_i, _args| {
-                    Ok(Value::Float(with_mt(|m| m.random())))
-                }),
-            ),
-            (
-                "seed",
-                nf("seed", |_i, args| {
-                    match args.first() {
-                        Some(Value::Int(n)) => with_mt(|m| m.seed_int(&n.to_bigint())),
-                        Some(Value::Bool(b)) => {
-                            with_mt(|m| m.seed_int(&num_bigint::BigInt::from(*b as i64)))
-                        }
-                        // CPython's no-arg / None form seeds from OS
-                        // entropy — non-deterministic by design.
-                        // `entropy_seed` preserves that property.
-                        Some(Value::None) | None => {
-                            let seed = entropy_seed();
-                            with_mt(|m| m.seed_int(&num_bigint::BigInt::from(seed)));
-                        }
-                        // str / bytes / float seeds hash through SHA-512
-                        // in CPython — silently mapping them to a fixed
-                        // seed would LOOK deterministic while diverging.
-                        // Fail loudly instead.
-                        Some(other) => {
-                            return Err(type_error(format!(
-                                "VM random.seed() supports int seeds only (got {}) — \
-                                 use `tyc run --compile` for str/bytes/float seeding",
-                                other.type_name()
-                            )))
-                        }
+    fn new_rng() -> usize {
+        RNGS.with(|r| {
+            let mut states = r.borrow_mut();
+            if states.is_empty() {
+                states.push(Mt19937::new());
+            }
+            states.push(Mt19937::new());
+            states.len() - 1
+        })
+    }
+    fn slot(v: Option<&Value>) -> Result<usize, Unwind> {
+        let id = v
+            .ok_or_else(|| type_error("random state id required"))?
+            .to_int()?;
+        if id < 0 {
+            return Err(value_error("invalid random state id"));
+        }
+        Ok(id as usize)
+    }
+    fn bits_arg(v: Option<&Value>) -> Result<u64, Unwind> {
+        let k = match v {
+            Some(Value::Int(n)) => n.to_bigint(),
+            Some(Value::Bool(b)) => num_bigint::BigInt::from(*b as i64),
+            Some(other) => {
+                return Err(type_error(format!(
+                    "'{}' object cannot be interpreted as an integer",
+                    other.type_name()
+                )))
+            }
+            None => return Err(type_error("getrandbits() missing required argument 'k'")),
+        };
+        use num_traits::{Signed, ToPrimitive};
+        if k.is_negative() {
+            return Err(value_error("number of bits must be non-negative"));
+        }
+        k.to_u64().ok_or_else(|| {
+            Unwind::Exception(crate::error::VmException::new(
+                "OverflowError",
+                "Python int too large to convert to C int",
+            ))
+        })
+    }
+
+    let natives: Vec<(&str, Value)> = vec![
+        (
+            "_rng_new",
+            nf("_rng_new", |_i, _args| {
+                Ok(Value::Int(VmInt::from(new_rng() as i64)))
+            }),
+        ),
+        (
+            "_rng_seed",
+            nf("_rng_seed", |_i, args| {
+                let id = slot(args.first())?;
+                let a = args.get(1).cloned().unwrap_or(Value::None);
+                with_rng(id, |m| m.seed_value(&a))?;
+                Ok(Value::None)
+            }),
+        ),
+        (
+            "_rng_random",
+            nf("_rng_random", |_i, args| {
+                let id = slot(args.first())?;
+                Ok(Value::Float(with_rng(id, |m| m.random())))
+            }),
+        ),
+        (
+            "_rng_getrandbits",
+            nf("_rng_getrandbits", |_i, args| {
+                let id = slot(args.first())?;
+                let k = bits_arg(args.get(1))?;
+                Ok(Value::Int(VmInt::from(with_rng(id, |m| m.getrandbits(k)))))
+            }),
+        ),
+        (
+            "_rng_getstate",
+            nf("_rng_getstate", |_i, args| {
+                let id = slot(args.first())?;
+                Ok(with_rng(id, |m| m.state_value()))
+            }),
+        ),
+        (
+            "_rng_setstate",
+            nf("_rng_setstate", |_i, args| {
+                let id = slot(args.first())?;
+                let state = args.get(1).cloned().unwrap_or(Value::None);
+                with_rng(id, |m| m.set_state(&state))?;
+                Ok(Value::None)
+            }),
+        ),
+    ];
+    let members = compile_helpers_seeded(interp, shims::RANDOM, natives)?;
+    let mut entries: Vec<(String, Value)> = members
+        .into_iter()
+        .filter(|(k, _)| !k.starts_with("_rng_"))
+        .collect();
+    // Fast native paths for the hottest module-level functions, on state
+    // slot 0 — the same draws as the shim methods they stand in for.
+    let fast: Vec<(&str, Value)> = vec![
+        (
+            "random",
+            nf("random", |_i, _args| {
+                Ok(Value::Float(with_rng(0, |m| m.random())))
+            }),
+        ),
+        (
+            "getrandbits",
+            nf("getrandbits", |_i, args| {
+                let k = bits_arg(args.first())?;
+                Ok(Value::Int(VmInt::from(with_rng(0, |m| m.getrandbits(k)))))
+            }),
+        ),
+        (
+            "uniform",
+            nf("uniform", |_i, args| {
+                let a = args
+                    .first()
+                    .ok_or_else(|| type_error("uniform() missing required argument 'a'"))?
+                    .to_float()?;
+                let b = args
+                    .get(1)
+                    .ok_or_else(|| type_error("uniform() missing required argument 'b'"))?
+                    .to_float()?;
+                let t = with_rng(0, |m| m.random());
+                Ok(Value::Float(a + (b - a) * t))
+            }),
+        ),
+        (
+            "randint",
+            nf("randint", |_i, args| {
+                let (a, b) = match (args.first(), args.get(1)) {
+                    (Some(Value::Int(a)), Some(Value::Int(b))) => (a.clone(), b.clone()),
+                    (Some(Value::Bool(a)), Some(Value::Bool(b))) => {
+                        (VmInt::from(*a as i64), VmInt::from(*b as i64))
                     }
-                    Ok(Value::None)
-                }),
-            ),
-            (
-                "getrandbits",
-                nf("getrandbits", |_i, args| {
-                    let k = args
-                        .first()
-                        .ok_or_else(|| type_error("getrandbits() needs k"))?
-                        .to_int()? as u32;
-                    if k > 64 {
-                        return Err(value_error(
-                            "VM getrandbits() supports k <= 64 — use `tyc run --compile`",
-                        ));
+                    (Some(Value::Int(a)), Some(Value::Bool(b))) => {
+                        (a.clone(), VmInt::from(*b as i64))
                     }
-                    Ok(Value::Int(VmInt::from(with_mt(|m| m.getrandbits(k)))))
-                }),
-            ),
-            (
-                "randint",
-                nf("randint", |_i, args| {
-                    let a = args
-                        .first()
-                        .ok_or_else(|| type_error("randint() needs args"))?
-                        .to_int()?;
-                    let b = args
-                        .get(1)
-                        .ok_or_else(|| type_error("randint() needs args"))?
-                        .to_int()?;
-                    if b < a {
-                        return Err(value_error("randint(a, b): b must be >= a"));
+                    (Some(Value::Bool(a)), Some(Value::Int(b))) => {
+                        (VmInt::from(*a as i64), b.clone())
                     }
-                    let span = (b - a + 1) as u64;
-                    let pick = with_mt(|m| m.randbelow(span)) as i64;
-                    Ok(Value::Int(VmInt::from(a + pick)))
-                }),
-            ),
-            (
-                "randrange",
-                nf("randrange", |_i, args| {
-                    let (start, stop, step) = match args.len() {
-                        1 => (0, args[0].to_int()?, 1),
-                        2 => (args[0].to_int()?, args[1].to_int()?, 1),
-                        3 => (args[0].to_int()?, args[1].to_int()?, args[2].to_int()?),
-                        _ => return Err(type_error("randrange() takes 1-3 arguments")),
-                    };
-                    if step == 0 {
-                        return Err(value_error("zero step for randrange()"));
+                    (Some(other), _) | (_, Some(other)) if !matches!(other, Value::Int(_)) => {
+                        return Err(type_error(format!(
+                            "'{}' object cannot be interpreted as an integer",
+                            other.type_name()
+                        )))
                     }
-                    // CPython supports descending ranges (negative step).
-                    let width = stop - start;
-                    let n = if step > 0 {
-                        if width <= 0 {
-                            0
-                        } else {
-                            (width + step - 1) / step
-                        }
-                    } else if width >= 0 {
-                        0
-                    } else {
-                        (width + step + 1) / step
-                    };
-                    if n <= 0 {
-                        return Err(value_error("empty range for randrange()"));
+                    _ => return Err(type_error("randint() missing required argument 'b'")),
+                };
+                let (Some(a), Some(b)) = (a.to_i64(), b.to_i64()) else {
+                    return Err(value_error("randint() bounds too large for the VM"));
+                };
+                if b < a {
+                    return Err(value_error(format!(
+                        "empty range in randrange({a}, {})",
+                        b + 1
+                    )));
+                }
+                let span = (b as i128 - a as i128 + 1) as u64;
+                let pick = with_rng(0, |m| m.randbelow(span)) as i128;
+                Ok(Value::Int(VmInt::from((a as i128 + pick) as i64)))
+            }),
+        ),
+        (
+            "choice",
+            nf("choice", |interp, args| {
+                let seq = args
+                    .first()
+                    .ok_or_else(|| type_error("choice() missing required argument 'seq'"))?;
+                let n = match seq {
+                    Value::List(l) => l.borrow().len(),
+                    Value::Tuple(t) => t.len(),
+                    Value::Str(s) => s.chars().count(),
+                    Value::Bytes(b) => b.len(),
+                    Value::Range { .. } | Value::Instance(_) => value_len(seq)?,
+                    other => {
+                        return Err(type_error(format!(
+                            "object of type '{}' has no len()",
+                            other.type_name()
+                        )))
                     }
-                    let pick = with_mt(|m| m.randbelow(n as u64)) as i64;
-                    Ok(Value::Int(VmInt::from(start + pick * step)))
-                }),
-            ),
-            (
-                "uniform",
-                nf("uniform", |_i, args| {
-                    let a = args
-                        .first()
-                        .ok_or_else(|| type_error("uniform() needs 2 args"))?
-                        .to_float()?;
-                    let b = args
-                        .get(1)
-                        .ok_or_else(|| type_error("uniform() needs 2 args"))?
-                        .to_float()?;
-                    let t = with_mt(|m| m.random());
-                    Ok(Value::Float(a + t * (b - a)))
-                }),
-            ),
-            (
-                "gauss",
-                nf("gauss", |_i, args| {
-                    // Exactly CPython's random.py gauss(): a cached
-                    // sin/cos pair per two draws.
-                    let mu = args
-                        .first()
-                        .map(|v| v.to_float())
-                        .transpose()?
-                        .unwrap_or(0.0);
-                    let sigma = args
-                        .get(1)
-                        .map(|v| v.to_float())
-                        .transpose()?
-                        .unwrap_or(1.0);
-                    let z = with_mt(|m| {
-                        if let Some(z) = m.gauss_next.take() {
-                            z
-                        } else {
-                            let x2pi = m.random() * std::f64::consts::TAU;
-                            let g2rad = (-2.0 * (1.0 - m.random()).ln()).sqrt();
-                            let z = x2pi.cos() * g2rad;
-                            m.gauss_next = Some(x2pi.sin() * g2rad);
-                            z
-                        }
-                    });
-                    Ok(Value::Float(mu + z * sigma))
-                }),
-            ),
-            (
-                "choice",
-                nf("choice", |interp, args| {
-                    let seq = args
-                        .first()
-                        .ok_or_else(|| type_error("choice() needs a sequence"))?;
-                    let items: Vec<Value> = {
-                        let it = interp.make_iter(seq.clone())?;
-                        let mut out = Vec::new();
-                        while let Some(v) = interp.iter_next(&it)? {
-                            out.push(v);
-                        }
-                        out
-                    };
-                    if items.is_empty() {
-                        return Err(Unwind::Exception(crate::error::VmException::new(
-                            "IndexError",
-                            "Cannot choose from an empty sequence".to_owned(),
-                        )));
+                };
+                if n == 0 {
+                    return Err(Unwind::Exception(crate::error::VmException::new(
+                        "IndexError",
+                        "Cannot choose from an empty sequence",
+                    )));
+                }
+                let idx = with_rng(0, |m| m.randbelow(n as u64)) as i64;
+                interp.subscript(seq, &Value::Int(VmInt::from(idx)))
+            }),
+        ),
+        (
+            "shuffle",
+            nf("shuffle", |_i, args| {
+                let lst = match args.first() {
+                    Some(Value::List(l)) => l.clone(),
+                    Some(other) => {
+                        return Err(type_error(format!(
+                            "'{}' object does not support item assignment",
+                            other.type_name()
+                        )))
                     }
-                    let idx = with_mt(|m| m.randbelow(items.len() as u64)) as usize;
-                    Ok(items[idx].clone())
-                }),
-            ),
-            (
-                "shuffle",
-                nf("shuffle", |_i, args| {
-                    let lst = match args.first() {
-                        Some(Value::List(l)) => l.clone(),
-                        _ => return Err(type_error("shuffle() needs a list")),
-                    };
-                    let mut items = lst.borrow_mut();
-                    // CPython: for i in reversed(range(1, len(x))).
-                    let n = items.len();
-                    for i in (1..n).rev() {
-                        let j = with_mt(|m| m.randbelow(i as u64 + 1)) as usize;
-                        items.swap(i, j);
-                    }
-                    Ok(Value::None)
-                }),
-            ),
-            (
-                "sample",
-                nf("sample", |interp, args| {
-                    let seq = args
-                        .first()
-                        .ok_or_else(|| type_error("sample() needs a sequence"))?;
-                    let k_raw = args
-                        .get(1)
-                        .ok_or_else(|| type_error("sample() needs k"))?
-                        .to_int()?;
-                    if k_raw < 0 {
-                        return Err(value_error("Sample larger than population or is negative"));
-                    }
-                    let k = k_raw as usize;
-                    let population: Vec<Value> = {
-                        let it = interp.make_iter(seq.clone())?;
-                        let mut out = Vec::new();
-                        while let Some(v) = interp.iter_next(&it)? {
-                            out.push(v);
-                        }
-                        out
-                    };
-                    let n = population.len();
-                    if k > n {
-                        return Err(value_error("Sample larger than population or is negative"));
-                    }
-                    // CPython's selection-set vs pool heuristic, verbatim,
-                    // so seeded sequences match exactly.
-                    let mut result: Vec<Value> = Vec::with_capacity(k);
-                    let mut setsize: usize = 21;
-                    if k > 5 {
-                        // CPython: `setsize += 4 ** _ceil(_log(k * 3, 4))`
-                        // — i.e. log base 4 of (3*k), not log base 3 of k.
-                        // Getting this exact keeps the pool-vs-selection-set
-                        // branch (and thus the MT19937 draw sequence) aligned
-                        // with CPython for seeded `random.sample`.
-                        setsize += 4.0f64.powf(((k * 3) as f64).log(4.0).ceil()) as usize;
-                    }
-                    if n <= setsize {
-                        let mut pool = population.clone();
-                        for i in 0..k {
-                            let j = with_mt(|m| m.randbelow((n - i) as u64)) as usize;
-                            result.push(pool[j].clone());
-                            pool[j] = pool[n - i - 1].clone();
-                        }
-                    } else {
-                        let mut selected: std::collections::HashSet<usize> =
-                            std::collections::HashSet::new();
-                        for _ in 0..k {
-                            let mut j = with_mt(|m| m.randbelow(n as u64)) as usize;
-                            while selected.contains(&j) {
-                                j = with_mt(|m| m.randbelow(n as u64)) as usize;
-                            }
-                            selected.insert(j);
-                            result.push(population[j].clone());
-                        }
-                    }
-                    Ok(Value::List(Rc::new(RefCell::new(result))))
-                }),
-            ),
-        ],
-    )
+                    None => return Err(type_error("shuffle() missing required argument 'x'")),
+                };
+                let n = lst.borrow().len();
+                for i in (1..n).rev() {
+                    let j = with_rng(0, |m| m.randbelow(i as u64 + 1)) as usize;
+                    lst.borrow_mut().swap(i, j);
+                }
+                Ok(Value::None)
+            }),
+        ),
+    ];
+    for (k, v) in fast {
+        entries.retain(|(name, _)| name != k);
+        entries.push((k.to_owned(), v));
+    }
+    let refs: Vec<(&str, Value)> = entries
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.clone()))
+        .collect();
+    Ok(make_module("random", refs))
 }
 
-// ── stdlib shims ───────────────────────────────────────────────────────────
-//
-// FINDINGS #25/#27. Most non-trivial Typhon programs reference the typing /
-// collections / functools / itertools / pathlib / re modules even when only
-// used as static annotations or for a handful of helpers. Compile mode
-// resolves these through CPython, but VM mode never bridges to CPython, so
-// every `from typing import …` line used to crash the VM with a hard
-// ImportError. The shims below give the VM partial native coverage so the
-// common-case program runs end-to-end. Each module documents what is
-// implemented; anything not listed will still raise AttributeError on use.
-//
-// The shims are intentionally minimal — they cover the surface that
-// users actually reach for in the v0.7.x stress sweep, not the full
-// stdlib API.
+fn make_hashlib_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
+    fn name_arg(v: Option<&Value>) -> Result<String, Unwind> {
+        match v {
+            Some(Value::Str(s)) => Ok((**s).clone()),
+            _ => Err(type_error("hash name must be a str")),
+        }
+    }
+    let natives: Vec<(&str, Value)> = vec![
+        (
+            "_hash_digest",
+            nf("_hash_digest", |_i, args| {
+                let name = name_arg(args.first())?;
+                let data = match args.get(1) {
+                    Some(Value::Bytes(b)) => b.clone(),
+                    _ => return Err(type_error("object supporting the buffer API required")),
+                };
+                crate::hashes::digest(&name, &data)
+                    .map(|d| Value::Bytes(Rc::new(d)))
+                    .ok_or_else(|| value_error(format!("unsupported hash type {name}")))
+            }),
+        ),
+        (
+            "_hash_sizes",
+            nf("_hash_sizes", |_i, args| {
+                let name = name_arg(args.first())?;
+                let (digest, block) = crate::hashes::sizes(&name)
+                    .ok_or_else(|| value_error(format!("unsupported hash type {name}")))?;
+                Ok(Value::Tuple(Rc::new(vec![
+                    Value::Int(VmInt::from(digest as i64)),
+                    Value::Int(VmInt::from(block as i64)),
+                ])))
+            }),
+        ),
+    ];
+    let members = compile_helpers_seeded(interp, shims::HASHLIB, natives)?;
+    let entries: Vec<(&str, Value)> = members
+        .iter()
+        .filter(|(k, _)| !k.starts_with("_hash_"))
+        .map(|(k, v)| (k.as_str(), v.clone()))
+        .collect();
+    Ok(make_module("hashlib", entries))
+}
 
-/// Identity-callable. Used by typing shims (`Callable`, `Optional`, …)
-/// where the only operation Typhon programs perform at runtime is
-/// subscription (`Optional[int]`) and occasional invocation.
 fn identity_native(name: &'static str) -> Value {
     Value::Native(Rc::new(NativeFn::new(name, |_i, args| {
         Ok(args.into_iter().next().unwrap_or(Value::None))
@@ -3822,7 +5244,7 @@ fn make_re_module() -> Value {
     // so `pattern.match(s)` etc. work.
     fn pattern_value(p: regex::Regex) -> Value {
         let p_rc = Rc::new(p);
-        let mut attrs: HashMap<String, Value> = HashMap::new();
+        let mut attrs: crate::value::FieldMap = crate::value::FieldMap::new();
         let p1 = p_rc.clone();
         attrs.insert(
             "match".into(),
@@ -3949,7 +5371,7 @@ fn make_re_module() -> Value {
             .map(|i| caps.get(i).map(|m| m.as_str().to_owned()))
             .collect();
         let names = names.clone();
-        let mut attrs: HashMap<String, Value> = HashMap::new();
+        let mut attrs: crate::value::FieldMap = crate::value::FieldMap::new();
         // `.group()`/`.group(n)`/`.group("name")`/`.group(a, b, ...)`.
         let gt = group_texts.clone();
         let names_g = names.clone();
@@ -4250,18 +5672,6 @@ fn make_re_module() -> Value {
     )
 }
 
-/// `collections` shim.
-///
-/// Implemented: `OrderedDict` (alias to `dict`), `defaultdict` (no auto-
-/// default behaviour — same as plain `dict`), `Counter` (returns a dict
-/// of counts), `namedtuple` (returns a callable that builds a tuple).
-/// `deque` is not implemented; users hitting that case should fall back
-/// to `tyc run --compile`.
-/// A completed-task wrapper: `TaskGroup.create_task` / `spawn` force the
-/// coroutine immediately (sequential semantics) and hand back this module
-/// so `.result()` / `await task` recover the value.
-/// The exception *value* carried by an unwind, materialising a
-/// `Value::Exception` summary when the raise site didn't attach one.
 fn exception_unwind_value(e: &crate::error::VmException) -> Value {
     e.value.clone().unwrap_or_else(|| Value::Exception {
         kind: Rc::new(e.kind.clone()),
@@ -4724,114 +6134,6 @@ fn make_abc_module() -> Value {
     make_module("abc", entries)
 }
 
-fn make_collections_module() -> Value {
-    let counter = nf("Counter", |i, args| {
-        let mut counts: DictMap = IndexMap::new();
-        if let Some(v) = args.into_iter().next() {
-            let it = i.make_iter(v)?;
-            while let Some(x) = i.iter_next(&it)? {
-                let key = x.to_hash_key()?;
-                let entry = counts.entry(key).or_insert(Value::Int(VmInt::from(0)));
-                *entry = match entry {
-                    Value::Int(n) => Value::Int(n.add(&VmInt::from(1i64))),
-                    _ => Value::Int(VmInt::from(1)),
-                };
-            }
-        }
-        Ok(Value::Dict(Rc::new(RefCell::new(counts))))
-    });
-    let defaultdict = nf("defaultdict", |i, mut args| {
-        // `defaultdict(factory[, mapping])` constructs a synthesised mapping
-        // instance whose `__missing__` calls `factory()` to materialise a
-        // default for absent keys (foundation `__missing__` hook). The
-        // backing store is a plain dict held in `self._data`.
-        let factory = if args.is_empty() {
-            Value::None
-        } else {
-            args.remove(0)
-        };
-        let cls = defaultdict_class(i)?;
-        let initial = args.into_iter().next().unwrap_or(Value::None);
-        i.call_value(cls, vec![factory, initial], &[])
-    });
-    let ordered_dict = nf("OrderedDict", |i, args| {
-        // CPython's `dict` preserves insertion order since 3.7, so this
-        // is a true alias for the v1 shim (FINDINGS #18 — the VM itself
-        // now backs dicts with IndexMap so iteration order matches).
-        let mut m: DictMap = IndexMap::new();
-        if let Some(v) = args.into_iter().next() {
-            let it = i.make_iter(v)?;
-            while let Some(pair) = i.iter_next(&it)? {
-                if let Value::Tuple(t) = pair {
-                    if t.len() == 2 {
-                        m.insert(t[0].to_hash_key()?, t[1].clone());
-                    }
-                }
-            }
-        }
-        Ok(Value::Dict(Rc::new(RefCell::new(m))))
-    });
-    // `namedtuple(name, fields)` returns a constructor that accepts the
-    // field values positionally or by keyword and returns a plain tuple.
-    // Attribute access on the result is not supported in this shim; the
-    // tuple shape is enough for most arithmetic / unpacking use sites.
-    let namedtuple = nf("namedtuple", |_i, args| {
-        let _name = args
-            .first()
-            .ok_or_else(|| type_error("namedtuple() needs a name"))?;
-        let fields = args
-            .get(1)
-            .ok_or_else(|| type_error("namedtuple() needs fields"))?
-            .clone();
-        let ctor = NativeFn::new("namedtuple_ctor", move |_i, mut call_args| {
-            // Pull field count from the captured `fields` argument.
-            let count = match &fields {
-                Value::Str(s) => s
-                    .split(|c: char| c.is_whitespace() || c == ',')
-                    .filter(|p| !p.is_empty())
-                    .count(),
-                Value::List(l) => l.borrow().len(),
-                Value::Tuple(t) => t.len(),
-                _ => 0,
-            };
-            // Pad with None up to the declared field count.
-            while call_args.len() < count {
-                call_args.push(Value::None);
-            }
-            Ok(Value::Tuple(Rc::new(call_args)))
-        });
-        Ok(Value::Native(Rc::new(ctor)))
-    });
-    // `deque([iterable])` — the VM exposes deques as plain lists, since
-    // all the methods we shim (append, appendleft, pop, popleft, extend)
-    // map cleanly onto list operations. This is `O(n)` for the *left*
-    // variants instead of the `O(1)` CPython gives, but functional
-    // equivalence is preserved.
-    let deque = nf("deque", |i, args| {
-        let mut out: Vec<Value> = Vec::new();
-        if let Some(v) = args.into_iter().next() {
-            if !matches!(v, Value::None) {
-                let it = i.make_iter(v)?;
-                while let Some(x) = i.iter_next(&it)? {
-                    out.push(x);
-                }
-            }
-        }
-        Ok(Value::List(Rc::new(RefCell::new(out))))
-    });
-    make_module(
-        "collections",
-        vec![
-            ("OrderedDict", ordered_dict),
-            ("abc", make_collections_abc_module()),
-            ("defaultdict", defaultdict),
-            ("Counter", counter),
-            ("namedtuple", namedtuple),
-            ("deque", deque),
-        ],
-    )
-}
-
 /// `heapq` shim — implements the small-but-essential surface for
 /// priority-queue-style algorithms (Dijkstra, A*, top-K, merge-K-sorted).
 /// Internally we re-heapify on every push/pop since the VM's lists don't
@@ -5089,7 +6391,7 @@ fn deep_freeze_value(v: Value) -> Result<Value, Unwind> {
             // Freeze every field in place; a frozen-class declaration on
             // the type already keeps individual field assignments rejected
             // at desugar time, so this is belt-and-braces.
-            let mut new_fields: HashMap<String, Value> = HashMap::new();
+            let mut new_fields: crate::value::FieldMap = crate::value::FieldMap::new();
             for (k, val) in inst.fields.borrow().iter() {
                 new_fields.insert(k.clone(), deep_freeze_value(val.clone())?);
             }
@@ -5156,11 +6458,116 @@ fn make_contextlib_module() -> Value {
             Ok(args.into_iter().next().unwrap_or(Value::None))
         })
     };
+    // `@contextmanager` wraps a generator function into a factory whose calls
+    // hand back a context manager driving that generator: `__enter__` runs
+    // the body up to its `yield` (the yielded value is what `as` binds) and
+    // `__exit__` resumes it — throwing the `with` body's exception in at the
+    // `yield` when there is one — so setup and teardown run around the block
+    // exactly as under CPython's `contextlib._GeneratorContextManager`.
+    let contextmanager = nf("contextmanager", |_i, args| {
+        let func = args.into_iter().next().unwrap_or(Value::None);
+        Ok(Value::Native(Rc::new(NativeFn::new(
+            "contextmanager_factory",
+            move |i, call_args| {
+                let (pos, kw) = split_kwargs(&call_args);
+                let gen = i.call_value(func.clone(), pos.to_vec(), &kw)?;
+                Ok(generator_context_manager(gen))
+            },
+        ))))
+    });
     make_module(
         "contextlib",
         vec![
-            ("contextmanager", identity("contextmanager")),
+            ("contextmanager", contextmanager),
             ("asynccontextmanager", identity("asynccontextmanager")),
+        ],
+    )
+}
+
+/// An object exposing native functions as attributes — the shape the VM
+/// uses for stdlib objects that need methods but no user-visible class body
+/// (`re.Pattern`, `re.Match`, a `@contextmanager` manager, …). Attribute
+/// reads hit the instance fields first, so the natives dispatch directly.
+pub(crate) fn native_object(class_name: &str, fields: Vec<(&str, Value)>) -> Value {
+    let cls = Rc::new(crate::value::Class {
+        name: class_name.to_owned(),
+        methods: RefCell::new(HashMap::new()),
+        fields: vec![],
+        class_attrs: RefCell::new(HashMap::new()),
+        bases: vec![],
+        properties: RefCell::new(std::collections::HashSet::new()),
+        classmethods: RefCell::new(std::collections::HashSet::new()),
+        is_exception: false,
+        is_protocol: false,
+    });
+    let fields: crate::value::FieldMap =
+        fields.into_iter().map(|(k, v)| (k.to_owned(), v)).collect();
+    Value::Instance(Rc::new(crate::value::Instance {
+        class: cls,
+        fields: RefCell::new(fields),
+    }))
+}
+
+/// The context manager `@contextmanager` builds around one generator object.
+fn generator_context_manager(gen: Value) -> Value {
+    let gen_enter = gen.clone();
+    let enter = NativeFn::new("__enter__", move |i, _args| {
+        match i.iter_next(&gen_enter)? {
+            Some(v) => Ok(v),
+            None => Err(Unwind::Exception(crate::error::VmException::new(
+                "RuntimeError",
+                "generator didn't yield",
+            ))),
+        }
+    });
+    let gen_exit = gen.clone();
+    let exit = NativeFn::new("__exit__", move |i, args| {
+        let exc_value = args.get(1).cloned().unwrap_or(Value::None);
+        if matches!(exc_value, Value::None) {
+            // Normal exit: the body must run to completion.
+            return match i.iter_next(&gen_exit)? {
+                Some(_) => Err(Unwind::Exception(crate::error::VmException::new(
+                    "RuntimeError",
+                    "generator didn't stop",
+                ))),
+                None => Ok(Value::Bool(false)),
+            };
+        }
+        // The `with` body raised: throw it in at the `yield`. A generator
+        // that swallows it and finishes suppresses the exception; one that
+        // lets the same exception out does not; a *different* exception
+        // propagates instead.
+        let Some(g) = crate::interp::as_generator(&gen_exit) else {
+            return Ok(Value::Bool(false));
+        };
+        let Unwind::Exception(exc) = i.value_to_exception(exc_value.clone()) else {
+            return Ok(Value::Bool(false));
+        };
+        match i.generator_resume(&g, None, Some(exc)) {
+            Ok(Some(_)) => Err(Unwind::Exception(crate::error::VmException::new(
+                "RuntimeError",
+                "generator didn't stop after throw()",
+            ))),
+            Ok(None) => Ok(Value::Bool(true)),
+            Err(Unwind::Exception(e)) => {
+                let same = match &e.value {
+                    Some(v) => crate::value::exception_values_identical(v, &exc_value),
+                    None => false,
+                };
+                if same {
+                    Ok(Value::Bool(false))
+                } else {
+                    Err(Unwind::Exception(e))
+                }
+            }
+            Err(other) => Err(other),
+        }
+    });
+    native_object(
+        "_GeneratorContextManager",
+        vec![
+            ("__enter__", Value::Native(Rc::new(enter))),
+            ("__exit__", Value::Native(Rc::new(exit))),
         ],
     )
 }
@@ -5184,7 +6591,7 @@ fn make_functools_module() -> Value {
             move |interp, call_args| {
                 let mut keys = Vec::with_capacity(call_args.len());
                 for a in &call_args {
-                    keys.push(a.to_hash_key()?);
+                    keys.push(interp.hash_key(a)?);
                 }
                 let key = HashKey::Tuple(Rc::new(keys));
                 if let Some(v) = cache.borrow().get(&key).cloned() {
@@ -5272,296 +6679,6 @@ fn make_functools_module() -> Value {
     )
 }
 
-/// `itertools` shim.
-///
-/// Implemented: `chain`, `repeat`, `count`, `cycle`, `accumulate`,
-/// `islice`, `takewhile`, `dropwhile`. The remaining helpers
-/// (`combinations`, `permutations`, `product`, `groupby`) return their
-/// results as eager lists because the VM doesn't yet expose a generator
-/// protocol — large inputs will materialise everything in memory.
-fn make_itertools_module() -> Value {
-    fn drain(i: &mut Interpreter, v: Value) -> Result<Vec<Value>, Unwind> {
-        let it = i.make_iter(v)?;
-        let mut out = Vec::new();
-        while let Some(x) = i.iter_next(&it)? {
-            out.push(x);
-        }
-        Ok(out)
-    }
-    let chain = nf("chain", |i, args| {
-        let mut out = Vec::new();
-        for a in args {
-            out.extend(drain(i, a)?);
-        }
-        Ok(Value::List(Rc::new(RefCell::new(out))))
-    });
-    let repeat = nf("repeat", |_i, args| {
-        let v = args
-            .first()
-            .ok_or_else(|| type_error("repeat() needs an arg"))?
-            .clone();
-        let times = args
-            .get(1)
-            .and_then(|x| x.to_int().ok())
-            .unwrap_or(0)
-            .max(0);
-        let out: Vec<Value> = (0..times).map(|_| v.clone()).collect();
-        Ok(Value::List(Rc::new(RefCell::new(out))))
-    });
-    let count = nf("count", |_i, args| {
-        // Eagerly materialises 1024 elements (open-ended iterators
-        // aren't safe to expand without a bound).
-        let start = args.first().and_then(|x| x.to_int().ok()).unwrap_or(0);
-        let step = args.get(1).and_then(|x| x.to_int().ok()).unwrap_or(1);
-        let out: Vec<Value> = (0..1024)
-            .map(|n| Value::Int(VmInt::from(start + n * step)))
-            .collect();
-        Ok(Value::List(Rc::new(RefCell::new(out))))
-    });
-    let cycle = nf("cycle", |i, args| {
-        // Materialises a fixed-size repetition (8x) so the VM doesn't
-        // hang on an infinite iterator. Users that need true cycling
-        // should fall back to compile mode.
-        let v = args
-            .into_iter()
-            .next()
-            .ok_or_else(|| type_error("cycle() needs an iterable"))?;
-        let elems = drain(i, v)?;
-        let mut out = Vec::with_capacity(elems.len() * 8);
-        for _ in 0..8 {
-            out.extend(elems.iter().cloned());
-        }
-        Ok(Value::List(Rc::new(RefCell::new(out))))
-    });
-    let accumulate = nf("accumulate", |i, mut args| {
-        if args.is_empty() {
-            return Err(type_error("accumulate() needs an iterable"));
-        }
-        let iterable = args.remove(0);
-        let func = args.into_iter().next();
-        let xs = drain(i, iterable)?;
-        let mut out = Vec::with_capacity(xs.len());
-        let mut iter = xs.into_iter();
-        if let Some(first) = iter.next() {
-            out.push(first.clone());
-            let mut acc = first;
-            for x in iter {
-                acc = match &func {
-                    Some(f) => i.call_value(f.clone(), vec![acc, x], &[])?,
-                    None => i.binop(&acc, ruff_python_ast::Operator::Add, &x)?,
-                };
-                out.push(acc.clone());
-            }
-        }
-        Ok(Value::List(Rc::new(RefCell::new(out))))
-    });
-    let islice = nf("islice", |i, mut args| {
-        if args.is_empty() {
-            return Err(type_error("islice() needs an iterable"));
-        }
-        let iterable = args.remove(0);
-        let xs = drain(i, iterable)?;
-        let (start, stop) = match args.len() {
-            1 => (0usize, args[0].to_int().unwrap_or(0).max(0) as usize),
-            2 => (
-                args[0].to_int().unwrap_or(0).max(0) as usize,
-                args[1].to_int().unwrap_or(0).max(0) as usize,
-            ),
-            _ => (0, xs.len()),
-        };
-        let stop = stop.min(xs.len());
-        let start = start.min(stop);
-        let out: Vec<Value> = xs[start..stop].to_vec();
-        Ok(Value::List(Rc::new(RefCell::new(out))))
-    });
-    let takewhile = nf("takewhile", |i, mut args| {
-        if args.len() < 2 {
-            return Err(type_error("takewhile() needs predicate, iterable"));
-        }
-        let pred = args.remove(0);
-        let xs = drain(i, args.remove(0))?;
-        let mut out = Vec::new();
-        for x in xs {
-            let keep = i.call_value(pred.clone(), vec![x.clone()], &[])?;
-            if !keep.truthy() {
-                break;
-            }
-            out.push(x);
-        }
-        Ok(Value::List(Rc::new(RefCell::new(out))))
-    });
-    let dropwhile = nf("dropwhile", |i, mut args| {
-        if args.len() < 2 {
-            return Err(type_error("dropwhile() needs predicate, iterable"));
-        }
-        let pred = args.remove(0);
-        let xs = drain(i, args.remove(0))?;
-        let mut out = Vec::new();
-        let mut dropping = true;
-        for x in xs {
-            if dropping {
-                let keep = i.call_value(pred.clone(), vec![x.clone()], &[])?;
-                if keep.truthy() {
-                    continue;
-                }
-                dropping = false;
-            }
-            out.push(x);
-        }
-        Ok(Value::List(Rc::new(RefCell::new(out))))
-    });
-    let combinations = nf("combinations", |i, mut args| {
-        if args.len() < 2 {
-            return Err(type_error("combinations() needs iterable, r"));
-        }
-        let xs = drain(i, args.remove(0))?;
-        let r = args[0].to_int().unwrap_or(0).max(0) as usize;
-        let mut out = Vec::new();
-        let n = xs.len();
-        if r <= n {
-            let mut idx: Vec<usize> = (0..r).collect();
-            loop {
-                let tup: Vec<Value> = idx.iter().map(|&i| xs[i].clone()).collect();
-                out.push(Value::Tuple(Rc::new(tup)));
-                let mut i_pos = r;
-                let mut done = true;
-                while i_pos > 0 {
-                    i_pos -= 1;
-                    if idx[i_pos] != i_pos + n - r {
-                        idx[i_pos] += 1;
-                        for j in (i_pos + 1)..r {
-                            idx[j] = idx[j - 1] + 1;
-                        }
-                        done = false;
-                        break;
-                    }
-                }
-                if done {
-                    break;
-                }
-            }
-        }
-        Ok(Value::List(Rc::new(RefCell::new(out))))
-    });
-    let permutations = nf("permutations", |i, mut args| {
-        if args.is_empty() {
-            return Err(type_error("permutations() needs an iterable"));
-        }
-        let xs = drain(i, args.remove(0))?;
-        let r = args
-            .first()
-            .and_then(|x| x.to_int().ok())
-            .map(|n| n.max(0) as usize)
-            .unwrap_or(xs.len());
-        let n = xs.len();
-        let mut out = Vec::new();
-        if r <= n {
-            let mut indices: Vec<usize> = (0..n).collect();
-            let mut cycles: Vec<usize> = (0..r).map(|i| n - i).collect();
-            out.push(Value::Tuple(Rc::new(
-                indices[..r].iter().map(|&i| xs[i].clone()).collect(),
-            )));
-            'outer: loop {
-                let mut i_pos = r;
-                while i_pos > 0 {
-                    i_pos -= 1;
-                    cycles[i_pos] -= 1;
-                    if cycles[i_pos] == 0 {
-                        let temp = indices.remove(i_pos);
-                        indices.push(temp);
-                        cycles[i_pos] = n - i_pos;
-                    } else {
-                        let j = cycles[i_pos];
-                        let len = indices.len();
-                        indices.swap(i_pos, len - j);
-                        out.push(Value::Tuple(Rc::new(
-                            indices[..r].iter().map(|&i| xs[i].clone()).collect(),
-                        )));
-                        continue 'outer;
-                    }
-                }
-                break;
-            }
-        }
-        Ok(Value::List(Rc::new(RefCell::new(out))))
-    });
-    let product = nf("product", |i, args| {
-        // `product(*iterables, repeat=1)` — ignore the repeat kwarg (not
-        // wired into the call frame). Returns a list of tuples.
-        let pools: Vec<Vec<Value>> = args
-            .into_iter()
-            .map(|a| drain(i, a))
-            .collect::<Result<_, _>>()?;
-        let mut out: Vec<Vec<Value>> = vec![vec![]];
-        for pool in &pools {
-            let mut next = Vec::with_capacity(out.len() * pool.len());
-            for prefix in &out {
-                for v in pool {
-                    let mut new_p = prefix.clone();
-                    new_p.push(v.clone());
-                    next.push(new_p);
-                }
-            }
-            out = next;
-        }
-        let tuples: Vec<Value> = out.into_iter().map(|v| Value::Tuple(Rc::new(v))).collect();
-        Ok(Value::List(Rc::new(RefCell::new(tuples))))
-    });
-    let groupby = nf("groupby", |i, mut args| {
-        if args.is_empty() {
-            return Err(type_error("groupby() needs an iterable"));
-        }
-        let xs = drain(i, args.remove(0))?;
-        let key = args.into_iter().next();
-        // Returns a list of (key, list) tuples.
-        let mut out: Vec<Value> = Vec::new();
-        let mut current_key: Option<Value> = None;
-        let mut current_group: Vec<Value> = Vec::new();
-        for x in xs {
-            let k = match &key {
-                Some(f) => i.call_value(f.clone(), vec![x.clone()], &[])?,
-                None => x.clone(),
-            };
-            if let Some(ck) = &current_key {
-                if ck.py_eq(&k) {
-                    current_group.push(x);
-                    continue;
-                }
-                out.push(Value::Tuple(Rc::new(vec![
-                    ck.clone(),
-                    Value::List(Rc::new(RefCell::new(std::mem::take(&mut current_group)))),
-                ])));
-            }
-            current_key = Some(k);
-            current_group.push(x);
-        }
-        if let Some(ck) = current_key {
-            out.push(Value::Tuple(Rc::new(vec![
-                ck,
-                Value::List(Rc::new(RefCell::new(current_group))),
-            ])));
-        }
-        Ok(Value::List(Rc::new(RefCell::new(out))))
-    });
-    make_module(
-        "itertools",
-        vec![
-            ("chain", chain),
-            ("repeat", repeat),
-            ("count", count),
-            ("cycle", cycle),
-            ("accumulate", accumulate),
-            ("islice", islice),
-            ("takewhile", takewhile),
-            ("dropwhile", dropwhile),
-            ("combinations", combinations),
-            ("permutations", permutations),
-            ("product", product),
-            ("groupby", groupby),
-        ],
-    )
-}
-
 /// `dataclasses` shim.
 ///
 /// `dataclass` is exposed as an identity decorator — the Typhon desugar
@@ -5640,7 +6757,7 @@ fn make_dataclasses_module() -> Value {
             .fields
             .iter()
             .map(|f| {
-                let mut attrs: HashMap<String, Value> = HashMap::new();
+                let mut attrs: crate::value::FieldMap = crate::value::FieldMap::new();
                 attrs.insert("name".to_owned(), Value::Str(Rc::new(f.name.clone())));
                 attrs.insert(
                     "type".to_owned(),
@@ -5676,8 +6793,22 @@ fn make_dataclasses_module() -> Value {
             ("fields", fields),
             ("is_dataclass", is_dataclass),
             ("replace", replace),
+            ("FrozenInstanceError", exception_ctor("FrozenInstanceError")),
         ],
     )
+}
+
+/// A constructor native for a builtin-style exception kind that lives in a
+/// module rather than the prelude (`dataclasses.FrozenInstanceError`).
+fn exception_ctor(name: &'static str) -> Value {
+    Value::Native(Rc::new(NativeFn::new(name, move |_i, args| {
+        let msg = args.first().map(|v| v.py_str()).unwrap_or_default();
+        Ok(Value::Exception {
+            kind: Rc::new(name.to_owned()),
+            message: Rc::new(msg),
+            args: Rc::new(args),
+        })
+    })))
 }
 
 /// `dataclasses.asdict` / `astuple` value conversion: a dataclass instance
@@ -5795,304 +6926,6 @@ fn dataclass_field_class() -> Rc<crate::value::Class> {
     DATACLASS_FIELD_CLASS.with(|c| c.clone())
 }
 
-/// `pathlib` shim.
-///
-/// Implements a `Path` callable that returns an instance with the
-/// following surface: `__truediv__`, `read_text`, `write_text`,
-/// `exists`, `is_file`, `is_dir`, `name`, `parent`, `suffix`, `suffixes`,
-/// `stem`, and `__str__`. Internally a Path instance is an `Instance` value
-/// whose `fields` map holds the resolved path string under `__path__`.
-///
-/// Source for the `pathlib.Path` dunder shim. Holds the path string in
-/// `_path`; `__truediv__` defers the actual join to the native `_join` field
-/// (so all the OS-aware part computation stays in Rust). `__str__` /
-/// `__repr__` / `__fspath__` surface the string form.
-const PATH_SRC: &str = r#"
-class _Path:
-    def __truediv__(self, other):
-        return self._join(other)
-    def __str__(self):
-        return self._path
-    def __repr__(self):
-        return "PosixPath('" + self._path + "')"
-    def __fspath__(self):
-        return self._path
-    def __eq__(self, other):
-        return self._path == str(other)
-    def __lt__(self, other):
-        return self._path < str(other)
-    def __le__(self, other):
-        return self._path <= str(other)
-    def __gt__(self, other):
-        return self._path > str(other)
-    def __ge__(self, other):
-        return self._path >= str(other)
-    def __hash__(self):
-        return hash(self._path)
-"#;
-
-fn path_class(interp: &mut Interpreter) -> Result<Rc<crate::value::Class>, Unwind> {
-    let cls = cached_helper_class(interp, "__shim_path__", PATH_SRC, "_Path")?;
-    match cls {
-        Value::Class(c) => Ok(c),
-        _ => Err(type_error("internal: _Path shim is not a class")),
-    }
-}
-
-fn make_pathlib_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
-    use crate::value::Instance;
-    let cls = path_class(interp)?;
-    fn make_path(cls: Rc<crate::value::Class>, s: String) -> Value {
-        let mut fields: HashMap<String, Value> = HashMap::new();
-        fields.insert("__path__".into(), Value::Str(Rc::new(s.clone())));
-        // `_path` mirrors `__path__` for the compiled `_Path` dunder methods,
-        // which reference `self._path`.
-        fields.insert("_path".into(), Value::Str(Rc::new(s.clone())));
-        // Cache derived parts as fields so attribute access (`p.name`,
-        // `p.suffix`, `p.stem`, `p.parent`) works without descriptors.
-        let p = std::path::Path::new(&s);
-        let name = p
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_owned();
-        let stem = p
-            .file_stem()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_owned();
-        let suffix = p
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| format!(".{e}"))
-            .unwrap_or_default();
-        let parent = p.parent().and_then(|n| n.to_str()).unwrap_or("").to_owned();
-        fields.insert("name".into(), Value::Str(Rc::new(name)));
-        fields.insert("stem".into(), Value::Str(Rc::new(stem)));
-        fields.insert("suffix".into(), Value::Str(Rc::new(suffix)));
-        // `parent` is exposed as a string here; users who need the
-        // full Path API on the parent can wrap with `Path(p.parent)`.
-        // This sidesteps an infinite recursion when `parent` of `/` is
-        // itself `/`.
-        fields.insert("parent".into(), Value::Str(Rc::new(parent)));
-        // `.suffixes` — every dotted extension on the final component, e.g.
-        // `Path("file.tar.gz").suffixes == ['.tar', '.gz']`. A leading dot
-        // (dotfile like `.bashrc`) does NOT start a suffix, matching CPython.
-        let suffixes: Vec<Value> = {
-            let name = std::path::Path::new(&s)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
-            let trimmed = name.trim_start_matches('.');
-            if trimmed.contains('.') {
-                trimmed
-                    .split('.')
-                    .skip(1)
-                    .map(|part| Value::Str(Rc::new(format!(".{part}"))))
-                    .collect()
-            } else {
-                Vec::new()
-            }
-        };
-        fields.insert(
-            "suffixes".into(),
-            Value::List(Rc::new(RefCell::new(suffixes))),
-        );
-        // `_join` backs `__truediv__`: append `other` as a path component and
-        // return a fresh `_Path` instance.
-        let s_for_join = s.clone();
-        let cls_for_join = cls.clone();
-        fields.insert(
-            "_join".into(),
-            Value::Native(Rc::new(NativeFn::new("_join", move |_i, args| {
-                let other = single(&args, "_join")?.py_str();
-                let joined = std::path::Path::new(&s_for_join)
-                    .join(&other)
-                    .to_str()
-                    .unwrap_or("")
-                    .to_owned();
-                Ok(make_path(cls_for_join.clone(), joined))
-            }))),
-        );
-        // Methods.
-        let s_for_read = s.clone();
-        fields.insert(
-            "read_text".into(),
-            Value::Native(Rc::new(NativeFn::new("read_text", move |_i, _args| {
-                std::fs::read_to_string(&s_for_read)
-                    .map(|t| Value::Str(Rc::new(t)))
-                    .map_err(|e| {
-                        crate::error::Unwind::Exception(crate::error::VmException::new(
-                            "OSError",
-                            format!("{e}"),
-                        ))
-                    })
-            }))),
-        );
-        let s_for_write = s.clone();
-        fields.insert(
-            "write_text".into(),
-            Value::Native(Rc::new(NativeFn::new("write_text", move |_i, args| {
-                let text = single(&args, "write_text")?.py_str();
-                std::fs::write(&s_for_write, text.as_bytes())
-                    // `Path.write_text` returns the number of characters written.
-                    .map(|_| Value::Int(VmInt::from(text.chars().count() as i64)))
-                    .map_err(|e| {
-                        crate::error::Unwind::Exception(crate::error::VmException::new(
-                            "OSError",
-                            format!("{e}"),
-                        ))
-                    })
-            }))),
-        );
-        let s_for_exists = s.clone();
-        fields.insert(
-            "exists".into(),
-            Value::Native(Rc::new(NativeFn::new("exists", move |_i, _args| {
-                Ok(Value::Bool(std::path::Path::new(&s_for_exists).exists()))
-            }))),
-        );
-        let s_for_is_file = s.clone();
-        fields.insert(
-            "is_file".into(),
-            Value::Native(Rc::new(NativeFn::new("is_file", move |_i, _args| {
-                Ok(Value::Bool(std::path::Path::new(&s_for_is_file).is_file()))
-            }))),
-        );
-        let s_for_is_dir = s.clone();
-        fields.insert(
-            "is_dir".into(),
-            Value::Native(Rc::new(NativeFn::new("is_dir", move |_i, _args| {
-                Ok(Value::Bool(std::path::Path::new(&s_for_is_dir).is_dir()))
-            }))),
-        );
-        let s_for_iter = s.clone();
-        let cls_for_iter = cls.clone();
-        fields.insert(
-            "iterdir".into(),
-            Value::Native(Rc::new(NativeFn::new("iterdir", move |_i, _args| {
-                let mut entries: Vec<Value> = Vec::new();
-                let rd = std::fs::read_dir(&s_for_iter).map_err(|e| {
-                    crate::error::Unwind::Exception(crate::error::VmException::new(
-                        if e.kind() == std::io::ErrorKind::NotFound {
-                            "FileNotFoundError"
-                        } else {
-                            "OSError"
-                        },
-                        format!("{e}: '{s_for_iter}'"),
-                    ))
-                })?;
-                for entry in rd.flatten() {
-                    entries.push(make_path(
-                        cls_for_iter.clone(),
-                        entry.path().to_string_lossy().into_owned(),
-                    ));
-                }
-                Ok(Value::List(Rc::new(RefCell::new(entries))))
-            }))),
-        );
-        let s_for_glob = s.clone();
-        let cls_for_glob = cls.clone();
-        fields.insert(
-            "glob".into(),
-            Value::Native(Rc::new(NativeFn::new("glob", move |_i, args| {
-                // Non-recursive single-component glob: `*`, `*.py`, `data*`.
-                let pat = single(&args, "glob")?.py_str();
-                if pat.contains("**") || pat.contains('/') {
-                    return Err(type_error(
-                        "VM glob() supports single-component patterns only — \
-                         use `tyc run --compile` for recursive globs",
-                    ));
-                }
-                let mut entries: Vec<Value> = Vec::new();
-                if let Ok(rd) = std::fs::read_dir(&s_for_glob) {
-                    for entry in rd.flatten() {
-                        let name = entry.file_name().to_string_lossy().into_owned();
-                        if glob_match(&pat, &name) {
-                            entries.push(make_path(
-                                cls_for_glob.clone(),
-                                entry.path().to_string_lossy().into_owned(),
-                            ));
-                        }
-                    }
-                }
-                Ok(Value::List(Rc::new(RefCell::new(entries))))
-            }))),
-        );
-        let s_for_mkdir = s.clone();
-        fields.insert(
-            "mkdir".into(),
-            Value::Native(Rc::new(NativeFn::new("mkdir", move |_i, args| {
-                // Accept the common kwargs via sentinel: parents=, exist_ok=.
-                let (_pos, kw_vec) = split_kwargs(&args);
-                let kw: HashMap<String, Value> = kw_vec.into_iter().collect();
-                let parents = kw.get("parents").map(|v| v.truthy()).unwrap_or(false);
-                let exist_ok = kw.get("exist_ok").map(|v| v.truthy()).unwrap_or(false);
-                let r = if parents {
-                    std::fs::create_dir_all(&s_for_mkdir)
-                } else {
-                    std::fs::create_dir(&s_for_mkdir)
-                };
-                match r {
-                    Ok(()) => Ok(Value::None),
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && exist_ok => {
-                        Ok(Value::None)
-                    }
-                    Err(e) => Err(fs_unwind(&s_for_mkdir, e)),
-                }
-            }))),
-        );
-        let s_for_unlink = s.clone();
-        fields.insert(
-            "unlink".into(),
-            Value::Native(Rc::new(NativeFn::new("unlink", move |_i, _args| {
-                std::fs::remove_file(&s_for_unlink).map_err(|e| fs_unwind(&s_for_unlink, e))?;
-                Ok(Value::None)
-            }))),
-        );
-        let s_for_read_b = s.clone();
-        fields.insert(
-            "read_bytes".into(),
-            Value::Native(Rc::new(NativeFn::new("read_bytes", move |_i, _args| {
-                std::fs::read(&s_for_read_b)
-                    .map(|b| Value::Bytes(Rc::new(b)))
-                    .map_err(|e| fs_unwind(&s_for_read_b, e))
-            }))),
-        );
-        let s_for_write_b = s.clone();
-        fields.insert(
-            "write_bytes".into(),
-            Value::Native(Rc::new(NativeFn::new("write_bytes", move |_i, args| {
-                let data = match single(&args, "write_bytes")? {
-                    Value::Bytes(b) => b.as_ref().clone(),
-                    other => {
-                        return Err(type_error(format!(
-                            "write_bytes() expects bytes, not {}",
-                            other.type_name()
-                        )))
-                    }
-                };
-                let n = data.len();
-                std::fs::write(&s_for_write_b, data).map_err(|e| fs_unwind(&s_for_write_b, e))?;
-                Ok(Value::Int(VmInt::from(n as i64)))
-            }))),
-        );
-        Value::Instance(Rc::new(Instance {
-            class: cls,
-            fields: RefCell::new(fields),
-        }))
-    }
-    let cls_for_ctor = cls.clone();
-    let path = nf("Path", move |_i, args| {
-        let s = args
-            .first()
-            .map(|v| v.py_str())
-            .unwrap_or_else(|| ".".to_string());
-        Ok(make_path(cls_for_ctor.clone(), s))
-    });
-    Ok(make_module("pathlib", vec![("Path", path)]))
-}
-
 // ── Method dispatch on built-in types ──────────────────────────────────────
 
 pub fn method_for(_value: &Value, _attr: &str) -> Option<()> {
@@ -6137,13 +6970,13 @@ pub fn dispatch_method(
         // ── str methods ────────────────────────────────────────────────────
         (Value::Str(s), m) => str_method(interp, s, m, rest, &kwargs),
         // ── bytes methods ──────────────────────────────────────────────────
-        (Value::Bytes(b), m) => bytes_method(b, m, rest),
+        (Value::Bytes(b), m) => bytes_method(b, m, rest, &kwargs),
         // ── list methods ───────────────────────────────────────────────────
         (Value::List(l), m) => list_method(interp, l, m, rest),
         // ── dict methods ───────────────────────────────────────────────────
         (Value::Dict(d), m) => dict_method(interp, d, m, rest),
         // ── set methods ────────────────────────────────────────────────────
-        (Value::Set(s), m) => set_method(s, m, rest),
+        (Value::Set(s), m) => set_method(interp, s, m, rest),
         // ── tuple methods ──────────────────────────────────────────────────
         (Value::Tuple(t), m) => tuple_method(t, m, rest),
         // ── int/float/bool method calls ────────────────────────────────────
@@ -6185,7 +7018,9 @@ pub fn dict_fromkeys(interp: &mut Interpreter, args: Vec<Value>) -> Result<Value
     let iter = interp.make_iter(iterable)?;
     while let Some(k) = interp.iter_next(&iter)? {
         // Last write wins on a duplicate key, matching CPython.
-        map.insert(k.to_hash_key()?, fill.clone());
+        let key = interp.hash_key(&k)?;
+        let key = interp.settle_key_in_map(&map, key)?;
+        map.insert(key, fill.clone());
     }
     Ok(Value::Dict(Rc::new(RefCell::new(map))))
 }
@@ -6682,7 +7517,20 @@ fn str_method(
             let (pos_args, kwargs) = split_kwargs(args);
             return str_format(interp, s, pos_args, &kwargs);
         }
-        "encode" => Value::Bytes(Rc::new(s.as_bytes().to_vec())),
+        "encode" => {
+            // Keywords arrive as a trailing sentinel (see `splitlines`).
+            let (args, kw) = split_kwargs(args);
+            let find = |name: &str| kw.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+            let encoding = match args.first().cloned().or_else(|| find("encoding")) {
+                Some(v) => v.py_str(),
+                None => "utf-8".to_owned(),
+            };
+            let errors = match args.get(1).cloned().or_else(|| find("errors")) {
+                Some(v) => v.py_str(),
+                None => "strict".to_owned(),
+            };
+            Value::Bytes(Rc::new(crate::codecs::encode(s, &encoding, &errors)?))
+        }
         _ => return Err(attribute_error(format!("str has no method '{}'", name))),
     })
 }
@@ -6804,23 +7652,28 @@ fn str_format(
     Ok(Value::Str(Rc::new(out)))
 }
 
-fn bytes_method(b: &Rc<Vec<u8>>, name: &str, args: &[Value]) -> Result<Value, Unwind> {
+fn bytes_method(
+    b: &Rc<Vec<u8>>,
+    name: &str,
+    args: &[Value],
+    _kwargs: &HashMap<String, Value>,
+) -> Result<Value, Unwind> {
     Ok(match name {
         // `.decode()` / `.decode("utf-8")` -> str. Only UTF-8/ASCII handled;
         // other encodings fall back to a lossy UTF-8 decode.
         "decode" => {
-            let enc = args.first().map(|v| v.py_str()).unwrap_or_default();
-            let enc_norm = enc.to_ascii_lowercase().replace(['-', '_'], "");
-            match enc_norm.as_str() {
-                "" | "utf8" | "ascii" => match std::str::from_utf8(b) {
-                    Ok(s) => Value::Str(Rc::new(s.to_owned())),
-                    Err(_) => return Err(value_error("'utf-8' codec can't decode byte sequence")),
-                },
-                "latin1" | "iso88591" => {
-                    Value::Str(Rc::new(b.iter().map(|&c| c as char).collect::<String>()))
-                }
-                _ => Value::Str(Rc::new(String::from_utf8_lossy(b).into_owned())),
-            }
+            // Keywords arrive as a trailing sentinel (see `str.splitlines`).
+            let (args, kw) = split_kwargs(args);
+            let find = |name: &str| kw.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+            let encoding = match args.first().cloned().or_else(|| find("encoding")) {
+                Some(v) => v.py_str(),
+                None => "utf-8".to_owned(),
+            };
+            let errors = match args.get(1).cloned().or_else(|| find("errors")) {
+                Some(v) => v.py_str(),
+                None => "strict".to_owned(),
+            };
+            Value::Str(Rc::new(crate::codecs::decode(b, &encoding, &errors)?))
         }
         // `.hex()` -> lowercase hex string with no separators.
         "hex" => {
@@ -6889,8 +7742,27 @@ fn bytes_method(b: &Rc<Vec<u8>>, name: &str, args: &[Value]) -> Result<Value, Un
             Value::Bool(b.ends_with(&suf))
         }
         "find" | "index" if !args.is_empty() => {
-            let needle = bytes_arg(single(args, name)?)?;
-            match find_subslice(b, &needle) {
+            let needle = bytes_arg(&args[0])?;
+            // Optional `start` / `end` bound the search like a slice.
+            let len = b.len() as i64;
+            let clamp = |v: Option<&Value>, default: i64| -> Result<usize, Unwind> {
+                let mut i = match v {
+                    None | Some(Value::None) => default,
+                    Some(v) => v.to_int()?,
+                };
+                if i < 0 {
+                    i += len;
+                }
+                Ok(i.clamp(0, len) as usize)
+            };
+            let start = clamp(args.get(1), 0)?;
+            let end = clamp(args.get(2), len)?;
+            let found = if start <= end {
+                find_subslice(&b[start..end], &needle).map(|i| i + start)
+            } else {
+                None
+            };
+            match found {
                 Some(i) => Value::Int(VmInt::from(i as i64)),
                 None if name == "find" => Value::Int(VmInt::from(-1)),
                 None => return Err(value_error("subsection not found")),
@@ -6988,6 +7860,12 @@ fn parse_complex_str(s: &str) -> Option<(f64, f64)> {
 /// Whether an unwind is a raised `AttributeError` (vs. some other exception
 /// or control-flow). Lets `getattr`/`hasattr` distinguish a genuinely
 /// missing attribute from an error raised inside a descriptor / `__getattr__`.
+/// Whether an unwind is an `AttributeError` (used by the `with` statement to
+/// turn a missing `__enter__` into CPython's protocol `TypeError`).
+pub(crate) fn is_attribute_error_unwind(u: &Unwind) -> bool {
+    is_attribute_error(u)
+}
+
 fn is_attribute_error(u: &Unwind) -> bool {
     matches!(u, Unwind::Exception(e) if e.kind == "AttributeError")
 }
@@ -7317,7 +8195,7 @@ fn dict_method(
     }
     match name {
         "get" => {
-            let k = single(args, "get")?.to_hash_key()?;
+            let k = interp.dict_probe_key(d, single(args, "get")?)?;
             let default = args.get(1).cloned().unwrap_or(Value::None);
             Ok(d.borrow().get(&k).cloned().unwrap_or(default))
         }
@@ -7350,7 +8228,7 @@ fn dict_method(
                 .collect(),
         }),
         "pop" => {
-            let k = single(args, "pop")?.to_hash_key()?;
+            let k = interp.dict_probe_key(d, single(args, "pop")?)?;
             let default = args.get(1).cloned();
             // `shift_remove` preserves the insertion order of remaining
             // keys (matches CPython `dict.pop` semantics).
@@ -7373,7 +8251,8 @@ fn dict_method(
                     while let Some(pair) = interp.iter_next(&it)? {
                         if let Value::Tuple(t) = pair {
                             if t.len() == 2 {
-                                d.borrow_mut().insert(t[0].to_hash_key()?, t[1].clone());
+                                let key = interp.dict_probe_key(d, &t[0])?;
+                                d.borrow_mut().insert(key, t[1].clone());
                                 continue;
                             }
                         }
@@ -7384,7 +8263,7 @@ fn dict_method(
             }
         }
         "setdefault" => {
-            let k = single(args, "setdefault")?.to_hash_key()?;
+            let k = interp.dict_probe_key(d, single(args, "setdefault")?)?;
             let default = args.get(1).cloned().unwrap_or(Value::None);
             let mut m = d.borrow_mut();
             Ok(m.entry(k).or_insert(default).clone())
@@ -7422,8 +8301,8 @@ fn dict_method(
             // (`shift_remove` keeps order; plain `swap_remove` would not).
             let key = args
                 .first()
-                .ok_or_else(|| type_error("move_to_end() requires a key"))?
-                .to_hash_key()?;
+                .ok_or_else(|| type_error("move_to_end() requires a key"))?;
+            let key = interp.dict_probe_key(d, key)?;
             let last = kw
                 .iter()
                 .find(|(k, _)| k == "last")
@@ -7506,6 +8385,7 @@ fn dict_method(
 }
 
 fn set_method(
+    interp: &mut Interpreter,
     s: &Rc<RefCell<HashSet<HashKey>>>,
     name: &str,
     args: &[Value],
@@ -7525,11 +8405,12 @@ fn set_method(
     }
     match name {
         "add" => {
-            s.borrow_mut().insert(single(args, "add")?.to_hash_key()?);
+            let k = interp.set_probe_key(s, single(args, "add")?)?;
+            s.borrow_mut().insert(k);
             Ok(Value::None)
         }
         "remove" | "discard" => {
-            let k = single(args, name)?.to_hash_key()?;
+            let k = interp.set_probe_key(s, single(args, name)?)?;
             let removed = s.borrow_mut().remove(&k);
             if name == "remove" && !removed {
                 return Err(crate::error::key_error_for(&k.clone().into_value()));
@@ -7595,7 +8476,7 @@ fn set_method(
 }
 
 /// The members of a set, excluding the internal `freeze let` sentinel.
-fn set_keys_no_sentinel(s: &Rc<RefCell<HashSet<HashKey>>>) -> HashSet<HashKey> {
+pub fn set_keys_no_sentinel(s: &Rc<RefCell<HashSet<HashKey>>>) -> HashSet<HashKey> {
     let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
     s.borrow()
         .iter()
@@ -8084,7 +8965,7 @@ pub fn json_decode_error(msg: &str, doc: &str, pos: usize) -> Unwind {
     let chars: Vec<char> = doc.chars().collect();
     let (lineno, colno) = json_line_col(&chars, pos);
     let full = format!("{msg}: line {lineno} column {colno} (char {pos})");
-    let mut fields: HashMap<String, Value> = HashMap::new();
+    let mut fields: crate::value::FieldMap = crate::value::FieldMap::new();
     fields.insert(
         "args".to_owned(),
         Value::Tuple(Rc::new(vec![Value::Str(Rc::new(full.clone()))])),
@@ -8726,9 +9607,6 @@ pub fn call_with_kwargs(
         // discard them. Used by stdlib stubs that exist purely so user
         // code that calls them at import time doesn't crash.
         "ConfigDict" | "dataclass" => (n.func)(interp, args),
-        // Text-IO helpers accept an `encoding=` (and `errors=`) kwarg the VM
-        // doesn't model (it is always UTF-8). Drop the kwargs and run.
-        "write_text" | "read_text" | "open" => (n.func)(interp, args),
         // `itertools.groupby(iterable, key=…)` — fold the `key` keyword into
         // the second positional slot the native already understands.
         "groupby" => {
@@ -8764,6 +9642,7 @@ pub fn call_with_kwargs(
             let mut sep = " ".to_owned();
             let mut end = "\n".to_owned();
             let mut to_stderr = false;
+            let mut file_sink: Option<Value> = None;
             for (k, v) in kwargs {
                 match k.as_str() {
                     "sep" => match v {
@@ -8793,13 +9672,8 @@ pub fn call_with_kwargs(
                         Value::Module(m) if m.name == "sys.stderr" => to_stderr = true,
                         Value::Module(m) if m.name == "sys.stdout" => to_stderr = false,
                         Value::None => {}
-                        other => {
-                            return Err(type_error(format!(
-                                "print() file= must be sys.stdout or sys.stderr in the VM, \
-                                 not {} — use `tyc run --compile` for arbitrary file sinks",
-                                other.type_name()
-                            )))
-                        }
+                        // Any other sink: `file.write(text)`, as CPython does.
+                        other => file_sink = Some(other.clone()),
                     },
                     "flush" => {}
                     _ => {
@@ -8818,6 +9692,11 @@ pub fn call_with_kwargs(
                 out.push_str(&interp.str_of(a)?);
             }
             out.push_str(&end);
+            if let Some(sink) = file_sink {
+                let write = interp.get_attr(&sink, "write")?;
+                interp.call_value(write, vec![Value::Str(Rc::new(out))], &[])?;
+                return Ok(Value::None);
+            }
             if to_stderr {
                 eprint!("{out}");
             } else {
@@ -8888,7 +9767,13 @@ pub fn call_with_kwargs(
         "Queue" => Ok(make_asyncio_queue(&args, kwargs)),
         // Instance-field natives that parse their own kwargs via the
         // sentinel (`split_kwargs`): forward and let the body peel it.
-        "mkdir" | "makedirs" => {
+        "mkdir"
+        | "makedirs"
+        | "contextmanager_factory"
+        | "namedtuple"
+        | "open"
+        | "str"
+        | "bytes" => {
             let mut args = args;
             args.push(make_kwargs_sentinel(kwargs));
             (n.func)(interp, args)

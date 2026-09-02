@@ -54,6 +54,17 @@ def bad(cond: bool) -> int:
 
 **Fix:** Initialise inline (`let x: int = 0`), or assign in every non-diverging arm.
 
+### `tyc::go_outside_async` — error
+
+`go f(x)` run from module-level code — directly, or through a module-level call to a sync function whose body spawns — where no event loop is running: the lowered `typhon_runtime.tasks.spawn(f(x))` raised `RuntimeError: no running event loop` at the call and the coroutine was never awaited. A `go` inside a sync `def` is not flagged on its own (the function may be called from a coroutine).
+
+```ty
+def kick() -> None:
+    go work()       # error: no event loop is running here
+```
+
+**Fix:** move the `go` into an `async def` driven by `asyncio.run(...)`, or call `asyncio.run(work())` to run the coroutine to completion here.
+
 ### `tyc::possibly_unbound` — warning
 
 An ordinary function-local name (not a declare-only `let`) is read on a path that may not assign it — or provably never does: a read before the first assignment, a read after `del`, an `except E as e` name used after its handler (CPython unbinds it), a loop target read after a loop that may run zero times, a name assigned in only one arm of an `if` without `else`.

@@ -604,7 +604,7 @@ field-init audit) is unchanged from v0.5.0 — see
 - ✅ **`extend`** keyword for adding methods to user-defined classes
   (alias for `impl`) and for the recognised Python built-ins (`str`,
   `list`, `dict`, …). Built-in extensions are extracted to module-level
-  free functions `__typhon_ext_<TYPE>__<METHOD>` at desugar time, and
+  free functions `__typhon_ext_<TYPE>__<METHOD>__` at desugar time, and
   call sites are rewritten when the receiver has a matching static
   annotation. No monkey-patching of built-ins.
 - ✅ **`.dty` stub files** with `.pyi` interop emission — every `.dty` next to

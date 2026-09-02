@@ -1750,6 +1750,7 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
         .collect();
     let exception_class_names =
         exception_class_names_from(&module_level_classes, &module_class_names);
+    let raw_class_infos = collect_raw_class_infos(&m.body, &options.raw_class_line_starts);
     let markers = ClassMarkers {
         raw_starts: &options.raw_class_line_starts,
         frozen_starts: &options.frozen_class_line_starts,
@@ -1759,6 +1760,7 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
         model_extra: &options.model_extra,
         exception_class_names: &exception_class_names,
         module_class_names: &module_class_names,
+        raw_class_infos: &raw_class_infos,
     };
     let (new_body, transformed_classes) = desugar_stmts(&m.body, markers);
 
@@ -2122,6 +2124,100 @@ struct ClassMarkers<'a> {
     /// (builtin/imported) exception base apart from a `*Error`-named module
     /// dataclass when classifying a class as an exception per-class.
     module_class_names: &'a std::collections::HashSet<String>,
+    /// Constructor shape of every module-level `class!`, so a `class!`
+    /// deriving from another in-module `class!` can thread the parent's
+    /// fields through its own synthesised `__init__`.
+    raw_class_infos: &'a HashMap<String, RawClassInfo>,
+}
+
+/// What a `class!` contributes to the constructors of `class!` subclasses.
+#[derive(Debug, Clone)]
+struct RawClassInfo {
+    /// Own annotated fields in source order: name, annotation, default.
+    fields: Vec<(String, Expr, Option<Expr>)>,
+    /// The first positional base (the one `super().__init__` reaches).
+    first_base: Option<String>,
+    /// The body writes its own `__init__`, whose parameters are unknown
+    /// to the synthesiser — subclasses pass it nothing.
+    has_own_init: bool,
+}
+
+/// Collect [`RawClassInfo`] for every module-level class whose `class`
+/// keyword sits on a `class!` marker line.
+fn collect_raw_class_infos(body: &[Stmt], raw_starts: &[u32]) -> HashMap<String, RawClassInfo> {
+    let mut out = HashMap::new();
+    for stmt in body {
+        let Stmt::ClassDef(c) = stmt else { continue };
+        let class_start = u32::from(c.range.start());
+        let name_start = u32::from(c.name.range.start());
+        if !ClassMarkers::marker_covers(raw_starts, class_start, name_start) {
+            continue;
+        }
+        let fields = c
+            .body
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::AnnAssign(a) if !is_classvar_annotation(&a.annotation) => {
+                    match a.target.as_ref() {
+                        Expr::Name(n) => Some((
+                            n.id.as_str().to_owned(),
+                            (*a.annotation).clone(),
+                            a.value.as_deref().cloned(),
+                        )),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+        let first_base = c.arguments.as_deref().and_then(|args| {
+            args.args.first().and_then(|b| match b {
+                Expr::Name(n) => Some(n.id.as_str().to_owned()),
+                _ => None,
+            })
+        });
+        out.insert(
+            c.name.as_str().to_owned(),
+            RawClassInfo {
+                fields,
+                first_base,
+                has_own_init: body_has_init(&c.body),
+            },
+        );
+    }
+    out
+}
+
+/// The parameters of `name`'s synthesised constructor: those of its
+/// nearest in-module `class!` ancestor (recursively), then its own fields.
+/// A field re-declared by a subclass keeps the ancestor's position and
+/// takes the subclass's annotation and default. An ancestor that writes
+/// its own `__init__` contributes nothing (its parameters are unknown).
+fn raw_ctor_params(
+    name: &str,
+    infos: &HashMap<String, RawClassInfo>,
+    depth: usize,
+) -> Vec<(String, Expr, Option<Expr>)> {
+    let Some(info) = infos.get(name) else {
+        return Vec::new();
+    };
+    if info.has_own_init || depth > 32 {
+        return Vec::new();
+    }
+    let mut params: Vec<(String, Expr, Option<Expr>)> = info
+        .first_base
+        .as_deref()
+        .filter(|b| infos.get(*b).is_some_and(|p| !p.has_own_init))
+        .map(|b| raw_ctor_params(b, infos, depth + 1))
+        .unwrap_or_default();
+    for field in &info.fields {
+        if let Some(slot) = params.iter_mut().find(|p| p.0 == field.0) {
+            *slot = field.clone();
+        } else {
+            params.push(field.clone());
+        }
+    }
+    params
 }
 
 impl ClassMarkers<'_> {
@@ -2255,7 +2351,9 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             // this for classes that will receive the dataclass decorator —
             // pydantic models, protocols, and impl stubs keep their bodies
             // untouched. FINDINGS #62.
-            if needs_decorator && rewrite_mutable_field_defaults(&mut new_body) {
+            if needs_decorator
+                && rewrite_mutable_field_defaults(&mut new_body, markers.module_class_names)
+            {
                 body_transformed = true;
             }
             let mut new_class = c.clone();
@@ -2314,7 +2412,29 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
                 && !body_has_init(&new_class.body)
                 && !class_has_enum_base(c)
             {
-                let synthesised = synthesise_raw_class_init(&new_class.body);
+                // A `class!` whose first base is another in-module `class!`
+                // (without a hand-written `__init__`) inherits that base's
+                // constructor parameters and forwards them to
+                // `super().__init__(...)` — otherwise the grandchild lost the
+                // parent's defaults and, for a framework base, skipped its
+                // `__init__` entirely.
+                let inherited: Vec<(String, Expr, Option<Expr>)> = c
+                    .arguments
+                    .as_deref()
+                    .and_then(|args| args.args.first())
+                    .and_then(|b| match b {
+                        Expr::Name(n) => Some(n.id.as_str()),
+                        _ => None,
+                    })
+                    .filter(|b| {
+                        markers
+                            .raw_class_infos
+                            .get(*b)
+                            .is_some_and(|info| !info.has_own_init)
+                    })
+                    .map(|b| raw_ctor_params(b, markers.raw_class_infos, 0))
+                    .unwrap_or_default();
+                let synthesised = synthesise_raw_class_init(&new_class.body, &inherited);
                 // Place `__init__` after the leading run of (docstring +
                 // field annotations) so the class reads top-to-bottom:
                 // doc → fields → __init__ → methods.
@@ -2408,8 +2528,29 @@ fn make_dataclasses_dot_dataclass_decorator_frozen() -> Decorator {
 /// `true` if any field was rewritten so the caller can mark the body
 /// as transformed (and therefore the `import dataclasses` injection is
 /// triggered). FINDINGS #62.
-fn rewrite_mutable_field_defaults(body: &mut [Stmt]) -> bool {
+fn rewrite_mutable_field_defaults(
+    body: &mut [Stmt],
+    module_class_names: &std::collections::HashSet<String>,
+) -> bool {
     let mut changed = false;
+    // Names the class body itself binds: a lambda defined in the body
+    // cannot see them, so a default that mentions one is left alone.
+    let class_body_names: std::collections::HashSet<String> = body
+        .iter()
+        .filter_map(|s| match s {
+            Stmt::AnnAssign(a) => match a.target.as_ref() {
+                Expr::Name(n) => Some(n.id.as_str().to_owned()),
+                _ => None,
+            },
+            Stmt::Assign(a) => a.targets.iter().find_map(|t| match t {
+                Expr::Name(n) => Some(n.id.as_str().to_owned()),
+                _ => None,
+            }),
+            Stmt::FunctionDef(f) => Some(f.name.as_str().to_owned()),
+            Stmt::ClassDef(c) => Some(c.name.as_str().to_owned()),
+            _ => None,
+        })
+        .collect();
     for stmt in body.iter_mut() {
         let Stmt::AnnAssign(a) = stmt else { continue };
         // A `ClassVar[...]` field is a class-level constant, not an instance
@@ -2435,6 +2576,15 @@ fn rewrite_mutable_field_defaults(body: &mut [Stmt]) -> bool {
             // class body cannot see class-scope names, so `[SIZE]` (with
             // `SIZE` a class attribute) is left exactly as written.
             make_lambda_returning(value.as_ref().clone())
+        } else if is_instance_or_nonconstant_display_default(value, module_class_names)
+            && !mentions_any_name(value, &class_body_names)
+        {
+            // `p: P = P(x=1)` (an instance of a module class — unhashable
+            // unless the class is frozen, so `@dataclass` raises at import)
+            // or a display over module-level names (`[SIZE]`): a factory
+            // gives every instance a fresh value, which is what the source
+            // meant and what the VM does.
+            make_lambda_returning(value.as_ref().clone())
         } else {
             continue;
         };
@@ -2442,6 +2592,48 @@ fn rewrite_mutable_field_defaults(body: &mut [Stmt]) -> bool {
         changed = true;
     }
     changed
+}
+
+/// A call to one of this module's classes (`P(x=1)`) or a non-empty
+/// container display that is not purely constant (`[SIZE]`, `{k: f()}`).
+fn is_instance_or_nonconstant_display_default(
+    value: &Expr,
+    module_class_names: &std::collections::HashSet<String>,
+) -> bool {
+    match value {
+        Expr::Call(call) => matches!(
+            call.func.as_ref(),
+            Expr::Name(n) if module_class_names.contains(n.id.as_str())
+        ),
+        Expr::List(l) => !l.elts.is_empty(),
+        Expr::Set(s) => !s.elts.is_empty(),
+        Expr::Dict(d) => !d.items.is_empty(),
+        _ => false,
+    }
+}
+
+/// `true` when `expr` reads any of `names` (at any depth).
+fn mentions_any_name(expr: &Expr, names: &std::collections::HashSet<String>) -> bool {
+    struct V<'a> {
+        names: &'a std::collections::HashSet<String>,
+        found: bool,
+    }
+    impl ruff_python_ast::visitor::Visitor<'_> for V<'_> {
+        fn visit_expr(&mut self, e: &Expr) {
+            if let Expr::Name(n) = e {
+                if self.names.contains(n.id.as_str()) {
+                    self.found = true;
+                }
+            }
+            ruff_python_ast::visitor::walk_expr(self, e);
+        }
+    }
+    let mut v = V {
+        names,
+        found: false,
+    };
+    ruff_python_ast::visitor::walk_expr(&mut v, expr);
+    v.found
 }
 
 /// A non-empty `list` / `dict` / `set` display whose every element (and, for a
@@ -3375,7 +3567,7 @@ fn strip_field_defaults(body: &mut [Stmt]) {
 /// shape for `Exception` subclasses — `raise AppError("oops")` must reach
 /// `Exception.__init__("oops")` — and works for any other framework base
 /// whose constructor accepts positional or keyword arguments.
-fn synthesise_raw_class_init(body: &[Stmt]) -> Stmt {
+fn synthesise_raw_class_init(body: &[Stmt], inherited: &[(String, Expr, Option<Expr>)]) -> Stmt {
     use ruff_python_ast::{StmtAnnAssign, StmtFunctionDef};
     // Collect (name, annotation, optional default) for each top-level
     // annotated field. Non-Name targets (subscript / attribute annotations)
@@ -3408,9 +3600,10 @@ fn synthesise_raw_class_init(body: &[Stmt]) -> Stmt {
         })
         .collect();
 
-    // No annotated fields → emit a `super()`-passthrough so positional and
-    // keyword arguments reach the parent constructor unchanged.
-    if raw_fields.is_empty() {
+    // No annotated fields anywhere in the chain → emit a `super()`-passthrough
+    // so positional and keyword arguments reach the parent constructor
+    // unchanged.
+    if raw_fields.is_empty() && inherited.is_empty() {
         return Stmt::FunctionDef(StmtFunctionDef {
             node_index: AtomicNodeIndex::NONE,
             range: TextRange::default(),
@@ -3452,12 +3645,26 @@ fn synthesise_raw_class_init(body: &[Stmt]) -> Stmt {
         });
     }
 
+    // The constructor takes the ancestor chain's parameters first, then the
+    // class's own fields (a re-declared field keeps its inherited slot).
+    let mut all_params: Vec<(String, Expr, Option<Expr>)> = inherited.to_vec();
+    for (name, annotation, default) in &raw_fields {
+        let own = (
+            name.as_str().to_owned(),
+            annotation.clone(),
+            default.clone(),
+        );
+        if let Some(slot) = all_params.iter_mut().find(|p| p.0 == own.0) {
+            *slot = own;
+        } else {
+            all_params.push(own);
+        }
+    }
     // Stable partition: non-defaulted params first, then defaulted ones.
-    let (no_default, with_default): (Vec<_>, Vec<_>) = raw_fields
-        .iter()
-        .cloned()
+    let (no_default, with_default): (Vec<_>, Vec<_>) = all_params
+        .into_iter()
         .partition(|(_, _, default)| default.is_none());
-    let fields: Vec<(&Name, Expr, Option<Expr>)> =
+    let fields: Vec<(String, Expr, Option<Expr>)> =
         no_default.into_iter().chain(with_default).collect();
 
     // Build the parameter list: `self` + one entry per field.
@@ -3487,14 +3694,19 @@ fn synthesise_raw_class_init(body: &[Stmt]) -> Stmt {
         });
     }
 
-    // Build the body: `super().__init__()` followed by `self.x = x` …
-    // Assignments use source order (the `raw_fields` order, not the
-    // partitioned signature order) so the body reads top-to-bottom like
-    // the original class definition.
+    // Build the body: `super().__init__(<inherited as keywords>)` followed
+    // by `self.x = x` for the class's own fields. Assignments use source
+    // order (the `raw_fields` order, not the partitioned signature order)
+    // so the body reads top-to-bottom like the original class definition.
+    // Fields the subclass re-declares are assigned by the ancestor's
+    // constructor (they travel through `super().__init__`), not here.
+    let inherited_names: Vec<&str> = inherited.iter().map(|(n, _, _)| n.as_str()).collect();
     let mut new_body: Vec<Stmt> = Vec::with_capacity(raw_fields.len() + 1);
-    new_body.push(make_super_init_call_stmt());
+    new_body.push(make_super_init_call_with_kwargs(&inherited_names));
     for (name, _, _) in &raw_fields {
-        new_body.push(make_self_field_assign_stmt(name.as_str()));
+        if !inherited_names.contains(&name.as_str()) {
+            new_body.push(make_self_field_assign_stmt(name.as_str()));
+        }
     }
 
     Stmt::FunctionDef(StmtFunctionDef {
@@ -3516,6 +3728,28 @@ fn synthesise_raw_class_init(body: &[Stmt]) -> Stmt {
         returns: Some(Box::new(make_none_expr())),
         body: new_body,
     })
+}
+
+/// `super().__init__(a=a, b=b)` as an expression statement — the inherited
+/// constructor parameters forwarded by keyword, so the ancestor's own
+/// parameter order never matters.
+fn make_super_init_call_with_kwargs(names: &[&str]) -> Stmt {
+    let Stmt::Expr(mut stmt) = make_super_init_call_stmt() else {
+        unreachable!("make_super_init_call_stmt builds an expression statement");
+    };
+    if let Expr::Call(call) = stmt.value.as_mut() {
+        let keywords: Vec<ruff_python_ast::Keyword> = names
+            .iter()
+            .map(|name| ruff_python_ast::Keyword {
+                range: TextRange::default(),
+                node_index: AtomicNodeIndex::NONE,
+                arg: Some(make_identifier(name)),
+                value: make_bare_name_expr(name),
+            })
+            .collect();
+        call.arguments.keywords = keywords.into_boxed_slice();
+    }
+    Stmt::Expr(stmt)
 }
 
 /// `super().__init__()` as an expression statement.
@@ -4638,6 +4872,75 @@ mod tests {
     }
 
     #[test]
+    fn raw_class_chain_forwards_inherited_fields_to_super_init() {
+        // `Grand` inherits `Child`'s constructor parameters (with their
+        // defaults), forwards them by keyword to `super().__init__`, and
+        // assigns only its own field. `Net(Module)` shows the framework
+        // base still being initialised first.
+        let src = "\
+class Base:
+    def __init__(self) -> None:
+        pass
+
+class Child(Base):
+    a: int
+    b: int = 2
+
+class Grand(Child):
+    c: str
+";
+        let parsed = tyc_syntax::parse_module(src).expect("parse failed");
+        let module = parsed.into_syntax();
+        let starts: Vec<u32> = ["class Child", "class Grand"]
+            .iter()
+            .map(|needle| src.find(needle).unwrap() as u32)
+            .collect();
+        let out = desugar_module_with(
+            &module,
+            DesugarOptions {
+                raw_class_line_starts: starts,
+                ..Default::default()
+            },
+        );
+        let emitted = emit(&out.module);
+        assert!(
+            emitted.contains("def __init__(self, a: int, c: str, b: int = 2) -> None:"),
+            "grandchild takes the whole chain, required first:\n{emitted}"
+        );
+        assert!(
+            emitted.contains("super(Grand, self).__init__(a=a, b=b)"),
+            "inherited fields are forwarded by keyword:\n{emitted}"
+        );
+        assert!(
+            emitted.contains("self.c = c"),
+            "own field assigned locally:\n{emitted}"
+        );
+        assert!(
+            emitted.contains("def __init__(self, a: int, b: int = 2) -> None:"),
+            "the parent keeps its own constructor:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn dataclass_instance_and_nonconstant_display_defaults_become_factories() {
+        let out = parse_and_desugar(
+            "class P:\n    x: int\n\nSIZE: int = 3\n\nclass C:\n    p: P = P(x=1)\n    xs: list[int] = [SIZE]\n",
+        );
+        assert!(
+            out.contains("p: P = dataclasses.field(default_factory=lambda: P(x=1))"),
+            "{out}"
+        );
+        assert!(
+            out.contains("xs: list[int] = dataclasses.field(default_factory=lambda: [SIZE])"),
+            "{out}"
+        );
+        // A display that reads a class-body attribute cannot move into a
+        // lambda (class scope is invisible there): left as written.
+        let out = parse_and_desugar("class C:\n    SIZE: int = 3\n    xs: list[int] = [SIZE]\n");
+        assert!(out.contains("xs: list[int] = [SIZE]"), "{out}");
+    }
+
+    #[test]
     fn plain_class_gets_dataclass_decorator() {
         let src = "class Point:\n    x: int\n    y: int\n";
         let out = parse_and_desugar(src);
@@ -4697,13 +5000,21 @@ mod tests {
             out.contains("default_factory=lambda: {1, -2}"),
             "non-empty set default must become a lambda factory; got:\n{out}"
         );
-        // A literal that names anything is left alone: a class-body lambda
-        // cannot see class-scope names, so the rewrite would change meaning.
+        // A literal that names a *class-body* symbol is left alone: a
+        // class-body lambda cannot see class scope, so the rewrite would
+        // turn a working default into a `NameError`. A literal that only
+        // names things from an outer scope is still wrapped -- `@dataclass`
+        // rejects the unhashable default either way, and the lambda body
+        // resolves the name exactly as the class body would have.
         let src = "class B:\n    SIZE: ClassVar[int] = 3\n    xs: list[int] = [SIZE]\n    ys: list[int] = [f()]\n";
         let out = parse_and_desugar(src);
         assert!(
-            !out.contains("default_factory"),
-            "a literal with a name inside must not be wrapped; got:\n{out}"
+            out.contains("xs: list[int] = [SIZE]"),
+            "a literal naming a class-body symbol must not be wrapped; got:\n{out}"
+        );
+        assert!(
+            out.contains("default_factory=lambda: [f()]"),
+            "a literal naming only outer-scope symbols is still wrapped; got:\n{out}"
         );
     }
 

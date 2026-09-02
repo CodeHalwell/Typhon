@@ -1035,7 +1035,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                     if let Some(builtin) = cls_name.strip_prefix("__typhon_builtin_ext_") {
                         let entry = builtin_ext_registry.entry(builtin.to_owned()).or_default();
                         for method_name in shape.methods.keys() {
-                            let fn_name = format!("__typhon_ext_{builtin}__{method_name}");
+                            let fn_name = format!("__typhon_ext_{builtin}__{method_name}__");
                             entry.entry(method_name.clone()).or_insert_with(|| {
                                 cross_module_fns.insert(fn_name.clone(), mod_name.to_string());
                                 fn_name
@@ -2881,13 +2881,13 @@ class Err(Generic[_E]):
 
 # Use `typing.Union` rather than PEP 695 `type Result[T, E] = …` so the
 # generated runtime loads under Python 3.10 / 3.11 / 3.12 as well as the
-# 3.13+ default. The runtime never inspects the alias's generic
-# parameters — `isinstance(x, Err)` and the dataclass shape are what the
-# rest of the runtime relies on — so dropping the parameters here is
-# harmless. Static type checkers still see `Result` as a union of `Ok`
-# and `Err`.
+# 3.13+ default. The alias is parameterised over the same type variables
+# as `Ok` / `Err`, so `Result[int, str]` is a real generic alias:
+# `typing.get_type_hints` resolves a `Result[int, str]` field instead of
+# raising `TypeError: ... is not a generic class`. The runtime itself only
+# relies on `isinstance(x, Err)` and the dataclass shape.
 from typing import TypeAlias, Union
-Result: TypeAlias = Union[Ok, Err]
+Result: TypeAlias = Union[Ok[_T], Err[_E]]
 
 
 def try_result(thunk, on_err=None):
@@ -3148,6 +3148,68 @@ class _LazyValue:
 
     def __abs__(self) -> object:
         return abs(self._materialise())
+
+    def __invert__(self) -> object:
+        return ~self._materialise()
+
+    def __ne__(self, other: object) -> bool:
+        return self._materialise() != other
+
+    def __matmul__(self, other: object) -> object:
+        return self._materialise() @ other
+
+    def __rmatmul__(self, other: object) -> object:
+        return other @ self._materialise()
+
+    def __divmod__(self, other: object) -> object:
+        return divmod(self._materialise(), other)
+
+    def __rdivmod__(self, other: object) -> object:
+        return divmod(other, self._materialise())
+
+    def __round__(self, ndigits: object = None) -> object:
+        value = self._materialise()
+        return round(value) if ndigits is None else round(value, ndigits)
+
+    def __trunc__(self) -> object:
+        import math
+        return math.trunc(self._materialise())
+
+    def __floor__(self) -> object:
+        import math
+        return math.floor(self._materialise())
+
+    def __ceil__(self) -> object:
+        import math
+        return math.ceil(self._materialise())
+
+    def __int__(self) -> int:
+        return int(self._materialise())
+
+    def __float__(self) -> float:
+        return float(self._materialise())
+
+    def __complex__(self) -> complex:
+        return complex(self._materialise())
+
+    def __index__(self) -> int:
+        import operator
+        return operator.index(self._materialise())
+
+    def __format__(self, spec: str) -> str:
+        return format(self._materialise(), spec)
+
+    def __contains__(self, item: object) -> bool:
+        return item in self._materialise()
+
+    def __reversed__(self) -> object:
+        return reversed(self._materialise())
+
+    def __enter__(self) -> object:
+        return self._materialise().__enter__()
+
+    def __exit__(self, *exc: object) -> object:
+        return self._materialise().__exit__(*exc)
 
     def __invert__(self) -> object:
         return ~self._materialise()
@@ -3473,6 +3535,13 @@ const TYPHON_RUNTIME_FREEZE_PY: &str = "\
 \"\"\"Deep-freeze helper backing Typhon's `freeze let` keyword.\"\"\"
 from __future__ import annotations
 
+import datetime as _datetime
+import decimal as _decimal
+import enum as _enum
+import fractions as _fractions
+import pathlib as _pathlib
+import types as _types
+import uuid as _uuid
 from types import MappingProxyType
 from typing import Any
 
@@ -3486,6 +3555,22 @@ _FROZEN_PRIMITIVES = (
     complex,
     type(Ellipsis),
     type(NotImplemented),
+    # Immutable stdlib value types: an enum member, a date / time /
+    # timedelta / tzinfo, a Decimal or Fraction, a (Pure)Path, a UUID, a
+    # class object or a function. None of them can be mutated through the
+    # frozen value, so they pass through like the primitives above.
+    _enum.Enum,
+    _datetime.date,
+    _datetime.time,
+    _datetime.timedelta,
+    _datetime.tzinfo,
+    _decimal.Decimal,
+    _fractions.Fraction,
+    _pathlib.PurePath,
+    _uuid.UUID,
+    type,
+    _types.FunctionType,
+    _types.BuiltinFunctionType,
 )
 
 # Containers that are already immutable at runtime — pass through unchanged.
@@ -3496,7 +3581,8 @@ def deep_freeze(value: Any) -> Any:
     \"\"\"Return a deeply-immutable version of *value*.
 
     Recursively replaces `list → tuple`, `dict → MappingProxyType`,
-    `set → frozenset`. Primitives, strings, and already-immutable
+    `set → frozenset`. Primitives, strings, immutable stdlib values
+    (enum members, dates, Decimals, Paths, UUIDs, …) and already-immutable
     containers are returned as-is. Raises `TypeError` when *value*
     holds something with no clean immutable equivalent so users find
     out at startup rather than via a subtle aliasing bug later.

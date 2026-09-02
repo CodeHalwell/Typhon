@@ -3376,6 +3376,8 @@ fn builtin_names() -> std::collections::HashSet<&'static str> {
         "Ellipsis",
         "NotImplemented",
         "__name__",
+        // Synthesised by the `pub` lowering (and legal to read in any module).
+        "__all__",
         "__file__",
         "__doc__",
         "__builtins__",
