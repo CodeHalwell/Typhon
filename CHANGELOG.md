@@ -334,6 +334,19 @@ tuple. And `Path.touch(mode=0o600)` discarded its mode, creating the file
 `0644` under the usual umask — the mode now applies to a file the call
 creates, leaving an existing one's permissions alone, as CPython does.
 
+**The differential harness told a half-truth about its own coverage.** 134
+units "agree" only because both sides fail with empty stdout, and the summary
+called that "usually an uninstalled third-party import". Only 92 are. The
+other 42 type-check, build, and then crash *the same way* under the VM and
+under CPython — so the VM is a faithful drop-in there and the gate is right
+not to flag them, but the accepted program is still wrong, and reading them
+as a missing package hid that. The two populations are counted and explained
+apart now (`vacuous` / `vacuous-runtime`). Auditing the second: 29 pass `tyc
+check` with no diagnostic at all, three of those are harness artefacts (no
+argv, no stdin, a traceback fixture), and every one of the remaining 26
+reproduces a limitation the beta-readiness review already lists. Nothing
+unknown was hiding there — but nothing was watching either.
+
 **A prelude name that only the VM could resolve.** `BaseModel` and
 `NewType` resolve without an import — the `model` and `newtype` lowerings
 introduce them — so naming either directly passes `tyc check`. Their

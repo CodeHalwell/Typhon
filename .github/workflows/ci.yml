@@ -185,7 +185,8 @@ jobs:
         with:
           python-version: "3.13"
 
-      # The per-unit classifications (ok / diverge / vacuous) depend on which
+      # The per-unit classifications (ok / diverge / vacuous / vacuous-runtime)
+      # depend on which
       # third-party packages the ambient python3.13 can import — see the
       # header of scripts/differential-baseline.txt. The baseline was recorded
       # with pydantic and PyYAML importable (every `model` class needs

@@ -456,6 +456,27 @@ with every gate green at each step.
   `typhon.toml` and no sources, and none fails without a code. The
   sweep did turn up two units written against `"Node"?`, which the
   preprocessor did not accept; that is fixed and both now build.
+
+- **The differential's "vacuous" bucket was hiding a second population.**
+  134 units agree only because both sides fail with empty stdout, which the
+  harness described as "usually an uninstalled third-party import". Only 92
+  are that. The other 42 type-check, build, and then crash *the same way*
+  under the VM and under CPython — so the VM is a faithful drop-in and the
+  gate is right not to flag them, but the accepted program is still wrong.
+  29 of those pass `tyc check` with no diagnostic at all (three are harness
+  artefacts: a CLI example with no argv, an `input()` probe with no stdin,
+  and the traceback fixture, which exists to raise). Every one of the
+  remaining 26 reproduces a limitation already listed above — the
+  attribute-narrowing hole (`h8`, `n3`, `n3b`, `t20`, `h67`), the dict
+  mutators (`s1b`, `s1d`, `s1e`), unchecked lambda bodies (`h10`), a
+  generic body's `T` (`s3`), `slots` attribute writes (`h89`), covariant
+  interface fields (`n5`), field redeclaration (`h64`), union subscripting
+  (`s2d`, `s5`), `int ** int` (`h101`), tuple-unpack arity (`s7`), `for`
+  over a non-iterable (`s8`), positional-only by keyword (`s112`), and the
+  `*args`/`**kwargs` gaps (`h22`, `h23`). Nothing unknown was hiding there,
+  which is the reassuring half; the harness now reports the two populations
+  separately (`vacuous` / `vacuous-runtime`) so the second cannot be read as
+  a missing package again.
 - ~~**`tyc run --compile <file>` diagnostics name the scaffold.**~~ Closed:
   the staged build reports diagnostics under the path the user gave, and
   the scaffold turns on `traceback-remap`, so an uncaught exception's

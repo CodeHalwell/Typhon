@@ -33,6 +33,15 @@
 # probe below is probabilistic — a coarse enough value repeats on both sides
 # and is then reported as a new divergence. See that file's header.
 #
+# A unit where BOTH sides fail with empty stdout proves nothing, so it is
+# never counted as a pass. The two reasons are reported apart, because they
+# say different things: `vacuous` is an import this machine does not have
+# (an environment fact), while `vacuous-runtime` means the program
+# type-checked, built, and then crashed *the same way* on both surfaces —
+# the VM is a faithful drop-in there and the accepted program is the problem.
+# Every current `vacuous-runtime` unit is a reproduction of a limitation
+# already listed in docs/beta-readiness-review-2026-09-01.md.
+#
 # Everything is network-free (TYC_NO_SYNC / TYC_NO_INTROSPECT) and needs only
 # bash, coreutils, a release `tyc`, and python3.13.
 #
@@ -326,10 +335,20 @@ TOML
     if cmp -s "$work/cpy.out" "$work/vm.out" && [ "$ccode" = "$vcode" ]; then
         # Agreement is only meaningful if at least one side actually produced
         # output or succeeded. Both-crash-with-empty-stdout agreement is a
-        # vacuous pass (typically a missing third-party import); count it
-        # separately so the summary cannot overstate real coverage.
+        # vacuous pass; count it separately so the summary cannot overstate
+        # real coverage. The two reasons are very different, so say which:
+        # an uninstalled third-party import is an environment fact, while a
+        # *shared runtime failure* means the program type-checked, built and
+        # then crashed the same way on both surfaces — a compiler limitation
+        # rather than a missing package.
         if [ ! -s "$work/cpy.out" ] && [ "$ccode" -ne 0 ]; then
-            printf '%s\t%s\t%s\n' "vacuous" "$unit" "both failed, empty stdout (exit=$ccode)"
+            if grep -qE '^(ModuleNotFoundError|ImportError)' "$work/cpy.err"; then
+                printf '%s\t%s\t%s\n' "vacuous" "$unit" "both failed, empty stdout — uninstalled import (exit=$ccode)"
+            else
+                reason=$(grep -oE '^[A-Za-z_.]*(Error|Exception)[A-Za-z]*' "$work/cpy.err" | tail -1)
+                [ -z "$reason" ] && reason="no exception"
+                printf '%s\t%s\t%s\n' "vacuous-runtime" "$unit" "both failed the same way at runtime — $reason (exit=$ccode)"
+            fi
         elif [ "$declared" = "1" ]; then
             # Listed as nondeterministic, yet both sides agreed this run. Weak
             # evidence the entry is stale — surfaced as a warning below, never a
@@ -410,6 +429,7 @@ fi
 count() { grep -cP "^$1\t" "$RESULTS" || true; }
 N_OK=$(count ok); N_DIV=$(count diverge); N_NOBUILD=$(count nobuild)
 N_NOENTRY=$(count noentry); N_VAC=$(count vacuous)
+N_VACRT=$(count vacuous-runtime)
 N_TMO=$(count both-timeout); N_ND=$(count nondeterministic)
 N_NOCOMPILE=$(count noncompiling)
 
@@ -428,7 +448,8 @@ fi
 echo "results over $TOTAL unit(s):"
 printf '  %-18s %5d   %s\n' "ok"               "$N_OK"      "stdout + exit code agree"
 printf '  %-18s %5d   %s\n' "diverge"          "$N_DIV"     "VM disagrees with CPython"
-printf '  %-18s %5d   %s\n' "vacuous"          "$N_VAC"     "agree only because both failed with empty stdout"
+printf '  %-18s %5d   %s\n' "vacuous"          "$N_VAC"     "agree only because an import is not installed here"
+printf '  %-18s %5d   %s\n' "vacuous-runtime"  "$N_VACRT"   "agree only because both crashed the same way at runtime"
 printf '  %-18s %5d   %s\n' "noncompiling"     "$N_NOCOMPILE" "emitted .py that CPython cannot compile — an EMITTER bug"
 printf '  %-18s %5d   %s\n' "nobuild"          "$N_NOBUILD" "tyc build failed — not comparable"
 printf '  %-18s %5d   %s\n' "noentry"          "$N_NOENTRY" "built but emitted no build/main.py"
@@ -436,10 +457,22 @@ printf '  %-18s %5d   %s\n' "nondeterministic" "$N_ND"      "not comparable (sel
 printf '  %-18s %5d   %s\n' "both-timeout"     "$N_TMO"     "both sides hit the ${TIMEOUT}s limit"
 echo
 
-if [ "$N_VAC" -gt 0 ]; then
-    echo "note: $N_VAC unit(s) 'agree' only because both execution paths failed with"
-    echo "      empty stdout (usually an uninstalled third-party import). They are"
-    echo "      NOT counted as passes; they are not real differential coverage."
+if [ "$N_VAC" -gt 0 ] || [ "$N_VACRT" -gt 0 ]; then
+    echo "note: $((N_VAC + N_VACRT)) unit(s) 'agree' only because both execution paths failed"
+    echo "      with empty stdout. They are NOT counted as passes; they are not real"
+    echo "      differential coverage."
+    if [ "$N_VAC" -gt 0 ]; then
+        echo "      $N_VAC of them fail on an import this machine does not have — an"
+        echo "      environment fact, not a compiler one."
+    fi
+    if [ "$N_VACRT" -gt 0 ]; then
+        echo "      $N_VACRT type-checked, built, and then crashed *the same way* on both"
+        echo "      surfaces. The VM is doing its job there; the accepted program is"
+        echo "      the problem. Each maps to a known limitation in the beta-readiness"
+        echo "      review — list them with:"
+        echo "          scripts/vm-differential.sh --report /tmp/r.tsv \\"
+        echo "            && grep '^vacuous-runtime' /tmp/r.tsv"
+    fi
     echo
 fi
 
@@ -551,7 +584,7 @@ COVERED="$SCRATCH/covered_expected.txt"
 comm -12 "$EXPECTED" <(sort -u "$UNITS") > "$COVERED"
 
 # "Fixed" requires a genuinely comparable, non-divergent run — i.e. class
-# `ok`. A baseline entry classified vacuous/nobuild/noentry/nondeterministic/
+# `ok`. A baseline entry classified vacuous/vacuous-runtime/nobuild/noentry/nondeterministic/
 # both-timeout was not COMPARED in this environment (typically a third-party
 # package the recording environment had installed is missing here — see the
 # baseline header), so it is neither fixed nor regressed: report it as
