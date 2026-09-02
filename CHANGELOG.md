@@ -347,6 +347,28 @@ argv, no stdin, a traceback fixture), and every one of the remaining 26
 reproduces a limitation the beta-readiness review already lists. Nothing
 unknown was hiding there — but nothing was watching either.
 
+**A diagnostic could be rendered against the wrong buffer.** Found by
+sweeping `tyc check` over the corpus and asking, of every diagnostic, only
+that its anchor line exist and not be blank. One unit failed
+(`stress/…/07-sdk-client`), and behind it was a renderer bug rather than a
+mapping one.
+
+`tyc check` groups diagnostics by file and — for speed, since sanitising
+the source listing is O(file) — sanitised the **first** diagnostic's source
+and lent that buffer to every other diagnostic in the group. Diagnostics in
+one file do not all carry the same buffer: most are remapped onto the
+original `.ty` text, but any that isn't still carries the preprocessed one.
+Lending that to a remapped diagnostic renders its original-coordinate span
+against preprocessed text. Here it put a `tyc::type_mismatch` two lines
+off, inside a comment, under a line reading `dict[str, object] | None`
+where the source says `?` — the user is pointed at a line that shows
+something else, and the lowering leaks into the listing. The cache is keyed
+by the buffer a diagnostic actually carries now, which keeps the one
+sanitise per file in the common case where they do all share one.
+
+With that fixed, every diagnostic across the corpus anchors on a real,
+non-blank line of the file it names.
+
 **Three formatter bugs, found by auditing what `tyc fmt` does to the whole
 corpus.** Nobody had run the formatter over `examples/` and `stress/` and
 asked the three questions that matter — does it converge, does it accept

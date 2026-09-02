@@ -1456,6 +1456,72 @@ fn fmt_reports_a_broken_file_and_still_formats_the_rest() {
 }
 
 #[test]
+fn diagnostics_in_one_file_keep_their_own_source() {
+    // The renderer sanitised the FIRST diagnostic of a file and lent that
+    // buffer to every other one in the group. Diagnostics grouped by file
+    // do not all carry the same buffer: most are remapped onto the
+    // original `.ty` text, but any that isn't still carries the
+    // preprocessed one. Lending that to a remapped diagnostic renders its
+    // original-coordinate span against preprocessed text — which put a
+    // `tyc::type_mismatch` two lines off, inside a comment, under a line
+    // reading `dict[str, object] | None` where the source says `?`.
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("k.ty");
+    std::fs::write(
+        &file,
+        concat!(
+            "class E:\n",        // 1
+            "    status: int\n", // 2
+            "\n",                // 3
+            "\n",                // 4
+            "class SDK:\n",      // 5
+            "    url: str\n",    // 6
+            "\n",                // 7
+            "\n",                // 8
+            "impl SDK:\n",       // 9
+            // The `?` here lengthens the preprocessed line by six bytes,
+            // which is what drags every later span out of alignment.
+            "    def req(self, body: dict[str, object]?) -> Result[dict[str, object], E]:\n", // 10
+            "        # a comment\n",                                                          // 11
+            "        if body is None:\n",                                                     // 12
+            "            return Ok({\"a\": 1})\n", // 13  <- the mismatch
+            "        return Err(E(status=404))\n", // 14
+            "\n",                                  // 15
+            "\n",                                  // 16
+            "def main() -> None:\n",               // 17
+            "    let u: int = 1\n",                // 18
+            "    match u:\n",                      // 19
+            "        case int(u): print(u)\n",     // 20
+        ),
+    )
+    .unwrap();
+
+    let out = tyc().arg("check").arg(&file).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let block = stderr
+        .split("type mismatch")
+        .nth(1)
+        .unwrap_or_else(|| panic!("expected a type mismatch:\n{stderr}"));
+    let anchor = block
+        .lines()
+        .find(|l| l.contains("╭─["))
+        .unwrap_or_else(|| panic!("no anchor line:\n{stderr}"));
+    assert!(
+        anchor.contains("k.ty:13:"),
+        "the mismatch is on line 13; got {anchor}\n{stderr}"
+    );
+    // And the rendered listing is the user's source, not the lowering.
+    assert!(
+        !stderr.contains("dict[str, object] | None"),
+        "the preprocessed form leaked into the listing:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("__typhon_impl_"),
+        "the impl lowering leaked into the listing:\n{stderr}"
+    );
+}
+
+#[test]
 fn build_fails_on_type_error() {
     let tmp = tempfile::tempdir().unwrap();
     scaffold(tmp.path(), "let x: int = \"wrong type\"\n");

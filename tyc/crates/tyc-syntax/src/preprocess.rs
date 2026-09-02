@@ -7077,21 +7077,25 @@ fn question_is_parameter_annotation(
 /// annotation. Which bracket is open is what tells the two apart, and it
 /// lives on an earlier line, so it is computed once per source here.
 fn line_entry_brackets(source: &str) -> Vec<QLineContext> {
+    // One shared mask over the whole source rather than a per-line kinds
+    // vector: this runs on every line of every file in three passes, and
+    // the allocation showed up on the build pipeline's timing.
+    let mask = LexMask::new(source);
+    let bytes = source.as_bytes();
     let mut stack: Vec<u8> = Vec::new();
-    let mut in_string: Option<StringMode> = None;
     let mut out: Vec<QLineContext> = Vec::new();
     let mut head = 0usize;
+    let mut start = 0usize;
     for (index, line) in source.split_inclusive('\n').enumerate() {
-        if stack.is_empty() && in_string.is_none() {
+        if stack.is_empty() && !mask.line_starts_in_string(index) {
             head = index;
         }
         out.push(QLineContext {
             bracket: stack.last().copied(),
             head_line: head,
         });
-        let kinds = crate::lexmask::scan_line_kinds(line, &mut in_string);
-        for (i, b) in line.bytes().enumerate() {
-            if !matches!(kinds.get(i), Some(ByteKind::Code)) {
+        for (offset, &b) in bytes[start..start + line.len()].iter().enumerate() {
+            if !mask.is_structural_code(start + offset) {
                 continue;
             }
             match b {
@@ -7102,6 +7106,7 @@ fn line_entry_brackets(source: &str) -> Vec<QLineContext> {
                 _ => {}
             }
         }
+        start += line.len();
     }
     out
 }
@@ -7135,6 +7140,13 @@ struct QContext<'a> {
 
 /// Per-line `?` context for `source`, indexed by physical line.
 fn q_contexts(source: &str) -> Vec<QContext<'_>> {
+    // Nothing to classify in a source with no `?` in it, which is most of
+    // them. The callers read this table through `get(..).unwrap_or_default()`,
+    // so an empty one is the same as a table of defaults — and it saves a
+    // whole-source lexical scan per pass on every file that never needs it.
+    if !source.contains('?') {
+        return Vec::new();
+    }
     let lines: Vec<&str> = source.split_inclusive('\n').collect();
     line_entry_brackets(source)
         .into_iter()

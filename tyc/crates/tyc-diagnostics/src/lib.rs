@@ -5063,6 +5063,45 @@ pub fn sanitised_named_source_for(err: &TycError) -> Option<NamedSource<String>>
     Some(NamedSource::new(src.name(), cleaned))
 }
 
+/// A sanitised-source cache for one render pass.
+///
+/// Sanitising is O(file), so a renderer that calls it per diagnostic is
+/// O(n_diags × file_size). The obvious fix — sanitise the first diagnostic
+/// of a file and reuse it for the rest — is wrong: diagnostics grouped by
+/// file do NOT all carry the same buffer. Most are remapped onto the
+/// original `.ty` text, but any that isn't still carries the preprocessed
+/// one, and lending that buffer to a remapped diagnostic renders its
+/// (original-coordinate) span against preprocessed text. In `stress/…/
+/// 07-sdk-client` that put a `tyc::type_mismatch` two lines off, inside a
+/// comment, under a line showing `dict[str, object] | None` where the
+/// source says `?`.
+///
+/// So the cache is keyed by the buffer a diagnostic actually carries. In
+/// the common case (every diagnostic remapped onto the same source) that
+/// is still one sanitise per file.
+#[derive(Default)]
+pub struct SanitisedSourceCache {
+    entries: Vec<(String, NamedSource<String>)>,
+}
+
+impl SanitisedSourceCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The sanitised source for `err`'s own buffer, or `None` when the
+    /// diagnostic embeds no source at all.
+    pub fn get(&mut self, err: &TycError) -> Option<NamedSource<String>> {
+        let src = err.embedded_source()?;
+        if let Some((_, cached)) = self.entries.iter().find(|(raw, _)| raw == src.inner()) {
+            return Some(cached.clone());
+        }
+        let cleaned = NamedSource::new(src.name(), sanitize_synthetic_source(src.inner()));
+        self.entries.push((src.inner().to_owned(), cleaned.clone()));
+        Some(cleaned)
+    }
+}
+
 impl std::fmt::Debug for SanitisedDiagnostic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(&self.inner, f)
@@ -6073,6 +6112,46 @@ mod tests {
         assert!(matches!(e, TycError::ContainsSecretLiteral { .. }));
         let msg = e.to_string();
         assert!(msg.contains("API_KEY"), "binding name should appear");
+    }
+
+    #[test]
+    fn sanitised_cache_gives_each_diagnostic_its_own_source() {
+        // The cache must be keyed by the buffer a diagnostic actually
+        // carries, not by the file it belongs to: two diagnostics in one
+        // file can hold different buffers (one remapped onto the `.ty`
+        // text, one still on the preprocessed one), and lending the first's
+        // buffer to the second renders its span against the wrong text.
+        let original = "impl SDK:\n    def req(self, b: int?) -> int:\n        return b\n";
+        let preprocessed = concat!(
+            "class __typhon_impl_SDK(object):\n",
+            "    def req(self, b: int | None) -> int:\n",
+            "        return b\n",
+        );
+        let a = TycError::parse("k.ty", original, "boom", 0);
+        let b = TycError::parse("k.ty", preprocessed, "boom", 0);
+
+        let mut cache = SanitisedSourceCache::new();
+        let sa = cache.get(&a).expect("source a");
+        let sb = cache.get(&b).expect("source b");
+        assert_eq!(
+            sa.inner().as_str(),
+            original,
+            "a diagnostic on the original source keeps it verbatim"
+        );
+        assert!(
+            !sb.inner().contains("__typhon_impl_"),
+            "the preprocessed one is still sanitised: {}",
+            sb.inner()
+        );
+        assert_ne!(
+            sa.inner(),
+            sb.inner(),
+            "the two must not be given the same buffer"
+        );
+        // Asking again for the same buffer reuses the cached entry rather
+        // than sanitising a second time.
+        let again = cache.get(&b).expect("source b again");
+        assert_eq!(again.inner(), sb.inner());
     }
 
     #[test]

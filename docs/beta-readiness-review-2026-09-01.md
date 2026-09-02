@@ -575,6 +575,22 @@ with every gate green at each step.
   statement, still inside a guard so a library import never installs a
   hook.
 
+- **Every diagnostic now anchors on a line that says what it claims.** The
+  last unaudited user-facing surface: sweep `tyc check` over the corpus and
+  check, of every diagnostic, only that its anchor line exists and is not
+  blank. One unit failed, and behind it was a renderer bug. `tyc check`
+  groups diagnostics by file and — sanitising the listing being O(file) —
+  reused the *first* diagnostic's sanitised source for the whole group.
+  They do not all carry the same buffer: most are remapped onto the
+  original `.ty` text, but any that isn't still carries the preprocessed
+  one, and lending that to a remapped diagnostic renders its
+  original-coordinate span against preprocessed text. The result put a
+  `tyc::type_mismatch` two lines off, inside a comment, under a line
+  reading `dict[str, object] | None` where the source says `?`. The cache
+  is keyed by the buffer each diagnostic carries now — still one sanitise
+  per file whenever they do share one — and the sweep is clean across all
+  1,460 standalone units.
+
 - ~~**`tyc run --compile <file>` diagnostics name the scaffold.**~~ Closed:
   the staged build reports diagnostics under the path the user gave, and
   the scaffold turns on `traceback-remap`, so an uncaught exception's
