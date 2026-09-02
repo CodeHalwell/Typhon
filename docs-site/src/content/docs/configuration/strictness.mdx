@@ -193,7 +193,7 @@ suggest-parallel = false
 
 ## `auto-memoise`
 
-**Off by default.** When on, every function the analyser infers as pure (all six conditions hold) gets `@functools.cache`. The runtime impact:
+**Off by default.** When on, every function the analyser can *prove* pure — with immutable, hashable parameters and an immutable return type — gets `@functools.cache`. The runtime impact:
 
 - Cached arguments stay alive forever (or until the cache is cleared).
 - Cached return values stay alive forever.
@@ -202,12 +202,14 @@ suggest-parallel = false
 These tradeoffs aren't free. Opt in deliberately, ideally after profiling.
 
 <Aside type="caution">
-  Even when `auto-memoise = true`, the analyser still requires all six purity conditions to hold. It does not blindly wrap impure functions.
+  Even when `auto-memoise = true`, the analyser only caches what it can prove: a call it cannot classify (a method on a value of unknown type, a module outside the pure stdlib allow-list) leaves the function un-cached, and a function returning a `list`, an iterator or a mutable object is never cached because every caller would share one object. See [`@pure` and `@memo`](/Typhon/reference/pure-memo/#what-pure-proves).
 </Aside>
 
 ## `auto-gather`
 
 Folds runs of two-or-more consecutive independent `name = await callee(...)` statements inside an `async def` into an `asyncio.TaskGroup`. **Every callee must carry an explicit `@gatherable` decorator.** As of v0.14.2 the rewrite folds runs whose callees are `@gatherable` async functions imported from **another project module** too, not just same-module callees as before. Undecorated async functions and third-party imported callees are still left alone, and the `@gatherable` decorator remains required on every callee regardless of where it is defined.
+
+A callee name the enclosing function rebinds (a parameter, a local, a nested `def`, an import) is never folded — it refers to a different callable — nor is a name rebound at module level after its definition. Runs lexically inside a `try` or `with` body also stay sequential: a `TaskGroup` re-raises a task's exception inside an `ExceptionGroup`, which a same-frame `except ValueError` would no longer catch.
 
 There is no diagnostic when a callee lacks `@gatherable` — the awaits just stay sequential. If you forget to decorate, you'll see no parallelism *and* no error. Run `tyc trace` or read the emitted Python to confirm whether a particular run got rewritten. (For a non-rewriting nudge toward `gather:`, see [`suggest-gather`](#suggest-gather).)
 

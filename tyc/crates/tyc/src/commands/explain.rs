@@ -96,6 +96,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "missing_initialiser",
         "missing_return",
         "mutable_default_param",
+        "possibly_unbound",
         "newtype_invalid_base",
         "newtype_violation",
         "no_block_shadow",
@@ -244,6 +245,7 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         "missing_field_init" => {
             include_str!("../../../../../docs/diagnostics/missing_field_init.md")
         }
+        "possibly_unbound" => include_str!("../../../../../docs/diagnostics/possibly_unbound.md"),
         "missing_initialiser" => {
             include_str!("../../../../../docs/diagnostics/missing_initialiser.md")
         }

@@ -323,7 +323,7 @@ error[tyc::impure_pure_fn]: `fetch` is annotated `@pure` but performs I/O
                             (urllib.request.urlopen)
 ```
 
-The six purity conditions: synchronous, hashable params, no I/O, no non-determinism, no mutable module state, no exceptions raised. Failing *any* condition is a hard error.
+The six purity conditions: synchronous, hashable params, no I/O, no non-determinism, no mutable module state, no exceptions raised. Failing *any* condition the verifier can prove is a hard error — including through import aliases (`datetime.now()`), logging calls, I/O method names, mutation of arguments (`c.n = ...`, `xs.pop()`, `next(it)`) and reads of `mut` module bindings. A call it cannot classify is trusted under `@pure`; only the automatic optimisations require provable purity.
 
 **Fix:** drop `@pure` (and lose memo eligibility), or refactor the I/O out.
 

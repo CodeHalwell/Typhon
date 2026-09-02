@@ -1192,6 +1192,21 @@ impl<'a> Resolver<'a> {
                 self.mark_loop_origin(span);
                 return;
             }
+            // `_` is the conventional throwaway: a second `let _ = ...`
+            // discards another value rather than rebinding a `let`. Replace
+            // the binding in place so later references see the newest span.
+            if name == "_" {
+                if let Some(b) = self.scopes[scope]
+                    .bindings
+                    .iter_mut()
+                    .find(|b| b.name == name)
+                {
+                    b.span = span;
+                    b.mutability = mutability;
+                    b.kind = kind;
+                }
+                return;
+            }
             if existing.mutability == Mutability::Let || mutability == Mutability::Let {
                 let decl_span = existing.span;
                 // R3-8: the FIRST assignment to an uninitialised `let
@@ -1200,6 +1215,26 @@ impl<'a> Resolver<'a> {
                 // hit the standard immutable-assign path below because
                 // the span is no longer in the uninit set.
                 if self.uninit_let_spans.remove(&decl_span) {
+                    // ...unless the initialiser sits inside a loop body the
+                    // declaration is not part of: it then runs once per
+                    // iteration, and iteration two rebinds a `let`. Only the
+                    // innermost open loop counts as "the declaration's own"
+                    // (a `let` declared in an outer loop and assigned in an
+                    // inner one is rebound per inner iteration all the same).
+                    let decl_loop = self.loop_origin_spans.get(&decl_span).copied();
+                    let repeats = self.loop_body_depth > 0
+                        && decl_loop != self.loop_body_stack.last().copied();
+                    if repeats && self.seen_immutable_redecl.insert((decl_span, span)) {
+                        self.diagnostics.push_error(TycError::immutable_assign(
+                            name,
+                            &self.path,
+                            self.source,
+                            decl_span.0,
+                            decl_span.1.saturating_sub(decl_span.0).max(1),
+                            span.0,
+                            span.1.saturating_sub(span.0).max(1),
+                        ));
+                    }
                     return;
                 }
                 if self.seen_immutable_redecl.insert((decl_span, span)) {
@@ -1271,13 +1306,17 @@ impl<'a> Resolver<'a> {
             let mut found = false;
             let mut wildcard_in_scope = false;
             // Python's scoping rule: a class body is NOT an enclosing scope
-            // for the functions (methods, lambdas) defined inside it — a
-            // method reading a class attribute by bare name raises
-            // `NameError` at runtime. So when the reference sits in a
-            // function scope, class scopes on the chain are skipped.
-            // Comprehension scopes keep the lenient walk: their first
-            // iterable is evaluated in the class body itself.
-            let origin_is_function = self.scopes[r.scope].kind == ScopeKind::Function;
+            // for the functions (methods, lambdas) or comprehensions defined
+            // inside it — a method or a comprehension clause reading a class
+            // attribute by bare name raises `NameError` at runtime. So when
+            // the reference sits in a function or comprehension scope, class
+            // scopes on the chain are skipped. (A comprehension's outermost
+            // iterable is walked in the enclosing scope by `walk_comp`, so it
+            // still sees the class body, exactly as CPython evaluates it.)
+            let origin_is_function = matches!(
+                self.scopes[r.scope].kind,
+                ScopeKind::Function | ScopeKind::Comprehension
+            );
             let mut current = Some(r.scope);
             while let Some(id) = current {
                 let scope = &self.scopes[id];
@@ -1955,7 +1994,9 @@ fn declare_target(
             // declaration (`BindingKind::Value`). A parameter / loop
             // target / import / function / class re-declaration is a
             // separate problem and not what this finding is about.
-            if ast_mutability.is_some() {
+            // `_` is the conventional throwaway; a second `let _ = ...` in
+            // the same function is discarding another value, not shadowing.
+            if ast_mutability.is_some() && n.id.as_str() != "_" {
                 if let Some(existing) = r.lookup_local(scope, n.id.as_str()) {
                     // The loop-origin carve-out only suppresses the shadow
                     // diagnostic while we are still inside a loop body (the
@@ -2990,8 +3031,13 @@ fn walk_expr(r: &mut Resolver, scope: ScopeId, expr: &Expr) {
         Expr::Generator(g) => walk_comp(r, scope, range_to_span(g.range), &g.elt, &g.generators),
         Expr::DictComp(c) => {
             let scope2 = r.push_scope(ScopeKind::Comprehension, scope, range_to_span(c.range));
-            for gen in &c.generators {
-                walk_expr(r, scope2, &gen.iter);
+            for (i, gen) in c.generators.iter().enumerate() {
+                // Outermost iterable in the enclosing scope (see `walk_comp`).
+                if i == 0 {
+                    walk_expr(r, scope, &gen.iter);
+                } else {
+                    walk_expr(r, scope2, &gen.iter);
+                }
                 // Dict-comp targets share the recursive shape of `for`/`with`
                 // targets — e.g. `{k: v for k, v in d.items()}` binds both
                 // `k` and `v`. Use the same helper as list/set comps so tuple
@@ -3033,16 +3079,12 @@ fn walk_expr(r: &mut Resolver, scope: ScopeId, expr: &Expr) {
         // visited via the same path on the next pass through this code.
         Expr::FString(fs) => {
             for elem in fs.value.elements() {
-                if let ast::InterpolatedStringElement::Interpolation(interp) = elem {
-                    walk_expr(r, scope, &interp.expression);
-                }
+                walk_interpolated_element(r, scope, elem);
             }
         }
         Expr::TString(ts) => {
             for elem in ts.value.elements() {
-                if let ast::InterpolatedStringElement::Interpolation(interp) = elem {
-                    walk_expr(r, scope, &interp.expression);
-                }
+                walk_interpolated_element(r, scope, elem);
             }
         }
         Expr::Named(n) => {
@@ -3064,6 +3106,42 @@ fn walk_expr(r: &mut Resolver, scope: ScopeId, expr: &Expr) {
     }
 }
 
+/// Walk one element of an f-string / t-string: the interpolated expression
+/// and — recursively — every interpolation nested inside its format spec
+/// (`f"{v:{prec}f}"` reads `prec`; `f"{v:{string.digits[3]}}"` uses the
+/// `string` import). Skipping the spec left those references invisible to
+/// the unknown-name and unused-import passes.
+fn walk_interpolated_element(
+    r: &mut Resolver,
+    scope: ScopeId,
+    elem: &ast::InterpolatedStringElement,
+) {
+    if let ast::InterpolatedStringElement::Interpolation(interp) = elem {
+        walk_expr(r, scope, &interp.expression);
+        if let Some(spec) = &interp.format_spec {
+            for inner in &spec.elements {
+                walk_interpolated_element(r, scope, inner);
+            }
+        }
+    }
+}
+
+/// [`declare_walrus_leaks`] for one f-string element, format spec included.
+fn leak_walrus_in_interpolated_element(
+    r: &mut Resolver,
+    scope: ScopeId,
+    elem: &ast::InterpolatedStringElement,
+) {
+    if let ast::InterpolatedStringElement::Interpolation(interp) = elem {
+        declare_walrus_leaks(r, scope, &interp.expression);
+        if let Some(spec) = &interp.format_spec {
+            for inner in &spec.elements {
+                leak_walrus_in_interpolated_element(r, scope, inner);
+            }
+        }
+    }
+}
+
 fn walk_comp(
     r: &mut Resolver,
     scope: ScopeId,
@@ -3072,8 +3150,17 @@ fn walk_comp(
     generators: &[ast::Comprehension],
 ) {
     let scope2 = r.push_scope(ScopeKind::Comprehension, scope, span);
-    for gen in generators {
-        walk_expr(r, scope2, &gen.iter);
+    for (i, gen) in generators.iter().enumerate() {
+        // CPython evaluates the *outermost* iterable in the enclosing scope
+        // (it is passed into the comprehension as its one argument); every
+        // other iterable, every condition and the element run inside the
+        // comprehension's own scope — which, like a function body, cannot
+        // see a surrounding class body.
+        if i == 0 {
+            walk_expr(r, scope, &gen.iter);
+        } else {
+            walk_expr(r, scope2, &gen.iter);
+        }
         // Comprehension targets share the recursive shape of `for`/`with`
         // targets — e.g. `[v for k, v in d.items()]` binds both `k` and `v`.
         declare_loop_target(r, scope2, &gen.target);
@@ -3192,12 +3279,11 @@ fn declare_walrus_leaks(r: &mut Resolver, scope: ScopeId, expr: &Expr) {
                 declare_walrus_leaks(r, scope, &item.value);
             }
         }
-        // `f"{(x := ...)}"` — walrus inside an f-string interpolation.
+        // `f"{(x := ...)}"` — walrus inside an f-string interpolation (or
+        // inside a nested format spec, `f"{v:{(w := 4)}}"`).
         Expr::FString(fs) => {
             for elem in fs.value.elements() {
-                if let ast::InterpolatedStringElement::Interpolation(interp) = elem {
-                    declare_walrus_leaks(r, scope, &interp.expression);
-                }
+                leak_walrus_in_interpolated_element(r, scope, elem);
             }
         }
         // Other expression heads either bind no names (literals, plain
@@ -3442,6 +3528,136 @@ mod tests {
 
     fn resolve(src: &str) -> (ResolvedModule, Diagnostics) {
         resolve_with_options(src, ResolveOptions::default())
+    }
+
+    // ── Beta hardening: f-string specs, class-body comprehensions, `_` ──
+
+    #[test]
+    fn format_spec_interpolations_are_resolved() {
+        let (_, diags) = resolve("def f(v: float) -> str:\n    return f\"{v:{prec}f}\"\n");
+        assert!(
+            diags
+                .errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UnknownName { name, .. } if name == "prec")),
+            "the spec's `prec` must be an unknown name: {:?}",
+            diags.errors()
+        );
+        let (_, diags) = resolve(
+            "import string\n\ndef f(v: float) -> str:\n    return f\"{v:{string.digits[3]}}\"\n",
+        );
+        assert!(
+            !diags
+                .warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::UnusedImport { .. })),
+            "an import used only inside a format spec is used: {:?}",
+            diags.warnings()
+        );
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
+    fn class_body_comprehension_sees_only_its_outermost_iterable() {
+        // CPython evaluates the first `for` iterable in the class body and
+        // everything else in the comprehension's own scope, which cannot
+        // see class attributes: `xs` in the second clause is a NameError.
+        let src = "\
+class Grid:
+    xs: list[int] = [1, 2]
+    pairs: list[int] = [a + b for a in xs for b in xs]
+";
+        let (_, diags) = resolve(src);
+        let unknown: Vec<&TycError> = diags
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::UnknownName { name, .. } if name == "xs"))
+            .collect();
+        assert_eq!(
+            unknown.len(),
+            1,
+            "exactly the second `xs`: {:?}",
+            diags.errors()
+        );
+        let ok = "\
+class Grid:
+    xs: list[int] = [1, 2]
+    doubled: list[int] = [a * 2 for a in xs if a > 0]
+    table: dict[int, int] = {a: a * a for a in xs}
+";
+        let (_, diags) = resolve(ok);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
+    fn declare_only_let_initialised_inside_a_later_loop_is_a_reassignment() {
+        // `last` is declared once, outside the loop; the body assigns it on
+        // every iteration, so iteration two rebinds a `let`.
+        let src = "\
+def f(xs: list[int]) -> None:
+    let last: int
+    for x in xs:
+        last = x
+        print(last)
+";
+        let (_, d) = resolve(src);
+        assert!(has_immutable_assign(&d), "{:?}", d.errors());
+        // Declared and initialised inside the same loop body: fresh per
+        // iteration, fine.
+        let ok = "\
+def g(xs: list[int]) -> None:
+    for x in xs:
+        let cur: int
+        cur = x
+        print(cur)
+";
+        let (_, d) = resolve(ok);
+        assert!(!has_immutable_assign(&d), "{:?}", d.errors());
+        // Declared in an outer loop, initialised in an inner one: rebound
+        // per inner iteration.
+        let nested = "\
+def h(xss: list[list[int]]) -> None:
+    for xs in xss:
+        let cur: int
+        for x in xs:
+            cur = x
+        print(cur)
+";
+        let (_, d) = resolve(nested);
+        assert!(has_immutable_assign(&d), "{:?}", d.errors());
+        // The plain declare-then-assign idiom outside loops is untouched.
+        let plain = "\
+def k(c: bool) -> int:
+    let v: int
+    if c:
+        v = 1
+    else:
+        v = 2
+    return v
+";
+        let (_, d) = resolve(plain);
+        assert!(!has_immutable_assign(&d), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn underscore_can_be_rebound_with_let() {
+        let src = "\
+def a() -> int:
+    return 1
+
+def f() -> None:
+    let _: int = a()
+    let _: int = a()
+";
+        let (_, diags) = resolve(src);
+        assert!(
+            !diags.errors().iter().any(|e| matches!(
+                e,
+                TycError::NoBlockShadow { .. } | TycError::ImmutableAssign { .. }
+            )),
+            "`let _` twice is not block shadowing: {:?}",
+            diags.errors()
+        );
     }
 
     fn resolve_with_options(src: &str, options: ResolveOptions) -> (ResolvedModule, Diagnostics) {

@@ -29,6 +29,20 @@ loops. The six rules are:
 If any of these is false, the optimisations would silently change behaviour,
 so the decorator is rejected.
 
+The check is syntactic and reports only what it can *prove*: I/O and clock /
+entropy builtins under any import alias (`datetime.now()` after
+`from datetime import datetime`, `np.random.rand()`), logging calls, I/O
+method names on any receiver (`.read_text()`, `.write()`, `.send()`),
+mutation of an argument or a module binding through a method or an attribute
+write (`REGISTRY.append(x)`, `c.n = c.n + 1`, `next(it)` on a parameter), a
+read of a `mut` (or rebound) module binding, and calls to same-module helpers
+that are not `@pure`. A call the checker cannot classify — a method on a value
+of unknown type, a function from a module outside the pure stdlib allow-list
+— is trusted under `@pure`; the automatic optimisations (`auto-memoise`,
+`pgo-memoise`, `auto-parallel`) require provable purity and ignore such
+functions. See [language.md — What the verifier
+proves](../language.md#what-the-verifier-proves).
+
 ## Fix
 
 Either drop the `@pure` decorator if the function genuinely has side effects,

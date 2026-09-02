@@ -1532,6 +1532,36 @@ pub enum TycError {
         decl_span: SourceSpan,
     },
 
+    /// An ordinary function-local name is read where the
+    /// definite-assignment pass cannot see an assignment on every path
+    /// that reaches it — or can see that *no* assignment does (a read
+    /// before the first assignment, after `del`, or after the
+    /// `except ... as` handler that bound it). CPython raises
+    /// `UnboundLocalError` / `NameError` on the path in question; the
+    /// warning names the read so the branch that forgot to assign can be
+    /// fixed. Advice-level: a program whose runtime never takes that path
+    /// keeps building.
+    #[error("`{name}` {reason}")]
+    #[diagnostic(
+        code(tyc::possibly_unbound),
+        url(
+            "https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/possibly_unbound.md"
+        ),
+        help(
+            "assign `{name}` on every path before this read (an `else` branch, a default \
+             before the loop or `try`), or restructure so the read sits where the \
+             assignment is certain"
+        )
+    )]
+    PossiblyUnbound {
+        name: String,
+        reason: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("read here")]
+        span: SourceSpan,
+    },
+
     /// Two sibling modules aggregated by a `pub *` re-export in
     /// `__init__.ty` both expose the same name. The synthesised
     /// `from .a import X` + `from .b import X` would silently shadow
@@ -1993,6 +2023,7 @@ impl TycError {
             | Self::FreezeNotFreezable { src, span, .. }
             | Self::NewtypeInvalidBase { src, span, .. }
             | Self::UseOfUninitialised { src, span, .. }
+            | Self::PossiblyUnbound { src, span, .. }
             | Self::PubNameCollision { src, span, .. }
             | Self::PubStarOutsideInit { src, span, .. }
             | Self::AsyncWithoutAwait { src, span, .. }
@@ -2086,6 +2117,7 @@ impl TycError {
             | Self::FreezeNotFreezable { src, span, .. }
             | Self::NewtypeInvalidBase { src, span, .. }
             | Self::UseOfUninitialised { src, span, .. }
+            | Self::PossiblyUnbound { src, span, .. }
             | Self::PubNameCollision { src, span, .. }
             | Self::PubStarOutsideInit { src, span, .. }
             | Self::AsyncWithoutAwait { src, span, .. }
@@ -3327,6 +3359,25 @@ impl TycError {
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(use_offset), use_length),
             decl_span: SourceSpan::new(SourceOffset::from(decl_offset), decl_length),
+        }
+    }
+
+    /// Construct a [`TycError::PossiblyUnbound`] warning for a read of a
+    /// function-local name that may not (or certainly does not) have a
+    /// binding on the path that reaches it.
+    pub fn possibly_unbound(
+        name: impl Into<String>,
+        reason: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::PossiblyUnbound {
+            name: name.into(),
+            reason: reason.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
         }
     }
 

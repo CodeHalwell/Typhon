@@ -63,8 +63,29 @@ pub fn rewrite_auto_gather(
         /* inside_async */ false,
         &mut counter,
         &mut stats,
+        /* guarded */ false,
     );
     stats
+}
+
+/// The eligible set for one function body: every gatherable name that this
+/// function does not rebind. A parameter, a local assignment, a nested `def`,
+/// an import or a loop target named like a `@gatherable` function makes a
+/// bare `await NAME(...)` refer to a *different* callable — one nobody
+/// attested as safe to run concurrently — so it must not be folded.
+fn scoped_eligible(
+    eligible: &HashSet<String>,
+    params: Option<&ruff_python_ast::Parameters>,
+    body: &[Stmt],
+) -> HashSet<String> {
+    eligible
+        .iter()
+        .filter(|name| {
+            !params.is_some_and(|p| crate::reductions::params_bind_name(p, name))
+                && !crate::reductions::scope_binds_name(body, name)
+        })
+        .cloned()
+        .collect()
 }
 
 /// Walk `module` and return a counter value that is strictly greater than
@@ -175,6 +196,7 @@ fn rewrite_stmts(
     inside_async: bool,
     counter: &mut usize,
     stats: &mut AutoGatherStats,
+    guarded: bool,
 ) -> Vec<Stmt> {
     let mut out: Vec<Stmt> = Vec::with_capacity(body.len());
     // Move into an iterator so we can take ownership of each stmt without
@@ -182,7 +204,11 @@ fn rewrite_stmts(
     // slice via an index into the source `Vec`.
     let mut i = 0;
     while i < body.len() {
-        if inside_async {
+        // A run inside a `try` body (or a `with` body, whose manager may
+        // suppress exceptions) is never folded: a `TaskGroup` re-raises a
+        // task's exception wrapped in an `ExceptionGroup`, so the handler
+        // that caught `ValueError` sequentially would no longer match.
+        if inside_async && !guarded {
             let run = collect_run(&body, i, eligible);
             if run.len() >= 2 {
                 // Emit the synthesized async-with + result-extracts directly
@@ -203,6 +229,7 @@ fn rewrite_stmts(
             inside_async,
             counter,
             stats,
+            guarded,
         ));
         i += 1;
     }
@@ -215,24 +242,32 @@ fn recurse_stmt(
     inside_async: bool,
     counter: &mut usize,
     stats: &mut AutoGatherStats,
+    guarded: bool,
 ) -> Stmt {
     match stmt {
         Stmt::FunctionDef(mut f) => {
             // A nested `async def` flips the walker back into async scope;
-            // a `def` inside an `async def` flips it off.
+            // a `def` inside an `async def` flips it off. The body is a new
+            // frame (an enclosing `try` no longer guards it) and a new scope
+            // (its own bindings shadow gatherable names).
             let body_async = f.is_async;
-            f.body = rewrite_stmts(f.body, eligible, body_async, counter, stats);
+            let scoped = scoped_eligible(eligible, Some(&f.parameters), &f.body);
+            f.body = rewrite_stmts(
+                f.body, &scoped, body_async, counter, stats, /* guarded */ false,
+            );
             Stmt::FunctionDef(f)
         }
         Stmt::ClassDef(mut c) => {
             // Methods inside a class body run their own walk; whether they're
             // async is determined per-method (handled by the FunctionDef arm
-            // above when we recurse into a method).
-            c.body = rewrite_stmts(c.body, eligible, false, counter, stats);
+            // above when we recurse into a method). Class-body bindings are
+            // not visible from method bodies, so the eligible set is passed
+            // through unchanged.
+            c.body = rewrite_stmts(c.body, eligible, false, counter, stats, guarded);
             Stmt::ClassDef(c)
         }
         Stmt::If(mut s) => {
-            s.body = rewrite_stmts(s.body, eligible, inside_async, counter, stats);
+            s.body = rewrite_stmts(s.body, eligible, inside_async, counter, stats, guarded);
             for clause in s.elif_else_clauses.iter_mut() {
                 clause.body = rewrite_stmts(
                     std::mem::take(&mut clause.body),
@@ -240,26 +275,45 @@ fn recurse_stmt(
                     inside_async,
                     counter,
                     stats,
+                    guarded,
                 );
             }
             Stmt::If(s)
         }
         Stmt::While(mut s) => {
-            s.body = rewrite_stmts(s.body, eligible, inside_async, counter, stats);
-            s.orelse = rewrite_stmts(s.orelse, eligible, inside_async, counter, stats);
+            s.body = rewrite_stmts(s.body, eligible, inside_async, counter, stats, guarded);
+            s.orelse = rewrite_stmts(s.orelse, eligible, inside_async, counter, stats, guarded);
             Stmt::While(s)
         }
         Stmt::For(mut s) => {
-            s.body = rewrite_stmts(s.body, eligible, inside_async, counter, stats);
-            s.orelse = rewrite_stmts(s.orelse, eligible, inside_async, counter, stats);
+            s.body = rewrite_stmts(s.body, eligible, inside_async, counter, stats, guarded);
+            s.orelse = rewrite_stmts(s.orelse, eligible, inside_async, counter, stats, guarded);
             Stmt::For(s)
         }
         Stmt::With(mut s) => {
-            s.body = rewrite_stmts(s.body, eligible, inside_async, counter, stats);
+            // The manager's `__exit__` may swallow an exception in this very
+            // frame; a `TaskGroup` would hand it an `ExceptionGroup` instead.
+            s.body = rewrite_stmts(
+                s.body,
+                eligible,
+                inside_async,
+                counter,
+                stats,
+                /* guarded */ true,
+            );
             Stmt::With(s)
         }
         Stmt::Try(mut s) => {
-            s.body = rewrite_stmts(s.body, eligible, inside_async, counter, stats);
+            // Only the `try` body is guarded by this statement's handlers;
+            // the handlers, `else` and `finally` inherit the outer state.
+            s.body = rewrite_stmts(
+                s.body,
+                eligible,
+                inside_async,
+                counter,
+                stats,
+                /* guarded */ true,
+            );
             for h in s.handlers.iter_mut() {
                 let ExceptHandler::ExceptHandler(h) = h;
                 h.body = rewrite_stmts(
@@ -268,10 +322,12 @@ fn recurse_stmt(
                     inside_async,
                     counter,
                     stats,
+                    guarded,
                 );
             }
-            s.orelse = rewrite_stmts(s.orelse, eligible, inside_async, counter, stats);
-            s.finalbody = rewrite_stmts(s.finalbody, eligible, inside_async, counter, stats);
+            s.orelse = rewrite_stmts(s.orelse, eligible, inside_async, counter, stats, guarded);
+            s.finalbody =
+                rewrite_stmts(s.finalbody, eligible, inside_async, counter, stats, guarded);
             Stmt::Try(s)
         }
         Stmt::Match(mut s) => {
@@ -282,6 +338,7 @@ fn recurse_stmt(
                     inside_async,
                     counter,
                     stats,
+                    guarded,
                 );
             }
             Stmt::Match(s)
@@ -666,7 +723,24 @@ pub fn collect_gatherable_async_fn_names(module: &ModModule) -> HashSet<String> 
             _ => {}
         }
     }
+    // A module-level rebinding of a collected name — `fetch = retry(fetch)`
+    // after the def, a second `def fetch`, `from client import fetch`, a
+    // loop target, a `global fetch` in some function — makes a bare
+    // `fetch(...)` refer to something nobody attested as gather-safe
+    // (possibly not even a coroutine function). Drop such names.
+    let mut globals = HashSet::new();
+    crate::collect_global_declarations(&module.body, &mut globals);
+    out.retain(|name| !globals.contains(name) && !module_rebinds(&module.body, name));
     out
+}
+
+/// `true` when more than one top-level statement of `body` binds `name`
+/// (the `@gatherable` definition itself counts as one).
+fn module_rebinds(body: &[Stmt], name: &str) -> bool {
+    body.iter()
+        .filter(|stmt| crate::reductions::scope_binds_name(std::slice::from_ref(stmt), name))
+        .count()
+        > 1
 }
 
 fn has_gatherable_decorator(decorators: &[ruff_python_ast::Decorator]) -> bool {
@@ -1815,5 +1889,123 @@ def load(client):
 ";
         let module = parse_module(src);
         assert!(detect_gather_opportunities(&module).is_empty());
+    }
+
+    // ── Shadowing and guarded bodies ────────────────────────────────────────
+
+    #[test]
+    fn parameter_shadowing_a_gatherable_name_is_not_folded() {
+        // `run`'s `fetch` parameter is whatever the caller passed — here a
+        // slow, order-sensitive coroutine — not the `@gatherable` one.
+        let src = "\
+from typing import Awaitable, Callable
+
+@gatherable
+async def fetch(tag: str) -> str:
+    return tag
+
+async def run(fetch: Callable[[str], Awaitable[str]]) -> None:
+    a = await fetch(\"a\")
+    b = await fetch(\"b\")
+    print(a, b)
+";
+        let (out, stats) = rewrite(src);
+        assert_eq!(stats.rewrites, 0, "{out}");
+        assert!(!out.contains("TaskGroup"), "{out}");
+    }
+
+    #[test]
+    fn nested_def_shadowing_a_gatherable_name_is_not_folded() {
+        let src = "\
+import asyncio
+
+@gatherable
+async def fetch(tag: str) -> str:
+    return tag
+
+async def run() -> None:
+    async def fetch(tag: str) -> str:
+        await asyncio.sleep(0.05 if tag == \"a\" else 0.0)
+        return tag
+    a = await fetch(\"a\")
+    b = await fetch(\"b\")
+    print(a, b)
+";
+        let (out, stats) = rewrite(src);
+        assert_eq!(stats.rewrites, 0, "{out}");
+    }
+
+    #[test]
+    fn local_assignment_shadowing_a_gatherable_name_is_not_folded() {
+        let src = "\
+@gatherable
+async def fetch(tag: str) -> str:
+    return tag
+
+async def other(tag: str) -> str:
+    return tag
+
+async def run() -> None:
+    fetch = other
+    a = await fetch(\"a\")
+    b = await fetch(\"b\")
+    print(a, b)
+";
+        let (out, stats) = rewrite(src);
+        assert_eq!(stats.rewrites, 0, "{out}");
+    }
+
+    #[test]
+    fn module_level_rebinding_removes_the_name_from_the_eligible_set() {
+        let src = "\
+@gatherable
+async def fetch(tag: str) -> str:
+    return tag
+
+def retry(f):
+    return f
+
+fetch = retry(fetch)
+
+async def run() -> None:
+    a = await fetch(\"a\")
+    b = await fetch(\"b\")
+    print(a, b)
+";
+        let module = parse_module(src);
+        let names = collect_gatherable_async_fn_names(&module);
+        assert!(
+            names.is_empty(),
+            "rebound name must not be eligible: {names:?}"
+        );
+        let (out, stats) = rewrite(src);
+        assert_eq!(stats.rewrites, 0, "{out}");
+    }
+
+    #[test]
+    fn runs_inside_try_and_with_bodies_are_not_folded() {
+        let src = "\
+@gatherable
+async def fetch(tag: str) -> str:
+    return tag
+
+async def main() -> None:
+    try:
+        a = await fetch(\"a\")
+        b = await fetch(\"b\")
+        print(a, b)
+    except ValueError as e:
+        print(\"caught:\", e)
+    async with lock:
+        c = await fetch(\"c\")
+        d = await fetch(\"d\")
+        print(c, d)
+    e = await fetch(\"e\")
+    f = await fetch(\"f\")
+    print(e, f)
+";
+        let (out, stats) = rewrite(src);
+        assert_eq!(stats.rewrites, 1, "only the unguarded run folds: {out}");
+        assert!(out.contains("try:\n        a = await fetch"), "{out}");
     }
 }

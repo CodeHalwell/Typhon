@@ -54,6 +54,19 @@ def bad(cond: bool) -> int:
 
 **Fix:** Initialise inline (`let x: int = 0`), or assign in every non-diverging arm.
 
+### `tyc::possibly_unbound` — warning
+
+An ordinary function-local name (not a declare-only `let`) is read on a path that may not assign it — or provably never does: a read before the first assignment, a read after `del`, an `except E as e` name used after its handler (CPython unbinds it), a loop target read after a loop that may run zero times, a name assigned in only one arm of an `if` without `else`.
+
+```ty
+def first_word(s: str) -> str:
+    if s:
+        word = s.split()[0]
+    return word     # warning: `word` is not assigned on every path that reaches here
+```
+
+**Fix:** give the name a default before the branch / loop / `try`, or `return` in the arm that has nothing to assign. Advice-level: the build continues.
+
 ### `tyc::no_block_shadow` — error
 
 A second `let`/`mut` would shadow an outer function-scoped binding of the same name. Python has no block scope, so the "inner" binding would actually rebind the outer one. Sibling `if`/`elif` and `case` arms each get fresh-binding behaviour (v0.6.0+/v0.7.0+); only true shadow situations fire.
@@ -736,6 +749,8 @@ A function decorated `@pure` violates one of six purity rules:
 def now_plus(n: int) -> float:
     return time.time() + n      # error: clock read
 ```
+
+The verifier reports only what it can *prove*: I/O and clock/entropy calls under any import alias (`datetime.now()` after `from datetime import datetime`), logging calls, I/O method names on any receiver (`.read_text()`, `.write()`), mutation of an argument or module binding through a method or attribute write (`REGISTRY.append(x)`, `c.n = c.n + 1`, `next(it)` on a parameter), reads of `mut` / rebound module bindings, and calls to non-`@pure` same-module helpers. A call it cannot classify (a method on a value of unknown type, a module outside the pure stdlib allow-list) is trusted under `@pure` — but `auto-memoise` / `pgo-memoise` / `auto-parallel` act only on *provably* pure functions with immutable, hashable parameters and an immutable return type.
 
 **Fix:** Drop `@pure`, or restructure so impure work happens at the caller.
 

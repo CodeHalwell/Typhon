@@ -1801,6 +1801,19 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
     if needs_dataclasses {
         final_body.insert(insert_at, make_dataclasses_import());
     }
+    // The resolver treats `functools` / `dataclasses` / `enum` as always in
+    // scope because the lowerings above reference them before their imports
+    // are injected. User code that names them directly (`functools.reduce`)
+    // without importing them would therefore pass `tyc check` and raise
+    // `NameError` at runtime — so inject the module import for any of the
+    // three the emitted module references by bare name and does not bind.
+    for module in ["functools", "dataclasses", "enum"] {
+        if module_references_bare_name(&final_body, module)
+            && !module_binds_bare_name(&final_body, module)
+        {
+            final_body.insert(insert_at, make_module_import(module));
+        }
+    }
 
     ModModule {
         range: m.range,
@@ -1952,11 +1965,76 @@ fn has_functools_import(body: &[Stmt]) -> bool {
 }
 
 fn make_functools_import() -> Stmt {
+    make_module_import("functools")
+}
+
+/// `import NAME` (top-level, eager).
+fn make_module_import(name: &str) -> Stmt {
     Stmt::Import(StmtImport {
         range: TextRange::default(),
         node_index: AtomicNodeIndex::NONE,
-        names: vec![make_alias("functools")],
+        names: vec![make_alias(name)],
         is_lazy: false,
+    })
+}
+
+/// `true` when any expression anywhere in `body` reads the bare name `name`
+/// (a `Name` load, at any nesting depth).
+fn module_references_bare_name(body: &[Stmt], name: &str) -> bool {
+    struct V<'a> {
+        name: &'a str,
+        found: bool,
+    }
+    impl ruff_python_ast::visitor::Visitor<'_> for V<'_> {
+        fn visit_expr(&mut self, e: &Expr) {
+            if self.found {
+                return;
+            }
+            if let Expr::Name(n) = e {
+                if n.id.as_str() == self.name && n.ctx.is_load() {
+                    self.found = true;
+                    return;
+                }
+            }
+            ruff_python_ast::visitor::walk_expr(self, e);
+        }
+    }
+    let mut v = V { name, found: false };
+    for stmt in body {
+        ruff_python_ast::visitor::walk_stmt(&mut v, stmt);
+        if v.found {
+            return true;
+        }
+    }
+    false
+}
+
+/// `true` when a top-level statement of `body` binds `name`: an import of
+/// the module itself (`import NAME`, `import NAME as NAME`, `import NAME.x`),
+/// a from-import or aliased import that lands on the name, a `def`, a
+/// `class`, or an assignment. Nested scopes do not count — a function-local
+/// `import functools` leaves the module-level reference unbound.
+fn module_binds_bare_name(body: &[Stmt], name: &str) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Stmt::Import(i) => i.names.iter().any(|a| match &a.asname {
+            Some(asname) => asname.as_str() == name,
+            None => a.name.as_str().split('.').next() == Some(name),
+        }),
+        Stmt::ImportFrom(i) => i.names.iter().any(|a| {
+            a.asname
+                .as_ref()
+                .map(|n| n.as_str())
+                .unwrap_or(a.name.as_str())
+                == name
+        }),
+        Stmt::FunctionDef(f) => f.name.as_str() == name,
+        Stmt::ClassDef(c) => c.name.as_str() == name,
+        Stmt::Assign(a) => a
+            .targets
+            .iter()
+            .any(|t| matches!(t, Expr::Name(n) if n.id.as_str() == name)),
+        Stmt::AnnAssign(a) => matches!(a.target.as_ref(), Expr::Name(n) if n.id.as_str() == name),
+        _ => false,
     })
 }
 
@@ -4529,6 +4607,34 @@ mod tests {
         let module = parsed.into_syntax();
         let output = desugar_module(&module);
         emit(&output.module)
+    }
+
+    #[test]
+    fn stdlib_prelude_modules_referenced_without_an_import_are_imported() {
+        // The resolver lets `functools` / `dataclasses` / `enum` resolve
+        // without an import (the lowerings reference them); user code that
+        // names them directly must not `NameError` at runtime.
+        let out = parse_and_desugar(
+            "def total(xs: list[int]) -> int:\n    return functools.reduce(lambda a, b: a + b, xs, 0)\n",
+        );
+        assert!(out.contains("import functools\n"), "{out}");
+        let out = parse_and_desugar(
+            "def kind() -> bool:\n    return dataclasses.is_dataclass(1) and enum.auto is not None\n",
+        );
+        assert!(out.contains("import dataclasses\n"), "{out}");
+        assert!(out.contains("import enum\n"), "{out}");
+        // Already bound: no duplicate; an alias that lands on the name counts.
+        let out = parse_and_desugar(
+            "import functools\n\ndef total(xs: list[int]) -> int:\n    return functools.reduce(lambda a, b: a + b, xs, 0)\n",
+        );
+        assert_eq!(out.matches("import functools").count(), 1, "{out}");
+        let out = parse_and_desugar(
+            "import operator as functools\n\ndef f() -> int:\n    return functools.add(1, 2)\n",
+        );
+        assert!(!out.contains("import functools\n"), "{out}");
+        // Not referenced: nothing injected.
+        let out = parse_and_desugar("def f() -> int:\n    return 1\n");
+        assert!(!out.contains("import enum"), "{out}");
     }
 
     #[test]

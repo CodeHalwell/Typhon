@@ -10,12 +10,12 @@ use std::path::PathBuf;
 use clap::Args;
 use miette::{miette, Result};
 use tyc_analyse::{
-    analyse_purity, collect_gatherable_async_fn_names, detect_missed_gathers,
-    evaluate_comptime_with_functions, extract_builtin_extensions, load_profile_samples,
-    parallel_opportunity_diagnostics, pgo_memoise_targets, purity_diagnostics, rewrite_auto_gather,
-    rewrite_builtin_extension_calls_tracking, rewrite_parallel_comprehensions,
-    rewrite_reduction_loops, shared_mut_across_tasks_diagnostics, substitute_comptime_literals,
-    ProfileSample,
+    analyse_purity_with, class_names_at_marker_starts, collect_gatherable_async_fn_names,
+    detect_missed_gathers, evaluate_comptime_with_functions, extract_builtin_extensions,
+    load_profile_samples, parallel_opportunity_diagnostics, pgo_memoise_targets,
+    purity_diagnostics, rewrite_auto_gather, rewrite_builtin_extension_calls_tracking,
+    rewrite_parallel_comprehensions, rewrite_reduction_loops, shared_mut_across_tasks_diagnostics,
+    substitute_comptime_literals, ProfileSample,
 };
 use tyc_db::{check_file_with_imports, extract_shapes_for_path, TycDatabase};
 use tyc_desugar::{desugar_module_with, DesugarOptions};
@@ -768,8 +768,18 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // Phase 3 purity analysis: every `@pure` / `@memo` function is verified
         // against the six-condition rule, and the desugarer is told which
         // functions to wrap in `@functools.cache`.
-        let purity_findings =
-            analyse_purity(&module, config.strictness.auto_memoise.unwrap_or(false));
+        // `class NAME frozen:` markers only survive as line indexes, so hand
+        // the analyser the frozen class names: their instances count as
+        // immutable (and hashable) for the cache-safety checks.
+        let frozen_class_names = class_names_at_marker_starts(
+            &module,
+            &line_byte_starts(&prep.python_source, &prep.frozen_class_lines),
+        );
+        let purity_findings = analyse_purity_with(
+            &module,
+            config.strictness.auto_memoise.unwrap_or(false),
+            &frozen_class_names,
+        );
         let purity_diags = purity_diagnostics(&purity_findings, &path.to_string_lossy(), source);
         if purity_diags.has_errors() {
             for err in purity_diags.errors() {
@@ -781,9 +791,19 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 path.display()
             ));
         }
+        // An explicit `@memo` / `@pure(memo=True)` is honoured once nothing
+        // provably impure was found; an `auto-memoise` candidate must be
+        // provably pure with cache-safe parameters and return type.
         let mut memoise_targets: Vec<String> = purity_findings
             .iter()
-            .filter(|f| f.violation.is_none() && f.memoise)
+            .filter(|f| {
+                f.memoise
+                    && if f.declared_pure {
+                        f.violation.is_none()
+                    } else {
+                        f.auto_cacheable()
+                    }
+            })
             .map(|f| f.name.clone())
             .collect();
 
@@ -795,9 +815,11 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // already in `memoise_targets` are skipped so the desugarer
         // doesn't emit two cache decorators on the same definition.
         if !profile_samples.is_empty() {
+            // PGO promotes functions the user never asked to cache, so it
+            // needs the full cache-safety proof, not just "nothing impure".
             let pgo_candidates: Vec<String> = purity_findings
                 .iter()
-                .filter(|f| f.violation.is_none())
+                .filter(|f| f.auto_cacheable())
                 .map(|f| f.name.clone())
                 .collect();
             let module_name = python_module_name_from_path(path, &src_dir);
@@ -950,7 +972,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             }
             let pure_names: std::collections::HashSet<String> = purity_findings
                 .iter()
-                .filter(|f| f.violation.is_none())
+                .filter(|f| f.callable_as_pure())
                 .map(|f| f.name.clone())
                 .collect();
             for advice in parallel_opportunity_diagnostics(
@@ -1049,9 +1071,11 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // on stock CPython the rewrite still happens but the GIL serialises
         // the workers (correctness preserved, no speedup).
         if config.strictness.auto_parallel.unwrap_or(false) {
+            // Calls to an explicit `@pure` are trusted once nothing provably
+            // impure was found; an inferred candidate must be provably pure.
             let pure_names: std::collections::HashSet<String> = purity_findings
                 .iter()
-                .filter(|f| f.violation.is_none())
+                .filter(|f| f.callable_as_pure())
                 .map(|f| f.name.clone())
                 .collect();
             let stats = rewrite_parallel_comprehensions(

@@ -55,38 +55,7 @@ fn corpus_sweep_body() {
             out.push_str(&format!("{path}\tUNREADABLE\n"));
             continue;
         };
-        let result = std::panic::catch_unwind(|| {
-            let prep = preprocess(&expand(&src));
-            let module = match tyc_syntax::parse_module(&prep.python_source) {
-                Ok(m) => m.into_syntax(),
-                Err(_) => return vec!["PARSE_ERROR".to_owned()],
-            };
-            let (resolved, resolver_diags) =
-                resolve_module(path.to_owned(), &prep.python_source, &module);
-            let diags = check_module_with(
-                path,
-                &prep.python_source,
-                &resolved,
-                &module,
-                &prep.unsafe_lines,
-                &prep.frozen_class_lines,
-                &prep.impl_distributed_lines,
-            );
-            if std::env::var("TYC_SWEEP_VERBOSE").is_ok() {
-                for e in resolver_diags.errors().iter().chain(diags.errors().iter()) {
-                    eprintln!("  {path}: {e}");
-                }
-            }
-            let mut names: Vec<String> = resolver_diags
-                .errors()
-                .iter()
-                .chain(diags.errors().iter())
-                .map(|e| variant_name(&format!("{e:?}")))
-                .collect();
-            names.sort();
-            names.dedup();
-            names
-        });
+        let result = std::panic::catch_unwind(|| variants_of(path, &src));
         match result {
             Ok(names) if names.is_empty() => {}
             Ok(names) => out.push_str(&format!("{path}\t{}\n", names.join(","))),
@@ -118,6 +87,13 @@ fn variants_of(path: &str, src: &str) -> Vec<String> {
         .iter()
         .chain(diags.errors().iter())
         .map(|e| variant_name(&format!("{e:?}")))
+        .chain(
+            resolver_diags
+                .warnings()
+                .iter()
+                .chain(diags.warnings().iter())
+                .map(|w| format!("W:{}", variant_name(&format!("{w:?}")))),
+        )
         .collect();
     names.sort();
     names.dedup();

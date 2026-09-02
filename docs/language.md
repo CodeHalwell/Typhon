@@ -534,6 +534,8 @@ loaded.use()        # OK — every non-diverging arm assigned `loaded`
 
 `match` over a sealed union or `Result[T, E]` is treated as exhaustive for definite-assignment purposes when every variant is covered by a class pattern; the canonical `case Ok(v): / case Err(e): return Err(e)` shape works without a `case _:` wildcard. `return` / `raise` / `continue` / `break` mark a branch as diverging — the branch is excluded from the intersection of "definitely-assigned" paths. Loop bodies do not propagate assignments out (the body may execute zero times).
 
+The same pass watches every *ordinary* local of a function — a name the body binds that is not a parameter, a declare-only `let`, or a `global` / `nonlocal` — and reports a read that is not definitely assigned as the advice-level `tyc::possibly_unbound`: assigned in one arm of an `if` without `else`, read after a `for` over a possibly-empty iterable, read before the first assignment, after `del`, or after the `except ... as e` handler that bound it (CPython unbinds `e` when the handler finishes). The message says which certainty applies ("not assigned on every path" versus "read before any assignment reaches it"). A literal `while True:` body counts as running at least once up to its first `break`; `match` captures are bound before the guard; a `try` statement's `else` clause continues from the clean-body path rather than the join with the handlers; reads inside nested functions, lambdas and comprehension bodies are left to the closure. Declare-only `let`s keep the error-level `tyc::use_of_uninitialised`.
+
 `mut NAME: T` without an initialiser is also accepted and follows the usual `mut` semantics — any number of subsequent assignments are legal.
 
 ## Lazy loading
@@ -587,6 +589,48 @@ A function is **inferable as pure** only if every one of the following holds:
 When all six hold, the analyser **may** emit `@functools.cache` or `@functools.lru_cache(maxsize=N)` — but only with an explicit opt-in: a `@memo` attribute on the function, an `@pure(memo=True)` annotation, or `[strictness] auto-memoise = true` in `typhon.toml`. The checker never inserts caches silently; caches extend the lifetime of every argument and return value, which is not a transparent change.
 
 Manually marking a function `@pure` that fails any of the six conditions is a hard error.
+
+### What the verifier proves
+
+The analyser is syntactic: it reads the function body, the module's own bindings and its import
+aliases, never the runtime. Every call and every read it inspects lands in one of three verdicts:
+
+- **Provably impure** — an I/O builtin (`print`, `open`, `input`, …), a clock or entropy read
+  through any spelling (`time.perf_counter()`, `datetime.datetime.now()`, `datetime.now()` after
+  `from datetime import datetime`, any `.now()` / `.today()` / `.utcnow()`, `random.*`,
+  `np.random.*`), a logging call on a logger-named receiver (`logger.warning(...)`), an I/O method
+  on any receiver (`.read_text()`, `.write()`, `.send()`, `.sleep()`, `.execute()`, …), a
+  mutating method or attribute/subscript write on an *argument* or a *module binding*
+  (`REGISTRY.append(x)`, `c.n = c.n + 1`, `next(it)` on a parameter), a read of a `mut` (or
+  rebound, or `global`-declared) module binding, `raise`, `try`, `global`, `nonlocal`, `await`,
+  `yield`, or a call to a same-module helper that is not itself `@pure`. These are what
+  `tyc::impure_pure_fn` reports.
+- **Provably pure** — arithmetic and comparisons, pure builtins (including the container
+  constructors), constructors of same-module classes, calls into a fixed stdlib allow-list
+  (`math`, `cmath`, `operator`, `itertools`, `functools`, `string`, `re`, `json`, `statistics`,
+  `fractions`, `decimal`, `numbers`, `typing`, `enum`, `textwrap`, `unicodedata`, `base64`,
+  `binascii`, `struct`, `bisect`, `heapq`, `copy`, `dataclasses`, `abc`, `collections`,
+  `datetime` constructors, `zoneinfo`, `hashlib`, `hmac`, `difflib`, `ipaddress`, `pathlib`
+  constructors, `urllib.parse`, `html`, `keyword`, `codecs`, `array`, `types`, and the pure
+  string operations of `os.path`), non-mutating methods of a receiver whose builtin type is
+  evident (a literal, a display, a builtin constructor call, an annotated parameter or local, a
+  `let X: str` module constant), mutating methods on a *fresh* local (`out: list[int] = []` then
+  `out.append(...)`), reads of immutable module constants, and calls to other `@pure` helpers.
+- **Not provably pure** — everything else: a method on a value of unknown type (`p.length()`), a
+  call into a module outside the allow-list (`np.sqrt(x)`, `mylib.helper(x)`), a read of a module
+  `let` whose value could be mutated in place (`TABLE: dict[str, int]`), a `with` block, a
+  computed callee. An explicit `@pure` **trusts the author** here — no diagnostic — but the
+  silent optimisations never act on such a function.
+
+The silent paths (`auto-memoise`, `pgo-memoise`, and the callee set of `auto-parallel`) require
+the function to be *provably* pure. `auto-memoise` and `pgo-memoise` additionally require a
+cache-safe signature: every parameter annotated with an immutable, hashable type and an immutable
+return type — scalars, `str` / `bytes`, `tuple[...]` / `frozenset[...]` of such, `Result` /
+`Ok` / `Err` of such, `Literal`, enums, `NamedTuple`s, `frozen` classes, `@dataclass(frozen=True)`
+classes. A function returning `list[int]`, an `Iterator`, or an ordinary (mutable) class is never
+auto-cached, because `functools.cache` would hand every caller the same object. An explicit
+`@memo` keeps its contract: it is honoured whenever nothing provably impure is found, whatever the
+return type — the author asked for the shared object.
 
 ## Compile-time evaluation (`comptime`)
 

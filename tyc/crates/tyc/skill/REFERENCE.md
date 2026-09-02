@@ -1222,7 +1222,7 @@ def fib(n: int) -> int:
 def expensive(k: str) -> int: ...
 ```
 
-`@pure` alone emits nothing — it's a static assertion. `@memo` (or `@pure(memo=True)`) inserts `functools.cache` / `lru_cache`. Manual `@pure` on a function failing any of the six purity conditions is `tyc::impure_pure_fn`.
+`@pure` alone emits nothing — it's a static assertion. `@memo` (or `@pure(memo=True)`) inserts `functools.cache` / `lru_cache`. Manual `@pure` on a function failing any of the six purity conditions is `tyc::impure_pure_fn`. The verifier is syntactic: it errors on what it can prove impure (I/O, clocks and entropy under any alias, logging, I/O method names, mutation of arguments or module bindings, `mut` reads, non-`@pure` helpers), trusts what it cannot classify, and hands only *provably* pure functions with immutable, hashable parameters and an immutable return type to `auto-memoise` / `pgo-memoise` / `auto-parallel`.
 
 `@gatherable` (no-op at emit) opts a function into auto-gather rewriting under `[strictness] auto-gather = true`. See [SKILL.md](SKILL.md) §10.
 

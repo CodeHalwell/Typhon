@@ -98,6 +98,7 @@ straight from a failed build to the corresponding documentation.
 - [`tyc::unsafe_value_leak`](./unsafe_value_leak.md) — value introduced inside an `unsafe:` block returned from a function whose annotated return is concrete, without re-asserting the type at the boundary.
 - [`tyc::unused_import`](./unused_import.md) — imported name is never used in the module.
 - [`tyc::use_of_uninitialised`](./use_of_uninitialised.md) — read on a declare-only `let NAME: T` binding via a control-flow path that didn't assign it.
+- [`tyc::possibly_unbound`](./possibly_unbound.md) — warning: an ordinary function-local name is read on a path that may not (or certainly does not) assign it — a missing `else`, a read after `del`, an `except ... as` name used after its handler, a loop target after a possibly-empty loop.
 
 Language-level reference pages (no `tyc::` code):
 

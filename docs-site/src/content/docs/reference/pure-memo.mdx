@@ -97,7 +97,7 @@ Same effect as `@pure` + `@memo` together.
 auto-memoise = true
 ```
 
-When on, *every* function the analyser infers as pure gets `@functools.cache` automatically. **Off by default.** Caches extend the lifetime of every argument and return value; that is not a transparent change. Opt in deliberately.
+When on, every function the analyser can **prove** pure gets `@functools.cache` automatically — and only when its signature is cache-safe: every parameter annotated with an immutable, hashable type and an immutable return type (scalars, `str`, `tuple[...]` / `frozenset[...]` of such, `Result` of such, enums, `frozen` classes). A function returning a `list`, an `Iterator` or a mutable class is never auto-cached, because every caller would receive the same object; a function calling something the analyser cannot classify (a method on a value of unknown type, a module outside the pure stdlib allow-list) is left alone. **Off by default.** Caches extend the lifetime of every argument and return value; that is not a transparent change. Opt in deliberately.
 
 ## PGO-guided memoisation
 
@@ -107,7 +107,7 @@ pgo-memoise = true
 pgo-min-calls = 100
 ```
 
-When on, `tyc build` reads `typhon-profile.json` (produced by a prior `tyc profile` run) and promotes pure functions whose observed call count meets `pgo-min-calls` to `@functools.cache`. Missing profile file is not an error — PGO is best-effort.
+When on, `tyc build` reads `typhon-profile.json` (produced by a prior `tyc profile` run) and promotes provably pure, cache-safe functions (the same bar as `auto-memoise`) whose observed call count meets `pgo-min-calls` to `@functools.cache`. Missing profile file is not an error — PGO is best-effort.
 
 This is the right shape for hot-loop helpers that aren't worth manually marking but show up at the top of a profile.
 
@@ -130,6 +130,10 @@ error[tyc::impure_pure_fn]: `fetch` is annotated `@pure` but performs I/O
 ```
 
 Fix: drop `@pure`, or refactor to take the body as a parameter (the *caller* does the I/O; the pure function processes the result).
+
+### What `@pure` proves
+
+The verifier is syntactic. It rejects what it can prove impure — I/O and clock or entropy calls under any import alias (`datetime.now()` after `from datetime import datetime`, `np.random.rand()`), logging calls, I/O method names on any receiver (`.read_text()`, `.write()`, `.send()`), mutation of an argument or a module binding through a method or attribute write (`REGISTRY.append(x)`, `c.n = c.n + 1`, `next(it)` on a parameter), a read of a `mut` or rebound module binding, and calls to same-module helpers that are not `@pure`. It accepts what it can prove pure — arithmetic, the pure builtins, same-module class constructors, a fixed stdlib allow-list (`math`, `re`, `json`, `itertools`, `functools`, `decimal`, `datetime` constructors, …), non-mutating methods on a receiver of evident builtin type, mutation of a fresh local. Anything in between — a method on a value of unknown type, a third-party module — is **trusted** under `@pure` and `@memo`, but never acted on by `auto-memoise`, `pgo-memoise` or `auto-parallel`.
 
 ## Why no implicit memoisation?
 

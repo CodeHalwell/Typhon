@@ -1350,7 +1350,7 @@ require-with = "warn"            # severity for tyc::resource_not_managed
 blocking-in-async = "warn"       # severity for tyc::blocking_in_async
 stub-check = "error"             # severity for tyc::stub_mismatch
 suggest-gather = true            # advice: surfaces tyc::gather_opportunity
-auto-memoise = false             # opt-in; inserts @functools.cache on inferred pure fns (defaults true at [optimise] level = 1)
+auto-memoise = false             # opt-in; caches *provably* pure fns with immutable, hashable params + return (defaults true at [optimise] level = 1)
 auto-gather = false              # opt-in; folds independent awaits into TaskGroup (needs @gatherable; defaults true at level = 1)
 auto-parallel = false            # opt-in; pure list/set/dict comprehensions → thread-pool map (defaults true at level = 1)
 auto-parallel-reductions = false # opt-in; parallelises `mut total: int` accumulator loops (requires auto-parallel; int-only — exact/associative, floats never reordered)
@@ -1599,6 +1599,7 @@ The recurring diagnostic codes and what they actually mean. **See [DIAGNOSTICS.m
 | `tyc::immutable_assign` | Reassigning a `let` binding | Change to `mut`, or extract a new `let` |
 | `tyc::missing_initialiser` | `let NAME: T` written that is never assigned | Initialise inline, or assign on every non-diverging path |
 | `tyc::use_of_uninitialised` | (v0.7.0) Read of `let NAME: T` on a path that didn't assign | Initialise inline, or assign in every non-diverging arm |
+| `tyc::possibly_unbound` | (warning) Ordinary local read on a path that may not — or provably does not — assign it (`if` without `else`, after `del`, `except … as e` after the handler, loop target after a possibly-empty loop) | Assign a default before the branch / loop, or `return` in the arm that has nothing to assign |
 | `tyc::no_block_shadow` | Inner `let`/`mut` would shadow an outer binding | Rename inner binding (no block scope in Python) |
 | `tyc::pattern_shadows_outer` | `case Wrap(value):` against outer `let value` | Rename the capture (`case Wrap(inner):`) |
 | `tyc::nullable_use` | Passing `T?` where `T` required | Narrow with `is None` / `guard` / early-return |
