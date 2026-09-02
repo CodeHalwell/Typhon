@@ -5822,27 +5822,22 @@ fn join_multiline_question_statements(source: &str) -> (String, Vec<usize>) {
     out.finish()
 }
 
-/// Every source-level expansion the front end runs before
-/// [`preprocess`], in the order the pipeline applies them.
+/// Every source-level expansion the front end runs before [`preprocess`],
+/// for a caller that wants no line table — the VM's entry point, its
+/// sibling-extension scan, and `tyc run`'s import scan.
 ///
-/// Three callers used to keep their own copy of this chain (the VM's entry
-/// point, its sibling-extension scan, and `tyc run`'s import scan), and a
-/// copy that drifted meant a program that parsed on one path failed to
-/// parse on another — which for the import scan silently disabled the
-/// VM's fall-back-to-CPython guarantee.
+/// Each of those three kept its own hand-written copy of the chain, and a
+/// copy that drifted meant a program parsing on one path failed to parse on
+/// another; for the import scan that silently disabled the VM's
+/// fall-back-to-CPython guarantee. They all share [`expand_sugar`] now,
+/// which is what `tyc check` runs.
 ///
-/// `expand_lazy_lets` is deliberately the lazy pass used here rather than
-/// the full `expand_lazy_imports`: the latter lowers `lazy import np =
-/// numpy` to a descriptor-protocol proxy class, which the VM does not
-/// model. `tyc build` applies `expand_lazy_imports` on top of this chain.
+/// `rewrite_lazy_imports` is off: the full `expand_lazy_imports` lowers
+/// `lazy import np = numpy` to a descriptor-protocol proxy class the VM
+/// does not model, and `preprocess` already rewrites the form the VM wants.
+/// `tyc build` passes `true` instead.
 pub fn expand_all(source: &str) -> String {
-    expand_question_ops(&expand_inline_question_ops(
-        &expand_compound_question_headers(&expand_pipes(&expand_with_chains(&expand_go_calls(
-            &expand_gather_blocks(&expand_multiline_guards(&expand_typed_let_unpack(
-                &expand_lazy_lets(source),
-            ))),
-        )))),
-    ))
+    expand_sugar(source, /*rewrite_lazy_imports=*/ false)
 }
 
 pub fn expand_question_ops(source: &str) -> String {
