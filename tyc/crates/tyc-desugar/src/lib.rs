@@ -1816,6 +1816,23 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
             final_body.insert(insert_at, make_module_import(module));
         }
     }
+    // `BaseModel` and `NewType` are prelude names for the same reason — the
+    // `model` and `newtype` lowerings introduce them — so naming either
+    // directly passes `tyc check`. The lowerings inject their imports only
+    // when they fire, so a bare reference (`print(BaseModel)`, or a
+    // hand-written `class C(BaseModel)` in a module with no `model`) raised
+    // `NameError` after `tyc build` while the VM, which has both in scope,
+    // ran it fine.
+    if module_references_bare_name(&final_body, "NewType")
+        && !module_binds_bare_name(&final_body, "NewType")
+    {
+        final_body.insert(insert_at, make_newtype_import());
+    }
+    if module_references_bare_name(&final_body, "BaseModel")
+        && !module_binds_bare_name(&final_body, "BaseModel")
+    {
+        final_body.insert(insert_at, make_pydantic_basemodel_only_import());
+    }
 
     ModModule {
         range: m.range,
@@ -4869,6 +4886,30 @@ mod tests {
         // Not referenced: nothing injected.
         let out = parse_and_desugar("def f() -> int:\n    return 1\n");
         assert!(!out.contains("import enum"), "{out}");
+    }
+
+    /// `BaseModel` and `NewType` resolve without an import (the `model` and
+    /// `newtype` lowerings introduce them), so a bare reference passes
+    /// `tyc check` — and used to `NameError` after `tyc build` while the VM
+    /// ran it, since the imports were injected only when a lowering fired.
+    #[test]
+    fn prelude_basemodel_and_newtype_referenced_bare_are_imported() {
+        let out = parse_and_desugar("def show() -> None:\n    print(BaseModel)\n");
+        assert!(out.contains("from pydantic import BaseModel"), "{out}");
+        let out = parse_and_desugar("def show() -> None:\n    print(NewType)\n");
+        assert!(out.contains("from typing import NewType"), "{out}");
+        // A hand-written base class gets it too (that path already worked).
+        let out = parse_and_desugar("class C(BaseModel):\n    x: int\n");
+        assert!(out.contains("from pydantic import BaseModel"), "{out}");
+        // Already bound: no duplicate.
+        let out = parse_and_desugar(
+            "from pydantic import BaseModel\n\ndef show() -> None:\n    print(BaseModel)\n",
+        );
+        assert_eq!(out.matches("import BaseModel").count(), 1, "{out}");
+        // Not referenced: nothing injected.
+        let out = parse_and_desugar("def f() -> int:\n    return 1\n");
+        assert!(!out.contains("BaseModel"), "{out}");
+        assert!(!out.contains("NewType"), "{out}");
     }
 
     #[test]

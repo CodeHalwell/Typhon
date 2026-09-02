@@ -133,6 +133,18 @@ while `shutil.rmtree` re-points its error at the argument it was given, as
 CPython's does. **The
 differential baseline falls from 167 entries to 13.**
 
+**A prelude name that only the VM could resolve.** `BaseModel` and
+`NewType` resolve without an import — the `model` and `newtype` lowerings
+introduce them — so naming either directly passes `tyc check`. Their
+imports were injected only when a lowering actually fired, so
+`print(BaseModel)`, or a hand-written `class C(BaseModel)` in a module
+with no `model` declaration, type-checked, built, and then raised
+`NameError` under CPython while `tyc run` (which has both in scope) ran
+it. The desugar injects the import for a bare reference now, and a source
+naming `BaseModel` adds the pydantic dependency the same way a `model`
+declaration does — otherwise the artefact would swap the `NameError` for a
+`ModuleNotFoundError`.
+
 **A staged script is reported as the script.** `tyc run --compile <file>`
 (and the automatic fallback, which now fires whenever a program imports
 something the VM does not model) stages the source into a temp project, so

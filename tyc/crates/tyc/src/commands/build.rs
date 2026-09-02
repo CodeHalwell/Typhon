@@ -2312,7 +2312,39 @@ fn python_module_name_from_path(path: &std::path::Path, src_dir: &std::path::Pat
 /// merge, since the emitter will produce `from pydantic import …`
 /// statements for those classes.
 fn sources_use_model_keyword(sources: &[(PathBuf, String)]) -> bool {
-    sources.iter().any(|(_, text)| source_uses_model(text))
+    sources
+        .iter()
+        .any(|(_, text)| source_uses_model(text) || source_names_basemodel(text))
+}
+
+/// Whether a source names `BaseModel` outside a string or comment. The
+/// desugar injects `from pydantic import BaseModel` for a bare reference
+/// (a hand-written `class C(BaseModel)`, say) exactly as it does for
+/// `model X:`, so the dependency has to be declared for both — otherwise
+/// the artefact swaps a `NameError` for a `ModuleNotFoundError`.
+fn source_names_basemodel(text: &str) -> bool {
+    let mut in_triple: Option<&'static str> = None;
+    for line in text.lines() {
+        let (next_state, line_starts_in_string) = update_triple_quote_state(line, in_triple);
+        let was_in_string = in_triple.is_some();
+        in_triple = next_state;
+        if was_in_string || line_starts_in_string {
+            continue;
+        }
+        let code = line.split('#').next().unwrap_or(line);
+        let mut rest = code;
+        while let Some(at) = rest.find("BaseModel") {
+            let before = rest[..at].chars().next_back();
+            let after = rest[at + "BaseModel".len()..].chars().next();
+            let boundary =
+                |c: Option<char>| !matches!(c, Some(c) if c.is_alphanumeric() || c == '_');
+            if boundary(before) && boundary(after) {
+                return true;
+            }
+            rest = &rest[at + "BaseModel".len()..];
+        }
+    }
+    false
 }
 
 fn source_uses_model(text: &str) -> bool {
