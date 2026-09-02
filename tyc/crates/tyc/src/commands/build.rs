@@ -4068,25 +4068,79 @@ def _load_state():
     return (build_root, maps, _source_root(build_root))
 
 
+# Written as chr(10) because this module is emitted from a Rust string
+# literal, where a backslash escape would have to be doubled.
+_NL = chr(10)
+
+
+def _ty_source(path, cache):
+    # Lines of a `.ty` file, or None when it cannot be read.
+    if path not in cache:
+        try:
+            with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+                cache[path] = fh.read().split(_NL)
+        except OSError:
+            cache[path] = None
+    return cache[path]
+
+
+def _is_anchor(line):
+    # A 3.11+ column-anchor row (`    ~~~~^^^^`) under a source line.
+    body = line.strip()
+    return bool(body) and set(body) <= set('~^')
+
+
 def _remap(text, state):
     build_root, maps, source_root = state
-
-    def repl(match):
-        path, lineno = match.group(1), int(match.group(2))
-        try:
-            rel = os.path.normpath(os.path.relpath(os.path.abspath(path), build_root))
-        except ValueError:  # pragma: no cover - different drive on Windows
-            return match.group(0)
-        entry = maps.get(rel)
-        if not entry:
-            return match.group(0)
-        source, lines = entry
-        if not (1 <= lineno <= len(lines)):
-            return match.group(0)
-        ty_path = os.path.join(source_root, source) if source_root else source
-        return 'File \"' + ty_path + '\", line ' + str(lines[lineno - 1])
-
-    return _FRAME_RE.sub(repl, text)
+    cache = {}
+    out = []
+    rows = text.split(_NL)
+    i = 0
+    while i < len(rows):
+        row = rows[i]
+        match = _FRAME_RE.search(row)
+        target = None
+        if match:
+            path, lineno = match.group(1), int(match.group(2))
+            try:
+                rel = os.path.normpath(os.path.relpath(os.path.abspath(path), build_root))
+            except ValueError:  # pragma: no cover - different drive on Windows
+                rel = None
+            entry = maps.get(rel) if rel else None
+            if entry:
+                source, table = entry
+                if 1 <= lineno <= len(table):
+                    ty_path = os.path.join(source_root, source) if source_root else source
+                    target = (ty_path, table[lineno - 1])
+        if target is None:
+            out.append(row)
+            i += 1
+            continue
+        ty_path, ty_line = target
+        head = 'File \"' + ty_path + '\", line ' + str(ty_line)
+        out.append(row[: match.start()] + head + row[match.end():])
+        i += 1
+        # The rows under a frame header are the EMITTED source and its column
+        # anchors. Leaving them under a `.ty` path and line is worse than
+        # showing nothing: the reader opens that line and finds something
+        # else, and a generated name (`__typhon_qi_0__`) leaks into the very
+        # traceback the source map exists to keep clean. Swap in the real
+        # `.ty` row and drop the anchors, whose columns no longer mean
+        # anything.
+        if i < len(rows) and rows[i].startswith(' ') and not _FRAME_RE.search(rows[i]):
+            src = _ty_source(ty_path, cache)
+            replacement = ''
+            if src is not None and 1 <= ty_line <= len(src):
+                replacement = src[ty_line - 1].strip()
+            # With no readable `.ty` row (a build shipped without its
+            # sources), keep what CPython printed rather than dropping it.
+            if replacement:
+                out.append('    ' + replacement)
+                i += 1
+                # The anchors point into the row just replaced.
+                if i < len(rows) and _is_anchor(rows[i]):
+                    i += 1
+    return _NL.join(out)
 ";
 
 /// Render `typhon_runtime/parallel.py`, baking the auto-parallel execution

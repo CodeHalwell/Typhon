@@ -1306,4 +1306,4 @@ Modelled shapes: scalars (`int` / `str` / `bool` / `float` / `bytes` / `None`), 
 - `tyc debug` source-mapping wrapper (v0.5.0) consumes to overload pdb's `do_list`/`do_where`/`format_stack_entry`/`prompt` so the entire debugger UI reads `.ty`
 - `tyc ty` (v0.5.0) consumes to remap `ty`'s `.py:LINE:COL` diagnostics back to `.ty` coordinates
 - `tyc lsp` consumes for go-to-definition across the `.ty` ↔ `.py` boundary
-- `typhon_runtime/traceback.py` (v0.14.0, when `[emit] traceback-remap = true`) consumes them at **runtime**: the installed `sys.excepthook` reads the sidecars from the running script's `.sourcemaps/` dir and rewrites an uncaught exception's frames to `.ty` — the `tyc trace` mapping, applied automatically
+- `typhon_runtime/traceback.py` (v0.14.0, when `[emit] traceback-remap = true`) consumes them at **runtime**: the installed `sys.excepthook` reads the sidecars from the running script's `.sourcemaps/` dir and rewrites an uncaught exception's frames to `.ty` — header, source row and all — the `tyc trace` mapping, applied automatically

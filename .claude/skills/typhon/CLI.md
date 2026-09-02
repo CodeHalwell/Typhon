@@ -165,6 +165,8 @@ See [RUNTIME.md](RUNTIME.md) for the VM's full feature surface and the fallback 
 
 Read a captured Python traceback (from the file, or from stdin when the argument is omitted) and rewrite frames back to `.ty` source via the `.py.map` sidecars.
 
+Every row is rewritten, not just the `File "…", line N` header: the source row CPython printed under a frame is replaced with the real `.ty` row and the column anchors (`~~~~^^^^`) are dropped, since their columns refer to the emitted line. Otherwise a frame naming `main.ty:10` sits above emitted Python — sometimes a generated name like `__typhon_qi_0__` — that does not exist there. Where the `.ty` is not readable from where `tyc trace` runs, the original row is kept.
+
 ```bash
 python build/main.py 2> err.log
 tyc trace err.log

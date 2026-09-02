@@ -1281,7 +1281,7 @@ fn is_main_guard(test: &Expr) -> bool {
 /// Inject the traceback-installer statements at the top of the first
 /// top-level `if __name__ == "__main__":` block. Returns `true` when an
 /// injection was made (so the caller flags `needs_typhon_runtime`).
-fn inject_traceback_install(body: &mut [Stmt]) -> bool {
+fn inject_traceback_install(body: &mut Vec<Stmt>) -> bool {
     for stmt in body.iter_mut() {
         if let Stmt::If(if_stmt) = stmt {
             if is_main_guard(&if_stmt.test) {
@@ -1292,7 +1292,53 @@ fn inject_traceback_install(body: &mut [Stmt]) -> bool {
             }
         }
     }
-    false
+    // No guard in the entry module — a script that just calls `main()` at
+    // the bottom, which most single-file programs are. The knob was turned
+    // on deliberately, so silently doing nothing for that shape is the
+    // wrong answer: synthesise a guard of our own and put the installer in
+    // it, ahead of the first executable statement. Keeping it inside a
+    // `__main__` guard preserves the property that importing the module as
+    // a library never installs a hook.
+    let at = body
+        .iter()
+        .position(|s| !is_module_prelude(s))
+        .unwrap_or(body.len());
+    let guard = Stmt::If(ast::StmtIf {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        test: Box::new(make_main_guard_test()),
+        body: make_traceback_install_stmts(),
+        elif_else_clauses: vec![],
+    });
+    body.insert(at, guard);
+    true
+}
+
+/// A top-level statement that must stay above the injected guard: the module
+/// docstring and the imports (`from __future__` in particular has to remain
+/// the first statement).
+fn is_module_prelude(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Import(_) | Stmt::ImportFrom(_) => true,
+        Stmt::Expr(e) => matches!(e.value.as_ref(), Expr::StringLiteral(_)),
+        _ => false,
+    }
+}
+
+/// The `__name__ == "__main__"` test expression.
+fn make_main_guard_test() -> Expr {
+    Expr::Compare(ast::ExprCompare {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        left: Box::new(Expr::Name(ExprName {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            id: Name::new("__name__"),
+            ctx: ExprContext::Load,
+        })),
+        ops: Box::new([ast::CmpOp::Eq]),
+        comparators: Box::new([make_string_literal_expr("__main__")]),
+    })
 }
 
 /// `true` when `body` already binds `__typhon_freeze__` as an alias of
@@ -5864,6 +5910,73 @@ def helper() -> None:
         assert!(
             call > guard,
             "install must be inside the __main__ block:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn traceback_remap_synthesises_a_guard_for_a_bare_script() {
+        // Most single-file programs just call `main()` at the bottom. The
+        // injector only ever looked for an existing `if __name__ ==
+        // "__main__":` block, so for those the knob silently did nothing
+        // and the traceback stayed in emitted-Python terms. A guard of our
+        // own is synthesised instead — keeping the installer out of a
+        // library import — and it goes ahead of the first executable
+        // statement, so the hook is live before any top-level code runs.
+        let src = "\"\"\"Doc.\"\"\"\nimport sys\n\n\ndef main() -> None:\n    pass\n\n\nmain()\n";
+        let module = tyc_syntax::parse_module(src)
+            .expect("parse failed")
+            .into_syntax();
+        let out = desugar_module_with(
+            &module,
+            DesugarOptions {
+                traceback_remap: true,
+                ..Default::default()
+            },
+        );
+        let emitted = emit(&out.module);
+        assert!(
+            emitted.contains("if __name__ == \"__main__\":")
+                && emitted.contains("__typhon_install_tb__()"),
+            "a guard should be synthesised:\n{emitted}"
+        );
+        assert!(out.needs_typhon_runtime, "runtime must be flagged");
+        // Ahead of the first executable statement, behind the prelude.
+        let doc = emitted.find("\"\"\"Doc.\"\"\"").expect("docstring kept");
+        let import = emitted.find("import sys").expect("import kept");
+        let guard = emitted.find("if __name__").expect("guard present");
+        let def = emitted.find("def main").expect("def present");
+        assert!(
+            doc < guard && import < guard && guard < def,
+            "the guard belongs after the prelude and before the first \
+             executable statement:\n{emitted}"
+        );
+        // Exactly one guard: a script that already has one must not get a
+        // second.
+        assert_eq!(
+            emitted.matches("if __name__").count(),
+            1,
+            "one guard only:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn traceback_remap_does_not_add_a_second_guard() {
+        let src = "def main() -> None:\n    pass\n\nif __name__ == \"__main__\":\n    main()\n";
+        let module = tyc_syntax::parse_module(src)
+            .expect("parse failed")
+            .into_syntax();
+        let out = desugar_module_with(
+            &module,
+            DesugarOptions {
+                traceback_remap: true,
+                ..Default::default()
+            },
+        );
+        let emitted = emit(&out.module);
+        assert_eq!(
+            emitted.matches("if __name__").count(),
+            1,
+            "the existing guard should be reused:\n{emitted}"
         );
     }
 

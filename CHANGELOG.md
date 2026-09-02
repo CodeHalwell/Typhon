@@ -442,6 +442,44 @@ re-emitted rather than joined. A trailing `?` on a continuation line
 (`sum([\n    parse(a)?\n])`) goes to the same lift, since the end-of-line
 pass rewrites whole statements and that line does not end one.
 
+**A traceback that says `.ty` now shows `.ty`.** The source maps were
+audited the way the formatter was — every buildable unit built, every
+`.py.map` checked against its source (mapped lines in range, the table
+covering every emitted line, and each emitted `def` / `class` header
+landing on a `.ty` row that names it). 1,203 of 1,208 pass; the five that
+don't are synthesised constructors, which have no `.ty` line of their own
+and honestly map to the last field. So the tables are right. What was
+wrong was what surrounded them.
+
+*The rows under a frame were still emitted Python.* Both the runtime
+remapper and `tyc trace` rewrote the `File "…", line N` header and left
+CPython's source row beneath it untouched — so a frame read
+
+```
+  File "src/main.ty", line 10, in total
+    __typhon_qi_1__ = parse(b)
+```
+
+where line 10 of that file is `parse(b)?,`. Opening the line named in the
+traceback showed something else, and a generated name leaked into the one
+place the source maps exist to keep clean. Both now substitute the real
+`.ty` row and drop the column anchors, whose columns no longer mean
+anything; where the `.ty` file cannot be read (a build shipped without its
+sources) the original row is kept rather than dropped.
+
+*The knob did nothing for a script without a `__main__` guard.* The
+installer was only ever injected into an existing `if __name__ ==
+"__main__":` block, and most single-file programs just call `main()` at the
+bottom. `[emit] traceback-remap = true` was silently inert for them. A
+guard is synthesised now, placed after the module docstring and imports and
+ahead of the first executable statement — inside a guard still, so
+importing the module as a library never installs a hook.
+
+*And a hoisted `?` guard maps to its own line.* The guards the new
+wrapped-call lift raises are recorded against the physical line their `?`
+came from rather than the head of the statement, so the frame points at
+`parse(b)?` and not at the `sum([` three lines above it.
+
 **Four more in `tyc migrate` itself, three of them corruption.** The
 rewrite loop counted brackets but tracked no strings, so docstring prose
 was read as code: a bullet whose item was `like:` on its own line came back

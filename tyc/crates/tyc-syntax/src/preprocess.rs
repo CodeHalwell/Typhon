@@ -6664,7 +6664,10 @@ fn expand_inline_question_ops_split(source: &str) -> (String, Vec<usize>) {
     // Without this, a `?` inside a wrapped call (`add(\n  p("a")?, p("b")?\n)`)
     // produced a guard spliced into the middle of an argument list, and the
     // parse error the user saw named neither the line nor the construct.
-    let mut pending: Vec<String> = Vec::new();
+    // Each pending guard remembers the physical line its `?` came from, so
+    // a traceback still points at the propagating call rather than at the
+    // head of the statement it was hoisted out of.
+    let mut pending: Vec<(usize, String)> = Vec::new();
     let mut buffered: Vec<String> = Vec::new();
     let mut buf_start = 0usize;
 
@@ -6709,13 +6712,16 @@ fn expand_inline_question_ops_split(source: &str) -> (String, Vec<usize>) {
                             .map(|l| &l[..l.len() - l.trim_start().len()])
                             .unwrap_or("");
                         for l in &lifted {
-                            pending.push(match l.strip_prefix(from) {
-                                Some(rest) => format!("{head_indent}{rest}"),
-                                None => l.clone(),
-                            });
+                            pending.push((
+                                line_index,
+                                match l.strip_prefix(from) {
+                                    Some(rest) => format!("{head_indent}{rest}"),
+                                    None => l.clone(),
+                                },
+                            ));
                         }
                     }
-                    None => pending.extend(lifted),
+                    None => pending.extend(lifted.into_iter().map(|l| (line_index, l))),
                 }
                 buffered.push(format!("{rewritten}{comment}{nl}"));
                 needs_err_alias_import = true;
@@ -6738,12 +6744,12 @@ fn expand_inline_question_ops_split(source: &str) -> (String, Vec<usize>) {
 /// statement opened on, so a traceback still points at the user's source.
 fn flush_lifted_statement(
     out: &mut MappedOut,
-    pending: &mut Vec<String>,
+    pending: &mut Vec<(usize, String)>,
     buffered: &mut Vec<String>,
     buf_start: usize,
 ) {
-    out.mark(buf_start);
-    for l in pending.drain(..) {
+    for (src_line, l) in pending.drain(..) {
+        out.mark(src_line);
         out.push_str(&l);
         out.push('\n');
     }

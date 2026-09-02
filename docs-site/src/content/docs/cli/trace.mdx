@@ -27,9 +27,12 @@ python build/main.py 2>&1 | tyc trace
 2. For each frame referring to a `build/*.py`, find the matching `.py.map` v2.
 3. Look up the `out_line → ty_line` mapping for the frame's line number.
 4. Rewrite the frame to point at `src/*.ty` line M.
-5. Print the remapped traceback.
+5. Replace the source row CPython printed under the frame with the real `.ty` row, and drop the column anchors (`~~~~^^^^`) — their columns refer to the emitted line, not this one.
+6. Print the remapped traceback.
 
 The output looks like a normal Python traceback, but the frames are `.ty` paths and line numbers.
+
+Step 5 matters as much as step 4. Rewriting only the header leaves a frame reading `File "src/main.ty", line 10` above a row of emitted Python — sometimes a generated name like `__typhon_qi_0__` — that does not exist at `main.ty:10`, so opening the line named in the traceback shows something else. Where the `.ty` file is not readable from where `tyc trace` runs (a traceback pasted from another machine), the original row is kept rather than dropped.
 
 ## When to use
 

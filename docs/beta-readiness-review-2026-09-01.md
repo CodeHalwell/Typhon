@@ -550,6 +550,31 @@ with every gate green at each step.
   answer is `type Alias = ...`; whether the checker should recognise the
   Python-legacy form is a design call, not a bug fix.
 
+- **The source maps were right; what surrounded them was not.** Nothing had
+  ever checked the `.py.map` sidecars at corpus scale, so they were audited
+  the way the formatter was: build every unit, then verify each map's lines
+  are in range, that the table covers every emitted line, and that each
+  emitted `def` / `class` header lands on a `.ty` row naming it. 1,203 of
+  1,208 pass, and the five that don't are synthesised constructors — which
+  have no `.ty` line of their own and honestly map to the last field. The
+  tables are sound.
+
+  The consumers were not. Both the runtime remapper and `tyc trace`
+  rewrote the `File "…", line N` header and left CPython's source row
+  beneath it alone, so a frame read `File "src/main.ty", line 10` above
+  `__typhon_qi_1__ = parse(b)` — where line 10 of that file says
+  `parse(b)?,`. The traceback named a line that showed something else, and
+  a generated name leaked into the one place source maps exist to keep
+  clean. Both substitute the real `.ty` row now and drop the column
+  anchors; where the `.ty` cannot be read, the original row is kept.
+
+  And `[emit] traceback-remap = true` did nothing at all for a script with
+  no `if __name__ == "__main__":` guard — which most single-file programs
+  are. The injector only ever *found* a guard; it synthesises one now,
+  after the docstring and imports and ahead of the first executable
+  statement, still inside a guard so a library import never installs a
+  hook.
+
 - ~~**`tyc run --compile <file>` diagnostics name the scaffold.**~~ Closed:
   the staged build reports diagnostics under the path the user gave, and
   the scaffold turns on `traceback-remap`, so an uncaught exception's
