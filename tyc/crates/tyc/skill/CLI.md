@@ -70,6 +70,8 @@ tyc fmt --check src/         # -c: exit non-zero if anything would change; write
 
 `--check` / `-c` is the only flag — there is no `--diff` or `--quiet`. `tyc fmt` collects `.ty` files only; `.dty` stubs are not formatted.
 
+A file that does not parse is reported and skipped — the walk carries on and the command exits non-zero at the end with a count, so one broken file never leaves a tree half-formatted and `--check` surfaces every failure in one run. The formatter accepts exactly what `tyc check` accepts (same sugar chain), converges in a single pass, and leaves `tyc build`'s emitted Python byte-identical (bar a generated `__typhon_guard_N` temporary, numbered from the line it came from).
+
 In-process whitespace pass handles: trailing spaces, final newline, leading-tab expansion, line-ending normalisation, and **five PEP 8 spacing rules** (v0.3.0): space after `:`, spaces around `->`, space after `,`, single-space around binary `+`/`-` and top-level `=`, two blank lines before top-level `def`/`class`/`async def`. Falls back silently to in-process output on `ruff` failure.
 
 Scientific-notation literals (`1e-12`, `2.5E+7`, `1.0e-12`) survive the whitespace pass intact (v0.7.0).

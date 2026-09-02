@@ -1328,6 +1328,134 @@ fn vm_imports_a_submodule_through_its_package() {
 }
 
 #[test]
+fn fmt_round_trips_the_corpus_shapes_it_used_to_corrupt() {
+    // End-to-end, through the real binary (so the `ruff format` wrap is in
+    // play, unlike the crate-level tests which disable it):
+    //
+    //   * a `freeze let` bound to a multi-line string must survive
+    //     formatting — it used to come back with the desugaring's
+    //     `__typhon_freeze__(` baked in and no longer parse;
+    //   * a multi-line `with`-chain using `?` must be accepted — the
+    //     formatter used to reject source `tyc check` accepts;
+    //   * formatting must converge in one pass, and the program must still
+    //     run to the same output afterwards.
+    let tmp = tempfile::tempdir().unwrap();
+    let source = concat!(
+        "freeze let BANNER = \"\"\"\n",
+        "hi ) there\n",
+        "\"\"\"\n",
+        "\n",
+        "\n",
+        "def pair(a: Result[str, str], b: Result[str, str]) -> Result[str, str]:\n",
+        "    with x = a?,\n",
+        "         y = b?:\n",
+        "        return Ok(x + y)\n",
+        "    else err:\n",
+        "        return Err(err)\n",
+        "\n",
+        "\n",
+        "def main() -> None:\n",
+        "    print(BANNER.strip(), pair(Ok(\"a\"), Ok(\"b\")))\n",
+        "\n",
+        "\n",
+        "main()\n",
+    );
+    scaffold(tmp.path(), source);
+    let entry = tmp.path().join("src").join("main.ty");
+
+    let before = tyc()
+        .arg("run")
+        .arg("--no-fallback")
+        .arg(tmp.path())
+        .env("TYC_NO_SYNC", "1")
+        .output()
+        .unwrap();
+    let before_out = String::from_utf8_lossy(&before.stdout).into_owned();
+    assert!(
+        before_out.contains("hi ) there"),
+        "the unformatted program should run: {before_out}"
+    );
+
+    let fmt1 = tyc().arg("fmt").arg(&entry).output().unwrap();
+    assert!(
+        fmt1.status.success(),
+        "tyc fmt rejected source tyc check accepts:\n{}",
+        String::from_utf8_lossy(&fmt1.stderr)
+    );
+    let pass1 = std::fs::read_to_string(&entry).unwrap();
+    assert!(
+        !pass1.contains("__typhon_freeze__"),
+        "the freeze desugaring leaked into the formatted source:\n{pass1}"
+    );
+
+    // Convergence: a second pass must be a no-op, and `--check` must agree.
+    let fmt2 = tyc().arg("fmt").arg(&entry).output().unwrap();
+    assert!(fmt2.status.success(), "second fmt pass failed");
+    assert_eq!(
+        pass1,
+        std::fs::read_to_string(&entry).unwrap(),
+        "tyc fmt is not idempotent on this file"
+    );
+    let check = tyc()
+        .arg("fmt")
+        .arg("--check")
+        .arg(&entry)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "tyc fmt --check should pass on already-formatted source:\n{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    // And meaning is preserved.
+    let after = tyc()
+        .arg("run")
+        .arg("--no-fallback")
+        .arg(tmp.path())
+        .env("TYC_NO_SYNC", "1")
+        .output()
+        .unwrap();
+    assert_eq!(
+        before_out,
+        String::from_utf8_lossy(&after.stdout),
+        "formatting changed the program's output"
+    );
+}
+
+#[test]
+fn fmt_reports_a_broken_file_and_still_formats_the_rest() {
+    // One unparseable file must not stop the walk: `tyc fmt <dir>` used to
+    // bail out at the first failure, leaving the tree half-formatted with
+    // no record of what it never reached.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "def main() -> None:\n    print(1)\n\n\nmain()\n",
+    );
+    let src = tmp.path().join("src");
+    // Sorts before `main.ty`, so it is visited first.
+    std::fs::write(src.join("aa_broken.ty"), "def f(:\n").unwrap();
+    std::fs::write(src.join("zz_messy.ty"), "def g():\n\tpass\n").unwrap();
+
+    let out = tyc().arg("fmt").arg(&src).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "an unformattable file must still fail the run"
+    );
+    assert!(
+        stderr.contains("1 file could not be formatted"),
+        "the failure should be counted and named:\n{stderr}"
+    );
+    let messy = std::fs::read_to_string(src.join("zz_messy.ty")).unwrap();
+    assert!(
+        messy.contains("    pass"),
+        "the file after the broken one must still be formatted, got {messy:?}"
+    );
+}
+
+#[test]
 fn build_fails_on_type_error() {
     let tmp = tempfile::tempdir().unwrap();
     scaffold(tmp.path(), "let x: int = \"wrong type\"\n");

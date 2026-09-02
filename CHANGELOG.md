@@ -347,6 +347,47 @@ argv, no stdin, a traceback fixture), and every one of the remaining 26
 reproduces a limitation the beta-readiness review already lists. Nothing
 unknown was hiding there — but nothing was watching either.
 
+**Three formatter bugs, found by auditing what `tyc fmt` does to the whole
+corpus.** Nobody had run the formatter over `examples/` and `stress/` and
+asked the three questions that matter — does it converge, does it accept
+what the checker accepts, and does it preserve meaning. It did not.
+
+*It wrote source it could not read back.* `freeze let BANNER = """…"""`
+lowers to `let BANNER = __typhon_freeze__("""…` with the closing `)`
+appended to the line that ends the string, and the restoration paired
+that `)` by bracket depth alone — which a triple-quoted right-hand side
+never opens. So the opener kept its `__typhon_freeze__(`, and the file
+`tyc fmt` left behind no longer parsed. The pairing walk now tracks the
+string literal alongside the brackets, and seeds the close line's scan
+with the state it is entered in so a `)` *inside* the string is never
+mistaken for the wrapper's.
+
+*It rejected programs `tyc check` accepts.* The formatter validated a
+throw-away copy built by running the sugar passes over the
+already-preprocessed buffer — the reverse of the order every other
+surface uses. `preprocess` rewrites nullable `T?` to `T | None`, so a
+postfix `?` was eaten before `expand_with_chains` could see it and
+`with x = a?,` arrived as `with x = a | None,`, which is not a chain.
+Any multi-line `with`-chain using `?` was unformattable. The copy is
+built from the original source through the shared `expand_sugar` chain
+now, which also re-syncs it: the hand-rolled composition had fallen two
+passes behind.
+
+*One bad file stopped the walk.* `tyc fmt src/` bailed out at the first
+file it could not parse, having already written every file before it —
+a half-formatted tree, no record of what was skipped, and a
+`--check` run in CI that surfaced one error per invocation. It reports
+each failure and carries on now, exiting non-zero at the end with a
+count, as every other formatter in the ecosystem does.
+
+With those fixed the audit is clean: all 1,684 formattable corpus files
+reach a fixed point in a single pass; the 8 the formatter rejects are
+exactly the 8 `tyc check` rejects; and formatting changes no emitted
+Python anywhere — 1,199 standalone units and all 19 buildable projects
+build byte-identically before and after, with nine files differing only
+in a `__typhon_guard_N` temporary whose number is derived from a line
+that moved.
+
 **A prelude name that only the VM could resolve.** `BaseModel` and
 `NewType` resolve without an import — the `model` and `newtype` lowerings
 introduce them — so naming either directly passes `tyc check`. Their

@@ -28,32 +28,59 @@ pub struct FmtArgs {
 pub fn run(args: FmtArgs) -> Result<()> {
     let mut changed = 0usize;
     let mut total = 0usize;
+    // A file the formatter cannot parse does NOT abort the walk. One
+    // work-in-progress file used to stop `tyc fmt src/` dead, leaving the
+    // tree half-formatted with no record of which files were never
+    // visited, and made `tyc fmt --check` in CI a one-error-per-run loop.
+    // Every other formatter in the ecosystem reports each failure and
+    // carries on, exiting non-zero at the end; so does this one.
+    let mut failed = 0usize;
 
     for root in &args.paths {
         for path in collect_ty_files(root)? {
             total += 1;
 
-            if args.check {
-                let source = std::fs::read_to_string(&path).map_err(|e| {
-                    Report::new(tyc_diagnostics::TycError::io(
-                        path.to_string_lossy().into_owned(),
-                        &e,
-                    ))
-                })?;
-                let result = tyc_format::format_source(&source, &path.to_string_lossy())
-                    .map_err(Report::new)?;
-                if result.changed {
-                    changed += 1;
-                    eprintln!("would reformat: {}", path.display());
-                }
+            let outcome = if args.check {
+                std::fs::read_to_string(&path)
+                    .map_err(|e| {
+                        Report::new(tyc_diagnostics::TycError::io(
+                            path.to_string_lossy().into_owned(),
+                            &e,
+                        ))
+                    })
+                    .and_then(|source| {
+                        tyc_format::format_source(&source, &path.to_string_lossy())
+                            .map(|result| result.changed)
+                            .map_err(Report::new)
+                    })
             } else {
-                let did_change = format_file(&path).map_err(Report::new)?;
-                if did_change {
+                format_file(&path).map_err(Report::new)
+            };
+
+            match outcome {
+                Ok(true) => {
                     changed += 1;
-                    println!("reformatted: {}", path.display());
+                    if args.check {
+                        eprintln!("would reformat: {}", path.display());
+                    } else {
+                        println!("reformatted: {}", path.display());
+                    }
+                }
+                Ok(false) => {}
+                Err(report) => {
+                    failed += 1;
+                    eprintln!("{:?}", report);
                 }
             }
         }
+    }
+
+    if failed > 0 {
+        return Err(miette!(
+            "{} file{} could not be formatted",
+            failed,
+            if failed == 1 { "" } else { "s" }
+        ));
     }
 
     if args.check && changed > 0 {
@@ -151,6 +178,49 @@ mod tests {
             check: true,
         };
         assert!(run(args).is_err());
+    }
+
+    #[test]
+    fn fmt_keeps_going_past_a_file_it_cannot_parse() {
+        // A single unparseable file must not abort the walk: every other
+        // file in the tree still gets formatted, and the command still
+        // exits non-zero so the failure is not silent.
+        let tmp = tempfile::tempdir().unwrap();
+        write_ty(tmp.path(), "a_broken.ty", "def f(:\n");
+        let good = write_ty(tmp.path(), "z_good.ty", "def f():\n\tpass\n");
+        let args = FmtArgs {
+            paths: vec![tmp.path().to_path_buf()],
+            check: false,
+        };
+        assert!(
+            run(args).is_err(),
+            "an unformattable file must fail the run"
+        );
+        // `a_broken.ty` sorts first, so the old `?` bailed out before ever
+        // reaching this file.
+        let formatted = std::fs::read_to_string(&good).unwrap();
+        assert!(
+            formatted.contains("    pass"),
+            "the file after the broken one must still be formatted, got {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn fmt_check_reports_every_unparseable_file() {
+        // `--check` in CI should surface all the failures in one run
+        // rather than one per invocation.
+        let tmp = tempfile::tempdir().unwrap();
+        write_ty(tmp.path(), "a.ty", "def f(:\n");
+        write_ty(tmp.path(), "b.ty", "class C(:\n");
+        let args = FmtArgs {
+            paths: vec![tmp.path().to_path_buf()],
+            check: true,
+        };
+        let err = run(args).unwrap_err();
+        assert!(
+            err.to_string().contains("2 files could not be formatted"),
+            "expected both failures to be counted, got {err}"
+        );
     }
 
     #[test]

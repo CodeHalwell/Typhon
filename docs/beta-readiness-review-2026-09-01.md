@@ -477,6 +477,34 @@ with every gate green at each step.
   which is the reassuring half; the harness now reports the two populations
   separately (`vacuous` / `vacuous-runtime`) so the second cannot be read as
   a missing package again.
+- **Nothing had audited the formatter.** `tyc fmt` had never been run over
+  the corpus and asked whether it converges, whether it accepts what the
+  checker accepts, and whether it preserves meaning. All three answers were
+  partly no. It **corrupted** a `freeze let X = """…"""` binding, writing
+  back source it could not itself parse (the `__typhon_freeze__(` wrapper's
+  closing `)` was paired by bracket depth alone, and a triple-quoted
+  right-hand side opens no brackets); it **rejected** any multi-line
+  `with`-chain using `?`, because its validation copy ran the sugar passes
+  over the already-preprocessed buffer — the reverse of every other
+  surface's order, so `preprocess`'s nullable rewrite ate the `?` before
+  `expand_with_chains` could see it, and the hand-rolled chain had drifted
+  two passes behind besides; and one unparseable file **aborted the whole
+  walk**, leaving a half-formatted tree and making `tyc fmt --check` a
+  one-error-per-run loop in CI. All three are fixed, and the audit is now
+  clean: 1,684/1,684 formattable files reach a fixed point in one pass, the
+  8 files the formatter rejects are exactly the 8 `tyc check` rejects, and
+  `tyc build` emits byte-identical Python before and after formatting for
+  all 1,199 buildable standalone units and all 19 buildable projects (nine
+  files differ only in a `__typhon_guard_N` temporary numbered from a line
+  that moved).
+
+  One decision is deferred to the maintainer rather than made here: 1,282
+  of the 1,692 corpus files are not `fmt`-clean, almost all of it ruff's
+  blank-line rules and the de-aligning of hand-aligned `case` arms.
+  Reformatting the corpus is a large, purely cosmetic diff, and it is a
+  precondition for ever adding `tyc fmt --check` to CI — but it is a style
+  call, not a correctness one.
+
 - ~~**`tyc run --compile <file>` diagnostics name the scaffold.**~~ Closed:
   the staged build reports diagnostics under the path the user gave, and
   the scaffold turns on `traceback-remap`, so an uncaught exception's

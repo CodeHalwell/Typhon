@@ -38,9 +38,8 @@ use tyc_diagnostics::TycError;
 use tyc_syntax::{
     parse_module,
     preprocess::{
-        expand_gather_blocks, expand_go_calls, expand_inline_question_ops, expand_multiline_guards,
-        expand_pipes, expand_question_ops, expand_typed_let_unpack, expand_with_chains,
-        postprocess_full, preprocess_opts, PreprocessOptions, StrippedKeyword, StrippedOptional,
+        expand_sugar, postprocess_full, preprocess, preprocess_opts, PreprocessOptions,
+        StrippedKeyword, StrippedOptional,
     },
 };
 
@@ -80,14 +79,20 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
     // The formatter does not want to rewrite the user's `?`, `|>`, or
     // `with`-chain syntax (that's `tyc build`'s job), but the underlying
     // Python parser cannot accept those constructs directly. Expand them in
-    // a throw-away copy of the source purely for validation; the normalised
-    // output below is still derived from `prep.python_source` so the Typhon
-    // sugar is preserved when the file is rewritten.
-    let validation_input = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
-        &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-            &expand_multiline_guards(&expand_typed_let_unpack(&prep.python_source)),
-        ))),
-    )));
+    // a throw-away copy purely for validation; the normalised output below
+    // is still derived from `prep.python_source` so the Typhon sugar is
+    // preserved when the file is rewritten.
+    //
+    // The throw-away copy is built from the ORIGINAL source through the
+    // shared sugar chain and only then preprocessed — the same order every
+    // other surface uses. Running the sugar passes over `prep.python_source`
+    // instead (preprocess first) inverts that order, and `preprocess`'s
+    // nullable-`?` rewrite then eats the postfix `?` operator a later pass
+    // needed: `with x = a?,` reaches `expand_with_chains` as
+    // `with x = a | None,`, which it cannot recognise, and the formatter
+    // rejects a file `tyc check` accepts. Sharing the chain also stops the
+    // two from drifting — this copy had fallen two passes behind.
+    let validation_input = preprocess(&expand_sugar(source, true)).python_source;
     parse_module(&validation_input).map_err(|e| {
         let offset = usize::from(e.location.start());
         TycError::parse(path, &validation_input, e.to_string(), offset)
@@ -2391,6 +2396,105 @@ def run() -> Result[int, str]:
             assert!(
                 !result.changed,
                 "clean snippet must report unchanged:\n{src:?}"
+            );
+        }
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TYC_FMT_DISABLE_RUFF", v),
+                None => std::env::remove_var("TYC_FMT_DISABLE_RUFF"),
+            }
+        }
+    }
+
+    #[test]
+    fn format_round_trips_a_freeze_let_with_a_multi_line_string() {
+        // `freeze let X = """…"""` lowers to `let X = __typhon_freeze__("""…`
+        // with the closing `)` appended to the line that closes the string.
+        // The restoration paired that `)` by bracket depth alone, which a
+        // triple-quoted RHS never opens — so the opener kept its
+        // `__typhon_freeze__(` and `tyc fmt` wrote source it could no
+        // longer parse. Round-tripping every shape here proves the pairing
+        // now tracks the literal too.
+        let _guard = lock_env();
+        let prior = std::env::var_os("TYC_FMT_DISABLE_RUFF");
+        unsafe {
+            std::env::set_var("TYC_FMT_DISABLE_RUFF", "1");
+        }
+        let sources = [
+            // The plain shape: nothing but a string.
+            "freeze let BANNER = \"\"\"\nhello\n\"\"\"\n",
+            // A `)` inside the string must not be mistaken for the wrapper's.
+            "freeze let DOC = \"\"\"\nline with ) paren\n\"\"\"\n",
+            // Single-quoted triples take the same path.
+            "freeze let TXT = '''a\nb'''\n",
+            // A comment on the opener survives the round-trip.
+            "freeze let N = \"\"\"\nx\n\"\"\"  # note\n",
+            // Brackets AND a literal open on the same line: both have to
+            // close before the appended `)` is found.
+            "freeze let CFG: dict[str, str] = {\n    \"sql\": \"\"\"\nselect 1)\n\"\"\",\n}\n",
+        ];
+        for src in sources {
+            let once = format_source(src, "<test>").unwrap();
+            assert!(
+                !once.output.contains("__typhon_freeze__"),
+                "the desugaring leaked into formatted source:\n{src:?}\n-> {:?}",
+                once.output
+            );
+            assert_eq!(
+                once.output, src,
+                "a freeze/string binding must round-trip exactly:\n{src:?}"
+            );
+            // And the output must still be formattable — the corruption
+            // showed up as a parse error on the SECOND pass.
+            let twice = format_source(&once.output, "<test>").unwrap();
+            assert_eq!(twice.output, once.output, "second pass changed the file");
+        }
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TYC_FMT_DISABLE_RUFF", v),
+                None => std::env::remove_var("TYC_FMT_DISABLE_RUFF"),
+            }
+        }
+    }
+
+    #[test]
+    fn format_accepts_the_sugar_the_checker_accepts() {
+        // The validation copy used to run the sugar passes over the
+        // ALREADY-preprocessed buffer. `preprocess` rewrites nullable `T?`
+        // to `T | None`, so a postfix `?` in a multi-line `with` chain was
+        // eaten before `expand_with_chains` could see it and the formatter
+        // rejected a file `tyc check` accepts. Building the copy from the
+        // original source through the shared chain fixes the order — and
+        // sharing it stops the two drifting apart again.
+        let _guard = lock_env();
+        let prior = std::env::var_os("TYC_FMT_DISABLE_RUFF");
+        unsafe {
+            std::env::set_var("TYC_FMT_DISABLE_RUFF", "1");
+        }
+        let sources = [
+            // The multi-line `with` chain that regressed.
+            concat!(
+                "def f(a: Result[str, str], b: Result[int, str]) -> Result[str, str]:\n",
+                "    with x = a?,\n",
+                "         y = b?:\n",
+                "        return Ok(f\"{x}{y}\")\n",
+                "    else err:\n",
+                "        return Err(err)\n",
+            ),
+            // A compound `?` header — the pass the copy had fallen behind on.
+            concat!(
+                "def g(a: Result[int, str]) -> Result[int, str]:\n",
+                "    if a? > 0:\n",
+                "        return Ok(1)\n",
+                "    return Ok(0)\n",
+            ),
+        ];
+        for src in sources {
+            let result = format_source(src, "<test>");
+            assert!(
+                result.is_ok(),
+                "the formatter rejected source the checker accepts:\n{src}\n{:?}",
+                result.err()
             );
         }
         unsafe {

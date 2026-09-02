@@ -1440,22 +1440,32 @@ fn unwrap_freeze_let(content: &str) -> Option<String> {
 /// the `__typhon_freeze__(` wrapper into the formatted `.ty` source
 /// (kilnlog #4).
 ///
-/// Returns `(open_line_without_wrapper, residual_bracket_depth)` where the
-/// residual depth is what the RHS opens on this physical line, so the caller
-/// can walk forward and drop the matching appended `)`. Returns `None` when
-/// the line isn't an unclosed freeze opener (leaving the single-line path
+/// Returns `(open_line_without_wrapper, residual_bracket_depth,
+/// trailing_string_mode)`. The residual depth is what the RHS opens in
+/// brackets on this physical line and the string mode is the literal it
+/// leaves open, so the caller can walk forward to the line that closes
+/// *both* and drop the matching appended `)`. Returns `None` when the line
+/// isn't an unclosed freeze opener (leaving the single-line path
 /// responsible for the balanced case).
-fn unwrap_freeze_let_open(content: &str) -> Option<(String, i32)> {
+///
+/// A triple-quoted RHS opens nothing in brackets, so the depth alone is
+/// not enough: `freeze let BANNER = """` has residual 0 and would look
+/// balanced. Reporting the open string mode too is what stops `tyc fmt`
+/// baking `__typhon_freeze__(` into the source of a multi-line string
+/// binding.
+fn unwrap_freeze_let_open(content: &str) -> Option<(String, i32, Option<StringMode>)> {
     let code = strip_trailing_comment(content);
     let comment = content[code.len()..].trim();
     let eq = code.find('=')?;
     let lhs = code[..eq].trim_end();
     let rhs = code[eq + 1..].trim();
     let inner = rhs.strip_prefix("__typhon_freeze__(")?;
-    let residual = bracket_delta_simple(inner);
-    // A balanced (residual <= 0) opener is the single-line shape — let
-    // `unwrap_freeze_let` own it. Only take over the genuinely-unclosed case.
-    if residual <= 0 {
+    let mut trailing_string: Option<StringMode> = None;
+    let residual = bracket_delta_outside_strings(inner, &mut trailing_string);
+    // A balanced opener that leaves no string open is the single-line shape
+    // — let `unwrap_freeze_let` own it. Only take over the genuinely
+    // unclosed case, in brackets or in a literal.
+    if residual <= 0 && trailing_string.is_none() {
         return None;
     }
     // Preserve a trailing comment on the opener so `tyc fmt` never silently
@@ -1465,7 +1475,11 @@ fn unwrap_freeze_let_open(content: &str) -> Option<(String, i32)> {
     } else {
         format!("  {}", comment)
     };
-    Some((format!("{} = {}{}", lhs, inner, suffix), residual))
+    Some((
+        format!("{} = {}{}", lhs, inner, suffix),
+        residual,
+        trailing_string,
+    ))
 }
 
 /// Wrap the RHS of a `freeze let` binding in `__typhon_freeze__(...)`.
@@ -3171,31 +3185,41 @@ pub fn postprocess_full(
                 if let Some(restored) = unwrap_freeze_let(&content) {
                     // Single-line, balanced wrapper.
                     lines[line_idx] = format!("{}freeze {}", prefix, restored);
-                } else if let Some((open_restored, residual)) = unwrap_freeze_let_open(&content) {
+                } else if let Some((open_restored, residual, open_string)) =
+                    unwrap_freeze_let_open(&content)
+                {
                     // Multi-line wrapper: the `__typhon_freeze__(` opener is
                     // on this line and its matching `)` was appended to the
                     // line that closes the literal. Locate that close line by
-                    // tracking bracket depth before mutating, so a shape we
-                    // can't fully account for is left intact rather than
-                    // half-rewritten.
+                    // tracking bracket depth AND string state before
+                    // mutating, so a shape we can't fully account for is left
+                    // intact rather than half-rewritten. Both have to return
+                    // to a closed state: a triple-quoted RHS opens no
+                    // brackets at all, so depth alone would stop on the very
+                    // next line and delete a `)` from inside the string.
                     let mut depth = residual;
-                    let mut in_string: Option<StringMode> = None;
-                    let mut close_line: Option<usize> = None;
+                    let mut in_string: Option<StringMode> = open_string;
+                    let mut close_line: Option<(usize, Option<StringMode>)> = None;
                     let mut j = line_idx + 1;
                     while j < lines.len() {
+                        let entry_string = in_string;
                         depth += bracket_delta_outside_strings(&lines[j], &mut in_string);
-                        if depth <= 0 {
-                            close_line = Some(j);
+                        if depth <= 0 && in_string.is_none() {
+                            close_line = Some((j, entry_string));
                             break;
                         }
                         j += 1;
                     }
-                    if let Some(j) = close_line {
+                    if let Some((j, entry_string)) = close_line {
                         // The appended `)` is the last `)` of the close line's
                         // *code* portion. Restrict the search to that portion
                         // so a `)` inside a trailing comment (`}  # see (note)`)
-                        // is never mistaken for it.
-                        let mut state: Option<StringMode> = None;
+                        // is never mistaken for it — and seed the scan with the
+                        // string state this line is *entered* in, so the `"""`
+                        // that closes the literal reads as a close rather than
+                        // an open (which would put the appended `)` inside a
+                        // string and leave the wrapper unbalanced).
+                        let mut state: Option<StringMode> = entry_string;
                         let code_end = scan_line_code_end(&lines[j], &mut state);
                         if let Some(pos) = lines[j][..code_end].rfind(')') {
                             lines[j].remove(pos);

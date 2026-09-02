@@ -79,6 +79,32 @@ repos:
         files: \.ty$
 ```
 
+## Files the formatter cannot parse
+
+A file that does not parse is reported and **skipped** — the walk carries
+on through the rest of the tree, and the command exits non-zero at the end
+with a count (`N files could not be formatted`). One work-in-progress file
+therefore never stops `tyc fmt src/` from formatting everything else, and
+`tyc fmt --check` in CI surfaces every failure in a single run rather than
+one per invocation.
+
+The set of files the formatter rejects is the set `tyc check` rejects: both
+run the same sugar-expansion chain over the original source before parsing.
+
+## Guarantees
+
+Three properties hold over the whole `.ty` corpus and are gated by the test
+suite:
+
+- **Convergence** — a second `tyc fmt` over already-formatted output is a
+  no-op. `tyc fmt --check` after `tyc fmt` always passes.
+- **Acceptance parity** — the formatter accepts exactly what `tyc check`
+  accepts.
+- **Meaning is preserved** — `tyc build` emits byte-identical Python before
+  and after formatting. The one thing that can move is a generated
+  `__typhon_guard_N` temporary, whose number is derived from the source line
+  it came from; source maps are regenerated for the new line numbers.
+
 ## What about `tyc fmt` on `.dty`?
 
 Not today — `tyc fmt` collects `.ty` files only; a `.dty` path, or the `.dty` files under a directory, are skipped untouched. Stubs are short signature lists, so hand-formatting them is cheap, and `tyc check --stubs` still validates them.
