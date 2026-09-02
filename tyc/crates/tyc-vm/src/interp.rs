@@ -2903,7 +2903,9 @@ impl Interpreter {
                                 }
                                 let s = match interp.conversion {
                                     ast::ConversionFlag::Repr => self.repr_of(&v)?,
-                                    ast::ConversionFlag::Ascii => self.repr_of(&v)?,
+                                    ast::ConversionFlag::Ascii => {
+                                        crate::builtins::ascii_repr(&self.repr_of(&v)?)
+                                    }
                                     ast::ConversionFlag::Str => self.str_of(&v)?,
                                     ast::ConversionFlag::None => {
                                         if has_debug && interp.format_spec.is_none() {
@@ -9597,11 +9599,30 @@ fn printf_format_with(
                 let p = precision.unwrap_or(6);
                 let neg = x.is_sign_negative() && x != 0.0;
                 let abs = x.abs();
-                let digits = match conv {
-                    'e' => normalise_exp_notation(format!("{:.*e}", p, abs), false),
-                    'E' => normalise_exp_notation(format!("{:.*e}", p, abs), true),
-                    'g' | 'G' => format_g(abs, if p == 0 { 1 } else { p }, conv == 'G'),
-                    _ => format!("{:.*}", p, abs),
+                // CPython spells the non-finite values in lower case whatever
+                // the conversion is; Rust writes `NaN` / `inf`.
+                let digits = if abs.is_nan() {
+                    "nan".to_owned()
+                } else if abs.is_infinite() {
+                    "inf".to_owned()
+                } else {
+                    let body = match conv {
+                        'e' => normalise_exp_notation(format!("{:.*e}", p, abs), false),
+                        'E' => normalise_exp_notation(format!("{:.*e}", p, abs), true),
+                        'g' | 'G' => format_g(
+                            abs,
+                            if p == 0 { 1 } else { p },
+                            conv == 'G',
+                            false,
+                            flag_alt,
+                        ),
+                        _ => format!("{:.*}", p, abs),
+                    };
+                    if flag_alt {
+                        ensure_decimal_point(&body)
+                    } else {
+                        body
+                    }
                 };
                 printf_signed(&digits, neg, flag_plus, flag_space)
             }
@@ -11057,14 +11078,31 @@ fn normalise_exp_notation(s: String, upper: bool) -> String {
     format!("{mantissa}{e_char}{sign}{padded}")
 }
 
-/// CPython-compatible `g`/`G` float formatting.
+/// The alternate form (`#`) on a float always leaves a decimal point, even
+/// where the precision asked for no digits after it (`f"{3:#.0e}"` →
+/// `3.e+00`).
+fn ensure_decimal_point(s: &str) -> String {
+    let head = s.find(['e', 'E']).unwrap_or(s.len());
+    if s[..head].contains('.') {
+        s.to_owned()
+    } else {
+        format!("{}.{}", &s[..head], &s[head..])
+    }
+}
+
+/// CPython-compatible `g`/`G` float formatting, in `sig` significant digits.
 ///
 /// Rules (PEP 3101 / C printf `%g`):
 /// 1. Use scientific notation when the exponent is < −4 or ≥ precision.
 /// 2. Trailing zeros after the decimal point are removed.
 /// 3. The decimal point is removed if there are no remaining digits after it.
 /// 4. Exponent sign and 2-digit pad follow the same rules as `e`.
-fn format_g(abs: f64, sig: usize, upper: bool) -> String {
+///
+/// `dot_0` selects the *no-type* variant (`f"{x:.3}"`): its exponent
+/// threshold is one lower than `g`'s, and an integral result keeps a `.0`.
+/// `alt` is the alternate form, which holds on to the trailing zeros rule 2
+/// would strip and always leaves a decimal point.
+fn format_g(abs: f64, sig: usize, upper: bool, dot_0: bool, alt: bool) -> String {
     // Format in scientific notation to determine the exponent.
     let sci = format!("{:.*e}", sig.saturating_sub(1), abs);
     // Parse out the exponent.
@@ -11073,25 +11111,37 @@ fn format_g(abs: f64, sig: usize, upper: bool) -> String {
     } else {
         0
     };
-    let result = if exp < -4 || exp >= sig as i32 {
+    let threshold = if dot_0 { sig as i32 - 1 } else { sig as i32 };
+    let mut result = if exp < -4 || exp >= threshold {
         // Scientific notation path.
         let raw = normalise_exp_notation(sci, upper);
         // Strip trailing zeros from mantissa part before `e`.
         let e_pos = raw.find(if upper { 'E' } else { 'e' }).unwrap_or(raw.len());
-        let mantissa = raw[..e_pos].trim_end_matches('0').trim_end_matches('.');
+        let mantissa = if alt {
+            ensure_decimal_point(&raw[..e_pos])
+        } else {
+            raw[..e_pos]
+                .trim_end_matches('0')
+                .trim_end_matches('.')
+                .to_owned()
+        };
         format!("{}{}", mantissa, &raw[e_pos..])
     } else {
         // Fixed notation: format with enough decimal places, then strip zeros.
         let decimal_places = (sig as i32 - 1 - exp).max(0) as usize;
         let fixed = format!("{:.*}", decimal_places, abs);
-        // Strip trailing zeros after decimal point.
-        if fixed.contains('.') {
-            let stripped = fixed.trim_end_matches('0').trim_end_matches('.');
-            stripped.to_owned()
+        if alt {
+            ensure_decimal_point(&fixed)
+        } else if fixed.contains('.') {
+            // Strip trailing zeros after decimal point.
+            fixed.trim_end_matches('0').trim_end_matches('.').to_owned()
         } else {
             fixed
         }
     };
+    if dot_0 && !result.contains(['.', 'e', 'E']) {
+        result.push_str(".0");
+    }
     result
 }
 
@@ -11220,7 +11270,19 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
         let scaled = x * 100.0;
         let p = precision.unwrap_or(6);
         let (abs, neg) = (scaled.abs(), scaled.is_sign_negative());
-        let body = format!("{:.*}%", p, abs);
+        let body = if abs.is_nan() {
+            "nan%".to_owned()
+        } else if abs.is_infinite() {
+            "inf%".to_owned()
+        } else {
+            let digits = format!("{:.*}", p, abs);
+            let digits = if alternate {
+                ensure_decimal_point(&digits)
+            } else {
+                digits
+            };
+            format!("{digits}%")
+        };
         if neg {
             explicit_sign.push('-');
         } else if let Some('+') = sign {
@@ -11276,12 +11338,17 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
                 "inf".to_owned()
             } else {
                 match typ {
-                    Some('e') => {
+                    Some('e') | Some('E') => {
                         // Rust's {:e} produces e.g. `3.141590e0`; CPython requires
                         // at least 2 exponent digits with an explicit sign: `3.141590e+00`.
-                        normalise_exp_notation(format!("{:.*e}", p, abs), false)
+                        let upper = typ == Some('E');
+                        let body = normalise_exp_notation(format!("{:.*e}", p, abs), upper);
+                        if alternate {
+                            ensure_decimal_point(&body)
+                        } else {
+                            body
+                        }
                     }
-                    Some('E') => normalise_exp_notation(format!("{:.*e}", p, abs), true),
                     Some('g') | Some('G') => {
                         // Python's `g` uses precision as significant digits.
                         // After computing the exponential form we apply CPython's
@@ -11289,22 +11356,20 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
                         // decide whether to render as fixed or scientific notation.
                         let sig = if p == 0 { 1 } else { p };
                         let upper = matches!(typ, Some('G'));
-                        format_g(abs, sig, upper)
+                        format_g(abs, sig, upper, false, alternate)
                     }
                     // No presentation type: without a precision this is
                     // `repr(x)` (`f"{1.5:10}"` → `1.5`, not `1.500000`); with
                     // one it is `g`-style significant digits that always keep
-                    // at least one digit after the point (`f"{3.0:.3}"` → `3.0`).
+                    // at least one digit after the point (`f"{3.0:.3}"` → `3.0`)
+                    // and switch to an exponent one decade sooner than `g`
+                    // does (`f"{100.0:.3}"` → `1e+02`, where `.3g` is `100`).
                     None if precision.is_none() => Value::Float(abs).py_repr(),
                     None => {
                         let sig = if p == 0 { 1 } else { p };
-                        let g = format_g(abs, sig, false);
-                        if g.contains(['.', 'e', 'n', 'i']) {
-                            g
-                        } else {
-                            format!("{g}.0")
-                        }
+                        format_g(abs, sig, false, true, alternate)
                     }
+                    _ if alternate => ensure_decimal_point(&format!("{:.*}", p, abs)),
                     _ => format!("{:.*}", p, abs),
                 }
             };
@@ -11327,25 +11392,25 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
             let neg = i_val.is_negative();
             match typ {
                 Some('x') => {
-                    buf = abs.to_str_radix(16);
+                    buf = grouped_radix(&abs.to_str_radix(16), underscore);
                     if alternate {
                         prefix.push_str("0x");
                     }
                 }
                 Some('X') => {
-                    buf = abs.to_str_radix(16).to_uppercase();
+                    buf = grouped_radix(&abs.to_str_radix(16).to_uppercase(), underscore);
                     if alternate {
                         prefix.push_str("0X");
                     }
                 }
                 Some('b') => {
-                    buf = abs.to_str_radix(2);
+                    buf = grouped_radix(&abs.to_str_radix(2), underscore);
                     if alternate {
                         prefix.push_str("0b");
                     }
                 }
                 Some('o') => {
-                    buf = abs.to_str_radix(8);
+                    buf = grouped_radix(&abs.to_str_radix(8), underscore);
                     if alternate {
                         prefix.push_str("0o");
                     }
@@ -11439,11 +11504,26 @@ pub fn format_with_spec_pub(
 
 /// Separator-group every third digit of a non-negative integer. Caller
 /// is responsible for prepending the sign — the body is sign-free.
+/// A binary/octal/hex integer body, grouped in fours when `_` was asked for.
+fn grouped_radix(digits: &str, underscore: bool) -> String {
+    if underscore {
+        group_digits(digits, '_', 4)
+    } else {
+        digits.to_owned()
+    }
+}
+
 fn format_bigint_with_separator(i: &VmInt, sep: char) -> String {
-    let s = i.to_str_radix(10);
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    group_digits(&i.to_str_radix(10), sep, 3)
+}
+
+/// Insert `sep` every `size` digits, counting from the right. Decimal groups
+/// by three; `_` on a binary, octal or hex integer groups by four, which is
+/// what CPython does (`f"{1234567:_x}"` → `12_d687`).
+fn group_digits(s: &str, sep: char, size: usize) -> String {
+    let mut out = String::with_capacity(s.len() + s.len() / size);
     for (k, c) in s.chars().rev().enumerate() {
-        if k > 0 && k % 3 == 0 {
+        if k > 0 && k.is_multiple_of(size) {
             out.push(sep);
         }
         out.push(c);

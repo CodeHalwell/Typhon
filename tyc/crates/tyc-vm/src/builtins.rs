@@ -8590,7 +8590,7 @@ fn split_field_accessors(field: &str) -> (&str, Vec<FieldAccess>) {
 
 /// `ascii()`'s escaping of a `repr` string: every non-ASCII character
 /// becomes its `\xNN` / `\uNNNN` / `\UNNNNNNNN` escape.
-fn ascii_repr(text: &str) -> String {
+pub(crate) fn ascii_repr(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         if c.is_ascii() {
@@ -8620,10 +8620,23 @@ fn str_format(
     pos_args: &[Value],
     kwargs: &[(String, Value)],
 ) -> Result<Value, Unwind> {
+    let mut auto_idx: usize = 0;
+    str_format_inner(interp, template, pos_args, kwargs, &mut auto_idx)
+}
+
+/// `str_format`'s body, threading the auto-numbering counter so a nested
+/// replacement field inside a spec (`"{:{}}".format(3, 5)`) draws the *next*
+/// argument rather than restarting at the first.
+fn str_format_inner(
+    interp: &mut Interpreter,
+    template: &str,
+    pos_args: &[Value],
+    kwargs: &[(String, Value)],
+    auto_idx: &mut usize,
+) -> Result<Value, Unwind> {
     let mut out = String::new();
     let chars: Vec<char> = template.chars().collect();
     let mut i = 0usize;
-    let mut auto_idx: usize = 0;
 
     while i < chars.len() {
         match chars[i] {
@@ -8667,13 +8680,13 @@ fn str_format(
                 // Resolve the value
                 let value = if field_ref.is_empty() {
                     // `{}` auto-numbering
-                    let v = pos_args.get(auto_idx).ok_or_else(|| {
+                    let v = pos_args.get(*auto_idx).ok_or_else(|| {
                         index_error(format!(
                             "Replacement index {} out of range for positional args",
-                            auto_idx
+                            *auto_idx
                         ))
                     })?;
-                    auto_idx += 1;
+                    *auto_idx += 1;
                     v.clone()
                 } else if let Ok(idx) = field_ref.parse::<usize>() {
                     // `{0}`, `{1}` etc.
@@ -8735,7 +8748,7 @@ fn str_format(
                 // `{n:>{w}}` — is resolved against the same arguments
                 // before the spec is applied.
                 let spec = if spec.contains('{') {
-                    str_format(interp, &spec, pos_args, kwargs)?.py_str()
+                    str_format_inner(interp, &spec, pos_args, kwargs, auto_idx)?.py_str()
                 } else {
                     spec
                 };

@@ -2678,6 +2678,61 @@ main()
     }
 
     #[test]
+    fn vm_format_spec_corners_match_cpython() {
+        let src = r#"
+def check(label: str, got: str, want: str) -> None:
+    if got != want:
+        raise ValueError(f"{label}: got {got!r}, want {want!r}")
+
+def main() -> None:
+    # `_` groups a binary, octal or hex integer in fours, not threes.
+    check("hex", f"{1234567:_x}", "12_d687")
+    check("bin", f"{1234567:_b}", "1_0010_1101_0110_1000_0111")
+    check("oct", f"{1234567:_o}", "455_3207")
+    check("HEX", f"{1234567:_X}", "12_D687")
+    check("dec", f"{1234567:_d}", "1_234_567")
+    check("short", f"{15:_b}", "1111")
+
+    # A float with a precision but no presentation type reaches for an
+    # exponent one decade sooner than `g` does, and keeps a `.0`.
+    check("none-100", f"{100.0:.3}", "1e+02")
+    check("g-100", f"{100.0:.3g}", "100")
+    check("none-1e6", f"{1000000.0:.7}", "1e+06")
+    check("none-1", f"{1.0:.1}", "1e+00")
+    check("none-3", f"{3.0:.3}", "3.0")
+    check("none-pi", f"{3.14159:.3}", "3.14")
+
+    # `#` on a float always leaves a decimal point, and `g` keeps the
+    # trailing zeros it would otherwise strip.
+    check("alt-g", f"{3.0:#g}", "3.00000")
+    check("alt-3g", f"{3:#.3g}", "3.00")
+    check("alt-0f", f"{3.0:#.0f}", "3.")
+    check("alt-0e", f"{3:#.0e}", "3.e+00")
+    check("alt-1", f"{3.0:#.1}", "3.e+00")
+    check("alt-1e10", f"{1e10:#g}", "1.00000e+10")
+    check("alt-pct", f"{0.5:#.0%}", "50.%")
+    check("alt-nan", f"{float('nan'):#.0f}", "nan")
+    check("printf-g", "%#g" % 3.0, "3.00000")
+    check("printf-f", "%#.0f" % 3.0, "3.")
+    check("printf-nan", "%g" % float("nan"), "nan")
+
+    # A nested field in a spec draws the *next* argument, not the first.
+    check("nested-w", "[{:{}}]".format(3, 5), "[    3]")
+    check("nested-kw", "[{:{w}.{p}f}]".format(3.14159, w=8, p=2), "[    3.14]")
+    check("nested-2", "[{:{}{}}]".format(3, ">", 6), "[     3]")
+
+    # `!a` escapes non-ASCII, where `!r` does not.
+    check("bang-a", f"{'ü'!a}", "'\\xfc'")
+    check("bang-r", f"{'ü'!r}", "'ü'")
+    check("bang-a2", "{!a}".format("aübሴ"), "'a\\xfcb\\u1234'")
+    print("ok")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn vm_directory_modes_append_writes_and_metadata_copies() {
         let src = r#"
 import argparse

@@ -36,7 +36,6 @@ stress/round-2026-05-21/04-ai-llm/04-structured-output.ty
 stress/round-2026-05-22/04-ai-llm/02-structured-output-validation.ty
 stress/round-2026-09-01/analyse/b_prelude.ty
 stress/round-2026-09-01/emit/typevar_default.ty
-stress/round-2026-09-01/vm/p1.ty
 stress/round-2026-09-01/vm/p12.ty
 stress/round-2026-09-01/vm/p13.ty
 stress/round-2026-09-01/vm/p2.ty

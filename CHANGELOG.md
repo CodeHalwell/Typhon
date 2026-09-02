@@ -155,6 +155,23 @@ the positionals in one pass and hands back whatever the later ones still
 need: `files` with `nargs="*"` ahead of a required `dest` failed on every
 one-argument command line.
 
+**Format specs that quietly rounded the wrong way.** An eleventh wave took
+the PEP 3101 mini-language. A float with a precision but no presentation
+type is not quite `g`: it reaches for an exponent one decade sooner, so
+`f"{100.0:.3}"` is `1e+02` where `.3g` is `100` — the VM printed `100.0`.
+The alternate form `#` was ignored on floats altogether, where CPython
+always leaves a decimal point and stops `g` stripping trailing zeros
+(`f"{3.0:#g}"` is `3.00000`, `f"{3:#.0e}"` is `3.e+00`); it is honoured now
+for `e`, `f`, `g`, `%` and the printf-style `%#g` alike, and the non-finite
+values print lower-case through the printf path as they already did
+through the spec path. An `_` on a binary, octal or hex integer groups in
+fours, not at all (`f"{1234567:_x}"` → `12_d687`). A nested replacement
+field inside a spec restarted auto-numbering, so `"{:{}}".format(3, 5)`
+took `3` as its own width; the counter is shared with the outer template
+now. And `!a` in an f-string was a synonym for `!r`, leaving non-ASCII
+unescaped — `f"{'ü'!a}"` is `'\xfc'`. **The differential baseline falls to
+12.**
+
 **A prelude name that only the VM could resolve.** `BaseModel` and
 `NewType` resolve without an import — the `model` and `newtype` lowerings
 introduce them — so naming either directly passes `tyc check`. Their
