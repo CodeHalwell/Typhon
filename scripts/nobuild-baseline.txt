@@ -85,7 +85,6 @@ stress/round-2026-05-21/10-error-quality/04-let-reassign.ty
 stress/round-2026-05-21/10-error-quality/05-non-exhaustive-match.ty
 stress/round-2026-05-21/10-error-quality/07-question-outside-result.ty
 stress/round-2026-05-21/10-error-quality/08-frozen-assign.ty
-stress/round-2026-05-21/10-error-quality/09-migrate-output.ty
 stress/round-2026-05-22/01-language-edge/02-newtype-mismatch.ty
 stress/round-2026-05-22/01-language-edge/05-result-question-in-comp.ty
 stress/round-2026-05-22/08-meta-stress/05-mut-rebind-types.ty
@@ -165,7 +164,6 @@ stress/round-2026-09-01/types/c3b_alias_direct.ty
 stress/round-2026-09-01/types/c3c_alias_opt.ty
 stress/round-2026-09-01/types/c3d_alias_mutual_param.ty
 stress/round-2026-09-01/types/c40_nested_optional.ty
-stress/round-2026-09-01/types/c41_fwd_ref.ty
 stress/round-2026-09-01/types/c45_impl_weird.ty
 stress/round-2026-09-01/types/c46_recursive_generic_class.ty
 stress/round-2026-09-01/types/c48_star_star.ty

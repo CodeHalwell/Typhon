@@ -28,6 +28,11 @@ The rest of this document is the detail under these rules. The
 
 A plain `T` forbids `None`; `T?` is the optional form. Internally `T?` is represented as a `Nullable[T]` wrapper but emits as `T | None` in Python annotations. The checker uses flow-sensitive analysis to narrow `T?` to `T` inside guards and null-checks. Attempting to call a method on a `T?` without a check is a compile error.
 
+The suffix applies to a quoted forward reference too — `parent: "Node"?` is
+the nullable form of `"Node"`, which is how a self-referential model spells
+its optional back-pointer. (`"Node?"`, with the `?` inside the quotes, is
+equivalent and was the only accepted spelling before v1.0.0-beta.1.)
+
 Narrowing forms the checker recognises:
 
 - `is None` / `is not None`

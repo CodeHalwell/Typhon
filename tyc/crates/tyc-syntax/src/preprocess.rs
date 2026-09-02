@@ -2878,9 +2878,14 @@ fn rewrite_optionals(line: &str, in_string: &mut Option<StringMode>) -> (String,
     for (i, c) in line.char_indices() {
         if c == '?'
             && matches!(kinds.get(i), Some(ByteKind::Code))
+            // A closing quote counts too: a forward reference is a type
+            // expression like any other, so `parent: "Node"?` is the nullable
+            // form of it. (`"Node?"` — the `?` inside the quotes — already
+            // worked, but nobody guesses that first.)
             && matches!(
                 prev_char,
-                Some(ch) if ch.is_alphanumeric() || ch == '_' || ch == ']'
+                Some(ch)
+                    if ch.is_alphanumeric() || ch == '_' || ch == ']' || ch == '"' || ch == '\''
             )
         {
             marks.push(out.len());
@@ -9787,6 +9792,35 @@ mod tests {
         assert!(
             !out.contains("a | Noneb"),
             "the nested literal must not be rewritten; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn optional_rewrite_fires_on_a_quoted_forward_reference() {
+        // A forward reference is a type expression like any other, so
+        // `parent: "Node"?` is its nullable form. It used to be a raw parse
+        // error ("Got unexpected token ?"), leaving `"Node?"` — the `?`
+        // inside the quotes — as the only spelling that worked.
+        let src = "class Node:\n    parent: \"Node\"?\n    other: 'Node'?\n";
+        let out = preprocess(src).python_source;
+        assert!(
+            out.contains("parent: \"Node\" | None"),
+            "a double-quoted forward reference should take the `?`; got:\n{out}"
+        );
+        assert!(
+            out.contains("other: 'Node' | None"),
+            "a single-quoted one too; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn optional_rewrite_leaves_a_question_mark_inside_a_string_alone() {
+        // The quote that opens a literal must not be read as a type tail.
+        let src = "def main() -> None:\n    print(\"who?\", 'also?')\n";
+        let out = preprocess(src).python_source;
+        assert!(
+            out.contains("\"who?\"") && out.contains("'also?'"),
+            "text inside a literal is untouched; got:\n{out}"
         );
     }
 

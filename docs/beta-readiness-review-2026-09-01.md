@@ -444,6 +444,18 @@ with every gate green at each step.
   CPython's — `pathlib.Path` is modelled as `PosixPath` — so stamping a
   module onto them would assert something untrue rather than close the
   gap.
+
+- **The 253 non-building units are non-building on purpose.** The
+  `nobuild` list is the larger of the two differential baselines, and
+  nothing had ever checked *why* each unit fails — a genuine compiler
+  failure hiding among the deliberate diagnostic probes would have been
+  invisible. Classifying every one by the `tyc::` codes it reports: 252
+  fail with a diagnostic (the top of the distribution being
+  `type_mismatch` ×39, `immutable_assign` ×21, `nullable_use` ×14,
+  `missing_return` ×11), one is a project directory holding a
+  `typhon.toml` and no sources, and none fails without a code. The
+  sweep did turn up two units written against `"Node"?`, which the
+  preprocessor did not accept; that is fixed and both now build.
 - ~~**`tyc run --compile <file>` diagnostics name the scaffold.**~~ Closed:
   the staged build reports diagnostics under the path the user gave, and
   the scaffold turns on `traceback-remap`, so an uncaught exception's

@@ -78,10 +78,13 @@ A string-literal annotation resolves as a **forward reference** to the type it n
 class Node:
     value: int
     next: "Node"
+    parent: "Node"?          # nullable forward reference (v1.0.0-beta.1)
 
 def grow() -> "Tree[T]": ...
 let xs: "list[Node]" = []
 ```
+
+The `?` suffix applies to a quoted reference like any other type expression, so `parent: "Node"?` is how a self-referential class spells its optional back-pointer. `"Node?"` — with the `?` inside the quotes — means the same thing and was the only accepted spelling before v1.0.0-beta.1.
 
 This is distinct from the literal-singleton union form (`type Color = "red" | "green"`), which is **unchanged**: there the strings are values in a string-literal union, not forward references to named types.
 

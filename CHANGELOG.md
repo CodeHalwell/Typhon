@@ -311,6 +311,17 @@ round-trip them through latin-1 now, which is a byte-for-byte bijection over
 the ASCII separators they inspect, and `join` refuses a str/bytes mixture as
 CPython does.
 
+**One accepted form added: `"Node"?`.** The nullable suffix is a type-level
+operator, and a quoted forward reference is a type expression, but the
+rewriter's tail test only recognised an identifier, `]` or `_` — so
+`parent: "Node"?`, the way a self-referential model spells its optional
+back-pointer, was a raw parse error naming an "unexpected token ?". It is
+accepted now. This is purely additive: `"Node?"` (the `?` inside the quotes)
+and `"Node" | None` already worked and are unchanged, and a `?` inside any
+string literal is still just text. Two stress units in the corpus were
+written against the form and had been sitting in the non-building baseline
+because of it.
+
 **A prelude name that only the VM could resolve.** `BaseModel` and
 `NewType` resolve without an import — the `model` and `newtype` lowerings
 introduce them — so naming either directly passes `tyc check`. Their
