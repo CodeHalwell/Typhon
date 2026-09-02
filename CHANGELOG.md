@@ -46,7 +46,14 @@ sibling used to inherit the entry's `"__main__"`, so its main-guard block
 ran under `tyc run` but not after `tyc build`. The filesystem surface
 (`os`, `os.path`, `pathlib`, `io`, `shutil`, `tempfile`, `glob`,
 `hashlib`, `random`) was rebuilt as Python shims over native primitives.
-**The differential baseline falls from 167 entries to 70.**
+A second VM pass added `bytearray` (mutable, CPython `repr`, unhashable,
+`fromhex`) and `x in b"…"` containment, which the VM rejected outright;
+`float.hex()` and `as_integer_ratio()`; the `str.format` `!r` / `!s` /
+`!a` conversions and `{0.attr}` / `{name[key]}` accessors; CPython's
+`str.center` padding bias; `Cls.__doc__` / `Cls.__mro__` /
+`fn.__type_params__`; `asyncio.to_thread` / `Lock` / `Semaphore` /
+`Event`; and the rest of the builtin exception hierarchy. **The
+differential baseline falls from 167 entries to 62.**
 
 **Checking a module is linear in its definitions again.** Every branch,
 `try` and loop clones the whole `TypeEnv`, and each clone deep-copied every
@@ -468,7 +475,7 @@ additive on correct programs except the one marked **narrowing**.
 
 Everything that review deferred is closed by the beta wave above, except
 the VM's eager generator expressions and the thin `re` shim, which remain
-in `scripts/differential-baseline.txt` — the 70 entries there are the
+in `scripts/differential-baseline.txt` — the 62 entries there are the
 honest list of what the VM still gets wrong, and each one is a bug.
 
 ## 1.0.0-alpha.9 — 2026-08-21 — maintenance: secret-name lint expansion, allocation reductions & dependency wave

@@ -4565,6 +4565,98 @@ main()
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
 
+    /// `bytearray` was missing entirely — `Value::Bytes` is immutable, so
+    /// the mutable sibling is a shim class marked as a `bytearray` for
+    /// `isinstance`. Checked against CPython 3.13.
+    #[test]
+    fn bytearray_matches_cpython() {
+        let src = r#"
+def main() -> None:
+    mut arr = bytearray(b"abc")
+    arr.append(100)
+    arr[0] = 65
+    if repr(arr) != "bytearray(b'Abcd')" or bytes(arr) != b"Abcd":
+        raise AssertionError("repr / bytes wrong: " + repr(arr))
+    if len(arr) != 4 or arr[1] != 98 or list(arr) != [65, 98, 99, 100]:
+        raise AssertionError("sequence protocol wrong")
+    if repr(arr[1:3]) != "bytearray(b'bc')" or arr.decode("ascii") != "Abcd":
+        raise AssertionError("slice / decode wrong")
+    if arr.hex() != "41626364":
+        raise AssertionError("hex wrong")
+    if repr(bytearray(3)) != "bytearray(b'\\x00\\x00\\x00')":
+        raise AssertionError("bytearray(int) wrong: " + repr(bytearray(3)))
+    if bytearray([1, 2]) != bytearray(b"\x01\x02"):
+        raise AssertionError("bytearray(iterable) wrong")
+    if arr != b"Abcd" or b"Abcd" != arr:
+        raise AssertionError("comparison with bytes wrong")
+    arr.extend(b"ef")
+    if repr(arr + b"!") != "bytearray(b'Abcdef!')":
+        raise AssertionError("concatenation wrong")
+    if repr(arr.upper()) != "bytearray(b'ABCDEF')" or arr.find(b"cd") != 2:
+        raise AssertionError("read methods wrong")
+    if not arr.startswith(b"Ab") or b"x" in arr or 65 not in arr:
+        raise AssertionError("containment wrong")
+    if arr.pop() != 102 or repr(arr) != "bytearray(b'Abcde')":
+        raise AssertionError("pop wrong")
+    if repr(bytearray.fromhex("6162")) != "bytearray(b'ab')":
+        raise AssertionError("fromhex wrong")
+    if not isinstance(arr, bytearray) or type(arr).__name__ != "bytearray":
+        raise AssertionError("isinstance / type name wrong")
+    mut raised: str = ""
+    try:
+        arr[0] = 999
+    except ValueError as e:
+        raised = str(e)
+    if raised != "byte must be in range(0, 256)":
+        raise AssertionError("range check wrong: " + raised)
+    # `bytes` containment, which the VM rejected outright.
+    if 97 not in b"abc" or b"bc" not in b"abc" or b"z" in b"abc":
+        raise AssertionError("bytes containment wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// The odd corners a formatting-heavy program hits: `str.format`
+    /// conversions and accessors, `str.center`'s padding bias, `float.hex`
+    /// and the `numbers` ratio methods.
+    #[test]
+    fn formatting_and_numeric_corners_match_cpython() {
+        let src = r#"
+plain class Point:
+    def __init__(self) -> None:
+        self.x = 7
+
+def main() -> None:
+    if "{name!r:>8}".format(name="n") != "     'n'":
+        raise AssertionError("!r conversion wrong: " + "{name!r:>8}".format(name="n"))
+    if "{0!s}-{0!r}".format("a") != "a-'a'":
+        raise AssertionError("!s / !r wrong")
+    if "{p.x}".format(p=Point()) != "7":
+        raise AssertionError("attribute accessor wrong")
+    if "{d[k]}-{xs[1]}".format(d={"k": 1}, xs=[9, 8]) != "1-8":
+        raise AssertionError("index accessor wrong")
+    # CPython biases the extra pad character right only when both the
+    # padding and the width are odd.
+    if "ab".center(5) != "  ab " or "ab".center(6) != "  ab  ":
+        raise AssertionError("center bias wrong: " + repr("ab".center(5)))
+    if "ab".center(5, "*") != "**ab*" or "ab".center(7, "-") != "---ab--":
+        raise AssertionError("center with fill wrong")
+    if (2.5).hex() != "0x1.4000000000000p+1" or (0.0).hex() != "0x0.0p+0":
+        raise AssertionError("float.hex wrong: " + (2.5).hex())
+    if (-0.0).hex() != "-0x0.0p+0" or (1.0).hex() != "0x1.0000000000000p+0":
+        raise AssertionError("float.hex sign / exponent wrong")
+    if (5).as_integer_ratio() != (5, 1) or (2.5).as_integer_ratio() != (5, 2):
+        raise AssertionError("as_integer_ratio wrong")
+    if bytes.fromhex("6162") != b"ab":
+        raise AssertionError("bytes.fromhex wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
     /// `class X(NamedTuple)` is a tuple and `class X(TypedDict)` is a dict in
     /// CPython. The VM built a plain instance for both, so `p[0]` and
     /// `u["name"]` raised `'instance' object is not subscriptable` on

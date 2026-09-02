@@ -763,6 +763,12 @@ pub fn install(interp: &mut Interpreter) {
         }
     });
 
+    native!("bytearray", |i, args| {
+        let (pos, kw) = split_kwargs(&args);
+        let cls = bytearray_class(i)?;
+        i.call_value(cls, pos.to_vec(), &kw)
+    });
+
     native!("set", |i, args| {
         let mut out = HashSet::new();
         if let Some(v) = args.into_iter().next() {
@@ -1484,6 +1490,29 @@ pub fn install(interp: &mut Interpreter) {
         "NotADirectoryError",
         "TimeoutError",
         "ConnectionError",
+        "BrokenPipeError",
+        "ConnectionResetError",
+        "ConnectionRefusedError",
+        "ConnectionAbortedError",
+        "BlockingIOError",
+        "InterruptedError",
+        "ChildProcessError",
+        "ProcessLookupError",
+        "FrozenInstanceError",
+        "BufferError",
+        "MemoryError",
+        "ReferenceError",
+        "SystemError",
+        "IndentationError",
+        "TabError",
+        "SyntaxError",
+        "UnicodeTranslateError",
+        "EncodingWarning",
+        "ResourceWarning",
+        "BytesWarning",
+        "ImportWarning",
+        "SyntaxWarning",
+        "UnicodeWarning",
         "EOFError",
         "LookupError",
         "ArithmeticError",
@@ -2145,6 +2174,7 @@ mod shims {
     pub const BASE64: &str = include_str!("shims/base64.py");
     pub const CSV: &str = include_str!("shims/csv.py");
     pub const FUNCTOOLS_EXTRA: &str = include_str!("shims/functools_extra.py");
+    pub const BYTEARRAY: &str = include_str!("shims/bytearray.py");
 }
 
 fn compile_helpers(interp: &mut Interpreter, source: &str) -> Result<Vec<(String, Value)>, Unwind> {
@@ -2436,6 +2466,13 @@ pub(crate) fn namedtuple_base_class(interp: &mut Interpreter) -> Result<Value, U
         shims::COLLECTIONS,
         "_NamedTupleBase",
     )
+}
+
+/// The `bytearray` class, cached. `Value::Bytes` is immutable, so the
+/// mutable sibling is a shim class whose `__typhon_builtin_bases__` marks
+/// it as a `bytearray` for `isinstance`.
+pub(crate) fn bytearray_class(interp: &mut Interpreter) -> Result<Value, Unwind> {
+    cached_helper_class(interp, "__shim_bytearray__", shims::BYTEARRAY, "bytearray")
 }
 
 fn defaultdict_class(interp: &mut Interpreter) -> Result<Value, Unwind> {
@@ -6263,6 +6300,141 @@ fn make_asyncio_module() -> Value {
                     Ok(make_task_value(result))
                 }),
             ),
+            // `asyncio.to_thread(fn, *args, **kwargs)` — under the VM's
+            // sequential scheduler there is no other thread to move the call
+            // to, so it runs inline and its result is handed back as a
+            // completed awaitable. Observationally identical for the
+            // overwhelmingly common `await asyncio.to_thread(blocking_fn)`;
+            // a program depending on the *concurrency* needs
+            // `tyc run --compile`, like the rest of the asyncio shim.
+            (
+                "to_thread",
+                nf("to_thread", |i, args| {
+                    let (pos, kw) = split_kwargs(&args);
+                    let Some((func, rest)) = pos.split_first() else {
+                        return Err(type_error("to_thread() requires a callable"));
+                    };
+                    let result = i.call_value(func.clone(), rest.to_vec(), &kw)?;
+                    Ok(make_task_value(result))
+                }),
+            ),
+            // `asyncio.Lock` / `Semaphore` / `Event` / `Condition` — the
+            // sequential scheduler never has two coroutines inside the same
+            // critical section, so acquisition always succeeds immediately.
+            // Modelled so `async with lock:` runs rather than raising.
+            ("Lock", nf("Lock", |_i, _args| Ok(make_asyncio_lock()))),
+            (
+                "Semaphore",
+                nf("Semaphore", |_i, _args| Ok(make_asyncio_lock())),
+            ),
+            (
+                "BoundedSemaphore",
+                nf("BoundedSemaphore", |_i, _args| Ok(make_asyncio_lock())),
+            ),
+            ("Event", nf("Event", |_i, _args| Ok(make_asyncio_event()))),
+        ],
+    )
+}
+
+/// `asyncio.Lock` / `Semaphore` under the sequential scheduler: acquisition
+/// always succeeds at once, so the object only has to satisfy the async
+/// context-manager protocol and the explicit `acquire` / `release` pair.
+fn make_asyncio_lock() -> Value {
+    let acquired = Rc::new(std::cell::Cell::new(false));
+    let enter_flag = acquired.clone();
+    let exit_flag = acquired.clone();
+    let acquire_flag = acquired.clone();
+    let release_flag = acquired.clone();
+    let locked_flag = acquired.clone();
+    native_object(
+        "asyncio.Lock",
+        vec![
+            (
+                "__aenter__",
+                Value::Native(Rc::new(NativeFn::new("__aenter__", move |_i, _args| {
+                    enter_flag.set(true);
+                    Ok(Value::None)
+                }))),
+            ),
+            (
+                "__aexit__",
+                Value::Native(Rc::new(NativeFn::new("__aexit__", move |_i, _args| {
+                    exit_flag.set(false);
+                    Ok(Value::Bool(false))
+                }))),
+            ),
+            (
+                "acquire",
+                Value::Native(Rc::new(NativeFn::new("acquire", move |_i, _args| {
+                    acquire_flag.set(true);
+                    Ok(Value::Bool(true))
+                }))),
+            ),
+            (
+                "release",
+                Value::Native(Rc::new(NativeFn::new("release", move |_i, _args| {
+                    release_flag.set(false);
+                    Ok(Value::None)
+                }))),
+            ),
+            (
+                "locked",
+                Value::Native(Rc::new(NativeFn::new("locked", move |_i, _args| {
+                    Ok(Value::Bool(locked_flag.get()))
+                }))),
+            ),
+        ],
+    )
+}
+
+/// `asyncio.Event` under the sequential scheduler. `wait()` on an unset
+/// event would deadlock, so it fails loudly with the same reasoning as
+/// `Queue.get` on an empty queue.
+fn make_asyncio_event() -> Value {
+    let flag = Rc::new(std::cell::Cell::new(false));
+    let set_flag = flag.clone();
+    let clear_flag = flag.clone();
+    let is_set_flag = flag.clone();
+    let wait_flag = flag.clone();
+    native_object(
+        "asyncio.Event",
+        vec![
+            (
+                "set",
+                Value::Native(Rc::new(NativeFn::new("set", move |_i, _args| {
+                    set_flag.set(true);
+                    Ok(Value::None)
+                }))),
+            ),
+            (
+                "clear",
+                Value::Native(Rc::new(NativeFn::new("clear", move |_i, _args| {
+                    clear_flag.set(false);
+                    Ok(Value::None)
+                }))),
+            ),
+            (
+                "is_set",
+                Value::Native(Rc::new(NativeFn::new("is_set", move |_i, _args| {
+                    Ok(Value::Bool(is_set_flag.get()))
+                }))),
+            ),
+            (
+                "wait",
+                Value::Native(Rc::new(NativeFn::new("wait", move |_i, _args| {
+                    if wait_flag.get() {
+                        return Ok(Value::Bool(true));
+                    }
+                    Err(crate::error::Unwind::Exception(
+                        crate::error::VmException::new(
+                            "RuntimeError",
+                            "asyncio.Event.wait() on an unset event would deadlock under the \
+                             VM's sequential scheduler — set the event before awaiting it, or \
+                             run with `tyc run --compile`",
+                        ),
+                    ))
+                }))),
+            ),
         ],
     )
 }
@@ -7788,7 +7960,13 @@ fn str_method(
                     "ljust" => format!("{}{}", s, pad_str(pad)),
                     "rjust" => format!("{}{}", pad_str(pad), s),
                     _ => {
-                        let left = pad / 2;
+                        // CPython's `str.center` biases the extra character
+                        // to the *right* only when both the padding and the
+                        // width are odd: `left = marg / 2 + (marg & width & 1)`
+                        // in `unicodeobject.c`. A plain `pad / 2` put it on
+                        // the wrong side for half the odd cases
+                        // (`"ab".center(5)` → `" ab  "`, not `"  ab "`).
+                        let left = pad / 2 + (pad & width & 1);
                         format!("{}{}{}", pad_str(left), s, pad_str(pad - left))
                     }
                 };
@@ -7898,10 +8076,99 @@ fn str_method(
     })
 }
 
+/// One `.attr` or `[key]` step in a `str.format` field name.
+enum FieldAccess {
+    Attr(String),
+    Index(String),
+}
+
+/// Split `name[!conv][:spec]`. The `!` and `:` separators only count
+/// outside `[...]`, so `{d[a:b]}` keeps its whole key — CPython's rule.
+fn split_format_field(field: &str) -> Result<(String, Option<char>, String), Unwind> {
+    let chars: Vec<char> = field.chars().collect();
+    let mut depth = 0usize;
+    let mut cut: Option<usize> = None;
+    for (i, c) in chars.iter().enumerate() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            '!' | ':' if depth == 0 => {
+                cut = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let Some(cut) = cut else {
+        return Ok((field.to_owned(), None, String::new()));
+    };
+    let name: String = chars[..cut].iter().collect();
+    if chars[cut] == ':' {
+        return Ok((name, None, chars[cut + 1..].iter().collect()));
+    }
+    // `!conv` — exactly one character, then an optional `:spec`.
+    let Some(conv) = chars.get(cut + 1).copied() else {
+        return Err(value_error(
+            "end of string while looking for conversion specifier",
+        ));
+    };
+    let rest = &chars[cut + 2..];
+    match rest.first() {
+        None => Ok((name, Some(conv), String::new())),
+        Some(':') => Ok((name, Some(conv), rest[1..].iter().collect())),
+        Some(_) => Err(value_error("expected ':' after conversion specifier")),
+    }
+}
+
+/// Split `base.attr[key]…` into the base name and its accessor chain.
+fn split_field_accessors(field: &str) -> (&str, Vec<FieldAccess>) {
+    let end = field.find(['.', '[']).unwrap_or(field.len());
+    let (base, mut rest) = field.split_at(end);
+    let mut out = Vec::new();
+    while !rest.is_empty() {
+        if let Some(tail) = rest.strip_prefix('.') {
+            let stop = tail.find(['.', '[']).unwrap_or(tail.len());
+            out.push(FieldAccess::Attr(tail[..stop].to_owned()));
+            rest = &tail[stop..];
+        } else if let Some(tail) = rest.strip_prefix('[') {
+            match tail.find(']') {
+                Some(stop) => {
+                    out.push(FieldAccess::Index(tail[..stop].to_owned()));
+                    rest = &tail[stop + 1..];
+                }
+                None => break,
+            }
+        } else {
+            break;
+        }
+    }
+    (base, out)
+}
+
+/// `ascii()`'s escaping of a `repr` string: every non-ASCII character
+/// becomes its `\xNN` / `\uNNNN` / `\UNNNNNNNN` escape.
+fn ascii_repr(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_ascii() {
+            out.push(c);
+        } else if (c as u32) <= 0xff {
+            out.push_str(&format!("\\x{:02x}", c as u32));
+        } else if (c as u32) <= 0xffff {
+            out.push_str(&format!("\\u{:04x}", c as u32));
+        } else {
+            out.push_str(&format!("\\U{:08x}", c as u32));
+        }
+    }
+    out
+}
+
 /// Implementation of `str.format(...)`. Supports:
 /// - `{}` auto-numbered positional fields
 /// - `{0}`, `{1}` explicit positional fields
 /// - `{name}` named fields
+/// - `{0.attr}`, `{name[key]}` attribute / index accessors
+/// - `{x!r}` / `{x!s}` / `{x!a}` conversions
 /// - `{0:.2f}`, `{name:05d}` format-spec fields
 /// - `{{` and `}}` as literal braces
 fn str_format(
@@ -7943,12 +8210,16 @@ fn str_format(
                 let field: String = chars[start..j - 1].iter().collect();
                 i = j;
 
-                // Split field_name from format_spec at the first ':'
-                let (field_ref, spec) = if let Some(colon) = field.find(':') {
-                    (&field[..colon], &field[colon + 1..])
-                } else {
-                    (field.as_str(), "")
-                };
+                // Split `field_name[!conversion][:format_spec]`. The
+                // separators only count outside `[...]`, so `{d[a:b]}` keeps
+                // its whole key — CPython's own rule.
+                let (field_ref, conversion, spec) = split_format_field(&field)?;
+                let field_ref = field_ref.as_str();
+
+                // `{0.attr}` / `{name[key]}` — the field name may be
+                // followed by attribute and index accessors.
+                let (base_ref, accessors) = split_field_accessors(field_ref);
+                let field_ref = base_ref;
 
                 // Resolve the value
                 let value = if field_ref.is_empty() {
@@ -7980,19 +8251,63 @@ fn str_format(
                         .ok_or_else(|| key_error(format!("'{}'", field_ref)))?
                 };
 
+                let mut value = value;
+                for access in accessors {
+                    value = match access {
+                        FieldAccess::Attr(name) => interp.get_attr(&value, &name)?,
+                        FieldAccess::Index(key) => {
+                            // A bare integer indexes; anything else is a
+                            // mapping key, as in CPython.
+                            let key = match key.parse::<i64>() {
+                                Ok(n) => Value::Int(VmInt::from(n)),
+                                Err(_) => Value::Str(Rc::new(key)),
+                            };
+                            interp.subscript(&value, &key)?
+                        }
+                    };
+                }
+
+                // `!r` / `!s` / `!a` convert *before* the spec applies, and
+                // the spec then formats the resulting string.
+                let (value, spec_target) = match conversion {
+                    Some('r') => {
+                        let text = interp.repr_of(&value)?;
+                        (Value::Str(Rc::new(text)), true)
+                    }
+                    Some('s') => {
+                        let text = interp.str_of(&value)?;
+                        (Value::Str(Rc::new(text)), true)
+                    }
+                    Some('a') => {
+                        let text = ascii_repr(&interp.repr_of(&value)?);
+                        (Value::Str(Rc::new(text)), true)
+                    }
+                    Some(other) => {
+                        return Err(value_error(format!("Unknown conversion specifier {other}")))
+                    }
+                    None => (value, false),
+                };
+
                 // A user `__format__(self, spec)` controls its own
                 // formatting for any spec (including the empty `{}` spec,
-                // which CPython routes through `__format__("")`).
-                let formatted = if let Some(custom) = interp.try_user_format(&value, spec)? {
-                    custom
+                // which CPython routes through `__format__("")`). A
+                // converted value is already a plain string, so it never
+                // reaches the user hook.
+                let formatted = match if spec_target {
+                    None
                 } else {
-                    // The default stringification honours a user `__str__`
-                    // (via `str_of`), matching `print` / `str`.
-                    let default = interp.str_of(&value)?;
-                    if spec.is_empty() {
-                        default
-                    } else {
-                        crate::interp::format_with_spec_pub(&value, &default, spec)?
+                    interp.try_user_format(&value, &spec)?
+                } {
+                    Some(custom) => custom,
+                    None => {
+                        // The default stringification honours a user
+                        // `__str__` (via `str_of`), matching `print` / `str`.
+                        let default = interp.str_of(&value)?;
+                        if spec.is_empty() {
+                            default
+                        } else {
+                            crate::interp::format_with_spec_pub(&value, &default, &spec)?
+                        }
                     }
                 };
                 out.push_str(&formatted);
@@ -8886,6 +9201,70 @@ fn num_method(v: &Value, name: &str, args: &[Value]) -> Result<Value, Unwind> {
         // The `numbers.Real` surface every int/float carries. `conjugate()`
         // is the identity for a real; `imag` is always 0 / 0.0.
         (Value::Int(i), "conjugate") => Ok(Value::Int(i.clone())),
+        // `(5).as_integer_ratio()` → `(5, 1)`; a float's is exact.
+        (Value::Int(i), "as_integer_ratio") => Ok(Value::Tuple(Rc::new(vec![
+            Value::Int(i.clone()),
+            Value::Int(VmInt::from(1)),
+        ]))),
+        (Value::Bool(b), "as_integer_ratio") => Ok(Value::Tuple(Rc::new(vec![
+            Value::Int(VmInt::from(i64::from(*b))),
+            Value::Int(VmInt::from(1)),
+        ]))),
+        (Value::Float(x), "as_integer_ratio") => {
+            if x.is_nan() {
+                return Err(value_error("cannot convert NaN to integer ratio"));
+            }
+            if x.is_infinite() {
+                return Err(crate::error::Unwind::Exception(
+                    crate::error::VmException::new(
+                        "OverflowError",
+                        "cannot convert Infinity to integer ratio",
+                    ),
+                ));
+            }
+            // A finite f64 is exactly `mantissa * 2^exp`; scale until the
+            // value is integral, which is what CPython's own implementation
+            // does. At most 1074 doublings for a subnormal.
+            let mut num = *x;
+            let mut denom = num_bigint::BigInt::from(1);
+            while num.fract() != 0.0 {
+                num *= 2.0;
+                denom *= 2;
+            }
+            let numer = num_bigint::BigInt::from(num as i128);
+            Ok(Value::Tuple(Rc::new(vec![
+                Value::Int(VmInt::from_bigint(numer)),
+                Value::Int(VmInt::from_bigint(denom)),
+            ])))
+        }
+        // `(2.5).hex()` → `0x1.4000000000000p+1`. IEEE-754 decomposition:
+        // sign, an 11-bit biased exponent and a 52-bit mantissa, which is
+        // exactly 13 hex digits.
+        (Value::Float(x), "hex") => {
+            let v = *x;
+            if v.is_nan() {
+                return Ok(Value::Str(Rc::new("nan".to_owned())));
+            }
+            if v.is_infinite() {
+                return Ok(Value::Str(Rc::new(
+                    if v < 0.0 { "-inf" } else { "inf" }.to_owned(),
+                )));
+            }
+            let bits = v.to_bits();
+            let sign = if bits >> 63 == 1 { "-" } else { "" };
+            let exponent = ((bits >> 52) & 0x7ff) as i64;
+            let mantissa = bits & 0x000f_ffff_ffff_ffff;
+            let text = if exponent == 0 && mantissa == 0 {
+                format!("{sign}0x0.0p+0")
+            } else if exponent == 0 {
+                // Subnormal: the implicit leading bit is 0 and the exponent
+                // is the minimum, which CPython prints as p-1022.
+                format!("{sign}0x0.{mantissa:013x}p-1022")
+            } else {
+                format!("{sign}0x1.{mantissa:013x}p{:+}", exponent - 1023)
+            };
+            Ok(Value::Str(Rc::new(text)))
+        }
         (Value::Float(x), "conjugate") => Ok(Value::Float(*x)),
         (Value::Bool(b), "conjugate") => Ok(Value::Int(VmInt::from(i64::from(*b)))),
         (Value::Int(i), "bit_length") => Ok(Value::Int(VmInt::from(i.bits() as i64))),
@@ -10143,6 +10522,7 @@ pub fn call_with_kwargs(
         | "open"
         | "str"
         | "bytes"
+        | "bytearray"
         | "partial"
         | "partial_call" => {
             let mut args = args;

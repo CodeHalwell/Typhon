@@ -242,6 +242,7 @@ Built-in method dispatch on `str` / `bytes` (v0.11.0) / `list` / `dict` (incl. `
 | `operator` (v1.0.0-beta.1) | Operator function forms plus `itemgetter`, `attrgetter`, `methodcaller`, `countOf`, `indexOf`, `length_hint` |
 | `bisect` (v1.0.0-beta.1) | `bisect_left` / `bisect_right` / `insort_left` / `insort_right` (+ aliases), with `lo` / `hi` / `key` |
 | `__future__` (v1.0.0-beta.1) | The feature flags, so `from __future__ import annotations` imports rather than raising |
+| `asyncio` additions (v1.0.0-beta.1) | `to_thread` (inline — no other thread under the sequential scheduler), `Lock` / `Semaphore` / `BoundedSemaphore` / `Event`; acquisition always succeeds at once, and `Event.wait()` on an unset event fails loudly rather than deadlocking |
 | `typhon_runtime` (and `typhon_runtime.*`) | `Ok`, `Err`, `tasks.spawn` (synchronous shim), `lazy.lazy_let`, `lazy.lazy_import`. `Ok` / `Err` carry bound `.map` / `.map_err` / `.and_then` / `.or_else` combinators since v0.9.0. Submodule imports (`from typhon_runtime.freeze import deep_freeze`) resolve to the matching submodule |
 
 `enum` is resolved separately by the interpreter (it backs the `enum` keyword), not through this table.
@@ -256,7 +257,13 @@ shim): `sqlite3`, `subprocess`, `threading` / `multiprocessing`, `socket`
 / `urllib` / `http`, `ctypes`, `decimal`, `fractions`, `logging`,
 `configparser`, `struct`, and every third-party package.
 
-Also new in v1.0.0-beta.1: `issubclass`; `str.isascii` / `isidentifier` /
+Also new in v1.0.0-beta.1: a full `bytearray` (mutable, CPython `repr`,
+unhashable, `fromhex`) and `x in b"…"` containment; `float.hex()` /
+`as_integer_ratio()`; `str.format` `!r` / `!s` / `!a` conversions and
+`{0.attr}` / `{name[key]}` accessors; CPython's `str.center` padding
+bias; `Cls.__doc__` / `Cls.__mro__` / `fn.__type_params__`; the rest of
+the builtin exception hierarchy (`BrokenPipeError`, `BlockingIOError`,
+`MemoryError`, …); `issubclass`; `str.isascii` / `isidentifier` /
 `isprintable`; the `numbers` tower on `int` / `float` (`real`, `imag`,
 `conjugate()`, `numerator`, `denominator`) and `int.from_bytes`; the
 unbound method form of every builtin type (`str.upper(s)`,

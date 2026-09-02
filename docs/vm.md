@@ -148,6 +148,7 @@ since v1.0.0-beta.1 — before that each built an opaque instance, so
 | `operator` (v1.0.0-beta.1) | The function forms of every operator plus `itemgetter`, `attrgetter`, `methodcaller`, `countOf`, `indexOf`, `length_hint` |
 | `bisect` (v1.0.0-beta.1) | `bisect_left`, `bisect_right`, `insort_left`, `insort_right` (and the `bisect` / `insort` aliases), with `lo` / `hi` / `key` |
 | `__future__` (v1.0.0-beta.1) | The feature flags, so `from __future__ import annotations` imports rather than raising |
+| `asyncio` additions (v1.0.0-beta.1) | `to_thread` (runs the call inline — there is no other thread under the sequential scheduler), and `Lock` / `Semaphore` / `BoundedSemaphore` / `Event`. Acquisition always succeeds at once, since two coroutines are never inside the same critical section; `Event.wait()` on an unset event fails loudly rather than deadlocking, like `Queue.get` on an empty queue |
 | `typhon_runtime` (and `typhon_runtime.*`) | `Ok`, `Err`, `tasks.spawn`, `lazy.lazy_let`, `lazy.lazy_import` — the `spawn` shim runs synchronously. `Ok` / `Err` carry bound `.map` / `.map_err` / `.and_then` / `.or_else` combinators since v0.9.0. Submodule imports (`from typhon_runtime.freeze import deep_freeze`) resolve to the matching submodule |
 
 `enum` is resolved separately by the interpreter (it backs the `enum` keyword), not through the module table.
@@ -196,12 +197,27 @@ package (`pydantic` has the placeholder above; `numpy`, `requests`,
   the frozen sentinel through `union` / `intersection` / `difference` /
   `symmetric_difference`; `update` is rejected on frozensets.
 - `tuple`: `count`, `index`.
+- `bytearray` (v1.0.0-beta.1): the mutable sibling of `bytes` —
+  construction from bytes / an int / an iterable of ints / `str` plus an
+  encoding, `append` / `extend` / `insert` / `pop` / `remove` / `clear` /
+  `reverse` / `copy`, index and slice read *and* write, `+` / `*` /
+  `in` / comparison against `bytes`, the `bytes` read methods, and
+  `bytearray.fromhex`. `repr` is CPython's `bytearray(b'…')`, and it is
+  unhashable, as CPython's is. `x in b"…"` (a byte value or a
+  subsequence) works too — the VM rejected both.
 - `int`: `bit_length`, `bit_count`, `to_bytes`, and the classmethod
   `int.from_bytes`. `float`: `is_integer`. Both carry the `numbers`
   tower's read-only components since v1.0.0-beta.1 — `real`, `imag`,
   `conjugate()`, plus `numerator` / `denominator` on `int`.
 - Every builtin *type* also exposes its methods unbound, as CPython does:
-  `str.upper(s)`, `dict.get(d, k)`, `list.count(xs, x)` (v1.0.0-beta.1).
+  `str.upper(s)`, `dict.get(d, k)`, `list.count(xs, x)` (v1.0.0-beta.1),
+  plus the classmethods `int.from_bytes` and `bytes.fromhex`.
+- `float.hex()` and `int` / `float` `as_integer_ratio()` (v1.0.0-beta.1).
+- `str.format` handles the `!r` / `!s` / `!a` conversions and the
+  `{0.attr}` / `{name[key]}` accessors (v1.0.0-beta.1); `str.center`
+  biases its extra pad character the way CPython does.
+- A class exposes `__doc__` and `__mro__`, and a function
+  `__type_params__` (v1.0.0-beta.1).
 - `bytes`: `repr` matches CPython byte-for-byte (`b'hi'` by default,
   `b"with 'embedded'"` fallback, `\xNN` for non-printable bytes). Since
   v0.11.0 also `decode`, `hex`, `fromhex`, `count`, `find`, `rfind`,

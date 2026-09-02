@@ -1764,6 +1764,10 @@ impl Interpreter {
                 Value::Tuple(Rc::new(builtin_bases)),
             );
         }
+        // `Cls.__doc__` — the class body's leading string literal.
+        if let Some(doc) = class_docstring(c) {
+            class_attrs.insert("__typhon_doc__".to_owned(), Value::Str(Rc::new(doc)));
+        }
         class_attrs.insert(
             "__typhon_module__".to_owned(),
             Value::Str(Rc::new(self.current_module_name.clone())),
@@ -3400,6 +3404,26 @@ impl Interpreter {
                 }
                 Ok(false)
             }
+            // `97 in b"abc"` tests a byte value; `b"bc" in b"abc"` tests a
+            // subsequence — CPython accepts both, and the VM accepted
+            // neither.
+            Value::Bytes(haystack) => match item {
+                Value::Int(_) | Value::Bool(_) => {
+                    let n = item.to_int()?;
+                    if !(0..=255).contains(&n) {
+                        return Err(value_error("byte must be in range(0, 256)"));
+                    }
+                    Ok(haystack.contains(&(n as u8)))
+                }
+                Value::Bytes(needle) => Ok(needle.is_empty()
+                    || haystack
+                        .windows(needle.len())
+                        .any(|w| w == needle.as_slice())),
+                other => Err(type_error(format!(
+                    "a bytes-like object is required, not '{}'",
+                    other.type_name()
+                ))),
+            },
             Value::Instance(i) => {
                 // `x in obj` → obj.__contains__(x).
                 if let Some(m) = self.find_method(&i.class, "__contains__") {
@@ -5754,6 +5778,39 @@ impl Interpreter {
                 if attr == "__name__" || attr == "__qualname__" {
                     return Ok(Value::Str(Rc::new(class.name.clone())));
                 }
+                // `Cls.__mro__` — the linearised base chain, ending in
+                // `object`. The VM walks bases depth-first for method
+                // lookup rather than computing a C3 linearisation, so this
+                // reports that same order (identical for the single-
+                // inheritance chains that make up almost all real code).
+                if attr == "__mro__" {
+                    let mut out: Vec<Value> = Vec::new();
+                    let mut stack: Vec<Rc<Class>> = vec![class.clone()];
+                    let mut seen: Vec<*const Class> = Vec::new();
+                    while let Some(c) = stack.pop() {
+                        let ptr = Rc::as_ptr(&c);
+                        if seen.contains(&ptr) {
+                            continue;
+                        }
+                        seen.push(ptr);
+                        out.push(Value::Class(c.clone()));
+                        for base in c.bases.iter().rev() {
+                            stack.push(base.clone());
+                        }
+                    }
+                    out.push(crate::builtins::make_builtin_type("object"));
+                    return Ok(Value::Tuple(Rc::new(out)));
+                }
+                // `Cls.__doc__` — the class body's leading string literal,
+                // recorded at class creation, or `None`.
+                if attr == "__doc__" {
+                    return Ok(class
+                        .class_attrs
+                        .borrow()
+                        .get("__typhon_doc__")
+                        .cloned()
+                        .unwrap_or(Value::None));
+                }
                 // `object.__setattr__(obj, name, value)` — the raw attribute
                 // store that bypasses a user `__setattr__` (how a class that
                 // overrides `__setattr__` initialises its own fields).
@@ -5891,6 +5948,13 @@ impl Interpreter {
             Value::Function(f) if attr == "__name__" || attr == "__qualname__" => {
                 Ok(Value::Str(Rc::new(f.name.clone())))
             }
+            // PEP 695: a function's own type parameters. The VM erases them
+            // at definition time, so the tuple is empty — which is what
+            // CPython reports for every non-generic function, and the only
+            // thing a runtime consumer can act on either way.
+            Value::Function(_) | Value::Native(_) if attr == "__type_params__" => {
+                Ok(Value::Tuple(Rc::new(Vec::new())))
+            }
             // …then whatever was attached to the function's own `__dict__`.
             Value::Function(f) if f.attrs.borrow().contains_key(attr) => Ok(f
                 .attrs
@@ -5907,6 +5971,13 @@ impl Interpreter {
             }
             Value::Native(n) if attr == "__name__" || attr == "__qualname__" => {
                 Ok(Value::Str(Rc::new(n.name.to_string())))
+            }
+            // `bytearray` is a shim *class* behind a constructor native, so
+            // a class-level read (`bytearray.fromhex(...)`) resolves through
+            // the class itself.
+            Value::Native(n) if n.name == "bytearray" => {
+                let cls = crate::builtins::bytearray_class(self)?;
+                self.get_attr(&cls, attr)
             }
             // A builtin *type* — the VM models `int` / `str` / `list` / … as
             // native constructors, so `int.from_bytes(b, "big")` and the
@@ -8240,6 +8311,41 @@ fn builtin_type_method(ty: &'static str, attr: &str) -> Option<Value> {
         "float" => Value::Float(0.0),
         _ => return None,
     };
+    // `bytes.fromhex("6162")` is a classmethod too — the unbound-method
+    // form below would take the hex *string* as the receiver and dispatch
+    // to `str`, which has no `fromhex`.
+    if ty == "bytes" && attr == "fromhex" {
+        return Some(Value::Native(Rc::new(NativeFn::new(
+            "fromhex",
+            |_i, args| {
+                let text = match args.first() {
+                    Some(Value::Str(s)) => (**s).clone(),
+                    _ => return Err(type_error("fromhex() argument must be str")),
+                };
+                // CPython ignores ASCII whitespace between byte pairs.
+                let digits: Vec<char> = text.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+                if !digits.len().is_multiple_of(2) {
+                    return Err(value_error(
+                        "non-hexadecimal number found in fromhex() arg at position 0",
+                    ));
+                }
+                let mut out = Vec::with_capacity(digits.len() / 2);
+                for pair in digits.chunks(2) {
+                    let hi = pair[0].to_digit(16);
+                    let lo = pair[1].to_digit(16);
+                    match (hi, lo) {
+                        (Some(h), Some(l)) => out.push(((h << 4) | l) as u8),
+                        _ => {
+                            return Err(value_error(
+                                "non-hexadecimal number found in fromhex() arg",
+                            ))
+                        }
+                    }
+                }
+                Ok(Value::Bytes(Rc::new(out)))
+            },
+        ))));
+    }
     // `int.from_bytes(bytes, byteorder="big", *, signed=False)` is a
     // classmethod, so it has no receiver to probe for.
     if ty == "int" && attr == "from_bytes" {
@@ -8477,7 +8583,10 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                 | "update"
         ),
         Value::Tuple(_) => matches!(attr, "count" | "index"),
-        Value::Float(_) => matches!(attr, "is_integer" | "conjugate" | "real" | "imag"),
+        Value::Float(_) => matches!(
+            attr,
+            "is_integer" | "conjugate" | "real" | "imag" | "hex" | "as_integer_ratio"
+        ),
         Value::Int(_) | Value::Bool(_) => matches!(
             attr,
             "bit_length"
@@ -8489,6 +8598,7 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                 | "imag"
                 | "numerator"
                 | "denominator"
+                | "as_integer_ratio"
         ),
         _ => false,
     }
@@ -9904,7 +10014,11 @@ pub fn builtin_exc_is_a(kind: &str, target: &str) -> bool {
             | "SyntaxWarning"
             | "ImportWarning"
             | "ResourceWarning"
+            | "EncodingWarning"
+            | "UnicodeWarning"
             | "BytesWarning" => "Warning",
+            "IndentationError" => "SyntaxError",
+            "TabError" => "IndentationError",
             _ => return None,
         })
     }
@@ -10479,6 +10593,18 @@ fn join_module(package: &[String], name: &str) -> String {
         name.to_owned()
     } else {
         format!("{}.{}", package.join("."), name)
+    }
+}
+
+/// A class body's docstring — its leading string-literal expression
+/// statement, exactly as CPython's `Cls.__doc__` reports it.
+fn class_docstring(c: &ast::StmtClassDef) -> Option<String> {
+    match c.body.first() {
+        Some(Stmt::Expr(e)) => match e.value.as_ref() {
+            Expr::StringLiteral(s) => Some(s.value.to_str().to_owned()),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
