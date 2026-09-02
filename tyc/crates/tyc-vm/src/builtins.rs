@@ -312,6 +312,16 @@ pub fn install(interp: &mut Interpreter) {
             return Ok(Value::Int(VmInt::from(0)));
         }
         let v = single(&args, "int")?;
+        // A value-mixin enum member (`IntEnum` / `IntFlag` / `StrEnum`) IS
+        // its value in CPython, so `int(Colour.RED)` is `1`.
+        let unwrapped;
+        let v = match crate::value::enum_mixin_value(v) {
+            Some(inner) => {
+                unwrapped = inner;
+                &unwrapped
+            }
+            None => v,
+        };
         // `int(str, base)` — parse a string in the given radix.
         if let (Value::Str(s), Some(base_v)) = (v, args.get(1)) {
             // `base` must be an integer (Python rejects float/str bases).
@@ -6919,11 +6929,6 @@ fn make_future_module() -> Value {
 }
 
 fn make_contextlib_module(interp: &mut Interpreter) -> Value {
-    let identity = |name: &'static str| {
-        nf(name, |_i, args| {
-            Ok(args.into_iter().next().unwrap_or(Value::None))
-        })
-    };
     // `@contextmanager` wraps a generator function into a factory whose calls
     // hand back a context manager driving that generator: `__enter__` runs
     // the body up to its `yield` (the yielded value is what `as` binds) and
@@ -6941,9 +6946,32 @@ fn make_contextlib_module(interp: &mut Interpreter) -> Value {
             },
         ))))
     });
+    let asynccontextmanager = nf("asynccontextmanager", |_i, args| {
+        let func = args.into_iter().next().unwrap_or(Value::None);
+        Ok(Value::Native(Rc::new(NativeFn::new(
+            "asynccontextmanager_factory",
+            move |i, call_args| {
+                let (pos, kw) = split_kwargs(&call_args);
+                let gen = i.call_value(func.clone(), pos.to_vec(), &kw)?;
+                // An `async def` *with* a `yield` is an async generator, and
+                // calling it already produces the generator object. Forcing
+                // that would run the body past its `yield` — the teardown
+                // after the yield would happen before `__aenter__` returned,
+                // printing "close" before the `async with` body. Only a
+                // plain coroutine (a decorator applied to a non-generator)
+                // needs forcing.
+                let gen = if crate::interp::as_generator(&gen).is_some() {
+                    gen
+                } else {
+                    i.force_awaitable(gen)?
+                };
+                Ok(async_generator_context_manager(gen))
+            },
+        ))))
+    });
     let mut entries = vec![
         ("contextmanager", contextmanager),
-        ("asynccontextmanager", identity("asynccontextmanager")),
+        ("asynccontextmanager", asynccontextmanager),
     ];
     // `suppress` / `nullcontext` / `closing` / `redirect_*` / `ExitStack` are
     // ordinary Python classes — the shim is both shorter and closer to
@@ -7062,6 +7090,30 @@ fn generator_context_manager(gen: Value) -> Value {
             ("__exit__", Value::Native(Rc::new(exit))),
         ],
     )
+}
+
+/// The `@asynccontextmanager` counterpart. The VM forces every coroutine at
+/// its await point and materialises async generators, so the *driving* is
+/// identical to the sync case — only the protocol names differ. Without
+/// this, `asynccontextmanager` was an identity decorator, so
+/// `async with session(...)` saw the raw generator and raised
+/// "does not support the asynchronous context manager protocol" on a
+/// program `tyc build` runs fine.
+fn async_generator_context_manager(gen: Value) -> Value {
+    let sync = generator_context_manager(gen);
+    let Value::Instance(inner) = &sync else {
+        return sync;
+    };
+    let enter_src = inner.fields.borrow().get("__enter__").cloned();
+    let exit_src = inner.fields.borrow().get("__exit__").cloned();
+    let mut fields: Vec<(&str, Value)> = Vec::new();
+    if let Some(f) = enter_src {
+        fields.push(("__aenter__", f));
+    }
+    if let Some(f) = exit_src {
+        fields.push(("__aexit__", f));
+    }
+    native_object("_AsyncGeneratorContextManager", fields)
 }
 
 /// `functools` shim.
@@ -7479,6 +7531,22 @@ pub fn dispatch_method(
         .cloned()
         .ok_or_else(|| type_error("method called without receiver"))?;
     let (rest, kwargs) = split_kwargs_map(&args[1..]);
+    // The universal dunders CPython exposes on every object. They are
+    // ordinary methods there (`(5).__repr__()`, `"a".__len__()`), and the
+    // per-type tables below do not carry them.
+    match name {
+        "__repr__" => return Ok(Value::Str(Rc::new(interp.repr_of(&receiver)?))),
+        "__str__" | "__format__" if rest.is_empty() || name == "__str__" => {
+            return Ok(Value::Str(Rc::new(interp.str_of(&receiver)?)))
+        }
+        "__len__" => {
+            return Ok(Value::Int(VmInt::from(value_len(&receiver)? as i64)));
+        }
+        "__bool__" => return Ok(Value::Bool(receiver.truthy())),
+        "__hash__" => return Ok(Value::Int(VmInt::from(interp.hash_value(&receiver)?))),
+        "__class__" => return Ok(make_builtin_type(receiver.type_name())),
+        _ => {}
+    }
     match (&receiver, name) {
         // ── str methods ────────────────────────────────────────────────────
         (Value::Str(s), m) => str_method(interp, s, m, rest, &kwargs),
@@ -8445,6 +8513,52 @@ fn bytes_method(
                 None if name == "find" => Value::Int(VmInt::from(-1)),
                 None => return Err(value_error("subsection not found")),
             }
+        }
+        // `b.count(sub[, start[, end]])` — a bytes-like *subsequence* or a
+        // single byte value, counted without overlaps, as in CPython.
+        "count" if !args.is_empty() => {
+            let len = b.len() as i64;
+            let clamp = |v: Option<&Value>, default: i64| -> Result<usize, Unwind> {
+                let mut i = match v {
+                    None | Some(Value::None) => default,
+                    Some(v) => v.to_int()?,
+                };
+                if i < 0 {
+                    i += len;
+                }
+                Ok(i.clamp(0, len) as usize)
+            };
+            let start = clamp(args.get(1), 0)?;
+            let end = clamp(args.get(2), len)?;
+            if start > end {
+                return Ok(Value::Int(VmInt::from(0)));
+            }
+            let window = &b[start..end];
+            let needle = match &args[0] {
+                Value::Int(_) | Value::Bool(_) => {
+                    let n = args[0].to_int()?;
+                    if !(0..=255).contains(&n) {
+                        return Err(value_error("byte must be in range(0, 256)"));
+                    }
+                    vec![n as u8]
+                }
+                other => bytes_arg(other)?,
+            };
+            if needle.is_empty() {
+                // CPython counts the empty needle at every position plus one.
+                return Ok(Value::Int(VmInt::from(window.len() as i64 + 1)));
+            }
+            let mut count = 0i64;
+            let mut at = 0usize;
+            while at + needle.len() <= window.len() {
+                if &window[at..at + needle.len()] == needle.as_slice() {
+                    count += 1;
+                    at += needle.len();
+                } else {
+                    at += 1;
+                }
+            }
+            Value::Int(VmInt::from(count))
         }
         "replace" => {
             let from = bytes_arg(
@@ -10032,6 +10146,12 @@ pub fn make_kwargs_sentinel(kwargs: &[(String, Value)]) -> Value {
 }
 
 /// If `args` ends with a kwargs sentinel, split it into (positional, keywords).
+/// [`split_kwargs`] for callers outside this module (the unbound
+/// builtin-classmethod natives in `interp`).
+pub(crate) fn split_kwargs_pub(args: &[Value]) -> (&[Value], Vec<(String, Value)>) {
+    split_kwargs(args)
+}
+
 fn split_kwargs(args: &[Value]) -> (&[Value], Vec<(String, Value)>) {
     if let Some(Value::Tuple(t)) = args.last() {
         if t.len() == 2 {
@@ -10523,6 +10643,7 @@ pub fn call_with_kwargs(
         | "str"
         | "bytes"
         | "bytearray"
+        | "from_bytes"
         | "partial"
         | "partial_call" => {
             let mut args = args;

@@ -229,7 +229,7 @@ Built-in method dispatch on `str` / `bytes` (v0.11.0) / `list` / `dict` (incl. `
 | `dataclasses` (v0.8.0) | `dataclass`, `field`, `fields`, `asdict`, `astuple`. v0.9.0: `field(default_factory=list)` actually invokes the factory per instance |
 | `pathlib` (v0.8.0, rebuilt v1.0.0-beta.1) | `PurePath` / `Path` over the `os` shim: normalisation, `parts`, `parent(s)`, `name`, `stem`, `suffix(es)`, `with_name` / `with_stem` / `with_suffix`, `joinpath` / `/`, `relative_to`, `is_absolute`, `match`, `as_posix`, `as_uri`, comparison + hashing, `home` / `cwd` / `absolute` / `resolve` / `expanduser`, `exists` / `is_file` / `is_dir` / `stat`, `read_text` / `write_text` / `read_bytes` / `write_bytes` / `open`, `iterdir` / `glob` / `rglob` / `walk`, `mkdir` / `touch` / `unlink` / `rmdir` / `rename`. `repr` and error messages match CPython |
 | `heapq` (v0.9.0) | `heappush`, `heappop`, `heapify`, `heappushpop`, `heapreplace`, `nsmallest`, `nlargest` |
-| `contextlib` (v0.9.0) | `@contextmanager` identity decorator; `with` block honours the wrapped `__enter__` / `__exit__` shape. v1.0.0-beta.1: `suppress`, `nullcontext`, `closing`, `redirect_stdout`, `redirect_stderr`, `ExitStack` |
+| `contextlib` (v0.9.0) | `@contextmanager` identity decorator; `with` block honours the wrapped `__enter__` / `__exit__` shape. v1.0.0-beta.1: `@asynccontextmanager` really drives its generator (it was an identity decorator, so `async with` raised), plus `suppress`, `nullcontext`, `closing`, `redirect_stdout`, `redirect_stderr`, `ExitStack` |
 | `pydantic` (v0.9.0) | `BaseModel` placeholder so declaring a `model` doesn't `ImportError` (full validation still requires `--compile`) |
 | `io` (v1.0.0-beta.1) | `open` and its file objects (`TextIOWrapper`, `BufferedReader` / `BufferedWriter`, `FileIO`), `StringIO`, `BytesIO`, `SEEK_*`, `UnsupportedOperation`. Modes, encodings, newline translation, `seek` / `tell` / `truncate` / `flush`, line iteration, CPython error messages |
 | `shutil` (v1.0.0-beta.1) | `copy`, `copy2`, `copyfile`, `copytree`, `move`, `rmtree`, `which`, `disk_usage`, `SameFileError` |
@@ -257,7 +257,13 @@ shim): `sqlite3`, `subprocess`, `threading` / `multiprocessing`, `socket`
 / `urllib` / `http`, `ctypes`, `decimal`, `fractions`, `logging`,
 `configparser`, `struct`, and every third-party package.
 
-Also new in v1.0.0-beta.1: a full `bytearray` (mutable, CPython `repr`,
+Also new in v1.0.0-beta.1: `async for` over a hand-written `__aiter__` /
+`__anext__` iterator, and generator bodies (sync *and* async) running
+lazily wherever the tree-walk can suspend, so a `@contextmanager` /
+`@asynccontextmanager` body runs between setup and teardown; set
+comparison as subset / superset; PEP 584 `d1 | d2`; value-mixin enum
+members behaving as their value under arithmetic, `int()` and flag
+membership; a full `bytearray` (mutable, CPython `repr`,
 unhashable, `fromhex`) and `x in b"…"` containment; `float.hex()` /
 `as_integer_ratio()`; `str.format` `!r` / `!s` / `!a` conversions and
 `{0.attr}` / `{name[key]}` accessors; CPython's `str.center` padding

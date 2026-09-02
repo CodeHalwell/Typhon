@@ -3269,7 +3269,6 @@ impl Interpreter {
     }
 
     fn cmp_op(&mut self, op: CmpOp, l: &Value, r: &Value) -> Result<bool, Unwind> {
-        use std::cmp::Ordering::*;
         // User-defined rich comparisons take priority when an operand is a
         // class instance (Python's `__eq__` / `__lt__` / … protocol).
         if matches!(l, Value::Instance(_)) || matches!(r, Value::Instance(_)) {
@@ -3287,7 +3286,11 @@ impl Interpreter {
             // True, ordering works against raw ints, etc. Unwrap to the
             // member value and retry. Plain `Enum` members deliberately do
             // NOT unwrap (CPython: `Color.RED == 1` is False).
-            if !matches!(op, CmpOp::Is | CmpOp::IsNot) {
+            // `In` / `NotIn` are *containment*, not comparison: unwrapping
+            // `Perm.READ in (Perm.READ | Perm.WRITE)` to `1 in 3` loses the
+            // fact that the left operand is a flag member, which is what
+            // makes the bit test legal.
+            if !matches!(op, CmpOp::Is | CmpOp::IsNot | CmpOp::In | CmpOp::NotIn) {
                 let lu = crate::value::enum_mixin_value(l);
                 let ru = crate::value::enum_mixin_value(r);
                 if lu.is_some() || ru.is_some() {
@@ -3297,6 +3300,35 @@ impl Interpreter {
                 }
             }
         }
+        // Set comparison is *subset* / *superset*, not ordering: `{1} <= {1, 2}`
+        // is True and `{1} < {1}` is False, and two sets that neither contain
+        // the other compare False both ways rather than raising. `py_cmp`
+        // models a total order, so sets are handled before it.
+        if let (Value::Set(a), Value::Set(b)) = (l, r) {
+            let (a, b) = (a.borrow(), b.borrow());
+            let frozen = crate::value::HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
+            let members = |s: &std::collections::HashSet<crate::value::HashKey>| {
+                s.iter().filter(|k| **k != frozen).count()
+            };
+            let subset = a.iter().all(|k| *k == frozen || b.contains(k));
+            let superset = b.iter().all(|k| *k == frozen || a.contains(k));
+            let (na, nb) = (members(&a), members(&b));
+            return Ok(match op {
+                CmpOp::Lt => subset && na < nb,
+                CmpOp::LtE => subset,
+                CmpOp::Gt => superset && na > nb,
+                CmpOp::GtE => superset,
+                _ => {
+                    drop((a, b));
+                    return self.cmp_op_non_set(op, l, r);
+                }
+            });
+        }
+        self.cmp_op_non_set(op, l, r)
+    }
+
+    fn cmp_op_non_set(&mut self, op: CmpOp, l: &Value, r: &Value) -> Result<bool, Unwind> {
+        use std::cmp::Ordering::*;
         Ok(match op {
             CmpOp::Eq => self.eq_values(l, r)?,
             CmpOp::NotEq => !self.eq_values(l, r)?,
@@ -3403,6 +3435,22 @@ impl Interpreter {
                     }
                 }
                 Ok(false)
+            }
+            // `Perm.READ in (Perm.READ | Perm.WRITE)` — an `IntFlag`
+            // combination. The VM reduces `|` over value-mixin members to a
+            // plain int, so the bit test has to be recognised here. Gated on
+            // the *item* being a flag member, so a bare `1 in 3` still
+            // raises, as CPython does.
+            Value::Int(_) | Value::Bool(_) => {
+                let Some(Value::Int(bit)) = crate::value::enum_mixin_value(item) else {
+                    return Err(type_error(format!(
+                        "argument of type '{}' is not iterable",
+                        container.type_name()
+                    )));
+                };
+                let whole = container.to_int()?;
+                let bit = bit.to_i64().unwrap_or(0);
+                Ok(bit != 0 && (whole & bit) == bit)
             }
             // `97 in b"abc"` tests a byte value; `b"bc" in b"abc"` tests a
             // subsequence — CPython accepts both, and the VM accepted
@@ -5079,6 +5127,18 @@ impl Interpreter {
         // `d1.keys() & d2.keys()`, `d.keys() - some_set`, etc. all work —
         // matching CPython, where keys/items views implement the set
         // operations (values views do not).
+        // PEP 584: `d1 | d2` merges two dicts, right operand winning. This
+        // has to precede the set-operand path, because a `dict` is a valid
+        // set operand (its keys) and would otherwise merge into a *set*.
+        if matches!(op, BitOr) {
+            if let (Dict(a), Dict(b)) = (l, r) {
+                let mut out = a.borrow().clone();
+                for (k, v) in b.borrow().iter() {
+                    out.insert(k.clone(), v.clone());
+                }
+                return Ok(Dict(Rc::new(RefCell::new(out))));
+            }
+        }
         if matches!(op, BitOr | BitAnd | Sub | BitXor) {
             if let (Some(a), Some(b)) = (as_set_operand(l)?, as_set_operand(r)?) {
                 let out: std::collections::HashSet<HashKey> = match op {
@@ -5193,6 +5253,12 @@ impl Interpreter {
                 if let Some(r) = self.call_dunder0(v, name)? {
                     return Ok(r);
                 }
+            }
+            // A value-mixin enum member (`IntEnum` / `IntFlag` / `StrEnum`)
+            // IS its value in CPython, so `-Colour.RED` is `-1`. Unwrap and
+            // retry, exactly as the comparison path does.
+            if let Some(inner) = crate::value::enum_mixin_value(v) {
+                return self.unop(op, &inner);
             }
         }
         match op {
@@ -6589,6 +6655,68 @@ impl Interpreter {
             // (used by the `defaultdict` shim so `for k in dd` / `list(dd)`
             // iterate the backing mapping's keys).
             Value::Instance(ref inst) => {
+                // `async for x in obj:` — the async iteration protocol.
+                // Async generators are materialised eagerly so the sync and
+                // async loops share this path, but a *hand-written* async
+                // iterator defines `__aiter__` / `__anext__` and has no
+                // `__iter__` at all, so it has to be recognised here.
+                // `__anext__` is a coroutine: force it at each step, and
+                // treat `StopAsyncIteration` as the end.
+                if self.find_method(&inst.class, "__iter__").is_none()
+                    && self.find_method(&inst.class, "__aiter__").is_some()
+                {
+                    let aiter = match self.find_method(&inst.class, "__aiter__") {
+                        Some(m) => self.call_value(
+                            Value::BoundMethod {
+                                receiver: Box::new(v.clone()),
+                                function: m,
+                            },
+                            vec![],
+                            &[],
+                        )?,
+                        None => v.clone(),
+                    };
+                    let aiter = self.force_awaitable(aiter)?;
+                    let Value::Instance(target) = &aiter else {
+                        return self.make_iter(aiter);
+                    };
+                    let Some(anext) = self.find_method(&target.class, "__anext__") else {
+                        return self.make_iter(aiter.clone());
+                    };
+                    // Drain it here: the VM's async model completes every
+                    // coroutine at its force point, so a lazily-stepped
+                    // async iterator would have no observable difference
+                    // and this keeps the iterator state machine simple.
+                    let mut out: Vec<Value> = Vec::new();
+                    loop {
+                        let step = self.call_value(
+                            Value::BoundMethod {
+                                receiver: Box::new(aiter.clone()),
+                                function: anext.clone(),
+                            },
+                            vec![],
+                            &[],
+                        );
+                        let step = match step {
+                            Ok(coro) => self.force_awaitable(coro),
+                            Err(e) => Err(e),
+                        };
+                        match step {
+                            Ok(item) => out.push(item),
+                            Err(Unwind::Exception(e)) if e.kind == "StopAsyncIteration" => break,
+                            Err(other) => return Err(other),
+                        }
+                        if out.len() > GENERATOR_CAP {
+                            return Err(crate::error::Unwind::Exception(
+                                crate::error::VmException::new(
+                                    "RuntimeError",
+                                    "async iterator produced more than 1,000,000 items — the VM                                      materialises async iteration eagerly; run with                                      `tyc run --compile` for an unbounded one",
+                                ),
+                            ));
+                        }
+                    }
+                    return self.make_iter(Value::List(Rc::new(RefCell::new(out))));
+                }
                 if let Some(m) = self.find_method(&inst.class, "__iter__") {
                     let iter_val = self.call_value(
                         Value::BoundMethod {
@@ -8352,6 +8480,18 @@ fn builtin_type_method(ty: &'static str, attr: &str) -> Option<Value> {
         return Some(Value::Native(Rc::new(NativeFn::new(
             "from_bytes",
             |_i, args| {
+                // `byteorder=` / `signed=` are keyword-capable in CPython.
+                let (pos, kw) = crate::builtins::split_kwargs_pub(&args);
+                let mut args: Vec<Value> = pos.to_vec();
+                if let Some((_, v)) = kw.iter().find(|(k, _)| k == "byteorder") {
+                    args.push(v.clone());
+                }
+                let signed = kw
+                    .iter()
+                    .find(|(k, _)| k == "signed")
+                    .map(|(_, v)| v.truthy())
+                    .unwrap_or(false);
+                let _ = signed;
                 let raw = match args.first() {
                     Some(Value::Bytes(b)) => (**b).clone(),
                     Some(Value::List(l)) => l
@@ -9112,9 +9252,18 @@ pub(crate) fn stop_iteration_for(it: &Value) -> Unwind {
 /// Classify a function body: not a generator, a lazily-resumable generator,
 /// or one that must run eagerly (see [`GeneratorKind`]).
 fn generator_kind(is_async: bool, body: &[Stmt]) -> GeneratorKind {
+    // An `async def` containing a `yield` is an async *generator*, and the
+    // resumable tree-walk drives it exactly as it drives a sync one — the
+    // VM forces every `await` inline, so nothing in the body needs a
+    // different suspension mechanism. Treating it as eager instead ran the
+    // whole body at the call, so the teardown after a `@asynccontextmanager`
+    // generator's `yield` executed *before* the `async with` body. Bodies
+    // whose yields sit in positions the tree-walk cannot suspend at still
+    // fall back to eager, sync and async alike.
+    let _ = is_async;
     if !body_is_generator(body) {
         GeneratorKind::NotGenerator
-    } else if is_async || !body_lazy_ok(body) {
+    } else if !body_lazy_ok(body) {
         GeneratorKind::Eager
     } else {
         GeneratorKind::Lazy

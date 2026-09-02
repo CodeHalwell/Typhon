@@ -4565,6 +4565,93 @@ main()
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
 
+    /// The async iteration and context-manager protocols, and the enum /
+    /// set / dict operator corners a real program reaches.
+    #[test]
+    fn async_protocols_and_operator_corners_match_cpython() {
+        let src = r#"
+import asyncio
+import enum
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
+
+class Colour(enum.IntEnum):
+    RED = 1
+    BLUE = 2
+
+class Perm(enum.IntFlag):
+    READ = 1
+    WRITE = 2
+
+plain class Counter:
+    def __init__(self, n: int) -> None:
+        self.n = n
+        self.i = 0
+
+    def __aiter__(self) -> object:
+        return self
+
+    async def __anext__(self) -> int:
+        if self.i >= self.n:
+            raise StopAsyncIteration()
+        self.i = self.i + 1
+        return self.i
+
+@asynccontextmanager
+async def ctx(name: str) -> AsyncIterator[str]:
+    log.append("enter:" + name)
+    yield name
+    log.append("exit:" + name)
+
+mut log: list[str] = []
+
+async def run() -> list[int]:
+    mut seen: list[int] = []
+    # A hand-written async iterator: `__aiter__` + `__anext__`, which the
+    # VM did not recognise at all.
+    async for v in Counter(3):
+        seen.append(v)
+    # `@asynccontextmanager` was an identity decorator, so this raised
+    # "does not support the asynchronous context manager protocol".
+    async with ctx("db") as c:
+        log.append("using:" + c)
+    return seen
+
+def main() -> None:
+    if asyncio.run(run()) != [1, 2, 3]:
+        raise AssertionError("async iteration wrong")
+    # The teardown after the `yield` must run AFTER the body, not before.
+    if log != ["enter:db", "using:db", "exit:db"]:
+        raise AssertionError("async context manager order wrong: " + str(log))
+
+    # Set comparison is subset/superset, not ordering.
+    if not ({1, 2} <= {1, 2, 3}) or not ({1} < {1, 2}) or ({1, 2} < {1, 2}):
+        raise AssertionError("set subset comparison wrong")
+    if not ({1, 2} >= {1}) or ({1} > {1, 2}):
+        raise AssertionError("set superset comparison wrong")
+    # PEP 584 dict merge.
+    if ({"a": 1} | {"b": 2}) != {"a": 1, "b": 2}:
+        raise AssertionError("dict merge wrong")
+    # A value-mixin enum member IS its value.
+    if int(Colour.RED) != 1 or -Colour.RED != -1 or Colour.RED + 1 != 2:
+        raise AssertionError("IntEnum arithmetic wrong")
+    if Perm.READ not in (Perm.READ | Perm.WRITE):
+        raise AssertionError("IntFlag membership wrong")
+    # …but a bare int is still not a container, as in CPython.
+    mut raised: str = ""
+    try:
+        if 1 in 3:
+            pass
+    except TypeError as e:
+        raised = str(e)
+    if raised != "argument of type 'int' is not iterable":
+        raise AssertionError("bare int containment must raise: " + raised)
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
     /// `bytearray` was missing entirely — `Value::Bytes` is immutable, so
     /// the mutable sibling is a shim class marked as a `bytearray` for
     /// `isinstance`. Checked against CPython 3.13.

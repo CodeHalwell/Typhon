@@ -135,7 +135,7 @@ since v1.0.0-beta.1 — before that each built an opaque instance, so
 | `pathlib` (v0.8.0, rebuilt v1.0.0-beta.1) | `PurePath` / `Path` over the `os` shim: construction and normalisation, `parts`, `parent`, `parents`, `name`, `stem`, `suffix`, `suffixes`, `with_name` / `with_stem` / `with_suffix`, `joinpath` / `/`, `relative_to`, `is_absolute`, `match`, `as_posix`, `as_uri`, comparison and hashing, `home` / `cwd` / `absolute` / `resolve` / `expanduser`, `exists` / `is_file` / `is_dir` / `stat`, `read_text` / `write_text` / `read_bytes` / `write_bytes` / `open`, `iterdir` / `glob` / `rglob` / `walk`, `mkdir` / `touch` / `unlink` / `rmdir` / `rename`. `repr` and error messages match CPython |
 | `collections.deque` (v0.9.0) | Rides on `Value::List` via new `popleft` / `appendleft` / `extendleft` / `rotate` list methods. Graph / BFS / queue algorithms work end-to-end |
 | `heapq` (v0.9.0) | `heappush`, `heappop`, `heapify`, `heappushpop`, `heapreplace`, `nsmallest`, `nlargest` |
-| `contextlib` (v0.9.0) | `@contextmanager` identity decorator and `contextmanager`-decorated factories. `with` block honours the wrapped `__enter__` / `__exit__` shape. v1.0.0-beta.1: `suppress`, `nullcontext`, `closing`, `redirect_stdout`, `redirect_stderr`, `ExitStack` |
+| `contextlib` (v0.9.0) | `@contextmanager` identity decorator and `contextmanager`-decorated factories. `with` block honours the wrapped `__enter__` / `__exit__` shape. v1.0.0-beta.1: `@asynccontextmanager` really drives its generator (it was an identity decorator, so `async with` raised), plus `suppress`, `nullcontext`, `closing`, `redirect_stdout`, `redirect_stderr`, `ExitStack` |
 | `pydantic` (v0.9.0, expanded v0.10.0) | `BaseModel` is a placeholder so declaring a `model` doesn't `ImportError`. Since v0.10.0 `Model.model_validate(mapping)` constructs an instance from a dict, `inst.model_dump()` returns a dict of fields in declaration order, and `model_dump_json()` the JSON form — flat `model` classes are usable under `tyc run`. Nested-model validation is not type-directed yet; deeply-nested models still need `--compile` |
 | `io` (v1.0.0-beta.1) | `open` and the file objects behind it (`TextIOWrapper`, `BufferedReader` / `BufferedWriter`, `FileIO`), `StringIO`, `BytesIO`, `SEEK_*`, `UnsupportedOperation`. Modes, encodings, newline translation, `seek` / `tell` / `truncate` / `flush`, iteration by line, and the CPython error messages for a closed or wrong-mode file |
 | `shutil` (v1.0.0-beta.1) | `copy`, `copy2`, `copyfile`, `copytree`, `move`, `rmtree`, `which`, `disk_usage`, `SameFileError` |
@@ -197,6 +197,11 @@ package (`pydantic` has the placeholder above; `numpy`, `requests`,
   the frozen sentinel through `union` / `intersection` / `difference` /
   `symmetric_difference`; `update` is rejected on frozensets.
 - `tuple`: `count`, `index`.
+- Set comparison is subset / superset (`{1} <= {1, 2}`), `d1 | d2` merges
+  two dicts (PEP 584), a value-mixin enum member is its value under
+  arithmetic and `int()` (`-Colour.RED`, `int(Colour.RED)`), and
+  `Perm.READ in (Perm.READ | Perm.WRITE)` is a flag bit-test — all
+  v1.0.0-beta.1; a bare `1 in 3` still raises, as in CPython.
 - `bytearray` (v1.0.0-beta.1): the mutable sibling of `bytes` —
   construction from bytes / an int / an iterable of ints / `str` plus an
   encoding, `append` / `extend` / `insert` / `pop` / `remove` / `clear` /
@@ -307,8 +312,10 @@ message:
   `asyncio.run`, `asyncio.gather` (including `return_exceptions=True`),
   `TaskGroup.create_task`, and `typhon_runtime.tasks.spawn` (the `go`
   lowering) force it to completion in program order. `gather:` blocks,
-  `go f(x) -> task` + `await task`, `async for` over (eagerly
-  materialised) async generators, `async with`, `asyncio.sleep`
+  `go f(x) -> task` + `await task`, `async for` over an async generator or
+  a hand-written `__aiter__` / `__anext__` iterator, `async with` (over a
+  user `__aenter__` / `__aexit__` **or** an `@asynccontextmanager`
+  generator), `asyncio.sleep`
   (real wall-clock sleep), `asyncio.timeout` (checked at scope exit),
   and `asyncio.Queue` all work — with results identical to CPython
   whenever the program's correctness doesn't depend on task
@@ -359,14 +366,18 @@ message:
   protocol are unsupported — the generator runs to its cap before the
   first `send` could ever reach it. Bidirectional generators need
   `tyc build`. (Plain forward iteration is unaffected.)
-- **`@contextmanager` generators inside `with` blocks.** Eager collection
-  runs the generator's setup and teardown at call time, so the `with`
-  body can't run between them; the VM emits a clear "use `tyc build`"
-  message.
+- **A generator whose `yield` sits where the tree-walk cannot suspend.**
+  Most generator bodies run lazily (`@contextmanager` and
+  `@asynccontextmanager` factories included, since v1.0.0-beta.1, so the
+  `with` body runs between setup and teardown). A `yield` in a loop test,
+  a `with` item, a call argument after another call, or two yields in one
+  expression falls back to eager collection, where setup and teardown both
+  run at call time.
 - Template strings (`t"…"`).
 - IPython escape commands.
-- `with` statements other than `open()` and `contextlib.@contextmanager`-decorated
-  factories (basic context-manager protocol since v0.9.0).
+- A `with` / `async with` over anything that is neither `open()`, a
+  `@contextmanager` / `@asynccontextmanager` factory, nor an object
+  implementing `__enter__` / `__exit__` (or `__aenter__` / `__aexit__`).
 - `lazy let` inside a class body uses an identity decorator; callers must
   use the method-call form `obj.x()`.
 - **Nested-model `pydantic.model_validate`** is not type-directed — a

@@ -393,7 +393,7 @@ with every gate green at each step.
    `functools` / `sys` / `typing` gaps), and the object model gained
    `NamedTuple` / `TypedDict` semantics, `issubclass`, function
    `__dict__`, identity-hashable classes and per-module dunders. **The
-   differential baseline is down from 167 entries to 62**, and the six
+   differential baseline is down from 167 entries to 54**, and the six
    diverging curated examples are gone.
 5. **Gates.** The differential job now also byte-compiles every emitted
    `.py` with `compileall` — an *emitter* verdict that is never baselined,
@@ -414,10 +414,10 @@ with every gate green at each step.
 
 ### What is still open
 
-- **The 62 remaining differential entries.** Each is a VM bug and the file
-  names them. The clusters left are eager generator expressions, the thin
-  `re` shim, `Counter` / `deque` corners, and a handful of formatting and
-  exception-chaining differences. None of them is a *silent* wrong answer
+- **The 54 remaining differential entries.** Each is a VM bug and the file
+  names them. The clusters left are the thin `re` shim, `Counter` / `deque`
+  corners, `lazy let`, deep Unicode casing and repr escaping, and a
+  handful of exception-chaining differences. None of them is a *silent* wrong answer
   on the compiled path — they are VM-only.
 - **`tyc run --compile <file>` diagnostics name the scaffold.** The
   single-file compile path stages the source into a temp project, so a

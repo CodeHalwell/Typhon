@@ -52,8 +52,16 @@ A second VM pass added `bytearray` (mutable, CPython `repr`, unhashable,
 `!a` conversions and `{0.attr}` / `{name[key]}` accessors; CPython's
 `str.center` padding bias; `Cls.__doc__` / `Cls.__mro__` /
 `fn.__type_params__`; `asyncio.to_thread` / `Lock` / `Semaphore` /
-`Event`; and the rest of the builtin exception hierarchy. **The
-differential baseline falls from 167 entries to 62.**
+`Event`; and the rest of the builtin exception hierarchy. A third pass
+took the async protocols — `async for` over a hand-written `__aiter__` /
+`__anext__` iterator, and `@asynccontextmanager` actually driving its
+generator rather than being the identity — which also made generator
+bodies run lazily whether or not they are `async`, so a context
+manager's teardown runs *after* the `with` body instead of at the call.
+Alongside: set comparison as subset / superset, PEP 584 `d1 | d2`, and
+value-mixin enum members behaving as their value under arithmetic,
+`int()` and flag membership. **The
+differential baseline falls from 167 entries to 54.**
 
 **Checking a module is linear in its definitions again.** Every branch,
 `try` and loop clones the whole `TypeEnv`, and each clone deep-copied every
@@ -475,7 +483,7 @@ additive on correct programs except the one marked **narrowing**.
 
 Everything that review deferred is closed by the beta wave above, except
 the VM's eager generator expressions and the thin `re` shim, which remain
-in `scripts/differential-baseline.txt` — the 62 entries there are the
+in `scripts/differential-baseline.txt` — the 54 entries there are the
 honest list of what the VM still gets wrong, and each one is a bug.
 
 ## 1.0.0-alpha.9 — 2026-08-21 — maintenance: secret-name lint expansion, allocation reductions & dependency wave
