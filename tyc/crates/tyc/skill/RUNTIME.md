@@ -211,8 +211,8 @@ Built-in method dispatch on `str` / `bytes` (v0.11.0) / `list` / `dict` (incl. `
 | Module | Surface |
 |---|---|
 | `math` | `pi`, `e`, `inf`, `nan`, `sqrt`, `floor`, `ceil`, `log` (with base), `log2`, `log10`, `exp`, `sin`, `cos`, `tan`, `pow`, `fabs`. v0.10.0: `gcd`, `lcm`, `factorial`, `isqrt`, `comb`, `perm` (reject non-int args). v0.12.0: `isnan`, `isinf`, `isfinite` |
-| `os` / `os.path` | `getenv`, `environ`, `path.exists`, `path.isfile`, `path.isdir`. `import os.path` resolves to the same shim |
-| `sys` | `argv`, `platform`, `version`, `exit(code)`, `stdout`, `stderr`. No `setrecursionlimit` / `getrecursionlimit` |
+| `os` / `os.path` (rebuilt v1.0.0-beta.1) | Full process + filesystem surface over native `_fs_*` primitives: `getenv`, `environ`, `getcwd`, `chdir`, `listdir`, `scandir`, `walk`, `mkdir`, `makedirs`, `remove`, `rmdir`, `rename`, `replace`, `stat`, `access`, `getpid`, `cpu_count`, `system`, `strerror`, `urandom`, the `O_*` / `*_OK` / `SEEK_*` constants, `PathLike` / `fspath`, and a full `posixpath` (`join`, `split`, `splitext`, `basename`, `dirname`, `normpath`, `abspath`, `realpath`, `relpath`, `commonpath`, `commonprefix`, `expanduser`, `expandvars`, `isabs`, `exists`, `isfile`, `isdir`, `islink`, `getsize`, `getmtime`, `samefile`). Errors carry CPython's `errno` / `strerror` / `filename`. `import os.path` / `import posixpath` resolve to the same shim |
+| `sys` | `argv`, `platform`, `version`, `version_info`, `byteorder`, `maxsize`, `exit(code)`, `stdout`, `stderr`, `stdin`, `getrecursionlimit` / `setrecursionlimit`. v1.0.0-beta.1: `modules` (live view of the import cache) and `exc_info()` (traceback slot is always `None`). Assigning `sys.stdout` redirects `print`, so `contextlib.redirect_stdout` works |
 | `json` | `dumps`, `loads` (full JSON 7159 surface). `json.load(f)` / `json.dump(obj, f)` ride on top of `open()` since v0.9.0. v0.10.0: `dumps(indent=…)`. v0.12.0: `dumps(sort_keys=True)` |
 | `time` | `time()`, `sleep()`, `monotonic()` (fixed in v0.10.0), `perf_counter()` / `process_time()` (v0.10.0) |
 | `datetime` (v0.11.0) | `datetime(y, mo, d, …)`, `.now()`, `.fromisoformat()`, `.isoformat()`, `+ timedelta`, comparisons; `timedelta(seconds=…)` arithmetic. **Naïve / UTC only** — tz-aware arithmetic still needs `--compile` |
@@ -224,16 +224,40 @@ Built-in method dispatch on `str` / `bytes` (v0.11.0) / `list` / `dict` (incl. `
 | `abc` (v0.15.6) | `ABC`, `ABCMeta`, `abstractmethod`, `abstractclassmethod`, `abstractstaticmethod`, `abstractproperty`, `update_abstractmethods` as identity natives; a non-class base such as `ABC` is ignored at class creation, so `class H(ABC): @abstractmethod def handle(...)` runs |
 | `asyncio` | Cooperative-sequential shim: `run`, `gather` (incl. `return_exceptions=True`), `TaskGroup` (`create_task`, `__aenter__` / `__aexit__`), `sleep` (real wall-clock), `timeout` (checked at scope exit), `Queue` (fails loudly instead of deadlocking), and the exception classes (`TimeoutError`, `CancelledError`, …). Coroutines are forced to completion at their `await` — see §2.5 for the interleaving caveat |
 | `collections` (v0.8.0) | `OrderedDict`, `defaultdict`, `Counter`, `namedtuple`. **`collections.deque`** added in v0.9.0 — rides on `Value::List` via new `popleft` / `appendleft` / `extendleft` / `rotate` list methods. v0.11.0: `defaultdict(factory)` actually invokes the factory on missing-key access via subscript `__missing__` (`dd[k] += 1` works) |
-| `functools` (v0.8.0) | `lru_cache`, `cache`, `cached_property`, `reduce`, `partial` |
+| `functools` (v0.8.0) | `lru_cache`, `cache`, `cached_property`, `reduce`, `partial`, `wraps`. v1.0.0-beta.1: `partial` binds keyword arguments (`partial(pow, exp=2)`), plus `cmp_to_key`, `total_ordering`, `singledispatch` |
 | `itertools` (v0.8.0) | `chain`, `count`, `cycle`, `accumulate`, `combinations`, `permutations`, `product`, `islice`, `takewhile`, `dropwhile`, `groupby` (honours `key=` since v0.11.0) |
 | `dataclasses` (v0.8.0) | `dataclass`, `field`, `fields`, `asdict`, `astuple`. v0.9.0: `field(default_factory=list)` actually invokes the factory per instance |
-| `pathlib` (v0.8.0) | `Path` with `exists`, `read_text`, `write_text`, `parent`, `name`, `stem`, `suffix`, `with_suffix`, `joinpath` / `/`. v0.11.0: `.suffixes` / `.parts`, `/`-join via `__truediv__`, CPython-matching `str()` / `repr()` |
+| `pathlib` (v0.8.0, rebuilt v1.0.0-beta.1) | `PurePath` / `Path` over the `os` shim: normalisation, `parts`, `parent(s)`, `name`, `stem`, `suffix(es)`, `with_name` / `with_stem` / `with_suffix`, `joinpath` / `/`, `relative_to`, `is_absolute`, `match`, `as_posix`, `as_uri`, comparison + hashing, `home` / `cwd` / `absolute` / `resolve` / `expanduser`, `exists` / `is_file` / `is_dir` / `stat`, `read_text` / `write_text` / `read_bytes` / `write_bytes` / `open`, `iterdir` / `glob` / `rglob` / `walk`, `mkdir` / `touch` / `unlink` / `rmdir` / `rename`. `repr` and error messages match CPython |
 | `heapq` (v0.9.0) | `heappush`, `heappop`, `heapify`, `heappushpop`, `heapreplace`, `nsmallest`, `nlargest` |
-| `contextlib` (v0.9.0) | `@contextmanager` identity decorator; `with` block honours the wrapped `__enter__` / `__exit__` shape |
+| `contextlib` (v0.9.0) | `@contextmanager` identity decorator; `with` block honours the wrapped `__enter__` / `__exit__` shape. v1.0.0-beta.1: `suppress`, `nullcontext`, `closing`, `redirect_stdout`, `redirect_stderr`, `ExitStack` |
 | `pydantic` (v0.9.0) | `BaseModel` placeholder so declaring a `model` doesn't `ImportError` (full validation still requires `--compile`) |
+| `io` (v1.0.0-beta.1) | `open` and its file objects (`TextIOWrapper`, `BufferedReader` / `BufferedWriter`, `FileIO`), `StringIO`, `BytesIO`, `SEEK_*`, `UnsupportedOperation`. Modes, encodings, newline translation, `seek` / `tell` / `truncate` / `flush`, line iteration, CPython error messages |
+| `shutil` (v1.0.0-beta.1) | `copy`, `copy2`, `copyfile`, `copytree`, `move`, `rmtree`, `which`, `disk_usage`, `SameFileError` |
+| `tempfile` (v1.0.0-beta.1) | `mkdtemp`, `mkstemp`, `gettempdir`, `NamedTemporaryFile`, `TemporaryDirectory`, `TemporaryFile` |
+| `glob` (v1.0.0-beta.1) | `glob`, `iglob`, `escape`, `has_magic` (incl. `**`) |
+| `hashlib` (v1.0.0-beta.1) | `md5`, `sha1`, `sha224`, `sha256`, `sha384`, `sha512`, `blake2b`, `blake2s`, `new` + `update` / `digest` / `hexdigest` / `copy` |
+| `base64` (v1.0.0-beta.1) | `b64encode` / `b64decode` (incl. `altchars`), `urlsafe_*`, `standard_*`, `b32*`, `b16*`, `encodebytes` / `decodebytes` |
+| `csv` (v1.0.0-beta.1) | `reader`, `writer`, `DictReader`, `DictWriter`, `QUOTE_*`, `excel` / `excel-tab` / `unix` dialects, `register_dialect`. No `Sniffer`, no `escapechar` |
+| `string` (v1.0.0-beta.1) | Constant tables, `capwords`, `Template` (`substitute` / `safe_substitute`) |
+| `operator` (v1.0.0-beta.1) | Operator function forms plus `itemgetter`, `attrgetter`, `methodcaller`, `countOf`, `indexOf`, `length_hint` |
+| `bisect` (v1.0.0-beta.1) | `bisect_left` / `bisect_right` / `insort_left` / `insort_right` (+ aliases), with `lo` / `hi` / `key` |
+| `__future__` (v1.0.0-beta.1) | The feature flags, so `from __future__ import annotations` imports rather than raising |
 | `typhon_runtime` (and `typhon_runtime.*`) | `Ok`, `Err`, `tasks.spawn` (synchronous shim), `lazy.lazy_let`, `lazy.lazy_import`. `Ok` / `Err` carry bound `.map` / `.map_err` / `.and_then` / `.or_else` combinators since v0.9.0. Submodule imports (`from typhon_runtime.freeze import deep_freeze`) resolve to the matching submodule |
 
-`enum` is resolved separately by the interpreter (it backs the `enum` keyword), not through this table. Any other module raises `ImportError` with a pointer to `--compile`.
+`enum` is resolved separately by the interpreter (it backs the `enum` keyword), not through this table. Any other module raises `ModuleNotFoundError`; reach for `tyc run --compile`.
+
+Deliberately **not** modelled (they need a real CPython runtime, not a
+shim): `sqlite3`, `subprocess`, `threading` / `multiprocessing`, `socket`
+/ `urllib` / `http`, `ctypes`, `decimal`, `fractions`, `logging`,
+`configparser`, `struct`, and every third-party package.
+
+Also new in v1.0.0-beta.1: `issubclass`; `str.isascii` / `isidentifier` /
+`isprintable`; the `numbers` tower on `int` / `float` (`real`, `imag`,
+`conjugate()`, `numerator`, `denominator`) and `int.from_bytes`; the
+unbound method form of every builtin type (`str.upper(s)`,
+`dict.get(d, k)`); function objects carrying their own `__dict__`; class
+objects hashable by identity (type-keyed registries); `class X(NamedTuple)`
+being a real tuple and `class X(TypedDict)` constructing a plain `dict`.
 
 ### 2.4a Built-in builtins surface (v0.9.0 → v0.12.0 additions)
 

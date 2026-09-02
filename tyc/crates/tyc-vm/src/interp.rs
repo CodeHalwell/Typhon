@@ -1321,6 +1321,7 @@ impl Interpreter {
             source: self.current_source.clone(),
             slot_info,
             generator,
+            attrs: RefCell::new(HashMap::new()),
         })
     }
 
@@ -1413,18 +1414,19 @@ impl Interpreter {
         // `class X(NamedTuple)` / `class X(TypedDict)`: CPython's metaclass
         // synthesises the constructor from the annotations, like a
         // dataclass does. (Both bases are identity natives in the VM.)
-        let is_typing_record = c
-            .arguments
-            .as_ref()
-            .map(|args| {
-                args.args.iter().any(|b| {
-                    matches!(
-                        rightmost_name(b).as_deref(),
-                        Some("NamedTuple") | Some("TypedDict")
-                    )
+        let base_named = |want: &str| -> bool {
+            c.arguments
+                .as_ref()
+                .map(|args| {
+                    args.args
+                        .iter()
+                        .any(|b| rightmost_name(b).as_deref() == Some(want))
                 })
-            })
-            .unwrap_or(false);
+                .unwrap_or(false)
+        };
+        let is_named_tuple = base_named("NamedTuple");
+        let is_typed_dict = base_named("TypedDict");
+        let is_typing_record = is_named_tuple || is_typed_dict;
         let has_generated_fields = is_dataclass || is_pydantic_model || is_typing_record;
         // PEP 695 `class X[T](object):` — the type-parameter syntax appends
         // `Generic` after the explicit bases, and `object` before `Generic`
@@ -1715,6 +1717,46 @@ impl Interpreter {
         }
         if is_typing_record {
             class_attrs.insert("__typhon_generated_init__".to_owned(), Value::Bool(true));
+        }
+        // `class Point(NamedTuple)` is a tuple in CPython: `p[0]`, `len(p)`,
+        // `p == (1, 2)`, `Point(x=1, y=2)` repr, `_replace` / `_asdict`.
+        // Give it the same `_NamedTupleBase` template `collections.namedtuple`
+        // uses, keyed by the annotated fields, and let the template's
+        // `__init__` run instead of the generated-field one.
+        if is_named_tuple {
+            let template = crate::builtins::namedtuple_base_class(self)?;
+            if let Value::Class(template) = template {
+                class_attrs.remove("__typhon_generated_init__");
+                class_attrs.insert(
+                    "_fields".to_owned(),
+                    Value::Tuple(Rc::new(
+                        fields
+                            .iter()
+                            .map(|f| Value::Str(Rc::new(f.name.clone())))
+                            .collect(),
+                    )),
+                );
+                let defaults: crate::value::DictMap = fields
+                    .iter()
+                    .filter_map(|f| {
+                        f.default
+                            .clone()
+                            .map(|d| (crate::value::HashKey::Str(Rc::new(f.name.clone())), d))
+                    })
+                    .collect();
+                class_attrs.insert(
+                    "_field_defaults".to_owned(),
+                    Value::Dict(Rc::new(RefCell::new(defaults))),
+                );
+                bases.push(template);
+            }
+        }
+        // `class User(TypedDict)` is *not* a class at runtime: CPython's
+        // metaclass makes `User(id=1, name="a")` return a plain `dict`, so
+        // `u["name"]` works and `u.name` does not. Mark the class so the
+        // call path builds the mapping instead of an instance.
+        if is_typed_dict {
+            class_attrs.insert("__typhon_typed_dict__".to_owned(), Value::Bool(true));
         }
         if !builtin_bases.is_empty() {
             class_attrs.insert(
@@ -2546,6 +2588,7 @@ impl Interpreter {
                     source: self.current_source.clone(),
                     slot_info,
                     generator,
+                    attrs: RefCell::new(HashMap::new()),
                 };
                 Ok(Value::Function(Rc::new(func)))
             }
@@ -4180,6 +4223,42 @@ impl Interpreter {
         if Self::is_enum_class(class) {
             return self.enum_lookup_by_value(class, args, kwargs);
         }
+        // `class User(TypedDict)` is a dict factory, not a class: CPython's
+        // metaclass returns a plain `dict` from the call, so `u["name"]`
+        // works and `u.name` raises. Positional args follow `dict(...)`:
+        // at most one mapping to seed from.
+        if class
+            .class_attrs
+            .borrow()
+            .contains_key("__typhon_typed_dict__")
+        {
+            if args.len() > 1 {
+                return Err(type_error(format!(
+                    "{}() takes at most 1 positional argument ({} given)",
+                    class.name,
+                    args.len()
+                )));
+            }
+            let mut map: crate::value::DictMap = crate::value::DictMap::new();
+            match args.into_iter().next() {
+                None => {}
+                Some(Value::Dict(seed)) => {
+                    for (k, v) in seed.borrow().iter() {
+                        map.insert(k.clone(), v.clone());
+                    }
+                }
+                Some(other) => {
+                    return Err(type_error(format!(
+                        "'{}' object is not a mapping",
+                        other.type_name()
+                    )));
+                }
+            }
+            for (k, v) in kwargs {
+                map.insert(crate::value::HashKey::Str(Rc::new(k.clone())), v.clone());
+            }
+            return Ok(Value::Dict(Rc::new(RefCell::new(map))));
+        }
         // Field-less exception subclass with no user/synthesised `__init__`:
         // behave like `BaseException`. Accept the positional args, stash them
         // as `.args`, and render via `str()`/`repr()` from those args, so
@@ -5533,6 +5612,23 @@ impl Interpreter {
                 _ => {}
             }
         }
+        // `int` / `float` carry the `numbers` tower's read-only components.
+        // `int` is exactly its own numerator over 1; `float` has no
+        // numerator/denominator, matching CPython.
+        match (value, attr) {
+            (Value::Int(i), "real") => return Ok(Value::Int(i.clone())),
+            (Value::Int(i), "numerator") => return Ok(Value::Int(i.clone())),
+            (Value::Int(_), "imag") => return Ok(Value::Int(crate::value::VmInt::from(0))),
+            (Value::Int(_), "denominator") => return Ok(Value::Int(crate::value::VmInt::from(1))),
+            (Value::Bool(b), "real") | (Value::Bool(b), "numerator") => {
+                return Ok(Value::Int(crate::value::VmInt::from(i64::from(*b))))
+            }
+            (Value::Bool(_), "imag") => return Ok(Value::Int(crate::value::VmInt::from(0))),
+            (Value::Bool(_), "denominator") => return Ok(Value::Int(crate::value::VmInt::from(1))),
+            (Value::Float(x), "real") => return Ok(Value::Float(*x)),
+            (Value::Float(_), "imag") => return Ok(Value::Float(0.0)),
+            _ => {}
+        }
         // Try instance fields first, then class methods.
         match value {
             Value::Instance(inst) => {
@@ -5722,12 +5818,40 @@ impl Interpreter {
                     });
                     return Ok(Value::Native(Rc::new(nf)));
                 }
+                // A declared field read off the *class*. For a plain
+                // `@dataclass` CPython leaves the default on the class, so
+                // `Cls.field` is that default; with `slots=True` it is the
+                // slot's member descriptor instead (which is what the
+                // `tyc::class_attr_shadows_slot` warning is about) — either
+                // way `tyc run` must agree with `tyc build`.
+                if let Some(field) = class.fields.iter().find(|f| f.name == attr) {
+                    if crate::value::class_flag(class, "__typhon_dc_slots__", true) {
+                        return Ok(crate::builtins::native_object(
+                            "member_descriptor",
+                            vec![
+                                ("__name__", Value::Str(Rc::new(attr.to_owned()))),
+                                ("__objclass__", Value::Str(Rc::new(class.name.clone()))),
+                            ],
+                        ));
+                    }
+                    if let Some(default) = &field.default {
+                        return Ok(default.clone());
+                    }
+                }
                 Err(attribute_error(format!(
                     "type object '{}' has no attribute '{}'",
                     class.name, attr
                 )))
             }
             Value::Module(m) => {
+                // `sys.modules` is a live view of the import cache, so it is
+                // built on read rather than snapshotted when `sys` was made.
+                if m.name == "sys"
+                    && attr == "modules"
+                    && !m.members.borrow().contains_key("modules")
+                {
+                    return Ok(crate::builtins::sys_modules_dict(self));
+                }
                 // The live namespace first: a global the module rebound
                 // after import (`global counter`) must be visible here.
                 if let Some(env) = &m.env {
@@ -5767,8 +5891,29 @@ impl Interpreter {
             Value::Function(f) if attr == "__name__" || attr == "__qualname__" => {
                 Ok(Value::Str(Rc::new(f.name.clone())))
             }
+            // …then whatever was attached to the function's own `__dict__`.
+            Value::Function(f) if f.attrs.borrow().contains_key(attr) => Ok(f
+                .attrs
+                .borrow()
+                .get(attr)
+                .cloned()
+                .expect("checked by the guard")),
+            Value::Function(f) if attr == "__dict__" => {
+                let mut map = crate::value::DictMap::new();
+                for (k, v) in f.attrs.borrow().iter() {
+                    map.insert(HashKey::Str(Rc::new(k.clone())), v.clone());
+                }
+                Ok(Value::Dict(Rc::new(RefCell::new(map))))
+            }
             Value::Native(n) if attr == "__name__" || attr == "__qualname__" => {
                 Ok(Value::Str(Rc::new(n.name.to_string())))
+            }
+            // A builtin *type* — the VM models `int` / `str` / `list` / … as
+            // native constructors, so `int.from_bytes(b, "big")` and the
+            // unbound-method form CPython also exposes (`str.upper(s)`,
+            // `dict.get(d, k)`) have to be read off the constructor.
+            Value::Native(n) if builtin_type_method(n.name, attr).is_some() => {
+                Ok(builtin_type_method(n.name, attr).expect("checked by the guard"))
             }
             Value::BoundMethod { function, .. } if attr == "__name__" || attr == "__qualname__" => {
                 Ok(Value::Str(Rc::new(function.name.clone())))
@@ -6142,6 +6287,13 @@ impl Interpreter {
                     env.set(attr, value.clone());
                 }
                 m.members.borrow_mut().insert(attr.to_owned(), value);
+                Ok(())
+            }
+            // A function object has a `__dict__` in CPython, which is how a
+            // decorator publishes extra API on its wrapper
+            // (`wrapper.register = …`, `fn.cache_clear`, test markers).
+            Value::Function(f) => {
+                f.attrs.borrow_mut().insert(attr.to_owned(), value);
                 Ok(())
             }
             other => Err(type_error(format!(
@@ -8051,6 +8203,86 @@ fn is_enum_sentinel(name: &str) -> bool {
 /// dunder name passes through so internal probing paths keep working; only
 /// plain unknown names are rejected, which is what makes `(5).foo` raise
 /// `AttributeError` (H5b) instead of returning a bogus bound method.
+/// Intern a builtin method name so it can be a `NativeFn`'s `&'static str`.
+///
+/// The set is bounded by the builtin method tables (a few hundred names at
+/// most) and each name is allocated once, so repeated `str.upper` lookups
+/// reuse the same string rather than leaking one per access.
+fn intern_method_name(name: &str) -> &'static str {
+    thread_local! {
+        static INTERNED: RefCell<std::collections::HashSet<&'static str>> =
+            RefCell::new(std::collections::HashSet::new());
+    }
+    INTERNED.with(|set| {
+        let mut set = set.borrow_mut();
+        if let Some(existing) = set.get(name) {
+            return *existing;
+        }
+        let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
+        set.insert(leaked);
+        leaked
+    })
+}
+
+/// `int.from_bytes` / `str.upper` / `dict.get` — the unbound form of a
+/// builtin method, plus the handful of builtin classmethods. `None` when
+/// `ty` is not a builtin type name or `attr` is not one of its methods, so
+/// the caller falls through to the normal attribute error.
+fn builtin_type_method(ty: &'static str, attr: &str) -> Option<Value> {
+    let probe = match ty {
+        "str" => Value::Str(Rc::new(String::new())),
+        "bytes" => Value::Bytes(Rc::new(Vec::new())),
+        "list" => Value::List(Rc::new(RefCell::new(Vec::new()))),
+        "dict" => Value::Dict(Rc::new(RefCell::new(crate::value::DictMap::new()))),
+        "set" | "frozenset" => Value::Set(Rc::new(RefCell::new(Default::default()))),
+        "tuple" => Value::Tuple(Rc::new(Vec::new())),
+        "int" | "bool" => Value::Int(crate::value::VmInt::from(0)),
+        "float" => Value::Float(0.0),
+        _ => return None,
+    };
+    // `int.from_bytes(bytes, byteorder="big", *, signed=False)` is a
+    // classmethod, so it has no receiver to probe for.
+    if ty == "int" && attr == "from_bytes" {
+        return Some(Value::Native(Rc::new(NativeFn::new(
+            "from_bytes",
+            |_i, args| {
+                let raw = match args.first() {
+                    Some(Value::Bytes(b)) => (**b).clone(),
+                    Some(Value::List(l)) => l
+                        .borrow()
+                        .iter()
+                        .map(|v| v.to_int().map(|n| n as u8))
+                        .collect::<Result<Vec<u8>, _>>()?,
+                    _ => {
+                        return Err(type_error(
+                            "cannot convert the argument to bytes for int.from_bytes()",
+                        ))
+                    }
+                };
+                let big_endian =
+                    !matches!(args.get(1), Some(Value::Str(s)) if s.as_str() == "little");
+                let mut raw = raw;
+                if !big_endian {
+                    raw.reverse();
+                }
+                let mut acc = num_bigint::BigInt::from(0);
+                for byte in raw {
+                    acc = (acc << 8) + num_bigint::BigInt::from(byte);
+                }
+                Ok(Value::Int(crate::value::VmInt::from_bigint(acc)))
+            },
+        ))));
+    }
+    if !builtin_has_attr(&probe, attr) || (attr.starts_with("__") && attr.ends_with("__")) {
+        return None;
+    }
+    let method = intern_method_name(attr);
+    Some(Value::Native(Rc::new(NativeFn::new(
+        method,
+        move |i, args| crate::builtins::dispatch_method(i, method, args),
+    ))))
+}
+
 fn builtin_has_attr(value: &Value, attr: &str) -> bool {
     if attr.starts_with("__") && attr.ends_with("__") {
         // Only the dunders every builtin value actually implements — so
@@ -8139,10 +8371,13 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                 | "index"
                 | "isalnum"
                 | "isalpha"
+                | "isascii"
                 | "isdecimal"
                 | "isdigit"
+                | "isidentifier"
                 | "islower"
                 | "isnumeric"
+                | "isprintable"
                 | "isspace"
                 | "istitle"
                 | "isupper"
@@ -8242,10 +8477,19 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                 | "update"
         ),
         Value::Tuple(_) => matches!(attr, "count" | "index"),
-        Value::Float(_) => matches!(attr, "is_integer"),
-        Value::Int(_) | Value::Bool(_) => {
-            matches!(attr, "bit_length" | "bit_count" | "to_bytes" | "is_integer")
-        }
+        Value::Float(_) => matches!(attr, "is_integer" | "conjugate" | "real" | "imag"),
+        Value::Int(_) | Value::Bool(_) => matches!(
+            attr,
+            "bit_length"
+                | "bit_count"
+                | "to_bytes"
+                | "is_integer"
+                | "conjugate"
+                | "real"
+                | "imag"
+                | "numerator"
+                | "denominator"
+        ),
         _ => false,
     }
 }

@@ -553,6 +553,12 @@ pub enum HashKey {
     /// An instance whose class inherits `object.__hash__` (a plain class, an
     /// enum member, an exception): CPython keys it by identity.
     Identity(Rc<Instance>),
+    /// A *class object* used as a key (`registry[SomeClass]`). CPython hashes
+    /// a type by identity, so two distinct classes with the same name are
+    /// different keys. Builtin types reach the VM as native constructors
+    /// rather than `Class` values, so they key on their name instead.
+    Class(Rc<Class>),
+    BuiltinType(&'static str),
     /// An instance whose class defines `__hash__`. `hash` is what the user
     /// method returned; `__eq__` is consulted by `Interpreter::settle_key`
     /// *before* the key reaches a container, so inside the container two
@@ -898,6 +904,15 @@ impl HashKey {
                 out.extend_from_slice(&hash.to_be_bytes());
                 out.extend_from_slice(&(Rc::as_ptr(instance) as usize as u64).to_be_bytes());
             }
+            HashKey::Class(c) => {
+                out.push(9);
+                out.extend_from_slice(&(Rc::as_ptr(c) as usize as u64).to_be_bytes());
+            }
+            HashKey::BuiltinType(name) => {
+                out.push(10);
+                out.extend_from_slice(&(name.len() as u32).to_be_bytes());
+                out.extend_from_slice(name.as_bytes());
+            }
         }
         out
     }
@@ -924,6 +939,8 @@ impl HashKey {
             }
             HashKey::Instance { instance, .. } => Value::Instance(instance),
             HashKey::Identity(instance) => Value::Instance(instance),
+            HashKey::Class(c) => Value::Class(c),
+            HashKey::BuiltinType(name) => Value::Str(Rc::new(name.to_owned())),
             HashKey::UserHashed { instance, .. } => Value::Instance(instance),
         }
     }
@@ -978,6 +995,8 @@ impl PartialEq for HashKey {
             // Rc is ignored so two distinct-but-equal instances match.
             (HashKey::Instance { key: a, .. }, HashKey::Instance { key: b, .. }) => a == b,
             (HashKey::Identity(a), HashKey::Identity(b)) => Rc::ptr_eq(a, b),
+            (HashKey::Class(a), HashKey::Class(b)) => Rc::ptr_eq(a, b),
+            (HashKey::BuiltinType(a), HashKey::BuiltinType(b)) => a == b,
             // Equal-by-`__eq__` probes are settled onto the stored key's
             // instance before they get here (`Interpreter::settle_key`).
             (
@@ -1024,6 +1043,8 @@ impl std::hash::Hash for HashKey {
             // with `Eq` (which ignores the retained `instance` Rc).
             HashKey::Instance { key, .. } => key.hash(state),
             HashKey::Identity(inst) => (Rc::as_ptr(inst) as usize).hash(state),
+            HashKey::Class(c) => (Rc::as_ptr(c) as usize).hash(state),
+            HashKey::BuiltinType(name) => name.hash(state),
             // Only the user hash feeds the hasher, so every probe with the
             // same `__hash__` lands in the same bucket chain and
             // `Interpreter::settle_key` can find its `__eq__` candidates.
@@ -1311,6 +1332,11 @@ pub struct Function {
     /// Whether the body contains a `yield`, and if so which execution
     /// strategy the VM uses for it — computed once at def time.
     pub generator: GeneratorKind,
+    /// A function's own `__dict__`. CPython lets any attribute be attached
+    /// to a function object, which is how decorators publish extra API on
+    /// the wrapper they return (`wrapper.register = …` in `singledispatch`,
+    /// `fn.cache_clear`, a test framework's markers).
+    pub attrs: RefCell<HashMap<String, Value>>,
 }
 
 /// How a `yield`-bearing function body is executed.
@@ -1468,6 +1494,15 @@ pub type FieldMap = IndexMap<String, Value>;
 pub struct Instance {
     pub class: Rc<Class>,
     pub fields: RefCell<FieldMap>,
+}
+
+// Hand-written so `HashKey::Class` can `#[derive(Debug)]` without pulling
+// the whole class graph into a `Debug` bound: the name is what a key dump
+// needs to be readable.
+impl fmt::Debug for Class {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<class '{}'>", self.name)
+    }
 }
 
 // Hand-written so `HashKey::Instance` (which retains an `Rc<Instance>`)
@@ -1860,6 +1895,11 @@ impl Value {
                     key: Rc::new(key),
                 })
             }
+            // A class object is hashable by identity in CPython — this is
+            // what makes a type-keyed registry (`functools.singledispatch`,
+            // a visitor table) work.
+            Value::Class(c) => Ok(HashKey::Class(c.clone())),
+            Value::Native(n) => Ok(HashKey::BuiltinType(n.name)),
             other => Err(type_error(format!(
                 "unhashable type: '{}'",
                 other.type_name()
@@ -2579,6 +2619,15 @@ fn instance_repr(inst: &Instance) -> String {
 
 fn instance_repr_inner(inst: &Instance) -> String {
     let fields = inst.fields.borrow();
+    // A `__slots__` member descriptor (`Cls.field` on a slots dataclass)
+    // reprs as CPython's `<member 'name' of 'Cls' objects>`.
+    if inst.class.name == "member_descriptor" {
+        if let (Some(Value::Str(name)), Some(Value::Str(owner))) =
+            (fields.get("__name__"), fields.get("__objclass__"))
+        {
+            return format!("<member '{name}' of '{owner}' objects>");
+        }
+    }
     // Enum members repr as `<Class.NAME: value>` (CPython default), not as
     // their backing dataclass fields.
     if class_is_enum(&inst.class) {

@@ -213,6 +213,11 @@ pub fn install(interp: &mut Interpreter) {
             out.push_str(&interp.str_of(a)?);
         }
         out.push('\n');
+        if let Some(sink) = redirected_std_stream(interp, false) {
+            let write = interp.get_attr(&sink, "write")?;
+            interp.call_value(write, vec![Value::Str(Rc::new(out))], &[])?;
+            return Ok(Value::None);
+        }
         vm_write_stdout(&out);
         Ok(Value::None)
     });
@@ -872,6 +877,20 @@ pub fn install(interp: &mut Interpreter) {
         })
     });
 
+    native!("issubclass", |i, args| {
+        if args.len() != 2 {
+            return Err(type_error("issubclass() expected 2 arguments"));
+        }
+        let sub = i.force_alias(&args[0]);
+        if !matches!(
+            sub,
+            Value::Class(_) | Value::Native(_) | Value::Str(_) | Value::Tuple(_)
+        ) {
+            return Err(type_error("issubclass() arg 1 must be a class"));
+        }
+        let cls = i.force_alias(&args[1]);
+        Ok(Value::Bool(is_subclass_of(&sub, &cls)))
+    });
     native!("isinstance", |i, args| {
         if args.len() != 2 {
             return Err(type_error("isinstance() expected 2 arguments"));
@@ -1932,6 +1951,45 @@ fn char_range_bytes(s: &str, start: usize, end: usize) -> (usize, usize) {
     (bs, be)
 }
 
+/// `issubclass(cls, classinfo)` — the class-level counterpart of
+/// [`is_instance_of`]. `classinfo` may be a tuple, as in CPython.
+pub(crate) fn is_subclass_of(sub: &Value, cls: &Value) -> bool {
+    if let Value::Tuple(t) = cls {
+        return t.iter().any(|c| is_subclass_of(sub, c));
+    }
+    let want = match cls {
+        Value::Native(n) => n.name.to_owned(),
+        Value::Class(c) => c.name.clone(),
+        Value::Str(s) => (**s).clone(),
+        _ => return false,
+    };
+    match sub {
+        Value::Class(c) => {
+            if want == "object" {
+                return true;
+            }
+            if let Value::Class(target) = cls {
+                if class_in_chain_rc(c, target) {
+                    return true;
+                }
+            }
+            class_in_chain(c, &want)
+        }
+        // An exception *kind* reaches here as a bare native / string (the VM
+        // models builtin exception types by name), so relate them through
+        // the same hierarchy `except` uses.
+        Value::Native(n) => {
+            n.name == want || want == "object" || crate::interp::builtin_exc_is_a(n.name, &want)
+        }
+        Value::Str(s) => {
+            s.as_str() == want
+                || want == "object"
+                || crate::interp::builtin_exc_is_a(s.as_str(), &want)
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
     let want_name = match cls {
         Value::Native(n) => Some(n.name.to_owned()),
@@ -2080,6 +2138,13 @@ mod shims {
     pub const SHUTIL: &str = include_str!("shims/shutil.py");
     pub const TEMPFILE: &str = include_str!("shims/tempfile.py");
     pub const GLOB: &str = include_str!("shims/glob.py");
+    pub const CONTEXTLIB_EXTRA: &str = include_str!("shims/contextlib_extra.py");
+    pub const STRING: &str = include_str!("shims/string.py");
+    pub const OPERATOR: &str = include_str!("shims/operator.py");
+    pub const BISECT: &str = include_str!("shims/bisect.py");
+    pub const BASE64: &str = include_str!("shims/base64.py");
+    pub const CSV: &str = include_str!("shims/csv.py");
+    pub const FUNCTOOLS_EXTRA: &str = include_str!("shims/functools_extra.py");
 }
 
 fn compile_helpers(interp: &mut Interpreter, source: &str) -> Result<Vec<(String, Value)>, Unwind> {
@@ -2358,6 +2423,21 @@ class _DefaultDict:
         return default
 "#;
 
+/// The `_NamedTupleBase` template from the `collections` shim, cached.
+///
+/// `class Point(NamedTuple):` gets it as a base so the instance behaves like
+/// the tuple CPython actually returns — indexable, iterable, comparable with
+/// a plain tuple, and rendered `Point(x=1, y=2)` — rather than a bare object
+/// whose fields happen to be set.
+pub(crate) fn namedtuple_base_class(interp: &mut Interpreter) -> Result<Value, Unwind> {
+    cached_helper_class(
+        interp,
+        "__shim_namedtuple_base__",
+        shims::COLLECTIONS,
+        "_NamedTupleBase",
+    )
+}
+
 fn defaultdict_class(interp: &mut Interpreter) -> Result<Value, Unwind> {
     cached_helper_class(
         interp,
@@ -2403,13 +2483,22 @@ pub fn resolve_module(interp: &mut Interpreter, name: &str) -> Result<Value, Unw
         // empty queue fails loudly instead of deadlocking. Programs whose
         // CORRECTNESS depends on interleaving need `tyc run --compile`.
         "asyncio" => Ok(make_asyncio_module()),
-        "functools" => Ok(make_functools_module()),
+        "functools" => Ok(make_functools_module(interp)),
         "itertools" => make_itertools_module(interp),
         "dataclasses" => Ok(make_dataclasses_module()),
         "pathlib" => make_pathlib_module(interp),
         "datetime" => make_datetime_module(interp),
         "heapq" => Ok(make_heapq_module()),
-        "contextlib" => Ok(make_contextlib_module()),
+        "contextlib" => Ok(make_contextlib_module(interp)),
+        // `from __future__ import annotations` (and friends): CPython's
+        // compiler consumes the statement, and the module only has to carry
+        // a truthy feature object per name.
+        "__future__" => Ok(make_future_module()),
+        "string" => module_from_shim(interp, "string", shims::STRING),
+        "operator" => module_from_shim(interp, "operator", shims::OPERATOR),
+        "bisect" => module_from_shim(interp, "bisect", shims::BISECT),
+        "base64" => module_from_shim(interp, "base64", shims::BASE64),
+        "csv" => module_from_shim(interp, "csv", shims::CSV),
         "pydantic" => Ok(make_pydantic_module()),
         // Typhon-runtime submodules — return the matching submodule so
         // `from typhon_runtime.freeze import deep_freeze` and friends
@@ -4126,6 +4215,50 @@ fn make_glob_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
     })
 }
 
+/// `sys.modules` — a dict view over the VM's import cache, built fresh on
+/// each read so it stays live as CPython's is. Internal cache keys (the
+/// `__builtin__:` / `__shim_` entries the shim machinery memoises under) are
+/// not modules and are filtered out.
+pub(crate) fn sys_modules_dict(interp: &Interpreter) -> Value {
+    let mut map = crate::value::DictMap::new();
+    let mut names: Vec<&String> = interp
+        .module_cache
+        .keys()
+        .filter(|k| !k.starts_with("__builtin__:") && !k.starts_with("__shim_"))
+        .collect();
+    names.sort();
+    for name in names {
+        if let Some(v) = interp.module_cache.get(name) {
+            map.insert(HashKey::Str(Rc::new(name.clone())), v.clone());
+        }
+    }
+    Value::Dict(Rc::new(RefCell::new(map)))
+}
+
+/// The current `sys.stdout` / `sys.stderr` when user code has replaced it
+/// (`sys.stdout = buf`, `contextlib.redirect_stdout(buf)`). `None` means the
+/// stream is still the VM's own, which is written directly.
+///
+/// CPython's `print` resolves `sys.stdout` on every call, so a redirect that
+/// happens after the first `print` still takes effect; matching that is what
+/// makes `redirect_stdout` work under `tyc run` as it does after `tyc build`.
+fn redirected_std_stream(interp: &Interpreter, stderr: bool) -> Option<Value> {
+    let (member, default_name) = if stderr {
+        ("stderr", "sys.stderr")
+    } else {
+        ("stdout", "sys.stdout")
+    };
+    let Some(Value::Module(sys)) = interp.module_cache.get("sys") else {
+        return None;
+    };
+    let current = sys.members.borrow().get(member).cloned()?;
+    match &current {
+        Value::Module(m) if m.name == default_name => None,
+        Value::None => None,
+        _ => Some(current),
+    }
+}
+
 fn make_sys_module(interp: &Interpreter) -> Value {
     // sys.argv reflects the user's script + its arguments, not the host
     // `tyc` process's own argv. Populated via `Interpreter.script_argv`.
@@ -4168,6 +4301,35 @@ fn make_sys_module(interp: &Interpreter) -> Value {
                 ])),
             ),
             ("byteorder", Value::Str(Rc::new("little".to_owned()))),
+            (
+                "exc_info",
+                nf("exc_info", |i, _args| {
+                    // `(type, value, traceback)` for the exception currently
+                    // being handled, `(None, None, None)` outside a handler.
+                    // The VM has no traceback object, so the third slot is
+                    // always None.
+                    let Some(exc) = i.active_exceptions.last().cloned() else {
+                        return Ok(Value::Tuple(Rc::new(vec![
+                            Value::None,
+                            Value::None,
+                            Value::None,
+                        ])));
+                    };
+                    let value = exc.value.clone().unwrap_or_else(|| Value::Exception {
+                        kind: Rc::new(exc.kind.clone()),
+                        message: Rc::new(exc.message.clone()),
+                        args: Rc::new(vec![Value::Str(Rc::new(exc.message.clone()))]),
+                    });
+                    // Slot 0 is the exception *type*: the raised instance's
+                    // own class when there is one, else the builtin type
+                    // object for its kind — either way `.__name__` reads.
+                    let kind = match &value {
+                        Value::Instance(inst) => Value::Class(inst.class.clone()),
+                        _ => make_builtin_type(&exc.kind),
+                    };
+                    Ok(Value::Tuple(Rc::new(vec![kind, value, Value::None])))
+                }),
+            ),
             (
                 "getrecursionlimit",
                 nf("getrecursionlimit", |i, _args| {
@@ -5025,6 +5187,39 @@ fn make_typing_module() -> Value {
         "Self",
         "Never",
         "NoReturn",
+        // Type-narrowing and variadic forms. All are erased at runtime —
+        // `typing` only has to expose the name so the import resolves.
+        "TypeGuard",
+        "TypeIs",
+        "TypeAlias",
+        "Required",
+        "NotRequired",
+        "Unpack",
+        "Concatenate",
+        "LiteralString",
+        "ParamSpec",
+        "TypeVarTuple",
+        "SupportsIndex",
+        "SupportsInt",
+        "SupportsFloat",
+        "SupportsBytes",
+        "SupportsAbs",
+        "SupportsRound",
+        "OrderedDict",
+        "DefaultDict",
+        "Counter",
+        "Deque",
+        "ChainMap",
+        "AbstractSet",
+        "Collection",
+        "Reversible",
+        "ItemsView",
+        "KeysView",
+        "ValuesView",
+        "IO",
+        "TextIO",
+        "BinaryIO",
+        "AnyStr",
     ] {
         entries.push((name, identity_native(name)));
     }
@@ -5068,6 +5263,30 @@ fn make_typing_module() -> Value {
         "runtime_checkable",
         Value::Native(Rc::new(NativeFn::new("runtime_checkable", |_i, args| {
             Ok(args.into_iter().next().unwrap_or(Value::None))
+        }))),
+    ));
+    // `@override` / `@final` / `@no_type_check` — checker-only decorators
+    // CPython also implements as the identity.
+    for name in ["override", "final", "no_type_check", "dataclass_transform"] {
+        entries.push((
+            name,
+            Value::Native(Rc::new(NativeFn::new(name, |_i, args| {
+                Ok(args.into_iter().next().unwrap_or(Value::None))
+            }))),
+        ));
+    }
+    // `get_args` / `get_origin` on an erased annotation have nothing to
+    // report, and `NoDefault` is a sentinel.
+    entries.push((
+        "get_args",
+        Value::Native(Rc::new(NativeFn::new("get_args", |_i, _args| {
+            Ok(Value::Tuple(Rc::new(Vec::new())))
+        }))),
+    ));
+    entries.push((
+        "get_origin",
+        Value::Native(Rc::new(NativeFn::new("get_origin", |_i, _args| {
+            Ok(Value::None)
         }))),
     ));
     make_module("typing", entries)
@@ -6452,7 +6671,29 @@ fn make_pydantic_module() -> Value {
 /// object; `@contextmanager` semantics around `yield` aren't fully
 /// reproduced (those need generator support in the VM), but the
 /// decorator no longer raises on import.
-fn make_contextlib_module() -> Value {
+/// `__future__` — one feature flag object per name CPython defines. The
+/// statement itself is compile-time, so the values only need to exist and be
+/// truthy.
+fn make_future_module() -> Value {
+    let entries: Vec<(&str, Value)> = [
+        "annotations",
+        "nested_scopes",
+        "generators",
+        "division",
+        "absolute_import",
+        "with_statement",
+        "print_function",
+        "unicode_literals",
+        "barry_as_FLUFL",
+        "generator_stop",
+    ]
+    .into_iter()
+    .map(|name| (name, native_object("_Feature", vec![])))
+    .collect();
+    make_module("__future__", entries)
+}
+
+fn make_contextlib_module(interp: &mut Interpreter) -> Value {
     let identity = |name: &'static str| {
         nf(name, |_i, args| {
             Ok(args.into_iter().next().unwrap_or(Value::None))
@@ -6475,13 +6716,39 @@ fn make_contextlib_module() -> Value {
             },
         ))))
     });
-    make_module(
-        "contextlib",
-        vec![
-            ("contextmanager", contextmanager),
-            ("asynccontextmanager", identity("asynccontextmanager")),
-        ],
-    )
+    let mut entries = vec![
+        ("contextmanager", contextmanager),
+        ("asynccontextmanager", identity("asynccontextmanager")),
+    ];
+    // `suppress` / `nullcontext` / `closing` / `redirect_*` / `ExitStack` are
+    // ordinary Python classes — the shim is both shorter and closer to
+    // CPython than hand-rolled natives would be.
+    let extras = compile_helpers(interp, shims::CONTEXTLIB_EXTRA).unwrap_or_default();
+    for (k, v) in extras {
+        if k.starts_with('_') {
+            continue;
+        }
+        entries.push((intern_shim_name(k), v));
+    }
+    make_module("contextlib", entries)
+}
+
+/// Intern a shim's exported binding name so it can be used where a
+/// `&'static str` is required. Shim namespaces are fixed and small, so each
+/// name is allocated at most once per process.
+fn intern_shim_name(name: String) -> &'static str {
+    thread_local! {
+        static INTERNED: RefCell<HashMap<String, &'static str>> = RefCell::new(HashMap::new());
+    }
+    INTERNED.with(|map| {
+        let mut map = map.borrow_mut();
+        if let Some(existing) = map.get(&name) {
+            return *existing;
+        }
+        let leaked: &'static str = Box::leak(name.clone().into_boxed_str());
+        map.insert(name, leaked);
+        leaked
+    })
 }
 
 /// An object exposing native functions as attributes — the shape the VM
@@ -6582,7 +6849,7 @@ fn generator_context_manager(gen: Value) -> Value {
 /// has no descriptor protocol).
 ///
 /// `wraps`, `singledispatch`, and `total_ordering` are not implemented.
-fn make_functools_module() -> Value {
+fn make_functools_module(interp: &mut Interpreter) -> Value {
     fn make_cache(_i: &mut Interpreter, args: Vec<Value>) -> Result<Value, Unwind> {
         let inner = args.into_iter().next().unwrap_or(Value::None);
         let cache: Rc<RefCell<HashMap<HashKey, Value>>> = Rc::new(RefCell::new(HashMap::new()));
@@ -6639,18 +6906,31 @@ fn make_functools_module() -> Value {
         }
         Ok(acc)
     });
-    let partial = nf("partial", |_i, mut args| {
-        if args.is_empty() {
+    let partial = nf("partial", |_i, args| {
+        // `partial(fn, *bound, **bound_kw)` — the keyword half was dropped,
+        // so `partial(pow, exp=2)` raised "partial() does not accept keyword
+        // arguments" on a call CPython runs.
+        let (pos, captured_kw) = split_kwargs(&args);
+        let Some((func, captured)) = pos.split_first() else {
             return Err(type_error("partial() needs a callable"));
-        }
-        let func = args.remove(0);
-        let captured = args;
+        };
+        let func = func.clone();
+        let captured: Vec<Value> = captured.to_vec();
         Ok(Value::Native(Rc::new(NativeFn::new(
             "partial_call",
             move |i, call_args| {
+                let (call_pos, call_kw) = split_kwargs(&call_args);
                 let mut all = captured.clone();
-                all.extend(call_args);
-                i.call_value(func.clone(), all, &[])
+                all.extend(call_pos.iter().cloned());
+                // A later keyword overrides the bound one, as in CPython.
+                let mut kw = captured_kw.clone();
+                for (k, v) in call_kw {
+                    match kw.iter_mut().find(|(existing, _)| *existing == k) {
+                        Some(slot) => slot.1 = v,
+                        None => kw.push((k, v)),
+                    }
+                }
+                i.call_value(func.clone(), all, &kw)
             },
         ))))
     });
@@ -6666,17 +6946,25 @@ fn make_functools_module() -> Value {
             |_i, args| Ok(args.into_iter().next().unwrap_or(Value::None)),
         ))))
     });
-    make_module(
-        "functools",
-        vec![
-            ("cache", cache_fn),
-            ("lru_cache", lru_cache),
-            ("reduce", reduce),
-            ("partial", partial),
-            ("cached_property", cached_property),
-            ("wraps", wraps),
-        ],
-    )
+    let mut entries = vec![
+        ("cache", cache_fn),
+        ("lru_cache", lru_cache),
+        ("reduce", reduce),
+        ("partial", partial),
+        ("cached_property", cached_property),
+        ("wraps", wraps),
+    ];
+    // `cmp_to_key` / `singledispatch` / `total_ordering` are pure Python in
+    // CPython too, so the shim is the honest implementation rather than a
+    // native approximation of one.
+    let extras = compile_helpers(interp, shims::FUNCTOOLS_EXTRA).unwrap_or_default();
+    for (k, v) in extras {
+        if k.starts_with('_') {
+            continue;
+        }
+        entries.push((intern_shim_name(k), v));
+    }
+    make_module("functools", entries)
 }
 
 /// `dataclasses` shim.
@@ -7348,6 +7636,8 @@ fn str_method(
             }
         }
         "isdigit" => Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_ascii_digit())),
+        // CPython: the empty string IS ascii (unlike every other `is*`).
+        "isascii" => Value::Bool(s.is_ascii()),
         "isalpha" => Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_alphabetic())),
         "isalnum" => Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_alphanumeric())),
         "isspace" => Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_whitespace())),
@@ -7379,6 +7669,26 @@ fn str_method(
             Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_numeric()))
         }
         "istitle" => Value::Bool(is_title_case(s)),
+        // CPython: an identifier starts with a letter or `_` and continues
+        // with letters, digits or `_` (the XID_Start / XID_Continue rule,
+        // approximated here by Unicode alphabetic + `_` + numeric).
+        "isidentifier" => {
+            let mut chars = s.chars();
+            Value::Bool(match chars.next() {
+                None => false,
+                Some(first) => {
+                    (first.is_alphabetic() || first == '_')
+                        && chars.all(|c| c.is_alphanumeric() || c == '_')
+                }
+            })
+        }
+        // CPython: the empty string IS printable; a string is printable when
+        // no character is "non-printable" (control / separator other than
+        // ASCII space / unassigned).
+        "isprintable" => Value::Bool(
+            s.chars()
+                .all(|c| c == ' ' || (!c.is_control() && !c.is_whitespace())),
+        ),
         "casefold" => {
             // Full Unicode case folding via the embedded C+F mappings, for
             // byte-exact parity with CPython's `str.casefold()`. `to_lowercase`
@@ -8520,6 +8830,11 @@ fn tuple_method(t: &Rc<Vec<Value>>, name: &str, args: &[Value]) -> Result<Value,
 fn num_method(v: &Value, name: &str, args: &[Value]) -> Result<Value, Unwind> {
     match (v, name) {
         (Value::Float(x), "is_integer") => Ok(Value::Bool(x.fract() == 0.0 && x.is_finite())),
+        // The `numbers.Real` surface every int/float carries. `conjugate()`
+        // is the identity for a real; `imag` is always 0 / 0.0.
+        (Value::Int(i), "conjugate") => Ok(Value::Int(i.clone())),
+        (Value::Float(x), "conjugate") => Ok(Value::Float(*x)),
+        (Value::Bool(b), "conjugate") => Ok(Value::Int(VmInt::from(i64::from(*b)))),
         (Value::Int(i), "bit_length") => Ok(Value::Int(VmInt::from(i.bits() as i64))),
         // `(n).bit_count()` — number of set bits in the absolute value.
         (Value::Int(i), "bit_count") => {
@@ -9692,6 +10007,7 @@ pub fn call_with_kwargs(
                 out.push_str(&interp.str_of(a)?);
             }
             out.push_str(&end);
+            let file_sink = file_sink.or_else(|| redirected_std_stream(interp, to_stderr));
             if let Some(sink) = file_sink {
                 let write = interp.get_attr(&sink, "write")?;
                 interp.call_value(write, vec![Value::Str(Rc::new(out))], &[])?;
@@ -9773,10 +10089,32 @@ pub fn call_with_kwargs(
         | "namedtuple"
         | "open"
         | "str"
-        | "bytes" => {
+        | "bytes"
+        | "partial"
+        | "partial_call" => {
             let mut args = args;
             args.push(make_kwargs_sentinel(kwargs));
             (n.func)(interp, args)
+        }
+        // `pow(base, exp, mod=None)` — CPython names all three parameters, so
+        // `pow(2, exp=3)` and `functools.partial(pow, exp=2)` are ordinary
+        // calls there.
+        "pow" => {
+            let mut positional = args;
+            for name in ["base", "exp", "mod"] {
+                if let Some((_, v)) = kwargs.iter().find(|(k, _)| k == name) {
+                    positional.push(v.clone());
+                }
+            }
+            if let Some((k, _)) = kwargs
+                .iter()
+                .find(|(k, _)| !matches!(k.as_str(), "base" | "exp" | "mod"))
+            {
+                return Err(type_error(format!(
+                    "pow() got an unexpected keyword argument '{k}'"
+                )));
+            }
+            (n.func)(interp, positional)
         }
         // `Ok` / `Err` are natives in the VM but frozen *dataclasses* in the
         // emitted `typhon_runtime`, where the field names are part of the

@@ -4383,4 +4383,190 @@ main()
 "#;
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
+
+    /// The builtin surface a program reaches for that the VM was missing:
+    /// the `numbers` tower on int/float, the string predicates, the unbound
+    /// method form of a builtin type, `issubclass`, function attributes, and
+    /// class objects as dict keys.
+    #[test]
+    fn builtin_type_surface_matches_cpython() {
+        let src = r#"
+def main() -> None:
+    if not "hi".isascii() or not "".isascii() or "é".isascii():
+        raise AssertionError("isascii wrong")
+    if not "a_b1".isidentifier() or "1a".isidentifier() or "".isidentifier():
+        raise AssertionError("isidentifier wrong")
+    if not "a b".isprintable() or "a\tb".isprintable() or not "".isprintable():
+        raise AssertionError("isprintable wrong")
+    if (5).real != 5 or (5).imag != 0 or (5).numerator != 5 or (5).denominator != 1:
+        raise AssertionError("int numeric tower wrong")
+    if (5).conjugate() != 5 or (2.5).conjugate() != 2.5 or (2.5).real != 2.5:
+        raise AssertionError("conjugate/real wrong")
+    if int.from_bytes(b"\x01\x02", "big") != 258:
+        raise AssertionError("int.from_bytes big-endian wrong")
+    if int.from_bytes(b"\x01\x02", "little") != 513:
+        raise AssertionError("int.from_bytes little-endian wrong")
+    # The unbound method form CPython exposes on every builtin type.
+    if str.upper("ab") != "AB" or list.count([1, 1, 2], 1) != 2:
+        raise AssertionError("unbound builtin method wrong")
+    if dict.get({"a": 1}, "a") != 1 or str.__name__ != "str":
+        raise AssertionError("unbound dict.get / type __name__ wrong")
+    if not issubclass(ValueError, Exception) or issubclass(Exception, ValueError):
+        raise AssertionError("issubclass on builtin exceptions wrong")
+    if not issubclass(bool, object):
+        raise AssertionError("everything subclasses object")
+
+class A:
+    pass
+
+class B(A):
+    pass
+
+def tagged() -> int:
+    return 1
+
+def check_more() -> None:
+    if not issubclass(B, A) or issubclass(A, B):
+        raise AssertionError("issubclass on user classes wrong")
+    # A class object is hashable by identity, which is what makes a
+    # type-keyed registry work.
+    let registry: dict[object, str] = {A: "a", B: "b", int: "i"}
+    if registry[A] != "a" or registry[B] != "b" or registry[int] != "i":
+        raise AssertionError("class-keyed dict wrong")
+    # A function has a `__dict__` a decorator can publish API on.
+    tagged.marker = 7
+    if tagged.marker != 7 or tagged.__dict__ != {"marker": 7}:
+        raise AssertionError("function attribute wrong")
+
+main()
+check_more()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// The stdlib shims added for the differential corpus, checked against
+    /// the values CPython 3.13 produces.
+    #[test]
+    fn added_stdlib_shims_match_cpython() {
+        let src = r#"
+import base64
+import bisect
+import csv
+import functools
+import io
+import operator
+import string
+import sys
+from contextlib import ExitStack, nullcontext, redirect_stdout, suppress
+
+def cmp(a: int, b: int) -> int:
+    return (a > b) - (a < b)
+
+def main() -> None:
+    if base64.b64encode(b"hello") != b"aGVsbG8=" or base64.b64decode(b"aGVsbG8=") != b"hello":
+        raise AssertionError("base64 round-trip wrong")
+    if base64.urlsafe_b64encode(b"\xfb\xff") != b"-_8=" or base64.b16encode(b"ab") != b"6162":
+        raise AssertionError("base64 alphabet variants wrong")
+    mut xs: list[int] = [1, 3, 5, 7]
+    if bisect.bisect_left(xs, 5) != 2 or bisect.bisect_right(xs, 5) != 3:
+        raise AssertionError("bisect wrong")
+    bisect.insort(xs, 4)
+    if xs != [1, 3, 4, 5, 7]:
+        raise AssertionError("insort wrong")
+    if string.digits != "0123456789" or string.capwords("a b") != "A B":
+        raise AssertionError("string constants wrong")
+    if string.Template("$a-${b}").substitute(a="x", b="y") != "x-y":
+        raise AssertionError("string.Template wrong")
+    if string.Template("$a-$b").safe_substitute(a="x") != "x-$b":
+        raise AssertionError("safe_substitute wrong")
+    if operator.add(2, 3) != 5 or operator.itemgetter(1)([9, 8]) != 8:
+        raise AssertionError("operator wrong")
+    if operator.attrgetter("real")(5) != 5 or operator.methodcaller("upper")("ab") != "AB":
+        raise AssertionError("operator getters wrong")
+    let buf = io.StringIO()
+    csv.writer(buf).writerow(["a", 'q"x', "c,d"])
+    if buf.getvalue() != 'a,"q""x","c,d"\r\n':
+        raise AssertionError("csv writer wrong: " + repr(buf.getvalue()))
+    if list(csv.reader(io.StringIO('a,"q""x","c,d"\r\n'))) != [["a", 'q"x', "c,d"]]:
+        raise AssertionError("csv reader wrong")
+    if sorted([3, 1, 2], key=functools.cmp_to_key(cmp)) != [1, 2, 3]:
+        raise AssertionError("cmp_to_key wrong")
+    if functools.partial(pow, exp=2)(3) != 9:
+        raise AssertionError("partial keyword binding wrong")
+    if not isinstance(sys.modules, dict) or "sys" not in sys.modules:
+        raise AssertionError("sys.modules wrong")
+    with suppress(ValueError):
+        raise ValueError("swallowed")
+    let cap = io.StringIO()
+    with redirect_stdout(cap):
+        print("captured")
+    if cap.getvalue() != "captured\n":
+        raise AssertionError("redirect_stdout wrong: " + repr(cap.getvalue()))
+    with nullcontext(7) as v:
+        if v != 7:
+            raise AssertionError("nullcontext wrong")
+    mut log: list[str] = []
+    with ExitStack() as stack:
+        stack.callback(lambda: log.append("cleanup"))
+        log.append("body")
+    if log != ["body", "cleanup"]:
+        raise AssertionError("ExitStack wrong")
+    try:
+        raise KeyError("k")
+    except KeyError:
+        let info = sys.exc_info()
+        if info[0].__name__ != "KeyError" or info[2] is not None:
+            raise AssertionError("exc_info wrong")
+    if sys.exc_info()[0] is not None:
+        raise AssertionError("exc_info outside a handler must be all-None")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// `class X(NamedTuple)` is a tuple and `class X(TypedDict)` is a dict in
+    /// CPython. The VM built a plain instance for both, so `p[0]` and
+    /// `u["name"]` raised `'instance' object is not subscriptable` on
+    /// programs `tyc build` runs fine.
+    #[test]
+    fn typing_records_are_tuples_and_dicts_like_cpython() {
+        let src = r#"
+from typing import NamedTuple, TypedDict
+
+class Point(NamedTuple):
+    x: int
+    y: int = 5
+
+class User(TypedDict):
+    id: int
+    name: str
+
+def main() -> None:
+    let p: Point = Point(x=1, y=2)
+    if (p.x, p.y) != (1, 2) or p[0] != 1 or p[1] != 2:
+        raise AssertionError("NamedTuple field / index access wrong")
+    if len(p) != 2 or list(p) != [1, 2] or p != (1, 2):
+        raise AssertionError("NamedTuple tuple protocol wrong")
+    if repr(p) != "Point(x=1, y=2)":
+        raise AssertionError("NamedTuple repr wrong: " + repr(p))
+    if p._asdict() != {"x": 1, "y": 2} or p._replace(y=9) != (1, 9):
+        raise AssertionError("NamedTuple _asdict/_replace wrong")
+    if Point(x=3) != (3, 5):
+        raise AssertionError("NamedTuple field default wrong")
+    if Point._fields != ("x", "y"):
+        raise AssertionError("NamedTuple _fields wrong")
+
+    let u: User = User(id=1, name="Alice")
+    if u["name"] != "Alice" or u["id"] != 1:
+        raise AssertionError("TypedDict subscript wrong")
+    if not isinstance(u, dict) or sorted(u.keys()) != ["id", "name"]:
+        raise AssertionError("TypedDict must construct a plain dict")
+    if repr(u) != "{'id': 1, 'name': 'Alice'}":
+        raise AssertionError("TypedDict repr wrong: " + repr(u))
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
 }
