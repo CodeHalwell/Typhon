@@ -242,6 +242,46 @@ unsupported, both of which have worked since earlier in this cycle — the
 real remaining pydantic gap is *validation*, which the VM does not do at
 all, and that is what they say now.
 
+**A shim audit, twenty findings deep.** The last review sweep turned up a
+long tail across the stdlib shims and the CLI, and closing it took the
+`bytes`-and-`str` work of the previous waves down into the corners.
+*Filesystem and permissions:* `os.umask` returned `0o022` without setting
+anything, so a program hardening its mask before writing credentials got the
+ambient one anyway; `shutil.copyfile(..., follow_symlinks=False)` copied
+*through* a symlink instead of recreating it, which can drag files out of a
+backup tree; and `shutil.which("./x")` reported a non-executable file as
+runnable. *Streams:* a seek past end-of-file left no NUL gap, so writing at
+offset 5 of a three-byte file gave `abcX` rather than `abc\0\0X`, and
+`truncate` past the end grew neither a file nor its text wrapper (an
+in-memory `BytesIO` correctly does not). *Parsers:* `csv` opened a quoted
+field on a quote *anywhere*, merging `ab"c,d` into one column, and
+`QUOTE_NONE` wrote a field containing the delimiter unescaped instead of
+escaping it or refusing; `base64`'s permissive decode discarded only CR and
+LF where CPython discards everything outside the alphabet, and its padding
+errors named the wrong one of CPython's two messages; `argparse` ignored
+`exit_on_error=False` for unrecognised arguments. *Collections:*
+`ChainMap` inherited six mutators that reach for a `_data` it does not have,
+so `pop` raised `AttributeError`; `bytearray.extend`, `insert` and slice
+assignment skipped the 0-255 check `append` applies (and slice assignment
+never reached the shim at all, because the interpreter dispatched a slice
+key before consulting `__setitem__`). *Elsewhere:* `contextlib.ExitStack`
+stopped unwinding at the first callback that raised, leaving outer files
+open; `pathlib.glob` discarded both `case_sensitive` and `recurse_symlinks`;
+and `hashlib` documented `sha224`, `sha384`, `blake2b` and `blake2s` without
+implementing them — all four are implemented now rather than struck from the
+docs. `base64.Error` is no longer exported, because CPython's `base64` has
+no such name.
+
+On the CLI side, `tyc build --check --out <new-dir>` created the directory it
+promised not to touch; a `"BaseModel"` *string literal* pulled pydantic into
+a project's dependencies, because the scan predated the shared lexical mask;
+`--python python3` was indistinguishable from the default, so an explicitly
+requested interpreter lost to the project venv; the venv probe hard-coded
+the POSIX layout, so no Windows build could ever find one; and an adjacent
+*package* was treated as local without being scanned, so a package importing
+something the VM does not model took the VM anyway and died there instead of
+compiling.
+
 **A prelude name that only the VM could resolve.** `BaseModel` and
 `NewType` resolve without an import — the `model` and `newtype` lowerings
 introduce them — so naming either directly passes `tyc check`. Their

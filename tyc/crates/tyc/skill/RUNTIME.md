@@ -235,9 +235,9 @@ Built-in method dispatch on `str` / `bytes` (v0.11.0) / `list` / `dict` (incl. `
 | `shutil` (v1.0.0-beta.1) | `copy`, `copy2`, `copyfile`, `copytree`, `move`, `rmtree`, `which`, `disk_usage`, `SameFileError` |
 | `tempfile` (v1.0.0-beta.1) | `mkdtemp`, `mkstemp`, `gettempdir`, `NamedTemporaryFile`, `TemporaryDirectory`, `TemporaryFile` |
 | `glob` (v1.0.0-beta.1) | `glob`, `iglob`, `escape`, `has_magic` (incl. `**`) |
-| `hashlib` (v1.0.0-beta.1) | `md5`, `sha1`, `sha224`, `sha256`, `sha384`, `sha512`, `blake2b`, `blake2s`, `new` + `update` / `digest` / `hexdigest` / `copy` |
+| `hashlib` (v1.0.0-beta.1) | `md5`, `sha1`, `sha224`, `sha256`, `sha384`, `sha512`, unkeyed `blake2b` / `blake2s` at their default sizes, `new` + `update` / `digest` / `hexdigest` / `copy` |
 | `base64` (v1.0.0-beta.1) | `b64encode` / `b64decode` (incl. `altchars`), `urlsafe_*`, `standard_*`, `b32*`, `b16*`, `encodebytes` / `decodebytes` |
-| `csv` (v1.0.0-beta.1) | `reader`, `writer`, `DictReader`, `DictWriter`, `QUOTE_*`, `excel` / `excel-tab` / `unix` dialects, `register_dialect`. No `Sniffer`, no `escapechar` |
+| `csv` (v1.0.0-beta.1) | `reader`, `writer`, `DictReader`, `DictWriter`, `QUOTE_*`, `excel` / `excel-tab` / `unix` dialects, `register_dialect`, `escapechar` on both sides. No `Sniffer` |
 | `string` (v1.0.0-beta.1) | Constant tables, `capwords`, `Template` (`substitute` / `safe_substitute`) |
 | `operator` (v1.0.0-beta.1) | Operator function forms plus `itemgetter`, `attrgetter`, `methodcaller`, `countOf`, `indexOf`, `length_hint` |
 | `bisect` (v1.0.0-beta.1) | `bisect_left` / `bisect_right` / `insort_left` / `insort_right` (+ aliases), with `lo` / `hi` / `key` |

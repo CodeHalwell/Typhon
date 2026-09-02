@@ -2683,6 +2683,164 @@ main()
     }
 
     #[test]
+    fn vm_stdlib_shim_edge_cases_match_cpython() {
+        let src = r#"
+import argparse
+import base64
+import collections
+import contextlib
+import csv
+import hashlib
+import io
+import os
+import pathlib
+import shutil
+import tempfile
+
+
+def check(label: str, got: str, want: str) -> None:
+    if got != want:
+        raise ValueError(f"{label}: got {got!r}, want {want!r}")
+
+
+def write_csv(rows: list[list[object]], quoting: int, escapechar: str | None) -> str:
+    let buf: io.StringIO = io.StringIO()
+    csv.writer(buf, quoting=quoting, escapechar=escapechar).writerows(rows)
+    return buf.getvalue()
+
+
+def main() -> None:
+    os.chdir(tempfile.mkdtemp())
+
+    # QUOTE_NONE escapes rather than quotes, and refuses without an escape.
+    try:
+        let _ = write_csv([["a,b"]], csv.QUOTE_NONE, None)
+        raise ValueError("QUOTE_NONE must refuse an unescapable field")
+    except csv.Error as e:
+        check("csv-refuse", str(e), "need to escape, but no escapechar set")
+    check("csv-escape", write_csv([["a,b"]], csv.QUOTE_NONE, "|"), "a|,b\r\n")
+    # A quote only opens a field at its start.
+    check("csv-midquote", str(list(csv.reader(['ab"c,d']))), "[['ab\"c', 'd']]")
+    check("csv-postquote", str(list(csv.reader(['"ab"cd']))), "[['abcd']]")
+    check("csv-escaped-read", str(list(csv.reader(["a\\,b"], escapechar="\\"))), "[['a,b']]")
+
+    # `os.umask` really sets the process mask.
+    let old: int = os.umask(0o077)
+    with open("u.txt", "w") as f:
+        f.write("x")
+    os.mkdir("d")
+    check("umask-file", oct(os.stat("u.txt").st_mode & 0o777), "0o600")
+    check("umask-dir", oct(os.stat("d").st_mode & 0o777), "0o700")
+    check("umask-prev", oct(os.umask(old)), "0o77")
+
+    # Seeking past end-of-file leaves a NUL gap; truncate grows a file only.
+    let sio: io.StringIO = io.StringIO("abc")
+    sio.seek(5)
+    sio.write("X")
+    check("sparse-str", repr(sio.getvalue()), "'abc\\x00\\x00X'")
+    let bio: io.BytesIO = io.BytesIO(b"abc")
+    bio.seek(5)
+    bio.write(b"X")
+    check("sparse-bytes", str(bio.getvalue()), "b'abc\\x00\\x00X'")
+    check("bytesio-truncate", str(io.BytesIO(b"abc").truncate(5)), "5")
+    check("bytesio-kept", str(io.BytesIO(b"abc").getvalue()), "b'abc'")
+    with open("t.bin", "wb") as wb:
+        wb.write(b"abc")
+    with open("t.bin", "r+b") as fb:
+        check("file-truncate", str(fb.truncate(5)), "5")
+    check("file-grown", str(open("t.bin", "rb").read()), "b'abc\\x00\\x00'")
+
+    # `follow_symlinks=False` recreates the link; `which` honours the mode.
+    with open("target.txt", "w") as t:
+        t.write("hi")
+    os.symlink("target.txt", "link.txt")
+    shutil.copyfile("link.txt", "out.txt", follow_symlinks=False)
+    check("copy-link", f"{os.path.islink('out.txt')} {os.readlink('out.txt')}", "True target.txt")
+    shutil.copyfile("link.txt", "out2.txt")
+    check("copy-follow", str(os.path.islink("out2.txt")), "False")
+    with open("noexec", "w") as g:
+        g.write("")
+    os.chmod("noexec", 0o644)
+    check("which-nonexec", str(shutil.which("./noexec")), "None")
+    os.chmod("noexec", 0o755)
+    check("which-exec", str(shutil.which("./noexec")), "./noexec")
+
+    # The permissive base64 decode discards every non-alphabet character.
+    check("b64-noise", str(base64.b64decode(b"Y W!Jj")), "b'abc'")
+    check("b64-tab", str(base64.b64decode(b"\tYWJj\n ")), "b'abc'")
+    check("b64-pad-ok", str(base64.b64decode(b"YWJ=")), "b'ab'")
+    for bad, want in [(b"YW=", "Incorrect padding"), (b"Y", "Invalid base64-encoded string: number of data characters (1) cannot be 1 more than a multiple of 4")]:
+        try:
+            let _ = base64.b64decode(bad)
+            raise ValueError("should have failed")
+        except ValueError as e:
+            check("b64-" + str(bad), str(e), want)
+
+    # `exit_on_error=False` reaches the unrecognized-arguments path.
+    let p = argparse.ArgumentParser(prog="p", exit_on_error=False)
+    p.add_argument("--x")
+    try:
+        let _ = p.parse_args(["--y"])
+        raise ValueError("should have raised")
+    except argparse.ArgumentError as e:
+        check("argparse-exit", str(e), "unrecognized arguments: --y")
+
+    # `ChainMap`'s mutators work on the first mapping.
+    let cm = collections.ChainMap({"x": 1}, {"y": 2})
+    check("chainmap-pop", f"{cm.pop('x')} {dict(cm.maps[0])}", "1 {}")
+    let cm2 = collections.ChainMap({"x": 1}, {"y": 2})
+    cm2.update(z=3)
+    check("chainmap-update", str(dict(cm2.maps[0])), "{'x': 1, 'z': 3}")
+    let cm3 = collections.ChainMap({"x": 1}, {"y": 2})
+    check("chainmap-setdefault", f"{cm3.setdefault('y', 9)} {cm3.setdefault('z', 5)}", "2 5")
+
+    # `glob` honours `case_sensitive` and `recurse_symlinks`.
+    os.makedirs("g/sub", exist_ok=True)
+    with open("g/sub/item.txt", "w") as h:
+        h.write("")
+    os.symlink("sub", "g/link")
+    let g: pathlib.Path = pathlib.Path("g")
+    check("glob-nocase", str(sorted([str(x) for x in pathlib.Path("g/sub").glob("*.TXT", case_sensitive=False)])), "['g/sub/item.txt']")
+    check("glob-case", str(sorted([str(x) for x in pathlib.Path("g/sub").glob("*.TXT")])), "[]")
+    check("rglob-links", str(sorted([str(x) for x in g.rglob("item.txt", recurse_symlinks=True)])), "['g/link/item.txt', 'g/sub/item.txt']")
+    check("rglob-nolinks", str(sorted([str(x) for x in g.rglob("item.txt")])), "['g/sub/item.txt']")
+
+    # A byte outside 0-255 is rejected by every mutator.
+    mut ba: bytearray = bytearray(b"a")
+    for label, thunk in [("extend", lambda: ba.extend([256])), ("insert", lambda: ba.insert(0, 256))]:
+        try:
+            let _ = thunk()
+            raise ValueError(label + " should have raised")
+        except ValueError as e:
+            check("ba-" + label, str(e), "byte must be in range(0, 256)")
+    ba[0:1] = [120]
+    check("ba-slice-write", str(ba), "bytearray(b'x')")
+
+    # `ExitStack` keeps unwinding after a callback raises.
+    let log: list[str] = []
+    try:
+        with contextlib.ExitStack() as stack:
+            stack.callback(lambda: log.append("outer"))
+            stack.callback(lambda: (log.append("inner"), 1 // 0)[0])
+        raise ValueError("should have propagated")
+    except ZeroDivisionError:
+        check("exitstack", str(log), "['inner', 'outer']")
+
+    # The SHA-2 family and unkeyed BLAKE2.
+    check("sha224", hashlib.sha224(b"").hexdigest()[:16], "d14a028c2a3a2bc9")
+    check("sha384", hashlib.sha384(b"").hexdigest()[:16], "38b060a751ac9638")
+    check("blake2b", hashlib.blake2b(b"").hexdigest()[:16], "786a02f742015903")
+    check("blake2s", hashlib.blake2s(b"").hexdigest()[:16], "69217a3079908094")
+    check("blake2b-block", hashlib.blake2b(b"x" * 128).hexdigest()[:16], hashlib.new("blake2b", b"x" * 128).hexdigest()[:16])
+    print("ok")
+
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn vm_type_parameter_and_class_reflection_match_cpython() {
         let src = r#"
 

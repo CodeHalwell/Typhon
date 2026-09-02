@@ -6931,6 +6931,23 @@ impl Interpreter {
     }
 
     fn set_subscript(&mut self, target: &Value, key: &Value, value: Value) -> Result<(), Unwind> {
+        // A user `__setitem__` receives the key exactly as written, a slice
+        // included — which is how `bytearray`'s slice write reaches its shim.
+        // This has to come before the slice dispatch below, which only knows
+        // how to assign into a list.
+        if let Value::Instance(i) = target {
+            if let Some(m) = self.find_method(&i.class, "__setitem__") {
+                self.call_value(
+                    Value::BoundMethod {
+                        receiver: Box::new(target.clone()),
+                        function: m,
+                    },
+                    vec![key.clone(), value],
+                    &[],
+                )?;
+                return Ok(());
+            }
+        }
         // Slice assignment: `xs[1:3] = [...]`.
         if let Value::Tuple(t) = key {
             if t.len() == 4 {
@@ -6968,27 +6985,6 @@ impl Interpreter {
                 let k = self.dict_probe_key(d, key)?;
                 d.borrow_mut().insert(k, value);
                 Ok(())
-            }
-            // `obj[key] = value` → `obj.__setitem__(key, value)` when the
-            // instance's class defines it. Needed by the builtins agent's
-            // `defaultdict` (and any user mapping type) so subscript-assignment
-            // round-trips with the `__missing__` read path (mechanism #2).
-            Value::Instance(i) => {
-                if let Some(m) = self.find_method(&i.class, "__setitem__") {
-                    self.call_value(
-                        Value::BoundMethod {
-                            receiver: Box::new(target.clone()),
-                            function: m,
-                        },
-                        vec![key.clone(), value],
-                        &[],
-                    )?;
-                    return Ok(());
-                }
-                Err(type_error(format!(
-                    "'{}' object does not support item assignment",
-                    target.type_name()
-                )))
             }
             other => Err(type_error(format!(
                 "'{}' object does not support item assignment",

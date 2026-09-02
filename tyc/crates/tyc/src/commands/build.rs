@@ -209,12 +209,14 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // still enough to catch a symlink *inside* the output tree, and without
     // it `tyc run --compile --temp` could never write its scratch build.
     let (confine_root, confine_label) = if out_is_explicit {
-        std::fs::create_dir_all(&out_dir)
-            .map_err(|e| miette!("cannot create '{}': {e}", out_dir.display()))?;
-        (
-            std::fs::canonicalize(&out_dir).unwrap_or_else(|_| out_dir.clone()),
-            "the output directory",
-        )
+        // `--check` promises to touch nothing, so the boundary is derived
+        // from the nearest existing ancestor rather than by creating the
+        // directory that a real build would want.
+        if !args.check {
+            std::fs::create_dir_all(&out_dir)
+                .map_err(|e| miette!("cannot create '{}': {e}", out_dir.display()))?;
+        }
+        (canonical_or_lexical(&out_dir), "the output directory")
     } else {
         (project_root.clone(), "the project root")
     };
@@ -1728,6 +1730,32 @@ fn inject_cross_module_ext_imports(
 /// leaf must not be a symlink (`atomic_write` refuses those too) and its
 /// parent directory, once it exists, must resolve inside the canonical
 /// project root.
+/// A canonical path for a directory that may not exist yet: canonicalise the
+/// nearest existing ancestor and re-attach the components below it. `--check`
+/// needs this because it must not create the output directory just to work
+/// out where the boundary is.
+fn canonical_or_lexical(path: &std::path::Path) -> std::path::PathBuf {
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return real;
+    }
+    let mut missing: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut probe = path;
+    while let Some(parent) = probe.parent() {
+        if let Some(name) = probe.file_name() {
+            missing.push(name);
+        }
+        if let Ok(real) = std::fs::canonicalize(parent) {
+            let mut out = real;
+            for part in missing.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        probe = parent;
+    }
+    path.to_path_buf()
+}
+
 fn confine_output_path(
     root: &std::path::Path,
     root_label: &str,
@@ -2345,25 +2373,29 @@ fn sources_use_model_keyword(sources: &[(PathBuf, String)]) -> bool {
 /// `model X:`, so the dependency has to be declared for both — otherwise
 /// the artefact swaps a `NameError` for a `ModuleNotFoundError`.
 fn source_names_basemodel(text: &str) -> bool {
-    let mut in_triple: Option<&'static str> = None;
-    for line in text.lines() {
-        let (next_state, line_starts_in_string) = update_triple_quote_state(line, in_triple);
-        let was_in_string = in_triple.is_some();
-        in_triple = next_state;
-        if was_in_string || line_starts_in_string {
-            continue;
-        }
-        let code = line.split('#').next().unwrap_or(line);
-        let mut rest = code;
-        while let Some(at) = rest.find("BaseModel") {
-            let before = rest[..at].chars().next_back();
-            let after = rest[at + "BaseModel".len()..].chars().next();
-            let boundary =
-                |c: Option<char>| !matches!(c, Some(c) if c.is_alphanumeric() || c == '_');
-            if boundary(before) && boundary(after) {
+    use tyc_syntax::lexmask::{scan_line_kinds, ByteKind};
+    // The same lexical mask the preprocessor uses, so an ordinary string
+    // literal (`let banner: str = "BaseModel"`) does not pull pydantic into
+    // the project's dependencies.
+    let mut in_string = None;
+    for line in text.split_inclusive('\n') {
+        let kinds = scan_line_kinds(line, &mut in_string);
+        let bytes = line.as_bytes();
+        let boundary = |i: usize| match bytes.get(i) {
+            Some(c) => !(c.is_ascii_alphanumeric() || *c == b'_'),
+            None => true,
+        };
+        let mut at = 0usize;
+        while let Some(found) = line[at..].find("BaseModel") {
+            let start = at + found;
+            let end = start + "BaseModel".len();
+            let is_code = kinds
+                .get(start)
+                .is_some_and(|k| matches!(k, ByteKind::Code | ByteKind::FStringExpr));
+            if is_code && (start == 0 || boundary(start - 1)) && boundary(end) {
                 return true;
             }
-            rest = &rest[at + "BaseModel".len()..];
+            at = end;
         }
     }
     false

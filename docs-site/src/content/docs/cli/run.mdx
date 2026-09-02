@@ -107,7 +107,7 @@ tyc run --compile --temp           # nothing left behind after exit
 |------|------|--------|
 | `--compile` (alias `--no-vm`) | switch | Build to `.py` and exec CPython instead of using the VM. |
 | `--entry FILE` | compile only | Entry-point file relative to the build dir. Default `main.py`. |
-| `--python PATH` | compile only | Python interpreter. Default `python3`. |
+| `--python PATH` | compile only | Python interpreter. Given explicitly it always wins; left out, the project's `.venv` is preferred, then `python3.<minor>` for `[python] target`, then `python3`. |
 | `--temp` / `-t` | compile only | Build into a tempdir that is deleted on exit. Mutually exclusive with `--no-build`. |
 | `--no-build` | compile only | Skip rebuilding; assume the persistent `build/` is current. |
 

@@ -911,7 +911,12 @@ class ArgumentParser:
     def parse_args(self, args=None, namespace=None):
         ns, extras = self.parse_known_args(args, namespace)
         if extras:
-            self.error("unrecognized arguments: %s" % " ".join(extras))
+            # `exit_on_error=False` is chosen precisely so a caller can catch
+            # the failure; leftover arguments must respect it too.
+            message = "unrecognized arguments: %s" % " ".join(extras)
+            if self.exit_on_error:
+                self.error(message)
+            raise ArgumentError(None, message)
         return ns
 
     def parse_intermixed_args(self, args=None, namespace=None):

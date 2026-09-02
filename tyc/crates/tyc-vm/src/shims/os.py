@@ -515,7 +515,7 @@ def getlogin():
 
 
 def umask(mask):
-    return 0o022
+    return _fs_umask(mask)
 
 
 def isatty(fd):

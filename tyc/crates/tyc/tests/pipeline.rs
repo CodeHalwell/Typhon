@@ -1192,6 +1192,102 @@ fn run_compile_temp_builds_outside_the_project_root() {
 }
 
 #[test]
+fn check_mode_does_not_create_the_output_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "def main() -> None:\n    print(\"hi\")\n\nmain()\n",
+    );
+    let out = tyc()
+        .arg("build")
+        .arg("--check")
+        .arg("--out")
+        .arg("newdir")
+        .arg(tmp.path())
+        .env("TYC_NO_SYNC", "1")
+        .output()
+        .unwrap();
+    // `--check` reports on stderr, leaving stdout for the program's output.
+    let reported = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        reported.contains("would write"),
+        "--check should report what it would write:\n{reported}"
+    );
+    assert!(
+        !tmp.path().join("newdir").exists(),
+        "--check must not create the output directory"
+    );
+    // The same invocation without `--check` still creates it.
+    tyc()
+        .arg("build")
+        .arg("--out")
+        .arg("newdir")
+        .arg(tmp.path())
+        .env("TYC_NO_SYNC", "1")
+        .output()
+        .unwrap();
+    assert!(
+        tmp.path().join("newdir").join("main.py").is_file(),
+        "a real build still writes into the output directory"
+    );
+}
+
+#[test]
+fn a_basemodel_string_literal_does_not_pull_in_pydantic() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "def main() -> None:\n    let banner: str = \"BaseModel\"\n    # BaseModel here too\n    print(banner)\n\nmain()\n",
+    );
+    tyc()
+        .arg("build")
+        .arg(tmp.path())
+        .env("TYC_NO_SYNC", "1")
+        .output()
+        .unwrap();
+    let manifest = std::fs::read_to_string(tmp.path().join("pyproject.toml")).unwrap_or_default();
+    assert!(
+        !manifest.contains("pydantic"),
+        "a string literal must not add pydantic as a dependency:\n{manifest}"
+    );
+}
+
+#[test]
+fn run_scans_an_adjacent_package_for_unmodelled_imports() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg = tmp.path().join("pkg");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        tmp.path().join("app.ty"),
+        "from pkg.store import name\n\n\ndef main() -> None:\n    print(name())\n\n\nmain()\n",
+    )
+    .unwrap();
+    std::fs::write(pkg.join("__init__.ty"), "").unwrap();
+    // `sqlite3` is not modelled by the VM, so the run has to compile.
+    std::fs::write(
+        pkg.join("store.ty"),
+        "import sqlite3\n\n\ndef name() -> str:\n    return sqlite3.version if False else \"store\"\n",
+    )
+    .unwrap();
+    let out = tyc()
+        .arg("run")
+        .arg(tmp.path().join("app.ty"))
+        .env("TYC_NO_SYNC", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("store"),
+        "the package's unmodelled import should send the run down the compiled path:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("sqlite3"),
+        "the fallback should name the import it could not model:\n{stderr}"
+    );
+}
+
+#[test]
 fn build_fails_on_type_error() {
     let tmp = tempfile::tempdir().unwrap();
     scaffold(tmp.path(), "let x: int = \"wrong type\"\n");

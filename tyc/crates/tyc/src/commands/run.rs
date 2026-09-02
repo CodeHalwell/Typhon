@@ -71,8 +71,11 @@ pub struct RunArgs {
     /// project's `.venv`, else `python3.<minor>` for `[python] target`,
     /// else `python3`). Applies to `--compile` and to the automatic
     /// fallback the VM takes for an unmodelled import.
-    #[arg(long, value_name = "PATH", default_value = DEFAULT_PYTHON)]
-    pub python: String,
+    /// `None` when the flag was not given: `--python python3` has to mean
+    /// *that* interpreter, not "fall back to the venv", so the default
+    /// cannot be baked in as a string.
+    #[arg(long, value_name = "PATH")]
+    pub python: Option<String>,
 
     /// Build into a temporary directory that is deleted when the process
     /// exits, instead of the configured `out` dir. No build artifacts
@@ -142,6 +145,13 @@ pub fn run(args: RunArgs) -> Result<()> {
             };
             std::fs::copy(&sibling, scaffold.path().join("src").join(name))
                 .map_err(|e| miette!("cannot stage '{}': {}", sibling.display(), e))?;
+        }
+        // An adjacent package comes too, shape intact.
+        for package in sibling_packages(&src_file) {
+            let Some(name) = package.file_name() else {
+                continue;
+            };
+            stage_package(&package, &scaffold.path().join("src").join(name))?;
         }
         let name = src_file
             .file_stem()
@@ -330,10 +340,18 @@ pub fn run(args: RunArgs) -> Result<()> {
 /// project's own `.venv` (which `uv sync` provisions for the configured
 /// target), then `python3.<minor>` for that target, then `python3`.
 fn resolve_interpreter(args: &RunArgs, project_root: &std::path::Path) -> String {
-    if args.python != DEFAULT_PYTHON {
-        return args.python.clone();
+    if let Some(explicit) = &args.python {
+        return explicit.clone();
     }
-    let venv = project_root.join(".venv").join("bin").join("python");
+    // A Windows virtualenv puts its interpreter somewhere else entirely.
+    let venv = if cfg!(windows) {
+        project_root
+            .join(".venv")
+            .join("Scripts")
+            .join("python.exe")
+    } else {
+        project_root.join(".venv").join("bin").join("python")
+    };
     if venv.exists() {
         return venv.to_string_lossy().into_owned();
     }
@@ -364,7 +382,16 @@ fn which_on_path(name: &str) -> bool {
     let Some(paths) = std::env::var_os("PATH") else {
         return false;
     };
-    std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())
+    // On Windows an executable is only found with one of `PATHEXT`'s
+    // suffixes appended: `python3.13` never matches `python3.13.exe`.
+    let mut names: Vec<String> = vec![name.to_owned()];
+    if cfg!(windows) {
+        let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned());
+        for ext in exts.split(';').filter(|e| !e.is_empty()) {
+            names.push(format!("{name}{ext}"));
+        }
+    }
+    std::env::split_paths(&paths).any(|dir| names.iter().any(|n| dir.join(n).is_file()))
 }
 
 /// Default execution path — the in-process tree-walking VM. Resolves the
@@ -446,27 +473,27 @@ fn unmodelled_imports(path: &std::path::Path, entry: &std::path::Path) -> Option
         .iter()
         .filter_map(|f| f.file_stem().and_then(|s| s.to_str()).map(str::to_owned))
         .collect();
+    // An adjacent *package* is local too, but the VM will load every module
+    // in it — so its files are scanned as well. They are added after
+    // `project_roots` is computed, so a submodule's name does not start
+    // standing in for a top-level import.
+    for package in sibling_packages(entry) {
+        for file in crate::commands::util::collect_ty_files(&package).unwrap_or_default() {
+            if !files.contains(&file) {
+                files.push(file);
+            }
+        }
+    }
     let mut missing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for file in &files {
-        let Ok(text) = std::fs::read_to_string(file) else {
-            continue;
-        };
-        // The same expansion chain the VM's own entry point runs. Skipping
-        // it meant a file using any expanded form (`?`, `|>`, `gather:`)
-        // failed to parse here, and a failed parse silently skipped the
-        // file — taking the VM into a program whose unmodelled import it
-        // never saw.
-        let expanded = tyc_syntax::preprocess::expand_all(&text);
-        let prep = tyc_syntax::preprocess::preprocess(&expanded);
-        let Ok(parsed) = tyc_syntax::parse_module(&prep.python_source) else {
+        let Some(roots) = imported_roots(file) else {
             // Falling back to the compiled path is the safe answer for a
             // file this scan cannot read: the build reports the parse
             // error properly, and the VM never starts on an unknown import.
             missing.insert(format!("<unparsed {}>", file.display()));
             continue;
         };
-        let module = parsed.into_syntax();
-        for root in tyc_resolve::collect_imported_roots(&module) {
+        for root in roots {
             if tyc_vm::models_module(&root) || project_roots.contains(&root) {
                 continue;
             }
@@ -501,15 +528,7 @@ fn sibling_modules(entry: &std::path::Path) -> Vec<PathBuf> {
     let mut seen: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
     let mut queue: Vec<PathBuf> = vec![entry.to_path_buf()];
     while let Some(file) = queue.pop() {
-        let Ok(text) = std::fs::read_to_string(&file) else {
-            continue;
-        };
-        let expanded = tyc_syntax::preprocess::expand_all(&text);
-        let prep = tyc_syntax::preprocess::preprocess(&expanded);
-        let Ok(parsed) = tyc_syntax::parse_module(&prep.python_source) else {
-            continue;
-        };
-        for root in tyc_resolve::collect_imported_roots(&parsed.into_syntax()) {
+        for root in imported_roots(&file).unwrap_or_default() {
             let candidate = dir.join(format!("{root}.ty"));
             if candidate.is_file() && seen.insert(candidate.clone()) {
                 queue.push(candidate);
@@ -517,6 +536,61 @@ fn sibling_modules(entry: &std::path::Path) -> Vec<PathBuf> {
         }
     }
     seen.into_iter().collect()
+}
+
+/// The import roots `file` names, or `None` when it cannot be read or parsed.
+///
+/// Runs the same expansion chain the VM's entry point does, so a file using
+/// `?`, `|>` or `gather:` is read rather than silently skipped.
+fn imported_roots(file: &std::path::Path) -> Option<std::collections::BTreeSet<String>> {
+    let text = std::fs::read_to_string(file).ok()?;
+    let expanded = tyc_syntax::preprocess::expand_all(&text);
+    let prep = tyc_syntax::preprocess::preprocess(&expanded);
+    let parsed = tyc_syntax::parse_module(&prep.python_source).ok()?;
+    Some(tyc_resolve::collect_imported_roots(&parsed.into_syntax()))
+}
+
+/// Package directories beside `entry` that the program reaches by import — a
+/// `<root>/__init__.ty` next to it, or next to one of its siblings.
+///
+/// The VM loads these on demand exactly as it loads a plain sibling, so the
+/// unmodelled-import scan has to look inside them (a package importing
+/// `sqlite3` must send the program down the compiled path, not into a VM
+/// that dies on it) and the scaffold has to stage them.
+fn sibling_packages(entry: &std::path::Path) -> Vec<PathBuf> {
+    let Some(dir) = entry.parent() else {
+        return Vec::new();
+    };
+    let mut sources: Vec<PathBuf> = vec![entry.to_path_buf()];
+    sources.extend(sibling_modules(entry));
+    let mut packages: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    for file in sources {
+        for root in imported_roots(&file).unwrap_or_default() {
+            let candidate = dir.join(&root);
+            if candidate.join("__init__.ty").is_file() {
+                packages.insert(candidate);
+            }
+        }
+    }
+    packages.into_iter().collect()
+}
+
+/// Copy a package's `.ty` sources into the temp scaffold, preserving shape.
+fn stage_package(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(to).map_err(|e| miette!("cannot create '{}': {e}", to.display()))?;
+    let entries =
+        std::fs::read_dir(from).map_err(|e| miette!("cannot read '{}': {e}", from.display()))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let target = to.join(entry.file_name());
+        if path.is_dir() {
+            stage_package(&path, &target)?;
+        } else if path.extension().is_some_and(|e| e == "ty") {
+            std::fs::copy(&path, &target)
+                .map_err(|e| miette!("cannot stage '{}': {e}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Decide which path(s) the pre-run `tyc check` should cover.
@@ -642,7 +716,15 @@ mod tests {
     #[test]
     fn args_default_to_python3_and_main_py() {
         let parsed = <WrapRun as clap::Parser>::try_parse_from(["run"]).unwrap();
-        assert_eq!(parsed.args.python, "python3");
+        assert_eq!(parsed.args.python, None);
+        assert_eq!(
+            <WrapRun as clap::Parser>::try_parse_from(["run", "--python", "python3"])
+                .unwrap()
+                .args
+                .python
+                .as_deref(),
+            Some("python3")
+        );
         assert_eq!(parsed.args.entry, PathBuf::from("main.py"));
         assert_eq!(parsed.args.path, PathBuf::from("."));
         assert!(parsed.args.script_args.is_empty());
@@ -713,7 +795,7 @@ mod tests {
             path: file,
             compile: true,
             entry: PathBuf::from("main.py"),
-            python: "python3".into(),
+            python: None,
             temp: false,
             no_build: true,
             no_fallback: false,
@@ -738,7 +820,7 @@ mod tests {
             path: tmp.path().to_path_buf(),
             compile: true,
             entry: PathBuf::from("main.py"),
-            python: "python3".into(),
+            python: None,
             temp: false,
             no_build: true,
             no_fallback: false,

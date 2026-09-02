@@ -77,14 +77,28 @@ class ExitStack:
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        # Every callback runs, even when an earlier one raises: a failing
+        # inner `__exit__` must not leave an outer file or lock open. The new
+        # exception becomes the one in flight and propagates at the end.
         suppressed = False
+        pending_type = exc_type
+        pending = exc
+        pending_tb = tb
         while self._callbacks:
             cb = self._callbacks.pop()
-            if cb(exc_type, exc, tb):
-                suppressed = True
-                exc_type = None
-                exc = None
-                tb = None
+            try:
+                if cb(pending_type, pending, pending_tb):
+                    suppressed = True
+                    pending_type = None
+                    pending = None
+                    pending_tb = None
+            except BaseException as raised:
+                pending_type = type(raised)
+                pending = raised
+                pending_tb = None
+                suppressed = False
+        if pending is not None and pending is not exc:
+            raise pending
         return suppressed
 
     def enter_context(self, cm):

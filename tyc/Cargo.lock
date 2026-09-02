@@ -2195,6 +2195,7 @@ name = "tyc-vm"
 version = "1.0.0-alpha.9"
 dependencies = [
  "indexmap",
+ "libc",
  "num-bigint",
  "num-integer",
  "num-traits",

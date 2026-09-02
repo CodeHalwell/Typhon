@@ -2502,9 +2502,23 @@ fn compile_shim(
 
 /// A module whose members are the top-level bindings of a Python shim.
 fn module_from_shim(interp: &mut Interpreter, name: &str, source: &str) -> Result<Value, Unwind> {
+    module_from_shim_hiding(interp, name, source, &[])
+}
+
+/// [`module_from_shim`], less the named bindings. A shim sometimes needs a
+/// helper the real module does not export — `base64`'s `Error` is CPython's
+/// `binascii.Error`, and a program that reached for `base64.Error` under the
+/// VM would break the moment it was compiled.
+fn module_from_shim_hiding(
+    interp: &mut Interpreter,
+    name: &str,
+    source: &str,
+    hidden: &[&str],
+) -> Result<Value, Unwind> {
     let (members, env) = compile_shim(interp, source, Vec::new())?;
     let entries: Vec<(&str, Value)> = members
         .iter()
+        .filter(|(k, _)| !hidden.contains(&k.as_str()))
         .map(|(k, v)| (k.as_str(), v.clone()))
         .collect();
     Ok(make_module_env(name, entries, env))
@@ -2880,7 +2894,7 @@ pub fn resolve_module(interp: &mut Interpreter, name: &str) -> Result<Value, Unw
         "string" => module_from_shim(interp, "string", shims::STRING),
         "operator" => module_from_shim(interp, "operator", shims::OPERATOR),
         "bisect" => module_from_shim(interp, "bisect", shims::BISECT),
-        "base64" => module_from_shim(interp, "base64", shims::BASE64),
+        "base64" => module_from_shim_hiding(interp, "base64", shims::BASE64, &["Error"]),
         "csv" => module_from_shim(interp, "csv", shims::CSV),
         "pydantic" => Ok(make_pydantic_module()),
         // Typhon-runtime submodules — return the matching submodule so
@@ -4215,6 +4229,19 @@ fn fs_natives() -> Vec<(&'static str, Value)> {
                     )));
                 }
                 Ok(Value::List(Rc::new(RefCell::new(names))))
+            }),
+        ),
+        (
+            "_fs_umask",
+            nf("_fs_umask", |_i, args| {
+                let requested = args.first().and_then(|v| v.to_int().ok()).unwrap_or(0o022);
+                // `umask(2)` is a process-global setter with no failure mode:
+                // it always succeeds and hands back the mask it replaced.
+                #[cfg(unix)]
+                let previous = unsafe { libc::umask(requested as libc::mode_t) } as i64;
+                #[cfg(not(unix))]
+                let previous = 0o022;
+                Ok(Value::Int(VmInt::from(previous)))
             }),
         ),
         (

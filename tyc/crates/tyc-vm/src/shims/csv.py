@@ -101,6 +101,12 @@ class _Reader:
         n = len(line)
         while i < n:
             ch = line[i]
+            # `escapechar` takes the next character literally, inside a
+            # quoted field or out of one.
+            if d.escapechar is not None and ch == d.escapechar and i + 1 < n:
+                field.append(line[i + 1])
+                i += 2
+                continue
             if in_quotes:
                 if ch == d.quotechar:
                     if d.doublequote and i + 1 < n and line[i + 1] == d.quotechar:
@@ -113,7 +119,9 @@ class _Reader:
                 field.append(ch)
                 i += 1
                 continue
-            if ch == d.quotechar and d.quoting != QUOTE_NONE:
+            # A quote opens a quoted field only at the *start* of one:
+            # `ab"c,d` is two fields, the first holding a literal quote.
+            if ch == d.quotechar and d.quoting != QUOTE_NONE and not field:
                 in_quotes = True
                 quoted = True
                 i += 1
@@ -186,12 +194,27 @@ class _Writer:
             text = ""
         else:
             text = str(value)
+        special = [d.delimiter, d.quotechar, "\r", "\n"]
+        if d.escapechar is not None:
+            special.append(d.escapechar)
+        if d.quoting == QUOTE_NONE:
+            # No quoting is available, so a special character has to be
+            # escaped — and without an `escapechar` there is no way to write
+            # the row at all. CPython raises rather than corrupt the shape.
+            out = []
+            for ch in text:
+                if ch in special:
+                    if d.escapechar is None:
+                        raise Error("need to escape, but no escapechar set")
+                    out.append(d.escapechar)
+                out.append(ch)
+            return "".join(out)
         needs = False
         if d.quoting == QUOTE_ALL:
             needs = True
         elif d.quoting == QUOTE_NONNUMERIC:
             needs = not isinstance(value, (int, float)) or isinstance(value, bool)
-        elif d.quoting != QUOTE_NONE:
+        else:
             for ch in [d.delimiter, d.quotechar, "\r", "\n"]:
                 if ch in text:
                     needs = True
@@ -199,6 +222,9 @@ class _Writer:
             return text
         if d.doublequote:
             text = text.replace(d.quotechar, d.quotechar + d.quotechar)
+        elif d.escapechar is not None:
+            text = text.replace(d.escapechar, d.escapechar + d.escapechar)
+            text = text.replace(d.quotechar, d.escapechar + d.quotechar)
         return d.quotechar + text + d.quotechar
 
     def writerow(self, row):

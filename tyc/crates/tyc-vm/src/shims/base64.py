@@ -3,7 +3,9 @@
 
 class Error(ValueError):
     """What CPython's `base64` raises: `binascii.Error`, a `ValueError`
-    subclass, so `except ValueError` catches it either way."""
+    subclass, so `except ValueError` catches it either way. It is deliberately
+    *not* exported — CPython has no `base64.Error`, and a program leaning on
+    one under the VM would break as soon as it was compiled."""
 
 
 _B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -61,26 +63,58 @@ def _decode(data, alphabet, validate=False):
         if data.count("=") > 2 or ("=" in data and not data.endswith("=")):
             raise Error("Excess padding not allowed")
     else:
-        data = data.replace("\n", "").replace("\r", "")
-    stripped = data.rstrip("=")
-    if (len(data) % 4) != 0:
-        raise Error("Invalid base64-encoded string: number of data characters (%d) cannot be 1 more than a multiple of 4" % len(stripped))
+        # The permissive default discards *every* character outside the
+        # alphabet, not just the line breaks: a MIME payload may be wrapped
+        # with whatever whitespace its producer chose.
+        kept = []
+        for ch in data:
+            if ch in alphabet or ch == "=":
+                kept.append(ch)
+        data = "".join(kept)
     index = {}
     i = 0
     for ch in alphabet:
         index[ch] = i
         i += 1
+    # Decode in four-character quanta. A run of `=` closes the quantum in
+    # progress when it is long enough to complete it — and everything after
+    # that is ignored, exactly as CPython's decoder does.
     bits = 0
     nbits = 0
     out = []
-    for ch in stripped:
+    quad = 0
+    ndata = 0
+    i = 0
+    n = len(data)
+    while i < n:
+        ch = data[i]
+        if ch == "=":
+            if quad == 0:
+                i += 1
+                continue
+            run = 0
+            while i + run < n and data[i + run] == "=":
+                run += 1
+            if run < 4 - quad:
+                raise Error("Incorrect padding")
+            quad = 0
+            break
         if ch not in index:
             raise Error("Invalid base64-encoded string")
         bits = (bits << 6) | index[ch]
         nbits += 6
+        ndata += 1
+        quad += 1
+        if quad == 4:
+            quad = 0
         if nbits >= 8:
             nbits -= 8
             out.append((bits >> nbits) & 255)
+        i += 1
+    if quad == 1:
+        raise Error("Invalid base64-encoded string: number of data characters (%d) cannot be 1 more than a multiple of 4" % ndata)
+    if quad != 0:
+        raise Error("Incorrect padding")
     return bytes(out)
 
 

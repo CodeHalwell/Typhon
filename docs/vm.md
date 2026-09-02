@@ -151,9 +151,9 @@ since v1.0.0-beta.1 — before that each built an opaque instance, so
 | `shutil` (v1.0.0-beta.1) | `copy`, `copy2`, `copyfile`, `copytree`, `move`, `rmtree`, `which`, `disk_usage`, `SameFileError` |
 | `tempfile` (v1.0.0-beta.1) | `mkdtemp`, `mkstemp`, `gettempdir`, `NamedTemporaryFile`, `TemporaryDirectory`, `TemporaryFile` |
 | `glob` (v1.0.0-beta.1) | `glob`, `iglob`, `escape`, `has_magic` — the same matcher `pathlib.Path.glob` uses, including `**` |
-| `hashlib` (v1.0.0-beta.1) | `md5`, `sha1`, `sha224`, `sha256`, `sha384`, `sha512`, `blake2b`, `blake2s`, `new`, with `update` / `digest` / `hexdigest` / `copy` and the `digest_size` / `block_size` / `name` attributes |
+| `hashlib` (v1.0.0-beta.1) | `md5`, `sha1`, `sha224`, `sha256`, `sha384`, `sha512`, plus unkeyed `blake2b` / `blake2s` at their default digest sizes (a `key=` / `digest_size=` argument raises rather than returning a wrong digest), `new`, with `update` / `digest` / `hexdigest` / `copy` and the `digest_size` / `block_size` / `name` attributes |
 | `base64` (v1.0.0-beta.1) | `b64encode` / `b64decode` (incl. `altchars`), `urlsafe_*`, `standard_*`, `b32encode` / `b32decode`, `b16encode` / `b16decode`, `encodebytes` / `decodebytes` |
-| `csv` (v1.0.0-beta.1) | `reader`, `writer`, `DictReader`, `DictWriter`, the `QUOTE_*` policies, `excel` / `excel-tab` / `unix` dialects and `register_dialect`. Quoted fields spanning lines are parsed. No `Sniffer`, no `escapechar` escaping |
+| `csv` (v1.0.0-beta.1) | `reader`, `writer`, `DictReader`, `DictWriter`, the `QUOTE_*` policies, `excel` / `excel-tab` / `unix` dialects and `register_dialect`. Quoted fields spanning lines are parsed, and `escapechar` escapes on both sides — `QUOTE_NONE` raises `csv.Error` for a field it cannot write without one, as CPython does. No `Sniffer` |
 | `string` (v1.0.0-beta.1) | The constant tables (`ascii_letters`, `digits`, `punctuation`, …), `capwords`, `Template` (`substitute` / `safe_substitute`) |
 | `operator` (v1.0.0-beta.1) | The function forms of every operator plus `itemgetter`, `attrgetter`, `methodcaller`, `countOf`, `indexOf`, `length_hint` |
 | `bisect` (v1.0.0-beta.1) | `bisect_left`, `bisect_right`, `insort_left`, `insort_right` (and the `bisect` / `insort` aliases), with `lo` / `hi` / `key` |

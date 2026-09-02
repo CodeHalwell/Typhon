@@ -60,7 +60,7 @@ class bytearray:
 
     def __setitem__(self, index, value):
         if isinstance(index, slice):
-            self._data[index] = list(_iter_ints(value))
+            self._data[index] = _checked_bytes(value)
             return
         if not isinstance(value, int) or value < 0 or value > 255:
             raise ValueError("byte must be in range(0, 256)")
@@ -117,9 +117,11 @@ class bytearray:
         self._data.append(value)
 
     def extend(self, iterable):
-        self._data.extend(_iter_ints(iterable))
+        self._data.extend(_checked_bytes(iterable))
 
     def insert(self, index, value):
+        if not isinstance(value, int) or value < 0 or value > 255:
+            raise ValueError("byte must be in range(0, 256)")
         self._data.insert(index, value)
 
     def pop(self, index=-1):
@@ -216,3 +218,12 @@ def _iter_ints(value):
     if isinstance(value, int):
         raise TypeError("can't concat int to bytearray")
     return list(value)
+
+
+def _checked_bytes(value):
+    """`_iter_ints`, with the 0-255 invariant every mutator has to keep."""
+    out = _iter_ints(value)
+    for b in out:
+        if not isinstance(b, int) or b < 0 or b > 255:
+            raise ValueError("byte must be in range(0, 256)")
+    return out

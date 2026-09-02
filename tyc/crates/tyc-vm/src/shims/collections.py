@@ -442,6 +442,60 @@ class ChainMap(_MappingBase):
     def copy(self):
         return ChainMap(dict(self.maps[0]), *self.maps[1:])
 
+    # `_MappingBase`'s mutators all reach for `self._data`, which a ChainMap
+    # does not have: every one of them has to work on the first mapping.
+    def pop(self, key, *default):
+        if key not in self.maps[0]:
+            if default:
+                return default[0]
+            raise KeyError("Key not found in the first mapping: %r" % (key,))
+        value = self.maps[0][key]
+        del self.maps[0][key]
+        return value
+
+    def popitem(self):
+        try:
+            key = next(iter(self.maps[0]))
+        except StopIteration:
+            raise KeyError("No keys found in the first mapping.")
+        value = self.maps[0][key]
+        del self.maps[0][key]
+        return (key, value)
+
+    def setdefault(self, key, default=None):
+        m = self._lookup_map(key)
+        if m is not None:
+            return m[key]
+        self.maps[0][key] = default
+        return default
+
+    def clear(self):
+        self.maps[0].clear()
+
+    def update(self, other=None, **kwargs):
+        if other is not None:
+            if hasattr(other, "keys"):
+                for k in other.keys():
+                    self.maps[0][k] = other[k]
+            else:
+                for k, v in other:
+                    self.maps[0][k] = v
+        for k in kwargs:
+            self.maps[0][k] = kwargs[k]
+
+    def __or__(self, other):
+        merged = self._flat()
+        if hasattr(other, "keys"):
+            for k in other.keys():
+                merged[k] = other[k]
+        else:
+            return NotImplemented
+        return ChainMap(merged, *self.maps[1:])
+
+    def __ior__(self, other):
+        self.update(other)
+        return self
+
 
 class deque:
     def __init__(self, iterable=None, maxlen=None):

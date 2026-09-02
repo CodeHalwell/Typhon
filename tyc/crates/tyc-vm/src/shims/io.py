@@ -141,6 +141,7 @@ class _TextStream(TextIOBase):
         self._buf = ""
         self._pos = 0
         self._append = False
+        self._grows_on_truncate = False
         self._newline = newline
         # Line terminators `readline` recognises.
         if newline is None or newline == "":
@@ -191,6 +192,10 @@ class _TextStream(TextIOBase):
             raise TypeError(self._write_type_message % type(s).__name__)
         self._load()
         text = self._translate_out(s)
+        # Writing past end-of-file leaves a NUL-filled gap, not a shortened
+        # buffer: `seek(5)` then `write("X")` on `"abc"` gives `abc\0\0X`.
+        if self._pos > len(self._buf):
+            self._buf = self._buf + "\x00" * (self._pos - len(self._buf))
         if self._append:
             # An `O_APPEND` write always lands at end-of-file, whatever the
             # cursor says; a seek only moves where the next read starts.
@@ -233,7 +238,13 @@ class _TextStream(TextIOBase):
         self._load()
         if pos is None:
             pos = self._pos
-        self._buf = self._buf[:pos]
+        if pos > len(self._buf):
+            # A file grows with NULs; `StringIO` / `BytesIO` do not, and
+            # `_grows_on_truncate` is what tells them apart.
+            if self._grows_on_truncate:
+                self._buf = self._buf + "\x00" * (pos - len(self._buf))
+        else:
+            self._buf = self._buf[:pos]
         self._dirty = True
         return pos
 
@@ -287,6 +298,7 @@ class TextIOWrapper(_TextStream):
         self._raw = raw_bytes
         self._loaded = False
         self._dirty = dirty
+        self._grows_on_truncate = True
 
     def readable(self):
         return self._readable
@@ -340,10 +352,15 @@ class TextIOWrapper(_TextStream):
             self._dirty = False
 
     # CPython's text-file positions are byte offsets into the encoded file.
+    # A cursor past the end counts one byte per character of overhang: the
+    # gap a later write fills is NULs, which encode to one byte each.
     def tell(self):
         self._check_closed()
         self._load()
-        return len(self._buf[:self._pos].encode(self.encoding, self.errors))
+        overhang = self._pos - len(self._buf)
+        if overhang < 0:
+            overhang = 0
+        return len(self._buf[:self._pos].encode(self.encoding, self.errors)) + overhang
 
     def seek(self, offset, whence=0):
         self._check_closed()
@@ -353,6 +370,10 @@ class TextIOWrapper(_TextStream):
                 raise ValueError("negative seek position %r" % (offset,))
             encoded = self._buf.encode(self.encoding, self.errors)
             self._pos = len(encoded[:offset].decode(self.encoding, "ignore"))
+            if offset > len(encoded):
+                # Seeking past end-of-file is legal; the gap becomes NULs on
+                # the next write.
+                self._pos = self._pos + offset - len(encoded)
         elif whence == 1:
             if offset != 0:
                 raise UnsupportedOperation("can't do nonzero cur-relative seeks")
@@ -374,6 +395,7 @@ class _BytesStream(BufferedIOBase):
         self._buf = b""
         self._pos = 0
         self._append = False
+        self._grows_on_truncate = False
         self._dirty = False
 
     def readable(self):
@@ -420,6 +442,10 @@ class _BytesStream(BufferedIOBase):
         if not isinstance(data, bytes):
             raise TypeError("a bytes-like object is required, not '%s'" % type(data).__name__)
         self._load()
+        # Writing past end-of-file leaves a NUL-filled gap, not a shortened
+        # buffer: `seek(5)` then `write(b"X")` on `b"abc"` gives `abc\0\0X`.
+        if self._pos > len(self._buf):
+            self._buf = self._buf + b"\x00" * (self._pos - len(self._buf))
         # An `O_APPEND` write always lands at end-of-file, whatever the cursor
         # says. CPython's buffered layer still advances `tell()` from wherever
         # the cursor was until the next flush, so leave `_pos` alone.
@@ -456,7 +482,11 @@ class _BytesStream(BufferedIOBase):
         self._load()
         if pos is None:
             pos = self._pos
-        self._buf = self._buf[:pos]
+        if pos > len(self._buf):
+            if self._grows_on_truncate:
+                self._buf = self._buf + b"\x00" * (pos - len(self._buf))
+        else:
+            self._buf = self._buf[:pos]
         self._dirty = True
         return pos
 
@@ -493,6 +523,7 @@ class _BinaryFile(_BytesStream):
         self._buf = raw_bytes
         self._dirty = dirty
         self._kind = kind
+        self._grows_on_truncate = True
 
     def readable(self):
         return self._readable

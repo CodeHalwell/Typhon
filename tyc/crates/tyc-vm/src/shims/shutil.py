@@ -36,16 +36,29 @@ def copyfileobj(fsrc, fdst, length=0):
 def copyfile(src, dst, *, follow_symlinks=True):
     if _samefile(src, dst):
         raise SameFileError("%r and %r are the same file" % (str(src), str(dst)))
+    # `follow_symlinks=False` recreates the link rather than copying what it
+    # points at — otherwise a backup drags in files outside the tree.
+    if not follow_symlinks and os.path.islink(src):
+        if os.path.lexists(dst):
+            os.unlink(dst)
+        os.symlink(os.readlink(src), dst)
+        return dst
     _fs_copyfile(src, dst)
     return dst
 
 
 def copymode(src, dst, *, follow_symlinks=True):
+    # A symlink's own mode is not settable on Linux (there is no `lchmod`),
+    # so CPython silently does nothing here.
+    if not follow_symlinks and (os.path.islink(src) or os.path.islink(dst)):
+        return
     st = os.stat(src)
     os.chmod(dst, st.st_mode & 0o7777)
 
 
 def copystat(src, dst, *, follow_symlinks=True):
+    if not follow_symlinks and (os.path.islink(src) or os.path.islink(dst)):
+        return
     st = os.stat(src)
     os.chmod(dst, st.st_mode & 0o7777)
     # `copy2` is `copy` plus metadata, and the timestamps are the metadata
@@ -202,17 +215,19 @@ def move(src, dst, copy_function=copy2):
 def which(cmd, mode=os.X_OK, path=None):
     cmd = _fspath(cmd)
     if "/" in cmd:
-        return cmd if os.path.isfile(cmd) else None
+        # A path with a separator is used as given, but still has to pass the
+        # requested access check — `which("./data.txt")` is not a program.
+        if os.path.isfile(cmd) and os.access(cmd, mode):
+            return cmd
+        return None
     if path is None:
         path = os.environ.get("PATH", os.defpath)
     for d in path.split(os.pathsep):
         if not d:
             d = "."
         candidate = os.path.join(d, cmd)
-        if os.path.isfile(candidate):
-            st = os.stat(candidate)
-            if st.st_mode & 0o111:
-                return candidate
+        if os.path.isfile(candidate) and os.access(candidate, mode):
+            return candidate
     return None
 
 

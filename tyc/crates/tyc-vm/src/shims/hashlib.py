@@ -1,9 +1,11 @@
-# `hashlib` — the digests the VM models (md5, sha1, sha256, sha512), computed
-# natively by `_hash_digest`; sizes by `_hash_sizes`. Hash objects buffer
-# their input and digest on demand.
+# `hashlib` — the digests the VM models (md5, sha1, the SHA-2 family and the
+# unkeyed BLAKE2 pair), computed natively by `_hash_digest`; sizes by
+# `_hash_sizes`. Hash objects buffer their input and digest on demand.
 
-algorithms_guaranteed = {"md5", "sha1", "sha256", "sha512"}
-algorithms_available = {"md5", "sha1", "sha256", "sha512"}
+_ALGORITHMS = {"md5", "sha1", "sha224", "sha256", "sha384", "sha512",
+               "blake2b", "blake2s"}
+algorithms_guaranteed = _ALGORITHMS
+algorithms_available = _ALGORITHMS
 
 
 class _Hash:
@@ -66,3 +68,32 @@ def sha256(data=b"", *, usedforsecurity=True):
 
 def sha512(data=b"", *, usedforsecurity=True):
     return _Hash("sha512", data)
+
+
+def sha224(data=b"", *, usedforsecurity=True):
+    return _Hash("sha224", data)
+
+
+def sha384(data=b"", *, usedforsecurity=True):
+    return _Hash("sha384", data)
+
+
+def _blake2(name, data, digest_size, kwargs):
+    # The keyed and personalised forms need the parameter block the VM's
+    # compression does not take; say so rather than return a wrong digest.
+    for unsupported in ["key", "salt", "person", "fanout", "depth", "leaf_size",
+                        "node_offset", "node_depth", "inner_size", "last_node"]:
+        if kwargs.get(unsupported):
+            raise ValueError("%s is not supported by the Typhon VM's %s — use `tyc run --compile`"
+                             % (unsupported, name))
+    if digest_size is not None:
+        raise ValueError("digest_size is not supported by the Typhon VM's %s — use `tyc run --compile`" % name)
+    return _Hash(name, data)
+
+
+def blake2b(data=b"", *, digest_size=None, **kwargs):
+    return _blake2("blake2b", data, digest_size, kwargs)
+
+
+def blake2s(data=b"", *, digest_size=None, **kwargs):
+    return _blake2("blake2s", data, digest_size, kwargs)

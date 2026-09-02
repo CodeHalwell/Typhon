@@ -3,8 +3,12 @@
 # seeded in by the VM and the `open` builtin.
 
 
-def _fnmatch(name, pat):
-    # fnmatch on one path component: `*`, `?`, `[seq]`, `[!seq]`; case-sensitive.
+def _fnmatch(name, pat, case_sensitive=None):
+    # fnmatch on one path component: `*`, `?`, `[seq]`, `[!seq]`. Matching is
+    # case-sensitive unless the caller asked otherwise.
+    if case_sensitive is False:
+        name = name.lower()
+        pat = pat.lower()
     return _fnmatch_at(name, 0, pat, 0)
 
 
@@ -545,7 +549,7 @@ class Path(PurePosixPath):
             raise NotImplementedError("Non-relative patterns are unsupported")
         dirs_only = pattern.endswith("/")
         parts = [p for p in pattern.split("/") if p and p != "."]
-        return iter(list(self._glob_parts(parts, dirs_only)))
+        return iter(list(self._glob_parts(parts, dirs_only, case_sensitive, recurse_symlinks)))
 
     def rglob(self, pattern, *, case_sensitive=None, recurse_symlinks=False):
         if not isinstance(pattern, str):
@@ -554,9 +558,9 @@ class Path(PurePosixPath):
             raise NotImplementedError("Non-relative patterns are unsupported")
         dirs_only = pattern.endswith("/")
         parts = ["**"] + [p for p in pattern.split("/") if p and p != "."]
-        return iter(list(self._glob_parts(parts, dirs_only)))
+        return iter(list(self._glob_parts(parts, dirs_only, case_sensitive, recurse_symlinks)))
 
-    def _glob_parts(self, parts, dirs_only):
+    def _glob_parts(self, parts, dirs_only, case_sensitive=None, recurse_symlinks=False):
         if not parts:
             if dirs_only and not self.is_dir():
                 return
@@ -565,48 +569,52 @@ class Path(PurePosixPath):
         part = parts[0]
         rest = parts[1:]
         if part == "**":
-            for d in self._walk_all(rest, dirs_only):
+            for d in self._walk_all(rest, dirs_only, case_sensitive, recurse_symlinks):
                 yield d
             return
-        if _has_magic(part):
+        # A literal component also has to go through the matcher when the
+        # comparison is case-insensitive — `glob("ITEM.TXT", case_sensitive=
+        # False)` must find `item.txt`, which an exact child lookup cannot.
+        if _has_magic(part) or case_sensitive is False:
             for name in self._scandir_names():
-                if _fnmatch(name, part):
+                if _fnmatch(name, part, case_sensitive):
                     child = self._make_child(name)
                     if rest and not child.is_dir():
                         continue
-                    for r in child._glob_parts(rest, dirs_only):
+                    for r in child._glob_parts(rest, dirs_only, case_sensitive, recurse_symlinks):
                         yield r
         else:
             child = self._make_child(part)
             if rest:
                 if child.is_dir():
-                    for r in child._glob_parts(rest, dirs_only):
+                    for r in child._glob_parts(rest, dirs_only, case_sensitive, recurse_symlinks):
                         yield r
             elif os.path.lexists(child._str):
                 if dirs_only and not child.is_dir():
                     return
                 yield child
 
-    def _walk_all(self, rest, dirs_only):
+    def _walk_all(self, rest, dirs_only, case_sensitive=None, recurse_symlinks=False):
         # `**`: this directory and every directory below it, each continuing
         # with the rest of the pattern; a trailing `**` also yields files.
+        # A directory symlink is only descended into when the caller asks.
         if not rest:
             if self.is_dir():
                 yield self
             for name in self._scandir_names():
                 child = self._make_child(name)
-                if child.is_dir() and not child.is_symlink():
-                    for r in child._walk_all(rest, dirs_only):
+                if child.is_dir() and (recurse_symlinks or not child.is_symlink()):
+                    for r in child._walk_all(rest, dirs_only, case_sensitive, recurse_symlinks):
                         yield r
                 elif not dirs_only:
                     yield child
             return
-        for r in self._glob_parts(rest, dirs_only):
+        for r in self._glob_parts(rest, dirs_only, case_sensitive, recurse_symlinks):
             yield r
         for name in self._scandir_names():
             child = self._make_child(name)
-            if child.is_dir() and not child.is_symlink():
-                for r in child._walk_all(rest, dirs_only):
+            if child.is_dir() and (recurse_symlinks or not child.is_symlink()):
+                for r in child._walk_all(rest, dirs_only, case_sensitive, recurse_symlinks):
                     yield r
 
     def walk(self, top_down=True, on_error=None, follow_symlinks=False):
