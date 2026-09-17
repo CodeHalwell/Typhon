@@ -242,12 +242,20 @@ textarea:focus-visible,
   color: var(--sl-color-white);
 }
 
+.card:active,
+.sl-link-card:active {
+  transform: translateY(0) scale(0.99);
+  box-shadow: 0 2px 4px color-mix(in srgb, var(--sl-color-accent) 20%, transparent);
+}
+
 /* Respect user's motion preferences */
 @media (prefers-reduced-motion: reduce) {
   .card:hover,
   .card:focus-within,
+  .card:active,
   .sl-link-card:hover,
-  .sl-link-card:focus-within {
+  .sl-link-card:focus-within,
+  .sl-link-card:active {
     transform: none;
   }
   .card,
