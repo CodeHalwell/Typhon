@@ -66,3 +66,6 @@
 ## 2026-06-27 - [Disable transitions alongside animations for reduced motion]
 **Learning:** In CSS `@media (prefers-reduced-motion: reduce)` blocks, explicitly declaring `animation: none` on elements like `:target` does not inherently disable CSS transitions that might be applied to the same element.
 **Action:** Always declare `transition: none` alongside `animation: none` when respecting reduced motion preferences to fully disable all unintended animated states.
+## 2024-05-31 - [Tactile active states for elevated cards]
+**Learning:** Elevated UI elements like cards that rise on `:hover` feel unresponsive if they do not react to being clicked. Adding an `:active` state that physically depresses the element back down improves perceived performance and creates a more tactile interface.
+**Action:** Always pair elevated `:hover` states with depressed `:active` states on interactive cards, and ensure these new selectors are added to the reduced motion media query.
