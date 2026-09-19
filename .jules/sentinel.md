@@ -35,3 +35,11 @@
 **Vulnerability:** The secret scanner missed secrets followed by a lowercase letter (e.g. `dbPASSWORDString`), preventing successful identification of uppercase secrets within camel/Pascalcase text strings.
 **Learning:** When validating the end boundary of an embedded secret keyword, a transition from an uppercase character at the end of the secret word to a lowercase character in the identifier indicates a valid case-boundary.
 **Prevention:** Added logic to `end_ok` to verify if the string continues with a lowercase letter directly after the matched uppercase keyword sequence.
+## 2025-01-20 - [OAUTH_TOKEN Secret Keyword Added]
+**Vulnerability:** OAUTH_TOKEN and OAUTHTOKEN were not in the hardcoded secret detection list, allowing them to bypass `tyc::contains_secret_literal` warnings.
+**Learning:** Overlapping keywords must be carefully ordered in the single shared keyword table (`tyc_analyse::SECRET_NAME_KEYWORDS`) in strict longest-first ordering. `OAUTH_TOKEN` contains `AUTH_TOKEN`, so it must be evaluated first to ensure the exact matching of the whole keyword, preserving the accuracy of the secret detection and preventing less-specific suffixes from being reported, and preventing failures in the `secret_keyword_table_is_longest_first` unit test.
+**Prevention:** Add the new secret keywords in longest-first order and maintain the single shared table design to avoid logic drift.
+## 2025-01-20 - [OAUTH_TOKEN Secret Keyword Added]
+**Vulnerability:** OAUTH_TOKEN and OAUTHTOKEN were not in the hardcoded secret detection list, allowing them to bypass `tyc::contains_secret_literal` warnings.
+**Learning:** Overlapping keywords must be carefully ordered in the single shared keyword table (`tyc_analyse::SECRET_NAME_KEYWORDS`) in strict longest-first ordering. `OAUTH_TOKEN` contains `AUTH_TOKEN`, so it must be evaluated first to ensure the exact matching of the whole keyword, preserving the accuracy of the secret detection and preventing less-specific suffixes from being reported, and preventing failures in the `secret_keyword_table_is_longest_first` unit test.
+**Prevention:** Add the new secret keywords in longest-first order and maintain the single shared table design to avoid logic drift.
