@@ -5607,6 +5607,8 @@ pub const SECRET_NAME_KEYWORDS: &[&str] = &[
     "SECRETKEY",
     "ACCESS_TOKEN",
     "ACCESSTOKEN",
+    "OAUTH_TOKEN",
+    "OAUTHTOKEN",
     "AUTH_TOKEN",
     "AUTHTOKEN",
     "BEARER_TOKEN",

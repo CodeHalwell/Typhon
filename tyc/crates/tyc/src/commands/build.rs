@@ -5819,6 +5819,8 @@ let pet: Animal = Dog(name=\"Rex\")
         // on the PR that introduced this table entry).
         assert_eq!(secret_suffix("DB_PWD"), Some("DB_PWD"));
         assert_eq!(secret_suffix("JWTTOKEN"), Some("JWTTOKEN"));
+        assert_eq!(secret_suffix("OAUTH_TOKEN"), Some("OAUTH_TOKEN"));
+        assert_eq!(secret_suffix("OAUTHTOKEN"), Some("OAUTHTOKEN"));
     }
 
     #[test]
