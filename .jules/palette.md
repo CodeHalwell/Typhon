@@ -66,3 +66,7 @@
 ## 2026-06-27 - [Disable transitions alongside animations for reduced motion]
 **Learning:** In CSS `@media (prefers-reduced-motion: reduce)` blocks, explicitly declaring `animation: none` on elements like `:target` does not inherently disable CSS transitions that might be applied to the same element.
 **Action:** Always declare `transition: none` alongside `animation: none` when respecting reduced motion preferences to fully disable all unintended animated states.
+
+## 2024-05-18 - Added :active states for cards
+**Learning:** Starlight documentation theme cards (`.card`, `.sl-link-card`) had hover and focus-within states with a slight lift (`translateY(-2px)`) and a dropshadow, but no `:active` states. This lack of visual change during the interaction removes tactile feedback when clicking, creating a floaty, detached feel for users interacting via pointing devices. Additionally, any new transformations (such as `transform: translateY(0)`) needed to be excluded explicitly in `prefers-reduced-motion` media queries for accessibility.
+**Action:** Consistently added `.card:active` and `.sl-link-card:active` that removes the lift `translateY(0)` and decreases the drop-shadow, effectively visually simulating a button press. Registered these classes correctly inside `@media (prefers-reduced-motion: reduce)` with `transform: none` to respect a11y preferences.
