@@ -66,3 +66,6 @@
 ## 2026-06-27 - [Disable transitions alongside animations for reduced motion]
 **Learning:** In CSS `@media (prefers-reduced-motion: reduce)` blocks, explicitly declaring `animation: none` on elements like `:target` does not inherently disable CSS transitions that might be applied to the same element.
 **Action:** Always declare `transition: none` alongside `animation: none` when respecting reduced motion preferences to fully disable all unintended animated states.
+## 2026-06-29 - [Add tactile active state to interactive container elements]
+**Learning:** Interactive container elements like cards that rise on hover (`transform: translateY(-2px)`) can feel unresponsive during actual interaction. Adding an `:active` pseudo-class that pushes them back down (`transform: translateY(0)`) provides immediate, tactile feedback simulating a physical press.
+**Action:** Added `:active` states with reduced `translateY` and `box-shadow` to `.card` and `.sl-link-card`, and updated the `prefers-reduced-motion` block to explicitly disable this transform for accessibility.

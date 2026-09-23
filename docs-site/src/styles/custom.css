@@ -242,12 +242,21 @@ textarea:focus-visible,
   color: var(--sl-color-white);
 }
 
+/* UX: Add tactile active state to cards */
+.card:active,
+.sl-link-card:active {
+  transform: translateY(0);
+  box-shadow: 0 2px 6px color-mix(in srgb, var(--sl-color-accent) 20%, transparent);
+}
+
 /* Respect user's motion preferences */
 @media (prefers-reduced-motion: reduce) {
   .card:hover,
   .card:focus-within,
+  .card:active,
   .sl-link-card:hover,
-  .sl-link-card:focus-within {
+  .sl-link-card:focus-within,
+  .sl-link-card:active {
     transform: none;
   }
   .card,
