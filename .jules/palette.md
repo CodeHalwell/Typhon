@@ -66,3 +66,7 @@
 ## 2026-06-27 - [Disable transitions alongside animations for reduced motion]
 **Learning:** In CSS `@media (prefers-reduced-motion: reduce)` blocks, explicitly declaring `animation: none` on elements like `:target` does not inherently disable CSS transitions that might be applied to the same element.
 **Action:** Always declare `transition: none` alongside `animation: none` when respecting reduced motion preferences to fully disable all unintended animated states.
+
+## 2024-05-24 - Missing Interactive States on Link Cards
+**Learning:** Interactive components like `.sl-link-card` and `.card` in the Starlight/Astro design system often define `:hover` and `:focus-within` elevation effects (using `translateY` and `box-shadow`) but fail to include an `:active` state. This omission deprives users of critical tactile feedback during clicks, making the UI feel unresponsive.
+**Action:** Always check for corresponding `:active` styles when adding or modifying `:hover` and `:focus-within` transitions on clickable components, ensuring the element visually "depresses" (e.g., `translateY(0)` and reduced `box-shadow`) to confirm interaction, while also adding it to `prefers-reduced-motion` queries.
