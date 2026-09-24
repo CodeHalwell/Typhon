@@ -5818,6 +5818,8 @@ let pet: Animal = Dog(name=\"Rex\")
         // the loop reports the less-specific suffix first (P2 review catch
         // on the PR that introduced this table entry).
         assert_eq!(secret_suffix("DB_PWD"), Some("DB_PWD"));
+        assert_eq!(secret_suffix("OAUTH_TOKEN"), Some("OAUTH_TOKEN"));
+        assert_eq!(secret_suffix("OAUTHTOKEN"), Some("OAUTHTOKEN"));
         assert_eq!(secret_suffix("JWTTOKEN"), Some("JWTTOKEN"));
     }
 
