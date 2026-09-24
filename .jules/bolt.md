@@ -39,3 +39,6 @@
 ## 2024-06-25 - Avoid HashSet<String> for temporary AST bounds
 **Learning:** Checking for bindings and usages inside AST nodes to detect optimization candidates (e.g., `auto_gather.rs` `collect_run` and `collect_opportunity_run`) utilized `HashSet<String>`. Every encountered variable binding allocated a new String just to push it into the tracking set, even though the variables are locally scoped to the traversal.
 **Action:** Use `HashSet<&str>` using the exact AST nodes' string slice lifetime (`&'a [Stmt]`) instead of mapping or cloning strings. Avoid dropping the lifetime too early.
+## 2024-11-28 - Zero-Allocation AST Import Traversal (Extension)
+**Learning:** `collect_imported_modules` within `tyc-venv` allocated strings for every module import inside the source file using `extract_dotted_modules_from_import` and `HashSet<String>`.
+**Action:** By borrowing `&str` instead via `HashSet<&str>`, and only calling `.to_owned()` conditionally for the collected subset of modules, we avoid significant allocation overhead during the import parsing step.

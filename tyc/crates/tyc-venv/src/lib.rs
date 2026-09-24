@@ -1290,7 +1290,7 @@ fn arity_info_from_params(
 /// allow-list, so anything we wouldn't have introspected anyway is
 /// silently skipped.
 pub fn collect_imported_modules(paths: &[PathBuf]) -> Vec<String> {
-    let mut found: HashSet<String> = HashSet::new();
+    let mut found_owned: HashSet<String> = HashSet::new();
     for root in paths {
         let files = match collect_ty_files_for_scan(root) {
             Some(f) => f,
@@ -1300,6 +1300,7 @@ pub fn collect_imported_modules(paths: &[PathBuf]) -> Vec<String> {
             let Ok(text) = std::fs::read_to_string(&file) else {
                 continue;
             };
+            let mut found: HashSet<&str> = HashSet::new();
             for line in text.lines() {
                 let trimmed = line.trim_start();
                 if let Some(rest) = trimmed.strip_prefix("import ") {
@@ -1318,9 +1319,12 @@ pub fn collect_imported_modules(paths: &[PathBuf]) -> Vec<String> {
                     }
                 }
             }
+            for item in found {
+                found_owned.insert(item.to_owned());
+            }
         }
     }
-    let mut out: Vec<String> = found.into_iter().collect();
+    let mut out: Vec<String> = found_owned.into_iter().collect();
     out.sort();
     out
 }
@@ -1328,12 +1332,12 @@ pub fn collect_imported_modules(paths: &[PathBuf]) -> Vec<String> {
 /// Extract the leading dotted-name token from an `import` continuation
 /// like `"foo.bar as baz"` or `"foo.bar, qux.zap"`. All modules listed
 /// in a comma-separated import are collected.
-fn extract_dotted_modules_from_import(rest: &str, out: &mut HashSet<String>) {
+fn extract_dotted_modules_from_import<'a>(rest: &'a str, out: &mut HashSet<&'a str>) {
     for chunk in rest.split(',') {
         let chunk = chunk.trim();
         let token = chunk.split_whitespace().next().unwrap_or("");
         if !token.is_empty() && is_valid_dotted_name(token) {
-            out.insert(token.to_owned());
+            out.insert(token);
         }
     }
 }
@@ -1341,10 +1345,10 @@ fn extract_dotted_modules_from_import(rest: &str, out: &mut HashSet<String>) {
 /// Strip the leading dotted-name token off `s` and return it. Returns
 /// `None` when the first non-whitespace span isn't a valid dotted
 /// identifier (i.e. the line wasn't actually an import).
-fn first_dotted_token(s: &str) -> Option<String> {
+fn first_dotted_token(s: &str) -> Option<&str> {
     let token = s.split_whitespace().next()?;
     if is_valid_dotted_name(token) {
-        Some(token.to_owned())
+        Some(token)
     } else {
         None
     }
