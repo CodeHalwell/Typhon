@@ -66,3 +66,6 @@
 ## 2026-06-27 - [Disable transitions alongside animations for reduced motion]
 **Learning:** In CSS `@media (prefers-reduced-motion: reduce)` blocks, explicitly declaring `animation: none` on elements like `:target` does not inherently disable CSS transitions that might be applied to the same element.
 **Action:** Always declare `transition: none` alongside `animation: none` when respecting reduced motion preferences to fully disable all unintended animated states.
+## 2024-09-25 - [Tactile active states for card components]
+**Learning:** Container components with distinct hover elevations (like translating up and increasing shadow) feel disconnected if clicking them doesn't provide visual feedback. An `:active` state that grounds the element (translating back to 0) provides important tactile feedback.
+**Action:** Always pair `:hover` elevation transitions with `:active` grounding transitions on interactive cards, while ensuring both are correctly disabled for reduced-motion users.
