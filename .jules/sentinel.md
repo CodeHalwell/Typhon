@@ -35,3 +35,8 @@
 **Vulnerability:** The secret scanner missed secrets followed by a lowercase letter (e.g. `dbPASSWORDString`), preventing successful identification of uppercase secrets within camel/Pascalcase text strings.
 **Learning:** When validating the end boundary of an embedded secret keyword, a transition from an uppercase character at the end of the secret word to a lowercase character in the identifier indicates a valid case-boundary.
 **Prevention:** Added logic to `end_ok` to verify if the string continues with a lowercase letter directly after the matched uppercase keyword sequence.
+
+## 2026-08-16 - Ensure all permutations of high-risk security keywords are explicitly registered
+**Vulnerability:** A hardcoded secrets check (`contains_secret_literal`) failed to detect `OAUTH_TOKEN`, `REFRESH_TOKEN`, `SESSION_TOKEN`, and `WEBHOOK_SECRET` as secrets, despite catching `TOKEN` and `SECRET` in some contexts.
+**Learning:** Case-boundary heuristics and substring matching logic may miss fully capitalized squashed acronyms like `OAUTHTOKEN` or compound prefixes like `OAUTH_TOKEN` if they are not explicitly registered as standalone keywords and placed before their substrings, leading to potential false negatives for common secret variable names.
+**Prevention:** When updating or adding to the `tyc::contains_secret_literal` diagnostic (e.g., in `is_secret_name` or `secret_suffix`), explicitly register all common permutations of high-risk security keywords (like `OAUTH_TOKEN` and `OAUTHTOKEN`), as boundary heuristics cannot be fully relied upon to catch all variations, and ensure they precede their shorter substrings.
