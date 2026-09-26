@@ -5791,6 +5791,7 @@ let pet: Animal = Dog(name=\"Rex\")
         assert_eq!(secret_suffix("DATABASE_DSN"), Some("DSN"));
         assert_eq!(secret_suffix("SESSION_COOKIE"), Some("COOKIE"));
         assert_eq!(secret_suffix("SLACK_WEBHOOK_URL"), Some("WEBHOOK"));
+        assert_eq!(secret_suffix("MY_WEBHOOK_SECRET"), Some("WEBHOOK_SECRET"));
         assert_eq!(secret_suffix("AUTHORIZATION_BEARER"), Some("AUTHORIZATION"));
         assert_eq!(secret_suffix("MY_CREDENTIALS"), Some("CREDENTIALS"));
         assert_eq!(secret_suffix("AWS_CREDENTIAL"), Some("CREDENTIAL"));
@@ -5800,6 +5801,9 @@ let pet: Animal = Dog(name=\"Rex\")
         assert_eq!(secret_suffix("BEARER_TOKEN"), Some("BEARER_TOKEN"));
         assert_eq!(secret_suffix("CSRF_TOKEN"), Some("CSRF_TOKEN"));
         assert_eq!(secret_suffix("JWT_TOKEN"), Some("JWT_TOKEN"));
+        assert_eq!(secret_suffix("OAUTH_TOKEN"), Some("OAUTH_TOKEN"));
+        assert_eq!(secret_suffix("REFRESH_TOKEN"), Some("REFRESH_TOKEN"));
+        assert_eq!(secret_suffix("SESSION_TOKEN"), Some("SESSION_TOKEN"));
         assert_eq!(secret_suffix("PRIVATE_KEY"), Some("PRIVATE_KEY"));
         assert_eq!(secret_suffix("PUBLIC_KEY"), Some("PUBLIC_KEY"));
         assert_eq!(secret_suffix("APPSECRET"), Some("APPSECRET"));
