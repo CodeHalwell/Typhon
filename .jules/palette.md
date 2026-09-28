@@ -66,3 +66,7 @@
 ## 2026-06-27 - [Disable transitions alongside animations for reduced motion]
 **Learning:** In CSS `@media (prefers-reduced-motion: reduce)` blocks, explicitly declaring `animation: none` on elements like `:target` does not inherently disable CSS transitions that might be applied to the same element.
 **Action:** Always declare `transition: none` alongside `animation: none` when respecting reduced motion preferences to fully disable all unintended animated states.
+
+## 2024-05-18 - [Add tactile active states to cards]
+**Learning:** Providing an explicit `:active` pseudo-class with a slight scale-down (`scale(0.99)`) and reduced box-shadow on `.card` and `.sl-link-card` components adds crucial tactile feedback for mouse/touch users when interacting with Starlight grid cards. This prevents interactions from feeling "hollow" or unresponsive when a card is visually lifted on `:hover` but provides no feedback upon the actual click.
+**Action:** Always pair upward/lifting `:hover` transformations with matching compressive `:active` states for interactive card-like components, and explicitly neutralize them in `prefers-reduced-motion` media queries.
