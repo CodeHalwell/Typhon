@@ -66,3 +66,9 @@
 ## 2026-06-27 - [Disable transitions alongside animations for reduced motion]
 **Learning:** In CSS `@media (prefers-reduced-motion: reduce)` blocks, explicitly declaring `animation: none` on elements like `:target` does not inherently disable CSS transitions that might be applied to the same element.
 **Action:** Always declare `transition: none` alongside `animation: none` when respecting reduced motion preferences to fully disable all unintended animated states.
+## 2026-06-30 - [Tactile feedback for interactive container components]
+**Learning:** Container components with hover states (like Cards and LinkCards) lacked a pressed (`:active`) state. This lack of active state makes them feel unresponsive during the actual click interaction, breaking the physical metaphor established by the hover elevation.
+**Action:** Always pair elevated `:hover` states with a depressed `:active` state (e.g., `transform: translateY(0)`) to provide tactile feedback and complete the interaction loop. Ensure this active state is also disabled under `@media (prefers-reduced-motion: reduce)`.
+## 2026-06-30 - [Revert broken lockfile changes before submitting]
+**Learning:** Running `pnpm install` in the `docs-site/` workspace triggered an 800+ line update to `pnpm-lock.yaml`, despite not intentionally installing new dependencies. This was caused by the presence of a previously broken lockfile format which pnpm automatically attempted to resolve and re-write during the standard install process.
+**Action:** When working on UI patches, if a generic `pnpm install` dramatically mutates the lockfile, always run `git restore --staged docs-site/pnpm-lock.yaml && git checkout -- docs-site/pnpm-lock.yaml` to revert these unintended lockfile modifications and isolate the commit exclusively to the scoped UX code improvements.
