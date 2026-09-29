@@ -39,3 +39,7 @@
 ## 2024-06-25 - Avoid HashSet<String> for temporary AST bounds
 **Learning:** Checking for bindings and usages inside AST nodes to detect optimization candidates (e.g., `auto_gather.rs` `collect_run` and `collect_opportunity_run`) utilized `HashSet<String>`. Every encountered variable binding allocated a new String just to push it into the tracking set, even though the variables are locally scoped to the traversal.
 **Action:** Use `HashSet<&str>` using the exact AST nodes' string slice lifetime (`&'a [Stmt]`) instead of mapping or cloning strings. Avoid dropping the lifetime too early.
+
+## 2024-11-28 - Zero-Allocation `module_class_names` in desugar
+**Learning:** Building sets of module-level classes using `HashSet<String>` required cloning strings during the AST desugaring pass, creating unnecessary memory pressure.
+**Action:** Using `HashSet<&str>` to track `module_class_names` and `exception_class_names` avoids heap allocations entirely, improving compiler performance in hot paths.
