@@ -5,14 +5,14 @@ from .text import describe
 
 
 pub class Catalogue:
-    shapes: dict[int, Shape]
+    shapes: dict[ShapeId, Shape]
     next_id: int = 1
 
 
 impl Catalogue:
     def add(self, shape: Shape) -> ShapeId:
         let sid: ShapeId = ShapeId(self.next_id)
-        self.shapes[self.next_id] = shape
+        self.shapes[sid] = shape
         self.next_id = self.next_id + 1
         return sid
 

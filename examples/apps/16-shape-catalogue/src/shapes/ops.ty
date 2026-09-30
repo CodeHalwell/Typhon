@@ -10,6 +10,7 @@ pub def area(s: Shape) -> float:
         case Tri(a, b, c):
             let p: float = (a + b + c) / 2.0
             return (p * (p - a) * (p - b) * (p - c)) ** 0.5
+    raise RuntimeError("unreachable")
 
 
 pub def kind_of(s: Shape) -> Kind:
@@ -20,6 +21,7 @@ pub def kind_of(s: Shape) -> Kind:
             return Kind.BOXY
         case Tri(_, _, _):
             return Kind.POINTY
+    raise RuntimeError("unreachable")
 
 
 pub def scale(s: Shape, k: float) -> Shape:
@@ -30,3 +32,4 @@ pub def scale(s: Shape, k: float) -> Shape:
             return Rect(w=w * k, h=h * k)
         case Tri(a, b, c):
             return Tri(a=a * k, b=b * k, c=c * k)
+    raise RuntimeError("unreachable")
