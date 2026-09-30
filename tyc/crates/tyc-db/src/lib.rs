@@ -511,6 +511,34 @@ pub fn check_source_file(db: &mut TycDatabase, source_file: SourceFile) -> Diagn
 /// stops there. Returns an empty [`ModuleShapes`] on any parse error
 /// — the real diagnostic surfaces when the file is checked for real.
 pub fn extract_shapes_for_path(_path: &str, text: &str) -> ModuleShapes {
+    match parse_for_shapes(text) {
+        Some((prep, module)) => shapes_of(&prep, &module),
+        None => ModuleShapes::default(),
+    }
+}
+
+/// [`extract_shapes_for_path`] plus the module's
+/// [`tyc_analyse::TypeFacts`] — the declared field and return types the
+/// `extend BUILTIN:` call-site rewrite consults for imported names —
+/// from the same preprocess + parse. `tyc build` uses this for its
+/// project-wide pre-pass so the rewrite sees `post.title` on an imported
+/// `Post`, or `make()` on an imported function, as the built-in it was
+/// declared to be. Both halves are empty on a parse error.
+pub fn extract_shapes_and_facts_for_path(
+    _path: &str,
+    text: &str,
+) -> (ModuleShapes, tyc_analyse::TypeFacts) {
+    match parse_for_shapes(text) {
+        Some((prep, module)) => {
+            let facts = tyc_analyse::collect_module_type_facts(&module);
+            (shapes_of(&prep, &module), facts)
+        }
+        None => (ModuleShapes::default(), tyc_analyse::TypeFacts::default()),
+    }
+}
+
+/// The preprocess + parse front-end shared by the shape extractors.
+fn parse_for_shapes(text: &str) -> Option<(PreprocessResult, tyc_syntax::ast::ModModule)> {
     let expanded = expand_question_ops(&expand_inline_question_ops(
         &expand_compound_question_headers(&expand_pipes(&expand_with_chains(&expand_go_calls(
             &expand_gather_blocks(&expand_multiline_guards(&expand_lazy_lets(
@@ -519,11 +547,12 @@ pub fn extract_shapes_for_path(_path: &str, text: &str) -> ModuleShapes {
         )))),
     ));
     let prep = preprocess(&expanded);
-    let module = match parse_module(&prep.python_source) {
-        Ok(p) => p.into_syntax(),
-        Err(_) => return ModuleShapes::default(),
-    };
-    let mut shapes = extract_module_shapes(&module);
+    let module = parse_module(&prep.python_source).ok()?.into_syntax();
+    Some((prep, module))
+}
+
+fn shapes_of(prep: &PreprocessResult, module: &tyc_syntax::ast::ModModule) -> ModuleShapes {
+    let mut shapes = extract_module_shapes(module);
     // Frozen-ness is preprocessor line-based (the `frozen` modifier is
     // stripped before parsing), so it isn't visible to the AST-only
     // `extract_module_shapes`. Fill it in here where the preprocess
