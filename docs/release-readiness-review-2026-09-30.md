@@ -486,3 +486,90 @@ lexical mask, semantics never inferred from surface text) have visibly been
 followed; this review's equivalent is **one receiver-typing path** — every
 `.attr` / `.method()` / `[i]` should go through the same nullable and
 union check regardless of the receiver's syntactic shape.
+
+## 9. Follow-up — remediation on the same branch
+
+Everything above was actioned on this branch after the review was written;
+this section records what changed, what the review got wrong, and what is
+deliberately left for the maintainer. The changelog's *third wave* entry
+carries the user-facing prose.
+
+### 9.1 Status of each finding
+
+| § | Finding | Outcome |
+|---|---|---|
+| 2 | `RUSTSEC-2026-0308` in salsa | Fixed — salsa 0.28.5; `cargo deny` green. |
+| 3.1 | Nullable call / subscript receivers | Fixed — every receiver shape reports; always-`None` receivers get their own wording. |
+| 3.2 | `with`-chain bindings untyped | Fixed — the chain body and `else` binding are typed; `{err}` inside a multi-line f-string is renamed (a lexical-mask bug: the f-prefix did not travel across physical lines). |
+| 3.3 | Member access on a union | Fixed — member access and subscripts on `type` aliases, parameters and builtin unions report; a member every variant has is fine. |
+| 3.4 | `nonlocal` write does not invalidate | Fixed — also writes through an alias and calls taking the narrowed object. |
+| 3.5 | Arity through a `Callable` | Fixed — the annotation's parameters are all required; `*args` / `**kwargs` exempt (a first version broke `add(*args)` in the stress corpus). |
+| 3.6 | `await` on a non-awaitable | Fixed for provably sync same-module calls and literals. **Narrower than proposed:** the checker types an un-awaited `async def` call as its declared return, so a bare name, a `Callable` call or an *imported* function stays permissive (a first version rejected `await run_crawl(...)` in four example apps). Tracked in `TYPE_SYSTEM_FRONTIER.md`. |
+| 3.7 | Comparisons unchecked | Fixed — orderings, `in`, and union subscripts; `==` / `is` and mixed numerics never reported; a class with the dunder is trusted. |
+| 3.8 | Re-confirmed 2026-09-01 holes | Fixed: subclass field redeclaration, positional-only by keyword, `for` over a non-iterable, undeclared slot writes, transitive `go`. Not fixed, by design: tuple-unpack arity on a fixed tuple, `int ** negative`, incompatible override (warn), use-after-`del` (warn) — documented limits. |
+| 3.9 | Warn-level defaults | `nullable-use` defaults to `"error"`. This is the one deliberate narrowing on programs that ran; it is the alpha.7 plan, and it only became honest once the `and`-chain false positive (below) was fixed. |
+| 4.1 | Relative imports break exhaustiveness | Fixed — `tyc-db` canonicalises the import against the importing package. |
+| 4.2 | Facade `newtype` does not widen | Fixed — see 9.2. |
+| 4.3 | `missing_return` on `try`/`for`/`while`-`else` | Fixed. |
+| 4.4 | Smaller | All fixed: `ClassVar` split, `lazy let` lowering, constants-namespace lint on `class!` and inheriting subclasses, bare generic annotations. |
+| 4.5 | Variance inference does not reach `impl` | Fixed — `impl[T]` methods and `frozen` fields (`tuple[T, ...]`) are observed; `@covariant` / `@contravariant` are stripped from emitted Python for top-level classes too. |
+| 4.6 | Diagnostic completeness across modules | Root cause corrected — see 9.2. |
+| 5 | `extend BUILTIN` receivers | Fixed on both surfaces, including package submodules and imported modules' own call sites under `tyc run`. |
+| 6 | VM ↔ CPython | See 9.4. |
+| 7 | Perf-gate flap, secret keywords, lockfile | Slack 10 ms; `OAUTH_*` keywords; lockfile refresh deferred (9.3). |
+
+Along the way the stress corpus surfaced three more false positives that
+the new checks would have turned into errors, all fixed before landing:
+`if b is not None and b.val is not None: b.val + 1` did not narrow through
+the `and` chain (the fp25 / t18 probes, previously warn-level);
+`case int() as n` bound `n` to the whole subject union; and `add(*args)`
+through a value callable was arity-counted. Every example project checks
+clean; the only corpus units that flip to *rejected* are stress probes that
+crash at runtime (`h*`, `s*`, `n*`, `t20`, and `fp25c`, whose
+`len(a.b.c or [])` raises for a non-zero `c`), and eight previously
+rejected units now check (`for`/`try`-`else`, the complex `match`, the
+recursive alias, the with-chain f-string, fp25 / fp25a / t18).
+
+### 9.2 Correction to §4.6
+
+§4.6 attributed the missing `frozen_assign` through a facade to an
+error-gated cross-module pass. That was wrong. The `pub *` aggregation
+(`aggregate_pub_star_shapes` → `merge_pub_visible`) merged classes,
+functions, interfaces and sealed unions but **dropped `newtypes`,
+`frozen_classes`, `enums`, `type_aliases`, `class_param_variance`,
+`gatherable_async_fns` and `hkt_param_names`**, so a facade-imported
+frozen class was not frozen and a facade-imported newtype was a plain
+class — which is also the whole of §4.2. The "only when the module has no
+other error" observation was a coincidence of the probes used. The merge
+now carries every table (HKT names unfiltered, as they are not exported
+names), with a unit test, and `examples/apps/16-shape-catalogue` covers the
+facade, the relative imports and the re-exported `newtype` / `frozen` /
+`enum` end to end on both surfaces.
+
+### 9.3 Left for the maintainer
+
+- **Lockfile refresh.** A semver-compatible `cargo update` pulls 98
+  packages and adds the ICU segmenter crates; that is a dependency-wave
+  decision (licence review, the vendored Ruff build), not a release fix.
+- **Version bump and tag.** Nothing here bumps the workspace version;
+  `v1.0.0-beta.1` is the maintainer's call, per §8.
+- **Syntax freeze, compatibility policy, bot-PR backlog** (§8, item 8).
+- **An extension does not travel through a `pub *` facade.** `from
+  catalogue import describe` sees `describe` but not the `extend str`
+  declared beside it; `from catalogue.text import describe` does. The new
+  app documents the rule; carrying registries through facades is a small
+  follow-up in `aggregate_pub_star_shapes`.
+- **Coroutine-typed calls** (frontier): the un-awaited-coroutine typing
+  that limits §3.6, and `make().slug()` on an `async def make`.
+
+### 9.4 VM parity
+
+The VM findings of §6 were worked in parallel (import `pkg.sub` binding,
+multi-iterable `map`, missing module attributes, `await` / `go` errors,
+the attribute-level pre-run scan) and merged after this section was
+written; the changelog's third-wave entry is the record. The
+extension-lowering gap that surfaced while building the new app — an
+extension declared in a package submodule, or called inside an imported
+module, raised `AttributeError` under `tyc run` only — is fixed and
+covered by a pipeline test.
+
