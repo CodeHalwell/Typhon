@@ -121,3 +121,104 @@ def singledispatch(func):
     wrapper.registry = registry
     wrapper.__wrapped__ = func
     return wrapper
+
+
+# ── update_wrapper / partialmethod / singledispatchmethod ───────────────────
+
+WRAPPER_ASSIGNMENTS = ('__module__', '__name__', '__qualname__', '__doc__',
+                       '__annotations__', '__type_params__')
+WRAPPER_UPDATES = ('__dict__',)
+
+
+def update_wrapper(wrapper, wrapped, assigned=WRAPPER_ASSIGNMENTS, updated=WRAPPER_UPDATES):
+    """Copy `wrapped`'s identity onto `wrapper` and record `__wrapped__`."""
+    for attr in assigned:
+        try:
+            value = getattr(wrapped, attr)
+        except AttributeError:
+            pass
+        else:
+            setattr(wrapper, attr, value)
+    for attr in updated:
+        try:
+            getattr(wrapper, attr).update(getattr(wrapped, attr, {}))
+        except AttributeError:
+            pass
+    wrapper.__wrapped__ = wrapped
+    return wrapper
+
+
+class partialmethod:
+    """`partial` as a method descriptor: the receiver is bound first, then
+    the captured positional arguments, then the call's own."""
+
+    def __init__(self, func, /, *args, **keywords):
+        if not callable(func) and not hasattr(func, "__get__"):
+            raise TypeError("{!r} is not callable or a descriptor".format(func))
+        if isinstance(func, partialmethod):
+            self.func = func.func
+            self.args = func.args + args
+            self.keywords = {**func.keywords, **keywords}
+        else:
+            self.func = func
+            self.args = args
+            self.keywords = keywords
+
+    def __repr__(self):
+        cls = type(self)
+        parts = [repr(self.func)]
+        parts.extend(repr(a) for a in self.args)
+        parts.extend("{}={!r}".format(k, v) for k, v in self.keywords.items())
+        return "{}.{}({})".format(cls.__module__, cls.__qualname__, ", ".join(parts))
+
+    def _make_unbound_method(self):
+        def _method(cls_or_self, /, *args, **keywords):
+            keywords = {**self.keywords, **keywords}
+            return self.func(cls_or_self, *self.args, *args, **keywords)
+        _method.__isabstractmethod__ = self.__isabstractmethod__
+        _method.__partialmethod__ = self
+        return _method
+
+    def __get__(self, obj, cls=None):
+        if obj is None:
+            return self._make_unbound_method()
+        # `partial` is a native of the assembled module, not a name of this
+        # shim's own namespace, so reach it through the module.
+        from functools import partial
+        return partial(self._make_unbound_method(), obj)
+
+    @property
+    def __isabstractmethod__(self):
+        return getattr(self.func, "__isabstractmethod__", False)
+
+
+class singledispatchmethod:
+    """`singledispatch` on a method: dispatch on the first argument *after*
+    the receiver."""
+
+    def __init__(self, func):
+        if not callable(func) and not hasattr(func, "__get__"):
+            raise TypeError("{!r} is not callable or a descriptor".format(func))
+        self.dispatcher = singledispatch(func)
+        self.func = func
+
+    def register(self, cls, method=None):
+        return self.dispatcher.register(cls, method)
+
+    def __get__(self, obj, cls=None):
+        dispatcher = self.dispatcher
+
+        def _method(*args, **kwargs):
+            method = dispatcher.dispatch(type(args[0]))
+            if obj is None:
+                return method(*args, **kwargs)
+            return method(obj, *args, **kwargs)
+
+        _method.__isabstractmethod__ = self.__isabstractmethod__
+        _method.register = self.register
+        update_wrapper(_method, self.func)
+        return _method
+
+    @property
+    def __isabstractmethod__(self):
+        return getattr(self.func, "__isabstractmethod__", False)

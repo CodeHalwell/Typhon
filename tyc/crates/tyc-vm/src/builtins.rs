@@ -706,9 +706,7 @@ pub fn install(interp: &mut Interpreter) {
                 }
             }
             Some(Value::Module(m)) => {
-                for k in m.members.borrow().keys() {
-                    names.insert(k.clone());
-                }
+                names.extend(module_dir_names(m));
             }
             Some(Value::Class(c)) => {
                 for k in c.methods.borrow().keys() {
@@ -1196,14 +1194,29 @@ pub fn install(interp: &mut Interpreter) {
 
     native!("map", |i, mut args| {
         if args.len() < 2 {
-            return Err(type_error("map() requires at least 2 arguments"));
+            return Err(type_error("map() must have at least two arguments."));
         }
         let func = args.remove(0);
-        let inner = i.make_iter(args.remove(0))?;
+        // `map(f, xs, ys, …)` calls `f(x, y, …)` and stops at the shortest
+        // iterable — exactly `zip`'s contract, so the extra iterables ride
+        // on a zip and each tuple is spread over `f`'s parameters.
+        let star = args.len() > 1;
+        let inner = if star {
+            let mut inners = Vec::with_capacity(args.len());
+            for a in args {
+                if let Value::Iter(it) = i.make_iter(a)? {
+                    inners.push(it);
+                }
+            }
+            Value::Iter(Rc::new(RefCell::new(IterState::Zip { inners })))
+        } else {
+            i.make_iter(args.remove(0))?
+        };
         if let Value::Iter(it) = inner {
             Ok(Value::Iter(Rc::new(RefCell::new(IterState::Map {
                 func,
                 inner: it,
+                star,
             }))))
         } else {
             unreachable!()
@@ -2418,6 +2431,7 @@ mod shims {
     pub const BYTEARRAY: &str = include_str!("shims/bytearray.py");
     pub const LAZY: &str = include_str!("shims/lazy.py");
     pub const TYPEPARAMS: &str = include_str!("shims/typeparams.py");
+    pub const HEAPQ_EXTRA: &str = include_str!("shims/heapq_extra.py");
 }
 
 fn compile_helpers(interp: &mut Interpreter, source: &str) -> Result<Vec<(String, Value)>, Unwind> {
@@ -2885,7 +2899,7 @@ pub fn resolve_module(interp: &mut Interpreter, name: &str) -> Result<Value, Unw
         "dataclasses" => Ok(make_dataclasses_module()),
         "pathlib" => make_pathlib_module(interp),
         "datetime" => make_datetime_module(interp),
-        "heapq" => Ok(make_heapq_module()),
+        "heapq" => make_heapq_module(interp),
         "contextlib" => Ok(make_contextlib_module(interp)),
         // `from __future__ import annotations` (and friends): CPython's
         // compiler consumes the statement, and the module only has to carry
@@ -2927,6 +2941,23 @@ pub fn resolve_module(interp: &mut Interpreter, name: &str) -> Result<Value, Unw
     }
 }
 
+/// The names `dir(module)` lists: the namespace snapshot, the live namespace
+/// of a module the VM executed (a global its functions rebound later), and
+/// the one name `get_attr` synthesises on read (`sys.modules`). The same
+/// set backs [`crate::modelled_module_exports`], so `tyc run`'s pre-run scan
+/// and `dir()` cannot disagree about what a module exposes.
+pub(crate) fn module_dir_names(m: &Module) -> std::collections::BTreeSet<String> {
+    let mut names: std::collections::BTreeSet<String> =
+        m.members.borrow().keys().cloned().collect();
+    if let Some(env) = &m.env {
+        names.extend(env.snapshot().into_iter().map(|(k, _)| k));
+    }
+    if m.name == "sys" {
+        names.insert("modules".to_owned());
+    }
+    names
+}
+
 fn make_module(name: &str, entries: Vec<(&str, Value)>) -> Value {
     let mut map = HashMap::new();
     for (k, v) in entries {
@@ -2958,6 +2989,29 @@ fn nf(
     f: impl Fn(&mut Interpreter, Vec<Value>) -> Result<Value, Unwind> + 'static,
 ) -> Value {
     Value::Native(Rc::new(NativeFn::new(name, f)))
+}
+
+/// [`nf`] for a native whose CPython counterpart is a coroutine function —
+/// see [`NativeFn::awaitable`].
+fn nf_awaitable(
+    name: &'static str,
+    f: impl Fn(&mut Interpreter, Vec<Value>) -> Result<Value, Unwind> + 'static,
+) -> Value {
+    Value::Native(Rc::new(NativeFn::new_awaitable(name, f)))
+}
+
+/// CPython's `asyncio.create_task` (and so `typhon_runtime.tasks.spawn`,
+/// the `go` lowering) needs a running event loop. The VM's is the dynamic
+/// extent of `asyncio.run`; outside it the call raises exactly as CPython
+/// does, instead of silently forcing the coroutine.
+fn require_running_loop(interp: &Interpreter) -> Result<(), Unwind> {
+    if interp.running_loop_depth == 0 {
+        return Err(Unwind::Exception(crate::error::VmException::new(
+            "RuntimeError",
+            "no running event loop",
+        )));
+    }
+    Ok(())
 }
 
 /// Native backing for the `try_result(thunk[, on_err])` exception→Result
@@ -3023,6 +3077,11 @@ fn make_typhon_runtime_module(interp: &Interpreter) -> Value {
         vec![(
             "spawn",
             nf("spawn", |i, args| {
+                // CPython's `spawn` is `asyncio.create_task`, which needs a
+                // running loop: a `go` reached from sync code outside
+                // `asyncio.run` raises there, and the coroutine never runs.
+                // The VM used to force it silently.
+                require_running_loop(i)?;
                 // Sequential "spawn": force the coroutine now (a bare
                 // callable is invoked, matching the old behaviour) and
                 // wrap the result so `go f(x) -> task; await task` works.
@@ -3686,8 +3745,846 @@ fn make_math_module() -> Value {
                     Ok(Value::Int(VmInt::from(bigint_perm(n, k)?)))
                 }),
             ),
+            // ── hyperbolics, inverse hyperbolics, cbrt, exp2 ──────────────────
+            // All libm on both sides, so bit-identical to the host CPython.
+            (
+                "sinh",
+                nf("sinh", |_i, args| {
+                    let x = math_arg(single(&args, "sinh")?)?;
+                    math_1(x, libm_sinh(x), true)
+                }),
+            ),
+            (
+                "cosh",
+                nf("cosh", |_i, args| {
+                    let x = math_arg(single(&args, "cosh")?)?;
+                    math_1(x, libm_cosh(x), true)
+                }),
+            ),
+            (
+                "tanh",
+                nf("tanh", |_i, args| {
+                    let x = math_arg(single(&args, "tanh")?)?;
+                    math_1(x, libm_tanh(x), false)
+                }),
+            ),
+            (
+                "asinh",
+                nf("asinh", |_i, args| {
+                    let x = math_arg(single(&args, "asinh")?)?;
+                    math_1(x, libm_asinh(x), false)
+                }),
+            ),
+            (
+                "acosh",
+                nf("acosh", |_i, args| {
+                    let x = math_arg(single(&args, "acosh")?)?;
+                    math_1(x, libm_acosh(x), false)
+                }),
+            ),
+            (
+                "atanh",
+                nf("atanh", |_i, args| {
+                    let x = math_arg(single(&args, "atanh")?)?;
+                    math_1(x, libm_atanh(x), false)
+                }),
+            ),
+            (
+                "cbrt",
+                nf("cbrt", |_i, args| {
+                    let x = math_arg(single(&args, "cbrt")?)?;
+                    math_1(x, libm_cbrt(x), false)
+                }),
+            ),
+            (
+                "exp2",
+                nf("exp2", |_i, args| {
+                    let x = math_arg(single(&args, "exp2")?)?;
+                    math_1(x, libm_exp2(x), true)
+                }),
+            ),
+            // ── erf / erfc / gamma / lgamma ──────────────────────────────────
+            // CPython 3.12+ takes `erf` / `erfc` from libm (no domain checks),
+            // but keeps its own Lanczos `gamma` / `lgamma` — ported in
+            // `math_tgamma` / `math_lgamma` so the last bit agrees.
+            (
+                "erf",
+                nf("erf", |_i, args| {
+                    let x = math_arg(single(&args, "erf")?)?;
+                    Ok(Value::Float(libm_erf(x)))
+                }),
+            ),
+            (
+                "erfc",
+                nf("erfc", |_i, args| {
+                    let x = math_arg(single(&args, "erfc")?)?;
+                    Ok(Value::Float(libm_erfc(x)))
+                }),
+            ),
+            (
+                "gamma",
+                nf("gamma", |_i, args| {
+                    let x = math_arg(single(&args, "gamma")?)?;
+                    math_special(x, math_tgamma(x))
+                }),
+            ),
+            (
+                "lgamma",
+                nf("lgamma", |_i, args| {
+                    let x = math_arg(single(&args, "lgamma")?)?;
+                    math_special(x, math_lgamma(x))
+                }),
+            ),
+            // ── fma / frexp / ldexp / modf / nextafter / ulp ─────────────────
+            (
+                "fma",
+                nf("fma", |_i, args| {
+                    if args.len() != 3 {
+                        return Err(type_error(format!(
+                            "fma expected 3 arguments, got {}",
+                            args.len()
+                        )));
+                    }
+                    let x = math_arg(&args[0])?;
+                    let y = math_arg(&args[1])?;
+                    let z = math_arg(&args[2])?;
+                    let r = x.mul_add(y, z);
+                    if r.is_nan() && !x.is_nan() && !y.is_nan() && !z.is_nan() {
+                        return Err(value_error("invalid operation in fma"));
+                    }
+                    if r.is_infinite() && x.is_finite() && y.is_finite() && z.is_finite() {
+                        return Err(Unwind::Exception(crate::error::VmException::new(
+                            "OverflowError",
+                            "overflow in fma",
+                        )));
+                    }
+                    Ok(Value::Float(r))
+                }),
+            ),
+            (
+                "frexp",
+                nf("frexp", |_i, args| {
+                    let x = math_arg(single(&args, "frexp")?)?;
+                    let (m, e) = math_frexp(x);
+                    Ok(Value::Tuple(Rc::new(vec![
+                        Value::Float(m),
+                        Value::Int(VmInt::from(e)),
+                    ])))
+                }),
+            ),
+            (
+                "ldexp",
+                nf("ldexp", |_i, args| {
+                    if args.len() != 2 {
+                        return Err(type_error(format!(
+                            "ldexp expected 2 arguments, got {}",
+                            args.len()
+                        )));
+                    }
+                    let x = math_arg(&args[0])?;
+                    let exp = match &args[1] {
+                        Value::Int(n) => n.to_bigint(),
+                        Value::Bool(b) => num_bigint::BigInt::from(*b as i64),
+                        _ => {
+                            return Err(type_error("Expected an int as second argument to ldexp."))
+                        }
+                    };
+                    math_ldexp(x, &exp)
+                }),
+            ),
+            (
+                "modf",
+                nf("modf", |_i, args| {
+                    let x = math_arg(single(&args, "modf")?)?;
+                    let (frac, int) = if x.is_nan() {
+                        (x, x)
+                    } else if x.is_infinite() {
+                        (0.0f64.copysign(x), x)
+                    } else {
+                        let int = x.trunc();
+                        ((x - int).copysign(x), int)
+                    };
+                    Ok(Value::Tuple(Rc::new(vec![
+                        Value::Float(frac),
+                        Value::Float(int),
+                    ])))
+                }),
+            ),
+            (
+                "nextafter",
+                nf("nextafter", |_i, args| {
+                    let (pos, kwargs) = split_kwargs(&args);
+                    if pos.len() != 2 {
+                        return Err(type_error(format!(
+                            "nextafter expected 2 arguments, got {}",
+                            pos.len()
+                        )));
+                    }
+                    let x = math_arg(&pos[0])?;
+                    let y = math_arg(&pos[1])?;
+                    let mut steps: Option<num_bigint::BigInt> = None;
+                    for (k, v) in &kwargs {
+                        if k != "steps" {
+                            return Err(type_error(format!(
+                                "nextafter() got an unexpected keyword argument '{k}'"
+                            )));
+                        }
+                        steps = match v {
+                            Value::None => None,
+                            Value::Int(n) => Some(n.to_bigint()),
+                            Value::Bool(b) => Some(num_bigint::BigInt::from(*b as i64)),
+                            other => {
+                                return Err(type_error(format!(
+                                    "'{}' object cannot be interpreted as an integer",
+                                    other.type_name()
+                                )))
+                            }
+                        };
+                    }
+                    let Some(steps) = steps else {
+                        return Ok(Value::Float(math_nextafter(x, y, 1, true)));
+                    };
+                    if steps.sign() == num_bigint::Sign::Minus {
+                        return Err(value_error("steps must be a non-negative integer"));
+                    }
+                    let steps = u64::try_from(steps).unwrap_or(u64::MAX);
+                    Ok(Value::Float(math_nextafter(x, y, steps, false)))
+                }),
+            ),
+            (
+                "ulp",
+                nf("ulp", |_i, args| {
+                    let x = math_arg(single(&args, "ulp")?)?;
+                    if x.is_nan() {
+                        return Ok(Value::Float(x));
+                    }
+                    let x = x.abs();
+                    if x.is_infinite() {
+                        return Ok(Value::Float(x));
+                    }
+                    let up = x.next_up();
+                    if up.is_infinite() {
+                        // The largest finite float: measure downwards.
+                        return Ok(Value::Float(x - x.next_down()));
+                    }
+                    Ok(Value::Float(up - x))
+                }),
+            ),
+            // ── isclose / sumprod ────────────────────────────────────────────
+            (
+                "isclose",
+                nf("isclose", |_i, args| {
+                    let (pos, kwargs) = split_kwargs(&args);
+                    if pos.len() != 2 {
+                        return Err(type_error(format!(
+                            "isclose() takes exactly 2 positional arguments ({} given)",
+                            pos.len()
+                        )));
+                    }
+                    let a = math_arg(&pos[0])?;
+                    let b = math_arg(&pos[1])?;
+                    let mut rel_tol = 1e-09;
+                    let mut abs_tol = 0.0;
+                    for (k, v) in &kwargs {
+                        match k.as_str() {
+                            "rel_tol" => rel_tol = math_arg(v)?,
+                            "abs_tol" => abs_tol = math_arg(v)?,
+                            _ => {
+                                return Err(type_error(format!(
+                                    "isclose() got an unexpected keyword argument '{k}'"
+                                )))
+                            }
+                        }
+                    }
+                    if rel_tol < 0.0 || abs_tol < 0.0 {
+                        return Err(value_error("tolerances must be non-negative"));
+                    }
+                    if a == b {
+                        return Ok(Value::Bool(true));
+                    }
+                    if a.is_infinite() || b.is_infinite() {
+                        return Ok(Value::Bool(false));
+                    }
+                    let diff = (b - a).abs();
+                    Ok(Value::Bool(
+                        diff <= (rel_tol * b).abs()
+                            || diff <= (rel_tol * a).abs()
+                            || diff <= abs_tol,
+                    ))
+                }),
+            ),
+            (
+                "sumprod",
+                nf("sumprod", |i, args| {
+                    if args.len() != 2 {
+                        return Err(type_error(format!(
+                            "sumprod expected 2 arguments, got {}",
+                            args.len()
+                        )));
+                    }
+                    math_sumprod(i, args[0].clone(), args[1].clone())
+                }),
+            ),
         ],
     )
+}
+
+// The host C math library, which CPython's `math` module calls for these
+// names. Rust's std has no stable `erf`, and its own `cbrt` is a pure-Rust
+// port that rounds differently from glibc's (`cbrt(27.0)`: `3.0` against
+// CPython's `3.0000000000000004`), so every libm-backed name goes through
+// the same functions CPython uses — std links the C library on every
+// supported target — and the results agree bit for bit with the host.
+unsafe extern "C" {
+    #[link_name = "erf"]
+    fn c_erf(x: f64) -> f64;
+    #[link_name = "erfc"]
+    fn c_erfc(x: f64) -> f64;
+    #[link_name = "sinh"]
+    fn c_sinh(x: f64) -> f64;
+    #[link_name = "cosh"]
+    fn c_cosh(x: f64) -> f64;
+    #[link_name = "tanh"]
+    fn c_tanh(x: f64) -> f64;
+    #[link_name = "asinh"]
+    fn c_asinh(x: f64) -> f64;
+    #[link_name = "acosh"]
+    fn c_acosh(x: f64) -> f64;
+    #[link_name = "atanh"]
+    fn c_atanh(x: f64) -> f64;
+    #[link_name = "cbrt"]
+    fn c_cbrt(x: f64) -> f64;
+    #[link_name = "exp2"]
+    fn c_exp2(x: f64) -> f64;
+}
+
+/// The host C library's `name` (a `double(double)` function), or the
+/// symbol the binary linked when there is nothing beyond it to find (a
+/// static binary, a non-unix host).
+///
+/// Rust's `compiler_builtins` carries its own copies of some of these
+/// (`cbrt` today, as a local symbol that wins at link time), so a plain
+/// `extern "C"` call can land on an implementation CPython does not use.
+/// `RTLD_NEXT` skips this binary and finds the shared library after it —
+/// the libm CPython links.
+#[cfg(unix)]
+fn host_libm(
+    name: &'static std::ffi::CStr,
+    linked: unsafe extern "C" fn(f64) -> f64,
+) -> unsafe extern "C" fn(f64) -> f64 {
+    // SAFETY: `dlsym` on a valid NUL-terminated name; the symbol found is
+    // the C library's `double(double)` function of that name, the exact
+    // signature transmuted to.
+    let sym = unsafe { libc::dlsym(libc::RTLD_NEXT, name.as_ptr()) };
+    if sym.is_null() {
+        linked
+    } else {
+        unsafe { std::mem::transmute::<*mut libc::c_void, unsafe extern "C" fn(f64) -> f64>(sym) }
+    }
+}
+
+#[cfg(not(unix))]
+fn host_libm(
+    _name: &'static std::ffi::CStr,
+    linked: unsafe extern "C" fn(f64) -> f64,
+) -> unsafe extern "C" fn(f64) -> f64 {
+    linked
+}
+
+/// A Rust wrapper over the host libm's `$c_name`, resolved once.
+macro_rules! host_math_fn {
+    ($fn_name:ident, $c_name:literal, $linked:ident) => {
+        fn $fn_name(x: f64) -> f64 {
+            static RESOLVED: std::sync::OnceLock<unsafe extern "C" fn(f64) -> f64> =
+                std::sync::OnceLock::new();
+            let f = *RESOLVED.get_or_init(|| host_libm($c_name, $linked));
+            // SAFETY: a pure function of one `f64` — no pointers, no global
+            // state.
+            unsafe { f(x) }
+        }
+    };
+}
+
+host_math_fn!(libm_erf, c"erf", c_erf);
+host_math_fn!(libm_erfc, c"erfc", c_erfc);
+host_math_fn!(libm_sinh, c"sinh", c_sinh);
+host_math_fn!(libm_cosh, c"cosh", c_cosh);
+host_math_fn!(libm_tanh, c"tanh", c_tanh);
+host_math_fn!(libm_asinh, c"asinh", c_asinh);
+host_math_fn!(libm_acosh, c"acosh", c_acosh);
+host_math_fn!(libm_atanh, c"atanh", c_atanh);
+host_math_fn!(libm_cbrt, c"cbrt", c_cbrt);
+host_math_fn!(libm_exp2, c"exp2", c_exp2);
+
+/// What CPython's `m_tgamma` / `m_lgamma` report through `errno`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MathErr {
+    None,
+    Domain,
+    Range,
+}
+
+/// Turn a special-function result plus its `errno` into a value or CPython's
+/// exception: a NaN from a non-NaN argument or a domain flag is
+/// `ValueError("math domain error")`; an infinity from a finite argument (or
+/// a range flag) is `OverflowError("math range error")`.
+fn math_special(x: f64, result: (f64, MathErr)) -> Result<Value, Unwind> {
+    let (r, err) = result;
+    if (r.is_nan() && !x.is_nan()) || (err == MathErr::Domain && x.is_finite()) {
+        return Err(value_error("math domain error"));
+    }
+    if err == MathErr::Domain {
+        // `gamma(-inf)`: a domain error on an infinite argument.
+        return Err(value_error("math domain error"));
+    }
+    if (r.is_infinite() && x.is_finite()) || err == MathErr::Range {
+        return Err(Unwind::Exception(crate::error::VmException::new(
+            "OverflowError",
+            "math range error",
+        )));
+    }
+    Ok(Value::Float(r))
+}
+
+// CPython's Lanczos approximation (Modules/mathmodule.c), constants and
+// evaluation order included, so `math.gamma` / `math.lgamma` round the same.
+const LANCZOS_N: usize = 13;
+// The constants below are CPython's own literals, kept verbatim (they
+// round to the same doubles) so the port can be checked against its source.
+#[allow(clippy::excessive_precision)]
+const LANCZOS_G: f64 = 6.024680040776729583740234375;
+#[allow(clippy::excessive_precision)]
+const LANCZOS_G_MINUS_HALF: f64 = 5.524680040776729583740234375;
+#[allow(clippy::excessive_precision)]
+const LANCZOS_NUM_COEFFS: [f64; LANCZOS_N] = [
+    23531376880.410759688572007674451636754734846804940,
+    42919803642.649098768957899047001988850926355848959,
+    35711959237.355668049440185451547166705960488635843,
+    17921034426.037209699919755754458931112671403265390,
+    6039542586.3520280050642916443072979210699388420708,
+    1439720407.3117216736632230727949123939715485786772,
+    248874557.86205415651146038641322942321632125127801,
+    31426415.585400194380614231628318205362874684987640,
+    2876370.6289353724412254090516208496135991145378768,
+    186056.26539522349504029498971604569928220784236328,
+    8071.6720023658162106380029022722506138218516325024,
+    210.82427775157934587250973392071336271166969580291,
+    2.5066282746310002701649081771338373386264310793408,
+];
+const LANCZOS_DEN_COEFFS: [f64; LANCZOS_N] = [
+    0.0,
+    39916800.0,
+    120543840.0,
+    150917976.0,
+    105258076.0,
+    45995730.0,
+    13339535.0,
+    2637558.0,
+    357423.0,
+    32670.0,
+    1925.0,
+    66.0,
+    1.0,
+];
+const NGAMMA_INTEGRAL: usize = 23;
+const GAMMA_INTEGRAL: [f64; NGAMMA_INTEGRAL] = [
+    1.0,
+    1.0,
+    2.0,
+    6.0,
+    24.0,
+    120.0,
+    720.0,
+    5040.0,
+    40320.0,
+    362880.0,
+    3628800.0,
+    39916800.0,
+    479001600.0,
+    6227020800.0,
+    87178291200.0,
+    1307674368000.0,
+    20922789888000.0,
+    355687428096000.0,
+    6402373705728000.0,
+    121645100408832000.0,
+    2432902008176640000.0,
+    51090942171709440000.0,
+    1124000727777607680000.0,
+];
+#[allow(clippy::excessive_precision)]
+const MATH_LOGPI: f64 = 1.144729885849400174143427351353058711647;
+
+fn lanczos_sum(x: f64) -> f64 {
+    let mut num = 0.0;
+    let mut den = 0.0;
+    if x < 5.0 {
+        for i in (0..LANCZOS_N).rev() {
+            num = num * x + LANCZOS_NUM_COEFFS[i];
+            den = den * x + LANCZOS_DEN_COEFFS[i];
+        }
+    } else {
+        for i in 0..LANCZOS_N {
+            num = num / x + LANCZOS_NUM_COEFFS[i];
+            den = den / x + LANCZOS_DEN_COEFFS[i];
+        }
+    }
+    num / den
+}
+
+/// `sin(pi * x)`, accurate near integers (CPython's `m_sinpi`).
+fn math_sinpi(x: f64) -> f64 {
+    let y = x.abs() % 2.0;
+    let n = (2.0 * y).round() as i64;
+    let r = match n {
+        0 => (std::f64::consts::PI * y).sin(),
+        1 => (std::f64::consts::PI * (y - 0.5)).cos(),
+        2 => (std::f64::consts::PI * (1.0 - y)).sin(),
+        3 => -(std::f64::consts::PI * (y - 1.5)).cos(),
+        _ => (std::f64::consts::PI * (y - 2.0)).sin(),
+    };
+    1.0f64.copysign(x) * r
+}
+
+/// CPython's `m_tgamma`.
+fn math_tgamma(x: f64) -> (f64, MathErr) {
+    if !x.is_finite() {
+        if x.is_nan() || x > 0.0 {
+            return (x, MathErr::None);
+        }
+        return (f64::NAN, MathErr::Domain);
+    }
+    if x == 0.0 {
+        return (f64::INFINITY.copysign(x), MathErr::Domain);
+    }
+    if x == x.floor() {
+        if x < 0.0 {
+            return (f64::NAN, MathErr::Domain);
+        }
+        if x <= NGAMMA_INTEGRAL as f64 {
+            return (GAMMA_INTEGRAL[x as usize - 1], MathErr::None);
+        }
+    }
+    let absx = x.abs();
+    if absx < 1e-20 {
+        let r = 1.0 / x;
+        return (
+            r,
+            if r.is_infinite() {
+                MathErr::Range
+            } else {
+                MathErr::None
+            },
+        );
+    }
+    if absx > 200.0 {
+        if x < 0.0 {
+            return (0.0 / math_sinpi(x), MathErr::None);
+        }
+        return (f64::INFINITY, MathErr::Range);
+    }
+    let y = absx + LANCZOS_G_MINUS_HALF;
+    let z = if absx > LANCZOS_G_MINUS_HALF {
+        let q = y - absx;
+        q - LANCZOS_G_MINUS_HALF
+    } else {
+        let q = y - LANCZOS_G_MINUS_HALF;
+        q - absx
+    };
+    let z = z * LANCZOS_G / y;
+    let mut r;
+    if x < 0.0 {
+        r = -std::f64::consts::PI / math_sinpi(absx) / absx * y.exp() / lanczos_sum(absx);
+        r -= z * r;
+        if absx < 140.0 {
+            r /= y.powf(absx - 0.5);
+        } else {
+            let sqrtpow = y.powf(absx / 2.0 - 0.25);
+            r /= sqrtpow;
+            r /= sqrtpow;
+        }
+    } else {
+        r = lanczos_sum(absx) / y.exp();
+        r += z * r;
+        if absx < 140.0 {
+            r *= y.powf(absx - 0.5);
+        } else {
+            let sqrtpow = y.powf(absx / 2.0 - 0.25);
+            r *= sqrtpow;
+            r *= sqrtpow;
+        }
+    }
+    (
+        r,
+        if r.is_infinite() {
+            MathErr::Range
+        } else {
+            MathErr::None
+        },
+    )
+}
+
+/// CPython's `m_lgamma`.
+fn math_lgamma(x: f64) -> (f64, MathErr) {
+    if !x.is_finite() {
+        if x.is_nan() {
+            return (x, MathErr::None);
+        }
+        return (f64::INFINITY, MathErr::None);
+    }
+    if x == x.floor() && x <= 2.0 {
+        if x <= 0.0 {
+            return (f64::INFINITY, MathErr::Domain);
+        }
+        return (0.0, MathErr::None);
+    }
+    let absx = x.abs();
+    if absx < 1e-20 {
+        return (-absx.ln(), MathErr::None);
+    }
+    let mut r = lanczos_sum(absx).ln() - LANCZOS_G;
+    r += (absx - 0.5) * ((absx + LANCZOS_G - 0.5).ln() - 1.0);
+    if x < 0.0 {
+        r = MATH_LOGPI - math_sinpi(absx).abs().ln() - absx.ln() - r;
+    }
+    (
+        r,
+        if r.is_infinite() {
+            MathErr::Range
+        } else {
+            MathErr::None
+        },
+    )
+}
+
+/// C `frexp`: `x == m * 2**e` with `0.5 <= |m| < 1`; zeros, infinities and
+/// NaN come back unchanged with exponent 0.
+fn math_frexp(x: f64) -> (f64, i64) {
+    if x == 0.0 || !x.is_finite() {
+        return (x, 0);
+    }
+    let bits = x.to_bits();
+    let exp_field = ((bits >> 52) & 0x7ff) as i64;
+    if exp_field == 0 {
+        // Subnormal: scale into the normal range first (exact).
+        let (m, e) = math_frexp(x * (1u64 << 54) as f64);
+        return (m, e - 54);
+    }
+    let sign = bits & (1 << 63);
+    let mantissa = bits & ((1 << 52) - 1);
+    (
+        f64::from_bits(sign | (1022u64 << 52) | mantissa),
+        exp_field - 1022,
+    )
+}
+
+/// C `ldexp` with CPython's range handling: an exponent past `INT_MAX`
+/// overflows, one below `INT_MIN` underflows to a signed zero, and an
+/// infinite result from a finite `x` is `OverflowError`.
+fn math_ldexp(x: f64, exp: &num_bigint::BigInt) -> Result<Value, Unwind> {
+    use num_traits::{Signed, ToPrimitive};
+    let range_error = || {
+        Unwind::Exception(crate::error::VmException::new(
+            "OverflowError",
+            "math range error",
+        ))
+    };
+    if x == 0.0 || !x.is_finite() {
+        return Ok(Value::Float(x));
+    }
+    let Some(exp) = exp.to_i64() else {
+        return if exp.is_negative() {
+            Ok(Value::Float(0.0f64.copysign(x)))
+        } else {
+            Err(range_error())
+        };
+    };
+    if exp > i32::MAX as i64 {
+        return Err(range_error());
+    }
+    if exp < i32::MIN as i64 {
+        return Ok(Value::Float(0.0f64.copysign(x)));
+    }
+    // Scale in chunks so a legitimate result is never lost to an
+    // intermediate overflow or underflow of the power-of-two factor.
+    let mut r = x;
+    let mut remaining: i64 = exp;
+    while remaining != 0 && r != 0.0 && r.is_finite() {
+        let step = remaining.clamp(-1022, 1023);
+        r *= f64::from_bits(((1023 + step) as u64) << 52);
+        remaining -= step;
+    }
+    if r.is_infinite() {
+        return Err(range_error());
+    }
+    Ok(Value::Float(r))
+}
+
+/// `nextafter(x, y[, steps])`. With `to_y_when_equal` (the two-argument
+/// form) an equal pair yields `y` itself, which is how C's `nextafter`
+/// distinguishes the zeros.
+fn math_nextafter(x: f64, y: f64, steps: u64, to_y_when_equal: bool) -> f64 {
+    if x.is_nan() {
+        return x;
+    }
+    if y.is_nan() {
+        return y;
+    }
+    if steps == 0 {
+        return x;
+    }
+    if x == y {
+        return if to_y_when_equal { y } else { x };
+    }
+    // Floats in the same order as their bit patterns, signed: consecutive
+    // keys are adjacent floats, and both zeros sit at key 0.
+    fn key(f: f64) -> i64 {
+        let bits = f.to_bits();
+        if bits >> 63 == 1 {
+            -((bits & !(1u64 << 63)) as i64)
+        } else {
+            bits as i64
+        }
+    }
+    fn from_key(k: i64) -> f64 {
+        if k < 0 {
+            f64::from_bits((-k) as u64 | (1u64 << 63))
+        } else {
+            f64::from_bits(k as u64)
+        }
+    }
+    let (kx, ky) = (key(x), key(y));
+    let distance = ky.abs_diff(kx);
+    if steps >= distance {
+        return y;
+    }
+    let steps = steps as i64;
+    from_key(if ky > kx { kx + steps } else { kx - steps })
+}
+
+/// CPython's `math.sumprod`: exact integer accumulation while both
+/// operands are ints, an extended-precision (`TripleLength`) float
+/// accumulator while both are floats or an int and a float, and the plain
+/// `total + p * q` path for anything else — with the running totals folded
+/// into `total` at exactly the points CPython folds them, so the rounding
+/// of the result matches.
+fn math_sumprod(interp: &mut Interpreter, p: Value, q: Value) -> Result<Value, Unwind> {
+    use ruff_python_ast::Operator;
+    #[derive(Clone, Copy)]
+    struct Triple {
+        hi: f64,
+        lo: f64,
+        tiny: f64,
+    }
+    fn dl_sum(a: f64, b: f64) -> (f64, f64) {
+        let x = a + b;
+        let z = x - a;
+        let y = (a - (x - z)) + (b - z);
+        (x, y)
+    }
+    fn dl_mul(x: f64, y: f64) -> (f64, f64) {
+        let z = x * y;
+        (z, x.mul_add(y, -z))
+    }
+    fn tl_fma(x: f64, y: f64, total: Triple) -> Triple {
+        let (pr_hi, pr_lo) = dl_mul(x, y);
+        let (sm_hi, sm_lo) = dl_sum(total.hi, pr_hi);
+        let (r1_hi, r1_lo) = dl_sum(total.lo, pr_lo);
+        let (r2_hi, r2_lo) = dl_sum(r1_hi, sm_lo);
+        Triple {
+            hi: sm_hi,
+            lo: r2_hi,
+            tiny: total.tiny + r1_lo + r2_lo,
+        }
+    }
+    fn tl_to_d(total: Triple) -> f64 {
+        let (last_hi, last_lo) = dl_sum(total.lo, total.hi);
+        total.tiny + last_lo + last_hi
+    }
+    /// The float value of an int operand on the float path, or `None` when
+    /// it is too large for a double (CPython then leaves the float path).
+    fn int_as_double(n: &VmInt) -> Option<f64> {
+        let f = n.to_f64();
+        f.is_finite().then_some(f)
+    }
+
+    let p_it = interp.make_iter(p)?;
+    let q_it = interp.make_iter(q)?;
+    let mut total = Value::Int(VmInt::from(0));
+    let mut int_path_enabled = true;
+    let mut int_total: i64 = 0;
+    let mut int_total_in_use = false;
+    let mut flt_path_enabled = true;
+    let mut flt_total = Triple {
+        hi: 0.0,
+        lo: 0.0,
+        tiny: 0.0,
+    };
+    let mut flt_total_in_use = false;
+    loop {
+        let p_i = interp.iter_next(&p_it)?;
+        let q_i = interp.iter_next(&q_it)?;
+        let (p_i, q_i) = match (p_i, q_i) {
+            (None, None) => break,
+            (Some(p_i), Some(q_i)) => (p_i, q_i),
+            _ => return Err(value_error("Inputs are not the same length")),
+        };
+        if int_path_enabled {
+            let ints = match (&p_i, &q_i) {
+                (Value::Int(a), Value::Int(b)) => a
+                    .to_i64()
+                    .zip(b.to_i64())
+                    .and_then(|(a, b)| a.checked_mul(b))
+                    .and_then(|prod| int_total.checked_add(prod)),
+                _ => None,
+            };
+            if let Some(new_total) = ints {
+                int_total = new_total;
+                int_total_in_use = true;
+                continue;
+            }
+            // Finished, overflowed, or a non-int: fold and leave the path.
+            int_path_enabled = false;
+            if int_total_in_use {
+                total = interp.binop(&total, Operator::Add, &Value::Int(VmInt::from(int_total)))?;
+                int_total = 0;
+                int_total_in_use = false;
+            }
+        }
+        if flt_path_enabled {
+            let pair = match (&p_i, &q_i) {
+                (Value::Float(a), Value::Float(b)) => Some((*a, *b)),
+                (Value::Float(a), Value::Int(b)) => int_as_double(b).map(|b| (*a, b)),
+                (Value::Int(a), Value::Float(b)) => int_as_double(a).map(|a| (a, *b)),
+                _ => None,
+            };
+            let folded = pair.map(|(a, b)| tl_fma(a, b, flt_total));
+            if let Some(new_total) = folded.filter(|t| t.hi.is_finite()) {
+                flt_total = new_total;
+                flt_total_in_use = true;
+                continue;
+            }
+            flt_path_enabled = false;
+            if flt_total_in_use {
+                total = interp.binop(&total, Operator::Add, &Value::Float(tl_to_d(flt_total)))?;
+                flt_total = Triple {
+                    hi: 0.0,
+                    lo: 0.0,
+                    tiny: 0.0,
+                };
+                flt_total_in_use = false;
+            }
+        }
+        let term = interp.binop(&p_i, Operator::Mult, &q_i)?;
+        total = interp.binop(&total, Operator::Add, &term)?;
+    }
+    if int_total_in_use {
+        total = interp.binop(&total, Operator::Add, &Value::Int(VmInt::from(int_total)))?;
+    }
+    if flt_total_in_use {
+        total = interp.binop(&total, Operator::Add, &Value::Float(tl_to_d(flt_total)))?;
+    }
+    Ok(total)
 }
 
 // ── Filesystem natives shared by the `os` / `io` / `pathlib` / `shutil` /
@@ -5632,6 +6529,37 @@ fn make_hashlib_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
             }),
         ),
     ];
+    let mut natives = natives;
+    natives.push((
+        "_hash_pbkdf2",
+        nf("_hash_pbkdf2", |_i, args| {
+            // (hash_name, password, salt, iterations, dklen) — the shim has
+            // already validated types and ranges the way CPython reports them.
+            let name = name_arg(args.first())?;
+            let bytes_at = |i: usize| match args.get(i) {
+                Some(Value::Bytes(b)) => Ok(b.clone()),
+                _ => Err(type_error("a bytes-like object is required")),
+            };
+            let password = bytes_at(1)?;
+            let salt = bytes_at(2)?;
+            let iterations = match args.get(3) {
+                Some(Value::Int(n)) => n.to_bigint(),
+                _ => return Err(type_error("iterations must be an int")),
+            };
+            let iterations = u64::try_from(iterations)
+                .map_err(|_| value_error("iteration value is too great."))?;
+            let dklen = match args.get(4) {
+                Some(Value::Int(n)) => Some(
+                    usize::try_from(n.to_bigint())
+                        .map_err(|_| value_error("key length is too great."))?,
+                ),
+                _ => None,
+            };
+            crate::hashes::pbkdf2_hmac(&name, &password, &salt, iterations, dklen)
+                .map(|d| Value::Bytes(Rc::new(d)))
+                .ok_or_else(|| value_error(format!("unsupported hash type {name}")))
+        }),
+    ));
     let members = compile_helpers_seeded(interp, shims::HASHLIB, natives)?;
     let entries: Vec<(&str, Value)> = members
         .iter()
@@ -5818,7 +6746,6 @@ fn make_typing_module() -> Value {
 /// (only the named methods above work), and lookaheads/lookbehinds
 /// (Rust's `regex` is a finite-automaton engine that rejects them).
 fn make_re_module() -> Value {
-    use crate::value::Class;
     // Compile a Python-shaped pattern into a Rust regex by rewriting
     // `(?P<name>` to `(?<name>`. The `(?P=name)` back-reference form is
     // left as-is so the Rust engine rejects it with a legible error —
@@ -5826,9 +6753,22 @@ fn make_re_module() -> Value {
     fn to_rust_pattern(p: &str) -> String {
         p.replace("(?P<", "(?<")
     }
-    fn compile_one(p: &str) -> Result<regex::Regex, Unwind> {
-        regex::Regex::new(&to_rust_pattern(p))
-            .map_err(|e| value_error(format!("invalid regex: {e}")))
+    // `flags` are the `re.I` / `re.M` / `re.S` / `re.X` bits, spelled as the
+    // inline group the Rust engine understands. `ASCII` / `UNICODE` /
+    // `LOCALE` / `DEBUG` are accepted and have no effect here.
+    fn compile_one(p: &str, flags: i64) -> Result<regex::Regex, Unwind> {
+        let mut inline = String::new();
+        for (bit, letter) in [(2, 'i'), (8, 'm'), (16, 's'), (64, 'x')] {
+            if flags & bit != 0 {
+                inline.push(letter);
+            }
+        }
+        let source = if inline.is_empty() {
+            to_rust_pattern(p)
+        } else {
+            format!("(?{inline}){}", to_rust_pattern(p))
+        };
+        regex::Regex::new(&source).map_err(|e| re_error(p, &e.to_string()))
     }
     // name -> group index for a compiled pattern's named groups.
     fn name_indices(re: &regex::Regex) -> HashMap<String, usize> {
@@ -5970,16 +6910,21 @@ fn make_re_module() -> Value {
         out
     }
     // A Pattern object holding a compiled regex plus a thin method table
-    // so `pattern.match(s)` etc. work.
-    fn pattern_value(p: regex::Regex) -> Value {
+    // so `pattern.match(s)` etc. work. Every method takes its keyword
+    // arguments (`pos=`, `endpos=`, `count=`, `maxsplit=`) by name.
+    fn pattern_value(p: regex::Regex, source: String, flags: i64) -> Value {
         let p_rc = Rc::new(p);
         let mut attrs: crate::value::FieldMap = crate::value::FieldMap::new();
         let p1 = p_rc.clone();
         attrs.insert(
             "match".into(),
             Value::Native(Rc::new(NativeFn::new("match", move |_i, args| {
-                let s = single(&args, "match")?.py_str();
-                let caps = p1.captures(&s).filter(|c| c.get(0).unwrap().start() == 0);
+                let a = re_args(args, &["string", "pos", "endpos"], "match")?;
+                let s = re_str_arg(&a[0], "match")?;
+                let (hay, pos) = re_window(&s, &a[1], &a[2])?;
+                let caps = p1
+                    .captures_at(&hay, pos)
+                    .filter(|c| c.get(0).unwrap().start() == pos);
                 Ok(captures_to_value(caps, &name_indices(&p1)))
             }))),
         );
@@ -5987,18 +6932,38 @@ fn make_re_module() -> Value {
         attrs.insert(
             "search".into(),
             Value::Native(Rc::new(NativeFn::new("search", move |_i, args| {
-                let s = single(&args, "search")?.py_str();
-                Ok(captures_to_value(p2.captures(&s), &name_indices(&p2)))
+                let a = re_args(args, &["string", "pos", "endpos"], "search")?;
+                let s = re_str_arg(&a[0], "search")?;
+                let (hay, pos) = re_window(&s, &a[1], &a[2])?;
+                Ok(captures_to_value(
+                    p2.captures_at(&hay, pos),
+                    &name_indices(&p2),
+                ))
+            }))),
+        );
+        let p2m = p_rc.clone();
+        attrs.insert(
+            "fullmatch".into(),
+            Value::Native(Rc::new(NativeFn::new("fullmatch", move |_i, args| {
+                let a = re_args(args, &["string", "pos", "endpos"], "fullmatch")?;
+                let s = re_str_arg(&a[0], "fullmatch")?;
+                let (hay, pos) = re_window(&s, &a[1], &a[2])?;
+                let caps = p2m.captures_at(&hay, pos).filter(|c| {
+                    c.get(0).unwrap().start() == pos && c.get(0).unwrap().end() == hay.len()
+                });
+                Ok(captures_to_value(caps, &name_indices(&p2m)))
             }))),
         );
         let p2f = p_rc.clone();
         attrs.insert(
             "finditer".into(),
             Value::Native(Rc::new(NativeFn::new("finditer", move |_i, args| {
-                let s = single(&args, "finditer")?.py_str();
+                let a = re_args(args, &["string", "pos", "endpos"], "finditer")?;
+                let s = re_str_arg(&a[0], "finditer")?;
+                let (hay, pos) = re_window(&s, &a[1], &a[2])?;
                 let names = name_indices(&p2f);
                 let out: Vec<Value> = p2f
-                    .captures_iter(&s)
+                    .captures_iter(&hay[pos..])
                     .map(|c| captures_to_value(Some(c), &names))
                     .collect();
                 Ok(Value::List(Rc::new(RefCell::new(out))))
@@ -6008,8 +6973,10 @@ fn make_re_module() -> Value {
         attrs.insert(
             "findall".into(),
             Value::Native(Rc::new(NativeFn::new("findall", move |_i, args| {
-                let s = single(&args, "findall")?.py_str();
-                let hits = re_findall_hits(&p3, &s);
+                let a = re_args(args, &["string", "pos", "endpos"], "findall")?;
+                let s = re_str_arg(&a[0], "findall")?;
+                let (hay, pos) = re_window(&s, &a[1], &a[2])?;
+                let hits = re_findall_hits(&p3, &hay[pos..]);
                 Ok(Value::List(Rc::new(RefCell::new(hits))))
             }))),
         );
@@ -6017,18 +6984,12 @@ fn make_re_module() -> Value {
         attrs.insert(
             "sub".into(),
             Value::Native(Rc::new(NativeFn::new("sub", move |i, args| {
-                let repl = args
-                    .first()
-                    .ok_or_else(|| type_error("sub() needs replacement"))?
-                    .clone();
-                let s = args
-                    .get(1)
-                    .ok_or_else(|| type_error("sub() needs string"))?
-                    .py_str();
-                let count = match args.get(2) {
-                    Some(c) if !matches!(c, Value::None) => c.to_int()?.max(0) as usize,
-                    _ => 0,
-                };
+                let a = re_args(args, &["repl", "string", "count"], "sub")?;
+                let repl = a[0]
+                    .clone()
+                    .ok_or_else(|| type_error("sub() needs replacement"))?;
+                let s = re_str_arg(&a[1], "sub")?;
+                let count = re_count_arg(&a[2])?;
                 let (out, _) = re_sub_apply(i, &p4, &repl, &s, count)?;
                 Ok(Value::Str(Rc::new(out)))
             }))),
@@ -6037,15 +6998,13 @@ fn make_re_module() -> Value {
         attrs.insert(
             "subn".into(),
             Value::Native(Rc::new(NativeFn::new("subn", move |i, args| {
-                let repl = args
-                    .first()
-                    .ok_or_else(|| type_error("subn() needs replacement"))?
-                    .clone();
-                let s = args
-                    .get(1)
-                    .ok_or_else(|| type_error("subn() needs string"))?
-                    .py_str();
-                let (out, n) = re_sub_apply(i, &p4n, &repl, &s, 0)?;
+                let a = re_args(args, &["repl", "string", "count"], "subn")?;
+                let repl = a[0]
+                    .clone()
+                    .ok_or_else(|| type_error("subn() needs replacement"))?;
+                let s = re_str_arg(&a[1], "subn")?;
+                let count = re_count_arg(&a[2])?;
+                let (out, n) = re_sub_apply(i, &p4n, &repl, &s, count)?;
                 Ok(Value::Tuple(Rc::new(vec![
                     Value::Str(Rc::new(out)),
                     Value::Int(VmInt::from(n as i64)),
@@ -6056,28 +7015,37 @@ fn make_re_module() -> Value {
         attrs.insert(
             "split".into(),
             Value::Native(Rc::new(NativeFn::new("split", move |_i, args| {
-                let s = single(&args, "split")?.py_str();
+                let a = re_args(args, &["string", "maxsplit"], "split")?;
+                let s = re_str_arg(&a[0], "split")?;
+                let maxsplit = re_count_arg(&a[1])?;
                 Ok(Value::List(Rc::new(RefCell::new(re_split_apply(
-                    &p5, &s, 0,
+                    &p5, &s, maxsplit,
                 )))))
             }))),
         );
-        // Wrap the attrs in a Class-shaped value with an Instance.
-        // The interpreter checks instance.fields before class.methods, so
+        // The data attributes CPython's `Pattern` carries.
+        attrs.insert("pattern".into(), Value::Str(Rc::new(source)));
+        attrs.insert("flags".into(), Value::Int(VmInt::from(flags)));
+        attrs.insert(
+            "groups".into(),
+            Value::Int(VmInt::from(p_rc.captures_len().saturating_sub(1) as i64)),
+        );
+        {
+            let mut d: DictMap = IndexMap::new();
+            for (name, idx) in name_indices(&p_rc) {
+                d.insert(
+                    HashKey::Str(Rc::new(name)),
+                    Value::Int(VmInt::from(idx as i64)),
+                );
+            }
+            attrs.insert("groupindex".into(), Value::Dict(Rc::new(RefCell::new(d))));
+        }
+        // Wrap the attrs in an Instance of the one shared `Pattern` class, so
+        // `isinstance(p, re.Pattern)` and `type(p) is re.Pattern` hold. The
+        // interpreter checks instance.fields before class.methods, so
         // exposing the natives as instance fields is enough.
-        let cls = Rc::new(Class {
-            name: "Pattern".into(),
-            methods: RefCell::new(HashMap::new()),
-            fields: vec![],
-            class_attrs: RefCell::new(HashMap::new()),
-            bases: vec![],
-            properties: std::cell::RefCell::new(std::collections::HashSet::new()),
-            classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
-            is_exception: false,
-            is_protocol: false,
-        });
         Value::Instance(Rc::new(crate::value::Instance {
-            class: cls,
+            class: re_pattern_class(),
             fields: RefCell::new(attrs),
             chain: RefCell::new(None),
         }))
@@ -6220,19 +7188,8 @@ fn make_re_module() -> Value {
                 ])))
             }))),
         );
-        let cls = Rc::new(crate::value::Class {
-            name: "Match".into(),
-            methods: RefCell::new(HashMap::new()),
-            fields: vec![],
-            class_attrs: RefCell::new(HashMap::new()),
-            bases: vec![],
-            properties: std::cell::RefCell::new(std::collections::HashSet::new()),
-            classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
-            is_exception: false,
-            is_protocol: false,
-        });
         Value::Instance(Rc::new(crate::value::Instance {
-            class: cls,
+            class: re_match_class(),
             fields: RefCell::new(attrs),
             chain: RefCell::new(None),
         }))
@@ -6243,23 +7200,20 @@ fn make_re_module() -> Value {
             (
                 "compile",
                 nf("compile", move |_i, args| {
-                    let p = single(&args, "compile")?.py_str();
-                    let r = compile_one(&p)?;
-                    Ok(pattern_value(r))
+                    let a = re_args(args, &["pattern", "flags"], "compile")?;
+                    let p = re_str_arg(&a[0], "compile")?;
+                    let flags = re_flags_arg(&a[1])?;
+                    let r = compile_one(&p, flags)?;
+                    Ok(pattern_value(r, p, flags))
                 }),
             ),
             (
                 "match",
                 nf("match", move |_i, args| {
-                    let p = args
-                        .first()
-                        .ok_or_else(|| type_error("match() needs pattern"))?
-                        .py_str();
-                    let s = args
-                        .get(1)
-                        .ok_or_else(|| type_error("match() needs string"))?
-                        .py_str();
-                    let r = compile_one(&p)?;
+                    let a = re_args(args, &["pattern", "string", "flags"], "match")?;
+                    let p = re_str_arg(&a[0], "match")?;
+                    let s = re_str_arg(&a[1], "match")?;
+                    let r = compile_one(&p, re_flags_arg(&a[2])?)?;
                     // Python's `re.match` only matches at the start of the
                     // string (unlike `re.search`). The Rust `regex` crate
                     // returns the leftmost match anywhere, so anchor by
@@ -6272,15 +7226,10 @@ fn make_re_module() -> Value {
             (
                 "search",
                 nf("search", move |_i, args| {
-                    let p = args
-                        .first()
-                        .ok_or_else(|| type_error("search() needs pattern"))?
-                        .py_str();
-                    let s = args
-                        .get(1)
-                        .ok_or_else(|| type_error("search() needs string"))?
-                        .py_str();
-                    let r = compile_one(&p)?;
+                    let a = re_args(args, &["pattern", "string", "flags"], "search")?;
+                    let p = re_str_arg(&a[0], "search")?;
+                    let s = re_str_arg(&a[1], "search")?;
+                    let r = compile_one(&p, re_flags_arg(&a[2])?)?;
                     let names = name_indices(&r);
                     Ok(captures_to_value(r.captures(&s), &names))
                 }),
@@ -6288,16 +7237,11 @@ fn make_re_module() -> Value {
             (
                 "fullmatch",
                 nf("fullmatch", move |_i, args| {
-                    let p = args
-                        .first()
-                        .ok_or_else(|| type_error("fullmatch() needs pattern"))?
-                        .py_str();
-                    let s = args
-                        .get(1)
-                        .ok_or_else(|| type_error("fullmatch() needs string"))?
-                        .py_str();
+                    let a = re_args(args, &["pattern", "string", "flags"], "fullmatch")?;
+                    let p = re_str_arg(&a[0], "fullmatch")?;
+                    let s = re_str_arg(&a[1], "fullmatch")?;
                     let anchored = format!("^(?:{p})$");
-                    let r = compile_one(&anchored)?;
+                    let r = compile_one(&anchored, re_flags_arg(&a[2])?)?;
                     let names = name_indices(&r);
                     Ok(captures_to_value(r.captures(&s), &names))
                 }),
@@ -6305,23 +7249,18 @@ fn make_re_module() -> Value {
             (
                 "sub",
                 nf("sub", move |i, args| {
-                    let p = args
-                        .first()
-                        .ok_or_else(|| type_error("sub() needs pattern"))?
-                        .py_str();
-                    let repl = args
-                        .get(1)
-                        .ok_or_else(|| type_error("sub() needs replacement"))?
-                        .clone();
-                    let s = args
-                        .get(2)
-                        .ok_or_else(|| type_error("sub() needs string"))?
-                        .py_str();
-                    let count = match args.get(3) {
-                        Some(c) if !matches!(c, Value::None) => c.to_int()?.max(0) as usize,
-                        _ => 0,
-                    };
-                    let r = compile_one(&p)?;
+                    let a = re_args(
+                        args,
+                        &["pattern", "repl", "string", "count", "flags"],
+                        "sub",
+                    )?;
+                    let p = re_str_arg(&a[0], "sub")?;
+                    let repl = a[1]
+                        .clone()
+                        .ok_or_else(|| type_error("sub() needs replacement"))?;
+                    let s = re_str_arg(&a[2], "sub")?;
+                    let count = re_count_arg(&a[3])?;
+                    let r = compile_one(&p, re_flags_arg(&a[4])?)?;
                     let (out, _) = re_sub_apply(i, &r, &repl, &s, count)?;
                     Ok(Value::Str(Rc::new(out)))
                 }),
@@ -6329,20 +7268,19 @@ fn make_re_module() -> Value {
             (
                 "subn",
                 nf("subn", move |i, args| {
-                    let p = args
-                        .first()
-                        .ok_or_else(|| type_error("subn() needs pattern"))?
-                        .py_str();
-                    let repl = args
-                        .get(1)
-                        .ok_or_else(|| type_error("subn() needs replacement"))?
-                        .clone();
-                    let s = args
-                        .get(2)
-                        .ok_or_else(|| type_error("subn() needs string"))?
-                        .py_str();
-                    let r = compile_one(&p)?;
-                    let (out, n) = re_sub_apply(i, &r, &repl, &s, 0)?;
+                    let a = re_args(
+                        args,
+                        &["pattern", "repl", "string", "count", "flags"],
+                        "subn",
+                    )?;
+                    let p = re_str_arg(&a[0], "subn")?;
+                    let repl = a[1]
+                        .clone()
+                        .ok_or_else(|| type_error("subn() needs replacement"))?;
+                    let s = re_str_arg(&a[2], "subn")?;
+                    let count = re_count_arg(&a[3])?;
+                    let r = compile_one(&p, re_flags_arg(&a[4])?)?;
+                    let (out, n) = re_sub_apply(i, &r, &repl, &s, count)?;
                     Ok(Value::Tuple(Rc::new(vec![
                         Value::Str(Rc::new(out)),
                         Value::Int(VmInt::from(n as i64)),
@@ -6352,15 +7290,10 @@ fn make_re_module() -> Value {
             (
                 "finditer",
                 nf("finditer", move |_i, args| {
-                    let p = args
-                        .first()
-                        .ok_or_else(|| type_error("finditer() needs pattern"))?
-                        .py_str();
-                    let s = args
-                        .get(1)
-                        .ok_or_else(|| type_error("finditer() needs string"))?
-                        .py_str();
-                    let r = compile_one(&p)?;
+                    let a = re_args(args, &["pattern", "string", "flags"], "finditer")?;
+                    let p = re_str_arg(&a[0], "finditer")?;
+                    let s = re_str_arg(&a[1], "finditer")?;
+                    let r = compile_one(&p, re_flags_arg(&a[2])?)?;
                     let names = name_indices(&r);
                     let out: Vec<Value> = r
                         .captures_iter(&s)
@@ -6372,15 +7305,10 @@ fn make_re_module() -> Value {
             (
                 "findall",
                 nf("findall", move |_i, args| {
-                    let p = args
-                        .first()
-                        .ok_or_else(|| type_error("findall() needs pattern"))?
-                        .py_str();
-                    let s = args
-                        .get(1)
-                        .ok_or_else(|| type_error("findall() needs string"))?
-                        .py_str();
-                    let r = compile_one(&p)?;
+                    let a = re_args(args, &["pattern", "string", "flags"], "findall")?;
+                    let p = re_str_arg(&a[0], "findall")?;
+                    let s = re_str_arg(&a[1], "findall")?;
+                    let r = compile_one(&p, re_flags_arg(&a[2])?)?;
                     let hits = re_findall_hits(&r, &s);
                     Ok(Value::List(Rc::new(RefCell::new(hits))))
                 }),
@@ -6388,19 +7316,11 @@ fn make_re_module() -> Value {
             (
                 "split",
                 nf("split", move |_i, args| {
-                    let p = args
-                        .first()
-                        .ok_or_else(|| type_error("split() needs pattern"))?
-                        .py_str();
-                    let s = args
-                        .get(1)
-                        .ok_or_else(|| type_error("split() needs string"))?
-                        .py_str();
-                    let maxsplit = match args.get(2) {
-                        Some(c) if !matches!(c, Value::None) => c.to_int()?.max(0) as usize,
-                        _ => 0,
-                    };
-                    let r = compile_one(&p)?;
+                    let a = re_args(args, &["pattern", "string", "maxsplit", "flags"], "split")?;
+                    let p = re_str_arg(&a[0], "split")?;
+                    let s = re_str_arg(&a[1], "split")?;
+                    let maxsplit = re_count_arg(&a[2])?;
+                    let r = compile_one(&p, re_flags_arg(&a[3])?)?;
                     Ok(Value::List(Rc::new(RefCell::new(re_split_apply(
                         &r, &s, maxsplit,
                     )))))
@@ -6413,17 +7333,206 @@ fn make_re_module() -> Value {
                     Ok(Value::Str(Rc::new(regex::escape(&s))))
                 }),
             ),
-            // Flag constants — accepted but currently ignored. The shim
-            // engine has no flag plumbing; users that rely on
-            // IGNORECASE/MULTILINE will see incorrect behaviour and
-            // should fall back to `tyc run --compile`.
+            // The flag constants and their one-letter aliases, as plain ints
+            // (CPython's are `RegexFlag` members; they combine with `|` the
+            // same way). `IGNORECASE` / `MULTILINE` / `DOTALL` / `VERBOSE`
+            // are honoured by every function above; `ASCII` / `LOCALE` /
+            // `UNICODE` / `DEBUG` are accepted without effect.
+            ("NOFLAG", Value::Int(VmInt::from(0))),
             ("IGNORECASE", Value::Int(VmInt::from(2))),
+            ("I", Value::Int(VmInt::from(2))),
+            ("LOCALE", Value::Int(VmInt::from(4))),
+            ("L", Value::Int(VmInt::from(4))),
             ("MULTILINE", Value::Int(VmInt::from(8))),
+            ("M", Value::Int(VmInt::from(8))),
             ("DOTALL", Value::Int(VmInt::from(16))),
+            ("S", Value::Int(VmInt::from(16))),
+            ("UNICODE", Value::Int(VmInt::from(32))),
+            ("U", Value::Int(VmInt::from(32))),
             ("VERBOSE", Value::Int(VmInt::from(64))),
+            ("X", Value::Int(VmInt::from(64))),
+            ("DEBUG", Value::Int(VmInt::from(128))),
             ("ASCII", Value::Int(VmInt::from(256))),
+            ("A", Value::Int(VmInt::from(256))),
+            // `RegexFlag(n)` is the int it wraps here.
+            (
+                "RegexFlag",
+                nf("RegexFlag", |_i, args| {
+                    Ok(Value::Int(VmInt::from(re_flags_arg(
+                        &args.first().cloned(),
+                    )?)))
+                }),
+            ),
+            // The classes, for `isinstance` / `except`: `re.error` is the
+            // 3.13 alias of `PatternError`.
+            ("Pattern", Value::Class(re_pattern_class())),
+            ("Match", Value::Class(re_match_class())),
+            ("PatternError", Value::Class(re_error_class())),
+            ("error", Value::Class(re_error_class())),
         ],
     )
+}
+
+thread_local! {
+    /// The one `re.Pattern` / `re.Match` / `re.PatternError` class each per
+    /// interpreter thread: what the functions build instances of and what
+    /// the module exports, so `isinstance(m, re.Match)`, `type(p) is
+    /// re.Pattern` and `except re.error` all match by identity.
+    static RE_PATTERN_CLASS: Rc<crate::value::Class> = Rc::new(bare_shim_class("Pattern"));
+    static RE_MATCH_CLASS: Rc<crate::value::Class> = Rc::new(bare_shim_class("Match"));
+    static RE_ERROR_CLASS: Rc<crate::value::Class> = {
+        let mut cls = bare_shim_class("PatternError");
+        cls.class_attrs.get_mut().insert(
+            "__typhon_exc_bases__".to_owned(),
+            Value::Tuple(Rc::new(vec![Value::Str(Rc::new("Exception".to_owned()))])),
+        );
+        cls.is_exception = true;
+        Rc::new(cls)
+    };
+}
+
+/// A method-less class for a native object to be an instance of.
+fn bare_shim_class(name: &str) -> crate::value::Class {
+    crate::value::Class {
+        name: name.to_owned(),
+        methods: RefCell::new(HashMap::new()),
+        fields: vec![],
+        class_attrs: RefCell::new(HashMap::new()),
+        bases: vec![],
+        properties: RefCell::new(HashSet::new()),
+        classmethods: RefCell::new(HashSet::new()),
+        is_exception: false,
+        is_protocol: false,
+    }
+}
+
+fn re_pattern_class() -> Rc<crate::value::Class> {
+    RE_PATTERN_CLASS.with(|c| c.clone())
+}
+
+fn re_match_class() -> Rc<crate::value::Class> {
+    RE_MATCH_CLASS.with(|c| c.clone())
+}
+
+fn re_error_class() -> Rc<crate::value::Class> {
+    RE_ERROR_CLASS.with(|c| c.clone())
+}
+
+/// `re.PatternError(msg, pattern)` — an `Exception` subclass carrying the
+/// `msg` / `pattern` / `pos` / `lineno` / `colno` attributes CPython's has
+/// (the position ones are `None`: the Rust engine reports no offset).
+fn re_error(pattern: &str, msg: &str) -> Unwind {
+    let mut fields: crate::value::FieldMap = crate::value::FieldMap::new();
+    fields.insert(
+        "args".to_owned(),
+        Value::Tuple(Rc::new(vec![Value::Str(Rc::new(msg.to_owned()))])),
+    );
+    fields.insert("msg".to_owned(), Value::Str(Rc::new(msg.to_owned())));
+    fields.insert(
+        "pattern".to_owned(),
+        Value::Str(Rc::new(pattern.to_owned())),
+    );
+    fields.insert("pos".to_owned(), Value::None);
+    fields.insert("lineno".to_owned(), Value::None);
+    fields.insert("colno".to_owned(), Value::None);
+    let inst = Value::Instance(Rc::new(crate::value::Instance {
+        class: re_error_class(),
+        fields: RefCell::new(fields),
+        chain: RefCell::new(None),
+    }));
+    Unwind::Exception(crate::error::VmException::new("PatternError", msg).with_value(inst))
+}
+
+/// Bind a `re` native's positional and keyword arguments to `params` by
+/// position and name, CPython's way: an unknown keyword, a keyword that
+/// duplicates a positional, or too many positionals are `TypeError`s. The
+/// result has one slot per parameter, `None` where nothing was passed.
+fn re_args(args: Vec<Value>, params: &[&str], fname: &str) -> Result<Vec<Option<Value>>, Unwind> {
+    let (pos, kwargs) = split_kwargs(&args);
+    if pos.len() > params.len() {
+        return Err(type_error(format!(
+            "{fname}() takes at most {} arguments ({} given)",
+            params.len(),
+            pos.len()
+        )));
+    }
+    let mut out: Vec<Option<Value>> = vec![None; params.len()];
+    for (slot, v) in out.iter_mut().zip(pos.iter()) {
+        *slot = Some(v.clone());
+    }
+    for (k, v) in kwargs {
+        let Some(idx) = params.iter().position(|p| *p == k) else {
+            return Err(type_error(format!(
+                "{fname}() got an unexpected keyword argument '{k}'"
+            )));
+        };
+        if out[idx].is_some() {
+            return Err(type_error(format!(
+                "{fname}() got multiple values for argument '{k}'"
+            )));
+        }
+        out[idx] = Some(v);
+    }
+    Ok(out)
+}
+
+/// A required `str` argument of a `re` function.
+fn re_str_arg(v: &Option<Value>, fname: &str) -> Result<String, Unwind> {
+    match v {
+        Some(Value::Str(s)) => Ok((**s).clone()),
+        Some(other) => Err(type_error(format!(
+            "expected string or bytes-like object, got '{}'",
+            other.type_name()
+        ))),
+        None => Err(type_error(format!("{fname}() missing required argument"))),
+    }
+}
+
+/// An optional `flags` argument: an int (a `RegexFlag` here), default 0.
+fn re_flags_arg(v: &Option<Value>) -> Result<i64, Unwind> {
+    match v {
+        None | Some(Value::None) => Ok(0),
+        Some(Value::Int(n)) => n.to_i64().ok_or_else(|| {
+            Unwind::Exception(crate::error::VmException::new(
+                "OverflowError",
+                "Python int too large to convert to C int",
+            ))
+        }),
+        Some(Value::Bool(b)) => Ok(*b as i64),
+        Some(other) => Err(type_error(format!(
+            "'{}' object cannot be interpreted as an integer",
+            other.type_name()
+        ))),
+    }
+}
+
+/// An optional `count` / `maxsplit` argument: a non-negative int, `0` (all)
+/// when absent.
+fn re_count_arg(v: &Option<Value>) -> Result<usize, Unwind> {
+    match v {
+        None | Some(Value::None) => Ok(0),
+        Some(c) => Ok(c.to_int()?.max(0) as usize),
+    }
+}
+
+/// The `[pos:endpos]` window of a `Pattern` method as (haystack, byte
+/// offset of `pos`), with the character offsets CPython uses.
+fn re_window(
+    s: &str,
+    pos: &Option<Value>,
+    endpos: &Option<Value>,
+) -> Result<(String, usize), Unwind> {
+    let chars = s.chars().count() as i64;
+    let clamp = |v: &Option<Value>, default: i64| -> Result<usize, Unwind> {
+        match v {
+            None | Some(Value::None) => Ok(default as usize),
+            Some(v) => Ok(v.to_int()?.clamp(0, chars) as usize),
+        }
+    };
+    let end = clamp(endpos, chars)?;
+    let start = clamp(pos, 0)?.min(end);
+    let byte_at = |n: usize| s.char_indices().nth(n).map(|(b, _)| b).unwrap_or(s.len());
+    Ok((s[..byte_at(end)].to_owned(), byte_at(start)))
 }
 
 fn exception_unwind_value(e: &crate::error::VmException) -> Value {
@@ -6496,7 +7605,7 @@ fn make_failed_task_value(exc: Value) -> Value {
     )
 }
 
-fn make_task_value(result: Value) -> Value {
+pub(crate) fn make_task_value(result: Value) -> Value {
     let result_for_member = result.clone();
     make_module(
         "Task",
@@ -6552,57 +7661,61 @@ fn make_asyncio_module() -> Value {
             let mut members = m.members.borrow_mut();
             members.insert(
                 "__aenter__".to_owned(),
-                Value::Native(Rc::new(NativeFn::new("__aenter__", move |_i, _args| {
-                    Ok(tg_for_enter.clone())
-                }))),
+                Value::Native(Rc::new(NativeFn::new_awaitable(
+                    "__aenter__",
+                    move |_i, _args| Ok(tg_for_enter.clone()),
+                ))),
             );
             members.insert(
                 "__aexit__".to_owned(),
-                Value::Native(Rc::new(NativeFn::new("__aexit__", move |i, args| {
-                    let mut pending = failures_for_exit.borrow_mut();
-                    // CPython wraps a body-raised exception into the same
-                    // group (verified against 3.13), so fold it in here —
-                    // unless it is a task failure the group already
-                    // collected, re-raised into the body by `await t` on the
-                    // failed task. CPython's body is cancelled at that await
-                    // and the group holds the error exactly once (3.13:
-                    // `ExceptionGroup('unhandled errors in a TaskGroup',
-                    // [ValueError('boom')])`, one member).
-                    if let Some(body_exc) = args.get(1) {
-                        if !matches!(body_exc, Value::None)
-                            && !pending
-                                .iter()
-                                .any(|p| crate::value::exception_values_identical(p, body_exc))
-                        {
-                            pending.push(body_exc.clone());
+                Value::Native(Rc::new(NativeFn::new_awaitable(
+                    "__aexit__",
+                    move |i, args| {
+                        let mut pending = failures_for_exit.borrow_mut();
+                        // CPython wraps a body-raised exception into the same
+                        // group (verified against 3.13), so fold it in here —
+                        // unless it is a task failure the group already
+                        // collected, re-raised into the body by `await t` on the
+                        // failed task. CPython's body is cancelled at that await
+                        // and the group holds the error exactly once (3.13:
+                        // `ExceptionGroup('unhandled errors in a TaskGroup',
+                        // [ValueError('boom')])`, one member).
+                        if let Some(body_exc) = args.get(1) {
+                            if !matches!(body_exc, Value::None)
+                                && !pending
+                                    .iter()
+                                    .any(|p| crate::value::exception_values_identical(p, body_exc))
+                            {
+                                pending.push(body_exc.clone());
+                            }
                         }
-                    }
-                    if pending.is_empty() {
-                        return Ok(Value::Bool(false));
-                    }
-                    let subs: Vec<Value> = pending.drain(..).collect();
-                    drop(pending);
-                    // CPython's TaskGroup singles out KeyboardInterrupt /
-                    // SystemExit (`_is_base_error`) as `_base_error` — the
-                    // first one observed is re-raised BARE, never wrapped in
-                    // the group, and every other collected failure is
-                    // dropped (verified against 3.13 for body- and
-                    // child-raised cases). A bare `BaseException` is *not* a
-                    // base error there and stays in the group.
-                    if let Some(base) = subs.iter().find(|v| is_taskgroup_base_error(v)) {
-                        return Err(i.value_to_exception(base.clone()));
-                    }
-                    let kind = crate::value::exception_group_kind_for(&subs);
-                    let group = crate::value::make_exception_group(
-                        kind,
-                        "unhandled errors in a TaskGroup",
-                        subs,
-                        false,
-                    );
-                    Err(Unwind::Exception(
-                        crate::error::VmException::new(kind, group.py_str()).with_value(group),
-                    ))
-                }))),
+                        if pending.is_empty() {
+                            return Ok(Value::Bool(false));
+                        }
+                        let subs: Vec<Value> = pending.drain(..).collect();
+                        drop(pending);
+                        // CPython's TaskGroup singles out KeyboardInterrupt /
+                        // SystemExit (`_is_base_error`) as `_base_error` — the
+                        // first one observed is re-raised BARE, never wrapped in
+                        // the group, and every other collected failure is
+                        // dropped (verified against 3.13 for body- and
+                        // child-raised cases). A bare `BaseException` is *not* a
+                        // base error there and stays in the group.
+                        if let Some(base) = subs.iter().find(|v| is_taskgroup_base_error(v)) {
+                            return Err(i.value_to_exception(base.clone()));
+                        }
+                        let kind = crate::value::exception_group_kind_for(&subs);
+                        let group = crate::value::make_exception_group(
+                            kind,
+                            "unhandled errors in a TaskGroup",
+                            subs,
+                            false,
+                        );
+                        Err(Unwind::Exception(
+                            crate::error::VmException::new(kind, group.py_str()).with_value(group),
+                        ))
+                    },
+                ))),
             );
             members.insert(
                 "create_task".to_owned(),
@@ -6639,24 +7752,28 @@ fn make_asyncio_module() -> Value {
             let mut members = m.members.borrow_mut();
             members.insert(
                 "__aenter__".to_owned(),
-                Value::Native(Rc::new(NativeFn::new("__aenter__", move |_i, _args| {
-                    Ok(cm_for_enter.clone())
-                }))),
+                Value::Native(Rc::new(NativeFn::new_awaitable(
+                    "__aenter__",
+                    move |_i, _args| Ok(cm_for_enter.clone()),
+                ))),
             );
             members.insert(
                 "__aexit__".to_owned(),
-                Value::Native(Rc::new(NativeFn::new("__aexit__", move |_i, args| {
-                    // Re-raising over an in-flight exception would mask it;
-                    // only convert a clean exit into TimeoutError.
-                    let body_raised = !matches!(args.first(), Some(Value::None) | None);
-                    if !body_raised && started.elapsed().as_secs_f64() > budget {
-                        return Err(Unwind::Exception(crate::error::VmException::new(
-                            "TimeoutError",
-                            "",
-                        )));
-                    }
-                    Ok(Value::Bool(false))
-                }))),
+                Value::Native(Rc::new(NativeFn::new_awaitable(
+                    "__aexit__",
+                    move |_i, args| {
+                        // Re-raising over an in-flight exception would mask it;
+                        // only convert a clean exit into TimeoutError.
+                        let body_raised = !matches!(args.first(), Some(Value::None) | None);
+                        if !body_raised && started.elapsed().as_secs_f64() > budget {
+                            return Err(Unwind::Exception(crate::error::VmException::new(
+                                "TimeoutError",
+                                "",
+                            )));
+                        }
+                        Ok(Value::Bool(false))
+                    },
+                ))),
             );
         }
         Ok(cm)
@@ -6696,12 +7813,25 @@ fn make_asyncio_module() -> Value {
                         .into_iter()
                         .next()
                         .ok_or_else(|| type_error("asyncio.run() requires a coroutine"))?;
-                    i.force_awaitable(coro)
+                    // CPython refuses to nest event loops.
+                    if i.running_loop_depth > 0 {
+                        return Err(Unwind::Exception(crate::error::VmException::new(
+                            "RuntimeError",
+                            "asyncio.run() cannot be called from a running event loop",
+                        )));
+                    }
+                    // Everything forced from here — the coroutine, the sync
+                    // helpers it calls, the tasks they spawn — runs "inside
+                    // the loop", which is what `spawn` / `create_task` check.
+                    i.running_loop_depth += 1;
+                    let result = i.force_awaitable(coro);
+                    i.running_loop_depth -= 1;
+                    result
                 }),
             ),
             (
                 "sleep",
-                nf("sleep", |_i, args| {
+                nf_awaitable("sleep", |_i, args| {
                     if let Some(v) = args.first() {
                         let secs = v.to_float().unwrap_or(0.0);
                         if secs > 0.0 {
@@ -6713,7 +7843,7 @@ fn make_asyncio_module() -> Value {
             ),
             (
                 "gather",
-                nf("gather", |i, args| {
+                nf_awaitable("gather", |i, args| {
                     // Positional-only fast path (return_exceptions arrives
                     // via the kwargs table in `call_with_kwargs`).
                     let mut out: Vec<Value> = Vec::with_capacity(args.len());
@@ -6725,7 +7855,7 @@ fn make_asyncio_module() -> Value {
             ),
             (
                 "wait_for",
-                nf("wait_for", |i, args| {
+                nf_awaitable("wait_for", |i, args| {
                     let coro = args
                         .into_iter()
                         .next()
@@ -6739,6 +7869,7 @@ fn make_asyncio_module() -> Value {
             (
                 "create_task",
                 nf("create_task", |i, args| {
+                    require_running_loop(i)?;
                     let coro = args
                         .into_iter()
                         .next()
@@ -6798,24 +7929,33 @@ fn make_asyncio_lock() -> Value {
         vec![
             (
                 "__aenter__",
-                Value::Native(Rc::new(NativeFn::new("__aenter__", move |_i, _args| {
-                    enter_flag.set(true);
-                    Ok(Value::None)
-                }))),
+                Value::Native(Rc::new(NativeFn::new_awaitable(
+                    "__aenter__",
+                    move |_i, _args| {
+                        enter_flag.set(true);
+                        Ok(Value::None)
+                    },
+                ))),
             ),
             (
                 "__aexit__",
-                Value::Native(Rc::new(NativeFn::new("__aexit__", move |_i, _args| {
-                    exit_flag.set(false);
-                    Ok(Value::Bool(false))
-                }))),
+                Value::Native(Rc::new(NativeFn::new_awaitable(
+                    "__aexit__",
+                    move |_i, _args| {
+                        exit_flag.set(false);
+                        Ok(Value::Bool(false))
+                    },
+                ))),
             ),
             (
                 "acquire",
-                Value::Native(Rc::new(NativeFn::new("acquire", move |_i, _args| {
-                    acquire_flag.set(true);
-                    Ok(Value::Bool(true))
-                }))),
+                Value::Native(Rc::new(NativeFn::new_awaitable(
+                    "acquire",
+                    move |_i, _args| {
+                        acquire_flag.set(true);
+                        Ok(Value::Bool(true))
+                    },
+                ))),
             ),
             (
                 "release",
@@ -6868,19 +8008,22 @@ fn make_asyncio_event() -> Value {
             ),
             (
                 "wait",
-                Value::Native(Rc::new(NativeFn::new("wait", move |_i, _args| {
-                    if wait_flag.get() {
-                        return Ok(Value::Bool(true));
-                    }
-                    Err(crate::error::Unwind::Exception(
-                        crate::error::VmException::new(
-                            "RuntimeError",
-                            "asyncio.Event.wait() on an unset event would deadlock under the \
+                Value::Native(Rc::new(NativeFn::new_awaitable(
+                    "wait",
+                    move |_i, _args| {
+                        if wait_flag.get() {
+                            return Ok(Value::Bool(true));
+                        }
+                        Err(crate::error::Unwind::Exception(
+                            crate::error::VmException::new(
+                                "RuntimeError",
+                                "asyncio.Event.wait() on an unset event would deadlock under the \
                              VM's sequential scheduler — set the event before awaiting it, or \
                              run with `tyc run --compile`",
-                        ),
-                    ))
-                }))),
+                            ),
+                        ))
+                    },
+                ))),
             ),
         ],
     )
@@ -6904,7 +8047,7 @@ fn make_asyncio_queue(args: &[Value], kwargs: &[(String, Value)]) -> Value {
         let b = buf.clone();
         members.insert(
             "put".to_owned(),
-            Value::Native(Rc::new(NativeFn::new("put", move |_i, args| {
+            Value::Native(Rc::new(NativeFn::new_awaitable("put", move |_i, args| {
                 if maxsize > 0 && b.borrow().len() as i64 >= maxsize {
                     return Err(Unwind::Exception(crate::error::VmException::new(
                         "RuntimeError",
@@ -6930,7 +8073,7 @@ fn make_asyncio_queue(args: &[Value], kwargs: &[(String, Value)]) -> Value {
         let b = buf.clone();
         members.insert(
             "get".to_owned(),
-            Value::Native(Rc::new(NativeFn::new("get", move |_i, _args| {
+            Value::Native(Rc::new(NativeFn::new_awaitable("get", move |_i, _args| {
                 b.borrow_mut().pop_front().ok_or_else(|| {
                     Unwind::Exception(crate::error::VmException::new(
                         "RuntimeError",
@@ -7030,7 +8173,7 @@ fn make_abc_module() -> Value {
 /// Internally we re-heapify on every push/pop since the VM's lists don't
 /// expose a stable heap-invariant; the algorithmic complexity goes from
 /// O(log n) to O(n log n) but the surface is correct.
-fn make_heapq_module() -> Value {
+fn make_heapq_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
     fn sift_down(list: &mut [Value], start: usize, pos: usize) {
         let mut pos = pos;
         let new_item = list[pos].clone();
@@ -7177,16 +8320,59 @@ fn make_heapq_module() -> Value {
         items.truncate(n.max(0) as usize);
         Ok(Value::List(Rc::new(RefCell::new(items))))
     });
-    make_module(
-        "heapq",
-        vec![
-            ("heappush", heappush),
-            ("heappop", heappop),
-            ("heapify", heapify),
-            ("nsmallest", nsmallest),
-            ("nlargest", nlargest),
-        ],
-    )
+    // `heappushpop(heap, item)`: push then pop, in one sift — the popped
+    // value is `item` itself when it is no larger than the current root.
+    let heappushpop = nf("heappushpop", |_i, args| {
+        if args.len() != 2 {
+            return Err(type_error("heappushpop expected 2 arguments"));
+        }
+        let heap = match &args[0] {
+            Value::List(l) => l.clone(),
+            _ => return Err(type_error("heappushpop expects a list")),
+        };
+        let mut item = args[1].clone();
+        let mut h = heap.borrow_mut();
+        if !h.is_empty() && value_lt(&h[0], &item) {
+            std::mem::swap(&mut h[0], &mut item);
+            sift_up(&mut h, 0);
+        }
+        Ok(item)
+    });
+    // `heapreplace(heap, item)`: pop the root, then push `item` — the root
+    // comes back even when `item` is smaller, as in CPython.
+    let heapreplace = nf("heapreplace", |_i, args| {
+        if args.len() != 2 {
+            return Err(type_error("heapreplace expected 2 arguments"));
+        }
+        let heap = match &args[0] {
+            Value::List(l) => l.clone(),
+            _ => return Err(type_error("heapreplace expects a list")),
+        };
+        let mut h = heap.borrow_mut();
+        if h.is_empty() {
+            return Err(crate::error::index_error("index out of range"));
+        }
+        let returned = std::mem::replace(&mut h[0], args[1].clone());
+        sift_up(&mut h, 0);
+        Ok(returned)
+    });
+    let mut entries = vec![
+        ("heappush", heappush),
+        ("heappop", heappop),
+        ("heapify", heapify),
+        ("nsmallest", nsmallest),
+        ("nlargest", nlargest),
+        ("heappushpop", heappushpop),
+        ("heapreplace", heapreplace),
+    ];
+    // `merge` is the one `heapq` function CPython itself writes in Python.
+    let extras = compile_helpers(interp, shims::HEAPQ_EXTRA)?;
+    for (k, v) in extras {
+        if !k.starts_with('_') {
+            entries.push((intern_shim_name(k), v));
+        }
+    }
+    Ok(make_module("heapq", entries))
 }
 
 /// Whether a `Value::Dict` carries the `__typhon_frozen__` sentinel
@@ -7552,11 +8738,27 @@ fn async_generator_context_manager(gen: Value) -> Value {
     let enter_src = inner.fields.borrow().get("__enter__").cloned();
     let exit_src = inner.fields.borrow().get("__exit__").cloned();
     let mut fields: Vec<(&str, Value)> = Vec::new();
+    // `__aenter__` / `__aexit__` are coroutine functions in CPython, so
+    // their results must be awaitable (`await cm.__aenter__()` is how an
+    // `AsyncExitStack` enters one): drive the sync natives through
+    // awaitable wrappers rather than sharing them.
     if let Some(f) = enter_src {
-        fields.push(("__aenter__", f));
+        fields.push((
+            "__aenter__",
+            Value::Native(Rc::new(NativeFn::new_awaitable(
+                "__aenter__",
+                move |i, args| i.call_value(f.clone(), args, &[]),
+            ))),
+        ));
     }
     if let Some(f) = exit_src {
-        fields.push(("__aexit__", f));
+        fields.push((
+            "__aexit__",
+            Value::Native(Rc::new(NativeFn::new_awaitable(
+                "__aexit__",
+                move |i, args| i.call_value(f.clone(), args, &[]),
+            ))),
+        ));
     }
     native_object("_AsyncGeneratorContextManager", fields)
 }
@@ -11562,6 +12764,16 @@ pub fn call_with_kwargs(
         // Bound builtin methods (the "method" native) never reach here — they
         // are intercepted in `call_value`, which forwards kwargs via the
         // tuple sentinel (`make_kwargs_sentinel` / `split_kwargs`).
+        // Natives that unpack their keyword arguments themselves (through
+        // `split_kwargs`): `math.isclose(rel_tol=, abs_tol=)`,
+        // `math.nextafter(steps=)`, and the `re` functions and `Pattern`
+        // methods (`flags=`, `count=`, `maxsplit=`, `pos=`, `endpos=`).
+        "isclose" | "nextafter" | "compile" | "match" | "search" | "fullmatch" | "findall"
+        | "finditer" | "sub" | "subn" | "split" => {
+            let mut args = args;
+            args.push(make_kwargs_sentinel(kwargs));
+            (n.func)(interp, args)
+        }
         _ => {
             if kwargs.is_empty() {
                 (n.func)(interp, args)

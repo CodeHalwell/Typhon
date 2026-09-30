@@ -418,7 +418,7 @@ fn run_vm(args: RunArgs) -> Result<()> {
     // half-executes and then restarts, and its diagnostics are reported
     // once (by the build) rather than by both paths.
     if !args.no_fallback {
-        if let Some(missing) = unmodelled_imports(&args.path, &entry) {
+        if let Some(missing) = unmodelled_references(&args.path, &entry) {
             eprintln!(
                 "note: `{}` {} not modelled by the in-process VM — running via \
                  `--compile` (build + CPython) so the program behaves as it \
@@ -443,12 +443,18 @@ fn run_vm(args: RunArgs) -> Result<()> {
     std::process::exit(code);
 }
 
-/// Modules the program imports that the VM cannot serve, or `None` when
-/// every import is either VM-modelled or a module of this project.
+/// Modules the program imports, and `module.attr` names it reads, that the
+/// VM cannot serve — or `None` when every import is either VM-modelled or a
+/// module of this project, and every attribute read on a modelled module is
+/// one its VM model exports (or one the program assigns itself).
 ///
 /// Scans the same file set the pre-run check covers, so an unmodelled
 /// import in a sibling module is caught before the entry starts running.
-fn unmodelled_imports(path: &std::path::Path, entry: &std::path::Path) -> Option<Vec<String>> {
+/// The attribute half closes the gap the import scan leaves: a missing
+/// *attribute* of a modelled module (`math.nextafter` before the VM had
+/// it) is otherwise a silent-until-runtime `AttributeError` on a program
+/// the compiled path runs fine.
+fn unmodelled_references(path: &std::path::Path, entry: &std::path::Path) -> Option<Vec<String>> {
     let scope = vm_check_scope(path, entry);
     let mut files: Vec<PathBuf> = Vec::new();
     for p in scope {
@@ -485,15 +491,17 @@ fn unmodelled_imports(path: &std::path::Path, entry: &std::path::Path) -> Option
         }
     }
     let mut missing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut exports = ModelledExports::default();
     for file in &files {
-        let Some(roots) = imported_roots(file) else {
+        let Some(module) = parse_for_scan(file) else {
             // Falling back to the compiled path is the safe answer for a
             // file this scan cannot read: the build reports the parse
             // error properly, and the VM never starts on an unknown import.
             missing.insert(format!("<unparsed {}>", file.display()));
             continue;
         };
-        for root in roots {
+        missing.extend(unmodelled_attribute_references(&module, &mut exports));
+        for root in tyc_resolve::collect_imported_roots(&module) {
             if tyc_vm::models_module(&root) || project_roots.contains(&root) {
                 continue;
             }
@@ -539,15 +547,289 @@ fn sibling_modules(entry: &std::path::Path) -> Vec<PathBuf> {
 }
 
 /// The import roots `file` names, or `None` when it cannot be read or parsed.
+fn imported_roots(file: &std::path::Path) -> Option<std::collections::BTreeSet<String>> {
+    parse_for_scan(file).map(|module| tyc_resolve::collect_imported_roots(&module))
+}
+
+/// `file` parsed for the pre-run scans, or `None` when it cannot be read or
+/// parsed.
 ///
 /// Runs the same expansion chain the VM's entry point does, so a file using
 /// `?`, `|>` or `gather:` is read rather than silently skipped.
-fn imported_roots(file: &std::path::Path) -> Option<std::collections::BTreeSet<String>> {
+fn parse_for_scan(file: &std::path::Path) -> Option<ruff_python_ast::ModModule> {
     let text = std::fs::read_to_string(file).ok()?;
     let expanded = tyc_syntax::preprocess::expand_all(&text);
     let prep = tyc_syntax::preprocess::preprocess(&expanded);
     let parsed = tyc_syntax::parse_module(&prep.python_source).ok()?;
-    Some(tyc_resolve::collect_imported_roots(&parsed.into_syntax()))
+    Some(parsed.into_syntax())
+}
+
+/// What each VM-modelled module exports, asked of the VM itself and cached
+/// for one scan (instantiating a shim module is not free).
+#[derive(Default)]
+struct ModelledExports {
+    probe: Option<tyc_vm::Interpreter>,
+    cache: std::collections::HashMap<String, Option<std::collections::BTreeSet<String>>>,
+}
+
+impl ModelledExports {
+    /// The names `module` (possibly dotted) exports under the VM, or `None`
+    /// when the VM does not serve it as a module.
+    fn names(&mut self, module: &str) -> Option<&std::collections::BTreeSet<String>> {
+        if !self.cache.contains_key(module) {
+            let probe = self.probe.get_or_insert_with(tyc_vm::Interpreter::new);
+            let names = tyc_vm::modelled_module_exports(probe, module);
+            self.cache.insert(module.to_owned(), names);
+        }
+        self.cache.get(module).and_then(|names| names.as_ref())
+    }
+}
+
+/// `module.attr` reads in `module` whose target the VM does not export,
+/// spelled `module.attr` (with the real module name, whatever the program
+/// bound it to).
+///
+/// Deliberately conservative — a false positive only costs the VM's fast
+/// path, but a program must never be sent down the compiled path for an
+/// attribute that would have worked, and never kept in the VM for one that
+/// would not:
+///
+/// * only a *bare name* receiver counts, and only one bound by `import mod`
+///   / `import mod as alias` to a VM-modelled module. A name that anything
+///   else binds anywhere in the file (a `from` import, a parameter, a
+///   `let`, a `for` target, a `def`, an `except … as`, a match capture) is
+///   left alone: it may not be the module where it is read.
+/// * dotted reads walk down through submodules the VM also serves
+///   (`os.path.join`), and stop at the first non-module (`datetime.datetime`
+///   is a class the VM cannot enumerate this way).
+/// * an attribute the program itself assigns or `setattr`s on the module is
+///   the program's, not the VM's to export.
+fn unmodelled_attribute_references(
+    module: &ruff_python_ast::ModModule,
+    exports: &mut ModelledExports,
+) -> std::collections::BTreeSet<String> {
+    use ruff_python_ast::visitor::Visitor;
+
+    let mut scan = AttributeScan::default();
+    for stmt in &module.body {
+        scan.visit_stmt(stmt);
+    }
+    let mut missing = std::collections::BTreeSet::new();
+    for (root, chain) in &scan.loads {
+        if scan.shadowed.contains(root) {
+            continue;
+        }
+        let Some(target) = scan.aliases.get(root) else {
+            continue;
+        };
+        let mut module_name = target.clone();
+        let mut owned = root.clone();
+        for attr in chain {
+            owned.push('.');
+            owned.push_str(attr);
+            if scan.program_defined.contains(&owned) {
+                break;
+            }
+            let Some(names) = exports.names(&module_name) else {
+                break;
+            };
+            if !names.contains(attr) {
+                missing.insert(format!("{module_name}.{attr}"));
+                break;
+            }
+            module_name.push('.');
+            module_name.push_str(attr);
+        }
+    }
+    missing
+}
+
+/// One file's import aliases, bare-name attribute chains, and everything
+/// that disqualifies a name from being read as a module.
+#[derive(Default)]
+struct AttributeScan {
+    /// Bound name → the module it names, for `import mod` / `import mod as
+    /// alias` on VM-modelled modules.
+    aliases: std::collections::HashMap<String, String>,
+    /// Names bound by anything other than one consistent `import` — never
+    /// trusted as module receivers.
+    shadowed: std::collections::HashSet<String>,
+    /// `(root name, attribute chain)` for every `root.a.b` read.
+    loads: Vec<(String, Vec<String>)>,
+    /// Dotted paths (`root.a`, `root.a.b`) the program assigns, deletes or
+    /// `setattr`s itself.
+    program_defined: std::collections::HashSet<String>,
+}
+
+impl AttributeScan {
+    fn bind_import(&mut self, bound: &str, module: &str) {
+        match self.aliases.get(bound) {
+            Some(existing) if existing != module => {
+                self.shadowed.insert(bound.to_owned());
+            }
+            Some(_) => {}
+            None => {
+                if tyc_vm::models_module(module) {
+                    self.aliases.insert(bound.to_owned(), module.to_owned());
+                } else {
+                    // An unmodelled module is the import scan's business; a
+                    // project module's attributes are its own.
+                    self.shadowed.insert(bound.to_owned());
+                }
+            }
+        }
+    }
+}
+
+/// `root.a.b` as `(root, [a, b])` when the receiver chain bottoms out in a
+/// bare name; `None` for `f().x`, `xs[0].y` and the like.
+fn attribute_chain(attr: &ruff_python_ast::ExprAttribute) -> Option<(String, Vec<String>)> {
+    use ruff_python_ast::Expr;
+    let mut chain = vec![attr.attr.as_str().to_owned()];
+    let mut value = attr.value.as_ref();
+    loop {
+        match value {
+            Expr::Attribute(inner) => {
+                chain.push(inner.attr.as_str().to_owned());
+                value = inner.value.as_ref();
+            }
+            Expr::Name(name) => {
+                chain.reverse();
+                return Some((name.id.as_str().to_owned(), chain));
+            }
+            _ => return None,
+        }
+    }
+}
+
+impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
+    fn visit_stmt(&mut self, stmt: &'a ruff_python_ast::Stmt) {
+        use ruff_python_ast::Stmt;
+        match stmt {
+            Stmt::Import(imp) => {
+                for alias in &imp.names {
+                    let module = alias.name.as_str();
+                    match &alias.asname {
+                        Some(asname) => self.bind_import(asname.as_str(), module),
+                        // `import a.b.c` binds `a`, to the package `a`.
+                        None => {
+                            let root = module.split('.').next().unwrap_or(module);
+                            self.bind_import(root, root);
+                        }
+                    }
+                }
+            }
+            Stmt::ImportFrom(imp) => {
+                for alias in &imp.names {
+                    let bound = alias
+                        .asname
+                        .as_ref()
+                        .map(|a| a.as_str())
+                        .unwrap_or(alias.name.as_str());
+                    self.shadowed.insert(bound.to_owned());
+                }
+            }
+            Stmt::FunctionDef(f) => {
+                self.shadowed.insert(f.name.as_str().to_owned());
+            }
+            Stmt::ClassDef(c) => {
+                self.shadowed.insert(c.name.as_str().to_owned());
+            }
+            Stmt::TypeAlias(t) => {
+                if let ruff_python_ast::Expr::Name(n) = t.name.as_ref() {
+                    self.shadowed.insert(n.id.as_str().to_owned());
+                }
+            }
+            _ => {}
+        }
+        ruff_python_ast::visitor::walk_stmt(self, stmt);
+    }
+
+    fn visit_expr(&mut self, expr: &'a ruff_python_ast::Expr) {
+        use ruff_python_ast::{Expr, ExprContext};
+        match expr {
+            // A store or delete of the bare name rebinds it.
+            Expr::Name(n) if !matches!(n.ctx, ExprContext::Load) => {
+                self.shadowed.insert(n.id.as_str().to_owned());
+            }
+            Expr::Attribute(a) => {
+                if let Some((root, chain)) = attribute_chain(a) {
+                    if matches!(a.ctx, ExprContext::Load) {
+                        self.loads.push((root, chain));
+                    } else {
+                        // `mod.x = …` / `del mod.x`: every prefix the store
+                        // touches is the program's own.
+                        let mut path = root;
+                        for attr in &chain {
+                            path.push('.');
+                            path.push_str(attr);
+                        }
+                        self.program_defined.insert(path);
+                    }
+                    // The chain is names and attributes only: nothing left
+                    // to walk.
+                    return;
+                }
+            }
+            // `setattr(mod, "x", …)` / `delattr(mod, "x")` with a literal
+            // name — the dynamic spelling of the store above.
+            Expr::Call(call) => {
+                if let Expr::Name(func) = call.func.as_ref() {
+                    if matches!(func.id.as_str(), "setattr" | "delattr") {
+                        if let [Expr::Name(target), Expr::StringLiteral(name), ..] =
+                            call.arguments.args.as_ref()
+                        {
+                            self.program_defined.insert(format!(
+                                "{}.{}",
+                                target.id.as_str(),
+                                name.value.to_str()
+                            ));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        ruff_python_ast::visitor::walk_expr(self, expr);
+    }
+
+    fn visit_parameters(&mut self, parameters: &'a ruff_python_ast::Parameters) {
+        for param in parameters.iter() {
+            self.shadowed.insert(param.name().as_str().to_owned());
+        }
+        ruff_python_ast::visitor::walk_parameters(self, parameters);
+    }
+
+    fn visit_except_handler(&mut self, handler: &'a ruff_python_ast::ExceptHandler) {
+        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = handler;
+        if let Some(name) = &h.name {
+            self.shadowed.insert(name.as_str().to_owned());
+        }
+        ruff_python_ast::visitor::walk_except_handler(self, handler);
+    }
+
+    fn visit_pattern(&mut self, pattern: &'a ruff_python_ast::Pattern) {
+        use ruff_python_ast::Pattern;
+        match pattern {
+            Pattern::MatchAs(p) => {
+                if let Some(name) = &p.name {
+                    self.shadowed.insert(name.as_str().to_owned());
+                }
+            }
+            Pattern::MatchStar(p) => {
+                if let Some(name) = &p.name {
+                    self.shadowed.insert(name.as_str().to_owned());
+                }
+            }
+            Pattern::MatchMapping(p) => {
+                if let Some(rest) = &p.rest {
+                    self.shadowed.insert(rest.as_str().to_owned());
+                }
+            }
+            _ => {}
+        }
+        ruff_python_ast::visitor::walk_pattern(self, pattern);
+    }
 }
 
 /// Package directories beside `entry` that the program reaches by import — a
@@ -711,6 +993,106 @@ mod tests {
         std::fs::write(&entry, "let x: int = 1\n").unwrap();
         let scope = vm_check_scope(&entry, &entry);
         assert_eq!(scope, vec![entry.clone()]);
+    }
+
+    /// Write `source` as a lone `.ty` file and run the pre-run scan on it.
+    fn scan_source(source: &str) -> Option<Vec<String>> {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = dir.path().join("probe.ty");
+        std::fs::write(&entry, source).unwrap();
+        unmodelled_references(&entry, &entry)
+    }
+
+    #[test]
+    fn attribute_scan_reports_a_missing_attribute_of_a_modelled_module() {
+        // The module is modelled, the attribute is not: the program would
+        // die with `AttributeError` in the VM, so it takes the compiled path,
+        // and the note names `module.attr`.
+        let missing = scan_source("import math\n\nprint(math.no_such_function(1.0))\n");
+        assert_eq!(missing, Some(vec!["math.no_such_function".to_owned()]));
+        // The real module name is reported, not the alias.
+        let missing = scan_source("import math as m\n\nprint(m.no_such_function(1.0))\n");
+        assert_eq!(missing, Some(vec!["math.no_such_function".to_owned()]));
+    }
+
+    #[test]
+    fn attribute_scan_walks_dotted_submodules() {
+        assert_eq!(
+            scan_source("import os\n\nprint(os.path.join(\"a\", \"b\"))\n"),
+            None
+        );
+        assert_eq!(
+            scan_source("import os.path as p\n\nprint(p.join(\"a\", \"b\"))\n"),
+            None
+        );
+        assert_eq!(
+            scan_source("import os\n\nprint(os.path.no_such_helper(\"a\"))\n"),
+            Some(vec!["os.path.no_such_helper".to_owned()])
+        );
+        // A non-module member ends the walk: the VM cannot enumerate a class
+        // this way, so nothing below it is judged.
+        assert_eq!(
+            scan_source("import datetime\n\nprint(datetime.datetime.now().year)\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn attribute_scan_never_false_positives_on_modelled_names() {
+        // Every name the VM's model exports passes, including one that only
+        // exists through the live namespace of a shim module.
+        assert_eq!(
+            scan_source(
+                "import math\nimport sys\nimport json\n\n\
+                 print(math.isclose(1.0, 1.0), sys.modules is not None, json.dumps([1]))\n"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn attribute_scan_ignores_from_imports_and_program_defined_attributes() {
+        // `from mod import name` binds a plain name: nothing to scan.
+        assert_eq!(
+            scan_source("from math import isclose\n\nprint(isclose(1.0, 1.0))\n"),
+            None
+        );
+        // An attribute the program sets on the module is the program's.
+        assert_eq!(
+            scan_source("import sys\n\nsys.custom_flag = 1\nprint(sys.custom_flag)\n"),
+            None
+        );
+        assert_eq!(
+            scan_source("import sys\n\nsetattr(sys, \"custom_flag\", 1)\nprint(sys.custom_flag)\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn attribute_scan_leaves_a_rebound_alias_alone() {
+        // The alias is a parameter (or any other binding) somewhere in the
+        // file: a read through it may not be the module, so it is not judged.
+        assert_eq!(
+            scan_source(
+                "import re\n\ndef f(re: int) -> int:\n    return re.no_such_method()\n\n\
+                 print(f(1))\n"
+            ),
+            None
+        );
+        assert_eq!(
+            scan_source("import math\n\nfor math in [1, 2]:\n    print(math.no_such)\n"),
+            None
+        );
+        // A project module's attributes are its own, never judged either.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("helper.ty"), "pub let value: int = 1\n").unwrap();
+        let entry = dir.path().join("probe.ty");
+        std::fs::write(
+            &entry,
+            "import helper\n\nprint(helper.value, helper.missing)\n",
+        )
+        .unwrap();
+        assert_eq!(unmodelled_references(&entry, &entry), None);
     }
 
     #[test]

@@ -1461,6 +1461,15 @@ pub type NativeFnImpl =
 pub struct NativeFn {
     pub name: &'static str,
     pub func: Box<NativeFnImpl>,
+    /// The native stands in for a CPython *coroutine function*
+    /// (`asyncio.sleep`, `Queue.get`, a `Lock.__aenter__`, …). The VM's
+    /// scheduler is sequential, so the body runs at the call and the result
+    /// is already known — but the caller still has to `await` it, so
+    /// `call_value` hands the result back wrapped in a completed task rather
+    /// than bare. That keeps `await` strict: a plain value in `await` is
+    /// CPython's `TypeError`, and only a coroutine, a task, or a flagged
+    /// native's result gets through.
+    pub awaitable: bool,
 }
 
 impl NativeFn {
@@ -1471,6 +1480,20 @@ impl NativeFn {
         NativeFn {
             name,
             func: Box::new(f),
+            awaitable: false,
+        }
+    }
+
+    /// A native whose CPython counterpart is `async def` — see
+    /// [`NativeFn::awaitable`].
+    pub fn new_awaitable<F>(name: &'static str, f: F) -> Self
+    where
+        F: Fn(&mut crate::interp::Interpreter, Vec<Value>) -> Result<Value, Unwind> + 'static,
+    {
+        NativeFn {
+            name,
+            func: Box::new(f),
+            awaitable: true,
         }
     }
 }
@@ -1744,6 +1767,10 @@ pub enum IterState {
     Map {
         func: Value,
         inner: Rc<RefCell<IterState>>,
+        /// `map(f, xs, ys, …)`: `inner` zips the iterables and each item is
+        /// a tuple spread over `f`'s parameters (stopping at the shortest
+        /// iterable, as CPython does).
+        star: bool,
     },
     Filter {
         func: Value,
@@ -2212,6 +2239,8 @@ impl Value {
             // (a native named "int"); match it against the type object's name.
             (Class(c), Native(n)) | (Native(n), Class(c)) => c.name == n.name,
             (Native(a), Native(b)) => Rc::ptr_eq(a, b),
+            // A function object is equal only to itself.
+            (Function(a), Function(b)) => Rc::ptr_eq(a, b),
             // Dataclass instances compare by value: same class and all
             // fields equal (recursively). CPython's generated `__eq__`
             // compares the field tuple only when the two operands are of

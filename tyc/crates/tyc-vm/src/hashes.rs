@@ -347,6 +347,10 @@ pub fn digest(name: &str, data: &[u8]) -> Option<Vec<u8>> {
         "sha512" => sha512(data),
         "blake2b" => blake2b(data, 64),
         "blake2s" => blake2s(data, 32),
+        "sha3_224" => sha3(data, 28),
+        "sha3_256" => sha3(data, 32),
+        "sha3_384" => sha3(data, 48),
+        "sha3_512" => sha3(data, 64),
         _ => return None,
     })
 }
@@ -362,8 +366,175 @@ pub fn sizes(name: &str) -> Option<(usize, usize)> {
         "sha512" => (64, 128),
         "blake2b" => (64, 128),
         "blake2s" => (32, 64),
+        // SHA-3's block size is the sponge rate, `200 - 2 * digest_size`.
+        "sha3_224" => (28, 144),
+        "sha3_256" => (32, 136),
+        "sha3_384" => (48, 104),
+        "sha3_512" => (64, 72),
         _ => return None,
     })
+}
+
+// ── SHA-3 (FIPS 202) ───────────────────────────────────────────────────────
+
+/// Keccak-f[1600] round constants.
+const KECCAK_RC: [u64; 24] = [
+    0x0000000000000001,
+    0x0000000000008082,
+    0x800000000000808a,
+    0x8000000080008000,
+    0x000000000000808b,
+    0x0000000080000001,
+    0x8000000080008081,
+    0x8000000000008009,
+    0x000000000000008a,
+    0x0000000000000088,
+    0x0000000080008009,
+    0x000000008000000a,
+    0x000000008000808b,
+    0x800000000000008b,
+    0x8000000000008089,
+    0x8000000000008003,
+    0x8000000000008002,
+    0x8000000000000080,
+    0x000000000000800a,
+    0x800000008000000a,
+    0x8000000080008081,
+    0x8000000000008080,
+    0x0000000080000001,
+    0x8000000080008008,
+];
+
+/// Rotation offsets for the ρ step, in the lane order π visits them.
+const KECCAK_ROTC: [u32; 24] = [
+    1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14, 27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44,
+];
+
+/// Lane permutation for the π step.
+const KECCAK_PILN: [usize; 24] = [
+    10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4, 15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1,
+];
+
+/// The Keccak-f[1600] permutation over a 25-lane state.
+fn keccak_f1600(st: &mut [u64; 25]) {
+    let mut bc = [0u64; 5];
+    for rc in KECCAK_RC {
+        // θ
+        for i in 0..5 {
+            bc[i] = st[i] ^ st[i + 5] ^ st[i + 10] ^ st[i + 15] ^ st[i + 20];
+        }
+        for i in 0..5 {
+            let t = bc[(i + 4) % 5] ^ bc[(i + 1) % 5].rotate_left(1);
+            for j in (0..25).step_by(5) {
+                st[j + i] ^= t;
+            }
+        }
+        // ρ and π
+        let mut t = st[1];
+        for i in 0..24 {
+            let j = KECCAK_PILN[i];
+            let lane = st[j];
+            st[j] = t.rotate_left(KECCAK_ROTC[i]);
+            t = lane;
+        }
+        // χ
+        for j in (0..25).step_by(5) {
+            bc.copy_from_slice(&st[j..j + 5]);
+            for i in 0..5 {
+                st[j + i] ^= (!bc[(i + 1) % 5]) & bc[(i + 2) % 5];
+            }
+        }
+        // ι
+        st[0] ^= rc;
+    }
+}
+
+/// XOR one rate-sized block into the state, little-endian lanes.
+fn keccak_absorb(st: &mut [u64; 25], block: &[u8]) {
+    for (lane, bytes) in st.iter_mut().zip(block.chunks(8)) {
+        let mut b = [0u8; 8];
+        b[..bytes.len()].copy_from_slice(bytes);
+        *lane ^= u64::from_le_bytes(b);
+    }
+}
+
+/// SHA-3 with a `digest_size`-byte digest: the Keccak sponge at rate
+/// `200 - 2 * digest_size` with the `01` domain suffix and pad10*1.
+pub fn sha3(data: &[u8], digest_size: usize) -> Vec<u8> {
+    let rate = 200 - 2 * digest_size;
+    let mut st = [0u64; 25];
+    let mut chunks = data.chunks_exact(rate);
+    for chunk in &mut chunks {
+        keccak_absorb(&mut st, chunk);
+        keccak_f1600(&mut st);
+    }
+    let rem = chunks.remainder();
+    let mut block = vec![0u8; rate];
+    block[..rem.len()].copy_from_slice(rem);
+    block[rem.len()] ^= 0x06;
+    block[rate - 1] ^= 0x80;
+    keccak_absorb(&mut st, &block);
+    keccak_f1600(&mut st);
+    // One squeeze suffices: every SHA-3 digest is shorter than its rate.
+    let mut out = Vec::with_capacity(digest_size);
+    for lane in st.iter() {
+        out.extend_from_slice(&lane.to_le_bytes());
+        if out.len() >= digest_size {
+            break;
+        }
+    }
+    out.truncate(digest_size);
+    out
+}
+
+// ── HMAC / PBKDF2 (RFC 2104 / RFC 8018) ───────────────────────────────────
+
+/// HMAC over any digest `digest` knows, or `None` for an unknown name.
+pub fn hmac(name: &str, key: &[u8], msg: &[u8]) -> Option<Vec<u8>> {
+    let (_, block) = sizes(name)?;
+    let mut k = if key.len() > block {
+        digest(name, key)?
+    } else {
+        key.to_vec()
+    };
+    k.resize(block, 0);
+    let mut inner: Vec<u8> = k.iter().map(|b| b ^ 0x36).collect();
+    inner.extend_from_slice(msg);
+    let inner_hash = digest(name, &inner)?;
+    let mut outer: Vec<u8> = k.iter().map(|b| b ^ 0x5c).collect();
+    outer.extend_from_slice(&inner_hash);
+    digest(name, &outer)
+}
+
+/// `hashlib.pbkdf2_hmac(hash_name, password, salt, iterations, dklen)`;
+/// `dklen` defaults to the digest size. `None` for an unknown digest name.
+pub fn pbkdf2_hmac(
+    name: &str,
+    password: &[u8],
+    salt: &[u8],
+    iterations: u64,
+    dklen: Option<usize>,
+) -> Option<Vec<u8>> {
+    let (digest_size, _) = sizes(name)?;
+    let dklen = dklen.unwrap_or(digest_size);
+    let mut out = Vec::with_capacity(dklen);
+    let mut block_index: u32 = 1;
+    while out.len() < dklen {
+        let mut msg = salt.to_vec();
+        msg.extend_from_slice(&block_index.to_be_bytes());
+        let mut u = hmac(name, password, &msg)?;
+        let mut t = u.clone();
+        for _ in 1..iterations {
+            u = hmac(name, password, &u)?;
+            for (acc, byte) in t.iter_mut().zip(u.iter()) {
+                *acc ^= byte;
+            }
+        }
+        out.extend_from_slice(&t);
+        block_index += 1;
+    }
+    out.truncate(dklen);
+    Some(out)
 }
 
 /// BLAKE2's message-word permutation, the same ten rows for both variants.
