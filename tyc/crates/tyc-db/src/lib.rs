@@ -48,7 +48,7 @@ pub struct SourceFile {
 /// `T | None`. Salsa caches the result, so an editor edit that doesn't change
 /// the file's text content (e.g. saving with no edits) avoids re-running the
 /// preprocess pass.
-#[salsa::tracked]
+#[salsa::tracked(returns(clone))]
 pub fn preprocessed_text(db: &dyn salsa::Database, file: SourceFile) -> String {
     // Delegate to the full-result query so the expand+preprocess work is
     // shared with `resolved_module` and the check pipeline. Salsa caches
@@ -81,16 +81,10 @@ impl std::ops::Deref for ArcPreprocessResult {
 }
 
 // SAFETY: same argument as for `ArcResolvedModule`.
-unsafe impl salsa::Update for ArcPreprocessResult {
-    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
-        if Arc::ptr_eq(&(*old_pointer).0, &new_value.0) {
-            false
-        } else {
-            *old_pointer = new_value;
-            true
-        }
-    }
-}
+// SAFETY: the wrapper holds only `'static` data behind an `Arc` and
+// references no salsa-interned or tracked struct; equality is pointer
+// identity (see `PartialEq` above), which is conservative but sound.
+unsafe impl salsa::SalsaValue for ArcPreprocessResult {}
 
 /// Tracked query: run sugar-expansion + the preprocessor and cache the
 /// full [`PreprocessResult`].
@@ -99,7 +93,7 @@ unsafe impl salsa::Update for ArcPreprocessResult {
 /// expand-then-preprocess pipeline; sharing it through this query means
 /// each source-text change runs the work exactly once instead of three
 /// times (preprocessed_text, resolved_module, and the check pipeline).
-#[salsa::tracked]
+#[salsa::tracked(returns(clone))]
 pub fn preprocessed_full(db: &dyn salsa::Database, file: SourceFile) -> ArcPreprocessResult {
     let text = file.text(db);
     // The mapped chain leaves `line_map` (preprocessed line → `.ty` line) on
@@ -117,7 +111,7 @@ pub fn preprocessed_full(db: &dyn salsa::Database, file: SourceFile) -> ArcPrepr
 /// The full [`ResolvedModule`](tyc_resolve::ResolvedModule) isn't yet
 /// `salsa::Update`-friendly, so this is the slice of the resolve step
 /// that's salsa-cacheable today.
-#[salsa::tracked]
+#[salsa::tracked(returns(clone))]
 pub fn module_decl_names(db: &dyn salsa::Database, file: SourceFile) -> Vec<String> {
     // Reuse the cached resolved module so a hover / completion path
     // doesn't trigger an independent parse+resolve cycle.
@@ -196,18 +190,10 @@ impl std::ops::Deref for ArcResolvedModule {
 // managed by Salsa.  The assignment `*old_pointer = new_value` drops the previous
 // Arcs (decrementing their refcounts) before storing the new ones, which is correct.
 // Pointer equality is used as a conservative proxy for value equality.
-unsafe impl salsa::Update for ArcResolvedModule {
-    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
-        if Arc::ptr_eq(&(*old_pointer).0, &new_value.0)
-            && Arc::ptr_eq(&(*old_pointer).1, &new_value.1)
-        {
-            false
-        } else {
-            *old_pointer = new_value;
-            true
-        }
-    }
-}
+// SAFETY: the wrapper holds only `'static` data behind an `Arc` and
+// references no salsa-interned or tracked struct; equality is pointer
+// identity (see `PartialEq` above), which is conservative but sound.
+unsafe impl salsa::SalsaValue for ArcResolvedModule {}
 
 /// Newtype wrapper around `Arc<Diagnostics>` for use as a `#[salsa::tracked]`
 /// query return type.
@@ -241,16 +227,10 @@ impl std::ops::Deref for ArcDiagnostics {
 }
 
 // SAFETY: same argument as for `ArcResolvedModule`.
-unsafe impl salsa::Update for ArcDiagnostics {
-    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
-        if Arc::ptr_eq(&(*old_pointer).0, &new_value.0) {
-            false
-        } else {
-            *old_pointer = new_value;
-            true
-        }
-    }
-}
+// SAFETY: the wrapper holds only `'static` data behind an `Arc` and
+// references no salsa-interned or tracked struct; equality is pointer
+// identity (see `PartialEq` above), which is conservative but sound.
+unsafe impl salsa::SalsaValue for ArcDiagnostics {}
 
 /// Salsa-tracked query: run the full check pipeline for a file and return
 /// the cached [`Diagnostics`].
@@ -267,7 +247,7 @@ unsafe impl salsa::Update for ArcDiagnostics {
 /// The body is [`check_pipeline`] with no cross-module registry — the exact
 /// same function [`check_source_file_with_imports`] runs, so the single-file
 /// path can never drift from the project path again (F55).
-#[salsa::tracked]
+#[salsa::tracked(returns(clone))]
 fn check_diagnostics(db: &dyn salsa::Database, file: SourceFile) -> ArcDiagnostics {
     ArcDiagnostics::new(check_pipeline(db, file, None))
 }
@@ -282,7 +262,7 @@ fn check_diagnostics(db: &dyn salsa::Database, file: SourceFile) -> ArcDiagnosti
 /// Returns an [`ArcResolvedModule`] (a thin newtype around
 /// `Arc<ResolvedModule>`) so the `salsa::Update` impl can satisfy the orphan
 /// rule.  Callers can deref directly or clone the inner `Arc` via `.0`.
-#[salsa::tracked]
+#[salsa::tracked(returns(clone))]
 pub fn resolved_module(db: &dyn salsa::Database, file: SourceFile) -> ArcResolvedModule {
     let raw_text = file.text(db).clone();
     let path = file.path(db).clone();
@@ -423,7 +403,7 @@ fn collect_original_lazy_import_alias_spans(source: &str) -> Vec<OriginalLazyAli
 /// `resolved_module` query result. Returns the same Arc on repeated calls
 /// for the same file (pointer equality), so LSP caching tests pass.
 pub fn resolved_module_arc(db: &dyn salsa::Database, file: SourceFile) -> Arc<ResolvedModule> {
-    resolved_module(db, file).into_resolved_arc()
+    resolved_module(db, file).resolved_arc()
 }
 
 /// The Typhon database — concrete carrier of salsa state.
@@ -596,16 +576,10 @@ impl std::ops::Deref for ArcModuleShapes {
 }
 
 // SAFETY: same argument as for `ArcResolvedModule`.
-unsafe impl salsa::Update for ArcModuleShapes {
-    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
-        if Arc::ptr_eq(&(*old_pointer).0, &new_value.0) {
-            false
-        } else {
-            *old_pointer = new_value;
-            true
-        }
-    }
-}
+// SAFETY: the wrapper holds only `'static` data behind an `Arc` and
+// references no salsa-interned or tracked struct; equality is pointer
+// identity (see `PartialEq` above), which is conservative but sound.
+unsafe impl salsa::SalsaValue for ArcModuleShapes {}
 
 /// Salsa-tracked variant of [`extract_shapes_for_path`]. The LSP
 /// backend keeps a `HashMap<dotted_name, SourceFile>` per project
@@ -620,7 +594,7 @@ unsafe impl salsa::Update for ArcModuleShapes {
 ///
 /// The result is wrapped in [`ArcModuleShapes`]; callers typically
 /// unwrap via `.0.clone()` to drop the wrapper.
-#[salsa::tracked]
+#[salsa::tracked(returns(clone))]
 pub fn module_shapes_query(db: &dyn salsa::Database, file: SourceFile) -> ArcModuleShapes {
     let text = file.text(db).clone();
     let shapes = extract_shapes_for_path(&file.path(db).clone(), &text);
