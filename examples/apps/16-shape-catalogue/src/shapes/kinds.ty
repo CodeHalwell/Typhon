@@ -1,0 +1,20 @@
+pub class Circle frozen:
+    r: float
+
+pub class Rect frozen:
+    w: float
+    h: float
+
+pub class Tri frozen:
+    a: float
+    b: float
+    c: float
+
+pub type Shape = Circle | Rect | Tri
+
+pub newtype ShapeId = int
+
+pub enum Kind:
+    ROUND
+    BOXY
+    POINTY

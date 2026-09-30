@@ -1,0 +1,39 @@
+from collections.abc import Callable
+
+from shapes import Shape, ShapeId, area
+from .text import describe
+
+
+pub class Catalogue:
+    shapes: dict[int, Shape]
+    next_id: int = 1
+
+
+impl Catalogue:
+    def add(self, shape: Shape) -> ShapeId:
+        let sid: ShapeId = ShapeId(self.next_id)
+        self.shapes[self.next_id] = shape
+        self.next_id = self.next_id + 1
+        return sid
+
+    def get(self, sid: ShapeId) -> Shape?:
+        return self.shapes.get(sid)
+
+    def require(self, sid: ShapeId) -> Result[Shape, str]:
+        let found: Shape? = self.get(sid)
+        if found is None:
+            return Err(f"no shape with id {sid}")
+        return Ok(found)
+
+    def total_area(self) -> float:
+        mut total: float = 0.0
+        for s in self.shapes.values():
+            total = total + area(s)
+        return total
+
+    def find(self, pred: Callable[[Shape], bool]) -> list[Shape]:
+        return [s for s in self.shapes.values() if pred(s)]
+
+    def summary(self) -> str:
+        let parts: list[str] = [describe(s).slug() for s in self.shapes.values()]
+        return ", ".join(parts)

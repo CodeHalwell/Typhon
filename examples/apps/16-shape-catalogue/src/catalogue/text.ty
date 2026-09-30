@@ -1,0 +1,21 @@
+from shapes import Shape, Circle, Rect, Tri, kind_of
+
+
+extend str:
+    def slug(self) -> str:
+        return self.strip().lower().replace(" ", "-")
+
+
+pub def describe(s: Shape) -> str:
+    match s:
+        case Circle(r):
+            return f"circle r={r:.1f}"
+        case Rect(w, h):
+            return f"rect {w:.1f} by {h:.1f}"
+        case Tri(a, b, c):
+            return f"tri {a:.1f} {b:.1f} {c:.1f}"
+
+
+pub def label(s: Shape) -> str:
+    let name: str = kind_of(s).name
+    return f"{name} {describe(s)}".slug()

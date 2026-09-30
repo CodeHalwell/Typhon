@@ -2191,12 +2191,39 @@ impl Interpreter {
             },
         );
         module = desugar_out.module;
-        let (registry, _stats) = tyc_analyse::extract_builtin_extensions(&mut module);
-        let _ = tyc_analyse::rewrite_builtin_extension_calls(&mut module, &registry);
-        // Store the extension registry for cross-module rewrite (#202).
+        let (mut registry, _stats) = tyc_analyse::extract_builtin_extensions(&mut module);
+        // Store the module's own extension registry for cross-module
+        // rewrite (#202) before the merge below adds its imports' entries.
         if !registry.is_empty() {
             self.builtin_ext_registries
-                .insert(name.to_owned(), registry);
+                .insert(name.to_owned(), registry.clone());
+        }
+        // Mirror the entry-module pipeline (lib.rs): an imported module's
+        // own `extend BUILTIN` call sites on receivers it imports from
+        // *its* siblings (`describe(s).slug()` with `describe` from a
+        // sibling and `slug` declared there) must be lowered too, else
+        // the VM raised `AttributeError` where `tyc build` + CPython ran
+        // (2026-09-30 review — the "transitive consumer" gap).
+        match (self.source_root.clone(), path.parent()) {
+            (Some(root), Some(importer_dir)) => {
+                let (cross_fns, external_facts) = crate::merge_cross_module_extensions_for_vm(
+                    &module,
+                    &root,
+                    importer_dir,
+                    &mut registry,
+                );
+                let _ = tyc_analyse::rewrite_builtin_extension_calls_with_facts(
+                    &mut module,
+                    &registry,
+                    &external_facts,
+                );
+                if !cross_fns.is_empty() {
+                    crate::inject_vm_cross_module_ext_imports(&mut module, &cross_fns, &root);
+                }
+            }
+            _ => {
+                let _ = tyc_analyse::rewrite_builtin_extension_calls(&mut module, &registry);
+            }
         }
 
         // Evaluate the module body in a fresh child scope of root; copy

@@ -90,7 +90,17 @@ would widen it, and a `T?` receiver reads as `T`. A relative `from .provider
 import …` inside a package now finds the provider's extensions too. Every
 corpus unit emits byte-identical Python before and after; a receiver whose
 type the pass cannot see (a `match` capture, an unannotated lambda
-parameter, a `with … as` target, a stdlib call) is still left alone.
+parameter, a `with … as` target, a stdlib call) is still left alone. Under
+`tyc run` the same lowering now reaches an extension declared in a package
+submodule (`from catalogue.text import describe`, or a relative `from .text
+import …`) and an extension call inside an imported module itself — the VM
+skipped dotted modules and never merged an imported module's own
+cross-module extensions, so both raised `AttributeError` where the compiled
+path ran. A new corpus app, `examples/apps/16-shape-catalogue`, pins the
+multi-file shapes this review found gaps in: relative imports inside a
+package, a `pub *` facade re-exporting a `newtype`, `frozen` classes and an
+`enum`, cross-module sealed-union exhaustiveness, and `extend str` on call
+receivers on both surfaces.
 
 **Supply chain and tooling.** `salsa` 0.27 → 0.28.5 clears
 RUSTSEC-2026-0308 (the only `cargo deny` failure). The perf gate's absolute

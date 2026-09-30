@@ -160,7 +160,7 @@ pub fn run_source(
     // Pre-scan sibling modules for cross-module builtin extensions.
     if let Some(src_root) = origin.and_then(|p| p.parent()) {
         let (cross_module_fns, external_facts) =
-            merge_cross_module_extensions_for_vm(&module, src_root, &mut registry);
+            merge_cross_module_extensions_for_vm(&module, src_root, src_root, &mut registry);
         let _ = tyc_analyse::rewrite_builtin_extension_calls_with_facts(
             &mut module,
             &registry,
@@ -308,9 +308,10 @@ pub fn run_source(
 /// imports bind, so the call-site rewrite types `post.title` on an
 /// imported `Post`, `make()` on an imported function, or
 /// `textutil.make()` on an imported module.
-fn merge_cross_module_extensions_for_vm(
+pub(crate) fn merge_cross_module_extensions_for_vm(
     module: &ruff_python_ast::ModModule,
     src_root: &Path,
+    importer_dir: &Path,
     registry: &mut tyc_analyse::ExtensionRegistry,
 ) -> (
     std::collections::HashMap<String, String>,
@@ -323,21 +324,63 @@ fn merge_cross_module_extensions_for_vm(
     let mut external = tyc_analyse::TypeFacts::default();
     // Each sibling is read once; its facts are re-keyed per import.
     let mut loaded: HashMap<String, Option<tyc_analyse::TypeFacts>> = HashMap::new();
+    // Resolve an import to the sibling file it names and that file's
+    // absolute dotted module name (the name the injected
+    // `from <module> import __typhon_ext_…` must use). `a.b.c` is
+    // `a/b/c.ty` or the package `a/b/c/__init__.ty`; a relative
+    // `from .text import …` / `from ..kinds import …` climbs from the
+    // importing module's directory. (Dotted and relative modules were
+    // skipped outright before the 2026-09-30 review, so an extension
+    // declared in `catalogue/text.ty` was lowered by `tyc build` but
+    // raised `AttributeError` under `tyc run`.)
+    let resolve = |name: &str, level: u32| -> Option<(std::path::PathBuf, String)> {
+        let rel = name.replace('.', "/");
+        let base = if level == 0 {
+            src_root.to_path_buf()
+        } else {
+            let mut dir = importer_dir.to_path_buf();
+            for _ in 1..level {
+                dir = dir.parent()?.to_path_buf();
+            }
+            dir
+        };
+        let candidates: Vec<std::path::PathBuf> = if rel.is_empty() {
+            vec![base.join("__init__.ty")]
+        } else {
+            vec![
+                base.join(format!("{rel}.ty")),
+                base.join(&rel).join("__init__.ty"),
+            ]
+        };
+        let path = candidates.into_iter().find(|p| p.is_file())?;
+        let dotted = path
+            .strip_prefix(src_root)
+            .ok()?
+            .with_extension("")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let dotted = dotted
+            .strip_suffix("/__init__")
+            .unwrap_or(&dotted)
+            .replace('/', ".");
+        if dotted.is_empty() {
+            return None;
+        }
+        Some((path, dotted))
+    };
     let mut load = |name: &str,
+                    level: u32,
                     registry: &mut tyc_analyse::ExtensionRegistry,
                     cross_fns: &mut HashMap<String, String>|
      -> Option<tyc_analyse::TypeFacts> {
-        if let Some(cached) = loaded.get(name) {
+        let (path, dotted) = resolve(name, level)?;
+        if let Some(cached) = loaded.get(&dotted) {
             return cached.clone();
         }
-        let facts = if name.contains('.') {
-            None
-        } else {
-            std::fs::read_to_string(src_root.join(format!("{name}.ty")))
-                .ok()
-                .and_then(|text| merge_sibling_extensions(&text, name, registry, cross_fns))
-        };
-        loaded.insert(name.to_owned(), facts.clone());
+        let facts = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| merge_sibling_extensions(&text, &dotted, registry, cross_fns));
+        loaded.insert(dotted, facts.clone());
         facts
     };
     let publish_lifted = |external: &mut tyc_analyse::TypeFacts, facts: &tyc_analyse::TypeFacts| {
@@ -352,9 +395,13 @@ fn merge_cross_module_extensions_for_vm(
     for stmt in &module.body {
         match stmt {
             Stmt::ImportFrom(i) => {
-                let Some(m) = &i.module else { continue };
-                let name = m.id.to_string();
-                let Some(facts) = load(&name, registry, &mut cross_fns) else {
+                let name = i.module.as_ref().map(|m| m.id.to_string());
+                let name = match (name, i.level) {
+                    (Some(n), _) => n,
+                    (None, level) if level > 0 => String::new(),
+                    (None, _) => continue,
+                };
+                let Some(facts) = load(&name, i.level, registry, &mut cross_fns) else {
                     continue;
                 };
                 publish_lifted(&mut external, &facts);
@@ -381,7 +428,7 @@ fn merge_cross_module_extensions_for_vm(
                 // Handle all aliases in `import a, b, c` — not just the first.
                 for alias in &i.names {
                     let name = alias.name.id.to_string();
-                    let Some(facts) = load(&name, registry, &mut cross_fns) else {
+                    let Some(facts) = load(&name, 0, registry, &mut cross_fns) else {
                         continue;
                     };
                     publish_lifted(&mut external, &facts);
@@ -429,7 +476,7 @@ fn merge_sibling_extensions(
 /// Inject `from <module> import <fn_name>` AST nodes into `module` for
 /// cross-module extension functions. This allows the VM to resolve the
 /// lifted free functions during execution.
-fn inject_vm_cross_module_ext_imports(
+pub(crate) fn inject_vm_cross_module_ext_imports(
     module: &mut ruff_python_ast::ModModule,
     cross_fns: &std::collections::HashMap<String, String>,
     _src_root: &Path,
