@@ -98,7 +98,7 @@ Typhon needs a small set of helpers: the `Result` ADT, the lazy-import proxy, th
 
 ### Monkey-patching built-ins
 
-`extend str:` looks like it ought to allow you to add a `.to_slug()` method to every `str` in the program. It does not. The compiler extracts the method to a module-level free function (`__typhon_ext_str__to_slug`) and rewrites call sites *only when the receiver has a static `str` annotation*. Un-annotated receivers still raise `AttributeError`. This is intentional. Monkey-patching built-ins is the kind of thing that looks helpful for two weeks and is impossible to debug for the next two years.
+`extend str:` looks like it ought to allow you to add a `.to_slug()` method to every `str` in the program. It does not. The compiler extracts the method to a module-level free function (`__typhon_ext_str__to_slug`) and rewrites call sites *only when the receiver's static type is known to be `str`* — an annotated or evidently-initialised binding, a literal, a field of a known class, a call with a declared return type, a loop variable. A receiver the compiler cannot type (a `match` capture, an unannotated lambda parameter, a `with … as` target) still raises `AttributeError`. This is intentional. Monkey-patching built-ins is the kind of thing that looks helpful for two weeks and is impossible to debug for the next two years.
 
 ### Runtime `isinstance(x, SomeInterface)`
 
