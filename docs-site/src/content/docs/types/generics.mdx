@@ -158,6 +158,8 @@ def smallest[T: Ordered](xs: list[T]) -> T?:
 
 Variance describes how a generic type relates to its parameters: `Box[Dog]` is to `Box[Animal]` as `Dog` is to `Animal` (covariant), opposite (contravariant), or unrelated (invariant).
 
+For your own generic classes, variance is **inferred from usage**: a plain field is read-write and pins the parameter invariant; a field of a `frozen` class is read-only and covariant (`tuple[T, ...]` included); a method parameter is contravariant and a method return covariant — and the methods of every `impl[T] Name[T]:` block count exactly like methods in the class body. So a frozen `Producer[Dog]` flows into a `Producer[Animal]` slot, while a `Sink[T]` whose `impl` accepts a `T` stays invariant. A bare `@covariant` / `@contravariant` decorator on the class overrides the inference (both are checker-only and dropped from the emitted Python), and a generic class annotated without arguments (`let b: Box = Box(value=1)`) accepts any instantiation.
+
 The current checker treats container generics conservatively for the mutable forms, but **the read-only protocols are covariant on `T`** (v0.9.0):
 
 - **`list[T]`** — invariant (because `list` is mutable).

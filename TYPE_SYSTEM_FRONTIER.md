@@ -48,8 +48,14 @@ each class type-parameter's usage and stores per-class variance, consulted in
   (`infer_class_param_variance` / `collect_param_variance`, composed via
   `compose_variance` / `join_variance`). So a `class Producer[T]` with `T` only
   in returns accepts `Producer[Dog]` where `Producer[Animal]` is expected.
+- **Through `impl` blocks and `frozen` fields (2026-09-30 review)**: the
+  methods of every `impl[T] Name[T]:` block are observed exactly like methods
+  in the class body (before, only the body was — so idiomatic Typhon, which
+  puts methods in `impl`, was invariant regardless), and a field of a
+  `frozen` class is an output position (covariant), `tuple[T, ...]` included.
 - **Explicit override**: a bare `@covariant` / `@contravariant` class decorator
-  forces the variance regardless of inferred usage (`explicit_variance_override`).
+  forces the variance regardless of inferred usage (`explicit_variance_override`);
+  the desugarer strips both markers from the emitted Python.
 - **Through interface bounds (C4)**: variance flows soundly through
   bounded type-params (`T: SomeInterface`) — this closed a soundness hole, not
   just a relaxation.
@@ -101,6 +107,14 @@ These are the items the language reference and skill point here for:
   for the alpha.
 - **Function-level HKT params, non-class constructor application, constructor
   composition** — the deferred remainder of the HKT work above.
+- **Coroutine-typed calls** — the checker types an un-awaited call to an
+  `async def` as its declared return (the coroutine is transparent), relying
+  on `tyc::missing_await` / `tyc::async_without_await` to catch the common
+  shapes. So `make().slug()` with `async def make() -> str` passes, and the
+  `await`-on-non-awaitable check (2026-09-30) can only fire on callees
+  provably sync in the same module — `ModuleShapes` records no async flag for
+  free functions. Modelling `Coroutine[..., T]` as the call's type (and
+  carrying `is_async` in the shapes) would close both.
 
 ---
 

@@ -434,7 +434,9 @@ extend str:
 
 let title: str = "Hello World"
 print(title.slug())
-print("untyped".slug())              # AttributeError at runtime — no static `str` annotation
+print("literal".slug())              # literals are typed too — rewritten
+print(make().slug())                 # `def make() -> str` — rewritten
+print(self.title.slug())             # a `str` field — rewritten
 ```
 
 ```python
@@ -444,10 +446,12 @@ def __typhon_ext_str__slug__(self: str) -> str:
 
 title: str = "Hello World"
 print(__typhon_ext_str__slug__(title))
-print("untyped".slug())              # untouched; falls back to native attribute lookup
+print(__typhon_ext_str__slug__("literal"))
+print(__typhon_ext_str__slug__(make()))
+print(__typhon_ext_str__slug__(self.title))
 ```
 
-Only call sites whose receiver has a static `str` annotation get rewritten. No monkey-patching. `extend list[int]:` (parametric target) → `tyc::extend_builtin`; use `extend list:`.
+Only call sites whose receiver's static type is known to be `str` get rewritten — an annotated or evidently-initialised binding, a literal or f-string, a field / property of a known class, a call whose declared return is `str` (same-module or imported, `impl` methods, chained extension calls, an awaited `async def`), a subscript on a `list[str]` / `dict[K, str]`, or a loop / comprehension variable. A `match` capture, an unannotated lambda parameter or a `with … as` target is left alone and raises `AttributeError` at runtime. No monkey-patching. `extend list[int]:` (parametric target) → `tyc::extend_builtin`; use `extend list:`.
 
 ### 3.10 Field default ordering (v0.7.0)
 
