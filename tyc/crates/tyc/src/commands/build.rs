@@ -13,11 +13,11 @@ use tyc_analyse::{
     analyse_purity_with, class_names_at_marker_starts, collect_gatherable_async_fn_names,
     detect_missed_gathers, evaluate_comptime_with_functions, extract_builtin_extensions,
     load_profile_samples, parallel_opportunity_diagnostics, pgo_memoise_targets,
-    purity_diagnostics, rewrite_auto_gather, rewrite_builtin_extension_calls_tracking,
+    purity_diagnostics, rewrite_auto_gather, rewrite_builtin_extension_calls_with_facts,
     rewrite_parallel_comprehensions, rewrite_reduction_loops, shared_mut_across_tasks_diagnostics,
-    substitute_comptime_literals, ProfileSample,
+    substitute_comptime_literals, ClassFacts, ProfileSample, StaticType, TypeFacts,
 };
-use tyc_db::{check_file_with_imports, extract_shapes_for_path, TycDatabase};
+use tyc_db::{check_file_with_imports, extract_shapes_and_facts_for_path, TycDatabase};
 use tyc_desugar::{desugar_module_with, DesugarOptions};
 use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_emit::{emit_python_with_source_for_target, emit_stub};
@@ -368,23 +368,37 @@ pub fn run(args: BuildArgs) -> Result<()> {
     let src_root = src_root_owned.as_str();
     let mut project_shapes: std::collections::HashMap<String, tyc_db::ModuleShapes> =
         std::collections::HashMap::new();
+    // Per-module declared field / return types for the `extend BUILTIN:`
+    // call-site rewrite, from the same parse as the shapes. Only project
+    // sources have an AST here; every other module in `project_shapes`
+    // (bundled stubs, venv introspection, `pub *` facade aggregates) is
+    // converted from its shape on demand at the rewrite site.
+    let mut project_facts: std::collections::HashMap<String, TypeFacts> =
+        std::collections::HashMap::new();
     // `.dty` stubs alongside the source tree should win on name
     // collisions because they're the authored Typhon surface.
     if let Ok(dty) = crate::commands::util::collect_dty_files(&src_dir) {
         for file in dty {
             let dotted = crate::commands::util::path_to_dotted(&file, src_root);
+            if project_shapes.contains_key(&dotted) {
+                continue;
+            }
             if let Ok(text) = std::fs::read_to_string(&file) {
-                project_shapes
-                    .entry(dotted)
-                    .or_insert_with(|| extract_shapes_for_path(&file.to_string_lossy(), &text));
+                let (shapes, facts) =
+                    extract_shapes_and_facts_for_path(&file.to_string_lossy(), &text);
+                project_shapes.insert(dotted.clone(), shapes);
+                project_facts.insert(dotted, facts);
             }
         }
     }
     for (path, source) in &sources {
         let dotted = crate::commands::util::path_to_dotted(path, src_root);
-        project_shapes
-            .entry(dotted)
-            .or_insert_with(|| extract_shapes_for_path(&path.to_string_lossy(), source));
+        if project_shapes.contains_key(&dotted) {
+            continue;
+        }
+        let (shapes, facts) = extract_shapes_and_facts_for_path(&path.to_string_lossy(), source);
+        project_shapes.insert(dotted.clone(), shapes);
+        project_facts.insert(dotted, facts);
     }
     // Aggregate `pub *` package facades into their __init__ shape so a
     // downstream `from <pkg> import X` resolves through the facade.
@@ -1045,52 +1059,85 @@ pub fn run(args: BuildArgs) -> Result<()> {
         let (mut builtin_ext_registry, _ext_stats) = extract_builtin_extensions(&mut module);
         // Build cross-module extension registry scoped to modules that
         // the current file actually imports. This ensures the build path
-        // agrees with the type-checker's import-based visibility and avoids
-        // non-deterministic provider selection when multiple modules declare
-        // `extend BUILTIN:` for the same type. (#202 review feedback)
-        // `fn_name → source_module` reverse map for import injection.
+        // agrees with the type-checker's import-based visibility, and the
+        // first import statement wins when several imported modules
+        // declare the same method. (#202 review feedback)
+        // `fn_name → import spec` reverse map for import injection; a
+        // relative import keeps its leading dots so the injected import
+        // resolves inside a package.
         let mut cross_module_fns: HashMap<String, String> = HashMap::new();
-        {
-            use ruff_python_ast::Stmt;
-            // Collect the set of module names this file imports.
-            let mut imported_modules: std::collections::HashSet<&str> =
-                std::collections::HashSet::new();
-            for stmt in &module.body {
-                match stmt {
-                    Stmt::ImportFrom(i) => {
-                        if let Some(m) = &i.module {
-                            imported_modules.insert(m.id.as_str());
-                        }
-                    }
-                    Stmt::Import(i) => {
-                        for alias in &i.names {
-                            imported_modules.insert(alias.name.id.as_str());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            for mod_name in &imported_modules {
-                let Some(shapes) = project_shapes.get(*mod_name) else {
-                    continue;
-                };
-                for (cls_name, shape) in &shapes.class_shapes {
-                    if let Some(builtin) = cls_name.strip_prefix("__typhon_builtin_ext_") {
-                        let entry = builtin_ext_registry.entry(builtin.to_owned()).or_default();
-                        for method_name in shape.methods.keys() {
-                            let fn_name = format!("__typhon_ext_{builtin}__{method_name}__");
-                            entry.entry(method_name.clone()).or_insert_with(|| {
-                                cross_module_fns.insert(fn_name.clone(), mod_name.to_string());
-                                fn_name
-                            });
-                        }
+        let current_dotted = crate::commands::util::path_to_dotted(path, src_root);
+        let is_init = path.file_stem().and_then(|s| s.to_str()) == Some("__init__");
+        let imports = scan_module_imports(&module.body, &current_dotted, is_init);
+        for imp in &imports {
+            let Some(key) = import_shape_key(imp, &project_shapes) else {
+                continue;
+            };
+            for (cls_name, shape) in &project_shapes[key].class_shapes {
+                if let Some(builtin) = cls_name.strip_prefix("__typhon_builtin_ext_") {
+                    let entry = builtin_ext_registry.entry(builtin.to_owned()).or_default();
+                    for method_name in shape.methods.keys() {
+                        let fn_name = format!("__typhon_ext_{builtin}__{method_name}__");
+                        entry.entry(method_name.clone()).or_insert_with(|| {
+                            cross_module_fns.insert(fn_name.clone(), imp.spec.clone());
+                            fn_name
+                        });
                     }
                 }
             }
         }
         if !builtin_ext_registry.is_empty() {
-            let (_rewrites, used_fns) =
-                rewrite_builtin_extension_calls_tracking(&mut module, &builtin_ext_registry);
+            // Declared types of the names this module imports, so the
+            // call-site rewrite types `post.title` on an imported `Post`,
+            // `make()` on an imported function, and `textutil.make()` on
+            // an imported module the way it types a same-module
+            // declaration. Only assembled when an extension is in scope.
+            let mut external_facts = TypeFacts::default();
+            let mut facts_cache: HashMap<String, TypeFacts> = HashMap::new();
+            for imp in &imports {
+                let Some(key) = import_shape_key(imp, &project_shapes) else {
+                    continue;
+                };
+                let Some(facts) =
+                    module_type_facts(key, &project_shapes, &project_facts, &mut facts_cache)
+                else {
+                    continue;
+                };
+                // The lifted extension functions' return types, so a
+                // chained cross-module call (`t.slug().shout()`) types.
+                for (name, ty) in &facts.functions {
+                    if name.starts_with("__typhon_ext_") {
+                        external_facts.functions.insert(name.clone(), ty.clone());
+                    }
+                }
+                if let Some(alias) = &imp.module_alias {
+                    external_facts.modules.insert(alias.clone(), facts.clone());
+                }
+                for (name, local) in &imp.names {
+                    if name == "*" {
+                        external_facts.merge(TypeFacts {
+                            functions: facts.functions.clone(),
+                            async_functions: facts.async_functions.clone(),
+                            classes: facts.classes.clone(),
+                            modules: HashMap::new(),
+                        });
+                        continue;
+                    }
+                    external_facts.import_name(&facts, name, local);
+                    // `from pkg import submodule`: the name is a module.
+                    let sub = format!("{key}.{name}");
+                    if let Some(sub_facts) =
+                        module_type_facts(&sub, &project_shapes, &project_facts, &mut facts_cache)
+                    {
+                        external_facts.modules.insert(local.clone(), sub_facts);
+                    }
+                }
+            }
+            let (_rewrites, used_fns) = rewrite_builtin_extension_calls_with_facts(
+                &mut module,
+                &builtin_ext_registry,
+                &external_facts,
+            );
             // Inject `from <module> import <fn_name>` for cross-module
             // extension functions that were actually used. The injected
             // import uses the dotted module name; `from X import *` won't
@@ -1639,6 +1686,262 @@ pub fn run(args: BuildArgs) -> Result<()> {
     Ok(())
 }
 
+/// One import statement of the module being built, as the `extend
+/// BUILTIN:` cross-module plumbing sees it.
+struct ImportSpec {
+    /// The module as written (`textutil`, `a.b.c`), without relative dots.
+    raw: String,
+    /// The module resolved against the importing module's package, so a
+    /// relative import inside a package finds its `project_shapes` entry.
+    resolved: String,
+    /// The spec an injected `from … import` should use (`.textutil` for
+    /// a relative import).
+    spec: String,
+    /// `(exported name, local name)` pairs of a `from M import …`; a star
+    /// import is `("*", "*")`.
+    names: Vec<(String, String)>,
+    /// The local name bound to the module itself by `import M [as N]` or
+    /// `from pkg import submodule`.
+    module_alias: Option<String>,
+}
+
+fn scan_module_imports(
+    body: &[ruff_python_ast::Stmt],
+    current_dotted: &str,
+    is_init: bool,
+) -> Vec<ImportSpec> {
+    use ruff_python_ast::Stmt;
+    let local_name = |alias: &ruff_python_ast::Alias| -> String {
+        alias
+            .asname
+            .as_ref()
+            .map(|n| n.as_str().to_owned())
+            .unwrap_or_else(|| alias.name.as_str().to_owned())
+    };
+    let mut out = Vec::new();
+    for stmt in body {
+        match stmt {
+            Stmt::ImportFrom(i) => {
+                let level = i.level as usize;
+                match &i.module {
+                    Some(m) => {
+                        let raw = m.as_str().to_owned();
+                        out.push(ImportSpec {
+                            resolved: resolve_import_module(current_dotted, is_init, &raw, level),
+                            spec: format!("{}{raw}", ".".repeat(level)),
+                            names: i
+                                .names
+                                .iter()
+                                .map(|a| (a.name.as_str().to_owned(), local_name(a)))
+                                .collect(),
+                            module_alias: None,
+                            raw,
+                        });
+                    }
+                    None => {
+                        // `from . import sibling [as alias]`: each name is
+                        // a module of the anchoring package.
+                        if level == 0 {
+                            continue;
+                        }
+                        let package = resolve_import_module(current_dotted, is_init, "", level);
+                        for a in &i.names {
+                            let name = a.name.as_str().to_owned();
+                            if name == "*" {
+                                continue;
+                            }
+                            out.push(ImportSpec {
+                                resolved: if package.is_empty() {
+                                    name.clone()
+                                } else {
+                                    format!("{package}.{name}")
+                                },
+                                spec: format!("{}{name}", ".".repeat(level)),
+                                names: Vec::new(),
+                                module_alias: Some(local_name(a)),
+                                raw: name,
+                            });
+                        }
+                    }
+                }
+            }
+            Stmt::Import(i) => {
+                for a in &i.names {
+                    let name = a.name.as_str().to_owned();
+                    out.push(ImportSpec {
+                        raw: name.clone(),
+                        resolved: name.clone(),
+                        spec: name,
+                        names: Vec::new(),
+                        module_alias: Some(local_name(a)),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The `project_shapes` key an import statement resolves to: the
+/// package-resolved module, falling back to the spelling as written
+/// (which is how a top-level module imported relatively from the source
+/// root is keyed). `None` when the project does not know the module.
+fn import_shape_key<'i>(
+    imp: &'i ImportSpec,
+    project_shapes: &HashMap<String, tyc_db::ModuleShapes>,
+) -> Option<&'i str> {
+    if project_shapes.contains_key(&imp.resolved) {
+        Some(imp.resolved.as_str())
+    } else if project_shapes.contains_key(&imp.raw) {
+        Some(imp.raw.as_str())
+    } else {
+        None
+    }
+}
+
+/// Resolve a `from … import` module against the importing module: a
+/// level-0 import is absolute; a relative one is anchored at the
+/// importing module's package (an `__init__` module is its own package)
+/// and climbs one package per extra dot.
+fn resolve_import_module(
+    current_dotted: &str,
+    is_init: bool,
+    module: &str,
+    level: usize,
+) -> String {
+    if level == 0 {
+        return module.to_owned();
+    }
+    let mut parts: Vec<&str> = current_dotted
+        .split('.')
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !is_init {
+        parts.pop();
+    }
+    for _ in 1..level {
+        parts.pop();
+    }
+    parts.extend(module.split('.').filter(|s| !s.is_empty()));
+    parts.join(".")
+}
+
+/// The [`TypeFacts`] of the project module keyed `key`: its shape
+/// converted (bundled stubs, venv introspection and `pub *` facade
+/// aggregates only have a shape) with the AST-derived facts of a project
+/// source merged on top (only those tell an `async def` apart). Memoised
+/// in `cache`; `None` for a module the project does not know.
+fn module_type_facts(
+    key: &str,
+    project_shapes: &HashMap<String, tyc_db::ModuleShapes>,
+    project_facts: &HashMap<String, TypeFacts>,
+    cache: &mut HashMap<String, TypeFacts>,
+) -> Option<TypeFacts> {
+    if let Some(cached) = cache.get(key) {
+        return Some(cached.clone());
+    }
+    let shapes = project_shapes.get(key)?;
+    let mut facts = facts_from_module_shapes(shapes);
+    if let Some(ast_facts) = project_facts.get(key) {
+        facts.merge(ast_facts.clone());
+    }
+    cache.insert(key.to_owned(), facts.clone());
+    Some(facts)
+}
+
+/// Convert a module's checker shapes into the rewrite pass's
+/// [`TypeFacts`]: class fields, `@property` getters, instance / static /
+/// async method returns and bases, plus free-function returns. The
+/// shape's arity table does not record whether a free function is
+/// `async def`, so a free function is recorded as sync here; the
+/// AST-derived facts merged on top correct that for project sources.
+fn facts_from_module_shapes(shapes: &tyc_db::ModuleShapes) -> TypeFacts {
+    let mut facts = TypeFacts::default();
+    for (name, shape) in &shapes.class_shapes {
+        if let Some(builtin) = name.strip_prefix("__typhon_builtin_ext_") {
+            // The `extend BUILTIN:` sentinel: publish its methods under
+            // the lifted free-function names.
+            for (method, sig) in &shape.methods {
+                if sig.is_async {
+                    continue;
+                }
+                if let Some(ret) = static_type_from(&sig.return_type) {
+                    facts
+                        .functions
+                        .insert(tyc_analyse::free_fn_name(builtin, method), ret);
+                }
+            }
+            continue;
+        }
+        let mut class = ClassFacts {
+            type_params: shapes
+                .class_type_params
+                .get(name)
+                .cloned()
+                .unwrap_or_default(),
+            bases: shape.bases.clone(),
+            ..ClassFacts::default()
+        };
+        for (field, ty) in &shape.fields {
+            if let Some(ty) = static_type_from(ty) {
+                class.fields.insert(field.clone(), ty);
+            }
+        }
+        for (method, sig) in &shape.methods {
+            let Some(ret) = static_type_from(&sig.return_type) else {
+                continue;
+            };
+            if sig.is_property {
+                class.fields.insert(method.clone(), ret);
+            } else if sig.is_static || sig.is_classmethod {
+                if !sig.is_async {
+                    class.static_methods.insert(method.clone(), ret);
+                }
+            } else if sig.is_async {
+                class.async_methods.insert(method.clone(), ret);
+            } else {
+                class.methods.insert(method.clone(), ret);
+            }
+        }
+        facts.classes.insert(name.clone(), class);
+    }
+    for (name, arity) in &shapes.function_arities {
+        if let Some(ret) = static_type_from(&arity.return_type) {
+            facts.functions.insert(name.clone(), ret);
+        }
+    }
+    facts
+}
+
+/// The rewrite pass's view of a checker type: builtins and classes by
+/// name, generics with their arguments, `T?` as `T`, a `Callable`'s
+/// return type. Anything the pass cannot model is `None`.
+fn static_type_from(ty: &tyc_types::Type) -> Option<StaticType> {
+    use tyc_types::Type;
+    match ty {
+        Type::Int => Some(StaticType::simple("int")),
+        Type::Str | Type::LitStr(_) => Some(StaticType::simple("str")),
+        Type::Bool => Some(StaticType::simple("bool")),
+        Type::Float => Some(StaticType::simple("float")),
+        Type::Bytes => Some(StaticType::simple("bytes")),
+        Type::Class(name) | Type::TypeVar(name) => Some(StaticType::simple(name)),
+        Type::Generic(head, args) => {
+            let args: Option<Vec<StaticType>> = args.iter().map(static_type_from).collect();
+            Some(StaticType::with_args(head, args.unwrap_or_default()))
+        }
+        Type::Union(_) => match ty.strip_none() {
+            Type::Union(_) => None,
+            stripped => static_type_from(&stripped),
+        },
+        Type::Function { ret, .. } => Some(StaticType::with_args(
+            "Callable",
+            vec![StaticType::simple("?"), static_type_from(ret)?],
+        )),
+        _ => None,
+    }
+}
+
 /// Inject `from <module> import <fn_name>` statements at the top of
 /// `module` for cross-module builtin extension free functions that were
 /// referenced during the rewrite pass. The injected imports are placed
@@ -1660,8 +1963,15 @@ fn inject_cross_module_ext_imports(
             .push(fn_name.clone());
     }
 
+    // Deterministic statement order when several providers are involved.
+    let mut by_module: Vec<(String, Vec<String>)> = by_module.into_iter().collect();
+    by_module.sort();
     let mut injected: Vec<Stmt> = Vec::new();
-    for (mod_name, fns) in &by_module {
+    for (mod_spec, fns) in &by_module {
+        // A relative import spec keeps its leading dots (`.textutil`):
+        // they become the statement's `level`.
+        let level = mod_spec.bytes().take_while(|b| *b == b'.').count();
+        let mod_name = &mod_spec[level..];
         let aliases: Vec<ruff_python_ast::Alias> = fns
             .iter()
             .map(|f| ruff_python_ast::Alias {
@@ -1678,13 +1988,13 @@ fn inject_cross_module_ext_imports(
         injected.push(Stmt::ImportFrom(StmtImportFrom {
             range: TextRange::default(),
             node_index: AtomicNodeIndex::NONE,
-            module: Some(Identifier {
+            module: (!mod_name.is_empty()).then(|| Identifier {
                 range: TextRange::default(),
                 node_index: AtomicNodeIndex::NONE,
                 id: Name::new(mod_name),
             }),
             names: aliases,
-            level: 0,
+            level: level as u32,
             is_lazy: false,
         }));
     }

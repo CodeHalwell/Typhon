@@ -159,9 +159,13 @@ pub fn run_source(
     let (mut registry, _stats) = tyc_analyse::extract_builtin_extensions(&mut module);
     // Pre-scan sibling modules for cross-module builtin extensions.
     if let Some(src_root) = origin.and_then(|p| p.parent()) {
-        let cross_module_fns =
+        let (cross_module_fns, external_facts) =
             merge_cross_module_extensions_for_vm(&module, src_root, &mut registry);
-        let _ = tyc_analyse::rewrite_builtin_extension_calls(&mut module, &registry);
+        let _ = tyc_analyse::rewrite_builtin_extension_calls_with_facts(
+            &mut module,
+            &registry,
+            &external_facts,
+        );
         // Inject explicit imports for cross-module extension functions
         // that were used. In the VM, these resolve to the sibling module's
         // lifted free functions when the module is loaded.
@@ -299,30 +303,77 @@ pub fn run_source(
 /// Pre-scan sibling `.ty` files referenced by the entry module's imports,
 /// extract their builtin extension registries, and merge them into `registry`.
 /// Returns a map of `fn_name → sibling_module_stem` for functions that were
-/// added from cross-module sources, so the caller can inject explicit imports.
+/// added from cross-module sources, so the caller can inject explicit
+/// imports, plus the declared field / return types of the names those
+/// imports bind, so the call-site rewrite types `post.title` on an
+/// imported `Post`, `make()` on an imported function, or
+/// `textutil.make()` on an imported module.
 fn merge_cross_module_extensions_for_vm(
     module: &ruff_python_ast::ModModule,
     src_root: &Path,
     registry: &mut tyc_analyse::ExtensionRegistry,
-) -> std::collections::HashMap<String, String> {
+) -> (
+    std::collections::HashMap<String, String>,
+    tyc_analyse::TypeFacts,
+) {
     use ruff_python_ast::Stmt;
     use std::collections::HashMap;
 
     let mut cross_fns: HashMap<String, String> = HashMap::new();
-    // Collect unique module names from import statements.
-    let mut seen_modules: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut external = tyc_analyse::TypeFacts::default();
+    // Each sibling is read once; its facts are re-keyed per import.
+    let mut loaded: HashMap<String, Option<tyc_analyse::TypeFacts>> = HashMap::new();
+    let mut load = |name: &str,
+                    registry: &mut tyc_analyse::ExtensionRegistry,
+                    cross_fns: &mut HashMap<String, String>|
+     -> Option<tyc_analyse::TypeFacts> {
+        if let Some(cached) = loaded.get(name) {
+            return cached.clone();
+        }
+        let facts = if name.contains('.') {
+            None
+        } else {
+            std::fs::read_to_string(src_root.join(format!("{name}.ty")))
+                .ok()
+                .and_then(|text| merge_sibling_extensions(&text, name, registry, cross_fns))
+        };
+        loaded.insert(name.to_owned(), facts.clone());
+        facts
+    };
+    let publish_lifted = |external: &mut tyc_analyse::TypeFacts, facts: &tyc_analyse::TypeFacts| {
+        // The lifted functions' return types, so a chained cross-module
+        // call (`t.slug().shout()`) types.
+        for (fn_name, ty) in &facts.functions {
+            if fn_name.starts_with("__typhon_ext_") {
+                external.functions.insert(fn_name.clone(), ty.clone());
+            }
+        }
+    };
     for stmt in &module.body {
         match stmt {
             Stmt::ImportFrom(i) => {
-                if let Some(m) = &i.module {
-                    let name = m.id.to_string();
-                    if !name.contains('.') && seen_modules.insert(name.clone()) {
-                        let sibling_path = src_root.join(format!("{name}.ty"));
-                        if sibling_path.exists() {
-                            if let Ok(text) = std::fs::read_to_string(&sibling_path) {
-                                merge_sibling_extensions(&text, &name, registry, &mut cross_fns);
-                            }
-                        }
+                let Some(m) = &i.module else { continue };
+                let name = m.id.to_string();
+                let Some(facts) = load(&name, registry, &mut cross_fns) else {
+                    continue;
+                };
+                publish_lifted(&mut external, &facts);
+                for alias in &i.names {
+                    let imported = alias.name.as_str();
+                    let local = alias
+                        .asname
+                        .as_ref()
+                        .map(|a| a.as_str())
+                        .unwrap_or(imported);
+                    if imported == "*" {
+                        external.merge(tyc_analyse::TypeFacts {
+                            functions: facts.functions.clone(),
+                            async_functions: facts.async_functions.clone(),
+                            classes: facts.classes.clone(),
+                            modules: HashMap::new(),
+                        });
+                    } else {
+                        external.import_name(&facts, imported, local);
                     }
                 }
             }
@@ -330,35 +381,37 @@ fn merge_cross_module_extensions_for_vm(
                 // Handle all aliases in `import a, b, c` — not just the first.
                 for alias in &i.names {
                     let name = alias.name.id.to_string();
-                    if !name.contains('.') && seen_modules.insert(name.clone()) {
-                        let sibling_path = src_root.join(format!("{name}.ty"));
-                        if sibling_path.exists() {
-                            if let Ok(text) = std::fs::read_to_string(&sibling_path) {
-                                merge_sibling_extensions(&text, &name, registry, &mut cross_fns);
-                            }
-                        }
-                    }
+                    let Some(facts) = load(&name, registry, &mut cross_fns) else {
+                        continue;
+                    };
+                    publish_lifted(&mut external, &facts);
+                    let local = alias
+                        .asname
+                        .as_ref()
+                        .map(|a| a.as_str().to_owned())
+                        .unwrap_or_else(|| name.clone());
+                    external.modules.insert(local, facts);
                 }
             }
             _ => {}
         }
     }
-    cross_fns
+    (cross_fns, external)
 }
 
 /// Parse a sibling `.ty` source just enough to extract builtin extension
-/// sentinel classes and merge their methods into `registry`.
+/// sentinel classes and merge their methods into `registry`. Returns the
+/// sibling's declared field / return types (`None` when it does not
+/// parse), with the lifted extension functions included.
 fn merge_sibling_extensions(
     source: &str,
     module_name: &str,
     registry: &mut tyc_analyse::ExtensionRegistry,
     cross_fns: &mut std::collections::HashMap<String, String>,
-) {
+) -> Option<tyc_analyse::TypeFacts> {
     let expanded = preprocess::expand_all(source);
     let prep = preprocess::preprocess(&expanded);
-    let Ok(parsed) = tyc_syntax::parse_module(&prep.python_source) else {
-        return;
-    };
+    let parsed = tyc_syntax::parse_module(&prep.python_source).ok()?;
     let mut sibling_module = parsed.into_syntax();
     let (sibling_registry, _) = tyc_analyse::extract_builtin_extensions(&mut sibling_module);
     for (builtin_type, methods) in &sibling_registry {
@@ -370,6 +423,7 @@ fn merge_sibling_extensions(
             });
         }
     }
+    Some(tyc_analyse::collect_module_type_facts(&sibling_module))
 }
 
 /// Inject `from <module> import <fn_name>` AST nodes into `module` for
@@ -1388,6 +1442,39 @@ extend str:
 
 let s: str = "Hello World"
 print(s.slug())
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn extend_builtin_attribute_and_call_receivers_dispatch() {
+        // docs/release-readiness-review-2026-09-30.md §5: an extension
+        // method called on an attribute (`p.title.slug()`), a call
+        // (`make().slug()`), an `impl` method call (`p.url().slug()`) or a
+        // chained extension call (`make().slug().slug()`) was never
+        // lowered, so the VM raised `AttributeError` like CPython did.
+        let src = r#"
+extend str:
+    def slug(self) -> str:
+        return self.lower().replace(" ", "-")
+
+class Post:
+    title: str
+
+impl Post:
+    def url(self) -> str:
+        return self.title.slug()
+
+def make() -> str:
+    return "A B"
+
+def main() -> None:
+    let p: Post = Post(title="Hello World")
+    let out: list[str] = [p.url(), make().slug(), p.title.slug(), p.url().slug(), make().slug().slug()]
+    if out != ["hello-world", "a-b", "hello-world", "hello-world", "a-b"]:
+        raise ValueError(str(out))
+
+main()
 "#;
         assert_eq!(run_capturing(src).unwrap(), 0);
     }

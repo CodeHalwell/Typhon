@@ -91,8 +91,10 @@ pub use parallel_lints::{parallel_opportunity_diagnostics, shared_mut_across_tas
 
 pub mod extend_builtin;
 pub use extend_builtin::{
-    extract_builtin_extensions, rewrite_builtin_extension_calls,
-    rewrite_builtin_extension_calls_tracking, ExtensionExtractionStats, ExtensionRegistry,
+    collect_module_type_facts, extract_builtin_extensions, free_fn_name,
+    rewrite_builtin_extension_calls, rewrite_builtin_extension_calls_tracking,
+    rewrite_builtin_extension_calls_with_facts, ClassFacts, ExtensionExtractionStats,
+    ExtensionRegistry, StaticType, TypeFacts,
 };
 
 pub mod perf;

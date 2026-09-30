@@ -787,6 +787,92 @@ fn check_cross_module_extend_str_no_attribute_not_found() {
     );
 }
 
+#[test]
+fn build_rewrites_attribute_and_call_receivers_of_str_extension() {
+    // docs/release-readiness-review-2026-09-30.md §5: a call of an
+    // `extend BUILTIN` method on an attribute or call receiver passed
+    // `tyc check` but was never lowered, so CPython raised
+    // `AttributeError: 'str' object has no attribute 'slug'`.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "extend str:\n    def slug(self) -> str:\n        return self.lower().replace(\" \", \"-\")\n\n\
+         class Post:\n    title: str\n\n\
+         impl Post:\n    def url(self) -> str:\n        return self.title.slug()\n\n\
+         def make() -> str:\n    return \"A B\"\n\n\
+         def main() -> None:\n    let p: Post = Post(title=\"Hello World\")\n    \
+         print(p.url(), make().slug(), p.title.slug(), p.url().slug(), make().slug().slug())\n\n\
+         main()\n",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    for expected in [
+        "__typhon_ext_str__slug__(self.title)",
+        "__typhon_ext_str__slug__(make())",
+        "__typhon_ext_str__slug__(p.title)",
+        "__typhon_ext_str__slug__(p.url())",
+        "__typhon_ext_str__slug__(__typhon_ext_str__slug__(make()))",
+    ] {
+        assert!(
+            py.contains(expected),
+            "expected `{expected}` in the emitted Python; got:\n{py}"
+        );
+    }
+    if let Some(out) = run_main(tmp.path()) {
+        assert_eq!(out.trim(), "hello-world a-b hello-world hello-world a-b");
+    }
+}
+
+#[test]
+fn build_cross_module_extend_str_rewrites_attribute_and_call_receivers() {
+    // The provider declares the extension, a class whose field is a
+    // `str`, and a function returning one; the consumer calls the
+    // extension on each of those receivers.
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        tmp.path().join("typhon.toml"),
+        "[project]\nname=\"ext\"\nversion=\"0.1.0\"\nsrc=\"src\"\nout=\"build\"\n\
+         [python]\ntarget=\"3.13\"\n[emit]\nformat=false\n[strictness]\n[env]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("textutil.ty"),
+        "extend str:\n    def slug(self) -> str:\n        return self.lower().replace(\" \", \"-\")\n\n\
+         pub class Post:\n    title: str\n\n\
+         impl Post:\n    def url(self) -> str:\n        return self.title.slug()\n\n\
+         pub def make() -> str:\n    return \"A B\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("main.ty"),
+        "from textutil import Post, make\nimport textutil\n\n\
+         def main() -> None:\n    let p: Post = Post(title=\"Hello World\")\n    \
+         print(p.title.slug(), make().slug(), textutil.make().slug(), p.url().slug())\n\n\
+         main()\n",
+    )
+    .unwrap();
+
+    build(tmp.path());
+    let py = std::fs::read_to_string(tmp.path().join("build").join("main.py")).unwrap();
+    for expected in [
+        "__typhon_ext_str__slug__(p.title)",
+        "__typhon_ext_str__slug__(make())",
+        "__typhon_ext_str__slug__(textutil.make())",
+        "__typhon_ext_str__slug__(p.url())",
+        "from textutil import __typhon_ext_str__slug__",
+    ] {
+        assert!(
+            py.contains(expected),
+            "expected `{expected}` in the emitted Python; got:\n{py}"
+        );
+    }
+    if let Some(out) = run_main(tmp.path()) {
+        assert_eq!(out.trim(), "hello-world a-b a-b hello-world");
+    }
+}
+
 // ── auto-parallel comprehensions ────────────────────────────────────────────
 
 #[test]
