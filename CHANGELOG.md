@@ -102,6 +102,57 @@ package, a `pub *` facade re-exporting a `newtype`, `frozen` classes and an
 `enum`, cross-module sealed-union exhaustiveness, and `extend str` on call
 receivers on both surfaces.
 
+**`tyc run` closes the review's VM ↔ CPython divergences.** A plain dotted
+import now binds each submodule on its package the way CPython's import
+machinery does — `import shapes.ops` followed by `shapes.ops.area(...)`
+raised `AttributeError: module 'shapes' has no attribute 'ops'` under the
+VM while `import shapes.ops as ops` worked — with `os.path`-style native
+submodules handed back as the very object the package exposes, and a
+directory without `__init__.ty` importing as a PEP 420 namespace package.
+`map(f, xs, ys, …)` zips its iterables and stops at the shortest instead of
+calling `f` with one argument. `await` on a non-awaitable (`await 1`,
+`await sync_call()`) is CPython's `TypeError: object int can't be used in
+'await' expression` rather than the value; the VM's coroutine-function
+stand-ins (`asyncio.sleep`, `Queue.get`, …) now hand back completed tasks so
+every previously-working `await` still works. `go f()` reached from sync
+code outside `asyncio.run` — and `asyncio.create_task` — raise
+`RuntimeError: no running event loop` without running the coroutine,
+exactly as `typhon_runtime.tasks.spawn` does under CPython; inside the loop
+nothing changes, and a nested `asyncio.run` raises CPython's `RuntimeError`
+too.
+
+**Modelled modules fill their gaps, value-for-value against CPython 3.13.**
+`math` is complete (`isclose` with `rel_tol` / `abs_tol`, `gamma` / `lgamma`
+as a port of CPython's own Lanczos code, `erf` / `erfc` / the hyperbolics /
+`cbrt` / `exp2` through the host libm, `sumprod` with CPython's
+extended-precision accumulator, `fma`, `frexp`, `ldexp`, `modf`,
+`nextafter(steps=)`, `ulp`); `re` gains `A I L M S U X`, `NOFLAG`,
+`RegexFlag`, real `Pattern` / `Match` classes and `error` / `PatternError`,
+and `IGNORECASE` / `MULTILINE` / `DOTALL` / `VERBOSE` are honoured instead
+of silently ignored; `heapq` gains `heappushpop`, `heapreplace` and
+`merge(key=, reverse=)`; `functools` gains `update_wrapper`,
+`WRAPPER_ASSIGNMENTS` / `WRAPPER_UPDATES`, `partialmethod` and
+`singledispatchmethod` (the descriptor protocol they rest on — an object's
+`__get__` read through a class attribute — is new too); `contextlib` gains
+`AbstractContextManager`, `AbstractAsyncContextManager`, `ContextDecorator`,
+`AsyncContextDecorator`, `chdir`, `aclosing` and `AsyncExitStack`;
+`operator` gains the in-place operators, `index`, `inv` and `call`;
+`collections` gains `UserDict`, `UserList` and `UserString`; `hashlib`
+gains SHA-3, `pbkdf2_hmac` and `file_digest`. Function objects now compare
+and `is` by identity and carry `__doc__`; a class body's own names are
+visible to its later statements. Known residuals: `re` flags are plain
+ints (`print(re.I)` shows `2`), `re.error` messages are the Rust engine's,
+and `pbkdf2_hmac` with an unknown digest raises `ValueError`.
+
+**The pre-run scan now checks attributes, not just modules.** `tyc run`
+asks the VM what each modelled module exports (the live module's own
+`dir()` — no hand-written table) and sends a program that reads a
+`module.attr` the VM lacks down the compiled path with a `note:` naming it
+(`re.purge`), the way an unmodelled import already did. It only ever judges
+a bare name bound by one `import`, never a `from` import, an attribute the
+program sets itself, or a name rebound anywhere in the file;
+`--no-fallback` still refuses.
+
 **Supply chain and tooling.** `salsa` 0.27 → 0.28.5 clears
 RUSTSEC-2026-0308 (the only `cargo deny` failure). The perf gate's absolute
 floor is 10 ms rather than 5: with a ~22 ms baseline the 20 % band was inside

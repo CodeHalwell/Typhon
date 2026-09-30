@@ -537,9 +537,9 @@ error-gated cross-module pass. That was wrong. The `pub *` aggregation
 (`aggregate_pub_star_shapes` → `merge_pub_visible`) merged classes,
 functions, interfaces and sealed unions but **dropped `newtypes`,
 `frozen_classes`, `enums`, `type_aliases`, `class_param_variance`,
-`gatherable_async_fns` and `hkt_param_names`**, so a facade-imported
-frozen class was not frozen and a facade-imported newtype was a plain
-class — which is also the whole of §4.2. The "only when the module has no
+`gatherable_async_fns` and `hkt_param_names`**, so a class declared
+`frozen` lost that through a facade and a facade-imported newtype was a
+plain class — which is also the whole of §4.2. The "only when the module has no
 other error" observation was a coincidence of the probes used. The merge
 now carries every table (HKT names unfiltered, as they are not exported
 names), with a unit test, and `examples/apps/16-shape-catalogue` covers the
@@ -564,12 +564,22 @@ facade, the relative imports and the re-exported `newtype` / `frozen` /
 
 ### 9.4 VM parity
 
-The VM findings of §6 were worked in parallel (import `pkg.sub` binding,
-multi-iterable `map`, missing module attributes, `await` / `go` errors,
-the attribute-level pre-run scan) and merged after this section was
-written; the changelog's third-wave entry is the record. The
-extension-lowering gap that surfaced while building the new app — an
-extension declared in a package submodule, or called inside an imported
-module, raised `AttributeError` under `tyc run` only — is fixed and
-covered by a pipeline test.
+Every §6 finding is closed and pinned by a VM unit test: a plain
+`import pkg.sub` binds `sub` on `pkg` (native submodules included, and a
+directory without `__init__.ty` is a namespace package); `map` over several
+iterables zips them; `await` on a non-awaitable and `go` / `create_task`
+outside a running loop raise CPython's errors; the modelled `math`, `re`,
+`heapq`, `functools`, `contextlib`, `operator`, `collections` and `hashlib`
+modules fill their gaps value-for-value against CPython 3.13 (`math` is now
+complete, and `re` flags are honoured instead of ignored); and the pre-run
+scan checks `module.attr` reads against what the VM's module actually
+exports, so `re.purge` takes the compiled path with a `note:` instead of
+dying mid-run. Residuals, all documented in `docs/vm.md`: `re` flags are
+plain ints, `re.error` text is the Rust engine's, and `pbkdf2_hmac` on an
+unknown digest raises `ValueError`. The extension-lowering gap that
+surfaced while building the new app — an extension declared in a package
+submodule, or called inside an imported module, raised `AttributeError`
+under `tyc run` only — is fixed and covered by a pipeline test. The
+differential gate over the full corpus passes with the same seven pinned
+divergences as before.
 
