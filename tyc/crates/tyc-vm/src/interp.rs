@@ -149,6 +149,13 @@ pub struct Interpreter {
     /// the class's stable `Rc` address (classes are never dropped, so it is a
     /// permanent identity — the same assumption `HashKey::Instance` relies on).
     pub method_cache: RefCell<HashMap<usize, MethodTableCache>>,
+    /// How many `asyncio.run(...)` calls are on the stack — the VM's stand-in
+    /// for CPython's "running event loop". `typhon_runtime.tasks.spawn`
+    /// (the `go` lowering) and `asyncio.create_task` need one and raise
+    /// CPython's `RuntimeError: no running event loop` at zero, whether the
+    /// caller is a coroutine or a sync helper: it is the dynamic extent of
+    /// the loop that matters, exactly as in CPython.
+    pub running_loop_depth: usize,
 }
 
 /// Upper bound on values an eagerly-evaluated generator may yield before the
@@ -231,6 +238,7 @@ impl Interpreter {
             unresolved_aliases: HashMap::new(),
             builtin_ext_registries: HashMap::new(),
             method_cache: RefCell::new(HashMap::new()),
+            running_loop_depth: 0,
         };
         crate::builtins::install(&mut interp);
         interp
@@ -857,7 +865,13 @@ impl Interpreter {
                             .contains(&(target.clone(), bind.clone()))
                     {
                         lazy_module_proxy(&target)
+                    } else if alias.asname.is_some() {
+                        self.import_module(&target)?
                     } else {
+                        // `import a.b.c` imports the whole chain — parent
+                        // first, each submodule bound on its parent — and
+                        // binds the root package, as CPython does.
+                        self.import_module(alias.name.as_str())?;
                         self.import_module(&target)?
                     };
                     env.set(&bind, module);
@@ -1487,6 +1501,15 @@ impl Interpreter {
         // Walk the class body in a temporary scope so any non-fn statements
         // (constants, comprehensions used as defaults) get evaluated.
         let body_env = Env::new_child(env);
+        // The class body's own namespace, where its statements are
+        // evaluated and every name they define is bound — so a later
+        // statement sees an earlier `def` or assignment (`__rmul__ =
+        // __mul__`, `double = partialmethod(scaled, 2)`, `@handle.register`),
+        // as in CPython. It is a child of `body_env`, which stays empty and
+        // is what methods close over: CPython skips the class scope when a
+        // method body resolves a bare name, so a class attribute must never
+        // shadow a module global inside one.
+        let body_ns = Env::new_child(&body_env);
 
         // A class is dataclass-shaped (annotated assigns are instance fields)
         // when it carries a `@dataclass` decorator. A `plain class` emits a
@@ -1638,7 +1661,7 @@ impl Interpreter {
                     let is_property = has_deco("property") || is_cached_property;
                     let is_classmethod = has_deco("classmethod");
                     for deco in f.decorator_list.iter().rev() {
-                        v = self.apply_decorator(deco, v, &body_env)?;
+                        v = self.apply_decorator(deco, v, &body_ns)?;
                     }
                     // The class body binds the decorator's *result* to the
                     // `def`'s own name — CPython does not consult the
@@ -1648,6 +1671,7 @@ impl Interpreter {
                     // wrapper, spelled `def wrapper(...)`) hid the method:
                     // `obj.greet()` raised `attribute not found`.
                     let declared = f.name.as_str().to_owned();
+                    body_ns.set(&declared, v.clone());
                     if let Value::Function(func) = &v {
                         if is_property {
                             properties.insert(declared.clone());
@@ -1669,9 +1693,12 @@ impl Interpreter {
                 Stmt::AnnAssign(a) => {
                     if let Expr::Name(n) = a.target.as_ref() {
                         let default = match &a.value {
-                            Some(e) => Some(self.eval_expr(e, &body_env)?),
+                            Some(e) => Some(self.eval_expr(e, &body_ns)?),
                             None => None,
                         };
+                        if let Some(v) = &default {
+                            body_ns.set(n.id.as_str(), v.clone());
+                        }
                         let classvar = is_classvar(&a.annotation);
                         // ClassVar is always a class attribute. In a non-
                         // dataclass (`plain class`) an annotated assign with a
@@ -1695,9 +1722,10 @@ impl Interpreter {
                     }
                 }
                 Stmt::Assign(a) => {
-                    let v = self.eval_expr(&a.value, &body_env)?;
+                    let v = self.eval_expr(&a.value, &body_ns)?;
                     for t in &a.targets {
                         if let Expr::Name(n) = t {
+                            body_ns.set(n.id.as_str(), v.clone());
                             class_attrs.insert(n.id.as_str().to_owned(), v.clone());
                         }
                     }
@@ -2053,23 +2081,92 @@ impl Interpreter {
             self.module_cache.insert(name.to_owned(), m.clone());
             return Ok(m);
         }
+        // CPython imports a dotted name parent-first: `import a.b.c` runs
+        // `a`, then `a.b`, then `a.b.c`, and binds each submodule as an
+        // attribute of its parent — which is what makes `a.b.c.x` resolve
+        // afterwards. A parent whose `__init__` is what is importing us
+        // right now (`pub *` aggregation, a relative import) is mid-load and
+        // cannot be bound to yet; its children are stamped onto it when it
+        // finishes (`adopt_loaded_submodules`).
+        let split = name.rsplit_once('.');
+        let parent = match split {
+            Some((parent_name, _)) if !self.loading_modules.contains(parent_name) => {
+                Some(self.import_module(parent_name)?)
+            }
+            _ => None,
+        };
+        let child = split.map(|(_, child)| child);
+        // A native package builds its own submodules (`os.path`,
+        // `typhon_runtime.tasks`, `collections.abc`): the object the parent
+        // exposes *is* the module, as `sys.modules["os.path"] is os.path`.
+        if let (Some(Value::Module(p)), Some(child)) = (&parent, child) {
+            let existing = p.members.borrow().get(child).cloned();
+            if let Some(sub @ Value::Module(_)) = existing {
+                self.module_cache.insert(name.to_owned(), sub.clone());
+                return Ok(sub);
+            }
+        }
         // Try the host stdlib / typhon_runtime first so user code can't
         // accidentally shadow `import json` with a sibling json.ty (the
         // stdlib_module_shadow lint already nudges users away from this
         // at check time).
-        match crate::builtins::resolve_module(self, name) {
-            Ok(v) => {
-                self.module_cache.insert(name.to_owned(), v.clone());
-                Ok(v)
-            }
+        let loaded = match crate::builtins::resolve_module(self, name) {
+            Ok(v) => v,
             Err(stdlib_err) => {
                 // Fall back to loading a sibling Typhon source file.
-                if let Some(loaded) = self.try_load_typhon_module(name)? {
-                    self.module_cache.insert(name.to_owned(), loaded.clone());
-                    return Ok(loaded);
+                match self.try_load_typhon_module(name)? {
+                    Some(loaded) => loaded,
+                    None => return Err(stdlib_err),
                 }
-                Err(stdlib_err)
             }
+        };
+        self.module_cache.insert(name.to_owned(), loaded.clone());
+        if let (Some(parent), Some(child)) = (&parent, child) {
+            Self::bind_submodule(parent, child, &loaded);
+        }
+        self.adopt_loaded_submodules(name, &loaded);
+        Ok(loaded)
+    }
+
+    /// Bind a freshly imported submodule as `child` on its parent package,
+    /// unless the package already has that name — CPython's
+    /// `setattr(parent, child, module)` after a first import, without
+    /// clobbering a binding the package body made itself.
+    fn bind_submodule(parent: &Value, child: &str, module: &Value) {
+        let Value::Module(p) = parent else {
+            return;
+        };
+        let bound = p.env.as_ref().is_some_and(|e| e.get_own(child).is_some())
+            || p.members.borrow().contains_key(child);
+        if bound {
+            return;
+        }
+        if let Some(env) = &p.env {
+            env.set(child, module.clone());
+        }
+        p.members
+            .borrow_mut()
+            .insert(child.to_owned(), module.clone());
+    }
+
+    /// A package that has just finished loading may already have children in
+    /// the import cache — the submodules its own `__init__` imported while it
+    /// was mid-load. Bind each of them, as CPython did at their import.
+    fn adopt_loaded_submodules(&self, name: &str, module: &Value) {
+        if !matches!(module, Value::Module(_)) {
+            return;
+        }
+        let prefix = format!("{name}.");
+        let children: Vec<(String, Value)> = self
+            .module_cache
+            .iter()
+            .filter_map(|(key, sub)| {
+                let rest = key.strip_prefix(&prefix)?;
+                (!rest.contains('.')).then(|| (rest.to_owned(), sub.clone()))
+            })
+            .collect();
+        for (child, sub) in children {
+            Self::bind_submodule(module, &child, &sub);
         }
     }
 
@@ -2089,6 +2186,13 @@ impl Interpreter {
         ];
         let path = candidates.iter().find(|p| p.exists()).cloned();
         let Some(path) = path else {
+            // PEP 420: a directory with no `__init__.ty` is a namespace
+            // package — an empty module whose submodules load on demand.
+            // Without it, importing `a.b` parent-first could not get past a
+            // plain directory `a/`.
+            if root.join(&rel).is_dir() {
+                return Ok(Some(namespace_package(name)));
+            }
             return Ok(None);
         };
 
@@ -2907,7 +3011,7 @@ impl Interpreter {
             }
             Expr::Await(a) => {
                 let v = self.eval_expr(&a.value, env)?;
-                self.force_awaitable(v)
+                self.await_value(v)
             }
             Expr::Yield(y) => {
                 // Lazy generator body: suspend here, unwinding out of the
@@ -4294,7 +4398,7 @@ impl Interpreter {
     ) -> Result<Value, Unwind> {
         match func {
             Value::Native(n) => {
-                if !kwargs.is_empty() {
+                let result = if !kwargs.is_empty() {
                     // The generic bound builtin-method dispatcher (`obj.sort`,
                     // `obj.method`) can't see kwargs through its fixed native
                     // signature, so forward them as a trailing sentinel arg the
@@ -4302,13 +4406,23 @@ impl Interpreter {
                     if n.name == "method" {
                         let mut args = args;
                         args.push(crate::builtins::make_kwargs_sentinel(kwargs));
-                        return (n.func)(self, args);
+                        (n.func)(self, args)?
+                    } else {
+                        // For v1, native fns receive positional args only.
+                        // Special-case common kwarg-accepting builtins (sorted, dict.get) by name.
+                        crate::builtins::call_with_kwargs(self, &n, args, kwargs)?
                     }
-                    // For v1, native fns receive positional args only.
-                    // Special-case common kwarg-accepting builtins (sorted, dict.get) by name.
-                    return crate::builtins::call_with_kwargs(self, &n, args, kwargs);
+                } else {
+                    (n.func)(self, args)?
+                };
+                // A native standing in for a coroutine function already ran
+                // (the scheduler is sequential); its result goes back as a
+                // completed task so the caller's `await` has an awaitable —
+                // see `NativeFn::awaitable`.
+                if n.awaitable {
+                    return Ok(crate::builtins::make_task_value(result));
                 }
-                (n.func)(self, args)
+                Ok(result)
             }
             Value::Function(f) => {
                 if f.is_async {
@@ -4727,11 +4841,26 @@ impl Interpreter {
         // class-attribute is a descriptor that binds through the class at
         // lookup time (this is how cross-module `extend` patches dispatch) —
         // snapshotting it into the instance would freeze an unbound copy.
-        for (k, v) in class.class_attrs.borrow().iter() {
+        // Likewise skip an object whose type defines `__get__` — a
+        // descriptor (`functools.partialmethod`, a hand-written one): it is
+        // read through the class so `__get__` sees the instance, and a
+        // per-instance assignment of the same name still wins.
+        let class_attrs: Vec<(String, Value)> = class
+            .class_attrs
+            .borrow()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (k, v) in class_attrs {
             if k.starts_with("__typhon_") || matches!(v, Value::Function(_)) {
                 continue;
             }
-            instance.fields.borrow_mut().insert(k.clone(), v.clone());
+            if let Value::Instance(d) = &v {
+                if self.find_method(&d.class, "__get__").is_some() {
+                    continue;
+                }
+            }
+            instance.fields.borrow_mut().insert(k, v);
         }
         // Custom __init__ wins.
         if let Some(init) = self.find_method(class, "__init__") {
@@ -4926,6 +5055,28 @@ impl Interpreter {
     /// (from `TaskGroup.create_task` / `spawn`) unwraps its stored result;
     /// anything else passes through (await on an already-produced value,
     /// e.g. the async-middleware `Callable[..., Awaitable[T]]` shape).
+    /// `await v`. CPython accepts a coroutine, a task / future, or an object
+    /// whose type defines `__await__`; anything else is a `TypeError` naming
+    /// the operand's type. The VM's natives that stand in for coroutine
+    /// functions hand back completed tasks (see `NativeFn::awaitable`), so
+    /// they pass here like any task. Before this check the VM returned a
+    /// non-awaitable operand unchanged, so `await 1` / `await sync_call()`
+    /// ran on under `tyc run` and raised after `tyc build`.
+    pub fn await_value(&mut self, v: Value) -> Result<Value, Unwind> {
+        match &v {
+            Value::Coroutine(_) => self.force_awaitable(v),
+            Value::Module(m) if m.name == "Task" => self.force_awaitable(v),
+            // An `__await__`-bearing object is awaitable in CPython. The VM
+            // models no `__await__` protocol, so such an object passes
+            // through as it always did rather than being rejected.
+            Value::Instance(inst) if self.find_method(&inst.class, "__await__").is_some() => Ok(v),
+            other => Err(type_error(format!(
+                "object {} can't be used in 'await' expression",
+                await_type_name(other)
+            ))),
+        }
+    }
+
     pub fn force_awaitable(&mut self, v: Value) -> Result<Value, Unwind> {
         match v {
             Value::Coroutine(thunk) => {
@@ -6133,6 +6284,35 @@ impl Interpreter {
         }
     }
 
+    /// The descriptor protocol for an *object* stored as a class attribute:
+    /// read through an instance or the class, its type's `__get__(obj,
+    /// owner)` produces the value (`obj` is `None` on class access).
+    /// Functions, `@property` and `@classmethod` have their own paths; this
+    /// is what `functools.partialmethod` / `singledispatchmethod` and any
+    /// hand-written descriptor rely on. `Ok(None)` when `v` is not one.
+    fn descriptor_get(
+        &mut self,
+        v: &Value,
+        obj: Option<Value>,
+        owner: &Rc<Class>,
+    ) -> Result<Option<Value>, Unwind> {
+        let Value::Instance(descriptor) = v else {
+            return Ok(None);
+        };
+        let Some(get) = self.find_method(&descriptor.class, "__get__") else {
+            return Ok(None);
+        };
+        let bound = self.call_value(
+            Value::BoundMethod {
+                receiver: Box::new(v.clone()),
+                function: get,
+            },
+            vec![obj.unwrap_or(Value::None), Value::Class(owner.clone())],
+            &[],
+        )?;
+        Ok(Some(bound))
+    }
+
     pub fn get_attr(&mut self, value: &Value, attr: &str) -> Result<Value, Unwind> {
         // `slice.start` / `.stop` / `.step` / `.indices(n)`.
         if let Value::Tuple(t) = value {
@@ -6309,9 +6489,10 @@ impl Interpreter {
                 // CPython: reading it through an instance binds `self`. This
                 // is how cross-module `extend Foo:` methods (lowered to
                 // `Foo.m = __typhon_extend_Foo__m`) dispatch.
-                if let Some(v) = inst.class.class_attrs.borrow().get(attr) {
+                let class_attr = inst.class.class_attrs.borrow().get(attr).cloned();
+                if let Some(v) = class_attr {
                     if !is_enum_sentinel(attr) {
-                        if let Value::Function(f) = v {
+                        if let Value::Function(f) = &v {
                             // `@staticmethod` extension: no receiver bound.
                             if f.is_static {
                                 return Ok(Value::Function(f.clone()));
@@ -6326,7 +6507,12 @@ impl Interpreter {
                                 function: f.clone(),
                             });
                         }
-                        return Ok(v.clone());
+                        if let Some(bound) =
+                            self.descriptor_get(&v, Some(value.clone()), &inst.class)?
+                        {
+                            return Ok(bound);
+                        }
+                        return Ok(v);
                     }
                 }
                 // Last resort: a user `__getattr__(self, name)` resolves
@@ -6428,8 +6614,12 @@ impl Interpreter {
                         },
                     ))));
                 }
-                if let Some(v) = class.class_attrs.borrow().get(attr) {
-                    return Ok(v.clone());
+                let class_attr = class.class_attrs.borrow().get(attr).cloned();
+                if let Some(v) = class_attr {
+                    if let Some(bound) = self.descriptor_get(&v, None, class)? {
+                        return Ok(bound);
+                    }
+                    return Ok(v);
                 }
                 if let Some(m) = class.methods.borrow().get(attr) {
                     // `@classmethod` accessed on the class binds `cls` to the class.
@@ -6578,6 +6768,16 @@ impl Interpreter {
             // `func.__name__` / `func.__qualname__`.
             Value::Function(f) if attr == "__name__" || attr == "__qualname__" => {
                 Ok(Value::Str(Rc::new(f.name.clone())))
+            }
+            // `func.__doc__`: what a decorator (`functools.update_wrapper`)
+            // set on it, else the body's docstring, else `None` — every
+            // function has one in CPython.
+            Value::Function(f) if attr == "__doc__" => {
+                let set = f.attrs.borrow().get("__doc__").cloned();
+                Ok(set.unwrap_or_else(|| match body_docstring(&f.body) {
+                    Some(doc) => Value::Str(Rc::new(doc)),
+                    None => Value::None,
+                }))
             }
             // PEP 695: a function's own type parameters, stamped at def time
             // by `build_type_params`. A non-generic function reports the empty
@@ -7336,7 +7536,7 @@ impl Interpreter {
         enum Recurse {
             Enumerate(Rc<RefCell<IterState>>),
             Zip(Vec<Rc<RefCell<IterState>>>),
-            Map(Value, Rc<RefCell<IterState>>),
+            Map(Value, Rc<RefCell<IterState>>, bool),
             Filter(Value, Rc<RefCell<IterState>>),
             Generator(Rc<RefCell<GeneratorState>>),
             GenExpr(Rc<RefCell<GenExprState>>),
@@ -7422,7 +7622,9 @@ impl Interpreter {
                 }
                 IterState::Enumerate { inner, .. } => Recurse::Enumerate(inner.clone()),
                 IterState::Zip { inners } => Recurse::Zip(inners.clone()),
-                IterState::Map { func, inner } => Recurse::Map(func.clone(), inner.clone()),
+                IterState::Map { func, inner, star } => {
+                    Recurse::Map(func.clone(), inner.clone(), *star)
+                }
                 IterState::Filter { func, inner } => Recurse::Filter(func.clone(), inner.clone()),
                 IterState::Generator(g) => Recurse::Generator(g.clone()),
                 IterState::GenExpr(g) => Recurse::GenExpr(g.clone()),
@@ -7470,7 +7672,12 @@ impl Interpreter {
                 }
                 Ok(Some(Value::Tuple(Rc::new(out))))
             }
-            Recurse::Map(func, inner) => match self.iter_next(&Value::Iter(inner))? {
+            Recurse::Map(func, inner, star) => match self.iter_next(&Value::Iter(inner))? {
+                // A multi-iterable `map` zips its inputs: each item is one
+                // tuple of arguments, spread over the callable.
+                Some(Value::Tuple(items)) if star => {
+                    Ok(Some(self.call_value(func, items.to_vec(), &[])?))
+                }
                 Some(v) => Ok(Some(self.call_value(func, vec![v], &[])?)),
                 None => Ok(None),
             },
@@ -8672,6 +8879,29 @@ fn number_to_value(n: &Number) -> Value {
         // as `Int(3) + Complex(0.0, 4.0)` so only the `imag` part is set here.
         Number::Complex { real, imag } => Value::Complex(*real, *imag),
     }
+}
+
+/// `type(v).__name__` as CPython spells it in the `await` error.
+fn await_type_name(v: &Value) -> String {
+    match v {
+        Value::Instance(inst) => inst.class.name.clone(),
+        Value::Class(_) => "type".to_owned(),
+        Value::Exception { kind, .. } => (**kind).clone(),
+        other => other.type_name().to_owned(),
+    }
+}
+
+/// The module object for a PEP 420 namespace package: no body to run, so
+/// just the dunders CPython gives every module.
+fn namespace_package(name: &str) -> Value {
+    let mut members: HashMap<String, Value> = HashMap::new();
+    members.insert("__name__".to_owned(), Value::Str(Rc::new(name.to_owned())));
+    members.insert("__doc__".to_owned(), Value::None);
+    Value::Module(Rc::new(crate::value::Module {
+        name: name.to_owned(),
+        members: RefCell::new(members),
+        env: None,
+    }))
 }
 
 fn decorator_simple_name(e: &Expr) -> Option<String> {
@@ -10094,6 +10324,11 @@ fn values_identical(a: &Value, b: &Value) -> bool {
         (Instance(x), Instance(y)) => Rc::ptr_eq(x, y),
         (Module(x), Module(y)) => Rc::ptr_eq(x, y),
         (Class(x), Class(y)) => Rc::ptr_eq(x, y),
+        // A function object is one `Rc`, so `g is f` after `g = f` (and
+        // `wrapper.__wrapped__ is f`) holds, as in CPython.
+        (Function(x), Function(y)) => Rc::ptr_eq(x, y),
+        (Native(x), Native(y)) => Rc::ptr_eq(x, y),
+        (Coroutine(x), Coroutine(y)) => Rc::ptr_eq(x, y),
         _ => false,
     }
 }
@@ -11829,6 +12064,17 @@ fn class_docstring(c: &ast::StmtClassDef) -> Option<String> {
 /// A module's docstring: the leading string-literal expression statement of
 /// its body, exactly as CPython's `__doc__` reports it. Returns `None` when
 /// the module doesn't open with one (CPython then binds `__doc__ = None`).
+/// The docstring of a function body: a leading string-literal statement.
+fn body_docstring(body: &[Stmt]) -> Option<String> {
+    match body.first()? {
+        Stmt::Expr(e) => match e.value.as_ref() {
+            Expr::StringLiteral(s) => Some(s.value.to_str().to_owned()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 pub(crate) fn module_docstring(module: &ModModule) -> Option<String> {
     match module.body.first() {
         Some(ruff_python_ast::Stmt::Expr(e)) => match e.value.as_ref() {

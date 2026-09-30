@@ -834,6 +834,74 @@ fn vm_run_resolves_siblings_and_binds_sealed_union_alias() {
 }
 
 #[test]
+fn tyc_run_falls_back_to_the_compiled_path_for_an_unmodelled_attribute() {
+    // The import scan only sees module names. `re` is modelled, but the VM's
+    // model of it has no `purge`, so without an attribute-level scan this
+    // program died with `AttributeError` under the VM while the compiled
+    // path ran it. The scan asks the VM what each modelled module exports
+    // and sends a program reading anything else down the compiled path,
+    // naming the `module.attr` in the note.
+    let project = tempfile::tempdir().unwrap();
+    let script = project.path().join("uses_purge.ty");
+    std::fs::write(
+        &script,
+        "import re\n\n\
+         def main() -> None:\n    \
+             re.purge()\n    \
+             print(re.sub(\"a\", \"b\", \"aaa\"))\n\n\
+         main()\n",
+    )
+    .unwrap();
+
+    let out = tyc().arg("run").arg(&script).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "tyc run must fall back rather than fail:\n{stderr}{stdout}"
+    );
+    assert!(
+        stdout.contains("bbb"),
+        "the program must actually run:\n{stderr}{stdout}"
+    );
+    assert!(
+        stderr.contains("`re.purge` is not modelled by the in-process VM"),
+        "the fallback must name the missing attribute:\n{stderr}"
+    );
+
+    // `--no-fallback` still refuses: the VM's own AttributeError surfaces.
+    let strict = tyc()
+        .arg("run")
+        .arg("--no-fallback")
+        .arg(&script)
+        .output()
+        .unwrap();
+    let strict_err = String::from_utf8_lossy(&strict.stderr);
+    assert!(
+        !strict.status.success() && strict_err.contains("AttributeError"),
+        "--no-fallback must surface the VM's AttributeError:\n{strict_err}"
+    );
+
+    // An attribute the VM does export keeps the program in the VM.
+    let plain = project.path().join("uses_flags.ty");
+    std::fs::write(
+        &plain,
+        "import re\n\ndef main() -> None:\n    print(re.findall(\"a\", \"AaA\", re.I))\n\nmain()\n",
+    )
+    .unwrap();
+    let out = tyc().arg("run").arg(&plain).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("not modelled"),
+        "a modelled-attribute program must stay in the VM:\n{stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("['A', 'a', 'A']"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn tyc_run_falls_back_to_the_compiled_path_for_an_unmodelled_module() {
     // The VM models a documented subset of the stdlib. `tyc run` is
     // contractually a drop-in for `tyc build` + CPython, so a program
