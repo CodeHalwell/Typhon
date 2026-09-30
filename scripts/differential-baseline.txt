@@ -27,7 +27,7 @@
 # rather than failed; affected non-baseline units may show up as new
 # divergences the recording environment would not produce.
 #
-# Generated 2026-09-02 against tyc 1.0.0-alpha.9
+# Generated 2026-09-30 against tyc 1.0.0-alpha.9
 # Scope: all
 #
 stress/round-2026-05-20-exploration/04-ai-llm/05-llm-structured-out.ty
