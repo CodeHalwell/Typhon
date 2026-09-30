@@ -42,7 +42,9 @@ pub fn user_bound_marker_names(
     body: &[ruff_python_ast::Stmt],
 ) -> std::collections::HashSet<String> {
     use ruff_python_ast::{Expr, Stmt};
-    const MARKERS: [&str; 3] = ["pure", "memo", "gatherable"];
+    // `covariant` / `contravariant` are the class-level variance overrides;
+    // like the three function markers they have no Python runtime form.
+    const MARKERS: [&str; 5] = ["pure", "memo", "gatherable", "covariant", "contravariant"];
     let mut out = std::collections::HashSet::new();
     let mut note = |name: &str| {
         if MARKERS.contains(&name) {

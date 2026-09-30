@@ -398,19 +398,26 @@ pub enum TycError {
     },
 
     /// A nullable value (`T | None`) was used in a position requiring `T`.
-    #[error("possibly-None value used where `{expected}` is required")]
+    ///
+    /// The three rendered strings are precomputed by the constructors so the
+    /// same code covers both shapes: the ordinary `T | None` value (guard it
+    /// and narrow) and a value that is *always* `None` — `None.attr`, or the
+    /// result of a `-> None` function used as a receiver — for which "guard
+    /// it" would be misleading advice.
+    #[error("{headline}")]
     #[diagnostic(
         code(tyc::nullable_use),
         url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/nullable_use.md"),
-        help("guard the value with `if {name} is not None:` to narrow it to `{expected}`")
+        help("{advice}")
     )]
     NullableUse {
-        name: String,
-        expected: String,
+        headline: String,
+        advice: String,
         #[source_code]
         src: NamedSource<String>,
-        #[label("value is `{expected} | None` here")]
+        #[label("{note}")]
         span: SourceSpan,
+        note: String,
     },
 
     /// The error type propagated by `?` from a callee does not match the
@@ -2474,7 +2481,8 @@ impl TycError {
         }
     }
 
-    /// Construct a [`TycError::NullableUse`] diagnostic.
+    /// Construct a [`TycError::NullableUse`] diagnostic for a `T | None`
+    /// value used where `T` is required.
     pub fn nullable_use(
         name: impl Into<String>,
         expected: impl Into<String>,
@@ -2483,11 +2491,42 @@ impl TycError {
         offset: usize,
         length: usize,
     ) -> Self {
+        let name = name.into();
+        let expected = expected.into();
         Self::NullableUse {
-            name: name.into(),
-            expected: expected.into(),
+            headline: format!("possibly-None value used where `{expected}` is required"),
+            advice: format!(
+                "guard the value with `if {name} is not None:` to narrow it to `{expected}`"
+            ),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
+            note: format!("value is `{expected} | None` here"),
+        }
+    }
+
+    /// Construct a [`TycError::NullableUse`] diagnostic for a value whose
+    /// type is exactly `None` — `None.attr`, `None[0]`, or the result of a
+    /// `-> None` function used as a receiver or operand. Same code, since it
+    /// is the same runtime failure (an operation on `None`), but the wording
+    /// must not suggest a narrowing guard: there is no non-None case to
+    /// narrow to.
+    pub fn nullable_use_always_none(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        let name = name.into();
+        Self::NullableUse {
+            headline: "`None` used where a non-None value is required".to_owned(),
+            advice: format!(
+                "`{name}` has type `None`, not `T | None`, so no `is not None` guard \
+                 can narrow it — give it a non-None value, or remove this use"
+            ),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+            note: format!("`{name}` is always `None` here"),
         }
     }
 
@@ -5667,6 +5706,18 @@ mod tests {
     }
 
     #[test]
+    fn nullable_use_always_none_does_not_suggest_a_guard() {
+        let e = TycError::nullable_use_always_none("f(...)", "a.ty", "f().attr", 0, 3);
+        assert!(matches!(e, TycError::NullableUse { .. }));
+        let headline = e.to_string();
+        assert!(headline.contains("`None` used"), "got: {headline}");
+        assert!(!headline.contains("possibly"), "got: {headline}");
+        let help = e.help().map(|h| h.to_string()).unwrap_or_default();
+        assert!(!help.contains("is not None:"), "got: {help}");
+        assert!(help.contains("`f(...)` has type `None`"), "got: {help}");
+    }
+
+    #[test]
     fn wrong_arg_count_contains_name_and_counts() {
         let e = TycError::wrong_arg_count("f", 2, 3, "a.ty", "f(1, 2, 3)", 0, 9);
         assert!(matches!(e, TycError::WrongArgCount { .. }));
@@ -5871,11 +5922,18 @@ mod tests {
             "\"off\" drops the field form; the bare-name error is not governed"
         );
 
-        let default = apply_severity_overrides(build(), &with("warn"));
+        let relaxed = apply_severity_overrides(build(), &with("warn"));
         assert_eq!(
-            (default.error_count(), default.warning_count()),
+            (relaxed.error_count(), relaxed.warning_count()),
             (1, 1),
-            "\"warn\" (the default) leaves both forms at their emitted severity"
+            "\"warn\" leaves both forms at their emitted severity"
+        );
+
+        let unset = apply_severity_overrides(build(), &with(""));
+        assert_eq!(
+            (unset.error_count(), unset.warning_count()),
+            (2, 0),
+            "unset promotes the field form: \"error\" is the default"
         );
     }
 
@@ -6214,7 +6272,7 @@ pub struct SeverityOverrides {
     pub unused_import: String,
     /// `"warn"` (default) | `"error"` | `"off"`.
     pub methods_in_class_body: String,
-    /// `"warn"` (default) | `"error"` | `"off"`. Governs only the
+    /// `"error"` (default) | `"warn"` | `"off"`. Governs only the
     /// warn-emitted *attribute-rooted* form of `tyc::nullable_use`; the
     /// error-emitted bare-name form is not reclassified by this knob.
     pub nullable_use: String,
@@ -6242,7 +6300,7 @@ impl SeverityOverrides {
         let stays_warning = |s: &str| s.is_empty() || s == "warn";
         stays_warning(&self.unused_import)
             && stays_warning(&self.methods_in_class_body)
-            && stays_warning(&self.nullable_use)
+            && (self.nullable_use == "warn")
             && stays_warning(&self.require_with)
             && stays_warning(&self.blocking_in_async)
             && (self.stub_check == "warn")
@@ -6284,7 +6342,11 @@ pub fn apply_severity_overrides(diags: Diagnostics, overrides: &SeverityOverride
         } else if matches!(warn, TycError::NullableUse { .. }) {
             // Only the warn-emitted (attribute-rooted) form reaches this
             // loop; the bare-name form is emitted as an error and stays one.
-            Some((overrides.nullable_use.as_str(), false))
+            // Promoted to an error unless explicitly relaxed (`"warn"`):
+            // `self.conn.execute()` on a `conn: Conn?` is the headline
+            // Rule-3 crash, and since the 2026-09-30 review it fails the
+            // build by default like the bare-name form.
+            Some((overrides.nullable_use.as_str(), true))
         } else if matches!(warn, TycError::ResourceNotManaged { .. }) {
             Some((overrides.require_with.as_str(), false))
         } else if matches!(warn, TycError::BlockingInAsync { .. }) {

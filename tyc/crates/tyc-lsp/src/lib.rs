@@ -1225,6 +1225,7 @@ impl LanguageServer for Backend {
                 let target = ImportInfo {
                     module,
                     member: Some(member.clone()),
+                    level: import.level,
                 };
                 if let Some(loc) = self.resolve_cross_file_import(&uri, &target).await {
                     return Ok(Some(GotoDefinitionResponse::Scalar(loc)));

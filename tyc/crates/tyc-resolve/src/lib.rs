@@ -102,6 +102,13 @@ pub struct ImportInfo {
     /// original member name. `None` for bare `import` statements where
     /// the bound name is the module itself.
     pub member: Option<String>,
+    /// Relative-import depth: the number of leading dots in a
+    /// `from .kinds import x` (`1`), `from ..util import y` (`2`), or
+    /// `from . import z` (`1`, with an empty `module`). `0` for an
+    /// absolute import. `module` is recorded exactly as written (without
+    /// the dots); the project checker canonicalises the pair against the
+    /// importing file's own package (review 2026-09-30 §4.1).
+    pub level: u32,
 }
 
 impl Binding {
@@ -1794,6 +1801,7 @@ fn declare_import_aliases(r: &mut Resolver, scope: ScopeId, i: &ruff_python_ast:
             Some(ImportInfo {
                 module,
                 member: None,
+                level: 0,
             }),
         );
     }
@@ -1860,10 +1868,17 @@ fn declare_import_from_aliases(
             BindingKind::Import,
             Mutability::Mut,
             span,
-            module.as_ref().map(|m| ImportInfo {
-                module: m.clone(),
-                member: Some(alias.name.as_str().to_owned()),
-            }),
+            // A relative import with no module (`from . import x`) sources
+            // the member from the package itself; keep the (empty) module
+            // and the level so the project checker can resolve it.
+            module
+                .clone()
+                .or_else(|| (i.level > 0).then(String::new))
+                .map(|m| ImportInfo {
+                    module: m,
+                    member: Some(alias.name.as_str().to_owned()),
+                    level: i.level,
+                }),
         );
     }
 }
@@ -3597,6 +3612,10 @@ fn builtin_names() -> std::collections::HashSet<&'static str> {
         "pure",
         "memo",
         "gatherable",
+        // Variance overrides on a generic class (`@covariant class Box[T]:`);
+        // the desugar pass drops them, like `pure` / `memo` / `gatherable`.
+        "covariant",
+        "contravariant",
         "runtime_checkable",
         "functools",
         "dataclass",
@@ -3612,6 +3631,33 @@ mod tests {
 
     fn resolve(src: &str) -> (ResolvedModule, Diagnostics) {
         resolve_with_options(src, ResolveOptions::default())
+    }
+
+    #[test]
+    fn from_imports_record_their_relative_level() {
+        // `tyc-db` resolves a relative import against the importing
+        // module's package; without the level a `from .shapes import Kind`
+        // was looked up as the absolute `shapes` and its sealed union /
+        // newtype shapes never reached the consumer.
+        let (r, _) = resolve(
+            "from .shapes import Kind\nfrom ..top import Other\nfrom . import Sibling\nfrom pkg.abs import Abs\nimport os\n",
+        );
+        let info = |name: &str| {
+            r.module_scope()
+                .lookup_local(name)
+                .and_then(|b| b.import_info.clone())
+                .unwrap_or_else(|| panic!("{name} should be an import binding"))
+        };
+        let kind = info("Kind");
+        assert_eq!((kind.module.as_str(), kind.level), ("shapes", 1));
+        let other = info("Other");
+        assert_eq!((other.module.as_str(), other.level), ("top", 2));
+        let sibling = info("Sibling");
+        assert_eq!((sibling.module.as_str(), sibling.level), ("", 1));
+        let abs = info("Abs");
+        assert_eq!((abs.module.as_str(), abs.level), ("pkg.abs", 0));
+        let os = info("os");
+        assert_eq!((os.module.as_str(), os.level, os.member), ("os", 0, None));
     }
 
     // ── Beta hardening: f-string specs, class-body comprehensions, `_` ──

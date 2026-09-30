@@ -39,8 +39,11 @@ TYC_BIN="${TYC_BIN:-$ROOT/tyc/target/release/tyc}"
 PERF_RUNS="${PERF_RUNS:-9}"
 PERF_WARMUP="${PERF_WARMUP:-2}"
 PERF_THRESHOLD="${PERF_THRESHOLD:-0.20}"
-# Absolute regression floor in milliseconds; see the comparison step.
-PERF_MIN_SLACK_MS="${PERF_MIN_SLACK_MS:-5}"
+# Absolute regression floor in milliseconds; see the comparison step. 10 ms
+# rather than 5: with a ~22 ms baseline the 20% band is under 5 ms, and a
+# shared runner's process-start jitter alone was tripping the gate on a
+# tree with no compiler change (2026-09-30 review, §2).
+PERF_MIN_SLACK_MS="${PERF_MIN_SLACK_MS:-10}"
 PERF_BASELINE="${PERF_BASELINE:-$ROOT/perf-baseline.json}"
 
 # Fixed benchmark corpus: a real, self-contained Typhon project that exercises

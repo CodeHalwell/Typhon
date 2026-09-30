@@ -24,7 +24,7 @@ use tyc_syntax::{
         PreprocessResult,
     },
 };
-use tyc_types::{check_module_with_imports, extract_module_shapes, ExternalShapes};
+use tyc_types::{check_module_with_imports, ExternalShapes};
 
 /// Re-export so downstream crates (CLI, LSP) can name the type
 /// without depending on `tyc-types` directly.
@@ -503,14 +503,15 @@ pub fn extract_shapes_for_path(_path: &str, text: &str) -> ModuleShapes {
         Ok(p) => p.into_syntax(),
         Err(_) => return ModuleShapes::default(),
     };
-    let mut shapes = extract_module_shapes(&module);
     // Frozen-ness is preprocessor line-based (the `frozen` modifier is
-    // stripped before parsing), so it isn't visible to the AST-only
-    // `extract_module_shapes`. Fill it in here where the preprocess
-    // metadata is in scope, so a consumer of an imported frozen class
-    // sees it as frozen.
-    shapes.frozen_classes =
+    // stripped before parsing), so it isn't visible to the AST alone.
+    // Compute it here where the preprocess metadata is in scope and hand
+    // it to the extractor: a consumer of an imported frozen class sees it
+    // as frozen, and variance inference treats its fields as read-only.
+    let frozen =
         tyc_types::frozen_class_names(&prep.python_source, &module.body, &prep.frozen_class_lines);
+    let mut shapes = tyc_types::extract_module_shapes_with(&module, &frozen);
+    shapes.frozen_classes = frozen;
     shapes
 }
 
@@ -763,7 +764,8 @@ fn check_pipeline(
     // `None` here is exactly what the pre-F55 single-file path did: with no
     // registry there is nothing to seed, so the checker runs its
     // in-module-only pass (`check_module_with`).
-    let external = shapes_by_module.map(|s| build_external_shapes(&resolved_arc, s));
+    let external = shapes_by_module
+        .map(|s| build_external_shapes(&resolved_arc, s, std::path::Path::new(&path)));
     let type_diags = check_module_with_imports(
         path.clone(),
         &prep.python_source,
@@ -781,6 +783,66 @@ fn check_pipeline(
     diags.remap_lines(&prep.python_source, &prep.line_map, &path, &text);
 
     diags
+}
+
+/// The registry key of the module at `path`: the longest key whose dotted
+/// spelling matches the path's tail (`shapes.kinds` ↔ `…/shapes/kinds.ty`,
+/// `shapes` ↔ `…/shapes/__init__.ty`). `None` when the file is not in the
+/// registry (a standalone check).
+fn own_module_key<'a>(
+    path: &std::path::Path,
+    keys: impl Iterator<Item = &'a String>,
+) -> Option<String> {
+    let p = path.to_string_lossy().replace('\\', "/");
+    let mut best: Option<String> = None;
+    for key in keys {
+        if key.is_empty() {
+            continue;
+        }
+        let rel = key.replace('.', "/");
+        let tails = [
+            format!("/{rel}.ty"),
+            format!("/{rel}.dty"),
+            format!("/{rel}/__init__.ty"),
+            format!("/{rel}/__init__.dty"),
+        ];
+        let matches = tails.iter().any(|t| p.ends_with(t.as_str()) || p == t[1..]);
+        if matches && best.as_ref().is_none_or(|b| key.len() > b.len()) {
+            best = Some(key.clone());
+        }
+    }
+    best
+}
+
+/// The absolute registry key an import binding sources from. A relative
+/// import walks up from the importing module's package — one level for the
+/// first dot, one more for each further dot — and appends the written
+/// module, if any; an absolute import is returned as written. Without a
+/// known own key the relative name is returned unchanged (and will simply
+/// not match the registry, as before).
+fn canonical_import_module(
+    info: &tyc_resolve::ImportInfo,
+    own_key: Option<&str>,
+    own_is_init: bool,
+) -> String {
+    if info.level == 0 {
+        return info.module.clone();
+    }
+    let Some(own) = own_key else {
+        return info.module.clone();
+    };
+    let mut parts: Vec<&str> = own.split('.').filter(|s| !s.is_empty()).collect();
+    if !own_is_init {
+        parts.pop();
+    }
+    for _ in 1..info.level {
+        parts.pop();
+    }
+    let mut out: Vec<String> = parts.iter().map(|s| (*s).to_owned()).collect();
+    if !info.module.is_empty() {
+        out.extend(info.module.split('.').map(str::to_owned));
+    }
+    out.join(".")
 }
 
 /// Walk the resolved module's bindings, pick out every import, and
@@ -805,7 +867,18 @@ fn check_pipeline(
 fn build_external_shapes(
     resolved: &ResolvedModule,
     shapes_by_module: &std::sync::Arc<std::collections::HashMap<String, ModuleShapes>>,
+    path: &std::path::Path,
 ) -> ExternalShapes {
+    // A relative import (`from .kinds import Shape`) names its source
+    // relative to the importing file's package, while the registry is
+    // keyed by absolute dotted names (`shapes.kinds`). Resolve the file's
+    // own key from the registry and canonicalise every relative import
+    // against it (review 2026-09-30 §4.1); absolute imports are unchanged.
+    let own_key = own_module_key(path, shapes_by_module.keys());
+    let is_init = path.file_stem().is_some_and(|s| s == "__init__");
+    let canon = |info: &tyc_resolve::ImportInfo| -> String {
+        canonical_import_module(info, own_key.as_deref(), is_init)
+    };
     // Just bump the refcount — the caller (`tyc check` / `tyc
     // build` / the LSP) constructs the registry once per
     // invocation and the per-file `ExternalShapes` snapshots
@@ -828,7 +901,7 @@ fn build_external_shapes(
         if let Some(info) = &b.import_info {
             if let Some(member) = info.member.as_ref() {
                 local_by_module
-                    .entry(info.module.clone())
+                    .entry(canon(info).clone())
                     .or_default()
                     .insert(member.clone(), b.name.clone());
             }
@@ -840,14 +913,14 @@ fn build_external_shapes(
             // Bare `import M as N` — record the alias mapping so the
             // checker can render `N.SomeClass(...)` via the module
             // registry. The shape lookup at attribute-access time
-            // uses `info.module` (the original dotted name), not the
+            // uses `canon(info)` (the original dotted name), not the
             // local alias.
             external
                 .bare_imports
-                .insert(b.name.clone(), info.module.clone());
+                .insert(b.name.clone(), canon(info).clone());
             continue;
         };
-        let Some(module_shapes) = shapes_by_module.get(&info.module) else {
+        let Some(module_shapes) = shapes_by_module.get(&canon(info)) else {
             continue;
         };
         if let Some(shape) = module_shapes.class_shapes.get(member) {
@@ -900,7 +973,7 @@ fn build_external_shapes(
             // through the per-module local-name map so
             // `from foo import A as MyA, Event` is seen as
             // `Event = MyA | …` by the consumer's checker.
-            let remap = local_by_module.get(&info.module);
+            let remap = local_by_module.get(&canon(info));
             let mapped: Vec<String> = variants
                 .iter()
                 .map(|v| {
@@ -953,13 +1026,13 @@ fn build_external_shapes(
         if info.member.is_none() {
             continue;
         }
-        if !modules_touched.insert(info.module.clone()) {
+        if !modules_touched.insert(canon(info).clone()) {
             continue;
         }
-        let Some(module_shapes) = shapes_by_module.get(&info.module) else {
+        let Some(module_shapes) = shapes_by_module.get(&canon(info)) else {
             continue;
         };
-        let remap = local_by_module.get(&info.module);
+        let remap = local_by_module.get(&canon(info));
         for (union_name, variants) in &module_shapes.sealed_unions {
             // Skip if already populated (handled above when the union
             // name itself was imported).
@@ -1087,7 +1160,7 @@ fn build_external_shapes(
         if info.member.is_some() {
             continue;
         }
-        let Some(module_shapes) = shapes_by_module.get(&info.module) else {
+        let Some(module_shapes) = shapes_by_module.get(&canon(info)) else {
             continue;
         };
         for (newtype_name, base) in &module_shapes.newtypes {
@@ -1141,6 +1214,62 @@ fn build_external_shapes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn import(module: &str, level: u32) -> tyc_resolve::ImportInfo {
+        tyc_resolve::ImportInfo {
+            module: module.to_owned(),
+            member: Some("Thing".to_owned()),
+            level,
+        }
+    }
+
+    #[test]
+    fn own_module_key_matches_the_longest_dotted_tail() {
+        let keys = [
+            "pkg".to_owned(),
+            "pkg.sub".to_owned(),
+            "other.sub".to_owned(),
+        ];
+        let key = |p: &str| own_module_key(std::path::Path::new(p), keys.iter());
+        assert_eq!(key("/proj/src/pkg/sub.ty").as_deref(), Some("pkg.sub"));
+        assert_eq!(key("/proj/src/pkg/__init__.ty").as_deref(), Some("pkg"));
+        assert_eq!(key("/proj/src/pkg/sub.dty").as_deref(), Some("pkg.sub"));
+        assert_eq!(key("/proj/src/unrelated.ty"), None);
+    }
+
+    #[test]
+    fn relative_imports_resolve_against_the_importing_package() {
+        // `from .shapes import Thing` inside `pkg/sub.ty` → `pkg.shapes`.
+        assert_eq!(
+            canonical_import_module(&import("shapes", 1), Some("pkg.sub"), false),
+            "pkg.shapes"
+        );
+        // …and inside `pkg/__init__.ty` the package itself is the base.
+        assert_eq!(
+            canonical_import_module(&import("shapes", 1), Some("pkg"), true),
+            "pkg.shapes"
+        );
+        // `from . import Thing` names the package.
+        assert_eq!(
+            canonical_import_module(&import("", 1), Some("pkg.sub"), false),
+            "pkg"
+        );
+        // `from ..x import Thing` from `pkg/sub.ty` climbs to the root.
+        assert_eq!(
+            canonical_import_module(&import("x", 2), Some("pkg.sub"), false),
+            "x"
+        );
+        // An absolute import is returned as written.
+        assert_eq!(
+            canonical_import_module(&import("pkg.shapes", 0), Some("pkg.sub"), false),
+            "pkg.shapes"
+        );
+        // Without a known own key the relative name is left alone.
+        assert_eq!(
+            canonical_import_module(&import("shapes", 1), None, false),
+            "shapes"
+        );
+    }
 
     #[test]
     fn seed_bundled_stubs_populates_httpx_and_requests() {

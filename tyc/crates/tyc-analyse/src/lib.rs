@@ -5607,6 +5607,10 @@ pub const SECRET_NAME_KEYWORDS: &[&str] = &[
     "SECRETKEY",
     "ACCESS_TOKEN",
     "ACCESSTOKEN",
+    // `OAUTH_TOKEN` contains `AUTH_TOKEN` (and `OAUTHTOKEN` contains
+    // `AUTHTOKEN`), so both sit ahead of the `AUTH*` pair.
+    "OAUTH_TOKEN",
+    "OAUTHTOKEN",
     "AUTH_TOKEN",
     "AUTHTOKEN",
     "BEARER_TOKEN",
@@ -5617,6 +5621,8 @@ pub const SECRET_NAME_KEYWORDS: &[&str] = &[
     "JWTTOKEN",
     "API_TOKEN",
     "APITOKEN",
+    "OAUTH_SECRET",
+    "OAUTHSECRET",
     "PASSWORD",
     "SECRET",
     "TOKEN",
@@ -7818,6 +7824,30 @@ mod secret_table_tests {
         for word in SECRET_NAME_KEYWORDS {
             assert!(seen.insert(word), "duplicate keyword `{word}`");
         }
+    }
+
+    /// `OAUTH_TOKEN` / `OAUTH_SECRET` (and their squashed forms) are the
+    /// commonest secret-shaped names the alpha.9 table still missed
+    /// (review 2026-09-30 §5.4); they sit before the bare `TOKEN` /
+    /// `SECRET` so the specific word is reported.
+    #[test]
+    fn oauth_names_are_secret_shaped() {
+        for name in [
+            "OAUTH_TOKEN",
+            "oauth_token",
+            "GITHUB_OAUTH_TOKEN",
+            "OAUTHTOKEN",
+            "OAUTH_SECRET",
+            "SlackOAuthSecret",
+            "OAUTHSECRET",
+        ] {
+            assert!(is_secret_name(name), "`{name}` should be secret-shaped");
+        }
+        let idx = |w: &str| SECRET_NAME_KEYWORDS.iter().position(|k| *k == w).unwrap();
+        assert!(idx("OAUTH_TOKEN") < idx("AUTH_TOKEN"));
+        assert!(idx("OAUTHTOKEN") < idx("AUTHTOKEN"));
+        assert!(idx("OAUTH_SECRET") < idx("SECRET"));
+        assert!(idx("OAUTHSECRET") < idx("SECRET"));
     }
 
     #[test]

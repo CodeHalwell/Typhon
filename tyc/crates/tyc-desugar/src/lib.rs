@@ -1920,6 +1920,10 @@ fn inject_memoise_decorators(body: Vec<Stmt>, memoise: &[String]) -> (Vec<Stmt>,
                 Stmt::FunctionDef(f)
             }
             Stmt::ClassDef(mut c) => {
+                // A top-level class drops its `@covariant` / `@contravariant`
+                // marker exactly like a nested one does.
+                c.decorator_list
+                    .retain(|d| !is_variance_marker_with(&d.expression, &shadowed));
                 c.body = strip_purity_decorators_in_body_with(c.body, &shadowed);
                 Stmt::ClassDef(c)
             }
@@ -1945,12 +1949,30 @@ fn strip_purity_decorators_in_body_with(
                 Stmt::FunctionDef(f)
             }
             Stmt::ClassDef(mut c) => {
+                // `@covariant` / `@contravariant` on a class are checker-only
+                // variance overrides with no runtime form, so they are dropped
+                // here exactly like the function markers (unless the module
+                // binds the name itself).
+                c.decorator_list
+                    .retain(|d| !is_variance_marker_with(&d.expression, shadowed));
                 c.body = strip_purity_decorators_in_body_with(c.body, shadowed);
                 Stmt::ClassDef(c)
             }
             other => other,
         })
         .collect()
+}
+
+/// A bare `@covariant` / `@contravariant` class decorator (see
+/// [`strip_purity_decorators_in_body_with`]).
+fn is_variance_marker_with(d: &Expr, shadowed: &std::collections::HashSet<String>) -> bool {
+    match d {
+        Expr::Name(n) => {
+            matches!(n.id.as_str(), "covariant" | "contravariant")
+                && !shadowed.contains(n.id.as_str())
+        }
+        _ => false,
+    }
 }
 
 // `user_bound_marker_names` — the "is this really Typhon's `@pure` /
@@ -4904,6 +4926,19 @@ mod tests {
         let module = parsed.into_syntax();
         let output = desugar_module(&module);
         emit(&output.module)
+    }
+
+    #[test]
+    fn variance_markers_are_stripped_from_class_decorators() {
+        // `@covariant` / `@contravariant` are checker-only annotations
+        // (review 2026-09-30 §4.5); nothing defines them at runtime, so
+        // leaving them in the emitted Python raised `NameError` on import.
+        let out = parse_and_desugar(
+            "@covariant\nclass Src[T]:\n    value: T\n\n@contravariant\nclass Sink[T]:\n    value: T\n",
+        );
+        assert!(!out.contains("covariant"), "{out}");
+        assert!(out.contains("class Src[T]"), "{out}");
+        assert!(out.contains("class Sink[T]"), "{out}");
     }
 
     #[test]

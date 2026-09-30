@@ -13,7 +13,7 @@ no-implicit-any = true
 unused-import = "warn"
 exhaustive-match = "error"
 methods-in-class-body = "warn"
-nullable-use = "warn"
+nullable-use = "error"
 require-with = "warn"
 blocking-in-async = "warn"
 stub-check = "error"
@@ -41,7 +41,7 @@ allow-secret-comptime = false
 | `no-implicit-any` | bool | `true` | Reserved — surfaces today as the [`tyc::missing_annotation`](/Typhon/diagnostics/type-errors/) diagnostic on un-annotated parameters and return types. The flag is parsed for forward compatibility; toggling it does not currently relax the check. |
 | `unused-import` | `"error"` \| `"warn"` \| `"off"` | `"warn"` | Severity for unused imports (default `"warn"` since v0.8.0). The LSP offers a "Remove unused import" quick-fix. |
 | `exhaustive-match` | `"error"` \| `"warn"` \| `"off"` | `"error"` | Severity for non-exhaustive `match` over sealed unions. |
-| `nullable-use` | `"error"` \| `"warn"` \| `"off"` | `"warn"` | Severity for the *attribute-rooted* form of [`tyc::nullable_use`](/Typhon/diagnostics/nullability/) — dereferencing a possibly-`None` field (`self.db.host` where `db: Db?`). Introduced at `"warn"` because the check never ran before v1.0.0-alpha.7; promote to `"error"` once your code is clean. The bare-name form is always an error and is not governed by this knob. |
+| `nullable-use` | `"error"` \| `"warn"` \| `"off"` | `"error"` | Severity for the *attribute-rooted* form of [`tyc::nullable_use`](/Typhon/diagnostics/nullability/) — dereferencing a possibly-`None` field (`self.db.host` where `db: Db?`). Introduced at `"warn"` in v1.0.0-alpha.7 because the check had never run before; an error by default since the 2026-09-30 review. Set `"warn"` to relax it during a migration. The bare-name form is always an error and is not governed by this knob. |
 | `methods-in-class-body` | `"error"` \| `"warn"` \| `"off"` | `"warn"` | Severity for [`tyc::method_in_class_body`](/Typhon/diagnostics/class-errors/) — Rule 4: methods live in `impl Name:`, not the class body. Default `"warn"` matches every other nudge diagnostic; promote to `"error"` once a codebase has finished migrating off in-body methods. `"off"` suppresses it entirely. |
 | `require-with` | `"error"` \| `"warn"` \| `"off"` | `"warn"` | Severity for [`tyc::resource_not_managed`](/Typhon/diagnostics/compile-errors/) — a call to a known resource-returning function (`open`, `socket.socket`, `sqlite3.connect`, `tempfile.*`) bound to a variable outside a `with` statement. `"error"` promotes it once a codebase has paid down the migration; `"off"` drops it. |
 | `blocking-in-async` | `"error"` \| `"warn"` \| `"off"` | `"warn"` | Severity for [`tyc::blocking_in_async`](/Typhon/diagnostics/async-errors/) — a direct call to a known-blocking stdlib function (`time.sleep`, `requests.get`, `subprocess.run`, `socket.recv`, …) inside an `async def`. `"error"` promotes it for codebases that have finished moving to async-aware libraries; `"off"` suppresses it. |

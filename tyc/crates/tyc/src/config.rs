@@ -188,12 +188,13 @@ pub struct StrictnessConfig {
     pub methods_in_class_body: String,
     /// Severity for the *attribute-rooted* form of `tyc::nullable_use` —
     /// dereferencing a possibly-`None` field (`self.db.host` where `db: Db?`).
-    /// `"warn"` (default) is the v1.0.0-alpha.7 introduction severity: the
-    /// check never ran before that release, so an immediate error would
-    /// reject programs whose nullable field happens always to be populated.
-    /// `"error"` promotes it (the documented migration path); `"off"`
-    /// suppresses it. The *bare-name* form (`x.upper()` where `x: str?`) has
-    /// always been an error and is not governed by this knob.
+    /// `"error"` (default since the 2026-09-30 review; `"warn"` was the
+    /// v1.0.0-alpha.7 introduction severity): a possibly-`None` field
+    /// dereference is the headline Rule-3 crash, so it fails the build like
+    /// the bare-name form. `"warn"` demotes it (the migration path for a
+    /// codebase whose nullable fields happen always to be populated);
+    /// `"off"` suppresses it. The *bare-name* form (`x.upper()` where
+    /// `x: str?`) has always been an error and is not governed by this knob.
     pub nullable_use: String,
     /// When true, every function that passes the six-condition purity check
     /// is treated as if the user had written `@memo` — the desugarer emits a
@@ -337,7 +338,7 @@ impl Default for StrictnessConfig {
             unused_import: "warn".into(),
             exhaustive_match: "error".into(),
             methods_in_class_body: "warn".into(),
-            nullable_use: "warn".into(),
+            nullable_use: "error".into(),
             // `None` = "absent from toml": resolved to a concrete bool by
             // `TyphonConfig::resolve_optimise` (off at optimise level 0, on at
             // level 1). An explicit toml entry deserialises to `Some(v)` and
