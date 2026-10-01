@@ -3968,19 +3968,19 @@ fn annotation_text(ann: &Expr) -> String {
     }
 }
 
-fn parameter_names(parameters: &Parameters) -> HashSet<String> {
-    let mut out: HashSet<String> = parameters
+fn parameter_names(parameters: &Parameters) -> HashSet<&str> {
+    let mut out: HashSet<&str> = parameters
         .posonlyargs
         .iter()
         .chain(parameters.args.iter())
         .chain(parameters.kwonlyargs.iter())
-        .map(|p| p.parameter.name.as_str().to_owned())
+        .map(|p| p.parameter.name.as_str())
         .collect();
     if let Some(v) = &parameters.vararg {
-        out.insert(v.name.as_str().to_owned());
+        out.insert(v.name.as_str());
     }
     if let Some(k) = &parameters.kwarg {
-        out.insert(k.name.as_str().to_owned());
+        out.insert(k.name.as_str());
     }
     out
 }
@@ -4250,7 +4250,7 @@ struct PurityCtx<'a> {
     unproven: Option<String>,
     module: &'a ModuleScope,
     /// The function's parameter names.
-    params: HashSet<String>,
+    params: HashSet<&'a str>,
     /// Names bound in the function body (plus comprehension / lambda
     /// variables as the walk enters them).
     locals: HashSet<String>,
@@ -4526,7 +4526,7 @@ fn walk_expr_purity(expr: &Expr, ctx: &mut PurityCtx) {
         }
         Expr::Lambda(x) => {
             if let Some(params) = x.parameters.as_deref() {
-                ctx.locals.extend(parameter_names(params));
+                ctx.locals.extend(parameter_names(params).into_iter().map(String::from));
             }
             walk_expr_purity(&x.body, ctx)
         }
