@@ -66,3 +66,6 @@
 ## 2026-06-27 - [Disable transitions alongside animations for reduced motion]
 **Learning:** In CSS `@media (prefers-reduced-motion: reduce)` blocks, explicitly declaring `animation: none` on elements like `:target` does not inherently disable CSS transitions that might be applied to the same element.
 **Action:** Always declare `transition: none` alongside `animation: none` when respecting reduced motion preferences to fully disable all unintended animated states.
+## 2026-10-01 - [Tactile active states for cards]
+**Learning:** Adding `:active` states on interactive container components (like cards) provides important tactile feedback to user clicks, simulating physical depression and increasing perceived responsiveness.
+**Action:** Implement `:active` CSS states (e.g., reverting `transform: translateY` and reducing `box-shadow`) on clickable components. Ensure these new states are added to `@media (prefers-reduced-motion: reduce)` blocks to maintain accessibility.
