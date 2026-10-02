@@ -1790,9 +1790,9 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
     // Module-level classes and the transitive exception subset among them.
     let mut module_level_classes: Vec<(String, Vec<String>)> = Vec::new();
     collect_class_bases_into(&m.body, &mut module_level_classes);
-    let module_class_names: std::collections::HashSet<String> = module_level_classes
+    let module_class_names: std::collections::HashSet<&str> = module_level_classes
         .iter()
-        .map(|(n, _)| n.clone())
+        .map(|(n, _)| n.as_str())
         .collect();
     let exception_class_names =
         exception_class_names_from(&module_level_classes, &module_class_names);
@@ -2204,11 +2204,11 @@ struct ClassMarkers<'a> {
     /// Names of every module-level class that is (transitively) an exception
     /// subclass — so a subclass of a non-suffix-named user exception base
     /// (`class Timeout(Failure)` where `Failure(Exception)`) is recognised.
-    exception_class_names: &'a std::collections::HashSet<String>,
+    exception_class_names: &'a std::collections::HashSet<&'a str>,
     /// Names of every module-level class. Used to tell an *external*
     /// (builtin/imported) exception base apart from a `*Error`-named module
     /// dataclass when classifying a class as an exception per-class.
-    module_class_names: &'a std::collections::HashSet<String>,
+    module_class_names: &'a std::collections::HashSet<&'a str>,
     /// Constructor shape of every module-level `class!`, so a `class!`
     /// deriving from another in-module `class!` can thread the parent's
     /// fields through its own synthesised `__init__`.
@@ -2615,7 +2615,7 @@ fn make_dataclasses_dot_dataclass_decorator_frozen() -> Decorator {
 /// triggered). FINDINGS #62.
 fn rewrite_mutable_field_defaults(
     body: &mut [Stmt],
-    module_class_names: &std::collections::HashSet<String>,
+    module_class_names: &std::collections::HashSet<&str>,
 ) -> bool {
     let mut changed = false;
     // Names the class body itself binds: a lambda defined in the body
@@ -2683,7 +2683,7 @@ fn rewrite_mutable_field_defaults(
 /// container display that is not purely constant (`[SIZE]`, `{k: f()}`).
 fn is_instance_or_nonconstant_display_default(
     value: &Expr,
-    module_class_names: &std::collections::HashSet<String>,
+    module_class_names: &std::collections::HashSet<&str>,
 ) -> bool {
     match value {
         Expr::Call(call) => matches!(
@@ -3266,11 +3266,11 @@ fn name_is_exception_base(name: &str) -> bool {
 /// dataclass, so `class Detailed(LexError):` stays a dataclass too. But
 /// `class Failure(Exception): pass` then `class Timeout(Failure): pass` both
 /// qualify, since `Failure` is rooted in the builtin `Exception`.
-fn exception_class_names_from(
-    classes: &[(String, Vec<String>)],
-    module_classes: &std::collections::HashSet<String>,
-) -> std::collections::HashSet<String> {
-    let mut exc: std::collections::HashSet<String> = std::collections::HashSet::new();
+fn exception_class_names_from<'a>(
+    classes: &'a [(String, Vec<String>)],
+    module_classes: &std::collections::HashSet<&str>,
+) -> std::collections::HashSet<&'a str> {
+    let mut exc: std::collections::HashSet<&'a str> = std::collections::HashSet::new();
     // Seed only from external exception bases — a `*Error`-named *module*
     // class is left to the fixpoint (it qualifies only if rooted in a builtin
     // exception), so a plain `*Error` dataclass base doesn't taint subclasses.
@@ -3279,14 +3279,14 @@ fn exception_class_names_from(
             .iter()
             .any(|b| !module_classes.contains(b.as_str()) && name_is_exception_base(b))
         {
-            exc.insert(name.clone());
+            exc.insert(name.as_str());
         }
     }
     loop {
         let mut changed = false;
         for (name, bases) in classes {
-            if !exc.contains(name) && bases.iter().any(|b| exc.contains(b)) {
-                exc.insert(name.clone());
+            if !exc.contains(name.as_str()) && bases.iter().any(|b| exc.contains(b.as_str())) {
+                exc.insert(name.as_str());
                 changed = true;
             }
         }

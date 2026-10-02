@@ -42,3 +42,7 @@
 ## 2024-11-28 - Zero-Allocation `parameter_names`
 **Learning:** Checking for bound local names in `collect_local_bindings` during AST traversal required `parameter_names` to create a `HashSet<String>` by cloning string identifiers inside AST nodes. As this is used to populate `PurityCtx`, the repeated allocation of strings negatively impacted compilation times on deep stacks of function nodes.
 **Action:** By bounding the lifetime of the `HashSet<&str>` to the incoming `&Parameters` reference, we can avoid String allocations entirely when building the `params` set and rely on dereferencing pointers for fast lookups.
+
+## 2024-11-28 - Zero-Allocation `module_class_names` in desugar
+**Learning:** Building sets of module-level classes using `HashSet<String>` required cloning strings during the AST desugaring pass, creating unnecessary memory pressure.
+**Action:** Using `HashSet<&str>` to track `module_class_names` and `exception_class_names` avoids heap allocations entirely, improving compiler performance in hot paths.
