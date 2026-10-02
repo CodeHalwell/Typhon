@@ -6105,8 +6105,14 @@ let pet: Animal = Dog(name=\"Rex\")
         assert_eq!(secret_suffix("MY_CREDENTIALS"), Some("CREDENTIALS"));
         assert_eq!(secret_suffix("AWS_CREDENTIAL"), Some("CREDENTIAL"));
         assert_eq!(secret_suffix("SIGNING_CERT"), Some("SIGNING"));
-        assert_eq!(secret_suffix("PERSONAL_ACCESS_TOKEN"), Some("PERSONAL_ACCESS_TOKEN"));
-        assert_eq!(secret_suffix("PERSONALACCESSTOKEN"), Some("PERSONALACCESSTOKEN"));
+        assert_eq!(
+            secret_suffix("PERSONAL_ACCESS_TOKEN"),
+            Some("PERSONAL_ACCESS_TOKEN")
+        );
+        assert_eq!(
+            secret_suffix("PERSONALACCESSTOKEN"),
+            Some("PERSONALACCESSTOKEN")
+        );
         assert_eq!(secret_suffix("OAUTH_TOKEN"), Some("OAUTH_TOKEN"));
         assert_eq!(secret_suffix("OAUTHTOKEN"), Some("OAUTHTOKEN"));
         assert_eq!(secret_suffix("GITHUB_TOKEN"), Some("GITHUB_TOKEN"));
