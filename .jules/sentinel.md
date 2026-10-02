@@ -35,3 +35,7 @@
 **Vulnerability:** The secret scanner missed secrets followed by a lowercase letter (e.g. `dbPASSWORDString`), preventing successful identification of uppercase secrets within camel/Pascalcase text strings.
 **Learning:** When validating the end boundary of an embedded secret keyword, a transition from an uppercase character at the end of the secret word to a lowercase character in the identifier indicates a valid case-boundary.
 **Prevention:** Added logic to `end_ok` to verify if the string continues with a lowercase letter directly after the matched uppercase keyword sequence.
+## 2025-02-14 - Add OAUTH_TOKEN to secret keywords
+**Vulnerability:** The secret detection logic was missing `OAUTH_TOKEN` and `OAUTHTOKEN`, potentially missing OAuth credentials embedded in source code.
+**Learning:** Hardcoded secret checks must explicitly include common high-risk acronyms like OAuth that don't always use standard suffixes.
+**Prevention:** Continue identifying and appending high-risk credentials explicitly to the `SECRET_NAME_KEYWORDS` list to prevent security gaps.
