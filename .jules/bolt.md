@@ -39,3 +39,6 @@
 ## 2024-06-25 - Avoid HashSet<String> for temporary AST bounds
 **Learning:** Checking for bindings and usages inside AST nodes to detect optimization candidates (e.g., `auto_gather.rs` `collect_run` and `collect_opportunity_run`) utilized `HashSet<String>`. Every encountered variable binding allocated a new String just to push it into the tracking set, even though the variables are locally scoped to the traversal.
 **Action:** Use `HashSet<&str>` using the exact AST nodes' string slice lifetime (`&'a [Stmt]`) instead of mapping or cloning strings. Avoid dropping the lifetime too early.
+## 2024-11-28 - Zero-Allocation `parameter_names`
+**Learning:** Checking for bound local names in `collect_local_bindings` during AST traversal required `parameter_names` to create a `HashSet<String>` by cloning string identifiers inside AST nodes. As this is used to populate `PurityCtx`, the repeated allocation of strings negatively impacted compilation times on deep stacks of function nodes.
+**Action:** By bounding the lifetime of the `HashSet<&str>` to the incoming `&Parameters` reference, we can avoid String allocations entirely when building the `params` set and rely on dereferencing pointers for fast lookups.
