@@ -46,3 +46,6 @@
 ## 2024-11-28 - Zero-Allocation `module_class_names` in desugar
 **Learning:** Building sets of module-level classes using `HashSet<String>` required cloning strings during the AST desugaring pass, creating unnecessary memory pressure.
 **Action:** Using `HashSet<&str>` to track `module_class_names` and `exception_class_names` avoids heap allocations entirely, improving compiler performance in hot paths.
+## 2024-11-28 - Zero-Allocation AST Import Traversal (Extension)
+**Learning:** `collect_imported_modules` within `tyc-venv` allocated strings for every module import inside the source file using `extract_dotted_modules_from_import` and `HashSet<String>`.
+**Action:** By borrowing `&str` instead via `HashSet<&str>`, and only calling `.to_owned()` conditionally for the collected subset of modules, we avoid significant allocation overhead during the import parsing step.
