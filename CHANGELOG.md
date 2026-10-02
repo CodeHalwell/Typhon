@@ -169,7 +169,9 @@ definition follows a relative import to the sibling package module. The
 embedded skill copies under `tyc/crates/tyc/skill/` carry the same text as
 the installed ones. `stress/round-2026-09-01/vm/p8.ty` is declared
 nondeterministic (its `as_completed` start order is set-ordered) rather
-than pinned as a divergence.
+than pinned as a divergence, and the `from pydantic import ValidationError`
+stress unit leaves the divergence baseline because that scan now routes it
+to the compiled path.
 
 **Supply chain and tooling.** `salsa` 0.26.2 → 0.28.5 clears
 RUSTSEC-2026-0308 (the only `cargo deny` failure). The perf gate's absolute
