@@ -27,6 +27,13 @@ tested, new pass added) or revert it before merging. The threshold is set
 conservatively — CI machines vary; changes under 20 % are noise on
 different hardware.
 
+The pipeline gate (`scripts/perf-gate.sh`) adds an absolute floor to that
+percentage: a run fails only when the median exceeds *both* `baseline × 1.2`
+and `baseline + PERF_MIN_SLACK_MS` (10 ms by default). With a ~22 ms
+baseline the 20 % band is under 5 ms, which is inside the process-start
+jitter of a shared runner — the floor keeps a quiet tree from failing for
+reasons that have nothing to do with the compiler.
+
 ## Baseline (first recorded)
 
 Recorded on a cloud CI runner (Linux x86-64). These numbers represent the

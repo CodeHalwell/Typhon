@@ -155,7 +155,7 @@ extend str:
         return self.lower().replace(" ", "-")
 ```
 
-For built-in types (`str`, `list`, `int`, `dict`, `bytes`, `set`, `frozenset`, `tuple`), each method is extracted to a module-level free function and call sites are rewritten when the receiver has a matching static annotation:
+For built-in types (`str`, `list`, `int`, `dict`, `bytes`, `set`, `frozenset`, `tuple`), each method is extracted to a module-level free function and call sites are rewritten when the receiver's static type is known to be that built-in — an annotated or evidently-initialised binding, a literal or f-string, a field or `@property` of a known class (`self.title.slug()`), a call with a declared return type (same-module or imported, `impl` methods, chained extension calls), a subscript on a `list[T]` / `dict[K, V]`, or a loop / comprehension variable:
 
 <Tabs>
   <TabItem label="Typhon">
@@ -199,7 +199,7 @@ def head(xs: list[int]) -> int:
     return xs.first_or(0)        # ✅ since v0.9.0 — was attribute_not_found before
 ```
 
-The receiver type is still required (Rule 1); a bare-`list` annotation is fine, a missing annotation isn't.
+The receiver's type must be *knowable* (Rule 1): a bare-`list` annotation is fine, and so is a call whose declared return is `list[int]`, but a `match` capture, an unannotated lambda parameter or a `with … as` target is left as a native attribute access and raises `AttributeError` at runtime. An extension travels with the module that declares it — import that module (`from pkg.text import describe`), not only a `pub *` facade of it.
 
 ### Which built-ins are extendable?
 

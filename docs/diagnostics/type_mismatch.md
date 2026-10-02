@@ -37,4 +37,44 @@ def main() -> None:
     print(result)
 ```
 
+
+## `await` on a value that is not awaitable
+
+`await` needs a coroutine, a task, a future, or an object with `__await__`.
+Awaiting the result of a *sync* function or method declared in the same
+module, or a literal, is `TypeError: object int can't be used in 'await'
+expression` at runtime and is reported here since the 2026-09-30 review. A
+bare name, a call through a `Callable`, or a function imported from another
+module is left alone — the checker types an un-awaited coroutine by its
+result, so it cannot tell those apart:
+
+```ty
+def load() -> int:
+    return 1
+
+async def main() -> None:
+    let v: int = await load()   # error: expected `an awaitable`, found `int`
+```
+
+## Subclass field redeclarations
+
+A subclass may redeclare an inherited field (to add a default, say), but not
+with an incompatible type: code written against the base then reads a value
+of the wrong type.
+
+```ty
+class Base:
+    x: int
+
+class Sub(Base):
+    x: str          # error: expected `int`, found `str`
+    y: int = 0      # fine — a new field
+```
+
+## `for` over a non-iterable
+
+Iterating an instance of a class that defines no `__iter__` (and whose
+hierarchy is fully known) is `TypeError: 'Bag' object is not iterable`, and is
+reported here.
+
 See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/type_mismatch.md

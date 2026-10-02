@@ -63,6 +63,8 @@ def kick() -> None:
     go work()       # error: no event loop is running here
 ```
 
+**(2026-09-30 review)** The sync-spawner check is transitive: `main()` → `kick()` → `go work()` from module level is reported the same as a direct spawn, naming the chain.
+
 **Fix:** move the `go` into an `async def` driven by `asyncio.run(...)`, or call `asyncio.run(work())` to run the coroutine to completion here.
 
 ### `tyc::possibly_unbound` — warning
@@ -173,11 +175,13 @@ let result: int = double("3")   # error: expected `int`, found `str`
 
 **(v0.12.0) Third-party argument types.** This is also the code you'll see when a wrong-*typed* argument is passed to a fully-typed third-party function **or constructor** — venv signature introspection (`tyc-venv`) now recovers parameter/return *annotations* (scalars, `Optional[X]` / `X | None`, parametric containers, fixed-arity tuples), so a dependency exposing `def fetch(url: str, …)` called as `fetch(12345)`, or constructing a `Client(host: str, port: int)` with `port="oops"`, is rejected at check time, not just on arity. Anything not confidently modelled degrades to a permissive `Unknown`, so the check only adds true positives. The dependency must ship **inline** annotations for this path — a stub-only library like `requests` (typed via typeshed's `types-requests`, not in its own source) degrades to `Unknown` here and is instead caught by the `ty`/typeshed pass (`[checker] external = "ty"`) or a `.dty` stub. A declared dependency that can't be introspected at all surfaces the separate `unintrospectable-dependency` warning (`[strictness] unintrospectable-dependency`, default `"warn"`) rather than silently skipping these checks.
 
+**(2026-09-30 review)** Also reported for `await` on a provably non-awaitable operand (a same-module sync `def` / method call, or a literal — imported functions and bare names stay permissive), an incompatible subclass field redeclaration (`class Sub(Base): x: str` over `x: int`), and `for` over an instance of a fully-known class with no `__iter__`.
+
 **Fix:** Convert at the boundary, or correct the annotation.
 
 ### `tyc::nullable_use` — error
 
-A value of type `T?` (= `T | None`) used where `T` is required. Render no longer shows `?` as the "expected" type (v0.6.0); the formatter substitutes the resolved bound.
+A value of type `T?` (= `T | None`) used where `T` is required. Render no longer shows `?` as the "expected" type (v0.6.0); the formatter substitutes the resolved bound. Every receiver / operand shape is checked (a bare name, a call result, a subscript, an f-string field, an attribute path); the attribute-rooted form (`self.conn.execute()` with `conn: Conn?`) is governed by `[strictness] nullable-use`, **`"error"` by default since the 2026-09-30 review** (`"warn"` relaxes it). Narrowing follows `and` chains through attribute paths (`if b is not None and b.val is not None:` narrows both). A receiver that is *always* `None` (`None.attr`, a `-> None` call's result) reports under this code with wording that does not suggest a guard.
 
 ```ty
 def length_of(name: str?) -> int:
@@ -194,6 +198,8 @@ Binary operator with clearly-incompatible operands (both types fully known, neit
 let result: str = "x" + 1   # error: unsupported operand types for `+`
 ```
 
+**(2026-09-30 review)** Also reported for ordering comparisons CPython refuses (`str < int`, a class with no `__lt__` family), `in` on a non-container (`3 in n` with `n: int`), and a subscript on a union with a non-subscriptable member (`v[0]` on `int | str`). Equality / identity and mixed numeric orderings are never reported; a class defining the dunder is trusted.
+
 **Fix:** Convert one operand, or wrap explicitly at the newtype boundary.
 
 ### `tyc::attribute_not_found` — error
@@ -204,6 +210,8 @@ Attribute access on a value whose static type doesn't declare that attribute (an
 let p: Point = Point(x=1, y=2)
 print(p.z)            # error: attribute `z` not defined on `Point`
 ```
+
+**(2026-09-30 review)** Also reported for a *write* to an undeclared attribute on a plain `class` (`self.y = 5` with no `y` field — slots dataclasses raise `AttributeError`; `plain class` / `class!` / unknown-base / `__setattr__` classes are exempt) and for member access on a union whose members do not all declare it (`type U = A | B`, `u.n` when only `A` has `n`; `v.upper()` on `int | str`).
 
 **Fix:** Correct the name, add the missing field, or wrap a genuinely dynamic call in `unsafe:`.
 
@@ -562,6 +570,8 @@ def add(a: int, b: int) -> int: return a + b
 add(1, 2, 3)          # error: expected 2, got 3
 ```
 
+**(2026-09-30 review)** A call *through a `Callable` value* (`f(1)` where `f: Callable[[int, int], int]`, a Callable field or parameter) is arity-checked against the annotation's parameter list; a `*args` / `**kwargs` at the call site disables the count check.
+
 **Fix:** Pass the correct number of arguments.
 
 ### `tyc::missing_argument` — error
@@ -582,6 +592,8 @@ Keyword argument doesn't match any parameter and the callee has no `**kwargs`. H
 ```ty
 connect(host="localhost", prot=80)   # error: unknown keyword `prot`
 ```
+
+**(2026-09-30 review)** Also reported when a *positional-only* parameter (declared before `/`) is passed by keyword — `f(a=1)` for `def f(a: int, /)` — with help saying so rather than suggesting a spelling.
 
 **Fix:** Correct the spelling.
 
@@ -721,7 +733,7 @@ A `comptime let` binding's name contains a secret-shaped keyword. The build arti
 comptime let API_KEY: str = env("MY_API_KEY")   # warning
 ```
 
-The table is `tyc_analyse::SECRET_NAME_KEYWORDS`, shared with the `tyc build` scan so the two cannot drift: `PASSPHRASE`, `AUTHORIZATION`, `CREDENTIALS`, `CREDENTIAL`, `WEBHOOK`, `SIGNING`, `COOKIE`, `DB_PASSWORD`, `DBPASSWORD`, `DB_PASS`, `DBPASS`, `DB_PWD`, `DBPWD`, `API_PASSWORD`, `APIPASSWORD`, `DB_SECRET`, `DBSECRET`, `API_SECRET`, `APISECRET`, `APP_SECRET`, `APPSECRET`, `CLIENT_SECRET`, `CLIENTSECRET`, `JWT_SECRET`, `JWTSECRET`, `SECRET_KEY`, `SECRETKEY`, `ACCESS_TOKEN`, `ACCESSTOKEN`, `AUTH_TOKEN`, `AUTHTOKEN`, `BEARER_TOKEN`, `BEARERTOKEN`, `CSRF_TOKEN`, `CSRFTOKEN`, `JWT_TOKEN`, `JWTTOKEN`, `API_TOKEN`, `APITOKEN`, `PASSWORD`, `SECRET`, `TOKEN`, `PRIVATE_KEY`, `PRIVATEKEY`, `PUBLIC_KEY`, `PUBLICKEY`, `SSH_KEY`, `SSHKEY`, `API_KEY`, `APIKEY`, `PRIVKEY`, `KEY`, `PWD`, `PASS`, `DSN`. Longest-first, so `KEY_APIKEY` reports `APIKEY` and `SSH_PRIVKEY` reports `PRIVKEY`.
+The table is `tyc_analyse::SECRET_NAME_KEYWORDS`, shared with the `tyc build` scan so the two cannot drift: `PASSPHRASE`, `AUTHORIZATION`, `CREDENTIALS`, `CREDENTIAL`, `WEBHOOK`, `SIGNING`, `COOKIE`, `DB_PASSWORD`, `DBPASSWORD`, `DB_PASS`, `DBPASS`, `DB_PWD`, `DBPWD`, `API_PASSWORD`, `APIPASSWORD`, `DB_SECRET`, `DBSECRET`, `API_SECRET`, `APISECRET`, `APP_SECRET`, `APPSECRET`, `CLIENT_SECRET`, `CLIENTSECRET`, `JWT_SECRET`, `JWTSECRET`, `SECRET_KEY`, `SECRETKEY`, `ACCESS_TOKEN`, `ACCESSTOKEN`, `OAUTH_TOKEN`, `OAUTHTOKEN`, `AUTH_TOKEN`, `AUTHTOKEN`, `BEARER_TOKEN`, `BEARERTOKEN`, `CSRF_TOKEN`, `CSRFTOKEN`, `JWT_TOKEN`, `JWTTOKEN`, `API_TOKEN`, `APITOKEN`, `OAUTH_SECRET`, `OAUTHSECRET`, `PASSWORD`, `SECRET`, `TOKEN`, `PRIVATE_KEY`, `PRIVATEKEY`, `PUBLIC_KEY`, `PUBLICKEY`, `SSH_KEY`, `SSHKEY`, `API_KEY`, `APIKEY`, `PRIVKEY`, `KEY`, `PWD`, `PASS`, `DSN`. Longest-first, so `KEY_APIKEY` reports `APIKEY` and `SSH_PRIVKEY` reports `PRIVKEY`.
 
 A keyword matches only on a **word boundary** — name start/end, `_`, a digit, or a case junction — so `MONKEY` does not match `KEY` and `PASSPORT` does not match `PASS`. Flagged: `API_KEY`, `myTokenValue`, (v1.0.0-alpha.8) `myPASSWORD123`, `foo123TOKEN`, `dbPASSWORDString`, and (v1.0.0-alpha.9) `TOKENs` / `dbPASSWORDstring` — an uppercase keyword followed directly by a lowercase letter also ends a word. That same rule is why `PASSPHRASE` (alpha.6) and `PRIVKEY` (alpha.8) need their own table entries.
 

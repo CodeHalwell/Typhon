@@ -523,6 +523,56 @@ fn merge_pub_visible(
                 .or_insert(*runtime_checkable);
         }
     }
+    // The remaining tables were not carried through the facade before
+    // the 2026-09-30 review (§4.2 / §4.6): a `newtype` re-exported by
+    // `pub *` did not widen to its base, and a write to a field of a
+    // re-exported `frozen` class was not rejected. Every table
+    // `ModuleShapes` publishes is merged, under the same visibility
+    // filter and first-write-wins rule.
+    for (name, base) in &src.newtypes {
+        if include(name) {
+            dst.newtypes
+                .entry(name.clone())
+                .or_insert_with(|| base.clone());
+        }
+    }
+    for (name, alias) in &src.type_aliases {
+        if include(name) {
+            dst.type_aliases
+                .entry(name.clone())
+                .or_insert_with(|| alias.clone());
+        }
+    }
+    for (name, members) in &src.enums {
+        if include(name) {
+            dst.enums
+                .entry(name.clone())
+                .or_insert_with(|| members.clone());
+        }
+    }
+    for name in &src.frozen_classes {
+        if include(name) {
+            dst.frozen_classes.insert(name.clone());
+        }
+    }
+    for name in &src.gatherable_async_fns {
+        if include(name) {
+            dst.gatherable_async_fns.insert(name.clone());
+        }
+    }
+    for (name, variances) in &src.class_param_variance {
+        if include(name) {
+            dst.class_param_variance
+                .entry(name.clone())
+                .or_insert_with(|| variances.clone());
+        }
+    }
+    // HKT constructor-variable names (`F` in `class Functor[F[_]]`) are
+    // type-parameter identifiers, never exported names, so the visibility
+    // filter does not apply — same as the checker's own import merge.
+    for name in &src.hkt_param_names {
+        dst.hkt_param_names.insert(name.clone());
+    }
 }
 
 #[cfg(test)]
@@ -564,6 +614,52 @@ mod tests {
 
     use super::*;
     use crate::config::TyphonConfig;
+
+    /// A `pub *` facade must carry every shape table the consumer's checker
+    /// reads, not just classes and functions: without `newtypes` a
+    /// re-exported `newtype UserId = int` behaved as a plain class at the
+    /// facade's call sites, and without `frozen_classes` a write to a
+    /// re-exported frozen class's field passed unnoticed (review
+    /// 2026-09-30 §4.6).
+    #[test]
+    fn merge_pub_visible_carries_every_shape_table_for_visible_names() {
+        let mut src = ModuleShapes::default();
+        src.newtypes
+            .insert("UserId".to_owned(), tyc_types::Type::Int);
+        src.frozen_classes.insert("Point".to_owned());
+        src.enums.insert("Color".to_owned(), vec!["RED".to_owned()]);
+        src.type_aliases
+            .insert("Pair".to_owned(), (Vec::new(), tyc_types::Type::Int));
+        src.class_param_variance
+            .insert("Box".to_owned(), vec![tyc_types::Variance::Covariant]);
+        src.gatherable_async_fns.insert("fetch".to_owned());
+        src.hkt_param_names.insert("F".to_owned());
+
+        let mut dst = ModuleShapes::default();
+        let visible: std::collections::HashSet<&str> =
+            ["UserId", "Point", "Color", "Pair", "Box", "fetch"]
+                .into_iter()
+                .collect();
+        merge_pub_visible(&mut dst, &src, Some(&visible));
+        assert!(dst.newtypes.contains_key("UserId"));
+        assert!(dst.frozen_classes.contains("Point"));
+        assert!(dst.enums.contains_key("Color"));
+        assert!(dst.type_aliases.contains_key("Pair"));
+        assert!(dst.class_param_variance.contains_key("Box"));
+        assert!(dst.gatherable_async_fns.contains("fetch"));
+        assert!(
+            dst.hkt_param_names.contains("F"),
+            "HKT names are not name-scoped"
+        );
+
+        // Names outside the visible set stay out.
+        let mut narrow = ModuleShapes::default();
+        let only: std::collections::HashSet<&str> = ["UserId"].into_iter().collect();
+        merge_pub_visible(&mut narrow, &src, Some(&only));
+        assert!(narrow.newtypes.contains_key("UserId"));
+        assert!(!narrow.frozen_classes.contains("Point"));
+        assert!(!narrow.enums.contains_key("Color"));
+    }
 
     fn config_with_methods_in_class_body(severity: &str) -> TyphonConfig {
         let mut c = TyphonConfig::default();

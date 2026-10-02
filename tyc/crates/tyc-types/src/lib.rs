@@ -822,6 +822,127 @@ fn is_dynamic_type(t: &Type) -> bool {
 /// false positives on the canonical `asyncio.run(coro())` pattern.
 /// `Some(spawned callee)` when a function body spawns a task with `go` in
 /// its own statements (nested `def`s are separate frames).
+/// Extend `sync_spawners` transitively: a sync `def` that calls (by bare
+/// name) a sync function already known to spawn a task spawns one itself,
+/// so `main()` at module level → `kick()` → `go work()` is reported the
+/// same way a direct spawn is (review 2026-09-30 §3.8). Iterates to a
+/// fixed point over the module's sync functions.
+fn check_subclass_field_redeclarations(c: &mut Checker, body: &[Stmt], classes: &[String]) {
+    for stmt in body {
+        let Stmt::ClassDef(cd) = stmt else { continue };
+        let name = cd.name.as_str();
+        let Some(shape) = c.class_shapes.get(name).cloned() else {
+            continue;
+        };
+        if shape.bases.is_empty() || c.is_plain_class(name) || c.is_raw_class(name) {
+            continue;
+        }
+        let tps = type_param_names_from(cd.type_params.as_deref());
+        for item in &cd.body {
+            let Stmt::AnnAssign(ann) = item else { continue };
+            let Expr::Name(target) = ann.target.as_ref() else {
+                continue;
+            };
+            let field = target.id.as_str();
+            let child_ty = type_from_annotation_with_params(&ann.annotation, classes, &tps);
+            if matches!(child_ty, Type::Unknown) || mentions_type_param(&child_ty) {
+                continue;
+            }
+            for base in &shape.bases {
+                let Some(parent) = effective_class_shape(base, &c.class_shapes) else {
+                    continue;
+                };
+                if parent.partial {
+                    continue;
+                }
+                let Some(parent_ty) = parent.fields.get(field) else {
+                    continue;
+                };
+                if matches!(parent_ty, Type::Unknown)
+                    || mentions_type_param(parent_ty)
+                    || c.is_assignable(parent_ty, &child_ty)
+                {
+                    continue;
+                }
+                let span = (
+                    ann.annotation.range().start().to_usize(),
+                    ann.annotation.range().end().to_usize(),
+                );
+                c.mismatch(parent_ty, &child_ty, span);
+                break;
+            }
+        }
+    }
+}
+
+fn close_sync_spawners(c: &mut Checker, body: &[Stmt]) {
+    loop {
+        let mut changed = false;
+        for stmt in body {
+            let Stmt::FunctionDef(f) = stmt else { continue };
+            if f.is_async || c.sync_spawners.contains_key(f.name.as_str()) {
+                continue;
+            }
+            let known: std::collections::HashSet<String> =
+                c.sync_spawners.keys().cloned().collect();
+            if let Some(callee) = body_calls_one_of(&f.body, &known) {
+                let spawned = c.sync_spawners.get(&callee).cloned().unwrap_or_default();
+                c.sync_spawners.insert(
+                    f.name.as_str().to_owned(),
+                    format!("{spawned} (via {callee})"),
+                );
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// The first bare-name callee in `body` (nested `def` / `class` bodies
+/// excluded) that appears in `names`.
+fn body_calls_one_of(body: &[Stmt], names: &std::collections::HashSet<String>) -> Option<String> {
+    struct V<'n> {
+        names: &'n std::collections::HashSet<String>,
+        found: Option<String>,
+    }
+    impl ruff_python_ast::visitor::Visitor<'_> for V<'_> {
+        fn visit_stmt(&mut self, s: &Stmt) {
+            if self.found.is_some() || matches!(s, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+                return;
+            }
+            ruff_python_ast::visitor::walk_stmt(self, s);
+        }
+        fn visit_expr(&mut self, e: &Expr) {
+            if self.found.is_some() {
+                return;
+            }
+            if let Expr::Call(call) = e {
+                if let Expr::Name(n) = call.func.as_ref() {
+                    if self.names.contains(n.id.as_str()) {
+                        self.found = Some(n.id.as_str().to_owned());
+                        return;
+                    }
+                }
+            }
+            ruff_python_ast::visitor::walk_expr(self, e);
+        }
+    }
+    let mut v = V { names, found: None };
+    // Dispatch through `visit_stmt` so a nested `def` / `class` at the root
+    // of the body is skipped exactly like one deeper down: a spawn inside a
+    // nested function is that frame's business, not the enclosing sync
+    // function's.
+    for s in body {
+        ruff_python_ast::visitor::Visitor::visit_stmt(&mut v, s);
+        if v.found.is_some() {
+            break;
+        }
+    }
+    v.found
+}
+
 fn body_spawns_task(body: &[Stmt]) -> Option<String> {
     struct V {
         found: Option<String>,
@@ -847,8 +968,11 @@ fn body_spawns_task(body: &[Stmt]) -> Option<String> {
         }
     }
     let mut v = V { found: None };
+    // Through `visit_stmt`, so a nested `def` / `class` at the root of the
+    // body is skipped like one deeper down (a spawn inside it is that
+    // frame's, not this function's).
     for s in body {
-        ruff_python_ast::visitor::walk_stmt(&mut v, s);
+        ruff_python_ast::visitor::Visitor::visit_stmt(&mut v, s);
         if v.found.is_some() {
             break;
         }
@@ -1236,7 +1360,11 @@ fn check_explicit_typearg_constructor(
     let info = class_constructor_arity(&shape);
     if !info.param_names.is_empty() {
         match check_arity_with_info(&info, pos_args, kw_args) {
-            ArityCheck::Ok | ArityCheck::UnknownKwarg { .. } => {}
+            // A synthesised constructor has no positional-only parameters,
+            // so the `/`-by-keyword outcome cannot occur here.
+            ArityCheck::Ok
+            | ArityCheck::UnknownKwarg { .. }
+            | ArityCheck::PositionalOnlyByKeyword { .. } => {}
             ArityCheck::Other => {
                 let missing = missing_required_fields(&shape, pos_args, kw_args);
                 if !missing.is_empty() {
@@ -1332,7 +1460,7 @@ pub fn generic_param_variance(head: &str, idx: usize) -> Variance {
     // Tn]` of any arity widens uniformly (the `("tuple", 0)` arm below
     // would only catch position 0 and leave positions 1+ falling through
     // to the invariant default).
-    if head == "tuple" || head == "Tuple" {
+    if head == "tuple" || head == "Tuple" || head == "tuple_variadic" {
         return Variance::Covariant;
     }
     match (head, idx) {
@@ -1781,11 +1909,19 @@ pub fn type_from_annotation_with_params(
                                         type_from_annotation_with_params(e, classes, type_params)
                                     })
                                     .collect();
+                                // A `Callable[[T, U], R]` annotation has no
+                                // defaults, so every listed parameter is
+                                // required — recorded so a call through the
+                                // value (`f(1)` on `Callable[[int, int], int]`)
+                                // is an arity error rather than a permissive
+                                // "defaults could cover the rest" pass
+                                // (review 2026-09-30 §3.5).
+                                let required = params.len();
                                 return Type::Function {
                                     params,
                                     ret: Box::new(ret),
                                     variadic: false,
-                                    min_params: None,
+                                    min_params: Some(required),
                                 };
                             }
                             // `Callable[..., R]` — any args (including
@@ -2621,6 +2757,24 @@ impl TypeEnv {
         self.attr_narrowings
             .retain(|k, _| k != path && !k.starts_with(&sub_prefix));
     }
+
+    /// Drop every narrowing whose path ends in `.field` (and their
+    /// sub-paths) except `keep` itself — a write to that field through one
+    /// root may have gone through an alias of any other root.
+    fn clear_attr_narrowings_of_field(&mut self, field: &str, keep: &str) {
+        let suffix = format!(".{field}");
+        let stale: Vec<String> = self
+            .attr_narrowings
+            .keys()
+            .filter(|k| {
+                k.as_str() != keep && (k.ends_with(&suffix) || k.contains(&format!("{suffix}.")))
+            })
+            .cloned()
+            .collect();
+        for k in stale {
+            self.attr_narrowings.remove(&k);
+        }
+    }
     /// Reset flow-narrowing on module-global bindings (the outermost scope)
     /// back to their declared type. A call may reassign a module global via a
     /// `global NAME` in the callee, so any narrowing the caller established on
@@ -2639,6 +2793,30 @@ impl TypeEnv {
     /// the reset ran from only three statement arms, still unsound everywhere
     /// else. Restricting the set is what makes it affordable to run the reset
     /// from *every* statement arm that evaluates a call (F41).
+    /// Widen the narrowings of the given names in every *function* scope
+    /// (everything but the module scope). The names are the locals a nested
+    /// `def` of the current function declares `nonlocal`, so a call can
+    /// rebind them by reference — the `nonlocal` counterpart of
+    /// [`Env::reset_global_narrowings`].
+    fn reset_local_narrowings(&mut self, rebound: &std::collections::HashSet<String>) {
+        if rebound.is_empty() {
+            return;
+        }
+        for scope in self.scopes.iter_mut().skip(1) {
+            let needs_reset = scope
+                .iter()
+                .any(|(name, b)| rebound.contains(name) && b.narrowed != b.declared);
+            if !needs_reset {
+                continue;
+            }
+            for (name, b) in Rc::make_mut(scope).iter_mut() {
+                if rebound.contains(name) && b.narrowed != b.declared {
+                    b.narrowed = b.declared.clone();
+                }
+            }
+        }
+    }
+
     fn reset_global_narrowings(&mut self, rebound: &std::collections::HashSet<String>) {
         if rebound.is_empty() {
             return;
@@ -2993,6 +3171,14 @@ struct Checker<'a> {
     /// majority of modules, which is what makes the per-statement invalidation
     /// in [`eval_stmt_expr`] free.
     globals_rebound_by_call: std::collections::HashSet<String>,
+    /// Names a nested `def` of the function being checked declares
+    /// `nonlocal`. A call from the enclosing body may run that nested
+    /// function and rebind the local, so — exactly like a module global a
+    /// callee rebinds through `global` — any narrowing the enclosing body
+    /// established on such a name is stale after an intervening call
+    /// (review 2026-09-30 §3.4). Empty for the overwhelmingly common
+    /// function with no `nonlocal` anywhere beneath it.
+    nonlocals_rebound_by_call: std::collections::HashSet<String>,
     /// For each declared function name, its inferred signature type.
     function_signatures: HashMap<String, Type>,
     /// Per-function arity metadata that doesn't fit in `Type::Function`
@@ -3016,6 +3202,10 @@ struct Checker<'a> {
     /// Names of `async def` functions declared at module top level.
     /// Used by the call-site arm to emit `tyc::missing_await`
     /// (FINDINGS #49) when a sync context calls one without `await`.
+    /// Names of sync (`def`, not `async def`) functions declared at module
+    /// top level — the ones `await f()` can be rejected on. Imported
+    /// functions never enter this set: their shapes carry no async flag.
+    sync_functions: std::collections::HashSet<String>,
     async_functions: std::collections::HashSet<String>,
     /// Bumped on entry to an `Expr::Await`, decremented on exit. While
     /// positive, the call-site arm skips the `missing_await` check so
@@ -3179,6 +3369,9 @@ struct Checker<'a> {
     /// `tyc::attribute_not_found`. Populated alongside `class_shapes` and
     /// merged across `impl` / `extend` pseudo-classes the same way.
     self_attrs: HashMap<String, std::collections::HashSet<String>>,
+    /// `ClassVar[...]` fields per class: excluded from the constructor but
+    /// always readable as `Cls.NAME` / `obj.NAME`, on every class kind.
+    class_var_attrs: HashMap<String, std::collections::HashSet<String>>,
     env: TypeEnv,
     diagnostics: Diagnostics,
     /// Return type of the function whose body we are currently checking
@@ -3487,10 +3680,12 @@ impl<'a> Checker<'a> {
             is_assignable_path: std::cell::RefCell::new(Vec::new()),
             classes: Vec::new(),
             globals_rebound_by_call: std::collections::HashSet::new(),
+            nonlocals_rebound_by_call: std::collections::HashSet::new(),
             function_signatures: HashMap::new(),
             function_arity_info: HashMap::new(),
             function_kwarg_types: HashMap::new(),
             async_functions: std::collections::HashSet::new(),
+            sync_functions: std::collections::HashSet::new(),
             inside_await: 0,
             in_question_temp_rhs: false,
             in_sync_function: false,
@@ -3511,6 +3706,7 @@ impl<'a> Checker<'a> {
             class_base_tails: HashMap::new(),
             local_classes: std::collections::HashSet::new(),
             self_attrs: HashMap::new(),
+            class_var_attrs: HashMap::new(),
             unsafe_depth: 0,
             unsafe_origin_bindings: HashMap::new(),
             unsafe_line_starts: Vec::new(),
@@ -4020,6 +4216,14 @@ impl<'a> Checker<'a> {
                 if self.is_interface_name(exp_name.as_str())
                     && self.class_conforms_to_interface(act_name, exp_name)
                 {
+                    return true;
+                }
+                // A generic class named bare (`let c: Box = Box(v=1)`, PEP
+                // 695 with a PEP 696 default or none) is `Box[Any]`: every
+                // instantiation of the same head fits (review 2026-09-30
+                // §4.4). A pure relaxation — the parametric form is still
+                // checked argument by argument.
+                if exp_name == act_name && self.class_type_params.contains_key(exp_name.as_str()) {
                     return true;
                 }
             }
@@ -4973,9 +5177,21 @@ impl<'a> Checker<'a> {
                 stack.extend(shape.bases.iter().map(String::as_str));
             }
             // Attributes assigned via `self.NAME = ...` in a method body
-            // resolve as instance attributes (typed `Unknown`).
+            // resolve as instance attributes (typed `Unknown`) — but only on
+            // a class that can carry an undeclared attribute at runtime: a
+            // `plain class` / `class!` (bare `class`, no slots), a class with
+            // a base the checker cannot see, or one defining `__setattr__` /
+            // `__getattr__`. A plain `class` emits `@dataclass(slots=True)`,
+            // where such a write raises `AttributeError`, so treating the
+            // write as a declaration hid both the write and every later
+            // read (review 2026-09-30 §3.8).
+            if let Some(vars) = self.class_var_attrs.get(name) {
+                if vars.contains(field_name) {
+                    return Some(&UNKNOWN);
+                }
+            }
             if let Some(attrs) = self.self_attrs.get(name) {
-                if attrs.contains(field_name) {
+                if attrs.contains(field_name) && self.class_accepts_undeclared_attrs(name) {
                     return Some(&UNKNOWN);
                 }
             }
@@ -4986,6 +5202,20 @@ impl<'a> Checker<'a> {
             visited.insert(name);
         }
         None
+    }
+
+    /// Whether an instance of `name` can hold an attribute the class never
+    /// declared: bare-`class` forms (`plain class`, `class!`), classes with a
+    /// base the checker cannot see (a framework base, a `model`), and
+    /// classes defining `__setattr__` / `__getattr__`. A plain `class` with
+    /// fully-known bases emits `@dataclass(slots=True)` and cannot.
+    fn class_accepts_undeclared_attrs(&self, name: &str) -> bool {
+        let real = name.strip_prefix("__typhon_impl_").unwrap_or(name);
+        self.is_plain_class(real)
+            || self.is_raw_class(real)
+            || !self.class_hierarchy_fully_known(real)
+            || self.class_defines_getattr(real)
+            || self.find_method(real, "__setattr__").is_some()
     }
 
     /// Return `true` when every class in `cls_name`'s inheritance chain has a
@@ -5416,6 +5646,21 @@ impl<'a> Checker<'a> {
             return;
         }
         let length = span.1.saturating_sub(span.0).max(1);
+        // A value that is *exactly* `None` — `None.attr`, or a `-> None`
+        // call used as a receiver — is not "possibly None"; it is always
+        // None, and "guard it with `is not None`" would be wrong advice
+        // (the guard would simply never pass). Say so instead of rendering
+        // the `None | None` nonsense the generic wording produces.
+        if matches!(expected, Type::None) {
+            let diag =
+                TycError::nullable_use_always_none(name, &self.path, self.source, span.0, length);
+            if warn_only {
+                self.diagnostics.push_warning(diag);
+            } else {
+                self.diagnostics.push_error(diag);
+            }
+            return;
+        }
         // R1#11: `Type::Unknown.display()` renders as the literal
         // character `?`, which leaks into the diagnostic as
         // "value is `?` | None here" / "where `?` is required" — an
@@ -5959,6 +6204,16 @@ pub struct ExternalShapes {
 /// silently tolerated: the goal here is to publish the surface API for
 /// downstream callers, not to validate it.
 pub fn extract_module_shapes(module: &ModModule) -> ModuleShapes {
+    extract_module_shapes_with(module, &std::collections::HashSet::new())
+}
+
+/// [`extract_module_shapes`] with the module's `frozen` class names, which
+/// the preprocessor knows (the modifier is stripped before parsing) and
+/// which variance inference needs: a frozen field is covariant.
+pub fn extract_module_shapes_with(
+    module: &ModModule,
+    frozen: &std::collections::HashSet<String>,
+) -> ModuleShapes {
     let mut classes: Vec<String> = Vec::new();
     for stmt in &module.body {
         match stmt {
@@ -5996,7 +6251,14 @@ pub fn extract_module_shapes(module: &ModModule) -> ModuleShapes {
                 // C2: infer each parameter's variance positionally, so the
                 // consumer can widen covariant / contravariant imported
                 // generics instead of forcing the invariant default.
-                let variances = infer_class_param_variance(cd, &tps, &classes);
+                let impls = impl_blocks_for(&module.body, &name);
+                let variances = infer_class_param_variance_with(
+                    cd,
+                    &tps,
+                    &classes,
+                    &impls,
+                    frozen.contains(&name),
+                );
                 class_param_variance.insert(name.clone(), variances);
                 class_type_params.insert(name, tps);
             }
@@ -6492,9 +6754,12 @@ pub fn check_module_with_imports(
     // First pass: collect class names + function signatures so forward
     // references work.
     collect_call_rebound_globals(&module.body, &mut c.globals_rebound_by_call);
+    // Frozen-ness first: the class pass infers type-parameter variance and
+    // needs to know which classes are `frozen` (their fields are
+    // read-only, hence covariant).
+    populate_frozen_classes(&mut c, &module.body, &frozen_starts);
     collect_classes_and_functions(&mut c, &module.body);
     check_override_compatibility(&mut c, &module.body);
-    populate_frozen_classes(&mut c, &module.body, &frozen_starts);
     check_frozen_inheritance(&mut c, &module.body);
     // Cross-function field-init audit pre-pass: identify helper
     // functions whose body is `return X.__new__(X)` (or
@@ -7686,13 +7951,60 @@ fn check_attr_assign_type(c: &mut Checker, target: &Expr, value_type: &Type) {
         Type::Generic(name, args) => (name, args),
         _ => return,
     };
-    let Some(shape) = c.class_shapes.get(&class_name).cloned() else {
+    // `self` inside `impl X:` carries the `__typhon_impl_X` pseudo-class;
+    // every shape lookup below wants the real class.
+    let real_class = class_name
+        .strip_prefix("__typhon_impl_")
+        .unwrap_or(&class_name)
+        .to_owned();
+    let Some(shape) = c
+        .class_shapes
+        .get(&real_class)
+        .or_else(|| c.class_shapes.get(&class_name))
+        .cloned()
+    else {
         return;
     };
     if shape.partial {
         return;
     }
-    let Some(field_ty) = shape.fields.get(attr.attr.as_str()).cloned() else {
+    let attr_name = attr.attr.as_str();
+    let Some(field_ty) = c.find_field(&real_class, attr_name).cloned() else {
+        // Writing a name the class never declared: a `class` emits
+        // `@dataclass(slots=True)`, so `self.y = 5` with no `y: …` field
+        // raises `AttributeError: 'X' object has no attribute 'y'` at
+        // runtime (review 2026-09-30 §3.8). `plain class` / `class!` bodies
+        // (no slots), classes with a foreign base, `__getattr__` /
+        // `__setattr__` classes, methods / properties and private names
+        // stay untouched.
+        let real_shape = shape.clone();
+        if c.unsafe_depth == 0
+            && !attr_name.starts_with('_')
+            && !real_class.contains('.')
+            && !c.is_plain_class(&real_class)
+            && !c.is_raw_class(&real_class)
+            && !real_shape.bases.iter().any(|b| b == "BaseModel")
+            && c.class_hierarchy_fully_known(&real_class)
+            && !c.class_defines_getattr(&real_class)
+            && c.find_method(&real_class, attr_name).is_none()
+            && c.find_method(&real_class, "__setattr__").is_none()
+        {
+            let attr_start = attr.attr.range.start().to_usize();
+            let attr_len = attr
+                .attr
+                .range
+                .end()
+                .to_usize()
+                .saturating_sub(attr_start)
+                .max(1);
+            let display = class_name
+                .strip_prefix("__typhon_impl_")
+                .unwrap_or(&class_name)
+                .to_owned();
+            c.diagnostics.push_error(TycError::attribute_not_found(
+                attr_name, &display, &c.path, c.source, attr_start, attr_len,
+            ));
+        }
         return;
     };
     // Substitute the receiver's type arguments into the field type, so a
@@ -7700,7 +8012,7 @@ fn check_attr_assign_type(c: &mut Checker, target: &Expr, value_type: &Type) {
     // bare (`Type::Class`) or the arity does not line up, the bindings map
     // stays empty and the `mentions_type_param` gate below drops the check.
     let mut bindings = std::collections::HashMap::new();
-    if let Some(tparams) = c.class_type_params.get(&class_name) {
+    if let Some(tparams) = c.class_type_params.get(&real_class) {
         if tparams.len() == targs.len() {
             for (p, a) in tparams.iter().zip(targs.iter()) {
                 bindings.insert(p.clone(), a.clone());
@@ -8545,7 +8857,7 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
             // don't false-positive `tyc::attribute_not_found`.
             let class_vars = collect_classvar_field_names(cd);
             if !class_vars.is_empty() {
-                c.self_attrs
+                c.class_var_attrs
                     .entry(name.clone())
                     .or_default()
                     .extend(class_vars);
@@ -8567,7 +8879,9 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                 // is used in the class body, then store it positionally so
                 // `is_assignable` can widen covariant / contravariant user
                 // generics while keeping the invariant default elsewhere.
-                let variances = infer_class_param_variance(cd, &tps, &classes);
+                let impls = impl_blocks_for(body, &name);
+                let frozen = c.frozen_classes.contains(&name);
+                let variances = infer_class_param_variance_with(cd, &tps, &classes, &impls, frozen);
                 c.class_param_variance.insert(name.clone(), variances);
                 c.class_type_params.insert(name, tps);
             }
@@ -8769,7 +9083,14 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
             }
         }
     }
+    // A subclass may re-declare an inherited field, but not with a type a
+    // base-typed reader cannot rely on: `class Sub(Base): x: str` where
+    // `Base.x: int` makes `def f(b: Base) -> int: return b.x + 1` raise
+    // for a `Sub` (review 2026-09-30 §3.8). Runs once every shape is
+    // recorded so the base's effective (inherited) fields are visible.
+    check_subclass_field_redeclarations(c, body, &classes);
     // Third pass: record function signatures (also needs the full class list).
+    // (The transitive `sync_spawners` closure runs after this loop — see below.)
     // Ruff folds `async def` into `Stmt::FunctionDef` with `is_async = true`,
     // so a single arm covers both sync and async forms.
     for stmt in body {
@@ -8812,9 +9133,14 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
             // alongside the body walk.
             if f.is_async {
                 c.async_functions.insert(f.name.as_str().to_owned());
-            } else if let Some(callee) = body_spawns_task(&f.body) {
-                c.sync_spawners.insert(f.name.as_str().to_owned(), callee);
+            } else {
+                c.sync_functions.insert(f.name.as_str().to_owned());
+                if let Some(callee) = body_spawns_task(&f.body) {
+                    c.sync_spawners.insert(f.name.as_str().to_owned(), callee);
+                }
             }
+            // (transitive closure over sync callers is computed once all
+            // direct spawners are known — `close_sync_spawners` below)
             // Also extract any declared TypeVar bounds so they can be checked
             // at call sites.
             let bounds = type_param_bounds_from(f.type_params.as_deref(), &classes);
@@ -8836,6 +9162,7 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
             }
         }
     }
+    close_sync_spawners(c, body);
     // R3-3 review follow-up: method-form context-manager factories
     // (`impl Pool: @contextmanager def acquire(self): yield Conn()`)
     // live inside a `ClassDef` body and aren't visited by the
@@ -9476,18 +9803,135 @@ fn is_property_getter(f: &ruff_python_ast::StmtFunctionDef) -> bool {
 /// parser already tolerates it as a bare name decorator) overrides the
 /// inferred result for *every* parameter of the class — a cheap escape
 /// hatch that needs no new syntax.
+/// The `impl` / `extend` pseudo-classes (`class __typhon_impl_NAME[…](object):`)
+/// that contribute methods to `name` in `body`.
+fn impl_blocks_for<'a>(body: &'a [Stmt], name: &str) -> Vec<&'a ruff_python_ast::StmtClassDef> {
+    let pseudo = format!("__typhon_impl_{name}");
+    body.iter()
+        .filter_map(|s| match s {
+            Stmt::ClassDef(cd) if cd.name.as_str() == pseudo => Some(cd),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Variance inference over the class body alone — the pre-2026-09-30
+/// shape, kept for callers with no `impl` blocks or frozen-ness to hand.
+#[cfg(test)]
 fn infer_class_param_variance(
     cd: &ruff_python_ast::StmtClassDef,
     class_tps: &[String],
     classes: &[String],
 ) -> Vec<Variance> {
+    infer_class_param_variance_with(cd, class_tps, classes, &[], false)
+}
+
+/// Infer each class type parameter's variance from every position it is
+/// used in: the class body's own fields and methods, and — since the
+/// 2026-09-30 review (§4.5) — the methods of every `impl[…] NAME[…]:` block
+/// (`impls`), which is where idiomatic Typhon puts them. A field of a
+/// `frozen` class is read-only, so it is an output position (covariant)
+/// rather than the read-write invariant of a mutable dataclass field.
+fn infer_class_param_variance_with(
+    cd: &ruff_python_ast::StmtClassDef,
+    class_tps: &[String],
+    classes: &[String],
+    impls: &[&ruff_python_ast::StmtClassDef],
+    frozen: bool,
+) -> Vec<Variance> {
     let candidates: std::collections::HashSet<&str> =
         class_tps.iter().map(|s| s.as_str()).collect();
     let mut observed: HashMap<String, Variance> = HashMap::new();
 
+    // `impl[U] Box[U]:` names the class's parameters positionally; walk
+    // each block's methods with its own parameter names and fold the
+    // observations back onto the class's names.
+    for block in impls {
+        let block_tps = type_param_names_from(block.type_params.as_deref());
+        let block_tps = if block_tps.is_empty() {
+            class_tps.to_vec()
+        } else {
+            block_tps
+        };
+        let block_candidates: std::collections::HashSet<&str> =
+            block_tps.iter().map(|s| s.as_str()).collect();
+        let mut block_observed: HashMap<String, Variance> = HashMap::new();
+        for item in &block.body {
+            if let Stmt::FunctionDef(f) = item {
+                observe_method_variance(
+                    f,
+                    &block_tps,
+                    classes,
+                    &block_candidates,
+                    &mut block_observed,
+                );
+            }
+        }
+        for (idx, btp) in block_tps.iter().enumerate() {
+            let Some(ctp) = class_tps.get(idx) else {
+                continue;
+            };
+            if let Some(v) = block_observed.get(btp) {
+                observed
+                    .entry(ctp.clone())
+                    .and_modify(|cur| *cur = join_variance(*cur, *v))
+                    .or_insert(*v);
+            }
+        }
+    }
+
     for item in &cd.body {
         match item {
             Stmt::FunctionDef(f) => {
+                observe_method_variance(f, class_tps, classes, &candidates, &mut observed);
+            }
+            Stmt::AnnAssign(ann) => {
+                // A plain annotated field is settable on the emitted
+                // dataclass, so the parameter is both read and written →
+                // invariant. A `frozen` class's field is read-only →
+                // covariant. Either way any mention pins the parameter.
+                let t = type_from_annotation_with_params(&ann.annotation, classes, class_tps);
+                let sign = if frozen {
+                    Variance::Covariant
+                } else {
+                    Variance::Invariant
+                };
+                collect_param_variance(&t, &candidates, sign, &mut observed);
+            }
+            _ => {}
+        }
+    }
+
+    // Optional explicit override via a bare `@covariant` / `@contravariant`
+    // class decorator. Honoured only if the parser already produced it as a
+    // decorator — no new syntax is introduced. Applies to every parameter.
+    let forced = explicit_variance_override(&cd.decorator_list);
+
+    class_tps
+        .iter()
+        .map(|tp| {
+            if let Some(v) = forced {
+                v
+            } else {
+                // Unobserved parameters default to the sound `Invariant`.
+                observed.get(tp).copied().unwrap_or(Variance::Invariant)
+            }
+        })
+        .collect()
+}
+
+/// Fold one method's parameter (input, contravariant) and return (output,
+/// covariant) positions into `observed`.
+fn observe_method_variance(
+    f: &ruff_python_ast::StmtFunctionDef,
+    class_tps: &[String],
+    classes: &[String],
+    candidates: &std::collections::HashSet<&str>,
+    observed: &mut HashMap<String, Variance>,
+) {
+    {
+        {
+            {
                 // Scope = class type params + this method's own type params
                 // so `def map[U](self, f: Callable[[T], U])` resolves `T`.
                 let mut scope = class_tps.to_vec();
@@ -9513,12 +9957,7 @@ fn infer_class_param_variance(
                 for pwd in params {
                     if let Some(ann) = &pwd.parameter.annotation {
                         let t = type_from_annotation_with_params(ann, classes, &scope);
-                        collect_param_variance(
-                            &t,
-                            &candidates,
-                            Variance::Contravariant,
-                            &mut observed,
-                        );
+                        collect_param_variance(&t, candidates, Variance::Contravariant, observed);
                     }
                 }
                 // Return type (output, covariant). A property getter's
@@ -9527,37 +9966,11 @@ fn infer_class_param_variance(
                 let _ = (getter, setter);
                 if let Some(r) = f.returns.as_deref() {
                     let t = type_from_annotation_with_params(r, classes, &scope);
-                    collect_param_variance(&t, &candidates, Variance::Covariant, &mut observed);
+                    collect_param_variance(&t, candidates, Variance::Covariant, observed);
                 }
             }
-            Stmt::AnnAssign(ann) => {
-                // A plain annotated field is settable on the emitted
-                // dataclass, so the parameter is both read and written →
-                // invariant. Feed it through at `Invariant` so any mention
-                // pins the parameter.
-                let t = type_from_annotation_with_params(&ann.annotation, classes, class_tps);
-                collect_param_variance(&t, &candidates, Variance::Invariant, &mut observed);
-            }
-            _ => {}
         }
     }
-
-    // Optional explicit override via a bare `@covariant` / `@contravariant`
-    // class decorator. Honoured only if the parser already produced it as a
-    // decorator — no new syntax is introduced. Applies to every parameter.
-    let forced = explicit_variance_override(&cd.decorator_list);
-
-    class_tps
-        .iter()
-        .map(|tp| {
-            if let Some(v) = forced {
-                v
-            } else {
-                // Unobserved parameters default to the sound `Invariant`.
-                observed.get(tp).copied().unwrap_or(Variance::Invariant)
-            }
-        })
-        .collect()
 }
 
 /// Recognise an explicit, whole-class variance override expressed as a bare
@@ -10797,6 +11210,14 @@ enum ArityCheck {
         /// The kw arg's source position.
         span: (usize, usize),
     },
+    /// A positional-only parameter (declared before `/`) was passed by
+    /// keyword and the function has no `**kwargs` to absorb it — CPython
+    /// raises `TypeError: … got some positional-only arguments passed as
+    /// keyword arguments` (review 2026-09-30 §3.8).
+    PositionalOnlyByKeyword {
+        name: String,
+        span: (usize, usize),
+    },
     /// Any other arity failure (count mismatch, double-bound name,
     /// missing required, etc.). Falls back to `tyc::arg_count`.
     Other,
@@ -10850,6 +11271,21 @@ fn check_arity_with_info(
         for kw in kw_args {
             let Some(ident) = &kw.arg else { continue };
             let name = ident.as_str();
+            if info
+                .param_names
+                .iter()
+                .take(info.posonly_count)
+                .any(|p| p == name)
+            {
+                let span = (
+                    ident.range.start().to_usize(),
+                    ident.range.start().to_usize() + name.len(),
+                );
+                return ArityCheck::PositionalOnlyByKeyword {
+                    name: name.to_owned(),
+                    span,
+                };
+            }
             let hits_pos = info.param_names.iter().any(|p| p == name);
             let hits_kwonly = info.kwonly_names.iter().any(|p| p == name);
             if !hits_pos && !hits_kwonly {
@@ -11414,22 +11850,15 @@ fn check_invariant_arg_positions(
 /// alone: `attr_path_of` returns `None` for it, and there is no stable place
 /// to name in the message. Those receivers were not checked before either, so
 /// staying quiet is no regression.
+/// Report a possibly-`None` receiver of an attribute read, a method call or
+/// a subscript. Every receiver shape reports: a bare name and an attribute
+/// path exactly as before, and — closing the receiver-position hole the
+/// 2026-09-30 review found (§3.1) — a call result (`d.get(k).upper()`,
+/// `find(x).name`), a subscript (`xs[0].upper()` on `list[str?]`) or any
+/// other expression, at error level, because there is no name to narrow and
+/// the access is the classic unguarded-`None` crash.
 fn check_nullable_receiver(c: &mut Checker, recv_expr: &Expr, recv_ty: &Type) {
-    if let Expr::Name(n) = recv_expr {
-        let span = (
-            n.range.start().to_usize(),
-            n.range.start().to_usize() + n.id.as_str().len(),
-        );
-        c.nullable_use(n.id.as_str(), recv_ty, span);
-        return;
-    }
-    if let Some(path) = attr_path_of(recv_expr) {
-        let span = (
-            recv_expr.range().start().to_usize(),
-            recv_expr.range().end().to_usize(),
-        );
-        c.nullable_attr_use(&path, recv_ty, span);
-    }
+    report_nullable_operand(c, recv_expr, recv_ty);
 }
 
 /// Whether an expression contains a call anywhere in evaluation position —
@@ -11666,6 +12095,67 @@ fn collect_call_rebound_globals(stmts: &[Stmt], acc: &mut std::collections::Hash
 /// arm that evaluates a call rather than from the three that used to (F41).
 fn reset_globals_after_call(c: &mut Checker) {
     c.env.reset_global_narrowings(&c.globals_rebound_by_call);
+    c.env.reset_local_narrowings(&c.nonlocals_rebound_by_call);
+}
+
+impl Checker<'_> {
+    /// Whether an intervening call can rebind a name some narrowing may
+    /// depend on: a module global a callee declares `global`, or a local of
+    /// the current function a nested `def` declares `nonlocal`.
+    fn call_can_rebind(&self) -> bool {
+        !self.globals_rebound_by_call.is_empty() || !self.nonlocals_rebound_by_call.is_empty()
+    }
+}
+
+/// Names declared `nonlocal` by any `def` nested (at any depth) inside
+/// `body`. Lambdas cannot declare `nonlocal`, and a nested class body's own
+/// methods are walked too, since `nonlocal` there still targets the
+/// enclosing function's scope.
+fn collect_nested_nonlocals(body: &[Stmt]) -> std::collections::HashSet<String> {
+    fn walk(stmts: &[Stmt], nested: bool, acc: &mut std::collections::HashSet<String>) {
+        for s in stmts {
+            match s {
+                Stmt::Nonlocal(nl) if nested => {
+                    acc.extend(nl.names.iter().map(|n| n.as_str().to_owned()));
+                }
+                Stmt::FunctionDef(f) => walk(&f.body, true, acc),
+                Stmt::ClassDef(cd) => walk(&cd.body, nested, acc),
+                Stmt::If(i) => {
+                    walk(&i.body, nested, acc);
+                    for clause in &i.elif_else_clauses {
+                        walk(&clause.body, nested, acc);
+                    }
+                }
+                Stmt::For(f) => {
+                    walk(&f.body, nested, acc);
+                    walk(&f.orelse, nested, acc);
+                }
+                Stmt::While(w) => {
+                    walk(&w.body, nested, acc);
+                    walk(&w.orelse, nested, acc);
+                }
+                Stmt::With(w) => walk(&w.body, nested, acc),
+                Stmt::Try(t) => {
+                    walk(&t.body, nested, acc);
+                    for h in &t.handlers {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                        walk(&h.body, nested, acc);
+                    }
+                    walk(&t.orelse, nested, acc);
+                    walk(&t.finalbody, nested, acc);
+                }
+                Stmt::Match(m) => {
+                    for case in &m.cases {
+                        walk(&case.body, nested, acc);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut acc = std::collections::HashSet::new();
+    walk(body, false, &mut acc);
+    acc
 }
 
 /// Evaluate an expression appearing in statement position, invalidating global
@@ -11682,7 +12172,7 @@ fn eval_stmt_expr(c: &mut Checker, e: &Expr) -> Type {
     // modules declare no `global` at all, and `expr_contains_call` is a full
     // subtree walk that would otherwise run once per statement in the program
     // only to find there is nothing it could invalidate.
-    if !c.globals_rebound_by_call.is_empty() && expr_contains_call(e) {
+    if c.call_can_rebind() && expr_contains_call(e) {
         reset_globals_after_call(c);
     }
     t
@@ -11717,7 +12207,7 @@ fn widen_loop_carried_narrowings(c: &mut Checker, body: &[Stmt]) {
     // The sequential reset at the call's own statement fires only once control
     // *reaches* the call — which is after the top-of-body read on iteration 2.
     // The back-edge therefore needs its own reset.
-    if !c.globals_rebound_by_call.is_empty() && body_contains_call(body) {
+    if c.call_can_rebind() && body_contains_call(body) {
         reset_globals_after_call(c);
     }
 }
@@ -11765,7 +12255,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 // `global NAME` in the callee, staling a caller narrowing on
                 // that global. Reset for subsequent statements (mirrors the
                 // `Stmt::Assign` / `Stmt::Expr` resets). Locals are immune.
-                if !c.globals_rebound_by_call.is_empty()
+                if c.call_can_rebind()
                     && (expr_contains_call(value) || expr_contains_call(&a.target))
                 {
                     reset_globals_after_call(c);
@@ -11890,7 +12380,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // narrowing survives — mirroring the bare-call `Stmt::Expr` reset.
             // Locals are immune (a call can't rebind a caller's local).
             // Targets count too: `xs[clear()] = 5` runs the callee.
-            if !c.globals_rebound_by_call.is_empty()
+            if c.call_can_rebind()
                 && (expr_contains_call(&a.value) || a.targets.iter().any(expr_contains_call))
             {
                 reset_globals_after_call(c);
@@ -11994,6 +12484,13 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         // first (the base object changed), then re-narrow this
                         // path to the assigned value when it's provably non-null.
                         c.env.clear_attr_narrowing(&path);
+                        // The written object may be an alias of another root
+                        // (`other = b; other.val = None` stales `b.val`), so
+                        // the same field narrowed under any OTHER root goes too
+                        // (review 2026-09-30 §3.8).
+                        if let Some(field) = path.rsplit('.').next() {
+                            c.env.clear_attr_narrowings_of_field(field, &path);
+                        }
                         if !value_type.is_nullable() && !matches!(value_type, Type::Unknown) {
                             c.env.narrow_attr(path, value_type.clone());
                         }
@@ -12298,12 +12795,33 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 // `class_attr_shadows_slot` warning (and the reasoning that
                 // backs it) does not apply — suppress it for plain classes.
                 let is_plain = c.is_plain_class(class_name);
+                // A `class!` emits a bare class too (no `@dataclass`, no
+                // slots), and a subclass that inherits a *required* field
+                // from a known base is an instance type, not a namespace of
+                // constants, whatever its own fields default to (review
+                // 2026-09-30 §4.4).
+                let is_raw = c.is_raw_class(class_name);
+                let inherits_required_field = c
+                    .class_shapes
+                    .get(class_name)
+                    .map(|shape| shape.bases.clone())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|b| effective_class_shape(b, &c.class_shapes))
+                    .any(|parent| {
+                        parent
+                            .field_order
+                            .iter()
+                            .any(|f| !parent.field_defaults.contains(f))
+                    });
                 if has_ann_assign
                     && all_ann_assigns_defaulted
                     && only_ann_assigns
                     && !body_has_function
                     && merged_methods_empty
                     && !is_plain
+                    && !is_raw
+                    && !inherits_required_field
                 {
                     if let Some((ann, field_name)) = first_defaulted {
                         let value_hint = ann
@@ -12347,6 +12865,21 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     if let Stmt::FunctionDef(f) = s {
                         let method = f.name.as_str();
                         let span_start = f.name.range.start().to_usize();
+                        // A class-level `lazy let NAME: T = …` lowers to a
+                        // `@cached_property def NAME(self)` — compiler
+                        // output, not a method the user wrote in the class
+                        // body (review 2026-09-30 §4.4).
+                        let is_lazy_let_lowering = f.decorator_list.iter().any(|d| {
+                            let last = match &d.expression {
+                                Expr::Name(n) => n.id.as_str(),
+                                Expr::Attribute(a) => a.attr.as_str(),
+                                _ => "",
+                            };
+                            last == "cached_property"
+                        });
+                        if is_lazy_let_lowering {
+                            continue;
+                        }
                         // `__init__` is generated from the field
                         // annotations (`@dataclass(slots=True)` or
                         // `BaseModel`). Writing one manually conflicts
@@ -12521,9 +13054,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // reachable afterwards, so this only matters for the statements
             // the checker keeps walking past a `return` — but the arm is here
             // so the reset never drifts out of the statement list again.
-            if !c.globals_rebound_by_call.is_empty()
-                && ret.value.as_deref().is_some_and(expr_contains_call)
-            {
+            if c.call_can_rebind() && ret.value.as_deref().is_some_and(expr_contains_call) {
                 reset_globals_after_call(c);
             }
         }
@@ -12617,6 +13148,19 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 );
                 c.mismatch_with("an iterable".to_string(), iter_ty.display(), span);
             }
+            // An instance of a fully-known user class that defines neither
+            // `__iter__` nor `__getitem__` (the legacy sequence protocol)
+            // raises `TypeError: 'X' object is not iterable` on the first
+            // iteration (review 2026-09-30 §3.8). `plain class` / `class!`
+            // bodies, enums, `__getattr__` classes and anything with a
+            // foreign base stay permissive.
+            if c.unsafe_depth == 0 && class_definitely_not_iterable(c, &iter_ty) {
+                let span = (
+                    f.iter.range().start().to_usize(),
+                    f.iter.range().end().to_usize(),
+                );
+                c.mismatch_with("an iterable".to_string(), iter_ty.display(), span);
+            }
             // Element type of the iterable, with `?` preserved. For
             // unmodelled shapes (`Unknown`, user classes, bare containers)
             // fall back to `Unknown` so we stay permissive.
@@ -12647,7 +13191,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // so any narrowing the caller established on a global is now stale.
             // Reset it. (Locals are immune — a call can't rebind a caller's
             // local.) See `reset_global_narrowings`.
-            if !c.globals_rebound_by_call.is_empty() && expr_contains_call(&e.value) {
+            if c.call_can_rebind() && expr_contains_call(&e.value) {
                 reset_globals_after_call(c);
             }
             // A bare method-call statement (`self.reset()`, `conn.close()`) may
@@ -12669,6 +13213,21 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 if let Expr::Attribute(recv_attr) = call.func.as_ref() {
                     if let Some(recv_path) = attr_path_of(&recv_attr.value) {
                         c.env.clear_attr_narrowing(&recv_path);
+                    }
+                }
+                // An object handed to a call in statement position
+                // (`clear(b)`, `self.reset(b)`) can have its fields rewritten
+                // by the callee just as a method call on it can, so the
+                // narrowings rooted at every bare-name argument are stale
+                // too (review 2026-09-30 §3.8).
+                for arg in call
+                    .arguments
+                    .args
+                    .iter()
+                    .chain(call.arguments.keywords.iter().map(|k| &k.value))
+                {
+                    if let Expr::Name(n) = arg {
+                        c.env.clear_attr_narrowing(n.id.as_str());
                     }
                 }
             }
@@ -12999,7 +13558,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
         }
         Stmt::Delete(d) => {
             // `del cache[key()]` evaluates the subscript, calls included.
-            if !c.globals_rebound_by_call.is_empty() && d.targets.iter().any(expr_contains_call) {
+            if c.call_can_rebind() && d.targets.iter().any(expr_contains_call) {
                 reset_globals_after_call(c);
             }
             // `del x` / `del self.x` removes the binding, so any flow narrowing
@@ -13279,6 +13838,13 @@ fn check_function(
     // scoped to this function body (a nested function starts clean and
     // the enclosing set is restored on exit).
     let saved_reassigned_names = std::mem::take(&mut c.reassigned_names);
+    // Locals a nested `def` of THIS body declares `nonlocal` (see
+    // `nonlocals_rebound_by_call`); the enclosing function's set is
+    // restored on exit.
+    let saved_nonlocals = std::mem::replace(
+        &mut c.nonlocals_rebound_by_call,
+        collect_nested_nonlocals(body),
+    );
 
     // Declare parameters with their annotation types. Type parameters resolve
     // to `Any` until a real inference engine lands. Inside a class body, an
@@ -13435,6 +14001,7 @@ fn check_function(
     c.env.restore_scope_narrowings(saved_scope_narrowings);
     c.env.attr_narrowings = saved_attr_narrowings;
     c.reassigned_names = saved_reassigned_names;
+    c.nonlocals_rebound_by_call = saved_nonlocals;
     c.current_return = saved_return;
     c.unsafe_origin_bindings = saved_unsafe_origins;
     c.active_typevar_bounds = saved_bounds;
@@ -14911,13 +15478,26 @@ fn stmt_always_exits(stmt: &Stmt) -> bool {
         // pattern that must not be flagged as a missing-return false positive.
         Stmt::Try(t) => {
             let finally_exits = !t.finalbody.is_empty() && body_always_exits(&t.finalbody);
-            let try_and_handlers_exit = body_always_exits(&t.body)
+            // The normal path runs the `try` body and then `else:`; it
+            // exits when either does (`try: r = f()` / `else: return r` is
+            // the canonical shape — review 2026-09-30 §4.3). The exceptional
+            // path exits when every handler does (an uncaught exception
+            // propagates, which is also an exit).
+            let normal_path_exits = body_always_exits(&t.body)
+                || (!t.orelse.is_empty() && body_always_exits(&t.orelse));
+            let try_and_handlers_exit = normal_path_exits
                 && t.handlers.iter().all(|h| {
                     let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
                     body_always_exits(&h.body)
-                })
-                && (t.orelse.is_empty() || body_always_exits(&t.orelse));
+                });
             finally_exits || try_and_handlers_exit
+        }
+        // `for … else:` / `while … else:` leave the function only through
+        // the `else` suite (which runs when the loop completes without
+        // `break`) — the body may run zero times, so it need not exit, but
+        // a `break` skips `else` and reaches the code after the loop.
+        Stmt::For(f) => {
+            !f.orelse.is_empty() && body_always_exits(&f.orelse) && !body_can_break(&f.body)
         }
         _ => false,
     }
@@ -15042,7 +15622,19 @@ fn stmt_always_exits_aware(c: &Checker, stmt: &Stmt) -> bool {
         // to honour this so `while True: match x: case A: return ...;
         // case B: continue` doesn't surface `missing_return` for the
         // function (B23 stress finding).
-        Stmt::While(w) => is_constant_true(&w.test) && !body_can_break(&w.body),
+        Stmt::While(w) => {
+            (is_constant_true(&w.test) && !body_can_break(&w.body))
+                || (!w.orelse.is_empty()
+                    && body_always_exits_aware(c, &w.orelse)
+                    && !body_can_break(&w.body))
+        }
+        // See the structural variant: the `else` suite is the only way out
+        // of a completed loop, and `break` bypasses it.
+        Stmt::For(f) => {
+            !f.orelse.is_empty()
+                && body_always_exits_aware(c, &f.orelse)
+                && !body_can_break(&f.body)
+        }
         // A `with` / `async with` block exits the enclosing function
         // only when every terminal in its body is *non-suppressible*
         // — `return` / `break` / `continue`. Bare `raise` is
@@ -15053,12 +15645,13 @@ fn stmt_always_exits_aware(c: &Checker, stmt: &Stmt) -> bool {
         Stmt::With(w) => body_exits_non_suppressible_aware(c, &w.body),
         Stmt::Try(t) => {
             let finally_exits = !t.finalbody.is_empty() && body_always_exits_aware(c, &t.finalbody);
-            let try_and_handlers_exit = body_always_exits_aware(c, &t.body)
+            let normal_path_exits = body_always_exits_aware(c, &t.body)
+                || (!t.orelse.is_empty() && body_always_exits_aware(c, &t.orelse));
+            let try_and_handlers_exit = normal_path_exits
                 && t.handlers.iter().all(|h| {
                     let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
                     body_always_exits_aware(c, &h.body)
-                })
-                && (t.orelse.is_empty() || body_always_exits_aware(c, &t.orelse));
+                });
             finally_exits || try_and_handlers_exit
         }
         _ => false,
@@ -15995,6 +16588,54 @@ fn declare_walrus_targets(c: &mut Checker, e: &Expr) {
     }
 }
 
+/// The type of a name or attribute path as it stands once the narrowings in
+/// `pending` (collected from earlier operands of the same `and` / negated
+/// `or` chain) are applied. The innermost pending narrowing for the exact
+/// name or path wins; otherwise the environment's own narrowing; otherwise
+/// the receiver is typed the same way (recursively) and the field is looked
+/// up on it — which is what lets `b.val` resolve while `b` is only known to
+/// be non-None from the operand just before it.
+fn attr_expr_type_with_pending(c: &Checker, e: &Expr, pending: &[Narrowing]) -> Type {
+    match e {
+        Expr::Name(n) => pending
+            .iter()
+            .rev()
+            .find(|p| p.attr_path.is_none() && p.name == n.id.as_str())
+            .map(|p| p.replacement.clone())
+            .unwrap_or_else(|| infer_expr_readonly(c, e)),
+        Expr::Attribute(a) => {
+            if let Some(path) = attr_path_of(e) {
+                if let Some(p) = pending
+                    .iter()
+                    .rev()
+                    .find(|p| p.attr_path.as_deref() == Some(path.as_str()))
+                {
+                    return p.replacement.clone();
+                }
+                if let Some(narrowed) = c.env.attr_narrowed(&path) {
+                    return narrowed.clone();
+                }
+            }
+            let recv = attr_expr_type_with_pending(c, &a.value, pending);
+            match &recv {
+                Type::Class(cls) | Type::Generic(cls, _) => {
+                    if let Some(field_ty) = c.find_field(cls, a.attr.as_str()) {
+                        return field_ty.clone();
+                    }
+                    if let Some(sig) = c.find_method(cls, a.attr.as_str()) {
+                        if sig.is_property {
+                            return sig.return_type.clone();
+                        }
+                    }
+                    infer_expr_readonly(c, e)
+                }
+                _ => infer_expr_readonly(c, e),
+            }
+        }
+        _ => infer_expr_readonly(c, e),
+    }
+}
+
 fn collect_narrowings(c: &Checker, test: &Expr, negate: bool) -> Vec<Narrowing> {
     let mut out = Vec::new();
     collect_narrowings_inner(c, test, negate, &mut out);
@@ -16046,13 +16687,16 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                         (cmp.left.as_ref(), &cmp.comparators[0])
                     {
                         // `self.value is None` / `b.field is not None` — narrow
-                        // the attribute access path.
+                        // the attribute access path. The path is typed with
+                        // the narrowings *already collected* from earlier
+                        // operands of the same `and` chain in force: in
+                        // `b is not None and b.val is not None` the second
+                        // operand's `b` is the non-None `Box`, not the
+                        // declared `Box?` (which typed `b.val` as unknown
+                        // and silently dropped the narrowing — the fp25/t18
+                        // stress false positives, review 2026-09-30 §4).
                         if let Some(path) = attr_path_of(cmp.left.as_ref()) {
-                            let current = c
-                                .env
-                                .attr_narrowed(&path)
-                                .cloned()
-                                .unwrap_or_else(|| infer_expr_readonly(c, cmp.left.as_ref()));
+                            let current = attr_expr_type_with_pending(c, cmp.left.as_ref(), out);
                             // Only narrow when the attribute is actually
                             // nullable; otherwise leave it alone.
                             if matches!(&current, Type::Union(_))
@@ -17007,10 +17651,9 @@ fn report_nullable_operand(c: &mut Checker, expr: &Expr, ty: &Type) {
             );
             c.nullable_use(n.id.as_str(), ty, span);
         }
-        Expr::Attribute(_) => {
-            if let Some(path) = attr_path_of(expr) {
-                c.nullable_attr_use(&path, ty, span);
-            }
+        Expr::Attribute(a) if attr_path_of(expr).is_some() => {
+            let path = attr_path_of(expr).unwrap_or_else(|| a.attr.as_str().to_owned());
+            c.nullable_attr_use(&path, ty, span);
         }
         other => {
             let display = match other {
@@ -17023,6 +17666,7 @@ fn report_nullable_operand(c: &mut Checker, expr: &Expr, ty: &Type) {
                     Expr::Name(n) => format!("{}[...]", n.id.as_str()),
                     _ => "the subscript".to_owned(),
                 },
+                Expr::Attribute(a) => format!("(...).{}", a.attr.as_str()),
                 _ => "the expression".to_owned(),
             };
             c.nullable_use(&display, ty, span);
@@ -17085,6 +17729,22 @@ fn refine_isinstance_target(current: &Type, narrowed_to: &Type) -> Type {
 }
 
 fn strip_variant(typ: &Type, variant: &Type) -> Type {
+    // `Result[T, E]` minus `Err` is `Ok[T]` (and minus `Ok` is `Err[E]`).
+    // This is the negative branch of the `?` / `with`-chain lowering
+    // (`if isinstance(t, __typhon_Err__): return t` followed by
+    // `x = t.value`), so without it every unannotated `let x = f()?` and
+    // every `with x = f()?` binding fell to `Unknown` (review 2026-09-30
+    // §3.2) — `t.value` on a still-`Result`-typed temp has no known type.
+    if let (Type::Generic(head, args), Type::Class(v)) = (typ, variant) {
+        if head == "Result" && args.len() == 2 {
+            if v == "Err" {
+                return Type::Generic("Ok".into(), vec![args[0].clone()]);
+            }
+            if v == "Ok" {
+                return Type::Generic("Err".into(), vec![args[1].clone()]);
+            }
+        }
+    }
     // A union variant (`isinstance(x, (A, B))` on the negative branch)
     // removes each of its members.
     if let Type::Union(members) = variant {
@@ -17856,14 +18516,48 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         | ruff_python_ast::CmpOp::Gt
                         | ruff_python_ast::CmpOp::GtE
                 );
-                if !ordering {
+                let membership = matches!(
+                    op,
+                    ruff_python_ast::CmpOp::In | ruff_python_ast::CmpOp::NotIn
+                );
+                if !ordering && !membership {
                     continue;
                 }
-                for idx in [i, i + 1] {
-                    if let Some((expr, ty)) = operand_tys.get(idx) {
-                        if ty.is_nullable() {
-                            report_nullable_operand(c, expr, ty);
+                if ordering {
+                    for idx in [i, i + 1] {
+                        if let Some((expr, ty)) = operand_tys.get(idx) {
+                            if ty.is_nullable() {
+                                report_nullable_operand(c, expr, ty);
+                            }
                         }
+                    }
+                }
+                // Operand compatibility (review 2026-09-30 §3.7): an
+                // ordering comparison between a string and a number, or
+                // on a class with no ordering dunder, and a membership
+                // test against a scalar or a class with no container
+                // protocol, are `TypeError`s CPython raises on every
+                // evaluation. `None` operands were reported just above, so
+                // the shape check runs on the non-`None` part.
+                if let (Some((_, lt)), Some((_, rt))) = (operand_tys.get(i), operand_tys.get(i + 1))
+                {
+                    let (ls, rs) = (lt.strip_none(), rt.strip_none());
+                    let compatible = if ordering {
+                        ordering_operands_compatible(c, &ls, &rs)
+                    } else {
+                        membership_container_ok(c, &rs)
+                    };
+                    if !compatible {
+                        let op_str = match op {
+                            ruff_python_ast::CmpOp::Lt => "<",
+                            ruff_python_ast::CmpOp::LtE => "<=",
+                            ruff_python_ast::CmpOp::Gt => ">",
+                            ruff_python_ast::CmpOp::GtE => ">=",
+                            ruff_python_ast::CmpOp::In => "in",
+                            _ => "not in",
+                        };
+                        let span = (cmp.range.start().to_usize(), cmp.range.end().to_usize());
+                        c.operator_type_mismatch(op_str, &ls, &rs, span);
                     }
                 }
             }
@@ -18192,7 +18886,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     params,
                     ret,
                     variadic,
-                    min_params: _,
+                    min_params,
                 } => {
                     // Argument count check honours defaults, keyword args,
                     // `*args`, and `**kwargs` by looking up the function's
@@ -18261,10 +18955,22 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         // cover the rest), and require ≥ params.len()
                         // when the function is variadic.
                         let total = pos_args.len() + kw_args.len();
-                        let ok = if variadic {
+                        // `min_params` is the number of required
+                        // parameters when the callable's origin recorded
+                        // it (a `Callable[[…], R]` annotation, a lambda);
+                        // absent, keep the permissive lower bound. A
+                        // `*args` / `**kwargs` at the call site expands to
+                        // an unknown count, so neither bound can be
+                        // checked against it.
+                        let has_star = pos_args.iter().any(|e| matches!(e, Expr::Starred(_)))
+                            || kw_args.iter().any(|k| k.arg.is_none());
+                        let required = min_params.unwrap_or(0);
+                        let ok = if has_star {
+                            true
+                        } else if variadic {
                             total >= params.len()
                         } else {
-                            total <= params.len()
+                            total <= params.len() && total >= required
                         };
                         if ok {
                             ArityCheck::Ok
@@ -18285,6 +18991,13 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                             let suggestion = suggest_candidate(&name, &candidates);
                             let fn_label = fn_name.clone().unwrap_or_else(|| "<call>".to_owned());
                             c.unknown_kwarg(&fn_label, &name, suggestion, span);
+                        }
+                        ArityCheck::PositionalOnlyByKeyword { name, span } => {
+                            let fn_label = fn_name.clone().unwrap_or_else(|| "<call>".to_owned());
+                            let help = format!(
+                                "`{name}` is positional-only (it is declared before `/`) — pass it by position"
+                            );
+                            c.unknown_kwarg(&fn_label, &name, help, span);
                         }
                         ArityCheck::Other => {
                             let name = fn_name.clone().unwrap_or_else(|| "<call>".to_owned());
@@ -18766,9 +19479,11 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         {
                             match check_arity_with_info(&info, pos_args, kw_args) {
                                 ArityCheck::Ok => {}
-                                ArityCheck::UnknownKwarg { .. } => {
+                                ArityCheck::UnknownKwarg { .. }
+                                | ArityCheck::PositionalOnlyByKeyword { .. } => {
                                     // Already handled by the dedicated
-                                    // unknown-kwarg loop above.
+                                    // unknown-kwarg loop above (and a
+                                    // synthesised constructor has no `/`).
                                 }
                                 ArityCheck::Other => {
                                     // Prefer the named-missing diagnostic
@@ -19100,6 +19815,13 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 // would land in `unsafe:`-style territory.
                 return Type::Unknown;
             }
+            // A sealed-union alias (`type U = A | B`) stays nominal for
+            // exhaustiveness, but a member access on a `U`-typed value is
+            // valid only if EVERY variant has the member (review 2026-09-30
+            // §3.3) — so when the alias itself does not resolve the name
+            // (an `impl U:` distributed method does), check it against the
+            // variants exactly like a structural union.
+            let recv = expand_sealed_union_alias(c, recv, attr_name);
             match &recv {
                 Type::Class(class_name) => {
                     let class_name = class_name.clone();
@@ -19354,6 +20076,20 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 // `nullable_use` above; the `None` member is treated as
                 // permissive here so we don't double-report.
                 Type::Union(members) => {
+                    // A field or `@property` every member declares with one
+                    // type reads as that type; anything else stays `Unknown`
+                    // (permissive) as before.
+                    let common = members
+                        .iter()
+                        .map(|m| member_field_type(c, m, attr_name))
+                        .collect::<Option<Vec<Type>>>()
+                        .and_then(|tys| {
+                            let first = tys.first()?.clone();
+                            tys.iter().all(|t| *t == first).then_some(first)
+                        });
+                    if let Some(t) = common {
+                        return t;
+                    }
                     if c.unsafe_depth == 0 && !attr_name.starts_with('_') {
                         if let Some(bad) = members
                             .iter()
@@ -19429,6 +20165,31 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
         Expr::Subscript(s) => {
             let value_ty = infer_expr(c, &s.value);
             let slice_ty = infer_expr(c, &s.slice);
+            // A possibly-`None` receiver (`find(k)[0]` on `list[int]?`) is
+            // reported like any other nullable receiver; the element type is
+            // then computed on the non-`None` part so the subscript still
+            // yields something useful for the rest of the checks.
+            if value_ty.is_nullable() {
+                check_nullable_receiver(c, &s.value, &value_ty);
+            }
+            let value_ty = value_ty.strip_none();
+            // Subscripting a union is only valid when EVERY member is
+            // subscriptable: `x[0]` on `int | str` raises for the `int`
+            // member (review 2026-09-30 §3.8). Members that are dynamic or
+            // user classes stay permissive, exactly like the scalar check
+            // below.
+            if c.unsafe_depth == 0 {
+                if let Type::Union(members) = &value_ty {
+                    if members
+                        .iter()
+                        .any(|m| matches!(m, Type::Int | Type::Float | Type::None))
+                    {
+                        let span = (s.range.start().to_usize(), s.range.end().to_usize());
+                        c.operator_type_mismatch("[]", &value_ty, &slice_ty, span);
+                        return Type::Unknown;
+                    }
+                }
+            }
             if let Type::Generic(head, elts) = &value_ty {
                 if head == "tuple" && !elts.is_empty() {
                     if let Some(idx) = const_int_index(&s.slice) {
@@ -19742,6 +20503,31 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             c.inside_await = c.inside_await.saturating_add(1);
             let inner = infer_expr_ctx(c, &a.value, expected);
             c.inside_await = c.inside_await.saturating_sub(1);
+            // `await` needs an awaitable: a plain value (`await 1`), a
+            // string, a container, a function object or an instance of a
+            // fully-known class with no `__await__` raises `TypeError:
+            // object int can't be used in 'await' expression` (review
+            // 2026-09-30 §3.6). Dynamic types, partial (foreign) classes and
+            // anything that might be a coroutine stay permissive.
+            //
+            // The checker types a call to an `async def` as its *declared
+            // return* (the coroutine is transparent), so the operand's type
+            // alone cannot tell `await fetch()` (fine) from `await load()`
+            // (a sync `def` — always a `TypeError`). The type test is
+            // therefore gated on the operand's *shape*: a call whose callee
+            // is provably sync, or a literal. A bare name or attribute is
+            // left alone — it may hold a coroutine the checker typed by its
+            // result.
+            if c.unsafe_depth == 0
+                && await_operand_is_shape_checkable(c, &a.value)
+                && definitely_not_awaitable(c, &inner)
+            {
+                let span = (
+                    a.value.range().start().to_usize(),
+                    a.value.range().end().to_usize(),
+                );
+                c.mismatch_with("an awaitable".to_string(), inner.display(), span);
+            }
             // R3-1: a `Callable[..., Awaitable[T]]` call site infers
             // to `Awaitable[T]` from the Callable's return position,
             // but `await` consumes the awaitable and produces the
@@ -20122,6 +20908,309 @@ fn operand_is_unflaggable(t: &Type) -> bool {
 
 fn is_numeric(t: &Type) -> bool {
     matches!(t, Type::Int | Type::Float | Type::Bool)
+}
+
+/// Replace a sealed-union alias receiver by the union of its variants for
+/// a member access the alias itself cannot resolve. Parametric aliases
+/// (`Maybe[T]`) expand to their bare variant classes, which keeps the
+/// result permissive for `T`-typed members.
+fn expand_sealed_union_alias(c: &Checker, recv: Type, attr: &str) -> Type {
+    let name = match &recv {
+        Type::Class(n) => n.as_str(),
+        Type::Generic(n, _) if !is_builtin_generic_head(n) => n.as_str(),
+        _ => return recv,
+    };
+    let Some(variants) = c.sealed_unions.get(name) else {
+        return recv;
+    };
+    if variants.is_empty()
+        || c.find_method(name, attr).is_some()
+        || c.find_field(name, attr).is_some()
+    {
+        return recv;
+    }
+    Type::Union(variants.iter().map(|v| Type::Class(v.clone())).collect())
+}
+
+/// The declared type of field / `@property` `attr` on a class member of a
+/// union, or `None` when the member is not a fully-known class or has no
+/// such field.
+fn member_field_type(c: &Checker, member: &Type, attr: &str) -> Option<Type> {
+    let Type::Class(name) = member else {
+        return None;
+    };
+    if !c.class_hierarchy_fully_known(name) {
+        return None;
+    }
+    if let Some(t) = c.find_field(name, attr) {
+        return Some(t.clone());
+    }
+    c.find_method(name, attr)
+        .filter(|sig| sig.is_property)
+        .map(|sig| sig.return_type.clone())
+}
+
+/// Whether a user class (or one of its known bases) defines any rich
+/// ordering dunder. `a < b` tries `a.__lt__(b)` and then the reflected
+/// `b.__gt__(a)`, and `functools.total_ordering` fills the rest in from any
+/// one of them, so one ordering dunder anywhere makes the class orderable.
+fn class_has_ordering_dunder(c: &Checker, name: &str) -> bool {
+    ["__lt__", "__le__", "__gt__", "__ge__"]
+        .iter()
+        .any(|d| c.find_method(name, d).is_some())
+}
+
+/// `true` when an ordering comparison (`<`, `<=`, `>`, `>=`) between `l` and
+/// `r` is known to be valid, or cannot be judged. Only statically-certain
+/// `TypeError`s answer `false`: a string against a number, `bytes` against
+/// `str`, a `dict`, a bare `None`, and an instance of a fully-known class
+/// with no ordering dunder on either side.
+fn ordering_operands_compatible(c: &Checker, l: &Type, r: &Type) -> bool {
+    if let Type::Union(ms) = l {
+        return ms.iter().all(|m| ordering_operands_compatible(c, m, r));
+    }
+    if let Type::Union(ms) = r {
+        return ms.iter().all(|m| ordering_operands_compatible(c, l, m));
+    }
+    let class_ok = |name: &str| -> bool {
+        // Anything we cannot see completely (a venv-introspected shape,
+        // an unknown base, a `__getattr__` class, an enum whose members
+        // may mix in `int` / `str`) stays permissive.
+        !c.class_hierarchy_fully_known(name)
+            || c.class_defines_getattr(name)
+            || c.enums.contains_key(name)
+            || class_has_ordering_dunder(c, name)
+    };
+    match (l, r) {
+        (Type::Any | Type::Unknown | Type::TypeVar(_) | Type::TypeConstructor(..), _)
+        | (_, Type::Any | Type::Unknown | Type::TypeVar(_) | Type::TypeConstructor(..)) => true,
+        (Type::Module(_), _) | (_, Type::Module(_)) => true,
+        (Type::Class(ln), Type::Class(rn)) => class_ok(ln) || class_ok(rn),
+        (Type::Class(n), _) | (_, Type::Class(n)) => class_ok(n),
+        (Type::Generic(lh, _), Type::Generic(rh, _)) => {
+            // Sequences compare lexicographically and sets by inclusion;
+            // a `dict` never orders. Unknown / user generic heads are left
+            // alone.
+            let orderable = |h: &str| {
+                matches!(
+                    h,
+                    "list"
+                        | "tuple"
+                        | "tuple_variadic"
+                        | "set"
+                        | "frozenset"
+                        | "Sequence"
+                        | "deque"
+                )
+            };
+            if lh == "dict" || rh == "dict" {
+                return false;
+            }
+            !(orderable(lh) && orderable(rh))
+                || lh == rh
+                || (is_set_head(lh) && is_set_head(rh))
+                || is_seq_head(lh) == is_seq_head(rh)
+        }
+        (Type::Generic(h, _), other) | (other, Type::Generic(h, _)) => {
+            // A container against a scalar (`[1] < 2`) always raises; an
+            // unknown generic head stays permissive.
+            let known_container = matches!(
+                h.as_str(),
+                "list" | "tuple" | "tuple_variadic" | "set" | "frozenset" | "dict" | "Sequence"
+            );
+            !(known_container
+                && matches!(
+                    other,
+                    Type::Int
+                        | Type::Float
+                        | Type::Bool
+                        | Type::Str
+                        | Type::LitStr(_)
+                        | Type::Bytes
+                ))
+        }
+        (Type::Function { .. }, _) | (_, Type::Function { .. }) => false,
+        (Type::None, _) | (_, Type::None) => false,
+        _ => {
+            let lk = scalar_kind(l);
+            let rk = scalar_kind(r);
+            lk.is_none() || rk.is_none() || lk == rk
+        }
+    }
+}
+
+/// `true` when iterating a value of type `t` is certain to raise: a
+/// non-enum, non-`plain` / `class!` user class whose fully-known hierarchy
+/// defines neither `__iter__` nor `__getitem__`.
+fn class_definitely_not_iterable(c: &Checker, t: &Type) -> bool {
+    let name = match t {
+        Type::Class(n) => n.as_str(),
+        Type::Generic(n, _) if !is_builtin_generic_head(n) => n.as_str(),
+        _ => return false,
+    };
+    !name.contains('.')
+        && !c.sealed_unions.contains_key(name)
+        && !c.enums.contains_key(name)
+        && !c.is_plain_class(name)
+        && !c.is_raw_class(name)
+        && c.class_hierarchy_fully_known(name)
+        && !c.class_defines_getattr(name)
+        && c.find_method(name, "__iter__").is_none()
+        && c.find_method(name, "__getitem__").is_none()
+        && c.find_method(name, "__aiter__").is_none()
+}
+
+fn is_set_head(h: &str) -> bool {
+    matches!(h, "set" | "frozenset")
+}
+
+fn is_seq_head(h: &str) -> bool {
+    matches!(
+        h,
+        "list" | "tuple" | "tuple_variadic" | "Sequence" | "deque"
+    )
+}
+
+/// Coarse comparison kind of a scalar: numbers order among themselves,
+/// strings among themselves, bytes among themselves.
+fn scalar_kind(t: &Type) -> Option<u8> {
+    match t {
+        Type::Int | Type::Float | Type::Bool => Some(0),
+        Type::Str | Type::LitStr(_) => Some(1),
+        Type::Bytes => Some(2),
+        _ => None,
+    }
+}
+
+/// `true` when `x in r` can be evaluated (or cannot be judged): `r` must
+/// support `__contains__`, `__iter__` or `__getitem__`. A number, `None`,
+/// a function object, or an instance of a fully-known class with none of
+/// those raises `TypeError: argument of type 'int' is not iterable`.
+fn membership_container_ok(c: &Checker, r: &Type) -> bool {
+    match r {
+        Type::Union(ms) => ms.iter().all(|m| membership_container_ok(c, m)),
+        Type::Int | Type::Float | Type::None | Type::Function { .. } => false,
+        Type::Class(name) => {
+            !c.class_hierarchy_fully_known(name)
+                || c.class_defines_getattr(name)
+                || c.enums.contains_key(name)
+                || ["__contains__", "__iter__", "__getitem__"]
+                    .iter()
+                    .any(|d| c.find_method(name, d).is_some())
+        }
+        _ => true,
+    }
+}
+
+/// Whether the operand of an `await` has a shape whose inferred type is
+/// trustworthy for the non-awaitable check: a literal or display, or a call
+/// whose callee is provably a sync function — a module-level `def` that is
+/// not `async`, a constructor of a class declared here, a method of a
+/// fully-known class whose signature is not `async`, or a method of a
+/// builtin `str` / `bytes` / container. Everything else (a name, an
+/// attribute, a call through a `Callable`, a foreign method) may be a
+/// coroutine the checker typed by its result, so it is left alone.
+fn await_operand_is_shape_checkable(c: &Checker, operand: &Expr) -> bool {
+    match operand {
+        Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::BytesLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::NoneLiteral(_)
+        | Expr::FString(_)
+        | Expr::List(_)
+        | Expr::Dict(_)
+        | Expr::Set(_)
+        | Expr::Tuple(_)
+        | Expr::ListComp(_)
+        | Expr::DictComp(_)
+        | Expr::SetComp(_) => true,
+        Expr::Call(call) => match call.func.as_ref() {
+            Expr::Name(n) => {
+                let name = n.id.as_str();
+                // Only this module's own declarations: an imported
+                // function's shape carries no async flag, so `await
+                // other.run()` on an `async def` imported from a sibling
+                // module must stay permissive.
+                let sync_def = c.sync_functions.contains(name) && !c.async_functions.contains(name);
+                let own_class = c.local_classes.contains(name)
+                    && c.class_shapes.contains_key(name)
+                    && !c.is_interface_name(name)
+                    && c.class_hierarchy_fully_known(name);
+                sync_def || own_class
+            }
+            Expr::Attribute(a) => {
+                let recv = infer_expr_readonly(c, &a.value);
+                match recv.strip_none() {
+                    Type::Str | Type::LitStr(_) | Type::Bytes => true,
+                    Type::Generic(head, _) => match head.as_str() {
+                        "list" | "dict" | "set" | "frozenset" | "tuple" | "tuple_variadic" => true,
+                        cls => class_method_is_known_sync(c, cls, a.attr.as_str()),
+                    },
+                    Type::Class(cls) => class_method_is_known_sync(c, &cls, a.attr.as_str()),
+                    _ => false,
+                }
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// `true` when `cls` is declared in this module with a fully-known
+/// hierarchy, no `__getattr__`, and a method `name` whose signature is not
+/// `async`.
+fn class_method_is_known_sync(c: &Checker, cls: &str, name: &str) -> bool {
+    !cls.contains('.')
+        && c.local_classes.contains(cls)
+        && c.class_shapes.contains_key(cls)
+        && c.class_hierarchy_fully_known(cls)
+        && !c.class_defines_getattr(cls)
+        && c.find_method(cls, name)
+            .is_some_and(|sig| !sig.is_async && !sig.is_property)
+}
+
+/// `true` when `await`ing a value of type `t` is certain to raise. Only
+/// statically-obvious non-awaitables answer `true`; coroutine-shaped
+/// generics, dynamic types, partial classes and classes defining
+/// `__await__` stay permissive.
+fn definitely_not_awaitable(c: &Checker, t: &Type) -> bool {
+    match t {
+        Type::Int
+        | Type::Float
+        | Type::Bool
+        | Type::Str
+        | Type::LitStr(_)
+        | Type::Bytes
+        | Type::None
+        | Type::Function { .. }
+        | Type::Module(_) => true,
+        Type::Generic(head, _) => matches!(
+            head.as_str(),
+            "list"
+                | "dict"
+                | "set"
+                | "frozenset"
+                | "tuple"
+                | "tuple_variadic"
+                | "Sequence"
+                | "Mapping"
+                | "Iterator"
+                | "Iterable"
+                | "Result"
+                | "Ok"
+                | "Err"
+        ),
+        Type::Class(name) => {
+            !name.contains('.')
+                && c.class_hierarchy_fully_known(name)
+                && !c.class_defines_getattr(name)
+                && c.find_method(name, "__await__").is_none()
+                && !c.enums.contains_key(name)
+        }
+        Type::Union(ms) => !ms.is_empty() && ms.iter().all(|m| definitely_not_awaitable(c, m)),
+        _ => false,
+    }
 }
 
 /// If `t` is a `Type::Class("X")` and `X` is a declared `newtype`,
@@ -21143,22 +22232,76 @@ fn collect_pattern_capture_names(p: &Pattern, out: &mut Vec<String>) {
     }
 }
 
+/// The type a `case <pattern> as name` capture takes: the members of the
+/// subject that the inner class pattern can match (`int()` keeps `int` and
+/// `bool`, `list()` keeps every `list[…]`, `C()` keeps `C` and its
+/// subclasses), falling back to the pattern's own class when the subject is
+/// not a union of candidates — a subclass pattern over a base-typed subject —
+/// and to the subject itself when the pattern says nothing about the type.
+fn as_capture_type(c: &Checker, subject: &Type, inner: &Pattern) -> Type {
+    let head = match inner {
+        Pattern::MatchClass(mc) => match mc.cls.as_ref() {
+            Expr::Name(n) => n.id.as_str().to_owned(),
+            _ => return subject.clone(),
+        },
+        _ => return subject.clone(),
+    };
+    let matches_head = |t: &Type| -> bool {
+        match (head.as_str(), t) {
+            ("int", Type::Int | Type::Bool)
+            | ("str", Type::Str | Type::LitStr(_))
+            | ("bool", Type::Bool)
+            | ("float", Type::Float)
+            | ("bytes", Type::Bytes) => true,
+            ("list" | "dict" | "set" | "frozenset", Type::Generic(h, _)) => h == head.as_str(),
+            ("tuple", Type::Generic(h, _)) => h == "tuple" || h == "tuple_variadic",
+            (_, Type::Class(cn)) | (_, Type::Generic(cn, _)) => {
+                cn == head.as_str() || c.is_assignable(&Type::Class(head.clone()), t)
+            }
+            _ => false,
+        }
+    };
+    match subject {
+        Type::Union(members) => {
+            let kept: Vec<Type> = members
+                .iter()
+                .filter(|m| matches_head(m))
+                .cloned()
+                .collect();
+            if kept.is_empty() {
+                pattern_narrowed_type(inner).unwrap_or_else(|| subject.clone())
+            } else {
+                Type::union_of(kept)
+            }
+        }
+        other if matches_head(other) => other.clone(),
+        other => pattern_narrowed_type(inner).unwrap_or_else(|| other.clone()),
+    }
+}
+
 fn bind_pattern_names(c: &mut Checker, pattern: &Pattern, ty: &Type) {
     match pattern {
         Pattern::MatchAs(a) => {
+            // `case X(...) as name` — the capture is the subject *as matched*
+            // by the inner pattern: `case int() as n` over `int | str` binds
+            // `n: int`, not the whole union (which made `n > 100` in the
+            // guard an operator error, review 2026-09-30 §4). A bare
+            // capture `case name` keeps the subject type.
+            let bound = match &a.pattern {
+                Some(inner) => as_capture_type(c, ty, inner),
+                None => ty.clone(),
+            };
             if let Some(name) = &a.name {
-                // `case X(...) as name` / a bare capture `case name` — the
-                // captured value has the matched (subject / sub-field) type.
                 c.env.declare(TypeBinding {
                     name: name.as_str().to_owned(),
-                    declared: ty.clone(),
-                    narrowed: ty.clone(),
+                    declared: bound.clone(),
+                    narrowed: bound.clone(),
                     span: (a.range.start().to_usize(), a.range.end().to_usize()),
                     from_unsafe: false,
                 });
             }
             if let Some(inner) = &a.pattern {
-                bind_pattern_names(c, inner, ty);
+                bind_pattern_names(c, inner, &bound);
             }
         }
         Pattern::MatchStar(s) => {
@@ -36315,5 +37458,511 @@ def main() -> None:
             "narrowed int member + 1 must NOT fire; got {:?}",
             d.errors()
         );
+    }
+
+    /// Regression net for the 2026-09-30 release-readiness review: the
+    /// soundness holes it closed (§3) and the false positives it removed
+    /// (§4). One test per finding, each a minimal program from the review's
+    /// probe corpus.
+    mod review_2026_09_30 {
+        use super::*;
+
+        fn has_error(d: &Diagnostics, pred: fn(&TycError) -> bool) -> bool {
+            d.errors().iter().any(pred)
+        }
+
+        /// Errors or warnings: the attribute-rooted `nullable_use` is emitted
+        /// at warn level here and promoted to an error by the CLI's default
+        /// `[strictness] nullable-use = "error"`.
+        fn has_diag(d: &Diagnostics, pred: fn(&TycError) -> bool) -> bool {
+            d.errors().iter().any(pred) || d.warnings().iter().any(pred)
+        }
+
+        fn errors_of(d: &Diagnostics) -> Vec<String> {
+            d.errors().iter().map(|e| e.to_string()).collect()
+        }
+
+        fn nullable(e: &TycError) -> bool {
+            matches!(e, TycError::NullableUse { .. })
+        }
+        fn mismatch(e: &TycError) -> bool {
+            matches!(e, TycError::TypeMismatch { .. })
+        }
+        fn operator(e: &TycError) -> bool {
+            matches!(e, TycError::OperatorTypeMismatch { .. })
+        }
+        fn attr_missing(e: &TycError) -> bool {
+            matches!(e, TycError::AttributeNotFound { .. })
+        }
+        fn arg_count(e: &TycError) -> bool {
+            matches!(e, TycError::WrongArgCount { .. })
+        }
+        fn unknown_kwarg(e: &TycError) -> bool {
+            matches!(e, TycError::UnknownKwarg { .. })
+        }
+
+        // ── §3.1 nullable receivers that are not a bare name ─────────────
+
+        #[test]
+        fn method_call_on_a_nullable_call_result_is_rejected() {
+            let d = check("def find(k: int) -> str?:\n    return None\ndef main() -> None:\n    print(find(1).upper())\n");
+            assert!(has_error(&d, nullable), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn method_chain_on_a_nullable_method_result_is_rejected() {
+            let d = check(
+                "class R:\n    v: str?\nimpl R:\n    def get(self) -> str?:\n        return self.v\ndef main() -> None:\n    print(R(v=None).get().upper())\n",
+            );
+            assert!(has_error(&d, nullable), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn attribute_read_on_a_nullable_call_result_is_rejected() {
+            let d = check("class C:\n    n: int\ndef find(k: int) -> C?:\n    return None\ndef main() -> None:\n    print(find(1).n)\n");
+            assert!(has_error(&d, nullable), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn subscript_on_a_nullable_call_result_is_rejected() {
+            let d = check("def find(k: int) -> list[int]?:\n    return None\ndef main() -> None:\n    print(find(1)[0])\n");
+            assert!(has_error(&d, nullable), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn nullable_call_result_inside_an_fstring_field_is_rejected() {
+            let d = check("def find(k: int) -> str?:\n    return None\ndef main() -> None:\n    print(f\"{find(1).upper()}\")\n");
+            assert!(has_error(&d, nullable), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn a_receiver_that_is_always_none_gets_the_always_none_wording() {
+            let d = check(
+                "def f() -> None:\n    return None\ndef main() -> None:\n    print(f().real)\n",
+            );
+            let e = d
+                .errors()
+                .iter()
+                .find(|e| nullable(e))
+                .map(|e| e.to_string());
+            let Some(msg) = e else {
+                panic!("expected nullable_use, got {:?}", errors_of(&d))
+            };
+            assert!(msg.contains("`None` used"), "got: {msg}");
+            assert!(!msg.contains("possibly"), "got: {msg}");
+        }
+
+        // ── §3.2 narrowing invalidation ──────────────────────────────────
+
+        #[test]
+        fn nonlocal_write_in_a_nested_def_invalidates_the_outer_narrowing() {
+            let d = check(
+                "def main() -> None:\n    mut x: int? = 1\n    def clear() -> None:\n        nonlocal x\n        x = None\n    if x is not None:\n        clear()\n        print(x + 1)\n",
+            );
+            assert!(has_error(&d, nullable), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn nested_def_declared_inside_the_narrowed_branch_still_invalidates() {
+            let d = check(
+                "def main() -> None:\n    mut x: int? = 1\n    if x is not None:\n        def clear() -> None:\n            nonlocal x\n            x = None\n        clear()\n        print(x + 1)\n",
+            );
+            assert!(has_error(&d, nullable), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn a_call_taking_the_narrowed_object_invalidates_its_attribute_narrowing() {
+            let d = check(
+                "class Box:\n    val: int?\ndef clear(b: Box) -> None:\n    b.val = None\ndef main() -> None:\n    let b: Box = Box(val=1)\n    if b.val is not None:\n        clear(b)\n        print(b.val + 1)\n",
+            );
+            assert!(has_diag(&d, nullable), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn a_write_through_an_alias_invalidates_the_attribute_narrowing() {
+            let d = check(
+                "class Box:\n    val: int?\ndef main() -> None:\n    let b: Box = Box(val=1)\n    let other: Box = b\n    if b.val is not None:\n        other.val = None\n        print(b.val + 1)\n",
+            );
+            assert!(has_diag(&d, nullable), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn a_narrowed_attribute_stays_narrowed_across_an_unrelated_call() {
+            let d = check(
+                "class Box:\n    val: int?\ndef tick() -> None:\n    return None\ndef main() -> None:\n    let b: Box = Box(val=1)\n    if b.val is not None:\n        tick()\n        print(b.val + 1)\n",
+            );
+            assert!(!has_error(&d, nullable), "{:?}", errors_of(&d));
+        }
+
+        // ── §4 and-chain attribute narrowing (fp25a / t18 stress probes) ─
+
+        #[test]
+        fn and_chain_narrows_a_field_of_a_receiver_narrowed_earlier_in_the_chain() {
+            let d = check(
+                "class Box:\n    val: int?\ndef f(b: Box?) -> int:\n    if b is not None and b.val is not None:\n        return b.val + 1\n    return 0\n",
+            );
+            assert!(d.errors().is_empty(), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn and_chain_narrows_a_nested_attribute_path() {
+            let d = check(
+                "class Inner:\n    c: int?\nclass Outer:\n    b: Inner?\ndef f(a: Outer) -> int:\n    if a.b is not None and a.b.c is not None:\n        return a.b.c + 1\n    return 0\ndef h(a: Outer?) -> int:\n    if a is not None and a.b is not None and a.b.c is not None:\n        return a.b.c\n    return 0\n",
+            );
+            assert!(d.errors().is_empty(), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn negated_or_chain_narrows_a_field_after_an_early_exit() {
+            let d = check(
+                "class Box:\n    val: int?\ndef f(b: Box?) -> int:\n    if b is None or b.val is None:\n        return 0\n    return b.val + 1\n",
+            );
+            assert!(d.errors().is_empty(), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn an_unnarrowed_nullable_field_is_still_rejected() {
+            let d =
+                check("class Box:\n    val: int?\ndef f(b: Box) -> int:\n    return b.val + 1\n");
+            assert!(has_diag(&d, nullable), "{:?}", errors_of(&d));
+        }
+
+        // ── §3.3 union member access and subscripts ──────────────────────
+
+        #[test]
+        fn field_access_on_a_union_alias_member_lacking_it_is_rejected() {
+            let d = check(
+                "class A:\n    n: int\nclass B:\n    s: str\ntype U = A | B\ndef main() -> None:\n    let u: U = B(s=\"x\")\n    print(u.n)\n",
+            );
+            assert!(has_error(&d, attr_missing), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn method_call_on_a_union_alias_member_lacking_it_is_rejected() {
+            let d = check(
+                "class A:\n    n: int\nimpl A:\n    def go(self) -> int:\n        return self.n\nclass B:\n    s: str\ntype U = A | B\ndef f(u: U) -> int:\n    return u.go()\n",
+            );
+            assert!(has_error(&d, attr_missing), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn builtin_method_missing_on_one_union_member_is_rejected() {
+            let d = check("def pick(f: bool) -> int | str:\n    return 1 if f else \"s\"\ndef main() -> None:\n    let v: int | str = pick(True)\n    print(v.upper())\n");
+            assert!(has_error(&d, attr_missing), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn field_common_to_every_union_member_is_accepted() {
+            let d = check("class A:\n    n: int\nclass B:\n    n: int\ntype U = A | B\ndef f(u: U) -> int:\n    return u.n\n");
+            assert!(d.errors().is_empty(), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn subscript_on_a_union_with_a_non_subscriptable_member_is_rejected() {
+            let d = check("def pick(flag: bool) -> int | str:\n    return 1 if flag else \"s\"\ndef main() -> None:\n    let v: int | str = pick(True)\n    print(v[0])\n");
+            assert!(has_error(&d, operator), "{:?}", errors_of(&d));
+        }
+
+        // ── §3.4 comparisons ─────────────────────────────────────────────
+
+        #[test]
+        fn ordering_comparison_between_str_and_int_is_rejected() {
+            let d = check("def main() -> None:\n    let s: str = \"a\"\n    let n: int = 1\n    print(s < n, n <= s)\n");
+            assert!(has_error(&d, operator), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn ordering_comparison_on_a_nullable_operand_is_rejected() {
+            let d = check("def find() -> int?:\n    return None\ndef main() -> None:\n    let v: int? = find()\n    print(v < 3)\n");
+            assert!(has_error(&d, nullable), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn ordering_comparison_on_a_class_without_lt_is_rejected() {
+            let d =
+                check("class P:\n    x: int\ndef main() -> None:\n    print(P(x=1) < P(x=2))\n");
+            assert!(has_error(&d, operator), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn ordering_comparison_on_a_class_defining_lt_is_accepted() {
+            let d = check(
+                "class P:\n    x: int\nimpl P:\n    def __lt__(self, other: P) -> bool:\n        return self.x < other.x\ndef main() -> None:\n    print(P(x=1) < P(x=2))\n",
+            );
+            assert!(!has_error(&d, operator), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn membership_test_on_an_int_is_rejected() {
+            let d = check("def main() -> None:\n    let n: int = 5\n    print(3 in n)\n");
+            assert!(has_error(&d, operator), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn numeric_and_same_type_comparisons_are_accepted() {
+            let d = check(
+                "def main() -> None:\n    let a: int = 1\n    let b: float = 2.0\n    let s: str = \"x\"\n    let xs: list[int] = [1]\n    print(a < b, b >= a, s < \"y\", 1 in xs, \"x\" in s, a == s)\n",
+            );
+            assert!(!has_error(&d, operator), "{:?}", errors_of(&d));
+        }
+
+        // ── §3.5 Callable arity ──────────────────────────────────────────
+
+        #[test]
+        fn callable_field_called_with_too_few_arguments_is_rejected() {
+            let d = check(
+                "from collections.abc import Callable\nclass H:\n    fn: Callable[[int, int], int]\ndef main() -> None:\n    let h: H = H(fn=lambda a, b: a + b)\n    print(h.fn(1))\n",
+            );
+            assert!(has_error(&d, arg_count), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn callable_parameter_called_with_too_few_arguments_is_rejected() {
+            let d = check("from collections.abc import Callable\ndef apply(f: Callable[[int, int], int]) -> int:\n    return f(1)\n");
+            assert!(has_error(&d, arg_count), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn callable_parameter_called_with_the_wrong_argument_type_is_rejected() {
+            let d = check("from collections.abc import Callable\ndef apply(f: Callable[[int], int]) -> int:\n    return f(\"x\")\n");
+            assert!(has_error(&d, mismatch), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn callable_parameter_called_with_the_right_arity_is_accepted() {
+            let d = check("from collections.abc import Callable\ndef apply(f: Callable[[int, int], int]) -> int:\n    return f(1, 2)\n");
+            assert!(d.errors().is_empty(), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn star_args_through_a_value_callable_are_not_arity_checked() {
+            let d = check(
+                "from collections.abc import Callable\ndef apply(f: Callable[[int, int, int], int]) -> int:\n    let args: list[int] = [1, 2, 3]\n    let kwargs: dict[str, int] = {\"a\": 1}\n    return f(*args) + f(1, **kwargs)\n",
+            );
+            assert!(!has_error(&d, arg_count), "{:?}", errors_of(&d));
+        }
+
+        // ── §3.6 await ───────────────────────────────────────────────────
+
+        #[test]
+        fn await_on_a_sync_call_result_is_rejected() {
+            let d = check("import asyncio\ndef f() -> int:\n    return 1\nasync def main() -> None:\n    let v: int = await f()\n    print(v)\n");
+            assert!(has_error(&d, mismatch), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn await_on_a_sync_method_result_is_rejected() {
+            let d = check(
+                "class S:\n    n: int\nimpl S:\n    def get(self) -> int:\n        return self.n\nasync def main() -> None:\n    let s: S = S(n=1)\n    let v: int = await s.get()\n    print(v)\n",
+            );
+            assert!(has_error(&d, mismatch), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn await_on_a_literal_is_rejected() {
+            let d = check("async def main() -> None:\n    let v: int = await 1\n    print(v)\n");
+            assert!(has_error(&d, mismatch), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn await_on_async_calls_and_interface_methods_is_accepted() {
+            let d = check(
+                "import asyncio\nasync def fetch() -> int:\n    return 1\nclass S:\n    n: int\nimpl S:\n    async def get(self) -> int:\n        return self.n\ninterface Fetcher:\n    async def fetch(self) -> int: ...\nasync def use(f: Fetcher, s: S) -> int:\n    let a: int = await fetch()\n    let b: int = await s.get()\n    let c: int = await f.fetch()\n    let n: int = 1\n    return a + b + c + n\n",
+            );
+            assert!(!has_error(&d, mismatch), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn await_on_a_bare_name_is_left_alone() {
+            // A name may hold a coroutine the checker typed by its result;
+            // the shape gate keeps the check to calls and literals.
+            let d = check("async def main() -> None:\n    let n: int = 1\n    let v: int = await n\n    print(v)\n");
+            assert!(!has_error(&d, mismatch), "{:?}", errors_of(&d));
+        }
+
+        // ── §3.7 / §3.8 structural rules ─────────────────────────────────
+
+        #[test]
+        fn subclass_field_redeclared_with_an_incompatible_type_is_rejected() {
+            let d = check("class Base:\n    x: int\nclass Sub(Base):\n    x: str\n");
+            assert!(has_error(&d, mismatch), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn subclass_field_redeclared_with_the_same_type_is_accepted() {
+            let d = check("class Base:\n    x: int\nclass Sub(Base):\n    x: int = 5\n");
+            assert!(d.errors().is_empty(), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn positional_only_parameter_passed_by_keyword_is_rejected() {
+            let d = check("def f(a: int, /, b: int) -> int:\n    return a + b\ndef main() -> None:\n    print(f(a=1, b=2))\n");
+            assert!(has_error(&d, unknown_kwarg), "{:?}", errors_of(&d));
+            // The help text is carried as a field, so the debug rendering
+            // shows it without needing the `Diagnostic` trait in scope.
+            let rendered = d
+                .errors()
+                .iter()
+                .find(|e| unknown_kwarg(e))
+                .map(|e| format!("{e:?}"))
+                .unwrap_or_default();
+            assert!(rendered.contains("positional-only"), "got: {rendered}");
+        }
+
+        #[test]
+        fn positional_only_parameter_passed_by_position_is_accepted() {
+            let d = check("def f(a: int, /, b: int) -> int:\n    return a + b\ndef main() -> None:\n    print(f(1, b=2))\n");
+            assert!(d.errors().is_empty(), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn for_over_a_class_without_iter_is_rejected() {
+            let d = check("class Bag:\n    n: int\ndef main() -> None:\n    let b: Bag = Bag(n=3)\n    for x in b:\n        print(x)\n");
+            assert!(has_error(&d, mismatch), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn for_over_a_class_defining_iter_is_accepted() {
+            let d = check(
+                "from collections.abc import Iterator\nclass Bag:\n    n: int\nimpl Bag:\n    def __iter__(self) -> Iterator[int]:\n        yield self.n\ndef main() -> None:\n    let b: Bag = Bag(n=3)\n    for x in b:\n        print(x)\n",
+            );
+            assert!(!has_error(&d, mismatch), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn undeclared_attribute_write_on_a_slots_class_is_rejected() {
+            let d = check(
+                "class P:\n    x: int\nimpl P:\n    def bump(self) -> None:\n        self.y = 5\n",
+            );
+            assert!(has_error(&d, attr_missing), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn undeclared_attribute_write_on_a_plain_class_is_accepted() {
+            let d = check_class_kinds("plain class P:\n    x: int\nimpl P:\n    def bump(self) -> None:\n        self.y = 5\n");
+            assert!(!has_error(&d, attr_missing), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn class_var_written_through_the_class_inside_a_method_is_accepted() {
+            let d = check(
+                "from typing import ClassVar\nclass Reg:\n    registry: ClassVar[dict[str, int]] = {}\n    name: str\nimpl Reg:\n    def register(self) -> None:\n        Reg.registry[self.name] = 1\n",
+            );
+            assert!(d.errors().is_empty(), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn go_inside_a_sync_def_reached_from_module_level_is_rejected() {
+            let d = check_full("import asyncio\nasync def work() -> None:\n    await asyncio.sleep(0)\ndef kick() -> None:\n    go work()\ndef main() -> None:\n    kick()\nmain()\n");
+            assert!(
+                has_error(&d, |e| matches!(e, TycError::GoOutsideAsync { .. })),
+                "{:?}",
+                errors_of(&d)
+            );
+        }
+
+        #[test]
+        fn a_spawn_inside_a_nested_def_does_not_make_the_enclosing_function_a_spawner() {
+            // The nested `def` is its own frame; calling `outer()` at module
+            // level spawns nothing.
+            let d = check_full("import asyncio\nasync def work() -> None:\n    await asyncio.sleep(0)\ndef outer() -> None:\n    def inner() -> None:\n        go work()\n    print(\"outer\")\nouter()\n");
+            assert!(
+                !has_error(&d, |e| matches!(e, TycError::GoOutsideAsync { .. })),
+                "{:?}",
+                errors_of(&d)
+            );
+        }
+
+        #[test]
+        fn go_inside_a_sync_def_reached_only_from_a_coroutine_is_accepted() {
+            let d = check_full("import asyncio\nasync def work() -> None:\n    await asyncio.sleep(0)\ndef kick() -> None:\n    go work()\nasync def main() -> None:\n    kick()\nasyncio.run(main())\n");
+            assert!(
+                !has_error(&d, |e| matches!(e, TycError::GoOutsideAsync { .. })),
+                "{:?}",
+                errors_of(&d)
+            );
+        }
+
+        // ── §4 false positives ───────────────────────────────────────────
+
+        #[test]
+        fn return_in_try_else_and_for_else_counts_as_exiting() {
+            let d = check(
+                "def f(a: int, b: int) -> float:\n    try:\n        let r: float = a / b\n    except ZeroDivisionError:\n        return 0.0\n    else:\n        return r\ndef find(xs: list[int], t: int) -> int:\n    for i, x in enumerate(xs):\n        if x == t:\n            return i\n    else:\n        return -1\ndef spin(n: int) -> int:\n    while n > 0:\n        return n\n    else:\n        return 0\n",
+            );
+            assert!(
+                !has_error(&d, |e| matches!(e, TycError::MissingReturn { .. })),
+                "{:?}",
+                errors_of(&d)
+            );
+        }
+
+        #[test]
+        fn class_pattern_as_capture_is_narrowed_to_the_matched_member() {
+            let d = check(
+                "def describe(v: int | str | list[int]) -> str:\n    match v:\n        case int() as n if n > 100:\n            return f\"big {n}\"\n        case int() as n:\n            let k: int = n\n            return f\"small {k}\"\n        case str() as s:\n            return s.upper()\n        case list() as xs:\n            return f\"list of {len(xs)}\"\n",
+            );
+            assert!(d.errors().is_empty(), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn frozen_generic_with_a_variadic_tuple_field_is_covariant() {
+            let d = check(
+                "class Animal:\n    name: str\nclass Dog(Animal):\n    tricks: int\nclass Producer[T] frozen:\n    items: tuple[T, ...]\nimpl[T] Producer[T]:\n    def first(self) -> T:\n        return self.items[0]\ndef main() -> None:\n    let p: Producer[Dog] = Producer(items=(Dog(name=\"rex\", tricks=1),))\n    let q: Producer[Animal] = p\n    print(q.first().name)\n",
+            );
+            assert!(d.errors().is_empty(), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn an_impl_block_consumer_keeps_the_parameter_invariant() {
+            let d = check(
+                "class Animal:\n    name: str\nclass Dog(Animal):\n    tricks: int\nclass Sink[T] frozen:\n    items: tuple[T, ...]\nimpl[T] Sink[T]:\n    def accept(self, v: T) -> None:\n        print(v)\ndef main() -> None:\n    let p: Sink[Dog] = Sink(items=())\n    let q: Sink[Animal] = p\n    print(q)\n",
+            );
+            assert!(has_error(&d, mismatch), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn an_explicit_covariant_marker_overrides_inference() {
+            let d = check(
+                "class Animal:\n    name: str\nclass Dog(Animal):\n    tricks: int\n@covariant\nclass Src[T]:\n    value: T\ndef main() -> None:\n    let p: Src[Dog] = Src(value=Dog(name=\"rex\", tricks=1))\n    let q: Src[Animal] = p\n    print(q.value.name)\n",
+            );
+            assert!(d.errors().is_empty(), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn a_bare_generic_annotation_accepts_any_instantiation() {
+            let d = check("class Box[T]:\n    value: T\ndef main() -> None:\n    let b: Box = Box(value=3)\n    print(b)\n");
+            assert!(d.errors().is_empty(), "{:?}", errors_of(&d));
+        }
+
+        #[test]
+        fn a_subclass_inheriting_a_required_field_is_not_a_constants_namespace() {
+            let d = check("class Base:\n    x: int\nclass Sub(Base):\n    y: int = 0\n");
+            assert!(
+                !d.warnings()
+                    .iter()
+                    .any(|w| matches!(w, TycError::ClassAttrShadowsSlot { .. })),
+                "{:?}",
+                d.warnings()
+                    .iter()
+                    .map(|w| w.to_string())
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        fn a_raw_class_with_only_defaulted_fields_is_not_a_constants_namespace() {
+            let d = check_class_kinds("class! Cfg:\n    retries: int = 3\n");
+            assert!(
+                !d.warnings()
+                    .iter()
+                    .any(|w| matches!(w, TycError::ClassAttrShadowsSlot { .. })),
+                "{:?}",
+                d.warnings()
+                    .iter()
+                    .map(|w| w.to_string())
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 }

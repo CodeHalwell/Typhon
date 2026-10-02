@@ -159,9 +159,13 @@ pub fn run_source(
     let (mut registry, _stats) = tyc_analyse::extract_builtin_extensions(&mut module);
     // Pre-scan sibling modules for cross-module builtin extensions.
     if let Some(src_root) = origin.and_then(|p| p.parent()) {
-        let cross_module_fns =
-            merge_cross_module_extensions_for_vm(&module, src_root, &mut registry);
-        let _ = tyc_analyse::rewrite_builtin_extension_calls(&mut module, &registry);
+        let (cross_module_fns, external_facts) =
+            merge_cross_module_extensions_for_vm(&module, src_root, src_root, &mut registry);
+        let _ = tyc_analyse::rewrite_builtin_extension_calls_with_facts(
+            &mut module,
+            &registry,
+            &external_facts,
+        );
         // Inject explicit imports for cross-module extension functions
         // that were used. In the VM, these resolve to the sibling module's
         // lifted free functions when the module is loaded.
@@ -299,30 +303,148 @@ pub fn run_source(
 /// Pre-scan sibling `.ty` files referenced by the entry module's imports,
 /// extract their builtin extension registries, and merge them into `registry`.
 /// Returns a map of `fn_name → sibling_module_stem` for functions that were
-/// added from cross-module sources, so the caller can inject explicit imports.
-fn merge_cross_module_extensions_for_vm(
+/// added from cross-module sources, so the caller can inject explicit
+/// imports, plus the declared field / return types of the names those
+/// imports bind, so the call-site rewrite types `post.title` on an
+/// imported `Post`, `make()` on an imported function, or
+/// `textutil.make()` on an imported module.
+pub(crate) fn merge_cross_module_extensions_for_vm(
     module: &ruff_python_ast::ModModule,
     src_root: &Path,
+    importer_dir: &Path,
     registry: &mut tyc_analyse::ExtensionRegistry,
-) -> std::collections::HashMap<String, String> {
+) -> (
+    std::collections::HashMap<String, String>,
+    tyc_analyse::TypeFacts,
+) {
     use ruff_python_ast::Stmt;
     use std::collections::HashMap;
 
     let mut cross_fns: HashMap<String, String> = HashMap::new();
-    // Collect unique module names from import statements.
-    let mut seen_modules: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut external = tyc_analyse::TypeFacts::default();
+    // Each sibling is read once; its facts are re-keyed per import.
+    let mut loaded: HashMap<String, Option<tyc_analyse::TypeFacts>> = HashMap::new();
+    // Resolve an import to the sibling file it names and that file's
+    // absolute dotted module name (the name the injected
+    // `from <module> import __typhon_ext_…` must use). `a.b.c` is
+    // `a/b/c.ty` or the package `a/b/c/__init__.ty`; a relative
+    // `from .text import …` / `from ..kinds import …` climbs from the
+    // importing module's directory. (Dotted and relative modules were
+    // skipped outright before the 2026-09-30 review, so an extension
+    // declared in `catalogue/text.ty` was lowered by `tyc build` but
+    // raised `AttributeError` under `tyc run`.)
+    let resolve = |name: &str, level: u32| -> Option<(std::path::PathBuf, String)> {
+        let rel = name.replace('.', "/");
+        let base = if level == 0 {
+            src_root.to_path_buf()
+        } else {
+            let mut dir = importer_dir.to_path_buf();
+            for _ in 1..level {
+                dir = dir.parent()?.to_path_buf();
+            }
+            dir
+        };
+        let candidates: Vec<std::path::PathBuf> = if rel.is_empty() {
+            vec![base.join("__init__.ty")]
+        } else {
+            vec![
+                base.join(format!("{rel}.ty")),
+                base.join(&rel).join("__init__.ty"),
+            ]
+        };
+        let path = candidates.into_iter().find(|p| p.is_file())?;
+        let dotted = path
+            .strip_prefix(src_root)
+            .ok()?
+            .with_extension("")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let dotted = dotted
+            .strip_suffix("/__init__")
+            .unwrap_or(&dotted)
+            .replace('/', ".");
+        if dotted.is_empty() {
+            return None;
+        }
+        Some((path, dotted))
+    };
+    let mut load = |name: &str,
+                    level: u32,
+                    registry: &mut tyc_analyse::ExtensionRegistry,
+                    cross_fns: &mut HashMap<String, String>|
+     -> Option<tyc_analyse::TypeFacts> {
+        let (path, dotted) = resolve(name, level)?;
+        if let Some(cached) = loaded.get(&dotted) {
+            return cached.clone();
+        }
+        let facts = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| merge_sibling_extensions(&text, &dotted, registry, cross_fns));
+        loaded.insert(dotted, facts.clone());
+        facts
+    };
+    let publish_lifted = |external: &mut tyc_analyse::TypeFacts, facts: &tyc_analyse::TypeFacts| {
+        // The lifted functions' return types, so a chained cross-module
+        // call (`t.slug().shout()`) types.
+        for (fn_name, ty) in &facts.functions {
+            if fn_name.starts_with("__typhon_ext_") {
+                external.functions.insert(fn_name.clone(), ty.clone());
+            }
+        }
+    };
     for stmt in &module.body {
         match stmt {
             Stmt::ImportFrom(i) => {
-                if let Some(m) = &i.module {
-                    let name = m.id.to_string();
-                    if !name.contains('.') && seen_modules.insert(name.clone()) {
-                        let sibling_path = src_root.join(format!("{name}.ty"));
-                        if sibling_path.exists() {
-                            if let Ok(text) = std::fs::read_to_string(&sibling_path) {
-                                merge_sibling_extensions(&text, &name, registry, &mut cross_fns);
-                            }
+                let name = i.module.as_ref().map(|m| m.id.to_string());
+                let name = match (name, i.level) {
+                    (Some(n), _) => n,
+                    (None, level) if level > 0 => String::new(),
+                    (None, _) => continue,
+                };
+                // `from . import text` / `from .. import kinds`: each alias
+                // is first and foremost a *submodule* of that package, and
+                // its own extensions and facts are the ones the importing
+                // module can reach through it. Only a name the package does
+                // not have as a submodule is looked up on the package
+                // facade (`from . import Thing` re-exported by a `pub *`).
+                if name.is_empty() {
+                    for alias in &i.names {
+                        let imported = alias.name.as_str();
+                        let local = alias
+                            .asname
+                            .as_ref()
+                            .map(|a| a.as_str())
+                            .unwrap_or(imported);
+                        if let Some(sub) = load(imported, i.level, registry, &mut cross_fns) {
+                            publish_lifted(&mut external, &sub);
+                            external.modules.insert(local.to_owned(), sub);
+                        } else if let Some(pkg) = load("", i.level, registry, &mut cross_fns) {
+                            publish_lifted(&mut external, &pkg);
+                            external.import_name(&pkg, imported, local);
                         }
+                    }
+                    continue;
+                }
+                let Some(facts) = load(&name, i.level, registry, &mut cross_fns) else {
+                    continue;
+                };
+                publish_lifted(&mut external, &facts);
+                for alias in &i.names {
+                    let imported = alias.name.as_str();
+                    let local = alias
+                        .asname
+                        .as_ref()
+                        .map(|a| a.as_str())
+                        .unwrap_or(imported);
+                    if imported == "*" {
+                        external.merge(tyc_analyse::TypeFacts {
+                            functions: facts.functions.clone(),
+                            async_functions: facts.async_functions.clone(),
+                            classes: facts.classes.clone(),
+                            modules: HashMap::new(),
+                        });
+                    } else {
+                        external.import_name(&facts, imported, local);
                     }
                 }
             }
@@ -330,35 +452,37 @@ fn merge_cross_module_extensions_for_vm(
                 // Handle all aliases in `import a, b, c` — not just the first.
                 for alias in &i.names {
                     let name = alias.name.id.to_string();
-                    if !name.contains('.') && seen_modules.insert(name.clone()) {
-                        let sibling_path = src_root.join(format!("{name}.ty"));
-                        if sibling_path.exists() {
-                            if let Ok(text) = std::fs::read_to_string(&sibling_path) {
-                                merge_sibling_extensions(&text, &name, registry, &mut cross_fns);
-                            }
-                        }
-                    }
+                    let Some(facts) = load(&name, 0, registry, &mut cross_fns) else {
+                        continue;
+                    };
+                    publish_lifted(&mut external, &facts);
+                    let local = alias
+                        .asname
+                        .as_ref()
+                        .map(|a| a.as_str().to_owned())
+                        .unwrap_or_else(|| name.clone());
+                    external.modules.insert(local, facts);
                 }
             }
             _ => {}
         }
     }
-    cross_fns
+    (cross_fns, external)
 }
 
 /// Parse a sibling `.ty` source just enough to extract builtin extension
-/// sentinel classes and merge their methods into `registry`.
+/// sentinel classes and merge their methods into `registry`. Returns the
+/// sibling's declared field / return types (`None` when it does not
+/// parse), with the lifted extension functions included.
 fn merge_sibling_extensions(
     source: &str,
     module_name: &str,
     registry: &mut tyc_analyse::ExtensionRegistry,
     cross_fns: &mut std::collections::HashMap<String, String>,
-) {
+) -> Option<tyc_analyse::TypeFacts> {
     let expanded = preprocess::expand_all(source);
     let prep = preprocess::preprocess(&expanded);
-    let Ok(parsed) = tyc_syntax::parse_module(&prep.python_source) else {
-        return;
-    };
+    let parsed = tyc_syntax::parse_module(&prep.python_source).ok()?;
     let mut sibling_module = parsed.into_syntax();
     let (sibling_registry, _) = tyc_analyse::extract_builtin_extensions(&mut sibling_module);
     for (builtin_type, methods) in &sibling_registry {
@@ -370,12 +494,13 @@ fn merge_sibling_extensions(
             });
         }
     }
+    Some(tyc_analyse::collect_module_type_facts(&sibling_module))
 }
 
 /// Inject `from <module> import <fn_name>` AST nodes into `module` for
 /// cross-module extension functions. This allows the VM to resolve the
 /// lifted free functions during execution.
-fn inject_vm_cross_module_ext_imports(
+pub(crate) fn inject_vm_cross_module_ext_imports(
     module: &mut ruff_python_ast::ModModule,
     cross_fns: &std::collections::HashMap<String, String>,
     _src_root: &Path,
@@ -467,6 +592,30 @@ pub fn models_module(name: &str) -> bool {
     crate::builtins::models_module(name)
 }
 
+/// The names the VM's model of `module` exports — what `dir(module)` lists
+/// there — or `None` when the VM does not model it (an unmodelled root, or
+/// a dotted name that is not a module: `math.pi` is a float). `module` may
+/// be dotted (`os.path`, `typhon_runtime.tasks`).
+///
+/// `probe` is an interpreter kept across calls so each module is
+/// instantiated once per scan; it has no source root, so a project module
+/// never resolves through it. `tyc run`'s pre-run scan uses this to send a
+/// program that reaches for an attribute the VM lacks down the compiled
+/// path, the way an unmodelled *module* already does — so the table is the
+/// live module, never a hand-maintained list.
+pub fn modelled_module_exports(
+    probe: &mut Interpreter,
+    module: &str,
+) -> Option<std::collections::BTreeSet<String>> {
+    if !models_module(module) {
+        return None;
+    }
+    match probe.import_module(module) {
+        Ok(Value::Module(m)) => Some(crate::builtins::module_dir_names(&m)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,6 +653,663 @@ mod tests {
         }
         assert!(models_module("os.path"), "a submodule follows its root");
         assert!(models_module("collections.abc"));
+    }
+
+    // ── VM ↔ CPython parity: the 2026-09-30 release-readiness review, §6 ──
+    //
+    // Each test is a program that raises on the first value that differs
+    // from what CPython 3.13 prints for the same source (the expected values
+    // were taken from the hosting python3.13), so a green run means the VM
+    // and the compiled path agree.
+
+    /// A `.ty` program plus the sibling files it imports, run from a temp dir.
+    fn run_project(files: &[(&str, &str)], entry: &str) -> Result<i32, VmError> {
+        let dir = tempfile::tempdir().unwrap();
+        for (rel, text) in files {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+        }
+        run_file(&dir.path().join(entry), &[])
+    }
+
+    const CHECK: &str = r#"
+def check(label: str, got: object, want: object) -> None:
+    if got != want:
+        raise ValueError(f"{label}: got {got!r}, want {want!r}")
+"#;
+
+    #[test]
+    fn dotted_import_binds_each_submodule_on_its_parent() {
+        // `import a.b.c` binds `a` and sets `a.b` / `a.b.c`, as CPython's
+        // import machinery does; `import a.b as x` and `from a import b`
+        // hand back the very same module objects.
+        let code = run_project(
+            &[
+                ("shapes/__init__.ty", "pub *\n"),
+                ("shapes/kinds.ty", "pub class Circle:\n    radius: float\n"),
+                (
+                    "shapes/ops.ty",
+                    "from .kinds import Circle\n\npub def area(c: Circle) -> float:\n    return 3.0 * c.radius * c.radius\n",
+                ),
+                ("ns/inner.ty", "pub let VALUE: int = 7\n"),
+                (
+                    "main.ty",
+                    r#"
+import shapes.ops
+import shapes.kinds
+import shapes.ops as ops_alias
+from shapes import ops as ops_from
+import os.path
+import typhon_runtime.tasks
+import ns.inner
+
+c = shapes.kinds.Circle(radius=2.0)
+if shapes.ops.area(c) != 12.0:
+    raise ValueError("dotted import did not bind the submodule on its package")
+if shapes.ops.__name__ != "shapes.ops" or shapes.kinds.__name__ != "shapes.kinds":
+    raise ValueError("submodule names")
+if ops_alias is not shapes.ops or ops_from is not shapes.ops:
+    raise ValueError("one module object per submodule")
+if os.path.join("a", "b") != "a/b":
+    raise ValueError("os.path through the dotted import")
+if typhon_runtime.tasks.spawn is None:
+    raise ValueError("typhon_runtime.tasks")
+if ns.inner.VALUE != 7 or ns.__name__ != "ns":
+    raise ValueError("a namespace package (no __init__.ty) imports too")
+"#,
+                ),
+            ],
+            "main.ty",
+        );
+        assert_eq!(code.unwrap(), 0);
+    }
+
+    #[test]
+    fn map_over_several_iterables_stops_at_the_shortest() {
+        let src = format!(
+            "{CHECK}
+check(\"two\", list(map(lambda a, b: a + b, [1, 2], [10, 20, 30])), [11, 22])
+check(\"pow\", list(map(pow, [2, 3], [3, 2])), [8, 9])
+check(\"three\", list(map(max, [1, 9, 3], [4, 5, 6], [7, 0, 8])), [7, 9, 8])
+check(\"one\", list(map(lambda x: x * 2, [1, 2, 3])), [2, 4, 6])
+check(\"mixed\", list(map(lambda a, b, c: (a, b, c), \"ab\", [1, 2, 3], (True,))), [(\"a\", 1, True)])
+check(\"type\", type(map(str, [1])).__name__, \"map\")
+"
+        );
+        assert_eq!(run_capturing(&src).unwrap(), 0);
+    }
+
+    #[test]
+    fn await_rejects_a_non_awaitable_like_cpython() {
+        // `await` on anything but a coroutine, a task or an awaitable native
+        // result is CPython's TypeError, spelled with the operand's type; the
+        // VM used to hand the value back. Everything the VM does model as
+        // awaitable — including a native result stored before it is awaited
+        // — keeps working.
+        let src = format!(
+            "{CHECK}
+import asyncio
+from contextlib import asynccontextmanager, AsyncExitStack
+
+def sync_function() -> int:
+    return 3
+
+class Box:
+    v: int
+
+async def main() -> None:
+    seen: list[str] = []
+    for value in [1, \"x\", None, [1], Box(v=1), sync_function()]:
+        try:
+            await value
+        except TypeError as e:
+            seen.append(str(e))
+        else:
+            raise ValueError(\"await of a non-awaitable must raise\")
+    check(\"messages\", seen, [
+        \"object int can't be used in 'await' expression\",
+        \"object str can't be used in 'await' expression\",
+        \"object NoneType can't be used in 'await' expression\",
+        \"object list can't be used in 'await' expression\",
+        \"object Box can't be used in 'await' expression\",
+        \"object int can't be used in 'await' expression\",
+    ])
+    check(\"sleep\", await asyncio.sleep(0), None)
+    stored = asyncio.sleep(0)
+    check(\"stored sleep\", await stored, None)
+    check(\"gather\", await asyncio.gather(asyncio.sleep(0), asyncio.sleep(0)), [None, None])
+    check(\"gather kw\", await asyncio.gather(asyncio.sleep(0), return_exceptions=True), [None])
+    check(\"wait_for\", await asyncio.wait_for(asyncio.sleep(0), 1.0), None)
+    check(\"to_thread\", await asyncio.to_thread(sync_function), 3)
+    t = asyncio.create_task(asyncio.sleep(0))
+    check(\"task\", await t, None)
+    q: asyncio.Queue[int] = asyncio.Queue()
+    await q.put(5)
+    check(\"queue\", await q.get(), 5)
+    ev = asyncio.Event()
+    ev.set()
+    check(\"event\", await ev.wait(), True)
+    lock = asyncio.Lock()
+    check(\"acquire\", await lock.acquire(), True)
+    lock.release()
+    async with lock:
+        check(\"locked\", lock.locked(), True)
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(asyncio.sleep(0))
+    async with asyncio.timeout(5):
+        await asyncio.sleep(0)
+
+    @asynccontextmanager
+    async def session():
+        yield \"open\"
+
+    async with session() as s:
+        check(\"acm\", s, \"open\")
+    async with AsyncExitStack() as stack:
+        check(\"exit stack\", await stack.enter_async_context(session()), \"open\")
+        check(\"lock via stack\", await stack.enter_async_context(lock), None)
+
+asyncio.run(main())
+"
+        );
+        assert_eq!(run_capturing(&src).unwrap(), 0);
+    }
+
+    #[test]
+    fn go_outside_a_running_loop_raises_like_cpython() {
+        // `go f()` lowers to `typhon_runtime.tasks.spawn`, which is
+        // `asyncio.create_task` under CPython: outside `asyncio.run` it
+        // raises `RuntimeError: no running event loop` and the coroutine
+        // never runs. Inside the loop — from a coroutine or from a sync
+        // helper it calls — it spawns as before.
+        let src = r#"
+import asyncio
+
+ran = 0
+
+async def f() -> None:
+    global ran
+    ran += 1
+
+def kick() -> None:
+    go f()
+
+def main() -> None:
+    try:
+        kick()
+    except RuntimeError as e:
+        if str(e) != "no running event loop":
+            raise ValueError(f"wrong message: {e}")
+    else:
+        raise ValueError("go outside a running loop must raise")
+
+main()
+if ran != 0:
+    raise ValueError("the coroutine must not run when spawn fails")
+
+try:
+    asyncio.create_task(f())
+except RuntimeError as e:
+    if str(e) != "no running event loop":
+        raise ValueError(f"create_task: {e}")
+else:
+    raise ValueError("create_task outside a running loop must raise")
+
+async def inner() -> None:
+    go f()
+
+def helper() -> None:
+    go f()
+
+async def inner2() -> None:
+    helper()
+    go f() -> task
+    await task
+
+async def nested() -> None:
+    try:
+        asyncio.run(f())
+    except RuntimeError as e:
+        if str(e) != "asyncio.run() cannot be called from a running event loop":
+            raise ValueError(f"nested: {e}")
+    else:
+        raise ValueError("nested asyncio.run must raise")
+
+asyncio.run(inner())
+asyncio.run(inner2())
+asyncio.run(nested())
+if ran != 3:
+    raise ValueError(f"expected 3 spawns inside the loop, got {ran}")
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn math_gains_the_missing_names_value_for_value() {
+        let src = format!(
+            "{CHECK}
+import math
+
+def r(x: float) -> str:
+    return repr(x)
+
+check(\"gamma(0.5)\", r(math.gamma(0.5)), \"1.7724538509055159\")
+check(\"gamma(5)\", r(math.gamma(5)), \"24.0\")
+check(\"gamma(-2.5)\", r(math.gamma(-2.5)), \"-0.9453087204829417\")
+check(\"gamma(170.5)\", r(math.gamma(170.5)), \"5.56209241456e+305\")
+check(\"gamma(1e-5)\", r(math.gamma(1e-5)), \"99999.42279422554\")
+check(\"gamma(inf)\", r(math.gamma(math.inf)), \"inf\")
+check(\"lgamma(3)\", r(math.lgamma(3)), \"0.693147180559945\")
+check(\"lgamma(0.5)\", r(math.lgamma(0.5)), \"0.5723649429247004\")
+check(\"lgamma(-2.5)\", r(math.lgamma(-2.5)), \"-0.05624371649767457\")
+check(\"lgamma(1e5)\", r(math.lgamma(1e5)), \"1051287.7089736566\")
+check(\"lgamma(1e-5)\", r(math.lgamma(1e-5)), \"11.512919692895824\")
+check(\"lgamma(-inf)\", r(math.lgamma(-math.inf)), \"inf\")
+check(\"erf(0.5)\", r(math.erf(0.5)), \"0.5204998778130465\")
+check(\"erfc(0.5)\", r(math.erfc(0.5)), \"0.4795001221869535\")
+check(\"erf(-2)\", r(math.erf(-2)), \"-0.9953222650189527\")
+check(\"erfc(3.5)\", r(math.erfc(3.5)), \"7.430983723414128e-07\")
+check(\"sinh\", r(math.sinh(1.5)), \"2.1292794550948173\")
+check(\"cosh\", r(math.cosh(1.5)), \"2.352409615243247\")
+check(\"tanh\", r(math.tanh(1.5)), \"0.9051482536448664\")
+check(\"asinh\", r(math.asinh(1.5)), \"1.1947632172871094\")
+check(\"acosh\", r(math.acosh(1.5)), \"0.9624236501192069\")
+check(\"atanh\", r(math.atanh(0.5)), \"0.5493061443340548\")
+check(\"cbrt(27)\", r(math.cbrt(27)), \"3.0000000000000004\")
+check(\"cbrt(-8.0)\", r(math.cbrt(-8.0)), \"-2.0\")
+check(\"exp2(10)\", r(math.exp2(10)), \"1024.0\")
+check(\"exp2(0.5)\", r(math.exp2(0.5)), \"1.4142135623730951\")
+check(\"fma\", r(math.fma(2, 3, 4)), \"10.0\")
+check(\"fma small\", r(math.fma(0.1, 10, -1)), \"5.551115123125783e-17\")
+check(\"frexp\", [math.frexp(8.0), math.frexp(-3.5), math.frexp(5e-324), math.frexp(1e-310), math.frexp(0.0), math.frexp(math.inf)], [(0.5, 4), (-0.875, 2), (0.5, -1073), (0.5752618031559393, -1029), (0.0, 0), (math.inf, 0)])
+check(\"ldexp\", [r(math.ldexp(1.5, -1074)), r(math.ldexp(1e-300, 1100)), r(math.ldexp(3, 4)), r(math.ldexp(True, 1)), r(math.ldexp(1, -2**70)), r(math.ldexp(0.0, 2**70))], [\"1e-323\", \"1.3582985290493859e+31\", \"48.0\", \"2.0\", \"0.0\", \"0.0\"])
+check(\"modf\", [math.modf(3.75), math.modf(-3.75), math.modf(math.inf), math.modf(-math.inf)], [(0.75, 3.0), (-0.75, -3.0), (0.0, math.inf), (-0.0, -math.inf)])
+check(\"modf(-0.0)\", repr(math.modf(-0.0)), \"(-0.0, -0.0)\")
+check(\"nextafter\", [r(math.nextafter(1.0, 2.0)), r(math.nextafter(1.0, 0.0)), r(math.nextafter(0.0, 1.0)), r(math.nextafter(0.0, -1.0)), r(math.nextafter(1, 2, steps=3)), r(math.nextafter(1, 0, steps=2**80)), r(math.nextafter(-0.0, 0.0)), r(math.nextafter(1, 2, steps=0))], [\"1.0000000000000002\", \"0.9999999999999999\", \"5e-324\", \"-5e-324\", \"1.0000000000000007\", \"0.0\", \"0.0\", \"1.0\"])
+check(\"ulp\", [r(math.ulp(1.0)), r(math.ulp(0.0)), r(math.ulp(-2.5)), r(math.ulp(1.7976931348623157e308)), r(math.ulp(3))], [\"2.220446049250313e-16\", \"5e-324\", \"4.440892098500626e-16\", \"1.99584030953472e+292\", \"4.440892098500626e-16\"])
+check(\"isclose\", [math.isclose(1.0, 1.0000000001), math.isclose(1, 1.1), math.isclose(1, 1.1, rel_tol=0.2), math.isclose(0.0, 1e-10, abs_tol=1e-9), math.isclose(math.inf, math.inf), math.isclose(math.nan, math.nan), math.isclose(math.inf, 1e308), math.isclose(3, 3)], [True, False, True, True, True, False, False, True])
+check(\"sumprod\", [math.sumprod([1, 2, 3], [4, 5, 6]), r(math.sumprod([1.5, 2], [2, 3.5])), r(math.sumprod([0.1] * 10, [0.1] * 10)), r(math.sumprod([2**70, 1], [1, 2.5])), r(math.sumprod([True], [1.5])), r(math.sumprod((1, 2), [3.0, 4.0])), math.sumprod([], []), r(math.sumprod([1e16, 1.0, -1e16], [1.0, 1.0, 1.0]))], [32, \"10.0\", \"0.1\", \"1.1805916207174113e+21\", \"1.5\", \"11.0\", 0, \"1.0\"])
+if not math.isnan(math.sumprod([1e308, 1e308], [10, -10])):
+    raise ValueError(\"sumprod overflow must be nan\")
+
+def expect(label: str, kind: str, message: str, thunk: object) -> None:
+    try:
+        thunk()
+    except Exception as e:
+        if type(e).__name__ != kind or str(e) != message:
+            raise ValueError(f\"{{label}}: got {{type(e).__name__}}: {{e}}\")
+    else:
+        raise ValueError(f\"{{label}}: did not raise\")
+
+expect(\"gamma(1000)\", \"OverflowError\", \"math range error\", lambda: math.gamma(1000))
+expect(\"gamma(-1)\", \"ValueError\", \"math domain error\", lambda: math.gamma(-1))
+expect(\"gamma(0.0)\", \"ValueError\", \"math domain error\", lambda: math.gamma(0.0))
+expect(\"gamma(-inf)\", \"ValueError\", \"math domain error\", lambda: math.gamma(-math.inf))
+expect(\"gamma(1e-320)\", \"OverflowError\", \"math range error\", lambda: math.gamma(1e-320))
+expect(\"lgamma(0)\", \"ValueError\", \"math domain error\", lambda: math.lgamma(0))
+expect(\"lgamma(1e308)\", \"OverflowError\", \"math range error\", lambda: math.lgamma(1e308))
+expect(\"exp2(2000)\", \"OverflowError\", \"math range error\", lambda: math.exp2(2000))
+expect(\"cosh(1000)\", \"OverflowError\", \"math range error\", lambda: math.cosh(1000))
+expect(\"acosh(0.5)\", \"ValueError\", \"math domain error\", lambda: math.acosh(0.5))
+expect(\"atanh(1)\", \"ValueError\", \"math domain error\", lambda: math.atanh(1))
+expect(\"fma overflow\", \"OverflowError\", \"overflow in fma\", lambda: math.fma(1e308, 10, 0))
+expect(\"fma invalid\", \"ValueError\", \"invalid operation in fma\", lambda: math.fma(math.inf, 0, 1))
+expect(\"ldexp float exp\", \"TypeError\", \"Expected an int as second argument to ldexp.\", lambda: math.ldexp(1, 2.0))
+expect(\"ldexp range\", \"OverflowError\", \"math range error\", lambda: math.ldexp(1, 2000))
+expect(\"nextafter negative steps\", \"ValueError\", \"steps must be a non-negative integer\", lambda: math.nextafter(1, 2, steps=-1))
+expect(\"isclose negative tol\", \"ValueError\", \"tolerances must be non-negative\", lambda: math.isclose(1, 2, rel_tol=-1))
+expect(\"isclose positional tol\", \"TypeError\", \"isclose() takes exactly 2 positional arguments (3 given)\", lambda: math.isclose(1, 2, 0.5))
+expect(\"sumprod length\", \"ValueError\", \"Inputs are not the same length\", lambda: math.sumprod([1, 2], [1]))
+"
+        );
+        assert_eq!(run_capturing(&src).unwrap(), 0);
+    }
+
+    #[test]
+    fn re_exports_flag_aliases_classes_and_error() {
+        let src = format!(
+            "{CHECK}
+import re
+
+check(\"aliases\", [re.A, re.I, re.L, re.M, re.S, re.U, re.X, re.NOFLAG, re.DEBUG], [256, 2, 4, 8, 16, 32, 64, 0, 128])
+check(\"alias identity\", [re.A == re.ASCII, re.I == re.IGNORECASE, re.L == re.LOCALE, re.M == re.MULTILINE, re.S == re.DOTALL, re.U == re.UNICODE, re.X == re.VERBOSE], [True] * 7)
+check(\"RegexFlag\", [re.RegexFlag(2), int(re.I | re.M)], [2, 10])
+m = re.match(r\"(\\d+)\", \"12ab\")
+p = re.compile(\"x\")
+check(\"classes\", [isinstance(m, re.Match), isinstance(p, re.Pattern), type(m) is re.Match, type(p) is re.Pattern, type(m).__name__, type(p).__name__, re.error is re.PatternError], [True, True, True, True, \"Match\", \"Pattern\", True])
+try:
+    re.compile(\"(\")
+except re.error as e:
+    check(\"error attrs\", [isinstance(e, Exception), isinstance(e, re.PatternError), e.pattern, e.pos], [True, True, \"(\", None])
+else:
+    raise ValueError(\"re.compile('(') must raise re.error\")
+try:
+    re.compile(\"(\")
+except Exception as e:
+    check(\"error type\", type(e).__name__, \"PatternError\")
+check(\"flags\", [re.findall(\"a\", \"AaA\", re.I), re.compile(\"^b\", re.M).findall(\"a\\nb\"), re.compile(\"a.b\", re.S).match(\"a\\nb\") is not None, re.compile(\"a b # c\", re.X).match(\"ab\") is not None, re.sub(\"a\", \"x\", \"AaA\", flags=re.I), re.split(\"A\", \"aAa\", flags=re.I), re.compile(\"A\", re.I).sub(\"x\", \"aAa\", count=1), re.compile(\"a\", flags=re.I).pattern, re.compile(\"a\", flags=re.I).flags], [[\"A\", \"a\", \"A\"], [\"b\"], True, True, \"xxx\", [\"\", \"\", \"\", \"\"], \"xAa\", \"a\", 2])
+check(\"pattern methods\", [re.compile(\"b\").fullmatch(\"b\") is not None, re.compile(\"b\").fullmatch(\"bb\") is None, re.compile(\"b\").search(\"abc\", 1).start(), re.compile(\"b\").match(\"abc\", pos=1) is not None, re.compile(\"c\").search(\"abc\", 0, 2) is None, re.compile(r\"(?P<w>\\w)\").groupindex, re.compile(\"(a)(b)\").groups], [True, True, 1, True, True, {{\"w\": 1}}, 2])
+"
+        );
+        assert_eq!(run_capturing(&src).unwrap(), 0);
+    }
+
+    #[test]
+    fn heapq_gains_heappushpop_heapreplace_and_merge() {
+        let src = format!(
+            "{CHECK}
+import heapq
+
+h = [5, 1, 8]
+heapq.heapify(h)
+check(\"heappushpop\", [heapq.heappushpop(h, 0), heapq.heappushpop(h, 7), h], [0, 1, [5, 7, 8]])
+check(\"heapreplace\", [heapq.heapreplace(h, 2), h], [5, [2, 7, 8]])
+check(\"merge\", [list(heapq.merge([1, 4, 7], [2, 3, 9], [0, 8])), list(heapq.merge([9, 4], [7, 3, 1], reverse=True)), list(heapq.merge([\"ab\", \"c\"], [\"b\", \"dd\"], key=len)), list(heapq.merge([(1, \"a\"), (2, \"a\")], [(1, \"b\")], key=lambda t: t[0])), list(heapq.merge())], [[0, 1, 2, 3, 4, 7, 8, 9], [9, 7, 4, 3, 1], [\"b\", \"ab\", \"c\", \"dd\"], [(1, \"a\"), (1, \"b\"), (2, \"a\")], []])
+try:
+    heapq.heapreplace([], 1)
+except IndexError as e:
+    check(\"heapreplace empty\", str(e), \"index out of range\")
+else:
+    raise ValueError(\"heapreplace on an empty heap must raise\")
+"
+        );
+        assert_eq!(run_capturing(&src).unwrap(), 0);
+    }
+
+    #[test]
+    fn functools_gains_update_wrapper_partialmethod_singledispatchmethod() {
+        let src = format!(
+            "{CHECK}
+import functools
+from functools import partialmethod, singledispatchmethod, update_wrapper
+
+check(\"WRAPPER\", [functools.WRAPPER_ASSIGNMENTS, functools.WRAPPER_UPDATES], [(\"__module__\", \"__name__\", \"__qualname__\", \"__doc__\", \"__annotations__\", \"__type_params__\"), (\"__dict__\",)])
+
+def original(x: int) -> int:
+    \"\"\"doc of original\"\"\"
+    return x + 1
+
+def wrapper(*args: object, **kwargs: object) -> object:
+    return original(*args, **kwargs)
+
+update_wrapper(wrapper, original)
+check(\"update_wrapper\", [wrapper.__name__, wrapper.__doc__, wrapper.__wrapped__ is original, wrapper(1)], [\"original\", \"doc of original\", True, 2])
+
+plain class Cell:
+    def __init__(self, base: int) -> None:
+        self.base = base
+
+    def scaled(self, factor: int, offset: int = 0) -> int:
+        return self.base * factor + offset
+
+    double = partialmethod(scaled, 2)
+    shifted = partialmethod(scaled, 1, offset=10)
+
+c = Cell(5)
+check(\"partialmethod\", [c.double(), c.shifted(), c.double(offset=1), Cell.double(c)], [10, 15, 11, 10])
+
+plain class Negotiator:
+    @singledispatchmethod
+    def handle(self, arg: object) -> str:
+        return \"object\"
+
+    @handle.register(int)
+    def _(self, arg: int) -> str:
+        return f\"int {{arg}}\"
+
+    @handle.register(str)
+    def _(self, arg: str) -> str:
+        return f\"str {{arg}}\"
+
+n = Negotiator()
+check(\"singledispatchmethod\", [n.handle(1), n.handle(\"a\"), n.handle(1.5)], [\"int 1\", \"str a\", \"object\"])
+"
+        );
+        assert_eq!(run_capturing(&src).unwrap(), 0);
+    }
+
+    #[test]
+    fn contextlib_gains_abstract_bases_decorators_chdir_aclosing_and_async_exit_stack() {
+        let src = format!(
+            "{CHECK}
+import os
+import asyncio
+from contextlib import AbstractContextManager, AbstractAsyncContextManager, ContextDecorator, AsyncContextDecorator, chdir, aclosing, AsyncExitStack, contextmanager
+
+events: list[str] = []
+log: list[str] = []
+order: list[str] = []
+
+plain class Tracker(ContextDecorator):
+    def __enter__(self) -> object:
+        events.append(\"enter\")
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        events.append(\"exit\")
+        return False
+
+@Tracker()
+def work() -> int:
+    events.append(\"work\")
+    return 42
+
+check(\"ContextDecorator\", [work(), events], [42, [\"enter\", \"work\", \"exit\"]])
+
+plain class Managed(AbstractContextManager):
+    pass
+
+with Managed() as m:
+    check(\"AbstractContextManager\", isinstance(m, Managed), True)
+
+here = os.getcwd()
+with chdir(\"/\"):
+    check(\"chdir inside\", os.getcwd(), \"/\")
+check(\"chdir restored\", os.getcwd(), here)
+
+plain class Closer:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+plain class ATracker(AsyncContextDecorator):
+    async def __aenter__(self) -> object:
+        log.append(\"aenter\")
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        log.append(\"aexit\")
+        return False
+
+plain class AManaged(AbstractAsyncContextManager):
+    pass
+
+@ATracker()
+async def awork() -> int:
+    log.append(\"awork\")
+    return 7
+
+@contextmanager
+def sync_cm(tag: str):
+    order.append(f\"+{{tag}}\")
+    yield tag
+    order.append(f\"-{{tag}}\")
+
+async def acallback(tag: str) -> None:
+    order.append(f\"cb {{tag}}\")
+
+async def main() -> None:
+    closer = Closer()
+    async with aclosing(closer) as c:
+        check(\"aclosing yields\", c is closer, True)
+    check(\"aclosing closed\", closer.closed, True)
+    check(\"AsyncContextDecorator\", [await awork(), log], [7, [\"aenter\", \"awork\", \"aexit\"]])
+    async with AManaged() as am:
+        check(\"AbstractAsyncContextManager\", isinstance(am, AManaged), True)
+    log.clear()
+    async with AsyncExitStack() as stack:
+        a = stack.enter_context(sync_cm(\"a\"))
+        b = await stack.enter_async_context(ATracker())
+        stack.push_async_callback(acallback, \"z\")
+        stack.callback(order.append, \"sync cb\")
+        check(\"stack values\", [a, isinstance(b, ATracker)], [\"a\", True])
+    check(\"stack order\", order, [\"+a\", \"sync cb\", \"cb z\", \"-a\"])
+    check(\"stack async exit\", log, [\"aenter\", \"aexit\"])
+
+asyncio.run(main())
+"
+        );
+        assert_eq!(run_capturing(&src).unwrap(), 0);
+    }
+
+    #[test]
+    fn operator_gains_in_place_ops_index_inv_call() {
+        let src = format!(
+            "{CHECK}
+import operator
+
+xs = [1]
+check(\"iadd list\", [operator.iadd(xs, [2]), xs], [[1, 2], [1, 2]])
+check(\"iadd int\", operator.iadd(1, 2), 3)
+check(\"in-place\", [operator.isub(5, 2), operator.imul(3, 4), operator.itruediv(7, 2), operator.ifloordiv(7, 2), operator.imod(7, 3), operator.ipow(2, 5), operator.ilshift(1, 3), operator.irshift(16, 2), operator.iand(6, 3), operator.ior(4, 1), operator.ixor(6, 3), operator.iconcat([1], [2])], [3, 12, 3.5, 3, 1, 32, 8, 4, 2, 5, 5, [1, 2]])
+check(\"index/inv/call\", [operator.index(5), operator.index(True), operator.inv(5), operator.call(max, 1, 2, 3), operator.call(str.upper, \"a\")], [5, True, -6, 3, \"A\"])
+try:
+    operator.iconcat(1, 2)
+except TypeError as e:
+    check(\"iconcat error\", str(e), \"'int' object can't be concatenated\")
+else:
+    raise ValueError(\"iconcat on ints must raise\")
+try:
+    operator.index(1.5)
+except TypeError as e:
+    check(\"index error\", str(e), \"'float' object cannot be interpreted as an integer\")
+else:
+    raise ValueError(\"index on a float must raise\")
+"
+        );
+        assert_eq!(run_capturing(&src).unwrap(), 0);
+    }
+
+    #[test]
+    fn collections_gains_user_dict_list_and_string() {
+        let src = format!(
+            "{CHECK}
+from collections import UserDict, UserList, UserString
+
+plain class Registry(UserDict):
+    def __missing__(self, key: str) -> str:
+        return f\"<{{key}}>\"
+
+r = Registry({{\"a\": 1}}, b=2)
+r[\"c\"] = 3
+check(\"UserDict\", [len(r), r[\"a\"], r[\"zzz\"], sorted(r.keys()), \"b\" in r, r.get(\"nope\"), dict(r.items()) == {{\"a\": 1, \"b\": 2, \"c\": 3}}, repr(UserDict({{\"x\": 1}}))], [3, 1, \"<zzz>\", [\"a\", \"b\", \"c\"], True, None, True, \"{{'x': 1}}\"])
+del r[\"a\"]
+check(\"UserDict del\", sorted(r), [\"b\", \"c\"])
+check(\"UserDict or\", dict(UserDict({{\"a\": 1}}) | {{\"b\": 2}}), {{\"a\": 1, \"b\": 2}})
+check(\"UserDict fromkeys\", dict(UserDict.fromkeys([\"x\", \"y\"], 0)), {{\"x\": 0, \"y\": 0}})
+
+ul = UserList([3, 1, 2])
+ul.append(0)
+ul.sort()
+check(\"UserList\", [list(ul), len(ul), ul[0], list(ul[1:]), isinstance(ul[1:], UserList), ul == [0, 1, 2, 3], list(ul + [9]), list(ul * 2)[:5], 2 in ul, ul.index(3), repr(ul)], [[0, 1, 2, 3], 4, 0, [1, 2, 3], True, True, [0, 1, 2, 3, 9], [0, 1, 2, 3, 0], True, 3, \"[0, 1, 2, 3]\"])
+ul += [7]
+ul.extend(UserList([8]))
+check(\"UserList mutation\", [list(ul), ul.pop(), list(ul)], [[0, 1, 2, 3, 7, 8], 8, [0, 1, 2, 3, 7]])
+
+us = UserString(\"Hello\")
+check(\"UserString\", [str(us), len(us), us.upper().data, isinstance(us.upper(), UserString), (us + \"!\").data, us == \"Hello\", us < \"Zebra\", \"ell\" in us, us[1:3].data, us.replace(\"l\", \"L\").data, us.split(\"l\"), us.find(\"l\"), repr(us), int(UserString(\"42\")), us * 2 == \"HelloHello\", us.startswith(\"He\"), us.isalpha()], [\"Hello\", 5, \"HELLO\", True, \"Hello!\", True, True, True, \"el\", \"HeLLo\", [\"He\", \"\", \"o\"], 2, \"'Hello'\", 42, True, True, True])
+"
+        );
+        assert_eq!(run_capturing(&src).unwrap(), 0);
+    }
+
+    #[test]
+    fn hashlib_gains_sha3_pbkdf2_hmac_and_file_digest() {
+        let src = format!(
+            "{CHECK}
+import hashlib
+import io
+
+check(\"sha3\", [hashlib.sha3_224(b\"abc\").hexdigest(), hashlib.sha3_256(b\"\").hexdigest(), hashlib.sha3_384(b\"abc\").hexdigest(), hashlib.sha3_512(b\"abc\").hexdigest(), hashlib.sha3_256(b\"a\" * 200).hexdigest(), hashlib.sha3_256(b\"b\" * 136).hexdigest(), hashlib.sha3_256(b\"b\" * 135).hexdigest(), hashlib.new(\"sha3_256\", b\"\").hexdigest()], [\"e642824c3f8cf24ad09234ee7d3c766fc9a3a5168d0c94ad73b46fdf\", \"a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a\", \"ec01498288516fc926459f58e2c6ad8df9b473cb0fc08c2596da7cf0e49be4b298d88cea927ac7f539f1edf228376d25\", \"b751850b1a57168a5693cd924b6b096e08f621827444f70d884f5d0240d2712e10e116e9192af3c91a7ec57647e3934057340b4cf408d5a56592f8274eec53f0\", \"cce34485baf2bf2aca99b94833892a4f52896d3d153f7b840cc4f9fe695f1387\", \"491d43679ebf9eeb191b33432034caebed97df8be9125a6db9b133c7ce660ca7\", \"bbcfe2803f2108ca1d38b9f9f5499cec8535096c9156e895817b60f407e229f4\", \"a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a\"])
+check(\"sha3 sizes\", [(h().digest_size, h().block_size, h().name) for h in (hashlib.sha3_224, hashlib.sha3_256, hashlib.sha3_384, hashlib.sha3_512)], [(28, 144, \"sha3_224\"), (32, 136, \"sha3_256\"), (48, 104, \"sha3_384\"), (64, 72, \"sha3_512\")])
+check(\"pbkdf2\", [hashlib.pbkdf2_hmac(\"sha256\", b\"password\", b\"salt\", 1000).hex(), hashlib.pbkdf2_hmac(\"sha1\", b\"password\", b\"salt\", 2, 40).hex(), hashlib.pbkdf2_hmac(\"sha512\", b\"pw\", b\"na\", 1).hex(), hashlib.pbkdf2_hmac(\"sha3_256\", b\"pw\", b\"na\", 3, dklen=20).hex()], [\"632c2812e46d4604102ba7618e9d6d7d2f8128f6266b4a03264d2a0460b7dcb3\", \"ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957cae93136266537a8d7bf4b76c51094cc1ae010b1\", \"d1271dbcae53c2502c92308b2f4b75bc5f0cd4ff05ed918cb94fca074dbddeef9b4c1b493bb04f20ee8cce9497701efd5d5d486614a851c61192b516f918fac7\", \"133280d8cb9acf41c441f241844430bd991aac03\"])
+check(\"file_digest\", [hashlib.file_digest(io.BytesIO(b\"hello world\"), \"sha256\").hexdigest(), hashlib.file_digest(io.BytesIO(b\"hello world\"), hashlib.sha256).hexdigest()], [\"b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9\", \"b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9\"])
+
+def expect(label: str, kind: str, message: str, thunk: object) -> None:
+    try:
+        thunk()
+    except Exception as e:
+        if type(e).__name__ != kind or str(e) != message:
+            raise ValueError(f\"{{label}}: got {{type(e).__name__}}: {{e}}\")
+    else:
+        raise ValueError(f\"{{label}}: did not raise\")
+
+expect(\"0 iterations\", \"ValueError\", \"iteration value must be greater than 0.\", lambda: hashlib.pbkdf2_hmac(\"sha256\", b\"p\", b\"s\", 0))
+expect(\"dklen 0\", \"ValueError\", \"key length must be greater than 0.\", lambda: hashlib.pbkdf2_hmac(\"sha256\", b\"p\", b\"s\", 1, 0))
+expect(\"str password\", \"TypeError\", \"a bytes-like object is required, not 'str'\", lambda: hashlib.pbkdf2_hmac(\"sha256\", \"p\", b\"s\", 1))
+expect(\"float iterations\", \"TypeError\", \"'float' object cannot be interpreted as an integer\", lambda: hashlib.pbkdf2_hmac(\"sha256\", b\"p\", b\"s\", 1.5))
+expect(\"unknown digest\", \"ValueError\", \"unsupported hash type nope\", lambda: hashlib.pbkdf2_hmac(\"nope\", b\"p\", b\"s\", 1))
+"
+        );
+        assert_eq!(run_capturing(&src).unwrap(), 0);
+    }
+
+    #[test]
+    fn descriptor_get_is_honoured_on_class_attributes() {
+        // A descriptor object stored as a class attribute is read through
+        // its `__get__`, on the instance and on the class — the protocol
+        // `partialmethod` / `singledispatchmethod` rest on.
+        let src = format!(
+            "{CHECK}
+plain class Desc:
+    def __init__(self, tag: str) -> None:
+        self.tag = tag
+
+    def __get__(self, obj: object, owner: object = None) -> str:
+        return f\"{{self.tag}}:{{obj is None}}:{{owner.__name__}}\"
+
+plain class Host:
+    a = Desc(\"assigned\")
+
+check(\"descriptor\", [Host().a, Host.a], [\"assigned:False:Host\", \"assigned:True:Host\"])
+"
+        );
+        assert_eq!(run_capturing(&src).unwrap(), 0);
+    }
+
+    /// The pre-run scan asks the VM what each modelled module exports; the
+    /// answer is the live module's `dir()`, never a hand-written table.
+    #[test]
+    fn modelled_module_exports_lists_a_modules_live_names() {
+        let mut probe = Interpreter::new();
+        let math = modelled_module_exports(&mut probe, "math").expect("math is modelled");
+        for name in ["isclose", "nextafter", "sumprod", "gamma", "pi"] {
+            assert!(math.contains(name), "math.{name}");
+        }
+        let os_path = modelled_module_exports(&mut probe, "os.path").expect("os.path is modelled");
+        assert!(os_path.contains("join"));
+        let sys = modelled_module_exports(&mut probe, "sys").expect("sys is modelled");
+        assert!(sys.contains("modules") && sys.contains("argv"));
+        let tasks = modelled_module_exports(&mut probe, "typhon_runtime.tasks")
+            .expect("typhon_runtime.tasks is modelled");
+        assert!(tasks.contains("spawn"));
+        let re = modelled_module_exports(&mut probe, "re").expect("re is modelled");
+        assert!(re.contains("I") && re.contains("Match") && !re.contains("purge"));
+        assert_eq!(modelled_module_exports(&mut probe, "sqlite3"), None);
+        assert_eq!(
+            modelled_module_exports(&mut probe, "math.pi"),
+            None,
+            "a non-module member is not a module"
+        );
+        for name in crate::builtins::MODELLED_MODULE_ROOTS {
+            assert!(
+                modelled_module_exports(&mut probe, name).is_some_and(|names| !names.is_empty()),
+                "`{name}` must answer with its names"
+            );
+        }
     }
 
     #[test]
@@ -1388,6 +2194,116 @@ extend str:
 
 let s: str = "Hello World"
 print(s.slug())
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn finditer_with_pos_reports_offsets_in_the_original_string() {
+        // PR #488 review: `finditer(s, pos)` searched a slice, so `span()`
+        // was relative to the slice. Empty matches still advance.
+        let src = r#"
+import re
+let spans = [m.span() for m in re.compile("a").finditer("aXa", 1)]
+if spans != [(2, 3)]:
+    raise ValueError(str(spans))
+let starts = [m.start() for m in re.compile("").finditer("ab", 1)]
+if starts != [1, 2]:
+    raise ValueError(str(starts))
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn starred_typed_unpack_keeps_pythons_arity_rule() {
+        // PR #488 review: the slice-based lowering bound `first` and `last`
+        // to the same element of a one-element sequence; the starred
+        // assignment it lowers through now raises as Python does.
+        let src = r#"
+def f(xs: list[int]) -> int:
+    let (first: int, *rest, last: int) = xs
+    return first + last + len(rest)
+
+if f([1, 2, 3, 4]) != 7:
+    raise ValueError("wrong arithmetic")
+try:
+    f([1])
+    raise AssertionError("no error")
+except ValueError as e:
+    if "not enough values to unpack" not in str(e):
+        raise AssertionError(str(e))
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn user_dict_pop_rejects_a_second_default() {
+        let src = r#"
+from collections import UserDict
+let d = UserDict({"a": 1})
+try:
+    d.pop("x", 1, 2)
+    raise AssertionError("accepted")
+except TypeError as e:
+    if "takes from 2 to 3 positional arguments" not in str(e):
+        raise AssertionError(str(e))
+if d.pop("a") != 1 or d.pop("zz", 5) != 5:
+    raise AssertionError("pop")
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn exit_stack_push_accepts_a_context_manager() {
+        let src = r#"
+from contextlib import ExitStack
+mut log: list[str] = []
+class Res:
+    name: str
+impl Res:
+    def __enter__(self) -> Res:
+        return self
+    def __exit__(self, et, ev, tb) -> bool:
+        log.append("exit " + self.name)
+        return False
+with ExitStack() as stack:
+    stack.push(Res(name="a"))
+    stack.callback(lambda: log.append("cb"))
+if log != ["cb", "exit a"]:
+    raise AssertionError(str(log))
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn extend_builtin_attribute_and_call_receivers_dispatch() {
+        // docs/release-readiness-review-2026-09-30.md §5: an extension
+        // method called on an attribute (`p.title.slug()`), a call
+        // (`make().slug()`), an `impl` method call (`p.url().slug()`) or a
+        // chained extension call (`make().slug().slug()`) was never
+        // lowered, so the VM raised `AttributeError` like CPython did.
+        let src = r#"
+extend str:
+    def slug(self) -> str:
+        return self.lower().replace(" ", "-")
+
+class Post:
+    title: str
+
+impl Post:
+    def url(self) -> str:
+        return self.title.slug()
+
+def make() -> str:
+    return "A B"
+
+def main() -> None:
+    let p: Post = Post(title="Hello World")
+    let out: list[str] = [p.url(), make().slug(), p.title.slug(), p.url().slug(), make().slug().slug()]
+    if out != ["hello-world", "a-b", "hello-world", "hello-world", "a-b"]:
+        raise ValueError(str(out))
+
+main()
 "#;
         assert_eq!(run_capturing(src).unwrap(), 0);
     }

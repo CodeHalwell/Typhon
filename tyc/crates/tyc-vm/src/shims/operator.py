@@ -188,3 +188,99 @@ class methodcaller:
 
     def __call__(self, obj):
         return getattr(obj, self._name)(*self._args, **self._kwargs)
+
+
+# ── in-place operators, `index` / `inv` / `call` ────────────────────────────
+# The in-place forms return their (possibly rebound) left operand, exactly as
+# CPython's `operator.py` spells them: `a += b` mutates a list in place and
+# rebinds an int.
+
+
+def iadd(a, b):
+    a += b
+    return a
+
+
+def iand(a, b):
+    a &= b
+    return a
+
+
+def iconcat(a, b):
+    if not hasattr(a, "__getitem__"):
+        msg = "'%s' object can't be concatenated" % type(a).__name__
+        raise TypeError(msg)
+    a += b
+    return a
+
+
+def ifloordiv(a, b):
+    a //= b
+    return a
+
+
+def ilshift(a, b):
+    a <<= b
+    return a
+
+
+def imatmul(a, b):
+    a @= b
+    return a
+
+
+def imod(a, b):
+    a %= b
+    return a
+
+
+def imul(a, b):
+    a *= b
+    return a
+
+
+def ior(a, b):
+    a |= b
+    return a
+
+
+def ipow(a, b):
+    a **= b
+    return a
+
+
+def irshift(a, b):
+    a >>= b
+    return a
+
+
+def isub(a, b):
+    a -= b
+    return a
+
+
+def itruediv(a, b):
+    a /= b
+    return a
+
+
+def ixor(a, b):
+    a ^= b
+    return a
+
+
+def index(a):
+    if isinstance(a, int):
+        return a
+    method = getattr(a, "__index__", None)
+    if method is None:
+        raise TypeError("'%s' object cannot be interpreted as an integer" % type(a).__name__)
+    return method()
+
+
+def inv(a):
+    return ~a
+
+
+def call(obj, /, *args, **kwargs):
+    return obj(*args, **kwargs)

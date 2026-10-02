@@ -1,0 +1,39 @@
+from collections.abc import Callable
+
+from shapes import Shape, Circle, Rect, Tri, ShapeId, Kind, area, scale
+from catalogue import Catalogue, label
+from catalogue.text import describe
+
+
+def build() -> Catalogue:
+    let cat: Catalogue = Catalogue(shapes={})
+    cat.add(Circle(r=1.0))
+    cat.add(Rect(w=2.0, h=3.0))
+    cat.add(Tri(a=3.0, b=4.0, c=5.0))
+    return cat
+
+
+def report(cat: Catalogue, sid: ShapeId) -> Result[str, str]:
+    with s = cat.require(sid)?:
+        return Ok(f"{label(s)}: {area(s):.2f}")
+    else err:
+        return Err(f"lookup failed: {err}")
+
+
+def main() -> None:
+    let cat: Catalogue = build()
+    for n in range(1, 5):
+        match report(cat, ShapeId(n)):
+            case Ok(line):
+                print(line)
+            case Err(msg):
+                print("error:", msg)
+    let big: Callable[[Shape], bool] = lambda s: area(s) > 5.0
+    for s in cat.find(big):
+        print("big", describe(s).slug(), Kind.BOXY.name)
+    let doubled: Shape = scale(Circle(r=1.0), 2.0)
+    print(f"{area(doubled):.2f}", f"total={cat.total_area():.2f}")
+    print(cat.summary())
+
+
+main()

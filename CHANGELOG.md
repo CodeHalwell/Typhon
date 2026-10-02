@@ -6,9 +6,181 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ## Unreleased — beta readiness
 
-Two waves on top of alpha.9. The first was the release-readiness review
-remediation described below; the second closed the backlog that review
-deferred, and is summarised here.
+Three waves on top of alpha.9. The first was the beta-readiness review
+remediation described further down; the second closed the backlog that
+review deferred; the third — the 2026-09-30 release-readiness review
+(`docs/release-readiness-review-2026-09-30.md`) — is summarised first.
+
+### Third wave — the 2026-09-30 release-readiness review
+
+**Seven ways a check-clean program could crash, closed.** Each of these
+passed `tyc check` and raised on both execution surfaces; all are
+conservative narrowings that fire only on code that already failed at
+runtime. The nullable-operand check was gated on the receiver being a bare
+name, so `find(k).upper()`, `find(k).n`, `find(k)[0]`, `R().get().upper()`
+and `f"{find(k).upper()}"` on a `-> str?` all passed — every receiver shape
+now reports, and a receiver that is *always* `None` (`None.attr`, a
+`-> None` call's result) says so instead of rendering "`None | None`".
+A `nonlocal` write from a nested `def`, a write through an alias, and a call
+that takes the narrowed object as an argument now invalidate a narrowing they
+could have made stale. Member access on a union whose members do not all
+declare it (`u.n` on `type U = A | B`, `v.upper()` on `int | str`) and a
+subscript on a union with a non-subscriptable member report; so do ordering
+comparisons CPython refuses (`str < int`, a class with no `__lt__` family),
+`in` on a non-container, a call through a `Callable[[…], R]` value with the
+wrong arity (its parameters are all required), `await` on a provably sync
+same-module call or a literal, a subclass redeclaring an inherited field with
+an incompatible type, a positional-only parameter passed by keyword (its own
+help text under `tyc::unknown_kwarg`), `for` over an instance with no
+`__iter__`, a write to an undeclared attribute on a slots class (previously
+read as a *declaration*, hiding every later read too), and `go` inside a sync
+`def` reached transitively from module level.
+
+**Fourteen false positives removed.** `return` in a `try`/`else`, `for`/`else`
+or `while`/`else` counts as exiting (`tyc::missing_return` no longer fires).
+`if b is not None and b.val is not None: b.val + 1` narrows both — the second
+operand is now typed with the first in force, which was the warn-level false
+positive behind the `fp25`/`t18` stress probes and a blocker for making the
+field form an error. `case int() as n` binds `n: int`, not the whole subject
+union (so a guard `n > 100` and a recursive `type IntTree = int |
+list["IntTree"]` walk check). Variance is inferred through `impl[T] Name[T]:`
+blocks and `frozen` fields (`tuple[T, ...]` covariant), so a frozen
+`Producer[Dog]` flows into `Producer[Animal]`; a bare `@covariant` /
+`@contravariant` still overrides and is now stripped from the emitted Python
+for top-level classes too. A generic class annotated bare (`let b: Box =
+Box(value=1)`) accepts any instantiation. `ClassVar` fields are no longer
+mistaken for instance attributes, a `lazy let` lowering is not a "method in
+class body", and the constants-namespace lint skips `class!` and subclasses
+inheriting a required field. `{err}` on the continuation line of a
+triple-quoted f-string in a with-chain `else err:` body was `unknown_name`
+(the f-prefix did not travel across physical lines in the lexical mask).
+`from .shapes import Kind` inside a package resolved against the wrong
+module, so a relative import's sealed unions and newtypes never reached the
+consumer; a `pub *` facade also dropped `newtype`, `frozen`, `enum`, alias
+and variance tables, so a re-exported newtype behaved as a plain class and a
+write to a re-exported frozen class's field passed. `rescue` outside a
+`Result`-returning function now names `rescue` in its diagnostic, and a
+typed tuple unpack accepts a single `*rest` capture. A `*args` / `**kwargs`
+call through a `Callable` value is no longer arity-counted.
+
+**`[strictness] nullable-use` defaults to `"error"`.** The attribute-rooted
+`tyc::nullable_use` form landed at warn in alpha.7 as its introduction
+severity; with the `and`-chain narrowing fixed it becomes the error Rule 3
+promises. `"warn"` relaxes it during a migration.
+
+**`extend BUILTIN` on an attribute, call, subscript or chained receiver is
+lowered.** A call of an `extend str:` method on anything but a bare
+annotated name — `self.title.slug()` on a class field, `make().slug()` on a
+function's return value, `post.url().slug()` on an `impl` method,
+`xs[0].slug()` on a `list[str]`, `t.slug().shout()` on another extension
+call, `(a + " " + b).slug()`, a `for` / comprehension variable, an imported
+class's field or an imported function's return — passed `tyc check` but was
+never rewritten to the lifted free function, so both `tyc build` + CPython
+and `tyc run` raised `AttributeError: 'str' object has no attribute 'slug'`
+(the one miscompile class the review left open). The rewriter now types
+receivers from declarations: every top-level `def`'s declared return (an
+`async def`'s only once awaited), every class's fields, `@property` getters,
+instance / static / async methods, PEP 695 type parameters and bases —
+inherited members resolve and `Box[str].value` substitutes — plus the same
+facts for imported names, assembled by `tyc build` from the project-wide
+shape registry and by the VM from the sibling `.ty` files it scans. An
+unannotated `let x = EXPR` refines to its initialiser's evident type, a
+refinement made inside a branch or loop body is dropped where the checker
+would widen it, and a `T?` receiver reads as `T`. A relative `from .provider
+import …` inside a package now finds the provider's extensions too. Every
+corpus unit emits byte-identical Python before and after; a receiver whose
+type the pass cannot see (a `match` capture, an unannotated lambda
+parameter, a `with … as` target, a stdlib call) is still left alone. Under
+`tyc run` the same lowering now reaches an extension declared in a package
+submodule (`from catalogue.text import describe`, or a relative `from .text
+import …`) and an extension call inside an imported module itself — the VM
+skipped dotted modules and never merged an imported module's own
+cross-module extensions, so both raised `AttributeError` where the compiled
+path ran. A new corpus app, `examples/apps/16-shape-catalogue`, pins the
+multi-file shapes this review found gaps in: relative imports inside a
+package, a `pub *` facade re-exporting a `newtype`, `frozen` classes and an
+`enum`, cross-module sealed-union exhaustiveness, and `extend str` on call
+receivers on both surfaces.
+
+**`tyc run` closes the review's VM ↔ CPython divergences.** A plain dotted
+import now binds each submodule on its package the way CPython's import
+machinery does — `import shapes.ops` followed by `shapes.ops.area(...)`
+raised `AttributeError: module 'shapes' has no attribute 'ops'` under the
+VM while `import shapes.ops as ops` worked — with `os.path`-style native
+submodules handed back as the very object the package exposes, and a
+directory without `__init__.ty` importing as a PEP 420 namespace package.
+`map(f, xs, ys, …)` zips its iterables and stops at the shortest instead of
+calling `f` with one argument. `await` on a non-awaitable (`await 1`,
+`await sync_call()`) is CPython's `TypeError: object int can't be used in
+'await' expression` rather than the value; the VM's coroutine-function
+stand-ins (`asyncio.sleep`, `Queue.get`, …) now hand back completed tasks so
+every previously-working `await` still works. `go f()` reached from sync
+code outside `asyncio.run` — and `asyncio.create_task` — raise
+`RuntimeError: no running event loop` without running the coroutine,
+exactly as `typhon_runtime.tasks.spawn` does under CPython; inside the loop
+nothing changes, and a nested `asyncio.run` raises CPython's `RuntimeError`
+too.
+
+**Modelled modules fill their gaps, value-for-value against CPython 3.13.**
+`math` is complete (`isclose` with `rel_tol` / `abs_tol`, `gamma` / `lgamma`
+as a port of CPython's own Lanczos code, `erf` / `erfc` / the hyperbolics /
+`cbrt` / `exp2` through the host libm, `sumprod` with CPython's
+extended-precision accumulator, `fma`, `frexp`, `ldexp`, `modf`,
+`nextafter(steps=)`, `ulp`); `re` gains `A I L M S U X`, `NOFLAG`,
+`RegexFlag`, real `Pattern` / `Match` classes and `error` / `PatternError`,
+and `IGNORECASE` / `MULTILINE` / `DOTALL` / `VERBOSE` are honoured instead
+of silently ignored; `heapq` gains `heappushpop`, `heapreplace` and
+`merge(key=, reverse=)`; `functools` gains `update_wrapper`,
+`WRAPPER_ASSIGNMENTS` / `WRAPPER_UPDATES`, `partialmethod` and
+`singledispatchmethod` (the descriptor protocol they rest on — an object's
+`__get__` read through a class attribute — is new too); `contextlib` gains
+`AbstractContextManager`, `AbstractAsyncContextManager`, `ContextDecorator`,
+`AsyncContextDecorator`, `chdir`, `aclosing` and `AsyncExitStack`;
+`operator` gains the in-place operators, `index`, `inv` and `call`;
+`collections` gains `UserDict`, `UserList` and `UserString`; `hashlib`
+gains SHA-3, `pbkdf2_hmac` and `file_digest`. Function objects now compare
+and `is` by identity and carry `__doc__`; a class body's own names are
+visible to its later statements. Known residuals: `re` flags are plain
+ints (`print(re.I)` shows `2`), `re.error` messages are the Rust engine's,
+and `pbkdf2_hmac` with an unknown digest raises `ValueError`.
+
+**The pre-run scan now checks attributes, not just modules.** `tyc run`
+asks the VM what each modelled module exports (the live module's own
+`dir()` — no hand-written table) and sends a program that reads a
+`module.attr` the VM lacks down the compiled path with a `note:` naming it
+(`re.purge`), the way an unmodelled import already did. It only ever judges
+a bare name bound by one `import`, never a `from` import, an attribute the
+program sets itself, or a name rebound anywhere in the file;
+`--no-fallback` still refuses.
+
+**Review follow-ups on PR #488.** `from . import text` now carries the
+submodule's extensions and type facts into the importing module under
+`tyc run` (the scan resolved the package facade instead). A `go` inside a
+*nested* `def` no longer makes the enclosing sync function a spawner (both
+the direct and the transitive scan walked root-level nested definitions).
+`Pattern.finditer(s, pos)` reports offsets in the original string. The
+starred typed unpack lowers through a real starred assignment, so too few
+elements raise Python's `ValueError` instead of binding both ends to the
+same element. `UserDict.pop` rejects a second default; `ExitStack.push` /
+`push_async_exit` accept a context manager. The pre-run attribute scan
+exempts a program-defined attribute only for reads after the store, and
+checks `from module import member` against the modelled exports. Go-to-
+definition follows a relative import to the sibling package module. The
+embedded skill copies under `tyc/crates/tyc/skill/` carry the same text as
+the installed ones. `stress/round-2026-09-01/vm/p8.ty` is declared
+nondeterministic (its `as_completed` start order is set-ordered) rather
+than pinned as a divergence, and the `from pydantic import ValidationError`
+stress unit leaves the divergence baseline because that scan now routes it
+to the compiled path.
+
+**Supply chain and tooling.** `salsa` 0.26.2 → 0.28.5 clears
+RUSTSEC-2026-0308 (the only `cargo deny` failure). The perf gate's absolute
+floor is 10 ms rather than 5: with a ~22 ms baseline the 20 % band was inside
+a shared runner's process-start jitter and the gate tripped on a tree with
+no compiler change. `OAUTH_TOKEN` / `OAUTH_SECRET` (and squashed forms) join
+the `tyc::contains_secret_literal` keyword table, ordered ahead of
+`AUTH_TOKEN`. Regression tests cover every item above; the docs, the skill
+and the docs-site are updated to match.
 
 **`tyc run` is a real drop-in for `tyc build` + CPython.** It scans a
 program's imports *before* executing anything; an import the VM does not

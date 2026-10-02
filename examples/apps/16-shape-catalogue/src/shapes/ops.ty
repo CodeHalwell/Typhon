@@ -1,0 +1,35 @@
+from .kinds import Shape, Circle, Rect, Tri, Kind
+
+
+pub def area(s: Shape) -> float:
+    match s:
+        case Circle(r):
+            return 3.14159 * r * r
+        case Rect(w, h):
+            return w * h
+        case Tri(a, b, c):
+            let p: float = (a + b + c) / 2.0
+            return (p * (p - a) * (p - b) * (p - c)) ** 0.5
+    raise RuntimeError("unreachable")
+
+
+pub def kind_of(s: Shape) -> Kind:
+    match s:
+        case Circle(_):
+            return Kind.ROUND
+        case Rect(_, _):
+            return Kind.BOXY
+        case Tri(_, _, _):
+            return Kind.POINTY
+    raise RuntimeError("unreachable")
+
+
+pub def scale(s: Shape, k: float) -> Shape:
+    match s:
+        case Circle(r):
+            return Circle(r=r * k)
+        case Rect(w, h):
+            return Rect(w=w * k, h=h * k)
+        case Tri(a, b, c):
+            return Tri(a=a * k, b=b * k, c=c * k)
+    raise RuntimeError("unreachable")

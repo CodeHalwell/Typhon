@@ -30,4 +30,20 @@ def main() -> None:
     connect(host="localhost", port=80)
 ```
 
+
+## Positional-only parameters
+
+A parameter declared before `/` can only be passed by position. Passing it by
+keyword is reported under this code (CPython raises
+`TypeError: got some positional-only arguments passed as keyword arguments`),
+and the help says so rather than suggesting a spelling:
+
+```ty
+def f(a: int, /, b: int) -> int:
+    return a + b
+
+f(a=1, b=2)   # error: unknown keyword argument 'a' — `a` is positional-only
+f(1, b=2)     # ok
+```
+
 See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/unknown_kwarg.md

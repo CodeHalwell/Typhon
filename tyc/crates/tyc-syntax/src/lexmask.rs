@@ -53,13 +53,20 @@
 
 /// Active string-literal mode while scanning. `Single` and `Double` cannot
 /// span a newline (per Python's grammar) and are reset at end-of-line;
-/// triple-quoted forms persist across lines.
+/// triple-quoted forms persist across lines. The `FTriple*` forms are the
+/// triple-quoted f-string variants: the f-prefix has to travel with the
+/// carried-over mode so that a replacement field on a *continuation* line
+/// (`f"""…\n{name}…"""`) is still scanned as code rather than string text.
+/// Single-line f-strings need no such variant — their frame never outlives
+/// the line that opened it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StringMode {
     Single,
     Double,
     TripleSingle,
     TripleDouble,
+    FTripleSingle,
+    FTripleDouble,
 }
 
 impl StringMode {
@@ -67,22 +74,36 @@ impl StringMode {
         match self {
             StringMode::Single => (b'\'', false),
             StringMode::Double => (b'"', false),
-            StringMode::TripleSingle => (b'\'', true),
-            StringMode::TripleDouble => (b'"', true),
+            StringMode::TripleSingle | StringMode::FTripleSingle => (b'\'', true),
+            StringMode::TripleDouble | StringMode::FTripleDouble => (b'"', true),
         }
     }
 
-    fn open(quote: u8, triple: bool) -> StringMode {
-        match (quote == b'\'', triple) {
-            (true, false) => StringMode::Single,
-            (false, false) => StringMode::Double,
-            (true, true) => StringMode::TripleSingle,
-            (false, true) => StringMode::TripleDouble,
+    fn open(quote: u8, triple: bool, fstring: bool) -> StringMode {
+        match (quote == b'\'', triple, fstring) {
+            (true, false, _) => StringMode::Single,
+            (false, false, _) => StringMode::Double,
+            (true, true, false) => StringMode::TripleSingle,
+            (false, true, false) => StringMode::TripleDouble,
+            (true, true, true) => StringMode::FTripleSingle,
+            (false, true, true) => StringMode::FTripleDouble,
         }
     }
 
     fn is_triple(self) -> bool {
-        matches!(self, StringMode::TripleSingle | StringMode::TripleDouble)
+        matches!(
+            self,
+            StringMode::TripleSingle
+                | StringMode::TripleDouble
+                | StringMode::FTripleSingle
+                | StringMode::FTripleDouble
+        )
+    }
+
+    /// `true` for the triple-quoted f-string modes — the only ones whose
+    /// f-ness can matter on a later line.
+    fn is_fstring(self) -> bool {
+        matches!(self, StringMode::FTripleSingle | StringMode::FTripleDouble)
     }
 }
 
@@ -198,12 +219,13 @@ where
     // Frame stack. Seeded from the carried-over `in_string` so a triple-quoted
     // string opened on an earlier line resumes correctly. A carried-over
     // string is never mid-replacement-field: a `{` may not span lines in the
-    // forms this preprocessor handles.
+    // forms this preprocessor handles. Its f-ness does carry, though — a
+    // replacement field on a continuation line is still code.
     let mut stack: Vec<Frame> = Vec::new();
     if let Some(mode) = *in_string {
         stack.push(Frame {
             mode,
-            is_fstring: false,
+            is_fstring: mode.is_fstring(),
             in_field: false,
             field_braces: 0,
             in_spec: false,
@@ -330,9 +352,10 @@ where
                         emit(i + 1, ByteKind::StringText, *depth);
                         emit(i + 2, ByteKind::StringText, *depth);
                     }
+                    let fstring = has_fstring_prefix(bytes, i);
                     stack.push(Frame {
-                        mode: StringMode::open(b, triple),
-                        is_fstring: has_fstring_prefix(bytes, i),
+                        mode: StringMode::open(b, triple, fstring),
+                        is_fstring: fstring,
                         in_field: false,
                         field_braces: 0,
                         in_spec: false,
@@ -393,9 +416,10 @@ where
                 emit(i + 1, ByteKind::StringText, *depth);
                 emit(i + 2, ByteKind::StringText, *depth);
             }
+            let fstring = has_fstring_prefix(bytes, i);
             stack.push(Frame {
-                mode: StringMode::open(b, triple),
-                is_fstring: has_fstring_prefix(bytes, i),
+                mode: StringMode::open(b, triple, fstring),
+                is_fstring: fstring,
                 in_field: false,
                 field_braces: 0,
                 in_spec: false,
@@ -536,6 +560,22 @@ impl LexMask {
     /// behaviour instead of panicking.
     pub(crate) fn kind(&self, i: usize) -> ByteKind {
         self.kinds.get(i).copied().unwrap_or(ByteKind::Code)
+    }
+
+    /// The byte kinds of physical line `line` (including its terminator),
+    /// classified with the string / bracket state the line was entered in —
+    /// so a line that begins inside a triple-quoted f-string still reports
+    /// its `{…}` replacement fields as [`ByteKind::FStringExpr`].
+    pub(crate) fn line_kinds(&self, line: usize) -> &[ByteKind] {
+        let Some(&start) = self.line_start.get(line) else {
+            return &[];
+        };
+        let end = self
+            .line_start
+            .get(line + 1)
+            .copied()
+            .unwrap_or(self.kinds.len());
+        &self.kinds[start..end]
     }
 
     /// `true` when byte `i` is code in the sense that matters for an
@@ -720,6 +760,36 @@ mod tests {
         let mask = LexMask::new(src);
         let e = src.find("err").unwrap();
         assert!(!mask.is_code(e));
+    }
+
+    #[test]
+    fn triple_quoted_fstring_field_on_a_continuation_line_is_code() {
+        // The f-prefix has to travel with the carried-over mode: a field on
+        // the second physical line of an `f"""…"""` literal is code just as
+        // one on the opening line is. Without that, an `else err:` with-chain
+        // body reporting through such a literal rewrote the opening-line
+        // field but left the continuation-line one as string text — an
+        // `unknown_name` on a name that was in scope.
+        let src = "x = f\"\"\"{err} first\nsecond {err} tail\n\"\"\"\ny = 1\n";
+        let mask = LexMask::new(src);
+        let first = src.find("err").unwrap();
+        let second = src.rfind("err").unwrap();
+        assert!(mask.is_code(first));
+        assert!(mask.is_code(second), "continuation-line field must be code");
+        assert!(!mask.is_structural_code(second));
+        let tail = src.find("tail").unwrap();
+        assert!(!mask.is_code(tail));
+        assert!(mask.line_starts_in_string(1));
+        assert!(!mask.line_starts_in_string(3));
+    }
+
+    #[test]
+    fn plain_triple_quoted_string_braces_stay_string_text_across_lines() {
+        // The inverse: a non-f triple-quoted literal must not grow fields.
+        let src = "x = \"\"\"{err} first\nsecond {err} tail\n\"\"\"\n";
+        let mask = LexMask::new(src);
+        assert!(!mask.is_code(src.find("err").unwrap()));
+        assert!(!mask.is_code(src.rfind("err").unwrap()));
     }
 
     #[test]

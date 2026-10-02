@@ -54,4 +54,18 @@ def collect(xs: list[str]) -> Result[list[int], str]:
     return Ok(out)
 ```
 
+
+## `rescue`
+
+`… rescue e: fallback` lowers to `try_result(lambda: …, lambda e: fallback)?`,
+so it propagates exactly like `?` and is subject to the same rule. It used to
+fail with the `?` wording; the message now names `rescue`:
+
+```ty
+let n: int = int(raw) rescue e: 0          # error: `rescue` used at module level
+
+def go() -> None:
+    let n: int = int(raw) rescue e: 0      # error: `rescue` used in a function returning `None`
+```
+
 See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/invalid_question_op.md

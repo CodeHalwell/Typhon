@@ -59,14 +59,14 @@ See [Flow Narrowing](/Typhon/types/narrowing/) for every form the checker recogn
 
 Dereferencing a nullable *field* — `self.conn.execute()`, `cfg.db.host`, `resp.body.decode()` — is reported too. Before **v1.0.0-alpha.7** it was not checked at all: the diagnostic was gated on the receiver being a bare name, so the single most common non-nullability bug in real code was invisible.
 
-Because that check has never run, it lands at **warn** level for one release rather than error — it can flag a field that happens always to be populated at the dereference. Promote it once your code is clean:
+It landed at **warn** level in v1.0.0-alpha.7, because a check that had never run could flag a field that happens always to be populated at the dereference. Since the 2026-09-30 review it is an **error by default** — Rule 3 is the language's headline guarantee. Relax it during a migration:
 
 ```toml
 [strictness]
-nullable-use = "error"
+nullable-use = "warn"
 ```
 
-It becomes an error by default in a later release. The bare-name form has always been, and remains, an error.
+The bare-name form has always been, and remains, an error. Narrowing follows `and` chains through attribute paths (`if b is not None and b.val is not None:` narrows both `b` and `b.val` in the body), and a receiver that is *always* `None` (`None.attr`, a `-> None` call's result) reports under the same code with wording that does not suggest a guard.
 
 ## What does *not* narrow
 

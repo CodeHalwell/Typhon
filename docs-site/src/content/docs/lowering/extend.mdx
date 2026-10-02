@@ -9,7 +9,7 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 `extend ClassName:` for a user-defined class is identical to `impl` — methods merge into the class body at desugar.
 
-`extend BUILTIN:` (where `BUILTIN` is `str`, `list`, `dict`, etc.) is different: each method is extracted to a module-level free function, and call sites are rewritten when the receiver has a matching static annotation.
+`extend BUILTIN:` (where `BUILTIN` is `str`, `list`, `dict`, etc.) is different: each method is extracted to a module-level free function, and call sites are rewritten when the receiver's static type is known to be that built-in (an annotated or evidently-initialised binding, a literal, a known class's field, a call with a declared return type, a subscript on a typed container, a loop variable). Receivers the pass cannot type are left alone.
 
 ## User-defined class
 

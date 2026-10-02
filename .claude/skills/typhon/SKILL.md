@@ -122,7 +122,7 @@ The 30-second mental model. Every later section in this skill is detail under on
 | Local binding | `let x: int = 1` / `mut x: int = 1` | `x: int = 1` |
 | Module binding | `X: int = 1` (implicit `let`) or `mut X: int = 1` | `X: int = 1` |
 | Declare-then-assign (v0.7.0) | `let loaded: Cfg` then assign on every non-diverging arm | `loaded: Cfg` then `loaded = …` |
-| Typed tuple unpack (v0.3.1) | `let (a: int, b: str) = pair()` | hidden temp + per-element typed assigns |
+| Typed tuple unpack (v0.3.1) | `let (a: int, b: str) = pair()` — one `*rest` capture allowed (2026-09-30) | hidden temp + per-element typed assigns; the starred form goes through a real starred assignment into hidden slots, so Python's arity `ValueError` applies |
 | Deep-immutable binding | `freeze let CFG = {"port": 8080, "hosts": ["a", "b"]}` | `CFG = __typhon_freeze__({...})` (deep-freezes value) |
 | Public name | `pub let API_VERSION: str = "v1"` / `pub class Foo: ...` | synthesised `__all__ = [...]` at top of module |
 | Package re-export (v0.7.0) | `pub *` in `__init__.ty` | aggregates sibling modules + sub-packages |
@@ -488,7 +488,7 @@ enum Color:                       # → class Color(enum.Enum):
 - `impl[T] ClassName[T]:` introduces type parameters scoped over the methods; methods may add their own (`def map[U](...)`).
 - `impl OtherType:` on an **alias** of a sealed union distributes the methods to every variant (v0.6.0). Duplicate-method check fires when the same method exists on both `impl Union:` and `impl Variant:`.
 - `extend ClassName:` is `impl`'s twin for cross-module method addition. Same merge semantics.
-- `extend BUILTIN:` (`str`, `list`, `int`, `dict`, …) extracts each method to a module-level free function `__typhon_ext_<TYPE>__<METHOD>__`, and rewrites `x.method(...)` to the free-function call **whenever the receiver `x` is statically annotated as that built-in**. No monkey-patching — un-annotated receivers still raise `AttributeError` at runtime. `extend list[int]:` (parametric target) fires `tyc::extend_builtin` — drop the brackets. **As of v0.15.5, `extend BUILTIN:` crosses module boundaries** — importing a module that declares `extend str: def slug(...)` makes `title.slug()` resolve in the consumer (the type checker, build/codegen, and VM all propagate the extension registry). In earlier releases this was module-local; the free-function workaround (`pub def to_slug(s: str) -> str: …`) still works but is no longer necessary.
+- `extend BUILTIN:` (`str`, `list`, `int`, `dict`, …) extracts each method to a module-level free function `__typhon_ext_<TYPE>__<METHOD>__`, and rewrites `x.method(...)` to the free-function call **whenever the receiver's static type is known to be that built-in** — an annotated or evidently-initialised binding, a literal, a field / property of a known class (`self.title.slug()`, `post.title.slug()`), a call with a declared return type (a same-module or imported `def`, an `impl` method, a chained extension call), a subscript on a parametric container, or a loop / comprehension variable (2026-09-30; before it, only a bare annotated name was rewritten and every other receiver raised `AttributeError` at runtime). No monkey-patching — un-typeable receivers (a `match` capture, an unannotated lambda parameter, a `with … as` target) still raise `AttributeError` at runtime. `extend list[int]:` (parametric target) fires `tyc::extend_builtin` — drop the brackets. **As of v0.15.5, `extend BUILTIN:` crosses module boundaries** — importing a module that declares `extend str: def slug(...)` makes `title.slug()` resolve in the consumer (the type checker, build/codegen, and VM all propagate the extension registry). In earlier releases this was module-local; the free-function workaround (`pub def to_slug(s: str) -> str: …`) still works but is no longer necessary.
 
 ### 5.9 `unsafe:` boundary
 
@@ -680,7 +680,7 @@ Remediation of a 2026-06-28 adversarial pre-release review, and the first releas
 Typhon's first tagged alpha and first *feature-complete* milestone: the proven production surface plus the previously-deferred type-system frontier. Rolls up milestones M1 + M2 of the alpha release plan, the early M3 polish (formatter idempotence, the perf-regression CI gate), and the **`rescue`** exception-boundary sugar (see [§9](#9-error-handling-with-resultt-e)). Frontier work landed:
 
 - **Higher-kinded type unification** — a constructor variable `F` in `class Functor[F[_]]:` binds against a concrete head like `list`, with `tyc::kind_mismatch` on wrong arity / conflicting binding. (Function-level `F[_]` params remain deferred — see `TYPE_SYSTEM_FRONTIER.md`.)
-- **User-generic variance inference** — covariant / contravariant type-params inferred from usage, across module boundaries, with `@covariant` / `@contravariant` overrides; variance flows through generic interface bounds.
+- **User-generic variance inference** — covariant / contravariant type-params inferred from usage (including the methods of `impl[T]` blocks and read-only `frozen` fields, `tuple[T, ...]` included — 2026-09-30), across module boundaries, with `@covariant` / `@contravariant` overrides (stripped from the emitted Python); variance flows through generic interface bounds. A bare generic annotation (`let b: Box = …`) accepts any instantiation.
 - **General inter-procedural field-init audit** (partial instances tracked across helper chains) and **2-member non-nullable union modelling** at the introspection boundary.
 
 The production path (`tyc build` → CPython 3.13+) is stable and carries no runtime dependency on the toolchain. As an **alpha** the surface syntax is *not yet frozen* and may change before `1.0.0` with a documented migration note. Deferred to beta: embedded `ty` Phase 2 (the Phase 1 subprocess path ships), typeshed-backed pure-extension checking, and the function-level HKT tail. Additive on the accepted surface — every previously-accepted program type-checks identically.
@@ -1345,7 +1345,7 @@ no-implicit-any = true           # reserved for forward compat; today the check 
 unused-import = "warn"           # default "warn" (since v0.8.0); or "error" | "off"
 exhaustive-match = "error"
 methods-in-class-body = "warn"   # or "error" (break CI) | "off"
-nullable-use = "warn"            # severity of the attribute-rooted tyc::nullable_use form (`self.conn.execute()`); "error" promotes it, "off" drops it. The bare-name form is always an error.
+nullable-use = "error"           # severity of the attribute-rooted tyc::nullable_use form (`self.conn.execute()`); "error" by default since the 2026-09-30 review, "warn" relaxes it, "off" drops it. The bare-name form is always an error.
 require-with = "warn"            # severity for tyc::resource_not_managed
 blocking-in-async = "warn"       # severity for tyc::blocking_in_async
 stub-check = "error"             # severity for tyc::stub_mismatch

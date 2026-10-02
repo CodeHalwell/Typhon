@@ -338,7 +338,7 @@ The merge happens at desugar; downstream callers see a single class with both se
 
 ### Extending built-ins
 
-`extend BUILTIN:` (`str`, `list`, `int`, `dict`, …) extracts each method to a module-level free function and rewrites call sites when the receiver has a matching static annotation:
+`extend BUILTIN:` (`str`, `list`, `int`, `dict`, …) extracts each method to a module-level free function and rewrites call sites when the receiver's static type is known to be that built-in — an annotated binding, a literal, a known class's field, a call with a declared return type, a loop variable:
 
 ```python
 extend str:

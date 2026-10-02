@@ -1,6 +1,6 @@
 # Typhon — large production-shaped apps
 
-This directory holds **fifteen** multi-file projects deliberately built to
+This directory holds **sixteen** multi-file projects deliberately built to
 stress the language end-to-end: every app touches a wide cross-section of
 Typhon features (sealed unions, `Result[T, E]`, `?`, `with`-chains,
 `impl`/`extend`, `model`, `frozen class`, `freeze let`, `newtype`,
@@ -45,6 +45,7 @@ for the smallest worked example.
 | 13 | [`13-vector-db`](13-vector-db/) | In-memory vector database: HNSW index, pluggable distance metrics, recursive filter DSL (lex + parse + eval), snapshot persistence, FastAPI server | generic `Collection[D]`, sealed-union `Metric` + `FilterExpr` with factories, `lazy import np = numpy`, `async with` RW-lock |
 | 14 | [`14-api-gateway`](14-api-gateway/) | L7 API gateway / service mesh: route matching, load-balancing strategies, circuit breakers, retry policy, token-bucket rate limiting, health probes, `/metrics` | `Callable`-field middleware pipeline (workaround for cross-module interface limit + R3-1 async-await-on-Callable bug), `BreakerState` state machine, `freeze let` policy constants |
 | 15 | [`15-stream-processor`](15-stream-processor/) | Flink-lite stream processor: source/map/filter/keyBy/window/aggregate/sink operators, event-time watermarks, keyed state with snapshot/restore | generic `ListSource[T]` / `Operator[I, O]`, sealed-union `OperatorKind` / `WindowKind`, `gather:` + `go` topology, watermark arithmetic via `newtype WatermarkTs` |
+| 16 | [`16-shape-catalogue`](16-shape-catalogue/) | Small multi-file layout probe: a `shapes` package (frozen classes, sealed union, `newtype`, `enum`) behind a `pub *` facade, a `catalogue` package with relative imports and an `extend str`, `Result` + `with`-chain lookups | relative imports inside packages, facade re-export of `newtype` / `frozen` / `enum`, cross-module sealed-union exhaustiveness, `extend str` on call receivers (compiled path and VM), `Callable` predicates |
 
 Each app has its own README with the run recipe. None of them require a
 network or third-party services to *type-check* — `tyc check` runs end

@@ -47,18 +47,39 @@ impl Cfg:
 
 Without the guard, `self.db.host` reports `tyc::nullable_use`.
 
-Since **v1.0.0-alpha.7** this field form is reported at **warn** level rather
-than error. It was never checked at all before that release, so making it an
-error immediately would break programs whose nullable field happens always to
-be populated at the dereference. Promote it once your code is clean:
+This field form landed in **v1.0.0-alpha.7** at **warn** level, because it had
+never been checked before and an immediate error would have broken programs
+whose nullable field happens always to be populated at the dereference. Since
+the **2026-09-30 review** it is an **error by default** — Rule 3 (no implicit
+`None`) is the language's headline guarantee, and a guarantee that only warns
+is not one. Relax it during a migration:
 
 ```toml
 [strictness]
-nullable-use = "error"
+nullable-use = "warn"   # or "off"
 ```
 
-It becomes an error by default in a later release. The bare-name form
-(`name.upper()` where `name: str?`) has always been, and remains, an error.
+The bare-name form (`name.upper()` where `name: str?`) has always been, and
+remains, an error and is not governed by the knob.
+
+Narrowing follows `and` chains through attribute paths: in
+`if b is not None and b.val is not None: b.val + 1` the second operand is
+typed with the first already in force, so both `b` and `b.val` are narrowed in
+the body (and after an early exit under the negated `or` form).
+
+## Always-None receivers
+
+A receiver that is not *possibly* `None` but *always* `None` — `None.attr`, or
+a `-> None` function's result used as a receiver or operand — is the same
+runtime failure, so it reports under the same code, but with wording that does
+not suggest a guard (there is no non-`None` case to narrow to):
+
+```ty
+def notify() -> None:
+    print("sent")
+
+let n: int = notify().real   # error: `None` used where a non-None value is required
+```
 
 See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/nullable_use.md
 

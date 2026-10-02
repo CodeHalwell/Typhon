@@ -30,7 +30,7 @@
 //! Anything else is left untouched.
 
 use crate::lexer::TyphonKeyword;
-use crate::lexmask::{scan_line, ByteKind, LexMask, StringMode};
+use crate::lexmask::{scan_line, scan_line_kinds, ByteKind, LexMask, StringMode};
 
 /// One stripped keyword and the 0-based line index in the source where it
 /// appeared.
@@ -3442,6 +3442,40 @@ pub fn validate_extend_usage(source: &str) -> Vec<ExtendUsageError> {
     out
 }
 
+/// Byte offset (within `raw`) of a `rescue` keyword in code position on this
+/// line — a postfix `… rescue e: …` or a block header `rescue e: …:` — or
+/// `None`. `entry` is the string state the line is entered in.
+fn rescue_keyword_offset(raw: &str, entry: Option<StringMode>) -> Option<usize> {
+    if !raw.contains("rescue") {
+        return None;
+    }
+    let mut state = entry;
+    let kinds = scan_line_kinds(raw, &mut state);
+    let bytes = raw.as_bytes();
+    let needle = b"rescue";
+    let mut i = 0usize;
+    while i + needle.len() <= bytes.len() {
+        if &bytes[i..i + needle.len()] == needle
+            && (i..i + needle.len()).all(|k| matches!(kinds.get(k), Some(ByteKind::Code)))
+            && (i == 0 || !is_ident_continuation(bytes[i - 1]))
+            && (i + needle.len() == bytes.len() || !is_ident_continuation(bytes[i + needle.len()]))
+        {
+            // The keyword is followed by an identifier and a colon
+            // (`rescue e:`); anything else is an ordinary name.
+            let rest = raw[i + needle.len()..].trim_start();
+            let ident_len = rest
+                .bytes()
+                .take_while(|b| is_ident_continuation(*b))
+                .count();
+            if ident_len > 0 && rest[ident_len..].trim_start().starts_with(':') {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 // ── `?` operator validation ───────────────────────────────────────────────────
 
 /// An error produced when the `?` operator is used in an invalid context.
@@ -3599,6 +3633,34 @@ pub fn validate_question_ops(source: &str) -> Vec<QuestionOpError> {
                     });
                 }
                 // Return type is Result-family (valid) or unknown (skip FP).
+                Some(_) => {}
+            }
+        }
+        // A `rescue` (postfix `EXPR rescue e: ERR`, or the block header
+        // `rescue e: ERR:`) lowers to a `?` / `return Err(…)`, so it needs
+        // the same `Result`-returning function as `?` does. Reporting it
+        // here names the construct the user wrote; letting it through
+        // surfaced as a baffling "expected `None`, found `Err[…]`" from the
+        // type checker (review 2026-09-30 §4.4). The keyword is only
+        // recognised in code bytes, never inside a string or comment.
+        if let Some(offset) = rescue_keyword_offset(raw, pre_string) {
+            let r_offset = byte_offset + offset;
+            match fn_stack.last() {
+                None => errors.push(QuestionOpError {
+                    line_index,
+                    offset: r_offset,
+                    message: "`rescue` used at module level; it propagates an `Err` like `?` \
+                             and is only valid inside a function returning `Result[T, E]`"
+                        .to_owned(),
+                }),
+                Some((_, Some(ret))) if !is_result_type(ret) => errors.push(QuestionOpError {
+                    line_index,
+                    offset: r_offset,
+                    message: format!(
+                        "`rescue` used in a function returning `{ret}`; it propagates an \
+                         `Err` like `?` and is only valid in functions returning `Result[T, E]`"
+                    ),
+                }),
                 Some(_) => {}
             }
         }
@@ -4982,26 +5044,62 @@ pub fn expand_typed_let_unpack_mapped(source: &str) -> (String, Vec<usize>) {
             Some(rewrite) => {
                 let tmp = format!("__typhon_unpack_{}__", counter);
                 counter += 1;
-                out.push_str(indent);
-                out.push_str("let ");
-                out.push_str(&tmp);
-                out.push_str(" = ");
-                out.push_str(&rewrite.rhs);
-                out.push_str(nl);
-                for (i, capture) in rewrite.captures.iter().enumerate() {
+                let has_star = rewrite.captures.iter().any(|c| c.starred);
+                if has_star {
+                    // A starred form lowers through a *real* starred
+                    // assignment into hidden slots, so Python's own arity
+                    // rule applies (`ValueError: not enough values to
+                    // unpack (expected at least 2, got 1)`) and `*rest`
+                    // is the list Python makes of it — slicing the temp
+                    // silently bound both ends of a one-element sequence
+                    // to the same element.
+                    out.push_str(indent);
+                    out.push_str("let (");
+                    for (i, capture) in rewrite.captures.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        if capture.starred {
+                            out.push('*');
+                        }
+                        out.push_str(&format!("{tmp}{i}__"));
+                    }
+                    out.push_str(") = ");
+                    out.push_str(&rewrite.rhs);
+                    out.push_str(nl);
+                    for (i, capture) in rewrite.captures.iter().enumerate() {
+                        out.push_str(indent);
+                        out.push_str("let ");
+                        out.push_str(&capture.name);
+                        if let Some(ty) = &capture.annotation {
+                            out.push_str(": ");
+                            out.push_str(ty);
+                        }
+                        out.push_str(&format!(" = {tmp}{i}__"));
+                        out.push_str(nl);
+                    }
+                } else {
                     out.push_str(indent);
                     out.push_str("let ");
-                    out.push_str(&capture.name);
-                    if let Some(ty) = &capture.annotation {
-                        out.push_str(": ");
-                        out.push_str(ty);
-                    }
-                    out.push_str(" = ");
                     out.push_str(&tmp);
-                    out.push('[');
-                    out.push_str(&i.to_string());
-                    out.push(']');
+                    out.push_str(" = ");
+                    out.push_str(&rewrite.rhs);
                     out.push_str(nl);
+                    for (i, capture) in rewrite.captures.iter().enumerate() {
+                        out.push_str(indent);
+                        out.push_str("let ");
+                        out.push_str(&capture.name);
+                        if let Some(ty) = &capture.annotation {
+                            out.push_str(": ");
+                            out.push_str(ty);
+                        }
+                        out.push_str(" = ");
+                        out.push_str(&tmp);
+                        out.push('[');
+                        out.push_str(&i.to_string());
+                        out.push(']');
+                        out.push_str(nl);
+                    }
                 }
             }
             None => {
@@ -5021,6 +5119,9 @@ struct TypedLetUnpack {
 struct TypedLetCapture {
     name: String,
     annotation: Option<String>,
+    /// A `*rest` capture: takes every element the fixed captures around it
+    /// do not, as a `list` (Python's starred-assignment semantics).
+    starred: bool,
 }
 
 /// Recognise `let (a: int, b: str) = expr` on a single physical line.
@@ -5136,6 +5237,20 @@ fn parse_typed_let_unpack(body: &str) -> Option<TypedLetUnpack> {
         if cap.is_empty() {
             return None;
         }
+        // `*rest` — a starred capture cannot be annotated (Python's rule
+        // too); at most one per target list.
+        if let Some(rest) = cap.strip_prefix('*') {
+            let name = rest.trim();
+            if !is_python_ident(name) || captures.iter().any(|c| c.starred) {
+                return None;
+            }
+            captures.push(TypedLetCapture {
+                name: name.to_owned(),
+                annotation: None,
+                starred: true,
+            });
+            continue;
+        }
         let (name, annotation) = if let Some(colon) = find_top_level_colon(cap) {
             saw_annotation = true;
             (
@@ -5151,6 +5266,7 @@ fn parse_typed_let_unpack(body: &str) -> Option<TypedLetUnpack> {
         captures.push(TypedLetCapture {
             name: name.to_owned(),
             annotation,
+            starred: false,
         });
     }
     // Outer-annotation form: distribute the `tuple[T1, T2, …]` annotation
@@ -7969,6 +8085,11 @@ struct WithChain {
     /// Body lines for the else branch, with the chain's base indentation
     /// removed (so each line starts at indent zero relative to the chain).
     else_body: Vec<String>,
+    /// Parallel to `else_body`: the byte kinds of each line as classified by
+    /// the whole-source [`LexMask`], so the `err` rename can still reach a
+    /// replacement field of a multi-line f-string (`{err}` on a line that
+    /// begins inside the literal — review 2026-09-30 §4.4).
+    else_kinds: Vec<Vec<ByteKind>>,
     /// Parallel to `else_body`, same meaning as `body_in_string`. Used to
     /// keep [`rename_whole_word`] off lines that are string content.
     else_in_string: Vec<bool>,
@@ -8173,6 +8294,7 @@ fn collect_chain(
     let mut err_var = None;
     let mut else_body = Vec::new();
     let mut else_in_string = Vec::new();
+    let mut else_kinds: Vec<Vec<ByteKind>> = Vec::new();
     let mut else_body_start = idx;
     if idx < lines.len() && !mask.line_starts_in_string(idx) {
         // The `!line_starts_in_string` guard matters: a physical line of
@@ -8209,6 +8331,7 @@ fn collect_chain(
                 }
                 else_body.push(l.to_string());
                 else_in_string.push(starts_in_string);
+                else_kinds.push(mask.line_kinds(idx).to_vec());
                 idx += 1;
             }
             if else_body.is_empty() {
@@ -8227,6 +8350,7 @@ fn collect_chain(
             else_body_start,
             err_var,
             else_body,
+            else_kinds,
             else_in_string,
         },
         consumed,
@@ -8286,12 +8410,29 @@ fn rename_whole_word(line: &str, from: &str, to: &str) -> String {
         return line.to_owned();
     }
     let mask = LexMask::new(line);
+    let kinds: Vec<ByteKind> = (0..line.len()).map(|i| mask.kind(i)).collect();
+    rename_whole_word_with_kinds(line, &kinds, from, to)
+}
+
+/// [`rename_whole_word`] over a line whose byte kinds were classified by the
+/// whole-source mask (so a line entered inside a string is scanned with that
+/// state, not as fresh code).
+fn rename_whole_word_with_kinds(line: &str, kinds: &[ByteKind], from: &str, to: &str) -> String {
+    if from.is_empty() || !line.contains(from) {
+        return line.to_owned();
+    }
+    let is_code = |i: usize| {
+        matches!(
+            kinds.get(i).copied().unwrap_or(ByteKind::Code),
+            ByteKind::Code | ByteKind::FStringExpr
+        )
+    };
     let bytes = line.as_bytes();
     let from_bytes = from.as_bytes();
     let mut out = String::with_capacity(line.len());
     let mut i = 0usize;
     while i < bytes.len() {
-        if mask.is_code(i)
+        if is_code(i)
             && i + from_bytes.len() <= bytes.len()
             && &bytes[i..i + from_bytes.len()] == from_bytes
         {
@@ -8300,7 +8441,7 @@ fn rename_whole_word(line: &str, from: &str, to: &str) -> String {
                 || !is_ident_continuation(bytes[i + from_bytes.len()]);
             // Every byte of the match must be code too: a name that starts in
             // a replacement field and runs past its closing brace is not one.
-            let all_code = (i..i + from_bytes.len()).all(|k| mask.is_code(k));
+            let all_code = (i..i + from_bytes.len()).all(&is_code);
             if before_ok && after_ok && all_code {
                 out.push_str(to);
                 i += from_bytes.len();
@@ -8417,12 +8558,21 @@ fn render_chain(
                     // points back at the one set of lines the user wrote.
                     src.push(chain.else_body_start + k);
                     // A line that begins inside a triple-quoted string is
-                    // string content end to end; renaming the user's `err`
-                    // binding inside it would rewrite the literal.
-                    if chain.else_in_string.get(k).copied().unwrap_or(false) {
-                        out.push_str(line);
-                    } else {
-                        out.push_str(&rename_whole_word(line, name, &unique_err));
+                    // string content — except for the replacement fields of
+                    // an f-string, where `{err}` is a real reference. The
+                    // whole-source byte kinds tell the two apart, so the
+                    // rename reaches the field and leaves the text alone.
+                    match chain.else_kinds.get(k) {
+                        Some(kinds) => out.push_str(&rename_whole_word_with_kinds(
+                            line,
+                            kinds,
+                            name,
+                            &unique_err,
+                        )),
+                        None if chain.else_in_string.get(k).copied().unwrap_or(false) => {
+                            out.push_str(line)
+                        }
+                        None => out.push_str(&rename_whole_word(line, name, &unique_err)),
                     }
                 }
             }
@@ -9641,9 +9791,12 @@ where
                 }
                 i += 1;
             }
-            Some(StringMode::TripleSingle) | Some(StringMode::TripleDouble) => {
+            Some(StringMode::TripleSingle)
+            | Some(StringMode::TripleDouble)
+            | Some(StringMode::FTripleSingle)
+            | Some(StringMode::FTripleDouble) => {
                 let triple: &[u8] = match in_string {
-                    Some(StringMode::TripleSingle) => b"'''",
+                    Some(StringMode::TripleSingle) | Some(StringMode::FTripleSingle) => b"'''",
                     _ => b"\"\"\"",
                 };
                 if i + 3 <= bytes.len() && &bytes[i..i + 3] == triple {
@@ -11992,6 +12145,124 @@ def f() -> None:
         assert!(
             out.contains("return __typhon_q_0__.value"),
             "the Ok value must be returned:\n{out}"
+        );
+    }
+
+    #[test]
+    fn rescue_at_module_level_is_an_invalid_question_op() {
+        // `rescue` lowers to `try_result(...)?`, so it propagates exactly
+        // like `?` — and used where `?` is invalid it failed later with the
+        // generic `?` message that never mentioned `rescue`.
+        let src = "let n: int = int(raw) rescue e: 0\n";
+        let errs = validate_question_ops(src);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(
+            errs[0].message.contains("`rescue` used at module level"),
+            "got: {}",
+            errs[0].message
+        );
+    }
+
+    #[test]
+    fn rescue_in_a_none_returning_function_names_the_return_type() {
+        let src = "def go() -> None:\n    let n: int = int(raw) rescue e: 0\n";
+        let errs = validate_question_ops(src);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(
+            errs[0]
+                .message
+                .contains("`rescue` used in a function returning `None`"),
+            "got: {}",
+            errs[0].message
+        );
+        assert_eq!(errs[0].line_index, 1);
+    }
+
+    #[test]
+    fn rescue_in_a_result_returning_function_is_fine() {
+        let src = "def go() -> Result[int, str]:\n    let n: int = int(raw) rescue e: 0\n    return Ok(n)\n";
+        assert!(validate_question_ops(src).is_empty());
+    }
+
+    #[test]
+    fn rescue_inside_a_string_is_not_a_rescue() {
+        let src = "let s: str = \"please rescue e: me\"\n";
+        assert!(validate_question_ops(src).is_empty());
+    }
+
+    #[test]
+    fn typed_let_unpack_accepts_a_starred_rest_capture() {
+        // `let (first: int, *rest, last: str) = f()` lowers through a real
+        // starred assignment into hidden slots, so Python's arity rule and
+        // list-making for `*rest` apply unchanged, and the typed `let`s
+        // read the slots.
+        let src = "def f() -> None:\n    let (first: int, *rest, last: str) = parts()\n";
+        let out = expand_typed_let_unpack(src);
+        assert!(
+            out.contains(
+                "let (__typhon_unpack_0__0__, *__typhon_unpack_0__1__, __typhon_unpack_0__2__) = parts()"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("let first: int = __typhon_unpack_0__0__"),
+            "{out}"
+        );
+        assert!(out.contains("let rest = __typhon_unpack_0__1__"), "{out}");
+        assert!(
+            out.contains("let last: str = __typhon_unpack_0__2__"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn typed_let_unpack_with_a_trailing_star_takes_the_tail() {
+        let src = "def f() -> None:\n    let (head: int, *tail) = parts()\n";
+        let out = expand_typed_let_unpack(src);
+        assert!(
+            out.contains("let (__typhon_unpack_0__0__, *__typhon_unpack_0__1__) = parts()"),
+            "{out}"
+        );
+        assert!(
+            out.contains("let head: int = __typhon_unpack_0__0__"),
+            "{out}"
+        );
+        assert!(out.contains("let tail = __typhon_unpack_0__1__"), "{out}");
+    }
+
+    #[test]
+    fn with_chain_else_binding_is_renamed_inside_a_multiline_fstring_field() {
+        // The else body's `err` is renamed to the chain's unique error
+        // binding everywhere it is code — including a replacement field on
+        // the *continuation* line of a triple-quoted f-string, which the
+        // line scanner used to classify as string text (the f-prefix did
+        // not travel across the physical line).
+        let src = "\
+def f() -> Result[int, str]:
+    with a = parse(\"x\")?:
+        return Ok(a)
+    else err:
+        return Err(f\"\"\"failed: {err}
+  {err}\"\"\")
+";
+        let out = expand_with_chains(src);
+        assert!(
+            !out.contains("{err}"),
+            "every `{{err}}` field must be renamed; got:\n{out}"
+        );
+        let fields: Vec<&str> = out
+            .split('{')
+            .skip(1)
+            .filter_map(|rest| rest.split('}').next())
+            .collect();
+        assert_eq!(
+            fields.len(),
+            2,
+            "two replacement fields expected; got {fields:?}\n{out}"
+        );
+        assert_eq!(
+            fields[0], fields[1],
+            "both fields must name the same binding; got {fields:?}"
         );
     }
 

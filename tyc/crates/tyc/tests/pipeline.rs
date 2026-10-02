@@ -720,6 +720,123 @@ fn await_on_stored_asyncio_task_unwraps_to_value() {
 }
 
 #[test]
+fn vm_run_lowers_extension_calls_in_imported_package_modules() {
+    // docs/release-readiness-review-2026-09-30.md §5 follow-up: an
+    // `extend str` declared in a package submodule (`catalogue/text.ty`)
+    // must be lowered (1) in the entry module importing it by dotted name
+    // and (2) inside a sibling module of the package that reaches it with
+    // a relative import — both ran under `tyc build` + CPython but raised
+    // `AttributeError: 'str' object has no attribute 'slug'` under
+    // `tyc run`, which skipped dotted modules and never merged an imported
+    // module's own cross-module extensions.
+    let project = tempfile::tempdir().unwrap();
+    let src = project.path().join("src");
+    let pkg = src.join("catalogue");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        project.path().join("typhon.toml"),
+        "[project]\nname = \"u\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+         [python]\ntarget = \"3.13\"\n[emit]\nformat = false\n[strictness]\n[env]\n",
+    )
+    .unwrap();
+    std::fs::write(pkg.join("__init__.ty"), "pub *\n").unwrap();
+    std::fs::write(
+        pkg.join("text.ty"),
+        "extend str:\n    def slug(self) -> str:\n        return self.lower().replace(\" \", \"-\")\n\n\
+            pub def describe(n: int) -> str:\n    return f\"Item {n}\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        pkg.join("store.ty"),
+        "from .text import describe\n\n\
+            pub def summary(ns: list[int]) -> str:\n    \
+                return \", \".join([describe(n).slug() for n in ns])\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("main.ty"),
+        "from catalogue import summary\nfrom catalogue.text import describe\n\n\
+            def main() -> None:\n    \
+                print(describe(7).slug())\n    \
+                print(summary([1, 2]))\n\n\
+            if __name__ == \"__main__\":\n    main()\n",
+    )
+    .unwrap();
+    let out = tyc().arg("run").arg(project.path()).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.status.success(),
+        "tyc run must lower package-module extension calls, got: {combined}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("item-7\n"),
+        "entry-module receiver: {combined}"
+    );
+    assert!(
+        stdout.contains("item-1, item-2"),
+        "imported-module receiver: {combined}"
+    );
+}
+
+#[test]
+fn vm_run_lowers_extension_calls_reached_through_a_from_dot_import() {
+    // PR #488 review: `from . import text` binds the *submodule*, and its
+    // extensions must reach the importing module's rewrite — the scan used
+    // to resolve the package facade instead and left `text.describe(n).slug()`
+    // as a native attribute access.
+    let project = tempfile::tempdir().unwrap();
+    let src = project.path().join("src");
+    let pkg = src.join("catalogue");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        project.path().join("typhon.toml"),
+        "[project]\nname = \"u\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+         [python]\ntarget = \"3.13\"\n[emit]\nformat = false\n[strictness]\n[env]\n",
+    )
+    .unwrap();
+    std::fs::write(pkg.join("__init__.ty"), "pub *\n").unwrap();
+    std::fs::write(
+        pkg.join("text.ty"),
+        "extend str:\n    def slug(self) -> str:\n        return self.lower().replace(\" \", \"-\")\n\n\
+            pub def describe(n: int) -> str:\n    return f\"Item {n}\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        pkg.join("store.ty"),
+        "from . import text\n\n\
+            pub def summary(ns: list[int]) -> str:\n    \
+                return \", \".join([text.describe(n).slug() for n in ns])\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("main.ty"),
+        "from catalogue.store import summary\n\n\
+            def main() -> None:\n    print(summary([1, 2]))\n\n\
+            if __name__ == \"__main__\":\n    main()\n",
+    )
+    .unwrap();
+    let out = tyc().arg("run").arg(project.path()).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.status.success(),
+        "tyc run must succeed, got: {combined}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("item-1, item-2"),
+        "from-dot import receiver: {combined}"
+    );
+}
+
+#[test]
 fn vm_run_resolves_siblings_and_binds_sealed_union_alias() {
     // Two regressions in one project: (1) the `tyc run` gating check must
     // resolve sibling modules (not check `main.ty` in isolation, which fired
@@ -766,6 +883,74 @@ fn vm_run_resolves_siblings_and_binds_sealed_union_alias() {
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("21"),
         "expected `21` on stdout, got: {combined}"
+    );
+}
+
+#[test]
+fn tyc_run_falls_back_to_the_compiled_path_for_an_unmodelled_attribute() {
+    // The import scan only sees module names. `re` is modelled, but the VM's
+    // model of it has no `purge`, so without an attribute-level scan this
+    // program died with `AttributeError` under the VM while the compiled
+    // path ran it. The scan asks the VM what each modelled module exports
+    // and sends a program reading anything else down the compiled path,
+    // naming the `module.attr` in the note.
+    let project = tempfile::tempdir().unwrap();
+    let script = project.path().join("uses_purge.ty");
+    std::fs::write(
+        &script,
+        "import re\n\n\
+         def main() -> None:\n    \
+             re.purge()\n    \
+             print(re.sub(\"a\", \"b\", \"aaa\"))\n\n\
+         main()\n",
+    )
+    .unwrap();
+
+    let out = tyc().arg("run").arg(&script).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "tyc run must fall back rather than fail:\n{stderr}{stdout}"
+    );
+    assert!(
+        stdout.contains("bbb"),
+        "the program must actually run:\n{stderr}{stdout}"
+    );
+    assert!(
+        stderr.contains("`re.purge` is not modelled by the in-process VM"),
+        "the fallback must name the missing attribute:\n{stderr}"
+    );
+
+    // `--no-fallback` still refuses: the VM's own AttributeError surfaces.
+    let strict = tyc()
+        .arg("run")
+        .arg("--no-fallback")
+        .arg(&script)
+        .output()
+        .unwrap();
+    let strict_err = String::from_utf8_lossy(&strict.stderr);
+    assert!(
+        !strict.status.success() && strict_err.contains("AttributeError"),
+        "--no-fallback must surface the VM's AttributeError:\n{strict_err}"
+    );
+
+    // An attribute the VM does export keeps the program in the VM.
+    let plain = project.path().join("uses_flags.ty");
+    std::fs::write(
+        &plain,
+        "import re\n\ndef main() -> None:\n    print(re.findall(\"a\", \"AaA\", re.I))\n\nmain()\n",
+    )
+    .unwrap();
+    let out = tyc().arg("run").arg(&plain).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("not modelled"),
+        "a modelled-attribute program must stay in the VM:\n{stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("['A', 'a', 'A']"),
+        "{stderr}"
     );
 }
 
