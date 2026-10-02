@@ -10,7 +10,7 @@ publish = false
 [dependencies]
 ruff_text_size = { workspace = true }
 
-get-size2 = { version = "0.8.0", features = ["derive"], optional = true }
+get-size2 = { version = "0.11.0", features = ["derive"], optional = true }
 memchr = "2.7.1"
 serde = { version = "1.0.197", features = ["derive"], optional = true }
 
