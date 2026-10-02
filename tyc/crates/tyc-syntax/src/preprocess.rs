@@ -5044,52 +5044,62 @@ pub fn expand_typed_let_unpack_mapped(source: &str) -> (String, Vec<usize>) {
             Some(rewrite) => {
                 let tmp = format!("__typhon_unpack_{}__", counter);
                 counter += 1;
-                out.push_str(indent);
-                out.push_str("let ");
-                out.push_str(&tmp);
-                out.push_str(" = ");
-                out.push_str(&rewrite.rhs);
-                out.push_str(nl);
-                let star_at = rewrite.captures.iter().position(|c| c.starred);
-                let after_star = star_at.map(|k| rewrite.captures.len() - k - 1);
-                for (i, capture) in rewrite.captures.iter().enumerate() {
+                let has_star = rewrite.captures.iter().any(|c| c.starred);
+                if has_star {
+                    // A starred form lowers through a *real* starred
+                    // assignment into hidden slots, so Python's own arity
+                    // rule applies (`ValueError: not enough values to
+                    // unpack (expected at least 2, got 1)`) and `*rest`
+                    // is the list Python makes of it — slicing the temp
+                    // silently bound both ends of a one-element sequence
+                    // to the same element.
+                    out.push_str(indent);
+                    out.push_str("let (");
+                    for (i, capture) in rewrite.captures.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        if capture.starred {
+                            out.push('*');
+                        }
+                        out.push_str(&format!("{tmp}{i}__"));
+                    }
+                    out.push_str(") = ");
+                    out.push_str(&rewrite.rhs);
+                    out.push_str(nl);
+                    for (i, capture) in rewrite.captures.iter().enumerate() {
+                        out.push_str(indent);
+                        out.push_str("let ");
+                        out.push_str(&capture.name);
+                        if let Some(ty) = &capture.annotation {
+                            out.push_str(": ");
+                            out.push_str(ty);
+                        }
+                        out.push_str(&format!(" = {tmp}{i}__"));
+                        out.push_str(nl);
+                    }
+                } else {
                     out.push_str(indent);
                     out.push_str("let ");
-                    out.push_str(&capture.name);
-                    if let Some(ty) = &capture.annotation {
-                        out.push_str(": ");
-                        out.push_str(ty);
-                    }
+                    out.push_str(&tmp);
                     out.push_str(" = ");
-                    match (star_at, after_star) {
-                        // `*rest` takes the middle as a list, exactly as
-                        // Python's starred assignment does.
-                        (Some(k), Some(n_after)) if i == k => {
-                            out.push_str("list(");
-                            out.push_str(&tmp);
-                            out.push('[');
-                            out.push_str(&i.to_string());
-                            out.push(':');
-                            if n_after > 0 {
-                                out.push_str(&format!("-{n_after}"));
-                            }
-                            out.push_str("])");
-                        }
-                        // Captures after the star count from the end.
-                        (Some(k), Some(n_after)) if i > k => {
-                            out.push_str(&tmp);
-                            out.push('[');
-                            out.push_str(&format!("-{}", n_after - (i - k - 1)));
-                            out.push(']');
-                        }
-                        _ => {
-                            out.push_str(&tmp);
-                            out.push('[');
-                            out.push_str(&i.to_string());
-                            out.push(']');
-                        }
-                    }
+                    out.push_str(&rewrite.rhs);
                     out.push_str(nl);
+                    for (i, capture) in rewrite.captures.iter().enumerate() {
+                        out.push_str(indent);
+                        out.push_str("let ");
+                        out.push_str(&capture.name);
+                        if let Some(ty) = &capture.annotation {
+                            out.push_str(": ");
+                            out.push_str(ty);
+                        }
+                        out.push_str(" = ");
+                        out.push_str(&tmp);
+                        out.push('[');
+                        out.push_str(&i.to_string());
+                        out.push(']');
+                        out.push_str(nl);
+                    }
                 }
             }
             None => {
@@ -12182,22 +12192,25 @@ def f() -> None:
 
     #[test]
     fn typed_let_unpack_accepts_a_starred_rest_capture() {
-        // `let (first: int, *rest, last: str) = f()` — the star takes the
-        // middle as a list (Python's starred-assignment semantics) and the
-        // captures after it index from the end.
+        // `let (first: int, *rest, last: str) = f()` lowers through a real
+        // starred assignment into hidden slots, so Python's arity rule and
+        // list-making for `*rest` apply unchanged, and the typed `let`s
+        // read the slots.
         let src = "def f() -> None:\n    let (first: int, *rest, last: str) = parts()\n";
         let out = expand_typed_let_unpack(src);
-        assert!(out.contains("__typhon_unpack_0__ = parts()"), "{out}");
         assert!(
-            out.contains("let first: int = __typhon_unpack_0__[0]"),
+            out.contains(
+                "let (__typhon_unpack_0__0__, *__typhon_unpack_0__1__, __typhon_unpack_0__2__) = parts()"
+            ),
             "{out}"
         );
         assert!(
-            out.contains("let rest = list(__typhon_unpack_0__[1:-1])"),
+            out.contains("let first: int = __typhon_unpack_0__0__"),
             "{out}"
         );
+        assert!(out.contains("let rest = __typhon_unpack_0__1__"), "{out}");
         assert!(
-            out.contains("let last: str = __typhon_unpack_0__[-1]"),
+            out.contains("let last: str = __typhon_unpack_0__2__"),
             "{out}"
         );
     }
@@ -12207,13 +12220,14 @@ def f() -> None:
         let src = "def f() -> None:\n    let (head: int, *tail) = parts()\n";
         let out = expand_typed_let_unpack(src);
         assert!(
-            out.contains("let head: int = __typhon_unpack_0__[0]"),
+            out.contains("let (__typhon_unpack_0__0__, *__typhon_unpack_0__1__) = parts()"),
             "{out}"
         );
         assert!(
-            out.contains("let tail = list(__typhon_unpack_0__[1:])"),
+            out.contains("let head: int = __typhon_unpack_0__0__"),
             "{out}"
         );
+        assert!(out.contains("let tail = __typhon_unpack_0__1__"), "{out}");
     }
 
     #[test]

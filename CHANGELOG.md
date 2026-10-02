@@ -153,7 +153,25 @@ a bare name bound by one `import`, never a `from` import, an attribute the
 program sets itself, or a name rebound anywhere in the file;
 `--no-fallback` still refuses.
 
-**Supply chain and tooling.** `salsa` 0.27 → 0.28.5 clears
+**Review follow-ups on PR #488.** `from . import text` now carries the
+submodule's extensions and type facts into the importing module under
+`tyc run` (the scan resolved the package facade instead). A `go` inside a
+*nested* `def` no longer makes the enclosing sync function a spawner (both
+the direct and the transitive scan walked root-level nested definitions).
+`Pattern.finditer(s, pos)` reports offsets in the original string. The
+starred typed unpack lowers through a real starred assignment, so too few
+elements raise Python's `ValueError` instead of binding both ends to the
+same element. `UserDict.pop` rejects a second default; `ExitStack.push` /
+`push_async_exit` accept a context manager. The pre-run attribute scan
+exempts a program-defined attribute only for reads after the store, and
+checks `from module import member` against the modelled exports. Go-to-
+definition follows a relative import to the sibling package module. The
+embedded skill copies under `tyc/crates/tyc/skill/` carry the same text as
+the installed ones. `stress/round-2026-09-01/vm/p8.ty` is declared
+nondeterministic (its `as_completed` start order is set-ordered) rather
+than pinned as a divergence.
+
+**Supply chain and tooling.** `salsa` 0.26.2 → 0.28.5 clears
 RUSTSEC-2026-0308 (the only `cargo deny` failure). The perf gate's absolute
 floor is 10 ms rather than 5: with a ~22 ms baseline the 20 % band was inside
 a shared runner's process-start jitter and the gate tripped on a tree with

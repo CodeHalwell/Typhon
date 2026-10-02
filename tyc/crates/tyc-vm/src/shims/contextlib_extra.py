@@ -259,11 +259,19 @@ class AsyncExitStack:
         return result
 
     def push(self, exit):
-        self._exit_callbacks.append((False, exit))
+        # A context manager's own `__exit__` is registered bound, as
+        # CPython does; anything else is taken to be an exit callback.
+        if hasattr(type(exit), "__exit__"):
+            self._exit_callbacks.append((False, exit.__exit__))
+        else:
+            self._exit_callbacks.append((False, exit))
         return exit
 
     def push_async_exit(self, exit):
-        self._exit_callbacks.append((True, exit))
+        if hasattr(type(exit), "__aexit__"):
+            self._exit_callbacks.append((True, exit.__aexit__))
+        else:
+            self._exit_callbacks.append((True, exit))
         return exit
 
     def callback(self, callback, /, *args, **kwds):

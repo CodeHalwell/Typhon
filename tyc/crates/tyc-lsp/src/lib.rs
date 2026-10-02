@@ -1670,7 +1670,14 @@ impl Backend {
     ) -> Option<Location> {
         let current_path = uri_to_path(current)?;
         let (_project_root, src_dir) = find_workspace_layout(&current_path)?;
-        let module_path = resolve_module_to_file(&src_dir, &info.module)?;
+        // `from .kinds import Shape` names a sibling of the importing file's
+        // package, not `src/kinds.ty`.
+        let module = if info.level > 0 {
+            canonical_relative_module(&current_path, &src_dir, &info.module, info.level)?
+        } else {
+            info.module.clone()
+        };
+        let module_path = resolve_module_to_file(&src_dir, &module)?;
         let original_source = std::fs::read_to_string(&module_path).ok()?;
 
         // Cache key: the canonicalised file:// URI of the target file.
@@ -2277,6 +2284,37 @@ fn read_severity_overrides(root: &std::path::Path) -> tyc_diagnostics::SeverityO
 /// retried with a `.py` extension so go-to-definition can also land in a
 /// hand-written `.py` sibling that lives alongside the Typhon sources.
 /// Returns `None` when neither candidate exists on disk.
+/// The absolute dotted name a relative import (`level` leading dots,
+/// `module` as written, possibly empty for `from . import x`) names from
+/// `current_path`: the file's package directory climbs one level per extra
+/// dot, and the written module is appended. `None` when the import climbs
+/// out of `src_dir` or names nothing.
+fn canonical_relative_module(
+    current_path: &std::path::Path,
+    src_dir: &std::path::Path,
+    module: &str,
+    level: u32,
+) -> Option<String> {
+    // A module's package is its directory — for `pkg/sub.ty` and for
+    // `pkg/__init__.ty` alike.
+    let mut base = current_path.parent()?.to_path_buf();
+    for _ in 1..level {
+        base = base.parent()?.to_path_buf();
+    }
+    let rel = base.strip_prefix(src_dir).ok()?;
+    let mut parts: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if !module.is_empty() {
+        parts.extend(module.split('.').map(str::to_owned));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("."))
+}
+
 fn resolve_module_to_file(src_dir: &std::path::Path, module: &str) -> Option<std::path::PathBuf> {
     let parts: Vec<&str> = module.split('.').collect();
     if parts.is_empty() {
@@ -5024,6 +5062,36 @@ mod tests {
     }
 
     // ── cross-file import resolution ─────────────────────────────────────
+
+    #[test]
+    fn canonical_relative_module_resolves_against_the_importing_package() {
+        use std::path::Path;
+        let src = Path::new("/proj/src");
+        let sub = Path::new("/proj/src/pkg/sub.ty");
+        let init = Path::new("/proj/src/pkg/__init__.ty");
+        assert_eq!(
+            canonical_relative_module(sub, src, "kinds", 1).as_deref(),
+            Some("pkg.kinds")
+        );
+        assert_eq!(
+            canonical_relative_module(init, src, "kinds", 1).as_deref(),
+            Some("pkg.kinds")
+        );
+        assert_eq!(
+            canonical_relative_module(sub, src, "top", 2).as_deref(),
+            Some("top")
+        );
+        assert_eq!(
+            canonical_relative_module(sub, src, "", 1).as_deref(),
+            Some("pkg")
+        );
+        assert_eq!(
+            canonical_relative_module(sub, src, "a.b", 1).as_deref(),
+            Some("pkg.a.b")
+        );
+        // Climbing out of the source tree names nothing.
+        assert_eq!(canonical_relative_module(sub, src, "x", 3), None);
+    }
 
     #[test]
     fn resolve_module_to_file_prefers_direct_module_over_package() {

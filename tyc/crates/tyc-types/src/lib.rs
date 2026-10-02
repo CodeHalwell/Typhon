@@ -930,8 +930,12 @@ fn body_calls_one_of(body: &[Stmt], names: &std::collections::HashSet<String>) -
         }
     }
     let mut v = V { names, found: None };
+    // Dispatch through `visit_stmt` so a nested `def` / `class` at the root
+    // of the body is skipped exactly like one deeper down: a spawn inside a
+    // nested function is that frame's business, not the enclosing sync
+    // function's.
     for s in body {
-        ruff_python_ast::visitor::walk_stmt(&mut v, s);
+        ruff_python_ast::visitor::Visitor::visit_stmt(&mut v, s);
         if v.found.is_some() {
             break;
         }
@@ -964,8 +968,11 @@ fn body_spawns_task(body: &[Stmt]) -> Option<String> {
         }
     }
     let mut v = V { found: None };
+    // Through `visit_stmt`, so a nested `def` / `class` at the root of the
+    // body is skipped like one deeper down (a spawn inside it is that
+    // frame's, not this function's).
     for s in body {
-        ruff_python_ast::visitor::walk_stmt(&mut v, s);
+        ruff_python_ast::visitor::Visitor::visit_stmt(&mut v, s);
         if v.found.is_some() {
             break;
         }
@@ -37849,6 +37856,18 @@ def main() -> None:
             let d = check_full("import asyncio\nasync def work() -> None:\n    await asyncio.sleep(0)\ndef kick() -> None:\n    go work()\ndef main() -> None:\n    kick()\nmain()\n");
             assert!(
                 has_error(&d, |e| matches!(e, TycError::GoOutsideAsync { .. })),
+                "{:?}",
+                errors_of(&d)
+            );
+        }
+
+        #[test]
+        fn a_spawn_inside_a_nested_def_does_not_make_the_enclosing_function_a_spawner() {
+            // The nested `def` is its own frame; calling `outer()` at module
+            // level spawns nothing.
+            let d = check_full("import asyncio\nasync def work() -> None:\n    await asyncio.sleep(0)\ndef outer() -> None:\n    def inner() -> None:\n        go work()\n    print(\"outer\")\nouter()\n");
+            assert!(
+                !has_error(&d, |e| matches!(e, TycError::GoOutsideAsync { .. })),
                 "{:?}",
                 errors_of(&d)
             );

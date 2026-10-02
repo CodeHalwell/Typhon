@@ -784,6 +784,59 @@ fn vm_run_lowers_extension_calls_in_imported_package_modules() {
 }
 
 #[test]
+fn vm_run_lowers_extension_calls_reached_through_a_from_dot_import() {
+    // PR #488 review: `from . import text` binds the *submodule*, and its
+    // extensions must reach the importing module's rewrite — the scan used
+    // to resolve the package facade instead and left `text.describe(n).slug()`
+    // as a native attribute access.
+    let project = tempfile::tempdir().unwrap();
+    let src = project.path().join("src");
+    let pkg = src.join("catalogue");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        project.path().join("typhon.toml"),
+        "[project]\nname = \"u\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+         [python]\ntarget = \"3.13\"\n[emit]\nformat = false\n[strictness]\n[env]\n",
+    )
+    .unwrap();
+    std::fs::write(pkg.join("__init__.ty"), "pub *\n").unwrap();
+    std::fs::write(
+        pkg.join("text.ty"),
+        "extend str:\n    def slug(self) -> str:\n        return self.lower().replace(\" \", \"-\")\n\n\
+            pub def describe(n: int) -> str:\n    return f\"Item {n}\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        pkg.join("store.ty"),
+        "from . import text\n\n\
+            pub def summary(ns: list[int]) -> str:\n    \
+                return \", \".join([text.describe(n).slug() for n in ns])\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("main.ty"),
+        "from catalogue.store import summary\n\n\
+            def main() -> None:\n    print(summary([1, 2]))\n\n\
+            if __name__ == \"__main__\":\n    main()\n",
+    )
+    .unwrap();
+    let out = tyc().arg("run").arg(project.path()).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.status.success(),
+        "tyc run must succeed, got: {combined}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("item-1, item-2"),
+        "from-dot import receiver: {combined}"
+    );
+}
+
+#[test]
 fn vm_run_resolves_siblings_and_binds_sealed_union_alias() {
     // Two regressions in one project: (1) the `tyc run` gating check must
     // resolve sibling modules (not check `main.ty` in isolation, which fired

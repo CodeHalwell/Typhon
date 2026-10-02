@@ -615,7 +615,7 @@ fn unmodelled_attribute_references(
         scan.visit_stmt(stmt);
     }
     let mut missing = std::collections::BTreeSet::new();
-    for (root, chain) in &scan.loads {
+    for (root, chain, read_at) in &scan.loads {
         if scan.shadowed.contains(root) {
             continue;
         }
@@ -627,7 +627,14 @@ fn unmodelled_attribute_references(
         for attr in chain {
             owned.push('.');
             owned.push_str(attr);
-            if scan.program_defined.contains(&owned) {
+            // The program's own store exempts a read only when it comes
+            // first in the file: `print(re.purge); re.purge = …` still
+            // reads the VM's `re` before the program has defined anything.
+            if scan
+                .program_defined
+                .get(&owned)
+                .is_some_and(|defined_at| defined_at < read_at)
+            {
                 break;
             }
             let Some(names) = exports.names(&module_name) else {
@@ -640,6 +647,20 @@ fn unmodelled_attribute_references(
             module_name.push('.');
             module_name.push_str(attr);
         }
+    }
+    // `from re import purge` would fail at the import itself: a member a
+    // modelled module does not export is the same gap as `re.purge`, unless
+    // it is a submodule the VM also serves (`from os import path`).
+    for (module, member) in &scan.from_imports {
+        let present = exports.names(module).map(|names| names.contains(member));
+        match present {
+            None | Some(true) => continue,
+            Some(false) => {}
+        }
+        if exports.names(&format!("{module}.{member}")).is_some() {
+            continue;
+        }
+        missing.insert(format!("{module}.{member}"));
     }
     missing
 }
@@ -654,14 +675,25 @@ struct AttributeScan {
     /// Names bound by anything other than one consistent `import` — never
     /// trusted as module receivers.
     shadowed: std::collections::HashSet<String>,
-    /// `(root name, attribute chain)` for every `root.a.b` read.
-    loads: Vec<(String, Vec<String>)>,
+    /// `(root name, attribute chain, byte offset)` for every `root.a.b`
+    /// read.
+    loads: Vec<(String, Vec<String>, usize)>,
     /// Dotted paths (`root.a`, `root.a.b`) the program assigns, deletes or
-    /// `setattr`s itself.
-    program_defined: std::collections::HashSet<String>,
+    /// `setattr`s itself, with the byte offset of the first such store.
+    program_defined: std::collections::HashMap<String, usize>,
+    /// `(module, member)` for every `from module import member` where the
+    /// module is one the VM models.
+    from_imports: Vec<(String, String)>,
 }
 
 impl AttributeScan {
+    fn define(&mut self, path: String, at: usize) {
+        self.program_defined
+            .entry(path)
+            .and_modify(|first| *first = (*first).min(at))
+            .or_insert(at);
+    }
+
     fn bind_import(&mut self, bound: &str, module: &str) {
         match self.aliases.get(bound) {
             Some(existing) if existing != module => {
@@ -720,6 +752,12 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                 }
             }
             Stmt::ImportFrom(imp) => {
+                let modelled_source = match (&imp.module, imp.level) {
+                    (Some(module), 0) if tyc_vm::models_module(module.as_str()) => {
+                        Some(module.as_str().to_owned())
+                    }
+                    _ => None,
+                };
                 for alias in &imp.names {
                     let bound = alias
                         .asname
@@ -727,6 +765,12 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                         .map(|a| a.as_str())
                         .unwrap_or(alias.name.as_str());
                     self.shadowed.insert(bound.to_owned());
+                    if let Some(module) = &modelled_source {
+                        if alias.name.as_str() != "*" {
+                            self.from_imports
+                                .push((module.clone(), alias.name.as_str().to_owned()));
+                        }
+                    }
                 }
             }
             Stmt::FunctionDef(f) => {
@@ -754,8 +798,9 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
             }
             Expr::Attribute(a) => {
                 if let Some((root, chain)) = attribute_chain(a) {
+                    let at = a.range.start().to_usize();
                     if matches!(a.ctx, ExprContext::Load) {
-                        self.loads.push((root, chain));
+                        self.loads.push((root, chain, at));
                     } else {
                         // `mod.x = …` / `del mod.x`: every prefix the store
                         // touches is the program's own.
@@ -764,7 +809,7 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                             path.push('.');
                             path.push_str(attr);
                         }
-                        self.program_defined.insert(path);
+                        self.define(path, at);
                     }
                     // The chain is names and attributes only: nothing left
                     // to walk.
@@ -779,11 +824,10 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                         if let [Expr::Name(target), Expr::StringLiteral(name), ..] =
                             call.arguments.args.as_ref()
                         {
-                            self.program_defined.insert(format!(
-                                "{}.{}",
-                                target.id.as_str(),
-                                name.value.to_str()
-                            ));
+                            self.define(
+                                format!("{}.{}", target.id.as_str(), name.value.to_str()),
+                                call.range.start().to_usize(),
+                            );
                         }
                     }
                 }
@@ -1051,8 +1095,47 @@ mod tests {
     }
 
     #[test]
+    fn attribute_scan_checks_from_imported_members_of_modelled_modules() {
+        // `from re import purge` fails at the import under the VM exactly as
+        // `re.purge` would at the read, so it takes the compiled path too.
+        assert_eq!(
+            scan_source("from re import purge\n\npurge()\n"),
+            Some(vec!["re.purge".to_owned()])
+        );
+        // A member the VM has, and a submodule the VM serves, are fine.
+        assert_eq!(
+            scan_source("from math import isclose\n\nprint(isclose(1.0, 1.0))\n"),
+            None
+        );
+        assert_eq!(
+            scan_source("from os import path\n\nprint(path.join(\"a\", \"b\"))\n"),
+            None
+        );
+        // A project module is the import scan's business, not this one's.
+        assert_eq!(
+            scan_source("from .sibling import thing\n\nprint(thing)\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn attribute_scan_exempts_a_program_defined_attribute_only_after_its_store() {
+        // The store comes first: the read is the program's own attribute.
+        assert_eq!(
+            scan_source("import re\n\nre.purge = 1\nprint(re.purge)\n"),
+            None
+        );
+        // The read comes first: it still reaches the VM's `re`, which has no
+        // `purge`, so the program takes the compiled path.
+        assert_eq!(
+            scan_source("import re\n\nprint(re.purge)\nre.purge = 1\n"),
+            Some(vec!["re.purge".to_owned()])
+        );
+    }
+
+    #[test]
     fn attribute_scan_ignores_from_imports_and_program_defined_attributes() {
-        // `from mod import name` binds a plain name: nothing to scan.
+        // A name a `from` import binds is never read as a module.
         assert_eq!(
             scan_source("from math import isclose\n\nprint(isclose(1.0, 1.0))\n"),
             None

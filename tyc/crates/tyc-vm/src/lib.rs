@@ -401,6 +401,30 @@ pub(crate) fn merge_cross_module_extensions_for_vm(
                     (None, level) if level > 0 => String::new(),
                     (None, _) => continue,
                 };
+                // `from . import text` / `from .. import kinds`: each alias
+                // is first and foremost a *submodule* of that package, and
+                // its own extensions and facts are the ones the importing
+                // module can reach through it. Only a name the package does
+                // not have as a submodule is looked up on the package
+                // facade (`from . import Thing` re-exported by a `pub *`).
+                if name.is_empty() {
+                    for alias in &i.names {
+                        let imported = alias.name.as_str();
+                        let local = alias
+                            .asname
+                            .as_ref()
+                            .map(|a| a.as_str())
+                            .unwrap_or(imported);
+                        if let Some(sub) = load(imported, i.level, registry, &mut cross_fns) {
+                            publish_lifted(&mut external, &sub);
+                            external.modules.insert(local.to_owned(), sub);
+                        } else if let Some(pkg) = load("", i.level, registry, &mut cross_fns) {
+                            publish_lifted(&mut external, &pkg);
+                            external.import_name(&pkg, imported, local);
+                        }
+                    }
+                    continue;
+                }
                 let Some(facts) = load(&name, i.level, registry, &mut cross_fns) else {
                     continue;
                 };
@@ -2170,6 +2194,83 @@ extend str:
 
 let s: str = "Hello World"
 print(s.slug())
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn finditer_with_pos_reports_offsets_in_the_original_string() {
+        // PR #488 review: `finditer(s, pos)` searched a slice, so `span()`
+        // was relative to the slice. Empty matches still advance.
+        let src = r#"
+import re
+let spans = [m.span() for m in re.compile("a").finditer("aXa", 1)]
+if spans != [(2, 3)]:
+    raise ValueError(str(spans))
+let starts = [m.start() for m in re.compile("").finditer("ab", 1)]
+if starts != [1, 2]:
+    raise ValueError(str(starts))
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn starred_typed_unpack_keeps_pythons_arity_rule() {
+        // PR #488 review: the slice-based lowering bound `first` and `last`
+        // to the same element of a one-element sequence; the starred
+        // assignment it lowers through now raises as Python does.
+        let src = r#"
+def f(xs: list[int]) -> int:
+    let (first: int, *rest, last: int) = xs
+    return first + last + len(rest)
+
+if f([1, 2, 3, 4]) != 7:
+    raise ValueError("wrong arithmetic")
+try:
+    f([1])
+    raise AssertionError("no error")
+except ValueError as e:
+    if "not enough values to unpack" not in str(e):
+        raise AssertionError(str(e))
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn user_dict_pop_rejects_a_second_default() {
+        let src = r#"
+from collections import UserDict
+let d = UserDict({"a": 1})
+try:
+    d.pop("x", 1, 2)
+    raise AssertionError("accepted")
+except TypeError as e:
+    if "takes from 2 to 3 positional arguments" not in str(e):
+        raise AssertionError(str(e))
+if d.pop("a") != 1 or d.pop("zz", 5) != 5:
+    raise AssertionError("pop")
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn exit_stack_push_accepts_a_context_manager() {
+        let src = r#"
+from contextlib import ExitStack
+mut log: list[str] = []
+class Res:
+    name: str
+impl Res:
+    def __enter__(self) -> Res:
+        return self
+    def __exit__(self, et, ev, tb) -> bool:
+        log.append("exit " + self.name)
+        return False
+with ExitStack() as stack:
+    stack.push(Res(name="a"))
+    stack.callback(lambda: log.append("cb"))
+if log != ["cb", "exit a"]:
+    raise AssertionError(str(log))
 "#;
         assert_eq!(run_capturing(src).unwrap(), 0);
     }

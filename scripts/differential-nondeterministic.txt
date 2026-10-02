@@ -47,3 +47,13 @@
 # rather than neutered. The VM and CPython take legitimately different amounts
 # of time, so the printed value cannot agree.
 examples/58-context-managers/context_managers.ty
+
+# `asyncio.as_completed([work("q", 0.01), work("r", 0)])` schedules its
+# futures from a set, so the order in which the two tasks *start* (the
+# `start q` / `start r` lines) depends on object hashes — address-dependent,
+# and it differs between two CPython runs of the same build (the 2026-10-01
+# CI run saw it agree; the local refresh the same day saw it differ). The
+# unit's point is the whole asyncio surface, so it is listed rather than
+# neutered; `tyc run` takes the compiled path for it anyway (the pre-run scan
+# finds `asyncio.as_completed` / `shield` / `wait` unmodelled).
+stress/round-2026-09-01/vm/p8.ty

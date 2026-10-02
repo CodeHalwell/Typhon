@@ -122,7 +122,7 @@ The 30-second mental model. Every later section in this skill is detail under on
 | Local binding | `let x: int = 1` / `mut x: int = 1` | `x: int = 1` |
 | Module binding | `X: int = 1` (implicit `let`) or `mut X: int = 1` | `X: int = 1` |
 | Declare-then-assign (v0.7.0) | `let loaded: Cfg` then assign on every non-diverging arm | `loaded: Cfg` then `loaded = …` |
-| Typed tuple unpack (v0.3.1) | `let (a: int, b: str) = pair()` — one `*rest` capture allowed (2026-09-30) | hidden temp + per-element typed assigns (`list(tmp[i:-k])` for the star) |
+| Typed tuple unpack (v0.3.1) | `let (a: int, b: str) = pair()` — one `*rest` capture allowed (2026-09-30) | hidden temp + per-element typed assigns; the starred form goes through a real starred assignment into hidden slots, so Python's arity `ValueError` applies |
 | Deep-immutable binding | `freeze let CFG = {"port": 8080, "hosts": ["a", "b"]}` | `CFG = __typhon_freeze__({...})` (deep-freezes value) |
 | Public name | `pub let API_VERSION: str = "v1"` / `pub class Foo: ...` | synthesised `__all__ = [...]` at top of module |
 | Package re-export (v0.7.0) | `pub *` in `__init__.ty` | aggregates sibling modules + sub-packages |

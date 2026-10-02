@@ -851,6 +851,10 @@ class UserDict:
         return default
 
     def pop(self, key, *default):
+        if len(default) > 1:
+            raise TypeError(
+                f"UserDict.pop() takes from 2 to 3 positional arguments but {len(default) + 2} were given"
+            )
         if key in self:
             value = self[key]
             del self[key]

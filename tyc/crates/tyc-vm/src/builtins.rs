@@ -6962,10 +6962,30 @@ fn make_re_module() -> Value {
                 let s = re_str_arg(&a[0], "finditer")?;
                 let (hay, pos) = re_window(&s, &a[1], &a[2])?;
                 let names = name_indices(&p2f);
-                let out: Vec<Value> = p2f
-                    .captures_iter(&hay[pos..])
-                    .map(|c| captures_to_value(Some(c), &names))
-                    .collect();
+                // Search the full window from `pos` rather than a slice
+                // starting there, so every match reports its offsets in the
+                // original string (`span()` on a `finditer(s, 1)` hit was
+                // slice-relative) and `^` keeps meaning the real start.
+                let mut out: Vec<Value> = Vec::new();
+                let mut at = pos;
+                while at <= hay.len() {
+                    let Some(caps) = p2f.captures_at(&hay, at) else {
+                        break;
+                    };
+                    let whole = caps.get(0).expect("group 0 always present");
+                    let (start, end) = (whole.start(), whole.end());
+                    out.push(captures_to_value(Some(caps), &names));
+                    at = if end > start {
+                        end
+                    } else {
+                        // An empty match: step one character so the scan
+                        // makes progress, as `captures_iter` does.
+                        match hay[end..].chars().next() {
+                            Some(ch) => end + ch.len_utf8(),
+                            None => break,
+                        }
+                    };
+                }
                 Ok(Value::List(Rc::new(RefCell::new(out))))
             }))),
         );

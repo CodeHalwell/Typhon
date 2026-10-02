@@ -524,7 +524,7 @@ Deep immutability for class instances is an emit-time concern: pass `frozen=True
 
 ### Tuple-unpacking `let` (with per-element types)
 
-`let (a: int, b: str) = func(x, y)` is sugar for "bind the result of `func(x, y)` to a hidden temp, then introduce `a: int` and `b: str` from the temp's first and second elements." Compound annotations survive the top-level-comma split (`let (xs: list[int], m: dict[str, int]) = …`), and mixed forms emit the un-annotated leg without a type so the checker fills it in (`let (a: int, b) = pair()`). The un-annotated tuple form (`let (a, b) = pair()`) continues to flow through unchanged with no synthetic temp. A single starred capture is accepted too — `let (first: int, *rest, last: str) = parts()` binds `rest` to a `list` of the middle elements and indexes the captures after it from the end, as Python's starred assignment does; the star itself cannot be annotated.
+`let (a: int, b: str) = func(x, y)` is sugar for "bind the result of `func(x, y)` to a hidden temp, then introduce `a: int` and `b: str` from the temp's first and second elements." Compound annotations survive the top-level-comma split (`let (xs: list[int], m: dict[str, int]) = …`), and mixed forms emit the un-annotated leg without a type so the checker fills it in (`let (a: int, b) = pair()`). The un-annotated tuple form (`let (a, b) = pair()`) continues to flow through unchanged with no synthetic temp. A single starred capture is accepted too — `let (first: int, *rest, last: str) = parts()` lowers through a real starred assignment into hidden slots, so `rest` is the `list` Python makes of the middle elements and too few elements raise Python's own `ValueError`; the star itself cannot be annotated.
 
 ### Declare-only `let NAME: T` with arm assignment
 

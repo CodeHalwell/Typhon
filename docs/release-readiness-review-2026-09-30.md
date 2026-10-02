@@ -580,6 +580,8 @@ unknown digest raises `ValueError`. The extension-lowering gap that
 surfaced while building the new app — an extension declared in a package
 submodule, or called inside an imported module, raised `AttributeError`
 under `tyc run` only — is fixed and covered by a pipeline test. The
-differential gate over the full corpus passes with the same seven pinned
-divergences as before.
+differential gate over the full corpus passes with six pinned divergences
+(the seventh, `vm/p8.ty`, turned out to be CPython disagreeing with itself
+on `as_completed`'s set-ordered task start, and is declared
+nondeterministic instead).
 
