@@ -39,3 +39,7 @@
 **Vulnerability:** A hardcoded secrets check (`contains_secret_literal`) failed to detect `OAUTHTOKEN` as a secret, despite catching `OAUTH_TOKEN` (which matches the `TOKEN` boundary heuristic).
 **Learning:** Fully capitalized squashed acronyms like `OAUTHTOKEN` are missed by the word-boundary logic because there is no explicit boundary (like an underscore or CamelCase transition) before the `TOKEN` suffix.
 **Prevention:** Explicitly register all permutations of high-risk security keywords, including fully collapsed acronyms like `OAUTHTOKEN`, to `SECRET_NAME_KEYWORDS` to prevent false negatives.
+## 2024-05-28 - Ensure all permutations of high-risk security keywords are explicitly registered
+**Vulnerability:** A hardcoded secrets check (`contains_secret_literal`) failed to detect `APPKEY` and `APP_KEY` as secrets.
+**Learning:** Case-boundary heuristics and substring matching logic may miss fully capitalized squashed acronyms like `APPKEY` and `APP_KEY` if they are not explicitly registered as standalone keywords, leading to potential false negatives for common secret variable names.
+**Prevention:** When updating or adding to the `tyc::contains_secret_literal` diagnostic, explicitly register all common permutations of high-risk security keywords (like `APP_KEY` and `APPKEY`), as boundary heuristics cannot be fully relied upon to catch all variations.
