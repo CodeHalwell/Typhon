@@ -49,3 +49,6 @@
 ## 2024-11-28 - Zero-Allocation AST Import Traversal (Extension)
 **Learning:** `collect_imported_modules` within `tyc-venv` allocated strings for every module import inside the source file using `extract_dotted_modules_from_import` and `HashSet<String>`.
 **Action:** By borrowing `&str` instead via `HashSet<&str>`, and only calling `.to_owned()` conditionally for the collected subset of modules, we avoid significant allocation overhead during the import parsing step.
+## 2024-05-18 - Prevented unnecessary String allocation in local_classes AST traversal
+**Learning:** In Rust AST passes, temporary lookups (like `local_classes`) shouldn't eagerly heap-allocate Strings if the references borrowed from `Vec<Stmt>` can live until the vector is consumed via `.into_iter()`. The borrow checker is satisfied as long as the `HashSet` holding those borrows is dropped explicitly before the iteration consumes the AST vector.
+**Action:** Always prefer `HashSet<&str>` over `HashSet<String>` for temporary name-tracking in AST traversals, and explicitly `drop` the collection before consuming the AST to prevent borrow checker conflicts.
