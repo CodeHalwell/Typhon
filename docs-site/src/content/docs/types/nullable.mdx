@@ -19,7 +19,7 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 | Nullable dict value | `dict[str, int?]` | `dict[str, int \| None]` |
 | Nullable param with default `None` | `name: str? = None` | `name: str \| None = None` |
 
-`Optional[T]` from `typing` and `T | None` are both rejected in `.ty` source; the migrator rewrites them. Internally Typhon represents nullability as `Nullable[T]`, but the emitter always lowers to `T | None`.
+`T?` is the preferred spelling. `T | None` is also accepted silently. `Optional[T]` from `typing` is accepted with one advisory warning (`tyc::typing_alias_in_annotation`, "prefer `T?` here"); the migrator rewrites it. Internally Typhon represents nullability as `Nullable[T]`, but the emitter always lowers to `T | None`.
 
 ## Default values
 
@@ -172,7 +172,7 @@ Fix: change the signature to `-> str?` or return a real `str`.
 
 ```python
 from typing import Optional
-def f(x: Optional[int]) -> None: ...    # ❌ — use `x: int?`
+def f(x: Optional[int]) -> None: ...    # accepted with a warning — prefer `x: int?`
 ```
 
 `tyc migrate` rewrites this automatically.
