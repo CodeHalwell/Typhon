@@ -299,3 +299,171 @@ def total(t: IntTree) -> int:
 "#,
     );
 }
+
+// ── W1-02: passing an object to a call ────────────────────────────────────
+
+fn assert_rejected(src: &str) {
+    let d = check(src);
+    assert!(
+        !d.errors().is_empty(),
+        "expected the stale narrowing to be rejected, got no errors"
+    );
+}
+
+const ITEMS: &str = r#"
+import logging
+class Item:
+    name: str
+    price: float?
+class Box:
+    value: int?
+class Card frozen:
+    name: str?
+"#;
+
+fn items(body: &str) -> String {
+    format!("{ITEMS}\n{body}")
+}
+
+#[test]
+fn w1_02_builtin_stdlib_and_container_calls_keep_narrowings() {
+    for call in [
+        "print(it)",
+        "out.append(it)",
+        "logging.info(\"%s\", it)",
+        "seen.add(it.name)",
+    ] {
+        assert_clean(&items(&format!(
+            r#"
+def f(it: Item, out: list[Item], seen: set[str]) -> float:
+    if it.price is not None:
+        {call}
+        return it.price
+    return 0.0
+"#
+        )));
+    }
+}
+
+#[test]
+fn w1_02_local_callee_that_cannot_write_the_field_keeps_narrowings() {
+    assert_clean(&items(
+        r#"
+def show(it: Item) -> None:
+    print(it.name)
+
+def rename(it: Item) -> None:
+    it.name = "x"
+
+def f(it: Item) -> float:
+    if it.price is not None:
+        show(it)
+        rename(it)
+        return it.price
+    return 0.0
+"#,
+    ));
+    assert_clean(&items(
+        r#"
+class Mgr:
+    n: int
+
+impl Mgr:
+    def show(self, b: Box) -> None:
+        print(b)
+
+def f(m: Mgr, b: Box) -> int:
+    if b.value is not None:
+        m.show(b)
+        return b.value
+    return 0
+"#,
+    ));
+}
+
+#[test]
+fn w1_02_frozen_argument_keeps_its_own_field_narrowings() {
+    assert_clean(&items(
+        r#"
+def logc(c: Card) -> None:
+    print(c)
+
+def f(c: Card) -> str:
+    if c.name is not None:
+        logc(c)
+        return c.name.upper()
+    return ""
+"#,
+    ));
+}
+
+#[test]
+fn w1_02_a_callee_that_can_write_the_field_still_invalidates() {
+    // Direct, transitive, through a method, through `setattr`, through a
+    // constructor that writes its argument, and through an opaque callable.
+    let cases = [
+        "def clear(b: Box) -> None:\n    b.value = None\n",
+        "def wipe(b: Box) -> None:\n    b.value = None\n\ndef clear(b: Box) -> None:\n    wipe(b)\n",
+        "def clear(b: Box) -> None:\n    setattr(b, \"value\", None)\n",
+    ];
+    for helper in cases {
+        assert_rejected(&items(&format!(
+            r#"
+{helper}
+def f(b: Box) -> int:
+    if b.value is not None:
+        clear(b)
+        return b.value
+    return 0
+"#
+        )));
+    }
+    assert_rejected(&items(
+        r#"
+class Mgr:
+    n: int
+
+impl Mgr:
+    def reset(self, b: Box) -> None:
+        b.value = None
+
+def f(m: Mgr, b: Box) -> int:
+    if b.value is not None:
+        m.reset(b)
+        return b.value
+    return 0
+"#,
+    ));
+    assert_rejected(&items(
+        r#"
+plain class Taker:
+    def __init__(self, b: Box) -> None:
+        b.value = None
+
+def f(b: Box) -> int:
+    if b.value is not None:
+        Taker(b)
+        return b.value
+    return 0
+"#,
+    ));
+    assert_rejected(&items(
+        r#"
+from typing import Callable
+def f(b: Box, cb: Callable[[Box], None]) -> int:
+    if b.value is not None:
+        cb(b)
+        return b.value
+    return 0
+"#,
+    ));
+    assert_rejected(&items(
+        r#"
+def f(b: Box) -> int:
+    if b.value is not None:
+        setattr(b, "value", None)
+        return b.value
+    return 0
+"#,
+    ));
+}

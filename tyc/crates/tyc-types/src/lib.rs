@@ -2758,6 +2758,17 @@ impl TypeEnv {
             .retain(|k, _| k != path && !k.starts_with(&sub_prefix));
     }
 
+    /// Drop the narrowings on paths below `root` (`root.a`, `root.a.b`, …)
+    /// for which `stale` holds of the path's segments after `root`.
+    fn clear_attr_narrowings_under(&mut self, root: &str, stale: impl Fn(&[&str]) -> bool) {
+        let prefix = format!("{root}.");
+        self.attr_narrowings
+            .retain(|k, _| match k.strip_prefix(&prefix) {
+                Some(rest) => !stale(&rest.split('.').collect::<Vec<_>>()),
+                None => true,
+            });
+    }
+
     /// Drop every narrowing whose path ends in `.field` (and their
     /// sub-paths) except `keep` itself — a write to that field through one
     /// root may have gone through an alias of any other root.
@@ -3179,6 +3190,10 @@ struct Checker<'a> {
     /// (review 2026-09-30 §3.4). Empty for the overwhelmingly common
     /// function with no `nonlocal` anywhere beneath it.
     nonlocals_rebound_by_call: std::collections::HashSet<String>,
+    /// Which fields a call into this module's own functions, constructors
+    /// and methods can write — what a statement-position call may do to the
+    /// narrowings of an object passed to it. See [`FieldWriteSummary`].
+    field_writes: FieldWriteSummary,
     /// For each declared function name, its inferred signature type.
     function_signatures: HashMap<String, Type>,
     /// Per-function arity metadata that doesn't fit in `Type::Function`
@@ -3680,6 +3695,7 @@ impl<'a> Checker<'a> {
             is_assignable_path: std::cell::RefCell::new(Vec::new()),
             classes: Vec::new(),
             globals_rebound_by_call: std::collections::HashSet::new(),
+            field_writes: FieldWriteSummary::default(),
             nonlocals_rebound_by_call: std::collections::HashSet::new(),
             function_signatures: HashMap::new(),
             function_arity_info: HashMap::new(),
@@ -6754,6 +6770,7 @@ pub fn check_module_with_imports(
     // First pass: collect class names + function signatures so forward
     // references work.
     collect_call_rebound_globals(&module.body, &mut c.globals_rebound_by_call);
+    c.field_writes = FieldWriteSummary::collect(&module.body);
     // Frozen-ness first: the class pass infers type-parameter variance and
     // needs to know which classes are `frozen` (their fields are
     // read-only, hence covariant).
@@ -12158,6 +12175,410 @@ fn collect_nested_nonlocals(body: &[Stmt]) -> std::collections::HashSet<String> 
     acc
 }
 
+/// What a call into this module's own code can do to the fields of an object
+/// handed to it, built once per module by [`FieldWriteSummary::collect`].
+///
+/// A statement-position call used to drop every field narrowing of every
+/// bare-name argument (review 2026-09-30 §3.8), so `print(it)`,
+/// `out.append(it)` and `logging.info("%s", it)` made a just-checked
+/// `it.price is not None` stale (review 2026-10-03 §4.3). The summary keeps
+/// the invalidation where a callee can actually write the field — a local
+/// `clear(b)` that does `b.value = None` — and drops it where it cannot.
+///
+/// Calls resolved inside a summarised body follow the same rules as at a call
+/// site, with one documented gap: a method call on a receiver of unknown type
+/// whose name no local class defines (`session.add(it)`) is taken to be a
+/// builtin- or library-object method that rebinds no field of its arguments.
+#[derive(Default)]
+struct FieldWriteSummary {
+    /// Local free function, or local class (its constructor), → the field
+    /// names it may write, transitively through local calls. `None`: it may
+    /// write anything, because it calls code whose body is not visible here.
+    funcs: HashMap<String, Option<HashSet<String>>>,
+    /// Method name → the union over every local class's method of that name.
+    methods: HashMap<String, Option<HashSet<String>>>,
+    /// Module-level import bindings: local name → dotted source module
+    /// (a leading `.` for a relative import).
+    imports: HashMap<String, String>,
+    /// Python builtin names, cached for the per-call-site lookup.
+    builtins: HashSet<&'static str>,
+}
+
+/// What a statement-position call may do to its arguments' field narrowings.
+enum ArgEffect {
+    /// Rebinds no field of an argument: builtins, the stdlib, methods of
+    /// builtin values.
+    Nothing,
+    /// May write exactly these field names.
+    Fields(HashSet<String>),
+    /// May write anything.
+    Anything,
+}
+
+impl ArgEffect {
+    fn from_summary(w: &Option<HashSet<String>>) -> ArgEffect {
+        match w {
+            Some(fields) if fields.is_empty() => ArgEffect::Nothing,
+            Some(fields) => ArgEffect::Fields(fields.clone()),
+            None => ArgEffect::Anything,
+        }
+    }
+}
+
+fn is_stdlib_dotted(module: &str) -> bool {
+    if module.starts_with('.') {
+        return false;
+    }
+    let root = module.split('.').next().unwrap_or(module);
+    tyc_resolve::python_stdlib_modules().contains(&root)
+}
+
+impl FieldWriteSummary {
+    fn collect(body: &[Stmt]) -> Self {
+        #[derive(Default)]
+        struct Direct {
+            writes: HashSet<String>,
+            unknown: bool,
+            funcs: HashSet<String>,
+            methods: HashSet<String>,
+        }
+        struct Facts<'a> {
+            d: Direct,
+            ctor: bool,
+            local_funcs: &'a HashSet<String>,
+            local_methods: &'a HashSet<String>,
+            imports: &'a HashMap<String, String>,
+            builtins: &'a HashSet<&'static str>,
+        }
+        impl Facts<'_> {
+            fn target(&mut self, t: &Expr) {
+                match t {
+                    Expr::Attribute(a) => {
+                        let own_field = self.ctor
+                            && matches!(a.value.as_ref(), Expr::Name(n) if matches!(n.id.as_str(), "self" | "cls"));
+                        if !own_field {
+                            self.d.writes.insert(a.attr.as_str().to_owned());
+                        }
+                    }
+                    Expr::Tuple(x) => x.elts.iter().for_each(|e| self.target(e)),
+                    Expr::List(x) => x.elts.iter().for_each(|e| self.target(e)),
+                    Expr::Starred(s) => self.target(&s.value),
+                    _ => {}
+                }
+            }
+            fn literal_field(&mut self, args: &[Expr], upto: usize) {
+                match args.iter().take(upto).find_map(|a| match a {
+                    Expr::StringLiteral(s) => Some(s.value.to_str().to_owned()),
+                    _ => None,
+                }) {
+                    Some(f) => {
+                        self.d.writes.insert(f);
+                    }
+                    None => self.d.unknown = true,
+                }
+            }
+            fn call(&mut self, call: &ruff_python_ast::ExprCall) {
+                let args = &call.arguments.args;
+                match call.func.as_ref() {
+                    Expr::Name(n) => {
+                        let f = n.id.as_str();
+                        if self.local_funcs.contains(f) {
+                            self.d.funcs.insert(f.to_owned());
+                        } else if let Some(m) = self.imports.get(f) {
+                            if !is_stdlib_dotted(m) {
+                                self.d.unknown = true;
+                            }
+                        } else if matches!(f, "setattr" | "delattr") {
+                            self.literal_field(args, 2);
+                        } else if !self.builtins.contains(f) {
+                            self.d.unknown = true;
+                        }
+                    }
+                    Expr::Attribute(a) => {
+                        let m = a.attr.as_str();
+                        if matches!(m, "__setattr__" | "__delattr__") {
+                            self.literal_field(args, 2);
+                        } else if let Some(module) = match a.value.as_ref() {
+                            Expr::Name(r) => self.imports.get(r.id.as_str()),
+                            _ => None,
+                        } {
+                            if !is_stdlib_dotted(module) {
+                                self.d.unknown = true;
+                            }
+                        } else if self.local_methods.contains(m) {
+                            self.d.methods.insert(m.to_owned());
+                        }
+                    }
+                    _ => self.d.unknown = true,
+                }
+            }
+        }
+        impl<'a> ruff_python_ast::visitor::Visitor<'a> for Facts<'_> {
+            fn visit_stmt(&mut self, s: &'a Stmt) {
+                match s {
+                    Stmt::Assign(a) => a.targets.iter().for_each(|t| self.target(t)),
+                    Stmt::AugAssign(a) => self.target(&a.target),
+                    Stmt::AnnAssign(a) if a.value.is_some() => self.target(&a.target),
+                    Stmt::Delete(d) => d.targets.iter().for_each(|t| self.target(t)),
+                    Stmt::For(f) => self.target(&f.target),
+                    Stmt::With(w) => w
+                        .items
+                        .iter()
+                        .filter_map(|i| i.optional_vars.as_deref())
+                        .for_each(|t| self.target(t)),
+                    _ => {}
+                }
+                ruff_python_ast::visitor::walk_stmt(self, s);
+            }
+            fn visit_expr(&mut self, e: &'a Expr) {
+                if let Expr::Call(call) = e {
+                    self.call(call);
+                }
+                ruff_python_ast::visitor::walk_expr(self, e);
+            }
+        }
+
+        let mut imports: HashMap<String, String> = HashMap::new();
+        let mut local_funcs: HashSet<String> = HashSet::new();
+        let mut local_methods: HashSet<String> = HashSet::new();
+        for s in body {
+            match s {
+                Stmt::Import(i) => {
+                    for a in &i.names {
+                        let dotted = a.name.as_str();
+                        let local = match &a.asname {
+                            Some(n) => n.as_str(),
+                            None => dotted.split('.').next().unwrap_or(dotted),
+                        };
+                        imports.insert(local.to_owned(), dotted.to_owned());
+                    }
+                }
+                Stmt::ImportFrom(i) => {
+                    let module = format!(
+                        "{}{}",
+                        ".".repeat(i.level as usize),
+                        i.module.as_ref().map(|m| m.as_str()).unwrap_or("")
+                    );
+                    for a in &i.names {
+                        let local = a.asname.as_ref().unwrap_or(&a.name).as_str();
+                        imports.insert(local.to_owned(), module.clone());
+                    }
+                }
+                Stmt::FunctionDef(f) => {
+                    local_funcs.insert(f.name.as_str().to_owned());
+                }
+                Stmt::ClassDef(cd) => {
+                    local_funcs.insert(cd.name.as_str().to_owned());
+                    for m in &cd.body {
+                        if let Stmt::FunctionDef(f) = m {
+                            local_methods.insert(f.name.as_str().to_owned());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // A local definition shadows an import of the same name.
+        imports.retain(|k, _| !local_funcs.contains(k));
+        let builtins = tyc_resolve::builtin_names();
+
+        let facts = |body: &[Stmt], ctor: bool| -> Direct {
+            use ruff_python_ast::visitor::Visitor;
+            let mut v = Facts {
+                d: Direct::default(),
+                ctor,
+                local_funcs: &local_funcs,
+                local_methods: &local_methods,
+                imports: &imports,
+                builtins: &builtins,
+            };
+            for s in body {
+                v.visit_stmt(s);
+            }
+            v.d
+        };
+        fn merge_direct(into: &mut Direct, from: Direct) {
+            into.writes.extend(from.writes);
+            into.unknown |= from.unknown;
+            into.funcs.extend(from.funcs);
+            into.methods.extend(from.methods);
+        }
+        // "f:<name>" for functions and constructors, "m:<name>" for methods.
+        let mut direct: HashMap<String, Direct> = HashMap::new();
+        for s in body {
+            match s {
+                Stmt::FunctionDef(f) => {
+                    let d = facts(&f.body, false);
+                    merge_direct(direct.entry(format!("f:{}", f.name)).or_default(), d);
+                }
+                Stmt::ClassDef(cd) => {
+                    let ctor_key = format!("f:{}", cd.name);
+                    direct.entry(ctor_key.clone()).or_default();
+                    for m in &cd.body {
+                        if let Stmt::FunctionDef(f) = m {
+                            let name = f.name.as_str();
+                            let ctor = matches!(name, "__init__" | "__post_init__" | "__new__");
+                            let d = facts(&f.body, ctor);
+                            if ctor {
+                                let again = facts(&f.body, ctor);
+                                merge_direct(direct.entry(ctor_key.clone()).or_default(), again);
+                            }
+                            merge_direct(direct.entry(format!("m:{name}")).or_default(), d);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut sum: HashMap<String, Option<HashSet<String>>> = direct
+            .iter()
+            .map(|(k, d)| (k.clone(), (!d.unknown).then(|| d.writes.clone())))
+            .collect();
+        loop {
+            let mut changed = false;
+            for (key, d) in &direct {
+                let edges = d
+                    .funcs
+                    .iter()
+                    .map(|f| format!("f:{f}"))
+                    .chain(d.methods.iter().map(|m| format!("m:{m}")));
+                for callee in edges {
+                    let Some(from) = sum.get(&callee).cloned() else {
+                        continue;
+                    };
+                    let Some(Some(into)) = sum.get_mut(key) else {
+                        continue;
+                    };
+                    match from {
+                        None => {
+                            sum.insert(key.clone(), None);
+                            changed = true;
+                            break;
+                        }
+                        Some(fields) => {
+                            let before = into.len();
+                            into.extend(fields);
+                            changed |= into.len() != before;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut out = FieldWriteSummary {
+            imports,
+            builtins,
+            ..FieldWriteSummary::default()
+        };
+        for (k, w) in sum {
+            if let Some(name) = k.strip_prefix("f:") {
+                out.funcs.insert(name.to_owned(), w);
+            } else if let Some(name) = k.strip_prefix("m:") {
+                out.methods.insert(name.to_owned(), w);
+            }
+        }
+        out
+    }
+}
+
+/// Whether `t` is a builtin value whose methods never rebind a field of an
+/// argument (`out.append(it)`, `"{}".format(it)`, `seen.add(it)`).
+fn is_builtin_value_type(t: &Type) -> bool {
+    match t {
+        Type::Int | Type::Str | Type::Bool | Type::Float | Type::Bytes | Type::LitStr(_) => true,
+        Type::Generic(h, _) => matches!(
+            h.as_str(),
+            "list"
+                | "dict"
+                | "set"
+                | "frozenset"
+                | "tuple"
+                | "tuple_variadic"
+                | "deque"
+                | "defaultdict"
+                | "OrderedDict"
+                | "Counter"
+        ),
+        _ => false,
+    }
+}
+
+/// What the statement-position call `call` may do to the field narrowings of
+/// an object passed to it. See [`FieldWriteSummary`].
+fn call_arg_effect(c: &Checker, call: &ruff_python_ast::ExprCall) -> ArgEffect {
+    let s = &c.field_writes;
+    match call.func.as_ref() {
+        Expr::Name(n) => {
+            let f = n.id.as_str();
+            if let Some(w) = s.funcs.get(f) {
+                return ArgEffect::from_summary(w);
+            }
+            if let Some(m) = s.imports.get(f) {
+                return if is_stdlib_dotted(m) {
+                    ArgEffect::Nothing
+                } else {
+                    ArgEffect::Anything
+                };
+            }
+            // A local variable or parameter holding a callable is opaque.
+            if matches!(f, "setattr" | "delattr") || c.env.lookup(f).is_some() {
+                return ArgEffect::Anything;
+            }
+            if s.builtins.contains(f) {
+                ArgEffect::Nothing
+            } else {
+                ArgEffect::Anything
+            }
+        }
+        Expr::Attribute(a) => {
+            if let Expr::Name(r) = a.value.as_ref() {
+                if let Some(m) = s.imports.get(r.id.as_str()) {
+                    return if is_stdlib_dotted(m) {
+                        ArgEffect::Nothing
+                    } else {
+                        ArgEffect::Anything
+                    };
+                }
+            }
+            let recv = infer_expr_readonly(c, &a.value);
+            match &recv {
+                Type::Module(m) if is_stdlib_dotted(m) => ArgEffect::Nothing,
+                t if is_builtin_value_type(t) => ArgEffect::Nothing,
+                Type::Class(name) if s.funcs.contains_key(name.as_str()) => {
+                    match s.methods.get(a.attr.as_str()) {
+                        Some(w) => ArgEffect::from_summary(w),
+                        None => ArgEffect::Anything,
+                    }
+                }
+                _ => ArgEffect::Anything,
+            }
+        }
+        _ => ArgEffect::Anything,
+    }
+}
+
+/// Drop the field narrowings rooted at `root` that a call with `effect` may
+/// have made stale. A `frozen` root's own fields cannot be rebound (the
+/// emitted dataclass raises), so only paths below them are dropped.
+fn invalidate_arg_fields(c: &mut Checker, root: &str, effect: &ArgEffect) {
+    if matches!(effect, ArgEffect::Nothing) {
+        return;
+    }
+    let frozen_root = matches!(
+        c.env.lookup(root).map(|b| &b.narrowed),
+        Some(Type::Class(n)) if c.frozen_classes.contains(n.as_str())
+    );
+    let skip = usize::from(frozen_root);
+    c.env
+        .clear_attr_narrowings_under(root, |segments| match effect {
+            ArgEffect::Nothing => false,
+            ArgEffect::Anything => segments.len() > skip,
+            ArgEffect::Fields(fields) => segments.iter().skip(skip).any(|s| fields.contains(*s)),
+        });
+}
+
 /// Evaluate an expression appearing in statement position, invalidating global
 /// narrowing when it contains a call.
 ///
@@ -13217,9 +13638,11 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 }
                 // An object handed to a call in statement position
                 // (`clear(b)`, `self.reset(b)`) can have its fields rewritten
-                // by the callee just as a method call on it can, so the
-                // narrowings rooted at every bare-name argument are stale
-                // too (review 2026-09-30 §3.8).
+                // by the callee just as a method call on it can (review
+                // 2026-09-30 §3.8) — but only if the callee can write them:
+                // `print(it)` / `out.append(it)` / `logging.info("%s", it)`
+                // cannot (review 2026-10-03 §4.3).
+                let effect = call_arg_effect(c, call);
                 for arg in call
                     .arguments
                     .args
@@ -13227,7 +13650,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     .chain(call.arguments.keywords.iter().map(|k| &k.value))
                 {
                     if let Expr::Name(n) = arg {
-                        c.env.clear_attr_narrowing(n.id.as_str());
+                        invalidate_arg_fields(c, n.id.as_str(), &effect);
                     }
                 }
             }

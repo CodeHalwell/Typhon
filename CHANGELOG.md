@@ -27,6 +27,18 @@ review deferred; the third — the 2026-09-30 release-readiness review
   irrefutable arm narrows later arms to what is left, and an or-pattern
   capture is the union of what its alternatives match. Programs that read a
   member some variant still lacks are rejected as before.
+- **Passing an object to a call no longer forgets its field narrowings
+  unless the callee can write them (regression from the third wave).**
+  `if it.price is not None: print(it); t += it.price` — and the same with
+  `out.append(it)`, `logging.info("%s", it)`, a local helper that never
+  writes `price`, or any call on a `frozen` object's own fields — was
+  rejected. The checker now summarises, per module, which fields each local
+  function, constructor and method can write (transitively through local
+  calls), and a statement-position call invalidates only those. Builtins,
+  the standard library and methods of builtin values write none; an
+  imported non-stdlib function, a callable parameter, `setattr` and
+  anything else it cannot see may still write any field, so
+  `clear(b)` with `b.value = None` inside stays rejected.
 
 ### Third wave — the 2026-09-30 release-readiness review
 

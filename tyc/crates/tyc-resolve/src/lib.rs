@@ -3393,7 +3393,7 @@ fn declare_walrus_leaks(r: &mut Resolver, scope: ScopeId, expr: &Expr) {
 /// A conservative list of Python built-in names that the resolver treats
 /// as always-in-scope. Not exhaustive — the goal is to avoid false-positive
 /// "unknown name" diagnostics for common identifiers in Phase 1.
-fn builtin_names() -> std::collections::HashSet<&'static str> {
+pub fn builtin_names() -> std::collections::HashSet<&'static str> {
     let names: &[&'static str] = &[
         // Built-in functions
         "print",
