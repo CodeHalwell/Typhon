@@ -25,6 +25,7 @@ mod callables;
 mod class_contracts;
 mod expression_calls;
 mod frozen_context;
+mod mutations;
 mod operators;
 #[cfg(debug_assertions)]
 mod unchecked;
@@ -12814,10 +12815,9 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     // respect the element type, else it silently corrupts the
                     // invariant: `data[0] = "x"` / `data[0:1] = ["x"]` into a
                     // `list[int]`, or `d[k] = "x"` into a `dict[K, int]`. The
-                    // dict KEY is intentionally not checked here (computed keys
-                    // carry a higher false-positive risk); only the element /
-                    // value type is enforced.
+                    // key/index and element/value types are both checked.
                     let recv_ty = infer_expr_readonly(c, &sub.value);
+                    mutations::index(c, sub, &recv_ty);
                     let span = (
                         a.value.range().start().to_usize(),
                         a.value.range().end().to_usize(),
@@ -19142,6 +19142,9 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     };
                     return Type::Generic("Result".into(), vec![ok_ty, err_ty]);
                 }
+            }
+            if let Some(result) = mutations::update(c, call) {
+                return result;
             }
             if let Some(result) = expression_calls::contract(c, call) {
                 return result;
@@ -39038,6 +39041,19 @@ def main() -> None:
             "newtype Email = str\ndef f(e: Email) -> list[int]:\n    return e.split(\"@\")\n",
         ] { assert!(!check(src).errors().is_empty(), "accepted: {src}"); }
         let src="newtype Email = str\ndef f(e: Email) -> list[str]:\n    return e.split(\"@\")\ndef g(e: Email) -> str:\n    return e.lower()\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn w2_14_container_mutation_contracts() {
+        for src in [
+            "def f(g: dict[str, int]) -> None:\n    g[7] = 8\n",
+            "def f(xs: list[int]) -> None:\n    xs[\"k\"] = 1\n",
+            "def f(g: dict[str, int]) -> None:\n    g.update({3: 4})\n",
+            "def f(g: dict[str, int]) -> None:\n    g.update({\"k\": \"bad\"})\n",
+        ] {
+            assert!(!check(src).errors().is_empty(), "accepted: {src}");
+        }
+        let src="def f(g: dict[str, int], xs: list[int]) -> None:\n    g[\"k\"] = 8\n    xs[0] = 1\n    xs[:] = [1, 2]\n    g.update({\"ok\": 1})\n    g.update(ok=1)\n    g.update([(\"ok\", 1)])\n";
         assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
     }
 }
