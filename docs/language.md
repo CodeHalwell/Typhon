@@ -779,3 +779,19 @@ is refused by the checker and by the generated runtime.
 Recursive aliases are supported for finite values. Cyclic values fail the cast.
 A shallow class or interface cast establishes the runtime class or member
 surface; it does not inspect the internals of an instance.
+
+
+### Frozen binding types
+
+A `freeze let` annotation describes the input value. The binding uses the
+runtime's recursively frozen shape: `list[T]` becomes `tuple[T, ...]`,
+`dict[K, V]` becomes `Mapping[K, V]`, and `set[T]` becomes `frozenset[T]`.
+Nested container elements are frozen too. Read operations remain available;
+container mutation and list concatenation on a frozen tuple are rejected. A
+new binding receiving a frozen value retains its frozen shape. An immutable
+operation deliberately protected by its matching exception handler is
+reported as a warning, allowing runtime failure probes to remain executable.
+
+Frozen dataclass instances pass through unchanged and retain identity. Their
+fields are not rebuilt or deep-frozen: use immutable field values when the
+instance must be deeply immutable.

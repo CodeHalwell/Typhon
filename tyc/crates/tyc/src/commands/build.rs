@@ -4107,6 +4107,12 @@ def _deep_freeze(value: Any, seen: set[int]) -> Any:
                 return frozenset(_deep_freeze(v, seen) for v in value)
             finally:
                 seen.discard(value_id)
+        if isinstance(value, MappingProxyType):
+            seen.add(value_id)
+            try:
+                return MappingProxyType({k: _deep_freeze(v, seen) for k, v in value.items()})
+            finally:
+                seen.discard(value_id)
         return value
     if isinstance(value, list):
         seen.add(value_id)

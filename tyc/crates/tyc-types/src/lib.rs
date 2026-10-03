@@ -21,6 +21,7 @@
 //! coverage.
 
 mod builtins;
+mod frozen_context;
 #[cfg(debug_assertions)]
 mod unchecked;
 
@@ -3035,10 +3036,28 @@ impl TypeEnv {
 /// conservative direction: the assignment falls through to the ordinary
 /// nominal check rather than being waved through.
 const READ_VIEW_LATTICE: &[(&str, &[&str])] = &[
-    ("Sequence", &["list", "tuple", "deque", "range", "Sequence"]),
+    (
+        "Sequence",
+        &[
+            "list",
+            "tuple",
+            "tuple_variadic",
+            "deque",
+            "range",
+            "Sequence",
+        ],
+    ),
     (
         "Reversible",
-        &["list", "tuple", "deque", "range", "Sequence", "Reversible"],
+        &[
+            "list",
+            "tuple",
+            "tuple_variadic",
+            "deque",
+            "range",
+            "Sequence",
+            "Reversible",
+        ],
     ),
     // Every iterable: the concrete containers, the dict views (iterating a
     // `dict` itself yields its keys, which is what `dict[K, V]`'s first
@@ -3049,6 +3068,7 @@ const READ_VIEW_LATTICE: &[(&str, &[&str])] = &[
         &[
             "list",
             "tuple",
+            "tuple_variadic",
             "set",
             "frozenset",
             "deque",
@@ -3069,6 +3089,7 @@ const READ_VIEW_LATTICE: &[(&str, &[&str])] = &[
         &[
             "list",
             "tuple",
+            "tuple_variadic",
             "set",
             "frozenset",
             "deque",
@@ -3086,6 +3107,7 @@ const READ_VIEW_LATTICE: &[(&str, &[&str])] = &[
         &[
             "list",
             "tuple",
+            "tuple_variadic",
             "set",
             "frozenset",
             "deque",
@@ -3137,6 +3159,7 @@ const IS_ASSIGNABLE_MAX_DEPTH: u32 = 256;
 struct Checker<'a> {
     expression_types: HashMap<(usize, usize), Type>,
     attribute_receiver_type: Option<Type>,
+    module: Option<&'a ModModule>,
     path: String,
     source: &'a str,
     resolved: &'a ResolvedModule,
@@ -3678,6 +3701,7 @@ impl InterfaceShape {
 impl<'a> Checker<'a> {
     fn new(path: String, source: &'a str, resolved: &'a ResolvedModule) -> Self {
         Self {
+            module: None,
             path,
             source,
             resolved,
@@ -6624,6 +6648,7 @@ pub fn check_module_with_imports_and_types(
     external: Option<&ExternalShapes>,
 ) -> CheckedModule {
     let mut c = Checker::new(path.into(), source, resolved);
+    c.module = Some(module);
     c.unsafe_line_starts = unsafe_byte_starts(source, unsafe_lines);
     let frozen_starts = unsafe_byte_starts(source, frozen_class_lines);
     // Seed cross-module shapes BEFORE the in-module first pass so
@@ -11052,6 +11077,9 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
             }
         }
         Expr::Call(call) => {
+            if let Some(argument) = freeze_call_argument(e) {
+                return frozen_type(&c.unwrap_alias(&infer_expr_readonly(c, argument)));
+            }
             if matches!(call.func.as_ref(), Expr::Name(n) if n.id.as_str() == "super") {
                 let receiver_class = c.current_class.clone().or_else(|| {
                     c.env
@@ -12367,6 +12395,16 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             };
             if let Some(value) = &a.value {
                 let value_type = infer_expr_ctx(c, value, Some(&ann_type));
+                // A freeze annotation describes the input; the binding carries
+                // the runtime's recursively immutable output shape.
+                let frozen_annotation = frozen_type(&c.unwrap_alias(&ann_type));
+                if freeze_call_argument(value).is_some()
+                    || (frozen_annotation != ann_type
+                        && c.is_assignable(&frozen_annotation, &value_type)
+                        && !c.is_assignable(&ann_type, &value_type))
+                {
+                    ann_type = frozen_annotation;
+                }
                 // A call in the RHS may reassign a module global via
                 // `global NAME` in the callee, staling a caller narrowing on
                 // that global. Reset for subsequent statements (mirrors the
@@ -12637,6 +12675,21 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         a.value.range().end().to_usize(),
                     );
                     if let Type::Generic(head, args) = &recv_ty {
+                        if matches!(
+                            head.as_str(),
+                            "Mapping" | "tuple" | "tuple_variadic" | "frozenset"
+                        ) {
+                            let diagnostic = TycError::generic(format!(
+                                "`{}` does not support item assignment",
+                                recv_ty.display()
+                            ));
+                            if frozen_context::failure_is_caught(c, target, "TypeError") {
+                                c.diagnostics.push_warning(diagnostic);
+                            } else {
+                                c.diagnostics.push_error(diagnostic);
+                            }
+                        }
+
                         if head == "list" && args.len() == 1 {
                             let elem = args[0].clone();
                             if matches!(sub.slice.as_ref(), Expr::Slice(_)) {
@@ -17040,7 +17093,7 @@ fn is_classvar_annotation(ann: &Expr) -> bool {
 fn is_builtin_generic_head(head: &str) -> bool {
     matches!(
         head,
-        "list" | "dict" | "set" | "tuple" | "str" | "bytes" | "frozenset"
+        "list" | "dict" | "set" | "tuple" | "tuple_variadic" | "Mapping" | "str" | "bytes" | "frozenset"
         // The Result family is Typhon's own closed surface — an unknown
         // method on Ok/Err/Result is always a runtime AttributeError, so
         // flag it at check time (closes the `.unwrap()`-before-it-existed
@@ -17114,7 +17167,19 @@ fn is_known_builtin_generic_attr(head: &str, attr: &str) -> bool {
                 | "copy"
                 | "fromkeys"
         ),
-        "set" | "frozenset" => matches!(
+        "Mapping" => matches!(attr, "get" | "keys" | "values" | "items" | "copy"),
+        "frozenset" => matches!(
+            attr,
+            "copy"
+                | "union"
+                | "intersection"
+                | "difference"
+                | "symmetric_difference"
+                | "issubset"
+                | "issuperset"
+                | "isdisjoint"
+        ),
+        "set" => matches!(
             attr,
             "add"
                 | "remove"
@@ -17134,7 +17199,7 @@ fn is_known_builtin_generic_attr(head: &str, attr: &str) -> bool {
                 | "issuperset"
                 | "isdisjoint"
         ),
-        "tuple" => matches!(attr, "count" | "index"),
+        "tuple" | "tuple_variadic" => matches!(attr, "count" | "index"),
         "str" => matches!(
             attr,
             "lower"
@@ -17400,6 +17465,9 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
     let Type::Generic(head, args) = recv else {
         return None;
     };
+    if head == "Mapping" && matches!(attr, "get" | "keys" | "values" | "items" | "copy") {
+        return builtin_generic_method(&Type::Generic("dict".into(), args.clone()), attr);
+    }
     if let Some(sig) = builtin_container_mutator(head, attr, args) {
         return Some(sig);
     }
@@ -18289,6 +18357,29 @@ fn checked_cast_target_supported(c: &Checker, target: &Type) -> bool {
     supported(c, target, &mut Vec::new())
 }
 
+/// Static output shape of deep_freeze. User instances, including generic
+/// frozen dataclasses, retain their own type and identity.
+pub fn frozen_type(ty: &Type) -> Type {
+    match ty {
+        Type::Generic(head, args)
+            if matches!(
+                head.as_str(),
+                "list" | "dict" | "set" | "tuple" | "tuple_variadic" | "frozenset" | "Mapping"
+            ) =>
+        {
+            let output = match head.as_str() {
+                "list" => "tuple_variadic",
+                "dict" => "Mapping",
+                "set" => "frozenset",
+                _ => head,
+            };
+            Type::Generic(output.into(), args.iter().map(frozen_type).collect())
+        }
+        Type::Union(members) => Type::union_of(members.iter().map(frozen_type).collect()),
+        _ => ty.clone(),
+    }
+}
+
 fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type {
     match expr {
         Expr::BooleanLiteral(_) => Type::Bool,
@@ -18511,6 +18602,21 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 if !operator_operands_compatible(b.op, &l_stripped, &r_stripped) {
                     let span = (b.range.start().to_usize(), b.range.end().to_usize());
                     c.operator_type_mismatch(op_str, &l_stripped, &r_stripped, span);
+                }
+            }
+            if matches!(b.op, Operator::Add) {
+                if let (Type::Generic(lh, la), Type::Generic(rh, ra)) = (&l_stripped, &r_stripped) {
+                    if matches!(lh.as_str(), "tuple" | "tuple_variadic")
+                        && matches!(rh.as_str(), "tuple" | "tuple_variadic")
+                    {
+                        let mut elements = la.clone();
+                        elements.extend(ra.clone());
+                        return if lh == "tuple" && rh == "tuple" {
+                            Type::Generic("tuple".into(), elements)
+                        } else {
+                            Type::Generic("tuple_variadic".into(), vec![Type::union_of(elements)])
+                        };
+                    }
                 }
             }
             // Constant-fold safety lint: literal-zero RHS on `/`, `//`, `%`
@@ -18773,6 +18879,10 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             }
         }
         Expr::Call(call) => {
+            if let Some(argument) = freeze_call_argument(expr) {
+                let input = infer_expr_ctx(c, argument, expected);
+                return frozen_type(&c.unwrap_alias(&input));
+            }
             if matches!(call.func.as_ref(), Expr::Name(n) if n.id.as_str() == "super") {
                 let receiver_class = c.current_class.clone().or_else(|| {
                     c.env
@@ -20117,14 +20227,21 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         .to_usize()
                         .saturating_sub(attr_start)
                         .max(1);
-                    c.diagnostics.push_error(TycError::attribute_not_found(
+                    let diagnostic = TycError::attribute_not_found(
                         attr_name,
                         head.as_str(),
                         &c.path,
                         c.source,
                         attr_start,
                         attr_len,
-                    ));
+                    );
+                    if matches!(head.as_str(), "tuple_variadic" | "Mapping" | "frozenset")
+                        && frozen_context::failure_is_caught(c, expr, "AttributeError")
+                    {
+                        c.diagnostics.push_warning(diagnostic);
+                    } else {
+                        c.diagnostics.push_error(diagnostic);
+                    }
                     return Type::Unknown;
                 }
             }
@@ -20510,14 +20627,21 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                                 .to_usize()
                                 .saturating_sub(attr_start)
                                 .max(1);
-                            c.diagnostics.push_error(TycError::attribute_not_found(
+                            let diagnostic = TycError::attribute_not_found(
                                 attr_name,
                                 &bad_display,
                                 &c.path,
                                 c.source,
                                 attr_start,
                                 attr_len,
-                            ));
+                            );
+                            if matches!(bad,Type::Generic(head,_) if matches!(head.as_str(),"tuple_variadic" | "Mapping" | "frozenset"))
+                                && frozen_context::failure_is_caught(c, expr, "AttributeError")
+                            {
+                                c.diagnostics.push_warning(diagnostic);
+                            } else {
+                                c.diagnostics.push_error(diagnostic);
+                            }
                         }
                     }
                     Type::Unknown
@@ -20641,7 +20765,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             // invariant — the runtime hashes/compares against the slot.
             if c.unsafe_depth == 0 && !matches!(s.slice.as_ref(), Expr::Slice(_)) {
                 if let Type::Generic(head, args) = &value_ty {
-                    if head == "dict" && args.len() == 2 {
+                    if matches!(head.as_str(), "dict" | "Mapping") && args.len() == 2 {
                         let key_ty = &args[0];
                         if !is_dynamic_type(key_ty)
                             && !is_dynamic_type(&slice_ty)
@@ -21704,7 +21828,10 @@ fn operator_operands_compatible(op: Operator, l: &Type, r: &Type) -> bool {
             if let (Type::Generic(ln, _), Type::Generic(rn, _)) = (l, r) {
                 // `list + list`, `tuple + tuple`, and `Counter + Counter`
                 // (multiset addition — `collections.Counter` overloads `+`).
-                if ln == rn && (ln == "list" || ln == "tuple" || ln == "Counter") {
+                if (matches!(ln.as_str(), "tuple" | "tuple_variadic")
+                    && matches!(rn.as_str(), "tuple" | "tuple_variadic"))
+                    || (ln == rn && (ln == "list" || ln == "Counter"))
+                {
                     return true;
                 }
             }
@@ -38512,5 +38639,26 @@ def main() -> None:
     fn w2_04_recursive_alias_target_remains_supported() {
         let d = check("from typing import Any\ntype Json = int | list[Json]\ndef f(value: Any) -> Json:\n    return __typhon_checked_cast__(value, Json)\n");
         assert!(d.errors().is_empty(), "{:?}", d.errors());
+    }
+    #[test]
+    fn w2_05_frozen_container_operations_are_checked() {
+        for src in [
+            "let NAMES: list[str] = __typhon_freeze__([\"a\"])\ndef f() -> None:\n    NAMES.append(\"b\")\n",
+            "let CONFIG: dict[str, int] = __typhon_freeze__({\"a\":1})\ndef f() -> None:\n    CONFIG[\"a\"] = 2\n",
+            "let VALUES: set[int] = __typhon_freeze__({1})\ndef f() -> None:\n    VALUES.add(2)\n",
+            "let CONFIG: dict[str, list[int]] = __typhon_freeze__({\"a\":[1]})\ndef f() -> None:\n    CONFIG[\"a\"].append(2)\n",
+        ] { assert!(!check(src).errors().is_empty(), "accepted: {src}"); }
+    }
+    #[test]
+    fn w2_05_read_views_aliases_and_caught_probe_controls() {
+        let src = "let NAMES: list[str] = __typhon_freeze__([\"a\"])\nlet CONFIG: dict[str, list[int]] = __typhon_freeze__({\"a\":[1]})\ndef f() -> None:\n    let row: list[int] = CONFIG[\"a\"]\n    let text: str = \",\".join(NAMES)\n    print(row[0], text, NAMES + (\"b\",))\n    try:\n        NAMES.append(\"b\")\n    except AttributeError:\n        pass\n    try:\n        CONFIG[\"a\"] = [2]\n    except TypeError:\n        pass\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn w2_05_wrong_handler_and_deferred_function_do_not_hide_mutation() {
+        for body in ["try:\n    NAMES.append(\"b\")\nexcept ValueError:\n    pass\n", "try:\n    def later() -> None:\n        NAMES.append(\"b\")\nexcept AttributeError:\n    pass\n"] {
+            let src=format!("let NAMES: list[str] = __typhon_freeze__([\"a\"])\n{body}");
+            assert!(!check(&src).errors().is_empty(), "{src}");
+        }
     }
 }
