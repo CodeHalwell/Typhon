@@ -620,8 +620,39 @@ pub fn modelled_module_exports(
 mod tests {
     use super::*;
 
+    /// The CLI runs the interpreter on a dedicated 256 MiB worker stack
+    /// (`tyc/src/main.rs`); libtest threads get 2 MiB, which a deep but
+    /// *legal* recursion overflows in debug builds long before the VM's own
+    /// 1000-frame guard fires — `slot_recursion_fib` used to abort the
+    /// whole test binary on aarch64. Run every VM invocation the way the
+    /// CLI does so the tests stop depending on the host's stack size.
+    ///
+    /// Measured native stack per VM call frame (aarch64, 2026-10-03,
+    /// depth-1000 recursion on the worker thread): **~99,370 B (97 KiB)
+    /// debug, ~7,119 B (7 KiB) release** — a debug build needs ~97 MiB for
+    /// the 1000-frame guard alone, so anything near a 2–8 MiB default
+    /// thread stack is marginal by an order of magnitude.
+    const TEST_WORKER_STACK_SIZE: usize = 256 * 1024 * 1024;
+
+    fn run_on_worker_stack<F, T>(f: F) -> T
+    where
+        F: FnOnce() -> T + Send,
+        T: Send,
+    {
+        std::thread::scope(|scope| {
+            let handle = std::thread::Builder::new()
+                .stack_size(TEST_WORKER_STACK_SIZE)
+                .spawn_scoped(scope, f)
+                .expect("failed to spawn the VM test worker thread");
+            match handle.join() {
+                Ok(v) => v,
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        })
+    }
+
     fn run_capturing(source: &str) -> Result<i32, VmError> {
-        run_source(source, None, &[])
+        run_on_worker_stack(|| run_source(source, None, &[]))
     }
 
     /// The declared list and the resolver must agree: a name in the list
@@ -670,7 +701,7 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, text).unwrap();
         }
-        run_file(&dir.path().join(entry), &[])
+        run_on_worker_stack(|| run_file(&dir.path().join(entry), &[]))
     }
 
     const CHECK: &str = r#"
