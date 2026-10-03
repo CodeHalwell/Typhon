@@ -122,6 +122,12 @@ review deferred; the third — the 2026-09-30 release-readiness review
   `value as! T`, or annotate the binding inside the block. The
   `unsafe_value_leak` doc page no longer recommends an annotated re-bind
   outside the block, which is itself reported.
+- **`del NAME` and `except … as NAME` cannot end a `let`.** Both remove the
+  binding (an `except … as` name is deleted when the handler ends), so a
+  module constant or local `let` could vanish and a later read would raise
+  `NameError` / `UnboundLocalError`. Both now report
+  `tyc::immutable_assign`. A `for` or `with … as` target rebinding a `let`
+  stays allowed, as decided in R2-17.
 
 ### Third wave — the 2026-09-30 release-readiness review
 

@@ -1085,6 +1085,33 @@ impl<'a> Resolver<'a> {
     /// both the same-body reassignment (`for …: let t = 1; t = 99`) and an
     /// inner loop writing to an outer body's `let`. Those are genuine Rule 2
     /// violations and must fall through to the `immutable_assign` path.
+    /// Report `tyc::immutable_assign` when `name` is a live `let` in `scope`
+    /// that a statement at `span` ends — `del NAME`, or an `except … as
+    /// NAME` handler, which deletes the name on exit.
+    fn report_let_ended(&mut self, scope: ScopeId, name: &str, span: (usize, usize)) {
+        if name == "_" {
+            return;
+        }
+        let Some(b) = self.lookup_local(scope, name) else {
+            return;
+        };
+        if b.mutability != Mutability::Let || b.kind == BindingKind::Loop {
+            return;
+        }
+        let decl_span = b.span;
+        if decl_span != span && self.seen_immutable_redecl.insert((decl_span, span)) {
+            self.diagnostics.push_error(TycError::immutable_assign(
+                name,
+                &self.path,
+                self.source,
+                decl_span.0,
+                decl_span.1.saturating_sub(decl_span.0).max(1),
+                span.0,
+                span.1.saturating_sub(span.0).max(1),
+            ));
+        }
+    }
+
     fn binding_came_from_an_exited_loop(&self, span: (usize, usize)) -> bool {
         self.loop_origin_spans
             .get(&span)
@@ -1248,6 +1275,7 @@ impl<'a> Resolver<'a> {
                             span.1.saturating_sub(span.0).max(1),
                         ));
                     }
+                    return;
                 }
                 return;
             }
@@ -2635,6 +2663,10 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
                         h.range.start().to_usize(),
                         h.range.start().to_usize() + name.as_str().len(),
                     );
+                    // Unlike a `for` target (R2-17), `except … as NAME`
+                    // *deletes* NAME when the handler ends, so a `let NAME`
+                    // in force is gone afterwards (review 2026-10-03 §3.10).
+                    r.report_let_ended(scope, name.as_str(), span);
                     r.declare(
                         scope,
                         name.as_str(),
@@ -2715,6 +2747,12 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
         Stmt::Delete(d) => {
             for t in &d.targets {
                 walk_expr(r, scope, t);
+                // `del NAME` on a `let` ends a binding the program promised
+                // never to change (review 2026-10-03 §3.10).
+                if let Expr::Name(n) = t {
+                    let span = (n.range.start().to_usize(), n.range.end().to_usize());
+                    r.report_let_ended(scope, n.id.as_str(), span);
+                }
             }
         }
         Stmt::Match(m) => {
@@ -3854,6 +3892,37 @@ def f() -> None:
         // the body is already rejected), so the augmented form matches.
         let (_, d) = resolve("def k(xs: list[int]) -> None:\n    for x in xs:\n        x += 1\n");
         assert!(has_immutable_assign(&d), "a loop target is a `let`");
+    }
+
+    /// `del NAME` and an `except … as NAME` handler both *end* a live `let`
+    /// (review 2026-10-03 §3.10). A `for` / `with … as` target rebinding one
+    /// stays allowed (R2-17).
+    #[test]
+    fn del_and_except_as_end_a_let() {
+        for src in [
+            "let err: str = \"x\"\ntry:\n    int(\"z\")\nexcept ValueError as err:\n    pass\n",
+            "let RATE: int = 3\ndel RATE\n",
+            "def g() -> None:\n    let r: int = 1\n    del r\n",
+            "def g() -> None:\n    let e: str = \"a\"\n    try:\n        int(\"z\")\n    except ValueError as e:\n        pass\n",
+        ] {
+            let (_, d) = resolve(src);
+            assert!(
+                has_immutable_assign(&d),
+                "expected immutable_assign for:\n{src}"
+            );
+        }
+        for src in [
+            "def g(xs: list[int], ys: list[int]) -> None:\n    for a in xs:\n        let x: int = a\n        print(x)\n    for x in ys:\n        print(x)\n",
+            "mut M: int = 3\nfor M in [1, 2]:\n    pass\n",
+            "def g(xs: list[int], ys: list[int]) -> None:\n    for x in xs:\n        pass\n    for x in ys:\n        pass\n",
+            "def g() -> None:\n    mut r: int = 1\n    del r\n",
+            "let f: int = 3\nwith open(\"/dev/null\") as f:\n    pass\n",
+            "def g(xs: list[int]) -> None:\n    let x: int = 1\n    for x in xs:\n        pass\n",
+            "def g() -> None:\n    try:\n        int(\"z\")\n    except ValueError as e:\n        pass\n    try:\n        int(\"y\")\n    except ValueError as e:\n        pass\n",
+        ] {
+            let (_, d) = resolve(src);
+            assert!(!has_immutable_assign(&d), "unexpected immutable_assign for:\n{src}: {:?}", d.errors());
+        }
     }
 
     /// `try` / `except` arms are alternatives, like `if` / `elif`: a `let` in
