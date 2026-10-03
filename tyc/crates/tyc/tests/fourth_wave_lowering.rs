@@ -151,3 +151,15 @@ fn named_mutable_default_gives_each_instance_a_copy() {
         include_str!("fourth_wave/named_mutable_default.expected"),
     );
 }
+
+/// W7-08: a CRLF file's multi-line string literals hold `\n`, as CPython
+/// reads them (both surfaces printed `'a\r\nb'`). The source is built here
+/// rather than checked in, so no checkout line-ending setting can alter it.
+#[test]
+fn crlf_source_strings_hold_lf_on_both_surfaces() {
+    let lf = "let s: str = \"\"\"a\nb\"\"\"\nprint(repr(s))\nlet t: str = f\"\"\"x\n{1 + 1}\ny\"\"\"\nprint(repr(t))\nlet u: bytes = b\"\"\"p\nq\"\"\"\nprint(repr(u))\n";
+    assert_runs_as(
+        &lf.replace('\n', "\r\n"),
+        "'a\\nb'\n'x\\n2\\ny'\nb'p\\nq'\n",
+    );
+}

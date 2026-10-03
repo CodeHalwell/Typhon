@@ -283,3 +283,33 @@ fn gather_blocks_inside_async_bodies_still_lower() {
         );
     }
 }
+
+// ── W7-08: CRLF line endings ─────────────────────────────────────────────────
+
+#[test]
+fn crlf_source_lowers_like_its_lf_twin() {
+    let lf = "let s: str = \"\"\"a\nb\"\"\"\nprint(repr(s))\nlet t: str = f\"\"\"x\n{1 + 1}\ny\"\"\"\nlet u: bytes = b\"\"\"p\nq\"\"\"\n";
+    let crlf = lf.replace('\n', "\r\n");
+    let lowered = lower(&crlf);
+    assert!(!lowered.contains('\r'), "{lowered:?}");
+    assert_eq!(lowered, lower(lf));
+    // Line numbering is unchanged: the same number of lines either way.
+    let (expanded, map) = tyc_syntax::preprocess::expand_sugar_mapped(&crlf, true);
+    assert_eq!(expanded.lines().count(), lf.lines().count());
+    assert_eq!(map.len(), lf.lines().count());
+}
+
+#[test]
+fn crlf_multiline_string_parses_to_lf_contents() {
+    let src = "let s: str = \"\"\"a\r\nb\"\"\"\r\n";
+    let module = tyc_syntax::parse_module(&lower(src))
+        .expect("parses")
+        .into_syntax();
+    let tyc_syntax::ast::Stmt::AnnAssign(a) = &module.body[0] else {
+        panic!("expected an annotated assignment");
+    };
+    let Some(tyc_syntax::ast::Expr::StringLiteral(lit)) = a.value.as_deref() else {
+        panic!("expected a string literal");
+    };
+    assert_eq!(lit.value.to_str(), "a\nb");
+}

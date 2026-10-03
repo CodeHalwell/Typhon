@@ -101,6 +101,13 @@ review deferred; the third — the 2026-09-30 release-readiness review
   name — now lowers to `dataclasses.field(default_factory=lambda:
   list(BASE))` (or `dict` / `set`): each instance gets its own shallow
   copy, the same fresh-value-per-instance the literal defaults already get.
+- **CRLF files: multi-line strings hold `\n`, as in Python (W7-08).** In a
+  file with `\r\n` line endings, `"""a` / `b"""` evaluated to `'a\r\nb'` on
+  both surfaces (CPython reads `'a\nb'`), and `tyc fmt`, which writes `\n`,
+  changed what the program printed — since W7-03 it refused such files
+  instead. The shared source normalisation (BOM, final newline) now also
+  reads `\r\n` as `\n`; line numbers and columns are unchanged, so
+  diagnostics and source maps point where they did.
 
 ### Third wave — the 2026-09-30 release-readiness review
 

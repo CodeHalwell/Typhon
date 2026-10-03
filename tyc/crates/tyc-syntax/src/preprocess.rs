@@ -5002,18 +5002,31 @@ pub fn expand_typed_let_unpack(source: &str) -> String {
     expand_typed_let_unpack_mapped(source).0
 }
 
-/// [`expand_typed_let_unpack`] plus an output-line → input-line table.
 /// The text every pipeline actually works on: without a leading UTF-8
-/// byte-order mark, and ending in a newline.
+/// byte-order mark, with `\r\n` line endings read as `\n`, and ending in a
+/// newline.
+///
+/// Python's tokenizer translates `\r\n` to `\n` before it reads the source,
+/// so a multi-line string literal in a CRLF file holds `\n`. Passing the CRs
+/// through left them inside the literal — `"""a\r\nb"""` was `'a\r\nb'` on
+/// both surfaces — and `tyc fmt`, which writes `\n`, then changed what the
+/// program printed (W7-08). Every line keeps its index and every column its
+/// offset (the CR is the last byte of its line), so line maps and the
+/// line/column diagnostic remap are unaffected. A lone `\r` is left as is.
 fn normalise_source_text(source: &str) -> std::borrow::Cow<'_, str> {
     let stripped = source.strip_prefix('\u{feff}').unwrap_or(source);
-    if stripped.is_empty() || stripped.ends_with('\n') {
-        std::borrow::Cow::Borrowed(stripped)
+    let mut text = if stripped.contains("\r\n") {
+        std::borrow::Cow::Owned(stripped.replace("\r\n", "\n"))
     } else {
-        std::borrow::Cow::Owned(format!("{stripped}\n"))
+        std::borrow::Cow::Borrowed(stripped)
+    };
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.to_mut().push('\n');
     }
+    text
 }
 
+/// [`expand_typed_let_unpack`] plus an output-line → input-line table.
 pub fn expand_typed_let_unpack_mapped(source: &str) -> (String, Vec<usize>) {
     // Every sugar chain starts here; a UTF-8 byte-order mark left on the
     // first line would be pushed *below* an injected runtime import by a

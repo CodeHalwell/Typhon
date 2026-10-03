@@ -2786,4 +2786,19 @@ def run() -> Result[int, str]:
         let out = without_ruff(|| format_source(src, "<test>").unwrap().output);
         assert_eq!(out, "let s: str = \"\u{E001}\"\nlet n: int? = None\n");
     }
+
+    #[test]
+    fn crlf_file_with_a_multiline_string_formats_without_changing_the_program() {
+        // W7-08: fmt writes `\n`; the CRLF original lowered with `\r` inside
+        // the literal, so the W7-03 self-check refused the file. Both sides
+        // now read `\r\n` as `\n`, as Python does.
+        let src = "let s:str = \"\"\"a\r\nb\"\"\"\r\nprint(repr(s))\r\n";
+        let out = without_ruff(|| {
+            format_source(src, "<test>")
+                .map(|r| r.output)
+                .map_err(|e| e.to_string())
+        })
+        .expect("a CRLF file formats");
+        assert_eq!(out, "let s: str = \"\"\"a\nb\"\"\"\nprint(repr(s))\n");
+    }
 }
