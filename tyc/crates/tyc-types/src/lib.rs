@@ -38911,4 +38911,15 @@ def main() -> None:
         let src="def parse() -> Result[int, str]:\n    return Ok(3)\ndef g() -> Result[str, str]:\n    return parse().map(lambda n: n + 1).map(lambda n: n + 1)\n";
         assert!(!check_full(src).errors().is_empty());
     }
+    #[test]
+    fn w2_11_go_requires_a_coroutine() {
+        let src = "def work() -> int:\n    return 1\nasync def f() -> None:\n    go work()\n";
+        assert!(!check_full(src).errors().is_empty(), "accepted: {src}");
+        let src="async def work() -> int:\n    return 1\nasync def f() -> int:\n    go work() -> task\n    return await task\n";
+        assert!(
+            check_full(src).errors().is_empty(),
+            "{:?}",
+            check_full(src).errors()
+        );
+    }
 }

@@ -74,6 +74,17 @@ pub(super) fn contract(c: &mut Checker, call: &ruff_python_ast::ExprCall) -> Opt
             .iter()
             .map(|arg| {
                 let ty = infer_expr(c, arg);
+                if spawn
+                    && c.unsafe_depth == 0
+                    && await_operand_is_shape_checkable(c, arg)
+                    && definitely_not_awaitable(c, &ty)
+                {
+                    c.mismatch_with(
+                        "a coroutine for go".into(),
+                        ty.display(),
+                        (arg.range().start().to_usize(), arg.range().end().to_usize()),
+                    );
+                }
                 unwrap_awaitable(&ty, &c.classes).unwrap_or(Type::Unknown)
             })
             .collect();
