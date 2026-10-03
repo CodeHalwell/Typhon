@@ -6,10 +6,33 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ## Unreleased — beta readiness
 
-Three waves on top of alpha.9. The first was the beta-readiness review
+Four waves on top of alpha.9. The first was the beta-readiness review
 remediation described further down; the second closed the backlog that
 review deferred; the third — the 2026-09-30 release-readiness review
-(`docs/release-readiness-review-2026-09-30.md`) — is summarised first.
+(`docs/release-readiness-review-2026-09-30.md`) — is summarised first; the
+fourth is the remediation of the six 2026-10-03 full reviews
+(`code_review/fix-plan-2026-10-03.md`), summarised under *Fourth wave*.
+
+### Fourth wave — the 2026-10-03 reviews
+
+#### W5 — VM & harness
+
+**The VM test suite is green on macOS again, and no longer hides tests.**
+A debug-build VM frame needs ~97 KiB of native stack (release: ~7 KiB), so
+`slot_recursion_fib` — 20 frames deep — overflowed libtest's 2 MiB thread
+stack and aborted the whole `tyc-vm` test binary, leaving 84 tests
+unreported. `run_capturing` and `run_project` now run the interpreter on a
+scoped 256 MiB worker stack, matching `tyc/src/main.rs`.
+
+**Host-derived test expectations, not one platform's literals.** The math
+test pinned glibc libm values while the VM deliberately calls the *host*
+libm (Apple libm differs by an ulp); the `random`, `filesystem` and `math`
+transcripts likewise recorded one host's errno numbers, `OSError`
+subclass, tempdir and locale-encoding spelling. All four now compute their
+expectations from the hosting `python3.13` at test time. `tyc-vm` goes
+from 148 reported tests (84 hidden) to **232 passing** on macOS. One
+cosmetic residual: CPython spells the default text encoding `UTF-8` on
+macOS and the `io` shim lowercases it — documented in `docs/vm.md`.
 
 ### Third wave — the 2026-09-30 release-readiness review
 
