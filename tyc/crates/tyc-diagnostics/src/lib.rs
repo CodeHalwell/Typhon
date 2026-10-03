@@ -4943,7 +4943,8 @@ fn impl_header_name(raw: &str) -> Option<String> {
     let trimmed = raw.trim_start();
     let after = if let Some(s) = trimmed.strip_prefix("impl ") {
         s
-    } else if let Some(s) = trimmed.strip_prefix("impl[") {
+    } else {
+        let s = trimmed.strip_prefix("impl[")?;
         // Skip the `[T, …]` impl type-param list.
         let mut depth = 1i32;
         let mut end = None;
@@ -4961,8 +4962,6 @@ fn impl_header_name(raw: &str) -> Option<String> {
             }
         }
         s[end?..].trim_start()
-    } else {
-        return None;
     };
     let header = after.trim_end();
     let body = header.strip_suffix(':')?;
