@@ -246,3 +246,46 @@ fn pipe_works_in_every_expression_position() {
         include_str!("fourth_wave/pipe_positions.expected"),
     );
 }
+
+/// W7-12: a `?` in replacement fields on a continuation line of a
+/// triple-quoted f-string, a declaration-only interface method with a
+/// trailing comment, and `go` / `comptime` as variables at the start of
+/// continuation lines — each a `tyc::parse` (or `go` / `comptime`) error
+/// before.
+#[test]
+fn low_severity_preprocessor_shapes_run_on_both_surfaces() {
+    assert_runs_as(
+        include_str!("fourth_wave/low_severity.ty"),
+        include_str!("fourth_wave/low_severity.expected"),
+    );
+}
+
+/// W7-12: more than 200 nested brackets is CPython's compile-time
+/// `SyntaxError: too many nested parentheses`; `tyc check` and `tyc run`
+/// accepted it and `tyc build` emitted a `.py` that did not compile.
+#[test]
+fn bracket_nesting_past_cpython_limit_is_rejected_at_check_time() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let d = 201;
+    scaffold(
+        dir,
+        &format!(
+            "let x: list[object] = {}{}\nprint(len(x))\n",
+            "[".repeat(d),
+            "]".repeat(d)
+        ),
+    );
+    for args in [
+        &["check", "src"][..],
+        &["run", "--no-fallback", "src/main.ty"][..],
+    ] {
+        let out = tyc().current_dir(dir).args(args).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{args:?} accepted it");
+        assert!(
+            stderr.contains("too many nested parentheses"),
+            "{args:?}:\n{stderr}"
+        );
+    }
+}

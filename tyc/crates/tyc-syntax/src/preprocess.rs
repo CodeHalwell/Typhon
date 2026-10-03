@@ -33,6 +33,7 @@ use crate::lexer::TyphonKeyword;
 use crate::lexmask::{scan_line, scan_line_kinds, ByteKind, LexMask, StringMode};
 
 mod eval_order;
+mod fstring_fields;
 mod pipe_slots;
 
 /// One stripped keyword and the 0-based line index in the source where it
@@ -171,6 +172,11 @@ pub struct PreprocessResult {
     /// recorded indices still point at the same headers in the sanitised
     /// buffer the remap operates on.
     pub impl_distributed_lines: Vec<usize>,
+    /// 0-based line indices of declaration-only `def … -> T` lines (an
+    /// `interface` method, say) to which the preprocessor appended `: ...`
+    /// so the Python parser accepts them. `tyc fmt` strips the appended
+    /// `: ...` again so the lowering does not leak into the user's file.
+    pub bodiless_def_lines: Vec<usize>,
     /// `python_source` line → line of the text the *whole* pipeline started
     /// from (both 0-based), when the caller composed the sugar chain's table
     /// with the preprocessor's own (see [`preprocess_mapped`]). Empty means
@@ -376,6 +382,7 @@ pub fn preprocess_opts_mapped(
     let mut raw_class_lines: Vec<usize> = Vec::new();
     let mut frozen_class_lines: Vec<usize> = Vec::new();
     let mut plain_class_lines: Vec<usize> = Vec::new();
+    let mut bodiless_def_lines: Vec<usize> = Vec::new();
     // When a `freeze let` RHS spans multiple lines (e.g. a multi-line dict
     // literal), the opening `__typhon_freeze__(` is emitted on the first
     // line but the matching `)` has to land *after* the closing bracket of
@@ -722,6 +729,7 @@ pub fn preprocess_opts_mapped(
             // without a body is invalid Python anyway, and `: ...` is a strict
             // upgrade that never changes a valid program's meaning.
             if let Some(with_body) = append_ellipsis_to_bodiless_def(line) {
+                bodiless_def_lines.push(line_index);
                 let (rewritten, marks) = rewrite_optionals(&with_body, &mut in_string);
                 for col in marks {
                     optionals.push(StrippedOptional {
@@ -910,7 +918,12 @@ pub fn preprocess_opts_mapped(
             // build time. Only record top-level (indent_len == 0)
             // comptime declarations.
             let mut stripped_line: Option<String> = None;
-            if indent_len == 0 && rest.starts_with("comptime ") {
+            // A continuation line inside brackets that happens to start at
+            // column 0 with a variable named `comptime` is not a declaration.
+            if indent_len == 0
+                && rest.starts_with("comptime ")
+                && mask.is_logical_line_start(line_index)
+            {
                 let payload = &rest["comptime ".len()..];
 
                 // Function declaration: `comptime def NAME(...):` — the
@@ -1042,6 +1055,7 @@ pub fn preprocess_opts_mapped(
         pub_names,
         pub_star_lines,
         impl_distributed_lines,
+        bodiless_def_lines,
         line_map: Vec::new(),
     };
     (result, line_map)
@@ -2015,7 +2029,16 @@ fn append_ellipsis_to_bodiless_def(line: &str) -> Option<String> {
     if !trimmed.contains("->") {
         return None;
     }
-    Some(format!("{}: ...{}", body.trim_end(), terminator))
+    // The `: ...` goes after the signature, before any trailing comment —
+    // appended after the comment it was inside it, and the declaration
+    // stayed bodiless (`tyc::parse`).
+    let code_end = body.len() - rest.len() + trimmed.len();
+    Some(format!(
+        "{}: ...{}{}",
+        &body[..code_end],
+        body[code_end..].trim_end(),
+        terminator
+    ))
 }
 
 /// Expand `impl[<tp>] Alias[<args>]:` (or the non-generic `impl Alias:`)
@@ -6829,18 +6852,40 @@ fn expand_inline_question_ops_split(source: &str) -> (String, Vec<usize>) {
             buf_start = line_index;
         }
 
-        // Lines that begin inside a triple-quoted string have no
-        // executable code on this row — emit verbatim.
-        if pre_string.is_some() {
-            buffered.push(line.to_owned());
-            continue;
-        }
-
-        let content = &raw[..code_end];
-        let comment = &raw[code_end..];
         let nl = if line.ends_with('\n') { "\n" } else { "" };
+        let (comment, rewrite) = match pre_string {
+            None => {
+                let content = &raw[..code_end];
+                (
+                    &raw[code_end..],
+                    rewrite_inline_question_ops_one_line(content, &mut counter, ctx),
+                )
+            }
+            // A line that begins inside a triple-quoted f-string carries
+            // code only in its replacement fields. A `?` there lifts above
+            // the statement like one on a bracket continuation line; left
+            // in place it was a `tyc::parse` error (W7-12).
+            Some(mode @ (StringMode::FTripleDouble | StringMode::FTripleSingle))
+                if ctx.head.is_some() =>
+            {
+                let quote = if mode == StringMode::FTripleDouble {
+                    b'"'
+                } else {
+                    b'\''
+                };
+                (
+                    "",
+                    rewrite_continued_fstring_fields(raw, quote, &mut counter, ctx),
+                )
+            }
+            // Any other string continuation has no code on this row.
+            Some(_) => {
+                buffered.push(line.to_owned());
+                continue;
+            }
+        };
 
-        match rewrite_inline_question_ops_one_line(content, &mut counter, ctx) {
+        match rewrite {
             Some((rewritten, lifted)) => {
                 // A guard lifted off a continuation line is re-indented to
                 // the statement's own indentation, since that is where it
@@ -6881,6 +6926,55 @@ fn expand_inline_question_ops_split(source: &str) -> (String, Vec<usize>) {
     } else {
         (text, map)
     }
+}
+
+/// Lift every propagating `?` in the replacement fields on a continuation
+/// line of a triple-quoted f-string (`line` starts inside the string; its
+/// quote character is `quote`). Each field expression is rewritten on its
+/// own, parenthesised so a `?` that ends it is not taken for the end of a
+/// statement. Same contract as [`rewrite_inline_question_ops_one_line`].
+fn rewrite_continued_fstring_fields(
+    line: &str,
+    quote: u8,
+    counter: &mut usize,
+    ctx: QContext<'_>,
+) -> Option<(String, Vec<String>)> {
+    if !line.contains('?') {
+        return None;
+    }
+    let field_ctx = QContext {
+        bracket: None,
+        ..ctx
+    };
+    let mut lifted = Vec::new();
+    let mut splices = Vec::new();
+    for range in fstring_fields::continued_fstring_field_exprs(line, quote) {
+        let expr = &line[range.clone()];
+        if !expr.contains('?') {
+            continue;
+        }
+        let Some((rewritten, field_lifted)) =
+            rewrite_inline_question_ops_one_line(&format!("({expr})"), counter, field_ctx)
+        else {
+            continue;
+        };
+        let Some(inner) = rewritten
+            .strip_prefix('(')
+            .and_then(|r| r.strip_suffix(')'))
+        else {
+            continue;
+        };
+        lifted.extend(field_lifted);
+        splices.push((range, inner.to_owned()));
+    }
+    if splices.is_empty() {
+        return None;
+    }
+    let mut out = line.to_owned();
+    for (range, text) in splices.into_iter().rev() {
+        out.replace_range(range, &text);
+    }
+    Some((out, lifted))
 }
 
 /// Emit one buffered logical statement: the guards it lifted first, then its
@@ -9388,6 +9482,10 @@ pub fn expand_go_calls(source: &str) -> String {
 pub fn expand_go_calls_mapped(source: &str) -> (String, Vec<usize>) {
     let (joined, join_map) = join_go_continuations(source);
     let source = joined.as_str();
+    // `go` is a statement keyword. On a line that continues an open bracket
+    // (`f(1,\n    go + 1)`) it is an ordinary name, and spawning there
+    // spliced `typhon_runtime.tasks.spawn(…)` into the argument list.
+    let mask = LexMask::new(source);
     let mut out = MappedOut::with_capacity(source.len());
     let mut in_string: Option<StringMode> = None;
     for (line_index, line) in source.split_inclusive('\n').enumerate() {
@@ -9407,7 +9505,8 @@ pub fn expand_go_calls_mapped(source: &str) -> (String, Vec<usize>) {
             .unwrap_or(code.len());
         let indent = &code[..indent_len];
         let body = code[indent_len..].trim_end();
-        if let Some(rest) = body.strip_prefix("go ") {
+        let at_statement_start = mask.is_logical_line_start(line_index);
+        if let Some(rest) = body.strip_prefix("go ").filter(|_| at_statement_start) {
             if let Some((call_expr, handle)) = parse_go_call(rest) {
                 if let Some(handle) = handle {
                     // Emit `let handle = …` so the user-visible task
@@ -9518,7 +9617,10 @@ fn parse_go_call(rest: &str) -> Option<(String, Option<String>)> {
 /// Lines that aren't part of a `go ...` continuation are emitted
 /// verbatim, leaving every other parser invariant intact.
 fn join_go_continuations(source: &str) -> (String, Vec<usize>) {
+    let mask = LexMask::new(source);
     let mut out = MappedOut::with_capacity(source.len());
+    // Whether the buffered line opens a `go` statement.
+    let mut buffering_go = false;
     // (line, original terminator, index of the first source line folded in)
     let mut buffered: Option<(String, String, usize)> = None;
     let mut paren_depth: i32 = 0;
@@ -9592,7 +9694,9 @@ fn join_go_continuations(source: &str) -> (String, Vec<usize>) {
                 }
                 d > 0
             };
-            let first = if opens_bracket && raw.trim_start().starts_with("go ") {
+            buffering_go =
+                mask.is_logical_line_start(line_index) && raw.trim_start().starts_with("go ");
+            let first = if opens_bracket && buffering_go {
                 raw[..code_end].trim_end().to_owned()
             } else {
                 raw.to_owned()
@@ -9632,11 +9736,8 @@ fn join_go_continuations(source: &str) -> (String, Vec<usize>) {
         // a `go ...` opener (or a continuation of one). A buffered
         // ordinary line that happens to be unterminated would not be a
         // `go`, so flush it now and reset.
-        if let Some((line, _, _)) = buffered.as_ref() {
-            let trimmed = line.trim_start();
-            if !trimmed.starts_with("go ") || paren_depth <= 0 {
-                flush(&mut buffered, &mut out);
-            }
+        if buffered.is_some() && (!buffering_go || paren_depth <= 0) {
+            flush(&mut buffered, &mut out);
         }
     }
     flush(&mut buffered, &mut out);

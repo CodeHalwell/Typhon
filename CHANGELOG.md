@@ -150,6 +150,27 @@ review deferred; the third — the 2026-09-30 release-readiness review
   a comma in parentheses swallowed the earlier arguments (`g(a, b |> f())`
   lowered to `g(f(a, b))`, now `g(a, f(b))`). To pipe into a comparison,
   parenthesise: `(x |> f()) > 0`.
+- **Four low-severity preprocessor and `tyc fmt` gaps closed (W7-12).**
+  - A module whose emitted Python opens more than 200 brackets at once
+    (list, set and dict displays, comprehensions, calls, subscripts) is a
+    `tyc::parse` error — "too many nested parentheses", CPython's own
+    compile-time `SyntaxError` for that `.py`. `tyc check` and `tyc run`
+    accepted it and `tyc build` emitted a file CPython refused. Grouping
+    parentheses do not count: the emitter drops them, and such a program
+    still compiles.
+  - `go` and `comptime` used as variable names at the start of a
+    continuation line inside brackets are names: `go + 1` was lowered to a
+    task spawn spliced into the argument list (`tyc::go_outside_async`),
+    and a column-0 `comptime * 3` was taken for a `comptime` declaration.
+  - `tyc fmt` no longer writes the lowering back into the file: a one-line
+    `enum Small: A; B` stays as written (it became
+    `enum Small: A = enum.auto(); B = enum.auto()`), and a declaration-only
+    `def area(self) -> float` keeps no `: ...`. A declaration-only `def`
+    with a trailing comment now parses — the appended `: ...` landed inside
+    the comment (`tyc::parse`).
+  - A propagating `?` in a replacement field on a continuation line of a
+    triple-quoted f-string lifts above the statement like one on a bracket
+    continuation line; it was a `tyc::parse` error.
 
 ### Third wave — the 2026-09-30 release-readiness review
 

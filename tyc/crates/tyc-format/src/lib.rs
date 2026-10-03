@@ -138,6 +138,7 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
     // The Phase-5 vision will replace this with an AST printer that
     // round-trips Typhon sugar end-to-end.
     let can_run_ruff = prep.stripped.is_empty()
+        && prep.bodiless_def_lines.is_empty()
         && prep.optionals.is_empty()
         && prep.lazy_imports.is_empty()
         && !contains_typhon_only_tokens(&normalised);
@@ -228,6 +229,14 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
     let original_lines: Vec<&str> = source.lines().collect();
     let output =
         restore_impl_extend_headers_verbatim(&output, &prep.stripped, &original_lines, &translate);
+
+    // Step 4d: undo the two lowerings `postprocess_full` does not reverse
+    // (W7-12). A one-line `enum Small: A; B` came back as
+    // `enum Small: A = enum.auto(); B = enum.auto()`, and a declaration-only
+    // `def area(self) -> float` (an `interface` method) came back with the
+    // `: ...` the preprocessor appended for the Python parser.
+    let output = restore_enum_one_liners(&output, &prep.stripped, &original_lines, &translate);
+    let output = strip_appended_ellipses(&output, &prep.bodiless_def_lines, &translate);
 
     // Step 5: self-check — refuse to hand back a different program.
     //
@@ -503,6 +512,87 @@ fn restore_impl_extend_headers_verbatim(
         out.push_str(term);
     }
     out
+}
+
+/// Apply `edit` to the lines of `output` whose 0-based index is a key of
+/// `targets`, keeping every line terminator. `edit` returns `None` to keep
+/// the line as it is.
+fn edit_lines<T>(
+    output: &str,
+    targets: &std::collections::HashMap<usize, T>,
+    edit: impl Fn(&str, &T) -> Option<String>,
+) -> String {
+    if targets.is_empty() {
+        return output.to_owned();
+    }
+    let mut out = String::with_capacity(output.len());
+    for (i, line) in output.split_inclusive('\n').enumerate() {
+        let content = line.trim_end_matches(['\n', '\r']);
+        let term = &line[content.len()..];
+        match targets.get(&i).and_then(|t| edit(content, t)) {
+            Some(edited) => out.push_str(&edited),
+            None => out.push_str(content),
+        }
+        out.push_str(term);
+    }
+    out
+}
+
+/// Put back the user's text for every one-line `enum NAME: A; B` header.
+/// The preprocessor turns each bare member on the header line into
+/// `A = enum.auto()`, and `postprocess_full` restores only the `enum`
+/// keyword. A member the user wrote as `A = enum.auto()` is
+/// indistinguishable from a generated one, so the original line (tidied
+/// like every other line) is spliced back rather than the members edited.
+fn restore_enum_one_liners(
+    output: &str,
+    stripped: &[StrippedKeyword],
+    original_lines: &[&str],
+    translate: &impl Fn(usize) -> usize,
+) -> String {
+    use tyc_syntax::lexer::TyphonKeyword;
+
+    let targets: std::collections::HashMap<usize, String> = stripped
+        .iter()
+        .filter(|s| matches!(s.keyword, TyphonKeyword::Enum))
+        .filter_map(|s| {
+            let orig = original_lines.get(s.line_index)?;
+            orig.trim_start()
+                .starts_with("enum ")
+                .then(|| (translate(s.line_index), tidy_header_line(orig)))
+        })
+        .collect();
+    edit_lines(output, &targets, |line, original| {
+        let rest = line.trim_start();
+        (rest.starts_with("enum ") && rest.contains("= enum.auto()")).then(|| original.clone())
+    })
+}
+
+/// Remove the `: ...` the preprocessor appended to each declaration-only
+/// `def … -> T` line. The appended text sits right after the signature,
+/// before any comment, so it is the first `: ...` that is followed only by
+/// whitespace or a comment — a `: ...` inside a default string is not.
+fn strip_appended_ellipses(
+    output: &str,
+    bodiless_def_lines: &[usize],
+    translate: &impl Fn(usize) -> usize,
+) -> String {
+    let targets: std::collections::HashMap<usize, ()> = bodiless_def_lines
+        .iter()
+        .map(|&l| (translate(l), ()))
+        .collect();
+    edit_lines(output, &targets, |line, ()| {
+        let rest = line.trim_start();
+        if !(rest.starts_with("def ") || rest.starts_with("async def ")) {
+            return None;
+        }
+        line.match_indices(": ...").find_map(|(at, m)| {
+            let after = &line[at + m.len()..];
+            let tail = after.trim_start();
+            (tail.is_empty() || tail.starts_with('#'))
+                .then(|| format!("{}{}", &line[..at], after.trim_end()))
+        })
+    })
 }
 
 /// Whether `line` (already stripped of its terminator) reads as a
@@ -2800,5 +2890,36 @@ def run() -> Result[int, str]:
         })
         .expect("a CRLF file formats");
         assert_eq!(out, "let s: str = \"\"\"a\nb\"\"\"\nprint(repr(s))\n");
+    }
+
+    fn fmt_without_ruff(src: &str) -> String {
+        without_ruff(|| {
+            format_source(src, "<test>")
+                .map(|r| r.output)
+                .map_err(|e| e.to_string())
+        })
+        .expect("formats")
+    }
+
+    #[test]
+    fn enum_one_liner_keeps_its_bare_members() {
+        // W7-12: the header came back as `enum Small: A = enum.auto(); …`.
+        let src = "enum Small: A; B\n\n\nenum Mixed: X = enum.auto(); Y  # note\n\n\nprint(Small.A, Mixed.Y)\n";
+        assert_eq!(fmt_without_ruff(src), src);
+        assert_eq!(fmt_without_ruff(&fmt_without_ruff(src)), src);
+    }
+
+    #[test]
+    fn declaration_only_defs_do_not_gain_an_ellipsis() {
+        // W7-12: the `: ...` the preprocessor appends for the Python parser
+        // leaked into the formatted file. A `: ...` the user wrote stays.
+        let src = concat!(
+            "interface Shape:\n",
+            "    def area(self) -> float\n",
+            "    def name(self, sep: str = \": ...\") -> str # the name\n",
+            "    async def load(self) -> int\n",
+            "    def done(self) -> bool: ...\n",
+        );
+        assert_eq!(fmt_without_ruff(src), src);
     }
 }

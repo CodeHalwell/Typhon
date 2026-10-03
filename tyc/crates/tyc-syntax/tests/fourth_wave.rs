@@ -505,3 +505,94 @@ fn every_pipe_position_lowers_to_parseable_python() {
     );
     assert!(parses(&lower(src)), "{}", lower(src));
 }
+
+// ── W7-12: low-severity preprocessor gaps ────────────────────────────────────
+
+/// (a) CPython refuses a 201st open bracket; so does the parser `tyc check`
+/// and `tyc run` use.
+#[test]
+fn bracket_nesting_past_cpython_limit_is_a_parse_error() {
+    let nest = |d: usize| format!("x = {}{}\nprint(len(x))\n", "[".repeat(d), "]".repeat(d));
+    assert!(parses(&lower(&nest(200))));
+    let err = tyc_syntax::parse_module(&lower(&nest(201))).expect_err("201 levels");
+    assert!(
+        err.to_string().contains("too many nested parentheses"),
+        "{err}"
+    );
+}
+
+/// (b) `go` / `comptime` starting a continuation line inside brackets are
+/// names, not statement keywords.
+#[test]
+fn go_and_comptime_on_a_continuation_line_are_names() {
+    for kw in ["go", "comptime"] {
+        for indent in ["", "    "] {
+            let src = format!(
+                "def f(*args: int) -> int:\n    return sum(args)\n\n\
+                 mut {kw}: int = 2\n\
+                 mut total: int = f(1,\n{indent}{kw} + 10)\n\
+                 total = f(\n{indent}{kw} * 3,\n)\n"
+            );
+            let out = lower(&src);
+            assert!(!out.contains("spawn"), "{kw}/{indent:?}:\n{out}");
+            assert!(
+                out.contains(&format!("{indent}{kw} + 10)"))
+                    && out.contains(&format!("{indent}{kw} * 3,")),
+                "{kw}/{indent:?}:\n{out}"
+            );
+            assert!(parses(&out), "{out}");
+            let prep = preprocess(&expand_sugar(&src, true));
+            assert!(
+                prep.comptime_bindings.is_empty(),
+                "{kw}: {:?}",
+                prep.comptime_bindings
+            );
+        }
+    }
+    // A real `go` statement is still a spawn.
+    let out = lower("async def w() -> None:\n    pass\n\nasync def m() -> None:\n    go w()\n");
+    assert!(out.contains("typhon_runtime.tasks.spawn(w())"), "{out}");
+}
+
+/// (c) A declaration-only `def` keeps a trailing comment outside the `: ...`
+/// the preprocessor appends, and the line is recorded for `tyc fmt`.
+#[test]
+fn bodiless_def_with_a_trailing_comment_parses_and_is_recorded() {
+    let src = "interface Shape:\n    def area(self) -> float  # the area\n    async def load(self) -> int\n";
+    let prep = preprocess(src);
+    assert!(
+        prep.python_source
+            .contains("    def area(self) -> float: ...  # the area\n"),
+        "{}",
+        prep.python_source
+    );
+    assert!(prep
+        .python_source
+        .contains("    async def load(self) -> int: ...\n"));
+    assert_eq!(prep.bodiless_def_lines, vec![1, 2]);
+    assert!(parses(&prep.python_source));
+}
+
+/// (d) A `?` in a replacement field on a continuation line of a
+/// triple-quoted f-string lifts above the statement.
+#[test]
+fn question_in_a_continued_triple_quoted_fstring_field_lifts() {
+    let src = concat!(
+        "def parse(s: str) -> Result[int, str]:\n    return Ok(int(s))\n\n",
+        "def show(s: str) -> Result[str, str]:\n",
+        "    let text: str = f\"\"\"value:\n",
+        "{parse(s)?:>3} and {{literal}} {s!r}\n",
+        "{parse(s + s)? * 2} done\"\"\"\n",
+        "    return Ok(text)\n",
+    );
+    let out = lower(src);
+    assert!(parses(&out), "{out}");
+    assert!(!out.contains(")?"), "{out}");
+    // Both guards sit above the statement, in field order, at its indent.
+    let first = out.find("= parse(s)\n").expect("first lift");
+    let second = out.find("= parse(s + s)\n").expect("second lift");
+    let stmt = out.find("    let text: str = f\"\"\"").expect("statement");
+    assert!(first < second && second < stmt, "{out}");
+    assert!(out.contains(".value:>3} and {{literal}} {s!r}\n"), "{out}");
+    assert!(out.contains(".value * 2} done\"\"\"\n"), "{out}");
+}
