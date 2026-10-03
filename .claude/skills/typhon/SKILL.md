@@ -1590,7 +1590,7 @@ Consumers:
 
 ## 19. Diagnostics catalog (top tier)
 
-The recurring diagnostic codes and what they actually mean. **See [DIAGNOSTICS.md](DIAGNOSTICS.md) for the exhaustive reference** (`tyc explain --list` prints all 90 codes the compiler ships as of v1.0.0-alpha.9) — what follows is the daily-driver subset.
+The recurring diagnostic codes and what they actually mean. **See [DIAGNOSTICS.md](DIAGNOSTICS.md) for the exhaustive reference** (`tyc explain --list` prints all 91 codes the compiler ships as of v1.0.0-alpha.9) — what follows is the daily-driver subset.
 
 | Code | Meaning | Fix |
 |---|---|---|
@@ -1638,7 +1638,7 @@ The recurring diagnostic codes and what they actually mean. **See [DIAGNOSTICS.m
 | `tyc::typevar_import_rejected` | `from typing import TypeVar` | Use PEP 695 (`def f[T](...)`) |
 | `tyc::typing_alias_deprecated` | `from typing import List/Dict/...` | Use lowercase built-ins |
 | `tyc::contains_secret_literal` (warn) | `comptime let *KEY/TOKEN/PASSWORD/SECRET = env(...)` would inline a secret | Read at runtime via `os.environ[...]` |
-| `tyc::comptime_env_missing` (or via `tyc::comptime`) | Required env var unset at build time | Set the env var or remove from `[env] required` |
+| `tyc::comptime` | Required env var unset at build time | Set the env var or remove from `[env] required` |
 | `tyc::cyclic_type_alias` | `type A = B; type B = A` | Anchor one alias to a concrete type |
 | `tyc::class_attr_shadows_slot` (warn) | `class` body with only annotated defaults reads like a constants namespace but emits slot descriptors | Use `ClassVar[T]`, or `pass` body for nullary variants |
 | `tyc::tuple_index_out_of_range` | Constant index out of range for fixed-arity tuple | Use an in-range index or change to homogeneous tuple |

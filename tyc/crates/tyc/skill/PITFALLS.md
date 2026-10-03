@@ -390,7 +390,7 @@ def bad(n: int = "zero") -> int: ...
 ```
 
 ```
-error[tyc::default_mismatch]: default value type `str` does not match annotation `int`
+error[tyc::type_mismatch]: type mismatch: expected `int`, found `str`
 ```
 
 **Fix:** match the type, or change the annotation.

@@ -69,12 +69,12 @@ The first form gives the proxy an alias; the second uses the module name directl
 ## `lazy from` is rejected
 
 ```python
-lazy from numpy import array        # ❌ parse error
+lazy from numpy import array        # ❌ rejected at check time
 ```
 
 ```
-error[tyc::lazy_from_import]: `lazy from … import` defeats deferred loading;
-                              use `lazy import numpy` plus `numpy.array(...)`
+error[tyc::lazy_usage]: `lazy from … import` defeats deferred loading;
+                        use `lazy import numpy` plus `numpy.array(...)`
 ```
 
 `from`-imports eagerly touch attributes on the source module — they cannot defer.

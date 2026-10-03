@@ -85,7 +85,7 @@ required = ["DATABASE_URL"]
 If `DATABASE_URL` is unset at build time, the build fails:
 
 ```
-error[tyc::comptime_env_missing]: required environment variable `DATABASE_URL` is not set
+error[tyc::comptime]: required environment variable `DATABASE_URL` is not set
  ┌─ src/main.ty:1:33
  │
 1 │ comptime let DB_URL: str = env("DATABASE_URL")

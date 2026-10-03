@@ -688,7 +688,7 @@ pub enum TycError {
     #[diagnostic(
         code(tyc::lazy_usage),
         url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/lazy_usage.md"),
-        help("`lazy` supports `lazy import name = module` and `lazy val NAME: T = expr` only")
+        help("`lazy` supports `lazy import name = module` and `lazy let NAME: T = expr` only")
     )]
     LazyUsage {
         message: String,
