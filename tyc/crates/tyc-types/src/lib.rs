@@ -883,8 +883,16 @@ fn close_sync_spawners(c: &mut Checker, body: &[Stmt]) {
             if f.is_async || c.sync_spawners.contains_key(f.name.as_str()) {
                 continue;
             }
-            let known: std::collections::HashSet<String> =
-                c.sync_spawners.keys().cloned().collect();
+            // A name the function binds itself — a parameter, a local, a
+            // nested `def` — shadows the module-level spawner of the same
+            // name (review 2026-10-03 §4.6).
+            let locals = function_local_names(f);
+            let known: std::collections::HashSet<String> = c
+                .sync_spawners
+                .keys()
+                .filter(|k| !locals.contains(k.as_str()))
+                .cloned()
+                .collect();
             if let Some(callee) = body_calls_one_of(&f.body, &known) {
                 let spawned = c.sync_spawners.get(&callee).cloned().unwrap_or_default();
                 c.sync_spawners.insert(
@@ -898,6 +906,74 @@ fn close_sync_spawners(c: &mut Checker, body: &[Stmt]) {
             break;
         }
     }
+}
+
+/// Every name `f` binds in its own scope: parameters, assignment / loop /
+/// `with` / walrus targets, nested `def` and `class` names, and local
+/// imports.
+fn function_local_names(f: &ruff_python_ast::StmtFunctionDef) -> std::collections::HashSet<String> {
+    let mut out: std::collections::HashSet<String> = f
+        .parameters
+        .iter()
+        .map(|p| p.name().as_str().to_owned())
+        .collect();
+    out.extend(collect_assign_sites(&f.body).into_iter().map(|(n, _)| n));
+    fn defs(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
+        for s in stmts {
+            match s {
+                Stmt::FunctionDef(d) => {
+                    out.insert(d.name.as_str().to_owned());
+                }
+                Stmt::ClassDef(d) => {
+                    out.insert(d.name.as_str().to_owned());
+                }
+                Stmt::Import(i) => {
+                    for a in &i.names {
+                        let local = a.asname.as_ref().map(|n| n.as_str()).unwrap_or_else(|| {
+                            a.name.as_str().split('.').next().unwrap_or(a.name.as_str())
+                        });
+                        out.insert(local.to_owned());
+                    }
+                }
+                Stmt::ImportFrom(i) => {
+                    for a in &i.names {
+                        out.insert(a.asname.as_ref().unwrap_or(&a.name).as_str().to_owned());
+                    }
+                }
+                Stmt::If(i) => {
+                    defs(&i.body, out);
+                    for c in &i.elif_else_clauses {
+                        defs(&c.body, out);
+                    }
+                }
+                Stmt::For(x) => {
+                    defs(&x.body, out);
+                    defs(&x.orelse, out);
+                }
+                Stmt::While(x) => {
+                    defs(&x.body, out);
+                    defs(&x.orelse, out);
+                }
+                Stmt::With(x) => defs(&x.body, out),
+                Stmt::Try(x) => {
+                    defs(&x.body, out);
+                    for h in &x.handlers {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                        if let Some(n) = &h.name {
+                            out.insert(n.as_str().to_owned());
+                        }
+                        defs(&h.body, out);
+                    }
+                    defs(&x.orelse, out);
+                    defs(&x.finalbody, out);
+                }
+                Stmt::Match(m) => m.cases.iter().for_each(|c| defs(&c.body, out)),
+                _ => {}
+            }
+        }
+    }
+    defs(&f.body, &mut out);
+    out
 }
 
 /// The first bare-name callee in `body` (nested `def` / `class` bodies

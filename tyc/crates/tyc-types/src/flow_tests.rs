@@ -1298,3 +1298,24 @@ def f(xs: list[str?]) -> str:
 "#,
     );
 }
+
+// ── W1-16: the transitive `go` scan respects shadowing ────────────────────
+
+fn go_outside_async(src: &str) -> bool {
+    check(src)
+        .errors()
+        .iter()
+        .any(|e| matches!(e, TycError::GoOutsideAsync { .. }))
+}
+
+#[test]
+fn w1_16_a_parameter_shadowing_a_spawner_is_not_the_spawner() {
+    let spawner =
+        "async def work(n: int) -> None:\n    print(n)\n\ndef start() -> None:\n    typhon_runtime.tasks.spawn(work(1))\n\n";
+    assert!(!go_outside_async(&format!(
+        "{spawner}def hello() -> None:\n    print(\"hi\")\n\ndef schedule(start: Callable[[], None]) -> None:\n    start()\n\nschedule(hello)\n"
+    )));
+    assert!(go_outside_async(&format!(
+        "{spawner}def schedule() -> None:\n    start()\n\nschedule()\n"
+    )));
+}

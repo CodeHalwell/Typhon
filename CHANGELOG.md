@@ -135,6 +135,11 @@ review deferred; the third — the 2026-09-30 release-readiness review
   comprehension binds in the enclosing scope at its declared type, as PEP
   572 specifies (it used to disappear with the comprehension and read as
   an unchecked `Unknown`, though it may hold `None`).
+- **The transitive `go_outside_async` scan respects shadowing.** A sync
+  function whose parameter (or local, nested `def` or import) is named like
+  a module-level spawner no longer counts as calling that spawner, so
+  `def schedule(start): start()` called at module level is not reported
+  because a module-level `def start(): go work(1)` exists.
 
 ### Third wave — the 2026-09-30 release-readiness review
 
