@@ -923,3 +923,121 @@ def m(xs: list[int?]) -> int:
 "#,
     );
 }
+
+// ── W1-08: invalidation gaps ──────────────────────────────────────────────
+
+const CLEAR: &str = r#"
+class Box:
+    value: int?
+def clear(b: Box) -> int:
+    b.value = None
+    return 0
+"#;
+
+#[test]
+fn w1_08_a_call_in_value_position_invalidates_in_evaluation_order() {
+    for body in [
+        "        let ignored: int = clear(b)\n        let n: int = b.value + 1\n",
+        "        print(clear(b), b.value + 1)\n",
+        "        match n:\n            case 1 if clear(b) == 0:\n                let k: int = b.value + 1\n            case _:\n                pass\n",
+    ] {
+        assert_rejected(&format!(
+            "{CLEAR}\ndef f(b: Box, n: int) -> None:\n    if b.value is not None:\n{body}"
+        ));
+    }
+}
+
+#[test]
+fn w1_08_writes_through_unnamed_objects_and_aliases_invalidate_the_field() {
+    assert_rejected(
+        r#"
+class Box:
+    v: int?
+def f(reg: dict[str, Box], b: Box) -> None:
+    if b.v is not None:
+        reg["k"].v = None
+        let n: int = b.v + 1
+"#,
+    );
+    assert_rejected(
+        r#"
+class H:
+    name: str?
+def f(hs: list[H], h: H) -> None:
+    if h.name is not None:
+        hs[0].name = None
+        print(h.name.upper())
+"#,
+    );
+    assert_rejected(
+        r#"
+class Box:
+    value: int?
+class H:
+    b: Box
+impl H:
+    def reset(self) -> None:
+        self.b.value = None
+def f(h: H, b: Box) -> None:
+    if b.value is not None:
+        h.reset()
+        let n: int = b.value + 1
+"#,
+    );
+}
+
+#[test]
+fn w1_08_yield_hands_control_to_the_caller() {
+    assert_rejected(
+        r#"
+class Box:
+    value: int?
+def gen(b: Box) -> Iterator[int]:
+    if b.value is not None:
+        yield 1
+        let z: int = b.value + 1
+        yield z
+"#,
+    );
+}
+
+#[test]
+fn w1_08_a_closure_does_not_keep_a_narrowing_reassigned_after_it() {
+    assert_rejected(
+        r#"
+from typing import Callable
+def f() -> None:
+    mut v: str? = "x"
+    if v is not None:
+        let g: Callable[[], str] = lambda: v.upper()
+        v = None
+        print(g())
+"#,
+    );
+    assert_rejected(
+        r#"
+def f() -> None:
+    mut v: str? = "x"
+    if v is not None:
+        def g() -> str:
+            return v.upper()
+        v = None
+        print(g())
+"#,
+    );
+    // Not reassigned afterwards: the narrowing holds.
+    assert_clean(
+        r#"
+from typing import Callable
+def f(v: str?, xs: list[int], b: Box) -> None:
+    if v is not None:
+        let g: Callable[[], str] = lambda: v.upper()
+        print(g())
+    if b.value is not None:
+        let n: int = len(xs) + b.value
+        print(str(b), b.value + 1)
+class Box:
+    value: int?
+"#,
+    );
+}

@@ -2634,6 +2634,8 @@ type ScopeMap = Rc<HashMap<String, TypeBinding>>;
 /// body is checked.
 #[derive(Debug, Default)]
 struct LoopExits {
+    /// Source range of the loop statement.
+    range: (usize, usize),
     breaks: Vec<TypeEnv>,
     continues: Vec<TypeEnv>,
 }
@@ -3221,6 +3223,11 @@ struct Checker<'a> {
     /// and `continue` in its body, joined into the loop-head and post-loop
     /// states (review 2026-10-03, W1-06 / W1-07).
     loop_exits: Vec<LoopExits>,
+    /// Per enclosing function body (the module first): every name it
+    /// assigns, with the offset the assignment takes effect at. Lets a
+    /// lambda or nested `def` drop narrowings of captured names that are
+    /// reassigned after it is created (see [`widen_captured_names`]).
+    assign_sites: Vec<Vec<(String, usize)>>,
     /// For each declared function name, its inferred signature type.
     function_signatures: HashMap<String, Type>,
     /// Per-function arity metadata that doesn't fit in `Type::Function`
@@ -3725,6 +3732,7 @@ impl<'a> Checker<'a> {
             field_writes: FieldWriteSummary::default(),
             pep695_aliases: HashSet::new(),
             loop_exits: Vec::new(),
+            assign_sites: Vec::new(),
             nonlocals_rebound_by_call: std::collections::HashSet::new(),
             function_signatures: HashMap::new(),
             function_arity_info: HashMap::new(),
@@ -6839,9 +6847,11 @@ pub fn check_module_with_imports(
     // - `Ok`/`Err` may be used before the `from typhon_runtime import`
     //   injection happens (the desugar pass adds it later).
     seed_typhon_builtins(&mut c);
+    c.assign_sites.push(collect_assign_sites(&module.body));
     for stmt in &module.body {
         check_stmt(&mut c, stmt);
     }
+    c.assign_sites.pop();
     c.env.leave();
 
     // Phase C: resource discipline. Walk the body for bound
@@ -12657,6 +12667,154 @@ fn invalidate_arg_fields(c: &mut Checker, root: &str, effect: &ArgEffect) {
         });
 }
 
+/// Every name `body` assigns — not counting nested `def` / `class` /
+/// lambda bodies, which bind their own locals — with the offset the
+/// assignment takes effect at (the end of an assignment statement, so the
+/// RHS of `v = make(lambda: v)` still counts as before it).
+fn collect_assign_sites(body: &[Stmt]) -> Vec<(String, usize)> {
+    struct V {
+        out: Vec<(String, usize)>,
+    }
+    fn names(t: &Expr, at: usize, out: &mut Vec<(String, usize)>) {
+        match t {
+            Expr::Name(n) => out.push((n.id.as_str().to_owned(), at)),
+            Expr::Tuple(x) => x.elts.iter().for_each(|e| names(e, at, out)),
+            Expr::List(x) => x.elts.iter().for_each(|e| names(e, at, out)),
+            Expr::Starred(s) => names(&s.value, at, out),
+            _ => {}
+        }
+    }
+    impl<'a> ruff_python_ast::visitor::Visitor<'a> for V {
+        fn visit_stmt(&mut self, s: &'a Stmt) {
+            let end = s.range().end().to_usize();
+            match s {
+                Stmt::FunctionDef(_) | Stmt::ClassDef(_) => return,
+                Stmt::Assign(a) => a.targets.iter().for_each(|t| names(t, end, &mut self.out)),
+                Stmt::AugAssign(a) => names(&a.target, end, &mut self.out),
+                Stmt::AnnAssign(a) if a.value.is_some() => names(&a.target, end, &mut self.out),
+                Stmt::Delete(d) => d.targets.iter().for_each(|t| names(t, end, &mut self.out)),
+                Stmt::For(f) => names(
+                    &f.target,
+                    f.target.range().start().to_usize(),
+                    &mut self.out,
+                ),
+                Stmt::With(w) => {
+                    for item in &w.items {
+                        if let Some(t) = item.optional_vars.as_deref() {
+                            names(t, t.range().start().to_usize(), &mut self.out);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            ruff_python_ast::visitor::walk_stmt(self, s);
+        }
+        fn visit_expr(&mut self, e: &'a Expr) {
+            match e {
+                Expr::Lambda(_) => return,
+                Expr::Named(n) => names(&n.target, n.range.end().to_usize(), &mut self.out),
+                _ => {}
+            }
+            ruff_python_ast::visitor::walk_expr(self, e);
+        }
+    }
+    use ruff_python_ast::visitor::Visitor;
+    let mut v = V { out: Vec::new() };
+    for s in body {
+        v.visit_stmt(s);
+    }
+    v.out
+}
+
+/// Widen the narrowings of names a closure created at offset `at` captures
+/// but the enclosing body reassigns after `at`, or anywhere inside a loop
+/// around `at` (the back-edge re-runs earlier assignments after the closure
+/// exists). Such a closure may run after the reassignment, so the narrowing
+/// in force where it is written does not hold inside it: `if v is not None:
+/// f = lambda: v.upper(); v = None; f()` (review 2026-10-03 §4.8).
+fn widen_captured_names(c: &mut Checker, at: usize) {
+    let Some(sites) = c.assign_sites.last() else {
+        return;
+    };
+    let loops: Vec<(usize, usize)> = c
+        .loop_exits
+        .iter()
+        .map(|f| f.range)
+        .filter(|r| r.0 <= at && at < r.1)
+        .collect();
+    let stale: Vec<String> = sites
+        .iter()
+        .filter(|(_, off)| *off > at || loops.iter().any(|r| r.0 <= *off && *off < r.1))
+        .map(|(n, _)| n.clone())
+        .collect();
+    for name in stale {
+        c.env.widen_to_declared(&name);
+    }
+}
+
+/// Flow effects of an expression that has just been inferred, applied in
+/// evaluation order: a call may rewrite fields its callee can reach, and a
+/// `yield` hands control to the caller, which may change any object.
+fn after_expr_effects(c: &mut Checker, expr: &Expr) {
+    match expr {
+        Expr::Call(call) => invalidate_after_call(c, call),
+        // The caller runs between `yield` and the next statement; any field
+        // it can see may have changed (review 2026-10-03 §3.11).
+        Expr::Yield(_) | Expr::YieldFrom(_) => c.env.attr_narrowings.clear(),
+        _ => {}
+    }
+}
+
+/// Drop the field narrowings a call may have made stale — on its receiver,
+/// on every bare-name argument, and, for a callee known to write fields
+/// `F`, on every path through a field in `F` (an alias of any object may
+/// have reached it: `h.reset()` where `h.b is b`). Runs for every call as
+/// it is inferred, so `let n: int = clear(b)` and `print(clear(b),
+/// b.value + 1)` are covered, not only a call in statement position
+/// (review 2026-10-03 §3.11, GPT-6 Codex F04).
+fn invalidate_after_call(c: &mut Checker, call: &ruff_python_ast::ExprCall) {
+    if c.env.attr_narrowings.is_empty() {
+        return;
+    }
+    let effect = call_arg_effect(c, call);
+    if let Expr::Attribute(recv_attr) = call.func.as_ref() {
+        if let Some(recv_path) = attr_path_of(&recv_attr.value) {
+            invalidate_receiver_fields(c, &recv_attr.value, &recv_path, &effect);
+        }
+    }
+    for arg in call
+        .arguments
+        .args
+        .iter()
+        .chain(call.arguments.keywords.iter().map(|k| &k.value))
+    {
+        if let Expr::Name(n) = arg {
+            invalidate_arg_fields(c, n.id.as_str(), &effect);
+        }
+    }
+    if let ArgEffect::Fields(fields) = &effect {
+        let frozen_roots: HashSet<String> = c
+            .env
+            .attr_narrowings
+            .keys()
+            .filter_map(|k| k.split('.').next())
+            .filter(|root| {
+                matches!(
+                    c.env.lookup(root).map(|b| &b.narrowed),
+                    Some(Type::Class(n)) if c.frozen_classes.contains(n.as_str())
+                )
+            })
+            .map(str::to_owned)
+            .collect();
+        c.env.attr_narrowings.retain(|k, _| {
+            let mut segs = k.split('.');
+            let root = segs.next().unwrap_or("");
+            let skip = usize::from(frozen_roots.contains(root));
+            !segs.skip(skip).any(|s| fields.contains(s))
+        });
+    }
+}
+
 /// Evaluate an expression appearing in statement position, invalidating global
 /// narrowing when it contains a call.
 ///
@@ -13013,6 +13171,11 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         if !value_type.is_nullable() && !matches!(value_type, Type::Unknown) {
                             c.env.narrow_attr(path, value_type.clone());
                         }
+                    } else if let Expr::Attribute(a) = target {
+                        // `reg["k"].v = None` / `hs[0].name = None`: the object
+                        // has no access path, so it may be any object whose
+                        // `v` is narrowed (review 2026-10-03 §3.11, §4.8).
+                        c.env.clear_attr_narrowings_of_field(a.attr.as_str(), "");
                     }
                 } else if matches!(target, Expr::Tuple(_) | Expr::List(_)) {
                     // Tuple/list unpack. A `let`/`mut` form introduces fresh
@@ -13619,7 +13782,10 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // ending in one is still widened (`body_always_leaves_loop`).
             widen_loop_carried_narrowings(c, &w.body);
             apply_narrowings(c, &narrowings);
-            c.loop_exits.push(LoopExits::default());
+            c.loop_exits.push(LoopExits {
+                range: (w.range.start().to_usize(), w.range.end().to_usize()),
+                ..LoopExits::default()
+            });
             for s in &w.body {
                 check_stmt(c, s);
             }
@@ -13712,7 +13878,10 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // every path) — there is then no back-edge, so no stale carry to
             // widen. A `continue` still reaches the back-edge, so it is widened.
             widen_loop_carried_narrowings(c, &f.body);
-            c.loop_exits.push(LoopExits::default());
+            c.loop_exits.push(LoopExits {
+                range: (f.range.start().to_usize(), f.range.end().to_usize()),
+                ..LoopExits::default()
+            });
             for s in &f.body {
                 check_stmt(c, s);
             }
@@ -13760,46 +13929,8 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             if c.call_can_rebind() && expr_contains_call(&e.value) {
                 reset_globals_after_call(c);
             }
-            // A bare method-call statement (`self.reset()`, `conn.close()`) may
-            // mutate a field of its receiver, so a prior attribute narrowing
-            // (`if self.x is not None:`) is stale afterwards. Clear narrowings
-            // rooted at the receiver. Scoped to a call in *statement* position
-            // (an almost-always-mutating side-effect call) to avoid the
-            // false positives that invalidating on every nested method call
-            // would cause on the common `self.helper(); self.x.foo()` shape.
-            // `await self.reset()` parses as `Await(Call(...))`, so peel a
-            // leading `await` before the call match — the awaited form is just
-            // as mutating a statement-position call as the sync one, and the
-            // alpha.2 fix only matched the bare `Call`.
-            let call_expr = match e.value.as_ref() {
-                Expr::Await(a) => a.value.as_ref(),
-                other => other,
-            };
-            if let Expr::Call(call) = call_expr {
-                if let Expr::Attribute(recv_attr) = call.func.as_ref() {
-                    if let Some(recv_path) = attr_path_of(&recv_attr.value) {
-                        let effect = call_arg_effect(c, call);
-                        invalidate_receiver_fields(c, &recv_attr.value, &recv_path, &effect);
-                    }
-                }
-                // An object handed to a call in statement position
-                // (`clear(b)`, `self.reset(b)`) can have its fields rewritten
-                // by the callee just as a method call on it can (review
-                // 2026-09-30 §3.8) — but only if the callee can write them:
-                // `print(it)` / `out.append(it)` / `logging.info("%s", it)`
-                // cannot (review 2026-10-03 §4.3).
-                let effect = call_arg_effect(c, call);
-                for arg in call
-                    .arguments
-                    .args
-                    .iter()
-                    .chain(call.arguments.keywords.iter().map(|k| &k.value))
-                {
-                    if let Expr::Name(n) = arg {
-                        invalidate_arg_fields(c, n.id.as_str(), &effect);
-                    }
-                }
-            }
+            // Field narrowings a call can invalidate are dropped as each call
+            // is inferred, in evaluation order (see `invalidate_after_call`).
         }
         Stmt::AugAssign(a) => {
             // The target can run a call too: `xs[bump()] += 1`.
@@ -14428,6 +14559,12 @@ fn check_function(
     // of a nested `def` — `leave()` only pops this body's own scope, so without
     // this restore the mutation to an outer frame's `narrowed` field persists.
     let saved_scope_narrowings = c.env.snapshot_scope_narrowings();
+    // A captured name the enclosing body reassigns after this `def` (or
+    // inside a loop around it) may hold any of those values when the body
+    // runs, so its narrowing at the `def` does not hold inside (review
+    // 2026-10-03 §4.8). Undone by the restore above on exit.
+    widen_captured_names(c, name_span_offset);
+    c.assign_sites.push(collect_assign_sites(body));
     c.env.enter();
     // Attribute narrowings (`self.x` non-null) belong to the enclosing
     // function body — a different `self` is in scope here, so start clean.
@@ -14596,6 +14733,7 @@ fn check_function(
     }
 
     c.env.leave();
+    c.assign_sites.pop();
     c.env.restore_scope_narrowings(saved_scope_narrowings);
     c.env.attr_narrowings = saved_attr_narrowings;
     c.reassigned_names = saved_reassigned_names;
@@ -18787,7 +18925,20 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
         return Type::Unknown;
     }
     c.infer_depth.set(depth + 1);
-    let result = infer_expr_ctx_inner(c, expr, expected);
+    let result = match expr {
+        // A lambda body runs later, when captured names may have been
+        // reassigned; check it without their narrowings, and let nothing it
+        // does leak into the enclosing flow.
+        Expr::Lambda(lam) => {
+            let snap = c.env.snapshot();
+            widen_captured_names(c, lam.range.start().to_usize());
+            let r = infer_expr_ctx_inner(c, expr, expected);
+            c.env.restore(snap);
+            r
+        }
+        _ => infer_expr_ctx_inner(c, expr, expected),
+    };
+    after_expr_effects(c, expr);
     c.infer_depth.set(depth);
     result
 }
@@ -21500,11 +21651,10 @@ fn assign_unpacking_target(c: &mut Checker, target: &Expr, elem_ty: &Type) {
         }
         // `(self.x, y) = (None, 1)` rebinds the attribute, so any narrowing on
         // that path — and on anything below it — is stale.
-        Expr::Attribute(_) => {
-            if let Some(path) = attr_path_of(target) {
-                c.env.clear_attr_narrowing(&path);
-            }
-        }
+        Expr::Attribute(a) => match attr_path_of(target) {
+            Some(path) => c.env.clear_attr_narrowing(&path),
+            None => c.env.clear_attr_narrowings_of_field(a.attr.as_str(), ""),
+        },
         Expr::Tuple(t) => {
             let slots: Option<&Vec<Type>> = match elem_ty {
                 Type::Generic(h, a) if h == "tuple" && a.len() == t.elts.len() => Some(a),

@@ -76,6 +76,17 @@ review deferred; the third — the 2026-09-30 release-readiness review
   every `break`. A nullable declaration with a non-`None` initializer
   (`mut x: int? = 5`) now starts out narrowed, as the same value assigned
   on the next line would. No previously clean corpus unit changes.
+- **Field narrowings are invalidated wherever a call or write can reach
+  them.** Every call now drops the narrowings its callee can write as it is
+  evaluated, not only a call in statement position: `let n: int = clear(b)`,
+  `print(clear(b), b.value + 1)` and `case 1 if clear(b):` no longer keep a
+  stale `b.value`. A callee known to write field `f` drops `f` on every
+  object, since it may reach one through an alias (`h.reset()` with
+  `h.b is b`). A write through an object with no access path
+  (`reg["k"].v = None`, `hs[0].name = None`) drops that field everywhere.
+  `yield` drops field narrowings, since the caller runs in between. A
+  lambda or nested `def` no longer keeps the narrowing of a captured name
+  that the enclosing body reassigns after it (or inside a loop around it).
 
 ### Third wave — the 2026-09-30 release-readiness review
 
