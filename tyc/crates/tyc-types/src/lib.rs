@@ -3134,6 +3134,7 @@ const IS_ASSIGNABLE_MAX_DEPTH: u32 = 256;
 
 struct Checker<'a> {
     expression_types: HashMap<(usize, usize), Type>,
+    attribute_receiver_type: Option<Type>,
     path: String,
     source: &'a str,
     resolved: &'a ResolvedModule,
@@ -3699,6 +3700,7 @@ impl<'a> Checker<'a> {
             function_type_bounds: HashMap::new(),
             active_typevar_bounds: HashMap::new(),
             expression_types: HashMap::new(),
+            attribute_receiver_type: None,
             active_type_params: Vec::new(),
             interfaces: HashMap::new(),
             class_shapes: HashMap::new(),
@@ -10951,6 +10953,25 @@ fn infer_try_result_arg_ret(c: &mut Checker, arg: &Expr) -> Type {
     }
 }
 
+fn expression_attr_narrowing(c: &Checker, expr: &Expr) -> Option<Type> {
+    c.env.attr_narrowings.iter().find_map(|(path, ty)| {
+        let mut node = expr;
+        let mut components = path.rsplit('.').peekable();
+        while let Some(component) = components.next() {
+            match node {
+                Expr::Attribute(attr) if attr.attr.as_str() == component => node = &attr.value,
+                Expr::Name(name)
+                    if name.id.as_str() == component && components.peek().is_none() =>
+                {
+                    return Some(ty.clone())
+                }
+                _ => return None,
+            }
+        }
+        None
+    })
+}
+
 fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
     match e {
         Expr::Name(n) => c
@@ -10959,10 +10980,8 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
             .map(|b| b.narrowed.clone())
             .unwrap_or(Type::Unknown),
         Expr::Attribute(a) => {
-            if let Some(path) = attr_path_of(e) {
-                if let Some(narrowed) = c.env.attr_narrowed(&path) {
-                    return narrowed.clone();
-                }
+            if let Some(narrowed) = expression_attr_narrowing(c, e) {
+                return narrowed;
             }
             let recv = infer_expr_readonly(c, &a.value);
             // Builtin container methods carry a real signature (`d.get(k)` is
@@ -18152,7 +18171,41 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
         return Type::Unknown;
     }
     c.infer_depth.set(depth + 1);
-    let result = infer_expr_ctx_inner(c, expr, expected);
+    let result = if matches!(expr, Expr::Attribute(_)) {
+        // Fold a receiver chain from the leaf outward. Each receiver is
+        // inferred once, on a bounded stack, instead of nesting the large
+        // expression-inference frame for every attribute.
+        let mut chain = Vec::new();
+        let mut leaf = expr;
+        while let Expr::Attribute(attr) = leaf {
+            chain.push(leaf);
+            leaf = &attr.value;
+        }
+        let mut receiver = infer_expr_ctx(c, leaf, None);
+        for node in chain.into_iter().rev() {
+            c.attribute_receiver_type = Some(receiver);
+            receiver = infer_expr_ctx_inner(
+                c,
+                node,
+                if std::ptr::eq(node, expr) {
+                    expected
+                } else {
+                    None
+                },
+            );
+            c.attribute_receiver_type = None;
+            c.expression_types.insert(
+                (
+                    node.range().start().to_usize(),
+                    node.range().end().to_usize(),
+                ),
+                receiver.clone(),
+            );
+        }
+        receiver
+    } else {
+        infer_expr_ctx_inner(c, expr, expected)
+    };
     c.infer_depth.set(depth);
     c.expression_types.insert(
         (
@@ -19845,12 +19898,13 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
         Expr::Attribute(a) => {
             // Flow-sensitive attribute narrowing: `if self.x is None: return …`
             // narrows `self.x` to non-`None` for the rest of the block.
-            if let Some(path) = attr_path_of(expr) {
-                if let Some(narrowed) = c.env.attr_narrowed(&path) {
-                    return narrowed.clone();
-                }
+            if let Some(narrowed) = expression_attr_narrowing(c, expr) {
+                return narrowed;
             }
-            let recv = infer_expr(c, &a.value);
+            let recv = c
+                .attribute_receiver_type
+                .take()
+                .unwrap_or_else(|| infer_expr(c, &a.value));
             if recv.is_nullable() {
                 check_nullable_receiver(c, &a.value, &recv);
             }
@@ -38224,5 +38278,28 @@ def main() -> None:
                 "{needle}"
             );
         }
+    }
+    #[test]
+    fn w2_19_narrowing_lookup_matches_the_entire_receiver_path() {
+        let source = "x.real.real\n";
+        let module = tyc_syntax::parse_module(source).unwrap().into_syntax();
+        let (resolved, _) = resolve_module("<test>".into(), source, &module);
+        let mut checker = Checker::new("<test>".into(), source, &resolved);
+        let Stmt::Expr(stmt) = &module.body[0] else {
+            panic!()
+        };
+        checker
+            .env
+            .attr_narrowings
+            .insert("x.real".into(), Type::Int);
+        assert_eq!(expression_attr_narrowing(&checker, &stmt.value), None);
+        checker
+            .env
+            .attr_narrowings
+            .insert("x.real.real".into(), Type::Float);
+        assert_eq!(
+            expression_attr_narrowing(&checker, &stmt.value),
+            Some(Type::Float)
+        );
     }
 }
