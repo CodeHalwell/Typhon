@@ -179,7 +179,11 @@ floor is 10 ms rather than 5: with a ~22 ms baseline the 20 % band was inside
 a shared runner's process-start jitter and the gate tripped on a tree with
 no compiler change. `OAUTH_TOKEN` / `OAUTH_SECRET` (and squashed forms) join
 the `tyc::contains_secret_literal` keyword table, ordered ahead of
-`AUTH_TOKEN`. Regression tests cover every item above; the docs, the skill
+`AUTH_TOKEN`. The consolidated Sentinel batch grows the table to 165
+entries (`PERSONAL_ACCESS_TOKEN`, `GITHUB_TOKEN`, `REFRESH_TOKEN`,
+`SESSION_TOKEN`, `WEBHOOK_SECRET`, `APP_KEY` and the `*_PASSWORD` / `*_PASS` /
+`*_PWD` / `*_KEY` / `*_TOKEN` / `*_SECRET` permutations), still longest-first
+and duplicate-free; the docs page and both skill copies list the full table. Regression tests cover every item above; the docs, the skill
 and the docs-site are updated to match.
 
 **`tyc run` is a real drop-in for `tyc build` + CPython.** It scans a

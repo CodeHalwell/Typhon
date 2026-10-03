@@ -39,3 +39,19 @@
 ## 2024-06-25 - Avoid HashSet<String> for temporary AST bounds
 **Learning:** Checking for bindings and usages inside AST nodes to detect optimization candidates (e.g., `auto_gather.rs` `collect_run` and `collect_opportunity_run`) utilized `HashSet<String>`. Every encountered variable binding allocated a new String just to push it into the tracking set, even though the variables are locally scoped to the traversal.
 **Action:** Use `HashSet<&str>` using the exact AST nodes' string slice lifetime (`&'a [Stmt]`) instead of mapping or cloning strings. Avoid dropping the lifetime too early.
+## 2024-11-28 - Zero-Allocation `parameter_names`
+**Learning:** Checking for bound local names in `collect_local_bindings` during AST traversal required `parameter_names` to create a `HashSet<String>` by cloning string identifiers inside AST nodes. As this is used to populate `PurityCtx`, the repeated allocation of strings negatively impacted compilation times on deep stacks of function nodes.
+**Action:** By bounding the lifetime of the `HashSet<&str>` to the incoming `&Parameters` reference, we can avoid String allocations entirely when building the `params` set and rely on dereferencing pointers for fast lookups.
+
+## 2024-11-28 - Zero-Allocation `module_class_names` in desugar
+**Learning:** Building sets of module-level classes using `HashSet<String>` required cloning strings during the AST desugaring pass, creating unnecessary memory pressure.
+**Action:** Using `HashSet<&str>` to track `module_class_names` and `exception_class_names` avoids heap allocations entirely, improving compiler performance in hot paths.
+## 2024-11-28 - Zero-Allocation AST Import Traversal (Extension)
+**Learning:** `collect_imported_modules` within `tyc-venv` allocated strings for every module import inside the source file using `extract_dotted_modules_from_import` and `HashSet<String>`.
+**Action:** By borrowing `&str` instead via `HashSet<&str>`, and only calling `.to_owned()` conditionally for the collected subset of modules, we avoid significant allocation overhead during the import parsing step.
+## 2024-05-18 - Prevented unnecessary String allocation in local_classes AST traversal
+**Learning:** In Rust AST passes, temporary lookups (like `local_classes`) shouldn't eagerly heap-allocate Strings if the references borrowed from `Vec<Stmt>` can live until the vector is consumed via `.into_iter()`. The borrow checker is satisfied as long as the `HashSet` holding those borrows is dropped explicitly before the iteration consumes the AST vector.
+**Action:** Always prefer `HashSet<&str>` over `HashSet<String>` for temporary name-tracking in AST traversals, and explicitly `drop` the collection before consuming the AST to prevent borrow checker conflicts.
+## 2024-11-28 - Zero-Allocation `local_classes` during AST impl block merging
+**Learning:** `local_classes` in `tyc-desugar` (used for merging `impl` blocks into `class` declarations) originally mapped AST nodes to a new `HashSet<String>` by explicitly cloning every class name in the module via `.to_owned()`. Because this operation occurs inside a hot path on every file lowered during desugaring, these string allocations introduced unnecessary overhead. Note that changing it to `HashSet<&str>` requires an explicit `drop(local_classes)` before consuming the `body` vector via `into_iter` to satisfy the borrow checker.
+**Action:** Always borrow AST string identifiers as `&str` using `HashSet<&str>` bounded by the `&[Stmt]` lifetime instead of allocating new `String`s. If the collection later needs to be consumed or mutated, use `drop(set)` to explicitly end the borrow to comply with Non-Lexical Lifetimes.
