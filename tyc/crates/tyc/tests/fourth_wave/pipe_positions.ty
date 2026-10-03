@@ -1,0 +1,22 @@
+def double(x: int) -> int:
+    return x * 2
+
+def add(x: int, y: int) -> int:
+    return x + y
+
+def label(x: int, prefix: str = "#") -> str:
+    return f"{prefix}{x}"
+
+let xs: list[int] = [1, 2, 3]
+let doubled: list[int] = [x |> double() for x in xs if (x |> double()) > 2]
+let table: dict[str, int] = {x |> label(): x |> add(10) for x in xs}
+let pair: tuple[int, int] = (xs[0] |> double(), xs[1] |> add(5))
+print(doubled, table, pair)
+print(xs[0], xs[2] |> label(prefix="n="))
+print(f"{xs[1] |> double():>5}|{xs |> len()}")
+let total: int = sum(x |> double() for x in xs)
+if (total |> add(-12)) == 0:
+    print("twelve")
+for v in xs |> reversed():
+    print(v |> label())
+print(1 < 2 |> str(), not 0 |> str())

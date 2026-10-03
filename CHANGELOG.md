@@ -135,6 +135,21 @@ review deferred; the third — the 2026-09-30 release-readiness review
   VM still ignores `metaclass=` and snapshots a base's class attributes
   when a subclass is created, so it does not yet print the CPython result
   for either program.
+- **`|>` works in every expression position, with one precedence (W7-09).**
+  The pipe keeps the precedence it always had at statement level — it binds
+  looser than every other expression operator, so its left operand is the
+  whole expression to its left (`not 0 |> add(0)` is `add(not 0, 0)`,
+  `1 < 2 |> f()` is `f(1 < 2)`) and its right operand must be a call or a
+  callable name — and that rule now applies in every expression slot. A
+  slot ends at a bracket, a top-level comma, a dict / slice / lambda `:`, a
+  keyword-argument or default `=`, a comprehension's `for` / `in` / `if`,
+  a statement's `return` / assignment prefix or `if` / `elif` / `while` /
+  `for … in` / `assert` header, and an f-string field's `!` / `:` / `=`.
+  Pipes in list, set and dict displays, comprehensions, subscripts, slices,
+  f-string fields and those headers were a `tyc::parse` error; a pipe after
+  a comma in parentheses swallowed the earlier arguments (`g(a, b |> f())`
+  lowered to `g(f(a, b))`, now `g(a, f(b))`). To pipe into a comparison,
+  parenthesise: `(x |> f()) > 0`.
 
 ### Third wave — the 2026-09-30 release-readiness review
 

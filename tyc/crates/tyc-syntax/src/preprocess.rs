@@ -33,6 +33,7 @@ use crate::lexer::TyphonKeyword;
 use crate::lexmask::{scan_line, scan_line_kinds, ByteKind, LexMask, StringMode};
 
 mod eval_order;
+mod pipe_slots;
 
 /// One stripped keyword and the 0-based line index in the source where it
 /// appeared.
@@ -9696,153 +9697,27 @@ fn expand_pipes_line_by_line(source: &str) -> (String, Vec<usize>) {
         }
 
         let code = &raw[..code_end];
-        // First, expand any `|>` that lives inside a parenthesised
-        // sub-expression — the original line-only pass only looked at
-        // depth-0 pipes, which left shapes like
-        // `(1 |> add(2)) |> add(3)` un-rewritten on the inner pipe
-        // and produced a parser error against the still-Typhon-only
-        // `|>` token. The nested helper recurses into each balanced
-        // `(...)` group so inner pipes are rewritten before the
-        // outer pipe pass sees them. O28 / FINDINGS #117–#119.
-        let nested_expanded = expand_pipes_in_subexpressions(code);
-        let code_for_top: &str = &nested_expanded;
-        let pipes = find_top_level_pipes(code_for_top);
-        if pipes.is_empty() {
-            // The nested pass may still have rewritten parenthesised
-            // sub-expressions even when no top-level pipe remained.
-            // Stream the rewritten code (plus the original trailing
-            // comment) into the buffer so that progress is preserved.
-            if nested_expanded != code {
-                result.push_str(&nested_expanded);
-                result.push_str(&raw[code_end..]);
-                result.push_str(terminator);
-            } else {
-                result.push_str(line);
-            }
+        if !code.contains("|>") {
+            result.push_str(line);
             continue;
         }
-
-        let rewritten = match rewrite_pipe_line(code_for_top, &pipes) {
-            Some(s) => s,
-            None => {
-                // Bail out — pass the line through unchanged so the regular
-                // parser produces a coherent diagnostic at the `|>` token.
-                result.push_str(line);
-                continue;
+        // Every expression slot — bracket groups innermost first, then the
+        // statement's own — gets its pipes rewritten (W7-09). `None` means a
+        // statement-level pipe could not be rewritten: pass the line through
+        // unchanged so the parser reports a coherent error at the `|>`.
+        match pipe_slots::rewrite_pipes_in_statement(code) {
+            Some(rewritten) if rewritten != code => {
+                result.push_str(&rewritten);
+                // Preserve any trailing comment, then re-attach the original
+                // newline bytes (which may be `\r\n` on Windows-authored files).
+                result.push_str(&raw[code_end..]);
+                result.push_str(terminator);
             }
-        };
-
-        result.push_str(&rewritten);
-        // Preserve any trailing comment, then re-attach the original
-        // newline bytes (which may be `\r\n` on Windows-authored files).
-        result.push_str(&raw[code_end..]);
-        result.push_str(terminator);
+            _ => result.push_str(line),
+        }
     }
 
     result.finish()
-}
-
-/// Recursively expand `|>` operators inside balanced `(...)` groups.
-/// Walks `code` left-to-right, treating top-level `(` / `)` pairs as
-/// independent sub-expressions; each pair's body is processed first
-/// (so nested pipes are rewritten innermost-first), then any pipes
-/// still present at the body's top level are rewritten via the same
-/// machinery the line-level pass uses. Triple-quoted and ordinary
-/// string literals are passed through verbatim.
-///
-/// This pass is a no-op when the input contains no `|>` token at all.
-/// O28 / FINDINGS #119.
-fn expand_pipes_in_subexpressions(code: &str) -> String {
-    if !code.contains("|>") {
-        return code.to_owned();
-    }
-    let bytes = code.as_bytes();
-    let mut out = String::with_capacity(code.len());
-    let mut in_str: Option<u8> = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        // Copy one whole UTF-8 character. Pushing `b as char` re-encoded
-        // every non-ASCII byte as its own Latin-1 code point, so any line
-        // containing both `|>` and a non-ASCII character came out mojibaked
-        // (`"café" |> str.upper()` printed `CAFÃ©`).
-        let char_len = utf8_char_len(bytes, i);
-        if let Some(q) = in_str {
-            out.push_str(&code[i..i + char_len]);
-            if b == b'\\' && i + 1 < bytes.len() {
-                let next_len = utf8_char_len(bytes, i + 1);
-                out.push_str(&code[i + 1..i + 1 + next_len]);
-                i += 1 + next_len;
-                continue;
-            }
-            if b == q {
-                in_str = None;
-            }
-            i += char_len;
-            continue;
-        }
-        if b == b'"' || b == b'\'' {
-            in_str = Some(b);
-            out.push(b as char);
-            i += 1;
-            continue;
-        }
-        if b == b'(' {
-            // Find the matching `)`, tracking string state inside.
-            let mut depth: i32 = 1;
-            let mut j = i + 1;
-            let mut local_str: Option<u8> = None;
-            while j < bytes.len() && depth > 0 {
-                let c = bytes[j];
-                if let Some(q) = local_str {
-                    if c == b'\\' && j + 1 < bytes.len() {
-                        j += 2;
-                        continue;
-                    }
-                    if c == q {
-                        local_str = None;
-                    }
-                    j += 1;
-                    continue;
-                }
-                match c {
-                    b'"' | b'\'' => local_str = Some(c),
-                    b'(' => depth += 1,
-                    b')' => depth -= 1,
-                    _ => {}
-                }
-                j += 1;
-            }
-            if depth != 0 {
-                // Unmatched paren — give up and emit verbatim. The
-                // downstream parser will produce a coherent diagnostic.
-                out.push('(');
-                i += 1;
-                continue;
-            }
-            let inner_bytes = &bytes[i + 1..j - 1];
-            let inner = std::str::from_utf8(inner_bytes).unwrap_or("");
-            // Recurse: rewrite any deeper-nested parens first, then
-            // run the top-level pass on the result.
-            let processed_inner = {
-                let nested = expand_pipes_in_subexpressions(inner);
-                let pipes = find_top_level_pipes(&nested);
-                if pipes.is_empty() {
-                    nested
-                } else {
-                    rewrite_pipe_line(&nested, &pipes).unwrap_or(nested)
-                }
-            };
-            out.push('(');
-            out.push_str(&processed_inner);
-            out.push(')');
-            i = j;
-            continue;
-        }
-        out.push_str(&code[i..i + char_len]);
-        i += char_len;
-    }
-    out
 }
 
 /// Fold multi-line pipe segments back onto their preceding line so the
@@ -10088,47 +9963,6 @@ where
             },
         }
     }
-}
-
-/// Rewrite a single line `code` containing top-level pipe operators (at the
-/// byte positions in `pipes`) into the equivalent nested-call form.
-///
-/// Returns `None` if any pipe right-hand-side does not match the supported
-/// callable shape — the caller is expected to pass the line through unchanged.
-fn rewrite_pipe_line(code: &str, pipes: &[usize]) -> Option<String> {
-    // Split into segments delimited by `|>`. Leading/trailing whitespace on
-    // each segment is preserved on the first segment (for indent) but trimmed
-    // on intermediate ones.
-    let mut segments: Vec<&str> = Vec::with_capacity(pipes.len() + 1);
-    let mut last = 0;
-    for &pos in pipes {
-        segments.push(&code[last..pos]);
-        last = pos + 2;
-    }
-    segments.push(&code[last..]);
-
-    let first = segments[0];
-    let indent_end = first
-        .find(|c: char| !c.is_whitespace())
-        .unwrap_or(first.len());
-    let indent = &first[..indent_end];
-    let first_body = first[indent_end..].trim_end();
-
-    // Identify any assignment / return prefix on the first segment so the
-    // chain only consumes the right-hand expression.
-    let (prefix, lhs_expr) = split_pipe_prefix(first_body);
-    let lhs_expr = lhs_expr.trim();
-    if lhs_expr.is_empty() {
-        return None;
-    }
-
-    let mut acc = lhs_expr.to_string();
-    for seg in &segments[1..] {
-        let rhs = seg.trim();
-        acc = apply_pipe_call(&acc, rhs)?;
-    }
-
-    Some(format!("{}{}{}", indent, prefix, acc))
 }
 
 /// Strip an optional `return ` or `LHS [op]= ` prefix from the head of a
@@ -13773,15 +13607,13 @@ def f() -> Result[int, str]:
     }
 
     #[test]
-    fn pipe_inside_parens_is_left_alone() {
-        // Pipes inside `[...]` brackets (list/set/dict comprehensions or
-        // index syntax) are NOT rewritten — Python's `|` already has a
-        // meaning in those positions and we leave the parser to surface
-        // the error. The matching recursion in `expand_pipes_in_sub-
-        // expressions` only walks `(...)` groups.
+    fn pipe_inside_brackets_is_rewritten_in_its_slot() {
+        // W7-09: a comprehension element is an expression slot like any
+        // other (`|>` is never valid Python, so leaving it was a parse
+        // error, not a deferral to Python's `|`).
         let src = "y = sum([a |> f for a in xs])\n";
         let out = expand_pipes(src);
-        assert_eq!(out, src);
+        assert_eq!(out, "y = sum([f(a) for a in xs])\n");
     }
 
     #[test]

@@ -233,3 +233,16 @@ fn plain_subclass_inherits_rather_than_copies_attributes() {
         "True False True cfg\n",
     );
 }
+
+/// W7-09: `|>` in a comprehension (element and condition), a dict
+/// comprehension (key and value), tuple elements, a call argument with a
+/// keyword argument, an f-string field, a generator argument, `if` and
+/// `for` headers — each a `tyc::parse` error before — plus the unchanged
+/// lowest precedence (`1 < 2 |> str()` is `str(1 < 2)`).
+#[test]
+fn pipe_works_in_every_expression_position() {
+    assert_runs_as(
+        include_str!("fourth_wave/pipe_positions.ty"),
+        include_str!("fourth_wave/pipe_positions.expected"),
+    );
+}

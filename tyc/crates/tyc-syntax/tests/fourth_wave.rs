@@ -393,3 +393,115 @@ fn with_chain_nested_form_leaves_string_content_alone() {
         "{out}"
     );
 }
+
+// ── W7-09: `|>` precedence in every expression position ─────────────────────
+
+use tyc_syntax::preprocess::expand_pipes;
+
+fn pipes(src: &str) -> String {
+    expand_pipes(&format!("{src}\n")).trim_end().to_owned()
+}
+
+#[test]
+fn pipe_binds_looser_than_every_operator_at_statement_level() {
+    // Unchanged: the left operand is everything to the left in the slot.
+    assert_eq!(pipes("x = not 0 |> add(0)"), "x = add(not 0, 0)");
+    assert_eq!(pipes("x = 1 < 2 |> f()"), "x = f(1 < 2)");
+    assert_eq!(pipes("x = a + b |> f()"), "x = f(a + b)");
+    assert_eq!(pipes("x = a if c else b |> f()"), "x = f(a if c else b)");
+    assert_eq!(pipes("return a and b |> f()"), "return f(a and b)");
+}
+
+#[test]
+fn pipe_slots_end_at_commas_colons_keywords_and_brackets() {
+    // Tuple elements and call arguments: the comma ends the slot (a pipe
+    // used to swallow `g(a, b |> f())` into `g(f(a, b))`).
+    assert_eq!(pipes("x = a |> f(), b |> g()"), "x = f(a), g(b)");
+    assert_eq!(pipes("return a |> f(), b"), "return f(a), b");
+    assert_eq!(pipes("print(a, b |> f())"), "print(a, f(b))");
+    assert_eq!(pipes("t = (a, b |> f())"), "t = (a, f(b))");
+    // List / set displays, subscripts and slices.
+    assert_eq!(pipes("xs = [a |> f(), b]"), "xs = [f(a), b]");
+    assert_eq!(pipes("s = {a |> f()}"), "s = {f(a)}");
+    assert_eq!(pipes("v = xs[i |> f()]"), "v = xs[f(i)]");
+    assert_eq!(pipes("v = xs[i |> f():j]"), "v = xs[f(i):j]");
+    // Dict keys and values.
+    assert_eq!(pipes("d = {k |> f(): v |> g()}"), "d = {f(k): g(v)}");
+    // Keyword arguments and parameter defaults.
+    assert_eq!(pipes("y = h(key=v |> f())"), "y = h(key=f(v))");
+    assert_eq!(
+        pipes("def m(x: int = a |> f()) -> int:"),
+        "def m(x: int = f(a)) -> int:"
+    );
+    // Lambda bodies inside an argument.
+    assert_eq!(
+        pipes("ys = map(lambda v: v |> f(), xs)"),
+        "ys = map(lambda v: f(v), xs)"
+    );
+    // Comprehensions: element, iterable and condition are separate slots;
+    // a conditional expression before the first `for` stays one slot.
+    assert_eq!(
+        pipes("ys = [x |> f() for x in xs |> g() if x |> h()]"),
+        "ys = [f(x) for x in g(xs) if h(x)]"
+    );
+    assert_eq!(
+        pipes("ys = [a if c else b |> f() for a in xs]"),
+        "ys = [f(a if c else b) for a in xs]"
+    );
+    assert_eq!(
+        pipes("d = {k: v |> f() for k, v in items}"),
+        "d = {k: f(v) for k, v in items}"
+    );
+    assert_eq!(
+        pipes("n = sum(x |> f() for x in xs)"),
+        "n = sum(f(x) for x in xs)"
+    );
+    // Comparisons and `not` stay inside the slot, as at statement level.
+    assert_eq!(
+        pipes("ys = [not x |> f() for x in xs]"),
+        "ys = [f(not x) for x in xs]"
+    );
+}
+
+#[test]
+fn pipe_in_statement_headers_and_fstring_fields() {
+    assert_eq!(pipes("if x |> f():"), "if f(x):");
+    assert_eq!(pipes("elif x |> f():"), "elif f(x):");
+    assert_eq!(pipes("while x |> f():"), "while f(x):");
+    assert_eq!(pipes("for y in xs |> f():"), "for y in f(xs):");
+    assert_eq!(pipes("assert x |> f(), msg"), "assert f(x), msg");
+    assert_eq!(pipes("s = f\"{x |> g()}\""), "s = f\"{g(x)}\"");
+    assert_eq!(
+        pipes("s = f\"a{x |> g():>10}b{y!r}\""),
+        "s = f\"a{g(x):>10}b{y!r}\""
+    );
+    assert_eq!(pipes("s = f'{x |> h(\", \")}'"), "s = f'{h(x, \", \")}'");
+    assert_eq!(pipes("s = f\"{x |> g()=}\""), "s = f\"{g(x)=}\"");
+    // Plain strings are never touched.
+    assert_eq!(pipes("s = \"{x |> g()}\""), "s = \"{x |> g()}\"");
+}
+
+#[test]
+fn pipe_with_a_non_call_right_operand_is_still_left_for_the_parser() {
+    for src in [
+        "x = a |> f() + 1",
+        "ys = [a |> 3]",
+        "x = a |> f() if c else b",
+    ] {
+        assert!(pipes(src).contains("|>"), "{src} -> {}", pipes(src));
+    }
+}
+
+#[test]
+fn every_pipe_position_lowers_to_parseable_python() {
+    let src = concat!(
+        "def f(x: int) -> int:\n    return x\n",
+        "def h(x: int, y: int = 0) -> int:\n    return x + y\n",
+        "xs: list[int] = [1, 2]\n",
+        "a = [x |> f() for x in xs if (x |> f()) > 0]\n",
+        "b = {x |> f(): x |> h(1) for x in xs}\n",
+        "c = (xs[0] |> f(), xs[1] |> h(y=2))\n",
+        "d = f\"{xs[0] |> f():>4}\"\n",
+    );
+    assert!(parses(&lower(src)), "{}", lower(src));
+}
