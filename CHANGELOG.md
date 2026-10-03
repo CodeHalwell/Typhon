@@ -108,6 +108,21 @@ review deferred; the third — the 2026-09-30 release-readiness review
   instead. The shared source normalisation (BOM, final newline) now also
   reads `\r\n` as `\n`; line numbers and columns are unchanged, so
   diagnostics and source maps point where they did.
+- **A with-chain `else` block may declare names (W7-10).** With two or more
+  bindings, `with x = f()?, y = g()?: … else err: let msg = …` was rejected
+  with a false `tyc::no_block_shadow` (whose "first declared here" label
+  then failed to render): the lowering put a copy of the `else` block under
+  each binding's guard, one after another, so `msg` was declared once per
+  binding. When the `else` block declares a name, the guards are now nested
+  `if` / `else`, so the copies sit in mutually exclusive branches — the
+  ordinary sibling-branch case — each with its own binding's error type,
+  and an `else` block that does not return continues after the chain
+  instead of crashing on `.value`. Other chains are lowered exactly as
+  before. A single shared copy, as the review proposed, would need the
+  checker to type `err` as the union of the bindings' error types and to
+  see the gate after it as exhaustive; without that it rejected valid
+  programs (`tyc::missing_return`, or a re-assignment error when two
+  bindings' `Result` types differ).
 
 ### Third wave — the 2026-09-30 release-readiness review
 

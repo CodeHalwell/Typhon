@@ -163,3 +163,15 @@ fn crlf_source_strings_hold_lf_on_both_surfaces() {
         "'a\\nb'\n'x\\n2\\ny'\nb'p\\nq'\n",
     );
 }
+
+/// W7-10: a `let` in the `else` block of a with-chain with two or more
+/// bindings no longer trips `tyc::no_block_shadow`; the block runs once on
+/// the first failing binding (three-binding, mixed error types, and an
+/// `else` that falls through to the code after the chain).
+#[test]
+fn with_chain_else_block_may_declare_names() {
+    assert_runs_as(
+        include_str!("fourth_wave/with_chain_else_let.ty"),
+        include_str!("fourth_wave/with_chain_else_let.expected"),
+    );
+}

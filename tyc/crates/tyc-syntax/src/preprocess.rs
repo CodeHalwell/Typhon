@@ -8543,6 +8543,16 @@ fn render_chain(
         .unwrap_or_else(|| "    ".to_owned());
     let inner_indent = format!("{}{}", chain_indent, unit_indent);
 
+    // Two or more bindings and an `else` block that declares a name: nest
+    // the guards (W7-10). The flat ladder below gives every binding its own
+    // `if` with a copy of the `else` block, one after another, so a `let`
+    // in that block was declared once per binding in sequential blocks and
+    // tripped `tyc::no_block_shadow` on a valid program. Every other chain
+    // keeps the flat ladder, and so exactly the diagnostics it had.
+    if chain.bindings.len() >= 2 && chain.err_var.is_some() && else_body_declares_a_name(chain) {
+        return render_chain_nested_else(chain, chain_indent, &unit_indent, counter);
+    }
+
     for binding in &chain.bindings {
         let tmp = format!("__typhon_with_{}__", *counter);
         *counter += 1;
@@ -8654,6 +8664,152 @@ fn render_chain(
         }
     }
 
+    (out, src)
+}
+
+/// Whether a code line of the chain's `else` block starts a `let` / `mut`
+/// declaration (optionally behind `freeze` / `lazy` / `comptime`).
+fn else_body_declares_a_name(chain: &WithChain) -> bool {
+    chain.else_body.iter().enumerate().any(|(k, line)| {
+        if chain.else_in_string.get(k).copied().unwrap_or(false) {
+            return false;
+        }
+        let mut rest = line.trim_start();
+        loop {
+            let word_end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            let (word, after) = rest.split_at(word_end);
+            let followed_by_space = after.starts_with([' ', '\t']);
+            match word {
+                "freeze" | "lazy" | "comptime" if followed_by_space => {
+                    rest = after.trim_start();
+                }
+                "let" | "mut" => return followed_by_space,
+                _ => return false,
+            }
+        }
+    })
+}
+
+/// Render a chain of two or more bindings with an `else` block as nested
+/// `if` / `else` guards:
+///
+/// ```text
+/// __typhon_with_0__ = <expr a>
+/// if isinstance(__typhon_with_0__, __typhon_Err__):
+///     let __typhon_with_err_0__ = __typhon_with_0__.error
+///     <else block>
+/// else:
+///     let a = __typhon_with_0__.value
+///     __typhon_with_1__ = <expr b>
+///     if isinstance(__typhon_with_1__, __typhon_Err__):
+///         let __typhon_with_err_1__ = __typhon_with_1__.error
+///         <else block>
+///     else:
+///         let b = __typhon_with_1__.value
+///         <success body>
+/// ```
+///
+/// Each `else` copy sits in a branch exclusive with every other copy, so a
+/// `let` in it is a sibling-branch declaration (accepted, as for any
+/// `if` / `else`), not a re-declaration in a later block. Each copy keeps
+/// its own binding's error type for `err`, every path's `return` stays
+/// visible to the checker, and an `else` block that falls through now
+/// continues after the chain instead of reading `.value` off the `Err`.
+///
+/// One shared copy after the ladder is not expressible without checker
+/// support: the copy needs a gate the checker cannot prove exhaustive
+/// (`tyc::missing_return` on every function that ends with the chain), and a
+/// failure slot assigned once per binding is a re-assignment the checker
+/// rejects whenever two bindings' `Result` types differ.
+///
+/// Copy `k` and the success body move in by one indent unit per enclosing
+/// guard — except lines that begin inside a string, whose leading
+/// whitespace is data. A diagnostic inside them keeps its line but its
+/// column moves with the indent, so this form is used only for chains the
+/// flat ladder rejected.
+fn render_chain_nested_else(
+    chain: &WithChain,
+    chain_indent: &str,
+    unit_indent: &str,
+    counter: &mut usize,
+) -> (String, Vec<usize>) {
+    let mut out = String::new();
+    let mut src: Vec<usize> = Vec::new();
+    let push_line = |out: &mut String, src: &mut Vec<usize>, line: usize, text: &str| {
+        src.push(line);
+        out.push_str(text);
+        out.push('\n');
+    };
+    // Re-indent a block written one unit inside the `with` (or `else`) by
+    // `extra`; string-content and blank lines are left exactly as written.
+    let shifted = |line: &str, in_string: bool, extra: &str| -> String {
+        if in_string || line.trim().is_empty() {
+            line.to_owned()
+        } else {
+            format!("{extra}{line}")
+        }
+    };
+    let name = chain.err_var.as_deref().unwrap_or("_err");
+
+    let mut level = chain_indent.to_owned();
+    for (depth, binding) in chain.bindings.iter().enumerate() {
+        let tmp = format!("__typhon_with_{}__", *counter);
+        let err_tmp = format!("__typhon_with_err_{}__", *counter);
+        *counter += 1;
+        let at = binding.src_line;
+        let inner = format!("{level}{unit_indent}");
+        push_line(
+            &mut out,
+            &mut src,
+            at,
+            &format!("{level}{tmp} = {}", binding.expr),
+        );
+        push_line(
+            &mut out,
+            &mut src,
+            at,
+            &format!("{level}if isinstance({tmp}, __typhon_Err__):"),
+        );
+        push_line(
+            &mut out,
+            &mut src,
+            at,
+            &format!("{inner}let {err_tmp} = {tmp}.error"),
+        );
+        let extra = unit_indent.repeat(depth);
+        for (k, line) in chain.else_body.iter().enumerate() {
+            src.push(chain.else_body_start + k);
+            let in_string = chain.else_in_string.get(k).copied().unwrap_or(false);
+            let renamed = match chain.else_kinds.get(k) {
+                Some(kinds) => rename_whole_word_with_kinds(line, kinds, name, &err_tmp),
+                None if in_string => line.clone(),
+                None => rename_whole_word(line, name, &err_tmp),
+            };
+            out.push_str(&shifted(&renamed, in_string, &extra));
+        }
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        push_line(&mut out, &mut src, at, &format!("{level}else:"));
+        push_line(
+            &mut out,
+            &mut src,
+            at,
+            &format!("{inner}let {} = {tmp}.value", binding.target),
+        );
+        level = inner;
+    }
+
+    // Success body: written one unit inside the `with`; now one unit inside
+    // the innermost guard's `else:`.
+    let extra = unit_indent.repeat(chain.bindings.len() - 1);
+    for (i, line) in chain.body.iter().enumerate() {
+        src.push(chain.body_start + i);
+        let in_string = chain.body_in_string.get(i).copied().unwrap_or(false);
+        out.push_str(&shifted(line, in_string, &extra));
+    }
     (out, src)
 }
 

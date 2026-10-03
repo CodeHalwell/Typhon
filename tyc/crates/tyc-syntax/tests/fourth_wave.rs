@@ -313,3 +313,83 @@ fn crlf_multiline_string_parses_to_lf_contents() {
     };
     assert_eq!(lit.value.to_str(), "a\nb");
 }
+
+// ── W7-10: with-chain `else` block that declares a name ─────────────────────
+
+use tyc_syntax::preprocess::expand_with_chains;
+
+#[test]
+fn with_chain_else_copies_sit_in_exclusive_branches_when_they_declare() {
+    let src = concat!(
+        "def total(a: str, b: str) -> int:\n",
+        "    with x = parse_int(a)?, y = parse_int(b)?:\n",
+        "        return x + y\n",
+        "    else err:\n",
+        "        let msg: str = f\"failed: {err}\"\n",
+        "        return -1\n",
+    );
+    let out = expand_with_chains(src);
+    // Copy 0 under the first guard; copy 1 nested in the first guard's
+    // `else:`, under the second guard; the success body innermost.
+    let expected_tail = concat!(
+        "    __typhon_with_0__ = parse_int(a)\n",
+        "    if isinstance(__typhon_with_0__, __typhon_Err__):\n",
+        "        let __typhon_with_err_0__ = __typhon_with_0__.error\n",
+        "        let msg: str = f\"failed: {__typhon_with_err_0__}\"\n",
+        "        return -1\n",
+        "    else:\n",
+        "        let x = __typhon_with_0__.value\n",
+        "        __typhon_with_1__ = parse_int(b)\n",
+        "        if isinstance(__typhon_with_1__, __typhon_Err__):\n",
+        "            let __typhon_with_err_1__ = __typhon_with_1__.error\n",
+        "            let msg: str = f\"failed: {__typhon_with_err_1__}\"\n",
+        "            return -1\n",
+        "        else:\n",
+        "            let y = __typhon_with_1__.value\n",
+        "            return x + y\n",
+    );
+    assert!(out.ends_with(expected_tail), "{out}");
+    assert!(parses(&lower(src)), "{}", lower(src));
+}
+
+#[test]
+fn with_chain_without_an_else_declaration_keeps_the_flat_ladder() {
+    for src in [
+        // `else` without a declaration.
+        "def f(a: str, b: str) -> Result[int, str]:\n    with x = p(a)?, y = p(b)?:\n        return Ok(x + y)\n    else err:\n        return Err(err)\n",
+        // A single binding never duplicated anything.
+        "def f(a: str) -> int:\n    with x = p(a)?:\n        return x\n    else err:\n        let m: str = err\n        return -1\n",
+        // No `else` at all.
+        "def f(a: str, b: str) -> Result[int, str]:\n    with x = p(a)?, y = p(b)?:\n        return Ok(x + y)\n",
+    ] {
+        let out = expand_with_chains(src);
+        assert!(
+            !out.lines().any(|l| l.trim() == "else:"),
+            "flat ladder expected:\n{src}\n---\n{out}"
+        );
+    }
+}
+
+#[test]
+fn with_chain_nested_form_leaves_string_content_alone() {
+    let src = concat!(
+        "def f(a: str, b: str) -> str:\n",
+        "    with x = p(a)?, y = p(b)?:\n",
+        "        let banner: str = \"\"\"sum\n",
+        "  of two\"\"\"\n",
+        "        return banner\n",
+        "    else err:\n",
+        "        freeze let m: list[str] = [err]\n",
+        "        return \"\"\"failed\n",
+        "  here\"\"\"\n",
+    );
+    let out = expand_with_chains(src);
+    // String continuation lines keep their exact leading whitespace.
+    assert_eq!(out.matches("\n  of two\"\"\"\n").count(), 1, "{out}");
+    assert_eq!(out.matches("\n  here\"\"\"\n").count(), 2, "{out}");
+    // The success body moved in one unit; its string opener with it.
+    assert!(
+        out.contains("\n            let banner: str = \"\"\"sum\n"),
+        "{out}"
+    );
+}
