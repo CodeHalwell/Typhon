@@ -244,3 +244,42 @@ fn an_operand_before_a_hoisted_sibling_is_hoisted_too() {
     );
     assert!(!out.contains("__typhon_ev_"), "{out}");
 }
+
+// ── W7-05: `gather` as an identifier ─────────────────────────────────────────
+
+use tyc_syntax::preprocess::expand_gather_blocks;
+
+#[test]
+fn gather_named_binding_outside_an_async_body_is_not_a_gather_block() {
+    for src in [
+        // A class attribute (was lowered to `async with` in a class body).
+        "class Settings:\n    gather: bool = False\nprint(Settings())\n",
+        // A module-level binding (was a bogus `unknown_name`).
+        "gather: int = 3\nprint(gather)\n",
+        // A parameter on its own continuation line (was `tyc::parse`).
+        "def f(\n    x: int,\n    gather: bool = False,\n) -> None:\n    pass\n",
+        // A sync function body: `gather:` can only lower inside `async def`.
+        "def f() -> None:\n    gather: int = 3\n",
+        // A class nested in an async function is still a class body.
+        "async def f() -> None:\n    class S:\n        gather: bool = False\n",
+    ] {
+        let out = expand_gather_blocks(src);
+        assert_eq!(out, src, "must be left alone:\n{src}");
+    }
+}
+
+#[test]
+fn gather_blocks_inside_async_bodies_still_lower() {
+    for src in [
+        "async def load() -> int:\n    gather: a = f1(); b = f2()\n    return a + b\n",
+        "async def load() -> int:\n    gather:\n        a = f1()\n        b = f2()\n    return a + b\n",
+        "impl X:\n    async def m(self) -> int:\n        if True:\n            gather: a = f1(); b = f2()\n        return 0\n",
+        "async def load() -> int:\n    gather(strategy=\"best-effort\"): a = f1(); b = f2()\n    return 0\n",
+    ] {
+        let out = expand_gather_blocks(src);
+        assert!(
+            out.contains("asyncio.TaskGroup()") || out.contains("asyncio.gather("),
+            "gather block must lower:\n{src}\n---\n{out}"
+        );
+    }
+}

@@ -1,0 +1,14 @@
+class Settings:
+    gather: bool = False
+
+gather: int = 3
+
+def configure(
+    name: str,
+    gather: bool = False,
+) -> str:
+    return f"{name}:{gather}"
+
+print(Settings())
+print(gather)
+print(configure("x"), configure("y", gather=True))

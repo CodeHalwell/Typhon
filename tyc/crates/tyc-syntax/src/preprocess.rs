@@ -8709,7 +8709,23 @@ pub fn expand_gather_blocks_mapped(source: &str) -> (String, Vec<usize>) {
         let header_indent = &raw[..indent_len];
         let body = &raw[indent_len..];
 
-        if let Some((strategy, stmts)) = parse_inline_gather_header(body) {
+        // `gather` is a soft keyword: a header only where a statement starts
+        // (not on a continuation line — `gather: bool = False,` in a wrapped
+        // parameter list is a parameter), and the one-line form only inside
+        // an `async def` body, the one place it can lower. Elsewhere
+        // `gather: T = v` is an annotated binding named `gather` — a class
+        // attribute or module binding — and was being rewritten into an
+        // `async with` block (W7-05).
+        let at_statement_start = mask.is_logical_line_start(i);
+        let inline = if at_statement_start
+            && body.starts_with("gather")
+            && gather_line_is_in_async_body(&lines, &mask, i, indent_len)
+        {
+            parse_inline_gather_header(body)
+        } else {
+            None
+        };
+        if let Some((strategy, stmts)) = inline {
             let bindings: Option<Vec<GatherBinding>> = stmts
                 .iter()
                 .map(|stmt| {
@@ -8731,7 +8747,9 @@ pub fn expand_gather_blocks_mapped(source: &str) -> (String, Vec<usize>) {
                 continue;
             }
         }
-        let parsed = parse_gather_header(body);
+        let parsed = at_statement_start
+            .then(|| parse_gather_header(body))
+            .flatten();
         if let Some(strategy) = parsed {
             if let Some((bindings, consumed)) =
                 collect_gather_bindings(&lines, &mask, i, header_indent)
@@ -8749,6 +8767,54 @@ pub fn expand_gather_blocks_mapped(source: &str) -> (String, Vec<usize>) {
     }
 
     out.finish()
+}
+
+/// Whether physical line `line` (indented `indent`) sits in the body of an
+/// `async def` — the nearest enclosing `def` / `class`-like header found by
+/// walking outward through less-indented logical lines is an `async def`.
+/// Control-flow headers in between (`if`, `for`, `try`, …) are transparent.
+fn gather_line_is_in_async_body(
+    lines: &[&str],
+    mask: &LexMask,
+    line: usize,
+    indent: usize,
+) -> bool {
+    let mut want = indent;
+    for k in (0..line).rev() {
+        if want == 0 {
+            return false;
+        }
+        if !mask.is_logical_line_start(k) {
+            continue;
+        }
+        let raw = lines[k].trim_end_matches(['\n', '\r']);
+        let code = raw[..mask.line_code_end(k).min(raw.len())].trim_end();
+        if code.trim_start().is_empty() {
+            continue;
+        }
+        let ind = code.len() - code.trim_start().len();
+        if ind >= want {
+            continue;
+        }
+        let head = code.trim_start();
+        let head = head.strip_prefix("pub ").unwrap_or(head);
+        if head.starts_with("async def ") {
+            return true;
+        }
+        let word = head
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .next()
+            .unwrap_or("");
+        if matches!(
+            word,
+            "def" | "class" | "plain" | "model" | "impl" | "extend" | "interface" | "enum"
+        ) || head.starts_with("class!")
+        {
+            return false;
+        }
+        want = ind;
+    }
+    false
 }
 
 /// Gather strategy chosen at the call site.

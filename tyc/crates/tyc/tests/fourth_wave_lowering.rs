@@ -116,3 +116,15 @@ fn inline_question_keeps_python_evaluation_order_across_shapes() {
         include_str!("fourth_wave/eval_order_shapes.expected"),
     );
 }
+
+/// W7-05: `gather` used as an ordinary name — a class attribute, a module
+/// binding, and a parameter on a continuation line — is not a `gather:`
+/// block. (It was lowered to `async with asyncio.TaskGroup()` in a class
+/// body, a bogus `unknown_name`, and a `tyc::parse` error respectively.)
+#[test]
+fn gather_is_an_ordinary_name_outside_async_bodies() {
+    assert_runs_as(
+        include_str!("fourth_wave/gather_identifier.ty"),
+        include_str!("fourth_wave/gather_identifier.expected"),
+    );
+}

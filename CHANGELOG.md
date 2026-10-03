@@ -65,6 +65,15 @@ review deferred; the third — the 2026-09-30 release-readiness review
   rebinds the exact name or attribute being read: a plain-name or
   dotted-name receiver is read after the operand, and an augmented
   assignment (`self.pos += self.advance()?`) loads its target after it.
+- **`gather` works as an ordinary name (W7-05).** A line starting with
+  `gather:` was taken as the `gather:` block form wherever it appeared, so
+  a class attribute `gather: bool = False` became `async with
+  asyncio.TaskGroup()` inside the class body (`SyntaxError` on CPython,
+  `NameError` on the VM), a module-level `gather: int = 3` reported a bogus
+  `tyc::unknown_name`, and a wrapped parameter `gather: bool = False,` was a
+  `tyc::parse` error. The header is now recognised only at the start of a
+  statement, and the one-line form only inside an `async def` body — the one
+  place either form can lower.
 
 ### Third wave — the 2026-09-30 release-readiness review
 
