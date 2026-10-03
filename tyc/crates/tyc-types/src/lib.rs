@@ -11142,6 +11142,17 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
                 return narrowed;
             }
             let recv = infer_expr_readonly(c, &a.value);
+            let recv = match &recv {
+                Type::Class(name) if c.find_method(name, a.attr.as_str()).is_none() => {
+                    c.newtypes.get(name).cloned().unwrap_or(recv)
+                }
+                _ => recv,
+            };
+            if matches!(recv, Type::Str | Type::LitStr(_)) {
+                if let Some(method) = builtin_str_method(a.attr.as_str()) {
+                    return method;
+                }
+            }
             // Builtin container methods carry a real signature (`d.get(k)` is
             // `V | None`, `xs.pop()` is `T`), so a wrapping call sees it.
             if let Some(method_type) = builtin_generic_method(&recv, a.attr.as_str()) {
@@ -18885,7 +18896,13 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         return Type::Class(ln.clone());
                     }
                     // Different newtypes, both numeric-based — explicit reject.
-                    (Some((_, lb)), Some((_, rb))) if is_numeric(lb) && is_numeric(rb) => {
+                    (Some((ln, lb)), Some((rn, rb)))
+                        if ln != rn
+                            && ((is_numeric(lb) && is_numeric(rb))
+                                || (matches!(b.op, Operator::Add)
+                                    && matches!(lb, Type::Str)
+                                    && matches!(rb, Type::Str))) =>
+                    {
                         if let Some(op_str) = arithmetic_op_str(b.op) {
                             let span = (b.range.start().to_usize(), b.range.end().to_usize());
                             c.operator_type_mismatch(op_str, &l_stripped, &r_stripped, span);
@@ -20366,6 +20383,14 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 check_nullable_receiver(c, &a.value, &recv);
             }
             let attr_name = a.attr.as_str();
+            if let Type::Class(name) = &recv {
+                if c.find_method(name, attr_name).is_none() {
+                    if let Some(base) = c.newtypes.get(name).cloned() {
+                        c.attribute_receiver_type = Some(base);
+                        return infer_expr_ctx_inner(c, expr, expected);
+                    }
+                }
+            }
             // B35: `_t.error` / `_t.value` on an isinstance-narrowed
             // `Generic("Err", [E])` / `Generic("Ok", [T])` resolves to
             // `E` / `T`. The `with`-chain lowering injects exactly this
@@ -39004,5 +39029,15 @@ def main() -> None:
             "from typing import Callable\ndef mapl[A, B](f: Callable[[A], B], xs: list[A]) -> list[B]:\n    return [f(x) for x in xs]\n",
             "class Container[F[_]]:\n    def same[A](self, xs: F[A]) -> F[A]:\n        return xs\n",
         ] { assert!(check_full(src).errors().is_empty(), "{src}: {:?}",check_full(src).errors()); }
+    }
+    #[test]
+    fn w2_13_newtype_method_results_and_mixing() {
+        for src in [
+            "newtype Email = str\ndef send(e: Email) -> None:\n    pass\ndef f(e: Email) -> None:\n    send(e.lower())\n",
+            "newtype Email = str\nnewtype Name = str\ndef f(e: Email, n: Name) -> str:\n    return e + n\n",
+            "newtype Email = str\ndef f(e: Email) -> list[int]:\n    return e.split(\"@\")\n",
+        ] { assert!(!check(src).errors().is_empty(), "accepted: {src}"); }
+        let src="newtype Email = str\ndef f(e: Email) -> list[str]:\n    return e.split(\"@\")\ndef g(e: Email) -> str:\n    return e.lower()\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
     }
 }
