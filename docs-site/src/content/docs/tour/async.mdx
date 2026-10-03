@@ -190,7 +190,7 @@ free-threaded = true
 
 When this is on:
 
-- `go` on a CPU-bound function lowers to a `ThreadPoolExecutor.submit` future instead of an `asyncio.Task`.
+- `go` always lowers through `typhon_runtime.tasks.spawn` (an `asyncio` task held in a strong-ref registry) — there is no `ThreadPoolExecutor` lowering for `go`, including on free-threaded builds.
 - The analyser may emit `ThreadPoolExecutor.map(...)` for pure-function comprehensions over large collections.
 - Every emitted parallel block first checks `sys._is_gil_enabled()` at runtime and falls back to sequential execution if a GIL build is detected.
 

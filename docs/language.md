@@ -496,9 +496,9 @@ Every widening is semantics-preserving because the element, its captured argumen
 
 ### `go` spawn
 
-`go f(x)` schedules `f(x)` in the background: an `asyncio.Task` in async contexts, a `ThreadPoolExecutor.submit` future on free-threaded builds for CPU-bound functions. `go f(x) -> fut` binds the task handle.
+`go f(x)` schedules `f(x)` in the background: an `asyncio.Task` in async contexts. `go f(x) -> fut` binds the task handle.
 
-`go` lowers through `typhon_runtime.tasks.spawn`, **never** to a bare `asyncio.create_task`. Python's event loop holds only weak references to tasks, so a fire-and-forget task whose handle is dropped can be garbage-collected mid-flight. The runtime helper keeps a strong-ref registry and discards entries from a done-callback. Same pattern, different registry, for thread-pool `go` on free-threaded builds.
+`go` always lowers through `typhon_runtime.tasks.spawn`, **never** to a bare `asyncio.create_task` — and there is no `ThreadPoolExecutor` lowering for `go`, including on free-threaded builds. Python's event loop holds only weak references to tasks, so a fire-and-forget task whose handle is dropped can be garbage-collected mid-flight. The runtime helper keeps a strong-ref registry and discards entries from a done-callback.
 
 ## `let` and `mut`
 

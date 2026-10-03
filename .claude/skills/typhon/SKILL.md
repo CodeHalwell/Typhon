@@ -1221,7 +1221,7 @@ async def middleware(next: Callable[[Req], Awaitable[Resp]], req: Req) -> Resp:
 
 `[python] free-threaded = true` (requires 3.13t / 3.14t / 3.15t):
 
-- `go` on CPU-bound functions lowers to `ThreadPoolExecutor.submit`.
+- `go` always lowers through `typhon_runtime.tasks.spawn` — there is no `ThreadPoolExecutor` lowering for `go`, including on free-threaded builds.
 - The analyser may parallelise pure-function comprehensions via `typhon_runtime.parallel.map_pure(...)`, gated by `[strictness] auto-parallel` and `[strictness] parallel-min-size` (default 64). Set, dict, and list comprehensions are all eligible (v0.5.0), including a pure `if` filter, extra literal/`let`-bound-invariant call arguments, and nested pure calls (`g(f(x))`).
 - `[strictness] auto-parallel-reductions` (requires `auto-parallel`) additionally parallelises `for x in xs: total += EXPR` accumulator loops with a **plain `int`** accumulator (`mut total: int`) and a pure `EXPR` — integer addition is exact/associative so partial sums combine identically in any order; `float` accumulators are never rewritten.
 - `[strictness] parallel-backend` (default `"threads"`) selects the executor `map_pure` uses; `"interpreters"` tries a PEP 734 `InterpreterPoolExecutor` (3.14+) first, falling back transparently to the thread pool on an older runtime or an unshareable mapped callable.

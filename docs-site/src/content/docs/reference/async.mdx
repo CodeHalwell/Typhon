@@ -158,7 +158,7 @@ The `-> handle` form binds the spawn result so you can join later.
 
 ### Free-threaded variant
 
-When `[python] free-threaded = true`, `go` on a CPU-bound function lowers to `ThreadPoolExecutor.submit` instead of `asyncio.Task`. The emitter inserts `sys._is_gil_enabled()` checks at runtime to fall back to sequential when run under a GIL build.
+`go` always lowers through `typhon_runtime.tasks.spawn` (an `asyncio` task held in a strong-ref registry) — there is no `ThreadPoolExecutor` lowering for `go`, including when `[python] free-threaded = true`.
 
 ## Free-threaded parallelism
 
