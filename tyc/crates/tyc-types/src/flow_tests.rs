@@ -1203,3 +1203,58 @@ def f(s: str) -> Result[int, str]:
 "#,
     );
 }
+
+// ── W1-13: values derived from an `unsafe:` binding ───────────────────────
+
+fn unsafe_leaks(src: &str) -> usize {
+    check(src)
+        .errors()
+        .iter()
+        .filter(|e| matches!(e, TycError::UnsafeValueLeak { .. }))
+        .count()
+}
+
+#[test]
+fn w1_13_derived_values_carry_the_unsafe_origin() {
+    let src = r#"
+import json
+def name_of(raw: str) -> str:
+    unsafe:
+        let data = json.loads(raw)
+    return data["name"]
+def count_of(raw: str) -> int:
+    unsafe:
+        let data = json.loads(raw)
+    return data.count + 1
+def items(raw: str) -> list[str]:
+    unsafe:
+        let data = json.loads(raw)
+    return [x for x in data]
+def first(raw: str) -> str:
+    unsafe:
+        let pair = json.loads(raw)
+    let s: str = pair[0]
+    return s
+"#;
+    assert_eq!(unsafe_leaks(src), 4);
+}
+
+#[test]
+fn w1_13_re_asserted_or_typed_values_do_not_leak() {
+    let src = r#"
+import json
+def a(raw: str) -> str:
+    unsafe:
+        let data: dict[str, str] = json.loads(raw)
+    return data["name"]
+def b(raw: str) -> str:
+    unsafe:
+        let data = json.loads(raw)
+    return str(data["name"])
+def c(raw: str) -> int:
+    unsafe:
+        let data = json.loads(raw)
+    return len(data)
+"#;
+    assert_eq!(unsafe_leaks(src), 0, "{:?}", messages(&check(src)));
+}

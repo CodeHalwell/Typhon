@@ -108,6 +108,20 @@ review deferred; the third — the 2026-09-30 release-readiness review
   e`). It was never bound, so `return Err(e)` in a `-> Result[int, str]`
   function and `let m: int = e` passed. Block `rescue` lowers to the same
   handler and is covered too.
+- **`unsafe:` containment follows derived values (deliberate narrowing).**
+  `tyc::unsafe_value_leak` only tracked the bare name, so after
+  `unsafe: let data = json.loads(raw)`, `return data["name"]` from a
+  `-> str` function — and `pair[0]`, `data.count + 1`, `[x for x in data]`,
+  `data.get("k")` or a lambda reading `data` — crossed into typed code
+  unchecked. Values built from an unsafe binding now carry its origin, as
+  Rule 5 specifies. This rejects programs that happen to run correctly when
+  the untyped value has the right shape, in the same way the existing
+  bare-name check does; the stress probe
+  `stress/round-2026-05-20/cases/33_unsafe_leak.ty` is one, and moves to
+  `scripts/nobuild-baseline.txt`. Re-assert at the boundary with
+  `value as! T`, or annotate the binding inside the block. The
+  `unsafe_value_leak` doc page no longer recommends an annotated re-bind
+  outside the block, which is itself reported.
 
 ### Third wave — the 2026-09-30 release-readiness review
 

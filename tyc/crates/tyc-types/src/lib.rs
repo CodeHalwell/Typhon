@@ -7954,12 +7954,13 @@ fn check_unsafe_leak_into(c: &mut Checker, expr: &Expr, target_ty: &Type) {
     if c.unsafe_depth > 0 {
         return;
     }
-    let Some(name) = (match expr {
-        Expr::Name(n) => Some(n.id.as_str()),
-        _ => None,
-    }) else {
+    // A value *derived* from an unsafe binding — `data["name"]`,
+    // `data.count + 1`, `[x for x in data]`, `lambda: data` — carries its
+    // lack of a type just as the bare name does (review 2026-10-03 §3.6).
+    let Some(name) = unsafe_root_name(c, expr) else {
         return;
     };
+    let derived = !matches!(expr, Expr::Name(_));
     // Check the current environment first: if a safe-scope rebind
     // outside the `unsafe:` block has re-introduced the name with
     // its own concrete type (`let value: int = value` after the
@@ -7989,8 +7990,27 @@ fn check_unsafe_leak_into(c: &mut Checker, expr: &Expr, target_ty: &Type) {
     // target via the normal nominal/structural rules (i.e. the user
     // annotated the unsafe binding with a concrete type and the check
     // passed), the cross is sound — no diagnostic needed.
-    if c.is_assignable(target_ty, &declared) && !matches!(declared, Type::Unknown) {
+    if !derived && c.is_assignable(target_ty, &declared) && !matches!(declared, Type::Unknown) {
         return;
+    }
+    // A derived value of an *annotated* unsafe binding has a real type;
+    // trust it when it fits. One of an untyped binding never does.
+    if derived && !matches!(declared, Type::Unknown | Type::Any) {
+        // The `unsafe:` scope is gone by now; infer with the binding's
+        // recorded type back in view.
+        c.env.enter();
+        c.env.declare(TypeBinding {
+            name: name.to_owned(),
+            declared: declared.clone(),
+            narrowed: declared.clone(),
+            span: (0, 0),
+            from_unsafe: false,
+        });
+        let actual = infer_expr_readonly(c, expr);
+        c.env.leave();
+        if !matches!(actual, Type::Unknown | Type::Any) && c.is_assignable(target_ty, &actual) {
+            return;
+        }
     }
     let span = (
         expr.range().start().to_usize(),
@@ -8006,6 +8026,90 @@ fn check_unsafe_leak_into(c: &mut Checker, expr: &Expr, target_ty: &Type) {
         span.0,
         length,
     ));
+}
+
+/// The name of the `unsafe:`-origin binding `expr`'s value is derived from,
+/// if any: the binding itself, or a subscript, attribute, method call,
+/// arithmetic, conditional, literal, comprehension or lambda built on it.
+/// A plain call `f(data)` returns `f`'s declared type and is not derived;
+/// neither is `data as! T`, which lowers to such a call.
+fn unsafe_root_name<'a>(c: &Checker, expr: &'a Expr) -> Option<&'a str> {
+    let is_unsafe = |name: &str| match c.env.lookup(name) {
+        Some(b) => b.from_unsafe,
+        None => c.unsafe_origin_bindings.contains_key(name),
+    };
+    match expr {
+        Expr::Name(n) => is_unsafe(n.id.as_str()).then_some(n.id.as_str()),
+        Expr::Subscript(s) => unsafe_root_name(c, &s.value),
+        Expr::Attribute(a) => unsafe_root_name(c, &a.value),
+        Expr::Call(call) => match call.func.as_ref() {
+            Expr::Attribute(a) => unsafe_root_name(c, &a.value),
+            _ => None,
+        },
+        Expr::BinOp(b) => unsafe_root_name(c, &b.left).or_else(|| unsafe_root_name(c, &b.right)),
+        Expr::UnaryOp(u) => unsafe_root_name(c, &u.operand),
+        Expr::BoolOp(b) => b.values.iter().find_map(|v| unsafe_root_name(c, v)),
+        Expr::If(i) => unsafe_root_name(c, &i.body).or_else(|| unsafe_root_name(c, &i.orelse)),
+        Expr::Await(a) => unsafe_root_name(c, &a.value),
+        Expr::Starred(s) => unsafe_root_name(c, &s.value),
+        Expr::Named(n) => unsafe_root_name(c, &n.value),
+        Expr::List(l) => l.elts.iter().find_map(|e| unsafe_root_name(c, e)),
+        Expr::Tuple(t) => t.elts.iter().find_map(|e| unsafe_root_name(c, e)),
+        Expr::Set(s) => s.elts.iter().find_map(|e| unsafe_root_name(c, e)),
+        Expr::Dict(d) => d.items.iter().find_map(|i| {
+            i.key
+                .as_ref()
+                .and_then(|k| unsafe_root_name(c, k))
+                .or_else(|| unsafe_root_name(c, &i.value))
+        }),
+        Expr::ListComp(l) => l
+            .generators
+            .iter()
+            .find_map(|g| unsafe_root_name(c, &g.iter)),
+        Expr::SetComp(l) => l
+            .generators
+            .iter()
+            .find_map(|g| unsafe_root_name(c, &g.iter)),
+        Expr::Generator(l) => l
+            .generators
+            .iter()
+            .find_map(|g| unsafe_root_name(c, &g.iter)),
+        Expr::DictComp(l) => l
+            .generators
+            .iter()
+            .find_map(|g| unsafe_root_name(c, &g.iter)),
+        // A lambda that reads an unsafe binding hands it out when called.
+        Expr::Lambda(l) => {
+            let params: HashSet<&str> = l
+                .parameters
+                .as_deref()
+                .map(|p| p.iter().map(|a| a.name().as_str()).collect())
+                .unwrap_or_default();
+            collect_names_in_expr_all(&l.body)
+                .into_iter()
+                .find(|n| !params.contains(n) && is_unsafe(n))
+        }
+        _ => None,
+    }
+}
+
+/// Every `Name` read anywhere in `expr`.
+fn collect_names_in_expr_all(expr: &Expr) -> Vec<&str> {
+    use ruff_python_ast::visitor::source_order::{walk_expr, SourceOrderVisitor};
+    struct V<'a> {
+        names: Vec<&'a str>,
+    }
+    impl<'a> SourceOrderVisitor<'a> for V<'a> {
+        fn visit_expr(&mut self, e: &'a Expr) {
+            if let Expr::Name(n) = e {
+                self.names.push(n.id.as_str());
+            }
+            walk_expr(self, e);
+        }
+    }
+    let mut v = V { names: Vec::new() };
+    v.visit_expr(expr);
+    v.names
 }
 
 /// Collect the set of `Name` ids occurring in an expression that
