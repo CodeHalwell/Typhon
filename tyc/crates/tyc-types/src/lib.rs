@@ -23,6 +23,7 @@
 mod builtins;
 mod callables;
 mod class_contracts;
+mod expression_calls;
 mod frozen_context;
 mod operators;
 #[cfg(debug_assertions)]
@@ -3998,7 +3999,15 @@ impl<'a> Checker<'a> {
                     return self.is_assignable(&e, &a);
                 }
             }
-            if eh == "Awaitable" && ah == "Coroutine" && ea.len() == 1 {
+            if eh == "Awaitable"
+                && matches!(
+                    ah.as_str(),
+                    "Coroutine" | "Task" | "asyncio.Task" | "Future" | "asyncio.Future"
+                )
+                && ea.len() == 1
+                && (!matches!(ah.as_str(), "Task" | "Future")
+                    || !self.classes.iter().any(|name| name == ah))
+            {
                 // The checker's own shorthand is `Coroutine[R]`; the typeshed
                 // form is `Coroutine[Y, S, R]`.
                 let result = match aa.len() {
@@ -9727,6 +9736,9 @@ fn has_runtime_checkable_decorator(decorators: &[ruff_python_ast::Decorator]) ->
 ///    stub layer (which doesn't carry `__enter__` annotations today)
 ///    and stays Unknown rather than misfiring downstream.
 fn with_target_type(c: &Checker, ctx_expr: &Expr, ctx_ty: &Type, is_async: bool) -> Type {
+    if is_async && matches!(ctx_ty,Type::Class(name) if name=="asyncio.TaskGroup") {
+        return ctx_ty.clone();
+    }
     // (1) Factory call. Both bare-name (`acquire()`) and
     // attribute-style (`self.acquire()`, `pool.session()`) callees
     // resolve through the contextmanager_yields registry — we key on
@@ -11025,7 +11037,7 @@ fn try_result_arg_ret_readonly(c: &Checker, arg: &Expr) -> Type {
 /// with `infer_expr` so the thunk / mapper's own diagnostics surface.
 fn infer_try_result_arg_ret(c: &mut Checker, arg: &Expr) -> Type {
     match arg {
-        Expr::Lambda(lam) => infer_expr(c, &lam.body),
+        Expr::Lambda(_) => expression_calls::callback_result(c, arg, vec![]),
         other => match infer_expr(c, other) {
             Type::Function { ret, .. } => *ret,
             _ => Type::Unknown,
@@ -17536,6 +17548,12 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
         return Some(sig);
     }
     match (head.as_str(), attr, args.as_slice()) {
+        ("Task", "result", [t]) => Some(Type::Function {
+            params: vec![],
+            ret: Box::new(t.clone()),
+            variadic: false,
+            min_params: Some(0),
+        }),
         ("dict", "get", [k, v]) => {
             // `d.get(k)` → V?  ;  `d.get(k, default)` → also typed as V?
             // (the default may broaden the runtime type, but the static
@@ -17946,7 +17964,7 @@ fn unwrap_awaitable(typ: &Type, user_classes: &[String]) -> Option<Type> {
         return None;
     };
     match (name.as_str(), args.len()) {
-        ("Awaitable", 1) => Some(args[0].clone()),
+        ("Awaitable" | "asyncio.Task" | "asyncio.Future", 1) => Some(args[0].clone()),
         ("Coroutine", 3) => Some(args[2].clone()),
         ("Coroutine", 1) => Some(args[0].clone()),
         ("Task", 1) | ("Future", 1) if !user_classes.iter().any(|c| c == name) => {
@@ -19031,12 +19049,19 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 {
                     let ok_ty = infer_try_result_arg_ret(c, &call.arguments.args[0]);
                     let err_ty = if call.arguments.args.len() == 2 {
-                        infer_try_result_arg_ret(c, &call.arguments.args[1])
+                        expression_calls::callback_result(
+                            c,
+                            &call.arguments.args[1],
+                            vec![Type::Class("Exception".into())],
+                        )
                     } else {
                         Type::Class("Exception".into())
                     };
                     return Type::Generic("Result".into(), vec![ok_ty, err_ty]);
                 }
+            }
+            if let Some(result) = expression_calls::contract(c, call) {
+                return result;
             }
             // B2: a call of shape `first[int]([1, 2, 3])` where `first`
             // is a generic function will type-check (the subscript is
@@ -20484,7 +20509,11 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         if params.len() < arity {
                             params.resize(arity, Type::Unknown);
                         }
-                        let ret = sig.return_type.clone();
+                        let ret = if sig.is_async {
+                            Type::Generic("Coroutine".into(), vec![sig.return_type.clone()])
+                        } else {
+                            sig.return_type.clone()
+                        };
                         return Type::Function {
                             params,
                             ret: Box::new(ret),
@@ -20581,6 +20610,11 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                             params.resize(sig.arity, Type::Unknown);
                         }
                         let ret = substitute_typevars(&sig.return_type, &bindings);
+                        let ret = if sig.is_async {
+                            Type::Generic("Coroutine".into(), vec![ret])
+                        } else {
+                            ret
+                        };
                         return Type::Function {
                             params,
                             ret: Box::new(ret),
@@ -38848,5 +38882,33 @@ def main() -> None:
     fn w2_09_caught_enum_order_and_mixed_key_controls() {
         let src="import enum\nclass IntE(enum.IntEnum):\n    ONE = 1\nclass StrE(enum.StrEnum):\n    X = \"x\"\nenum Plain:\n    A\n    B\ndef f() -> None:\n    print({IntE.ONE: 1}[1], {StrE.X: 1}[\"x\"])\n    try:\n        print(Plain.A < Plain.B)\n    except TypeError:\n        pass\n";
         assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn w2_10_expression_binding_contracts() {
+        for src in [
+            "from typhon_runtime import try_result\ndef f(s: str) -> Result[int, str]:\n    return try_result(lambda: int(s), lambda e: e)\n",
+            "async def fetch() -> int:\n    return 1\nasync def f() -> str:\n    gather:\n        a = fetch()\n    return a\n",
+            "async def fetch() -> int:\n    return 1\nasync def f() -> str:\n    go fetch() -> task\n    return task.result()\n",
+            "async def fetch() -> int:\n    return 1\nasync def f() -> int:\n    gather(strategy=\"best-effort\"):\n        a = fetch()\n    return a\n",
+            "def parse() -> Result[int, str]:\n    return Ok(3)\ndef f() -> Result[str, str]:\n    return parse().map(lambda n: n + 1)\n",
+            "def parse() -> Result[int, str]:\n    return Ok(3)\ndef f() -> Result[int, str]:\n    return parse().map_err(lambda e: len(e))\n",
+            "def parse() -> Result[int, str]:\n    return Ok(3)\ndef f() -> Result[str, str]:\n    return parse().and_then(lambda n: Ok(n + 1))\n",
+        ] { assert!(!check_full(src).errors().is_empty(), "accepted: {src}"); }
+        for src in [
+            "async def fetch() -> int:\n    return 1\nasync def f() -> int:\n    gather:\n        a = fetch()\n    go fetch() -> task\n    return a + task.result()\n",
+            "async def fetch() -> int:\n    return 1\nasync def f() -> int | Exception:\n    gather(strategy=\"best-effort\"):\n        a = fetch()\n    return a\n",
+            "def parse() -> Result[int, str]:\n    return Ok(3)\ndef f() -> Result[str, str]:\n    return parse().map(lambda n: str(n))\n",
+        ] { assert!(check_full(src).errors().is_empty(), "{src}: {:?}",check_full(src).errors()); }
+    }
+    #[test]
+    fn w2_10_task_and_combinator_chain_controls() {
+        let src="class Box[T]:\n    value: T\nimpl[T] Box[T]:\n    async def get(self) -> T:\n        return self.value\nasync def f(box: Box[int]) -> int:\n    go box.get() -> task\n    return await task\ndef parse() -> Result[int, str]:\n    return Ok(3)\ndef g() -> Result[str, str]:\n    return parse().map(lambda n: n + 1).map(lambda n: str(n))\n";
+        assert!(
+            check_full(src).errors().is_empty(),
+            "{:?}",
+            check_full(src).errors()
+        );
+        let src="def parse() -> Result[int, str]:\n    return Ok(3)\ndef g() -> Result[str, str]:\n    return parse().map(lambda n: n + 1).map(lambda n: n + 1)\n";
+        assert!(!check_full(src).errors().is_empty());
     }
 }
