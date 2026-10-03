@@ -13,6 +13,7 @@
 //! `gather:`, `go`, `lazy`, `with`-chains, the `?` error-propagation
 //! operator) into plain Python before parsing.
 
+pub mod ast_equiv;
 pub mod lexer;
 pub mod lexmask;
 pub mod mro;

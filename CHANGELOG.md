@@ -39,6 +39,13 @@ review deferred; the third — the 2026-09-30 release-readiness review
   from trimming trailing spaces inside a string the emitter prints as a
   triple-quoted literal (`"\n a \n".splitlines()` printed `['', ' a']` on
   CPython and `['', ' a ']` on the VM).
+- **`tyc fmt` checks its own output before writing (W7-03).** The formatter
+  lowers its output exactly as it lowered the input, parses both, and
+  refuses to write — leaving the file untouched and reporting a formatter
+  bug — unless the two module ASTs are equal (positions, comments and the
+  line-numbered `__typhon_*` temporaries aside; docstring whitespace is
+  tolerated only when `ruff format` ran). The same guard covers the
+  `[emit] format = true` pass over emitted Python in `tyc build`.
 
 ### Third wave — the 2026-09-30 release-readiness review
 

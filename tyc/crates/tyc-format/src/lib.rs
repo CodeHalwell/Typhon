@@ -36,6 +36,7 @@ use std::process::{Command, Stdio};
 
 use tyc_diagnostics::TycError;
 use tyc_syntax::{
+    ast_equiv::{compare_python_sources, AstComparison, CompareOptions},
     parse_module,
     preprocess::{
         expand_sugar, postprocess_full, preprocess, preprocess_opts, PreprocessOptions,
@@ -140,9 +141,13 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
         && prep.optionals.is_empty()
         && prep.lazy_imports.is_empty()
         && !contains_typhon_only_tokens(&normalised);
+    let mut ruff_ran = false;
     let after_ruff = match can_run_ruff.then(ruff_path).flatten() {
         Some(ruff) => match run_ruff_format(&ruff, &normalised, path) {
-            Ok(reformatted) => reformatted,
+            Ok(reformatted) => {
+                ruff_ran = true;
+                reformatted
+            }
             Err(msg) => {
                 eprintln!("tyc fmt: ruff format failed ({msg}); using in-process output");
                 normalised
@@ -224,8 +229,62 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
     let output =
         restore_impl_extend_headers_verbatim(&output, &prep.stripped, &original_lines, &translate);
 
+    // Step 5: self-check — refuse to hand back a different program.
+    //
+    // Every step above is a text edit, and text edits on a language with
+    // sugar the parser does not see have corrupted source in four release
+    // lines (`?` → `| None`, string-literal contents respaced, …) — in the
+    // user's own file, under the one tool people run without reading the
+    // diff. Lower the output exactly as the input was lowered, parse it, and
+    // compare the two module ASTs. Only `ruff format`'s docstring
+    // re-indentation is tolerated, and only when ruff actually ran.
+    if output != source {
+        verify_same_program(&validation_input, &output, ruff_ran, path)?;
+    }
+
     let changed = output != source;
     Ok(FormatResult { output, changed })
+}
+
+/// The formatter's self-check: lower `output` exactly as the input was
+/// lowered (`input_lowered` is that lowering of the original source), parse
+/// both, and fail unless they denote the same module. `ruff_ran` relaxes the
+/// comparison of docstrings to whitespace-insensitive, since `ruff format`
+/// re-indents them.
+#[allow(clippy::result_large_err)]
+fn verify_same_program(
+    input_lowered: &str,
+    output: &str,
+    ruff_ran: bool,
+    path: &str,
+) -> Result<(), TycError> {
+    let output_lowered = preprocess(&expand_sugar(output, true)).python_source;
+    let verdict = compare_python_sources(
+        input_lowered,
+        &output_lowered,
+        CompareOptions {
+            lenient_docstrings: ruff_ran,
+        },
+    );
+    match verdict {
+        AstComparison::Same => Ok(()),
+        AstComparison::Different => Err(TycError::generic(format!(
+            "tyc fmt: refusing to format '{path}': the formatted text parses to a \
+             different program than the original, so the file was left unchanged. \
+             This is a formatter bug — please report it at \
+             https://github.com/CodeHalwell/Typhon/issues with the file attached."
+        ))),
+        AstComparison::AfterDoesNotParse(msg) => Err(TycError::generic(format!(
+            "tyc fmt: refusing to format '{path}': the formatted text does not parse \
+             ({msg}), so the file was left unchanged. This is a formatter bug — please \
+             report it at https://github.com/CodeHalwell/Typhon/issues with the file \
+             attached."
+        ))),
+        // The caller parsed the input lowering before formatting anything, so
+        // this cannot happen; with nothing to compare against there is also
+        // nothing to refuse on.
+        AstComparison::BeforeDoesNotParse(_) => Ok(()),
+    }
 }
 
 /// The text the preprocessor substitutes for a `?` (see
@@ -2617,6 +2676,73 @@ def run() -> Result[int, str]:
         // Code after the continued string closes is still formatted.
         let (out, _) = normalise_whitespace_with_map("b = \"a\\\nb\"\nc=f(1,2)\n");
         assert_eq!(out, "b = \"a\\\nb\"\nc = f(1, 2)\n");
+    }
+
+    #[test]
+    fn self_check_refuses_output_that_changes_the_program() {
+        // W7-03: the structural guard. Lower the original, then judge a
+        // candidate output against it.
+        let src =
+            "def h(r: Result[int, str]) -> Result[int, str]:\n    let z:int=r?\n    return Ok(z)\n";
+        let lowered = preprocess(&expand_sugar(src, true)).python_source;
+        // A faithful respacing passes.
+        let good = "def h(r: Result[int, str]) -> Result[int, str]:\n    let z: int = r?\n    return Ok(z)\n";
+        assert!(verify_same_program(&lowered, good, false, "t.ty").is_ok());
+        // The W7-01 corruption (`r?` → `r | None`) is refused.
+        let bad = "def h(r: Result[int, str]) -> Result[int, str]:\n    let z: int = r | None\n    return Ok(z)\n";
+        let err = verify_same_program(&lowered, bad, false, "t.ty").unwrap_err();
+        assert!(err.to_string().contains("refusing to format"), "{err}");
+        // A string-content change (the W7-02 corruption) is refused.
+        let s_lowered = preprocess(&expand_sugar("b: str = \"c,d  e#f\"\n", true)).python_source;
+        assert!(
+            verify_same_program(&s_lowered, "b: str = \"c, d e# f\"\n", false, "t.ty").is_err()
+        );
+        // Output that no longer parses is refused.
+        assert!(verify_same_program(&lowered, "def h(:\n", false, "t.ty").is_err());
+        // `let` → `mut` is a different program.
+        let m_lowered = preprocess(&expand_sugar("let x: int = 1\n", true)).python_source;
+        assert!(verify_same_program(&m_lowered, "mut x: int = 1\n", false, "t.ty").is_err());
+    }
+
+    #[test]
+    fn self_check_tolerates_ruff_docstring_reindent_only_when_ruff_ran() {
+        let src = "def f() -> None:\n    \"\"\"Doc.\n\n        more   \n    \"\"\"\n";
+        let lowered = preprocess(&expand_sugar(src, true)).python_source;
+        let reindented = "def f() -> None:\n    \"\"\"Doc.\n\n    more\n    \"\"\"\n";
+        assert!(verify_same_program(&lowered, reindented, true, "t.ty").is_ok());
+        assert!(verify_same_program(&lowered, reindented, false, "t.ty").is_err());
+    }
+
+    #[test]
+    fn format_source_self_check_passes_on_the_sugar_corpus_shapes() {
+        // Every Typhon form the formatter round-trips must survive its own
+        // guard (a false refusal would make `tyc fmt` unusable).
+        let src = concat!(
+            "from typing import Protocol\n",
+            "lazy import js = json\n",
+            "pub let VERSION: str = \"1\"\n",
+            "freeze let CFG = {\"a\": [1,2]}\n",
+            "newtype UserId = int\n",
+            "enum Color: RED; GREEN\n",
+            "interface Shape:\n    def area(self) -> float\n",
+            "class P frozen:\n    x: float\n",
+            "plain class Bag:\n    items: list[str]\n",
+            "model Api:\n    id: int\n",
+            "impl P:\n    def norm(self) -> float:\n        return self.x\n",
+            "def g(x:int) -> Result[int, str]:\n    return Ok(x)\n",
+            "def h(a:int,b:str?=None) -> Result[int, str]:\n",
+            "    let r:int=g(a)?\n",
+            "    let s: str = b if b is not None else \"\"\n",
+            "    let t = r |> str()\n",
+            "    unsafe:\n        let u = js.loads(\"1\")\n",
+            "    return Ok(r + len(s) + len(t))\n",
+        );
+        let out = without_ruff(|| format_source(src, "<test>").map_err(|e| e.to_string()));
+        assert!(
+            out.is_ok(),
+            "self-check refused a faithful format: {:?}",
+            out.err()
+        );
     }
 
     #[test]
