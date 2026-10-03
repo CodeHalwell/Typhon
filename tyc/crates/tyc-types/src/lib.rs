@@ -22,6 +22,7 @@
 
 mod builtins;
 mod callables;
+mod class_contracts;
 mod frozen_context;
 mod operators;
 #[cfg(debug_assertions)]
@@ -11068,6 +11069,14 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
             if let Some(method_type) = builtin_generic_method(&recv, a.attr.as_str()) {
                 return method_type;
             }
+            if let Type::Class(name) = &recv {
+                if c.enums
+                    .get(name)
+                    .is_some_and(|members| members.iter().any(|member| member == a.attr.as_str()))
+                {
+                    return Type::Class(name.clone());
+                }
+            }
             match &recv {
                 Type::Class(class_name) | Type::Generic(class_name, _) => {
                     if let Some(field_ty) = c.find_field(class_name, a.attr.as_str()) {
@@ -18913,6 +18922,8 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         ordering_operands_compatible(c, &ls, &rs)
                     } else {
                         membership_container_ok(c, &rs)
+                            && (!matches!(rs, Type::Str | Type::LitStr(_))
+                                || c.is_assignable(&Type::Str, lt))
                     };
                     if !compatible {
                         let op_str = match op {
@@ -18924,7 +18935,19 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                             _ => "not in",
                         };
                         let span = (cmp.range.start().to_usize(), cmp.range.end().to_usize());
-                        c.operator_type_mismatch(op_str, &ls, &rs, span);
+                        if frozen_context::failure_is_caught(c, expr, "TypeError") {
+                            c.diagnostics.push_warning(TycError::operator_type_mismatch(
+                                op_str,
+                                ls.display(),
+                                rs.display(),
+                                &c.path,
+                                c.source,
+                                span.0,
+                                span.1.saturating_sub(span.0).max(1),
+                            ));
+                        } else {
+                            c.operator_type_mismatch(op_str, &ls, &rs, span);
+                        }
                     }
                 }
             }
@@ -20271,6 +20294,14 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     return args[0].clone();
                 }
             }
+            if let Type::Class(name) = &recv {
+                if c.enums
+                    .get(name)
+                    .is_some_and(|members| members.iter().any(|member| member == attr_name))
+                {
+                    return Type::Class(name.clone());
+                }
+            }
             // Resolve attribute access on known class instances and TypeVar-bounded parameters.
             if let Some(method_type) = builtin_generic_method(&recv, attr_name) {
                 return method_type;
@@ -20849,6 +20880,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         if !is_dynamic_type(key_ty)
                             && !is_dynamic_type(&slice_ty)
                             && !c.is_assignable(key_ty, &slice_ty)
+                            && !class_contracts::enum_key_compatible(c, key_ty, &slice_ty)
                         {
                             let span = (
                                 s.slice.range().start().to_usize(),
@@ -21580,9 +21612,10 @@ fn member_field_type(c: &Checker, member: &Type, attr: &str) -> Option<Type> {
 /// `b.__gt__(a)`, and `functools.total_ordering` fills the rest in from any
 /// one of them, so one ordering dunder anywhere makes the class orderable.
 fn class_has_ordering_dunder(c: &Checker, name: &str) -> bool {
-    ["__lt__", "__le__", "__gt__", "__ge__"]
-        .iter()
-        .any(|d| c.find_method(name, d).is_some())
+    class_contracts::dataclass_option(c, name, "order") == Some(true)
+        || ["__lt__", "__le__", "__gt__", "__ge__"]
+            .iter()
+            .any(|d| c.find_method(name, d).is_some())
 }
 
 /// `true` when an ordering comparison (`<`, `<=`, `>`, `>=`) between `l` and
@@ -21598,12 +21631,27 @@ fn ordering_operands_compatible(c: &Checker, l: &Type, r: &Type) -> bool {
         return ms.iter().all(|m| ordering_operands_compatible(c, l, m));
     }
     let class_ok = |name: &str| -> bool {
+        if c.enums.contains_key(name)
+            && !c.class_derives_from_builtin(
+                name,
+                &[
+                    "int",
+                    "IntEnum",
+                    "enum.IntEnum",
+                    "str",
+                    "StrEnum",
+                    "enum.StrEnum",
+                ],
+            )
+            && !class_has_ordering_dunder(c, name)
+        {
+            return false;
+        }
         // Anything we cannot see completely (a venv-introspected shape,
         // an unknown base, a `__getattr__` class, an enum whose members
         // may mix in `int` / `str`) stays permissive.
         !c.class_hierarchy_fully_known(name)
             || c.class_defines_getattr(name)
-            || c.enums.contains_key(name)
             || class_has_ordering_dunder(c, name)
     };
     match (l, r) {
@@ -38785,6 +38833,20 @@ def main() -> None:
             "def f(exponent: int) -> int:\n    mut n: int = 2\n    n **= exponent\n    return n\n",
         ] { assert!(!check(src).errors().is_empty(), "accepted: {src}"); }
         let src="newtype Count = int\ndef f(n: Count) -> Count:\n    return n ** 2\ndef g(exponent: int) -> int | float:\n    return 2 ** exponent\ndef h() -> bool:\n    mut b: bool = True\n    b &= False\n    return b\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn w2_09_ordering_and_membership() {
+        for src in [
+            "enum Color:\n    RED\n    GREEN\ndef f() -> bool:\n    return Color.RED < Color.GREEN\n",
+            "def f() -> bool:\n    return 1 in \"abc\"\n",
+        ] { assert!(!check(src).errors().is_empty(), "accepted: {src}"); }
+        let src="from dataclasses import dataclass\n@dataclass(order=True)\nclass Point:\n    x: int\ndef f() -> bool:\n    return Point(1) < Point(2)\ndef g() -> bool:\n    return \"a\" in \"abc\"\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn w2_09_caught_enum_order_and_mixed_key_controls() {
+        let src="import enum\nclass IntE(enum.IntEnum):\n    ONE = 1\nclass StrE(enum.StrEnum):\n    X = \"x\"\nenum Plain:\n    A\n    B\ndef f() -> None:\n    print({IntE.ONE: 1}[1], {StrE.X: 1}[\"x\"])\n    try:\n        print(Plain.A < Plain.B)\n    except TypeError:\n        pass\n";
         assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
     }
 }
