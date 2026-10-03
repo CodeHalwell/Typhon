@@ -5389,12 +5389,29 @@ impl<'a> Checker<'a> {
     /// classes defining `__setattr__` / `__getattr__`. A plain `class` with
     /// fully-known bases emits `@dataclass(slots=True)` and cannot.
     fn class_accepts_undeclared_attrs(&self, name: &str) -> bool {
-        let real = name.strip_prefix("__typhon_impl_").unwrap_or(name);
-        self.is_plain_class(real)
-            || self.is_raw_class(real)
-            || !self.class_hierarchy_fully_known(real)
-            || self.class_defines_getattr(real)
-            || self.find_method(real, "__setattr__").is_some()
+        let mut stack = vec![name
+            .strip_prefix("__typhon_impl_")
+            .unwrap_or(name)
+            .to_owned()];
+        let mut seen = HashSet::new();
+        while let Some(real) = stack.pop() {
+            if !seen.insert(real.clone()) {
+                continue;
+            }
+            if self.is_plain_class(&real)
+                || self.is_raw_class(&real)
+                || class_contracts::dataclass_option(self, &real, "slots") == Some(false)
+                || !self.class_hierarchy_fully_known(&real)
+                || self.class_defines_getattr(&real)
+                || self.find_method(&real, "__setattr__").is_some()
+            {
+                return true;
+            }
+            if let Some(shape) = self.resolve_class_shape(&real) {
+                stack.extend(shape.bases.iter().cloned());
+            }
+        }
+        false
     }
 
     /// Return `true` when every class in `cls_name`'s inheritance chain has a
@@ -8162,9 +8179,6 @@ fn check_attr_assign_type(c: &mut Checker, target: &Expr, value_type: &Type) {
     let Expr::Attribute(attr) = target else {
         return;
     };
-    if matches!(value_type, Type::Unknown) {
-        return;
-    }
     let recv = infer_expr_readonly(c, &attr.value);
     // A nullable receiver is already reported as `tyc::nullable_use`; peel the
     // `| None` so the field check still applies to the underlying class rather
@@ -8192,7 +8206,36 @@ fn check_attr_assign_type(c: &mut Checker, target: &Expr, value_type: &Type) {
         return;
     }
     let attr_name = attr.attr.as_str();
-    let Some(field_ty) = c.find_field(&real_class, attr_name).cloned() else {
+    if class_contracts::classvar(c, &real_class, attr_name)
+        && !class_contracts::class_object(c, &attr.value)
+    {
+        c.diagnostics.push_error(TycError::generic(format!(
+            "ClassVar `{real_class}.{attr_name}` must be assigned through the class"
+        )));
+        return;
+    }
+    let property = class_contracts::property(c, &real_class, attr_name);
+    if property
+        .as_ref()
+        .is_some_and(|(_, setter)| setter.is_none())
+    {
+        let diagnostic = TycError::generic(format!(
+            "`{real_class}.{attr_name}` is a read-only property"
+        ));
+        if frozen_context::failure_is_caught(c, target, "AttributeError") {
+            c.diagnostics.push_warning(diagnostic);
+        } else {
+            c.diagnostics.push_error(diagnostic);
+        }
+        return;
+    }
+    if matches!(value_type, Type::Unknown) {
+        return;
+    }
+    let field_type = property
+        .and_then(|(_, setter)| setter)
+        .or_else(|| c.find_field(&real_class, attr_name).cloned());
+    let Some(field_ty) = field_type else {
         // Writing a name the class never declared: a `class` emits
         // `@dataclass(slots=True)`, so `self.y = 5` with no `y: …` field
         // raises `AttributeError: 'X' object has no attribute 'y'` at
@@ -8204,8 +8247,7 @@ fn check_attr_assign_type(c: &mut Checker, target: &Expr, value_type: &Type) {
         if c.unsafe_depth == 0
             && !attr_name.starts_with('_')
             && !real_class.contains('.')
-            && !c.is_plain_class(&real_class)
-            && !c.is_raw_class(&real_class)
+            && !c.class_accepts_undeclared_attrs(&real_class)
             && !real_shape.bases.iter().any(|b| b == "BaseModel")
             && c.class_hierarchy_fully_known(&real_class)
             && !c.class_defines_getattr(&real_class)
@@ -11167,6 +11209,12 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
             if matches!(recv, Type::Str | Type::LitStr(_)) {
                 if let Some(method) = builtin_str_method(a.attr.as_str()) {
                     return method;
+                }
+            }
+            if let Type::Class(name) | Type::Generic(name, _) = &recv {
+                let real = name.strip_prefix("__typhon_impl_").unwrap_or(name);
+                if let Some((getter, _)) = class_contracts::property(c, real, a.attr.as_str()) {
+                    return substitute_typevars(&getter, &receiver_type_bindings(c, &recv));
                 }
             }
             // Builtin container methods carry a real signature (`d.get(k)` is
@@ -20407,6 +20455,12 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         c.attribute_receiver_type = Some(base);
                         return infer_expr_ctx_inner(c, expr, expected);
                     }
+                }
+            }
+            if let Type::Class(name) | Type::Generic(name, _) = &recv {
+                let real = name.strip_prefix("__typhon_impl_").unwrap_or(name);
+                if let Some((getter, _)) = class_contracts::property(c, real, attr_name) {
+                    return substitute_typevars(&getter, &receiver_type_bindings(c, &recv));
                 }
             }
             // B35: `_t.error` / `_t.value` on an isinstance-narrowed
@@ -39086,5 +39140,28 @@ def main() -> None:
     fn w2_15_writable_property_and_readonly_interface_controls() {
         let src="interface Owner:\n    pet: int\nclass Kennel:\n    value: int\nimpl Kennel:\n    @property\n    def pet(self) -> int:\n        return self.value\n    @pet.setter\n    def pet(self, value: int) -> None:\n        self.value = value\ndef f(k: Kennel) -> Owner:\n    return k\ninterface Readonly:\n    @property\n    def value(self) -> int: ...\ndef g(k: Kennel) -> Readonly:\n    return k\n";
         assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn w2_16_attribute_write_contracts() {
+        for src in [
+            "class Temperature:\n    value: float\nimpl Temperature:\n    @property\n    def celsius(self) -> float:\n        return self.value\ndef f(t: Temperature) -> None:\n    t.celsius = 5.0\n",
+            "from typing import ClassVar\nclass Counter:\n    count: ClassVar[int] = 0\ndef f(c: Counter) -> None:\n    c.count = 5\n",
+        ] { assert!(!check_class_kinds(src).errors().is_empty(), "accepted: {src}"); }
+        for src in [
+            "from dataclasses import dataclass\n@dataclass\nclass Counter:\n    value: int\nimpl Counter:\n    def f(self) -> None:\n        self.cache = 5\n",
+            "from dataclasses import dataclass\n@dataclass(slots=False)\nclass Counter:\n    value: int\nimpl Counter:\n    def f(self) -> None:\n        self.cache = 5\n",
+            "plain class Base:\n    value: int\nclass Child(Base):\n    other: int\nimpl Child:\n    def f(self) -> None:\n        self.cache = 5\n",
+            "from typing import ClassVar\nclass Counter:\n    count: ClassVar[int] = 0\ndef f() -> None:\n    Counter.count = 5\n",
+            "class Temperature:\n    value: float\nimpl Temperature:\n    @property\n    def celsius(self) -> float:\n        return self.value\n    @celsius.setter\n    def celsius(self, value: float) -> None:\n        self.value = value\ndef f(t: Temperature) -> float:\n    t.celsius = 5.0\n    return t.celsius\n",
+        ] { assert!(check_class_kinds(src).errors().is_empty(), "{src}: {:?}",check_class_kinds(src).errors()); }
+    }
+    #[test]
+    fn w2_16_cached_property_assignment_is_not_readonly() {
+        let src="from dataclasses import dataclass\nfrom functools import cached_property\n@dataclass\nclass Box:\n    value: int\n    @cached_property\n    def cached(self) -> int:\n        return self.value\ndef f(box: Box) -> int:\n    box.cached = 5\n    return box.cached\n";
+        assert!(
+            check_class_kinds(src).errors().is_empty(),
+            "{:?}",
+            check_class_kinds(src).errors()
+        );
     }
 }

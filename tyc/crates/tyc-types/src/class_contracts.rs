@@ -13,6 +13,12 @@ pub(super) fn dataclass_option(c: &Checker, name: &str, option: &str) -> Option<
             if let Stmt::ClassDef(cd) = stmt {
                 if cd.name.as_str() == self.name {
                     for decorator in &cd.decorator_list {
+                        if matches!(&decorator.expression,Expr::Name(n) if n.id.as_str()=="dataclass")
+                            || matches!(&decorator.expression,Expr::Attribute(a) if a.attr.as_str()=="dataclass")
+                        {
+                            self.result = Some(false);
+                        }
+
                         if let Expr::Call(call) = &decorator.expression {
                             let is_dataclass = match call.func.as_ref() {
                                 Expr::Name(n) => n.id.as_str() == "dataclass",
@@ -141,6 +147,10 @@ pub(super) fn property(c: &Checker, class: &str, field: &str) -> Option<(Type, O
                                             })
                                             .unwrap_or(Type::Unknown),
                                     );
+                                    let readonly=f.decorator_list.iter().any(|d|matches!(&d.expression,Expr::Name(n) if n.id.as_str()=="property") || matches!(&d.expression,Expr::Attribute(a) if a.attr.as_str()=="property"));
+                                    if !readonly {
+                                        self.setter = self.getter.clone();
+                                    }
                                 } else if is_property_setter(f) {
                                     self.setter = Some(
                                         f.parameters
@@ -203,4 +213,34 @@ pub(super) fn property(c: &Checker, class: &str, field: &str) -> Option<(Type, O
         None
     }
     resolve(c, class, field, &mut HashSet::new())
+}
+
+pub(super) fn class_object(c: &Checker, expr: &Expr) -> bool {
+    let Expr::Name(n) = expr else { return false };
+    let Some(binding) = c.env.lookup(n.id.as_str()) else {
+        return false;
+    };
+    c.resolved.scopes.iter().flat_map(|s| &s.bindings).any(|b| {
+        b.name == n.id.as_str() && b.kind == BindingKind::Class && b.span.0 == binding.span.0
+    })
+}
+
+pub(super) fn classvar(c: &Checker, class: &str, field: &str) -> bool {
+    let mut stack = vec![class.to_owned()];
+    let mut seen = HashSet::new();
+    while let Some(class) = stack.pop() {
+        if !seen.insert(class.clone()) {
+            continue;
+        }
+        if c.class_var_attrs
+            .get(&class)
+            .is_some_and(|fields| fields.contains(field))
+        {
+            return true;
+        }
+        if let Some(shape) = c.class_shapes.get(&class) {
+            stack.extend(shape.bases.iter().cloned());
+        }
+    }
+    false
 }
