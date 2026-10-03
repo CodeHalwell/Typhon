@@ -187,33 +187,39 @@ pub fn run(args: RunArgs) -> Result<()> {
     //    `tyc run --compile script.ty` fail outright with "refusing to
     //    write … outside the project root". The scaffold is itself a
     //    TempDir, so nothing persists either way.
-    let (out_dir, _tmp_guard): (PathBuf, Option<TempDir>) = if scaffold_no_sync {
-        (args.path.join("build"), None)
+    let (out_dir, _tmp_guard, project_root_for_python): (PathBuf, Option<TempDir>, PathBuf) = if scaffold_no_sync {
+        (args.path.join("build"), None, args.path.clone())
     } else if args.temp {
         let tmp = tempfile::Builder::new()
             .prefix("tyc-run-")
             .tempdir()
             .map_err(|e| miette!("cannot create temp directory: {e}"))?;
-        (tmp.path().to_path_buf(), Some(tmp))
+        let root = args.path.canonicalize().unwrap_or_else(|_| args.path.clone());
+        let root = match TyphonConfig::load(&root) {
+            Ok(Some((toml_path, _))) => toml_path.parent().map(|p| p.to_path_buf()).unwrap_or(root),
+            _ => root,
+        };
+        (tmp.path().to_path_buf(), Some(tmp), root)
     } else {
         // Resolve the persistent `out` dir the same way `tyc build` does
         // so the entry-point lookup matches what was just emitted.
-        let project_root = args
+        let invocation_root = args
             .path
             .canonicalize()
             .map_err(|e| miette!("cannot resolve path '{}': {}", args.path.display(), e))?;
-        let (config_dir, config) = match TyphonConfig::load(&project_root) {
+        let (config_dir, config) = match TyphonConfig::load(&invocation_root) {
             Ok(Some((toml_path, cfg))) => {
                 let dir = toml_path
                     .parent()
                     .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| project_root.clone());
+                    .unwrap_or_else(|| invocation_root.clone());
                 (dir, cfg)
             }
-            Ok(None) => (project_root.clone(), TyphonConfig::default()),
+            Ok(None) => (invocation_root.clone(), TyphonConfig::default()),
             Err(e) => return Err(miette!("{e}")),
         };
-        (config_dir.join(&config.project.out), None)
+        let out = config_dir.join(&config.project.out);
+        (out, None, config_dir)
     };
 
     // 2. Build the project unless --no-build was passed.  When --temp is
@@ -245,13 +251,6 @@ pub fn run(args: RunArgs) -> Result<()> {
             entry.display()
         ));
     }
-
-    // The project root, for locating a `.venv` and reading `[python] target`
-    // when picking the interpreter below.
-    let project_root_for_python = args
-        .path
-        .canonicalize()
-        .unwrap_or_else(|_| args.path.clone());
 
     // 3. Decide between two spawn shapes:
     //    (a) script mode: `python build/main.py` — works for single-file
