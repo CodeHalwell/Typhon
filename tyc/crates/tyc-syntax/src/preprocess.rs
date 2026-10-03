@@ -2960,10 +2960,17 @@ pub fn postprocess_full(
         cols.sort_unstable_by(|a, b| b.cmp(a));
         let mut line = std::mem::take(&mut lines[line_idx]);
         for col in cols {
-            // Defensive bounds checks — normalisation can move columns
-            // around (it doesn't in Phase 0, but stay safe).
+            // The columns are only valid against the buffer `preprocess`
+            // produced; any whitespace edit since then moves them. Checked
+            // access (`get` also rejects a column inside a multi-byte
+            // character) so a stale column is skipped instead of panicking.
+            // `tyc fmt` no longer restores `?` through this path at all — it
+            // carries a marker character through the edits instead.
             const REWRITE: &str = " | None";
-            if col <= line.len() && line[col..].starts_with(REWRITE) {
+            if line
+                .get(col..)
+                .is_some_and(|tail| tail.starts_with(REWRITE))
+            {
                 line.replace_range(col..col + REWRITE.len(), "?");
             }
         }

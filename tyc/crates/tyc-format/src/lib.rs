@@ -98,13 +98,30 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
         TycError::parse(path, &validation_input, e.to_string(), offset)
     })?;
 
+    // Step 2b: stand a single marker character in for every `?` the
+    // preprocessor rewrote to ` | None`.
+    //
+    // The restore used to be keyed by the byte column of each ` | None` in
+    // the pre-processed line. The spacing pass below moves columns
+    // (`z:int=r | None` → `z: int = r | None`), so the restore silently
+    // missed and the user's `r?` came back as `r | None` — and when the
+    // shifted column landed inside a multi-byte character the indexing
+    // panicked. A marker character travels with its token through any
+    // whitespace edit, so restoration no longer depends on columns at all.
+    let marker = optional_marker_for(source);
+    let marked = mark_optionals(&prep.python_source, &prep.optionals, marker).ok_or_else(|| {
+        TycError::generic(format!(
+            "tyc fmt: could not locate a rewritten `?` in '{path}'; the file was left unchanged"
+        ))
+    })?;
+
     // Step 3: normalise whitespace on the pre-processed source.
     //
     // Phase 0 normalisation rules:
     //   • Strip trailing whitespace from each line.
     //   • Ensure the file ends with exactly one newline.
     //   • Expand tabs to 4 spaces.
-    let (normalised, line_map) = normalise_whitespace_with_map(&prep.python_source);
+    let (normalised, line_map) = normalise_whitespace_with_map(&marked);
 
     // Step 3b: (optional) pipe the pure-Python buffer through `ruff format`
     // when the binary is on $PATH AND the buffer contains nothing that the
@@ -154,14 +171,6 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
             keyword: s.keyword,
         })
         .collect();
-    let translated_optionals: Vec<StrippedOptional> = prep
-        .optionals
-        .iter()
-        .map(|o| StrippedOptional {
-            line_index: translate(o.line_index),
-            python_col: o.python_col,
-        })
-        .collect();
     let translated_lazy: Vec<_> = prep
         .lazy_imports
         .iter()
@@ -171,12 +180,10 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
             module: li.module.clone(),
         })
         .collect();
-    let output = postprocess_full(
-        &after_ruff,
-        &translated_stripped,
-        &translated_optionals,
-        &translated_lazy,
-    );
+    // `?` sugar is restored from its marker character, not by column (the
+    // optionals list is deliberately empty here — see step 2b).
+    let output = postprocess_full(&after_ruff, &translated_stripped, &[], &translated_lazy);
+    let output = output.replace(marker, "?");
 
     // Step 4b: repair the builtin-extend restoration.
     //
@@ -219,6 +226,88 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
 
     let changed = output != source;
     Ok(FormatResult { output, changed })
+}
+
+/// The text the preprocessor substitutes for a `?` (see
+/// `tyc_syntax::preprocess::rewrite_optionals`).
+const OPTIONAL_REWRITE: &str = " | None";
+
+/// First private-use code point tried as the `?` stand-in. `U+E000` itself is
+/// reserved: [`apply_simple_style_rules_with_paren_depth`] hides string
+/// literals behind it.
+const FIRST_OPTIONAL_MARKER: u32 = 0xE001;
+const LAST_OPTIONAL_MARKER: u32 = 0xF8FF;
+
+/// Pick a private-use character that does not occur anywhere in `source`, so
+/// replacing every occurrence of it with `?` after formatting touches only
+/// the stand-ins this module inserted.
+fn optional_marker_for(source: &str) -> char {
+    (FIRST_OPTIONAL_MARKER..=LAST_OPTIONAL_MARKER)
+        .filter_map(char::from_u32)
+        .find(|c| !source.contains(*c))
+        // A file containing all 6,399 private-use characters is not a real
+        // input; the first one keeps behaviour defined.
+        .unwrap_or('\u{E001}')
+}
+
+/// `true` for a `?` stand-in inserted by [`mark_optionals`]. The spacing
+/// engine treats it like the identifier character it replaced (`r?` ends an
+/// operand exactly as `r` does).
+fn is_optional_marker(c: char) -> bool {
+    (FIRST_OPTIONAL_MARKER..=LAST_OPTIONAL_MARKER).contains(&(c as u32))
+}
+
+/// Replace each ` | None` the preprocessor substituted for a `?` with
+/// `marker`. `optionals` carries the exact `(line, byte column)` of every
+/// substitution in `python_source`, which is still the buffer they were
+/// recorded against, so the columns are valid here (and only here: every
+/// later pass may move them). Returns `None` when a recorded position does
+/// not hold the rewrite — the caller refuses to format rather than restore
+/// the wrong text.
+fn mark_optionals(
+    python_source: &str,
+    optionals: &[StrippedOptional],
+    marker: char,
+) -> Option<String> {
+    if optionals.is_empty() {
+        return Some(python_source.to_owned());
+    }
+    let mut per_line: std::collections::BTreeMap<usize, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for opt in optionals {
+        per_line
+            .entry(opt.line_index)
+            .or_default()
+            .push(opt.python_col);
+    }
+    let mut out = String::with_capacity(python_source.len());
+    for (idx, line) in python_source.split_inclusive('\n').enumerate() {
+        let Some(cols) = per_line.remove(&idx) else {
+            out.push_str(line);
+            continue;
+        };
+        let mut line = line.to_owned();
+        let mut cols = cols;
+        // Right to left, so an earlier column is not moved by a later edit.
+        cols.sort_unstable_by(|a, b| b.cmp(a));
+        cols.dedup();
+        for col in cols {
+            if !line
+                .get(col..)
+                .is_some_and(|tail| tail.starts_with(OPTIONAL_REWRITE))
+            {
+                return None;
+            }
+            let mut buf = [0u8; 4];
+            line.replace_range(
+                col..col + OPTIONAL_REWRITE.len(),
+                marker.encode_utf8(&mut buf),
+            );
+        }
+        out.push_str(&line);
+    }
+    // Every recorded line must exist.
+    per_line.is_empty().then_some(out)
 }
 
 /// Marker prefix the preprocessor uses for the synthesised stub class of
@@ -1045,6 +1134,7 @@ fn is_binary_operand_lhs(prev: Option<char>) -> bool {
         prev,
         Some(c)
             if c.is_ascii_alphanumeric() || c == '_' || c == ')' || c == ']'
+                || is_optional_marker(c)
     )
 }
 
@@ -2539,5 +2629,66 @@ def run() -> Result[int, str]:
                 None => std::env::remove_var("TYC_FMT_DISABLE_RUFF"),
             }
         }
+    }
+
+    /// Run `f` with the external `ruff format` pass disabled, restoring the
+    /// previous value of `TYC_FMT_DISABLE_RUFF` afterwards.
+    fn without_ruff<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = lock_env();
+        let prior = std::env::var_os("TYC_FMT_DISABLE_RUFF");
+        // SAFETY: serialised by `lock_env`; restored before returning.
+        unsafe {
+            std::env::set_var("TYC_FMT_DISABLE_RUFF", "1");
+        }
+        let out = f();
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TYC_FMT_DISABLE_RUFF", v),
+                None => std::env::remove_var("TYC_FMT_DISABLE_RUFF"),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn format_keeps_postfix_question_when_spacing_shifts_its_column() {
+        // W7-01: the preprocessor rewrites every `?` to ` | None` and records
+        // the column; the spacing pass then moved that column (`z:int=r` →
+        // `z: int = r`) and the column-keyed restore silently skipped, so
+        // the user's file came back with `r | None` where `r?` was.
+        let src = concat!(
+            "def h(x:int) -> Result[int, str]:\n",
+            "    let r: Result[int, str] = g(x)\n",
+            "    let z:int=r?\n",
+            "    print(x,r?)\n",
+            "    let o:int?=None\n",
+            "    return Ok(z)\n",
+        );
+        let out = without_ruff(|| format_source(src, "<test>").unwrap().output);
+        assert!(out.contains("    let z: int = r?\n"), "got:\n{out}");
+        assert!(out.contains("    print(x, r?)\n"), "got:\n{out}");
+        assert!(out.contains("    let o: int? = None\n"), "got:\n{out}");
+        assert!(!out.contains("| None"), "`?` leaked as `| None`:\n{out}");
+    }
+
+    #[test]
+    fn format_handles_nullable_of_a_non_ascii_class() {
+        // W7-01: the shifted column landed inside `Ü` and the restore indexed
+        // the line with it — a "not a char boundary" panic (exit 101).
+        let src = "class Üü:\n    v: int\n\ndef f(a:int,b:Üü?) -> int:\n    return a\n";
+        let out = without_ruff(|| format_source(src, "<test>").unwrap().output);
+        assert!(
+            out.contains("def f(a: int, b: Üü?) -> int:\n"),
+            "got:\n{out}"
+        );
+        assert!(!out.contains("| None"), "`?` leaked as `| None`:\n{out}");
+    }
+
+    #[test]
+    fn format_question_marks_survive_a_marker_char_in_a_string() {
+        // The stand-in character must not collide with one the user wrote.
+        let src = "let s: str = \"\u{E001}\"\nlet n:int?=None\n";
+        let out = without_ruff(|| format_source(src, "<test>").unwrap().output);
+        assert_eq!(out, "let s: str = \"\u{E001}\"\nlet n: int? = None\n");
     }
 }

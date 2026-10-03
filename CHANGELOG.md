@@ -11,6 +11,19 @@ remediation described further down; the second closed the backlog that
 review deferred; the third — the 2026-09-30 release-readiness review
 (`docs/release-readiness-review-2026-09-30.md`) — is summarised first.
 
+### Fourth wave — 2026-10-03 reviews
+
+#### W7 — preprocessor, fmt, lowering
+
+- **`tyc fmt` no longer rewrites `?` into `| None`, and no longer panics on
+  a nullable non-ASCII type (W7-01).** The `?` restore was keyed by byte
+  column, and the spacing pass moved the column (`let z:int=r?` came back as
+  `let z: int = r | None`, `print(x,r?)` as `print(x, r | None)`); when the
+  moved column fell inside a multi-byte character (`b:Üü?`) the restore
+  panicked. The formatter now carries a marker character through the edits
+  instead of a column, and `postprocess_full` never indexes a line at an
+  unchecked offset.
+
 ### Third wave — the 2026-09-30 release-readiness review
 
 **Seven ways a check-clean program could crash, closed.** Each of these
