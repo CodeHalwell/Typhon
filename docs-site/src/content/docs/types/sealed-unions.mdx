@@ -5,7 +5,7 @@ sidebar:
   order: 7
 ---
 
-A *sealed* union, declared with the `type` keyword, is a closed sum: every inhabitant is one of the variants listed in the alias. The checker uses this to enforce exhaustive `match`. Adding a new variant fails every `match` site that doesn't cover it.
+A *sealed* union, declared with the `type` keyword, is a closed sum: every inhabitant is one of the variants listed in the alias. The checker uses this to enforce exhaustive `match` directly over the union. Adding a new variant fails every such `match` site that doesn't cover it. (A `match` on `Result[T, E]` is not yet checked for variants nested inside the `Ok`/`Err` arms.)
 
 See [Sealed Unions and Match (tour)](/Typhon/tour/sealed-unions/) for the full walk-through; this page is the reference.
 

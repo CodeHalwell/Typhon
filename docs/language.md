@@ -15,7 +15,7 @@ internalise only this section, you can already read and write most Typhon:
 3. **`T` cannot hold `None`.** Use `T?` (sugar for `T | None`) when a value is optional, and narrow it (`is None`, `guard`, early return, `match`) before use.
 4. **Methods live in `impl` blocks, not in `class`.** Write `impl Foo:` with explicit `self`. For an ordinary `class` / `model`, the constructor is generated and a hand-written `__init__` is rejected; the raw-class escape hatches (`class!` and `plain class`) deliberately keep your own `__init__`.
 5. **`Any` only enters through `unsafe:` or `.dty` stubs.** Re-assert a concrete type at the boundary; for a one-off value, `EXPR as! TYPE` is the sound one-liner.
-6. **`match` on a sealed union must be exhaustive.** Add a variant and every `match` site errors until you handle it — no silent fall-through.
+6. **Direct `match` on a sealed union must be exhaustive.** Add a variant and every `match` over that union errors until you handle it — no silent fall-through. (A `match` on `Result[T, E]` is not yet checked for variants nested inside the `Ok`/`Err` arms.)
 7. **Errors flow as `Result[T, E]`, not exceptions.** `Ok`/`Err` and the `?` operator make failure visible in signatures; bridge to exceptions only at library boundaries.
 8. **Declare-only `let NAME: T` must be definitely assigned** before it's read — the first assignment on every non-diverging path is its initialiser.
 
