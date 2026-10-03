@@ -6,10 +6,10 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ## Unreleased — beta readiness
 
-Three waves on top of alpha.9. The first was the beta-readiness review
-remediation described further down; the second closed the backlog that
-review deferred; the third — the 2026-09-30 release-readiness review
-(`docs/release-readiness-review-2026-09-30.md`) — is summarised first.
+### Fourth wave — 2026-10-03 reviews
+
+#### W4 — CLI, LSP, filesystem safety
+- **LSP definition URIs rebased onto client workspace root.** `goto_definition` now uses the client's declared workspace root URI (preserving symlink prefixes such as `/var/folders` or `/tmp` rather than macOS `/private/var/...`) or open-document URI, preventing editors from opening duplicate tabs on cross-file jumps.
 
 ### Third wave — the 2026-09-30 release-readiness review
 

@@ -190,6 +190,8 @@ pub struct Backend {
     /// and staleness story as [`Self::lint_options_cache`], for the
     /// `apply_severity_overrides` pass that runs on every check.
     severity_overrides_cache: SeverityOverridesCache,
+    /// Declared workspace root URI from the client (`InitializeParams`).
+    workspace_root: Arc<Mutex<Option<Uri>>>,
 }
 
 impl std::fmt::Debug for Backend {
@@ -199,6 +201,66 @@ impl std::fmt::Debug for Backend {
 }
 
 impl Backend {
+    /// Convert an internal path to a client-facing URI.
+    ///
+    /// Keeps canonical paths internal for identity and equality. When returning
+    /// a location to the client:
+    /// 1. If the file is already open, returns the exact URI opened by the client.
+    /// 2. If the file lives within the declared workspace root, rebases the
+    ///    canonical path onto the client's workspace root URI (preserving
+    ///    symlink prefixes like `/var/folders` or `/tmp` rather than macOS
+    ///    `/private/var/...`).
+    /// 3. Otherwise returns a standard file:// URI.
+    async fn path_to_client_uri(&self, path: &std::path::Path) -> Option<Uri> {
+        let canonical_target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
+        // 1. If the file is currently open in the editor, use its open URI.
+        {
+            let docs = self.documents.lock().await;
+            for uri_str in docs.keys() {
+                if let Some(doc_path) = uri_str_to_path(uri_str) {
+                    let doc_canonical = doc_path.canonicalize().unwrap_or(doc_path);
+                    if doc_canonical == canonical_target {
+                        if let Ok(uri) = std::str::FromStr::from_str(uri_str) {
+                            return Some(uri);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Otherwise rebase the canonical path onto the client's workspace-root URI.
+        let root_guard = self.workspace_root.lock().await;
+        if let Some(root_uri) = root_guard.as_ref() {
+            if let Some(client_root_path) = uri_to_path(root_uri) {
+                let canonical_root = client_root_path
+                    .canonicalize()
+                    .unwrap_or_else(|_| client_root_path.clone());
+                if let Ok(rel) = canonical_target.strip_prefix(&canonical_root) {
+                    let rebased = client_root_path.join(rel);
+                    if let Some(s) = rebased.to_str() {
+                        let encoded = percent_encode(s);
+                        if let Ok(uri) = std::str::FromStr::from_str(&format!("file://{encoded}")) {
+                            return Some(uri);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Fallback: if path is absolute, encode directly without canonicalising.
+        if path.is_absolute() {
+            if let Some(s) = path.to_str() {
+                let encoded = percent_encode(s);
+                if let Ok(uri) = std::str::FromStr::from_str(&format!("file://{encoded}")) {
+                    return Some(uri);
+                }
+            }
+        }
+
+        path_to_uri(path)
+    }
+
     /// True if a message at `level` should be forwarded to the editor.
     fn should_log(&self, level: MessageType) -> bool {
         // `MessageType` ranking, low-to-high: LOG < INFO < WARNING < ERROR.
@@ -682,7 +744,17 @@ impl Backend {
 }
 
 impl LanguageServer for Backend {
-    async fn initialize(&self, _: InitializeParams) -> jsonrpc::Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> jsonrpc::Result<InitializeResult> {
+        #[allow(deprecated)]
+        let root = params.root_uri.or_else(|| {
+            params
+                .workspace_folders
+                .as_ref()
+                .and_then(|folders| folders.first().map(|f| f.uri.clone()))
+        });
+        if let Some(r) = root {
+            *self.workspace_root.lock().await = Some(r);
+        }
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
@@ -1725,8 +1797,12 @@ impl Backend {
             map_preprocessed_offset_to_original(&prep, &original_source, start_prep),
             map_preprocessed_offset_to_original(&prep, &original_source, end_prep),
         );
+        let client_uri = self
+            .path_to_client_uri(&module_path)
+            .await
+            .unwrap_or(target_uri);
         Some(Location {
-            uri: target_uri,
+            uri: client_uri,
             range: Range {
                 start: byte_to_position(&original_source, start),
                 end: byte_to_position(&original_source, end),
@@ -2784,6 +2860,7 @@ pub fn run_stdio(log_level: LogLevel) {
             prewarmed_versions: Arc::new(Mutex::new(HashMap::new())),
             lint_options_cache: Arc::new(Mutex::new(HashMap::new())),
             severity_overrides_cache: Arc::new(Mutex::new(HashMap::new())),
+            workspace_root: Arc::new(Mutex::new(None)),
         });
         Server::new(stdin, stdout, socket).serve(service).await;
     });
@@ -4466,6 +4543,7 @@ mod tests {
             prewarmed_versions: Arc::new(Mutex::new(HashMap::new())),
             lint_options_cache: Arc::new(Mutex::new(HashMap::new())),
             severity_overrides_cache: Arc::new(Mutex::new(HashMap::new())),
+            workspace_root: Arc::new(Mutex::new(None)),
         });
         let (to_server, server_in) = tokio::io::duplex(64 * 1024);
         let (server_out, from_server) = tokio::io::duplex(64 * 1024);
@@ -5862,6 +5940,52 @@ mod tests {
             utils_src[start_char..].starts_with('f'),
             "range start should sit on `f`, got char {start_char}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn goto_definition_in_symlinked_workspace_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_root = tmp.path().join("real_project");
+        let src = real_root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            real_root.join("typhon.toml"),
+            "[project]\nname=\"sym\"\nsrc=\"src\"\n",
+        )
+        .unwrap();
+        let utils_src = "def helper() -> None:\n    pass\n";
+        std::fs::write(src.join("utils.ty"), utils_src).unwrap();
+        let main_src = "from utils import helper\n\nlet _ = helper()\n";
+        std::fs::write(src.join("main.ty"), main_src).unwrap();
+
+        // Create a symlink pointing to the real project directory
+        let symlink_root = tmp.path().join("symlink_project");
+        std::os::unix::fs::symlink(&real_root, &symlink_root).unwrap();
+
+        // Client opens the workspace through the symlinked path
+        let root_uri = format!("file://{}", symlink_root.display());
+        let main_uri = format!("file://{}/src/main.ty", symlink_root.display());
+        let expected_utils_uri = format!("file://{}/src/utils.ty", symlink_root.display());
+
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, Some(&root_uri)).await;
+        did_open(&mut to, &main_uri, main_src).await;
+
+        let col = main_src.lines().nth(2).unwrap().find("helper").unwrap() as u32;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            goto_definition_request(&mut to, &mut from, 114, &main_uri, 2, col + 1),
+        )
+        .await
+        .expect("goto_definition timed out");
+
+        assert_eq!(
+            result["uri"].as_str(),
+            Some(expected_utils_uri.as_str()),
+            "definition must preserve client's symlinked workspace root URI, got {result}"
+        );
+        assert_eq!(result["range"]["start"]["line"].as_u64(), Some(0));
     }
 
     #[test]
