@@ -20,6 +20,8 @@
 //! useful diagnostics on a meaningful subset of programs, not full
 //! coverage.
 
+mod builtins;
+
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -3902,6 +3904,11 @@ impl<'a> Checker<'a> {
     }
 
     fn is_assignable_inner(&self, expected: &Type, actual: &Type) -> bool {
+        if matches!(expected, Type::Generic(head, _) if head == "TypeGuard" || head == "TypeIs")
+            && matches!(actual, Type::Bool)
+        {
+            return true;
+        }
         if let Some(verdict) = self.opaque_typevar_verdict(expected, actual) {
             return verdict;
         }
@@ -10979,6 +10986,49 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
             }
         }
         Expr::Call(call) => {
+            if matches!(call.func.as_ref(), Expr::Name(n) if n.id.as_str() == "super") {
+                let receiver_class = c.current_class.clone().or_else(|| {
+                    c.env
+                        .lookup("self")
+                        .and_then(|binding| match &binding.narrowed {
+                            Type::Class(name) | Type::Generic(name, _) => Some(name.clone()),
+                            _ => None,
+                        })
+                });
+                if let Some(base) = receiver_class
+                    .as_ref()
+                    .and_then(|name| {
+                        c.class_shapes
+                            .get(name.strip_prefix("__typhon_impl_").unwrap_or(name))
+                    })
+                    .and_then(|shape| shape.bases.first())
+                {
+                    return Type::Class(base.clone());
+                }
+            }
+            if let Expr::Name(name) = call.func.as_ref() {
+                if c.env.lookup(name.id.as_str()).is_none() && builtins::contains(name.id.as_str())
+                {
+                    let args: Vec<Type> = call
+                        .arguments
+                        .args
+                        .iter()
+                        .map(|arg| infer_expr_readonly(c, arg))
+                        .collect();
+                    let kwargs: Vec<(&str, Type)> = call
+                        .arguments
+                        .keywords
+                        .iter()
+                        .filter_map(|kw| {
+                            kw.arg
+                                .as_ref()
+                                .map(|n| (n.as_str(), infer_expr_readonly(c, &kw.value)))
+                        })
+                        .collect();
+                    return builtins::result(name.id.as_str(), &args, &kwargs)
+                        .unwrap_or(Type::Unknown);
+                }
+            }
             // `__typhon_checked_cast__(EXPR, TYPE)` (the lowering of
             // `EXPR as! TYPE`) reads as the target `TYPE` here too, so a
             // `match x as! Shape:` subject or a chained cast resolves.
@@ -17933,6 +17983,7 @@ fn truthy(t: &Type) -> Option<Type> {
 fn iterable_element_type(ty: &Type) -> Option<Type> {
     match ty {
         // `str` iterates to `str` (one-char strings); `bytes` to `int`.
+        Type::Class(name) if name == "range" => Some(Type::Int),
         Type::Str => Some(Type::Str),
         Type::Bytes => Some(Type::Int),
         Type::Generic(head, args) => match head.as_str() {
@@ -18280,7 +18331,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             if let Some(b) = c.env.lookup(n.id.as_str()) {
                 b.narrowed.clone()
             } else {
-                Type::Unknown
+                builtins::value_type(n.id.as_str()).unwrap_or(Type::Unknown)
             }
         }
         Expr::BinOp(b) => {
@@ -18578,6 +18629,26 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             }
         }
         Expr::Call(call) => {
+            if matches!(call.func.as_ref(), Expr::Name(n) if n.id.as_str() == "super") {
+                let receiver_class = c.current_class.clone().or_else(|| {
+                    c.env
+                        .lookup("self")
+                        .and_then(|binding| match &binding.narrowed {
+                            Type::Class(name) | Type::Generic(name, _) => Some(name.clone()),
+                            _ => None,
+                        })
+                });
+                if let Some(base) = receiver_class
+                    .as_ref()
+                    .and_then(|name| {
+                        c.class_shapes
+                            .get(name.strip_prefix("__typhon_impl_").unwrap_or(name))
+                    })
+                    .and_then(|shape| shape.bases.first())
+                {
+                    return Type::Class(base.clone());
+                }
+            }
             // `EXPR as! TYPE` lowers (in tyc-syntax) to
             // `__typhon_checked_cast__(EXPR, TYPE)`. The cast's static type
             // is the target `TYPE` — read the second argument as a type
@@ -18777,6 +18848,86 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     }
                 }
                 check_builtin_first_argument(c, fn_name, pos_args);
+                if c.env.lookup(ctor).is_none() && builtins::contains(ctor) {
+                    let actuals: Vec<Type> =
+                        pos_args.iter().map(|arg| infer_expr(c, arg)).collect();
+                    let keywords: Vec<(&str, Type)> = kw_args
+                        .iter()
+                        .filter_map(|kw| {
+                            let actual = infer_expr(c, &kw.value);
+                            kw.arg.as_ref().map(|name| (name.as_str(), actual))
+                        })
+                        .collect();
+                    let names: Vec<&str> = keywords.iter().map(|(name, _)| *name).collect();
+                    let expanded = pos_args.iter().any(|arg| matches!(arg, Expr::Starred(_)))
+                        || kw_args.iter().any(|kw| kw.arg.is_none());
+                    if !expanded && !builtins::valid_arity(ctor, pos_args.len(), &names) {
+                        c.diagnostics.push_error(TycError::generic(format!(
+                            "invalid arguments to builtin `{ctor}`"
+                        )));
+                    }
+                    for (i, actual) in actuals.iter().enumerate() {
+                        if let Some(formal) = builtins::argument_type(ctor, i, None) {
+                            if !c.is_assignable(&formal, actual) {
+                                let arg = &pos_args[i];
+                                c.mismatch(
+                                    &formal,
+                                    actual,
+                                    (arg.range().start().to_usize(), arg.range().end().to_usize()),
+                                );
+                            }
+                        }
+                    }
+                    for kw in kw_args.iter() {
+                        if let Some(name) = &kw.arg {
+                            if let Some(formal) =
+                                builtins::argument_type(ctor, usize::MAX, Some(name.as_str()))
+                            {
+                                if let Some((_, actual)) =
+                                    keywords.iter().find(|(key, _)| *key == name.as_str())
+                                {
+                                    if !c.is_assignable(&formal, actual) {
+                                        c.mismatch(
+                                            &formal,
+                                            actual,
+                                            (
+                                                kw.value.range().start().to_usize(),
+                                                kw.value.range().end().to_usize(),
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let result =
+                        builtins::result(ctor, &actuals, &keywords).unwrap_or(Type::Unknown);
+                    // Constructors allocate a fresh container: its elements may
+                    // widen covariantly into the receiving annotation, unlike
+                    // assignment of an existing mutable container.
+                    if let (Type::Generic(head, args), Some(Type::Generic(ehead, eargs))) =
+                        (&result, expected)
+                    {
+                        if head == ehead
+                            && args.len() == eargs.len()
+                            && matches!(
+                                head.as_str(),
+                                "list" | "set" | "dict" | "frozenset" | "tuple_variadic"
+                            )
+                        {
+                            if args.iter().zip(eargs).all(|(a, e)| c.is_assignable(e, a)) {
+                                return Type::Generic(head.clone(), eargs.clone());
+                            }
+                            // `float` annotations admit integer inhabitants without
+                            // runtime coercion. Without value provenance, a copied
+                            // float-view container cannot prove those are floats.
+                            if args.len() == 1 && args[0] == Type::Float && eargs[0] == Type::Int {
+                                return Type::Generic(head.clone(), vec![Type::Unknown]);
+                            }
+                        }
+                    }
+                    return result;
+                }
             }
 
             // Phase E: blocking-in-async call detection. When the
@@ -20474,6 +20625,9 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
         // checker so each side of the ternary sees the right type for
         // `x`.
         Expr::If(e) => {
+            if let Expr::BooleanLiteral(test) = e.test.as_ref() {
+                return infer_expr_ctx(c, if test.value { &e.body } else { &e.orelse }, expected);
+            }
             let _ = infer_expr(c, &e.test);
             let pos = collect_narrowings(c, &e.test, /*negate=*/ false);
             let snap_pre = c.env.snapshot();
@@ -37964,5 +38118,34 @@ def main() -> None:
                     .collect::<Vec<_>>()
             );
         }
+    }
+    #[test]
+    fn w2_01_builtin_results_and_iteration_are_checked() {
+        for src in [
+            "def label(n: int) -> int:\n    return str(n)\n",
+            "def f() -> None:\n    let s: str = len([1])\n",
+            "def f() -> None:\n    for i in range(3):\n        print(i.upper())\n",
+            "def f() -> None:\n    for i, s in enumerate([1]):\n        print(s.upper())\n",
+            "def f() -> None:\n    for i, s in zip([1], [2]):\n        print(s.upper())\n",
+        ] {
+            assert!(!check(src).errors().is_empty(), "accepted: {src}");
+        }
+    }
+    #[test]
+    fn w2_01_builtin_overloads_and_shadowing_stay_valid() {
+        let src = "def len(x: int) -> str:\n    return str(x)\n\ndef f() -> None:\n    let s: str = len(1)\n    let a: int = round(1.2)\n    let b: float = round(1.2, 1)\n    let c: int = int(\"ff\", 16)\n    let d: list[int] = sorted([1, 2], key=lambda x: -x)\n    let e: int = min(1, 2)\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn w2_01_super_method_contracts() {
+        for body in ["return super().read(1)", "return super().read()"] {
+            let src = format!("class A:\n    n: int\nimpl A:\n    def read(self, n: int) -> int:\n        return n\nclass B(A):\n    n: int\nimpl B:\n    def text(self) -> str:\n        {body}\n");
+            assert!(!check(&src).errors().is_empty(), "accepted: {src}");
+        }
+    }
+    #[test]
+    fn w2_01_fresh_containers_and_dead_branch_controls() {
+        let src = "class Animal:\n    name: str\nclass Dog(Animal):\n    name: str\ndef f() -> None:\n    let dogs: list[Dog] = [Dog(name=\"x\")]\n    let animals: list[Animal] = list(dogs)\n    let xs: list[float] = [1, 2]\n    let ints: set[int] = set(xs)\n    print(float(\"1\")[:0] if False else \"skip\")\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
     }
 }
