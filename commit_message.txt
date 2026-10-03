@@ -1,0 +1,6 @@
+⚡ Bolt: Zero-Allocation `class_body_names` in desugar
+
+💡 What: Changed `class_body_names` from `HashSet<String>` to `HashSet<&str>` to borrow AST node identifiers instead of allocating strings. Separated read and write passes using a `Vec` to satisfy the borrow checker.
+🎯 Why: `rewrite_mutable_field_defaults` cloned strings via `.to_owned()` during AST traversal, creating unnecessary memory overhead.
+📊 Impact: Reduces heap allocations and improves AST desugaring performance in hot paths.
+🔬 Measurement: Verify AST compilation time is faster for source files with multiple dataclass fields.

@@ -2620,23 +2620,24 @@ fn rewrite_mutable_field_defaults(
     let mut changed = false;
     // Names the class body itself binds: a lambda defined in the body
     // cannot see them, so a default that mentions one is left alone.
-    let class_body_names: std::collections::HashSet<String> = body
+    let class_body_names: std::collections::HashSet<&str> = body
         .iter()
         .filter_map(|s| match s {
             Stmt::AnnAssign(a) => match a.target.as_ref() {
-                Expr::Name(n) => Some(n.id.as_str().to_owned()),
+                Expr::Name(n) => Some(n.id.as_str()),
                 _ => None,
             },
             Stmt::Assign(a) => a.targets.iter().find_map(|t| match t {
-                Expr::Name(n) => Some(n.id.as_str().to_owned()),
+                Expr::Name(n) => Some(n.id.as_str()),
                 _ => None,
             }),
-            Stmt::FunctionDef(f) => Some(f.name.as_str().to_owned()),
-            Stmt::ClassDef(c) => Some(c.name.as_str().to_owned()),
+            Stmt::FunctionDef(f) => Some(f.name.as_str()),
+            Stmt::ClassDef(c) => Some(c.name.as_str()),
             _ => None,
         })
         .collect();
-    for stmt in body.iter_mut() {
+    let mut changes = Vec::new();
+    for (idx, stmt) in body.iter().enumerate() {
         let Stmt::AnnAssign(a) = stmt else { continue };
         // A `ClassVar[...]` field is a class-level constant, not an instance
         // field: `@dataclass` never gives it an `__init__` parameter and
@@ -2673,9 +2674,17 @@ fn rewrite_mutable_field_defaults(
         } else {
             continue;
         };
+        changes.push((idx, factory));
+    }
+
+    drop(class_body_names);
+
+    for (idx, factory) in changes {
+        let Stmt::AnnAssign(a) = &mut body[idx] else { unreachable!() };
         a.value = Some(Box::new(make_dataclasses_field_default_factory(factory)));
         changed = true;
     }
+
     changed
 }
 
@@ -2698,9 +2707,9 @@ fn is_instance_or_nonconstant_display_default(
 }
 
 /// `true` when `expr` reads any of `names` (at any depth).
-fn mentions_any_name(expr: &Expr, names: &std::collections::HashSet<String>) -> bool {
+fn mentions_any_name(expr: &Expr, names: &std::collections::HashSet<&str>) -> bool {
     struct V<'a> {
-        names: &'a std::collections::HashSet<String>,
+        names: &'a std::collections::HashSet<&'a str>,
         found: bool,
     }
     impl ruff_python_ast::visitor::Visitor<'_> for V<'_> {
