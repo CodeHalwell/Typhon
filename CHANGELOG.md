@@ -64,6 +64,18 @@ review deferred; the third — the 2026-09-30 release-readiness review
   `isinstance(x, Poly)` on a `type` alias were accepted and raise
   `TypeError` on CPython (a `type` statement makes a `TypeAliasType`, not a
   class). The help text lists the variants to match or test instead.
+- **Loops join their exit paths.** The `else:` suite of a `for` loop was
+  never type-checked (`for … else: let bad: str = 1` passed). After a
+  `while` loop the checker restored the pre-loop state, so a narrowing the
+  body invalidated (`while running: x = None`, or `b.v = None`) survived
+  the loop; after a `for` loop the body's state flowed on as if the loop
+  always ran, so `last = v` in the body made a nullable `last` look set even
+  for an empty iterable. The loop head now joins the pre-loop state, the
+  end of the body and every `continue`; after the loop the checker joins
+  the natural exit (the `else` suite, with the negated `while` test) and
+  every `break`. A nullable declaration with a non-`None` initializer
+  (`mut x: int? = 5`) now starts out narrowed, as the same value assigned
+  on the next line would. No previously clean corpus unit changes.
 
 ### Third wave — the 2026-09-30 release-readiness review
 

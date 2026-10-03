@@ -824,3 +824,102 @@ def g(s: Shape) -> bool:
 "#
     ));
 }
+
+// ── W1-06 / W1-07: loop exits ─────────────────────────────────────────────
+
+#[test]
+fn w1_06_the_for_else_suite_is_checked() {
+    let d = check(
+        "def f() -> None:\n    for i in range(0):\n        pass\n    else:\n        let bad: str = 1\n",
+    );
+    assert!(
+        d.errors()
+            .iter()
+            .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+        "got {:?}",
+        messages(&d)
+    );
+}
+
+#[test]
+fn w1_06_a_for_body_narrowing_does_not_survive_a_zero_iteration_loop() {
+    assert_rejected(
+        r#"
+def f(xs: list[int]) -> int:
+    mut last: int? = None
+    for v in xs:
+        last = v
+    return last + 1
+"#,
+    );
+}
+
+#[test]
+fn w1_07_a_narrowing_the_while_body_invalidates_does_not_survive_the_loop() {
+    assert_rejected(
+        r#"
+def f() -> None:
+    mut x: int? = 1
+    mut running: bool = True
+    if x is not None:
+        while running:
+            x = None
+            running = False
+        print(x + 1)
+"#,
+    );
+    assert_rejected(
+        r#"
+class B:
+    v: int?
+def f(b: B) -> None:
+    mut running: bool = True
+    if b.v is not None:
+        while running:
+            b.v = None
+            running = False
+        print(b.v + 1)
+"#,
+    );
+}
+
+#[test]
+fn w1_06_07_loop_exits_keep_what_every_path_agrees_on() {
+    assert_clean(
+        r#"
+def load() -> int?:
+    return 3
+def f() -> int:
+    mut y: int? = None
+    while y is None:
+        y = load()
+    return y + 1
+def g(xs: list[int]) -> int:
+    mut x: int? = 5
+    for v in xs:
+        x = v
+    return x + 1
+def h() -> int:
+    mut x: int? = None
+    while True:
+        x = load()
+        if x is not None:
+            break
+    return x + 1
+def k(xs: list[int]) -> int:
+    for v in xs:
+        if v > 2:
+            break
+    else:
+        return 0
+    return 1
+def m(xs: list[int?]) -> int:
+    mut t: int = 0
+    for v in xs:
+        if v is None:
+            continue
+        t = t + v
+    return t
+"#,
+    );
+}

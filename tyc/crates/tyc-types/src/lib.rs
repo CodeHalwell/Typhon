@@ -2630,6 +2630,26 @@ struct TypeBinding {
 /// top-level definitions: 4 000 one-`if` functions took 35 s.
 type ScopeMap = Rc<HashMap<String, TypeBinding>>;
 
+/// The envs reaching a loop's `break`s and `continue`s, recorded while its
+/// body is checked.
+#[derive(Debug, Default)]
+struct LoopExits {
+    breaks: Vec<TypeEnv>,
+    continues: Vec<TypeEnv>,
+}
+
+/// The join of `states` — a narrowing survives only where every state
+/// agrees on it ([`TypeEnv::intersect_narrowings`]). `None` when there are
+/// none (the point is unreachable).
+fn join_envs(states: Vec<TypeEnv>) -> Option<TypeEnv> {
+    let mut it = states.into_iter();
+    let mut joined = it.next()?;
+    for s in it {
+        joined.intersect_narrowings(&s);
+    }
+    Some(joined)
+}
+
 /// Type-environment stack — a map of name → TypeBinding per scope.
 #[derive(Debug, Default, Clone)]
 struct TypeEnv {
@@ -3197,6 +3217,10 @@ struct Checker<'a> {
     /// Names bound by a `type X = …` statement. Each is a `TypeAliasType`
     /// at runtime, not a class (see [`is_type_alias_name`]).
     pep695_aliases: HashSet<String>,
+    /// One frame per enclosing loop being checked: the env at every `break`
+    /// and `continue` in its body, joined into the loop-head and post-loop
+    /// states (review 2026-10-03, W1-06 / W1-07).
+    loop_exits: Vec<LoopExits>,
     /// For each declared function name, its inferred signature type.
     function_signatures: HashMap<String, Type>,
     /// Per-function arity metadata that doesn't fit in `Type::Function`
@@ -3700,6 +3724,7 @@ impl<'a> Checker<'a> {
             globals_rebound_by_call: std::collections::HashSet::new(),
             field_writes: FieldWriteSummary::default(),
             pep695_aliases: HashSet::new(),
+            loop_exits: Vec::new(),
             nonlocals_rebound_by_call: std::collections::HashSet::new(),
             function_signatures: HashMap::new(),
             function_arity_info: HashMap::new(),
@@ -12723,8 +12748,10 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             } else {
                 type_from_annotation(&a.annotation, &c.classes)
             };
+            let mut init_type: Option<Type> = None;
             if let Some(value) = &a.value {
                 let value_type = infer_expr_ctx(c, value, Some(&ann_type));
+                init_type = Some(value_type.clone());
                 // A call in the RHS may reassign a module global via
                 // `global NAME` in the callee, staling a caller narrowing on
                 // that global. Reset for subsequent statements (mirrors the
@@ -12812,10 +12839,28 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 if c.env.lookup(n.id.as_str()).is_some() {
                     c.reassigned_names.insert(n.id.as_str().to_owned());
                 }
+                // A nullable declaration with a definitely non-`None`
+                // initializer starts out narrowed, exactly as the same value
+                // assigned on the next line would narrow it: `mut x: int? = 5`
+                // is an `int` until something rebinds it. Without this a loop
+                // that re-assigns `x` from an `int` left `x` nullable after
+                // the loop once loop exits were joined (review 2026-10-03,
+                // W1-06 / W1-07).
+                let narrowed = match &init_type {
+                    Some(v)
+                        if ann_type.is_nullable()
+                            && !v.is_nullable()
+                            && !matches!(v, Type::Unknown | Type::Any | Type::None)
+                            && c.is_assignable(&ann_type, v) =>
+                    {
+                        ann_type.strip_none()
+                    }
+                    _ => ann_type.clone(),
+                };
                 c.env.declare(TypeBinding {
                     name: n.id.as_str().to_owned(),
-                    declared: ann_type.clone(),
-                    narrowed: ann_type,
+                    declared: ann_type,
+                    narrowed,
                     span,
                     from_unsafe,
                 });
@@ -13556,6 +13601,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // narrowing snapshot has been restored.
             let narrowings = collect_narrowings(c, &w.test, /*negate=*/ false);
             let snap_pre = c.env.snapshot();
+            let pre_loop = snap_pre.clone();
             // Iteration-2 soundness: a name reassigned inside the body holds,
             // at the top of the second and later passes, whatever the previous
             // pass last assigned — not the pre-loop narrowed value. Widen those
@@ -13573,34 +13619,44 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // ending in one is still widened (`body_always_leaves_loop`).
             widen_loop_carried_narrowings(c, &w.body);
             apply_narrowings(c, &narrowings);
+            c.loop_exits.push(LoopExits::default());
             for s in &w.body {
                 check_stmt(c, s);
             }
-            c.env.restore(snap_pre);
-            // `while ... else:` runs exactly when the loop test became
-            // false without a `break`, so the negated narrowing holds
-            // at the top of the orelse block — the dual of the
-            // positive narrowing applied to the body. Mirrors the
-            // `if` checker's else-branch handling.
+            let exits = c.loop_exits.pop().unwrap_or_default();
+            drop(snap_pre);
+            // The loop head — where TEST is evaluated again — is reached
+            // before the first pass, from the end of the body and from every
+            // `continue`; it holds only what all three agree on. Restoring the
+            // pre-loop env here instead (as before) let a narrowing the body
+            // invalidated survive the loop: `while running: x = None` left a
+            // pre-loop `x: int` narrowing in force after it (review
+            // 2026-10-03, W1-07).
+            let mut head_states = vec![c.env.snapshot(), pre_loop];
+            head_states.extend(exits.continues);
+            if let Some(head) = join_envs(head_states) {
+                c.env.restore(head);
+            }
+            // `while ... else:` runs exactly when TEST became false without a
+            // `break`, so the negated narrowing holds at the top of the
+            // `else` block and on the natural exit — `while y is None:
+            // y = load()` leaves `y` non-`None` (B25).
             let neg = collect_narrowings(c, &w.test, /*negate=*/ true);
-            let snap_pre = c.env.snapshot();
             apply_narrowings(c, &neg);
             for s in &w.orelse {
                 check_stmt(c, s);
             }
-            c.env.restore(snap_pre);
-            // B25: post-loop narrowing. A `while TEST: BODY` that has
-            // no `break` in the body can only exit through TEST going
-            // false (the natural-exit path) — so the negation of TEST
-            // holds at the join point after the loop. Apply the
-            // negated narrowings persistently so code like
-            //   while y is None: y = load()
-            //   return y + 1            # y is `int` here
-            // checks cleanly. A `break` inside the body would leave
-            // the loop while TEST is still true; in that case we have
-            // no information at the join and skip the apply.
-            if !body_can_break(&w.body) {
-                apply_narrowings(c, &neg);
+            // After the loop: the natural exit (unless TEST is constant
+            // true, or the `else` always leaves) joined with every `break`.
+            let natural_exit = !is_constant_true(&w.test)
+                && (w.orelse.is_empty() || !body_always_exits(&w.orelse));
+            let mut post_states = Vec::new();
+            if natural_exit {
+                post_states.push(c.env.snapshot());
+            }
+            post_states.extend(exits.breaks);
+            if let Some(post) = join_envs(post_states) {
+                c.env.restore(post);
             }
         }
         Stmt::For(f) => {
@@ -13639,6 +13695,8 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // unmodelled shapes (`Unknown`, user classes, bare containers)
             // fall back to `Unknown` so we stay permissive.
             let elem_ty = iterable_element_type(&iter_ty).unwrap_or(Type::Unknown);
+            // The zero-iteration path: the env before the target is bound.
+            let pre_loop = c.env.snapshot();
             // Bind the loop target(s). A tuple target (`for k, v in d.items()`)
             // destructures the element `tuple[K, V]` per slot; previously only
             // a bare `Expr::Name` target was bound and tuple slots fell to
@@ -13654,8 +13712,42 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // every path) — there is then no back-edge, so no stale carry to
             // widen. A `continue` still reaches the back-edge, so it is widened.
             widen_loop_carried_narrowings(c, &f.body);
+            c.loop_exits.push(LoopExits::default());
             for s in &f.body {
                 check_stmt(c, s);
+            }
+            let exits = c.loop_exits.pop().unwrap_or_default();
+            // The iterator is re-polled before the first pass, after the end
+            // of the body and after every `continue`; exhausting it there
+            // runs the `else` block and leaves the loop. The body's state
+            // used to flow straight on, as if the loop always ran to the end
+            // at least once, and the `else` block was never checked at all
+            // (review 2026-10-03, W1-06).
+            let mut head_states = vec![c.env.snapshot(), pre_loop];
+            head_states.extend(exits.continues);
+            if let Some(head) = join_envs(head_states) {
+                c.env.restore(head);
+            }
+            for s in &f.orelse {
+                check_stmt(c, s);
+            }
+            let mut post_states = Vec::new();
+            if f.orelse.is_empty() || !body_always_exits(&f.orelse) {
+                post_states.push(c.env.snapshot());
+            }
+            post_states.extend(exits.breaks);
+            if let Some(post) = join_envs(post_states) {
+                c.env.restore(post);
+            }
+        }
+        Stmt::Break(_) => {
+            if let Some(frame) = c.loop_exits.last_mut() {
+                frame.breaks.push(c.env.snapshot());
+            }
+        }
+        Stmt::Continue(_) => {
+            if let Some(frame) = c.loop_exits.last_mut() {
+                frame.continues.push(c.env.snapshot());
             }
         }
         Stmt::Expr(e) => {
