@@ -1,0 +1,7 @@
+    Checking memchr v2.8.3
+    Checking object v0.37.3
+    Checking backtrace v0.3.76
+    Checking backtrace-ext v0.2.1
+    Checking miette v7.6.0
+    Checking tyc-diagnostics v1.0.0-alpha.9 (/private/tmp/typhon-w2-codex/tyc/crates/tyc-diagnostics)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 11.85s

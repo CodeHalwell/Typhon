@@ -1,0 +1,20 @@
+── errors in /tmp/w2-badkwargs.ty ──
+tyc::type_mismatch (https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/type_mismatch.md)
+
+  × type mismatch: expected `int`, found `str`
+   ╭─[/tmp/w2-badkwargs.ty:7:21]
+ 6 │ def f(b: Bag) -> None:
+ 7 │     b.add("a", item="bad")
+   ·                     ──┬──
+   ·                       ╰── expected `int`
+   ╰────
+  help: change the value so it produces `int`, or widen the annotation to `int
+        | str` if both are intended
+
+
+── summary ──
+  1 error(s):   tyc::type_mismatch
+
+  hint: run `tyc explain type_mismatch` for a full explanation (and try `tyc explain --list` to browse all codes).
+Error:   × 1 error (1 unique code) in 1 file
+

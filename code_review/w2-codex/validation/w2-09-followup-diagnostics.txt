@@ -1,0 +1,70 @@
+   Compiling tyc-diagnostics v1.0.0-alpha.9 (/private/tmp/typhon-w2-codex/tyc/crates/tyc-diagnostics)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.34s
+     Running unittests src/lib.rs (tyc/target/debug/deps/tyc_diagnostics-59207995082c5713)
+
+running 62 tests
+test tests::errors_and_warnings_slices_are_consistent_with_counts ... ok
+test tests::block_remap_skips_real_adjacent_duplicate_impls ... ok
+test tests::block_remap_ignores_single_impl_block ... ok
+test tests::block_remap_redirects_generic_distributed_impl_blocks ... ok
+test tests::block_remap_redirects_duplicate_impl_blocks ... ok
+test tests::contains_secret_literal_contains_name_and_env_key ... ok
+test tests::comptime_contains_name_and_message ... ok
+test tests::block_remap_preserves_columns_across_uneven_variant_names ... ok
+test tests::distributed_impl_lines_empty_for_real_adjacent_impls ... ok
+test tests::distributed_impl_lines_flags_only_alias_distributions ... ok
+test tests::dedupe_distributed_keeps_same_message_at_distinct_spans ... ok
+test tests::dedupe_distributed_collapses_identical_span_duplicates ... ok
+test tests::extend_merges_both_error_and_warning_lists ... ok
+test tests::frozen_assign_contains_class_and_field ... ok
+test tests::error_codes_are_stable ... ok
+test tests::dedup_removes_identical_errors ... ok
+test tests::dedup_keeps_shared_first_label_distinct_second_label ... ok
+test tests::dedup_preserves_distinct_warnings ... ok
+test tests::generic_error_round_trips_message ... ok
+test tests::immutable_assign_contains_name ... ok
+test tests::immutable_assign_has_doc_url ... ok
+test tests::interface_isinstance_contains_interface_name ... ok
+test tests::impure_pure_fn_contains_name_and_reason ... ok
+test tests::interface_not_conforming_contains_key_fields ... ok
+test tests::invalid_config_value_contains_key_value_and_allowed ... ok
+test tests::into_parts_separates_errors_and_warnings ... ok
+test tests::invalid_question_op_is_correct_variant ... ok
+test tests::io_error_contains_path_and_cause ... ok
+test tests::lazy_usage_contains_message ... ok
+test tests::new_variant_codes_are_stable ... ok
+test tests::non_exhaustive_match_contains_union_and_missing ... ok
+test tests::new_diagnostics_is_empty ... ok
+test tests::not_callable_contains_type ... ok
+test tests::nullable_use_contains_expected_type ... ok
+test tests::orphan_py_import_contains_import_path ... ok
+test tests::parse_error_hint_freeze_let_inside_function ... ok
+test tests::parse_error_hint_pipe_chain_without_parens ... ok
+test tests::nullable_use_always_none_does_not_suggest_a_guard ... ok
+test tests::nullable_use_knob_promotes_demotes_and_drops_the_warn_form_only ... ok
+test tests::parse_error_hint_returns_none_for_unrelated_message ... ok
+test tests::remap_lines_moves_a_diagnostic_onto_the_original_line ... ok
+test tests::parse_error_is_correct_variant ... ok
+test tests::sanitize_synthetic_source_short_circuits_clean_text ... ok
+test tests::push_error_increments_error_count ... ok
+test tests::type_mismatch_dict_literal_to_model_suggests_constructor ... ok
+test tests::type_mismatch_contains_expected_and_actual ... ok
+test tests::type_mismatch_scalar_keeps_default_hint ... ok
+test tests::typevar_bound_violation_code_is_stable ... ok
+test tests::typevar_bound_violation_contains_all_three_names ... ok
+test tests::unknown_name_contains_name ... ok
+test tests::push_warning_increments_warning_count_not_error_count ... ok
+test tests::wrong_arg_count_equal_counts_gets_kw_only_help ... ok
+test tests::wrong_arg_count_unequal_counts_no_help ... ok
+test tests::python_semantic_drift_contains_expression_and_detail ... ok
+test tests::sanitised_cache_gives_each_diagnostic_its_own_source ... ok
+test tests::sanitize_synthetic_source_blanks_q_scaffolding ... ok
+test tests::sanitize_synthetic_source_strips_impl_class_wrapper ... ok
+test tests::type_mismatch_dict_variance_suggests_mapping ... ok
+test tests::type_mismatch_list_variance_suggests_sequence ... ok
+test tests::w2_09_operator_help_covers_class_comparisons ... ok
+test tests::unused_import_contains_name ... ok
+test tests::wrong_arg_count_contains_name_and_counts ... ok
+
+test result: ok. 62 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+

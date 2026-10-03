@@ -1,0 +1,19 @@
+── errors in src/main.ty ──
+tyc::nullable_use (https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/nullable_use.md)
+
+  × possibly-None value used where `str` is required
+   ╭─[src/main.ty:4:16]
+ 3 │ def f(p: Person) -> int:
+ 4 │     return len(p.email)
+   ·                ───┬───
+   ·                   ╰── value is `str | None` here
+   ╰────
+  help: guard the value with `if p.email is not None:` to narrow it to `str`
+
+
+── summary ──
+  1 error(s):   tyc::nullable_use
+
+  hint: run `tyc explain nullable_use` for a full explanation (and try `tyc explain --list` to browse all codes).
+Error:   × 1 error (1 unique code) in 1 file
+

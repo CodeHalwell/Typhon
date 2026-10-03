@@ -1,0 +1,2 @@
+    Checking tyc-types v1.0.0-alpha.9 (/private/tmp/typhon-w2-codex/tyc/crates/tyc-types)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.28s

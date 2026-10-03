@@ -1,0 +1,14 @@
+{
+  "units": 1481,
+  "accepted": 1216,
+  "rejected": 265,
+  "rejected_outside_baseline": [
+    "stress/round-2026-06-21/repros/118-cast-partial.ty",
+    "stress/round-2026-06-21/repros/78-deep-recursion-bignum.ty",
+    "stress/round-2026-09-01/types/h101_pow.ty",
+    "stress/round-2026-09-01/types/h22_kwargs_callable.ty",
+    "stress/round-2026-09-01/types/h34_frozen_iface.ty",
+    "stress/round-2026-09-01/types/n5_iface_field_covariant.ty",
+    "stress/round-2026-09-01/types/s1d_update.ty"
+  ]
+}

@@ -1,0 +1,11 @@
+   Compiling tyc-diagnostics v1.0.0-alpha.9 (/private/tmp/typhon-w2-codex/tyc/crates/tyc-diagnostics)
+   Compiling tyc-resolve v1.0.0-alpha.9 (/private/tmp/typhon-w2-codex/tyc/crates/tyc-resolve)
+   Compiling tyc-analyse v1.0.0-alpha.9 (/private/tmp/typhon-w2-codex/tyc/crates/tyc-analyse)
+   Compiling tyc-format v1.0.0-alpha.9 (/private/tmp/typhon-w2-codex/tyc/crates/tyc-format)
+   Compiling tyc-types v1.0.0-alpha.9 (/private/tmp/typhon-w2-codex/tyc/crates/tyc-types)
+   Compiling tyc-vm v1.0.0-alpha.9 (/private/tmp/typhon-w2-codex/tyc/crates/tyc-vm)
+   Compiling tyc-db v1.0.0-alpha.9 (/private/tmp/typhon-w2-codex/tyc/crates/tyc-db)
+   Compiling tyc-venv v1.0.0-alpha.9 (/private/tmp/typhon-w2-codex/tyc/crates/tyc-venv)
+   Compiling tyc-lsp v1.0.0-alpha.9 (/private/tmp/typhon-w2-codex/tyc/crates/tyc-lsp)
+   Compiling tyc v1.0.0-alpha.9 (/private/tmp/typhon-w2-codex/tyc/crates/tyc)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.56s
