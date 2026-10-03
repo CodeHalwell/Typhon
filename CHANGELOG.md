@@ -15,6 +15,8 @@ review deferred; the third — the 2026-09-30 release-readiness review
 
 #### W2 — checker expressions
 
+- W2-04: checked casts expand transparent and concrete generic aliases, enforce Literal membership, preserve NewType base checks, and terminate recursive/cyclic values. Bare parameters and unsupported parameterised contracts are refused; `docs/language.md` records the supported-target table. The emitted CPython runtime rejects the JSON alias repro at the cast.
+
 - W2-02: debug builds support `TYC_REPORT_UNCHECKED=1 tyc check PATH`, reporting per-file Unknown annotation, return and member sites without changing severity. Examples baseline after builtin typing: 266 files, 206 annotated sites, 179 returns, 952 member sites (1337 total). Per-file counts are saved in `code_review/w2-codex/unchecked-examples-baseline.csv`.
 
 - W2-03: shared fields and properties on unions return the union of their types. Direct method calls must satisfy every variant's arity and parameter types and return the union of their results, with generic receiver parameters substituted and async methods returning coroutines.

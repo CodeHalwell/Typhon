@@ -18252,6 +18252,43 @@ fn lambda_structural_type(lam: &ruff_python_ast::ExprLambda) -> Type {
     }
 }
 
+fn checked_cast_target_supported(c: &Checker, target: &Type) -> bool {
+    fn supported(c: &Checker, target: &Type, path: &mut Vec<Type>) -> bool {
+        if path.contains(target) {
+            return true;
+        }
+        path.push(target.clone());
+        let result = match c.unwrap_alias(target) {
+            Type::TypeVar(_)
+            | Type::TypeConstructor(..)
+            | Type::Unknown
+            | Type::Function { .. }
+            | Type::Module(_) => false,
+            Type::Generic(head, args) => {
+                matches!(
+                    head.as_str(),
+                    "list"
+                        | "dict"
+                        | "set"
+                        | "frozenset"
+                        | "tuple"
+                        | "tuple_variadic"
+                        | "Mapping"
+                        | "MutableMapping"
+                        | "Sequence"
+                        | "Collection"
+                        | "AbstractSet"
+                ) && args.iter().all(|arg| supported(c, arg, path))
+            }
+            Type::Union(members) => members.iter().all(|arg| supported(c, arg, path)),
+            _ => true,
+        };
+        path.pop();
+        result
+    }
+    supported(c, target, &mut Vec::new())
+}
+
 fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type {
     match expr {
         Expr::BooleanLiteral(_) => Type::Bool,
@@ -18769,7 +18806,15 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     // Walk the value argument so its own diagnostics still
                     // surface, then discard its (boundary) type.
                     let _ = infer_expr(c, &call.arguments.args[0]);
-                    return type_from_annotation(&call.arguments.args[1], &c.classes);
+                    let target = type_from_annotation_with_params(
+                        &call.arguments.args[1],
+                        &c.classes,
+                        &c.active_type_params,
+                    );
+                    if !checked_cast_target_supported(c, &target) {
+                        c.diagnostics.push_error(TycError::generic(format!("as! cannot check target `{}` at runtime; choose a concrete supported target", target.display())));
+                    }
+                    return target;
                 }
             }
             // `try_result(thunk)` / `try_result(thunk, on_err)` — the
@@ -38457,5 +38502,15 @@ def main() -> None:
                 members: 1
             }
         );
+    }
+    #[test]
+    fn w2_04_bare_cast_type_parameter_is_refused() {
+        let d = check("from typing import Any\ndef cast[T](x: Any) -> T:\n    return __typhon_checked_cast__(x, T)\n");
+        assert!(!d.errors().is_empty(), "a bare T has no runtime check");
+    }
+    #[test]
+    fn w2_04_recursive_alias_target_remains_supported() {
+        let d = check("from typing import Any\ntype Json = int | list[Json]\ndef f(value: Any) -> Json:\n    return __typhon_checked_cast__(value, Json)\n");
+        assert!(d.errors().is_empty(), "{:?}", d.errors());
     }
 }
