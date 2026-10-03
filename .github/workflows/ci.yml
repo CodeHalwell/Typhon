@@ -127,6 +127,60 @@ jobs:
           TYC_REQUIRE_PYTHON: "1"
           TYC_REQUIRE_RUFF: "1"
 
+  fmt-guard:
+    name: Formatter scope guard
+    runs-on: ubuntu-latest
+    # `cargo fmt` must never reformat a file the change did not otherwise
+    # touch: a drive-by reformat hides in review and conflicts with every
+    # parallel workstream. This job fails when `cargo fmt --check` flags a
+    # `.rs` file outside the change's own file list.
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch (toolchain pinned via `with:`)
+        with:
+          toolchain: "1.94"
+          components: rustfmt
+
+      - name: Fail on out-of-scope reformats
+        working-directory: tyc
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          if ! git rev-parse --verify --quiet "$base" >/dev/null; then
+            # No base commit (e.g. a new branch's first push): compare
+            # against the empty tree, i.e. require a fully clean tree.
+            base="4b825dc642cb6b88a060e54bf8d69288fbee4904"
+          fi
+          # Files the change itself touches (added, copied, modified,
+          # renamed — not deleted or type-changed). `git diff --name-only`
+          # prints repo-root-relative paths whatever the cwd is.
+          mapfile -t changed < <(git diff --name-only --diff-filter=ACMR "$base"...HEAD -- '*.rs' | sort -u)
+          # Files rustfmt would rewrite, normalised the same way. rustfmt
+          # prints absolute paths with a trailing `:line:`; $PWD here is
+          # <root>/tyc.
+          mapfile -t unformatted < <(cargo fmt -- --check 2>&1 | sed -n 's|^Diff in \(.*\)$|\1|p' | sed -e 's|:[0-9]*:$||' -e 's|:[0-9]*$||' -e "s|^$PWD/|tyc/|" | sort -u)
+          if [ "${#unformatted[@]}" -eq 0 ]; then
+            echo "tree is rustfmt-clean"
+            exit 0
+          fi
+          offenders=$(comm -23 <(printf '%s\n' "${unformatted[@]}") <(printf '%s\n' "${changed[@]}"))
+          if [ -n "$offenders" ]; then
+            echo "::error::cargo fmt would reformat files this change does not touch:"
+            printf '%s\n' "$offenders"
+            exit 1
+          fi
+          echo "rustfmt touches only files in this change (or the tree is clean)"
+
   security:
     name: Security audit
     runs-on: ubuntu-latest
