@@ -1023,7 +1023,9 @@ fn task_spawn_callee(call: &ruff_python_ast::ExprCall) -> Option<String> {
 /// receiver whose class shape is known.
 fn callee_is_async(c: &Checker, call: &ruff_python_ast::ExprCall) -> bool {
     match call.func.as_ref() {
-        Expr::Name(n) => c.async_functions.contains(n.id.as_str()),
+        Expr::Name(_) => {
+            matches!(infer_expr_readonly(c,&call.func), Type::Function { ret,.. } if matches!(ret.as_ref(),Type::Generic(head,_) if head=="Coroutine"))
+        }
         Expr::Attribute(a) => {
             let recv = infer_expr_readonly(c, &a.value);
             let class_name = match recv.strip_none() {
@@ -3987,6 +3989,13 @@ impl<'a> Checker<'a> {
         // `async def` value assignable to a `Callable[..., Awaitable[R]]`
         // parameter.
         if let (Type::Generic(eh, ea), Type::Generic(ah, aa)) = (expected, actual) {
+            if eh == "Coroutine" && ah == "Coroutine" && ea.len() != aa.len() {
+                let e = unwrap_awaitable(expected, &self.classes);
+                let a = unwrap_awaitable(actual, &self.classes);
+                if let (Some(e), Some(a)) = (e, a) {
+                    return self.is_assignable(&e, &a);
+                }
+            }
             if eh == "Awaitable" && ah == "Coroutine" && ea.len() == 1 {
                 // The checker's own shorthand is `Coroutine[R]`; the typeshed
                 // form is `Coroutine[Y, S, R]`.
@@ -19402,9 +19411,14 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             // async function silently read `.value` off the coroutine at
             // runtime. Either way `inside_await` exempts the `await expr?`
             // form. (FINDINGS: async-`?` missing-await.)
-            if (c.in_sync_function || c.in_question_temp_rhs) && c.inside_await == 0 {
+            let expects_awaitable = expected
+                .is_some_and(|ty| unwrap_awaitable(&c.unwrap_alias(ty), &c.classes).is_some());
+            if (c.in_sync_function || c.in_question_temp_rhs)
+                && c.inside_await == 0
+                && !expects_awaitable
+            {
                 if let Expr::Name(n) = call.func.as_ref() {
-                    if c.async_functions.contains(n.id.as_str()) {
+                    if callee_is_async(c, call) {
                         let span = (n.range.start().to_usize(), n.range.end().to_usize());
                         c.missing_await(n.id.as_str(), span);
                     }
@@ -21722,9 +21736,13 @@ fn await_operand_is_shape_checkable(c: &Checker, operand: &Expr) -> bool {
         | Expr::ListComp(_)
         | Expr::DictComp(_)
         | Expr::SetComp(_) => true,
+        Expr::Name(_) | Expr::Attribute(_) => true,
         Expr::Call(call) => match call.func.as_ref() {
             Expr::Name(n) => {
                 let name = n.id.as_str();
+                if callables::decorated(c, name) {
+                    return false;
+                }
                 // Only this module's own declarations: an imported
                 // function's shape carries no async flag, so `await
                 // other.run()` on an `async def` imported from a sibling
@@ -21758,7 +21776,8 @@ fn await_operand_is_shape_checkable(c: &Checker, operand: &Expr) -> bool {
 /// hierarchy, no `__getattr__`, and a method `name` whose signature is not
 /// `async`.
 fn class_method_is_known_sync(c: &Checker, cls: &str, name: &str) -> bool {
-    !cls.contains('.')
+    !callables::decorated(c, name)
+        && !cls.contains('.')
         && c.local_classes.contains(cls)
         && c.class_shapes.contains_key(cls)
         && c.class_hierarchy_fully_known(cls)
@@ -38373,11 +38392,10 @@ def main() -> None:
         }
 
         #[test]
-        fn await_on_a_bare_name_is_left_alone() {
-            // A name may hold a coroutine the checker typed by its result;
-            // the shape gate keeps the check to calls and literals.
+        fn await_on_a_concrete_bare_name_is_rejected() {
+            // Stored coroutines carry a wrapper; an int binding is concrete.
             let d = check("async def main() -> None:\n    let n: int = 1\n    let v: int = await n\n    print(v)\n");
-            assert!(!has_error(&d, mismatch), "{:?}", errors_of(&d));
+            assert!(has_error(&d, mismatch), "{:?}", errors_of(&d));
         }
 
         // ── §3.7 / §3.8 structural rules ─────────────────────────────────
@@ -38725,6 +38743,21 @@ def main() -> None:
             "from typing import Callable\nclass Pt:\n    x: int\ndef apply(factory: Callable[[int], Pt]) -> Pt:\n    return factory(1)\ndef f() -> Pt:\n    return apply(Pt)\n",
             "from typing import Callable\ndef deco[**P, R](f: Callable[P, R]) -> Callable[P, R]:\n    return f\ndef add(a: int, b: int = 10) -> int:\n    return a + b\ndef f() -> int:\n    let g = deco(add)\n    return g(1)\n",
             "def add(a: int) -> int:\n    return a + 1\ndef f() -> int:\n    let fs = [add, lambda a: a]\n    return fs[0](1)\n",
+        ] { assert!(check(src).errors().is_empty(), "{src}: {:?}",check(src).errors()); }
+    }
+    #[test]
+    fn w2_07_await_contracts() {
+        for src in [
+            "async def f(n: int) -> int:\n    return await n\n",
+            "class Box:\n    value: int\nasync def f(b: Box) -> int:\n    return await b.value\n",
+        ] {
+            assert!(!check(src).errors().is_empty(), "accepted: {src}");
+        }
+        for src in [
+            "from typing import Awaitable\nasync def fetch() -> int:\n    return 1\ndef f() -> Awaitable[int]:\n    return fetch()\n",
+            "from typing import Coroutine\nasync def fetch() -> int:\n    return 1\ndef f() -> Coroutine[None, None, int]:\n    return fetch()\n",
+            "from typing import Awaitable, Callable\ndef deco(f: Callable[[], int]) -> Callable[[], Awaitable[int]]:\n    async def wrapper() -> int:\n        return f()\n    return wrapper\n@deco\ndef fetch() -> int:\n    return 1\nasync def f() -> int:\n    return await fetch()\n",
+            "async def fetch() -> int:\n    return 1\nasync def f() -> int:\n    let stored = fetch()\n    return await stored\n",
         ] { assert!(check(src).errors().is_empty(), "{src}: {:?}",check(src).errors()); }
     }
 }

@@ -144,3 +144,27 @@ pub(super) fn union_call(
     }
     Some(Type::union_of(returns))
 }
+
+/// Decorators may replace a synchronous function with an awaitable factory.
+pub(super) fn decorated(c: &Checker, name: &str) -> bool {
+    struct Scan<'s> {
+        name: &'s str,
+        found: bool,
+    }
+    impl<'a> Visitor<'a> for Scan<'_> {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            if let Stmt::FunctionDef(f) = stmt {
+                if f.name.as_str() == self.name && !f.decorator_list.is_empty() {
+                    self.found = true;
+                }
+            }
+            visitor::walk_stmt(self, stmt);
+        }
+    }
+    let Some(module) = c.module else { return false };
+    let mut scan = Scan { name, found: false };
+    for stmt in &module.body {
+        scan.visit_stmt(stmt);
+    }
+    scan.found
+}
