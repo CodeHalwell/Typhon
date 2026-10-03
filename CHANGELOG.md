@@ -11,6 +11,23 @@ remediation described further down; the second closed the backlog that
 review deferred; the third — the 2026-09-30 release-readiness review
 (`docs/release-readiness-review-2026-09-30.md`) — is summarised first.
 
+### Fourth wave — 2026-10-03 reviews
+
+#### W1 — checker flow, narrowing, exhaustiveness
+
+- **Narrowing over a sealed-union alias works on the negative branch
+  again (regression from the third wave).** With `type Pet = Dog | Cat | Fish`,
+  the `else` of `isinstance(p, Dog)`, the code after `if isinstance(p, Dog):
+  return`, `not isinstance(p, (Dog, Cat))`, an `… or …` early exit, a
+  ternary, a comprehension filter, a `case _:` after `case Fish():`, and a
+  `case Dog() | Cat() as an:` capture all kept the whole alias, so the
+  third wave's union member check rejected correct code such as `p.fins`.
+  The alias now expands to its variants before a variant is stripped, a
+  second strip in the same condition starts from the first, an unguarded
+  irrefutable arm narrows later arms to what is left, and an or-pattern
+  capture is the union of what its alternatives match. Programs that read a
+  member some variant still lacks are rejected as before.
+
 ### Third wave — the 2026-09-30 release-readiness review
 
 **Seven ways a check-clean program could crash, closed.** Each of these

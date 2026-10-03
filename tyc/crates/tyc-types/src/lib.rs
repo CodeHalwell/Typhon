@@ -13452,8 +13452,25 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // narrowing the caller held on such a global, exactly as a call in
             // any other statement position does (`eval_stmt_expr`).
             let subject_type = eval_stmt_expr(c, &m.subject);
+            // Types already fully matched by an earlier unguarded arm
+            // (`case Fish():`, `case None:`). A later arm only sees what is
+            // left, so `case _:` after `case Fish():` over `Dog | Cat | Fish`
+            // narrows the subject to `Dog | Cat` (review 2026-10-03 §4.1/§4.7).
+            let mut excluded: Vec<Type> = Vec::new();
             for case in &m.cases {
                 check_pattern_class_fields(c, &case.pattern);
+                let residual = match m.subject.as_ref() {
+                    Expr::Name(_) if !excluded.is_empty() => {
+                        let expanded = expand_sealed_alias_for_narrowing(c, &subject_type);
+                        let mut rest = expanded.clone();
+                        for x in &excluded {
+                            rest = strip_variant(&rest, x);
+                        }
+                        (rest != expanded && !matches!(rest, Type::Unknown)).then_some(rest)
+                    }
+                    _ => None,
+                };
+                let case_subject = residual.clone().unwrap_or_else(|| subject_type.clone());
                 // Enter scope and bind pattern names FIRST so guard expressions
                 // (e.g. `case Circle(radius=r) if r > 0:`) can reference them.
                 // A class pattern narrows the *subject variable* inside the
@@ -13471,12 +13488,13 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 // sound conservative choice there.
                 let narrow_to = match m.subject.as_ref() {
                     Expr::Name(_) => pattern_narrowed_type(&case.pattern)
-                        .filter(|t| c.is_assignable(&subject_type, t)),
+                        .filter(|t| c.is_assignable(&subject_type, t))
+                        .or_else(|| residual.clone()),
                     _ => None,
                 };
                 let snap = narrow_to.as_ref().map(|_| c.env.snapshot());
                 c.env.enter();
-                bind_pattern_names(c, &case.pattern, &subject_type);
+                bind_pattern_names(c, &case.pattern, &case_subject);
                 if let (Expr::Name(subj), Some(t)) = (m.subject.as_ref(), narrow_to) {
                     c.env.narrow(subj.id.as_str(), t);
                 }
@@ -13490,6 +13508,11 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 c.env.leave();
                 if let Some(snap) = snap {
                     c.env.restore(snap);
+                }
+                if case.guard.is_none() {
+                    if let Some(t) = irrefutable_pattern_type(&case.pattern) {
+                        excluded.push(t);
+                    }
                 }
             }
             // Exhaustiveness check: sealed unions and enums (both are
@@ -16739,7 +16762,9 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                                     let replacement = if !negate {
                                         Some(guard_args[0].clone())
                                     } else if head == "TypeIs" {
-                                        Some(strip_variant(&b.narrowed, &guard_args[0]))
+                                        let base = pending_name_narrowing(out, target.id.as_str())
+                                            .unwrap_or_else(|| b.narrowed.clone());
+                                        Some(strip_variant_expanding(c, &base, &guard_args[0]))
                                     } else {
                                         None
                                     };
@@ -16760,8 +16785,13 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                         let new_type = type_from_annotation(&pos_args[1], &c.classes);
                         if let Some(b) = c.env.lookup(target.id.as_str()) {
                             let replacement = if negate {
-                                // Best-effort: strip the type out of the union.
-                                strip_variant(&b.narrowed, &new_type)
+                                // Strip the type out of the union, starting from
+                                // what an earlier operand of the same condition
+                                // already narrowed it to, and seeing through a
+                                // sealed-union alias (review 2026-10-03 §4.1).
+                                let base = pending_name_narrowing(out, target.id.as_str())
+                                    .unwrap_or_else(|| b.narrowed.clone());
+                                strip_variant_expanding(c, &base, &new_type)
                             } else {
                                 // Preserve generic parameters when narrowing
                                 // `Result[T, E]` against `Ok` or `Err`.
@@ -16789,13 +16819,12 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                         // reassignment.
                         if let Some(path) = attr_path_of(&pos_args[0]) {
                             let new_type = type_from_annotation(&pos_args[1], &c.classes);
-                            let current = c
-                                .env
-                                .attr_narrowed(&path)
-                                .cloned()
+                            let current = pending_attr_narrowing(out, &path)
+                                .filter(|_| negate)
+                                .or_else(|| c.env.attr_narrowed(&path).cloned())
                                 .unwrap_or_else(|| infer_expr_readonly(c, &pos_args[0]));
                             let replacement = if negate {
-                                strip_variant(&current, &new_type)
+                                strip_variant_expanding(c, &current, &new_type)
                             } else {
                                 refine_isinstance_target(&current, &new_type)
                             };
@@ -17762,6 +17791,110 @@ fn strip_variant(typ: &Type, variant: &Type) -> Type {
     } else {
         typ.clone()
     }
+}
+
+/// Expand every sealed-union alias in `t` — the alias itself, a union that
+/// contains one (`Pet?`), or an alias nested inside another
+/// (`type Shape = Circle | Poly`, `type Poly = Rect | Tri`) — into the union
+/// of its leaf variant classes.
+///
+/// A sealed union declared with `type Event = A | B` is a `Type::Class("Event")`
+/// until something expands it, and `strip_variant` compares by equality, so
+/// stripping `A` from the unexpanded alias removed nothing: the negative
+/// branch of `isinstance(e, A)` kept the whole union, and the union member
+/// check then rejected `e.b_field` on correct code (review 2026-10-03 §4.1,
+/// a regression from the 09-30 union member check). Parametric aliases expand
+/// to bare variant classes, matching `expand_sealed_union_alias`.
+fn expand_sealed_alias_for_narrowing(c: &Checker, t: &Type) -> Type {
+    fn walk(c: &Checker, t: &Type, depth: usize, out: &mut Vec<Type>) {
+        if depth > 32 {
+            out.push(t.clone());
+            return;
+        }
+        let name = match t {
+            Type::Union(xs) => {
+                for x in xs {
+                    walk(c, x, depth + 1, out);
+                }
+                return;
+            }
+            Type::Class(n) => n.as_str(),
+            Type::Generic(n, _) if !is_builtin_generic_head(n) => n.as_str(),
+            _ => {
+                out.push(t.clone());
+                return;
+            }
+        };
+        // Only aliases whose every variant is a user class expand: a
+        // variant named after a builtin (`type IntTree = int | list[…]`)
+        // would become a nominal `Class("int")`, which is not `int`.
+        let user_class = |v: &String| {
+            !is_builtin_generic_head(v)
+                && !matches!(
+                    v.as_str(),
+                    "int"
+                        | "str"
+                        | "float"
+                        | "bool"
+                        | "bytes"
+                        | "bytearray"
+                        | "complex"
+                        | "object"
+                        | "type"
+                        | "None"
+                )
+        };
+        match c.sealed_unions.get(name) {
+            Some(variants) if !variants.is_empty() && variants.iter().all(user_class) => {
+                for v in variants {
+                    walk(c, &Type::Class(v.clone()), depth + 1, out);
+                }
+            }
+            _ => out.push(t.clone()),
+        }
+    }
+    let mut out = Vec::new();
+    walk(c, t, 0, &mut out);
+    Type::union_of(out)
+}
+
+/// `strip_variant`, seeing through sealed-union aliases. The expanded form
+/// is only used when it actually removes something, so a type the variant
+/// has nothing to do with keeps its original (alias) spelling.
+fn strip_variant_expanding(c: &Checker, typ: &Type, variant: &Type) -> Type {
+    let direct = strip_variant(typ, variant);
+    if direct != *typ {
+        return direct;
+    }
+    let expanded = expand_sealed_alias_for_narrowing(c, typ);
+    if expanded == *typ {
+        return direct;
+    }
+    let stripped = strip_variant(&expanded, &expand_sealed_alias_for_narrowing(c, variant));
+    if stripped == expanded || matches!(stripped, Type::Unknown) {
+        direct
+    } else {
+        stripped
+    }
+}
+
+/// The type an earlier operand of the same condition has already narrowed
+/// `name` to, if any. `not (isinstance(p, A) or isinstance(p, B))` narrows
+/// `p` twice; each step must start from the previous one, or the last
+/// replacement (computed from the declared type) silently undoes the first.
+fn pending_name_narrowing(out: &[Narrowing], name: &str) -> Option<Type> {
+    out.iter()
+        .rev()
+        .find(|n| n.attr_path.is_none() && n.name == name)
+        .map(|n| n.replacement.clone())
+}
+
+/// Attribute-path counterpart of [`pending_name_narrowing`].
+fn pending_attr_narrowing(out: &[Narrowing], path: &str) -> Option<Type> {
+    out.iter()
+        .rev()
+        .find(|n| n.attr_path.as_deref() == Some(path))
+        .map(|n| n.replacement.clone())
 }
 
 fn apply_narrowings(c: &mut Checker, ns: &[Narrowing]) {
@@ -21515,6 +21648,36 @@ fn check_match_exhaustiveness(
 /// `case Action() as a` → `Action`. Returns `None` for patterns that
 /// don't pin down a class (wildcards, captures, literals, sequences,
 /// mappings) — the subject keeps its declared type in those arms.
+/// The type a pattern matches *every* value of, when it does: a class
+/// pattern whose sub-patterns are all bare captures / wildcards
+/// (`Fish()`, `Fish(f)`), `None`, an `as` around one, or an or-pattern of
+/// them. Used to narrow later `match` arms to what is left.
+fn irrefutable_pattern_type(pattern: &Pattern) -> Option<Type> {
+    fn is_bare(p: &Pattern) -> bool {
+        matches!(p, Pattern::MatchAs(a) if a.pattern.is_none())
+    }
+    match pattern {
+        Pattern::MatchClass(mc)
+            if mc.arguments.patterns.iter().all(is_bare)
+                && mc.arguments.keywords.iter().all(|k| is_bare(&k.pattern)) =>
+        {
+            pattern_narrowed_type(pattern)
+        }
+        Pattern::MatchSingleton(s) if matches!(s.value, ruff_python_ast::Singleton::None) => {
+            Some(Type::None)
+        }
+        Pattern::MatchAs(a) => a.pattern.as_deref().and_then(irrefutable_pattern_type),
+        Pattern::MatchOr(or) => {
+            let mut parts = Vec::with_capacity(or.patterns.len());
+            for p in &or.patterns {
+                parts.push(irrefutable_pattern_type(p)?);
+            }
+            Some(Type::union_of(parts))
+        }
+        _ => None,
+    }
+}
+
 fn pattern_narrowed_type(pattern: &Pattern) -> Option<Type> {
     match pattern {
         Pattern::MatchClass(mc) => match mc.cls.as_ref() {
@@ -22239,6 +22402,24 @@ fn collect_pattern_capture_names(p: &Pattern, out: &mut Vec<String>) {
 /// not a union of candidates — a subclass pattern over a base-typed subject —
 /// and to the subject itself when the pattern says nothing about the type.
 fn as_capture_type(c: &Checker, subject: &Type, inner: &Pattern) -> Type {
+    // `case Dog() | Cat() as an:` captures whatever any alternative matched,
+    // not the whole subject (review 2026-10-03 §4.1).
+    if let Pattern::MatchOr(or) = inner {
+        return Type::union_of(
+            or.patterns
+                .iter()
+                .map(|p| as_capture_type(c, subject, p))
+                .collect(),
+        );
+    }
+    // A sealed-union alias subject is a single `Class("Pet")` that every
+    // variant is assignable to; expand it so the variants can be filtered.
+    let expanded = expand_sealed_alias_for_narrowing(c, subject);
+    let subject = if matches!(inner, Pattern::MatchClass(_)) {
+        &expanded
+    } else {
+        subject
+    };
     let head = match inner {
         Pattern::MatchClass(mc) => match mc.cls.as_ref() {
             Expr::Name(n) => n.id.as_str().to_owned(),
@@ -37966,3 +38147,6 @@ def main() -> None:
         }
     }
 }
+
+#[cfg(test)]
+mod flow_tests;
