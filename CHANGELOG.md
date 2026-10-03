@@ -46,6 +46,25 @@ review deferred; the third — the 2026-09-30 release-readiness review
   line-numbered `__typhon_*` temporaries aside; docstring whitespace is
   tolerated only when `ruff format` ran). The same guard covers the
   `[emit] format = true` pass over emitted Python in `tyc build`.
+- **Inline `?` keeps Python's evaluation order (W7-04).** The lift that
+  lowers an inline `?` moved its operand above the whole statement, ahead of
+  everything Python evaluates before it — on both execution surfaces, so the
+  differential gate could not see it. `return Ok(Node(start=self.pos,
+  text=self.word()?))` recorded `start` *after* `word()` advanced it;
+  `combine(first(), second()?)` ran `second` first and skipped `first`
+  entirely when `second` returned `Err`; `[side("a"), counter("b")?,
+  side("c")]` ran b, a, c; `d[k()?] = v()?` evaluated the index before the
+  value. A new step hoists, in evaluation order, every expression the
+  statement evaluates before a propagated operand into a `__typhon_ev_N__`
+  temporary — earlier arguments and keyword arguments, earlier display
+  elements, left operands, a computed call receiver (`self.peek().m(…)`),
+  and an assignment's value ahead of a target that holds a `?`. Literals,
+  names, lambdas and dotted-name receivers stay in place; a statement whose
+  operand sits under `and`/`or`, a ternary, a lambda, a comprehension or an
+  f-string is left as before. Two residual differences need a callee that
+  rebinds the exact name or attribute being read: a plain-name or
+  dotted-name receiver is read after the operand, and an augmented
+  assignment (`self.pos += self.advance()?`) loads its target after it.
 
 ### Third wave — the 2026-09-30 release-readiness review
 

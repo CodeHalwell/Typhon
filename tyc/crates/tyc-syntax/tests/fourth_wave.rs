@@ -116,3 +116,131 @@ fn sugar_inside_a_backslash_continued_string_is_left_alone() {
         );
     }
 }
+
+// ── W7-04: inline `?` keeps Python evaluation order ──────────────────────────
+
+use tyc_syntax::preprocess::expand_inline_question_ops;
+
+/// Line index of the first line containing `needle`.
+fn line_of(text: &str, needle: &str) -> usize {
+    text.lines()
+        .position(|l| l.contains(needle))
+        .unwrap_or_else(|| panic!("`{needle}` not found in:\n{text}"))
+}
+
+#[test]
+fn earlier_keyword_argument_is_hoisted_before_the_lifted_operand() {
+    let src = "def node(self) -> Result[Node, str]:\n    return Ok(Node(start=self.pos, text=self.word()?))\n";
+    let out = expand_inline_question_ops(src);
+    let ev = line_of(&out, "__typhon_ev_0__ = self.pos");
+    let qi = line_of(&out, "__typhon_qi_0__ = self.word()");
+    assert!(ev < qi, "self.pos must be read before word() runs:\n{out}");
+    assert!(out.contains("start=__typhon_ev_0__"), "{out}");
+}
+
+#[test]
+fn earlier_positional_argument_and_list_element_are_hoisted() {
+    let out = expand_inline_question_ops(
+        "def run() -> Result[int, str]:\n    return Ok(combine(first(), second()?))\n",
+    );
+    assert!(
+        line_of(&out, "= first()") < line_of(&out, "= second()"),
+        "{out}"
+    );
+    let out = expand_inline_question_ops(
+        "def f() -> Result[int, str]:\n    let xs: list[str] = [side(\"a\"), counter(\"b\")?, side(\"c\")]\n    return Ok(0)\n",
+    );
+    assert!(
+        line_of(&out, "= side(\"a\")") < line_of(&out, "= counter(\"b\")"),
+        "{out}"
+    );
+    // The element after the operand stays where it is (evaluated after it).
+    assert!(out.contains("side(\"c\")]"), "{out}");
+}
+
+#[test]
+fn assignment_value_is_hoisted_before_a_target_operand() {
+    // Python evaluates the right-hand side before the subscript target.
+    let out = expand_inline_question_ops(
+        "def f(d: dict[str, int]) -> Result[int, str]:\n    d[k()?] = v()?\n    return Ok(0)\n",
+    );
+    assert!(
+        line_of(&out, "__typhon_ev_0__ = v()?") < line_of(&out, "= k()"),
+        "{out}"
+    );
+    assert!(out.contains("] = __typhon_ev_0__"), "{out}");
+}
+
+#[test]
+fn trivial_siblings_and_dotted_receivers_are_left_alone() {
+    for src in [
+        "def f(a: int) -> Result[int, str]:\n    return Ok(add(a, parse(s)?))\n",
+        "def f(out: list[int]) -> Result[int, str]:\n    out.append(parse(s)?)\n    return Ok(0)\n",
+        "def f(self) -> Result[int, str]:\n    self.items.append(parse(s)?)\n    return Ok(0)\n",
+        "def f() -> Result[int, str]:\n    return Ok(g([], {}, 1, \"s\", None, lambda x: x, parse(s)?))\n",
+        "def f() -> Result[int, str]:\n    let x: int = parse(s)?\n    return Ok(x)\n",
+    ] {
+        let out = expand_inline_question_ops(src);
+        assert!(
+            !out.contains("__typhon_ev_"),
+            "nothing needed hoisting:\n{src}\n---\n{out}"
+        );
+    }
+}
+
+#[test]
+fn unmodelled_shapes_are_left_exactly_as_before() {
+    // An operand under a conditional is not reordered (the checker rejects
+    // the placement; the lowering must not invent an order for it).
+    let src = "def f(c: bool) -> Result[int, str]:\n    return Ok(g(h(), parse(s)? if c else 0))\n";
+    let out = expand_inline_question_ops(src);
+    assert!(!out.contains("__typhon_ev_"), "{out}");
+}
+
+#[test]
+fn multi_line_statement_hoists_a_sibling_from_an_earlier_line() {
+    let src = concat!(
+        "def node(self) -> Result[Node, str]:\n",
+        "    return Ok(Node(\n",
+        "        start=self.pos,\n",
+        "        text=self.word()?,\n",
+        "    ))\n",
+    );
+    let out = expand_inline_question_ops(src);
+    assert!(
+        line_of(&out, "__typhon_ev_0__ = self.pos") < line_of(&out, "= self.word()"),
+        "{out}"
+    );
+    assert!(parses(&lower(src)), "{}", lower(src));
+}
+
+#[test]
+fn hoisting_keeps_the_line_map_on_the_statement() {
+    // Every emitted line still maps to a line of the statement it came from.
+    let src = "def f() -> Result[int, str]:\n    return Ok(combine(first(), second()?))\n";
+    let (out, map) = tyc_syntax::preprocess::expand_inline_question_ops_mapped(src);
+    for (i, line) in out.lines().enumerate() {
+        if line.contains("first()") || line.contains("second()") || line.contains("combine") {
+            assert_eq!(map[i], 1, "line {i} `{line}` maps to {}", map[i]);
+        }
+    }
+}
+
+#[test]
+fn an_operand_before_a_hoisted_sibling_is_hoisted_too() {
+    // `f(a()?, b(), c()?)`: hoists land above every lift, so `a()` has to be
+    // hoisted with `b()` or it would run after it.
+    let out = expand_inline_question_ops(
+        "def f() -> Result[int, str]:\n    return Ok(add3(a()?, b(), c()?))\n",
+    );
+    assert!(
+        line_of(&out, "= a()?") < line_of(&out, "= b()"),
+        "a() must stay before b():\n{out}"
+    );
+    assert!(line_of(&out, "= b()") < line_of(&out, "= c()"), "{out}");
+    // Two operands with nothing between them keep the plain in-place lift.
+    let out = expand_inline_question_ops(
+        "def f() -> Result[int, str]:\n    return Ok(add(parse(s)?, parse(t)?))\n",
+    );
+    assert!(!out.contains("__typhon_ev_"), "{out}");
+}

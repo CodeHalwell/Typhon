@@ -8,6 +8,7 @@ description = "Typhon lexer and parser — vendored Ruff fork with Typhon-specif
 [dependencies]
 ruff_python_ast = { workspace = true }
 ruff_python_parser = { workspace = true }
+ruff_text_size = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

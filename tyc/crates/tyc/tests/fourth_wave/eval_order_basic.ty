@@ -1,0 +1,66 @@
+class Parser:
+    src: str
+    pos: int = 0
+
+class Node:
+    start: int
+    text: str
+
+impl Parser:
+    def word(self) -> Result[str, str]:
+        let b: int = self.pos
+        while self.pos < len(self.src) and self.src[self.pos] != " ":
+            self.pos += 1
+        return Ok(self.src[b:self.pos])
+
+    def node(self) -> Result[Node, str]:
+        return Ok(Node(start=self.pos, text=self.word()?))
+
+def first() -> int:
+    print("first")
+    return 1
+
+def second(fail: bool) -> Result[int, str]:
+    print("second")
+    if fail:
+        return Err("boom")
+    return Ok(2)
+
+def combine(a: int, b: int) -> int:
+    return a + b
+
+def run(fail: bool) -> Result[int, str]:
+    return Ok(combine(first(), second(fail)?))
+
+def side(tag: str) -> str:
+    print(tag)
+    return tag
+
+def counter(tag: str) -> Result[str, str]:
+    print(tag)
+    return Ok(tag)
+
+def lst() -> Result[list[str], str]:
+    let xs: list[str] = [side("a"), counter("b")?, side("c")]
+    return Ok(xs)
+
+def k() -> Result[str, str]:
+    print("k")
+    return Ok("key")
+
+def v() -> Result[int, str]:
+    print("v")
+    return Ok(1)
+
+def store(d: dict[str, int]) -> Result[int, str]:
+    d[k()?] = v()?
+    return Ok(len(d))
+
+def main() -> None:
+    print(Parser(src="hello world").node())
+    print(run(False))
+    print(run(True))
+    print(lst())
+    print(store({}))
+
+main()

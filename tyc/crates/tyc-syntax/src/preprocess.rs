@@ -32,6 +32,8 @@
 use crate::lexer::TyphonKeyword;
 use crate::lexmask::{scan_line, scan_line_kinds, ByteKind, LexMask, StringMode};
 
+mod eval_order;
+
 /// One stripped keyword and the 0-based line index in the source where it
 /// appeared.
 #[derive(Debug, Clone)]
@@ -6764,7 +6766,12 @@ pub fn expand_inline_question_ops_mapped(source: &str) -> (String, Vec<usize>) {
     // its guard at the statement's own indentation, which is only right once
     // each statement owns a line.
     let (split, split_map) = expand_question_one_liners_mapped(source);
-    let (text, map) = expand_inline_question_ops_split(&split);
+    // The lift below moves each propagated operand above its statement;
+    // first hoist whatever the statement evaluates *before* that operand,
+    // in Python evaluation order, so the lift cannot reorder it (W7-04).
+    let (ordered, order_map) = eval_order::hoist_for_evaluation_order_mapped(&split);
+    let split_map = compose_line_maps(&order_map, &split_map);
+    let (text, map) = expand_inline_question_ops_split(&ordered);
     (text, compose_line_maps(&map, &split_map))
 }
 
