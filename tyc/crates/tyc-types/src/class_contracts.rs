@@ -58,3 +58,149 @@ pub(super) fn enum_key_compatible(c: &Checker, key: &Type, index: &Type) -> bool
             _ => false,
         }
 }
+
+pub(super) fn method_accepts_contract(expected: &MethodSig, actual: &MethodSig) -> bool {
+    let e = &expected.arity_info;
+    let a = &actual.arity_info;
+    if a.min_positional > e.min_positional {
+        return false;
+    }
+    match (e.max_positional, a.max_positional) {
+        (None, Some(_)) => return false,
+        (Some(e), Some(a)) if a < e => return false,
+        _ => {}
+    }
+    if e.has_kwarg && !a.has_kwarg {
+        return false;
+    }
+    for (i, name) in e.param_names.iter().enumerate() {
+        if i >= e.posonly_count && (i < a.posonly_count || a.param_names.get(i) != Some(name)) {
+            return false;
+        }
+    }
+    for name in &e.kwonly_names {
+        if !a.kwonly_names.contains(name)
+            && !a
+                .param_names
+                .iter()
+                .skip(a.posonly_count)
+                .any(|n| n == name)
+            && !a.has_kwarg
+        {
+            return false;
+        }
+    }
+    if a.kwonly_required
+        .iter()
+        .any(|name| !e.kwonly_required.contains(name))
+    {
+        return false;
+    }
+    true
+}
+
+pub(super) fn property(c: &Checker, class: &str, field: &str) -> Option<(Type, Option<Type>)> {
+    fn own(c: &Checker, class: &str, field: &str) -> (Option<Type>, Option<Type>) {
+        struct Scan<'a, 'c> {
+            c: &'a Checker<'c>,
+            class: &'a str,
+            field: &'a str,
+            getter: Option<Type>,
+            setter: Option<Type>,
+        }
+        impl<'s> Visitor<'s> for Scan<'_, '_> {
+            fn visit_stmt(&mut self, stmt: &'s Stmt) {
+                if let Stmt::ClassDef(cd) = stmt {
+                    let real = cd
+                        .name
+                        .as_str()
+                        .strip_prefix("__typhon_impl_")
+                        .unwrap_or(cd.name.as_str());
+                    if real == self.class {
+                        let tps = self
+                            .c
+                            .class_type_params
+                            .get(self.class)
+                            .cloned()
+                            .unwrap_or_default();
+                        for stmt in &cd.body {
+                            if let Stmt::FunctionDef(f) = stmt {
+                                if f.name.as_str() != self.field {
+                                    continue;
+                                }
+                                if is_property_getter(f) {
+                                    self.getter = Some(
+                                        f.returns
+                                            .as_deref()
+                                            .map(|r| {
+                                                type_from_annotation_with_params(
+                                                    r,
+                                                    &self.c.classes,
+                                                    &tps,
+                                                )
+                                            })
+                                            .unwrap_or(Type::Unknown),
+                                    );
+                                } else if is_property_setter(f) {
+                                    self.setter = Some(
+                                        f.parameters
+                                            .posonlyargs
+                                            .iter()
+                                            .chain(&f.parameters.args)
+                                            .nth(1)
+                                            .and_then(|p| p.parameter.annotation.as_deref())
+                                            .map(|r| {
+                                                type_from_annotation_with_params(
+                                                    r,
+                                                    &self.c.classes,
+                                                    &tps,
+                                                )
+                                            })
+                                            .unwrap_or(Type::Unknown),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                visitor::walk_stmt(self, stmt);
+            }
+        }
+        let mut scan = Scan {
+            c,
+            class,
+            field,
+            getter: None,
+            setter: None,
+        };
+        if let Some(module) = c.module {
+            for stmt in &module.body {
+                scan.visit_stmt(stmt);
+            }
+        }
+        (scan.getter, scan.setter)
+    }
+    fn resolve(
+        c: &Checker,
+        class: &str,
+        field: &str,
+        seen: &mut HashSet<String>,
+    ) -> Option<(Type, Option<Type>)> {
+        if !seen.insert(class.into()) {
+            return None;
+        }
+        let (getter, setter) = own(c, class, field);
+        if let Some(getter) = getter {
+            return Some((getter, setter));
+        }
+        if let Some(shape) = c.class_shapes.get(class) {
+            for base in &shape.bases {
+                if let Some((getter, inherited_setter)) = resolve(c, base, field, seen) {
+                    return Some((getter, setter.or(inherited_setter)));
+                }
+            }
+        }
+        None
+    }
+    resolve(c, class, field, &mut HashSet::new())
+}

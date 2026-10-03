@@ -4990,8 +4990,16 @@ impl<'a> Checker<'a> {
             } else {
                 substitute_typevars(&iface_sig.return_type, iface_subst)
             };
+            if iface_sig.is_property {
+                if let Some((getter, _)) = class_contracts::property(self, cls_name, m) {
+                    if !is_self_ref(&iface_ret) && !self.is_assignable(&iface_ret, &getter) {
+                        return false;
+                    }
+                    continue;
+                }
+            }
             match self.find_method(cls_name, m) {
-                Some(cls_sig) if cls_sig.arity == iface_sig.arity => {
+                Some(cls_sig) if class_contracts::method_accepts_contract(iface_sig, cls_sig) => {
                     // `async def` is part of the contract in both directions: a
                     // caller `await`s an interface coroutine method (an `int`
                     // from a sync implementation crashes) and calls a sync one
@@ -5056,6 +5064,12 @@ impl<'a> Checker<'a> {
                 _ => return false,
             }
         }
+        if !iface_shape.fields.is_empty()
+            && (self.frozen_classes.contains(cls_name)
+                || class_contracts::dataclass_option(self, cls_name, "frozen") == Some(true))
+        {
+            return false;
+        }
         for (f, iface_type_raw) in &iface_shape.fields {
             let iface_type = if iface_subst.is_empty() {
                 iface_type_raw.clone()
@@ -5063,17 +5077,18 @@ impl<'a> Checker<'a> {
                 substitute_typevars(iface_type_raw, iface_subst)
             };
             match self.find_field(cls_name, f) {
-                Some(cls_type) if self.is_assignable(&iface_type, cls_type) => {}
+                Some(cls_type)
+                    if self.is_assignable(&iface_type, cls_type)
+                        && self.is_assignable(cls_type, &iface_type) => {}
                 Some(_) => return false, // field present but wrong type
-                // A `@property` of the right type satisfies a field — reading
-                // it yields the value. A plain zero-argument *method* does not:
-                // `obj.f` would be a bound method where the interface promised
-                // the value itself.
-                None if self.find_method(cls_name, f).is_some_and(|s| {
-                    s.is_property
-                        && (s.return_type == Type::Unknown
-                            || self.is_assignable(&iface_type, &s.return_type))
-                }) => {}
+                None if class_contracts::property(self, cls_name, f).is_some_and(
+                    |(getter, setter)| {
+                        setter.is_some_and(|setter| {
+                            self.is_assignable(&iface_type, &getter)
+                                && self.is_assignable(&setter, &iface_type)
+                        })
+                    },
+                ) => {}
                 None => return false,
             }
         }
@@ -25603,7 +25618,8 @@ interface Shape:
     def area(self) -> float
 
 interface Named:
-    name: str
+    @property
+    def name(self) -> str
 
 class Async:
     n: int
@@ -33548,7 +33564,7 @@ class Dog:
     name: str
 
 class Person:
-    pet: Dog
+    pet: Pet
 
 let p: Owner = Person(pet=Dog(name=\"Fido\"))
 ";
@@ -33562,10 +33578,8 @@ let p: Owner = Person(pet=Dog(name=\"Fido\"))
 
     #[test]
     fn interface_field_satisfied_by_property_not_by_plain_method() {
-        // Reading `d.name` through `Named` must yield the `str` the interface
-        // promises. A `@property` does; a plain zero-argument method yields a
-        // bound method instead (so `d.name.upper()` raises AttributeError and
-        // `print(d.name)` prints `<bound method …>`), and no longer conforms.
+        // A mutable field contract requires both reads and writes. Neither a
+        // plain method nor a getter-only property supplies that contract.
         let plain = "\
 interface Named:
     name: str
@@ -33593,8 +33607,8 @@ let d: Named = Dog()
 ";
         let d = check(property);
         assert!(
-            !d.has_errors(),
-            "a @property of the right type satisfies the field; errors: {:?}",
+            d.has_errors(),
+            "a read-only property cannot satisfy a writable field; errors: {:?}",
             d.errors()
         );
     }
@@ -39054,6 +39068,23 @@ def main() -> None:
             assert!(!check(src).errors().is_empty(), "accepted: {src}");
         }
         let src="def f(g: dict[str, int], xs: list[int]) -> None:\n    g[\"k\"] = 8\n    xs[0] = 1\n    xs[:] = [1, 2]\n    g.update({\"ok\": 1})\n    g.update(ok=1)\n    g.update([(\"ok\", 1)])\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn w2_15_mutable_interface_contracts() {
+        for src in [
+            "class Animal:\n    tag: str\nclass Dog(Animal):\n    breed: str\ninterface Owner:\n    pet: Animal\nclass Kennel:\n    pet: Dog\ndef f(k: Kennel) -> Owner:\n    return k\n",
+            "interface Owner:\n    pet: int\nclass Kennel frozen:\n    pet: int\ndef f(k: Kennel) -> Owner:\n    return k\n",
+            "interface Owner:\n    pet: int\nclass Kennel:\n    value: int\nimpl Kennel:\n    @property\n    def pet(self) -> int:\n        return self.value\ndef f(k: Kennel) -> Owner:\n    return k\n",
+            "interface Sized:\n    def size(self, item: str) -> int: ...\nclass Bag:\n    value: int\nimpl Bag:\n    def size(self, thing: str) -> int:\n        return len(thing)\ndef f(b: Bag) -> Sized:\n    return b\n",
+        ] { assert!(!check(src).errors().is_empty(), "accepted: {src}"); }
+        let src="interface Sized:\n    def size(self, item: str) -> int: ...\nclass Bag:\n    value: int\nimpl Bag:\n    def size(self, item: str, suffix: str = \"\") -> int:\n        return len(item + suffix)\ndef f(b: Bag) -> Sized:\n    return b\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+
+    #[test]
+    fn w2_15_writable_property_and_readonly_interface_controls() {
+        let src="interface Owner:\n    pet: int\nclass Kennel:\n    value: int\nimpl Kennel:\n    @property\n    def pet(self) -> int:\n        return self.value\n    @pet.setter\n    def pet(self, value: int) -> None:\n        self.value = value\ndef f(k: Kennel) -> Owner:\n    return k\ninterface Readonly:\n    @property\n    def value(self) -> int: ...\ndef g(k: Kennel) -> Readonly:\n    return k\n";
         assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
     }
 }
