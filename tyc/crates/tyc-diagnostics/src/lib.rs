@@ -1736,10 +1736,11 @@ pub enum TycError {
         span: SourceSpan,
     },
 
-    /// A `comptime let` binding whose name matches a secret-suffix heuristic
-    /// (`*KEY`, `*TOKEN`, `*PASSWORD`, `*SECRET`, `*PASS`, `*PWD`) inlines its
-    /// env value at build time, so the emitted Python contains the raw secret
-    /// as a string literal. Read the env var at runtime instead.
+    /// A `comptime let` binding whose name matches the shared secret-keyword
+    /// table (`tyc_analyse::SECRET_NAME_KEYWORDS`, longest-first with word
+    /// boundaries) inlines its env value at build time, so the emitted
+    /// Python contains the raw secret as a string literal. Read the env var
+    /// at runtime instead.
     #[error("comptime binding `{name}` inlines a secret-shaped value at build time")]
     #[diagnostic(
         severity(Warning),
@@ -1749,11 +1750,11 @@ pub enum TycError {
     )]
     ContainsSecretLiteral { name: String, env_key: String },
 
-    /// A plain `let` / module-level binding whose name matches the
-    /// secret-suffix heuristic (`*KEY`, `*TOKEN`, `*PASSWORD`, `*SECRET`,
-    /// `*PWD`, `*API_KEY`) is initialised from a raw string literal
-    /// instead of an environment lookup. Committing such a literal hard-
-    /// codes a credential into the source tree.
+    /// A plain `let` / module-level binding whose name matches the shared
+    /// secret-keyword table (`tyc_analyse::SECRET_NAME_KEYWORDS`,
+    /// longest-first with word boundaries) is initialised from a raw string
+    /// literal instead of an environment lookup. Committing such a literal
+    /// hard-codes a credential into the source tree.
     #[error("binding `{name}` looks like a credential but is initialised from a string literal")]
     #[diagnostic(
         severity(Warning),
