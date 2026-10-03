@@ -23,6 +23,7 @@
 mod builtins;
 mod callables;
 mod frozen_context;
+mod operators;
 #[cfg(debug_assertions)]
 mod unchecked;
 
@@ -13460,8 +13461,26 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // the same operand rules as `x = x op y`; mutable containers have
             // looser in-place semantics (`list += any_iterable`) so we stay
             // permissive there to avoid false positives.
+            for (side, ty) in [(a.target.as_ref(), &l), (a.value.as_ref(), &r)] {
+                if ty.is_nullable() {
+                    report_nullable_operand(c, side, ty);
+                }
+            }
             let l_stripped = l.strip_none();
             let r_stripped = r.strip_none();
+            let result = operators::augmented_result(c, &l_stripped, &r_stripped, a.op, &a.value);
+            let target_type = match a.target.as_ref() {
+                Expr::Name(n) => c
+                    .env
+                    .lookup(n.id.as_str())
+                    .map(|b| b.declared.clone())
+                    .unwrap_or_else(|| l.clone()),
+                _ => l.clone(),
+            };
+            if !c.is_assignable(&target_type, &result) {
+                let span = (a.range.start().to_usize(), a.range.end().to_usize());
+                c.mismatch(&target_type, &result, span);
+            }
             let scalar_target = matches!(
                 l_stripped,
                 Type::Int | Type::Float | Type::Bool | Type::Str | Type::Bytes
@@ -13470,17 +13489,6 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 if let Some(op_str) = arithmetic_op_str(a.op) {
                     let span = (a.range.start().to_usize(), a.range.end().to_usize());
                     if !operator_operands_compatible(a.op, &l_stripped, &r_stripped) {
-                        c.operator_type_mismatch(op_str, &l_stripped, &r_stripped, span);
-                    } else if matches!(l_stripped, Type::Int)
-                        && (matches!(a.op, ruff_python_ast::Operator::Div)
-                            || matches!(r_stripped, Type::Float))
-                    {
-                        // Numeric widening: `x: int; x += 0.5` (or `x /= 2`)
-                        // makes x a float at runtime, which is not assignable
-                        // back to the int target — exactly like `x = x + 0.5`.
-                        // Catches int fields and dict/list[int] elements too
-                        // (their inferred element type is `int`). Same
-                        // diagnostic the reassignment path uses.
                         c.operator_type_mismatch(op_str, &l_stripped, &r_stripped, span);
                     }
                 }
@@ -18736,6 +18744,12 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                             return sig.return_type.clone();
                         }
                     }
+                }
+            }
+            if matches!(b.op, Operator::Pow) {
+                if let Some(result) = operators::power_result(c, &l_stripped, &r_stripped, &b.right)
+                {
+                    return result;
                 }
             }
             // Newtype arithmetic carve-out. R2-12: `newtype LogIndex = int`
@@ -38759,5 +38773,18 @@ def main() -> None:
             "from typing import Awaitable, Callable\ndef deco(f: Callable[[], int]) -> Callable[[], Awaitable[int]]:\n    async def wrapper() -> int:\n        return f()\n    return wrapper\n@deco\ndef fetch() -> int:\n    return 1\nasync def f() -> int:\n    return await fetch()\n",
             "async def fetch() -> int:\n    return 1\nasync def f() -> int:\n    let stored = fetch()\n    return await stored\n",
         ] { assert!(check(src).errors().is_empty(), "{src}: {:?}",check(src).errors()); }
+    }
+    #[test]
+    fn w2_08_power_and_augmented_assignment() {
+        for src in [
+            "let n: int = 2 ** -1\n",
+            "def f(exponent: int) -> int:\n    return 2 ** exponent\n",
+            "newtype Count = int\ndef f(n: Count, exponent: int) -> Count:\n    return n ** exponent\n",
+            "def f() -> bool:\n    mut b: bool = True\n    b += 1\n    return b\n",
+            "def f(p: float?) -> float:\n    mut t: float = 1.0\n    t += p\n    return t\n",
+            "def f(exponent: int) -> int:\n    mut n: int = 2\n    n **= exponent\n    return n\n",
+        ] { assert!(!check(src).errors().is_empty(), "accepted: {src}"); }
+        let src="newtype Count = int\ndef f(n: Count) -> Count:\n    return n ** 2\ndef g(exponent: int) -> int | float:\n    return 2 ** exponent\ndef h() -> bool:\n    mut b: bool = True\n    b &= False\n    return b\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
     }
 }
