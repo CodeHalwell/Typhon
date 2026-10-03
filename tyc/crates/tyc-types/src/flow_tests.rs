@@ -1126,3 +1126,50 @@ def f() -> str:
         ));
     }
 }
+
+// ── W1-11: nullable `type` aliases ────────────────────────────────────────
+
+#[test]
+fn w1_11_a_nullable_alias_is_nullable() {
+    for alias in ["str | None", "str?"] {
+        assert_rejected(&format!(
+            "type OptStr = {alias}\ndef shout(s: OptStr) -> str:\n    return s.upper()\n"
+        ));
+    }
+    assert_rejected(
+        r#"
+class User:
+    name: str
+type MaybeUser = User | None
+def find() -> MaybeUser:
+    return None
+def m() -> str:
+    return find().name
+"#,
+    );
+}
+
+#[test]
+fn w1_11_a_nullable_alias_narrows() {
+    assert_clean(
+        r#"
+type OptStr = str | None
+class User:
+    name: str
+    nick: OptStr
+type MaybeUser = User | None
+def shout(s: OptStr) -> str:
+    if s is None:
+        return ""
+    return s.upper()
+def n(u: MaybeUser) -> str:
+    if u is None:
+        return "?"
+    if u.nick is not None:
+        return u.nick
+    return u.name
+def keep(s: OptStr) -> OptStr:
+    return s
+"#,
+    );
+}

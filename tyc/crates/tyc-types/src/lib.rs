@@ -4538,6 +4538,98 @@ impl<'a> Checker<'a> {
         self.unwrap_alias_inner(ty, 0)
     }
 
+    /// Replace every `type` alias whose right-hand side is nullable
+    /// (`type OptStr = str | None`, `= str?`, `= User | None`) by that
+    /// right-hand side, inside `ty`. Such an alias was an opaque nominal
+    /// `Class("OptStr")` to every nullable check and narrowing, so
+    /// `s.upper()` on an `OptStr` was accepted and `if s is None: return`
+    /// could not narrow it (review 2026-10-03 §4.8, W1-11). Other aliases
+    /// keep their name.
+    fn expand_nullable_aliases(&self, ty: &Type) -> Type {
+        self.expand_nullable_aliases_inner(ty, 0)
+    }
+
+    fn expand_nullable_aliases_inner(&self, ty: &Type, depth: u8) -> Type {
+        if depth >= 8 {
+            return ty.clone();
+        }
+        match ty {
+            Type::Class(name) => match self.type_aliases.get(name.as_str()) {
+                Some((params, rhs)) if params.is_empty() => {
+                    let rhs = self.unwrap_alias(rhs);
+                    if rhs.is_nullable() {
+                        self.expand_nullable_aliases_inner(&rhs, depth + 1)
+                    } else {
+                        ty.clone()
+                    }
+                }
+                _ => ty.clone(),
+            },
+            Type::Union(xs) => Type::union_of(
+                xs.iter()
+                    .map(|x| self.expand_nullable_aliases_inner(x, depth + 1))
+                    .collect(),
+            ),
+            Type::Generic(h, args) => Type::Generic(
+                h.clone(),
+                args.iter()
+                    .map(|a| self.expand_nullable_aliases_inner(a, depth + 1))
+                    .collect(),
+            ),
+            Type::Function {
+                params,
+                ret,
+                variadic,
+                min_params,
+            } => Type::Function {
+                params: params
+                    .iter()
+                    .map(|p| self.expand_nullable_aliases_inner(p, depth + 1))
+                    .collect(),
+                ret: Box::new(self.expand_nullable_aliases_inner(ret, depth + 1)),
+                variadic: *variadic,
+                min_params: *min_params,
+            },
+            _ => ty.clone(),
+        }
+    }
+
+    /// Apply [`expand_nullable_aliases`](Self::expand_nullable_aliases) to
+    /// every signature and class shape collected for this module.
+    fn expand_nullable_aliases_in_shapes(&mut self) {
+        let has_nullable_alias = self
+            .type_aliases
+            .iter()
+            .any(|(_, (params, rhs))| params.is_empty() && self.unwrap_alias(rhs).is_nullable());
+        if !has_nullable_alias {
+            return;
+        }
+        let sigs: Vec<(String, Type)> = self
+            .function_signatures
+            .iter()
+            .map(|(k, v)| (k.clone(), self.expand_nullable_aliases(v)))
+            .collect();
+        self.function_signatures.extend(sigs);
+        let shapes: Vec<(String, InterfaceShape)> = self
+            .class_shapes
+            .iter()
+            .map(|(k, shape)| {
+                let mut s = shape.clone();
+                for t in s.fields.values_mut() {
+                    *t = self.expand_nullable_aliases(t);
+                }
+                for m in s.methods.values_mut() {
+                    m.return_type = self.expand_nullable_aliases(&m.return_type);
+                    for p in m.param_types.iter_mut() {
+                        *p = self.expand_nullable_aliases(p);
+                    }
+                }
+                (k.clone(), s)
+            })
+            .collect();
+        self.class_shapes.extend(shapes);
+    }
+
     /// Walk `ty` and rewrite every `Class("alias.X")` whose prefix
     /// resolves to a `Type::Module(canonical)` binding in the env into
     /// `Class("canonical.X")`. Pure if no aliases match. The recursion
@@ -6837,6 +6929,7 @@ pub fn check_module_with_imports(
     // read-only, hence covariant).
     populate_frozen_classes(&mut c, &module.body, &frozen_starts);
     collect_classes_and_functions(&mut c, &module.body);
+    c.expand_nullable_aliases_in_shapes();
     check_override_compatibility(&mut c, &module.body);
     check_frozen_inheritance(&mut c, &module.body);
     // Cross-function field-init audit pre-pass: identify helper
@@ -13143,7 +13236,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             let mut ann_type = if bare_final {
                 Type::Unknown
             } else {
-                type_from_annotation(&a.annotation, &c.classes)
+                c.expand_nullable_aliases(&type_from_annotation(&a.annotation, &c.classes))
             };
             let mut init_type: Option<Type> = None;
             if let Some(value) = &a.value {
@@ -13518,11 +13611,16 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         .unwrap_or(Type::Unknown)
                 })
                 .collect();
+            let params: Vec<Type> = params
+                .iter()
+                .map(|p| c.expand_nullable_aliases(p))
+                .collect();
             let ret = f
                 .returns
                 .as_deref()
                 .map(|r| type_from_annotation_with_params(r, &classes, &tps))
                 .unwrap_or(Type::Unknown);
+            let ret = c.expand_nullable_aliases(&ret);
             // An `async def` value is a coroutine-returning callable (see the
             // module-level signature pass for the same wrapping).
             let ret = if f.is_async {
@@ -14678,7 +14776,9 @@ fn check_function(
     let (name, name_span_offset, name_span_len) = name_info;
     let classes = c.classes.clone();
     let ret_type = match returns {
-        Some(r) => type_from_annotation_with_params(r, &classes, type_params),
+        Some(r) => {
+            c.expand_nullable_aliases(&type_from_annotation_with_params(r, &classes, type_params))
+        }
         None => Type::Unknown,
     };
 
@@ -14844,7 +14944,11 @@ fn check_function(
         let is_self_receiver = positional_first_name.as_deref() == Some(param_name)
             && (param_name == "self" || param_name == "cls");
         let t = match &pwd.parameter.annotation {
-            Some(ann) => type_from_annotation_with_params(ann, &classes, type_params),
+            Some(ann) => c.expand_nullable_aliases(&type_from_annotation_with_params(
+                ann,
+                &classes,
+                type_params,
+            )),
             None => {
                 if is_self_receiver {
                     // `extend BUILTIN:` is lowered to a

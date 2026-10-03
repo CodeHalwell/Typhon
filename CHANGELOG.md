@@ -97,6 +97,13 @@ review deferred; the third — the 2026-09-30 release-readiness review
   (calling it, or a nested `def` that calls it); once it escapes (stored,
   passed, returned, or a nested class method) every call still resets it,
   as before.
+- **A `type` alias over a nullable type is nullable.** With
+  `type OptStr = str | None` (or `= str?`, `= User | None`), a parameter,
+  annotated binding, field or return typed `OptStr` was an opaque name to
+  every nullable check: `s.upper()` was accepted and crashes on `None`, and
+  `if s is None: return ""` could not narrow `s`. Such aliases now expand to
+  their right-hand side; messages show `str | None` where they showed
+  `OptStr`.
 
 ### Third wave — the 2026-09-30 release-readiness review
 
