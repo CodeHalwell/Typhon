@@ -168,7 +168,7 @@ A fresh adversarial sweep (~35 programs run through both `tyc run` and `tyc buil
 
 ### Project plumbing
 
-- ✅ CI — five jobs on every push to `main` / `dev/**` / `claude/**`: `test` (`cargo fmt --check` → `clippy -D warnings` → `cargo test --workspace`), `security` (`cargo-deny` advisories / licences / source bans), `perf-gate` (the build-pipeline performance regression gate), `differential` (the VM ↔ CPython differential gate over the full example + stress corpus), and `knob-matrix` (the opt-in-knob codegen matrix).
+- ✅ CI — eight jobs on every push to `main` / `dev/**` / `claude/**`: `test` (`cargo fmt --check` → `clippy -D warnings` → `cargo test --workspace`), `test-macos` (the test suite on macOS), `fmt-guard` (no out-of-scope `cargo fmt` reformats), `security` (`cargo-deny` advisories / licences / source bans), `perf-gate` (the build-pipeline performance regression gate), `differential` (the VM ↔ CPython differential gate over the full example + stress corpus), `knob-matrix` (the opt-in-knob codegen matrix), and `valid-corpus` (`tyc check` plus the VM ↔ CPython differential over the `corpus/valid/` valid-programs corpus).
 - ✅ Generated `typhon_runtime/` ships as local source — no PyPI dependency.
 
 ## Landed in v0.9.0 (stress-test cleanup release)

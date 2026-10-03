@@ -1,0 +1,198 @@
+# corpus/valid/fnmatch.ty — migrated from CPython 3.13 Lib/fnmatch.py (PSF-2.0)
+# via `tyc migrate`, hand-fixed once to check clean. Kept green by
+# the valid-corpus CI job; read README.md before editing.
+
+"""Filename matching with shell patterns.
+
+fnmatch(FILENAME, PATTERN) matches according to the local convention.
+fnmatchcase(FILENAME, PATTERN) always takes case in account.
+
+The functions operate by translating the pattern into a regular
+expression.  They cache the compiled regular expressions for speed.
+
+The function translate(PATTERN) returns a regular expression
+corresponding to PATTERN.  (It does not compile it.)
+"""
+import os
+import posixpath
+import re
+import functools
+
+__all__ = ["filter", "fnmatch", "fnmatchcase", "translate"]
+
+def fnmatch(name: str, pat: str) -> bool:
+    """Test whether FILENAME matches PATTERN.
+
+    Patterns are Unix shell style:
+
+    *       matches everything
+    ?       matches any single character
+    [seq]   matches any character in seq
+    [!seq]  matches any char not in seq
+
+    An initial period in FILENAME is not special.
+    Both FILENAME and PATTERN are first case-normalized
+    if the operating system requires it.
+    If you don't want this, use fnmatchcase(FILENAME, PATTERN).
+    """
+    let normed_name: str = os.path.normcase(name)
+    let normed_pat: str = os.path.normcase(pat)
+    return fnmatchcase(normed_name, normed_pat)
+
+@functools.lru_cache(maxsize=32768, typed=True)
+def _compile_pattern(pat: str | bytes) -> object:
+    if isinstance(pat, bytes):
+        let pat_str: str = str(pat, 'ISO-8859-1')
+        let res_str: str = translate(pat_str)
+        let res: bytes = bytes(res_str, 'ISO-8859-1')
+        return re.compile(res).match
+    let res_text: str = translate(pat)
+    return re.compile(res_text).match
+
+def filter(names: list[str], pat: str) -> list[str]:
+    """Construct a list from those elements of the iterable NAMES that match PAT."""
+    let result: list[str] = []
+    let normed_pat: str = os.path.normcase(pat)
+    let match: object = _compile_pattern(normed_pat)
+    if os.path is posixpath:
+        # normcase on posix is NOP. Optimize it away from the loop.
+        for name in names:
+            if match(name):
+                result.append(name)
+    else:
+        for name in names:
+            if match(os.path.normcase(name)):
+                result.append(name)
+    return result
+
+def fnmatchcase(name: str, pat: str) -> bool:
+    """Test whether FILENAME matches PATTERN, including case.
+
+    This is a version of fnmatch() which doesn't case-normalize
+    its arguments.
+    """
+    let match: object = _compile_pattern(pat)
+    return match(name) is not None
+
+
+def translate(pat: str) -> str:
+    """Translate a shell PATTERN to a regular expression.
+
+    There is no way to quote meta-characters.
+    """
+
+    let STAR: object = object()
+    let parts: list[object] = _translate(pat, STAR, '.')
+    return _join_translated_parts(parts, STAR)
+
+
+def _translate(pat: str, STAR: object, QUESTION_MARK: str) -> list[object]:
+    mut res: list[object] = []
+    let add = res.append
+    mut i: int = 0
+    let n: int = len(pat)
+    while i < n:
+        let c: str = pat[i]
+        i = i+1
+        if c == '*':
+            # compress consecutive `*` into one
+            if (not res) or res[-1] is not STAR:
+                add(STAR)
+        elif c == '?':
+            add(QUESTION_MARK)
+        elif c == '[':
+            mut j: int = i
+            if j < n and pat[j] == '!':
+                j = j+1
+            if j < n and pat[j] == ']':
+                j = j+1
+            while j < n and pat[j] != ']':
+                j = j+1
+            if j >= n:
+                add('\\[')
+            else:
+                mut stuff: str = pat[i:j]
+                if '-' not in stuff:
+                    stuff = stuff.replace('\\', r'\\')
+                else:
+                    let chunks: list[str] = []
+                    mut k: int = i+2 if pat[i] == '!' else i+1
+                    while True:
+                        k = pat.find('-', k, j)
+                        if k < 0:
+                            break
+                        chunks.append(pat[i:k])
+                        i = k+1
+                        k = k+3
+                    let chunk: str = pat[i:j]
+                    if chunk:
+                        chunks.append(chunk)
+                    else:
+                        chunks[-1] += '-'
+                    # Remove empty ranges -- invalid in RE.
+                    for k in range(len(chunks)-1, 0, -1):
+                        if chunks[k-1][-1] > chunks[k][0]:
+                            chunks[k-1] = chunks[k-1][:-1] + chunks[k][1:]
+                            del chunks[k]
+                    # Escape backslashes and hyphens for set difference (--).
+                    # Hyphens that create ranges shouldn't be escaped.
+                    stuff = '-'.join(s.replace('\\', r'\\').replace('-', r'\-')
+                                     for s in chunks)
+                # Escape set operations (&&, ~~ and ||).
+                stuff = re.sub(r'([&~|])', r'\\\1', stuff)
+                i = j+1
+                if not stuff:
+                    # Empty range: never match.
+                    add('(?!)')
+                elif stuff == '!':
+                    # Negated empty range: match any character.
+                    add('.')
+                else:
+                    if stuff[0] == '!':
+                        stuff = '^' + stuff[1:]
+                    elif stuff[0] in ('^', '['):
+                        stuff = '\\' + stuff
+                    add(f'[{stuff}]')
+        else:
+            add(re.escape(c))
+    assert i == n
+    return res
+
+
+def _join_translated_parts(inp: list[object], STAR: object) -> str:
+    # Deal with STARs.
+    mut res: list[str] = []
+    let add = res.append
+    mut i: int = 0
+    let n: int = len(inp)
+    # Fixed pieces at the start?
+    while i < n and inp[i] is not STAR:
+        add(inp[i] as! str)
+        i += 1
+    # Now deal with STAR fixed STAR fixed ...
+    # For an interior `STAR fixed` pairing, we want to do a minimal
+    # .*? match followed by `fixed`, with no possibility of backtracking.
+    # Atomic groups ("(?>...)") allow us to spell that directly.
+    # Note: people rely on the undocumented ability to join multiple
+    # translate() results together via "|" to build large regexps matching
+    # "one of many" shell patterns.
+    while i < n:
+        assert inp[i] is STAR
+        i += 1
+        if i == n:
+            add(".*")
+            break
+        assert inp[i] is not STAR
+        mut fixed: list[str] = []
+        while i < n and inp[i] is not STAR:
+            fixed.append(inp[i] as! str)
+            i += 1
+        let fixed_str: str = "".join(fixed)
+        if i == n:
+            add(".*")
+            add(fixed_str)
+        else:
+            add(f"(?>.*?{fixed_str})")
+    assert i == n
+    let joined: str = "".join(res)
+    return fr'(?s:{joined})\Z'

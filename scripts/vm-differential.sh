@@ -47,7 +47,11 @@
 #
 # Usage:
 #   scripts/vm-differential.sh [options]
-#     --scope examples|stress|all   corpus subset (default: all)
+#     --scope examples|stress|valid|all   corpus subset (default: all)
+#       valid = corpus/valid (the valid-programs corpus, W6-18), gated by its
+#       own baseline via --baseline scripts/valid-corpus-baseline.txt and by
+#       the valid-corpus CI job. `all` stays examples+stress so the main
+#       differential baseline is unaffected.
 #     --filter REGEX                only units whose id matches REGEX
 #     --jobs N                      parallel workers (default: nproc)
 #     --timeout N                   per-side wall-clock seconds (default: 20)
@@ -156,7 +160,8 @@ case "$SCOPE" in
     examples) ROOTS=(examples) ;;
     stress)   ROOTS=(stress) ;;
     all)      ROOTS=(examples stress) ;;
-    *) echo "unknown --scope '$SCOPE' (examples|stress|all)" >&2; exit 2 ;;
+    valid)   ROOTS=(corpus/valid) ;;
+    *) echo "unknown --scope '$SCOPE' (examples|stress|valid|all)" >&2; exit 2 ;;
 esac
 
 PROJECTS="$SCRATCH/projects.txt"

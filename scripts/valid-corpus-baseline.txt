@@ -1,0 +1,37 @@
+# scripts/valid-corpus-baseline.txt
+#
+# Known VM <-> CPython divergences over corpus/valid (the valid-programs
+# corpus, W6-18). Gated by the valid-corpus CI job:
+#     scripts/vm-differential.sh --scope valid \
+#         --baseline scripts/valid-corpus-baseline.txt
+# Each line is a unit id (a corpus/valid/*.ty path) whose `tyc run` output
+# does NOT match `tyc build` + python3.13.
+#
+# Same contract as scripts/differential-baseline.txt: EVERY line here is a
+# bug, the gate fails on a NEW divergence and equally on a listed unit that
+# stops diverging, so the list can only shrink. Triage a single entry with:
+#     scripts/vm-differential.sh --scope valid \
+#         --baseline scripts/valid-corpus-baseline.txt --filter '<unit>' --keep
+# then diff cpy.out / vm.out (and read vm.err) in the kept workdir.
+#
+# Unlike the main baseline this corpus is stdlib-only, so no third-party
+# runtime packages are needed to verify it — but each unit's classification
+# (ok / diverge / vacuous) still depends on which stdlib C-accelerator
+# modules the ambient python3.13 and the VM model (_string is imported by
+# string.ty; heapq.ty prefers _heapq when importable).
+#
+# Seeded 2026-10-03 against tyc 1.0.0-alpha.9.
+#
+# corpus/valid/textwrap.ty — VM does not model `dict.fromkeys` (the unit
+# builds `unicode_whitespace_trans` with it at class level); CPython runs the
+# unit fine, including its `__main__` demo. VM bug, burn it down.
+corpus/valid/textwrap.ty
+# NOTE (not a baseline entry — the mechanism cannot pin it): string.ty is
+# `vacuous-runtime` on both surfaces because of an EMITTER bug: an `impl`
+# method whose first parameter is named `cls` (`__init_subclass__`) is
+# emitted as `(self, cls)` with no `@classmethod`, so the explicit
+# `Template.__init_subclass__()` call upstream string.py relies on raises
+# `TypeError` in the emitted code. The unit is faithful to upstream and stays
+# check-clean (the checker's sweep is the corpus's primary job); when the
+# emitter is fixed the unit flips to full differential coverage by itself.
+#
