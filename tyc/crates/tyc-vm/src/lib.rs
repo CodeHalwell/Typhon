@@ -2983,6 +2983,41 @@ main()
     }
 
     #[test]
+    fn class_attributes_resolve_on_read_not_at_construction() {
+        // W5-06: a class attribute read through an instance must go through
+        // the class, so a later update to it (a class-level counter) is
+        // visible from instances built earlier. Copying it into the instance
+        // dict at construction froze the old value.
+        let src = r#"
+plain class Counter:
+    instances: int = 0
+
+impl Counter:
+    def __init__(self) -> None:
+        Counter.instances += 1
+
+plain class Circle:
+    unit: str = "px"
+
+def main() -> None:
+    let a: Counter = Counter()
+    let b: Counter = Counter()
+    if Counter.instances != 2 or a.instances != 2 or b.instances != 2:
+        raise ValueError("class attr not shared: " + str([Counter.instances, a.instances, b.instances]))
+    # A per-instance assignment still shadows the class attribute, and a
+    # sibling instance keeps reading the class value.
+    let c: Circle = Circle()
+    c.unit = "em"
+    let d: Circle = Circle()
+    if c.unit != "em" or d.unit != "px" or Circle.unit != "px":
+        raise ValueError("instance shadow/read wrong: " + str([c.unit, d.unit, Circle.unit]))
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn type_object_model() {
         // type(x) is a real type object: .__name__, str(), and == all work
         // for both builtins and user classes.

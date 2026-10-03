@@ -4885,25 +4885,18 @@ impl Interpreter {
         // snapshotting it into the instance would freeze an unbound copy.
         // Likewise skip an object whose type defines `__get__` — a
         // descriptor (`functools.partialmethod`, a hand-written one): it is
-        // read through the class so `__get__` sees the instance, and a
-        // per-instance assignment of the same name still wins.
-        let class_attrs: Vec<(String, Value)> = class
-            .class_attrs
-            .borrow()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        for (k, v) in class_attrs {
-            if k.starts_with("__typhon_") || matches!(v, Value::Function(_)) {
-                continue;
-            }
-            if let Value::Instance(d) = &v {
-                if self.find_method(&d.class, "__get__").is_some() {
-                    continue;
-                }
-            }
-            instance.fields.borrow_mut().insert(k, v);
-        }
+        // Class attributes are NOT copied onto the instance: CPython resolves
+        // them at read time (`instance.attr` -> instance dict -> class -> MRO),
+        // so `Counter.instances += 1` in `__init__` is visible through an
+        // already-built instance. Copying them here snapshotted the value at
+        // construction and made `Counter.instances` and `c.instances` disagree
+        // (W5-06). `class_attr` reads fall back to the class at :6534, which
+        // covers constants, `ClassVar`s and extension methods; a later
+        // per-instance assignment still wins because it lands in `fields`.
+        //
+        // The exception is data descriptors: a class attribute that defines
+        // `__get__`/`__set__` (a `property`) must stay on the class so the
+        // descriptor protocol runs on every access.
         // Custom __init__ wins.
         if let Some(init) = self.find_method(class, "__init__") {
             self.call_function(&init, args, kwargs, Some(Value::Instance(instance.clone())))?;
