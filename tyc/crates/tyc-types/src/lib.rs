@@ -21,6 +21,7 @@
 //! coverage.
 
 mod builtins;
+mod callables;
 mod frozen_context;
 #[cfg(debug_assertions)]
 mod unchecked;
@@ -1944,6 +1945,14 @@ pub fn type_from_annotation_with_params(
                                     min_params: None,
                                 };
                             }
+                            Expr::Name(n) if type_params.iter().any(|p| p == n.id.as_str()) => {
+                                return Type::Function {
+                                    params: vec![Type::TypeVar(format!("**{}", n.id))],
+                                    ret: Box::new(ret),
+                                    variadic: true,
+                                    min_params: Some(0),
+                                };
+                            }
                             _ => {}
                         }
                     }
@@ -2287,6 +2296,20 @@ fn bind_typevars_checked(
                 ret: fr,
                 ..
             },
+            Type::Function { ret: ar, .. },
+        ) if callables::parameter_pack(fp).is_some() => {
+            bindings.insert(
+                format!("**{}", callables::parameter_pack(fp).unwrap()),
+                actual.clone(),
+            );
+            bind_typevars_checked(fr, ar, bindings, ctor_vars)?;
+        }
+        (
+            Type::Function {
+                params: fp,
+                ret: fr,
+                ..
+            },
             Type::Function {
                 params: ap,
                 ret: ar,
@@ -2369,18 +2392,32 @@ fn substitute_typevars(ty: &Type, bindings: &std::collections::HashMap<String, T
             ret,
             variadic,
             min_params,
-        } => Type::Function {
-            params: params
-                .iter()
-                .map(|p| substitute_typevars(p, bindings))
-                .collect(),
-            ret: Box::new(substitute_typevars(ret, bindings)),
-            variadic: *variadic,
-            // Carry the required-arity through: dropping it here silently
-            // reverts a substituted signature to "every parameter required",
-            // which is exactly the false positive this field exists to fix.
-            min_params: *min_params,
-        },
+        } => {
+            let pack = callables::parameter_pack(params)
+                .and_then(|name| bindings.get(&format!("**{name}")));
+            let (params, variadic, min_params) = match pack {
+                Some(Type::Function {
+                    params,
+                    variadic,
+                    min_params,
+                    ..
+                }) => (params.clone(), *variadic, *min_params),
+                _ => (
+                    params
+                        .iter()
+                        .map(|p| substitute_typevars(p, bindings))
+                        .collect(),
+                    *variadic,
+                    *min_params,
+                ),
+            };
+            Type::Function {
+                params,
+                ret: Box::new(substitute_typevars(ret, bindings)),
+                variadic,
+                min_params,
+            }
+        }
         other => other.clone(),
     }
 }
@@ -4069,6 +4106,9 @@ impl<'a> Checker<'a> {
             },
         ) = (expected, actual)
         {
+            if callables::parameter_pack(ep).is_some() {
+                return self.is_assignable(er, ar);
+            }
             // `Callable[..., R]` (empty params + variadic) accepts any
             // function with an assignable (covariant) return type.
             if *ev && ep.is_empty() {
@@ -12773,9 +12813,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             } else {
                 ret
             };
-            let variadic = all_params().any(|pwd| pwd.default.is_some())
-                || f.parameters.vararg.is_some()
-                || f.parameters.kwarg.is_some();
+            let variadic = f.parameters.vararg.is_some();
             // How many parameters the caller must actually supply. This
             // binding *overrides* the one `seed_env_from_scope` installed from
             // `function_signature`, so it has to carry the required-arity too
@@ -18563,6 +18601,11 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             Type::Str
         }
         Expr::Name(n) => {
+            if matches!(expected, Some(Type::Function { .. })) {
+                if let Some(factory) = callables::constructor(c, n.id.as_str()) {
+                    return factory;
+                }
+            }
             if let Some(b) = c.env.lookup(n.id.as_str()) {
                 b.narrowed.clone()
             } else {
@@ -19328,6 +19371,11 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             // arity check and the return type. FINDINGS E4.
             let func_type = c.unwrap_alias(&func_type_raw);
             let call_span = (call.range.start().to_usize(), call.range.end().to_usize());
+            if let Type::Union(members) = &func_type {
+                if let Some(result) = callables::union_call(c, call, members) {
+                    return result;
+                }
+            }
 
             // `tyc::missing_await` (FINDINGS #49): a *sync* function
             // calling an `async def` without `await` returns a
@@ -19455,12 +19503,14 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         } else {
                             None
                         };
-                    let arity_info: Option<ArityInfo> = method_arity_info.or_else(|| {
-                        fn_name
-                            .as_deref()
-                            .and_then(|n| c.function_arity_info.get(n))
-                            .cloned()
-                    });
+                    let arity_info: Option<ArityInfo> = method_arity_info
+                        .or_else(|| callables::origin(c, &call.func))
+                        .or_else(|| {
+                            fn_name
+                                .as_deref()
+                                .and_then(|n| c.function_arity_info.get(n))
+                                .cloned()
+                        });
                     let arity_outcome = if let Some(info) = arity_info.as_ref() {
                         check_arity_with_info(info, pos_args, kw_args)
                     } else {
@@ -19472,7 +19522,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         // any total ≤ params.len() (defaults could
                         // cover the rest), and require ≥ params.len()
                         // when the function is variadic.
-                        let total = pos_args.len() + kw_args.len();
+                        let total = pos_args.len();
                         // `min_params` is the number of required
                         // parameters when the callable's origin recorded
                         // it (a `Callable[[…], R]` annotation, a lambda);
@@ -19483,12 +19533,13 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         let has_star = pos_args.iter().any(|e| matches!(e, Expr::Starred(_)))
                             || kw_args.iter().any(|k| k.arg.is_none());
                         let required = min_params.unwrap_or(0);
-                        let ok = if has_star {
+                        let is_pack = callables::parameter_pack(&params).is_some();
+                        let ok = if has_star || is_pack {
                             true
                         } else if variadic {
-                            total >= params.len()
+                            total >= required
                         } else {
-                            total <= params.len() && total >= required
+                            kw_args.is_empty() && total <= params.len() && total >= required
                         };
                         if ok {
                             ArityCheck::Ok
@@ -38660,5 +38711,20 @@ def main() -> None:
             let src=format!("let NAMES: list[str] = __typhon_freeze__([\"a\"])\n{body}");
             assert!(!check(&src).errors().is_empty(), "{src}");
         }
+    }
+    #[test]
+    fn w2_06_callable_shapes() {
+        for src in [
+            "from typing import Callable\ndef f(g: Callable[[int], int]) -> int:\n    return g(y=1)\n",
+            "from typing import Callable\ndef deco[**P, R](f: Callable[P, R]) -> Callable[P, R]:\n    return f\ndef add(a: int, b: int = 10) -> int:\n    return a + b\ndef f() -> int:\n    let g = deco(add)\n    return g(1, 2, 3)\n",
+
+            "def add(a: int, b: int = 10) -> int:\n    return a + b\ndef f() -> int:\n    let g = add\n    return g(1, 2, 3)\n",
+        ] { assert!(!check(src).errors().is_empty(), "accepted: {src}"); }
+        for src in [
+            "def add(a: int, b: int = 10) -> int:\n    return a + b\ndef f() -> int:\n    let g = add\n    return g(a=1)\n",
+            "from typing import Callable\nclass Pt:\n    x: int\ndef apply(factory: Callable[[int], Pt]) -> Pt:\n    return factory(1)\ndef f() -> Pt:\n    return apply(Pt)\n",
+            "from typing import Callable\ndef deco[**P, R](f: Callable[P, R]) -> Callable[P, R]:\n    return f\ndef add(a: int, b: int = 10) -> int:\n    return a + b\ndef f() -> int:\n    let g = deco(add)\n    return g(1)\n",
+            "def add(a: int) -> int:\n    return a + 1\ndef f() -> int:\n    let fs = [add, lambda a: a]\n    return fs[0](1)\n",
+        ] { assert!(check(src).errors().is_empty(), "{src}: {:?}",check(src).errors()); }
     }
 }
