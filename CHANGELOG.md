@@ -74,6 +74,24 @@ review deferred; the third — the 2026-09-30 release-readiness review
   `tyc::parse` error. The header is now recognised only at the start of a
   statement, and the one-line form only inside an `async def` body — the one
   place either form can lower.
+- **An `impl` method can use a name defined after its class (W7-06).**
+  Merging `impl Greeter:` into `class Greeter` evaluated each method's
+  decorators and parameter defaults where the class is, so `def greet(self,
+  word: str = DEFAULT_GREETING)` with `let DEFAULT_GREETING` between the class
+  and the block — or a decorator defined between a sealed-union alias and its
+  `impl` — raised `NameError` on import, on both surfaces. Such a method is
+  now defined at its `impl` block and attached there (`Greeter.greet =
+  __typhon_extend_Greeter__greet`, the cross-module `extend` lowering);
+  every other method keeps the merged class body exactly as before. A method
+  moves only when the hoisted form raised `NameError` and an attribute
+  assignment reproduces the class-body behaviour, so dunders, private
+  (`__x`) names, `cached_property`/`abstractmethod`, and — until `tyc run`
+  dispatches class-attribute functions like CPython — `@property`,
+  `@classmethod`, methods a base may also define, and methods of a class
+  subclassed before the block or overridden by a subclass keep the old
+  placement. The attached method's
+  bare `super()` is spelled out, which also fixes `super()` in a
+  cross-module `extend` method.
 
 ### Third wave — the 2026-09-30 release-readiness review
 

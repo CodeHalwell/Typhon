@@ -1,0 +1,63 @@
+from typing import Callable
+
+class Greeter:
+    name: str
+
+let DEFAULT_GREETING: str = "hello"
+
+def shout(f: Callable[..., str]) -> Callable[..., str]:
+    def wrapper(*args: object) -> str:
+        return f(*args) + "!"
+    return wrapper
+
+print("before impl")
+
+impl Greeter:
+    def greet(self, word: str = DEFAULT_GREETING) -> str:
+        return f"{word}, {self.name}"
+
+    @shout
+    def hail(self) -> str:
+        return f"hail {self.name}"
+
+    @staticmethod
+    def make(name: str = DEFAULT_GREETING) -> Greeter:
+        return Greeter(name=name)
+
+    def plain(self) -> str:
+        return "plain"
+
+class Circle frozen:
+    r: float
+
+class Square frozen:
+    s: float
+
+type Shape = Circle | Square
+
+def tagged(f: Callable[..., str]) -> Callable[..., str]:
+    def wrapper(*args: object) -> str:
+        return "<" + f(*args) + ">"
+    return wrapper
+
+impl Shape:
+    @tagged
+    def describe(self) -> str:
+        match self:
+            case Circle(r=r):
+                return f"circle {r}"
+            case Square(s=s):
+                return f"square {s}"
+
+let g: Greeter = Greeter(name="ada")
+print(g.greet())
+print(g.greet("hi"))
+print(g.hail())
+print(Greeter.make().name, g.make("x").name)
+print(g.plain())
+
+class Child(Greeter):
+    pass
+
+print(Child(name="kid").greet())
+print(Circle(r=1.0).describe(), Square(s=2.0).describe())

@@ -29,6 +29,8 @@ use ruff_python_ast::{
 };
 use ruff_text_size::TextRange;
 
+mod impl_site;
+
 // ── public API ───────────────────────────────────────────────────────────────
 
 /// Output of the module desugaring pass.
@@ -4232,25 +4234,64 @@ fn merge_impl_blocks(body: Vec<Stmt>) -> (Vec<Stmt>, bool) {
     let mut impl_methods_map: HashMap<String, Vec<Stmt>> = HashMap::new();
     // Pseudo-class indices whose target is foreign: lowered in place to
     // `def __typhon_extend_T__m(self, ...)` + `T.m = __typhon_extend_T__m`.
+    // W7-06: a local-target method whose decorators or defaults read a name
+    // bound after the class is lowered the same way, at its block.
     let mut foreign_patches: HashMap<usize, Vec<Stmt>> = HashMap::new();
+    let targets_of = |target_name: &String| -> Vec<String> {
+        match union_aliases.get(target_name) {
+            Some(variants) => variants.clone(),
+            None => vec![target_name.clone()],
+        }
+    };
+    // Every name the merged class body binds: its own members plus every
+    // `impl` method aimed at it.
+    let mut class_scope: HashMap<String, HashSet<String>> = HashMap::new();
+    for stmt in &body {
+        if let Stmt::ClassDef(c) = stmt {
+            if !c.name.as_str().starts_with(IMPL_PREFIX) {
+                impl_site::class_body_names(
+                    &c.body,
+                    class_scope.entry(c.name.as_str().to_owned()).or_default(),
+                );
+            }
+        }
+    }
+    for (impl_idx, target_name) in &impl_indices {
+        if let Stmt::ClassDef(c) = &body[*impl_idx] {
+            for target in targets_of(target_name) {
+                impl_site::class_body_names(&c.body, class_scope.entry(target).or_default());
+            }
+        }
+    }
+    let planner = impl_site::ImplSitePlanner::new(&body, IMPL_PREFIX);
     for (impl_idx, target_name) in &impl_indices {
         if let Stmt::ClassDef(c) = &body[*impl_idx] {
             let methods: Vec<Stmt> = c.body.iter().map(insert_self_param).collect();
             // Determine the actual target class(es). A union alias expands
             // to every variant; a concrete class is its own target.
-            let targets: Vec<String> = match union_aliases.get(target_name) {
-                Some(variants) => variants.clone(),
-                None => vec![target_name.clone()],
-            };
+            let targets: Vec<String> = targets_of(target_name);
             let all_local = targets
                 .iter()
                 .all(|t| local_classes.contains(t.as_str()) || union_aliases.contains_key(t));
             if all_local {
                 for target in targets {
-                    impl_methods_map
-                        .entry(target)
-                        .or_default()
-                        .extend(methods.iter().cloned());
+                    for method in &methods {
+                        if planner.must_define_at_impl_site(
+                            &target,
+                            *impl_idx,
+                            method,
+                            &class_scope,
+                        ) {
+                            foreign_patches.entry(*impl_idx).or_default().extend(
+                                make_extend_patch_stmts(&target, std::slice::from_ref(method)),
+                            );
+                        } else {
+                            impl_methods_map
+                                .entry(target.clone())
+                                .or_default()
+                                .push(method.clone());
+                        }
+                    }
                 }
             } else {
                 foreign_patches.insert(*impl_idx, make_extend_patch_stmts(target_name, &methods));
@@ -4464,11 +4505,25 @@ fn make_extend_patch_stmts(target: &str, methods: &[Stmt]) -> Vec<Stmt> {
         let module_fn_name = format!("__typhon_extend_{target}__{method_name}");
         let mut renamed = f.clone();
         renamed.name = make_identifier(&module_fn_name);
+        // A module-level function has no `__class__` cell, so a bare
+        // `super()` in it raises `RuntimeError` — spell out the class the
+        // method is attached to, as `rewrite_bare_super` does in a class body.
+        if let Some(self_name) = first_parameter_name(&renamed.parameters) {
+            let rewriter = SuperRewriter {
+                class_name: target.to_owned(),
+                self_name,
+            };
+            for body_stmt in &mut renamed.body {
+                rewriter.visit_stmt(body_stmt);
+            }
+        }
         out.push(Stmt::FunctionDef(renamed));
-        // `Target.method = __typhon_extend_Target__method`
+        // `Target.method = __typhon_extend_Target__method`, attributed to
+        // the method's `def` line (its name's range) in the source map
+        // rather than inheriting the last line of the body above it.
         out.push(Stmt::Assign(StmtAssign {
             node_index: AtomicNodeIndex::NONE,
-            range: TextRange::default(),
+            range: f.name.range,
             targets: vec![Expr::Attribute(ExprAttribute {
                 node_index: AtomicNodeIndex::NONE,
                 range: TextRange::default(),
@@ -6853,5 +6908,161 @@ class __typhon_impl_Event(object):
             !out.contains("@dataclasses.dataclass"),
             "typing_extensions.TypedDict must not get @dataclasses.dataclass decorator: {out}"
         );
+    }
+
+    // ── W7-06: impl methods whose def-time names come after the class ──────
+
+    /// Index of the first line of `out` containing `needle`.
+    fn line_index(out: &str, needle: &str) -> usize {
+        out.lines()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("`{needle}` not in:\n{out}"))
+    }
+
+    #[test]
+    fn impl_method_with_a_late_default_is_defined_at_the_impl_site() {
+        let src = "\
+class Greeter:
+    name: str
+
+DEFAULT_GREETING = 'hello'
+
+class __typhon_impl_Greeter(object):
+    def greet(word: str = DEFAULT_GREETING) -> str:
+        return word
+
+    def plain() -> str:
+        return 'plain'
+";
+        let out = parse_and_desugar(src);
+        let constant = line_index(&out, "DEFAULT_GREETING = ");
+        let def = line_index(&out, "def __typhon_extend_Greeter__greet(self, word");
+        let attach = line_index(&out, "Greeter.greet = __typhon_extend_Greeter__greet");
+        assert!(constant < def && def < attach, "{out}");
+        // A method with no late name keeps the merged class body.
+        assert!(line_index(&out, "    def plain(self)") < constant, "{out}");
+        assert!(!out.contains("__typhon_impl_"), "{out}");
+    }
+
+    #[test]
+    fn impl_method_with_a_late_decorator_moves_for_every_union_variant() {
+        let src = "\
+class Circle:
+    r: float
+
+class Square:
+    s: float
+
+type Shape = Circle | Square
+
+def tagged(f):
+    return f
+
+class __typhon_impl_Shape(object):
+    @tagged
+    def describe() -> str:
+        return 'shape'
+";
+        let out = parse_and_desugar(src);
+        let deco = line_index(&out, "def tagged(");
+        assert!(
+            deco < line_index(&out, "def __typhon_extend_Circle__describe(self)"),
+            "{out}"
+        );
+        assert!(
+            deco < line_index(&out, "def __typhon_extend_Square__describe(self)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Circle.describe = __typhon_extend_Circle__describe"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Square.describe = __typhon_extend_Square__describe"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn impl_methods_that_ran_before_keep_the_merged_class_body() {
+        for src in [
+            // Bound before the class: hoisting never crashed.
+            "K = 1\nclass C:\n    x: int\nK2 = 2\nclass __typhon_impl_C(object):\n    def m(k: int = K) -> int:\n        return k\n",
+            // A builtin: resolved at the class site.
+            "class C:\n    x: int\nlen = 3\nclass __typhon_impl_C(object):\n    def m(f = len) -> int:\n        return 0\n",
+            // A name from the class namespace (`@x.setter`-style).
+            "class C:\n    x: int\n    def helper(): pass\nhelper = 1\nclass __typhon_impl_C(object):\n    def m(f = helper) -> int:\n        return 0\n",
+            // The impl block precedes the class.
+            "class __typhon_impl_C(object):\n    def m(k: int = K) -> int:\n        return k\nK = 1\nclass C:\n    x: int\n",
+            // A `from … import *` before the class may bind the name.
+            "from os import *\nclass C:\n    x: int\nK = 1\nclass __typhon_impl_C(object):\n    def m(k: int = K) -> int:\n        return k\n",
+        ] {
+            let out = parse_and_desugar(src);
+            assert!(!out.contains("__typhon_extend_"), "must stay merged:\n{src}\n---\n{out}");
+        }
+    }
+
+    #[test]
+    fn impl_methods_needing_class_body_semantics_stay_merged() {
+        let late = "class C:\n    x: int\nK = 1\n";
+        for method in [
+            // Dunder: `__post_init__` / `__init_subclass__` / `__eq__` act at class creation.
+            "    def __post_init__(k: int = K) -> None:\n        pass\n",
+            // Private-name mangling only happens in a class body.
+            "    def m(k: int = K) -> int:\n        return self.__secret\n",
+            // `cached_property` needs `__set_name__`.
+            "    @functools.cached_property\n    def m(k: int = K) -> int:\n        return k\n",
+            "    @abstractmethod\n    def m(k: int = K) -> int:\n        return k\n",
+            // VM dispatch gaps for class-attribute functions.
+            "    @property\n    def m(k: int = K) -> int:\n        return k\n",
+            "    @classmethod\n    def m(k: int = K) -> int:\n        return k\n",
+        ] {
+            let src = format!("{late}class __typhon_impl_C(object):\n{method}");
+            let out = parse_and_desugar(&src);
+            assert!(
+                !out.contains("__typhon_extend_"),
+                "must stay merged:\n{src}\n---\n{out}"
+            );
+        }
+        // A subclass created before the block, or one overriding the method.
+        for src in [
+            "class C:\n    x: int\nclass D(C):\n    pass\nK = 1\nclass __typhon_impl_C(object):\n    def m(k: int = K) -> int:\n        return k\n",
+            "class C:\n    x: int\nK = 1\nclass __typhon_impl_C(object):\n    def m(k: int = K) -> int:\n        return k\nclass D(C):\n    def m(self, k: int = 2) -> int:\n        return super().m(k)\n",
+        ] {
+            let out = parse_and_desugar(src);
+            assert!(!out.contains("__typhon_extend_"), "must stay merged:\n{src}\n---\n{out}");
+        }
+        // A member the class may inherit: the VM finds the base's first.
+        for src in [
+            "class B:\n    x: int\n    def m(self) -> int:\n        return 0\nclass C(B):\n    y: int\nK = 1\nclass __typhon_impl_C(object):\n    def m(k: int = K) -> int:\n        return k\n",
+            "from mod import Ext\nclass C(Ext):\n    y: int\nK = 1\nclass __typhon_impl_C(object):\n    def m(k: int = K) -> int:\n        return k\n",
+        ] {
+            let out = parse_and_desugar(src);
+            assert!(!out.contains("__typhon_extend_"), "must stay merged:\n{src}\n---\n{out}");
+        }
+        // A subclass defined after the block that does not override is fine.
+        let out = parse_and_desugar(
+            "class C:\n    x: int\nK = 1\nclass __typhon_impl_C(object):\n    def m(k: int = K) -> int:\n        return k\nclass D(C):\n    pass\n",
+        );
+        assert!(out.contains("C.m = __typhon_extend_C__m"), "{out}");
+    }
+
+    #[test]
+    fn attached_method_bare_super_names_its_class() {
+        let src = "\
+class Base:
+    x: int
+
+class C(Base):
+    y: int
+
+K = 1
+
+class __typhon_impl_C(object):
+    def m(k: int = K) -> int:
+        return super().m(k)
+";
+        let out = parse_and_desugar(src);
+        assert!(out.contains("return super(C, self).m(k)"), "{out}");
     }
 }

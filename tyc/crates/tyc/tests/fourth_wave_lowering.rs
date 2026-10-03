@@ -128,3 +128,15 @@ fn gather_is_an_ordinary_name_outside_async_bodies() {
         include_str!("fourth_wave/gather_identifier.expected"),
     );
 }
+
+/// W7-06: an `impl` method whose default or decorator names something bound
+/// after the class is defined where the `impl` block is, so the module
+/// imports instead of raising `NameError` (both surfaces), including a
+/// decorator between a sealed-union alias and its `impl` block.
+#[test]
+fn impl_methods_see_names_bound_before_their_block() {
+    assert_runs_as(
+        include_str!("fourth_wave/impl_site.ty"),
+        include_str!("fourth_wave/impl_site.expected"),
+    );
+}
