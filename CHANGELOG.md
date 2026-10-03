@@ -15,6 +15,8 @@ review deferred; the third — the 2026-09-30 release-readiness review
 
 #### W2 — checker expressions
 
+- W2-02: debug builds support `TYC_REPORT_UNCHECKED=1 tyc check PATH`, reporting per-file Unknown annotation, return and member sites without changing severity. Examples baseline after builtin typing: 266 files, 206 annotated sites, 179 returns, 952 member sites (1337 total). Per-file counts are saved in `code_review/w2-codex/unchecked-examples-baseline.csv`.
+
 - W2-03: shared fields and properties on unions return the union of their types. Direct method calls must satisfy every variant's arity and parameter types and return the union of their results, with generic receiver parameters substituted and async methods returning coroutines.
 
 - W2-19: attribute inference folds receiver chains iteratively and compares recorded narrowing paths without building every receiver prefix. On this Mac, debug checks at 2k/4k/8k links fell from 1.18s/4.84s/34.44s (8k stack abort) to 0.125s/0.210s/0.559s, all successful.

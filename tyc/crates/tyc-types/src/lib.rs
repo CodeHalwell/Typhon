@@ -21,6 +21,8 @@
 //! coverage.
 
 mod builtins;
+#[cfg(debug_assertions)]
+mod unchecked;
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -6866,6 +6868,8 @@ pub fn check_module_with_imports_and_types(
     // the failure shows in the editor instead of at first import.
     check_freeze_let_freezable(&mut c, &module.body);
 
+    #[cfg(debug_assertions)]
+    unchecked::report(&c.path, module, &c.expression_types);
     CheckedModule {
         diagnostics: c.diagnostics,
         expression_types: c.expression_types,
@@ -38425,5 +38429,33 @@ def main() -> None:
             "class A:\n    n: int\nimpl A:\n    def read(self, x: int) -> int:\n        return x\nclass B:\n    n: int\nimpl B:\n    def read(self, x: str) -> int:\n        return 2\ntype U = A | B\ndef f(u: U) -> int:\n    return u.read(1)\n",
             "class A:\n    n: int\nimpl A:\n    def read(self) -> int:\n        return 1\nclass B:\n    n: int\nimpl B:\n    def read(self, x: str) -> int:\n        return 2\ntype U = A | B\ndef f(u: U) -> int:\n    return u.read()\n",
         ] { assert!(!check(src).errors().is_empty(), "accepted: {src}"); }
+    }
+    #[test]
+    #[cfg(debug_assertions)]
+    fn w2_02_unknown_counts_are_observable() {
+        let source = "def legacy(x):\n    return x\ndef f() -> int:\n    let n: int = legacy(1)\n    return legacy(2)\ndef g(value) -> None:\n    print(value.name)\n";
+        let prep = preprocess(source);
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module("<test>".into(), &prep.python_source, &module);
+        let checked = check_module_with_imports_and_types(
+            "<test>",
+            &prep.python_source,
+            &resolved,
+            &module,
+            &[],
+            &[],
+            &[],
+            None,
+        );
+        assert_eq!(
+            unchecked::counts(&module, &checked.expression_types),
+            unchecked::Counts {
+                annotated: 1,
+                returns: 1,
+                members: 1
+            }
+        );
     }
 }
