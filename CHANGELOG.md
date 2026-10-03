@@ -34,6 +34,27 @@ from 148 reported tests (84 hidden) to **232 passing** on macOS. One
 cosmetic residual: CPython spells the default text encoding `UTF-8` on
 macOS and the `io` shim lowercases it — documented in `docs/vm.md`.
 
+**The verification shell gates run on macOS.** Both `scripts/` gates used
+four GNU-only constructs, and one failed silently: `find -printf` built
+the differential's project list (with the error swallowed by
+`2>/dev/null`), so on BSD find the list came out empty, every
+project-internal `.ty` was mis-discovered as a standalone unit, and a run
+covered 1,699 units instead of ~1,481 — a different corpus with no error.
+`-exec dirname` (POSIX) replaces it, and both gates now refuse to run when
+discovery finds nothing. `xargs -a`/`-d` became `tr '\n' '\0' | xargs -0`,
+`grep -P` became `awk` field matching, and the absent GNU `timeout` is
+provided by a small PATH executable (`scripts/portable.sh`). Verified on
+macOS: the differential covers 1,481 units and PASSes with its five
+baseline divergences, and the knob matrix is 12/12 (previously unrunnable).
+
+**The perf gate compares like with like.** Its verdict was an absolute
+median against one committed number recorded on a single host, so an
+unchanged tree read as +140% on another machine. It now builds a control
+from the latest release tag in the same run and interleaves candidate and
+control timings, failing only on the ratio; the absolute baseline stays
+for reporting and a `--no-control` fallback, and `--update` records the
+host that produced it.
+
 ### Third wave — the 2026-09-30 release-readiness review
 
 **Seven ways a check-clean program could crash, closed.** Each of these
