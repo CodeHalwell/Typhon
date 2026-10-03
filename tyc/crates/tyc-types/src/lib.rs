@@ -12559,6 +12559,38 @@ fn call_arg_effect(c: &Checker, call: &ruff_python_ast::ExprCall) -> ArgEffect {
     }
 }
 
+/// Drop the narrowings a method call `recv.m(…)` may have made stale, where
+/// `effect` is what `m` can write and `recv_path` is `recv`'s access path.
+///
+/// The method runs with `recv` as `self`, so it can rewrite fields *below*
+/// `recv_path` — but not the slot `recv` itself was read from: after
+/// `if self.conn is None: return`, `self.conn.execute("x")` leaves
+/// `self.conn` non-`None` (review 2026-10-03 §4.2). The one exception is a
+/// local method known to write a field named like that slot, which may have
+/// reached it through an alias, so the slot is dropped too.
+fn invalidate_receiver_fields(c: &mut Checker, recv: &Expr, recv_path: &str, effect: &ArgEffect) {
+    if matches!(effect, ArgEffect::Nothing) {
+        return;
+    }
+    if let (ArgEffect::Fields(fields), Some((_, slot))) = (effect, recv_path.rsplit_once('.')) {
+        if fields.contains(slot) {
+            c.env.clear_attr_narrowing(recv_path);
+            return;
+        }
+    }
+    let frozen = matches!(
+        infer_expr_readonly(c, recv),
+        Type::Class(n) if c.frozen_classes.contains(n.as_str())
+    );
+    let skip = usize::from(frozen);
+    c.env
+        .clear_attr_narrowings_under(recv_path, |segments| match effect {
+            ArgEffect::Nothing => false,
+            ArgEffect::Anything => segments.len() > skip,
+            ArgEffect::Fields(fields) => segments.iter().skip(skip).any(|s| fields.contains(*s)),
+        });
+}
+
 /// Drop the field narrowings rooted at `root` that a call with `effect` may
 /// have made stale. A `frozen` root's own fields cannot be rebound (the
 /// emitted dataclass raises), so only paths below them are dropped.
@@ -13633,7 +13665,8 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             if let Expr::Call(call) = call_expr {
                 if let Expr::Attribute(recv_attr) = call.func.as_ref() {
                     if let Some(recv_path) = attr_path_of(&recv_attr.value) {
-                        c.env.clear_attr_narrowing(&recv_path);
+                        let effect = call_arg_effect(c, call);
+                        invalidate_receiver_fields(c, &recv_attr.value, &recv_path, &effect);
                     }
                 }
                 // An object handed to a call in statement position
@@ -17303,6 +17336,25 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                             name: n.id.as_str().to_owned(),
                             attr_path: None,
                             replacement: b.narrowed.strip_none(),
+                        });
+                    }
+                }
+            }
+        }
+        Expr::Attribute(_) => {
+            // Truthy narrowing on an attribute path, the counterpart of the
+            // `Name` arm: `if head.nxt: head.nxt.v`, `if not self.data:
+            // return`, `a.b.v if a.b else 0`, `a.b and a.b.v > 5`. Only the
+            // true branch narrows, for the same reason (review 2026-10-03
+            // §4.2).
+            if !negate {
+                if let Some(path) = attr_path_of(test) {
+                    let current = attr_expr_type_with_pending(c, test, out);
+                    if current.is_nullable() {
+                        out.push(Narrowing {
+                            name: String::new(),
+                            attr_path: Some(path),
+                            replacement: current.strip_none(),
                         });
                     }
                 }

@@ -39,6 +39,13 @@ review deferred; the third — the 2026-09-30 release-readiness review
   imported non-stdlib function, a callable parameter, `setattr` and
   anything else it cannot see may still write any field, so
   `clear(b)` with `b.value = None` inside stays rejected.
+- **`nullable-use = "error"` stays the default; the narrowing gaps it
+  exposed are closed.** A method call `self.conn.execute(…)` no longer drops
+  the narrowing of `self.conn` itself, only of fields below it that the
+  method can write; `self.log("x")` keeps `self.conn` narrowed unless `log`
+  can write `conn`. Attribute paths now narrow on truthiness like plain
+  names: `if head.nxt: head.nxt.v`, `if not self.data: return`,
+  `head.nxt.v if head.nxt else 0`, `head.nxt and head.nxt.v > 5`.
 
 ### Third wave — the 2026-09-30 release-readiness review
 

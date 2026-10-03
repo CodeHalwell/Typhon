@@ -28,12 +28,21 @@ fn messages(d: &Diagnostics) -> Vec<String> {
     d.errors().iter().map(|e| e.to_string()).collect()
 }
 
+/// No errors, and no `NullableUse` warning (see [`assert_rejected`] for why
+/// that check is a warning in this harness).
 fn assert_clean(src: &str) {
     let d = check(src);
+    let nullable: Vec<String> = d
+        .warnings()
+        .iter()
+        .filter(|w| matches!(w, TycError::NullableUse { .. }))
+        .map(|w| w.to_string())
+        .collect();
     assert!(
-        d.errors().is_empty(),
-        "expected no errors, got {:?}",
-        messages(&d)
+        d.errors().is_empty() && nullable.is_empty(),
+        "expected no errors, got {:?} / {:?}",
+        messages(&d),
+        nullable
     );
 }
 
@@ -302,11 +311,18 @@ def total(t: IntTree) -> int:
 
 // ── W1-02: passing an object to a call ────────────────────────────────────
 
+/// The stale narrowing is reported. `NullableUse` counts at either level:
+/// this harness runs without a `typhon.toml`, so it carries the checker's
+/// built-in severity rather than the CLI's `nullable-use = "error"` default.
 fn assert_rejected(src: &str) {
     let d = check(src);
+    let nullable_warning = d
+        .warnings()
+        .iter()
+        .any(|w| matches!(w, TycError::NullableUse { .. }));
     assert!(
-        !d.errors().is_empty(),
-        "expected the stale narrowing to be rejected, got no errors"
+        !d.errors().is_empty() || nullable_warning,
+        "expected the stale narrowing to be reported, got nothing"
     );
 }
 
@@ -466,4 +482,118 @@ def f(b: Box) -> int:
     return 0
 "#,
     ));
+}
+
+// ── W1-03: method calls and attribute truthiness under `nullable-use = "error"` ──
+
+#[test]
+fn w1_03_a_method_call_keeps_the_receiver_slot_narrowed() {
+    assert_clean(
+        r#"
+import sqlite3
+class Conn:
+    n: int
+impl Conn:
+    def execute(self, q: str) -> None:
+        print(q)
+    def commit(self) -> None:
+        print("c")
+class Repo:
+    conn: Conn?
+    db: sqlite3.Connection?
+impl Repo:
+    def log(self, m: str) -> None:
+        print(m)
+    def save(self) -> int:
+        if self.conn is None:
+            return 0
+        self.conn.execute("x")
+        self.conn.commit()
+        self.log("x")
+        self.conn.commit()
+        return 1
+    def store(self) -> int:
+        if self.db is None:
+            return 0
+        self.db.execute("x")
+        self.db.commit()
+        return 1
+"#,
+    );
+}
+
+#[test]
+fn w1_03_a_method_that_writes_the_field_still_invalidates() {
+    assert_rejected(
+        r#"
+class Conn:
+    n: int
+class Repo:
+    conn: Conn?
+impl Repo:
+    def close(self) -> None:
+        self.conn = None
+    def save(self) -> int:
+        if self.conn is None:
+            return 0
+        self.close()
+        return self.conn.n
+"#,
+    );
+    assert_rejected(
+        r#"
+class Inner:
+    x: int?
+impl Inner:
+    def wipe(self) -> None:
+        self.x = None
+class Outer:
+    inner: Inner
+def f(o: Outer) -> int:
+    if o.inner.x is None:
+        return 0
+    o.inner.wipe()
+    return o.inner.x
+"#,
+    );
+}
+
+#[test]
+fn w1_03_attribute_paths_narrow_on_truthiness() {
+    assert_clean(
+        r#"
+class Node:
+    v: int
+    nxt: Node?
+class Buf:
+    data: list[int]?
+impl Buf:
+    def first(self) -> int:
+        if not self.data:
+            return 0
+        return self.data[0]
+def f(head: Node) -> int:
+    if head.nxt:
+        return head.nxt.v
+    return 0
+def g(head: Node) -> int:
+    return head.nxt.v if head.nxt else 0
+def h(head: Node) -> bool:
+    if head.nxt and head.nxt.v > 5:
+        return True
+    return False
+"#,
+    );
+    // Falsy does not imply `None`: the else branch stays nullable.
+    assert_rejected(
+        r#"
+class Node:
+    v: int
+    nxt: Node?
+def f(head: Node) -> int:
+    if head.nxt:
+        return 0
+    return head.nxt.v
+"#,
+    );
 }
