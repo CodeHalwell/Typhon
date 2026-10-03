@@ -284,14 +284,15 @@ fn docs_only_name_emitted_diagnostic_codes() {
     // the roadmap name codes that were proposed, renamed or never built.
     // They are history and must not be rewritten to match the present.
     let historical: &[&str] = &[
-        "docs/adversarial-audit-50agent-2026-06-28.md",
-        "docs/adversarial-review-2026-06-28.md",
-        "docs/codebase-review-2026-07-28.md",
-        "docs/codebase-review-2026-07-28-findings.md",
-        "docs/beta-readiness-review-2026-09-01.md",
-        "docs/project-review-2026-05-16.md",
-        "docs/release-readiness-2026-07-20.md",
-        "docs/release-readiness-review-2026-09-30.md",
+        "docs/reviews/adversarial-audit-50agent-2026-06-28.md",
+        "docs/reviews/adversarial-review-2026-06-28.md",
+        "docs/reviews/codebase-review-2026-07-28.md",
+        "docs/reviews/codebase-review-2026-07-28-findings.md",
+        "docs/reviews/beta-readiness-review-2026-09-01.md",
+        "docs/reviews/project-review-2026-05-16.md",
+        "docs/reviews/release-readiness-2026-07-20.md",
+        "docs/reviews/release-readiness-review-2026-09-30.md",
+        "docs/reviews/RELEASE_READINESS_REVIEW.md",
         "docs/alpha-release-plan.md",
         "docs/roadmap.md",
     ];

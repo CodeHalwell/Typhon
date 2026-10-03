@@ -4,7 +4,7 @@
 **Reviewed tree:** branch `claude/language-release-review-0tcm9q` — `main` (post-alpha.5,
 including the three 2026-07-20 patches #321/#322/#325) **plus** the ten pending Dependabot
 bumps (#299–#310), which this branch validates and remediates.
-**Prior review:** [`RELEASE_READINESS_REVIEW.md`](../RELEASE_READINESS_REVIEW.md)
+**Prior review:** [`RELEASE_READINESS_REVIEW.md`](RELEASE_READINESS_REVIEW.md)
 (v1.0.0-alpha.2, 2026-07-01) — used as the regression baseline throughout.
 **Method:** every CI gate run against a fresh release build; the full `examples/` +
 `stress/` corpus type-checked; an end-to-end smoke test (init → check → VM run → build →

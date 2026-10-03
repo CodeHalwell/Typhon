@@ -1,7 +1,7 @@
 # Differential and knob-coverage gates
 
 Two CI gates, added in response to items **T0.2** and **T0.4** of
-[`codebase-review-2026-07-28.md`](codebase-review-2026-07-28.md). Both live in
+[`codebase-review-2026-07-28.md`](reviews/codebase-review-2026-07-28.md). Both live in
 `scripts/`, run locally with no network access, and refuse to run at all rather
 than run partially — a gate that passes vacuously is worse than no gate, because
 it reads as coverage.

@@ -7,7 +7,7 @@ the full example and stress corpora type-checked and executed both ways, and
 six parallel adversarial reviewers (one per area: preprocessor, type checker,
 desugar/emit/format, VM, tooling, docs) each required to reproduce every
 finding against the binary before reporting it. Their reproduction files are
-committed as [`stress/round-2026-09-01/`](../stress/round-2026-09-01/).
+committed as [`stress/round-2026-09-01/`](../../stress/round-2026-09-01/).
 
 ## Verdict
 

@@ -52,7 +52,7 @@ diagnostic.
 
 **[v1.0.0-alpha.7](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.7) — 2026-07-29.**
 The full-codebase-review remediation release. It closes all ten of the
-[2026-07-28 codebase review](codebase-review-2026-07-28.md)'s 1.0 blockers
+[2026-07-28 codebase review](reviews/codebase-review-2026-07-28.md)'s 1.0 blockers
 plus the Tier-0 gates that make them verifiable: type-checker soundness
 fixes (instance-attribute assignment is now type-checked, constructor field
 order follows reverse MRO, model constructors are keyword-only, recursive
@@ -72,7 +72,7 @@ unsound typing, plus one warn-level diagnostic-surface addition.
 
 **[v1.0.0-alpha.6](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.6) — 2026-07-21.**
 A maintenance release on top of alpha.5, driven by the
-[2026-07-20 release-readiness review](release-readiness-2026-07-20.md). The
+[2026-07-20 release-readiness review](reviews/release-readiness-2026-07-20.md). The
 July dependency wave is carried safely across the `toml` 0.8 → 1.x major —
 including the fix for the one regression that bump introduced (the
 `tyc-venv` dependency allow-list reader silently returning empty, which
@@ -118,7 +118,7 @@ provably-different-shaped class across a module boundary, so no
 previously-*correct* program changes behaviour.
 
 **[v1.0.0-alpha.3](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.3) — 2026-07-03.**
-A release-readiness remediation pass (`RELEASE_READINESS_REVIEW.md`) — the
+A release-readiness remediation pass ([`RELEASE_READINESS_REVIEW.md`](reviews/RELEASE_READINESS_REVIEW.md)) — the
 licensing, packaging, and robustness counterpart to alpha.2's soundness sweep.
 Licensing / packaging gaps that would block a clean public release are closed
 (a repository-root MIT `LICENSE`, the upstream Ruff MIT notice vendored beside
@@ -138,7 +138,7 @@ previously-*unsound* narrowing, so no previously-*correct* program changes
 behaviour.
 
 **[v1.0.0-alpha.2](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.2) — 2026-06-29.**
-The remediation of the [2026-06-28 adversarial pre-release review](adversarial-review-2026-06-28.md):
+The remediation of the [2026-06-28 adversarial pre-release review](reviews/adversarial-review-2026-06-28.md):
 a type-checker soundness sweep (non-local flow-narrowing invalidated across an
 intervening call or alias write; short-circuit `and`/`or` narrowing no longer
 false-positives on `x is not None and x.method()`), a batch of newly-typed

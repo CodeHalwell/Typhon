@@ -50,7 +50,7 @@ production Rust were cited by no reviewer, and the 53,337-line vendored Ruff for
 nobody in either audit. Full accounting in the coverage critique below.
 
 **6. Duplicates against prior audits were screened.** Verifiers checked each finding against the
-logged-pending lists in `docs/adversarial-audit-50agent-2026-06-28.md`, `docs/findings.md`,
+logged-pending lists in `docs/reviews/adversarial-audit-50agent-2026-06-28.md`, `docs/findings.md`,
 `RELEASE_READINESS_REVIEW.md` and `TYPE_SYSTEM_FRONTIER.md`, and duplicates were refuted.
 
 ---
@@ -478,7 +478,7 @@ Cross-referencing every `crates/...` path cited in the 26 coverage notes against
 
 The `tyc-venv` domain summary is the literal string `Test.` for both summary and coverage — **that agent produced nothing**. I confirmed the gap is not filled elsewhere:
 - The security reviewer read only `discover_python`, `which_python3`, `INTROSPECT_SCRIPT` and the allow-list — and then spent its finding on `tyc-lsp/src/venv_introspect.rs`, the *other* implementation.
-- `grep -n "venv\|introspect" docs/adversarial-audit-50agent-2026-06-28.md` returns **zero hits** — the prior 50-agent audit never covered it either.
+- `grep -n "venv\|introspect" docs/reviews/adversarial-audit-50agent-2026-06-28.md` returns **zero hits** — the prior 50-agent audit never covered it either.
 - Nobody exercised introspection against a real installed third-party package (only the classes reviewer installed pydantic, for a different purpose).
 
 So the crate that (a) spawns a Python subprocess, (b) executes `import` of arbitrary user-named modules, (c) parses free-text annotation strings via a hand-rolled recursive descent (`annotation_to_type` at `crates/tyc-venv/src/lib.rs:756`, `split_top_level_pipes:971`, `split_generic:895`, `union_from_members:1007`), and (d) feeds the result straight into `tyc::type_mismatch` — has **never been reviewed by anyone, ever**. Every one of those parsers is a false-positive generator by construction: a mis-parsed annotation becomes a wrong `Type` and then a hard error on correct user code, which is this project's stated worst-case defect class.
