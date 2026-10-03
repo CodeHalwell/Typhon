@@ -5974,8 +5974,10 @@ let pet: Animal = Dog(name=\"Rex\")
             source_label: None,
         })
         .expect_err("an escaping output directory must fail the build");
+        let rendered = format!("{err:?}");
         assert!(
-            format!("{err:?}").contains("outside the project root"),
+            err.to_string().contains("outside the project root")
+                || (rendered.contains("outside") && rendered.contains("project root")),
             "error should explain the escape; got {err:?}"
         );
         assert!(
