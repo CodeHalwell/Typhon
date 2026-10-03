@@ -153,38 +153,9 @@ SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/tyc-diff.XXXXXX")"
 cleanup() { [ "$KEEP" = "1" ] || rm -rf "$SCRATCH"; }
 trap cleanup EXIT
 
-# `timeout` is GNU coreutils and absent on stock macOS, where every unit then
-# fails (the calls below run it through `env`, which only searches PATH, so a
-# shell function cannot stand in). Install a small executable on PATH with
-# GNU's contract: kill the child after N seconds and report exit 124. A flag
-# file distinguishes "the watchdog fired" from "the child exiting on its own"
-# — polling the watchdog process instead races a command that finishes at the
-# deadline.
-if ! command -v timeout >/dev/null 2>&1; then
-    TIMEOUT_BIN_DIR="$SCRATCH/bin"
-    mkdir -p "$TIMEOUT_BIN_DIR"
-    cat > "$TIMEOUT_BIN_DIR/timeout" <<'TIMEOUT_SH'
-#!/usr/bin/env bash
-secs="$1"; shift
-flag="$(mktemp -u "${TMPDIR:-/tmp}/tyc-timeout.XXXXXX")"
-"$@" &
-pid=$!
-( sleep "$secs"; : > "$flag"; kill -TERM "$pid" 2>/dev/null ) &
-watcher=$!
-status=0
-wait "$pid" 2>/dev/null || status=$?
-if [ -e "$flag" ]; then
-    status=124
-    rm -f "$flag"
-fi
-kill "$watcher" 2>/dev/null
-wait "$watcher" 2>/dev/null
-exit "$status"
-TIMEOUT_SH
-    chmod +x "$TIMEOUT_BIN_DIR/timeout"
-    PATH="$TIMEOUT_BIN_DIR:$PATH"
-    export PATH
-fi
+# `timeout` is GNU-only; see scripts/portable.sh.
+source "$(dirname "${BASH_SOURCE[0]}")/portable.sh"
+ensure_timeout "$SCRATCH/bin"
 
 case "$SCOPE" in
     examples) ROOTS=(examples) ;;

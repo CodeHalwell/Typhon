@@ -94,6 +94,10 @@ SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/tyc-knob.XXXXXX")"
 cleanup() { [ "$KEEP" = "1" ] || rm -rf "$SCRATCH"; }
 trap cleanup EXIT
 
+# `timeout` is GNU-only and called through `env`; see scripts/portable.sh.
+source "$(dirname "${BASH_SOURCE[0]}")/portable.sh"
+ensure_timeout "$SCRATCH/bin"
+
 # `-printf` is a GNU find extension (BSD find fails on it, which silently
 # yielded zero fixtures). `-exec basename` is POSIX and gives the same names.
 mapfile -t NAMES < <(find "$FIXTURES" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | sort)
