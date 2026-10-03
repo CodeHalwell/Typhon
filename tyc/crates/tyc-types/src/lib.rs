@@ -3194,6 +3194,9 @@ struct Checker<'a> {
     /// and methods can write — what a statement-position call may do to the
     /// narrowings of an object passed to it. See [`FieldWriteSummary`].
     field_writes: FieldWriteSummary,
+    /// Names bound by a `type X = …` statement. Each is a `TypeAliasType`
+    /// at runtime, not a class (see [`is_type_alias_name`]).
+    pep695_aliases: HashSet<String>,
     /// For each declared function name, its inferred signature type.
     function_signatures: HashMap<String, Type>,
     /// Per-function arity metadata that doesn't fit in `Type::Function`
@@ -3696,6 +3699,7 @@ impl<'a> Checker<'a> {
             classes: Vec::new(),
             globals_rebound_by_call: std::collections::HashSet::new(),
             field_writes: FieldWriteSummary::default(),
+            pep695_aliases: HashSet::new(),
             nonlocals_rebound_by_call: std::collections::HashSet::new(),
             function_signatures: HashMap::new(),
             function_arity_info: HashMap::new(),
@@ -5788,6 +5792,22 @@ impl<'a> Checker<'a> {
         let length = span.1.saturating_sub(span.0).max(1);
         self.diagnostics.push_error(TycError::missing_await(
             callee,
+            &self.path,
+            self.source,
+            span.0,
+            length,
+        ));
+    }
+
+    fn alias_not_a_class(&mut self, alias: &str, form: &str, fix: &str, span: (usize, usize)) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
+        let length = span.1.saturating_sub(span.0).max(1);
+        self.diagnostics.push_error(TycError::alias_not_a_class(
+            alias,
+            form,
+            fix,
             &self.path,
             self.source,
             span.0,
@@ -8742,6 +8762,7 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                 if let Expr::Name(n) = ta.name.as_ref() {
                     let union_name = n.id.as_str().to_owned();
                     c.classes.push(union_name.clone());
+                    c.pep695_aliases.insert(union_name.clone());
                     if let Some(variants) = extract_sealed_union_variants(&ta.value) {
                         c.sealed_unions.insert(union_name.clone(), variants);
                     }
@@ -13915,6 +13936,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             let mut excluded: Vec<Type> = Vec::new();
             for case in &m.cases {
                 check_pattern_class_fields(c, &case.pattern);
+                check_alias_class_patterns(c, &case.pattern);
                 let residual = match m.subject.as_ref() {
                     Expr::Name(_) if !excluded.is_empty() => {
                         let expanded = expand_sealed_alias_for_narrowing(c, &subject_type);
@@ -13989,6 +14011,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     m.subject.range().end().to_usize(),
                 );
                 if let Some(variants) = c.sealed_unions.get(union_name.as_str()).cloned() {
+                    let variants = flatten_sealed_variants(c, &variants);
                     check_match_exhaustiveness(c, &m.cases, union_name, &variants, subject_span);
                 } else if let Some(members) = c.enums.get(union_name.as_str()).cloned() {
                     check_enum_match_exhaustiveness(
@@ -13998,7 +14021,11 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         &members,
                         subject_span,
                     );
+                } else {
+                    check_closed_match_exhaustiveness(c, &m.cases, &subject_type, &m.subject);
                 }
+            } else {
+                check_closed_match_exhaustiveness(c, &m.cases, &subject_type, &m.subject);
             }
         }
         // `assert <test>` permanently narrows subsequent code in the
@@ -16494,15 +16521,16 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
         Type::Class(n) => n.as_str(),
         Type::Generic(head, _) => {
             if head == "Result" {
-                let variants = ["Ok", "Err"];
-                let mut covered: HashSet<&str> = HashSet::new();
-                for case in cases {
-                    if case.guard.is_some() {
-                        continue;
-                    }
-                    collect_matched_class_names(&case.pattern, &mut covered);
-                }
-                return variants.iter().all(|&v| covered.contains(v));
+                // `Ok` and `Err`, each with its payload checked against the
+                // `Result`'s own `T` / `E` where those are closed sets — so
+                // `Err(NotFound())` + `Err(Timeout())` does not cover a
+                // `Denied` member of `E` (review 2026-10-03 §3.3).
+                let pats: Vec<&Pattern> = cases
+                    .iter()
+                    .filter(|cs| cs.guard.is_none())
+                    .map(|cs| &cs.pattern)
+                    .collect();
+                return missing_cases(c, &pats, ty, 0).is_some_and(|m| m.is_empty());
             }
             head.as_str()
         }
@@ -16515,6 +16543,7 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
         _ => return false,
     };
     if let Some(variants) = c.sealed_unions.get(class_name).cloned() {
+        let variants = flatten_sealed_variants(c, &variants);
         let mut covered: HashSet<&str> = HashSet::new();
         let mut covered_with_guards: HashSet<&str> = HashSet::new();
         let mut has_guarded_wildcard = false;
@@ -19347,6 +19376,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 // `@runtime_checkable` are exempt — the user acknowledged the
                 // weaker guarantee.
                 if fn_name.id.as_str() == "isinstance" && pos_args.len() == 2 {
+                    check_isinstance_alias(c, &pos_args[1]);
                     if let Expr::Name(t) = &pos_args[1] {
                         if let Some(iface) = c.interfaces.get(t.id.as_str()) {
                             if !iface.runtime_checkable {
@@ -22115,6 +22145,390 @@ fn check_match_exhaustiveness(
     if !missing.is_empty() {
         let missing_str = missing.join(", ");
         c.non_exhaustive_match(union_name, &missing_str, subject_span);
+    }
+}
+
+/// The leaf variants of a sealed union, with nested sealed aliases expanded:
+/// `type Shape = Circle | Poly`, `type Poly = Rect | Tri` → `Circle, Rect,
+/// Tri`. Only the leaves are classes a `case` can name; `Poly` itself is a
+/// `TypeAliasType` (review 2026-10-03 §3.5).
+fn flatten_sealed_variants(c: &Checker, variants: &[String]) -> Vec<String> {
+    fn walk(c: &Checker, vs: &[String], depth: usize, out: &mut Vec<String>) {
+        for v in vs {
+            match c.sealed_unions.get(v.as_str()) {
+                Some(inner) if depth < 32 && !c.class_shapes.contains_key(v.as_str()) => {
+                    walk(c, inner, depth + 1, out)
+                }
+                _ => {
+                    if !out.contains(v) {
+                        out.push(v.clone());
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(c, variants, 0, &mut out);
+    out
+}
+
+/// Whether `name` is a `type` alias rather than a class: a sealed union
+/// (local or imported) or any `type X = …` statement of this module.
+fn is_type_alias_name(c: &Checker, name: &str) -> bool {
+    (c.sealed_unions.contains_key(name) || c.pep695_aliases.contains(name))
+        && !c.class_shapes.contains_key(name)
+        && !c.enums.contains_key(name)
+}
+
+/// `Rect() | Tri()` / `(Rect, Tri)` for an alias's leaf variants, for the
+/// `alias_not_a_class` help text.
+fn alias_variant_fix(c: &Checker, alias: &str, isinstance: bool) -> String {
+    let leaves = c
+        .sealed_unions
+        .get(alias)
+        .map(|v| flatten_sealed_variants(c, v))
+        .unwrap_or_default();
+    if leaves.is_empty() {
+        return format!("use the classes `{alias}` stands for instead");
+    }
+    if isinstance {
+        format!(
+            "test its variants instead: `isinstance(x, ({}))`",
+            leaves.join(", ")
+        )
+    } else {
+        let arms: Vec<String> = leaves.iter().map(|l| format!("{l}()")).collect();
+        format!("match its variants instead: `case {}:`", arms.join(" | "))
+    }
+}
+
+/// Report a `type` alias used as a `match` class pattern, anywhere in
+/// `pattern` (review 2026-10-03 §3.5).
+fn check_alias_class_patterns(c: &mut Checker, pattern: &Pattern) {
+    match pattern {
+        Pattern::MatchClass(mc) => {
+            if let Expr::Name(n) = mc.cls.as_ref() {
+                let name = n.id.as_str();
+                if is_type_alias_name(c, name) {
+                    let fix = alias_variant_fix(c, name, false);
+                    let span = (n.range.start().to_usize(), n.range.end().to_usize());
+                    c.alias_not_a_class(name, &format!("`case {name}():`"), &fix, span);
+                }
+            }
+            for p in &mc.arguments.patterns {
+                check_alias_class_patterns(c, p);
+            }
+            for k in &mc.arguments.keywords {
+                check_alias_class_patterns(c, &k.pattern);
+            }
+        }
+        Pattern::MatchAs(a) => {
+            if let Some(inner) = &a.pattern {
+                check_alias_class_patterns(c, inner);
+            }
+        }
+        Pattern::MatchOr(o) => o
+            .patterns
+            .iter()
+            .for_each(|p| check_alias_class_patterns(c, p)),
+        Pattern::MatchSequence(s) => s
+            .patterns
+            .iter()
+            .for_each(|p| check_alias_class_patterns(c, p)),
+        Pattern::MatchMapping(m) => m
+            .patterns
+            .iter()
+            .for_each(|p| check_alias_class_patterns(c, p)),
+        Pattern::MatchStar(_) | Pattern::MatchValue(_) | Pattern::MatchSingleton(_) => {}
+    }
+}
+
+/// Report a `type` alias as `isinstance`'s second argument, alone or in a
+/// tuple (review 2026-10-03 §3.5).
+fn check_isinstance_alias(c: &mut Checker, arg: &Expr) {
+    let names: Vec<&ruff_python_ast::ExprName> = match arg {
+        Expr::Name(n) => vec![n],
+        Expr::Tuple(t) => t
+            .elts
+            .iter()
+            .filter_map(|e| match e {
+                Expr::Name(n) => Some(n),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    for n in names {
+        let name = n.id.as_str();
+        if is_type_alias_name(c, name) {
+            let fix = alias_variant_fix(c, name, true);
+            let span = (n.range.start().to_usize(), n.range.end().to_usize());
+            c.alias_not_a_class(name, &format!("`isinstance(x, {name})`"), &fix, span);
+        }
+    }
+}
+
+/// Pattern coverage of a closed type, for `match` exhaustiveness and
+/// `missing_return` (review 2026-10-03 §3.3). `Some(missing)` lists what of
+/// `ty` no pattern in `pats` matches — empty when they are exhaustive —
+/// and `None` when `ty` is not a set this check can decompose (an open
+/// `str` matched only by literals).
+///
+/// Leaf user classes stay as lenient as the sealed-union check has always
+/// been: any class pattern naming the class (or a base) covers it,
+/// whatever its sub-patterns. Only `Ok` / `Err` payloads are followed into.
+fn missing_cases(c: &Checker, pats: &[&Pattern], ty: &Type, depth: usize) -> Option<Vec<String>> {
+    fn flatten<'a>(p: &'a Pattern, out: &mut Vec<&'a Pattern>) {
+        match p {
+            Pattern::MatchAs(a) => match &a.pattern {
+                Some(inner) => flatten(inner, out),
+                None => out.push(p),
+            },
+            Pattern::MatchOr(o) => o.patterns.iter().for_each(|q| flatten(q, out)),
+            _ => out.push(p),
+        }
+    }
+    fn class_name(p: &Pattern) -> Option<&str> {
+        match p {
+            Pattern::MatchClass(mc) => match mc.cls.as_ref() {
+                Expr::Name(n) => Some(n.id.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    // `int()` / `int(x)`: a builtin class pattern with irrefutable
+    // sub-patterns matches every value of that builtin.
+    fn builtin_total(pats: &[&Pattern], builtin: &str) -> bool {
+        pats.iter().any(|p| match p {
+            Pattern::MatchClass(mc) => {
+                class_name(p) == Some(builtin)
+                    && mc.arguments.keywords.is_empty()
+                    && mc.arguments.patterns.iter().all(is_capture_or_underscore)
+            }
+            _ => false,
+        })
+    }
+    if depth > 16 {
+        return None;
+    }
+    let mut flat: Vec<&Pattern> = Vec::new();
+    for p in pats {
+        flatten(p, &mut flat);
+    }
+    if flat.iter().any(|p| is_wildcard_pattern(p)) {
+        return Some(Vec::new());
+    }
+    match ty {
+        Type::Union(xs) => {
+            let mut missing = Vec::new();
+            for x in xs {
+                missing.extend(missing_cases(c, &flat, x, depth + 1)?);
+            }
+            Some(missing)
+        }
+        Type::None => {
+            let covered = flat.iter().any(|p| {
+                matches!(p, Pattern::MatchSingleton(s) if matches!(s.value, ruff_python_ast::Singleton::None))
+            });
+            Some(if covered {
+                Vec::new()
+            } else {
+                vec!["None".to_owned()]
+            })
+        }
+        Type::Bool => {
+            if builtin_total(&flat, "bool") || builtin_total(&flat, "int") {
+                return Some(Vec::new());
+            }
+            let mut missing = Vec::new();
+            for (v, name) in [(true, "True"), (false, "False")] {
+                if !flat.iter().any(|p| pattern_bool_value(p) == Some(v)) {
+                    missing.push(name.to_owned());
+                }
+            }
+            Some(missing)
+        }
+        Type::LitStr(s) => {
+            let covered = builtin_total(&flat, "str")
+                || flat
+                    .iter()
+                    .any(|p| pattern_str_value(p).as_deref() == Some(s.as_str()));
+            Some(if covered {
+                Vec::new()
+            } else {
+                vec![format!("{s:?}")]
+            })
+        }
+        Type::Int | Type::Str | Type::Float | Type::Bytes => {
+            let name = match ty {
+                Type::Int => "int",
+                Type::Str => "str",
+                Type::Float => "float",
+                _ => "bytes",
+            };
+            builtin_total(&flat, name).then(Vec::new)
+        }
+        Type::Generic(h, args) if h == "Result" && args.len() == 2 => {
+            let mut missing = result_half(c, &flat, "Ok", &args[0], depth);
+            missing.extend(result_half(c, &flat, "Err", &args[1], depth));
+            Some(missing)
+        }
+        Type::Generic(h, args) if (h == "Ok" || h == "Err") && args.len() == 1 => {
+            Some(result_half(c, &flat, h, &args[0], depth))
+        }
+        Type::Class(name) | Type::Generic(name, _) => {
+            let name = name.as_str();
+            if let Some(members) = c.enums.get(name) {
+                let mut covered: HashSet<&str> = HashSet::new();
+                for p in &flat {
+                    let _ = enum_pattern_covered_members(p, name, &mut covered);
+                }
+                return Some(
+                    members
+                        .iter()
+                        .filter(|m| !covered.contains(m.as_str()))
+                        .map(|m| format!("{name}.{m}"))
+                        .collect(),
+                );
+            }
+            if let Some(variants) = c.sealed_unions.get(name) {
+                let leaves = flatten_sealed_variants(c, variants);
+                let user_class = |v: &String| {
+                    !is_builtin_generic_head(v)
+                        && !matches!(
+                            v.as_str(),
+                            "int" | "str" | "float" | "bool" | "bytes" | "None" | "object"
+                        )
+                };
+                if !leaves.iter().all(user_class) {
+                    return None;
+                }
+                let mut missing = Vec::new();
+                for v in &leaves {
+                    missing.extend(missing_cases(c, &flat, &Type::Class(v.clone()), depth + 1)?);
+                }
+                return Some(missing);
+            }
+            if let Some((params, rhs)) = c.type_aliases.get(name) {
+                if params.is_empty() && !matches!(rhs, Type::Unknown | Type::Any) {
+                    let rhs = rhs.clone();
+                    return missing_cases(c, &flat, &rhs, depth + 1);
+                }
+                return None;
+            }
+            if !c.class_shapes.contains_key(name) {
+                return None;
+            }
+            let covered = flat.iter().any(|p| {
+                class_name(p).is_some_and(|n| n == name || c.class_inherits_from(name, n))
+            });
+            Some(if covered {
+                Vec::new()
+            } else {
+                vec![name.to_owned()]
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The `Ok` or `Err` half of a `Result` coverage check: `[ctor]` when no
+/// arm matches that constructor at all, `ctor(<missing>)` for the parts of
+/// the payload type `inner` its arms leave out, nothing when they cover it
+/// — or when `inner` is an open type the payload patterns cannot be checked
+/// against (the arms are then trusted, as before).
+fn result_half(
+    c: &Checker,
+    flat: &[&Pattern],
+    ctor: &str,
+    inner: &Type,
+    depth: usize,
+) -> Vec<String> {
+    let field = if ctor == "Ok" { "value" } else { "error" };
+    let mut subs: Vec<&Pattern> = Vec::new();
+    let mut any = false;
+    for p in flat {
+        let Pattern::MatchClass(mc) = p else {
+            continue;
+        };
+        let Expr::Name(n) = mc.cls.as_ref() else {
+            continue;
+        };
+        if n.id.as_str() != ctor {
+            continue;
+        }
+        any = true;
+        match (
+            mc.arguments.patterns.first(),
+            mc.arguments
+                .keywords
+                .iter()
+                .find(|k| k.attr.as_str() == field),
+        ) {
+            (Some(sp), _) => subs.push(sp),
+            (None, Some(k)) => subs.push(&k.pattern),
+            // `Ok()` matches every `Ok`.
+            (None, None) => return Vec::new(),
+        }
+    }
+    if !any {
+        return vec![ctor.to_owned()];
+    }
+    match missing_cases(c, &subs, inner, depth + 1) {
+        Some(m) => m.into_iter().map(|x| format!("{ctor}({x})")).collect(),
+        None => Vec::new(),
+    }
+}
+
+/// The type a closed-subject exhaustiveness check runs against, when the
+/// subject is a closed set the sealed-union and enum checks do not see:
+/// `Result[…]`, `bool`, a string literal or literal union, or a union that
+/// includes `None` (review 2026-10-03 §3.3). A transparent alias resolves
+/// to its right-hand side.
+fn closed_match_subject(c: &Checker, t: &Type, depth: usize) -> Option<Type> {
+    if depth > 8 {
+        return None;
+    }
+    match t {
+        Type::Generic(h, _) if matches!(h.as_str(), "Result" | "Ok" | "Err") => Some(t.clone()),
+        Type::Bool | Type::LitStr(_) => Some(t.clone()),
+        Type::Union(xs) if xs.iter().any(|x| matches!(x, Type::None | Type::LitStr(_))) => {
+            Some(t.clone())
+        }
+        Type::Class(n) => match c.type_aliases.get(n.as_str()) {
+            Some((params, rhs)) if params.is_empty() => closed_match_subject(c, rhs, depth + 1),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `tyc::non_exhaustive_match` for a closed subject (see
+/// [`closed_match_subject`]): `Err(Denied)` missing from a `Result` match,
+/// `None` from a match over `int?`, `False` from a match over `bool`.
+fn check_closed_match_exhaustiveness(
+    c: &mut Checker,
+    cases: &[MatchCase],
+    subject_type: &Type,
+    subject: &Expr,
+) {
+    let Some(closed) = closed_match_subject(c, subject_type, 0) else {
+        return;
+    };
+    let pats: Vec<&Pattern> = cases
+        .iter()
+        .filter(|cs| cs.guard.is_none())
+        .map(|cs| &cs.pattern)
+        .collect();
+    if let Some(missing) = missing_cases(c, &pats, &closed, 0) {
+        if !missing.is_empty() {
+            let span = (
+                subject.range().start().to_usize(),
+                subject.range().end().to_usize(),
+            );
+            c.non_exhaustive_match(&subject_type.display(), &missing.join(", "), span);
+        }
     }
 }
 

@@ -46,6 +46,24 @@ review deferred; the third — the 2026-09-30 release-readiness review
   can write `conn`. Attribute paths now narrow on truthiness like plain
   names: `if head.nxt: head.nxt.v`, `if not self.data: return`,
   `head.nxt.v if head.nxt else 0`, `head.nxt and head.nxt.v > 5`.
+- **`match` exhaustiveness covers every closed subject.** A `Result[T, E]`
+  match must handle `Ok` and `Err`, and when `E` (or `T`) is a sealed
+  union, enum, `bool` or literal union, the payload patterns must cover it:
+  the README's `match load(...)` with `Err(NotFound(..))` and
+  `Err(Timeout(..))` now reports `Err(Denied)` missing instead of falling
+  through. A match over `T?` must handle `None` once its arms cover `T`;
+  `bool` and literal-union subjects must cover every value. `missing_return`
+  follows the same rules for `Result`. All forms report
+  `tyc::non_exhaustive_match` and honour `[strictness] exhaustive-match`.
+  Over the example and stress corpus no previously clean unit is rejected.
+- **Nested sealed unions flatten to their leaf classes.** With
+  `type Poly = Rect | Tri` and `type Shape = Circle | Poly`, arms for
+  `Circle`, `Rect` and `Tri` are exhaustive (they used to report "missing
+  Poly").
+- **New `tyc::alias_not_a_class` (error).** `case Poly():` and
+  `isinstance(x, Poly)` on a `type` alias were accepted and raise
+  `TypeError` on CPython (a `type` statement makes a `TypeAliasType`, not a
+  class). The help text lists the variants to match or test instead.
 
 ### Third wave — the 2026-09-30 release-readiness review
 

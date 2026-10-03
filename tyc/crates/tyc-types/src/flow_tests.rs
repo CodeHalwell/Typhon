@@ -597,3 +597,230 @@ def f(head: Node) -> int:
 "#,
     );
 }
+
+// ── W1-04 / W1-05: exhaustiveness ─────────────────────────────────────────
+
+fn non_exhaustive(src: &str) -> Vec<String> {
+    check(src)
+        .errors()
+        .iter()
+        .filter_map(|e| match e {
+            TycError::NonExhaustiveMatch { missing, .. } => Some(missing.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+const LOAD: &str = r#"
+class NotFound frozen:
+    path: str
+class Timeout frozen:
+    secs: int
+class Denied frozen:
+    who: str
+type LoadError = NotFound | Timeout | Denied
+def load(p: str) -> Result[str, LoadError]:
+    return Err(Denied(who="me"))
+"#;
+
+#[test]
+fn w1_04_result_with_a_missing_err_variant_is_not_exhaustive() {
+    let src = format!(
+        r#"{LOAD}
+def show(p: str) -> None:
+    match load(p):
+        case Ok(body):
+            print(body)
+        case Err(NotFound(path=q)):
+            print(q)
+        case Err(Timeout(secs=s)):
+            print(s)
+"#
+    );
+    assert_eq!(non_exhaustive(&src), vec!["Err(Denied)".to_owned()]);
+    let ok_only = format!(
+        r#"{LOAD}
+def show(p: str) -> None:
+    match load(p):
+        case Ok(body):
+            print(body)
+"#
+    );
+    assert_eq!(non_exhaustive(&ok_only), vec!["Err".to_owned()]);
+}
+
+#[test]
+fn w1_04_result_value_position_reports_missing_return_too() {
+    let d = check(&format!(
+        r#"{LOAD}
+def show(p: str) -> str:
+    match load(p):
+        case Ok(body):
+            return body
+        case Err(NotFound(path=q)):
+            return q
+        case Err(Timeout(secs=s)):
+            return str(s)
+"#
+    ));
+    assert!(
+        d.errors()
+            .iter()
+            .any(|e| matches!(e, TycError::MissingReturn { .. })),
+        "got {:?}",
+        messages(&d)
+    );
+}
+
+#[test]
+fn w1_04_nullable_bool_and_literal_subjects() {
+    assert_eq!(
+        non_exhaustive(
+            "def f(o: int?) -> None:\n    match o:\n        case int():\n            print(o)\n"
+        ),
+        vec!["None".to_owned()]
+    );
+    assert_eq!(
+        non_exhaustive(
+            "def f(b: bool) -> None:\n    match b:\n        case True:\n            print(1)\n"
+        ),
+        vec!["False".to_owned()]
+    );
+    assert_eq!(
+        non_exhaustive(
+            "type Color = \"red\" | \"green\" | \"blue\"\ndef f(c: Color) -> None:\n    match c:\n        case \"red\":\n            print(1)\n        case \"green\":\n            print(2)\n"
+        ),
+        vec!["\"blue\"".to_owned()]
+    );
+}
+
+#[test]
+fn w1_04_covering_and_open_subjects_stay_clean() {
+    assert_clean(&format!(
+        r#"{LOAD}
+def a(p: str) -> str:
+    match load(p):
+        case Ok(body):
+            return body
+        case Err(NotFound(path=q)):
+            return q
+        case Err(Timeout(secs=s)):
+            return str(s)
+        case Err(Denied()):
+            return "d"
+def b(p: str) -> str:
+    match load(p):
+        case Ok(v):
+            return v
+        case Err(e):
+            return "e"
+def c(o: int?) -> int:
+    match o:
+        case int():
+            return o
+        case None:
+            return 0
+def d(x: bool) -> int:
+    match x:
+        case True:
+            return 1
+        case False:
+            return 0
+def e(s: str?) -> None:
+    # `str` is open: literal arms never claim to cover it.
+    match s:
+        case "a":
+            print(1)
+        case None:
+            print(0)
+def f(r: Result[int, str]) -> None:
+    match r:
+        case Ok(0):
+            print(0)
+        case Ok(n):
+            print(n)
+        case Err(m):
+            print(m)
+"#
+    ));
+}
+
+const SHAPES: &str = r#"
+class Circle frozen:
+    r: float
+class Rect frozen:
+    w: float
+class Tri frozen:
+    b: float
+type Poly = Rect | Tri
+type Shape = Circle | Poly
+"#;
+
+#[test]
+fn w1_05_nested_sealed_unions_flatten_to_their_leaves() {
+    assert_clean(&format!(
+        r#"{SHAPES}
+def area(s: Shape) -> float:
+    match s:
+        case Circle(r=r):
+            return r
+        case Rect(w=w):
+            return w
+        case Tri(b=b):
+            return b
+"#
+    ));
+    assert_eq!(
+        non_exhaustive(&format!(
+            r#"{SHAPES}
+def area(s: Shape) -> None:
+    match s:
+        case Circle(r=r):
+            print(r)
+        case Rect(w=w):
+            print(w)
+"#
+        )),
+        vec!["Tri".to_owned()]
+    );
+}
+
+#[test]
+fn w1_05_an_alias_is_not_a_class_pattern_or_isinstance_target() {
+    let d = check(&format!(
+        r#"{SHAPES}
+def area(s: Shape) -> float:
+    match s:
+        case Circle(r=r):
+            return r
+        case Poly():
+            return 1.0
+        case _:
+            return 0.0
+
+def g(s: Shape) -> bool:
+    return isinstance(s, Poly) or isinstance(s, (Circle, Shape))
+"#
+    ));
+    let aliases: Vec<&str> = d
+        .errors()
+        .iter()
+        .filter_map(|e| match e {
+            TycError::AliasNotAClass { alias, .. } => Some(alias.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        aliases,
+        vec!["Poly", "Poly", "Shape"],
+        "got {:?}",
+        messages(&d)
+    );
+    // A real class with the same shape of use is fine.
+    assert_clean(&format!(
+        r#"{SHAPES}
+def g(s: Shape) -> bool:
+    return isinstance(s, (Rect, Tri))
+"#
+    ));
+}

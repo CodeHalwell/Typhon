@@ -65,6 +65,7 @@ const LANGUAGE_TOPICS: &[&str] = &["freeze", "pub"];
 /// code resolves to a non-empty entry.
 fn catalog_codes() -> &'static [&'static str] {
     &[
+        "alias_not_a_class",
         "arg_count",
         "async_without_await",
         "attribute_not_found",
@@ -165,6 +166,9 @@ fn catalog_codes() -> &'static [&'static str] {
 /// page. Every page under `docs/diagnostics/` is embedded into the binary.
 fn catalog_entry(short_code: &str) -> Option<&'static str> {
     Some(match short_code {
+        "alias_not_a_class" => {
+            include_str!("../../../../../docs/diagnostics/alias_not_a_class.md")
+        }
         "arg_count" => include_str!("../../../../../docs/diagnostics/arg_count.md"),
         "async_without_await" => {
             include_str!("../../../../../docs/diagnostics/async_without_await.md")

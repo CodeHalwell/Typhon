@@ -622,6 +622,27 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A `type` alias used where Python needs a class: a `match` class
+    /// pattern (`case Poly():`) or `isinstance`'s second argument. A PEP 695
+    /// alias is a `TypeAliasType`, so both raise `TypeError` at runtime.
+    #[error("`{alias}` is a type alias, not a class: {form} raises `TypeError` at runtime")]
+    #[diagnostic(
+        code(tyc::alias_not_a_class),
+        url(
+            "https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/alias_not_a_class.md"
+        ),
+        help("{fix}")
+    )]
+    AliasNotAClass {
+        alias: String,
+        form: String,
+        fix: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("a type alias, not a class")]
+        span: SourceSpan,
+    },
+
     /// A `comptime` binding could not be evaluated at build time.
     #[error("comptime evaluation failed for '{name}': {message}")]
     #[diagnostic(
@@ -2034,6 +2055,7 @@ impl TycError {
             | Self::FieldDefaultOrdering { src, span, .. }
             | Self::MissingAwait { src, span, .. }
             | Self::NonExhaustiveMatch { src, span, .. }
+            | Self::AliasNotAClass { src, span, .. }
             | Self::InvalidQuestionOp { src, span, .. }
             | Self::UnusedImport { src, span, .. }
             | Self::LazyUsage { src, span, .. }
@@ -2130,6 +2152,7 @@ impl TycError {
             | Self::FieldDefaultOrdering { src, span, .. }
             | Self::MissingAwait { src, span, .. }
             | Self::NonExhaustiveMatch { src, span, .. }
+            | Self::AliasNotAClass { src, span, .. }
             | Self::InvalidQuestionOp { src, span, .. }
             | Self::UnusedImport { src, span, .. }
             | Self::LazyUsage { src, span, .. }
@@ -2705,6 +2728,25 @@ impl TycError {
         Self::NonExhaustiveMatch {
             union_name: union_name.into(),
             missing: missing.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::AliasNotAClass`] diagnostic.
+    pub fn alias_not_a_class(
+        alias: impl Into<String>,
+        form: impl Into<String>,
+        fix: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::AliasNotAClass {
+            alias: alias.into(),
+            form: form.into(),
+            fix: fix.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }
