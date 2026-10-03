@@ -64,6 +64,30 @@ fn assert_runs_as(src: &str, expected: &str) {
     );
     assert_eq!(String::from_utf8_lossy(&vm.stdout), expected, "VM output");
 
+    assert_cpython_runs_in(dir, expected);
+}
+
+/// `tyc check` passes on `src`, and compiled on CPython it prints exactly
+/// `expected`. For lowerings whose VM side depends on a VM change outside
+/// this workstream (named at each call site).
+fn assert_checks_and_cpython_runs_as(src: &str, expected: &str) {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    scaffold(dir, src);
+    let check = tyc()
+        .current_dir(dir)
+        .args(["check", "src"])
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "tyc check failed:\n{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    assert_cpython_runs_in(dir, expected);
+}
+
+fn assert_cpython_runs_in(dir: &Path, expected: &str) {
     let Some(py) = python() else { return };
     let build = tyc()
         .current_dir(dir)
@@ -173,5 +197,39 @@ fn with_chain_else_block_may_declare_names() {
     assert_runs_as(
         include_str!("fourth_wave/with_chain_else_let.ty"),
         include_str!("fourth_wave/with_chain_else_let.expected"),
+    );
+}
+
+/// W7-11: a metaclass (`class Registry(type)`, and a subclass of one) is not
+/// given `@dataclass`, which replaced `type.__init__` and raised `TypeError`
+/// when the first class used it. CPython only: `tyc run` ignores
+/// `metaclass=` (reported to the VM workstream).
+#[test]
+fn metaclass_is_not_a_dataclass() {
+    assert_checks_and_cpython_runs_as(
+        "class Registry(type):\n    pass\n\nclass Strict(Registry):\n    pass\n\n\
+         class Widget(metaclass=Registry):\n    size: int = 3\n\n\
+         class Gadget(metaclass=Strict):\n    pass\n\n\
+         print(type(Widget).__name__, type(Gadget).__name__)\n\
+         print(isinstance(Widget, Registry), isinstance(Gadget, Registry))\n\
+         print(Widget().size)\n",
+        "Registry Strict\nTrue True\n3\n",
+    );
+}
+
+/// W7-11: a `plain class` subclass no longer re-declares the attributes it
+/// inherits, so a later `Cfg.debug = True` reaches it (a subclass that
+/// declares its own `debug` keeps it). CPython only: `tyc run` snapshots a
+/// base's class attributes when a subclass is created (reported to the VM
+/// workstream).
+#[test]
+fn plain_subclass_inherits_rather_than_copies_attributes() {
+    assert_checks_and_cpython_runs_as(
+        "plain class Cfg:\n    debug: bool = False\n    name: str = \"cfg\"\n\n\
+         plain class Sub(Cfg):\n    debug: bool = False\n\n\
+         plain class Other(Cfg):\n    pass\n\n\
+         Cfg.debug = True\n\
+         print(Cfg.debug, Sub.debug, Other.debug, Sub.name)\n",
+        "True False True cfg\n",
     );
 }

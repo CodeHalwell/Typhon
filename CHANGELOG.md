@@ -123,6 +123,18 @@ review deferred; the third — the 2026-09-30 release-readiness review
   see the gate after it as exhaustive; without that it rejected valid
   programs (`tyc::missing_return`, or a re-assignment error when two
   bindings' `Result` types differ).
+- **Metaclasses and `plain class` subclasses emit as written (W7-11).**
+  `class Meta(type):` (and any subclass of it, or of `ABCMeta` / `EnumMeta`
+  / `EnumType`) no longer gets `@dataclass(slots=True)`, whose generated
+  `__init__` replaced `type.__init__` and raised `TypeError` the first time
+  a class used the metaclass. A `plain class` subclass no longer receives
+  copies of its parent's annotated attributes (that copy exists to feed a
+  dataclass constructor, which a `plain class` does not have), so
+  `Cfg.debug = True` now reaches a subclass that never declared `debug`; a
+  subclass that declares its own keeps it. Both were wrong on CPython; the
+  VM still ignores `metaclass=` and snapshots a base's class attributes
+  when a subclass is created, so it does not yet print the CPython result
+  for either program.
 
 ### Third wave — the 2026-09-30 release-readiness review
 

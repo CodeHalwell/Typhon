@@ -1800,6 +1800,7 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
         exception_class_names_from(&module_level_classes, &module_class_names);
     let raw_class_infos = collect_raw_class_infos(&m.body, &options.raw_class_line_starts);
     let module_mutable_names = collect_module_mutable_names(&m.body);
+    let metaclass_names = metaclass_names_from(&module_level_classes, &module_class_names);
     let markers = ClassMarkers {
         raw_starts: &options.raw_class_line_starts,
         frozen_starts: &options.frozen_class_line_starts,
@@ -1811,6 +1812,7 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
         module_class_names: &module_class_names,
         raw_class_infos: &raw_class_infos,
         module_mutable_names: &module_mutable_names,
+        metaclass_names: &metaclass_names,
     };
     let (new_body, transformed_classes) = desugar_stmts(&m.body, markers);
 
@@ -1834,7 +1836,7 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
     // fields, so no transformation is needed there — but the duplicated
     // annotation is harmless under `@dataclass` and keeps the desugared
     // module consistent across run modes.
-    let merged_body = inherit_parent_fields(merged_body);
+    let merged_body = inherit_parent_fields(merged_body, &options.plain_class_line_starts);
 
     // Inject `@functools.cache` on every top-level function name the purity
     // analyser flagged as opted-into memoisation.  Returns whether any cache
@@ -2221,6 +2223,10 @@ struct ClassMarkers<'a> {
     /// (by annotation or by value), mapped to that builtin's name — so a
     /// field defaulting to one gets a per-instance copy (W7-07).
     module_mutable_names: &'a HashMap<String, &'static str>,
+    /// Names of every module-level class that is (transitively) a
+    /// metaclass — derived from `type` (or `ABCMeta` / `EnumMeta` /
+    /// `EnumType`). A metaclass is never a dataclass (W7-11).
+    metaclass_names: &'a std::collections::HashSet<&'a str>,
 }
 
 /// What a `class!` contributes to the constructors of `class!` subclasses.
@@ -2409,6 +2415,16 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             });
             let is_exception_subclass = has_external_exception_base
                 || markers.exception_class_names.contains(c.name.as_str());
+            // A metaclass (`class Meta(type):`, or a subclass of one) is not
+            // a record type: `@dataclass` gave it an `__init__(self, …)` that
+            // replaced `type.__init__`, so the first class created with it
+            // raised `TypeError` (W7-11). Same rule as exceptions: an external
+            // metaclass base in any scope, or a module class rooted in one.
+            let is_metaclass = c.bases().iter().any(|b| {
+                base_last_segment(b).is_some_and(|seg| {
+                    !markers.module_class_names.contains(seg) && METACLASS_BASES.contains(&seg)
+                })
+            }) || markers.metaclass_names.contains(c.name.as_str());
             // Multi-inheritance with concrete bases conflicts with
             // `slots=True`; emit the decorator without `slots=True` in
             // that case. FINDINGS #102. Also drop `slots=True` for any
@@ -2431,6 +2447,7 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
                 && !is_lazy_proxy
                 && !is_skip_decoration_subclass
                 && !is_exception_subclass
+                && !is_metaclass
                 && !has_dataclass_decorator(&c.decorator_list);
             // Pydantic `model` classes must have `model_config = ConfigDict(extra="forbid")`
             // as their first body statement unless the user already defined it.
@@ -3435,6 +3452,38 @@ fn exception_class_names_from<'a>(
         }
     }
     exc
+}
+
+/// Builtin metaclasses: a class deriving from one is itself a metaclass.
+const METACLASS_BASES: &[&str] = &["type", "ABCMeta", "EnumMeta", "EnumType"];
+
+/// Names of every module-level class that is (transitively) a metaclass:
+/// seeded from an external (non-module) base in [`METACLASS_BASES`], then
+/// closed over module-class inheritance — a subclass of a metaclass is one.
+fn metaclass_names_from<'a>(
+    classes: &'a [(String, Vec<String>)],
+    module_classes: &std::collections::HashSet<&str>,
+) -> std::collections::HashSet<&'a str> {
+    let mut meta: std::collections::HashSet<&'a str> = classes
+        .iter()
+        .filter(|(_, bases)| {
+            bases.iter().any(|b| {
+                !module_classes.contains(b.as_str()) && METACLASS_BASES.contains(&b.as_str())
+            })
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    loop {
+        let before = meta.len();
+        for (name, bases) in classes {
+            if bases.iter().any(|b| meta.contains(b.as_str())) {
+                meta.insert(name.as_str());
+            }
+        }
+        if meta.len() == before {
+            return meta;
+        }
+    }
 }
 
 /// Collect `(class name, base trailing segments)` for every *module-level*
@@ -4694,7 +4743,7 @@ fn make_extend_patch_stmts(target: &str, methods: &[Stmt]) -> Vec<Stmt> {
 ///
 /// Recurses into nested function/class bodies so a class defined inside a
 /// function still benefits from this transformation.
-fn inherit_parent_fields(body: Vec<Stmt>) -> Vec<Stmt> {
+fn inherit_parent_fields(body: Vec<Stmt>, plain_starts: &[u32]) -> Vec<Stmt> {
     // First pass: collect each class's own field annotations, indexed by name,
     // plus its direct bases so the MRO can be reconstructed.
     let mut field_map: HashMap<String, Vec<Stmt>> = HashMap::new();
@@ -4744,6 +4793,7 @@ fn inherit_parent_fields(body: Vec<Stmt>) -> Vec<Stmt> {
         stmts: Vec<Stmt>,
         field_map: &HashMap<String, Vec<Stmt>>,
         parents: &HashMap<String, Vec<String>>,
+        plain_starts: &[u32],
     ) -> Vec<Stmt> {
         stmts
             .into_iter()
@@ -4752,7 +4802,21 @@ fn inherit_parent_fields(body: Vec<Stmt>) -> Vec<Stmt> {
                     // Recurse so a class defined inside another class
                     // body is also rewritten.
                     let inner = std::mem::take(&mut c.body);
-                    c.body = rewrite(inner, field_map, parents);
+                    c.body = rewrite(inner, field_map, parents, plain_starts);
+
+                    // A `plain class` is emitted exactly as written: it has
+                    // no generated constructor to feed, and an annotated
+                    // assignment in its body is a class attribute. Copying
+                    // the parent's attributes into it shadowed them —
+                    // `Cfg.debug = True` no longer reached a subclass that
+                    // never declared `debug` (W7-11).
+                    if ClassMarkers::marker_covers(
+                        plain_starts,
+                        u32::from(c.range.start()),
+                        u32::from(c.name.range.start()),
+                    ) {
+                        return Stmt::ClassDef(c);
+                    }
 
                     // The class's own field annotations, keyed by name, so a
                     // re-declared parent field can be re-sited (see below).
@@ -4858,14 +4922,14 @@ fn inherit_parent_fields(body: Vec<Stmt>) -> Vec<Stmt> {
                 }
                 Stmt::FunctionDef(mut f) => {
                     let inner = std::mem::take(&mut f.body);
-                    f.body = rewrite(inner, field_map, parents);
+                    f.body = rewrite(inner, field_map, parents, plain_starts);
                     Stmt::FunctionDef(f)
                 }
                 other => other,
             })
             .collect()
     }
-    rewrite(body, &field_map, &parents)
+    rewrite(body, &field_map, &parents, plain_starts)
 }
 
 /// Rewrite a `class!`'s synthesised `__init__` so it also accepts and
@@ -7253,5 +7317,74 @@ class __typhon_impl_C(object):
                 "must be left alone:\n{src}\n---\n{out}"
             );
         }
+    }
+
+    // ── W7-11: class emission ──────────────────────────────────────────────
+
+    #[test]
+    fn metaclasses_are_never_dataclasses() {
+        let out = parse_and_desugar(
+            "class Registry(type):\n    pass\n\nclass Strict(Registry):\n    pass\n\nclass Widget(metaclass=Registry):\n    size: int = 3\n",
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        let decorated = |name: &str| {
+            let at = lines
+                .iter()
+                .position(|l| l.starts_with(&format!("class {name}")))
+                .unwrap_or_else(|| panic!("no class {name} in:\n{out}"));
+            at > 0 && lines[at - 1].starts_with("@dataclasses.dataclass")
+        };
+        assert!(!decorated("Registry"), "{out}");
+        assert!(
+            !decorated("Strict"),
+            "a subclass of a metaclass is one:\n{out}"
+        );
+        // A class *using* a metaclass is an ordinary record type.
+        assert!(decorated("Widget"), "{out}");
+        // Dotted and other builtin metaclasses.
+        for src in [
+            "import builtins\nclass M(builtins.type):\n    pass\n",
+            "import enum\nclass M(enum.EnumMeta):\n    pass\n",
+        ] {
+            let out = parse_and_desugar(src);
+            assert!(!out.contains("@dataclasses.dataclass"), "{src}\n---\n{out}");
+        }
+    }
+
+    #[test]
+    fn plain_subclass_keeps_only_its_own_attributes() {
+        let src = "class Cfg:\n    debug: bool = False\n\nclass Other(Cfg):\n    pass\n\nclass Sub(Cfg):\n    debug: bool = True\n";
+        let module = tyc_syntax::parse_module(src).expect("parse").into_syntax();
+        let line_start = |needle: &str| src.find(needle).expect("present") as u32;
+        let plain = vec![
+            line_start("class Cfg"),
+            line_start("class Other"),
+            line_start("class Sub"),
+        ];
+        let out = emit(
+            &desugar_module_with(
+                &module,
+                DesugarOptions {
+                    plain_class_line_starts: plain,
+                    ..Default::default()
+                },
+            )
+            .module,
+        );
+        assert!(!out.contains("@dataclasses.dataclass"), "{out}");
+        // `Other` inherits `debug` from `Cfg` rather than shadowing it.
+        let other = out
+            .split("class Other(Cfg):")
+            .nth(1)
+            .expect("Other emitted");
+        let other_body = other.split("class Sub").next().unwrap_or(other);
+        assert!(!other_body.contains("debug"), "{out}");
+        // `Sub` declares its own and keeps it.
+        let sub = out.split("class Sub(Cfg):").nth(1).expect("Sub emitted");
+        assert!(sub.contains("debug: bool = True"), "{out}");
+        // A dataclass subclass still receives the inherited field copy.
+        let out = parse_and_desugar("class A:\n    x: int\n\nclass B(A):\n    y: int\n");
+        let b = out.split("class B(A):").nth(1).expect("B emitted");
+        assert!(b.contains("x: int"), "{out}");
     }
 }
