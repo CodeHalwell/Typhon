@@ -9,6 +9,7 @@ enum ResultRule {
     Float,
     Bool,
     Range,
+    Slice,
     Container(&'static str),
     Dict,
     Same,
@@ -38,6 +39,7 @@ macro_rules! contract {
     };
 }
 const CONTRACTS: &[Contract] = &[
+    contract!("slice", 1, 3, &[], ResultRule::Slice),
     contract!("len", 1, 1, &[], ResultRule::Int),
     contract!("int", 0, 2, &["base"], ResultRule::Int),
     contract!(
@@ -147,6 +149,7 @@ pub(super) fn result(name: &str, args: &[Type], keywords: &[(&str, Type)]) -> Op
         ResultRule::Str => Type::Str,
         ResultRule::Float => Type::Float,
         ResultRule::Bool => Type::Bool,
+        ResultRule::Slice => Type::Class("slice".into()),
         ResultRule::Range => Type::Class("range".into()),
         ResultRule::Container(head) => generic(head, vec![elem()]),
         ResultRule::Iterator => generic("Iterator", vec![elem()]),

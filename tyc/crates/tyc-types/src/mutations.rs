@@ -38,7 +38,10 @@ pub(super) fn index(c: &mut Checker, sub: &ruff_python_ast::ExprSubscript, recv:
                 }
                 _ => false,
             };
-            if !index_protocol && !c.is_assignable(&Type::Int, &actual) {
+            if !matches!(&actual, Type::Class(n) if n == "slice" && !c.classes.contains(n))
+                && !index_protocol
+                && !c.is_assignable(&Type::Int, &actual)
+            {
                 c.mismatch(
                     &Type::Int,
                     &actual,
@@ -118,4 +121,8 @@ pub(super) fn update(c: &mut Checker, call: &ruff_python_ast::ExprCall) -> Optio
         }
     }
     Some(Type::None)
+}
+
+pub(super) fn slice_object(c: &Checker, expr: &Expr) -> bool {
+    matches!(infer_expr_readonly(c, expr),Type::Class(n) if n == "slice" && !c.classes.contains(&n))
 }

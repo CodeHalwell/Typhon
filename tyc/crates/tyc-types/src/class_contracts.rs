@@ -244,3 +244,59 @@ pub(super) fn classvar(c: &Checker, class: &str, field: &str) -> bool {
     }
     false
 }
+
+pub(super) fn call_kwarg_type(c: &Checker, func: &Expr) -> Option<Type> {
+    let Expr::Attribute(a) = func else {
+        return None;
+    };
+    let receiver = infer_expr_readonly(c, &a.value);
+    let class = match &receiver {
+        Type::Class(n) | Type::Generic(n, _) => n.as_str(),
+        _ => return None,
+    };
+    struct Scan<'c, 's> {
+        c: &'c Checker<'s>,
+        class: &'c str,
+        method: &'c str,
+        result: Option<Type>,
+    }
+    impl<'a> Visitor<'a> for Scan<'_, '_> {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            if let Stmt::ClassDef(cd) = stmt {
+                if cd.name.as_str() == self.class
+                    || cd.name.as_str() == format!("__typhon_impl_{}", self.class)
+                {
+                    for stmt in &cd.body {
+                        if let Stmt::FunctionDef(f) = stmt {
+                            if f.name.as_str() == self.method {
+                                self.result = f
+                                    .parameters
+                                    .kwarg
+                                    .as_ref()
+                                    .and_then(|p| p.annotation.as_deref())
+                                    .map(|a| {
+                                        type_from_annotation_with_params(
+                                            a,
+                                            &self.c.classes,
+                                            &type_param_names_from(cd.type_params.as_deref()),
+                                        )
+                                    });
+                            }
+                        }
+                    }
+                }
+            }
+            visitor::walk_stmt(self, stmt);
+        }
+    }
+    let mut scan = Scan {
+        c,
+        class,
+        method: a.attr.as_str(),
+        result: None,
+    };
+    for stmt in &c.module?.body {
+        scan.visit_stmt(stmt);
+    }
+    scan.result
+}

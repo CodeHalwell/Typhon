@@ -11539,7 +11539,12 @@ fn check_builtin_first_argument(
         if let Expr::Name(n) = first {
             c.nullable_use(n.id.as_str(), &accepted, span);
         } else {
-            c.mismatch(&accepted, &actual, span);
+            let value = c.source.get(span.0..span.1).unwrap_or("value").to_owned();
+            if name == "len" {
+                c.nullable_attr_use(&value, &actual.strip_none(), span);
+            } else {
+                c.mismatch(&accepted, &actual, span);
+            }
         }
         return;
     }
@@ -12903,7 +12908,9 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
 
                         if head == "list" && args.len() == 1 {
                             let elem = args[0].clone();
-                            if matches!(sub.slice.as_ref(), Expr::Slice(_)) {
+                            if matches!(sub.slice.as_ref(), Expr::Slice(_))
+                                || mutations::slice_object(c, &sub.slice)
+                            {
                                 // `xs[a:b] = it`: `it` must be a sequence of T.
                                 // Skip when the RHS element type is unknown.
                                 if let Some(rhs_elem) = subscript_element_type(&value_type) {
@@ -17532,6 +17539,7 @@ fn is_known_primitive_attr(prim: &str, attr: &str) -> bool {
             "as_integer_ratio"
                 | "bit_count"
                 | "bit_length"
+                | "is_integer"
                 | "conjugate"
                 | "denominator"
                 | "from_bytes"
@@ -19363,7 +19371,10 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 {
                     let arg_ty = infer_expr(c, &pos_args[0]);
                     if let Type::Union(members) = &arg_ty {
-                        if let Some(bad) = members.iter().find(|m| !c.member_is_sized(m)) {
+                        if let Some(bad) = members
+                            .iter()
+                            .find(|m| !arg_ty.is_nullable() && !c.member_is_sized(m))
+                        {
                             let span = (
                                 pos_args[0].range().start().to_usize(),
                                 pos_args[0].range().end().to_usize(),
@@ -19375,7 +19386,11 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 check_builtin_first_argument(c, fn_name, pos_args);
                 if c.env.lookup(ctor).is_none() && builtins::contains(ctor) {
                     let actuals: Vec<Type> =
-                        pos_args.iter().map(|arg| infer_expr(c, arg)).collect();
+                        pos_args.iter().enumerate().map(|(i,arg)| {
+                            if i == 1 && matches!(ctor, "isinstance" | "issubclass") && matches!(arg, Expr::BinOp(b) if b.op == ruff_python_ast::Operator::BitOr) {
+                                type_from_annotation_with_params(arg, &c.classes, &[])
+                            } else { infer_expr(c,arg) }
+                        }).collect();
                     let keywords: Vec<(&str, Type)> = kw_args
                         .iter()
                         .filter_map(|kw| {
@@ -19940,14 +19955,18 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                             .as_deref()
                             .and_then(|n| c.function_kwarg_types.get(n))
                             .cloned()
+                            .or_else(|| class_contracts::call_kwarg_type(c, &call.func))
                     } else {
                         None
                     };
                     if let Some(param_names) = kwarg_param_names {
                         for kw in kw_args {
                             let Some(ident) = &kw.arg else { continue };
-                            let Some(idx) = param_names.iter().position(|p| p == ident.as_str())
-                            else {
+                            let Some(idx) = param_names.iter().enumerate().find_map(|(i, p)| {
+                                (i >= arity_info.as_ref().map_or(0, |a| a.posonly_count)
+                                    && p == ident.as_str())
+                                .then_some(i)
+                            }) else {
                                 // No positional parameter matches this name.
                                 // Try a kw-only parameter; failing that, the
                                 // argument is absorbed by `**kwargs: T` and
@@ -20186,6 +20205,59 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                             return ret;
                         }
                     }
+                    if func_is_class_name
+                        && c.find_method(&name, "__init__").is_none()
+                        && c.find_method(&name, "__new__").is_none()
+                    {
+                        let builtin = [
+                            "int",
+                            "str",
+                            "float",
+                            "bool",
+                            "list",
+                            "tuple",
+                            "dict",
+                            "set",
+                            "frozenset",
+                        ]
+                        .into_iter()
+                        .find(|base| c.class_derives_from_builtin(&name, &[*base]));
+                        if c.enums.contains_key(&name) || builtin.is_some() {
+                            let keys: Vec<&str> = kw_args
+                                .iter()
+                                .filter_map(|k| k.arg.as_ref().map(|a| a.as_str()))
+                                .collect();
+                            let expanded = pos_args.iter().any(|a| matches!(a, Expr::Starred(_)))
+                                || kw_args.iter().any(|k| k.arg.is_none());
+                            let valid = if c.enums.contains_key(&name) {
+                                pos_args.len() + usize::from(keys.contains(&"value")) == 1
+                                    && keys.iter().all(|k| *k == "value")
+                            } else {
+                                builtins::valid_arity(builtin.unwrap(), pos_args.len(), &keys)
+                            };
+                            if !expanded && !valid {
+                                c.diagnostics.push_error(TycError::generic(format!(
+                                    "invalid constructor arguments to `{name}`"
+                                )));
+                            }
+                            for (i, arg) in pos_args.iter().enumerate() {
+                                let actual = infer_expr(c, arg);
+                                if !c.enums.contains_key(&name) {
+                                    if let Some(expected) =
+                                        builtins::argument_type(builtin.unwrap(), i, None)
+                                    {
+                                        if !c.is_assignable(&expected, &actual) {
+                                            c.mismatch(&expected, &actual, call_span);
+                                        }
+                                    }
+                                }
+                            }
+                            for kw in kw_args {
+                                let _ = infer_expr(c, &kw.value);
+                            }
+                            return Type::Class(name);
+                        }
+                    }
                     if let Some(shape) = effective_class_shape(&name, &c.class_shapes) {
                         // `plain class` / `class!` may carry a hand-written
                         // `__init__` whose parameter names need not match the
@@ -20298,12 +20370,18 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                                     } else {
                                         let supplied = pos_args.len()
                                             + kw_args.iter().filter(|k| k.arg.is_some()).count();
-                                        c.wrong_args(
-                                            &name,
-                                            info.min_positional,
-                                            supplied,
-                                            call_span,
-                                        );
+                                        if supplied == info.min_positional {
+                                            c.diagnostics.push_error(TycError::generic(format!(
+                                                "conflicting constructor arguments to `{name}`"
+                                            )));
+                                        } else {
+                                            c.wrong_args(
+                                                &name,
+                                                info.min_positional,
+                                                supplied,
+                                                call_span,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -20973,6 +21051,14 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     Type::Unknown
                 }
                 Type::Int => {
+                    if attr_name == "is_integer" {
+                        return Type::Function {
+                            params: vec![],
+                            ret: Box::new(Type::Bool),
+                            variadic: false,
+                            min_params: Some(0),
+                        };
+                    }
                     if !is_known_primitive_attr("int", attr_name)
                         && !is_user_builtin_extension(c, "int", attr_name)
                     {
@@ -21101,7 +21187,9 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             // trailing `?` — so extracting from a `list[T?]` honestly
             // yields `T?` rather than silently dropping the `None`
             // (the soundness hole).
-            if matches!(s.slice.as_ref(), Expr::Slice(_)) {
+            if matches!(s.slice.as_ref(), Expr::Slice(_))
+                || matches!(&slice_ty, Type::Class(n) if n == "slice" && !c.classes.contains(n))
+            {
                 // A slice (`xs[a:b]`) yields the container itself, not an
                 // element: `list[int][a:b]` is `list[int]`, `str[a:b]` is
                 // `str`. Was always `Unknown`, so `let s: str = xs[1:3]` (xs:
@@ -28609,7 +28697,7 @@ def f(b: Box) -> int:
 ";
         let d = check(src);
         assert!(
-            d.errors().iter().any(|e| matches!(
+            d.errors().iter().chain(d.warnings()).any(|e| matches!(
                 e,
                 TycError::OperatorTypeMismatch { .. } | TycError::NullableUse { .. }
             )),
@@ -28709,7 +28797,7 @@ impl Box:
         ] {
             let d = check(src);
             assert!(
-                d.errors().iter().any(|e| matches!(
+                d.errors().iter().chain(d.warnings()).any(|e| matches!(
                     e,
                     TycError::OperatorTypeMismatch { .. } | TycError::NullableUse { .. }
                 )),
@@ -39163,5 +39251,22 @@ def main() -> None:
             "{:?}",
             check_class_kinds(src).errors()
         );
+    }
+    #[test]
+    fn w2_17_builtin_false_positive_controls() {
+        for src in [
+            "def f(xs: list[int]) -> list[int]:\n    xs[slice(0, 1)] = [2]\n    return xs[slice(0, 2)]\n",
+            "from enum import Enum\nclass Choice(str, Enum):\n    A = \"a\"\ndef f() -> Choice:\n    return Choice(\"a\")\n",
+            "def f(n: int) -> bool:\n    return n.is_integer()\n",
+            "def f(v: int?) -> bool:\n    return isinstance(v, int | None)\n",
+            "from enum import IntEnum\nclass Choice(IntEnum):\n    A = 2\ndef f() -> Choice:\n    return Choice(2)\n",
+            "plain class Count(int):\n    pass\ndef f() -> Count:\n    return Count(2)\n",
+            "class Bag:\n    tag: int\nimpl Bag:\n    def add(self, item: str, /, **meta: int) -> None:\n        pass\ndef f(b: Bag) -> None:\n    b.add(\"a\", item=3)\n",
+        ] { assert!(check_full(src).errors().is_empty(), "{src}: {:?}", check_full(src).errors()); }
+    }
+    #[test]
+    fn w2_17_len_has_one_nullable_diagnostic() {
+        let d = check_full("def f(v: str?) -> int:\n    return len(v)\n");
+        assert_eq!(d.errors().len(), 1, "{:?}", d.errors());
     }
 }

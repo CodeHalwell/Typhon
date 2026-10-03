@@ -3398,6 +3398,7 @@ fn builtin_names() -> std::collections::HashSet<&'static str> {
         // Built-in functions
         "print",
         "len",
+        "slice",
         "range",
         "abs",
         "min",
