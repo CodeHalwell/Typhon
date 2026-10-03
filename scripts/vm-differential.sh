@@ -78,7 +78,7 @@ NOBUILD_BASELINE="$REPO_ROOT/scripts/nobuild-baseline.txt"
 NONDET="$REPO_ROOT/scripts/differential-nondeterministic.txt"
 SCOPE="all"
 FILTER=""
-JOBS="$(nproc 2>/dev/null || echo 4)"
+JOBS="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 TIMEOUT=20
 UPDATE=0
 KEEP=0
@@ -98,6 +98,7 @@ while [ $# -gt 0 ]; do
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
+
 
 # ---------------------------------------------------------------- preflight --
 if [ ! -x "$TYC" ]; then
@@ -152,6 +153,39 @@ SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/tyc-diff.XXXXXX")"
 cleanup() { [ "$KEEP" = "1" ] || rm -rf "$SCRATCH"; }
 trap cleanup EXIT
 
+# `timeout` is GNU coreutils and absent on stock macOS, where every unit then
+# fails (the calls below run it through `env`, which only searches PATH, so a
+# shell function cannot stand in). Install a small executable on PATH with
+# GNU's contract: kill the child after N seconds and report exit 124. A flag
+# file distinguishes "the watchdog fired" from "the child exiting on its own"
+# — polling the watchdog process instead races a command that finishes at the
+# deadline.
+if ! command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_BIN_DIR="$SCRATCH/bin"
+    mkdir -p "$TIMEOUT_BIN_DIR"
+    cat > "$TIMEOUT_BIN_DIR/timeout" <<'TIMEOUT_SH'
+#!/usr/bin/env bash
+secs="$1"; shift
+flag="$(mktemp -u "${TMPDIR:-/tmp}/tyc-timeout.XXXXXX")"
+"$@" &
+pid=$!
+( sleep "$secs"; : > "$flag"; kill -TERM "$pid" 2>/dev/null ) &
+watcher=$!
+status=0
+wait "$pid" 2>/dev/null || status=$?
+if [ -e "$flag" ]; then
+    status=124
+    rm -f "$flag"
+fi
+kill "$watcher" 2>/dev/null
+wait "$watcher" 2>/dev/null
+exit "$status"
+TIMEOUT_SH
+    chmod +x "$TIMEOUT_BIN_DIR/timeout"
+    PATH="$TIMEOUT_BIN_DIR:$PATH"
+    export PATH
+fi
+
 case "$SCOPE" in
     examples) ROOTS=(examples) ;;
     stress)   ROOTS=(stress) ;;
@@ -161,7 +195,19 @@ esac
 
 PROJECTS="$SCRATCH/projects.txt"
 UNITS="$SCRATCH/units.txt"
-find "${ROOTS[@]}" -name typhon.toml -printf '%h\n' 2>/dev/null | sort -u > "$PROJECTS"
+# `-printf` is a GNU find extension; on BSD find it fails, and swallowing that
+# with 2>/dev/null silently emptied the project list — every project-internal
+# .ty was then mis-discovered as a standalone unit and the corpus grew by
+# hundreds of broken entries with no error. Use -exec dirname (POSIX) and
+# refuse to continue if it finds nothing.
+find "${ROOTS[@]}" -name typhon.toml -exec dirname {} \; | sort -u > "$PROJECTS"
+if [ ! -s "$PROJECTS" ]; then
+    echo "error: project discovery found no ${ROOTS[*]}/*/typhon.toml." >&2
+    echo "       Either there are no project units, or find failed (wrong working" >&2
+    echo "       directory, unreadable trees). Refusing to run against a corpus that" >&2
+    echo "       is not the one the baseline was recorded on." >&2
+    exit 2
+fi
 
 {
     # project units
@@ -405,8 +451,11 @@ TOML
 export -f run_unit run_unit_inner
 
 RESULTS="$SCRATCH/results.tsv"
-# shellcheck disable=SC2016
-xargs -a "$UNITS" -d '\n' -P "$JOBS" -I{} bash -c 'run_unit "$@"' _ {} > "$RESULTS"
+# `xargs -a FILE -d '\n'` is GNU-only (BSD xargs has neither). Feed the unit
+# list on stdin as NUL-separated records instead, which both implementations
+# read with -0 and which needs no quote processing (unit paths have no
+# whitespace, but -0 avoids the shell's word splitting entirely).
+tr '\n' '\0' < "$UNITS" | xargs -0 -P "$JOBS" -I{} bash -c 'run_unit "$@"' _ {} > "$RESULTS"
 XARGS_STATUS=$?
 sort -k2,2 -o "$RESULTS" "$RESULTS"
 
@@ -426,7 +475,7 @@ if [ "$N_RESULTS" -ne "$TOTAL" ] || [ "$XARGS_STATUS" -ne 0 ]; then
 fi
 
 # ------------------------------------------------------------- aggregation --
-count() { grep -cP "^$1\t" "$RESULTS" || true; }
+count() { awk -F'\t' -v c="$1" '$1 == c' "$RESULTS" | wc -l | tr -d ' '; }
 N_OK=$(count ok); N_DIV=$(count diverge); N_NOBUILD=$(count nobuild)
 N_NOENTRY=$(count noentry); N_VAC=$(count vacuous)
 N_VACRT=$(count vacuous-runtime)
@@ -434,11 +483,11 @@ N_TMO=$(count both-timeout); N_ND=$(count nondeterministic)
 N_NOCOMPILE=$(count noncompiling)
 
 DIVERGED="$SCRATCH/diverged.txt"
-grep -P '^diverge\t' "$RESULTS" | cut -f2 | sort > "$DIVERGED"
+awk -F'\t' '$1 == "diverge" { print $2 }' "$RESULTS" | sort > "$DIVERGED"
 NOBUILT="$SCRATCH/nobuilt.txt"
-grep -P '^nobuild\t' "$RESULTS" | cut -f2 | sort > "$NOBUILT"
+awk -F'\t' '$1 == "nobuild" { print $2 }' "$RESULTS" | sort > "$NOBUILT"
 NOCOMPILE_LIST="$SCRATCH/noncompiling.txt"
-grep -P '^noncompiling\t' "$RESULTS" | sort > "$NOCOMPILE_LIST"
+awk -F'\t' '$1 == "noncompiling"' "$RESULTS" | sort > "$NOCOMPILE_LIST"
 
 if [ -n "$REPORT" ]; then
     cp "$RESULTS" "$REPORT"
@@ -592,7 +641,7 @@ comm -12 "$EXPECTED" <(sort -u "$UNITS") > "$COVERED"
 # runner flipped every pydantic/yaml-dependent divergence to `vacuous` and the
 # gate failed by design on its very first environment mismatch.
 OK_UNITS="$SCRATCH/ok_units.txt"
-grep -P '^ok\t' "$RESULTS" | cut -f2 | sort > "$OK_UNITS"
+awk -F'\t' '$1 == "ok" { print $2 }' "$RESULTS" | sort > "$OK_UNITS"
 
 NEW="$SCRATCH/new.txt"
 FIXED="$SCRATCH/fixed.txt"
@@ -644,7 +693,7 @@ if [ -s "$NB_NEW" ]; then
     status=1
     echo "FAIL: $(wc -l < "$NB_NEW" | tr -d ' ') unit(s) newly fail \`tyc build\`:"
     while IFS= read -r u; do
-        printf '  + %s\n      %s\n' "$u" "$(grep -P "^nobuild\t\Q$u\E\t" "$RESULTS" | cut -f3)"
+        printf '  + %s\n      %s\n' "$u" "$(awk -F'\t' -v u="$u" '$1 == "nobuild" && $2 == u { print $3 }' "$RESULTS")"
     done < "$NB_NEW"
     echo "  Either the build regressed, or the unit is a new diagnostic probe —"
     echo "  in which case record it with scripts/vm-differential.sh --update."
@@ -662,8 +711,8 @@ fi
 # Advisory, never fatal — see the header of the declarations file for why a
 # single agreeing run is not proof that an entry is stale.
 STALE_DECL="$SCRATCH/declared_agreed.txt"
-grep -P '^nondeterministic\t' "$RESULTS" \
-    | grep -F 'declared; but agreed this run' | cut -f2 | sort > "$STALE_DECL" || true
+awk -F'\t' '$1 == "nondeterministic" && /declared; but agreed this run/ { print $2 }' "$RESULTS" \
+    | sort > "$STALE_DECL" || true
 if [ -s "$STALE_DECL" ]; then
     echo "note: $(wc -l < "$STALE_DECL" | tr -d ' ') declared-nondeterministic unit(s) were fully reproducible AND"
     echo "      agreed on both sides this run. If that holds consistently the entry is"
@@ -676,7 +725,7 @@ if [ "$N_NEW" -gt 0 ]; then
     status=1
     echo "FAIL: $N_NEW NEW divergence(s) not in the baseline:"
     while IFS= read -r u; do
-        printf '  + %s\n      %s\n' "$u" "$(grep -P "^diverge\t\Q$u\E\t" "$RESULTS" | cut -f3)"
+        printf '  + %s\n      %s\n' "$u" "$(awk -F'\t' -v u="$u" '$1 == "diverge" && $2 == u { print $3 }' "$RESULTS")"
     done < "$NEW"
     echo
     echo "  The VM must behave identically to \`tyc build\` + CPython. Fix the VM,"
@@ -700,7 +749,7 @@ if [ "$N_UNVER" -gt 0 ]; then
     echo "      for the package set the classifications assume). Neither fixed nor"
     echo "      regressed; not failing the gate on them:"
     while IFS= read -r u; do
-        cls="$(grep -P "\t\Q$u\E\t" "$RESULTS" | cut -f1 | head -1)"
+        cls="$(awk -F'\t' -v u="$u" '$2 == u { print $1; exit }' "$RESULTS")"
         printf '  ? %s  (%s)\n' "$u" "${cls:-no result}"
     done < "$UNVERIFIABLE"
     echo
