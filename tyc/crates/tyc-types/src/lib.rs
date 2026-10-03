@@ -3212,6 +3212,13 @@ struct Checker<'a> {
     /// (review 2026-09-30 §3.4). Empty for the overwhelmingly common
     /// function with no `nonlocal` anywhere beneath it.
     nonlocals_rebound_by_call: std::collections::HashSet<String>,
+    /// Nested `def`s of the function being checked that can rebind its
+    /// locals through `nonlocal` (directly or by calling another such `def`)
+    /// and are only ever *called* by name, never passed or stored: writer
+    /// name → the locals it rebinds. A call to one of them resets exactly
+    /// those narrowings; any other call cannot reach it (review 2026-10-03
+    /// §4.5). Writers that escape are in `nonlocals_rebound_by_call`.
+    nonlocal_writer_calls: HashMap<String, std::collections::HashSet<String>>,
     /// Which fields a call into this module's own functions, constructors
     /// and methods can write — what a statement-position call may do to the
     /// narrowings of an object passed to it. See [`FieldWriteSummary`].
@@ -3734,6 +3741,7 @@ impl<'a> Checker<'a> {
             loop_exits: Vec::new(),
             assign_sites: Vec::new(),
             nonlocals_rebound_by_call: std::collections::HashSet::new(),
+            nonlocal_writer_calls: HashMap::new(),
             function_signatures: HashMap::new(),
             function_arity_info: HashMap::new(),
             function_kwarg_types: HashMap::new(),
@@ -12180,55 +12188,165 @@ impl Checker<'_> {
     }
 }
 
-/// Names declared `nonlocal` by any `def` nested (at any depth) inside
-/// `body`. Lambdas cannot declare `nonlocal`, and a nested class body's own
-/// methods are walked too, since `nonlocal` there still targets the
-/// enclosing function's scope.
-fn collect_nested_nonlocals(body: &[Stmt]) -> std::collections::HashSet<String> {
-    fn walk(stmts: &[Stmt], nested: bool, acc: &mut std::collections::HashSet<String>) {
+/// The nested `def`s of `body` that can rebind a local of `body` through
+/// `nonlocal`, split by whether they escape. Returns the locals any
+/// *escaping* writer rebinds — those reset on every call, since anything may
+/// end up calling it — and, for writers only ever called by name, writer →
+/// the locals it rebinds (directly, or by calling another writer).
+fn collect_nonlocal_writers(
+    body: &[Stmt],
+) -> (
+    std::collections::HashSet<String>,
+    HashMap<String, std::collections::HashSet<String>>,
+) {
+    use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
+    // Nested `def`s at any statement depth of `body` (not inside another
+    // def), and the methods of classes nested there — which are called
+    // through an attribute, so they always count as escaping.
+    fn defs<'a>(stmts: &'a [Stmt], out: &mut Vec<(&'a ruff_python_ast::StmtFunctionDef, bool)>) {
         for s in stmts {
             match s {
-                Stmt::Nonlocal(nl) if nested => {
-                    acc.extend(nl.names.iter().map(|n| n.as_str().to_owned()));
+                Stmt::FunctionDef(f) => out.push((f, false)),
+                Stmt::ClassDef(cd) => {
+                    for m in &cd.body {
+                        if let Stmt::FunctionDef(f) = m {
+                            out.push((f, true));
+                        }
+                    }
                 }
-                Stmt::FunctionDef(f) => walk(&f.body, true, acc),
-                Stmt::ClassDef(cd) => walk(&cd.body, nested, acc),
                 Stmt::If(i) => {
-                    walk(&i.body, nested, acc);
-                    for clause in &i.elif_else_clauses {
-                        walk(&clause.body, nested, acc);
+                    defs(&i.body, out);
+                    for c in &i.elif_else_clauses {
+                        defs(&c.body, out);
                     }
                 }
                 Stmt::For(f) => {
-                    walk(&f.body, nested, acc);
-                    walk(&f.orelse, nested, acc);
+                    defs(&f.body, out);
+                    defs(&f.orelse, out);
                 }
                 Stmt::While(w) => {
-                    walk(&w.body, nested, acc);
-                    walk(&w.orelse, nested, acc);
+                    defs(&w.body, out);
+                    defs(&w.orelse, out);
                 }
-                Stmt::With(w) => walk(&w.body, nested, acc),
+                Stmt::With(w) => defs(&w.body, out),
                 Stmt::Try(t) => {
-                    walk(&t.body, nested, acc);
+                    defs(&t.body, out);
                     for h in &t.handlers {
                         let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
-                        walk(&h.body, nested, acc);
+                        defs(&h.body, out);
                     }
-                    walk(&t.orelse, nested, acc);
-                    walk(&t.finalbody, nested, acc);
+                    defs(&t.orelse, out);
+                    defs(&t.finalbody, out);
                 }
-                Stmt::Match(m) => {
-                    for case in &m.cases {
-                        walk(&case.body, nested, acc);
-                    }
-                }
+                Stmt::Match(m) => m.cases.iter().for_each(|c| defs(&c.body, out)),
                 _ => {}
             }
         }
     }
-    let mut acc = std::collections::HashSet::new();
-    walk(body, false, &mut acc);
-    acc
+    // `nonlocal` names anywhere in a def, the names it calls, and every name
+    // it (or `body`) reads other than as a call's callee.
+    #[derive(Default)]
+    struct Scan {
+        nonlocals: std::collections::HashSet<String>,
+        calls: std::collections::HashSet<String>,
+        loads: std::collections::HashSet<String>,
+    }
+    impl<'a> Visitor<'a> for Scan {
+        fn visit_stmt(&mut self, s: &'a Stmt) {
+            if let Stmt::Nonlocal(nl) = s {
+                self.nonlocals
+                    .extend(nl.names.iter().map(|n| n.as_str().to_owned()));
+            }
+            walk_stmt(self, s);
+        }
+        fn visit_expr(&mut self, e: &'a Expr) {
+            match e {
+                Expr::Call(call) => {
+                    if let Expr::Name(f) = call.func.as_ref() {
+                        self.calls.insert(f.id.as_str().to_owned());
+                        for a in &call.arguments.args {
+                            self.visit_expr(a);
+                        }
+                        for k in &call.arguments.keywords {
+                            self.visit_expr(&k.value);
+                        }
+                        return;
+                    }
+                }
+                Expr::Name(n) => {
+                    self.loads.insert(n.id.as_str().to_owned());
+                }
+                _ => {}
+            }
+            walk_expr(self, e);
+        }
+    }
+    let mut nested = Vec::new();
+    defs(body, &mut nested);
+    if nested.is_empty() {
+        return Default::default();
+    }
+    let mut per_def: HashMap<String, Scan> = HashMap::new();
+    for (f, is_method) in &nested {
+        let mut s = Scan::default();
+        for st in &f.body {
+            s.visit_stmt(st);
+        }
+        // Two defs may share a name (a method and a function, or a
+        // redefinition); keep the union of what they do.
+        let key = if *is_method {
+            format!(".{}", f.name)
+        } else {
+            f.name.as_str().to_owned()
+        };
+        let entry = per_def.entry(key).or_default();
+        entry.nonlocals.extend(s.nonlocals);
+        entry.calls.extend(s.calls);
+        entry.loads.extend(s.loads);
+    }
+    // Writers, closed over "calls a writer".
+    let mut writes: HashMap<String, std::collections::HashSet<String>> = per_def
+        .iter()
+        .filter(|(_, s)| !s.nonlocals.is_empty())
+        .map(|(n, s)| (n.clone(), s.nonlocals.clone()))
+        .collect();
+    loop {
+        let mut changed = false;
+        for (name, s) in &per_def {
+            let mut acc: std::collections::HashSet<String> =
+                writes.get(name).cloned().unwrap_or_default();
+            let before = acc.len();
+            for callee in &s.calls {
+                if callee != name {
+                    if let Some(w) = writes.get(callee) {
+                        acc.extend(w.iter().cloned());
+                    }
+                }
+            }
+            if acc.len() != before {
+                writes.insert(name.clone(), acc);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // A writer read as a value anywhere — passed, stored, returned — escapes.
+    let mut all = Scan::default();
+    for st in body {
+        all.visit_stmt(st);
+    }
+    let mut escaped = std::collections::HashSet::new();
+    let mut called = HashMap::new();
+    for (name, w) in writes {
+        if name.starts_with('.') || all.loads.contains(&name) {
+            escaped.extend(w);
+        } else {
+            called.insert(name, w);
+        }
+    }
+    (escaped, called)
 }
 
 /// What a call into this module's own code can do to the fields of an object
@@ -12757,7 +12875,16 @@ fn widen_captured_names(c: &mut Checker, at: usize) {
 /// `yield` hands control to the caller, which may change any object.
 fn after_expr_effects(c: &mut Checker, expr: &Expr) {
     match expr {
-        Expr::Call(call) => invalidate_after_call(c, call),
+        Expr::Call(call) => {
+            // A direct call to a nested `def` that rebinds a local through
+            // `nonlocal` resets exactly that local.
+            if let Expr::Name(f) = call.func.as_ref() {
+                if let Some(names) = c.nonlocal_writer_calls.get(f.id.as_str()).cloned() {
+                    c.env.reset_local_narrowings(&names);
+                }
+            }
+            invalidate_after_call(c, call);
+        }
         // The caller runs between `yield` and the next statement; any field
         // it can see may have changed (review 2026-10-03 §3.11).
         Expr::Yield(_) | Expr::YieldFrom(_) => c.env.attr_narrowings.clear(),
@@ -12812,6 +12939,118 @@ fn invalidate_after_call(c: &mut Checker, call: &ruff_python_ast::ExprCall) {
             let skip = usize::from(frozen_roots.contains(root));
             !segs.skip(skip).any(|s| fields.contains(s))
         });
+    }
+}
+
+/// The object expression an attribute target writes into (`a.b` in
+/// `a.b.c = v`).
+fn attr_base(target: &Expr) -> Option<&Expr> {
+    match target {
+        Expr::Attribute(a) => Some(&a.value),
+        _ => None,
+    }
+}
+
+/// The static type of the object that owns the last field of `path`
+/// (`p.addr` for `p.addr.city`), following declared field types from the
+/// root binding. `None` when any step is unknown.
+fn path_owner_type(c: &Checker, path: &str) -> Option<Type> {
+    let segs: Vec<&str> = path.split('.').collect();
+    let (root, fields) = segs.split_first()?;
+    let mut t = c.env.lookup(root)?.narrowed.clone();
+    for (i, f) in fields.iter().enumerate() {
+        if i + 1 == fields.len() {
+            return Some(t);
+        }
+        let partial = segs[..=i + 1].join(".");
+        t = match c.env.attr_narrowed(&partial) {
+            Some(n) => n.clone(),
+            None => match t.strip_none() {
+                Type::Class(name) => c.find_field(&name, f)?.clone(),
+                _ => return None,
+            },
+        };
+    }
+    None
+}
+
+/// Whether two objects of static types `a` and `b` can be the same object:
+/// some class of one is the other or a subclass of it. Anything this cannot
+/// decide may alias.
+fn may_alias(c: &Checker, a: &Type, b: &Type) -> bool {
+    let classes = |t: &Type| -> Option<Vec<String>> {
+        match t.strip_none() {
+            Type::Class(n) => Some(vec![n]),
+            Type::Union(xs) => xs
+                .iter()
+                .map(|x| match x {
+                    Type::Class(n) => Some(n.clone()),
+                    Type::None => Some("None".to_owned()),
+                    _ => None,
+                })
+                .collect(),
+            _ => None,
+        }
+    };
+    let (Some(xs), Some(ys)) = (classes(a), classes(b)) else {
+        return true;
+    };
+    xs.iter().any(|x| {
+        ys.iter().any(|y| {
+            x == y
+                || !c.class_hierarchy_fully_known(x)
+                || !c.class_hierarchy_fully_known(y)
+                || c.class_inherits_from(x, y)
+                || c.class_inherits_from(y, x)
+        })
+    })
+}
+
+/// After `<owner>.field = value`, drop the narrowings of `field` on other
+/// objects that may be the same object and whose narrowed type `value` no
+/// longer fits — `keep` (the written path itself) excepted. Before, every
+/// `*.field` narrowing went, so `if src.name is not None: dst.name =
+/// src.name; src.name.upper()` was rejected, and so was `p.email` after an
+/// unrelated `acc.email = "x"` (review 2026-10-03 §4.4). Paths *below* an
+/// aliased `field` always go: the object they read through was replaced.
+fn clear_aliased_field_narrowings(
+    c: &mut Checker,
+    field: &str,
+    keep: &str,
+    owner: &Type,
+    value: &Type,
+) {
+    let suffix = format!(".{field}");
+    let inner = format!(".{field}.");
+    let stale: Vec<String> = c
+        .env
+        .attr_narrowings
+        .iter()
+        .filter(|(k, _)| k.as_str() != keep)
+        .filter_map(|(k, narrowed)| {
+            let ends = k.ends_with(&suffix);
+            let below = k.contains(&inner);
+            if !ends && !below {
+                return None;
+            }
+            let field_path = if ends {
+                k.clone()
+            } else {
+                k[..k.find(&inner)? + suffix.len()].to_owned()
+            };
+            let aliases = path_owner_type(c, &field_path).is_none_or(|o| may_alias(c, &o, owner));
+            if !aliases {
+                return None;
+            }
+            let still_fits = ends
+                && !below
+                && !matches!(value, Type::Unknown | Type::Any)
+                && c.is_assignable(narrowed, value);
+            (!still_fits).then(|| k.clone())
+        })
+        .collect();
+    for k in stale {
+        c.env.clear_attr_narrowing(&k);
     }
 }
 
@@ -13166,16 +13405,21 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         // the same field narrowed under any OTHER root goes too
                         // (review 2026-09-30 §3.8).
                         if let Some(field) = path.rsplit('.').next() {
-                            c.env.clear_attr_narrowings_of_field(field, &path);
+                            let owner = attr_base(target)
+                                .map(|b| infer_expr_readonly(c, b))
+                                .unwrap_or(Type::Unknown);
+                            clear_aliased_field_narrowings(c, field, &path, &owner, &value_type);
                         }
                         if !value_type.is_nullable() && !matches!(value_type, Type::Unknown) {
                             c.env.narrow_attr(path, value_type.clone());
                         }
                     } else if let Expr::Attribute(a) = target {
                         // `reg["k"].v = None` / `hs[0].name = None`: the object
-                        // has no access path, so it may be any object whose
-                        // `v` is narrowed (review 2026-10-03 §3.11, §4.8).
-                        c.env.clear_attr_narrowings_of_field(a.attr.as_str(), "");
+                        // has no access path, so it may be any object of a
+                        // compatible type whose `v` is narrowed (review
+                        // 2026-10-03 §3.11, §4.8).
+                        let owner = infer_expr_readonly(c, &a.value);
+                        clear_aliased_field_narrowings(c, a.attr.as_str(), "", &owner, &value_type);
                     }
                 } else if matches!(target, Expr::Tuple(_) | Expr::List(_)) {
                     // Tuple/list unpack. A `let`/`mut` form introduces fresh
@@ -14576,10 +14820,9 @@ fn check_function(
     // Locals a nested `def` of THIS body declares `nonlocal` (see
     // `nonlocals_rebound_by_call`); the enclosing function's set is
     // restored on exit.
-    let saved_nonlocals = std::mem::replace(
-        &mut c.nonlocals_rebound_by_call,
-        collect_nested_nonlocals(body),
-    );
+    let (escaped_nonlocals, writer_calls) = collect_nonlocal_writers(body);
+    let saved_nonlocals = std::mem::replace(&mut c.nonlocals_rebound_by_call, escaped_nonlocals);
+    let saved_writer_calls = std::mem::replace(&mut c.nonlocal_writer_calls, writer_calls);
 
     // Declare parameters with their annotation types. Type parameters resolve
     // to `Any` until a real inference engine lands. Inside a class body, an
@@ -14738,6 +14981,7 @@ fn check_function(
     c.env.attr_narrowings = saved_attr_narrowings;
     c.reassigned_names = saved_reassigned_names;
     c.nonlocals_rebound_by_call = saved_nonlocals;
+    c.nonlocal_writer_calls = saved_writer_calls;
     c.current_return = saved_return;
     c.unsafe_origin_bindings = saved_unsafe_origins;
     c.active_typevar_bounds = saved_bounds;

@@ -87,6 +87,16 @@ review deferred; the third — the 2026-09-30 release-readiness review
   `yield` drops field narrowings, since the caller runs in between. A
   lambda or nested `def` no longer keeps the narrowing of a captured name
   that the enclosing body reassigns after it (or inside a loop around it).
+- **Fewer false invalidations.** A field write no longer drops the
+  same-named field's narrowing on every object: only on objects whose
+  static type can alias the written one, and only when the written value no
+  longer fits the narrowing. `if src.name is not None: dst.name = src.name;
+  src.name.upper()` and `acc.email = None` next to an unrelated
+  `p.email` narrowing now check. A nested `def` that rebinds a local
+  through `nonlocal` resets that local only on a call that can reach it
+  (calling it, or a nested `def` that calls it); once it escapes (stored,
+  passed, returned, or a nested class method) every call still resets it,
+  as before.
 
 ### Third wave — the 2026-09-30 release-readiness review
 

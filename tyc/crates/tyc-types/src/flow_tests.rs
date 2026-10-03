@@ -1041,3 +1041,88 @@ class Box:
 "#,
     );
 }
+
+// ── W1-09: writes invalidate only objects that may alias ──────────────────
+
+#[test]
+fn w1_09_a_write_keeps_narrowings_it_cannot_break() {
+    assert_clean(
+        r#"
+class P:
+    name: str?
+class Acc:
+    email: str?
+class Person:
+    email: str?
+def f(src: P, dst: P) -> str:
+    if src.name is not None:
+        dst.name = src.name
+        return src.name.upper()
+    return ""
+def g(acc: Acc, p: Person) -> str:
+    if p.email is not None:
+        acc.email = None
+        return p.email.upper()
+    return ""
+"#,
+    );
+}
+
+#[test]
+fn w1_09_a_none_write_through_a_possible_alias_still_invalidates() {
+    assert_rejected(
+        r#"
+class P:
+    name: str?
+def f(src: P, dst: P) -> str:
+    if src.name is not None:
+        dst.name = None
+        return src.name.upper()
+    return ""
+"#,
+    );
+}
+
+// ── W1-10: `nonlocal` writers reset only through calls that reach them ────
+
+#[test]
+fn w1_10_an_unrelated_call_keeps_a_nonlocal_narrowing() {
+    assert_clean(
+        r#"
+def f(xs: list[str]) -> str:
+    mut best: str? = None
+    def consider(x: str) -> None:
+        nonlocal best
+        best = x
+    for x in xs:
+        consider(x)
+    if best is not None:
+        print("found")
+        return best.upper()
+    return ""
+"#,
+    );
+}
+
+#[test]
+fn w1_10_calls_that_reach_the_writer_reset() {
+    for (decl, call) in [
+        ("", "reset()"),
+        ("    def helper() -> None:\n        reset()\n", "helper()"),
+        ("    let h = reset\n", "print(\"x\")"),
+    ] {
+        assert_rejected(&format!(
+            r#"
+def f() -> str:
+    mut best: str? = "a"
+    def reset() -> None:
+        nonlocal best
+        best = None
+{decl}    if best is not None:
+        {call}
+        return best.upper()
+    return ""
+"#
+        ));
+    }
+}
