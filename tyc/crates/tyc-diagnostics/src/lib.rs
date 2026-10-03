@@ -367,7 +367,7 @@ pub enum TycError {
     #[diagnostic(
         code(tyc::operator_type_mismatch),
         url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/operator_type_mismatch.md"),
-        help("convert one operand so the types match (e.g. `str(n)` / `int(s)`)")
+        help("use operands supported by this operator; for class ordering, define the comparison methods or enable dataclass order=True")
     )]
     OperatorTypeMismatch {
         op: String,
@@ -5275,6 +5275,14 @@ fn dedup_vec(v: &mut Vec<TycError>) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn w2_09_operator_help_covers_class_comparisons() {
+        let d = TycError::operator_type_mismatch("<", "Point", "Point", "<test>", "a < b", 0, 5);
+        let help = miette::Diagnostic::help(&d).unwrap().to_string();
+        assert!(!help.contains("str(n)"), "{help}");
+        assert!(help.contains("operator"), "{help}");
+    }
     #[test]
     fn remap_lines_moves_a_diagnostic_onto_the_original_line() {
         // The expanded buffer has two synthesised lines (a temp binding and
