@@ -1,11 +1,30 @@
 // @ts-check
+import { readFileSync } from 'node:fs';
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
+
+// Typhon highlighting reuses the VS Code extension's TextMate grammar, so
+// ```typhon fences highlight and the build stops warning about an unknown
+// language. The grammar is self-contained (only `source.typhon` includes).
+const typhonGrammar = JSON.parse(
+  readFileSync(
+    new URL(
+      '../editors/vscode/syntaxes/typhon.tmLanguage.json',
+      import.meta.url,
+    ),
+    'utf8',
+  ),
+);
 
 // https://astro.build/config
 export default defineConfig({
   site: 'https://codehalwell.github.io',
   base: '/Typhon',
+  markdown: {
+    shikiConfig: {
+      langs: [{ ...typhonGrammar, name: 'typhon' }],
+    },
+  },
   integrations: [
     starlight({
       title: 'Typhon',
