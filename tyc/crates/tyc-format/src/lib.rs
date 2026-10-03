@@ -511,7 +511,14 @@ fn normalise_whitespace_with_map(source: &str) -> (String, Vec<usize>) {
     // record which output line index this input line landed on.
     let mut line_map: Vec<usize> = Vec::new();
     let mut consecutive_blank = 0u32;
-    let mut in_triple: Option<char> = None;
+    // One lexical mask for the whole buffer — the same scanner every
+    // preprocessor pass uses — so "does this line start (or end) inside a
+    // string literal?" has one answer. This pass used to keep its own
+    // triple-quote tracker, which (a) cleared its state on a line like
+    // `y""" + """p` without noticing the new literal it opens, and (b) knew
+    // nothing of a backslash-continued single-quoted string; both let the
+    // spacing rules rewrite the contents of a literal in the user's file.
+    let mask = tyc_syntax::lexmask::LexMask::new(source);
     // Track whether any real (non-blank, non-shebang, non-comment) line
     // has been emitted yet so the "two blank lines before top-level
     // def/class" rule doesn't fire at the file head. PEP 8.
@@ -526,12 +533,13 @@ fn normalise_whitespace_with_map(source: &str) -> (String, Vec<usize>) {
     // Tracks `(` nesting across lines so multi-line calls keep their
     // kwargs tight (`a=3,` on a continuation line stays `a=3,`, not
     // `a = 3,`). Bracket / brace depth stays line-local because
-    // triple-quoted spans get verbatim treatment and `[ ]` slices
+    // string-content lines get verbatim treatment and `[ ]` slices
     // don't realistically straddle newlines in idiomatic Python.
     let mut paren_depth_carry: i32 = 0;
-    for raw_line in source.lines() {
-        // Is this line *string content* — i.e. inside a triple-quoted literal
-        // that opened on an earlier line?
+    for (line_index, raw_line) in source.lines().enumerate() {
+        // Is this line *string content* — i.e. does it begin inside a
+        // literal that opened on an earlier line (a triple-quoted string, or
+        // a single-quoted one continued with a backslash)?
         //
         // If so it gets no normalisation whatsoever. This used to "keep raw,
         // but still strip trailing spaces and expand the leading tabs so
@@ -541,45 +549,29 @@ fn normalise_whitespace_with_map(source: &str) -> (String, Vec<usize>) {
         // out of `tyc fmt` with different contents — in the user's own source
         // file, in place — and out of `tyc build` with a different constant
         // than the VM had.
-        let starts_inside_triple = in_triple.is_some();
-        let (line_owned, exited_triple) = if let Some(q) = in_triple {
-            let exited = line_closes_triple_quote(raw_line, q);
-            (raw_line.to_owned(), exited)
-        } else {
-            // The line that *opens* a triple quote carries string content
-            // after the delimiter, so its trailing whitespace is data too.
-            let opens_triple = detect_triple_quote_open(raw_line).is_some();
-            let trimmed = if opens_triple {
-                raw_line
-            } else {
-                raw_line.trim_end()
-            };
-            let (rewritten, new_depth) =
-                apply_simple_style_rules_with_paren_depth(trimmed, paren_depth_carry);
-            paren_depth_carry = new_depth.max(0);
-            (rewritten, false)
-        };
-
-        if starts_inside_triple {
+        if mask.line_starts_in_string(line_index) {
             // Verbatim, and short-circuit every rule below: blank-line
             // collapsing would eat blank lines out of a docstring, and the
             // tab expansion at the tail would rewrite its indentation.
             line_map.push(out_line);
-            result.push_str(&line_owned);
+            result.push_str(raw_line);
             result.push('\n');
             out_line += 1;
             consecutive_blank = 0;
-            if exited_triple {
-                in_triple = None;
-            }
             continue;
         }
-
-        if in_triple.is_none() && !exited_triple {
-            in_triple = detect_triple_quote_open(&line_owned);
-        } else if exited_triple {
-            in_triple = None;
-        }
+        // A line that ends inside a literal (it opens a triple-quoted string,
+        // or continues a single-quoted one with a backslash) carries string
+        // content up to its end, so its trailing whitespace is data too.
+        let ends_in_string = mask.line_starts_in_string(line_index + 1);
+        let trimmed = if ends_in_string {
+            raw_line
+        } else {
+            raw_line.trim_end()
+        };
+        let (line_owned, new_depth) =
+            apply_simple_style_rules_with_paren_depth(trimmed, paren_depth_carry);
+        paren_depth_carry = new_depth.max(0);
 
         let line = line_owned.as_str();
         let indent_end = line
@@ -619,10 +611,9 @@ fn normalise_whitespace_with_map(source: &str) -> (String, Vec<usize>) {
         //     `@cached_property\ndef f(...)` and `@a\n@b\ndef f(...)`
         //     must stay glued (otherwise the formatter splits the
         //     decorator from its target). PR #96 P1.
-        let is_top_level_decorator =
-            leading.is_empty() && in_triple.is_none() && rest.starts_with('@');
+        let is_top_level_decorator = leading.is_empty() && !ends_in_string && rest.starts_with('@');
         let is_top_level_def_or_class = leading.is_empty()
-            && in_triple.is_none()
+            && !ends_in_string
             && (rest.starts_with("def ")
                 || rest.starts_with("class ")
                 || rest.starts_with("async def "));
@@ -1234,74 +1225,6 @@ fn is_scientific_exponent_sign(out: &str, next: Option<char>) -> bool {
     true
 }
 
-/// Returns the quote character that opens an *unterminated* triple-quoted
-/// string starting on this line, if any.  When a triple-quoted string is
-/// opened *and* closed on the same line we treat it as fully balanced and
-/// return `None`.
-///
-/// Scanned character-by-character with awareness of regular single- and
-/// double-quoted regions, so a sequence like `x = "'''"` (which contains
-/// `'''` inside a normal string) does not falsely look like a
-/// triple-quote opener.
-fn detect_triple_quote_open(line: &str) -> Option<char> {
-    let mut counts = [0u32, 0u32]; // [single, double]
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    let mut inside: Option<u8> = None;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if let Some(q) = inside {
-            // Inside a regular (non-triple) string. Skip escapes.
-            if b == b'\\' && i + 1 < bytes.len() {
-                i += 2;
-                continue;
-            }
-            if b == q {
-                inside = None;
-            }
-            i += 1;
-            continue;
-        }
-        if (b == b'"' || b == b'\'')
-            && i + 2 < bytes.len()
-            && bytes[i + 1] == b
-            && bytes[i + 2] == b
-        {
-            let idx = if b == b'\'' { 0 } else { 1 };
-            counts[idx] += 1;
-            i += 3;
-            continue;
-        }
-        if b == b'"' || b == b'\'' {
-            inside = Some(b);
-            i += 1;
-            continue;
-        }
-        if b == b'#' {
-            // Comment end — anything past `#` (outside a string) is text.
-            break;
-        }
-        i += 1;
-    }
-    if !counts[0].is_multiple_of(2) {
-        return Some('\'');
-    }
-    if !counts[1].is_multiple_of(2) {
-        return Some('"');
-    }
-    None
-}
-
-/// Whether the remainder of a multi-line triple-quoted string is closed
-/// on this `line` by the matching `q` triple.  The check is intentionally
-/// loose (string match) because once we are *inside* a triple-quoted
-/// region, regular-quote string syntax does not apply — the only way out
-/// is the matching triple.
-fn line_closes_triple_quote(line: &str, q: char) -> bool {
-    let triple: String = std::iter::repeat_n(q, 3).collect();
-    line.contains(&triple)
-}
-
 /// Heuristic check for Typhon-only tokens that the stock `ruff` binary
 /// cannot parse.  The vendored ruff parser used by `tyc check` accepts
 /// `let`/`mut` natively, but the user's own `ruff` install — which is
@@ -1865,11 +1788,17 @@ def run() -> Result[int, str]:
     }
 
     #[test]
-    fn detect_triple_quote_open_ignores_triples_inside_regular_strings() {
-        assert_eq!(detect_triple_quote_open("x = \"'''\""), None);
-        assert_eq!(detect_triple_quote_open("x = '\"\"\"'"), None);
-        // But a real triple-quote opener still produces Some.
-        assert_eq!(detect_triple_quote_open("x = \"\"\"hi"), Some('"'));
+    fn triple_quote_shapes_inside_regular_strings_open_nothing() {
+        // A `'''` / `"""` run inside a regular string is text, not an
+        // opener: the following lines are still code and get normalised.
+        for src in ["x = \"'''\"\ny=1\n", "x = '\"\"\"'\ny=1\n"] {
+            let (out, _) = normalise_whitespace_with_map(src);
+            assert!(out.ends_with("\ny = 1\n"), "got {out:?}");
+        }
+        // But a real triple-quote opener still makes the next line string
+        // content.
+        let (out, _) = normalise_whitespace_with_map("x = \"\"\"hi\ny=1\n\"\"\"\n");
+        assert!(out.contains("\ny=1\n"), "got {out:?}");
     }
 
     /// Serialises every test that mutates `TYC_FMT_DISABLE_RUFF`. Rust
@@ -2648,6 +2577,46 @@ def run() -> Result[int, str]:
             }
         }
         out
+    }
+
+    #[test]
+    fn triple_quote_closing_and_opening_on_one_line_keeps_the_second_string_verbatim() {
+        // W7-02: `line_closes_triple_quote` cleared the in-string state on
+        // `y""" + """p` without noticing a new literal opened on the same
+        // line, so the second string's contents got comma / `#` spacing and
+        // PEP 8 blank lines were inserted before a `def` inside it.
+        let src = concat!(
+            "a: str = \"\"\"x\n",
+            "y\"\"\" + \"\"\"p\n",
+            "q,r  s\n",
+            "#hash\n",
+            "def inner():\n",
+            "    pass\"\"\"\n",
+            "print(a)\n",
+        );
+        let (out, _) = normalise_whitespace_with_map(src);
+        assert_eq!(out, src, "string contents must survive verbatim");
+        let formatted = without_ruff(|| format_source(src, "<test>").unwrap().output);
+        assert_eq!(formatted, src);
+    }
+
+    #[test]
+    fn backslash_continued_string_contents_are_never_reformatted() {
+        // W7-02: the shared lexmask reset a single-quoted string at end of
+        // line, so the continuation of `"a,b\` + newline was read as code
+        // and came back as `c, d e# f"`.
+        for src in [
+            "b: str = \"a,b\\\n    c,d  e#f\"\nprint(b)\n",
+            "b: str = 'x:1\\\n=2,3  #'\nprint(b)\n",
+        ] {
+            let (out, _) = normalise_whitespace_with_map(src);
+            assert_eq!(out, src, "string contents must survive verbatim");
+            let formatted = without_ruff(|| format_source(src, "<test>").unwrap().output);
+            assert_eq!(formatted, src);
+        }
+        // Code after the continued string closes is still formatted.
+        let (out, _) = normalise_whitespace_with_map("b = \"a\\\nb\"\nc=f(1,2)\n");
+        assert_eq!(out, "b = \"a\\\nb\"\nc = f(1, 2)\n");
     }
 
     #[test]

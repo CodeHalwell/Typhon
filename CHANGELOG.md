@@ -23,6 +23,22 @@ review deferred; the third — the 2026-09-30 release-readiness review
   panicked. The formatter now carries a marker character through the edits
   instead of a column, and `postprocess_full` never indexes a line at an
   unchecked offset.
+- **`tyc fmt` no longer rewrites the contents of string literals, and a
+  backslash-continued string no longer breaks `check`/`build` (W7-02).** Two
+  scanners lost track of strings across lines. The formatter's own
+  triple-quote tracker cleared its state on `y""" + """p` without noticing
+  the second literal open, so that literal got comma / `#` spacing and blank
+  lines before a `def` inside it. The shared lexical mask reset a single-
+  quoted string at end of line even when the line break was escaped
+  (`"a,b\` + newline), so the continuation was read as code: fmt respaced it
+  (`c,d  e#f"` → `c, d e# f"`), and a `?`, `as!` or `rescue` inside it was
+  lowered as sugar (`tyc::parse` on valid code, or a spurious
+  module-level-rescue error). The mask now carries a backslash-continued
+  string onto the next line, and the formatter uses the mask instead of its
+  own tracker. The same fix stops `tyc build` with `[emit] format = true`
+  from trimming trailing spaces inside a string the emitter prints as a
+  triple-quoted literal (`"\n a \n".splitlines()` printed `['', ' a']` on
+  CPython and `['', ' a ']` on the VM).
 
 ### Third wave — the 2026-09-30 release-readiness review
 
