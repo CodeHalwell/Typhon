@@ -3940,6 +3940,72 @@ impl<'a> Checker<'a> {
             }
             _ => false,
         };
+        fn nested_opaque(c: &Checker, ty: &Type) -> bool {
+            match ty {
+                Type::TypeVar(name) | Type::Class(name) => {
+                    c.active_type_params.iter().any(|p| p == name)
+                }
+                Type::Generic(_, args) | Type::Union(args) => {
+                    args.iter().any(|a| nested_opaque(c, a))
+                }
+                Type::Function { params, ret, .. } => {
+                    params.iter().any(|a| nested_opaque(c, a)) || nested_opaque(c, ret)
+                }
+                _ => false,
+            }
+        }
+        if nested_opaque(self, expected) || nested_opaque(self, actual) {
+            if let (Type::Generic(eh, ea), Type::Generic(ah, aa)) = (expected, actual) {
+                if ea.len() == 1
+                    && !aa.is_empty()
+                    && (read_view_head_accepts(eh, ah) || (eh == "tuple_variadic" && ah == "tuple"))
+                {
+                    let slots = if ah == "tuple" {
+                        aa.as_slice()
+                    } else {
+                        &aa[..1]
+                    };
+                    return Some(slots.iter().all(|a| self.is_assignable(&ea[0], a)));
+                }
+                if eh == "Mapping"
+                    && matches!(ah.as_str(), "dict" | "Mapping")
+                    && ea.len() == aa.len()
+                {
+                    return Some(ea.iter().zip(aa).all(|(e, a)| self.is_assignable(e, a)));
+                }
+            }
+            match (expected, actual) {
+                (
+                    Type::Function {
+                        params: ep,
+                        ret: er,
+                        ..
+                    },
+                    Type::Function {
+                        params: ap,
+                        ret: ar,
+                        ..
+                    },
+                ) if ep.len() == ap.len() => {
+                    return Some(
+                        ep.iter().zip(ap).all(|(e, a)| self.is_assignable(a, e))
+                            && self.is_assignable(er, ar),
+                    )
+                }
+                (Type::Generic(eh, ea), Type::Generic(ah, aa))
+                    if eh == ah && ea.len() == aa.len() =>
+                {
+                    return Some(ea.iter().zip(aa).all(|(e, a)| self.is_assignable(e, a)))
+                }
+                (_, Type::Union(members)) => {
+                    return Some(members.iter().all(|a| self.is_assignable(expected, a)))
+                }
+                (Type::Union(members), _) => {
+                    return Some(members.iter().any(|e| self.is_assignable(e, actual)))
+                }
+                _ => {}
+            }
+        }
         match (expected, actual) {
             (Type::TypeVar(e), Type::TypeVar(a)) if opaque(expected) || opaque(actual) => {
                 Some(e == a)
@@ -35938,7 +36004,7 @@ def relay(r: Response) -> None:
         let src = "\
 class Functor[F[_]]:
     def fmap[A, B](self, fa: F[A], f: B) -> F[B]:
-        return fa
+        raise NotImplementedError
 
 def main() -> None:
     let xs: list[int] = [1, 2, 3]
@@ -35961,7 +36027,7 @@ class Box[T]:
 
 class Functor[F[_]]:
     def fmap[A, B](self, fa: F[A], f: B) -> F[B]:
-        return fa
+        raise NotImplementedError
 
 def main() -> None:
     let b: Box[int] = Box(value=1)
@@ -38921,5 +38987,22 @@ def main() -> None:
             "{:?}",
             check_full(src).errors()
         );
+    }
+    #[test]
+    fn w2_12_nested_type_parameters_are_rigid() {
+        for src in [
+            "def wrap[T](x: T) -> list[T]:\n    return [1]\n",
+            "def opt[T](x: T) -> T?:\n    return 0\n",
+            "def swap[A, B](p: tuple[A, B]) -> tuple[B, A]:\n    return p\n",
+            "from typing import Callable\ndef mapl[A, B](f: Callable[[A], B], xs: list[A]) -> list[B]:\n    return xs\n",
+            "class Container[F[_]]:\n    def wrong[A, B](self, xs: F[A]) -> F[B]:\n        return xs\n",
+        ] { assert!(!check_full(src).errors().is_empty(), "accepted: {src}"); }
+        for src in [
+            "def wrap[T](x: T) -> list[T]:\n    return [x]\n",
+            "def opt[T](x: T) -> T?:\n    return None\n",
+            "def swap[A, B](p: tuple[A, B]) -> tuple[B, A]:\n    return (p[1], p[0])\n",
+            "from typing import Callable\ndef mapl[A, B](f: Callable[[A], B], xs: list[A]) -> list[B]:\n    return [f(x) for x in xs]\n",
+            "class Container[F[_]]:\n    def same[A](self, xs: F[A]) -> F[A]:\n        return xs\n",
+        ] { assert!(check_full(src).errors().is_empty(), "{src}: {:?}",check_full(src).errors()); }
     }
 }
