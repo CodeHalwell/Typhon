@@ -69,3 +69,7 @@
 ## 2024-08-23 - [Remove tabindex="0" from abbr tags]
 **Learning:** Adding `tabindex="0"` to non-interactive `<abbr>` elements makes them focusable for screen readers but fails WCAG 1.4.13 (Content on Hover or Focus) for sighted keyboard users. Standard browser tooltips (`title` attribute) do not display on keyboard focus, making this pattern inaccessible.
 **Action:** Removed `tabindex="0"` from `<abbr>` tags. If tooltips are needed for keyboard users, a custom tooltip component must be used instead of relying on the native `title` attribute on `<abbr>`.
+
+## 2024-10-03 - Active state for Starlight tabs
+**Learning:** Found custom CSS defining hover and focus states for starlight-tabs, but there was no visible indication for active/selected tabs `[aria-selected="true"]`. This reduces navigation context and fails accessibility best practices for selected states.
+**Action:** Added explicit CSS styling using `--sl-color-accent` for the `border-bottom-color` on active tabs to improve navigation context.
