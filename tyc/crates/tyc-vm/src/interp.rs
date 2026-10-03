@@ -1032,16 +1032,21 @@ impl Interpreter {
         // values). Re-entering a generator suspended in the body
         // continues with the live iterator, skipping the assignment
         // for that one iteration.
-        let (iter, mut resumed) = match self.pop_resume_frame() {
+        // Keep the raw iterable alongside the iteration state: if it is a
+        // generator, `make_iter` wraps it, and CPython finalises an abandoned
+        // generator when its last reference drops (see the loop epilogue).
+        let (iter, generator, mut resumed) = match self.pop_resume_frame() {
             None => {
                 let iterable = self.eval_expr(&s.iter, env)?;
-                (self.make_iter(iterable)?, false)
+                let generator = as_generator(&iterable);
+                (self.make_iter(iterable)?, generator, false)
             }
-            Some(ResumeFrame::ForBody { iter }) => (iter, true),
+            Some(ResumeFrame::ForBody { iter }) => (iter, None, true),
             Some(ResumeFrame::LoopElse) => return self.exec_loop_else(&s.orelse, env),
             Some(other) => return Err(resume_mismatch(&other)),
         };
         let mut completed = true;
+        let mut outcome: Result<(), Unwind> = Ok(());
         loop {
             if !resumed {
                 let Some(v) = self.iter_next(&iter)? else {
@@ -1058,12 +1063,49 @@ impl Interpreter {
                     break;
                 }
                 Err(Unwind::Yield(v)) => {
+                    // Suspended, not abandoned: the generator is still live
+                    // (its state is on the resume frame), so it must NOT be
+                    // finalised here.
                     self.record_suspend(ResumeFrame::ForBody { iter: iter.clone() });
                     return Err(Unwind::Yield(v));
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    outcome = Err(e);
+                    break;
+                }
             }
         }
+        // CPython finalises an abandoned generator the moment its last
+        // reference drops — running its `finally` blocks and `with` exits.
+        // The VM has no GC, so it does the equivalent at the one point it can
+        // observe the reference go away: the end of the loop that was
+        // iterating it, when that loop holds the only reference. A generator
+        // still referenced from a name (`it = iter(g())`) has a higher count
+        // here and is correctly left alone.
+        if generator.is_some() {
+            // The loop holds two references to a generator it iterates: the
+            // raw value kept above and the copy inside the iteration state.
+            // Drop the iteration state first, so a surviving count of 1 means
+            // the program itself holds no reference — the VM's stand-in for
+            // CPython's refcount reaching zero. A generator still bound to a
+            // name (`it = g()`) is left live, exactly as CPython leaves it.
+            drop(iter);
+        }
+        if let Some(g) = generator {
+            if Rc::strong_count(&g) == 1 {
+                match &outcome {
+                    // A clean break/exit: closing may legitimately raise
+                    // (`generator ignored GeneratorExit`), as CPython does.
+                    Ok(()) => self.generator_close(&g)?,
+                    // The body is already unwinding with an exception; run
+                    // the generator's cleanup but let the original error win.
+                    Err(_) => {
+                        let _ = self.generator_close(&g);
+                    }
+                }
+            }
+        }
+        outcome?;
         if completed && !s.orelse.is_empty() {
             self.exec_loop_else(&s.orelse, env)?;
         }

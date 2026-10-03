@@ -655,6 +655,11 @@ mod tests {
         run_on_worker_stack(|| run_source(source, None, &[]))
     }
 
+    /// A probe that calls `os.chdir` changes the *process* working directory,
+    /// and libtest runs tests concurrently, so two such tests make every
+    /// relative-path assertion in the suite nondeterministic. Serialise them.
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The declared list and the resolver must agree: a name in the list
     /// that no longer resolves would send `tyc run` into the VM for a
     /// module it cannot serve, and one the resolver serves but the list
@@ -2928,6 +2933,56 @@ main()
     }
 
     #[test]
+    fn abandoned_generators_are_finalised_at_loop_exit() {
+        // W5-05: CPython finalises a generator when its last reference drops,
+        // running `finally` / `with` exits. The VM has no GC, so it does this
+        // at the end of the loop that holds the only reference — which covers
+        // `break` / `return` out of a `for` over a generator. A generator the
+        // program kept a reference to is left live, as CPython leaves it.
+        //
+        // Residual (docs/vm.md): a generator held only by a function local is
+        // finalised when that local's scope ends in CPython, which needs
+        // refcounting the VM does not model.
+        let src = r#"
+from typing import Iterator
+
+out: list[str] = []
+
+def g() -> Iterator[int]:
+    try:
+        yield 1
+        yield 2
+    finally:
+        out.append("cleanup")
+
+def break_out() -> None:
+    for x in g():
+        out.append("body " + str(x))
+        break
+
+def return_out() -> None:
+    for x in g():
+        if x == 1:
+            return
+
+def still_referenced() -> None:
+    let it: Iterator[int] = g()
+    out.append(str(next(it)))
+    out.append("held")
+
+def main() -> None:
+    break_out()
+    return_out()
+    still_referenced()
+    if out != ["body 1", "cleanup", "cleanup", "1", "held"]:
+        raise ValueError("abandoned-generator cleanup wrong: " + repr(out))
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn type_object_model() {
         // type(x) is a real type object: .__name__, str(), and == all work
         // for both builtins and user classes.
@@ -3718,6 +3773,7 @@ main()
 
     #[test]
     fn vm_stdlib_shim_edge_cases_match_cpython() {
+        let _cwd = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let src = r#"
 import argparse
 import base64
@@ -5079,6 +5135,7 @@ if got != expected:
 
     #[test]
     fn filesystem_modules_match_cpython() {
+        let _cwd = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // `pathlib`, `open` / file objects, `io.StringIO` / `BytesIO`, `os` / `os.path`,
         // `glob`, `shutil` and `tempfile`, with CPython's `OSError` messages.
         // The expectation is derived from the hosting python3.13 at
@@ -5104,9 +5161,7 @@ def show(label: str, f: object) -> None:
     except Exception as e:
         emit(label, type(e).__name__, e)
 
-BASE = "/tmp/zz_probe_fs"
-shutil.rmtree(BASE, ignore_errors=True)
-os.makedirs(BASE)
+BASE = tempfile.mkdtemp(prefix="zz_probe_fs_")
 os.chdir(BASE)
 # Fixtures for the probes whose *kind* of failure must not depend on who
 # is running the suite: unlinking a directory, rmdir-ing a file and
