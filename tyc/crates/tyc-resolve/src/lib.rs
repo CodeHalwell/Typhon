@@ -893,6 +893,12 @@ struct Resolver<'a> {
     /// without this guard a re-declaration would emit the same diagnostic
     /// twice.
     seen_immutable_redecl: std::collections::HashSet<((usize, usize), (usize, usize))>,
+    /// Depth of annotation walking; a reference made while it is non-zero
+    /// sits inside a type annotation, which the emitted module never
+    /// evaluates (`from __future__ import annotations`).
+    in_annotation: usize,
+    /// Spans of the references made inside annotations.
+    annotation_refs: std::collections::HashSet<(usize, usize)>,
     /// `(scope, span)` pairs already reported as `missing_binding_kind`.
     /// Same dedup story as `seen_immutable_redecl`: the bareword
     /// assignment is visited once per pre-collect pass and once per
@@ -1009,6 +1015,8 @@ impl<'a> Resolver<'a> {
             references: Vec::new(),
             diagnostics: Diagnostics::new(),
             seen_immutable_redecl: std::collections::HashSet::new(),
+            in_annotation: 0,
+            annotation_refs: std::collections::HashSet::new(),
             seen_missing_binding_kind: std::collections::HashSet::new(),
             global_nonlocal_names: std::collections::HashMap::new(),
             raw_class_byte_starts: options.raw_class_byte_starts,
@@ -1402,6 +1410,9 @@ impl<'a> Resolver<'a> {
     }
 
     fn reference(&mut self, scope: ScopeId, name: &str, span: (usize, usize)) {
+        if self.in_annotation > 0 {
+            self.annotation_refs.insert(span);
+        }
         self.references.push(Reference {
             name: name.to_owned(),
             span,
@@ -1464,7 +1475,16 @@ impl<'a> Resolver<'a> {
                 }
                 current = scope.parent;
             }
-            if !found && !wildcard_in_scope && !builtins.contains(&r.name.as_str()) {
+            // `typing` names are accepted without an import inside an
+            // annotation (never evaluated at runtime), but as a value —
+            // `t is Union`, `TypeVar("T")`, a `Generic[T]` base — they
+            // raise `NameError` (review 2026-10-03 §5.6).
+            let typing_value = TYPING_ONLY_NAMES.contains(&r.name.as_str())
+                && !self.annotation_refs.contains(&r.span);
+            if !found
+                && !wildcard_in_scope
+                && (!builtins.contains(&r.name.as_str()) || typing_value)
+            {
                 let length = r.span.1.saturating_sub(r.span.0).max(1);
                 // `self` is special: it's only legal inside an `impl`
                 // method body, so an unresolved reference deserves a
@@ -2375,7 +2395,7 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             };
             walk_argument_annotations(r, ann_scope, &f.parameters);
             if let Some(ret) = &f.returns {
-                walk_expr(r, ann_scope, ret);
+                walk_annotation(r, ann_scope, ret);
             }
             // Parameters become bindings in the new scope.
             declare_arguments(r, fn_scope, &f.parameters);
@@ -2456,7 +2476,9 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             // `collect_top_level`.
             let alias_scope = r.push_scope(ScopeKind::Function, scope, range_to_span(ta.range));
             declare_type_params(r, alias_scope, ta.type_params.as_deref());
-            walk_expr(r, alias_scope, &ta.value);
+            // A `type` statement's value is evaluated lazily, like an
+            // annotation.
+            walk_annotation(r, alias_scope, &ta.value);
         }
         Stmt::Assign(a) => {
             walk_expr(r, scope, &a.value);
@@ -2477,7 +2499,7 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             if let Some(v) = &a.value {
                 walk_expr(r, scope, v);
             }
-            walk_expr(r, scope, &a.annotation);
+            walk_annotation(r, scope, &a.annotation);
             // R3-8: `let NAME: T` (or `mut NAME: T`) without an
             // initialiser is now allowed for the declare-then-assign
             // idiom. The first subsequent assignment to the same name
@@ -2922,7 +2944,7 @@ fn walk_argument_annotations(r: &mut Resolver, scope: ScopeId, args: &ast::Param
         .chain(args.kwonlyargs.iter());
     for arg in all {
         if let Some(ann) = &arg.parameter.annotation {
-            walk_expr(r, scope, ann);
+            walk_annotation(r, scope, ann);
         }
         if let Some(def) = &arg.default {
             walk_expr(r, scope, def);
@@ -2930,14 +2952,21 @@ fn walk_argument_annotations(r: &mut Resolver, scope: ScopeId, args: &ast::Param
     }
     if let Some(va) = &args.vararg {
         if let Some(ann) = &va.annotation {
-            walk_expr(r, scope, ann);
+            walk_annotation(r, scope, ann);
         }
     }
     if let Some(kw) = &args.kwarg {
         if let Some(ann) = &kw.annotation {
-            walk_expr(r, scope, ann);
+            walk_annotation(r, scope, ann);
         }
     }
+}
+
+/// Walk a type annotation (references made inside it are recorded as such).
+fn walk_annotation(r: &mut Resolver, scope: ScopeId, ann: &Expr) {
+    r.in_annotation += 1;
+    walk_expr(r, scope, ann);
+    r.in_annotation -= 1;
 }
 
 /// Walk a single statement from an `impl` pseudo-class body.
@@ -2976,7 +3005,7 @@ fn walk_impl_method(r: &mut Resolver, cls_scope: ScopeId, stmt: &Stmt) {
             };
             walk_argument_annotations(r, ann_scope, &f.parameters);
             if let Some(ret) = &f.returns {
-                walk_expr(r, ann_scope, ret);
+                walk_annotation(r, ann_scope, ret);
             }
             declare_arguments(r, fn_scope, &f.parameters);
             collect_top_level(r, fn_scope, &f.body);
@@ -3431,6 +3460,30 @@ fn declare_walrus_leaks(r: &mut Resolver, scope: ScopeId, expr: &Expr) {
 /// A conservative list of Python built-in names that the resolver treats
 /// as always-in-scope. Not exhaustive — the goal is to avoid false-positive
 /// "unknown name" diagnostics for common identifiers in Phase 1.
+/// The `typing` names [`builtin_names`] accepts so annotations can use them
+/// without an import, and that nothing imports for the emitted module
+/// either: as runtime values they raise `NameError`. (`Protocol` and the
+/// `collections.abc` names are left out — the desugarer injects their
+/// imports for interfaces and annotation uses.)
+const TYPING_ONLY_NAMES: &[&str] = &[
+    "Optional",
+    "Union",
+    "Any",
+    "List",
+    "Dict",
+    "Set",
+    "Tuple",
+    "FrozenSet",
+    "Type",
+    "TypeVar",
+    "Generic",
+    "Self",
+    "ClassVar",
+    "Final",
+    "Literal",
+    "NoReturn",
+];
+
 pub fn builtin_names() -> std::collections::HashSet<&'static str> {
     let names: &[&'static str] = &[
         // Built-in functions
@@ -3892,6 +3945,37 @@ def f() -> None:
         // the body is already rejected), so the augmented form matches.
         let (_, d) = resolve("def k(xs: list[int]) -> None:\n    for x in xs:\n        x += 1\n");
         assert!(has_immutable_assign(&d), "a loop target is a `let`");
+    }
+
+    /// A `typing` name accepted without an import in an annotation is a
+    /// `NameError` as a runtime value (review 2026-10-03 §5.6).
+    #[test]
+    fn typing_names_as_values_need_an_import() {
+        let has_unknown = |d: &Diagnostics, name: &str| {
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UnknownName { name: n, .. } if n == name))
+        };
+        let (_, d) = resolve("def f(t: object) -> bool:\n    return t is Union\n");
+        assert!(has_unknown(&d, "Union"), "{:?}", d.errors());
+        let (_, d) = resolve("T = TypeVar(\"T\")\n");
+        assert!(has_unknown(&d, "TypeVar"), "{:?}", d.errors());
+        for ok in [
+            "def g(x: Union[int, str]) -> Optional[int]:\n    return None\n",
+            "let y: Optional[int] = None\n",
+            "type Handler = Callable[[int], None]\ntype U = Union[int, str]\n",
+            "from typing import Union\ndef f(t: object) -> bool:\n    return t is Union\n",
+            "def f(x: object) -> bool:\n    return isinstance(x, Iterable)\n",
+        ] {
+            let (_, d) = resolve(ok);
+            assert!(
+                !d.errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::UnknownName { .. })),
+                "{ok}: {:?}",
+                d.errors()
+            );
+        }
     }
 
     /// `del NAME` and an `except … as NAME` handler both *end* a live `let`

@@ -140,6 +140,14 @@ review deferred; the third — the 2026-09-30 release-readiness review
   a module-level spawner no longer counts as calling that spawner, so
   `def schedule(start): start()` called at module level is not reported
   because a module-level `def start(): go work(1)` exists.
+- **`typing` names used as values need their import.** `Union`, `Optional`,
+  `Any`, `List`/`Dict`/`Set`/`Tuple`/`FrozenSet`, `Type`, `TypeVar`,
+  `Generic`, `Self`, `ClassVar`, `Final`, `Literal` and `NoReturn` stay
+  usable without an import inside annotations and `type` statements, which
+  the emitted module never evaluates; as runtime values (`t is Union`,
+  `TypeVar("T")`, a `Generic[T]` base) they raised `NameError` and now
+  report `tyc::unknown_name`. `Protocol` and the `collections.abc` names
+  are unaffected: the build imports them.
 
 ### Third wave — the 2026-09-30 release-readiness review
 
