@@ -140,3 +140,14 @@ fn impl_methods_see_names_bound_before_their_block() {
         include_str!("fourth_wave/impl_site.expected"),
     );
 }
+
+/// W7-07: a field whose default is a module-level list / dict / set given by
+/// name imports (it raised `ValueError: mutable default` on both surfaces)
+/// and every instance gets its own shallow copy.
+#[test]
+fn named_mutable_default_gives_each_instance_a_copy() {
+    assert_runs_as(
+        include_str!("fourth_wave/named_mutable_default.ty"),
+        include_str!("fourth_wave/named_mutable_default.expected"),
+    );
+}

@@ -92,6 +92,15 @@ review deferred; the third — the 2026-09-30 release-readiness review
   placement. The attached method's
   bare `super()` is spelled out, which also fixes `super()` in a
   cross-module `extend` method.
+- **A field defaulting to a named list, dict or set no longer fails at
+  class creation (W7-07).** `let BASE: list[int] = [1]` then `class Box:
+  items: list[int] = BASE` passed `tyc check` and raised `ValueError:
+  mutable default … use default_factory` on import, on both surfaces. A
+  plain or dotted name default whose value is evidently a `list` / `dict` /
+  `set` — by the field's annotation, or by the module-level binding of the
+  name — now lowers to `dataclasses.field(default_factory=lambda:
+  list(BASE))` (or `dict` / `set`): each instance gets its own shallow
+  copy, the same fresh-value-per-instance the literal defaults already get.
 
 ### Third wave — the 2026-09-30 release-readiness review
 

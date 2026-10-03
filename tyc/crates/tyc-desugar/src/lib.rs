@@ -1799,6 +1799,7 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
     let exception_class_names =
         exception_class_names_from(&module_level_classes, &module_class_names);
     let raw_class_infos = collect_raw_class_infos(&m.body, &options.raw_class_line_starts);
+    let module_mutable_names = collect_module_mutable_names(&m.body);
     let markers = ClassMarkers {
         raw_starts: &options.raw_class_line_starts,
         frozen_starts: &options.frozen_class_line_starts,
@@ -1809,6 +1810,7 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
         exception_class_names: &exception_class_names,
         module_class_names: &module_class_names,
         raw_class_infos: &raw_class_infos,
+        module_mutable_names: &module_mutable_names,
     };
     let (new_body, transformed_classes) = desugar_stmts(&m.body, markers);
 
@@ -2215,6 +2217,10 @@ struct ClassMarkers<'a> {
     /// deriving from another in-module `class!` can thread the parent's
     /// fields through its own synthesised `__init__`.
     raw_class_infos: &'a HashMap<String, RawClassInfo>,
+    /// Module-level names evidently bound to a `list` / `dict` / `set`
+    /// (by annotation or by value), mapped to that builtin's name — so a
+    /// field defaulting to one gets a per-instance copy (W7-07).
+    module_mutable_names: &'a HashMap<String, &'static str>,
 }
 
 /// What a `class!` contributes to the constructors of `class!` subclasses.
@@ -2439,7 +2445,11 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             // pydantic models, protocols, and impl stubs keep their bodies
             // untouched. FINDINGS #62.
             if needs_decorator
-                && rewrite_mutable_field_defaults(&mut new_body, markers.module_class_names)
+                && rewrite_mutable_field_defaults(
+                    &mut new_body,
+                    markers.module_class_names,
+                    markers.module_mutable_names,
+                )
             {
                 body_transformed = true;
             }
@@ -2618,6 +2628,7 @@ fn make_dataclasses_dot_dataclass_decorator_frozen() -> Decorator {
 fn rewrite_mutable_field_defaults(
     body: &mut [Stmt],
     module_class_names: &std::collections::HashSet<&str>,
+    module_mutable_names: &HashMap<String, &'static str>,
 ) -> bool {
     let mut changed = false;
     // Names the class body itself binds: a lambda defined in the body
@@ -2672,6 +2683,17 @@ fn rewrite_mutable_field_defaults(
             // gives every instance a fresh value, which is what the source
             // meant and what the VM does.
             make_lambda_returning(value.as_ref().clone())
+        } else if let Some(kind) =
+            named_mutable_default_kind(value, &a.annotation, module_mutable_names)
+                .filter(|_| !mentions_any_name(value, &class_body_names))
+        {
+            // W7-07: `items: list[int] = BASE` with `BASE` a module-level
+            // list. The default's type is unhashable, so `@dataclass` raised
+            // `ValueError` when the class was created (both surfaces), though
+            // `tyc check` accepted it. Give each instance a shallow copy —
+            // the same fresh-value-per-instance the literal rewrites above
+            // give, and never one list aliased across instances.
+            make_lambda_returning(make_call(kind, value.as_ref().clone()))
         } else {
             continue;
         };
@@ -2679,6 +2701,120 @@ fn rewrite_mutable_field_defaults(
         changed = true;
     }
     changed
+}
+
+/// `list` / `dict` / `set` when `annotation` is (a subscript of) one of
+/// them, or its `typing` alias.
+fn mutable_builtin_of_annotation(annotation: &Expr) -> Option<&'static str> {
+    let name = match annotation {
+        Expr::Subscript(s) => return mutable_builtin_of_annotation(&s.value),
+        Expr::Name(n) => n.id.as_str(),
+        Expr::Attribute(a) => a.attr.as_str(),
+        _ => return None,
+    };
+    match name {
+        "list" | "List" => Some("list"),
+        "dict" | "Dict" => Some("dict"),
+        "set" | "Set" => Some("set"),
+        _ => None,
+    }
+}
+
+/// `list` / `dict` / `set` when `value` evidently builds one.
+fn mutable_builtin_of_value(value: &Expr) -> Option<&'static str> {
+    match value {
+        Expr::List(_) | Expr::ListComp(_) => Some("list"),
+        Expr::Dict(_) | Expr::DictComp(_) => Some("dict"),
+        Expr::Set(_) | Expr::SetComp(_) => Some("set"),
+        Expr::Call(c) => match c.func.as_ref() {
+            Expr::Name(n) => match n.id.as_str() {
+                "list" => Some("list"),
+                "dict" => Some("dict"),
+                "set" => Some("set"),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Module-level names bound to an evident `list` / `dict` / `set`, by their
+/// annotation or their value. A name bound twice to different kinds is left
+/// out.
+fn collect_module_mutable_names(body: &[Stmt]) -> HashMap<String, &'static str> {
+    let mut out: HashMap<String, &'static str> = HashMap::new();
+    let mut conflicting: HashSet<String> = HashSet::new();
+    for stmt in body {
+        let (name, kind) = match stmt {
+            Stmt::AnnAssign(a) => {
+                let Expr::Name(n) = a.target.as_ref() else {
+                    continue;
+                };
+                let kind = mutable_builtin_of_annotation(&a.annotation)
+                    .or_else(|| a.value.as_deref().and_then(mutable_builtin_of_value));
+                (n.id.as_str(), kind)
+            }
+            Stmt::Assign(a) => {
+                let [Expr::Name(n)] = a.targets.as_slice() else {
+                    continue;
+                };
+                (n.id.as_str(), mutable_builtin_of_value(&a.value))
+            }
+            _ => continue,
+        };
+        match (kind, out.get(name)) {
+            (Some(k), None) => {
+                out.insert(name.to_owned(), k);
+            }
+            (Some(k), Some(prev)) if *prev == k => {}
+            _ => {
+                conflicting.insert(name.to_owned());
+            }
+        }
+    }
+    out.retain(|name, _| !conflicting.contains(name));
+    out
+}
+
+/// For a field default that is a plain or dotted name (`BASE`,
+/// `config.DEFAULTS`) whose value is evidently a `list` / `dict` / `set` —
+/// by the field's own annotation, or by a module-level binding of the name —
+/// the builtin to copy it with.
+fn named_mutable_default_kind(
+    value: &Expr,
+    annotation: &Expr,
+    module_mutable_names: &HashMap<String, &'static str>,
+) -> Option<&'static str> {
+    fn is_dotted_name(e: &Expr) -> bool {
+        match e {
+            Expr::Name(_) => true,
+            Expr::Attribute(a) => is_dotted_name(&a.value),
+            _ => false,
+        }
+    }
+    if !is_dotted_name(value) {
+        return None;
+    }
+    mutable_builtin_of_annotation(annotation).or_else(|| match value {
+        Expr::Name(n) => module_mutable_names.get(n.id.as_str()).copied(),
+        _ => None,
+    })
+}
+
+/// `<func>(<arg>)` with `func` a bare name.
+fn make_call(func: &str, arg: Expr) -> Expr {
+    Expr::Call(ExprCall {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        func: Box::new(make_name_load(func)),
+        arguments: Arguments {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            args: Box::new([arg]),
+            keywords: Box::new([]),
+        },
+    })
 }
 
 /// A call to one of this module's classes (`P(x=1)`) or a non-empty
@@ -2719,7 +2855,9 @@ fn mentions_any_name(expr: &Expr, names: &std::collections::HashSet<String>) -> 
         names,
         found: false,
     };
-    ruff_python_ast::visitor::walk_expr(&mut v, expr);
+    // `visit_expr`, not `walk_expr`: the latter only visits children, so a
+    // bare-name default (`items: list[int] = BASE`) was never checked.
+    ruff_python_ast::visitor::Visitor::visit_expr(&mut v, expr);
     v.found
 }
 
@@ -7064,5 +7202,56 @@ class __typhon_impl_C(object):
 ";
         let out = parse_and_desugar(src);
         assert!(out.contains("return super(C, self).m(k)"), "{out}");
+    }
+
+    // ── W7-07: a mutable default given by name ─────────────────────────────
+
+    #[test]
+    fn named_mutable_default_gets_a_per_instance_copy() {
+        // By the field's annotation.
+        let out =
+            parse_and_desugar("BASE: list[int] = [1]\n\nclass Box:\n    items: list[int] = BASE\n");
+        assert!(
+            out.contains(
+                "items: list[int] = dataclasses.field(default_factory=lambda: list(BASE))"
+            ),
+            "{out}"
+        );
+        // By the module-level binding when the field annotation is abstract.
+        let out = parse_and_desugar(
+            "TABLE = {'a': 1}\n\nclass Box:\n    table: Mapping[str, int] = TABLE\n",
+        );
+        assert!(out.contains("default_factory=lambda: dict(TABLE)"), "{out}");
+        let out = parse_and_desugar("TAGS = set()\n\nclass Box:\n    tags: Set[str] = TAGS\n");
+        assert!(out.contains("default_factory=lambda: set(TAGS)"), "{out}");
+        // A dotted name, typed by the annotation.
+        let out = parse_and_desugar("class Box:\n    items: List[int] = config.DEFAULTS\n");
+        assert!(
+            out.contains("default_factory=lambda: list(config.DEFAULTS)"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn hashable_or_unknown_named_defaults_are_left_alone() {
+        for src in [
+            // Immutable value.
+            "LIMIT = 3\n\nclass Box:\n    n: int = LIMIT\n",
+            "PAIR = (1, 2)\n\nclass Box:\n    p: tuple[int, int] = PAIR\n",
+            // Kind unknown: neither the annotation nor a binding says list/dict/set.
+            "class Box:\n    items: Sequence[int] = make_items\n",
+            // A class-body name: a lambda in the class body cannot see it.
+            "class Box:\n    BASE: ClassVar[list[int]] = [1]\n    items: list[int] = BASE\n",
+            // ClassVar fields are class attributes, never factories.
+            "BASE: list[int] = [1]\n\nclass Box:\n    items: ClassVar[list[int]] = BASE\n",
+            // A name bound to different kinds is ambiguous.
+            "X = [1]\nX = {1}\n\nclass Box:\n    items: Collection[int] = X\n",
+        ] {
+            let out = parse_and_desugar(src);
+            assert!(
+                !out.contains("default_factory=lambda:"),
+                "must be left alone:\n{src}\n---\n{out}"
+            );
+        }
     }
 }
