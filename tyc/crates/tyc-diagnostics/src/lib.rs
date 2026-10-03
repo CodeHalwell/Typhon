@@ -420,16 +420,13 @@ pub enum TycError {
         note: String,
     },
 
-    /// The error type propagated by `?` from a callee does not match the
-    /// caller's `Result[T, E]` declaration. Distinct from the generic
-    /// `tyc::type_mismatch` so users see immediately that the failure is
-    /// at a `?`-propagation boundary and can act accordingly (convert at
-    /// the boundary, or change one of the function signatures).
-    #[error("`?` propagates `Err[{actual_err}]` into `Result[_, {expected_err}]`")]
+    /// A returned or propagated Err value does not match the enclosing
+    /// Result error type. This covers plain returns and `?` boundaries.
+    #[error("`Err[{actual_err}]` does not match declared `Result[_, {expected_err}]`")]
     #[diagnostic(
         code(tyc::result_error_mismatch),
         url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/result_error_mismatch.md"),
-        help("the `?` operator forwards the callee's `Err` value as-is; convert it with a `match` or change one signature so the error types match")
+        help("return or propagate an `Err` with the declared error type; convert the value with a `match` or change the result signature")
     )]
     ResultErrorMismatch {
         expected_err: String,

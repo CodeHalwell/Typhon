@@ -300,3 +300,46 @@ pub(super) fn call_kwarg_type(c: &Checker, func: &Expr) -> Option<Type> {
     }
     scan.result
 }
+
+pub(super) fn descriptor_used(c: &Checker, class: &str, field: &str) -> bool {
+    struct Scan<'c, 's> {
+        c: &'c Checker<'s>,
+        uses: HashSet<(String, String)>,
+    }
+    impl<'a> Visitor<'a> for Scan<'_, '_> {
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            if let Expr::Attribute(a) = expr {
+                if let Expr::Name(n) = a.value.as_ref() {
+                    let mut scope =
+                        Some(self.c.resolved.scope_at_offset(n.range.start().to_usize()));
+                    while let Some(id) = scope {
+                        let s = &self.c.resolved.scopes[id];
+                        if let Some(b) = s.lookup_local(n.id.as_str()) {
+                            if b.kind == BindingKind::Class {
+                                self.uses
+                                    .insert((n.id.as_str().to_owned(), a.attr.as_str().to_owned()));
+                            }
+                            break;
+                        }
+                        scope = s.parent;
+                    }
+                }
+            }
+            visitor::walk_expr(self, expr);
+        }
+    }
+    c.descriptor_uses
+        .get_or_init(|| {
+            let mut scan = Scan {
+                c,
+                uses: HashSet::new(),
+            };
+            if let Some(module) = c.module {
+                for stmt in &module.body {
+                    scan.visit_stmt(stmt);
+                }
+            }
+            scan.uses
+        })
+        .contains(&(class.to_owned(), field.to_owned()))
+}

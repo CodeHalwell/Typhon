@@ -3200,6 +3200,7 @@ const INFER_EXPR_MAX_DEPTH: u32 = 20_000;
 const IS_ASSIGNABLE_MAX_DEPTH: u32 = 256;
 
 struct Checker<'a> {
+    descriptor_uses: std::cell::OnceCell<HashSet<(String, String)>>,
     expression_types: HashMap<(usize, usize), Type>,
     attribute_receiver_type: Option<Type>,
     module: Option<&'a ModModule>,
@@ -3768,6 +3769,7 @@ impl<'a> Checker<'a> {
             in_generator: false,
             function_type_bounds: HashMap::new(),
             active_typevar_bounds: HashMap::new(),
+            descriptor_uses: std::cell::OnceCell::new(),
             expression_types: HashMap::new(),
             attribute_receiver_type: None,
             active_type_params: Vec::new(),
@@ -13152,7 +13154,13 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                                 }
                                 if first_defaulted.is_none() {
                                     if let Expr::Name(n) = a.target.as_ref() {
-                                        first_defaulted = Some((a, n.id.as_str().to_owned()));
+                                        if class_contracts::descriptor_used(
+                                            c,
+                                            class_name,
+                                            n.id.as_str(),
+                                        ) {
+                                            first_defaulted = Some((a, n.id.as_str().to_owned()));
+                                        }
                                     }
                                 }
                             }
@@ -13208,7 +13216,9 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     && !is_raw
                     && !inherits_required_field
                 {
-                    if let Some((ann, field_name)) = first_defaulted {
+                    if let Some((ann, field_name)) = first_defaulted
+                        .filter(|(_, field)| class_contracts::descriptor_used(c, class_name, field))
+                    {
                         let value_hint = ann
                             .value
                             .as_deref()
@@ -13230,9 +13240,14 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                                         "False".to_owned()
                                     }
                                 }
-                                _ => "its literal value".to_owned(),
+                                Expr::NoneLiteral(_) => "None".to_owned(),
+                                _ => c
+                                    .source
+                                    .get(v.range().start().to_usize()..v.range().end().to_usize())
+                                    .unwrap_or("the declared default")
+                                    .to_owned(),
                             })
-                            .unwrap_or_else(|| "its literal value".to_owned());
+                            .unwrap_or_else(|| "the declared default".to_owned());
                         let class_range = cd.name.range;
                         c.diagnostics
                             .push_warning(TycError::class_attr_shadows_slot(
@@ -38118,6 +38133,7 @@ class Foo:
 plain class Config:
     DEBUG: bool = True
     NAME: str = \"app\"
+let debug = Config.DEBUG
 ";
         let d = check_class_kinds(src);
         assert!(
@@ -38137,6 +38153,7 @@ plain class Config:
 class Config:
     DEBUG: bool = True
     NAME: str = \"app\"
+let debug = Config.DEBUG
 ";
         let d = check_class_kinds(src);
         assert!(
@@ -39268,5 +39285,39 @@ def main() -> None:
     fn w2_17_len_has_one_nullable_diagnostic() {
         let d = check_full("def f(v: str?) -> int:\n    return len(v)\n");
         assert_eq!(d.errors().len(), 1, "{:?}", d.errors());
+    }
+    #[test]
+    fn w2_18_class_lint_requires_descriptor_use() {
+        for src in [
+            "class Conn:\n    name: str? = None\ndef f() -> Conn:\n    return Conn()\n",
+            "class Conn:\n    name: str? = None\ndef f(Conn: Conn) -> str?:\n    return Conn.name\n",
+        ] { assert!(!check_class_kinds(src).warnings().iter().any(|e| matches!(e,TycError::ClassAttrShadowsSlot{..})), "{src}: {:?}",check_class_kinds(src).warnings()); }
+        let d = check_class_kinds("class Conn:\n    name: str? = None\nlet n = Conn.name\n");
+        assert!(
+            d.warnings()
+                .iter()
+                .any(|e| matches!(e, TycError::ClassAttrShadowsSlot { .. })),
+            "{:?}",
+            d.warnings()
+        );
+        assert!(!d
+            .warnings()
+            .iter()
+            .any(|e| e.to_string().contains("its literal value")));
+    }
+    #[test]
+    fn w2_18_result_error_wording() {
+        let d = check("def f() -> Result[int, str]:\n    return Err(5)\n");
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ResultErrorMismatch { .. })),
+            "{:?}",
+            d.errors()
+        );
+        assert!(!d
+            .errors()
+            .iter()
+            .any(|e| e.to_string().contains("`?` propagates")));
     }
 }
