@@ -1173,3 +1173,33 @@ def keep(s: OptStr) -> OptStr:
 "#,
     );
 }
+
+// ── W1-12: `except E as e` ────────────────────────────────────────────────
+
+#[test]
+fn w1_12_the_except_name_has_the_caught_type() {
+    assert_rejected(
+        "def f(s: str) -> Result[int, str]:\n    try:\n        return Ok(int(s))\n    except ValueError as e:\n        return Err(e)\n",
+    );
+    assert_rejected(
+        "def f(s: str) -> int:\n    try:\n        return int(s)\n    except ValueError as e:\n        let m: int = e\n        return m\n",
+    );
+    assert_clean(
+        r#"
+import logging
+class A(Exception):
+    code: int
+def f(s: str) -> Result[int, str]:
+    try:
+        return Ok(int(s))
+    except ValueError as e:
+        logging.error("bad %s", e)
+        return Err(str(e))
+    except A as a:
+        return Err(str(a.code))
+    except Exception as ex:
+        print(ex.args)
+        raise RuntimeError("x") from ex
+"#,
+    );
+}

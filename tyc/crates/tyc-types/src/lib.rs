@@ -13147,6 +13147,53 @@ fn clear_aliased_field_narrowings(
     }
 }
 
+/// Bind the `as` name of an `except` handler to what it catches: the class
+/// of `except ValueError as e`, the union of `except (A, B) as e`, and
+/// `BaseException` for a bare `except … as e` (which cannot be written,
+/// but a type the checker cannot read gives `Unknown`). It was never bound,
+/// so `return Err(e)` in a `-> Result[int, str]`, `let m: int = e` and
+/// `e.code` where only one of `(A, B)` has `code` all passed (review
+/// 2026-10-03 §3.2). `except*` binds an `ExceptionGroup`, left `Unknown`.
+fn bind_except_name(c: &mut Checker, h: &ruff_python_ast::ExceptHandlerExceptHandler, star: bool) {
+    let Some(name) = &h.name else {
+        return;
+    };
+    let ty = if star {
+        Type::Unknown
+    } else {
+        match h.type_.as_deref() {
+            None => Type::Class("BaseException".to_owned()),
+            Some(Expr::Tuple(tup)) => {
+                let members: Vec<Type> = tup
+                    .elts
+                    .iter()
+                    .map(|e| type_from_annotation(e, &c.classes))
+                    .collect();
+                if members
+                    .iter()
+                    .any(|m| matches!(m, Type::Unknown | Type::Any))
+                {
+                    Type::Unknown
+                } else {
+                    Type::union_of(members)
+                }
+            }
+            Some(e) => match type_from_annotation(e, &c.classes) {
+                t @ (Type::Class(_) | Type::Generic(..)) => t,
+                _ => Type::Unknown,
+            },
+        }
+    };
+    let start = name.range.start().to_usize();
+    c.env.declare(TypeBinding {
+        name: name.as_str().to_owned(),
+        declared: ty.clone(),
+        narrowed: ty,
+        span: (start, start + name.as_str().len()),
+        from_unsafe: c.unsafe_depth > 0,
+    });
+}
+
 /// Evaluate an expression appearing in statement position, invalidating global
 /// narrowing when it contains a call.
 ///
@@ -14423,6 +14470,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 for path in &body_writes.attrs {
                     c.env.clear_attr_narrowing(path);
                 }
+                bind_except_name(c, h, t.is_star);
                 for s in &h.body {
                     check_stmt(c, s);
                 }

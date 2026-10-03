@@ -104,6 +104,10 @@ review deferred; the third — the 2026-09-30 release-readiness review
   `if s is None: return ""` could not narrow `s`. Such aliases now expand to
   their right-hand side; messages show `str | None` where they showed
   `OptStr`.
+- **`except E as e` binds `e` to `E`** (the union for `except (A, B) as
+  e`). It was never bound, so `return Err(e)` in a `-> Result[int, str]`
+  function and `let m: int = e` passed. Block `rescue` lowers to the same
+  handler and is covered too.
 
 ### Third wave — the 2026-09-30 release-readiness review
 
