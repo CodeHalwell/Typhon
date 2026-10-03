@@ -2368,8 +2368,10 @@ fn comptime_type_value_rejects_any_without_import() {
         "build must fail for comptime Any without import"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // The resolver reports a `typing` name used as a value without its
+    // import before comptime evaluation runs.
     assert!(
-        stderr.contains("unknown name 'Any'"),
+        stderr.contains("unknown name 'Any'") || stderr.contains("cannot find 'Any' in scope"),
         "error should mention 'Any'; got:\n{stderr}"
     );
 }
