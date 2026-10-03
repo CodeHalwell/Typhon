@@ -28,7 +28,7 @@ cargo fmt -- --check             # formatting gate (CI runs this)
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-**CI treats all warnings as errors** (`RUSTFLAGS: -D warnings`). Code that compiles locally with warnings will fail CI — keep the tree warning-clean. CI runs five jobs: `test` (fmt check → clippy → `cargo test`), `security` (`cargo-deny` over `tyc/Cargo.toml` — advisories, licences, source/registry bans per `tyc/deny.toml`), `perf-gate`, `differential` (the VM↔CPython differential gate over the full example+stress corpus), and `knob-matrix` (the opt-in-knob codegen matrix).
+**CI treats all warnings as errors** (`RUSTFLAGS: -D warnings`). Code that compiles locally with warnings will fail CI — keep the tree warning-clean. CI runs six jobs: `test` (fmt check → clippy → `cargo test`), `test-macos` (same suite on macOS, non-blocking while the cross-platform failures land), `security` (`cargo-deny` over `tyc/Cargo.toml` — advisories, licences, source/registry bans per `tyc/deny.toml`), `perf-gate`, `differential` (the VM↔CPython differential gate over the full example+stress corpus), and `knob-matrix` (the opt-in-knob codegen matrix).
 
 Run a single test:
 
