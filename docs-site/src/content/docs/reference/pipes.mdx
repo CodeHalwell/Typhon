@@ -38,14 +38,23 @@ let cleaned: str = raw |> str.strip() |> str.lower() |> str.replace(",", "")
 
 No partial application, no curry, no special placeholder. Just first-positional threading.
 
-## Precedence
+## Precedence and positions
 
-Pipes bind looser than function calls and attribute access; tighter than comparisons, boolean ops, and conditionals:
+A `|>` chain must *end* its syntactic slot. Arithmetic (and calls/attribute
+access) may feed into the pipe on the left, and the chain nests inside call
+arguments and `return`, but no operator may follow the chain on the same
+level — a comparison, boolean-op, arithmetic or ternary tail is a parse
+error. Parenthesise the chain to use its value further:
 
 ```python
-a |> f() + 1            # ❌ parses as (a |> f()) + 1
-a |> (f() + 1)          # ❌ doesn't make sense — f()+1 isn't a call
-let n: int = a |> f() if cond else b |> g()   # parses as you'd hope
+1 + 2 |> f()                      # ✅ == f(1 + 2)
+g(3 |> f())                       # ✅ pipes nest in call args
+return x |> f()                   # ✅ a bare chain may end a return
+(x |> f()) == 0                   # ✅ parenthesised: compare the piped value
+3 |> f() + 1                      # ❌ parse error — parenthesise as above
+3 |> f() == 30                    # ❌ parse error — parenthesise as above
+3 |> f() if cond else 4 |> g()    # ❌ parse error — parenthesise each arm
+if 3 |> f():                      # ❌ parse error — parenthesise the condition
 ```
 
 When in doubt, parenthesise.

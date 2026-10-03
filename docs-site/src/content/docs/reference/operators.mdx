@@ -40,12 +40,17 @@ The `?` suffix on a `Result`-typed expression binds at the same precedence as `f
 
 ## Pipe precedence in detail
 
-`a |> f()` binds tighter than comparisons and boolean ops, looser than arithmetic:
+A `|>` chain must *end* its syntactic slot: arithmetic may feed into the pipe
+on the left, but no operator may follow the chain — comparisons, boolean ops,
+arithmetic tails and ternaries after a pipe are all parse errors. Parenthesise
+the chain to use its value further:
 
 ```python
-x + 1 |> f()        # parses as (x + 1) |> f() == f(x + 1)
-x |> f() == 0       # parses as (x |> f()) == 0
-x |> f() and g(x)   # parses as (x |> f()) and g(x)
+x + 1 |> f()        # ✅ == f(x + 1): arithmetic feeds the pipe
+x |> f() |> g()     # ✅ == g(f(x)): chains nest left
+(x |> f()) == 0     # ✅ parenthesised: compare the piped value
+x |> f() == 0       # ❌ parse error — parenthesise as above
+x |> f() and g(x)   # ❌ parse error — parenthesise as above
 ```
 
 When in doubt, parenthesise.
