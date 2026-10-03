@@ -15,6 +15,8 @@ review deferred; the third — the 2026-09-30 release-readiness review
 
 #### W2 — checker expressions
 
+- W2-03: shared fields and properties on unions return the union of their types. Direct method calls must satisfy every variant's arity and parameter types and return the union of their results, with generic receiver parameters substituted and async methods returning coroutines.
+
 - W2-19: attribute inference folds receiver chains iteratively and compares recorded narrowing paths without building every receiver prefix. On this Mac, debug checks at 2k/4k/8k links fell from 1.18s/4.84s/34.44s (8k stack abort) to 0.125s/0.210s/0.559s, all successful.
 
 - W2-20: `check_module_with_imports_and_types` exposes the checker's contextual expression types by preprocessed-source byte span, including Callable lambda parameters and match captures, for extension lowering.

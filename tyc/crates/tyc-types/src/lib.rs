@@ -19055,6 +19055,111 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     }
                 }
             }
+            if let Expr::Attribute(attr) = call.func.as_ref() {
+                let recv = c.unwrap_alias(&infer_expr_readonly(c, &attr.value));
+                let recv = expand_sealed_union_alias(c, recv, attr.attr.as_str());
+                if let Type::Union(members) = recv {
+                    let signatures: Option<Vec<MethodSig>> = members
+                        .iter()
+                        .map(|m| match m {
+                            Type::Class(name) | Type::Generic(name, _) => c
+                                .find_method(name, attr.attr.as_str())
+                                .cloned()
+                                .map(|mut sig| {
+                                    let bindings = receiver_type_bindings(c, m);
+                                    sig.return_type =
+                                        substitute_typevars(&sig.return_type, &bindings);
+                                    sig.param_types = sig
+                                        .param_types
+                                        .iter()
+                                        .map(|t| substitute_typevars(t, &bindings))
+                                        .collect();
+                                    sig.arity_info.kwonly_types = sig
+                                        .arity_info
+                                        .kwonly_types
+                                        .iter()
+                                        .map(|t| substitute_typevars(t, &bindings))
+                                        .collect();
+                                    sig
+                                }),
+                            _ => None,
+                        })
+                        .collect();
+                    if let Some(signatures) = signatures {
+                        let _ = infer_expr(c, &call.func);
+                        let actuals: Vec<Type> =
+                            pos_args.iter().map(|a| infer_expr(c, a)).collect();
+                        let kw_actuals: Vec<Type> =
+                            kw_args.iter().map(|k| infer_expr(c, &k.value)).collect();
+                        for sig in &signatures {
+                            if !matches!(
+                                check_arity_with_info(&sig.arity_info, pos_args, kw_args),
+                                ArityCheck::Ok
+                            ) {
+                                c.mismatch_with(
+                                    "arguments valid for every union member".into(),
+                                    "incompatible call arguments".into(),
+                                    (call.range.start().to_usize(), call.range.end().to_usize()),
+                                );
+                            }
+                            for (actual, (arg, expected)) in
+                                actuals.iter().zip(pos_args.iter().zip(&sig.param_types))
+                            {
+                                if !c.is_assignable(expected, actual) {
+                                    c.mismatch(
+                                        expected,
+                                        actual,
+                                        (
+                                            arg.range().start().to_usize(),
+                                            arg.range().end().to_usize(),
+                                        ),
+                                    );
+                                }
+                            }
+                            for (kw, actual) in kw_args.iter().zip(&kw_actuals) {
+                                if let Some(name) = &kw.arg {
+                                    let info = &sig.arity_info;
+                                    let expected = info
+                                        .param_names
+                                        .iter()
+                                        .position(|p| p == name.as_str())
+                                        .and_then(|i| sig.param_types.get(i))
+                                        .or_else(|| {
+                                            info.kwonly_names
+                                                .iter()
+                                                .position(|p| p == name.as_str())
+                                                .and_then(|i| info.kwonly_types.get(i))
+                                        });
+                                    if let Some(expected) = expected {
+                                        if !c.is_assignable(expected, actual) {
+                                            c.mismatch(
+                                                expected,
+                                                actual,
+                                                (
+                                                    kw.value.range().start().to_usize(),
+                                                    kw.value.range().end().to_usize(),
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        return Type::union_of(
+                            signatures
+                                .into_iter()
+                                .map(|s| {
+                                    if s.is_async {
+                                        Type::Generic("Coroutine".into(), vec![s.return_type])
+                                    } else {
+                                        s.return_type
+                                    }
+                                })
+                                .collect(),
+                        );
+                    }
+                }
+            }
             let func_type_raw = infer_expr(c, &call.func);
             // Unwrap transparent type aliases (`type Handler = Callable[..., R]`)
             // so that calls through the alias resolve to the underlying
@@ -20338,10 +20443,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         .iter()
                         .map(|m| member_field_type(c, m, attr_name))
                         .collect::<Option<Vec<Type>>>()
-                        .and_then(|tys| {
-                            let first = tys.first()?.clone();
-                            tys.iter().all(|t| *t == first).then_some(first)
-                        });
+                        .map(Type::union_of);
                     if let Some(t) = common {
                         return t;
                     }
@@ -21193,19 +21295,32 @@ fn expand_sealed_union_alias(c: &Checker, recv: Type, attr: &str) -> Type {
 /// The declared type of field / `@property` `attr` on a class member of a
 /// union, or `None` when the member is not a fully-known class or has no
 /// such field.
+fn receiver_type_bindings(c: &Checker, receiver: &Type) -> HashMap<String, Type> {
+    match receiver {
+        Type::Generic(name, args) => c
+            .class_type_params
+            .get(name)
+            .filter(|params| params.len() == args.len())
+            .map(|params| params.iter().cloned().zip(args.iter().cloned()).collect())
+            .unwrap_or_default(),
+        _ => HashMap::new(),
+    }
+}
+
 fn member_field_type(c: &Checker, member: &Type, attr: &str) -> Option<Type> {
-    let Type::Class(name) = member else {
-        return None;
+    let name = match member {
+        Type::Class(name) | Type::Generic(name, _) => name,
+        _ => return None,
     };
     if !c.class_hierarchy_fully_known(name) {
         return None;
     }
-    if let Some(t) = c.find_field(name, attr) {
-        return Some(t.clone());
-    }
-    c.find_method(name, attr)
-        .filter(|sig| sig.is_property)
-        .map(|sig| sig.return_type.clone())
+    let ty = c.find_field(name, attr).cloned().or_else(|| {
+        c.find_method(name, attr)
+            .filter(|sig| sig.is_property)
+            .map(|sig| sig.return_type.clone())
+    })?;
+    Some(substitute_typevars(&ty, &receiver_type_bindings(c, member)))
 }
 
 /// Whether a user class (or one of its known bases) defines any rich
@@ -38301,5 +38416,14 @@ def main() -> None:
             expression_attr_narrowing(&checker, &stmt.value),
             Some(Type::Float)
         );
+    }
+    #[test]
+    fn w2_03_union_member_contracts() {
+        for src in [
+            "class A:\n    value: int\nclass B:\n    value: str\ntype U = A | B\ndef f(u: U) -> int:\n    return u.value + 1\n",
+            "class A:\n    n: int\nimpl A:\n    def read(self) -> int:\n        return 1\nclass B:\n    n: int\nimpl B:\n    def read(self) -> int:\n        return 2\ntype U = A | B\ndef f(u: U) -> str:\n    return u.read()\n",
+            "class A:\n    n: int\nimpl A:\n    def read(self, x: int) -> int:\n        return x\nclass B:\n    n: int\nimpl B:\n    def read(self, x: str) -> int:\n        return 2\ntype U = A | B\ndef f(u: U) -> int:\n    return u.read(1)\n",
+            "class A:\n    n: int\nimpl A:\n    def read(self) -> int:\n        return 1\nclass B:\n    n: int\nimpl B:\n    def read(self, x: str) -> int:\n        return 2\ntype U = A | B\ndef f(u: U) -> int:\n    return u.read()\n",
+        ] { assert!(!check(src).errors().is_empty(), "accepted: {src}"); }
     }
 }
