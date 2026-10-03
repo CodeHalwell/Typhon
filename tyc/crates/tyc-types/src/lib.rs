@@ -3133,6 +3133,7 @@ const INFER_EXPR_MAX_DEPTH: u32 = 20_000;
 const IS_ASSIGNABLE_MAX_DEPTH: u32 = 256;
 
 struct Checker<'a> {
+    expression_types: HashMap<(usize, usize), Type>,
     path: String,
     source: &'a str,
     resolved: &'a ResolvedModule,
@@ -3697,6 +3698,7 @@ impl<'a> Checker<'a> {
             in_generator: false,
             function_type_bounds: HashMap::new(),
             active_typevar_bounds: HashMap::new(),
+            expression_types: HashMap::new(),
             active_type_params: Vec::new(),
             interfaces: HashMap::new(),
             class_shapes: HashMap::new(),
@@ -6579,6 +6581,44 @@ pub fn check_module_with_imports(
     impl_distributed_lines: &[usize],
     external: Option<&ExternalShapes>,
 ) -> Diagnostics {
+    check_module_with_imports_and_types(
+        path,
+        source,
+        resolved,
+        module,
+        unsafe_lines,
+        frozen_class_lines,
+        impl_distributed_lines,
+        external,
+    )
+    .diagnostics
+}
+
+/// Checked expression types use byte spans in the preprocessed source. The
+/// map records contextual inference, including expected Callable parameters
+/// and typed match captures, rather than reconstructing types during lowering.
+#[derive(Debug)]
+pub struct CheckedModule {
+    pub diagnostics: Diagnostics,
+    pub expression_types: HashMap<(usize, usize), Type>,
+}
+impl CheckedModule {
+    pub fn type_at(&self, span: (usize, usize)) -> Option<&Type> {
+        self.expression_types.get(&span)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn check_module_with_imports_and_types(
+    path: impl Into<String>,
+    source: &str,
+    resolved: &ResolvedModule,
+    module: &ModModule,
+    unsafe_lines: &[usize],
+    frozen_class_lines: &[usize],
+    impl_distributed_lines: &[usize],
+    external: Option<&ExternalShapes>,
+) -> CheckedModule {
     let mut c = Checker::new(path.into(), source, resolved);
     c.unsafe_line_starts = unsafe_byte_starts(source, unsafe_lines);
     let frozen_starts = unsafe_byte_starts(source, frozen_class_lines);
@@ -6824,7 +6864,10 @@ pub fn check_module_with_imports(
     // the failure shows in the editor instead of at first import.
     check_freeze_let_freezable(&mut c, &module.body);
 
-    c.diagnostics
+    CheckedModule {
+        diagnostics: c.diagnostics,
+        expression_types: c.expression_types,
+    }
 }
 
 /// Compute the byte offset of the start of each line in `source` that was
@@ -18111,6 +18154,13 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
     c.infer_depth.set(depth + 1);
     let result = infer_expr_ctx_inner(c, expr, expected);
     c.infer_depth.set(depth);
+    c.expression_types.insert(
+        (
+            expr.range().start().to_usize(),
+            expr.range().end().to_usize(),
+        ),
+        result.clone(),
+    );
     result
 }
 
@@ -38147,5 +38197,32 @@ def main() -> None:
     fn w2_01_fresh_containers_and_dead_branch_controls() {
         let src = "class Animal:\n    name: str\nclass Dog(Animal):\n    name: str\ndef f() -> None:\n    let dogs: list[Dog] = [Dog(name=\"x\")]\n    let animals: list[Animal] = list(dogs)\n    let xs: list[float] = [1, 2]\n    let ints: set[int] = set(xs)\n    print(float(\"1\")[:0] if False else \"skip\")\n";
         assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn w2_20_contextual_receiver_query() {
+        let prep = preprocess("from typing import Callable\nlet f: Callable[[str], str] = lambda s: s.upper()\ndef g(xs: list[str]) -> str:\n    match xs:\n        case [item]:\n            return item.upper()\n        case _:\n            return \"\"\n");
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module("<test>".into(), &prep.python_source, &module);
+        let checked = check_module_with_imports_and_types(
+            "<test>",
+            &prep.python_source,
+            &resolved,
+            &module,
+            &[],
+            &[],
+            &[],
+            None,
+        );
+        for needle in ["s.upper()", "item.upper()"] {
+            let start = prep.python_source.find(needle).unwrap();
+            let name_len = needle.find('.').unwrap();
+            assert_eq!(
+                checked.type_at((start, start + name_len)),
+                Some(&Type::Str),
+                "{needle}"
+            );
+        }
     }
 }

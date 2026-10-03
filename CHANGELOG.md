@@ -15,6 +15,8 @@ review deferred; the third — the 2026-09-30 release-readiness review
 
 #### W2 — checker expressions
 
+- W2-20: `check_module_with_imports_and_types` exposes the checker's contextual expression types by preprocessed-source byte span, including Callable lambda parameters and match captures, for extension lowering.
+
 - W2-01: builtin calls retain their result and iterator element types, including per-call overloads for `round`, `min`/`max`, numeric conversions and container constructors. `super()` resolves the base method contract. Fresh container copies may widen their elements; constant-false expression branches do not introduce diagnostics. The 1,481-unit checker corpus retains its baseline; no newly rejected unit was added.
 
 ### Third wave — the 2026-09-30 release-readiness review
