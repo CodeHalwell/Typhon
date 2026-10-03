@@ -55,14 +55,31 @@ pub struct MigrateArgs {
     /// Print the migrated source to stdout instead of writing `.ty` files.
     #[arg(long)]
     pub check: bool,
+
+    /// Overwrite existing `.ty` files. Without this flag, `tyc migrate` refuses
+    /// if any target `.ty` file already exists.
+    #[arg(long, short)]
+    pub force: bool,
 }
 
 pub fn run(args: MigrateArgs) -> Result<()> {
     let path = args.path.clone();
-    let py_files = collect_py_files(&path)?;
+    let py_files = crate::commands::util::collect_py_files(&path)?;
 
     if py_files.is_empty() {
         return Err(miette!("no .py files found under '{}'", path.display()));
+    }
+
+    if !args.force && !args.check {
+        for py in &py_files {
+            let ty = py.with_extension("ty");
+            if ty.exists() {
+                return Err(miette!(
+                    "'{}' already exists; re-run with --force to overwrite",
+                    ty.display()
+                ));
+            }
+        }
     }
 
     let mut migrated = 0usize;
@@ -78,7 +95,8 @@ pub fn run(args: MigrateArgs) -> Result<()> {
         }
 
         let ty = py.with_extension("ty");
-        std::fs::write(&ty, &out).map_err(|e| miette!("cannot write '{}': {e}", ty.display()))?;
+        tyc_format::atomic_write(&ty, out.as_bytes())
+            .map_err(|e| miette!("cannot write '{}': {e}", ty.display()))?;
         migrated += 1;
     }
 
@@ -95,6 +113,9 @@ pub fn run(args: MigrateArgs) -> Result<()> {
 pub fn migrate_source(source: &str) -> String {
     let reassigned = collect_reassigned_names(source);
     let mut bang_class_lines = collect_bang_class_lines(source);
+    let custom_dataclass_decorator_lines = collect_custom_dataclass_decorator_lines(source);
+    let plain_dataclass_class_lines =
+        collect_plain_dataclass_class_lines(source, &custom_dataclass_decorator_lines);
     let frozen_class_lines = collect_frozen_class_lines(source);
     let frozen_decorator_lines = collect_frozen_decorator_lines(source);
 
@@ -210,6 +231,8 @@ pub fn migrate_source(source: &str) -> String {
                 &reassigned,
                 line_index,
                 &bang_class_lines,
+                &custom_dataclass_decorator_lines,
+                &plain_dataclass_class_lines,
                 &frozen_class_lines,
                 &frozen_decorator_lines,
                 in_class_body,
@@ -239,6 +262,7 @@ pub fn migrate_source(source: &str) -> String {
                 });
             } else if trimmed.starts_with("class ")
                 || trimmed.starts_with("class!")
+                || trimmed.starts_with("plain class ")
                 || trimmed == "class"
             {
                 scope_stack.push(Scope {
@@ -434,6 +458,28 @@ fn insert_pass_for_empty_blocks(source: &str) -> String {
     out
 }
 
+fn parse_method_alias(line: &str) -> Option<(&str, &str)> {
+    let trimmed = line.trim();
+    let code = match find_comment_start(trimmed) {
+        Some(pos) => trimmed[..pos].trim_end(),
+        None => trimmed,
+    };
+    let eq_pos = code.find('=')?;
+    let before = code[..eq_pos].trim();
+    let after = code[eq_pos + 1..].trim();
+    if after.starts_with('=') {
+        return None;
+    }
+    if before.ends_with(['+', '-', '*', '/', '%', '&', '|', '^', '<', '>', '!', ':']) {
+        return None;
+    }
+    if is_python_identifier(before) && is_python_identifier(after) {
+        Some((before, after))
+    } else {
+        None
+    }
+}
+
 /// Relocate method definitions out of top-level `class` bodies into an
 /// `impl ClassName:` block emitted right after the class — Typhon's Rule
 /// 4 (`tyc::method_in_class_body` is a warning on exactly the output the
@@ -492,6 +538,48 @@ fn move_methods_to_impl(source: &str) -> String {
             }
             end += 1;
         }
+        // Scan for method names and aliases defined in this class body.
+        let mut defined_methods: HashSet<String> = HashSet::new();
+        let mut scan_idx = i + 1;
+        while scan_idx < end {
+            let r = lines[scan_idx].trim_end_matches(['\n', '\r']);
+            let t = r.trim_start();
+            let ind = r.len() - t.len();
+            if !in_string[scan_idx] && ind == 4 {
+                if let Some(rest) = t.strip_prefix("def ") {
+                    let name_end = rest
+                        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .unwrap_or(rest.len());
+                    let name = &rest[..name_end];
+                    if !name.is_empty() {
+                        defined_methods.insert(name.to_owned());
+                    }
+                } else if let Some(rest) = t.strip_prefix("async def ") {
+                    let name_end = rest
+                        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .unwrap_or(rest.len());
+                    let name = &rest[..name_end];
+                    if !name.is_empty() {
+                        defined_methods.insert(name.to_owned());
+                    }
+                }
+            }
+            scan_idx += 1;
+        }
+        scan_idx = i + 1;
+        while scan_idx < end {
+            let r = lines[scan_idx].trim_end_matches(['\n', '\r']);
+            let t = r.trim_start();
+            let ind = r.len() - t.len();
+            if !in_string[scan_idx] && ind == 4 {
+                if let Some((alias, target)) = parse_method_alias(t) {
+                    if defined_methods.contains(target) {
+                        defined_methods.insert(alias.to_owned());
+                    }
+                }
+            }
+            scan_idx += 1;
+        }
         // Partition body items at indent 4 into methods vs the rest.
         let mut others: Vec<&str> = Vec::new();
         let mut methods: Vec<&str> = Vec::new();
@@ -517,7 +605,9 @@ fn move_methods_to_impl(source: &str) -> String {
                     rk.len() - tk.len() == 4
                         && (tk.starts_with("def ")
                             || tk.starts_with("async def ")
-                            || tk.starts_with('@'))
+                            || tk.starts_with('@')
+                            || parse_method_alias(tk)
+                                .is_some_and(|(_, target)| defined_methods.contains(target)))
                 };
                 for blank in &lines[j..k.min(end)] {
                     if next_is_method {
@@ -527,6 +617,14 @@ fn move_methods_to_impl(source: &str) -> String {
                     }
                 }
                 j = k;
+                continue;
+            }
+            if !in_string[j]
+                && ind == 4
+                && parse_method_alias(t).is_some_and(|(_, target)| defined_methods.contains(target))
+            {
+                methods.push(lines[j]);
+                j += 1;
                 continue;
             }
             if !in_string[j]
@@ -753,6 +851,8 @@ fn prune_stale_migration_imports(source: &str) -> String {
             Some("dataclasses")
         } else if trimmed.starts_with("from enum import ") {
             Some("enum")
+        } else if trimmed.starts_with("from typing import ") {
+            Some("typing")
         } else {
             None
         };
@@ -763,13 +863,23 @@ fn prune_stale_migration_imports(source: &str) -> String {
         let prefix_len = format!("from {module} import ").len();
         let names: Vec<&str> = trimmed[prefix_len..]
             .split(',')
-            .map(|n| n.trim())
+            .map(|n| n.trim().trim_matches(['(', ')', ' ']))
             .filter(|n| !n.is_empty())
             .collect();
         let kept: Vec<&str> = names
             .iter()
             .copied()
-            .filter(|n| referenced_outside_imports(source, n))
+            .filter(|n| {
+                if module == "typing" {
+                    if *n == "Union" || *n == "Optional" {
+                        referenced_outside_imports(source, n)
+                    } else {
+                        true
+                    }
+                } else {
+                    referenced_outside_imports(source, n)
+                }
+            })
             .collect();
         if kept.is_empty() {
             continue; // whole import is dead
@@ -793,6 +903,8 @@ fn rewrite_line(
     reassigned: &HashSet<String>,
     line_index: usize,
     bang_class_lines: &HashSet<usize>,
+    custom_dataclass_decorator_lines: &HashSet<usize>,
+    plain_dataclass_class_lines: &HashSet<usize>,
     frozen_class_lines: &HashSet<usize>,
     frozen_decorator_lines: &HashSet<usize>,
     in_class_body: bool,
@@ -809,11 +921,6 @@ fn rewrite_line(
     let trimmed = line.trim_start();
     if trimmed.starts_with('#') {
         return line.to_owned();
-    }
-
-    // Rule 5: drop `from dataclasses import dataclass` entirely.
-    if line.trim() == "from dataclasses import dataclass" {
-        return String::new();
     }
 
     // Rule 5b: `Optional` was just rewritten to `T?` everywhere, so any
@@ -834,18 +941,24 @@ fn rewrite_line(
     // line — also covers `@dataclass(frozen=True[, ...])` and the
     // qualified `@dataclasses.dataclass(...)` form. The frozen variant
     // has already been recorded in `frozen_decorator_lines` so the
-    // class header below can append the `frozen` modifier. The
-    // qualified prefix is checked first because it's a superset of the
-    // bare `@dataclass` form.
+    // class header below can append the `frozen` modifier. Decorators
+    // carrying custom options like `order=True` or `eq=False` are kept
+    // intact on a `plain class`.
     if let Some(rest) = trimmed.strip_prefix("@dataclasses.dataclass") {
         let after = rest.trim();
-        if after.is_empty() || after.starts_with('(') {
+        if after.is_empty() {
+            return String::new();
+        }
+        if after.starts_with('(') && !custom_dataclass_decorator_lines.contains(&line_index) {
             return String::new();
         }
     }
     if let Some(rest) = trimmed.strip_prefix("@dataclass") {
         let after = rest.trim();
-        if after.is_empty() || after.starts_with('(') {
+        if after.is_empty() {
+            return String::new();
+        }
+        if after.starts_with('(') && !custom_dataclass_decorator_lines.contains(&line_index) {
             return String::new();
         }
     }
@@ -910,6 +1023,12 @@ fn rewrite_line(
     // whose `@dataclass(frozen=True[, ...])` decorator was just dropped.
     if frozen_class_lines.contains(&line_index) {
         body = append_frozen_modifier(&body);
+    }
+
+    if plain_dataclass_class_lines.contains(&line_index) {
+        if let Some(rest) = body.strip_prefix("class ") {
+            body = format!("plain class {rest}");
+        }
     }
 
     // Module-level annotated assignment: prepend let/mut.
@@ -979,7 +1098,6 @@ fn rewrite_line(
 /// typing import …` line drops the now-dead names.
 const TYPING_NAMES_TO_REWRITE: &[&str] = &[
     "Optional",
-    "Union",
     "List",
     "Dict",
     "Tuple",
@@ -1643,6 +1761,99 @@ fn collect_bang_class_lines(source: &str) -> HashSet<usize> {
     out
 }
 
+/// True when a `@dataclass(...)` (or `@dataclasses.dataclass(...)`) line specifies
+/// arguments other than native Typhon parameters (`frozen=True/False`, `slots=True/False`).
+///
+/// For example: `@dataclass(order=True)` or `@dataclass(eq=False)` change dataclass semantics
+/// in ways Typhon's default `@dataclass(slots=True)` doesn't replicate. Such classes are kept as
+/// `plain class` with the decorator preserved.
+fn is_custom_dataclass_decorator(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let rest = if let Some(rest) = trimmed.strip_prefix("@dataclasses.dataclass") {
+        rest.trim()
+    } else if let Some(rest) = trimmed.strip_prefix("@dataclass") {
+        rest.trim()
+    } else {
+        return false;
+    };
+    if rest.is_empty() || !rest.starts_with('(') {
+        return false;
+    }
+    let Some(close) = find_matching_close_paren(rest) else {
+        return false;
+    };
+    let inside = rest[1..close].trim();
+    if inside.is_empty() {
+        return false;
+    }
+    for piece in split_top_level_commas(inside) {
+        let p = piece.trim();
+        if p.is_empty() {
+            continue;
+        }
+        let (k, v) = match p.split_once('=') {
+            Some((k, v)) => (k.trim(), v.trim()),
+            None => continue,
+        };
+        match k {
+            "order" if v == "True" => return true,
+            "eq" if v == "False" => return true,
+            "unsafe_hash" if v == "True" => return true,
+            "repr" if v == "False" => return true,
+            "init" if v == "False" => return true,
+            "kw_only" if v == "True" => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn collect_custom_dataclass_decorator_lines(source: &str) -> HashSet<usize> {
+    let mut out: HashSet<usize> = HashSet::new();
+    for (idx, raw) in source.lines().enumerate() {
+        if is_custom_dataclass_decorator(raw) {
+            out.insert(idx);
+        }
+    }
+    out
+}
+
+fn collect_plain_dataclass_class_lines(
+    source: &str,
+    custom_decorators: &HashSet<usize>,
+) -> HashSet<usize> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut out: HashSet<usize> = HashSet::new();
+    for (idx, raw) in lines.iter().enumerate() {
+        let trimmed = raw.trim_start();
+        if !trimmed.starts_with("class ") && trimmed != "class" {
+            continue;
+        }
+        let indent_len = raw.len() - trimmed.len();
+        let mut probe = idx;
+        while probe > 0 {
+            probe -= 1;
+            let prev = lines[probe];
+            let prev_trim = prev.trim_start();
+            if prev_trim.is_empty() {
+                continue;
+            }
+            let prev_indent = prev.len() - prev_trim.len();
+            if prev_indent != indent_len {
+                break;
+            }
+            if !prev_trim.starts_with('@') {
+                break;
+            }
+            if custom_decorators.contains(&probe) {
+                out.insert(idx);
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Find every `@dataclass(frozen=True[, ...])` (and qualified-form)
 /// decorator line. The decorator itself is dropped at rewrite time;
 /// the immediately-following class header gets a `frozen` suffix
@@ -1650,6 +1861,9 @@ fn collect_bang_class_lines(source: &str) -> HashSet<usize> {
 fn collect_frozen_decorator_lines(source: &str) -> HashSet<usize> {
     let mut out: HashSet<usize> = HashSet::new();
     for (idx, raw) in source.lines().enumerate() {
+        if is_custom_dataclass_decorator(raw) {
+            continue;
+        }
         let trimmed = raw.trim_start();
         // Check the qualified form first because `@dataclass` is a
         // strict prefix of `@dataclasses.dataclass`.
@@ -2066,6 +2280,36 @@ fn pos_in_ranges(pos: usize, ranges: &[(usize, usize)]) -> bool {
     ranges.iter().any(|(s, e)| pos >= *s && pos < *e)
 }
 
+/// Check whether `pos` in `s` falls inside the argument list of an `isinstance(...)` call.
+fn is_inside_isinstance(s: &str, pos: usize) -> bool {
+    let bytes = &s.as_bytes()[..pos];
+    let string_ranges = string_literal_byte_ranges(&s[..pos]);
+    let mut paren_stack: Vec<bool> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if pos_in_ranges(i, &string_ranges) {
+            i += 1;
+            continue;
+        }
+        match bytes[i] {
+            b'(' => {
+                let before = s[..i].trim_end();
+                let is_isinstance = before.ends_with("isinstance")
+                    && (before.len() == 10
+                        || (!before.as_bytes()[before.len() - 11].is_ascii_alphanumeric()
+                            && before.as_bytes()[before.len() - 11] != b'_'));
+                paren_stack.push(is_isinstance);
+            }
+            b')' => {
+                paren_stack.pop();
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    paren_stack.iter().any(|&is_inst| is_inst)
+}
+
 /// Rewrite every `Optional[T]` (including `typing.Optional[T]`) to `T?`
 /// and every `T | None` to `T?`.
 ///
@@ -2078,14 +2322,20 @@ fn rewrite_optional(line: &str) -> String {
     // Replace fully-qualified first to avoid double rewriting. Skip
     // matches that fall inside a string literal on the same line so we
     // don't munge `x = "Optional[int]"` into `x = "int?"` (FINDINGS —
-    // Codex review on PR #94).
+    // Codex review on PR #94). Also skip inside `isinstance(...)` calls.
     for prefix in &["typing.Optional[", "Optional["] {
+        let mut search_from = 0usize;
         while let Some(start) = {
             let string_ranges = string_literal_byte_ranges(&s);
-            s.match_indices(prefix)
-                .map(|(i, _)| i)
+            s[search_from..]
+                .match_indices(prefix)
+                .map(|(rel, _)| search_from + rel)
                 .find(|&i| !pos_in_ranges(i, &string_ranges))
         } {
+            if is_inside_isinstance(&s, start) {
+                search_from = start + prefix.len();
+                continue;
+            }
             let open = start + prefix.len() - 1;
             // Find the matching `]` honouring nested brackets.
             let mut depth: i32 = 0;
@@ -2127,6 +2377,7 @@ fn rewrite_optional(line: &str) -> String {
                 format!("{inner}?")
             };
             s.replace_range(start..=close, &replacement);
+            search_from = start + replacement.len();
         }
     }
 
@@ -2165,6 +2416,10 @@ fn rewrite_union_optional(line: &str) -> String {
                 .map(|(rel, m)| (search_from + rel, m))
                 .find(|(i, _)| !pos_in_ranges(*i, &string_ranges))
         } {
+            if is_inside_isinstance(&s, start) {
+                search_from = start + prefix.len();
+                continue;
+            }
             let open = start + prefix.len() - 1;
             // Find the matching `]` honouring nested brackets.
             let mut depth: i32 = 0;
@@ -2531,6 +2786,10 @@ fn collect_reassigned_names(source: &str) -> HashSet<String> {
             Some(scope) => &mut scope.declared,
             None => &mut module_declared,
         };
+        if let Some(name) = leading_aug_assign_name(trimmed) {
+            reassigned.insert(name);
+            continue;
+        }
         if let Some(name) = leading_ann_assign_name(trimmed) {
             // Annotated assigns count as a declaration.
             if !declared.insert(name.clone()) {
@@ -2593,36 +2852,46 @@ fn leading_plain_assign_name(line: &str) -> Option<String> {
     Some(name.to_owned())
 }
 
-/// Recursively collect every `.py` file under `root`.  Mirrors the helper
-/// in `commands::util` but specialised for the migration command so we
-/// don't conflict with `.ty` discovery.
-fn collect_py_files(root: &std::path::Path) -> Result<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    if root.is_file() {
-        if root.extension().and_then(|s| s.to_str()) == Some("py") {
-            out.push(root.to_path_buf());
+/// Extract `NAME` from a leading `NAME += …`, `NAME -= …`, etc. augmented assignment line.
+fn leading_aug_assign_name(line: &str) -> Option<String> {
+    let mut end = 0usize;
+    for (i, c) in line.char_indices() {
+        if i == 0 {
+            if !(c.is_alphabetic() || c == '_') {
+                return None;
+            }
+            end = c.len_utf8();
+            continue;
         }
-        return Ok(out);
-    }
-    walk(root, &mut out)?;
-    out.sort();
-    Ok(out)
-}
-
-fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in
-        std::fs::read_dir(dir).map_err(|e| miette!("cannot list '{}': {e}", dir.display()))?
-    {
-        let entry =
-            entry.map_err(|e| miette!("cannot read entry under '{}': {e}", dir.display()))?;
-        let path = entry.path();
-        if path.is_dir() {
-            walk(&path, out)?;
-        } else if path.extension().and_then(|s| s.to_str()) == Some("py") {
-            out.push(path);
+        if c.is_alphanumeric() || c == '_' {
+            end = i + c.len_utf8();
+            continue;
         }
+        break;
     }
-    Ok(())
+    if end == 0 {
+        return None;
+    }
+    let name = &line[..end];
+    let after = line[end..].trim_start();
+    let is_aug = after.starts_with("+=")
+        || after.starts_with("-=")
+        || after.starts_with("*=")
+        || after.starts_with("/=")
+        || after.starts_with("//=")
+        || after.starts_with("%=")
+        || after.starts_with("**=")
+        || after.starts_with("&=")
+        || after.starts_with("|=")
+        || after.starts_with("^=")
+        || after.starts_with("<<=")
+        || after.starts_with(">>=")
+        || after.starts_with("@=");
+    if is_aug {
+        Some(name.to_owned())
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -3436,5 +3705,133 @@ def run():
             !out.contains("pass"),
             "a body that already has a statement must not gain `pass`; got:\n{out}"
         );
+    }
+
+    #[test]
+    fn aug_assign_counts_as_reassignment() {
+        let src = "i = 0\nwhile i < 10:\n    i += 1\n";
+        let out = migrate_source(src);
+        assert!(out.contains("mut i = 0"), "got:\n{out}");
+    }
+
+    #[test]
+    fn dataclass_with_custom_args_emits_plain_class() {
+        let src = "from dataclasses import dataclass\n@dataclass(order=True)\nclass Item:\n    priority: int\n";
+        let out = migrate_source(src);
+        assert!(out.contains("from dataclasses import dataclass"), "import must be kept; got:\n{out}");
+        assert!(out.contains("@dataclass(order=True)"), "decorator must be kept; got:\n{out}");
+        assert!(out.contains("plain class Item:"), "must emit plain class; got:\n{out}");
+
+        let src_eq = "from dataclasses import dataclass\n@dataclass(eq=False)\nclass Entity:\n    id: int\n";
+        let out_eq = migrate_source(src_eq);
+        assert!(out_eq.contains("from dataclasses import dataclass"), "import must be kept; got:\n{out_eq}");
+        assert!(out_eq.contains("@dataclass(eq=False)"), "decorator must be kept; got:\n{out_eq}");
+        assert!(out_eq.contains("plain class Entity:"), "must emit plain class; got:\n{out_eq}");
+    }
+
+    #[test]
+    fn method_alias_moves_to_impl_block() {
+        let src = "class MyNum:\n    val: int\n    def __add__(self, other: MyNum) -> MyNum:\n        return MyNum(self.val + other.val)\n    __radd__ = __add__\n";
+        let out = migrate_source(src);
+        assert!(out.contains("impl MyNum:"), "got:\n{out}");
+        let impl_idx = out.find("impl MyNum:").unwrap();
+        let alias_idx = out.find("__radd__ = __add__").expect("alias must exist in output");
+        assert!(alias_idx > impl_idx, "alias must move to impl block; got:\n{out}");
+    }
+
+    #[test]
+    fn isinstance_union_preserved_and_not_rewritten_to_question_mark() {
+        let src = "from typing import Union\n\ndef check(v: object) -> bool:\n    return isinstance(v, Union[int, None])\n";
+        let out = migrate_source(src);
+        assert!(!out.contains("int?"), "must not rewrite to int? inside isinstance; got:\n{out}");
+        assert!(out.contains("isinstance(v, Union[int, None])"), "got:\n{out}");
+        assert!(out.contains("from typing import Union"), "Union import must be preserved; got:\n{out}");
+    }
+
+    #[test]
+    fn union_preserved_when_used_at_runtime() {
+        let src = "from typing import Union\n\nu = Union\n";
+        let out = migrate_source(src);
+        assert!(out.contains("from typing import Union"), "got:\n{out}");
+    }
+
+    #[test]
+    fn migrate_refuses_to_overwrite_without_force() {
+        let tmp = tempfile::tempdir().unwrap();
+        let py_file = tmp.path().join("app.py");
+        let ty_file = tmp.path().join("app.ty");
+        std::fs::write(&py_file, "x = 1\n").unwrap();
+        std::fs::write(&ty_file, "# hand edited\n").unwrap();
+
+        let args = super::MigrateArgs {
+            path: tmp.path().to_path_buf(),
+            check: false,
+            force: false,
+        };
+        let err = super::run(args).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "got: {err}");
+        assert_eq!(std::fs::read_to_string(&ty_file).unwrap(), "# hand edited\n");
+    }
+
+    #[test]
+    fn migrate_force_overwrites_existing_ty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let py_file = tmp.path().join("app.py");
+        let ty_file = tmp.path().join("app.ty");
+        std::fs::write(&py_file, "x = 1\n").unwrap();
+        std::fs::write(&ty_file, "# hand edited\n").unwrap();
+
+        let args = super::MigrateArgs {
+            path: tmp.path().to_path_buf(),
+            check: false,
+            force: true,
+        };
+        super::run(args).unwrap();
+        assert_ne!(std::fs::read_to_string(&ty_file).unwrap(), "# hand edited\n");
+    }
+
+    #[test]
+    fn migrate_skips_venv_and_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let venv = tmp.path().join(".venv");
+        let build = tmp.path().join("build");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&venv).unwrap();
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::write(src.join("app.py"), "x = 1\n").unwrap();
+        std::fs::write(venv.join("bad.py"), "x = 1\n").unwrap();
+        std::fs::write(build.join("skip.py"), "x = 1\n").unwrap();
+
+        let args = super::MigrateArgs {
+            path: tmp.path().to_path_buf(),
+            check: false,
+            force: false,
+        };
+        super::run(args).unwrap();
+        assert!(src.join("app.ty").exists());
+        assert!(!venv.join("bad.ty").exists());
+        assert!(!build.join("skip.ty").exists());
+    }
+
+    #[test]
+    fn migrate_does_not_loop_on_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("app.py"), "x = 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            let link = src.join("cycle");
+            let _ = std::os::unix::fs::symlink(&src, &link);
+        }
+
+        let args = super::MigrateArgs {
+            path: tmp.path().to_path_buf(),
+            check: false,
+            force: false,
+        };
+        super::run(args).unwrap();
+        assert!(src.join("app.ty").exists());
     }
 }

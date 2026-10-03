@@ -12,6 +12,7 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 - **LSP definition URIs rebased onto client workspace root.** `goto_definition` now uses the client's declared workspace root URI (preserving symlink prefixes such as `/var/folders` or `/tmp` rather than macOS `/private/var/...`) or open-document URI, preventing editors from opening duplicate tabs on cross-file jumps.
 - **Build escape test uses stable assertion.** The regression test asserts on the unrendered error message rather than terminal-width-dependent formatting from miette.
 - **Dependencies commands preserve pyproject.toml and reject symlinks.** `tyc sync`, `tyc add`, and `tyc remove` now update `pyproject.toml` via `merge_pyproject` with `atomic_write`, preserving comments, authors, and `[tool.*]` tables while refusing symlinked targets. Edits to `typhon.toml` also enforce atomic writes and reject symlinks.
+- **Migrate overwrite safety, symlink loop protection, and semantic preservation.** `tyc migrate` now uses `util::collect_py_files` to skip `.venv` and `build` directories, avoids symlink loops and escaping symlinks, refuses to overwrite existing `.ty` files without `--force`, and writes atomically. Preserves custom `@dataclass(...)` decorators on plain classes, treats `+=` as reassignment (`mut`), moves method aliases (`__radd__ = __add__`) into `impl` blocks, preserves `from typing import Union` when used at runtime, and protects `Union` arguments inside `isinstance(...)` calls from rewriting.
 
 ### Third wave — the 2026-09-30 release-readiness review
 
