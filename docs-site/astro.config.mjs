@@ -21,8 +21,7 @@ export default defineConfig({
         github: 'https://github.com/CodeHalwell/Typhon',
       },
       editLink: {
-        baseUrl:
-          'https://github.com/CodeHalwell/Typhon/edit/main/docs-site/src/content/docs/',
+        baseUrl: 'https://github.com/CodeHalwell/Typhon/edit/main/docs-site/',
       },
       customCss: ['./src/styles/custom.css'],
       head: [

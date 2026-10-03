@@ -1275,6 +1275,7 @@ fn arity_info_from_params(
         param_types,
         kwonly_types,
         return_type,
+        is_async: false,
     })
 }
 

@@ -51,7 +51,7 @@ of decorators above it.
 `@dataclass(frozen=True)` becomes Typhon's `frozen` modifier, which binds
 to the class **name** and sits ahead of any base list:
 
-```typhon
+```text
 class Vec frozen(Base):   # not `class Vec(Base) frozen:`
     x: int
 ```

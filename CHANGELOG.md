@@ -11,6 +11,14 @@ remediation described further down; the second closed the backlog that
 review deferred; the third — the 2026-09-30 release-readiness review
 (`docs/release-readiness-review-2026-09-30.md`) — is summarised first.
 
+**Post-review fixes.** Cross-module free-function shapes now retain whether a
+function is `async`, so both `from provider import make; make()` and
+`import provider; provider.make()` type as coroutines until awaited instead of
+masquerading as the declared result type. The docs site labels unreleased
+beta.1 behaviour, generates working GitHub edit links, and builds without
+unknown-code-language warnings. The symlink-escape regression test now asserts
+stable diagnostic fragments rather than terminal-width-dependent wrapping.
+
 ### Third wave — the 2026-09-30 release-readiness review
 
 **Seven ways a check-clean program could crash, closed.** Each of these

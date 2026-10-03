@@ -107,15 +107,6 @@ These are the items the language reference and skill point here for:
   for the alpha.
 - **Function-level HKT params, non-class constructor application, constructor
   composition** — the deferred remainder of the HKT work above.
-- **Coroutine-typed calls** — the checker types an un-awaited call to an
-  `async def` as its declared return (the coroutine is transparent), relying
-  on `tyc::missing_await` / `tyc::async_without_await` to catch the common
-  shapes. So `make().slug()` with `async def make() -> str` passes, and the
-  `await`-on-non-awaitable check (2026-09-30) can only fire on callees
-  provably sync in the same module — `ModuleShapes` records no async flag for
-  free functions. Modelling `Coroutine[..., T]` as the call's type (and
-  carrying `is_async` in the shapes) would close both.
-
 ---
 
 ## References
