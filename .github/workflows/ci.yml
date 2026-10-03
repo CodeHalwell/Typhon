@@ -79,6 +79,54 @@ jobs:
           TYC_REQUIRE_PYTHON: "1"
           TYC_REQUIRE_RUFF: "1"
 
+  test-macos:
+    name: Test (macOS)
+    runs-on: macos-latest
+    # Non-blocking while the day-one cross-platform failures land (W4-01,
+    # W4-02, W5-01, W5-02). Flip to a hard gate after ~1 week green.
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: tyc
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch (toolchain pinned via `with:`)
+        with:
+          toolchain: "1.94"
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        # Same convention as the Linux job: the cache is an optimization,
+        # never a correctness requirement.
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tyc/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('tyc/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # Same loud-interpreter convention as the Linux job: a missing
+      # interpreter must fail loudly, never skip silently.
+      - name: Install Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install ruff (format-stage source-map tests)
+        run: python -m pip install --quiet ruff==0.15.8
+
+      - name: Tests
+        run: cargo test --workspace
+        env:
+          TYC_REQUIRE_PYTHON: "1"
+          TYC_REQUIRE_RUFF: "1"
+
   security:
     name: Security audit
     runs-on: ubuntu-latest
