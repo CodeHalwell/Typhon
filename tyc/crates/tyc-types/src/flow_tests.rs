@@ -1258,3 +1258,43 @@ def c(raw: str) -> int:
 "#;
     assert_eq!(unsafe_leaks(src), 0, "{:?}", messages(&check(src)));
 }
+
+// ── W1-15: older narrowing gaps ───────────────────────────────────────────
+
+#[test]
+fn w1_15_isinstance_bare_container_and_walrus_truthiness() {
+    assert_clean(
+        r#"
+def f(x: list[int] | str) -> str:
+    if isinstance(x, list):
+        return "l"
+    return x.upper()
+def g(x: dict[str, int] | int) -> int:
+    if not isinstance(x, dict):
+        return x + 1
+    return 0
+def h(n: str?) -> str:
+    match n:
+        case None:
+            return ""
+        case s:
+            return s.upper()
+def k(d: dict[str, list[int]]) -> int:
+    if (xs := d.get("a")) and len(xs) > 0:
+        return xs[0]
+    return 0
+"#,
+    );
+}
+
+#[test]
+fn w1_15_a_comprehension_walrus_target_keeps_its_declared_type_afterwards() {
+    assert_rejected(
+        r#"
+def f(xs: list[str?]) -> str:
+    let ys = [u for v in xs if (u := v) is not None]
+    print(ys)
+    return u.upper()
+"#,
+    );
+}

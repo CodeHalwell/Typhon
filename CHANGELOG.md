@@ -128,6 +128,13 @@ review deferred; the third — the 2026-09-30 release-readiness review
   `NameError` / `UnboundLocalError`. Both now report
   `tyc::immutable_assign`. A `for` or `with … as` target rebinding a `let`
   stays allowed, as decided in R2-17.
+- **Older narrowing gaps.** `isinstance(x, list)` / `dict` / `tuple` now
+  removes `list[int]` / `dict[…]` / `tuple[…]` on the negative branch; a
+  walrus is truthy-narrowed like the name it binds
+  (`if (xs := d.get("a")) and len(xs) > 0`); and a walrus inside a
+  comprehension binds in the enclosing scope at its declared type, as PEP
+  572 specifies (it used to disappear with the comprehension and read as
+  an unchecked `Unknown`, though it may hold `None`).
 
 ### Third wave — the 2026-09-30 release-readiness review
 

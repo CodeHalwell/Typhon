@@ -13089,6 +13089,48 @@ fn after_expr_effects(c: &mut Checker, expr: &Expr) {
     }
 }
 
+/// Pop a comprehension's scope, carrying out the names a walrus inside it
+/// bound: PEP 572 binds them in the enclosing scope, holding the *last*
+/// value assigned — whatever the filter's narrowing said about each one —
+/// so they come out at their declared type. They used to vanish with the
+/// scope, leaving `u` in `[u for v in xs if (u := v) is not None]` an
+/// unchecked `Unknown` afterwards when it may hold `None` (review
+/// 2026-10-03 §3.11).
+fn leave_comprehension_scope(c: &mut Checker, comp: &Expr) {
+    let carried: Vec<TypeBinding> = walrus_targets_in(comp)
+        .iter()
+        .filter_map(|n| c.env.scopes.last().and_then(|s| s.get(n.as_str())).cloned())
+        .collect();
+    c.env.leave();
+    for mut b in carried {
+        b.narrowed = b.declared.clone();
+        c.env.declare(b);
+    }
+}
+
+/// Names bound by a walrus anywhere in `expr` (not inside a nested lambda).
+fn walrus_targets_in(expr: &Expr) -> Vec<String> {
+    use ruff_python_ast::visitor::{walk_expr, Visitor};
+    struct V(Vec<String>);
+    impl<'a> Visitor<'a> for V {
+        fn visit_expr(&mut self, e: &'a Expr) {
+            match e {
+                Expr::Lambda(_) => return,
+                Expr::Named(n) => {
+                    if let Expr::Name(t) = n.target.as_ref() {
+                        self.0.push(t.id.as_str().to_owned());
+                    }
+                }
+                _ => {}
+            }
+            walk_expr(self, e);
+        }
+    }
+    let mut v = V(Vec::new());
+    v.visit_expr(expr);
+    v.0
+}
+
 /// Drop the field narrowings a call may have made stale — on its receiver,
 /// on every bare-name argument, and, for a callee known to write fields
 /// `F`, on every path through a field in `F` (an alias of any object may
@@ -18100,6 +18142,23 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                 }
             }
         }
+        Expr::Named(nd) => {
+            // `(xs := d.get("a"))` is truthy-tested like the name it binds:
+            // `if (xs := …) and len(xs) > 0` (review 2026-10-03 §4.7).
+            if !negate {
+                if let Expr::Name(n) = nd.target.as_ref() {
+                    if let Some(b) = c.env.lookup(n.id.as_str()) {
+                        if b.narrowed.is_nullable() {
+                            out.push(Narrowing {
+                                name: n.id.as_str().to_owned(),
+                                attr_path: None,
+                                replacement: b.narrowed.strip_none(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
         Expr::Attribute(_) => {
             // Truthy narrowing on an attribute path, the counterpart of the
             // `Name` arm: `if head.nxt: head.nxt.v`, `if not self.data:
@@ -19018,12 +19077,40 @@ fn strip_variant(typ: &Type, variant: &Type) -> Type {
         return out;
     }
     if let Type::Union(xs) = typ {
-        let kept: Vec<Type> = xs.iter().filter(|t| *t != variant).cloned().collect();
+        let kept: Vec<Type> = xs
+            .iter()
+            .filter(|t| !same_runtime_class(t, variant))
+            .cloned()
+            .collect();
         Type::union_of(kept)
-    } else if typ == variant {
+    } else if same_runtime_class(typ, variant) {
         Type::Unknown
     } else {
         typ.clone()
+    }
+}
+
+/// Whether every value of `member` is an instance of the class `variant`
+/// names, for the negative branch of `isinstance`: equal types, or a
+/// parameterised builtin container against its bare class —
+/// `isinstance(x, list)` removes `list[int]` (review 2026-10-03 §4.7).
+fn same_runtime_class(member: &Type, variant: &Type) -> bool {
+    if member == variant {
+        return true;
+    }
+    let head = match variant {
+        Type::Class(h) => h.as_str(),
+        Type::Generic(h, args) if args.is_empty() => h.as_str(),
+        _ => return false,
+    };
+    match member {
+        Type::Generic(h, _) => {
+            h == head
+                || (head == "tuple" && h == "tuple_variadic")
+                || (head == "dict"
+                    && matches!(h.as_str(), "defaultdict" | "OrderedDict" | "Counter"))
+        }
+        _ => false,
     }
 }
 
@@ -21952,7 +22039,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             c.env.enter();
             infer_comprehension_generators(c, &comp.generators);
             let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
-            c.env.leave();
+            leave_comprehension_scope(c, expr);
             c.env.restore_scope_narrowings(comp_saved);
             // A comprehension builds a *fresh* list, so — like a list literal —
             // it takes the annotated element type whenever every element fits
@@ -21971,7 +22058,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             c.env.enter();
             infer_comprehension_generators(c, &comp.generators);
             let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
-            c.env.leave();
+            leave_comprehension_scope(c, expr);
             c.env.restore_scope_narrowings(comp_saved);
             let elt = widen_fresh_element(c, elt, elt_expected.as_ref());
             Type::Generic("set".into(), vec![elt])
@@ -21989,7 +22076,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             c.env.enter();
             infer_comprehension_generators(c, &comp.generators);
             let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
-            c.env.leave();
+            leave_comprehension_scope(c, expr);
             c.env.restore_scope_narrowings(comp_saved);
             // A generator expression is an `Iterator[T]`.
             Type::Generic("Iterator".into(), vec![elt])
@@ -22033,7 +22120,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     c.mismatch(ve, &v, span);
                 }
             }
-            c.env.leave();
+            leave_comprehension_scope(c, expr);
             c.env.restore_scope_narrowings(comp_saved);
             Type::Generic("dict".into(), vec![k, v])
         }
