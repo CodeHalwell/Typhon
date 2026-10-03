@@ -10,19 +10,8 @@ pub(super) fn parameter_pack(params: &[Type]) -> Option<&str> {
 }
 
 pub(super) fn constructor(c: &Checker, name: &str) -> Option<Type> {
-    if !c.classes.iter().any(|n| n == name) {
-        return None;
-    }
-    let binding = c.env.lookup(name)?;
-    if !c
-        .resolved
-        .scopes
-        .iter()
-        .flat_map(|s| &s.bindings)
-        .any(|b| b.name == name && b.kind == BindingKind::Class && b.span.0 == binding.span.0)
-    {
-        return None;
-    }
+    let name = class_name(c, name)?;
+    let name = name.as_str();
     let shape = effective_class_shape(name, &c.class_shapes)?;
     let info = shape
         .methods
@@ -47,6 +36,33 @@ pub(super) fn origin(c: &Checker, expr: &Expr) -> Option<ArityInfo> {
                 .parameters
                 .as_deref()
                 .map(|p| arity_info_from_parameters(p, &c.classes, &[]));
+        }
+        if let Expr::Call(call) = expr {
+            if let Type::Function { params, ret, .. } = infer_expr_readonly(c, &call.func) {
+                if let Type::Function { params: output, .. } = ret.as_ref() {
+                    if let Some(pack) = parameter_pack(output) {
+                        for (i, param) in params.iter().enumerate() {
+                            if matches!(param, Type::Function{params,..} if parameter_pack(params)==Some(pack))
+                            {
+                                let arg = call.arguments.args.get(i).or_else(|| {
+                                    let info = origin(c, &call.func)?;
+                                    let name = info.param_names.get(i)?;
+                                    call.arguments
+                                        .keywords
+                                        .iter()
+                                        .find(|kw| {
+                                            kw.arg.as_ref().is_some_and(|n| n.as_str() == name)
+                                        })
+                                        .map(|kw| &kw.value)
+                                });
+                                if let Some(arg) = arg {
+                                    return resolve(c, arg, seen);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         let Expr::Name(n) = expr else { return None };
         let binding = c.env.lookup(n.id.as_str())?;
@@ -167,4 +183,57 @@ pub(super) fn decorated(c: &Checker, name: &str) -> bool {
         scan.visit_stmt(stmt);
     }
     scan.found
+}
+
+fn alias_value<'a>(c: &Checker<'a>, start: usize) -> Option<&'a Expr> {
+    struct Find<'a> {
+        start: usize,
+        value: Option<&'a Expr>,
+    }
+    impl<'a> Visitor<'a> for Find<'a> {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            match stmt {
+                Stmt::AnnAssign(a) if a.target.range().start().to_usize() == self.start => {
+                    self.value = a.value.as_deref()
+                }
+                Stmt::Assign(a)
+                    if a.targets
+                        .iter()
+                        .any(|t| t.range().start().to_usize() == self.start) =>
+                {
+                    self.value = Some(&a.value)
+                }
+                _ => visitor::walk_stmt(self, stmt),
+            }
+        }
+    }
+    let mut find = Find { start, value: None };
+    for stmt in &c.module?.body {
+        find.visit_stmt(stmt);
+    }
+    find.value
+}
+pub(super) fn class_name(c: &Checker, name: &str) -> Option<String> {
+    fn resolve(c: &Checker, name: &str, seen: &mut HashSet<usize>) -> Option<String> {
+        let binding = c.env.lookup(name)?;
+        if !seen.insert(binding.span.0) {
+            return None;
+        }
+        let resolved = c
+            .resolved
+            .scopes
+            .iter()
+            .flat_map(|s| &s.bindings)
+            .find(|b| b.name == name && b.span.0 == binding.span.0)?;
+        if matches!(resolved.kind, BindingKind::Class | BindingKind::Import)
+            && c.classes.iter().any(|n| n == name)
+        {
+            return Some(name.to_owned());
+        }
+        if let Expr::Name(n) = alias_value(c, binding.span.0)? {
+            return resolve(c, n.id.as_str(), seen);
+        }
+        None
+    }
+    resolve(c, name, &mut HashSet::new())
 }

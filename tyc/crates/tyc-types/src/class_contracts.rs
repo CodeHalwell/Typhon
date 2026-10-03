@@ -217,12 +217,7 @@ pub(super) fn property(c: &Checker, class: &str, field: &str) -> Option<(Type, O
 
 pub(super) fn class_object(c: &Checker, expr: &Expr) -> bool {
     let Expr::Name(n) = expr else { return false };
-    let Some(binding) = c.env.lookup(n.id.as_str()) else {
-        return false;
-    };
-    c.resolved.scopes.iter().flat_map(|s| &s.bindings).any(|b| {
-        b.name == n.id.as_str() && b.kind == BindingKind::Class && b.span.0 == binding.span.0
-    })
+    callables::class_name(c, n.id.as_str()).is_some()
 }
 
 pub(super) fn classvar(c: &Checker, class: &str, field: &str) -> bool {

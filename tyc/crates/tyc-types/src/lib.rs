@@ -39320,4 +39320,11 @@ def main() -> None:
             .iter()
             .any(|e| e.to_string().contains("`?` propagates")));
     }
+    #[test]
+    fn w2_06_preserve_callable_alias_provenance() {
+        for src in [
+            "from typing import Callable\ndef deco[**P, R](f: Callable[P, R]) -> Callable[P, R]:\n    return f\ndef add(a: int, b: int = 10) -> int:\n    return a+b\ndef f() -> int:\n    let g=deco(add)\n    return g(a=1)\n",
+            "from typing import Callable\nclass Pt:\n    x: int\ndef apply(factory: Callable[[int], Pt]) -> Pt:\n    return factory(1)\ndef f() -> Pt:\n    let factory=Pt\n    return apply(factory)\n",
+        ] {assert!(check(src).errors().is_empty(),"{src}: {:?}",check(src).errors());}
+    }
 }
