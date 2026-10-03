@@ -22109,7 +22109,7 @@ fn await_operand_is_shape_checkable(c: &Checker, operand: &Expr) -> bool {
                 // function's shape carries no async flag, so `await
                 // other.run()` on an `async def` imported from a sibling
                 // module must stay permissive.
-                let sync_def = c.sync_functions.contains(name) && !c.async_functions.contains(name);
+                let sync_def = callables::known_sync(c, &call.func);
                 let own_class = c.local_classes.contains(name)
                     && c.class_shapes.contains_key(name)
                     && !c.is_interface_name(name)
@@ -39326,5 +39326,18 @@ def main() -> None:
             "from typing import Callable\ndef deco[**P, R](f: Callable[P, R]) -> Callable[P, R]:\n    return f\ndef add(a: int, b: int = 10) -> int:\n    return a+b\ndef f() -> int:\n    let g=deco(add)\n    return g(a=1)\n",
             "from typing import Callable\nclass Pt:\n    x: int\ndef apply(factory: Callable[[int], Pt]) -> Pt:\n    return factory(1)\ndef f() -> Pt:\n    let factory=Pt\n    return apply(factory)\n",
         ] {assert!(check(src).errors().is_empty(),"{src}: {:?}",check(src).errors());}
+    }
+    #[test]
+    fn w2_11_sync_aliases_and_callable_contracts() {
+        for src in [
+            "def work() -> int:\n    return 1\nasync def f() -> None:\n    let g=work\n    go g()\n",
+            "from typing import Callable\nasync def f(g: Callable[[], int]) -> None:\n    go g()\n",
+        ] {assert!(!check_full(src).errors().is_empty(),"accepted: {src}");}
+        let src="async def work() -> int:\n    return 1\nasync def f() -> None:\n    let g=work\n    go g()\n";
+        assert!(
+            check_full(src).errors().is_empty(),
+            "{:?}",
+            check_full(src).errors()
+        );
     }
 }

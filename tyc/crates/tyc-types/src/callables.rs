@@ -237,3 +237,57 @@ pub(super) fn class_name(c: &Checker, name: &str) -> Option<String> {
     }
     resolve(c, name, &mut HashSet::new())
 }
+
+pub(super) fn known_sync(c: &Checker, expr: &Expr) -> bool {
+    fn resolve(c: &Checker, expr: &Expr, seen: &mut HashSet<usize>) -> bool {
+        if matches!(expr, Expr::Lambda(_)) {
+            return true;
+        }
+        let Expr::Name(n) = expr else { return false };
+        let Some(binding) = c.env.lookup(n.id.as_str()) else {
+            return false;
+        };
+        if !seen.insert(binding.span.0) {
+            return false;
+        }
+        struct Find {
+            start: usize,
+            sync: Option<bool>,
+        }
+        impl<'a> Visitor<'a> for Find {
+            fn visit_stmt(&mut self, stmt: &'a Stmt) {
+                if let Stmt::FunctionDef(f) = stmt {
+                    if f.name.range.start().to_usize() == self.start {
+                        self.sync = Some(!f.is_async && f.decorator_list.is_empty());
+                        return;
+                    }
+                }
+                visitor::walk_stmt(self, stmt);
+            }
+        }
+        let mut find = Find {
+            start: binding.span.0,
+            sync: None,
+        };
+        if let Some(module) = c.module {
+            for stmt in &module.body {
+                find.visit_stmt(stmt);
+            }
+        }
+        if let Some(sync) = find.sync {
+            return sync;
+        }
+        if let Some(value) = alias_value(c, binding.span.0) {
+            return resolve(c, value, seen);
+        }
+        let parameter = c
+            .resolved
+            .scopes
+            .iter()
+            .flat_map(|s| &s.bindings)
+            .any(|b| b.span.0 == binding.span.0 && b.kind == BindingKind::Parameter);
+        parameter
+            && matches!(&binding.narrowed,Type::Function{ret,..} if definitely_not_awaitable(c,ret))
+    }
+    resolve(c, expr, &mut HashSet::new())
+}
