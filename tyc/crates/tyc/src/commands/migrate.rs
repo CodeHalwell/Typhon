@@ -1531,14 +1531,23 @@ fn collect_trivial_init_classes(source: &str) -> TrivialInitClasses {
         }
 
         // Walk the body. Body extends from header_end+1 up to the next
-        // line whose indent is <= class_indent (or EOF).
+        // code line whose indent is <= body_indent (or EOF).
+        //
+        // A blank or comment line belongs to the method only when more of
+        // the method follows it. The run of them after the last body line
+        // belongs to the method up to the first comment dedented to the
+        // class body's level or shallower: that comment (`# keep this` at
+        // column zero, or the comment above the next method) and everything
+        // after it precede what follows the method, and must survive the
+        // strip.
         let mut body_lines: Vec<usize> = Vec::new();
+        let mut pending: Vec<usize> = Vec::new();
         let mut i = header_end + 1;
         while i < lines.len() {
             let l = lines[i];
             let lt = l.trim_start();
             if lt.is_empty() || lt.starts_with('#') {
-                body_lines.push(i);
+                pending.push(i);
                 i += 1;
                 continue;
             }
@@ -1546,8 +1555,17 @@ fn collect_trivial_init_classes(source: &str) -> TrivialInitClasses {
             if ind <= body_indent {
                 break;
             }
+            body_lines.append(&mut pending);
             body_lines.push(i);
             i += 1;
+        }
+        for li in pending {
+            let l = lines[li];
+            let lt = l.trim_start();
+            if lt.starts_with('#') && l.len() - lt.len() <= body_indent {
+                break;
+            }
+            body_lines.push(li);
         }
         // Inside the body, ignore blank/comment lines for the pattern
         // match. Every remaining line must be `self.NAME = NAME` at
@@ -3207,6 +3225,41 @@ class Box(Generic[T]):
             out.contains("class Box[T]:"),
             "header should be `class Box[T]:`, got:\n{out}"
         );
+    }
+
+    #[test]
+    fn stripping_a_trivial_init_keeps_comments_that_follow_the_method() {
+        // The body walk used to take every blank and comment line after
+        // the method, at any indent, so the strip deleted a column-zero
+        // comment after the class and the comment above the next method.
+        let src = "\
+class Point:
+    def __init__(self, x: int, y: int):
+        self.x = x
+        # nested in the method
+        self.y = y
+        # trailing, still in the method
+# keep this
+
+def main() -> None:
+    pass
+
+
+class Pair:
+    def __init__(self, a: int):
+        self.a = a
+
+    # describes total
+    def total(self) -> int:
+        return self.a
+";
+        let out = migrate_source(src);
+        assert!(!out.contains("def __init__"), "got:\n{out}");
+        assert!(out.contains("# keep this\n\ndef main"), "got:\n{out}");
+        assert!(out.contains("# describes total"), "got:\n{out}");
+        // Comments inside the stripped method go with it.
+        assert!(!out.contains("nested in the method"), "got:\n{out}");
+        assert!(!out.contains("still in the method"), "got:\n{out}");
     }
 
     #[test]

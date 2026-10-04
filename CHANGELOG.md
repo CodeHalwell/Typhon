@@ -472,6 +472,12 @@ grouped by workstream (W1–W7).
   own filter that keeps every user-authored directory and skips only virtual
   environments (any directory with a `pyvenv.cfg`), VCS metadata, caches,
   `node_modules` and `build`.
+- **`tyc migrate` keeps comments after a stripped constructor.** Removing a
+  trivial `__init__` also removed every comment line between it and the next
+  statement, whatever its indent — a column-zero `# keep this` after the
+  class, or the comment above the next method. A comment dedented to the
+  class body's level or shallower now ends the method; comments inside it
+  still go with it.
 - **A refused `pyproject.toml` no longer leaves `tyc add` half-done.**
   `tyc add` / `tyc remove` refused a symlinked or unparseable
   `pyproject.toml` only after rewriting `typhon.toml`, so the command failed
