@@ -27,8 +27,11 @@
 use std::collections::HashSet;
 
 use ruff_python_ast::{
-    name::Name, Arguments, AtomicNodeIndex, ExceptHandler, Expr, ExprAttribute, ExprCall,
-    ExprContext, ExprName, Identifier, Keyword, ModModule, Stmt, StmtAssign, StmtWith, WithItem,
+    name::Name, Arguments, AtomicNodeIndex, BoolOp, CmpOp, ExceptHandler,
+    ExceptHandlerExceptHandler, Expr, ExprAttribute, ExprBoolOp, ExprCall, ExprCompare,
+    ExprContext, ExprName, ExprNoneLiteral, ExprNumberLiteral, ExprSubscript, ExprUnaryOp,
+    Identifier, Int, Keyword, ModModule, Number, Stmt, StmtAssign, StmtIf, StmtRaise, StmtTry,
+    StmtWith, UnaryOp, WithItem,
 };
 use ruff_text_size::TextRange;
 
@@ -538,16 +541,42 @@ fn comp_generators_use_any(
 
 // ── synthesis ────────────────────────────────────────────────────────────────
 
-/// Synthesize the statement sequence that replaces a candidate gather run.
-/// Returns the `async with asyncio.TaskGroup() as tg: ...` block followed
-/// by one `name = task.result()` extraction per candidate. The caller
-/// extends its enclosing block with the result so we don't need a wrapper
-/// statement (no `if True:` no-op block).
+/// Synthesize the statement sequence that replaces a candidate gather run:
+///
+/// ```python
+/// task_0 = task_1 = None
+/// err = None
+/// try:
+///     async with asyncio.TaskGroup() as tg:
+///         task_0 = tg.create_task(callee_0(args))
+///         task_1 = tg.create_task(callee_1(args))
+/// except BaseExceptionGroup as eg:
+///     err = eg.exceptions[0]
+///     if task_1 is not None and task_1.done() and not task_1.cancelled() and task_1.exception() is not None:
+///         err = task_1.exception()
+///     if task_0 is not None and ...:
+///         err = task_0.exception()
+/// if err is not None:
+///     raise err
+/// name_0 = task_0.result()
+/// name_1 = task_1.result()
+/// ```
+///
+/// A `TaskGroup` reports a failure as an `ExceptionGroup`, which no
+/// `except ValueError` up the stack would catch, while the sequential
+/// awaits this replaces raise the failing call's own exception. The
+/// handler hands callers that exception back — the earliest failing task
+/// in source order, as sequential execution would — and the `raise` sits
+/// outside the handler so the group is not chained on as `__context__`.
+/// The caller extends its enclosing block with the result, so no wrapper
+/// statement (`if True:`) is needed.
 fn make_autogather_block(run: &[Candidate<'_>], counter: &mut usize) -> Vec<Stmt> {
     let id = *counter;
     *counter += 1;
 
     let tg_name = format!("__typhon_autogather_tg_{}__", id);
+    let err_name = format!("__typhon_autogather_err_{}__", id);
+    let eg_name = format!("__typhon_autogather_eg_{}__", id);
     let task_name = |i: usize| format!("__typhon_autogather_task_{}_{}__", id, i);
 
     // Body of the `async with` block: one `task_i = tg.create_task(callee(args))`
@@ -570,12 +599,144 @@ fn make_autogather_block(run: &[Candidate<'_>], counter: &mut usize) -> Vec<Stmt
         body: block_body,
     });
 
-    let mut out: Vec<Stmt> = Vec::with_capacity(1 + run.len());
-    out.push(async_with);
+    // `err = eg.exceptions[0]`, then one override per task, last task
+    // first, so the earliest failing task in source order wins.
+    let mut handler_body: Vec<Stmt> = vec![assign(
+        vec![name_store(&err_name)],
+        Expr::Subscript(ExprSubscript {
+            node_index: AtomicNodeIndex::NONE,
+            range: TextRange::default(),
+            value: Box::new(attr(name_load(&eg_name), "exceptions")),
+            slice: Box::new(Expr::NumberLiteral(ExprNumberLiteral {
+                node_index: AtomicNodeIndex::NONE,
+                range: TextRange::default(),
+                value: Number::Int(Int::from(0u8)),
+            })),
+            ctx: ExprContext::Load,
+        }),
+    )];
+    for i in (0..run.len()).rev() {
+        let task = task_name(i);
+        let failed = Expr::BoolOp(ExprBoolOp {
+            node_index: AtomicNodeIndex::NONE,
+            range: TextRange::default(),
+            op: BoolOp::And,
+            values: vec![
+                is_not_none(name_load(&task)),
+                method_call(&task, "done"),
+                Expr::UnaryOp(ExprUnaryOp {
+                    node_index: AtomicNodeIndex::NONE,
+                    range: TextRange::default(),
+                    op: UnaryOp::Not,
+                    operand: Box::new(method_call(&task, "cancelled")),
+                }),
+                is_not_none(method_call(&task, "exception")),
+            ],
+        });
+        handler_body.push(Stmt::If(StmtIf {
+            node_index: AtomicNodeIndex::NONE,
+            range: TextRange::default(),
+            test: Box::new(failed),
+            body: vec![assign(
+                vec![name_store(&err_name)],
+                method_call(&task, "exception"),
+            )],
+            elif_else_clauses: vec![],
+        }));
+    }
+    let try_stmt = Stmt::Try(StmtTry {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+        body: vec![async_with],
+        handlers: vec![ExceptHandler::ExceptHandler(ExceptHandlerExceptHandler {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            type_: Some(Box::new(name_load("BaseExceptionGroup"))),
+            name: Some(Identifier::new(eg_name.as_str(), TextRange::default())),
+            body: handler_body,
+        })],
+        orelse: vec![],
+        finalbody: vec![],
+        is_star: false,
+    });
+    let reraise = Stmt::If(StmtIf {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+        test: Box::new(is_not_none(name_load(&err_name))),
+        body: vec![Stmt::Raise(StmtRaise {
+            node_index: AtomicNodeIndex::NONE,
+            range: TextRange::default(),
+            exc: Some(Box::new(name_load(&err_name))),
+            cause: None,
+        })],
+        elif_else_clauses: vec![],
+    });
+
+    let mut out: Vec<Stmt> = Vec::with_capacity(4 + run.len());
+    out.push(assign(
+        (0..run.len()).map(|i| name_store(&task_name(i))).collect(),
+        none_literal(),
+    ));
+    out.push(assign(vec![name_store(&err_name)], none_literal()));
+    out.push(try_stmt);
+    out.push(reraise);
     for (i, c) in run.iter().enumerate() {
         out.push(make_result_extract(c.bind, &task_name(i)));
     }
     out
+}
+
+fn assign(targets: Vec<Expr>, value: Expr) -> Stmt {
+    Stmt::Assign(StmtAssign {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+        targets,
+        value: Box::new(value),
+        mutability: None,
+    })
+}
+
+fn none_literal() -> Expr {
+    Expr::NoneLiteral(ExprNoneLiteral {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+    })
+}
+
+fn attr(value: Expr, name: &str) -> Expr {
+    Expr::Attribute(ExprAttribute {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+        value: Box::new(value),
+        attr: Identifier::new(name, TextRange::default()),
+        ctx: ExprContext::Load,
+    })
+}
+
+/// `receiver.method()`.
+fn method_call(receiver: &str, method: &str) -> Expr {
+    Expr::Call(ExprCall {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+        func: Box::new(attr(name_load(receiver), method)),
+        arguments: Arguments {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            args: Box::new([]),
+            keywords: Box::new([]),
+        },
+    })
+}
+
+/// `expr is not None`.
+fn is_not_none(expr: Expr) -> Expr {
+    Expr::Compare(ExprCompare {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+        left: Box::new(expr),
+        ops: Box::new([CmpOp::IsNot]),
+        comparators: Box::new([none_literal()]),
+    })
 }
 
 fn name_load(name: &str) -> Expr {
@@ -704,22 +865,12 @@ pub fn collect_gatherable_async_fn_names(module: &ModModule) -> HashSet<String> 
             Stmt::FunctionDef(f) if f.is_async && has_gatherable_decorator(&f.decorator_list) => {
                 out.insert(f.name.as_str().to_owned());
             }
-            // Methods declared inside `class Foo:` or the
-            // preprocessor's `__typhon_impl_Foo` pseudo-class (the
-            // lowered form of `impl Foo:`) are scanned too so a
-            // `@gatherable` annotation on a method is honoured. The
-            // gather rewriter already recurses into class bodies, so
-            // the eligibility set has to match for the rewrite to
-            // fire on a class-method bare-name call.
-            Stmt::ClassDef(c) => {
-                for inner in &c.body {
-                    if let Stmt::FunctionDef(f) = inner {
-                        if f.is_async && has_gatherable_decorator(&f.decorator_list) {
-                            out.insert(f.name.as_str().to_owned());
-                        }
-                    }
-                }
-            }
+            // Methods are deliberately NOT collected (W3-07): the rewrite
+            // folds *bare-name* calls, and a bare `fetch(...)` never names
+            // a method — no Python scope makes a method visible by its bare
+            // name. Collecting `Client.fetch` made an undecorated
+            // module-level `fetch` look gather-safe, so two order-dependent
+            // awaits of it ran concurrently.
             _ => {}
         }
     }
@@ -812,23 +963,11 @@ fn collect_local_async_fn_names(module: &ModModule) -> HashSet<String> {
     let mut out = HashSet::new();
     for stmt in &module.body {
         match stmt {
+            // Top-level functions only, matching
+            // `collect_gatherable_async_fn_names`: a bare-name call never
+            // reaches a method.
             Stmt::FunctionDef(f) if f.is_async => {
                 out.insert(f.name.as_str().to_owned());
-            }
-            // Match `collect_gatherable_async_fn_names`'s scan into
-            // class bodies (covers both real `class Foo:` declarations
-            // and the preprocessor's `__typhon_impl_Foo` pseudo-class
-            // form). Without this, the missed-gather detector would
-            // skip async methods even when the gather rewriter would
-            // happily fold them given the right decorator.
-            Stmt::ClassDef(c) => {
-                for inner in &c.body {
-                    if let Stmt::FunctionDef(f) = inner {
-                        if f.is_async {
-                            out.insert(f.name.as_str().to_owned());
-                        }
-                    }
-                }
             }
             _ => {}
         }
@@ -1722,13 +1861,10 @@ async def load() -> int:
     }
 
     #[test]
-    fn detect_missed_includes_class_method_callees() {
-        // Async methods defined inside a class body (or the
-        // preprocessor's `__typhon_impl_<Name>` pseudo-class form of
-        // an `impl` block) are local to the module too. Without the
-        // class-body scan, a run of bare-name calls to class methods
-        // would be silently ignored by the detector. Regression for
-        // the gemini-code-assist review on PR #51.
+    fn detect_missed_ignores_class_method_names() {
+        // A bare-name call never names a method (W3-07): `fetch_a()` inside
+        // `load` is a module-level lookup, so the methods below are not
+        // gather candidates and there is nothing to nudge about.
         let src = "\
 class Service:
     async def fetch_a(self) -> int:
@@ -1743,16 +1879,15 @@ async def load() -> int:
 ";
         let module = parse_module(src);
         let missed = detect_missed_gathers(&module);
-        assert_eq!(missed.len(), 1, "expected 1 missed run; got {missed:?}");
-        // First missing callee is `fetch_a` (none decorated).
-        assert_eq!(missed[0].missing_callee, "fetch_a");
+        assert!(missed.is_empty(), "got {missed:?}");
     }
 
     #[test]
-    fn collect_gatherable_includes_class_methods() {
-        // Symmetric to the missed-detection scan: a `@gatherable`
-        // decorator on an async method must register the method name
-        // so the rewriter's eligibility set includes it.
+    fn collect_gatherable_excludes_class_methods() {
+        // W3-07 / stress/round-2026-09-01/analyse/p_gather.ty: a
+        // `@gatherable` method made an undecorated module-level function of
+        // the same name eligible, so two order-dependent awaits of it were
+        // folded into a TaskGroup.
         let src = "\
 class Service:
     @gatherable
@@ -1761,10 +1896,73 @@ class Service:
 ";
         let module = parse_module(src);
         let names = collect_gatherable_async_fn_names(&module);
+        assert!(!names.contains("fetch_a"), "got {names:?}");
+    }
+
+    #[test]
+    fn a_gatherable_method_does_not_fold_a_same_named_function() {
+        let src = "\
+class Client:
+    @gatherable
+    async def fetch(self) -> int:
+        return 1
+
+async def fetch(tag: str) -> str:
+    return tag
+
+async def main() -> None:
+    a = await fetch(\"a\")
+    b = await fetch(\"b\")
+";
+        let (out, stats) = rewrite(src);
+        assert_eq!(stats.rewrites, 0, "{out}");
+    }
+
+    #[test]
+    fn a_folded_run_unwraps_the_exception_group_for_callers() {
+        // W3-07: callers in other frames caught `ValueError` sequentially;
+        // the TaskGroup raised an `ExceptionGroup` past them.
+        let src = "\
+@gatherable
+async def fetch_a() -> int:
+    return 1
+
+@gatherable
+async def fetch_b() -> int:
+    return 2
+
+async def load() -> int:
+    a = await fetch_a()
+    b = await fetch_b()
+    return a + b
+";
+        let (out, stats) = rewrite(src);
+        assert_eq!(stats.rewrites, 1, "{out}");
         assert!(
-            names.contains("fetch_a"),
-            "class-method gatherable must be collected; got {names:?}"
+            out.contains("except BaseExceptionGroup as __typhon_autogather_eg_0__:"),
+            "{out}"
         );
+        assert!(
+            out.contains("__typhon_autogather_err_0__ = __typhon_autogather_eg_0__.exceptions[0]"),
+            "{out}"
+        );
+        // The re-raise is outside the handler (no `__context__` chaining)
+        // and before the results are read.
+        let reraise = out
+            .find("if __typhon_autogather_err_0__ is not None:\n        raise __typhon_autogather_err_0__")
+            .unwrap_or_else(|| panic!("{out}"));
+        let first_result = out
+            .find("a = __typhon_autogather_task_0_0__.result()")
+            .unwrap();
+        assert!(reraise < first_result, "{out}");
+        // The first task in source order wins: its override comes last.
+        let t0 = out
+            .find("__typhon_autogather_err_0__ = __typhon_autogather_task_0_0__.exception()")
+            .unwrap();
+        let t1 = out
+            .find("__typhon_autogather_err_0__ = __typhon_autogather_task_0_1__.exception()")
+            .unwrap();
+        assert!(t1 < t0, "{out}");
     }
 
     // ── detect_gather_opportunities (default-on advice, callee-agnostic) ──

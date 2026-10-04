@@ -4091,8 +4091,7 @@ impl ModuleScope {
                 let factories_ok = fields(c).iter().all(|(_, value)| match value {
                     Some(Expr::Call(call)) if decorator_is_field(&call.func) => {
                         call.arguments.keywords.iter().all(|k| {
-                            if k
-                                .arg
+                            if k.arg
                                 .as_ref()
                                 .is_none_or(|a| a.as_str() != "default_factory")
                             {

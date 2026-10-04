@@ -220,6 +220,15 @@ grouped by workstream (W1–W7).
   explicit `@memo` keeps `@functools.cache`. None of this adds a
   `tyc::impure_pure_fn` error: every new finding is "not provably pure",
   which only withholds the optimisation.
+- **auto-gather resolves callees correctly and raises the original
+  exception** (W3-07). A `@gatherable` *method* no longer makes a
+  same-named module-level function eligible — a bare-name call never
+  reaches a method — so `stress/round-2026-09-01/analyse/p_gather.ty`
+  prints `['a', 'b']` under `-O` as it does by default. A folded run now
+  hands callers the failing call's own exception (the earliest failing task
+  in source order) instead of the `TaskGroup`'s `ExceptionGroup`, so
+  `try: await load(-1) except ValueError:` in a *calling* frame catches it
+  under `-O` too.
 
 #### W4 — CLI, LSP, filesystem safety
 - **LSP definition URIs rebased onto client workspace root.** `goto_definition` now uses the client's declared workspace root URI (preserving symlink prefixes such as `/var/folders` or `/tmp` rather than macOS `/private/var/...`) or open-document URI, preventing editors from opening duplicate tabs on cross-file jumps.
