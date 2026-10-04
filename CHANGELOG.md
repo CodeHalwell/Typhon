@@ -202,10 +202,11 @@ grouped by workstream (W1–W7).
 - **Dependencies commands preserve pyproject.toml and reject symlinks.** `tyc sync`, `tyc add`, and `tyc remove` now update `pyproject.toml` via `merge_pyproject` with `atomic_write`, preserving comments, authors, and `[tool.*]` tables while refusing symlinked targets. Edits to `typhon.toml` also enforce atomic writes and reject symlinks.
 - **Migrate overwrite safety, symlink loop protection, and semantic preservation.** `tyc migrate` now uses `util::collect_py_files` to skip `.venv` and `build` directories, avoids symlink loops and escaping symlinks, refuses to overwrite existing `.ty` files without `--force`, and writes atomically. Preserves custom `@dataclass(...)` decorators on plain classes, treats `+=` as reassignment (`mut`), moves method aliases (`__radd__ = __add__`) into `impl` blocks, preserves `from typing import Union` when used at runtime, and protects `Union` arguments inside `isinstance(...)` calls from rewriting.
 - **Build confinement anchored to config directory and validated upfront.** `tyc build` now confines build outputs to `config_dir` (the directory enclosing `typhon.toml`) rather than the invocation path, fixing builds invoked from subdirectories (`cd proj/src && tyc build` or `tyc build src`). Output confinement is validated before writing anything to disk, preventing `pyproject.toml` mutations or empty directory creation when the output destination escapes the project root.
-- **Open consumers refresh when a dependency changes** (W4-09). The LSP
-  re-checks and republishes every open document after an open, edit, close
-  or watched-file change, so a consumer's error appears as soon as the
-  module it imports changes.
+- **Open consumers refresh when a dependency changes** (W4-09). When a
+  module changes — an edit, an unsaved buffer opened or closed, or a
+  watched-file change on disk — the LSP re-checks the open documents that
+  import it, so a consumer's error appears as soon as the module it imports
+  changes. (W4-10 narrowed this from "every open document".)
 - **`tyc install skill` refuses to write through a symlink** (W4-13, install
   half). Every destination component is checked before the first write, and
   writes are atomic.
@@ -243,6 +244,18 @@ grouped by workstream (W1–W7).
   cycles took RSS from 5 MB to 75 MB). An invalid `typhon.toml` is reported as
   a diagnostic on the file — on the offending key, or at a TOML syntax error —
   instead of silently falling back to defaults, and clears once fixed.
+- **Language-server performance** (W4-10). Edits are checked once the
+  keystrokes pause (100 ms debounce): a burst of 51 full-text changes used to
+  be checked and published 51 times, the last 9.6 s after the burst. A newer
+  edit supersedes a pending or running check — the check stops between its
+  phases and never publishes a superseded result. An edit refreshes only the
+  open documents that import the edited module, never the edited document a
+  second time (W4-09 re-checked every open document on every keystroke).
+  `semanticTokens/full` is linear (positions came from a scan from offset 0
+  per token: 20k lines took 15.3 s), and its parse and token walk, like the
+  Salsa queries behind hover, completion and go-to-definition, run on a
+  blocking thread instead of the server's single async thread. The check
+  releases the database lock around venv introspection.
 
 #### W5 — VM & harness
 

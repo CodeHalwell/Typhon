@@ -26,7 +26,8 @@ use tower_lsp_server::ls_types::{
 use tower_lsp_server::{jsonrpc, Client, LanguageServer, LspService, Server};
 use tyc_db::{
     check_source_file, check_source_file_with_imports, module_shapes_query, preprocessed_full,
-    preprocessed_text, resolved_module_arc, set_source_text, ModuleShapes, SourceFile, TycDatabase,
+    preprocessed_text, resolved_module_arc, set_source_text, ArcPreprocessResult, ModuleShapes,
+    SourceFile, TycDatabase,
 };
 use tyc_diagnostics::TycError;
 use tyc_resolve::{
@@ -142,6 +143,7 @@ fn project_sources(
 /// `check_source_file` call can run on a blocking executor thread without
 /// pinning the async runtime — concurrent `hover` and `shutdown`
 /// requests stay responsive while a file is being checked.
+#[derive(Clone)]
 pub struct Backend {
     client: Client,
     db: Arc<Mutex<TycDatabase>>,
@@ -259,6 +261,84 @@ pub struct Backend {
     /// message, so a fix clears the report and an unchanged error is not
     /// republished on every keystroke.
     config_errors: Arc<Mutex<HashMap<std::path::PathBuf, String>>>,
+    /// Latest version the client sent for each open document. Edits that
+    /// arrive out of order never overwrite newer text, and every publish
+    /// carries the version its text came from.
+    doc_versions: Arc<std::sync::Mutex<HashMap<String, i32>>>,
+    /// Per-document check generation (W4-10). Every edit, close or refresh
+    /// bumps it; a scheduled check runs only if its generation is still
+    /// current when its debounce expires, stops between phases once it is
+    /// not, and never publishes a superseded result.
+    check_generations: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+}
+
+/// How long an edit waits for the next keystroke before it is checked
+/// (W4-10). A burst of edits is checked once, after the last one.
+const EDIT_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Lock a `std` mutex, recovering the data if a panicking holder poisoned it.
+fn lock_std<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match m.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    }
+}
+
+/// `true` when `gen` is still `uri`'s current check generation.
+fn generation_is_current(
+    generations: &std::sync::Mutex<HashMap<String, u64>>,
+    uri: &str,
+    gen: u64,
+) -> bool {
+    lock_std(generations).get(uri) == Some(&gen)
+}
+
+/// Whether the module `module` (dotted, within the project whose sources
+/// live in `src_dir`) is imported by the document at `path`, per its resolved
+/// imports. A package and its submodules count as related in both directions
+/// (`from pkg import x` reaches `pkg.x` through a facade). A document that did
+/// not resolve (a parse error) counts as an importer: re-checking it is the
+/// safe answer.
+fn imports_module(
+    resolved: &ResolvedModule,
+    path: &std::path::Path,
+    src_dir: &std::path::Path,
+    module: &str,
+) -> bool {
+    if resolved.scopes.is_empty() {
+        return true;
+    }
+    let related = |name: &str| {
+        name == module
+            || module.starts_with(&format!("{name}."))
+            || name.starts_with(&format!("{module}."))
+    };
+    resolved
+        .scopes
+        .iter()
+        .flat_map(|scope| scope.bindings.iter())
+        .filter_map(|b| b.import_info.as_ref())
+        .any(|info| {
+            let base = if info.level > 0 {
+                canonical_relative_module(path, src_dir, &info.module, info.level)
+            } else {
+                Some(info.module.clone())
+            };
+            let Some(base) = base else {
+                return false;
+            };
+            if !base.is_empty() && related(&base) {
+                return true;
+            }
+            info.member.as_ref().is_some_and(|member| {
+                let full = if base.is_empty() {
+                    member.clone()
+                } else {
+                    format!("{base}.{member}")
+                };
+                related(&full)
+            })
+        })
 }
 
 impl std::fmt::Debug for Backend {
@@ -293,6 +373,8 @@ impl Backend {
             shutdown_requested,
             closed_documents: Arc::new(Mutex::new(HashMap::new())),
             config_errors: Arc::new(Mutex::new(HashMap::new())),
+            doc_versions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            check_generations: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -400,25 +482,111 @@ impl Backend {
         path_to_uri(path)
     }
 
+    /// Re-check every open document (debounced, without cascading) — for a
+    /// `typhon.toml` change, which can affect any of them.
     async fn refresh_open_documents(&self) {
-        let open: Vec<(String, SourceFile)> = {
-            let docs = self.documents.lock().await;
-            docs.iter().map(|(uri, sf)| (uri.clone(), *sf)).collect()
-        };
-        for (uri_str, sf) in open {
-            let text = {
-                let db = self.db.lock().await;
-                sf.text(&*db).clone()
-            };
-            // Publish with the document's last known version rather than
-            // `None`: an unversioned `publishDiagnostics` can't be superseded
-            // by the client, so a refresh racing the user's typing could
-            // clobber newer, versioned diagnostics. (PR #192 review.)
-            let version = self.prewarmed_versions.lock().await.get(&uri_str).copied();
+        let open: Vec<String> = self.documents.lock().await.keys().cloned().collect();
+        for uri_str in open {
             if let Ok(uri) = Uri::from_str(&uri_str) {
-                self.check_and_publish(uri, text, version).await;
+                let gen = self.begin_check(&uri_str);
+                self.spawn_check(uri, gen, EDIT_DEBOUNCE, false);
             }
         }
+    }
+
+    /// Start a new check generation for `uri`, superseding any check that is
+    /// pending or running for it. Returns the new generation.
+    fn begin_check(&self, uri: &str) -> u64 {
+        let mut gens = lock_std(&self.check_generations);
+        let gen = gens.entry(uri.to_owned()).or_insert(0);
+        *gen += 1;
+        *gen
+    }
+
+    /// Check `uri` after `delay`, unless a newer generation supersedes `gen`
+    /// first. With `cascade`, the open documents that import it are then
+    /// refreshed (an edit changes what they see; a refresh does not).
+    fn spawn_check(&self, uri: Uri, gen: u64, delay: std::time::Duration, cascade: bool) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            if !generation_is_current(&this.check_generations, uri.as_str(), gen) {
+                return;
+            }
+            if this.check_document(&uri, gen).await && cascade {
+                if let Some(path) = uri_to_path(&uri) {
+                    this.refresh_importers(&path).await;
+                }
+            }
+        });
+    }
+
+    /// Re-check the open documents that import the module at `changed` —
+    /// only those, never `changed` itself, debounced and without cascading
+    /// further (W4-10). W4-09 re-checked every open document on every edit.
+    async fn refresh_importers(&self, changed: &std::path::Path) {
+        let Some((root, src_dir)) = find_workspace_layout(changed) else {
+            return;
+        };
+        let src_root_name = src_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("src")
+            .to_owned();
+        let changed_module = path_to_dotted(changed, &src_root_name);
+        let changed_key = path_lookup_key(changed);
+        let candidates: Vec<(String, std::path::PathBuf, SourceFile)> = {
+            let docs = self.documents.lock().await;
+            docs.iter()
+                .filter_map(|(uri, sf)| {
+                    let path = uri_str_to_path(uri)?;
+                    (path_lookup_key(&path) != changed_key).then(|| (uri.clone(), path, *sf))
+                })
+                .collect()
+        };
+        if candidates.is_empty() {
+            return;
+        }
+        let db = Arc::clone(&self.db);
+        let importers: Vec<String> = tokio::task::spawn_blocking(move || {
+            let db = db.blocking_lock();
+            candidates
+                .into_iter()
+                .filter(|(_, path, sf)| {
+                    find_workspace_layout(path).is_some_and(|(r, _)| r == root)
+                        && imports_module(
+                            &resolved_module_arc(&*db, *sf),
+                            path,
+                            &src_dir,
+                            &changed_module,
+                        )
+                })
+                .map(|(uri, _, _)| uri)
+                .collect()
+        })
+        .await
+        .unwrap_or_default();
+        for uri_str in importers {
+            if let Ok(uri) = Uri::from_str(&uri_str) {
+                let gen = self.begin_check(&uri_str);
+                self.spawn_check(uri, gen, EDIT_DEBOUNCE, false);
+            }
+        }
+    }
+
+    /// `true` when the open document `uri` holds text that differs from the
+    /// file on disk — what its importers see changes when it opens or closes.
+    async fn differs_from_disk(&self, uri: &Uri, sf: SourceFile) -> bool {
+        let Some(path) = uri_to_path(uri) else {
+            return false;
+        };
+        let text = {
+            let db = self.db.lock().await;
+            sf.text(&*db).clone()
+        };
+        std::fs::read_to_string(&path).map_or(true, |disk| disk != text)
     }
 
     /// True if a message at `level` should be forwarded to the editor.
@@ -447,18 +615,19 @@ impl Backend {
         }
     }
 
-    /// Run the check pipeline on `text` and publish any resulting diagnostics
-    /// (warnings + errors) back to the editor. `version` is forwarded so the
-    /// editor can drop stale results.
-    ///
-    /// The check itself runs inside [`tokio::task::spawn_blocking`] because
-    /// the compiler pipeline is CPU-bound and synchronous; keeping it off
-    /// the runtime thread lets other LSP requests (hover, shutdown) make
-    /// progress concurrently.
-    async fn check_and_publish(&self, uri: Uri, text: String, version: Option<i32>) {
-        let uri_str = uri.as_str().to_owned();
-        let db = Arc::clone(&self.db);
-
+    /// Store `text` as the content of `uri_str` (creating, or reusing a
+    /// closed document's, Salsa input). An edit older than the version
+    /// already stored is ignored, so out-of-order notifications never roll
+    /// the buffer back. Hover and completion read the new text immediately;
+    /// only the check is debounced.
+    async fn update_document(&self, uri_str: &str, text: String, version: Option<i32>) {
+        if let Some(v) = version {
+            let mut versions = lock_std(&self.doc_versions);
+            if versions.get(uri_str).is_some_and(|&old| old > v) {
+                return;
+            }
+            versions.insert(uri_str.to_owned(), v);
+        }
         // Upsert the SourceFile in the Salsa database.
         //
         // On `did_open` we create a fresh entity; on `did_change` we push the
@@ -468,47 +637,78 @@ impl Backend {
         // *other* files stay cached. `set_source_text` compares before it
         // writes — raw `set_text` does not (F56) — so a `did_change` that
         // delivers byte-identical text (a formatter round-trip, an editor
-        // re-sync) leaves the whole cache warm. We hold the db lock only for
-        // this short operation so hover/completion requests can still acquire
-        // it while the heavy `check_source_file` runs on the blocking thread.
-        let source_file: SourceFile = {
-            let open = {
-                let docs = self.documents.lock().await;
-                docs.get(&uri_str).copied()
-            };
-            // A document reopened after a close gets its old input back.
-            let existing = match open {
-                Some(sf) => Some(sf),
-                None => self.closed_documents.lock().await.remove(&uri_str),
-            };
+        // re-sync) leaves the whole cache warm.
+        let open = {
+            let docs = self.documents.lock().await;
+            docs.get(uri_str).copied()
+        };
+        // A document reopened after a close gets its old input back.
+        let existing = match open {
+            Some(sf) => Some(sf),
+            None => self.closed_documents.lock().await.remove(uri_str),
+        };
+        let source_file = {
             let mut db_guard = self.db.lock().await;
+            // Re-check under the db lock: a newer edit may have been stored
+            // while this one waited for it.
+            if let Some(v) = version {
+                if lock_std(&self.doc_versions)
+                    .get(uri_str)
+                    .is_some_and(|&newest| newest > v)
+                {
+                    return;
+                }
+            }
             if let Some(sf) = existing {
-                set_source_text(&mut db_guard, sf, text.clone());
+                set_source_text(&mut db_guard, sf, text);
                 sf
             } else {
-                SourceFile::new(&*db_guard, uri_str.clone(), text.clone())
+                SourceFile::new(&*db_guard, uri_str.to_owned(), text)
             }
         };
+        self.documents
+            .lock()
+            .await
+            .insert(uri_str.to_owned(), source_file);
+    }
 
-        // Cache the Salsa handle; raw text is stored inside Salsa itself and
-        // retrieved via `source_file.text(db)` when needed.
-        //
-        // The same pass snapshots every open document's handle keyed by
-        // filesystem path, so the cross-module shape builder below can read
-        // sibling modules from their live buffers instead of from disk (F57).
-        // `SourceFile` is `Copy`, so this is a cheap handle snapshot — the
-        // text stays in Salsa and is only read under the db lock inside the
-        // blocking closure. Taking it here (rather than inside the closure)
-        // keeps the `documents` lock off the blocking thread entirely.
+    /// Run the check pipeline on the open document `uri` and publish its
+    /// diagnostics (warnings + errors), tagged with the version its text came
+    /// from. Returns `false` when the document is not open or `gen` was
+    /// superseded before the result could be published.
+    ///
+    /// The check runs inside [`tokio::task::spawn_blocking`] because the
+    /// compiler pipeline is CPU-bound and synchronous. It holds the database
+    /// lock in two phases — registering the project's inputs, then checking —
+    /// and releases it around the venv enrichment (which may shell to
+    /// Python), so hover and completion are not stuck behind that. Between
+    /// phases it stops as soon as a newer edit supersedes `gen` (W4-10).
+    async fn check_document(&self, uri: &Uri, gen: u64) -> bool {
+        let uri_str = uri.as_str().to_owned();
+        let db = Arc::clone(&self.db);
+        let Some(source_file) = self.documents.lock().await.get(&uri_str).copied() else {
+            return false;
+        };
+        let version = lock_std(&self.doc_versions).get(&uri_str).copied();
+        let text = {
+            let db = self.db.lock().await;
+            source_file.text(&*db).clone()
+        };
+
+        // Snapshot every open document's handle keyed by filesystem path, so
+        // the cross-module shape builder below can read sibling modules from
+        // their live buffers instead of from disk (F57). `SourceFile` is
+        // `Copy`, so this is a cheap handle snapshot — the text stays in Salsa
+        // and is only read under the db lock inside the blocking closure.
         let open_docs: HashMap<std::path::PathBuf, SourceFile> = {
-            let mut docs = self.documents.lock().await;
-            docs.insert(uri_str.clone(), source_file);
+            let docs = self.documents.lock().await;
             docs.iter()
                 .filter_map(|(doc_uri, sf)| {
                     uri_str_to_path(doc_uri).map(|p| (path_lookup_key(&p), *sf))
                 })
                 .collect()
         };
+        let uri = uri.clone();
 
         // Resolve the project root once on the async side so the
         // blocking closure (which holds the salsa db lock) only needs
@@ -547,9 +747,13 @@ impl Backend {
 
         let uri_str_for_check = uri_str.clone();
         let text_for_check = text.clone();
+        let generations = Arc::clone(&self.check_generations);
         let result = tokio::task::spawn_blocking(move || {
-            // Hold the mutex only for the duration of the salsa call.
-            let mut db = db.blocking_lock();
+            let still_current = || generation_is_current(&generations, &uri_str_for_check, gen);
+            let db_arc = db;
+            // Phase 1, under the db lock: register the project's inputs and
+            // build the cross-module shape registry.
+            let mut db = db_arc.blocking_lock();
             // Build the project-wide shape registry inside the
             // blocking closure so the salsa-cached
             // `module_shapes_query` does the heavy lifting: only the
@@ -562,7 +766,7 @@ impl Backend {
             // is served from its live buffer input (`open_docs`), so
             // cross-module diagnostics react to unsaved edits in any
             // module within one keystroke, not just the edited one.
-            let project_shapes = if let Some((_root, src_dir)) = workspace.as_ref() {
+            let registry = if let Some((_root, src_dir)) = workspace.as_ref() {
                 let src_root_name = src_dir
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -591,6 +795,16 @@ impl Backend {
                 // `tyc build`. Before venv enrichment (which skips modules
                 // already in the map).
                 tyc_db::seed_bundled_stubs(&mut shapes);
+                Some((shapes, sources))
+            } else {
+                None
+            };
+            drop(db);
+            if !still_current() {
+                return None;
+            }
+            // Venv enrichment may shell to Python: done without the db lock.
+            let project_shapes = if let Some((mut shapes, sources)) = registry {
                 // Fold venv-introspected third-party shapes into the project
                 // map so the cross-module check flags wrong-typed / -arity
                 // calls to installed dependencies live in the editor. All of
@@ -631,6 +845,11 @@ impl Backend {
             } else {
                 std::sync::Arc::new(std::collections::HashMap::new())
             };
+            if !still_current() {
+                return None;
+            }
+            // Phase 2, under the db lock again: the check itself.
+            let mut db = db_arc.blocking_lock();
             #[allow(clippy::explicit_auto_deref)]
             let mut diags = if project_shapes.is_empty() {
                 // No workspace layout discovered — fall back to the
@@ -765,21 +984,28 @@ impl Backend {
                 );
                 diags.extend(lint_diags);
             }
-            (diags, mapping_source)
+            Some((diags, mapping_source))
         })
         .await;
 
         let (diags, mapping_source) = match result {
-            Ok(value) => value,
+            Ok(Some(value)) => value,
+            // Superseded by a newer edit between phases.
+            Ok(None) => return false,
             Err(e) => {
                 self.log(
                     MessageType::ERROR,
                     format!("tyc-lsp: check task panicked: {e}"),
                 )
                 .await;
-                return;
+                return false;
             }
         };
+        // A result for text the user has since changed is not published; the
+        // newer generation's check publishes instead.
+        if !generation_is_current(&self.check_generations, &uri_str, gen) {
+            return false;
+        }
 
         let mut out = Vec::with_capacity(diags.error_count() + diags.warning_count());
         for err in diags.errors() {
@@ -818,6 +1044,7 @@ impl Backend {
         // before the first one had a chance to populate the cache.
         self.spawn_introspection_prewarm(uri_for_prewarm, version)
             .await;
+        true
     }
 
     /// Spawn a detached task that introspects every third-party
@@ -978,9 +1205,22 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let doc = params.text_document;
-        self.check_and_publish(doc.uri, doc.text, Some(doc.version))
+        let uri_str = doc.uri.as_str().to_owned();
+        let gen = self.begin_check(&uri_str);
+        self.update_document(&uri_str, doc.text, Some(doc.version))
             .await;
-        self.refresh_open_documents().await;
+        // First diagnostics without a debounce.
+        self.check_document(&doc.uri, gen).await;
+        // Importers saw the file on disk; refresh them only if the buffer
+        // says something else.
+        let sf = self.documents.lock().await.get(&uri_str).copied();
+        if let Some(sf) = sf {
+            if self.differs_from_disk(&doc.uri, sf).await {
+                if let Some(path) = uri_to_path(&doc.uri) {
+                    self.refresh_importers(&path).await;
+                }
+            }
+        }
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -989,48 +1229,82 @@ impl LanguageServer for Backend {
         let Some(change) = params.content_changes.into_iter().next() else {
             return;
         };
-        self.check_and_publish(
-            params.text_document.uri,
-            change.text,
-            Some(params.text_document.version),
-        )
-        .await;
-        self.refresh_open_documents().await;
+        let uri = params.text_document.uri;
+        let uri_str = uri.as_str().to_owned();
+        // Supersede any pending or running check before the text changes,
+        // then store the text now (hover and completion see it at once) and
+        // check once the burst of keystrokes pauses (W4-10).
+        let gen = self.begin_check(&uri_str);
+        self.update_document(&uri_str, change.text, Some(params.text_document.version))
+            .await;
+        self.spawn_check(uri, gen, EDIT_DEBOUNCE, true);
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
-        let relevant = params.changes.iter().any(|change| {
-            uri_to_path(&change.uri).is_some_and(|p| {
-                p.file_name().is_some_and(|n| n == "typhon.toml")
-                    || p.extension().is_some_and(|e| e == "ty" || e == "dty")
-            })
-        });
-        if !relevant {
+        let mut config_changed = false;
+        let mut sources_changed: Vec<std::path::PathBuf> = Vec::new();
+        for change in &params.changes {
+            let Some(path) = uri_to_path(&change.uri) else {
+                continue;
+            };
+            if path.file_name().is_some_and(|n| n == "typhon.toml") {
+                config_changed = true;
+            } else if path.extension().is_some_and(|e| e == "ty" || e == "dty") {
+                sources_changed.push(path);
+            }
+        }
+        if !config_changed && sources_changed.is_empty() {
             return;
         }
         self.resolved_cache.lock().await.clear();
         // A source was created, deleted or changed: the next check walks the
         // tree again rather than serving the cached listing.
-        match self.source_walks.lock() {
-            Ok(mut g) => g.clear(),
-            Err(p) => p.into_inner().clear(),
+        lock_std(&self.source_walks).clear();
+        if config_changed {
+            // Settings can change any document's diagnostics.
+            self.refresh_open_documents().await;
+            return;
         }
-        self.refresh_open_documents().await;
+        let open: std::collections::HashSet<std::path::PathBuf> = {
+            let docs = self.documents.lock().await;
+            docs.keys()
+                .filter_map(|u| uri_str_to_path(u))
+                .map(|p| path_lookup_key(&p))
+                .collect()
+        };
+        for path in sources_changed {
+            // An open document's buffer, not its file, is what everyone sees;
+            // saving it changes nothing.
+            if open.contains(&path_lookup_key(&path)) {
+                continue;
+            }
+            self.refresh_importers(&path).await;
+        }
     }
+
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         // Clear diagnostics when the user closes a file so stale errors do
         // not linger in the editor.
         let uri = params.text_document.uri;
         let uri_str = uri.as_str().to_owned();
-        {
+        // Cancel any pending or running check of the closed document.
+        self.begin_check(&uri_str);
+        let closed = {
             let mut docs = self.documents.lock().await;
-            if let Some(sf) = docs.remove(&uri_str) {
-                self.closed_documents
-                    .lock()
-                    .await
-                    .insert(uri_str.clone(), sf);
-            }
+            docs.remove(&uri_str)
+        };
+        // Importers now see the file on disk instead of the buffer.
+        let refresh = match closed {
+            Some(sf) => self.differs_from_disk(&uri, sf).await,
+            None => false,
+        };
+        if let Some(sf) = closed {
+            self.closed_documents
+                .lock()
+                .await
+                .insert(uri_str.clone(), sf);
         }
+        lock_std(&self.doc_versions).remove(&uri_str);
         {
             // Drop the per-document debounce entry so reopening the
             // file re-runs the prewarm (the venv may have changed
@@ -1039,8 +1313,14 @@ impl LanguageServer for Backend {
             versions.remove(&uri_str);
         }
         self.evict_resolved_cache(&uri_str).await;
-        self.client.publish_diagnostics(uri, Vec::new(), None).await;
-        self.refresh_open_documents().await;
+        self.client
+            .publish_diagnostics(uri.clone(), Vec::new(), None)
+            .await;
+        if refresh {
+            if let Some(path) = uri_to_path(&uri) {
+                self.refresh_importers(&path).await;
+            }
+        }
     }
 
     async fn hover(&self, params: HoverParams) -> jsonrpc::Result<Option<Hover>> {
@@ -1052,13 +1332,8 @@ impl LanguageServer for Backend {
         // Both `preprocessed_full` and `resolved_module` are Salsa-tracked
         // queries that hit the cache when the file hasn't changed since the
         // last `check_source_file` call.
-        let (original, prep_full, resolved) = {
-            let db = self.db.lock().await;
-            (
-                sf.text(&*db).clone(),
-                preprocessed_full(&*db, sf),
-                resolved_module_arc(&*db, sf),
-            )
+        let Some((original, prep_full, resolved)) = self.document_queries(sf).await else {
+            return Ok(None);
         };
         let preprocessed = prep_full.python_source.as_str();
         // The editor's position is in the text the user wrote; the resolver
@@ -1126,41 +1401,11 @@ impl LanguageServer for Backend {
         // entry has gone away (e.g. concurrent close); falling back to
         // the *preprocessed* text would defeat the remap, since the
         // whole point is to translate into the original Typhon source.
-        let (preprocessed, resolved, prep_full, salsa_text) = {
-            let db = self.db.lock().await;
-            (
-                preprocessed_text(&*db, sf),
-                resolved_module_arc(&*db, sf),
-                preprocessed_full(&*db, sf),
-                sf.text(&*db).clone(),
-            )
+        // `original` is the document's own (pre-preprocess) text, which the
+        // client renders the colours over.
+        let Some((original, prep_full, resolved)) = self.document_queries(sf).await else {
+            return Ok(None);
         };
-        // Original (pre-preprocess) source: read from the editor's open
-        // buffer when we have it, fall back to the SourceFile's stored
-        // Typhon text. The semantic-tokens client uses this to render
-        // colours, so we want the freshest version of the buffer.
-        let original = self.document_text(&uri).await.unwrap_or(salsa_text);
-        let line_shifts = prep_full.0.line_col_shifts();
-        // Parse the preprocessed source for the AST walk
-        // (attribute-access tokens). `parse_module` is fast — the
-        // type checker already does it on every check pass — but the
-        // result isn't currently Salsa-cached for the LSP, so we
-        // re-parse here. Cheap enough at the file sizes we expect;
-        // can be promoted to a tracked query later if profiling
-        // says it matters.
-        let module = match tyc_syntax::parse_module(&preprocessed) {
-            Ok(p) => p.into_syntax(),
-            Err(_) => {
-                // Parse errors are surfaced through diagnostics
-                // already; the semantic-tokens stream stays empty so
-                // the editor falls back to the TextMate grammar
-                // without a confusing partial colouring.
-                return Ok(Some(SemanticTokensResult::Tokens(
-                    tower_lsp_server::ls_types::SemanticTokens::default(),
-                )));
-            }
-        };
-        let stdlib = tyc_resolve::python_stdlib_modules();
         // Build the callee → signature map the kwarg pass consults.
         // Walks the resolver's top-level bindings to find every
         // imported class / function name, then asks the introspection
@@ -1171,17 +1416,36 @@ impl LanguageServer for Backend {
         // affecting the rest of the file.
         let (callee_signatures, attribute_kinds) =
             self.build_callee_signatures(&uri, &resolved).await;
-        let tokens = semantic::compute_with_original(
-            &preprocessed,
-            &original,
-            &line_shifts,
-            &prep_full.line_map,
-            &resolved,
-            &module,
-            stdlib,
-            &callee_signatures,
-            &attribute_kinds,
-        );
+        // The parse and the token walk are CPU work over the whole file: on a
+        // blocking thread, not the server's async thread (W4-10).
+        let tokens = tokio::task::spawn_blocking(move || {
+            let preprocessed = prep_full.python_source.as_str();
+            let line_shifts = prep_full.0.line_col_shifts();
+            // Parse the preprocessed source for the AST walk
+            // (attribute-access tokens). The result isn't Salsa-cached for
+            // the LSP, so we re-parse here.
+            let module = match tyc_syntax::parse_module(preprocessed) {
+                Ok(p) => p.into_syntax(),
+                // Parse errors are surfaced through diagnostics already; the
+                // semantic-tokens stream stays empty so the editor falls back
+                // to the TextMate grammar without a confusing partial
+                // colouring.
+                Err(_) => return tower_lsp_server::ls_types::SemanticTokens::default(),
+            };
+            semantic::compute_with_original(
+                preprocessed,
+                &original,
+                &line_shifts,
+                &prep_full.line_map,
+                &resolved,
+                &module,
+                tyc_resolve::python_stdlib_modules(),
+                &callee_signatures,
+                &attribute_kinds,
+            )
+        })
+        .await
+        .unwrap_or_default();
         Ok(Some(SemanticTokensResult::Tokens(tokens)))
     }
 
@@ -1194,13 +1458,8 @@ impl LanguageServer for Backend {
         let Some(sf) = self.source_file_for(&uri).await else {
             return Ok(None);
         };
-        let (original, prep_full, resolved) = {
-            let db = self.db.lock().await;
-            (
-                sf.text(&*db).clone(),
-                preprocessed_full(&*db, sf),
-                resolved_module_arc(&*db, sf),
-            )
+        let Some((original, prep_full, resolved)) = self.document_queries(sf).await else {
+            return Ok(None);
         };
         let preprocessed = prep_full.python_source.clone();
         // Everything below reads the expanded buffer, so move the editor's
@@ -1422,13 +1681,8 @@ impl LanguageServer for Backend {
         let Some(sf) = self.source_file_for(&uri).await else {
             return Ok(None);
         };
-        let (original, prep_full, resolved) = {
-            let db = self.db.lock().await;
-            (
-                sf.text(&*db).clone(),
-                preprocessed_full(&*db, sf),
-                resolved_module_arc(&*db, sf),
-            )
+        let Some((original, prep_full, resolved)) = self.document_queries(sf).await else {
+            return Ok(None);
         };
         let preprocessed = prep_full.python_source.clone();
         // The editor's `position` is in *original* (pre-preprocess) text
@@ -1691,6 +1945,28 @@ impl Backend {
     async fn source_file_for(&self, uri: &Uri) -> Option<SourceFile> {
         let docs = self.documents.lock().await;
         docs.get(uri.as_str()).copied()
+    }
+
+    /// The document's text, full preprocess result and resolved module.
+    /// Salsa computes them on a blocking thread (W4-10): after an edit the
+    /// first request re-runs preprocess + parse + resolve, which used to
+    /// happen on the server's single async thread and stall every other
+    /// request behind it. `None` if the blocking task panicked.
+    async fn document_queries(
+        &self,
+        sf: SourceFile,
+    ) -> Option<(String, ArcPreprocessResult, Arc<ResolvedModule>)> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || {
+            let db = db.blocking_lock();
+            (
+                sf.text(&*db).clone(),
+                preprocessed_full(&*db, sf),
+                resolved_module_arc(&*db, sf),
+            )
+        })
+        .await
+        .ok()
     }
 
     /// Render the import-specific addition to a hover body: the
@@ -6504,6 +6780,184 @@ mod tests {
         .await
         .expect("cleared typhon.toml diagnostics");
         assert!(cleared.is_empty(), "{cleared:?}");
+    }
+
+    async fn did_change(to: &mut DuplexStream, uri: &str, version: i32, text: &str) {
+        send(
+            to,
+            serde_json::json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{
+                "textDocument":{"uri":uri,"version":version},
+                "contentChanges":[{"text":text}]}}),
+        )
+        .await;
+    }
+
+    /// Every `publishDiagnostics` that arrives within `window`, as
+    /// `(uri, version, diagnostics)`.
+    async fn publishes_within(
+        from: &mut DuplexStream,
+        window: std::time::Duration,
+    ) -> Vec<(String, Option<i64>, Vec<serde_json::Value>)> {
+        let mut out = Vec::new();
+        let deadline = tokio::time::Instant::now() + window;
+        while let Ok(msg) = tokio::time::timeout_at(deadline, recv(from)).await {
+            if msg.get("method").and_then(|m| m.as_str()) == Some("textDocument/publishDiagnostics")
+            {
+                out.push((
+                    msg["params"]["uri"].as_str().unwrap_or_default().to_owned(),
+                    msg["params"]["version"].as_i64(),
+                    msg["params"]["diagnostics"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default(),
+                ));
+            }
+        }
+        out
+    }
+
+    /// W4-10: a burst of edits is checked once, not once per keystroke
+    /// (51 full-text changes used to produce 51 checks and publishes).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_burst_of_edits_is_checked_once() {
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, None).await;
+        let uri = "file:///tmp/tyc_lsp_w410_burst/main.ty";
+        did_open(&mut to, uri, "let x: int = 0\n").await;
+        publishes_within(&mut from, std::time::Duration::from_millis(500)).await;
+        for v in 2..=31 {
+            did_change(&mut to, uri, v, &format!("let x: int = {v}\n")).await;
+        }
+        did_change(&mut to, uri, 32, "let x: int = \"oops\"\n").await;
+        let published = publishes_within(&mut from, std::time::Duration::from_secs(3)).await;
+        let mine: Vec<_> = published.iter().filter(|p| p.0 == uri).collect();
+        assert!(
+            mine.len() <= 3,
+            "31 edits produced {} publishes: {:?}",
+            mine.len(),
+            mine.iter().map(|p| p.1).collect::<Vec<_>>()
+        );
+        let last = mine.last().expect("the final version is published");
+        assert_eq!(last.1, Some(32));
+        assert!(
+            last.2.iter().any(|d| d["code"]
+                .as_str()
+                .is_some_and(|c| c.contains("type_mismatch"))),
+            "{:?}",
+            last.2
+        );
+    }
+
+    /// W4-10 (the cost W4-09 introduced): an edit re-checks the open
+    /// documents that import the edited module — and only those — and never
+    /// checks the edited document twice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_edit_refreshes_only_importers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname=\"x\"\nsrc=\"src\"\n",
+        )
+        .unwrap();
+        let provider = "def value() -> int:\n    return 1\n";
+        let consumer = "from provider import value\nlet x: int = value()\n";
+        let unrelated = "let y: int = 2\n";
+        for (name, text) in [
+            ("provider.ty", provider),
+            ("consumer.ty", consumer),
+            ("unrelated.ty", unrelated),
+        ] {
+            std::fs::write(src.join(name), text).unwrap();
+        }
+        let uri = |n: &str| format!("file://{}", src.join(n).display());
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, None).await;
+        for (name, text) in [
+            ("provider.ty", provider),
+            ("consumer.ty", consumer),
+            ("unrelated.ty", unrelated),
+        ] {
+            did_open(&mut to, &uri(name), text).await;
+        }
+        publishes_within(&mut from, std::time::Duration::from_secs(2)).await;
+
+        // Change the provider's return type, unsaved.
+        did_change(
+            &mut to,
+            &uri("provider.ty"),
+            2,
+            "def value() -> str:\n    return \"a\"\n",
+        )
+        .await;
+        let published = publishes_within(&mut from, std::time::Duration::from_secs(3)).await;
+        let count = |n: &str| published.iter().filter(|p| p.0 == uri(n)).count();
+        assert_eq!(count("provider.ty"), 1, "{published:?}");
+        assert_eq!(count("unrelated.ty"), 0, "{published:?}");
+        let consumer_diags = published
+            .iter()
+            .rfind(|p| p.0 == uri("consumer.ty"))
+            .expect("the importer is refreshed");
+        assert!(
+            consumer_diags.2.iter().any(|d| d["code"]
+                .as_str()
+                .is_some_and(|c| c.contains("type_mismatch"))),
+            "{consumer_diags:?}"
+        );
+    }
+
+    /// W4-09 (kept by W4-10): a dependency changed on disk refreshes the open
+    /// consumer once the editor reports the change.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dependency_changed_on_disk_refreshes_its_importer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname=\"x\"\nsrc=\"src\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("provider.ty"),
+            "def value() -> int:\n    return 1\n",
+        )
+        .unwrap();
+        let consumer = "from provider import value\nlet x: int = value()\n";
+        std::fs::write(src.join("consumer.ty"), consumer).unwrap();
+        let consumer_uri = format!("file://{}", src.join("consumer.ty").display());
+        let provider_uri = format!("file://{}", src.join("provider.ty").display());
+
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, None).await;
+        did_open(&mut to, &consumer_uri, consumer).await;
+        let first = next_diagnostics(&mut from, &consumer_uri).await;
+        assert!(first.is_empty(), "{first:?}");
+
+        std::fs::write(
+            src.join("provider.ty"),
+            "def value() -> str:\n    return \"a\"\n",
+        )
+        .unwrap();
+        send(
+            &mut to,
+            serde_json::json!({"jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles",
+                "params":{"changes":[{"uri":provider_uri,"type":2}]}}),
+        )
+        .await;
+        let refreshed = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            next_diagnostics(&mut from, &consumer_uri),
+        )
+        .await
+        .expect("the importer is refreshed");
+        assert!(
+            refreshed.iter().any(|d| d["code"]
+                .as_str()
+                .is_some_and(|c| c.contains("type_mismatch"))),
+            "{refreshed:?}"
+        );
     }
 
     #[cfg(unix)]
