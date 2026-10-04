@@ -362,7 +362,11 @@ pub fn aggregate_pub_star_shapes(
                 continue;
             };
             let visible_set: HashSet<&str> = visible_names.iter().map(|s| s.as_str()).collect();
-            merge_pub_visible(&mut merged, sibling_shape, Some(&visible_set));
+            // `extend Class:` sentinels name their class relative to the
+            // sibling; make them absolute before they move to the package key.
+            let sibling_shape =
+                tyc_db::absolutise_extension_sentinels(sibling_shape, &sibling_dotted, false);
+            merge_pub_visible(&mut merged, &sibling_shape, Some(&visible_set));
         }
         // Direct sub-packages: any __init__ whose parent.parent == pkg_dir.
         // Filter the merge through the sub-package's effective public
@@ -398,7 +402,8 @@ pub fn aggregate_pub_star_shapes(
                 &mut visited,
             );
             let visible_set: HashSet<&str> = surface.iter().map(|s| s.as_str()).collect();
-            merge_pub_visible(&mut merged, sub_shape, Some(&visible_set));
+            let sub_shape = tyc_db::absolutise_extension_sentinels(sub_shape, &sub_dotted, true);
+            merge_pub_visible(&mut merged, &sub_shape, Some(&visible_set));
         }
         shape_map.insert(pkg_dotted, merged);
     }
@@ -490,7 +495,9 @@ fn merge_pub_visible(
         }
     };
     for (name, shape) in &src.class_shapes {
-        if name.starts_with("__typhon_builtin_ext_") {
+        if name.starts_with("__typhon_builtin_ext_")
+            || name.starts_with(tyc_types::EXTENSION_SENTINEL_PREFIX)
+        {
             // An `extend BUILTIN:` block's methods (the sentinel class
             // shape) travel through the facade whatever the visibility
             // filter: importing from a module brings its extensions into

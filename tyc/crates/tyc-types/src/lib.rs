@@ -6657,6 +6657,28 @@ pub struct ExternalShapes {
 /// (cyclic aliases, unknown class names in annotations, …) are
 /// silently tolerated: the goal here is to publish the surface API for
 /// downstream callers, not to validate it.
+/// Class-shape name under which a module publishes the methods its
+/// `extend Class:` block patches onto an imported class:
+/// `__typhon_extend_<Class>@<import spec>`, where the spec is the module as
+/// the extending module imported it (`user`, `.user`, `..`). The consumer
+/// resolves the spec against the extending module's key; see
+/// [`parse_extension_sentinel`].
+pub fn extension_sentinel_name(class: &str, spec: &str) -> String {
+    format!("{EXTENSION_SENTINEL_PREFIX}{class}@{spec}")
+}
+
+/// Prefix of [`extension_sentinel_name`].
+pub const EXTENSION_SENTINEL_PREFIX: &str = "__typhon_extend_";
+
+/// `(class, level, module)` of an [`extension_sentinel_name`].
+pub fn parse_extension_sentinel(name: &str) -> Option<(&str, u32, &str)> {
+    let rest = name.strip_prefix(EXTENSION_SENTINEL_PREFIX)?;
+    let (class, spec) = rest.split_once('@')?;
+    let module = spec.trim_start_matches('.');
+    let level = (spec.len() - module.len()) as u32;
+    Some((class, level, module))
+}
+
 pub fn extract_module_shapes(module: &ModModule) -> ModuleShapes {
     extract_module_shapes_with(module, &std::collections::HashSet::new())
 }
@@ -6718,6 +6740,27 @@ pub fn extract_module_shapes_with(
             }
         }
     }
+    // `from M import X [as Y]` bindings, so an `extend Y:` of an imported
+    // class can name the class it patches (W3-03).
+    let mut from_imports: HashMap<String, String> = HashMap::new();
+    for stmt in &module.body {
+        if let Stmt::ImportFrom(i) = stmt {
+            let spec = format!(
+                "{}{}",
+                ".".repeat(i.level as usize),
+                i.module.as_ref().map(|m| m.as_str()).unwrap_or("")
+            );
+            for alias in &i.names {
+                let member = alias.name.as_str();
+                if member == "*" {
+                    continue;
+                }
+                let local = alias.asname.as_ref().map(|a| a.as_str()).unwrap_or(member);
+                from_imports.insert(local.to_owned(), extension_sentinel_name(member, &spec));
+            }
+        }
+    }
+    let mut foreign_extensions: HashMap<String, InterfaceShape> = HashMap::new();
     // Second sweep: fold `__typhon_impl_NAME` contributions back into
     // the target class so an out-of-module caller sees `impl`-block
     // methods on the same shape as the in-module checker does.
@@ -6725,7 +6768,21 @@ pub fn extract_module_shapes_with(
         if let Stmt::ClassDef(cd) = stmt {
             let pseudo = cd.name.as_str();
             if let Some(target) = pseudo.strip_prefix("__typhon_impl_") {
-                if class_shapes.contains_key(target) {
+                if !class_shapes.contains_key(target) {
+                    // `extend User:` of an imported class lowers to
+                    // module-level patches (`User.m = …`) that run when this
+                    // module is imported. Publish its methods under a
+                    // sentinel naming the patched class's module, so a
+                    // consumer importing this module sees them on `User`
+                    // (W3-03). Fields are not patched, so not published.
+                    if let Some(sentinel) = from_imports.get(target) {
+                        let impl_shape = collect_class_shape(cd, &classes);
+                        let entry = foreign_extensions.entry(sentinel.clone()).or_default();
+                        for (m, sig) in impl_shape.methods {
+                            entry.methods.entry(m).or_insert(sig);
+                        }
+                    }
+                } else {
                     let impl_shape = collect_class_shape(cd, &classes);
                     let target_shape = class_shapes.get_mut(target).expect("checked above");
                     for (m, sig) in impl_shape.methods {
@@ -6755,6 +6812,7 @@ pub fn extract_module_shapes_with(
     // Drop the synthetic pseudo-classes from the published surface —
     // consumers should never see them by name.
     class_shapes.retain(|name, _| !name.starts_with("__typhon_impl_"));
+    class_shapes.extend(foreign_extensions);
 
     let mut function_arities: HashMap<String, ArityInfo> = HashMap::new();
     for stmt in &module.body {
@@ -39111,6 +39169,55 @@ class Service:
             !shapes.gatherable_async_fns.contains("helper"),
             "sync fn must be excluded"
         );
+    }
+
+    /// W3-03: `extend User:` of an imported class publishes its methods
+    /// under a sentinel naming the class and the module it was imported
+    /// from; a local class's `extend` still folds into the class itself.
+    #[test]
+    fn foreign_extend_blocks_publish_an_extension_sentinel() {
+        let src = "\
+from .user import User as U
+from other import Thing
+
+class Local:
+    x: int
+
+extend U:
+    def tracking_id(self) -> str:
+        return \"t\"
+
+extend Local:
+    def double(self) -> int:
+        return self.x * 2
+
+extend Unknown:
+    def nope(self) -> int:
+        return 1
+";
+        let prep = preprocess(src);
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let shapes = extract_module_shapes(&module);
+        let sentinel = extension_sentinel_name("User", ".user");
+        assert_eq!(sentinel, "__typhon_extend_User@.user");
+        assert_eq!(
+            parse_extension_sentinel(&sentinel),
+            Some(("User", 1, "user"))
+        );
+        assert_eq!(
+            parse_extension_sentinel("__typhon_extend_Thing@other"),
+            Some(("Thing", 0, "other"))
+        );
+        assert!(shapes.class_shapes[&sentinel]
+            .methods
+            .contains_key("tracking_id"));
+        assert!(shapes.class_shapes["Local"].methods.contains_key("double"));
+        assert!(!shapes
+            .class_shapes
+            .keys()
+            .any(|k| k.contains("Unknown") || k.starts_with("__typhon_impl_")));
     }
 
     /// Cross-module newtype escape-upward. A `newtype ProjectTag = str`

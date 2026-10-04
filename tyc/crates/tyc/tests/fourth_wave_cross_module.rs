@@ -117,3 +117,88 @@ fn builtin_extensions_travel_through_pub_star_facades() {
         "hello-world\nhello-world\nhello-world\n14\na-b\n",
     );
 }
+
+// ── W3-03: cross-module `extend User:` seen by a third module ──────────────
+
+#[test]
+fn a_cross_module_extend_is_seen_by_modules_that_import_it() {
+    assert_all_surfaces_print(
+        &[
+            ("user.ty", "class User:\n    id: int\n    name: str\n"),
+            (
+                "metrics.ty",
+                "from user import User\n\n\
+                 extend User:\n    def tracking_id(self) -> str:\n        return f\"user-{self.id:08d}\"\n",
+            ),
+            (
+                "main.ty",
+                "import metrics as _metrics\nfrom user import User\n\n\
+                 def main() -> None:\n\
+                 \x20   let u = User(id=7, name=\"ann\")\n\
+                 \x20   print(u.tracking_id())\n\n\
+                 main()\n",
+            ),
+        ],
+        "user-00000007\n",
+    );
+}
+
+#[test]
+fn a_cross_module_extend_travels_through_a_facade_and_signatures() {
+    assert_all_surfaces_print(
+        &[
+            ("pkg/__init__.ty", "pub *\n"),
+            (
+                "pkg/user.ty",
+                "pub class User:\n    id: int\n    name: str\n\n\
+                 pub def make_user(i: int) -> User:\n    return User(id=i, name=\"x\")\n",
+            ),
+            (
+                "pkg/metrics.ty",
+                "from .user import User\n\n\
+                 extend User:\n    def tracking_id(self) -> str:\n        return f\"user-{self.id:08d}\"\n\n\
+                 pub def metric_names() -> list[str]:\n    return [\"tracking_id\"]\n",
+            ),
+            (
+                "main.ty",
+                "from pkg import User, make_user, metric_names\nimport pkg.user\n\n\
+                 def main() -> None:\n\
+                 \x20   print(metric_names())\n\
+                 \x20   print(User(id=1, name=\"a\").tracking_id())\n\
+                 \x20   print(make_user(2).tracking_id())\n\
+                 \x20   print(pkg.user.User(id=3, name=\"c\").tracking_id())\n\n\
+                 main()\n",
+            ),
+        ],
+        "['tracking_id']\nuser-00000001\nuser-00000002\nuser-00000003\n",
+    );
+}
+
+#[test]
+fn a_cross_module_extend_is_not_promised_to_modules_that_do_not_import_it() {
+    // Nothing guarantees `metrics` ran before `report` calls the method, so
+    // the checker keeps rejecting it (as before).
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        &[
+            ("user.ty", "class User:\n    id: int\n"),
+            (
+                "metrics.ty",
+                "from user import User\n\n\
+                 extend User:\n    def tracking_id(self) -> str:\n        return \"t\"\n",
+            ),
+            (
+                "report.ty",
+                "from user import User\n\n\
+                 def tid(u: User) -> str:\n    return u.tracking_id()\n",
+            ),
+        ],
+    );
+    let (ok, out, err) = run_tyc(tmp.path(), &["check", "src"]);
+    assert!(!ok, "{out}{err}");
+    assert!(
+        err.contains("tracking_id") || out.contains("tracking_id"),
+        "{out}{err}"
+    );
+}

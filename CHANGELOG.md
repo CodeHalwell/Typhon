@@ -278,6 +278,16 @@ grouped by workstream (W1–W7).
   `__init__.py` re-exports the lifted `__typhon_ext_*` helpers, and the VM
   loads a facade's constituents' extensions — checker, build and `tyc run`
   agree.
+- **Cross-module `extend User:` is seen by the modules that import it**
+  (W3-03). Module B's `extend User:` of A's class patches `User` when B is
+  imported, but a module C importing both got `tyc::attribute_not_found`
+  on `u.tracking_id()`. B now publishes the patched methods (a
+  `__typhon_extend_<Class>@<module>` sentinel in its shapes), and a module
+  that imports B — by name, as a module, or through a `pub *` facade —
+  sees them on its `User`, on `a.User`, and on a `User` returned by an
+  imported function. A module that does not import B is still rejected:
+  nothing guarantees B's patch ran. The docs-site `extend` page now shows
+  the real lowering (a module-level patch, not a merged class body).
 
 #### W4 — CLI, LSP, filesystem safety
 - **LSP definition URIs rebased onto client workspace root.** `goto_definition` now uses the client's declared workspace root URI (preserving symlink prefixes such as `/var/folders` or `/tmp` rather than macOS `/private/var/...`) or open-document URI, preventing editors from opening duplicate tabs on cross-file jumps.

@@ -763,7 +763,7 @@ comptime let MAX_SCORE: int = 100 if env("STRICT", "1") == "1" else 80
 
 ### Extension methods
 
-`extend ClassName:` attaches methods to a user-defined class declared elsewhere — `impl`'s twin for code you don't want to keep in the original module. The merge happens at desugar; downstream callers see a single class with both sets of methods.
+`extend ClassName:` attaches methods to a user-defined class declared elsewhere — `impl`'s twin for code you don't want to keep in the original module. In the class's own module the methods merge into the class body at desugar. When the class is imported (`from domain.user import User`), each method lowers to a module-level function plus a patch (`User.tracking_id = __typhon_extend_User__tracking_id`) that runs when the extending module is imported — so the methods are visible, to the checker and at runtime, in the extending module and in every module that imports it (by name, as a module, or through a `pub *` facade that aggregates it). A module that does not import the extending module gets no guarantee it ran, so the checker still reports `tyc::attribute_not_found` there; import it for its effect with `import analytics.user_metrics as _user_metrics`.
 
 ```
 # domain/user.ty
@@ -772,9 +772,11 @@ class User:
     name: str
 
 # analytics/user_metrics.ty
+from domain.user import User
+
 extend User:
-    def tracking_id() -> str:
-        return f"user-{id:08d}"
+    def tracking_id(self) -> str:
+        return f"user-{self.id:08d}"
 ```
 
 `extend BUILTIN:` (extending the recognised Python built-ins — `str`, `list`, `int`, `dict`, …) is also supported. Each method is extracted at desugar time to a module-level free function `__typhon_ext_<TYPE>__<METHOD>__`, and call sites `x.method(...)` are rewritten to `__typhon_ext_<TYPE>__method(x, ...)` whenever the receiver `x` has a static annotation matching one of the registered built-ins. There is no monkey-patching of built-in types; the rewrite is strictly opt-in by type annotation, so calls on un-annotated receivers continue to raise `AttributeError` at runtime, matching Python's existing semantics. The receiver's type is taken from declarations: an annotated name (a parameter, a `let x: T`, or a module-level constant read from inside a function), an unannotated `let x = EXPR` whose initialiser's type is evident, a literal or f-string, a field or `@property` of a class declared in or imported into the module (`self.title.slug()`, `post.title.slug()`, including inherited and generic fields), a call whose declared return is the builtin (a same-module or imported `def`, an `impl` / static method, a constructor's field, `module.f()`), an awaited `async def`, a subscript on a `list[T]` / `dict[K, V]` / tuple, a `for` or comprehension variable, a chain of type-preserving builtin methods, `str` concatenation / repetition / `%`, and another extension call (`t.slug().shout()`). A `T?` receiver counts as `T` (the checker requires the narrowing). A receiver whose type the pass cannot see — an untyped match capture, a lambda parameter without a contextual `Callable` type, a `with … as` target, an unannotated module-level binding read inside a function, a stdlib call — is left as a native attribute access and raises `AttributeError` at runtime. The free-function name ends in a double underscore so CPython does not name-mangle it when the rewritten call sits inside a class body.

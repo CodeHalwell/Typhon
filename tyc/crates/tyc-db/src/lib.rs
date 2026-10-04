@@ -24,7 +24,7 @@ use tyc_syntax::{
         PreprocessResult,
     },
 };
-use tyc_types::{check_module_with_imports, ExternalShapes};
+use tyc_types::{check_module_with_imports, ExternalShapes, InterfaceShape};
 
 /// Re-export so downstream crates (CLI, LSP) can name the type
 /// without depending on `tyc-types` directly.
@@ -1238,7 +1238,157 @@ fn build_external_shapes(
                 .or_insert_with(|| variances.clone());
         }
     }
+    apply_cross_module_extensions(&mut external, bindings, &canon, shapes_by_module);
     external
+}
+
+/// The key a `__typhon_extend_<Class>@<spec>` sentinel published by the
+/// module keyed `owner` points at: the patched class's module. `owner` may
+/// be a package (`pkg` for `pkg/__init__.ty`); the relative spec is
+/// resolved as a module first and as a package if that names nothing.
+fn extension_target_key(
+    owner: &str,
+    level: u32,
+    module: &str,
+    known: &std::collections::HashMap<String, ModuleShapes>,
+) -> String {
+    let info = tyc_resolve::ImportInfo {
+        module: module.to_owned(),
+        member: None,
+        level,
+    };
+    let as_module = canonical_import_module(&info, Some(owner), false);
+    if level == 0 || known.contains_key(&as_module) {
+        return as_module;
+    }
+    let as_package = canonical_import_module(&info, Some(owner), true);
+    if known.contains_key(&as_package) {
+        as_package
+    } else {
+        as_module
+    }
+}
+
+/// Rewrite every relative `__typhon_extend_` sentinel in `shapes` (the
+/// shapes of the module keyed `owner`) to an absolute spec, so the
+/// sentinels survive being merged into a `pub *` facade under another key.
+pub fn absolutise_extension_sentinels<'a>(
+    shapes: &'a ModuleShapes,
+    owner: &str,
+    owner_is_init: bool,
+) -> std::borrow::Cow<'a, ModuleShapes> {
+    let relative = shapes.class_shapes.keys().any(|name| {
+        tyc_types::parse_extension_sentinel(name).is_some_and(|(_, level, _)| level > 0)
+    });
+    if !relative {
+        return std::borrow::Cow::Borrowed(shapes);
+    }
+    let mut out = shapes.clone();
+    out.class_shapes = shapes
+        .class_shapes
+        .iter()
+        .map(|(name, shape)| {
+            let name = match tyc_types::parse_extension_sentinel(name) {
+                Some((class, level, module)) if level > 0 => {
+                    let info = tyc_resolve::ImportInfo {
+                        module: module.to_owned(),
+                        member: None,
+                        level,
+                    };
+                    let target = canonical_import_module(&info, Some(owner), owner_is_init);
+                    tyc_types::extension_sentinel_name(class, &target)
+                }
+                _ => name.clone(),
+            };
+            (name, shape.clone())
+        })
+        .collect();
+    std::borrow::Cow::Owned(out)
+}
+
+/// W3-03: `extend User:` in module B patches `User` (declared in A) when B
+/// is imported. A consumer that imports B — by name, as a module, or
+/// through a `pub *` facade aggregating it — sees the patched methods on
+/// its `User`, the local name(s) it bound A's class to, and on A's shape
+/// in the registry (a `User` reached through an imported signature or
+/// `a.User`). A consumer that does not import B gets no promise that B
+/// ran, so it sees no extension. Methods merge first-write-wins: the
+/// class's own methods win.
+fn apply_cross_module_extensions(
+    external: &mut ExternalShapes,
+    bindings: &[tyc_resolve::Binding],
+    canon: &dyn Fn(&tyc_resolve::ImportInfo) -> String,
+    shapes_by_module: &std::sync::Arc<std::collections::HashMap<String, ModuleShapes>>,
+) {
+    let mut imported: Vec<String> = Vec::new();
+    for b in bindings {
+        if let Some(info) = &b.import_info {
+            let key = canon(info);
+            if !imported.contains(&key) {
+                imported.push(key);
+            }
+            // `from pkg import text` binds a submodule.
+            if let Some(member) = &info.member {
+                let sub = format!("{}.{member}", canon(info));
+                if shapes_by_module.contains_key(&sub) && !imported.contains(&sub) {
+                    imported.push(sub);
+                }
+            }
+        }
+    }
+    let mut contributions: Vec<(String, String, InterfaceShape)> = Vec::new();
+    for owner in &imported {
+        let Some(shapes) = shapes_by_module.get(owner) else {
+            continue;
+        };
+        let mut sentinels: Vec<_> = shapes
+            .class_shapes
+            .iter()
+            .filter_map(|(name, shape)| {
+                tyc_types::parse_extension_sentinel(name).map(|parsed| (parsed, shape))
+            })
+            .collect();
+        sentinels.sort_by(|a, b| a.0.cmp(&b.0));
+        for ((class, level, module), shape) in sentinels {
+            let target = extension_target_key(owner, level, module, shapes_by_module);
+            contributions.push((target, class.to_owned(), shape.clone()));
+        }
+    }
+    if contributions.is_empty() {
+        return;
+    }
+    let merge = |into: &mut InterfaceShape, from: &InterfaceShape| {
+        for (m, sig) in &from.methods {
+            into.methods.entry(m.clone()).or_insert_with(|| sig.clone());
+        }
+    };
+    for (target, class, shape) in &contributions {
+        // The consumer's local names for the class: `from a import User
+        // [as U]`, or the same class re-exported by a facade it lives under.
+        for b in bindings {
+            let Some(info) = &b.import_info else { continue };
+            if info.member.as_deref() != Some(class.as_str()) {
+                continue;
+            }
+            let source = canon(info);
+            if &source != target && !target.starts_with(&format!("{source}.")) {
+                continue;
+            }
+            if let Some(local) = external.class_shapes.get_mut(&b.name) {
+                merge(local, shape);
+            }
+        }
+        // The registry entry, for `a.User` and a `User` reached through an
+        // imported signature. Copy-on-write: only consumers that import an
+        // extending module pay for the clone.
+        let registry = std::sync::Arc::make_mut(&mut external.by_module);
+        if let Some(cls) = registry
+            .get_mut(target)
+            .and_then(|m| m.class_shapes.get_mut(class))
+        {
+            merge(cls, shape);
+        }
+    }
 }
 
 #[cfg(test)]
