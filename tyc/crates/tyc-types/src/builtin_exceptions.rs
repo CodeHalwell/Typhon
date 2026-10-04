@@ -41,13 +41,24 @@ const EXCEPTION_GROUP: &[&str] = &["derive", "exceptions", "message", "split", "
 /// not a builtin exception class.
 fn extra_attrs(name: &str) -> Option<&'static [&'static str]> {
     Some(match name {
-        "OSError" | "EnvironmentError" | "IOError" | "BlockingIOError" | "BrokenPipeError"
-        | "ChildProcessError" | "ConnectionAbortedError" | "ConnectionError"
-        | "ConnectionRefusedError" | "ConnectionResetError" | "FileExistsError"
-        | "FileNotFoundError" | "InterruptedError" | "IsADirectoryError"
-        | "NotADirectoryError" | "PermissionError" | "ProcessLookupError" | "TimeoutError" => {
-            OS_ERROR
-        }
+        "OSError"
+        | "EnvironmentError"
+        | "IOError"
+        | "BlockingIOError"
+        | "BrokenPipeError"
+        | "ChildProcessError"
+        | "ConnectionAbortedError"
+        | "ConnectionError"
+        | "ConnectionRefusedError"
+        | "ConnectionResetError"
+        | "FileExistsError"
+        | "FileNotFoundError"
+        | "InterruptedError"
+        | "IsADirectoryError"
+        | "NotADirectoryError"
+        | "PermissionError"
+        | "ProcessLookupError"
+        | "TimeoutError" => OS_ERROR,
         "SyntaxError" | "IndentationError" | "TabError" => SYNTAX_ERROR,
         "ImportError" | "ModuleNotFoundError" => IMPORT_ERROR,
         "UnicodeDecodeError" | "UnicodeEncodeError" | "UnicodeTranslateError" => UNICODE_ERROR,
@@ -56,15 +67,42 @@ fn extra_attrs(name: &str) -> Option<&'static [&'static str]> {
         "NameError" | "UnboundLocalError" => &["name"],
         "StopIteration" => &["value"],
         "SystemExit" => &["code"],
-        "ArithmeticError" | "AssertionError" | "BaseException" | "BufferError"
-        | "BytesWarning" | "DeprecationWarning" | "EOFError" | "EncodingWarning"
-        | "Exception" | "FloatingPointError" | "FutureWarning" | "GeneratorExit"
-        | "ImportWarning" | "IndexError" | "KeyError" | "KeyboardInterrupt" | "LookupError"
-        | "MemoryError" | "NotImplementedError" | "OverflowError"
-        | "PendingDeprecationWarning" | "PythonFinalizationError" | "RecursionError"
-        | "ReferenceError" | "ResourceWarning" | "RuntimeError" | "RuntimeWarning"
-        | "StopAsyncIteration" | "SyntaxWarning" | "SystemError" | "TypeError"
-        | "UnicodeError" | "UnicodeWarning" | "UserWarning" | "ValueError" | "Warning"
+        "ArithmeticError"
+        | "AssertionError"
+        | "BaseException"
+        | "BufferError"
+        | "BytesWarning"
+        | "DeprecationWarning"
+        | "EOFError"
+        | "EncodingWarning"
+        | "Exception"
+        | "FloatingPointError"
+        | "FutureWarning"
+        | "GeneratorExit"
+        | "ImportWarning"
+        | "IndexError"
+        | "KeyError"
+        | "KeyboardInterrupt"
+        | "LookupError"
+        | "MemoryError"
+        | "NotImplementedError"
+        | "OverflowError"
+        | "PendingDeprecationWarning"
+        | "PythonFinalizationError"
+        | "RecursionError"
+        | "ReferenceError"
+        | "ResourceWarning"
+        | "RuntimeError"
+        | "RuntimeWarning"
+        | "StopAsyncIteration"
+        | "SyntaxWarning"
+        | "SystemError"
+        | "TypeError"
+        | "UnicodeError"
+        | "UnicodeWarning"
+        | "UserWarning"
+        | "ValueError"
+        | "Warning"
         | "ZeroDivisionError" => &[],
         _ => return None,
     })

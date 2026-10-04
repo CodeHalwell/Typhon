@@ -6384,7 +6384,14 @@ impl<'a> Checker<'a> {
         span: (usize, usize),
     ) {
         self.push_non_exhaustive(span, |path, source, offset, length| {
-            TycError::non_exhaustive_closed_match(subject_type, missing, path, source, offset, length)
+            TycError::non_exhaustive_closed_match(
+                subject_type,
+                missing,
+                path,
+                source,
+                offset,
+                length,
+            )
         });
     }
 
@@ -41840,7 +41847,10 @@ def main() -> None:
         ] {
             let src = format!("{pre}{body}");
             assert!(
-                check(&src).errors().iter().any(|e| matches!(e, TycError::TypeMismatch { .. })),
+                check(&src)
+                    .errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::TypeMismatch { .. })),
                 "accepted: {src}"
             );
         }
@@ -41921,13 +41931,21 @@ def main() -> None:
         let src = "class Conn:\n    n: int\nclass Box:\n    conn: Conn?\ndef reset(b: Box) -> None:\n    b.conn = None\ndef f(b: Box) -> int:\n    if b.conn is None:\n        return 0\n    reset(b)\n    return b.conn.n\n";
         let helps = nullable_helps(&check(src));
         assert_eq!(helps.len(), 1, "{helps:?}");
-        assert!(helps[0].contains("already checked above (`if b.conn is None:`)"), "{}", helps[0]);
+        assert!(
+            helps[0].contains("already checked above (`if b.conn is None:`)"),
+            "{}",
+            helps[0]
+        );
         assert!(helps[0].contains("let conn = b.conn"), "{}", helps[0]);
         // A local reassigned after its guard.
         let src = "def find() -> str?:\n    return None\ndef f() -> int:\n    mut v: str? = find()\n    if v is None:\n        return 0\n    v = find()\n    return len(v)\n";
         let helps = nullable_helps(&check(src));
         assert_eq!(helps.len(), 1, "{helps:?}");
-        assert!(helps[0].contains("already checked above (`if v is None:`)"), "{}", helps[0]);
+        assert!(
+            helps[0].contains("already checked above (`if v is None:`)"),
+            "{}",
+            helps[0]
+        );
         assert!(helps[0].contains("reassigned"), "{}", helps[0]);
     }
     #[test]
@@ -41955,10 +41973,15 @@ def main() -> None:
             .filter(|e| matches!(e, TycError::NonExhaustiveMatch { .. }))
             .map(ToString::to_string)
             .collect();
-        assert_eq!(msgs, vec!["non-exhaustive `match` on `bool`: missing case(s) False".to_owned()]);
+        assert_eq!(
+            msgs,
+            vec!["non-exhaustive `match` on `bool`: missing case(s) False".to_owned()]
+        );
         let d = check("class A:\n    n: int\nclass B:\n    n: int\ntype U = A | B\ndef f(u: U) -> int:\n    match u:\n        case A():\n            return 1\n    return 0\n");
         assert!(
-            d.errors().iter().any(|e| e.to_string().contains("on sealed union `U`")),
+            d.errors()
+                .iter()
+                .any(|e| e.to_string().contains("on sealed union `U`")),
             "{:?}",
             d.errors()
         );
@@ -41975,7 +41998,11 @@ def main() -> None:
             .map(|e| e.help_text().unwrap())
             .collect();
         assert_eq!(helps.len(), 1, "{:?} / {}", d.errors(), prep.python_source);
-        assert!(helps[0].contains("`data[\"name\"] as! str`"), "{}", helps[0]);
+        assert!(
+            helps[0].contains("`data[\"name\"] as! str`"),
+            "{}",
+            helps[0]
+        );
         assert!(!helps[0].contains("let typed"), "{}", helps[0]);
     }
 }

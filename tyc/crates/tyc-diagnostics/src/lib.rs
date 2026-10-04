@@ -778,7 +778,9 @@ pub enum TycError {
     )]
     #[diagnostic(
         code(tyc::unsafe_value_leak),
-        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/unsafe_value_leak.md"),
+        url(
+            "https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/unsafe_value_leak.md"
+        )
     )]
     UnsafeValueLeak {
         name: String,
@@ -2169,7 +2171,9 @@ impl TycError {
                 capture,
                 ..
             } => Some((src, vec![capture, declaration])),
-            other => other.source_and_span_mut().map(|(src, span)| (src, vec![span])),
+            other => other
+                .source_and_span_mut()
+                .map(|(src, span)| (src, vec![span])),
         }
     }
 
@@ -6031,7 +6035,10 @@ mod tests {
     fn non_exhaustive_match_names_a_closed_subject_by_its_type() {
         let e = TycError::non_exhaustive_closed_match("bool", "False", "a.ty", "match b:", 0, 7);
         let msg = e.to_string();
-        assert_eq!(msg, "non-exhaustive `match` on `bool`: missing case(s) False");
+        assert_eq!(
+            msg,
+            "non-exhaustive `match` on `bool`: missing case(s) False"
+        );
         let help = miette::Diagnostic::help(&e).unwrap().to_string();
         assert!(help.contains("`case False:`"), "{help}");
         let e = TycError::non_exhaustive_enum_match("Color", "BLUE", "a.ty", "match c:", 0, 7);
