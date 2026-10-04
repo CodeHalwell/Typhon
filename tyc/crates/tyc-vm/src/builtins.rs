@@ -799,7 +799,14 @@ pub fn install(interp: &mut Interpreter) {
             Some(Value::Bytes(b)) => Ok(Value::Bytes(b)),
             // bytes(int) -> that many zero bytes.
             Some(Value::Int(n)) => {
-                let n = n.to_usize().ok_or_else(|| value_error("negative count"))?;
+                if n.is_negative() {
+                    return Err(value_error("negative count"));
+                }
+                let n = n
+                    .to_usize()
+                    .filter(|n| *n <= isize::MAX as usize)
+                    .ok_or_else(crate::limits::index_overflow)?;
+                crate::limits::ensure_alloc(n)?;
                 Ok(Value::Bytes(Rc::new(vec![0u8; n])))
             }
             // bytes(str) requires an encoding in Python; not supported here.
@@ -1443,12 +1450,27 @@ pub fn install(interp: &mut Interpreter) {
                     // round-ties-to-even, matching CPython (so 2.675, which is
                     // really 2.67499..., rounds to 2.67).
                     Some(n) if !matches!(n, Value::None) => {
-                        let n = n.to_int()? as i32;
-                        if !x.is_finite() {
+                        // CPython clamps `ndigits` to `Py_ssize_t`, returns `x`
+                        // itself past the last representable decimal place and
+                        // a signed zero before the largest one
+                        // (`NDIGITS_MAX` / `NDIGITS_MIN` in floatobject.c).
+                        let n: i64 = match n {
+                            Value::Int(v) => v.to_i64().unwrap_or(if v.is_negative() {
+                                i64::MIN
+                            } else {
+                                i64::MAX
+                            }),
+                            other => other.to_int()?,
+                        };
+                        if !x.is_finite() || n > 323 {
                             return Ok(Value::Float(x));
                         }
+                        if n < -308 {
+                            return Ok(Value::Float(0.0 * x));
+                        }
+                        let n = n as i32;
                         if n >= 0 {
-                            let s = format!("{:.*}", n as usize, x);
+                            let s = crate::limits::fixed(x, n as usize);
                             Ok(Value::Float(s.parse::<f64>().unwrap_or(x)))
                         } else {
                             // Round to a negative decimal place (tens, hundreds…).
@@ -5505,7 +5527,12 @@ fn fs_natives() -> Vec<(&'static str, Value)> {
             "_fs_urandom",
             nf("_fs_urandom", |_i, args| {
                 use std::hash::{BuildHasher, Hasher};
-                let n = single(&args, "urandom")?.to_int()?.max(0) as usize;
+                let n = crate::limits::ssize_arg(single(&args, "urandom")?)?;
+                if n < 0 {
+                    return Err(value_error("negative argument not allowed"));
+                }
+                let n = n as usize;
+                crate::limits::ensure_alloc(n)?;
                 let mut out = Vec::with_capacity(n);
                 while out.len() < n {
                     let word = std::collections::hash_map::RandomState::new()
@@ -9782,7 +9809,7 @@ fn str_method(
             Value::Str(Rc::new(s.strip_suffix(&p).unwrap_or(s).to_owned()))
         }
         "center" | "ljust" | "rjust" => {
-            let width = single(args, name)?.to_int()?.max(0) as usize;
+            let width = crate::limits::ssize_arg(single(args, name)?)?.max(0) as usize;
             // `fillchar` (optional) must be exactly one character.
             let fill = match args.get(1) {
                 Some(Value::Str(fs)) => {
@@ -9808,6 +9835,7 @@ fn str_method(
                 Value::Str(s.clone())
             } else {
                 let pad = width - len;
+                crate::limits::ensure_alloc_items(pad, fill.len_utf8())?;
                 let pad_str = |n: usize| fill.to_string().repeat(n);
                 let out = match name {
                     "ljust" => format!("{}{}", s, pad_str(pad)),
@@ -9827,11 +9855,12 @@ fn str_method(
             }
         }
         "zfill" => {
-            let width = single(args, "zfill")?.to_int().unwrap_or(0).max(0) as usize;
+            let width = crate::limits::ssize_arg(single(args, "zfill")?)?.max(0) as usize;
             let len = s.chars().count();
             if len >= width {
                 Value::Str(s.clone())
             } else {
+                crate::limits::ensure_alloc(width - len)?;
                 let pad = "0".repeat(width - len);
                 let out = if let Some(rest) = s.strip_prefix('-') {
                     format!("-{}{}", pad, rest)
@@ -9878,7 +9907,7 @@ fn str_method(
             // Expand tabs so the next column is a multiple of `tabsize`
             // (CPython semantics), resetting the column on newlines.
             let tabsize = match args.first() {
-                Some(v) => v.to_int()?.max(0) as usize,
+                Some(v) => crate::limits::c_int_arg(v)?.max(0) as usize,
                 None => 8,
             };
             let mut out = String::with_capacity(s.len());
@@ -9888,6 +9917,7 @@ fn str_method(
                     '\t' => {
                         if tabsize > 0 {
                             let spaces = tabsize - (column % tabsize);
+                            crate::limits::ensure_alloc(out.len().saturating_add(spaces))?;
                             out.push_str(&" ".repeat(spaces));
                             column += spaces;
                         }
@@ -10466,7 +10496,7 @@ fn bytes_method(
         }
         "ljust" | "rjust" | "center" => {
             let width = match args.first() {
-                Some(v) => v.to_int()?.max(0) as usize,
+                Some(v) => crate::limits::ssize_arg(v)?.max(0) as usize,
                 None => return Err(type_error(format!("bytes.{name} requires a width"))),
             };
             let fill = match args.get(1) {
@@ -10476,6 +10506,7 @@ fn bytes_method(
             if b.len() >= width {
                 Value::Bytes(Rc::new(b.to_vec()))
             } else {
+                crate::limits::ensure_alloc(width)?;
                 let pad = width - b.len();
                 let mut out = Vec::with_capacity(width);
                 let (before, after) = match name {
@@ -10492,12 +10523,13 @@ fn bytes_method(
         }
         "zfill" => {
             let width = match args.first() {
-                Some(v) => v.to_int()?.max(0) as usize,
+                Some(v) => crate::limits::ssize_arg(v)?.max(0) as usize,
                 None => return Err(type_error("bytes.zfill requires a width")),
             };
             if b.len() >= width {
                 Value::Bytes(Rc::new(b.to_vec()))
             } else {
+                crate::limits::ensure_alloc(width)?;
                 // A leading sign stays in front of the zeros.
                 let signed = matches!(b.first(), Some(b'+') | Some(b'-'));
                 let mut out = Vec::with_capacity(width);
@@ -10519,7 +10551,7 @@ fn bytes_method(
         }
         "expandtabs" => {
             let size = match args.first() {
-                Some(v) if !matches!(v, Value::None) => v.to_int()?.max(0) as usize,
+                Some(v) if !matches!(v, Value::None) => crate::limits::c_int_arg(v)?.max(0) as usize,
                 _ => 8,
             };
             let mut out: Vec<u8> = Vec::with_capacity(b.len());
@@ -10528,6 +10560,7 @@ fn bytes_method(
                 match c {
                     b'\t' => {
                         let advance = if size == 0 { 0 } else { size - column % size };
+                        crate::limits::ensure_alloc(out.len().saturating_add(advance))?;
                         out.extend(std::iter::repeat_n(b' ', advance));
                         column += advance;
                     }
@@ -11594,7 +11627,14 @@ fn num_method(v: &Value, name: &str, args: &[Value]) -> Result<Value, Unwind> {
             let (pos, kw) = split_kwargs(args);
             let kwarg = |name: &str| kw.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
             let length = match pos.first().cloned().or_else(|| kwarg("length")) {
-                Some(n) => n.to_int()?.max(0) as usize,
+                Some(n) => {
+                    let n = crate::limits::ssize_arg(&n)?;
+                    if n < 0 {
+                        return Err(value_error("length argument must be non-negative"));
+                    }
+                    crate::limits::ensure_alloc(n as usize)?;
+                    n as usize
+                }
                 None => 1,
             };
             let big_endian = match pos.get(1).cloned().or_else(|| kwarg("byteorder")) {
@@ -11697,6 +11737,40 @@ pub struct JsonDumpOpts {
     /// "Object of type X is not JSON serializable" — but pydantic's
     /// `model_dump_json` renders nested models that way.
     pub instances_as_objects: bool,
+    /// `check_circular`: a container met again inside itself raises
+    /// `ValueError: Circular reference detected` (CPython's default).
+    pub check_circular: bool,
+}
+
+/// CPython's JSON encoder recurses through `Py_EnterRecursiveCall`, whose C
+/// recursion budget (10,000 in 3.13, less the frames below `json.dumps`)
+/// runs out at this nesting depth.
+const JSON_MAX_DEPTH: usize = 9998;
+
+/// The containers being encoded, by address (CPython's `markers`).
+type JsonMarkers = std::collections::HashSet<usize>;
+
+/// Enter a container at nesting `level`: the recursion limit, then the
+/// circular-reference check. `addr` is `None` for an empty container,
+/// which CPython writes before it consults its markers.
+fn json_enter(
+    level: usize,
+    addr: Option<usize>,
+    opts: &JsonDumpOpts,
+    markers: &mut JsonMarkers,
+) -> Result<(), Unwind> {
+    if level >= JSON_MAX_DEPTH {
+        return Err(Unwind::Exception(crate::error::VmException::new(
+            "RecursionError",
+            "maximum recursion depth exceeded while encoding a JSON object",
+        )));
+    }
+    if let (true, Some(addr)) = (opts.check_circular, addr) {
+        if !markers.insert(addr) {
+            return Err(value_error("Circular reference detected"));
+        }
+    }
+    Ok(())
 }
 
 impl JsonDumpOpts {
@@ -11710,6 +11784,7 @@ impl JsonDumpOpts {
             item_sep: ", ".to_owned(),
             key_sep: ": ".to_owned(),
             instances_as_objects: false,
+            check_circular: true,
         }
     }
 
@@ -11724,6 +11799,7 @@ impl JsonDumpOpts {
             item_sep: ",".to_owned(),
             key_sep: ":".to_owned(),
             instances_as_objects: true,
+            check_circular: true,
         }
     }
 }
@@ -11782,7 +11858,8 @@ pub fn json_dump_opts_from_kwargs(
                     _ => return Err(type_error("separators must be a pair of two strings")),
                 }
             }
-            "default" | "cls" | "skipkeys" | "check_circular" => {}
+            "check_circular" => opts.check_circular = interp.is_truthy(v)?,
+            "default" | "cls" | "skipkeys" => {}
             other => {
                 return Err(type_error(format!(
                     "dumps() got an unexpected keyword argument '{other}'"
@@ -11801,7 +11878,7 @@ pub fn json_dump_opts_from_kwargs(
 /// non-finite float under `allow_nan=False`.
 pub fn json_dumps_with(v: &Value, opts: &JsonDumpOpts) -> Result<String, Unwind> {
     let mut out = String::new();
-    json_write(v, opts, 0, &mut out)?;
+    json_write(v, opts, 0, &mut JsonMarkers::new(), &mut out)?;
     Ok(out)
 }
 
@@ -11823,6 +11900,31 @@ fn json_write(
     v: &Value,
     opts: &JsonDumpOpts,
     level: usize,
+    markers: &mut JsonMarkers,
+    out: &mut String,
+) -> Result<(), Unwind> {
+    // A container's address while it is being encoded, for the
+    // circular-reference markers.
+    let container = match v {
+        Value::List(l) => Some((Rc::as_ptr(l) as *const () as usize, l.borrow().is_empty())),
+        Value::Tuple(t) => Some((Rc::as_ptr(t) as *const () as usize, t.is_empty())),
+        Value::Dict(d) => Some((Rc::as_ptr(d) as *const () as usize, d.borrow().is_empty())),
+        _ => None,
+    };
+    if let Some((addr, empty)) = container {
+        json_enter(level, (!empty).then_some(addr), opts, markers)?;
+        let result = json_write_inner(v, opts, level, markers, out);
+        markers.remove(&addr);
+        return result;
+    }
+    json_write_inner(v, opts, level, markers, out)
+}
+
+fn json_write_inner(
+    v: &Value,
+    opts: &JsonDumpOpts,
+    level: usize,
+    markers: &mut JsonMarkers,
     out: &mut String,
 ) -> Result<(), Unwind> {
     match v {
@@ -11835,9 +11937,9 @@ fn json_write(
         Value::Str(s) => json_string_into(s, opts.ensure_ascii, out),
         Value::List(l) => {
             let items = l.borrow();
-            json_write_seq(&items, opts, level, out)?;
+            json_write_seq(&items, opts, level, markers, out)?;
         }
-        Value::Tuple(t) => json_write_seq(t, opts, level, out)?,
+        Value::Tuple(t) => json_write_seq(t, opts, level, markers, out)?,
         Value::Dict(d) => {
             let d = d.borrow();
             // (sort key, rendered key, value). Sorting uses the original
@@ -11859,7 +11961,7 @@ fn json_write(
             }
             let pairs: Vec<(String, &Value)> =
                 entries.into_iter().map(|(_, k, v)| (k, v)).collect();
-            json_write_object(&pairs, opts, level, out)?;
+            json_write_object(&pairs, opts, level, markers, out)?;
         }
         Value::Instance(inst) if opts.instances_as_objects && !inst.class.fields.is_empty() => {
             let fields = inst.fields.borrow();
@@ -11869,13 +11971,16 @@ fn json_write(
                     pairs.push((json_string(&f.name, opts.ensure_ascii), val));
                 }
             }
-            json_write_object(&pairs, opts, level, out)?;
+            json_enter(level, Some(Rc::as_ptr(inst) as *const () as usize), opts, markers)?;
+            let result = json_write_object(&pairs, opts, level, markers, out);
+            markers.remove(&(Rc::as_ptr(inst) as *const () as usize));
+            result?;
         }
         // A `str` / `int` / `float` subclass encodes as its value: a
         // value-mixin enum member (`IntEnum`, `class Mode(str, Enum)`).
         v @ Value::Instance(_) if crate::value::enum_mixin_value(v).is_some() => {
             let inner = crate::value::enum_mixin_value(v).expect("checked by the guard");
-            json_write(&inner, opts, level, out)?;
+            json_write(&inner, opts, level, markers, out)?;
         }
         other => {
             return Err(type_error(format!(
@@ -11891,6 +11996,7 @@ fn json_write_seq(
     items: &[Value],
     opts: &JsonDumpOpts,
     level: usize,
+    markers: &mut JsonMarkers,
     out: &mut String,
 ) -> Result<(), Unwind> {
     if items.is_empty() {
@@ -11903,7 +12009,7 @@ fn json_write_seq(
             out.push_str(&opts.item_sep);
         }
         json_newline(opts, level + 1, out);
-        json_write(item, opts, level + 1, out)?;
+        json_write(item, opts, level + 1, markers, out)?;
     }
     json_newline(opts, level, out);
     out.push(']');
@@ -11914,6 +12020,7 @@ fn json_write_object(
     pairs: &[(String, &Value)],
     opts: &JsonDumpOpts,
     level: usize,
+    markers: &mut JsonMarkers,
     out: &mut String,
 ) -> Result<(), Unwind> {
     if pairs.is_empty() {
@@ -11928,7 +12035,7 @@ fn json_write_object(
         json_newline(opts, level + 1, out);
         out.push_str(key);
         out.push_str(&opts.key_sep);
-        json_write(val, opts, level + 1, out)?;
+        json_write(val, opts, level + 1, markers, out)?;
     }
     json_newline(opts, level, out);
     out.push('}');

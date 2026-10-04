@@ -29,10 +29,22 @@ use crate::error::{type_error, value_error, Unwind};
 /// without bound and overflow the native stack, aborting the process. The
 /// bound is far deeper than any realistic data structure but shallow enough to
 /// stay well within the VM's worker stack.
-const MAX_STRUCTURAL_DEPTH: usize = 10_000;
+/// It is CPython 3.13's: comparing two lists nested 10,000 deep raises
+/// `RecursionError` there (see `Interpreter::eq_values`).
+const MAX_STRUCTURAL_DEPTH: usize = 9_999;
 
 thread_local! {
     static STRUCTURAL_DEPTH: Cell<usize> = const { Cell::new(0) };
+    /// Set when a structural walk hit the depth bound, so a caller that can
+    /// raise (an ordering comparison) reports CPython's `RecursionError`
+    /// instead of the "not supported" a bare `None` would suggest.
+    static STRUCTURAL_OVERFLOW: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether a structural walk hit the depth bound since the last call
+/// (clearing the flag).
+pub(crate) fn take_structural_overflow() -> bool {
+    STRUCTURAL_OVERFLOW.with(|f| f.replace(false))
 }
 
 /// RAII guard that decrements the structural-recursion depth on drop. Using a
@@ -57,6 +69,7 @@ pub(crate) fn structural_depth_enter() -> Option<StructuralDepthGuard> {
     STRUCTURAL_DEPTH.with(|d| {
         let cur = d.get();
         if cur >= MAX_STRUCTURAL_DEPTH {
+            STRUCTURAL_OVERFLOW.with(|f| f.set(true));
             None
         } else {
             d.set(cur + 1);

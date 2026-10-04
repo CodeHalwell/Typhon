@@ -639,3 +639,105 @@ trap("set", lambda: reversed({1, 2}))
 "#,
     );
 }
+
+// ── W5-12: catchable exceptions where the VM used to abort or panic ───────
+
+#[test]
+fn w5_12_oversized_results_raise_instead_of_aborting() {
+    // Each of these aborted `tyc run` (exit 134: "memory allocation of …
+    // bytes failed"), panicked ("capacity overflow", "Formatting argument
+    // out of range", exit 101) or overflowed the native stack.
+    assert_matches_cpython(
+        "w5_12_oversized_results_raise_instead_of_aborting",
+        r#"import json
+import os
+def size(thunk: object) -> object:
+    return len(thunk())
+trap("str*", lambda: size(lambda: "a" * 2**62))
+trap("str2*", lambda: size(lambda: "aa" * 2**62))
+trap("bytes*", lambda: size(lambda: b"a" * 2**62))
+trap("zfill", lambda: size(lambda: "x".zfill(2**62)))
+trap("ljust", lambda: size(lambda: "x".ljust(2**62)))
+trap("rjust", lambda: size(lambda: "x".rjust(2**62, "*")))
+trap("center", lambda: size(lambda: "x".center(2**62)))
+trap("ljust63", lambda: size(lambda: "x".ljust(2**63)))
+trap("bytes()", lambda: size(lambda: bytes(2**62)))
+trap("bytes63", lambda: size(lambda: bytes(2**63)))
+trap("bytes-1", lambda: size(lambda: bytes(-1)))
+trap("to_bytes", lambda: size(lambda: (5).to_bytes(2**62, "big")))
+trap("to_bytes-1", lambda: size(lambda: (5).to_bytes(-1, "big")))
+trap("expandtabs", lambda: size(lambda: "a\tb".expandtabs(2**62)))
+trap("fwidth", lambda: size(lambda: f"{1:{2**62}}"))
+trap("fmtwidth", lambda: size(lambda: "{:>{w}}".format(1, w=2**62)))
+trap("urandom", lambda: size(lambda: os.urandom(2**62)))
+trap("prec", lambda: format(1.5, ".70000f")[:8])
+trap("prec-g", lambda: f"{2.5:.70000}"[:8])
+trap("prec-e", lambda: format(1.5, ".70000e")[-6:])
+trap("prec-%", lambda: ("%.70000f" % 1.5)[:8])
+trap("prec-pct", lambda: format(0.5, ".70000%")[-3:])
+trap("prec-big", lambda: format(1.5, ".2147483648f"))
+trap("prec-%big", lambda: "%.2147483648f" % 1.5)
+trap("digits", lambda: format(1, "99999999999999999999d"))
+trap("round", lambda: round(1.25, 70000))
+trap("round-huge", lambda: round(1.25, 2**100))
+trap("round-neg", lambda: round(1.25e300, -400))
+cyc: list[object] = []
+cyc.append(cyc)
+trap("json-cycle", lambda: json.dumps(cyc))
+d: dict[str, object] = {}
+d["x"] = [d]
+trap("json-dcycle", lambda: json.dumps(d))
+shared = [1]
+trap("json-shared", lambda: json.dumps([shared, shared, (shared,)]))
+def nest(n: int) -> list[object]:
+    x: list[object] = []
+    for _ in range(n):
+        x = [x]
+    return x
+trap("json-9997", lambda: len(json.dumps(nest(9997))))
+trap("json-9998", lambda: len(json.dumps(nest(9998))))
+trap("repr-150", lambda: len(repr(nest(150))))
+trap("repr-9998", lambda: len(repr(nest(9998))))
+trap("eq-9999", lambda: nest(9999) == nest(9999))
+trap("lt-9999", lambda: nest(9999) < nest(9999))
+t = (cyc,)
+cyc.append(t)
+dd: dict[str, object] = {}
+dd["self"] = dd
+dd["l"] = [dd, cyc]
+show(cyc, dd, f"{dd}")
+"#,
+    );
+}
+
+#[test]
+fn w5_12_native_stack_exhaustion_is_a_recursion_error() {
+    // A raised recursion limit no longer lets a deep recursion run the host
+    // stack into its guard page: the VM raises `RecursionError` near the
+    // end of whatever stack it runs on (here a deliberately small one).
+    let src = r#"import sys
+sys.setrecursionlimit(10**6)
+def f(n: int) -> int:
+    if n == 0:
+        return 0
+    return 1 + f(n - 1)
+try:
+    f(10**6)
+    print("finished")
+except RecursionError as e:
+    print("RecursionError", e)
+print(f(50))
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("deep.ty");
+    std::fs::write(&path, src).unwrap();
+    let code = std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn_scoped(scope, || run_file(&path, &[]))
+            .unwrap()
+            .join()
+            .unwrap()
+    });
+    assert_eq!(code.unwrap(), 0);
+}

@@ -160,6 +160,15 @@ pub struct Interpreter {
     /// frame a caught exception's `__traceback__` ends in, so a chained
     /// traceback names the catching function the way CPython's does.
     pub current_function: Option<Rc<Function>>,
+    /// Lowest native stack address a call may start at (0 = the platform
+    /// cannot report the stack, no check): below it a call raises
+    /// `RecursionError` rather than overflowing the host stack. See
+    /// `crate::stack`.
+    pub stack_floor: usize,
+    /// Lists and dicts whose `repr` is being built (CPython's
+    /// `Py_ReprEnter`): met again inside themselves they render as `[...]`
+    /// / `{...}`.
+    pub repr_active: std::collections::HashSet<usize>,
 }
 
 /// Upper bound on values an eagerly-evaluated generator may yield before the
@@ -278,6 +287,10 @@ impl Interpreter {
             method_cache: RefCell::new(HashMap::new()),
             running_loop_depth: 0,
             current_function: None,
+            repr_active: std::collections::HashSet::new(),
+            stack_floor: crate::stack::current_thread_stack()
+                .map(|(low, size)| low + crate::stack::safety_margin(size))
+                .unwrap_or(0),
         };
         crate::builtins::install(&mut interp);
         interp
@@ -653,9 +666,12 @@ impl Interpreter {
     /// Whether one more Python-level frame would exceed the recursion limit.
     /// CPython counts the module's own frame against `sys.getrecursionlimit()`
     /// (at the default 1000, 999 nested calls fit), so the VM's call depth
-    /// stops one short of the limit.
+    /// stops one short of the limit. The native-stack floor catches a raised
+    /// limit (`sys.setrecursionlimit(10**6)`) the host stack cannot hold:
+    /// CPython raises `RecursionError` there, where the VM used to abort.
     fn recursion_exhausted(&self) -> bool {
         self.stack_depth + 1 >= self.max_stack_depth
+            || (self.stack_floor != 0 && crate::stack::stack_pointer() < self.stack_floor)
     }
 
     /// Append a traceback frame for `function` to an escaping exception,
@@ -3527,7 +3543,7 @@ impl Interpreter {
                     return Ok(false);
                 }
                 let Some(_guard) = crate::value::structural_depth_enter() else {
-                    return Ok(false);
+                    return Err(comparison_recursion());
                 };
                 for i in 0..n {
                     // Re-borrow per element: an element's `__eq__` may touch
@@ -3550,7 +3566,7 @@ impl Interpreter {
                     return Ok(false);
                 }
                 let Some(_guard) = crate::value::structural_depth_enter() else {
-                    return Ok(false);
+                    return Err(comparison_recursion());
                 };
                 for (x, y) in a.iter().zip(b.iter()) {
                     if !x.same_identity(y) && !self.cmp_op(CmpOp::Eq, x, y)? {
@@ -3567,7 +3583,7 @@ impl Interpreter {
                     return Ok(false);
                 }
                 let Some(_guard) = crate::value::structural_depth_enter() else {
-                    return Ok(false);
+                    return Err(comparison_recursion());
                 };
                 let pairs: Vec<(HashKey, Value)> = a
                     .borrow()
@@ -3964,6 +3980,18 @@ impl Interpreter {
 
     fn cmp_op_non_set(&mut self, op: CmpOp, l: &Value, r: &Value) -> Result<bool, Unwind> {
         use std::cmp::Ordering::*;
+        // An ordering that came back `None` because the structural walk ran
+        // out of depth is CPython's `RecursionError`, not a type error.
+        let unorderable = |l: &Value, sym: &str, r: &Value| {
+            if crate::value::take_structural_overflow() {
+                comparison_recursion()
+            } else {
+                unorderable(l, sym, r)
+            }
+        };
+        if matches!(op, CmpOp::Lt | CmpOp::LtE | CmpOp::Gt | CmpOp::GtE) {
+            crate::value::take_structural_overflow();
+        }
         Ok(match op {
             CmpOp::Eq => self.eq_values(l, r)?,
             CmpOp::NotEq => !self.eq_values(l, r)?,
@@ -5579,9 +5607,9 @@ impl Interpreter {
     /// via `repr_of` (so user `__repr__` dunders dispatch on elements), with
     /// EXACT CPython formatting replicated from `Value::py_str`. Scalars and
     /// every other `Value` kind delegate to the existing dunder / `py_repr`
-    /// path unchanged. The depth cap falls back to `[...]` (CPython prints
-    /// the same for direct self-reference) so self-referential containers
-    /// don't blow the stack.
+    /// path unchanged. A list or dict met again inside itself renders as
+    /// `[...]` / `{...}` (CPython's `Py_ReprEnter`); nesting deeper than
+    /// CPython's C recursion budget raises its `RecursionError`.
     fn repr_of_depth(&mut self, v: &Value, depth: usize) -> Result<String, Unwind> {
         self.repr_of_depth_inner(v, depth, false)
     }
@@ -5595,18 +5623,39 @@ impl Interpreter {
         depth: usize,
         unwrap_frozen: bool,
     ) -> Result<String, Unwind> {
-        const MAX_REPR_DEPTH: usize = 100;
-        if depth >= MAX_REPR_DEPTH {
-            // CPython renders a self-referential container with a kind-specific
-            // ellipsis: `[...]` for lists, `{...}` for dicts/sets, `(...)` for
-            // tuples.
-            return Ok(match v {
-                Value::Tuple(_) => "(...)",
-                Value::Dict(_) | Value::Set(_) => "{...}",
-                _ => "[...]",
-            }
-            .to_string());
+        // `PyObject_Repr`'s `Py_EnterRecursiveCall`: CPython 3.13's C
+        // budget runs out at this nesting depth below a module-level `repr`.
+        const MAX_REPR_DEPTH: usize = 9998;
+        if depth >= MAX_REPR_DEPTH
+            || (self.stack_floor != 0 && crate::stack::stack_pointer() < self.stack_floor)
+        {
+            return Err(Unwind::Exception(VmException::new(
+                "RecursionError",
+                "maximum recursion depth exceeded while getting the repr of an object",
+            )));
         }
+        let active = match v {
+            Value::List(l) => Some((Rc::as_ptr(l) as *const () as usize, "[...]")),
+            Value::Dict(d) => Some((Rc::as_ptr(d) as *const () as usize, "{...}")),
+            _ => None,
+        };
+        if let Some((addr, placeholder)) = active {
+            if !self.repr_active.insert(addr) {
+                return Ok(placeholder.to_owned());
+            }
+            let out = self.repr_container(v, depth, unwrap_frozen);
+            self.repr_active.remove(&addr);
+            return out;
+        }
+        self.repr_container(v, depth, unwrap_frozen)
+    }
+
+    fn repr_container(
+        &mut self,
+        v: &Value,
+        depth: usize,
+        unwrap_frozen: bool,
+    ) -> Result<String, Unwind> {
         match v {
             // `<bound method Path.iterdir of PosixPath('/t')>` — the class
             // the method is *defined* on, and the receiver's own repr
@@ -6016,15 +6065,15 @@ impl Interpreter {
         if let (Str(a), Add, Str(b)) = (l, op, r) {
             return Ok(Str(Rc::new(format!("{}{}", a, b))));
         }
-        if let (Str(a), Mult, Int(n)) = (l, op, r) {
-            let n =
-                repeat_count_checked(a.len(), n, repeated_too_long("repeated string is too long"))?;
-            return Ok(Str(Rc::new(a.repeat(n))));
-        }
-        if let (Int(n), Mult, Str(a)) = (l, op, r) {
-            let n =
-                repeat_count_checked(a.len(), n, repeated_too_long("repeated string is too long"))?;
-            return Ok(Str(Rc::new(a.repeat(n))));
+        // The length limit counts characters, as CPython's does; a result
+        // that fits the limit but not memory is a `MemoryError`.
+        if let (Str(a), Mult, Int(n)) | (Int(n), Mult, Str(a)) = (l, op, r) {
+            let n = repeat_count_checked(
+                a.chars().count(),
+                n,
+                repeated_too_long("repeated string is too long"),
+            )?;
+            return Ok(Str(Rc::new(crate::limits::try_repeat_str(a, n)?)));
         }
 
         // Bytes: concatenation (`b"a" + b"b"`) and repetition (`b"a" * 3`).
@@ -6034,15 +6083,10 @@ impl Interpreter {
             out.extend_from_slice(b);
             return Ok(Bytes(Rc::new(out)));
         }
-        if let (Bytes(a), Mult, Int(n)) = (l, op, r) {
+        if let (Bytes(a), Mult, Int(n)) | (Int(n), Mult, Bytes(a)) = (l, op, r) {
             let n =
                 repeat_count_checked(a.len(), n, repeated_too_long("repeated bytes are too long"))?;
-            return Ok(Bytes(Rc::new(a.repeat(n))));
-        }
-        if let (Int(n), Mult, Bytes(a)) = (l, op, r) {
-            let n =
-                repeat_count_checked(a.len(), n, repeated_too_long("repeated bytes are too long"))?;
-            return Ok(Bytes(Rc::new(a.repeat(n))));
+            return Ok(Bytes(Rc::new(crate::limits::try_repeat_bytes(a, n)?)));
         }
 
         // Lists / tuples.
@@ -10564,30 +10608,31 @@ fn printf_format_with(
             }
             i += 1;
         }
-        // Width.
-        let mut width: Option<usize> = None;
-        while let Some(c) = chars.get(i) {
-            if let Some(d) = c.to_digit(10) {
-                width = Some(width.unwrap_or(0) * 10 + d as usize);
-                i += 1;
-            } else {
-                break;
+        // Width and precision: CPython refuses a width past `Py_ssize_t`
+        // ("width too big") and a precision past `INT_MAX` ("precision too
+        // big").
+        let printf_number = |i: &mut usize, what: &str, max: usize| -> Result<usize, Unwind> {
+            let mut n = 0usize;
+            while let Some(d) = chars.get(*i).and_then(|c| c.to_digit(10)) {
+                n = n.saturating_mul(10).saturating_add(d as usize);
+                if n > max {
+                    return Err(value_error(format!("{what} too big")));
+                }
+                *i += 1;
             }
-        }
-        // Precision.
+            Ok(n)
+        };
+        let width: Option<usize> = if chars.get(i).is_some_and(|c| c.is_ascii_digit()) {
+            let w = printf_number(&mut i, "width", isize::MAX as usize)?;
+            crate::limits::ensure_alloc(w)?;
+            Some(w)
+        } else {
+            None
+        };
         let mut precision: Option<usize> = None;
         if chars.get(i) == Some(&'.') {
             i += 1;
-            let mut p = 0usize;
-            while let Some(c) = chars.get(i) {
-                if let Some(d) = c.to_digit(10) {
-                    p = p * 10 + d as usize;
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
-            precision = Some(p);
+            precision = Some(printf_number(&mut i, "precision", i32::MAX as usize)?);
         }
         let conv = *chars
             .get(i)
@@ -10677,8 +10722,8 @@ fn printf_format_with(
                     "inf".to_owned()
                 } else {
                     let body = match conv {
-                        'e' => normalise_exp_notation(format!("{:.*e}", p, abs), false),
-                        'E' => normalise_exp_notation(format!("{:.*e}", p, abs), true),
+                        'e' => normalise_exp_notation(crate::limits::scientific(abs, p), false),
+                        'E' => normalise_exp_notation(crate::limits::scientific(abs, p), true),
                         'g' | 'G' => format_g(
                             abs,
                             if p == 0 { 1 } else { p },
@@ -10686,7 +10731,7 @@ fn printf_format_with(
                             false,
                             flag_alt,
                         ),
-                        _ => format!("{:.*}", p, abs),
+                        _ => crate::limits::fixed(abs, p),
                     };
                     if flag_alt {
                         ensure_decimal_point(&body)
@@ -10763,6 +10808,15 @@ fn pad_printf(body: &str, width: Option<usize>, left: bool, zero: bool, conv: ch
 
 fn overflow() -> Unwind {
     Unwind::Exception(VmException::new("OverflowError", "int overflow"))
+}
+
+/// CPython's `RecursionError` for a comparison nested past its C recursion
+/// budget (`a == b` on two 10,000-deep lists).
+fn comparison_recursion() -> Unwind {
+    Unwind::Exception(VmException::new(
+        "RecursionError",
+        "maximum recursion depth exceeded in comparison",
+    ))
 }
 
 /// Resolve a sequence-repetition count (`seq * n` / `n * seq`). CPython treats
@@ -12218,7 +12272,7 @@ fn ensure_decimal_point(s: &str) -> String {
 /// would strip and always leaves a decimal point.
 fn format_g(abs: f64, sig: usize, upper: bool, dot_0: bool, alt: bool) -> String {
     // Format in scientific notation to determine the exponent.
-    let sci = format!("{:.*e}", sig.saturating_sub(1), abs);
+    let sci = crate::limits::scientific(abs, sig.saturating_sub(1));
     // Parse out the exponent.
     let exp: i32 = if let Some(pos) = sci.find('e') {
         sci[pos + 1..].parse().unwrap_or(0)
@@ -12243,7 +12297,7 @@ fn format_g(abs: f64, sig: usize, upper: bool, dot_0: bool, alt: bool) -> String
     } else {
         // Fixed notation: format with enough decimal places, then strip zeros.
         let decimal_places = (sig as i32 - 1 - exp).max(0) as usize;
-        let fixed = format!("{:.*}", decimal_places, abs);
+        let fixed = crate::limits::fixed(abs, decimal_places);
         if alt {
             ensure_decimal_point(&fixed)
         } else if fixed.contains('.') {
@@ -12257,6 +12311,26 @@ fn format_g(abs: f64, sig: usize, upper: bool, dot_0: bool, alt: bool) -> String
         result.push_str(".0");
     }
     result
+}
+
+/// A width or precision in a format spec. CPython parses it into a
+/// `Py_ssize_t` and refuses one that overflows.
+fn spec_number(raw: &[char], i: &mut usize) -> Result<usize, Unwind> {
+    let mut n = 0usize;
+    while let Some(k) = raw.get(*i).and_then(|c| c.to_digit(10)) {
+        n = n
+            .checked_mul(10)
+            .and_then(|n| n.checked_add(k as usize))
+            .filter(|n| *n <= isize::MAX as usize)
+            .ok_or_else(|| {
+                Unwind::Exception(VmException::new(
+                    "ValueError",
+                    "Too many decimal digits in format string",
+                ))
+            })?;
+        *i += 1;
+    }
+    Ok(n)
 }
 
 fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, Unwind> {
@@ -12324,16 +12398,7 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
                 i += 1;
             }
             d if d.is_ascii_digit() => {
-                let mut n = 0usize;
-                while i < raw.len() {
-                    if let Some(k) = raw[i].to_digit(10) {
-                        n = n * 10 + k as usize;
-                        i += 1;
-                    } else {
-                        break;
-                    }
-                }
-                width = Some(n);
+                width = Some(spec_number(&raw, &mut i)?);
             }
             ',' => {
                 comma = true;
@@ -12345,16 +12410,7 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
             }
             '.' => {
                 i += 1;
-                let mut n = 0usize;
-                while i < raw.len() {
-                    if let Some(k) = raw[i].to_digit(10) {
-                        n = n * 10 + k as usize;
-                        i += 1;
-                    } else {
-                        break;
-                    }
-                }
-                precision = Some(n);
+                precision = Some(spec_number(&raw, &mut i)?);
             }
             _ => {
                 typ = Some(c);
@@ -12363,6 +12419,16 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
         }
     }
 
+    // A width the result cannot be padded to is CPython's `MemoryError`,
+    // and a float precision beyond a C `int` its "precision too big".
+    if let Some(w) = width {
+        crate::limits::ensure_alloc_items(w, fill.len_utf8())?;
+    }
+    if let (Some(p), Value::FloatData(_) | Value::Int(_) | Value::Bool(_)) = (precision, value) {
+        if !matches!(typ, Some('d' | 'n' | 'x' | 'X' | 'o' | 'b' | 'c' | 's')) {
+            crate::limits::check_float_precision(p)?;
+        }
+    }
     // The conversion type implies a *numeric* default alignment (right);
     // zero-pad implies fill='0' and align='=' (sign before pad). Strings
     // default to left-aligned. We approximate by tracking `is_numeric`.
@@ -12389,7 +12455,7 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
         } else if abs.is_infinite() {
             "inf%".to_owned()
         } else {
-            let digits = format!("{:.*}", p, abs);
+            let digits = crate::limits::fixed(abs, p);
             let digits = if alternate {
                 ensure_decimal_point(&digits)
             } else {
@@ -12456,7 +12522,7 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
                         // Rust's {:e} produces e.g. `3.141590e0`; CPython requires
                         // at least 2 exponent digits with an explicit sign: `3.141590e+00`.
                         let upper = typ == Some('E');
-                        let body = normalise_exp_notation(format!("{:.*e}", p, abs), upper);
+                        let body = normalise_exp_notation(crate::limits::scientific(abs, p), upper);
                         if alternate {
                             ensure_decimal_point(&body)
                         } else {
@@ -12483,8 +12549,8 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
                         let sig = if p == 0 { 1 } else { p };
                         format_g(abs, sig, false, true, alternate)
                     }
-                    _ if alternate => ensure_decimal_point(&format!("{:.*}", p, abs)),
-                    _ => format!("{:.*}", p, abs),
+                    _ if alternate => ensure_decimal_point(&crate::limits::fixed(abs, p)),
+                    _ => crate::limits::fixed(abs, p),
                 }
             };
             buf = if comma || underscore {

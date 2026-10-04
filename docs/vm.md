@@ -46,7 +46,10 @@ tyc run --compile --temp      # legacy with ephemeral build dir
   recursion (a 1000-frame limit by default, matching CPython's
   `sys.getrecursionlimit()`; `sys.setrecursionlimit(n)` moves it, rejecting
   `n < 1` with CPython's own `ValueError`, and exceeding it raises
-  `RecursionError`).
+  `RecursionError`). A raised limit is also bounded by the native stack the
+  VM runs on: about 30,000 nested calls under `tyc run` (a 256 MiB stack),
+  past which the VM raises `RecursionError` where CPython 3.13 — whose
+  Python-to-Python calls use no C stack — keeps going.
 - Classes: annotated fields (constructor synthesised at instantiation),
   explicit `__init__`, methods declared inside `class` body, methods
   declared in a sibling `impl Foo:` block (merged on the fly), single
@@ -329,6 +332,25 @@ encodes in `json` as its value, and it keeps its identity as a dict key.
 `IntFlag` and `Mode.FAST` for a plain mixin (CPython 3.12+). A
 `StrEnum`'s `auto()` is the lower-cased member name, and a second name
 bound to an existing value is an alias of that member.
+
+### Size limits raise, they do not abort (beta)
+
+Everywhere CPython reports a size problem as an exception, so does the VM;
+it used to abort (`memory allocation of … bytes failed`, exit 134) or
+panic (exit 101). `"a" * 2**62`, `bytes(2**62)`, `x.zfill(2**62)` / `ljust`
+/ `rjust` / `center`, `int.to_bytes(2**62)`, `os.urandom(2**62)` and an
+f-string or `format` width of `2**62` raise `MemoryError`; `bytes(2**63)`
+and `"x".ljust(2**63)` raise `OverflowError` with CPython's messages.
+Float precisions of 65,536 and more format exactly (Rust's formatter caps
+precision at `u16::MAX`); a precision past `INT_MAX` is `ValueError:
+precision too big`. `round(x, n)` returns `x` itself for `n > 323` and a
+signed zero for `n < -308`, as CPython does. `json.dumps` raises
+`ValueError: Circular reference detected` for a self-containing list or
+dict and `RecursionError` past 9,997 levels of nesting. `repr` renders a
+list or dict met again inside itself as `[...]` / `{...}` at any depth
+(it used to print `[...]` for any nesting past 100 levels) and raises
+`RecursionError` past 9,997 levels; comparing two structures that deep
+raises `RecursionError` (`==` used to answer `False`).
 
 ### Live dict views and checked iteration (beta)
 

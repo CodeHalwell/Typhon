@@ -313,6 +313,22 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   views (`keys()` / `values()` / `items()`) became live views of the dict
   rather than snapshots (`k in d.keys()` is a lookup), and `reversed()`
   of a list / dict is live while refusing non-sequences as CPython does.
+- **Oversized results raise instead of aborting `tyc run`** (W5-12).
+  `"a" * 2**62`, `bytes(2**62)`, `zfill` / `ljust` / `rjust` / `center`,
+  `to_bytes`, `os.urandom` and huge f-string / `format` widths aborted the
+  process (exit 134) and `bytes(2**63)` panicked; they now raise CPython's
+  `MemoryError` / `OverflowError`. Float precisions of 65,536 and more
+  panicked in Rust's formatter and now format exactly ("precision too big"
+  past `INT_MAX`); `round(x, n)` clamps `n` as CPython does. A
+  self-referential `json.dumps` overflowed the native stack and now
+  raises `ValueError: Circular reference detected` (`RecursionError`
+  past 9,997 levels). A raised `sys.setrecursionlimit` no longer lets deep
+  recursion overflow the native stack: the VM checks its remaining stack
+  on every call and raises `RecursionError`. `repr` of nested lists past
+  100 levels printed `[...]`; it now detects self-reference by identity,
+  as CPython does, and raises `RecursionError` only past CPython's depth,
+  where deep `==` / `<` likewise raise instead of answering `False` /
+  `TypeError`.
 - **One front end for every VM entry point** (W5-20). The entry program,
   imported sibling modules and the embedded stdlib shims all go through
   `tyc_syntax::preprocess::expand_and_preprocess_mapped` — the chain

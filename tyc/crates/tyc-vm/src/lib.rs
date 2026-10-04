@@ -32,8 +32,10 @@ pub mod ffi;
 pub mod hashes;
 pub mod interp;
 pub mod pyhash;
+pub mod limits;
 pub mod pyset;
 pub mod slots;
+mod stack;
 mod unicode_data;
 pub mod value;
 
