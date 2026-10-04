@@ -94,7 +94,19 @@ SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/tyc-knob.XXXXXX")"
 cleanup() { [ "$KEEP" = "1" ] || rm -rf "$SCRATCH"; }
 trap cleanup EXIT
 
-mapfile -t NAMES < <(find "$FIXTURES" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
+# `timeout` is GNU-only and called through `env`; see scripts/portable.sh.
+source "$(dirname "${BASH_SOURCE[0]}")/portable.sh"
+ensure_timeout "$SCRATCH/bin"
+
+# `-printf` is a GNU find extension (BSD find fails on it, which silently
+# yielded zero fixtures). `-exec basename` is POSIX and gives the same names.
+mapfile -t NAMES < <(find "$FIXTURES" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | sort)
+if [ ${#NAMES[@]} -eq 0 ]; then
+    echo "error: no knob fixtures found under $FIXTURES." >&2
+    echo "       Either there are none, or find failed (wrong working directory," >&2
+    echo "       unreadable tree). Refusing to report a vacuous matrix." >&2
+    exit 2
+fi
 if [ -n "$FILTER" ]; then
     mapfile -t NAMES < <(printf '%s\n' "${NAMES[@]}" | grep -E "$FILTER")
 fi

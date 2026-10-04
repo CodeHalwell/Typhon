@@ -1032,16 +1032,21 @@ impl Interpreter {
         // values). Re-entering a generator suspended in the body
         // continues with the live iterator, skipping the assignment
         // for that one iteration.
-        let (iter, mut resumed) = match self.pop_resume_frame() {
+        // Keep the raw iterable alongside the iteration state: if it is a
+        // generator, `make_iter` wraps it, and CPython finalises an abandoned
+        // generator when its last reference drops (see the loop epilogue).
+        let (iter, generator, mut resumed) = match self.pop_resume_frame() {
             None => {
                 let iterable = self.eval_expr(&s.iter, env)?;
-                (self.make_iter(iterable)?, false)
+                let generator = as_generator(&iterable);
+                (self.make_iter(iterable)?, generator, false)
             }
-            Some(ResumeFrame::ForBody { iter }) => (iter, true),
+            Some(ResumeFrame::ForBody { iter }) => (iter, None, true),
             Some(ResumeFrame::LoopElse) => return self.exec_loop_else(&s.orelse, env),
             Some(other) => return Err(resume_mismatch(&other)),
         };
         let mut completed = true;
+        let mut outcome: Result<(), Unwind> = Ok(());
         loop {
             if !resumed {
                 let Some(v) = self.iter_next(&iter)? else {
@@ -1058,12 +1063,49 @@ impl Interpreter {
                     break;
                 }
                 Err(Unwind::Yield(v)) => {
+                    // Suspended, not abandoned: the generator is still live
+                    // (its state is on the resume frame), so it must NOT be
+                    // finalised here.
                     self.record_suspend(ResumeFrame::ForBody { iter: iter.clone() });
                     return Err(Unwind::Yield(v));
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    outcome = Err(e);
+                    break;
+                }
             }
         }
+        // CPython finalises an abandoned generator the moment its last
+        // reference drops — running its `finally` blocks and `with` exits.
+        // The VM has no GC, so it does the equivalent at the one point it can
+        // observe the reference go away: the end of the loop that was
+        // iterating it, when that loop holds the only reference. A generator
+        // still referenced from a name (`it = iter(g())`) has a higher count
+        // here and is correctly left alone.
+        if generator.is_some() {
+            // The loop holds two references to a generator it iterates: the
+            // raw value kept above and the copy inside the iteration state.
+            // Drop the iteration state first, so a surviving count of 1 means
+            // the program itself holds no reference — the VM's stand-in for
+            // CPython's refcount reaching zero. A generator still bound to a
+            // name (`it = g()`) is left live, exactly as CPython leaves it.
+            drop(iter);
+        }
+        if let Some(g) = generator {
+            if Rc::strong_count(&g) == 1 {
+                match &outcome {
+                    // A clean break/exit: closing may legitimately raise
+                    // (`generator ignored GeneratorExit`), as CPython does.
+                    Ok(()) => self.generator_close(&g)?,
+                    // The body is already unwinding with an exception; run
+                    // the generator's cleanup but let the original error win.
+                    Err(_) => {
+                        let _ = self.generator_close(&g);
+                    }
+                }
+            }
+        }
+        outcome?;
         if completed && !s.orelse.is_empty() {
             self.exec_loop_else(&s.orelse, env)?;
         }
@@ -4843,25 +4885,18 @@ impl Interpreter {
         // snapshotting it into the instance would freeze an unbound copy.
         // Likewise skip an object whose type defines `__get__` — a
         // descriptor (`functools.partialmethod`, a hand-written one): it is
-        // read through the class so `__get__` sees the instance, and a
-        // per-instance assignment of the same name still wins.
-        let class_attrs: Vec<(String, Value)> = class
-            .class_attrs
-            .borrow()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        for (k, v) in class_attrs {
-            if k.starts_with("__typhon_") || matches!(v, Value::Function(_)) {
-                continue;
-            }
-            if let Value::Instance(d) = &v {
-                if self.find_method(&d.class, "__get__").is_some() {
-                    continue;
-                }
-            }
-            instance.fields.borrow_mut().insert(k, v);
-        }
+        // Class attributes are NOT copied onto the instance: CPython resolves
+        // them at read time (`instance.attr` -> instance dict -> class -> MRO),
+        // so `Counter.instances += 1` in `__init__` is visible through an
+        // already-built instance. Copying them here snapshotted the value at
+        // construction and made `Counter.instances` and `c.instances` disagree
+        // (W5-06). `class_attr` reads fall back to the class at :6534, which
+        // covers constants, `ClassVar`s and extension methods; a later
+        // per-instance assignment still wins because it lands in `fields`.
+        //
+        // The exception is data descriptors: a class attribute that defines
+        // `__get__`/`__set__` (a `property`) must stay on the class so the
+        // descriptor protocol runs on every access.
         // Custom __init__ wins.
         if let Some(init) = self.find_method(class, "__init__") {
             self.call_function(&init, args, kwargs, Some(Value::Instance(instance.clone())))?;

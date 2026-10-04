@@ -9,22 +9,34 @@
 # threshold (default 20%).
 #
 # Usage:
-#   scripts/perf-gate.sh             # measure + gate against committed baseline
-#   scripts/perf-gate.sh --update    # measure + overwrite the baseline median
+#   scripts/perf-gate.sh             # measure + gate against a same-run control
+#   scripts/perf-gate.sh --update    # measure + overwrite the reference baseline
 #   scripts/perf-gate.sh --check     # alias for the default (measure + gate)
+#   scripts/perf-gate.sh --control-ref REF   # git revision to build the control from
 #
 # Environment overrides:
 #   TYC_BIN          path to the release tyc binary (default: tyc/target/release/tyc)
 #   PERF_RUNS        number of timed runs (default: 9)
-#   PERF_WARMUP      number of untimed warmup runs (default: 2)
+#   PERF_WARMUP      number of untimed warmup runs per binary (default: 2)
 #   PERF_THRESHOLD   regression threshold as a fraction (default: 0.20 = 20%)
 #   PERF_BASELINE    path to baseline JSON (default: perf-baseline.json)
+#   PERF_CONTROL_BIN a prebuilt control binary (skips the control build)
+#   PERF_CONTROL_REF git revision for the control build (default: latest tag)
+#
+# Why a same-run control. Absolute milliseconds are a property of the machine,
+# not the compiler: a 22 ms committed baseline measured on one host reads as
+# +140% on another at the same revision. The gate therefore times the
+# candidate against a *control built in the same run* — by default the latest
+# release tag — interleaved so thermal drift hits both equally, and fails only
+# when the candidate is slower than the control by more than the threshold.
+# The committed baseline's absolute median is kept for reporting and for hosts
+# that have no control available (see the fallback below); it records which
+# machine produced it.
 #
 # Why a shell harness and not Criterion: the existing criterion benches
 # (tyc-syntax, tyc-db) measure individual passes in microseconds. This gate
 # measures the *whole* CLI build pipeline end-to-end on a realistic multi-file
-# project — the number a developer actually feels — and produces a single
-# median that CI can compare against a committed value. It is deliberately
+# project — the number a developer actually feels. It is deliberately
 # dependency-free (bash + python3 + jq, all present on CI) and adds no Rust
 # build targets, keeping it disjoint from concurrent compiler work.
 #
@@ -39,6 +51,13 @@ TYC_BIN="${TYC_BIN:-$ROOT/tyc/target/release/tyc}"
 PERF_RUNS="${PERF_RUNS:-9}"
 PERF_WARMUP="${PERF_WARMUP:-2}"
 PERF_THRESHOLD="${PERF_THRESHOLD:-0.20}"
+# The same-run control: a prebuilt binary if the caller has one, else built
+# from PERF_CONTROL_REF (default: the latest tag). Set PERF_CONTROL_BIN to a
+# non-existent path (or PERF_NO_CONTROL=1) to force the absolute-baseline
+# fallback.
+PERF_CONTROL_BIN="${PERF_CONTROL_BIN:-}"
+PERF_CONTROL_REF="${PERF_CONTROL_REF:-}"
+PERF_NO_CONTROL="${PERF_NO_CONTROL:-0}"
 # Absolute regression floor in milliseconds; see the comparison step. 10 ms
 # rather than 5: with a ~22 ms baseline the 20% band is under 5 ms, and a
 # shared runner's process-start jitter alone was tripping the gate on a
@@ -74,18 +93,26 @@ BUILD_FLAGS=(build "$CORPUS" --no-sync --check --no-format)
 export TYC_NO_INTROSPECT=1
 
 MODE="check"
-case "${1:-}" in
-  --update) MODE="update" ;;
-  --check | "") MODE="check" ;;
-  -h | --help)
-    sed -n '2,33p' "${BASH_SOURCE[0]}"
-    exit 0
-    ;;
-  *)
-    echo "perf-gate.sh: unknown argument '$1' (use --check or --update)" >&2
-    exit 2
-    ;;
-esac
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --update) MODE="update"; shift ;;
+    --check) MODE="check"; shift ;;
+    --control-ref) PERF_CONTROL_REF="$2"; shift 2 ;;
+    --no-control) PERF_NO_CONTROL=1; shift ;;
+    -h | --help)
+      sed -n '2,40p' "${BASH_SOURCE[0]}"
+      exit 0
+      ;;
+    *)
+      echo "perf-gate.sh: unknown argument '$1' (use --check, --update, --control-ref REF or --no-control)" >&2
+      exit 2
+      ;;
+  esac
+done
+
+SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/tyc-perf.XXXXXX")"
+cleanup() { rm -rf "$SCRATCH"; }
+trap cleanup EXIT
 
 # --- Preflight ------------------------------------------------------------
 if [[ ! -x "$TYC_BIN" ]]; then
@@ -115,25 +142,69 @@ if ! "$TYC_BIN" "${BUILD_FLAGS[@]}" >/dev/null 2>"$ROOT/.perf-gate-stderr.log"; 
 fi
 rm -f "$ROOT/.perf-gate-stderr.log"
 
+# --- Same-run control -----------------------------------------------------
+# A control binary lets the gate compare like with like on any host. Prefer a
+# caller-supplied one; otherwise build the reference revision into a scratch
+# target dir so the working tree's `tyc/target` is untouched.
+CONTROL_BIN=""
+CONTROL_DESC=""
+if [[ "$PERF_NO_CONTROL" != "1" ]]; then
+  if [[ -n "$PERF_CONTROL_BIN" && -x "$PERF_CONTROL_BIN" ]]; then
+    CONTROL_BIN="$PERF_CONTROL_BIN"
+    CONTROL_DESC="supplied $PERF_CONTROL_BIN"
+  elif [[ "$MODE" != "update" ]]; then
+    ref="$PERF_CONTROL_REF"
+    if [[ -z "$ref" ]]; then
+      ref="$(git -C "$ROOT" describe --tags --abbrev=0 2>/dev/null || true)"
+    fi
+    if [[ -n "$ref" ]]; then
+      echo "perf-gate: building control from $ref into $SCRATCH/target (one-off)…"
+      control_src="$SCRATCH/control-src"
+      if git -C "$ROOT" worktree add --detach "$control_src" "$ref" >/dev/null 2>&1; then
+        if CARGO_TARGET_DIR="$SCRATCH/target" \
+             bash -c "cd '$control_src/tyc' && cargo build --release --bin tyc" >/dev/null 2>&1; then
+          CONTROL_BIN="$SCRATCH/target/release/tyc"
+          CONTROL_DESC="built from $ref"
+        fi
+        git -C "$ROOT" worktree remove --force "$control_src" >/dev/null 2>&1 || true
+      fi
+    fi
+  fi
+fi
+if [[ -n "$CONTROL_BIN" ]]; then
+  echo "perf-gate: control=$CONTROL_DESC"
+else
+  echo "perf-gate: control=unavailable — falling back to the absolute baseline"
+fi
+
 # --- Warmup (fills OS/page caches; not timed) -----------------------------
 for ((i = 0; i < PERF_WARMUP; i++)); do
   "$TYC_BIN" "${BUILD_FLAGS[@]}" >/dev/null 2>&1
+  [[ -n "$CONTROL_BIN" ]] && "$CONTROL_BIN" "${BUILD_FLAGS[@]}" >/dev/null 2>&1
 done
 
 # --- Timed runs -----------------------------------------------------------
-samples=()
-for ((i = 0; i < PERF_RUNS; i++)); do
-  # Time the run in Python (already a required dependency): `date +%s%N` is a
-  # GNU extension and emits a literal `%N` on macOS/BSD `date`, breaking the
-  # arithmetic. `time.perf_counter()` is portable and monotonic.
-  ms=$(python3 -c 'import time, subprocess, sys
+# Interleave candidate and control so thermal drift and page-cache state hit
+# both equally. Time the run in Python: `date +%s%N` is a GNU extension that
+# emits a literal `%N` on macOS/BSD `date`. `time.perf_counter()` is portable.
+time_run() {
+  python3 -c 'import time, subprocess, sys
 t0 = time.perf_counter()
 subprocess.run([sys.argv[1], *sys.argv[2:]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-print(int((time.perf_counter() - t0) * 1000))' "$TYC_BIN" "${BUILD_FLAGS[@]}")
-  samples+=("$ms")
+print(int((time.perf_counter() - t0) * 1000))' "$1" "${BUILD_FLAGS[@]}"
+}
+
+samples=()
+control_samples=()
+for ((i = 0; i < PERF_RUNS; i++)); do
+  samples+=("$(time_run "$TYC_BIN")")
+  if [[ -n "$CONTROL_BIN" ]]; then
+    control_samples+=("$(time_run "$CONTROL_BIN")")
+  fi
 done
 
 echo "perf-gate: samples (ms) = ${samples[*]}"
+[[ -n "$CONTROL_BIN" ]] && echo "perf-gate: control samples (ms) = ${control_samples[*]}"
 
 # --- Median (python3: robust integer median, plus min/max for reporting) --
 read -r MEDIAN MIN MAX <<<"$(python3 - "${samples[@]}" <<'PY'
@@ -144,8 +215,26 @@ PY
 )"
 echo "perf-gate: measured median=${MEDIAN}ms (min=${MIN}ms max=${MAX}ms)"
 
+CONTROL_MEDIAN=""
+if [[ -n "$CONTROL_BIN" ]]; then
+  CONTROL_MEDIAN="$(python3 - "${control_samples[@]}" <<'PY'
+import sys, statistics
+xs = sorted(int(x) for x in sys.argv[1:])
+print(int(statistics.median(xs)))
+PY
+)"
+  echo "perf-gate: control median=${CONTROL_MEDIAN}ms"
+fi
+
 # --- Update mode: write the baseline and exit -----------------------------
 if [[ "$MODE" == "update" ]]; then
+  # Record the host, so a reader knows which machine the absolute median
+  # belongs to. The same-run control is the cross-host verdict; this is for
+  # reporting and the no-control fallback.
+  HOST_DESC="$(uname -sm 2>/dev/null || echo unknown)"
+  HOST_DESC="$HOST_DESC / $(sysctl -n machdep.cpu.brand_string 2>/dev/null \
+    || grep -m1 'model name' /proc/cpuinfo 2>/dev/null | sed 's/.*: //' \
+    || echo 'unknown cpu')"
   tmp="$(mktemp)"
   if [[ -f "$PERF_BASELINE" ]]; then
     jq \
@@ -154,11 +243,13 @@ if [[ "$MODE" == "update" ]]; then
       --argjson runs "$PERF_RUNS" \
       --argjson threshold "$PERF_THRESHOLD" \
       --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      --arg host "$HOST_DESC" \
       '.median_ms = $median
        | .corpus = $corpus
        | .runs = $runs
        | .threshold = $threshold
-       | .recorded_utc = $date' \
+       | .recorded_utc = $date
+       | .recorded_host = $host' \
       "$PERF_BASELINE" >"$tmp"
   else
     cat >"$tmp" <<EOF
@@ -167,12 +258,13 @@ if [[ "$MODE" == "update" ]]; then
   "corpus": "$CORPUS_REL",
   "runs": $PERF_RUNS,
   "threshold": $PERF_THRESHOLD,
-  "recorded_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  "recorded_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "recorded_host": "$HOST_DESC"
 }
 EOF
   fi
   mv "$tmp" "$PERF_BASELINE"
-  echo "perf-gate: baseline updated -> $PERF_BASELINE (median_ms=$MEDIAN)"
+  echo "perf-gate: baseline updated -> $PERF_BASELINE (median_ms=$MEDIAN on $HOST_DESC)"
   exit 0
 fi
 
@@ -184,30 +276,50 @@ fi
 
 BASELINE_MS="$(jq -r '.median_ms' "$PERF_BASELINE")"
 
-# Compute limit = baseline * (1 + threshold), the verdict, and a readable
-# report in python3 (no float math in bash).
-python3 - "$MEDIAN" "$BASELINE_MS" "$PERF_THRESHOLD" "$PERF_MIN_SLACK_MS" <<'PY'
+# Verdict. With a same-run control the comparison is candidate-vs-control on
+# this host, which is the only number that isolates the compiler change; the
+# committed absolute median is then reporting only. Without a control, fall
+# back to the absolute baseline plus an absolute slack floor — and say so,
+# because on a host other than the recording one that verdict is a property of
+# the machine, not the tree.
+python3 - "$MEDIAN" "$BASELINE_MS" "$PERF_THRESHOLD" "$PERF_MIN_SLACK_MS" \
+         "${CONTROL_MEDIAN:-}" <<'PY'
 import sys
 median = float(sys.argv[1])
 baseline = float(sys.argv[2])
 threshold = float(sys.argv[3])
 min_slack = float(sys.argv[4])
-# Absolute floor on top of the percentage. Now that the Python-subprocess time
-# is excluded the median is small (tens of ms), and at that scale a percentage
-# alone is dominated by process-start jitter on a shared CI runner — a 3 ms
-# hiccup would read as a 20% regression. Require the regression to clear both
-# the percentage and an absolute slack before failing.
-limit = max(baseline * (1.0 + threshold), baseline + min_slack)
-delta = (median - baseline) / baseline * 100.0 if baseline else 0.0
-print(f"perf-gate: baseline={baseline:.0f}ms  measured={median:.0f}ms  "
-      f"delta={delta:+.1f}%  limit={limit:.0f}ms "
-      f"(+{threshold*100:.0f}%, min slack {min_slack:.0f}ms)")
-if median > limit:
-    print(f"perf-gate: FAIL — build pipeline regressed {delta:+.1f}% "
-          f"(> +{threshold*100:.0f}% threshold).")
-    print("perf-gate: if this is an intentional, justified change, refresh the "
-          "baseline with 'scripts/perf-gate.sh --update' and commit "
-          "perf-baseline.json.")
-    sys.exit(1)
-print("perf-gate: PASS — within threshold.")
+control = float(sys.argv[5]) if sys.argv[5] else None
+
+if control is not None:
+    ratio = median / control if control else 0.0
+    delta = (ratio - 1.0) * 100.0
+    print(f"perf-gate: candidate={median:.0f}ms  control={control:.0f}ms  "
+          f"delta={delta:+.1f}%  (committed baseline {baseline:.0f}ms, reporting only)")
+    if ratio > 1.0 + threshold:
+        print(f"perf-gate: FAIL — candidate is {delta:+.1f}% slower than the "
+              f"same-run control (> +{threshold*100:.0f}%).")
+        print("perf-gate: this is a real regression in the tree, not host drift. "
+              "Fix it, or if intentional refresh the reference with "
+              "'scripts/perf-gate.sh --update'.")
+        sys.exit(1)
+    print("perf-gate: PASS — within threshold of the same-run control.")
+else:
+    # Absolute-baseline fallback (no control could be built or supplied).
+    limit = max(baseline * (1.0 + threshold), baseline + min_slack)
+    delta = (median - baseline) / baseline * 100.0 if baseline else 0.0
+    print(f"perf-gate: baseline={baseline:.0f}ms  measured={median:.0f}ms  "
+          f"delta={delta:+.1f}%  limit={limit:.0f}ms "
+          f"(+{threshold*100:.0f}%, min slack {min_slack:.0f}ms)")
+    if median > limit:
+        print(f"perf-gate: FAIL — build pipeline regressed {delta:+.1f}% "
+              f"(> +{threshold*100:.0f}% threshold).")
+        print("perf-gate: NOTE this compares against an absolute baseline recorded "
+              "on a different machine; if the tree is unchanged, treat it as host "
+              "drift and build a control (--control-ref REF) instead.")
+        print("perf-gate: if this is an intentional, justified change, refresh the "
+              "baseline with 'scripts/perf-gate.sh --update' and commit "
+              "perf-baseline.json.")
+        sys.exit(1)
+    print("perf-gate: PASS — within threshold.")
 PY
