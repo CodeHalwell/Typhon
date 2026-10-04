@@ -451,7 +451,7 @@ print(__typhon_ext_str__slug__(make()))
 print(__typhon_ext_str__slug__(self.title))
 ```
 
-Only call sites whose receiver's static type is known to be `str` get rewritten — an annotated or evidently-initialised binding, a literal or f-string, a field / property of a known class, a call whose declared return is `str` (same-module or imported, `impl` methods, chained extension calls, an awaited `async def`), a subscript on a `list[str]` / `dict[K, str]`, or a loop / comprehension variable. A `match` capture, an unannotated lambda parameter or a `with … as` target is left alone and raises `AttributeError` at runtime. No monkey-patching. `extend list[int]:` (parametric target) → `tyc::extend_builtin`; use `extend list:`.
+Only call sites whose receiver's static type is known to be `str` get rewritten — an annotated or evidently-initialised binding, a literal or f-string, a field / property of a known class, a call whose declared return is `str` (same-module or imported, `impl` methods, chained extension calls, an awaited `async def`), a subscript on a `list[str]` / `dict[K, str]`, a loop / comprehension variable, a contextually typed lambda parameter, or a typed match capture. An untyped match capture, a lambda parameter without a contextual `Callable` type or a `with … as` target is left alone and raises `AttributeError` at runtime. No monkey-patching. `extend list[int]:` (parametric target) → `tyc::extend_builtin`; use `extend list:`.
 
 ### 3.10 Field default ordering (v0.7.0)
 

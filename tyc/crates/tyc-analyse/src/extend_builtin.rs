@@ -267,7 +267,13 @@ impl StaticType {
                     match a {
                         Expr::EllipsisLiteral(_) => args.push(Self::simple("...")),
                         // A `Callable`'s parameter list; never a type.
-                        Expr::List(_) => args.push(Self::unknown()),
+                        Expr::List(l) => args.push(Self::with_args(
+                            "parameters",
+                            l.elts
+                                .iter()
+                                .map(|e| Self::from_annotation(e).unwrap_or_else(Self::unknown))
+                                .collect(),
+                        )),
                         other => match Self::from_annotation(other) {
                             Some(t) => args.push(t),
                             None => {
@@ -1933,7 +1939,8 @@ impl Walker<'_> {
             }
             Stmt::AnnAssign(mut a) => {
                 if let Some(v) = a.value.as_mut() {
-                    self.expr(v, env);
+                    let expected = StaticType::from_annotation(&a.annotation);
+                    self.expr_expected(v, env, expected.as_ref());
                 }
                 if let Expr::Name(n) = a.target.as_ref() {
                     env.bind_declared(n.id.as_str(), StaticType::from_annotation(&a.annotation));
@@ -2100,17 +2107,112 @@ impl Walker<'_> {
                 for case in &mut m.cases {
                     let mut captures = HashSet::new();
                     collect_pattern_captures(&case.pattern, &mut captures);
+                    let mut case_env = Env::nested(env);
                     for name in &captures {
-                        env.bind_unknown(name);
+                        case_env.bind_unknown(name);
                     }
+                    let subject = self.ctx.receiver_type(&m.subject, env);
+                    self.bind_pattern(&case.pattern, subject.as_ref(), &mut case_env);
                     if let Some(g) = case.guard.as_mut() {
-                        self.expr(g, env);
+                        self.expr(g, &mut case_env);
                     }
-                    case.body = self.block(std::mem::take(&mut case.body), env);
+                    case.body = self.block(std::mem::take(&mut case.body), &mut case_env);
                 }
                 Stmt::Match(m)
             }
             other => other,
+        }
+    }
+
+    fn expr_expected(&mut self, expr: &mut Expr, env: &mut Env, expected: Option<&StaticType>) {
+        if let (Expr::Lambda(l), Some(expected)) = (&mut *expr, expected) {
+            if expected.head.rsplit('.').next() == Some("Callable") {
+                let mut local = Env::nested(env);
+                if let Some(params) = l.parameters.as_deref() {
+                    let types = expected.args.first().filter(|t| t.head == "parameters");
+                    for (i, param) in params
+                        .posonlyargs
+                        .iter()
+                        .chain(params.args.iter())
+                        .enumerate()
+                    {
+                        local.bind_declared(
+                            param.parameter.name.as_str(),
+                            types.and_then(|t| t.args.get(i)).cloned(),
+                        );
+                    }
+                    for param in &params.kwonlyargs {
+                        local.bind_unknown(param.parameter.name.as_str());
+                    }
+                    if let Some(p) = &params.vararg {
+                        local.bind_unknown(p.name.as_str());
+                    }
+                    if let Some(p) = &params.kwarg {
+                        local.bind_unknown(p.name.as_str());
+                    }
+                }
+                self.expr_expected(&mut l.body, &mut local, expected.args.get(1));
+                return;
+            }
+        }
+        self.expr(expr, env);
+    }
+
+    fn bind_pattern(&self, pattern: &Pattern, ty: Option<&StaticType>, env: &mut Env) {
+        match pattern {
+            Pattern::MatchAs(p) => {
+                if let Some(name) = &p.name {
+                    env.bind_declared(name.as_str(), ty.cloned());
+                }
+                if let Some(inner) = &p.pattern {
+                    self.bind_pattern(inner, ty, env);
+                }
+            }
+            Pattern::MatchSequence(p) => {
+                for (i, inner) in p.patterns.iter().enumerate() {
+                    let elem = ty.and_then(|t| {
+                        if t.head == "tuple" {
+                            t.args.get(i)
+                        } else {
+                            t.args.first()
+                        }
+                    });
+                    if let Pattern::MatchStar(star) = inner {
+                        if let Some(name) = &star.name {
+                            env.bind_declared(
+                                name.as_str(),
+                                elem.cloned()
+                                    .map(|t| StaticType::with_args("list", vec![t])),
+                            );
+                        }
+                    } else {
+                        self.bind_pattern(inner, elem, env);
+                    }
+                }
+            }
+            Pattern::MatchMapping(p) => {
+                for inner in &p.patterns {
+                    self.bind_pattern(inner, ty.and_then(|t| t.args.get(1)), env);
+                }
+                if let Some(name) = &p.rest {
+                    env.bind_declared(name.as_str(), ty.cloned());
+                }
+            }
+            Pattern::MatchClass(p) => {
+                let owner = dotted_name(&p.cls).map(StaticType::simple);
+                for kw in &p.arguments.keywords {
+                    let field = owner
+                        .as_ref()
+                        .and_then(|t| self.ctx.class_member(t, kw.attr.as_str(), Member::Field));
+                    self.bind_pattern(&kw.pattern, field.as_ref(), env);
+                }
+            }
+            Pattern::MatchOr(p) => {
+                for inner in &p.patterns {
+                    self.bind_pattern(inner, ty, env);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2356,6 +2458,30 @@ mod tests {
         let (registry, _) = extract_builtin_extensions(&mut m);
         let (rewrites, _) = rewrite_builtin_extension_calls_with_facts(&mut m, &registry, external);
         (rewrites, tyc_emit::emit_python(&m))
+    }
+
+    #[test]
+    fn review_contextual_lambda_and_pattern_captures() {
+        let (_, emitted) = rewrite(
+            r###"from typing import Callable
+extend str:
+    def shout(self) -> str:
+        return self.upper()
+let f: Callable[[str], str] = lambda x: x.shout()
+let values: list[str] = ["ok"]
+match values:
+    case [item]:
+        print(item.shout())
+"###,
+        );
+        assert!(
+            emitted.contains("__typhon_ext_str__shout__(x)"),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("__typhon_ext_str__shout__(item)"),
+            "{emitted}"
+        );
     }
 
     const SLUG: &str = "extend str:\n    def slug(self) -> str:\n        return self.lower()\n\n";
