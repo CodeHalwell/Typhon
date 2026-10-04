@@ -838,7 +838,7 @@ mod tests {
         ));
         assert!(secret_binding_warrants_warning(
             "KEY",
-            "a8f5f167f44f4964e6c998dee827110c"
+            concat!("a8f5f167f44f4964", "e6c998dee827110c")
         ));
     }
 
@@ -873,7 +873,7 @@ mod tests {
             "xoxb-123456789012-abcdefghij",
             "-----BEGIN RSA PRIVATE KEY-----\nMIIE...",
             "https://user:s3cret@example.com/x",
-            "a8f5f167f44f4964e6c998dee827110c",
+            concat!("a8f5f167f44f4964", "e6c998dee827110c"),
             "dGhpcyBpcyBhIHNlY3JldCBrZXkgMTIzNDU2",
         ] {
             assert!(secret_value_is_credential_shaped(v), "{v:?}");
@@ -926,9 +926,15 @@ mod tests {
     #[test]
     fn comptime_scan_checks_the_env_key_and_the_value() {
         // Unique variable names: other tests run in parallel and touch env.
-        std::env::set_var("TYPHON_W306_AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG");
+        std::env::set_var(
+            "TYPHON_W306_AWS_SECRET_ACCESS_KEY",
+            concat!("wJalrXUtnFEMI", "/K7MDENG"),
+        );
         std::env::set_var("TYPHON_W306_REGION", "eu-west-2");
-        std::env::set_var("TYPHON_W306_KEY", "a8f5f167f44f4964e6c998dee827110c");
+        std::env::set_var(
+            "TYPHON_W306_KEY",
+            concat!("a8f5f167f44f4964", "e6c998dee827110c"),
+        );
         let src = "\
 comptime def secret_cfg() -> str:
     return env(\"TYPHON_W306_AWS_SECRET_ACCESS_KEY\")

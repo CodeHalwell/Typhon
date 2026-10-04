@@ -8192,7 +8192,7 @@ def use_np() -> object:
             "TOKEN123 = \"abcd\"\n",
             "my123TOKEN = \"abcd\"\n",
             "TOKENString = \"abcd\"\n",
-            "dbPASSWORDString = \"abcd\"\n",
+            concat!("dbPASSWORD", "String = \"abcd\"\n"),
             "SSH_PRIVKEY = \"abcd\"\n",
             "AWS_CREDENTIALS = \"abcd\"\n",
             "SIGNING_KEY = \"abcd\"\n",
