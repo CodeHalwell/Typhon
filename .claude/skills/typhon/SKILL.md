@@ -1207,6 +1207,8 @@ await task                          # later
 
 Multi-line `go expr(...)` parses (v0.7.0).
 
+`go` needs a coroutine. `go f(x)` where `f` is a plain `def` — in the same module, or imported from a `.ty` module — is a `tyc::type_mismatch` ("`go` needs a coroutine, but `f(x)` returns `T`"); at runtime it raised `TypeError: a coroutine was expected`. Introspected third-party callables of unknown asyncness are not checked.
+
 ### Async-callable awaits (v0.7.0)
 
 ```python
@@ -1310,7 +1312,7 @@ SHIPS_AUTH: bool = True
 
 ### Secret-shape literal warning
 
-`tyc::contains_secret_literal` (warn) fires when a `comptime let` binding's name matches `*KEY`, `*TOKEN`, `*PASSWORD`, `*SECRET`, `*PASS`, `*PWD` — the build artifact would contain the resolved env-var value as a string literal. Read at runtime via `os.environ[...]` instead.
+`tyc::contains_secret_literal` (warn) fires in two places, both silenced by `[strictness] allow-secret-comptime`: `tyc check` flags a binding initialised from a bare string literal whose name names a credential (`API_KEY = "sk-…"`), and `tyc build` flags a `comptime let` whose string value reads `env("…")` — the emitted Python would contain the resolved value. A name names a credential when, split into words (underscores, digits, camelCase, squashed acronyms), it contains a credential noun (`PASSWORD`, `SECRET`, `TOKEN`, `CREDENTIAL`, …) or a key noun (`KEY`, `PASS`, `PWD`, `PIN`) after a secret qualifier (`API`, `ACCESS`, `DB`, `PRIVATE`, …); metadata words (`TOKEN_LIMIT`, `API_KEY_HEADER`), counting words (`MAX_TOKENS`) and non-secret qualifiers (`PUBLIC_KEY`, `PRIMARY_KEY`) do not; ambiguous names (`STRIPE_KEY`, `DATABASE_DSN`) let the value decide, and placeholder values are skipped. Read secrets at runtime via `os.environ[...]` instead. Full rules: `docs/diagnostics/contains_secret_literal.md`.
 
 ---
 
@@ -1637,7 +1639,7 @@ The recurring diagnostic codes and what they actually mean. **See [DIAGNOSTICS.m
 | `tyc::pub_star_outside_init` (advice) | (v0.7.0) `pub *` outside `__init__.ty` is a no-op | Move to `__init__.ty` or remove |
 | `tyc::typevar_import_rejected` | `from typing import TypeVar` | Use PEP 695 (`def f[T](...)`) |
 | `tyc::typing_alias_deprecated` | `from typing import List/Dict/...` | Use lowercase built-ins |
-| `tyc::contains_secret_literal` (warn) | `comptime let *KEY/TOKEN/PASSWORD/SECRET = env(...)` would inline a secret | Read at runtime via `os.environ[...]` |
+| `tyc::contains_secret_literal` (warn) | A credential-named binding holds a string literal, or a `comptime let` reads `env("…")` and would inline the secret | Read at runtime via `os.environ[...]` |
 | `tyc::comptime` | Required env var unset at build time | Set the env var or remove from `[env] required` |
 | `tyc::cyclic_type_alias` | `type A = B; type B = A` | Anchor one alias to a concrete type |
 | `tyc::class_attr_shadows_slot` (warn) | `class` body with only annotated defaults reads like a constants namespace but emits slot descriptors | Use `ClassVar[T]`, or `pass` body for nullary variants |
