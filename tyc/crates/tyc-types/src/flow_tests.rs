@@ -924,6 +924,76 @@ def m(xs: list[int?]) -> int:
     );
 }
 
+#[test]
+fn w1_06_07_a_dead_loop_tail_does_not_reach_the_loop_head() {
+    // Statements after an unconditional `break` / `return` / `continue` /
+    // `raise` never run, so they cannot widen the state at the loop head.
+    assert_clean(
+        r#"
+class B:
+    v: int?
+def f(flag: bool) -> int:
+    mut x: int? = 1
+    while flag:
+        break
+        x = None
+    return x
+def g(xs: list[int]) -> int:
+    mut x: int? = 1
+    for _ in xs:
+        break
+        x = None
+    return x
+def h(flag: bool) -> int:
+    mut x: int? = 1
+    while flag:
+        return 2
+        x = None
+    return x
+def k(xs: list[int]) -> int:
+    mut x: int? = 1
+    for _ in xs:
+        continue
+        x = None
+    return x
+def m(flag: bool) -> int:
+    mut x: int? = 1
+    while flag:
+        if flag:
+            break
+        else:
+            raise ValueError("stop")
+        x = None
+    return x
+def n(b: B, flag: bool) -> int:
+    if b.v is not None:
+        while flag:
+            break
+            b.v = None
+        return b.v + 1
+    return 0
+def p(xs: list[int]) -> int:
+    for v in xs:
+        let y: int = v
+        break
+    else:
+        return 0
+    return y
+"#,
+    );
+    // A tail that is reachable still reaches the head, and the state at a
+    // `break` / `continue` still flows on.
+    for body in [
+        "    while flag:\n        if flag:\n            break\n        x = None\n",
+        "    while flag:\n        x = None\n        break\n",
+        "    for _ in range(3):\n        x = None\n        continue\n",
+    ] {
+        assert_rejected(&format!(
+            "def f(flag: bool) -> int:\n    mut x: int? = 1\n{body}    return x\n"
+        ));
+    }
+}
+
 // ── W1-08: invalidation gaps ──────────────────────────────────────────────
 
 const CLEAR: &str = r#"

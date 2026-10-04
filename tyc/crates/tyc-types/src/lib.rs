@@ -2771,6 +2771,27 @@ struct LoopExits {
     continues: Vec<TypeEnv>,
 }
 
+/// The envs reaching a loop's head once its body has been checked (`c.env`
+/// is the env at the end of the body): the pre-loop env, every `continue`,
+/// and the end of the body. When a statement in the body always leaves it
+/// (`break` / `continue` / `return` / `raise`), whatever follows is dead and
+/// its end never reaches the head — `while f: break; x = None` must not
+/// widen `x` — so it contributes its declarations but no narrowings.
+fn loop_head_states(
+    c: &Checker,
+    body: &[Stmt],
+    pre_loop: TypeEnv,
+    continues: Vec<TypeEnv>,
+) -> Vec<TypeEnv> {
+    let mut body_end = c.env.snapshot();
+    if body.iter().any(stmt_always_exits) {
+        body_end.take_narrowings_from(&pre_loop);
+    }
+    let mut states = vec![body_end, pre_loop];
+    states.extend(continues);
+    states
+}
+
 /// The join of `states` — a narrowing survives only where every state
 /// agrees on it ([`TypeEnv::intersect_narrowings`]). `None` when there are
 /// none (the point is unreachable).
@@ -3076,6 +3097,29 @@ impl TypeEnv {
         }
         self.attr_narrowings
             .retain(|k, v| other.attr_narrowings.get(k) == Some(v));
+    }
+
+    /// Replace `self`'s narrowings with `other`'s, keeping `self`'s bindings:
+    /// one `other` shares (same declaration) takes its narrowed type, any
+    /// other is widened to its declared type. For an env whose own flow is
+    /// dead — the end of a loop body after an unconditional `break` — so it
+    /// contributes its declarations to a join but none of its narrowings.
+    fn take_narrowings_from(&mut self, other: &TypeEnv) {
+        for (i, scope) in self.scopes.iter_mut().enumerate() {
+            let other_scope = other.scopes.get(i);
+            if other_scope.is_some_and(|o| Rc::ptr_eq(scope, o)) {
+                continue;
+            }
+            for (name, b) in Rc::make_mut(scope).iter_mut() {
+                b.narrowed = match other_scope.and_then(|s| s.get(name)) {
+                    Some(ob) if ob.span == b.span && ob.declared == b.declared => {
+                        ob.narrowed.clone()
+                    }
+                    _ => b.declared.clone(),
+                };
+            }
+        }
+        self.attr_narrowings = other.attr_narrowings.clone();
     }
 
     /// Overlay onto `self` the binding and narrowing changes a `finally` block
@@ -12941,11 +12985,14 @@ fn collect_reassigned_names(stmts: &[Stmt], acc: &mut LoopReassigned) {
                     }
                 }
             }
-            // An unconditional exit ends this block's contribution to the
-            // back-edge: statements after it can't carry a value to the next
-            // iteration, so stop collecting here.
-            Stmt::Break(_) | Stmt::Return(_) | Stmt::Raise(_) | Stmt::Continue(_) => return,
             _ => {}
+        }
+        // An unconditional exit — a bare `break` / `return` / `raise` /
+        // `continue`, or a compound statement every branch of which leaves —
+        // ends this block's contribution to the back-edge: statements after
+        // it can't carry a value to the next iteration, so stop collecting.
+        if stmt_always_exits(s) {
+            return;
         }
     }
 }
@@ -15342,8 +15389,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // invalidated survive the loop: `while running: x = None` left a
             // pre-loop `x: int` narrowing in force after it (review
             // 2026-10-03, W1-07).
-            let mut head_states = vec![c.env.snapshot(), pre_loop];
-            head_states.extend(exits.continues);
+            let head_states = loop_head_states(c, &w.body, pre_loop, exits.continues);
             if let Some(head) = join_envs(head_states) {
                 c.env.restore(head);
             }
@@ -15436,8 +15482,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // used to flow straight on, as if the loop always ran to the end
             // at least once, and the `else` block was never checked at all
             // (review 2026-10-03, W1-06).
-            let mut head_states = vec![c.env.snapshot(), pre_loop];
-            head_states.extend(exits.continues);
+            let head_states = loop_head_states(c, &f.body, pre_loop, exits.continues);
             if let Some(head) = join_envs(head_states) {
                 c.env.restore(head);
             }
