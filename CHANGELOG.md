@@ -465,6 +465,12 @@ grouped by workstream (W1–W7).
 - **Docs: `tyc migrate --force`** is now documented in `docs/cli.md` and on
   the docs site (it overwrites existing `.ty` files; without it the command
   refuses before writing anything).
+- **A refused `pyproject.toml` no longer leaves `tyc add` half-done.**
+  `tyc add` / `tyc remove` refused a symlinked or unparseable
+  `pyproject.toml` only after rewriting `typhon.toml`, so the command failed
+  with the dependency already added (or removed). Both files are now rendered
+  first and written together; a refusal changes neither, and a failed
+  `pyproject.toml` write restores `typhon.toml`.
 
 #### W5 — VM & harness
 

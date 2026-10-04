@@ -46,6 +46,8 @@ When `pyproject.toml` declares `dynamic = ["version"]`, the merge leaves `versio
 
 Drops the package from `[dependencies]` (or `[dev-dependencies]` with `--dev`) and runs `tyc sync`.
 
+`tyc add` and `tyc remove` update `typhon.toml` and `pyproject.toml` together. When `pyproject.toml` is a symlink or does not parse as TOML, the command fails before writing either file, so a failed `tyc add` never leaves the dependency half-added.
+
 ## `tyc sync`
 
 Materialises a `pyproject.toml` from `typhon.toml`'s `[dependencies]` / `[dev-dependencies]` and runs `uv sync`. The generated `pyproject.toml` is overwritten on every sync (don't hand-edit it).
