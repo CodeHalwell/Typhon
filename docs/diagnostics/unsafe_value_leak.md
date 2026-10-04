@@ -1,12 +1,16 @@
 # tyc::unsafe_value_leak
 
-Fires when a binding introduced inside an `unsafe:` block is returned from a
-function whose annotated return type is concrete (e.g. `-> int`) without
-being re-asserted at the boundary. Rule 5 in the Typhon language spec: an
+Fires when a binding introduced inside an `unsafe:` block — or a value
+derived from one: `data["name"]`, `data.count + 1`, `[x for x in data]`,
+`data.get("k")`, a lambda that reads it — is returned from a function whose
+annotated return type is concrete (e.g. `-> int`), or assigned to a
+concretely annotated binding, without being re-asserted at the boundary. Rule 5 in the Typhon language spec: an
 unsafe value carries `Unknown` and must cross the safety boundary via a
-deliberate re-typing — either an inner annotation that the compiler can
-verify (`let typed: int = …`) or an outer re-bind that goes through the
-normal assignability check.
+deliberate re-typing — either an annotation on the binding inside the block
+that the compiler can verify (`let value: int = …`) or a checked cast at the
+boundary (`value as! int`). The help text spells the cast on the escaping
+expression (`data["name"] as! str`); when the target has no runtime check
+(a `Callable`, a bare type parameter) it suggests only the annotation.
 
 ## Example
 
@@ -37,10 +41,13 @@ def parse(raw: object) -> int:
         let value: int = raw.maybe_int()
     return value
 
-# Option B — re-bind with an annotation outside the unsafe block.
+# Option B — check the type at the boundary with `as!`.
 def parse(raw: object) -> int:
     unsafe:
         let value = raw.maybe_int()
-    let checked: int = value
-    return checked
+    return value as! int
 ```
+
+An annotated re-bind outside the block (`let checked: int = value`) is not a
+re-assertion: it is itself a concrete boundary, and is reported the same
+way.

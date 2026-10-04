@@ -61,6 +61,7 @@ stress/round-2026-05-20/cases/139_too_many_args.ty
 stress/round-2026-05-20/cases/15_match_guard_missing.ty
 stress/round-2026-05-20/cases/24_pure_violation.ty
 stress/round-2026-05-20/cases/25_pure_io_indirect.ty
+stress/round-2026-05-20/cases/33_unsafe_leak.ty
 stress/round-2026-05-20/cases/39_interface_partial.ty
 stress/round-2026-05-20/cases/42_class_frozen_assign.ty
 stress/round-2026-05-20/cases/45_immutable_violation.ty
@@ -177,10 +178,12 @@ stress/round-2026-09-01/types/h14_guard_exhaustive.ty
 stress/round-2026-09-01/types/h18_enum_exhaust.ty
 stress/round-2026-09-01/types/h20_tuple_exhaust.ty
 stress/round-2026-09-01/types/h21_result_err_type.ty
+stress/round-2026-09-01/types/h22_kwargs_callable.ty
 stress/round-2026-09-01/types/h24_typevar_return.ty
 stress/round-2026-09-01/types/h30_async_iface.ty
 stress/round-2026-09-01/types/h31_property_iface.ty
 stress/round-2026-09-01/types/h32_iface_contra.ty
+stress/round-2026-09-01/types/h34_frozen_iface.ty
 stress/round-2026-09-01/types/h35_inherit_default_order.ty
 stress/round-2026-09-01/types/h43_nullable_ops.ty
 stress/round-2026-09-01/types/h56_generic_ctor.ty
@@ -200,6 +203,7 @@ stress/round-2026-09-01/types/n3c_try_method.ty
 stress/round-2026-09-01/types/n4_builtins_nullable.ty
 stress/round-2026-09-01/types/n4b_builtins_min.ty
 stress/round-2026-09-01/types/n4c_sorted_nullable.ty
+stress/round-2026-09-01/types/n5_iface_field_covariant.ty
 stress/round-2026-09-01/types/n6_unnarrowed_field_deref.ty
 stress/round-2026-09-01/types/n7_kwarg_type.ty
 stress/round-2026-09-01/types/n8_none_fn_returns.ty
@@ -211,6 +215,7 @@ stress/round-2026-09-01/types/s13_iface_field_variance.ty
 stress/round-2026-09-01/types/s17_result_match_partial.ty
 stress/round-2026-09-01/types/s1_append.ty
 stress/round-2026-09-01/types/s1c_augassign.ty
+stress/round-2026-09-01/types/s1d_update.ty
 stress/round-2026-09-01/types/s1f_setadd.ty
 stress/round-2026-09-01/types/s1g_nested_append.ty
 stress/round-2026-09-01/types/s26_bool_exhaust.ty

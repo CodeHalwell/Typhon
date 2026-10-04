@@ -17,14 +17,11 @@ use tyc_resolve::{resolve_module_with, LazyImportRemap, ResolveOptions, Resolved
 use tyc_syntax::{
     parse_module,
     preprocess::{
-        expand_compound_question_headers, expand_gather_blocks, expand_go_calls,
-        expand_inline_question_ops, expand_lazy_lets, expand_multiline_guards, expand_pipes,
-        expand_question_ops, expand_typed_let_unpack, expand_with_chains, line_byte_starts,
-        preprocess, validate_extend_usage, validate_lazy_usage, validate_question_ops,
+        line_byte_starts, validate_extend_usage, validate_lazy_usage, validate_question_ops,
         PreprocessResult,
     },
 };
-use tyc_types::{check_module_with_imports, ExternalShapes};
+use tyc_types::{check_module_with_imports, ExternalShapes, InterfaceShape};
 
 /// Re-export so downstream crates (CLI, LSP) can name the type
 /// without depending on `tyc-types` directly.
@@ -99,9 +96,35 @@ pub fn preprocessed_full(db: &dyn salsa::Database, file: SourceFile) -> ArcPrepr
     // The mapped chain leaves `line_map` (preprocessed line → `.ty` line) on
     // the result, which `check_pipeline` uses to report the line the user
     // wrote rather than the preprocessed buffer's.
-    ArcPreprocessResult(Arc::new(
-        tyc_syntax::preprocess::expand_and_preprocess_mapped(text, false),
-    ))
+    ArcPreprocessResult(shared_preprocess(text))
+}
+
+/// `expand_and_preprocess_mapped(text, false)`, shared between
+/// [`preprocessed_full`] and the shape pre-pass ([`parse_for_shapes`]):
+/// `tyc build` and `tyc check` extract every file's shapes before checking
+/// it, and both used to run the whole sugar pipeline on the same text. Keyed
+/// by the full source text, so a hit is exact; bounded, so a long-running
+/// language server does not keep every edit it has seen.
+fn shared_preprocess(text: &str) -> Arc<PreprocessResult> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Cache = Mutex<HashMap<String, Arc<PreprocessResult>>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    const CAPACITY: usize = 1024;
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(hit) = cache.lock().ok().and_then(|c| c.get(text).cloned()) {
+        return hit;
+    }
+    let result = Arc::new(tyc_syntax::preprocess::expand_and_preprocess_mapped(
+        text, false,
+    ));
+    if let Ok(mut c) = cache.lock() {
+        if c.len() >= CAPACITY {
+            c.clear();
+        }
+        c.insert(text.to_owned(), Arc::clone(&result));
+    }
+    result
 }
 
 /// Tracked query: the names declared at the top level of the module.
@@ -490,11 +513,23 @@ pub fn check_source_file(db: &mut TycDatabase, source_file: SourceFile) -> Diagn
 /// Runs the same preprocess + parse front-end as [`check_pipeline`], but
 /// stops there. Returns an empty [`ModuleShapes`] on any parse error
 /// — the real diagnostic surfaces when the file is checked for real.
-pub fn extract_shapes_for_path(_path: &str, text: &str) -> ModuleShapes {
+pub fn extract_shapes_for_path(path: &str, text: &str) -> ModuleShapes {
     match parse_for_shapes(text) {
-        Some((prep, module)) => shapes_of(&prep, &module),
+        Some((prep, module)) => source_provenance(path, shapes_of(&prep, &module)),
         None => ModuleShapes::default(),
     }
+}
+
+/// Only a `.ty` source's plain `def` is known synchronous: a `.dty` stub or
+/// a bundled stub (`path` is then a module name) describes code the checker
+/// cannot see, so its functions keep `declared_sync = false`.
+fn source_provenance(path: &str, mut shapes: ModuleShapes) -> ModuleShapes {
+    if !path.ends_with(".ty") {
+        for info in shapes.function_arities.values_mut() {
+            info.declared_sync = false;
+        }
+    }
+    shapes
 }
 
 /// [`extract_shapes_for_path`] plus the module's
@@ -505,28 +540,23 @@ pub fn extract_shapes_for_path(_path: &str, text: &str) -> ModuleShapes {
 /// `Post`, or `make()` on an imported function, as the built-in it was
 /// declared to be. Both halves are empty on a parse error.
 pub fn extract_shapes_and_facts_for_path(
-    _path: &str,
+    path: &str,
     text: &str,
 ) -> (ModuleShapes, tyc_analyse::TypeFacts) {
     match parse_for_shapes(text) {
         Some((prep, module)) => {
             let facts = tyc_analyse::collect_module_type_facts(&module);
-            (shapes_of(&prep, &module), facts)
+            (source_provenance(path, shapes_of(&prep, &module)), facts)
         }
         None => (ModuleShapes::default(), tyc_analyse::TypeFacts::default()),
     }
 }
 
 /// The preprocess + parse front-end shared by the shape extractors.
-fn parse_for_shapes(text: &str) -> Option<(PreprocessResult, tyc_syntax::ast::ModModule)> {
-    let expanded = expand_question_ops(&expand_inline_question_ops(
-        &expand_compound_question_headers(&expand_pipes(&expand_with_chains(&expand_go_calls(
-            &expand_gather_blocks(&expand_multiline_guards(&expand_lazy_lets(
-                &expand_typed_let_unpack(text),
-            ))),
-        )))),
-    ));
-    let prep = preprocess(&expanded);
+fn parse_for_shapes(text: &str) -> Option<(Arc<PreprocessResult>, tyc_syntax::ast::ModModule)> {
+    // The same canonical chain (and so the same result) as the check
+    // pipeline's `preprocessed_full`, which reuses it.
+    let prep = shared_preprocess(text);
     let module = parse_module(&prep.python_source).ok()?.into_syntax();
     Some((prep, module))
 }
@@ -760,8 +790,10 @@ fn check_pipeline(
     // declaration. Without this, `T` resolves as a distinct nominal
     // class and `def f(x: T)` rejects `int` arguments. Matches the
     // same substitution `tyc build` and `tyc run` apply.
-    let (comptime_values, _comptime_diags) = tyc_analyse::evaluate_comptime_with_functions(
+    let (comptime_values, _comptime_diags) = tyc_analyse::evaluate_comptime_in_source(
         &module,
+        &path,
+        &prep.python_source,
         &prep.comptime_bindings,
         &prep.comptime_functions,
     );
@@ -1237,7 +1269,157 @@ fn build_external_shapes(
                 .or_insert_with(|| variances.clone());
         }
     }
+    apply_cross_module_extensions(&mut external, bindings, &canon, shapes_by_module);
     external
+}
+
+/// The key a `__typhon_extend_<Class>@<spec>` sentinel published by the
+/// module keyed `owner` points at: the patched class's module. `owner` may
+/// be a package (`pkg` for `pkg/__init__.ty`); the relative spec is
+/// resolved as a module first and as a package if that names nothing.
+fn extension_target_key(
+    owner: &str,
+    level: u32,
+    module: &str,
+    known: &std::collections::HashMap<String, ModuleShapes>,
+) -> String {
+    let info = tyc_resolve::ImportInfo {
+        module: module.to_owned(),
+        member: None,
+        level,
+    };
+    let as_module = canonical_import_module(&info, Some(owner), false);
+    if level == 0 || known.contains_key(&as_module) {
+        return as_module;
+    }
+    let as_package = canonical_import_module(&info, Some(owner), true);
+    if known.contains_key(&as_package) {
+        as_package
+    } else {
+        as_module
+    }
+}
+
+/// Rewrite every relative `__typhon_extend_` sentinel in `shapes` (the
+/// shapes of the module keyed `owner`) to an absolute spec, so the
+/// sentinels survive being merged into a `pub *` facade under another key.
+pub fn absolutise_extension_sentinels<'a>(
+    shapes: &'a ModuleShapes,
+    owner: &str,
+    owner_is_init: bool,
+) -> std::borrow::Cow<'a, ModuleShapes> {
+    let relative = shapes.class_shapes.keys().any(|name| {
+        tyc_types::parse_extension_sentinel(name).is_some_and(|(_, level, _)| level > 0)
+    });
+    if !relative {
+        return std::borrow::Cow::Borrowed(shapes);
+    }
+    let mut out = shapes.clone();
+    out.class_shapes = shapes
+        .class_shapes
+        .iter()
+        .map(|(name, shape)| {
+            let name = match tyc_types::parse_extension_sentinel(name) {
+                Some((class, level, module)) if level > 0 => {
+                    let info = tyc_resolve::ImportInfo {
+                        module: module.to_owned(),
+                        member: None,
+                        level,
+                    };
+                    let target = canonical_import_module(&info, Some(owner), owner_is_init);
+                    tyc_types::extension_sentinel_name(class, &target)
+                }
+                _ => name.clone(),
+            };
+            (name, shape.clone())
+        })
+        .collect();
+    std::borrow::Cow::Owned(out)
+}
+
+/// W3-03: `extend User:` in module B patches `User` (declared in A) when B
+/// is imported. A consumer that imports B — by name, as a module, or
+/// through a `pub *` facade aggregating it — sees the patched methods on
+/// its `User`, the local name(s) it bound A's class to, and on A's shape
+/// in the registry (a `User` reached through an imported signature or
+/// `a.User`). A consumer that does not import B gets no promise that B
+/// ran, so it sees no extension. Methods merge first-write-wins: the
+/// class's own methods win.
+fn apply_cross_module_extensions(
+    external: &mut ExternalShapes,
+    bindings: &[tyc_resolve::Binding],
+    canon: &dyn Fn(&tyc_resolve::ImportInfo) -> String,
+    shapes_by_module: &std::sync::Arc<std::collections::HashMap<String, ModuleShapes>>,
+) {
+    let mut imported: Vec<String> = Vec::new();
+    for b in bindings {
+        if let Some(info) = &b.import_info {
+            let key = canon(info);
+            if !imported.contains(&key) {
+                imported.push(key);
+            }
+            // `from pkg import text` binds a submodule.
+            if let Some(member) = &info.member {
+                let sub = format!("{}.{member}", canon(info));
+                if shapes_by_module.contains_key(&sub) && !imported.contains(&sub) {
+                    imported.push(sub);
+                }
+            }
+        }
+    }
+    let mut contributions: Vec<(String, String, InterfaceShape)> = Vec::new();
+    for owner in &imported {
+        let Some(shapes) = shapes_by_module.get(owner) else {
+            continue;
+        };
+        let mut sentinels: Vec<_> = shapes
+            .class_shapes
+            .iter()
+            .filter_map(|(name, shape)| {
+                tyc_types::parse_extension_sentinel(name).map(|parsed| (parsed, shape))
+            })
+            .collect();
+        sentinels.sort_by(|a, b| a.0.cmp(&b.0));
+        for ((class, level, module), shape) in sentinels {
+            let target = extension_target_key(owner, level, module, shapes_by_module);
+            contributions.push((target, class.to_owned(), shape.clone()));
+        }
+    }
+    if contributions.is_empty() {
+        return;
+    }
+    let merge = |into: &mut InterfaceShape, from: &InterfaceShape| {
+        for (m, sig) in &from.methods {
+            into.methods.entry(m.clone()).or_insert_with(|| sig.clone());
+        }
+    };
+    for (target, class, shape) in &contributions {
+        // The consumer's local names for the class: `from a import User
+        // [as U]`, or the same class re-exported by a facade it lives under.
+        for b in bindings {
+            let Some(info) = &b.import_info else { continue };
+            if info.member.as_deref() != Some(class.as_str()) {
+                continue;
+            }
+            let source = canon(info);
+            if &source != target && !target.starts_with(&format!("{source}.")) {
+                continue;
+            }
+            if let Some(local) = external.class_shapes.get_mut(&b.name) {
+                merge(local, shape);
+            }
+        }
+        // The registry entry, for `a.User` and a `User` reached through an
+        // imported signature. Copy-on-write: only consumers that import an
+        // extending module pay for the clone.
+        let registry = std::sync::Arc::make_mut(&mut external.by_module);
+        if let Some(cls) = registry
+            .get_mut(target)
+            .and_then(|m| m.class_shapes.get_mut(class))
+        {
+            merge(cls, shape);
+        }
+    }
 }
 
 #[cfg(test)]

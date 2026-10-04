@@ -31,6 +31,32 @@ Relative imports (`.`, `..`) work as in Python. Since v0.9.0 the in-process VM (
 
 `tyc run --compile` was tweaked at the same time: instead of `python build/main.py`, it spawns `python -m <pkg>.main` so relative imports in the entry point resolve correctly under the compiled path too.
 
+### `typing` names
+
+Inside annotations and `type` statements — which the emitted module never
+evaluates — `Union`, `Optional`, `Any`, `List` / `Dict` / `Set` / `Tuple` /
+`FrozenSet`, `Type`, `TypeVar`, `Generic`, `Self`, `ClassVar`, `Final`,
+`Literal` and `NoReturn` can be written without an import. Used as runtime
+values they need one, because CPython would raise `NameError`:
+
+```python
+def describe(hint: object) -> str:
+    return "union" if hint is Union else "other"   # ❌ tyc::unknown_name
+```
+
+```python
+from typing import Union
+
+def describe(hint: object) -> str:
+    return "union" if hint is Union else "other"   # ✅
+```
+
+`Protocol` and the `collections.abc` names (`Callable`, `Iterator`, …) are
+unaffected: the build imports them. The deprecated capitalised aliases and
+`TypeVar` cannot be imported at all (`tyc::typing_alias_deprecated`,
+`tyc::typevar_import_rejected`); use the lowercase built-ins and PEP 695
+type parameters.
+
 ## Conditional imports
 
 ```python
@@ -69,12 +95,12 @@ The first form gives the proxy an alias; the second uses the module name directl
 ## `lazy from` is rejected
 
 ```python
-lazy from numpy import array        # ❌ parse error
+lazy from numpy import array        # ❌ rejected at check time
 ```
 
 ```
-error[tyc::lazy_from_import]: `lazy from … import` defeats deferred loading;
-                              use `lazy import numpy` plus `numpy.array(...)`
+error[tyc::lazy_usage]: `lazy from … import` defeats deferred loading;
+                        use `lazy import numpy` plus `numpy.array(...)`
 ```
 
 `from`-imports eagerly touch attributes on the source module — they cannot defer.

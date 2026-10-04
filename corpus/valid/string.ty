@@ -1,0 +1,333 @@
+# corpus/valid/string.ty — migrated from CPython 3.13 Lib/string.py (PSF-2.0)
+# via `tyc migrate`, hand-fixed once to check clean. Kept green by
+# the valid-corpus CI job; read README.md before editing.
+
+"""A collection of string constants.
+
+Public module variables:
+
+whitespace -- a string containing all ASCII whitespace
+ascii_lowercase -- a string containing all ASCII lowercase letters
+ascii_uppercase -- a string containing all ASCII uppercase letters
+ascii_letters -- a string containing all ASCII letters
+digits -- a string containing all ASCII decimal digits
+hexdigits -- a string containing all ASCII hexadecimal digits
+octdigits -- a string containing all ASCII octal digits
+punctuation -- a string containing all ASCII punctuation characters
+printable -- a string containing all ASCII characters considered printable
+
+"""
+
+__all__ = ["ascii_letters", "ascii_lowercase", "ascii_uppercase", "capwords",
+           "digits", "hexdigits", "octdigits", "printable", "punctuation",
+           "whitespace", "Formatter", "Template"]
+
+import _string
+
+# Some strings for ctype-style character classification
+whitespace = ' \t\n\r\v\f'
+ascii_lowercase = 'abcdefghijklmnopqrstuvwxyz'
+ascii_uppercase = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+ascii_letters = ascii_lowercase + ascii_uppercase
+digits = '0123456789'
+hexdigits = digits + 'abcdef' + 'ABCDEF'
+octdigits = '01234567'
+punctuation = r"""!"#$%&'()*+,-./:;<=>?@[\]^_`{|}~"""
+printable = digits + ascii_letters + punctuation + whitespace
+
+# Functions which aren't available as string methods.
+
+# Capitalize the words in a string, e.g. " aBc  dEf " -> "Abc Def".
+def capwords(s: str, sep: str? = None) -> str:
+    """capwords(s [,sep]) -> string
+
+    Split the argument into words using split, capitalize each
+    word using capitalize, and join the capitalized words using
+    join.  If the optional second argument sep is absent or None,
+    runs of whitespace characters are replaced by a single space
+    and leading and trailing whitespace are removed, otherwise
+    sep is used to split and join the words.
+
+    """
+    return (sep or ' ').join(map(str.capitalize, s.split(sep)))
+
+
+####################################################################
+import re as _re
+from collections import ChainMap as _ChainMap
+
+_sentinel_dict: dict[str, object] = {}
+
+class! Template:
+    """A string class for supporting $-substitutions."""
+
+    pattern: _re.Pattern[str]
+    delimiter: str = '$'
+    # r'[a-z]' matches to non-ASCII letters when used with IGNORECASE, but
+    # without the ASCII flag.  We can't add re.ASCII to flags because of
+    # backward compatibility.  So we use the ?a local flag and [a-z] pattern.
+    # See https://bugs.python.org/issue31672
+    idpattern: str = r'(?a:[_a-z][_a-z0-9]*)'
+    braceidpattern: str? = None
+    flags: object = _re.IGNORECASE
+
+    def __init__(self, template: str) -> None:
+        self.template = template
+
+    # Search for $$, $identifier, ${identifier}, and any bare $'s
+
+impl Template:
+    def __init_subclass__(cls: object) -> None:
+        super().__init_subclass__()
+        if 'pattern' in cls.__dict__:
+            let existing: object = cls.pattern
+            if isinstance(existing, _re.Pattern):
+                # An already-compiled pattern (which the documentation allows)
+                # is used as-is; re.compile() rejects flags on a compiled
+                # pattern.
+                return
+            cls.pattern = _re.compile(existing as! str, cls.flags | _re.VERBOSE)
+            return
+        let delim: object = _re.escape(cls.delimiter as! str)
+        let id: object = cls.idpattern
+        let bid: object = cls.braceidpattern or cls.idpattern
+        let pattern: str = fr"""
+            {delim}(?:
+              (?P<escaped>{delim})  |   # Escape sequence of two delimiters
+              (?P<named>{id})       |   # delimiter and a Python identifier
+              {{(?P<braced>{bid})}} |   # delimiter and a braced identifier
+              (?P<invalid>)             # Other ill-formed delimiter exprs
+            )
+            """
+        cls.pattern = _re.compile(pattern, cls.flags | _re.VERBOSE)
+
+    def _invalid(self, mo: _re.Match[str]) -> None:
+        let i: int = mo.start('invalid')
+        let lines: list[str] = self.template[:i].splitlines(keepends=True)
+        mut colno: int = 1
+        mut lineno: int = 1
+        if lines:
+            colno = i - len(''.join(lines[:-1]))
+            lineno = len(lines)
+        raise ValueError('Invalid placeholder in string: line %d, col %d' %
+                         (lineno, colno))
+
+    def substitute(self, mapping: object = _sentinel_dict, /, **kws: object) -> str:
+        if mapping is _sentinel_dict:
+            mut mapping: object = kws
+        elif kws:
+            mapping = _ChainMap(kws, mapping)
+        # Helper function for .sub()
+        def convert(mo: _re.Match[str]) -> str:
+            # Check the most common path first.
+            let named = mo.group('named') or mo.group('braced')
+            if named is not None:
+                return str(mapping[named])
+            if mo.group('escaped') is not None:
+                return self.delimiter
+            if mo.group('invalid') is not None:
+                self._invalid(mo)
+            raise ValueError('Unrecognized named group in pattern',
+                             self.pattern)
+        return self.pattern.sub(convert, self.template)
+
+    def safe_substitute(self, mapping: object = _sentinel_dict, /, **kws: object) -> str:
+        if mapping is _sentinel_dict:
+            mut mapping: object = kws
+        elif kws:
+            mapping = _ChainMap(kws, mapping)
+        # Helper function for .sub()
+        def convert(mo: _re.Match[str]) -> str:
+            let named = mo.group('named') or mo.group('braced')
+            if named is not None:
+                try:
+                    return str(mapping[named])
+                except KeyError:
+                    return mo.group()
+            if mo.group('escaped') is not None:
+                return self.delimiter
+            if mo.group('invalid') is not None:
+                return mo.group()
+            raise ValueError('Unrecognized named group in pattern',
+                             self.pattern)
+        return self.pattern.sub(convert, self.template)
+
+    def is_valid(self) -> bool:
+        for mo in self.pattern.finditer(self.template):
+            if mo.group('invalid') is not None:
+                return False
+            if (mo.group('named') is None
+                and mo.group('braced') is None
+                and mo.group('escaped') is None):
+                # If all the groups are None, there must be
+                # another group we're not expecting
+                raise ValueError('Unrecognized named group in pattern',
+                    self.pattern)
+        return True
+
+    def get_identifiers(self) -> list[str]:
+        let ids: list[str] = []
+        for mo in self.pattern.finditer(self.template):
+            let named = mo.group('named') or mo.group('braced')
+            if named is not None and named not in ids:
+                # add a named group only the first time it appears
+                ids.append(named)
+            elif (named is None
+                and mo.group('invalid') is None
+                and mo.group('escaped') is None):
+                # If all the groups are None, there must be
+                # another group we're not expecting
+                raise ValueError('Unrecognized named group in pattern',
+                    self.pattern)
+        return ids
+
+# Initialize Template.pattern.  __init_subclass__() is automatically called
+# only for subclasses, not for the Template class itself.
+Template.__init_subclass__()
+
+
+########################################################################
+# the Formatter class
+# see PEP 3101 for details and purpose of this class
+
+# The hard parts are reused from the C implementation.  They're exposed as "_"
+# prefixed methods of str.
+
+# The overall parser is implemented in _string.formatter_parser.
+# The field name parser is implemented in _string.formatter_field_name_split
+
+class Formatter:
+
+
+    # returns an iterable that contains tuples of the form:
+    # (literal_text, field_name, format_spec, conversion)
+    # literal_text can be zero length
+    # field_name can be None, in which case there's no
+    #  object to format and output
+    # if field_name is not None, it is looked up, formatted
+    #  with format_spec and conversion and then used
+
+
+    # given a field_name, find the object it references.
+    #  field_name:   the field being looked up, e.g. "0.name"
+    #                 or "lookup[3]"
+    #  used_args:    a set of which args have been used
+    #  args, kwargs: as passed in to vformat
+    pass
+
+impl Formatter:
+    def format(self, format_string: str, /, *args: object, **kwargs: object) -> str:
+        return self.vformat(format_string, args, kwargs)
+
+    def vformat(self, format_string: str, args: tuple[object, ...], kwargs: dict[str, object]) -> str:
+        let used_args: set[object] = set()
+        let vres: tuple[str, int | bool] = self._vformat(format_string, args, kwargs, used_args, 2)
+        let result: str = vres[0]
+        self.check_unused_args(used_args, args, kwargs)
+        return result
+
+    def _vformat(self, format_string: str, args: tuple[object, ...], kwargs: dict[str, object], used_args: set[object], recursion_depth: int,
+                 auto_arg_index: int | bool = 0) -> tuple[str, int | bool]:
+        mut auto_index: int | bool = auto_arg_index
+        if recursion_depth < 0:
+            raise ValueError('Max string recursion exceeded')
+        let result: list[str] = []
+        let pieces: object = self.parse(format_string)
+        for piece in pieces:
+            let literal_text: object = piece[0]
+            let field_name: object = piece[1]
+            let format_spec: object = piece[2]
+            let conversion: object = piece[3]
+
+            # output the literal text
+            if literal_text:
+                result.append(literal_text as! str)
+
+            # if there's a field, output it
+            if field_name is not None:
+                # this is some markup, find the object and do
+                #  the formatting
+
+                # handle arg indexing when empty field_names are given.
+                mut field_str: str = field_name as! str
+                if field_name == '':
+                    if auto_index is False:
+                        raise ValueError('cannot switch from manual field '
+                                         'specification to automatic field '
+                                         'numbering')
+                    field_str = str(auto_index)
+                    auto_index += 1
+                elif field_name.isdigit():
+                    if auto_index:
+                        raise ValueError('cannot switch from manual field '
+                                         'specification to automatic field '
+                                         'numbering')
+                    # disable auto arg incrementing, if it gets
+                    # used later on, then an exception will be raised
+                    auto_index = False
+
+                # given the field_name, find the object it references
+                #  and the argument it came from
+                let field_pair: tuple[object, ...] = self.get_field(field_str, args, kwargs)
+                mut obj: object = field_pair[0]
+                let arg_used: object = field_pair[1]
+                used_args.add(arg_used)
+
+                # do any conversion on the resulting object
+                obj = self.convert_field(obj, conversion)
+
+                # expand the format spec, if needed
+                let sub: tuple[str, int | bool] = self._vformat(
+                    format_spec as! str, args, kwargs,
+                    used_args, recursion_depth-1,
+                    auto_arg_index=auto_index)
+                let expanded: object = sub[0]
+                let auto_next: int | bool = sub[1]
+                auto_index = auto_next
+
+                # format the object and append to the result
+                result.append(self.format_field(obj, expanded) as! str)
+
+        return ''.join(result), auto_arg_index
+
+    def get_value(self, key: object, args: tuple[object, ...], kwargs: dict[str, object]) -> object:
+        if isinstance(key, int):
+            return args[key as! int]
+        else:
+            return kwargs[key as! str]
+
+    def check_unused_args(self, used_args: set[object], args: tuple[object, ...], kwargs: dict[str, object]) -> None:
+        pass
+
+    def format_field(self, value: object, format_spec: object) -> object:
+        return format(value, format_spec as! str)
+
+    def convert_field(self, value: object, conversion: object) -> object:
+        # do any conversion on the resulting object
+        if conversion is None:
+            return value
+        elif conversion == 's':
+            return str(value)
+        elif conversion == 'r':
+            return repr(value)
+        elif conversion == 'a':
+            return ascii(value)
+        raise ValueError("Unknown conversion specifier {0!s}".format(conversion))
+    def parse(self, format_string: str) -> object:
+        return _string.formatter_parser(format_string)
+    def get_field(self, field_name: str, args: tuple[object, ...], kwargs: dict[str, object]) -> tuple[object, ...]:
+        let split: object = _string.formatter_field_name_split(field_name)
+        let first: object = split[0]
+        let rest: object = split[1]
+
+        mut obj: object = self.get_value(first, args, kwargs)
+
+        # loop through the rest of the field_name, doing
+        #  getattr or getitem as needed
+        for item in rest:
+            if item[0]:
+                obj = getattr(obj, item[1])
+            else:
+                obj = obj[item[1]]
+
+        return obj, first

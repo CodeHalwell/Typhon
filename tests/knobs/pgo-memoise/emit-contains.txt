@@ -1,1 +1,1 @@
-@functools.cache\ndef hot(n: int) -> int:
+@functools.lru_cache(maxsize=1024, typed=True)\ndef hot(n: int) -> int:

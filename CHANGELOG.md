@@ -4,12 +4,1093 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## Unreleased — beta readiness
+## 1.0.0-beta.1 — 2026-10-04 — first beta: four review-remediation waves & a frozen surface
 
-Three waves on top of alpha.9. The first was the beta-readiness review
-remediation described further down; the second closed the backlog that
-review deferred; the third — the 2026-09-30 release-readiness review
-(`docs/release-readiness-review-2026-09-30.md`) — is summarised first.
+The first beta: four review-remediation waves on top of alpha.9 — the
+2026-09-01 beta-readiness review and the backlog it deferred, the 2026-09-30
+release-readiness review, and the remediation of the six 2026-10-03 full
+reviews (W1–W7). Together they close the ways a check-clean program could
+still crash, miscompile, or behave differently under `tyc run` than under
+CPython: type-checker soundness (field narrowings dropped wherever a call or
+write can reach them, loops joining their exit paths, nullable receivers of
+every shape, union member access, `match` exhaustiveness over `Result`
+payloads, `T?`, `bool`, literal unions and nested sealed unions, and enforced
+`Callable`, `yield` and container-write contracts); lowering (an inline `?`
+keeps Python's evaluation order, `|>` works in every expression position, an
+`impl` method may read a name bound after its class, and `extend BUILTIN`
+reaches every receiver shape and crosses a `pub *` facade); VM ↔ CPython
+parity (C3 method resolution, CPython-ordered sets, value-mixin enums, a
+stdlib-shim audit, and an automatic CPython fallback for programs the VM does
+not model — the differential baseline falls from 167 entries to single
+figures); and tooling, where `tyc fmt` refuses output that changes what a
+program means, `tyc build`, `tyc fmt` and the dependency commands refuse to
+write through symlinks, and the language server survives symlink loops and
+malformed frames. CI gains a `compileall` pass over every emitted module, a
+no-build baseline, the `fmt-corpus`, `fmt-guard` and `valid-corpus` jobs, and
+a non-blocking macOS job.
+
+**No new syntax** — the one newly accepted spelling, `"Node"?` for a nullable
+quoted forward reference, is additive. The new error-level diagnostics fire
+only on programs that already crashed at runtime or emitted Python CPython
+refuses to compile: `tyc::alias_not_a_class` (`case Poly():` or
+`isinstance(x, Poly)` on a `type` alias), `tyc::invalid_pattern` (a `match`
+pattern the CPython compiler rejects), `tyc::impl_forward_reference` (an
+`impl` method that must stay in the class body reading a name bound after the
+class), and `tyc::reserved_module_name` (an error only when a program imports
+from `typhon_runtime` something the generated runtime does not provide;
+otherwise a warning). Apart from the exceptions below, the checks tightened
+under existing codes reject only code that already failed at runtime or relied
+on unsound typing. **One documented exception changes a default:
+`[strictness] nullable-use` now defaults to `"error"`**, so dereferencing a
+nullable field without a guard — a warning since alpha.7 — fails the check;
+`nullable-use = "warn"` relaxes it during a migration. The release's other
+deliberate narrowings on code that may run (`x += 1` on a `let`, `unsafe:`
+containment following derived values, the wider exhaustiveness check, `del` /
+`except … as` ending a `let`) each have an escape and are listed in
+`docs/compatibility.md`, the new compatibility policy. Under it **the surface
+is now frozen for the beta line**: the forms it lists keep their syntax and
+meaning in every beta release, and a deprecation or breaking change follows
+its warn-first process.
+
+The sections below cover the four waves. The first was the beta-readiness
+review remediation described further down; the second closed the backlog that
+review deferred; the third is the 2026-09-30 release-readiness review
+(`docs/reviews/release-readiness-review-2026-09-30.md`); the fourth,
+summarised first, is the remediation of the six 2026-10-03 full reviews,
+grouped by workstream (W1–W7).
+
+### Fourth wave — 2026-10-03 reviews
+
+#### W1 — checker flow, narrowing, exhaustiveness
+
+- **Narrowing over a sealed-union alias works on the negative branch
+  again (regression from the third wave).** With `type Pet = Dog | Cat | Fish`,
+  the `else` of `isinstance(p, Dog)`, the code after `if isinstance(p, Dog):
+  return`, `not isinstance(p, (Dog, Cat))`, an `… or …` early exit, a
+  ternary, a comprehension filter, a `case _:` after `case Fish():`, and a
+  `case Dog() | Cat() as an:` capture all kept the whole alias, so the
+  third wave's union member check rejected correct code such as `p.fins`.
+  The alias now expands to its variants before a variant is stripped, a
+  second strip in the same condition starts from the first, an unguarded
+  irrefutable arm narrows later arms to what is left, and an or-pattern
+  capture is the union of what its alternatives match. Programs that read a
+  member some variant still lacks are rejected as before.
+- **Passing an object to a call no longer forgets its field narrowings
+  unless the callee can write them (regression from the third wave).**
+  `if it.price is not None: print(it); t += it.price` — and the same with
+  `out.append(it)`, `logging.info("%s", it)`, a local helper that never
+  writes `price`, or any call on a `frozen` object's own fields — was
+  rejected. The checker now summarises, per module, which fields each local
+  function, constructor and method can write (transitively through local
+  calls), and a statement-position call invalidates only those. Builtins,
+  the standard library and methods of builtin values write none; an
+  imported non-stdlib function, a callable parameter, `setattr` and
+  anything else it cannot see may still write any field, so
+  `clear(b)` with `b.value = None` inside stays rejected.
+- **`nullable-use = "error"` stays the default; the narrowing gaps it
+  exposed are closed.** A method call `self.conn.execute(…)` no longer drops
+  the narrowing of `self.conn` itself, only of fields below it that the
+  method can write; `self.log("x")` keeps `self.conn` narrowed unless `log`
+  can write `conn`. Attribute paths now narrow on truthiness like plain
+  names: `if head.nxt: head.nxt.v`, `if not self.data: return`,
+  `head.nxt.v if head.nxt else 0`, `head.nxt and head.nxt.v > 5`.
+- **`match` exhaustiveness covers every closed subject.** A `Result[T, E]`
+  match must handle `Ok` and `Err`, and when `E` (or `T`) is a sealed
+  union, enum, `bool` or literal union, the payload patterns must cover it:
+  the README's `match load(...)` with `Err(NotFound(..))` and
+  `Err(Timeout(..))` now reports `Err(Denied)` missing instead of falling
+  through. A match over `T?` must handle `None` once its arms cover `T`;
+  `bool` and literal-union subjects must cover every value. `missing_return`
+  follows the same rules for `Result`. All forms report
+  `tyc::non_exhaustive_match` and honour `[strictness] exhaustive-match`.
+  Over the example and stress corpus no previously clean unit is rejected.
+- **Nested sealed unions flatten to their leaf classes.** With
+  `type Poly = Rect | Tri` and `type Shape = Circle | Poly`, arms for
+  `Circle`, `Rect` and `Tri` are exhaustive (they used to report "missing
+  Poly").
+- **New `tyc::alias_not_a_class` (error).** `case Poly():` and
+  `isinstance(x, Poly)` on a `type` alias were accepted and raise
+  `TypeError` on CPython (a `type` statement makes a `TypeAliasType`, not a
+  class). The help text lists the variants to match or test instead.
+- **Loops join their exit paths.** The `else:` suite of a `for` loop was
+  never type-checked (`for … else: let bad: str = 1` passed). After a
+  `while` loop the checker restored the pre-loop state, so a narrowing the
+  body invalidated (`while running: x = None`, or `b.v = None`) survived
+  the loop; after a `for` loop the body's state flowed on as if the loop
+  always ran, so `last = v` in the body made a nullable `last` look set even
+  for an empty iterable. The loop head now joins the pre-loop state, the
+  end of the body and every `continue`; after the loop the checker joins
+  the natural exit (the `else` suite, with the negated `while` test) and
+  every `break`. A nullable declaration with a non-`None` initializer
+  (`mut x: int? = 5`) now starts out narrowed, as the same value assigned
+  on the next line would. No previously clean corpus unit changes.
+- **Field narrowings are invalidated wherever a call or write can reach
+  them.** Every call now drops the narrowings its callee can write as it is
+  evaluated, not only a call in statement position: `let n: int = clear(b)`,
+  `print(clear(b), b.value + 1)` and `case 1 if clear(b):` no longer keep a
+  stale `b.value`. A callee known to write field `f` drops `f` on every
+  object, since it may reach one through an alias (`h.reset()` with
+  `h.b is b`). A write through an object with no access path
+  (`reg["k"].v = None`, `hs[0].name = None`) drops that field everywhere.
+  `yield` drops field narrowings, since the caller runs in between. A
+  lambda or nested `def` no longer keeps the narrowing of a captured name
+  that the enclosing body reassigns after it (or inside a loop around it).
+- **Fewer false invalidations.** A field write no longer drops the
+  same-named field's narrowing on every object: only on objects whose
+  static type can alias the written one, and only when the written value no
+  longer fits the narrowing. `if src.name is not None: dst.name = src.name;
+  src.name.upper()` and `acc.email = None` next to an unrelated
+  `p.email` narrowing now check. A nested `def` that rebinds a local
+  through `nonlocal` resets that local only on a call that can reach it
+  (calling it, or a nested `def` that calls it); once it escapes (stored,
+  passed, returned, or a nested class method) every call still resets it,
+  as before.
+- **A `type` alias over a nullable type is nullable.** With
+  `type OptStr = str | None` (or `= str?`, `= User | None`), a parameter,
+  annotated binding, field or return typed `OptStr` was an opaque name to
+  every nullable check: `s.upper()` was accepted and crashes on `None`, and
+  `if s is None: return ""` could not narrow `s`. Such aliases now expand to
+  their right-hand side; messages show `str | None` where they showed
+  `OptStr`.
+- **`except E as e` binds `e` to `E`** (the union for `except (A, B) as
+  e`). It was never bound, so `return Err(e)` in a `-> Result[int, str]`
+  function and `let m: int = e` passed. Block `rescue` lowers to the same
+  handler and is covered too.
+- **`unsafe:` containment follows derived values (deliberate narrowing).**
+  `tyc::unsafe_value_leak` only tracked the bare name, so after
+  `unsafe: let data = json.loads(raw)`, `return data["name"]` from a
+  `-> str` function — and `pair[0]`, `data.count + 1`, `[x for x in data]`,
+  `data.get("k")` or a lambda reading `data` — crossed into typed code
+  unchecked. Values built from an unsafe binding now carry its origin, as
+  Rule 5 specifies. This rejects programs that happen to run correctly when
+  the untyped value has the right shape, in the same way the existing
+  bare-name check does; the stress probe
+  `stress/round-2026-05-20/cases/33_unsafe_leak.ty` is one, and moves to
+  `scripts/nobuild-baseline.txt`. Re-assert at the boundary with
+  `value as! T`, or annotate the binding inside the block. The
+  `unsafe_value_leak` doc page no longer recommends an annotated re-bind
+  outside the block, which is itself reported.
+- **`del NAME` and `except … as NAME` cannot end a `let`.** Both remove the
+  binding (an `except … as` name is deleted when the handler ends), so a
+  module constant or local `let` could vanish and a later read would raise
+  `NameError` / `UnboundLocalError`. Both now report
+  `tyc::immutable_assign`. A `for` or `with … as` target rebinding a `let`
+  stays allowed, as decided in R2-17.
+- **Older narrowing gaps.** `isinstance(x, list)` / `dict` / `tuple` now
+  removes `list[int]` / `dict[…]` / `tuple[…]` on the negative branch; a
+  walrus is truthy-narrowed like the name it binds
+  (`if (xs := d.get("a")) and len(xs) > 0`); and a walrus inside a
+  comprehension binds in the enclosing scope at its declared type, as PEP
+  572 specifies (it used to disappear with the comprehension and read as
+  an unchecked `Unknown`, though it may hold `None`).
+- **The transitive `go_outside_async` scan respects shadowing.** A sync
+  function whose parameter (or local, nested `def` or import) is named like
+  a module-level spawner no longer counts as calling that spawner, so
+  `def schedule(start): start()` called at module level is not reported
+  because a module-level `def start(): go work(1)` exists.
+- **`typing` names used as values need their import.** `Union`, `Optional`,
+  `Any`, `List`/`Dict`/`Set`/`Tuple`/`FrozenSet`, `Type`, `TypeVar`,
+  `Generic`, `Self`, `ClassVar`, `Final`, `Literal` and `NoReturn` stay
+  usable without an import inside annotations and `type` statements, which
+  the emitted module never evaluates; as runtime values (`t is Union`,
+  `TypeVar("T")`, a `Generic[T]` base) they raised `NameError` and now
+  report `tyc::unknown_name`. `Protocol` and the `collections.abc` names
+  are unaffected: the build imports them.
+- **Diagnostic wording.**
+  - `tyc::non_exhaustive_match` names the subject by what it is. Only a
+    real sealed union is called one; an enum reads
+    "on enum \`Color\`: missing member(s) BLUE", and `Result`, `T?`,
+    `bool` and literal-union subjects are named by their type
+    ("on \`bool\`: missing case(s) False") instead of
+    "on sealed union \`bool\`".
+  - `tyc::unsafe_value_leak` recommends a checked cast spelled on the
+    escaping expression (`data["name"] as! str`) or an annotation inside the
+    block. It recommended `let typed: T = name` outside the block, which is
+    itself reported. A target `as!` cannot check gets only the annotation
+    advice.
+  - `tyc::nullable_use`: when the function already checks the value for
+    `None` above the use (`if self.conn is None: return`) but the narrowing
+    cannot reach it — a call, assignment, `await` or `yield` in between, a
+    check on another path, a closure that may run later — the help says so
+    and suggests copying a field into a local and guarding that, instead of
+    asking for a guard that is already there (W1-03).
+
+#### W2 — checker expressions
+
+- W2-05: frozen bindings and aliases carry recursively immutable tuple, Mapping and frozenset types; read-only tuple views and tuple concatenation remain usable. Unhandled mutations reject; deliberate mutations caught by their matching handler warn. Mapping proxies are recursively frozen, while frozen dataclass instances preserve identity and field values. The banking read and caught-failure corpus probes remain accepted.
+
+- W2-04: checked casts expand transparent and concrete generic aliases, enforce Literal membership, preserve NewType base checks, and terminate recursive/cyclic values. Bare parameters and unsupported parameterised contracts are refused; `docs/language.md` records the supported-target table. The emitted CPython runtime rejects the JSON alias repro at the cast.
+
+- W2-02: debug builds support `TYC_REPORT_UNCHECKED=1 tyc check PATH`, reporting per-file Unknown annotation, return and member sites without changing severity. Examples baseline after builtin typing: 266 files, 206 annotated sites, 179 returns, 952 member sites (1337 total). Per-file counts are kept with the W2 reports on the `fix/W2-codex` branch.
+
+- W2-03: shared fields and properties on unions return the union of their types. Direct method calls must satisfy every variant's arity and parameter types and return the union of their results, with generic receiver parameters substituted and async methods returning coroutines.
+
+- W2-19: attribute inference folds receiver chains iteratively and compares recorded narrowing paths without building every receiver prefix. On this Mac, debug checks at 2k/4k/8k links fell from 1.18s/4.84s/34.44s (8k stack abort) to 0.125s/0.210s/0.559s, all successful.
+
+- W2-20: `check_module_with_imports_and_types` exposes the checker's contextual expression types by preprocessed-source byte span, including Callable lambda parameters and match captures, for extension lowering.
+
+- W2-01: builtin calls retain their result and iterator element types, including per-call overloads for `round`, `min`/`max`, numeric conversions and container constructors. `super()` resolves the base method contract. Fresh container copies may widen their elements; constant-false expression branches do not introduce diagnostics. The 1,481-unit checker corpus retains its baseline; no newly rejected unit was added.
+
+- W2-06: `Callable` contracts are enforced: aliases respect defaults and maximum arity, a positional `Callable` rejects keyword substitution, class factories are accepted, ParamSpec keeps argument shapes and keyword names, and unions of functions and lambdas stay callable.
+- W2-07: `await` operands are checked on concrete names and fields, and stored coroutines keep their wrapper type.
+- W2-08: powers and augmented assignments are typed by their result. A provably negative integer exponent (`2 ** -1`, `n **= -1`) gives `float`; an exponent of unknown sign keeps `int`, so `def power(base: int, exp: int) -> int` still checks. `bool += int` and nullable augmented operands are rejected.
+- W2-09: `@dataclass(order=True)` ordering is recognised, plain enum ordering is rejected unless caught, and `in` on a `str` requires a `str` operand.
+- W2-10: `gather` results, `go` task handles, exception-mapper parameters and chained `Result` combinators carry their inferred types.
+- W2-11: `go` on a callee known to be synchronous (including sync aliases and callable parameters) is rejected.
+- W2-12: generic type parameters stay rigid inside nested types in a generic body.
+- W2-13: newtypes keep their base type's method contracts (`Email.split()` is `list[str]`), and distinct string newtypes do not mix.
+- W2-14: container writes check keys, indices and `update()` payloads.
+- W2-15: interface conformance rejects covariant mutable fields, frozen implementations of writable fields, getter-only properties for writable members, and incompatible parameter names.
+- W2-16: property and `ClassVar` writes are checked, with inherited slot semantics.
+- W2-17: builtin constructors accept their keywords (int methods, enum and builtin-subclass constructors, positional-only parameters, `isinstance` union targets); a nullable `len()` argument reports one diagnostic.
+- W2-18: the class-attribute slot lint fires only on class-level accesses, and the `Result` error wording covers plain returns as well as `?`.
+- A lambda with no expected `Callable` type has its body checked. `let g = lambda: v.upper()` with `v: str?` passed, because only a lambda checked against a `Callable` contract had its body inferred. Its parameters are `Unknown` (and shadow outer names), so only errors that hold for any argument fire: free variables, the calls made on them, literals. A captured name reassigned after the lambda is read at its declared type, as for a contract-checked lambda. Corpus: 0 newly rejected.
+- `yield` is checked against the generator's element type. In a function annotated `-> Iterator[T]`, `Iterable[T]`, `Generator[T, S, R]` or an async form, `yield v` must produce a `T` (a bare `yield` produces `None`): `yield maybe_int` with `maybe_int: int?` in `-> Iterator[int]` passed, and the operand was not inferred at all, so `yield v.upper()` on a nullable `v` passed too. `yield from` operands are inferred. A `yield` inside a lambda is not attributed to the enclosing function. Corpus: 0 newly rejected.
+- A union member read on classes derived from builtin exceptions is checked. The union member check skipped every class with a base it could not see, and every exception class has one, so `except (A, B) as e: e.code` passed when only `A` defines `code` and raised `AttributeError` whenever a `B` was caught. A builtin exception base now counts as known through a fixed table of its public attributes (`args`, `SystemExit.code`, `OSError.errno`, …). Still permissive: any other unseen base, a `__getattr__`, and an attribute the module writes on a non-`self` receiver (`err.code = 404`) or through `setattr` / `vars` / `__dict__`. Corpus: 0 newly rejected.
+- Diagnostic rendering fixes from the docs audit:
+  - `tyc check` draws each diagnostic with the marker of the bucket it was reported in, so a warning no longer shows the error `×` (a `[strictness]` knob at `"warn"`, a mutation caught by its handler). `tyc::unknown_module` and `tyc::typing_alias_deprecated` are always warnings and say so on every surface; their doc pages, which called them errors, are corrected (both run fine at runtime when the module is installed / the alias is used, so they stay warnings and `tyc check` exits 0).
+  - `tyc build` does the same for the warnings it prints itself (the strictness-filtered check results, `stdlib_module_shadow`, the build-time secret scan and `orphan_py_import`); `tyc run` already renders through `tyc check`.
+  - An item assignment into a frozen `Mapping` / tuple / `frozenset` (W2-05) is reported at the assignment instead of under "(no location)".
+  - Messages name `tuple[T, ...]` instead of the internal `tuple_variadic`.
+  - `go` on a call that is not a coroutine reads "`go` needs a coroutine, but `work(1)` returns `int`" instead of "expected `a coroutine for go`".
+  - A diagnostic on a rewritten line (`go f(x)`, a `?` expansion) is anchored to the spanned text on the original line when it appears there, instead of the carried-over column (which could land past the end of the expression).
+
+#### W3 — cross-module & analysis passes
+
+- **Post-review fixes.** Cross-module free-function shapes now retain whether a
+  function is `async`, so both `from provider import make; make()` and
+  `import provider; provider.make()` type as coroutines until awaited instead of
+  masquerading as the declared result type. The docs site labels unreleased
+  beta.1 behaviour, generates working GitHub edit links, and builds without
+  unknown-code-language warnings. The symlink-escape regression test now asserts
+  stable diagnostic fragments rather than terminal-width-dependent wrapping.
+- **Extension calls in typed lambdas and pattern captures are lowered**
+  (W3-08). A lambda parameter takes the type of its contextual `Callable`
+  annotation, and `match` sequence / mapping / `as` / or-pattern captures
+  take the subject's type, so `x.slug()` on such a receiver is rewritten to
+  the `extend BUILTIN` function instead of raising `AttributeError`.
+- **`-O` / `auto-memoise` can no longer change what a program prints**
+  (W3-04, W3-05). A plain `@pure` under `-O` is held to the full
+  cache-safety proof — `@pure` is a purity claim, not a cacheability claim —
+  so `@pure def window(n) -> list[int]` is no longer cached (a caller's
+  `append` leaked into the next call) and `stress/…/05-knn-toy.ty` no longer
+  fails with `unhashable type: 'Point'`. The silent paths (`auto-memoise`,
+  `pgo-memoise`, `-O`) now also refuse: recursive functions (direct or
+  mutual — the cache wrapper deepens every frame, turning a working depth
+  into `RecursionError`); `float`, `Decimal`, path, datetime and `Callable`
+  parameters, and `int` / `str` inside a tuple key (`0.0 == -0.0`,
+  `(True,) == (1,)`); `Callable` results; `frozen` classes / `NamedTuple`s
+  with a mutable field; user classes named like stdlib types (`Flag`,
+  `Path`, `Decimal`, `UUID`, `date`, `Pattern` are resolved through the
+  imports first); constructors that run code (`__post_init__`, a
+  hand-written `__init__`, a foreign base); class-attribute reads; whatever
+  an `assert` evaluates; `decimal` (context-dependent), `Path.cwd()` /
+  `Path.exists`, and `heapq.heappush` / `bisect.insort` /
+  `operator.setitem` on a non-fresh argument; nested `def`s; and a call to a
+  `@pure` helper whose own check was inconclusive. A silent path emits
+  `@functools.lru_cache(maxsize=1024, typed=True)` — typed, so `show(True)`
+  no longer returns the cached `show(1.0)`, and bounded, so a cache keyed on
+  every rendered document or crawled URL no longer retains them all. An
+  explicit `@memo` keeps `@functools.cache`. None of this adds a
+  `tyc::impure_pure_fn` error: every new finding is "not provably pure",
+  which only withholds the optimisation.
+- **auto-gather resolves callees correctly and raises the original
+  exception** (W3-07). A `@gatherable` *method* no longer makes a
+  same-named module-level function eligible — a bare-name call never
+  reaches a method — so `stress/round-2026-09-01/analyse/p_gather.ty`
+  prints `['a', 'b']` under `-O` as it does by default. A folded run now
+  hands callers the failing call's own exception (the earliest failing task
+  in source order) instead of the `TaskGroup`'s `ExceptionGroup`, so
+  `try: await load(-1) except ValueError:` in a *calling* frame catches it
+  under `-O` too.
+- **auto-parallel and the reduction rewrite no longer change program
+  semantics** (W3-09). The comprehension rewrite now requires the same
+  bounded, effect-free iterable as the reduction rewrite (a display, a
+  builtin `range(...)`, or a `list` / `tuple` / `set` / `frozenset`-annotated
+  name in scope): `map_pure` reads the whole iterable first, so
+  `[parse(l) for l in lines()]` over a printing generator read lines `4` and
+  `5` before the `ValueError`, and an infinite iterator hung. A parameter,
+  local or comprehension target that shadows a pure function's name is no
+  longer treated as that function (both rewrites). And the reduction rewrite
+  requires each element to be a provable `int`, not just an `int`
+  accumulator: `total += field(r)` with `field -> Any` over `1e16, -1e16`
+  printed `1.0` instead of `0.0`.
+- **comptime: a step budget, CPython-faithful values, and a real anchor**
+  (W3-10). Each `comptime let` now has a 10-million-step evaluation budget,
+  so exponential recursion inside the 64-frame depth cap (`f(n - 1) +
+  f(n - 1)`, `f(40)`) fails with `tyc::comptime` instead of hanging
+  `tyc check`, `tyc build` and the LSP. Values CPython would raise on are
+  build errors rather than inlined `inf` / `nan` / U+FFFD: `10.0 ** 400`,
+  `0.0 ** -1`, `0 ** -1`, `(-8.0) ** 0.5` (complex), and a lone-surrogate
+  string literal (`"\ud800"`); `strip()` / `lstrip()` / `rstrip()` now strip
+  U+001C–U+001F as `str.isspace()` does. A type mismatch on a `comptime let`
+  is reported at the binding instead of line 1, column 1, and a deep
+  recursion's error names the call once instead of once per frame.
+- **Every `tyc::comptime` error points at its source** (W3-10 follow-up).
+  `tyc check` grouped comptime evaluation failures under "(no location)"
+  and `tyc build` printed them without a snippet; each now carries a `.ty`
+  span — the innermost failing part of the initialiser (`time.time()` in
+  `comptime let NOW: float = time.time()`, or the `boom(3)` call whose
+  `comptime def` body failed), or the binding name when it lacks an
+  annotation or initialiser — relocated through the preprocessor's line
+  map. Message text and exit codes are unchanged.
+- **`tyc::contains_secret_literal` redesigned** (W3-06, warn-level). The
+  165-entry keyword cross-product is replaced by a word matcher shared by
+  the lint and the `tyc build` scan (`tyc-analyse/src/secrets.rs`): the name
+  is split into words (squashed words segmented, so `APIKEYS` now warns), a
+  credential noun (`PASSWORD`, `SECRET`, `TOKEN`, `CREDENTIAL`) or a
+  qualified key noun (`API_KEY`, `DB_PASS`) names a secret, and a metadata
+  word after it (`TOKEN_LIMIT`, `PASSWORD_MIN_LENGTH`, `CREDENTIALS_PATH`,
+  `AUTHORIZATION_URL`, `AWS_ACCESS_KEY_ID`), a counting word (`MAX_TOKENS`)
+  or a non-secret qualifier (`PRIMARY_KEY`, `SORT_KEY`, `PUBLIC_KEY`) rules
+  it out. Ambiguous names (`KEY`, `STRIPE_KEY`, `DATABASE_DSN`,
+  `SESSION_COOKIE`) warn only on a credential-shaped value (known token
+  prefix, PEM private key, URL with a password, long high-entropy run);
+  placeholders (`""`, `"xxxx"`, `"<token>"`) never warn. The build scan
+  fires only on string values (no more `comptime let TOKEN_LIMIT: int`
+  warning) and also checks the key of every `env("…")` the binding reads,
+  through `comptime def` calls too, so `comptime let DEPLOY_CFG: str =
+  env("AWS_SECRET_ACCESS_KEY")` now warns.
+- **`extend BUILTIN:` travels through a `pub *` facade** (W3-02). With
+  `pkg/text.ty` declaring `extend str: def slug(...)` and `pkg/__init__.ty`
+  holding `pub *`, a consumer importing `from pkg import describe` got
+  `tyc::attribute_not_found` on `s.slug()`, and no surface lowered the
+  call. The facade's aggregated shape now carries every
+  constituent's extension methods (sub-packages included), the emitted
+  `__init__.py` re-exports the lifted `__typhon_ext_*` helpers, and the VM
+  loads a facade's constituents' extensions — checker, build and `tyc run`
+  agree.
+- **Cross-module `extend User:` is seen by the modules that import it**
+  (W3-03). Module B's `extend User:` of A's class patches `User` when B is
+  imported, but a module C importing both got `tyc::attribute_not_found`
+  on `u.tracking_id()`. B now publishes the patched methods (a
+  `__typhon_extend_<Class>@<module>` sentinel in its shapes), and a module
+  that imports B — by name, as a module, or through a `pub *` facade —
+  sees them on its `User`, on `a.User`, and on a `User` returned by an
+  imported function. A module that does not import B is still rejected:
+  nothing guarantees B's patch ran. The docs-site `extend` page now shows
+  the real lowering (a module-level patch, not a merged class body).
+- **Lint false positives and negatives** (W3-11; warn / advice level).
+  `shared_mut_across_tasks` now sees in-place mutation of module state
+  (`SEEN[k] = …`, `LOG.append(…)`, `del CACHE[k]`, `Cls.attr = …`) and a
+  same-module helper writing on the spawned task's behalf; a parameter or
+  local of the same name is not module state. `gather_opportunity` treats
+  two awaits on the same receiver (`conn.execute` twice, `client.login()`
+  then `client.fetch()`) as dependent. `blocking_in_async` follows import
+  aliases (`from time import sleep`, `import time as t`, `import
+  subprocess as sp`). `resource_not_managed` no longer fires on
+  `self.fh = open(…)`, a handle closed in a later `finally`, or one handed
+  to `ExitStack.enter_context` / `closing`, and now flags handles used and
+  dropped inline (`open(p).read()`, `json.load(open(p))`).
+  `perf_membership_in_loop` is silent for lists whose elements are not
+  provably hashable and when the loop may mutate the list through a call;
+  `perf_sorted_first` is silent inside a `try` catching `IndexError` /
+  `LookupError`. Under `[strictness] require-with = "error"` or
+  `blocking-in-async = "error"` the newly-caught shapes fail the build.
+- **`go` on an imported synchronous function is rejected** (W3, extending
+  W2-11). `from helpers import work` + `go work()`, where `work` is a plain
+  `def` in a project `.ty` module, passed `tyc check` and raised
+  `TypeError: a coroutine was expected` from `asyncio.create_task` at
+  runtime; it is now `tyc::type_mismatch` ("`go` needs a coroutine, but
+  `work()` returns `int`"), as for a same-module `def` (`await work()`
+  likewise). Shapes
+  carry a new `ArityInfo::declared_sync` flag, set only for an undecorated
+  `def` extracted from `.ty` source — `.dty`, bundled and venv-introspected
+  stubs, decorated functions and module-qualified calls stay permissive.
+
+#### W4 — CLI, LSP, filesystem safety
+- **LSP definition URIs rebased onto client workspace root.** `goto_definition` now uses the client's declared workspace root URI (preserving symlink prefixes such as `/var/folders` or `/tmp` rather than macOS `/private/var/...`) or open-document URI, preventing editors from opening duplicate tabs on cross-file jumps.
+- **Build escape test uses stable assertion.** The regression test asserts on the unrendered error message rather than terminal-width-dependent formatting from miette.
+- **Dependencies commands preserve pyproject.toml and reject symlinks.** `tyc sync`, `tyc add`, and `tyc remove` now update `pyproject.toml` via `merge_pyproject` with `atomic_write`, preserving comments, authors, and `[tool.*]` tables while refusing symlinked targets. Edits to `typhon.toml` also enforce atomic writes and reject symlinks.
+- **Migrate overwrite safety, symlink loop protection, and semantic preservation.** `tyc migrate` now skips virtual environments, VCS metadata, caches, `node_modules` and `build` directories, avoids symlink loops and escaping symlinks, refuses to overwrite existing `.ty` files without `--force`, and writes atomically. Preserves custom `@dataclass(...)` decorators on plain classes, treats `+=` as reassignment (`mut`), moves method aliases (`__radd__ = __add__`) into `impl` blocks, preserves `from typing import Union` when used at runtime, and protects `Union` arguments inside `isinstance(...)` calls from rewriting.
+- **Build confinement anchored to config directory and validated upfront.** `tyc build` now confines build outputs to `config_dir` (the directory enclosing `typhon.toml`) rather than the invocation path, fixing builds invoked from subdirectories (`cd proj/src && tyc build` or `tyc build src`). Output confinement is validated before writing anything to disk, preventing `pyproject.toml` mutations or empty directory creation when the output destination escapes the project root.
+- **Open consumers refresh when a dependency changes** (W4-09). When a
+  module changes — an edit, an unsaved buffer opened or closed, or a
+  watched-file change on disk — the LSP re-checks the open documents that
+  import it, so a consumer's error appears as soon as the module it imports
+  changes. (W4-10 narrowed this from "every open document".)
+- **`tyc install skill` refuses to write through a symlink** (W4-13, install
+  half). Every destination component is checked before the first write, and
+  writes are atomic.
+- **`tyc check DIR` checks nested projects separately** (W4-06). A directory
+  argument is split at every nested `typhon.toml`; each project is checked
+  with its own config and database, as `tyc check <project>` would check it,
+  and files outside every nested project keep the config found for `DIR`.
+  `tyc check examples/` used to report 34 errors from apps resolving each
+  other's modules; it is now clean.
+- **LSP hover, definition, completion and semantic tokens follow sugar
+  expansion** (W4-07). Editor positions are mapped through the same expansion
+  line table diagnostics use, with the column recovered by locating the
+  identifier among the lines its source line expanded into. Below a `?`,
+  `gather:` or with-chain, hover named a desugaring temporary
+  (`__typhon_q_0__`), the wrong line's binding or nothing; go-to-definition
+  and the hover range pointed at the expanded buffer's line; member completion
+  read the wrong receiver. Desugaring temporaries (`__typhon_*`) are never
+  offered by hover, definition or completion. Cross-file definitions map back
+  through the target file's own table.
+- **The language server survives symlink loops and refuses an escaping
+  `src`** (W4-08). `tyc lsp` lists sources with the CLI's symlink-safe walk
+  (now shared from `tyc-venv`, which also fixes the venv import scan that hung
+  `tyc check` on a `src/a -> .` loop when a dependency was declared) and loads
+  `typhon.toml` with the CLI's validating loader (moved to `tyc-venv` and
+  re-exported as `tyc::config`), so an absolute or `..` `[project] src` is
+  refused instead of walked. `ln -s . src/a; ln -s . src/b` used to stall
+  diagnostics for good. The source listing is cached instead of re-walked on
+  every keystroke.
+- **Language-server robustness** (W4-11). A malformed frame (truncated or
+  non-UTF-8 JSON, non-JSON, a JSON array, a message without `"jsonrpc"`) gets
+  a `-32700` / `-32600` reply and the server keeps reading; tower-lsp-server
+  used to stop after the first one and exit 0. `tyc lsp` exits 1 on `exit`
+  without `shutdown` (the spec's code) or when stdin closes first, 0 after
+  `shutdown`. Reopening a closed document reuses its Salsa input (300 reopen
+  cycles took RSS from 5 MB to 75 MB). An invalid `typhon.toml` is reported as
+  a diagnostic on the file — on the offending key, or at a TOML syntax error —
+  instead of silently falling back to defaults, and clears once fixed.
+- **Language-server performance** (W4-10). Edits are checked once the
+  keystrokes pause (100 ms debounce): a burst of 51 full-text changes used to
+  be checked and published 51 times, the last 9.6 s after the burst. A newer
+  edit supersedes a pending or running check — the check stops between its
+  phases and never publishes a superseded result. An edit refreshes only the
+  open documents that import the edited module, never the edited document a
+  second time (W4-09 re-checked every open document on every keystroke).
+  `semanticTokens/full` is linear (positions came from a scan from offset 0
+  per token: 20k lines took 15.3 s), and its parse and token walk, like the
+  Salsa queries behind hover, completion and go-to-definition, run on a
+  blocking thread instead of the server's single async thread. The check
+  releases the database lock around venv introspection.
+- **`typhon_runtime` is a reserved module name** (W4-12, new
+  `tyc::reserved_module_name`). The runtime package `tyc build` generates
+  replaced a project's own `src/typhon_runtime` module or package: check and
+  build were clean, then the program failed with `ImportError: cannot import
+  name 'helper'`. `tyc build` now fails before writing the runtime when the
+  program imports a name or submodule from `typhon_runtime` that the generated
+  runtime does not provide (a program that could not start); otherwise `tyc
+  build` and `tyc check` warn that the name is reserved. No program that runs
+  today is rejected.
+- **`tyc fmt` refuses to write through a symlink leaving the project**
+  (W4-13, fmt half). `tyc fmt src/` with `src -> ../elsewhere` reformatted the
+  link's target; files that resolve outside the project (the nearest directory
+  above the argument with a `typhon.toml`, never one reached through a
+  symlinked directory) are now skipped with a warning, as `tyc fmt .` already
+  did.
+- **`tyc init` no longer pins the optimiser knobs, and checks before
+  writing** (W4-14). The scaffold wrote `auto-memoise = false`,
+  `auto-gather = false` and `pgo-memoise = false`, and an explicit
+  `[strictness]` entry beats `[optimise] level` and `-O`, so `tyc build -O`
+  did nothing on every new project; the three lines are gone (they were the
+  defaults) and a comment explains how the knobs follow `[optimise] level`.
+  (Lands with W3-04's `-O` memoise safety.) `tyc init` over an existing
+  `src/main.ty` used to write `typhon.toml` and `tests/` before failing; every
+  refusal now comes first, a symlink at either path counts as present, and
+  both files are written atomically.
+- **Smaller CLI fixes** (W4-15).
+  - `tyc check` on a path with nothing to check (an empty directory, a
+    `.py`-only tree, a mistyped path) exits 1 instead of passing, so CI cannot
+    go green without checking anything.
+  - A piped `tyc repl` (a script fed on stdin) exits 1 when any snippet failed
+    to compile or raised; it exited 0.
+  - The `pyproject.toml` merge no longer writes a static `[project] version`
+    when the file declares `dynamic = ["version"]` (`uv sync` rejected the
+    pair).
+  - `tyc add pkg@git+https://…` records a PEP 508 direct reference
+    (`pkg @ git+https://…`) instead of `pkg==git+https://…`.
+  - `tyc debug` writes its wrapper's string literals as Python escapes; Rust's
+    `{:?}` produced `\u{200b}` for a zero-width space in a path, a Python
+    `SyntaxError`.
+  - `tyc trace` rewrites frames inside `ExceptionGroup` tracebacks (the
+    `  |   File "…"` rows every failed `gather:` prints), keeping the gutter.
+- **Warnings for parallel settings that cannot take effect** (W4-16).
+  `[python] free-threaded = true` with a target lacking the `t` suffix, and
+  `[strictness] auto-parallel-reductions = true` while `auto-parallel`
+  resolves to off (after `[optimise] level` and `tyc build -O`), are now
+  reported by `tyc check` and `tyc build`. Decision: warnings, not
+  config-load errors — both combinations build and run today (one only
+  switches on advice lints, the other is a no-op), and validation only
+  rejects configs that cannot work. The free-threading preset on the docs
+  site now uses `target = "3.14t"`.
+- **Docs: `tyc migrate --force`** is now documented in `docs/cli.md` and on
+  the docs site (it overwrites existing `.ty` files; without it the command
+  refuses before writing anything).
+- **`tyc migrate DIR` migrates `tests/` again.** The migrate overwrite-safety
+  change above walked the tree with the build's source filter, which skips
+  every `tests/` and hidden directory, so a project's test suite was silently
+  left unmigrated while the command reported success. Migration now has its
+  own filter that keeps every user-authored directory and skips only virtual
+  environments (any directory with a `pyvenv.cfg`), VCS metadata, caches,
+  `node_modules` and `build`.
+- **`tyc migrate` keeps comments after a stripped constructor.** Removing a
+  trivial `__init__` also removed every comment line between it and the next
+  statement, whatever its indent — a column-zero `# keep this` after the
+  class, or the comment above the next method. A comment dedented to the
+  class body's level or shallower now ends the method; comments inside it
+  still go with it.
+- **`extend BUILTIN:` helpers reach consumers of a source-root facade and of
+  `from .. import name`.** A `pub *` facade at the source root
+  (`src/__init__.ty`) looked its siblings up as `.text` instead of `text`, so
+  the generated `__init__.py` did not re-export their `extend str:` helpers.
+  And `tyc build` resolved `from . import name` / `from .. import name` only
+  as a submodule, never as a name read off the package: a consumer's
+  `describe(s).slug()` stayed a method call, so check and build were clean
+  and CPython raised `AttributeError`. A name that is not a submodule now
+  resolves through the package, and the helper is imported from it.
+- **`tyc::reserved_module_name` covers reads through a bare
+  `import typhon_runtime`.** The W4-12 check looked only at `from
+  typhon_runtime import …` and `import typhon_runtime.sub`, so a program that
+  defined `typhon_runtime.ty`, called `typhon_runtime.helper()` after a bare
+  `import typhon_runtime`, and used `Result` built cleanly, then raised
+  `AttributeError` once the generated runtime replaced the module. Attribute
+  reads through a bare import (or `… as alias`) are now checked against the
+  generated runtime; a name the file rebinds elsewhere, an attribute it sets
+  itself, and dunders are not counted, so no program that runs is rejected.
+- **A refused `pyproject.toml` no longer leaves `tyc add` half-done.**
+  `tyc add` / `tyc remove` refused a symlinked or unparseable
+  `pyproject.toml` only after rewriting `typhon.toml`, so the command failed
+  with the dependency already added (or removed). Both files are now rendered
+  first and written together; a refusal changes neither, and a failed
+  `pyproject.toml` write restores `typhon.toml`.
+
+#### W5 — VM & harness
+
+**The VM test suite is green on macOS again, and no longer hides tests.**
+A debug-build VM frame needs ~97 KiB of native stack (release: ~7 KiB), so
+`slot_recursion_fib` — 20 frames deep — overflowed libtest's 2 MiB thread
+stack and aborted the whole `tyc-vm` test binary, leaving 84 tests
+unreported. `run_capturing` and `run_project` now run the interpreter on a
+scoped 256 MiB worker stack, matching `tyc/src/main.rs`.
+
+**Host-derived test expectations, not one platform's literals.** The math
+test pinned glibc libm values while the VM deliberately calls the *host*
+libm (Apple libm differs by an ulp); the `random`, `filesystem` and `math`
+transcripts likewise recorded one host's errno numbers, `OSError`
+subclass, tempdir and locale-encoding spelling. All four now compute their
+expectations from the hosting `python3.13` at test time. `tyc-vm` goes
+from 148 reported tests (84 hidden) to **232 passing** on macOS. One
+cosmetic residual: CPython spells the default text encoding `UTF-8` on
+macOS and the `io` shim lowercases it — documented in `docs/vm.md`.
+
+**The verification shell gates run on macOS.** Both `scripts/` gates used
+four GNU-only constructs, and one failed silently: `find -printf` built
+the differential's project list (with the error swallowed by
+`2>/dev/null`), so on BSD find the list came out empty, every
+project-internal `.ty` was mis-discovered as a standalone unit, and a run
+covered 1,699 units instead of ~1,481 — a different corpus with no error.
+`-exec dirname` (POSIX) replaces it, and both gates now refuse to run when
+discovery finds nothing. `xargs -a`/`-d` became `tr '\n' '\0' | xargs -0`,
+`grep -P` became `awk` field matching, and the absent GNU `timeout` is
+provided by a small PATH executable (`scripts/portable.sh`). Verified on
+macOS: the differential covers 1,481 units and PASSes with its five
+baseline divergences, and the knob matrix is 12/12 (previously unrunnable).
+
+**The perf gate compares like with like.** Its verdict was an absolute
+median against one committed number recorded on a single host, so an
+unchanged tree read as +140% on another machine. It now builds a control
+from the latest release tag in the same run and interleaves candidate and
+control timings, failing only on the ratio; the absolute baseline stays
+for reporting and a `--no-control` fallback, and `--update` records the
+host that produced it.
+
+**Post-review fixes.** Cross-module free-function shapes now retain whether a
+function is `async`, so both `from provider import make; make()` and
+`import provider; provider.make()` type as coroutines until awaited instead of
+masquerading as the declared result type. The docs site labels unreleased
+beta.1 behaviour, generates working GitHub edit links, and builds without
+unknown-code-language warnings. The symlink-escape regression test now asserts
+stable diagnostic fragments rather than terminal-width-dependent wrapping.
+
+- **VM `re` follows Python semantics** (W5-13). A program importing `re`
+  runs on compiled CPython under normal `tyc run`; with `--no-fallback` the
+  VM subset honours `re.ASCII` and refuses unsupported flags.
+- **NaN identity in containers** (W5-14). `[nan] == [nan]`, `nan in [nan]`
+  and NaN dict keys match CPython's identity-first comparison.
+- **The frozen marker no longer collides with user data** (W5-15). Frozen
+  dicts and sets carry the flag outside their contents; freezing a frozen
+  dataclass instance returns the same object, and enum members, dates,
+  times, timedeltas, timezones and paths pass through unchanged, as in the
+  emitted runtime.
+- **C3 method resolution and live class namespaces** (W5-07). The VM
+  computes each class's `__mro__` by C3 and resolves attributes, `super()`
+  and `__mro__` through it, instead of walking bases depth-first and
+  copying every base's methods and class attributes into each subclass at
+  creation. A diamond `D(B, C)` now resolves `D > B > C > A` (it printed
+  `D>B>A`, and a cooperative `__init__` diamond skipped a base); an
+  attribute set on a base after a subclass exists is visible through it; a
+  subclass's own class attribute shadows an inherited method; an
+  inconsistent base order raises CPython's MRO `TypeError`. Also fixed
+  along the way: `classmethod(f)` / `staticmethod(f)` / `property(f)`
+  called as functions bind correctly (`cls` was left unbound and a
+  property read returned a method), `super()` finds class attributes,
+  works inside classmethods and as a value (`super().name`),
+  `__init_subclass__` and `__set_name__` run at class creation, data
+  descriptors' `__set__` / `__delete__` and `@prop.deleter` are honoured,
+  and `del Cls.attr` / `delattr(Cls, …)` work.
+- **Sets iterate in CPython's order** (W5-08). VM sets were a Rust
+  `HashSet` with a random seed — a different iteration order on every
+  run — while `repr` sorted, so the VM even disagreed with itself
+  (`s = {-1, 0, 1}; print(s, list(s))`). Sets are now a reproduction of
+  CPython's table with CPython's hashes, so iteration, `repr`, `pop()` and
+  every set operation match CPython (`{5, 3, 1, 100, 33, 2}` prints
+  `{1, 33, 3, 100, 5, 2}`; strings match under `PYTHONHASHSEED=0`). Also:
+  the set methods accept any iterable; `pop`, `intersection_update`,
+  `difference_update` and `symmetric_difference_update` exist;
+  `frozenset | set` is a `frozenset`; `isinstance(frozenset(), set)` is
+  `False`; `frozenset(f) is f`.
+- **Value-mixin enums behave as their value** (W5-10). `class Mode(str,
+  Enum)` members compared unequal to their string (`Mode.FAST == "fast"`
+  was `False`, `{"fast": 1}.get(Mode.FAST)` was `None`), `class L(int,
+  Enum)` likewise, and `isinstance(IntEnum.X, int)` was `False`. Members
+  of `IntEnum` / `StrEnum` / `IntFlag` and of data-type-mixin enums now
+  equal, hash and order as their value (in containers and dict keys too,
+  keeping member identity), are instances of the value's type, encode in
+  `json` as the value, and `str()` / `format()` follow CPython 3.12+.
+  `StrEnum`'s `auto()` gives the lower-cased name, and duplicate values
+  become aliases.
+- **Changing a dict or set while iterating it raises** (W5-11). Adding
+  or removing keys inside `for k in d:` completed silently on the VM;
+  CPython raises `RuntimeError: dictionary changed size during
+  iteration` (and `Set changed size during iteration`). Dict and set
+  iterators now walk the live container and raise the same errors. Dict
+  views (`keys()` / `values()` / `items()`) became live views of the dict
+  rather than snapshots (`k in d.keys()` is a lookup), and `reversed()`
+  of a list / dict is live while refusing non-sequences as CPython does.
+- **Oversized results raise instead of aborting `tyc run`** (W5-12).
+  `"a" * 2**62`, `bytes(2**62)`, `zfill` / `ljust` / `rjust` / `center`,
+  `to_bytes`, `os.urandom` and huge f-string / `format` widths aborted the
+  process (exit 134) and `bytes(2**63)` panicked; they now raise CPython's
+  `MemoryError` / `OverflowError`. Float precisions of 65,536 and more
+  panicked in Rust's formatter and now format exactly ("precision too big"
+  past `INT_MAX`); `round(x, n)` clamps `n` as CPython does. A
+  self-referential `json.dumps` overflowed the native stack and now
+  raises `ValueError: Circular reference detected` (`RecursionError`
+  past 9,997 levels). A raised `sys.setrecursionlimit` no longer lets deep
+  recursion overflow the native stack: the VM checks its remaining stack
+  on every call and raises `RecursionError`. `repr` of nested lists past
+  100 levels printed `[...]`; it now detects self-reference by identity,
+  as CPython does, and raises `RecursionError` only past CPython's depth,
+  where deep `==` / `<` likewise raise instead of answering `False` /
+  `TypeError`.
+- **`as!` on the VM follows the checked-cast target table** (W5-16).
+  The VM's cast check disagreed with the compiled runtime in both
+  directions: newtypes and `Literal` targets accepted anything, `type`
+  aliases (`IntList`, `Pair[int]`) were rejected outright or accepted
+  without looking, `Sequence[int]` / `Mapping[...]` skipped their
+  elements, an `interface` with only data members accepted any value, and
+  `Box[int]` / `Callable[...]` were accepted where the runtime refuses
+  them. The VM now expands aliases from their definitions, checks a
+  newtype's declared base, and matches `typhon_runtime/cast.py` case by
+  case, including its refusals and its failure messages.
+- **`freeze let` values match the runtime's** (W5-17). A frozen dict
+  reported `type(D).__name__ == "dict"` and `isinstance(D, dict)` on the
+  VM; the generated runtime makes it a `mappingproxy`, which is not a
+  `dict`. Both now agree. (Frozen dataclass instances already passed
+  through unchanged; a parity test now pins that against the runtime.)
+- **Remaining silent VM divergences closed** (W5-18). The VM now matches
+  CPython on: correctly rounded float `repr` ties; `OverflowError` for
+  ints too large for a float (`float(10**400)`, `10**400 // 3.0`), for
+  `2.0**10000` and for an over-large `int / int` (now correctly rounded:
+  `10**400 / 10**399` is `10.0`, not `nan`); the 4,300-digit int/str
+  limit with `sys.get/set_int_max_str_digits`; `f"{x!s:<8}"`;
+  `f"{None:>6}"`, `format(1, ',_')`, `'%c' % 0x110000`, `'abc'.split('')`
+  and `1 in "abc"` raising; huge slice bounds clipping and huge indices
+  raising `IndexError`; `raise e from e`; `iter(g) is g`;
+  `True.bit_length()`; set-like comparisons of keys / items views;
+  `dict.fromkeys` / `str.maketrans` (dispatched on their first argument
+  before — the lead's `corpus/valid/textwrap.ty` case); three-argument
+  `type()`; class decorators (they were silently skipped, so
+  `@total_ordering` and registry decorators had no effect);
+  `Cls.__dict__`; abstract-class instantiation errors;
+  `@dataclass(order=True)` and `repr=False`; 3.13 docstring dedenting;
+  `in` through `__iter__` / `__getitem__`; `__await__`; `NotImplemented`;
+  `Box[int]` / `list[int]` generic aliases (and `class Named(Box[int])`);
+  runtime `int | str` unions in `isinstance`. The remaining known gaps
+  (type-alias objects, `__del__`, metaclasses, lone surrogates) are listed
+  in `docs/vm.md`.
+- **Four VM performance cliffs are linear now** (W5-22). `del d[k]` /
+  `d.pop(k)` shifted every later key (draining 80k keys took 19 s, now
+  0.03 s): a dict deletes by leaving a hole, as CPython's does.
+  `OrderedDict.popitem(last=False)` (47.8 s for 60k items, now 0.16 s),
+  `deque.popleft` / `appendleft`, and `len(s)` / `s[i]` / `s[a:b]` on a
+  long string no longer rescan their whole container per call; `len()`
+  of a dict or set no longer counts its keys. An exhausted dict or set
+  iterator now ignores later mutation (it raised `RuntimeError` where
+  CPython raises `StopIteration`).
+- **Keyword arguments bind like CPython's, and the pre-run scan covers
+  builtins and keywords** (W5-21, partial). Builtin-type methods bind
+  keywords to their 3.13 signatures — before, a keyword reached most
+  methods as a stray positional tuple (`s.replace("a", "b", count=2)`
+  raised, `b.hex(sep=":")` was silently ignored, `d.get(k, default=0)`
+  returned `None` where CPython raises). `round(ndigits=)`, `int(base=)`,
+  `math.prod(start=)`, `heapq.nlargest(key=)`, `json.loads(object_hook=)`
+  and friends are accepted. `tyc run` routes a program to the compiled
+  path when it uses a CPython builtin the VM lacks (`exec`, `memoryview`,
+  `globals`, …), `.add_note()`, or a keyword the VM would reject or
+  ignore.
+- **One front end for every VM entry point** (W5-20). The entry program,
+  imported sibling modules and the embedded stdlib shims all go through
+  `tyc_syntax::preprocess::expand_and_preprocess_mapped` — the chain
+  `tyc check` and `tyc build` run — instead of two hand-assembled copies
+  that had drifted (they ran `expand_lazy_lets` before
+  `expand_typed_let_unpack`, the reverse of the canonical order).
+- **VM tracebacks report the `.ty` source** (W5-19). Frames carry the line
+  the user wrote and its text — an 8-line file with one `?` no longer
+  reports `line 10`, and an `as!` frame no longer shows
+  `__typhon_checked_cast__(…)`. Uncaught chained exceptions print their
+  cause / context sections, deep recursion collapses into "[Previous line
+  repeated N more times]", and a user-raised `KeyError` keeps its quotes.
+  The recursion limit now counts the module frame, so a program that
+  catches `RecursionError` sees the depth CPython reports (one less than
+  before).
+- **Programs that schedule tasks run on CPython under `tyc run`** (W5-09).
+  The VM runs a coroutine to completion when it is created, so
+  `create_task` printed the task body before the caller continued,
+  `asyncio.wait_for` ignored its timeout, `gather:` / `asyncio.gather`
+  did not interleave, and `go` ran the spawned task before the spawning
+  code went on — all silently, with exit 0. The pre-run scan now sends a
+  program that uses `go`, `gather:` or an `asyncio` scheduling member
+  (`create_task`, `ensure_future`, `gather`, `wait`, `wait_for`,
+  `timeout`, `as_completed`, `TaskGroup`, `shield`, `to_thread`, the
+  queues and locks, the event-loop accessors) to the compiled path, with
+  a `note:` naming the member. Sequential `await` chains stay on the VM.
+  A CPython-style ready queue in the VM remains open work.
+
+#### W6 — CI, docs & hygiene
+
+- Clippy passes on Rust 1.98 as well as the pinned 1.94 (`question_mark`,
+  `unnecessary_sort_by`, `useless_conversion` at three sites).
+- `.gitignore` covers `.DS_Store` and the root `/.venv/`.
+- Docs-site "Edit page" links point at each file's real location (the
+  `baseUrl` double-prefix is gone).
+- Pages describing unreleased beta.1 behaviour carry a banner, and
+  `status.mdx` names alpha.9 as the current release.
+- New non-blocking macOS CI job; workflows hardened (least-privilege
+  permissions, re-pinned actions, cold release builds).
+- Dependabot ignores reverted bumps; `engines.vscode` bumped to `^1.138.0`.
+- The README flagship exhaustiveness claim is scoped to direct matches.
+- After W1-04/W1-05 the claim is full strength again: the README,
+  `docs/language.md` and the docs-site match pages describe exhaustiveness
+  over `Result` payloads, `T?`, `bool`, literal unions and nested sealed
+  unions, with the binary's real `non_exhaustive_match` output.
+- The docs site carries the W2-04 `as!` supported-target table (refused
+  targets are a check-time error, not a silent accept) and the W2-05 frozen
+  binding types (`freeze let` now has a reference section).
+- The docs-site `tyc run` page documents the automatic CPython fallback,
+  `--no-fallback`, and that a program importing `re` runs on compiled
+  CPython (W5-13); it no longer says there is no fallback.
+- The docs-site language reference matches the W1/W2 checker: `del` and
+  `except … as` cannot end a `let`, `typing` names used as runtime values
+  need their import, `go` needs a coroutine, `int ** int` with a negative
+  literal exponent is `float`, and interface conformance (parameter names,
+  optional parameters, writable fields) is described as the checker
+  enforces it — the old "optional parameters match in either direction"
+  sentence was wrong.
+- Every code `tyc explain --list` prints now has a docs-site section: 44
+  codes had only their `docs/diagnostics` page. They are on the existing
+  catalog pages plus a new *Lints & Performance Advice* page, each with an
+  example checked against the binary, and the catalog index lists every
+  code. A `shipped_docs.rs` test fails when a code the compiler declares is
+  missing from `tyc explain --list`, from `docs/diagnostics/`, or from the
+  docs-site catalog and its index. `missing_initialiser` and
+  `python_semantic_drift` are listed but never emitted; their pages say so.
+- New `fmt-corpus` CI job (W7-03 request): a copy of `examples/`,
+  `stress/` and `corpus/valid/` has its code de-formatted (`let x: T = 1` →
+  `let x:T=1`, no space after `,` or `:`, `=` and `->` squeezed, trailing
+  blanks; strings and comments untouched), `tyc fmt` runs over it, and every
+  unit must emit exactly the Python AST the unmodified corpus emits. A file
+  `tyc fmt` refuses only after de-formatting also fails the job. First run:
+  1,224 built units identical, 264 non-building on both sides.
+- `scripts/emitted-ast.py equiv A B` is the emitted-AST equivalence harness
+  (step 0 of `docs/design/sugar-as-ast-nodes.md`): A and B are `tyc`
+  binaries or git revisions; every corpus unit is built with both and the
+  `ast.dump` of every emitted `.py` compared, listing the units that
+  changed. Documented in `docs/differential-testing.md` and
+  `CONTRIBUTING.md`.
+- New compatibility policy for the beta line (`docs/compatibility.md`, and
+  *Project → Compatibility Policy* on the docs site), linked from the
+  README: the additive-on-correct-programs rule, the four categories every
+  narrowing is filed under, the exceptions made since alpha.2, the surface
+  frozen for beta (each form checked against the binary), how deprecations
+  and breaking changes are made after beta, and what counts as a bug.
+- Docs cite only diagnostic codes the binary emits (`tyc explain --list`
+  minus `freeze`/`pub`, now language topics), locked in by a guard test.
+- New nullable-operator docs page listing the accepted spellings with the
+  real warning.
+- The docs site registers the Typhon grammar (no more unknown-code-language
+  build warnings); the gitignore block uses a known lexer.
+- `go` lowering docs match the binary (`tasks.spawn`, no thread pool).
+- Secret-lint comments describe the shared keyword table.
+- `|>` precedence docs match the parser.
+- Stale job counts fixed, `--no-sync` documented, review note, CONTRIBUTING.
+- Reviews moved to `docs/reviews/` with repaired links.
+- New `fmt-guard` CI job (no out-of-scope reformats); fuzz/sharding
+  recommendations recorded.
+- New `corpus/valid/` valid-programs corpus (~2.3k lines of migrated
+  stdlib, hand-fixed once) with its own `valid-corpus` CI job (a `tyc check`
+  false-positive sweep plus a scoped VM ↔ CPython differential); the seed
+  triage baselines one VM bug (`dict.fromkeys`) and records one emitter bug
+  (explicit `__init_subclass__()` calls).
+
+#### W7 — preprocessor, fmt, lowering
+
+- **`tyc fmt` no longer rewrites `?` into `| None`, and no longer panics on
+  a nullable non-ASCII type (W7-01).** The `?` restore was keyed by byte
+  column, and the spacing pass moved the column (`let z:int=r?` came back as
+  `let z: int = r | None`, `print(x,r?)` as `print(x, r | None)`); when the
+  moved column fell inside a multi-byte character (`b:Üü?`) the restore
+  panicked. The formatter now carries a marker character through the edits
+  instead of a column, and `postprocess_full` never indexes a line at an
+  unchecked offset.
+- **`tyc fmt` no longer rewrites the contents of string literals, and a
+  backslash-continued string no longer breaks `check`/`build` (W7-02).** Two
+  scanners lost track of strings across lines. The formatter's own
+  triple-quote tracker cleared its state on `y""" + """p` without noticing
+  the second literal open, so that literal got comma / `#` spacing and blank
+  lines before a `def` inside it. The shared lexical mask reset a single-
+  quoted string at end of line even when the line break was escaped
+  (`"a,b\` + newline), so the continuation was read as code: fmt respaced it
+  (`c,d  e#f"` → `c, d e# f"`), and a `?`, `as!` or `rescue` inside it was
+  lowered as sugar (`tyc::parse` on valid code, or a spurious
+  module-level-rescue error). The mask now carries a backslash-continued
+  string onto the next line, and the formatter uses the mask instead of its
+  own tracker. The same fix stops `tyc build` with `[emit] format = true`
+  from trimming trailing spaces inside a string the emitter prints as a
+  triple-quoted literal (`"\n a \n".splitlines()` printed `['', ' a']` on
+  CPython and `['', ' a ']` on the VM).
+- **`tyc fmt` checks its own output before writing (W7-03).** The formatter
+  lowers its output exactly as it lowered the input, parses both, and
+  refuses to write — leaving the file untouched and reporting a formatter
+  bug — unless the two module ASTs are equal (positions, comments and the
+  line-numbered `__typhon_*` temporaries aside; docstring whitespace is
+  tolerated only when `ruff format` ran). The same guard covers the
+  `[emit] format = true` pass over emitted Python in `tyc build`.
+- **Inline `?` keeps Python's evaluation order (W7-04).** The lift that
+  lowers an inline `?` moved its operand above the whole statement, ahead of
+  everything Python evaluates before it — on both execution surfaces, so the
+  differential gate could not see it. `return Ok(Node(start=self.pos,
+  text=self.word()?))` recorded `start` *after* `word()` advanced it;
+  `combine(first(), second()?)` ran `second` first and skipped `first`
+  entirely when `second` returned `Err`; `[side("a"), counter("b")?,
+  side("c")]` ran b, a, c; `d[k()?] = v()?` evaluated the index before the
+  value. A new step hoists, in evaluation order, every expression the
+  statement evaluates before a propagated operand into a `__typhon_ev_N__`
+  temporary — earlier arguments and keyword arguments, earlier display
+  elements, left operands, a computed call receiver (`self.peek().m(…)`),
+  and an assignment's value ahead of a target that holds a `?`. Literals,
+  names, lambdas and dotted-name receivers stay in place; a statement whose
+  operand sits under `and`/`or`, a ternary, a lambda, a comprehension or an
+  f-string is left as before. Two residual differences need a callee that
+  rebinds the exact name or attribute being read: a plain-name or
+  dotted-name receiver is read after the operand, and an augmented
+  assignment (`self.pos += self.advance()?`) loads its target after it.
+- **`gather` works as an ordinary name (W7-05).** A line starting with
+  `gather:` was taken as the `gather:` block form wherever it appeared, so
+  a class attribute `gather: bool = False` became `async with
+  asyncio.TaskGroup()` inside the class body (`SyntaxError` on CPython,
+  `NameError` on the VM), a module-level `gather: int = 3` reported a bogus
+  `tyc::unknown_name`, and a wrapped parameter `gather: bool = False,` was a
+  `tyc::parse` error. The header is now recognised only at the start of a
+  statement, and the one-line form only inside an `async def` body — the one
+  place either form can lower.
+- **An `impl` method can use a name defined after its class (W7-06).**
+  Merging `impl Greeter:` into `class Greeter` evaluated each method's
+  decorators and parameter defaults where the class is, so `def greet(self,
+  word: str = DEFAULT_GREETING)` with `let DEFAULT_GREETING` between the class
+  and the block — or a decorator defined between a sealed-union alias and its
+  `impl` — raised `NameError` on import, on both surfaces. Such a method is
+  now defined at its `impl` block and attached there (`Greeter.greet =
+  __typhon_extend_Greeter__greet`, the cross-module `extend` lowering);
+  every other method keeps the merged class body exactly as before. A method
+  moves only when the hoisted form raised `NameError` and an attribute
+  assignment reproduces the class-body behaviour, so dunders, private
+  (`__x`) names, `cached_property`/`abstractmethod`, and — until `tyc run`
+  dispatches class-attribute functions like CPython — `@property`,
+  `@classmethod`, methods a base may also define, and methods of a class
+  subclassed before the block or overridden by a subclass keep the old
+  placement. The attached method's
+  bare `super()` is spelled out, which also fixes `super()` in a
+  cross-module `extend` method.
+- **A field defaulting to a named list, dict or set no longer fails at
+  class creation (W7-07).** `let BASE: list[int] = [1]` then `class Box:
+  items: list[int] = BASE` passed `tyc check` and raised `ValueError:
+  mutable default … use default_factory` on import, on both surfaces. A
+  plain or dotted name default whose value is evidently a `list` / `dict` /
+  `set` — by the field's annotation, or by the module-level binding of the
+  name — now lowers to `dataclasses.field(default_factory=lambda:
+  list(BASE))` (or `dict` / `set`): each instance gets its own shallow
+  copy, the same fresh-value-per-instance the literal defaults already get.
+- **CRLF files: multi-line strings hold `\n`, as in Python (W7-08).** In a
+  file with `\r\n` line endings, `"""a` / `b"""` evaluated to `'a\r\nb'` on
+  both surfaces (CPython reads `'a\nb'`), and `tyc fmt`, which writes `\n`,
+  changed what the program printed — since W7-03 it refused such files
+  instead. The shared source normalisation (BOM, final newline) now also
+  reads `\r\n` as `\n`; line numbers and columns are unchanged, so
+  diagnostics and source maps point where they did.
+- **A with-chain `else` block may declare names (W7-10).** With two or more
+  bindings, `with x = f()?, y = g()?: … else err: let msg = …` was rejected
+  with a false `tyc::no_block_shadow` (whose "first declared here" label
+  then failed to render): the lowering put a copy of the `else` block under
+  each binding's guard, one after another, so `msg` was declared once per
+  binding. When the `else` block declares a name, the guards are now nested
+  `if` / `else`, so the copies sit in mutually exclusive branches — the
+  ordinary sibling-branch case — each with its own binding's error type,
+  and an `else` block that does not return continues after the chain
+  instead of crashing on `.value`. Other chains are lowered exactly as
+  before. A single shared copy, as the review proposed, would need the
+  checker to type `err` as the union of the bindings' error types and to
+  see the gate after it as exhaustive; without that it rejected valid
+  programs (`tyc::missing_return`, or a re-assignment error when two
+  bindings' `Result` types differ).
+- **Metaclasses and `plain class` subclasses emit as written (W7-11).**
+  `class Meta(type):` (and any subclass of it, or of `ABCMeta` / `EnumMeta`
+  / `EnumType`) no longer gets `@dataclass(slots=True)`, whose generated
+  `__init__` replaced `type.__init__` and raised `TypeError` the first time
+  a class used the metaclass. A `plain class` subclass no longer receives
+  copies of its parent's annotated attributes (that copy exists to feed a
+  dataclass constructor, which a `plain class` does not have), so
+  `Cfg.debug = True` now reaches a subclass that never declared `debug`; a
+  subclass that declares its own keeps it. Both were wrong on CPython; the
+  VM still ignores `metaclass=` and snapshots a base's class attributes
+  when a subclass is created, so it does not yet print the CPython result
+  for either program.
+- **`|>` works in every expression position, with one precedence (W7-09).**
+  The pipe keeps the precedence it always had at statement level — it binds
+  looser than every other expression operator, so its left operand is the
+  whole expression to its left (`not 0 |> add(0)` is `add(not 0, 0)`,
+  `1 < 2 |> f()` is `f(1 < 2)`) and its right operand must be a call or a
+  callable name — and that rule now applies in every expression slot. A
+  slot ends at a bracket, a top-level comma, a dict / slice / lambda `:`, a
+  keyword-argument or default `=`, a comprehension's `for` / `in` / `if`,
+  a statement's `return` / assignment prefix or `if` / `elif` / `while` /
+  `for … in` / `assert` header, and an f-string field's `!` / `:` / `=`.
+  Pipes in list, set and dict displays, comprehensions, subscripts, slices,
+  f-string fields and those headers were a `tyc::parse` error; a pipe after
+  a comma in parentheses swallowed the earlier arguments (`g(a, b |> f())`
+  lowered to `g(f(a, b))`, now `g(a, f(b))`). To pipe into a comparison,
+  parenthesise: `(x |> f()) > 0`.
+- **Four low-severity preprocessor and `tyc fmt` gaps closed (W7-12).**
+  - A module whose emitted Python opens more than 200 brackets at once
+    (list, set and dict displays, comprehensions, calls, subscripts) is a
+    `tyc::parse` error — "too many nested parentheses", CPython's own
+    compile-time `SyntaxError` for that `.py`. `tyc check` and `tyc run`
+    accepted it and `tyc build` emitted a file CPython refused. Grouping
+    parentheses do not count: the emitter drops them, and such a program
+    still compiles.
+  - `go` and `comptime` used as variable names at the start of a
+    continuation line inside brackets are names: `go + 1` was lowered to a
+    task spawn spliced into the argument list (`tyc::go_outside_async`),
+    and a column-0 `comptime * 3` was taken for a `comptime` declaration.
+  - `tyc fmt` no longer writes the lowering back into the file: a one-line
+    `enum Small: A; B` stays as written (it became
+    `enum Small: A = enum.auto(); B = enum.auto()`), and a declaration-only
+    `def area(self) -> float` keeps no `: ...`. A declaration-only `def`
+    with a trailing comment now parses — the appended `: ...` landed inside
+    the comment (`tyc::parse`).
+  - A propagating `?` in a replacement field on a continuation line of a
+    triple-quoted f-string lifts above the statement like one on a bracket
+    continuation line; it was a `tyc::parse` error.
+- **Inline `?`: the two W7-04 residuals are closed.** A name the operand
+  can rebind — declared `global` / `nonlocal` anywhere in the file, or a
+  walrus target of the statement — is read before the operand (`f(x, g()?)`
+  where `g` does `global x; x = …` passed the new `x`). A dotted method
+  receiver is evaluated before the arguments
+  (`self.items.append(self.word()?)` appended to the list `word()` had just
+  installed, not the one Python read); a receiver rooted at an eagerly
+  imported module (`os.path.join(…)`) or a builtin `super()` stays in place.
+  The method lookup moves with the receiver, as in Python, where the whole
+  callable is evaluated before any argument: `p.handler(p.swap()?)` called
+  the handler `swap()` had just installed, and a `@property` supplying the
+  callable ran after the operand. A receiver — a plain name too — is
+  hoisted into a temporary, which is what the checker reads (the call keeps
+  its method-call shape, so signatures, overloads and keyword arguments are
+  checked as written); after checking, both surfaces read `recv.method`
+  into that temporary (extension-method calls on builtins excepted — their
+  lookup is static). An augmented assignment whose
+  value carries a propagated operand and whose target that operand could
+  change — an attribute, a subscript, or a rebindable name — loads the
+  target first: `self.pos += self.advance()?` lowers to
+  `__typhon_ev_0__ = self.pos`, `__typhon_ev_0__ += …`,
+  `self.pos = __typhon_ev_0__` (container and non-trivial index hoisted
+  once; `+=` on the temporary keeps the in-place semantics). Both surfaces
+  share the lowering; the new test checks each against the same program run
+  as plain Python. `super()` and the empty builtin constructor calls
+  (`list()`, `dict()`, …) stay in place only while the name is provably the
+  builtin — bound nowhere in the file and not reachable through an
+  `import *`; a user `def list()` / `def super()` is hoisted like any other
+  call (it ran after the operand, and not at all when the operand failed).
+- **`impl` methods that must stay in the class body: W7-06 residuals.** A
+  method on a class whose only unseen bases are builtin exceptions
+  (`class AppError(Exception)`) is now attached at its `impl` block too when
+  the base does not define that name (`Exception` has a fixed member list),
+  so `impl AppError: def describe(self, p: str = PREFIX)` with `PREFIX`
+  bound after the class imports instead of raising `NameError`. A method
+  that still has to stay merged — a special method, a private `__name`
+  user, a `@property` / `@classmethod` / `@cached_property` /
+  `@abstractmethod`, a method a base may define, a class subclassed before
+  the block — and reads a name bound only after the class is a new
+  check-time error, `tyc::impl_forward_reference`, naming the reason,
+  instead of a `NameError` on import (the program already crashed on both
+  surfaces). It stays silent when the name might be bound before the class
+  after all: a star import above it, a `global NAME` in any function, or
+  `globals()` / `exec` / `setattr` / `sys.modules` / `builtins` use. The
+  placement planner moved from `tyc-desugar` to `tyc_syntax::impl_site`, so
+  the desugarer and the resolver make the same decision.
+- **Secondary diagnostic labels survive a `?` expansion.** Mapping a
+  diagnostic from the expanded source back to the `.ty` file moved only its
+  primary span; a second label (`first declared here`, `declared here`)
+  kept its expanded-text offset, and the report printed
+  "Failed to read contents for label … OutOfBounds" instead of the snippet
+  — for example a `let m` re-declared below a line that uses `?`. Every
+  label is now remapped, and `tyc::immutable_assign` /
+  `tyc::pattern_shadows_outer` (two labels, no primary span) point at the
+  original file instead of the expanded text.
+
+#### PR #493 review follow-ups
+
+Fixes for the Copilot and Codex review comments on the integration PR. Each
+claim was reproduced before it was fixed; two VM claims (frozenset results of
+set operators, frozenset dict keys) did not reproduce.
+
+- **Checker false positives on valid code.** A call through a union of
+  functions (`h = a if flag else b; h(x=1)`) no longer fails with
+  `tyc::arg_count`. Keyword and `*` / `**` calls check only for too many
+  positional arguments, plus the keyword values. A loop body that always
+  exits (`break` / `return` / `continue` / `raise`) no longer feeds its dead
+  tail into the loop head, so `while flag: break; x = None` does not make `x`
+  nullable after the loop. `asyncio.create_task(coro=work())` is accepted.
+- **Checker soundness.** `asyncio.TaskGroup(...)` arguments are checked and
+  rejected with `tyc::arg_count`, since CPython raises `TypeError`, and the
+  keyword values of `create_task` / `gather` are checked. A lambda inside a
+  `try` is a deferred scope for the frozen-mutation handler scan. An
+  exponent's sign is tracked through unary `-` / `+`, `**` and bool literals,
+  so `2 ** -(2 ** 3)` is a `float`.
+- **`?` evaluation order.** A `list()` / `dict()` / `set()` / `tuple()` /
+  `frozenset()` / `super()` call stays in place only when the module never
+  rebinds the name; otherwise it is hoisted like any call. A method's lookup
+  (a property, a callable field) now happens before a later `?` operand, as in
+  Python.
+- **VM parity.**
+  - `datetime` and `pathlib` shim instances refuse attribute writes and
+    deletes with CPython's messages.
+  - `frozenset | d.keys()` returns a set.
+  - `s |= t` and the other in-place set operators update `s` in place, so
+    aliases see the change.
+  - `as!` resolves a rebound target name (`list = tuple`) before choosing its
+    check.
+  - A user class named `object` is no longer mistaken for the builtin.
+- **Gates.**
+  - `scripts/emitted-ast.py` and `tyc_syntax::ast_equiv` canonicalise
+    generated names only in identifiers, never inside strings.
+  - A partial-scope `vm-differential.sh --update` keeps the nobuild entries it
+    did not cover.
+  - The `perf-gate` CI job fetches tags, so it builds its same-run control.
+- **Build-pipeline speed.** With its control restored, the perf gate measured
+  `tyc build` of `examples/47-mini-app` at +44% against alpha.9 (26 ms vs
+  18 ms). Three fixes bring it to +5.6% (19 ms vs 18 ms):
+  - The `go`, `?` and with-chain passes skip their whole-source lexical
+    scans when the file has no `go` line, no `?` or no `with`.
+  - The `pub *` scan in `tyc build` no longer runs the whole sugar pipeline
+    on files that contain neither `pub` nor `*`.
+  - The shape pre-pass and the check share one expand-and-preprocess per
+    file, where each used to run it.
+  Output is unchanged; the corpus check is identical before and after.
 
 ### Third wave — the 2026-09-30 release-readiness review
 

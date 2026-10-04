@@ -32,6 +32,12 @@
 use crate::lexer::TyphonKeyword;
 use crate::lexmask::{scan_line, scan_line_kinds, ByteKind, LexMask, StringMode};
 
+mod eval_order;
+mod fstring_fields;
+mod pipe_slots;
+
+pub use eval_order::attach_method_lookups;
+
 /// One stripped keyword and the 0-based line index in the source where it
 /// appeared.
 #[derive(Debug, Clone)]
@@ -168,6 +174,11 @@ pub struct PreprocessResult {
     /// recorded indices still point at the same headers in the sanitised
     /// buffer the remap operates on.
     pub impl_distributed_lines: Vec<usize>,
+    /// 0-based line indices of declaration-only `def … -> T` lines (an
+    /// `interface` method, say) to which the preprocessor appended `: ...`
+    /// so the Python parser accepts them. `tyc fmt` strips the appended
+    /// `: ...` again so the lowering does not leak into the user's file.
+    pub bodiless_def_lines: Vec<usize>,
     /// `python_source` line → line of the text the *whole* pipeline started
     /// from (both 0-based), when the caller composed the sugar chain's table
     /// with the preprocessor's own (see [`preprocess_mapped`]). Empty means
@@ -373,6 +384,7 @@ pub fn preprocess_opts_mapped(
     let mut raw_class_lines: Vec<usize> = Vec::new();
     let mut frozen_class_lines: Vec<usize> = Vec::new();
     let mut plain_class_lines: Vec<usize> = Vec::new();
+    let mut bodiless_def_lines: Vec<usize> = Vec::new();
     // When a `freeze let` RHS spans multiple lines (e.g. a multi-line dict
     // literal), the opening `__typhon_freeze__(` is emitted on the first
     // line but the matching `)` has to land *after* the closing bracket of
@@ -719,6 +731,7 @@ pub fn preprocess_opts_mapped(
             // without a body is invalid Python anyway, and `: ...` is a strict
             // upgrade that never changes a valid program's meaning.
             if let Some(with_body) = append_ellipsis_to_bodiless_def(line) {
+                bodiless_def_lines.push(line_index);
                 let (rewritten, marks) = rewrite_optionals(&with_body, &mut in_string);
                 for col in marks {
                     optionals.push(StrippedOptional {
@@ -907,7 +920,12 @@ pub fn preprocess_opts_mapped(
             // build time. Only record top-level (indent_len == 0)
             // comptime declarations.
             let mut stripped_line: Option<String> = None;
-            if indent_len == 0 && rest.starts_with("comptime ") {
+            // A continuation line inside brackets that happens to start at
+            // column 0 with a variable named `comptime` is not a declaration.
+            if indent_len == 0
+                && rest.starts_with("comptime ")
+                && mask.is_logical_line_start(line_index)
+            {
                 let payload = &rest["comptime ".len()..];
 
                 // Function declaration: `comptime def NAME(...):` — the
@@ -1039,6 +1057,7 @@ pub fn preprocess_opts_mapped(
         pub_names,
         pub_star_lines,
         impl_distributed_lines,
+        bodiless_def_lines,
         line_map: Vec::new(),
     };
     (result, line_map)
@@ -2012,7 +2031,16 @@ fn append_ellipsis_to_bodiless_def(line: &str) -> Option<String> {
     if !trimmed.contains("->") {
         return None;
     }
-    Some(format!("{}: ...{}", body.trim_end(), terminator))
+    // The `: ...` goes after the signature, before any trailing comment —
+    // appended after the comment it was inside it, and the declaration
+    // stayed bodiless (`tyc::parse`).
+    let code_end = body.len() - rest.len() + trimmed.len();
+    Some(format!(
+        "{}: ...{}{}",
+        &body[..code_end],
+        body[code_end..].trim_end(),
+        terminator
+    ))
 }
 
 /// Expand `impl[<tp>] Alias[<args>]:` (or the non-generic `impl Alias:`)
@@ -2960,10 +2988,17 @@ pub fn postprocess_full(
         cols.sort_unstable_by(|a, b| b.cmp(a));
         let mut line = std::mem::take(&mut lines[line_idx]);
         for col in cols {
-            // Defensive bounds checks — normalisation can move columns
-            // around (it doesn't in Phase 0, but stay safe).
+            // The columns are only valid against the buffer `preprocess`
+            // produced; any whitespace edit since then moves them. Checked
+            // access (`get` also rejects a column inside a multi-byte
+            // character) so a stale column is skipped instead of panicking.
+            // `tyc fmt` no longer restores `?` through this path at all — it
+            // carries a marker character through the edits instead.
             const REWRITE: &str = " | None";
-            if col <= line.len() && line[col..].starts_with(REWRITE) {
+            if line
+                .get(col..)
+                .is_some_and(|tail| tail.starts_with(REWRITE))
+            {
                 line.replace_range(col..col + REWRITE.len(), "?");
             }
         }
@@ -2979,7 +3014,7 @@ pub fn postprocess_full(
     // Sort descending by line_index; for identical line_index values preserve
     // original order (stable sort) so that `val` is restored before `comptime`
     // on the same line, allowing `comptime` to be prepended on top.
-    insertions.sort_by(|a, b| b.0.cmp(&a.0));
+    insertions.sort_by_key(|a| std::cmp::Reverse(a.0));
     for (line_idx, kw) in insertions {
         if line_idx >= lines.len() {
             continue;
@@ -4993,18 +5028,31 @@ pub fn expand_typed_let_unpack(source: &str) -> String {
     expand_typed_let_unpack_mapped(source).0
 }
 
-/// [`expand_typed_let_unpack`] plus an output-line → input-line table.
 /// The text every pipeline actually works on: without a leading UTF-8
-/// byte-order mark, and ending in a newline.
+/// byte-order mark, with `\r\n` line endings read as `\n`, and ending in a
+/// newline.
+///
+/// Python's tokenizer translates `\r\n` to `\n` before it reads the source,
+/// so a multi-line string literal in a CRLF file holds `\n`. Passing the CRs
+/// through left them inside the literal — `"""a\r\nb"""` was `'a\r\nb'` on
+/// both surfaces — and `tyc fmt`, which writes `\n`, then changed what the
+/// program printed (W7-08). Every line keeps its index and every column its
+/// offset (the CR is the last byte of its line), so line maps and the
+/// line/column diagnostic remap are unaffected. A lone `\r` is left as is.
 fn normalise_source_text(source: &str) -> std::borrow::Cow<'_, str> {
     let stripped = source.strip_prefix('\u{feff}').unwrap_or(source);
-    if stripped.is_empty() || stripped.ends_with('\n') {
-        std::borrow::Cow::Borrowed(stripped)
+    let mut text = if stripped.contains("\r\n") {
+        std::borrow::Cow::Owned(stripped.replace("\r\n", "\n"))
     } else {
-        std::borrow::Cow::Owned(format!("{stripped}\n"))
+        std::borrow::Cow::Borrowed(stripped)
+    };
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.to_mut().push('\n');
     }
+    text
 }
 
+/// [`expand_typed_let_unpack`] plus an output-line → input-line table.
 pub fn expand_typed_let_unpack_mapped(source: &str) -> (String, Vec<usize>) {
     // Every sugar chain starts here; a UTF-8 byte-order mark left on the
     // first line would be pushed *below* an injected runtime import by a
@@ -5278,7 +5326,7 @@ fn parse_typed_let_unpack(body: &str) -> Option<TypedLetUnpack> {
         let slots = parse_outer_tuple_annotation(outer);
         match slots {
             Some(slots) if slots.len() == captures.len() => {
-                for (cap, slot) in captures.iter_mut().zip(slots.into_iter()) {
+                for (cap, slot) in captures.iter_mut().zip(slots) {
                     if cap.annotation.is_none() {
                         cap.annotation = Some(slot);
                         saw_annotation = true;
@@ -6435,6 +6483,13 @@ pub fn expand_question_one_liners(source: &str) -> String {
 
 /// [`expand_question_one_liners`] plus an output-line → input-line table.
 pub fn expand_question_one_liners_mapped(source: &str) -> (String, Vec<usize>) {
+    // Only lines with a propagating `?` are split.
+    if !source.contains('?') {
+        return (
+            source.to_owned(),
+            identity_line_map(text_line_count(source)),
+        );
+    }
     let mut out = MappedOut::with_capacity(source.len() + 64);
     let mut in_string: Option<StringMode> = None;
     let entry_brackets = q_contexts(source);
@@ -6512,6 +6567,13 @@ pub fn expand_question_one_liners_mapped(source: &str) -> (String, Vec<usize>) {
 /// [`expand_compound_question_headers`] plus an output-line → input-line
 /// table.
 pub fn expand_compound_question_headers_mapped(source: &str) -> (String, Vec<usize>) {
+    // Only headers with a propagating `?` are rewritten.
+    if !source.contains('?') {
+        return (
+            source.to_owned(),
+            identity_line_map(text_line_count(source)),
+        );
+    }
     // One-line compound statements (`while f()?: n += 1`) must be header +
     // body before the header rewrite can see the condition on its own.
     let (current, map) = expand_question_one_liners_mapped(source);
@@ -6751,13 +6813,25 @@ pub fn expand_inline_question_ops(source: &str) -> String {
 
 /// [`expand_inline_question_ops`] plus an output-line → input-line table.
 pub fn expand_inline_question_ops_mapped(source: &str) -> (String, Vec<usize>) {
+    // Nothing to lift without a `?`: skip the sub-passes' lexical scans.
+    if !source.contains('?') {
+        return (
+            source.to_owned(),
+            identity_line_map(text_line_count(source)),
+        );
+    }
     // Every pipeline runs this pass, so it is where a one-line compound
     // statement or a `;`-joined line carrying a `?` is split first (a no-op
     // when the compound-header rewrite already ran). The lift below places
     // its guard at the statement's own indentation, which is only right once
     // each statement owns a line.
     let (split, split_map) = expand_question_one_liners_mapped(source);
-    let (text, map) = expand_inline_question_ops_split(&split);
+    // The lift below moves each propagated operand above its statement;
+    // first hoist whatever the statement evaluates *before* that operand,
+    // in Python evaluation order, so the lift cannot reorder it (W7-04).
+    let (ordered, order_map) = eval_order::hoist_for_evaluation_order_mapped(&split);
+    let split_map = compose_line_maps(&order_map, &split_map);
+    let (text, map) = expand_inline_question_ops_split(&ordered);
     (text, compose_line_maps(&map, &split_map))
 }
 
@@ -6801,18 +6875,40 @@ fn expand_inline_question_ops_split(source: &str) -> (String, Vec<usize>) {
             buf_start = line_index;
         }
 
-        // Lines that begin inside a triple-quoted string have no
-        // executable code on this row — emit verbatim.
-        if pre_string.is_some() {
-            buffered.push(line.to_owned());
-            continue;
-        }
-
-        let content = &raw[..code_end];
-        let comment = &raw[code_end..];
         let nl = if line.ends_with('\n') { "\n" } else { "" };
+        let (comment, rewrite) = match pre_string {
+            None => {
+                let content = &raw[..code_end];
+                (
+                    &raw[code_end..],
+                    rewrite_inline_question_ops_one_line(content, &mut counter, ctx),
+                )
+            }
+            // A line that begins inside a triple-quoted f-string carries
+            // code only in its replacement fields. A `?` there lifts above
+            // the statement like one on a bracket continuation line; left
+            // in place it was a `tyc::parse` error (W7-12).
+            Some(mode @ (StringMode::FTripleDouble | StringMode::FTripleSingle))
+                if ctx.head.is_some() =>
+            {
+                let quote = if mode == StringMode::FTripleDouble {
+                    b'"'
+                } else {
+                    b'\''
+                };
+                (
+                    "",
+                    rewrite_continued_fstring_fields(raw, quote, &mut counter, ctx),
+                )
+            }
+            // Any other string continuation has no code on this row.
+            Some(_) => {
+                buffered.push(line.to_owned());
+                continue;
+            }
+        };
 
-        match rewrite_inline_question_ops_one_line(content, &mut counter, ctx) {
+        match rewrite {
             Some((rewritten, lifted)) => {
                 // A guard lifted off a continuation line is re-indented to
                 // the statement's own indentation, since that is where it
@@ -6853,6 +6949,55 @@ fn expand_inline_question_ops_split(source: &str) -> (String, Vec<usize>) {
     } else {
         (text, map)
     }
+}
+
+/// Lift every propagating `?` in the replacement fields on a continuation
+/// line of a triple-quoted f-string (`line` starts inside the string; its
+/// quote character is `quote`). Each field expression is rewritten on its
+/// own, parenthesised so a `?` that ends it is not taken for the end of a
+/// statement. Same contract as [`rewrite_inline_question_ops_one_line`].
+fn rewrite_continued_fstring_fields(
+    line: &str,
+    quote: u8,
+    counter: &mut usize,
+    ctx: QContext<'_>,
+) -> Option<(String, Vec<String>)> {
+    if !line.contains('?') {
+        return None;
+    }
+    let field_ctx = QContext {
+        bracket: None,
+        ..ctx
+    };
+    let mut lifted = Vec::new();
+    let mut splices = Vec::new();
+    for range in fstring_fields::continued_fstring_field_exprs(line, quote) {
+        let expr = &line[range.clone()];
+        if !expr.contains('?') {
+            continue;
+        }
+        let Some((rewritten, field_lifted)) =
+            rewrite_inline_question_ops_one_line(&format!("({expr})"), counter, field_ctx)
+        else {
+            continue;
+        };
+        let Some(inner) = rewritten
+            .strip_prefix('(')
+            .and_then(|r| r.strip_suffix(')'))
+        else {
+            continue;
+        };
+        lifted.extend(field_lifted);
+        splices.push((range, inner.to_owned()));
+    }
+    if splices.is_empty() {
+        return None;
+    }
+    let mut out = line.to_owned();
+    for (range, text) in splices.into_iter().rev() {
+        out.replace_range(range, &text);
+    }
+    Some((out, lifted))
 }
 
 /// Emit one buffered logical statement: the guards it lifted first, then its
@@ -7995,6 +8140,13 @@ pub fn expand_with_chains_mapped(source: &str) -> (String, Vec<usize>) {
 }
 
 fn expand_with_chains_once_mapped(source: &str) -> (String, Vec<usize>) {
+    // A with-chain needs the `with` keyword; skip the lexical scan without it.
+    if !source.contains("with") {
+        return (
+            source.to_owned(),
+            identity_line_map(text_line_count(source)),
+        );
+    }
     let mut out = MappedOut::with_capacity(source.len());
     let mut counter: usize = 0;
     let lines: Vec<&str> = source.split_inclusive('\n').collect();
@@ -8516,6 +8668,16 @@ fn render_chain(
         .unwrap_or_else(|| "    ".to_owned());
     let inner_indent = format!("{}{}", chain_indent, unit_indent);
 
+    // Two or more bindings and an `else` block that declares a name: nest
+    // the guards (W7-10). The flat ladder below gives every binding its own
+    // `if` with a copy of the `else` block, one after another, so a `let`
+    // in that block was declared once per binding in sequential blocks and
+    // tripped `tyc::no_block_shadow` on a valid program. Every other chain
+    // keeps the flat ladder, and so exactly the diagnostics it had.
+    if chain.bindings.len() >= 2 && chain.err_var.is_some() && else_body_declares_a_name(chain) {
+        return render_chain_nested_else(chain, chain_indent, &unit_indent, counter);
+    }
+
     for binding in &chain.bindings {
         let tmp = format!("__typhon_with_{}__", *counter);
         *counter += 1;
@@ -8630,6 +8792,152 @@ fn render_chain(
     (out, src)
 }
 
+/// Whether a code line of the chain's `else` block starts a `let` / `mut`
+/// declaration (optionally behind `freeze` / `lazy` / `comptime`).
+fn else_body_declares_a_name(chain: &WithChain) -> bool {
+    chain.else_body.iter().enumerate().any(|(k, line)| {
+        if chain.else_in_string.get(k).copied().unwrap_or(false) {
+            return false;
+        }
+        let mut rest = line.trim_start();
+        loop {
+            let word_end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            let (word, after) = rest.split_at(word_end);
+            let followed_by_space = after.starts_with([' ', '\t']);
+            match word {
+                "freeze" | "lazy" | "comptime" if followed_by_space => {
+                    rest = after.trim_start();
+                }
+                "let" | "mut" => return followed_by_space,
+                _ => return false,
+            }
+        }
+    })
+}
+
+/// Render a chain of two or more bindings with an `else` block as nested
+/// `if` / `else` guards:
+///
+/// ```text
+/// __typhon_with_0__ = <expr a>
+/// if isinstance(__typhon_with_0__, __typhon_Err__):
+///     let __typhon_with_err_0__ = __typhon_with_0__.error
+///     <else block>
+/// else:
+///     let a = __typhon_with_0__.value
+///     __typhon_with_1__ = <expr b>
+///     if isinstance(__typhon_with_1__, __typhon_Err__):
+///         let __typhon_with_err_1__ = __typhon_with_1__.error
+///         <else block>
+///     else:
+///         let b = __typhon_with_1__.value
+///         <success body>
+/// ```
+///
+/// Each `else` copy sits in a branch exclusive with every other copy, so a
+/// `let` in it is a sibling-branch declaration (accepted, as for any
+/// `if` / `else`), not a re-declaration in a later block. Each copy keeps
+/// its own binding's error type for `err`, every path's `return` stays
+/// visible to the checker, and an `else` block that falls through now
+/// continues after the chain instead of reading `.value` off the `Err`.
+///
+/// One shared copy after the ladder is not expressible without checker
+/// support: the copy needs a gate the checker cannot prove exhaustive
+/// (`tyc::missing_return` on every function that ends with the chain), and a
+/// failure slot assigned once per binding is a re-assignment the checker
+/// rejects whenever two bindings' `Result` types differ.
+///
+/// Copy `k` and the success body move in by one indent unit per enclosing
+/// guard — except lines that begin inside a string, whose leading
+/// whitespace is data. A diagnostic inside them keeps its line but its
+/// column moves with the indent, so this form is used only for chains the
+/// flat ladder rejected.
+fn render_chain_nested_else(
+    chain: &WithChain,
+    chain_indent: &str,
+    unit_indent: &str,
+    counter: &mut usize,
+) -> (String, Vec<usize>) {
+    let mut out = String::new();
+    let mut src: Vec<usize> = Vec::new();
+    let push_line = |out: &mut String, src: &mut Vec<usize>, line: usize, text: &str| {
+        src.push(line);
+        out.push_str(text);
+        out.push('\n');
+    };
+    // Re-indent a block written one unit inside the `with` (or `else`) by
+    // `extra`; string-content and blank lines are left exactly as written.
+    let shifted = |line: &str, in_string: bool, extra: &str| -> String {
+        if in_string || line.trim().is_empty() {
+            line.to_owned()
+        } else {
+            format!("{extra}{line}")
+        }
+    };
+    let name = chain.err_var.as_deref().unwrap_or("_err");
+
+    let mut level = chain_indent.to_owned();
+    for (depth, binding) in chain.bindings.iter().enumerate() {
+        let tmp = format!("__typhon_with_{}__", *counter);
+        let err_tmp = format!("__typhon_with_err_{}__", *counter);
+        *counter += 1;
+        let at = binding.src_line;
+        let inner = format!("{level}{unit_indent}");
+        push_line(
+            &mut out,
+            &mut src,
+            at,
+            &format!("{level}{tmp} = {}", binding.expr),
+        );
+        push_line(
+            &mut out,
+            &mut src,
+            at,
+            &format!("{level}if isinstance({tmp}, __typhon_Err__):"),
+        );
+        push_line(
+            &mut out,
+            &mut src,
+            at,
+            &format!("{inner}let {err_tmp} = {tmp}.error"),
+        );
+        let extra = unit_indent.repeat(depth);
+        for (k, line) in chain.else_body.iter().enumerate() {
+            src.push(chain.else_body_start + k);
+            let in_string = chain.else_in_string.get(k).copied().unwrap_or(false);
+            let renamed = match chain.else_kinds.get(k) {
+                Some(kinds) => rename_whole_word_with_kinds(line, kinds, name, &err_tmp),
+                None if in_string => line.clone(),
+                None => rename_whole_word(line, name, &err_tmp),
+            };
+            out.push_str(&shifted(&renamed, in_string, &extra));
+        }
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        push_line(&mut out, &mut src, at, &format!("{level}else:"));
+        push_line(
+            &mut out,
+            &mut src,
+            at,
+            &format!("{inner}let {} = {tmp}.value", binding.target),
+        );
+        level = inner;
+    }
+
+    // Success body: written one unit inside the `with`; now one unit inside
+    // the innermost guard's `else:`.
+    let extra = unit_indent.repeat(chain.bindings.len() - 1);
+    for (i, line) in chain.body.iter().enumerate() {
+        src.push(chain.body_start + i);
+        let in_string = chain.body_in_string.get(i).copied().unwrap_or(false);
+        out.push_str(&shifted(line, in_string, &extra));
+    }
+    (out, src)
+}
+
 // ── `gather` block expansion ──────────────────────────────────────────────────
 
 /// Expand a `gather` block into a concurrent task pattern.
@@ -8695,7 +9003,23 @@ pub fn expand_gather_blocks_mapped(source: &str) -> (String, Vec<usize>) {
         let header_indent = &raw[..indent_len];
         let body = &raw[indent_len..];
 
-        if let Some((strategy, stmts)) = parse_inline_gather_header(body) {
+        // `gather` is a soft keyword: a header only where a statement starts
+        // (not on a continuation line — `gather: bool = False,` in a wrapped
+        // parameter list is a parameter), and the one-line form only inside
+        // an `async def` body, the one place it can lower. Elsewhere
+        // `gather: T = v` is an annotated binding named `gather` — a class
+        // attribute or module binding — and was being rewritten into an
+        // `async with` block (W7-05).
+        let at_statement_start = mask.is_logical_line_start(i);
+        let inline = if at_statement_start
+            && body.starts_with("gather")
+            && gather_line_is_in_async_body(&lines, &mask, i, indent_len)
+        {
+            parse_inline_gather_header(body)
+        } else {
+            None
+        };
+        if let Some((strategy, stmts)) = inline {
             let bindings: Option<Vec<GatherBinding>> = stmts
                 .iter()
                 .map(|stmt| {
@@ -8717,7 +9041,9 @@ pub fn expand_gather_blocks_mapped(source: &str) -> (String, Vec<usize>) {
                 continue;
             }
         }
-        let parsed = parse_gather_header(body);
+        let parsed = at_statement_start
+            .then(|| parse_gather_header(body))
+            .flatten();
         if let Some(strategy) = parsed {
             if let Some((bindings, consumed)) =
                 collect_gather_bindings(&lines, &mask, i, header_indent)
@@ -8735,6 +9061,54 @@ pub fn expand_gather_blocks_mapped(source: &str) -> (String, Vec<usize>) {
     }
 
     out.finish()
+}
+
+/// Whether physical line `line` (indented `indent`) sits in the body of an
+/// `async def` — the nearest enclosing `def` / `class`-like header found by
+/// walking outward through less-indented logical lines is an `async def`.
+/// Control-flow headers in between (`if`, `for`, `try`, …) are transparent.
+fn gather_line_is_in_async_body(
+    lines: &[&str],
+    mask: &LexMask,
+    line: usize,
+    indent: usize,
+) -> bool {
+    let mut want = indent;
+    for k in (0..line).rev() {
+        if want == 0 {
+            return false;
+        }
+        if !mask.is_logical_line_start(k) {
+            continue;
+        }
+        let raw = lines[k].trim_end_matches(['\n', '\r']);
+        let code = raw[..mask.line_code_end(k).min(raw.len())].trim_end();
+        if code.trim_start().is_empty() {
+            continue;
+        }
+        let ind = code.len() - code.trim_start().len();
+        if ind >= want {
+            continue;
+        }
+        let head = code.trim_start();
+        let head = head.strip_prefix("pub ").unwrap_or(head);
+        if head.starts_with("async def ") {
+            return true;
+        }
+        let word = head
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .next()
+            .unwrap_or("");
+        if matches!(
+            word,
+            "def" | "class" | "plain" | "model" | "impl" | "extend" | "interface" | "enum"
+        ) || head.starts_with("class!")
+        {
+            return false;
+        }
+        want = ind;
+    }
+    false
 }
 
 /// Gather strategy chosen at the call site.
@@ -9136,8 +9510,25 @@ pub fn expand_go_calls(source: &str) -> String {
 
 /// [`expand_go_calls`] plus an output-line → input-line table.
 pub fn expand_go_calls_mapped(source: &str) -> (String, Vec<usize>) {
+    // A `go` statement starts its line (both passes below match only a line
+    // whose code begins `go `), so a source where no line does is returned
+    // unchanged without their two whole-source lexical scans. That is most
+    // files, and this pass runs on several paths per file.
+    if !source
+        .lines()
+        .any(|line| line.trim_start().starts_with("go "))
+    {
+        return (
+            source.to_owned(),
+            identity_line_map(text_line_count(source)),
+        );
+    }
     let (joined, join_map) = join_go_continuations(source);
     let source = joined.as_str();
+    // `go` is a statement keyword. On a line that continues an open bracket
+    // (`f(1,\n    go + 1)`) it is an ordinary name, and spawning there
+    // spliced `typhon_runtime.tasks.spawn(…)` into the argument list.
+    let mask = LexMask::new(source);
     let mut out = MappedOut::with_capacity(source.len());
     let mut in_string: Option<StringMode> = None;
     for (line_index, line) in source.split_inclusive('\n').enumerate() {
@@ -9157,7 +9548,8 @@ pub fn expand_go_calls_mapped(source: &str) -> (String, Vec<usize>) {
             .unwrap_or(code.len());
         let indent = &code[..indent_len];
         let body = code[indent_len..].trim_end();
-        if let Some(rest) = body.strip_prefix("go ") {
+        let at_statement_start = mask.is_logical_line_start(line_index);
+        if let Some(rest) = body.strip_prefix("go ").filter(|_| at_statement_start) {
             if let Some((call_expr, handle)) = parse_go_call(rest) {
                 if let Some(handle) = handle {
                     // Emit `let handle = …` so the user-visible task
@@ -9268,7 +9660,10 @@ fn parse_go_call(rest: &str) -> Option<(String, Option<String>)> {
 /// Lines that aren't part of a `go ...` continuation are emitted
 /// verbatim, leaving every other parser invariant intact.
 fn join_go_continuations(source: &str) -> (String, Vec<usize>) {
+    let mask = LexMask::new(source);
     let mut out = MappedOut::with_capacity(source.len());
+    // Whether the buffered line opens a `go` statement.
+    let mut buffering_go = false;
     // (line, original terminator, index of the first source line folded in)
     let mut buffered: Option<(String, String, usize)> = None;
     let mut paren_depth: i32 = 0;
@@ -9342,7 +9737,9 @@ fn join_go_continuations(source: &str) -> (String, Vec<usize>) {
                 }
                 d > 0
             };
-            let first = if opens_bracket && raw.trim_start().starts_with("go ") {
+            buffering_go =
+                mask.is_logical_line_start(line_index) && raw.trim_start().starts_with("go ");
+            let first = if opens_bracket && buffering_go {
                 raw[..code_end].trim_end().to_owned()
             } else {
                 raw.to_owned()
@@ -9382,11 +9779,8 @@ fn join_go_continuations(source: &str) -> (String, Vec<usize>) {
         // a `go ...` opener (or a continuation of one). A buffered
         // ordinary line that happens to be unterminated would not be a
         // `go`, so flush it now and reset.
-        if let Some((line, _, _)) = buffered.as_ref() {
-            let trimmed = line.trim_start();
-            if !trimmed.starts_with("go ") || paren_depth <= 0 {
-                flush(&mut buffered, &mut out);
-            }
+        if buffered.is_some() && (!buffering_go || paren_depth <= 0) {
+            flush(&mut buffered, &mut out);
         }
     }
     flush(&mut buffered, &mut out);
@@ -9447,153 +9841,27 @@ fn expand_pipes_line_by_line(source: &str) -> (String, Vec<usize>) {
         }
 
         let code = &raw[..code_end];
-        // First, expand any `|>` that lives inside a parenthesised
-        // sub-expression — the original line-only pass only looked at
-        // depth-0 pipes, which left shapes like
-        // `(1 |> add(2)) |> add(3)` un-rewritten on the inner pipe
-        // and produced a parser error against the still-Typhon-only
-        // `|>` token. The nested helper recurses into each balanced
-        // `(...)` group so inner pipes are rewritten before the
-        // outer pipe pass sees them. O28 / FINDINGS #117–#119.
-        let nested_expanded = expand_pipes_in_subexpressions(code);
-        let code_for_top: &str = &nested_expanded;
-        let pipes = find_top_level_pipes(code_for_top);
-        if pipes.is_empty() {
-            // The nested pass may still have rewritten parenthesised
-            // sub-expressions even when no top-level pipe remained.
-            // Stream the rewritten code (plus the original trailing
-            // comment) into the buffer so that progress is preserved.
-            if nested_expanded != code {
-                result.push_str(&nested_expanded);
-                result.push_str(&raw[code_end..]);
-                result.push_str(terminator);
-            } else {
-                result.push_str(line);
-            }
+        if !code.contains("|>") {
+            result.push_str(line);
             continue;
         }
-
-        let rewritten = match rewrite_pipe_line(code_for_top, &pipes) {
-            Some(s) => s,
-            None => {
-                // Bail out — pass the line through unchanged so the regular
-                // parser produces a coherent diagnostic at the `|>` token.
-                result.push_str(line);
-                continue;
+        // Every expression slot — bracket groups innermost first, then the
+        // statement's own — gets its pipes rewritten (W7-09). `None` means a
+        // statement-level pipe could not be rewritten: pass the line through
+        // unchanged so the parser reports a coherent error at the `|>`.
+        match pipe_slots::rewrite_pipes_in_statement(code) {
+            Some(rewritten) if rewritten != code => {
+                result.push_str(&rewritten);
+                // Preserve any trailing comment, then re-attach the original
+                // newline bytes (which may be `\r\n` on Windows-authored files).
+                result.push_str(&raw[code_end..]);
+                result.push_str(terminator);
             }
-        };
-
-        result.push_str(&rewritten);
-        // Preserve any trailing comment, then re-attach the original
-        // newline bytes (which may be `\r\n` on Windows-authored files).
-        result.push_str(&raw[code_end..]);
-        result.push_str(terminator);
+            _ => result.push_str(line),
+        }
     }
 
     result.finish()
-}
-
-/// Recursively expand `|>` operators inside balanced `(...)` groups.
-/// Walks `code` left-to-right, treating top-level `(` / `)` pairs as
-/// independent sub-expressions; each pair's body is processed first
-/// (so nested pipes are rewritten innermost-first), then any pipes
-/// still present at the body's top level are rewritten via the same
-/// machinery the line-level pass uses. Triple-quoted and ordinary
-/// string literals are passed through verbatim.
-///
-/// This pass is a no-op when the input contains no `|>` token at all.
-/// O28 / FINDINGS #119.
-fn expand_pipes_in_subexpressions(code: &str) -> String {
-    if !code.contains("|>") {
-        return code.to_owned();
-    }
-    let bytes = code.as_bytes();
-    let mut out = String::with_capacity(code.len());
-    let mut in_str: Option<u8> = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        // Copy one whole UTF-8 character. Pushing `b as char` re-encoded
-        // every non-ASCII byte as its own Latin-1 code point, so any line
-        // containing both `|>` and a non-ASCII character came out mojibaked
-        // (`"café" |> str.upper()` printed `CAFÃ©`).
-        let char_len = utf8_char_len(bytes, i);
-        if let Some(q) = in_str {
-            out.push_str(&code[i..i + char_len]);
-            if b == b'\\' && i + 1 < bytes.len() {
-                let next_len = utf8_char_len(bytes, i + 1);
-                out.push_str(&code[i + 1..i + 1 + next_len]);
-                i += 1 + next_len;
-                continue;
-            }
-            if b == q {
-                in_str = None;
-            }
-            i += char_len;
-            continue;
-        }
-        if b == b'"' || b == b'\'' {
-            in_str = Some(b);
-            out.push(b as char);
-            i += 1;
-            continue;
-        }
-        if b == b'(' {
-            // Find the matching `)`, tracking string state inside.
-            let mut depth: i32 = 1;
-            let mut j = i + 1;
-            let mut local_str: Option<u8> = None;
-            while j < bytes.len() && depth > 0 {
-                let c = bytes[j];
-                if let Some(q) = local_str {
-                    if c == b'\\' && j + 1 < bytes.len() {
-                        j += 2;
-                        continue;
-                    }
-                    if c == q {
-                        local_str = None;
-                    }
-                    j += 1;
-                    continue;
-                }
-                match c {
-                    b'"' | b'\'' => local_str = Some(c),
-                    b'(' => depth += 1,
-                    b')' => depth -= 1,
-                    _ => {}
-                }
-                j += 1;
-            }
-            if depth != 0 {
-                // Unmatched paren — give up and emit verbatim. The
-                // downstream parser will produce a coherent diagnostic.
-                out.push('(');
-                i += 1;
-                continue;
-            }
-            let inner_bytes = &bytes[i + 1..j - 1];
-            let inner = std::str::from_utf8(inner_bytes).unwrap_or("");
-            // Recurse: rewrite any deeper-nested parens first, then
-            // run the top-level pass on the result.
-            let processed_inner = {
-                let nested = expand_pipes_in_subexpressions(inner);
-                let pipes = find_top_level_pipes(&nested);
-                if pipes.is_empty() {
-                    nested
-                } else {
-                    rewrite_pipe_line(&nested, &pipes).unwrap_or(nested)
-                }
-            };
-            out.push('(');
-            out.push_str(&processed_inner);
-            out.push(')');
-            i = j;
-            continue;
-        }
-        out.push_str(&code[i..i + char_len]);
-        i += char_len;
-    }
-    out
 }
 
 /// Fold multi-line pipe segments back onto their preceding line so the
@@ -9839,47 +10107,6 @@ where
             },
         }
     }
-}
-
-/// Rewrite a single line `code` containing top-level pipe operators (at the
-/// byte positions in `pipes`) into the equivalent nested-call form.
-///
-/// Returns `None` if any pipe right-hand-side does not match the supported
-/// callable shape — the caller is expected to pass the line through unchanged.
-fn rewrite_pipe_line(code: &str, pipes: &[usize]) -> Option<String> {
-    // Split into segments delimited by `|>`. Leading/trailing whitespace on
-    // each segment is preserved on the first segment (for indent) but trimmed
-    // on intermediate ones.
-    let mut segments: Vec<&str> = Vec::with_capacity(pipes.len() + 1);
-    let mut last = 0;
-    for &pos in pipes {
-        segments.push(&code[last..pos]);
-        last = pos + 2;
-    }
-    segments.push(&code[last..]);
-
-    let first = segments[0];
-    let indent_end = first
-        .find(|c: char| !c.is_whitespace())
-        .unwrap_or(first.len());
-    let indent = &first[..indent_end];
-    let first_body = first[indent_end..].trim_end();
-
-    // Identify any assignment / return prefix on the first segment so the
-    // chain only consumes the right-hand expression.
-    let (prefix, lhs_expr) = split_pipe_prefix(first_body);
-    let lhs_expr = lhs_expr.trim();
-    if lhs_expr.is_empty() {
-        return None;
-    }
-
-    let mut acc = lhs_expr.to_string();
-    for seg in &segments[1..] {
-        let rhs = seg.trim();
-        acc = apply_pipe_call(&acc, rhs)?;
-    }
-
-    Some(format!("{}{}{}", indent, prefix, acc))
 }
 
 /// Strip an optional `return ` or `LHS [op]= ` prefix from the head of a
@@ -13524,15 +13751,13 @@ def f() -> Result[int, str]:
     }
 
     #[test]
-    fn pipe_inside_parens_is_left_alone() {
-        // Pipes inside `[...]` brackets (list/set/dict comprehensions or
-        // index syntax) are NOT rewritten — Python's `|` already has a
-        // meaning in those positions and we leave the parser to surface
-        // the error. The matching recursion in `expand_pipes_in_sub-
-        // expressions` only walks `(...)` groups.
+    fn pipe_inside_brackets_is_rewritten_in_its_slot() {
+        // W7-09: a comprehension element is an expression slot like any
+        // other (`|>` is never valid Python, so leaving it was a parse
+        // error, not a deferral to Python's `|`).
         let src = "y = sum([a |> f for a in xs])\n";
         let out = expand_pipes(src);
-        assert_eq!(out, src);
+        assert_eq!(out, "y = sum([f(a) for a in xs])\n");
     }
 
     #[test]

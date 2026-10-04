@@ -15,7 +15,7 @@ internalise only this section, you can already read and write most Typhon:
 3. **`T` cannot hold `None`.** Use `T?` (sugar for `T | None`) when a value is optional, and narrow it (`is None`, `guard`, early return, `match`) before use.
 4. **Methods live in `impl` blocks, not in `class`.** Write `impl Foo:` with explicit `self`. For an ordinary `class` / `model`, the constructor is generated and a hand-written `__init__` is rejected; the raw-class escape hatches (`class!` and `plain class`) deliberately keep your own `__init__`.
 5. **`Any` only enters through `unsafe:` or `.dty` stubs.** Re-assert a concrete type at the boundary; for a one-off value, `EXPR as! TYPE` is the sound one-liner.
-6. **`match` on a sealed union must be exhaustive.** Add a variant and every `match` site errors until you handle it — no silent fall-through.
+6. **`match` on a closed type must be exhaustive.** Sealed unions (nested ones flatten to their leaf classes), enums, `Result[T, E]` (including a closed payload inside `Ok` / `Err`), `T?`, `bool` and string-literal unions. Add a variant and every `match` over that union errors until you handle it — no silent fall-through.
 7. **Errors flow as `Result[T, E]`, not exceptions.** `Ok`/`Err` and the `?` operator make failure visible in signatures; bridge to exceptions only at library boundaries.
 8. **Declare-only `let NAME: T` must be definitely assigned** before it's read — the first assignment on every non-diverging path is its initialiser.
 
@@ -107,6 +107,15 @@ type Shape = Circle | Rectangle | Triangle
 ```
 
 declares a finite, sealed sum type. `match` on a sealed union must cover every variant or include a wildcard. The single biggest static-safety win over current Python and mechanically simple to implement.
+
+The same `tyc::non_exhaustive_match` check covers every closed subject:
+
+- a union nested in another (`type Shape = Circle | Poly` with `type Poly = Rect | Tri`) flattens to its leaf classes, so arms for `Circle`, `Rect` and `Tri` are exhaustive. The alias itself is not a class: `case Poly():` and `isinstance(x, Poly)` raise `TypeError` on CPython and report `tyc::alias_not_a_class`;
+- `Result[T, E]` must handle `Ok` and `Err`, and when `E` (or `T`) is a sealed union, enum, `bool` or literal union the payload patterns must cover it (`Err(NotFound(..))`, `Err(Timeout(..))`, …);
+- `T?` must handle `None` once its arms cover `T`;
+- `bool` and string-literal unions must cover every value.
+
+`tyc::missing_return` follows the same rules, and `[strictness] exhaustive-match` sets the severity of all of them.
 
 ### Function signatures (Rule 1)
 
@@ -368,6 +377,8 @@ class-body execution, iteration is in declaration order, and
 
 `Result[T, E]` is a sealed sum type with two constructors, `Ok(T)` and `Err(E)`. Emits as a tagged dataclass in a generated `typhon_runtime/` module — no PyPI dependency.
 
+The module name `typhon_runtime` is reserved for that generated package: a project module or package of the same name directly under the source root is replaced whenever the runtime is written. `tyc check` and `tyc build` warn about it ([`tyc::reserved_module_name`](diagnostics/reserved_module_name.md)), and `tyc build` fails when the program imports something from `typhon_runtime` that the generated runtime does not provide, or reads such a name off a bare `import typhon_runtime`.
+
 ### The `?` operator
 
 `?` suffix on a `Result`-typed expression unwraps `Ok` and short-circuits `Err` to the enclosing function. The checker enforces that `?` appears only inside a function whose return type is a compatible `Result`. Desugaring is a localised `if isinstance(_x, Err): return _x; v = _x.value` pattern — not try/except, to keep stack traces clean.
@@ -496,9 +507,11 @@ Every widening is semantics-preserving because the element, its captured argumen
 
 ### `go` spawn
 
-`go f(x)` schedules `f(x)` in the background: an `asyncio.Task` in async contexts, a `ThreadPoolExecutor.submit` future on free-threaded builds for CPU-bound functions. `go f(x) -> fut` binds the task handle.
+`go f(x)` schedules `f(x)` in the background: an `asyncio.Task` in async contexts. `go f(x) -> fut` binds the task handle.
 
-`go` lowers through `typhon_runtime.tasks.spawn`, **never** to a bare `asyncio.create_task`. Python's event loop holds only weak references to tasks, so a fire-and-forget task whose handle is dropped can be garbage-collected mid-flight. The runtime helper keeps a strong-ref registry and discards entries from a done-callback. Same pattern, different registry, for thread-pool `go` on free-threaded builds.
+The spawned call must produce a coroutine. `go` (and `await`) on a callee the checker knows to be synchronous is rejected with `tyc::type_mismatch` ("`go` needs a coroutine, but `work()` returns `int`"), because `spawn` raises `TypeError` on it at runtime: a plain `def` in the same module, a sync alias, a callable parameter typed as returning a non-awaitable, or a plain, undecorated `def` imported by name from another project `.ty` module (`from helpers import work`). Functions known only from a `.dty` stub or venv introspection, decorated functions and module-qualified calls (`go helpers.work()`) stay permissive.
+
+`go` always lowers through `typhon_runtime.tasks.spawn`, **never** to a bare `asyncio.create_task` — and there is no `ThreadPoolExecutor` lowering for `go`, including on free-threaded builds. Python's event loop holds only weak references to tasks, so a fire-and-forget task whose handle is dropped can be garbage-collected mid-flight. The runtime helper keeps a strong-ref registry and discards entries from a done-callback.
 
 ## `let` and `mut`
 
@@ -614,31 +627,56 @@ aliases, never the runtime. Every call and every read it inspects lands in one o
   `yield`, or a call to a same-module helper that is not itself `@pure`. These are what
   `tyc::impure_pure_fn` reports.
 - **Provably pure** — arithmetic and comparisons, pure builtins (including the container
-  constructors), constructors of same-module classes, calls into a fixed stdlib allow-list
-  (`math`, `cmath`, `operator`, `itertools`, `functools`, `string`, `re`, `json`, `statistics`,
-  `fractions`, `decimal`, `numbers`, `typing`, `enum`, `textwrap`, `unicodedata`, `base64`,
-  `binascii`, `struct`, `bisect`, `heapq`, `copy`, `dataclasses`, `abc`, `collections`,
-  `datetime` constructors, `zoneinfo`, `hashlib`, `hmac`, `difflib`, `ipaddress`, `pathlib`
-  constructors, `urllib.parse`, `html`, `keyword`, `codecs`, `array`, `types`, and the pure
-  string operations of `os.path`), non-mutating methods of a receiver whose builtin type is
-  evident (a literal, a display, a builtin constructor call, an annotated parameter or local, a
-  `let X: str` module constant), mutating methods on a *fresh* local (`out: list[int] = []` then
-  `out.append(...)`), reads of immutable module constants, and calls to other `@pure` helpers.
+  constructors), constructors of same-module classes that run no code of their own (no
+  hand-written `__init__` / `__post_init__` / `__new__` / `__setattr__`, in the class or an `impl`
+  block; no foreign base such as `BaseModel`; no metaclass; no impure `default_factory`), calls
+  into a fixed stdlib allow-list (`math`, `cmath`, `operator`, `itertools`, `functools`, `string`,
+  `re`, `json`, `statistics`, `fractions`, `numbers`, `typing`, `enum`, `textwrap`,
+  `unicodedata`, `base64`, `binascii`, `struct`, `bisect`, `heapq`, `copy`, `dataclasses`, `abc`,
+  `collections`, `datetime` constructors, `zoneinfo`, `hashlib`, `hmac`, `difflib`, `ipaddress`,
+  `pathlib` path construction and the pure-path API, `urllib.parse`, `html`, `keyword`, `codecs`,
+  `array`, `types`, and the pure string operations of `os.path`), non-mutating methods of a
+  receiver whose builtin type is evident (a literal, a display, a builtin constructor call, an
+  annotated parameter or local, a `let X: str` module constant), mutating methods on a *fresh*
+  local (`out: list[int] = []` then `out.append(...)`, or `heapq.heappush(out, x)`), reads of
+  immutable module constants and enum members, and calls to other `@pure` helpers that are
+  themselves provably pure.
 - **Not provably pure** — everything else: a method on a value of unknown type (`p.length()`), a
-  call into a module outside the allow-list (`np.sqrt(x)`, `mylib.helper(x)`), a read of a module
-  `let` whose value could be mutated in place (`TABLE: dict[str, int]`), a `with` block, a
-  computed callee. An explicit `@pure` **trusts the author** here — no diagnostic — but the
-  silent optimisations never act on such a function.
+  call into a module outside the allow-list (`np.sqrt(x)`, `mylib.helper(x)`, anything in
+  `decimal`, whose every operation reads the thread's current context), a filesystem query
+  (`Path.cwd()`, `Path.exists(p)`), a stdlib function that mutates a non-fresh first argument
+  (`heapq.heappush(QUEUE, x)`, `bisect.insort`, `operator.setitem`), a read of a module `let`
+  whose value could be mutated in place (`TABLE: dict[str, int]`), a read of a class attribute
+  (`Config.DEBUG` can be rebound at runtime), a constructor that runs code, a `with` block, a
+  nested `def` / `class`, a function-local import, a computed callee, whatever an `assert`
+  evaluates, a call to a `@pure` helper whose own check was inconclusive, and recursion (direct
+  or mutual). An explicit `@pure` **trusts the author** here — no diagnostic — but the silent
+  optimisations never act on such a function.
 
-The silent paths (`auto-memoise`, `pgo-memoise`, and the callee set of `auto-parallel`) require
-the function to be *provably* pure. `auto-memoise` and `pgo-memoise` additionally require a
-cache-safe signature: every parameter annotated with an immutable, hashable type and an immutable
-return type — scalars, `str` / `bytes`, `tuple[...]` / `frozenset[...]` of such, `Result` /
-`Ok` / `Err` of such, `Literal`, enums, `NamedTuple`s, `frozen` classes, `@dataclass(frozen=True)`
-classes. A function returning `list[int]`, an `Iterator`, or an ordinary (mutable) class is never
-auto-cached, because `functools.cache` would hand every caller the same object. An explicit
-`@memo` keeps its contract: it is honoured whenever nothing provably impure is found, whatever the
-return type — the author asked for the shared object.
+The silent paths (`auto-memoise`, `pgo-memoise`, `-O`, and the callee set of `auto-parallel`)
+require the function to be *provably* pure. A plain `@pure` under `auto-memoise` / `-O` is held to
+the same bar — `@pure` is a purity claim, not a cacheability claim. `auto-memoise` and
+`pgo-memoise` additionally require a cache-safe signature:
+
+- the return type is **deeply** immutable — scalars, `str` / `bytes`, `Decimal`, `datetime`
+  values, paths, `tuple[...]` / `frozenset[...]` of such, `Result` / `Ok` / `Err` of such,
+  `Literal`, enums, and `NamedTuple`s / `frozen` classes / `@dataclass(frozen=True)` classes
+  whose every field is itself deeply immutable (a `frozen` class with a `list` field is not);
+- every parameter is a **sound cache key**: two arguments that compare equal must be
+  indistinguishable to the function. `int`, `str`, `bytes`, `bool`, `None`, `Literal`, enums and
+  their unions qualify at the top level; `float` does not (`0.0 == -0.0`, yet `repr` tells them
+  apart), nor do `Decimal`, `datetime`, paths, callables or mutable classes. Inside a `tuple` /
+  `frozenset` / frozen-class field only `bool`, `None`, enums and other key-safe `frozen` classes
+  qualify, since `(True,) == (1,)`.
+
+Type names are resolved before they are trusted: a user class called `Path`, `Flag`, `Decimal`
+or `date` is not the stdlib type. A function returning `list[int]`, an `Iterator`, a `Callable`
+or an ordinary (mutable) class is never auto-cached, because a cache would hand every caller the
+same object. A silent path emits `@functools.lru_cache(maxsize=1024, typed=True)`: typed so `1`,
+`1.0` and `True` never share an entry, bounded so the cache cannot retain every argument it ever
+saw. An explicit `@memo` keeps its contract: it is honoured whenever nothing provably impure is
+found, whatever the signature, and emits `@functools.cache` — the author asked for the shared
+object.
 
 ## Compile-time evaluation (`comptime`)
 
@@ -694,7 +732,8 @@ The contract is intentionally tight in v1, but already covers most build-time co
 - **Expressions**: every form available to a `comptime let` initialiser, plus parameter and local-binding references, comparisons (`==`, `!=`, `<`, `<=`, `>`, `>=`), boolean operators (`and`, `or`, `not`), and the `EXPR if COND else EXPR` ternary.
 - **Parameters** must be plain positional names — no defaults, `*args`, `**kwargs`, or keyword-only forms.
 - **Free variables** (module-level names other than parameters and local bindings) are not in scope inside the body. Comptime evaluation is hermetic — call sites pass everything in as arguments.
-- **Recursion depth** is capped (currently 64) so a buggy definition fails the build rather than hanging it.
+- **Recursion depth** is capped (currently 64) and each `comptime let` has an **evaluation-step budget** (currently 10 million steps), so a buggy definition — including exponential recursion that stays within the depth cap, like `f(n - 1) + f(n - 1)` — fails the build with a `tyc::comptime` error rather than hanging `tyc check`, `tyc build` or the editor.
+- **Values match CPython or fail the build.** Where CPython would raise, the evaluator reports a `tyc::comptime` error instead of inlining a value the program never computes: `10.0 ** 400` (CPython: `OverflowError`), `0.0 ** -1` / `0 ** -1` (`ZeroDivisionError`), a negative base to a fractional power such as `(-8.0) ** 0.5` (a `complex` in CPython), and a string literal spelling a lone surrogate (`"\ud800"`), which no comptime value can represent. `strip()` / `lstrip()` / `rstrip()` strip exactly what `str.isspace()` matches, including U+001C–U+001F.
 
 These restrictions exist because comptime evaluation runs *inside the compiler*. Lifting them further (loops, container construction, types as values) is incremental work; the rule of thumb today is "if a comptime function couldn't be a small pure helper over arithmetic, strings, and booleans, it probably belongs at runtime."
 
@@ -733,11 +772,11 @@ comptime let MAX_SCORE: int = 100 if env("STRICT", "1") == "1" else 80
 
 ### Pipe operator
 
-`a |> f() |> g(arg)` desugars to `g(f(a), arg)`. Left-associative; the pipe argument fills the first positional slot of the next call.
+`a |> f() |> g(arg)` desugars to `g(f(a), arg)`. Left-associative; the pipe argument fills the first positional slot of the next call. `|>` binds looser than every other expression operator, and its left operand is the whole expression to its left *within its slot* — one call argument, collection element, dict key or value, subscript, keyword or default value, lambda body, comprehension part, `return` / assignment value, `if` / `elif` / `while` / `for … in` / `assert` header, or f-string field. So `1 + 2 |> f()` is `f(1 + 2)` and `h(a, b |> f())` is `h(a, f(b))`. No operator may follow a chain on the same level: write `(x |> f()) > 0`, not `x |> f() > 0`.
 
 ### Extension methods
 
-`extend ClassName:` attaches methods to a user-defined class declared elsewhere — `impl`'s twin for code you don't want to keep in the original module. The merge happens at desugar; downstream callers see a single class with both sets of methods.
+`extend ClassName:` attaches methods to a user-defined class declared elsewhere — `impl`'s twin for code you don't want to keep in the original module. In the class's own module the methods merge into the class body at desugar. When the class is imported (`from domain.user import User`), each method lowers to a module-level function plus a patch (`User.tracking_id = __typhon_extend_User__tracking_id`) that runs when the extending module is imported — so the methods are visible, to the checker and at runtime, in the extending module and in every module that imports it (by name, as a module, or through a `pub *` facade that aggregates it). A module that does not import the extending module gets no guarantee it ran, so the checker still reports `tyc::attribute_not_found` there; import it for its effect with `import analytics.user_metrics as _user_metrics`.
 
 ```
 # domain/user.ty
@@ -746,9 +785,56 @@ class User:
     name: str
 
 # analytics/user_metrics.ty
+from domain.user import User
+
 extend User:
-    def tracking_id() -> str:
-        return f"user-{id:08d}"
+    def tracking_id(self) -> str:
+        return f"user-{self.id:08d}"
 ```
 
-`extend BUILTIN:` (extending the recognised Python built-ins — `str`, `list`, `int`, `dict`, …) is also supported. Each method is extracted at desugar time to a module-level free function `__typhon_ext_<TYPE>__<METHOD>__`, and call sites `x.method(...)` are rewritten to `__typhon_ext_<TYPE>__method(x, ...)` whenever the receiver `x` has a static annotation matching one of the registered built-ins. There is no monkey-patching of built-in types; the rewrite is strictly opt-in by type annotation, so calls on un-annotated receivers continue to raise `AttributeError` at runtime, matching Python's existing semantics. The receiver's type is taken from declarations: an annotated name (a parameter, a `let x: T`, or a module-level constant read from inside a function), an unannotated `let x = EXPR` whose initialiser's type is evident, a literal or f-string, a field or `@property` of a class declared in or imported into the module (`self.title.slug()`, `post.title.slug()`, including inherited and generic fields), a call whose declared return is the builtin (a same-module or imported `def`, an `impl` / static method, a constructor's field, `module.f()`), an awaited `async def`, a subscript on a `list[T]` / `dict[K, V]` / tuple, a `for` or comprehension variable, a chain of type-preserving builtin methods, `str` concatenation / repetition / `%`, and another extension call (`t.slug().shout()`). A `T?` receiver counts as `T` (the checker requires the narrowing). A receiver whose type the pass cannot see — a `match` capture, an unannotated lambda parameter, a `with … as` target, an unannotated module-level binding read inside a function, a stdlib call — is left as a native attribute access and raises `AttributeError` at runtime. The free-function name ends in a double underscore so CPython does not name-mangle it when the rewritten call sits inside a class body.
+`extend BUILTIN:` (extending the recognised Python built-ins — `str`, `list`, `int`, `dict`, …) is also supported. Each method is extracted at desugar time to a module-level free function `__typhon_ext_<TYPE>__<METHOD>__`, and call sites `x.method(...)` are rewritten to `__typhon_ext_<TYPE>__method(x, ...)` whenever the receiver `x` has a static annotation matching one of the registered built-ins. There is no monkey-patching of built-in types; the rewrite is strictly opt-in by type annotation, so calls on un-annotated receivers continue to raise `AttributeError` at runtime, matching Python's existing semantics. The receiver's type is taken from declarations: an annotated name (a parameter, a `let x: T`, or a module-level constant read from inside a function), an unannotated `let x = EXPR` whose initialiser's type is evident, a literal or f-string, a field or `@property` of a class declared in or imported into the module (`self.title.slug()`, `post.title.slug()`, including inherited and generic fields), a call whose declared return is the builtin (a same-module or imported `def`, an `impl` / static method, a constructor's field, `module.f()`), an awaited `async def`, a subscript on a `list[T]` / `dict[K, V]` / tuple, a `for` or comprehension variable, a chain of type-preserving builtin methods, `str` concatenation / repetition / `%`, and another extension call (`t.slug().shout()`). A `T?` receiver counts as `T` (the checker requires the narrowing). A receiver whose type the pass cannot see — an untyped match capture, a lambda parameter without a contextual `Callable` type, a `with … as` target, an unannotated module-level binding read inside a function, a stdlib call — is left as a native attribute access and raises `AttributeError` at runtime. The free-function name ends in a double underscore so CPython does not name-mangle it when the rewritten call sits inside a class body.
+
+An `extend BUILTIN:` block is visible in its own module and in every module that imports from it (`from text import describe`, `import text`). Importing from a `pub *` package facade counts as importing from every module the facade aggregates, so `from pkg import describe` brings the extensions of `pkg/text.ty` (and of its `pub *` sub-packages) into scope; the facade's emitted `__init__.py` re-exports the lifted helpers for that purpose.
+
+
+## Checked boundary casts (`as!`)
+
+`EXPR as! TYPE` checks an untyped boundary value and returns the same object.
+A mismatch raises `TypeError`. A target without an enforceable runtime shape
+is refused by the checker and by the generated runtime.
+
+| Target | Check |
+| --- | --- |
+| `int`, `str`, `bool`, `bytes`, `None`, other ordinary classes | `isinstance` (classes are shallow) |
+| `float`, `complex` | Numeric widening is accepted: integers inhabit float targets |
+| `Any`, `object` | Accept any value |
+| Unions and nullable types | At least one member must match |
+| `Literal[...]` | Exact value and primitive type membership |
+| `list[T]`, `set[T]`, `frozenset[T]` | Container kind and every element recursively |
+| `dict[K, V]`, `Mapping[K, V]`, `MutableMapping[K, V]` | Mapping kind and every key/value recursively |
+| `Sequence[T]`, `Collection[T]`, `AbstractSet[T]` | Collection kind and every element recursively |
+| Fixed tuples and `tuple[T, ...]` | Length/slots, or every homogeneous element recursively |
+| Transparent aliases, including generic aliases with concrete arguments | Expand the alias and substitute its arguments; apply the underlying check |
+| Newtypes | Check the underlying base type |
+| Interfaces | Shallow member presence; method bodies and field values are not inspected |
+| Bare type parameters, unbound alias parameters, `Callable`, iterator/awaitable contracts, parameterised user classes, other unknown descriptors | Refused |
+
+Recursive aliases are supported for finite values. Cyclic values fail the cast.
+A shallow class or interface cast establishes the runtime class or member
+surface; it does not inspect the internals of an instance.
+
+
+### Frozen binding types
+
+A `freeze let` annotation describes the input value. The binding uses the
+runtime's recursively frozen shape: `list[T]` becomes `tuple[T, ...]`,
+`dict[K, V]` becomes `Mapping[K, V]`, and `set[T]` becomes `frozenset[T]`.
+Nested container elements are frozen too. Read operations remain available;
+container mutation and list concatenation on a frozen tuple are rejected. A
+new binding receiving a frozen value retains its frozen shape. An immutable
+operation deliberately protected by its matching exception handler is
+reported as a warning, allowing runtime failure probes to remain executable.
+
+Frozen dataclass instances pass through unchanged and retain identity. Their
+fields are not rebuilt or deep-frozen: use immutable field values when the
+instance must be deeply immutable.

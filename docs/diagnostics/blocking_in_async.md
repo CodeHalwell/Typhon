@@ -4,7 +4,9 @@ Fires when a direct call to a known-blocking stdlib function
 (`time.sleep`, `requests.get`, `socket.recv`, `subprocess.run`,
 `input`, …) appears inside an `async def` body. The call halts the
 entire event loop until it returns, defeating the point of `async`
-and starving every other coroutine in the same loop.
+and starving every other coroutine in the same loop. Import aliases are
+followed: `from time import sleep` then `sleep(1)`, `import time as t` then
+`t.sleep(1)`, and `import subprocess as sp` then `sp.run(...)` all fire.
 
 ## Example
 

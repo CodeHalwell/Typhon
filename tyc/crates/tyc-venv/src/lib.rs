@@ -1,4 +1,7 @@
-//! Venv-driven signature introspection for the type checker.
+//! Venv-driven signature introspection for the type checker, plus the
+//! project plumbing the CLI and the language server share: `typhon.toml`
+//! loading and validation ([`config`]) and the symlink-safe source walk
+//! ([`walk`]).
 //!
 //! When a project imports a third-party Python package that ships no
 //! `.dty` stub (the common case for things installed via `uv add`),
@@ -42,6 +45,9 @@
 //!   wrong-arity third-party calls surface as live editor diagnostics. The
 //!   cache reuses per-module results across keystrokes and invalidates on a
 //!   `.venv/pyvenv.cfg` mtime change (a `uv sync`).
+
+pub mod config;
+pub mod walk;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1275,6 +1281,8 @@ fn arity_info_from_params(
         param_types,
         kwonly_types,
         return_type,
+        is_async: false,
+        declared_sync: false,
     })
 }
 
@@ -1368,29 +1376,19 @@ fn is_valid_dotted_name(s: &str) -> bool {
 }
 
 fn collect_ty_files_for_scan(root: &Path) -> Option<Vec<PathBuf>> {
-    let mut files: Vec<PathBuf> = Vec::new();
-    if root.is_file() {
-        files.push(root.to_path_buf());
-        return Some(files);
-    }
-    if !root.is_dir() {
+    if !root.exists() {
         return None;
     }
-    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("ty") {
-                files.push(path);
-            }
-        }
+    // The shared symlink-safe walk: the hand-rolled stack walk this replaced
+    // had no loop guard, so a `src/a -> .` link hung both `tyc check` and the
+    // language server whenever a dependency was declared (W4-08).
+    walk::Walk {
+        ext: "ty",
+        filter: walk::DirFilter::None,
+        strict: false,
     }
-    Some(files)
+    .collect_quiet(root)
+    .ok()
 }
 
 /// Walk every `.ty` file under `paths`, introspect each third-party
@@ -1764,6 +1762,17 @@ pub fn top_level_imports_from_venv(
 
 #[cfg(test)]
 mod tests {
+    /// Tests that spawn a subprocess (a stub interpreter they write
+    /// themselves, or the host Python) run one at a time. On macOS a child
+    /// forked by one test can inherit another test's freshly created pipe
+    /// or script descriptor before close-on-exec is applied, stalling the
+    /// other child's exec or its end-of-input; the preload tests then count
+    /// too few invocations (seen under the full parallel workspace run).
+    fn serialise_subprocess_tests() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     use super::*;
 
     #[test]
@@ -2281,6 +2290,7 @@ lazy import np = numpy
     #[test]
     #[cfg(unix)]
     fn preload_batches_all_modules_into_one_subprocess() {
+        let _serial = serialise_subprocess_tests();
         // The performance fix relies on Python being spawned once
         // per `tyc check` invocation. Rather than time the call and
         // hope CI is fast enough (the original timing-based check
@@ -2357,6 +2367,7 @@ lazy import np = numpy
     #[test]
     #[cfg(unix)]
     fn preload_falls_back_to_per_module_on_batch_failure() {
+        let _serial = serialise_subprocess_tests();
         // If the batched subprocess fails (timeout, malformed
         // stdout, …), each module should be retried in isolation
         // so one pathological import doesn't poison every
@@ -2438,6 +2449,7 @@ lazy import np = numpy
 
     #[test]
     fn introspection_survives_a_member_that_raises_on_signature() {
+        let _serial = serialise_subprocess_tests();
         // Regression: a module member that raises a NON-(TypeError|ValueError)
         // from `inspect.signature` (the canonical case is a werkzeug
         // `LocalProxy` re-exported at module scope — `flask.current_app` / `g`
@@ -2535,6 +2547,7 @@ class App:
 
     #[test]
     fn introspection_does_not_run_in_the_project_root() {
+        let _serial = serialise_subprocess_tests();
         // The import-shadowing regression `SECURITY.md` rules out: the
         // embedded helper's first statement imports stdlib modules
         // (`import sys, json, …`), and for a stdin script `sys.path[0]` is

@@ -893,6 +893,12 @@ struct Resolver<'a> {
     /// without this guard a re-declaration would emit the same diagnostic
     /// twice.
     seen_immutable_redecl: std::collections::HashSet<((usize, usize), (usize, usize))>,
+    /// Depth of annotation walking; a reference made while it is non-zero
+    /// sits inside a type annotation, which the emitted module never
+    /// evaluates (`from __future__ import annotations`).
+    in_annotation: usize,
+    /// Spans of the references made inside annotations.
+    annotation_refs: std::collections::HashSet<(usize, usize)>,
     /// `(scope, span)` pairs already reported as `missing_binding_kind`.
     /// Same dedup story as `seen_immutable_redecl`: the bareword
     /// assignment is visited once per pre-collect pass and once per
@@ -1009,6 +1015,8 @@ impl<'a> Resolver<'a> {
             references: Vec::new(),
             diagnostics: Diagnostics::new(),
             seen_immutable_redecl: std::collections::HashSet::new(),
+            in_annotation: 0,
+            annotation_refs: std::collections::HashSet::new(),
             seen_missing_binding_kind: std::collections::HashSet::new(),
             global_nonlocal_names: std::collections::HashMap::new(),
             raw_class_byte_starts: options.raw_class_byte_starts,
@@ -1085,6 +1093,33 @@ impl<'a> Resolver<'a> {
     /// both the same-body reassignment (`for …: let t = 1; t = 99`) and an
     /// inner loop writing to an outer body's `let`. Those are genuine Rule 2
     /// violations and must fall through to the `immutable_assign` path.
+    /// Report `tyc::immutable_assign` when `name` is a live `let` in `scope`
+    /// that a statement at `span` ends — `del NAME`, or an `except … as
+    /// NAME` handler, which deletes the name on exit.
+    fn report_let_ended(&mut self, scope: ScopeId, name: &str, span: (usize, usize)) {
+        if name == "_" {
+            return;
+        }
+        let Some(b) = self.lookup_local(scope, name) else {
+            return;
+        };
+        if b.mutability != Mutability::Let || b.kind == BindingKind::Loop {
+            return;
+        }
+        let decl_span = b.span;
+        if decl_span != span && self.seen_immutable_redecl.insert((decl_span, span)) {
+            self.diagnostics.push_error(TycError::immutable_assign(
+                name,
+                &self.path,
+                self.source,
+                decl_span.0,
+                decl_span.1.saturating_sub(decl_span.0).max(1),
+                span.0,
+                span.1.saturating_sub(span.0).max(1),
+            ));
+        }
+    }
+
     fn binding_came_from_an_exited_loop(&self, span: (usize, usize)) -> bool {
         self.loop_origin_spans
             .get(&span)
@@ -1248,6 +1283,7 @@ impl<'a> Resolver<'a> {
                             span.1.saturating_sub(span.0).max(1),
                         ));
                     }
+                    return;
                 }
                 return;
             }
@@ -1374,6 +1410,9 @@ impl<'a> Resolver<'a> {
     }
 
     fn reference(&mut self, scope: ScopeId, name: &str, span: (usize, usize)) {
+        if self.in_annotation > 0 {
+            self.annotation_refs.insert(span);
+        }
         self.references.push(Reference {
             name: name.to_owned(),
             span,
@@ -1436,7 +1475,16 @@ impl<'a> Resolver<'a> {
                 }
                 current = scope.parent;
             }
-            if !found && !wildcard_in_scope && !builtins.contains(&r.name.as_str()) {
+            // `typing` names are accepted without an import inside an
+            // annotation (never evaluated at runtime), but as a value —
+            // `t is Union`, `TypeVar("T")`, a `Generic[T]` base — they
+            // raise `NameError` (review 2026-10-03 §5.6).
+            let typing_value = TYPING_ONLY_NAMES.contains(&r.name.as_str())
+                && !self.annotation_refs.contains(&r.span);
+            if !found
+                && !wildcard_in_scope
+                && (!builtins.contains(&r.name.as_str()) || typing_value)
+            {
                 let length = r.span.1.saturating_sub(r.span.0).max(1);
                 // `self` is special: it's only legal inside an `impl`
                 // method body, so an unresolved reference deserves a
@@ -1653,6 +1701,7 @@ pub fn resolve_module_with(
     r.report_unknown_names();
     r.report_unused_imports();
     r.report_main_not_called();
+    report_impl_forward_references(&mut r, &module.body);
 
     // Collect class-kind metadata for the type checker. `plain class`
     // names are scraped by name from the original Typhon source (robust
@@ -1685,6 +1734,29 @@ pub fn resolve_module_with(
     let mut diagnostics = r.diagnostics;
     diagnostics.dedup();
     (resolved, diagnostics)
+}
+
+/// `tyc::impl_forward_reference`: an `impl` method that stays merged into
+/// its class body although a decorator or parameter default reads a name
+/// bound only after the class — importing the module raises `NameError`
+/// (W7-06). The decision is the one `tyc-desugar` makes when it places the
+/// methods (`tyc_syntax::impl_site`), so this fires exactly on the methods
+/// the build leaves in the class body.
+fn report_impl_forward_references(r: &mut Resolver, body: &[Stmt]) {
+    for e in tyc_syntax::impl_site::merged_name_errors(body, "__typhon_impl_") {
+        let offset = e.range.start().to_usize();
+        let length = e.range.len().to_usize();
+        r.diagnostics.push_error(TycError::impl_forward_reference(
+            &e.name,
+            &e.class,
+            &e.method,
+            e.why,
+            r.path.clone(),
+            r.source.to_owned(),
+            offset,
+            length,
+        ));
+    }
 }
 
 /// Scan original Typhon source for `plain class NAME ...` (and
@@ -2347,7 +2419,7 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             };
             walk_argument_annotations(r, ann_scope, &f.parameters);
             if let Some(ret) = &f.returns {
-                walk_expr(r, ann_scope, ret);
+                walk_annotation(r, ann_scope, ret);
             }
             // Parameters become bindings in the new scope.
             declare_arguments(r, fn_scope, &f.parameters);
@@ -2428,7 +2500,9 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             // `collect_top_level`.
             let alias_scope = r.push_scope(ScopeKind::Function, scope, range_to_span(ta.range));
             declare_type_params(r, alias_scope, ta.type_params.as_deref());
-            walk_expr(r, alias_scope, &ta.value);
+            // A `type` statement's value is evaluated lazily, like an
+            // annotation.
+            walk_annotation(r, alias_scope, &ta.value);
         }
         Stmt::Assign(a) => {
             walk_expr(r, scope, &a.value);
@@ -2449,7 +2523,7 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             if let Some(v) = &a.value {
                 walk_expr(r, scope, v);
             }
-            walk_expr(r, scope, &a.annotation);
+            walk_annotation(r, scope, &a.annotation);
             // R3-8: `let NAME: T` (or `mut NAME: T`) without an
             // initialiser is now allowed for the declare-then-assign
             // idiom. The first subsequent assignment to the same name
@@ -2635,6 +2709,10 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
                         h.range.start().to_usize(),
                         h.range.start().to_usize() + name.as_str().len(),
                     );
+                    // Unlike a `for` target (R2-17), `except … as NAME`
+                    // *deletes* NAME when the handler ends, so a `let NAME`
+                    // in force is gone afterwards (review 2026-10-03 §3.10).
+                    r.report_let_ended(scope, name.as_str(), span);
                     r.declare(
                         scope,
                         name.as_str(),
@@ -2715,6 +2793,12 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
         Stmt::Delete(d) => {
             for t in &d.targets {
                 walk_expr(r, scope, t);
+                // `del NAME` on a `let` ends a binding the program promised
+                // never to change (review 2026-10-03 §3.10).
+                if let Expr::Name(n) = t {
+                    let span = (n.range.start().to_usize(), n.range.end().to_usize());
+                    r.report_let_ended(scope, n.id.as_str(), span);
+                }
             }
         }
         Stmt::Match(m) => {
@@ -2884,7 +2968,7 @@ fn walk_argument_annotations(r: &mut Resolver, scope: ScopeId, args: &ast::Param
         .chain(args.kwonlyargs.iter());
     for arg in all {
         if let Some(ann) = &arg.parameter.annotation {
-            walk_expr(r, scope, ann);
+            walk_annotation(r, scope, ann);
         }
         if let Some(def) = &arg.default {
             walk_expr(r, scope, def);
@@ -2892,14 +2976,21 @@ fn walk_argument_annotations(r: &mut Resolver, scope: ScopeId, args: &ast::Param
     }
     if let Some(va) = &args.vararg {
         if let Some(ann) = &va.annotation {
-            walk_expr(r, scope, ann);
+            walk_annotation(r, scope, ann);
         }
     }
     if let Some(kw) = &args.kwarg {
         if let Some(ann) = &kw.annotation {
-            walk_expr(r, scope, ann);
+            walk_annotation(r, scope, ann);
         }
     }
+}
+
+/// Walk a type annotation (references made inside it are recorded as such).
+fn walk_annotation(r: &mut Resolver, scope: ScopeId, ann: &Expr) {
+    r.in_annotation += 1;
+    walk_expr(r, scope, ann);
+    r.in_annotation -= 1;
 }
 
 /// Walk a single statement from an `impl` pseudo-class body.
@@ -2938,7 +3029,7 @@ fn walk_impl_method(r: &mut Resolver, cls_scope: ScopeId, stmt: &Stmt) {
             };
             walk_argument_annotations(r, ann_scope, &f.parameters);
             if let Some(ret) = &f.returns {
-                walk_expr(r, ann_scope, ret);
+                walk_annotation(r, ann_scope, ret);
             }
             declare_arguments(r, fn_scope, &f.parameters);
             collect_top_level(r, fn_scope, &f.body);
@@ -3393,11 +3484,36 @@ fn declare_walrus_leaks(r: &mut Resolver, scope: ScopeId, expr: &Expr) {
 /// A conservative list of Python built-in names that the resolver treats
 /// as always-in-scope. Not exhaustive — the goal is to avoid false-positive
 /// "unknown name" diagnostics for common identifiers in Phase 1.
-fn builtin_names() -> std::collections::HashSet<&'static str> {
+/// The `typing` names [`builtin_names`] accepts so annotations can use them
+/// without an import, and that nothing imports for the emitted module
+/// either: as runtime values they raise `NameError`. (`Protocol` and the
+/// `collections.abc` names are left out — the desugarer injects their
+/// imports for interfaces and annotation uses.)
+const TYPING_ONLY_NAMES: &[&str] = &[
+    "Optional",
+    "Union",
+    "Any",
+    "List",
+    "Dict",
+    "Set",
+    "Tuple",
+    "FrozenSet",
+    "Type",
+    "TypeVar",
+    "Generic",
+    "Self",
+    "ClassVar",
+    "Final",
+    "Literal",
+    "NoReturn",
+];
+
+pub fn builtin_names() -> std::collections::HashSet<&'static str> {
     let names: &[&'static str] = &[
         // Built-in functions
         "print",
         "len",
+        "slice",
         "range",
         "abs",
         "min",
@@ -3633,6 +3749,66 @@ mod tests {
         resolve_with_options(src, ResolveOptions::default())
     }
 
+    fn impl_forward_refs(src: &str) -> Vec<String> {
+        let (_, d) = resolve(src);
+        d.errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::ImplForwardReference { .. }))
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn merged_impl_method_reading_a_late_name_is_reported() {
+        let late = "class C:\n    x: int\nK = 1\n";
+        for method in [
+            "    def __call__(k: int = K) -> int:\n        return k\n",
+            "    def m(k: int = K) -> int:\n        return self.__secret\n",
+            "    @property\n    def m(k: int = K) -> int:\n        return k\n",
+            "    @classmethod\n    def m(k: int = K) -> int:\n        return k\n",
+        ] {
+            let src = format!("{late}class __typhon_impl_C(object):\n{method}");
+            let errs = impl_forward_refs(&src);
+            assert_eq!(errs.len(), 1, "{src}: {errs:?}");
+            assert!(
+                errs[0].contains("`K` is not bound yet when class `C` is created"),
+                "{errs:?}"
+            );
+        }
+        // A subclass before the block; a base-defined name.
+        for src in [
+            "class C:\n    x: int\nclass D(C):\n    pass\nK = 1\nclass __typhon_impl_C(object):\n    def m(k: int = K) -> int:\n        return k\n",
+            "from mod import Ext\nclass C(Ext):\n    y: int\nK = 1\nclass __typhon_impl_C(object):\n    def m(k: int = K) -> int:\n        return k\n",
+            // A decorator defined after the class.
+            "class C:\n    x: int\ndef deco(f):\n    return f\nclass __typhon_impl_C(object):\n    @deco\n    def __repr__() -> str:\n        return \"c\"\n",
+        ] {
+            assert_eq!(impl_forward_refs(src).len(), 1, "{src}");
+        }
+    }
+
+    #[test]
+    fn impl_methods_that_run_are_not_reported() {
+        for src in [
+            // Attached at its block (W7-06): runs.
+            "class C:\n    x: int\nK = 1\nclass __typhon_impl_C(object):\n    def m(k: int = K) -> int:\n        return k\n",
+            // Bound before the class.
+            "K = 0\nclass C:\n    x: int\nK = 1\nclass __typhon_impl_C(object):\n    def __call__(k: int = K) -> int:\n        return k\n",
+            // A star import above the class may bind it.
+            "from os import *\nclass C:\n    x: int\nK = 1\nclass __typhon_impl_C(object):\n    def __call__(k: int = K) -> int:\n        return k\n",
+            // A function may bind it with `global` before the class runs.
+            "def setup() -> None:\n    global K\n    K = 0\nsetup()\nclass C:\n    x: int\nK = 1\nclass __typhon_impl_C(object):\n    def __call__(k: int = K) -> int:\n        return k\n",
+            // The namespace is written dynamically.
+            "globals()[\"K\"] = 0\nclass C:\n    x: int\nK = 1\nclass __typhon_impl_C(object):\n    def __call__(k: int = K) -> int:\n        return k\n",
+            // The class body binds the name.
+            "class C:\n    x: int\n    K = 2\nK = 1\nclass __typhon_impl_C(object):\n    def __call__(k: int = K) -> int:\n        return k\n",
+            // Only annotations and the body read it.
+            "class C:\n    x: int\nK = 1\nclass __typhon_impl_C(object):\n    def __call__(k: K = None) -> int:\n        return K\n",
+        ] {
+            let errs = impl_forward_refs(src);
+            assert!(errs.is_empty(), "{src}: {errs:?}");
+        }
+    }
+
     #[test]
     fn from_imports_record_their_relative_level() {
         // `tyc-db` resolves a relative import against the importing
@@ -3854,6 +4030,68 @@ def f() -> None:
         // the body is already rejected), so the augmented form matches.
         let (_, d) = resolve("def k(xs: list[int]) -> None:\n    for x in xs:\n        x += 1\n");
         assert!(has_immutable_assign(&d), "a loop target is a `let`");
+    }
+
+    /// A `typing` name accepted without an import in an annotation is a
+    /// `NameError` as a runtime value (review 2026-10-03 §5.6).
+    #[test]
+    fn typing_names_as_values_need_an_import() {
+        let has_unknown = |d: &Diagnostics, name: &str| {
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UnknownName { name: n, .. } if n == name))
+        };
+        let (_, d) = resolve("def f(t: object) -> bool:\n    return t is Union\n");
+        assert!(has_unknown(&d, "Union"), "{:?}", d.errors());
+        let (_, d) = resolve("T = TypeVar(\"T\")\n");
+        assert!(has_unknown(&d, "TypeVar"), "{:?}", d.errors());
+        for ok in [
+            "def g(x: Union[int, str]) -> Optional[int]:\n    return None\n",
+            "let y: Optional[int] = None\n",
+            "type Handler = Callable[[int], None]\ntype U = Union[int, str]\n",
+            "from typing import Union\ndef f(t: object) -> bool:\n    return t is Union\n",
+            "def f(x: object) -> bool:\n    return isinstance(x, Iterable)\n",
+        ] {
+            let (_, d) = resolve(ok);
+            assert!(
+                !d.errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::UnknownName { .. })),
+                "{ok}: {:?}",
+                d.errors()
+            );
+        }
+    }
+
+    /// `del NAME` and an `except … as NAME` handler both *end* a live `let`
+    /// (review 2026-10-03 §3.10). A `for` / `with … as` target rebinding one
+    /// stays allowed (R2-17).
+    #[test]
+    fn del_and_except_as_end_a_let() {
+        for src in [
+            "let err: str = \"x\"\ntry:\n    int(\"z\")\nexcept ValueError as err:\n    pass\n",
+            "let RATE: int = 3\ndel RATE\n",
+            "def g() -> None:\n    let r: int = 1\n    del r\n",
+            "def g() -> None:\n    let e: str = \"a\"\n    try:\n        int(\"z\")\n    except ValueError as e:\n        pass\n",
+        ] {
+            let (_, d) = resolve(src);
+            assert!(
+                has_immutable_assign(&d),
+                "expected immutable_assign for:\n{src}"
+            );
+        }
+        for src in [
+            "def g(xs: list[int], ys: list[int]) -> None:\n    for a in xs:\n        let x: int = a\n        print(x)\n    for x in ys:\n        print(x)\n",
+            "mut M: int = 3\nfor M in [1, 2]:\n    pass\n",
+            "def g(xs: list[int], ys: list[int]) -> None:\n    for x in xs:\n        pass\n    for x in ys:\n        pass\n",
+            "def g() -> None:\n    mut r: int = 1\n    del r\n",
+            "let f: int = 3\nwith open(\"/dev/null\") as f:\n    pass\n",
+            "def g(xs: list[int]) -> None:\n    let x: int = 1\n    for x in xs:\n        pass\n",
+            "def g() -> None:\n    try:\n        int(\"z\")\n    except ValueError as e:\n        pass\n    try:\n        int(\"y\")\n    except ValueError as e:\n        pass\n",
+        ] {
+            let (_, d) = resolve(src);
+            assert!(!has_immutable_assign(&d), "unexpected immutable_assign for:\n{src}: {:?}", d.errors());
+        }
     }
 
     /// `try` / `except` arms are alternatives, like `if` / `elif`: a `let` in

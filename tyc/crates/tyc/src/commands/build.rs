@@ -11,11 +11,11 @@ use clap::Args;
 use miette::{miette, Result};
 use tyc_analyse::{
     analyse_purity_with, class_names_at_marker_starts, collect_gatherable_async_fn_names,
-    detect_missed_gathers, evaluate_comptime_with_functions, extract_builtin_extensions,
+    detect_missed_gathers, evaluate_comptime_in_source, extract_builtin_extensions,
     load_profile_samples, parallel_opportunity_diagnostics, pgo_memoise_targets,
     purity_diagnostics, rewrite_auto_gather, rewrite_builtin_extension_calls_with_facts,
     rewrite_parallel_comprehensions, rewrite_reduction_loops, shared_mut_across_tasks_diagnostics,
-    substitute_comptime_literals, ClassFacts, ProfileSample, StaticType, TypeFacts,
+    substitute_comptime_literals, CacheKind, ClassFacts, ProfileSample, StaticType, TypeFacts,
 };
 use tyc_db::{check_file_with_imports, extract_shapes_and_facts_for_path, TycDatabase};
 use tyc_desugar::{desugar_module_with, DesugarOptions};
@@ -104,24 +104,24 @@ pub fn run(args: BuildArgs) -> Result<()> {
             args.path.display()
         ));
     }
-    let project_root = args
+    let invocation_path = args
         .path
         .canonicalize()
         .map_err(|e| miette!("cannot resolve path '{}': {}", args.path.display(), e))?;
 
     // Load typhon.toml, anchoring src/out to the directory that contains it
     // so that `tyc build` works correctly when invoked from a subdirectory.
-    let (config_dir, config) = match TyphonConfig::load(&project_root) {
+    let (project_root, config) = match TyphonConfig::load(&invocation_path) {
         Ok(Some((toml_path, cfg))) => {
             let dir = toml_path
                 .parent()
                 .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| project_root.clone());
+                .unwrap_or_else(|| invocation_path.clone());
             (dir, cfg)
         }
         Ok(None) => {
             eprintln!("warning: no typhon.toml found; using defaults");
-            (project_root.clone(), TyphonConfig::default())
+            (invocation_path.clone(), TyphonConfig::default())
         }
         // Lift typed `ConfigError` variants into the structured
         // `TycError` catalog so config-load failures render the same
@@ -183,6 +183,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         Err(e) => return Err(miette!("{e}")),
     };
 
+    let config_dir = project_root.clone();
     let src_dir = config_dir.join(&config.project.src);
 
     // Resolve --out relative to project_root so `tyc build path/to/proj -o build`
@@ -197,7 +198,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             if out.is_absolute() {
                 out
             } else {
-                project_root.join(out)
+                config_dir.join(out)
             }
         }
         None => config_dir.join(&config.project.out),
@@ -209,17 +210,20 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // still enough to catch a symlink *inside* the output tree, and without
     // it `tyc run --compile --temp` could never write its scratch build.
     let (confine_root, confine_label) = if out_is_explicit {
-        // `--check` promises to touch nothing, so the boundary is derived
-        // from the nearest existing ancestor rather than by creating the
-        // directory that a real build would want.
         if !args.check {
             std::fs::create_dir_all(&out_dir)
                 .map_err(|e| miette!("cannot create '{}': {e}", out_dir.display()))?;
         }
         (canonical_or_lexical(&out_dir), "the output directory")
     } else {
-        (project_root.clone(), "the project root")
+        (config_dir.clone(), "the project root")
     };
+
+    // Validate confinement before writing anything (e.g. before updating pyproject.toml
+    // or creating build/ or .venv directories).
+    if !out_is_explicit {
+        validate_output_confinement(&confine_root, confine_label, &out_dir)?;
+    }
 
     let do_format = config.emit.format && !args.no_format;
     // PEP 810 (Python 3.15) ships native `lazy import` syntax with exactly
@@ -293,6 +297,13 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // are known. After this, `config.strictness.{auto_memoise,auto_gather,
     // auto_parallel,pgo_memoise}` are `Some(_)` and read with `.unwrap_or(false)`.
     // An explicit `[strictness]` entry always wins over the level default.
+    // W4-16: settings that are accepted but cannot take effect.
+    for advisory in config.advisories(args.optimise) {
+        eprintln!(
+            "warning: {}: {advisory}",
+            project_root.join("typhon.toml").display()
+        );
+    }
     config.resolve_optimise(args.optimise);
     if sources_use_model_keyword(&sources) && !config.dependencies.contains_key("pydantic") {
         config
@@ -317,7 +328,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             if let Some(warn) =
                 crate::commands::check::check_stdlib_module_shadow(path, source, &src_dir_canon)
             {
-                eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn)));
+                eprint_warning(warn);
             }
         }
     }
@@ -482,7 +493,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
 
     // Emit warnings even when there are no errors so they are always visible.
     for warn in all_phase1_diags.warnings() {
-        eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn.clone())));
+        eprint_warning(warn.clone());
     }
 
     if all_phase1_diags.has_errors() {
@@ -748,6 +759,63 @@ pub fn run(args: BuildArgs) -> Result<()> {
                         }
                     })
                     .collect();
+                // Re-export every constituent's `extend BUILTIN:` helpers
+                // too (`from .text import __typhon_ext_str__slug__`), so the
+                // call-site rewrite in a consumer that imports through the
+                // facade can import them from it (W3-02). They stay out of
+                // `__all__` and the collision check: the checker merges
+                // them first-write-wins.
+                let pkg_dotted = crate::commands::util::path_to_dotted(path, src_root);
+                let mut constituents: Vec<String> = sources
+                    .iter()
+                    .filter_map(|(sib_path, _)| {
+                        let sib_parent = sib_path.parent()?;
+                        let stem = sib_path.file_stem()?.to_str()?;
+                        if sib_parent == parent_dir && stem != "__init__" {
+                            return Some(stem.to_owned());
+                        }
+                        if sib_parent.parent() == Some(parent_dir) && stem == "__init__" {
+                            return Some(sib_parent.file_name()?.to_str()?.to_owned());
+                        }
+                        None
+                    })
+                    .collect();
+                constituents.sort();
+                constituents.dedup();
+                let mut ext_seen: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                let mut import_pieces = import_pieces;
+                for sib in &constituents {
+                    // A source-root facade (`src/__init__.ty`) has an empty
+                    // dotted name; its siblings are keyed `text`, not `.text`.
+                    let sib_key = if pkg_dotted.is_empty() {
+                        sib.clone()
+                    } else {
+                        format!("{pkg_dotted}.{sib}")
+                    };
+                    let Some(shape) = project_shapes.get(&sib_key) else {
+                        continue;
+                    };
+                    let mut ext_names: Vec<String> = Vec::new();
+                    let mut sentinels: Vec<_> = shape.class_shapes.iter().collect();
+                    sentinels.sort_by(|a, b| a.0.cmp(b.0));
+                    for (cls_name, ext) in sentinels {
+                        let Some(builtin) = cls_name.strip_prefix("__typhon_builtin_ext_") else {
+                            continue;
+                        };
+                        let mut methods: Vec<&String> = ext.methods.keys().collect();
+                        methods.sort();
+                        for method in methods {
+                            let fn_name = tyc_analyse::free_fn_name(builtin, method);
+                            if ext_seen.insert(fn_name.clone()) {
+                                ext_names.push(fn_name);
+                            }
+                        }
+                    }
+                    if !ext_names.is_empty() {
+                        import_pieces.push(format!("from .{sib} import {}", ext_names.join(", ")));
+                    }
+                }
                 if !import_pieces.is_empty() {
                     let import_line = import_pieces.join("; ");
                     prep.python_source =
@@ -775,40 +843,33 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // Evaluate all `comptime` bindings and substitute their literals into
         // the AST before desugaring. `comptime def` functions registered by
         // the preprocessor are dispatchable from the binding RHSs.
-        let (comptime_values, comptime_diags) = evaluate_comptime_with_functions(
+        let (comptime_values, mut comptime_diags) = evaluate_comptime_in_source(
             &module,
+            &path.display().to_string(),
+            &prep.python_source,
             &prep.comptime_bindings,
             &prep.comptime_functions,
         );
 
-        // Phase 5.6 secret-literal lint: flag any comptime binding whose
-        // name looks like a credential (KEY / TOKEN / PASSWORD / SECRET /
-        // PASS / PWD, case-insensitive). The substituted value lands in
-        // the emitted Python as a raw string literal — committing such
-        // build output to a repository leaks the secret.
-        //
-        // Suppression knob: a `[strictness] allow-secret-comptime = true`
-        // toggle in `typhon.toml` should silence this warning.
-        // It is checked using `!config.strictness.allow_secret_comptime` below.
+        // Phase 5.6 secret-literal lint: a `comptime let` whose string value
+        // reads `env("…")` lands in the emitted Python as a raw literal, so
+        // committing the build output leaks it. Fires when the binding name
+        // or an env key it reads names a credential, weighted by the value
+        // (the shared `tyc_analyse::secrets` heuristics — the same ones the
+        // plain-literal lint uses). Silenced by `[strictness]
+        // allow-secret-comptime = true`.
         if !config.strictness.allow_secret_comptime {
-            for name in comptime_values.keys() {
-                if secret_suffix(name).is_none() {
-                    continue;
-                }
-                // Only fire when the RHS actually pulls from `env(...)` — a
-                // hard-coded `comptime let API_KEY = "test"` isn't reading a
-                // secret, just labelling a literal. Pull the actual env-var
-                // key out of the source so the help text points at the right
-                // identifier (the binding name and the env key often differ:
-                // `comptime let API_KEY = env("MY_SERVICE_API_KEY")`).
-                if let Some(env_key) = find_env_key_for_comptime_binding(source, name) {
-                    let warn = TycError::contains_secret_literal(name.clone(), env_key);
-                    eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn)));
-                }
+            for (name, env_key) in tyc_analyse::comptime_secret_bindings(&module, &comptime_values)
+            {
+                let warn = TycError::contains_secret_literal(name, env_key);
+                eprint_warning(warn);
             }
         }
 
         if comptime_diags.has_errors() {
+            // Anchored in the preprocessed buffer; point them at the `.ty`.
+            let ty_name = path.display().to_string();
+            comptime_diags.remap_lines(&prep.python_source, &preprocessed_to_ty, &ty_name, source);
             for err in comptime_diags.errors() {
                 eprintln!("{:?}", miette::Report::new_boxed(Box::new(err.clone())));
             }
@@ -849,18 +910,18 @@ pub fn run(args: BuildArgs) -> Result<()> {
             ));
         }
         // An explicit `@memo` / `@pure(memo=True)` is honoured once nothing
-        // provably impure was found; an `auto-memoise` candidate must be
-        // provably pure with cache-safe parameters and return type.
-        let mut memoise_targets: Vec<String> = purity_findings
+        // provably impure was found (`@functools.cache`). Every silent path —
+        // `auto-memoise`, `-O`, and a plain `@pure` under either — needs the
+        // full cache-safety proof and gets a bounded, typed `lru_cache`
+        // (W3-04: `@pure` is a purity claim, not a cacheability claim).
+        let memoise_targets: Vec<String> = purity_findings
             .iter()
-            .filter(|f| {
-                f.memoise
-                    && if f.declared_pure {
-                        f.violation.is_none()
-                    } else {
-                        f.auto_cacheable()
-                    }
-            })
+            .filter(|f| f.cache_decision() == Some(CacheKind::Explicit))
+            .map(|f| f.name.clone())
+            .collect();
+        let mut auto_memoise_targets: Vec<String> = purity_findings
+            .iter()
+            .filter(|f| f.cache_decision() == Some(CacheKind::Auto))
             .map(|f| f.name.clone())
             .collect();
 
@@ -887,8 +948,8 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 config.strictness.pgo_min_calls,
             );
             for name in promoted {
-                if !memoise_targets.contains(&name) {
-                    memoise_targets.push(name);
+                if !memoise_targets.contains(&name) && !auto_memoise_targets.contains(&name) {
+                    auto_memoise_targets.push(name);
                 }
             }
         }
@@ -962,7 +1023,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // Default-on concurrency nudge. Flag every remaining run of 2+
         // adjacent independent awaited calls inside an `async def` —
         // most commonly awaited method calls on imported clients
-        // (`await client.get_user(id)` then `await client.get_posts(id)`),
+        // (`await users.get(id)` then `await posts_api.for_user(id)`),
         // which `auto-gather` never folds — so the user can wrap them in
         // an explicit `gather:` block and run them concurrently. Runs
         // already folded by `auto-gather` above are gone from the AST, so
@@ -1068,7 +1129,10 @@ pub fn run(args: BuildArgs) -> Result<()> {
         let mut cross_module_fns: HashMap<String, String> = HashMap::new();
         let current_dotted = crate::commands::util::path_to_dotted(path, src_root);
         let is_init = path.file_stem().and_then(|s| s.to_str()) == Some("__init__");
-        let imports = scan_module_imports(&module.body, &current_dotted, is_init);
+        let imports = resolve_package_attribute_imports(
+            scan_module_imports(&module.body, &current_dotted, is_init),
+            &project_shapes,
+        );
         for imp in &imports {
             let Some(key) = import_shape_key(imp, &project_shapes) else {
                 continue;
@@ -1154,6 +1218,10 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 inject_cross_module_ext_imports(&mut module, &cross_module_used);
             }
         }
+        // Inline `?` evaluation order: the method lookup of each hoisted
+        // receiver moves up with it (after the extension rewrite, which owns
+        // extension calls on those receivers). The VM runs the same step.
+        tyc_syntax::preprocess::attach_method_lookups(&mut module);
 
         // Phase 4 loop parallelisation: rewrite `[f(x) for x in xs]` runs
         // whose callee is in the pure-function set into thread-pool maps.
@@ -1204,6 +1272,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             &module,
             DesugarOptions {
                 memoise_functions: memoise_targets,
+                auto_memoise_functions: auto_memoise_targets,
                 raw_class_line_starts,
                 frozen_class_line_starts,
                 plain_class_line_starts,
@@ -1504,7 +1573,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 offset,
                 length,
             );
-            eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn)));
+            eprint_warning(warn);
         };
         // Relative imports that escape the source root (`from ..x import …`
         // from a top-level module) crash at import — surface them here.
@@ -1564,6 +1633,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             &module,
             DesugarOptions {
                 memoise_functions: Vec::new(),
+                auto_memoise_functions: Vec::new(),
                 raw_class_line_starts,
                 frozen_class_line_starts,
                 plain_class_line_starts,
@@ -1598,31 +1668,36 @@ pub fn run(args: BuildArgs) -> Result<()> {
         eprintln!("emitted {} stub(s) (.pyi)", stubs_emitted);
     }
 
+    // W4-12: `typhon_runtime` is reserved for the generated package below.
+    // A project module of that name is shadowed (or overwritten file by file)
+    // whenever the runtime is written; refuse the build only when that breaks
+    // an import the program makes, and warn otherwise.
+    if let Some(user_runtime) = super::reserved::user_runtime(&src_dir) {
+        if needs_runtime {
+            let broken = super::reserved::broken_imports(
+                &sources,
+                &user_runtime,
+                &generated_runtime_files(&config),
+            );
+            if !broken.is_empty() {
+                return Err(super::reserved::reserved_error(&user_runtime, &broken));
+            }
+        }
+        eprintln!(
+            "{:?}",
+            super::reserved::reserved_warning(&user_runtime, needs_runtime)
+        );
+    }
+
     // Emit the typhon_runtime helper alongside the Python output when any
     // source file uses Ok, Err, Result, `go`, `lazy`, etc.  The helper is a
     // generated package the build owns; users do not need to install a
     // separate PyPI package.
     if needs_runtime {
         let runtime_dir = out_dir.join("typhon_runtime");
-        // `parallel.py` is parameterised by the configured execution backend
-        // (`[strictness] parallel-backend`); the rest are static.
-        let parallel_py = typhon_runtime_parallel_py(
-            &config.strictness.parallel_backend,
-            config.strictness.parallel_min_size,
-        );
-        let files = [
-            ("__init__.py", TYPHON_RUNTIME_INIT_PY),
-            ("tasks.py", TYPHON_RUNTIME_TASKS_PY),
-            ("lazy.py", TYPHON_RUNTIME_LAZY_PY),
-            ("stdlib.py", TYPHON_RUNTIME_STDLIB_PY),
-            ("result.py", TYPHON_RUNTIME_RESULT_PY),
-            ("parallel.py", parallel_py.as_str()),
-            ("freeze.py", TYPHON_RUNTIME_FREEZE_PY),
-            ("cast.py", TYPHON_RUNTIME_CAST_PY),
-            ("traceback.py", TYPHON_RUNTIME_TRACEBACK_PY),
-        ];
+        let files = generated_runtime_files(&config);
         if check_mode {
-            for (name, _body) in files {
+            for (name, _body) in &files {
                 let path = runtime_dir.join(name);
                 eprintln!("would write {}", display_relative(&path, &project_root));
                 would_write_count += 1;
@@ -1632,7 +1707,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 .map_err(|e| miette!("cannot create output dir '{}': {e}", out_dir.display()))?;
             std::fs::create_dir_all(&runtime_dir)
                 .map_err(|e| miette!("cannot create '{}': {e}", runtime_dir.display()))?;
-            for (name, body) in files {
+            for (name, body) in &files {
                 let path = runtime_dir.join(name);
                 confine_output_path(&confine_root, confine_label, &path)?;
                 tyc_format::atomic_write(&path, body.as_bytes())
@@ -1703,6 +1778,19 @@ struct ImportSpec {
     /// The local name bound to the module itself by `import M [as N]` or
     /// `from pkg import submodule`.
     module_alias: Option<String>,
+    /// For `from . import name` / `from .. import name`: the anchoring
+    /// package, which `name` is read off when it is not a submodule (see
+    /// [`resolve_package_attribute_imports`]).
+    from_package: Option<String>,
+}
+
+/// Print `warn` as a warning. A diagnostic reported as a warning (a
+/// strictness knob at `"warn"`) is often a variant whose static severity is
+/// `Error`; render it with the warning marker, as `tyc check` does.
+fn eprint_warning(warn: TycError) {
+    let wrapped =
+        tyc_diagnostics::SanitisedDiagnostic::wrap(warn).with_severity(miette::Severity::Warning);
+    eprintln!("{:?}", miette::Report::new_boxed(Box::new(wrapped)));
 }
 
 fn scan_module_imports(
@@ -1736,6 +1824,7 @@ fn scan_module_imports(
                                 .collect(),
                             module_alias: None,
                             raw,
+                            from_package: None,
                         });
                     }
                     None => {
@@ -1760,6 +1849,7 @@ fn scan_module_imports(
                                 names: Vec::new(),
                                 module_alias: Some(local_name(a)),
                                 raw: name,
+                                from_package: Some(package.clone()),
                             });
                         }
                     }
@@ -1774,6 +1864,7 @@ fn scan_module_imports(
                         spec: name,
                         names: Vec::new(),
                         module_alias: Some(local_name(a)),
+                        from_package: None,
                     });
                 }
             }
@@ -1781,6 +1872,42 @@ fn scan_module_imports(
         }
     }
     out
+}
+
+/// `from . import name` names a submodule first; a name the package has no
+/// submodule for is read off the package itself — typically a `pub *`
+/// facade's re-export — as CPython and the VM resolve it. Re-point such an
+/// import at the package, so the names' declared types and the package's
+/// `extend BUILTIN:` helpers reach the consumer exactly as they do for
+/// `from pkg import name`; the injected helper import names the package
+/// (`from .. import __typhon_ext_str__slug__`), whose facade re-exports it.
+fn resolve_package_attribute_imports(
+    imports: Vec<ImportSpec>,
+    project_shapes: &HashMap<String, tyc_db::ModuleShapes>,
+) -> Vec<ImportSpec> {
+    imports
+        .into_iter()
+        .map(|imp| {
+            let Some(package) = imp.from_package.clone() else {
+                return imp;
+            };
+            if import_shape_key(&imp, project_shapes).is_some()
+                || !project_shapes.contains_key(&package)
+            {
+                return imp;
+            }
+            let level = imp.spec.bytes().take_while(|b| *b == b'.').count();
+            let local = imp.module_alias.unwrap_or_else(|| imp.raw.clone());
+            ImportSpec {
+                raw: package.clone(),
+                resolved: package,
+                spec: ".".repeat(level),
+                names: vec![(imp.raw, local)],
+                module_alias: None,
+                from_package: None,
+            }
+        })
+        .collect()
 }
 
 /// The `project_shapes` key an import statement resolves to: the
@@ -2066,6 +2193,46 @@ fn canonical_or_lexical(path: &std::path::Path) -> std::path::PathBuf {
     path.to_path_buf()
 }
 
+fn validate_output_confinement(
+    root: &std::path::Path,
+    root_label: &str,
+    out_dir: &std::path::Path,
+) -> Result<()> {
+    if std::fs::symlink_metadata(out_dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        let real = std::fs::canonicalize(out_dir).map_err(|e| {
+            miette!(
+                "cannot resolve output dir symlink '{}': {e}",
+                out_dir.display()
+            )
+        })?;
+        let root = std::fs::canonicalize(root)
+            .map_err(|e| miette!("cannot resolve output root '{}': {e}", root.display()))?;
+        if !real.starts_with(&root) {
+            return Err(miette!(
+                "refusing to write '{}': its directory resolves to '{}', outside {} '{}'",
+                out_dir.display(),
+                real.display(),
+                root_label,
+                root.display()
+            ));
+        }
+        return Ok(());
+    }
+    let root = std::fs::canonicalize(root)
+        .map_err(|e| miette!("cannot resolve output root '{}': {e}", root.display()))?;
+    let resolved_out = canonical_or_lexical(out_dir);
+    if !resolved_out.starts_with(&root) {
+        return Err(miette!(
+            "refusing to write '{}': its directory resolves to '{}', outside {} '{}'",
+            out_dir.display(),
+            resolved_out.display(),
+            root_label,
+            root.display()
+        ));
+    }
+    Ok(())
+}
+
 fn confine_output_path(
     root: &std::path::Path,
     root_label: &str,
@@ -2099,18 +2266,6 @@ fn display_relative(path: &std::path::Path, project_root: &std::path::Path) -> S
     path.strip_prefix(project_root)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| path.to_string_lossy().into_owned())
-}
-
-/// Return `Some(suffix)` if `name` looks like a credential identifier.
-/// Used by the secret-comptime lint. Delegates to the single shared
-/// word-boundary matcher in `tyc-analyse` (which also backs the
-/// `tyc::contains_secret_literal` lint), so the two consumers can no
-/// longer drift — the boundary logic used to be a hand-synchronised
-/// copy of that function, the same drift class that produced the
-/// alpha.4 `KEY_APIKEY` ordering bug. The `secret_suffix_*` tests below
-/// pin the shared behaviour from this call site.
-fn secret_suffix(name: &str) -> Option<&'static str> {
-    tyc_analyse::secret_keyword_match(name)
 }
 
 /// Scan `source` for `from .NAME import …` lines and return
@@ -2220,51 +2375,6 @@ pub(crate) fn scan_overdeep_relative_imports(
         line_start += line_len;
     }
     out
-}
-
-/// Find the env-var key in a `comptime let NAME ... = env("KEY"...)`
-/// declaration by scanning `source` for the binding's line. Returns the
-/// first quoted string immediately following `env(` on a line that mentions
-/// `NAME`. Returns `None` when the binding's RHS doesn't use `env(...)` —
-/// e.g. `comptime let X = 42`, where the secret lint shouldn't fire.
-fn find_env_key_for_comptime_binding(source: &str, binding_name: &str) -> Option<String> {
-    let needle = "comptime ";
-    for line in source.lines() {
-        let trimmed = line.trim_start();
-        if !trimmed.starts_with(needle) {
-            continue;
-        }
-        // Match either `comptime let NAME` or `comptime mut NAME` or
-        // bare `comptime NAME` (legacy). Cheaply check the binding name
-        // appears before the `=`.
-        let lhs = trimmed.split('=').next().unwrap_or("");
-        let lhs_has_name = lhs.split_whitespace().any(|tok| {
-            tok.trim_end_matches(':')
-                .trim_end_matches(',')
-                .eq(binding_name)
-        });
-        if !lhs_has_name {
-            continue;
-        }
-        // Locate the first `env(` after the `=` and lift the first quoted
-        // string out of its argument list.
-        let after_eq = match trimmed.split_once('=') {
-            Some((_, r)) => r,
-            None => continue,
-        };
-        let env_idx = after_eq.find("env(")?;
-        let after_open = &after_eq[env_idx + "env(".len()..];
-        // Strip optional whitespace and grab the leading `"..."` or `'...'`.
-        let after_ws = after_open.trim_start();
-        let quote = after_ws.chars().next()?;
-        if quote != '"' && quote != '\'' {
-            return None;
-        }
-        let rest = &after_ws[1..];
-        let end = rest.find(quote)?;
-        return Some(rest[..end].to_owned());
-    }
-    None
 }
 
 /// Byte offset of the start of the 0-based `line_idx` line in `source`.
@@ -2467,6 +2577,11 @@ pub(crate) fn detect_pub_star_diagnostics(
     let mut advice: Vec<tyc_diagnostics::TycError> = Vec::new();
 
     for (path, source) in sources {
+        // Only a `pub *` line is reported, and no sugar expansion writes one,
+        // so a file without both tokens skips the whole pipeline below.
+        if !(source.contains("pub") && source.contains('*')) {
+            continue;
+        }
         let expanded = expand_question_ops(&expand_inline_question_ops(
             &expand_compound_question_headers(&expand_pipes(&expand_with_chains(
                 &expand_go_calls(&expand_gather_blocks(&expand_multiline_guards(
@@ -3260,6 +3375,27 @@ fn build_source_map_v2(
 // `substitute_comptime_literals` re-export at the top of this file.
 // Transformation: `PORT: int = int(env("PORT", "8080"))` →
 // `PORT: int = 8080`.
+
+/// The generated `typhon_runtime/` package: file name → contents.
+/// `parallel.py` is parameterised by the configured execution backend
+/// (`[strictness] parallel-backend`); the rest are static.
+fn generated_runtime_files(config: &TyphonConfig) -> Vec<(&'static str, String)> {
+    let parallel_py = typhon_runtime_parallel_py(
+        &config.strictness.parallel_backend,
+        config.strictness.parallel_min_size,
+    );
+    vec![
+        ("__init__.py", TYPHON_RUNTIME_INIT_PY.to_owned()),
+        ("tasks.py", TYPHON_RUNTIME_TASKS_PY.to_owned()),
+        ("lazy.py", TYPHON_RUNTIME_LAZY_PY.to_owned()),
+        ("stdlib.py", TYPHON_RUNTIME_STDLIB_PY.to_owned()),
+        ("result.py", TYPHON_RUNTIME_RESULT_PY.to_owned()),
+        ("parallel.py", parallel_py),
+        ("freeze.py", TYPHON_RUNTIME_FREEZE_PY.to_owned()),
+        ("cast.py", TYPHON_RUNTIME_CAST_PY.to_owned()),
+        ("traceback.py", TYPHON_RUNTIME_TRACEBACK_PY.to_owned()),
+    ]
+}
 
 /// Generated `typhon_runtime/__init__.py` — exposes `Ok`/`Err`/`Result` plus
 /// the `tasks` and `lazy` submodules at the package root.
@@ -4107,6 +4243,12 @@ def _deep_freeze(value: Any, seen: set[int]) -> Any:
                 return frozenset(_deep_freeze(v, seen) for v in value)
             finally:
                 seen.discard(value_id)
+        if isinstance(value, MappingProxyType):
+            seen.add(value_id)
+            try:
+                return MappingProxyType({k: _deep_freeze(v, seen) for k, v in value.items()})
+            finally:
+                seen.discard(value_id)
         return value
     if isinstance(value, list):
         seen.add(value_id)
@@ -4160,99 +4302,95 @@ const TYPHON_RUNTIME_CAST_PY: &str = "\
 \"\"\"Runtime guard backing Typhon's `as!` checked boundary cast.\"\"\"
 from __future__ import annotations
 
+import collections.abc as abc
 import types
 import typing
 from typing import Any
 
 
 def checked_cast(value: Any, tp: Any) -> Any:
-    \"\"\"Return *value* if it structurally matches *tp*, else raise TypeError.
-
-    Backs `EXPR as! TYPE`. The static type is `TYPE` (the checker handles
-    that); this enforces the same shape at runtime so the boundary cast is
-    sound rather than a blind assertion.
-    \"\"\"
-    if _matches(value, tp):
+    \"\"\"Preserve value identity after checking the documented target shape.\"\"\"
+    if _matches(value, tp, {}, set()):
         return value
     raise TypeError(
         f\"as! cast failed: value of type {type(value).__name__} \"
-        f\"does not match {_format_type(tp)}\"
+        f\"does not match {tp}\"
     )
 
 
-def _matches(value: Any, tp: Any) -> bool:
-    # `Any` / `object` accept anything.
+def _matches(value: Any, tp: Any, bindings: dict, active: set) -> bool:
+    parameters_seen = set()
+    while isinstance(tp, typing.TypeVar):
+        if tp not in bindings or tp in parameters_seen:
+            raise TypeError(f\"as! cannot check unbound type parameter {tp}\")
+        parameters_seen.add(tp)
+        tp = bindings[tp]
     if tp is Any or tp is object:
         return True
-    origin = typing.get_origin(tp)
-    if origin is None:
+    # Alias recursion and cyclic container values must terminate. A pair
+    # stays active only while descending that branch, allowing shared values.
+    pair = (id(value), id(tp))
+    if pair in active:
+        return False
+    active.add(pair)
+    try:
+        if isinstance(tp, typing.TypeAliasType):
+            return _matches(value, tp.__value__, bindings, active)
+        origin = typing.get_origin(tp)
+        args = typing.get_args(tp)
+        if isinstance(origin, typing.TypeAliasType):
+            parameters = origin.__type_params__
+            if len(parameters) != len(args):
+                raise TypeError(f\"as! requires all alias arguments for {origin}\")
+            substitutions = dict(bindings)
+            substitutions.update(zip(parameters, args))
+            return _matches(value, origin.__value__, substitutions, active)
+        if origin is typing.Annotated:
+            return _matches(value, args[0], bindings, active)
+        if origin is typing.Literal:
+            return any(type(value) is type(arg) and value == arg for arg in args)
+        if origin is typing.Union or origin is types.UnionType:
+            return any(_matches(value, arg, bindings, active) for arg in args)
+        if origin in (list, set, frozenset, abc.Sequence, abc.Collection, abc.Set):
+            if not isinstance(value, origin):
+                return False
+            return not args or all(_matches(item, args[0], bindings, active) for item in value)
+        if origin in (dict, abc.Mapping, abc.MutableMapping):
+            if not isinstance(value, origin):
+                return False
+            return not args or all(
+                _matches(k, args[0], bindings, active) and _matches(v, args[1], bindings, active)
+                for k, v in value.items()
+            )
+        if origin is tuple:
+            if not isinstance(value, tuple):
+                return False
+            if not args:
+                return True
+            if len(args) == 2 and args[1] is Ellipsis:
+                return all(_matches(item, args[0], bindings, active) for item in value)
+            return len(args) == len(value) and all(
+                _matches(item, arg, bindings, active) for item, arg in zip(value, args)
+            )
+        if origin is not None:
+            raise TypeError(f\"as! cannot check parameterised target {tp}\")
         if tp is None or tp is type(None):
             return value is None
-        # Typhon widens int -> float (and bool -> int), so mirror that for a
-        # numeric-target cast; otherwise a JSON int cast `as! float` would
-        # spuriously fail.
         if tp is float:
             return isinstance(value, (int, float)) and not isinstance(value, complex)
         if tp is complex:
             return isinstance(value, (int, float, complex))
-        # `newtype Foo = int` lowers to `typing.NewType`, which is a callable,
-        # not a type — `isinstance(tp, type)` is False, so this fell straight
-        # through to `return True` and the cast was completely unchecked on
-        # the compiled path while the VM rejected it. Unwrap to the base type
-        # and check that.
         supertype = getattr(tp, \"__supertype__\", None)
         if supertype is not None:
-            return _matches(value, supertype)
-        # An `interface` lowers to a `Protocol` subclass, and `isinstance`
-        # against a Protocol that is not `@runtime_checkable` *raises*
-        # TypeError — so `EXPR as! SomeInterface` could never succeed, it only
-        # ever blew up inside the guard. Check structurally instead, which is
-        # what an interface means anyway: does the value carry the members?
+            return _matches(value, supertype, bindings, active)
         protocol_attrs = getattr(tp, \"__protocol_attrs__\", None)
         if protocol_attrs is not None:
             return all(hasattr(value, attr) for attr in protocol_attrs)
         if isinstance(tp, type):
             return isinstance(value, tp)
-        # An unrecognised descriptor (e.g. a TypeVar) — be permissive so the
-        # cast only ever rejects shapes it can actually prove wrong.
-        return True
-    args = typing.get_args(tp)
-    if origin is typing.Union or origin is types.UnionType:
-        return any(_matches(value, arg) for arg in args)
-    if origin in (list, set, frozenset):
-        if not isinstance(value, origin):
-            return False
-        return not args or all(_matches(item, args[0]) for item in value)
-    if origin is dict:
-        if not isinstance(value, dict):
-            return False
-        if len(args) != 2:
-            return True
-        key_t, val_t = args
-        return all(
-            _matches(k, key_t) and _matches(v, val_t) for k, v in value.items()
-        )
-    if origin is tuple:
-        if not isinstance(value, tuple):
-            return False
-        # `tuple[X, ...]` — homogeneous, any length.
-        if len(args) == 2 and args[1] is Ellipsis:
-            return all(_matches(item, args[0]) for item in value)
-        if len(args) != len(value):
-            return False
-        return all(_matches(item, arg) for item, arg in zip(value, args))
-    # Other parameterised origins (collections.abc.*, etc.) — check the
-    # erased origin only; element types are beyond what we model here.
-    if isinstance(origin, type):
-        return isinstance(value, origin)
-    return True
-
-
-def _format_type(tp: Any) -> str:
-    try:
-        return str(tp)
-    except Exception:  # pragma: no cover - defensive
-        return repr(tp)
+        raise TypeError(f\"as! cannot check target descriptor {tp}\")
+    finally:
+        active.discard(pair)
 ";
 
 /// Generated `typhon_runtime/traceback.py` — rewrites an uncaught
@@ -5279,6 +5417,63 @@ def fib(n: int) -> int:
         );
     }
 
+    /// W3-04: `-O` held a plain `@pure` only to "nothing provably impure",
+    /// so `@pure def window(n) -> list[int]` was cached and a caller's
+    /// `append` leaked into the next call. It now needs the cache-safety
+    /// proof; a cache-safe function gets a bounded, typed `lru_cache`.
+    #[test]
+    fn optimise_holds_plain_pure_to_the_cache_safety_proof() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = "\
+@pure
+def window(n: int) -> list[int]:
+    return list(range(n))
+
+@pure
+def add(a: int, b: int) -> int:
+    return a + b
+
+@pure
+def depth(n: int) -> int:
+    return 0 if n == 0 else depth(n - 1) + 1
+";
+        let (_, out_dir) = scaffold(tmp.path(), src);
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+            check: false,
+            no_sync: true,
+            with_ty: false,
+            optimise: true,
+            source_label: None,
+        })
+        .unwrap();
+        let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
+        let decorated = |name: &str| {
+            let at = py.find(&format!("def {name}(")).unwrap();
+            py[..at].trim_end().ends_with(')')
+                && py[..at]
+                    .trim_end()
+                    .rsplit('\n')
+                    .next()
+                    .unwrap()
+                    .starts_with('@')
+        };
+        assert!(
+            !decorated("window"),
+            "a mutable result must not be cached:\n{py}"
+        );
+        assert!(
+            !decorated("depth"),
+            "recursion must not be cached silently:\n{py}"
+        );
+        assert!(
+            py.contains("@functools.lru_cache(maxsize=1024, typed=True)\ndef add("),
+            "a cache-safe @pure gets a bounded typed cache under -O:\n{py}"
+        );
+    }
+
     #[test]
     fn build_interface_conformance_error_on_missing_member() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5974,13 +6169,113 @@ let pet: Animal = Dog(name=\"Rex\")
             source_label: None,
         })
         .expect_err("an escaping output directory must fail the build");
+        let rendered = format!("{err:?}");
         assert!(
-            format!("{err:?}").contains("outside the project root"),
+            err.to_string().contains("outside the project root")
+                || (rendered.contains("outside") && rendered.contains("project root")),
             "error should explain the escape; got {err:?}"
         );
         assert!(
             !outside.path().join("main.py").exists(),
             "nothing may be written outside the project"
+        );
+        assert!(
+            !tmp.path().join("pyproject.toml").exists(),
+            "an escaping output directory must fail before writing pyproject.toml"
+        );
+    }
+
+    #[test]
+    fn build_from_subdirectory_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        scaffold(tmp.path(), "let x: int = 1\n");
+        let src_sub = tmp.path().join("src");
+        run(BuildArgs {
+            path: src_sub,
+            out: None,
+            no_format: true,
+            check: false,
+            no_sync: true,
+            with_ty: false,
+            optimise: false,
+            source_label: None,
+        })
+        .expect("building from a subdirectory must succeed and confine to config_dir");
+        assert!(
+            tmp.path().join("build/main.py").exists(),
+            "emitted output must land in project's build directory"
+        );
+    }
+
+    #[test]
+    fn build_from_nested_subdirectory_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        scaffold(tmp.path(), "let x: int = 1\n");
+        let nested = tmp.path().join("src").join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("sub.ty"), "let y: int = 2\n").unwrap();
+        run(BuildArgs {
+            path: nested,
+            out: None,
+            no_format: true,
+            check: false,
+            no_sync: true,
+            with_ty: false,
+            optimise: false,
+            source_label: None,
+        })
+        .expect("building from a deeply nested subdirectory must succeed");
+        assert!(
+            tmp.path().join("build/main.py").exists(),
+            "emitted output must land in project's build directory"
+        );
+        assert!(
+            tmp.path().join("build/nested/sub.py").exists(),
+            "nested source file must be emitted under build/nested/sub.py"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_refuses_escaping_out_config_without_writing_anything() {
+        let outside = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(proj.join("src")).unwrap();
+        std::fs::write(
+            proj.join("typhon.toml"),
+            "[project]\nname = \"esc\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+             [python]\ntarget = \"3.13\"\n[emit]\nformat = false\n[strictness]\n[env]\n",
+        )
+        .unwrap();
+        std::fs::write(proj.join("src/main.ty"), "let x: int = 1\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), proj.join("build")).unwrap();
+
+        let err = run(BuildArgs {
+            path: proj.clone(),
+            out: None,
+            no_format: true,
+            check: false,
+            no_sync: true,
+            with_ty: false,
+            optimise: false,
+            source_label: None,
+        })
+        .expect_err("escaping out symlink must fail confinement");
+
+        let rendered = format!("{err:?}");
+        assert!(
+            err.to_string().contains("outside the project root")
+                || (rendered.contains("outside") && rendered.contains("project root")),
+            "error must mention outside the project root; got: {rendered}"
+        );
+        assert!(
+            !proj.join("pyproject.toml").exists(),
+            "must not write pyproject.toml when out directory escapes"
+        );
+        assert!(
+            !outside.path().join("main.py").exists(),
+            "must not write into escaping out directory"
         );
     }
 
@@ -6071,90 +6366,6 @@ let pet: Animal = Dog(name=\"Rex\")
     }
 
     // ── Pure helpers ───────────────────────────────────────────────────────
-
-    #[test]
-    fn secret_suffix_matches_credential_names() {
-        assert_eq!(secret_suffix("API_KEY"), Some("API_KEY"));
-        assert_eq!(secret_suffix("MyToken"), Some("TOKEN"));
-        assert_eq!(secret_suffix("myTokenValue"), Some("TOKEN"));
-        assert_eq!(secret_suffix("DB_PASSWORD"), Some("DB_PASSWORD"));
-        assert_eq!(secret_suffix("client_secret"), Some("CLIENT_SECRET"));
-        assert_eq!(secret_suffix("PWD"), Some("PWD"));
-        assert_eq!(secret_suffix("API_KEY_FOO"), Some("API_KEY"));
-        assert_eq!(secret_suffix("FOO_API_KEY_BAR"), Some("API_KEY"));
-        assert_eq!(secret_suffix("KEY_APIKEY"), Some("APIKEY"));
-        assert_eq!(secret_suffix("APIKEY"), Some("APIKEY"));
-        assert_eq!(secret_suffix("APITOKEN"), Some("APITOKEN"));
-        assert_eq!(secret_suffix("APISECRET"), Some("APISECRET"));
-        assert_eq!(secret_suffix("API_TOKEN"), Some("API_TOKEN"));
-        assert_eq!(secret_suffix("TOKEN123"), Some("TOKEN"));
-        assert_eq!(secret_suffix("123TOKEN"), Some("TOKEN"));
-        assert_eq!(secret_suffix("my123TOKEN"), Some("TOKEN"));
-        assert_eq!(secret_suffix("TOKENString"), Some("TOKEN"));
-        assert_eq!(secret_suffix("dbPASSWORDString"), Some("DBPASSWORD"));
-        // `PRIVKEY` is reported as itself, not as the bare `KEY` it contains.
-        assert_eq!(secret_suffix("PRIVKEY"), Some("PRIVKEY"));
-        assert_eq!(secret_suffix("SSH_PRIVKEY"), Some("PRIVKEY"));
-        assert_eq!(secret_suffix("PRIVKEY_PEM"), Some("PRIVKEY"));
-
-        // New high-risk keywords consolidated from the Sentinel PR batch.
-        assert_eq!(secret_suffix("DATABASE_DSN"), Some("DSN"));
-        assert_eq!(secret_suffix("SESSION_COOKIE"), Some("COOKIE"));
-        assert_eq!(secret_suffix("SLACK_WEBHOOK_URL"), Some("WEBHOOK"));
-        assert_eq!(secret_suffix("AUTHORIZATION_BEARER"), Some("AUTHORIZATION"));
-        assert_eq!(secret_suffix("MY_CREDENTIALS"), Some("CREDENTIALS"));
-        assert_eq!(secret_suffix("AWS_CREDENTIAL"), Some("CREDENTIAL"));
-        assert_eq!(secret_suffix("SIGNING_CERT"), Some("SIGNING"));
-        assert_eq!(
-            secret_suffix("PERSONAL_ACCESS_TOKEN"),
-            Some("PERSONAL_ACCESS_TOKEN")
-        );
-        assert_eq!(
-            secret_suffix("PERSONALACCESSTOKEN"),
-            Some("PERSONALACCESSTOKEN")
-        );
-        assert_eq!(secret_suffix("OAUTH_TOKEN"), Some("OAUTH_TOKEN"));
-        assert_eq!(secret_suffix("OAUTHTOKEN"), Some("OAUTHTOKEN"));
-        assert_eq!(secret_suffix("GITHUB_TOKEN"), Some("GITHUB_TOKEN"));
-        assert_eq!(secret_suffix("GITHUBTOKEN"), Some("GITHUBTOKEN"));
-        assert_eq!(secret_suffix("GH_TOKEN"), Some("GH_TOKEN"));
-        assert_eq!(secret_suffix("GHTOKEN"), Some("GHTOKEN"));
-        assert_eq!(secret_suffix("ACCESS_TOKEN"), Some("ACCESS_TOKEN"));
-        assert_eq!(secret_suffix("AUTH_TOKEN"), Some("AUTH_TOKEN"));
-        assert_eq!(secret_suffix("BEARER_TOKEN"), Some("BEARER_TOKEN"));
-        assert_eq!(secret_suffix("CSRF_TOKEN"), Some("CSRF_TOKEN"));
-        assert_eq!(secret_suffix("JWT_TOKEN"), Some("JWT_TOKEN"));
-        assert_eq!(secret_suffix("PRIVATE_KEY"), Some("PRIVATE_KEY"));
-        assert_eq!(secret_suffix("PUBLIC_KEY"), Some("PUBLIC_KEY"));
-        assert_eq!(secret_suffix("APPSECRET"), Some("APPSECRET"));
-        assert_eq!(secret_suffix("ACCESSTOKEN"), Some("ACCESSTOKEN"));
-        assert_eq!(secret_suffix("SECRETKEY"), Some("SECRETKEY"));
-        assert_eq!(secret_suffix("SSH_KEY"), Some("SSH_KEY"));
-        assert_eq!(secret_suffix("JWTSECRET"), Some("JWTSECRET"));
-        assert_eq!(secret_suffix("AUTHTOKEN"), Some("AUTHTOKEN"));
-        assert_eq!(secret_suffix("APP_KEY"), Some("APP_KEY"));
-        assert_eq!(secret_suffix("APPKEY"), Some("APPKEY"));
-        assert_eq!(secret_suffix("DBPASSWORD"), Some("DBPASSWORD"));
-        assert_eq!(secret_suffix("DBSECRET"), Some("DBSECRET"));
-        assert_eq!(secret_suffix("DBPASS"), Some("DBPASS"));
-        assert_eq!(secret_suffix("DBPWD"), Some("DBPWD"));
-        assert_eq!(secret_suffix("DB_PASS"), Some("DB_PASS"));
-        // Regression: with an underscore, `PWD` is a validly-bounded match
-        // inside `DB_PWD` too, so `DB_PWD` must precede the bare `PWD` or
-        // the loop reports the less-specific suffix first (P2 review catch
-        // on the PR that introduced this table entry).
-        assert_eq!(secret_suffix("DB_PWD"), Some("DB_PWD"));
-        assert_eq!(secret_suffix("JWTTOKEN"), Some("JWTTOKEN"));
-    }
-
-    #[test]
-    fn secret_suffix_ignores_unrelated_names() {
-        assert_eq!(secret_suffix("PORT"), None);
-        assert_eq!(secret_suffix("MAX_RETRIES"), None);
-        assert_eq!(secret_suffix("USER"), None);
-        assert_eq!(secret_suffix("MONKEY"), None);
-        assert_eq!(secret_suffix("PASSPORT"), None);
-    }
 
     #[test]
     fn scan_relative_py_imports_picks_up_sibling_imports() {

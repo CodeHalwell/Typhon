@@ -180,8 +180,10 @@ pub enum TycError {
     /// (`List`, `Dict`, `Tuple`, `Set`, `FrozenSet`, `Type`) — Typhon prefers
     /// the built-in lowercase forms (PEP 585) for consistency with the rest
     /// of the language.
+    /// Always reported as a warning: `typing.List` still works at runtime.
     #[error("`from typing import {name}` is deprecated in Typhon")]
     #[diagnostic(
+        severity(Warning),
         code(tyc::typing_alias_deprecated),
         url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/typing_alias_deprecated.md"),
         help("Use the built-in lowercase `{lower}` instead — `{lower}[T]` works directly without importing anything.")
@@ -367,7 +369,7 @@ pub enum TycError {
     #[diagnostic(
         code(tyc::operator_type_mismatch),
         url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/operator_type_mismatch.md"),
-        help("convert one operand so the types match (e.g. `str(n)` / `int(s)`)")
+        help("use operands supported by this operator; for class ordering, define the comparison methods or enable dataclass order=True")
     )]
     OperatorTypeMismatch {
         op: String,
@@ -420,16 +422,13 @@ pub enum TycError {
         note: String,
     },
 
-    /// The error type propagated by `?` from a callee does not match the
-    /// caller's `Result[T, E]` declaration. Distinct from the generic
-    /// `tyc::type_mismatch` so users see immediately that the failure is
-    /// at a `?`-propagation boundary and can act accordingly (convert at
-    /// the boundary, or change one of the function signatures).
-    #[error("`?` propagates `Err[{actual_err}]` into `Result[_, {expected_err}]`")]
+    /// A returned or propagated Err value does not match the enclosing
+    /// Result error type. This covers plain returns and `?` boundaries.
+    #[error("`Err[{actual_err}]` does not match declared `Result[_, {expected_err}]`")]
     #[diagnostic(
         code(tyc::result_error_mismatch),
         url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/result_error_mismatch.md"),
-        help("the `?` operator forwards the callee's `Err` value as-is; convert it with a `match` or change one signature so the error types match")
+        help("return or propagate an `Err` with the declared error type; convert the value with a `match` or change the result signature")
     )]
     ResultErrorMismatch {
         expected_err: String,
@@ -606,19 +605,46 @@ pub enum TycError {
         span: SourceSpan,
     },
 
-    /// A `match` on a sealed union does not cover all variants and has no wildcard arm.
-    #[error("non-exhaustive `match` on sealed union `{union_name}`: missing variant(s) {missing}")]
+    /// A `match` on a closed subject — a sealed union, an enum, `Result`,
+    /// `T?`, `bool` or a literal union — does not cover every value and has
+    /// no wildcard arm. `subject` is already phrased ("sealed union
+    /// `Shape`", "enum `Color`", "`bool`"): only a real sealed union is
+    /// called one.
+    #[error("non-exhaustive `match` on {subject}: missing {noun} {missing}")]
     #[diagnostic(
         code(tyc::non_exhaustive_match),
-        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/non_exhaustive_match.md"),
-        help("add a `case <Variant>():` arm for each missing variant, or add a `case _:` wildcard arm")
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/non_exhaustive_match.md")
     )]
     NonExhaustiveMatch {
-        union_name: String,
+        subject: String,
+        noun: &'static str,
         missing: String,
+        #[help]
+        help: String,
         #[source_code]
         src: NamedSource<String>,
         #[label("match is not exhaustive")]
+        span: SourceSpan,
+    },
+
+    /// A `type` alias used where Python needs a class: a `match` class
+    /// pattern (`case Poly():`) or `isinstance`'s second argument. A PEP 695
+    /// alias is a `TypeAliasType`, so both raise `TypeError` at runtime.
+    #[error("`{alias}` is a type alias, not a class: {form} raises `TypeError` at runtime")]
+    #[diagnostic(
+        code(tyc::alias_not_a_class),
+        url(
+            "https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/alias_not_a_class.md"
+        ),
+        help("{fix}")
+    )]
+    AliasNotAClass {
+        alias: String,
+        form: String,
+        fix: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("a type alias, not a class")]
         span: SourceSpan,
     },
 
@@ -631,6 +657,24 @@ pub enum TycError {
     )]
     Comptime { name: String, message: String },
 
+    /// [`TycError::Comptime`] anchored at the binding whose initialiser
+    /// failed (or, for a missing initialiser, the binding itself).
+    #[error("comptime evaluation failed for '{name}': {message}")]
+    #[diagnostic(
+        code(tyc::comptime),
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/comptime.md"),
+        help("comptime expressions support: int/float/str/bool literals, list/tuple/dict literals, arithmetic, comparisons, boolean ops (and/or/not), ternaries (`x if c else y`), env(\"NAME\"[, \"default\"]), int()/str()/float()/len(), pure str methods (upper, lower, strip, lstrip, rstrip, replace, startswith, endswith, split), and calls to user-defined `comptime def` functions")
+    )]
+    ComptimeAt {
+        name: String,
+        message: String,
+        label: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("{label}")]
+        span: SourceSpan,
+    },
+
     /// Generic error with a human-readable message (used during early phases).
     #[error("{message}")]
     #[diagnostic(
@@ -638,6 +682,24 @@ pub enum TycError {
         url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/generic.md")
     )]
     Generic { message: String },
+
+    /// [`TycError::Generic`] at a source location (same code). Used where a
+    /// check has no dedicated diagnostic but does know where the problem is
+    /// — an item assignment into an immutable container — so the report is
+    /// not filed under "(no location)".
+    #[error("{message}")]
+    #[diagnostic(
+        code(tyc::generic),
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/generic.md")
+    )]
+    GenericAt {
+        message: String,
+        label: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("{label}")]
+        span: SourceSpan,
+    },
 
     /// The `?` error-propagation operator was used in a position where
     /// it cannot lower correctly. Two common reasons: (a) the enclosing
@@ -688,7 +750,7 @@ pub enum TycError {
     #[diagnostic(
         code(tyc::lazy_usage),
         url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/lazy_usage.md"),
-        help("`lazy` supports `lazy import name = module` and `lazy val NAME: T = expr` only")
+        help("`lazy` supports `lazy import name = module` and `lazy let NAME: T = expr` only")
     )]
     LazyUsage {
         message: String,
@@ -754,12 +816,15 @@ pub enum TycError {
     )]
     #[diagnostic(
         code(tyc::unsafe_value_leak),
-        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/unsafe_value_leak.md"),
-        help("re-assert the type before returning, e.g. `let typed: {return_ty} = {name}` outside the unsafe block, or annotate the assignment inside `unsafe:` with `let {name}: {return_ty} = …` so the compiler can verify the cross")
+        url(
+            "https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/unsafe_value_leak.md"
+        )
     )]
     UnsafeValueLeak {
         name: String,
         return_ty: String,
+        #[help]
+        help: String,
         #[source_code]
         src: NamedSource<String>,
         #[label("unsafe value crosses into safe-typed return")]
@@ -1248,8 +1313,11 @@ pub enum TycError {
     /// listed in `typhon.toml`'s dependencies. The build would later
     /// fail at import time with `ModuleNotFoundError`; surface the
     /// typo / missing dep at check time instead. FINDINGS #79.
+    /// Always reported as a warning: the module may still be installed in
+    /// the environment the program runs in.
     #[error("module `{module}` is not in the stdlib, the project, or `typhon.toml` dependencies")]
     #[diagnostic(
+        severity(Warning),
         code(tyc::unknown_module),
         url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/unknown_module.md"),
         help("Either fix the import name, add `{module}` to the `[dependencies]` table in `typhon.toml` (then run `tyc sync`), or create a sibling `.ty` file with the right name.")
@@ -1736,10 +1804,11 @@ pub enum TycError {
         span: SourceSpan,
     },
 
-    /// A `comptime let` binding whose name matches a secret-suffix heuristic
-    /// (`*KEY`, `*TOKEN`, `*PASSWORD`, `*SECRET`, `*PASS`, `*PWD`) inlines its
-    /// env value at build time, so the emitted Python contains the raw secret
-    /// as a string literal. Read the env var at runtime instead.
+    /// A `comptime let` binding whose name matches the shared secret-keyword
+    /// table (`tyc_analyse::SECRET_NAME_KEYWORDS`, longest-first with word
+    /// boundaries) inlines its env value at build time, so the emitted
+    /// Python contains the raw secret as a string literal. Read the env var
+    /// at runtime instead.
     #[error("comptime binding `{name}` inlines a secret-shaped value at build time")]
     #[diagnostic(
         severity(Warning),
@@ -1749,11 +1818,11 @@ pub enum TycError {
     )]
     ContainsSecretLiteral { name: String, env_key: String },
 
-    /// A plain `let` / module-level binding whose name matches the
-    /// secret-suffix heuristic (`*KEY`, `*TOKEN`, `*PASSWORD`, `*SECRET`,
-    /// `*PWD`, `*API_KEY`) is initialised from a raw string literal
-    /// instead of an environment lookup. Committing such a literal hard-
-    /// codes a credential into the source tree.
+    /// A plain `let` / module-level binding whose name matches the shared
+    /// secret-keyword table (`tyc_analyse::SECRET_NAME_KEYWORDS`,
+    /// longest-first with word boundaries) is initialised from a raw string
+    /// literal instead of an environment lookup. Committing such a literal
+    /// hard-codes a credential into the source tree.
     #[error("binding `{name}` looks like a credential but is initialised from a string literal")]
     #[diagnostic(
         severity(Warning),
@@ -1999,6 +2068,54 @@ pub enum TycError {
         #[label("not allowed inside an `except*` handler")]
         span: SourceSpan,
     },
+
+    /// An `impl` method that is merged into its class body reads, in a
+    /// decorator or a parameter default, a name bound only after the class.
+    /// Those expressions run when the `class` statement runs, before the
+    /// name exists, so importing the module raises `NameError` on both
+    /// execution surfaces. Methods that can be attached at their `impl`
+    /// block instead are moved there (W7-06); this reports the rest — a
+    /// special method, a private-name method, a `@property` /
+    /// `@classmethod` / `@cached_property` / `@abstractmethod`, a method a
+    /// base may define, or a class subclassed before the block.
+    #[error(
+        "`{name}` is not bound yet when class `{class}` is created, but `{method}` reads it there"
+    )]
+    #[diagnostic(
+        severity(Error),
+        code(tyc::impl_forward_reference),
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/impl_forward_reference.md")
+    )]
+    ImplForwardReference {
+        name: String,
+        class: String,
+        method: String,
+        #[help]
+        help: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("read when `class {class}` runs — raises `NameError` on import")]
+        span: SourceSpan,
+    },
+
+    /// `go f(…)` where `f(…)` is not a coroutine: `go` schedules an
+    /// awaitable as a task, and a plain value makes `create_task` raise
+    /// `TypeError`. Same code as any other type mismatch (W2-11), worded for
+    /// the `go` form.
+    #[error("`go` needs a coroutine, but `{call}` returns `{actual}`")]
+    #[diagnostic(
+        code(tyc::type_mismatch),
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/type_mismatch.md"),
+        help("make the callee `async def` (then `go` runs it as a task), or call it directly without `go`")
+    )]
+    GoNeedsCoroutine {
+        call: String,
+        actual: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("not a coroutine")]
+        span: SourceSpan,
+    },
 }
 
 impl TycError {
@@ -2034,6 +2151,7 @@ impl TycError {
             | Self::FieldDefaultOrdering { src, span, .. }
             | Self::MissingAwait { src, span, .. }
             | Self::NonExhaustiveMatch { src, span, .. }
+            | Self::AliasNotAClass { src, span, .. }
             | Self::InvalidQuestionOp { src, span, .. }
             | Self::UnusedImport { src, span, .. }
             | Self::LazyUsage { src, span, .. }
@@ -2084,6 +2202,7 @@ impl TycError {
             | Self::OrphanPyImport { src, span, .. }
             | Self::PythonSemanticDrift { src, span, .. }
             | Self::SecretLiteralInline { src, span, .. }
+            | Self::ComptimeAt { src, span, .. }
             | Self::EmptyCollectionNoAnnotation { src, span, .. }
             | Self::TypingAliasInAnnotation { src, span, .. }
             | Self::MutableDefaultParam { src, span, .. }
@@ -2093,12 +2212,61 @@ impl TycError {
             | Self::FrozenInheritanceConflict { src, span, .. }
             | Self::RaiseNonException { src, span, .. }
             | Self::NotAContextManager { src, span, .. }
-            | Self::ReturnInExceptStar { src, span, .. } => {
+            | Self::ReturnInExceptStar { src, span, .. }
+            | Self::ImplForwardReference { src, span, .. }
+            | Self::GoNeedsCoroutine { src, span, .. }
+            | Self::GenericAt { src, span, .. } => {
                 let _ = span;
                 Some(src.inner().as_str())
             }
             #[allow(unreachable_patterns)]
             _ => None,
+        }
+    }
+
+    /// The source text and *every* labelled span of this diagnostic, the
+    /// primary span first. A rewrite of the source (`remap_lines`) must move
+    /// each label, not only the primary one: a secondary label left at its
+    /// expanded-text offset points past the end of the original file, and
+    /// miette then refuses to render the snippet at all ("Failed to read
+    /// contents for label `first declared here` … OutOfBounds").
+    pub fn source_and_spans_mut(
+        &mut self,
+    ) -> Option<(&mut NamedSource<String>, Vec<&mut SourceSpan>)> {
+        match self {
+            Self::NoBlockShadow {
+                src,
+                span,
+                decl_span,
+                ..
+            }
+            | Self::TypeReassignMismatch {
+                src,
+                span,
+                decl_span,
+                ..
+            }
+            | Self::UseOfUninitialised {
+                src,
+                span,
+                decl_span,
+                ..
+            } => Some((src, vec![span, decl_span])),
+            Self::ImmutableAssign {
+                src,
+                declaration,
+                assignment,
+                ..
+            } => Some((src, vec![assignment, declaration])),
+            Self::PatternShadowsOuter {
+                src,
+                declaration,
+                capture,
+                ..
+            } => Some((src, vec![capture, declaration])),
+            other => other
+                .source_and_span_mut()
+                .map(|(src, span)| (src, vec![span])),
         }
     }
 
@@ -2130,6 +2298,7 @@ impl TycError {
             | Self::FieldDefaultOrdering { src, span, .. }
             | Self::MissingAwait { src, span, .. }
             | Self::NonExhaustiveMatch { src, span, .. }
+            | Self::AliasNotAClass { src, span, .. }
             | Self::InvalidQuestionOp { src, span, .. }
             | Self::UnusedImport { src, span, .. }
             | Self::LazyUsage { src, span, .. }
@@ -2180,6 +2349,7 @@ impl TycError {
             | Self::OrphanPyImport { src, span, .. }
             | Self::PythonSemanticDrift { src, span, .. }
             | Self::SecretLiteralInline { src, span, .. }
+            | Self::ComptimeAt { src, span, .. }
             | Self::EmptyCollectionNoAnnotation { src, span, .. }
             | Self::TypingAliasInAnnotation { src, span, .. }
             | Self::MutableDefaultParam { src, span, .. }
@@ -2189,7 +2359,10 @@ impl TycError {
             | Self::FrozenInheritanceConflict { src, span, .. }
             | Self::RaiseNonException { src, span, .. }
             | Self::NotAContextManager { src, span, .. }
-            | Self::ReturnInExceptStar { src, span, .. } => Some((src, span)),
+            | Self::ReturnInExceptStar { src, span, .. }
+            | Self::ImplForwardReference { src, span, .. }
+            | Self::GoNeedsCoroutine { src, span, .. }
+            | Self::GenericAt { src, span, .. } => Some((src, span)),
             #[allow(unreachable_patterns)]
             _ => None,
         }
@@ -2504,6 +2677,49 @@ impl TycError {
         }
     }
 
+    /// The rendered `help:` text, for callers (and tests) that do not depend
+    /// on miette themselves.
+    pub fn help_text(&self) -> Option<String> {
+        Diagnostic::help(self).map(|h| h.to_string())
+    }
+
+    /// Re-word a [`TycError::NullableUse`] whose value the function already
+    /// checks for `None` (`guard` is that check's line, as written) in a
+    /// way the checker could not carry to this use. "Add a guard" is wrong
+    /// advice when the guard is three lines up (review 2026-10-03 §4.2,
+    /// W1-03); say why the narrowing may have been lost and how to keep it.
+    /// Any other diagnostic is returned unchanged.
+    #[must_use]
+    pub fn with_existing_guard(mut self, name: &str, guard: &str) -> Self {
+        if let Self::NullableUse { advice, .. } = &mut self {
+            let guard = guard.trim();
+            *advice = match name.rsplit_once('.') {
+                // A field path: the usual cause is a call or assignment in
+                // between that may rebind the field (or another alias of
+                // the object). A local copy cannot be rebound behind the
+                // checker's back.
+                Some((_, field)) => format!(
+                    "`{name}` is already checked above (`{guard}`), but that narrowing does not \
+                     reach this use: a call, assignment, `await` or `yield` in between may have \
+                     changed the field, or the check is on another path. Copy it into a local \
+                     and guard that instead (`let {field} = {name}`, then `if {field} is not \
+                     None:` and use `{field}`), or repeat the check right before this use"
+                ),
+                // A local: it was reassigned in between, the check is on
+                // another path, or this use is in a closure that may run
+                // after a later reassignment.
+                None => format!(
+                    "`{name}` is already checked above (`{guard}`), but that narrowing does not \
+                     reach this use: `{name}` may be reassigned in between, the check may be on \
+                     another path, or this use is inside a closure that can run after a later \
+                     reassignment. Repeat the check right before this use, or bind the checked \
+                     value to a new `let` name and use that"
+                ),
+            };
+        }
+        self
+    }
+
     /// Construct a [`TycError::NullableUse`] diagnostic for a value whose
     /// type is exactly `None` — `None.attr`, `None[0]`, or the result of a
     /// `-> None` function used as a receiver or operand. Same code, since it
@@ -2703,8 +2919,77 @@ impl TycError {
         length: usize,
     ) -> Self {
         Self::NonExhaustiveMatch {
-            union_name: union_name.into(),
+            subject: format!("sealed union `{}`", union_name.into()),
+            noun: "variant(s)",
             missing: missing.into(),
+            help: "add a `case <Variant>():` arm for each missing variant, or add a `case _:` wildcard arm".into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// [`TycError::NonExhaustiveMatch`] over an `enum`: the missing values
+    /// are its members.
+    pub fn non_exhaustive_enum_match(
+        enum_name: impl Into<String>,
+        missing: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        let enum_name = enum_name.into();
+        Self::NonExhaustiveMatch {
+            help: format!(
+                "add a `case {enum_name}.<MEMBER>:` arm for each missing member, or add a `case _:` wildcard arm"
+            ),
+            subject: format!("enum `{enum_name}`"),
+            noun: "member(s)",
+            missing: missing.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// [`TycError::NonExhaustiveMatch`] over any other closed subject —
+    /// `Result[T, E]`, `T?`, `bool` or a literal union — named by its type
+    /// (`on \`bool\``), since it is not a sealed union.
+    pub fn non_exhaustive_closed_match(
+        subject_type: impl Into<String>,
+        missing: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        let missing = missing.into();
+        let example = missing.split(", ").next().unwrap_or("_").to_owned();
+        Self::NonExhaustiveMatch {
+            subject: format!("`{}`", subject_type.into()),
+            noun: "case(s)",
+            help: format!(
+                "add an arm for each missing case (e.g. `case {example}:`), or add a `case _:` wildcard arm"
+            ),
+            missing,
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::AliasNotAClass`] diagnostic.
+    pub fn alias_not_a_class(
+        alias: impl Into<String>,
+        form: impl Into<String>,
+        fix: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::AliasNotAClass {
+            alias: alias.into(),
+            form: form.into(),
+            fix: fix.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }
@@ -2715,6 +3000,26 @@ impl TycError {
         Self::Comptime {
             name: name.into(),
             message: message.into(),
+        }
+    }
+
+    /// Construct a [`TycError::ComptimeAt`] diagnostic anchored at
+    /// `offset..offset+length` of `source`, with `label` under the span.
+    pub fn comptime_at(
+        name: impl Into<String>,
+        message: impl Into<String>,
+        label: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::ComptimeAt {
+            name: name.into(),
+            message: message.into(),
+            label: label.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
         }
     }
 
@@ -2809,17 +3114,34 @@ impl TycError {
     }
 
     /// Construct a [`TycError::UnsafeValueLeak`] diagnostic. O14 / FINDINGS #107.
+    ///
+    /// `cast` is the checked cast to suggest (`data as! int`), or `None`
+    /// when the target has no runtime check `as!` could perform (a
+    /// `Callable`, a bare type parameter, …). An annotated re-bind outside
+    /// the block (`let typed: T = name`) is never suggested: it is itself a
+    /// concrete boundary and is reported the same way.
     pub fn unsafe_value_leak(
         name: impl Into<String>,
         return_ty: impl Into<String>,
+        cast: Option<String>,
         path: impl Into<String>,
         source: impl Into<String>,
         offset: usize,
         length: usize,
     ) -> Self {
+        let name = name.into();
+        let return_ty = return_ty.into();
+        let annotate = format!(
+            "annotate the binding inside `unsafe:` (`let {name}: {return_ty} = …`) so the compiler can verify the crossing"
+        );
+        let help = match cast {
+            Some(cast) => format!("check the type at the boundary with `{cast}`, or {annotate}"),
+            None => format!("{annotate}; `as!` cannot check `{return_ty}` at runtime"),
+        };
         Self::UnsafeValueLeak {
-            name: name.into(),
-            return_ty: return_ty.into(),
+            help,
+            name,
+            return_ty,
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }
@@ -3796,6 +4118,74 @@ impl TycError {
         }
     }
 
+    /// Construct a [`TycError::GenericAt`]: a free-form message at a
+    /// location, with `label` under the span.
+    pub fn generic_at(
+        message: impl Into<String>,
+        label: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::GenericAt {
+            message: message.into(),
+            label: label.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::GoNeedsCoroutine`]. `call` is the spawned
+    /// expression as written (`work(1)`), `actual` its type.
+    pub fn go_needs_coroutine(
+        call: impl Into<String>,
+        actual: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::GoNeedsCoroutine {
+            call: call.into(),
+            actual: actual.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::ImplForwardReference`] error. `why` says what
+    /// keeps `method` in the class body instead of at its `impl` block.
+    #[allow(clippy::too_many_arguments)]
+    pub fn impl_forward_reference(
+        name: impl Into<String>,
+        class: impl Into<String>,
+        method: impl Into<String>,
+        why: &str,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        let name = name.into();
+        let class = class.into();
+        let method = method.into();
+        let help = format!(
+            "`{method}` must stay in the body of `class {class}` ({why}), and a method's \
+             decorators and parameter defaults run when its class is created. Bind `{name}` \
+             above `class {class}`, or default the parameter to `None` and read `{name}` inside \
+             the method body"
+        );
+        Self::ImplForwardReference {
+            name,
+            class,
+            method,
+            help,
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
     /// Construct a [`TycError::IsLiteralComparison`] warning.
     pub fn is_literal_comparison(
         path: impl Into<String>,
@@ -3961,13 +4351,7 @@ impl Diagnostics {
                 .unwrap_or(original.len());
             original[start..end].trim_end_matches(['\n', '\r']).len()
         };
-        for err in self.errors.iter_mut().chain(self.warnings.iter_mut()) {
-            let Some((src, span)) = err.source_and_span_mut() else {
-                continue;
-            };
-            if src.inner().as_str() != expanded {
-                continue;
-            }
+        let remap = |span: &mut SourceSpan| {
             let offset = span.offset().min(expanded.len());
             let line = match expanded_starts.binary_search(&offset) {
                 Ok(l) => l,
@@ -3980,13 +4364,43 @@ impl Diagnostics {
                 .unwrap_or(line)
                 .min(original_starts.len().saturating_sub(1));
             let width = original_line_len(target);
+            // A rewritten line (`go f(x)` → `…spawn(f(x))`) shifts columns,
+            // so the carried column can land past the expression. When the
+            // spanned text appears on the original line, anchor to the
+            // occurrence nearest the carried column instead.
+            let snippet = expanded
+                .get(offset..(offset + span.len()).min(expanded.len()))
+                .filter(|t| !t.is_empty() && !t.contains('\n'));
+            let original_line = &original[original_starts[target]..original_starts[target] + width];
+            let found = snippet.and_then(|t| {
+                original_line
+                    .match_indices(t)
+                    .map(|(at, _)| at)
+                    .min_by_key(|at| at.abs_diff(col))
+            });
+            if let (Some(at), Some(t)) = (found, snippet) {
+                *span = SourceSpan::new(SourceOffset::from(original_starts[target] + at), t.len());
+                return;
+            }
             let new_col = col.min(width);
             let new_len = span.len().clamp(1, (width - new_col).max(1));
-            *src = NamedSource::new(original_name, original.to_owned());
             *span = SourceSpan::new(
                 SourceOffset::from(original_starts[target] + new_col),
                 new_len,
             );
+        };
+        for err in self.errors.iter_mut().chain(self.warnings.iter_mut()) {
+            let Some((src, spans)) = err.source_and_spans_mut() else {
+                continue;
+            };
+            if src.inner().as_str() != expanded {
+                continue;
+            }
+            *src = NamedSource::new(original_name, original.to_owned());
+            // Every label moves, not only the primary one.
+            for span in spans {
+                remap(span);
+            }
         }
     }
 
@@ -3996,7 +4410,7 @@ impl Diagnostics {
     /// `/tmp/tyc-script-…/src/main.ty` rather than their own file.
     pub fn rename_source(&mut self, name: &str) {
         for err in self.errors.iter_mut().chain(self.warnings.iter_mut()) {
-            let Some((src, _)) = err.source_and_span_mut() else {
+            let Some((src, _)) = err.source_and_spans_mut() else {
                 continue;
             };
             *src = NamedSource::new(name, src.inner().clone());
@@ -4492,9 +4906,24 @@ pub struct SanitisedDiagnostic {
     /// position in the first (real-source-aligned) block, so the
     /// rendered line number never exceeds the file's real line count.
     block_remap: Option<BlockRemap>,
+    /// The severity to render with, when the caller knows it better than
+    /// the variant's static one: a diagnostic pushed as a warning (a
+    /// strictness knob at `"warn"`, a mutation caught by its handler) is
+    /// still a variant whose derive says `Error`, and rendered with the
+    /// error marker under a "warnings" heading.
+    severity: Option<miette::Severity>,
 }
 
 impl SanitisedDiagnostic {
+    /// Render with `severity` instead of the variant's own. Renderers pass
+    /// the bucket the diagnostic was reported in (`Diagnostics::warnings()`
+    /// → `Severity::Warning`).
+    #[must_use]
+    pub fn with_severity(mut self, severity: miette::Severity) -> Self {
+        self.severity = Some(severity);
+        self
+    }
+
     /// Build a wrapper that masks synthetic preprocess output from the
     /// rendered source listing. When the inner diagnostic doesn't carry
     /// a `NamedSource` (e.g. `TycError::Io`) the wrapper is a no-op
@@ -4513,6 +4942,7 @@ impl SanitisedDiagnostic {
             inner,
             sanitised,
             block_remap,
+            severity: None,
         }
     }
 
@@ -4528,6 +4958,7 @@ impl SanitisedDiagnostic {
             inner,
             sanitised: Some(sanitised),
             block_remap,
+            severity: None,
         }
     }
 
@@ -4562,6 +4993,7 @@ impl SanitisedDiagnostic {
             inner,
             sanitised: Some(sanitised),
             block_remap,
+            severity: None,
         }
     }
 }
@@ -4943,7 +5375,8 @@ fn impl_header_name(raw: &str) -> Option<String> {
     let trimmed = raw.trim_start();
     let after = if let Some(s) = trimmed.strip_prefix("impl ") {
         s
-    } else if let Some(s) = trimmed.strip_prefix("impl[") {
+    } else {
+        let s = trimmed.strip_prefix("impl[")?;
         // Skip the `[T, …]` impl type-param list.
         let mut depth = 1i32;
         let mut end = None;
@@ -4961,8 +5394,6 @@ fn impl_header_name(raw: &str) -> Option<String> {
             }
         }
         s[end?..].trim_start()
-    } else {
-        return None;
     };
     let header = after.trim_end();
     let body = header.strip_suffix(':')?;
@@ -5164,7 +5595,7 @@ impl miette::Diagnostic for SanitisedDiagnostic {
         self.inner.code()
     }
     fn severity(&self) -> Option<miette::Severity> {
-        self.inner.severity()
+        self.severity.or_else(|| self.inner.severity())
     }
     fn help<'b>(&'b self) -> Option<Box<dyn std::fmt::Display + 'b>> {
         self.inner.help()
@@ -5278,6 +5709,14 @@ fn dedup_vec(v: &mut Vec<TycError>) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn w2_09_operator_help_covers_class_comparisons() {
+        let d = TycError::operator_type_mismatch("<", "Point", "Point", "<test>", "a < b", 0, 5);
+        let help = miette::Diagnostic::help(&d).unwrap().to_string();
+        assert!(!help.contains("str(n)"), "{help}");
+        assert!(help.contains("operator"), "{help}");
+    }
     #[test]
     fn remap_lines_moves_a_diagnostic_onto_the_original_line() {
         // The expanded buffer has two synthesised lines (a temp binding and
@@ -5315,6 +5754,41 @@ mod tests {
             .map(|(s, sp)| (s.clone(), *sp))
             .unwrap();
         assert_eq!(wspan.offset(), 4);
+    }
+
+    #[test]
+    fn remap_lines_moves_secondary_labels_too() {
+        // A `let m` re-declared after a `?` expansion: the "first declared
+        // here" label used to keep its expanded-text offset, which lies past
+        // the end of the shorter original file.
+        let original = "def f() -> int:\n    let m: int = g()?\n    if m:\n        let m: int = 3\n    return m\n";
+        let expanded = "def f() -> int:\n    __q = g()\n    if isinstance(__q, Err):\n        return __q\n    m: int = __q.value\n    if m:\n        m: int = 3\n    return m\n";
+        let line_map = vec![0, 1, 1, 1, 1, 2, 3, 4];
+        let decl = expanded.find("m: int = __q").unwrap();
+        let redecl = expanded.find("m: int = 3").unwrap();
+        let mut diags = super::Diagnostics::new();
+        diags.push_error(super::TycError::no_block_shadow(
+            "m", "f.ty", expanded, decl, 1, redecl, 1,
+        ));
+        diags.push_error(super::TycError::immutable_assign(
+            "m", "f.ty", expanded, decl, 1, redecl, 1,
+        ));
+        diags.remap_lines(expanded, &line_map, "f.ty", original);
+        let first = original.find("m: int = g").unwrap();
+        let second = original.find("m: int = 3").unwrap();
+        let line_of = |o: usize| original[..o].matches('\n').count();
+        for err in diags.errors() {
+            let mut err = err.clone();
+            let (src, spans) = err.source_and_spans_mut().unwrap();
+            assert_eq!(src.inner().as_str(), original);
+            let mut offsets: Vec<usize> = spans.iter().map(|s| s.offset()).collect();
+            offsets.sort_unstable();
+            assert!(offsets.iter().all(|o| *o < original.len()), "{offsets:?}");
+            assert_eq!(
+                offsets.iter().map(|o| line_of(*o)).collect::<Vec<_>>(),
+                vec![line_of(first), line_of(second)],
+            );
+        }
     }
 
     use super::*;
@@ -5774,8 +6248,60 @@ mod tests {
         let e = TycError::non_exhaustive_match("Shape", "Circle", "a.ty", "match s:", 0, 7);
         assert!(matches!(e, TycError::NonExhaustiveMatch { .. }));
         let msg = e.to_string();
-        assert!(msg.contains("Shape"));
+        assert!(msg.contains("sealed union `Shape`"), "{msg}");
         assert!(msg.contains("Circle"));
+    }
+
+    #[test]
+    fn warning_only_codes_render_as_warnings() {
+        use miette::{Diagnostic, Severity};
+        let src = "import flask\nfrom typing import List\n";
+        let m = TycError::unknown_module("flask", "a.ty", src, 7, 5);
+        let t = TycError::typing_alias_deprecated("List", "list", "a.ty", src, 32, 4);
+        assert_eq!(m.severity(), Some(Severity::Warning));
+        assert_eq!(t.severity(), Some(Severity::Warning));
+        // A variant that is an error by default renders with the severity of
+        // the bucket it was reported in.
+        let caught = TycError::generic_at(
+            "`Mapping[str, int]` does not support item assignment",
+            "here",
+            "a.ty",
+            src,
+            0,
+            6,
+        );
+        let wrapped = SanitisedDiagnostic::wrap(caught.clone()).with_severity(Severity::Warning);
+        assert_eq!(wrapped.severity(), Some(Severity::Warning));
+        assert_eq!(SanitisedDiagnostic::wrap(caught.clone()).severity(), None);
+        // ...and carries its location.
+        let mut caught = caught;
+        assert!(caught.source_and_span_mut().is_some());
+    }
+
+    #[test]
+    fn go_on_a_plain_value_reads_as_a_sentence() {
+        let e = TycError::go_needs_coroutine("work(1)", "int", "a.ty", "go work(1)", 3, 7);
+        assert_eq!(
+            e.to_string(),
+            "`go` needs a coroutine, but `work(1)` returns `int`"
+        );
+    }
+
+    #[test]
+    fn non_exhaustive_match_names_a_closed_subject_by_its_type() {
+        let e = TycError::non_exhaustive_closed_match("bool", "False", "a.ty", "match b:", 0, 7);
+        let msg = e.to_string();
+        assert_eq!(
+            msg,
+            "non-exhaustive `match` on `bool`: missing case(s) False"
+        );
+        let help = miette::Diagnostic::help(&e).unwrap().to_string();
+        assert!(help.contains("`case False:`"), "{help}");
+        let e = TycError::non_exhaustive_enum_match("Color", "BLUE", "a.ty", "match c:", 0, 7);
+        assert_eq!(
+            e.to_string(),
+            "non-exhaustive `match` on enum `Color`: missing member(s) BLUE"
+        );
     }
 
     #[test]

@@ -146,6 +146,198 @@ class Counter frozen:
 freeze let CFG = Counter(value=0)    # ✅ check-time validated
 ```
 
+## `tyc::reserved_module_name`
+
+The project defines its own `typhon_runtime` module or package directly under the source root. That name is reserved for the runtime package `tyc build` generates next to the emitted Python whenever the program uses `Result` / `Ok` / `Err`, `go`, `lazy`, `freeze` or `try_result`, or imports `typhon_runtime`; the generated package replaces the project's.
+
+```text
+src/typhon_runtime/__init__.ty    # def helper() -> int: …
+src/main.ty                       # from typhon_runtime import helper … Ok(helper())
+```
+
+`tyc build` stops with an error when the program imports something from `typhon_runtime` that the generated runtime does not provide — the program could not start (`ImportError: cannot import name 'helper'`) — or reads such a name off a bare `import typhon_runtime` (`typhon_runtime.helper()`, which raises `AttributeError` where it runs). A read through a name the file rebinds elsewhere, or of an attribute the program sets on the module itself, is not counted. In every other case it, like `tyc check`, only warns.
+
+**Fix:** rename the module (for example to `runtime_helpers`) and update its imports.
+
+## `tyc::unknown_module` (warning)
+
+In a project with a `typhon.toml`, an import names a module that is not in
+the standard library, not part of the project, and not declared under
+`[dependencies]`.
+
+```python
+import flask    # module `flask` is not in the stdlib, the project, or `typhon.toml` dependencies
+```
+
+**Fix:** correct the name, add the package to `[dependencies]` (`tyc add
+flask`), or create the missing `.ty` module. The diagnostic is rendered
+with the error marker but does not fail `tyc check`.
+
+## `tyc::unknown_kwarg`
+
+A call passes a keyword argument the callee does not accept (and the callee
+has no `**kwargs`), or passes a positional-only parameter by keyword.
+
+```python
+def connect(host: str, port: int) -> None:
+    print(host, port)
+
+def main() -> None:
+    connect(host="localhost", prot=80)    # ❌ unknown keyword argument 'prot' to `connect`
+```
+
+**Fix:** use the parameter's real name (`port=80`); the help text suggests
+the closest match.
+
+## `tyc::typevar_import_rejected`
+
+`from typing import TypeVar`. Typhon uses PEP 695 type-parameter syntax
+instead.
+
+```python
+from typing import TypeVar    # ❌ `from typing import TypeVar` is not supported in Typhon
+```
+
+**Fix:** declare the parameter on the function or class:
+
+```python
+def first[T](xs: list[T]) -> T:
+    return xs[0]
+```
+
+## `tyc::typing_alias_deprecated` (warning)
+
+An import of a capitalised `typing` alias (`List`, `Dict`, `Tuple`, `Set`,
+`FrozenSet`, `Type`).
+
+```python
+from typing import List    # `from typing import List` is deprecated in Typhon
+
+def total(xs: List[int]) -> int:
+    return sum(xs)
+```
+
+**Fix:** drop the import and use the built-in (`list[int]`). Like
+`unknown_module`, it is rendered with the error marker but does not fail
+`tyc check`.
+
+## `tyc::typing_alias_in_annotation` (warning)
+
+An annotation uses a capitalised `typing` alias, imported or not.
+
+```python
+import typing
+
+def total(xs: typing.List[int]) -> int:    # ⚠ `List` in an annotation is the deprecated `typing.List` alias
+    return sum(xs)
+```
+
+**Fix:** `List` → `list`, `Dict` → `dict`, `Tuple` → `tuple`, `Set` → `set`,
+`FrozenSet` → `frozenset`, `Type` → `type`.
+
+## `tyc::unsafe_value_leak`
+
+A value from an `unsafe:` block — or one derived from it (`data["name"]`,
+`data.count + 1`, `[x for x in data]`) — reaches a concretely typed return
+or binding without being checked.
+
+```python
+import json
+
+def parse(raw: str) -> int:
+    unsafe:
+        let value = json.loads(raw)
+    return value    # ❌ `value` was introduced inside `unsafe:` and escapes into a concrete `int` return
+```
+
+**Fix:** check it at the boundary with `return value as! int`, or annotate
+the binding inside the block (`let value: int = json.loads(raw)`). An
+annotated re-bind *outside* the block is itself a boundary and is reported
+the same way.
+
+## `tyc::invalid_config_value`
+
+A `typhon.toml` key has a value outside its allowed set — for example
+`[emit] class-default = "plain"` (only `"dataclass"` is accepted), an
+unknown `[checker] external`, or an invalid `[strictness]` severity.
+
+```
+tyc::invalid_config_value
+
+  × invalid value `plain` for `emit.class-default` in `typhon.toml`: expected one of dataclass
+  help: Pick one of the listed values in your typhon.toml.
+```
+
+**Fix:** use one of the listed values. Every command that loads the config
+refuses to run; `tyc build` reports it under this code, `tyc check` prints
+the same message without the code.
+
+## `tyc::pub_name_collision`
+
+`pub *` in an `__init__.ty` aggregates two sibling modules that both export
+the same `pub` name, so whichever import ran last would win.
+
+```python
+# src/mypkg/a.ty
+pub def hello() -> str:
+    return "from a"
+
+# src/mypkg/b.ty
+pub def hello() -> str:
+    return "from b"
+
+# src/mypkg/__init__.ty
+pub *    # ❌ `pub *` collision: `hello` is exported by both `a` and `b`
+```
+
+**Fix:** rename one, drop `pub` from one, or replace `pub *` with explicit
+`from .a import hello` re-exports.
+
+## `tyc::pub_star_outside_init` (advice)
+
+`pub *` in an ordinary module. It only aggregates a package's sibling
+modules, so outside `__init__.ty` it does nothing.
+
+**Fix:** move it to the package's `__init__.ty`, or delete it.
+
+## `tyc::stdlib_module_shadow` (warning)
+
+A project file is named like a standard-library module (`types.ty`,
+`json.ty`, `io.ty`, …). The emitted `build/types.py` sits on `sys.path`
+ahead of the standard library and intercepts every `import types`,
+including the standard library's own.
+
+**Fix:** rename the file (`lang_types.ty`) and update its imports. Checked
+only in a project with a `typhon.toml`.
+
+## `tyc::orphan_py_import` (warning)
+
+A relative import resolves to a `.py` file outside `src/`. The build copies
+only `src/`, so the import would fail with `ModuleNotFoundError` once the
+build output is shipped.
+
+```python
+from .helper import do_thing    # ⚠ resolves outside `src/` and will not be copied to the build output
+```
+
+**Fix:** move the `.py` file under `src/`, or import it by an absolute name
+that the build does package.
+
+## `tyc::main_not_called` (advice)
+
+A module defines a top-level `def main()` but never calls it, so running the
+script does nothing.
+
+**Fix:** add the entry guard:
+
+```python
+def main() -> None:
+    print("hello")
+
+if __name__ == "__main__":
+    main()
+```
+
 ## Quoted annotations as forward references (v0.13.0)
 
 Quoted annotations now resolve as **forward references** — the reflexive Python idiom for naming a type that isn't defined yet — rather than as string-literal singleton types. This covers `next: "Node"`, `-> "Tree[T]"`, and `"list[Node]"`, including a trailing `?` (`"Node"?`).

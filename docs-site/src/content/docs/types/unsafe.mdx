@@ -10,7 +10,7 @@ import { Aside, TabItem, Tabs } from '@astrojs/starlight/components';
 `unsafe:` is Typhon's escape hatch for talking to code the type system can't reason about — typically untyped third-party libraries or genuinely dynamic Python. It is a **lexical region**, not a per-value cast, with a hidden marker that prevents `Any` from leaking into typed code.
 
 <Aside type="tip" title="At a single boundary, reach for `as!`">
-  When the boundary is a *single* untyped value — a JSON payload, a sqlite row, a redis value — the [`as!` checked cast](#as-the-sound-one-line-boundary-cast) replaces the entire `unsafe:` + re-assertion dance with one sound, runtime-checked line. Read on for `unsafe:`, but prefer `as!` for the one-off case.
+  When the boundary is a *single* untyped value — a JSON payload, a sqlite row, a redis value — the [`as!` checked cast](#as--the-sound-one-line-boundary-cast) replaces the entire `unsafe:` + re-assertion dance with one sound, runtime-checked line. Read on for `unsafe:`, but prefer `as!` for the one-off case.
 </Aside>
 
 ## The shape
@@ -151,19 +151,19 @@ What happens:
 
 1. **The checker types the whole expression as `TYPE`.** The boundary value (which may be `Any`) flows in freely — no `unsafe:` block, no `Unsafe[T]` marker, no `unsafe_value_leak` footgun. `as!` reuses the same machinery as `type[T]` generic inference, not a bespoke special case.
 2. **The lowering** (in `tyc-syntax`) rewrites `EXPR as! TYPE` to `__typhon_checked_cast__(EXPR, TYPE)`, resolved via an injected `from typhon_runtime.cast import checked_cast as __typhon_checked_cast__`.
-3. **At runtime**, `checked_cast` verifies the value's shape against `TYPE` **recursively** — scalars; `list[X]` / `set[X]` / `frozenset[X]`; `dict[K, V]`; fixed- and variadic-`tuple[...]`; unions / `Optional` — and raises `TypeError` on a mismatch.
+3. **At runtime**, `checked_cast` checks the value against `TYPE` — scalars and classes, numeric widening, unions and `T?`, `Literal[...]`, containers and mappings recursively, tuples, aliases, newtypes and interfaces — and raises `TypeError` on a mismatch. The full table of supported targets is on the [`unsafe` reference page](/Typhon/reference/unsafe/#supported-targets).
 
 ### Sound, unlike TypeScript's `as`
 
 A static-only re-assertion trusts the boundary blindly; TypeScript's `as` is an *unchecked* compile-time coercion. `as!` is neither — it can only let through values it cannot prove wrong. The structural check is the whole point.
 
-### Fall-back-to-acceptance
+### Accepting and refusing targets
 
-`as!` never invents a failure. `Any` / `object` targets, and any shape `checked_cast` can't model, **fall back to acceptance**. And `int → float` (and `bool → int`) widening is honoured, so a JSON int cast `as! float` does not spuriously fail.
+`Any` / `object` targets accept every value, and `int → float` (and `bool → int`) widening is honoured, so a JSON int cast `as! float` does not spuriously fail. A target the runtime cannot check — a bare type parameter, `Callable`, an iterator or awaitable contract, a parameterised user class such as `Box[int]` — is **refused** at check time (`tyc::generic`) rather than accepted silently.
 
 ### VM behaviour
 
-The in-process VM treats `as!` as an identity passthrough on the value; the authoritative structural check runs on the `tyc build && python` path. The VM intercepts `__typhon_checked_cast__` *before* argument evaluation, so a cast to a union / parametric type still runs under `tyc run`. `tyc fmt` preserves the surface `as!` syntax.
+The in-process VM intercepts `__typhon_checked_cast__` *before* argument evaluation and runs a structural check of its own, so a wrong-shaped scalar, container, tuple, union or plain alias raises `TypeError` under `tyc run` as it does after `tyc build`. It does not yet enforce `Literal`, newtype, generic-alias or interface targets: those casts pass under `tyc run` and raise `TypeError` on CPython. `tyc fmt` preserves the surface `as!` syntax.
 
 The generated runtime file is `typhon_runtime/cast.py`, exposing `checked_cast(value, tp)`.
 
@@ -185,7 +185,7 @@ The **left** operand is the whole current syntactic slot — back to the enclosi
 - **A [`.dty` stub](/Typhon/interop/dty-stubs/)** — a long-lived dependency.
 - **`as!`** — an ad-hoc one-off shape assertion, the sound runtime-checked upgrade over a bare `unsafe:` re-assertion.
 
-See [`unsafe` → `as!`](/Typhon/reference/unsafe/#as-the-checked-boundary-cast) for the reference-page summary.
+See [`unsafe` → `as!`](/Typhon/reference/unsafe/#as--the-checked-boundary-cast) for the reference-page summary.
 
 ## When to use `unsafe:`
 

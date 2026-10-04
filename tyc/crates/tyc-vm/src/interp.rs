@@ -29,6 +29,9 @@ use crate::value::{
     Instance, IterState, NativeFn, ResumeFrame, Value, VmInt,
 };
 
+#[path = "cast.rs"]
+mod cast;
+
 /// One active generator body on the interpreter's generator stack.
 pub enum GenFrame {
     /// Eager materialisation: yielded values are collected into the buffer
@@ -156,6 +159,24 @@ pub struct Interpreter {
     /// caller is a coroutine or a sync helper: it is the dynamic extent of
     /// the loop that matters, exactly as in CPython.
     pub running_loop_depth: usize,
+    /// The function whose body is executing (`None` at module level) — the
+    /// frame a caught exception's `__traceback__` ends in, so a chained
+    /// traceback names the catching function the way CPython's does.
+    pub current_function: Option<Rc<Function>>,
+    /// Lowest native stack address a call may start at (0 = the platform
+    /// cannot report the stack, no check): below it a call raises
+    /// `RecursionError` rather than overflowing the host stack. See
+    /// `crate::stack`.
+    pub stack_floor: usize,
+    /// Lists and dicts whose `repr` is being built (CPython's
+    /// `Py_ReprEnter`): met again inside themselves they render as `[...]`
+    /// / `{...}`.
+    pub repr_active: std::collections::HashSet<usize>,
+    /// Every `type` alias statement executed, by name, for `as!` (see
+    /// `cast`).
+    pub(crate) alias_defs: HashMap<String, Vec<Rc<cast::AliasDef>>>,
+    /// The base expression of each `NewType` object, by object address.
+    pub(crate) newtype_defs: HashMap<usize, cast::NewTypeDef>,
 }
 
 /// Upper bound on values an eagerly-evaluated generator may yield before the
@@ -177,6 +198,9 @@ pub struct SourceInfo {
     pub name: String,
     pub line_starts: Vec<usize>,
     pub lines: Vec<String>,
+    /// Parsed-buffer line → user-source line (0-based); empty when the
+    /// two coincide. See [`SourceInfo::mapped`].
+    pub line_map: Vec<usize>,
 }
 
 impl SourceInfo {
@@ -191,13 +215,44 @@ impl SourceInfo {
             name: name.into(),
             line_starts,
             lines: source.lines().map(|l| l.to_owned()).collect(),
+            line_map: Vec::new(),
         }
     }
-    /// 1-based line number containing `offset`.
+    /// A source whose AST offsets index `python_source` (the preprocessed,
+    /// sugar-expanded buffer the parser saw) while frames must report the
+    /// line the user wrote: `line_map[i]` is the 0-based `original` line
+    /// that `python_source` line `i` came from (the table
+    /// `preprocess::expand_and_preprocess_mapped` composes, the same one
+    /// `tyc check` reports through). Without it every `?`, with-chain,
+    /// `rescue` or `gather:` above a frame shifted its line number, and the
+    /// printed text was the lowered Python (`__typhon_checked_cast__(…)`).
+    pub fn mapped(
+        name: impl Into<String>,
+        python_source: &str,
+        original: &str,
+        line_map: &[usize],
+    ) -> Self {
+        let mut info = Self::new(name, python_source);
+        if !line_map.is_empty() {
+            let original = original.strip_prefix('\u{feff}').unwrap_or(original);
+            info.lines = original.lines().map(|l| l.to_owned()).collect();
+            info.line_map = line_map.to_vec();
+        }
+        info
+    }
+    /// 1-based line number containing `offset` — in the user's source when
+    /// the info carries a line map, else in the parsed buffer.
     pub fn line_of(&self, offset: usize) -> u32 {
-        match self.line_starts.binary_search(&offset) {
-            Ok(i) => (i + 1) as u32,
-            Err(i) => i as u32,
+        let raw = match self.line_starts.binary_search(&offset) {
+            Ok(i) => i + 1,
+            Err(i) => i,
+        };
+        if self.line_map.is_empty() || raw == 0 {
+            return raw as u32;
+        }
+        match self.line_map.get(raw - 1) {
+            Some(&orig) => (orig + 1) as u32,
+            None => raw as u32,
         }
     }
     pub fn line_text(&self, line: u32) -> Option<String> {
@@ -239,6 +294,16 @@ impl Interpreter {
             builtin_ext_registries: HashMap::new(),
             method_cache: RefCell::new(HashMap::new()),
             running_loop_depth: 0,
+            current_function: None,
+            repr_active: {
+                crate::limits::set_int_max_str_digits(crate::limits::DEFAULT_INT_MAX_STR_DIGITS);
+                std::collections::HashSet::new()
+            },
+            alias_defs: HashMap::new(),
+            newtype_defs: HashMap::new(),
+            stack_floor: crate::stack::current_thread_stack()
+                .map(|(low, size)| low + crate::stack::safety_margin(size))
+                .unwrap_or(0),
         };
         crate::builtins::install(&mut interp);
         interp
@@ -461,7 +526,7 @@ impl Interpreter {
                 std::mem::take(&mut st.resume),
             )
         };
-        if self.stack_depth >= self.max_stack_depth {
+        if self.recursion_exhausted() {
             g.borrow_mut().running = false;
             return Err(Unwind::Exception(VmException::new(
                 "RecursionError",
@@ -471,6 +536,7 @@ impl Interpreter {
         self.stack_depth += 1;
         let caller_offset = self.current_offset;
         let caller_source = self.current_source.clone();
+        let caller_function = self.current_function.replace(function.clone());
         if function.source.is_some() {
             self.current_source = function.source.clone();
         }
@@ -521,6 +587,7 @@ impl Interpreter {
         };
         self.current_offset = caller_offset;
         self.current_source = caller_source;
+        self.current_function = caller_function;
         result
     }
 
@@ -609,14 +676,48 @@ impl Interpreter {
         result
     }
 
+    /// Whether one more Python-level frame would exceed the recursion limit.
+    /// CPython counts the module's own frame against `sys.getrecursionlimit()`
+    /// (at the default 1000, 999 nested calls fit), so the VM's call depth
+    /// stops one short of the limit. The native-stack floor catches a raised
+    /// limit (`sys.setrecursionlimit(10**6)`) the host stack cannot hold:
+    /// CPython raises `RecursionError` there, where the VM used to abort.
+    fn recursion_exhausted(&self) -> bool {
+        self.stack_depth + 1 >= self.max_stack_depth
+            || (self.stack_floor != 0 && crate::stack::stack_pointer() < self.stack_floor)
+    }
+
     /// Append a traceback frame for `function` to an escaping exception,
     /// stamped with the raise-site line read against the active source.
     fn stamp_frame(&self, e: &mut VmException, function: &str) {
-        // CPython prints every frame; cap ours so deep recursion doesn't
-        // render a megabyte of repeats.
+        let line = self
+            .current_source
+            .as_ref()
+            .map(|si| si.line_of(self.current_offset));
+        // Run-length encode consecutive identical frames (deep recursion):
+        // the renderer prints three and CPython's "[Previous line repeated
+        // N more times]", which needs the true count.
+        if let Some(last) = e.frames.last_mut() {
+            let same_file = match (&last.file, &self.current_source) {
+                (Some(f), Some(si)) => *f == si.name,
+                (None, None) => true,
+                _ => false,
+            };
+            if last.function == function && last.line == line && same_file {
+                last.repeat += 1;
+                return;
+            }
+        }
+        // CPython prints every frame; cap the distinct ones so a deep
+        // mutual recursion doesn't render a megabyte of frames.
         if e.frames.len() >= 64 {
             return;
         }
+        e.frames.push(self.frame_here(function));
+    }
+
+    /// A traceback frame for `function` at the current statement.
+    fn frame_here(&self, function: &str) -> crate::error::Frame {
         let (line, file, line_text) = match &self.current_source {
             Some(si) => {
                 let line = si.line_of(self.current_offset);
@@ -624,12 +725,38 @@ impl Interpreter {
             }
             None => (None, None, None),
         };
-        e.frames.push(crate::error::Frame {
+        crate::error::Frame {
             function: function.to_owned(),
             line,
             file,
             line_text,
-        });
+            repeat: 0,
+        }
+    }
+
+    /// Give a just-caught exception its `__traceback__`: the frames it
+    /// unwound through plus the catching frame (the function, or
+    /// `<module>`, whose `try` caught it — at the line that raised), as
+    /// CPython's traceback for a handled exception reads. Stored on the
+    /// exception value so a later uncaught exception chained to it (`raise
+    /// … from e`, or one raised while handling it) prints the "The above
+    /// exception was the direct cause …" / "During handling …" sections.
+    fn record_caught_traceback(&self, exc: &mut VmException) {
+        let mut frames = exc.frames.clone();
+        let name = self
+            .current_function
+            .as_ref()
+            .map(|f| f.name.clone())
+            .unwrap_or_else(|| "<module>".to_owned());
+        frames.push(self.frame_here(&name));
+        let value = exc
+            .value
+            .take()
+            .unwrap_or_else(|| exception_binding_value(exc));
+        exc.value = Some(crate::value::with_exception_traceback(
+            value,
+            Rc::new(frames),
+        ));
     }
 
     /// A loop's `else` clause, resumable across a `yield` inside it.
@@ -779,6 +906,34 @@ impl Interpreter {
                         return Ok(());
                     }
                 }
+                // `set |= / &= / -= / ^= <set or frozenset>` update the set in
+                // place (`set.__ior__` & co., the same tables as `update` /
+                // `intersection_update` / …), so aliases observe the change.
+                // Any other right operand (a dict view) makes the in-place
+                // slot decline and falls back to the binary operator and a
+                // rebind, as in CPython; a frozenset has no in-place slots.
+                if let (Value::Set(target), Value::Set(_)) = (&current, &rhs) {
+                    let method = match a.op {
+                        Operator::BitOr => Some("update"),
+                        Operator::BitAnd => Some("intersection_update"),
+                        Operator::Sub => Some("difference_update"),
+                        Operator::BitXor => Some("symmetric_difference_update"),
+                        _ => None,
+                    };
+                    if let Some(method) = method {
+                        if !crate::builtins::set_is_frozen(target) {
+                            let target = target.clone();
+                            crate::builtins::set_method(
+                                self,
+                                &target,
+                                method,
+                                std::slice::from_ref(&rhs),
+                            )?;
+                            store_back!(self, Value::Set(target))?;
+                            return Ok(());
+                        }
+                    }
+                }
                 let new = self.binop(&current, a.op, &rhs)?;
                 store_back!(self, new)?;
                 Ok(())
@@ -830,7 +985,19 @@ impl Interpreter {
                     // No target — fall through and register as a regular class.
                 }
                 let class = self.build_class(c, env)?;
-                env.set(name, Value::Class(class));
+                // Class decorators run bottom-up on the new class and the
+                // name binds their result (`@total_ordering`, a registry
+                // decorator). The ones `build_class` already applied itself
+                // (`@dataclass(...)`, `@runtime_checkable`) are skipped.
+                let mut value = Value::Class(class);
+                for deco in c.decorator_list.iter().rev() {
+                    let name = decorator_simple_name(&deco.expression);
+                    if matches!(name.as_deref(), Some("dataclass" | "runtime_checkable")) {
+                        continue;
+                    }
+                    value = self.apply_decorator(deco, value, env)?;
+                }
+                env.set(name, value);
                 Ok(())
             }
             Stmt::Import(im) => {
@@ -915,6 +1082,7 @@ impl Interpreter {
                 // raised `AttributeError: module '…' has no attribute 'Event'`
                 // at the import statement. Bind the alias name so the module
                 // attribute exists.
+                self.register_alias(ta, env);
                 if let Expr::Name(n) = ta.name.as_ref() {
                     let name = n.id.as_str();
                     let val = self.eval_type_alias_value(name, &ta.value, env);
@@ -1032,16 +1200,21 @@ impl Interpreter {
         // values). Re-entering a generator suspended in the body
         // continues with the live iterator, skipping the assignment
         // for that one iteration.
-        let (iter, mut resumed) = match self.pop_resume_frame() {
+        // Keep the raw iterable alongside the iteration state: if it is a
+        // generator, `make_iter` wraps it, and CPython finalises an abandoned
+        // generator when its last reference drops (see the loop epilogue).
+        let (iter, generator, mut resumed) = match self.pop_resume_frame() {
             None => {
                 let iterable = self.eval_expr(&s.iter, env)?;
-                (self.make_iter(iterable)?, false)
+                let generator = as_generator(&iterable);
+                (self.make_iter(iterable)?, generator, false)
             }
-            Some(ResumeFrame::ForBody { iter }) => (iter, true),
+            Some(ResumeFrame::ForBody { iter }) => (iter, None, true),
             Some(ResumeFrame::LoopElse) => return self.exec_loop_else(&s.orelse, env),
             Some(other) => return Err(resume_mismatch(&other)),
         };
         let mut completed = true;
+        let mut outcome: Result<(), Unwind> = Ok(());
         loop {
             if !resumed {
                 let Some(v) = self.iter_next(&iter)? else {
@@ -1058,12 +1231,49 @@ impl Interpreter {
                     break;
                 }
                 Err(Unwind::Yield(v)) => {
+                    // Suspended, not abandoned: the generator is still live
+                    // (its state is on the resume frame), so it must NOT be
+                    // finalised here.
                     self.record_suspend(ResumeFrame::ForBody { iter: iter.clone() });
                     return Err(Unwind::Yield(v));
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    outcome = Err(e);
+                    break;
+                }
             }
         }
+        // CPython finalises an abandoned generator the moment its last
+        // reference drops — running its `finally` blocks and `with` exits.
+        // The VM has no GC, so it does the equivalent at the one point it can
+        // observe the reference go away: the end of the loop that was
+        // iterating it, when that loop holds the only reference. A generator
+        // still referenced from a name (`it = iter(g())`) has a higher count
+        // here and is correctly left alone.
+        if generator.is_some() {
+            // The loop holds two references to a generator it iterates: the
+            // raw value kept above and the copy inside the iteration state.
+            // Drop the iteration state first, so a surviving count of 1 means
+            // the program itself holds no reference — the VM's stand-in for
+            // CPython's refcount reaching zero. A generator still bound to a
+            // name (`it = g()`) is left live, exactly as CPython leaves it.
+            drop(iter);
+        }
+        if let Some(g) = generator {
+            if Rc::strong_count(&g) == 1 {
+                match &outcome {
+                    // A clean break/exit: closing may legitimately raise
+                    // (`generator ignored GeneratorExit`), as CPython does.
+                    Ok(()) => self.generator_close(&g)?,
+                    // The body is already unwinding with an exception; run
+                    // the generator's cleanup but let the original error win.
+                    Err(_) => {
+                        let _ = self.generator_close(&g);
+                    }
+                }
+            }
+        }
+        outcome?;
         if completed && !s.orelse.is_empty() {
             self.exec_loop_else(&s.orelse, env)?;
         }
@@ -1238,28 +1448,7 @@ impl Interpreter {
                 // `del obj.attr` removes an instance attribute.
                 Expr::Attribute(a) => {
                     let recv = self.eval_expr(&a.value, env)?;
-                    match recv {
-                        Value::Instance(inst) => {
-                            if let Some(err) =
-                                frozen_dataclass_error(&inst.class, a.attr.as_str(), "delete")
-                            {
-                                return Err(err);
-                            }
-                            if inst
-                                .fields
-                                .borrow_mut()
-                                .shift_remove(a.attr.as_str())
-                                .is_none()
-                            {
-                                return Err(attribute_error(format!(
-                                    "'{}' object has no attribute '{}'",
-                                    inst.class.name,
-                                    a.attr.as_str()
-                                )));
-                            }
-                        }
-                        _ => return Err(type_error("cannot delete attribute on this object")),
-                    }
+                    self.del_attr(&recv, a.attr.as_str())?;
                 }
                 _ => return Err(not_implemented("complex delete targets")),
             }
@@ -1470,6 +1659,13 @@ impl Interpreter {
                 let v = self.eval_expr(arg, env)?;
                 match v {
                     Value::Class(c) => bases.push(c),
+                    // `class Named(Box[int])`: a generic alias's
+                    // `__mro_entries__` is its origin class.
+                    Value::Instance(inst) if inst.class.name == "_GenericAlias" => {
+                        if let Some(Value::Class(origin)) = inst.fields.borrow().get("__origin__") {
+                            bases.push(origin.clone());
+                        }
+                    }
                     Value::Module(_) => {
                         // e.g. `typing.Protocol` referenced as `Protocol` — ignored for v1.
                     }
@@ -1612,6 +1808,8 @@ impl Interpreter {
         let mut fields = Vec::new();
         let mut methods: HashMap<String, Rc<Function>> = HashMap::new();
         let mut class_attrs: HashMap<String, Value> = HashMap::new();
+        // A protocol's annotated data members (`interface X: name: str`).
+        let mut protocol_data: Vec<Value> = Vec::new();
         let mut properties: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut classmethods: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -1624,19 +1822,22 @@ impl Interpreter {
                     // sentinel class-attr key) rather than overriding the
                     // getter method. Evaluating `prop.setter` directly would
                     // fail (`prop` isn't bound during class-body execution).
-                    let mut setter_target: Option<String> = None;
+                    let mut setter_target: Option<(&str, String)> = None;
                     for deco in f.decorator_list.iter() {
                         if let Expr::Attribute(a) = &deco.expression {
-                            if a.attr.as_str() == "setter" {
-                                if let Expr::Name(prop) = a.value.as_ref() {
-                                    setter_target = Some(prop.id.as_str().to_owned());
-                                }
+                            let role = match a.attr.as_str() {
+                                "setter" => "setter",
+                                "deleter" => "deleter",
+                                _ => continue,
+                            };
+                            if let Expr::Name(prop) = a.value.as_ref() {
+                                setter_target = Some((role, prop.id.as_str().to_owned()));
                             }
                         }
                     }
-                    if let Some(prop) = setter_target {
+                    if let Some((role, prop)) = setter_target {
                         class_attrs.insert(
-                            format!("__typhon_setter__{}", prop),
+                            format!("__typhon_{role}__{prop}"),
                             Value::Function(Rc::new(func)),
                         );
                         continue;
@@ -1711,7 +1912,11 @@ impl Interpreter {
                         } else if !has_generated_fields {
                             // A bare annotation in a plain class (`plain
                             // class` / `class!`) creates no attribute and no
-                            // constructor parameter — exactly CPython.
+                            // constructor parameter — exactly CPython. On a
+                            // protocol it is still a member to check for.
+                            if is_protocol {
+                                protocol_data.push(Value::Str(Rc::new(n.id.as_str().to_owned())));
+                            }
                         } else {
                             fields.push(ClassField {
                                 name: n.id.as_str().to_owned(),
@@ -1752,19 +1957,27 @@ impl Interpreter {
         // Names the subclass defines itself — an inherited descriptor marker
         // (`@property` / `@classmethod`) must NOT carry over to a name the
         // subclass has overridden with a plain method.
-        let own_method_names: std::collections::HashSet<String> = methods.keys().cloned().collect();
+        let own_method_names: std::collections::HashSet<String> =
+            methods.keys().chain(class_attrs.keys()).cloned().collect();
 
-        // Inherit methods from base classes that aren't already overridden.
+        // C3 linearisation of the ancestors: every lookup, `super()` and
+        // `__mro__` walk it. Methods and user-visible class attributes are
+        // *not* copied into the subclass — CPython resolves them through the
+        // MRO at read time, so an attribute set on a base after a subclass
+        // was created is visible through it, a subclass's own class
+        // attribute shadows an inherited method, and a diamond resolves
+        // `D(B, C)` as D > B > C > A rather than depth-first.
         for base in &bases {
-            for (name, m) in base.methods.borrow().iter() {
-                methods.entry(name.clone()).or_insert_with(|| m.clone());
-            }
             for (name, v) in base.class_attrs.borrow().iter() {
-                // Don't inherit the internal enum sentinels — a subclass
-                // should not be treated as the enum base marker, and each
-                // enum owns its own member list (materialised after this
-                // class is built).
-                if is_enum_sentinel(name) || is_uninherited_marker(name) {
+                // The VM's internal `__typhon_*` class-kind records are still
+                // inherited by copy (they are written once, at class
+                // creation) — except the enum sentinels (a subclass is not
+                // the enum base marker, and each enum owns its member list)
+                // and the per-level markers each class answers for itself.
+                if !name.starts_with("__typhon_")
+                    || is_enum_sentinel(name)
+                    || is_uninherited_marker(name)
+                {
                     continue;
                 }
                 class_attrs.entry(name.clone()).or_insert_with(|| v.clone());
@@ -1864,6 +2077,7 @@ impl Interpreter {
                 ("unsafe_hash", "__typhon_dc_unsafe_hash__"),
                 ("slots", "__typhon_dc_slots__"),
                 ("order", "__typhon_dc_order__"),
+                ("repr", "__typhon_dc_repr__"),
             ] {
                 if let Some(flag) = dataclass_option(&c.decorator_list, option) {
                     class_attrs.insert(marker.to_owned(), Value::Bool(flag));
@@ -1901,7 +2115,7 @@ impl Interpreter {
                     .collect();
                 class_attrs.insert(
                     "_field_defaults".to_owned(),
-                    Value::Dict(Rc::new(RefCell::new(defaults))),
+                    Value::Dict(Rc::new(crate::value::FrozenCell::new(defaults))),
                 );
                 bases.push(template);
             }
@@ -1912,6 +2126,32 @@ impl Interpreter {
         // call path builds the mapping instead of an instance.
         if is_typed_dict {
             class_attrs.insert("__typhon_typed_dict__".to_owned(), Value::Bool(true));
+        }
+        // `class X(ABC)` / `metaclass=ABCMeta`: instances are refused while
+        // an abstract method is unimplemented (`ABC` itself is an identity
+        // stand-in, so the base is read off the class header). Subclasses
+        // inherit the marker.
+        let abc_header = c.arguments.as_ref().is_some_and(|args| {
+            args.args
+                .iter()
+                .any(|b| base_trailing_name(b) == Some("ABC"))
+                || args.keywords.iter().any(|k| {
+                    k.arg.as_ref().is_some_and(|a| a.as_str() == "metaclass")
+                        && base_trailing_name(&k.value) == Some("ABCMeta")
+                })
+        });
+        if abc_header {
+            class_attrs.insert("__typhon_abc__".to_owned(), Value::Bool(true));
+        }
+        // `class Box(Generic[T])` (the pre-PEP 695 spelling) is subscriptable.
+        let generic_header = c.arguments.as_ref().is_some_and(|args| {
+            args.args.iter().any(|b| {
+                matches!(b, Expr::Subscript(s)
+                    if matches!(base_trailing_name(&s.value), Some("Generic" | "Protocol")))
+            })
+        });
+        if generic_header {
+            class_attrs.insert("__typhon_generic__".to_owned(), Value::Bool(true));
         }
         if !builtin_bases.is_empty() {
             class_attrs.insert(
@@ -1941,12 +2181,26 @@ impl Interpreter {
         {
             class_attrs.insert("_is_runtime_protocol".to_owned(), Value::Bool(true));
         }
+        if !protocol_data.is_empty() {
+            class_attrs.insert(
+                "__typhon_protocol_data__".to_owned(),
+                Value::Tuple(Rc::new(protocol_data)),
+            );
+        }
+        // After every base is known (a `NamedTuple` gains its template base
+        // above).
+        let mro = crate::value::linearize(&bases).map_err(|names| {
+            type_error(format!(
+                "Cannot create a consistent method resolution order (MRO) for bases {names}"
+            ))
+        })?;
         let class = Rc::new(Class {
             name: c.name.as_str().to_owned(),
             methods: RefCell::new(methods),
             fields,
             class_attrs: RefCell::new(class_attrs),
             bases,
+            mro,
             properties: RefCell::new(properties),
             classmethods: RefCell::new(classmethods),
             is_exception,
@@ -1967,7 +2221,77 @@ impl Interpreter {
             self.materialise_enum_members(&class, c);
         }
 
+        self.finish_class_creation(&class, c, env)?;
         Ok(class)
+    }
+
+    /// The two hooks `type.__new__` runs once a class object exists: every
+    /// class attribute whose type defines `__set_name__` learns its owner and
+    /// name, then the nearest ancestor's `__init_subclass__` (an implicit
+    /// classmethod) is called with the class header's keyword arguments —
+    /// how plugin registries and validating base classes work.
+    fn finish_class_creation(
+        &mut self,
+        class: &Rc<Class>,
+        c: &ast::StmtClassDef,
+        env: &EnvRef,
+    ) -> Result<(), Unwind> {
+        let candidates: Vec<(String, Value)> = class
+            .class_attrs
+            .borrow()
+            .iter()
+            .filter(|(k, v)| !k.starts_with("__typhon_") && matches!(v, Value::Instance(_)))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (name, v) in candidates {
+            if let Value::Instance(d) = &v {
+                if let Some(set_name) = self.find_method(&d.class, "__set_name__") {
+                    self.call_value(
+                        Value::BoundMethod {
+                            receiver: Box::new(v.clone()),
+                            function: set_name,
+                        },
+                        vec![Value::Class(class.clone()), Value::Str(Rc::new(name))],
+                        &[],
+                    )?;
+                }
+            }
+        }
+        let mut kwargs: Vec<(String, Value)> = Vec::new();
+        if let Some(args) = &c.arguments {
+            for kw in args.keywords.iter() {
+                match kw.arg.as_ref().map(|a| a.as_str()) {
+                    Some("metaclass") => {}
+                    Some(name) => kwargs.push((name.to_owned(), self.eval_expr(&kw.value, env)?)),
+                    None => {}
+                }
+            }
+        }
+        let hook = class.mro.iter().find_map(|base| {
+            base.methods
+                .borrow()
+                .get("__init_subclass__")
+                .map(|m| (base.clone(), m.clone()))
+        });
+        match hook {
+            Some((owner, init_subclass)) => {
+                self.call_method_with_frame(
+                    &init_subclass,
+                    owner,
+                    Value::Class(class.clone()),
+                    vec![],
+                    &kwargs,
+                )?;
+            }
+            None if !kwargs.is_empty() => {
+                return Err(type_error(format!(
+                    "{}.__init_subclass__() takes no keyword arguments",
+                    class.name
+                )));
+            }
+            None => {}
+        }
+        Ok(())
     }
 
     fn apply_decorator(
@@ -2223,78 +2547,21 @@ impl Interpreter {
             ))
         })?;
 
-        // Run the same preprocess + desugar pipeline lib.rs uses for the
-        // top-level entry, so the imported module sees identical surface
-        // syntax handling.
-        use tyc_syntax::preprocess;
-        let expanded = preprocess::expand_question_ops(&preprocess::expand_inline_question_ops(
-            // Shared with the CLI: the VM omitted both of these, so an
-            // inline `?` (`f(g()?)`, `elif h()? > 1:`) failed to parse under
-            // `tyc run` on a program `tyc build` compiles and runs.
-            &preprocess::expand_compound_question_headers(&preprocess::expand_pipes(
-                &preprocess::expand_with_chains(&preprocess::expand_go_calls(
-                    &preprocess::expand_gather_blocks(&preprocess::expand_multiline_guards(
-                        &preprocess::expand_typed_let_unpack(&preprocess::expand_lazy_lets(
-                            &source,
-                        )),
-                    )),
-                )),
-            )),
-        ));
-        let prep = preprocess::preprocess(&expanded);
+        // Run the same front end lib.rs uses for the top-level entry (the
+        // canonical sugar chain, preprocess, comptime, `@memo`, desugar), so
+        // the imported module sees identical surface syntax handling.
+        let (mut module, prep) =
+            crate::front_end(&source, crate::FrontEnd::Program).map_err(|e| {
+                crate::error::Unwind::Exception(crate::error::VmException::new(
+                    "ImportError",
+                    format!("parse error in '{}': {e}", path.display()),
+                ))
+            })?;
         self.lazy_import_aliases.extend(
             prep.lazy_imports
                 .iter()
                 .map(|li| (li.module.clone(), li.alias.clone())),
         );
-        let parsed = tyc_syntax::parse_module(&prep.python_source).map_err(|e| {
-            crate::error::Unwind::Exception(crate::error::VmException::new(
-                "ImportError",
-                format!("parse error in '{}': {e}", path.display()),
-            ))
-        })?;
-        let mut module = parsed.into_syntax();
-        let (comptime_values, _diags) = tyc_analyse::evaluate_comptime_with_functions(
-            &module,
-            &prep.comptime_bindings,
-            &prep.comptime_functions,
-        );
-        module = tyc_analyse::substitute_comptime_literals(
-            module,
-            &comptime_values,
-            &prep.comptime_functions,
-        );
-        // Mirror the entry-module pipeline (lib.rs): thread the `@memo`
-        // opt-ins and the preprocessor's class-kind markers through to
-        // desugar, so a sibling module's `@memo def` is actually memoised
-        // and its `class X frozen:` / `plain class` / `class!` forms keep
-        // their declared shape under `tyc run`.
-        let memoise_targets: Vec<String> = tyc_analyse::analyse_purity(&module, false)
-            .into_iter()
-            .filter(|f| f.violation.is_none() && f.memoise)
-            .map(|f| f.name)
-            .collect();
-        let desugar_out = tyc_desugar::desugar_module_with(
-            &module,
-            tyc_desugar::DesugarOptions {
-                memoise_functions: memoise_targets,
-                raw_class_line_starts: preprocess::line_byte_starts(
-                    &prep.python_source,
-                    &prep.raw_class_lines,
-                ),
-                frozen_class_line_starts: preprocess::line_byte_starts(
-                    &prep.python_source,
-                    &prep.frozen_class_lines,
-                ),
-                plain_class_line_starts: preprocess::line_byte_starts(
-                    &prep.python_source,
-                    &prep.plain_class_lines,
-                ),
-                pub_names: prep.pub_names.clone(),
-                ..Default::default()
-            },
-        );
-        module = desugar_out.module;
         let (mut registry, _stats) = tyc_analyse::extract_builtin_extensions(&mut module);
         // Store the module's own extension registry for cross-module
         // rewrite (#202) before the merge below adds its imports' entries.
@@ -2329,6 +2596,8 @@ impl Interpreter {
                 let _ = tyc_analyse::rewrite_builtin_extension_calls(&mut module, &registry);
             }
         }
+        // Inline `?` evaluation order, as for the entry module (lib.rs).
+        tyc_syntax::preprocess::attach_method_lookups(&mut module);
 
         // Evaluate the module body in a fresh child scope of root; copy
         // every named binding into a Module namespace so attribute
@@ -2354,9 +2623,11 @@ impl Interpreter {
             Value::Str(Rc::new(path.to_string_lossy().into_owned())),
         );
         let saved_source = self.current_source.clone();
-        self.current_source = Some(Rc::new(SourceInfo::new(
+        self.current_source = Some(Rc::new(SourceInfo::mapped(
             path.to_string_lossy().into_owned(),
             &prep.python_source,
+            &source,
+            &prep.line_map,
         )));
         // Enter the loaded module's package so its own relative imports
         // resolve from where it lives, not from where the import chain
@@ -2476,6 +2747,7 @@ impl Interpreter {
                 fields: vec![],
                 class_attrs: RefCell::new(class_attrs),
                 bases: vec![],
+                mro: vec![],
                 properties: RefCell::new(std::collections::HashSet::new()),
                 classmethods: RefCell::new(std::collections::HashSet::new()),
                 is_exception: false,
@@ -2669,6 +2941,17 @@ impl Interpreter {
         }))
     }
 
+    /// Whether `class` derives from the VM's enum base class `base`
+    /// (`"StrEnum"`, `"IntEnum"`, …).
+    fn enum_base_named(class: &Rc<Class>, base: &str) -> bool {
+        (class
+            .class_attrs
+            .borrow()
+            .contains_key("__typhon_enum_base__")
+            && class.name == base)
+            || class.bases.iter().any(|b| Self::enum_base_named(b, base))
+    }
+
     /// Whether `class` is a `Flag` or `IntFlag` subclass — the two whose
     /// `auto()` members are numbered by bit rather than by increment.
     fn is_flag_class(class: &Rc<Class>) -> bool {
@@ -2685,7 +2968,7 @@ impl Interpreter {
         marker(class)
     }
 
-    fn is_enum_member(value: &Value) -> bool {
+    pub(crate) fn is_enum_member(value: &Value) -> bool {
         if let Value::Instance(i) = value {
             return Self::is_enum_class(&i.class) && i.fields.borrow().contains_key("_name_");
         }
@@ -2699,6 +2982,8 @@ impl Interpreter {
         // `Flag` and `IntFlag` number their `auto()` members by bit. Read
         // before the `class_attrs` borrow below, which this walk shares.
         let is_flag = Self::is_flag_class(class);
+        // `StrEnum`'s `auto()` is the member name lower-cased.
+        let is_str_enum = Self::enum_base_named(class, "StrEnum");
         // Collect member names in source order (each `NAME = value`
         // assignment in the class body, excluding dunders).
         let mut order: Vec<String> = Vec::new();
@@ -2734,7 +3019,9 @@ impl Interpreter {
                 // from it. In a `Flag` / `IntFlag` each `auto()` is instead
                 // the next *bit* — `A, B, C = 1, 2, 4` — because members
                 // combine bitwise.
-                let raw = if Self::is_enum_auto(&raw) {
+                let raw = if Self::is_enum_auto(&raw) && is_str_enum {
+                    Value::Str(Rc::new(name.to_lowercase()))
+                } else if Self::is_enum_auto(&raw) {
                     last_value = if is_flag {
                         if last_value <= 0 {
                             1
@@ -2753,6 +3040,20 @@ impl Interpreter {
                     }
                     raw
                 };
+                // A second name for an existing value is an *alias* of that
+                // member: the same object, not a new member, and absent
+                // from iteration (`Color.CRIMSON is Color.RED`).
+                if let Some(existing) = member_list.iter().find(|m| match m {
+                    Value::Instance(i) => i
+                        .fields
+                        .borrow()
+                        .get("_value_")
+                        .is_some_and(|v| v.py_eq(&raw)),
+                    _ => false,
+                }) {
+                    attrs.insert(name.clone(), existing.clone());
+                    continue;
+                }
                 let mut fields: crate::value::FieldMap = crate::value::FieldMap::new();
                 fields.insert("name".to_owned(), Value::Str(Rc::new(name.clone())));
                 fields.insert("_name_".to_owned(), Value::Str(Rc::new(name.clone())));
@@ -2849,6 +3150,9 @@ impl Interpreter {
             Expr::Compare(c) => self.eval_compare(c, env),
             Expr::Call(c) => self.eval_call(c, env),
             Expr::Attribute(a) => {
+                if let Some(sup) = Self::as_super_call(&a.value) {
+                    return self.eval_super_attr(sup, a.attr.as_str(), env);
+                }
                 let receiver = self.eval_expr(&a.value, env)?;
                 self.get_attr(&receiver, a.attr.as_str())
             }
@@ -2872,17 +3176,25 @@ impl Interpreter {
                 Ok(Value::Tuple(Rc::new(items)))
             }
             Expr::Set(s) => {
-                let mut set = std::collections::HashSet::new();
+                // CPython compiles a literal of three or more constants to
+                // `BUILD_SET 0; LOAD_CONST frozenset(...); SET_UPDATE`, so its
+                // table is a copy of that frozenset's; any other literal adds
+                // its items (and `*splats`) one by one.
+                let mut set = crate::pyset::PySet::new();
+                if s.elts.len() > 2 && s.elts.iter().all(is_constant_expr) {
+                    let mut constant = crate::pyset::PySet::new();
+                    for e in &s.elts {
+                        let v = self.eval_expr(e, env)?;
+                        constant.insert(self.hash_key(&v)?);
+                    }
+                    set.merge(&constant);
+                    return Ok(Value::Set(Rc::new(crate::value::FrozenCell::new(set))));
+                }
                 for e in &s.elts {
                     // `{*xs, 9}` — splat an iterable's elements into the set.
                     if let Expr::Starred(st) = e {
                         let it = self.eval_expr(&st.value, env)?;
-                        let it = self.make_iter(it)?;
-                        while let Some(v) = self.iter_next(&it)? {
-                            let k = self.hash_key(&v)?;
-                            let k = self.settle_key_in_set(&set, k)?;
-                            set.insert(k);
-                        }
+                        self.set_update_from(&mut set, it)?;
                     } else {
                         let v = self.eval_expr(e, env)?;
                         let k = self.hash_key(&v)?;
@@ -2890,10 +3202,10 @@ impl Interpreter {
                         set.insert(k);
                     }
                 }
-                Ok(Value::Set(Rc::new(RefCell::new(set))))
+                Ok(Value::Set(Rc::new(crate::value::FrozenCell::new(set))))
             }
             Expr::Dict(d) => {
-                let mut map: DictMap = IndexMap::new();
+                let mut map: DictMap = DictMap::new();
                 for item in &d.items {
                     match (&item.key, &item.value) {
                         (Some(k), v) => {
@@ -2916,7 +3228,7 @@ impl Interpreter {
                         }
                     }
                 }
-                Ok(Value::Dict(Rc::new(RefCell::new(map))))
+                Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(map))))
             }
             Expr::If(t) => {
                 let cond = self.eval_expr(&t.test, env)?;
@@ -3150,6 +3462,8 @@ impl Interpreter {
                                     ast::ConversionFlag::None => {
                                         if has_debug && interp.format_spec.is_none() {
                                             self.repr_of(&v)?
+                                        } else if interp.format_spec.is_some() {
+                                            self.format_default(&v, "x")?
                                         } else {
                                             self.str_of(&v)?
                                         }
@@ -3173,6 +3487,11 @@ impl Interpreter {
                                     };
                                     if let Some(formatted) = user_formatted {
                                         out.push_str(&formatted);
+                                    } else if has_conversion {
+                                        // `f"{True!s:<8}"` formats the string
+                                        // the conversion produced.
+                                        let converted = Value::Str(Rc::new(s.clone()));
+                                        out.push_str(&format_with_spec(&converted, &s, &spec_str)?);
                                     } else {
                                         out.push_str(&format_with_spec(&v, &s, &spec_str)?);
                                     }
@@ -3198,6 +3517,17 @@ impl Interpreter {
             }
         }
         Ok(Value::Str(Rc::new(out)))
+    }
+
+    /// The `str()` text a format spec falls back on. An int under a non-empty
+    /// spec is not converted to decimal through `str()` first, so its
+    /// digit limit applies only where the spec produces decimal digits
+    /// (`format(10**5000, "x")` is fine).
+    pub fn format_default(&mut self, v: &Value, spec: &str) -> Result<String, Unwind> {
+        match v {
+            Value::Int(_) if !spec.is_empty() => Ok(v.py_str()),
+            _ => self.str_of(v),
+        }
     }
 
     /// If `v` is a user instance defining `__format__(self, spec)`, call it
@@ -3279,6 +3609,8 @@ impl Interpreter {
             CmpOp::GtE => ("__ge__", "__le__"),
             _ => return Ok(None),
         };
+        // A method returning `NotImplemented` declines: the reflected
+        // method on the other operand is tried next, then the default.
         if let Value::Instance(i) = l {
             if let Some(m) = self.find_method(&i.class, name) {
                 let res = self.call_value(
@@ -3289,7 +3621,9 @@ impl Interpreter {
                     vec![r.clone()],
                     &[],
                 )?;
-                return Ok(Some(res.truthy()));
+                if !crate::value::is_not_implemented(&res) {
+                    return Ok(Some(self.is_truthy(&res)?));
+                }
             }
         }
         // Reflected comparison on the right instance operand.
@@ -3303,7 +3637,32 @@ impl Interpreter {
                     vec![l.clone()],
                     &[],
                 )?;
-                return Ok(Some(res.truthy()));
+                if !crate::value::is_not_implemented(&res) {
+                    return Ok(Some(self.is_truthy(&res)?));
+                }
+            }
+        }
+        // Both declined: `==` / `!=` fall back to identity, as CPython's
+        // `object` comparison does; an ordering has no default.
+        if matches!(l, Value::Instance(_)) || matches!(r, Value::Instance(_)) {
+            let declined = |this: &mut Self, v: &Value, n: &str| match v {
+                Value::Instance(i) => this.find_method(&i.class, n).is_some(),
+                _ => false,
+            };
+            if declined(self, l, name) || declined(self, r, rname) {
+                return match op {
+                    CmpOp::Eq => Ok(Some(values_identical(l, r))),
+                    CmpOp::NotEq => Ok(Some(!values_identical(l, r))),
+                    _ => {
+                        let sym = match op {
+                            CmpOp::Lt => "<",
+                            CmpOp::LtE => "<=",
+                            CmpOp::Gt => ">",
+                            _ => ">=",
+                        };
+                        Err(unorderable(l, sym, r))
+                    }
+                };
             }
         }
         Ok(None)
@@ -3330,7 +3689,7 @@ impl Interpreter {
                     return Ok(false);
                 }
                 let Some(_guard) = crate::value::structural_depth_enter() else {
-                    return Ok(false);
+                    return Err(comparison_recursion());
                 };
                 for i in 0..n {
                     // Re-borrow per element: an element's `__eq__` may touch
@@ -3339,7 +3698,7 @@ impl Interpreter {
                     let (Some(x), Some(y)) = pair else {
                         return Ok(false);
                     };
-                    if !self.cmp_op(CmpOp::Eq, &x, &y)? {
+                    if !x.same_identity(&y) && !self.cmp_op(CmpOp::Eq, &x, &y)? {
                         return Ok(false);
                     }
                 }
@@ -3353,10 +3712,10 @@ impl Interpreter {
                     return Ok(false);
                 }
                 let Some(_guard) = crate::value::structural_depth_enter() else {
-                    return Ok(false);
+                    return Err(comparison_recursion());
                 };
                 for (x, y) in a.iter().zip(b.iter()) {
-                    if !self.cmp_op(CmpOp::Eq, x, y)? {
+                    if !x.same_identity(y) && !self.cmp_op(CmpOp::Eq, x, y)? {
                         return Ok(false);
                     }
                 }
@@ -3370,7 +3729,7 @@ impl Interpreter {
                     return Ok(false);
                 }
                 let Some(_guard) = crate::value::structural_depth_enter() else {
-                    return Ok(false);
+                    return Err(comparison_recursion());
                 };
                 let pairs: Vec<(HashKey, Value)> = a
                     .borrow()
@@ -3381,7 +3740,7 @@ impl Interpreter {
                     let Some(w) = b.borrow().get(&k).cloned() else {
                         return Ok(false);
                     };
-                    if !self.cmp_op(CmpOp::Eq, &v, &w)? {
+                    if !v.same_identity(&w) && !self.cmp_op(CmpOp::Eq, &v, &w)? {
                         return Ok(false);
                     }
                 }
@@ -3481,6 +3840,43 @@ impl Interpreter {
         self.resolve_user_hash_candidates(*hash, instance, candidates)
     }
 
+    /// `set_update_internal`: add `other`'s members to `out` the way CPython
+    /// does for its type — a set or frozenset merges its table, a `dict`
+    /// adds its keys after one up-front resize, anything else is iterated
+    /// and added in order. The order of the result depends on which.
+    pub(crate) fn set_update_from(
+        &mut self,
+        out: &mut crate::pyset::PySet,
+        other: Value,
+    ) -> Result<(), Unwind> {
+        match &other {
+            Value::Set(s) => {
+                let src = s.borrow().clone();
+                out.merge(&src);
+            }
+            Value::Dict(d) => {
+                let keys: Vec<HashKey> = d.borrow().keys().cloned().collect();
+                out.update_from_dict_keys(keys.iter());
+            }
+            _ => {
+                let it = self.make_iter(other)?;
+                while let Some(x) = self.iter_next(&it)? {
+                    let k = self.hash_key(&x)?;
+                    let k = self.settle_key_in_set(out, k)?;
+                    out.insert(k);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `set(iterable)` / `frozenset(iterable)`.
+    pub(crate) fn set_from_value(&mut self, v: Value) -> Result<crate::pyset::PySet, Unwind> {
+        let mut out = crate::pyset::PySet::new();
+        self.set_update_from(&mut out, v)?;
+        Ok(out)
+    }
+
     pub fn settle_key_set(
         &mut self,
         s: &crate::value::RcSet,
@@ -3495,7 +3891,7 @@ impl Interpreter {
 
     pub fn settle_key_in_set(
         &mut self,
-        set: &std::collections::HashSet<HashKey>,
+        set: &crate::pyset::PySet,
         key: HashKey,
     ) -> Result<HashKey, Unwind> {
         let HashKey::UserHashed { hash, instance } = &key else {
@@ -3543,7 +3939,7 @@ impl Interpreter {
                 Some(n) => pyhash::small_int_hash(n),
                 None => pyhash::int_hash(&i.to_bigint()),
             },
-            Value::Float(f) => pyhash::float_hash(*f),
+            Value::FloatData(crate::value::VmFloat { value: f, .. }) => pyhash::float_hash(*f),
             Value::Complex(re, im) => pyhash::complex_hash(*re, *im),
             Value::Str(s) => pyhash::str_hash(s),
             Value::Bytes(b) => pyhash::bytes_hash(b),
@@ -3555,8 +3951,10 @@ impl Interpreter {
                 pyhash::tuple_hash(&hs)
             }
             Value::Set(s) if crate::builtins::set_is_frozen(s) => {
-                let members: Vec<Value> = crate::builtins::set_keys_no_sentinel(s)
-                    .into_iter()
+                let members: Vec<Value> = s
+                    .borrow()
+                    .iter()
+                    .cloned()
                     .map(HashKey::into_value)
                     .collect();
                 let mut hs = Vec::with_capacity(members.len());
@@ -3677,6 +4075,34 @@ impl Interpreter {
             if let Some(b) = self.cmp_dunder(op, l, r)? {
                 return Ok(b);
             }
+            // `@dataclass(order=True)`: the generated `__lt__` & co. compare
+            // the field tuples of two instances of exactly the same class.
+            if let (Value::Instance(a), Value::Instance(b)) = (l, r) {
+                if matches!(op, CmpOp::Lt | CmpOp::LtE | CmpOp::Gt | CmpOp::GtE)
+                    && Rc::ptr_eq(&a.class, &b.class)
+                {
+                    let provider = class_mro(&a.class)
+                        .find(|c| {
+                            crate::value::class_is_dataclass(c)
+                                && crate::value::class_flag(c, "__typhon_dc_order__", false)
+                        })
+                        .cloned();
+                    if let Some(provider) = provider {
+                        let fields = |inst: &Rc<Instance>| {
+                            let own = inst.fields.borrow();
+                            Value::Tuple(Rc::new(
+                                provider
+                                    .fields
+                                    .iter()
+                                    .map(|f| own.get(&f.name).cloned().unwrap_or(Value::None))
+                                    .collect(),
+                            ))
+                        };
+                        let (ta, tb) = (fields(a), fields(b));
+                        return self.cmp_op(op, &ta, &tb);
+                    }
+                }
+            }
             // Python derives `!=` from `__eq__` when `__ne__` is absent.
             if op == CmpOp::NotEq {
                 if let Some(b) = self.cmp_dunder(CmpOp::Eq, l, r)? {
@@ -3702,18 +4128,72 @@ impl Interpreter {
                 }
             }
         }
+        // A keys / items view is set-like: it compares with a set or another
+        // set-like view by containment (CPython's `dictview_richcompare`).
+        let set_view = |v: &Value| {
+            matches!(
+                v,
+                Value::DictView {
+                    kind: crate::value::DictViewKind::Keys | crate::value::DictViewKind::Items,
+                    ..
+                }
+            )
+        };
+        if (set_view(l) || set_view(r))
+            && matches!(
+                op,
+                CmpOp::Eq | CmpOp::NotEq | CmpOp::Lt | CmpOp::LtE | CmpOp::Gt | CmpOp::GtE
+            )
+        {
+            let set_like = |v: &Value| set_view(v) || matches!(v, Value::Set(_));
+            if !(set_like(l) && set_like(r)) {
+                return match op {
+                    CmpOp::Eq => Ok(false),
+                    CmpOp::NotEq => Ok(true),
+                    _ => {
+                        let sym = match op {
+                            CmpOp::Lt => "<",
+                            CmpOp::LtE => "<=",
+                            CmpOp::Gt => ">",
+                            _ => ">=",
+                        };
+                        Err(unorderable(l, sym, r))
+                    }
+                };
+            }
+            let size = |v: &Value| match v {
+                Value::Set(s) => s.borrow().len(),
+                Value::DictView { dict, .. } => dict.borrow().len(),
+                _ => 0,
+            };
+            let (na, nb) = (size(l), size(r));
+            let within = |this: &mut Self, a: &Value, b: &Value| -> Result<bool, Unwind> {
+                let it = this.make_iter(a.clone())?;
+                while let Some(x) = this.iter_next(&it)? {
+                    if !this.contains(b, &x)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            };
+            return Ok(match op {
+                CmpOp::Eq => na == nb && within(self, l, r)?,
+                CmpOp::NotEq => !(na == nb && within(self, l, r)?),
+                CmpOp::Lt => na < nb && within(self, l, r)?,
+                CmpOp::LtE => na <= nb && within(self, l, r)?,
+                CmpOp::Gt => na > nb && within(self, r, l)?,
+                _ => na >= nb && within(self, r, l)?,
+            });
+        }
         // Set comparison is *subset* / *superset*, not ordering: `{1} <= {1, 2}`
         // is True and `{1} < {1}` is False, and two sets that neither contain
         // the other compare False both ways rather than raising. `py_cmp`
         // models a total order, so sets are handled before it.
         if let (Value::Set(a), Value::Set(b)) = (l, r) {
             let (a, b) = (a.borrow(), b.borrow());
-            let frozen = crate::value::HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
-            let members = |s: &std::collections::HashSet<crate::value::HashKey>| {
-                s.iter().filter(|k| **k != frozen).count()
-            };
-            let subset = a.iter().all(|k| *k == frozen || b.contains(k));
-            let superset = b.iter().all(|k| *k == frozen || a.contains(k));
+            let members = |s: &crate::pyset::PySet| s.len();
+            let subset = a.iter().all(|k| b.contains(k));
+            let superset = b.iter().all(|k| a.contains(k));
             let (na, nb) = (members(&a), members(&b));
             return Ok(match op {
                 CmpOp::Lt => subset && na < nb,
@@ -3731,6 +4211,18 @@ impl Interpreter {
 
     fn cmp_op_non_set(&mut self, op: CmpOp, l: &Value, r: &Value) -> Result<bool, Unwind> {
         use std::cmp::Ordering::*;
+        // An ordering that came back `None` because the structural walk ran
+        // out of depth is CPython's `RecursionError`, not a type error.
+        let unorderable = |l: &Value, sym: &str, r: &Value| {
+            if crate::value::take_structural_overflow() {
+                comparison_recursion()
+            } else {
+                unorderable(l, sym, r)
+            }
+        };
+        if matches!(op, CmpOp::Lt | CmpOp::LtE | CmpOp::Gt | CmpOp::GtE) {
+            crate::value::take_structural_overflow();
+        }
         Ok(match op {
             CmpOp::Eq => self.eq_values(l, r)?,
             CmpOp::NotEq => !self.eq_values(l, r)?,
@@ -3773,7 +4265,7 @@ impl Interpreter {
             Value::List(l) => {
                 let items: Vec<Value> = l.borrow().clone();
                 for v in &items {
-                    if self.cmp_op(CmpOp::Eq, v, item)? {
+                    if v.same_identity(item) || self.cmp_op(CmpOp::Eq, v, item)? {
                         return Ok(true);
                     }
                 }
@@ -3782,29 +4274,30 @@ impl Interpreter {
             Value::Tuple(t) => {
                 let items = t.clone();
                 for v in items.iter() {
-                    if self.cmp_op(CmpOp::Eq, v, item)? {
+                    if v.same_identity(item) || self.cmp_op(CmpOp::Eq, v, item)? {
                         return Ok(true);
                     }
                 }
                 Ok(false)
             }
-            Value::Str(s) => {
-                let needle = item.py_str();
-                Ok(s.contains(&needle))
-            }
+            Value::Str(s) => match item {
+                Value::Str(needle) => Ok(s.contains(needle.as_str())),
+                // A `StrEnum` / `(str, Enum)` member is a `str`.
+                other => match crate::value::enum_mixin_value(other) {
+                    Some(Value::Str(needle)) => Ok(s.contains(needle.as_str())),
+                    _ => Err(type_error(format!(
+                        "'in <string>' requires string as left operand, not {}",
+                        other.type_display_name()
+                    ))),
+                },
+            },
             Value::Dict(d) => {
                 let key = self.dict_probe_key(d, item)?;
                 Ok(d.borrow().contains_key(&key))
             }
             Value::Set(s) => {
                 let key = self.set_probe_key(s, item)?;
-                // The synthetic `__typhon_frozen__` sentinel must not
-                // be observable via `x in s` — a literal `"…frozen…"`
-                // probe would otherwise return True on every
-                // `freeze let`-marked set.
-                if matches!(&key, HashKey::Str(name) if name.as_str() == "__typhon_frozen__") {
-                    return Ok(false);
-                }
+                // Frozen metadata lives outside user-visible container contents.
                 Ok(s.borrow().contains(&key))
             }
             Value::Range { start, stop, step } => match item {
@@ -3826,10 +4319,41 @@ impl Interpreter {
                 }
                 _ => Ok(false),
             },
-            Value::DictView { items, .. } => {
-                let items = items.clone();
+            // `k in d.keys()` is a dict lookup, and `(k, v) in d.items()` a
+            // lookup plus a value comparison — not a scan of a copy.
+            Value::DictView {
+                kind: crate::value::DictViewKind::Keys,
+                dict,
+            } => {
+                let dict = dict.clone();
+                self.contains(&Value::Dict(dict), item)
+            }
+            Value::DictView {
+                kind: crate::value::DictViewKind::Items,
+                dict,
+            } => {
+                let Value::Tuple(pair) = item else {
+                    return Ok(false);
+                };
+                if pair.len() != 2 {
+                    return Ok(false);
+                }
+                let Ok(key) = self.hash_key(&pair[0]) else {
+                    return Ok(false);
+                };
+                let key = self.settle_key_dict(dict, key)?;
+                let found = dict.borrow().get(&key).cloned();
+                match found {
+                    Some(v) => {
+                        Ok(v.same_identity(&pair[1]) || self.cmp_op(CmpOp::Eq, &v, &pair[1])?)
+                    }
+                    None => Ok(false),
+                }
+            }
+            Value::DictView { kind, dict } => {
+                let items = crate::value::view_items(*kind, dict);
                 for v in &items {
-                    if self.cmp_op(CmpOp::Eq, v, item)? {
+                    if v.same_identity(item) || self.cmp_op(CmpOp::Eq, v, item)? {
                         return Ok(true);
                     }
                 }
@@ -3839,7 +4363,7 @@ impl Interpreter {
             // up to the first match, as CPython does.
             Value::Iter(_) => {
                 while let Some(v) = self.iter_next(container)? {
-                    if self.cmp_op(CmpOp::Eq, &v, item)? {
+                    if v.same_identity(item) || self.cmp_op(CmpOp::Eq, &v, item)? {
                         return Ok(true);
                     }
                 }
@@ -3902,6 +4426,19 @@ impl Interpreter {
                     )?;
                     return Ok(res.truthy());
                 }
+                // No `__contains__`: CPython iterates — `__iter__`, else the
+                // `__getitem__` sequence protocol.
+                if self.find_method(&i.class, "__iter__").is_some()
+                    || self.find_method(&i.class, "__getitem__").is_some()
+                {
+                    let it = self.make_iter(container.clone())?;
+                    while let Some(v) = self.iter_next(&it)? {
+                        if v.same_identity(item) || self.cmp_op(CmpOp::Eq, &v, item)? {
+                            return Ok(true);
+                        }
+                    }
+                    return Ok(false);
+                }
                 Err(type_error(format!(
                     "argument of type '{}' is not iterable",
                     container.type_display_name()
@@ -3954,16 +4491,13 @@ impl Interpreter {
                 && !matches!(c.arguments.args[0], Expr::Starred(_))
             {
                 let value = self.eval_expr(&c.arguments.args[0], env)?;
-                let tp = &c.arguments.args[1];
-                if self.value_matches_cast_type(&value, tp, env) {
-                    return Ok(value);
-                }
-                return Err(type_error(format!(
-                    "as! cast failed: value of type {} does not match {}",
-                    value.type_name(),
-                    format_cast_type_display(tp),
-                )));
+                return self.checked_cast(value, &c.arguments.args[1], env);
             }
+        }
+        // `NewType(name, base)` (what `newtype X = Base` lowers to): record
+        // the base *expression* so `as! X` can check it element by element.
+        if let Some(v) = self.eval_newtype_call(c, env)? {
+            return Ok(v);
         }
         // Fast path for a method call on a user instance — `obj.method(args)`.
         // The generic path evaluates `obj.method` into an intermediate
@@ -4071,172 +4605,55 @@ impl Interpreter {
         Ok((args, kwargs))
     }
 
-    /// Structural runtime check backing `EXPR as! TYPE` in the VM — mirrors
-    /// `typhon_runtime/cast.py::_matches` so `tyc run` and `tyc build && python`
-    /// agree. `tp` is the type-descriptor AST (`int | None`, `dict[str, int]`,
-    /// `Optional[X]`, `tuple[int, ...]`, a user class, …). Conservative: any
-    /// shape it can't model (a TypeVar, an unresolvable name, an unknown
-    /// parameterised origin) is accepted, so the cast only ever rejects a value
-    /// it can prove wrong.
-    /// Match `value` against an `as!` target that has already been resolved to
-    /// a runtime value, mirroring `typhon_runtime/cast.py::_matches`.
-    ///
-    /// Two targets need more than `isinstance`:
-    ///
-    /// * An `interface` lowers to a `Protocol` subclass. Nominal
-    ///   `isinstance` can never succeed against one — the value's class chain
-    ///   does not contain the protocol — so `EXPR as! SomeInterface` always
-    ///   raised `TypeError` inside the guard, making a structurally valid cast
-    ///   to an interface impossible. Interfaces are structural by definition,
-    ///   so check for the members instead.
-    ///
-    /// * A `newtype` lowers to `typing.NewType`, which the VM models as an
-    ///   identity callable. That is not a class, so `isinstance` rejected
-    ///   *everything* — `as! SomeNewtype` could never succeed here either,
-    ///   while the compiled path (before it was fixed) accepted everything
-    ///   unchecked. The VM cannot recover the declared base from the identity
-    ///   shim, so it accepts, which is the documented rule for this matcher:
-    ///   only ever reject a value it can prove wrong.
-    fn value_matches_resolved_target(&mut self, value: &Value, target: &Value) -> bool {
-        if let Value::Native(n) = target {
-            if n.name == "NewTypeAlias" {
-                return true;
-            }
+    /// `NewType(name, base)` called directly: the newtype object, with its
+    /// base expression recorded for `as!`. `None` when `c` is another call.
+    fn eval_newtype_call(
+        &mut self,
+        c: &ast::ExprCall,
+        env: &EnvRef,
+    ) -> Result<Option<Value>, Unwind> {
+        let named = match c.func.as_ref() {
+            Expr::Name(n) => n.id.as_str() == "NewType",
+            Expr::Attribute(a) => a.attr.as_str() == "NewType",
+            _ => false,
+        };
+        if !named || c.arguments.args.len() != 2 || !c.arguments.keywords.is_empty() {
+            return Ok(None);
         }
-        if let Value::Class(cls) = target {
-            if class_is_protocol(cls) {
-                let names: Vec<String> = cls.methods.borrow().keys().cloned().collect();
-                return names
-                    .iter()
-                    .all(|m| self.get_attr(value, m.as_str()).is_ok());
-            }
+        if c.arguments
+            .args
+            .iter()
+            .any(|a| matches!(a, Expr::Starred(_)))
+        {
+            return Ok(None);
         }
-        crate::builtins::is_instance_of(value, target)
-    }
-
-    fn value_matches_cast_type(&mut self, value: &Value, tp: &Expr, env: &EnvRef) -> bool {
-        match tp {
-            Expr::NoneLiteral(_) => matches!(value, Value::None),
-            Expr::Name(n) => match n.id.as_str() {
-                "Any" | "object" => true,
-                "None" => matches!(value, Value::None),
-                // `isinstance(value, int)` is `True` for `bool` (bool ⊆ int).
-                "int" => matches!(value, Value::Int(_) | Value::Bool(_)),
-                // Typhon/CPython widen int (and bool) into a float/complex target.
-                "float" => matches!(value, Value::Int(_) | Value::Float(_) | Value::Bool(_)),
-                "complex" => {
-                    matches!(
-                        value,
-                        Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Complex(..)
-                    )
-                }
-                "bool" => matches!(value, Value::Bool(_)),
-                "str" => matches!(value, Value::Str(_)),
-                "bytes" => matches!(value, Value::Bytes(_)),
-                // User class / unknown — resolve the name and use isinstance;
-                // be permissive when it can't be resolved in the VM env.
-                _ => match self.eval_expr(tp, env) {
-                    Ok(cls) => self.value_matches_resolved_target(value, &cls),
-                    Err(_) => true,
+        let func = self.eval_expr(&c.func, env)?;
+        if !matches!(&func, Value::Native(n) if n.name == "NewType") {
+            return Ok(None);
+        }
+        let name = self.eval_expr(&c.arguments.args[0], env)?;
+        // The VM has no runtime generic aliases (`list[int]` does not
+        // evaluate); such a base is kept as its annotation text, and `as!`
+        // checks the recorded expression.
+        let base = match self.eval_expr(&c.arguments.args[1], env) {
+            Ok(v) => v,
+            Err(_) => Value::Str(Rc::new(format_cast_type(&c.arguments.args[1]))),
+        };
+        let module = env
+            .module_scope()
+            .get("__name__")
+            .unwrap_or(Value::Str(Rc::new("__main__".into())));
+        let obj = crate::builtins::new_newtype(self, name, base, module)?;
+        if let Value::Instance(inst) = &obj {
+            self.newtype_defs.insert(
+                Rc::as_ptr(inst) as *const () as usize,
+                cast::NewTypeDef {
+                    base: Rc::new(c.arguments.args[1].clone()),
+                    env: env.clone(),
                 },
-            },
-            Expr::Attribute(_) => match self.eval_expr(tp, env) {
-                Ok(cls) => self.value_matches_resolved_target(value, &cls),
-                Err(_) => true,
-            },
-            Expr::BinOp(b) if matches!(b.op, Operator::BitOr) => {
-                self.value_matches_cast_type(value, &b.left, env)
-                    || self.value_matches_cast_type(value, &b.right, env)
-            }
-            Expr::Subscript(s) => {
-                let base = match s.value.as_ref() {
-                    Expr::Name(n) => n.id.as_str().to_owned(),
-                    Expr::Attribute(a) => a.attr.as_str().to_owned(),
-                    _ => return true,
-                };
-                let args: Vec<&Expr> = match s.slice.as_ref() {
-                    Expr::Tuple(t) => t.elts.iter().collect(),
-                    other => vec![other],
-                };
-                match base.as_str() {
-                    "Optional" => {
-                        matches!(value, Value::None)
-                            || args
-                                .first()
-                                .is_none_or(|a| self.value_matches_cast_type(value, a, env))
-                    }
-                    "Union" => args
-                        .iter()
-                        .any(|a| self.value_matches_cast_type(value, a, env)),
-                    "list" => match value {
-                        Value::List(l) => {
-                            let Some(elt) = args.first() else { return true };
-                            let items: Vec<Value> = l.borrow().iter().cloned().collect();
-                            items
-                                .iter()
-                                .all(|item| self.value_matches_cast_type(item, elt, env))
-                        }
-                        _ => false,
-                    },
-                    "set" | "frozenset" => match value {
-                        Value::Set(set) => {
-                            let Some(elt) = args.first() else { return true };
-                            let items: Vec<Value> = set
-                                .borrow()
-                                .iter()
-                                .map(|k| k.clone().into_value())
-                                .collect();
-                            items
-                                .iter()
-                                .all(|item| self.value_matches_cast_type(item, elt, env))
-                        }
-                        _ => false,
-                    },
-                    "dict" => match value {
-                        Value::Dict(d) => {
-                            if args.len() != 2 {
-                                return true;
-                            }
-                            let pairs: Vec<(Value, Value)> = d
-                                .borrow()
-                                .iter()
-                                .map(|(k, v)| (k.clone().into_value(), v.clone()))
-                                .collect();
-                            pairs.iter().all(|(k, v)| {
-                                self.value_matches_cast_type(k, args[0], env)
-                                    && self.value_matches_cast_type(v, args[1], env)
-                            })
-                        }
-                        _ => false,
-                    },
-                    "tuple" => match value {
-                        Value::Tuple(t) => {
-                            let items: Vec<Value> = t.iter().cloned().collect();
-                            // `tuple[X, ...]` — homogeneous, any length.
-                            if args.len() == 2 && matches!(args[1], Expr::EllipsisLiteral(_)) {
-                                return items
-                                    .iter()
-                                    .all(|item| self.value_matches_cast_type(item, args[0], env));
-                            }
-                            if args.len() != items.len() {
-                                return false;
-                            }
-                            items
-                                .iter()
-                                .zip(args.iter())
-                                .all(|(item, a)| self.value_matches_cast_type(item, a, env))
-                        }
-                        _ => false,
-                    },
-                    // Unknown parameterised origin (collections.abc.*, etc.) —
-                    // beyond what we model; accept.
-                    _ => true,
-                }
-            }
-            // Anything else (a literal, a call, …) isn't a shape we can check —
-            // be permissive.
-            _ => true,
+            );
         }
+        Ok(Some(obj))
     }
 
     /// Recognise an expression that is a call to `super(...)`. Returns that
@@ -4252,6 +4669,120 @@ impl Interpreter {
         None
     }
 
+    /// The `(class to search above, bound object)` pair a `super(...)` call
+    /// denotes: the in-flight method frame for zero-arg `super()`, or the
+    /// explicit `super(Cls, obj)`.
+    fn super_target(
+        &mut self,
+        sup: &ast::ExprCall,
+        env: &EnvRef,
+    ) -> Result<(Rc<Class>, Value), Unwind> {
+        if sup.arguments.args.is_empty() {
+            return self
+                .method_stack
+                .last()
+                .cloned()
+                .ok_or_else(|| type_error("super(): no arguments and no enclosing method"));
+        }
+        // Any arity but 0 or 2 is a `TypeError` in CPython (`super(A, b, c)`).
+        if sup.arguments.args.len() != 2 {
+            return Err(type_error("super() takes 0 or 2 arguments"));
+        }
+        let cls_v = self.eval_expr(&sup.arguments.args[0], env)?;
+        let obj_v = self.eval_expr(&sup.arguments.args[1], env)?;
+        match cls_v {
+            Value::Class(c) => Ok((c, obj_v)),
+            _ => Err(type_error("super() argument 1 must be a class")),
+        }
+    }
+
+    /// The binding `super(owner, obj).attr` resolves to: the first class
+    /// *after* `owner` in the MRO of `obj`'s type (of `obj` itself when it
+    /// is a class — `super()` inside a classmethod) whose own namespace binds
+    /// `attr`. That is what makes a cooperative diamond run every
+    /// `__init__` once, in C3 order.
+    fn super_lookup(
+        &self,
+        owner: &Rc<Class>,
+        obj: &Value,
+        attr: &str,
+    ) -> Option<(Rc<Class>, ClassMember)> {
+        let ty = match obj {
+            Value::Instance(i) => i.class.clone(),
+            Value::Class(c) => c.clone(),
+            _ => owner.clone(),
+        };
+        let mro: Vec<Rc<Class>> = if class_mro(&ty).any(|c| Rc::ptr_eq(c, owner)) {
+            class_mro(&ty)
+                .skip_while(|c| !Rc::ptr_eq(c, owner))
+                .skip(1)
+                .cloned()
+                .collect()
+        } else {
+            owner.mro.clone()
+        };
+        for c in &mro {
+            if let Some(m) = c.methods.borrow().get(attr) {
+                return Some((c.clone(), ClassMember::Method(m.clone())));
+            }
+            if attr.starts_with("__typhon_") {
+                continue;
+            }
+            if let Some(v) = c.class_attrs.borrow().get(attr) {
+                return Some((c.clone(), ClassMember::Attr(v.clone())));
+            }
+        }
+        None
+    }
+
+    /// `super().attr` read as a value (not called): a bound method, the
+    /// class attribute itself, or a property's value.
+    fn eval_super_attr(
+        &mut self,
+        sup: &ast::ExprCall,
+        attr: &str,
+        env: &EnvRef,
+    ) -> Result<Value, Unwind> {
+        let (owner, self_val) = self.super_target(sup, env)?;
+        let Some((found_in, member)) = self.super_lookup(&owner, &self_val, attr) else {
+            return Err(attribute_error(format!(
+                "'super' object has no attribute '{attr}'"
+            )));
+        };
+        match member {
+            ClassMember::Method(m) | ClassMember::Attr(Value::Function(m)) => {
+                if found_in.properties.borrow().contains(attr)
+                    && matches!(self_val, Value::Instance(_))
+                {
+                    return self.call_method_with_frame(&m, found_in, self_val, vec![], &[]);
+                }
+                if m.is_static {
+                    return Ok(Value::Function(m));
+                }
+                let receiver = if m.is_classmethod || found_in.classmethods.borrow().contains(attr)
+                {
+                    match &self_val {
+                        Value::Instance(i) => Value::Class(i.class.clone()),
+                        other => other.clone(),
+                    }
+                } else {
+                    self_val
+                };
+                Ok(Value::BoundMethod {
+                    receiver: Box::new(receiver),
+                    function: m,
+                })
+            }
+            ClassMember::Attr(v) => {
+                let instance = matches!(self_val, Value::Instance(_)).then(|| self_val.clone());
+                match self.descriptor_get(&v, instance, &found_in)? {
+                    Some(bound) => Ok(bound),
+                    None => Ok(v),
+                }
+            }
+        }
+    }
+
     /// Resolve `super(...).attr(args)`. Supports zero-arg `super()` (uses the
     /// in-flight method frame) and two-arg `super(Cls, self)`.
     fn eval_super_method_call(
@@ -4261,114 +4792,94 @@ impl Interpreter {
         outer: &ast::ExprCall,
         env: &EnvRef,
     ) -> Result<Value, Unwind> {
-        // Determine the class to search *above* and the bound `self`.
-        let (start_class, self_val) = if sup.arguments.args.is_empty() {
-            // Zero-arg: pull from the current method frame.
-            self.method_stack
-                .last()
-                .cloned()
-                .ok_or_else(|| type_error("super(): no arguments and no enclosing method"))?
-        } else {
-            // Two-arg form `super(Cls, obj)`. Any other arity is a `TypeError`
-            // in CPython (`super(A, b, c)`); reject it rather than silently
-            // ignoring the extra arguments.
-            if sup.arguments.args.len() != 2 {
-                return Err(type_error("super() takes 0 or 2 arguments"));
+        let (start_class, self_val) = self.super_target(sup, env)?;
+        let found = self.super_lookup(&start_class, &self_val, attr);
+        let (owner, method) = match found {
+            Some((owner, ClassMember::Method(m))) => (owner, m),
+            Some((owner, ClassMember::Attr(Value::Function(m)))) => (owner, m),
+            Some((_, ClassMember::Attr(_))) => {
+                // A non-function class attribute: read it, then call it.
+                let callee = self.eval_super_attr(sup, attr, env)?;
+                let (args, kwargs) = self.eval_call_args(outer, env)?;
+                return self.call_value(callee, args, &kwargs);
             }
-            let cls_v = self.eval_expr(&sup.arguments.args[0], env)?;
-            let obj_v = self.eval_expr(&sup.arguments.args[1], env)?;
-            match cls_v {
-                Value::Class(c) => (c, obj_v),
-                _ => return Err(type_error("super() argument 1 must be a class")),
-            }
-        };
-
-        // Resolve the method starting from the bases of `start_class`.
-        let method = start_class
-            .bases
-            .iter()
-            .find_map(|b| self.find_method(b, attr));
-        let Some(method) = method else {
-            // `super().__init__()` against a base with no such method (e.g.
-            // the implicit `object`) is a no-op, matching CPython for the
-            // synthesised dataclass constructors.
-            if attr == "__init__" {
-                // …except on an exception instance: `BaseException.__init__`
-                // stashes its positional args as `.args`, which drives
-                // `str(e)`/`repr(e)`. The builtin base has no `Value::Class`,
-                // so capture the message here so a hand-written
-                // `super().__init__(f"…")` is reflected by `str(e)`.
-                if let Value::Instance(inst) = &self_val {
-                    if inst.class.is_exception {
-                        let mut exc_args = Vec::with_capacity(outer.arguments.args.len());
-                        for arg in outer.arguments.args.iter() {
-                            if let Expr::Starred(s) = arg {
-                                let v = self.eval_expr(&s.value, env)?;
-                                let it = self.make_iter(v)?;
-                                while let Some(x) = self.iter_next(&it)? {
-                                    exc_args.push(x);
-                                }
-                            } else {
-                                exc_args.push(self.eval_expr(arg, env)?);
-                            }
-                        }
-                        inst.fields
-                            .borrow_mut()
-                            .insert("args".to_owned(), Value::Tuple(Rc::new(exc_args)));
+            None => {
+                // `object.__init_subclass__` — the end of a cooperative
+                // `super().__init_subclass__(**kw)` chain — accepts no
+                // keyword arguments and does nothing.
+                if attr == "__init_subclass__" {
+                    let (_, kwargs) = self.eval_call_args(outer, env)?;
+                    if !kwargs.is_empty() {
+                        let name = match &self_val {
+                            Value::Class(c) => c.name.clone(),
+                            Value::Instance(i) => i.class.name.clone(),
+                            _ => "object".to_owned(),
+                        };
+                        return Err(type_error(format!(
+                            "{name}.__init_subclass__() takes no keyword arguments"
+                        )));
                     }
+                    return Ok(Value::None);
                 }
-                return Ok(Value::None);
+                // `super().__init__()` against a base with no such method
+                // (e.g. the implicit `object`) is a no-op, matching CPython
+                // for the synthesised dataclass constructors.
+                if attr == "__init__" {
+                    // …except on an exception instance: `BaseException.__init__`
+                    // stashes its positional args as `.args`, which drives
+                    // `str(e)`/`repr(e)`. The builtin base has no
+                    // `Value::Class`, so capture the message here so a
+                    // hand-written `super().__init__(f"…")` is reflected by
+                    // `str(e)`.
+                    if let Value::Instance(inst) = &self_val {
+                        if inst.class.is_exception {
+                            let (exc_args, _) = self.eval_call_args(outer, env)?;
+                            inst.fields
+                                .borrow_mut()
+                                .insert("args".to_owned(), Value::Tuple(Rc::new(exc_args)));
+                        }
+                    }
+                    return Ok(Value::None);
+                }
+                return Err(attribute_error(format!(
+                    "'super' object has no attribute '{}'",
+                    attr
+                )));
             }
-            return Err(attribute_error(format!(
-                "'super' object has no attribute '{}'",
-                attr
-            )));
         };
-
-        // Evaluate the call arguments.
-        let mut args = Vec::with_capacity(outer.arguments.args.len());
-        for arg in outer.arguments.args.iter() {
-            if let Expr::Starred(s) = arg {
-                let v = self.eval_expr(&s.value, env)?;
-                let iter = self.make_iter(v)?;
-                while let Some(x) = self.iter_next(&iter)? {
-                    args.push(x);
-                }
-            } else {
-                args.push(self.eval_expr(arg, env)?);
-            }
+        let (args, kwargs) = self.eval_call_args(outer, env)?;
+        if method.is_static {
+            return self.call_function(&method, args, &kwargs, None);
         }
-        let mut kwargs: Vec<(String, Value)> = Vec::with_capacity(outer.arguments.keywords.len());
-        for kw in outer.arguments.keywords.iter() {
-            if let Some(name) = &kw.arg {
-                kwargs.push((name.as_str().to_owned(), self.eval_expr(&kw.value, env)?));
+        let receiver = if method.is_classmethod || owner.classmethods.borrow().contains(attr) {
+            match &self_val {
+                Value::Instance(i) => Value::Class(i.class.clone()),
+                other => other.clone(),
             }
-        }
-
-        // Find the class that actually owns `method` so a chained
-        // `super()` inside it resolves the *next* level up, not itself.
-        let owner = start_class
-            .bases
-            .iter()
-            .find_map(|b| self.method_owner(b, &method))
-            .unwrap_or_else(|| start_class.clone());
-        self.call_method_with_frame(&method, owner, self_val, args, &kwargs)
+        } else {
+            self_val
+        };
+        // The frame names the class that owns `method`, so a chained
+        // `super()` inside it resolves the *next* class in the MRO.
+        self.call_method_with_frame(&method, owner, receiver, args, &kwargs)
     }
 
-    /// Walk `class`'s MRO and return the class whose method table holds
-    /// `func` (by pointer identity).
+    /// The class in `class`'s MRO whose own namespace holds `func` (by
+    /// pointer identity) — the class a method was defined on.
     fn method_owner(&self, class: &Rc<Class>, func: &Rc<Function>) -> Option<Rc<Class>> {
-        if let Some(m) = class.methods.borrow().get(&func.name) {
-            if Rc::ptr_eq(m, func) {
-                return Some(class.clone());
-            }
-        }
-        for base in &class.bases {
-            if let Some(c) = self.method_owner(base, func) {
-                return Some(c);
-            }
-        }
-        None
+        class_mro(class)
+            .find(|c| {
+                c.methods
+                    .borrow()
+                    .get(&func.name)
+                    .is_some_and(|m| Rc::ptr_eq(m, func))
+                    || c.methods.borrow().values().any(|m| Rc::ptr_eq(m, func))
+                    || c.class_attrs
+                        .borrow()
+                        .values()
+                        .any(|v| matches!(v, Value::Function(f) if Rc::ptr_eq(f, func)))
+            })
+            .cloned()
     }
 
     /// Call `method` bound to `self_val`, pushing a `(owner, self)` frame so
@@ -4454,6 +4965,9 @@ impl Interpreter {
                 // bound to the class object) skip the frame.
                 let owner = match receiver.as_ref() {
                     Value::Instance(inst) => self.method_owner(&inst.class, &function),
+                    // A classmethod bound to its class: `super()` inside it
+                    // climbs that class's MRO.
+                    Value::Class(cls) => self.method_owner(cls, &function),
                     _ => None,
                 };
                 if let Some(owner) = owner {
@@ -4526,7 +5040,7 @@ impl Interpreter {
         kwargs: &[(String, Value)],
         receiver: Option<Value>,
     ) -> Result<Value, Unwind> {
-        if self.stack_depth >= self.max_stack_depth {
+        if self.recursion_exhausted() {
             return Err(Unwind::Exception(VmException::new(
                 "RecursionError",
                 "maximum recursion depth exceeded",
@@ -4543,6 +5057,7 @@ impl Interpreter {
         // def-time captures) to its own file, not the caller's.
         let caller_offset = self.current_offset;
         let caller_source = self.current_source.clone();
+        let caller_function = self.current_function.replace(f.clone());
         if f.source.is_some() {
             self.current_source = f.source.clone();
         }
@@ -4621,6 +5136,7 @@ impl Interpreter {
         };
         self.current_offset = caller_offset;
         self.current_source = caller_source;
+        self.current_function = caller_function;
         result
     }
 
@@ -4736,11 +5252,14 @@ impl Interpreter {
         }
 
         if let Some(kw) = &params.kwarg {
-            let mut map: DictMap = IndexMap::new();
+            let mut map: DictMap = DictMap::new();
             for (k, v) in kwargs_left.drain(..) {
                 map.insert(HashKey::Str(Rc::new(k)), v);
             }
-            env.set(kw.name.as_str(), Value::Dict(Rc::new(RefCell::new(map))));
+            env.set(
+                kw.name.as_str(),
+                Value::Dict(Rc::new(crate::value::FrozenCell::new(map))),
+            );
         } else if !kwargs_left.is_empty() {
             let names: Vec<String> = kwargs_left.keys().cloned().collect();
             return Err(type_error(format!(
@@ -4762,6 +5281,18 @@ impl Interpreter {
         // `Color(2)` → the member whose value is 2 (CPython semantics).
         if Self::is_enum_class(class) {
             return self.enum_lookup_by_value(class, args, kwargs);
+        }
+        if class.class_attrs.borrow().contains_key("__typhon_abc__") {
+            let missing = abstract_methods(class);
+            if !missing.is_empty() {
+                let quoted: Vec<String> = missing.iter().map(|m| format!("'{m}'")).collect();
+                return Err(type_error(format!(
+                    "Can't instantiate abstract class {} without an implementation for abstract method{} {}",
+                    class.name,
+                    if missing.len() == 1 { "" } else { "s" },
+                    quoted.join(", ")
+                )));
+            }
         }
         // `class User(TypedDict)` is a dict factory, not a class: CPython's
         // metaclass returns a plain `dict` from the call, so `u["name"]`
@@ -4797,7 +5328,7 @@ impl Interpreter {
             for (k, v) in kwargs {
                 map.insert(crate::value::HashKey::Str(Rc::new(k.clone())), v.clone());
             }
-            return Ok(Value::Dict(Rc::new(RefCell::new(map))));
+            return Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(map))));
         }
         // Field-less exception subclass with no user/synthesised `__init__`:
         // behave like `BaseException`. Accept the positional args, stash them
@@ -4843,25 +5374,18 @@ impl Interpreter {
         // snapshotting it into the instance would freeze an unbound copy.
         // Likewise skip an object whose type defines `__get__` — a
         // descriptor (`functools.partialmethod`, a hand-written one): it is
-        // read through the class so `__get__` sees the instance, and a
-        // per-instance assignment of the same name still wins.
-        let class_attrs: Vec<(String, Value)> = class
-            .class_attrs
-            .borrow()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        for (k, v) in class_attrs {
-            if k.starts_with("__typhon_") || matches!(v, Value::Function(_)) {
-                continue;
-            }
-            if let Value::Instance(d) = &v {
-                if self.find_method(&d.class, "__get__").is_some() {
-                    continue;
-                }
-            }
-            instance.fields.borrow_mut().insert(k, v);
-        }
+        // Class attributes are NOT copied onto the instance: CPython resolves
+        // them at read time (`instance.attr` -> instance dict -> class -> MRO),
+        // so `Counter.instances += 1` in `__init__` is visible through an
+        // already-built instance. Copying them here snapshotted the value at
+        // construction and made `Counter.instances` and `c.instances` disagree
+        // (W5-06). `class_attr` reads fall back to the class at :6534, which
+        // covers constants, `ClassVar`s and extension methods; a later
+        // per-instance assignment still wins because it lands in `fields`.
+        //
+        // The exception is data descriptors: a class attribute that defines
+        // `__get__`/`__set__` (a `property`) must stay on the class so the
+        // descriptor protocol runs on every access.
         // Custom __init__ wins.
         if let Some(init) = self.find_method(class, "__init__") {
             self.call_function(&init, args, kwargs, Some(Value::Instance(instance.clone())))?;
@@ -5005,26 +5529,26 @@ impl Interpreter {
     }
 
     pub fn find_method(&self, class: &Rc<Class>, name: &str) -> Option<Rc<Function>> {
-        // Fast path: the class's own table. `build_class` flattens inherited
-        // methods down into every subclass, so a normal method (own or
-        // inherited-at-build-time) resolves here in a single probe with no
-        // base-chain walk and no cache overhead — the hot case.
+        // Fast path: the class's own method table — the class itself is the
+        // head of its MRO, so an own method always wins.
         if let Some(m) = class.methods.borrow().get(name) {
             return Some(m.clone());
         }
-        // Miss on the own table: either a genuine negative (a dunder probe like
-        // `__enter__` / `__add__` that most classes lack) or a method added to
-        // a *base* after this class was built. Both otherwise re-walk the whole
-        // base chain on every call, so memoise the resolution here — including
-        // the negative. Cleared wholesale on any impl-merge (see `method_cache`),
-        // which also covers a base gaining a method.
+        // Otherwise walk the MRO, memoising the resolution — including the
+        // negative (a dunder probe like `__enter__` / `__add__` that most
+        // classes lack). Cleared wholesale whenever a class namespace gains,
+        // loses or re-binds a function-valued name (see `method_cache`).
         let cid = Rc::as_ptr(class) as usize;
         if let Some(inner) = self.method_cache.borrow().get(&cid) {
             if let Some(hit) = inner.get(name) {
                 return hit.clone();
             }
         }
-        let resolved = self.resolve_via_bases(class, name);
+        let resolved = match lookup_class_member(class, name) {
+            Some((_, ClassMember::Method(m))) => Some(m),
+            Some((_, ClassMember::Attr(Value::Function(f)))) => Some(f),
+            _ => None,
+        };
         self.method_cache
             .borrow_mut()
             .entry(cid)
@@ -5033,20 +5557,11 @@ impl Interpreter {
         resolved
     }
 
-    /// Resolve `name` through `class`'s base chain only (the own table has
-    /// already been probed by [`find_method`]). Each base's own table is
-    /// likewise base-flattened, so this recurses only for methods added to a
-    /// base after `class` was built.
-    fn resolve_via_bases(&self, class: &Rc<Class>, name: &str) -> Option<Rc<Function>> {
-        for base in &class.bases {
-            if let Some(m) = base.methods.borrow().get(name) {
-                return Some(m.clone());
-            }
-            if let Some(m) = self.resolve_via_bases(base, name) {
-                return Some(m);
-            }
-        }
-        None
+    /// Forget every memoised method resolution — called when a class
+    /// namespace changes in a way that can alter one (a new name, a removed
+    /// name, or a function-valued binding replaced).
+    pub(crate) fn invalidate_method_cache(&self) {
+        self.method_cache.borrow_mut().clear();
     }
 
     /// Drive an awaitable to its value. A `Coroutine` thunk runs its body
@@ -5066,10 +5581,11 @@ impl Interpreter {
         match &v {
             Value::Coroutine(_) => self.force_awaitable(v),
             Value::Module(m) if m.name == "Task" => self.force_awaitable(v),
-            // An `__await__`-bearing object is awaitable in CPython. The VM
-            // models no `__await__` protocol, so such an object passes
-            // through as it always did rather than being rejected.
-            Value::Instance(inst) if self.find_method(&inst.class, "__await__").is_some() => Ok(v),
+            // An `__await__`-bearing object: driven to its result (see
+            // `force_awaitable`).
+            Value::Instance(inst) if self.find_method(&inst.class, "__await__").is_some() => {
+                self.force_awaitable(v)
+            }
             other => Err(type_error(format!(
                 "object {} can't be used in 'await' expression",
                 await_type_name(other)
@@ -5108,6 +5624,26 @@ impl Interpreter {
                     return Err(self.value_to_exception(err));
                 }
                 Ok(result.unwrap_or(Value::None))
+            }
+            // An awaitable object: `__await__()` returns an iterator whose
+            // `return` value is the result. The VM's scheduler is
+            // sequential, so whatever it yields is simply run past.
+            Value::Instance(ref inst) if self.find_method(&inst.class, "__await__").is_some() => {
+                let it = self.call_dunder0(&v, "__await__")?.unwrap_or(Value::None);
+                let is_iterator = match &it {
+                    Value::Iter(_) => true,
+                    Value::Instance(i) => self.find_method(&i.class, "__next__").is_some(),
+                    _ => false,
+                };
+                if !is_iterator {
+                    return Err(type_error(format!(
+                        "__await__() returned non-iterator of type '{}'",
+                        it.type_display_name()
+                    )));
+                }
+                let it = self.make_iter(it)?;
+                while self.iter_next(&it)?.is_some() {}
+                Ok(generator_return_value(&it).unwrap_or(Value::None))
             }
             other => Ok(other),
         }
@@ -5173,6 +5709,9 @@ impl Interpreter {
     /// container delegates to `repr_of` (which recurses through user dunders
     /// on each element). Scalars keep their dedicated `__str__` path.
     pub fn str_of(&mut self, v: &Value) -> Result<String, Unwind> {
+        if let Value::Int(n) = v {
+            crate::limits::check_int_to_str(n)?;
+        }
         if let Some(s) = self.enum_member_repr(v) {
             return Ok(s);
         }
@@ -5209,20 +5748,12 @@ impl Interpreter {
     /// `Path.iterdir`.
     fn defining_class_name(&self, receiver: &Value, function: &Rc<Function>) -> Option<String> {
         fn walk(class: &Rc<Class>, function: &Rc<Function>) -> Option<String> {
-            // Depth-first through the bases first: the *most general* class
-            // that still defines this exact function is the one CPython
-            // names, since the derived class inherited it from there.
-            for base in &class.bases {
-                if let Some(found) = walk(base, function) {
-                    return Some(found);
-                }
-            }
-            let own = class
-                .methods
-                .borrow()
-                .values()
-                .any(|m| Rc::ptr_eq(m, function));
-            own.then(|| class.name.clone())
+            // The first class in the MRO whose own namespace holds this exact
+            // function is where it was defined (an inherited method lives
+            // only on its defining class).
+            class_mro(class)
+                .find(|c| c.methods.borrow().values().any(|m| Rc::ptr_eq(m, function)))
+                .map(|c| c.name.clone())
         }
         match receiver {
             Value::Instance(i) => walk(&i.class, function),
@@ -5244,9 +5775,9 @@ impl Interpreter {
     /// via `repr_of` (so user `__repr__` dunders dispatch on elements), with
     /// EXACT CPython formatting replicated from `Value::py_str`. Scalars and
     /// every other `Value` kind delegate to the existing dunder / `py_repr`
-    /// path unchanged. The depth cap falls back to `[...]` (CPython prints
-    /// the same for direct self-reference) so self-referential containers
-    /// don't blow the stack.
+    /// path unchanged. A list or dict met again inside itself renders as
+    /// `[...]` / `{...}` (CPython's `Py_ReprEnter`); nesting deeper than
+    /// CPython's C recursion budget raises its `RecursionError`.
     fn repr_of_depth(&mut self, v: &Value, depth: usize) -> Result<String, Unwind> {
         self.repr_of_depth_inner(v, depth, false)
     }
@@ -5260,18 +5791,39 @@ impl Interpreter {
         depth: usize,
         unwrap_frozen: bool,
     ) -> Result<String, Unwind> {
-        const MAX_REPR_DEPTH: usize = 100;
-        if depth >= MAX_REPR_DEPTH {
-            // CPython renders a self-referential container with a kind-specific
-            // ellipsis: `[...]` for lists, `{...}` for dicts/sets, `(...)` for
-            // tuples.
-            return Ok(match v {
-                Value::Tuple(_) => "(...)",
-                Value::Dict(_) | Value::Set(_) => "{...}",
-                _ => "[...]",
-            }
-            .to_string());
+        // `PyObject_Repr`'s `Py_EnterRecursiveCall`: CPython 3.13's C
+        // budget runs out at this nesting depth below a module-level `repr`.
+        const MAX_REPR_DEPTH: usize = 9998;
+        if depth >= MAX_REPR_DEPTH
+            || (self.stack_floor != 0 && crate::stack::stack_pointer() < self.stack_floor)
+        {
+            return Err(Unwind::Exception(VmException::new(
+                "RecursionError",
+                "maximum recursion depth exceeded while getting the repr of an object",
+            )));
         }
+        let active = match v {
+            Value::List(l) => Some((Rc::as_ptr(l) as *const () as usize, "[...]")),
+            Value::Dict(d) => Some((Rc::as_ptr(d) as *const () as usize, "{...}")),
+            _ => None,
+        };
+        if let Some((addr, placeholder)) = active {
+            if !self.repr_active.insert(addr) {
+                return Ok(placeholder.to_owned());
+            }
+            let out = self.repr_container(v, depth, unwrap_frozen);
+            self.repr_active.remove(&addr);
+            return out;
+        }
+        self.repr_container(v, depth, unwrap_frozen)
+    }
+
+    fn repr_container(
+        &mut self,
+        v: &Value,
+        depth: usize,
+        unwrap_frozen: bool,
+    ) -> Result<String, Unwind> {
         match v {
             // `<bound method Path.iterdir of PosixPath('/t')>` — the class
             // the method is *defined* on, and the receiver's own repr
@@ -5325,16 +5877,11 @@ impl Interpreter {
                 Ok(s)
             }
             Value::Dict(d) => {
-                let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
-                let is_frozen = matches!(d.borrow().get(&frozen_key), Some(Value::Bool(true)));
-                // Snapshot (key, value) pairs, filtering the synthetic
-                // `__typhon_frozen__` sentinel, before recursing.
+                let is_frozen = d.frozen.get();
+                // Frozen metadata lives outside user-visible container contents.
                 let pairs: Vec<(HashKey, Value)> = d
                     .borrow()
                     .iter()
-                    .filter(|(k, _)| {
-                        !matches!(k, HashKey::Str(name) if name.as_str() == "__typhon_frozen__")
-                    })
                     .map(|(k, val)| (k.clone(), val.clone()))
                     .collect();
                 let wrap = is_frozen && !unwrap_frozen;
@@ -5360,18 +5907,9 @@ impl Interpreter {
                 Ok(s)
             }
             Value::Set(set) => {
-                let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
-                let is_frozen = set.borrow().contains(&frozen_key);
-                // Match `Value::py_str`'s ordering EXACTLY: sort by the
-                // collision-safe `canonical_sort_key` so the repr is stable
-                // and matches CPython for all-numeric / all-string cases.
-                let mut keys: Vec<HashKey> = set
-                    .borrow()
-                    .iter()
-                    .filter(|k| **k != frozen_key)
-                    .cloned()
-                    .collect();
-                keys.sort_by_key(|k| k.canonical_sort_key());
+                let is_frozen = set.frozen.get();
+                // CPython's iteration order (see `pyset`), as `py_str`.
+                let keys: Vec<HashKey> = set.borrow().iter().cloned().collect();
                 if keys.is_empty() {
                     return Ok(if is_frozen {
                         "frozenset()".to_string()
@@ -5393,6 +5931,9 @@ impl Interpreter {
             // Scalars, instances (incl. enum members → `instance_repr`),
             // Result Ok/Err, etc. keep the existing dunder / `py_repr` path.
             _ => {
+                if let Value::Int(n) = v {
+                    crate::limits::check_int_to_str(n)?;
+                }
                 if let Some(r) = self.call_dunder0(v, "__repr__")? {
                     return require_str_return(r, "__repr__");
                 }
@@ -5412,11 +5953,11 @@ impl Interpreter {
                 if items.is_empty() {
                     return Ok("frozenset()".to_string());
                 }
-                // Match `Value::py_str` set ordering: sort by canonical key.
-                let mut sorted: Vec<HashKey> = items.iter().cloned().collect();
-                sorted.sort_by_key(|k| k.canonical_sort_key());
-                let mut parts: Vec<String> = Vec::with_capacity(sorted.len());
-                for inner in &sorted {
+                // The members in the frozenset's own iteration order.
+                let rebuilt: crate::pyset::PySet = items.iter().cloned().collect();
+                let ordered: Vec<HashKey> = rebuilt.iter().cloned().collect();
+                let mut parts: Vec<String> = Vec::with_capacity(ordered.len());
+                for inner in &ordered {
                     parts.push(self.repr_hashkey(inner, depth + 1)?);
                 }
                 Ok(format!("frozenset({{{}}})", parts.join(", ")))
@@ -5434,8 +5975,10 @@ impl Interpreter {
         // Value-mixin members (`StrEnum` / `IntEnum` / `IntFlag`) stringify
         // through their value in CPython 3.11+ — `print(Status.ACTIVE)`
         // shows `active`, `print(Level.HIGH)` shows `2`.
-        if let Some(value) = crate::value::enum_mixin_value(v) {
-            return Some(value.py_str());
+        if crate::value::enum_str_is_value(v) {
+            if let Some(value) = crate::value::enum_mixin_value(v) {
+                return Some(value.py_str());
+            }
         }
         if let Value::Instance(i) = v {
             if let Some(Value::Str(name)) = i.fields.borrow().get("_name_") {
@@ -5462,7 +6005,7 @@ impl Interpreter {
             (Int(a), Sub, Int(b)) => return Ok(Int(a.sub(b))),
             (Int(a), Mult, Int(b)) => return Ok(Int(a.mul(b))),
             (Int(_), Div, Int(b)) if b.is_zero() => return Err(zero_division()),
-            (Int(a), Div, Int(b)) => return Ok(Float(a.to_f64() / b.to_f64())),
+            (Int(a), Div, Int(b)) => return int_true_div(a, b).map(Value::Float),
             (Int(_), FloorDiv, Int(b)) if b.is_zero() => return Err(zero_division_floor_mod()),
             (Int(a), FloorDiv, Int(b)) => return Ok(Int(a.div_floor(b))),
             (Int(_), Mod, Int(b)) if b.is_zero() => {
@@ -5475,7 +6018,10 @@ impl Interpreter {
                     if a.is_zero() {
                         return Err(zero_division_negative_power());
                     }
-                    return Ok(Float(a.to_f64().powf(b.to_f64())));
+                    // CPython hands a negative exponent to `float.__pow__`,
+                    // converting both operands (an over-large one raises).
+                    let (af, bf) = (l.to_float()?, r.to_float()?);
+                    return self.binop(&Value::Float(af), Pow, &Value::Float(bf));
                 }
                 // `pow` takes a `u32` exponent; for ridiculous exponents
                 // (10**million) we'd happily eat all the RAM, so cap at
@@ -5507,16 +6053,34 @@ impl Interpreter {
                 return Ok(Int(a.shr(shift)));
             }
 
-            (Float(a), Add, Float(b)) => return Ok(Float(a + b)),
-            (Float(a), Sub, Float(b)) => return Ok(Float(a - b)),
-            (Float(a), Mult, Float(b)) => return Ok(Float(a * b)),
-            (Float(a), Div, Float(b)) => {
+            (
+                FloatData(crate::value::VmFloat { value: a, .. }),
+                Add,
+                FloatData(crate::value::VmFloat { value: b, .. }),
+            ) => return Ok(Value::Float(a + b)),
+            (
+                FloatData(crate::value::VmFloat { value: a, .. }),
+                Sub,
+                FloatData(crate::value::VmFloat { value: b, .. }),
+            ) => return Ok(Value::Float(a - b)),
+            (
+                FloatData(crate::value::VmFloat { value: a, .. }),
+                Mult,
+                FloatData(crate::value::VmFloat { value: b, .. }),
+            ) => return Ok(Value::Float(a * b)),
+            (
+                FloatData(crate::value::VmFloat { value: a, .. }),
+                Div,
+                FloatData(crate::value::VmFloat { value: b, .. }),
+            ) => {
                 if *b == 0.0 {
                     return Err(zero_division_named("float division by zero"));
                 }
-                return Ok(Float(a / b));
+                return Ok(Value::Float(a / b));
             }
-            (Float(_), FloorDiv, Float(b)) if *b == 0.0 => {
+            (FloatData(_), FloorDiv, FloatData(crate::value::VmFloat { value: b, .. }))
+                if *b == 0.0 =>
+            {
                 return Err(zero_division_named("float floor division by zero"));
             }
             // Float `//` and `%` share CPython's `float_divmod`. `floor(a/b)`
@@ -5524,12 +6088,24 @@ impl Interpreter {
             // `(7.0 / 0.1).floor()` is 70.0 where CPython's fmod-based
             // algorithm gives 69.0. Likewise `%` must carry the divisor's sign
             // even on a zero result (`-3.0 % 3.0 == 0.0`, `7.0 % -7.0 == -0.0`).
-            (Float(a), FloorDiv, Float(b)) => return Ok(Float(float_divmod(*a, *b).0)),
-            (Float(_), Mod, Float(b)) if *b == 0.0 => {
+            (
+                FloatData(crate::value::VmFloat { value: a, .. }),
+                FloorDiv,
+                FloatData(crate::value::VmFloat { value: b, .. }),
+            ) => return Ok(Value::Float(float_divmod(*a, *b).0)),
+            (FloatData(_), Mod, FloatData(crate::value::VmFloat { value: b, .. })) if *b == 0.0 => {
                 return Err(zero_division_named("float modulo by zero"))
             }
-            (Float(a), Mod, Float(b)) => return Ok(Float(float_divmod(*a, *b).1)),
-            (Float(a), Pow, Float(b)) => {
+            (
+                FloatData(crate::value::VmFloat { value: a, .. }),
+                Mod,
+                FloatData(crate::value::VmFloat { value: b, .. }),
+            ) => return Ok(Value::Float(float_divmod(*a, *b).1)),
+            (
+                FloatData(crate::value::VmFloat { value: a, .. }),
+                Pow,
+                FloatData(crate::value::VmFloat { value: b, .. }),
+            ) => {
                 // `0.0 ** -n` is a ZeroDivisionError in CPython, not `inf`.
                 if *a == 0.0 && *b < 0.0 {
                     return Err(zero_division_negative_power());
@@ -5541,7 +6117,16 @@ impl Interpreter {
                     let theta = std::f64::consts::PI * b;
                     return Ok(Complex(r * theta.cos(), r * theta.sin()));
                 }
-                return Ok(Float(a.powf(*b)));
+                let result = a.powf(*b);
+                // A finite power that overflows is `OverflowError: (34,
+                // '<strerror(ERANGE)>')` in CPython (errno ERANGE).
+                if result.is_infinite() && a.is_finite() && b.is_finite() {
+                    return Err(Unwind::Exception(VmException::new(
+                        "OverflowError",
+                        format!("(34, '{}')", erange_message()),
+                    )));
+                }
+                return Ok(Value::Float(result));
             }
             // Complex base raised to a non-negative integer power — repeated
             // multiplication for an exact result (`(1j) ** 2` → `-1+0j`),
@@ -5573,11 +6158,11 @@ impl Interpreter {
         // Mixed int/float — promote to float.
         if matches!(
             (l, r),
-            (Int(_) | Bool(_), Float(_)) | (Float(_), Int(_) | Bool(_))
+            (Int(_) | Bool(_), FloatData(_)) | (FloatData(_), Int(_) | Bool(_))
         ) {
             let a = l.to_float()?;
             let b = r.to_float()?;
-            return self.binop(&Float(a), op, &Float(b));
+            return self.binop(&Value::Float(a), op, &Value::Float(b));
         }
         // Bool ↔ Int.
         if matches!((l, r), (Bool(_), Int(_) | Bool(_)) | (Int(_), Bool(_))) {
@@ -5663,15 +6248,15 @@ impl Interpreter {
         if let (Str(a), Add, Str(b)) = (l, op, r) {
             return Ok(Str(Rc::new(format!("{}{}", a, b))));
         }
-        if let (Str(a), Mult, Int(n)) = (l, op, r) {
-            let n =
-                repeat_count_checked(a.len(), n, repeated_too_long("repeated string is too long"))?;
-            return Ok(Str(Rc::new(a.repeat(n))));
-        }
-        if let (Int(n), Mult, Str(a)) = (l, op, r) {
-            let n =
-                repeat_count_checked(a.len(), n, repeated_too_long("repeated string is too long"))?;
-            return Ok(Str(Rc::new(a.repeat(n))));
+        // The length limit counts characters, as CPython's does; a result
+        // that fits the limit but not memory is a `MemoryError`.
+        if let (Str(a), Mult, Int(n)) | (Int(n), Mult, Str(a)) = (l, op, r) {
+            let n = repeat_count_checked(
+                a.chars().count(),
+                n,
+                repeated_too_long("repeated string is too long"),
+            )?;
+            return Ok(Str(Rc::new(crate::limits::try_repeat_str(a, n)?)));
         }
 
         // Bytes: concatenation (`b"a" + b"b"`) and repetition (`b"a" * 3`).
@@ -5681,15 +6266,10 @@ impl Interpreter {
             out.extend_from_slice(b);
             return Ok(Bytes(Rc::new(out)));
         }
-        if let (Bytes(a), Mult, Int(n)) = (l, op, r) {
+        if let (Bytes(a), Mult, Int(n)) | (Int(n), Mult, Bytes(a)) = (l, op, r) {
             let n =
                 repeat_count_checked(a.len(), n, repeated_too_long("repeated bytes are too long"))?;
-            return Ok(Bytes(Rc::new(a.repeat(n))));
-        }
-        if let (Int(n), Mult, Bytes(a)) = (l, op, r) {
-            let n =
-                repeat_count_checked(a.len(), n, repeated_too_long("repeated bytes are too long"))?;
-            return Ok(Bytes(Rc::new(a.repeat(n))));
+            return Ok(Bytes(Rc::new(crate::limits::try_repeat_bytes(a, n)?)));
         }
 
         // Lists / tuples.
@@ -5742,48 +6322,83 @@ impl Interpreter {
                 for (k, v) in b.borrow().iter() {
                     out.insert(k.clone(), v.clone());
                 }
-                return Ok(Dict(Rc::new(RefCell::new(out))));
+                return Ok(Dict(Rc::new(crate::value::FrozenCell::new(out))));
             }
         }
         if matches!(op, BitOr | BitAnd | Sub | BitXor) {
             if let (Some(a), Some(b)) = (as_set_operand(l)?, as_set_operand(r)?) {
-                let out: std::collections::HashSet<HashKey> = match op {
-                    BitOr => a.union(&b).cloned().collect(),
-                    BitAnd => a.intersection(&b).cloned().collect(),
-                    Sub => a.difference(&b).cloned().collect(),
-                    BitXor => a.symmetric_difference(&b).cloned().collect(),
+                // CPython's `set_or` / `set_intersection` / `set_difference` /
+                // `set_symmetric_difference`, so the result's order is its.
+                let out = match op {
+                    BitOr => {
+                        let mut out = a.copy();
+                        out.merge(&b);
+                        out
+                    }
+                    BitAnd => a.intersection(&b),
+                    Sub => a.difference(&b),
+                    BitXor => a.symmetric_difference(&b),
                     _ => unreachable!(),
                 };
-                return Ok(Set(Rc::new(RefCell::new(out))));
+                // The result has the left operand's type when both are sets:
+                // `frozenset | set` is a frozenset. A dict-view operand makes
+                // `frozenset`'s slot decline, and the view's reflected one
+                // builds a `set` (`frozenset | d.keys()` is a set).
+                let frozen =
+                    matches!(l, Set(s) if crate::builtins::set_is_frozen(s)) && matches!(r, Set(_));
+                let cell = crate::value::FrozenCell::new(out);
+                cell.frozen.set(frozen);
+                return Ok(Set(Rc::new(cell)));
             }
         }
 
         // Operator overloading: dispatch to the left operand's dunder method,
         // falling back to the right operand's reflected dunder (`__radd__`).
         if let Some(dunder) = binop_dunder(op) {
+            let mut declined = false;
             if let Value::Instance(i) = l {
                 if let Some(m) = self.find_method(&i.class, dunder) {
-                    return self.call_value(
+                    let res = self.call_value(
                         Value::BoundMethod {
                             receiver: Box::new(l.clone()),
                             function: m,
                         },
                         vec![r.clone()],
                         &[],
-                    );
+                    )?;
+                    if !crate::value::is_not_implemented(&res) {
+                        return Ok(res);
+                    }
+                    declined = true;
                 }
             }
             if let (Some(rdunder), Value::Instance(i)) = (binop_reflected_dunder(op), r) {
                 if let Some(m) = self.find_method(&i.class, rdunder) {
-                    return self.call_value(
+                    let res = self.call_value(
                         Value::BoundMethod {
                             receiver: Box::new(r.clone()),
                             function: m,
                         },
                         vec![l.clone()],
                         &[],
-                    );
+                    )?;
+                    if !crate::value::is_not_implemented(&res) {
+                        return Ok(res);
+                    }
+                    declined = true;
                 }
+            }
+            if declined {
+                let op_text = match op {
+                    Pow => "** or pow()",
+                    other => other.as_str(),
+                };
+                return Err(type_error(format!(
+                    "unsupported operand type(s) for {}: '{}' and '{}'",
+                    op_text,
+                    l.type_display_name(),
+                    r.type_display_name()
+                )));
             }
         }
 
@@ -5822,6 +6437,17 @@ impl Interpreter {
             }
         }
 
+        // `int | str`, `A | None`: a runtime union of types (`types.UnionType`).
+        let type_like = |v: &Value| match v {
+            Native(n) => crate::builtins::is_builtin_type_name(n.name),
+            Class(_) | None => true,
+            _ => false,
+        };
+        if op == BitOr && type_like(l) && type_like(r) && !(matches!(l, None) && matches!(r, None))
+        {
+            let union = crate::builtins::descriptor_shim_class(self, "_union")?;
+            return self.call_value(union, vec![l.clone(), r.clone()], &[]);
+        }
         // CPython's wording differs for a few sequence operations.
         match (l, op, r) {
             (Str(_), Add, _) => {
@@ -5860,8 +6486,8 @@ impl Interpreter {
         Err(type_error(format!(
             "unsupported operand type(s) for {}: '{}' and '{}'",
             op_text,
-            l.type_name(),
-            r.type_name()
+            l.type_display_name(),
+            r.type_display_name()
         )))
     }
 
@@ -5892,7 +6518,7 @@ impl Interpreter {
             UnaryOp::Not => Ok(Value::Bool(!self.is_truthy(v)?)),
             UnaryOp::USub => match v {
                 Value::Int(i) => Ok(Value::Int(-i)),
-                Value::Float(x) => Ok(Value::Float(-*x)),
+                Value::FloatData(crate::value::VmFloat { value: x, .. }) => Ok(Value::Float(-*x)),
                 Value::Bool(b) => Ok(Value::Int(VmInt::from(-(*b as i64)))),
                 Value::Complex(re, im) => Ok(Value::Complex(-*re, -*im)),
                 _ => Err(type_error(format!(
@@ -5901,7 +6527,7 @@ impl Interpreter {
                 ))),
             },
             UnaryOp::UAdd => match v {
-                Value::Int(_) | Value::Float(_) | Value::Complex(_, _) => Ok(v.clone()),
+                Value::Int(_) | Value::FloatData(_) | Value::Complex(_, _) => Ok(v.clone()),
                 Value::Bool(b) => Ok(Value::Int(VmInt::from(*b as i64))),
                 _ => Err(type_error(format!(
                     "bad operand type for unary +: '{}'",
@@ -5974,7 +6600,7 @@ impl Interpreter {
                 } else {
                     ((start - stop).max(0) - step - 1) / -step
                 };
-                let i = key.to_int()?;
+                let i = index_int(key)?;
                 let idx = normalize_index(i, len as usize)
                     .ok_or_else(|| index_error("range object index out of range"))?;
                 Ok(Value::Int(VmInt::from(start + idx as i64 * step)))
@@ -5987,7 +6613,7 @@ impl Interpreter {
             }
             Value::Str(s) => {
                 let i = match key {
-                    Value::Int(_) | Value::Bool(_) => key.to_int()?,
+                    Value::Int(_) | Value::Bool(_) => index_int(key)?,
                     other => {
                         return Err(type_error(format!(
                             "string indices must be integers, not '{}'",
@@ -5995,10 +6621,11 @@ impl Interpreter {
                         )))
                     }
                 };
-                let chars: Vec<char> = s.chars().collect();
-                let idx = normalize_index(i, chars.len())
+                let idx = normalize_index(i, crate::strindex::char_len(s))
                     .ok_or_else(|| index_error("string index out of range"))?;
-                Ok(Value::Str(Rc::new(chars[idx].to_string())))
+                let c = crate::strindex::char_at(s, idx)
+                    .ok_or_else(|| index_error("string index out of range"))?;
+                Ok(Value::Str(Rc::new(c.to_string())))
             }
             Value::Dict(d) => {
                 // A plain `Value::Dict` has no associated class, so the
@@ -6012,7 +6639,7 @@ impl Interpreter {
                     .ok_or_else(|| crate::error::key_error_for(key))
             }
             Value::Bytes(b) => {
-                let i = key.to_int()?;
+                let i = index_int(key)?;
                 let idx = normalize_index(i, b.len())
                     .ok_or_else(|| index_error("bytes index out of range"))?;
                 Ok(Value::Int(VmInt::from(b[idx] as i64)))
@@ -6076,6 +6703,52 @@ impl Interpreter {
                     target.type_display_name()
                 )))
             }
+            // `list[int]` / `dict[str, int]`: a `types.GenericAlias` —
+            // callable, printed `list[int]`.
+            Value::Native(n)
+                if matches!(
+                    n.name,
+                    "list" | "dict" | "set" | "frozenset" | "tuple" | "type"
+                ) =>
+            {
+                let args = match key {
+                    Value::Tuple(t) => Value::Tuple(t.clone()),
+                    other => Value::Tuple(Rc::new(vec![other.clone()])),
+                };
+                let alias = crate::builtins::descriptor_shim_class(self, "_GenericAlias")?;
+                self.call_value(alias, vec![target.clone(), args], &[])
+            }
+            // `Optional[int]`, `Generic[T]`, `Callable[[int], str]`: the
+            // VM's `typing` forms are inert stand-ins, and so are their
+            // subscriptions (annotations and bases only read them).
+            Value::Native(n) if crate::builtins::is_typing_form(n.name) => Ok(target.clone()),
+            // `Box[int]` on a generic class: CPython's `typing` generic
+            // alias (callable, printed `__main__.Box[int]`, usable as a
+            // base). A class's own `__class_getitem__` wins; any other
+            // class is not subscriptable.
+            Value::Class(c) => {
+                if let Some(m) = self.find_method(c, "__class_getitem__") {
+                    let mut args = vec![target.clone(), key.clone()];
+                    if m.is_static {
+                        args.remove(0);
+                    }
+                    return self.call_function(&m, args, &[], None);
+                }
+                let generic = c.class_attrs.borrow().contains_key("__type_params__")
+                    || crate::value::class_flag(c, "__typhon_generic__", false);
+                if !generic {
+                    return Err(type_error(format!(
+                        "type '{}' is not subscriptable",
+                        c.name
+                    )));
+                }
+                let args = match key {
+                    Value::Tuple(t) => Value::Tuple(t.clone()),
+                    other => Value::Tuple(Rc::new(vec![other.clone()])),
+                };
+                let alias = crate::builtins::descriptor_shim_class(self, "_GenericAlias")?;
+                self.call_value(alias, vec![target.clone(), args], &[])
+            }
             other => Err(type_error(format!(
                 "'{}' object is not subscriptable",
                 other.type_display_name()
@@ -6112,7 +6785,7 @@ impl Interpreter {
         let len = match target {
             Value::List(l) => l.borrow().len(),
             Value::Tuple(t) => t.len(),
-            Value::Str(s) => s.chars().count(),
+            Value::Str(s) => crate::strindex::char_len(s),
             Value::Bytes(b) => b.len(),
             _ => {
                 return Err(type_error(format!(
@@ -6123,12 +6796,21 @@ impl Interpreter {
         };
         let step_i = match step {
             Value::None => 1,
-            v => v.to_int()?,
+            v => slice_bound(v)?,
         };
         if step_i == 0 {
             return Err(value_error("slice step cannot be zero"));
         }
         let (start, stop, step_i) = compute_slice(lower, upper, step_i, len)?;
+        // A contiguous substring is cut by offset, not by listing indices.
+        if let (Value::Str(s), 1) = (target, step_i) {
+            let (start, stop) = (start.max(0) as usize, stop.max(0) as usize);
+            return Ok(Value::Str(Rc::new(if start >= stop {
+                String::new()
+            } else {
+                crate::strindex::char_range(s, start, stop)
+            })));
+        }
         let mut indices: Vec<usize> = Vec::new();
         if step_i > 0 {
             let mut idx = start;
@@ -6201,10 +6883,10 @@ impl Interpreter {
             }
             Value::Dict(d) => {
                 let k = self.dict_probe_key(d, key)?;
-                // `shift_remove` preserves insertion order (matches Python's
-                // `del d[k]` on an insertion-ordered dict).
+                // Removal keeps the rest in insertion order, as `del d[k]`
+                // does.
                 d.borrow_mut()
-                    .shift_remove(&k)
+                    .remove(&k)
                     .map(|_| ())
                     .ok_or_else(|| crate::error::key_error_for(key))
             }
@@ -6401,8 +7083,10 @@ impl Interpreter {
             }
             (Value::Bool(_), "imag") => return Ok(Value::Int(crate::value::VmInt::from(0))),
             (Value::Bool(_), "denominator") => return Ok(Value::Int(crate::value::VmInt::from(1))),
-            (Value::Float(x), "real") => return Ok(Value::Float(*x)),
-            (Value::Float(_), "imag") => return Ok(Value::Float(0.0)),
+            (Value::FloatData(crate::value::VmFloat { value: x, .. }), "real") => {
+                return Ok(Value::Float(*x))
+            }
+            (Value::FloatData(_), "imag") => return Ok(Value::Float(0.0)),
             _ => {}
         }
         // Try instance fields first, then class methods.
@@ -6462,7 +7146,7 @@ impl Interpreter {
                     let inst = inst.clone();
                     let as_json = attr == "model_dump_json";
                     let nf = NativeFn::new("model_dump", move |_i, _args| {
-                        let mut map: DictMap = IndexMap::new();
+                        let mut map: DictMap = DictMap::new();
                         let fields = inst.fields.borrow();
                         for field in &inst.class.fields {
                             if let Some(v) = fields.get(&field.name) {
@@ -6472,7 +7156,7 @@ impl Interpreter {
                                 );
                             }
                         }
-                        let dict = Value::Dict(Rc::new(RefCell::new(map)));
+                        let dict = Value::Dict(Rc::new(crate::value::FrozenCell::new(map)));
                         if as_json {
                             Ok(Value::Str(Rc::new(crate::builtins::json_dumps_model(
                                 &dict,
@@ -6489,7 +7173,7 @@ impl Interpreter {
                 // CPython: reading it through an instance binds `self`. This
                 // is how cross-module `extend Foo:` methods (lowered to
                 // `Foo.m = __typhon_extend_Foo__m`) dispatch.
-                let class_attr = inst.class.class_attrs.borrow().get(attr).cloned();
+                let class_attr = class_attr_via_mro(&inst.class, attr);
                 if let Some(v) = class_attr {
                     if !is_enum_sentinel(attr) {
                         if let Value::Function(f) = &v {
@@ -6545,28 +7229,45 @@ impl Interpreter {
                 if attr == "__name__" || attr == "__qualname__" {
                     return Ok(Value::Str(Rc::new(class.name.clone())));
                 }
-                // `Cls.__mro__` — the linearised base chain, ending in
-                // `object`. The VM walks bases depth-first for method
-                // lookup rather than computing a C3 linearisation, so this
-                // reports that same order (identical for the single-
-                // inheritance chains that make up almost all real code).
+                // `Cls.__mro__` — the C3 linearisation, ending in `object`.
                 if attr == "__mro__" {
-                    let mut out: Vec<Value> = Vec::new();
-                    let mut stack: Vec<Rc<Class>> = vec![class.clone()];
-                    let mut seen: Vec<*const Class> = Vec::new();
-                    while let Some(c) = stack.pop() {
-                        let ptr = Rc::as_ptr(&c);
-                        if seen.contains(&ptr) {
-                            continue;
-                        }
-                        seen.push(ptr);
-                        out.push(Value::Class(c.clone()));
-                        for base in c.bases.iter().rev() {
-                            stack.push(base.clone());
-                        }
-                    }
+                    let mut out: Vec<Value> = class_mro(class)
+                        .filter(|c| !crate::value::is_builtin_object(c))
+                        .map(|c| Value::Class(c.clone()))
+                        .collect();
                     out.push(crate::builtins::make_builtin_type("object"));
                     return Ok(Value::Tuple(Rc::new(out)));
+                }
+                // `Cls.__dict__` — the class's own namespace, read-only (a
+                // snapshot `mappingproxy`; the VM's `__typhon_*` records
+                // are not part of it).
+                if attr == "__dict__" && !class.class_attrs.borrow().contains_key("__dict__") {
+                    let mut map: DictMap = DictMap::new();
+                    if let Some(Value::Str(m)) = class.class_attrs.borrow().get("__typhon_module__")
+                    {
+                        map.insert(
+                            HashKey::Str(Rc::new("__module__".into())),
+                            Value::Str(m.clone()),
+                        );
+                    }
+                    for (k, f) in class.methods.borrow().iter() {
+                        map.insert(HashKey::Str(Rc::new(k.clone())), Value::Function(f.clone()));
+                    }
+                    for (k, v) in class.class_attrs.borrow().iter() {
+                        if !k.starts_with("__typhon_") {
+                            map.insert(HashKey::Str(Rc::new(k.clone())), v.clone());
+                        }
+                    }
+                    let doc = class
+                        .class_attrs
+                        .borrow()
+                        .get("__typhon_doc__")
+                        .cloned()
+                        .unwrap_or(Value::None);
+                    map.insert(HashKey::Str(Rc::new("__doc__".into())), doc);
+                    let d = Rc::new(crate::value::FrozenCell::new(map));
+                    d.frozen.set(true);
+                    return Ok(Value::Dict(d));
                 }
                 // `Cls.__type_params__` — the PEP 695 parameter objects, or
                 // the empty tuple for a class that has none.
@@ -6591,7 +7292,8 @@ impl Interpreter {
                 // `object.__setattr__(obj, name, value)` — the raw attribute
                 // store that bypasses a user `__setattr__` (how a class that
                 // overrides `__setattr__` initialises its own fields).
-                if class.name == "object" && attr == "__setattr__" && class.bases.is_empty() {
+                let builtin_object = crate::value::is_builtin_object(class);
+                if builtin_object && attr == "__setattr__" {
                     return Ok(Value::Native(Rc::new(NativeFn::new(
                         "object.__setattr__",
                         |i, args| {
@@ -6603,7 +7305,19 @@ impl Interpreter {
                         },
                     ))));
                 }
-                if class.name == "object" && attr == "__getattribute__" && class.bases.is_empty() {
+                if builtin_object && attr == "__delattr__" {
+                    return Ok(Value::Native(Rc::new(NativeFn::new(
+                        "object.__delattr__",
+                        |i, args| {
+                            let [obj, name] = <[Value; 2]>::try_from(args).map_err(|_| {
+                                type_error("object.__delattr__() takes exactly 2 arguments")
+                            })?;
+                            i.del_attr_raw(&obj, &name.py_str())?;
+                            Ok(Value::None)
+                        },
+                    ))));
+                }
+                if builtin_object && attr == "__getattribute__" {
                     return Ok(Value::Native(Rc::new(NativeFn::new(
                         "object.__getattribute__",
                         |i, args| {
@@ -6614,22 +7328,35 @@ impl Interpreter {
                         },
                     ))));
                 }
-                let class_attr = class.class_attrs.borrow().get(attr).cloned();
-                if let Some(v) = class_attr {
-                    if let Some(bound) = self.descriptor_get(&v, None, class)? {
-                        return Ok(bound);
+                match lookup_class_member(class, attr) {
+                    Some((_, ClassMember::Attr(v))) => {
+                        // A function stored as a class attribute with
+                        // `@classmethod` binds the class it is read through.
+                        if let Value::Function(f) = &v {
+                            if f.is_classmethod {
+                                return Ok(Value::BoundMethod {
+                                    receiver: Box::new(value.clone()),
+                                    function: f.clone(),
+                                });
+                            }
+                        }
+                        if let Some(bound) = self.descriptor_get(&v, None, class)? {
+                            return Ok(bound);
+                        }
+                        return Ok(v);
                     }
-                    return Ok(v);
-                }
-                if let Some(m) = class.methods.borrow().get(attr) {
-                    // `@classmethod` accessed on the class binds `cls` to the class.
-                    if class.classmethods.borrow().contains(attr) {
-                        return Ok(Value::BoundMethod {
-                            receiver: Box::new(value.clone()),
-                            function: m.clone(),
-                        });
+                    Some((_, ClassMember::Method(m))) => {
+                        // `@classmethod` accessed on the class binds `cls` to
+                        // the class it is read through (a subclass included).
+                        if m.is_classmethod || class.classmethods.borrow().contains(attr) {
+                            return Ok(Value::BoundMethod {
+                                receiver: Box::new(value.clone()),
+                                function: m,
+                            });
+                        }
+                        return Ok(Value::Function(m));
                     }
-                    return Ok(Value::Function(m.clone()));
+                    None => {}
                 }
                 // Pydantic `model` class methods: `Model.model_validate(dict)`
                 // builds an instance from a mapping (validation is not modelled;
@@ -6794,7 +7521,7 @@ impl Interpreter {
                 for (k, v) in f.attrs.borrow().iter() {
                     map.insert(HashKey::Str(Rc::new(k.clone())), v.clone());
                 }
-                Ok(Value::Dict(Rc::new(RefCell::new(map))))
+                Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(map))))
             }
             Value::Native(n) if attr == "__name__" || attr == "__qualname__" => {
                 Ok(Value::Str(Rc::new(n.name.to_string())))
@@ -6838,7 +7565,7 @@ impl Interpreter {
             | Value::Set(_)
             | Value::Tuple(_)
             | Value::Int(_)
-            | Value::Float(_)
+            | Value::FloatData(_)
             | Value::Bool(_)
             | Value::Bytes(_) => {
                 // H5b — accessing an unknown (non-method, non-dunder)
@@ -7136,6 +7863,90 @@ impl Interpreter {
         self.set_attr_raw(receiver, attr, value)
     }
 
+    /// `del obj.attr` / `delattr(obj, attr)`.
+    pub(crate) fn del_attr(&mut self, recv: &Value, attr: &str) -> Result<(), Unwind> {
+        if let Value::Instance(inst) = recv {
+            if let Some(err) = frozen_dataclass_error(&inst.class, attr, "delete") {
+                return Err(err);
+            }
+            // A user `__delattr__` intercepts every `del obj.attr` (CPython
+            // protocol); it deletes through `object.__delattr__`.
+            if let Some(m) = self.find_method(&inst.class, "__delattr__") {
+                self.call_value(
+                    Value::BoundMethod {
+                        receiver: Box::new(recv.clone()),
+                        function: m,
+                    },
+                    vec![Value::Str(Rc::new(attr.to_owned()))],
+                    &[],
+                )?;
+                return Ok(());
+            }
+        }
+        self.del_attr_raw(recv, attr)
+    }
+
+    /// `object.__delattr__`: delete an attribute without consulting a user
+    /// `__delattr__` (property deleters and descriptors still apply).
+    pub(crate) fn del_attr_raw(&mut self, recv: &Value, attr: &str) -> Result<(), Unwind> {
+        match recv {
+            Value::Instance(inst) => {
+                if self.delete_via_descriptor(inst, attr)? {
+                    return Ok(());
+                }
+                if inst.fields.borrow_mut().shift_remove(attr).is_none() {
+                    // An instance without a `__dict__` reports the name as
+                    // an attribute store would.
+                    let msg = slots_violation(&inst.class, attr, &inst.fields.borrow())
+                        .unwrap_or_else(|| {
+                            format!("'{}' object has no attribute '{}'", inst.class.name, attr)
+                        });
+                    return Err(attribute_error(msg));
+                }
+                Ok(())
+            }
+            Value::Class(c) => del_class_attr(self, c, attr),
+            _ => Err(type_error("cannot delete attribute on this object")),
+        }
+    }
+
+    /// `del obj.attr` through a `@prop.deleter` or a data descriptor's
+    /// `__delete__`; `Ok(false)` when neither applies.
+    fn delete_via_descriptor(&mut self, inst: &Rc<Instance>, attr: &str) -> Result<bool, Unwind> {
+        let receiver = Value::Instance(inst.clone());
+        let deleter = inst
+            .class
+            .class_attrs
+            .borrow()
+            .get(&format!("__typhon_deleter__{attr}"))
+            .cloned();
+        if let Some(Value::Function(deleter)) = deleter {
+            self.call_value(
+                Value::BoundMethod {
+                    receiver: Box::new(receiver),
+                    function: deleter,
+                },
+                vec![],
+                &[],
+            )?;
+            return Ok(true);
+        }
+        if let Some(Value::Instance(d)) = class_attr_via_mro(&inst.class, attr) {
+            if let Some(del) = self.find_method(&d.class, "__delete__") {
+                self.call_value(
+                    Value::BoundMethod {
+                        receiver: Box::new(Value::Instance(d)),
+                        function: del,
+                    },
+                    vec![receiver],
+                    &[],
+                )?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// `object.__setattr__`: store an attribute without consulting a user
     /// `__setattr__` (property setters still apply).
     pub fn set_attr_raw(
@@ -7165,6 +7976,22 @@ impl Interpreter {
                     )?;
                     return Ok(());
                 }
+                // A data descriptor on the class (an object whose type
+                // defines `__set__` — `property(...)`, a hand-written
+                // validator) intercepts the store, as in CPython.
+                if let Some(Value::Instance(d)) = class_attr_via_mro(&i.class, attr) {
+                    if let Some(set) = self.find_method(&d.class, "__set__") {
+                        self.call_value(
+                            Value::BoundMethod {
+                                receiver: Box::new(Value::Instance(d)),
+                                function: set,
+                            },
+                            vec![receiver.clone(), value],
+                            &[],
+                        )?;
+                        return Ok(());
+                    }
+                }
                 // `@dataclass(slots=True)` (Typhon's default class lowering)
                 // and an explicit `__slots__` leave the instance without a
                 // `__dict__`: only the declared slots are assignable.
@@ -7175,7 +8002,7 @@ impl Interpreter {
                 Ok(())
             }
             Value::Class(c) => {
-                c.class_attrs.borrow_mut().insert(attr.to_owned(), value);
+                set_class_attr(self, c, attr, value);
                 Ok(())
             }
             Value::Module(m) => {
@@ -7370,34 +8197,22 @@ impl Interpreter {
                     index: 0,
                 }
             }
+            // Dict and set iterators walk the live container and raise
+            // CPython's `RuntimeError` if it changes size underneath them.
             Value::Dict(d) => {
-                let keys: Vec<HashKey> = d
-                    .borrow()
-                    .keys()
-                    .filter(|k| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
-                    .cloned()
-                    .collect();
-                IterState::Dict { keys, index: 0 }
+                crate::value::IterState::dict_iter(&d, crate::value::DictViewKind::Keys)
             }
             Value::Set(s) => {
-                // Filter the synthetic `__typhon_frozen__` sentinel
-                // `deep_freeze_value` inserts to mark the set
-                // immutable.
-                let keys: Vec<HashKey> = s
-                    .borrow()
-                    .iter()
-                    .filter(|k| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
-                    .cloned()
-                    .collect();
-                IterState::Set { keys, index: 0 }
+                let used = s.borrow().len();
+                IterState::Set {
+                    set: s,
+                    pos: 0,
+                    used,
+                    remaining: used,
+                }
             }
             Value::Iter(it) => return Ok(Value::Iter(it)),
-            // A dict-view iterates over its materialised items, so
-            // `for k in d.keys()`, `list(d.values())`, `set(d.items())` work.
-            Value::DictView { items, .. } => IterState::List {
-                items: Rc::new(RefCell::new(items)),
-                index: 0,
-            },
+            Value::DictView { kind, dict } => crate::value::IterState::dict_iter(&dict, kind),
             // Iterating an enum class yields its members in definition order.
             Value::Class(ref c) if Self::is_enum_class(c) => {
                 let members = match c.class_attrs.borrow().get("__typhon_enum_members__") {
@@ -7593,23 +8408,112 @@ impl Interpreter {
                         Ok(Some(v))
                     };
                 }
-                IterState::Dict { keys, index } => {
-                    return if *index >= keys.len() {
-                        Ok(None)
-                    } else {
-                        let v = keys[*index].clone().into_value();
-                        *index += 1;
-                        Ok(Some(v))
+                IterState::Dict {
+                    dict,
+                    kind,
+                    index,
+                    used,
+                    remaining,
+                } => {
+                    // An exhausted iterator has let go of its dict (CPython
+                    // clears `di_dict`): later mutation is not its business.
+                    if *index == usize::MAX {
+                        return Ok(None);
+                    }
+                    let d = dict.borrow();
+                    if d.len() != *used {
+                        // Sticky, like CPython's `di_used = -1`.
+                        *used = usize::MAX;
+                        return Err(Unwind::Exception(VmException::new(
+                            "RuntimeError",
+                            "dictionary changed size during iteration",
+                        )));
+                    }
+                    // `index` is a slot position: holes left by deletions
+                    // are stepped over, as CPython's iterator does.
+                    let Some((next, k, v)) = d.next_slot(*index) else {
+                        *index = usize::MAX;
+                        return Ok(None);
                     };
+                    if *remaining == 0 {
+                        return Err(Unwind::Exception(VmException::new(
+                            "RuntimeError",
+                            "dictionary keys changed during iteration",
+                        )));
+                    }
+                    *index = next;
+                    *remaining -= 1;
+                    return Ok(Some(match kind {
+                        crate::value::DictViewKind::Keys => k.clone().into_value(),
+                        crate::value::DictViewKind::Values => v.clone(),
+                        crate::value::DictViewKind::Items => {
+                            Value::Tuple(Rc::new(vec![k.clone().into_value(), v.clone()]))
+                        }
+                    }));
                 }
-                IterState::Set { keys, index } => {
-                    return if *index >= keys.len() {
-                        Ok(None)
-                    } else {
-                        let v = keys[*index].clone().into_value();
-                        *index += 1;
-                        Ok(Some(v))
+                IterState::Set {
+                    set,
+                    pos,
+                    used,
+                    remaining,
+                } => {
+                    if *pos == usize::MAX {
+                        return Ok(None);
+                    }
+                    let s = set.borrow();
+                    if s.len() != *used {
+                        *used = usize::MAX;
+                        return Err(Unwind::Exception(VmException::new(
+                            "RuntimeError",
+                            "Set changed size during iteration",
+                        )));
+                    }
+                    let Some((next, k)) = s.next_entry(*pos) else {
+                        *pos = usize::MAX;
+                        return Ok(None);
                     };
+                    *pos = next;
+                    *remaining = remaining.saturating_sub(1);
+                    return Ok(Some(k.clone().into_value()));
+                }
+                IterState::ListRev { list, index } => {
+                    let l = list.borrow();
+                    if *index == 0 || *index > l.len() {
+                        *index = 0;
+                        return Ok(None);
+                    }
+                    *index -= 1;
+                    return Ok(Some(l[*index].clone()));
+                }
+                IterState::DictRev {
+                    dict,
+                    kind,
+                    index,
+                    used,
+                } => {
+                    if *index == usize::MAX {
+                        return Ok(None);
+                    }
+                    let d = dict.borrow();
+                    if d.len() != *used {
+                        *used = usize::MAX;
+                        return Err(Unwind::Exception(VmException::new(
+                            "RuntimeError",
+                            "dictionary changed size during iteration",
+                        )));
+                    }
+                    let Some((at, k, v)) = d.prev_slot(*index) else {
+                        *index = usize::MAX;
+                        return Ok(None);
+                    };
+                    *index = at;
+                    return Ok(Some(match kind {
+                        crate::value::DictViewKind::Keys => k.clone().into_value(),
+                        crate::value::DictViewKind::Values => v.clone(),
+                        crate::value::DictViewKind::Items => {
+                            Value::Tuple(Rc::new(vec![k.clone().into_value(), v.clone()]))
+                        }
+                    }));
                 }
                 IterState::Reversed { items, index } => {
                     return if *index >= items.len() {
@@ -7805,7 +8709,7 @@ impl Interpreter {
     }
 
     fn eval_setcomp(&mut self, c: &ast::ExprSetComp, env: &EnvRef) -> Result<Value, Unwind> {
-        let out = Rc::new(RefCell::new(std::collections::HashSet::new()));
+        let out = Rc::new(crate::value::FrozenCell::new(crate::pyset::PySet::new()));
         let elt = c.elt.clone();
         let out_clone = out.clone();
         let leaks = comprehension_walrus_names(&[&c.elt], &c.generators);
@@ -7817,11 +8721,12 @@ impl Interpreter {
             Ok(())
         })?;
         let result = std::mem::take(&mut *out.borrow_mut());
-        Ok(Value::Set(Rc::new(RefCell::new(result))))
+        Ok(Value::Set(Rc::new(crate::value::FrozenCell::new(result))))
     }
 
     fn eval_dictcomp(&mut self, c: &ast::ExprDictComp, env: &EnvRef) -> Result<Value, Unwind> {
-        let out: Rc<RefCell<DictMap>> = Rc::new(RefCell::new(IndexMap::new()));
+        let out: Rc<crate::value::FrozenCell<DictMap>> =
+            Rc::new(crate::value::FrozenCell::new(DictMap::new()));
         let key_expr = c
             .key
             .clone()
@@ -7842,7 +8747,7 @@ impl Interpreter {
             Ok(())
         })?;
         let result = std::mem::take(&mut *out.borrow_mut());
-        Ok(Value::Dict(Rc::new(RefCell::new(result))))
+        Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(result))))
     }
 
     // ── try/except ─────────────────────────────────────────────────────────
@@ -7898,6 +8803,8 @@ impl Interpreter {
                         }
                         match matched {
                             Some(index) => {
+                                let mut exc = exc;
+                                self.record_caught_traceback(&mut exc);
                                 let ExceptHandler::ExceptHandler(h) = &t.handlers[index];
                                 // If the raised exception carried a
                                 // user-constructed Instance (typical for
@@ -7948,7 +8855,17 @@ impl Interpreter {
                     // if finally itself raises, that wins (D5).
                     Stage::Finally(result)
                 }
-                Stage::Finally(pending) => {
+                Stage::Finally(mut pending) => {
+                    // An exception on its way out becomes the `__context__`
+                    // of anything the `finally` body raises; capture its
+                    // traceback now, while the offset is still its raise site.
+                    if let Err(Unwind::Exception(e)) = &mut pending {
+                        if !t.finalbody.is_empty()
+                            && !crate::value::has_exception_traceback(e.value.as_ref())
+                        {
+                            self.record_caught_traceback(e);
+                        }
+                    }
                     return match self.exec_block(&t.finalbody, env) {
                         Ok(()) => pending,
                         Err(Unwind::Yield(v)) => {
@@ -8657,7 +9574,7 @@ impl Interpreter {
         }
         if let Some(rest_name) = &m.rest {
             // Build a new dict of the keys we *didn't* consume.
-            let mut rest_map: DictMap = IndexMap::new();
+            let mut rest_map: DictMap = DictMap::new();
             for (k, v) in d.borrow().iter() {
                 if !matched_keys.iter().any(|seen| seen == k) {
                     rest_map.insert(k.clone(), v.clone());
@@ -8665,7 +9582,7 @@ impl Interpreter {
             }
             env.set(
                 rest_name.as_str(),
-                Value::Dict(Rc::new(RefCell::new(rest_map))),
+                Value::Dict(Rc::new(crate::value::FrozenCell::new(rest_map))),
             );
         }
         Ok(true)
@@ -8739,7 +9656,7 @@ impl Interpreter {
                 ("str", Value::Str(_))
                     | ("int", Value::Int(_))
                     | ("int", Value::Bool(_))
-                    | ("float", Value::Float(_))
+                    | ("float", Value::FloatData(_))
                     | ("bool", Value::Bool(_))
                     | ("bytes", Value::Bytes(_))
                     | ("list", Value::List(_))
@@ -8935,7 +9852,7 @@ fn decorator_simple_name(e: &Expr) -> Option<String> {
 fn model_dump_value(v: &Value) -> Value {
     match v {
         Value::Instance(inner) if crate::value::class_is_pydantic_model(&inner.class) => {
-            let mut map: DictMap = IndexMap::new();
+            let mut map: DictMap = DictMap::new();
             let fields = inner.fields.borrow();
             for field in &inner.class.fields {
                 if let Some(f) = fields.get(&field.name) {
@@ -8945,18 +9862,18 @@ fn model_dump_value(v: &Value) -> Value {
                     );
                 }
             }
-            Value::Dict(Rc::new(RefCell::new(map)))
+            Value::Dict(Rc::new(crate::value::FrozenCell::new(map)))
         }
         Value::List(items) => Value::List(Rc::new(RefCell::new(
             items.borrow().iter().map(model_dump_value).collect(),
         ))),
         Value::Tuple(items) => Value::Tuple(Rc::new(items.iter().map(model_dump_value).collect())),
         Value::Dict(d) => {
-            let mut map: DictMap = IndexMap::new();
+            let mut map: DictMap = DictMap::new();
             for (k, item) in d.borrow().iter() {
                 map.insert(k.clone(), model_dump_value(item));
             }
-            Value::Dict(Rc::new(RefCell::new(map)))
+            Value::Dict(Rc::new(crate::value::FrozenCell::new(map)))
         }
         other => other.clone(),
     }
@@ -9037,7 +9954,7 @@ fn lazy_module_proxy(target: &str) -> Value {
 fn slice_indices(parts: &[Value], n: i64) -> Result<(i64, i64, i64), Unwind> {
     let step = match &parts[3] {
         Value::None => 1,
-        v => v.to_int()?,
+        v => slice_bound(v)?,
     };
     if step == 0 {
         return Err(crate::error::value_error("slice step cannot be zero"));
@@ -9047,9 +9964,9 @@ fn slice_indices(parts: &[Value], n: i64) -> Result<(i64, i64, i64), Unwind> {
         match v {
             Value::None => Ok(default),
             v => {
-                let mut i = v.to_int()?;
+                let mut i = slice_bound(v)?;
                 if i < 0 {
-                    i += n;
+                    i = i.saturating_add(n);
                     if i < lower {
                         i = lower;
                     }
@@ -9067,6 +9984,151 @@ fn slice_indices(parts: &[Value], n: i64) -> Result<(i64, i64, i64), Unwind> {
 
 /// Class-kind markers that describe one class body only and must not be
 /// copied into subclasses by the attribute-inheritance flattening.
+/// `cls.__abstractmethods__`: every name in the MRO whose binding, as the
+/// class resolves it, is still marked `@abstractmethod`. Sorted, as
+/// CPython's error message lists them.
+fn abstract_methods(class: &Rc<Class>) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for c in class_mro(class) {
+        let own: Vec<String> = c
+            .methods
+            .borrow()
+            .keys()
+            .chain(c.class_attrs.borrow().keys())
+            .cloned()
+            .collect();
+        for name in own {
+            if names.contains(&name) {
+                continue;
+            }
+            let abstract_ = match lookup_class_member(class, &name) {
+                Some((_, ClassMember::Method(f))) => f
+                    .attrs
+                    .borrow()
+                    .get("__isabstractmethod__")
+                    .is_some_and(Value::truthy),
+                Some((_, ClassMember::Attr(Value::Instance(i)))) => i
+                    .fields
+                    .borrow()
+                    .get("__isabstractmethod__")
+                    .is_some_and(Value::truthy),
+                _ => false,
+            };
+            if abstract_ {
+                names.push(name);
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+/// What a class namespace binds a name to: a `def` in the class body (or
+/// merged from an `impl` block), or any other class attribute.
+pub(crate) enum ClassMember {
+    Method(Rc<Function>),
+    Attr(Value),
+}
+
+/// `class` followed by its C3-linearised ancestors — `__mro__` without the
+/// implicit `object`.
+pub(crate) fn class_mro(class: &Rc<Class>) -> impl Iterator<Item = &Rc<Class>> {
+    std::iter::once(class).chain(class.mro.iter())
+}
+
+/// Resolve `name` the way CPython's `type.__getattribute__` finds a class
+/// attribute: the first class in the MRO whose own namespace binds it wins,
+/// whether as a method or as a plain attribute. Returns that class with the
+/// binding. The VM's internal `__typhon_*` records are never found on an
+/// ancestor here (they are copied per class where they are inherited).
+pub(crate) fn lookup_class_member(
+    class: &Rc<Class>,
+    name: &str,
+) -> Option<(Rc<Class>, ClassMember)> {
+    let internal = name.starts_with("__typhon_");
+    for (depth, c) in class_mro(class).enumerate() {
+        if let Some(m) = c.methods.borrow().get(name) {
+            return Some((c.clone(), ClassMember::Method(m.clone())));
+        }
+        if depth > 0 && internal {
+            continue;
+        }
+        if let Some(v) = c.class_attrs.borrow().get(name) {
+            return Some((c.clone(), ClassMember::Attr(v.clone())));
+        }
+    }
+    None
+}
+
+/// `Cls.attr = value`: one namespace per class, as in CPython — a `def`
+/// the class body bound under `attr` is replaced, not shadowed by a
+/// parallel class attribute. Method resolutions are memoised, so any change
+/// that can alter one (a new name, or a function-valued binding replaced)
+/// drops the cache; re-binding an existing plain attribute (a class-level
+/// counter) does not.
+pub(crate) fn set_class_attr(interp: &Interpreter, class: &Rc<Class>, attr: &str, value: Value) {
+    let had_method = class.methods.borrow_mut().remove(attr).is_some();
+    let previous = class
+        .class_attrs
+        .borrow_mut()
+        .insert(attr.to_owned(), value.clone());
+    let reshapes = had_method
+        || matches!(previous, None | Some(Value::Function(_)))
+        || matches!(value, Value::Function(_));
+    if reshapes {
+        interp.invalidate_method_cache();
+    }
+}
+
+/// `del Cls.attr`: remove the class's own binding (an inherited one is not
+/// the class's to delete — CPython raises `AttributeError`).
+pub(crate) fn del_class_attr(
+    interp: &Interpreter,
+    class: &Rc<Class>,
+    attr: &str,
+) -> Result<(), Unwind> {
+    let had_method = class.methods.borrow_mut().remove(attr).is_some();
+    let had_attr = class.class_attrs.borrow_mut().remove(attr).is_some();
+    if !(had_method || had_attr) {
+        return Err(attribute_error(format!(
+            "type object '{}' has no attribute '{attr}'",
+            class.name
+        )));
+    }
+    interp.invalidate_method_cache();
+    Ok(())
+}
+
+/// The methods a Protocol requires: its own and those of the protocol
+/// classes it extends.
+pub(crate) fn protocol_members(class: &Rc<Class>) -> Vec<String> {
+    // CPython's `__protocol_attrs__`: the methods *and* the annotated data
+    // members of every protocol class in the MRO.
+    let mut names: Vec<String> = Vec::new();
+    for c in class_mro(class).filter(|c| class_is_protocol(c)) {
+        let fields = c.fields.iter().map(|f| f.name.clone());
+        let data: Vec<String> = match c.class_attrs.borrow().get("__typhon_protocol_data__") {
+            Some(Value::Tuple(t)) => t.iter().map(Value::py_str).collect(),
+            _ => Vec::new(),
+        };
+        for k in c.methods.borrow().keys().cloned().chain(fields).chain(data) {
+            if !names.contains(&k) {
+                names.push(k);
+            }
+        }
+    }
+    names
+}
+
+/// The value of a class attribute `name` resolved through the MRO, if the
+/// first binding found is a plain attribute (not a method).
+pub(crate) fn class_attr_via_mro(class: &Rc<Class>, name: &str) -> Option<Value> {
+    match lookup_class_member(class, name) {
+        Some((_, ClassMember::Attr(v))) => Some(v),
+        _ => None,
+    }
+}
+
 fn is_uninherited_marker(name: &str) -> bool {
     matches!(
         name,
@@ -9075,6 +10137,8 @@ fn is_uninherited_marker(name: &str) -> bool {
             | "__typhon_hash_none__"
             | "__typhon_module__"
             | "__typhon_generated_init__"
+            | "__typhon_doc__"
+            | "__typhon_generic__"
     ) || name.starts_with("__typhon_dc_")
 }
 
@@ -9151,10 +10215,10 @@ fn dataclass_missing_arguments(class: &str, missing: &[&str]) -> String {
     )
 }
 
-/// `object.__setattr__` on an instance without a `__dict__` (every class
-/// in its MRO is `@dataclass(slots=True)` or declares `__slots__`): the
-/// AttributeError CPython raises for a name outside the slots, or `None`
-/// when the store is allowed.
+/// `object.__setattr__` (or `__delattr__`) on an instance without a
+/// `__dict__` (every class in its MRO is `@dataclass(slots=True)` or
+/// declares `__slots__`): the AttributeError CPython raises for a name
+/// outside the slots, or `None` when the store is allowed.
 fn slots_violation(
     class: &Rc<Class>,
     attr: &str,
@@ -9184,6 +10248,14 @@ fn slots_violation(
     {
         return None;
     }
+    // A name the class binds (a method, a class attribute) is there to be
+    // found, just not writable through an instance with no `__dict__`.
+    if lookup_class_member(class, attr).is_some() {
+        return Some(format!(
+            "'{}' object attribute '{}' is read-only",
+            class.name, attr
+        ));
+    }
     Some(format!(
         "'{}' object has no attribute '{}' and no __dict__ for setting new attributes",
         class.name, attr
@@ -9197,16 +10269,12 @@ fn user_hash_candidates_in_map(
     hash: i64,
     probe: &Rc<Instance>,
 ) -> Vec<Rc<Instance>> {
-    use indexmap::map::raw_entry_v1::RawEntryApiV1;
-    use std::hash::BuildHasher;
     let mut out = Vec::new();
-    let h = map.hasher().hash_one(HashKey::UserHashed {
+    let probe_key = HashKey::UserHashed {
         hash,
         instance: probe.clone(),
-    });
-    // A predicate that never matches walks the whole probe sequence, so
-    // every stored key with this user hash is visited.
-    let _ = map.raw_entry_v1().from_hash(h, |k| {
+    };
+    map.for_each_colliding_key(&probe_key, |k| {
         if let HashKey::UserHashed {
             hash: kh,
             instance: ki,
@@ -9216,13 +10284,12 @@ fn user_hash_candidates_in_map(
                 out.push(ki.clone());
             }
         }
-        false
     });
     out
 }
 
 fn user_hash_candidates_in_set(
-    set: &std::collections::HashSet<HashKey>,
+    set: &crate::pyset::PySet,
     hash: i64,
     probe: &Rc<Instance>,
 ) -> Vec<Rc<Instance>> {
@@ -9331,12 +10398,33 @@ fn scale_pow2(mut m: f64, mut k: i32) -> f64 {
 }
 
 fn builtin_type_method(ty: &'static str, attr: &str) -> Option<Value> {
+    // Static / class methods take their arguments as data, not as the
+    // receiver the unbound-method form below would make of the first one.
+    match (ty, attr) {
+        ("dict", "fromkeys") => {
+            return Some(Value::Native(Rc::new(NativeFn::new(
+                "fromkeys",
+                crate::builtins::dict_fromkeys,
+            ))))
+        }
+        ("str", "maketrans") => {
+            return Some(Value::Native(Rc::new(NativeFn::new(
+                "maketrans",
+                |_i, args| crate::builtins::str_maketrans(&args),
+            ))))
+        }
+        _ => {}
+    }
     let probe = match ty {
         "str" => Value::Str(Rc::new(String::new())),
         "bytes" => Value::Bytes(Rc::new(Vec::new())),
         "list" => Value::List(Rc::new(RefCell::new(Vec::new()))),
-        "dict" => Value::Dict(Rc::new(RefCell::new(crate::value::DictMap::new()))),
-        "set" | "frozenset" => Value::Set(Rc::new(RefCell::new(Default::default()))),
+        "dict" => Value::Dict(Rc::new(crate::value::FrozenCell::new(
+            crate::value::DictMap::new(),
+        ))),
+        "set" | "frozenset" => {
+            Value::Set(Rc::new(crate::value::FrozenCell::new(Default::default())))
+        }
         "tuple" => Value::Tuple(Rc::new(Vec::new())),
         "int" | "bool" => Value::Int(crate::value::VmInt::from(0)),
         "float" => Value::Float(0.0),
@@ -9454,6 +10542,11 @@ fn builtin_type_method(ty: &'static str, attr: &str) -> Option<Value> {
     ))))
 }
 
+/// [`builtin_has_attr`] for the method dispatcher in `builtins`.
+pub(crate) fn builtin_has_attr_pub(value: &Value, attr: &str) -> bool {
+    builtin_has_attr(value, attr)
+}
+
 fn builtin_has_attr(value: &Value, attr: &str) -> bool {
     if attr.starts_with("__") && attr.ends_with("__") {
         // Dunders every builtin value carries.
@@ -9490,13 +10583,13 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
         return match attr {
             "__floordiv__" | "__rfloordiv__" | "__divmod__" | "__int__" | "__float__"
             | "__round__" | "__trunc__" | "__floor__" | "__ceil__" => {
-                matches!(value, Value::Int(_) | Value::Bool(_) | Value::Float(_))
+                matches!(value, Value::Int(_) | Value::Bool(_) | Value::FloatData(_))
             }
             "__radd__" | "__truediv__" | "__rtruediv__" | "__pow__" | "__rpow__" | "__neg__"
             | "__pos__" | "__abs__" => {
                 matches!(
                     value,
-                    Value::Int(_) | Value::Bool(_) | Value::Float(_) | Value::Complex(..)
+                    Value::Int(_) | Value::Bool(_) | Value::FloatData(_) | Value::Complex(..)
                 )
             }
             "__invert__" | "__lshift__" | "__rshift__" | "__index__" => {
@@ -9511,7 +10604,7 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                         | Value::Tuple(_)
                         | Value::Int(_)
                         | Value::Bool(_)
-                        | Value::Float(_)
+                        | Value::FloatData(_)
                         | Value::Complex(..)
                 )
             }
@@ -9522,7 +10615,7 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                         | Value::Bytes(_)
                         | Value::Int(_)
                         | Value::Bool(_)
-                        | Value::Float(_)
+                        | Value::FloatData(_)
                 )
             }
             "__sub__" | "__rsub__" => {
@@ -9531,7 +10624,7 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                     Value::Set(_)
                         | Value::Int(_)
                         | Value::Bool(_)
-                        | Value::Float(_)
+                        | Value::FloatData(_)
                         | Value::Complex(..)
                         | Value::DictView { .. }
                 )
@@ -9569,7 +10662,7 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                         | Value::Tuple(_)
                         | Value::Int(_)
                         | Value::Bool(_)
-                        | Value::Float(_)
+                        | Value::FloatData(_)
                         | Value::Complex(..)
                 )
             }
@@ -9579,7 +10672,7 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                     Value::Range { .. }
                         | Value::Int(_)
                         | Value::Bool(_)
-                        | Value::Float(_)
+                        | Value::FloatData(_)
                         | Value::Complex(..)
                         | Value::None
                 )
@@ -9774,9 +10867,12 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                 | "symmetric_difference"
                 | "union"
                 | "update"
+                | "intersection_update"
+                | "difference_update"
+                | "symmetric_difference_update"
         ),
         Value::Tuple(_) => matches!(attr, "count" | "index"),
-        Value::Float(_) => matches!(
+        Value::FloatData(_) => matches!(
             attr,
             "is_integer" | "conjugate" | "real" | "imag" | "hex" | "as_integer_ratio"
         ),
@@ -9945,30 +11041,31 @@ fn printf_format_with(
             }
             i += 1;
         }
-        // Width.
-        let mut width: Option<usize> = None;
-        while let Some(c) = chars.get(i) {
-            if let Some(d) = c.to_digit(10) {
-                width = Some(width.unwrap_or(0) * 10 + d as usize);
-                i += 1;
-            } else {
-                break;
+        // Width and precision: CPython refuses a width past `Py_ssize_t`
+        // ("width too big") and a precision past `INT_MAX` ("precision too
+        // big").
+        let printf_number = |i: &mut usize, what: &str, max: usize| -> Result<usize, Unwind> {
+            let mut n = 0usize;
+            while let Some(d) = chars.get(*i).and_then(|c| c.to_digit(10)) {
+                n = n.saturating_mul(10).saturating_add(d as usize);
+                if n > max {
+                    return Err(value_error(format!("{what} too big")));
+                }
+                *i += 1;
             }
-        }
-        // Precision.
+            Ok(n)
+        };
+        let width: Option<usize> = if chars.get(i).is_some_and(|c| c.is_ascii_digit()) {
+            let w = printf_number(&mut i, "width", isize::MAX as usize)?;
+            crate::limits::ensure_alloc(w)?;
+            Some(w)
+        } else {
+            None
+        };
         let mut precision: Option<usize> = None;
         if chars.get(i) == Some(&'.') {
             i += 1;
-            let mut p = 0usize;
-            while let Some(c) = chars.get(i) {
-                if let Some(d) = c.to_digit(10) {
-                    p = p * 10 + d as usize;
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
-            precision = Some(p);
+            precision = Some(printf_number(&mut i, "precision", i32::MAX as usize)?);
         }
         let conv = *chars
             .get(i)
@@ -10001,19 +11098,31 @@ fn printf_format_with(
             'c' => {
                 let v = take_arg(&keyed, values, &mut arg)?;
                 match v {
-                    Value::Str(s) => s.chars().next().map(String::from).unwrap_or_default(),
-                    other => {
-                        let n = other.to_int()?;
+                    Value::Str(s) if s.chars().count() == 1 => (**s).clone(),
+                    Value::Int(_) | Value::Bool(_) => {
+                        let n = match v {
+                            Value::Int(n) => n.to_i64().unwrap_or(i64::MAX),
+                            other => other.to_int()?,
+                        };
+                        if !(0..0x110000).contains(&n) {
+                            return Err(Unwind::Exception(VmException::new(
+                                "OverflowError",
+                                "%c arg not in range(0x110000)",
+                            )));
+                        }
+                        // A lone surrogate has no Rust `char`; see docs/vm.md.
                         char::from_u32(n as u32)
                             .map(String::from)
-                            .unwrap_or_default()
+                            .unwrap_or_else(|| char::REPLACEMENT_CHARACTER.to_string())
                     }
+                    _ => return Err(type_error("%c requires int or char")),
                 }
             }
             // `%u` is a deprecated alias for `%d`, still accepted.
             'd' | 'i' | 'u' => {
                 let v = take_arg(&keyed, values, &mut arg)?;
                 let iv = v.to_bigint()?;
+                crate::limits::check_int_to_str(&VmInt::from(iv.clone()))?;
                 printf_signed(
                     &pad_digits(&iv.abs().to_str_radix(10), precision),
                     iv.is_negative(),
@@ -10058,8 +11167,8 @@ fn printf_format_with(
                     "inf".to_owned()
                 } else {
                     let body = match conv {
-                        'e' => normalise_exp_notation(format!("{:.*e}", p, abs), false),
-                        'E' => normalise_exp_notation(format!("{:.*e}", p, abs), true),
+                        'e' => normalise_exp_notation(crate::limits::scientific(abs, p), false),
+                        'E' => normalise_exp_notation(crate::limits::scientific(abs, p), true),
                         'g' | 'G' => format_g(
                             abs,
                             if p == 0 { 1 } else { p },
@@ -10067,7 +11176,7 @@ fn printf_format_with(
                             false,
                             flag_alt,
                         ),
-                        _ => format!("{:.*}", p, abs),
+                        _ => crate::limits::fixed(abs, p),
                     };
                     if flag_alt {
                         ensure_decimal_point(&body)
@@ -10144,6 +11253,56 @@ fn pad_printf(body: &str, width: Option<usize>, left: bool, zero: bool, conv: ch
 
 fn overflow() -> Unwind {
     Unwind::Exception(VmException::new("OverflowError", "int overflow"))
+}
+
+/// `a / b` for two ints, correctly rounded as CPython's `long_true_divide`:
+/// the operands are not converted to floats first, so `10**400 / 10**399`
+/// is `10.0` (not `inf / inf`), and a quotient too large for a float raises.
+fn int_true_div(a: &VmInt, b: &VmInt) -> Result<f64, Unwind> {
+    use num_integer::Integer;
+    use num_traits::{ToPrimitive, Zero};
+    let (a, b) = (a.to_bigint(), b.to_bigint());
+    let negative = a.is_negative() != b.is_negative() && !a.is_zero();
+    let (a, b) = (a.abs(), b.abs());
+    let exact = |n: &BigInt| n.bits() <= 53;
+    let magnitude = if exact(&a) && exact(&b) {
+        // Both operands are exact doubles, so IEEE division rounds once.
+        a.to_f64().unwrap_or(0.0) / b.to_f64().unwrap_or(1.0)
+    } else if a.is_zero() {
+        0.0
+    } else {
+        // Scale to a 55–56-bit quotient, fold the remainder into a sticky
+        // bit, and let the single rounding to 53 bits happen in `to_f64`.
+        let shift = 55 + b.bits() as i64 - a.bits() as i64;
+        let (num, den) = if shift >= 0 {
+            (a << shift as usize, b)
+        } else {
+            (a, b << (-shift) as usize)
+        };
+        let (mut q, r) = num.div_rem(&den);
+        if !r.is_zero() {
+            q |= BigInt::from(1);
+        }
+        let q = q.to_f64().unwrap_or(f64::INFINITY);
+        let exp = i32::try_from(-shift).unwrap_or(if shift > 0 { i32::MIN } else { i32::MAX });
+        scale_pow2(q, exp)
+    };
+    if magnitude.is_infinite() {
+        return Err(Unwind::Exception(VmException::new(
+            "OverflowError",
+            "integer division result too large for a float",
+        )));
+    }
+    Ok(if negative { -magnitude } else { magnitude })
+}
+
+/// CPython's `RecursionError` for a comparison nested past its C recursion
+/// budget (`a == b` on two 10,000-deep lists).
+fn comparison_recursion() -> Unwind {
+    Unwind::Exception(VmException::new(
+        "RecursionError",
+        "maximum recursion depth exceeded in comparison",
+    ))
 }
 
 /// Resolve a sequence-repetition count (`seq * n` / `n * seq`). CPython treats
@@ -10272,7 +11431,7 @@ fn compute_slice(
 ) -> Result<(i64, i64, i64), Unwind> {
     let len_i = len as i64;
     let clamp_start = |x: i64| -> i64 {
-        let x = if x < 0 { x + len_i } else { x };
+        let x = if x < 0 { x.saturating_add(len_i) } else { x };
         if step > 0 {
             x.clamp(0, len_i)
         } else {
@@ -10280,7 +11439,7 @@ fn compute_slice(
         }
     };
     let clamp_stop = |x: i64| -> i64 {
-        let x = if x < 0 { x + len_i } else { x };
+        let x = if x < 0 { x.saturating_add(len_i) } else { x };
         if step > 0 {
             x.clamp(0, len_i)
         } else {
@@ -10295,7 +11454,7 @@ fn compute_slice(
                 len_i - 1
             }
         }
-        v => clamp_start(v.to_int()?),
+        v => clamp_start(slice_bound(v)?),
     };
     let stop = match upper {
         Value::None => {
@@ -10305,7 +11464,7 @@ fn compute_slice(
                 -1
             }
         }
-        v => clamp_stop(v.to_int()?),
+        v => clamp_stop(slice_bound(v)?),
     };
     Ok((start, stop, step))
 }
@@ -10315,6 +11474,7 @@ fn values_identical(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (None, None) => true,
         (Bool(x), Bool(y)) => x == y,
+        (FloatData(x), FloatData(y)) => x.identity != 0 && x.identity == y.identity,
         (Int(x), Int(y)) => x == y,
         (Str(x), Str(y)) => Rc::ptr_eq(x, y) || x == y,
         (List(x), List(y)) => Rc::ptr_eq(x, y),
@@ -10329,6 +11489,10 @@ fn values_identical(a: &Value, b: &Value) -> bool {
         (Function(x), Function(y)) => Rc::ptr_eq(x, y),
         (Native(x), Native(y)) => Rc::ptr_eq(x, y),
         (Coroutine(x), Coroutine(y)) => Rc::ptr_eq(x, y),
+        // An iterator / generator is one shared state: `iter(g) is g`.
+        (Iter(x), Iter(y)) => Rc::ptr_eq(x, y),
+        // One raised exception keeps its payload `Rc` through every clone.
+        (Exception { .. }, Exception { .. }) => crate::value::exception_values_identical(a, b),
         _ => false,
     }
 }
@@ -10337,7 +11501,7 @@ fn values_identical(a: &Value, b: &Value) -> bool {
 /// can fail for a reason other than their types (a NaN). `complex` is
 /// deliberately excluded: CPython refuses to order it at all.
 fn both_numeric(l: &Value, r: &Value) -> bool {
-    let numeric = |v: &Value| matches!(v, Value::Int(_) | Value::Float(_) | Value::Bool(_));
+    let numeric = |v: &Value| matches!(v, Value::Int(_) | Value::FloatData(_) | Value::Bool(_));
     numeric(l) && numeric(r)
 }
 
@@ -10345,8 +11509,8 @@ fn both_numeric(l: &Value, r: &Value) -> bool {
 fn unorderable(l: &Value, op: &str, r: &Value) -> Unwind {
     type_error(format!(
         "'{op}' not supported between instances of '{}' and '{}'",
-        l.type_name(),
-        r.type_name()
+        l.type_display_name(),
+        r.type_display_name()
     ))
 }
 
@@ -10354,11 +11518,34 @@ fn unorderable(l: &Value, op: &str, r: &Value) -> Unwind {
 /// `list indices must be integers or slices, not float` wording otherwise.
 fn sequence_index(key: &Value, seq: &str) -> Result<i64, Unwind> {
     match key {
-        Value::Int(_) | Value::Bool(_) => key.to_int(),
+        Value::Int(_) | Value::Bool(_) => index_int(key),
         other => Err(type_error(format!(
             "{seq} indices must be integers or slices, not {}",
             other.type_name()
         ))),
+    }
+}
+
+/// An integer subscript: CPython's `IndexError` for one that does not fit
+/// `Py_ssize_t` (`[1][-(2**70)]`).
+fn index_int(key: &Value) -> Result<i64, Unwind> {
+    match key {
+        Value::Int(n) => n
+            .to_i64()
+            .ok_or_else(|| index_error("cannot fit 'int' into an index-sized integer")),
+        other => other.to_int(),
+    }
+}
+
+/// A slice bound: CPython clips one outside `Py_ssize_t` to its range
+/// (`'abc'[2**64:]` is `''`).
+fn slice_bound(v: &Value) -> Result<i64, Unwind> {
+    match v {
+        Value::Int(n) => {
+            Ok(n.to_i64()
+                .unwrap_or(if n.is_negative() { i64::MIN } else { i64::MAX }))
+        }
+        other => other.to_int(),
     }
 }
 
@@ -10852,7 +12039,7 @@ fn require_str_return(v: Value, dunder: &str) -> Result<String, Unwind> {
 fn value_as_complex(v: &Value) -> Option<(f64, f64)> {
     match v {
         Value::Complex(re, im) => Some((*re, *im)),
-        Value::Float(x) => Some((*x, 0.0)),
+        Value::FloatData(crate::value::VmFloat { value: x, .. }) => Some((*x, 0.0)),
         Value::Int(i) => Some((i.to_f64(), 0.0)),
         Value::Bool(b) => Some((*b as i64 as f64, 0.0)),
         _ => None,
@@ -11120,7 +12307,7 @@ fn base_trailing_name(base: &Expr) -> Option<&str> {
 /// `*Warning` suffixes, covering builtins like `ValueError`/`KeyError`/
 /// `Warning` and user hierarchies like `AppError`), plus the handful of
 /// builtin exception bases that don't follow the suffix convention.
-fn name_is_exception_base(name: &str) -> bool {
+pub(crate) fn name_is_exception_base(name: &str) -> bool {
     name.ends_with("Error")
         || name.ends_with("Exception")
         || name.ends_with("Warning")
@@ -11161,21 +12348,43 @@ pub(crate) fn class_has_builtin_exc_base(class: &Rc<Class>, target: &str) -> boo
 /// `Ok(None)` for anything that isn't set-like (so the binop falls through to
 /// the normal dunder / mismatch path), and propagates an unwind if a view
 /// element isn't hashable. `dict.values()` is intentionally not set-like.
-fn as_set_operand(v: &Value) -> Result<Option<std::collections::HashSet<HashKey>>, Unwind> {
+fn as_set_operand(v: &Value) -> Result<Option<crate::pyset::PySet>, Unwind> {
     use crate::value::DictViewKind;
     match v {
-        Value::Set(s) => Ok(Some(s.borrow().iter().cloned().collect())),
+        Value::Set(s) => Ok(Some(s.borrow().clone())),
+        // A view joins set algebra as `set(view)`: its items added in order.
         Value::DictView {
-            kind: DictViewKind::Keys | DictViewKind::Items,
-            items,
+            kind: kind @ (DictViewKind::Keys | DictViewKind::Items),
+            dict,
         } => {
-            let mut out = std::collections::HashSet::with_capacity(items.len());
-            for item in items {
+            let mut out = crate::pyset::PySet::new();
+            for item in crate::value::view_items(*kind, dict) {
                 out.insert(item.to_hash_key()?);
             }
             Ok(Some(out))
         }
         _ => Ok(None),
+    }
+}
+
+/// Whether CPython's AST optimiser folds `e` into a constant — what decides
+/// that a set literal is built from a constant `frozenset`.
+fn is_constant_expr(e: &Expr) -> bool {
+    match e {
+        Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::BytesLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::NoneLiteral(_)
+        | Expr::EllipsisLiteral(_) => true,
+        Expr::UnaryOp(u) => {
+            matches!(
+                u.op,
+                ast::UnaryOp::USub | ast::UnaryOp::UAdd | ast::UnaryOp::Invert
+            ) && matches!(u.operand.as_ref(), Expr::NumberLiteral(_))
+        }
+        Expr::Tuple(t) => t.elts.iter().all(is_constant_expr),
+        _ => false,
     }
 }
 
@@ -11221,52 +12430,6 @@ fn exc_fallback_args(message: &str) -> Vec<Value> {
         Vec::new()
     } else {
         vec![Value::Str(Rc::new(message.to_owned()))]
-    }
-}
-
-/// Whether builtin exception `kind` is `target` or one of its subclasses in
-/// the standard CPython exception hierarchy. `Exception` / `BaseException`
-/// match everything except the bare base-only kinds. Returns false for
-/// unknown names (user exceptions go through the instance-MRO path instead).
-/// Render a `as!` type-descriptor AST back to a readable string for the
-/// `TypeError` message (`dict[str, int]`, `int | None`, `list[int]`). Kept
-/// close to the `str(tp)` text the compile path's `cast.py` produces.
-/// `str(tp)` of an `as!` target, matching the compiled runtime's
-/// `_format_type` in the failure message: a bare class renders as
-/// `<class 'int'>` (a builtin) or `<class '__main__.User'>` (a user class);
-/// a parametric or union type renders as its annotation text
-/// (`dict[str, int]`, `int | None`), which is what `str()` of a
-/// `types.GenericAlias` / `types.UnionType` gives.
-fn format_cast_type_display(tp: &Expr) -> String {
-    const BUILTIN_TYPES: &[&str] = &[
-        "int",
-        "float",
-        "str",
-        "bool",
-        "bytes",
-        "bytearray",
-        "list",
-        "dict",
-        "set",
-        "frozenset",
-        "tuple",
-        "object",
-        "complex",
-        "type",
-        "range",
-        "slice",
-        "memoryview",
-    ];
-    match tp {
-        Expr::Name(n) => {
-            let name = n.id.as_str();
-            if BUILTIN_TYPES.contains(&name) {
-                format!("<class '{name}'>")
-            } else {
-                format!("<class '__main__.{name}'>")
-            }
-        }
-        other => format_cast_type(other),
     }
 }
 
@@ -11578,7 +12741,7 @@ fn ensure_decimal_point(s: &str) -> String {
 /// would strip and always leaves a decimal point.
 fn format_g(abs: f64, sig: usize, upper: bool, dot_0: bool, alt: bool) -> String {
     // Format in scientific notation to determine the exponent.
-    let sci = format!("{:.*e}", sig.saturating_sub(1), abs);
+    let sci = crate::limits::scientific(abs, sig.saturating_sub(1));
     // Parse out the exponent.
     let exp: i32 = if let Some(pos) = sci.find('e') {
         sci[pos + 1..].parse().unwrap_or(0)
@@ -11603,7 +12766,7 @@ fn format_g(abs: f64, sig: usize, upper: bool, dot_0: bool, alt: bool) -> String
     } else {
         // Fixed notation: format with enough decimal places, then strip zeros.
         let decimal_places = (sig as i32 - 1 - exp).max(0) as usize;
-        let fixed = format!("{:.*}", decimal_places, abs);
+        let fixed = crate::limits::fixed(abs, decimal_places);
         if alt {
             ensure_decimal_point(&fixed)
         } else if fixed.contains('.') {
@@ -11619,9 +12782,47 @@ fn format_g(abs: f64, sig: usize, upper: bool, dot_0: bool, alt: bool) -> String
     result
 }
 
+/// A width or precision in a format spec. CPython parses it into a
+/// `Py_ssize_t` and refuses one that overflows.
+fn spec_number(raw: &[char], i: &mut usize) -> Result<usize, Unwind> {
+    let mut n = 0usize;
+    while let Some(k) = raw.get(*i).and_then(|c| c.to_digit(10)) {
+        n = n
+            .checked_mul(10)
+            .and_then(|n| n.checked_add(k as usize))
+            .filter(|n| *n <= isize::MAX as usize)
+            .ok_or_else(|| {
+                Unwind::Exception(VmException::new(
+                    "ValueError",
+                    "Too many decimal digits in format string",
+                ))
+            })?;
+        *i += 1;
+    }
+    Ok(n)
+}
+
 fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, Unwind> {
     if spec.is_empty() {
         return Ok(default.to_owned());
+    }
+    // These types inherit `object.__format__`, which takes only the empty
+    // spec (`f"{None:>6}"` is a `TypeError` in CPython).
+    if matches!(
+        value,
+        Value::None
+            | Value::List(_)
+            | Value::Tuple(_)
+            | Value::Dict(_)
+            | Value::Set(_)
+            | Value::Bytes(_)
+            | Value::Range { .. }
+            | Value::DictView { .. }
+    ) {
+        return Err(type_error(format!(
+            "unsupported format string passed to {}.__format__",
+            value.type_name()
+        )));
     }
     // A complex formats its two components with the spec and joins them —
     // `format(1+2j, ".1f")` is `1.0+2.0j`, with no parentheses. The
@@ -11684,16 +12885,7 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
                 i += 1;
             }
             d if d.is_ascii_digit() => {
-                let mut n = 0usize;
-                while i < raw.len() {
-                    if let Some(k) = raw[i].to_digit(10) {
-                        n = n * 10 + k as usize;
-                        i += 1;
-                    } else {
-                        break;
-                    }
-                }
-                width = Some(n);
+                width = Some(spec_number(&raw, &mut i)?);
             }
             ',' => {
                 comma = true;
@@ -11705,16 +12897,7 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
             }
             '.' => {
                 i += 1;
-                let mut n = 0usize;
-                while i < raw.len() {
-                    if let Some(k) = raw[i].to_digit(10) {
-                        n = n * 10 + k as usize;
-                        i += 1;
-                    } else {
-                        break;
-                    }
-                }
-                precision = Some(n);
+                precision = Some(spec_number(&raw, &mut i)?);
             }
             _ => {
                 typ = Some(c);
@@ -11723,10 +12906,26 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
         }
     }
 
+    if comma && underscore {
+        return Err(value_error("Cannot specify both ',' and '_'."));
+    }
+    if let (Value::Int(n), None | Some('d' | 'n')) = (value, typ) {
+        crate::limits::check_int_to_str(n)?;
+    }
+    // A width the result cannot be padded to is CPython's `MemoryError`,
+    // and a float precision beyond a C `int` its "precision too big".
+    if let Some(w) = width {
+        crate::limits::ensure_alloc_items(w, fill.len_utf8())?;
+    }
+    if let (Some(p), Value::FloatData(_) | Value::Int(_) | Value::Bool(_)) = (precision, value) {
+        if !matches!(typ, Some('d' | 'n' | 'x' | 'X' | 'o' | 'b' | 'c' | 's')) {
+            crate::limits::check_float_precision(p)?;
+        }
+    }
     // The conversion type implies a *numeric* default alignment (right);
     // zero-pad implies fill='0' and align='=' (sign before pad). Strings
     // default to left-aligned. We approximate by tracking `is_numeric`.
-    let is_numeric = matches!(value, Value::Int(_) | Value::Float(_) | Value::Bool(_));
+    let is_numeric = matches!(value, Value::Int(_) | Value::FloatData(_) | Value::Bool(_));
     if zero_pad && align.is_none() {
         align = Some('=');
         fill = '0';
@@ -11749,7 +12948,7 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
         } else if abs.is_infinite() {
             "inf%".to_owned()
         } else {
-            let digits = format!("{:.*}", p, abs);
+            let digits = crate::limits::fixed(abs, p);
             let digits = if alternate {
                 ensure_decimal_point(&digits)
             } else {
@@ -11800,7 +12999,7 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
     };
 
     match value {
-        Value::Float(x) => {
+        Value::FloatData(crate::value::VmFloat { value: x, .. }) => {
             let p = precision.unwrap_or(6);
             let (abs, neg) = (x.abs(), *x < 0.0 || x.is_sign_negative());
             // CPython formats NaN and inf with lowercase letters regardless of
@@ -11816,7 +13015,7 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
                         // Rust's {:e} produces e.g. `3.141590e0`; CPython requires
                         // at least 2 exponent digits with an explicit sign: `3.141590e+00`.
                         let upper = typ == Some('E');
-                        let body = normalise_exp_notation(format!("{:.*e}", p, abs), upper);
+                        let body = normalise_exp_notation(crate::limits::scientific(abs, p), upper);
                         if alternate {
                             ensure_decimal_point(&body)
                         } else {
@@ -11843,8 +13042,8 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
                         let sig = if p == 0 { 1 } else { p };
                         format_g(abs, sig, false, true, alternate)
                     }
-                    _ if alternate => ensure_decimal_point(&format!("{:.*}", p, abs)),
-                    _ => format!("{:.*}", p, abs),
+                    _ if alternate => ensure_decimal_point(&crate::limits::fixed(abs, p)),
+                    _ => crate::limits::fixed(abs, p),
                 }
             };
             buf = if comma || underscore {
@@ -12054,11 +13253,62 @@ fn join_module(package: &[String], name: &str) -> String {
 fn class_docstring(c: &ast::StmtClassDef) -> Option<String> {
     match c.body.first() {
         Some(Stmt::Expr(e)) => match e.value.as_ref() {
-            Expr::StringLiteral(s) => Some(s.value.to_str().to_owned()),
+            Expr::StringLiteral(s) => Some(clean_doc(s.value.to_str())),
             _ => None,
         },
         _ => None,
     }
+}
+
+/// `str.expandtabs(tabsize)`: columns reset at `\n` / `\r`.
+fn expand_tabs(s: &str, tabsize: usize) -> String {
+    if !s.contains('\t') {
+        return s.to_owned();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut column = 0usize;
+    for c in s.chars() {
+        match c {
+            '\t' => {
+                let spaces = tabsize - column % tabsize;
+                out.extend(std::iter::repeat_n(' ', spaces));
+                column += spaces;
+            }
+            '\n' | '\r' => {
+                out.push(c);
+                column = 0;
+            }
+            _ => {
+                out.push(c);
+                column += 1;
+            }
+        }
+    }
+    out
+}
+
+/// CPython 3.13's compile-time docstring cleanup (`_PyCompile_CleanDoc`):
+/// tabs expanded, the first line's leading spaces dropped, and the common
+/// indentation of the later non-blank lines removed from every later line.
+pub(crate) fn clean_doc(doc: &str) -> String {
+    let expanded = expand_tabs(doc, 8);
+    let mut lines = expanded.split('\n');
+    let first = lines.next().unwrap_or("").trim_start_matches(' ');
+    let rest: Vec<&str> = lines.collect();
+    let margin = rest
+        .iter()
+        .filter(|l| !l.trim_start_matches(' ').is_empty())
+        .map(|l| l.len() - l.trim_start_matches(' ').len())
+        .min()
+        .unwrap_or(0);
+    let mut out = String::with_capacity(expanded.len());
+    out.push_str(first);
+    for line in rest {
+        out.push('\n');
+        let spaces = line.len() - line.trim_start_matches(' ').len();
+        out.push_str(&line[spaces.min(margin)..]);
+    }
+    out
 }
 
 /// A module's docstring: the leading string-literal expression statement of
@@ -12068,7 +13318,7 @@ fn class_docstring(c: &ast::StmtClassDef) -> Option<String> {
 fn body_docstring(body: &[Stmt]) -> Option<String> {
     match body.first()? {
         Stmt::Expr(e) => match e.value.as_ref() {
-            Expr::StringLiteral(s) => Some(s.value.to_str().to_owned()),
+            Expr::StringLiteral(s) => Some(clean_doc(s.value.to_str())),
             _ => None,
         },
         _ => None,
@@ -12078,7 +13328,7 @@ fn body_docstring(body: &[Stmt]) -> Option<String> {
 pub(crate) fn module_docstring(module: &ModModule) -> Option<String> {
     match module.body.first() {
         Some(ruff_python_ast::Stmt::Expr(e)) => match e.value.as_ref() {
-            ruff_python_ast::Expr::StringLiteral(s) => Some(s.value.to_str().to_owned()),
+            ruff_python_ast::Expr::StringLiteral(s) => Some(clean_doc(s.value.to_str())),
             _ => None,
         },
         _ => None,
@@ -12108,6 +13358,20 @@ pub(crate) fn class_is_protocol_pub(cls: &Rc<crate::value::Class>) -> bool {
 
 fn class_is_protocol(cls: &Rc<crate::value::Class>) -> bool {
     cls.is_protocol || cls.name == "Protocol" || cls.bases.iter().any(class_is_protocol)
+}
+
+/// The C library's message for errno ERANGE, which CPython puts in a float
+/// `OverflowError`: "Result too large" on macOS and Windows, "Numerical
+/// result out of range" under glibc.
+fn erange_message() -> String {
+    #[cfg(unix)]
+    {
+        let full = std::io::Error::from_raw_os_error(libc::ERANGE).to_string();
+        if let Some(msg) = full.strip_suffix(&format!(" (os error {})", libc::ERANGE)) {
+            return msg.to_owned();
+        }
+    }
+    "Result too large".to_owned()
 }
 
 #[cfg(test)]
@@ -12895,34 +14159,32 @@ e = (1+2j) - (3+1j)
     #[test]
     fn dict_view_repr_iter_len_contains() {
         use crate::value::DictViewKind;
+        let mut map: DictMap = DictMap::new();
+        map.insert(
+            HashKey::Str(Rc::new("a".into())),
+            Value::Int(VmInt::from(1)),
+        );
+        map.insert(
+            HashKey::Str(Rc::new("b".into())),
+            Value::Int(VmInt::from(2)),
+        );
+        let dict = Rc::new(crate::value::FrozenCell::new(map));
         let keys = Value::DictView {
             kind: DictViewKind::Keys,
-            items: vec![
-                Value::Str(Rc::new("a".into())),
-                Value::Str(Rc::new("b".into())),
-            ],
+            dict: dict.clone(),
         };
         assert_eq!(keys.py_str(), "dict_keys(['a', 'b'])");
         assert_eq!(keys.type_name(), "dict_keys");
 
         let values = Value::DictView {
             kind: DictViewKind::Values,
-            items: vec![Value::Int(VmInt::from(1)), Value::Int(VmInt::from(2))],
+            dict: dict.clone(),
         };
         assert_eq!(values.py_str(), "dict_values([1, 2])");
 
         let items = Value::DictView {
             kind: DictViewKind::Items,
-            items: vec![
-                Value::Tuple(Rc::new(vec![
-                    Value::Str(Rc::new("a".into())),
-                    Value::Int(VmInt::from(1)),
-                ])),
-                Value::Tuple(Rc::new(vec![
-                    Value::Str(Rc::new("b".into())),
-                    Value::Int(VmInt::from(2)),
-                ])),
-            ],
+            dict,
         };
         assert_eq!(items.py_str(), "dict_items([('a', 1), ('b', 2)])");
 

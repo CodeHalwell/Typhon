@@ -32,10 +32,12 @@
 //!
 //! ## Scanning rules
 //!
-//! * Single- and double-quoted strings cannot span a physical line: an
-//!   unterminated one is reset at end-of-line (it is a Python syntax error
-//!   anyway, and resetting stops one bad line from swallowing the rest of
-//!   the file). Triple-quoted strings persist across lines.
+//! * Single- and double-quoted strings span a physical line only through a
+//!   backslash-escaped line break (`"a,b\` + newline), and then carry their
+//!   state onto the next line exactly like a triple-quoted string does. Any
+//!   other unterminated one is reset at end-of-line (it is a Python syntax
+//!   error anyway, and resetting stops one bad line from swallowing the rest
+//!   of the file). Triple-quoted strings persist across lines.
 //! * A backslash escapes the next character inside **every** string mode.
 //!   Raw-string prefixes are not modelled — the escape is honoured either
 //!   way, which matches what the majority of the previous copies did.
@@ -215,6 +217,13 @@ where
     let bytes = line.as_bytes();
     let start_depth = *depth;
     let mut code_end = line.len();
+    // Set when the line ends with a backslash escaping the line break inside
+    // the literal portion of a string — `"a,b\` followed by a newline. In a
+    // single- or double-quoted string that continues the literal onto the
+    // next physical line, so its state must be carried (see the end of the
+    // scan). Both terminator shapes count, and so does a backslash that is
+    // the very last byte, for callers that scan lines without terminators.
+    let mut escaped_line_break = false;
 
     // Frame stack. Seeded from the carried-over `in_string` so a triple-quoted
     // string opened on an earlier line resumes correctly. A carried-over
@@ -241,6 +250,9 @@ where
             if !top.in_field {
                 // ── Literal portion of a string ──────────────────────────
                 emit(i, ByteKind::StringText, *depth);
+                if b == b'\\' && matches!(bytes.get(i + 1), None | Some(b'\n') | Some(b'\r')) {
+                    escaped_line_break = true;
+                }
                 if b == b'\\' && i + 1 < bytes.len() {
                     let n = char_len_at(bytes, i + 1);
                     for k in 0..n {
@@ -450,13 +462,23 @@ where
         i += 1;
     }
 
-    // Carry only a triple-quoted string across the line boundary. An
-    // unterminated single/double-quoted string is a Python syntax error;
-    // resetting keeps one bad line from swallowing the rest of the file.
-    *in_string = stack
-        .first()
-        .map(|f| f.mode)
-        .filter(|mode| mode.is_triple());
+    // Carry a triple-quoted string across the line boundary, and a single-
+    // line string whose line break was escaped with a backslash (`"a,b\`
+    // then newline is ONE literal spanning two physical lines — resetting it
+    // here made the continuation read as code, so `tyc fmt` respaced the
+    // literal's contents and a `?` / `as!` / `rescue` in it was lowered as
+    // sugar). Any other unterminated single/double-quoted string is a Python
+    // syntax error; resetting keeps one bad line from swallowing the rest of
+    // the file. A continued string carries as its plain mode: an f-string's
+    // replacement fields on the continuation line then read as string text,
+    // which is conservative (no rewrite fires inside them).
+    *in_string = match stack.first() {
+        Some(frame) if frame.mode.is_triple() => Some(frame.mode),
+        Some(frame) if stack.len() == 1 && !frame.in_field && escaped_line_break => {
+            Some(frame.mode)
+        }
+        _ => None,
+    };
 
     LineScan {
         code_end,

@@ -63,13 +63,13 @@ Before v0.9.0 `lazy import np = numpy` raised `ImportError` under `tyc run` (the
 ### `lazy from` is rejected
 
 ```python
-lazy from numpy import array    # ❌ parse error
+lazy from numpy import array    # ❌ rejected at check time
 ```
 
 ```
-error[tyc::lazy_from_import]: `lazy from … import` is not allowed because it eagerly
-                              touches attributes on the source module — use
-                              `lazy import numpy` plus `numpy.array(...)`
+error[tyc::lazy_usage]: `lazy from … import` is not allowed because it eagerly
+                        touches attributes on the source module — use
+                        `lazy import numpy` plus `numpy.array(...)`
 ```
 
 PEP 690 explains why: `from`-imports eagerly resolve attributes, defeating deferral.

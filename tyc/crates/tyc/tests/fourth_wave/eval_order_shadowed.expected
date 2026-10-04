@@ -1,0 +1,9 @@
+super
+q
+2 10
+list
+q
+Ok(value=11)
+super
+q
+Err(error='bad')

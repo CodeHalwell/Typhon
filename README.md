@@ -60,8 +60,9 @@ def main() -> None:
             print(f"timed out after {after_ms}ms")
 ```
 
-Add a third variant to `LoadError` and **every `match` site turns red** until you
-handle it. That is the kind of safety Typhon brings to Python — and it compiles to
+Add a third variant to `LoadError` and every `match` that lists its variants turns red
+until you handle the new one — including this one, where they sit inside `Err(...)`
+arms. That is the kind of safety Typhon brings to Python — and it compiles to
 idiomatic dataclasses + a small generated `Ok`/`Err` helper you can read and debug.
 
 ## Why Typhon
@@ -172,6 +173,7 @@ Focused references in this repo:
 | [docs/vm.md](docs/vm.md) | The in-process tree-walking VM (default for `tyc run`) |
 | [docs/architecture.md](docs/architecture.md) | Compiler pipeline, crate layout, toolchain choices |
 | [docs/diagnostics/](docs/diagnostics/) | One page per `tyc::` code — also surfaced by `tyc explain <code>` |
+| [docs/compatibility.md](docs/compatibility.md) | What the beta line will not break, how breaking changes are made, and what counts as a bug |
 | [docs/roadmap.md](docs/roadmap.md) · [docs/risks.md](docs/risks.md) · [docs/prior-art.md](docs/prior-art.md) | The phased plan, risks, and influences |
 | [editors/vscode/README.md](editors/vscode/README.md) | VS Code extension — syntax highlighting + LSP client |
 
@@ -179,20 +181,22 @@ The single canonical design doc is **[the long-term plan](docs/long-term-plan.md
 
 ## Project status
 
-**Current release: [v1.0.0-alpha.9](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.9)** (2026-08-21).
+**Current release: [v1.0.0-beta.1](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-beta.1)** (2026-10-04).
 
 Typhon reached its **first feature-complete alpha** in
 [v1.0.0-alpha](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha): the
 proven production surface *plus* the type-system frontier earlier releases deferred
 (higher-kinded type unification, user-generic variance inference, the inter-procedural
-field-init audit). Since then, the alpha.2 → alpha.9 point releases have been a
+field-init audit). The alpha.2 → alpha.9 point releases that followed were a
 soundness, robustness, performance, release-engineering, and codebase-review
-hardening pass.
+hardening pass, and **v1.0.0-beta.1**, the first beta, closes four
+review-remediation waves and freezes the surface under the
+[compatibility policy](docs/compatibility.md).
 
 - ✅ **The production path is stable.** `tyc build` → CPython 3.13+ carries no runtime dependency on the toolchain; the full `examples/` + `examples/apps/` corpus builds to runnable Python and checks clean.
-- ✅ **The language is additive on *correct* programs** across the whole v0.3.0 → v1.0.0-alpha line — every program that type-checked *and ran correctly* continues to behave identically. (A few deliberate diagnostics reject only code that already crashed at runtime.)
-- ⚠️ **As an alpha, the surface syntax is not yet frozen** — it may change before `1.0.0`, always with a documented migration note.
-- ⏳ **Deferred to beta:** embedded in-process `ty` (the subprocess `[checker] external = "ty"` path ships), typeshed-backed checking for pure-extension libraries, and the function-level HKT tail.
+- ✅ **The language is additive on *correct* programs** across the whole v0.3.0 → v1.0.0-alpha line — every program that type-checked *and ran correctly* continues to behave identically. (A few deliberate diagnostics reject only code that already crashed at runtime.) The deliberate exceptions in v1.0.0-beta.1, chiefly `[strictness] nullable-use` now defaulting to `"error"`, are listed in the compatibility policy.
+- ✅ **The surface is frozen for the beta line.** From `v1.0.0-beta.1` the forms listed in the **[compatibility policy](docs/compatibility.md)** keep their syntax and meaning in every beta release, and the policy says how a deprecation or breaking change is made.
+- ⏳ **Still deferred:** embedded in-process `ty` (the subprocess `[checker] external = "ty"` path ships), typeshed-backed checking for pure-extension libraries, and the function-level HKT tail.
 
 **Want the details?** The full release-by-release history lives in
 **[CHANGELOG.md](CHANGELOG.md)** (every release back to v0.1.0), and the per-feature

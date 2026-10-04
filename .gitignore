@@ -3,6 +3,12 @@
 __pycache__/
 .claude/worktrees/
 
+# macOS Finder metadata (untracked; leave existing files alone)
+.DS_Store
+
+# Local dev venv at the repo root (the committed product never installs one)
+/.venv/
+
 # tyc / uv build artefacts
 examples/*/build/
 examples/*/pyproject.toml
@@ -23,3 +29,4 @@ stress/round-2026-06-21/proj/
 # AI-agent scratch notes live only in lowercase .jules/ — the capitalised
 # twin breaks checkout on case-insensitive filesystems (macOS, Windows).
 .Jules/
+code_review/

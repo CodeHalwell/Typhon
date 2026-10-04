@@ -1,17 +1,20 @@
 # Differential and knob-coverage gates
 
-Two CI gates, added in response to items **T0.2** and **T0.4** of
-[`codebase-review-2026-07-28.md`](codebase-review-2026-07-28.md). Both live in
-`scripts/`, run locally with no network access, and refuse to run at all rather
-than run partially — a gate that passes vacuously is worse than no gate, because
-it reads as coverage.
+The CI gates added in response to items **T0.2** and **T0.4** of
+[`codebase-review-2026-07-28.md`](reviews/codebase-review-2026-07-28.md), plus the
+de-formatted-corpus `tyc fmt` gate and the emitted-AST equivalence harness
+(fourth review wave, W6/W7). All live in `scripts/`, run locally with no
+network access, and refuse to run at all rather than run partially — a gate
+that passes vacuously is worse than no gate, because it reads as coverage.
 
 | Gate | Script | CI job | What it proves |
 |---|---|---|---|
-| VM ↔ CPython differential | `scripts/vm-differential.sh` | `differential` | `tyc run` behaves identically to `tyc build` + CPython 3.13 over the whole `.ty` corpus |
+| VM ↔ CPython differential | `scripts/vm-differential.sh` | `differential`, `valid-corpus` | `tyc run` behaves identically to `tyc build` + CPython 3.13 over `examples/` + `stress/` (plus `corpus/valid/` under its own baseline — see below) |
 | Opt-in knob codegen matrix | `scripts/knob-matrix.sh` | `knob-matrix` | Every opt-in codegen knob actually fires, and does not change observable behaviour |
+| De-formatted corpus `tyc fmt` gate | `scripts/emitted-ast.py fmt-gate` | `fmt-corpus` | `tyc fmt` never changes what a program means, over every unit of `examples/` + `stress/` + `corpus/valid/` |
+| Emitted-AST equivalence | `scripts/emitted-ast.py equiv` | — (run by hand) | Two compilers (binaries or git revisions) emit the same Python AST for every corpus unit, or exactly which units differ |
 
-Both require a release binary and a CPython **3.13+** interpreter reachable as
+All require a release binary and a CPython **3.13+** interpreter reachable as
 `python3.13`:
 
 ```bash
@@ -175,6 +178,8 @@ The gate keeps the list honest from both ends, but asymmetrically:
 ```bash
 scripts/vm-differential.sh                       # whole corpus, gate against the baseline
 scripts/vm-differential.sh --scope examples      # examples/ only
+scripts/vm-differential.sh --scope valid \       # corpus/valid/ against its own baseline
+    --baseline scripts/valid-corpus-baseline.txt
 scripts/vm-differential.sh --jobs 16             # parallelism (default: nproc)
 scripts/vm-differential.sh --report r.tsv        # full per-unit TSV
 scripts/vm-differential.sh --update              # rewrite the baseline from this run
@@ -187,6 +192,33 @@ TMPDIR=/tmp/triage scripts/vm-differential.sh \
     --filter 'examples/57-iterators-generators' --keep
 # then diff cpy.out / vm.out and read vm.err in the kept workdir
 ```
+
+### The valid-programs corpus (`--scope valid`, W6-18)
+
+`corpus/valid/` holds real, ordinary libraries (seeded from CPython 3.13's
+stdlib via `tyc migrate`, hand-fixed once — see `corpus/valid/README.md`),
+kept green by the `valid-corpus` CI job: `tyc check corpus/valid/` (every new
+diagnostic is swept over ordinary code, so a false positive like W1-01/W1-02
+fails fast) plus the same harness over `--scope valid`. The valid scope has
+its **own** baseline file, so the two gates evolve independently — and `all`
+stays `examples` + `stress`, so the main baseline never sees valid units.
+
+The valid corpus is stdlib-only by design, so unlike the main baseline it has
+no third-party package set to keep in sync. Its seed triage (2026-10-03,
+alpha.9) is recorded in `corpus/valid/README.md`: four units agree
+byte-for-byte, `heapq` agrees including its doctests, `textwrap` is a
+baselined VM bug (`dict.fromkeys` unmodelled), and `string.ty` is
+`vacuous-runtime` on both surfaces (an emitter bug in explicit
+`__init_subclass__()` calls — out of scope for the corpus, which stays
+faithful to upstream).
+
+**Do not `--update` a custom `--baseline`.** `--update` rewrites `$BASELINE`
+(which honours `--baseline`) **and** the shared
+`scripts/nobuild-baseline.txt` (which does not) from *this run's* units, so an
+`--update --scope valid` would truncate the main nobuild list to the valid
+units. Grow `scripts/valid-corpus-baseline.txt` by hand from a `--report` run
+after triaging each entry; all seven seed units build, so nothing valid
+belongs in the nobuild list today.
 
 Runtime is roughly **75 s** for the full 1130-unit corpus at `--jobs 8` on a
 4-core machine; CI runs it at `--jobs 2`. CI used `--jobs 4` until v1.0.0-alpha.9:
@@ -325,7 +357,100 @@ network-free.
 
 ---
 
-## 3. Known gaps
+## 3. De-formatted corpus `tyc fmt` gate
+
+### Why
+
+`tyc fmt` rewrites files in place and is the one tool people run without
+reading the diff. It has corrupted source in four release lines (`?` turned
+into `| None`, string-literal contents respaced, …), each time through a text
+edit that a parse of its own output would have caught. Since W7-03 the
+formatter lowers its output as it lowered its input, parses both, and refuses
+to write unless the two ASTs are equal (`tyc_syntax::ast_equiv`). This gate
+checks the same property end to end, over the whole corpus, through
+`tyc build`.
+
+### What it does
+
+1. Build every unit of `examples/`, `stress/` and `corpus/valid/` as written
+   and record the AST of every emitted `.py` (`ast.dump`, positions and
+   comments ignored, compiler temporaries named `__typhon_*` renumbered by
+   first appearance, docstrings compared with each line trimmed because
+   `ruff format` may re-indent them).
+2. Copy the corpus and de-format the code in every `.ty` file: `let x: T = 1`
+   becomes `let x:T=1`, spaces after `,` and `:` and around `=`, augmented
+   assignments and `->` are removed, and two trailing blanks are added to
+   code lines. Indentation, line breaks, strings and comments are untouched,
+   so the program means the same thing.
+3. Run `tyc fmt` on each de-formatted file (with `ruff` on `PATH` in CI, so
+   the whole formatter runs, not only its whitespace pass).
+4. Build the formatted copy and compare every unit's emitted AST with step 1.
+
+The gate fails when a unit's emitted AST changes, when a unit builds on one
+side only, or when `tyc fmt` refuses a de-formatted file it formats fine as
+written. A file `tyc fmt` cannot format even as written (a parse-error probe
+in `stress/`) is reported as an expected refusal. There is no baseline file:
+the first run on the current corpus was clean (1,224 built units identical,
+264 non-building units non-building on both sides, 8 expected refusals).
+
+### Running it
+
+```bash
+python3.13 scripts/emitted-ast.py fmt-gate --tyc tyc/target/release/tyc
+python3.13 scripts/emitted-ast.py fmt-gate --scope examples --filter '^examples/0' --keep
+```
+
+`--report PATH` writes one TSV line per unit (`same`, `changed`, `status`,
+`same-nobuild`, …). `--keep` keeps the scratch tree, including the
+de-formatted and formatted copies. On this Mac a full run takes a few
+minutes at `--jobs 8`.
+
+---
+
+## 4. Emitted-AST equivalence harness
+
+### Why
+
+Step 0 of [`design/sugar-as-ast-nodes.md`](design/sugar-as-ast-nodes.md): before
+a lowering moves from text rewriting to AST nodes (or any other refactor that
+should not change a single emitted program), there has to be a way to prove
+it. The harness builds every corpus unit with two compilers and compares the
+Python they emit.
+
+### Running it
+
+```bash
+# Two git revisions: each is exported with `git archive` and built with
+# `cargo build --release --bin tyc` (target dir: tyc/target/emitted-ast).
+python3.13 scripts/emitted-ast.py equiv origin/main HEAD
+
+# Two binaries you already have:
+python3.13 scripts/emitted-ast.py equiv /tmp/tyc-before tyc/target/release/tyc
+
+# Narrow it while iterating:
+python3.13 scripts/emitted-ast.py equiv origin/main HEAD --scope examples --filter apps/
+```
+
+The corpus always comes from the working tree, so only the compiler differs
+between the two sides; the working tree and the repository's refs are never
+modified. The comparison uses the same normalisation as the fmt gate, without
+the docstring leniency unless `--lenient-docstrings` is given. The report
+lists each unit whose emitted AST changed, with the first differing line of
+the two `ast.dump`s, and each unit that builds on one side only. Exit status
+is 0 when every unit agrees and 1 otherwise, so it can gate a refactor's PR.
+
+`dump` and `compare` are the building blocks, for when the two compilers are
+not available at the same time:
+
+```bash
+python3.13 scripts/emitted-ast.py dump --tyc /tmp/tyc-before --out /tmp/ast-before
+python3.13 scripts/emitted-ast.py dump --tyc tyc/target/release/tyc --out /tmp/ast-after
+python3.13 scripts/emitted-ast.py compare /tmp/ast-before /tmp/ast-after
+```
+
+---
+
+## 5. Known gaps
 
 These are stated plainly rather than papered over.
 

@@ -67,7 +67,7 @@ pub fn run(args: ProfileArgs) -> Result<()> {
             if out.is_absolute() {
                 out
             } else {
-                project_root.join(out)
+                config_dir.join(out)
             }
         }
         None => config_dir.join(&config.project.out),

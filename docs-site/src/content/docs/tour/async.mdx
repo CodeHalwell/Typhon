@@ -141,9 +141,9 @@ Most teams pick explicit `gather:` blocks instead, because they make intent visi
   You don't have to spot these by eye. `tyc check` ships a [`tyc::gather_opportunity`](/Typhon/diagnostics/async-errors/) advice (on by default) that flags any run of 2+ adjacent **independent** awaits inside an `async def` and nudges you to wrap them in a `gather:` block:
 
   ```python
-  async def load(client: Client, uid: int) -> tuple[User, list[Post]]:
-      let user  = await client.get_user(uid)     # 💡 these two awaits
-      let posts = await client.get_posts(uid)    #    could run concurrently
+  async def load(users: UserApi, posts_api: PostApi, uid: int) -> tuple[User, list[Post]]:
+      let user  = await users.get(uid)           # 💡 these two awaits
+      let posts = await posts_api.for_user(uid)  #    could run concurrently
       return (user, posts)
   ```
 
@@ -190,7 +190,7 @@ free-threaded = true
 
 When this is on:
 
-- `go` on a CPU-bound function lowers to a `ThreadPoolExecutor.submit` future instead of an `asyncio.Task`.
+- `go` always lowers through `typhon_runtime.tasks.spawn` (an `asyncio` task held in a strong-ref registry) — there is no `ThreadPoolExecutor` lowering for `go`, including on free-threaded builds.
 - The analyser may emit `ThreadPoolExecutor.map(...)` for pure-function comprehensions over large collections.
 - Every emitted parallel block first checks `sys._is_gil_enabled()` at runtime and falls back to sequential execution if a GIL build is detected.
 

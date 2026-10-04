@@ -246,7 +246,7 @@ If you forget to set `DATABASE_URL` at build time:
 
 ```bash
 tyc build
-# error[tyc::comptime_env_missing]: required environment variable `DATABASE_URL` is not set
+# error[tyc::comptime]: required environment variable `DATABASE_URL` is not set
 ```
 
 The build fails. Production never sees `KeyError: 'DATABASE_URL'`.

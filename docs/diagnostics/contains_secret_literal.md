@@ -1,74 +1,68 @@
 # tyc::contains_secret_literal
 
-Warns when a `comptime let` binding's name contains a secret-shaped keyword.
-`comptime` bindings are evaluated at build time, so the emitted Python contains
-the resolved env-var value as a string literal — anyone with the build output
-can read the secret.
+Warns when a credential would end up as a string literal in your source or
+your build output. It fires in two places, both silenced by
+`[strictness] allow-secret-comptime`:
 
-## Recognised names
+- **`tyc check` / the editor** — a binding initialised from a bare string
+  literal (`API_KEY = "sk-…"`, `let DB_PASSWORD: str = "hunter2"`, or a
+  `comptime let` with a literal value): the credential is committed with the
+  source.
+- **`tyc build`** — a `comptime let` whose string value reads
+  `env("…")`. `comptime` bindings are evaluated at build time, so the emitted
+  Python contains the resolved env-var value as a string literal — anyone
+  with the build output can read the secret.
 
-The keyword table is `tyc_analyse::SECRET_NAME_KEYWORDS`, shared by this lint
-and the `tyc build` scan so the two cannot drift:
+Both decide the same way: the **name** must name a credential and the
+**value** must be a string that could be one. A non-string value
+(`comptime let TOKEN_LIMIT: int = int(env("N"))`) never warns.
 
-`PASSPHRASE`, `AUTHORIZATION_TOKEN`, `AUTHORIZATIONTOKEN`, `AUTHORIZATION`,
-`CREDENTIALS`, `CREDENTIAL`, `WEBHOOK_SECRET`, `WEBHOOKSECRET`, `WEBHOOK`,
-`SIGNING`, `COOKIE`, `DB_PASSWORD`, `DBPASSWORD`, `DB_PASS`, `DBPASS`,
-`DB_PWD`, `DBPWD`, `API_PASSWORD`, `APIPASSWORD`, `DB_SECRET`, `DBSECRET`,
-`API_SECRET`, `APISECRET`, `APP_SECRET`, `APPSECRET`, `CLIENT_SECRET`,
-`CLIENTSECRET`, `JWT_SECRET`, `JWTSECRET`, `SECRET_KEY`, `SECRETKEY`,
-`PERSONAL_ACCESS_TOKEN`, `PERSONALACCESSTOKEN`, `OAUTH_TOKEN`, `OAUTHTOKEN`,
-`GITHUB_TOKEN`, `GITHUBTOKEN`, `ACCESS_TOKEN`, `ACCESSTOKEN`, `AUTH_TOKEN`,
-`GH_TOKEN`, `GHTOKEN`, `AUTHTOKEN`, `BEARER_TOKEN`, `BEARERTOKEN`,
-`CSRF_TOKEN`, `CSRFTOKEN`, `JWT_TOKEN`, `JWTTOKEN`, `API_TOKEN`, `APITOKEN`,
-`OAUTH_SECRET`, `OAUTHSECRET`, `ACCESS_PASSWORD`, `BEARER_PASSWORD`,
-`CLIENT_PASSWORD`, `SECRET_PASSWORD`, `ACCESSPASSWORD`, `BEARERPASSWORD`,
-`CLIENTPASSWORD`, `SECRETPASSWORD`, `AUTH_PASSWORD`, `CSRF_PASSWORD`,
-`APP_PASSWORD`, `AUTHPASSWORD`, `CSRFPASSWORD`, `JWT_PASSWORD`, `APPPASSWORD`,
-`JWTPASSWORD`, `PASSWORD`, `ACCESS_SECRET`, `BEARER_SECRET`, `SECRET_SECRET`,
-`ACCESSSECRET`, `BEARERSECRET`, `SECRETSECRET`, `SECRET_TOKEN`, `AUTH_SECRET`,
-`CSRF_SECRET`, `SECRETTOKEN`, `SECRET_PASS`, `AUTHSECRET`, `CSRFSECRET`,
-`SECRETPASS`, `SECRET_PWD`, `SECRETPWD`, `SECRET`, `REFRESH_TOKEN`,
-`SESSION_TOKEN`, `REFRESHTOKEN`, `SESSIONTOKEN`, `CLIENT_TOKEN`,
-`CLIENTTOKEN`, `APP_TOKEN`, `APPTOKEN`, `DB_TOKEN`, `ID_TOKEN`, `DBTOKEN`,
-`IDTOKEN`, `TOKEN`, `PRIVATE_KEY`, `PRIVATEKEY`, `PUBLIC_KEY`, `PUBLICKEY`,
-`SSH_KEY`, `SSHKEY`, `API_KEY`, `APIKEY`, `APP_KEY`, `APPKEY`, `PRIVKEY`,
-`ENCRYPTION_KEY`, `ENCRYPTIONKEY`, `ACCESS_KEY`, `BEARER_KEY`, `CLIENT_KEY`,
-`MASTER_KEY`, `ACCESSKEY`, `BEARERKEY`, `CLIENTKEY`, `MASTERKEY`, `AUTH_KEY`,
-`CSRF_KEY`, `AUTHKEY`, `CSRFKEY`, `JWT_KEY`, `DB_KEY`, `JWTKEY`, `DBKEY`,
-`KEY`, `ACCESS_PWD`, `BEARER_PWD`, `CLIENT_PWD`, `ACCESSPWD`, `BEARERPWD`,
-`CLIENTPWD`, `AUTH_PWD`, `CSRF_PWD`, `API_PWD`, `APP_PWD`, `AUTHPWD`,
-`CSRFPWD`, `JWT_PWD`, `APIPWD`, `APPPWD`, `JWTPWD`, `PWD`, `ACCESS_PASS`,
-`BEARER_PASS`, `CLIENT_PASS`, `ACCESSPASS`, `BEARERPASS`, `CLIENTPASS`,
-`AUTH_PASS`, `CSRF_PASS`, `API_PASS`, `APP_PASS`, `AUTHPASS`, `CSRFPASS`,
-`JWT_PASS`, `APIPASS`, `APPPASS`, `JWTPASS`, `PASS`, `DSN`.
+## When a name names a credential
 
-The table is ordered longest-first, so a name matching more than one keyword
-reports the most specific: `KEY_APIKEY` reports `APIKEY`, not `KEY`, and
-`SSH_PRIVKEY` reports `PRIVKEY`.
+The name is split into words — at underscores, digits, `camelCase` and
+`ACRONYMWord` junctions — and squashed words are segmented against the
+vocabulary below (`APIKEYS` → `API` `KEYS`, `dbPASSWORD` → `DB` `PASSWORD`;
+`MONKEY` and `PASSPORT` do not segment, so they never match `KEY` / `PASS`).
+A trailing plural `s` is accepted (`SECRETS`, `TOKENs`).
 
-A keyword only matches when it sits on a **word boundary** — otherwise `MONKEY`
-would match `KEY` and `PASSPORT` would match `PASS`. A boundary is the start or
-end of the name, an underscore, a digit, or a case junction in either
-direction:
-
-| Name | Matches | Why |
+| Name shape | Examples | Result |
 |---|---|---|
-| `API_KEY` | `API_KEY` | underscore-separated |
-| `myTokenValue` | `TOKEN` | `lower`→`Upper` on both sides |
-| `myPASSWORD123` | `PASSWORD` | digit closes the word (v1.0.0-alpha.8) |
-| `foo123TOKEN` | `TOKEN` | digit opens the word (v1.0.0-alpha.8) |
-| `dbPASSWORDString` | `DBPASSWORD` | `UPPER`→`TitleCase` junction (v1.0.0-alpha.8); reported as `DBPASSWORD` since that entry joined the table in v1.0.0-alpha.9 |
-| `dbPASSWORDstring` | `DBPASSWORD` | `UPPER`→`lower` closes the word (v1.0.0-alpha.9) |
-| `TOKENs` | `TOKEN` | same rule — a lowercase letter after an uppercase keyword character (v1.0.0-alpha.9) |
-| `MONKEY` | — | `N` before `KEY` is not a boundary |
-| `PASSPORT` | — | `P` after `PASS` is not a boundary |
+| a credential noun: `PASSWORD`, `PASSWD`, `PASSPHRASE`, `SECRET`, `TOKEN`, `CREDENTIAL` | `DB_PASSWORD`, `GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`, `SECRET_KEY_BASE`, `myTokenValue` | **clear** |
+| a key noun (`KEY`, `PASS`, `PWD`, `PIN`) right after a secret qualifier (`API`, `ACCESS`, `AUTH`, `CLIENT`, `APP`, `DB`, `PRIVATE`, `SSH`, `SIGNING`, `ENCRYPTION`, `MASTER`, `ADMIN`, …) | `API_KEY`, `OPENAI_API_KEY`, `APIKEYS`, `DB_PASS`, `PRIVKEY`, `SIGNING_KEY` | **clear** |
+| a key noun on its own or after another word; `DSN`, `COOKIE`, `AUTHORIZATION`, `WEBHOOK` | `KEY`, `STRIPE_KEY`, `PWD`, `DATABASE_DSN`, `SESSION_COOKIE` | **ambiguous** — the value decides |
+| a key noun after a non-secret qualifier (`PUBLIC`, `PRIMARY`, `FOREIGN`, `SORT`, `PARTITION`, `CACHE`, …) | `PUBLIC_KEY`, `PRIMARY_KEY`, `SORT_KEY` | not a credential |
+| a metadata word after the noun (`COUNT`, `LIMIT`, `LENGTH`, `TTL`, `TIMEOUT`, `PATH`, `FILE`, `DIR`, `URL`, `NAME`, `TYPE`, `HEADER`, `PREFIX`, `SEPARATOR`, `ID`, `ALGORITHM`, `JAR`, …) | `TOKEN_LIMIT`, `PASSWORD_MIN_LENGTH`, `CREDENTIALS_PATH`, `AUTHORIZATION_URL`, `API_KEY_HEADER`, `AWS_ACCESS_KEY_ID`, `COOKIE_JAR` | not a credential — the name describes the secret |
+| a counting word anywhere (`MAX`, `MIN`, `NUM`, `N`, `TOTAL`, `COUNT`) | `MAX_TOKENS`, `tokenCount` | not a credential |
 
-Because the boundary rule is what stops `PASSPORT` matching `PASS`, it also
-stopped `PASSPHRASE` (v1.0.0-alpha.6) and `PRIVKEY` (v1.0.0-alpha.8), so both
-have their own entries in the table.
+The word sets are `tyc_analyse::SECRET_NAME_KEYWORDS` and its siblings in
+`tyc-analyse/src/secrets.rs`, shared by both checks so they cannot drift.
 
-This diagnostic is **warn-level**: a newly-flagged name warns, it never fails
-the build. Silence it project-wide with `[strictness] allow-secret-comptime`.
+## When a value could be a credential
+
+- A **clear** name warns on any string except a placeholder: empty or
+  whitespace only, one repeated character (`"x"`, `"xxxx"`, `"****"`), or a
+  template (`"<your token>"`, `"${TOKEN}"`, `"{{ token }}"`).
+- An **ambiguous** name warns only on a *credential-shaped* value: a known
+  token prefix (`ghp_`, `github_pat_`, `glpat-`, `sk-`, `sk_live_`, `xoxb-`,
+  `AKIA`, `AIza`, `hf_`, …), a PEM private key, a URL with an embedded password
+  (`postgres://app:hunter2@db/prod`), or a run of at least 20 letters, digits
+  and `_-+=.` with both letters and digits and at least 3.5 bits of entropy per
+  character (hex digests, base64 keys, random tokens).
+
+## The build-time `env("…")` check
+
+`tyc build` also reads the key of every `env("KEY")` the binding's value
+depends on — directly, or through the `comptime def` functions it calls — and
+uses the most secret-shaped of the binding name and those keys:
+
+```ty
+comptime let DEPLOY_CFG: str = env("AWS_SECRET_ACCESS_KEY")  # warning: the key names a secret
+comptime let REGION: str = env("AWS_REGION")                   # fine
+comptime let TOKEN_LIMIT: int = int(env("TOKEN_LIMIT"))        # fine: not a string
+```
+
+This diagnostic is **warn-level**: it never fails the build. Silence it
+project-wide with `[strictness] allow-secret-comptime = true`.
 
 ## Example
 

@@ -167,6 +167,7 @@ pub fn compute(
         source,
         source,
         &[],
+        &[],
         resolved,
         module,
         stdlib_modules,
@@ -191,6 +192,7 @@ pub fn compute_with_original(
     preprocessed: &str,
     original: &str,
     line_shifts: &[usize],
+    line_map: &[usize],
     resolved: &ResolvedModule,
     module: &ModModule,
     stdlib_modules: &[&str],
@@ -207,6 +209,7 @@ pub fn compute_with_original(
     // can promote both the declaration site and every reference to
     // `class`, matching how `pub class X:` already paints.
     let newtype_names = collect_newtype_names(module);
+    let _line_index = LineIndexScope::install(source);
     let mut tokens: Vec<AbsoluteToken> = Vec::new();
     emit_binding_tokens(
         &mut tokens,
@@ -236,7 +239,7 @@ pub fn compute_with_original(
     // identifiers the preprocessor injected — e.g. the `NewType` call in
     // a `newtype Foo = Bar` rewrite) are dropped so the TextMate grammar
     // paints the keyword instead of leaking a wrong colour into it.
-    remap_to_original(&mut tokens, source, original, line_shifts);
+    remap_to_original(&mut tokens, source, original, line_shifts, line_map);
     // The LSP encoding requires tokens in document order (each
     // delta-line is non-negative; ties broken by delta-start).
     tokens.sort_by_key(|t| (t.line, t.col));
@@ -271,11 +274,23 @@ fn remap_to_original(
     preprocessed: &str,
     original: &str,
     line_shifts: &[usize],
+    line_map: &[usize],
 ) {
     let orig_line_starts = compute_line_starts(original);
     let prep_line_starts = compute_line_starts(preprocessed);
     tokens.retain_mut(|tok| {
         let prep_line_idx = tok.line as usize;
+        // The original line this preprocessed line came from, through the
+        // sugar chain's expansion table (`?`, `gather:`, with-chains insert
+        // lines); identity when the caller has no table (W4-07).
+        let orig_line_idx = if line_map.is_empty() {
+            prep_line_idx
+        } else {
+            line_map
+                .get(prep_line_idx)
+                .copied()
+                .unwrap_or(prep_line_idx)
+        };
 
         // Convert the token's UTF-16 column back to a byte column within
         // the preprocessed line so we can add the byte-denominated shift.
@@ -298,11 +313,12 @@ fn remap_to_original(
         if let Some(byte) = try_line_match(
             original,
             &orig_line_starts,
-            prep_line_idx,
+            orig_line_idx,
             candidate_byte,
             name,
         ) {
-            let line_text = original_line_text(original, &orig_line_starts, prep_line_idx);
+            let line_text = original_line_text(original, &orig_line_starts, orig_line_idx);
+            tok.line = orig_line_idx as u32;
             tok.col = byte_col_to_utf16(line_text, byte);
             tok.length = name.encode_utf16().count() as u32;
             return true;
@@ -320,7 +336,7 @@ fn remap_to_original(
         // TextMate grammar paints the keyword instead, which beats
         // pinning a colour to the wrong location.
         if let Some((line, byte)) =
-            find_closest_match(original, &orig_line_starts, name, prep_line_idx)
+            find_closest_match(original, &orig_line_starts, name, orig_line_idx)
         {
             let line_text = original_line_text(original, &orig_line_starts, line);
             tok.line = line as u32;
@@ -1155,6 +1171,43 @@ fn utf16_len_of_span(source: &str, start: usize, end: usize) -> u32 {
     slice.chars().map(|c| c.len_utf16() as u32).sum()
 }
 
+thread_local! {
+    /// Line starts of the buffer [`compute_with_original`] is colouring,
+    /// keyed by that buffer's address and length (see [`LineIndexScope`]).
+    static LINE_INDEX: std::cell::RefCell<Option<(usize, usize, Vec<usize>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Installs the line-start table for `source` for the duration of one
+/// [`compute_with_original`] call, so every [`byte_to_line_col`] lookup on
+/// that buffer is a binary search instead of a scan from offset 0 — which
+/// made `semanticTokens/full` quadratic (20k lines: 15 s; W4-10). The table is
+/// keyed by the buffer's address and length and removed on drop; the buffer
+/// is borrowed for the scope's whole life, so the key cannot be reused by a
+/// different text while the table is installed.
+struct LineIndexScope;
+
+impl LineIndexScope {
+    fn install(source: &str) -> Self {
+        let mut starts = vec![0usize];
+        for (i, b) in source.bytes().enumerate() {
+            if b == b'\n' {
+                starts.push(i + 1);
+            }
+        }
+        LINE_INDEX.with(|cell| {
+            *cell.borrow_mut() = Some((source.as_ptr() as usize, source.len(), starts));
+        });
+        LineIndexScope
+    }
+}
+
+impl Drop for LineIndexScope {
+    fn drop(&mut self) {
+        LINE_INDEX.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
 /// Convert a byte offset into LSP `(line, character)` coordinates.
 /// Columns are counted in UTF-16 code units to match the rest of
 /// the LSP — the file may contain wide characters in identifiers
@@ -1164,6 +1217,27 @@ fn utf16_len_of_span(source: &str, start: usize, end: usize) -> u32 {
 fn byte_to_line_col(source: &str, offset: usize) -> Option<(u32, u32)> {
     if offset > source.len() {
         return None;
+    }
+    let indexed = LINE_INDEX.with(|cell| {
+        let guard = cell.borrow();
+        let (ptr, len, starts) = guard.as_ref()?;
+        if *ptr != source.as_ptr() as usize || *len != source.len() {
+            return None;
+        }
+        let line = starts.partition_point(|&s| s <= offset).saturating_sub(1);
+        let mut col: u32 = 0;
+        let mut byte = starts[line];
+        for ch in source[starts[line]..].chars() {
+            if byte >= offset {
+                break;
+            }
+            col += ch.len_utf16() as u32;
+            byte += ch.len_utf8();
+        }
+        Some((line as u32, col))
+    });
+    if indexed.is_some() {
+        return indexed;
     }
     let mut line: u32 = 0;
     let mut col: u32 = 0;
@@ -1229,6 +1303,37 @@ mod tests {
             prev_col = col;
         }
         None
+    }
+
+    /// W4-10: `semanticTokens/full` used to be quadratic — every token's
+    /// position was found by scanning from offset 0 (20k lines took 15 s).
+    /// 10k lines must now finish in well under the bound below, which a
+    /// quadratic scan exceeds many times over.
+    #[test]
+    fn semantic_tokens_scale_linearly() {
+        let mut source = String::new();
+        for i in 0..10_000 {
+            source.push_str(&format!("v{i} = len(\"x\") + {i}\n"));
+        }
+        let (prep, resolved, module) = parse_and_resolve(&source);
+        let started = std::time::Instant::now();
+        let tokens = compute(
+            &prep,
+            &resolved,
+            &module,
+            &stdlib(),
+            &CalleeSignatures::new(),
+            &AttributeKinds::new(),
+        );
+        let elapsed = started.elapsed();
+        assert!(tokens.data.len() >= 10_000, "{}", tokens.data.len());
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "10k lines took {elapsed:?}"
+        );
+        // Positions are still exact: the last binding sits on the last line.
+        let line: u32 = tokens.data.iter().map(|t| t.delta_line).sum();
+        assert_eq!(line, 9_999);
     }
 
     #[test]
@@ -1978,6 +2083,7 @@ mod tests {
             &prep.python_source,
             original,
             &prep.line_col_shifts(),
+            &prep.line_map,
             &resolved,
             &module,
             &stdlib_refs,
@@ -2251,6 +2357,7 @@ pub def first(x: int?) -> int:
             &prep.python_source,
             original,
             &prep.line_col_shifts(),
+            &prep.line_map,
             &resolved,
             &module,
             &stdlib_refs,

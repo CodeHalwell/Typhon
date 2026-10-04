@@ -276,7 +276,62 @@ def _parse_isoformat_time(tstr):
     return (time_comps[0], time_comps[1], time_comps[2], time_comps[3], tzi)
 
 
+# CPython's `date` / `time` / `datetime` / `timedelta` / `tzinfo` are C
+# types with no `__dict__`: an attribute store or delete on one of their
+# instances is refused, with the message its C attribute table gives. A
+# user subclass has a `__dict__`, so there only the C attributes refuse.
+# The shim's own constructors store through `object.__setattr__`.
+_DATE_FIELDS = ("year", "month", "day")
+_TIME_FIELDS = ("hour", "minute", "second", "microsecond", "tzinfo", "fold")
+
+
+def _attr_write_error(obj, name):
+    if isinstance(obj, timedelta) and name in ("days", "seconds", "microseconds"):
+        return AttributeError("readonly attribute")
+    owner = None
+    if isinstance(obj, date) and name in _DATE_FIELDS:
+        owner = "date"
+    elif isinstance(obj, datetime) and name in _TIME_FIELDS:
+        owner = "datetime"
+    elif isinstance(obj, time) and name in _TIME_FIELDS:
+        owner = "time"
+    elif isinstance(obj, IsoCalendarDate) and name in ("year", "week", "weekday"):
+        owner = "IsoCalendarDate"
+    if owner is not None:
+        return AttributeError("attribute '%s' of 'datetime.%s' objects is not writable" % (name, owner))
+    cls = type(obj)
+    if cls not in _C_TYPES:
+        return None
+    if hasattr(cls, name):
+        return AttributeError("'datetime.%s' object attribute '%s' is read-only" % (cls.__name__, name))
+    return AttributeError("'datetime.%s' object has no attribute '%s' and no __dict__ "
+                          "for setting new attributes" % (cls.__name__, name))
+
+
+def _c_setattr(self, name, value):
+    err = _attr_write_error(self, name)
+    if err is not None:
+        raise err
+    object.__setattr__(self, name, value)
+
+
+def _c_delattr(self, name):
+    err = _attr_write_error(self, name)
+    if err is not None:
+        raise err
+    object.__delattr__(self, name)
+
+
 class timedelta:
+    # deep_freeze passes this immutable value through, as the
+    # emitted typhon_runtime does for the CPython class.
+    __typhon_immutable__ = True
+    def __setattr__(self, name, value):
+        _c_setattr(self, name, value)
+
+    def __delattr__(self, name):
+        _c_delattr(self, name)
+
     def __init__(self, days=0, seconds=0, microseconds=0, milliseconds=0, minutes=0, hours=0, weeks=0):
         d = 0
         s = 0
@@ -321,9 +376,9 @@ class timedelta:
         d += days
         if abs(d) > 999999999:
             raise OverflowError("days=%d; must have magnitude <= 999999999" % d)
-        self.days = d
-        self.seconds = s
-        self.microseconds = us
+        object.__setattr__(self, "days", d)
+        object.__setattr__(self, "seconds", s)
+        object.__setattr__(self, "microseconds", us)
 
     def __repr__(self):
         args = []
@@ -466,6 +521,15 @@ timedelta.resolution = timedelta(microseconds=1)
 
 
 class tzinfo:
+    # deep_freeze passes this immutable value through, as the
+    # emitted typhon_runtime does for the CPython class.
+    __typhon_immutable__ = True
+    def __setattr__(self, name, value):
+        _c_setattr(self, name, value)
+
+    def __delattr__(self, name):
+        _c_delattr(self, name)
+
     def tzname(self, dt):
         raise NotImplementedError("tzinfo subclass must override tzname()")
 
@@ -497,8 +561,8 @@ class timezone(tzinfo):
             raise TypeError("name must be a string")
         if not (-timedelta(hours=24) < offset < timedelta(hours=24)):
             raise ValueError("offset must be a timedelta strictly between -timedelta(hours=24) and timedelta(hours=24), not %r." % offset)
-        self._offset = offset
-        self._name = name
+        object.__setattr__(self, "_offset", offset)
+        object.__setattr__(self, "_name", name)
 
     def utcoffset(self, dt=None):
         return self._offset
@@ -570,11 +634,20 @@ _EPOCH_ORD = _ymd2ord(1970, 1, 1)
 
 
 class date:
+    # deep_freeze passes this immutable value through, as the
+    # emitted typhon_runtime does for the CPython class.
+    __typhon_immutable__ = True
+    def __setattr__(self, name, value):
+        _c_setattr(self, name, value)
+
+    def __delattr__(self, name):
+        _c_delattr(self, name)
+
     def __init__(self, year, month, day):
         _check_date_fields(year, month, day)
-        self.year = year
-        self.month = month
-        self.day = day
+        object.__setattr__(self, "year", year)
+        object.__setattr__(self, "month", month)
+        object.__setattr__(self, "day", day)
 
     @classmethod
     def fromtimestamp(cls, t):
@@ -727,11 +800,17 @@ date.resolution = timedelta(days=1)
 
 
 class IsoCalendarDate:
+    def __setattr__(self, name, value):
+        _c_setattr(self, name, value)
+
+    def __delattr__(self, name):
+        _c_delattr(self, name)
+
     def __init__(self, year, week, weekday):
-        self.year = year
-        self.week = week
-        self.weekday = weekday
-        self._t = (year, week, weekday)
+        object.__setattr__(self, "year", year)
+        object.__setattr__(self, "week", week)
+        object.__setattr__(self, "weekday", weekday)
+        object.__setattr__(self, "_t", (year, week, weekday))
 
     def __getitem__(self, i):
         return self._t[i]
@@ -778,15 +857,24 @@ def _fields_from_timestamp(t):
 
 
 class time:
+    # deep_freeze passes this immutable value through, as the
+    # emitted typhon_runtime does for the CPython class.
+    __typhon_immutable__ = True
+    def __setattr__(self, name, value):
+        _c_setattr(self, name, value)
+
+    def __delattr__(self, name):
+        _c_delattr(self, name)
+
     def __init__(self, hour=0, minute=0, second=0, microsecond=0, tzinfo=None, fold=0):
         _check_time_fields(hour, minute, second, microsecond, fold)
         _check_tzinfo_arg(tzinfo)
-        self.hour = hour
-        self.minute = minute
-        self.second = second
-        self.microsecond = microsecond
-        self.tzinfo = tzinfo
-        self.fold = fold
+        object.__setattr__(self, "hour", hour)
+        object.__setattr__(self, "minute", minute)
+        object.__setattr__(self, "second", second)
+        object.__setattr__(self, "microsecond", microsecond)
+        object.__setattr__(self, "tzinfo", tzinfo)
+        object.__setattr__(self, "fold", fold)
 
     def _tuple(self):
         return (self.hour, self.minute, self.second, self.microsecond)
@@ -919,15 +1007,15 @@ class datetime(date):
         _check_date_fields(year, month, day)
         _check_time_fields(hour, minute, second, microsecond, fold)
         _check_tzinfo_arg(tzinfo)
-        self.year = year
-        self.month = month
-        self.day = day
-        self.hour = hour
-        self.minute = minute
-        self.second = second
-        self.microsecond = microsecond
-        self.tzinfo = tzinfo
-        self.fold = fold
+        object.__setattr__(self, "year", year)
+        object.__setattr__(self, "month", month)
+        object.__setattr__(self, "day", day)
+        object.__setattr__(self, "hour", hour)
+        object.__setattr__(self, "minute", minute)
+        object.__setattr__(self, "second", second)
+        object.__setattr__(self, "microsecond", microsecond)
+        object.__setattr__(self, "tzinfo", tzinfo)
+        object.__setattr__(self, "fold", fold)
 
     @classmethod
     def _fromtimestamp(cls, t, utc, tz):
@@ -1217,3 +1305,5 @@ datetime.min = datetime(1, 1, 1)
 datetime.max = datetime(9999, 12, 31, 23, 59, 59, 999999)
 datetime.resolution = timedelta(microseconds=1)
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+_C_TYPES = (timedelta, tzinfo, timezone, date, time, datetime, IsoCalendarDate)

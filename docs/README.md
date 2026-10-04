@@ -27,12 +27,13 @@ The sub-docs below are extracted from the long-term plan for easier navigation. 
 | [install.md](install.md) | Installing the `tyc` binary (macOS / Linux / Windows) |
 | [vm.md](vm.md) | The in-process tree-walking VM behind `tyc run` |
 | [ty-integration.md](ty-integration.md) | The `tyc ty` / `[checker] external = "ty"` typeshed checker |
-| [differential-testing.md](differential-testing.md) | The VM ↔ CPython differential gate and the opt-in knob codegen matrix |
+| [differential-testing.md](differential-testing.md) | The VM ↔ CPython differential gate, the opt-in knob codegen matrix, the de-formatted-corpus `tyc fmt` gate and the emitted-AST equivalence harness |
 | [diagnostics/](diagnostics/README.md) | One page per `tyc::` diagnostic code |
+| [compatibility.md](compatibility.md) | What the beta line will not break, deprecations, and what counts as a bug |
 | [roadmap.md](roadmap.md) | Phased delivery plan |
 | [risks.md](risks.md) | Risks and mitigations |
 | [prior-art.md](prior-art.md) | Languages and tools Typhon learns from |
 
 ## Status
 
-**Current release: [v1.0.0-alpha.9](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.9).** Typhon reached its first *feature-complete* alpha in [v1.0.0-alpha](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha); the production path (`tyc build` → CPython 3.13+) is stable, and the language is additive on *correct* programs across the whole v0.3.0 → v1.0.0-alpha line. As an alpha, the surface syntax is not yet frozen. See [roadmap.md](roadmap.md) for the per-feature status, [../CHANGELOG.md](../CHANGELOG.md) for the release-by-release history, and the project [README](../README.md) for build instructions.
+**Current release: [v1.0.0-beta.1](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-beta.1)**, the first beta. Typhon reached its first *feature-complete* alpha in [v1.0.0-alpha](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha); the production path (`tyc build` → CPython 3.13+) is stable, and the language is additive on *correct* programs across the whole v0.3.0 → v1.0.0-alpha line. From `v1.0.0-beta.1` the surface listed in [compatibility.md](compatibility.md) is frozen for the beta line, and that page lists the release's deliberate exceptions. See [roadmap.md](roadmap.md) for the per-feature status, [../CHANGELOG.md](../CHANGELOG.md) for the release-by-release history, and the project [README](../README.md) for build instructions.

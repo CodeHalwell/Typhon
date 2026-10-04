@@ -97,6 +97,9 @@ pub fn run(args: ReplArgs) -> Result<()> {
     let mut stdout = stdout.lock();
 
     let mut buf = String::new();
+    // Snippets that failed to compile or raised. A piped session (a script
+    // fed on stdin) exits non-zero when any did (W4-15); it used to exit 0.
+    let mut failures = 0usize;
     // Holds a line that closed a previous multi-line block as its
     // dedent-to-0 terminator. When set, it is processed as the next
     // top-level prompt instead of reading stdin.
@@ -205,12 +208,24 @@ pub fn run(args: ReplArgs) -> Result<()> {
                     }
                 }
                 Ok(None) => {}
-                Err(e) => eprintln!("runtime: {e}"),
+                Err(e) => {
+                    failures += 1;
+                    eprintln!("runtime: {e}");
+                }
             },
-            Err(e) => eprintln!("error: {e}"),
+            Err(e) => {
+                failures += 1;
+                eprintln!("error: {e}");
+            }
         }
     }
 
+    if !interactive && failures > 0 {
+        return Err(miette!(
+            "{failures} snippet{} failed",
+            if failures == 1 { "" } else { "s" }
+        ));
+    }
     Ok(())
 }
 
@@ -503,9 +518,11 @@ pub(crate) fn compile_to_python(source: &str) -> Result<String> {
         return Err(miette!("{first}"));
     }
 
-    let module = tyc_syntax::parse_module(&prep.python_source)
+    let mut module = tyc_syntax::parse_module(&prep.python_source)
         .map(|p| p.into_syntax())
         .map_err(|e| miette!("parse error: {e}"))?;
+    // Inline `?` evaluation order, as `tyc build` lowers it.
+    tyc_syntax::preprocess::attach_method_lookups(&mut module);
 
     let desugar = desugar_module_with(&module, DesugarOptions::default());
     let (py, _offsets) = emit_python_with_line_offsets(&desugar.module);

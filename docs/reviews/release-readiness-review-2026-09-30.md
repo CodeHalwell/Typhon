@@ -198,6 +198,11 @@ Same for `await "x"` and `await sync_fn()`. Under CPython this is a
 `TypeError`; **the VM runs it and returns the value** (exit 0), so it is
 also a VM ↔ CPython divergence the differential corpus does not contain.
 
+> **Note (2026-10-03):** for the false-positive side of this area — valid
+> `await` forms the checker wrongly rejects — see the Kimi findings §7,
+> which catalogues the awaitable shapes worth covering when this item is
+> worked.
+
 ### 3.7 Comparison operators are not type-checked — *new, medium*
 
 `"a" < 1`, `1 <= "a"`, `P(x=1) < P(x=2)` on a class with no `__lt__`, and

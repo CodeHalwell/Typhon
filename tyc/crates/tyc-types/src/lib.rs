@@ -20,6 +20,16 @@
 //! useful diagnostics on a meaningful subset of programs, not full
 //! coverage.
 
+mod builtins;
+mod callables;
+mod class_contracts;
+mod expression_calls;
+mod frozen_context;
+mod mutations;
+mod operators;
+#[cfg(debug_assertions)]
+mod unchecked;
+
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -883,8 +893,16 @@ fn close_sync_spawners(c: &mut Checker, body: &[Stmt]) {
             if f.is_async || c.sync_spawners.contains_key(f.name.as_str()) {
                 continue;
             }
-            let known: std::collections::HashSet<String> =
-                c.sync_spawners.keys().cloned().collect();
+            // A name the function binds itself — a parameter, a local, a
+            // nested `def` — shadows the module-level spawner of the same
+            // name (review 2026-10-03 §4.6).
+            let locals = function_local_names(f);
+            let known: std::collections::HashSet<String> = c
+                .sync_spawners
+                .keys()
+                .filter(|k| !locals.contains(k.as_str()))
+                .cloned()
+                .collect();
             if let Some(callee) = body_calls_one_of(&f.body, &known) {
                 let spawned = c.sync_spawners.get(&callee).cloned().unwrap_or_default();
                 c.sync_spawners.insert(
@@ -898,6 +916,74 @@ fn close_sync_spawners(c: &mut Checker, body: &[Stmt]) {
             break;
         }
     }
+}
+
+/// Every name `f` binds in its own scope: parameters, assignment / loop /
+/// `with` / walrus targets, nested `def` and `class` names, and local
+/// imports.
+fn function_local_names(f: &ruff_python_ast::StmtFunctionDef) -> std::collections::HashSet<String> {
+    let mut out: std::collections::HashSet<String> = f
+        .parameters
+        .iter()
+        .map(|p| p.name().as_str().to_owned())
+        .collect();
+    out.extend(collect_assign_sites(&f.body).into_iter().map(|(n, _)| n));
+    fn defs(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
+        for s in stmts {
+            match s {
+                Stmt::FunctionDef(d) => {
+                    out.insert(d.name.as_str().to_owned());
+                }
+                Stmt::ClassDef(d) => {
+                    out.insert(d.name.as_str().to_owned());
+                }
+                Stmt::Import(i) => {
+                    for a in &i.names {
+                        let local = a.asname.as_ref().map(|n| n.as_str()).unwrap_or_else(|| {
+                            a.name.as_str().split('.').next().unwrap_or(a.name.as_str())
+                        });
+                        out.insert(local.to_owned());
+                    }
+                }
+                Stmt::ImportFrom(i) => {
+                    for a in &i.names {
+                        out.insert(a.asname.as_ref().unwrap_or(&a.name).as_str().to_owned());
+                    }
+                }
+                Stmt::If(i) => {
+                    defs(&i.body, out);
+                    for c in &i.elif_else_clauses {
+                        defs(&c.body, out);
+                    }
+                }
+                Stmt::For(x) => {
+                    defs(&x.body, out);
+                    defs(&x.orelse, out);
+                }
+                Stmt::While(x) => {
+                    defs(&x.body, out);
+                    defs(&x.orelse, out);
+                }
+                Stmt::With(x) => defs(&x.body, out),
+                Stmt::Try(x) => {
+                    defs(&x.body, out);
+                    for h in &x.handlers {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                        if let Some(n) = &h.name {
+                            out.insert(n.as_str().to_owned());
+                        }
+                        defs(&h.body, out);
+                    }
+                    defs(&x.orelse, out);
+                    defs(&x.finalbody, out);
+                }
+                Stmt::Match(m) => m.cases.iter().for_each(|c| defs(&c.body, out)),
+                _ => {}
+            }
+        }
+    }
+    defs(&f.body, &mut out);
+    out
 }
 
 /// The first bare-name callee in `body` (nested `def` / `class` bodies
@@ -1017,10 +1103,19 @@ fn task_spawn_callee(call: &ruff_python_ast::ExprCall) -> Option<String> {
 /// receiver whose class shape is known.
 fn callee_is_async(c: &Checker, call: &ruff_python_ast::ExprCall) -> bool {
     match call.func.as_ref() {
-        Expr::Name(n) => c.async_functions.contains(n.id.as_str()),
+        Expr::Name(_) => {
+            matches!(infer_expr_readonly(c,&call.func), Type::Function { ret,.. } if matches!(ret.as_ref(),Type::Generic(head,_) if head=="Coroutine"))
+        }
         Expr::Attribute(a) => {
             let recv = infer_expr_readonly(c, &a.value);
             let class_name = match recv.strip_none() {
+                Type::Module(name) => {
+                    return c
+                        .module_registry
+                        .get(&name)
+                        .and_then(|shapes| shapes.function_arities.get(a.attr.as_str()))
+                        .is_some_and(|info| info.is_async);
+                }
                 Type::Class(name) => name,
                 Type::Generic(name, _) => name,
                 _ => return false,
@@ -1939,6 +2034,14 @@ pub fn type_from_annotation_with_params(
                                     min_params: None,
                                 };
                             }
+                            Expr::Name(n) if type_params.iter().any(|p| p == n.id.as_str()) => {
+                                return Type::Function {
+                                    params: vec![Type::TypeVar(format!("**{}", n.id))],
+                                    ret: Box::new(ret),
+                                    variadic: true,
+                                    min_params: Some(0),
+                                };
+                            }
                             _ => {}
                         }
                     }
@@ -2282,6 +2385,20 @@ fn bind_typevars_checked(
                 ret: fr,
                 ..
             },
+            Type::Function { ret: ar, .. },
+        ) if callables::parameter_pack(fp).is_some() => {
+            bindings.insert(
+                format!("**{}", callables::parameter_pack(fp).unwrap()),
+                actual.clone(),
+            );
+            bind_typevars_checked(fr, ar, bindings, ctor_vars)?;
+        }
+        (
+            Type::Function {
+                params: fp,
+                ret: fr,
+                ..
+            },
             Type::Function {
                 params: ap,
                 ret: ar,
@@ -2364,18 +2481,32 @@ fn substitute_typevars(ty: &Type, bindings: &std::collections::HashMap<String, T
             ret,
             variadic,
             min_params,
-        } => Type::Function {
-            params: params
-                .iter()
-                .map(|p| substitute_typevars(p, bindings))
-                .collect(),
-            ret: Box::new(substitute_typevars(ret, bindings)),
-            variadic: *variadic,
-            // Carry the required-arity through: dropping it here silently
-            // reverts a substituted signature to "every parameter required",
-            // which is exactly the false positive this field exists to fix.
-            min_params: *min_params,
-        },
+        } => {
+            let pack = callables::parameter_pack(params)
+                .and_then(|name| bindings.get(&format!("**{name}")));
+            let (params, variadic, min_params) = match pack {
+                Some(Type::Function {
+                    params,
+                    variadic,
+                    min_params,
+                    ..
+                }) => (params.clone(), *variadic, *min_params),
+                _ => (
+                    params
+                        .iter()
+                        .map(|p| substitute_typevars(p, bindings))
+                        .collect(),
+                    *variadic,
+                    *min_params,
+                ),
+            };
+            Type::Function {
+                params,
+                ret: Box::new(substitute_typevars(ret, bindings)),
+                variadic,
+                min_params,
+            }
+        }
         other => other.clone(),
     }
 }
@@ -2630,6 +2761,51 @@ struct TypeBinding {
 /// top-level definitions: 4 000 one-`if` functions took 35 s.
 type ScopeMap = Rc<HashMap<String, TypeBinding>>;
 
+/// The envs reaching a loop's `break`s and `continue`s, recorded while its
+/// body is checked.
+#[derive(Debug, Default)]
+struct LoopExits {
+    /// Source range of the loop statement.
+    range: (usize, usize),
+    breaks: Vec<TypeEnv>,
+    continues: Vec<TypeEnv>,
+}
+
+/// The envs reaching a loop's head once its body has been checked (`c.env`
+/// is the env at the end of the body): the pre-loop env, every `continue`,
+/// and the end of the body. When a statement in the body always leaves it
+/// (`break` / `continue` / `return` / `raise`, judged by the checker-aware
+/// [`stmt_always_exits_aware`], so an open `match` still falls through),
+/// whatever follows is dead and its end never reaches the head — `while f:
+/// break; x = None` must not widen `x` — so it contributes its declarations
+/// but no narrowings.
+fn loop_head_states(
+    c: &Checker,
+    body: &[Stmt],
+    pre_loop: TypeEnv,
+    continues: Vec<TypeEnv>,
+) -> Vec<TypeEnv> {
+    let mut body_end = c.env.snapshot();
+    if body.iter().any(|s| stmt_always_exits_aware(c, s)) {
+        body_end.take_narrowings_from(&pre_loop);
+    }
+    let mut states = vec![body_end, pre_loop];
+    states.extend(continues);
+    states
+}
+
+/// The join of `states` — a narrowing survives only where every state
+/// agrees on it ([`TypeEnv::intersect_narrowings`]). `None` when there are
+/// none (the point is unreachable).
+fn join_envs(states: Vec<TypeEnv>) -> Option<TypeEnv> {
+    let mut it = states.into_iter();
+    let mut joined = it.next()?;
+    for s in it {
+        joined.intersect_narrowings(&s);
+    }
+    Some(joined)
+}
+
 /// Type-environment stack — a map of name → TypeBinding per scope.
 #[derive(Debug, Default, Clone)]
 struct TypeEnv {
@@ -2756,6 +2932,17 @@ impl TypeEnv {
         let sub_prefix = format!("{path}.");
         self.attr_narrowings
             .retain(|k, _| k != path && !k.starts_with(&sub_prefix));
+    }
+
+    /// Drop the narrowings on paths below `root` (`root.a`, `root.a.b`, …)
+    /// for which `stale` holds of the path's segments after `root`.
+    fn clear_attr_narrowings_under(&mut self, root: &str, stale: impl Fn(&[&str]) -> bool) {
+        let prefix = format!("{root}.");
+        self.attr_narrowings
+            .retain(|k, _| match k.strip_prefix(&prefix) {
+                Some(rest) => !stale(&rest.split('.').collect::<Vec<_>>()),
+                None => true,
+            });
     }
 
     /// Drop every narrowing whose path ends in `.field` (and their
@@ -2914,6 +3101,29 @@ impl TypeEnv {
             .retain(|k, v| other.attr_narrowings.get(k) == Some(v));
     }
 
+    /// Replace `self`'s narrowings with `other`'s, keeping `self`'s bindings:
+    /// one `other` shares (same declaration) takes its narrowed type, any
+    /// other is widened to its declared type. For an env whose own flow is
+    /// dead — the end of a loop body after an unconditional `break` — so it
+    /// contributes its declarations to a join but none of its narrowings.
+    fn take_narrowings_from(&mut self, other: &TypeEnv) {
+        for (i, scope) in self.scopes.iter_mut().enumerate() {
+            let other_scope = other.scopes.get(i);
+            if other_scope.is_some_and(|o| Rc::ptr_eq(scope, o)) {
+                continue;
+            }
+            for (name, b) in Rc::make_mut(scope).iter_mut() {
+                b.narrowed = match other_scope.and_then(|s| s.get(name)) {
+                    Some(ob) if ob.span == b.span && ob.declared == b.declared => {
+                        ob.narrowed.clone()
+                    }
+                    _ => b.declared.clone(),
+                };
+            }
+        }
+        self.attr_narrowings = other.attr_narrowings.clone();
+    }
+
     /// Overlay onto `self` the binding and narrowing changes a `finally` block
     /// made, given the env it was checked *from* (`before`, the conservative
     /// all-paths view) and the env *after* checking it (`after`).
@@ -3031,10 +3241,28 @@ impl TypeEnv {
 /// conservative direction: the assignment falls through to the ordinary
 /// nominal check rather than being waved through.
 const READ_VIEW_LATTICE: &[(&str, &[&str])] = &[
-    ("Sequence", &["list", "tuple", "deque", "range", "Sequence"]),
+    (
+        "Sequence",
+        &[
+            "list",
+            "tuple",
+            "tuple_variadic",
+            "deque",
+            "range",
+            "Sequence",
+        ],
+    ),
     (
         "Reversible",
-        &["list", "tuple", "deque", "range", "Sequence", "Reversible"],
+        &[
+            "list",
+            "tuple",
+            "tuple_variadic",
+            "deque",
+            "range",
+            "Sequence",
+            "Reversible",
+        ],
     ),
     // Every iterable: the concrete containers, the dict views (iterating a
     // `dict` itself yields its keys, which is what `dict[K, V]`'s first
@@ -3045,6 +3273,7 @@ const READ_VIEW_LATTICE: &[(&str, &[&str])] = &[
         &[
             "list",
             "tuple",
+            "tuple_variadic",
             "set",
             "frozenset",
             "deque",
@@ -3065,6 +3294,7 @@ const READ_VIEW_LATTICE: &[(&str, &[&str])] = &[
         &[
             "list",
             "tuple",
+            "tuple_variadic",
             "set",
             "frozenset",
             "deque",
@@ -3082,6 +3312,7 @@ const READ_VIEW_LATTICE: &[(&str, &[&str])] = &[
         &[
             "list",
             "tuple",
+            "tuple_variadic",
             "set",
             "frozenset",
             "deque",
@@ -3131,6 +3362,15 @@ const INFER_EXPR_MAX_DEPTH: u32 = 20_000;
 const IS_ASSIGNABLE_MAX_DEPTH: u32 = 256;
 
 struct Checker<'a> {
+    descriptor_uses: std::cell::OnceCell<HashSet<(String, String)>>,
+    /// Attribute names this module writes on a receiver other than `self`
+    /// (`err.code = 404`, `cls.code = 1`); `None` when it calls `setattr`,
+    /// `vars` or touches `__dict__`, which can write any name. Computed on
+    /// first use by [`Checker::module_may_store_attr`].
+    dynamic_attr_stores: std::cell::OnceCell<Option<HashSet<String>>>,
+    expression_types: HashMap<(usize, usize), Type>,
+    attribute_receiver_type: Option<Type>,
+    module: Option<&'a ModModule>,
     path: String,
     source: &'a str,
     resolved: &'a ResolvedModule,
@@ -3179,6 +3419,29 @@ struct Checker<'a> {
     /// (review 2026-09-30 §3.4). Empty for the overwhelmingly common
     /// function with no `nonlocal` anywhere beneath it.
     nonlocals_rebound_by_call: std::collections::HashSet<String>,
+    /// Nested `def`s of the function being checked that can rebind its
+    /// locals through `nonlocal` (directly or by calling another such `def`)
+    /// and are only ever *called* by name, never passed or stored: writer
+    /// name → the locals it rebinds. A call to one of them resets exactly
+    /// those narrowings; any other call cannot reach it (review 2026-10-03
+    /// §4.5). Writers that escape are in `nonlocals_rebound_by_call`.
+    nonlocal_writer_calls: HashMap<String, std::collections::HashSet<String>>,
+    /// Which fields a call into this module's own functions, constructors
+    /// and methods can write — what a statement-position call may do to the
+    /// narrowings of an object passed to it. See [`FieldWriteSummary`].
+    field_writes: FieldWriteSummary,
+    /// Names bound by a `type X = …` statement. Each is a `TypeAliasType`
+    /// at runtime, not a class (see [`is_type_alias_name`]).
+    pep695_aliases: HashSet<String>,
+    /// One frame per enclosing loop being checked: the env at every `break`
+    /// and `continue` in its body, joined into the loop-head and post-loop
+    /// states (review 2026-10-03, W1-06 / W1-07).
+    loop_exits: Vec<LoopExits>,
+    /// Per enclosing function body (the module first): every name it
+    /// assigns, with the offset the assignment takes effect at. Lets a
+    /// lambda or nested `def` drop narrowings of captured names that are
+    /// reassigned after it is created (see [`widen_captured_names`]).
+    assign_sites: Vec<Vec<(String, usize)>>,
     /// For each declared function name, its inferred signature type.
     function_signatures: HashMap<String, Type>,
     /// Per-function arity metadata that doesn't fit in `Type::Function`
@@ -3207,6 +3470,11 @@ struct Checker<'a> {
     /// functions never enter this set: their shapes carry no async flag.
     sync_functions: std::collections::HashSet<String>,
     async_functions: std::collections::HashSet<String>,
+    /// Local names of imported free functions a project `.ty` module
+    /// declares as a plain, undecorated `def` ([`ArityInfo::declared_sync`]):
+    /// calling one never yields a coroutine, so `go f()` on it is rejected
+    /// like `go` on a same-module `def`.
+    imported_sync_functions: std::collections::HashSet<String>,
     /// Bumped on entry to an `Expr::Await`, decremented on exit. While
     /// positive, the call-site arm skips the `missing_await` check so
     /// the user's `await f()` is accepted.
@@ -3533,6 +3801,17 @@ pub struct ArityInfo {
     pub kwonly_types: Vec<Type>,
     /// Declared return type. `Type::Unknown` when unannotated.
     pub return_type: Type,
+    /// `true` when the free function is declared with `async def`.
+    /// Cross-module consumers need this to type an un-awaited call as
+    /// `Coroutine[..., T]` rather than the declared result `T`.
+    pub is_async: bool,
+    /// `true` only for a plain, undecorated `def` extracted from Typhon
+    /// source (`.ty`): calling it can never produce a coroutine unless its
+    /// declared return type says so. Stubs (`.dty`, bundled, venv
+    /// introspection) never set it — their `def` is a claim about code the
+    /// checker cannot see. A consumer uses it to reject `go f()` / `await
+    /// f()` on an imported synchronous function (W3, extending W2-11).
+    pub declared_sync: bool,
 }
 
 /// Declared interface (`interface Name:` → `class Name(Protocol):`). Bundles
@@ -3672,6 +3951,7 @@ impl InterfaceShape {
 impl<'a> Checker<'a> {
     fn new(path: String, source: &'a str, resolved: &'a ResolvedModule) -> Self {
         Self {
+            module: None,
             path,
             source,
             resolved,
@@ -3680,12 +3960,18 @@ impl<'a> Checker<'a> {
             is_assignable_path: std::cell::RefCell::new(Vec::new()),
             classes: Vec::new(),
             globals_rebound_by_call: std::collections::HashSet::new(),
+            field_writes: FieldWriteSummary::default(),
+            pep695_aliases: HashSet::new(),
+            loop_exits: Vec::new(),
+            assign_sites: Vec::new(),
             nonlocals_rebound_by_call: std::collections::HashSet::new(),
+            nonlocal_writer_calls: HashMap::new(),
             function_signatures: HashMap::new(),
             function_arity_info: HashMap::new(),
             function_kwarg_types: HashMap::new(),
             async_functions: std::collections::HashSet::new(),
             sync_functions: std::collections::HashSet::new(),
+            imported_sync_functions: std::collections::HashSet::new(),
             inside_await: 0,
             in_question_temp_rhs: false,
             in_sync_function: false,
@@ -3695,6 +3981,10 @@ impl<'a> Checker<'a> {
             in_generator: false,
             function_type_bounds: HashMap::new(),
             active_typevar_bounds: HashMap::new(),
+            descriptor_uses: std::cell::OnceCell::new(),
+            dynamic_attr_stores: std::cell::OnceCell::new(),
+            expression_types: HashMap::new(),
+            attribute_receiver_type: None,
             active_type_params: Vec::new(),
             interfaces: HashMap::new(),
             class_shapes: HashMap::new(),
@@ -3866,6 +4156,72 @@ impl<'a> Checker<'a> {
             }
             _ => false,
         };
+        fn nested_opaque(c: &Checker, ty: &Type) -> bool {
+            match ty {
+                Type::TypeVar(name) | Type::Class(name) => {
+                    c.active_type_params.iter().any(|p| p == name)
+                }
+                Type::Generic(_, args) | Type::Union(args) => {
+                    args.iter().any(|a| nested_opaque(c, a))
+                }
+                Type::Function { params, ret, .. } => {
+                    params.iter().any(|a| nested_opaque(c, a)) || nested_opaque(c, ret)
+                }
+                _ => false,
+            }
+        }
+        if nested_opaque(self, expected) || nested_opaque(self, actual) {
+            if let (Type::Generic(eh, ea), Type::Generic(ah, aa)) = (expected, actual) {
+                if ea.len() == 1
+                    && !aa.is_empty()
+                    && (read_view_head_accepts(eh, ah) || (eh == "tuple_variadic" && ah == "tuple"))
+                {
+                    let slots = if ah == "tuple" {
+                        aa.as_slice()
+                    } else {
+                        &aa[..1]
+                    };
+                    return Some(slots.iter().all(|a| self.is_assignable(&ea[0], a)));
+                }
+                if eh == "Mapping"
+                    && matches!(ah.as_str(), "dict" | "Mapping")
+                    && ea.len() == aa.len()
+                {
+                    return Some(ea.iter().zip(aa).all(|(e, a)| self.is_assignable(e, a)));
+                }
+            }
+            match (expected, actual) {
+                (
+                    Type::Function {
+                        params: ep,
+                        ret: er,
+                        ..
+                    },
+                    Type::Function {
+                        params: ap,
+                        ret: ar,
+                        ..
+                    },
+                ) if ep.len() == ap.len() => {
+                    return Some(
+                        ep.iter().zip(ap).all(|(e, a)| self.is_assignable(a, e))
+                            && self.is_assignable(er, ar),
+                    )
+                }
+                (Type::Generic(eh, ea), Type::Generic(ah, aa))
+                    if eh == ah && ea.len() == aa.len() =>
+                {
+                    return Some(ea.iter().zip(aa).all(|(e, a)| self.is_assignable(e, a)))
+                }
+                (_, Type::Union(members)) => {
+                    return Some(members.iter().all(|a| self.is_assignable(expected, a)))
+                }
+                (Type::Union(members), _) => {
+                    return Some(members.iter().any(|e| self.is_assignable(e, actual)))
+                }
+                _ => {}
+            }
+        }
         match (expected, actual) {
             (Type::TypeVar(e), Type::TypeVar(a)) if opaque(expected) || opaque(actual) => {
                 Some(e == a)
@@ -3902,6 +4258,11 @@ impl<'a> Checker<'a> {
     }
 
     fn is_assignable_inner(&self, expected: &Type, actual: &Type) -> bool {
+        if matches!(expected, Type::Generic(head, _) if head == "TypeGuard" || head == "TypeIs")
+            && matches!(actual, Type::Bool)
+        {
+            return true;
+        }
         if let Some(verdict) = self.opaque_typevar_verdict(expected, actual) {
             return verdict;
         }
@@ -3913,7 +4274,22 @@ impl<'a> Checker<'a> {
         // `async def` value assignable to a `Callable[..., Awaitable[R]]`
         // parameter.
         if let (Type::Generic(eh, ea), Type::Generic(ah, aa)) = (expected, actual) {
-            if eh == "Awaitable" && ah == "Coroutine" && ea.len() == 1 {
+            if eh == "Coroutine" && ah == "Coroutine" && ea.len() != aa.len() {
+                let e = unwrap_awaitable(expected, &self.classes);
+                let a = unwrap_awaitable(actual, &self.classes);
+                if let (Some(e), Some(a)) = (e, a) {
+                    return self.is_assignable(&e, &a);
+                }
+            }
+            if eh == "Awaitable"
+                && matches!(
+                    ah.as_str(),
+                    "Coroutine" | "Task" | "asyncio.Task" | "Future" | "asyncio.Future"
+                )
+                && ea.len() == 1
+                && (!matches!(ah.as_str(), "Task" | "Future")
+                    || !self.classes.iter().any(|name| name == ah))
+            {
                 // The checker's own shorthand is `Coroutine[R]`; the typeshed
                 // form is `Coroutine[Y, S, R]`.
                 let result = match aa.len() {
@@ -4032,6 +4408,9 @@ impl<'a> Checker<'a> {
             },
         ) = (expected, actual)
         {
+            if callables::parameter_pack(ep).is_some() {
+                return self.is_assignable(er, ar);
+            }
             // `Callable[..., R]` (empty params + variadic) accepts any
             // function with an assignable (covariant) return type.
             if *ev && ep.is_empty() {
@@ -4477,6 +4856,98 @@ impl<'a> Checker<'a> {
         self.unwrap_alias_inner(ty, 0)
     }
 
+    /// Replace every `type` alias whose right-hand side is nullable
+    /// (`type OptStr = str | None`, `= str?`, `= User | None`) by that
+    /// right-hand side, inside `ty`. Such an alias was an opaque nominal
+    /// `Class("OptStr")` to every nullable check and narrowing, so
+    /// `s.upper()` on an `OptStr` was accepted and `if s is None: return`
+    /// could not narrow it (review 2026-10-03 §4.8, W1-11). Other aliases
+    /// keep their name.
+    fn expand_nullable_aliases(&self, ty: &Type) -> Type {
+        self.expand_nullable_aliases_inner(ty, 0)
+    }
+
+    fn expand_nullable_aliases_inner(&self, ty: &Type, depth: u8) -> Type {
+        if depth >= 8 {
+            return ty.clone();
+        }
+        match ty {
+            Type::Class(name) => match self.type_aliases.get(name.as_str()) {
+                Some((params, rhs)) if params.is_empty() => {
+                    let rhs = self.unwrap_alias(rhs);
+                    if rhs.is_nullable() {
+                        self.expand_nullable_aliases_inner(&rhs, depth + 1)
+                    } else {
+                        ty.clone()
+                    }
+                }
+                _ => ty.clone(),
+            },
+            Type::Union(xs) => Type::union_of(
+                xs.iter()
+                    .map(|x| self.expand_nullable_aliases_inner(x, depth + 1))
+                    .collect(),
+            ),
+            Type::Generic(h, args) => Type::Generic(
+                h.clone(),
+                args.iter()
+                    .map(|a| self.expand_nullable_aliases_inner(a, depth + 1))
+                    .collect(),
+            ),
+            Type::Function {
+                params,
+                ret,
+                variadic,
+                min_params,
+            } => Type::Function {
+                params: params
+                    .iter()
+                    .map(|p| self.expand_nullable_aliases_inner(p, depth + 1))
+                    .collect(),
+                ret: Box::new(self.expand_nullable_aliases_inner(ret, depth + 1)),
+                variadic: *variadic,
+                min_params: *min_params,
+            },
+            _ => ty.clone(),
+        }
+    }
+
+    /// Apply [`expand_nullable_aliases`](Self::expand_nullable_aliases) to
+    /// every signature and class shape collected for this module.
+    fn expand_nullable_aliases_in_shapes(&mut self) {
+        let has_nullable_alias = self
+            .type_aliases
+            .iter()
+            .any(|(_, (params, rhs))| params.is_empty() && self.unwrap_alias(rhs).is_nullable());
+        if !has_nullable_alias {
+            return;
+        }
+        let sigs: Vec<(String, Type)> = self
+            .function_signatures
+            .iter()
+            .map(|(k, v)| (k.clone(), self.expand_nullable_aliases(v)))
+            .collect();
+        self.function_signatures.extend(sigs);
+        let shapes: Vec<(String, InterfaceShape)> = self
+            .class_shapes
+            .iter()
+            .map(|(k, shape)| {
+                let mut s = shape.clone();
+                for t in s.fields.values_mut() {
+                    *t = self.expand_nullable_aliases(t);
+                }
+                for m in s.methods.values_mut() {
+                    m.return_type = self.expand_nullable_aliases(&m.return_type);
+                    for p in m.param_types.iter_mut() {
+                        *p = self.expand_nullable_aliases(p);
+                    }
+                }
+                (k.clone(), s)
+            })
+            .collect();
+        self.class_shapes.extend(shapes);
+    }
+
     /// Walk `ty` and rewrite every `Class("alias.X")` whose prefix
     /// resolves to a `Type::Module(canonical)` binding in the env into
     /// `Class("canonical.X")`. Pure if no aliases match. The recursion
@@ -4826,8 +5297,16 @@ impl<'a> Checker<'a> {
             } else {
                 substitute_typevars(&iface_sig.return_type, iface_subst)
             };
+            if iface_sig.is_property {
+                if let Some((getter, _)) = class_contracts::property(self, cls_name, m) {
+                    if !is_self_ref(&iface_ret) && !self.is_assignable(&iface_ret, &getter) {
+                        return false;
+                    }
+                    continue;
+                }
+            }
             match self.find_method(cls_name, m) {
-                Some(cls_sig) if cls_sig.arity == iface_sig.arity => {
+                Some(cls_sig) if class_contracts::method_accepts_contract(iface_sig, cls_sig) => {
                     // `async def` is part of the contract in both directions: a
                     // caller `await`s an interface coroutine method (an `int`
                     // from a sync implementation crashes) and calls a sync one
@@ -4892,6 +5371,12 @@ impl<'a> Checker<'a> {
                 _ => return false,
             }
         }
+        if !iface_shape.fields.is_empty()
+            && (self.frozen_classes.contains(cls_name)
+                || class_contracts::dataclass_option(self, cls_name, "frozen") == Some(true))
+        {
+            return false;
+        }
         for (f, iface_type_raw) in &iface_shape.fields {
             let iface_type = if iface_subst.is_empty() {
                 iface_type_raw.clone()
@@ -4899,17 +5384,18 @@ impl<'a> Checker<'a> {
                 substitute_typevars(iface_type_raw, iface_subst)
             };
             match self.find_field(cls_name, f) {
-                Some(cls_type) if self.is_assignable(&iface_type, cls_type) => {}
+                Some(cls_type)
+                    if self.is_assignable(&iface_type, cls_type)
+                        && self.is_assignable(cls_type, &iface_type) => {}
                 Some(_) => return false, // field present but wrong type
-                // A `@property` of the right type satisfies a field — reading
-                // it yields the value. A plain zero-argument *method* does not:
-                // `obj.f` would be a bound method where the interface promised
-                // the value itself.
-                None if self.find_method(cls_name, f).is_some_and(|s| {
-                    s.is_property
-                        && (s.return_type == Type::Unknown
-                            || self.is_assignable(&iface_type, &s.return_type))
-                }) => {}
+                None if class_contracts::property(self, cls_name, f).is_some_and(
+                    |(getter, setter)| {
+                        setter.is_some_and(|setter| {
+                            self.is_assignable(&iface_type, &getter)
+                                && self.is_assignable(&setter, &iface_type)
+                        })
+                    },
+                ) => {}
                 None => return false,
             }
         }
@@ -5210,12 +5696,29 @@ impl<'a> Checker<'a> {
     /// classes defining `__setattr__` / `__getattr__`. A plain `class` with
     /// fully-known bases emits `@dataclass(slots=True)` and cannot.
     fn class_accepts_undeclared_attrs(&self, name: &str) -> bool {
-        let real = name.strip_prefix("__typhon_impl_").unwrap_or(name);
-        self.is_plain_class(real)
-            || self.is_raw_class(real)
-            || !self.class_hierarchy_fully_known(real)
-            || self.class_defines_getattr(real)
-            || self.find_method(real, "__setattr__").is_some()
+        let mut stack = vec![name
+            .strip_prefix("__typhon_impl_")
+            .unwrap_or(name)
+            .to_owned()];
+        let mut seen = HashSet::new();
+        while let Some(real) = stack.pop() {
+            if !seen.insert(real.clone()) {
+                continue;
+            }
+            if self.is_plain_class(&real)
+                || self.is_raw_class(&real)
+                || class_contracts::dataclass_option(self, &real, "slots") == Some(false)
+                || !self.class_hierarchy_fully_known(&real)
+                || self.class_defines_getattr(&real)
+                || self.find_method(&real, "__setattr__").is_some()
+            {
+                return true;
+            }
+            if let Some(shape) = self.resolve_class_shape(&real) {
+                stack.extend(shape.bases.iter().cloned());
+            }
+        }
+        false
     }
 
     /// Return `true` when every class in `cls_name`'s inheritance chain has a
@@ -5242,6 +5745,105 @@ impl<'a> Checker<'a> {
             }
         }
         true
+    }
+
+    /// The builtin exception classes `cls_name` inherits from, when every
+    /// class in its hierarchy is either a non-partial project class or a
+    /// builtin exception; `None` when any other unseen base (a framework
+    /// class, a venv type) could supply attributes the checker cannot list.
+    fn builtin_exception_bases(&self, cls_name: &str) -> Option<Vec<String>> {
+        let mut out = Vec::new();
+        let mut stack: Vec<&str> = vec![cls_name];
+        let mut visited: HashSet<&str> = HashSet::new();
+        while let Some(name) = stack.pop() {
+            if !visited.insert(name) {
+                continue;
+            }
+            match self.class_shapes.get(name) {
+                Some(shape) if shape.partial => return None,
+                Some(_) => {}
+                None if name == "object" => continue,
+                None if tyc_syntax::builtin_exceptions::is_builtin_exception(name) => {
+                    out.push(name.to_owned());
+                    continue;
+                }
+                None => return None,
+            }
+            if let Some(parents) = self.class_parents.get(name) {
+                stack.extend(parents.iter().map(String::as_str));
+            }
+        }
+        Some(out)
+    }
+
+    /// Whether this module may write attribute `attr` onto an object from
+    /// outside its class body: a store through a receiver other than
+    /// `self` (`err.code = 404`, `cls.code = 1`, `obj.code += 1`), or any
+    /// `setattr` / `vars` / `__dict__` use, which can write any name.
+    fn module_may_store_attr(&self, attr: &str) -> bool {
+        use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
+        struct Scan {
+            stores: HashSet<String>,
+            dynamic: bool,
+        }
+        impl Scan {
+            fn target(&mut self, t: &Expr) {
+                match t {
+                    Expr::Attribute(a) => {
+                        if !matches!(a.value.as_ref(), Expr::Name(n) if n.id.as_str() == "self") {
+                            self.stores.insert(a.attr.as_str().to_owned());
+                        }
+                    }
+                    Expr::Tuple(x) => x.elts.iter().for_each(|e| self.target(e)),
+                    Expr::List(x) => x.elts.iter().for_each(|e| self.target(e)),
+                    Expr::Starred(x) => self.target(&x.value),
+                    _ => {}
+                }
+            }
+        }
+        impl<'a> Visitor<'a> for Scan {
+            fn visit_stmt(&mut self, stmt: &'a Stmt) {
+                match stmt {
+                    Stmt::Assign(a) => a.targets.iter().for_each(|t| self.target(t)),
+                    Stmt::AugAssign(a) => self.target(&a.target),
+                    Stmt::AnnAssign(a) => self.target(&a.target),
+                    Stmt::For(f) => self.target(&f.target),
+                    Stmt::With(w) => w
+                        .items
+                        .iter()
+                        .filter_map(|i| i.optional_vars.as_deref())
+                        .for_each(|t| self.target(t)),
+                    _ => {}
+                }
+                walk_stmt(self, stmt);
+            }
+            fn visit_expr(&mut self, expr: &'a Expr) {
+                match expr {
+                    Expr::Name(n) if matches!(n.id.as_str(), "setattr" | "vars") => {
+                        self.dynamic = true;
+                    }
+                    Expr::Attribute(a) if a.attr.as_str() == "__dict__" => self.dynamic = true,
+                    Expr::Named(n) => self.target(&n.target),
+                    _ => {}
+                }
+                walk_expr(self, expr);
+            }
+        }
+        self.dynamic_attr_stores
+            .get_or_init(|| {
+                let mut scan = Scan {
+                    stores: HashSet::new(),
+                    dynamic: false,
+                };
+                if let Some(module) = self.module {
+                    for stmt in &module.body {
+                        scan.visit_stmt(stmt);
+                    }
+                }
+                (!scan.dynamic).then_some(scan.stores)
+            })
+            .as_ref()
+            .is_none_or(|stores| stores.contains(attr))
     }
 
     /// SOUNDNESS (union use sites): return `true` when attribute / method
@@ -5301,10 +5903,31 @@ impl<'a> Checker<'a> {
                 }
             }
             Type::Class(name) => {
-                if !self.class_hierarchy_fully_known(name) || self.class_defines_getattr(name) {
+                if self.class_defines_getattr(name) {
                     return true;
                 }
-                self.find_method(name, attr).is_some() || self.find_field(name, attr).is_some()
+                let declared =
+                    self.find_method(name, attr).is_some() || self.find_field(name, attr).is_some();
+                if self.class_hierarchy_fully_known(name) {
+                    return declared;
+                }
+                // A base the checker cannot see may supply `attr` — unless
+                // every such base is a builtin exception, whose attributes
+                // are a fixed table (`except (A, B) as e: e.code` where only
+                // `A` declares `code` and both derive from `Exception`).
+                // An instance of such a class has a `__dict__`, so a write
+                // of `attr` anywhere in the module (`err.code = 404`) keeps
+                // it permissive.
+                match self.builtin_exception_bases(name) {
+                    Some(bases) => {
+                        declared
+                            || bases
+                                .iter()
+                                .any(|b| tyc_syntax::builtin_exceptions::has_attr(b, attr))
+                            || self.module_may_store_attr(attr)
+                    }
+                    None => true,
+                }
             }
             // Nested union — recurse (every member must support it).
             Type::Union(ms) => ms.iter().all(|m| self.member_supports_attr(m, attr)),
@@ -5676,7 +6299,11 @@ impl<'a> Checker<'a> {
             },
             other => other.display(),
         };
-        let diag = TycError::nullable_use(name, display, &self.path, self.source, span.0, length);
+        let mut diag =
+            TycError::nullable_use(name, display, &self.path, self.source, span.0, length);
+        if let Some(guard) = prior_none_guard(self.source, name, span.0) {
+            diag = diag.with_existing_guard(name, guard);
+        }
         if warn_only {
             self.diagnostics.push_warning(diag);
         } else {
@@ -5779,19 +6406,66 @@ impl<'a> Checker<'a> {
         ));
     }
 
-    fn non_exhaustive_match(&mut self, union_name: &str, missing: &str, span: (usize, usize)) {
+    fn alias_not_a_class(&mut self, alias: &str, form: &str, fix: &str, span: (usize, usize)) {
         if self.unsafe_depth > 0 {
             return;
         }
         let length = span.1.saturating_sub(span.0).max(1);
-        self.diagnostics.push_error(TycError::non_exhaustive_match(
-            union_name,
-            missing,
+        self.diagnostics.push_error(TycError::alias_not_a_class(
+            alias,
+            form,
+            fix,
             &self.path,
             self.source,
             span.0,
             length,
         ));
+    }
+
+    fn non_exhaustive_match(&mut self, union_name: &str, missing: &str, span: (usize, usize)) {
+        self.push_non_exhaustive(span, |path, source, offset, length| {
+            TycError::non_exhaustive_match(union_name, missing, path, source, offset, length)
+        });
+    }
+
+    /// `tyc::non_exhaustive_match` over an `enum` subject.
+    fn non_exhaustive_enum_match(&mut self, enum_name: &str, missing: &str, span: (usize, usize)) {
+        self.push_non_exhaustive(span, |path, source, offset, length| {
+            TycError::non_exhaustive_enum_match(enum_name, missing, path, source, offset, length)
+        });
+    }
+
+    /// `tyc::non_exhaustive_match` over a closed subject that is not a
+    /// sealed union (`Result`, `T?`, `bool`, a literal union).
+    fn non_exhaustive_closed_match(
+        &mut self,
+        subject_type: &str,
+        missing: &str,
+        span: (usize, usize),
+    ) {
+        self.push_non_exhaustive(span, |path, source, offset, length| {
+            TycError::non_exhaustive_closed_match(
+                subject_type,
+                missing,
+                path,
+                source,
+                offset,
+                length,
+            )
+        });
+    }
+
+    fn push_non_exhaustive(
+        &mut self,
+        span: (usize, usize),
+        make: impl FnOnce(&str, &str, usize, usize) -> TycError,
+    ) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
+        let length = span.1.saturating_sub(span.0).max(1);
+        let err = make(&self.path, self.source, span.0, length);
+        self.diagnostics.push_error(err);
     }
 
     fn typevar_bound_violation(
@@ -6203,6 +6877,28 @@ pub struct ExternalShapes {
 /// (cyclic aliases, unknown class names in annotations, …) are
 /// silently tolerated: the goal here is to publish the surface API for
 /// downstream callers, not to validate it.
+/// Class-shape name under which a module publishes the methods its
+/// `extend Class:` block patches onto an imported class:
+/// `__typhon_extend_<Class>@<import spec>`, where the spec is the module as
+/// the extending module imported it (`user`, `.user`, `..`). The consumer
+/// resolves the spec against the extending module's key; see
+/// [`parse_extension_sentinel`].
+pub fn extension_sentinel_name(class: &str, spec: &str) -> String {
+    format!("{EXTENSION_SENTINEL_PREFIX}{class}@{spec}")
+}
+
+/// Prefix of [`extension_sentinel_name`].
+pub const EXTENSION_SENTINEL_PREFIX: &str = "__typhon_extend_";
+
+/// `(class, level, module)` of an [`extension_sentinel_name`].
+pub fn parse_extension_sentinel(name: &str) -> Option<(&str, u32, &str)> {
+    let rest = name.strip_prefix(EXTENSION_SENTINEL_PREFIX)?;
+    let (class, spec) = rest.split_once('@')?;
+    let module = spec.trim_start_matches('.');
+    let level = (spec.len() - module.len()) as u32;
+    Some((class, level, module))
+}
+
 pub fn extract_module_shapes(module: &ModModule) -> ModuleShapes {
     extract_module_shapes_with(module, &std::collections::HashSet::new())
 }
@@ -6264,6 +6960,27 @@ pub fn extract_module_shapes_with(
             }
         }
     }
+    // `from M import X [as Y]` bindings, so an `extend Y:` of an imported
+    // class can name the class it patches (W3-03).
+    let mut from_imports: HashMap<String, String> = HashMap::new();
+    for stmt in &module.body {
+        if let Stmt::ImportFrom(i) = stmt {
+            let spec = format!(
+                "{}{}",
+                ".".repeat(i.level as usize),
+                i.module.as_ref().map(|m| m.as_str()).unwrap_or("")
+            );
+            for alias in &i.names {
+                let member = alias.name.as_str();
+                if member == "*" {
+                    continue;
+                }
+                let local = alias.asname.as_ref().map(|a| a.as_str()).unwrap_or(member);
+                from_imports.insert(local.to_owned(), extension_sentinel_name(member, &spec));
+            }
+        }
+    }
+    let mut foreign_extensions: HashMap<String, InterfaceShape> = HashMap::new();
     // Second sweep: fold `__typhon_impl_NAME` contributions back into
     // the target class so an out-of-module caller sees `impl`-block
     // methods on the same shape as the in-module checker does.
@@ -6271,7 +6988,21 @@ pub fn extract_module_shapes_with(
         if let Stmt::ClassDef(cd) = stmt {
             let pseudo = cd.name.as_str();
             if let Some(target) = pseudo.strip_prefix("__typhon_impl_") {
-                if class_shapes.contains_key(target) {
+                if !class_shapes.contains_key(target) {
+                    // `extend User:` of an imported class lowers to
+                    // module-level patches (`User.m = …`) that run when this
+                    // module is imported. Publish its methods under a
+                    // sentinel naming the patched class's module, so a
+                    // consumer importing this module sees them on `User`
+                    // (W3-03). Fields are not patched, so not published.
+                    if let Some(sentinel) = from_imports.get(target) {
+                        let impl_shape = collect_class_shape(cd, &classes);
+                        let entry = foreign_extensions.entry(sentinel.clone()).or_default();
+                        for (m, sig) in impl_shape.methods {
+                            entry.methods.entry(m).or_insert(sig);
+                        }
+                    }
+                } else {
                     let impl_shape = collect_class_shape(cd, &classes);
                     let target_shape = class_shapes.get_mut(target).expect("checked above");
                     for (m, sig) in impl_shape.methods {
@@ -6301,20 +7032,21 @@ pub fn extract_module_shapes_with(
     // Drop the synthetic pseudo-classes from the published surface —
     // consumers should never see them by name.
     class_shapes.retain(|name, _| !name.starts_with("__typhon_impl_"));
+    class_shapes.extend(foreign_extensions);
 
     let mut function_arities: HashMap<String, ArityInfo> = HashMap::new();
     for stmt in &module.body {
         if let Stmt::FunctionDef(f) = stmt {
             let tps = type_param_names_from(f.type_params.as_deref());
-            function_arities.insert(
-                f.name.as_str().to_owned(),
-                arity_info_from_parameters_with_returns(
-                    f.parameters.as_ref(),
-                    f.returns.as_deref(),
-                    &classes,
-                    &tps,
-                ),
+            let mut info = arity_info_from_parameters_with_returns(
+                f.parameters.as_ref(),
+                f.returns.as_deref(),
+                &classes,
+                &tps,
             );
+            info.is_async = f.is_async;
+            info.declared_sync = !f.is_async && f.decorator_list.is_empty();
+            function_arities.insert(f.name.as_str().to_owned(), info);
         }
     }
 
@@ -6572,7 +7304,46 @@ pub fn check_module_with_imports(
     impl_distributed_lines: &[usize],
     external: Option<&ExternalShapes>,
 ) -> Diagnostics {
+    check_module_with_imports_and_types(
+        path,
+        source,
+        resolved,
+        module,
+        unsafe_lines,
+        frozen_class_lines,
+        impl_distributed_lines,
+        external,
+    )
+    .diagnostics
+}
+
+/// Checked expression types use byte spans in the preprocessed source. The
+/// map records contextual inference, including expected Callable parameters
+/// and typed match captures, rather than reconstructing types during lowering.
+#[derive(Debug)]
+pub struct CheckedModule {
+    pub diagnostics: Diagnostics,
+    pub expression_types: HashMap<(usize, usize), Type>,
+}
+impl CheckedModule {
+    pub fn type_at(&self, span: (usize, usize)) -> Option<&Type> {
+        self.expression_types.get(&span)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn check_module_with_imports_and_types(
+    path: impl Into<String>,
+    source: &str,
+    resolved: &ResolvedModule,
+    module: &ModModule,
+    unsafe_lines: &[usize],
+    frozen_class_lines: &[usize],
+    impl_distributed_lines: &[usize],
+    external: Option<&ExternalShapes>,
+) -> CheckedModule {
     let mut c = Checker::new(path.into(), source, resolved);
+    c.module = Some(module);
     c.unsafe_line_starts = unsafe_byte_starts(source, unsafe_lines);
     let frozen_starts = unsafe_byte_starts(source, frozen_class_lines);
     // Seed cross-module shapes BEFORE the in-module first pass so
@@ -6659,6 +7430,11 @@ pub fn check_module_with_imports(
             c.function_arity_info
                 .entry(name.clone())
                 .or_insert_with(|| info.clone());
+            if info.is_async {
+                c.async_functions.insert(name.clone());
+            } else if info.declared_sync && !name.contains('.') {
+                c.imported_sync_functions.insert(name.clone());
+            }
         }
         // Cross-module sealed unions: an imported `type Event = A | B`
         // must allow variant→union flow at this module's call sites,
@@ -6754,11 +7530,13 @@ pub fn check_module_with_imports(
     // First pass: collect class names + function signatures so forward
     // references work.
     collect_call_rebound_globals(&module.body, &mut c.globals_rebound_by_call);
+    c.field_writes = FieldWriteSummary::collect(&module.body);
     // Frozen-ness first: the class pass infers type-parameter variance and
     // needs to know which classes are `frozen` (their fields are
     // read-only, hence covariant).
     populate_frozen_classes(&mut c, &module.body, &frozen_starts);
     collect_classes_and_functions(&mut c, &module.body);
+    c.expand_nullable_aliases_in_shapes();
     check_override_compatibility(&mut c, &module.body);
     check_frozen_inheritance(&mut c, &module.body);
     // Cross-function field-init audit pre-pass: identify helper
@@ -6777,9 +7555,11 @@ pub fn check_module_with_imports(
     // - `Ok`/`Err` may be used before the `from typhon_runtime import`
     //   injection happens (the desugar pass adds it later).
     seed_typhon_builtins(&mut c);
+    c.assign_sites.push(collect_assign_sites(&module.body));
     for stmt in &module.body {
         check_stmt(&mut c, stmt);
     }
+    c.assign_sites.pop();
     c.env.leave();
 
     // Phase C: resource discipline. Walk the body for bound
@@ -6817,7 +7597,12 @@ pub fn check_module_with_imports(
     // the failure shows in the editor instead of at first import.
     check_freeze_let_freezable(&mut c, &module.body);
 
-    c.diagnostics
+    #[cfg(debug_assertions)]
+    unchecked::report(&c.path, module, &c.expression_types);
+    CheckedModule {
+        diagnostics: c.diagnostics,
+        expression_types: c.expression_types,
+    }
 }
 
 /// Compute the byte offset of the start of each line in `source` that was
@@ -7761,6 +8546,82 @@ fn check_unsafe_return_leak(c: &mut Checker, expr: &Expr) {
     check_unsafe_leak_into(c, expr, &ret_ty);
 }
 
+/// The line of an earlier `None` check on `path` — `if path is None:`,
+/// `if path is not None:`, `if not path:`, `assert path`, `while path`,
+/// `isinstance(path, …)` — between the start of the enclosing `def` and
+/// `use_at`, as written. `tyc::nullable_use` re-words its help when the
+/// value is already checked somewhere the checker could not carry the
+/// narrowing from (W1-03): "add a guard" is wrong advice when the guard is
+/// three lines up. A text scan over the checked source, so it only answers
+/// "is there such a check above", never "does it dominate this use".
+fn prior_none_guard<'s>(source: &'s str, path: &str, use_at: usize) -> Option<&'s str> {
+    let is_ident = |seg: &str| {
+        let mut chars = seg.chars();
+        chars
+            .next()
+            .is_some_and(|ch| ch.is_alphabetic() || ch == '_')
+            && chars.all(|ch| ch.is_alphanumeric() || ch == '_')
+    };
+    if path.is_empty() || !path.split('.').all(is_ident) || use_at > source.len() {
+        return None;
+    }
+    let indent_of = |l: &str| l.len() - l.trim_start().len();
+    let use_line_start = source[..use_at].rfind('\n').map_or(0, |i| i + 1);
+    let use_indent = indent_of(&source[use_line_start..]);
+    // Walk back to the header of the enclosing `def` (the module start
+    // otherwise).
+    let mut region_start = 0;
+    let mut pos = use_line_start;
+    while pos > 0 {
+        let prev = source[..pos - 1].rfind('\n').map_or(0, |i| i + 1);
+        let line = &source[prev..pos - 1];
+        let t = line.trim_start();
+        if (t.starts_with("def ") || t.starts_with("async def ")) && indent_of(line) < use_indent {
+            region_start = prev;
+            break;
+        }
+        pos = prev;
+    }
+    let region = &source[region_start..use_at];
+    let continues_path = |ch: char| ch.is_alphanumeric() || ch == '_' || ch == '.';
+    let mut found = None;
+    for (i, _) in region.match_indices(path) {
+        let before = &region[..i];
+        let after = &region[i + path.len()..];
+        if before.chars().next_back().is_some_and(continues_path)
+            || after
+                .chars()
+                .next()
+                .is_some_and(|ch| continues_path(ch) || ch == '[' || ch == '(')
+        {
+            continue;
+        }
+        let rest = after.trim_start_matches([' ', '\t']);
+        let compared = ["is None", "is not None", "== None", "!= None"]
+            .iter()
+            .any(|op| rest.starts_with(op));
+        let last_word = before
+            .trim_end_matches([' ', '\t', '('])
+            .rsplit([' ', '\t', '\n', '('])
+            .next()
+            .unwrap_or("");
+        let tested = matches!(
+            last_word,
+            "if" | "elif" | "while" | "and" | "or" | "not" | "assert"
+        ) && (rest.is_empty()
+            || [":", ")", "\n", "and ", "or ", "else"]
+                .iter()
+                .any(|end| rest.starts_with(end)));
+        let isinstance = before.ends_with("isinstance(") && rest.starts_with(',');
+        if compared || tested || isinstance {
+            let line_start = region[..i].rfind('\n').map_or(0, |j| j + 1);
+            let line_end = region[i..].find('\n').map_or(region.len(), |j| i + j);
+            found = Some(region[line_start..line_end].trim());
+        }
+    }
+    found
+}
+
 /// Shared core of the `unsafe:` value-leak audit (Rule 5 / SKILL §5.9):
 /// fire `tyc::unsafe_value_leak` when a bare `Name` whose binding was
 /// first introduced inside an `unsafe:` block flows OUT into a
@@ -7781,12 +8642,13 @@ fn check_unsafe_leak_into(c: &mut Checker, expr: &Expr, target_ty: &Type) {
     if c.unsafe_depth > 0 {
         return;
     }
-    let Some(name) = (match expr {
-        Expr::Name(n) => Some(n.id.as_str()),
-        _ => None,
-    }) else {
+    // A value *derived* from an unsafe binding — `data["name"]`,
+    // `data.count + 1`, `[x for x in data]`, `lambda: data` — carries its
+    // lack of a type just as the bare name does (review 2026-10-03 §3.6).
+    let Some(name) = unsafe_root_name(c, expr) else {
         return;
     };
+    let derived = !matches!(expr, Expr::Name(_));
     // Check the current environment first: if a safe-scope rebind
     // outside the `unsafe:` block has re-introduced the name with
     // its own concrete type (`let value: int = value` after the
@@ -7816,8 +8678,27 @@ fn check_unsafe_leak_into(c: &mut Checker, expr: &Expr, target_ty: &Type) {
     // target via the normal nominal/structural rules (i.e. the user
     // annotated the unsafe binding with a concrete type and the check
     // passed), the cross is sound — no diagnostic needed.
-    if c.is_assignable(target_ty, &declared) && !matches!(declared, Type::Unknown) {
+    if !derived && c.is_assignable(target_ty, &declared) && !matches!(declared, Type::Unknown) {
         return;
+    }
+    // A derived value of an *annotated* unsafe binding has a real type;
+    // trust it when it fits. One of an untyped binding never does.
+    if derived && !matches!(declared, Type::Unknown | Type::Any) {
+        // The `unsafe:` scope is gone by now; infer with the binding's
+        // recorded type back in view.
+        c.env.enter();
+        c.env.declare(TypeBinding {
+            name: name.to_owned(),
+            declared: declared.clone(),
+            narrowed: declared.clone(),
+            span: (0, 0),
+            from_unsafe: false,
+        });
+        let actual = infer_expr_readonly(c, expr);
+        c.env.leave();
+        if !matches!(actual, Type::Unknown | Type::Any) && c.is_assignable(target_ty, &actual) {
+            return;
+        }
     }
     let span = (
         expr.range().start().to_usize(),
@@ -7825,14 +8706,113 @@ fn check_unsafe_leak_into(c: &mut Checker, expr: &Expr, target_ty: &Type) {
     );
     let length = span.1.saturating_sub(span.0).max(1);
     let target_display = target_ty.display();
+    // Suggest the checked cast spelled on the escaping expression itself
+    // (`data["name"] as! str`), parenthesised unless it is a plain operand.
+    let cast = checked_cast_target_supported(c, target_ty).then(|| {
+        let text = c.source.get(span.0..span.1).unwrap_or(name).trim();
+        let plain = matches!(
+            expr,
+            Expr::Name(_) | Expr::Attribute(_) | Expr::Subscript(_) | Expr::Call(_)
+        ) && !text.contains('\n');
+        if plain {
+            format!("{text} as! {target_display}")
+        } else {
+            format!("({}) as! {target_display}", text.replace('\n', " "))
+        }
+    });
     c.diagnostics.push_error(TycError::unsafe_value_leak(
         name,
         target_display,
+        cast,
         &c.path,
         c.source,
         span.0,
         length,
     ));
+}
+
+/// The name of the `unsafe:`-origin binding `expr`'s value is derived from,
+/// if any: the binding itself, or a subscript, attribute, method call,
+/// arithmetic, conditional, literal, comprehension or lambda built on it.
+/// A plain call `f(data)` returns `f`'s declared type and is not derived;
+/// neither is `data as! T`, which lowers to such a call.
+fn unsafe_root_name<'a>(c: &Checker, expr: &'a Expr) -> Option<&'a str> {
+    let is_unsafe = |name: &str| match c.env.lookup(name) {
+        Some(b) => b.from_unsafe,
+        None => c.unsafe_origin_bindings.contains_key(name),
+    };
+    match expr {
+        Expr::Name(n) => is_unsafe(n.id.as_str()).then_some(n.id.as_str()),
+        Expr::Subscript(s) => unsafe_root_name(c, &s.value),
+        Expr::Attribute(a) => unsafe_root_name(c, &a.value),
+        Expr::Call(call) => match call.func.as_ref() {
+            Expr::Attribute(a) => unsafe_root_name(c, &a.value),
+            _ => None,
+        },
+        Expr::BinOp(b) => unsafe_root_name(c, &b.left).or_else(|| unsafe_root_name(c, &b.right)),
+        Expr::UnaryOp(u) => unsafe_root_name(c, &u.operand),
+        Expr::BoolOp(b) => b.values.iter().find_map(|v| unsafe_root_name(c, v)),
+        Expr::If(i) => unsafe_root_name(c, &i.body).or_else(|| unsafe_root_name(c, &i.orelse)),
+        Expr::Await(a) => unsafe_root_name(c, &a.value),
+        Expr::Starred(s) => unsafe_root_name(c, &s.value),
+        Expr::Named(n) => unsafe_root_name(c, &n.value),
+        Expr::List(l) => l.elts.iter().find_map(|e| unsafe_root_name(c, e)),
+        Expr::Tuple(t) => t.elts.iter().find_map(|e| unsafe_root_name(c, e)),
+        Expr::Set(s) => s.elts.iter().find_map(|e| unsafe_root_name(c, e)),
+        Expr::Dict(d) => d.items.iter().find_map(|i| {
+            i.key
+                .as_ref()
+                .and_then(|k| unsafe_root_name(c, k))
+                .or_else(|| unsafe_root_name(c, &i.value))
+        }),
+        Expr::ListComp(l) => l
+            .generators
+            .iter()
+            .find_map(|g| unsafe_root_name(c, &g.iter)),
+        Expr::SetComp(l) => l
+            .generators
+            .iter()
+            .find_map(|g| unsafe_root_name(c, &g.iter)),
+        Expr::Generator(l) => l
+            .generators
+            .iter()
+            .find_map(|g| unsafe_root_name(c, &g.iter)),
+        Expr::DictComp(l) => l
+            .generators
+            .iter()
+            .find_map(|g| unsafe_root_name(c, &g.iter)),
+        // A lambda that reads an unsafe binding hands it out when called.
+        Expr::Lambda(l) => {
+            let params: HashSet<&str> = l
+                .parameters
+                .as_deref()
+                .map(|p| p.iter().map(|a| a.name().as_str()).collect())
+                .unwrap_or_default();
+            collect_names_in_expr_all(&l.body)
+                .into_iter()
+                .find(|n| !params.contains(n) && is_unsafe(n))
+        }
+        _ => None,
+    }
+}
+
+/// Every `Name` read anywhere in `expr`.
+fn collect_names_in_expr_all(expr: &Expr) -> Vec<&str> {
+    use ruff_python_ast::visitor::source_order::{walk_expr, SourceOrderVisitor};
+    struct V<'a> {
+        names: Vec<&'a str>,
+    }
+    impl<'a> SourceOrderVisitor<'a> for V<'a> {
+        fn visit_expr(&mut self, e: &'a Expr) {
+            if let Expr::Name(n) = e {
+                self.names.push(n.id.as_str());
+            }
+            walk_expr(self, e);
+        }
+    }
+    let mut v = V { names: Vec::new() };
+    v.visit_expr(expr);
+    v.names
 }
 
 /// Collect the set of `Name` ids occurring in an expression that
@@ -7939,9 +8919,6 @@ fn check_attr_assign_type(c: &mut Checker, target: &Expr, value_type: &Type) {
     let Expr::Attribute(attr) = target else {
         return;
     };
-    if matches!(value_type, Type::Unknown) {
-        return;
-    }
     let recv = infer_expr_readonly(c, &attr.value);
     // A nullable receiver is already reported as `tyc::nullable_use`; peel the
     // `| None` so the field check still applies to the underlying class rather
@@ -7969,7 +8946,36 @@ fn check_attr_assign_type(c: &mut Checker, target: &Expr, value_type: &Type) {
         return;
     }
     let attr_name = attr.attr.as_str();
-    let Some(field_ty) = c.find_field(&real_class, attr_name).cloned() else {
+    if class_contracts::classvar(c, &real_class, attr_name)
+        && !class_contracts::class_object(c, &attr.value)
+    {
+        c.diagnostics.push_error(TycError::generic(format!(
+            "ClassVar `{real_class}.{attr_name}` must be assigned through the class"
+        )));
+        return;
+    }
+    let property = class_contracts::property(c, &real_class, attr_name);
+    if property
+        .as_ref()
+        .is_some_and(|(_, setter)| setter.is_none())
+    {
+        let diagnostic = TycError::generic(format!(
+            "`{real_class}.{attr_name}` is a read-only property"
+        ));
+        if frozen_context::failure_is_caught(c, target, "AttributeError") {
+            c.diagnostics.push_warning(diagnostic);
+        } else {
+            c.diagnostics.push_error(diagnostic);
+        }
+        return;
+    }
+    if matches!(value_type, Type::Unknown) {
+        return;
+    }
+    let field_type = property
+        .and_then(|(_, setter)| setter)
+        .or_else(|| c.find_field(&real_class, attr_name).cloned());
+    let Some(field_ty) = field_type else {
         // Writing a name the class never declared: a `class` emits
         // `@dataclass(slots=True)`, so `self.y = 5` with no `y: …` field
         // raises `AttributeError: 'X' object has no attribute 'y'` at
@@ -7981,8 +8987,7 @@ fn check_attr_assign_type(c: &mut Checker, target: &Expr, value_type: &Type) {
         if c.unsafe_depth == 0
             && !attr_name.starts_with('_')
             && !real_class.contains('.')
-            && !c.is_plain_class(&real_class)
-            && !c.is_raw_class(&real_class)
+            && !c.class_accepts_undeclared_attrs(&real_class)
             && !real_shape.bases.iter().any(|b| b == "BaseModel")
             && c.class_hierarchy_fully_known(&real_class)
             && !c.class_defines_getattr(&real_class)
@@ -8186,6 +9191,49 @@ const BLOCKING_CALLEES: &[&str] = &[
     "subprocess.check_call",
     "subprocess.check_output",
 ];
+
+/// The dotted callee path of `func` with module-level import aliases
+/// expanded, for matching [`BLOCKING_CALLEES`]: `t.sleep` after `import time
+/// as t` and `sleep` after `from time import sleep` are both `time.sleep`.
+/// A head bound in an inner scope (a parameter, a local) is not the import,
+/// so the path is returned as written; so is a relative import.
+fn canonical_callee_path(c: &Checker, func: &Expr) -> Option<String> {
+    let path = dotted_name_of(func)?;
+    let (head, rest) = match path.split_once('.') {
+        Some((h, r)) => (h, Some(r)),
+        None => (path.as_str(), None),
+    };
+    if c.env.scope_of(head) != Some(0) {
+        return Some(path);
+    }
+    let Some(info) = c
+        .resolved
+        .scopes
+        .first()
+        .and_then(|scope| scope.bindings.iter().find(|b| b.name == head))
+        .and_then(|b| b.import_info.as_ref())
+    else {
+        return Some(path);
+    };
+    if info.level > 0 {
+        return Some(path);
+    }
+    // `import urllib.request` binds `urllib`: the path already starts at
+    // the package, so only an alias (`import time as t`) is rewritten.
+    if info.member.is_none() && info.module.split('.').next() == Some(head) {
+        return Some(path);
+    }
+    let mut canonical = info.module.clone();
+    if let Some(member) = &info.member {
+        canonical.push('.');
+        canonical.push_str(member);
+    }
+    if let Some(rest) = rest {
+        canonical.push('.');
+        canonical.push_str(rest);
+    }
+    Some(canonical)
+}
 
 /// The curated set of stdlib calls that return an unmanaged resource
 /// (a file handle, socket, connection, …) which **must** be wrapped in
@@ -8434,16 +9482,145 @@ fn walk_freeze_expr(c: &mut Checker, binding: &str, expr: &Expr) {
 /// `Stmt::Assign`, so legitimate `with open(...) as f:` forms never
 /// trip the check — only bare assignments do.
 fn check_resource_discipline(c: &mut Checker, body: &[Stmt]) {
-    for stmt in body {
-        check_resource_discipline_stmt(c, stmt);
+    for (i, stmt) in body.iter().enumerate() {
+        check_resource_discipline_stmt(c, stmt, &body[i + 1..]);
     }
 }
 
-fn check_resource_discipline_stmt(c: &mut Checker, stmt: &Stmt) {
+/// True when a later statement of the same block is a `try` whose
+/// `finally` closes `name` (`f = open(p)` / `try: … finally: f.close()`):
+/// the handle is managed, just not by `with`.
+fn closed_in_later_finally(name: &str, rest: &[Stmt]) -> bool {
+    fn closes(stmts: &[Stmt], name: &str) -> bool {
+        stmts.iter().any(|stmt| {
+            let Stmt::Expr(e) = stmt else { return false };
+            let Expr::Call(call) = e.value.as_ref() else {
+                return false;
+            };
+            matches!(call.func.as_ref(), Expr::Attribute(a)
+                if a.attr.as_str() == "close"
+                    && matches!(a.value.as_ref(), Expr::Name(n) if n.id.as_str() == name))
+        })
+    }
+    rest.iter()
+        .any(|stmt| matches!(stmt, Stmt::Try(t) if closes(&t.finalbody, name)))
+}
+
+/// The resource-returning call a statement assigns to plain local names,
+/// or `None` when it stores it somewhere longer-lived (`self.fh = open(…)`
+/// hands it to an object that manages it) or closes it in a later
+/// `finally`.
+fn unmanaged_resource_assignment(targets: &[&Expr], value: &Expr, rest: &[Stmt]) -> Option<String> {
+    let name = dotted_callee_path(value)?;
+    if !REQUIRE_WITH_CALLEES.iter().any(|p| *p == name) {
+        return None;
+    }
+    let mut locals = Vec::new();
+    for t in targets {
+        match t {
+            Expr::Name(n) => locals.push(n.id.as_str()),
+            _ => return None,
+        }
+    }
+    if locals.iter().any(|l| closed_in_later_finally(l, rest)) {
+        return None;
+    }
+    Some(name)
+}
+
+/// A resource-returning call used and dropped inside an expression — the
+/// receiver of a method call (`open(p).read()`) or an argument
+/// (`json.load(open(p))`) — never reaches a `with` or a `close()`.
+/// `with` items, `return` values and assignment right-hand sides are
+/// handled by the statement walk, so only these two positions count.
+fn check_inline_resource_exprs(c: &mut Checker, stmt: &Stmt) {
+    use ruff_python_ast::visitor::{walk_expr, Visitor};
+    struct Finder {
+        found: Vec<(String, TextRange)>,
+    }
+    impl Finder {
+        fn note(&mut self, e: &Expr) {
+            if let Some(name) = dotted_callee_path(e) {
+                if REQUIRE_WITH_CALLEES.iter().any(|p| *p == name) {
+                    self.found.push((name, e.range()));
+                }
+            }
+        }
+    }
+    impl<'a> Visitor<'a> for Finder {
+        fn visit_stmt(&mut self, _stmt: &'a Stmt) {
+            // Nested statements are walked by `check_resource_discipline`.
+        }
+        fn visit_expr(&mut self, e: &'a Expr) {
+            if let Expr::Call(call) = e {
+                if let Expr::Attribute(a) = call.func.as_ref() {
+                    self.note(&a.value);
+                }
+                // `stack.enter_context(open(p))` / `closing(open(p))` take
+                // ownership and close it.
+                let takes_ownership = match call.func.as_ref() {
+                    Expr::Attribute(a) => {
+                        matches!(
+                            a.attr.as_str(),
+                            "enter_context" | "enter_async_context" | "closing"
+                        )
+                    }
+                    Expr::Name(n) => n.id.as_str() == "closing",
+                    _ => false,
+                };
+                if !takes_ownership {
+                    for arg in &call.arguments.args {
+                        self.note(arg);
+                    }
+                    for kw in &call.arguments.keywords {
+                        self.note(&kw.value);
+                    }
+                }
+            }
+            walk_expr(self, e);
+        }
+    }
+    let mut finder = Finder { found: Vec::new() };
+    let exprs: Vec<&Expr> = match stmt {
+        Stmt::Expr(e) => vec![e.value.as_ref()],
+        Stmt::Assign(a) => vec![a.value.as_ref()],
+        Stmt::AnnAssign(a) => a.value.as_deref().into_iter().collect(),
+        Stmt::AugAssign(a) => vec![a.value.as_ref()],
+        Stmt::Return(r) => r.value.as_deref().into_iter().collect(),
+        Stmt::If(s) => std::iter::once(s.test.as_ref())
+            .chain(s.elif_else_clauses.iter().filter_map(|c| c.test.as_ref()))
+            .collect(),
+        Stmt::While(s) => vec![s.test.as_ref()],
+        Stmt::For(s) => vec![s.iter.as_ref()],
+        _ => Vec::new(),
+    };
+    for e in exprs {
+        finder.visit_expr(e);
+    }
+    for (name, range) in finder.found {
+        let (start, end) = (range.start().to_usize(), range.end().to_usize());
+        c.diagnostics.push_warning(TycError::resource_not_managed(
+            &name,
+            &c.path,
+            c.source,
+            start,
+            end.saturating_sub(start).max(1),
+        ));
+    }
+}
+
+fn check_resource_discipline_stmt(c: &mut Checker, stmt: &Stmt, rest: &[Stmt]) {
+    if !matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+        let unsafe_block = matches!(stmt, Stmt::If(s) if c.is_unsafe_marker(s.range));
+        if !unsafe_block {
+            check_inline_resource_exprs(c, stmt);
+        }
+    }
     match stmt {
         Stmt::Assign(a) => {
-            if let Some(name) = dotted_callee_path(a.value.as_ref()) {
-                if REQUIRE_WITH_CALLEES.iter().any(|p| *p == name) {
+            let targets: Vec<&Expr> = a.targets.iter().collect();
+            if let Some(name) = unmanaged_resource_assignment(&targets, a.value.as_ref(), rest) {
+                {
                     let span = (
                         a.value.range().start().to_usize(),
                         a.value.range().end().to_usize(),
@@ -8460,8 +9637,10 @@ fn check_resource_discipline_stmt(c: &mut Checker, stmt: &Stmt) {
         }
         Stmt::AnnAssign(a) => {
             if let Some(v) = a.value.as_ref() {
-                if let Some(name) = dotted_callee_path(v.as_ref()) {
-                    if REQUIRE_WITH_CALLEES.iter().any(|p| *p == name) {
+                if let Some(name) =
+                    unmanaged_resource_assignment(&[a.target.as_ref()], v.as_ref(), rest)
+                {
+                    {
                         let span = (v.range().start().to_usize(), v.range().end().to_usize());
                         c.diagnostics.push_warning(TycError::resource_not_managed(
                             &name,
@@ -8725,6 +9904,7 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                 if let Expr::Name(n) = ta.name.as_ref() {
                     let union_name = n.id.as_str().to_owned();
                     c.classes.push(union_name.clone());
+                    c.pep695_aliases.insert(union_name.clone());
                     if let Some(variants) = extract_sealed_union_variants(&ta.value) {
                         c.sealed_unions.insert(union_name.clone(), variants);
                     }
@@ -9595,6 +10775,9 @@ fn has_runtime_checkable_decorator(decorators: &[ruff_python_ast::Decorator]) ->
 ///    stub layer (which doesn't carry `__enter__` annotations today)
 ///    and stays Unknown rather than misfiring downstream.
 fn with_target_type(c: &Checker, ctx_expr: &Expr, ctx_ty: &Type, is_async: bool) -> Type {
+    if is_async && matches!(ctx_ty,Type::Class(name) if name=="asyncio.TaskGroup") {
+        return ctx_ty.clone();
+    }
     // (1) Factory call. Both bare-name (`acquire()`) and
     // attribute-style (`self.acquire()`, `pool.session()`) callees
     // resolve through the contextmanager_yields registry — we key on
@@ -10639,6 +11822,8 @@ fn class_constructor_arity_for(shape: &InterfaceShape, class_name: Option<&str>)
             param_types: Vec::new(),
             kwonly_types: param_types,
             return_type,
+            is_async: false,
+            declared_sync: false,
         };
     }
     ArityInfo {
@@ -10654,6 +11839,8 @@ fn class_constructor_arity_for(shape: &InterfaceShape, class_name: Option<&str>)
         param_types,
         kwonly_types: Vec::new(),
         return_type,
+        is_async: false,
+        declared_sync: false,
     }
 }
 
@@ -10893,12 +12080,31 @@ fn try_result_arg_ret_readonly(c: &Checker, arg: &Expr) -> Type {
 /// with `infer_expr` so the thunk / mapper's own diagnostics surface.
 fn infer_try_result_arg_ret(c: &mut Checker, arg: &Expr) -> Type {
     match arg {
-        Expr::Lambda(lam) => infer_expr(c, &lam.body),
+        Expr::Lambda(_) => expression_calls::callback_result(c, arg, vec![]),
         other => match infer_expr(c, other) {
             Type::Function { ret, .. } => *ret,
             _ => Type::Unknown,
         },
     }
+}
+
+fn expression_attr_narrowing(c: &Checker, expr: &Expr) -> Option<Type> {
+    c.env.attr_narrowings.iter().find_map(|(path, ty)| {
+        let mut node = expr;
+        let mut components = path.rsplit('.').peekable();
+        while let Some(component) = components.next() {
+            match node {
+                Expr::Attribute(attr) if attr.attr.as_str() == component => node = &attr.value,
+                Expr::Name(name)
+                    if name.id.as_str() == component && components.peek().is_none() =>
+                {
+                    return Some(ty.clone())
+                }
+                _ => return None,
+            }
+        }
+        None
+    })
 }
 
 fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
@@ -10909,16 +12115,39 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
             .map(|b| b.narrowed.clone())
             .unwrap_or(Type::Unknown),
         Expr::Attribute(a) => {
-            if let Some(path) = attr_path_of(e) {
-                if let Some(narrowed) = c.env.attr_narrowed(&path) {
-                    return narrowed.clone();
-                }
+            if let Some(narrowed) = expression_attr_narrowing(c, e) {
+                return narrowed;
             }
             let recv = infer_expr_readonly(c, &a.value);
+            let recv = match &recv {
+                Type::Class(name) if c.find_method(name, a.attr.as_str()).is_none() => {
+                    c.newtypes.get(name).cloned().unwrap_or(recv)
+                }
+                _ => recv,
+            };
+            if matches!(recv, Type::Str | Type::LitStr(_)) {
+                if let Some(method) = builtin_str_method(a.attr.as_str()) {
+                    return method;
+                }
+            }
+            if let Type::Class(name) | Type::Generic(name, _) = &recv {
+                let real = name.strip_prefix("__typhon_impl_").unwrap_or(name);
+                if let Some((getter, _)) = class_contracts::property(c, real, a.attr.as_str()) {
+                    return substitute_typevars(&getter, &receiver_type_bindings(c, &recv));
+                }
+            }
             // Builtin container methods carry a real signature (`d.get(k)` is
             // `V | None`, `xs.pop()` is `T`), so a wrapping call sees it.
             if let Some(method_type) = builtin_generic_method(&recv, a.attr.as_str()) {
                 return method_type;
+            }
+            if let Type::Class(name) = &recv {
+                if c.enums
+                    .get(name)
+                    .is_some_and(|members| members.iter().any(|member| member == a.attr.as_str()))
+                {
+                    return Type::Class(name.clone());
+                }
             }
             match &recv {
                 Type::Class(class_name) | Type::Generic(class_name, _) => {
@@ -10979,6 +12208,52 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
             }
         }
         Expr::Call(call) => {
+            if let Some(argument) = freeze_call_argument(e) {
+                return frozen_type(&c.unwrap_alias(&infer_expr_readonly(c, argument)));
+            }
+            if matches!(call.func.as_ref(), Expr::Name(n) if n.id.as_str() == "super") {
+                let receiver_class = c.current_class.clone().or_else(|| {
+                    c.env
+                        .lookup("self")
+                        .and_then(|binding| match &binding.narrowed {
+                            Type::Class(name) | Type::Generic(name, _) => Some(name.clone()),
+                            _ => None,
+                        })
+                });
+                if let Some(base) = receiver_class
+                    .as_ref()
+                    .and_then(|name| {
+                        c.class_shapes
+                            .get(name.strip_prefix("__typhon_impl_").unwrap_or(name))
+                    })
+                    .and_then(|shape| shape.bases.first())
+                {
+                    return Type::Class(base.clone());
+                }
+            }
+            if let Expr::Name(name) = call.func.as_ref() {
+                if c.env.lookup(name.id.as_str()).is_none() && builtins::contains(name.id.as_str())
+                {
+                    let args: Vec<Type> = call
+                        .arguments
+                        .args
+                        .iter()
+                        .map(|arg| infer_expr_readonly(c, arg))
+                        .collect();
+                    let kwargs: Vec<(&str, Type)> = call
+                        .arguments
+                        .keywords
+                        .iter()
+                        .filter_map(|kw| {
+                            kw.arg
+                                .as_ref()
+                                .map(|n| (n.as_str(), infer_expr_readonly(c, &kw.value)))
+                        })
+                        .collect();
+                    return builtins::result(name.id.as_str(), &args, &kwargs)
+                        .unwrap_or(Type::Unknown);
+                }
+            }
             // `__typhon_checked_cast__(EXPR, TYPE)` (the lowering of
             // `EXPR as! TYPE`) reads as the target `TYPE` here too, so a
             // `match x as! Shape:` subject or a chained cast resolves.
@@ -11183,7 +12458,12 @@ fn check_builtin_first_argument(
         if let Expr::Name(n) = first {
             c.nullable_use(n.id.as_str(), &accepted, span);
         } else {
-            c.mismatch(&accepted, &actual, span);
+            let value = c.source.get(span.0..span.1).unwrap_or("value").to_owned();
+            if name == "len" {
+                c.nullable_attr_use(&value, &actual.strip_none(), span);
+            } else {
+                c.mismatch(&accepted, &actual, span);
+            }
         }
         return;
     }
@@ -11494,6 +12774,8 @@ fn arity_info_from_parameters_with_returns(
         param_types,
         kwonly_types,
         return_type,
+        is_async: false,
+        declared_sync: false,
     }
 }
 
@@ -11546,9 +12828,18 @@ fn seed_env_from_scope(c: &mut Checker, scope: ScopeId) {
                     } else {
                         vec![Type::Unknown; info.param_names.len()]
                     };
+                    // An imported `async def` returns a coroutine, exactly
+                    // like a same-module one (whose binding carries
+                    // `Coroutine[T]`), so an un-awaited call does not
+                    // masquerade as `T`.
+                    let ret = if info.is_async {
+                        Type::Generic("Coroutine".into(), vec![info.return_type.clone()])
+                    } else {
+                        info.return_type.clone()
+                    };
                     Type::Function {
                         params,
-                        ret: Box::new(info.return_type.clone()),
+                        ret: Box::new(ret),
                         variadic: info.max_positional.is_none(),
                         // Real required-arity, so a function whose trailing
                         // parameters carry defaults can satisfy a narrower
@@ -11614,7 +12905,7 @@ struct LoopReassigned {
     attrs: std::collections::HashSet<String>,
 }
 
-fn collect_reassigned_names(stmts: &[Stmt], acc: &mut LoopReassigned) {
+fn collect_reassigned_names(c: &Checker, stmts: &[Stmt], acc: &mut LoopReassigned) {
     fn add_target(t: &Expr, acc: &mut LoopReassigned) {
         match t {
             Expr::Name(n) => {
@@ -11657,50 +12948,54 @@ fn collect_reassigned_names(stmts: &[Stmt], acc: &mut LoopReassigned) {
             Stmt::AugAssign(a) => add_target(&a.target, acc),
             Stmt::If(i) => {
                 if !body_always_leaves_loop(&i.body) {
-                    collect_reassigned_names(&i.body, acc);
+                    collect_reassigned_names(c, &i.body, acc);
                 }
                 for clause in &i.elif_else_clauses {
                     if !body_always_leaves_loop(&clause.body) {
-                        collect_reassigned_names(&clause.body, acc);
+                        collect_reassigned_names(c, &clause.body, acc);
                     }
                 }
             }
             Stmt::For(f) => {
-                collect_reassigned_names(&f.body, acc);
-                collect_reassigned_names(&f.orelse, acc);
+                collect_reassigned_names(c, &f.body, acc);
+                collect_reassigned_names(c, &f.orelse, acc);
             }
             Stmt::While(w) => {
-                collect_reassigned_names(&w.body, acc);
-                collect_reassigned_names(&w.orelse, acc);
+                collect_reassigned_names(c, &w.body, acc);
+                collect_reassigned_names(c, &w.orelse, acc);
             }
             Stmt::With(w) => {
                 if !body_always_leaves_loop(&w.body) {
-                    collect_reassigned_names(&w.body, acc);
+                    collect_reassigned_names(c, &w.body, acc);
                 }
             }
             Stmt::Try(t) => {
-                collect_reassigned_names(&t.body, acc);
+                collect_reassigned_names(c, &t.body, acc);
                 for h in &t.handlers {
                     let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
                     if !body_always_leaves_loop(&h.body) {
-                        collect_reassigned_names(&h.body, acc);
+                        collect_reassigned_names(c, &h.body, acc);
                     }
                 }
-                collect_reassigned_names(&t.orelse, acc);
-                collect_reassigned_names(&t.finalbody, acc);
+                collect_reassigned_names(c, &t.orelse, acc);
+                collect_reassigned_names(c, &t.finalbody, acc);
             }
             Stmt::Match(m) => {
                 for case in &m.cases {
                     if !body_always_leaves_loop(&case.body) {
-                        collect_reassigned_names(&case.body, acc);
+                        collect_reassigned_names(c, &case.body, acc);
                     }
                 }
             }
-            // An unconditional exit ends this block's contribution to the
-            // back-edge: statements after it can't carry a value to the next
-            // iteration, so stop collecting here.
-            Stmt::Break(_) | Stmt::Return(_) | Stmt::Raise(_) | Stmt::Continue(_) => return,
             _ => {}
+        }
+        // An unconditional exit — a bare `break` / `return` / `raise` /
+        // `continue`, or a compound statement every branch of which leaves
+        // (the checker-aware form: an open `match` can fall through) — ends
+        // this block's contribution to the back-edge: statements after it
+        // can't carry a value to the next iteration, so stop collecting.
+        if stmt_always_exits_aware(c, s) {
+            return;
         }
     }
 }
@@ -12107,55 +13402,959 @@ impl Checker<'_> {
     }
 }
 
-/// Names declared `nonlocal` by any `def` nested (at any depth) inside
-/// `body`. Lambdas cannot declare `nonlocal`, and a nested class body's own
-/// methods are walked too, since `nonlocal` there still targets the
-/// enclosing function's scope.
-fn collect_nested_nonlocals(body: &[Stmt]) -> std::collections::HashSet<String> {
-    fn walk(stmts: &[Stmt], nested: bool, acc: &mut std::collections::HashSet<String>) {
+/// The nested `def`s of `body` that can rebind a local of `body` through
+/// `nonlocal`, split by whether they escape. Returns the locals any
+/// *escaping* writer rebinds — those reset on every call, since anything may
+/// end up calling it — and, for writers only ever called by name, writer →
+/// the locals it rebinds (directly, or by calling another writer).
+fn collect_nonlocal_writers(
+    body: &[Stmt],
+) -> (
+    std::collections::HashSet<String>,
+    HashMap<String, std::collections::HashSet<String>>,
+) {
+    use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
+    // Nested `def`s at any statement depth of `body` (not inside another
+    // def), and the methods of classes nested there — which are called
+    // through an attribute, so they always count as escaping.
+    fn defs<'a>(stmts: &'a [Stmt], out: &mut Vec<(&'a ruff_python_ast::StmtFunctionDef, bool)>) {
         for s in stmts {
             match s {
-                Stmt::Nonlocal(nl) if nested => {
-                    acc.extend(nl.names.iter().map(|n| n.as_str().to_owned()));
+                Stmt::FunctionDef(f) => out.push((f, false)),
+                Stmt::ClassDef(cd) => {
+                    for m in &cd.body {
+                        if let Stmt::FunctionDef(f) = m {
+                            out.push((f, true));
+                        }
+                    }
                 }
-                Stmt::FunctionDef(f) => walk(&f.body, true, acc),
-                Stmt::ClassDef(cd) => walk(&cd.body, nested, acc),
                 Stmt::If(i) => {
-                    walk(&i.body, nested, acc);
-                    for clause in &i.elif_else_clauses {
-                        walk(&clause.body, nested, acc);
+                    defs(&i.body, out);
+                    for c in &i.elif_else_clauses {
+                        defs(&c.body, out);
                     }
                 }
                 Stmt::For(f) => {
-                    walk(&f.body, nested, acc);
-                    walk(&f.orelse, nested, acc);
+                    defs(&f.body, out);
+                    defs(&f.orelse, out);
                 }
                 Stmt::While(w) => {
-                    walk(&w.body, nested, acc);
-                    walk(&w.orelse, nested, acc);
+                    defs(&w.body, out);
+                    defs(&w.orelse, out);
                 }
-                Stmt::With(w) => walk(&w.body, nested, acc),
+                Stmt::With(w) => defs(&w.body, out),
                 Stmt::Try(t) => {
-                    walk(&t.body, nested, acc);
+                    defs(&t.body, out);
                     for h in &t.handlers {
                         let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
-                        walk(&h.body, nested, acc);
+                        defs(&h.body, out);
                     }
-                    walk(&t.orelse, nested, acc);
-                    walk(&t.finalbody, nested, acc);
+                    defs(&t.orelse, out);
+                    defs(&t.finalbody, out);
                 }
-                Stmt::Match(m) => {
-                    for case in &m.cases {
-                        walk(&case.body, nested, acc);
+                Stmt::Match(m) => m.cases.iter().for_each(|c| defs(&c.body, out)),
+                _ => {}
+            }
+        }
+    }
+    // `nonlocal` names anywhere in a def, the names it calls, and every name
+    // it (or `body`) reads other than as a call's callee.
+    #[derive(Default)]
+    struct Scan {
+        nonlocals: std::collections::HashSet<String>,
+        calls: std::collections::HashSet<String>,
+        loads: std::collections::HashSet<String>,
+    }
+    impl<'a> Visitor<'a> for Scan {
+        fn visit_stmt(&mut self, s: &'a Stmt) {
+            if let Stmt::Nonlocal(nl) = s {
+                self.nonlocals
+                    .extend(nl.names.iter().map(|n| n.as_str().to_owned()));
+            }
+            walk_stmt(self, s);
+        }
+        fn visit_expr(&mut self, e: &'a Expr) {
+            match e {
+                Expr::Call(call) => {
+                    if let Expr::Name(f) = call.func.as_ref() {
+                        self.calls.insert(f.id.as_str().to_owned());
+                        for a in &call.arguments.args {
+                            self.visit_expr(a);
+                        }
+                        for k in &call.arguments.keywords {
+                            self.visit_expr(&k.value);
+                        }
+                        return;
+                    }
+                }
+                Expr::Name(n) => {
+                    self.loads.insert(n.id.as_str().to_owned());
+                }
+                _ => {}
+            }
+            walk_expr(self, e);
+        }
+    }
+    let mut nested = Vec::new();
+    defs(body, &mut nested);
+    if nested.is_empty() {
+        return Default::default();
+    }
+    let mut per_def: HashMap<String, Scan> = HashMap::new();
+    for (f, is_method) in &nested {
+        let mut s = Scan::default();
+        for st in &f.body {
+            s.visit_stmt(st);
+        }
+        // Two defs may share a name (a method and a function, or a
+        // redefinition); keep the union of what they do.
+        let key = if *is_method {
+            format!(".{}", f.name)
+        } else {
+            f.name.as_str().to_owned()
+        };
+        let entry = per_def.entry(key).or_default();
+        entry.nonlocals.extend(s.nonlocals);
+        entry.calls.extend(s.calls);
+        entry.loads.extend(s.loads);
+    }
+    // Writers, closed over "calls a writer".
+    let mut writes: HashMap<String, std::collections::HashSet<String>> = per_def
+        .iter()
+        .filter(|(_, s)| !s.nonlocals.is_empty())
+        .map(|(n, s)| (n.clone(), s.nonlocals.clone()))
+        .collect();
+    loop {
+        let mut changed = false;
+        for (name, s) in &per_def {
+            let mut acc: std::collections::HashSet<String> =
+                writes.get(name).cloned().unwrap_or_default();
+            let before = acc.len();
+            for callee in &s.calls {
+                if callee != name {
+                    if let Some(w) = writes.get(callee) {
+                        acc.extend(w.iter().cloned());
+                    }
+                }
+            }
+            if acc.len() != before {
+                writes.insert(name.clone(), acc);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // A writer read as a value anywhere — passed, stored, returned — escapes.
+    let mut all = Scan::default();
+    for st in body {
+        all.visit_stmt(st);
+    }
+    let mut escaped = std::collections::HashSet::new();
+    let mut called = HashMap::new();
+    for (name, w) in writes {
+        if name.starts_with('.') || all.loads.contains(&name) {
+            escaped.extend(w);
+        } else {
+            called.insert(name, w);
+        }
+    }
+    (escaped, called)
+}
+
+/// What a call into this module's own code can do to the fields of an object
+/// handed to it, built once per module by [`FieldWriteSummary::collect`].
+///
+/// A statement-position call used to drop every field narrowing of every
+/// bare-name argument (review 2026-09-30 §3.8), so `print(it)`,
+/// `out.append(it)` and `logging.info("%s", it)` made a just-checked
+/// `it.price is not None` stale (review 2026-10-03 §4.3). The summary keeps
+/// the invalidation where a callee can actually write the field — a local
+/// `clear(b)` that does `b.value = None` — and drops it where it cannot.
+///
+/// Calls resolved inside a summarised body follow the same rules as at a call
+/// site, with one documented gap: a method call on a receiver of unknown type
+/// whose name no local class defines (`session.add(it)`) is taken to be a
+/// builtin- or library-object method that rebinds no field of its arguments.
+#[derive(Default)]
+struct FieldWriteSummary {
+    /// Local free function, or local class (its constructor), → the field
+    /// names it may write, transitively through local calls. `None`: it may
+    /// write anything, because it calls code whose body is not visible here.
+    funcs: HashMap<String, Option<HashSet<String>>>,
+    /// Method name → the union over every local class's method of that name.
+    methods: HashMap<String, Option<HashSet<String>>>,
+    /// Module-level import bindings: local name → dotted source module
+    /// (a leading `.` for a relative import).
+    imports: HashMap<String, String>,
+    /// Python builtin names, cached for the per-call-site lookup.
+    builtins: HashSet<&'static str>,
+}
+
+/// What a statement-position call may do to its arguments' field narrowings.
+enum ArgEffect {
+    /// Rebinds no field of an argument: builtins, the stdlib, methods of
+    /// builtin values.
+    Nothing,
+    /// May write exactly these field names.
+    Fields(HashSet<String>),
+    /// May write anything.
+    Anything,
+}
+
+impl ArgEffect {
+    fn from_summary(w: &Option<HashSet<String>>) -> ArgEffect {
+        match w {
+            Some(fields) if fields.is_empty() => ArgEffect::Nothing,
+            Some(fields) => ArgEffect::Fields(fields.clone()),
+            None => ArgEffect::Anything,
+        }
+    }
+}
+
+fn is_stdlib_dotted(module: &str) -> bool {
+    if module.starts_with('.') {
+        return false;
+    }
+    let root = module.split('.').next().unwrap_or(module);
+    tyc_resolve::python_stdlib_modules().contains(&root)
+}
+
+impl FieldWriteSummary {
+    fn collect(body: &[Stmt]) -> Self {
+        #[derive(Default)]
+        struct Direct {
+            writes: HashSet<String>,
+            unknown: bool,
+            funcs: HashSet<String>,
+            methods: HashSet<String>,
+        }
+        struct Facts<'a> {
+            d: Direct,
+            ctor: bool,
+            local_funcs: &'a HashSet<String>,
+            local_methods: &'a HashSet<String>,
+            imports: &'a HashMap<String, String>,
+            builtins: &'a HashSet<&'static str>,
+        }
+        impl Facts<'_> {
+            fn target(&mut self, t: &Expr) {
+                match t {
+                    Expr::Attribute(a) => {
+                        let own_field = self.ctor
+                            && matches!(a.value.as_ref(), Expr::Name(n) if matches!(n.id.as_str(), "self" | "cls"));
+                        if !own_field {
+                            self.d.writes.insert(a.attr.as_str().to_owned());
+                        }
+                    }
+                    Expr::Tuple(x) => x.elts.iter().for_each(|e| self.target(e)),
+                    Expr::List(x) => x.elts.iter().for_each(|e| self.target(e)),
+                    Expr::Starred(s) => self.target(&s.value),
+                    _ => {}
+                }
+            }
+            fn literal_field(&mut self, args: &[Expr], upto: usize) {
+                match args.iter().take(upto).find_map(|a| match a {
+                    Expr::StringLiteral(s) => Some(s.value.to_str().to_owned()),
+                    _ => None,
+                }) {
+                    Some(f) => {
+                        self.d.writes.insert(f);
+                    }
+                    None => self.d.unknown = true,
+                }
+            }
+            fn call(&mut self, call: &ruff_python_ast::ExprCall) {
+                let args = &call.arguments.args;
+                match call.func.as_ref() {
+                    Expr::Name(n) => {
+                        let f = n.id.as_str();
+                        if self.local_funcs.contains(f) {
+                            self.d.funcs.insert(f.to_owned());
+                        } else if let Some(m) = self.imports.get(f) {
+                            if !is_stdlib_dotted(m) {
+                                self.d.unknown = true;
+                            }
+                        } else if matches!(f, "setattr" | "delattr") {
+                            self.literal_field(args, 2);
+                        } else if !self.builtins.contains(f) {
+                            self.d.unknown = true;
+                        }
+                    }
+                    Expr::Attribute(a) => {
+                        let m = a.attr.as_str();
+                        if matches!(m, "__setattr__" | "__delattr__") {
+                            self.literal_field(args, 2);
+                        } else if let Some(module) = match a.value.as_ref() {
+                            Expr::Name(r) => self.imports.get(r.id.as_str()),
+                            _ => None,
+                        } {
+                            if !is_stdlib_dotted(module) {
+                                self.d.unknown = true;
+                            }
+                        } else if self.local_methods.contains(m) {
+                            self.d.methods.insert(m.to_owned());
+                        }
+                    }
+                    _ => self.d.unknown = true,
+                }
+            }
+        }
+        impl<'a> ruff_python_ast::visitor::Visitor<'a> for Facts<'_> {
+            fn visit_stmt(&mut self, s: &'a Stmt) {
+                match s {
+                    Stmt::Assign(a) => a.targets.iter().for_each(|t| self.target(t)),
+                    Stmt::AugAssign(a) => self.target(&a.target),
+                    Stmt::AnnAssign(a) if a.value.is_some() => self.target(&a.target),
+                    Stmt::Delete(d) => d.targets.iter().for_each(|t| self.target(t)),
+                    Stmt::For(f) => self.target(&f.target),
+                    Stmt::With(w) => w
+                        .items
+                        .iter()
+                        .filter_map(|i| i.optional_vars.as_deref())
+                        .for_each(|t| self.target(t)),
+                    _ => {}
+                }
+                ruff_python_ast::visitor::walk_stmt(self, s);
+            }
+            fn visit_expr(&mut self, e: &'a Expr) {
+                if let Expr::Call(call) = e {
+                    self.call(call);
+                }
+                ruff_python_ast::visitor::walk_expr(self, e);
+            }
+        }
+
+        let mut imports: HashMap<String, String> = HashMap::new();
+        let mut local_funcs: HashSet<String> = HashSet::new();
+        let mut local_methods: HashSet<String> = HashSet::new();
+        for s in body {
+            match s {
+                Stmt::Import(i) => {
+                    for a in &i.names {
+                        let dotted = a.name.as_str();
+                        let local = match &a.asname {
+                            Some(n) => n.as_str(),
+                            None => dotted.split('.').next().unwrap_or(dotted),
+                        };
+                        imports.insert(local.to_owned(), dotted.to_owned());
+                    }
+                }
+                Stmt::ImportFrom(i) => {
+                    let module = format!(
+                        "{}{}",
+                        ".".repeat(i.level as usize),
+                        i.module.as_ref().map(|m| m.as_str()).unwrap_or("")
+                    );
+                    for a in &i.names {
+                        let local = a.asname.as_ref().unwrap_or(&a.name).as_str();
+                        imports.insert(local.to_owned(), module.clone());
+                    }
+                }
+                Stmt::FunctionDef(f) => {
+                    local_funcs.insert(f.name.as_str().to_owned());
+                }
+                Stmt::ClassDef(cd) => {
+                    local_funcs.insert(cd.name.as_str().to_owned());
+                    for m in &cd.body {
+                        if let Stmt::FunctionDef(f) = m {
+                            local_methods.insert(f.name.as_str().to_owned());
+                        }
                     }
                 }
                 _ => {}
             }
         }
+        // A local definition shadows an import of the same name.
+        imports.retain(|k, _| !local_funcs.contains(k));
+        let builtins = tyc_resolve::builtin_names();
+
+        let facts = |body: &[Stmt], ctor: bool| -> Direct {
+            use ruff_python_ast::visitor::Visitor;
+            let mut v = Facts {
+                d: Direct::default(),
+                ctor,
+                local_funcs: &local_funcs,
+                local_methods: &local_methods,
+                imports: &imports,
+                builtins: &builtins,
+            };
+            for s in body {
+                v.visit_stmt(s);
+            }
+            v.d
+        };
+        fn merge_direct(into: &mut Direct, from: Direct) {
+            into.writes.extend(from.writes);
+            into.unknown |= from.unknown;
+            into.funcs.extend(from.funcs);
+            into.methods.extend(from.methods);
+        }
+        // "f:<name>" for functions and constructors, "m:<name>" for methods.
+        let mut direct: HashMap<String, Direct> = HashMap::new();
+        for s in body {
+            match s {
+                Stmt::FunctionDef(f) => {
+                    let d = facts(&f.body, false);
+                    merge_direct(direct.entry(format!("f:{}", f.name)).or_default(), d);
+                }
+                Stmt::ClassDef(cd) => {
+                    let ctor_key = format!("f:{}", cd.name);
+                    direct.entry(ctor_key.clone()).or_default();
+                    for m in &cd.body {
+                        if let Stmt::FunctionDef(f) = m {
+                            let name = f.name.as_str();
+                            let ctor = matches!(name, "__init__" | "__post_init__" | "__new__");
+                            let d = facts(&f.body, ctor);
+                            if ctor {
+                                let again = facts(&f.body, ctor);
+                                merge_direct(direct.entry(ctor_key.clone()).or_default(), again);
+                            }
+                            merge_direct(direct.entry(format!("m:{name}")).or_default(), d);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut sum: HashMap<String, Option<HashSet<String>>> = direct
+            .iter()
+            .map(|(k, d)| (k.clone(), (!d.unknown).then(|| d.writes.clone())))
+            .collect();
+        loop {
+            let mut changed = false;
+            for (key, d) in &direct {
+                let edges = d
+                    .funcs
+                    .iter()
+                    .map(|f| format!("f:{f}"))
+                    .chain(d.methods.iter().map(|m| format!("m:{m}")));
+                for callee in edges {
+                    let Some(from) = sum.get(&callee).cloned() else {
+                        continue;
+                    };
+                    let Some(Some(into)) = sum.get_mut(key) else {
+                        continue;
+                    };
+                    match from {
+                        None => {
+                            sum.insert(key.clone(), None);
+                            changed = true;
+                            break;
+                        }
+                        Some(fields) => {
+                            let before = into.len();
+                            into.extend(fields);
+                            changed |= into.len() != before;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut out = FieldWriteSummary {
+            imports,
+            builtins,
+            ..FieldWriteSummary::default()
+        };
+        for (k, w) in sum {
+            if let Some(name) = k.strip_prefix("f:") {
+                out.funcs.insert(name.to_owned(), w);
+            } else if let Some(name) = k.strip_prefix("m:") {
+                out.methods.insert(name.to_owned(), w);
+            }
+        }
+        out
     }
-    let mut acc = std::collections::HashSet::new();
-    walk(body, false, &mut acc);
-    acc
+}
+
+/// Whether `t` is a builtin value whose methods never rebind a field of an
+/// argument (`out.append(it)`, `"{}".format(it)`, `seen.add(it)`).
+fn is_builtin_value_type(t: &Type) -> bool {
+    match t {
+        Type::Int | Type::Str | Type::Bool | Type::Float | Type::Bytes | Type::LitStr(_) => true,
+        Type::Generic(h, _) => matches!(
+            h.as_str(),
+            "list"
+                | "dict"
+                | "set"
+                | "frozenset"
+                | "tuple"
+                | "tuple_variadic"
+                | "deque"
+                | "defaultdict"
+                | "OrderedDict"
+                | "Counter"
+        ),
+        _ => false,
+    }
+}
+
+/// What the statement-position call `call` may do to the field narrowings of
+/// an object passed to it. See [`FieldWriteSummary`].
+fn call_arg_effect(c: &Checker, call: &ruff_python_ast::ExprCall) -> ArgEffect {
+    let s = &c.field_writes;
+    match call.func.as_ref() {
+        Expr::Name(n) => {
+            let f = n.id.as_str();
+            if let Some(w) = s.funcs.get(f) {
+                return ArgEffect::from_summary(w);
+            }
+            if let Some(m) = s.imports.get(f) {
+                return if is_stdlib_dotted(m) {
+                    ArgEffect::Nothing
+                } else {
+                    ArgEffect::Anything
+                };
+            }
+            // A local variable or parameter holding a callable is opaque.
+            if matches!(f, "setattr" | "delattr") || c.env.lookup(f).is_some() {
+                return ArgEffect::Anything;
+            }
+            if s.builtins.contains(f) {
+                ArgEffect::Nothing
+            } else {
+                ArgEffect::Anything
+            }
+        }
+        Expr::Attribute(a) => {
+            if let Expr::Name(r) = a.value.as_ref() {
+                if let Some(m) = s.imports.get(r.id.as_str()) {
+                    return if is_stdlib_dotted(m) {
+                        ArgEffect::Nothing
+                    } else {
+                        ArgEffect::Anything
+                    };
+                }
+            }
+            let recv = infer_expr_readonly(c, &a.value);
+            match &recv {
+                Type::Module(m) if is_stdlib_dotted(m) => ArgEffect::Nothing,
+                t if is_builtin_value_type(t) => ArgEffect::Nothing,
+                Type::Class(name) if s.funcs.contains_key(name.as_str()) => {
+                    match s.methods.get(a.attr.as_str()) {
+                        Some(w) => ArgEffect::from_summary(w),
+                        None => ArgEffect::Anything,
+                    }
+                }
+                _ => ArgEffect::Anything,
+            }
+        }
+        _ => ArgEffect::Anything,
+    }
+}
+
+/// Drop the narrowings a method call `recv.m(…)` may have made stale, where
+/// `effect` is what `m` can write and `recv_path` is `recv`'s access path.
+///
+/// The method runs with `recv` as `self`, so it can rewrite fields *below*
+/// `recv_path` — but not the slot `recv` itself was read from: after
+/// `if self.conn is None: return`, `self.conn.execute("x")` leaves
+/// `self.conn` non-`None` (review 2026-10-03 §4.2). The one exception is a
+/// local method known to write a field named like that slot, which may have
+/// reached it through an alias, so the slot is dropped too.
+fn invalidate_receiver_fields(c: &mut Checker, recv: &Expr, recv_path: &str, effect: &ArgEffect) {
+    if matches!(effect, ArgEffect::Nothing) {
+        return;
+    }
+    if let (ArgEffect::Fields(fields), Some((_, slot))) = (effect, recv_path.rsplit_once('.')) {
+        if fields.contains(slot) {
+            c.env.clear_attr_narrowing(recv_path);
+            return;
+        }
+    }
+    let frozen = matches!(
+        infer_expr_readonly(c, recv),
+        Type::Class(n) if c.frozen_classes.contains(n.as_str())
+    );
+    let skip = usize::from(frozen);
+    c.env
+        .clear_attr_narrowings_under(recv_path, |segments| match effect {
+            ArgEffect::Nothing => false,
+            ArgEffect::Anything => segments.len() > skip,
+            ArgEffect::Fields(fields) => segments.iter().skip(skip).any(|s| fields.contains(*s)),
+        });
+}
+
+/// Drop the field narrowings rooted at `root` that a call with `effect` may
+/// have made stale. A `frozen` root's own fields cannot be rebound (the
+/// emitted dataclass raises), so only paths below them are dropped.
+fn invalidate_arg_fields(c: &mut Checker, root: &str, effect: &ArgEffect) {
+    if matches!(effect, ArgEffect::Nothing) {
+        return;
+    }
+    let frozen_root = matches!(
+        c.env.lookup(root).map(|b| &b.narrowed),
+        Some(Type::Class(n)) if c.frozen_classes.contains(n.as_str())
+    );
+    let skip = usize::from(frozen_root);
+    c.env
+        .clear_attr_narrowings_under(root, |segments| match effect {
+            ArgEffect::Nothing => false,
+            ArgEffect::Anything => segments.len() > skip,
+            ArgEffect::Fields(fields) => segments.iter().skip(skip).any(|s| fields.contains(*s)),
+        });
+}
+
+/// Every name `body` assigns — not counting nested `def` / `class` /
+/// lambda bodies, which bind their own locals — with the offset the
+/// assignment takes effect at (the end of an assignment statement, so the
+/// RHS of `v = make(lambda: v)` still counts as before it).
+fn collect_assign_sites(body: &[Stmt]) -> Vec<(String, usize)> {
+    struct V {
+        out: Vec<(String, usize)>,
+    }
+    fn names(t: &Expr, at: usize, out: &mut Vec<(String, usize)>) {
+        match t {
+            Expr::Name(n) => out.push((n.id.as_str().to_owned(), at)),
+            Expr::Tuple(x) => x.elts.iter().for_each(|e| names(e, at, out)),
+            Expr::List(x) => x.elts.iter().for_each(|e| names(e, at, out)),
+            Expr::Starred(s) => names(&s.value, at, out),
+            _ => {}
+        }
+    }
+    impl<'a> ruff_python_ast::visitor::Visitor<'a> for V {
+        fn visit_stmt(&mut self, s: &'a Stmt) {
+            let end = s.range().end().to_usize();
+            match s {
+                Stmt::FunctionDef(_) | Stmt::ClassDef(_) => return,
+                Stmt::Assign(a) => a.targets.iter().for_each(|t| names(t, end, &mut self.out)),
+                Stmt::AugAssign(a) => names(&a.target, end, &mut self.out),
+                Stmt::AnnAssign(a) if a.value.is_some() => names(&a.target, end, &mut self.out),
+                Stmt::Delete(d) => d.targets.iter().for_each(|t| names(t, end, &mut self.out)),
+                Stmt::For(f) => names(
+                    &f.target,
+                    f.target.range().start().to_usize(),
+                    &mut self.out,
+                ),
+                Stmt::With(w) => {
+                    for item in &w.items {
+                        if let Some(t) = item.optional_vars.as_deref() {
+                            names(t, t.range().start().to_usize(), &mut self.out);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            ruff_python_ast::visitor::walk_stmt(self, s);
+        }
+        fn visit_expr(&mut self, e: &'a Expr) {
+            match e {
+                Expr::Lambda(_) => return,
+                Expr::Named(n) => names(&n.target, n.range.end().to_usize(), &mut self.out),
+                _ => {}
+            }
+            ruff_python_ast::visitor::walk_expr(self, e);
+        }
+    }
+    use ruff_python_ast::visitor::Visitor;
+    let mut v = V { out: Vec::new() };
+    for s in body {
+        v.visit_stmt(s);
+    }
+    v.out
+}
+
+/// Widen the narrowings of names a closure created at offset `at` captures
+/// but the enclosing body reassigns after `at`, or anywhere inside a loop
+/// around `at` (the back-edge re-runs earlier assignments after the closure
+/// exists). Such a closure may run after the reassignment, so the narrowing
+/// in force where it is written does not hold inside it: `if v is not None:
+/// f = lambda: v.upper(); v = None; f()` (review 2026-10-03 §4.8).
+fn widen_captured_names(c: &mut Checker, at: usize) {
+    let Some(sites) = c.assign_sites.last() else {
+        return;
+    };
+    let loops: Vec<(usize, usize)> = c
+        .loop_exits
+        .iter()
+        .map(|f| f.range)
+        .filter(|r| r.0 <= at && at < r.1)
+        .collect();
+    let stale: Vec<String> = sites
+        .iter()
+        .filter(|(_, off)| *off > at || loops.iter().any(|r| r.0 <= *off && *off < r.1))
+        .map(|(n, _)| n.clone())
+        .collect();
+    for name in stale {
+        c.env.widen_to_declared(&name);
+    }
+}
+
+/// Flow effects of an expression that has just been inferred, applied in
+/// evaluation order: a call may rewrite fields its callee can reach, and a
+/// `yield` hands control to the caller, which may change any object.
+fn after_expr_effects(c: &mut Checker, expr: &Expr) {
+    match expr {
+        Expr::Call(call) => {
+            // A direct call to a nested `def` that rebinds a local through
+            // `nonlocal` resets exactly that local.
+            if let Expr::Name(f) = call.func.as_ref() {
+                if let Some(names) = c.nonlocal_writer_calls.get(f.id.as_str()).cloned() {
+                    c.env.reset_local_narrowings(&names);
+                }
+            }
+            invalidate_after_call(c, call);
+        }
+        // The caller runs between `yield` and the next statement; any field
+        // it can see may have changed (review 2026-10-03 §3.11).
+        Expr::Yield(_) | Expr::YieldFrom(_) => c.env.attr_narrowings.clear(),
+        _ => {}
+    }
+}
+
+/// Pop a comprehension's scope, carrying out the names a walrus inside it
+/// bound: PEP 572 binds them in the enclosing scope, holding the *last*
+/// value assigned — whatever the filter's narrowing said about each one —
+/// so they come out at their declared type. They used to vanish with the
+/// scope, leaving `u` in `[u for v in xs if (u := v) is not None]` an
+/// unchecked `Unknown` afterwards when it may hold `None` (review
+/// 2026-10-03 §3.11).
+fn leave_comprehension_scope(c: &mut Checker, comp: &Expr) {
+    let carried: Vec<TypeBinding> = walrus_targets_in(comp)
+        .iter()
+        .filter_map(|n| c.env.scopes.last().and_then(|s| s.get(n.as_str())).cloned())
+        .collect();
+    c.env.leave();
+    for mut b in carried {
+        b.narrowed = b.declared.clone();
+        c.env.declare(b);
+    }
+}
+
+/// Names bound by a walrus anywhere in `expr` (not inside a nested lambda).
+fn walrus_targets_in(expr: &Expr) -> Vec<String> {
+    use ruff_python_ast::visitor::{walk_expr, Visitor};
+    struct V(Vec<String>);
+    impl<'a> Visitor<'a> for V {
+        fn visit_expr(&mut self, e: &'a Expr) {
+            match e {
+                Expr::Lambda(_) => return,
+                Expr::Named(n) => {
+                    if let Expr::Name(t) = n.target.as_ref() {
+                        self.0.push(t.id.as_str().to_owned());
+                    }
+                }
+                _ => {}
+            }
+            walk_expr(self, e);
+        }
+    }
+    let mut v = V(Vec::new());
+    v.visit_expr(expr);
+    v.0
+}
+
+/// Drop the field narrowings a call may have made stale — on its receiver,
+/// on every bare-name argument, and, for a callee known to write fields
+/// `F`, on every path through a field in `F` (an alias of any object may
+/// have reached it: `h.reset()` where `h.b is b`). Runs for every call as
+/// it is inferred, so `let n: int = clear(b)` and `print(clear(b),
+/// b.value + 1)` are covered, not only a call in statement position
+/// (review 2026-10-03 §3.11, GPT-6 Codex F04).
+fn invalidate_after_call(c: &mut Checker, call: &ruff_python_ast::ExprCall) {
+    if c.env.attr_narrowings.is_empty() {
+        return;
+    }
+    let effect = call_arg_effect(c, call);
+    if let Expr::Attribute(recv_attr) = call.func.as_ref() {
+        if let Some(recv_path) = attr_path_of(&recv_attr.value) {
+            invalidate_receiver_fields(c, &recv_attr.value, &recv_path, &effect);
+        }
+    }
+    for arg in call
+        .arguments
+        .args
+        .iter()
+        .chain(call.arguments.keywords.iter().map(|k| &k.value))
+    {
+        if let Expr::Name(n) = arg {
+            invalidate_arg_fields(c, n.id.as_str(), &effect);
+        }
+    }
+    if let ArgEffect::Fields(fields) = &effect {
+        let frozen_roots: HashSet<String> = c
+            .env
+            .attr_narrowings
+            .keys()
+            .filter_map(|k| k.split('.').next())
+            .filter(|root| {
+                matches!(
+                    c.env.lookup(root).map(|b| &b.narrowed),
+                    Some(Type::Class(n)) if c.frozen_classes.contains(n.as_str())
+                )
+            })
+            .map(str::to_owned)
+            .collect();
+        c.env.attr_narrowings.retain(|k, _| {
+            let mut segs = k.split('.');
+            let root = segs.next().unwrap_or("");
+            let skip = usize::from(frozen_roots.contains(root));
+            !segs.skip(skip).any(|s| fields.contains(s))
+        });
+    }
+}
+
+/// The object expression an attribute target writes into (`a.b` in
+/// `a.b.c = v`).
+fn attr_base(target: &Expr) -> Option<&Expr> {
+    match target {
+        Expr::Attribute(a) => Some(&a.value),
+        _ => None,
+    }
+}
+
+/// The static type of the object that owns the last field of `path`
+/// (`p.addr` for `p.addr.city`), following declared field types from the
+/// root binding. `None` when any step is unknown.
+fn path_owner_type(c: &Checker, path: &str) -> Option<Type> {
+    let segs: Vec<&str> = path.split('.').collect();
+    let (root, fields) = segs.split_first()?;
+    let mut t = c.env.lookup(root)?.narrowed.clone();
+    for (i, f) in fields.iter().enumerate() {
+        if i + 1 == fields.len() {
+            return Some(t);
+        }
+        let partial = segs[..=i + 1].join(".");
+        t = match c.env.attr_narrowed(&partial) {
+            Some(n) => n.clone(),
+            None => match t.strip_none() {
+                Type::Class(name) => c.find_field(&name, f)?.clone(),
+                _ => return None,
+            },
+        };
+    }
+    None
+}
+
+/// Whether two objects of static types `a` and `b` can be the same object:
+/// some class of one is the other or a subclass of it. Anything this cannot
+/// decide may alias.
+fn may_alias(c: &Checker, a: &Type, b: &Type) -> bool {
+    let classes = |t: &Type| -> Option<Vec<String>> {
+        match t.strip_none() {
+            Type::Class(n) => Some(vec![n]),
+            Type::Union(xs) => xs
+                .iter()
+                .map(|x| match x {
+                    Type::Class(n) => Some(n.clone()),
+                    Type::None => Some("None".to_owned()),
+                    _ => None,
+                })
+                .collect(),
+            _ => None,
+        }
+    };
+    let (Some(xs), Some(ys)) = (classes(a), classes(b)) else {
+        return true;
+    };
+    xs.iter().any(|x| {
+        ys.iter().any(|y| {
+            x == y
+                || !c.class_hierarchy_fully_known(x)
+                || !c.class_hierarchy_fully_known(y)
+                || c.class_inherits_from(x, y)
+                || c.class_inherits_from(y, x)
+        })
+    })
+}
+
+/// After `<owner>.field = value`, drop the narrowings of `field` on other
+/// objects that may be the same object and whose narrowed type `value` no
+/// longer fits — `keep` (the written path itself) excepted. Before, every
+/// `*.field` narrowing went, so `if src.name is not None: dst.name =
+/// src.name; src.name.upper()` was rejected, and so was `p.email` after an
+/// unrelated `acc.email = "x"` (review 2026-10-03 §4.4). Paths *below* an
+/// aliased `field` always go: the object they read through was replaced.
+fn clear_aliased_field_narrowings(
+    c: &mut Checker,
+    field: &str,
+    keep: &str,
+    owner: &Type,
+    value: &Type,
+) {
+    let suffix = format!(".{field}");
+    let inner = format!(".{field}.");
+    let stale: Vec<String> = c
+        .env
+        .attr_narrowings
+        .iter()
+        .filter(|(k, _)| k.as_str() != keep)
+        .filter_map(|(k, narrowed)| {
+            let ends = k.ends_with(&suffix);
+            let below = k.contains(&inner);
+            if !ends && !below {
+                return None;
+            }
+            let field_path = if ends {
+                k.clone()
+            } else {
+                k[..k.find(&inner)? + suffix.len()].to_owned()
+            };
+            let aliases = path_owner_type(c, &field_path).is_none_or(|o| may_alias(c, &o, owner));
+            if !aliases {
+                return None;
+            }
+            let still_fits = ends
+                && !below
+                && !matches!(value, Type::Unknown | Type::Any)
+                && c.is_assignable(narrowed, value);
+            (!still_fits).then(|| k.clone())
+        })
+        .collect();
+    for k in stale {
+        c.env.clear_attr_narrowing(&k);
+    }
+}
+
+/// Bind the `as` name of an `except` handler to what it catches: the class
+/// of `except ValueError as e`, the union of `except (A, B) as e`, and
+/// `BaseException` for a bare `except … as e` (which cannot be written,
+/// but a type the checker cannot read gives `Unknown`). It was never bound,
+/// so `return Err(e)` in a `-> Result[int, str]`, `let m: int = e` and
+/// `e.code` where only one of `(A, B)` has `code` all passed (review
+/// 2026-10-03 §3.2). `except*` binds an `ExceptionGroup`, left `Unknown`.
+fn bind_except_name(c: &mut Checker, h: &ruff_python_ast::ExceptHandlerExceptHandler, star: bool) {
+    let Some(name) = &h.name else {
+        return;
+    };
+    let ty = if star {
+        Type::Unknown
+    } else {
+        match h.type_.as_deref() {
+            None => Type::Class("BaseException".to_owned()),
+            Some(Expr::Tuple(tup)) => {
+                let members: Vec<Type> = tup
+                    .elts
+                    .iter()
+                    .map(|e| type_from_annotation(e, &c.classes))
+                    .collect();
+                if members
+                    .iter()
+                    .any(|m| matches!(m, Type::Unknown | Type::Any))
+                {
+                    Type::Unknown
+                } else {
+                    Type::union_of(members)
+                }
+            }
+            Some(e) => match type_from_annotation(e, &c.classes) {
+                t @ (Type::Class(_) | Type::Generic(..)) => t,
+                _ => Type::Unknown,
+            },
+        }
+    };
+    let start = name.range.start().to_usize();
+    c.env.declare(TypeBinding {
+        name: name.as_str().to_owned(),
+        declared: ty.clone(),
+        narrowed: ty,
+        span: (start, start + name.as_str().len()),
+        from_unsafe: c.unsafe_depth > 0,
+    });
 }
 
 /// Evaluate an expression appearing in statement position, invalidating global
@@ -12197,7 +14396,7 @@ fn widen_loop_carried_narrowings(c: &mut Checker, body: &[Stmt]) {
         return;
     }
     let mut reassigned = LoopReassigned::default();
-    collect_reassigned_names(body, &mut reassigned);
+    collect_reassigned_names(c, body, &mut reassigned);
     for name in &reassigned.names {
         c.env.widen_to_declared(name);
     }
@@ -12247,10 +14446,22 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             let mut ann_type = if bare_final {
                 Type::Unknown
             } else {
-                type_from_annotation(&a.annotation, &c.classes)
+                c.expand_nullable_aliases(&type_from_annotation(&a.annotation, &c.classes))
             };
+            let mut init_type: Option<Type> = None;
             if let Some(value) = &a.value {
                 let value_type = infer_expr_ctx(c, value, Some(&ann_type));
+                init_type = Some(value_type.clone());
+                // A freeze annotation describes the input; the binding carries
+                // the runtime's recursively immutable output shape.
+                let frozen_annotation = frozen_type(&c.unwrap_alias(&ann_type));
+                if freeze_call_argument(value).is_some()
+                    || (frozen_annotation != ann_type
+                        && c.is_assignable(&frozen_annotation, &value_type)
+                        && !c.is_assignable(&ann_type, &value_type))
+                {
+                    ann_type = frozen_annotation;
+                }
                 // A call in the RHS may reassign a module global via
                 // `global NAME` in the callee, staling a caller narrowing on
                 // that global. Reset for subsequent statements (mirrors the
@@ -12338,10 +14549,28 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 if c.env.lookup(n.id.as_str()).is_some() {
                     c.reassigned_names.insert(n.id.as_str().to_owned());
                 }
+                // A nullable declaration with a definitely non-`None`
+                // initializer starts out narrowed, exactly as the same value
+                // assigned on the next line would narrow it: `mut x: int? = 5`
+                // is an `int` until something rebinds it. Without this a loop
+                // that re-assigns `x` from an `int` left `x` nullable after
+                // the loop once loop exits were joined (review 2026-10-03,
+                // W1-06 / W1-07).
+                let narrowed = match &init_type {
+                    Some(v)
+                        if ann_type.is_nullable()
+                            && !v.is_nullable()
+                            && !matches!(v, Type::Unknown | Type::Any | Type::None)
+                            && c.is_assignable(&ann_type, v) =>
+                    {
+                        ann_type.strip_none()
+                    }
+                    _ => ann_type.clone(),
+                };
                 c.env.declare(TypeBinding {
                     name: n.id.as_str().to_owned(),
-                    declared: ann_type.clone(),
-                    narrowed: ann_type,
+                    declared: ann_type,
+                    narrowed,
                     span,
                     from_unsafe,
                 });
@@ -12489,11 +14718,21 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         // the same field narrowed under any OTHER root goes too
                         // (review 2026-09-30 §3.8).
                         if let Some(field) = path.rsplit('.').next() {
-                            c.env.clear_attr_narrowings_of_field(field, &path);
+                            let owner = attr_base(target)
+                                .map(|b| infer_expr_readonly(c, b))
+                                .unwrap_or(Type::Unknown);
+                            clear_aliased_field_narrowings(c, field, &path, &owner, &value_type);
                         }
                         if !value_type.is_nullable() && !matches!(value_type, Type::Unknown) {
                             c.env.narrow_attr(path, value_type.clone());
                         }
+                    } else if let Expr::Attribute(a) = target {
+                        // `reg["k"].v = None` / `hs[0].name = None`: the object
+                        // has no access path, so it may be any object of a
+                        // compatible type whose `v` is narrowed (review
+                        // 2026-10-03 §3.11, §4.8).
+                        let owner = infer_expr_readonly(c, &a.value);
+                        clear_aliased_field_narrowings(c, a.attr.as_str(), "", &owner, &value_type);
                     }
                 } else if matches!(target, Expr::Tuple(_) | Expr::List(_)) {
                     // Tuple/list unpack. A `let`/`mut` form introduces fresh
@@ -12512,18 +14751,39 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     // respect the element type, else it silently corrupts the
                     // invariant: `data[0] = "x"` / `data[0:1] = ["x"]` into a
                     // `list[int]`, or `d[k] = "x"` into a `dict[K, int]`. The
-                    // dict KEY is intentionally not checked here (computed keys
-                    // carry a higher false-positive risk); only the element /
-                    // value type is enforced.
+                    // key/index and element/value types are both checked.
                     let recv_ty = infer_expr_readonly(c, &sub.value);
+                    mutations::index(c, sub, &recv_ty);
                     let span = (
                         a.value.range().start().to_usize(),
                         a.value.range().end().to_usize(),
                     );
                     if let Type::Generic(head, args) = &recv_ty {
+                        if matches!(
+                            head.as_str(),
+                            "Mapping" | "tuple" | "tuple_variadic" | "frozenset"
+                        ) {
+                            let at = target.range();
+                            let diagnostic = TycError::generic_at(
+                                format!("`{}` does not support item assignment", recv_ty.display()),
+                                "item assignment raises `TypeError` here",
+                                &c.path,
+                                c.source,
+                                at.start().to_usize(),
+                                at.len().to_usize(),
+                            );
+                            if frozen_context::failure_is_caught(c, target, "TypeError") {
+                                c.diagnostics.push_warning(diagnostic);
+                            } else {
+                                c.diagnostics.push_error(diagnostic);
+                            }
+                        }
+
                         if head == "list" && args.len() == 1 {
                             let elem = args[0].clone();
-                            if matches!(sub.slice.as_ref(), Expr::Slice(_)) {
+                            if matches!(sub.slice.as_ref(), Expr::Slice(_))
+                                || mutations::slice_object(c, &sub.slice)
+                            {
                                 // `xs[a:b] = it`: `it` must be a sequence of T.
                                 // Skip when the RHS element type is unknown.
                                 if let Some(rhs_elem) = subscript_element_type(&value_type) {
@@ -12592,11 +14852,16 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         .unwrap_or(Type::Unknown)
                 })
                 .collect();
+            let params: Vec<Type> = params
+                .iter()
+                .map(|p| c.expand_nullable_aliases(p))
+                .collect();
             let ret = f
                 .returns
                 .as_deref()
                 .map(|r| type_from_annotation_with_params(r, &classes, &tps))
                 .unwrap_or(Type::Unknown);
+            let ret = c.expand_nullable_aliases(&ret);
             // An `async def` value is a coroutine-returning callable (see the
             // module-level signature pass for the same wrapping).
             let ret = if f.is_async {
@@ -12604,9 +14869,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             } else {
                 ret
             };
-            let variadic = all_params().any(|pwd| pwd.default.is_some())
-                || f.parameters.vararg.is_some()
-                || f.parameters.kwarg.is_some();
+            let variadic = f.parameters.vararg.is_some();
             // How many parameters the caller must actually supply. This
             // binding *overrides* the one `seed_env_from_scope` installed from
             // `function_signature`, so it has to carry the required-arity too
@@ -12767,7 +15030,13 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                                 }
                                 if first_defaulted.is_none() {
                                     if let Expr::Name(n) = a.target.as_ref() {
-                                        first_defaulted = Some((a, n.id.as_str().to_owned()));
+                                        if class_contracts::descriptor_used(
+                                            c,
+                                            class_name,
+                                            n.id.as_str(),
+                                        ) {
+                                            first_defaulted = Some((a, n.id.as_str().to_owned()));
+                                        }
                                     }
                                 }
                             }
@@ -12823,7 +15092,9 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     && !is_raw
                     && !inherits_required_field
                 {
-                    if let Some((ann, field_name)) = first_defaulted {
+                    if let Some((ann, field_name)) = first_defaulted
+                        .filter(|(_, field)| class_contracts::descriptor_used(c, class_name, field))
+                    {
                         let value_hint = ann
                             .value
                             .as_deref()
@@ -12845,9 +15116,14 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                                         "False".to_owned()
                                     }
                                 }
-                                _ => "its literal value".to_owned(),
+                                Expr::NoneLiteral(_) => "None".to_owned(),
+                                _ => c
+                                    .source
+                                    .get(v.range().start().to_usize()..v.range().end().to_usize())
+                                    .unwrap_or("the declared default")
+                                    .to_owned(),
                             })
-                            .unwrap_or_else(|| "its literal value".to_owned());
+                            .unwrap_or_else(|| "the declared default".to_owned());
                         let class_range = cd.name.range;
                         c.diagnostics
                             .push_warning(TycError::class_attr_shadows_slot(
@@ -13082,6 +15358,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // narrowing snapshot has been restored.
             let narrowings = collect_narrowings(c, &w.test, /*negate=*/ false);
             let snap_pre = c.env.snapshot();
+            let pre_loop = snap_pre.clone();
             // Iteration-2 soundness: a name reassigned inside the body holds,
             // at the top of the second and later passes, whatever the previous
             // pass last assigned — not the pre-loop narrowed value. Widen those
@@ -13099,34 +15376,46 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // ending in one is still widened (`body_always_leaves_loop`).
             widen_loop_carried_narrowings(c, &w.body);
             apply_narrowings(c, &narrowings);
+            c.loop_exits.push(LoopExits {
+                range: (w.range.start().to_usize(), w.range.end().to_usize()),
+                ..LoopExits::default()
+            });
             for s in &w.body {
                 check_stmt(c, s);
             }
-            c.env.restore(snap_pre);
-            // `while ... else:` runs exactly when the loop test became
-            // false without a `break`, so the negated narrowing holds
-            // at the top of the orelse block — the dual of the
-            // positive narrowing applied to the body. Mirrors the
-            // `if` checker's else-branch handling.
+            let exits = c.loop_exits.pop().unwrap_or_default();
+            drop(snap_pre);
+            // The loop head — where TEST is evaluated again — is reached
+            // before the first pass, from the end of the body and from every
+            // `continue`; it holds only what all three agree on. Restoring the
+            // pre-loop env here instead (as before) let a narrowing the body
+            // invalidated survive the loop: `while running: x = None` left a
+            // pre-loop `x: int` narrowing in force after it (review
+            // 2026-10-03, W1-07).
+            let head_states = loop_head_states(c, &w.body, pre_loop, exits.continues);
+            if let Some(head) = join_envs(head_states) {
+                c.env.restore(head);
+            }
+            // `while ... else:` runs exactly when TEST became false without a
+            // `break`, so the negated narrowing holds at the top of the
+            // `else` block and on the natural exit — `while y is None:
+            // y = load()` leaves `y` non-`None` (B25).
             let neg = collect_narrowings(c, &w.test, /*negate=*/ true);
-            let snap_pre = c.env.snapshot();
             apply_narrowings(c, &neg);
             for s in &w.orelse {
                 check_stmt(c, s);
             }
-            c.env.restore(snap_pre);
-            // B25: post-loop narrowing. A `while TEST: BODY` that has
-            // no `break` in the body can only exit through TEST going
-            // false (the natural-exit path) — so the negation of TEST
-            // holds at the join point after the loop. Apply the
-            // negated narrowings persistently so code like
-            //   while y is None: y = load()
-            //   return y + 1            # y is `int` here
-            // checks cleanly. A `break` inside the body would leave
-            // the loop while TEST is still true; in that case we have
-            // no information at the join and skip the apply.
-            if !body_can_break(&w.body) {
-                apply_narrowings(c, &neg);
+            // After the loop: the natural exit (unless TEST is constant
+            // true, or the `else` always leaves) joined with every `break`.
+            let natural_exit = !is_constant_true(&w.test)
+                && (w.orelse.is_empty() || !body_always_exits(&w.orelse));
+            let mut post_states = Vec::new();
+            if natural_exit {
+                post_states.push(c.env.snapshot());
+            }
+            post_states.extend(exits.breaks);
+            if let Some(post) = join_envs(post_states) {
+                c.env.restore(post);
             }
         }
         Stmt::For(f) => {
@@ -13165,6 +15454,8 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // unmodelled shapes (`Unknown`, user classes, bare containers)
             // fall back to `Unknown` so we stay permissive.
             let elem_ty = iterable_element_type(&iter_ty).unwrap_or(Type::Unknown);
+            // The zero-iteration path: the env before the target is bound.
+            let pre_loop = c.env.snapshot();
             // Bind the loop target(s). A tuple target (`for k, v in d.items()`)
             // destructures the element `tuple[K, V]` per slot; previously only
             // a bare `Expr::Name` target was bound and tuple slots fell to
@@ -13180,8 +15471,44 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // every path) — there is then no back-edge, so no stale carry to
             // widen. A `continue` still reaches the back-edge, so it is widened.
             widen_loop_carried_narrowings(c, &f.body);
+            c.loop_exits.push(LoopExits {
+                range: (f.range.start().to_usize(), f.range.end().to_usize()),
+                ..LoopExits::default()
+            });
             for s in &f.body {
                 check_stmt(c, s);
+            }
+            let exits = c.loop_exits.pop().unwrap_or_default();
+            // The iterator is re-polled before the first pass, after the end
+            // of the body and after every `continue`; exhausting it there
+            // runs the `else` block and leaves the loop. The body's state
+            // used to flow straight on, as if the loop always ran to the end
+            // at least once, and the `else` block was never checked at all
+            // (review 2026-10-03, W1-06).
+            let head_states = loop_head_states(c, &f.body, pre_loop, exits.continues);
+            if let Some(head) = join_envs(head_states) {
+                c.env.restore(head);
+            }
+            for s in &f.orelse {
+                check_stmt(c, s);
+            }
+            let mut post_states = Vec::new();
+            if f.orelse.is_empty() || !body_always_exits(&f.orelse) {
+                post_states.push(c.env.snapshot());
+            }
+            post_states.extend(exits.breaks);
+            if let Some(post) = join_envs(post_states) {
+                c.env.restore(post);
+            }
+        }
+        Stmt::Break(_) => {
+            if let Some(frame) = c.loop_exits.last_mut() {
+                frame.breaks.push(c.env.snapshot());
+            }
+        }
+        Stmt::Continue(_) => {
+            if let Some(frame) = c.loop_exits.last_mut() {
+                frame.continues.push(c.env.snapshot());
             }
         }
         Stmt::Expr(e) => {
@@ -13194,43 +15521,8 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             if c.call_can_rebind() && expr_contains_call(&e.value) {
                 reset_globals_after_call(c);
             }
-            // A bare method-call statement (`self.reset()`, `conn.close()`) may
-            // mutate a field of its receiver, so a prior attribute narrowing
-            // (`if self.x is not None:`) is stale afterwards. Clear narrowings
-            // rooted at the receiver. Scoped to a call in *statement* position
-            // (an almost-always-mutating side-effect call) to avoid the
-            // false positives that invalidating on every nested method call
-            // would cause on the common `self.helper(); self.x.foo()` shape.
-            // `await self.reset()` parses as `Await(Call(...))`, so peel a
-            // leading `await` before the call match — the awaited form is just
-            // as mutating a statement-position call as the sync one, and the
-            // alpha.2 fix only matched the bare `Call`.
-            let call_expr = match e.value.as_ref() {
-                Expr::Await(a) => a.value.as_ref(),
-                other => other,
-            };
-            if let Expr::Call(call) = call_expr {
-                if let Expr::Attribute(recv_attr) = call.func.as_ref() {
-                    if let Some(recv_path) = attr_path_of(&recv_attr.value) {
-                        c.env.clear_attr_narrowing(&recv_path);
-                    }
-                }
-                // An object handed to a call in statement position
-                // (`clear(b)`, `self.reset(b)`) can have its fields rewritten
-                // by the callee just as a method call on it can, so the
-                // narrowings rooted at every bare-name argument are stale
-                // too (review 2026-09-30 §3.8).
-                for arg in call
-                    .arguments
-                    .args
-                    .iter()
-                    .chain(call.arguments.keywords.iter().map(|k| &k.value))
-                {
-                    if let Expr::Name(n) = arg {
-                        c.env.clear_attr_narrowing(n.id.as_str());
-                    }
-                }
-            }
+            // Field narrowings a call can invalidate are dropped as each call
+            // is inferred, in evaluation order (see `invalidate_after_call`).
         }
         Stmt::AugAssign(a) => {
             // The target can run a call too: `xs[bump()] += 1`.
@@ -13244,8 +15536,26 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // the same operand rules as `x = x op y`; mutable containers have
             // looser in-place semantics (`list += any_iterable`) so we stay
             // permissive there to avoid false positives.
+            for (side, ty) in [(a.target.as_ref(), &l), (a.value.as_ref(), &r)] {
+                if ty.is_nullable() {
+                    report_nullable_operand(c, side, ty);
+                }
+            }
             let l_stripped = l.strip_none();
             let r_stripped = r.strip_none();
+            let result = operators::augmented_result(c, &l_stripped, &r_stripped, a.op, &a.value);
+            let target_type = match a.target.as_ref() {
+                Expr::Name(n) => c
+                    .env
+                    .lookup(n.id.as_str())
+                    .map(|b| b.declared.clone())
+                    .unwrap_or_else(|| l.clone()),
+                _ => l.clone(),
+            };
+            if !c.is_assignable(&target_type, &result) {
+                let span = (a.range.start().to_usize(), a.range.end().to_usize());
+                c.mismatch(&target_type, &result, span);
+            }
             let scalar_target = matches!(
                 l_stripped,
                 Type::Int | Type::Float | Type::Bool | Type::Str | Type::Bytes
@@ -13254,17 +15564,6 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 if let Some(op_str) = arithmetic_op_str(a.op) {
                     let span = (a.range.start().to_usize(), a.range.end().to_usize());
                     if !operator_operands_compatible(a.op, &l_stripped, &r_stripped) {
-                        c.operator_type_mismatch(op_str, &l_stripped, &r_stripped, span);
-                    } else if matches!(l_stripped, Type::Int)
-                        && (matches!(a.op, ruff_python_ast::Operator::Div)
-                            || matches!(r_stripped, Type::Float))
-                    {
-                        // Numeric widening: `x: int; x += 0.5` (or `x /= 2`)
-                        // makes x a float at runtime, which is not assignable
-                        // back to the int target — exactly like `x = x + 0.5`.
-                        // Catches int fields and dict/list[int] elements too
-                        // (their inferred element type is `int`). Same
-                        // diagnostic the reassignment path uses.
                         c.operator_type_mismatch(op_str, &l_stripped, &r_stripped, span);
                     }
                 }
@@ -13367,7 +15666,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // such name to its declared type on entry to each handler; the
             // same goes for attribute paths the body assigns.
             let mut body_writes = LoopReassigned::default();
-            collect_reassigned_names(&t.body, &mut body_writes);
+            collect_reassigned_names(c, &t.body, &mut body_writes);
             for h in &t.handlers {
                 let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
                 // Enter the handler with the pre-`try` narrowings (keeping any
@@ -13381,6 +15680,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 for path in &body_writes.attrs {
                     c.env.clear_attr_narrowing(path);
                 }
+                bind_except_name(c, h, t.is_star);
                 for s in &h.body {
                     check_stmt(c, s);
                 }
@@ -13441,7 +15741,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 // the normal-path narrowings `finally` never touched.
                 let finally_result = c.env.snapshot();
                 let mut finally_writes = LoopReassigned::default();
-                collect_reassigned_names(&t.finalbody, &mut finally_writes);
+                collect_reassigned_names(c, &t.finalbody, &mut finally_writes);
                 after_try.overlay_finally_delta(&finally_view, &finally_result, &finally_writes);
                 c.env.restore(after_try);
             }
@@ -13452,8 +15752,26 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // narrowing the caller held on such a global, exactly as a call in
             // any other statement position does (`eval_stmt_expr`).
             let subject_type = eval_stmt_expr(c, &m.subject);
+            // Types already fully matched by an earlier unguarded arm
+            // (`case Fish():`, `case None:`). A later arm only sees what is
+            // left, so `case _:` after `case Fish():` over `Dog | Cat | Fish`
+            // narrows the subject to `Dog | Cat` (review 2026-10-03 §4.1/§4.7).
+            let mut excluded: Vec<Type> = Vec::new();
             for case in &m.cases {
                 check_pattern_class_fields(c, &case.pattern);
+                check_alias_class_patterns(c, &case.pattern);
+                let residual = match m.subject.as_ref() {
+                    Expr::Name(_) if !excluded.is_empty() => {
+                        let expanded = expand_sealed_alias_for_narrowing(c, &subject_type);
+                        let mut rest = expanded.clone();
+                        for x in &excluded {
+                            rest = strip_variant(&rest, x);
+                        }
+                        (rest != expanded && !matches!(rest, Type::Unknown)).then_some(rest)
+                    }
+                    _ => None,
+                };
+                let case_subject = residual.clone().unwrap_or_else(|| subject_type.clone());
                 // Enter scope and bind pattern names FIRST so guard expressions
                 // (e.g. `case Circle(radius=r) if r > 0:`) can reference them.
                 // A class pattern narrows the *subject variable* inside the
@@ -13471,12 +15789,13 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 // sound conservative choice there.
                 let narrow_to = match m.subject.as_ref() {
                     Expr::Name(_) => pattern_narrowed_type(&case.pattern)
-                        .filter(|t| c.is_assignable(&subject_type, t)),
+                        .filter(|t| c.is_assignable(&subject_type, t))
+                        .or_else(|| residual.clone()),
                     _ => None,
                 };
                 let snap = narrow_to.as_ref().map(|_| c.env.snapshot());
                 c.env.enter();
-                bind_pattern_names(c, &case.pattern, &subject_type);
+                bind_pattern_names(c, &case.pattern, &case_subject);
                 if let (Expr::Name(subj), Some(t)) = (m.subject.as_ref(), narrow_to) {
                     c.env.narrow(subj.id.as_str(), t);
                 }
@@ -13490,6 +15809,11 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 c.env.leave();
                 if let Some(snap) = snap {
                     c.env.restore(snap);
+                }
+                if case.guard.is_none() {
+                    if let Some(t) = irrefutable_pattern_type(&case.pattern) {
+                        excluded.push(t);
+                    }
                 }
             }
             // Exhaustiveness check: sealed unions and enums (both are
@@ -13510,6 +15834,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     m.subject.range().end().to_usize(),
                 );
                 if let Some(variants) = c.sealed_unions.get(union_name.as_str()).cloned() {
+                    let variants = flatten_sealed_variants(c, &variants);
                     check_match_exhaustiveness(c, &m.cases, union_name, &variants, subject_span);
                 } else if let Some(members) = c.enums.get(union_name.as_str()).cloned() {
                     check_enum_match_exhaustiveness(
@@ -13519,7 +15844,11 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         &members,
                         subject_span,
                     );
+                } else {
+                    check_closed_match_exhaustiveness(c, &m.cases, &subject_type, &m.subject);
                 }
+            } else {
+                check_closed_match_exhaustiveness(c, &m.cases, &subject_type, &m.subject);
             }
         }
         // `assert <test>` permanently narrows subsequent code in the
@@ -13705,7 +16034,9 @@ fn check_function(
     let (name, name_span_offset, name_span_len) = name_info;
     let classes = c.classes.clone();
     let ret_type = match returns {
-        Some(r) => type_from_annotation_with_params(r, &classes, type_params),
+        Some(r) => {
+            c.expand_nullable_aliases(&type_from_annotation_with_params(r, &classes, type_params))
+        }
         None => Type::Unknown,
     };
 
@@ -13830,6 +16161,12 @@ fn check_function(
     // of a nested `def` — `leave()` only pops this body's own scope, so without
     // this restore the mutation to an outer frame's `narrowed` field persists.
     let saved_scope_narrowings = c.env.snapshot_scope_narrowings();
+    // A captured name the enclosing body reassigns after this `def` (or
+    // inside a loop around it) may hold any of those values when the body
+    // runs, so its narrowing at the `def` does not hold inside (review
+    // 2026-10-03 §4.8). Undone by the restore above on exit.
+    widen_captured_names(c, name_span_offset);
+    c.assign_sites.push(collect_assign_sites(body));
     c.env.enter();
     // Attribute narrowings (`self.x` non-null) belong to the enclosing
     // function body — a different `self` is in scope here, so start clean.
@@ -13841,10 +16178,9 @@ fn check_function(
     // Locals a nested `def` of THIS body declares `nonlocal` (see
     // `nonlocals_rebound_by_call`); the enclosing function's set is
     // restored on exit.
-    let saved_nonlocals = std::mem::replace(
-        &mut c.nonlocals_rebound_by_call,
-        collect_nested_nonlocals(body),
-    );
+    let (escaped_nonlocals, writer_calls) = collect_nonlocal_writers(body);
+    let saved_nonlocals = std::mem::replace(&mut c.nonlocals_rebound_by_call, escaped_nonlocals);
+    let saved_writer_calls = std::mem::replace(&mut c.nonlocal_writer_calls, writer_calls);
 
     // Declare parameters with their annotation types. Type parameters resolve
     // to `Any` until a real inference engine lands. Inside a class body, an
@@ -13866,7 +16202,11 @@ fn check_function(
         let is_self_receiver = positional_first_name.as_deref() == Some(param_name)
             && (param_name == "self" || param_name == "cls");
         let t = match &pwd.parameter.annotation {
-            Some(ann) => type_from_annotation_with_params(ann, &classes, type_params),
+            Some(ann) => c.expand_nullable_aliases(&type_from_annotation_with_params(
+                ann,
+                &classes,
+                type_params,
+            )),
             None => {
                 if is_self_receiver {
                     // `extend BUILTIN:` is lowered to a
@@ -13998,10 +16338,12 @@ fn check_function(
     }
 
     c.env.leave();
+    c.assign_sites.pop();
     c.env.restore_scope_narrowings(saved_scope_narrowings);
     c.env.attr_narrowings = saved_attr_narrowings;
     c.reassigned_names = saved_reassigned_names;
     c.nonlocals_rebound_by_call = saved_nonlocals;
+    c.nonlocal_writer_calls = saved_writer_calls;
     c.current_return = saved_return;
     c.unsafe_origin_bindings = saved_unsafe_origins;
     c.active_typevar_bounds = saved_bounds;
@@ -16015,15 +18357,16 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
         Type::Class(n) => n.as_str(),
         Type::Generic(head, _) => {
             if head == "Result" {
-                let variants = ["Ok", "Err"];
-                let mut covered: HashSet<&str> = HashSet::new();
-                for case in cases {
-                    if case.guard.is_some() {
-                        continue;
-                    }
-                    collect_matched_class_names(&case.pattern, &mut covered);
-                }
-                return variants.iter().all(|&v| covered.contains(v));
+                // `Ok` and `Err`, each with its payload checked against the
+                // `Result`'s own `T` / `E` where those are closed sets — so
+                // `Err(NotFound())` + `Err(Timeout())` does not cover a
+                // `Denied` member of `E` (review 2026-10-03 §3.3).
+                let pats: Vec<&Pattern> = cases
+                    .iter()
+                    .filter(|cs| cs.guard.is_none())
+                    .map(|cs| &cs.pattern)
+                    .collect();
+                return missing_cases(c, &pats, ty, 0).is_some_and(|m| m.is_empty());
             }
             head.as_str()
         }
@@ -16036,6 +18379,7 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
         _ => return false,
     };
     if let Some(variants) = c.sealed_unions.get(class_name).cloned() {
+        let variants = flatten_sealed_variants(c, &variants);
         let mut covered: HashSet<&str> = HashSet::new();
         let mut covered_with_guards: HashSet<&str> = HashSet::new();
         let mut has_guarded_wildcard = false;
@@ -16739,7 +19083,9 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                                     let replacement = if !negate {
                                         Some(guard_args[0].clone())
                                     } else if head == "TypeIs" {
-                                        Some(strip_variant(&b.narrowed, &guard_args[0]))
+                                        let base = pending_name_narrowing(out, target.id.as_str())
+                                            .unwrap_or_else(|| b.narrowed.clone());
+                                        Some(strip_variant_expanding(c, &base, &guard_args[0]))
                                     } else {
                                         None
                                     };
@@ -16760,8 +19106,13 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                         let new_type = type_from_annotation(&pos_args[1], &c.classes);
                         if let Some(b) = c.env.lookup(target.id.as_str()) {
                             let replacement = if negate {
-                                // Best-effort: strip the type out of the union.
-                                strip_variant(&b.narrowed, &new_type)
+                                // Strip the type out of the union, starting from
+                                // what an earlier operand of the same condition
+                                // already narrowed it to, and seeing through a
+                                // sealed-union alias (review 2026-10-03 §4.1).
+                                let base = pending_name_narrowing(out, target.id.as_str())
+                                    .unwrap_or_else(|| b.narrowed.clone());
+                                strip_variant_expanding(c, &base, &new_type)
                             } else {
                                 // Preserve generic parameters when narrowing
                                 // `Result[T, E]` against `Ok` or `Err`.
@@ -16789,13 +19140,12 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                         // reassignment.
                         if let Some(path) = attr_path_of(&pos_args[0]) {
                             let new_type = type_from_annotation(&pos_args[1], &c.classes);
-                            let current = c
-                                .env
-                                .attr_narrowed(&path)
-                                .cloned()
+                            let current = pending_attr_narrowing(out, &path)
+                                .filter(|_| negate)
+                                .or_else(|| c.env.attr_narrowed(&path).cloned())
                                 .unwrap_or_else(|| infer_expr_readonly(c, &pos_args[0]));
                             let replacement = if negate {
-                                strip_variant(&current, &new_type)
+                                strip_variant_expanding(c, &current, &new_type)
                             } else {
                                 refine_isinstance_target(&current, &new_type)
                             };
@@ -16851,6 +19201,42 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                             name: n.id.as_str().to_owned(),
                             attr_path: None,
                             replacement: b.narrowed.strip_none(),
+                        });
+                    }
+                }
+            }
+        }
+        Expr::Named(nd) => {
+            // `(xs := d.get("a"))` is truthy-tested like the name it binds:
+            // `if (xs := …) and len(xs) > 0` (review 2026-10-03 §4.7).
+            if !negate {
+                if let Expr::Name(n) = nd.target.as_ref() {
+                    if let Some(b) = c.env.lookup(n.id.as_str()) {
+                        if b.narrowed.is_nullable() {
+                            out.push(Narrowing {
+                                name: n.id.as_str().to_owned(),
+                                attr_path: None,
+                                replacement: b.narrowed.strip_none(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Expr::Attribute(_) => {
+            // Truthy narrowing on an attribute path, the counterpart of the
+            // `Name` arm: `if head.nxt: head.nxt.v`, `if not self.data:
+            // return`, `a.b.v if a.b else 0`, `a.b and a.b.v > 5`. Only the
+            // true branch narrows, for the same reason (review 2026-10-03
+            // §4.2).
+            if !negate {
+                if let Some(path) = attr_path_of(test) {
+                    let current = attr_expr_type_with_pending(c, test, out);
+                    if current.is_nullable() {
+                        out.push(Narrowing {
+                            name: String::new(),
+                            attr_path: Some(path),
+                            replacement: current.strip_none(),
                         });
                     }
                 }
@@ -16924,7 +19310,7 @@ fn is_classvar_annotation(ann: &Expr) -> bool {
 fn is_builtin_generic_head(head: &str) -> bool {
     matches!(
         head,
-        "list" | "dict" | "set" | "tuple" | "str" | "bytes" | "frozenset"
+        "list" | "dict" | "set" | "tuple" | "tuple_variadic" | "Mapping" | "str" | "bytes" | "frozenset"
         // The Result family is Typhon's own closed surface — an unknown
         // method on Ok/Err/Result is always a runtime AttributeError, so
         // flag it at check time (closes the `.unwrap()`-before-it-existed
@@ -16998,7 +19384,19 @@ fn is_known_builtin_generic_attr(head: &str, attr: &str) -> bool {
                 | "copy"
                 | "fromkeys"
         ),
-        "set" | "frozenset" => matches!(
+        "Mapping" => matches!(attr, "get" | "keys" | "values" | "items" | "copy"),
+        "frozenset" => matches!(
+            attr,
+            "copy"
+                | "union"
+                | "intersection"
+                | "difference"
+                | "symmetric_difference"
+                | "issubset"
+                | "issuperset"
+                | "isdisjoint"
+        ),
+        "set" => matches!(
             attr,
             "add"
                 | "remove"
@@ -17018,7 +19416,7 @@ fn is_known_builtin_generic_attr(head: &str, attr: &str) -> bool {
                 | "issuperset"
                 | "isdisjoint"
         ),
-        "tuple" => matches!(attr, "count" | "index"),
+        "tuple" | "tuple_variadic" => matches!(attr, "count" | "index"),
         "str" => matches!(
             attr,
             "lower"
@@ -17135,6 +19533,7 @@ fn is_known_primitive_attr(prim: &str, attr: &str) -> bool {
             "as_integer_ratio"
                 | "bit_count"
                 | "bit_length"
+                | "is_integer"
                 | "conjugate"
                 | "denominator"
                 | "from_bytes"
@@ -17284,10 +19683,19 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
     let Type::Generic(head, args) = recv else {
         return None;
     };
+    if head == "Mapping" && matches!(attr, "get" | "keys" | "values" | "items" | "copy") {
+        return builtin_generic_method(&Type::Generic("dict".into(), args.clone()), attr);
+    }
     if let Some(sig) = builtin_container_mutator(head, attr, args) {
         return Some(sig);
     }
     match (head.as_str(), attr, args.as_slice()) {
+        ("Task", "result", [t]) => Some(Type::Function {
+            params: vec![],
+            ret: Box::new(t.clone()),
+            variadic: false,
+            min_params: Some(0),
+        }),
         ("dict", "get", [k, v]) => {
             // `d.get(k)` → V?  ;  `d.get(k, default)` → also typed as V?
             // (the default may broaden the runtime type, but the static
@@ -17587,6 +19995,28 @@ fn extract_err_generic_param(typ: &Type) -> Option<Type> {
 /// `return value` payloads are accepted unchecked. Used by the
 /// `c.in_generator` early-return in `check_stmt::Return` (FINDINGS
 /// O6, refined per Codex review on PR #94).
+/// The element type `T` a generator annotated `-> Iterator[T]` /
+/// `Iterable[T]` / `Generator[T, S, R]` (or an async form) must `yield`.
+/// `None` for any other annotation, including the bare names.
+fn generator_yield_type(typ: &Type) -> Option<Type> {
+    match typ {
+        Type::Generic(name, args)
+            if matches!(
+                name.as_str(),
+                "Iterator"
+                    | "Iterable"
+                    | "Generator"
+                    | "AsyncIterator"
+                    | "AsyncIterable"
+                    | "AsyncGenerator"
+            ) && !args.is_empty() =>
+        {
+            Some(args[0].clone())
+        }
+        _ => None,
+    }
+}
+
 fn extract_generator_return_type(typ: &Type) -> Option<Type> {
     if let Type::Generic(name, args) = typ {
         if name == "Generator" && args.len() == 3 {
@@ -17698,7 +20128,7 @@ fn unwrap_awaitable(typ: &Type, user_classes: &[String]) -> Option<Type> {
         return None;
     };
     match (name.as_str(), args.len()) {
-        ("Awaitable", 1) => Some(args[0].clone()),
+        ("Awaitable" | "asyncio.Task" | "asyncio.Future", 1) => Some(args[0].clone()),
         ("Coroutine", 3) => Some(args[2].clone()),
         ("Coroutine", 1) => Some(args[0].clone()),
         ("Task", 1) | ("Future", 1) if !user_classes.iter().any(|c| c == name) => {
@@ -17755,13 +20185,145 @@ fn strip_variant(typ: &Type, variant: &Type) -> Type {
         return out;
     }
     if let Type::Union(xs) = typ {
-        let kept: Vec<Type> = xs.iter().filter(|t| *t != variant).cloned().collect();
+        let kept: Vec<Type> = xs
+            .iter()
+            .filter(|t| !same_runtime_class(t, variant))
+            .cloned()
+            .collect();
         Type::union_of(kept)
-    } else if typ == variant {
+    } else if same_runtime_class(typ, variant) {
         Type::Unknown
     } else {
         typ.clone()
     }
+}
+
+/// Whether every value of `member` is an instance of the class `variant`
+/// names, for the negative branch of `isinstance`: equal types, or a
+/// parameterised builtin container against its bare class —
+/// `isinstance(x, list)` removes `list[int]` (review 2026-10-03 §4.7).
+fn same_runtime_class(member: &Type, variant: &Type) -> bool {
+    if member == variant {
+        return true;
+    }
+    let head = match variant {
+        Type::Class(h) => h.as_str(),
+        Type::Generic(h, args) if args.is_empty() => h.as_str(),
+        _ => return false,
+    };
+    match member {
+        Type::Generic(h, _) => {
+            h == head
+                || (head == "tuple" && h == "tuple_variadic")
+                || (head == "dict"
+                    && matches!(h.as_str(), "defaultdict" | "OrderedDict" | "Counter"))
+        }
+        _ => false,
+    }
+}
+
+/// Expand every sealed-union alias in `t` — the alias itself, a union that
+/// contains one (`Pet?`), or an alias nested inside another
+/// (`type Shape = Circle | Poly`, `type Poly = Rect | Tri`) — into the union
+/// of its leaf variant classes.
+///
+/// A sealed union declared with `type Event = A | B` is a `Type::Class("Event")`
+/// until something expands it, and `strip_variant` compares by equality, so
+/// stripping `A` from the unexpanded alias removed nothing: the negative
+/// branch of `isinstance(e, A)` kept the whole union, and the union member
+/// check then rejected `e.b_field` on correct code (review 2026-10-03 §4.1,
+/// a regression from the 09-30 union member check). Parametric aliases expand
+/// to bare variant classes, matching `expand_sealed_union_alias`.
+fn expand_sealed_alias_for_narrowing(c: &Checker, t: &Type) -> Type {
+    fn walk(c: &Checker, t: &Type, depth: usize, out: &mut Vec<Type>) {
+        if depth > 32 {
+            out.push(t.clone());
+            return;
+        }
+        let name = match t {
+            Type::Union(xs) => {
+                for x in xs {
+                    walk(c, x, depth + 1, out);
+                }
+                return;
+            }
+            Type::Class(n) => n.as_str(),
+            Type::Generic(n, _) if !is_builtin_generic_head(n) => n.as_str(),
+            _ => {
+                out.push(t.clone());
+                return;
+            }
+        };
+        // Only aliases whose every variant is a user class expand: a
+        // variant named after a builtin (`type IntTree = int | list[…]`)
+        // would become a nominal `Class("int")`, which is not `int`.
+        let user_class = |v: &String| {
+            !is_builtin_generic_head(v)
+                && !matches!(
+                    v.as_str(),
+                    "int"
+                        | "str"
+                        | "float"
+                        | "bool"
+                        | "bytes"
+                        | "bytearray"
+                        | "complex"
+                        | "object"
+                        | "type"
+                        | "None"
+                )
+        };
+        match c.sealed_unions.get(name) {
+            Some(variants) if !variants.is_empty() && variants.iter().all(user_class) => {
+                for v in variants {
+                    walk(c, &Type::Class(v.clone()), depth + 1, out);
+                }
+            }
+            _ => out.push(t.clone()),
+        }
+    }
+    let mut out = Vec::new();
+    walk(c, t, 0, &mut out);
+    Type::union_of(out)
+}
+
+/// `strip_variant`, seeing through sealed-union aliases. The expanded form
+/// is only used when it actually removes something, so a type the variant
+/// has nothing to do with keeps its original (alias) spelling.
+fn strip_variant_expanding(c: &Checker, typ: &Type, variant: &Type) -> Type {
+    let direct = strip_variant(typ, variant);
+    if direct != *typ {
+        return direct;
+    }
+    let expanded = expand_sealed_alias_for_narrowing(c, typ);
+    if expanded == *typ {
+        return direct;
+    }
+    let stripped = strip_variant(&expanded, &expand_sealed_alias_for_narrowing(c, variant));
+    if stripped == expanded || matches!(stripped, Type::Unknown) {
+        direct
+    } else {
+        stripped
+    }
+}
+
+/// The type an earlier operand of the same condition has already narrowed
+/// `name` to, if any. `not (isinstance(p, A) or isinstance(p, B))` narrows
+/// `p` twice; each step must start from the previous one, or the last
+/// replacement (computed from the declared type) silently undoes the first.
+fn pending_name_narrowing(out: &[Narrowing], name: &str) -> Option<Type> {
+    out.iter()
+        .rev()
+        .find(|n| n.attr_path.is_none() && n.name == name)
+        .map(|n| n.replacement.clone())
+}
+
+/// Attribute-path counterpart of [`pending_name_narrowing`].
+fn pending_attr_narrowing(out: &[Narrowing], path: &str) -> Option<Type> {
+    out.iter()
+        .rev()
+        .find(|n| n.attr_path.as_deref() == Some(path))
+        .map(|n| n.replacement.clone())
 }
 
 fn apply_narrowings(c: &mut Checker, ns: &[Narrowing]) {
@@ -17933,6 +20495,7 @@ fn truthy(t: &Type) -> Option<Type> {
 fn iterable_element_type(ty: &Type) -> Option<Type> {
     match ty {
         // `str` iterates to `str` (one-char strings); `bytes` to `int`.
+        Type::Class(name) if name == "range" => Some(Type::Int),
         Type::Str => Some(Type::Str),
         Type::Bytes => Some(Type::Int),
         Type::Generic(head, args) => match head.as_str() {
@@ -18058,9 +20621,100 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
         return Type::Unknown;
     }
     c.infer_depth.set(depth + 1);
-    let result = infer_expr_ctx_inner(c, expr, expected);
+    let result = match expr {
+        // A lambda body runs later, when captured names may have been
+        // reassigned; check it without their narrowings, and let nothing it
+        // does leak into the enclosing flow.
+        Expr::Lambda(lam) => {
+            let snap = c.env.snapshot();
+            widen_captured_names(c, lam.range.start().to_usize());
+            // A `yield` in a lambda body makes the *lambda* a generator; it
+            // does not yield from the enclosing function.
+            let saved_in_generator = std::mem::replace(&mut c.in_generator, false);
+            let r = infer_expr_ctx_inner(c, expr, expected);
+            c.in_generator = saved_in_generator;
+            c.env.restore(snap);
+            r
+        }
+        Expr::Attribute(_) => {
+            // Fold a receiver chain from the leaf outward. Each receiver is
+            // inferred once, on a bounded stack, instead of nesting the large
+            // expression-inference frame for every attribute.
+            let mut chain = Vec::new();
+            let mut leaf = expr;
+            while let Expr::Attribute(attr) = leaf {
+                chain.push(leaf);
+                leaf = &attr.value;
+            }
+            let mut receiver = infer_expr_ctx(c, leaf, None);
+            for node in chain.into_iter().rev() {
+                c.attribute_receiver_type = Some(receiver);
+                receiver = infer_expr_ctx_inner(
+                    c,
+                    node,
+                    if std::ptr::eq(node, expr) {
+                        expected
+                    } else {
+                        None
+                    },
+                );
+                c.attribute_receiver_type = None;
+                c.expression_types.insert(
+                    (
+                        node.range().start().to_usize(),
+                        node.range().end().to_usize(),
+                    ),
+                    receiver.clone(),
+                );
+            }
+            receiver
+        }
+        _ => infer_expr_ctx_inner(c, expr, expected),
+    };
+    after_expr_effects(c, expr);
     c.infer_depth.set(depth);
+    c.expression_types.insert(
+        (
+            expr.range().start().to_usize(),
+            expr.range().end().to_usize(),
+        ),
+        result.clone(),
+    );
     result
+}
+
+/// Type-check the body of a lambda that has no expected `Callable` type.
+/// Every parameter is bound as `Unknown` in a fresh scope — shadowing any
+/// outer name of the same spelling — so only diagnostics that hold for any
+/// argument values fire: the free variables the body reads, the calls it
+/// makes on them, its literals. Defaults are not inferred here: they are
+/// evaluated where the lambda is written, under the narrowings
+/// `widen_captured_names` has already dropped for the body.
+fn infer_lambda_body_unannotated(c: &mut Checker, lam: &ruff_python_ast::ExprLambda) {
+    c.env.enter();
+    if let Some(params) = lam.parameters.as_deref() {
+        let names = params
+            .posonlyargs
+            .iter()
+            .chain(params.args.iter())
+            .chain(params.kwonlyargs.iter())
+            .map(|pwd| &pwd.parameter)
+            .chain(params.vararg.iter().map(|p| p.as_ref()))
+            .chain(params.kwarg.iter().map(|p| p.as_ref()));
+        for param in names {
+            let name = param.name.as_str();
+            let start = param.name.range.start().to_usize();
+            c.env.declare(TypeBinding {
+                name: name.to_owned(),
+                declared: Type::Unknown,
+                narrowed: Type::Unknown,
+                span: (start, start + name.len()),
+                from_unsafe: c.unsafe_depth > 0,
+            });
+        }
+    }
+    let _ = infer_expr_ctx(c, &lam.body, None);
+    c.env.leave();
 }
 
 /// The structural type of a lambda with no expected `Callable` to check it
@@ -18091,6 +20745,66 @@ fn lambda_structural_type(lam: &ruff_python_ast::ExprLambda) -> Type {
         ret: Box::new(Type::Unknown),
         variadic,
         min_params: (required < n).then_some(required),
+    }
+}
+
+fn checked_cast_target_supported(c: &Checker, target: &Type) -> bool {
+    fn supported(c: &Checker, target: &Type, path: &mut Vec<Type>) -> bool {
+        if path.contains(target) {
+            return true;
+        }
+        path.push(target.clone());
+        let result = match c.unwrap_alias(target) {
+            Type::TypeVar(_)
+            | Type::TypeConstructor(..)
+            | Type::Unknown
+            | Type::Function { .. }
+            | Type::Module(_) => false,
+            Type::Generic(head, args) => {
+                matches!(
+                    head.as_str(),
+                    "list"
+                        | "dict"
+                        | "set"
+                        | "frozenset"
+                        | "tuple"
+                        | "tuple_variadic"
+                        | "Mapping"
+                        | "MutableMapping"
+                        | "Sequence"
+                        | "Collection"
+                        | "AbstractSet"
+                ) && args.iter().all(|arg| supported(c, arg, path))
+            }
+            Type::Union(members) => members.iter().all(|arg| supported(c, arg, path)),
+            _ => true,
+        };
+        path.pop();
+        result
+    }
+    supported(c, target, &mut Vec::new())
+}
+
+/// Static output shape of deep_freeze. User instances, including generic
+/// frozen dataclasses, retain their own type and identity.
+pub fn frozen_type(ty: &Type) -> Type {
+    match ty {
+        Type::Generic(head, args)
+            if matches!(
+                head.as_str(),
+                "list" | "dict" | "set" | "tuple" | "tuple_variadic" | "frozenset" | "Mapping"
+            ) =>
+        {
+            let output = match head.as_str() {
+                "list" => "tuple_variadic",
+                "dict" => "Mapping",
+                "set" => "frozenset",
+                _ => head,
+            };
+            Type::Generic(output.into(), args.iter().map(frozen_type).collect())
+        }
+        Type::Union(members) => Type::union_of(members.iter().map(frozen_type).collect()),
+        _ => ty.clone(),
     }
 }
 
@@ -18139,6 +20853,12 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             };
             let shape = lambda_structural_type(lam);
             let Some((exp_params, exp_ret)) = expected_fn else {
+                // No contract to check against — but the body is still
+                // code: `lambda: v.upper()` with `v: str?` crashes when it
+                // runs. Check it with every parameter `Unknown` (so only
+                // errors that hold whatever the arguments are fire) and keep
+                // the structural shape as the lambda's type.
+                infer_lambda_body_unannotated(c, lam);
                 return shape;
             };
             let (variadic, min_params) = match &shape {
@@ -18277,10 +20997,15 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             Type::Str
         }
         Expr::Name(n) => {
+            if matches!(expected, Some(Type::Function { .. })) {
+                if let Some(factory) = callables::constructor(c, n.id.as_str()) {
+                    return factory;
+                }
+            }
             if let Some(b) = c.env.lookup(n.id.as_str()) {
                 b.narrowed.clone()
             } else {
-                Type::Unknown
+                builtins::value_type(n.id.as_str()).unwrap_or(Type::Unknown)
             }
         }
         Expr::BinOp(b) => {
@@ -18316,6 +21041,21 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 if !operator_operands_compatible(b.op, &l_stripped, &r_stripped) {
                     let span = (b.range.start().to_usize(), b.range.end().to_usize());
                     c.operator_type_mismatch(op_str, &l_stripped, &r_stripped, span);
+                }
+            }
+            if matches!(b.op, Operator::Add) {
+                if let (Type::Generic(lh, la), Type::Generic(rh, ra)) = (&l_stripped, &r_stripped) {
+                    if matches!(lh.as_str(), "tuple" | "tuple_variadic")
+                        && matches!(rh.as_str(), "tuple" | "tuple_variadic")
+                    {
+                        let mut elements = la.clone();
+                        elements.extend(ra.clone());
+                        return if lh == "tuple" && rh == "tuple" {
+                            Type::Generic("tuple".into(), elements)
+                        } else {
+                            Type::Generic("tuple_variadic".into(), vec![Type::union_of(elements)])
+                        };
+                    }
                 }
             }
             // Constant-fold safety lint: literal-zero RHS on `/`, `//`, `%`
@@ -18385,6 +21125,12 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     }
                 }
             }
+            if matches!(b.op, Operator::Pow) {
+                if let Some(result) = operators::power_result(c, &l_stripped, &r_stripped, &b.right)
+                {
+                    return result;
+                }
+            }
             // Newtype arithmetic carve-out. R2-12: `newtype LogIndex = int`
             // is structurally identical to `int` at runtime but the
             // checker treats it as `Class("LogIndex")`. Without this
@@ -18425,7 +21171,13 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         return Type::Class(ln.clone());
                     }
                     // Different newtypes, both numeric-based — explicit reject.
-                    (Some((_, lb)), Some((_, rb))) if is_numeric(lb) && is_numeric(rb) => {
+                    (Some((ln, lb)), Some((rn, rb)))
+                        if ln != rn
+                            && ((is_numeric(lb) && is_numeric(rb))
+                                || (matches!(b.op, Operator::Add)
+                                    && matches!(lb, Type::Str)
+                                    && matches!(rb, Type::Str))) =>
+                    {
                         if let Some(op_str) = arithmetic_op_str(b.op) {
                             let span = (b.range.start().to_usize(), b.range.end().to_usize());
                             c.operator_type_mismatch(op_str, &l_stripped, &r_stripped, span);
@@ -18546,6 +21298,8 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         ordering_operands_compatible(c, &ls, &rs)
                     } else {
                         membership_container_ok(c, &rs)
+                            && (!matches!(rs, Type::Str | Type::LitStr(_))
+                                || c.is_assignable(&Type::Str, lt))
                     };
                     if !compatible {
                         let op_str = match op {
@@ -18557,7 +21311,19 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                             _ => "not in",
                         };
                         let span = (cmp.range.start().to_usize(), cmp.range.end().to_usize());
-                        c.operator_type_mismatch(op_str, &ls, &rs, span);
+                        if frozen_context::failure_is_caught(c, expr, "TypeError") {
+                            c.diagnostics.push_warning(TycError::operator_type_mismatch(
+                                op_str,
+                                ls.display(),
+                                rs.display(),
+                                &c.path,
+                                c.source,
+                                span.0,
+                                span.1.saturating_sub(span.0).max(1),
+                            ));
+                        } else {
+                            c.operator_type_mismatch(op_str, &ls, &rs, span);
+                        }
                     }
                 }
             }
@@ -18578,6 +21344,30 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             }
         }
         Expr::Call(call) => {
+            if let Some(argument) = freeze_call_argument(expr) {
+                let input = infer_expr_ctx(c, argument, expected);
+                return frozen_type(&c.unwrap_alias(&input));
+            }
+            if matches!(call.func.as_ref(), Expr::Name(n) if n.id.as_str() == "super") {
+                let receiver_class = c.current_class.clone().or_else(|| {
+                    c.env
+                        .lookup("self")
+                        .and_then(|binding| match &binding.narrowed {
+                            Type::Class(name) | Type::Generic(name, _) => Some(name.clone()),
+                            _ => None,
+                        })
+                });
+                if let Some(base) = receiver_class
+                    .as_ref()
+                    .and_then(|name| {
+                        c.class_shapes
+                            .get(name.strip_prefix("__typhon_impl_").unwrap_or(name))
+                    })
+                    .and_then(|shape| shape.bases.first())
+                {
+                    return Type::Class(base.clone());
+                }
+            }
             // `EXPR as! TYPE` lowers (in tyc-syntax) to
             // `__typhon_checked_cast__(EXPR, TYPE)`. The cast's static type
             // is the target `TYPE` — read the second argument as a type
@@ -18591,7 +21381,15 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     // Walk the value argument so its own diagnostics still
                     // surface, then discard its (boundary) type.
                     let _ = infer_expr(c, &call.arguments.args[0]);
-                    return type_from_annotation(&call.arguments.args[1], &c.classes);
+                    let target = type_from_annotation_with_params(
+                        &call.arguments.args[1],
+                        &c.classes,
+                        &c.active_type_params,
+                    );
+                    if !checked_cast_target_supported(c, &target) {
+                        c.diagnostics.push_error(TycError::generic(format!("as! cannot check target `{}` at runtime; choose a concrete supported target", target.display())));
+                    }
+                    return target;
                 }
             }
             // `try_result(thunk)` / `try_result(thunk, on_err)` — the
@@ -18609,12 +21407,22 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 {
                     let ok_ty = infer_try_result_arg_ret(c, &call.arguments.args[0]);
                     let err_ty = if call.arguments.args.len() == 2 {
-                        infer_try_result_arg_ret(c, &call.arguments.args[1])
+                        expression_calls::callback_result(
+                            c,
+                            &call.arguments.args[1],
+                            vec![Type::Class("Exception".into())],
+                        )
                     } else {
                         Type::Class("Exception".into())
                     };
                     return Type::Generic("Result".into(), vec![ok_ty, err_ty]);
                 }
+            }
+            if let Some(result) = mutations::update(c, call) {
+                return result;
+            }
+            if let Some(result) = expression_calls::contract(c, call) {
+                return result;
             }
             // B2: a call of shape `first[int]([1, 2, 3])` where `first`
             // is a generic function will type-check (the subscript is
@@ -18739,6 +21547,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 // `@runtime_checkable` are exempt — the user acknowledged the
                 // weaker guarantee.
                 if fn_name.id.as_str() == "isinstance" && pos_args.len() == 2 {
+                    check_isinstance_alias(c, &pos_args[1]);
                     if let Expr::Name(t) = &pos_args[1] {
                         if let Some(iface) = c.interfaces.get(t.id.as_str()) {
                             if !iface.runtime_checkable {
@@ -18767,7 +21576,10 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 {
                     let arg_ty = infer_expr(c, &pos_args[0]);
                     if let Type::Union(members) = &arg_ty {
-                        if let Some(bad) = members.iter().find(|m| !c.member_is_sized(m)) {
+                        if let Some(bad) = members
+                            .iter()
+                            .find(|m| !arg_ty.is_nullable() && !c.member_is_sized(m))
+                        {
                             let span = (
                                 pos_args[0].range().start().to_usize(),
                                 pos_args[0].range().end().to_usize(),
@@ -18777,6 +21589,90 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     }
                 }
                 check_builtin_first_argument(c, fn_name, pos_args);
+                if c.env.lookup(ctor).is_none() && builtins::contains(ctor) {
+                    let actuals: Vec<Type> =
+                        pos_args.iter().enumerate().map(|(i,arg)| {
+                            if i == 1 && matches!(ctor, "isinstance" | "issubclass") && matches!(arg, Expr::BinOp(b) if b.op == ruff_python_ast::Operator::BitOr) {
+                                type_from_annotation_with_params(arg, &c.classes, &[])
+                            } else { infer_expr(c,arg) }
+                        }).collect();
+                    let keywords: Vec<(&str, Type)> = kw_args
+                        .iter()
+                        .filter_map(|kw| {
+                            let actual = infer_expr(c, &kw.value);
+                            kw.arg.as_ref().map(|name| (name.as_str(), actual))
+                        })
+                        .collect();
+                    let names: Vec<&str> = keywords.iter().map(|(name, _)| *name).collect();
+                    let expanded = pos_args.iter().any(|arg| matches!(arg, Expr::Starred(_)))
+                        || kw_args.iter().any(|kw| kw.arg.is_none());
+                    if !expanded && !builtins::valid_arity(ctor, pos_args.len(), &names) {
+                        c.diagnostics.push_error(TycError::generic(format!(
+                            "invalid arguments to builtin `{ctor}`"
+                        )));
+                    }
+                    for (i, actual) in actuals.iter().enumerate() {
+                        if let Some(formal) = builtins::argument_type(ctor, i, None) {
+                            if !c.is_assignable(&formal, actual) {
+                                let arg = &pos_args[i];
+                                c.mismatch(
+                                    &formal,
+                                    actual,
+                                    (arg.range().start().to_usize(), arg.range().end().to_usize()),
+                                );
+                            }
+                        }
+                    }
+                    for kw in kw_args.iter() {
+                        if let Some(name) = &kw.arg {
+                            if let Some(formal) =
+                                builtins::argument_type(ctor, usize::MAX, Some(name.as_str()))
+                            {
+                                if let Some((_, actual)) =
+                                    keywords.iter().find(|(key, _)| *key == name.as_str())
+                                {
+                                    if !c.is_assignable(&formal, actual) {
+                                        c.mismatch(
+                                            &formal,
+                                            actual,
+                                            (
+                                                kw.value.range().start().to_usize(),
+                                                kw.value.range().end().to_usize(),
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let result =
+                        builtins::result(ctor, &actuals, &keywords).unwrap_or(Type::Unknown);
+                    // Constructors allocate a fresh container: its elements may
+                    // widen covariantly into the receiving annotation, unlike
+                    // assignment of an existing mutable container.
+                    if let (Type::Generic(head, args), Some(Type::Generic(ehead, eargs))) =
+                        (&result, expected)
+                    {
+                        if head == ehead
+                            && args.len() == eargs.len()
+                            && matches!(
+                                head.as_str(),
+                                "list" | "set" | "dict" | "frozenset" | "tuple_variadic"
+                            )
+                        {
+                            if args.iter().zip(eargs).all(|(a, e)| c.is_assignable(e, a)) {
+                                return Type::Generic(head.clone(), eargs.clone());
+                            }
+                            // `float` annotations admit integer inhabitants without
+                            // runtime coercion. Without value provenance, a copied
+                            // float-view container cannot prove those are floats.
+                            if args.len() == 1 && args[0] == Type::Float && eargs[0] == Type::Int {
+                                return Type::Generic(head.clone(), vec![Type::Unknown]);
+                            }
+                        }
+                    }
+                    return result;
+                }
             }
 
             // Phase E: blocking-in-async call detection. When the
@@ -18788,7 +21684,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             // because `asyncio.to_thread(time.sleep, 1)` itself is
             // `asyncio.to_thread(...)` — not in the registry.
             if c.in_async_function && c.unsafe_depth == 0 {
-                if let Some(callee_path) = dotted_name_of(&call.func) {
+                if let Some(callee_path) = canonical_callee_path(c, &call.func) {
                     if BLOCKING_CALLEES.iter().any(|p| *p == callee_path) {
                         let span = (call.range.start().to_usize(), call.range.end().to_usize());
                         c.diagnostics.push_warning(TycError::blocking_in_async(
@@ -18801,6 +21697,111 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     }
                 }
             }
+            if let Expr::Attribute(attr) = call.func.as_ref() {
+                let recv = c.unwrap_alias(&infer_expr_readonly(c, &attr.value));
+                let recv = expand_sealed_union_alias(c, recv, attr.attr.as_str());
+                if let Type::Union(members) = recv {
+                    let signatures: Option<Vec<MethodSig>> = members
+                        .iter()
+                        .map(|m| match m {
+                            Type::Class(name) | Type::Generic(name, _) => c
+                                .find_method(name, attr.attr.as_str())
+                                .cloned()
+                                .map(|mut sig| {
+                                    let bindings = receiver_type_bindings(c, m);
+                                    sig.return_type =
+                                        substitute_typevars(&sig.return_type, &bindings);
+                                    sig.param_types = sig
+                                        .param_types
+                                        .iter()
+                                        .map(|t| substitute_typevars(t, &bindings))
+                                        .collect();
+                                    sig.arity_info.kwonly_types = sig
+                                        .arity_info
+                                        .kwonly_types
+                                        .iter()
+                                        .map(|t| substitute_typevars(t, &bindings))
+                                        .collect();
+                                    sig
+                                }),
+                            _ => None,
+                        })
+                        .collect();
+                    if let Some(signatures) = signatures {
+                        let _ = infer_expr(c, &call.func);
+                        let actuals: Vec<Type> =
+                            pos_args.iter().map(|a| infer_expr(c, a)).collect();
+                        let kw_actuals: Vec<Type> =
+                            kw_args.iter().map(|k| infer_expr(c, &k.value)).collect();
+                        for sig in &signatures {
+                            if !matches!(
+                                check_arity_with_info(&sig.arity_info, pos_args, kw_args),
+                                ArityCheck::Ok
+                            ) {
+                                c.mismatch_with(
+                                    "arguments valid for every union member".into(),
+                                    "incompatible call arguments".into(),
+                                    (call.range.start().to_usize(), call.range.end().to_usize()),
+                                );
+                            }
+                            for (actual, (arg, expected)) in
+                                actuals.iter().zip(pos_args.iter().zip(&sig.param_types))
+                            {
+                                if !c.is_assignable(expected, actual) {
+                                    c.mismatch(
+                                        expected,
+                                        actual,
+                                        (
+                                            arg.range().start().to_usize(),
+                                            arg.range().end().to_usize(),
+                                        ),
+                                    );
+                                }
+                            }
+                            for (kw, actual) in kw_args.iter().zip(&kw_actuals) {
+                                if let Some(name) = &kw.arg {
+                                    let info = &sig.arity_info;
+                                    let expected = info
+                                        .param_names
+                                        .iter()
+                                        .position(|p| p == name.as_str())
+                                        .and_then(|i| sig.param_types.get(i))
+                                        .or_else(|| {
+                                            info.kwonly_names
+                                                .iter()
+                                                .position(|p| p == name.as_str())
+                                                .and_then(|i| info.kwonly_types.get(i))
+                                        });
+                                    if let Some(expected) = expected {
+                                        if !c.is_assignable(expected, actual) {
+                                            c.mismatch(
+                                                expected,
+                                                actual,
+                                                (
+                                                    kw.value.range().start().to_usize(),
+                                                    kw.value.range().end().to_usize(),
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        return Type::union_of(
+                            signatures
+                                .into_iter()
+                                .map(|s| {
+                                    if s.is_async {
+                                        Type::Generic("Coroutine".into(), vec![s.return_type])
+                                    } else {
+                                        s.return_type
+                                    }
+                                })
+                                .collect(),
+                        );
+                    }
+                }
+            }
             let func_type_raw = infer_expr(c, &call.func);
             // Unwrap transparent type aliases (`type Handler = Callable[..., R]`)
             // so that calls through the alias resolve to the underlying
@@ -18810,6 +21811,11 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             // arity check and the return type. FINDINGS E4.
             let func_type = c.unwrap_alias(&func_type_raw);
             let call_span = (call.range.start().to_usize(), call.range.end().to_usize());
+            if let Type::Union(members) = &func_type {
+                if let Some(result) = callables::union_call(c, call, members) {
+                    return result;
+                }
+            }
 
             // `tyc::missing_await` (FINDINGS #49): a *sync* function
             // calling an `async def` without `await` returns a
@@ -18836,9 +21842,14 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             // async function silently read `.value` off the coroutine at
             // runtime. Either way `inside_await` exempts the `await expr?`
             // form. (FINDINGS: async-`?` missing-await.)
-            if (c.in_sync_function || c.in_question_temp_rhs) && c.inside_await == 0 {
+            let expects_awaitable = expected
+                .is_some_and(|ty| unwrap_awaitable(&c.unwrap_alias(ty), &c.classes).is_some());
+            if (c.in_sync_function || c.in_question_temp_rhs)
+                && c.inside_await == 0
+                && !expects_awaitable
+            {
                 if let Expr::Name(n) = call.func.as_ref() {
-                    if c.async_functions.contains(n.id.as_str()) {
+                    if callee_is_async(c, call) {
                         let span = (n.range.start().to_usize(), n.range.end().to_usize());
                         c.missing_await(n.id.as_str(), span);
                     }
@@ -18937,12 +21948,14 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         } else {
                             None
                         };
-                    let arity_info: Option<ArityInfo> = method_arity_info.or_else(|| {
-                        fn_name
-                            .as_deref()
-                            .and_then(|n| c.function_arity_info.get(n))
-                            .cloned()
-                    });
+                    let arity_info: Option<ArityInfo> = method_arity_info
+                        .or_else(|| callables::origin(c, &call.func))
+                        .or_else(|| {
+                            fn_name
+                                .as_deref()
+                                .and_then(|n| c.function_arity_info.get(n))
+                                .cloned()
+                        });
                     let arity_outcome = if let Some(info) = arity_info.as_ref() {
                         check_arity_with_info(info, pos_args, kw_args)
                     } else {
@@ -18954,7 +21967,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         // any total ≤ params.len() (defaults could
                         // cover the rest), and require ≥ params.len()
                         // when the function is variadic.
-                        let total = pos_args.len() + kw_args.len();
+                        let total = pos_args.len();
                         // `min_params` is the number of required
                         // parameters when the callable's origin recorded
                         // it (a `Callable[[…], R]` annotation, a lambda);
@@ -18965,12 +21978,13 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         let has_star = pos_args.iter().any(|e| matches!(e, Expr::Starred(_)))
                             || kw_args.iter().any(|k| k.arg.is_none());
                         let required = min_params.unwrap_or(0);
-                        let ok = if has_star {
+                        let is_pack = callables::parameter_pack(&params).is_some();
+                        let ok = if has_star || is_pack {
                             true
                         } else if variadic {
-                            total >= params.len()
+                            total >= required
                         } else {
-                            total <= params.len() && total >= required
+                            kw_args.is_empty() && total <= params.len() && total >= required
                         };
                         if ok {
                             ArityCheck::Ok
@@ -19146,14 +22160,18 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                             .as_deref()
                             .and_then(|n| c.function_kwarg_types.get(n))
                             .cloned()
+                            .or_else(|| class_contracts::call_kwarg_type(c, &call.func))
                     } else {
                         None
                     };
                     if let Some(param_names) = kwarg_param_names {
                         for kw in kw_args {
                             let Some(ident) = &kw.arg else { continue };
-                            let Some(idx) = param_names.iter().position(|p| p == ident.as_str())
-                            else {
+                            let Some(idx) = param_names.iter().enumerate().find_map(|(i, p)| {
+                                (i >= arity_info.as_ref().map_or(0, |a| a.posonly_count)
+                                    && p == ident.as_str())
+                                .then_some(i)
+                            }) else {
                                 // No positional parameter matches this name.
                                 // Try a kw-only parameter; failing that, the
                                 // argument is absorbed by `**kwargs: T` and
@@ -19392,6 +22410,59 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                             return ret;
                         }
                     }
+                    if func_is_class_name
+                        && c.find_method(&name, "__init__").is_none()
+                        && c.find_method(&name, "__new__").is_none()
+                    {
+                        let builtin = [
+                            "int",
+                            "str",
+                            "float",
+                            "bool",
+                            "list",
+                            "tuple",
+                            "dict",
+                            "set",
+                            "frozenset",
+                        ]
+                        .into_iter()
+                        .find(|base| c.class_derives_from_builtin(&name, &[*base]));
+                        if c.enums.contains_key(&name) || builtin.is_some() {
+                            let keys: Vec<&str> = kw_args
+                                .iter()
+                                .filter_map(|k| k.arg.as_ref().map(|a| a.as_str()))
+                                .collect();
+                            let expanded = pos_args.iter().any(|a| matches!(a, Expr::Starred(_)))
+                                || kw_args.iter().any(|k| k.arg.is_none());
+                            let valid = if c.enums.contains_key(&name) {
+                                pos_args.len() + usize::from(keys.contains(&"value")) == 1
+                                    && keys.iter().all(|k| *k == "value")
+                            } else {
+                                builtins::valid_arity(builtin.unwrap(), pos_args.len(), &keys)
+                            };
+                            if !expanded && !valid {
+                                c.diagnostics.push_error(TycError::generic(format!(
+                                    "invalid constructor arguments to `{name}`"
+                                )));
+                            }
+                            for (i, arg) in pos_args.iter().enumerate() {
+                                let actual = infer_expr(c, arg);
+                                if !c.enums.contains_key(&name) {
+                                    if let Some(expected) =
+                                        builtins::argument_type(builtin.unwrap(), i, None)
+                                    {
+                                        if !c.is_assignable(&expected, &actual) {
+                                            c.mismatch(&expected, &actual, call_span);
+                                        }
+                                    }
+                                }
+                            }
+                            for kw in kw_args {
+                                let _ = infer_expr(c, &kw.value);
+                            }
+                            return Type::Class(name);
+                        }
+                    }
                     if let Some(shape) = effective_class_shape(&name, &c.class_shapes) {
                         // `plain class` / `class!` may carry a hand-written
                         // `__init__` whose parameter names need not match the
@@ -19504,12 +22575,18 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                                     } else {
                                         let supplied = pos_args.len()
                                             + kw_args.iter().filter(|k| k.arg.is_some()).count();
-                                        c.wrong_args(
-                                            &name,
-                                            info.min_positional,
-                                            supplied,
-                                            call_span,
-                                        );
+                                        if supplied == info.min_positional {
+                                            c.diagnostics.push_error(TycError::generic(format!(
+                                                "conflicting constructor arguments to `{name}`"
+                                            )));
+                                        } else {
+                                            c.wrong_args(
+                                                &name,
+                                                info.min_positional,
+                                                supplied,
+                                                call_span,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -19644,16 +22721,31 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
         Expr::Attribute(a) => {
             // Flow-sensitive attribute narrowing: `if self.x is None: return …`
             // narrows `self.x` to non-`None` for the rest of the block.
-            if let Some(path) = attr_path_of(expr) {
-                if let Some(narrowed) = c.env.attr_narrowed(&path) {
-                    return narrowed.clone();
-                }
+            if let Some(narrowed) = expression_attr_narrowing(c, expr) {
+                return narrowed;
             }
-            let recv = infer_expr(c, &a.value);
+            let recv = c
+                .attribute_receiver_type
+                .take()
+                .unwrap_or_else(|| infer_expr(c, &a.value));
             if recv.is_nullable() {
                 check_nullable_receiver(c, &a.value, &recv);
             }
             let attr_name = a.attr.as_str();
+            if let Type::Class(name) = &recv {
+                if c.find_method(name, attr_name).is_none() {
+                    if let Some(base) = c.newtypes.get(name).cloned() {
+                        c.attribute_receiver_type = Some(base);
+                        return infer_expr_ctx_inner(c, expr, expected);
+                    }
+                }
+            }
+            if let Type::Class(name) | Type::Generic(name, _) = &recv {
+                let real = name.strip_prefix("__typhon_impl_").unwrap_or(name);
+                if let Some((getter, _)) = class_contracts::property(c, real, attr_name) {
+                    return substitute_typevars(&getter, &receiver_type_bindings(c, &recv));
+                }
+            }
             // B35: `_t.error` / `_t.value` on an isinstance-narrowed
             // `Generic("Err", [E])` / `Generic("Ok", [T])` resolves to
             // `E` / `T`. The `with`-chain lowering injects exactly this
@@ -19671,6 +22763,14 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 }
                 if head == "Ok" && args.len() == 1 && attr_name == "value" {
                     return args[0].clone();
+                }
+            }
+            if let Type::Class(name) = &recv {
+                if c.enums
+                    .get(name)
+                    .is_some_and(|members| members.iter().any(|member| member == attr_name))
+                {
+                    return Type::Class(name.clone());
                 }
             }
             // Resolve attribute access on known class instances and TypeVar-bounded parameters.
@@ -19708,14 +22808,23 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         .to_usize()
                         .saturating_sub(attr_start)
                         .max(1);
-                    c.diagnostics.push_error(TycError::attribute_not_found(
-                        attr_name,
-                        head.as_str(),
-                        &c.path,
-                        c.source,
-                        attr_start,
-                        attr_len,
-                    ));
+                    // `tuple_variadic` is the internal head of `tuple[T, ...]`;
+                    // name the type as written.
+                    let shown = if head == "tuple_variadic" {
+                        recv.display()
+                    } else {
+                        head.clone()
+                    };
+                    let diagnostic = TycError::attribute_not_found(
+                        attr_name, &shown, &c.path, c.source, attr_start, attr_len,
+                    );
+                    if matches!(head.as_str(), "tuple_variadic" | "Mapping" | "frozenset")
+                        && frozen_context::failure_is_caught(c, expr, "AttributeError")
+                    {
+                        c.diagnostics.push_warning(diagnostic);
+                    } else {
+                        c.diagnostics.push_error(diagnostic);
+                    }
                     return Type::Unknown;
                 }
             }
@@ -19848,7 +22957,11 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         if params.len() < arity {
                             params.resize(arity, Type::Unknown);
                         }
-                        let ret = sig.return_type.clone();
+                        let ret = if sig.is_async {
+                            Type::Generic("Coroutine".into(), vec![sig.return_type.clone()])
+                        } else {
+                            sig.return_type.clone()
+                        };
                         return Type::Function {
                             params,
                             ret: Box::new(ret),
@@ -19945,6 +23058,11 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                             params.resize(sig.arity, Type::Unknown);
                         }
                         let ret = substitute_typevars(&sig.return_type, &bindings);
+                        let ret = if sig.is_async {
+                            Type::Generic("Coroutine".into(), vec![ret])
+                        } else {
+                            ret
+                        };
                         return Type::Function {
                             params,
                             ret: Box::new(ret),
@@ -20083,10 +23201,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         .iter()
                         .map(|m| member_field_type(c, m, attr_name))
                         .collect::<Option<Vec<Type>>>()
-                        .and_then(|tys| {
-                            let first = tys.first()?.clone();
-                            tys.iter().all(|t| *t == first).then_some(first)
-                        });
+                        .map(Type::union_of);
                     if let Some(t) = common {
                         return t;
                     }
@@ -20104,14 +23219,21 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                                 .to_usize()
                                 .saturating_sub(attr_start)
                                 .max(1);
-                            c.diagnostics.push_error(TycError::attribute_not_found(
+                            let diagnostic = TycError::attribute_not_found(
                                 attr_name,
                                 &bad_display,
                                 &c.path,
                                 c.source,
                                 attr_start,
                                 attr_len,
-                            ));
+                            );
+                            if matches!(bad,Type::Generic(head,_) if matches!(head.as_str(),"tuple_variadic" | "Mapping" | "frozenset"))
+                                && frozen_context::failure_is_caught(c, expr, "AttributeError")
+                            {
+                                c.diagnostics.push_warning(diagnostic);
+                            } else {
+                                c.diagnostics.push_error(diagnostic);
+                            }
                         }
                     }
                     Type::Unknown
@@ -20136,6 +23258,14 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     Type::Unknown
                 }
                 Type::Int => {
+                    if attr_name == "is_integer" {
+                        return Type::Function {
+                            params: vec![],
+                            ret: Box::new(Type::Bool),
+                            variadic: false,
+                            min_params: Some(0),
+                        };
+                    }
                     if !is_known_primitive_attr("int", attr_name)
                         && !is_user_builtin_extension(c, "int", attr_name)
                     {
@@ -20235,11 +23365,12 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             // invariant — the runtime hashes/compares against the slot.
             if c.unsafe_depth == 0 && !matches!(s.slice.as_ref(), Expr::Slice(_)) {
                 if let Type::Generic(head, args) = &value_ty {
-                    if head == "dict" && args.len() == 2 {
+                    if matches!(head.as_str(), "dict" | "Mapping") && args.len() == 2 {
                         let key_ty = &args[0];
                         if !is_dynamic_type(key_ty)
                             && !is_dynamic_type(&slice_ty)
                             && !c.is_assignable(key_ty, &slice_ty)
+                            && !class_contracts::enum_key_compatible(c, key_ty, &slice_ty)
                         {
                             let span = (
                                 s.slice.range().start().to_usize(),
@@ -20263,7 +23394,9 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             // trailing `?` — so extracting from a `list[T?]` honestly
             // yields `T?` rather than silently dropping the `None`
             // (the soundness hole).
-            if matches!(s.slice.as_ref(), Expr::Slice(_)) {
+            if matches!(s.slice.as_ref(), Expr::Slice(_))
+                || matches!(&slice_ty, Type::Class(n) if n == "slice" && !c.classes.contains(n))
+            {
                 // A slice (`xs[a:b]`) yields the container itself, not an
                 // element: `list[int][a:b]` is `list[int]`, `str[a:b]` is
                 // `str`. Was always `Unknown`, so `let s: str = xs[1:3]` (xs:
@@ -20474,6 +23607,9 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
         // checker so each side of the ternary sees the right type for
         // `x`.
         Expr::If(e) => {
+            if let Expr::BooleanLiteral(test) = e.test.as_ref() {
+                return infer_expr_ctx(c, if test.value { &e.body } else { &e.orelse }, expected);
+            }
             let _ = infer_expr(c, &e.test);
             let pos = collect_narrowings(c, &e.test, /*negate=*/ false);
             let snap_pre = c.env.snapshot();
@@ -20571,7 +23707,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             c.env.enter();
             infer_comprehension_generators(c, &comp.generators);
             let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
-            c.env.leave();
+            leave_comprehension_scope(c, expr);
             c.env.restore_scope_narrowings(comp_saved);
             // A comprehension builds a *fresh* list, so — like a list literal —
             // it takes the annotated element type whenever every element fits
@@ -20590,10 +23726,46 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             c.env.enter();
             infer_comprehension_generators(c, &comp.generators);
             let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
-            c.env.leave();
+            leave_comprehension_scope(c, expr);
             c.env.restore_scope_narrowings(comp_saved);
             let elt = widen_fresh_element(c, elt, elt_expected.as_ref());
             Type::Generic("set".into(), vec![elt])
+        }
+        // `yield v` in a generator annotated `-> Iterator[T]` /
+        // `Generator[T, S, R]` / `AsyncIterator[T]` (and the `Iterable`
+        // forms) must produce a `T`: the consumer is typed against it.
+        // `yield maybe_int` in `-> Iterator[int]` used to pass unchecked —
+        // the operand was not even inferred. A bare `yield` produces `None`.
+        // The expression's own value (what `send` passes in) stays
+        // `Unknown`.
+        Expr::Yield(y) => {
+            let element = if c.in_generator {
+                c.current_return
+                    .as_ref()
+                    .and_then(|r| generator_yield_type(&c.unwrap_alias(r)))
+            } else {
+                None
+            };
+            let element = element.filter(|t| !matches!(t, Type::Unknown | Type::Any));
+            let actual = match y.value.as_deref() {
+                Some(value) => infer_expr_ctx(c, value, element.as_ref()),
+                None => Type::None,
+            };
+            if let Some(element) = element {
+                if !matches!(actual, Type::Unknown) && !c.is_assignable(&element, &actual) {
+                    let at = y.value.as_deref().map_or(y.range, |v| v.range());
+                    c.mismatch(
+                        &element,
+                        &actual,
+                        (at.start().to_usize(), at.end().to_usize()),
+                    );
+                }
+            }
+            Type::Unknown
+        }
+        Expr::YieldFrom(y) => {
+            let _ = infer_expr_ctx(c, &y.value, None);
+            Type::Unknown
         }
         Expr::Generator(comp) => {
             let elt_expected = match expected {
@@ -20608,7 +23780,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             c.env.enter();
             infer_comprehension_generators(c, &comp.generators);
             let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
-            c.env.leave();
+            leave_comprehension_scope(c, expr);
             c.env.restore_scope_narrowings(comp_saved);
             // A generator expression is an `Iterator[T]`.
             Type::Generic("Iterator".into(), vec![elt])
@@ -20652,7 +23824,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     c.mismatch(ve, &v, span);
                 }
             }
-            c.env.leave();
+            leave_comprehension_scope(c, expr);
             c.env.restore_scope_narrowings(comp_saved);
             Type::Generic("dict".into(), vec![k, v])
         }
@@ -20770,11 +23942,10 @@ fn assign_unpacking_target(c: &mut Checker, target: &Expr, elem_ty: &Type) {
         }
         // `(self.x, y) = (None, 1)` rebinds the attribute, so any narrowing on
         // that path — and on anything below it — is stale.
-        Expr::Attribute(_) => {
-            if let Some(path) = attr_path_of(target) {
-                c.env.clear_attr_narrowing(&path);
-            }
-        }
+        Expr::Attribute(a) => match attr_path_of(target) {
+            Some(path) => c.env.clear_attr_narrowing(&path),
+            None => c.env.clear_attr_narrowings_of_field(a.attr.as_str(), ""),
+        },
         Expr::Tuple(t) => {
             let slots: Option<&Vec<Type>> = match elem_ty {
                 Type::Generic(h, a) if h == "tuple" && a.len() == t.elts.len() => Some(a),
@@ -20935,19 +24106,32 @@ fn expand_sealed_union_alias(c: &Checker, recv: Type, attr: &str) -> Type {
 /// The declared type of field / `@property` `attr` on a class member of a
 /// union, or `None` when the member is not a fully-known class or has no
 /// such field.
+fn receiver_type_bindings(c: &Checker, receiver: &Type) -> HashMap<String, Type> {
+    match receiver {
+        Type::Generic(name, args) => c
+            .class_type_params
+            .get(name)
+            .filter(|params| params.len() == args.len())
+            .map(|params| params.iter().cloned().zip(args.iter().cloned()).collect())
+            .unwrap_or_default(),
+        _ => HashMap::new(),
+    }
+}
+
 fn member_field_type(c: &Checker, member: &Type, attr: &str) -> Option<Type> {
-    let Type::Class(name) = member else {
-        return None;
+    let name = match member {
+        Type::Class(name) | Type::Generic(name, _) => name,
+        _ => return None,
     };
     if !c.class_hierarchy_fully_known(name) {
         return None;
     }
-    if let Some(t) = c.find_field(name, attr) {
-        return Some(t.clone());
-    }
-    c.find_method(name, attr)
-        .filter(|sig| sig.is_property)
-        .map(|sig| sig.return_type.clone())
+    let ty = c.find_field(name, attr).cloned().or_else(|| {
+        c.find_method(name, attr)
+            .filter(|sig| sig.is_property)
+            .map(|sig| sig.return_type.clone())
+    })?;
+    Some(substitute_typevars(&ty, &receiver_type_bindings(c, member)))
 }
 
 /// Whether a user class (or one of its known bases) defines any rich
@@ -20955,9 +24139,10 @@ fn member_field_type(c: &Checker, member: &Type, attr: &str) -> Option<Type> {
 /// `b.__gt__(a)`, and `functools.total_ordering` fills the rest in from any
 /// one of them, so one ordering dunder anywhere makes the class orderable.
 fn class_has_ordering_dunder(c: &Checker, name: &str) -> bool {
-    ["__lt__", "__le__", "__gt__", "__ge__"]
-        .iter()
-        .any(|d| c.find_method(name, d).is_some())
+    class_contracts::dataclass_option(c, name, "order") == Some(true)
+        || ["__lt__", "__le__", "__gt__", "__ge__"]
+            .iter()
+            .any(|d| c.find_method(name, d).is_some())
 }
 
 /// `true` when an ordering comparison (`<`, `<=`, `>`, `>=`) between `l` and
@@ -20973,12 +24158,27 @@ fn ordering_operands_compatible(c: &Checker, l: &Type, r: &Type) -> bool {
         return ms.iter().all(|m| ordering_operands_compatible(c, l, m));
     }
     let class_ok = |name: &str| -> bool {
+        if c.enums.contains_key(name)
+            && !c.class_derives_from_builtin(
+                name,
+                &[
+                    "int",
+                    "IntEnum",
+                    "enum.IntEnum",
+                    "str",
+                    "StrEnum",
+                    "enum.StrEnum",
+                ],
+            )
+            && !class_has_ordering_dunder(c, name)
+        {
+            return false;
+        }
         // Anything we cannot see completely (a venv-introspected shape,
         // an unknown base, a `__getattr__` class, an enum whose members
         // may mix in `int` / `str`) stays permissive.
         !c.class_hierarchy_fully_known(name)
             || c.class_defines_getattr(name)
-            || c.enums.contains_key(name)
             || class_has_ordering_dunder(c, name)
     };
     match (l, r) {
@@ -21125,14 +24325,18 @@ fn await_operand_is_shape_checkable(c: &Checker, operand: &Expr) -> bool {
         | Expr::ListComp(_)
         | Expr::DictComp(_)
         | Expr::SetComp(_) => true,
+        Expr::Name(_) | Expr::Attribute(_) => true,
         Expr::Call(call) => match call.func.as_ref() {
             Expr::Name(n) => {
                 let name = n.id.as_str();
+                if callables::decorated(c, name) {
+                    return false;
+                }
                 // Only this module's own declarations: an imported
                 // function's shape carries no async flag, so `await
                 // other.run()` on an `async def` imported from a sibling
                 // module must stay permissive.
-                let sync_def = c.sync_functions.contains(name) && !c.async_functions.contains(name);
+                let sync_def = callables::known_sync(c, &call.func);
                 let own_class = c.local_classes.contains(name)
                     && c.class_shapes.contains_key(name)
                     && !c.is_interface_name(name)
@@ -21161,7 +24365,8 @@ fn await_operand_is_shape_checkable(c: &Checker, operand: &Expr) -> bool {
 /// hierarchy, no `__getattr__`, and a method `name` whose signature is not
 /// `async`.
 fn class_method_is_known_sync(c: &Checker, cls: &str, name: &str) -> bool {
-    !cls.contains('.')
+    !callables::decorated(c, name)
+        && !cls.contains('.')
         && c.local_classes.contains(cls)
         && c.class_shapes.contains_key(cls)
         && c.class_hierarchy_fully_known(cls)
@@ -21282,7 +24487,10 @@ fn operator_operands_compatible(op: Operator, l: &Type, r: &Type) -> bool {
             if let (Type::Generic(ln, _), Type::Generic(rn, _)) = (l, r) {
                 // `list + list`, `tuple + tuple`, and `Counter + Counter`
                 // (multiset addition — `collections.Counter` overloads `+`).
-                if ln == rn && (ln == "list" || ln == "tuple" || ln == "Counter") {
+                if (matches!(ln.as_str(), "tuple" | "tuple_variadic")
+                    && matches!(rn.as_str(), "tuple" | "tuple_variadic"))
+                    || (ln == rn && (ln == "list" || ln == "Counter"))
+                {
                     return true;
                 }
             }
@@ -21510,11 +24718,425 @@ fn check_match_exhaustiveness(
     }
 }
 
+/// The leaf variants of a sealed union, with nested sealed aliases expanded:
+/// `type Shape = Circle | Poly`, `type Poly = Rect | Tri` → `Circle, Rect,
+/// Tri`. Only the leaves are classes a `case` can name; `Poly` itself is a
+/// `TypeAliasType` (review 2026-10-03 §3.5).
+fn flatten_sealed_variants(c: &Checker, variants: &[String]) -> Vec<String> {
+    fn walk(c: &Checker, vs: &[String], depth: usize, out: &mut Vec<String>) {
+        for v in vs {
+            match c.sealed_unions.get(v.as_str()) {
+                Some(inner) if depth < 32 && !c.class_shapes.contains_key(v.as_str()) => {
+                    walk(c, inner, depth + 1, out)
+                }
+                _ => {
+                    if !out.contains(v) {
+                        out.push(v.clone());
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(c, variants, 0, &mut out);
+    out
+}
+
+/// Whether `name` is a `type` alias rather than a class: a sealed union
+/// (local or imported) or any `type X = …` statement of this module.
+fn is_type_alias_name(c: &Checker, name: &str) -> bool {
+    (c.sealed_unions.contains_key(name) || c.pep695_aliases.contains(name))
+        && !c.class_shapes.contains_key(name)
+        && !c.enums.contains_key(name)
+}
+
+/// `Rect() | Tri()` / `(Rect, Tri)` for an alias's leaf variants, for the
+/// `alias_not_a_class` help text.
+fn alias_variant_fix(c: &Checker, alias: &str, isinstance: bool) -> String {
+    let leaves = c
+        .sealed_unions
+        .get(alias)
+        .map(|v| flatten_sealed_variants(c, v))
+        .unwrap_or_default();
+    if leaves.is_empty() {
+        return format!("use the classes `{alias}` stands for instead");
+    }
+    if isinstance {
+        format!(
+            "test its variants instead: `isinstance(x, ({}))`",
+            leaves.join(", ")
+        )
+    } else {
+        let arms: Vec<String> = leaves.iter().map(|l| format!("{l}()")).collect();
+        format!("match its variants instead: `case {}:`", arms.join(" | "))
+    }
+}
+
+/// Report a `type` alias used as a `match` class pattern, anywhere in
+/// `pattern` (review 2026-10-03 §3.5).
+fn check_alias_class_patterns(c: &mut Checker, pattern: &Pattern) {
+    match pattern {
+        Pattern::MatchClass(mc) => {
+            if let Expr::Name(n) = mc.cls.as_ref() {
+                let name = n.id.as_str();
+                if is_type_alias_name(c, name) {
+                    let fix = alias_variant_fix(c, name, false);
+                    let span = (n.range.start().to_usize(), n.range.end().to_usize());
+                    c.alias_not_a_class(name, &format!("`case {name}():`"), &fix, span);
+                }
+            }
+            for p in &mc.arguments.patterns {
+                check_alias_class_patterns(c, p);
+            }
+            for k in &mc.arguments.keywords {
+                check_alias_class_patterns(c, &k.pattern);
+            }
+        }
+        Pattern::MatchAs(a) => {
+            if let Some(inner) = &a.pattern {
+                check_alias_class_patterns(c, inner);
+            }
+        }
+        Pattern::MatchOr(o) => o
+            .patterns
+            .iter()
+            .for_each(|p| check_alias_class_patterns(c, p)),
+        Pattern::MatchSequence(s) => s
+            .patterns
+            .iter()
+            .for_each(|p| check_alias_class_patterns(c, p)),
+        Pattern::MatchMapping(m) => m
+            .patterns
+            .iter()
+            .for_each(|p| check_alias_class_patterns(c, p)),
+        Pattern::MatchStar(_) | Pattern::MatchValue(_) | Pattern::MatchSingleton(_) => {}
+    }
+}
+
+/// Report a `type` alias as `isinstance`'s second argument, alone or in a
+/// tuple (review 2026-10-03 §3.5).
+fn check_isinstance_alias(c: &mut Checker, arg: &Expr) {
+    let names: Vec<&ruff_python_ast::ExprName> = match arg {
+        Expr::Name(n) => vec![n],
+        Expr::Tuple(t) => t
+            .elts
+            .iter()
+            .filter_map(|e| match e {
+                Expr::Name(n) => Some(n),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    for n in names {
+        let name = n.id.as_str();
+        if is_type_alias_name(c, name) {
+            let fix = alias_variant_fix(c, name, true);
+            let span = (n.range.start().to_usize(), n.range.end().to_usize());
+            c.alias_not_a_class(name, &format!("`isinstance(x, {name})`"), &fix, span);
+        }
+    }
+}
+
+/// Pattern coverage of a closed type, for `match` exhaustiveness and
+/// `missing_return` (review 2026-10-03 §3.3). `Some(missing)` lists what of
+/// `ty` no pattern in `pats` matches — empty when they are exhaustive —
+/// and `None` when `ty` is not a set this check can decompose (an open
+/// `str` matched only by literals).
+///
+/// Leaf user classes stay as lenient as the sealed-union check has always
+/// been: any class pattern naming the class (or a base) covers it,
+/// whatever its sub-patterns. Only `Ok` / `Err` payloads are followed into.
+fn missing_cases(c: &Checker, pats: &[&Pattern], ty: &Type, depth: usize) -> Option<Vec<String>> {
+    fn flatten<'a>(p: &'a Pattern, out: &mut Vec<&'a Pattern>) {
+        match p {
+            Pattern::MatchAs(a) => match &a.pattern {
+                Some(inner) => flatten(inner, out),
+                None => out.push(p),
+            },
+            Pattern::MatchOr(o) => o.patterns.iter().for_each(|q| flatten(q, out)),
+            _ => out.push(p),
+        }
+    }
+    fn class_name(p: &Pattern) -> Option<&str> {
+        match p {
+            Pattern::MatchClass(mc) => match mc.cls.as_ref() {
+                Expr::Name(n) => Some(n.id.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    // `int()` / `int(x)`: a builtin class pattern with irrefutable
+    // sub-patterns matches every value of that builtin.
+    fn builtin_total(pats: &[&Pattern], builtin: &str) -> bool {
+        pats.iter().any(|p| match p {
+            Pattern::MatchClass(mc) => {
+                class_name(p) == Some(builtin)
+                    && mc.arguments.keywords.is_empty()
+                    && mc.arguments.patterns.iter().all(is_capture_or_underscore)
+            }
+            _ => false,
+        })
+    }
+    if depth > 16 {
+        return None;
+    }
+    let mut flat: Vec<&Pattern> = Vec::new();
+    for p in pats {
+        flatten(p, &mut flat);
+    }
+    if flat.iter().any(|p| is_wildcard_pattern(p)) {
+        return Some(Vec::new());
+    }
+    match ty {
+        Type::Union(xs) => {
+            let mut missing = Vec::new();
+            for x in xs {
+                missing.extend(missing_cases(c, &flat, x, depth + 1)?);
+            }
+            Some(missing)
+        }
+        Type::None => {
+            let covered = flat.iter().any(|p| {
+                matches!(p, Pattern::MatchSingleton(s) if matches!(s.value, ruff_python_ast::Singleton::None))
+            });
+            Some(if covered {
+                Vec::new()
+            } else {
+                vec!["None".to_owned()]
+            })
+        }
+        Type::Bool => {
+            if builtin_total(&flat, "bool") || builtin_total(&flat, "int") {
+                return Some(Vec::new());
+            }
+            let mut missing = Vec::new();
+            for (v, name) in [(true, "True"), (false, "False")] {
+                if !flat.iter().any(|p| pattern_bool_value(p) == Some(v)) {
+                    missing.push(name.to_owned());
+                }
+            }
+            Some(missing)
+        }
+        Type::LitStr(s) => {
+            let covered = builtin_total(&flat, "str")
+                || flat
+                    .iter()
+                    .any(|p| pattern_str_value(p).as_deref() == Some(s.as_str()));
+            Some(if covered {
+                Vec::new()
+            } else {
+                vec![format!("{s:?}")]
+            })
+        }
+        Type::Int | Type::Str | Type::Float | Type::Bytes => {
+            let name = match ty {
+                Type::Int => "int",
+                Type::Str => "str",
+                Type::Float => "float",
+                _ => "bytes",
+            };
+            builtin_total(&flat, name).then(Vec::new)
+        }
+        Type::Generic(h, args) if h == "Result" && args.len() == 2 => {
+            let mut missing = result_half(c, &flat, "Ok", &args[0], depth);
+            missing.extend(result_half(c, &flat, "Err", &args[1], depth));
+            Some(missing)
+        }
+        Type::Generic(h, args) if (h == "Ok" || h == "Err") && args.len() == 1 => {
+            Some(result_half(c, &flat, h, &args[0], depth))
+        }
+        Type::Class(name) | Type::Generic(name, _) => {
+            let name = name.as_str();
+            if let Some(members) = c.enums.get(name) {
+                let mut covered: HashSet<&str> = HashSet::new();
+                for p in &flat {
+                    let _ = enum_pattern_covered_members(p, name, &mut covered);
+                }
+                return Some(
+                    members
+                        .iter()
+                        .filter(|m| !covered.contains(m.as_str()))
+                        .map(|m| format!("{name}.{m}"))
+                        .collect(),
+                );
+            }
+            if let Some(variants) = c.sealed_unions.get(name) {
+                let leaves = flatten_sealed_variants(c, variants);
+                let user_class = |v: &String| {
+                    !is_builtin_generic_head(v)
+                        && !matches!(
+                            v.as_str(),
+                            "int" | "str" | "float" | "bool" | "bytes" | "None" | "object"
+                        )
+                };
+                if !leaves.iter().all(user_class) {
+                    return None;
+                }
+                let mut missing = Vec::new();
+                for v in &leaves {
+                    missing.extend(missing_cases(c, &flat, &Type::Class(v.clone()), depth + 1)?);
+                }
+                return Some(missing);
+            }
+            if let Some((params, rhs)) = c.type_aliases.get(name) {
+                if params.is_empty() && !matches!(rhs, Type::Unknown | Type::Any) {
+                    let rhs = rhs.clone();
+                    return missing_cases(c, &flat, &rhs, depth + 1);
+                }
+                return None;
+            }
+            if !c.class_shapes.contains_key(name) {
+                return None;
+            }
+            let covered = flat.iter().any(|p| {
+                class_name(p).is_some_and(|n| n == name || c.class_inherits_from(name, n))
+            });
+            Some(if covered {
+                Vec::new()
+            } else {
+                vec![name.to_owned()]
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The `Ok` or `Err` half of a `Result` coverage check: `[ctor]` when no
+/// arm matches that constructor at all, `ctor(<missing>)` for the parts of
+/// the payload type `inner` its arms leave out, nothing when they cover it
+/// — or when `inner` is an open type the payload patterns cannot be checked
+/// against (the arms are then trusted, as before).
+fn result_half(
+    c: &Checker,
+    flat: &[&Pattern],
+    ctor: &str,
+    inner: &Type,
+    depth: usize,
+) -> Vec<String> {
+    let field = if ctor == "Ok" { "value" } else { "error" };
+    let mut subs: Vec<&Pattern> = Vec::new();
+    let mut any = false;
+    for p in flat {
+        let Pattern::MatchClass(mc) = p else {
+            continue;
+        };
+        let Expr::Name(n) = mc.cls.as_ref() else {
+            continue;
+        };
+        if n.id.as_str() != ctor {
+            continue;
+        }
+        any = true;
+        match (
+            mc.arguments.patterns.first(),
+            mc.arguments
+                .keywords
+                .iter()
+                .find(|k| k.attr.as_str() == field),
+        ) {
+            (Some(sp), _) => subs.push(sp),
+            (None, Some(k)) => subs.push(&k.pattern),
+            // `Ok()` matches every `Ok`.
+            (None, None) => return Vec::new(),
+        }
+    }
+    if !any {
+        return vec![ctor.to_owned()];
+    }
+    match missing_cases(c, &subs, inner, depth + 1) {
+        Some(m) => m.into_iter().map(|x| format!("{ctor}({x})")).collect(),
+        None => Vec::new(),
+    }
+}
+
+/// The type a closed-subject exhaustiveness check runs against, when the
+/// subject is a closed set the sealed-union and enum checks do not see:
+/// `Result[…]`, `bool`, a string literal or literal union, or a union that
+/// includes `None` (review 2026-10-03 §3.3). A transparent alias resolves
+/// to its right-hand side.
+fn closed_match_subject(c: &Checker, t: &Type, depth: usize) -> Option<Type> {
+    if depth > 8 {
+        return None;
+    }
+    match t {
+        Type::Generic(h, _) if matches!(h.as_str(), "Result" | "Ok" | "Err") => Some(t.clone()),
+        Type::Bool | Type::LitStr(_) => Some(t.clone()),
+        Type::Union(xs) if xs.iter().any(|x| matches!(x, Type::None | Type::LitStr(_))) => {
+            Some(t.clone())
+        }
+        Type::Class(n) => match c.type_aliases.get(n.as_str()) {
+            Some((params, rhs)) if params.is_empty() => closed_match_subject(c, rhs, depth + 1),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `tyc::non_exhaustive_match` for a closed subject (see
+/// [`closed_match_subject`]): `Err(Denied)` missing from a `Result` match,
+/// `None` from a match over `int?`, `False` from a match over `bool`.
+fn check_closed_match_exhaustiveness(
+    c: &mut Checker,
+    cases: &[MatchCase],
+    subject_type: &Type,
+    subject: &Expr,
+) {
+    let Some(closed) = closed_match_subject(c, subject_type, 0) else {
+        return;
+    };
+    let pats: Vec<&Pattern> = cases
+        .iter()
+        .filter(|cs| cs.guard.is_none())
+        .map(|cs| &cs.pattern)
+        .collect();
+    if let Some(missing) = missing_cases(c, &pats, &closed, 0) {
+        if !missing.is_empty() {
+            let span = (
+                subject.range().start().to_usize(),
+                subject.range().end().to_usize(),
+            );
+            c.non_exhaustive_closed_match(&subject_type.display(), &missing.join(", "), span);
+        }
+    }
+}
+
 /// The type a class pattern narrows its match subject to inside the arm:
 /// `case Action(...)` → `Action`; `case A() | B()` → `A | B`;
 /// `case Action() as a` → `Action`. Returns `None` for patterns that
 /// don't pin down a class (wildcards, captures, literals, sequences,
 /// mappings) — the subject keeps its declared type in those arms.
+/// The type a pattern matches *every* value of, when it does: a class
+/// pattern whose sub-patterns are all bare captures / wildcards
+/// (`Fish()`, `Fish(f)`), `None`, an `as` around one, or an or-pattern of
+/// them. Used to narrow later `match` arms to what is left.
+fn irrefutable_pattern_type(pattern: &Pattern) -> Option<Type> {
+    fn is_bare(p: &Pattern) -> bool {
+        matches!(p, Pattern::MatchAs(a) if a.pattern.is_none())
+    }
+    match pattern {
+        Pattern::MatchClass(mc)
+            if mc.arguments.patterns.iter().all(is_bare)
+                && mc.arguments.keywords.iter().all(|k| is_bare(&k.pattern)) =>
+        {
+            pattern_narrowed_type(pattern)
+        }
+        Pattern::MatchSingleton(s) if matches!(s.value, ruff_python_ast::Singleton::None) => {
+            Some(Type::None)
+        }
+        Pattern::MatchAs(a) => a.pattern.as_deref().and_then(irrefutable_pattern_type),
+        Pattern::MatchOr(or) => {
+            let mut parts = Vec::with_capacity(or.patterns.len());
+            for p in &or.patterns {
+                parts.push(irrefutable_pattern_type(p)?);
+            }
+            Some(Type::union_of(parts))
+        }
+        _ => None,
+    }
+}
+
 fn pattern_narrowed_type(pattern: &Pattern) -> Option<Type> {
     match pattern {
         Pattern::MatchClass(mc) => match mc.cls.as_ref() {
@@ -21840,7 +25462,7 @@ fn check_enum_match_exhaustiveness(
         .collect();
     if !missing.is_empty() {
         let missing_str = missing.join(", ");
-        c.non_exhaustive_match(enum_name, &missing_str, subject_span);
+        c.non_exhaustive_enum_match(enum_name, &missing_str, subject_span);
     }
 }
 
@@ -22239,6 +25861,24 @@ fn collect_pattern_capture_names(p: &Pattern, out: &mut Vec<String>) {
 /// not a union of candidates — a subclass pattern over a base-typed subject —
 /// and to the subject itself when the pattern says nothing about the type.
 fn as_capture_type(c: &Checker, subject: &Type, inner: &Pattern) -> Type {
+    // `case Dog() | Cat() as an:` captures whatever any alternative matched,
+    // not the whole subject (review 2026-10-03 §4.1).
+    if let Pattern::MatchOr(or) = inner {
+        return Type::union_of(
+            or.patterns
+                .iter()
+                .map(|p| as_capture_type(c, subject, p))
+                .collect(),
+        );
+    }
+    // A sealed-union alias subject is a single `Class("Pet")` that every
+    // variant is assignable to; expand it so the variants can be filtered.
+    let expanded = expand_sealed_alias_for_narrowing(c, subject);
+    let subject = if matches!(inner, Pattern::MatchClass(_)) {
+        &expanded
+    } else {
+        subject
+    };
     let head = match inner {
         Pattern::MatchClass(mc) => match mc.cls.as_ref() {
             Expr::Name(n) => n.id.as_str().to_owned(),
@@ -24794,7 +28434,8 @@ interface Shape:
     def area(self) -> float
 
 interface Named:
-    name: str
+    @property
+    def name(self) -> str
 
 class Async:
     n: int
@@ -27730,7 +31371,7 @@ def f(b: Box) -> int:
 ";
         let d = check(src);
         assert!(
-            d.errors().iter().any(|e| matches!(
+            d.errors().iter().chain(d.warnings()).any(|e| matches!(
                 e,
                 TycError::OperatorTypeMismatch { .. } | TycError::NullableUse { .. }
             )),
@@ -27830,7 +31471,7 @@ impl Box:
         ] {
             let d = check(src);
             assert!(
-                d.errors().iter().any(|e| matches!(
+                d.errors().iter().chain(d.warnings()).any(|e| matches!(
                     e,
                     TycError::OperatorTypeMismatch { .. } | TycError::NullableUse { .. }
                 )),
@@ -30177,6 +33818,41 @@ let x: A = 1
 
     // ── blocking in async (Phase E) ─────────────────────────────────────
 
+    /// 2026-10-03 review §7.9: aliased and from-imported blocking calls.
+    #[test]
+    fn blocking_calls_through_import_aliases_warn() {
+        for (imports, call) in [
+            ("from time import sleep", "sleep(1)"),
+            ("from time import sleep as nap", "nap(1)"),
+            ("import time as t", "t.sleep(1)"),
+            ("import subprocess as sp", "sp.run([\"ls\"])"),
+            (
+                "import urllib.request",
+                "urllib.request.urlopen(\"http://x\")",
+            ),
+        ] {
+            let src = format!("{imports}\nasync def bad() -> None:\n    {call}\n    return\n");
+            let d = check(&src);
+            assert!(
+                d.warnings()
+                    .iter()
+                    .any(|w| matches!(w, TycError::BlockingInAsync { .. })),
+                "expected blocking_in_async for `{imports}` + `{call}`"
+            );
+        }
+        // A parameter shadowing the import is not the import.
+        let src = "\
+from time import sleep
+async def ok(sleep: int) -> None:
+    print(sleep)
+";
+        let d = check(src);
+        assert!(!d
+            .warnings()
+            .iter()
+            .any(|w| matches!(w, TycError::BlockingInAsync { .. })));
+    }
+
     #[test]
     fn blocking_call_in_async_def_warns() {
         let src = "\
@@ -30268,6 +33944,54 @@ async def escape_hatch() -> None:
     }
 
     // ── resource discipline (Phase C) ───────────────────────────────────
+
+    /// 2026-10-03 review §7.9: a handle stored on an object or closed in a
+    /// later `finally` is managed; one used and dropped inline is not.
+    #[test]
+    fn resource_not_managed_ownership_and_inline_uses() {
+        let warns = |src: &str| {
+            check(src)
+                .warnings()
+                .iter()
+                .filter(|w| matches!(w, TycError::ResourceNotManaged { .. }))
+                .count()
+        };
+        let managed = "\
+import contextlib
+class Log:
+    def __init__(self, path: str) -> None:
+        self.fh = open(path)
+
+def read(path: str) -> str:
+    let f = open(path)
+    try:
+        return f.read()
+    finally:
+        f.close()
+
+def many(paths: list[str]) -> None:
+    with contextlib.ExitStack() as stack:
+        for p in paths:
+            stack.enter_context(open(p))
+
+def factory(path: str) -> object:
+    return open(path)
+";
+        assert_eq!(warns(managed), 0, "managed handles must not warn");
+        let leaked = "\
+import json
+def text(path: str) -> str:
+    return open(path).read()
+
+def data(path: str) -> object:
+    return json.load(open(path))
+
+def first(path: str) -> str:
+    let line: str = open(path).readline()
+    return line
+";
+        assert_eq!(warns(leaked), 3, "inline handles must warn");
+    }
 
     #[test]
     fn bare_open_assignment_warns() {
@@ -32739,7 +36463,7 @@ class Dog:
     name: str
 
 class Person:
-    pet: Dog
+    pet: Pet
 
 let p: Owner = Person(pet=Dog(name=\"Fido\"))
 ";
@@ -32753,10 +36477,8 @@ let p: Owner = Person(pet=Dog(name=\"Fido\"))
 
     #[test]
     fn interface_field_satisfied_by_property_not_by_plain_method() {
-        // Reading `d.name` through `Named` must yield the `str` the interface
-        // promises. A `@property` does; a plain zero-argument method yields a
-        // bound method instead (so `d.name.upper()` raises AttributeError and
-        // `print(d.name)` prints `<bound method …>`), and no longer conforms.
+        // A mutable field contract requires both reads and writes. Neither a
+        // plain method nor a getter-only property supplies that contract.
         let plain = "\
 interface Named:
     name: str
@@ -32784,8 +36506,8 @@ let d: Named = Dog()
 ";
         let d = check(property);
         assert!(
-            !d.has_errors(),
-            "a @property of the right type satisfies the field; errors: {:?}",
+            d.has_errors(),
+            "a read-only property cannot satisfy a writable field; errors: {:?}",
             d.errors()
         );
     }
@@ -35223,7 +38945,7 @@ def relay(r: Response) -> None:
         let src = "\
 class Functor[F[_]]:
     def fmap[A, B](self, fa: F[A], f: B) -> F[B]:
-        return fa
+        raise NotImplementedError
 
 def main() -> None:
     let xs: list[int] = [1, 2, 3]
@@ -35246,7 +38968,7 @@ class Box[T]:
 
 class Functor[F[_]]:
     def fmap[A, B](self, fa: F[A], f: B) -> F[B]:
-        return fa
+        raise NotImplementedError
 
 def main() -> None:
     let b: Box[int] = Box(value=1)
@@ -36134,6 +39856,55 @@ class Service:
         );
     }
 
+    /// W3-03: `extend User:` of an imported class publishes its methods
+    /// under a sentinel naming the class and the module it was imported
+    /// from; a local class's `extend` still folds into the class itself.
+    #[test]
+    fn foreign_extend_blocks_publish_an_extension_sentinel() {
+        let src = "\
+from .user import User as U
+from other import Thing
+
+class Local:
+    x: int
+
+extend U:
+    def tracking_id(self) -> str:
+        return \"t\"
+
+extend Local:
+    def double(self) -> int:
+        return self.x * 2
+
+extend Unknown:
+    def nope(self) -> int:
+        return 1
+";
+        let prep = preprocess(src);
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let shapes = extract_module_shapes(&module);
+        let sentinel = extension_sentinel_name("User", ".user");
+        assert_eq!(sentinel, "__typhon_extend_User@.user");
+        assert_eq!(
+            parse_extension_sentinel(&sentinel),
+            Some(("User", 1, "user"))
+        );
+        assert_eq!(
+            parse_extension_sentinel("__typhon_extend_Thing@other"),
+            Some(("Thing", 0, "other"))
+        );
+        assert!(shapes.class_shapes[&sentinel]
+            .methods
+            .contains_key("tracking_id"));
+        assert!(shapes.class_shapes["Local"].methods.contains_key("double"));
+        assert!(!shapes
+            .class_shapes
+            .keys()
+            .any(|k| k.contains("Unknown") || k.starts_with("__typhon_impl_")));
+    }
+
     /// Cross-module newtype escape-upward. A `newtype ProjectTag = str`
     /// declared in a producer module must widen into a `str`-typed slot
     /// in a consumer module exactly as a locally-declared newtype does.
@@ -36413,6 +40184,104 @@ def label(p: Point) -> float:
                 .any(|e| e.to_string().contains("totally_bogus_attr")),
             "must still flag bogus attr on a fully-known cross-module class; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn imported_async_function_call_is_a_coroutine() {
+        let producer_prep = preprocess("pub async def make() -> str:\n    return \"ready\"\n");
+        let producer_module = tyc_syntax::parse_module(&producer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let producer_shapes = extract_module_shapes(&producer_module);
+        let make_info = producer_shapes
+            .function_arities
+            .get("make")
+            .expect("async function exported")
+            .clone();
+        assert!(make_info.is_async);
+
+        let consumer_src = "\
+from producer import make
+
+def use() -> None:
+    let value: str = make()
+";
+        let consumer_prep = preprocess(consumer_src);
+        let consumer_module = tyc_syntax::parse_module(&consumer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module(
+            "<consumer>".to_owned(),
+            &consumer_prep.python_source,
+            &consumer_module,
+        );
+        let mut external = ExternalShapes::default();
+        external
+            .function_arities
+            .insert("make".to_owned(), make_info);
+
+        let d = check_module_with_imports(
+            "<consumer>",
+            &consumer_prep.python_source,
+            &resolved,
+            &consumer_module,
+            &consumer_prep.unsafe_lines,
+            &consumer_prep.frozen_class_lines,
+            &consumer_prep.impl_distributed_lines,
+            Some(&external),
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "an imported async call must not masquerade as its declared result: {d:?}"
+        );
+    }
+
+    #[test]
+    fn module_qualified_async_function_call_is_a_coroutine() {
+        let producer_prep = preprocess("pub async def make() -> str:\n    return \"ready\"\n");
+        let producer_module = tyc_syntax::parse_module(&producer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let producer_shapes = extract_module_shapes(&producer_module);
+
+        let consumer_src = "\
+import producer
+
+def use() -> None:
+    let value: str = producer.make()
+";
+        let consumer_prep = preprocess(consumer_src);
+        let consumer_module = tyc_syntax::parse_module(&consumer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module(
+            "<consumer>".to_owned(),
+            &consumer_prep.python_source,
+            &consumer_module,
+        );
+        let mut external = ExternalShapes::default();
+        let mut by_module = HashMap::new();
+        by_module.insert("producer".to_owned(), producer_shapes);
+        external.by_module = std::sync::Arc::new(by_module);
+
+        let d = check_module_with_imports(
+            "<consumer>",
+            &consumer_prep.python_source,
+            &resolved,
+            &consumer_module,
+            &consumer_prep.unsafe_lines,
+            &consumer_prep.frozen_class_lines,
+            &consumer_prep.impl_distributed_lines,
+            Some(&external),
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "a module-qualified async call must be a coroutine: {d:?}"
         );
     }
 
@@ -37153,6 +41022,7 @@ class Foo:
 plain class Config:
     DEBUG: bool = True
     NAME: str = \"app\"
+let debug = Config.DEBUG
 ";
         let d = check_class_kinds(src);
         assert!(
@@ -37172,6 +41042,7 @@ plain class Config:
 class Config:
     DEBUG: bool = True
     NAME: str = \"app\"
+let debug = Config.DEBUG
 ";
         let d = check_class_kinds(src);
         assert!(
@@ -37773,11 +41644,10 @@ def main() -> None:
         }
 
         #[test]
-        fn await_on_a_bare_name_is_left_alone() {
-            // A name may hold a coroutine the checker typed by its result;
-            // the shape gate keeps the check to calls and literals.
+        fn await_on_a_concrete_bare_name_is_rejected() {
+            // Stored coroutines carry a wrapper; an int binding is concrete.
             let d = check("async def main() -> None:\n    let n: int = 1\n    let v: int = await n\n    print(v)\n");
-            assert!(!has_error(&d, mismatch), "{:?}", errors_of(&d));
+            assert!(has_error(&d, mismatch), "{:?}", errors_of(&d));
         }
 
         // ── §3.7 / §3.8 structural rules ─────────────────────────────────
@@ -37965,4 +41835,742 @@ def main() -> None:
             );
         }
     }
+    #[test]
+    fn w2_01_builtin_results_and_iteration_are_checked() {
+        for src in [
+            "def label(n: int) -> int:\n    return str(n)\n",
+            "def f() -> None:\n    let s: str = len([1])\n",
+            "def f() -> None:\n    for i in range(3):\n        print(i.upper())\n",
+            "def f() -> None:\n    for i, s in enumerate([1]):\n        print(s.upper())\n",
+            "def f() -> None:\n    for i, s in zip([1], [2]):\n        print(s.upper())\n",
+        ] {
+            assert!(!check(src).errors().is_empty(), "accepted: {src}");
+        }
+    }
+    #[test]
+    fn w2_01_builtin_overloads_and_shadowing_stay_valid() {
+        let src = "def len(x: int) -> str:\n    return str(x)\n\ndef f() -> None:\n    let s: str = len(1)\n    let a: int = round(1.2)\n    let b: float = round(1.2, 1)\n    let c: int = int(\"ff\", 16)\n    let d: list[int] = sorted([1, 2], key=lambda x: -x)\n    let e: int = min(1, 2)\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn w2_01_super_method_contracts() {
+        for body in ["return super().read(1)", "return super().read()"] {
+            let src = format!("class A:\n    n: int\nimpl A:\n    def read(self, n: int) -> int:\n        return n\nclass B(A):\n    n: int\nimpl B:\n    def text(self) -> str:\n        {body}\n");
+            assert!(!check(&src).errors().is_empty(), "accepted: {src}");
+        }
+    }
+    #[test]
+    fn w2_01_fresh_containers_and_dead_branch_controls() {
+        let src = "class Animal:\n    name: str\nclass Dog(Animal):\n    name: str\ndef f() -> None:\n    let dogs: list[Dog] = [Dog(name=\"x\")]\n    let animals: list[Animal] = list(dogs)\n    let xs: list[float] = [1, 2]\n    let ints: set[int] = set(xs)\n    print(float(\"1\")[:0] if False else \"skip\")\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn w2_20_contextual_receiver_query() {
+        let prep = preprocess("from typing import Callable\nlet f: Callable[[str], str] = lambda s: s.upper()\ndef g(xs: list[str]) -> str:\n    match xs:\n        case [item]:\n            return item.upper()\n        case _:\n            return \"\"\n");
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module("<test>".into(), &prep.python_source, &module);
+        let checked = check_module_with_imports_and_types(
+            "<test>",
+            &prep.python_source,
+            &resolved,
+            &module,
+            &[],
+            &[],
+            &[],
+            None,
+        );
+        for needle in ["s.upper()", "item.upper()"] {
+            let start = prep.python_source.find(needle).unwrap();
+            let name_len = needle.find('.').unwrap();
+            assert_eq!(
+                checked.type_at((start, start + name_len)),
+                Some(&Type::Str),
+                "{needle}"
+            );
+        }
+    }
+    #[test]
+    fn w2_19_narrowing_lookup_matches_the_entire_receiver_path() {
+        let source = "x.real.real\n";
+        let module = tyc_syntax::parse_module(source).unwrap().into_syntax();
+        let (resolved, _) = resolve_module("<test>".into(), source, &module);
+        let mut checker = Checker::new("<test>".into(), source, &resolved);
+        let Stmt::Expr(stmt) = &module.body[0] else {
+            panic!()
+        };
+        checker
+            .env
+            .attr_narrowings
+            .insert("x.real".into(), Type::Int);
+        assert_eq!(expression_attr_narrowing(&checker, &stmt.value), None);
+        checker
+            .env
+            .attr_narrowings
+            .insert("x.real.real".into(), Type::Float);
+        assert_eq!(
+            expression_attr_narrowing(&checker, &stmt.value),
+            Some(Type::Float)
+        );
+    }
+    #[test]
+    fn w2_03_union_member_contracts() {
+        for src in [
+            "class A:\n    value: int\nclass B:\n    value: str\ntype U = A | B\ndef f(u: U) -> int:\n    return u.value + 1\n",
+            "class A:\n    n: int\nimpl A:\n    def read(self) -> int:\n        return 1\nclass B:\n    n: int\nimpl B:\n    def read(self) -> int:\n        return 2\ntype U = A | B\ndef f(u: U) -> str:\n    return u.read()\n",
+            "class A:\n    n: int\nimpl A:\n    def read(self, x: int) -> int:\n        return x\nclass B:\n    n: int\nimpl B:\n    def read(self, x: str) -> int:\n        return 2\ntype U = A | B\ndef f(u: U) -> int:\n    return u.read(1)\n",
+            "class A:\n    n: int\nimpl A:\n    def read(self) -> int:\n        return 1\nclass B:\n    n: int\nimpl B:\n    def read(self, x: str) -> int:\n        return 2\ntype U = A | B\ndef f(u: U) -> int:\n    return u.read()\n",
+        ] { assert!(!check(src).errors().is_empty(), "accepted: {src}"); }
+    }
+    #[test]
+    #[cfg(debug_assertions)]
+    fn w2_02_unknown_counts_are_observable() {
+        let source = "def legacy(x):\n    return x\ndef f() -> int:\n    let n: int = legacy(1)\n    return legacy(2)\ndef g(value) -> None:\n    print(value.name)\n";
+        let prep = preprocess(source);
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module("<test>".into(), &prep.python_source, &module);
+        let checked = check_module_with_imports_and_types(
+            "<test>",
+            &prep.python_source,
+            &resolved,
+            &module,
+            &[],
+            &[],
+            &[],
+            None,
+        );
+        assert_eq!(
+            unchecked::counts(&module, &checked.expression_types),
+            unchecked::Counts {
+                annotated: 1,
+                returns: 1,
+                members: 1
+            }
+        );
+    }
+    #[test]
+    fn w2_04_bare_cast_type_parameter_is_refused() {
+        let d = check("from typing import Any\ndef cast[T](x: Any) -> T:\n    return __typhon_checked_cast__(x, T)\n");
+        assert!(!d.errors().is_empty(), "a bare T has no runtime check");
+    }
+    #[test]
+    fn w2_04_recursive_alias_target_remains_supported() {
+        let d = check("from typing import Any\ntype Json = int | list[Json]\ndef f(value: Any) -> Json:\n    return __typhon_checked_cast__(value, Json)\n");
+        assert!(d.errors().is_empty(), "{:?}", d.errors());
+    }
+    #[test]
+    fn w2_05_frozen_container_operations_are_checked() {
+        for src in [
+            "let NAMES: list[str] = __typhon_freeze__([\"a\"])\ndef f() -> None:\n    NAMES.append(\"b\")\n",
+            "let CONFIG: dict[str, int] = __typhon_freeze__({\"a\":1})\ndef f() -> None:\n    CONFIG[\"a\"] = 2\n",
+            "let VALUES: set[int] = __typhon_freeze__({1})\ndef f() -> None:\n    VALUES.add(2)\n",
+            "let CONFIG: dict[str, list[int]] = __typhon_freeze__({\"a\":[1]})\ndef f() -> None:\n    CONFIG[\"a\"].append(2)\n",
+        ] { assert!(!check(src).errors().is_empty(), "accepted: {src}"); }
+    }
+    #[test]
+    fn w2_05_read_views_aliases_and_caught_probe_controls() {
+        let src = "let NAMES: list[str] = __typhon_freeze__([\"a\"])\nlet CONFIG: dict[str, list[int]] = __typhon_freeze__({\"a\":[1]})\ndef f() -> None:\n    let row: list[int] = CONFIG[\"a\"]\n    let text: str = \",\".join(NAMES)\n    print(row[0], text, NAMES + (\"b\",))\n    try:\n        NAMES.append(\"b\")\n    except AttributeError:\n        pass\n    try:\n        CONFIG[\"a\"] = [2]\n    except TypeError:\n        pass\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn w2_05_wrong_handler_and_deferred_function_do_not_hide_mutation() {
+        for body in ["try:\n    NAMES.append(\"b\")\nexcept ValueError:\n    pass\n", "try:\n    def later() -> None:\n        NAMES.append(\"b\")\nexcept AttributeError:\n    pass\n"] {
+            let src=format!("let NAMES: list[str] = __typhon_freeze__([\"a\"])\n{body}");
+            assert!(!check(&src).errors().is_empty(), "{src}");
+        }
+    }
+    #[test]
+    fn deferred_lambda_body_does_not_hide_mutation() {
+        // The body runs when the lambda is called, outside the handler.
+        let src = "let NAMES: list[str] = __typhon_freeze__([\"a\"])\ntry:\n    let later = lambda: NAMES.append(\"b\")\nexcept AttributeError:\n    pass\n";
+        assert!(!check(src).errors().is_empty(), "{src}");
+        // A default runs where the lambda is created, inside the handler.
+        let src = "let NAMES: list[str] = __typhon_freeze__([\"a\"])\ntry:\n    let probe = lambda n=NAMES.append(\"b\"): n\nexcept AttributeError:\n    pass\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn w2_06_callable_shapes() {
+        for src in [
+            "from typing import Callable\ndef f(g: Callable[[int], int]) -> int:\n    return g(y=1)\n",
+            "from typing import Callable\ndef deco[**P, R](f: Callable[P, R]) -> Callable[P, R]:\n    return f\ndef add(a: int, b: int = 10) -> int:\n    return a + b\ndef f() -> int:\n    let g = deco(add)\n    return g(1, 2, 3)\n",
+
+            "def add(a: int, b: int = 10) -> int:\n    return a + b\ndef f() -> int:\n    let g = add\n    return g(1, 2, 3)\n",
+        ] { assert!(!check(src).errors().is_empty(), "accepted: {src}"); }
+        for src in [
+            "def add(a: int, b: int = 10) -> int:\n    return a + b\ndef f() -> int:\n    let g = add\n    return g(a=1)\n",
+            "from typing import Callable\nclass Pt:\n    x: int\ndef apply(factory: Callable[[int], Pt]) -> Pt:\n    return factory(1)\ndef f() -> Pt:\n    return apply(Pt)\n",
+            "from typing import Callable\ndef deco[**P, R](f: Callable[P, R]) -> Callable[P, R]:\n    return f\ndef add(a: int, b: int = 10) -> int:\n    return a + b\ndef f() -> int:\n    let g = deco(add)\n    return g(1)\n",
+            "def add(a: int) -> int:\n    return a + 1\ndef f() -> int:\n    let fs = [add, lambda a: a]\n    return fs[0](1)\n",
+        ] { assert!(check(src).errors().is_empty(), "{src}: {:?}",check(src).errors()); }
+    }
+    #[test]
+    fn a_union_of_functions_accepts_keyword_arguments() {
+        const AB: &str =
+            "def a(x: int) -> int:\n    return x\ndef b(x: int) -> str:\n    return str(x)\n";
+        for call in ["h(x=1)", "h(*(1,))", "h(**{\"x\": 1})"] {
+            let src = format!(
+                "{AB}def f(flag: bool) -> int | str:\n    let h = a if flag else b\n    return {call}\n"
+            );
+            assert!(
+                check(&src).errors().is_empty(),
+                "{src}: {:?}",
+                check(&src).errors()
+            );
+        }
+        // Too many positionals, a positional of the wrong type, and an error
+        // inside a keyword value are still reported.
+        for call in ["h(1, 2, x=3)", "h(\"s\", x=1)", "h(x=a(\"s\"))", "h(1, 2)"] {
+            let src = format!(
+                "{AB}def f(flag: bool) -> int | str:\n    let h = a if flag else b\n    return {call}\n"
+            );
+            assert!(!check(&src).errors().is_empty(), "accepted: {src}");
+        }
+    }
+    #[test]
+    fn w2_07_await_contracts() {
+        for src in [
+            "async def f(n: int) -> int:\n    return await n\n",
+            "class Box:\n    value: int\nasync def f(b: Box) -> int:\n    return await b.value\n",
+        ] {
+            assert!(!check(src).errors().is_empty(), "accepted: {src}");
+        }
+        for src in [
+            "from typing import Awaitable\nasync def fetch() -> int:\n    return 1\ndef f() -> Awaitable[int]:\n    return fetch()\n",
+            "from typing import Coroutine\nasync def fetch() -> int:\n    return 1\ndef f() -> Coroutine[None, None, int]:\n    return fetch()\n",
+            "from typing import Awaitable, Callable\ndef deco(f: Callable[[], int]) -> Callable[[], Awaitable[int]]:\n    async def wrapper() -> int:\n        return f()\n    return wrapper\n@deco\ndef fetch() -> int:\n    return 1\nasync def f() -> int:\n    return await fetch()\n",
+            "async def fetch() -> int:\n    return 1\nasync def f() -> int:\n    let stored = fetch()\n    return await stored\n",
+        ] { assert!(check(src).errors().is_empty(), "{src}: {:?}",check(src).errors()); }
+    }
+    #[test]
+    fn builtin_classes_used_as_values_are_types() {
+        // `corpus/valid/copy.ty` keys a dispatch table by builtin classes.
+        // A builtin class name is the class object, not a plain function.
+        let src = "let d: dict[type, object] = {}\nd[list] = list.copy\nd[int] = 2\nlet t: type = list\nfor k in (int, str, zip):\n    d[k] = 0\nprint(d, t, isinstance(t, type))\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+        // Builtin functions keep their contract types.
+        assert!(!check("let n: str = len\n").errors().is_empty());
+    }
+    #[test]
+    fn w2_08_power_and_augmented_assignment() {
+        for src in [
+            "let n: int = 2 ** -1\n",
+            "newtype Count = int\ndef f(n: Count) -> Count:\n    return n ** -2\n",
+            "def f() -> bool:\n    mut b: bool = True\n    b += 1\n    return b\n",
+            "def f(p: float?) -> float:\n    mut t: float = 1.0\n    t += p\n    return t\n",
+            "def f() -> int:\n    mut n: int = 2\n    n **= -1\n    return n\n",
+        ] {
+            assert!(!check(src).errors().is_empty(), "accepted: {src}");
+        }
+        let src="newtype Count = int\ndef f(n: Count) -> Count:\n    return n ** 2\ndef g(exponent: int) -> int | float:\n    return 2 ** exponent\ndef h() -> bool:\n    mut b: bool = True\n    b &= False\n    return b\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+        // An exponent of unknown sign keeps the integer type: these run
+        // correctly whenever callers pass non-negative exponents, so
+        // rejecting them would narrow correct programs.
+        let src="def power(base: int, exp: int) -> int:\n    return base ** exp\nnewtype Count = int\ndef f(n: Count, exponent: int) -> Count:\n    return n ** exponent\ndef g(exponent: int) -> int:\n    mut n: int = 2\n    n **= exponent\n    return n\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn power_sign_follows_unary_minus_over_constant_expressions() {
+        // CPython: `2 ** -(2 ** 3) == 0.00390625`, `2 ** -True == 0.5`.
+        for src in [
+            "def f() -> int:\n    return 2 ** -(2 ** 3)\n",
+            "def f() -> int:\n    return 2 ** -True\n",
+            "def f() -> int:\n    return 2 ** +-(1 ** 0)\n",
+        ] {
+            assert!(!check(src).errors().is_empty(), "accepted: {src}");
+        }
+        // `-(-3)`, `-0` and `-(0 ** 2)` are non-negative: the result is an int.
+        let src = "def f() -> int:\n    return 2 ** -(-3)\ndef g() -> int:\n    return 2 ** -(0)\ndef h() -> int:\n    return 2 ** -(0 ** 2)\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn w2_09_ordering_and_membership() {
+        for src in [
+            "enum Color:\n    RED\n    GREEN\ndef f() -> bool:\n    return Color.RED < Color.GREEN\n",
+            "def f() -> bool:\n    return 1 in \"abc\"\n",
+        ] { assert!(!check(src).errors().is_empty(), "accepted: {src}"); }
+        let src="from dataclasses import dataclass\n@dataclass(order=True)\nclass Point:\n    x: int\ndef f() -> bool:\n    return Point(1) < Point(2)\ndef g() -> bool:\n    return \"a\" in \"abc\"\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn w2_09_caught_enum_order_and_mixed_key_controls() {
+        let src="import enum\nclass IntE(enum.IntEnum):\n    ONE = 1\nclass StrE(enum.StrEnum):\n    X = \"x\"\nenum Plain:\n    A\n    B\ndef f() -> None:\n    print({IntE.ONE: 1}[1], {StrE.X: 1}[\"x\"])\n    try:\n        print(Plain.A < Plain.B)\n    except TypeError:\n        pass\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn w2_10_expression_binding_contracts() {
+        for src in [
+            "from typhon_runtime import try_result\ndef f(s: str) -> Result[int, str]:\n    return try_result(lambda: int(s), lambda e: e)\n",
+            "async def fetch() -> int:\n    return 1\nasync def f() -> str:\n    gather:\n        a = fetch()\n    return a\n",
+            "async def fetch() -> int:\n    return 1\nasync def f() -> str:\n    go fetch() -> task\n    return task.result()\n",
+            "async def fetch() -> int:\n    return 1\nasync def f() -> int:\n    gather(strategy=\"best-effort\"):\n        a = fetch()\n    return a\n",
+            "def parse() -> Result[int, str]:\n    return Ok(3)\ndef f() -> Result[str, str]:\n    return parse().map(lambda n: n + 1)\n",
+            "def parse() -> Result[int, str]:\n    return Ok(3)\ndef f() -> Result[int, str]:\n    return parse().map_err(lambda e: len(e))\n",
+            "def parse() -> Result[int, str]:\n    return Ok(3)\ndef f() -> Result[str, str]:\n    return parse().and_then(lambda n: Ok(n + 1))\n",
+        ] { assert!(!check_full(src).errors().is_empty(), "accepted: {src}"); }
+        for src in [
+            "async def fetch() -> int:\n    return 1\nasync def f() -> int:\n    gather:\n        a = fetch()\n    go fetch() -> task\n    return a + task.result()\n",
+            "async def fetch() -> int:\n    return 1\nasync def f() -> int | Exception:\n    gather(strategy=\"best-effort\"):\n        a = fetch()\n    return a\n",
+            "def parse() -> Result[int, str]:\n    return Ok(3)\ndef f() -> Result[str, str]:\n    return parse().map(lambda n: str(n))\n",
+        ] { assert!(check_full(src).errors().is_empty(), "{src}: {:?}",check_full(src).errors()); }
+    }
+    #[test]
+    fn w2_10_task_and_combinator_chain_controls() {
+        let src="class Box[T]:\n    value: T\nimpl[T] Box[T]:\n    async def get(self) -> T:\n        return self.value\nasync def f(box: Box[int]) -> int:\n    go box.get() -> task\n    return await task\ndef parse() -> Result[int, str]:\n    return Ok(3)\ndef g() -> Result[str, str]:\n    return parse().map(lambda n: n + 1).map(lambda n: str(n))\n";
+        assert!(
+            check_full(src).errors().is_empty(),
+            "{:?}",
+            check_full(src).errors()
+        );
+        let src="def parse() -> Result[int, str]:\n    return Ok(3)\ndef g() -> Result[str, str]:\n    return parse().map(lambda n: n + 1).map(lambda n: n + 1)\n";
+        assert!(!check_full(src).errors().is_empty());
+    }
+    #[test]
+    fn w2_10_task_contracts_walk_their_arguments() {
+        // `TaskGroup()` takes no arguments (CPython raises `TypeError`), and
+        // the expressions passed to the task contracts are still checked.
+        for src in [
+            "async def f() -> None:\n    async with asyncio.TaskGroup(1) as tg:\n        pass\n",
+            "async def f() -> None:\n    async with asyncio.TaskGroup(limit=1) as tg:\n        pass\n",
+        ] {
+            let d = check_full(src);
+            assert!(
+                d.errors().iter().any(|e| matches!(e, TycError::WrongArgCount { .. })),
+                "accepted: {src}"
+            );
+        }
+        for src in [
+            "def g(x: int) -> int:\n    return x\nasync def f() -> None:\n    async with asyncio.TaskGroup(g(\"s\")) as tg:\n        pass\n",
+            "def g(x: int) -> str:\n    return str(x)\nasync def work() -> int:\n    return 1\nasync def f() -> int:\n    let t = asyncio.create_task(work(), name=g(\"s\"))\n    return await t\n",
+        ] {
+            let d = check_full(src);
+            assert!(
+                d.errors().iter().any(|e| matches!(e, TycError::TypeMismatch { .. })),
+                "argument not checked: {src}: {:?}",
+                d.errors()
+            );
+        }
+        for src in [
+            "async def f() -> None:\n    async with asyncio.TaskGroup(*()) as tg:\n        pass\n",
+            "async def work() -> int:\n    return 1\nasync def f() -> int:\n    let t = asyncio.create_task(work(), name=\"w\")\n    return await t\n",
+        ] { assert!(check_full(src).errors().is_empty(), "{src}: {:?}", check_full(src).errors()); }
+    }
+    #[test]
+    fn create_task_accepts_the_coroutine_by_keyword() {
+        // `create_task(coro, *, name=None, context=None)`: CPython accepts
+        // `coro=` by keyword, and a `*`/`**` unpacking can supply it.
+        for src in [
+            "async def work() -> int:\n    return 1\nasync def f() -> int:\n    let t = asyncio.create_task(coro=work())\n    return await t\n",
+            "async def work() -> int:\n    return 1\nasync def f() -> None:\n    async with asyncio.TaskGroup() as tg:\n        let t = tg.create_task(coro=work(), name=\"w\")\n    let n: int = t.result()\n",
+            "async def work() -> int:\n    return 1\nasync def f() -> None:\n    let t = asyncio.create_task(*(work(),))\n    await t\n",
+        ] { assert!(check_full(src).errors().is_empty(), "{src}: {:?}", check_full(src).errors()); }
+        for src in [
+            "async def work() -> int:\n    return 1\nasync def f() -> str:\n    let t = asyncio.create_task(coro=work())\n    return await t\n",
+            "async def work() -> int:\n    return 1\nasync def f() -> None:\n    let t = asyncio.create_task(work(), coro=work())\n    await t\n",
+            "async def f() -> None:\n    let t = asyncio.create_task(name=\"w\")\n    await t\n",
+        ] { assert!(!check_full(src).errors().is_empty(), "accepted: {src}"); }
+    }
+    #[test]
+    fn w2_11_go_requires_a_coroutine() {
+        let src = "def work() -> int:\n    return 1\nasync def f() -> None:\n    go work()\n";
+        assert!(!check_full(src).errors().is_empty(), "accepted: {src}");
+        let src="async def work() -> int:\n    return 1\nasync def f() -> int:\n    go work() -> task\n    return await task\n";
+        assert!(
+            check_full(src).errors().is_empty(),
+            "{:?}",
+            check_full(src).errors()
+        );
+    }
+    #[test]
+    fn w2_12_nested_type_parameters_are_rigid() {
+        for src in [
+            "def wrap[T](x: T) -> list[T]:\n    return [1]\n",
+            "def opt[T](x: T) -> T?:\n    return 0\n",
+            "def swap[A, B](p: tuple[A, B]) -> tuple[B, A]:\n    return p\n",
+            "from typing import Callable\ndef mapl[A, B](f: Callable[[A], B], xs: list[A]) -> list[B]:\n    return xs\n",
+            "class Container[F[_]]:\n    def wrong[A, B](self, xs: F[A]) -> F[B]:\n        return xs\n",
+        ] { assert!(!check_full(src).errors().is_empty(), "accepted: {src}"); }
+        for src in [
+            "def wrap[T](x: T) -> list[T]:\n    return [x]\n",
+            "def opt[T](x: T) -> T?:\n    return None\n",
+            "def swap[A, B](p: tuple[A, B]) -> tuple[B, A]:\n    return (p[1], p[0])\n",
+            "from typing import Callable\ndef mapl[A, B](f: Callable[[A], B], xs: list[A]) -> list[B]:\n    return [f(x) for x in xs]\n",
+            "class Container[F[_]]:\n    def same[A](self, xs: F[A]) -> F[A]:\n        return xs\n",
+        ] { assert!(check_full(src).errors().is_empty(), "{src}: {:?}",check_full(src).errors()); }
+    }
+    #[test]
+    fn w2_13_newtype_method_results_and_mixing() {
+        for src in [
+            "newtype Email = str\ndef send(e: Email) -> None:\n    pass\ndef f(e: Email) -> None:\n    send(e.lower())\n",
+            "newtype Email = str\nnewtype Name = str\ndef f(e: Email, n: Name) -> str:\n    return e + n\n",
+            "newtype Email = str\ndef f(e: Email) -> list[int]:\n    return e.split(\"@\")\n",
+        ] { assert!(!check(src).errors().is_empty(), "accepted: {src}"); }
+        let src="newtype Email = str\ndef f(e: Email) -> list[str]:\n    return e.split(\"@\")\ndef g(e: Email) -> str:\n    return e.lower()\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn w2_14_container_mutation_contracts() {
+        for src in [
+            "def f(g: dict[str, int]) -> None:\n    g[7] = 8\n",
+            "def f(xs: list[int]) -> None:\n    xs[\"k\"] = 1\n",
+            "def f(g: dict[str, int]) -> None:\n    g.update({3: 4})\n",
+            "def f(g: dict[str, int]) -> None:\n    g.update({\"k\": \"bad\"})\n",
+        ] {
+            assert!(!check(src).errors().is_empty(), "accepted: {src}");
+        }
+        let src="def f(g: dict[str, int], xs: list[int]) -> None:\n    g[\"k\"] = 8\n    xs[0] = 1\n    xs[:] = [1, 2]\n    g.update({\"ok\": 1})\n    g.update(ok=1)\n    g.update([(\"ok\", 1)])\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn w2_15_mutable_interface_contracts() {
+        for src in [
+            "class Animal:\n    tag: str\nclass Dog(Animal):\n    breed: str\ninterface Owner:\n    pet: Animal\nclass Kennel:\n    pet: Dog\ndef f(k: Kennel) -> Owner:\n    return k\n",
+            "interface Owner:\n    pet: int\nclass Kennel frozen:\n    pet: int\ndef f(k: Kennel) -> Owner:\n    return k\n",
+            "interface Owner:\n    pet: int\nclass Kennel:\n    value: int\nimpl Kennel:\n    @property\n    def pet(self) -> int:\n        return self.value\ndef f(k: Kennel) -> Owner:\n    return k\n",
+            "interface Sized:\n    def size(self, item: str) -> int: ...\nclass Bag:\n    value: int\nimpl Bag:\n    def size(self, thing: str) -> int:\n        return len(thing)\ndef f(b: Bag) -> Sized:\n    return b\n",
+        ] { assert!(!check(src).errors().is_empty(), "accepted: {src}"); }
+        let src="interface Sized:\n    def size(self, item: str) -> int: ...\nclass Bag:\n    value: int\nimpl Bag:\n    def size(self, item: str, suffix: str = \"\") -> int:\n        return len(item + suffix)\ndef f(b: Bag) -> Sized:\n    return b\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+
+    #[test]
+    fn w2_15_writable_property_and_readonly_interface_controls() {
+        let src="interface Owner:\n    pet: int\nclass Kennel:\n    value: int\nimpl Kennel:\n    @property\n    def pet(self) -> int:\n        return self.value\n    @pet.setter\n    def pet(self, value: int) -> None:\n        self.value = value\ndef f(k: Kennel) -> Owner:\n    return k\ninterface Readonly:\n    @property\n    def value(self) -> int: ...\ndef g(k: Kennel) -> Readonly:\n    return k\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn w2_16_attribute_write_contracts() {
+        for src in [
+            "class Temperature:\n    value: float\nimpl Temperature:\n    @property\n    def celsius(self) -> float:\n        return self.value\ndef f(t: Temperature) -> None:\n    t.celsius = 5.0\n",
+            "from typing import ClassVar\nclass Counter:\n    count: ClassVar[int] = 0\ndef f(c: Counter) -> None:\n    c.count = 5\n",
+        ] { assert!(!check_class_kinds(src).errors().is_empty(), "accepted: {src}"); }
+        for src in [
+            "from dataclasses import dataclass\n@dataclass\nclass Counter:\n    value: int\nimpl Counter:\n    def f(self) -> None:\n        self.cache = 5\n",
+            "from dataclasses import dataclass\n@dataclass(slots=False)\nclass Counter:\n    value: int\nimpl Counter:\n    def f(self) -> None:\n        self.cache = 5\n",
+            "plain class Base:\n    value: int\nclass Child(Base):\n    other: int\nimpl Child:\n    def f(self) -> None:\n        self.cache = 5\n",
+            "from typing import ClassVar\nclass Counter:\n    count: ClassVar[int] = 0\ndef f() -> None:\n    Counter.count = 5\n",
+            "class Temperature:\n    value: float\nimpl Temperature:\n    @property\n    def celsius(self) -> float:\n        return self.value\n    @celsius.setter\n    def celsius(self, value: float) -> None:\n        self.value = value\ndef f(t: Temperature) -> float:\n    t.celsius = 5.0\n    return t.celsius\n",
+        ] { assert!(check_class_kinds(src).errors().is_empty(), "{src}: {:?}",check_class_kinds(src).errors()); }
+    }
+    #[test]
+    fn w2_16_cached_property_assignment_is_not_readonly() {
+        let src="from dataclasses import dataclass\nfrom functools import cached_property\n@dataclass\nclass Box:\n    value: int\n    @cached_property\n    def cached(self) -> int:\n        return self.value\ndef f(box: Box) -> int:\n    box.cached = 5\n    return box.cached\n";
+        assert!(
+            check_class_kinds(src).errors().is_empty(),
+            "{:?}",
+            check_class_kinds(src).errors()
+        );
+    }
+    #[test]
+    fn w2_17_builtin_false_positive_controls() {
+        for src in [
+            "def f(xs: list[int]) -> list[int]:\n    xs[slice(0, 1)] = [2]\n    return xs[slice(0, 2)]\n",
+            "from enum import Enum\nclass Choice(str, Enum):\n    A = \"a\"\ndef f() -> Choice:\n    return Choice(\"a\")\n",
+            "def f(n: int) -> bool:\n    return n.is_integer()\n",
+            "def f(v: int?) -> bool:\n    return isinstance(v, int | None)\n",
+            "from enum import IntEnum\nclass Choice(IntEnum):\n    A = 2\ndef f() -> Choice:\n    return Choice(2)\n",
+            "plain class Count(int):\n    pass\ndef f() -> Count:\n    return Count(2)\n",
+            "class Bag:\n    tag: int\nimpl Bag:\n    def add(self, item: str, /, **meta: int) -> None:\n        pass\ndef f(b: Bag) -> None:\n    b.add(\"a\", item=3)\n",
+        ] { assert!(check_full(src).errors().is_empty(), "{src}: {:?}", check_full(src).errors()); }
+    }
+    #[test]
+    fn w2_17_len_has_one_nullable_diagnostic() {
+        let d = check_full("def f(v: str?) -> int:\n    return len(v)\n");
+        assert_eq!(d.errors().len(), 1, "{:?}", d.errors());
+    }
+    #[test]
+    fn w2_18_class_lint_requires_descriptor_use() {
+        for src in [
+            "class Conn:\n    name: str? = None\ndef f() -> Conn:\n    return Conn()\n",
+            "class Conn:\n    name: str? = None\ndef f(Conn: Conn) -> str?:\n    return Conn.name\n",
+        ] { assert!(!check_class_kinds(src).warnings().iter().any(|e| matches!(e,TycError::ClassAttrShadowsSlot{..})), "{src}: {:?}",check_class_kinds(src).warnings()); }
+        let d = check_class_kinds("class Conn:\n    name: str? = None\nlet n = Conn.name\n");
+        assert!(
+            d.warnings()
+                .iter()
+                .any(|e| matches!(e, TycError::ClassAttrShadowsSlot { .. })),
+            "{:?}",
+            d.warnings()
+        );
+        assert!(!d
+            .warnings()
+            .iter()
+            .any(|e| e.to_string().contains("its literal value")));
+    }
+    #[test]
+    fn w2_18_result_error_wording() {
+        let d = check("def f() -> Result[int, str]:\n    return Err(5)\n");
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ResultErrorMismatch { .. })),
+            "{:?}",
+            d.errors()
+        );
+        assert!(!d
+            .errors()
+            .iter()
+            .any(|e| e.to_string().contains("`?` propagates")));
+    }
+    #[test]
+    fn w2_06_preserve_callable_alias_provenance() {
+        for src in [
+            "from typing import Callable\ndef deco[**P, R](f: Callable[P, R]) -> Callable[P, R]:\n    return f\ndef add(a: int, b: int = 10) -> int:\n    return a+b\ndef f() -> int:\n    let g=deco(add)\n    return g(a=1)\n",
+            "from typing import Callable\nclass Pt:\n    x: int\ndef apply(factory: Callable[[int], Pt]) -> Pt:\n    return factory(1)\ndef f() -> Pt:\n    let factory=Pt\n    return apply(factory)\n",
+        ] {assert!(check(src).errors().is_empty(),"{src}: {:?}",check(src).errors());}
+    }
+    #[test]
+    fn w2_11_sync_aliases_and_callable_contracts() {
+        for src in [
+            "def work() -> int:\n    return 1\nasync def f() -> None:\n    let g=work\n    go g()\n",
+            "from typing import Callable\nasync def f(g: Callable[[], int]) -> None:\n    go g()\n",
+        ] {assert!(!check_full(src).errors().is_empty(),"accepted: {src}");}
+        let src="async def work() -> int:\n    return 1\nasync def f() -> None:\n    let g=work\n    go g()\n";
+        assert!(
+            check_full(src).errors().is_empty(),
+            "{:?}",
+            check_full(src).errors()
+        );
+    }
+    #[test]
+    fn lambda_body_without_a_callable_contract_is_checked() {
+        for src in [
+            "def find() -> str?:\n    return None\ndef main() -> None:\n    let v: str? = find()\n    let g = lambda: v.upper()\n    print(g)\n",
+            "def find() -> str?:\n    return None\ndef main() -> None:\n    let v: str? = find()\n    print(list(map(lambda x: x + len(v), [1])))\n",
+            "def main() -> None:\n    let n: int = 1\n    let g = lambda: n.upper()\n    print(g)\n",
+            // A captured name reassigned after the lambda loses its narrowing.
+            "def find() -> str?:\n    return None\ndef main() -> None:\n    mut v: str? = find()\n    if v is not None:\n        let g = lambda: v.upper()\n        v = None\n        print(g())\n",
+        ] {
+            assert!(!check(src).errors().is_empty(), "accepted: {src}");
+        }
+    }
+    #[test]
+    fn lambda_body_without_a_contract_keeps_its_parameters_unknown() {
+        for src in [
+            // Parameters are `Unknown` and shadow outer names of the same
+            // spelling.
+            "def find() -> str?:\n    return None\ndef main() -> None:\n    let v: str? = find()\n    let g = lambda v, *a, k=1, **kw: v.upper() + a.whatever + kw.other(k)\n    print(g, v)\n",
+            // A narrowing that still holds when the body runs is kept.
+            "def find() -> str?:\n    return None\ndef main() -> None:\n    let v: str? = find()\n    if v is not None:\n        let g = lambda: v.upper()\n        print(g())\n",
+            "def main() -> None:\n    let xs: list[str] = [\"b\", \"a\"]\n    print(sorted(xs, key=lambda s: s.lower()), (lambda: [y for y in xs])())\n",
+            // Defaults are evaluated where the lambda is written.
+            "def find() -> str?:\n    return None\ndef main() -> None:\n    let v: str? = find()\n    if v is not None:\n        let g = lambda w=v.upper(): w\n        print(g())\n",
+        ] {
+            let d = check(src);
+            assert!(d.errors().is_empty(), "{src}: {:?}", d.errors());
+        }
+    }
+    #[test]
+    fn yielded_values_are_checked_against_the_element_type() {
+        let pre = "from typing import Iterator, Generator, AsyncIterator, Iterable\ndef maybe() -> int?:\n    return None\n";
+        for body in [
+            "def gen() -> Iterator[int]:\n    let m: int? = maybe()\n    yield m\n",
+            "def gen() -> Iterator[int]:\n    yield \"s\"\n",
+            "def gen() -> Iterable[int]:\n    yield 1.5\n",
+            "def gen() -> Generator[int, None, str]:\n    yield \"s\"\n    return \"done\"\n",
+            "async def gen() -> AsyncIterator[str]:\n    yield 1\n",
+            "def gen() -> Iterator[int]:\n    yield\n",
+            "def gen() -> Iterator[list[int]]:\n    yield [\"a\"]\n",
+        ] {
+            let src = format!("{pre}{body}");
+            assert!(
+                check(&src)
+                    .errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+                "accepted: {src}"
+            );
+        }
+    }
+    #[test]
+    fn yields_of_the_element_type_are_accepted() {
+        let pre = "from typing import Iterator, Generator, AsyncIterator\nfrom contextlib import contextmanager\ndef maybe() -> int?:\n    return None\n";
+        for body in [
+            "def gen() -> Iterator[int?]:\n    yield maybe()\n    yield 1\n    yield None\n",
+            "def gen() -> Iterator[float]:\n    yield 1\n    yield 2.5\n",
+            "def gen() -> Iterator[list[int]]:\n    yield []\n",
+            "@contextmanager\ndef ctx() -> Iterator[None]:\n    yield\n",
+            "def gen() -> Generator[int, str, None]:\n    let got = yield 1\n    print(got)\n",
+            "def gen() -> Iterator:\n    yield \"anything\"\n",
+            "def gen() -> Iterator[int]:\n    yield from [1, 2]\n    def inner() -> Iterator[str]:\n        yield \"s\"\n    for s in inner():\n        yield len(s)\n",
+            "async def gen() -> AsyncIterator[int]:\n    yield 1\n",
+            "def gen() -> Iterator[int]:\n    let m: int? = maybe()\n    if m is not None:\n        yield m\n",
+        ] {
+            let src = format!("{pre}{body}");
+            let d = check(&src);
+            assert!(d.errors().is_empty(), "{src}: {:?}", d.errors());
+        }
+    }
+    fn union_attr_errors(src: &str) -> Vec<String> {
+        check(src)
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::AttributeNotFound { .. }))
+            .map(ToString::to_string)
+            .collect()
+    }
+    #[test]
+    fn union_member_missing_on_a_builtin_exception_subclass_is_rejected() {
+        let pre = "class A(Exception):\n    code: int\nclass B(Exception):\n    pass\nclass C(ValueError):\n    pass\nclass D(C):\n    pass\n";
+        for body in [
+            "def main() -> None:\n    try:\n        raise B()\n    except (A, B) as e:\n        print(e.code)\n",
+            "type E = A | C\ndef f(e: E) -> int:\n    return e.code\n",
+            "def f(e: A | D) -> int:\n    return e.code\n",
+        ] {
+            let src = format!("{pre}{body}");
+            let errs = union_attr_errors(&src);
+            assert_eq!(errs.len(), 1, "{src}: {errs:?}");
+        }
+    }
+    #[test]
+    fn union_member_supplied_by_the_base_or_written_dynamically_is_accepted() {
+        let pre = "class A(Exception):\n    code: int\n";
+        for body in [
+            // `SystemExit` has `code`; `OSError` has `errno`; every
+            // exception has `args`.
+            "class B(SystemExit):\n    pass\ndef f(e: A | B) -> None:\n    print(e.code, e.args)\n",
+            "class B(OSError):\n    pass\nclass C(OSError):\n    pass\ndef f(e: B | C) -> None:\n    print(e.errno, e.filename)\n",
+            // `B` declares it as a method.
+            "class B(Exception):\n    pass\nimpl B:\n    def code(self) -> int:\n        return 1\ndef f(e: A | B) -> None:\n    print(e.code)\n",
+            // An instance attribute written outside the class.
+            "class B(Exception):\n    pass\ndef make() -> B:\n    let err = B()\n    err.code = 404\n    return err\ndef f(e: A | B) -> None:\n    print(e.code)\n",
+            "class B(Exception):\n    pass\ndef make() -> B:\n    let err = B()\n    setattr(err, \"code\", 404)\n    return err\ndef f(e: A | B) -> None:\n    print(e.code)\n",
+            // A base the checker cannot see may supply anything.
+            "from somewhere import Base\nclass B(Base):\n    pass\ndef f(e: A | B) -> None:\n    print(e.code)\n",
+        ] {
+            let src = format!("{pre}{body}");
+            let errs = union_attr_errors(&src);
+            assert!(errs.is_empty(), "{src}: {errs:?}");
+        }
+    }
+    #[test]
+    fn caught_frozen_mutations_name_the_type_and_keep_their_location() {
+        let src = "let NAMES: list[str] = __typhon_freeze__([\"a\"])\nlet CONFIG: dict[str, int] = __typhon_freeze__({\"a\": 1})\ndef f() -> None:\n    try:\n        NAMES.append(\"b\")\n    except AttributeError:\n        pass\n    try:\n        CONFIG[\"a\"] = 2\n    except TypeError:\n        pass\n";
+        let d = check(src);
+        assert!(d.errors().is_empty(), "{:?}", d.errors());
+        let msgs: Vec<String> = d.warnings().iter().map(ToString::to_string).collect();
+        assert!(
+            msgs.iter()
+                .any(|m| m == "attribute `append` is not defined on `tuple[str, ...]`"),
+            "{msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("tuple_variadic")),
+            "{msgs:?}"
+        );
+        let item = d
+            .warnings()
+            .iter()
+            .find(|w| w.to_string().contains("does not support item assignment"))
+            .expect("item-assignment warning");
+        assert!(item.clone().source_and_span_mut().is_some(), "{item:?}");
+    }
+    #[test]
+    fn go_on_a_synchronous_call_says_it_needs_a_coroutine() {
+        let d = check_full(
+            "def work(n: int) -> int:\n    return n\nasync def f() -> None:\n    go work(1)\n",
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| e.to_string() == "`go` needs a coroutine, but `work(1)` returns `int`"),
+            "{:?}",
+            d.errors()
+        );
+    }
+    fn nullable_helps(d: &Diagnostics) -> Vec<String> {
+        d.errors()
+            .iter()
+            .chain(d.warnings())
+            .filter(|e| matches!(e, TycError::NullableUse { .. }))
+            .map(|e| e.help_text().unwrap())
+            .collect()
+    }
+    #[test]
+    fn nullable_use_help_names_an_existing_guard_it_could_not_use() {
+        // The guard is right there, but `reset(b)` may rebind `b.conn`:
+        // "add a guard" would be wrong advice.
+        let src = "class Conn:\n    n: int\nclass Box:\n    conn: Conn?\ndef reset(b: Box) -> None:\n    b.conn = None\ndef f(b: Box) -> int:\n    if b.conn is None:\n        return 0\n    reset(b)\n    return b.conn.n\n";
+        let helps = nullable_helps(&check(src));
+        assert_eq!(helps.len(), 1, "{helps:?}");
+        assert!(
+            helps[0].contains("already checked above (`if b.conn is None:`)"),
+            "{}",
+            helps[0]
+        );
+        assert!(helps[0].contains("let conn = b.conn"), "{}", helps[0]);
+        // A local reassigned after its guard.
+        let src = "def find() -> str?:\n    return None\ndef f() -> int:\n    mut v: str? = find()\n    if v is None:\n        return 0\n    v = find()\n    return len(v)\n";
+        let helps = nullable_helps(&check(src));
+        assert_eq!(helps.len(), 1, "{helps:?}");
+        assert!(
+            helps[0].contains("already checked above (`if v is None:`)"),
+            "{}",
+            helps[0]
+        );
+        assert!(helps[0].contains("reassigned"), "{}", helps[0]);
+    }
+    #[test]
+    fn nullable_use_help_without_a_guard_still_suggests_one() {
+        for src in [
+            "def find() -> str?:\n    return None\ndef f() -> int:\n    let v: str? = find()\n    return len(v)\n",
+            // A check on a longer path, or in another function, is not a
+            // check on this value.
+            "class Conn:\n    n: int?\nclass Box:\n    conn: Conn?\ndef g(b: Box) -> bool:\n    return b.conn is None\ndef f(b: Box) -> int:\n    if b.conn.n is None:\n        return 0\n    return 1\n",
+        ] {
+            let helps = nullable_helps(&check(src));
+            assert!(!helps.is_empty(), "{src}");
+            assert!(
+                helps.iter().all(|h| h.starts_with("guard the value with")),
+                "{helps:?}"
+            );
+        }
+    }
+    #[test]
+    fn closed_subject_match_is_not_called_a_sealed_union() {
+        let d = check("def f(b: bool) -> int:\n    match b:\n        case True:\n            return 1\n    return 0\n");
+        let msgs: Vec<String> = d
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::NonExhaustiveMatch { .. }))
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            msgs,
+            vec!["non-exhaustive `match` on `bool`: missing case(s) False".to_owned()]
+        );
+        let d = check("class A:\n    n: int\nclass B:\n    n: int\ntype U = A | B\ndef f(u: U) -> int:\n    match u:\n        case A():\n            return 1\n    return 0\n");
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| e.to_string().contains("on sealed union `U`")),
+            "{:?}",
+            d.errors()
+        );
+    }
+    #[test]
+    fn unsafe_value_leak_help_recommends_a_checked_cast() {
+        let src = "import json\ndef f(raw: str) -> str:\n    unsafe:\n        let data = json.loads(raw)\n    return data[\"name\"]\n";
+        let prep = preprocess(src);
+        let d = check(src);
+        let helps: Vec<String> = d
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::UnsafeValueLeak { .. }))
+            .map(|e| e.help_text().unwrap())
+            .collect();
+        assert_eq!(helps.len(), 1, "{:?} / {}", d.errors(), prep.python_source);
+        assert!(
+            helps[0].contains("`data[\"name\"] as! str`"),
+            "{}",
+            helps[0]
+        );
+        assert!(!helps[0].contains("let typed"), "{}", helps[0]);
+    }
 }
+
+#[cfg(test)]
+mod flow_tests;

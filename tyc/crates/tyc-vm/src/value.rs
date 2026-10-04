@@ -29,10 +29,22 @@ use crate::error::{type_error, value_error, Unwind};
 /// without bound and overflow the native stack, aborting the process. The
 /// bound is far deeper than any realistic data structure but shallow enough to
 /// stay well within the VM's worker stack.
-const MAX_STRUCTURAL_DEPTH: usize = 10_000;
+/// It is CPython 3.13's: comparing two lists nested 10,000 deep raises
+/// `RecursionError` there (see `Interpreter::eq_values`).
+const MAX_STRUCTURAL_DEPTH: usize = 9_999;
 
 thread_local! {
     static STRUCTURAL_DEPTH: Cell<usize> = const { Cell::new(0) };
+    /// Set when a structural walk hit the depth bound, so a caller that can
+    /// raise (an ordering comparison) reports CPython's `RecursionError`
+    /// instead of the "not supported" a bare `None` would suggest.
+    static STRUCTURAL_OVERFLOW: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether a structural walk hit the depth bound since the last call
+/// (clearing the flag).
+pub(crate) fn take_structural_overflow() -> bool {
+    STRUCTURAL_OVERFLOW.with(|f| f.replace(false))
 }
 
 /// RAII guard that decrements the structural-recursion depth on drop. Using a
@@ -57,6 +69,7 @@ pub(crate) fn structural_depth_enter() -> Option<StructuralDepthGuard> {
     STRUCTURAL_DEPTH.with(|d| {
         let cur = d.get();
         if cur >= MAX_STRUCTURAL_DEPTH {
+            STRUCTURAL_OVERFLOW.with(|f| f.set(true));
             None
         } else {
             d.set(cur + 1);
@@ -69,14 +82,87 @@ use ruff_python_ast::{Parameters, Stmt};
 /// Reference-counted, interior-mutable list. Cloning a `Value::List` aliases
 /// the same storage.
 pub type RcList = Rc<RefCell<Vec<Value>>>;
-/// Dicts use `IndexMap` so insertion order is preserved on iteration —
-/// matching CPython 3.7+ semantics (FINDINGS #18). Previously a `HashMap`
-/// gave non-deterministic iteration order, which made `tyc run` and
-/// `tyc build && python build/main.py` produce different stdout for any
-/// program that prints a dict literal.
-pub type DictMap = IndexMap<HashKey, Value>;
-pub type RcDict = Rc<RefCell<DictMap>>;
-pub type RcSet = Rc<RefCell<std::collections::HashSet<HashKey>>>;
+/// Dicts preserve insertion order on iteration — matching CPython 3.7+
+/// semantics (FINDINGS #18) — and delete in O(1); see `pydict`.
+pub type DictMap = crate::pydict::PyDict;
+/// Container storage with metadata outside the user-visible contents.
+/// Clones of a Value share this flag along with the underlying storage.
+#[derive(Debug)]
+pub struct FrozenCell<T> {
+    values: RefCell<T>,
+    pub frozen: std::cell::Cell<bool>,
+}
+impl<T> FrozenCell<T> {
+    pub fn new(values: T) -> Self {
+        Self {
+            values: RefCell::new(values),
+            frozen: std::cell::Cell::new(false),
+        }
+    }
+    pub fn frozen(values: T) -> Self {
+        Self {
+            values: RefCell::new(values),
+            frozen: std::cell::Cell::new(true),
+        }
+    }
+}
+impl<T> std::ops::Deref for FrozenCell<T> {
+    type Target = RefCell<T>;
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+pub type RcDict = Rc<crate::value::FrozenCell<DictMap>>;
+pub type RcSet = Rc<crate::value::FrozenCell<crate::pyset::PySet>>;
+#[derive(Clone, Copy)]
+pub struct VmFloat {
+    pub value: f64,
+    pub identity: u64,
+}
+impl VmFloat {
+    fn new(value: f64) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self {
+            value,
+            identity: if value.is_nan() {
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            } else {
+                0
+            },
+        }
+    }
+}
+impl std::ops::Deref for VmFloat {
+    type Target = f64;
+    fn deref(&self) -> &f64 {
+        &self.value
+    }
+}
+impl std::fmt::Debug for VmFloat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.value.fmt(f)
+    }
+}
+impl PartialEq for VmFloat {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+impl PartialOrd for VmFloat {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.value.partial_cmp(&other.value)
+    }
+}
+impl PartialEq<f64> for VmFloat {
+    fn eq(&self, other: &f64) -> bool {
+        self.value == *other
+    }
+}
+impl PartialOrd<f64> for VmFloat {
+    fn partial_cmp(&self, other: &f64) -> Option<std::cmp::Ordering> {
+        self.value.partial_cmp(other)
+    }
+}
 pub type RcStr = Rc<String>;
 
 /// The VM's arbitrary-precision integer, with a small-value fast path.
@@ -528,6 +614,7 @@ pub enum HashKey {
     Bool(bool),
     Int(VmInt),
     Float(u64),
+    NaN(u64),
     /// A complex number stored as the bit patterns of its real and
     /// imaginary `f64` parts (bitwise, like `Float`). Python's `complex`
     /// is hashable, so `{1j: ...}` / `set([1j])` work.
@@ -566,6 +653,15 @@ pub enum HashKey {
     UserHashed {
         hash: i64,
         instance: Rc<Instance>,
+    },
+    /// A value-mixin enum member (`IntEnum`, `StrEnum`, `class Mode(str,
+    /// Enum)`) used as a key. In CPython the member *is* an `int` / `str`
+    /// subclass instance, so it hashes and compares as its value
+    /// (`{"fast": 1}[Mode.FAST]` works) — but the key is still the member,
+    /// so iterating the keys back gives `Lvl.LOW`, not `1`.
+    Mixin {
+        value: Box<HashKey>,
+        member: Rc<Instance>,
     },
 }
 
@@ -674,6 +770,9 @@ pub fn class_is_frozen_dataclass(class: &Rc<Class>) -> bool {
 /// natives print as classes (`<class 'int'>`, `<class 'ValueError'>`),
 /// everything else as `<built-in function name>`.
 pub fn native_repr(name: &str) -> String {
+    if name == "NotImplemented" {
+        return name.to_owned();
+    }
     let is_type = matches!(
         name,
         "int"
@@ -801,6 +900,22 @@ pub fn flag_member_bits(v: &Value) -> Option<i64> {
     }
 }
 
+/// Whether `str()` / `format()` of an enum member shows its *value*: true
+/// for `StrEnum` / `IntEnum` / `IntFlag` (whose `__str__` is the mixin
+/// type's), false for a plain data-type mixin such as `class Mode(str,
+/// Enum)`, whose members still print `Mode.FAST` (CPython 3.12+).
+pub fn enum_str_is_value(v: &Value) -> bool {
+    fn marker(class: &Rc<Class>) -> bool {
+        (class
+            .class_attrs
+            .borrow()
+            .contains_key("__typhon_enum_base__")
+            && matches!(class.name.as_str(), "StrEnum" | "IntEnum" | "IntFlag"))
+            || class.bases.iter().any(marker)
+    }
+    matches!(v, Value::Instance(inst) if marker(&inst.class))
+}
+
 pub fn enum_mixin_value(v: &Value) -> Option<Value> {
     fn mixin_base(class: &Rc<Class>) -> bool {
         let is_marker = class
@@ -813,8 +928,20 @@ pub fn enum_mixin_value(v: &Value) -> Option<Value> {
         }
         class.bases.iter().any(mixin_base)
     }
+    // `class Mode(str, Enum)` / `class L(int, Enum)`: a data-type mixin makes
+    // every member an instance of that type, exactly as `StrEnum` /
+    // `IntEnum` do — equal to and hashing like its value.
+    fn data_type_mixin(class: &Rc<Class>) -> bool {
+        matches!(
+            class.class_attrs.borrow().get("__typhon_builtin_bases__"),
+            Some(Value::Tuple(names)) if names.iter().any(|n| matches!(
+                n,
+                Value::Str(s) if matches!(s.as_str(), "str" | "int" | "float" | "bytes" | "complex")
+            ))
+        )
+    }
     if let Value::Instance(inst) = v {
-        if mixin_base(&inst.class) {
+        if mixin_base(&inst.class) || (class_is_enum(&inst.class) && data_type_mixin(&inst.class)) {
             return inst.fields.borrow().get("value").cloned();
         }
     }
@@ -885,6 +1012,14 @@ fn push_int_canonical(out: &mut Vec<u8>, i: &BigInt) {
     out.extend_from_slice(&digits);
 }
 
+/// The sorted canonical encodings of a frozenset's members — the
+/// order-independent identity `Eq`, `Hash` and the sort key use.
+fn frozenset_canonical(items: &[HashKey]) -> Vec<Vec<u8>> {
+    let mut keys: Vec<Vec<u8>> = items.iter().map(HashKey::canonical_sort_key).collect();
+    keys.sort();
+    keys
+}
+
 impl HashKey {
     /// Stable, collision-safe sort key. Two distinct `HashKey` values
     /// have distinct sort keys (the discriminant byte differs across
@@ -893,8 +1028,16 @@ impl HashKey {
     /// with the same members hash equal regardless of insertion
     /// order — review thread copilot on PR #147.
     pub fn canonical_sort_key(&self) -> Vec<u8> {
+        if let HashKey::Mixin { value, .. } = self {
+            return value.canonical_sort_key();
+        }
         let mut out = Vec::with_capacity(16);
         match self {
+            HashKey::Mixin { .. } => unreachable!("handled above"),
+            HashKey::NaN(id) => {
+                out.push(9);
+                out.extend_from_slice(&id.to_be_bytes());
+            }
             HashKey::None => out.push(0),
             // Numeric keys share one canonical encoding so equal values across
             // bool/int/float sort identically (see `push_int_canonical`).
@@ -929,10 +1072,9 @@ impl HashKey {
             HashKey::FrozenSet(items) => {
                 out.push(6);
                 out.extend_from_slice(&(items.len() as u32).to_be_bytes());
-                // FrozenSet elements are already canonicalised at
-                // construction so this is deterministic.
-                for item in items.iter() {
-                    let inner = item.canonical_sort_key();
+                // Members are kept in the frozenset's iteration order;
+                // sort their encodings so equal frozensets encode equally.
+                for inner in frozenset_canonical(items) {
                     out.extend_from_slice(&(inner.len() as u32).to_be_bytes());
                     out.extend_from_slice(&inner);
                 }
@@ -977,6 +1119,11 @@ impl HashKey {
 
     pub fn into_value(self) -> Value {
         match self {
+            HashKey::Mixin { member, .. } => Value::Instance(member),
+            HashKey::NaN(identity) => Value::FloatData(VmFloat {
+                value: f64::NAN,
+                identity,
+            }),
             HashKey::None => Value::None,
             HashKey::Bool(b) => Value::Bool(b),
             HashKey::Int(i) => Value::Int(i),
@@ -987,13 +1134,9 @@ impl HashKey {
                 items.iter().cloned().map(HashKey::into_value).collect(),
             )),
             HashKey::FrozenSet(items) => {
-                use std::collections::HashSet;
-                let mut set = HashSet::new();
-                for k in items.iter() {
-                    set.insert(k.clone());
-                }
-                // Surface back as a frozenset-tagged Value::Set.
-                Value::Set(Rc::new(RefCell::new(set)))
+                let set: crate::pyset::PySet = items.iter().cloned().collect();
+                // Surface back as a frozenset.
+                Value::Set(Rc::new(crate::value::FrozenCell::frozen(set)))
             }
             HashKey::Instance { instance, .. } => Value::Instance(instance),
             HashKey::Identity(instance) => Value::Instance(instance),
@@ -1007,6 +1150,9 @@ impl HashKey {
 impl PartialEq for HashKey {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
+            (HashKey::Mixin { value: a, .. }, b) => **a == *b,
+            (a, HashKey::Mixin { value: b, .. }) => *a == **b,
+            (HashKey::NaN(a), HashKey::NaN(b)) => a == b,
             (HashKey::None, HashKey::None) => true,
             (HashKey::Bool(a), HashKey::Bool(b)) => a == b,
             // Python: bool ↔ int comparison shares hash slot. A bool is
@@ -1043,10 +1189,9 @@ impl PartialEq for HashKey {
             (HashKey::Str(a), HashKey::Str(b)) => a == b,
             (HashKey::Tuple(a), HashKey::Tuple(b)) => a == b,
             (HashKey::FrozenSet(a), HashKey::FrozenSet(b)) => {
-                // Frozenset equality is order-independent; the constructor
-                // stores items pre-sorted by their hash representation so
-                // this works as a vector compare.
-                a == b
+                // Order-independent: the members are kept in iteration
+                // order, so compare their sorted canonical encodings.
+                a.len() == b.len() && frozenset_canonical(a) == frozenset_canonical(b)
             }
             // Instance keys compare on their canonical projection: same
             // class name and equal field set. The original `instance`
@@ -1076,6 +1221,11 @@ impl Eq for HashKey {}
 impl std::hash::Hash for HashKey {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match self {
+            HashKey::Mixin { value, .. } => value.hash(state),
+            HashKey::NaN(id) => {
+                9u8.hash(state);
+                id.hash(state);
+            }
             HashKey::None => 0u8.hash(state),
             // bool/int collide intentionally — Python's `hash(True) == hash(1)`.
             // A bool widens to a BigInt before hashing so it produces the
@@ -1096,7 +1246,7 @@ impl std::hash::Hash for HashKey {
             }
             HashKey::Str(s) => s.hash(state),
             HashKey::Tuple(items) => items.hash(state),
-            HashKey::FrozenSet(items) => items.hash(state),
+            HashKey::FrozenSet(items) => frozenset_canonical(items).hash(state),
             // Hash only the canonical projection so it stays consistent
             // with `Eq` (which ignores the retained `instance` Rc).
             HashKey::Instance { key, .. } => key.hash(state),
@@ -1293,6 +1443,17 @@ pub fn with_exception_cause(v: Value, cause: Value) -> Value {
     })
 }
 
+/// Attach the traceback recorded when the exception was caught.
+pub fn with_exception_traceback(v: Value, frames: Rc<Vec<crate::error::Frame>>) -> Value {
+    update_exception_chain(v, |c| c.traceback = Some(frames))
+}
+
+/// Whether `v` already carries a recorded traceback.
+pub fn has_exception_traceback(v: Option<&Value>) -> bool {
+    v.and_then(exception_chain)
+        .is_some_and(|c| c.traceback.is_some())
+}
+
 /// Record the exception that was being handled when this one was raised
 /// (`__context__`). Never overwrites a context already set, and never chains
 /// an exception to itself — both would build a cycle CPython does not.
@@ -1376,6 +1537,10 @@ pub struct ExcChain {
     pub cause: Option<Value>,
     pub context: Option<Value>,
     pub suppress_context: bool,
+    /// The frames the exception unwound through before it was caught,
+    /// innermost first, ending in the catching frame — what an uncaught
+    /// exception chained to this one prints for it.
+    pub traceback: Option<Rc<Vec<crate::error::Frame>>>,
 }
 
 #[derive(Clone)]
@@ -1383,7 +1548,7 @@ pub enum Value {
     None,
     Bool(bool),
     Int(VmInt),
-    Float(f64),
+    FloatData(VmFloat),
     /// A complex number `(real, imag)`. Constructed from imaginary literals
     /// (`2j` → `Complex(0.0, 2.0)`) and the builtins agent's `complex(re, im)`
     /// constructor.
@@ -1440,10 +1605,59 @@ pub enum Value {
     /// The builtins agent materialises the `items` vector (already containing
     /// the keys, values, or `(k, v)` tuples respectively) and tags it with the
     /// matching `kind`. The VM provides repr, iteration, `len()`, and `in`.
+    /// `dict.keys()` / `.values()` / `.items()`: a *live* view of `dict`
+    /// (CPython's views reflect later changes to the dict).
     DictView {
         kind: DictViewKind,
-        items: Vec<Value>,
+        dict: RcDict,
     },
+}
+
+impl IterState {
+    /// `reversed()` over `dict`'s keys, values or items.
+    pub fn dict_rev(dict: &RcDict, kind: DictViewKind) -> IterState {
+        let (used, end) = {
+            let d = dict.borrow();
+            (d.len(), d.slot_end())
+        };
+        IterState::DictRev {
+            dict: dict.clone(),
+            kind,
+            index: end,
+            used,
+        }
+    }
+
+    /// A fresh iterator over `dict`'s keys, values or items.
+    pub fn dict_iter(dict: &RcDict, kind: DictViewKind) -> IterState {
+        let used = dict.borrow().len();
+        IterState::Dict {
+            dict: dict.clone(),
+            kind,
+            index: 0,
+            used,
+            remaining: used,
+        }
+    }
+}
+
+/// `NotImplemented`: the singleton a binary or comparison dunder returns to
+/// decline. The VM binds one native of that name (see `builtins`).
+pub fn is_not_implemented(v: &Value) -> bool {
+    matches!(v, Value::Native(n) if n.name == "NotImplemented")
+}
+
+/// The current contents of a dict view, in dict order.
+pub fn view_items(kind: DictViewKind, dict: &RcDict) -> Vec<Value> {
+    let d = dict.borrow();
+    match kind {
+        DictViewKind::Keys => d.keys().cloned().map(HashKey::into_value).collect(),
+        DictViewKind::Values => d.values().cloned().collect(),
+        DictViewKind::Items => d
+            .iter()
+            .map(|(k, v)| Value::Tuple(Rc::new(vec![k.clone().into_value(), v.clone()])))
+            .collect(),
+    }
 }
 
 /// Which flavour of dict view a `Value::DictView` represents. Controls the
@@ -1642,9 +1856,13 @@ pub struct Class {
     pub fields: Vec<ClassField>,
     /// Class-level attributes (constants, defaults pulled out of class body).
     pub class_attrs: RefCell<HashMap<String, Value>>,
-    /// Base classes in MRO order (after head). For v1 we only walk the chain
-    /// for method lookup; we don't compute C3 linearisation.
+    /// The direct bases, in declaration order (`__bases__`).
     pub bases: Vec<Rc<Class>>,
+    /// The C3 linearisation of the ancestors (`__mro__` without the class
+    /// itself and without the implicit `object`), computed once when the
+    /// class is created. Every attribute lookup, `super()` and `__mro__`
+    /// walk this order, as CPython does.
+    pub mro: Vec<Rc<Class>>,
     /// Method names decorated with `@property` — accessed without `()` and
     /// invoked lazily on attribute read.
     pub properties: RefCell<std::collections::HashSet<String>>,
@@ -1667,6 +1885,82 @@ pub struct Class {
     /// to a nominal `isinstance`, which can never succeed against a protocol —
     /// making `EXPR as! SomeInterface` impossible under `tyc run`.
     pub is_protocol: bool,
+}
+
+thread_local! {
+    /// The VM's placeholder for the builtin `object` class, bound as
+    /// `object` in every interpreter's root scope. It is one object per
+    /// thread so it can be told apart from a user class that is also named
+    /// `object` (`plain class object:`) by identity rather than by name.
+    static BUILTIN_OBJECT: Rc<Class> = Rc::new(Class {
+        name: "object".to_owned(),
+        methods: RefCell::new(HashMap::new()),
+        fields: vec![],
+        class_attrs: RefCell::new(HashMap::new()),
+        bases: vec![],
+        mro: vec![],
+        properties: RefCell::new(std::collections::HashSet::new()),
+        classmethods: RefCell::new(std::collections::HashSet::new()),
+        is_exception: false,
+        is_protocol: false,
+    });
+}
+
+/// The VM's builtin `object` class (see `BUILTIN_OBJECT`).
+pub fn builtin_object_class() -> Rc<Class> {
+    BUILTIN_OBJECT.with(Rc::clone)
+}
+
+/// Whether `c` is the builtin `object` class, not merely a class named so.
+pub fn is_builtin_object(c: &Rc<Class>) -> bool {
+    BUILTIN_OBJECT.with(|o| Rc::ptr_eq(o, c))
+}
+
+/// C3 linearisation of a class with direct `bases`: the ancestors in method
+/// resolution order, without the class itself. `Err` carries the base names
+/// for CPython's "Cannot create a consistent method resolution order (MRO)"
+/// `TypeError`. The VM's placeholder `object` class sorts last, as the
+/// implicit root does in CPython.
+pub fn linearize(bases: &[Rc<Class>]) -> Result<Vec<Rc<Class>>, String> {
+    let is_object = is_builtin_object;
+    let mut seqs: Vec<Vec<Rc<Class>>> = bases
+        .iter()
+        .map(|b| {
+            let mut seq = vec![b.clone()];
+            seq.extend(b.mro.iter().cloned());
+            seq
+        })
+        .collect();
+    seqs.push(bases.to_vec());
+    let mut out: Vec<Rc<Class>> = Vec::new();
+    loop {
+        seqs.retain(|s| !s.is_empty());
+        if seqs.is_empty() {
+            break;
+        }
+        // The first head that appears in no other sequence's tail.
+        let candidate = seqs.iter().map(|s| s[0].clone()).find(|head| {
+            !seqs
+                .iter()
+                .any(|s| s[1..].iter().any(|c| Rc::ptr_eq(c, head)))
+        });
+        let Some(next) = candidate else {
+            let names: Vec<String> = bases.iter().map(|b| b.name.clone()).collect();
+            return Err(names.join(", "));
+        };
+        for s in seqs.iter_mut() {
+            if Rc::ptr_eq(&s[0], &next) {
+                s.remove(0);
+            }
+        }
+        out.push(next);
+    }
+    // A placeholder `object` reached through some base belongs at the end.
+    if let Some(pos) = out.iter().position(is_object) {
+        let obj = out.remove(pos);
+        out.push(obj);
+    }
+    Ok(out)
 }
 
 #[derive(Clone)]
@@ -1749,13 +2043,36 @@ pub enum IterState {
         chars: Vec<char>,
         index: usize,
     },
+    /// A dict (or dict view) iterator over the live dict: `used` is the
+    /// size it started with (a change raises CPython's `RuntimeError`) and
+    /// `remaining` how many entries it may still yield.
     Dict {
-        keys: Vec<HashKey>,
+        dict: RcDict,
+        kind: DictViewKind,
+        index: usize,
+        used: usize,
+        remaining: usize,
+    },
+    /// `reversed(list)`: yields `list[index - 1]` while that index is still
+    /// inside the (live) list.
+    ListRev {
+        list: RcList,
         index: usize,
     },
-    Set {
-        keys: Vec<HashKey>,
+    /// `reversed(dict)` / `reversed(view)`: `index` counts down the live
+    /// dict's entries; a size change raises.
+    DictRev {
+        dict: RcDict,
+        kind: DictViewKind,
         index: usize,
+        used: usize,
+    },
+    /// A set iterator over the live table (`pos` is a slot index).
+    Set {
+        set: RcSet,
+        pos: usize,
+        used: usize,
+        remaining: usize,
     },
     Enumerate {
         inner: Rc<RefCell<IterState>>,
@@ -1803,13 +2120,37 @@ pub fn iter_type_name(state: &IterState) -> &'static str {
         IterState::List { .. } => "list_iterator",
         IterState::Tuple { .. } => "tuple_iterator",
         IterState::Str { .. } => "str_ascii_iterator",
-        IterState::Dict { .. } => "dict_keyiterator",
+        IterState::Dict {
+            kind: DictViewKind::Keys,
+            ..
+        } => "dict_keyiterator",
+        IterState::Dict {
+            kind: DictViewKind::Values,
+            ..
+        } => "dict_valueiterator",
+        IterState::Dict {
+            kind: DictViewKind::Items,
+            ..
+        } => "dict_itemiterator",
         IterState::Set { .. } => "set_iterator",
         IterState::Enumerate { .. } => "enumerate",
         IterState::Zip { .. } => "zip",
         IterState::Map { .. } => "map",
         IterState::Filter { .. } => "filter",
-        IterState::Reversed { .. } => "list_reverseiterator",
+        IterState::Reversed { .. } => "reversed",
+        IterState::ListRev { .. } => "list_reverseiterator",
+        IterState::DictRev {
+            kind: DictViewKind::Keys,
+            ..
+        } => "dict_reversekeyiterator",
+        IterState::DictRev {
+            kind: DictViewKind::Values,
+            ..
+        } => "dict_reversevalueiterator",
+        IterState::DictRev {
+            kind: DictViewKind::Items,
+            ..
+        } => "dict_reverseitemiterator",
         IterState::Generator(_) | IterState::GenExpr(_) => "generator",
         IterState::UserIter(_) => "iterator",
         IterState::SeqIter { .. } => "iterator",
@@ -1824,32 +2165,26 @@ impl fmt::Debug for Value {
             Value::None => write!(f, "None"),
             Value::Bool(b) => write!(f, "{b:?}"),
             Value::Int(i) => write!(f, "{}", i.to_str_radix(10)),
-            Value::Float(x) => write!(f, "{x:?}"),
+            Value::FloatData(crate::value::VmFloat { value: x, .. }) => write!(f, "{x:?}"),
             Value::Complex(re, im) => write!(f, "{}", format_complex(*re, *im)),
             Value::Str(s) => write!(f, "{:?}", s.as_str()),
             Value::Bytes(b) => write!(f, "{}", python_repr_bytes(b)),
             Value::List(l) => write!(f, "{:?}", l.borrow()),
             Value::Tuple(t) => write!(f, "{:?}", &t[..]),
             Value::Dict(d) => {
-                let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
-                let is_frozen = matches!(d.borrow().get(&frozen_key), Some(Value::Bool(true)));
+                let is_frozen = d.frozen.get();
                 if is_frozen {
                     write!(f, "mappingproxy({{")?;
                 } else {
                     write!(f, "{{")?;
                 }
                 let d = d.borrow();
-                let mut emitted = 0usize;
-                for (k, v) in d.iter() {
+                for (emitted, (k, v)) in d.iter().enumerate() {
                     // Hide the internal freeze sentinel from user output.
-                    if matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__") {
-                        continue;
-                    }
                     if emitted > 0 {
                         write!(f, ", ")?;
                     }
                     write!(f, "{:?}: {:?}", k.clone().into_value(), v)?;
-                    emitted += 1;
                 }
                 if is_frozen {
                     write!(f, "}})")
@@ -1940,29 +2275,42 @@ fn dict_render(v: &Value, wrap_frozen: bool) -> String {
     let Value::Dict(d) = v else {
         return String::new();
     };
-    let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
-    let wrap = wrap_frozen && matches!(d.borrow().get(&frozen_key), Some(Value::Bool(true)));
+    let wrap = wrap_frozen && d.frozen.get();
     let d = d.borrow();
     let mut s = String::new();
     s.push_str(if wrap { "mappingproxy({" } else { "{" });
-    let mut emitted = 0usize;
-    for (k, v) in d.iter() {
-        if matches!(k, HashKey::Str(name) if name.as_str() == "__typhon_frozen__") {
-            continue;
-        }
+    for (emitted, (k, v)) in d.iter().enumerate() {
         if emitted > 0 {
             s.push_str(", ");
         }
         s.push_str(&k.clone().into_value().py_repr());
         s.push_str(": ");
         s.push_str(&v.py_repr());
-        emitted += 1;
     }
     s.push_str(if wrap { "})" } else { "}" });
     s
 }
 
 impl Value {
+    #[allow(non_snake_case)]
+    pub fn Float(value: f64) -> Self {
+        Self::FloatData(VmFloat::new(value))
+    }
+    pub fn same_identity(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::FloatData(a), Self::FloatData(b)) => a.identity != 0 && a.identity == b.identity,
+            (Self::Instance(a), Self::Instance(b)) => Rc::ptr_eq(a, b),
+            (Self::List(a), Self::List(b)) => Rc::ptr_eq(a, b),
+            (Self::Tuple(a), Self::Tuple(b)) => Rc::ptr_eq(a, b),
+            (Self::Dict(a), Self::Dict(b)) => Rc::ptr_eq(a, b),
+            (Self::Set(a), Self::Set(b)) => Rc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+    pub fn identical_or_equal(&self, other: &Self) -> bool {
+        self.same_identity(other) || self.py_eq(other)
+    }
+
     /// The type name CPython puts in an error message: a user instance
     /// reports its *class*, everything else its structural `type_name`.
     pub fn type_display_name(&self) -> String {
@@ -1978,7 +2326,7 @@ impl Value {
             Value::None => "NoneType",
             Value::Bool(_) => "bool",
             Value::Int(_) => "int",
-            Value::Float(_) => "float",
+            Value::FloatData(_) => "float",
             Value::Complex(..) => "complex",
             Value::Str(_) => "str",
             Value::Bytes(_) => "bytes",
@@ -1986,9 +2334,13 @@ impl Value {
             Value::Tuple(t) if is_slice_marker(t) => "slice",
             Value::Tuple(t) if is_ellipsis_marker(t) => "ellipsis",
             Value::Tuple(_) => "tuple",
+            // A `freeze let` dict is CPython's read-only `mappingproxy`.
+            Value::Dict(d) if d.frozen.get() => "mappingproxy",
             Value::Dict(_) => "dict",
+            Value::Set(s) if s.frozen.get() => "frozenset",
             Value::Set(_) => "set",
             Value::Range { .. } => "range",
+            Value::Native(n) if n.name == "NotImplemented" => "NotImplementedType",
             Value::Native(_) | Value::Function(_) | Value::BoundMethod { .. } => "function",
             Value::Class(_) => "type",
             // Don't leak the class name into a `'static str`. Callers that
@@ -2018,25 +2370,15 @@ impl Value {
             Value::None => false,
             Value::Bool(b) => *b,
             Value::Int(i) => !i.is_zero(),
-            Value::Float(x) => *x != 0.0,
+            Value::FloatData(crate::value::VmFloat { value: x, .. }) => *x != 0.0,
             Value::Complex(re, im) => *re != 0.0 || *im != 0.0,
             Value::Str(s) => !s.is_empty(),
             Value::Bytes(b) => !b.is_empty(),
             Value::List(l) => !l.borrow().is_empty(),
             Value::Tuple(t) => !t.is_empty(),
-            // Truthiness ignores the synthetic `__typhon_frozen__`
-            // sentinel a `freeze let` may have inserted into a dict
-            // or set (review thread copilot on PR #147 — otherwise
-            // a frozen-and-otherwise-empty container would test as
-            // truthy under `bool(d)` / `if d:`).
-            Value::Dict(d) => {
-                let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
-                d.borrow().keys().any(|k| *k != frozen_key)
-            }
-            Value::Set(s) => {
-                let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
-                s.borrow().iter().any(|k| *k != frozen_key)
-            }
+            // Frozen metadata lives outside user-visible container contents.
+            Value::Dict(d) => !d.borrow().is_empty(),
+            Value::Set(s) => !s.borrow().is_empty(),
             Value::Range { start, stop, step } => {
                 if *step > 0 {
                     stop > start
@@ -2046,7 +2388,7 @@ impl Value {
                     false
                 }
             }
-            Value::DictView { items, .. } => !items.is_empty(),
+            Value::DictView { dict, .. } => !dict.borrow().is_empty(),
             _ => true,
         }
     }
@@ -2058,7 +2400,11 @@ impl Value {
             Value::None => Ok(HashKey::None),
             Value::Bool(b) => Ok(HashKey::Bool(*b)),
             Value::Int(i) => Ok(HashKey::Int(i.clone())),
-            Value::Float(x) => Ok(HashKey::Float(x.to_bits())),
+            Value::FloatData(x) => Ok(if x.value.is_nan() {
+                HashKey::NaN(x.identity)
+            } else {
+                HashKey::Float(x.value.to_bits())
+            }),
             Value::Complex(re, im) => Ok(HashKey::Complex(re.to_bits(), im.to_bits())),
             Value::Str(s) => Ok(HashKey::Str(s.clone())),
             Value::Tuple(items) => {
@@ -2074,22 +2420,10 @@ impl Value {
             // The (much more common) flow we care about is `frozenset(...)`
             // as a dict key, which now works.
             Value::Set(s) => {
-                let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
-                let mut keys: Vec<HashKey> = s
-                    .borrow()
-                    .iter()
-                    .filter(|k| **k != frozen_key)
-                    .cloned()
-                    .collect();
-                // Canonical ordering so two sets with the same members
-                // produce identical `FrozenSet` payloads (and therefore
-                // hash equal). We compare on a collision-safe sort key
-                // — sorting by `DefaultHasher::finish()` alone allows
-                // two distinct elements to share an ordering slot and
-                // the resulting key ordering depends on insertion
-                // history, breaking `Eq` / `Hash` consistency
-                // (review thread copilot on PR #147).
-                keys.sort_by_key(|a| a.canonical_sort_key());
+                // Members in the set's iteration order, so a frozenset read
+                // back out of a dict or set iterates as it did going in;
+                // `Eq` / `Hash` compare the sorted canonical encodings.
+                let keys: Vec<HashKey> = s.borrow().iter().cloned().collect();
                 Ok(HashKey::FrozenSet(Rc::new(keys)))
             }
             // Dataclass instances are hashable: CPython makes
@@ -2106,7 +2440,10 @@ impl Value {
                 // works exactly as it does under CPython (where the member
                 // IS a str / int subclass).
                 if let Some(v) = enum_mixin_value(self) {
-                    return v.to_hash_key();
+                    return Ok(HashKey::Mixin {
+                        value: Box::new(v.to_hash_key()?),
+                        member: inst.clone(),
+                    });
                 }
                 match instance_hash_mode(&inst.class) {
                     HashMode::Unhashable => {
@@ -2182,18 +2519,37 @@ impl Value {
 
     fn py_eq_inner(&self, other: &Value) -> bool {
         use Value::*;
+        // A value-mixin enum member equals its value, inside containers too.
+        if matches!(self, Instance(_)) != matches!(other, Instance(_)) {
+            let (l, r) = (enum_mixin_value(self), enum_mixin_value(other));
+            if l.is_some() || r.is_some() {
+                let l = l.unwrap_or_else(|| self.clone());
+                let r = r.unwrap_or_else(|| other.clone());
+                return l.py_eq_inner(&r);
+            }
+        }
         match (self, other) {
             (None, None) => true,
             (Bool(a), Bool(b)) => a == b,
             (Bool(a), Int(b)) | (Int(b), Bool(a)) => &VmInt::from(*a as i64) == b,
-            (Bool(a), Float(b)) | (Float(b), Bool(a)) => (*a as i64 as f64) == *b,
+            (Bool(a), FloatData(crate::value::VmFloat { value: b, .. }))
+            | (FloatData(crate::value::VmFloat { value: b, .. }), Bool(a)) => {
+                (*a as i64 as f64) == *b
+            }
             (Int(a), Int(b)) => a == b,
-            (Float(a), Float(b)) => a == b,
-            (Int(a), Float(b)) | (Float(b), Int(a)) => vmint_eq_f64(a, *b),
+            (
+                FloatData(crate::value::VmFloat { value: a, .. }),
+                FloatData(crate::value::VmFloat { value: b, .. }),
+            ) => a == b,
+            (Int(a), FloatData(crate::value::VmFloat { value: b, .. }))
+            | (FloatData(crate::value::VmFloat { value: b, .. }), Int(a)) => vmint_eq_f64(a, *b),
             (Complex(ar, ai), Complex(br, bi)) => ar == br && ai == bi,
             // `complex == float` / `complex == int` only when the imaginary
             // part is zero (matching CPython).
-            (Complex(re, im), Float(f)) | (Float(f), Complex(re, im)) => *im == 0.0 && re == f,
+            (Complex(re, im), FloatData(crate::value::VmFloat { value: f, .. }))
+            | (FloatData(crate::value::VmFloat { value: f, .. }), Complex(re, im)) => {
+                *im == 0.0 && re == f
+            }
             (Complex(re, im), Int(i)) | (Int(i), Complex(re, im)) => {
                 *im == 0.0 && vmint_eq_f64(i, *re)
             }
@@ -2211,10 +2567,10 @@ impl Value {
                 }
                 let a = a.borrow();
                 let b = b.borrow();
-                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.py_eq(y))
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.identical_or_equal(y))
             }
             (Tuple(a), Tuple(b)) => {
-                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.py_eq(y))
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.identical_or_equal(y))
             }
             (Dict(a), Dict(b)) => {
                 if Rc::ptr_eq(a, b) {
@@ -2225,7 +2581,8 @@ impl Value {
                 if a.len() != b.len() {
                     return false;
                 }
-                a.iter().all(|(k, v)| b.get(k).is_some_and(|w| v.py_eq(w)))
+                a.iter()
+                    .all(|(k, v)| b.get(k).is_some_and(|w| v.identical_or_equal(w)))
             }
             (ResultOk(a), ResultOk(b)) => a.py_eq(b),
             (ResultErr(a), ResultErr(b)) => a.py_eq(b),
@@ -2269,25 +2626,13 @@ impl Value {
                 // deterministic; fall back to whatever keys exist for
                 // dynamically-added attributes.
                 fa.iter()
-                    .all(|(k, v)| fb.get(k).is_some_and(|w| v.py_eq(w)))
+                    .all(|(k, v)| fb.get(k).is_some_and(|w| v.identical_or_equal(w)))
             }
-            // Sets / frozensets compare with set semantics: equal iff
-            // they contain the same elements, independent of iteration
-            // order. The synthetic `__typhon_frozen__` sentinel is
-            // excluded so a frozen and non-frozen copy of the same
-            // members still compare equal.
+            // Frozen metadata lives outside user-visible container contents.
             (Set(a), Set(b)) => {
-                let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
                 let a = a.borrow();
                 let b = b.borrow();
-                let a_len = a.iter().filter(|k| **k != frozen_key).count();
-                let b_len = b.iter().filter(|k| **k != frozen_key).count();
-                if a_len != b_len {
-                    return false;
-                }
-                a.iter()
-                    .filter(|k| **k != frozen_key)
-                    .all(|k| b.contains(k))
+                a.len() == b.len() && a.iter().all(|k| b.contains(k))
             }
             _ => false,
         }
@@ -2306,18 +2651,39 @@ impl Value {
     fn py_cmp_inner(&self, other: &Value) -> Option<std::cmp::Ordering> {
         use std::cmp::Ordering::*;
         use Value::*;
+        // A value-mixin enum member orders as its value (it *is* an `int` /
+        // `str` subclass instance in CPython).
+        if matches!(self, Instance(_)) || matches!(other, Instance(_)) {
+            let (l, r) = (enum_mixin_value(self), enum_mixin_value(other));
+            if l.is_some() || r.is_some() {
+                let l = l.unwrap_or_else(|| self.clone());
+                let r = r.unwrap_or_else(|| other.clone());
+                if !matches!(l, Instance(_)) && !matches!(r, Instance(_)) {
+                    return l.py_cmp_inner(&r);
+                }
+            }
+        }
         match (self, other) {
             (Int(a), Int(b)) => a.partial_cmp(b),
-            (Float(a), Float(b)) => a.partial_cmp(b),
-            (Int(a), Float(b)) => vmint_cmp_f64(a, *b),
-            (Float(a), Int(b)) => vmint_cmp_f64(b, *a).map(|o| o.reverse()),
+            (
+                FloatData(crate::value::VmFloat { value: a, .. }),
+                FloatData(crate::value::VmFloat { value: b, .. }),
+            ) => a.partial_cmp(b),
+            (Int(a), FloatData(crate::value::VmFloat { value: b, .. })) => vmint_cmp_f64(a, *b),
+            (FloatData(crate::value::VmFloat { value: a, .. }), Int(b)) => {
+                vmint_cmp_f64(b, *a).map(|o| o.reverse())
+            }
             (Bool(a), Bool(b)) => a.partial_cmp(b),
             (Bool(a), Int(b)) => VmInt::from(*a as i64).partial_cmp(b),
             (Int(a), Bool(b)) => a.partial_cmp(&VmInt::from(*b as i64)),
             // `bool` is an `int` in CPython, so it orders against floats too
             // — `sorted([True, False, 0.5])` needs this.
-            (Bool(a), Float(b)) => f64::from(*a).partial_cmp(b),
-            (Float(a), Bool(b)) => a.partial_cmp(&f64::from(*b)),
+            (Bool(a), FloatData(crate::value::VmFloat { value: b, .. })) => {
+                f64::from(*a).partial_cmp(b)
+            }
+            (FloatData(crate::value::VmFloat { value: a, .. }), Bool(b)) => {
+                a.partial_cmp(&f64::from(*b))
+            }
             (Str(a), Str(b)) => a.partial_cmp(b),
             // `bytes` is ordered in CPython (lexicographic over the byte
             // values). Without this arm every bytes pair was "incomparable",
@@ -2364,7 +2730,7 @@ impl Value {
             Value::Bool(b) => Ok(*b as i64),
             // Same saturation hazard as `to_bigint`: reject rather than
             // silently clamp to `i64::MAX`.
-            Value::Float(x) => float_to_bigint(*x)?.to_i64().ok_or_else(|| {
+            Value::FloatData(crate::value::VmFloat { value: x, .. }) => float_to_bigint(*x)?.to_i64().ok_or_else(|| {
                 Unwind::Exception(crate::error::VmException::new(
                     "OverflowError",
                     "Python int too large to convert to C int",
@@ -2410,7 +2776,7 @@ impl Value {
             // instead of raising. The VM's whole point is arbitrary precision,
             // and CPython raises `OverflowError` / `ValueError` here — so
             // convert exactly and reject what has no integer value.
-            Value::Float(x) => float_to_bigint(*x),
+            Value::FloatData(crate::value::VmFloat { value: x, .. }) => float_to_bigint(*x),
             Value::Bytes(b) => {
                 parse_decimal_str::<BigInt>(&String::from_utf8_lossy(b)).map_err(|_| {
                     value_error(format!(
@@ -2444,8 +2810,17 @@ impl Value {
 
     pub fn to_float(&self) -> Result<f64, Unwind> {
         match self {
-            Value::Float(x) => Ok(*x),
-            Value::Int(i) => Ok(i.to_f64()),
+            Value::FloatData(crate::value::VmFloat { value: x, .. }) => Ok(*x),
+            Value::Int(i) => {
+                let x = i.to_f64();
+                if x.is_infinite() {
+                    return Err(Unwind::Exception(crate::error::VmException::new(
+                        "OverflowError",
+                        "int too large to convert to float",
+                    )));
+                }
+                Ok(x)
+            }
             Value::Bool(b) => Ok(*b as i64 as f64),
             Value::Bytes(b) => {
                 parse_decimal_str::<f64>(&String::from_utf8_lossy(b)).map_err(|_| {
@@ -2482,7 +2857,7 @@ impl Value {
             Value::Bool(true) => "True".into(),
             Value::Bool(false) => "False".into(),
             Value::Int(i) => i.to_str_radix(10),
-            Value::Float(x) => format_float(*x),
+            Value::FloatData(crate::value::VmFloat { value: x, .. }) => format_float(*x),
             Value::Complex(re, im) => format_complex(*re, *im),
             Value::Str(s) => (**s).clone(),
             Value::Bytes(b) => python_repr_bytes(b),
@@ -2521,21 +2896,10 @@ impl Value {
             Value::Dict(_) => dict_render(self, false),
             Value::Set(set) => {
                 let s = set.borrow();
-                let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
-                let is_frozen = s.contains(&frozen_key);
-                // Filter the synthetic `__typhon_frozen__` sentinel
-                // that `deep_freeze_value` inserts to mark the set
-                // immutable (review thread codex / copilot on PR
-                // #147 — without this the sentinel leaks into
-                // user-visible repr).
-                //
-                // The backing store is a Rust `HashSet`, whose iteration
-                // order is non-deterministic and differs from CPython.
-                // Sort by the collision-safe `canonical_sort_key` so the
-                // repr is stable across runs and matches CPython for the
-                // common all-numeric / all-string cases (FINDINGS H4).
-                let mut keys: Vec<&HashKey> = s.iter().filter(|k| **k != frozen_key).collect();
-                keys.sort_by_key(|k| k.canonical_sort_key());
+                let is_frozen = set.frozen.get();
+                // Frozen metadata lives outside user-visible container
+                // contents. CPython's iteration order (see `pyset`).
+                let keys: Vec<&HashKey> = s.iter().collect();
                 let items: Vec<String> = keys
                     .into_iter()
                     .map(|k| k.clone().into_value().py_repr())
@@ -2659,7 +3023,8 @@ impl Value {
                     ),
                 }
             }
-            Value::DictView { kind, items } => {
+            Value::DictView { kind, dict } => {
+                let items = view_items(*kind, dict);
                 let prefix = match kind {
                     DictViewKind::Keys => "dict_keys",
                     DictViewKind::Values => "dict_values",
@@ -2944,8 +3309,23 @@ fn instance_repr_inner(inst: &Instance) -> String {
             return format!("<{}.{}: {}>", inst.class.name, name, val.py_repr());
         }
     }
+    // `@dataclass(repr=False)` generates no `__repr__`: the nearest
+    // ancestor's applies — another dataclass's (its own fields), else
+    // `object.__repr__`.
+    let mut repr_fields = &inst.class.fields;
+    if class_is_dataclass(&inst.class) && !class_flag(&inst.class, "__typhon_dc_repr__", true) {
+        match inst
+            .class
+            .mro
+            .iter()
+            .find(|c| class_is_dataclass(c) && class_flag(c, "__typhon_dc_repr__", true))
+        {
+            Some(provider) => repr_fields = &provider.fields,
+            None => return object_default_repr(inst),
+        }
+    }
     let mut parts: Vec<String> = Vec::with_capacity(fields.len());
-    for cf in &inst.class.fields {
+    for cf in repr_fields {
         if let Some(v) = fields.get(&cf.name) {
             parts.push(format!("{}={}", cf.name, v.py_repr()));
         }
@@ -3208,58 +3588,60 @@ fn format_float(x: f64) -> String {
     }
 }
 
-/// CPython's shortest float repr breaks an *exact* tie toward the even last
-/// digit; Rust's Ryū picks the larger one, so `1e15 + 0.3` — exactly
-/// `1000000000000000.25` — printed as `…0.3` under `tyc run` and `…0.2`
-/// after `tyc build`.
+/// CPython's `repr` is the shortest digit string that round-trips and, when
+/// several strings of that length do, the one *closest* to the double's
+/// exact value (ties to even) — David Gay's `dtoa` mode 0. Rust's shortest
+/// formatter finds the same length but not always the same digits:
+/// `(-4819706.21)**2` is exactly `23229567950712.5625`, and Rust prints
+/// `…712.563` where CPython prints `…712.562`; `1e15 + 0.3` (exactly
+/// `…0.25`) likewise.
 ///
-/// The tie has to be established, not guessed: `3.3000000000000003` also has
-/// a neighbour that round-trips, but it is genuinely the closer of the two
-/// and both surfaces print it. So compare against the double's exact decimal
-/// expansion and only swap when the digit after the repr's last is a `5`
-/// with nothing but zeros behind it.
+/// The closest string of that length is the correctly rounded one, which
+/// Rust's fixed-precision formatting produces (it rounds ties to even, as
+/// C does); use it whenever it also round-trips. Below 16 significant
+/// digits a double's rounding interval holds only one candidate, so only
+/// the long forms need the check.
 fn tie_break_even(s: &str, x: f64) -> String {
-    let digits: Vec<u8> = s.bytes().filter(u8::is_ascii_digit).collect();
-    // A tie needs the full 17 significant digits, and only an odd last digit
-    // can be replaced by an even neighbour.
-    if digits.len() < 16 || (digits[digits.len() - 1] - b'0').is_multiple_of(2) {
-        return s.to_owned();
-    }
-    let significant = digits.iter().skip_while(|d| **d == b'0').count();
-    // A double's exact decimal expansion is finite, and only one that
-    // *terminates* in a `5` can be a tie — 80 significant digits is far more
-    // than such a value needs.
-    let exact = format!("{:.*e}", 80, x.abs());
-    let mantissa: Vec<u8> = exact[..exact.find('e').unwrap_or(exact.len())]
+    let mantissa_end = s.find(['e', 'E']).unwrap_or(s.len());
+    let digits: Vec<u8> = s[..mantissa_end]
         .bytes()
         .filter(u8::is_ascii_digit)
         .collect();
-    if mantissa.len() <= significant
-        || mantissa[significant] != b'5'
-        || mantissa[significant + 1..].iter().any(|d| *d != b'0')
+    let lead = digits.iter().take_while(|d| **d == b'0').count();
+    let k = digits.len() - lead;
+    if k < 16 {
+        return s.to_owned();
+    }
+    let rounded = format!("{:.*e}", k - 1, x.abs());
+    let best: Vec<u8> = rounded[..rounded.find('e').unwrap_or(rounded.len())]
+        .bytes()
+        .filter(u8::is_ascii_digit)
+        .collect();
+    if best.len() != k || best[..] == digits[lead..] {
+        return s.to_owned();
+    }
+    // Put the correctly rounded digits in place of the shortest ones.
+    let mut seen = 0usize;
+    let candidate: String = s
+        .char_indices()
+        .map(|(i, c)| {
+            if i < mantissa_end && c.is_ascii_digit() {
+                seen += 1;
+                if seen > lead {
+                    return best[seen - lead - 1] as char;
+                }
+            }
+            c
+        })
+        .collect();
+    if candidate
+        .parse::<f64>()
+        .is_ok_and(|v| v.to_bits() == x.to_bits())
     {
-        return s.to_owned();
+        candidate
+    } else {
+        s.to_owned()
     }
-    let mantissa_end = s.find(['e', 'E']).unwrap_or(s.len());
-    let Some(last) = s[..mantissa_end].rfind(|c: char| c.is_ascii_digit()) else {
-        return s.to_owned();
-    };
-    let digit = s.as_bytes()[last];
-    // The last digit is odd, so both neighbours are digits and both even;
-    // whichever round-trips is the one CPython prints.
-    for neighbour in [digit + 1, digit - 1] {
-        let mut candidate = String::with_capacity(s.len());
-        candidate.push_str(&s[..last]);
-        candidate.push(neighbour as char);
-        candidate.push_str(&s[last + 1..]);
-        if candidate
-            .parse::<f64>()
-            .is_ok_and(|v| v.to_bits() == x.to_bits())
-        {
-            return candidate;
-        }
-    }
-    s.to_owned()
 }
 
 /// Format a float in CPython's scientific-notation style: shortest
@@ -3269,14 +3651,13 @@ fn format_float_scientific(x: f64) -> String {
     // Rust's `{:e}` gives a shortest mantissa with a base-10 exponent but
     // formats the exponent without a sign or zero-padding (`1e20`,
     // `1.5e-5`). Reformat the exponent to CPython's `e+NN` / `e-NN`.
-    let raw = format!("{:e}", x);
+    let raw = tie_break_even(&format!("{:e}", x), x);
     let (mantissa, exp_str) = match raw.split_once('e') {
         Some((m, e)) => (m, e),
         None => return raw,
     };
     let exp: i32 = exp_str.parse().unwrap_or(0);
     let sign = if exp < 0 { '-' } else { '+' };
-    let mantissa = tie_break_even(mantissa, x);
     format!("{}e{}{:02}", mantissa, sign, exp.abs())
 }
 
@@ -3529,6 +3910,7 @@ mod tests {
                 .collect(),
             class_attrs: RefCell::new(class_attrs),
             bases: vec![],
+            mro: vec![],
             properties: RefCell::new(std::collections::HashSet::new()),
             classmethods: RefCell::new(std::collections::HashSet::new()),
             is_exception: false,
@@ -3608,7 +3990,7 @@ mod tests {
 
     #[test]
     fn set_equality_is_order_independent() {
-        use std::collections::HashSet;
+        use crate::pyset::PySet as HashSet;
         let mut s1 = HashSet::new();
         s1.insert(HashKey::Int(1.into()));
         s1.insert(HashKey::Int(2.into()));
@@ -3617,20 +3999,25 @@ mod tests {
         s2.insert(HashKey::Int(3.into()));
         s2.insert(HashKey::Int(2.into()));
         s2.insert(HashKey::Int(1.into()));
-        let a = Value::Set(Rc::new(RefCell::new(s1)));
-        let b = Value::Set(Rc::new(RefCell::new(s2)));
+        let a = Value::Set(Rc::new(crate::value::FrozenCell::new(s1)));
+        let b = Value::Set(Rc::new(crate::value::FrozenCell::new(s2)));
         assert!(a.py_eq(&b));
     }
 
     #[test]
-    fn set_repr_is_sorted_and_deterministic() {
-        use std::collections::HashSet;
-        let mut s = HashSet::new();
-        for n in [5, 3, 1, 4, 2, 0, 7, 6] {
-            s.insert(HashKey::Int(n.into()));
-        }
-        let v = Value::Set(Rc::new(RefCell::new(s)));
+    fn set_repr_follows_cpython_iteration_order() {
+        let s: crate::pyset::PySet = [5, 3, 1, 4, 2, 0, 7, 6]
+            .into_iter()
+            .map(|n| HashKey::Int(n.into()))
+            .collect();
+        let v = Value::Set(Rc::new(crate::value::FrozenCell::new(s)));
         assert_eq!(v.py_str(), "{0, 1, 2, 3, 4, 5, 6, 7}");
+        let s: crate::pyset::PySet = [5, 3, 1, 100, 33, 2]
+            .into_iter()
+            .map(|n| HashKey::Int(n.into()))
+            .collect();
+        let v = Value::Set(Rc::new(crate::value::FrozenCell::new(s)));
+        assert_eq!(v.py_str(), "{1, 33, 3, 100, 5, 2}");
     }
 
     #[test]

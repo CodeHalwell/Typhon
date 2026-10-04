@@ -3,8 +3,12 @@
 Advice-level diagnostic, **on by default** — but only fires when the project
 targets free-threaded Python (`[python] free-threaded = true`). Surfaces a
 `go`-spawned same-module function that writes module-level mutable state: a
-`global NAME` assignment, or an assignment / augmented-assignment to a
-module-level `mut` binding.
+`global NAME` assignment, an assignment / augmented-assignment to a
+module-level `mut` binding, an in-place mutation of a module-level binding
+(`SEEN[k] = …`, `del CACHE[k]`, `LOG.append(…)` and the other mutating
+`list` / `dict` / `set` / `deque` methods, `Config.level = …`), or a call to a
+same-module helper that does any of these. A parameter or local of the same
+name is not module state.
 
 Under free-threaded Python a `go`-spawned task runs *concurrently* with the code
 that spawned it (and with every other task), so an unguarded write to shared

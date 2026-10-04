@@ -1,1 +1,2 @@
 @functools.cache\ndef cold(n: int) -> int:
+@functools.lru_cache(maxsize=1024, typed=True)\ndef cold(n: int) -> int:

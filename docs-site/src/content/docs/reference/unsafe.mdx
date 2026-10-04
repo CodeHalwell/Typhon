@@ -10,7 +10,7 @@ import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
 `unsafe:` opens a lexical region where the checker tolerates `Any`-shaped expressions. Values inside acquire an `Unsafe[T]` marker that cannot cross out without re-assertion.
 
 <Aside type="tip" title="Prefer `as!` at a single boundary">
-  For a one-off untyped boundary — a JSON payload, a sqlite row, a redis value — reach for the [`as!` checked cast](#as-the-checked-boundary-cast) instead. It replaces the whole `unsafe:` + re-assertion dance with one sound, runtime-checked line.
+  For a one-off untyped boundary — a JSON payload, a sqlite row, a redis value — reach for the [`as!` checked cast](#as--the-checked-boundary-cast) instead. It replaces the whole `unsafe:` + re-assertion dance with one sound, runtime-checked line.
 </Aside>
 
 ## Syntax
@@ -128,23 +128,33 @@ It reuses the same machinery as `type[T]` generic inference — it is not a besp
 
 ### Sound, not blind
 
-Unlike a static-only re-assertion (which trusts the boundary blindly) or TypeScript's unchecked `as`, `as!` is **checked at runtime**. The lowering injects `from typhon_runtime.cast import checked_cast as __typhon_checked_cast__` and the call `__typhon_checked_cast__(EXPR, TYPE)` verifies the value's shape against `TYPE` **recursively**:
+Unlike a static-only re-assertion (which trusts the boundary blindly) or TypeScript's unchecked `as`, `as!` is **checked at runtime**. The lowering injects `from typhon_runtime.cast import checked_cast as __typhon_checked_cast__`, and the call `__typhon_checked_cast__(EXPR, TYPE)` checks the value against `TYPE` and returns the same object. On a mismatch it raises `TypeError`, so an `as!` can only let through values it cannot prove wrong.
 
-- scalars;
-- `list[X]` / `set[X]` / `frozenset[X]`;
-- `dict[K, V]`;
-- fixed- and variadic-`tuple[...]`;
-- unions / `Optional`.
+### Supported targets
 
-On a mismatch it raises `TypeError`. So an `as!` can only let through values it cannot prove wrong.
+| Target | Check |
+| --- | --- |
+| `int`, `str`, `bool`, `bytes`, `None`, other ordinary classes | `isinstance` (classes are shallow) |
+| `float`, `complex` | Numeric widening is accepted: integers (and `bool`) inhabit float targets |
+| `Any`, `object` | Accept any value |
+| Unions and nullable types (`int \| str`, `T?`) | At least one member must match |
+| `Literal[...]` | Exact value and primitive type membership |
+| `list[T]`, `set[T]`, `frozenset[T]` | Container kind and every element recursively |
+| `dict[K, V]`, `Mapping[K, V]`, `MutableMapping[K, V]` | Mapping kind and every key and value recursively |
+| `Sequence[T]`, `Collection[T]`, `AbstractSet[T]` | Collection kind and every element recursively |
+| Fixed tuples and `tuple[T, ...]` | Length and each slot, or every element recursively |
+| Transparent aliases, including generic aliases with concrete arguments (`Rows[int]`) | The alias is expanded and its arguments substituted; the underlying check applies |
+| Newtypes | The underlying base type |
+| Interfaces | Shallow member presence; method bodies and field values are not inspected |
+| Bare type parameters, unbound alias parameters, `Callable`, iterator / awaitable contracts, parameterised user classes (`Box[int]`), other unknown descriptors | Refused |
 
-### Fall-back-to-acceptance
+A refused target is a check-time error (``as! cannot check target `Box[int]` at runtime; choose a concrete supported target``, reported as `tyc::generic`), and the generated runtime refuses it as well. Recursive aliases are supported for finite values; a cyclic value fails the cast. A shallow class or interface cast establishes the runtime class or member surface; it does not inspect the internals of an instance.
 
-`Any` / `object` targets, and any shape the runtime can't model, **fall back to acceptance** — `as!` never invents a failure for a type it can't reason about. `int → float` (and `bool → int`) widening is honoured, so a JSON int cast `as! float` does not spuriously fail.
+`Any` and `object` are the only targets that accept everything. A target the runtime cannot check is refused rather than accepted silently.
 
 ### VM behaviour
 
-The in-process VM treats `as!` as an identity passthrough on the value — the authoritative structural check runs on the `tyc build && python` path. The VM intercepts `__typhon_checked_cast__` *before* argument evaluation, so a cast to a union / parametric type still runs under `tyc run`. `tyc fmt` preserves the surface `as!` syntax.
+The in-process VM intercepts `__typhon_checked_cast__` *before* argument evaluation and runs a structural check of its own, so a wrong-shaped scalar, container, tuple, union or plain alias raises `TypeError` under `tyc run` as it does after `tyc build`. It does not yet enforce `Literal`, newtype, generic-alias or interface targets: those casts pass under `tyc run` and raise `TypeError` on CPython. `tyc fmt` preserves the surface `as!` syntax.
 
 ### Which boundary tool to reach for
 
@@ -152,7 +162,7 @@ The in-process VM treats `as!` as an identity passthrough on the value — the a
 - **A [`.dty` stub](/Typhon/interop/dty-stubs/)** — for a long-lived dependency.
 - **`as!`** — for an ad-hoc one-off shape assertion. It is the sound, runtime-checked upgrade over a bare `unsafe:` re-assertion.
 
-See [The Unsafe Boundary → `as!`](/Typhon/types/unsafe/#as-the-sound-one-line-boundary-cast) for the full treatment.
+See [The Unsafe Boundary → `as!`](/Typhon/types/unsafe/#as--the-sound-one-line-boundary-cast) for the full treatment.
 
 ## When to use
 

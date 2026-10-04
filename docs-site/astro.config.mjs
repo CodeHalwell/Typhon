@@ -1,11 +1,30 @@
 // @ts-check
+import { readFileSync } from 'node:fs';
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
+
+// Typhon highlighting reuses the VS Code extension's TextMate grammar, so
+// ```typhon fences highlight and the build stops warning about an unknown
+// language. The grammar is self-contained (only `source.typhon` includes).
+const typhonGrammar = JSON.parse(
+  readFileSync(
+    new URL(
+      '../editors/vscode/syntaxes/typhon.tmLanguage.json',
+      import.meta.url,
+    ),
+    'utf8',
+  ),
+);
 
 // https://astro.build/config
 export default defineConfig({
   site: 'https://codehalwell.github.io',
   base: '/Typhon',
+  markdown: {
+    shikiConfig: {
+      langs: [{ ...typhonGrammar, name: 'typhon' }],
+    },
+  },
   integrations: [
     starlight({
       title: 'Typhon',
@@ -21,8 +40,7 @@ export default defineConfig({
         github: 'https://github.com/CodeHalwell/Typhon',
       },
       editLink: {
-        baseUrl:
-          'https://github.com/CodeHalwell/Typhon/edit/main/docs-site/src/content/docs/',
+        baseUrl: 'https://github.com/CodeHalwell/Typhon/edit/main/docs-site/',
       },
       customCss: ['./src/styles/custom.css'],
       head: [
@@ -198,6 +216,7 @@ export default defineConfig({
             { label: 'Purity Errors', slug: 'diagnostics/purity-errors' },
             { label: 'Stub Errors', slug: 'diagnostics/stub-errors' },
             { label: 'Compile & Interface Errors', slug: 'diagnostics/compile-errors' },
+            { label: 'Lints & Performance Advice', slug: 'diagnostics/lints' },
           ],
         },
         {
@@ -240,6 +259,7 @@ export default defineConfig({
           label: 'Project',
           items: [
             { label: 'Roadmap', slug: 'project/roadmap' },
+            { label: 'Compatibility Policy', slug: 'project/compatibility' },
             { label: 'Risks and Mitigations', slug: 'project/risks' },
             { label: 'Prior Art', slug: 'project/prior-art' },
             { label: 'Naming', slug: 'project/naming' },

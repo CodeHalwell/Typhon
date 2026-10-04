@@ -28,6 +28,9 @@ the code.
 
 - the `sorted(...)` call carries a `key=` or `reverse=` keyword (kept simple —
   only the bare form is flagged);
+- it sits in the body of a `try` whose handler catches `IndexError` or
+  `LookupError` — on an empty sequence `sorted(xs)[0]` raises `IndexError`
+  but `min(xs)` raises `ValueError`, which that handler would not catch;
 - the index isn't `[0]` or `[-1]` (a slice `[:3]` or a middle index really does
   need the full order).
 

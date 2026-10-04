@@ -46,7 +46,10 @@ tyc run --compile --temp      # legacy with ephemeral build dir
   recursion (a 1000-frame limit by default, matching CPython's
   `sys.getrecursionlimit()`; `sys.setrecursionlimit(n)` moves it, rejecting
   `n < 1` with CPython's own `ValueError`, and exceeding it raises
-  `RecursionError`).
+  `RecursionError`). A raised limit is also bounded by the native stack the
+  VM runs on: about 30,000 nested calls under `tyc run` (a 256 MiB stack),
+  past which the VM raises `RecursionError` where CPython 3.13 — whose
+  Python-to-Python calls use no C stack — keeps going.
 - Classes: annotated fields (constructor synthesised at instantiation),
   explicit `__init__`, methods declared inside `class` body, methods
   declared in a sibling `impl Foo:` block (merged on the fly), single
@@ -90,9 +93,9 @@ absent),
 (raises `ZeroDivisionError` with CPython messages), `pow` (2- and 3-arg
 modular), `format`, `ascii`, and `int(str, base)` including `base=0`
 (autodetect `0x` / `0o` / `0b`). `min` / `max` accept `key=` / `default=`
-keyword arguments. Decorator stubs `@property`, `@classmethod`,
-`@staticmethod`, and the `super()` call are present as identity-ish
-builtins since v0.9.0 so decorated methods no longer crash on import.
+keyword arguments. `property`, `classmethod`, `staticmethod` and
+`super()` follow CPython's descriptor and MRO rules (see "Classes: method
+resolution and class namespaces" below).
 
 Since v0.10.0 `type(x)` returns a **real type object**, not a plain
 string. `type(x).__name__` resolves to the type name, `str(type(x))`
@@ -147,7 +150,7 @@ since v1.0.0-beta.1 — before that each built an opaque instance, so
 | `heapq` (v0.9.0) | `heappush`, `heappop`, `heapify`, `heappushpop`, `heapreplace`, `nsmallest`, `nlargest` — plus, since the 2026-09-30 review, `merge(*iterables, key=, reverse=)` with CPython's tie order |
 | `contextlib` (v0.9.0) | `@contextmanager` identity decorator and `contextmanager`-decorated factories. `with` block honours the wrapped `__enter__` / `__exit__` shape. v1.0.0-beta.1: `@asynccontextmanager` really drives its generator (it was an identity decorator, so `async with` raised), plus `suppress`, `nullcontext`, `closing`, `redirect_stdout`, `redirect_stderr`, `ExitStack`. 2026-09-30 review: `AbstractContextManager`, `AbstractAsyncContextManager`, `ContextDecorator`, `AsyncContextDecorator`, `chdir`, `aclosing`, `AsyncExitStack` |
 | `pydantic` (v0.9.0, expanded v0.10.0 and v1.0.0-beta.1) | `BaseModel` is a placeholder so declaring a `model` doesn't `ImportError`. `Model.model_validate(mapping)` constructs an instance from a dict — annotated sub-models included, recursively, since v1.0.0-beta.1, alongside `model_validate_json` — `inst.model_dump()` returns a dict of the fields in declaration order (unwrapping nested models back to dicts, as pydantic's does), and `model_dump_json()` the JSON form. It does not *validate*: a field of the wrong type is stored as given rather than raising `ValidationError` |
-| `io` (v1.0.0-beta.1) | `open` and the file objects behind it (`TextIOWrapper`, `BufferedReader` / `BufferedWriter`, `FileIO`), `StringIO`, `BytesIO`, `SEEK_*`, `UnsupportedOperation`. Modes, encodings, newline translation, `seek` / `tell` / `truncate` / `flush`, iteration by line, and the CPython error messages for a closed or wrong-mode file |
+| `io` (v1.0.0-beta.1) | `open` and the file objects behind it (`TextIOWrapper`, `BufferedReader` / `BufferedWriter`, `FileIO`), `StringIO`, `BytesIO`, `SEEK_*`, `UnsupportedOperation`. Modes, encodings, newline translation, `seek` / `tell` / `truncate` / `flush`, iteration by line, and the CPython error messages for a closed or wrong-mode file. Residual: the default text encoding is reported as `utf-8`, where CPython spells the host locale encoding (`UTF-8` on macOS, `utf-8` under glibc) |
 | `shutil` (v1.0.0-beta.1) | `copy`, `copy2`, `copyfile`, `copytree`, `move`, `rmtree`, `which`, `disk_usage`, `SameFileError` |
 | `tempfile` (v1.0.0-beta.1) | `mkdtemp`, `mkstemp`, `gettempdir`, `NamedTemporaryFile`, `TemporaryDirectory`, `TemporaryFile` |
 | `glob` (v1.0.0-beta.1) | `glob`, `iglob`, `escape`, `has_magic` — the same matcher `pathlib.Path.glob` uses, including `**` |
@@ -290,6 +293,201 @@ honours them on user-class instances:
   descriptor marker is cleared when a subclass plain method overrides an
   inherited property / classmethod.
 
+### Classes: method resolution and class namespaces (beta)
+
+Attribute lookup follows CPython's object model rather than copying a
+base class's namespace into every subclass:
+
+- **C3 linearisation.** Each class computes its `__mro__` once, by C3,
+  and every lookup, `super()` and `__mro__` walk it — a diamond `D(B, C)`
+  resolves `D > B > C > A`, a cooperative `__init__` diamond runs every
+  `__init__` exactly once, and an inconsistent base order raises CPython's
+  `TypeError: Cannot create a consistent method resolution order (MRO)`.
+- **One namespace per class, read at lookup time.** An attribute set on a
+  base after a subclass was created is visible through the subclass and
+  its instances; a subclass's own class attribute shadows an inherited
+  method; `Cls.f = func` replaces a `def f`; `del Cls.attr` removes the
+  class's own binding (an inherited one raises `AttributeError`).
+- **`super()`** (zero-argument, explicit two-argument, inside a
+  `@classmethod`, and read as a value — `super().name` for a property or
+  class attribute) searches the MRO of the bound object's type *after* the
+  class that defines the running method.
+- **Descriptors.** `property(fget, fset, fdel)`, `classmethod(f)` and
+  `staticmethod(f)` called as functions (or stored on a class later) bind
+  like their decorator forms; `@prop.deleter` is honoured; an object whose
+  type defines `__set__` / `__delete__` intercepts assignment / deletion
+  through an instance, and `__set_name__` is called at class creation.
+- **`__init_subclass__`** of the nearest ancestor runs when a subclass is
+  created, with the class header's keyword arguments.
+
+### Value-mixin enums (beta)
+
+A member of `IntEnum`, `StrEnum`, `IntFlag` or an enum with a data-type
+mixin (`class Mode(str, Enum)`, `class L(int, Enum)`) *is* an instance of
+its value's type, as in CPython: it compares and hashes like its value
+(also inside containers, `sorted`, tuple comparison and dict lookups —
+`{"fast": 1}[Mode.FAST]`), `isinstance(IntEnum.X, int)` holds, it
+encodes in `json` as its value, and it keeps its identity as a dict key.
+`str()` / `format()` show the value for `IntEnum` / `StrEnum` /
+`IntFlag` and `Mode.FAST` for a plain mixin (CPython 3.12+). A
+`StrEnum`'s `auto()` is the lower-cased member name, and a second name
+bound to an existing value is an alias of that member.
+
+### Checked casts (`as!`) follow the target table (beta)
+
+`EXPR as! TYPE` applies the table in `docs/language.md` ("Checked boundary
+casts") exactly as the generated `typhon_runtime/cast.py` does. The VM
+reads the target's syntax, since its typing objects are erased stand-ins:
+a `type` alias is expanded from its definition with its parameters bound
+to the cast's arguments (`Pair[int]`, recursive aliases over finite
+values; a cyclic value fails), a `newtype` checks the base it was declared
+with (including a generic base such as `list[int]`), `Literal[...]` checks
+exact type and value (`True` is not `1`), `Sequence` / `Collection` /
+`AbstractSet` / `Mapping` / `MutableMapping` check kind and elements, an
+`interface` checks member presence (fields as well as methods), and
+targets with no runtime shape — a parameterised user class, `Callable[…]`,
+`Iterator[…]`, `type[…]`, an alias used without its arguments — raise the
+runtime's `TypeError: as! cannot check …`. Failure messages print the
+target as CPython does (`list[int]`, `typing.Sequence[int]`, `Pair[int]`,
+`__main__.UserId`, `<class 'int'>`). `NewType(...)` builds a real newtype
+object (callable, `__supertype__`, printed `__main__.UserId`).
+
+### Size limits raise, they do not abort (beta)
+
+Everywhere CPython reports a size problem as an exception, so does the VM;
+it used to abort (`memory allocation of … bytes failed`, exit 134) or
+panic (exit 101). `"a" * 2**62`, `bytes(2**62)`, `x.zfill(2**62)` / `ljust`
+/ `rjust` / `center`, `int.to_bytes(2**62)`, `os.urandom(2**62)` and an
+f-string or `format` width of `2**62` raise `MemoryError`; `bytes(2**63)`
+and `"x".ljust(2**63)` raise `OverflowError` with CPython's messages.
+Float precisions of 65,536 and more format exactly (Rust's formatter caps
+precision at `u16::MAX`); a precision past `INT_MAX` is `ValueError:
+precision too big`. `round(x, n)` returns `x` itself for `n > 323` and a
+signed zero for `n < -308`, as CPython does. `json.dumps` raises
+`ValueError: Circular reference detected` for a self-containing list or
+dict and `RecursionError` past 9,997 levels of nesting. `repr` renders a
+list or dict met again inside itself as `[...]` / `{...}` at any depth
+(it used to print `[...]` for any nesting past 100 levels) and raises
+`RecursionError` past 9,997 levels; comparing two structures that deep
+raises `RecursionError` (`==` used to answer `False`).
+
+### Live dict views and checked iteration (beta)
+
+`dict.keys()` / `.values()` / `.items()` are live views of their dict, as
+in CPython: a key added after the view was taken shows up in it, `len`
+and `in` read the current dict (`k in d.keys()` is a dict lookup, not a
+scan). Iterating a dict, a dict view or a set while the loop body changes
+its size raises CPython's `RuntimeError` ("dictionary changed size during
+iteration" / "Set changed size during iteration"); re-binding an existing
+key's value is fine. `reversed(list)` indexes the live list,
+`reversed(dict)` (and of a view) raises on a size change, `reversed` of a
+range is a range iterator, and a non-sequence (`set`, a generator) is
+refused with `TypeError: '…' object is not reversible`.
+
+### Sets iterate in CPython's order (beta)
+
+A `set` / `frozenset` is a reproduction of CPython's open-addressing
+table (`Objects/setobject.c`: nine linear probes then perturbed probing,
+growth at three-fifths full, dummies on deletion), keyed by CPython's own
+hashes. Iteration, `repr`, `list(s)`, `s.pop()` and every set operation
+therefore produce CPython's order: `{-1, 0, 1}` is `{0, 1, -1}` and
+`{5, 3, 1, 100, 33, 2}` is `{1, 33, 3, 100, 5, 2}`. The construction path
+matters as it does in CPython — a literal of three or more constants is
+copied from a constant `frozenset`, `set(other_set)` copies its table,
+`set(a_dict)` resizes once up front, and `a | b`, `a & b`, `a - b`,
+`a ^ b` follow `set_or` / `set_intersection` / `set_difference` /
+`set_symmetric_difference`. `str` hashes use CPython's
+`PYTHONHASHSEED=0` key, so string sets match a CPython run with that seed
+(CPython randomises string-set order per process otherwise). All the
+`set` methods accept any iterable, including `intersection_update`,
+`difference_update`, `symmetric_difference_update` and `pop`.
+
+### Smaller CPython details (beta)
+
+- **Floats.** `repr` picks the correctly rounded digits when several
+  shortest strings round-trip (`(-4819706.21)**2` is `…712.562`). An int
+  too large for a float raises `OverflowError` wherever it is converted
+  (`float(10**400)`, `10**400 // 3.0`), `int / int` is correctly rounded
+  without converting the operands first (`10**400 / 10**399` is `10.0`),
+  and a finite `**` that overflows raises `OverflowError: (34, 'Result too
+  large')`.
+- **The int/str digit limit.** Converting an int of more than 4,300
+  decimal digits to text, or parsing one from text, raises CPython's
+  `ValueError`; `sys.get_int_max_str_digits()` /
+  `sys.set_int_max_str_digits(n)` read and move the limit (0 disables it).
+  Hex/octal/binary conversions are unlimited, as in CPython.
+- **Formatting.** `f"{x!s:<8}"` formats the converted string; a non-empty
+  spec on `None` / a list / a tuple / a dict / a set is
+  `TypeError: unsupported format string passed to NoneType.__format__`;
+  `','` with `'_'` is a `ValueError`; `'%c'` checks its range.
+- **Indexing.** A slice bound beyond the index range is clipped
+  (`'abc'[2**64:]` is `''`); an index beyond it raises
+  `IndexError: cannot fit 'int' into an index-sized integer`.
+- **Containment.** `1 in "abc"` is a `TypeError`; a class with only
+  `__iter__` or `__getitem__` supports `in` by iteration.
+- **Classes.** Class decorators run (`@total_ordering`, registries, any
+  decorator returning a replacement); `type(name, bases, ns)` builds a
+  class; `Cls.__dict__` is a read-only view of the class namespace;
+  `class X(ABC)` refuses instantiation while an `@abstractmethod` is
+  unimplemented; `@dataclass(order=True)` compares field tuples and
+  `@dataclass(repr=False)` falls back to the inherited `repr`; docstrings
+  are dedented as CPython 3.13's compiler does; `Box[int]` on a generic
+  class (PEP 695 or `Generic[T]`) is a callable generic alias usable as a
+  base, `list[int]` prints `list[int]`, a class's own `__class_getitem__`
+  is honoured, and `int | str` / `A | None` are runtime unions that
+  `isinstance` and `issubclass` accept.
+- **Protocols.** `NotImplemented` exists; a comparison or arithmetic dunder
+  returning it defers to the reflected method and then to CPython's
+  default (identity for `==`, `TypeError` otherwise). `await obj` drives
+  `obj.__await__()` to its return value. `raise e from e` records the
+  cause; `iter(g) is g` for a generator; `True.bit_length()` works; keys /
+  items views compare with sets and each other as sets do.
+- **`dict.fromkeys` / `str.maketrans`** are class methods (they were
+  dispatched as unbound methods of their first argument).
+
+Still different from CPython (each a known gap, not a silent wrong
+answer you can rely on): a PEP 695 `type` alias is bound to its value
+rather than a `TypeAliasType` object, so `isinstance(x, Alias)` works on
+the VM where CPython raises `TypeError` and `Alias.__value__` is missing;
+`__del__` never runs; a metaclass's `__call__` / `__new__` are not
+consulted; `Named.__mro__` omits `typing.Generic`; a lone surrogate
+(`"\ud800"`) cannot be represented in a Rust `String` (`'%c' % 0xD800`
+yields U+FFFD); and a generator that falls back to eager collection (see
+"What the VM does not support yet") runs its side effects at call time.
+
+### Keyword arguments and the pre-run scan (beta)
+
+A builtin-type method binds keyword arguments to its CPython 3.13
+signature: `s.replace("a", "b", count=2)`, `s.split(maxsplit=1)`,
+`n.to_bytes(2, byteorder="little")` and `b.hex(sep=":")` work, a method
+CPython gives no keywords (`d.get(k, default=0)`) raises CPython's
+`TypeError`, and an unknown or doubled keyword raises its message.
+`round(ndigits=)`, `int(base=)`, `math.prod(start=)`,
+`heapq.nlargest/nsmallest(key=)`, `json.loads/load(object_hook=,
+object_pairs_hook=)`, `asyncio.sleep(result=)`, `asyncio.wait_for(timeout=)`,
+`functools.lru_cache(maxsize=, typed=)` and `sorted(key=None)` are
+accepted too.
+
+Before running, `tyc run` also sends a program down the compiled path
+(as it does for an unmodelled import) when it uses a CPython builtin the
+VM lacks (`exec`, `eval`-style `compile`, `memoryview`, `globals`,
+`locals`, `aiter`, `anext`, `breakpoint`, `help`, `__import__`), calls
+`.add_note()` / reads `.__notes__`, or passes a builtin or VM-modelled
+module function a keyword the VM would reject or ignore
+(`json.dumps(default=)`, `dataclasses.field(repr=)`, `json.loads(parse_float=)`).
+
+A program that **schedules tasks** takes the compiled path too (W5-09):
+one that uses `go`, `gather:`, or an `asyncio` member whose effect
+depends on the event loop — `create_task`, `ensure_future`, `gather`,
+`wait`, `wait_for`, `timeout` / `timeout_at`, `as_completed`,
+`TaskGroup`, `shield`, `to_thread`, `Queue` and the other queues,
+`Lock` / `Event` / `Condition` / `Semaphore` / `Barrier`, `Runner`,
+`current_task` / `all_tasks`, and the event-loop accessors. The VM's
+scheduler is sequential: it runs a coroutine to completion when it is
+created, so such a program would print in a different order or ignore a
+timeout. A program that only awaits coroutines one after another stays
+on the VM. `--no-fallback` keeps the VM, with its sequential ordering.
+
 ## Multi-file projects
 
 Since v0.9.0 the VM loads sibling `.ty` modules from the project source
@@ -395,10 +593,12 @@ message:
   between exceptions collected from handler bodies, and an uncaught group
   prints the summary line (`ExceptionGroup: g (2 sub-exceptions)`) rather
   than CPython's nested `+-+---- 1 ----` traceback tree. Inherent to
-  sequential execution: the VM cannot cancel sibling tasks, so a
-  multi-failure `gather:` may report more members than CPython would — and
-  the body of a `TaskGroup` sees a failed task's exception at the `await`
-  rather than the `CancelledError` a real cancellation would deliver.
+  sequential execution, and only reachable with `--no-fallback` since
+  W5-09 routes task-scheduling programs to CPython: the VM cannot cancel
+  sibling tasks, so a multi-failure `gather:` may report more members than
+  CPython would — and the body of a `TaskGroup` sees a failed task's
+  exception at the `await` rather than the `CancelledError` a real
+  cancellation would deliver.
 - **Lazy / unbounded generators.** Finite `yield` / `yield from` work
   since v0.10.0 via eager materialisation, but the worst case
   (`while True: yield`) hits the `GENERATOR_CAP = 1_000_000` ceiling and
@@ -482,8 +682,9 @@ on the old behaviour will see different — correct — results):
   order (was `<Name instance>`).
 - Dataclass instances are hashable via `HashKey::Instance` (class
   identity + fields sorted by name).
-- Set / frozenset equality is order-independent; repr sorts elements
-  by canonical key.
+- Set / frozenset equality is order-independent. (Since beta, iteration
+  and `repr` follow CPython's table order — see "Sets iterate in
+  CPython's order" below; they no longer sort.)
 - Float `repr` matches CPython's shortest round-tripping form, with
   scientific notation for exp < -4 or ≥ 16 (`e+NN` / `e-NN`, ≥ 2
   exponent digits), `-0.0` preserved.
@@ -538,7 +739,10 @@ on the old behaviour will see different — correct — results):
   MRO.
 - `freeze let` deeply freezes (list → tuple, dict → mappingproxy,
   recursive); mutators on a frozen dict raise `TypeError` matching
-  CPython.
+  CPython. Since beta a frozen dict also *is* a `mappingproxy`:
+  `type(D).__name__` names it and `isinstance(D, dict)` is `False`, and a
+  frozen dataclass instance passes through unchanged (same object, fields
+  not rebuilt), as the generated runtime does.
 - `comptime let X = ...` inlines via the substitution pass shared
   with `tyc build`.
 - `lazy import M = N` uses the simpler `import M as N` rewrite.
@@ -629,6 +833,27 @@ a real Rust frame plus argument binding — exactly the cost Tier 2 (a
 bytecode VM) targets. [`docs/vm-performance-plan.md`](vm-performance-plan.md)
 has the full measured tables, the root-cause breakdown, and the tiers.
 
+Four operations used to be *quadratic* rather than merely slower, and
+are linear since v1.0.0-beta.1 (measured on an M-series Mac, release
+build; times for the whole loop):
+
+| Loop | Size | Before | After | CPython 3.13 |
+|---|---|---|---|---|
+| `del d[k]` over every key | 80k keys | 19.0 s | 0.03 s | 0.01 s |
+| `OrderedDict.popitem(last=False)` until empty | 60k items | 47.8 s | 0.16 s | 0.01 s |
+| `deque.popleft()` until empty | 200k items | quadratic | 0.73 s | 0.01 s |
+| `while i < len(s): s[i]` | 200k non-ASCII chars | quadratic | 0.10 s | 0.02 s |
+
+A dict deletes by leaving a hole, as CPython's does, and compacts once
+holes outnumber live keys; `len(dict)` no longer counts the keys; a
+`deque` keeps a head offset instead of shifting its list; and a long
+string remembers whether it is ASCII (and, if not, where each character
+starts), so `len(s)`, `s[i]` and `s[a:b]` stop rescanning it. One
+behaviour follows CPython only loosely: a dict mutated during iteration
+*without* changing size (a delete and an insert) may yield a different
+set of remaining keys than CPython, whose answer depends on when its
+table resizes; CPython documents that case as unreliable.
+
 A bytecode VM — the point at which rough CPython parity on most code
 becomes realistic — is designed as Tier 2 of that plan but not yet
 started; see [`docs/vm-performance-plan.md`](vm-performance-plan.md).
@@ -637,12 +862,29 @@ listed there as a non-goal for now.
 
 ## Diagnostics
 
-Runtime failures surface as `Traceback (most recent call last):` followed
-by `KIND: MESSAGE`. The traceback is intentionally minimal in v1 — it
-names the function frame but not the source line. Source-line tracebacks
-inside the VM are a tracked follow-up; for now, programs that need full
-traceback fidelity should run under `tyc run --compile` and use
-`tyc trace` on the captured stderr.
+An uncaught exception prints a CPython-format traceback on stderr and
+exits with status 1:
+
+- every frame names the file, the **line in the `.ty` source** and the
+  function, followed by that source line as written — the VM maps the
+  preprocessed buffer back through the same line table `tyc check` uses,
+  so `?`, with-chains, `rescue`, `gather:` and `as!` above a frame no
+  longer shift its line or show lowered Python;
+- a chained exception prints first, with CPython's separator: "The above
+  exception was the direct cause of the following exception:" for
+  `raise … from e`, "During handling of the above exception, another
+  exception occurred:" for an exception raised in an `except` or `finally`
+  (suppressed by `from None`);
+- a run of more than three identical frames (deep recursion) collapses into
+  `[Previous line repeated N more times]`;
+- the last line is `Kind: str(exc)` (so `KeyError: 'missing'` keeps its
+  quotes).
+
+Two cosmetic differences remain: the file name is the path `tyc run` was
+given rather than an absolute path, and CPython 3.13's `~~~^^^` position
+markers are not drawn (the compiled path's remapped tracebacks omit them
+too). The recursion limit counts the module frame, as CPython does: at the
+default of 1000, the 999th nested call is the last that fits.
 
 ## Talking to the VM from Rust
 
@@ -659,3 +901,5 @@ interp.root.set("custom", tyc_vm::Value::Int(42.into()));
 ```
 
 The crate is in `tyc/crates/tyc-vm`. See `lib.rs` for the public surface.
+
+Regular-expression imports (`re`) select compiled CPython execution in normal `tyc run`, before user code starts, so dynamic patterns, lookaround, backreferences and Python flags retain their Python semantics. `--no-fallback` explicitly requires the VM subset; unsupported regex syntax or flags raise an error. The VM honours `re.ASCII` for its supported patterns.

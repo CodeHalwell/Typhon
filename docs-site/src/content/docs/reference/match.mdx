@@ -7,7 +7,7 @@ sidebar:
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-`match` is Python's pattern-matching statement, with one Typhon-specific rule: on a sealed union, every variant must be covered (or `case _:` must be present).
+`match` is Python's pattern-matching statement, with one Typhon-specific rule: on a closed subject — a sealed union, an `enum`, `Result[T, E]`, `T?`, `bool` or a string-literal union — every value must be covered (or `case _:` must be present).
 
 ## Syntax
 
@@ -108,7 +108,7 @@ def add(p: tuple[int, int]) -> int:
         case (x, y): return x + y     # exhaustive — fixed-arity tuple, length is static
 ```
 
-Variadic `tuple[int, ...]` is intentionally excluded; non-exhaustive bool / string-literal subjects and wrong-arity tuple patterns still fire.
+Variadic `tuple[int, ...]` is intentionally excluded. A `bool` or string-literal match that misses a value reports `tyc::non_exhaustive_match` naming it (as well as `tyc::missing_return` when the function falls off the end); wrong-arity tuple patterns still fire.
 
 ### Or pattern
 
@@ -184,7 +184,7 @@ No wildcard needed — the three cases cover the whole sealed union. Add a fourt
 type Shape = Circle | Rectangle | Triangle | Square    # added Square
 
 # every match s: ... in the codebase now fails:
-# error[tyc::non_exhaustive_match]: match does not cover variant `Square`
+# error[tyc::non_exhaustive_match]: non-exhaustive `match` on sealed union `Shape`: missing variant(s) Square
 ```
 
 Use `case _:` for a deliberate catch-all (opts out of exhaustiveness):
@@ -215,10 +215,86 @@ def delta(d: Dir) -> tuple[int, int]:
 Drop a member and the `match` fails, naming the one you missed:
 
 ```python
-# error[tyc::non_exhaustive_match]: match does not cover member `Dir.WEST`
+# error[tyc::non_exhaustive_match]: non-exhaustive `match` on sealed union `Dir`: missing variant(s) WEST
 ```
 
 Since v0.14.1 enum exhaustiveness also carries across module boundaries — an `enum` imported from another module is checked the same way.
+
+## Nested sealed unions
+
+A sealed union whose variants include another sealed union flattens to its
+leaf classes. Covering every leaf is exhaustive:
+
+```python
+class Circle frozen:
+    r: float
+class Rect frozen:
+    w: float
+    h: float
+class Tri frozen:
+    b: float
+    h: float
+
+type Poly = Rect | Tri
+type Shape = Circle | Poly
+
+def area(s: Shape) -> float:
+    match s:
+        case Circle(r):
+            return 3.14 * r * r
+        case Rect(w, h):
+            return w * h
+        case Tri(b, h):
+            return 0.5 * b * h          # exhaustive — every leaf covered
+```
+
+Drop the `Tri` arm and the match reports `missing variant(s) Tri`. The inner
+alias is not a class, so `case Poly():` cannot stand in for its variants: it
+is rejected with
+[`tyc::alias_not_a_class`](/Typhon/diagnostics/match-errors/#tycalias_not_a_class)
+(CPython raises `TypeError` on it). Write `case Rect() | Tri():` instead.
+
+## Exhaustiveness on `Result`, `T?`, `bool` and literal unions
+
+The same check covers every other closed subject, and reports the same
+`tyc::non_exhaustive_match`:
+
+- **`Result[T, E]`** must handle `Ok` and `Err`. When `E` (or `T`) is itself
+  closed — a sealed union, an `enum`, `bool` or a literal union — the payload
+  patterns must cover it too.
+- **`T?`** must handle `None` once the other arms cover `T`.
+- **`bool`** must handle `True` and `False`.
+- **A string-literal union** must handle every literal.
+
+```python
+class NotFound frozen:
+    path: str
+class Timeout frozen:
+    after_ms: int
+
+type LoadError = NotFound | Timeout
+
+def describe(r: Result[str, LoadError]) -> str:
+    match r:
+        case Ok(body):
+            return body
+        case Err(NotFound(path)):
+            return f"missing: {path}"
+        case Err(Timeout(after_ms)):
+            return f"timed out after {after_ms}ms"
+
+def label(x: int?) -> str:
+    match x:
+        case None:
+            return "none"
+        case int() as n:
+            return str(n)
+```
+
+Add `Denied` to `LoadError` and `describe` reports
+`missing variant(s) Err(Denied)`; drop `case None:` from `label` and it
+reports `missing variant(s) None`. The `[strictness] exhaustive-match`
+setting applies to all of these forms.
 
 ## Matching over an expression scrutinee (v0.13.0)
 
@@ -262,7 +338,7 @@ match parse("42"):
         print(f"error: {msg}")
 ```
 
-`Result[T, E]` is a sealed union, so the checker enforces both arms.
+`Result[T, E]` is a closed type, so the checker enforces both arms — and, when the error type is itself a sealed union, an `Err(...)` arm for each of its variants (see [above](#exhaustiveness-on-result-t-bool-and-literal-unions)).
 
 ## How it desugars
 

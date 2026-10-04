@@ -64,11 +64,17 @@ def area(s: Shape) -> float:
 ```
 
 ```
-error[tyc::non_exhaustive_match]: match does not cover variant `Triangle`
- ┌─ src/shapes.ty:2:5
- │
-2 │     match s:
- │     ^^^^^^^^ add `case Triangle(base, height): ...` or use `case _:`
+tyc::non_exhaustive_match
+
+  × non-exhaustive `match` on sealed union `Shape`: missing variant(s)
+  │ Triangle
+   ╭─[src/shapes.ty:2:11]
+ 2 │     match s:
+   ·           ┬
+   ·           ╰── match is not exhaustive
+   ╰────
+  help: add a `case <Variant>():` arm for each missing variant, or add a `case
+        _:` wildcard arm
 ```
 
 This is what the design doc calls "the single biggest static-safety win over current Python" — and it pays off every time the union grows.

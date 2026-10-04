@@ -108,7 +108,7 @@ let e: int = 2 ** 10      # 1024
 let f: int = abs(-7)      # 7
 ```
 
-`/` always returns `float`; `//` returns `int` (or `float` if either operand is `float`). The checker tracks the result type.
+`/` always returns `float`; `//` returns `int` (or `float` if either operand is `float`). `int ** int` is `int` unless the exponent is provably negative: `2 ** -1` is `float` (`0.5`), while `2 ** k` with an `int` parameter `k` stays `int`. The checker tracks the result type.
 
 ### String operations
 

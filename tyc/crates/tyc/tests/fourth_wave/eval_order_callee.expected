@@ -1,0 +1,14 @@
+lookup callback
+swap
+shout 7
+Ok(value=7)
+swap
+shout 7
+Ok(value=7)
+width
+Ok(value='yo..')
+width
+Ok(value='hi..')
+width
+base greet 2
+Ok(value=3)

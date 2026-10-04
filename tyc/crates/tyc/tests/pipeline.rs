@@ -888,20 +888,21 @@ fn vm_run_resolves_siblings_and_binds_sealed_union_alias() {
 
 #[test]
 fn tyc_run_falls_back_to_the_compiled_path_for_an_unmodelled_attribute() {
-    // The import scan only sees module names. `re` is modelled, but the VM's
-    // model of it has no `purge`, so without an attribute-level scan this
-    // program died with `AttributeError` under the VM while the compiled
-    // path ran it. The scan asks the VM what each modelled module exports
+    // The import scan only sees module names. `json` is modelled, but the
+    // VM's model of it has no `detect_encoding`, so without an
+    // attribute-level scan this program died with `AttributeError` under the
+    // VM while the compiled path ran it. (`re` no longer serves as the
+    // example: any `re` import now takes the compiled path, W5-13.) The scan asks the VM what each modelled module exports
     // and sends a program reading anything else down the compiled path,
     // naming the `module.attr` in the note.
     let project = tempfile::tempdir().unwrap();
-    let script = project.path().join("uses_purge.ty");
+    let script = project.path().join("uses_detect_encoding.ty");
     std::fs::write(
         &script,
-        "import re\n\n\
+        "import json\n\n\
          def main() -> None:\n    \
-             re.purge()\n    \
-             print(re.sub(\"a\", \"b\", \"aaa\"))\n\n\
+             print(json.detect_encoding(b\"{}\"))\n    \
+             print(json.dumps([\"bbb\"]))\n\n\
          main()\n",
     )
     .unwrap();
@@ -918,7 +919,7 @@ fn tyc_run_falls_back_to_the_compiled_path_for_an_unmodelled_attribute() {
         "the program must actually run:\n{stderr}{stdout}"
     );
     assert!(
-        stderr.contains("`re.purge` is not modelled by the in-process VM"),
+        stderr.contains("`json.detect_encoding` is not modelled by the in-process VM"),
         "the fallback must name the missing attribute:\n{stderr}"
     );
 
@@ -936,10 +937,10 @@ fn tyc_run_falls_back_to_the_compiled_path_for_an_unmodelled_attribute() {
     );
 
     // An attribute the VM does export keeps the program in the VM.
-    let plain = project.path().join("uses_flags.ty");
+    let plain = project.path().join("uses_dumps.ty");
     std::fs::write(
         &plain,
-        "import re\n\ndef main() -> None:\n    print(re.findall(\"a\", \"AaA\", re.I))\n\nmain()\n",
+        "import json\n\ndef main() -> None:\n    print(json.dumps({\"a\": 1}))\n\nmain()\n",
     )
     .unwrap();
     let out = tyc().arg("run").arg(&plain).output().unwrap();
@@ -949,7 +950,7 @@ fn tyc_run_falls_back_to_the_compiled_path_for_an_unmodelled_attribute() {
         "a modelled-attribute program must stay in the VM:\n{stderr}"
     );
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("['A', 'a', 'A']"),
+        String::from_utf8_lossy(&out.stdout).contains("{\"a\": 1}"),
         "{stderr}"
     );
 }
@@ -1118,7 +1119,9 @@ fn vm_run_binds_forward_declared_sealed_union_alias() {
     // for `from shapes import AB` — the eager bind falls back to a name
     // placeholder, corrected by the post-body resolution pass before the
     // module's attributes are snapshotted. Regression for the Codex review
-    // on PR #187.
+    // on PR #187. (The import itself fails if the binding is missing. The
+    // test used to also print `isinstance(A(v=1), AB)`, which CPython
+    // rejects with `TypeError` and is now `tyc::alias_not_a_class`.)
     let project = tempfile::tempdir().unwrap();
     let src = project.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
@@ -1143,8 +1146,7 @@ fn vm_run_binds_forward_declared_sealed_union_alias() {
                     case A(v):\n            return v\n        \
                     case B(v):\n            return v * 2\n\n\
             def main() -> None:\n    \
-                print(pick(B(v=10)))\n    \
-                print(isinstance(A(v=1), AB))\n\n\
+                print(pick(B(v=10)))\n\n\
             if __name__ == \"__main__\":\n    main()\n",
     )
     .unwrap();
@@ -1159,10 +1161,7 @@ fn vm_run_binds_forward_declared_sealed_union_alias() {
         "run with a forward-declared imported alias must succeed: {combined}"
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("20") && stdout.contains("True"),
-        "expected `20` and `True`, got: {combined}"
-    );
+    assert!(stdout.contains("20"), "expected `20`, got: {combined}");
 }
 
 #[test]
@@ -2191,7 +2190,7 @@ fn source_map_question_op_expansion_maps_back_to_original_line() {
     //
     // Source layout (line numbers 1-indexed):
     //   1: def parse(s: str) -> Result[int, str]:
-    //   2:     let n = int(s)?
+    //   2:     let n = try_result(lambda: int(s), lambda e: str(e))?
     //   3:     return Ok(n)
     //
     // The `?` on line 2 expands to ≥3 Python lines; all of them should map
@@ -2201,7 +2200,7 @@ fn source_map_question_op_expansion_maps_back_to_original_line() {
         tmp.path(),
         "\
 def parse(s: str) -> Result[int, str]:
-    let n = int(s)?
+    let n = try_result(lambda: int(s), lambda e: str(e))?
     return Ok(n)
 ",
     );
@@ -2271,7 +2270,7 @@ def parse(s: str) -> Result[int, str]:
     }
 
     // 3. The lines of the `?` expansion all map back to the *single* `.ty`
-    //    line they came from (line 2, `let n = int(s)?`). Before the fix they
+    //    line they came from (line 2, `let n = try_result(lambda: int(s), lambda e: str(e))?`). Before the fix they
     //    mapped to 3, 4, 5, 6 — four consecutive preprocessed-buffer lines.
     assert!(
         lines.iter().filter(|&&l| l == 2).count() >= 2,
@@ -2303,7 +2302,7 @@ fn source_map_question_op_traceback_rewrite() {
         tmp.path(),
         "\
 def parse(s: str) -> Result[int, str]:
-    let n = int(s)?
+    let n = try_result(lambda: int(s), lambda e: str(e))?
     return Ok(n)
 ",
     );

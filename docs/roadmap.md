@@ -10,6 +10,32 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Current release
 
+**[v1.0.0-beta.1](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-beta.1) — 2026-10-04.**
+The first beta: four review-remediation waves on top of alpha.9 — the
+2026-09-01 beta-readiness review and the backlog it deferred, the 2026-09-30
+release-readiness review, and the W1–W7 remediation of the six 2026-10-03
+full reviews. Type-checker soundness: field narrowings are dropped wherever a
+call or write can reach them, loops join their exit paths, nullable receivers
+of every shape and union member access are checked, and `match`
+exhaustiveness covers `Result` payloads, `T?`, `bool`, literal unions and
+nested sealed unions. Lowering: an inline `?` keeps Python's evaluation order,
+`|>` works in every expression position, an `impl` method may read a name
+bound after its class, and `extend BUILTIN` reaches every receiver shape.
+`tyc run` gains C3 method resolution, CPython-ordered sets, value-mixin enums,
+a stdlib-shim audit and an automatic CPython fallback for programs the VM does
+not model. `tyc fmt` refuses output that changes what a program means, the
+CLI and the language server no longer write through or walk out of the
+project along a symlink, and CI gains `compileall`, no-build-baseline,
+`fmt-corpus`, `fmt-guard`, `valid-corpus` and macOS jobs. No new syntax beyond
+the additive `"Node"?` spelling. The new error-level diagnostics
+(`tyc::alias_not_a_class`, `tyc::invalid_pattern`,
+`tyc::impl_forward_reference`, and `tyc::reserved_module_name` when the
+program could not start) fire only on code that already crashed. One
+documented exception changes a default: `[strictness] nullable-use` is now
+`"error"`. It and the release's other deliberate narrowings are listed with
+their escapes in the new [compatibility policy](compatibility.md), under which
+the surface is now frozen for the beta line.
+
 **[v1.0.0-alpha.9](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.9) — 2026-08-21.**
 A maintenance release on top of alpha.8, with no language change. The
 warn-level `tyc::contains_secret_literal` keyword table grows from 16 entries
@@ -52,7 +78,7 @@ diagnostic.
 
 **[v1.0.0-alpha.7](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.7) — 2026-07-29.**
 The full-codebase-review remediation release. It closes all ten of the
-[2026-07-28 codebase review](codebase-review-2026-07-28.md)'s 1.0 blockers
+[2026-07-28 codebase review](reviews/codebase-review-2026-07-28.md)'s 1.0 blockers
 plus the Tier-0 gates that make them verifiable: type-checker soundness
 fixes (instance-attribute assignment is now type-checked, constructor field
 order follows reverse MRO, model constructors are keyword-only, recursive
@@ -72,7 +98,7 @@ unsound typing, plus one warn-level diagnostic-surface addition.
 
 **[v1.0.0-alpha.6](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.6) — 2026-07-21.**
 A maintenance release on top of alpha.5, driven by the
-[2026-07-20 release-readiness review](release-readiness-2026-07-20.md). The
+[2026-07-20 release-readiness review](reviews/release-readiness-2026-07-20.md). The
 July dependency wave is carried safely across the `toml` 0.8 → 1.x major —
 including the fix for the one regression that bump introduced (the
 `tyc-venv` dependency allow-list reader silently returning empty, which
@@ -118,7 +144,7 @@ provably-different-shaped class across a module boundary, so no
 previously-*correct* program changes behaviour.
 
 **[v1.0.0-alpha.3](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.3) — 2026-07-03.**
-A release-readiness remediation pass (`RELEASE_READINESS_REVIEW.md`) — the
+A release-readiness remediation pass ([`RELEASE_READINESS_REVIEW.md`](reviews/RELEASE_READINESS_REVIEW.md)) — the
 licensing, packaging, and robustness counterpart to alpha.2's soundness sweep.
 Licensing / packaging gaps that would block a clean public release are closed
 (a repository-root MIT `LICENSE`, the upstream Ruff MIT notice vendored beside
@@ -138,7 +164,7 @@ previously-*unsound* narrowing, so no previously-*correct* program changes
 behaviour.
 
 **[v1.0.0-alpha.2](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.2) — 2026-06-29.**
-The remediation of the [2026-06-28 adversarial pre-release review](adversarial-review-2026-06-28.md):
+The remediation of the [2026-06-28 adversarial pre-release review](reviews/adversarial-review-2026-06-28.md):
 a type-checker soundness sweep (non-local flow-narrowing invalidated across an
 intervening call or alias write; short-circuit `and`/`or` narrowing no longer
 false-positives on `x is not None and x.method()`), a batch of newly-typed

@@ -7,6 +7,10 @@ sidebar:
 
 The compiler generates a small `typhon_runtime/` package alongside your code whenever the emitted Python references any of its helpers — that is, whenever the program uses `Result` / `Ok` / `Err`, `go` (spawn), `lazy import` / `lazy let`, `map_pure`, `deep_freeze`, `checked_cast` (the `as!` cast, v0.14.0), or `try_result` (v0.15.0). This page lists what's in it. The exact source below is what `tyc build` writes verbatim — search for `TYPHON_RUNTIME_*_PY` in `tyc/crates/tyc/src/commands/build.rs` to read the templates.
 
+:::caution[`typhon_runtime` is a reserved name]
+Do not name a module of your own `typhon_runtime`. The generated package replaces it whenever it is written, so `tyc check` and `tyc build` warn ([`tyc::reserved_module_name`](/Typhon/diagnostics/compile-errors/#tycreserved_module_name)) when the source root holds a `typhon_runtime.ty` or a `typhon_runtime/` package, and `tyc build` fails when the program imports a name from it that the generated runtime does not provide — such a program could not start — or reads one off a bare `import typhon_runtime` (`typhon_runtime.helper()`), which would raise `AttributeError`.
+:::
+
 ## `typhon_runtime/__init__.py`
 
 Always emitted when any of the runtime helpers are needed. Re-exports `Ok` / `Err` / `Result` so callers can `from typhon_runtime import Ok, Err`, and re-exports the `lazy`, `tasks`, `result`, `parallel`, `stdlib` submodules under dotted paths.
@@ -176,7 +180,7 @@ The full implementation lives in `tyc/crates/tyc/src/commands/build.rs` under `T
 
 Emitted whenever the `as!` checked boundary cast appears (v0.14.0). Holds `checked_cast(value, tp)`, which backs `EXPR as! TYPE`: it performs a **recursive structural shape check** of `value` against the target type `tp` and returns `value` on success, raising `TypeError` on a mismatch. The check honours `int`→`float` widening (an `int` passes a cast to `float`) and recurses into containers, unions, and parametric types (`x as! int | None`, `d as! dict[str, int]`).
 
-`as!` lowers to a `__typhon_checked_cast__(value, tp)` call routed through this helper on the build path. Under `tyc run` the VM intercepts `__typhon_checked_cast__` before argument evaluation and applies the same structural check natively, so a cast composes in any expression position (v0.15.0) under both runners.
+`as!` lowers to a `__typhon_checked_cast__(value, tp)` call routed through this helper on the build path. Under `tyc run` the VM intercepts `__typhon_checked_cast__` before argument evaluation and applies a structural check natively, so a cast composes in any expression position (v0.15.0) under both runners. The VM's check does not yet cover `Literal`, newtype, generic-alias or interface targets; see the [supported-target table](/Typhon/reference/unsafe/#supported-targets).
 
 ## `typhon_runtime/traceback.py`
 

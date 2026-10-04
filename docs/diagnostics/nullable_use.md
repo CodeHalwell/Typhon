@@ -29,6 +29,36 @@ def length_of(name: str?) -> int:
     return 0
 ```
 
+## Already checked, but not here
+
+When the function already checks the value for `None` above the use
+(`if self.conn is None: return`), but the checker cannot carry that
+narrowing to the use, the help text says so instead of asking for a guard
+that is already there. Typical causes: a call in between that may rebind the
+field (`reset(self)` writes `self.conn`), an assignment or `await` / `yield`
+in between, a check on another path, or a use inside a closure that can run
+after a later reassignment:
+
+```ty
+def run(b: Box) -> int:
+    if b.conn is None:
+        return 0
+    reset(b)              # may set b.conn = None
+    return b.conn.n       # help: `b.conn` is already checked above (`if b.conn is None:`), …
+```
+
+For a field, copy it into a local and guard that — a local cannot be rebound
+behind the checker's back:
+
+```ty
+def run(b: Box) -> int:
+    let conn = b.conn
+    if conn is None:
+        return 0
+    reset(b)
+    return conn.n
+```
+
 ## Nullable fields
 
 The same rule applies when the possibly-`None` value is a *field* rather than a

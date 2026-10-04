@@ -31,8 +31,13 @@ pub mod error;
 pub mod ffi;
 pub mod hashes;
 pub mod interp;
+pub mod limits;
+pub(crate) mod pydict;
 pub mod pyhash;
+pub mod pyset;
 pub mod slots;
+mod stack;
+pub(crate) mod strindex;
 mod unicode_data;
 pub mod value;
 
@@ -60,89 +65,23 @@ pub fn run_source(
     origin: Option<&Path>,
     script_args: &[String],
 ) -> Result<i32, VmError> {
-    // Apply the same surface-syntax expansions as `tyc build` so the parser
-    // sees identical input. `gather:`, `go`, `with`-chains, pipes and `?`
-    // all get lowered to plain Python before parsing.
-    //
-    // Note: we deliberately call `expand_lazy_lets` instead of the full
-    // `expand_lazy_imports`. The full version lowers `lazy import np =
-    // numpy` to a `__TyphonLazy_np_` proxy class that uses descriptor
-    // protocol and `__getattr__` — neither of which the VM models. The
-    // simpler `preprocess` pass below already rewrites `lazy import ALIAS
-    // = MODULE` to a plain `import MODULE as ALIAS`, which is the right
-    // shape for an in-process VM (no point deferring an import that's
-    // about to be evaluated eagerly anyway).
-    let expanded = preprocess::expand_all(source);
-    let prep = preprocess::preprocess(&expanded);
+    run_source_reporting(source, origin, script_args, &mut |tb| eprint!("{tb}"))
+}
 
-    let parsed = tyc_syntax::parse_module(&prep.python_source).map_err(|e| {
+/// [`run_source`], handing the rendered traceback of an uncaught exception
+/// to `report` instead of writing it to stderr.
+fn run_source_reporting(
+    source: &str,
+    origin: Option<&Path>,
+    script_args: &[String],
+    report: &mut dyn FnMut(&str),
+) -> Result<i32, VmError> {
+    let (mut module, prep) = front_end(source, FrontEnd::Program).map_err(|e| {
         let where_ = origin
             .map(|p| format!("{}: ", p.display()))
             .unwrap_or_default();
         VmError::Parse(format!("{where_}{e}"))
     })?;
-    let mut module = parsed.into_syntax();
-
-    // Evaluate `comptime` bindings and inline the resulting literals into
-    // the AST so the VM doesn't try to execute `env(...)` (a build-only
-    // intrinsic). `comptime def` bodies are stripped at the same time so
-    // a NameError from one of their build-only calls can't surface at
-    // runtime. Matches the substitution pass `tyc build` runs before
-    // desugaring.
-    let (comptime_values, _comptime_diags) = tyc_analyse::evaluate_comptime_with_functions(
-        &module,
-        &prep.comptime_bindings,
-        &prep.comptime_functions,
-    );
-    module = tyc_analyse::substitute_comptime_literals(
-        module,
-        &comptime_values,
-        &prep.comptime_functions,
-    );
-
-    // Collect `@memo` / `@pure(memo=True)` opt-ins exactly like `tyc build`
-    // does, so the desugar pass below injects `@functools.cache` instead of
-    // silently stripping the marker (which left memoised recursion running
-    // exponentially under the VM while the build path returned instantly).
-    let memoise_targets: Vec<String> = tyc_analyse::analyse_purity(&module, false)
-        .into_iter()
-        .filter(|f| f.violation.is_none() && f.memoise)
-        .map(|f| f.name)
-        .collect();
-
-    // Hand the VM the desugared module so it sees the same shape as the
-    // compile path: dataclass-decorated user classes, merged impl blocks,
-    // injected runtime imports, and so on. FINDINGS #21 follow-up.
-    // Running the full desugar pass also rewrites \`extend\` user-classes
-    // into method merges; the builtin-extension rewrite below handles the
-    // \`extend str:\` / \`extend list:\` shape that desugar leaves alone.
-    //
-    // Pass the preprocessor's class-kind markers (plain / raw / frozen) so
-    // the VM desugars `plain class` / `class!` / `class … frozen` exactly
-    // like `tyc build` — otherwise a `plain class` would be wrongly
-    // decorated as a `@dataclass` and its class-level constants treated as
-    // slots.
-    let desugar_out = tyc_desugar::desugar_module_with(
-        &module,
-        tyc_desugar::DesugarOptions {
-            memoise_functions: memoise_targets,
-            raw_class_line_starts: preprocess::line_byte_starts(
-                &prep.python_source,
-                &prep.raw_class_lines,
-            ),
-            frozen_class_line_starts: preprocess::line_byte_starts(
-                &prep.python_source,
-                &prep.frozen_class_lines,
-            ),
-            plain_class_line_starts: preprocess::line_byte_starts(
-                &prep.python_source,
-                &prep.plain_class_lines,
-            ),
-            pub_names: prep.pub_names.clone(),
-            ..Default::default()
-        },
-    );
-    module = desugar_out.module;
 
     // FINDINGS #21: rewrite \`x.method(args)\` to \`__typhon_ext_TYPE__method
     // (x, args)\` for every receiver statically annotated as a built-in
@@ -175,6 +114,9 @@ pub fn run_source(
     } else {
         let _ = tyc_analyse::rewrite_builtin_extension_calls(&mut module, &registry);
     }
+    // Inline `?` evaluation order: move each hoisted method receiver's
+    // lookup up with it, as `tyc build` does after the same rewrite.
+    preprocess::attach_method_lookups(&mut module);
 
     let mut interp = Interpreter::new();
     interp.lazy_import_aliases = prep
@@ -185,11 +127,13 @@ pub fn run_source(
     // Source info for traceback frames: file name + line table over the
     // preprocessed source (line-preserving for ordinary statements, so
     // frame numbers match the user's .ty lines).
-    interp.current_source = Some(std::rc::Rc::new(interp::SourceInfo::new(
+    interp.current_source = Some(std::rc::Rc::new(interp::SourceInfo::mapped(
         origin
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| "<source>".to_string()),
         &prep.python_source,
+        source,
+        &prep.line_map,
     )));
     // Seed sys.argv before any user code (or import sys) can observe it.
     let argv0 = origin
@@ -263,41 +207,259 @@ pub fn run_source(
             Ok(code)
         }
         Err(Unwind::Exception(exc)) => {
-            eprintln!("Traceback (most recent call last):");
-            // Frames accumulate innermost-first as the exception bubbles
-            // through `call_function`; CPython prints outermost-first.
-            // The module-level frame (where the failing call chain
-            // started) renders first, from the interpreter's final
-            // statement offset.
-            if let Some(si) = &interp.current_source {
-                let line = si.line_of(interp.current_offset);
-                eprintln!("  File \"{}\", line {}, in <module>", si.name, line);
-                if let Some(text) = si.line_text(line) {
-                    eprintln!("    {text}");
-                }
-            }
-            for frame in exc.frames.iter().rev() {
-                match (&frame.file, frame.line) {
-                    (Some(file), Some(line)) => {
-                        eprintln!("  File \"{file}\", line {line}, in {}", frame.function);
-                        if let Some(text) = &frame.line_text {
-                            eprintln!("    {text}");
-                        }
-                    }
-                    _ => eprintln!("  in {}", frame.function),
-                }
-            }
-            if exc.message.is_empty() {
-                eprintln!("{}", exc.kind);
-            } else {
-                eprintln!("{}: {}", exc.kind, exc.message);
-            }
+            report(&render_uncaught(&mut interp, &exc));
             Ok(1)
         }
         Err(Unwind::Break | Unwind::Continue | Unwind::QuestionMark(_) | Unwind::Yield(_)) => {
             Err(VmError::runtime("unexpected control-flow at module level"))
         }
     }
+}
+
+/// Print an uncaught exception the way CPython's default excepthook does:
+/// any chained exception first (its `__cause__`, else its `__context__`
+/// unless suppressed) with the "direct cause" / "during handling"
+/// separator, then this exception's traceback — outermost frame first,
+/// three copies of a repeated frame and "[Previous line repeated N more
+/// times]" for the rest — and its `Kind: str(exc)` line.
+fn render_uncaught(interp: &mut Interpreter, exc: &VmException) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    // The module-level frame (where the failing call chain started) comes
+    // from the interpreter's final statement offset; the rest accumulated
+    // innermost-first as the exception bubbled through `call_function`.
+    let mut frames: Vec<error::Frame> = exc.frames.iter().rev().cloned().collect();
+    if let Some(si) = &interp.current_source {
+        let line = si.line_of(interp.current_offset);
+        frames.insert(
+            0,
+            error::Frame {
+                function: "<module>".to_owned(),
+                line: Some(line),
+                file: Some(si.name.clone()),
+                line_text: si.line_text(line),
+                repeat: 0,
+            },
+        );
+    }
+    let mut seen: Vec<Value> = Vec::new();
+    if let Some(v) = &exc.value {
+        seen.push(v.clone());
+        render_chained(interp, v, &mut seen, &mut out);
+    }
+    out.push_str("Traceback (most recent call last):\n");
+    render_frames(&frames, &mut out);
+    let headline = match &exc.value {
+        Some(v) => exception_headline(interp, v, &exc.kind),
+        None if exc.message.is_empty() => exc.kind.clone(),
+        None => format!("{}: {}", exc.kind, exc.message),
+    };
+    let _ = writeln!(out, "{headline}");
+    out
+}
+
+/// Print the exception `v` is chained to, recursively, followed by the
+/// separator CPython prints before `v`'s own traceback.
+fn render_chained(interp: &mut Interpreter, v: &Value, seen: &mut Vec<Value>, out: &mut String) {
+    use std::fmt::Write as _;
+    let Some(chain) = value::exception_chain(v) else {
+        return;
+    };
+    let (next, separator) = match (&chain.cause, &chain.context) {
+        (Some(cause), _) if !matches!(cause, Value::None) => (
+            cause.clone(),
+            "The above exception was the direct cause of the following exception:",
+        ),
+        (_, Some(context)) if !chain.suppress_context => (
+            context.clone(),
+            "During handling of the above exception, another exception occurred:",
+        ),
+        _ => return,
+    };
+    if seen
+        .iter()
+        .any(|s| value::exception_values_identical(s, &next))
+    {
+        return;
+    }
+    seen.push(next.clone());
+    render_chained(interp, &next, seen, out);
+    if let Some(tb) = value::exception_chain(&next).and_then(|c| c.traceback.clone()) {
+        out.push_str("Traceback (most recent call last):\n");
+        let frames: Vec<error::Frame> = tb.iter().rev().cloned().collect();
+        render_frames(&frames, out);
+    }
+    let kind = match &next {
+        Value::Exception { kind, .. } => (**kind).clone(),
+        Value::Instance(i) => i.class.name.clone(),
+        _ => "Exception".to_owned(),
+    };
+    let _ = writeln!(out, "{}", exception_headline(interp, &next, &kind));
+    let _ = writeln!(out, "\n{separator}\n");
+}
+
+/// `Kind: str(exc)`, or the bare kind when `str(exc)` is empty.
+fn exception_headline(interp: &mut Interpreter, v: &Value, kind: &str) -> String {
+    let message = interp.str_of(v).unwrap_or_default();
+    if message.is_empty() {
+        kind.to_owned()
+    } else {
+        format!("{kind}: {message}")
+    }
+}
+
+/// Render frames outermost-first, collapsing a run of identical frames
+/// past the third into CPython's "[Previous line repeated N more times]".
+fn render_frames(frames: &[error::Frame], out: &mut String) {
+    use std::fmt::Write as _;
+    const RECURSIVE_CUTOFF: u64 = 3;
+    let mut last: Option<(&Option<String>, Option<u32>, &str)> = None;
+    let mut count: u64 = 0;
+    let flush = |count: u64, out: &mut String| {
+        if count > RECURSIVE_CUTOFF {
+            let more = count - RECURSIVE_CUTOFF;
+            let s = if more > 1 { "s" } else { "" };
+            let _ = writeln!(out, "  [Previous line repeated {more} more time{s}]");
+        }
+    };
+    for frame in frames {
+        let key = (&frame.file, frame.line, frame.function.as_str());
+        if last != Some(key) {
+            flush(count, out);
+            last = Some(key);
+            count = 0;
+        }
+        for _ in 0..=frame.repeat {
+            count += 1;
+            if count > RECURSIVE_CUTOFF {
+                continue;
+            }
+            match (&frame.file, frame.line) {
+                (Some(file), Some(line)) => {
+                    let _ = writeln!(out, "  File \"{file}\", line {line}, in {}", frame.function);
+                    if let Some(text) = &frame.line_text {
+                        let _ = writeln!(out, "    {text}");
+                    }
+                }
+                _ => {
+                    let _ = writeln!(out, "  in {}", frame.function);
+                }
+            }
+        }
+    }
+    flush(count, out);
+}
+
+/// Which caller a [`front_end`] run serves.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrontEnd {
+    /// A `.ty` program file: the entry module or an imported sibling.
+    Program,
+    /// An embedded stdlib shim: plain Python validated against CPython, so
+    /// every class is emitted exactly as written (no `@dataclass`
+    /// decoration, no synthesised `__init__`) and there is no `@memo` or
+    /// `comptime` to evaluate.
+    Shim,
+}
+
+/// The one front end every VM entry point shares — the entry program, an
+/// imported sibling module, and the embedded stdlib shims. It runs the
+/// canonical sugar chain plus the preprocessor
+/// ([`preprocess::expand_and_preprocess_mapped`], the exact chain
+/// `tyc check` / `tyc build` run), parses, inlines `comptime` values and
+/// desugars, so the VM can never drift from the compiled path's pass order
+/// again (each caller used to assemble the ten-pass chain by hand, and the
+/// copies ran `expand_lazy_lets` before `expand_typed_let_unpack`).
+///
+/// `lazy import` stays an eager import (`rewrite_lazy_imports = false`):
+/// the full lowering produces a descriptor-and-`__getattr__` proxy class,
+/// and there is no point deferring an import the VM is about to evaluate.
+///
+/// The returned `PreprocessResult::line_map` maps a `python_source` line to
+/// the line the user wrote (both 0-based); tracebacks use it.
+pub(crate) fn front_end(
+    source: &str,
+    kind: FrontEnd,
+) -> Result<(ruff_python_ast::ModModule, preprocess::PreprocessResult), String> {
+    let prep = preprocess::expand_and_preprocess_mapped(source, false);
+    let parsed = tyc_syntax::parse_module(&prep.python_source).map_err(|e| e.to_string())?;
+    let mut module = parsed.into_syntax();
+    if kind == FrontEnd::Shim {
+        let plain_class_lines: Vec<usize> = prep
+            .python_source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.trim_start().starts_with("class "))
+            .map(|(i, _)| i)
+            .collect();
+        let desugar_out = tyc_desugar::desugar_module_with(
+            &module,
+            tyc_desugar::DesugarOptions {
+                plain_class_line_starts: preprocess::line_byte_starts(
+                    &prep.python_source,
+                    &plain_class_lines,
+                ),
+                ..Default::default()
+            },
+        );
+        return Ok((desugar_out.module, prep));
+    }
+
+    // Evaluate `comptime` bindings and inline the resulting literals into
+    // the AST so the VM doesn't try to execute `env(...)` (a build-only
+    // intrinsic). `comptime def` bodies are stripped at the same time so
+    // a NameError from one of their build-only calls can't surface at
+    // runtime. Matches the substitution pass `tyc build` runs before
+    // desugaring.
+    let (comptime_values, _comptime_diags) = tyc_analyse::evaluate_comptime_with_functions(
+        &module,
+        &prep.comptime_bindings,
+        &prep.comptime_functions,
+    );
+    module = tyc_analyse::substitute_comptime_literals(
+        module,
+        &comptime_values,
+        &prep.comptime_functions,
+    );
+
+    // Collect `@memo` / `@pure(memo=True)` opt-ins exactly like `tyc build`
+    // does, so the desugar pass below injects `@functools.cache` instead of
+    // silently stripping the marker (which left memoised recursion running
+    // exponentially under the VM while the build path returned instantly).
+    let memoise_targets: Vec<String> = tyc_analyse::analyse_purity(&module, false)
+        .into_iter()
+        .filter(|f| f.violation.is_none() && f.memoise)
+        .map(|f| f.name)
+        .collect();
+
+    // Hand the VM the desugared module so it sees the same shape as the
+    // compile path: dataclass-decorated user classes, merged impl blocks,
+    // injected runtime imports, and so on. The preprocessor's class-kind
+    // markers (plain / raw / frozen) are threaded through so `plain class`
+    // / `class!` / `class … frozen` desugar exactly like `tyc build` —
+    // otherwise a `plain class` would be wrongly decorated as a
+    // `@dataclass` and its class-level constants treated as slots.
+    let desugar_out = tyc_desugar::desugar_module_with(
+        &module,
+        tyc_desugar::DesugarOptions {
+            memoise_functions: memoise_targets,
+            raw_class_line_starts: preprocess::line_byte_starts(
+                &prep.python_source,
+                &prep.raw_class_lines,
+            ),
+            frozen_class_line_starts: preprocess::line_byte_starts(
+                &prep.python_source,
+                &prep.frozen_class_lines,
+            ),
+            plain_class_line_starts: preprocess::line_byte_starts(
+                &prep.python_source,
+                &prep.plain_class_lines,
+            ),
+            pub_names: prep.pub_names.clone(),
+            ..Default::default()
+        },
+    );
+    Ok((desugar_out.module, prep))
 }
 
 /// Pre-scan sibling `.ty` files referenced by the entry module's imports,
@@ -377,9 +539,7 @@ pub(crate) fn merge_cross_module_extensions_for_vm(
         if let Some(cached) = loaded.get(&dotted) {
             return cached.clone();
         }
-        let facts = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| merge_sibling_extensions(&text, &dotted, registry, cross_fns));
+        let facts = load_module_extensions(&path, &dotted, registry, cross_fns, 0);
         loaded.insert(dotted, facts.clone());
         facts
     };
@@ -470,18 +630,73 @@ pub(crate) fn merge_cross_module_extensions_for_vm(
     (cross_fns, external)
 }
 
+/// [`merge_sibling_extensions`] for the module at `path`, plus — when it
+/// is a package `__init__.ty` with `pub *` — every module that facade
+/// aggregates (direct sibling modules and sub-packages, recursively), so a
+/// consumer importing through the facade sees their `extend BUILTIN:`
+/// methods and declared types as `tyc check` and `tyc build` do (W3-02).
+/// Each extension maps to the module that declares it, so the injected
+/// `from <module> import __typhon_ext_…` needs no re-export.
+fn load_module_extensions(
+    path: &Path,
+    dotted: &str,
+    registry: &mut tyc_analyse::ExtensionRegistry,
+    cross_fns: &mut std::collections::HashMap<String, String>,
+    depth: usize,
+) -> Option<tyc_analyse::TypeFacts> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let (own, is_facade) = merge_sibling_extensions(&text, dotted, registry, cross_fns)?;
+    let is_init = path.file_name().and_then(|n| n.to_str()) == Some("__init__.ty");
+    if !(is_init && is_facade) || depth > 32 {
+        return Some(own);
+    }
+    let dir = path.parent()?;
+    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    entries.sort();
+    let mut facts = tyc_analyse::TypeFacts::default();
+    for p in entries {
+        let (member, child) = if p.extension().and_then(|e| e.to_str()) == Some("ty") {
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if stem == "__init__" || stem.is_empty() {
+                continue;
+            }
+            (stem.to_owned(), p.clone())
+        } else if p.is_dir() && p.join("__init__.ty").is_file() {
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            (name.to_owned(), p.join("__init__.ty"))
+        } else {
+            continue;
+        };
+        let child_dotted = format!("{dotted}.{member}");
+        if let Some(child_facts) =
+            load_module_extensions(&child, &child_dotted, registry, cross_fns, depth + 1)
+        {
+            facts.merge(child_facts);
+        }
+    }
+    // The facade's own declarations win over what it aggregates.
+    facts.merge(own);
+    Some(facts)
+}
+
 /// Parse a sibling `.ty` source just enough to extract builtin extension
 /// sentinel classes and merge their methods into `registry`. Returns the
 /// sibling's declared field / return types (`None` when it does not
-/// parse), with the lifted extension functions included.
+/// parse), with the lifted extension functions included, and whether the
+/// source carries a `pub *` marker.
 fn merge_sibling_extensions(
     source: &str,
     module_name: &str,
     registry: &mut tyc_analyse::ExtensionRegistry,
     cross_fns: &mut std::collections::HashMap<String, String>,
-) -> Option<tyc_analyse::TypeFacts> {
-    let expanded = preprocess::expand_all(source);
-    let prep = preprocess::preprocess(&expanded);
+) -> Option<(tyc_analyse::TypeFacts, bool)> {
+    let prep = preprocess::expand_and_preprocess_mapped(source, false);
+    let is_facade = !prep.pub_star_lines.is_empty();
     let parsed = tyc_syntax::parse_module(&prep.python_source).ok()?;
     let mut sibling_module = parsed.into_syntax();
     let (sibling_registry, _) = tyc_analyse::extract_builtin_extensions(&mut sibling_module);
@@ -494,7 +709,10 @@ fn merge_sibling_extensions(
             });
         }
     }
-    Some(tyc_analyse::collect_module_type_facts(&sibling_module))
+    Some((
+        tyc_analyse::collect_module_type_facts(&sibling_module),
+        is_facade,
+    ))
 }
 
 /// Inject `from <module> import <fn_name>` AST nodes into `module` for
@@ -616,12 +834,363 @@ pub fn modelled_module_exports(
     }
 }
 
+/// Every builtin name a CPython 3.13 program can use: the public
+/// `dir(builtins)` plus the dunders a program can name.
+const PYTHON_BUILTINS: &[&str] = &[
+    "ArithmeticError",
+    "AssertionError",
+    "AttributeError",
+    "BaseException",
+    "BaseExceptionGroup",
+    "BlockingIOError",
+    "BrokenPipeError",
+    "BufferError",
+    "BytesWarning",
+    "ChildProcessError",
+    "ConnectionAbortedError",
+    "ConnectionError",
+    "ConnectionRefusedError",
+    "ConnectionResetError",
+    "DeprecationWarning",
+    "EOFError",
+    "Ellipsis",
+    "EncodingWarning",
+    "EnvironmentError",
+    "Exception",
+    "ExceptionGroup",
+    "False",
+    "FileExistsError",
+    "FileNotFoundError",
+    "FloatingPointError",
+    "FutureWarning",
+    "GeneratorExit",
+    "IOError",
+    "ImportError",
+    "ImportWarning",
+    "IndentationError",
+    "IndexError",
+    "InterruptedError",
+    "IsADirectoryError",
+    "KeyError",
+    "KeyboardInterrupt",
+    "LookupError",
+    "MemoryError",
+    "ModuleNotFoundError",
+    "NameError",
+    "None",
+    "NotADirectoryError",
+    "NotImplemented",
+    "NotImplementedError",
+    "OSError",
+    "OverflowError",
+    "PendingDeprecationWarning",
+    "PermissionError",
+    "ProcessLookupError",
+    "PythonFinalizationError",
+    "RecursionError",
+    "ReferenceError",
+    "ResourceWarning",
+    "RuntimeError",
+    "RuntimeWarning",
+    "StopAsyncIteration",
+    "StopIteration",
+    "SyntaxError",
+    "SyntaxWarning",
+    "SystemError",
+    "SystemExit",
+    "TabError",
+    "TimeoutError",
+    "True",
+    "TypeError",
+    "UnboundLocalError",
+    "UnicodeDecodeError",
+    "UnicodeEncodeError",
+    "UnicodeError",
+    "UnicodeTranslateError",
+    "UnicodeWarning",
+    "UserWarning",
+    "ValueError",
+    "Warning",
+    "ZeroDivisionError",
+    "abs",
+    "aiter",
+    "all",
+    "anext",
+    "any",
+    "ascii",
+    "bin",
+    "bool",
+    "breakpoint",
+    "bytearray",
+    "bytes",
+    "callable",
+    "chr",
+    "classmethod",
+    "compile",
+    "complex",
+    "copyright",
+    "credits",
+    "delattr",
+    "dict",
+    "dir",
+    "divmod",
+    "enumerate",
+    "eval",
+    "exec",
+    "exit",
+    "filter",
+    "float",
+    "format",
+    "frozenset",
+    "getattr",
+    "globals",
+    "hasattr",
+    "hash",
+    "help",
+    "hex",
+    "id",
+    "input",
+    "int",
+    "isinstance",
+    "issubclass",
+    "iter",
+    "len",
+    "license",
+    "list",
+    "locals",
+    "map",
+    "max",
+    "memoryview",
+    "min",
+    "next",
+    "object",
+    "oct",
+    "open",
+    "ord",
+    "pow",
+    "print",
+    "property",
+    "quit",
+    "range",
+    "repr",
+    "reversed",
+    "round",
+    "set",
+    "setattr",
+    "slice",
+    "sorted",
+    "staticmethod",
+    "str",
+    "sum",
+    "super",
+    "tuple",
+    "type",
+    "vars",
+    "zip",
+    "__import__",
+    "__build_class__",
+    "__debug__",
+];
+
+/// Whether `name` is a CPython builtin the VM does not provide (`exec`,
+/// `memoryview`, `globals`). `tyc run`'s pre-run scan sends a program that
+/// uses one down the compiled path rather than into a `NameError`.
+pub fn unmodelled_builtin(probe: &Interpreter, name: &str) -> bool {
+    PYTHON_BUILTINS.contains(&name) && probe.root.get(name).is_none()
+}
+
+/// Whether the VM accepts keyword `kw` when calling `name` — a builtin when
+/// `module` is `None`, else that VM-modelled module's attribute. `None` when
+/// the answer is not known here (the callee is not a VM-provided function,
+/// or it forwards keywords somewhere this cannot see), which the pre-run
+/// scan treats as "leave it to the VM".
+pub fn call_accepts_keyword(
+    probe: &mut Interpreter,
+    module: Option<&str>,
+    name: &str,
+    kw: &str,
+) -> Option<bool> {
+    let callee = match module {
+        None => probe.root.get(name)?,
+        Some(m) => {
+            if !models_module(m) {
+                return None;
+            }
+            let Ok(module) = probe.import_module(m) else {
+                return None;
+            };
+            probe.get_attr(&module, name).ok()?
+        }
+    };
+    match callee {
+        Value::Native(n) => crate::builtins::native_accepts_keyword(n.name, kw),
+        Value::Function(f) => {
+            let p = &f.params;
+            let named = p
+                .args
+                .iter()
+                .chain(p.kwonlyargs.iter())
+                .any(|a| a.parameter.name.as_str() == kw);
+            Some(named || p.kwarg.is_some())
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod parity_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The CLI runs the interpreter on a dedicated 256 MiB worker stack
+    /// (`tyc/src/main.rs`); libtest threads get 2 MiB, which a deep but
+    /// *legal* recursion overflows in debug builds long before the VM's own
+    /// 1000-frame guard fires — `slot_recursion_fib` used to abort the
+    /// whole test binary on aarch64. Run every VM invocation the way the
+    /// CLI does so the tests stop depending on the host's stack size.
+    ///
+    /// Measured native stack per VM call frame (aarch64, 2026-10-03,
+    /// depth-1000 recursion on the worker thread): **~99,370 B (97 KiB)
+    /// debug, ~7,119 B (7 KiB) release** — a debug build needs ~97 MiB for
+    /// the 1000-frame guard alone, so anything near a 2–8 MiB default
+    /// thread stack is marginal by an order of magnitude.
+    const TEST_WORKER_STACK_SIZE: usize = 256 * 1024 * 1024;
+
+    fn run_on_worker_stack<F, T>(f: F) -> T
+    where
+        F: FnOnce() -> T + Send,
+        T: Send,
+    {
+        std::thread::scope(|scope| {
+            let handle = std::thread::Builder::new()
+                .stack_size(TEST_WORKER_STACK_SIZE)
+                .spawn_scoped(scope, f)
+                .expect("failed to spawn the VM test worker thread");
+            match handle.join() {
+                Ok(v) => v,
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        })
+    }
+
     fn run_capturing(source: &str) -> Result<i32, VmError> {
-        run_source(source, None, &[])
+        run_on_worker_stack(|| run_source(source, None, &[]))
+    }
+
+    /// A probe that calls `os.chdir` changes the *process* working directory,
+    /// and libtest runs tests concurrently, so two such tests make every
+    /// relative-path assertion in the suite nondeterministic. Serialise them.
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn review_nan_identity_in_containers() {
+        assert_eq!(
+            run_capturing(
+                r###"let x: float = float("nan")
+let y: float = float("nan")
+assert not (x == x)
+assert [x] == [x]
+assert (x,) == (x,)
+assert {"n": x} == {"n": x}
+assert x in [x]
+assert not (y in [x])
+assert not ([x] == [y])
+let d: dict[float, int] = {x: 1, y: 2}
+assert len(d) == 2
+assert d[x] == 1
+assert d[y] == 2
+"###
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn freeze_passes_immutable_values_through_like_the_runtime() {
+        // The emitted runtime's `deep_freeze` returns enum members, dates,
+        // timedeltas, timezones and paths unchanged; the VM must too.
+        assert_eq!(
+            run_capturing(
+                r###"import datetime
+from pathlib import Path
+enum Mode:
+    FAST
+    SLOW
+let d = datetime.date(2026, 1, 2)
+let p = Path("a")
+freeze let CFG = {"mode": Mode.FAST, "d": d, "dt": datetime.datetime(2026, 1, 2), "td": datetime.timedelta(days=1), "tz": datetime.timezone.utc, "p": p}
+assert CFG["mode"] is Mode.FAST
+assert CFG["d"] is d
+assert CFG["p"] is p
+assert CFG["td"] == datetime.timedelta(days=1)
+"###
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn review_frozen_metadata_and_instance_identity() {
+        assert_eq!(
+            run_capturing(
+                r###"let key: str = "__typhon_frozen__"
+let d: dict[str, int] = {key: 1}
+d["x"] = 2
+freeze let D: dict[str, int] = d
+assert len(D) == 2
+assert D[key] == 1
+freeze let S: set[str] = {key}
+assert key in S
+assert key in S.union({"x"})
+assert len(S.union({"x"})) == 2
+class Box frozen:
+    values: list[int]
+let b: Box = Box(values=[1])
+freeze let B: Box = b
+assert B is b
+B.values.append(2)
+assert B.values == [1, 2]
+"###
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn review_question_evaluates_prior_arguments_before_success_and_error() {
+        assert_eq!(
+            run_capturing(
+                r###"let calls: list[str] = []
+def first() -> int:
+    calls.append("first")
+    return 1
+def second(fail: bool) -> Result[int, str]:
+    calls.append("second")
+    return Err("bad") if fail else Ok(2)
+def combine(a: int, b: int) -> int:
+    return a + b
+def use(fail: bool) -> Result[int, str]:
+    return Ok(combine(
+        first(),
+        second(fail)?,
+    ))
+let result = use(False)
+assert calls == ["first", "second"]
+assert result.value == 3
+calls.clear()
+let failed = use(True)
+assert calls == ["first", "second"]
+assert failed.error == "bad"
+"###
+            )
+            .unwrap(),
+            0
+        );
     }
 
     /// The declared list and the resolver must agree: a name in the list
@@ -670,7 +1239,7 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, text).unwrap();
         }
-        run_file(&dir.path().join(entry), &[])
+        run_on_worker_stack(|| run_file(&dir.path().join(entry), &[]))
     }
 
     const CHECK: &str = r#"
@@ -885,54 +1454,141 @@ if ran != 3:
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
 
+    /// Evaluate each expression with the hosting `python3.13` and return the
+    /// `repr` of each result, in order — `None` when no python3.13 is on
+    /// PATH (the caller then skips, or panics when TYC_REQUIRE_PYTHON is
+    /// set: the same loud-or-skip convention as the pipeline tests).
+    fn python313_repr_oracle(exprs: &[&str]) -> Option<Vec<String>> {
+        let out = std::process::Command::new("python3.13")
+            .arg("-c")
+            .arg("import math, sys\nfor e in sys.argv[1:]:\n    print(repr(eval(e)))")
+            .args(exprs)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8(out.stdout).ok()?;
+        let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        (lines.len() == exprs.len()).then_some(lines)
+    }
+
+    /// Run a probe (Typhon source, ending in an accumulator join) through
+    /// the hosting `python3.13` and return its stdout. Only the two surface
+    /// rewrites the VM itself applies are needed to make the probe valid
+    /// Python: `mut x = …` -> `x = …`, and `unsafe:` -> `if True:`.
+    ///
+    /// Whole-transcript tests used to bury one platform's output in a
+    /// literal, which pinned host facts — errno numbers, the OSError
+    /// subclass, the tempdir path, CPython's locale-encoding spelling — as
+    /// if they were VM behaviour, and failed on every other host.
+    fn python313_transcript(probe: &str, accumulator: &str) -> Option<String> {
+        let py = format!(
+            "{}\nprint(chr(10).join({}))",
+            probe.replace("mut ", "").replace("unsafe:", "if True:"),
+            accumulator
+        );
+        let out = std::process::Command::new("python3.13")
+            .arg("-c")
+            .arg(&py)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let mut text = String::from_utf8(out.stdout).ok()?;
+        if text.ends_with('\n') {
+            text.pop();
+        }
+        Some(text)
+    }
+
     #[test]
     fn math_gains_the_missing_names_value_for_value() {
+        // libm-backed results can differ by an ulp between platforms (glibc
+        // vs Apple libm) and the VM deliberately calls the *host* libm, so
+        // pinning one platform's literals failed on macOS while the VM was
+        // bit-correct against the Mac's own CPython. The expectations are
+        // computed from the hosting python3.13 at test time instead.
+        let cases: &[(&str, &str)] = &[
+            ("gamma(0.5)", "math.gamma(0.5)"),
+            ("gamma(5)", "math.gamma(5)"),
+            ("gamma(-2.5)", "math.gamma(-2.5)"),
+            ("gamma(170.5)", "math.gamma(170.5)"),
+            ("gamma(1e-5)", "math.gamma(1e-5)"),
+            ("gamma(inf)", "math.gamma(math.inf)"),
+            ("lgamma(3)", "math.lgamma(3)"),
+            ("lgamma(0.5)", "math.lgamma(0.5)"),
+            ("lgamma(-2.5)", "math.lgamma(-2.5)"),
+            ("lgamma(1e5)", "math.lgamma(1e5)"),
+            ("lgamma(1e-5)", "math.lgamma(1e-5)"),
+            ("lgamma(-inf)", "math.lgamma(-math.inf)"),
+            ("erf(0.5)", "math.erf(0.5)"),
+            ("erfc(0.5)", "math.erfc(0.5)"),
+            ("erf(-2)", "math.erf(-2)"),
+            ("erfc(3.5)", "math.erfc(3.5)"),
+            ("sinh", "math.sinh(1.5)"),
+            ("cosh", "math.cosh(1.5)"),
+            ("tanh", "math.tanh(1.5)"),
+            ("asinh", "math.asinh(1.5)"),
+            ("acosh", "math.acosh(1.5)"),
+            ("atanh", "math.atanh(0.5)"),
+            ("cbrt(27)", "math.cbrt(27)"),
+            ("cbrt(-8.0)", "math.cbrt(-8.0)"),
+            ("exp2(10)", "math.exp2(10)"),
+            ("exp2(0.5)", "math.exp2(0.5)"),
+            ("fma", "math.fma(2, 3, 4)"),
+            ("fma small", "math.fma(0.1, 10, -1)"),
+            ("frexp", "[math.frexp(8.0), math.frexp(-3.5), math.frexp(5e-324), math.frexp(1e-310), math.frexp(0.0), math.frexp(math.inf)]"),
+            ("ldexp", "[math.ldexp(1.5, -1074), math.ldexp(1e-300, 1100), math.ldexp(3, 4), math.ldexp(True, 1), math.ldexp(1, -2**70), math.ldexp(0.0, 2**70)]"),
+            ("modf", "[math.modf(3.75), math.modf(-3.75), math.modf(math.inf), math.modf(-math.inf)]"),
+            ("modf(-0.0)", "math.modf(-0.0)"),
+            ("nextafter", "[math.nextafter(1.0, 2.0), math.nextafter(1.0, 0.0), math.nextafter(0.0, 1.0), math.nextafter(0.0, -1.0), math.nextafter(1, 2, steps=3), math.nextafter(1, 0, steps=2**80), math.nextafter(-0.0, 0.0), math.nextafter(1, 2, steps=0)]"),
+            ("ulp", "[math.ulp(1.0), math.ulp(0.0), math.ulp(-2.5), math.ulp(1.7976931348623157e308), math.ulp(3)]"),
+            ("isclose", "[math.isclose(1.0, 1.0000000001), math.isclose(1, 1.1), math.isclose(1, 1.1, rel_tol=0.2), math.isclose(0.0, 1e-10, abs_tol=1e-9), math.isclose(math.inf, math.inf), math.isclose(math.nan, math.nan), math.isclose(math.inf, 1e308), math.isclose(3, 3)]"),
+            ("sumprod", "[math.sumprod([1, 2, 3], [4, 5, 6]), math.sumprod([1.5, 2], [2, 3.5]), math.sumprod([0.1] * 10, [0.1] * 10), math.sumprod([2**70, 1], [1, 2.5]), math.sumprod([True], [1.5]), math.sumprod((1, 2), [3.0, 4.0]), math.sumprod([], []), math.sumprod([1e16, 1.0, -1e16], [1.0, 1.0, 1.0])]"),
+            ("sumprod overflow", "math.sumprod([1e308, 1e308], [10, -10])"),
+        ];
+        let exprs: Vec<&str> = cases.iter().map(|(_, e)| *e).collect();
+        let Some(wants) = python313_repr_oracle(&exprs) else {
+            if std::env::var_os("TYC_REQUIRE_PYTHON").is_some() {
+                panic!("python3.13 is required as the math oracle (TYC_REQUIRE_PYTHON is set)");
+            }
+            eprintln!(
+                "skipping math_gains_the_missing_names_value_for_value: no python3.13 on PATH"
+            );
+            return;
+        };
+        let mut checks = String::new();
+        for ((label, expr), want) in cases.iter().zip(&wants) {
+            if label.starts_with("gamma(") || label.starts_with("lgamma(") {
+                // `gamma` / `lgamma` are CPython's *own* Lanczos evaluation,
+                // not libm calls, and even two CPython builds disagree here:
+                // glibc's python3.13 gives gamma(-2.5) = …29417 and
+                // lgamma(1e5) = …36566 while Apple libm's gives …29418 and
+                // …36569. The VM's port pins the glibc rounding, so a host
+                // CPython can legitimately land a few ulp away — compare
+                // with a 1e-15 relative tolerance instead of exactly.
+                checks.push_str(&format!("check_gamma({label:?}, repr({expr}), {want:?})\n"));
+            } else {
+                checks.push_str(&format!("check({label:?}, repr({expr}), {want:?})\n"));
+            }
+        }
         let src = format!(
             "{CHECK}
 import math
 
-def r(x: float) -> str:
-    return repr(x)
+def check_gamma(label: str, got: str, want: str) -> None:
+    a: float = float(got)
+    b: float = float(want)
+    if a == b or (a != a and b != b):
+        return
+    let scale: float = max(abs(a), abs(b))
+    if scale > 0.0 and abs(a - b) <= 1e-15 * scale:
+        return
+    raise ValueError(f\"{{label}}: got {{got!r}}, want {{want!r}}\")
 
-check(\"gamma(0.5)\", r(math.gamma(0.5)), \"1.7724538509055159\")
-check(\"gamma(5)\", r(math.gamma(5)), \"24.0\")
-check(\"gamma(-2.5)\", r(math.gamma(-2.5)), \"-0.9453087204829417\")
-check(\"gamma(170.5)\", r(math.gamma(170.5)), \"5.56209241456e+305\")
-check(\"gamma(1e-5)\", r(math.gamma(1e-5)), \"99999.42279422554\")
-check(\"gamma(inf)\", r(math.gamma(math.inf)), \"inf\")
-check(\"lgamma(3)\", r(math.lgamma(3)), \"0.693147180559945\")
-check(\"lgamma(0.5)\", r(math.lgamma(0.5)), \"0.5723649429247004\")
-check(\"lgamma(-2.5)\", r(math.lgamma(-2.5)), \"-0.05624371649767457\")
-check(\"lgamma(1e5)\", r(math.lgamma(1e5)), \"1051287.7089736566\")
-check(\"lgamma(1e-5)\", r(math.lgamma(1e-5)), \"11.512919692895824\")
-check(\"lgamma(-inf)\", r(math.lgamma(-math.inf)), \"inf\")
-check(\"erf(0.5)\", r(math.erf(0.5)), \"0.5204998778130465\")
-check(\"erfc(0.5)\", r(math.erfc(0.5)), \"0.4795001221869535\")
-check(\"erf(-2)\", r(math.erf(-2)), \"-0.9953222650189527\")
-check(\"erfc(3.5)\", r(math.erfc(3.5)), \"7.430983723414128e-07\")
-check(\"sinh\", r(math.sinh(1.5)), \"2.1292794550948173\")
-check(\"cosh\", r(math.cosh(1.5)), \"2.352409615243247\")
-check(\"tanh\", r(math.tanh(1.5)), \"0.9051482536448664\")
-check(\"asinh\", r(math.asinh(1.5)), \"1.1947632172871094\")
-check(\"acosh\", r(math.acosh(1.5)), \"0.9624236501192069\")
-check(\"atanh\", r(math.atanh(0.5)), \"0.5493061443340548\")
-check(\"cbrt(27)\", r(math.cbrt(27)), \"3.0000000000000004\")
-check(\"cbrt(-8.0)\", r(math.cbrt(-8.0)), \"-2.0\")
-check(\"exp2(10)\", r(math.exp2(10)), \"1024.0\")
-check(\"exp2(0.5)\", r(math.exp2(0.5)), \"1.4142135623730951\")
-check(\"fma\", r(math.fma(2, 3, 4)), \"10.0\")
-check(\"fma small\", r(math.fma(0.1, 10, -1)), \"5.551115123125783e-17\")
-check(\"frexp\", [math.frexp(8.0), math.frexp(-3.5), math.frexp(5e-324), math.frexp(1e-310), math.frexp(0.0), math.frexp(math.inf)], [(0.5, 4), (-0.875, 2), (0.5, -1073), (0.5752618031559393, -1029), (0.0, 0), (math.inf, 0)])
-check(\"ldexp\", [r(math.ldexp(1.5, -1074)), r(math.ldexp(1e-300, 1100)), r(math.ldexp(3, 4)), r(math.ldexp(True, 1)), r(math.ldexp(1, -2**70)), r(math.ldexp(0.0, 2**70))], [\"1e-323\", \"1.3582985290493859e+31\", \"48.0\", \"2.0\", \"0.0\", \"0.0\"])
-check(\"modf\", [math.modf(3.75), math.modf(-3.75), math.modf(math.inf), math.modf(-math.inf)], [(0.75, 3.0), (-0.75, -3.0), (0.0, math.inf), (-0.0, -math.inf)])
-check(\"modf(-0.0)\", repr(math.modf(-0.0)), \"(-0.0, -0.0)\")
-check(\"nextafter\", [r(math.nextafter(1.0, 2.0)), r(math.nextafter(1.0, 0.0)), r(math.nextafter(0.0, 1.0)), r(math.nextafter(0.0, -1.0)), r(math.nextafter(1, 2, steps=3)), r(math.nextafter(1, 0, steps=2**80)), r(math.nextafter(-0.0, 0.0)), r(math.nextafter(1, 2, steps=0))], [\"1.0000000000000002\", \"0.9999999999999999\", \"5e-324\", \"-5e-324\", \"1.0000000000000007\", \"0.0\", \"0.0\", \"1.0\"])
-check(\"ulp\", [r(math.ulp(1.0)), r(math.ulp(0.0)), r(math.ulp(-2.5)), r(math.ulp(1.7976931348623157e308)), r(math.ulp(3))], [\"2.220446049250313e-16\", \"5e-324\", \"4.440892098500626e-16\", \"1.99584030953472e+292\", \"4.440892098500626e-16\"])
-check(\"isclose\", [math.isclose(1.0, 1.0000000001), math.isclose(1, 1.1), math.isclose(1, 1.1, rel_tol=0.2), math.isclose(0.0, 1e-10, abs_tol=1e-9), math.isclose(math.inf, math.inf), math.isclose(math.nan, math.nan), math.isclose(math.inf, 1e308), math.isclose(3, 3)], [True, False, True, True, True, False, False, True])
-check(\"sumprod\", [math.sumprod([1, 2, 3], [4, 5, 6]), r(math.sumprod([1.5, 2], [2, 3.5])), r(math.sumprod([0.1] * 10, [0.1] * 10)), r(math.sumprod([2**70, 1], [1, 2.5])), r(math.sumprod([True], [1.5])), r(math.sumprod((1, 2), [3.0, 4.0])), math.sumprod([], []), r(math.sumprod([1e16, 1.0, -1e16], [1.0, 1.0, 1.0]))], [32, \"10.0\", \"0.1\", \"1.1805916207174113e+21\", \"1.5\", \"11.0\", 0, \"1.0\"])
-if not math.isnan(math.sumprod([1e308, 1e308], [10, -10])):
-    raise ValueError(\"sumprod overflow must be nan\")
-
+{checks}
 def expect(label: str, kind: str, message: str, thunk: object) -> None:
     try:
         thunk()
@@ -2810,6 +3466,91 @@ main()
     }
 
     #[test]
+    fn abandoned_generators_are_finalised_at_loop_exit() {
+        // W5-05: CPython finalises a generator when its last reference drops,
+        // running `finally` / `with` exits. The VM has no GC, so it does this
+        // at the end of the loop that holds the only reference — which covers
+        // `break` / `return` out of a `for` over a generator. A generator the
+        // program kept a reference to is left live, as CPython leaves it.
+        //
+        // Residual (docs/vm.md): a generator held only by a function local is
+        // finalised when that local's scope ends in CPython, which needs
+        // refcounting the VM does not model.
+        let src = r#"
+from typing import Iterator
+
+out: list[str] = []
+
+def g() -> Iterator[int]:
+    try:
+        yield 1
+        yield 2
+    finally:
+        out.append("cleanup")
+
+def break_out() -> None:
+    for x in g():
+        out.append("body " + str(x))
+        break
+
+def return_out() -> None:
+    for x in g():
+        if x == 1:
+            return
+
+def still_referenced() -> None:
+    let it: Iterator[int] = g()
+    out.append(str(next(it)))
+    out.append("held")
+
+def main() -> None:
+    break_out()
+    return_out()
+    still_referenced()
+    if out != ["body 1", "cleanup", "cleanup", "1", "held"]:
+        raise ValueError("abandoned-generator cleanup wrong: " + repr(out))
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn class_attributes_resolve_on_read_not_at_construction() {
+        // W5-06: a class attribute read through an instance must go through
+        // the class, so a later update to it (a class-level counter) is
+        // visible from instances built earlier. Copying it into the instance
+        // dict at construction froze the old value.
+        let src = r#"
+plain class Counter:
+    instances: int = 0
+
+impl Counter:
+    def __init__(self) -> None:
+        Counter.instances += 1
+
+plain class Circle:
+    unit: str = "px"
+
+def main() -> None:
+    let a: Counter = Counter()
+    let b: Counter = Counter()
+    if Counter.instances != 2 or a.instances != 2 or b.instances != 2:
+        raise ValueError("class attr not shared: " + str([Counter.instances, a.instances, b.instances]))
+    # A per-instance assignment still shadows the class attribute, and a
+    # sibling instance keeps reading the class value.
+    let c: Circle = Circle()
+    c.unit = "em"
+    let d: Circle = Circle()
+    if c.unit != "em" or d.unit != "px" or Circle.unit != "px":
+        raise ValueError("instance shadow/read wrong: " + str([c.unit, d.unit, Circle.unit]))
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn type_object_model() {
         // type(x) is a real type object: .__name__, str(), and == all work
         // for both builtins and user classes.
@@ -3600,6 +4341,7 @@ main()
 
     #[test]
     fn vm_stdlib_shim_edge_cases_match_cpython() {
+        let _cwd = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let src = r#"
 import argparse
 import base64
@@ -4817,11 +5559,14 @@ if len(out) != len(expected):
 
     #[test]
     fn random_module_matches_cpython_sequences_and_errors() {
-        // `random`: seeded module-level and `Random`-instance sequences (int, str,
-        // bytes, float and big-int seeds), every distribution, `getstate` /
-        // `setstate`, `sample(counts=)`, `choices`, subclassing, and the exact
-        // error messages — expected text printed by python3.13 on this program.
-        let src = r#"
+        // `random`: seeded module-level and `Random`-instance sequences, every
+        // distribution, `getstate` / `setstate`, `sample(counts=)`, `choices`,
+        // subclassing, and the exact error messages.
+        // The expectation is derived from the hosting python3.13 at
+        // test time; its output carries host facts (errno numbers, the
+        // OSError subclass, the tempdir, the locale-encoding spelling)
+        // that differ by platform and are not the VM's to pin.
+        let probe = r#"
 out: list[str] = []
 
 def emit(*parts: object) -> None:
@@ -4880,48 +5625,32 @@ class Sub(random.Random):
     pass
 s = Sub(99)
 emit("R19", s.random(), s.randint(1, 10), isinstance(s, random.Random))
-
-expected = """R1 0.32383276483316237 0.15084917392450192 6 0 10 2.3212742919913083
-R2 1 374 1070981047564691937373 0
-R3 [1, 2, 4, 6, 5, 9, 7, 0, 3, 8] [70, 54, 7, 72, 15] [8, 21, 29, 19, 2, 27, 25, 13]
-R4 0.6728571905145633 0.2167066023245946 -0.5011069926874049 0.3959723340256104 0.5640647937702591 2.062191146355306 2.430387389584938
-R5 ['a', 'b', 'a', 'a', 'c'] [3, 3, 3, 3, 3, 3] [2, 2, 1, 1]
-R6 1.6868345025778617 0.3533734146759453 3.119772354676761 1.4346044809702374 0.038144116028092784 3.8711511433769172 0.740040315369941 2.896946289183157 4.958024904289246
-R7 0.32383276483316237 20 714660325134 x
-R8 True 3 625 None
-R9 True 0.15084917392450192
-R10 0.3537754404730722 b'\\xcfa\\xc7\\xa9'
-R11 0.3537754404730722
-R12 0.41877545666909954
-R13 0.46300735781502145
-R14 0.2327882718301838
-R15 0.8444218515250481 0.05219198828260849 -1.0434089742005737
-R16 0.9417154046806644 0.420571580830845 -1.3965781047011498
-R17 [593537256020, 960208693573, 821033197451] [573090097483, 410397959609] 13565560346403939986
-E1 ValueError empty range for randrange()
-E2 ValueError empty range in randrange(5, 5)
-E3 ValueError empty range in randrange(5, 1, 2)
-E4 ValueError zero step for randrange()
-E5 TypeError 'float' object cannot be interpreted as an integer
-E6 ValueError empty range in randrange(5, 2)
-E7 TypeError Missing a non-None stop argument
-E8 IndexError Cannot choose from an empty sequence
-E9 TypeError Population must be a sequence.  For dicts or sets, use sorted(d).
-E10 ValueError Sample larger than population or is negative
-E11 ValueError number of bits must be non-negative
-E12 TypeError The only supported seed types are:
-None, int, float, str, bytes, and bytearray.
-E13 ValueError The number of weights does not match the population
-E14 TypeError The number of choices must be a keyword argument: k=3
-E15 ValueError gammavariate: alpha and beta must be > 0.0
-E16 ValueError The number of counts does not match the population
-R18 [1, 3, 3, 3] 2 0 5
-R19 0.40397807494366633 4 True"""
-got = "\n".join(out)
-if got != expected:
-    raise AssertionError("mismatch:\n" + got + "\n--- want ---\n" + expected)
 "#;
-        assert_eq!(run_capturing(src).unwrap(), 0);
+        let Some(expected) = python313_transcript(probe, "out") else {
+            if std::env::var_os("TYC_REQUIRE_PYTHON").is_some() {
+                panic!("python3.13 is required as the oracle (TYC_REQUIRE_PYTHON is set)");
+            }
+            eprintln!("skipping random_module_matches_cpython_sequences_and_errors: no python3.13 on PATH");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("transcript.txt");
+        let src = format!(
+            "{probe}\nwith open({path:?}, \"w\", encoding=\"utf-8\") as _out:\n    _out.write(\"\\n\".join(out))\n",
+            path = out_path.display().to_string()
+        );
+        assert_eq!(run_capturing(&src).unwrap(), 0);
+        let got = std::fs::read_to_string(&out_path).unwrap();
+        // CPython spells the default text encoding per host ("utf-8" under
+        // glibc, "UTF-8" on macOS); the VM's `io` shim lowercases it. Fold
+        // the case so the test compares file semantics, not locale naming —
+        // the spelling difference is documented in docs/vm.md.
+        let normalise = |s: String| s.replace("utf-8", "UTF-8");
+        let (got, expected) = (normalise(got), normalise(expected));
+        assert_eq!(
+            got, expected,
+            "VM transcript differs from the hosting python3.13"
+        );
     }
 
     #[test]
@@ -4974,11 +5703,14 @@ if got != expected:
 
     #[test]
     fn filesystem_modules_match_cpython() {
-        // `pathlib` (pure and concrete), `open` / file objects, `io.StringIO` /
-        // `BytesIO`, `os` / `os.path`, `glob`, `shutil` and `tempfile`, with
-        // CPython's `OSError` messages and attributes — expected text printed by
-        // python3.13 on this program (which works under /tmp/zz_probe_fs).
-        let src = r#"
+        let _cwd = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // `pathlib`, `open` / file objects, `io.StringIO` / `BytesIO`, `os` / `os.path`,
+        // `glob`, `shutil` and `tempfile`, with CPython's `OSError` messages.
+        // The expectation is derived from the hosting python3.13 at
+        // test time; its output carries host facts (errno numbers, the
+        // OSError subclass, the tempdir, the locale-encoding spelling)
+        // that differ by platform and are not the VM's to pin.
+        let probe = r#"
 __lines: list[str] = []
 
 def emit(*parts: object) -> None:
@@ -4997,9 +5729,7 @@ def show(label: str, f: object) -> None:
     except Exception as e:
         emit(label, type(e).__name__, e)
 
-BASE = "/tmp/zz_probe_fs"
-shutil.rmtree(BASE, ignore_errors=True)
-os.makedirs(BASE)
+BASE = tempfile.mkdtemp(prefix="zz_probe_fs_")
 os.chdir(BASE)
 # Fixtures for the probes whose *kind* of failure must not depend on who
 # is running the suite: unlinking a directory, rmdir-ing a file and
@@ -5184,188 +5914,32 @@ emit("X8", os.path.isfile(nm), tempfile.gettempdir(), tempfile.tempdir)
 os.chdir("/tmp")
 shutil.rmtree(BASE)
 emit("DONE", os.path.exists(BASE))
-
-expected = """PP 'a//b/./c/' a/b/c ('a', 'b', 'c') 'c' '' [] 'c' a/b '' '' False ['a/b', 'a', '.']
-PP '' . () '' '' [] '' . '' '' False []
-PP '.' . () '' '' [] '' . '' '' False []
-PP '/' / ('/',) '' '' [] '' / '/' '/' True []
-PP '//x/y' //x/y ('//', 'x', 'y') 'y' '' [] 'y' //x '//' '//' True ['//x', '//']
-PP '///x' /x ('/', 'x') 'x' '' [] 'x' / '/' '/' True ['/']
-PP 'a/../b' a/../b ('a', '..', 'b') 'b' '' [] 'b' a/.. '' '' False ['a/..', 'a', '.']
-PP 'a/b/' a/b ('a', 'b') 'b' '' [] 'b' a '' '' False ['a', '.']
-PP './a' a ('a',) 'a' '' [] 'a' . '' '' False ['.']
-PP '/a/b.tar.gz' /a/b.tar.gz ('/', 'a', 'b.tar.gz') 'b.tar.gz' '.gz' ['.tar', '.gz'] 'b.tar' /a '/' '/' True ['/a', '/']
-PP '.bashrc' .bashrc ('.bashrc',) '.bashrc' '' [] '.bashrc' . '' '' False ['.']
-PP 'a.' a. ('a.',) 'a.' '' [] 'a.' . '' '' False ['.']
-PP 'a..b' a..b ('a..b',) 'a..b' '.b' ['.', '.b'] 'a.' . '' '' False ['.']
-PP '..' .. ('..',) '..' '' [] '..' . '' '' False ['.']
-PP 'a/..' a/.. ('a', '..') '..' '' [] '..' a '' '' False ['a', '.']
-PP 'c:/x' c:/x ('c:', 'x') 'x' '' [] 'x' c: '' '' False ['c:', '.']
-PJ /c/d a/b a/b/c x/y a/b/c /b a
-W1 PosixPath('a/c.md')
-W2 PosixPath('a/b.md')
-W3 PosixPath('a/b')
-W4 PosixPath('a/b.x')
-W5 PosixPath('a/q.txt')
-W6 ValueError Invalid name ''
-W7 ValueError Invalid name 'x/y'
-W8 ValueError PosixPath('/') has an empty name
-W9 ValueError Invalid suffix 'txt'
-W10 ValueError Invalid suffix '.'
-W11 ValueError Invalid name 'a.x/y'
-W12 PosixPath('a/b.tar.zip')
-R1 PosixPath('b/c')
-R2 ValueError '/a/b/c' is not in the subpath of '/x'
-R3 PosixPath('.')
-R4 PosixPath('..')
-R5 ValueError '/a/b' is not in the subpath of 'c'
-R6 (True, False)
-M1 (True, True, False, True, False, True, True, True, False, True, True, True, False, False, True, True, True, True)
-M2 ValueError empty pattern
-M3 ValueError Unacceptable pattern: PosixPath('.')
-M4 []
-O1 [PosixPath('/z'), PosixPath('a'), PosixPath('a/b'), PosixPath('a-b'), PosixPath('a.b'), PosixPath('b')]
-O2 (True, True, False, True, True)
-O3 TypeError unsupported operand type(s) for /: 'PosixPath' and 'int'
-O4 TypeError unsupported operand type(s) for /: 'int' and 'PosixPath'
-O5 TypeError argument should be a str or an os.PathLike object where __fspath__ returns a str, not 'int'
-O6 ('PosixPath("it\\'s")', 'a\\\\b', PosixPath('a b'), 'q', 'a', 'file:///a/b%20c')
-O7 (PosixPath('a'), PosixPath('.'))
-O8 IndexError 5
-O9 ('<PosixPath.parents>', 2, [PosixPath('/a'), PosixPath('/')])
-O10 ('PosixPath', 'y', True, True)
-O11 True
-O12 (True, True, True)
-O13 (True, PosixPath('/x'))
-O14 FileNotFoundError [Errno 2] No such file or directory: '/tmp/zz_definitely_missing/q'
-O15 FileNotFoundError [Errno 2] No such file or directory: '/tmp/zz_definitely_missing/q'
-O16 FileExistsError [Errno 17] File exists: '/tmp'
-O17 FileNotFoundError [Errno 2] No such file or directory: '/tmp/zz_definitely_missing/q'
-O18 IsADirectoryError [Errno 21] Is a directory: '/tmp'
-O19 FileNotFoundError [Errno 2] No such file or directory: '/tmp/zz_definitely_missing/q'
-O20 FileNotFoundError [Errno 2] No such file or directory: '/tmp/zz_definitely_missing/q'
-O22 FileNotFoundError [Errno 2] No such file or directory: '/tmp/zz_definitely_missing/q'
-O23 FileNotFoundError [Errno 2] No such file or directory: '/tmp/zz_definitely_missing/q' -> '/tmp/zz2'
-O24 IsADirectoryError [Errno 21] Is a directory: 'zz_env/full'
-O25 NotADirectoryError [Errno 20] Not a directory: 'zz_env/file'
-O26 TypeError data must be str, not int
-O27 FileNotFoundError [Errno 2] No such file or directory: '/tmp/zz_definitely_missing/q'
-O29 FileNotFoundError [Errno 2] No such file or directory: '/tmp/zz_definitely_missing/q' 2 No such file or directory /tmp/zz_definitely_missing/q (2, 'No such file or directory')
-O30 [Errno 2] msg: 'f' (2, 'msg') 2 msg f FileNotFoundError
-O31 one ('one',) None None None
-O32 [Errno 2] msg (2, 'msg') 2 None
-O33 [Errno 2] No such file or directory: 'x' True
-O34 stat_result True True True True 10 True
-F FileNotFoundError [Errno 2] No such file or directory: '/nonexistent_zz/x'
-F IsADirectoryError [Errno 21] Is a directory: '/tmp'
-F ValueError invalid mode: 'q'
-F TypeError expected str, bytes or os.PathLike object, not float
-F FileNotFoundError [Errno 2] No such file or directory: '/nonexistent_zz/x'
-F b''
-F ValueError must have exactly one of create/read/write/append mode
-F ValueError binary mode doesn't take an encoding argument
-T1 4 a
-b
- b'a\\nb\\n' 5 b'x\\r\\ny\\n' 5 b'l1\\r\\nl2' l1
-l2 l1\r
-l2
-T2 6 True True False False True
-T3 zz_probe2.txt True False
-T4 FileNotFoundError [Errno 2] No such file or directory: 'zz_probe2.txt'
-T5 None
-T6 11 w f1.txt utf-8 False <_io.TextIOWrapper name='f1.txt' mode='w' encoding='utf-8'> True False
-T7 True héllo
-wörld hÃ©llo
-wÃ¶rld b'h\\xc3\\xa9llo\\nw\\xc3\\xb6rld'
-T8 héllo
- wörld  13 0 hél ['lo\\n', 'wörld']
-T9 ['héllo\\n', 'wörld\\n', 'more'] ['héllo', 'wörld', 'more']
-T10 4 <_io.BufferedWriter name='f2.b wb
-T11 b'\\x00\\x01' b'ab' 4 1 b'\\x01' True False
-T12 UnsupportedOperation write
-T13 UnsupportedOperation not readable
-T14 ValueError I/O operation on closed file.
-T14b ValueError I/O operation on closed file.
-T15 UnicodeEncodeError 'ascii' codec can't encode character '\\xe9' in position 0: ordinal not in range(128)
-T16 '\\x00\\x01ab'
-T17 '\\x00\\x01ab' '\\x00\\x01ab'
-T18 FileExistsError [Errno 17] File exists: 'f4.txt'
-T19 new!
-T20 bc 3
-T21 0
-T22 9 unflushed
-T23 [] ['f1.txt', 'f2.bin', 'f3.txt', 'f4.txt', 'f5.txt', 'zz_env']
-T24 'hello-there\\n1 2!'
-I1 a b
-cd
- 6 0 ab
- ['cd\\n'] ab
-cd
- 1 ab
-cd
-X 7
-I2 hello
-world ['a\\n', 'b\\n'] False <_io.StringIO object 11 11 3 hel
-I3 TypeError initial_value must be str or None, not int
-I4 TypeError string argument expected, got 'int'
-I5 ValueError I/O operation on closed file
-I5b ValueError I/O operation on closed file
-I6 q False
-I7 True
-I8 b'a' b'b\\ncd' b'ab\\ncd' 0 b'ab\\n' 1 b'ab\\nZd' 4 [b'1\\n', b'2']
-I9 TypeError a bytes-like object is required, not 'str'
-I10 TypeError a bytes-like object is required, not 'str'
-I11 1 bc 0 1 Zbc bc ['a\\r\\n', 'b'] ['a\\r\\n', 'b'] True True True
-I12 True True StringIO StringIO None
-I13 'x 1\\n'
-P1 /c/d a/b a/ ('a/b', 'c') ('', 'a') ('/', 'a') ('f.tar', '.gz') ('.bashrc', '') ('a/b.c/d', '')  a/b a/c/d /a . True ../b/c /a/b ab True True / : True posix . .. . None /dev/null
-P2 ValueError Can't mix absolute and relative paths
-P3 ValueError no path specified
-P4 FileNotFoundError [Errno 2] No such file or directory: '/nonexistent_zz'
-P5 FileNotFoundError [Errno 2] No such file or directory: '/nonexistent_zz'
-P6 FileExistsError [Errno 17] File exists: '/tmp'
-P7 FileNotFoundError [Errno 2] No such file or directory: '/nonexistent_zz'
-P8 FileNotFoundError [Errno 2] No such file or directory: '/nonexistent_zz' -> '/tmp/q'
-P9 FileExistsError [Errno 17] File exists: '/tmp'
-P10 None
-P11 FileNotFoundError [Errno 2] No such file or directory: '/nonexistent_zz'
-P12 FileNotFoundError [Errno 2] No such file or directory: '/nonexistent_zz'
-P13 OSError [Errno 39] Directory not empty: 'zz_env/full'
-P14 IsADirectoryError [Errno 21] Is a directory: 'zz_env/full'
-P15 NotADirectoryError [Errno 20] Not a directory: '/etc/passwd'
-P16 FileNotFoundError [Errno 2] No such file or directory: '/nonexistent_zz'
-P17 True True True False 0 True dflt True True 768 True No such file or directory True False
-G1 ['.hidden', 'a.py', 'sub'] ['a.py'] ['a.py', 'sub/b.py'] ['a.py', 'sub/b.py'] ['.', 'sub', 'sub/deep'] ['.hidden', 'a.py', 'sub', 'sub/b.py', 'sub/deep', 'sub/deep/c.txt'] ['sub/b.py', 'sub/deep'] ['sub'] ['.', '.hidden', 'a.py', 'sub', 'sub/b.py', 'sub/deep', 'sub/deep/c.txt'] ['sub/deep/c.txt'] [] ['sub/deep']
-G2 ['.hidden', 'a.py', 'sub'] [('.', ['sub'], ['.hidden', 'a.py']), ('sub', ['deep'], ['b.py']), ('sub/deep', [], ['c.txt'])] ['.hidden', 'a.py', 'sub']
-G3 [('.', ['sub'], ['.hidden', 'a.py']), ('sub', ['deep'], ['b.py']), ('sub/deep', [], ['c.txt'])] [('sub/deep', [], ['c.txt']), ('sub', ['deep'], ['b.py']), ('.', ['sub'], ['.hidden', 'a.py'])]
-G4 OSError [Errno 39] Directory not empty: 'tree'
-G5 FileExistsError [Errno 17] File exists: 'tree/a.py'
-G6 None
-G7 ['tree/a.py'] ['tree/a.py', 'tree/sub/b.py'] ['a.py'] ['tree/a.py', 'tree/sub'] [] ['tree/', 'tree/a.py', 'tree/sub', 'tree/sub/b.py', 'tree/sub/deep', 'tree/sub/deep/c.txt'] a[[]b][*] ['tree/.hidden'] ['tree/.hidden', 'tree/a.py', 'tree/sub'] ['tree'] ['tree/']
-S1 copy.py tree/sub/a.py cf.py c2.py 1
-S2 tree2 ['.hidden', 'a.py', 'sub'] moved True moved/cf.py ['.hidden', 'a.py', 'cf.py', 'sub']
-S3 FileNotFoundError [Errno 2] No such file or directory: 'nope'
-S4 FileExistsError [Errno 17] File exists: 'moved'
-S5 IsADirectoryError [Errno 21] Is a directory: 'tree'
-S6 NotADirectoryError [Errno 20] Not a directory: 'tree/a.py'
-S7 SameFileError 'tree/a.py' and 'tree/a.py' are the same file
-S8 True None None False
-S9 FileNotFoundError [Errno 2] No such file or directory: PosixPath('nope_dir')
-S10 False
-X1 True 11 True
-X2 True str True
-X3 False
-X4 int True True
-X5 hi True True _TemporaryFileWrapper
-X6 True
-X7 True rb+
-X8 False /tmp /tmp
-DONE False"""
-got = "\n".join(__lines)
-if got != expected:
-    raise AssertionError("mismatch:\n" + got + "\n--- want ---\n" + expected)
 "#;
-        assert_eq!(run_capturing(src).unwrap(), 0);
+        let Some(expected) = python313_transcript(probe, "__lines") else {
+            if std::env::var_os("TYC_REQUIRE_PYTHON").is_some() {
+                panic!("python3.13 is required as the oracle (TYC_REQUIRE_PYTHON is set)");
+            }
+            eprintln!("skipping filesystem_modules_match_cpython: no python3.13 on PATH");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("transcript.txt");
+        let src = format!(
+            "{probe}\nwith open({path:?}, \"w\", encoding=\"utf-8\") as _out:\n    _out.write(\"\\n\".join(__lines))\n",
+            path = out_path.display().to_string()
+        );
+        assert_eq!(run_capturing(&src).unwrap(), 0);
+        let got = std::fs::read_to_string(&out_path).unwrap();
+        // CPython spells the default text encoding per host ("utf-8" under
+        // glibc, "UTF-8" on macOS); the VM's `io` shim lowercases it. Fold
+        // the case so the test compares file semantics, not locale naming —
+        // the spelling difference is documented in docs/vm.md.
+        let normalise = |s: String| s.replace("utf-8", "UTF-8");
+        let (got, expected) = (normalise(got), normalise(expected));
+        assert_eq!(
+            got, expected,
+            "VM transcript differs from the hosting python3.13"
+        );
     }
 
     #[test]

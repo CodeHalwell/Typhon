@@ -14,7 +14,7 @@ Typhon ships a single binary, `tyc`, that handles every stage of the workflow. S
 | `tyc lsp` | Run as a Language Server on stdio. `--log-level {error,warn,info,debug}` (default `info`) sets the threshold for the status messages forwarded to the editor over `window/logMessage`; `--stdio` is accepted as a no-op for `vscode-languageclient`. |
 | `tyc init` | Scaffold a new project: `typhon.toml`, `src/`, `tests/`. The generated `src/main.ty` includes a frozen dataclass, an `impl` block, a `mut` binding, and a `Result`/`?`/`match` example; the generated `typhon.toml` ships every `[strictness]` / `[emit]` key with a comment. |
 | `tyc install skill` | Write the embedded `typhon` Claude skill (`SKILL.md` + sibling reference docs + the `references/` example programs) into `.claude/skills/typhon/` of the current project. The skill is bundled into the binary at build time, so it works offline. `--force` overwrites an existing copy, `--dir PATH` targets another root, `--list` previews the files without writing. |
-| `tyc trace` | Map a Python traceback (a file argument, or stdin when omitted) back to Typhon source via `.py.map` files. Every row is rewritten, not just the `File "…", line N` header: the source row under each frame becomes the real `.ty` row and the column anchors are dropped, so no emitted Python is shown under a `.ty` line. `--map-dir DIR` adds a directory to search for sidecars; by default each frame's map is located from its own `.py` path (`<dir>/.sourcemaps/<rel>.py.map`, then a legacy adjacent `.py.map`). |
+| `tyc trace` | Map a Python traceback (a file argument, or stdin when omitted) back to Typhon source via `.py.map` files. Every row is rewritten, not just the `File "…", line N` header: the source row under each frame becomes the real `.ty` row and the column anchors are dropped, so no emitted Python is shown under a `.ty` line. Frames inside an `ExceptionGroup` traceback (`  |   File "…"`, as every failed `gather:` prints) are rewritten too. `--map-dir DIR` adds a directory to search for sidecars; by default each frame's map is located from its own `.py` path (`<dir>/.sourcemaps/<rel>.py.map`, then a legacy adjacent `.py.map`). |
 | `tyc profile` | Build, then instrument every top-level function in the emitted code for hot-function detection (advanced, opt-in). `--out DIR` overrides the build directory. See [`tyc profile`](#tyc-profile) for the round trip into `[strictness] pgo-memoise`. |
 | `tyc migrate` | Convert typed Python (`.py`) to Typhon (`.ty`): rewrites `Optional[T]`/`T \| None` → `T?`, adds `let`/`mut` to module-level annotated assigns *and* function-body plain assignments, strips `@dataclass` decorators. |
 | `tyc ty` | Build the project and run Astral's `ty` checker against the emitted Python. Requires `ty` on `PATH` (`pip install ty`). Supports `--watch` for continuous feedback. |
@@ -100,10 +100,14 @@ The remaining daily-loop commands have small flag sets:
 |---------|------|--------|
 | `tyc check [PATH]...` | `--stubs` | Also parse + type-check every `.dty` under the checked paths and diff each stub's surface against its sibling `.ty` (preferred) or `.py` implementation; findings surface as `tyc::stub_mismatch` at the `[strictness] stub-check` severity (default `"error"`). |
 | | `--with-ty` | Build to a throwaway directory and run Astral's `ty` over it (see [`tyc build`](#tyc-build)). |
-| `tyc fmt [PATH]...` | `--check` / `-c` | Exit non-zero if any file would change; write nothing. The only `fmt` flag — there is no `--diff` / `--quiet`. `tyc fmt` collects `.ty` files only (`.dty` stubs are not formatted). A file that does not parse is reported and skipped rather than aborting the walk; the command still exits non-zero, with a count of the files it could not format. The formatter accepts exactly what `tyc check` accepts — both run the same sugar-expansion chain — formatting converges in one pass, and `tyc build` emits byte-identical Python before and after it (bar a generated `__typhon_guard_N` temporary, numbered from the line it came from). |
-| `tyc init [NAME]` | `--dir DIR` / `-d` | Directory to initialise (default `.`). With `NAME`, the scaffold lands in `<DIR>/<NAME>/`; without it, `DIR` itself is initialised and its basename becomes the project name. |
+| `tyc fmt [PATH]...` | `--check` / `-c` | Exit non-zero if any file would change; write nothing. The only `fmt` flag — there is no `--diff` / `--quiet`. `tyc fmt` collects `.ty` files only (`.dty` stubs are not formatted). A file that does not parse is reported and skipped rather than aborting the walk; the command still exits non-zero, with a count of the files it could not format. The formatter accepts exactly what `tyc check` accepts — both run the same sugar-expansion chain — formatting converges in one pass, and `tyc build` emits byte-identical Python before and after it (bar a generated `__typhon_guard_N` temporary, numbered from the line it came from). A file that resolves outside the project (the nearest directory above the path with a `typhon.toml`) — through `src -> ../elsewhere` or a link inside the tree — is skipped with a warning, never written through. |
+| `tyc init [NAME]` | `--dir DIR` / `-d` | Directory to initialise (default `.`). With `NAME`, the scaffold lands in `<DIR>/<NAME>/`; without it, `DIR` itself is initialised and its basename becomes the project name. An existing `typhon.toml` or `src/main.ty` (or a symlink at either path) stops it before it writes anything. The generated `typhon.toml` leaves `auto-memoise` / `auto-gather` / `auto-parallel` / `pgo-memoise` unset, so `[optimise] level = 1` and `tyc build -O` turn them on. |
 | `tyc lsp` | `--log-level LEVEL` | `error` / `warn` / `info` (default) / `debug` — threshold for status messages forwarded over `window/logMessage`. `--stdio` is accepted as a no-op. |
 | `tyc trace [TRACEBACK]` | `--map-dir DIR` | Extra directory to search for `.py.map` sidecars (`<DIR>/.sourcemaps/<file>.py.map`, then `<DIR>/<file>.py.map`). Without a `TRACEBACK` argument the traceback is read from stdin. |
+
+`tyc lsp` loads `typhon.toml` with the same validating loader as the CLI (an absolute or `..` `[project] src` is refused, not walked; an invalid file is reported as a diagnostic on `typhon.toml` and each open file is checked on its own) and lists the source tree with the same symlink-safe walk, cached across keystrokes and refreshed on watched-file create/delete events, when a file missing from the listing is opened, or after five seconds. A malformed frame gets a `-32700` / `-32600` error reply and the server keeps reading; it exits 0 after `shutdown` + `exit` and 1 on `exit` without `shutdown` or when stdin closes first.
+
+`tyc check DIR` splits `DIR` at every nested `typhon.toml`: each nested project is checked with its own config and module set, as `tyc check <that project>` would check it, and files outside every nested project are checked together under the config found for `DIR`. A folder of independent apps (`tyc check examples/`) therefore never resolves one app's imports against another app's modules.
 
 The binary has no global flags beyond `--help` / `--version`: no `--quiet`, `--verbose`, `--color`, or `--manifest` (every command discovers `typhon.toml` by walking up from the path it was given).
 
@@ -183,6 +187,10 @@ tyc migrate src/app.py
 # Preview without writing (prints to stdout):
 tyc migrate --check src/app.py
 ```
+
+`PATH` is a `.py` file or a directory. A directory is migrated whole, `tests/` included; only directories nobody writes by hand are skipped — virtual environments (any directory holding a `pyvenv.cfg`, plus `.venv`, `.tox`, `.nox`), VCS metadata (`.git`, `.hg`, `.svn`, `.bzr`), caches (`__pycache__`, `.mypy_cache`, `.pytest_cache`, …), `node_modules` and `build`.
+
+`--force` (`-f`) overwrites existing `.ty` files. Without it, `tyc migrate` refuses before writing anything when any target `.ty` already exists, and names it; a `.ty` that is a symlink is never written through, even with `--force`.
 
 `--check` is a preview mode: it prints the migrated source to stdout instead of writing `.ty` files, but it does not compare against the input and always exits 0 on a successful migration. CI users who want a fail-on-diff signal should diff `--check` output against a checked-in `.ty`; a native exit-1-on-changes mode is a deliberate follow-up.
 
@@ -378,11 +386,15 @@ tyc sync
 tyc sync --dry-run
 ```
 
+`tyc add name@git+https://…` (any value containing `://`, or starting with `file:`) records a [PEP 508 direct reference](https://peps.python.org/pep-0508/), rendered as `name @ URL` in `pyproject.toml`. When `pyproject.toml` declares `dynamic = ["version"]`, the merge leaves `version` to the build backend rather than adding a static one, which `uv sync` would reject.
+
+`tyc add` / `tyc remove` update `typhon.toml` and `pyproject.toml` together: when `pyproject.toml` is a symlink or does not parse as TOML, the command fails before writing either file, so a failed `tyc add` never leaves the dependency half-added.
+
 `--no-sync` on `tyc add` / `tyc remove` skips the `uv` install step — useful for batching edits and running `tyc sync` once at the end. `--dev` on either targets `[dev-dependencies]`, and `--dir DIR` (default `.`) selects the project whose `typhon.toml` to edit; `tyc sync` takes the project directory as its positional argument instead.
 
 ## CI integration
 
-`tyc check` is the recommended command for CI: it runs everything up to the analyser without emitting `.py` output, so it fails fast on type errors without producing artifacts.
+`tyc check` is the recommended command for CI: it runs everything up to the analyser without emitting `.py` output, so it fails fast on type errors without producing artifacts. A path with nothing to check (no `.ty` files) exits 1, so a mistyped path cannot pass. A piped `tyc repl` (a script fed on stdin) exits 1 when any snippet failed to compile or raised.
 
 ## Editor integration
 

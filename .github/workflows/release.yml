@@ -75,9 +75,13 @@ jobs:
       - name: Resolve release tag
         id: tag
         shell: bash
+        # `${{ inputs.tag }}` travels via `env:`, never interpolated into
+        # `run:` (workflow_dispatch inputs are user-controlled).
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            tag="${{ inputs.tag }}"
+            tag="$INPUT_TAG"
           else
             tag="${GITHUB_REF#refs/tags/}"
           fi
@@ -93,13 +97,15 @@ jobs:
           targets: ${{ matrix.target }}
           components: rustfmt, clippy
 
-      - name: Cache cargo registry and build
+      # Release binaries are cold builds: only the registry/git caches are
+      # restored, never a prior `tyc/target/` (a stale incremental cache
+      # must not leak into a shipped binary).
+      - name: Cache cargo registry
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            tyc/target
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('tyc/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-cargo-
@@ -143,9 +149,12 @@ jobs:
         if: matrix.archive == 'tar.gz'
         id: package_posix
         shell: bash
+        # Step outputs travel via `env:`, never interpolated into `run:`.
+        env:
+          PKG_VERSION: ${{ steps.tag.outputs.version }}
         run: |
           set -euo pipefail
-          version="${{ steps.tag.outputs.version }}"
+          version="$PKG_VERSION"
           target="${{ matrix.target }}"
           stage="$(mktemp -d)"
           name="tyc-${version}-${target}"
@@ -177,9 +186,12 @@ jobs:
         if: matrix.archive == 'zip'
         id: package_windows
         shell: pwsh
+        # Step outputs travel via `env:`, never interpolated into `run:`.
+        env:
+          PKG_VERSION: ${{ steps.tag.outputs.version }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $version = '${{ steps.tag.outputs.version }}'
+          $version = $env:PKG_VERSION
           $target  = '${{ matrix.target }}'
           $name    = "tyc-$version-$target"
           $stage   = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP $name) -Force
@@ -229,9 +241,13 @@ jobs:
       - name: Resolve release tag
         id: tag
         shell: bash
+        # `${{ inputs.tag }}` travels via `env:`, never interpolated into
+        # `run:` (workflow_dispatch inputs are user-controlled).
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            tag="${{ inputs.tag }}"
+            tag="$INPUT_TAG"
           else
             tag="${GITHUB_REF#refs/tags/}"
           fi

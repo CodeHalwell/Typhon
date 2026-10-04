@@ -247,7 +247,7 @@ Python 3.13 ships an experimental free-threaded build; 3.14 (Phase II) makes it 
 
 #### `go` spawn
 
-`go f(x)` schedules `f(x)` in the background: an `asyncio.Task` in async contexts, a `ThreadPoolExecutor.submit` future on free-threaded builds for CPU-bound functions. The form `go f(x) -> fut` binds the task handle.
+`go f(x)` schedules `f(x)` in the background: an `asyncio.Task` in async contexts, always lowered through `typhon_runtime.tasks.spawn` (there is no `ThreadPoolExecutor` lowering for `go`, including on free-threaded builds). The form `go f(x) -> fut` binds the task handle.
 
 **`go` does not lower to a bare `asyncio.create_task`.** Python's event loop holds only weak references to scheduled tasks, so a fire-and-forget `create_task(...)` whose handle is not retained can be garbage-collected mid-flight. `go` therefore lowers via a small helper in `typhon_runtime`:
 
@@ -493,8 +493,8 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 > the long tail of missing builtins, pydantic `model_validate` /
 > `model_dump`, and three type-checker exhaustiveness / augmented-assign
 > fixes). The current release is
-> **[v1.0.0-alpha.9](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.9)**
-> (see `CHANGELOG.md` for the full v0.13.0 → v1.0.0-alpha.9 line). The
+> **[v1.0.0-beta.1](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-beta.1)**
+> (see `CHANGELOG.md` for the full v0.13.0 → v1.0.0-beta.1 line). The
 > milestone below,
 > **[v0.12.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.12.0)**, brought
 > VM comparison-protocol parity (`sorted` / `min` / `max` honour a user

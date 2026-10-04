@@ -1,0 +1,14 @@
+Ok(value=Node(start=0, text='hello'))
+first
+second
+Ok(value=3)
+first
+second
+Err(error='boom')
+a
+b
+c
+Ok(value=['a', 'b', 'c'])
+v
+k
+Ok(value=1)

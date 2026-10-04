@@ -91,7 +91,7 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 ## Free-threaded variant
 
-When `[python] free-threaded = true`, `go` on a CPU-bound function lowers to `ThreadPoolExecutor.submit` instead of `asyncio.Task`. The runtime helper has a parallel `Future` registry. The emitter inserts `sys._is_gil_enabled()` runtime checks to fall back to sequential execution if run under a GIL build.
+`go` always lowers through `typhon_runtime.tasks.spawn` (an `asyncio` task held in a strong-ref registry) — there is no `ThreadPoolExecutor` lowering for `go`, including when `[python] free-threaded = true`.
 
 ## Why never `asyncio.create_task` directly?
 

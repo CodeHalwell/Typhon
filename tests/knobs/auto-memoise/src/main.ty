@@ -1,16 +1,18 @@
-# `[strictness] auto-memoise = true` puts @functools.cache on every function the
-# analyser proves pure. Naive `fib` is exponential without it, linear with it —
-# so the fixture also demonstrates the rewrite is observationally transparent.
+# `[strictness] auto-memoise = true` caches every function the analyser proves
+# safe to cache — pure, not recursive, hashable cache-key parameters and an
+# immutable result (W3-04) — with a bounded `functools.lru_cache`. The output
+# matches the uncached control build, so the rewrite is transparent.
 @pure
-def fib(n: int) -> int:
-    if n < 2:
-        return n
-    return fib(n - 1) + fib(n - 2)
+def score(n: int) -> int:
+    return n * n + 3 * n + 1
 
 
 def main() -> None:
-    print(fib(24))
-    print(fib(0), fib(1), fib(2))
+    mut total: int = 0
+    for i in range(50):
+        total += score(i % 5)
+    print(total)
+    print(score(0), score(1), score(2))
 
 
 if __name__ == "__main__":

@@ -187,34 +187,46 @@ pub fn run(args: RunArgs) -> Result<()> {
     //    `tyc run --compile script.ty` fail outright with "refusing to
     //    write … outside the project root". The scaffold is itself a
     //    TempDir, so nothing persists either way.
-    let (out_dir, _tmp_guard): (PathBuf, Option<TempDir>) = if scaffold_no_sync {
-        (args.path.join("build"), None)
-    } else if args.temp {
-        let tmp = tempfile::Builder::new()
-            .prefix("tyc-run-")
-            .tempdir()
-            .map_err(|e| miette!("cannot create temp directory: {e}"))?;
-        (tmp.path().to_path_buf(), Some(tmp))
-    } else {
-        // Resolve the persistent `out` dir the same way `tyc build` does
-        // so the entry-point lookup matches what was just emitted.
-        let project_root = args
-            .path
-            .canonicalize()
-            .map_err(|e| miette!("cannot resolve path '{}': {}", args.path.display(), e))?;
-        let (config_dir, config) = match TyphonConfig::load(&project_root) {
-            Ok(Some((toml_path, cfg))) => {
-                let dir = toml_path
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| project_root.clone());
-                (dir, cfg)
-            }
-            Ok(None) => (project_root.clone(), TyphonConfig::default()),
-            Err(e) => return Err(miette!("{e}")),
+    let (out_dir, _tmp_guard, project_root_for_python): (PathBuf, Option<TempDir>, PathBuf) =
+        if scaffold_no_sync {
+            (args.path.join("build"), None, args.path.clone())
+        } else if args.temp {
+            let tmp = tempfile::Builder::new()
+                .prefix("tyc-run-")
+                .tempdir()
+                .map_err(|e| miette!("cannot create temp directory: {e}"))?;
+            let root = args
+                .path
+                .canonicalize()
+                .unwrap_or_else(|_| args.path.clone());
+            let root = match TyphonConfig::load(&root) {
+                Ok(Some((toml_path, _))) => {
+                    toml_path.parent().map(|p| p.to_path_buf()).unwrap_or(root)
+                }
+                _ => root,
+            };
+            (tmp.path().to_path_buf(), Some(tmp), root)
+        } else {
+            // Resolve the persistent `out` dir the same way `tyc build` does
+            // so the entry-point lookup matches what was just emitted.
+            let invocation_root = args
+                .path
+                .canonicalize()
+                .map_err(|e| miette!("cannot resolve path '{}': {}", args.path.display(), e))?;
+            let (config_dir, config) = match TyphonConfig::load(&invocation_root) {
+                Ok(Some((toml_path, cfg))) => {
+                    let dir = toml_path
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| invocation_root.clone());
+                    (dir, cfg)
+                }
+                Ok(None) => (invocation_root.clone(), TyphonConfig::default()),
+                Err(e) => return Err(miette!("{e}")),
+            };
+            let out = config_dir.join(&config.project.out);
+            (out, None, config_dir)
         };
-        (config_dir.join(&config.project.out), None)
-    };
 
     // 2. Build the project unless --no-build was passed.  When --temp is
     //    set we always build (clap's conflicts_with already rejected
@@ -245,13 +257,6 @@ pub fn run(args: RunArgs) -> Result<()> {
             entry.display()
         ));
     }
-
-    // The project root, for locating a `.venv` and reading `[python] target`
-    // when picking the interpreter below.
-    let project_root_for_python = args
-        .path
-        .canonicalize()
-        .unwrap_or_else(|_| args.path.clone());
 
     // 3. Decide between two spawn shapes:
     //    (a) script mode: `python build/main.py` — works for single-file
@@ -502,6 +507,10 @@ fn unmodelled_references(path: &std::path::Path, entry: &std::path::Path) -> Opt
         };
         missing.extend(unmodelled_attribute_references(&module, &mut exports));
         for root in tyc_resolve::collect_imported_roots(&module) {
+            if root == "re" {
+                missing.insert("re (Python regular-expression semantics)".into());
+                continue;
+            }
             if tyc_vm::models_module(&root) || project_roots.contains(&root) {
                 continue;
             }
@@ -648,6 +657,65 @@ fn unmodelled_attribute_references(
             module_name.push_str(attr);
         }
     }
+    // CPython builtins the VM lacks (`exec`, `memoryview`, `globals`), read
+    // as a bare name the program does not bind itself.
+    {
+        let probe = exports.probe.get_or_insert_with(tyc_vm::Interpreter::new);
+        for name in &scan.name_loads {
+            if !scan.shadowed.contains(name) && tyc_vm::unmodelled_builtin(probe, name) {
+                missing.insert(format!("builtin {name}"));
+            }
+        }
+    }
+    for attr in UNMODELLED_ATTRIBUTES {
+        if scan.attribute_names.contains(*attr) && !scan.shadowed.contains(*attr) {
+            missing.insert(format!(".{attr}"));
+        }
+    }
+    // Keyword arguments the VM's builtin, module function or builtin-type
+    // method would reject (or silently ignore) where CPython accepts them.
+    for (callee, keywords) in &scan.keyword_calls {
+        let (module, function): (Option<String>, &str) = match callee {
+            KeywordCallee::Name(name) => {
+                if scan.shadowed.contains(name) {
+                    continue;
+                }
+                (None, name.as_str())
+            }
+            KeywordCallee::Chain(root, chain) => {
+                let last = chain.last().map(String::as_str).unwrap_or_default();
+                let module = (!scan.shadowed.contains(root))
+                    .then(|| scan.aliases.get(root))
+                    .flatten()
+                    .map(|target| {
+                        let mut path = target.clone();
+                        for attr in &chain[..chain.len() - 1] {
+                            path.push('.');
+                            path.push_str(attr);
+                        }
+                        path
+                    })
+                    .filter(|path| exports.names(path).is_some());
+                match module {
+                    Some(path) => (Some(path), last),
+                    // A method call: a builtin-type method binds keywords to
+                    // its CPython signature in the VM, and anything else
+                    // binds them to its own parameters.
+                    None => continue,
+                }
+            }
+        };
+        let probe = exports.probe.get_or_insert_with(tyc_vm::Interpreter::new);
+        for kw in keywords {
+            if tyc_vm::call_accepts_keyword(probe, module.as_deref(), function, kw) == Some(false) {
+                let callee = match &module {
+                    Some(m) => format!("{m}.{function}"),
+                    None => function.to_owned(),
+                };
+                missing.insert(format!("{callee}({kw}=…)"));
+            }
+        }
+    }
     // `from re import purge` would fail at the import itself: a member a
     // modelled module does not export is the same gap as `re.purge`, unless
     // it is a submodule the VM also serves (`from os import path`).
@@ -661,6 +729,33 @@ fn unmodelled_attribute_references(
             continue;
         }
         missing.insert(format!("{module}.{member}"));
+    }
+    // Task scheduling (see `ASYNC_SCHEDULING`). `go` and `gather:` arrive
+    // here already expanded, to `typhon_runtime.tasks.spawn(…)` and an
+    // `asyncio.TaskGroup` (or `asyncio.gather`).
+    for (root, chain, _) in &scan.loads {
+        if root == "typhon_runtime"
+            && chain.len() == 2
+            && chain[0] == "tasks"
+            && chain[1] == "spawn"
+        {
+            missing.insert("go (CPython task scheduling)".into());
+            continue;
+        }
+        let Some(first) = chain.first() else {
+            continue;
+        };
+        if !scan.shadowed.contains(root)
+            && scan.aliases.get(root).is_some_and(|m| m == "asyncio")
+            && ASYNC_SCHEDULING.contains(&first.as_str())
+        {
+            missing.insert(format!("asyncio.{first} (CPython task scheduling)"));
+        }
+    }
+    for (module, member) in &scan.from_imports {
+        if module == "asyncio" && ASYNC_SCHEDULING.contains(&member.as_str()) {
+            missing.insert(format!("asyncio.{member} (CPython task scheduling)"));
+        }
     }
     missing
 }
@@ -684,7 +779,63 @@ struct AttributeScan {
     /// `(module, member)` for every `from module import member` where the
     /// module is one the VM models.
     from_imports: Vec<(String, String)>,
+    /// Every bare name read — checked against the CPython builtins the VM
+    /// lacks.
+    name_loads: std::collections::BTreeSet<String>,
+    /// Every attribute name read or called, on any receiver.
+    attribute_names: std::collections::BTreeSet<String>,
+    /// Calls passing keyword arguments: the callee and the keyword names.
+    keyword_calls: Vec<(KeywordCallee, Vec<String>)>,
 }
+
+/// What a keyword-passing call calls, as far as the syntax tells.
+enum KeywordCallee {
+    /// `f(k=…)`.
+    Name(String),
+    /// `root.a.f(k=…)`: a module function when `root` names a module, else
+    /// a method `f` of whatever `root.a` is (left to the VM, which binds a
+    /// builtin-type method's keywords to its CPython signature).
+    Chain(String, Vec<String>),
+}
+
+/// Attributes of builtin values the VM does not model, which a program
+/// reaches only by name (`e.add_note(…)`, `e.__notes__`).
+const UNMODELLED_ATTRIBUTES: &[&str] = &["add_note", "__notes__"];
+
+/// `asyncio` members whose effect depends on CPython's event-loop
+/// scheduling. The VM runs a coroutine to completion as soon as it is
+/// created, so a program that creates tasks, waits on several, or bounds
+/// an await in time interleaves (and times out) differently: a task body
+/// printed before `create_task` returned, `wait_for` ignored its timeout.
+const ASYNC_SCHEDULING: &[&str] = &[
+    "Barrier",
+    "BoundedSemaphore",
+    "Condition",
+    "Event",
+    "LifoQueue",
+    "Lock",
+    "PriorityQueue",
+    "Queue",
+    "Runner",
+    "Semaphore",
+    "TaskGroup",
+    "all_tasks",
+    "as_completed",
+    "create_task",
+    "current_task",
+    "ensure_future",
+    "gather",
+    "get_event_loop",
+    "get_running_loop",
+    "new_event_loop",
+    "run_coroutine_threadsafe",
+    "shield",
+    "timeout",
+    "timeout_at",
+    "to_thread",
+    "wait",
+    "wait_for",
+];
 
 impl AttributeScan {
     fn define(&mut self, path: String, at: usize) {
@@ -797,6 +948,7 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                 self.shadowed.insert(n.id.as_str().to_owned());
             }
             Expr::Attribute(a) => {
+                self.attribute_names.insert(a.attr.as_str().to_owned());
                 if let Some((root, chain)) = attribute_chain(a) {
                     let at = a.range.start().to_usize();
                     if matches!(a.ctx, ExprContext::Load) {
@@ -816,9 +968,31 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                     return;
                 }
             }
+            Expr::Name(n) => {
+                self.name_loads.insert(n.id.as_str().to_owned());
+            }
             // `setattr(mod, "x", …)` / `delattr(mod, "x")` with a literal
             // name — the dynamic spelling of the store above.
             Expr::Call(call) => {
+                let keywords: Vec<String> = call
+                    .arguments
+                    .keywords
+                    .iter()
+                    .filter_map(|k| k.arg.as_ref().map(|a| a.as_str().to_owned()))
+                    .collect();
+                // A `**mapping` splat names keywords the scan cannot see.
+                let splat = call.arguments.keywords.iter().any(|k| k.arg.is_none());
+                if !keywords.is_empty() && !splat {
+                    let callee = match call.func.as_ref() {
+                        Expr::Name(n) => Some(KeywordCallee::Name(n.id.as_str().to_owned())),
+                        Expr::Attribute(a) => attribute_chain(a)
+                            .map(|(root, chain)| KeywordCallee::Chain(root, chain)),
+                        _ => None,
+                    };
+                    if let Some(callee) = callee {
+                        self.keyword_calls.push((callee, keywords));
+                    }
+                }
                 if let Expr::Name(func) = call.func.as_ref() {
                     if matches!(func.id.as_str(), "setattr" | "delattr") {
                         if let [Expr::Name(target), Expr::StringLiteral(name), ..] =
@@ -1048,6 +1222,59 @@ mod tests {
     }
 
     #[test]
+    fn scan_routes_unmodelled_builtins_and_keywords() {
+        let got = scan_source("exec(\"x = 1\")\nprint(memoryview(b\"a\"))\n").unwrap_or_default();
+        assert!(got.contains(&"builtin exec".to_owned()), "{got:?}");
+        assert!(got.contains(&"builtin memoryview".to_owned()), "{got:?}");
+        // A name the program binds itself is its own.
+        assert_eq!(
+            scan_source("def exec(s: str) -> None:\n    pass\nexec(\"x\")\n"),
+            None
+        );
+        let got =
+            scan_source("import json\nprint(json.dumps({}, default=str))\n").unwrap_or_default();
+        assert!(got.contains(&"json.dumps(default=…)".to_owned()), "{got:?}");
+        let got = scan_source("e = ValueError(\"v\")\ne.add_note(\"n\")\n").unwrap_or_default();
+        assert!(got.contains(&".add_note".to_owned()), "{got:?}");
+        // Keywords the VM binds stay on the VM.
+        assert_eq!(
+            scan_source("import json\nimport math\nprint(round(2.5, ndigits=0), int(\"ff\", base=16), math.prod([2], start=3), json.loads(\"{}\", object_hook=dict), \"a b\".split(maxsplit=1))\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn scan_routes_task_scheduling_to_cpython() {
+        let task = "import asyncio\nasync def w() -> None:\n    await asyncio.sleep(0)\nasync def main() -> None:\n    let t = asyncio.create_task(w())\n    print(\"created\")\n    await t\nasyncio.run(main())\n";
+        let got = scan_source(task).unwrap_or_default();
+        assert!(
+            got.contains(&"asyncio.create_task (CPython task scheduling)".to_owned()),
+            "{got:?}"
+        );
+        let from = "from asyncio import wait_for\nimport asyncio\nasync def w() -> int:\n    await asyncio.sleep(0)\n    return 1\nasync def main() -> None:\n    print(await wait_for(w(), 0.5))\nasyncio.run(main())\n";
+        let got = scan_source(from).unwrap_or_default();
+        assert!(
+            got.contains(&"asyncio.wait_for (CPython task scheduling)".to_owned()),
+            "{got:?}"
+        );
+        let go = "import asyncio\nasync def w() -> None:\n    await asyncio.sleep(0)\nasync def main() -> None:\n    go w()\n    await asyncio.sleep(0)\nasyncio.run(main())\n";
+        let got = scan_source(go).unwrap_or_default();
+        assert!(
+            got.contains(&"go (CPython task scheduling)".to_owned()),
+            "{got:?}"
+        );
+        let gather = "import asyncio\nasync def w(n: int) -> int:\n    await asyncio.sleep(0)\n    return n\nasync def main() -> None:\n    gather:\n        a = w(1)\n        b = w(2)\n    print(a, b)\nasyncio.run(main())\n";
+        let got = scan_source(gather).unwrap_or_default();
+        assert!(
+            got.contains(&"asyncio.TaskGroup (CPython task scheduling)".to_owned()),
+            "{got:?}"
+        );
+        // Plain sequential awaits schedule nothing: they stay on the VM.
+        let sequential = "import asyncio\nasync def w() -> int:\n    await asyncio.sleep(0)\n    return 1\nasync def main() -> None:\n    let v = await w()\n    print(v)\nasyncio.run(main())\n";
+        assert_eq!(scan_source(sequential), None);
+    }
+
+    #[test]
     fn attribute_scan_reports_a_missing_attribute_of_a_modelled_module() {
         // The module is modelled, the attribute is not: the program would
         // die with `AttributeError` in the VM, so it takes the compiled path,
@@ -1096,11 +1323,13 @@ mod tests {
 
     #[test]
     fn attribute_scan_checks_from_imported_members_of_modelled_modules() {
-        // `from re import purge` fails at the import under the VM exactly as
-        // `re.purge` would at the read, so it takes the compiled path too.
+        // `from json import detect_encoding` fails at the import under the
+        // VM exactly as `json.detect_encoding` would at the read, so it takes
+        // the compiled path too. (`re` is no example: any `re` import now
+        // takes the compiled path, see `importing_re_takes_the_compiled_path`.)
         assert_eq!(
-            scan_source("from re import purge\n\npurge()\n"),
-            Some(vec!["re.purge".to_owned()])
+            scan_source("from json import detect_encoding\n\nprint(detect_encoding)\n"),
+            Some(vec!["json.detect_encoding".to_owned()])
         );
         // A member the VM has, and a submodule the VM serves, are fine.
         assert_eq!(
@@ -1122,14 +1351,14 @@ mod tests {
     fn attribute_scan_exempts_a_program_defined_attribute_only_after_its_store() {
         // The store comes first: the read is the program's own attribute.
         assert_eq!(
-            scan_source("import re\n\nre.purge = 1\nprint(re.purge)\n"),
+            scan_source("import json\n\njson.detect_encoding = 1\nprint(json.detect_encoding)\n"),
             None
         );
-        // The read comes first: it still reaches the VM's `re`, which has no
-        // `purge`, so the program takes the compiled path.
+        // The read comes first: it still reaches the VM's `json`, which has
+        // no `detect_encoding`, so the program takes the compiled path.
         assert_eq!(
-            scan_source("import re\n\nprint(re.purge)\nre.purge = 1\n"),
-            Some(vec!["re.purge".to_owned()])
+            scan_source("import json\n\nprint(json.detect_encoding)\njson.detect_encoding = 1\n"),
+            Some(vec!["json.detect_encoding".to_owned()])
         );
     }
 
@@ -1152,12 +1381,23 @@ mod tests {
     }
 
     #[test]
+    fn importing_re_takes_the_compiled_path() {
+        // The VM's `re` runs on Rust's regex engine, whose `$`, empty-match,
+        // lookaround and flag semantics differ from Python's (W5-13), so a
+        // program that imports `re` runs on CPython under plain `tyc run`.
+        assert_eq!(
+            scan_source("import re\n\nprint(re.fullmatch(\"a\", \"a\") is not None)\n"),
+            Some(vec!["re (Python regular-expression semantics)".to_owned()])
+        );
+    }
+
+    #[test]
     fn attribute_scan_leaves_a_rebound_alias_alone() {
         // The alias is a parameter (or any other binding) somewhere in the
         // file: a read through it may not be the module, so it is not judged.
         assert_eq!(
             scan_source(
-                "import re\n\ndef f(re: int) -> int:\n    return re.no_such_method()\n\n\
+                "import json\n\ndef f(json: int) -> int:\n    return json.no_such_method()\n\n\
                  print(f(1))\n"
             ),
             None

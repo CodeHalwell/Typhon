@@ -1,0 +1,74 @@
+from typing import Callable
+
+extend str:
+    def pad(self, n: int) -> str:
+        return self + "." * n
+
+def shout(n: int) -> int:
+    print("shout", n)
+    return n
+
+def whisper(n: int) -> int:
+    print("whisper", n)
+    return n
+
+def width() -> Result[int, str]:
+    print("width")
+    return Ok(2)
+
+class Provider:
+    handler: Callable[[int], int]
+
+impl Provider:
+    @property
+    def callback(self) -> Callable[[int], int]:
+        print("lookup callback")
+        return self.handler
+
+    def swap(self) -> Result[int, str]:
+        print("swap")
+        self.handler = whisper
+        return Ok(7)
+
+class Post:
+    title: str
+
+impl Post:
+    def show(self) -> Result[str, str]:
+        return Ok(self.title.pad(width()?))
+
+class Base:
+    n: int
+
+impl Base:
+    def greet(self, k: int) -> int:
+        print("base greet", k)
+        return self.n + k
+
+class Child(Base):
+    m: int
+
+impl Child:
+    def greet(self, k: int) -> int:
+        return 0
+
+    def run(self) -> Result[int, str]:
+        return Ok(super().greet(width()?))
+
+def via_property(p: Provider) -> Result[int, str]:
+    return Ok(p.callback(p.swap()?))
+
+def via_field(p: Provider) -> Result[int, str]:
+    return Ok(p.handler(p.swap()?))
+
+def via_extension(title: str) -> Result[str, str]:
+    return Ok(title.pad(width()?))
+
+def main() -> None:
+    print(via_property(Provider(handler=shout)))
+    print(via_field(Provider(handler=shout)))
+    print(via_extension("yo"))
+    print(Post(title="hi").show())
+    print(Child(n=1, m=0).run())
+
+main()

@@ -22,7 +22,17 @@ pub use ruff_python_ast as ast;
 pub use ruff_python_ast::Mutability;
 pub use ruff_python_parser::{ParseError, Parsed};
 
-use ruff_python_ast::ModModule;
+use ruff_python_ast::visitor::{walk_expr, Visitor};
+use ruff_python_ast::{Expr, ModModule};
+use ruff_python_parser::ParseErrorType;
+use ruff_text_size::{Ranged, TextRange, TextSize};
+
+use crate::lexmask::{ByteKind, LexMask};
+
+/// CPython's tokenizer refuses to open a bracket while 200 are already open
+/// (`MAXLEVEL` in `Parser/lexer/lexer.c`): `SyntaxError: too many nested
+/// parentheses`. The vendored parser has no such limit.
+const CPYTHON_MAX_BRACKET_DEPTH: usize = 200;
 
 /// Parse a Typhon source file with the vendored Ruff parser.
 ///
@@ -32,8 +42,117 @@ use ruff_python_ast::ModModule;
 /// etc.) is *not* yet known to this parser; callers that need to accept
 /// that sugar should still preprocess it with the helpers in
 /// [`crate::preprocess`] before calling this function.
+///
+/// A module whose emitted Python would open more than 200 brackets at once
+/// is rejected the way CPython rejects that `.py` at compile time —
+/// otherwise `tyc check` and `tyc run` accepted a program `tyc build` turned
+/// into a `.py` that does not compile.
 pub fn parse_module(source: &str) -> Result<Parsed<ModModule>, ParseError> {
-    ruff_python_parser::parse_module(source)
+    let parsed = ruff_python_parser::parse_module(source)?;
+    if source_nests_past_cpython_limit(source) {
+        if let Some(at) = emitted_bracket_past_cpython_limit(parsed.syntax()) {
+            return Err(ParseError {
+                error: ParseErrorType::OtherError(format!(
+                    "too many nested parentheses: CPython allows at most \
+                     {CPYTHON_MAX_BRACKET_DEPTH} open brackets at once"
+                )),
+                location: TextRange::at(at, 1.into()),
+            });
+        }
+    }
+    Ok(parsed)
+}
+
+/// Cheap pre-filter: whether the source's own code brackets (not those in
+/// strings, comments or f-string fields) ever nest past the limit. The
+/// emitted Python can only nest that deep if the source does.
+fn source_nests_past_cpython_limit(source: &str) -> bool {
+    let opens = source
+        .bytes()
+        .filter(|b| matches!(b, b'(' | b'[' | b'{'))
+        .count();
+    if opens <= CPYTHON_MAX_BRACKET_DEPTH {
+        return false;
+    }
+    let mask = LexMask::new(source);
+    let mut depth = 0usize;
+    for (i, b) in source.bytes().enumerate() {
+        if !matches!(b, b'(' | b'[' | b'{' | b')' | b']' | b'}')
+            || !matches!(mask.kind(i), ByteKind::Code)
+        {
+            continue;
+        }
+        if matches!(b, b'(' | b'[' | b'{') {
+            if depth == CPYTHON_MAX_BRACKET_DEPTH {
+                return true;
+            }
+            depth += 1;
+        } else {
+            depth = depth.saturating_sub(1);
+        }
+    }
+    false
+}
+
+/// Where the emitted Python opens a bracket past the limit, if it does.
+///
+/// Grouping parentheses are not in the AST, and the emitter prints only the
+/// ones precedence needs, so `((((1))))` nested 3000 deep is fine. Counted
+/// here are the brackets every printing of the AST must keep: list, set and
+/// dict displays and comprehensions, call argument lists and subscripts.
+/// Tuples, generator expressions and precedence parentheses are not counted
+/// — so a miss is possible, a false report is not.
+fn emitted_bracket_past_cpython_limit(module: &ModModule) -> Option<TextSize> {
+    let mut probe = NestingProbe {
+        depth: 0,
+        too_deep: None,
+    };
+    probe.visit_body(&module.body);
+    probe.too_deep
+}
+
+struct NestingProbe {
+    depth: usize,
+    too_deep: Option<TextSize>,
+}
+
+impl NestingProbe {
+    fn nested(&mut self, at: TextSize, inner: impl FnOnce(&mut Self)) {
+        if self.depth == CPYTHON_MAX_BRACKET_DEPTH {
+            self.too_deep.get_or_insert(at);
+            return;
+        }
+        self.depth += 1;
+        inner(self);
+        self.depth -= 1;
+    }
+}
+
+impl<'a> Visitor<'a> for NestingProbe {
+    fn visit_expr(&mut self, expr: &'a Expr) {
+        if self.too_deep.is_some() {
+            return;
+        }
+        match expr {
+            Expr::List(_)
+            | Expr::Set(_)
+            | Expr::Dict(_)
+            | Expr::ListComp(_)
+            | Expr::SetComp(_)
+            | Expr::DictComp(_) => self.nested(expr.start(), |p| walk_expr(p, expr)),
+            Expr::Call(call) => {
+                self.visit_expr(&call.func);
+                self.nested(call.arguments.start(), |p| {
+                    p.visit_arguments(&call.arguments)
+                });
+            }
+            Expr::Subscript(sub) => {
+                self.visit_expr(&sub.value);
+                self.nested(sub.value.end(), |p| p.visit_expr(&sub.slice));
+            }
+            _ => walk_expr(self, expr),
+        }
+    }
 }
 
 /// Parse a single expression — used by the type checker to resolve quoted
@@ -72,6 +191,33 @@ mod tests {
     fn plain_python_still_parses() {
         let parsed = parse_module("def f(x: int) -> int:\n    return x * 2\n").expect("parse");
         assert_eq!(parsed.into_syntax().body.len(), 1);
+    }
+
+    #[test]
+    fn bracket_nesting_stops_where_cpython_stops() {
+        let nest = |d: usize| format!("x = {}{}\n", "[".repeat(d), "]".repeat(d));
+        assert!(parse_module(&nest(200)).is_ok());
+        let err = parse_module(&nest(201)).expect_err("201 levels");
+        assert!(
+            err.to_string().contains("too many nested parentheses"),
+            "{err}"
+        );
+        assert_eq!(usize::from(err.location.start()), "x = ".len() + 200);
+        // Grouping parentheses vanish from the emitted Python (the stress
+        // corpus nests 3000 of them; 400 keeps the debug test stack small);
+        // brackets in strings and comments, and many sequential groups, are
+        // not nesting either.
+        let grouped = format!("x = {}1{}\n", "(".repeat(400), ")".repeat(400));
+        assert!(parse_module(&grouped).is_ok());
+        let calls = format!("x = {}1{}\n", "f(".repeat(201), ")".repeat(201));
+        assert!(parse_module(&calls).is_err());
+        let flat = format!(
+            "x = [{}]  # {}\ns = \"{}\"\n",
+            "(1), ".repeat(300),
+            "(".repeat(300),
+            "[".repeat(300)
+        );
+        assert!(parse_module(&flat).is_ok());
     }
 
     #[test]
