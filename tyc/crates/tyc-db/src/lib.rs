@@ -490,11 +490,23 @@ pub fn check_source_file(db: &mut TycDatabase, source_file: SourceFile) -> Diagn
 /// Runs the same preprocess + parse front-end as [`check_pipeline`], but
 /// stops there. Returns an empty [`ModuleShapes`] on any parse error
 /// — the real diagnostic surfaces when the file is checked for real.
-pub fn extract_shapes_for_path(_path: &str, text: &str) -> ModuleShapes {
+pub fn extract_shapes_for_path(path: &str, text: &str) -> ModuleShapes {
     match parse_for_shapes(text) {
-        Some((prep, module)) => shapes_of(&prep, &module),
+        Some((prep, module)) => source_provenance(path, shapes_of(&prep, &module)),
         None => ModuleShapes::default(),
     }
+}
+
+/// Only a `.ty` source's plain `def` is known synchronous: a `.dty` stub or
+/// a bundled stub (`path` is then a module name) describes code the checker
+/// cannot see, so its functions keep `declared_sync = false`.
+fn source_provenance(path: &str, mut shapes: ModuleShapes) -> ModuleShapes {
+    if !path.ends_with(".ty") {
+        for info in shapes.function_arities.values_mut() {
+            info.declared_sync = false;
+        }
+    }
+    shapes
 }
 
 /// [`extract_shapes_for_path`] plus the module's
@@ -505,13 +517,13 @@ pub fn extract_shapes_for_path(_path: &str, text: &str) -> ModuleShapes {
 /// `Post`, or `make()` on an imported function, as the built-in it was
 /// declared to be. Both halves are empty on a parse error.
 pub fn extract_shapes_and_facts_for_path(
-    _path: &str,
+    path: &str,
     text: &str,
 ) -> (ModuleShapes, tyc_analyse::TypeFacts) {
     match parse_for_shapes(text) {
         Some((prep, module)) => {
             let facts = tyc_analyse::collect_module_type_facts(&module);
-            (shapes_of(&prep, &module), facts)
+            (source_provenance(path, shapes_of(&prep, &module)), facts)
         }
         None => (ModuleShapes::default(), tyc_analyse::TypeFacts::default()),
     }

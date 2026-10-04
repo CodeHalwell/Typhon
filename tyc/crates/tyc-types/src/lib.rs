@@ -3419,6 +3419,11 @@ struct Checker<'a> {
     /// functions never enter this set: their shapes carry no async flag.
     sync_functions: std::collections::HashSet<String>,
     async_functions: std::collections::HashSet<String>,
+    /// Local names of imported free functions a project `.ty` module
+    /// declares as a plain, undecorated `def` ([`ArityInfo::declared_sync`]):
+    /// calling one never yields a coroutine, so `go f()` on it is rejected
+    /// like `go` on a same-module `def`.
+    imported_sync_functions: std::collections::HashSet<String>,
     /// Bumped on entry to an `Expr::Await`, decremented on exit. While
     /// positive, the call-site arm skips the `missing_await` check so
     /// the user's `await f()` is accepted.
@@ -3749,6 +3754,13 @@ pub struct ArityInfo {
     /// Cross-module consumers need this to type an un-awaited call as
     /// `Coroutine[..., T]` rather than the declared result `T`.
     pub is_async: bool,
+    /// `true` only for a plain, undecorated `def` extracted from Typhon
+    /// source (`.ty`): calling it can never produce a coroutine unless its
+    /// declared return type says so. Stubs (`.dty`, bundled, venv
+    /// introspection) never set it — their `def` is a claim about code the
+    /// checker cannot see. A consumer uses it to reject `go f()` / `await
+    /// f()` on an imported synchronous function (W3, extending W2-11).
+    pub declared_sync: bool,
 }
 
 /// Declared interface (`interface Name:` → `class Name(Protocol):`). Bundles
@@ -3908,6 +3920,7 @@ impl<'a> Checker<'a> {
             function_kwarg_types: HashMap::new(),
             async_functions: std::collections::HashSet::new(),
             sync_functions: std::collections::HashSet::new(),
+            imported_sync_functions: std::collections::HashSet::new(),
             inside_await: 0,
             in_question_temp_rhs: false,
             in_sync_function: false,
@@ -6825,6 +6838,7 @@ pub fn extract_module_shapes_with(
                 &tps,
             );
             info.is_async = f.is_async;
+            info.declared_sync = !f.is_async && f.decorator_list.is_empty();
             function_arities.insert(f.name.as_str().to_owned(), info);
         }
     }
@@ -7211,6 +7225,8 @@ pub fn check_module_with_imports_and_types(
                 .or_insert_with(|| info.clone());
             if info.is_async {
                 c.async_functions.insert(name.clone());
+            } else if info.declared_sync && !name.contains('.') {
+                c.imported_sync_functions.insert(name.clone());
             }
         }
         // Cross-module sealed unions: an imported `type Event = A | B`
@@ -11509,6 +11525,7 @@ fn class_constructor_arity_for(shape: &InterfaceShape, class_name: Option<&str>)
             kwonly_types: param_types,
             return_type,
             is_async: false,
+            declared_sync: false,
         };
     }
     ArityInfo {
@@ -11525,6 +11542,7 @@ fn class_constructor_arity_for(shape: &InterfaceShape, class_name: Option<&str>)
         kwonly_types: Vec::new(),
         return_type,
         is_async: false,
+        declared_sync: false,
     }
 }
 
@@ -12459,6 +12477,7 @@ fn arity_info_from_parameters_with_returns(
         kwonly_types,
         return_type,
         is_async: false,
+        declared_sync: false,
     }
 }
 

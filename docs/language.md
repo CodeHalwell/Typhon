@@ -509,6 +509,8 @@ Every widening is semantics-preserving because the element, its captured argumen
 
 `go f(x)` schedules `f(x)` in the background: an `asyncio.Task` in async contexts. `go f(x) -> fut` binds the task handle.
 
+The spawned call must produce a coroutine. `go` (and `await`) on a callee the checker knows to be synchronous is rejected with `tyc::type_mismatch` (``expected `a coroutine for go` ``), because `spawn` raises `TypeError` on it at runtime: a plain `def` in the same module, a sync alias, a callable parameter typed as returning a non-awaitable, or a plain, undecorated `def` imported by name from another project `.ty` module (`from helpers import work`). Functions known only from a `.dty` stub or venv introspection, decorated functions and module-qualified calls (`go helpers.work()`) stay permissive.
+
 `go` always lowers through `typhon_runtime.tasks.spawn`, **never** to a bare `asyncio.create_task` — and there is no `ThreadPoolExecutor` lowering for `go`, including on free-threaded builds. Python's event loop holds only weak references to tasks, so a fire-and-forget task whose handle is dropped can be garbage-collected mid-flight. The runtime helper keeps a strong-ref registry and discards entries from a done-callback.
 
 ## `let` and `mut`

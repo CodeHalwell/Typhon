@@ -305,6 +305,15 @@ grouped by workstream (W1–W7).
   `perf_sorted_first` is silent inside a `try` catching `IndexError` /
   `LookupError`. Under `[strictness] require-with = "error"` or
   `blocking-in-async = "error"` the newly-caught shapes fail the build.
+- **`go` on an imported synchronous function is rejected** (W3, extending
+  W2-11). `from helpers import work` + `go work()`, where `work` is a plain
+  `def` in a project `.ty` module, passed `tyc check` and raised
+  `TypeError: a coroutine was expected` from `asyncio.create_task` at
+  runtime; it is now `tyc::type_mismatch` (``expected `a coroutine for
+  go` ``), as for a same-module `def` (`await work()` likewise). Shapes
+  carry a new `ArityInfo::declared_sync` flag, set only for an undecorated
+  `def` extracted from `.ty` source — `.dty`, bundled and venv-introspected
+  stubs, decorated functions and module-qualified calls stay permissive.
 
 #### W4 — CLI, LSP, filesystem safety
 - **LSP definition URIs rebased onto client workspace root.** `goto_definition` now uses the client's declared workspace root URI (preserving symlink prefixes such as `/var/folders` or `/tmp` rather than macOS `/private/var/...`) or open-document URI, preventing editors from opening duplicate tabs on cross-file jumps.

@@ -202,3 +202,65 @@ fn a_cross_module_extend_is_not_promised_to_modules_that_do_not_import_it() {
         "{out}{err}"
     );
 }
+
+// ── W3 (extending W2-11): `go` on an imported synchronous function ─────────
+
+fn check_project(files: &[(&str, &str)]) -> (bool, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(tmp.path(), files);
+    let (ok, out, err) = run_tyc(tmp.path(), &["check", "src"]);
+    (ok, format!("{out}{err}"))
+}
+
+#[test]
+fn go_on_an_imported_synchronous_def_is_rejected() {
+    // Base accepted this; CPython raised `TypeError: a coroutine was
+    // expected, got 1` from `asyncio.create_task`.
+    let main = "\
+import asyncio
+from helpers import work, awork
+
+async def main() -> None:
+    go awork() -> t
+    print(await t)
+    go work()
+
+asyncio.run(main())
+";
+    let (ok, out) = check_project(&[
+        (
+            "helpers.ty",
+            "def work() -> int:\n    return 1\n\nasync def awork() -> int:\n    return 2\n",
+        ),
+        ("main.ty", main),
+    ]);
+    assert!(!ok, "{out}");
+    assert!(out.contains("a coroutine for go"), "{out}");
+}
+
+#[test]
+fn go_stays_permissive_for_stubs_decorators_and_async_imports() {
+    let main = "\
+import helpers
+from helpers import wrapped, awork
+from stubbed import stub_work
+
+async def main() -> None:
+    go wrapped()
+    go awork()
+    go stub_work()
+    go helpers.awork()
+";
+    let (ok, out) = check_project(&[
+        (
+            "helpers.ty",
+            "import asyncio\nfrom typing import Callable\n\n\
+             def deco(f: Callable[[], object]) -> Callable[[], object]:\n    return f\n\n\
+             @deco\ndef wrapped() -> int:\n    return 1\n\n\
+             async def awork() -> int:\n    await asyncio.sleep(0)\n    return 2\n",
+        ),
+        ("stubbed.dty", "def stub_work() -> int: ...\n"),
+        ("main.ty", main),
+    ]);
+    assert!(ok, "{out}");
+}
