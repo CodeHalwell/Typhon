@@ -79,9 +79,13 @@ Output appears in `View → Output → Typhon`. Other editors have similar setti
 
 Standard JSON-RPC over stdio. The implementation uses `tower-lsp-server` (the active fork of `tower-lsp` that tracks `lsp-types` 0.97+).
 
+A malformed frame does not stop the server: bytes that are not a JSON value (truncated JSON, non-UTF-8) get a `-32700` parse-error reply, and a JSON value that is not a JSON-RPC 2.0 message (an array, a message without `"jsonrpc": "2.0"`) gets `-32600`; the server then reads the next frame. The process exits 0 after `shutdown` + `exit`, and 1 when the client sends `exit` without `shutdown` or closes stdin first.
+
+Reopening a closed file reuses that file's entry in the Salsa database, so opening and closing a file repeatedly does not grow the server's memory.
+
 ## Configuration
 
-The LSP picks up project settings from `typhon.toml` automatically (it walks up from the open file). `[strictness]` settings, `[python] target`, and `[emit]` all flow through. The file is loaded with the same validating loader as the CLI, so a `typhon.toml` that `tyc check` refuses — an absolute or `..` `[project] src`, an unknown key, an invalid value — is refused by the server too, which then checks each open file on its own.
+The LSP picks up project settings from `typhon.toml` automatically (it walks up from the open file). `[strictness]` settings, `[python] target`, and `[emit]` all flow through. The file is loaded with the same validating loader as the CLI, so a `typhon.toml` that `tyc check` refuses — an absolute or `..` `[project] src`, an unknown key, an invalid value — is refused by the server too, which then checks each open file on its own and reports the error as a diagnostic on `typhon.toml` (on the offending key's line, or the line and column of a TOML syntax error). The report clears once the file is valid again.
 
 ## Common issues
 

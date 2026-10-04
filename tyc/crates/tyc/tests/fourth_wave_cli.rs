@@ -122,3 +122,169 @@ fn check_uses_each_nested_projects_config() {
     assert!(t.contains("1 error"), "{t}");
     assert!(t.contains("strict/src/main.ty"), "{t}");
 }
+
+// ── `tyc lsp` transport (W4-11) ─────────────────────────────────────────────
+
+mod lsp_transport {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::process::{Child, ChildStdin, Command, Stdio};
+    use std::sync::mpsc::{channel, Receiver};
+    use std::time::Duration;
+
+    struct Server {
+        child: Child,
+        stdin: Option<ChildStdin>,
+        frames: Receiver<serde_json::Value>,
+    }
+
+    impl Server {
+        fn start() -> Self {
+            let mut child = Command::new(env!("CARGO_BIN_EXE_tyc"))
+                .args(["lsp", "--log-level", "error"])
+                .env("TYC_NO_INTROSPECT", "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let stdin = child.stdin.take();
+            let stdout = child.stdout.take().unwrap();
+            let (tx, frames) = channel();
+            std::thread::spawn(move || {
+                let mut r = BufReader::new(stdout);
+                loop {
+                    let mut len = None;
+                    loop {
+                        let mut line = String::new();
+                        if r.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let line = line.trim_end();
+                        if line.is_empty() {
+                            break;
+                        }
+                        if let Some(v) = line.strip_prefix("Content-Length:") {
+                            len = v.trim().parse::<usize>().ok();
+                        }
+                    }
+                    let mut body = vec![0u8; len.unwrap()];
+                    if r.read_exact(&mut body).is_err() {
+                        return;
+                    }
+                    if tx.send(serde_json::from_slice(&body).unwrap()).is_err() {
+                        return;
+                    }
+                }
+            });
+            Server {
+                child,
+                stdin,
+                frames,
+            }
+        }
+
+        fn raw(&mut self, bytes: &[u8]) {
+            let w = self.stdin.as_mut().unwrap();
+            w.write_all(bytes).unwrap();
+            w.flush().unwrap();
+        }
+
+        fn frame(&mut self, body: &[u8]) {
+            let mut msg = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+            msg.extend_from_slice(body);
+            self.raw(&msg);
+        }
+
+        fn send(&mut self, v: serde_json::Value) {
+            self.frame(&serde_json::to_vec(&v).unwrap());
+        }
+
+        /// The next message that satisfies `pred`, within 20 s.
+        fn expect(&self, pred: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
+            loop {
+                let msg = self
+                    .frames
+                    .recv_timeout(Duration::from_secs(20))
+                    .expect("server went quiet (or exited)");
+                if pred(&msg) {
+                    return msg;
+                }
+            }
+        }
+
+        fn initialize(&mut self, id: i64) -> serde_json::Value {
+            self.send(
+                serde_json::json!({"jsonrpc":"2.0","id":id,"method":"initialize",
+                "params":{"capabilities":{}}}),
+            );
+            self.expect(|m| m["id"] == id)
+        }
+
+        fn exit_code(mut self) -> i32 {
+            for _ in 0..200 {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    return status.code().unwrap_or(-1);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let _ = self.child.kill();
+            panic!("server did not exit");
+        }
+    }
+
+    /// W4-11: a malformed frame gets an error reply and the server keeps
+    /// serving. tower-lsp used to stop reading after the first one and exit 0.
+    #[test]
+    fn malformed_frames_get_an_error_and_the_server_survives() {
+        let mut s = Server::start();
+        let cases: [(&[u8], i64); 5] = [
+            (b"{\"jsonrpc\":\"2.0\",\"id\":1,\"meth", -32700),
+            (b"not json at all", -32700),
+            (b"[1, 2, 3]", -32600),
+            (
+                b"{\"id\":2,\"method\":\"initialize\",\"params\":{}}",
+                -32600,
+            ),
+            (b"{\"jsonrpc\":\"2.0\",\"method\":\"x\xff\xfe\"}", -32700),
+        ];
+        for (body, code) in cases {
+            s.frame(body);
+            let reply = s.expect(|m| m.get("error").is_some());
+            assert_eq!(
+                reply["error"]["code"].as_i64(),
+                Some(code),
+                "{} → {reply}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        // A header block without `Content-Length` is skipped the same way.
+        s.raw(b"Content-Type: application/vscode-jsonrpc; charset=utf-8\r\n\r\n");
+        let reply = s.expect(|m| m.get("error").is_some());
+        assert_eq!(reply["error"]["code"].as_i64(), Some(-32700), "{reply}");
+
+        let init = s.initialize(7);
+        assert!(init["result"]["capabilities"].is_object(), "{init}");
+        s.send(serde_json::json!({"jsonrpc":"2.0","id":8,"method":"shutdown"}));
+        s.expect(|m| m["id"] == 8);
+        s.send(serde_json::json!({"jsonrpc":"2.0","method":"exit"}));
+        assert_eq!(s.exit_code(), 0);
+    }
+
+    /// W4-11: `exit` without a preceding `shutdown` exits 1, per the spec.
+    #[test]
+    fn exit_without_shutdown_is_exit_code_one() {
+        let mut s = Server::start();
+        s.initialize(1);
+        s.send(serde_json::json!({"jsonrpc":"2.0","method":"exit"}));
+        assert_eq!(s.exit_code(), 1);
+    }
+
+    /// W4-11: stdin closing before `shutdown` is not a clean exit either.
+    #[test]
+    fn stdin_closing_without_shutdown_is_not_exit_code_zero() {
+        let mut s = Server::start();
+        s.initialize(1);
+        s.stdin = None;
+        assert_eq!(s.exit_code(), 1);
+    }
+}

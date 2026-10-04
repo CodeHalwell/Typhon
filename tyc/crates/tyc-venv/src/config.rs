@@ -744,6 +744,24 @@ pub enum ConfigError {
     },
 }
 
+impl ConfigError {
+    /// The `typhon.toml` key the error is about, when it names one — what an
+    /// editor highlights.
+    pub fn key(&self) -> Option<&str> {
+        match self {
+            ConfigError::Io { .. } | ConfigError::Parse { .. } => None,
+            ConfigError::UnsupportedPythonTarget { .. } => Some("target"),
+            ConfigError::InvalidClassDefault { .. } => Some("class-default"),
+            ConfigError::InvalidModelExtra { .. } => Some("model-extra"),
+            ConfigError::InvalidSeverity { key, .. } => Some(key),
+            ConfigError::InvalidChecker { .. } => Some("external"),
+            ConfigError::InvalidOptimiseLevel { .. } => Some("level"),
+            ConfigError::InvalidParallelBackend { .. } => Some("parallel-backend"),
+            ConfigError::ProjectPathEscapesRoot { key, .. } => Some(key),
+        }
+    }
+}
+
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

@@ -36,6 +36,7 @@ use tyc_resolve::{
 mod position_map;
 mod semantic;
 mod stdlib_stubs;
+mod transport;
 mod venv_introspect;
 
 /// Manual resolved-module cache for cross-file import resolution.
@@ -247,6 +248,17 @@ pub struct Backend {
     /// Cached per-project source listings (W4-08): the walk used to run on
     /// every keystroke.
     source_walks: SourceWalkCache,
+    /// Set by the `shutdown` request. `exit` (or the client hanging up)
+    /// without it is an abnormal termination: exit code 1, per the spec.
+    shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
+    /// Salsa inputs of documents the client closed, by URI. Salsa never frees
+    /// an input, so a reopen reuses the old one instead of allocating another
+    /// (W4-11: 300 reopen cycles grew RSS from 5 MB to 75 MB).
+    closed_documents: Arc<Mutex<HashMap<String, SourceFile>>>,
+    /// `typhon.toml` files currently reported invalid, with the reported
+    /// message, so a fix clears the report and an unchanged error is not
+    /// republished on every keystroke.
+    config_errors: Arc<Mutex<HashMap<std::path::PathBuf, String>>>,
 }
 
 impl std::fmt::Debug for Backend {
@@ -256,8 +268,13 @@ impl std::fmt::Debug for Backend {
 }
 
 impl Backend {
-    /// A backend with empty caches, talking to `client`.
-    fn new(client: Client, log_level: LogLevel) -> Self {
+    /// A backend with empty caches, talking to `client`. `shutdown_requested`
+    /// is raised when the client sends `shutdown`.
+    fn new(
+        client: Client,
+        log_level: LogLevel,
+        shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
         Backend {
             client,
             db: Arc::new(Mutex::new(TycDatabase::new())),
@@ -273,7 +290,54 @@ impl Backend {
             severity_overrides_cache: Arc::new(Mutex::new(HashMap::new())),
             workspace_root: Arc::new(Mutex::new(None)),
             source_walks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            shutdown_requested,
+            closed_documents: Arc::new(Mutex::new(HashMap::new())),
+            config_errors: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Report an invalid `typhon.toml` on the file itself, the way `tyc
+    /// check` refuses to run on it, and clear the report once it is valid
+    /// again (W4-11: the server used to fall back to defaults silently).
+    async fn report_config(&self, lookup: &WorkspaceLookup) {
+        let (toml_path, message, error) = match lookup {
+            WorkspaceLookup::Invalid(path, err) => (path.clone(), Some(err.to_string()), Some(err)),
+            WorkspaceLookup::Project(root, _) => (root.join("typhon.toml"), None, None),
+            WorkspaceLookup::None => return,
+        };
+        {
+            let mut reported = self.config_errors.lock().await;
+            match &message {
+                Some(m) if reported.get(&toml_path) == Some(m) => return,
+                Some(m) => {
+                    reported.insert(toml_path.clone(), m.clone());
+                }
+                None => {
+                    if reported.remove(&toml_path).is_none() {
+                        return;
+                    }
+                }
+            }
+        }
+        let Some(uri) = self.path_to_client_uri(&toml_path).await else {
+            return;
+        };
+        let diagnostics = match (message, error) {
+            (Some(message), Some(error)) => {
+                let text = std::fs::read_to_string(&toml_path).unwrap_or_default();
+                vec![Diagnostic {
+                    range: config_error_range(&text, error),
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    source: Some("tyc".to_owned()),
+                    message,
+                    ..Default::default()
+                }]
+            }
+            _ => Vec::new(),
+        };
+        self.client
+            .publish_diagnostics(uri, diagnostics, None)
+            .await;
     }
 
     /// Convert an internal path to a client-facing URI.
@@ -408,9 +472,14 @@ impl Backend {
         // this short operation so hover/completion requests can still acquire
         // it while the heavy `check_source_file` runs on the blocking thread.
         let source_file: SourceFile = {
-            let existing = {
+            let open = {
                 let docs = self.documents.lock().await;
                 docs.get(&uri_str).copied()
+            };
+            // A document reopened after a close gets its old input back.
+            let existing = match open {
+                Some(sf) => Some(sf),
+                None => self.closed_documents.lock().await.remove(&uri_str),
             };
             let mut db_guard = self.db.lock().await;
             if let Some(sf) = existing {
@@ -453,7 +522,12 @@ impl Backend {
         // this file already uses.
         let path_for_root =
             uri_to_path(&uri).unwrap_or_else(|| std::path::PathBuf::from(uri.path().as_str()));
-        let workspace = find_workspace_layout(&path_for_root);
+        let lookup = lookup_workspace(&path_for_root);
+        self.report_config(&lookup).await;
+        let workspace = match lookup {
+            WorkspaceLookup::Project(root, src) => Some((root, src)),
+            _ => None,
+        };
         let project_files_arc = Arc::clone(&self.project_files);
         let source_walks_arc = Arc::clone(&self.source_walks);
         let current_path = path_lookup_key(&path_for_root);
@@ -897,6 +971,8 @@ impl LanguageServer for Backend {
     }
 
     async fn shutdown(&self) -> jsonrpc::Result<()> {
+        self.shutdown_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
@@ -948,7 +1024,12 @@ impl LanguageServer for Backend {
         let uri_str = uri.as_str().to_owned();
         {
             let mut docs = self.documents.lock().await;
-            docs.remove(&uri_str);
+            if let Some(sf) = docs.remove(&uri_str) {
+                self.closed_documents
+                    .lock()
+                    .await
+                    .insert(uri_str.clone(), sf);
+            }
         }
         {
             // Drop the per-document debounce entry so reopening the
@@ -2205,7 +2286,6 @@ enum WorkspaceLookup {
     /// A valid project: `(project_root, src_dir)`.
     Project(std::path::PathBuf, std::path::PathBuf),
     /// A `typhon.toml` the CLI would refuse: its path and the CLI's error.
-    #[allow(dead_code)] // reported on `typhon.toml` by W4-11
     Invalid(std::path::PathBuf, tyc_venv::config::ConfigError),
 }
 
@@ -2247,6 +2327,55 @@ fn find_workspace_layout(
         WorkspaceLookup::Project(root, src) => Some((root, src)),
         _ => None,
     }
+}
+
+/// Where in `typhon.toml` (`text`) an error belongs: the line and column a
+/// TOML syntax error names, else the line assigning the key the error is
+/// about, else the top of the file.
+fn config_error_range(text: &str, error: &tyc_venv::config::ConfigError) -> Range {
+    let whole_line = |line: usize| -> Range {
+        let len = text
+            .lines()
+            .nth(line)
+            .map_or(0, |l| l.encode_utf16().count());
+        Range {
+            start: Position {
+                line: line as u32,
+                character: 0,
+            },
+            end: Position {
+                line: line as u32,
+                character: len as u32,
+            },
+        }
+    };
+    if let tyc_venv::config::ConfigError::Parse { cause, .. } = error {
+        // `TOML parse error at line 3, column 5`
+        let at = |marker: &str| -> Option<usize> {
+            let rest = &cause[cause.find(marker)? + marker.len()..];
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            digits.parse().ok()
+        };
+        if let (Some(line), Some(col)) = (at("at line "), at(", column ")) {
+            let line = line.saturating_sub(1);
+            let mut range = whole_line(line);
+            range.start.character = (col.saturating_sub(1) as u32).min(range.end.character);
+            return range;
+        }
+        return whole_line(0);
+    }
+    if let Some(key) = error.key() {
+        for (i, line) in text.lines().enumerate() {
+            let trimmed = line.trim_start();
+            let rest = trimmed
+                .strip_prefix(key)
+                .or_else(|| trimmed.strip_prefix(&format!("\"{key}\"")));
+            if rest.is_some_and(|r| r.trim_start().starts_with('=')) {
+                return whole_line(i);
+            }
+        }
+    }
+    whole_line(0)
 }
 
 /// `[project] src` from a valid `typhon.toml` (the CLI's loader; `None` when
@@ -2854,7 +2983,11 @@ impl LogLevel {
 /// `log_level` controls the severity threshold for messages the backend
 /// forwards to the editor via `client.log_message`. Messages below the
 /// threshold are dropped.
-pub fn run_stdio(log_level: LogLevel) {
+/// Serve LSP on stdin/stdout until the client sends `exit` or hangs up.
+/// Returns the process exit code: 0 after a `shutdown` request, 1 otherwise
+/// (the spec's rule for `exit`; a client that vanishes without `shutdown` is
+/// not a clean exit either).
+pub fn run_stdio(log_level: LogLevel) -> i32 {
     // Match the CLI's deep-recursion headroom (see `tyc/src/main.rs`): the
     // recursive-descent parser and the AST/type walkers can recurse as deep
     // as the user nests brackets/expressions, which overflows the default
@@ -2869,12 +3002,47 @@ pub fn run_stdio(log_level: LogLevel) {
         .build()
         .expect("failed to start tokio runtime for tyc-lsp");
 
-    runtime.block_on(async {
-        let stdin = tokio::io::stdin();
-        let stdout = tokio::io::stdout();
-        let (service, socket) = LspService::new(move |client| Backend::new(client, log_level));
-        Server::new(stdin, stdout, socket).serve(service).await;
+    let shutdown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&shutdown_requested);
+    runtime.block_on(async move {
+        // The transport guard (W4-11) sits between stdio and the library:
+        // stdin → guard → server, and server → relay → writer → stdout, with
+        // the guard's error replies joining the writer's queue a whole frame
+        // at a time.
+        let (to_server, server_in) = tokio::io::duplex(1 << 16);
+        let (server_out, from_server) = tokio::io::duplex(1 << 16);
+        let (frames_tx, frames_rx) = tokio::sync::mpsc::unbounded_channel();
+        let writer = tokio::spawn(transport::write_frames(tokio::io::stdout(), frames_rx));
+        let guard = tokio::spawn(transport::guard_input(
+            tokio::io::BufReader::new(tokio::io::stdin()),
+            to_server,
+            frames_tx.clone(),
+        ));
+        let relay = tokio::spawn(transport::relay_output(
+            tokio::io::BufReader::new(from_server),
+            frames_tx,
+        ));
+
+        let (service, socket) =
+            LspService::new(move |client| Backend::new(client, log_level, flag));
+        Server::new(server_in, server_out, socket)
+            .serve(service)
+            .await;
+
+        // `serve` dropped its output end, so the relay drains and stops. The
+        // guard may still be parked on a stdin read the client never closes.
+        let _ = relay.await;
+        guard.abort();
+        let _ = guard.await;
+        let _ = writer.await;
     });
+    // Don't wait for a blocking stdin read that will never complete.
+    runtime.shutdown_background();
+    if shutdown_requested.load(std::sync::atomic::Ordering::SeqCst) {
+        0
+    } else {
+        1
+    }
 }
 
 /// Typhon-specific keywords that the LSP advertises in completion.  Kept
@@ -4551,7 +4719,13 @@ mod tests {
     /// Spin up the real server over an in-memory pipe; return the client-side
     /// (writer, reader) duplex halves.
     fn spawn_backend() -> (DuplexStream, DuplexStream) {
-        let (service, socket) = LspService::new(|client| Backend::new(client, LogLevel::Error));
+        let (service, socket) = LspService::new(|client| {
+            Backend::new(
+                client,
+                LogLevel::Error,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+        });
         let (to_server, server_in) = tokio::io::duplex(64 * 1024);
         let (server_out, from_server) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
@@ -6198,6 +6372,138 @@ mod tests {
                 "src = {src_value:?} must not be read: {diags:?}"
             );
         }
+    }
+
+    /// [`spawn_backend`], also handing back the backend's open-document map.
+    fn spawn_backend_with_documents() -> (
+        DuplexStream,
+        DuplexStream,
+        Arc<Mutex<HashMap<String, SourceFile>>>,
+    ) {
+        let mut documents = None;
+        let (service, socket) = LspService::new(|client| {
+            let backend = Backend::new(
+                client,
+                LogLevel::Error,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            );
+            documents = Some(Arc::clone(&backend.documents));
+            backend
+        });
+        let (to_server, server_in) = tokio::io::duplex(64 * 1024);
+        let (server_out, from_server) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            Server::new(server_in, server_out, socket)
+                .serve(service)
+                .await
+        });
+        (to_server, from_server, documents.unwrap())
+    }
+
+    /// W4-11: reopening a closed document reuses its Salsa input. Each
+    /// `didOpen` after a `didClose` used to allocate a fresh, never-freed
+    /// `SourceFile` (300 reopen cycles: 5 MB → 75 MB RSS).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reopening_a_document_reuses_its_input() {
+        let (mut to, mut from, documents) = spawn_backend_with_documents();
+        handshake(&mut to, &mut from, None).await;
+        let uri = "file:///tmp/tyc_lsp_w411_reopen/main.ty";
+        // Drain the server's output so its writes never block.
+        tokio::spawn(async move {
+            loop {
+                recv(&mut from).await;
+            }
+        });
+        // Wait until the document is (or is not) in the open set.
+        let settle = |want_open: bool| {
+            let documents = Arc::clone(&documents);
+            async move {
+                tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                    loop {
+                        if let Some(sf) = documents.lock().await.get(uri).copied() {
+                            if want_open {
+                                return Some(sf);
+                            }
+                        } else if !want_open {
+                            return None;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("document state")
+            }
+        };
+        let mut handles = Vec::new();
+        for i in 0..3 {
+            did_open(&mut to, uri, &format!("let x: int = {i}\n")).await;
+            handles.push(settle(true).await.unwrap());
+            send(
+                &mut to,
+                serde_json::json!({"jsonrpc":"2.0","method":"textDocument/didClose",
+                    "params":{"textDocument":{"uri":uri}}}),
+            )
+            .await;
+            settle(false).await;
+        }
+        assert!(
+            handles.windows(2).all(|w| w[0] == w[1]),
+            "every reopen must reuse the first input"
+        );
+    }
+
+    /// W4-11: a `typhon.toml` the CLI rejects is reported on the file itself
+    /// (the server used to fall back to defaults in silence), and the report
+    /// clears once the file is fixed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invalid_typhon_toml_is_reported_on_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let toml_path = tmp.path().join("typhon.toml");
+        std::fs::write(
+            &toml_path,
+            "[project]\nname = \"x\"\n\n[strictness]\nnullable-use = \"eror\"\n",
+        )
+        .unwrap();
+        let main_src = "let x: int = 1\n";
+        std::fs::write(src.join("main.ty"), main_src).unwrap();
+        let main_uri = format!("file://{}", src.join("main.ty").display());
+        let toml_uri = format!("file://{}", toml_path.display());
+
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, None).await;
+        did_open(&mut to, &main_uri, main_src).await;
+        let diags = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            next_diagnostics(&mut from, &toml_uri),
+        )
+        .await
+        .expect("typhon.toml diagnostics");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        let d = &diags[0];
+        assert_eq!(d["severity"].as_i64(), Some(1), "{d}");
+        assert!(
+            d["message"].as_str().unwrap().contains("nullable-use"),
+            "{d}"
+        );
+        assert_eq!(d["range"]["start"]["line"].as_u64(), Some(4), "{d}");
+
+        // Fix it and tell the server; the report goes away.
+        std::fs::write(&toml_path, "[project]\nname = \"x\"\n").unwrap();
+        send(
+            &mut to,
+            serde_json::json!({"jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles",
+                "params":{"changes":[{"uri":toml_uri,"type":2}]}}),
+        )
+        .await;
+        let cleared = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            next_diagnostics(&mut from, &toml_uri),
+        )
+        .await
+        .expect("cleared typhon.toml diagnostics");
+        assert!(cleared.is_empty(), "{cleared:?}");
     }
 
     #[cfg(unix)]

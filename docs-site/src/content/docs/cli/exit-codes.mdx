@@ -31,6 +31,7 @@ sidebar:
 | `tyc ty` | `ty` returned 0. | Propagates `ty`'s exit code. |
 | `tyc stubtest` | `mypy.stubtest` returned 0. | Propagates mypy's exit code. |
 | `tyc add` / `remove` / `sync` | Manifest updated and `uv sync` succeeded. | 1 if uv missing; non-zero from uv on resolution failure. |
+| `tyc lsp` | The client sent `shutdown` before `exit`. | 1 when the client sends `exit` without `shutdown` (the LSP spec's rule) or closes stdin without it. |
 
 ## Severity-to-exit-code mapping
 

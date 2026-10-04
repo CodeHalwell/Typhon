@@ -234,6 +234,15 @@ grouped by workstream (W1–W7).
   refused instead of walked. `ln -s . src/a; ln -s . src/b` used to stall
   diagnostics for good. The source listing is cached instead of re-walked on
   every keystroke.
+- **Language-server robustness** (W4-11). A malformed frame (truncated or
+  non-UTF-8 JSON, non-JSON, a JSON array, a message without `"jsonrpc"`) gets
+  a `-32700` / `-32600` reply and the server keeps reading; tower-lsp-server
+  used to stop after the first one and exit 0. `tyc lsp` exits 1 on `exit`
+  without `shutdown` (the spec's code) or when stdin closes first, 0 after
+  `shutdown`. Reopening a closed document reuses its Salsa input (300 reopen
+  cycles took RSS from 5 MB to 75 MB). An invalid `typhon.toml` is reported as
+  a diagnostic on the file — on the offending key, or at a TOML syntax error —
+  instead of silently falling back to defaults, and clears once fixed.
 
 #### W5 — VM & harness
 
