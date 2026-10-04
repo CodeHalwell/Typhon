@@ -10,8 +10,12 @@
 //! This module owns the comparison so the vendored AST crate stays wrapped in
 //! one place.
 
+use std::collections::HashMap;
+
 use ruff_python_ast::comparable::ComparableModModule;
+use ruff_python_ast::token::{TokenKind, Tokens};
 use ruff_python_ast::{self as ast, Expr, ModModule, Stmt};
+use ruff_text_size::Ranged;
 
 /// Outcome of [`compare_python_sources`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,19 +44,19 @@ pub struct CompareOptions {
 /// same module, ignoring source positions and comments.
 ///
 /// Compiler-generated names (`__typhon_…`) are renamed by order of first
-/// appearance on each side before parsing: some lowerings number their
-/// temporaries by source line (`__typhon_guard_12`), and a formatter that
-/// adds a PEP 8 blank line legitimately renumbers them.
+/// appearance on each side: some lowerings number their temporaries by
+/// source line (`__typhon_guard_12`), and a formatter that adds a PEP 8
+/// blank line legitimately renumbers them. Only identifier tokens are
+/// renamed — the same text inside a string literal is program data, and
+/// a change to it is a change to the program.
 pub fn compare_python_sources(before: &str, after: &str, opts: CompareOptions) -> AstComparison {
-    let before = canonicalise_generated_names(before);
-    let after = canonicalise_generated_names(after);
-    let mut before = match ruff_python_parser::parse_module(&before) {
-        Ok(parsed) => parsed.into_syntax(),
-        Err(e) => return AstComparison::BeforeDoesNotParse(e.to_string()),
+    let mut before = match parse_canonical(before) {
+        Ok(module) => module,
+        Err(e) => return AstComparison::BeforeDoesNotParse(e),
     };
-    let mut after = match ruff_python_parser::parse_module(&after) {
-        Ok(parsed) => parsed.into_syntax(),
-        Err(e) => return AstComparison::AfterDoesNotParse(e.to_string()),
+    let mut after = match parse_canonical(after) {
+        Ok(module) => module,
+        Err(e) => return AstComparison::AfterDoesNotParse(e),
     };
     if opts.lenient_docstrings {
         normalise_docstrings(&mut before.body);
@@ -69,40 +73,50 @@ fn modules_equal(a: &ModModule, b: &ModModule) -> bool {
     ComparableModModule::from(a) == ComparableModModule::from(b)
 }
 
-/// Rename every identifier-shaped run that starts with `__typhon_` to
-/// `__typhon_c<N>__`, numbering distinct names by first appearance.
-fn canonicalise_generated_names(src: &str) -> String {
+/// Parse `src`, with its compiler-generated names canonicalised.
+fn parse_canonical(src: &str) -> Result<ModModule, String> {
+    let parsed = ruff_python_parser::parse_module(src).map_err(|e| e.to_string())?;
+    match canonicalise_generated_names(src, parsed.tokens()) {
+        None => Ok(parsed.into_syntax()),
+        Some(canonical) => ruff_python_parser::parse_module(&canonical)
+            .map(|p| p.into_syntax())
+            .map_err(|e| e.to_string()),
+    }
+}
+
+/// Rename every identifier token of `src` that starts with `__typhon_` to
+/// `__typhon_c<N>__`, numbering distinct names by first appearance. String
+/// literal contents (f-string literal parts included) and comments are
+/// different tokens, so they are left exactly as written. `None` when no
+/// identifier needs renaming.
+fn canonicalise_generated_names(src: &str, tokens: &Tokens) -> Option<String> {
     const PREFIX: &str = "__typhon_";
     if !src.contains(PREFIX) {
-        return src.to_owned();
+        return None;
     }
-    let bytes = src.as_bytes();
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut seen: HashMap<&str, usize> = HashMap::new();
     let mut out = String::with_capacity(src.len());
     let mut last = 0usize;
-    let mut search = 0usize;
-    while let Some(rel) = src[search..].find(PREFIX) {
-        let start = search + rel;
-        // Must start an identifier, not sit inside one (`x__typhon_y`).
-        if start > 0 && is_ident(bytes[start - 1]) {
-            search = start + PREFIX.len();
+    for token in tokens {
+        if token.kind() != TokenKind::Name {
             continue;
         }
-        let mut end = start + PREFIX.len();
-        while end < bytes.len() && is_ident(bytes[end]) {
-            end += 1;
+        let range = token.range();
+        let name = &src[range];
+        if !name.starts_with(PREFIX) {
+            continue;
         }
-        let name = &src[start..end];
         let next = seen.len();
         let id = *seen.entry(name).or_insert(next);
-        out.push_str(&src[last..start]);
+        out.push_str(&src[last..range.start().to_usize()]);
         out.push_str(&format!("__typhon_c{id}__"));
-        last = end;
-        search = end;
+        last = range.end().to_usize();
+    }
+    if seen.is_empty() {
+        return None;
     }
     out.push_str(&src[last..]);
-    out
+    Some(out)
 }
 
 /// Replace every docstring (the leading string-literal expression statement
@@ -228,6 +242,39 @@ mod tests {
                 "__typhon_guard_5 = f()\nx = __typhon_guard_5\n",
             ),
             AstComparison::Different
+        );
+    }
+
+    #[test]
+    fn generated_names_inside_strings_are_compared_as_written() {
+        // Only identifiers are canonicalised: the same text inside a
+        // string literal is data, and a changed literal is a changed program.
+        assert_eq!(
+            cmp("x = \"__typhon_old\"\n", "x = \"__typhon_new\"\n"),
+            AstComparison::Different
+        );
+        assert_eq!(
+            cmp(
+                "x = f\"{__typhon_a}-__typhon_old\"\n",
+                "x = f\"{__typhon_b}-__typhon_new\"\n",
+            ),
+            AstComparison::Different
+        );
+        // An identifier inside an f-string replacement field is still one.
+        assert_eq!(
+            cmp(
+                "__typhon_q_1 = 1\nx = f\"{__typhon_q_1}-__typhon_lit\"\n",
+                "__typhon_q_7 = 1\nx = f\"{__typhon_q_7}-__typhon_lit\"\n",
+            ),
+            AstComparison::Same
+        );
+        // A string mentioning a generated name does not shift the numbering.
+        assert_eq!(
+            cmp(
+                "s = \"__typhon_z\"\n__typhon_g_3 = f()\n",
+                "s = \"__typhon_z\"\n__typhon_g_9 = f()\n",
+            ),
+            AstComparison::Same
         );
     }
 

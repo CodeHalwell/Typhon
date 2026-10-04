@@ -114,6 +114,9 @@ fn run_source_reporting(
     } else {
         let _ = tyc_analyse::rewrite_builtin_extension_calls(&mut module, &registry);
     }
+    // Inline `?` evaluation order: move each hoisted method receiver's
+    // lookup up with it, as `tyc build` does after the same rewrite.
+    preprocess::attach_method_lookups(&mut module);
 
     let mut interp = Interpreter::new();
     interp.lazy_import_aliases = prep

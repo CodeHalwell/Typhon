@@ -40,7 +40,8 @@ compared, so only the compiler differs between the two sides.
 
 Before comparison each emitted file is normalised the way `tyc fmt`'s own check
 is (tyc-syntax/src/ast_equiv.rs): identifiers starting `__typhon_` are renamed
-by first appearance (some lowerings number temporaries by source line), and
+by first appearance (some lowerings number temporaries by source line; the
+same text inside a string literal is left alone), and
 source positions and comments are ignored. `--lenient-docstrings` compares
 docstrings with each line trimmed and blank lines dropped, for when `ruff
 format` may have re-indented them; `fmt-gate` always sets it.
@@ -87,6 +88,7 @@ import argparse
 import ast
 import concurrent.futures
 import hashlib
+import io
 import json
 import os
 import re
@@ -95,6 +97,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import tokenize
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -161,20 +164,38 @@ def slug(unit: str) -> str:
 
 # --------------------------------------------------------- normalisation --
 
-_GENERATED = re.compile(r"(?<![A-Za-z0-9_])__typhon_[A-Za-z0-9_]*")
+_GENERATED_PREFIX = "__typhon_"
 
 
 def canonicalise_generated_names(src: str) -> str:
-    """Rename `__typhon_*` identifiers by first appearance (as ast_equiv.rs does)."""
+    """Rename `__typhon_*` identifiers by first appearance (as ast_equiv.rs does).
+
+    Only NAME tokens are renamed. The same text inside a string literal (or an
+    f-string's literal part) is program data: renaming it would let a changed
+    literal compare equal. Source the tokenizer rejects is returned unchanged,
+    for `ast.parse` to report.
+    """
+    if _GENERATED_PREFIX not in src:
+        return src
+    line_starts = [0] + [m.end() for m in re.finditer("\n", src)]
     seen: dict[str, int] = {}
-
-    def repl(m: re.Match[str]) -> str:
-        name = m.group(0)
-        if name not in seen:
-            seen[name] = len(seen)
-        return f"__typhon_c{seen[name]}__"
-
-    return _GENERATED.sub(repl, src)
+    pieces: list[str] = []
+    last = 0
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+            if tok.type != tokenize.NAME or not tok.string.startswith(_GENERATED_PREFIX):
+                continue
+            start = line_starts[tok.start[0] - 1] + tok.start[1]
+            end = line_starts[tok.end[0] - 1] + tok.end[1]
+            if tok.string not in seen:
+                seen[tok.string] = len(seen)
+            pieces.append(src[last:start])
+            pieces.append(f"__typhon_c{seen[tok.string]}__")
+            last = end
+    except (tokenize.TokenError, SyntaxError):
+        return src
+    pieces.append(src[last:])
+    return "".join(pieces)
 
 
 def _normalise_docstrings(tree: ast.AST) -> None:
