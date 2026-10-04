@@ -42035,6 +42035,36 @@ def main() -> None:
         assert!(!check_full(src).errors().is_empty());
     }
     #[test]
+    fn w2_10_task_contracts_walk_their_arguments() {
+        // `TaskGroup()` takes no arguments (CPython raises `TypeError`), and
+        // the expressions passed to the task contracts are still checked.
+        for src in [
+            "async def f() -> None:\n    async with asyncio.TaskGroup(1) as tg:\n        pass\n",
+            "async def f() -> None:\n    async with asyncio.TaskGroup(limit=1) as tg:\n        pass\n",
+        ] {
+            let d = check_full(src);
+            assert!(
+                d.errors().iter().any(|e| matches!(e, TycError::WrongArgCount { .. })),
+                "accepted: {src}"
+            );
+        }
+        for src in [
+            "def g(x: int) -> int:\n    return x\nasync def f() -> None:\n    async with asyncio.TaskGroup(g(\"s\")) as tg:\n        pass\n",
+            "def g(x: int) -> str:\n    return str(x)\nasync def work() -> int:\n    return 1\nasync def f() -> int:\n    let t = asyncio.create_task(work(), name=g(\"s\"))\n    return await t\n",
+        ] {
+            let d = check_full(src);
+            assert!(
+                d.errors().iter().any(|e| matches!(e, TycError::TypeMismatch { .. })),
+                "argument not checked: {src}: {:?}",
+                d.errors()
+            );
+        }
+        for src in [
+            "async def f() -> None:\n    async with asyncio.TaskGroup(*()) as tg:\n        pass\n",
+            "async def work() -> int:\n    return 1\nasync def f() -> int:\n    let t = asyncio.create_task(work(), name=\"w\")\n    return await t\n",
+        ] { assert!(check_full(src).errors().is_empty(), "{src}: {:?}", check_full(src).errors()); }
+    }
+    #[test]
     fn w2_11_go_requires_a_coroutine() {
         let src = "def work() -> int:\n    return 1\nasync def f() -> None:\n    go work()\n";
         assert!(!check_full(src).errors().is_empty(), "accepted: {src}");
