@@ -1630,7 +1630,7 @@ The recurring diagnostic codes and what they actually mean. **See [DIAGNOSTICS.m
 | `tyc::newtype_violation` | Bare base-type value flowing into a `newtype` slot or wrong-typed constructor arg | Wrap with the constructor: `UserId(raw_int)` |
 | `tyc::resource_not_managed` (warn) | Bare assignment of `open` / `socket.socket` / `sqlite3.connect` / `tempfile.*` without `with` | Wrap in `with` or move into an explicit `try/finally`. Severity controlled by `[strictness] require-with` |
 | `tyc::div_by_zero_literal` | Literal-divisor `/ 0`, `// 0`, `% 0` (including `-0.0` and unary-negated zero) | Fix the divisor or guard the call site |
-| `tyc::unsafe_value_leak` | A `return x` outside the `unsafe:` block where `x` was declared | Re-assert inside (`let x: T = …`) or re-bind at the boundary (`let typed: T = x`) |
+| `tyc::unsafe_value_leak` | A `return x` outside the `unsafe:` block where `x` was declared | Re-assert inside (`let x: T = …`) or cast at the boundary (`x as! T`). Re-binding outside the block (`let typed: T = x`) is itself reported |
 | `tyc::extend_builtin` | `extend list[int]:` (parametric target) | Drop the `[…]`; `extend list:` is the supported form |
 | `tyc::duplicate_method` | Two `impl`/`extend` blocks define the same method | Rename, delete, or merge |
 | `tyc::pub_name_collision` | (v0.7.0) Two siblings both `pub`-export the same name under `pub *` | Rename one, drop `pub` on one, or use explicit re-exports |
