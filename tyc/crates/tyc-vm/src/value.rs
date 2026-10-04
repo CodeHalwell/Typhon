@@ -103,7 +103,7 @@ impl<T> std::ops::Deref for FrozenCell<T> {
     }
 }
 pub type RcDict = Rc<crate::value::FrozenCell<DictMap>>;
-pub type RcSet = Rc<crate::value::FrozenCell<std::collections::HashSet<HashKey>>>;
+pub type RcSet = Rc<crate::value::FrozenCell<crate::pyset::PySet>>;
 #[derive(Clone, Copy)]
 pub struct VmFloat {
     pub value: f64,
@@ -962,6 +962,14 @@ fn push_int_canonical(out: &mut Vec<u8>, i: &BigInt) {
     out.extend_from_slice(&digits);
 }
 
+/// The sorted canonical encodings of a frozenset's members — the
+/// order-independent identity `Eq`, `Hash` and the sort key use.
+fn frozenset_canonical(items: &[HashKey]) -> Vec<Vec<u8>> {
+    let mut keys: Vec<Vec<u8>> = items.iter().map(HashKey::canonical_sort_key).collect();
+    keys.sort();
+    keys
+}
+
 impl HashKey {
     /// Stable, collision-safe sort key. Two distinct `HashKey` values
     /// have distinct sort keys (the discriminant byte differs across
@@ -1010,10 +1018,9 @@ impl HashKey {
             HashKey::FrozenSet(items) => {
                 out.push(6);
                 out.extend_from_slice(&(items.len() as u32).to_be_bytes());
-                // FrozenSet elements are already canonicalised at
-                // construction so this is deterministic.
-                for item in items.iter() {
-                    let inner = item.canonical_sort_key();
+                // Members are kept in the frozenset's iteration order;
+                // sort their encodings so equal frozensets encode equally.
+                for inner in frozenset_canonical(items) {
                     out.extend_from_slice(&(inner.len() as u32).to_be_bytes());
                     out.extend_from_slice(&inner);
                 }
@@ -1072,13 +1079,9 @@ impl HashKey {
                 items.iter().cloned().map(HashKey::into_value).collect(),
             )),
             HashKey::FrozenSet(items) => {
-                use std::collections::HashSet;
-                let mut set = HashSet::new();
-                for k in items.iter() {
-                    set.insert(k.clone());
-                }
-                // Surface back as a frozenset-tagged Value::Set.
-                Value::Set(Rc::new(crate::value::FrozenCell::new(set)))
+                let set: crate::pyset::PySet = items.iter().cloned().collect();
+                // Surface back as a frozenset.
+                Value::Set(Rc::new(crate::value::FrozenCell::frozen(set)))
             }
             HashKey::Instance { instance, .. } => Value::Instance(instance),
             HashKey::Identity(instance) => Value::Instance(instance),
@@ -1129,10 +1132,9 @@ impl PartialEq for HashKey {
             (HashKey::Str(a), HashKey::Str(b)) => a == b,
             (HashKey::Tuple(a), HashKey::Tuple(b)) => a == b,
             (HashKey::FrozenSet(a), HashKey::FrozenSet(b)) => {
-                // Frozenset equality is order-independent; the constructor
-                // stores items pre-sorted by their hash representation so
-                // this works as a vector compare.
-                a == b
+                // Order-independent: the members are kept in iteration
+                // order, so compare their sorted canonical encodings.
+                a.len() == b.len() && frozenset_canonical(a) == frozenset_canonical(b)
             }
             // Instance keys compare on their canonical projection: same
             // class name and equal field set. The original `instance`
@@ -1186,7 +1188,7 @@ impl std::hash::Hash for HashKey {
             }
             HashKey::Str(s) => s.hash(state),
             HashKey::Tuple(items) => items.hash(state),
-            HashKey::FrozenSet(items) => items.hash(state),
+            HashKey::FrozenSet(items) => frozenset_canonical(items).hash(state),
             // Hash only the canonical projection so it stays consistent
             // with `Eq` (which ignores the retained `instance` Rc).
             HashKey::Instance { key, .. } => key.hash(state),
@@ -2150,6 +2152,7 @@ impl Value {
             Value::Tuple(t) if is_ellipsis_marker(t) => "ellipsis",
             Value::Tuple(_) => "tuple",
             Value::Dict(_) => "dict",
+            Value::Set(s) if s.frozen.get() => "frozenset",
             Value::Set(_) => "set",
             Value::Range { .. } => "range",
             Value::Native(_) | Value::Function(_) | Value::BoundMethod { .. } => "function",
@@ -2231,16 +2234,10 @@ impl Value {
             // The (much more common) flow we care about is `frozenset(...)`
             // as a dict key, which now works.
             Value::Set(s) => {
-                let mut keys: Vec<HashKey> = s.borrow().iter().cloned().collect();
-                // Canonical ordering so two sets with the same members
-                // produce identical `FrozenSet` payloads (and therefore
-                // hash equal). We compare on a collision-safe sort key
-                // — sorting by `DefaultHasher::finish()` alone allows
-                // two distinct elements to share an ordering slot and
-                // the resulting key ordering depends on insertion
-                // history, breaking `Eq` / `Hash` consistency
-                // (review thread copilot on PR #147).
-                keys.sort_by_key(|a| a.canonical_sort_key());
+                // Members in the set's iteration order, so a frozenset read
+                // back out of a dict or set iterates as it did going in;
+                // `Eq` / `Hash` compare the sorted canonical encodings.
+                let keys: Vec<HashKey> = s.borrow().iter().cloned().collect();
                 Ok(HashKey::FrozenSet(Rc::new(keys)))
             }
             // Dataclass instances are hashable: CPython makes
@@ -2437,12 +2434,7 @@ impl Value {
             (Set(a), Set(b)) => {
                 let a = a.borrow();
                 let b = b.borrow();
-                let a_len = a.iter().count();
-                let b_len = b.iter().count();
-                if a_len != b_len {
-                    return false;
-                }
-                a.iter().all(|k| b.contains(k))
+                a.len() == b.len() && a.iter().all(|k| b.contains(k))
             }
             _ => false,
         }
@@ -2686,9 +2678,9 @@ impl Value {
             Value::Set(set) => {
                 let s = set.borrow();
                 let is_frozen = set.frozen.get();
-                // Frozen metadata lives outside user-visible container contents.
-                let mut keys: Vec<&HashKey> = s.iter().collect();
-                keys.sort_by_key(|k| k.canonical_sort_key());
+                // Frozen metadata lives outside user-visible container
+                // contents. CPython's iteration order (see `pyset`).
+                let keys: Vec<&HashKey> = s.iter().collect();
                 let items: Vec<String> = keys
                     .into_iter()
                     .map(|k| k.clone().into_value().py_repr())
@@ -3762,7 +3754,7 @@ mod tests {
 
     #[test]
     fn set_equality_is_order_independent() {
-        use std::collections::HashSet;
+        use crate::pyset::PySet as HashSet;
         let mut s1 = HashSet::new();
         s1.insert(HashKey::Int(1.into()));
         s1.insert(HashKey::Int(2.into()));
@@ -3777,14 +3769,19 @@ mod tests {
     }
 
     #[test]
-    fn set_repr_is_sorted_and_deterministic() {
-        use std::collections::HashSet;
-        let mut s = HashSet::new();
-        for n in [5, 3, 1, 4, 2, 0, 7, 6] {
-            s.insert(HashKey::Int(n.into()));
-        }
+    fn set_repr_follows_cpython_iteration_order() {
+        let s: crate::pyset::PySet = [5, 3, 1, 4, 2, 0, 7, 6]
+            .into_iter()
+            .map(|n| HashKey::Int(n.into()))
+            .collect();
         let v = Value::Set(Rc::new(crate::value::FrozenCell::new(s)));
         assert_eq!(v.py_str(), "{0, 1, 2, 3, 4, 5, 6, 7}");
+        let s: crate::pyset::PySet = [5, 3, 1, 100, 33, 2]
+            .into_iter()
+            .map(|n| HashKey::Int(n.into()))
+            .collect();
+        let v = Value::Set(Rc::new(crate::value::FrozenCell::new(s)));
+        assert_eq!(v.py_str(), "{1, 33, 3, 100, 5, 2}");
     }
 
     #[test]

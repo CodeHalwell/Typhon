@@ -284,6 +284,17 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   `__init_subclass__` and `__set_name__` run at class creation, data
   descriptors' `__set__` / `__delete__` and `@prop.deleter` are honoured,
   and `del Cls.attr` / `delattr(Cls, …)` work.
+- **Sets iterate in CPython's order** (W5-08). VM sets were a Rust
+  `HashSet` with a random seed — a different iteration order on every
+  run — while `repr` sorted, so the VM even disagreed with itself
+  (`s = {-1, 0, 1}; print(s, list(s))`). Sets are now a reproduction of
+  CPython's table with CPython's hashes, so iteration, `repr`, `pop()` and
+  every set operation match CPython (`{5, 3, 1, 100, 33, 2}` prints
+  `{1, 33, 3, 100, 5, 2}`; strings match under `PYTHONHASHSEED=0`). Also:
+  the set methods accept any iterable; `pop`, `intersection_update`,
+  `difference_update` and `symmetric_difference_update` exist;
+  `frozenset | set` is a `frozenset`; `isinstance(frozenset(), set)` is
+  `False`; `frozenset(f) is f`.
 - **One front end for every VM entry point** (W5-20). The entry program,
   imported sibling modules and the embedded stdlib shims all go through
   `tyc_syntax::preprocess::expand_and_preprocess_mapped` — the chain

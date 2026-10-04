@@ -317,6 +317,24 @@ base class's namespace into every subclass:
 - **`__init_subclass__`** of the nearest ancestor runs when a subclass is
   created, with the class header's keyword arguments.
 
+### Sets iterate in CPython's order (beta)
+
+A `set` / `frozenset` is a reproduction of CPython's open-addressing
+table (`Objects/setobject.c`: nine linear probes then perturbed probing,
+growth at three-fifths full, dummies on deletion), keyed by CPython's own
+hashes. Iteration, `repr`, `list(s)`, `s.pop()` and every set operation
+therefore produce CPython's order: `{-1, 0, 1}` is `{0, 1, -1}` and
+`{5, 3, 1, 100, 33, 2}` is `{1, 33, 3, 100, 5, 2}`. The construction path
+matters as it does in CPython — a literal of three or more constants is
+copied from a constant `frozenset`, `set(other_set)` copies its table,
+`set(a_dict)` resizes once up front, and `a | b`, `a & b`, `a - b`,
+`a ^ b` follow `set_or` / `set_intersection` / `set_difference` /
+`set_symmetric_difference`. `str` hashes use CPython's
+`PYTHONHASHSEED=0` key, so string sets match a CPython run with that seed
+(CPython randomises string-set order per process otherwise). All the
+`set` methods accept any iterable, including `intersection_update`,
+`difference_update`, `symmetric_difference_update` and `pop`.
+
 ## Multi-file projects
 
 Since v0.9.0 the VM loads sibling `.ty` modules from the project source
@@ -509,8 +527,9 @@ on the old behaviour will see different — correct — results):
   order (was `<Name instance>`).
 - Dataclass instances are hashable via `HashKey::Instance` (class
   identity + fields sorted by name).
-- Set / frozenset equality is order-independent; repr sorts elements
-  by canonical key.
+- Set / frozenset equality is order-independent. (Since beta, iteration
+  and `repr` follow CPython's table order — see "Sets iterate in
+  CPython's order" below; they no longer sort.)
 - Float `repr` matches CPython's shortest round-tripping form, with
   scientific notation for exp < -4 or ≥ 16 (`e+NN` / `e-NN`, ≥ 2
   exponent digits), `-0.0` preserved.

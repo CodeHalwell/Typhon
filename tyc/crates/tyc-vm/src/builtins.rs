@@ -859,15 +859,16 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("set", |i, args| {
-        let mut out = HashSet::new();
-        if let Some(v) = args.into_iter().next() {
-            let it = i.make_iter(v)?;
-            while let Some(x) = i.iter_next(&it)? {
-                let k = i.hash_key(&x)?;
-                let k = i.settle_key_in_set(&out, k)?;
-                out.insert(k);
-            }
+        if args.len() > 1 {
+            return Err(type_error(format!(
+                "set expected at most 1 argument, got {}",
+                args.len()
+            )));
         }
+        let out = match args.into_iter().next() {
+            Some(v) => i.set_from_value(v)?,
+            None => crate::pyset::PySet::new(),
+        };
         Ok(Value::Set(Rc::new(crate::value::FrozenCell::new(out))))
     });
 
@@ -938,15 +939,22 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("frozenset", |i, args| {
-        let mut out = HashSet::new();
-        if let Some(v) = args.into_iter().next() {
-            let it = i.make_iter(v)?;
-            while let Some(x) = i.iter_next(&it)? {
-                let k = i.hash_key(&x)?;
-                let k = i.settle_key_in_set(&out, k)?;
-                out.insert(k);
+        if args.len() > 1 {
+            return Err(type_error(format!(
+                "frozenset expected at most 1 argument, got {}",
+                args.len()
+            )));
+        }
+        // `frozenset(f)` of a frozenset is that same object.
+        if let Some(Value::Set(s)) = args.first() {
+            if set_is_frozen(s) {
+                return Ok(args[0].clone());
             }
         }
+        let out = match args.into_iter().next() {
+            Some(v) => i.set_from_value(v)?,
+            None => crate::pyset::PySet::new(),
+        };
         // Frozen metadata lives outside user-visible container contents.
         Ok(Value::Set(Rc::new(crate::value::FrozenCell::frozen(out))))
     });
@@ -2265,8 +2273,8 @@ pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
         ("tuple", Value::Tuple(t)) => !crate::value::is_slice_marker(t),
         ("slice", Value::Tuple(t)) => crate::value::is_slice_marker(t),
         ("dict", Value::Dict(_)) => true,
-        ("set", Value::Set(_)) => true,
-        ("frozenset", Value::Set(_)) => true,
+        ("set", Value::Set(s)) => !set_is_frozen(s),
+        ("frozenset", Value::Set(s)) => set_is_frozen(s),
         ("range", Value::Range { .. }) => true,
         ("complex", Value::Complex(..)) => true,
         ("Ok", Value::ResultOk(_)) => true,
@@ -8434,7 +8442,7 @@ pub fn dict_is_frozen(d: &Rc<crate::value::FrozenCell<DictMap>>) -> bool {
 }
 
 // Frozen metadata lives outside user-visible container contents.
-pub fn set_is_frozen(s: &Rc<crate::value::FrozenCell<std::collections::HashSet<HashKey>>>) -> bool {
+pub fn set_is_frozen(s: &crate::value::RcSet) -> bool {
     s.frozen.get()
 }
 
@@ -8494,7 +8502,8 @@ fn deep_freeze_value(v: Value) -> Result<Value, Unwind> {
         }
         Value::Set(s) => {
             // Frozen metadata lives outside user-visible container contents.
-            let elements: std::collections::HashSet<HashKey> = s.borrow().iter().cloned().collect();
+            // `frozenset(s)`: a copy of the set's table.
+            let elements = s.borrow().copy();
             Ok(Value::Set(Rc::new(crate::value::FrozenCell::frozen(
                 elements,
             ))))
@@ -11222,26 +11231,60 @@ fn dict_method(
 
 fn set_method(
     interp: &mut Interpreter,
-    s: &Rc<crate::value::FrozenCell<HashSet<HashKey>>>,
+    s: &crate::value::RcSet,
     name: &str,
     args: &[Value],
 ) -> Result<Value, Unwind> {
-    // Refuse mutators on a `freeze let`-tagged set so the VM matches
-    // the compile path's `frozenset` semantics (review thread codex
-    // and copilot on PR #147). Read-only methods are unaffected.
+    use crate::pyset::PySet;
+    let frozen = set_is_frozen(s);
+    let type_name = if frozen { "frozenset" } else { "set" };
+    // Refuse mutators on a frozenset (and a `freeze let`-tagged set) so the
+    // VM matches the compile path's `frozenset` semantics. Read-only
+    // methods are unaffected.
     let is_mutator = matches!(
         name,
-        "add" | "remove" | "discard" | "pop" | "clear" | "update"
+        "add"
+            | "remove"
+            | "discard"
+            | "pop"
+            | "clear"
+            | "update"
+            | "intersection_update"
+            | "difference_update"
+            | "symmetric_difference_update"
     );
-    if is_mutator && set_is_frozen(s) {
+    if is_mutator && frozen {
         return Err(attribute_error(format!(
             "'frozenset' object has no attribute '{}'",
             name
         )));
     }
+    let new_value = |set: PySet| {
+        let cell = crate::value::FrozenCell::new(set);
+        cell.frozen.set(frozen);
+        Value::Set(Rc::new(cell))
+    };
+    // The members of a non-set operand, in iteration order.
+    fn operand_keys(interp: &mut Interpreter, v: &Value) -> Result<Vec<HashKey>, Unwind> {
+        let it = interp.make_iter(v.clone())?;
+        let mut keys = Vec::new();
+        while let Some(x) = interp.iter_next(&it)? {
+            keys.push(interp.hash_key(&x)?);
+        }
+        Ok(keys)
+    }
+    // A set operand as a table (a set's own, a dict's keys, or the
+    // iterable collected as `set(it)` would).
+    fn operand_set(interp: &mut Interpreter, v: &Value) -> Result<PySet, Unwind> {
+        match v {
+            Value::Set(o) => Ok(o.borrow().clone()),
+            other => interp.set_from_value(other.clone()),
+        }
+    }
     match name {
         "add" => {
-            let k = interp.set_probe_key(s, single(args, "add")?)?;
+            let x = single(args, "add")?;
+            let k = interp.set_probe_key(s, x)?;
             s.borrow_mut().insert(k);
             Ok(Value::None)
         }
@@ -11253,70 +11296,148 @@ fn set_method(
             }
             Ok(Value::None)
         }
+        "pop" => {
+            if !args.is_empty() {
+                return Err(type_error(format!(
+                    "set.pop() takes no arguments ({} given)",
+                    args.len()
+                )));
+            }
+            match s.borrow_mut().pop() {
+                Some(k) => Ok(k.into_value()),
+                None => Err(Unwind::Exception(crate::error::VmException::new(
+                    "KeyError",
+                    "'pop from an empty set'",
+                )
+                .with_value(Value::Exception {
+                    kind: Rc::new("KeyError".to_owned()),
+                    message: Rc::new("'pop from an empty set'".to_owned()),
+                    args: Rc::new(vec![Value::Str(Rc::new("pop from an empty set".to_owned()))]),
+                    chain: None,
+                }))),
+            }
+        }
         "clear" => {
             s.borrow_mut().clear();
             Ok(Value::None)
         }
         "copy" => {
-            let result = crate::value::FrozenCell::new(s.borrow().clone());
-            result.frozen.set(set_is_frozen(s));
-            Ok(Value::Set(Rc::new(result)))
-        }
-        "union" | "intersection" | "difference" | "symmetric_difference" => {
-            let a = set_keys_no_sentinel(s);
-            let mut acc: HashSet<HashKey> = a;
-            for arg in args {
-                let b = value_to_key_set(arg)?;
-                acc = match name {
-                    "union" => acc.union(&b).cloned().collect(),
-                    "intersection" => acc.intersection(&b).cloned().collect(),
-                    "difference" => acc.difference(&b).cloned().collect(),
-                    _ => acc.symmetric_difference(&b).cloned().collect(),
-                };
+            // `frozenset.copy()` is the object itself.
+            if frozen {
+                return Ok(Value::Set(s.clone()));
             }
-            // A set operation on a `frozenset` yields a `frozenset` — carry the
-            // immutability sentinel over so the result stays read-only.
-            let result = crate::value::FrozenCell::new(acc);
-            result.frozen.set(set_is_frozen(s));
-            Ok(Value::Set(Rc::new(result)))
+            Ok(new_value(s.borrow().copy()))
         }
-        "issubset" | "issuperset" | "isdisjoint" => {
-            let a = set_keys_no_sentinel(s);
-            let b = value_to_key_set(single(args, name)?)?;
-            let result = match name {
-                "issubset" => a.is_subset(&b),
-                "issuperset" => a.is_superset(&b),
-                _ => a.is_disjoint(&b),
-            };
-            Ok(Value::Bool(result))
+        "union" => {
+            let mut acc = s.borrow().copy();
+            for arg in args {
+                if let Value::Set(o) = arg {
+                    if Rc::ptr_eq(o, s) {
+                        continue;
+                    }
+                }
+                interp.set_update_from(&mut acc, arg.clone())?;
+            }
+            Ok(new_value(acc))
         }
         "update" => {
             for arg in args {
-                let b = value_to_key_set(arg)?;
-                s.borrow_mut().extend(b);
+                if let Value::Set(o) = arg {
+                    if Rc::ptr_eq(o, s) {
+                        continue;
+                    }
+                }
+                let mut acc = std::mem::take(&mut *s.borrow_mut());
+                let r = interp.set_update_from(&mut acc, arg.clone());
+                *s.borrow_mut() = acc;
+                r?;
             }
             Ok(Value::None)
         }
-        _ => Err(attribute_error(format!("set has no method '{}'", name))),
-    }
-}
-
-/// The members of a set, excluding the internal `freeze let` sentinel.
-pub fn set_keys_no_sentinel(
-    s: &Rc<crate::value::FrozenCell<HashSet<HashKey>>>,
-) -> HashSet<HashKey> {
-    s.borrow().iter().cloned().collect()
-}
-
-/// Coerce a set-method argument (set / list / tuple / frozenset) into a key set.
-fn value_to_key_set(v: &Value) -> Result<HashSet<HashKey>, Unwind> {
-    match v {
-        Value::Set(other) => Ok(set_keys_no_sentinel(other)),
-        Value::List(l) => l.borrow().iter().map(|x| x.to_hash_key()).collect(),
-        Value::Tuple(t) => t.iter().map(|x| x.to_hash_key()).collect(),
-        _ => Err(type_error(format!(
-            "'{}' object is not a valid set operand",
-            v.type_name()
+        "intersection" | "intersection_update" => {
+            let mut acc = s.borrow().clone();
+            if args.is_empty() {
+                acc = acc.copy();
+            }
+            for arg in args {
+                acc = match arg {
+                    Value::Set(o) => acc.intersection(&o.borrow()),
+                    other => {
+                        let keys = operand_keys(interp, other)?;
+                        acc.intersection_keys(keys)
+                    }
+                };
+            }
+            if name == "intersection_update" {
+                *s.borrow_mut() = acc;
+                return Ok(Value::None);
+            }
+            Ok(new_value(acc))
+        }
+        "difference" | "difference_update" => {
+            let mut acc = if name == "difference" {
+                match args.first() {
+                    None => s.borrow().copy(),
+                    Some(Value::Set(o)) => s.borrow().difference(&o.borrow()),
+                    Some(Value::Dict(d)) => {
+                        let keys: PySet = d.borrow().keys().cloned().collect();
+                        s.borrow().difference(&keys)
+                    }
+                    Some(other) => {
+                        let keys = operand_keys(interp, other)?;
+                        let mut acc = s.borrow().copy();
+                        acc.difference_update_keys(keys);
+                        acc
+                    }
+                }
+            } else {
+                s.borrow().clone()
+            };
+            let rest = if name == "difference" { args.get(1..).unwrap_or(&[]) } else { args };
+            for arg in rest {
+                match arg {
+                    Value::Set(o) if Rc::ptr_eq(o, s) => acc.clear(),
+                    Value::Set(o) => acc.difference_update(&o.borrow()),
+                    other => {
+                        let keys = operand_keys(interp, other)?;
+                        acc.difference_update_keys(keys);
+                    }
+                }
+            }
+            if name == "difference_update" {
+                *s.borrow_mut() = acc;
+                return Ok(Value::None);
+            }
+            Ok(new_value(acc))
+        }
+        "symmetric_difference" => {
+            let other = operand_set(interp, single(args, name)?)?;
+            Ok(new_value(s.borrow().symmetric_difference(&other)))
+        }
+        "symmetric_difference_update" => {
+            let arg = single(args, name)?;
+            if let Value::Set(o) = arg {
+                if Rc::ptr_eq(o, s) {
+                    s.borrow_mut().clear();
+                    return Ok(Value::None);
+                }
+            }
+            let other = operand_set(interp, arg)?;
+            s.borrow_mut().symmetric_difference_update(&other);
+            Ok(Value::None)
+        }
+        "issubset" | "issuperset" | "isdisjoint" => {
+            let other = operand_set(interp, single(args, name)?)?;
+            let a = s.borrow();
+            let result = match name {
+                "issubset" => a.is_subset(&other),
+                "issuperset" => a.is_superset(&other),
+                _ => a.is_disjoint(&other),
+            };
+            Ok(Value::Bool(result))
+        }
+        _ => Err(attribute_error(format!(
+            "'{type_name}' object has no attribute '{name}'"
         ))),
     }
 }

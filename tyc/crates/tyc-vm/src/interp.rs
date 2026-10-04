@@ -3032,17 +3032,25 @@ impl Interpreter {
                 Ok(Value::Tuple(Rc::new(items)))
             }
             Expr::Set(s) => {
-                let mut set = std::collections::HashSet::new();
+                // CPython compiles a literal of three or more constants to
+                // `BUILD_SET 0; LOAD_CONST frozenset(...); SET_UPDATE`, so its
+                // table is a copy of that frozenset's; any other literal adds
+                // its items (and `*splats`) one by one.
+                let mut set = crate::pyset::PySet::new();
+                if s.elts.len() > 2 && s.elts.iter().all(is_constant_expr) {
+                    let mut constant = crate::pyset::PySet::new();
+                    for e in &s.elts {
+                        let v = self.eval_expr(e, env)?;
+                        constant.insert(self.hash_key(&v)?);
+                    }
+                    set.merge(&constant);
+                    return Ok(Value::Set(Rc::new(crate::value::FrozenCell::new(set))));
+                }
                 for e in &s.elts {
                     // `{*xs, 9}` — splat an iterable's elements into the set.
                     if let Expr::Starred(st) = e {
                         let it = self.eval_expr(&st.value, env)?;
-                        let it = self.make_iter(it)?;
-                        while let Some(v) = self.iter_next(&it)? {
-                            let k = self.hash_key(&v)?;
-                            let k = self.settle_key_in_set(&set, k)?;
-                            set.insert(k);
-                        }
+                        self.set_update_from(&mut set, it)?;
                     } else {
                         let v = self.eval_expr(e, env)?;
                         let k = self.hash_key(&v)?;
@@ -3641,6 +3649,43 @@ impl Interpreter {
         self.resolve_user_hash_candidates(*hash, instance, candidates)
     }
 
+    /// `set_update_internal`: add `other`'s members to `out` the way CPython
+    /// does for its type — a set or frozenset merges its table, a `dict`
+    /// adds its keys after one up-front resize, anything else is iterated
+    /// and added in order. The order of the result depends on which.
+    pub(crate) fn set_update_from(
+        &mut self,
+        out: &mut crate::pyset::PySet,
+        other: Value,
+    ) -> Result<(), Unwind> {
+        match &other {
+            Value::Set(s) => {
+                let src = s.borrow().clone();
+                out.merge(&src);
+            }
+            Value::Dict(d) => {
+                let keys: Vec<HashKey> = d.borrow().keys().cloned().collect();
+                out.update_from_dict_keys(keys.iter());
+            }
+            _ => {
+                let it = self.make_iter(other)?;
+                while let Some(x) = self.iter_next(&it)? {
+                    let k = self.hash_key(&x)?;
+                    let k = self.settle_key_in_set(out, k)?;
+                    out.insert(k);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `set(iterable)` / `frozenset(iterable)`.
+    pub(crate) fn set_from_value(&mut self, v: Value) -> Result<crate::pyset::PySet, Unwind> {
+        let mut out = crate::pyset::PySet::new();
+        self.set_update_from(&mut out, v)?;
+        Ok(out)
+    }
+
     pub fn settle_key_set(
         &mut self,
         s: &crate::value::RcSet,
@@ -3655,7 +3700,7 @@ impl Interpreter {
 
     pub fn settle_key_in_set(
         &mut self,
-        set: &std::collections::HashSet<HashKey>,
+        set: &crate::pyset::PySet,
         key: HashKey,
     ) -> Result<HashKey, Unwind> {
         let HashKey::UserHashed { hash, instance } = &key else {
@@ -3715,8 +3760,10 @@ impl Interpreter {
                 pyhash::tuple_hash(&hs)
             }
             Value::Set(s) if crate::builtins::set_is_frozen(s) => {
-                let members: Vec<Value> = crate::builtins::set_keys_no_sentinel(s)
-                    .into_iter()
+                let members: Vec<Value> = s
+                    .borrow()
+                    .iter()
+                    .cloned()
                     .map(HashKey::into_value)
                     .collect();
                 let mut hs = Vec::with_capacity(members.len());
@@ -3868,7 +3915,7 @@ impl Interpreter {
         // models a total order, so sets are handled before it.
         if let (Value::Set(a), Value::Set(b)) = (l, r) {
             let (a, b) = (a.borrow(), b.borrow());
-            let members = |s: &std::collections::HashSet<crate::value::HashKey>| s.len();
+            let members = |s: &crate::pyset::PySet| s.len();
             let subset = a.iter().all(|k| b.contains(k));
             let superset = b.iter().all(|k| a.contains(k));
             let (na, nb) = (members(&a), members(&b));
@@ -5586,11 +5633,8 @@ impl Interpreter {
             }
             Value::Set(set) => {
                 let is_frozen = set.frozen.get();
-                // Match `Value::py_str`'s ordering EXACTLY: sort by the
-                // collision-safe `canonical_sort_key` so the repr is stable
-                // and matches CPython for all-numeric / all-string cases.
-                let mut keys: Vec<HashKey> = set.borrow().iter().cloned().collect();
-                keys.sort_by_key(|k| k.canonical_sort_key());
+                // CPython's iteration order (see `pyset`), as `py_str`.
+                let keys: Vec<HashKey> = set.borrow().iter().cloned().collect();
                 if keys.is_empty() {
                     return Ok(if is_frozen {
                         "frozenset()".to_string()
@@ -5631,11 +5675,11 @@ impl Interpreter {
                 if items.is_empty() {
                     return Ok("frozenset()".to_string());
                 }
-                // Match `Value::py_str` set ordering: sort by canonical key.
-                let mut sorted: Vec<HashKey> = items.iter().cloned().collect();
-                sorted.sort_by_key(|k| k.canonical_sort_key());
-                let mut parts: Vec<String> = Vec::with_capacity(sorted.len());
-                for inner in &sorted {
+                // The members in the frozenset's own iteration order.
+                let rebuilt: crate::pyset::PySet = items.iter().cloned().collect();
+                let ordered: Vec<HashKey> = rebuilt.iter().cloned().collect();
+                let mut parts: Vec<String> = Vec::with_capacity(ordered.len());
+                for inner in &ordered {
                     parts.push(self.repr_hashkey(inner, depth + 1)?);
                 }
                 Ok(format!("frozenset({{{}}})", parts.join(", ")))
@@ -5996,14 +6040,25 @@ impl Interpreter {
         }
         if matches!(op, BitOr | BitAnd | Sub | BitXor) {
             if let (Some(a), Some(b)) = (as_set_operand(l)?, as_set_operand(r)?) {
-                let out: std::collections::HashSet<HashKey> = match op {
-                    BitOr => a.union(&b).cloned().collect(),
-                    BitAnd => a.intersection(&b).cloned().collect(),
-                    Sub => a.difference(&b).cloned().collect(),
-                    BitXor => a.symmetric_difference(&b).cloned().collect(),
+                // CPython's `set_or` / `set_intersection` / `set_difference` /
+                // `set_symmetric_difference`, so the result's order is its.
+                let out = match op {
+                    BitOr => {
+                        let mut out = a.copy();
+                        out.merge(&b);
+                        out
+                    }
+                    BitAnd => a.intersection(&b),
+                    Sub => a.difference(&b),
+                    BitXor => a.symmetric_difference(&b),
                     _ => unreachable!(),
                 };
-                return Ok(Set(Rc::new(crate::value::FrozenCell::new(out))));
+                // The result has the left operand's type: `frozenset | set`
+                // is a frozenset.
+                let frozen = matches!(l, Set(s) if crate::builtins::set_is_frozen(s));
+                let cell = crate::value::FrozenCell::new(out);
+                cell.frozen.set(frozen);
+                return Ok(Set(Rc::new(cell)));
             }
         }
 
@@ -8119,9 +8174,7 @@ impl Interpreter {
     }
 
     fn eval_setcomp(&mut self, c: &ast::ExprSetComp, env: &EnvRef) -> Result<Value, Unwind> {
-        let out = Rc::new(crate::value::FrozenCell::new(
-            std::collections::HashSet::new(),
-        ));
+        let out = Rc::new(crate::value::FrozenCell::new(crate::pyset::PySet::new()));
         let elt = c.elt.clone();
         let out_clone = out.clone();
         let leaks = comprehension_walrus_names(&[&c.elt], &c.generators);
@@ -9644,7 +9697,7 @@ fn user_hash_candidates_in_map(
 }
 
 fn user_hash_candidates_in_set(
-    set: &std::collections::HashSet<HashKey>,
+    set: &crate::pyset::PySet,
     hash: i64,
     probe: &Rc<Instance>,
 ) -> Vec<Rc<Instance>> {
@@ -10200,6 +10253,9 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                 | "symmetric_difference"
                 | "union"
                 | "update"
+                | "intersection_update"
+                | "difference_update"
+                | "symmetric_difference_update"
         ),
         Value::Tuple(_) => matches!(attr, "count" | "index"),
         Value::FloatData(_) => matches!(
@@ -11588,21 +11644,41 @@ pub(crate) fn class_has_builtin_exc_base(class: &Rc<Class>, target: &str) -> boo
 /// `Ok(None)` for anything that isn't set-like (so the binop falls through to
 /// the normal dunder / mismatch path), and propagates an unwind if a view
 /// element isn't hashable. `dict.values()` is intentionally not set-like.
-fn as_set_operand(v: &Value) -> Result<Option<std::collections::HashSet<HashKey>>, Unwind> {
+fn as_set_operand(v: &Value) -> Result<Option<crate::pyset::PySet>, Unwind> {
     use crate::value::DictViewKind;
     match v {
-        Value::Set(s) => Ok(Some(s.borrow().iter().cloned().collect())),
+        Value::Set(s) => Ok(Some(s.borrow().clone())),
+        // A view joins set algebra as `set(view)`: its items added in order.
         Value::DictView {
             kind: DictViewKind::Keys | DictViewKind::Items,
             items,
         } => {
-            let mut out = std::collections::HashSet::with_capacity(items.len());
+            let mut out = crate::pyset::PySet::new();
             for item in items {
                 out.insert(item.to_hash_key()?);
             }
             Ok(Some(out))
         }
         _ => Ok(None),
+    }
+}
+
+/// Whether CPython's AST optimiser folds `e` into a constant — what decides
+/// that a set literal is built from a constant `frozenset`.
+fn is_constant_expr(e: &Expr) -> bool {
+    match e {
+        Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::BytesLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::NoneLiteral(_)
+        | Expr::EllipsisLiteral(_) => true,
+        Expr::UnaryOp(u) => {
+            matches!(u.op, ast::UnaryOp::USub | ast::UnaryOp::UAdd | ast::UnaryOp::Invert)
+                && matches!(u.operand.as_ref(), Expr::NumberLiteral(_))
+        }
+        Expr::Tuple(t) => t.elts.iter().all(is_constant_expr),
+        _ => false,
     }
 }
 

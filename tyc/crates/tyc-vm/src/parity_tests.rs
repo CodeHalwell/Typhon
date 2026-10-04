@@ -69,6 +69,9 @@ fn run_python(dir: &Path, py: &str) -> Option<(String, String, i32)> {
         .arg("no_debug_ranges")
         .arg(&script)
         .current_dir(dir)
+        // The VM's `str` hash is CPython's under this seed (see `pyhash`),
+        // so string-set order is comparable too.
+        .env("PYTHONHASHSEED", "0")
         .output()
         .ok()?;
     Some((
@@ -465,6 +468,57 @@ plain class R1(Registry, tag="one"):
 plain class R2(R1):
     pass
 show(Registry.subs)
+"#,
+    );
+}
+
+// ── W5-08: set iteration order ────────────────────────────────────────────
+
+#[test]
+fn w5_08_set_order_matches_cpython() {
+    assert_matches_cpython(
+        "w5_08_set_order_matches_cpython",
+        r#"s = {-1, 0, 1}
+show(s, list(s))
+show({5, 3, 1, 100, 33, 2})
+x = 5
+show({x, 3, 1, 100, 33, 2})
+show(set([5, 3, 1, 100, 33, 2, 64, 17, 9, 1000, -7]))
+show(set(range(20, 0, -3)))
+a = set(range(10))
+b = {3, 4, 50, 60, 70, 8}
+show(a | b, a & b, a - b, a ^ b, b - a, b ^ a, b & a)
+show(a.union([100, 7, 99]), a.intersection([9, 1, 77]), a.difference(range(5)), a.symmetric_difference([1, 2, 300]))
+c: set[int] = set()
+for i in [10, 20, 30, 40, 50, 60, 70, 80, 90]:
+    c.add(i)
+show(c)
+c.discard(30)
+c.add(31)
+c.add(8)
+show(c)
+show(c.pop(), c.pop(), c)
+d = {"b": 1, "a": 2, 77: 3}
+show(set(d), {"pear", "apple", "fig"}, set("hello"))
+show({i * 7 for i in range(15)})
+f = frozenset([3, 1, 2, 900])
+show(f, {f: 1}, frozenset(f) is f, f | {5}, type(f | {5}).__name__)
+show({1.5, 2.5, 0.5, 1e10}, {(1, 2), (3, 4), (0, 0)}, {True, 2, None})
+e = {1, 2, 3}
+e.update([4, 5], {6, 7})
+show(e)
+e.intersection_update({1, 2, 3, 4, 99})
+show(e)
+e.difference_update([1])
+show(e)
+e.symmetric_difference_update({2, 10})
+show(e)
+trap("pop empty", lambda: set().pop())
+big = set(range(0, 100000, 7))
+show(len(big), list(big)[:5])
+for k in range(0, 100000, 14):
+    big.discard(k)
+show(len(big), list(big)[:5])
 "#,
     );
 }
