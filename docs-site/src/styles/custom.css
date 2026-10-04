@@ -225,6 +225,32 @@ textarea:focus-visible,
   border-radius: 0.25rem;
 }
 
+/* Hero buttons tactile feedback */
+.sl-link-button {
+  transition: transform 120ms ease, box-shadow 120ms ease, background-color 120ms ease, border-color 120ms ease;
+}
+
+.sl-link-button:not(.minimal):hover,
+.sl-link-button:not(.minimal):focus-visible {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px color-mix(in srgb, var(--sl-color-accent) 30%, transparent);
+}
+
+.sl-link-button:not(.minimal):active {
+  transform: translateY(0);
+  box-shadow: 0 2px 6px color-mix(in srgb, var(--sl-color-accent) 15%, transparent);
+}
+
+.sl-link-button.minimal:hover,
+.sl-link-button.minimal:focus-visible {
+  transform: translateY(-2px);
+  background-color: color-mix(in srgb, var(--sl-color-gray-5) 50%, transparent);
+}
+
+.sl-link-button.minimal:active {
+  transform: translateY(0);
+}
+
 /* Starlight specific focus fixes */
 .sl-link-card {
   transition: border-color 120ms ease, transform 120ms ease, box-shadow 120ms ease, background-color 120ms ease;
@@ -259,12 +285,19 @@ textarea:focus-visible,
   .card:active,
   .sl-link-card:hover,
   .sl-link-card:focus-within,
-  .sl-link-card:active {
+  .sl-link-card:active,
+  .sl-link-button:not(.minimal):hover,
+  .sl-link-button:not(.minimal):focus-visible,
+  .sl-link-button:not(.minimal):active,
+  .sl-link-button.minimal:hover,
+  .sl-link-button.minimal:focus-visible,
+  .sl-link-button.minimal:active {
     transform: none;
   }
   .card,
   .sl-link-card,
   .sl-link-card .icon,
+  .sl-link-button,
   table tbody tr,
   .sl-markdown-content a:not(:where(.not-content *)),
   starlight-tabs .tab > [role="tab"] {
