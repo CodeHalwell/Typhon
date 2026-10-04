@@ -208,8 +208,10 @@ check. Each migration step is gated on:
 1. **Emitted-AST equivalence over the corpus.** The W7 verification
    harness (build every unit in `examples/`, `examples/apps/` and `stress/`
    with the old and new binary, parse both `build/**/*.py`, compare ASTs)
-   ran on 1481 units / 1222 building for every W7 commit. Commit it as a
-   test tool. Any diff must be a case where the text lowering was wrong
+   ran on 1481 units / 1222 building for every W7 commit. Committed as
+   `scripts/emitted-ast.py equiv OLD NEW` (see
+   [`differential-testing.md`](../differential-testing.md#4-emitted-ast-equivalence-harness)).
+   Any diff must be a case where the text lowering was wrong
    (the W7-04 residuals in step 4), listed in the changelog.
 2. **Check-result equivalence**: no unit that checks before fails after.
 3. The VM ↔ CPython differential.
@@ -224,7 +226,7 @@ Each step is one PR and leaves the tree shippable.
 
 0. **Groundwork.** W5-20's single canonical chain (so removing a pass is one
    edit, not five); vendor `ast.toml` / `generate.py`; commit the
-   equivalence harness.
+   equivalence harness (done: `scripts/emitted-ast.py`).
 1. **Fork.** Tokens, nodes, grammar, `ParseOptions::typhon_sugar` (default
    off); parser snapshot tests for every form and every slot; no consumer
    change. Update `tyc/vendor/README.md` ("Typhon-specific extensions",

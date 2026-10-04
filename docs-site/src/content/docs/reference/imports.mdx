@@ -3,6 +3,8 @@ title: Imports
 description: import, from-import, and lazy import.
 sidebar:
   order: 19
+banner:
+  content: "This page includes behaviour implemented on <code>main</code> for the unreleased <code>v1.0.0-beta.1</code>. The latest published binary is <code>v1.0.0-alpha.9</code>."
 ---
 
 Imports follow Python's syntax, with one Typhon addition (`lazy import`) and one Typhon restriction (`lazy from` is rejected).
@@ -30,6 +32,32 @@ from ..lib import helper
 Relative imports (`.`, `..`) work as in Python. Since v0.9.0 the in-process VM (`tyc run`) also resolves relative imports against the project source root — sibling `.ty` modules load on demand and each module's bindings are cached as a `Value::Module`. Multi-file projects no longer require `--compile` to handle the cross-module imports.
 
 `tyc run --compile` was tweaked at the same time: instead of `python build/main.py`, it spawns `python -m <pkg>.main` so relative imports in the entry point resolve correctly under the compiled path too.
+
+### `typing` names
+
+Inside annotations and `type` statements — which the emitted module never
+evaluates — `Union`, `Optional`, `Any`, `List` / `Dict` / `Set` / `Tuple` /
+`FrozenSet`, `Type`, `TypeVar`, `Generic`, `Self`, `ClassVar`, `Final`,
+`Literal` and `NoReturn` can be written without an import. Used as runtime
+values they need one, because CPython would raise `NameError`:
+
+```python
+def describe(hint: object) -> str:
+    return "union" if hint is Union else "other"   # ❌ tyc::unknown_name
+```
+
+```python
+from typing import Union
+
+def describe(hint: object) -> str:
+    return "union" if hint is Union else "other"   # ✅
+```
+
+`Protocol` and the `collections.abc` names (`Callable`, `Iterator`, …) are
+unaffected: the build imports them. The deprecated capitalised aliases and
+`TypeVar` cannot be imported at all (`tyc::typing_alias_deprecated`,
+`tyc::typevar_import_rejected`); use the lowercase built-ins and PEP 695
+type parameters.
 
 ## Conditional imports
 

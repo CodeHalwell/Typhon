@@ -184,6 +184,60 @@ def f(x: object) -> None:
 
 **Fix:** use static narrowing or a sealed union; or write an explicit predicate function. See [Interfaces](/Typhon/types/interfaces/) for why.
 
+## `tyc::go_outside_async`
+
+A `go` spawn runs where no event loop is running: in module-level code, or
+in a synchronous function that module-level code calls. `spawn` would raise
+`RuntimeError: no running event loop`, leaving the coroutine never awaited.
+
+```python
+async def work() -> None:
+    print("w")
+
+def kick() -> None:
+    go work()
+
+kick()    # ❌ `go` needs a running event loop — `work (via kick)` is spawned from module-level code
+```
+
+**Fix:** spawn from inside a coroutine driven by `asyncio.run`, or run the
+coroutine to completion instead of spawning it (`asyncio.run(work())`):
+
+```python
+import asyncio
+
+async def work() -> None:
+    await asyncio.sleep(0)
+    print("w")
+
+async def kick() -> None:
+    go work()
+    await asyncio.sleep(0.01)
+
+asyncio.run(kick())
+```
+
+A synchronous function that spawns is fine when only coroutines call it;
+the check flags the module-level call that would run it without a loop.
+
+## `tyc::blocking_in_async` (warning)
+
+A known-blocking standard-library call (`time.sleep`, `requests.get`,
+`subprocess.run`, `input`, `socket.recv`, …) appears directly inside an
+`async def`. It stalls the event loop and every other coroutine on it.
+
+```python
+import time
+
+async def poll() -> None:
+    time.sleep(1)    # ⚠ `time.sleep(...)` blocks the event loop
+```
+
+**Fix:** use the async equivalent (`await asyncio.sleep(1)`), or move the
+call to a worker thread with `await asyncio.to_thread(time.sleep, 1)`. Only
+direct calls are flagged, and calls inside `unsafe:` are not. Severity:
+`[strictness] blocking-in-async`.
+
 ## Where next
 
 - [`async`, `await`, `gather`, `go` reference](/Typhon/reference/async/) — the surface.

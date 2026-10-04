@@ -1,32 +1,26 @@
 # tyc::missing_initialiser
 
-Fires when `let NAME: T` (or `mut NAME: T`) is written without an `= <expr>`
-initialiser. Typhon requires every binding to have a value at declaration —
-the Rust-style "declare-then-assign-later" shape is not supported.
+**Not currently emitted.** The code is registered and listed by
+`tyc explain --list`, but no check in the current compiler reports it.
 
-## Example
-
-```ty
-def main() -> None:
-    let x: int            # error: missing `= <expr>`
-    x = 1
-```
-
-## Why
-
-Without an initialiser, the binding is uninitialised until the first
-assignment — which Python would raise as `NameError` if read before then.
-Typhon avoids the entire class of bugs by requiring a value at the point of
-declaration; the dedicated diagnostic fires earlier than the confusing
-`tyc::immutable_assign` you'd otherwise get on the follow-up assignment.
-
-## Fix
-
-Initialise the binding inline:
+It was written for a rule that every `let NAME: T` must carry an
+`= <expr>` initialiser. That rule was relaxed in v0.7.0: a declare-only
+binding is legal, and the first assignment on each path is its
+initialiser.
 
 ```ty
-def main() -> None:
-    let x: int = 1
+def pick(cond: bool) -> int:
+    let x: int
+    if cond:
+        x = 5
+    else:
+        x = 10
+    return x        # ok: every path assigns `x` before the read
 ```
+
+A read on a path that has not assigned the binding reports
+`tyc::use_of_uninitialised`, and a second assignment reports
+`tyc::immutable_assign`. A declaration that is never assigned or read
+produces no diagnostic.
 
 See https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/missing_initialiser.md

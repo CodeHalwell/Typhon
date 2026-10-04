@@ -3,6 +3,8 @@ title: Interfaces (Protocols)
 description: Structural typing in Typhon — anything with the right shape satisfies the interface.
 sidebar:
   order: 8
+banner:
+  content: "This page includes behaviour implemented on <code>main</code> for the unreleased <code>v1.0.0-beta.1</code>. The latest published binary is <code>v1.0.0-alpha.9</code>."
 ---
 
 import { Aside, TabItem, Tabs } from '@astrojs/starlight/components';
@@ -116,7 +118,9 @@ A *member* is:
 - A method (`def name(self, ...) -> R`).
 - A field (`name: T`).
 
-Method signatures must match parameter and return types. Optional parameters in the interface are satisfied by required parameters in the implementation (and vice versa, in either direction).
+Method signatures must match parameter and return types, and parameter names must match too, since a caller may pass them by keyword. The implementation must accept every call the interface allows: it may add parameters only if they have defaults, and a parameter the interface makes optional must be optional in the implementation as well.
+
+An interface field is writable through the interface, so the implementation must provide a writable field of the same type. A `frozen` class, a getter-only `@property`, or a field with a narrower element type (`list[int]` for an interface's `list[object]`) does not conform: a write through the interface would fail, or store a value the implementation's type does not allow.
 
 ## `isinstance` against an interface is rejected
 
