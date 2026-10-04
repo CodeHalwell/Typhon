@@ -733,7 +733,7 @@ comptime let MAX_SCORE: int = 100 if env("STRICT", "1") == "1" else 80
 
 ### Pipe operator
 
-`a |> f() |> g(arg)` desugars to `g(f(a), arg)`. Left-associative; the pipe argument fills the first positional slot of the next call.
+`a |> f() |> g(arg)` desugars to `g(f(a), arg)`. Left-associative; the pipe argument fills the first positional slot of the next call. `|>` binds looser than every other expression operator, and its left operand is the whole expression to its left *within its slot* — one call argument, collection element, dict key or value, subscript, keyword or default value, lambda body, comprehension part, `return` / assignment value, `if` / `elif` / `while` / `for … in` / `assert` header, or f-string field. So `1 + 2 |> f()` is `f(1 + 2)` and `h(a, b |> f())` is `h(a, f(b))`. No operator may follow a chain on the same level: write `(x |> f()) > 0`, not `x |> f() > 0`.
 
 ### Extension methods
 

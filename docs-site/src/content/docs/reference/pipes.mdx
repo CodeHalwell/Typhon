@@ -41,20 +41,26 @@ No partial application, no curry, no special placeholder. Just first-positional 
 ## Precedence and positions
 
 A `|>` chain must *end* its syntactic slot. Arithmetic (and calls/attribute
-access) may feed into the pipe on the left, and the chain nests inside call
-arguments and `return`, but no operator may follow the chain on the same
-level — a comparison, boolean-op, arithmetic or ternary tail is a parse
-error. Parenthesise the chain to use its value further:
+access) may feed into the pipe on the left, but no operator may follow the
+chain on the same level — a comparison, boolean-op, arithmetic or ternary
+tail is a parse error. Parenthesise the chain to use its value further.
+
+A slot is any single expression position: one call argument, a list / set /
+tuple element, a dict key or value, a subscript, a keyword-argument or
+default value, a lambda body, a comprehension part, a `return` / assignment
+value, an `if` / `elif` / `while` / `for … in` / `assert` header, or an
+f-string field. The pipe only takes the expression inside its own slot:
 
 ```python
 1 + 2 |> f()                      # ✅ == f(1 + 2)
 g(3 |> f())                       # ✅ pipes nest in call args
+h(a, b |> f())                    # ✅ == h(a, f(b)) — only its own argument
 return x |> f()                   # ✅ a bare chain may end a return
+if 3 |> f():                      # ✅ a chain may be a header
 (x |> f()) == 0                   # ✅ parenthesised: compare the piped value
 3 |> f() + 1                      # ❌ parse error — parenthesise as above
 3 |> f() == 30                    # ❌ parse error — parenthesise as above
 3 |> f() if cond else 4 |> g()    # ❌ parse error — parenthesise each arm
-if 3 |> f():                      # ❌ parse error — parenthesise the condition
 ```
 
 When in doubt, parenthesise.
