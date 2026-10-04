@@ -307,6 +307,12 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   missing from `tyc explain --list`, from `docs/diagnostics/`, or from the
   docs-site catalog and its index. `missing_initialiser` and
   `python_semantic_drift` are listed but never emitted; their pages say so.
+- `scripts/emitted-ast.py equiv A B` is the emitted-AST equivalence harness
+  (step 0 of `docs/design/sugar-as-ast-nodes.md`): A and B are `tyc`
+  binaries or git revisions; every corpus unit is built with both and the
+  `ast.dump` of every emitted `.py` compared, listing the units that
+  changed. Documented in `docs/differential-testing.md` and
+  `CONTRIBUTING.md`.
 - Docs cite only diagnostic codes the binary emits (`tyc explain --list`
   minus `freeze`/`pub`, now language topics), locked in by a guard test.
 - New nullable-operator docs page listing the accepted spellings with the

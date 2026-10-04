@@ -34,6 +34,17 @@ non-blocking while the cross-platform failures land), `security`
 `differential` gate (`scripts/vm-differential.sh`), and the opt-in-knob
 `knob-matrix` (`scripts/knob-matrix.sh`).
 
+To check that a change to a lowering does not change any emitted program,
+compare the Python every corpus unit emits under the old and new compiler:
+
+```bash
+python3.13 scripts/emitted-ast.py equiv origin/main HEAD          # two revisions
+python3.13 scripts/emitted-ast.py equiv /tmp/tyc-old tyc/target/release/tyc
+```
+
+It reports each unit whose emitted AST changed; see
+[docs/differential-testing.md](docs/differential-testing.md#4-emitted-ast-equivalence-harness).
+
 ## Working in the Typhon language
 
 ```bash
