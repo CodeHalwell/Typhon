@@ -2,7 +2,12 @@
 
 Fires when a call to a known resource-returning function (`open`,
 `socket.socket`, `sqlite3.connect`, `tempfile.NamedTemporaryFile`, …)
-is bound to a variable without a surrounding `with` statement. Without
+is bound to a variable without a surrounding `with` statement, or is used
+and dropped inline — the receiver of a method call (`open(p).read()`) or an
+argument (`json.load(open(p))`). It does not fire when the handle is stored
+on an object (`self.fh = open(p)`, closed by the object), closed in a later
+`try: … finally: f.close()`, handed to `ExitStack.enter_context(...)` /
+`contextlib.closing(...)`, or returned to the caller. Without
 `with`, the handle is only released when the garbage collector runs —
 non-deterministic at best, and lost entirely if an exception escapes
 before the binding falls out of scope.

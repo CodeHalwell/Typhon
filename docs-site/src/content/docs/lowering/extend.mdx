@@ -7,7 +7,7 @@ sidebar:
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-`extend ClassName:` for a user-defined class is identical to `impl` — methods merge into the class body at desugar.
+`extend ClassName:` for a user-defined class is identical to `impl` when the class lives in the same module — methods merge into the class body at desugar. For an imported class, the methods are patched onto it when the extending module is imported.
 
 `extend BUILTIN:` (where `BUILTIN` is `str`, `list`, `dict`, etc.) is different: each method is extracted to a module-level free function, and call sites are rewritten when the receiver's static type is known to be that built-in (an annotated or evidently-initialised binding, a literal, a known class's field, a call with a declared return type, a subscript on a typed container, a loop variable). Receivers the pass cannot type are left alone.
 
@@ -22,12 +22,14 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
         name: str
 
     # analytics/user_metrics.ty
+    from domain.user import User
+
     extend User:
         def tracking_id(self) -> str:
             return f"user-{self.id:08d}"
     ```
   </TabItem>
-  <TabItem label="Emitted (after impl merge)">
+  <TabItem label="Emitted">
     ```python
     # build/domain/user.py
     @dataclass(slots=True)
@@ -35,16 +37,18 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
         id: int
         name: str
 
-        def tracking_id(self) -> str:    # merged from extend
-            return f"user-{self.id:08d}"
-
     # build/analytics/user_metrics.py
-    # (empty — extend was merged elsewhere)
+    from domain.user import User
+
+    def __typhon_extend_User__tracking_id(self) -> str:
+        return f"user-{self.id:08d}"
+
+    User.tracking_id = __typhon_extend_User__tracking_id
     ```
   </TabItem>
 </Tabs>
 
-The desugar pass collects every `impl` and `extend` over the same user-defined class and merges them into the class definition.
+In the class's own module, the desugar pass merges every `impl` and `extend` over the class into its definition. For an imported class, the patch runs when the extending module is imported, so the methods are visible — to the checker and at runtime — in the extending module and in every module that imports it, by name, as a module, or through a `pub *` facade that aggregates it. A module that does not import the extending module has no guarantee the patch ran, and the checker still reports `tyc::attribute_not_found` there; import it for its effect (`import analytics.user_metrics as _user_metrics`).
 
 ## Built-in extension
 
@@ -75,6 +79,7 @@ Key points:
 - The method becomes a free function with a Typhon-internal name (`__typhon_ext_<TYPE>__<METHOD>`).
 - The call site `title.to_slug()` is rewritten to `__typhon_ext_str__to_slug(title)` because `title` has the static annotation `str`.
 - **Un-annotated receivers** continue to use native attribute lookup. `some_dynamic.to_slug()` raises `AttributeError` at runtime, matching Python's existing semantics.
+- **Across modules**, an extension is visible in every module that imports from the declaring module. The rewritten call imports the helper (`from text import __typhon_ext_str__to_slug__`). Importing from a `pub *` package facade counts as importing from every module it aggregates: `from pkg import describe` brings `pkg/text.ty`'s extensions into scope, and the facade's `__init__.py` re-exports the helpers.
 
 ## Why this design
 

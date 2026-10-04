@@ -657,6 +657,24 @@ pub enum TycError {
     )]
     Comptime { name: String, message: String },
 
+    /// [`TycError::Comptime`] anchored at the binding whose initialiser
+    /// failed (or, for a missing initialiser, the binding itself).
+    #[error("comptime evaluation failed for '{name}': {message}")]
+    #[diagnostic(
+        code(tyc::comptime),
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/comptime.md"),
+        help("comptime expressions support: int/float/str/bool literals, list/tuple/dict literals, arithmetic, comparisons, boolean ops (and/or/not), ternaries (`x if c else y`), env(\"NAME\"[, \"default\"]), int()/str()/float()/len(), pure str methods (upper, lower, strip, lstrip, rstrip, replace, startswith, endswith, split), and calls to user-defined `comptime def` functions")
+    )]
+    ComptimeAt {
+        name: String,
+        message: String,
+        label: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("{label}")]
+        span: SourceSpan,
+    },
+
     /// Generic error with a human-readable message (used during early phases).
     #[error("{message}")]
     #[diagnostic(
@@ -2184,6 +2202,7 @@ impl TycError {
             | Self::OrphanPyImport { src, span, .. }
             | Self::PythonSemanticDrift { src, span, .. }
             | Self::SecretLiteralInline { src, span, .. }
+            | Self::ComptimeAt { src, span, .. }
             | Self::EmptyCollectionNoAnnotation { src, span, .. }
             | Self::TypingAliasInAnnotation { src, span, .. }
             | Self::MutableDefaultParam { src, span, .. }
@@ -2330,6 +2349,7 @@ impl TycError {
             | Self::OrphanPyImport { src, span, .. }
             | Self::PythonSemanticDrift { src, span, .. }
             | Self::SecretLiteralInline { src, span, .. }
+            | Self::ComptimeAt { src, span, .. }
             | Self::EmptyCollectionNoAnnotation { src, span, .. }
             | Self::TypingAliasInAnnotation { src, span, .. }
             | Self::MutableDefaultParam { src, span, .. }
@@ -2980,6 +3000,26 @@ impl TycError {
         Self::Comptime {
             name: name.into(),
             message: message.into(),
+        }
+    }
+
+    /// Construct a [`TycError::ComptimeAt`] diagnostic anchored at
+    /// `offset..offset+length` of `source`, with `label` under the span.
+    pub fn comptime_at(
+        name: impl Into<String>,
+        message: impl Into<String>,
+        label: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::ComptimeAt {
+            name: name.into(),
+            message: message.into(),
+            label: label.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
         }
     }
 

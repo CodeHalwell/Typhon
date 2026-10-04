@@ -11,7 +11,7 @@ use clap::Args;
 use miette::{miette, Result};
 
 use tyc_analyse::{
-    analyse_purity, editor_lint_diagnostics, evaluate_comptime_with_functions, purity_diagnostics,
+    analyse_purity, editor_lint_diagnostics, evaluate_comptime_in_source, purity_diagnostics,
 };
 use tyc_db::{check_file_with_imports, extract_shapes_for_path, TycDatabase};
 use tyc_diagnostics::{Diagnostics, SanitisedDiagnostic, TycError};
@@ -1111,8 +1111,10 @@ fn run_secondary_passes(
 
     // Pass `comptime_functions` so `comptime def` calls dispatch
     // correctly in check the same way they do in build (FINDINGS #48).
-    let (_, comptime_diags) = evaluate_comptime_with_functions(
+    let (_, comptime_diags) = evaluate_comptime_in_source(
         &module,
+        path,
+        &prep.python_source,
         &prep.comptime_bindings,
         &prep.comptime_functions,
     );

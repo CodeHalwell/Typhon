@@ -316,7 +316,11 @@ pub fn aggregate_pub_star_shapes(
                 continue;
             };
             let visible_set: HashSet<&str> = visible_names.iter().map(|s| s.as_str()).collect();
-            merge_pub_visible(&mut merged, sibling_shape, Some(&visible_set));
+            // `extend Class:` sentinels name their class relative to the
+            // sibling; make them absolute before they move to the package key.
+            let sibling_shape =
+                tyc_db::absolutise_extension_sentinels(sibling_shape, &sibling_dotted, false);
+            merge_pub_visible(&mut merged, &sibling_shape, Some(&visible_set));
         }
         // Direct sub-packages: any __init__ whose parent.parent == pkg_dir.
         // Filter the merge through the sub-package's effective public
@@ -352,7 +356,8 @@ pub fn aggregate_pub_star_shapes(
                 &mut visited,
             );
             let visible_set: HashSet<&str> = surface.iter().map(|s| s.as_str()).collect();
-            merge_pub_visible(&mut merged, sub_shape, Some(&visible_set));
+            let sub_shape = tyc_db::absolutise_extension_sentinels(sub_shape, &sub_dotted, true);
+            merge_pub_visible(&mut merged, &sub_shape, Some(&visible_set));
         }
         shape_map.insert(pkg_dotted, merged);
     }
@@ -444,6 +449,27 @@ fn merge_pub_visible(
         }
     };
     for (name, shape) in &src.class_shapes {
+        if name.starts_with("__typhon_builtin_ext_")
+            || name.starts_with(tyc_types::EXTENSION_SENTINEL_PREFIX)
+        {
+            // An `extend BUILTIN:` block's methods (the sentinel class
+            // shape) travel through the facade whatever the visibility
+            // filter: importing from a module brings its extensions into
+            // scope, so importing from a facade brings those of every
+            // module it aggregates (review 2026-10-03, W3-02). Methods are
+            // merged first-write-wins, like the checker's import merge.
+            let entry = dst
+                .class_shapes
+                .entry(name.clone())
+                .or_insert_with(|| shape.clone());
+            for (method, sig) in &shape.methods {
+                entry
+                    .methods
+                    .entry(method.clone())
+                    .or_insert_with(|| sig.clone());
+            }
+            continue;
+        }
         if include(name) {
             dst.class_shapes
                 .entry(name.clone())
@@ -614,6 +640,35 @@ mod tests {
         assert!(narrow.newtypes.contains_key("UserId"));
         assert!(!narrow.frozen_classes.contains("Point"));
         assert!(!narrow.enums.contains_key("Color"));
+    }
+
+    /// `extend BUILTIN:` methods are a module's extension surface, not a
+    /// name it exports: they travel through a `pub *` facade whatever the
+    /// visibility filter, merged method by method first-write-wins
+    /// (review 2026-10-03, W3-02).
+    #[test]
+    fn merge_pub_visible_carries_builtin_extensions() {
+        let shapes = |src: &str| {
+            let prep = preprocess(src);
+            let module = tyc_syntax::parse_module(&prep.python_source)
+                .expect("parse failed")
+                .into_syntax();
+            tyc_types::extract_module_shapes(&module)
+        };
+        let a = shapes("extend str:\n    def slug(self) -> str:\n        return self\n");
+        let b = shapes(
+            "extend str:\n    def shout(self) -> str:\n        return self\n\n\
+             class Private:\n    x: int\n",
+        );
+        assert!(a.class_shapes.contains_key("__typhon_builtin_ext_str"));
+        let mut dst = ModuleShapes::default();
+        let none: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        merge_pub_visible(&mut dst, &a, Some(&none));
+        merge_pub_visible(&mut dst, &b, Some(&none));
+        let merged = &dst.class_shapes["__typhon_builtin_ext_str"];
+        assert!(merged.methods.contains_key("slug"));
+        assert!(merged.methods.contains_key("shout"));
+        assert!(!dst.class_shapes.contains_key("Private"));
     }
 
     fn config_with_methods_in_class_body(severity: &str) -> TyphonConfig {

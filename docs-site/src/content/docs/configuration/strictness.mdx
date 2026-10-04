@@ -50,13 +50,13 @@ allow-secret-comptime = false
 | `suggest-gather` | bool | `true` | Emit the advice-level [`tyc::gather_opportunity`](/Typhon/diagnostics/async-errors/#tycgather_opportunity-advice) hint when 2+ adjacent independent awaited calls could be wrapped in a `gather:` block. Never rewrites, never blocks a build. |
 | `suggest-perf` | bool | `true` | Emit the advice-level `tyc::perf_*` micro-optimisation family (six lints) plus [`tyc::lazy_import_opportunity`](/Typhon/pitfalls/performance/#automatic-performance-advice). Never rewrites, never blocks a build. |
 | `suggest-parallel` | bool | `true` | Emit the advice-level `tyc::parallel_opportunity` / `tyc::shared_mut_across_tasks` hints. Both additionally require `[python] free-threaded = true` to fire. Never rewrites, never blocks a build. |
-| `auto-memoise` | bool | `false` | Insert `@functools.cache` on every function the analyser infers as pure. **Off by default — caches extend lifetimes invisibly.** |
+| `auto-memoise` | bool | `false` | Insert a bounded, typed `@functools.lru_cache` on every function the analyser proves pure and cache-safe. **Off by default — caches extend lifetimes invisibly.** |
 | `auto-gather` | bool | `false` | Fold straight-line independent `await` runs into `asyncio.TaskGroup`, but only for `@gatherable`-decorated callees (same-module or imported from another project module). |
 | `auto-parallel` | bool | `false` | Rewrite pure list comprehensions over large iterables to a `ThreadPoolExecutor.map` (needs `free-threaded`). |
 | `auto-parallel-reductions` | bool | `false` | Parallelise `int`-only accumulator loops (`for x in xs: total += f(x)` with `mut total: int` and a pure `f`) the same way `auto-parallel` handles comprehensions. Requires `auto-parallel = true`. On its own it does nothing, so `tyc check` / `tyc build` warn when `auto-parallel` resolves to off (it is on with `[optimise] level = 1` or `tyc build -O`); the config is still accepted. `float` accumulators are never rewritten — reordering IEEE-754 addition changes the result — and the iterable must be provably bounded and effect-free to materialise (a container literal, a container-annotated name, or a builtin `range(...)` call). |
 | `parallel-min-size` | int | `64` | Minimum iterable size for `auto-parallel` to fire. When the size can't be statically inferred, treated as zero. |
 | `parallel-backend` | `"threads"` \| `"interpreters"` | `"threads"` | Execution backend for `auto-parallel` / `auto-parallel-reductions` rewrites. `"interpreters"` tries a PEP 734 `InterpreterPoolExecutor` (3.14+) first, falling back transparently to the thread pool on an older runtime or an unshareable mapped callable. |
-| `pgo-memoise` | bool | `false` | Promote hot pure functions to `@functools.cache` based on `typhon-profile.json` from a prior `tyc profile` run. |
+| `pgo-memoise` | bool | `false` | Promote hot pure, cache-safe functions to a bounded, typed `@functools.lru_cache` based on `typhon-profile.json` from a prior `tyc profile` run. |
 | `pgo-min-calls` | int | `100` | Threshold for `pgo-memoise`. |
 | `allow-secret-comptime` | bool | `false` | When true, silences the `tyc::contains_secret_literal` warning that flags hardcoded secrets or environment variables mapped at build time. |
 
@@ -135,11 +135,11 @@ let f = open("data.txt")          # ⚠️ tyc::resource_not_managed
 - `"error"` — promote once the codebase has migrated to `with` (or an explicit `try` / `finally`).
 - `"off"` — drop the diagnostic.
 
-Bodies of `@contextmanager` / `@asynccontextmanager` factories are exempt — acquiring the resource is their job.
+Bodies of `@contextmanager` / `@asynccontextmanager` factories are exempt — acquiring the resource is their job. So is a handle stored on an object (`self.fh = open(p)`), closed in a later `try` / `finally: f.close()`, handed to `ExitStack.enter_context(...)` / `contextlib.closing(...)`, or returned. A handle used and dropped inline — `open(p).read()`, `json.load(open(p))` — is flagged.
 
 ## `blocking-in-async`
 
-Severity for `tyc::blocking_in_async`: a direct call to a known-blocking stdlib function (`time.sleep`, `requests.get` / `post` / …, `urllib.request.urlopen`, `subprocess.run` / `call` / `check_output`, `input`, `socket.recv`) inside an `async def` stalls the event loop.
+Severity for `tyc::blocking_in_async`: a direct call to a known-blocking stdlib function (`time.sleep`, `requests.get` / `post` / …, `urllib.request.urlopen`, `subprocess.run` / `call` / `check_output`, `input`, `socket.recv`) inside an `async def` stalls the event loop. Import aliases are followed (`from time import sleep`, `import time as t`, `import subprocess as sp`).
 
 ```python
 async def poll() -> None:
@@ -193,7 +193,7 @@ suggest-parallel = false
 
 ## `auto-memoise`
 
-**Off by default.** When on, every function the analyser can *prove* pure — with immutable, hashable parameters and an immutable return type — gets `@functools.cache`. The runtime impact:
+**Off by default.** When on, every function the analyser can *prove* pure — with parameters that are sound cache keys (no `float`, callables or mutable classes) and a deeply immutable return type, and not recursive — gets `@functools.lru_cache(maxsize=1024, typed=True)`. A plain `@pure` is held to the same bar. The runtime impact:
 
 - Cached arguments stay alive forever (or until the cache is cleared).
 - Cached return values stay alive forever.
@@ -209,7 +209,7 @@ These tradeoffs aren't free. Opt in deliberately, ideally after profiling.
 
 Folds runs of two-or-more consecutive independent `name = await callee(...)` statements inside an `async def` into an `asyncio.TaskGroup`. **Every callee must carry an explicit `@gatherable` decorator.** As of v0.14.2 the rewrite folds runs whose callees are `@gatherable` async functions imported from **another project module** too, not just same-module callees as before. Undecorated async functions and third-party imported callees are still left alone, and the `@gatherable` decorator remains required on every callee regardless of where it is defined.
 
-A callee name the enclosing function rebinds (a parameter, a local, a nested `def`, an import) is never folded — it refers to a different callable — nor is a name rebound at module level after its definition. Runs lexically inside a `try` or `with` body also stay sequential: a `TaskGroup` re-raises a task's exception inside an `ExceptionGroup`, which a same-frame `except ValueError` would no longer catch.
+A callee name the enclosing function rebinds (a parameter, a local, a nested `def`, an import) is never folded — it refers to a different callable — nor is a name rebound at module level after its definition. Runs lexically inside a `try` or `with` body also stay sequential. A folded run raises the failing call's own exception rather than the `TaskGroup`'s `ExceptionGroup` — the earliest failing task in source order, as the sequential awaits would — so an `except ValueError` in any caller still catches it. Only top-level functions count: a `@gatherable` *method* never makes a same-named module function eligible.
 
 There is no diagnostic when a callee lacks `@gatherable` — the awaits just stay sequential. If you forget to decorate, you'll see no parallelism *and* no error. Run `tyc trace` or read the emitted Python to confirm whether a particular run got rewritten. (For a non-rewriting nudge toward `gather:`, see [`suggest-gather`](#suggest-gather).)
 
@@ -219,6 +219,8 @@ Default `false`. Explicit `gather:` blocks are unaffected by this setting.
 
 When `true`, pure list comprehensions whose element is a pure call are rewritten at build time to a `ThreadPoolExecutor.map`. Combine with `[python] free-threaded = true` to release the GIL across workers; on stock CPython the rewrite still runs but the GIL serialises.
 
+The iterable must be bounded and effect-free to materialise — a list / tuple / set display, a builtin `range(...)`, or a name annotated `list` / `tuple` / `set` / `frozenset` in scope — because the parallel map reads the whole iterable before mapping a single element; a generator would otherwise run ahead of the element that raises. A parameter or local that shadows a pure function's name (`def apply(double: Callable[...])`) is never treated as that function.
+
 `parallel-min-size` is the minimum statically-detectable iterable length. Default `64`. When the iterable size cannot be inferred, the threshold is treated as zero — users opting in accept that contract.
 
 ## `auto-parallel-reductions`
@@ -226,6 +228,8 @@ When `true`, pure list comprehensions whose element is a pure call are rewritten
 **Off by default. Requires `auto-parallel = true`.** Extends the `auto-parallel` rewrite to integer accumulator loops: `for x in xs: total += f(x)` with a **plain `int`** accumulator (`mut total: int`) and a pure `f` lowers to `total += sum(map_pure(lambda x: f(x), xs))`. Integer addition is exact and associative/commutative, so summing partial results in any order gives an identical answer.
 
 The iterable must additionally be **provably bounded and effect-free to materialise**, because `map_pure` runs `list(ITER)` before evaluating a single element: a `list`/`tuple`/`set` literal, a bare name annotated `list[...]` / `tuple[...]` / `set[...]` / `frozenset[...]` in the loop's scope, or a direct builtin `range(...)` call. Anything else — an unannotated name, a function/method call result, a generator — is never rewritten: an unbounded iterator would hang where the sequential loop raises on its first element, and a stateful iterator's side effects would all run where the loop stopped early. Note that parallelising a `range` loop materialises the range — an inherent cost of the map-based design.
+
+Each **element** must also provably be an exact `int` / `bool`, not just the accumulator: the loop target over a `range(...)` or an `int`-element container, `int`-annotated names, integer literals, operators other than `/`, comparisons, and calls to functions declared `-> int`. An element typed `Any` (a `json.loads(...)` result) may be a float, and `1 + 1e16 - 1e16` summed in a different order prints a different answer.
 
 <Aside type="caution">
   `float` accumulators are **never** rewritten — reordering IEEE-754 floating-point addition changes the result, so the compiler refuses to silently reorder it. A `float` loop that's otherwise shaped for the rewrite surfaces `tyc::parallel_opportunity` instead, explaining why it was skipped.
@@ -242,7 +246,7 @@ Any other value is rejected at config load.
 
 ## `pgo-memoise`
 
-When `true`, `tyc build` reads `typhon-profile.json` (from a prior [`tyc profile`](/Typhon/cli/profile/) run) and promotes every pure function whose observed call count meets `pgo-min-calls` to `@functools.cache`, even if the user did not write `@memo`. Complements `auto-memoise` (which caches every pure function regardless of profile data).
+When `true`, `tyc build` reads `typhon-profile.json` (from a prior [`tyc profile`](/Typhon/cli/profile/) run) and promotes every provably pure, cache-safe function whose observed call count meets `pgo-min-calls` to a bounded, typed `@functools.lru_cache`, even if the user did not write `@memo`. Complements `auto-memoise` (which caches every pure function regardless of profile data).
 
 Missing profile file is not an error — PGO is best-effort: nothing is promoted and nothing is reported.
 
@@ -252,7 +256,15 @@ The round trip has three moving parts worth knowing. `tyc profile` only *produce
 
 **Off by default.** When `true`, this knob silences the `tyc::contains_secret_literal` diagnostic.
 
-That diagnostic flags hardcoded credentials (like `let API_KEY = "test"`) or sensitive environmental variables mapped using `comptime let API_KEY = env("API_KEY")`. While `comptime` substitution is useful, mapping secrets at build time embeds the literal secret directly into the compiled `.py` output, exposing it to anyone who can read the build artifacts.
+That diagnostic flags hardcoded credentials (like `let API_KEY = "sk-live-…"`) and secrets mapped at build time with `comptime let API_KEY: str = env("API_KEY")`. While `comptime` substitution is useful, mapping secrets at build time embeds the literal secret directly into the compiled `.py` output, exposing it to anyone who can read the build artifacts.
+
+It fires when the binding name — or, for a `comptime let`, the key of any `env("…")` it reads — names a credential, and the value is a string that could be one:
+
+- **Clear credential names** (`API_KEY`, `DB_PASSWORD`, `GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`, `SECRET_KEY_BASE`) warn on any string except a placeholder (`""`, `"xxxx"`, `"<your token>"`, `"${TOKEN}"`).
+- **Ambiguous names** (`KEY`, `STRIPE_KEY`, `PWD`, `DATABASE_DSN`, `SESSION_COOKIE`) warn only on a credential-shaped value: a known token prefix (`ghp_`, `sk-`, `AKIA`, `xoxb-`, …), a PEM private key, a URL with an embedded password, or a long high-entropy run of letters and digits.
+- **Descriptive names** never warn: a metadata word after the credential word (`TOKEN_LIMIT`, `PASSWORD_MIN_LENGTH`, `CREDENTIALS_PATH`, `AUTHORIZATION_URL`, `API_KEY_HEADER`, `AWS_ACCESS_KEY_ID`), a counting word (`MAX_TOKENS`), or a non-secret qualifier (`PRIMARY_KEY`, `SORT_KEY`, `PUBLIC_KEY`). Nor does a non-string value (`comptime let TOKEN_LIMIT: int = …`).
+
+So `comptime let DEPLOY_CFG: str = env("AWS_SECRET_ACCESS_KEY")` warns even though `DEPLOY_CFG` is not secret-shaped.
 
 Setting this to `true` disables the warning, which is useful when the literal is intentionally public or part of a test suite, allowing you to document and silence expected findings.
 

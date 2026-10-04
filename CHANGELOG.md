@@ -222,6 +222,134 @@ grouped by workstream (W1–W7).
   annotation, and `match` sequence / mapping / `as` / or-pattern captures
   take the subject's type, so `x.slug()` on such a receiver is rewritten to
   the `extend BUILTIN` function instead of raising `AttributeError`.
+- **`-O` / `auto-memoise` can no longer change what a program prints**
+  (W3-04, W3-05). A plain `@pure` under `-O` is held to the full
+  cache-safety proof — `@pure` is a purity claim, not a cacheability claim —
+  so `@pure def window(n) -> list[int]` is no longer cached (a caller's
+  `append` leaked into the next call) and `stress/…/05-knn-toy.ty` no longer
+  fails with `unhashable type: 'Point'`. The silent paths (`auto-memoise`,
+  `pgo-memoise`, `-O`) now also refuse: recursive functions (direct or
+  mutual — the cache wrapper deepens every frame, turning a working depth
+  into `RecursionError`); `float`, `Decimal`, path, datetime and `Callable`
+  parameters, and `int` / `str` inside a tuple key (`0.0 == -0.0`,
+  `(True,) == (1,)`); `Callable` results; `frozen` classes / `NamedTuple`s
+  with a mutable field; user classes named like stdlib types (`Flag`,
+  `Path`, `Decimal`, `UUID`, `date`, `Pattern` are resolved through the
+  imports first); constructors that run code (`__post_init__`, a
+  hand-written `__init__`, a foreign base); class-attribute reads; whatever
+  an `assert` evaluates; `decimal` (context-dependent), `Path.cwd()` /
+  `Path.exists`, and `heapq.heappush` / `bisect.insort` /
+  `operator.setitem` on a non-fresh argument; nested `def`s; and a call to a
+  `@pure` helper whose own check was inconclusive. A silent path emits
+  `@functools.lru_cache(maxsize=1024, typed=True)` — typed, so `show(True)`
+  no longer returns the cached `show(1.0)`, and bounded, so a cache keyed on
+  every rendered document or crawled URL no longer retains them all. An
+  explicit `@memo` keeps `@functools.cache`. None of this adds a
+  `tyc::impure_pure_fn` error: every new finding is "not provably pure",
+  which only withholds the optimisation.
+- **auto-gather resolves callees correctly and raises the original
+  exception** (W3-07). A `@gatherable` *method* no longer makes a
+  same-named module-level function eligible — a bare-name call never
+  reaches a method — so `stress/round-2026-09-01/analyse/p_gather.ty`
+  prints `['a', 'b']` under `-O` as it does by default. A folded run now
+  hands callers the failing call's own exception (the earliest failing task
+  in source order) instead of the `TaskGroup`'s `ExceptionGroup`, so
+  `try: await load(-1) except ValueError:` in a *calling* frame catches it
+  under `-O` too.
+- **auto-parallel and the reduction rewrite no longer change program
+  semantics** (W3-09). The comprehension rewrite now requires the same
+  bounded, effect-free iterable as the reduction rewrite (a display, a
+  builtin `range(...)`, or a `list` / `tuple` / `set` / `frozenset`-annotated
+  name in scope): `map_pure` reads the whole iterable first, so
+  `[parse(l) for l in lines()]` over a printing generator read lines `4` and
+  `5` before the `ValueError`, and an infinite iterator hung. A parameter,
+  local or comprehension target that shadows a pure function's name is no
+  longer treated as that function (both rewrites). And the reduction rewrite
+  requires each element to be a provable `int`, not just an `int`
+  accumulator: `total += field(r)` with `field -> Any` over `1e16, -1e16`
+  printed `1.0` instead of `0.0`.
+- **comptime: a step budget, CPython-faithful values, and a real anchor**
+  (W3-10). Each `comptime let` now has a 10-million-step evaluation budget,
+  so exponential recursion inside the 64-frame depth cap (`f(n - 1) +
+  f(n - 1)`, `f(40)`) fails with `tyc::comptime` instead of hanging
+  `tyc check`, `tyc build` and the LSP. Values CPython would raise on are
+  build errors rather than inlined `inf` / `nan` / U+FFFD: `10.0 ** 400`,
+  `0.0 ** -1`, `0 ** -1`, `(-8.0) ** 0.5` (complex), and a lone-surrogate
+  string literal (`"\ud800"`); `strip()` / `lstrip()` / `rstrip()` now strip
+  U+001C–U+001F as `str.isspace()` does. A type mismatch on a `comptime let`
+  is reported at the binding instead of line 1, column 1, and a deep
+  recursion's error names the call once instead of once per frame.
+- **Every `tyc::comptime` error points at its source** (W3-10 follow-up).
+  `tyc check` grouped comptime evaluation failures under "(no location)"
+  and `tyc build` printed them without a snippet; each now carries a `.ty`
+  span — the innermost failing part of the initialiser (`time.time()` in
+  `comptime let NOW: float = time.time()`, or the `boom(3)` call whose
+  `comptime def` body failed), or the binding name when it lacks an
+  annotation or initialiser — relocated through the preprocessor's line
+  map. Message text and exit codes are unchanged.
+- **`tyc::contains_secret_literal` redesigned** (W3-06, warn-level). The
+  165-entry keyword cross-product is replaced by a word matcher shared by
+  the lint and the `tyc build` scan (`tyc-analyse/src/secrets.rs`): the name
+  is split into words (squashed words segmented, so `APIKEYS` now warns), a
+  credential noun (`PASSWORD`, `SECRET`, `TOKEN`, `CREDENTIAL`) or a
+  qualified key noun (`API_KEY`, `DB_PASS`) names a secret, and a metadata
+  word after it (`TOKEN_LIMIT`, `PASSWORD_MIN_LENGTH`, `CREDENTIALS_PATH`,
+  `AUTHORIZATION_URL`, `AWS_ACCESS_KEY_ID`), a counting word (`MAX_TOKENS`)
+  or a non-secret qualifier (`PRIMARY_KEY`, `SORT_KEY`, `PUBLIC_KEY`) rules
+  it out. Ambiguous names (`KEY`, `STRIPE_KEY`, `DATABASE_DSN`,
+  `SESSION_COOKIE`) warn only on a credential-shaped value (known token
+  prefix, PEM private key, URL with a password, long high-entropy run);
+  placeholders (`""`, `"xxxx"`, `"<token>"`) never warn. The build scan
+  fires only on string values (no more `comptime let TOKEN_LIMIT: int`
+  warning) and also checks the key of every `env("…")` the binding reads,
+  through `comptime def` calls too, so `comptime let DEPLOY_CFG: str =
+  env("AWS_SECRET_ACCESS_KEY")` now warns.
+- **`extend BUILTIN:` travels through a `pub *` facade** (W3-02). With
+  `pkg/text.ty` declaring `extend str: def slug(...)` and `pkg/__init__.ty`
+  holding `pub *`, a consumer importing `from pkg import describe` got
+  `tyc::attribute_not_found` on `s.slug()`, and no surface lowered the
+  call. The facade's aggregated shape now carries every
+  constituent's extension methods (sub-packages included), the emitted
+  `__init__.py` re-exports the lifted `__typhon_ext_*` helpers, and the VM
+  loads a facade's constituents' extensions — checker, build and `tyc run`
+  agree.
+- **Cross-module `extend User:` is seen by the modules that import it**
+  (W3-03). Module B's `extend User:` of A's class patches `User` when B is
+  imported, but a module C importing both got `tyc::attribute_not_found`
+  on `u.tracking_id()`. B now publishes the patched methods (a
+  `__typhon_extend_<Class>@<module>` sentinel in its shapes), and a module
+  that imports B — by name, as a module, or through a `pub *` facade —
+  sees them on its `User`, on `a.User`, and on a `User` returned by an
+  imported function. A module that does not import B is still rejected:
+  nothing guarantees B's patch ran. The docs-site `extend` page now shows
+  the real lowering (a module-level patch, not a merged class body).
+- **Lint false positives and negatives** (W3-11; warn / advice level).
+  `shared_mut_across_tasks` now sees in-place mutation of module state
+  (`SEEN[k] = …`, `LOG.append(…)`, `del CACHE[k]`, `Cls.attr = …`) and a
+  same-module helper writing on the spawned task's behalf; a parameter or
+  local of the same name is not module state. `gather_opportunity` treats
+  two awaits on the same receiver (`conn.execute` twice, `client.login()`
+  then `client.fetch()`) as dependent. `blocking_in_async` follows import
+  aliases (`from time import sleep`, `import time as t`, `import
+  subprocess as sp`). `resource_not_managed` no longer fires on
+  `self.fh = open(…)`, a handle closed in a later `finally`, or one handed
+  to `ExitStack.enter_context` / `closing`, and now flags handles used and
+  dropped inline (`open(p).read()`, `json.load(open(p))`).
+  `perf_membership_in_loop` is silent for lists whose elements are not
+  provably hashable and when the loop may mutate the list through a call;
+  `perf_sorted_first` is silent inside a `try` catching `IndexError` /
+  `LookupError`. Under `[strictness] require-with = "error"` or
+  `blocking-in-async = "error"` the newly-caught shapes fail the build.
+- **`go` on an imported synchronous function is rejected** (W3, extending
+  W2-11). `from helpers import work` + `go work()`, where `work` is a plain
+  `def` in a project `.ty` module, passed `tyc check` and raised
+  `TypeError: a coroutine was expected` from `asyncio.create_task` at
+  runtime; it is now `tyc::type_mismatch` ("`go` needs a coroutine, but
+  `work()` returns `int`"), as for a same-module `def` (`await work()`
+  likewise). Shapes
+  carry a new `ArityInfo::declared_sync` flag, set only for an undecorated
+  `def` extracted from `.ty` source — `.dty`, bundled and venv-introspected
+  stubs, decorated functions and module-qualified calls stay permissive.
 
 #### W4 — CLI, LSP, filesystem safety
 - **LSP definition URIs rebased onto client workspace root.** `goto_definition` now uses the client's declared workspace root URI (preserving symlink prefixes such as `/var/folders` or `/tmp` rather than macOS `/private/var/...`) or open-document URI, preventing editors from opening duplicate tabs on cross-file jumps.

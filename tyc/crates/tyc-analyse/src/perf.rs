@@ -287,10 +287,24 @@ pub fn perf_diagnostics(
     let mut diags = Diagnostics::new();
     // Loop-scoped lints (membership / list-shift / str-concat / sort).
     let module_env = collect_scope_bindings(&module.body, &HashMap::new(), None);
+    // Names each top-level function may content-mutate, so a loop calling
+    // a helper that mutates a list (`remember(x)` appending to `SEEN`) does
+    // not read that list as loop-invariant.
+    let fns: HashMap<String, HashSet<String>> = module
+        .body
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::FunctionDef(f) => {
+                Some((f.name.to_string(), names_mutated(&f.body, CONTENT_MUTATORS)))
+            }
+            _ => None,
+        })
+        .collect();
     walk_scope(
         &module.body,
         &module_env,
         /* loop_mutated */ None,
+        &fns,
         path,
         source,
         &mut diags,
@@ -301,6 +315,7 @@ pub fn perf_diagnostics(
             path,
             source,
             diags: &mut diags,
+            index_error_guards: 0,
         };
         for stmt in &module.body {
             anywhere.visit_stmt(stmt);
@@ -319,6 +334,10 @@ pub fn perf_diagnostics(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnnKind {
     List,
+    /// A `list` whose elements are provably hashable (`list[int]`, a
+    /// literal of constants): converting it to a `set` is safe, so the
+    /// membership lint may suggest it.
+    HashableList,
     Str,
     Dict,
     Set,
@@ -339,7 +358,12 @@ fn classify_annotation(expr: &Expr) -> Option<AnnKind> {
         _ => return None,
     };
     match head {
-        "list" => Some(AnnKind::List),
+        "list" => match expr {
+            Expr::Subscript(sub) if annotation_is_hashable(&sub.slice) => {
+                Some(AnnKind::HashableList)
+            }
+            _ => Some(AnnKind::List),
+        },
         "str" => Some(AnnKind::Str),
         "dict" => Some(AnnKind::Dict),
         "set" | "frozenset" => Some(AnnKind::Set),
@@ -390,8 +414,14 @@ fn collect_bindings_into(body: &[Stmt], env: &mut HashMap<String, AnnKind>) {
             }
             Stmt::Assign(a) => {
                 if a.targets.len() == 1 {
-                    if let (Expr::Name(n), Expr::List(_)) = (&a.targets[0], a.value.as_ref()) {
-                        env.insert(n.id.to_string(), AnnKind::List);
+                    if let (Expr::Name(n), Expr::List(l)) = (&a.targets[0], a.value.as_ref()) {
+                        let kind = if !l.elts.is_empty() && l.elts.iter().all(is_hashable_constant)
+                        {
+                            AnnKind::HashableList
+                        } else {
+                            AnnKind::List
+                        };
+                        env.insert(n.id.to_string(), kind);
                     }
                 }
             }
@@ -466,6 +496,7 @@ fn walk_scope(
     stmts: &[Stmt],
     env: &HashMap<String, AnnKind>,
     loop_mutated: Option<&HashSet<String>>,
+    fns: &HashMap<String, HashSet<String>>,
     path: &str,
     source: &str,
     diags: &mut Diagnostics,
@@ -474,12 +505,12 @@ fn walk_scope(
         match stmt {
             Stmt::FunctionDef(f) => {
                 let fenv = collect_scope_bindings(&f.body, env, Some(&f.parameters));
-                walk_scope(&f.body, &fenv, None, path, source, diags);
+                walk_scope(&f.body, &fenv, None, fns, path, source, diags);
             }
             Stmt::ClassDef(c) => {
                 // Methods are `FunctionDef`s handled above; the class body
                 // itself isn't a loop scope.
-                walk_scope(&c.body, env, None, path, source, diags);
+                walk_scope(&c.body, env, None, fns, path, source, diags);
             }
             Stmt::For(s) => {
                 if loop_mutated.is_some() {
@@ -489,44 +520,44 @@ fn walk_scope(
                 // loop-invariant — fold its names into the mutated set so a
                 // `sorted(target)` / `target in list` in the body doesn't
                 // read as invariant.
-                let mut mutated = names_mutated(&s.body, CONTENT_MUTATORS);
+                let mut mutated = loop_mutations(&s.body, fns);
                 collect_target_names(&s.target, &mut mutated);
-                walk_scope(&s.body, env, Some(&mutated), path, source, diags);
-                walk_scope(&s.orelse, env, loop_mutated, path, source, diags);
+                walk_scope(&s.body, env, Some(&mutated), fns, path, source, diags);
+                walk_scope(&s.orelse, env, loop_mutated, fns, path, source, diags);
             }
             Stmt::While(s) => {
                 if loop_mutated.is_some() {
                     check_stmt_in_loop(stmt, env, loop_mutated, path, source, diags);
                 }
-                let mutated = names_mutated(&s.body, CONTENT_MUTATORS);
-                walk_scope(&s.body, env, Some(&mutated), path, source, diags);
-                walk_scope(&s.orelse, env, loop_mutated, path, source, diags);
+                let mutated = loop_mutations(&s.body, fns);
+                walk_scope(&s.body, env, Some(&mutated), fns, path, source, diags);
+                walk_scope(&s.orelse, env, loop_mutated, fns, path, source, diags);
             }
             Stmt::If(s) => {
                 if loop_mutated.is_some() {
                     check_stmt_in_loop(stmt, env, loop_mutated, path, source, diags);
                 }
-                walk_scope(&s.body, env, loop_mutated, path, source, diags);
+                walk_scope(&s.body, env, loop_mutated, fns, path, source, diags);
                 for c in &s.elif_else_clauses {
-                    walk_scope(&c.body, env, loop_mutated, path, source, diags);
+                    walk_scope(&c.body, env, loop_mutated, fns, path, source, diags);
                 }
             }
             Stmt::With(s) => {
                 if loop_mutated.is_some() {
                     check_stmt_in_loop(stmt, env, loop_mutated, path, source, diags);
                 }
-                walk_scope(&s.body, env, loop_mutated, path, source, diags);
+                walk_scope(&s.body, env, loop_mutated, fns, path, source, diags);
             }
             Stmt::Try(s) => {
                 if loop_mutated.is_some() {
                     check_stmt_in_loop(stmt, env, loop_mutated, path, source, diags);
                 }
-                walk_scope(&s.body, env, loop_mutated, path, source, diags);
-                walk_scope(&s.orelse, env, loop_mutated, path, source, diags);
-                walk_scope(&s.finalbody, env, loop_mutated, path, source, diags);
+                walk_scope(&s.body, env, loop_mutated, fns, path, source, diags);
+                walk_scope(&s.orelse, env, loop_mutated, fns, path, source, diags);
+                walk_scope(&s.finalbody, env, loop_mutated, fns, path, source, diags);
                 for h in &s.handlers {
                     let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
-                    walk_scope(&h.body, env, loop_mutated, path, source, diags);
+                    walk_scope(&h.body, env, loop_mutated, fns, path, source, diags);
                 }
             }
             Stmt::Match(s) => {
@@ -534,7 +565,7 @@ fn walk_scope(
                     check_stmt_in_loop(stmt, env, loop_mutated, path, source, diags);
                 }
                 for case in &s.cases {
-                    walk_scope(&case.body, env, loop_mutated, path, source, diags);
+                    walk_scope(&case.body, env, loop_mutated, fns, path, source, diags);
                 }
             }
             _ => {
@@ -653,7 +684,9 @@ fn scan_membership_in_test(
                 if c.ops.len() == 1 && matches!(c.ops[0], CmpOp::In | CmpOp::NotIn) {
                     if let Some(Expr::Name(rhs)) = c.comparators.first() {
                         let name = rhs.id.as_str();
-                        let is_list = matches!(self.env.get(name), Some(AnnKind::List));
+                        // A `set` of unhashable elements raises `TypeError`,
+                        // so only a provably-hashable list gets the advice.
+                        let is_list = matches!(self.env.get(name), Some(AnnKind::HashableList));
                         let invariant = self.loop_mutated.is_none_or(|m| !m.contains(name));
                         if is_list && invariant {
                             let range = c.range();
@@ -714,7 +747,10 @@ impl CallLintVisitor<'_> {
                 };
                 let name = recv.id.as_str();
                 let method = attr.attr.as_str();
-                let is_list = matches!(self.env.get(name), Some(AnnKind::List));
+                let is_list = matches!(
+                    self.env.get(name),
+                    Some(AnnKind::List | AnnKind::HashableList)
+                );
                 // Lint 2 — `LIST.insert(0, …)` / `LIST.pop(0)`.
                 if is_list {
                     let op = if method == "insert"
@@ -769,6 +805,128 @@ impl CallLintVisitor<'_> {
             _ => {}
         }
     }
+}
+
+/// True when an element annotation names a hashable type: a builtin
+/// scalar, `Literal[...]`, or a `tuple` / `frozenset` of hashable types.
+fn annotation_is_hashable(expr: &Expr) -> bool {
+    match expr {
+        Expr::Name(n) => matches!(
+            n.id.as_str(),
+            "int" | "str" | "float" | "bool" | "bytes" | "complex" | "frozenset"
+        ),
+        Expr::EllipsisLiteral(_) => true,
+        Expr::Subscript(s) => {
+            let Expr::Name(head) = s.value.as_ref() else {
+                return false;
+            };
+            match head.id.as_str() {
+                "Literal" => true,
+                "tuple" | "frozenset" => match s.slice.as_ref() {
+                    Expr::Tuple(t) => t.elts.iter().all(annotation_is_hashable),
+                    other => annotation_is_hashable(other),
+                },
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// True when a list-literal element is a hashable constant (or a tuple of
+/// them).
+fn is_hashable_constant(expr: &Expr) -> bool {
+    match expr {
+        Expr::StringLiteral(_)
+        | Expr::BytesLiteral(_)
+        | Expr::NumberLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::NoneLiteral(_) => true,
+        Expr::UnaryOp(u) => matches!(u.operand.as_ref(), Expr::NumberLiteral(_)),
+        Expr::Tuple(t) => t.elts.iter().all(is_hashable_constant),
+        _ => false,
+    }
+}
+
+/// Builtins that never mutate the arguments they are given.
+const NON_MUTATING_BUILTINS: &[&str] = &[
+    "len",
+    "print",
+    "sorted",
+    "set",
+    "frozenset",
+    "tuple",
+    "list",
+    "dict",
+    "sum",
+    "min",
+    "max",
+    "any",
+    "all",
+    "enumerate",
+    "zip",
+    "iter",
+    "reversed",
+    "str",
+    "repr",
+    "isinstance",
+    "hash",
+    "id",
+    "type",
+    "bool",
+    "int",
+    "float",
+    "range",
+    "map",
+    "filter",
+];
+
+/// Names a loop body may content-mutate: [`names_mutated`], plus every
+/// name passed to a call that might mutate it (anything but a
+/// [`NON_MUTATING_BUILTINS`] call), plus what each same-module function the
+/// body calls may mutate (`fns`) — a helper appending to the list breaks
+/// the invariance the advice relies on.
+fn loop_mutations(body: &[Stmt], fns: &HashMap<String, HashSet<String>>) -> HashSet<String> {
+    struct V<'a> {
+        out: HashSet<String>,
+        fns: &'a HashMap<String, HashSet<String>>,
+    }
+    impl<'ast> SourceOrderVisitor<'ast> for V<'_> {
+        fn visit_expr(&mut self, e: &'ast Expr) {
+            if let Expr::Call(c) = e {
+                let builtin = matches!(c.func.as_ref(), Expr::Name(n)
+                    if NON_MUTATING_BUILTINS.contains(&n.id.as_str()));
+                if let Expr::Name(n) = c.func.as_ref() {
+                    if let Some(m) = self.fns.get(n.id.as_str()) {
+                        self.out.extend(m.iter().cloned());
+                    }
+                }
+                if !builtin {
+                    for arg in c
+                        .arguments
+                        .args
+                        .iter()
+                        .chain(c.arguments.keywords.iter().map(|k| &k.value))
+                    {
+                        if let Some(name) = base_name(arg) {
+                            self.out.insert(name);
+                        }
+                    }
+                }
+            }
+            walk_expr(self, e);
+        }
+    }
+    let mut out = names_mutated(body, CONTENT_MUTATORS);
+    let mut v = V {
+        out: HashSet::new(),
+        fns,
+    };
+    for stmt in body {
+        v.visit_stmt(stmt);
+    }
+    out.extend(v.out);
+    out
 }
 
 /// True when `expr` is the integer literal `0`.
@@ -860,16 +1018,59 @@ struct AnywhereVisitor<'a> {
     path: &'a str,
     source: &'a str,
     diags: &'a mut Diagnostics,
+    /// Depth of enclosing `try` bodies whose handlers catch `IndexError`
+    /// (or `LookupError`): `sorted(xs)[0]` raises `IndexError` on an empty
+    /// `xs` where `min(xs)` raises `ValueError`, so the rewrite would
+    /// escape the handler.
+    index_error_guards: usize,
+}
+
+/// True when a `try` statement has a handler naming `IndexError` or
+/// `LookupError` (alone or in a tuple).
+fn catches_index_error(t: &ruff_python_ast::StmtTry) -> bool {
+    fn names(e: &Expr) -> bool {
+        match e {
+            Expr::Name(n) => matches!(n.id.as_str(), "IndexError" | "LookupError"),
+            Expr::Attribute(a) => matches!(a.attr.as_str(), "IndexError" | "LookupError"),
+            Expr::Tuple(t) => t.elts.iter().any(names),
+            _ => false,
+        }
+    }
+    t.handlers.iter().any(|h| {
+        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+        h.type_.as_deref().is_some_and(names)
+    })
 }
 
 impl<'ast, 'a> SourceOrderVisitor<'ast> for AnywhereVisitor<'a> {
+    fn visit_stmt(&mut self, stmt: &'ast Stmt) {
+        if let Stmt::Try(t) = stmt {
+            if catches_index_error(t) {
+                self.index_error_guards += 1;
+                for s in &t.body {
+                    self.visit_stmt(s);
+                }
+                self.index_error_guards -= 1;
+                for h in &t.handlers {
+                    self.visit_except_handler(h);
+                }
+                for s in t.orelse.iter().chain(t.finalbody.iter()) {
+                    self.visit_stmt(s);
+                }
+                return;
+            }
+        }
+        ruff_python_ast::visitor::source_order::walk_stmt(self, stmt);
+    }
+
     fn visit_expr(&mut self, e: &'ast Expr) {
         // Lint 5 — `sorted(EXPR)[0]` / `sorted(EXPR)[-1]`, bare form only
         // (no `key=` / `reverse=` keywords).
         if let Expr::Subscript(sub) = e {
             if let Expr::Call(call) = sub.value.as_ref() {
                 let is_bare_sorted = matches!(call.func.as_ref(), Expr::Name(n) if n.id.as_str() == "sorted")
-                    && call.arguments.keywords.is_empty();
+                    && call.arguments.keywords.is_empty()
+                    && self.index_error_guards == 0;
                 if is_bare_sorted {
                     if let Some((which, builtin)) = first_or_last_index(&sub.slice) {
                         let range = e.range();

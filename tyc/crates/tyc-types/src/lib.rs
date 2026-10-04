@@ -3424,6 +3424,11 @@ struct Checker<'a> {
     /// functions never enter this set: their shapes carry no async flag.
     sync_functions: std::collections::HashSet<String>,
     async_functions: std::collections::HashSet<String>,
+    /// Local names of imported free functions a project `.ty` module
+    /// declares as a plain, undecorated `def` ([`ArityInfo::declared_sync`]):
+    /// calling one never yields a coroutine, so `go f()` on it is rejected
+    /// like `go` on a same-module `def`.
+    imported_sync_functions: std::collections::HashSet<String>,
     /// Bumped on entry to an `Expr::Await`, decremented on exit. While
     /// positive, the call-site arm skips the `missing_await` check so
     /// the user's `await f()` is accepted.
@@ -3754,6 +3759,13 @@ pub struct ArityInfo {
     /// Cross-module consumers need this to type an un-awaited call as
     /// `Coroutine[..., T]` rather than the declared result `T`.
     pub is_async: bool,
+    /// `true` only for a plain, undecorated `def` extracted from Typhon
+    /// source (`.ty`): calling it can never produce a coroutine unless its
+    /// declared return type says so. Stubs (`.dty`, bundled, venv
+    /// introspection) never set it — their `def` is a claim about code the
+    /// checker cannot see. A consumer uses it to reject `go f()` / `await
+    /// f()` on an imported synchronous function (W3, extending W2-11).
+    pub declared_sync: bool,
 }
 
 /// Declared interface (`interface Name:` → `class Name(Protocol):`). Bundles
@@ -3913,6 +3925,7 @@ impl<'a> Checker<'a> {
             function_kwarg_types: HashMap::new(),
             async_functions: std::collections::HashSet::new(),
             sync_functions: std::collections::HashSet::new(),
+            imported_sync_functions: std::collections::HashSet::new(),
             inside_await: 0,
             in_question_temp_rhs: false,
             in_sync_function: false,
@@ -6818,6 +6831,28 @@ pub struct ExternalShapes {
 /// (cyclic aliases, unknown class names in annotations, …) are
 /// silently tolerated: the goal here is to publish the surface API for
 /// downstream callers, not to validate it.
+/// Class-shape name under which a module publishes the methods its
+/// `extend Class:` block patches onto an imported class:
+/// `__typhon_extend_<Class>@<import spec>`, where the spec is the module as
+/// the extending module imported it (`user`, `.user`, `..`). The consumer
+/// resolves the spec against the extending module's key; see
+/// [`parse_extension_sentinel`].
+pub fn extension_sentinel_name(class: &str, spec: &str) -> String {
+    format!("{EXTENSION_SENTINEL_PREFIX}{class}@{spec}")
+}
+
+/// Prefix of [`extension_sentinel_name`].
+pub const EXTENSION_SENTINEL_PREFIX: &str = "__typhon_extend_";
+
+/// `(class, level, module)` of an [`extension_sentinel_name`].
+pub fn parse_extension_sentinel(name: &str) -> Option<(&str, u32, &str)> {
+    let rest = name.strip_prefix(EXTENSION_SENTINEL_PREFIX)?;
+    let (class, spec) = rest.split_once('@')?;
+    let module = spec.trim_start_matches('.');
+    let level = (spec.len() - module.len()) as u32;
+    Some((class, level, module))
+}
+
 pub fn extract_module_shapes(module: &ModModule) -> ModuleShapes {
     extract_module_shapes_with(module, &std::collections::HashSet::new())
 }
@@ -6879,6 +6914,27 @@ pub fn extract_module_shapes_with(
             }
         }
     }
+    // `from M import X [as Y]` bindings, so an `extend Y:` of an imported
+    // class can name the class it patches (W3-03).
+    let mut from_imports: HashMap<String, String> = HashMap::new();
+    for stmt in &module.body {
+        if let Stmt::ImportFrom(i) = stmt {
+            let spec = format!(
+                "{}{}",
+                ".".repeat(i.level as usize),
+                i.module.as_ref().map(|m| m.as_str()).unwrap_or("")
+            );
+            for alias in &i.names {
+                let member = alias.name.as_str();
+                if member == "*" {
+                    continue;
+                }
+                let local = alias.asname.as_ref().map(|a| a.as_str()).unwrap_or(member);
+                from_imports.insert(local.to_owned(), extension_sentinel_name(member, &spec));
+            }
+        }
+    }
+    let mut foreign_extensions: HashMap<String, InterfaceShape> = HashMap::new();
     // Second sweep: fold `__typhon_impl_NAME` contributions back into
     // the target class so an out-of-module caller sees `impl`-block
     // methods on the same shape as the in-module checker does.
@@ -6886,7 +6942,21 @@ pub fn extract_module_shapes_with(
         if let Stmt::ClassDef(cd) = stmt {
             let pseudo = cd.name.as_str();
             if let Some(target) = pseudo.strip_prefix("__typhon_impl_") {
-                if class_shapes.contains_key(target) {
+                if !class_shapes.contains_key(target) {
+                    // `extend User:` of an imported class lowers to
+                    // module-level patches (`User.m = …`) that run when this
+                    // module is imported. Publish its methods under a
+                    // sentinel naming the patched class's module, so a
+                    // consumer importing this module sees them on `User`
+                    // (W3-03). Fields are not patched, so not published.
+                    if let Some(sentinel) = from_imports.get(target) {
+                        let impl_shape = collect_class_shape(cd, &classes);
+                        let entry = foreign_extensions.entry(sentinel.clone()).or_default();
+                        for (m, sig) in impl_shape.methods {
+                            entry.methods.entry(m).or_insert(sig);
+                        }
+                    }
+                } else {
                     let impl_shape = collect_class_shape(cd, &classes);
                     let target_shape = class_shapes.get_mut(target).expect("checked above");
                     for (m, sig) in impl_shape.methods {
@@ -6916,6 +6986,7 @@ pub fn extract_module_shapes_with(
     // Drop the synthetic pseudo-classes from the published surface —
     // consumers should never see them by name.
     class_shapes.retain(|name, _| !name.starts_with("__typhon_impl_"));
+    class_shapes.extend(foreign_extensions);
 
     let mut function_arities: HashMap<String, ArityInfo> = HashMap::new();
     for stmt in &module.body {
@@ -6928,6 +6999,7 @@ pub fn extract_module_shapes_with(
                 &tps,
             );
             info.is_async = f.is_async;
+            info.declared_sync = !f.is_async && f.decorator_list.is_empty();
             function_arities.insert(f.name.as_str().to_owned(), info);
         }
     }
@@ -7314,6 +7386,8 @@ pub fn check_module_with_imports_and_types(
                 .or_insert_with(|| info.clone());
             if info.is_async {
                 c.async_functions.insert(name.clone());
+            } else if info.declared_sync && !name.contains('.') {
+                c.imported_sync_functions.insert(name.clone());
             }
         }
         // Cross-module sealed unions: an imported `type Event = A | B`
@@ -9072,6 +9146,49 @@ const BLOCKING_CALLEES: &[&str] = &[
     "subprocess.check_output",
 ];
 
+/// The dotted callee path of `func` with module-level import aliases
+/// expanded, for matching [`BLOCKING_CALLEES`]: `t.sleep` after `import time
+/// as t` and `sleep` after `from time import sleep` are both `time.sleep`.
+/// A head bound in an inner scope (a parameter, a local) is not the import,
+/// so the path is returned as written; so is a relative import.
+fn canonical_callee_path(c: &Checker, func: &Expr) -> Option<String> {
+    let path = dotted_name_of(func)?;
+    let (head, rest) = match path.split_once('.') {
+        Some((h, r)) => (h, Some(r)),
+        None => (path.as_str(), None),
+    };
+    if c.env.scope_of(head) != Some(0) {
+        return Some(path);
+    }
+    let Some(info) = c
+        .resolved
+        .scopes
+        .first()
+        .and_then(|scope| scope.bindings.iter().find(|b| b.name == head))
+        .and_then(|b| b.import_info.as_ref())
+    else {
+        return Some(path);
+    };
+    if info.level > 0 {
+        return Some(path);
+    }
+    // `import urllib.request` binds `urllib`: the path already starts at
+    // the package, so only an alias (`import time as t`) is rewritten.
+    if info.member.is_none() && info.module.split('.').next() == Some(head) {
+        return Some(path);
+    }
+    let mut canonical = info.module.clone();
+    if let Some(member) = &info.member {
+        canonical.push('.');
+        canonical.push_str(member);
+    }
+    if let Some(rest) = rest {
+        canonical.push('.');
+        canonical.push_str(rest);
+    }
+    Some(canonical)
+}
+
 /// The curated set of stdlib calls that return an unmanaged resource
 /// (a file handle, socket, connection, …) which **must** be wrapped in
 /// a `with` statement to guarantee cleanup. Matched as either a bare
@@ -9319,16 +9436,145 @@ fn walk_freeze_expr(c: &mut Checker, binding: &str, expr: &Expr) {
 /// `Stmt::Assign`, so legitimate `with open(...) as f:` forms never
 /// trip the check — only bare assignments do.
 fn check_resource_discipline(c: &mut Checker, body: &[Stmt]) {
-    for stmt in body {
-        check_resource_discipline_stmt(c, stmt);
+    for (i, stmt) in body.iter().enumerate() {
+        check_resource_discipline_stmt(c, stmt, &body[i + 1..]);
     }
 }
 
-fn check_resource_discipline_stmt(c: &mut Checker, stmt: &Stmt) {
+/// True when a later statement of the same block is a `try` whose
+/// `finally` closes `name` (`f = open(p)` / `try: … finally: f.close()`):
+/// the handle is managed, just not by `with`.
+fn closed_in_later_finally(name: &str, rest: &[Stmt]) -> bool {
+    fn closes(stmts: &[Stmt], name: &str) -> bool {
+        stmts.iter().any(|stmt| {
+            let Stmt::Expr(e) = stmt else { return false };
+            let Expr::Call(call) = e.value.as_ref() else {
+                return false;
+            };
+            matches!(call.func.as_ref(), Expr::Attribute(a)
+                if a.attr.as_str() == "close"
+                    && matches!(a.value.as_ref(), Expr::Name(n) if n.id.as_str() == name))
+        })
+    }
+    rest.iter()
+        .any(|stmt| matches!(stmt, Stmt::Try(t) if closes(&t.finalbody, name)))
+}
+
+/// The resource-returning call a statement assigns to plain local names,
+/// or `None` when it stores it somewhere longer-lived (`self.fh = open(…)`
+/// hands it to an object that manages it) or closes it in a later
+/// `finally`.
+fn unmanaged_resource_assignment(targets: &[&Expr], value: &Expr, rest: &[Stmt]) -> Option<String> {
+    let name = dotted_callee_path(value)?;
+    if !REQUIRE_WITH_CALLEES.iter().any(|p| *p == name) {
+        return None;
+    }
+    let mut locals = Vec::new();
+    for t in targets {
+        match t {
+            Expr::Name(n) => locals.push(n.id.as_str()),
+            _ => return None,
+        }
+    }
+    if locals.iter().any(|l| closed_in_later_finally(l, rest)) {
+        return None;
+    }
+    Some(name)
+}
+
+/// A resource-returning call used and dropped inside an expression — the
+/// receiver of a method call (`open(p).read()`) or an argument
+/// (`json.load(open(p))`) — never reaches a `with` or a `close()`.
+/// `with` items, `return` values and assignment right-hand sides are
+/// handled by the statement walk, so only these two positions count.
+fn check_inline_resource_exprs(c: &mut Checker, stmt: &Stmt) {
+    use ruff_python_ast::visitor::{walk_expr, Visitor};
+    struct Finder {
+        found: Vec<(String, TextRange)>,
+    }
+    impl Finder {
+        fn note(&mut self, e: &Expr) {
+            if let Some(name) = dotted_callee_path(e) {
+                if REQUIRE_WITH_CALLEES.iter().any(|p| *p == name) {
+                    self.found.push((name, e.range()));
+                }
+            }
+        }
+    }
+    impl<'a> Visitor<'a> for Finder {
+        fn visit_stmt(&mut self, _stmt: &'a Stmt) {
+            // Nested statements are walked by `check_resource_discipline`.
+        }
+        fn visit_expr(&mut self, e: &'a Expr) {
+            if let Expr::Call(call) = e {
+                if let Expr::Attribute(a) = call.func.as_ref() {
+                    self.note(&a.value);
+                }
+                // `stack.enter_context(open(p))` / `closing(open(p))` take
+                // ownership and close it.
+                let takes_ownership = match call.func.as_ref() {
+                    Expr::Attribute(a) => {
+                        matches!(
+                            a.attr.as_str(),
+                            "enter_context" | "enter_async_context" | "closing"
+                        )
+                    }
+                    Expr::Name(n) => n.id.as_str() == "closing",
+                    _ => false,
+                };
+                if !takes_ownership {
+                    for arg in &call.arguments.args {
+                        self.note(arg);
+                    }
+                    for kw in &call.arguments.keywords {
+                        self.note(&kw.value);
+                    }
+                }
+            }
+            walk_expr(self, e);
+        }
+    }
+    let mut finder = Finder { found: Vec::new() };
+    let exprs: Vec<&Expr> = match stmt {
+        Stmt::Expr(e) => vec![e.value.as_ref()],
+        Stmt::Assign(a) => vec![a.value.as_ref()],
+        Stmt::AnnAssign(a) => a.value.as_deref().into_iter().collect(),
+        Stmt::AugAssign(a) => vec![a.value.as_ref()],
+        Stmt::Return(r) => r.value.as_deref().into_iter().collect(),
+        Stmt::If(s) => std::iter::once(s.test.as_ref())
+            .chain(s.elif_else_clauses.iter().filter_map(|c| c.test.as_ref()))
+            .collect(),
+        Stmt::While(s) => vec![s.test.as_ref()],
+        Stmt::For(s) => vec![s.iter.as_ref()],
+        _ => Vec::new(),
+    };
+    for e in exprs {
+        finder.visit_expr(e);
+    }
+    for (name, range) in finder.found {
+        let (start, end) = (range.start().to_usize(), range.end().to_usize());
+        c.diagnostics.push_warning(TycError::resource_not_managed(
+            &name,
+            &c.path,
+            c.source,
+            start,
+            end.saturating_sub(start).max(1),
+        ));
+    }
+}
+
+fn check_resource_discipline_stmt(c: &mut Checker, stmt: &Stmt, rest: &[Stmt]) {
+    if !matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+        let unsafe_block = matches!(stmt, Stmt::If(s) if c.is_unsafe_marker(s.range));
+        if !unsafe_block {
+            check_inline_resource_exprs(c, stmt);
+        }
+    }
     match stmt {
         Stmt::Assign(a) => {
-            if let Some(name) = dotted_callee_path(a.value.as_ref()) {
-                if REQUIRE_WITH_CALLEES.iter().any(|p| *p == name) {
+            let targets: Vec<&Expr> = a.targets.iter().collect();
+            if let Some(name) = unmanaged_resource_assignment(&targets, a.value.as_ref(), rest) {
+                {
                     let span = (
                         a.value.range().start().to_usize(),
                         a.value.range().end().to_usize(),
@@ -9345,8 +9591,10 @@ fn check_resource_discipline_stmt(c: &mut Checker, stmt: &Stmt) {
         }
         Stmt::AnnAssign(a) => {
             if let Some(v) = a.value.as_ref() {
-                if let Some(name) = dotted_callee_path(v.as_ref()) {
-                    if REQUIRE_WITH_CALLEES.iter().any(|p| *p == name) {
+                if let Some(name) =
+                    unmanaged_resource_assignment(&[a.target.as_ref()], v.as_ref(), rest)
+                {
+                    {
                         let span = (v.range().start().to_usize(), v.range().end().to_usize());
                         c.diagnostics.push_warning(TycError::resource_not_managed(
                             &name,
@@ -11529,6 +11777,7 @@ fn class_constructor_arity_for(shape: &InterfaceShape, class_name: Option<&str>)
             kwonly_types: param_types,
             return_type,
             is_async: false,
+            declared_sync: false,
         };
     }
     ArityInfo {
@@ -11545,6 +11794,7 @@ fn class_constructor_arity_for(shape: &InterfaceShape, class_name: Option<&str>)
         kwonly_types: Vec::new(),
         return_type,
         is_async: false,
+        declared_sync: false,
     }
 }
 
@@ -12479,6 +12729,7 @@ fn arity_info_from_parameters_with_returns(
         kwonly_types,
         return_type,
         is_async: false,
+        declared_sync: false,
     }
 }
 
@@ -21385,7 +21636,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             // because `asyncio.to_thread(time.sleep, 1)` itself is
             // `asyncio.to_thread(...)` — not in the registry.
             if c.in_async_function && c.unsafe_depth == 0 {
-                if let Some(callee_path) = dotted_name_of(&call.func) {
+                if let Some(callee_path) = canonical_callee_path(c, &call.func) {
                     if BLOCKING_CALLEES.iter().any(|p| *p == callee_path) {
                         let span = (call.range.start().to_usize(), call.range.end().to_usize());
                         c.diagnostics.push_warning(TycError::blocking_in_async(
@@ -33519,6 +33770,41 @@ let x: A = 1
 
     // ── blocking in async (Phase E) ─────────────────────────────────────
 
+    /// 2026-10-03 review §7.9: aliased and from-imported blocking calls.
+    #[test]
+    fn blocking_calls_through_import_aliases_warn() {
+        for (imports, call) in [
+            ("from time import sleep", "sleep(1)"),
+            ("from time import sleep as nap", "nap(1)"),
+            ("import time as t", "t.sleep(1)"),
+            ("import subprocess as sp", "sp.run([\"ls\"])"),
+            (
+                "import urllib.request",
+                "urllib.request.urlopen(\"http://x\")",
+            ),
+        ] {
+            let src = format!("{imports}\nasync def bad() -> None:\n    {call}\n    return\n");
+            let d = check(&src);
+            assert!(
+                d.warnings()
+                    .iter()
+                    .any(|w| matches!(w, TycError::BlockingInAsync { .. })),
+                "expected blocking_in_async for `{imports}` + `{call}`"
+            );
+        }
+        // A parameter shadowing the import is not the import.
+        let src = "\
+from time import sleep
+async def ok(sleep: int) -> None:
+    print(sleep)
+";
+        let d = check(src);
+        assert!(!d
+            .warnings()
+            .iter()
+            .any(|w| matches!(w, TycError::BlockingInAsync { .. })));
+    }
+
     #[test]
     fn blocking_call_in_async_def_warns() {
         let src = "\
@@ -33610,6 +33896,54 @@ async def escape_hatch() -> None:
     }
 
     // ── resource discipline (Phase C) ───────────────────────────────────
+
+    /// 2026-10-03 review §7.9: a handle stored on an object or closed in a
+    /// later `finally` is managed; one used and dropped inline is not.
+    #[test]
+    fn resource_not_managed_ownership_and_inline_uses() {
+        let warns = |src: &str| {
+            check(src)
+                .warnings()
+                .iter()
+                .filter(|w| matches!(w, TycError::ResourceNotManaged { .. }))
+                .count()
+        };
+        let managed = "\
+import contextlib
+class Log:
+    def __init__(self, path: str) -> None:
+        self.fh = open(path)
+
+def read(path: str) -> str:
+    let f = open(path)
+    try:
+        return f.read()
+    finally:
+        f.close()
+
+def many(paths: list[str]) -> None:
+    with contextlib.ExitStack() as stack:
+        for p in paths:
+            stack.enter_context(open(p))
+
+def factory(path: str) -> object:
+    return open(path)
+";
+        assert_eq!(warns(managed), 0, "managed handles must not warn");
+        let leaked = "\
+import json
+def text(path: str) -> str:
+    return open(path).read()
+
+def data(path: str) -> object:
+    return json.load(open(path))
+
+def first(path: str) -> str:
+    let line: str = open(path).readline()
+    return line
+";
+        assert_eq!(warns(leaked), 3, "inline handles must warn");
+    }
 
     #[test]
     fn bare_open_assignment_warns() {
@@ -39472,6 +39806,55 @@ class Service:
             !shapes.gatherable_async_fns.contains("helper"),
             "sync fn must be excluded"
         );
+    }
+
+    /// W3-03: `extend User:` of an imported class publishes its methods
+    /// under a sentinel naming the class and the module it was imported
+    /// from; a local class's `extend` still folds into the class itself.
+    #[test]
+    fn foreign_extend_blocks_publish_an_extension_sentinel() {
+        let src = "\
+from .user import User as U
+from other import Thing
+
+class Local:
+    x: int
+
+extend U:
+    def tracking_id(self) -> str:
+        return \"t\"
+
+extend Local:
+    def double(self) -> int:
+        return self.x * 2
+
+extend Unknown:
+    def nope(self) -> int:
+        return 1
+";
+        let prep = preprocess(src);
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let shapes = extract_module_shapes(&module);
+        let sentinel = extension_sentinel_name("User", ".user");
+        assert_eq!(sentinel, "__typhon_extend_User@.user");
+        assert_eq!(
+            parse_extension_sentinel(&sentinel),
+            Some(("User", 1, "user"))
+        );
+        assert_eq!(
+            parse_extension_sentinel("__typhon_extend_Thing@other"),
+            Some(("Thing", 0, "other"))
+        );
+        assert!(shapes.class_shapes[&sentinel]
+            .methods
+            .contains_key("tracking_id"));
+        assert!(shapes.class_shapes["Local"].methods.contains_key("double"));
+        assert!(!shapes
+            .class_shapes
+            .keys()
+            .any(|k| k.contains("Unknown") || k.starts_with("__typhon_impl_")));
     }
 
     /// Cross-module newtype escape-upward. A `newtype ProjectTag = str`

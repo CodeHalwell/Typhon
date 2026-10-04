@@ -44,9 +44,9 @@ The warning already stands down where `async` is genuinely required despite the 
 Two or more adjacent **independent** awaited calls inside an `async def` could run concurrently. This advice (Hint severity, **on by default**) suggests wrapping them in an explicit `gather:` block, which lowers to an `asyncio.TaskGroup`:
 
 ```python
-async def load(client: Client, uid: int) -> tuple[User, list[Post]]:
-    let user  = await client.get_user(uid)     # 💡 tyc::gather_opportunity —
-    let posts = await client.get_posts(uid)    #    these awaits could run concurrently
+async def load(users: UserApi, posts_api: PostApi, uid: int) -> tuple[User, list[Post]]:
+    let user  = await users.get(uid)           # 💡 tyc::gather_opportunity —
+    let posts = await posts_api.for_user(uid)  #    these awaits could run concurrently
     return (user, posts)
 ```
 
@@ -57,12 +57,14 @@ It **never rewrites** — concurrency is a behaviour change the author opts into
 **Fix:** wrap the independent awaits in a `gather:` block:
 
 ```python
-async def load(client: Client, uid: int) -> tuple[User, list[Post]]:
+async def load(users: UserApi, posts_api: PostApi, uid: int) -> tuple[User, list[Post]]:
     gather:
-        user  = client.get_user(uid)
-        posts = client.get_posts(uid)
+        user  = users.get(uid)
+        posts = posts_api.for_user(uid)
     return (user, posts)
 ```
+
+Awaits on the **same receiver** (`await conn.execute(...)` twice, `await client.login()` then `await client.fetch()`) are treated as dependent and never suggested — the object carries state between the calls, so running them concurrently would reorder it.
 
 Knob: [`[strictness] suggest-gather`](/Typhon/configuration/strictness/) (default `true`). `tyc explain gather_opportunity` documents it offline.
 

@@ -76,6 +76,17 @@
 //!      imply non-raising: integer `//` and `%` and calls to `@pure` functions
 //!      all raise while being side-effect-free.) A nested `def` resets this:
 //!      it opens a new frame, which an enclosing `try` does not guard.
+//!   9. **Integer elements.** `EXPR` itself provably evaluates to an exact
+//!      `int` / `bool`: built from the loop target (whose iterable is a
+//!      `range(...)`, an `int` literal display, or a name annotated
+//!      `list[int]` / `tuple[int, ...]` / `set[int]` / `frozenset[int]`),
+//!      `int`-annotated names, integer literals, `+ - * // % << >> & | ^`,
+//!      comparisons, and calls to functions declared `-> int`. An `int`
+//!      accumulator is not enough: `total += field(r)` with `field -> Any`
+//!      can add floats, and reordering float addition changes the sum.
+//!
+//! Inside a function, a parameter or local named like a pure function is a
+//! different callable and never counts as pure (`def apply(double: …)`).
 //!
 //! Gated at the call site on `auto-parallel` **and** `auto-parallel-reductions`
 //! both being on. Honours `[strictness] parallel-min-size` for statically-sized
@@ -91,7 +102,7 @@ use ruff_text_size::{Ranged, TextRange};
 
 use crate::parallel::{
     build_map_pure_call, collect_capturable_names, is_pure_value_expr, literal_iter_len,
-    mentions_name, RewriteCtx,
+    mentions_name, scoped_pure, RewriteCtx,
 };
 
 /// Summary of what the reduction pass rewrote.
@@ -117,7 +128,7 @@ struct ReductionMatch {
 /// builtin-shadowing flags, all resolved against a single function / module /
 /// class scope. Recomputed on entry to each `def` / `class`; threaded
 /// unchanged through control-flow blocks, which share their enclosing scope.
-struct ScopeEnv {
+pub(crate) struct ScopeEnv {
     /// Names declared `mut NAME: int` in this scope (condition 3).
     int_mut: HashSet<String>,
     /// Names declared `mut NAME: float` in this scope (detection's
@@ -133,6 +144,16 @@ struct ScopeEnv {
     /// True when `range` is rebound in this or any enclosing scope — a
     /// `range(...)` iterable only proves boundedness when it's the builtin.
     range_shadowed: bool,
+    /// The subset of `containers` whose element type is `int` / `bool`
+    /// (`list[int]`, `tuple[int, ...]`, `frozenset[bool]`): iterating one
+    /// yields exact integers (condition 9).
+    int_containers: HashSet<String>,
+    /// Names visible here that are annotated `int` / `bool` — parameters
+    /// and annotated bindings of this scope, plus those of enclosing scopes
+    /// this one does not rebind.
+    int_names: HashSet<String>,
+    /// Functions visible here whose declared return type is `int` / `bool`.
+    int_fns: HashSet<String>,
 }
 
 impl ScopeEnv {
@@ -142,7 +163,7 @@ impl ScopeEnv {
     /// same-named binding in another scope is a different binding — see
     /// [`collect_scope_typed_mut`]); the shadowing flags *are* OR-inherited,
     /// because an enclosing scope's binding stays visible inside.
-    fn for_scope(
+    pub(crate) fn for_scope(
         body: &[Stmt],
         params: Option<&ruff_python_ast::Parameters>,
         outer: Option<&ScopeEnv>,
@@ -152,13 +173,294 @@ impl ScopeEnv {
                 || params.is_some_and(|p| params_bind_name(p, name))
                 || scope_binds_name(body, name)
         };
+        let rebound_here = |name: &str| {
+            params.is_some_and(|p| params_bind_name(p, name)) || scope_binds_name(body, name)
+        };
+        let mut int_names: HashSet<String> = outer
+            .map(|o| {
+                o.int_names
+                    .iter()
+                    .filter(|n| !rebound_here(n))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut int_fns: HashSet<String> = outer
+            .map(|o| {
+                o.int_fns
+                    .iter()
+                    .filter(|n| !rebound_here(n))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        collect_scope_int_names(body, params, &mut int_names, &mut int_fns);
         ScopeEnv {
             int_mut: collect_scope_typed_mut(body, "int"),
             float_mut: collect_scope_typed_mut(body, "float"),
             containers: collect_scope_container_names(body, params),
             sum_shadowed: shadowed("sum", outer.is_some_and(|o| o.sum_shadowed)),
             range_shadowed: shadowed("range", outer.is_some_and(|o| o.range_shadowed)),
+            int_containers: collect_scope_int_containers(body, params),
+            int_names,
+            int_fns,
         }
+    }
+}
+
+/// `int` / `bool` (the bare annotation).
+fn is_int_annotation(ann: &Expr) -> bool {
+    matches!(ann, Expr::Name(n) if matches!(n.id.as_str(), "int" | "bool"))
+}
+
+/// `list[int]`, `tuple[int, ...]`, `tuple[int, bool]`, `set[int]`,
+/// `frozenset[bool]`: a materialised container of exact integers.
+fn is_int_container_annotation(ann: &Expr) -> bool {
+    let Expr::Subscript(sub) = ann else {
+        return false;
+    };
+    if !is_container_annotation(ann) {
+        return false;
+    }
+    let args: Vec<&Expr> = match sub.slice.as_ref() {
+        Expr::Tuple(t) => t.elts.iter().collect(),
+        other => vec![other],
+    };
+    !args.is_empty()
+        && args
+            .iter()
+            .all(|a| is_int_annotation(a) || matches!(a, Expr::EllipsisLiteral(_)))
+        && args.iter().any(|a| is_int_annotation(a))
+}
+
+/// The names of one scope annotated `int` / `bool` (parameters and
+/// annotated bindings, descending control-flow blocks but not nested
+/// scopes), and the functions it defines with an `int` / `bool` return.
+fn collect_scope_int_names(
+    body: &[Stmt],
+    params: Option<&ruff_python_ast::Parameters>,
+    names: &mut HashSet<String>,
+    fns: &mut HashSet<String>,
+) {
+    if let Some(params) = params {
+        for p in params
+            .posonlyargs
+            .iter()
+            .chain(params.args.iter())
+            .chain(params.kwonlyargs.iter())
+        {
+            if p.parameter
+                .annotation
+                .as_deref()
+                .is_some_and(is_int_annotation)
+            {
+                names.insert(p.parameter.name.to_string());
+            }
+        }
+    }
+    fn walk(body: &[Stmt], names: &mut HashSet<String>, fns: &mut HashSet<String>) {
+        for stmt in body {
+            match stmt {
+                Stmt::AnnAssign(a) => {
+                    if let Expr::Name(t) = a.target.as_ref() {
+                        if is_int_annotation(&a.annotation) {
+                            names.insert(t.id.to_string());
+                        }
+                    }
+                }
+                Stmt::FunctionDef(f) => {
+                    if !f.is_async && f.returns.as_deref().is_some_and(is_int_annotation) {
+                        fns.insert(f.name.to_string());
+                    }
+                }
+                Stmt::If(s) => {
+                    walk(&s.body, names, fns);
+                    for clause in &s.elif_else_clauses {
+                        walk(&clause.body, names, fns);
+                    }
+                }
+                Stmt::While(s) => {
+                    walk(&s.body, names, fns);
+                    walk(&s.orelse, names, fns);
+                }
+                Stmt::For(s) => {
+                    walk(&s.body, names, fns);
+                    walk(&s.orelse, names, fns);
+                }
+                Stmt::With(s) => walk(&s.body, names, fns),
+                Stmt::Try(s) => {
+                    walk(&s.body, names, fns);
+                    walk(&s.orelse, names, fns);
+                    walk(&s.finalbody, names, fns);
+                    for h in &s.handlers {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                        walk(&h.body, names, fns);
+                    }
+                }
+                Stmt::Match(s) => {
+                    for case in &s.cases {
+                        walk(&case.body, names, fns);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    walk(body, names, fns);
+}
+
+/// [`collect_scope_container_names`], restricted to containers of `int` /
+/// `bool` elements.
+fn collect_scope_int_containers(
+    body: &[Stmt],
+    params: Option<&ruff_python_ast::Parameters>,
+) -> HashSet<String> {
+    let mut out = HashSet::new();
+    if let Some(params) = params {
+        for p in params
+            .posonlyargs
+            .iter()
+            .chain(params.args.iter())
+            .chain(params.kwonlyargs.iter())
+        {
+            if p.parameter
+                .annotation
+                .as_deref()
+                .is_some_and(is_int_container_annotation)
+            {
+                out.insert(p.parameter.name.to_string());
+            }
+        }
+    }
+    fn walk(body: &[Stmt], out: &mut HashSet<String>) {
+        for stmt in body {
+            match stmt {
+                Stmt::AnnAssign(a) => {
+                    if let Expr::Name(t) = a.target.as_ref() {
+                        if is_int_container_annotation(&a.annotation) {
+                            out.insert(t.id.to_string());
+                        }
+                    }
+                }
+                Stmt::If(s) => {
+                    walk(&s.body, out);
+                    for clause in &s.elif_else_clauses {
+                        walk(&clause.body, out);
+                    }
+                }
+                Stmt::While(s) => {
+                    walk(&s.body, out);
+                    walk(&s.orelse, out);
+                }
+                Stmt::For(s) => {
+                    walk(&s.body, out);
+                    walk(&s.orelse, out);
+                }
+                Stmt::With(s) => walk(&s.body, out),
+                Stmt::Try(s) => {
+                    walk(&s.body, out);
+                    walk(&s.orelse, out);
+                    walk(&s.finalbody, out);
+                    for h in &s.handlers {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                        walk(&h.body, out);
+                    }
+                }
+                Stmt::Match(s) => {
+                    for case in &s.cases {
+                        walk(&case.body, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    walk(body, &mut out);
+    out
+}
+
+/// Condition 9: the element type of `iter` is provably `int` / `bool`.
+fn iter_yields_ints(iter: &Expr, env: &ScopeEnv) -> bool {
+    match iter {
+        Expr::List(l) => !l.elts.is_empty() && l.elts.iter().all(is_int_literal),
+        Expr::Tuple(t) => !t.elts.is_empty() && t.elts.iter().all(is_int_literal),
+        Expr::Set(st) => !st.elts.is_empty() && st.elts.iter().all(is_int_literal),
+        Expr::Name(n) => env.int_containers.contains(n.id.as_str()),
+        Expr::Call(c) => {
+            !env.range_shadowed
+                && matches!(c.func.as_ref(), Expr::Name(f) if f.id.as_str() == "range")
+        }
+        _ => false,
+    }
+}
+
+fn is_int_literal(e: &Expr) -> bool {
+    match e {
+        Expr::NumberLiteral(n) => matches!(n.value, ruff_python_ast::Number::Int(_)),
+        Expr::BooleanLiteral(_) => true,
+        Expr::UnaryOp(u) => {
+            matches!(
+                u.op,
+                ruff_python_ast::UnaryOp::USub | ruff_python_ast::UnaryOp::UAdd
+            ) && is_int_literal(&u.operand)
+        }
+        _ => false,
+    }
+}
+
+/// Condition 9: `expr` (a pure value expression over `target`) provably
+/// evaluates to an exact `int` / `bool`, so summing the per-element results
+/// in any order is exact. An `int` accumulator is not enough: an element of
+/// type `Any` (`json.loads(...)`) can be a float, and reordering float
+/// addition changes the sum.
+fn expr_is_int(expr: &Expr, target: &str, target_is_int: bool, env: &ScopeEnv) -> bool {
+    let rec = |e: &Expr| expr_is_int(e, target, target_is_int, env);
+    match expr {
+        Expr::NumberLiteral(_) | Expr::BooleanLiteral(_) | Expr::UnaryOp(_)
+            if is_int_literal(expr) =>
+        {
+            true
+        }
+        Expr::Name(n) => {
+            if n.id.as_str() == target {
+                target_is_int
+            } else {
+                env.int_names.contains(n.id.as_str())
+            }
+        }
+        Expr::BinOp(b) => match b.op {
+            Operator::Add
+            | Operator::Sub
+            | Operator::Mult
+            | Operator::FloorDiv
+            | Operator::Mod
+            | Operator::LShift
+            | Operator::RShift
+            | Operator::BitAnd
+            | Operator::BitOr
+            | Operator::BitXor => rec(&b.left) && rec(&b.right),
+            // `int ** -1` is a float; only a non-negative literal exponent
+            // keeps the result an int.
+            Operator::Pow => {
+                rec(&b.left)
+                    && matches!(b.right.as_ref(), Expr::NumberLiteral(n)
+                        if matches!(n.value, ruff_python_ast::Number::Int(_)))
+            }
+            _ => false,
+        },
+        Expr::UnaryOp(u) => match u.op {
+            ruff_python_ast::UnaryOp::USub
+            | ruff_python_ast::UnaryOp::UAdd
+            | ruff_python_ast::UnaryOp::Invert => rec(&u.operand),
+            ruff_python_ast::UnaryOp::Not => true,
+        },
+        // A comparison of ints is a `bool`.
+        Expr::Compare(c) => rec(&c.left) && c.comparators.iter().all(&rec),
+        Expr::BoolOp(b) => b.values.iter().all(rec),
+        Expr::Call(c) => {
+            matches!(c.func.as_ref(), Expr::Name(f) if env.int_fns.contains(f.id.as_str()))
+        }
+        _ => false,
     }
 }
 
@@ -201,7 +503,7 @@ fn rewrite_stmts(
         // to recurse into anyway).
         recurse_children(stmt, ctx, env, stats, in_try, dead);
         let Stmt::For(f) = &*stmt else { continue };
-        let Some(m) = match_reduction_loop(f, ctx, &env.int_mut, env) else {
+        let Some(m) = match_reduction_loop(f, ctx, &env.int_mut, env, true) else {
             continue;
         };
         if env.sum_shadowed || under_min_size(&m.iter, ctx.min_size) {
@@ -481,9 +783,13 @@ fn recurse_children(
         // frame and takes its accumulator with it.
         Stmt::FunctionDef(f) => {
             let inner = ScopeEnv::for_scope(&f.body, Some(&f.parameters), Some(env));
+            // A parameter or local named like a pure function is a different
+            // callable inside this body.
+            let pure = scoped_pure(ctx.pure, Some(&f.parameters), &f.body);
+            let inner_ctx = RewriteCtx::new(&pure, ctx.min_size, ctx.captures);
             rewrite_stmts(
                 &mut f.body,
-                ctx,
+                &inner_ctx,
                 &inner,
                 stats,
                 /*in_try=*/ false,
@@ -553,6 +859,7 @@ fn match_reduction_loop(
     ctx: &RewriteCtx<'_>,
     typed_mut: &HashSet<String>,
     env: &ScopeEnv,
+    require_int_elements: bool,
 ) -> Option<ReductionMatch> {
     if f.is_async || !f.orelse.is_empty() || f.body.len() != 1 {
         return None;
@@ -570,6 +877,11 @@ fn match_reduction_loop(
     // mentions the target (and hence can't be the accumulator, which is `mut`
     // and therefore not a capture).
     if !is_pure_value_expr(expr, &target, ctx) || !mentions_name(expr, &target) {
+        return None;
+    }
+    // Condition 9 (the rewrite's int arm only): the element itself must be
+    // an exact integer, not merely added to an `int` accumulator.
+    if require_int_elements && !expr_is_int(expr, &target, iter_yields_ints(&f.iter, env), env) {
         return None;
     }
     // The iterable must be loop-invariant with respect to the accumulator.
@@ -685,7 +997,7 @@ fn under_min_size(iter: &Expr, min_size: u64) -> bool {
 ///
 /// Everything else — an unannotated name, a function / method call result, an
 /// attribute, a generator expression — is refused.
-fn iter_is_materialisable(iter: &Expr, env: &ScopeEnv) -> bool {
+pub(crate) fn iter_is_materialisable(iter: &Expr, env: &ScopeEnv) -> bool {
     match iter {
         Expr::List(_) | Expr::Tuple(_) | Expr::Set(_) => true,
         Expr::Name(n) => env.containers.contains(n.id.as_str()),
@@ -1129,7 +1441,7 @@ fn detect_in_stmts(
             // int accumulator → eligible for the rewrite (unless a user
             // binding of `sum` would capture the rewrite's emitted call).
             if !env.sum_shadowed {
-                if let Some(m) = match_reduction_loop(f, ctx, &env.int_mut, env) {
+                if let Some(m) = match_reduction_loop(f, ctx, &env.int_mut, env, true) {
                     if !under_min_size(&m.iter, ctx.min_size) {
                         out.push(ReductionHit {
                             acc: m.acc,
@@ -1146,7 +1458,7 @@ fn detect_in_stmts(
             // shares every structural condition, including the materialisable
             // iterable: advice about a shape that could never be a parallel
             // reduction is noise.)
-            if let Some(m) = match_reduction_loop(f, ctx, &env.float_mut, env) {
+            if let Some(m) = match_reduction_loop(f, ctx, &env.float_mut, env, false) {
                 if !under_min_size(&m.iter, ctx.min_size) {
                     out.push(ReductionHit {
                         acc: m.acc,
@@ -1171,7 +1483,9 @@ fn detect_children(
         // `recurse_children`, this walker's sibling in the rewrite path).
         Stmt::FunctionDef(f) => {
             let inner = ScopeEnv::for_scope(&f.body, Some(&f.parameters), Some(env));
-            detect_in_stmts(&f.body, ctx, &inner, dead, out);
+            let pure = scoped_pure(ctx.pure, Some(&f.parameters), &f.body);
+            let inner_ctx = RewriteCtx::new(&pure, ctx.min_size, ctx.captures);
+            detect_in_stmts(&f.body, &inner_ctx, &inner, dead, out);
         }
         Stmt::ClassDef(c) => {
             let inner = ScopeEnv::for_scope(&c.body, None, Some(env));
@@ -1226,6 +1540,84 @@ mod tests {
         let mut m = parse(src);
         let stats = rewrite_reduction_loops(&mut m, &pure_set(pure), min_size);
         (tyc_emit::emit_python(&m), stats)
+    }
+
+    #[test]
+    fn non_int_elements_are_never_reordered() {
+        // W3-09: an `int` accumulator plus a `json.loads` element typed `Any`
+        // over `1e16, -1e16` printed `0.0` by default and `1.0` under the
+        // reduction. The element itself must be provably `int`.
+        for src in [
+            "\
+from typing import Any
+@pure
+def field(r: str) -> Any:
+    return r
+
+def run(rows: list[str]) -> int:
+    mut total: int = 1
+    for r in rows:
+        total += field(r)
+    return total
+",
+            // A target of unknown element type.
+            "\
+def run(rows: list) -> int:
+    mut total: int = 1
+    for r in rows:
+        total += r
+    return total
+",
+            "\
+def run(rows: list[float]) -> int:
+    mut total: int = 1
+    for r in rows:
+        total += r
+    return total
+",
+            // True division and a negative power make floats.
+            "\
+def run(xs: list[int]) -> int:
+    mut total: int = 0
+    for x in xs:
+        total += x / 2
+    return total
+",
+        ] {
+            let (out, stats) = rewrite(src, &["field"], 0);
+            assert_eq!(stats.rewrites, 0, "{src}\n{out}");
+        }
+        // An `int`-returning pure helper over `range` still qualifies.
+        let ok = "\
+@pure
+def sq(n: int) -> int:
+    return n * n
+
+def run(n: int) -> int:
+    mut total: int = 0
+    for x in range(n):
+        total += sq(x) + (x > 3) + n
+    return total
+";
+        let (out, stats) = rewrite(ok, &["sq"], 0);
+        assert_eq!(stats.rewrites, 1, "{out}");
+    }
+
+    #[test]
+    fn a_parameter_shadowing_a_pure_function_is_not_pure() {
+        let src = "\
+@pure
+def double(n: int) -> int:
+    return n * 2
+
+def run(double: Callable[[int], int], xs: list[int]) -> int:
+    mut total: int = 0
+    for x in xs:
+        total += double(x)
+    return total
+";
+        let (out, stats) = rewrite(src, &["double"], 0);
+        assert_eq!(stats.rewrites, 0, "{out}");
     }
 
     #[test]

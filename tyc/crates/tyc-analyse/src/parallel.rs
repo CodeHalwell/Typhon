@@ -28,7 +28,18 @@
 //!      `map_pure(lambda x: f(x), [x for x in xs if COND])`.
 //!   4. **Purity.** Every callee reached must appear in the supplied set of
 //!      pure-function names — typically every function the analyser
-//!      already proved pure under the six-condition rule.
+//!      already proved pure under the six-condition rule — and must not be
+//!      shadowed: inside a function, a parameter or local of the same name
+//!      (`def apply(double: Callable…)`), or a comprehension target, is a
+//!      different callable.
+//!   5. **Materialisable iterable.** `map_pure` runs `list(iterable)` before
+//!      mapping a single element (even when it falls back to sequential on a
+//!      GIL build), while the comprehension pulls one element at a time. So
+//!      the iterable must be bounded and effect-free to materialise — a
+//!      display, a builtin `range(...)`, or a name annotated `list` /
+//!      `tuple` / `set` / `frozenset` in the comprehension's scope (the same
+//!      proof as the reduction rewrite's condition 6). A generator would run
+//!      ahead of the element that raises; an infinite one would hang.
 //!
 //! The rewrite preserves the comprehension's location and the order of
 //! the bound results: `map_pure` returns results in input order.  Code
@@ -46,6 +57,8 @@ use ruff_python_ast::{
     Pattern, Stmt,
 };
 use ruff_text_size::{Ranged, TextRange};
+
+use crate::reductions::ScopeEnv;
 
 /// Summary of what the pass rewrote.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -75,15 +88,46 @@ pub fn rewrite_parallel_comprehensions(
 ) -> ParallelStats {
     let mut stats = ParallelStats::default();
     let captures = collect_capturable_names(module);
+    let env = ScopeEnv::for_scope(&module.body, None, None);
     let ctx = RewriteCtx {
         pure: pure_callees,
         min_size,
         captures: &captures,
+        env: Some(&env),
     };
     for stmt in &mut module.body {
         rewrite_stmt(stmt, &ctx, &mut stats);
     }
     stats
+}
+
+/// `pure` minus every name the scope `body` (with `params`) binds: inside a
+/// function, a parameter or local named like a module-level pure function is
+/// a different callable — `def apply(double: Callable[...]): [double(x) for x
+/// in xs]` must not be treated as a call to the pure `double`.
+pub(crate) fn scoped_pure(
+    pure: &HashSet<String>,
+    params: Option<&ruff_python_ast::Parameters>,
+    body: &[Stmt],
+) -> HashSet<String> {
+    pure.iter()
+        .filter(|name| {
+            !params.is_some_and(|p| crate::reductions::params_bind_name(p, name))
+                && !crate::reductions::scope_binds_name(body, name)
+        })
+        .cloned()
+        .collect()
+}
+
+/// `pure` minus the comprehension targets of `generators`: inside a
+/// comprehension (`[double(y) for y in ys]` nested under `for double in
+/// fs`), a target named like a pure function shadows it.
+fn pure_minus_targets(pure: &HashSet<String>, generators: &[Comprehension]) -> HashSet<String> {
+    let mut bound = HashSet::new();
+    for g in generators {
+        collect_target_names(&g.target, &mut bound);
+    }
+    pure.difference(&bound).cloned().collect()
 }
 
 /// Shared analysis context for the parallel comprehension rewrite and the
@@ -96,6 +140,11 @@ pub(crate) struct RewriteCtx<'a> {
     /// `let`-bound (explicit or module-level implicit) or a parameter, and
     /// never mutated anywhere in the module. See [`collect_capturable_names`].
     pub(crate) captures: &'a HashSet<String>,
+    /// The enclosing scope's environment (container-annotated names,
+    /// builtin shadowing), for the comprehension rewrite's
+    /// materialisable-iterable proof. `None` (the reduction pass threads its
+    /// own environment) never proves an iterable materialisable.
+    pub(crate) env: Option<&'a ScopeEnv>,
 }
 
 impl<'a> RewriteCtx<'a> {
@@ -110,20 +159,44 @@ impl<'a> RewriteCtx<'a> {
             pure,
             min_size,
             captures,
+            env: None,
         }
+    }
+
+    /// The same context with a different pure set and scope environment.
+    fn with<'b>(&'b self, pure: &'b HashSet<String>, env: Option<&'b ScopeEnv>) -> RewriteCtx<'b> {
+        RewriteCtx {
+            pure,
+            min_size: self.min_size,
+            captures: self.captures,
+            env,
+        }
+    }
+
+    /// Whether `iter` is bounded and effect-free to materialise (see
+    /// `crate::reductions::iter_is_materialisable`).
+    fn iter_is_materialisable(&self, iter: &Expr) -> bool {
+        self.env
+            .is_some_and(|env| crate::reductions::iter_is_materialisable(iter, env))
     }
 }
 
 fn rewrite_stmt(stmt: &mut Stmt, ctx: &RewriteCtx<'_>, stats: &mut ParallelStats) {
     match stmt {
         Stmt::FunctionDef(f) => {
+            let env = ScopeEnv::for_scope(&f.body, Some(&f.parameters), ctx.env);
+            let pure = scoped_pure(ctx.pure, Some(&f.parameters), &f.body);
+            let inner = ctx.with(&pure, Some(&env));
             for s in &mut f.body {
-                rewrite_stmt(s, ctx, stats);
+                rewrite_stmt(s, &inner, stats);
             }
         }
         Stmt::ClassDef(c) => {
+            let env = ScopeEnv::for_scope(&c.body, None, ctx.env);
+            let pure = scoped_pure(ctx.pure, None, &c.body);
+            let inner = ctx.with(&pure, Some(&env));
             for s in &mut c.body {
-                rewrite_stmt(s, ctx, stats);
+                rewrite_stmt(s, &inner, stats);
             }
         }
         Stmt::Assign(a) => {
@@ -186,42 +259,50 @@ fn rewrite_expr(expr: &mut Expr, ctx: &RewriteCtx<'_>, stats: &mut ParallelStats
     // iterable is itself complex.
     match expr {
         Expr::ListComp(lc) => {
-            for gen in &mut lc.generators {
-                rewrite_expr(&mut gen.iter, ctx, stats);
+            // Inside the comprehension its own targets shadow pure names
+            // (the first iterable is evaluated outside, in `ctx`).
+            let pure = pure_minus_targets(ctx.pure, &lc.generators);
+            let inner = ctx.with(&pure, ctx.env);
+            for (i, gen) in lc.generators.iter_mut().enumerate() {
+                rewrite_expr(&mut gen.iter, if i == 0 { ctx } else { &inner }, stats);
                 for f in &mut gen.ifs {
-                    rewrite_expr(f, ctx, stats);
+                    rewrite_expr(f, &inner, stats);
                 }
             }
-            rewrite_expr(&mut lc.elt, ctx, stats);
+            rewrite_expr(&mut lc.elt, &inner, stats);
             if let Some(rewritten) = try_rewrite_listcomp(lc, ctx) {
                 *expr = rewritten;
                 stats.rewrites += 1;
             }
         }
         Expr::SetComp(sc) => {
-            for gen in &mut sc.generators {
-                rewrite_expr(&mut gen.iter, ctx, stats);
+            let pure = pure_minus_targets(ctx.pure, &sc.generators);
+            let inner = ctx.with(&pure, ctx.env);
+            for (i, gen) in sc.generators.iter_mut().enumerate() {
+                rewrite_expr(&mut gen.iter, if i == 0 { ctx } else { &inner }, stats);
                 for f in &mut gen.ifs {
-                    rewrite_expr(f, ctx, stats);
+                    rewrite_expr(f, &inner, stats);
                 }
             }
-            rewrite_expr(&mut sc.elt, ctx, stats);
+            rewrite_expr(&mut sc.elt, &inner, stats);
             if let Some(rewritten) = try_rewrite_setcomp(sc, ctx) {
                 *expr = rewritten;
                 stats.rewrites += 1;
             }
         }
         Expr::DictComp(dc) => {
-            for gen in &mut dc.generators {
-                rewrite_expr(&mut gen.iter, ctx, stats);
+            let pure = pure_minus_targets(ctx.pure, &dc.generators);
+            let inner = ctx.with(&pure, ctx.env);
+            for (i, gen) in dc.generators.iter_mut().enumerate() {
+                rewrite_expr(&mut gen.iter, if i == 0 { ctx } else { &inner }, stats);
                 for f in &mut gen.ifs {
-                    rewrite_expr(f, ctx, stats);
+                    rewrite_expr(f, &inner, stats);
                 }
             }
             if let Some(ref mut key) = dc.key {
-                rewrite_expr(key, ctx, stats);
+                rewrite_expr(key, &inner, stats);
             }
-            rewrite_expr(&mut dc.value, ctx, stats);
+            rewrite_expr(&mut dc.value, &inner, stats);
             if let Some(rewritten) = try_rewrite_dictcomp(dc, ctx) {
                 *expr = rewritten;
                 stats.rewrites += 1;
@@ -311,6 +392,11 @@ fn try_rewrite_dictcomp(dc: &ExprDictComp, ctx: &RewriteCtx<'_>) -> Option<Expr>
         if literal_len < ctx.min_size {
             return None;
         }
+    }
+    // `map_pure` materialises its source before mapping a single element;
+    // see `analyse_comprehension`.
+    if !ctx.iter_is_materialisable(&gen.iter) {
+        return None;
     }
 
     // Determine which of key/value contains the pure call.
@@ -447,6 +533,17 @@ fn analyse_comprehension(
         if literal_len < ctx.min_size {
             return None;
         }
+    }
+    // `map_pure` materialises its whole source (`list(iterable)`) before
+    // mapping a single element — even when it falls back to sequential on a
+    // GIL build — so the comprehension, which pulls one element at a time,
+    // and the rewrite only agree when the iterable is bounded and
+    // effect-free to materialise: a display, a builtin `range(...)`, or a
+    // name annotated `list` / `tuple` / `set` / `frozenset` in this scope.
+    // A printing generator would run ahead of the element that raises; an
+    // infinite iterator would hang instead of raising.
+    if !ctx.iter_is_materialisable(&gen.iter) {
+        return None;
     }
     // The element must be a parallelisable pure call over the loop target.
     if !elt_is_parallelisable(elt, &target_name, ctx) {
@@ -605,7 +702,8 @@ fn is_pure_call(call: &ExprCall, target: &str, ctx: &RewriteCtx<'_>) -> bool {
     let Expr::Name(callee) = call.func.as_ref() else {
         return false;
     };
-    if !ctx.pure.contains(callee.id.as_str()) {
+    // The comprehension / loop target shadows a same-named pure function.
+    if callee.id.as_str() == target || !ctx.pure.contains(callee.id.as_str()) {
         return false;
     }
     if call
@@ -949,10 +1047,12 @@ pub fn detect_parallel_comprehensions(
     min_size: u64,
 ) -> Vec<TextRange> {
     let captures = collect_capturable_names(module);
+    let env = ScopeEnv::for_scope(&module.body, None, None);
     let ctx = RewriteCtx {
         pure: pure_callees,
         min_size,
         captures: &captures,
+        env: Some(&env),
     };
     let mut out = Vec::new();
     for stmt in &module.body {
@@ -966,13 +1066,19 @@ fn detect_in_stmt(stmt: &Stmt, ctx: &RewriteCtx<'_>, out: &mut Vec<TextRange>) {
     // ranges instead of replacing nodes.
     match stmt {
         Stmt::FunctionDef(f) => {
+            let env = ScopeEnv::for_scope(&f.body, Some(&f.parameters), ctx.env);
+            let pure = scoped_pure(ctx.pure, Some(&f.parameters), &f.body);
+            let inner = ctx.with(&pure, Some(&env));
             for s in &f.body {
-                detect_in_stmt(s, ctx, out);
+                detect_in_stmt(s, &inner, out);
             }
         }
         Stmt::ClassDef(c) => {
+            let env = ScopeEnv::for_scope(&c.body, None, ctx.env);
+            let pure = scoped_pure(ctx.pure, None, &c.body);
+            let inner = ctx.with(&pure, Some(&env));
             for s in &c.body {
-                detect_in_stmt(s, ctx, out);
+                detect_in_stmt(s, &inner, out);
             }
         }
         Stmt::Assign(a) => detect_in_expr(&a.value, ctx, out),
@@ -1193,7 +1299,7 @@ ys = [f(x, k) for x in xs]
 
     #[test]
     fn rewrites_pure_listcomp() {
-        let src = "ys = [f(x) for x in xs]\n";
+        let src = "xs: list[int] = []\nys = [f(x) for x in xs]\n";
         let mut m = parse(src);
         let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
         assert_eq!(stats.rewrites, 1);
@@ -1210,7 +1316,7 @@ ys = [f(x, k) for x in xs]
 
     #[test]
     fn leaves_impure_callee_alone() {
-        let src = "ys = [g(x) for x in xs]\n";
+        let src = "xs: list[int] = []\nys = [g(x) for x in xs]\n";
         let mut m = parse(src);
         let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
         assert_eq!(stats.rewrites, 0);
@@ -1220,7 +1326,7 @@ ys = [f(x, k) for x in xs]
     fn rewrites_filtered_comprehension_with_pure_filter() {
         // Widening (a): a pure `if` filter no longer vetoes — the rewrite
         // filters sequentially, maps in parallel.
-        let src = "ys = [f(x) for x in xs if x > 0]\n";
+        let src = "xs: list[int] = []\nys = [f(x) for x in xs if x > 0]\n";
         let mut m = parse(src);
         let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
         assert_eq!(
@@ -1241,7 +1347,7 @@ ys = [f(x, k) for x in xs]
     #[test]
     fn leaves_impure_filtered_comprehension_alone() {
         // The filter calls an impure function `g` — must NOT rewrite.
-        let src = "ys = [f(x) for x in xs if g(x)]\n";
+        let src = "xs: list[int] = []\nys = [f(x) for x in xs if g(x)]\n";
         let mut m = parse(src);
         let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
         assert_eq!(stats.rewrites, 0, "impure filter must veto the rewrite");
@@ -1249,7 +1355,7 @@ ys = [f(x, k) for x in xs]
 
     #[test]
     fn leaves_nested_comprehension_alone() {
-        let src = "ys = [f(x) for row in rows for x in row]\n";
+        let src = "xs: list[int] = []\nys = [f(x) for row in rows for x in row]\n";
         let mut m = parse(src);
         let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
         assert_eq!(stats.rewrites, 0);
@@ -1258,7 +1364,7 @@ ys = [f(x, k) for x in xs]
     #[test]
     fn rewrites_multi_arg_call_with_literal() {
         // Widening (b): a literal extra argument is safe to capture.
-        let src = "ys = [f(x, 1) for x in xs]\n";
+        let src = "xs: list[int] = []\nys = [f(x, 1) for x in xs]\n";
         let mut m = parse(src);
         let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
         assert_eq!(stats.rewrites, 1, "literal extra arg should be captured");
@@ -1302,7 +1408,7 @@ def run(xs: list[int]) -> list[int]:
     #[test]
     fn rewrites_nested_pure_call() {
         // Widening (c): `g(f(x))` with both pure.
-        let src = "ys = [g(f(x)) for x in xs]\n";
+        let src = "xs: list[int] = []\nys = [g(f(x)) for x in xs]\n";
         let mut m = parse(src);
         let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f", "g"]), 0);
         assert_eq!(stats.rewrites, 1, "nested pure calls should rewrite");
@@ -1313,7 +1419,7 @@ def run(xs: list[int]) -> list[int]:
     #[test]
     fn leaves_nested_call_with_impure_inner_alone() {
         // `g` is pure but the inner `f` is not — must NOT rewrite.
-        let src = "ys = [g(f(x)) for x in xs]\n";
+        let src = "xs: list[int] = []\nys = [g(f(x)) for x in xs]\n";
         let mut m = parse(src);
         let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["g"]), 0);
         assert_eq!(stats.rewrites, 0, "impure inner call must veto");
@@ -1335,7 +1441,7 @@ def run(xs: list[int]) -> list[int]:
 
     #[test]
     fn rewrites_inside_function_body() {
-        let src = "def run() -> list[int]:\n    return [f(x) for x in xs]\n";
+        let src = "def run(xs: list[int]) -> list[int]:\n    return [f(x) for x in xs]\n";
         let mut m = parse(src);
         let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
         assert_eq!(stats.rewrites, 1);
@@ -1344,7 +1450,7 @@ def run(xs: list[int]) -> list[int]:
     #[test]
     fn min_size_threshold_suppresses_short_literal_iters() {
         // `[1, 2, 3]` is statically size 3; threshold 64 should suppress.
-        let src = "ys = [f(x) for x in [1, 2, 3]]\n";
+        let src = "xs: list[int] = []\nys = [f(x) for x in [1, 2, 3]]\n";
         let mut m = parse(src);
         let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 64);
         assert_eq!(
@@ -1367,22 +1473,58 @@ def run(xs: list[int]) -> list[int]:
     }
 
     #[test]
-    fn min_size_threshold_passes_unknown_size_iters() {
-        // An arbitrary call has no statically-known size — proceed.
-        let src = "ys = [f(x) for x in fetch()]\n";
-        let mut m = parse(src);
-        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 64);
-        assert_eq!(
-            stats.rewrites, 1,
-            "unknown iter size should fall through the threshold"
-        );
+    fn unmaterialisable_iterables_are_never_rewritten() {
+        // W3-09: `map_pure` runs `list(iterable)` before mapping a single
+        // element, so a printing generator ran ahead of the element that
+        // raises and an infinite iterator hung. Only a display, a builtin
+        // `range(...)` or a container-annotated name qualifies.
+        for src in [
+            "ys = [f(x) for x in fetch()]\n",
+            "ys = [f(x) for x in xs]\n",
+            "def run(it: Iterator[int]) -> list[int]:\n    return [f(x) for x in it]\n",
+            "def run(o: Obj) -> list[int]:\n    return [f(x) for x in o.items]\n",
+            "ys = {x: f(x) for x in fetch()}\n",
+            "ys = {f(x) for x in (y for y in zs)}\n",
+        ] {
+            let mut m = parse(src);
+            let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 64);
+            assert_eq!(stats.rewrites, 0, "{src}");
+        }
+        for src in [
+            "ys = [f(x) for x in range(100)]\n",
+            "def run(xs: tuple[int, ...]) -> list[int]:\n    return [f(x) for x in xs]\n",
+        ] {
+            let mut m = parse(src);
+            let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 64);
+            assert_eq!(stats.rewrites, 1, "{src}");
+        }
+    }
+
+    #[test]
+    fn a_name_shadowing_a_pure_function_is_not_pure() {
+        // W3-09: `def apply(double: Callable…)` — `double` is the parameter,
+        // not the module's pure `double`.
+        for src in [
+            "def apply(double: Callable[[int], int], xs: list[int]) -> list[int]:\n    return [double(x) for x in xs]\n",
+            "def apply(xs: list[int]) -> list[int]:\n    double = make()\n    return [double(x) for x in xs]\n",
+            "def apply(fs: list[int], ys: list[int]) -> list[list[int]]:\n    return [[double(y) for y in ys] for double in fs]\n",
+            "def apply(double: list[int]) -> list[int]:\n    return [double(double) for double in double]\n",
+        ] {
+            let mut m = parse(src);
+            let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["double"]), 0);
+            assert_eq!(stats.rewrites, 0, "{src}");
+        }
+        let ok = "def apply(xs: list[int]) -> list[int]:\n    return [double(x) for x in xs]\n";
+        let mut m = parse(ok);
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["double"]), 0);
+        assert_eq!(stats.rewrites, 1);
     }
 
     // ── set comprehensions ─────────────────────────────────────────────────
 
     #[test]
     fn rewrites_pure_setcomp_uses_set_literal_to_avoid_shadowing() {
-        let src = "ys = {f(x) for x in xs}\n";
+        let src = "xs: list[int] = []\nys = {f(x) for x in xs}\n";
         let mut m = parse(src);
         let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
         assert_eq!(stats.rewrites, 1, "set comprehension should rewrite");
@@ -1406,7 +1548,7 @@ def run(xs: list[int]) -> list[int]:
 
     #[test]
     fn rewrites_filtered_setcomp_with_pure_filter() {
-        let src = "ys = {f(x) for x in xs if x > 0}\n";
+        let src = "xs: list[int] = []\nys = {f(x) for x in xs if x > 0}\n";
         let mut m = parse(src);
         let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
         assert_eq!(
@@ -1420,7 +1562,7 @@ def run(xs: list[int]) -> list[int]:
 
     #[test]
     fn leaves_impure_setcomp_alone() {
-        let src = "ys = {g(x) for x in xs}\n";
+        let src = "xs: list[int] = []\nys = {g(x) for x in xs}\n";
         let mut m = parse(src);
         let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
         assert_eq!(stats.rewrites, 0);
@@ -1431,7 +1573,7 @@ def run(xs: list[int]) -> list[int]:
     #[test]
     fn rewrites_pure_dictcomp_value_pure() {
         // Pattern: {simple_key: f(x) for x in xs}
-        let src = "ys = {x: f(x) for x in xs}\n";
+        let src = "xs: list[int] = []\nys = {x: f(x) for x in xs}\n";
         let mut m = parse(src);
         let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
         assert_eq!(stats.rewrites, 1, "dict comprehension should rewrite");
@@ -1454,7 +1596,7 @@ def run(xs: list[int]) -> list[int]:
     #[test]
     fn rewrites_pure_dictcomp_key_pure() {
         // Pattern: {f(x): simple_value for x in xs}
-        let src = "ys = {f(x): x for x in xs}\n";
+        let src = "xs: list[int] = []\nys = {f(x): x for x in xs}\n";
         let mut m = parse(src);
         let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
         assert_eq!(stats.rewrites, 1, "dict comprehension should rewrite");
@@ -1472,7 +1614,7 @@ def run(xs: list[int]) -> list[int]:
     #[test]
     fn rewrites_pure_dictcomp_literal_key() {
         // Pattern: {literal: f(x) for x in xs}
-        let src = "ys = {'key': f(x) for x in xs}\n";
+        let src = "xs: list[int] = []\nys = {'key': f(x) for x in xs}\n";
         let mut m = parse(src);
         let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
         assert_eq!(
@@ -1484,7 +1626,7 @@ def run(xs: list[int]) -> list[int]:
     #[test]
     fn leaves_both_pure_dictcomp_alone() {
         // Neither key nor value is simple — cannot rewrite
-        let src = "ys = {f(x): g(x) for x in xs}\n";
+        let src = "xs: list[int] = []\nys = {f(x): g(x) for x in xs}\n";
         let mut m = parse(src);
         let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f", "g"]), 0);
         assert_eq!(
@@ -1496,7 +1638,7 @@ def run(xs: list[int]) -> list[int]:
     #[test]
     fn leaves_both_simple_dictcomp_alone() {
         // Both key and value are simple — no pure call
-        let src = "ys = {x: x for x in xs}\n";
+        let src = "xs: list[int] = []\nys = {x: x for x in xs}\n";
         let mut m = parse(src);
         let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
         assert_eq!(stats.rewrites, 0, "no pure call present");
@@ -1504,7 +1646,7 @@ def run(xs: list[int]) -> list[int]:
 
     #[test]
     fn rewrites_filtered_dictcomp_with_pure_filter() {
-        let src = "ys = {x: f(x) for x in xs if x > 0}\n";
+        let src = "xs: list[int] = []\nys = {x: f(x) for x in xs if x > 0}\n";
         let mut m = parse(src);
         let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
         assert_eq!(
@@ -1521,7 +1663,7 @@ def run(xs: list[int]) -> list[int]:
 
     #[test]
     fn leaves_nested_dictcomp_alone() {
-        let src = "ys = {x: f(x) for row in rows for x in row}\n";
+        let src = "xs: list[int] = []\nys = {x: f(x) for row in rows for x in row}\n";
         let mut m = parse(src);
         let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
         assert_eq!(stats.rewrites, 0, "nested generators must veto the rewrite");
@@ -1529,7 +1671,7 @@ def run(xs: list[int]) -> list[int]:
 
     #[test]
     fn leaves_impure_dictcomp_alone() {
-        let src = "ys = {x: g(x) for x in xs}\n";
+        let src = "xs: list[int] = []\nys = {x: g(x) for x in xs}\n";
         let mut m = parse(src);
         let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
         assert_eq!(stats.rewrites, 0, "impure callee must veto the rewrite");
@@ -1537,7 +1679,7 @@ def run(xs: list[int]) -> list[int]:
 
     #[test]
     fn dictcomp_min_size_threshold_suppresses_short_literal_iters() {
-        let src = "ys = {x: f(x) for x in [1, 2, 3]}\n";
+        let src = "xs: list[int] = []\nys = {x: f(x) for x in [1, 2, 3]}\n";
         let mut m = parse(src);
         let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 64);
         assert_eq!(
@@ -1565,6 +1707,7 @@ def run(xs: list[int]) -> list[int]:
         // The detector must flag exactly the eligible comprehensions and no
         // more — here a pure list comp is flagged, the impure one is not.
         let src = "\
+xs: list[int] = []
 a = [f(x) for x in xs]
 b = [g(x) for x in xs]
 ";
