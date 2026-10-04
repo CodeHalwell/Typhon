@@ -6089,11 +6089,11 @@ impl Interpreter {
                 }
                 let result = a.powf(*b);
                 // A finite power that overflows is `OverflowError: (34,
-                // 'Result too large')` in CPython (errno ERANGE).
+                // '<strerror(ERANGE)>')` in CPython (errno ERANGE).
                 if result.is_infinite() && a.is_finite() && b.is_finite() {
                     return Err(Unwind::Exception(VmException::new(
                         "OverflowError",
-                        "(34, 'Result too large')",
+                        format!("(34, '{}')", erange_message()),
                     )));
                 }
                 return Ok(Value::Float(result));
@@ -13280,6 +13280,20 @@ pub(crate) fn class_is_protocol_pub(cls: &Rc<crate::value::Class>) -> bool {
 
 fn class_is_protocol(cls: &Rc<crate::value::Class>) -> bool {
     cls.is_protocol || cls.name == "Protocol" || cls.bases.iter().any(class_is_protocol)
+}
+
+/// The C library's message for errno ERANGE, which CPython puts in a float
+/// `OverflowError`: "Result too large" on macOS and Windows, "Numerical
+/// result out of range" under glibc.
+fn erange_message() -> String {
+    #[cfg(unix)]
+    {
+        let full = std::io::Error::from_raw_os_error(libc::ERANGE).to_string();
+        if let Some(msg) = full.strip_suffix(&format!(" (os error {})", libc::ERANGE)) {
+            return msg.to_owned();
+        }
+    }
+    "Result too large".to_owned()
 }
 
 #[cfg(test)]
