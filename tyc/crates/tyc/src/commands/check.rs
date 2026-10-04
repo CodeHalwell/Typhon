@@ -1113,6 +1113,7 @@ fn run_secondary_passes(
     // correctly in check the same way they do in build (FINDINGS #48).
     let (_, comptime_diags) = evaluate_comptime_in_source(
         &module,
+        path,
         &prep.python_source,
         &prep.comptime_bindings,
         &prep.comptime_functions,

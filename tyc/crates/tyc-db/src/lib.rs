@@ -774,6 +774,7 @@ fn check_pipeline(
     // same substitution `tyc build` and `tyc run` apply.
     let (comptime_values, _comptime_diags) = tyc_analyse::evaluate_comptime_in_source(
         &module,
+        &path,
         &prep.python_source,
         &prep.comptime_bindings,
         &prep.comptime_functions,

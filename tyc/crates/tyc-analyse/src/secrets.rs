@@ -914,6 +914,7 @@ mod tests {
             .into_syntax();
         let (values, diags) = crate::evaluate_comptime_in_source(
             &module,
+            "t.ty",
             &prep.python_source,
             &prep.comptime_bindings,
             &prep.comptime_functions,

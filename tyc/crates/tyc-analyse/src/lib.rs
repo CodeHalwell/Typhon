@@ -51,6 +51,7 @@
 use std::collections::{HashMap, HashSet};
 
 use ruff_python_ast::{Decorator, Expr, ExprCall, ModModule, Number, Parameters, Stmt};
+use ruff_text_size::{Ranged, TextRange};
 use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_syntax::preprocess::ComptimeBinding;
 
@@ -518,21 +519,84 @@ pub fn evaluate_comptime_with_functions(
 /// (`"\ud800"`) parses to U+FFFD, so inlining the parsed value would change
 /// the string CPython builds; with the source the binding is rejected
 /// instead.
+///
+/// Every diagnostic is anchored in `source` under `path`: at the innermost
+/// failing sub-expression of the initialiser, or at the binding itself when
+/// it has no usable initialiser. `source` is the text `module` was parsed
+/// from, so a caller holding a line map relocates the diagnostics onto the
+/// `.ty` text with [`Diagnostics::remap_lines`].
 pub fn evaluate_comptime_in_source(
     module: &ModModule,
+    path: &str,
     source: &str,
     bindings: &[ComptimeBinding],
     comptime_function_names: &[String],
 ) -> (HashMap<String, ComptimeValue>, Diagnostics) {
-    evaluate_comptime_inner(module, Some(source), bindings, comptime_function_names)
+    evaluate_comptime_inner(
+        module,
+        Some((path, source)),
+        bindings,
+        comptime_function_names,
+    )
+}
+
+/// A comptime diagnostic for `name`, anchored at `range` when the caller
+/// supplied a source (otherwise the unanchored legacy form, which only the
+/// VM's value-only callers produce and never render).
+fn comptime_error(
+    name: &str,
+    message: String,
+    label: &str,
+    anchor: Option<(&str, &str)>,
+    range: Option<TextRange>,
+) -> TycError {
+    match (anchor, range) {
+        (Some((path, source)), Some(range)) => {
+            let start = range.start().to_usize().min(source.len());
+            let len = range.len().to_usize().min(source.len() - start).max(1);
+            TycError::comptime_at(name, message, label, path, source, start, len)
+        }
+        _ => TycError::comptime(name, message),
+    }
+}
+
+/// Range of the statement that declares comptime binding `name`: the
+/// annotated or plain assignment's target, else the start of the binding's
+/// recorded line.
+fn comptime_binding_range(body: &[Stmt], binding: &ComptimeBinding, source: &str) -> TextRange {
+    let target = body.iter().find_map(|stmt| match stmt {
+        Stmt::AnnAssign(a) => match a.target.as_ref() {
+            Expr::Name(n) if n.id.as_str() == binding.name => Some(n.range),
+            _ => None,
+        },
+        Stmt::Assign(a) => a.targets.iter().find_map(|t| match t {
+            Expr::Name(n) if n.id.as_str() == binding.name => Some(n.range),
+            _ => None,
+        }),
+        _ => None,
+    });
+    target.unwrap_or_else(|| {
+        let start = source
+            .split_inclusive('\n')
+            .take(binding.line_index)
+            .map(str::len)
+            .sum::<usize>()
+            .min(source.len());
+        let len = source[start..].find('\n').unwrap_or(source.len() - start);
+        TextRange::at(
+            ruff_text_size::TextSize::try_from(start).unwrap_or_default(),
+            ruff_text_size::TextSize::try_from(len.max(1)).unwrap_or_default(),
+        )
+    })
 }
 
 fn evaluate_comptime_inner(
     module: &ModModule,
-    source: Option<&str>,
+    anchor: Option<(&str, &str)>,
     bindings: &[ComptimeBinding],
     comptime_function_names: &[String],
 ) -> (HashMap<String, ComptimeValue>, Diagnostics) {
+    let source = anchor.map(|(_, source)| source);
     let mut values = HashMap::new();
     let mut diags = Diagnostics::new();
 
@@ -580,7 +644,14 @@ fn evaluate_comptime_inner(
                 } else {
                     format!("comptime binding '{}' has no initialiser", binding.name)
                 };
-                diags.push_error(TycError::comptime(binding.name.clone(), message));
+                let range = source.map(|src| comptime_binding_range(body, binding, src));
+                diags.push_error(comptime_error(
+                    &binding.name,
+                    message,
+                    "comptime binding declared here",
+                    anchor,
+                    range,
+                ));
             }
             Some(expr) => {
                 let mut ctx = EvalContext::new(&functions);
@@ -597,7 +668,14 @@ fn evaluate_comptime_inner(
                         values.insert(binding.name.clone(), v);
                     }
                     Err(e) => {
-                        diags.push_error(TycError::comptime(binding.name.clone(), e));
+                        let range = ctx.error_range.or(Some(expr.range()));
+                        diags.push_error(comptime_error(
+                            &binding.name,
+                            e,
+                            "failed while evaluating this at build time",
+                            anchor,
+                            range,
+                        ));
                     }
                 }
             }
@@ -632,6 +710,12 @@ struct EvalContext<'a> {
     /// The source the module was parsed from, when the caller has it (see
     /// [`evaluate_comptime_in_source`]).
     source: Option<&'a str>,
+    /// Range of the innermost expression of the binding's own initialiser
+    /// (call depth 0) whose evaluation failed — the diagnostic's anchor. A
+    /// failure inside a `comptime def` body anchors at the call in the
+    /// initialiser, which is where the message's `in comptime call to 'f'`
+    /// points.
+    error_range: Option<TextRange>,
 }
 
 impl<'a> EvalContext<'a> {
@@ -643,6 +727,7 @@ impl<'a> EvalContext<'a> {
             string_bytes: 0,
             steps: 0,
             source: None,
+            error_range: None,
         }
     }
 
@@ -741,6 +826,14 @@ fn simple_parameter_names(params: &Parameters) -> Option<Vec<&str>> {
 // ── Expression evaluator ──────────────────────────────────────────────────────
 
 fn eval_expr(expr: &Expr, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue, String> {
+    let result = eval_expr_inner(expr, ctx);
+    if result.is_err() && ctx.depth == 0 && ctx.error_range.is_none() {
+        ctx.error_range = Some(expr.range());
+    }
+    result
+}
+
+fn eval_expr_inner(expr: &Expr, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue, String> {
     ctx.tick()?;
     match expr {
         // Numeric literals.
@@ -2260,10 +2353,47 @@ mod tests {
             .into_syntax();
         evaluate_comptime_in_source(
             &module,
+            "t.ty",
             &prep.python_source,
             &prep.comptime_bindings,
             &prep.comptime_functions,
         )
+    }
+
+    /// The text every error's primary span covers (`None` when unanchored).
+    fn error_snippets(diags: &Diagnostics) -> Vec<Option<String>> {
+        diags
+            .errors()
+            .iter()
+            .map(|e| {
+                let mut e = e.clone();
+                let (src, span) = e.source_and_span_mut()?;
+                let text = src.inner().as_str();
+                Some(text[span.offset()..span.offset() + span.len()].to_owned())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn comptime_diagnostics_carry_their_source_span() {
+        let src = "\
+comptime def boom(n: int) -> int:
+    return n // 0
+
+comptime let A: int = 1 + boom(3)
+comptime let B = 5
+comptime let C: int = 2 + time.time()
+";
+        let (_, diags) = eval(src);
+        assert_eq!(
+            error_snippets(&diags),
+            vec![
+                Some("boom(3)".to_owned()),
+                Some("B".to_owned()),
+                Some("time".to_owned()),
+            ],
+            "{diags:?}"
+        );
     }
 
     fn first_error(diags: &Diagnostics) -> String {
@@ -2383,6 +2513,7 @@ comptime let X: int = fact(20)
             .into_syntax();
         let (values, _) = evaluate_comptime_in_source(
             &module,
+            "t.ty",
             &prep.python_source,
             &prep.comptime_bindings,
             &prep.comptime_functions,

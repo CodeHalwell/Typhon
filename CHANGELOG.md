@@ -279,6 +279,14 @@ grouped by workstream (W1–W7).
   U+001C–U+001F as `str.isspace()` does. A type mismatch on a `comptime let`
   is reported at the binding instead of line 1, column 1, and a deep
   recursion's error names the call once instead of once per frame.
+- **Every `tyc::comptime` error points at its source** (W3-10 follow-up).
+  `tyc check` grouped comptime evaluation failures under "(no location)"
+  and `tyc build` printed them without a snippet; each now carries a `.ty`
+  span — the innermost failing part of the initialiser (`time.time()` in
+  `comptime let NOW: float = time.time()`, or the `boom(3)` call whose
+  `comptime def` body failed), or the binding name when it lacks an
+  annotation or initialiser — relocated through the preprocessor's line
+  map. Message text and exit codes are unchanged.
 - **`tyc::contains_secret_literal` redesigned** (W3-06, warn-level). The
   165-entry keyword cross-product is replaced by a word matcher shared by
   the lint and the `tyc build` scan (`tyc-analyse/src/secrets.rs`): the name

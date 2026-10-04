@@ -836,8 +836,9 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // Evaluate all `comptime` bindings and substitute their literals into
         // the AST before desugaring. `comptime def` functions registered by
         // the preprocessor are dispatchable from the binding RHSs.
-        let (comptime_values, comptime_diags) = evaluate_comptime_in_source(
+        let (comptime_values, mut comptime_diags) = evaluate_comptime_in_source(
             &module,
+            &path.display().to_string(),
             &prep.python_source,
             &prep.comptime_bindings,
             &prep.comptime_functions,
@@ -859,6 +860,9 @@ pub fn run(args: BuildArgs) -> Result<()> {
         }
 
         if comptime_diags.has_errors() {
+            // Anchored in the preprocessed buffer; point them at the `.ty`.
+            let ty_name = path.display().to_string();
+            comptime_diags.remap_lines(&prep.python_source, &preprocessed_to_ty, &ty_name, source);
             for err in comptime_diags.errors() {
                 eprintln!("{:?}", miette::Report::new_boxed(Box::new(err.clone())));
             }
