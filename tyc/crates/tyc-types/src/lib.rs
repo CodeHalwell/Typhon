@@ -41228,7 +41228,9 @@ def main() -> None:
             "def f() -> bool:\n    mut b: bool = True\n    b += 1\n    return b\n",
             "def f(p: float?) -> float:\n    mut t: float = 1.0\n    t += p\n    return t\n",
             "def f() -> int:\n    mut n: int = 2\n    n **= -1\n    return n\n",
-        ] { assert!(!check(src).errors().is_empty(), "accepted: {src}"); }
+        ] {
+            assert!(!check(src).errors().is_empty(), "accepted: {src}");
+        }
         let src="newtype Count = int\ndef f(n: Count) -> Count:\n    return n ** 2\ndef g(exponent: int) -> int | float:\n    return 2 ** exponent\ndef h() -> bool:\n    mut b: bool = True\n    b &= False\n    return b\n";
         assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
         // An exponent of unknown sign keeps the integer type: these run

@@ -172,7 +172,6 @@ stress/round-2026-09-01/types/c9_deep_generic.ty
 stress/round-2026-09-01/types/fp25c_local_chain.ty
 stress/round-2026-09-01/types/fp8_isinstance_sub.ty
 stress/round-2026-09-01/types/fp8b_isinstance_super_union.ty
-stress/round-2026-09-01/types/h101_pow.ty
 stress/round-2026-09-01/types/h112_kwonly.ty
 stress/round-2026-09-01/types/h12_try_handler.ty
 stress/round-2026-09-01/types/h14_guard_exhaustive.ty
