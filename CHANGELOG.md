@@ -198,6 +198,7 @@ grouped by workstream (W1–W7).
 - W2-16: property and `ClassVar` writes are checked, with inherited slot semantics.
 - W2-17: builtin constructors accept their keywords (int methods, enum and builtin-subclass constructors, positional-only parameters, `isinstance` union targets); a nullable `len()` argument reports one diagnostic.
 - W2-18: the class-attribute slot lint fires only on class-level accesses, and the `Result` error wording covers plain returns as well as `?`.
+- A lambda with no expected `Callable` type has its body checked. `let g = lambda: v.upper()` with `v: str?` passed, because only a lambda checked against a `Callable` contract had its body inferred. Its parameters are `Unknown` (and shadow outer names), so only errors that hold for any argument fire: free variables, the calls made on them, literals. A captured name reassigned after the lambda is read at its declared type, as for a contract-checked lambda. Corpus: 0 newly rejected.
 
 #### W3 — cross-module & analysis passes
 

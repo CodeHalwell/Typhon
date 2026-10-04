@@ -20220,6 +20220,40 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
     result
 }
 
+/// Type-check the body of a lambda that has no expected `Callable` type.
+/// Every parameter is bound as `Unknown` in a fresh scope — shadowing any
+/// outer name of the same spelling — so only diagnostics that hold for any
+/// argument values fire: the free variables the body reads, the calls it
+/// makes on them, its literals. Defaults are not inferred here: they are
+/// evaluated where the lambda is written, under the narrowings
+/// `widen_captured_names` has already dropped for the body.
+fn infer_lambda_body_unannotated(c: &mut Checker, lam: &ruff_python_ast::ExprLambda) {
+    c.env.enter();
+    if let Some(params) = lam.parameters.as_deref() {
+        let names = params
+            .posonlyargs
+            .iter()
+            .chain(params.args.iter())
+            .chain(params.kwonlyargs.iter())
+            .map(|pwd| &pwd.parameter)
+            .chain(params.vararg.iter().map(|p| p.as_ref()))
+            .chain(params.kwarg.iter().map(|p| p.as_ref()));
+        for param in names {
+            let name = param.name.as_str();
+            let start = param.name.range.start().to_usize();
+            c.env.declare(TypeBinding {
+                name: name.to_owned(),
+                declared: Type::Unknown,
+                narrowed: Type::Unknown,
+                span: (start, start + name.len()),
+                from_unsafe: c.unsafe_depth > 0,
+            });
+        }
+    }
+    let _ = infer_expr_ctx(c, &lam.body, None);
+    c.env.leave();
+}
+
 /// The structural type of a lambda with no expected `Callable` to check it
 /// against: its *arity* (so a call site expecting `Callable[[int, int], int]`
 /// rejects `lambda x: x` at check time instead of TypeError-ing at runtime)
@@ -20356,6 +20390,12 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             };
             let shape = lambda_structural_type(lam);
             let Some((exp_params, exp_ret)) = expected_fn else {
+                // No contract to check against — but the body is still
+                // code: `lambda: v.upper()` with `v: str?` crashes when it
+                // runs. Check it with every parameter `Unknown` (so only
+                // errors that hold whatever the arguments are fire) and keep
+                // the structural shape as the lambda's type.
+                infer_lambda_body_unannotated(c, lam);
                 return shape;
             };
             let (variadic, min_params) = match &shape {
@@ -41570,6 +41610,34 @@ def main() -> None:
             "{:?}",
             check_full(src).errors()
         );
+    }
+    #[test]
+    fn lambda_body_without_a_callable_contract_is_checked() {
+        for src in [
+            "def find() -> str?:\n    return None\ndef main() -> None:\n    let v: str? = find()\n    let g = lambda: v.upper()\n    print(g)\n",
+            "def find() -> str?:\n    return None\ndef main() -> None:\n    let v: str? = find()\n    print(list(map(lambda x: x + len(v), [1])))\n",
+            "def main() -> None:\n    let n: int = 1\n    let g = lambda: n.upper()\n    print(g)\n",
+            // A captured name reassigned after the lambda loses its narrowing.
+            "def find() -> str?:\n    return None\ndef main() -> None:\n    mut v: str? = find()\n    if v is not None:\n        let g = lambda: v.upper()\n        v = None\n        print(g())\n",
+        ] {
+            assert!(!check(src).errors().is_empty(), "accepted: {src}");
+        }
+    }
+    #[test]
+    fn lambda_body_without_a_contract_keeps_its_parameters_unknown() {
+        for src in [
+            // Parameters are `Unknown` and shadow outer names of the same
+            // spelling.
+            "def find() -> str?:\n    return None\ndef main() -> None:\n    let v: str? = find()\n    let g = lambda v, *a, k=1, **kw: v.upper() + a.whatever + kw.other(k)\n    print(g, v)\n",
+            // A narrowing that still holds when the body runs is kept.
+            "def find() -> str?:\n    return None\ndef main() -> None:\n    let v: str? = find()\n    if v is not None:\n        let g = lambda: v.upper()\n        print(g())\n",
+            "def main() -> None:\n    let xs: list[str] = [\"b\", \"a\"]\n    print(sorted(xs, key=lambda s: s.lower()), (lambda: [y for y in xs])())\n",
+            // Defaults are evaluated where the lambda is written.
+            "def find() -> str?:\n    return None\ndef main() -> None:\n    let v: str? = find()\n    if v is not None:\n        let g = lambda w=v.upper(): w\n        print(g())\n",
+        ] {
+            let d = check(src);
+            assert!(d.errors().is_empty(), "{src}: {:?}", d.errors());
+        }
     }
     fn nullable_helps(d: &Diagnostics) -> Vec<String> {
         d.errors()
