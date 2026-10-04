@@ -225,6 +225,15 @@ grouped by workstream (W1–W7).
   read the wrong receiver. Desugaring temporaries (`__typhon_*`) are never
   offered by hover, definition or completion. Cross-file definitions map back
   through the target file's own table.
+- **The language server survives symlink loops and refuses an escaping
+  `src`** (W4-08). `tyc lsp` lists sources with the CLI's symlink-safe walk
+  (now shared from `tyc-venv`, which also fixes the venv import scan that hung
+  `tyc check` on a `src/a -> .` loop when a dependency was declared) and loads
+  `typhon.toml` with the CLI's validating loader (moved to `tyc-venv` and
+  re-exported as `tyc::config`), so an absolute or `..` `[project] src` is
+  refused instead of walked. `ln -s . src/a; ln -s . src/b` used to stall
+  diagnostics for good. The source listing is cached instead of re-walked on
+  every keystroke.
 
 #### W5 — VM & harness
 

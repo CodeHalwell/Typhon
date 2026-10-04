@@ -83,6 +83,57 @@ type LintOptionsCache =
 type SeverityOverridesCache =
     Arc<Mutex<HashMap<std::path::PathBuf, (Option<u64>, tyc_diagnostics::SeverityOverrides)>>>;
 
+/// One project's source listing (`.dty` stubs, `.ty` sources) from the shared
+/// symlink-safe walk, with the time it was taken.
+#[derive(Debug, Clone)]
+struct SourceWalk {
+    taken: std::time::Instant,
+    dty: Vec<std::path::PathBuf>,
+    ty: Vec<std::path::PathBuf>,
+}
+
+/// How long a cached [`SourceWalk`] serves checks before the tree is walked
+/// again. Watched-file create/delete events and opening a file the listing
+/// does not contain refresh it sooner; the bound covers editors that send
+/// neither.
+const SOURCE_WALK_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Per-source-directory [`SourceWalk`] cache. A plain `std` mutex: it is only
+/// touched from blocking threads, for the length of a lookup or a walk.
+type SourceWalkCache = Arc<std::sync::Mutex<HashMap<std::path::PathBuf, SourceWalk>>>;
+
+/// The project's sources, from the cache when fresh. `current` is the file
+/// being checked: a listing that lacks it (a file created since the walk) is
+/// refreshed rather than served.
+fn project_sources(
+    cache: &SourceWalkCache,
+    src_dir: &std::path::Path,
+    current: Option<&std::path::Path>,
+) -> SourceWalk {
+    let mut guard = match cache.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if let Some(walk) = guard.get(src_dir) {
+        let fresh = walk.taken.elapsed() < SOURCE_WALK_TTL;
+        let knows_current = current.is_none_or(|c| {
+            !c.starts_with(src_dir)
+                || c.extension().is_none_or(|e| e != "ty")
+                || walk.ty.iter().any(|f| f == c)
+        });
+        if fresh && knows_current {
+            return walk.clone();
+        }
+    }
+    let walk = SourceWalk {
+        taken: std::time::Instant::now(),
+        dty: collect_files_with_ext(src_dir, "dty"),
+        ty: collect_files_with_ext(src_dir, "ty"),
+    };
+    guard.insert(src_dir.to_path_buf(), walk.clone());
+    walk
+}
+
 /// The Typhon LSP backend. Holds a single shared salsa database and the
 /// `Client` handle used to send notifications back to the editor.
 ///
@@ -193,6 +244,9 @@ pub struct Backend {
     severity_overrides_cache: SeverityOverridesCache,
     /// Declared workspace root URI from the client (`InitializeParams`).
     workspace_root: Arc<Mutex<Option<Uri>>>,
+    /// Cached per-project source listings (W4-08): the walk used to run on
+    /// every keystroke.
+    source_walks: SourceWalkCache,
 }
 
 impl std::fmt::Debug for Backend {
@@ -202,6 +256,26 @@ impl std::fmt::Debug for Backend {
 }
 
 impl Backend {
+    /// A backend with empty caches, talking to `client`.
+    fn new(client: Client, log_level: LogLevel) -> Self {
+        Backend {
+            client,
+            db: Arc::new(Mutex::new(TycDatabase::new())),
+            log_level,
+            documents: Arc::new(Mutex::new(HashMap::new())),
+            resolved_cache: Arc::new(Mutex::new(HashMap::new())),
+            introspection: Arc::new(Mutex::new(HashMap::new())),
+            signature_caches: Arc::new(Mutex::new(HashMap::new())),
+            project_indexes: Arc::new(Mutex::new(HashMap::new())),
+            project_files: Arc::new(Mutex::new(HashMap::new())),
+            prewarmed_versions: Arc::new(Mutex::new(HashMap::new())),
+            lint_options_cache: Arc::new(Mutex::new(HashMap::new())),
+            severity_overrides_cache: Arc::new(Mutex::new(HashMap::new())),
+            workspace_root: Arc::new(Mutex::new(None)),
+            source_walks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
     /// Convert an internal path to a client-facing URI.
     ///
     /// Keeps canonical paths internal for identity and equality. When returning
@@ -381,6 +455,8 @@ impl Backend {
             uri_to_path(&uri).unwrap_or_else(|| std::path::PathBuf::from(uri.path().as_str()));
         let workspace = find_workspace_layout(&path_for_root);
         let project_files_arc = Arc::clone(&self.project_files);
+        let source_walks_arc = Arc::clone(&self.source_walks);
+        let current_path = path_lookup_key(&path_for_root);
 
         // Per-project venv signature caches, for folding third-party shapes
         // into the check so wrong-typed / wrong-arity third-party calls show
@@ -418,11 +494,19 @@ impl Backend {
                     .and_then(|n| n.to_str())
                     .unwrap_or("src")
                     .to_owned();
+                // The project's source listing, from the shared symlink-safe
+                // walk and cached across keystrokes (W4-08).
+                let sources = project_sources(
+                    &source_walks_arc,
+                    &path_lookup_key(src_dir),
+                    Some(&current_path),
+                );
                 #[allow(clippy::explicit_auto_deref)]
                 let mut shapes = build_project_shapes_salsa(
                     &mut *db,
                     &project_files_arc,
                     src_dir,
+                    &sources,
                     &src_root_name,
                     &uri_str_for_check,
                     &text_for_check,
@@ -465,11 +549,7 @@ impl Backend {
                         if let Ok(mut vs) = sig_cache.lock() {
                             let project_module_set: std::collections::HashSet<String> =
                                 shapes.keys().cloned().collect();
-                            let _ = vs.enrich_into(
-                                std::slice::from_ref(src_dir),
-                                &project_module_set,
-                                &mut shapes,
-                            );
+                            let _ = vs.enrich_into(&sources.ty, &project_module_set, &mut shapes);
                         };
                     }
                 }
@@ -853,6 +933,12 @@ impl LanguageServer for Backend {
             return;
         }
         self.resolved_cache.lock().await.clear();
+        // A source was created, deleted or changed: the next check walks the
+        // tree again rather than serving the cached listing.
+        match self.source_walks.lock() {
+            Ok(mut g) => g.clear(),
+            Err(p) => p.into_inner().clear(),
+        }
         self.refresh_open_documents().await;
     }
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -1948,10 +2034,12 @@ fn from_hex(b: u8) -> Option<u8> {
 /// `.dty` stubs are registered first; the second pass over `.ty`
 /// files skips dotted names already in the map so authored stubs
 /// remain the authoritative surface for any module.
+#[allow(clippy::too_many_arguments)]
 fn build_project_shapes_salsa(
     db: &mut TycDatabase,
     project_files: &Arc<Mutex<HashMap<std::path::PathBuf, HashMap<String, SourceFile>>>>,
     src_dir: &std::path::Path,
+    sources: &SourceWalk,
     src_root_name: &str,
     current_uri: &str,
     current_text: &str,
@@ -1970,9 +2058,7 @@ fn build_project_shapes_salsa(
 
     // `.dty` stubs first, so `.ty` insertions skip them on
     // collisions — authored stubs are the source of truth.
-    let dty_files = collect_files_with_ext(src_dir, "dty");
-    let ty_files = collect_files_with_ext(src_dir, "ty");
-    for file in dty_files.iter().chain(ty_files.iter()) {
+    for file in sources.dty.iter().chain(sources.ty.iter()) {
         let dotted = path_to_dotted(file, src_root_name);
         if shapes.contains_key(&dotted) {
             continue;
@@ -2056,37 +2142,16 @@ fn upsert_source_file(
     }
 }
 
-/// Recursive file collection that mirrors the CLI's
-/// `collect_with_ext` — copied here so this crate stays free of a
-/// reverse dependency on the CLI binary crate.
+/// Every `.{ext}` file under `root`, sorted, through the shared symlink-safe
+/// walk the CLI uses (`tyc_venv::walk`): it terminates on symlink cycles and
+/// skips links that leave the tree. The copy this replaced had no loop guard,
+/// so `ln -s . src/a; ln -s . src/b` stalled the server for good (W4-08).
 fn collect_files_with_ext(root: &std::path::Path, ext: &str) -> Vec<std::path::PathBuf> {
-    let mut acc = Vec::new();
-    collect_files_inner(root, ext, &mut acc);
+    let mut acc = tyc_venv::walk::Walk::lenient(ext)
+        .collect_quiet(root)
+        .unwrap_or_default();
     acc.sort();
     acc
-}
-
-fn collect_files_inner(root: &std::path::Path, ext: &str, acc: &mut Vec<std::path::PathBuf>) {
-    if root.is_file() {
-        if root.extension().and_then(|e| e.to_str()) == Some(ext) {
-            acc.push(root.to_path_buf());
-        }
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with('.') || name == "__pycache__" {
-                    continue;
-                }
-            }
-        }
-        collect_files_inner(&path, ext, acc);
-    }
 }
 
 /// Map a file path to its dotted Python module name. Identical
@@ -2132,40 +2197,65 @@ fn uri_matches_path(uri: &str, path: &std::path::Path) -> bool {
     }
 }
 
-/// Walk up from `file_path` looking for a `typhon.toml`.  Returns
-/// `(project_root, src_dir)` — `src_dir` defaults to `project_root/src`
-/// when the toml does not specify, matching `tyc init`'s scaffolding.
-fn find_workspace_layout(
-    file_path: &std::path::Path,
-) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-    let mut dir = file_path.parent()?.to_path_buf();
+/// The project a document belongs to, per the nearest `typhon.toml`.
+#[derive(Debug)]
+enum WorkspaceLookup {
+    /// No `typhon.toml` above the file: single-file mode.
+    None,
+    /// A valid project: `(project_root, src_dir)`.
+    Project(std::path::PathBuf, std::path::PathBuf),
+    /// A `typhon.toml` the CLI would refuse: its path and the CLI's error.
+    #[allow(dead_code)] // reported on `typhon.toml` by W4-11
+    Invalid(std::path::PathBuf, tyc_venv::config::ConfigError),
+}
+
+/// Walk up from `file_path` to the nearest `typhon.toml` and load it with the
+/// CLI's validating loader (`tyc_venv::config`), so the server accepts and
+/// rejects exactly what `tyc check` does. In particular an absolute or `..`
+/// `[project] src` is refused instead of walked (W4-08) — `src = "/"` used to
+/// walk the whole filesystem on every keystroke.
+fn lookup_workspace(file_path: &std::path::Path) -> WorkspaceLookup {
+    let Some(parent) = file_path.parent() else {
+        return WorkspaceLookup::None;
+    };
+    let mut dir = parent.to_path_buf();
     loop {
         let candidate = dir.join("typhon.toml");
         if candidate.exists() {
-            let src = parse_src_dir(&candidate).unwrap_or_else(|| "src".to_owned());
-            let src_dir = dir.join(src);
-            return Some((dir, src_dir));
+            return match tyc_venv::config::TyphonConfig::load_file(&candidate) {
+                Ok(config) => {
+                    let src_dir = dir.join(&config.project.src);
+                    WorkspaceLookup::Project(dir, src_dir)
+                }
+                Err(e) => WorkspaceLookup::Invalid(candidate, e),
+            };
         }
         if !dir.pop() {
-            return None;
+            return WorkspaceLookup::None;
         }
     }
 }
 
-/// Pull out the `[project] src` field from `typhon.toml`.
-///
-/// Uses the `toml` crate so inline-table values, end-of-line comments,
-/// nested tables, and the array-of-tables syntax are handled correctly
-/// (the previous line-by-line scanner choked on any of those).  Returns
-/// `None` when the file is unreadable, malformed, or doesn't carry a
-/// `[project] src = "…"` entry — callers fall through to the default
-/// `"src"` directory in that case.
+/// `(project_root, src_dir)` for `file_path`'s project — `src_dir` defaults to
+/// `project_root/src`, matching `tyc init`. `None` outside a project and for a
+/// project whose `typhon.toml` is invalid (the server then checks the file on
+/// its own and reports the config error on `typhon.toml`).
+fn find_workspace_layout(
+    file_path: &std::path::Path,
+) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    match lookup_workspace(file_path) {
+        WorkspaceLookup::Project(root, src) => Some((root, src)),
+        _ => None,
+    }
+}
+
+/// `[project] src` from a valid `typhon.toml` (the CLI's loader; `None` when
+/// the file is unreadable or invalid).
+#[cfg(test)]
 fn parse_src_dir(toml_path: &std::path::Path) -> Option<String> {
-    let text = std::fs::read_to_string(toml_path).ok()?;
-    let parsed: toml::Value = toml::from_str(&text).ok()?;
-    let project = parsed.get("project")?.as_table()?;
-    let src = project.get("src")?.as_str()?;
-    Some(src.to_owned())
+    tyc_venv::config::TyphonConfig::load_file(toml_path)
+        .ok()
+        .map(|c| c.project.src)
 }
 
 /// Read the `[strictness]` knobs that gate the editor advisory lints
@@ -2782,21 +2872,7 @@ pub fn run_stdio(log_level: LogLevel) {
     runtime.block_on(async {
         let stdin = tokio::io::stdin();
         let stdout = tokio::io::stdout();
-        let (service, socket) = LspService::new(move |client| Backend {
-            client,
-            db: Arc::new(Mutex::new(TycDatabase::new())),
-            log_level,
-            documents: Arc::new(Mutex::new(HashMap::new())),
-            resolved_cache: Arc::new(Mutex::new(HashMap::new())),
-            introspection: Arc::new(Mutex::new(HashMap::new())),
-            signature_caches: Arc::new(Mutex::new(HashMap::new())),
-            project_indexes: Arc::new(Mutex::new(HashMap::new())),
-            project_files: Arc::new(Mutex::new(HashMap::new())),
-            prewarmed_versions: Arc::new(Mutex::new(HashMap::new())),
-            lint_options_cache: Arc::new(Mutex::new(HashMap::new())),
-            severity_overrides_cache: Arc::new(Mutex::new(HashMap::new())),
-            workspace_root: Arc::new(Mutex::new(None)),
-        });
+        let (service, socket) = LspService::new(move |client| Backend::new(client, log_level));
         Server::new(stdin, stdout, socket).serve(service).await;
     });
 }
@@ -4288,6 +4364,16 @@ fn byte_to_position(source: &str, target: usize) -> Position {
 mod tests {
     use super::*;
 
+    /// A fresh [`SourceWalk`] of `src`, for tests that build the registry
+    /// directly.
+    fn walk_of(src: &std::path::Path) -> SourceWalk {
+        SourceWalk {
+            taken: std::time::Instant::now(),
+            dty: collect_files_with_ext(src, "dty"),
+            ty: collect_files_with_ext(src, "ty"),
+        }
+    }
+
     #[test]
     fn advisory_severity_maps_advice_to_hint() {
         // `gather_opportunity` is declared `severity(Advice)` → faint HINT.
@@ -4465,21 +4551,7 @@ mod tests {
     /// Spin up the real server over an in-memory pipe; return the client-side
     /// (writer, reader) duplex halves.
     fn spawn_backend() -> (DuplexStream, DuplexStream) {
-        let (service, socket) = LspService::new(|client| Backend {
-            client,
-            db: Arc::new(Mutex::new(TycDatabase::new())),
-            log_level: LogLevel::Error,
-            documents: Arc::new(Mutex::new(HashMap::new())),
-            resolved_cache: Arc::new(Mutex::new(HashMap::new())),
-            introspection: Arc::new(Mutex::new(HashMap::new())),
-            signature_caches: Arc::new(Mutex::new(HashMap::new())),
-            project_indexes: Arc::new(Mutex::new(HashMap::new())),
-            project_files: Arc::new(Mutex::new(HashMap::new())),
-            prewarmed_versions: Arc::new(Mutex::new(HashMap::new())),
-            lint_options_cache: Arc::new(Mutex::new(HashMap::new())),
-            severity_overrides_cache: Arc::new(Mutex::new(HashMap::new())),
-            workspace_root: Arc::new(Mutex::new(None)),
-        });
+        let (service, socket) = LspService::new(|client| Backend::new(client, LogLevel::Error));
         let (to_server, server_in) = tokio::io::duplex(64 * 1024);
         let (server_out, from_server) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
@@ -6051,6 +6123,83 @@ mod tests {
         );
     }
 
+    /// W4-08: a symlink loop in the source tree must not hang the server.
+    /// `ln -s . src/a; ln -s . src/b` made the old walk enumerate an
+    /// exponential number of paths, so no diagnostics ever arrived.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn symlink_loop_in_src_does_not_hang() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname=\"x\"\nsrc=\"src\"\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("util.ty"), "def f() -> int:\n    return 1\n").unwrap();
+        let main_src = "from util import f\nlet s: str = f()\n";
+        std::fs::write(src.join("main.ty"), main_src).unwrap();
+        std::os::unix::fs::symlink(".", src.join("a")).unwrap();
+        std::os::unix::fs::symlink(".", src.join("b")).unwrap();
+
+        let uri = format!("file://{}", src.join("main.ty").display());
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, None).await;
+        did_open(&mut to, &uri, main_src).await;
+        let diags = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            next_diagnostics(&mut from, &uri),
+        )
+        .await
+        .expect("a symlink loop must not stall diagnostics");
+        // The project is still checked across modules (once per file).
+        assert!(
+            diags.iter().any(|d| d["code"]
+                .as_str()
+                .is_some_and(|c| c.contains("type_mismatch"))),
+            "cross-module check expected: {diags:?}"
+        );
+    }
+
+    /// W4-08: `[project] src` outside the project is rejected, as the CLI
+    /// rejects it — the server must not read (or walk) that directory.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn src_outside_the_project_is_not_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("proj");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("util.ty"), "def f() -> int:\n    return 1\n").unwrap();
+        for src_value in [outside.display().to_string(), "../outside".to_owned()] {
+            std::fs::write(
+                project.join("typhon.toml"),
+                format!("[project]\nname=\"x\"\nsrc=\"{src_value}\"\n"),
+            )
+            .unwrap();
+            let main_src = "from util import f\nlet s: str = f()\n";
+            let main = project.join("main.ty");
+            std::fs::write(&main, main_src).unwrap();
+            let uri = format!("file://{}", main.display());
+            let (mut to, mut from) = spawn_backend();
+            handshake(&mut to, &mut from, None).await;
+            did_open(&mut to, &uri, main_src).await;
+            let diags = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                next_diagnostics(&mut from, &uri),
+            )
+            .await
+            .expect("diagnostics");
+            assert!(
+                !diags.iter().any(|d| d["code"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("type_mismatch"))),
+                "src = {src_value:?} must not be read: {diags:?}"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn goto_definition_in_symlinked_workspace_root() {
@@ -7106,6 +7255,7 @@ def f() -> None:
             &mut db,
             &project_files,
             &src,
+            &walk_of(&src),
             "src",
             "",
             "",
@@ -7128,8 +7278,16 @@ def f() -> None:
         let mut open_docs = HashMap::new();
         open_docs.insert(path_lookup_key(&thing_path), doc);
 
-        let shapes =
-            build_project_shapes_salsa(&mut db, &project_files, &src, "src", "", "", &open_docs);
+        let shapes = build_project_shapes_salsa(
+            &mut db,
+            &project_files,
+            &src,
+            &walk_of(&src),
+            "src",
+            "",
+            "",
+            &open_docs,
+        );
         let live = &shapes["thing"].class_shapes["Thing"];
         assert!(
             live.fields.contains_key("b"),
@@ -7153,6 +7311,7 @@ def f() -> None:
             &mut db,
             &project_files,
             &src,
+            &walk_of(&src),
             "src",
             "",
             "",
@@ -7173,6 +7332,7 @@ def f() -> None:
             &mut db,
             &project_files,
             &src,
+            &walk_of(&src),
             "src",
             "",
             "",
@@ -7195,6 +7355,7 @@ def f() -> None:
             &mut db,
             &project_files,
             &src,
+            &walk_of(&src),
             "src",
             "",
             "",

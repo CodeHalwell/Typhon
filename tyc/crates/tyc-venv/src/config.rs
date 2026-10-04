@@ -1,4 +1,10 @@
 //! `typhon.toml` configuration file parsing.
+//!
+//! Lives in `tyc-venv`, the crate the CLI and the language server already
+//! share, so `tyc lsp` loads and validates a project exactly as `tyc check`
+//! does (W4-08, W4-11): the same unknown-key rejection, the same `[project]
+//! src` confinement, the same error text. The `tyc` binary re-exports it as
+//! `crate::config`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -182,7 +188,7 @@ pub struct StrictnessConfig {
     /// Severity for `tyc::method_in_class_body` (Rule 4: methods live in
     /// `impl Name:`, not in the class body). `"warn"` (default) is the
     /// shipped behaviour and matches every other "nudge" diagnostic.
-    /// `"error"` promotes it through [`crate::commands::util::apply_strictness`]
+    /// `"error"` promotes it through the CLI's `apply_strictness`
     /// so CI breaks on the form. `"off"` suppresses the diagnostic
     /// entirely — useful for codebases still mid-migration.
     pub methods_in_class_body: String,
@@ -411,18 +417,7 @@ impl TyphonConfig {
         loop {
             let candidate = dir.join("typhon.toml");
             if candidate.exists() {
-                let text = std::fs::read_to_string(&candidate).map_err(|e| {
-                    crate::config::ConfigError::Io {
-                        path: candidate.to_string_lossy().into_owned(),
-                        cause: e.to_string(),
-                    }
-                })?;
-                let config: Self =
-                    toml::from_str(&text).map_err(|e| crate::config::ConfigError::Parse {
-                        path: candidate.to_string_lossy().into_owned(),
-                        cause: e.to_string(),
-                    })?;
-                config.validate(&candidate)?;
+                let config = Self::load_file(&candidate)?;
                 return Ok(Some((candidate, config)));
             }
             if !dir.pop() {
@@ -430,6 +425,27 @@ impl TyphonConfig {
             }
         }
         Ok(None)
+    }
+
+    /// Read, parse and [`validate`](Self::validate) the `typhon.toml` at
+    /// `path` (no ancestor search). The language server loads a project
+    /// through this so it accepts and rejects exactly what the CLI does.
+    pub fn load_file(path: &Path) -> Result<Self, crate::config::ConfigError> {
+        let text = std::fs::read_to_string(path).map_err(|e| crate::config::ConfigError::Io {
+            path: path.to_string_lossy().into_owned(),
+            cause: e.to_string(),
+        })?;
+        Self::parse_str(&text, path)
+    }
+
+    /// Parse and validate `typhon.toml` text; `path` names it in errors.
+    pub fn parse_str(text: &str, path: &Path) -> Result<Self, crate::config::ConfigError> {
+        let config: Self = toml::from_str(text).map_err(|e| crate::config::ConfigError::Parse {
+            path: path.to_string_lossy().into_owned(),
+            cause: e.to_string(),
+        })?;
+        config.validate(path)?;
+        Ok(config)
     }
 
     /// Serialize this config back to TOML.
@@ -643,7 +659,7 @@ impl TyphonConfig {
 /// rather than the minor-only [`parse_python_minor`] in `build.rs` — is
 /// the correct comparison basis: a hypothetical future `"4.0"` compares
 /// `>= (3, 15)` as a version, whereas its minor `0` would not.
-pub(crate) fn parse_python_target(s: &str) -> Option<(u32, u32)> {
+pub fn parse_python_target(s: &str) -> Option<(u32, u32)> {
     let mut parts = s.split('.');
     let major: u32 = parts.next()?.parse().ok()?;
     let minor_raw = parts.next()?;

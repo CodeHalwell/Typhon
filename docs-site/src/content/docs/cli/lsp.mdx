@@ -61,6 +61,8 @@ For the constructor / method arity checks introduced in v0.2.0, the LSP backend 
 
 `.dty` stubs participate on equal footing with `.ty` source — both flow through the same `ExternalShapes` registry — and stubs win on name collisions. When no `typhon.toml` ancestor is found, the LSP falls back to the per-file salsa-cached check path with no cross-module shape propagation.
 
+The source tree is listed with the same symlink-safe walk `tyc check` uses: a symlink cycle (`src/a -> .`) is visited once, and a link that leaves the source directory is skipped. The listing is cached and refreshed when the editor reports a created or deleted file, when a file missing from the listing is opened, and otherwise every five seconds.
+
 ## Trace logs
 
 To debug LSP traffic, set the trace level in your editor. For VS Code, settings:
@@ -79,7 +81,7 @@ Standard JSON-RPC over stdio. The implementation uses `tower-lsp-server` (the ac
 
 ## Configuration
 
-The LSP picks up project settings from `typhon.toml` automatically (it walks up from the open file). `[strictness]` settings, `[python] target`, and `[emit]` all flow through.
+The LSP picks up project settings from `typhon.toml` automatically (it walks up from the open file). `[strictness]` settings, `[python] target`, and `[emit]` all flow through. The file is loaded with the same validating loader as the CLI, so a `typhon.toml` that `tyc check` refuses — an absolute or `..` `[project] src`, an unknown key, an invalid value — is refused by the server too, which then checks each open file on its own.
 
 ## Common issues
 

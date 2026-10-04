@@ -105,6 +105,8 @@ The remaining daily-loop commands have small flag sets:
 | `tyc lsp` | `--log-level LEVEL` | `error` / `warn` / `info` (default) / `debug` — threshold for status messages forwarded over `window/logMessage`. `--stdio` is accepted as a no-op. |
 | `tyc trace [TRACEBACK]` | `--map-dir DIR` | Extra directory to search for `.py.map` sidecars (`<DIR>/.sourcemaps/<file>.py.map`, then `<DIR>/<file>.py.map`). Without a `TRACEBACK` argument the traceback is read from stdin. |
 
+`tyc lsp` loads `typhon.toml` with the same validating loader as the CLI (an absolute or `..` `[project] src` is refused, not walked) and lists the source tree with the same symlink-safe walk, cached across keystrokes and refreshed on watched-file create/delete events, when a file missing from the listing is opened, or after five seconds.
+
 `tyc check DIR` splits `DIR` at every nested `typhon.toml`: each nested project is checked with its own config and module set, as `tyc check <that project>` would check it, and files outside every nested project are checked together under the config found for `DIR`. A folder of independent apps (`tyc check examples/`) therefore never resolves one app's imports against another app's modules.
 
 The binary has no global flags beyond `--help` / `--version`: no `--quiet`, `--verbose`, `--color`, or `--manifest` (every command discovers `typhon.toml` by walking up from the path it was given).
