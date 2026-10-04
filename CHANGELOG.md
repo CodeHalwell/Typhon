@@ -478,6 +478,15 @@ grouped by workstream (W1–W7).
   class, or the comment above the next method. A comment dedented to the
   class body's level or shallower now ends the method; comments inside it
   still go with it.
+- **`extend BUILTIN:` helpers reach consumers of a source-root facade and of
+  `from .. import name`.** A `pub *` facade at the source root
+  (`src/__init__.ty`) looked its siblings up as `.text` instead of `text`, so
+  the generated `__init__.py` did not re-export their `extend str:` helpers.
+  And `tyc build` resolved `from . import name` / `from .. import name` only
+  as a submodule, never as a name read off the package: a consumer's
+  `describe(s).slug()` stayed a method call, so check and build were clean
+  and CPython raised `AttributeError`. A name that is not a submodule now
+  resolves through the package, and the helper is imported from it.
 - **A refused `pyproject.toml` no longer leaves `tyc add` half-done.**
   `tyc add` / `tyc remove` refused a symlinked or unparseable
   `pyproject.toml` only after rewriting `typhon.toml`, so the command failed
