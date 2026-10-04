@@ -356,7 +356,7 @@ grouped by workstream (W1–W7).
 - **LSP definition URIs rebased onto client workspace root.** `goto_definition` now uses the client's declared workspace root URI (preserving symlink prefixes such as `/var/folders` or `/tmp` rather than macOS `/private/var/...`) or open-document URI, preventing editors from opening duplicate tabs on cross-file jumps.
 - **Build escape test uses stable assertion.** The regression test asserts on the unrendered error message rather than terminal-width-dependent formatting from miette.
 - **Dependencies commands preserve pyproject.toml and reject symlinks.** `tyc sync`, `tyc add`, and `tyc remove` now update `pyproject.toml` via `merge_pyproject` with `atomic_write`, preserving comments, authors, and `[tool.*]` tables while refusing symlinked targets. Edits to `typhon.toml` also enforce atomic writes and reject symlinks.
-- **Migrate overwrite safety, symlink loop protection, and semantic preservation.** `tyc migrate` now uses `util::collect_py_files` to skip `.venv` and `build` directories, avoids symlink loops and escaping symlinks, refuses to overwrite existing `.ty` files without `--force`, and writes atomically. Preserves custom `@dataclass(...)` decorators on plain classes, treats `+=` as reassignment (`mut`), moves method aliases (`__radd__ = __add__`) into `impl` blocks, preserves `from typing import Union` when used at runtime, and protects `Union` arguments inside `isinstance(...)` calls from rewriting.
+- **Migrate overwrite safety, symlink loop protection, and semantic preservation.** `tyc migrate` now skips virtual environments, VCS metadata, caches, `node_modules` and `build` directories, avoids symlink loops and escaping symlinks, refuses to overwrite existing `.ty` files without `--force`, and writes atomically. Preserves custom `@dataclass(...)` decorators on plain classes, treats `+=` as reassignment (`mut`), moves method aliases (`__radd__ = __add__`) into `impl` blocks, preserves `from typing import Union` when used at runtime, and protects `Union` arguments inside `isinstance(...)` calls from rewriting.
 - **Build confinement anchored to config directory and validated upfront.** `tyc build` now confines build outputs to `config_dir` (the directory enclosing `typhon.toml`) rather than the invocation path, fixing builds invoked from subdirectories (`cd proj/src && tyc build` or `tyc build src`). Output confinement is validated before writing anything to disk, preventing `pyproject.toml` mutations or empty directory creation when the output destination escapes the project root.
 - **Open consumers refresh when a dependency changes** (W4-09). When a
   module changes — an edit, an unsaved buffer opened or closed, or a
@@ -465,6 +465,43 @@ grouped by workstream (W1–W7).
 - **Docs: `tyc migrate --force`** is now documented in `docs/cli.md` and on
   the docs site (it overwrites existing `.ty` files; without it the command
   refuses before writing anything).
+- **`tyc migrate DIR` migrates `tests/` again.** The migrate overwrite-safety
+  change above walked the tree with the build's source filter, which skips
+  every `tests/` and hidden directory, so a project's test suite was silently
+  left unmigrated while the command reported success. Migration now has its
+  own filter that keeps every user-authored directory and skips only virtual
+  environments (any directory with a `pyvenv.cfg`), VCS metadata, caches,
+  `node_modules` and `build`.
+- **`tyc migrate` keeps comments after a stripped constructor.** Removing a
+  trivial `__init__` also removed every comment line between it and the next
+  statement, whatever its indent — a column-zero `# keep this` after the
+  class, or the comment above the next method. A comment dedented to the
+  class body's level or shallower now ends the method; comments inside it
+  still go with it.
+- **`extend BUILTIN:` helpers reach consumers of a source-root facade and of
+  `from .. import name`.** A `pub *` facade at the source root
+  (`src/__init__.ty`) looked its siblings up as `.text` instead of `text`, so
+  the generated `__init__.py` did not re-export their `extend str:` helpers.
+  And `tyc build` resolved `from . import name` / `from .. import name` only
+  as a submodule, never as a name read off the package: a consumer's
+  `describe(s).slug()` stayed a method call, so check and build were clean
+  and CPython raised `AttributeError`. A name that is not a submodule now
+  resolves through the package, and the helper is imported from it.
+- **`tyc::reserved_module_name` covers reads through a bare
+  `import typhon_runtime`.** The W4-12 check looked only at `from
+  typhon_runtime import …` and `import typhon_runtime.sub`, so a program that
+  defined `typhon_runtime.ty`, called `typhon_runtime.helper()` after a bare
+  `import typhon_runtime`, and used `Result` built cleanly, then raised
+  `AttributeError` once the generated runtime replaced the module. Attribute
+  reads through a bare import (or `… as alias`) are now checked against the
+  generated runtime; a name the file rebinds elsewhere, an attribute it sets
+  itself, and dunders are not counted, so no program that runs is rejected.
+- **A refused `pyproject.toml` no longer leaves `tyc add` half-done.**
+  `tyc add` / `tyc remove` refused a symlinked or unparseable
+  `pyproject.toml` only after rewriting `typhon.toml`, so the command failed
+  with the dependency already added (or removed). Both files are now rendered
+  first and written together; a refusal changes neither, and a failed
+  `pyproject.toml` write restores `typhon.toml`.
 
 #### W5 — VM & harness
 

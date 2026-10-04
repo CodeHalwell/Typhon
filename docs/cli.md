@@ -188,6 +188,8 @@ tyc migrate src/app.py
 tyc migrate --check src/app.py
 ```
 
+`PATH` is a `.py` file or a directory. A directory is migrated whole, `tests/` included; only directories nobody writes by hand are skipped — virtual environments (any directory holding a `pyvenv.cfg`, plus `.venv`, `.tox`, `.nox`), VCS metadata (`.git`, `.hg`, `.svn`, `.bzr`), caches (`__pycache__`, `.mypy_cache`, `.pytest_cache`, …), `node_modules` and `build`.
+
 `--force` (`-f`) overwrites existing `.ty` files. Without it, `tyc migrate` refuses before writing anything when any target `.ty` already exists, and names it; a `.ty` that is a symlink is never written through, even with `--force`.
 
 `--check` is a preview mode: it prints the migrated source to stdout instead of writing `.ty` files, but it does not compare against the input and always exits 0 on a successful migration. CI users who want a fail-on-diff signal should diff `--check` output against a checked-in `.ty`; a native exit-1-on-changes mode is a deliberate follow-up.
@@ -385,6 +387,8 @@ tyc sync --dry-run
 ```
 
 `tyc add name@git+https://…` (any value containing `://`, or starting with `file:`) records a [PEP 508 direct reference](https://peps.python.org/pep-0508/), rendered as `name @ URL` in `pyproject.toml`. When `pyproject.toml` declares `dynamic = ["version"]`, the merge leaves `version` to the build backend rather than adding a static one, which `uv sync` would reject.
+
+`tyc add` / `tyc remove` update `typhon.toml` and `pyproject.toml` together: when `pyproject.toml` is a symlink or does not parse as TOML, the command fails before writing either file, so a failed `tyc add` never leaves the dependency half-added.
 
 `--no-sync` on `tyc add` / `tyc remove` skips the `uv` install step — useful for batching edits and running `tyc sync` once at the end. `--dev` on either targets `[dev-dependencies]`, and `--dir DIR` (default `.`) selects the project whose `typhon.toml` to edit; `tyc sync` takes the project directory as its positional argument instead.
 

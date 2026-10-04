@@ -367,6 +367,51 @@ fn a_user_typhon_runtime_the_build_never_replaces_still_builds() {
     assert!(!dir.join("build/typhon_runtime").exists());
 }
 
+/// W4-12: a bare `import typhon_runtime` imports cleanly whatever replaces
+/// the project's module, so the import check passed it — and
+/// `typhon_runtime.helper()` raised `AttributeError` once the generated
+/// runtime won. Attribute reads through the bare import are now checked
+/// against the generated runtime; a read it provides still builds.
+#[test]
+fn attribute_reads_through_a_bare_typhon_runtime_import_are_checked() {
+    let program = |read: &str| {
+        format!(
+            "import typhon_runtime\n\ndef parse(s: str) -> Result[int, str]:\n    return Ok(int(s))\n\n\
+             def main() -> None:\n    print({read})\n    print(parse(\"3\"))\n\nmain()\n"
+        )
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(
+        dir,
+        "rt",
+        &[
+            ("typhon_runtime.ty", "def helper() -> int:\n    return 41\n"),
+            ("main.ty", &program("typhon_runtime.helper()")),
+        ],
+    );
+    let build = tyc()
+        .current_dir(dir)
+        .args(["build", "--no-sync"])
+        .output()
+        .unwrap();
+    let t = text(&build);
+    assert!(!build.status.success(), "{t}");
+    assert!(t.contains("tyc::reserved_module_name"), "{t}");
+    assert!(t.contains("`typhon_runtime.helper`"), "{t}");
+    assert!(!dir.join("build/typhon_runtime").exists(), "{t}");
+
+    std::fs::write(dir.join("src/main.ty"), program("typhon_runtime.__name__")).unwrap();
+    let build = tyc()
+        .current_dir(dir)
+        .args(["build", "--no-sync"])
+        .output()
+        .unwrap();
+    let t = text(&build);
+    assert!(build.status.success(), "{t}");
+    assert!(t.contains("tyc::reserved_module_name"), "{t}");
+}
+
 // ── `tyc fmt` symlink write-through (W4-13, fmt half) ───────────────────────
 
 /// W4-13: `tyc fmt src/` where `src` is a symlink leaving the project used to
@@ -508,4 +553,68 @@ fn ineffective_parallel_settings_warn_but_still_build() {
         "{}",
         text(&out)
     );
+}
+
+// ── `tyc migrate` over a project tree ───────────────────────────────────────
+
+/// `tyc migrate DIR` converts the whole tree, tests included. It briefly
+/// used the build's source walk, which skips every `tests/` and hidden
+/// directory, so a project's test suite was silently left unmigrated while
+/// the command reported success. Only directories nobody writes by hand are
+/// skipped: virtual environments, VCS metadata, caches, `node_modules/` and
+/// `build/`.
+#[test]
+fn migrate_converts_tests_and_skips_only_generated_directories() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let write = |rel: &str, body: &str| {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    };
+    write("pkg/mod.py", "def f(x: int) -> int:\n    return x\n");
+    write(
+        "tests/test_mod.py",
+        "def test_f() -> None:\n    assert True\n",
+    );
+    write(
+        "pkg/tests/test_inner.py",
+        "def test_g() -> None:\n    pass\n",
+    );
+    write(".github/scripts/release.py", "x: int = 1\n");
+    for generated in [
+        ".venv/lib/site.py",
+        "env/lib/site.py",
+        ".git/hooks/hook.py",
+        "node_modules/x/gyp.py",
+        "build/lib/mod.py",
+        "__pycache__/mod.py",
+        ".mypy_cache/x.py",
+    ] {
+        write(generated, "x: int = 1\n");
+    }
+    write("env/pyvenv.cfg", "home = /usr/bin\n");
+
+    let out = tyc().arg("migrate").arg(root).output().unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("migrated 4 file(s)"), "{}", text(&out));
+    for kept in [
+        "pkg/mod.ty",
+        "tests/test_mod.ty",
+        "pkg/tests/test_inner.ty",
+        ".github/scripts/release.ty",
+    ] {
+        assert!(root.join(kept).is_file(), "{kept} was not migrated");
+    }
+    for skipped in [
+        ".venv/lib/site.ty",
+        "env/lib/site.ty",
+        ".git/hooks/hook.ty",
+        "node_modules/x/gyp.ty",
+        "build/lib/mod.ty",
+        "__pycache__/mod.ty",
+        ".mypy_cache/x.ty",
+    ] {
+        assert!(!root.join(skipped).exists(), "{skipped} must be skipped");
+    }
 }

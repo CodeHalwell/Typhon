@@ -786,7 +786,14 @@ pub fn run(args: BuildArgs) -> Result<()> {
                     std::collections::HashSet::new();
                 let mut import_pieces = import_pieces;
                 for sib in &constituents {
-                    let Some(shape) = project_shapes.get(&format!("{pkg_dotted}.{sib}")) else {
+                    // A source-root facade (`src/__init__.ty`) has an empty
+                    // dotted name; its siblings are keyed `text`, not `.text`.
+                    let sib_key = if pkg_dotted.is_empty() {
+                        sib.clone()
+                    } else {
+                        format!("{pkg_dotted}.{sib}")
+                    };
+                    let Some(shape) = project_shapes.get(&sib_key) else {
                         continue;
                     };
                     let mut ext_names: Vec<String> = Vec::new();
@@ -1122,7 +1129,10 @@ pub fn run(args: BuildArgs) -> Result<()> {
         let mut cross_module_fns: HashMap<String, String> = HashMap::new();
         let current_dotted = crate::commands::util::path_to_dotted(path, src_root);
         let is_init = path.file_stem().and_then(|s| s.to_str()) == Some("__init__");
-        let imports = scan_module_imports(&module.body, &current_dotted, is_init);
+        let imports = resolve_package_attribute_imports(
+            scan_module_imports(&module.body, &current_dotted, is_init),
+            &project_shapes,
+        );
         for imp in &imports {
             let Some(key) = import_shape_key(imp, &project_shapes) else {
                 continue;
@@ -1764,6 +1774,10 @@ struct ImportSpec {
     /// The local name bound to the module itself by `import M [as N]` or
     /// `from pkg import submodule`.
     module_alias: Option<String>,
+    /// For `from . import name` / `from .. import name`: the anchoring
+    /// package, which `name` is read off when it is not a submodule (see
+    /// [`resolve_package_attribute_imports`]).
+    from_package: Option<String>,
 }
 
 /// Print `warn` as a warning. A diagnostic reported as a warning (a
@@ -1806,6 +1820,7 @@ fn scan_module_imports(
                                 .collect(),
                             module_alias: None,
                             raw,
+                            from_package: None,
                         });
                     }
                     None => {
@@ -1830,6 +1845,7 @@ fn scan_module_imports(
                                 names: Vec::new(),
                                 module_alias: Some(local_name(a)),
                                 raw: name,
+                                from_package: Some(package.clone()),
                             });
                         }
                     }
@@ -1844,6 +1860,7 @@ fn scan_module_imports(
                         spec: name,
                         names: Vec::new(),
                         module_alias: Some(local_name(a)),
+                        from_package: None,
                     });
                 }
             }
@@ -1851,6 +1868,42 @@ fn scan_module_imports(
         }
     }
     out
+}
+
+/// `from . import name` names a submodule first; a name the package has no
+/// submodule for is read off the package itself — typically a `pub *`
+/// facade's re-export — as CPython and the VM resolve it. Re-point such an
+/// import at the package, so the names' declared types and the package's
+/// `extend BUILTIN:` helpers reach the consumer exactly as they do for
+/// `from pkg import name`; the injected helper import names the package
+/// (`from .. import __typhon_ext_str__slug__`), whose facade re-exports it.
+fn resolve_package_attribute_imports(
+    imports: Vec<ImportSpec>,
+    project_shapes: &HashMap<String, tyc_db::ModuleShapes>,
+) -> Vec<ImportSpec> {
+    imports
+        .into_iter()
+        .map(|imp| {
+            let Some(package) = imp.from_package.clone() else {
+                return imp;
+            };
+            if import_shape_key(&imp, project_shapes).is_some()
+                || !project_shapes.contains_key(&package)
+            {
+                return imp;
+            }
+            let level = imp.spec.bytes().take_while(|b| *b == b'.').count();
+            let local = imp.module_alias.unwrap_or_else(|| imp.raw.clone());
+            ImportSpec {
+                raw: package.clone(),
+                resolved: package,
+                spec: ".".repeat(level),
+                names: vec![(imp.raw, local)],
+                module_alias: None,
+                from_package: None,
+            }
+        })
+        .collect()
 }
 
 /// The `project_shapes` key an import statement resolves to: the

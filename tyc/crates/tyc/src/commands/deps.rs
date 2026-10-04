@@ -99,7 +99,9 @@ pub fn run_add(args: AddArgs) -> Result<()> {
         new_pkgs.push(spec.clone());
     }
 
-    edit_typhon_dependencies(&toml_path, args.dev, &upserts, &[], &config)?;
+    let manifest = render_typhon_dependencies(&toml_path, args.dev, &upserts, &[], &config)?;
+    let pyproject = render_merged_pyproject(&project_root, &config)?;
+    write_manifests(&toml_path, manifest, pyproject)?;
     println!(
         "updated {} ({} package{})",
         toml_path.display(),
@@ -107,7 +109,6 @@ pub fn run_add(args: AddArgs) -> Result<()> {
         if new_pkgs.len() == 1 { "" } else { "s" }
     );
 
-    merge_pyproject(&project_root, &config)?;
     if args.no_sync {
         return Ok(());
     }
@@ -139,10 +140,11 @@ pub fn run_remove(args: RemoveArgs) -> Result<()> {
         return Ok(());
     }
 
-    edit_typhon_dependencies(&toml_path, args.dev, &[], &removed_names, &config)?;
+    let manifest = render_typhon_dependencies(&toml_path, args.dev, &[], &removed_names, &config)?;
+    let pyproject = render_merged_pyproject(&project_root, &config)?;
+    write_manifests(&toml_path, manifest, pyproject)?;
     println!("updated {} ({removed} removed)", toml_path.display());
 
-    merge_pyproject(&project_root, &config)?;
     if args.no_sync {
         return Ok(());
     }
@@ -206,6 +208,7 @@ fn load_or_default(dir: &Path) -> Result<(PathBuf, TyphonConfig)> {
 /// written — a manifest people hand-edit is not a round-trippable struct.
 /// `toml_edit` keeps the rest of the document byte-identical and touches only
 /// the dependency table. A missing file still gets a full manifest.
+#[cfg(test)]
 fn edit_typhon_dependencies(
     path: &Path,
     dev: bool,
@@ -213,6 +216,24 @@ fn edit_typhon_dependencies(
     removals: &[String],
     config: &TyphonConfig,
 ) -> Result<()> {
+    match render_typhon_dependencies(path, dev, upserts, removals, config)? {
+        Some(text) => tyc_format::atomic_write(path, text.as_bytes())
+            .map_err(|e| miette!("cannot write {}: {e}", path.display())),
+        None => Ok(()),
+    }
+}
+
+/// The `typhon.toml` text with the dependency edits applied (see
+/// `edit_typhon_dependencies`), or `None` when the edit changes nothing. Every refusal (a symlink, a file
+/// that does not parse, a non-table dependency entry) is raised here, before
+/// anything is written.
+fn render_typhon_dependencies(
+    path: &Path,
+    dev: bool,
+    upserts: &[(String, String)],
+    removals: &[String],
+    config: &TyphonConfig,
+) -> Result<Option<String>> {
     if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(miette!(
             "refusing to update {}: it is a symlink (resolve or remove it first)",
@@ -220,7 +241,10 @@ fn edit_typhon_dependencies(
         ));
     }
     let Ok(existing) = std::fs::read_to_string(path) else {
-        return write_typhon_toml(path, config);
+        let text = config
+            .to_toml_string()
+            .map_err(|e| miette!("cannot serialise typhon.toml: {e}"))?;
+        return Ok(Some(text));
     };
     let mut doc: toml_edit::DocumentMut = existing
         .parse()
@@ -232,7 +256,7 @@ fn edit_typhon_dependencies(
     };
     if !doc.contains_key(table_name) {
         if !removals.is_empty() && upserts.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         doc[table_name] = toml_edit::Item::Table(toml_edit::Table::new());
     }
@@ -249,22 +273,41 @@ fn edit_typhon_dependencies(
     for name in removals {
         table.remove(name);
     }
-    tyc_format::atomic_write(path, doc.to_string().as_bytes())
-        .map_err(|e| miette!("cannot write {}: {e}", path.display()))
+    Ok(Some(doc.to_string()))
 }
 
-fn write_typhon_toml(path: &Path, config: &TyphonConfig) -> Result<()> {
-    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
-        return Err(miette!(
-            "refusing to update {}: it is a symlink (resolve or remove it first)",
-            path.display()
-        ));
+/// Write the edited `typhon.toml` and the merged `pyproject.toml` that
+/// `tyc add` / `tyc remove` rendered. Both were rendered — and every refusal
+/// raised — before this runs, so a symlinked or unparseable `pyproject.toml`
+/// fails the command with neither file touched. A failed `pyproject.toml`
+/// write puts `typhon.toml` back as it was, so a failing command leaves the
+/// project unchanged.
+fn write_manifests(
+    toml_path: &Path,
+    manifest: Option<String>,
+    (pyproject_path, pyproject): (PathBuf, String),
+) -> Result<()> {
+    let original = std::fs::read(toml_path).ok();
+    if let Some(text) = &manifest {
+        tyc_format::atomic_write(toml_path, text.as_bytes())
+            .map_err(|e| miette!("cannot write {}: {e}", toml_path.display()))?;
     }
-    let text = config
-        .to_toml_string()
-        .map_err(|e| miette!("cannot serialise typhon.toml: {e}"))?;
-    tyc_format::atomic_write(path, text.as_bytes())
-        .map_err(|e| miette!("cannot write {}: {e}", path.display()))
+    if let Err(e) = tyc_format::atomic_write(&pyproject_path, pyproject.as_bytes()) {
+        if manifest.is_some() {
+            let restored = match &original {
+                Some(bytes) => tyc_format::atomic_write(toml_path, bytes).is_ok(),
+                None => std::fs::remove_file(toml_path).is_ok(),
+            };
+            if !restored {
+                eprintln!(
+                    "warning: could not restore {} after the failed write below",
+                    toml_path.display()
+                );
+            }
+        }
+        return Err(miette!("cannot write {}: {e}", pyproject_path.display()));
+    }
+    Ok(())
 }
 
 /// Split a CLI dep spec like `requests`, `requests@2.31`, or
@@ -458,6 +501,18 @@ pub fn bootstrap_python_env_with(
 /// existing file is present we fall back to a minimal greenfield render
 /// via [`render_pyproject`].
 fn merge_pyproject(project_root: &Path, config: &TyphonConfig) -> Result<()> {
+    let (path, text) = render_merged_pyproject(project_root, config)?;
+    tyc_format::atomic_write(&path, text.as_bytes())
+        .map_err(|e| miette!("cannot write {}: {e}", path.display()))
+}
+
+/// The `pyproject.toml` path and the text [`merge_pyproject`] writes there.
+/// Every refusal (a symlink, a file that does not parse) is raised here,
+/// before anything is written.
+fn render_merged_pyproject(
+    project_root: &Path,
+    config: &TyphonConfig,
+) -> Result<(PathBuf, String)> {
     let path = project_root.join("pyproject.toml");
     // A symlinked `pyproject.toml` in an untrusted checkout would otherwise
     // have its *target* rewritten with `typhon.toml`-derived content.
@@ -471,9 +526,7 @@ fn merge_pyproject(project_root: &Path, config: &TyphonConfig) -> Result<()> {
     }
     if !path.exists() {
         let text = render_pyproject(config);
-        tyc_format::atomic_write(&path, text.as_bytes())
-            .map_err(|e| miette!("cannot write {}: {e}", path.display()))?;
-        return Ok(());
+        return Ok((path, text));
     }
 
     let existing = std::fs::read_to_string(&path)
@@ -484,8 +537,8 @@ fn merge_pyproject(project_root: &Path, config: &TyphonConfig) -> Result<()> {
 
     apply_owned_keys(&mut doc, config);
 
-    tyc_format::atomic_write(&path, doc.to_string().as_bytes())
-        .map_err(|e| miette!("cannot write {}: {e}", path.display()))
+    let text = doc.to_string();
+    Ok((path, text))
 }
 
 /// Overwrite the keys this tool owns inside the document, leaving every
@@ -784,6 +837,91 @@ mod tests {
             std::fs::read_to_string(&victim).unwrap(),
             "[project]\nname = \"victim\"\n"
         );
+    }
+
+    /// A `pyproject.toml` that `tyc add` / `tyc remove` refuses (a symlink,
+    /// or a file that does not parse) used to be refused only after
+    /// `typhon.toml` had been rewritten: the command failed with the
+    /// dependency already added or removed. Both manifests are now rendered
+    /// first, so a failing command changes neither.
+    #[test]
+    fn add_and_remove_change_nothing_when_pyproject_is_refused() {
+        let manifest =
+            "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[dependencies]\nsix = \"*\"\n";
+        let malformed = "[project\nname = \"x\"\n";
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("typhon.toml"), manifest).unwrap();
+        std::fs::write(tmp.path().join("pyproject.toml"), malformed).unwrap();
+
+        let err = run_add(AddArgs {
+            dir: tmp.path().to_path_buf(),
+            packages: vec!["requests".to_string()],
+            dev: false,
+            no_sync: true,
+        })
+        .expect_err("add must refuse a pyproject.toml that does not parse");
+        assert!(format!("{err:?}").contains("cannot parse"), "{err:?}");
+        let err = run_remove(RemoveArgs {
+            dir: tmp.path().to_path_buf(),
+            packages: vec!["six".to_string()],
+            dev: false,
+            no_sync: true,
+        })
+        .expect_err("remove must refuse a pyproject.toml that does not parse");
+        assert!(format!("{err:?}").contains("cannot parse"), "{err:?}");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("typhon.toml")).unwrap(),
+            manifest
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("pyproject.toml")).unwrap(),
+            malformed
+        );
+
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            let victim = outside.path().join("victim.toml");
+            std::fs::write(&victim, "precious = true\n").unwrap();
+            std::fs::remove_file(tmp.path().join("pyproject.toml")).unwrap();
+            std::os::unix::fs::symlink(&victim, tmp.path().join("pyproject.toml")).unwrap();
+            run_add(AddArgs {
+                dir: tmp.path().to_path_buf(),
+                packages: vec!["requests".to_string()],
+                dev: true,
+                no_sync: true,
+            })
+            .expect_err("add must refuse a symlinked pyproject.toml");
+            run_remove(RemoveArgs {
+                dir: tmp.path().to_path_buf(),
+                packages: vec!["six".to_string()],
+                dev: false,
+                no_sync: true,
+            })
+            .expect_err("remove must refuse a symlinked pyproject.toml");
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join("typhon.toml")).unwrap(),
+                manifest
+            );
+            assert_eq!(
+                std::fs::read_to_string(&victim).unwrap(),
+                "precious = true\n"
+            );
+        }
+
+        // A pyproject.toml the merge accepts still gets both edits.
+        std::fs::remove_file(tmp.path().join("pyproject.toml")).unwrap();
+        run_add(AddArgs {
+            dir: tmp.path().to_path_buf(),
+            packages: vec!["requests".to_string()],
+            dev: false,
+            no_sync: true,
+        })
+        .unwrap();
+        let after = std::fs::read_to_string(tmp.path().join("typhon.toml")).unwrap();
+        assert!(after.contains("requests = \"*\""), "{after}");
+        let pyproject = std::fs::read_to_string(tmp.path().join("pyproject.toml")).unwrap();
+        assert!(pyproject.contains("\"requests\""), "{pyproject}");
     }
 
     use super::*;

@@ -377,7 +377,7 @@ class-body execution, iteration is in declaration order, and
 
 `Result[T, E]` is a sealed sum type with two constructors, `Ok(T)` and `Err(E)`. Emits as a tagged dataclass in a generated `typhon_runtime/` module — no PyPI dependency.
 
-The module name `typhon_runtime` is reserved for that generated package: a project module or package of the same name directly under the source root is replaced whenever the runtime is written. `tyc check` and `tyc build` warn about it ([`tyc::reserved_module_name`](diagnostics/reserved_module_name.md)), and `tyc build` fails when the program imports something from `typhon_runtime` that the generated runtime does not provide.
+The module name `typhon_runtime` is reserved for that generated package: a project module or package of the same name directly under the source root is replaced whenever the runtime is written. `tyc check` and `tyc build` warn about it ([`tyc::reserved_module_name`](diagnostics/reserved_module_name.md)), and `tyc build` fails when the program imports something from `typhon_runtime` that the generated runtime does not provide, or reads such a name off a bare `import typhon_runtime`.
 
 ### The `?` operator
 

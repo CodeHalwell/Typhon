@@ -30,10 +30,16 @@ pub enum DirFilter {
     /// Skip hidden directories, `__pycache__/`, `tests/`, `.venv/` and
     /// `build/` — the directories that are never user-authored sources.
     NonSource,
+    /// Skip only what nobody writes by hand: virtual environments (any
+    /// directory holding a `pyvenv.cfg`, plus `.venv/`, `.tox/`, `.nox/`),
+    /// VCS metadata, caches (`__pycache__/`, `.mypy_cache/`, …),
+    /// `node_modules/` and `build/`. A project's `tests/` and other
+    /// directories are kept — `tyc migrate` converts the whole tree.
+    Generated,
 }
 
 impl DirFilter {
-    fn skips(self, name: &str) -> bool {
+    fn skips(self, dir: &Path, name: &str) -> bool {
         match self {
             DirFilter::None => false,
             DirFilter::Hidden => name.starts_with('.') || name == "__pycache__",
@@ -43,6 +49,22 @@ impl DirFilter {
                     || name == "tests"
                     || name == ".venv"
                     || name == "build"
+            }
+            DirFilter::Generated => {
+                matches!(
+                    name,
+                    ".git"
+                        | ".hg"
+                        | ".svn"
+                        | ".bzr"
+                        | "__pycache__"
+                        | ".venv"
+                        | ".tox"
+                        | ".nox"
+                        | "node_modules"
+                        | "build"
+                ) || (name.starts_with('.') && name.ends_with("cache"))
+                    || dir.join("pyvenv.cfg").is_file()
             }
         }
     }
@@ -165,7 +187,7 @@ impl<'a> Walk<'a> {
         for path in paths {
             if path.is_dir() {
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if self.filter.skips(name) {
+                    if self.filter.skips(&path, name) {
                         continue;
                     }
                 }
@@ -252,5 +274,52 @@ mod tests {
         assert_eq!(all(DirFilter::None), 5);
         assert_eq!(all(DirFilter::Hidden), 3);
         assert_eq!(all(DirFilter::NonSource), 1);
+        // `.hidden`, `tests` and `pkg`: only `__pycache__` and `build` are
+        // generated.
+        assert_eq!(all(DirFilter::Generated), 3);
+    }
+
+    #[test]
+    fn the_generated_filter_skips_environments_caches_and_vcs_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let skipped = [
+            ".git",
+            ".venv",
+            "env",
+            ".tox",
+            "node_modules",
+            ".mypy_cache",
+            ".pytest_cache",
+            "__pycache__",
+            "build",
+        ];
+        let kept = ["tests", "pkg", ".github", "docs"];
+        for dir in skipped.iter().chain(kept.iter()) {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join("m.py"), "").unwrap();
+        }
+        // A virtual environment under any name is recognised by its marker.
+        std::fs::write(root.join("env").join("pyvenv.cfg"), "home = /usr\n").unwrap();
+        let files = Walk {
+            ext: "py",
+            filter: DirFilter::Generated,
+            strict: true,
+        }
+        .collect_quiet(root)
+        .unwrap();
+        let mut dirs: Vec<String> = files
+            .iter()
+            .map(|f| {
+                f.parent()
+                    .unwrap()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        dirs.sort();
+        assert_eq!(dirs, vec![".github", "docs", "pkg", "tests"]);
     }
 }

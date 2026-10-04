@@ -155,7 +155,7 @@ src/typhon_runtime/__init__.ty    # def helper() -> int: …
 src/main.ty                       # from typhon_runtime import helper … Ok(helper())
 ```
 
-`tyc build` stops with an error when the program imports something from `typhon_runtime` that the generated runtime does not provide — the program could not start (`ImportError: cannot import name 'helper'`). In every other case it, like `tyc check`, only warns.
+`tyc build` stops with an error when the program imports something from `typhon_runtime` that the generated runtime does not provide — the program could not start (`ImportError: cannot import name 'helper'`) — or reads such a name off a bare `import typhon_runtime` (`typhon_runtime.helper()`, which raises `AttributeError` where it runs). A read through a name the file rebinds elsewhere, or of an attribute the program sets on the module itself, is not counted. In every other case it, like `tyc check`, only warns.
 
 **Fix:** rename the module (for example to `runtime_helpers`) and update its imports.
 

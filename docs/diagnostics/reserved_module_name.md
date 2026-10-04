@@ -29,8 +29,8 @@ def f() -> Result[int, str]:
 Error: tyc::reserved_module_name
 
   × `typhon_runtime` is reserved: this program uses the runtime `tyc build`
-  │ generates, which replaces 'src/typhon_runtime', so these imports would
-  │ fail when the program starts:
+  │ generates, which replaces 'src/typhon_runtime', so these imports and
+  │ attribute reads would fail at run time:
   │   src/main.ty:1: `from typhon_runtime import helper` — `helper` is not
   │   provided by the generated runtime
   help: rename the module (and these imports) — for example to `runtime_helpers`
@@ -43,14 +43,20 @@ own emitted `typhon_runtime/__init__.py` (and any submodule sharing a name with
 a runtime file such as `result.py`), and a package shadows a same-named
 `typhon_runtime.py` module. Before this diagnostic the project checked and
 built cleanly, then failed at start-up with
-`ImportError: cannot import name 'helper' from 'typhon_runtime'`.
+`ImportError: cannot import name 'helper' from 'typhon_runtime'` (or, through
+a bare `import typhon_runtime`, `AttributeError: module 'typhon_runtime' has no
+attribute 'helper'`).
 
 ## Severity
 
 - **`tyc build` — error** when the build writes the generated runtime *and*
   a project file imports a name (or submodule) from `typhon_runtime` that the
-  generated runtime does not provide. That program could not start; the build
-  stops before writing the runtime.
+  generated runtime does not provide — that program could not start — or
+  reads such a name off a bare `import typhon_runtime` / `import
+  typhon_runtime as rt` (`typhon_runtime.helper()` raises `AttributeError`
+  where it runs). A read is not counted when the file binds that name some
+  other way too, or sets the attribute on the module itself. The build stops
+  before writing the runtime.
 - **`tyc build` — warning** in every other case: the project defines the name
   but nothing that is replaced is imported, so the program still runs today.
 - **`tyc check` — warning** whenever the project defines the name. Whether the

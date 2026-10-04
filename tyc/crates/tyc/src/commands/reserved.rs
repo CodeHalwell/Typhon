@@ -11,10 +11,11 @@
 //! The name is reserved. `tyc check` warns whenever a project defines it.
 //! `tyc build` refuses only when the program needs the generated runtime *and*
 //! imports something from `typhon_runtime` that the generated runtime will not
-//! provide — a program that already fails on import. Every other case keeps
-//! building (it works today) with a warning to rename the module.
+//! provide, or reads such an attribute off a bare `import typhon_runtime` — a
+//! program that already fails. Every other case keeps building (it works
+//! today) with a warning to rename the module.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use miette::{miette, Severity};
@@ -122,7 +123,10 @@ fn bound_names(python: &str) -> HashSet<String> {
 }
 
 /// One `typhon_runtime` import in project source that will fail at import
-/// time once the generated runtime replaces the project's module.
+/// time once the generated runtime replaces the project's module — or one
+/// attribute read through a bare `import typhon_runtime` that will raise
+/// `AttributeError` (`statement` is then the `typhon_runtime.NAME`
+/// expression).
 #[derive(Debug)]
 pub(crate) struct BrokenImport {
     pub file: PathBuf,
@@ -247,8 +251,254 @@ pub(crate) fn broken_imports(
                 }
             }
         }
+        // `import typhon_runtime` (or `… as rt`) imports cleanly whatever
+        // replaces it; what fails is reading an attribute the generated
+        // runtime does not have — `typhon_runtime.helper()` raises
+        // `AttributeError` where it runs.
+        for read in runtime_attribute_reads(source) {
+            let sub_names;
+            let available = if read.module == "typhon_runtime" {
+                &package_names
+            } else {
+                let sub = read.module.trim_start_matches("typhon_runtime.");
+                if surviving.contains(sub.split('.').next().unwrap_or(sub))
+                    || !generated_modules.contains(sub)
+                {
+                    // The project's own surviving submodule, or a module the
+                    // import check above already reports.
+                    continue;
+                }
+                sub_names = module_names(sub);
+                &sub_names
+            };
+            if !available.contains(&read.attr) {
+                broken.push(BrokenImport {
+                    file: file.clone(),
+                    line: read.line,
+                    statement: format!("{}.{}", read.local, read.attr),
+                    missing: format!("`{}`", read.attr),
+                });
+            }
+        }
     }
     broken
+}
+
+/// One `NAME.attr` read where `NAME` is bound by `import typhon_runtime[.sub]
+/// [as NAME]`.
+#[derive(Debug, PartialEq)]
+struct RuntimeAttributeRead {
+    /// The local name read from (`typhon_runtime`, or an `as` alias).
+    local: String,
+    /// The module that name is bound to (`typhon_runtime`,
+    /// `typhon_runtime.lazy`).
+    module: String,
+    attr: String,
+    /// 1-based line in the `.ty` source.
+    line: usize,
+}
+
+/// The attribute reads in `source` through a bare `typhon_runtime` import.
+///
+/// Conservative, so a program that runs is never rejected: only a name that
+/// nothing else in the file binds (no other import, `let`, parameter, `def`,
+/// `for` target, `except … as`, match capture) counts; an attribute the file
+/// itself assigns or `setattr`s on it, and dunders every module has, are
+/// skipped; a file that does not parse is skipped.
+fn runtime_attribute_reads(source: &str) -> Vec<RuntimeAttributeRead> {
+    use ruff_python_ast::visitor::Visitor;
+
+    if !source.contains("typhon_runtime") {
+        return Vec::new();
+    }
+    let prep = tyc_syntax::preprocess::expand_and_preprocess_mapped(source, false);
+    let Ok(parsed) = tyc_syntax::parse_module(&prep.python_source) else {
+        return Vec::new();
+    };
+    let module = parsed.into_syntax();
+    let mut scan = RuntimeAttributeScan::default();
+    for stmt in &module.body {
+        scan.visit_stmt(stmt);
+    }
+    let python = &prep.python_source;
+    let mut reads = Vec::new();
+    for (local, attr, at) in scan.loads {
+        if scan.shadowed.contains(&local)
+            || scan.stored.contains(&(local.clone(), attr.clone()))
+            || (attr.starts_with("__") && attr.ends_with("__"))
+        {
+            continue;
+        }
+        let Some(module) = scan.aliases.get(&local) else {
+            continue;
+        };
+        let python_line = python[..at.min(python.len())].matches('\n').count();
+        let line = prep
+            .line_map
+            .get(python_line)
+            .copied()
+            .unwrap_or(python_line)
+            + 1;
+        reads.push(RuntimeAttributeRead {
+            local,
+            module: module.clone(),
+            attr,
+            line,
+        });
+    }
+    reads
+}
+
+/// The bindings and attribute reads [`runtime_attribute_reads`] works from.
+#[derive(Default)]
+struct RuntimeAttributeScan {
+    /// Local name → the `typhon_runtime` module a bare import binds it to.
+    aliases: HashMap<String, String>,
+    /// Names bound any other way somewhere in the file.
+    shadowed: HashSet<String>,
+    /// `(name, attr, offset)` for every `name.attr` load.
+    loads: Vec<(String, String, usize)>,
+    /// `(name, attr)` the file assigns, deletes or `setattr`s.
+    stored: HashSet<(String, String)>,
+}
+
+impl RuntimeAttributeScan {
+    fn bind_import(&mut self, local: &str, module: Option<&str>) {
+        match module {
+            Some(module) => match self.aliases.get(local) {
+                Some(prev) if prev != module => {
+                    self.shadowed.insert(local.to_owned());
+                }
+                _ => {
+                    self.aliases.insert(local.to_owned(), module.to_owned());
+                }
+            },
+            None => {
+                self.shadowed.insert(local.to_owned());
+            }
+        }
+    }
+}
+
+impl<'a> ruff_python_ast::visitor::Visitor<'a> for RuntimeAttributeScan {
+    fn visit_stmt(&mut self, stmt: &'a ruff_python_ast::Stmt) {
+        use ruff_python_ast::Stmt;
+        match stmt {
+            Stmt::Import(imp) => {
+                for alias in &imp.names {
+                    let module = alias.name.as_str();
+                    let is_runtime =
+                        module == "typhon_runtime" || module.starts_with("typhon_runtime.");
+                    match &alias.asname {
+                        Some(asname) => {
+                            self.bind_import(asname.as_str(), is_runtime.then_some(module))
+                        }
+                        // `import a.b` binds `a`, to the package `a`.
+                        None => {
+                            let root = module.split('.').next().unwrap_or(module);
+                            self.bind_import(root, is_runtime.then_some("typhon_runtime"));
+                        }
+                    }
+                }
+            }
+            Stmt::ImportFrom(imp) => {
+                for alias in &imp.names {
+                    let bound = alias.asname.as_ref().unwrap_or(&alias.name);
+                    self.shadowed.insert(bound.as_str().to_owned());
+                }
+            }
+            Stmt::FunctionDef(f) => {
+                self.shadowed.insert(f.name.as_str().to_owned());
+            }
+            Stmt::ClassDef(c) => {
+                self.shadowed.insert(c.name.as_str().to_owned());
+            }
+            Stmt::TypeAlias(t) => {
+                if let ruff_python_ast::Expr::Name(n) = t.name.as_ref() {
+                    self.shadowed.insert(n.id.as_str().to_owned());
+                }
+            }
+            _ => {}
+        }
+        ruff_python_ast::visitor::walk_stmt(self, stmt);
+    }
+
+    fn visit_expr(&mut self, expr: &'a ruff_python_ast::Expr) {
+        use ruff_python_ast::{Expr, ExprContext};
+        match expr {
+            Expr::Name(n) if !matches!(n.ctx, ExprContext::Load) => {
+                self.shadowed.insert(n.id.as_str().to_owned());
+            }
+            Expr::Attribute(a) => {
+                if let Expr::Name(root) = a.value.as_ref() {
+                    let key = (root.id.as_str().to_owned(), a.attr.as_str().to_owned());
+                    if matches!(a.ctx, ExprContext::Load) {
+                        self.loads.push((key.0, key.1, a.range.start().to_usize()));
+                    } else {
+                        self.stored.insert(key);
+                    }
+                }
+            }
+            Expr::Call(call) => {
+                // `setattr(typhon_runtime, "x", …)`: the dynamic spelling
+                // of a store.
+                if let Expr::Name(func) = call.func.as_ref() {
+                    if matches!(func.id.as_str(), "setattr" | "delattr") {
+                        if let [Expr::Name(target), Expr::StringLiteral(name), ..] =
+                            call.arguments.args.as_ref()
+                        {
+                            self.stored.insert((
+                                target.id.as_str().to_owned(),
+                                name.value.to_str().to_owned(),
+                            ));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        ruff_python_ast::visitor::walk_expr(self, expr);
+    }
+
+    fn visit_parameters(&mut self, parameters: &'a ruff_python_ast::Parameters) {
+        for param in parameters.iter() {
+            self.shadowed.insert(param.name().as_str().to_owned());
+        }
+        ruff_python_ast::visitor::walk_parameters(self, parameters);
+    }
+
+    fn visit_except_handler(&mut self, handler: &'a ruff_python_ast::ExceptHandler) {
+        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = handler;
+        if let Some(name) = &h.name {
+            self.shadowed.insert(name.as_str().to_owned());
+        }
+        ruff_python_ast::visitor::walk_except_handler(self, handler);
+    }
+
+    fn visit_pattern(&mut self, pattern: &'a ruff_python_ast::Pattern) {
+        use ruff_python_ast::Pattern;
+        let bound = match pattern {
+            Pattern::MatchAs(p) => p.name.as_ref(),
+            Pattern::MatchStar(p) => p.name.as_ref(),
+            Pattern::MatchMapping(p) => p.rest.as_ref(),
+            _ => None,
+        };
+        if let Some(name) = bound {
+            self.shadowed.insert(name.as_str().to_owned());
+        }
+        ruff_python_ast::visitor::walk_pattern(self, pattern);
+    }
+
+    fn visit_type_param(&mut self, type_param: &'a ruff_python_ast::TypeParam) {
+        use ruff_python_ast::TypeParam;
+        let name = match type_param {
+            TypeParam::TypeVar(t) => &t.name,
+            TypeParam::TypeVarTuple(t) => &t.name,
+            TypeParam::ParamSpec(t) => &t.name,
+        };
+        self.shadowed.insert(name.as_str().to_owned());
+        ruff_python_ast::visitor::walk_type_param(self, type_param);
+    }
 }
 
 /// The warning both commands print when a project defines the reserved name.
@@ -288,7 +538,7 @@ pub(crate) fn reserved_error(user: &UserRuntime, broken: &[BrokenImport]) -> mie
         url = URL,
         help = "rename the module (and these imports) — for example to `runtime_helpers`",
         "`typhon_runtime` is reserved: this program uses the runtime `tyc build` generates, \
-         which replaces '{}', so these imports would fail when the program starts:\n{}",
+         which replaces '{}', so these imports and attribute reads would fail at run time:\n{}",
         user.path.display(),
         list.join("\n")
     )
@@ -319,6 +569,65 @@ mod tests {
             assert!(names.contains(want), "{want} missing from {names:?}");
         }
         assert!(!names.contains("value") && !names.contains("x"));
+    }
+
+    /// A bare `import typhon_runtime` imports cleanly whatever replaces the
+    /// module; reading an attribute the generated runtime lacks raises
+    /// `AttributeError` at run time, and used to build without complaint.
+    #[test]
+    fn attribute_reads_through_a_bare_import_are_checked() {
+        let files = vec![
+            (
+                "__init__.py",
+                "from . import lazy\nclass Ok:\n    pass\n".to_owned(),
+            ),
+            ("lazy.py", "def lazy_import(m):\n    pass\n".to_owned()),
+        ];
+        let user = UserRuntime {
+            path: PathBuf::from("src/typhon_runtime.ty"),
+            submodules: Vec::new(),
+        };
+        let src = "import typhon_runtime\nimport typhon_runtime as rt\nimport typhon_runtime.lazy as lz\n\n\
+                   def main() -> None:\n\
+                   \x20   print(typhon_runtime.helper())\n\
+                   \x20   print(rt.Ok, rt.other, typhon_runtime.lazy, typhon_runtime.__name__)\n\
+                   \x20   print(lz.lazy_import, lz.nope)\n";
+        let broken = broken_imports(&[(PathBuf::from("m.ty"), src.to_owned())], &user, &files);
+        let found: Vec<(usize, &str, &str)> = broken
+            .iter()
+            .map(|b| (b.line, b.statement.as_str(), b.missing.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                (6, "typhon_runtime.helper", "`helper`"),
+                (7, "rt.other", "`other`"),
+                (8, "lz.nope", "`nope`"),
+            ]
+        );
+    }
+
+    /// Nothing is reported where the name read is not the bare import's
+    /// module where it is read: a name rebound elsewhere in the file, an
+    /// attribute the program sets itself, a `from` import.
+    #[test]
+    fn attribute_reads_the_runtime_need_not_provide_are_not_reported() {
+        let files = vec![("__init__.py", "class Ok:\n    pass\n".to_owned())];
+        let user = UserRuntime {
+            path: PathBuf::from("src/typhon_runtime.ty"),
+            submodules: Vec::new(),
+        };
+        for src in [
+            "import typhon_runtime as rt\n\ndef f(rt: int) -> None:\n    print(rt.real)\n",
+            "import typhon_runtime\ntyphon_runtime.extra = 1\nprint(typhon_runtime.extra)\n",
+            "import typhon_runtime\nsetattr(typhon_runtime, \"extra\", 1)\nprint(typhon_runtime.extra)\n",
+            "from typhon_runtime import Ok\nprint(Ok.helper)\n",
+            "import os\nprint(os.typhon_runtime)\n",
+            "let s: str = \"typhon_runtime.helper\"\nprint(s)\n",
+        ] {
+            let broken = broken_imports(&[(PathBuf::from("m.ty"), src.to_owned())], &user, &files);
+            assert!(broken.is_empty(), "{src}\n{broken:?}");
+        }
     }
 
     #[test]

@@ -118,6 +118,92 @@ fn builtin_extensions_travel_through_pub_star_facades() {
     );
 }
 
+/// `tyc check` + `tyc build`, then CPython runs `python -m <module>` from the
+/// project directory (so the build output is a package), and the run prints
+/// `expected`.
+fn assert_build_runs_as_package(files: &[(&str, &str)], module: &str, expected: &str) {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    scaffold(dir, files);
+    let (ok, out, err) = run_tyc(dir, &["check", "src"]);
+    assert!(ok, "tyc check failed:\n{out}{err}");
+    let (ok, out, err) = run_tyc(dir, &["build"]);
+    assert!(ok, "tyc build failed:\n{out}{err}");
+    if let Some(py) = python() {
+        let run = Command::new(py)
+            .current_dir(dir)
+            .args(["-m", module])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout),
+            expected,
+            "CPython output; stderr:\n{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}
+
+const SLUG_TEXT: &str = "extend str:\n    def slug(self) -> str:\n        return self.lower().replace(\" \", \"-\")\n\n\
+     pub def describe(s: str) -> str:\n    return s.slug()\n";
+
+const SLUG_CONSUMER: &str = "from .. import describe\n\n\
+     def run() -> None:\n\
+     \x20   let s: str = \"Hello World\"\n\
+     \x20   print(describe(s).slug())\n\n\
+     run()\n";
+
+/// A facade at the source root (`src/__init__.ty`) has an empty dotted name,
+/// so its re-export of a sibling's `extend str:` helper looked the sibling up
+/// as `.text` and found nothing: the generated `__init__.py` lacked the
+/// helper. And a consumer reading a name off a package with
+/// `from .. import describe` was never resolved through the facade, so
+/// `describe(s).slug()` stayed a method call — check and build were clean,
+/// and CPython raised `AttributeError: 'str' object has no attribute 'slug'`.
+#[test]
+fn builtin_extensions_travel_through_a_source_root_facade() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        &[("__init__.ty", "pub *\n"), ("text.ty", SLUG_TEXT)],
+    );
+    let (ok, out, err) = run_tyc(tmp.path(), &["build"]);
+    assert!(ok, "tyc build failed:\n{out}{err}");
+    let init = std::fs::read_to_string(tmp.path().join("build/__init__.py")).unwrap();
+    assert!(
+        init.contains("from .text import __typhon_ext_str__slug__"),
+        "{init}"
+    );
+
+    assert_build_runs_as_package(
+        &[
+            ("__init__.ty", "pub *\n"),
+            ("text.ty", SLUG_TEXT),
+            ("app/__init__.ty", ""),
+            ("app/main.ty", SLUG_CONSUMER),
+        ],
+        "build.app.main",
+        "hello-world\n",
+    );
+}
+
+/// The same relative read of a facade name inside a nested package. (The VM
+/// is not asserted: it does not yet import a package attribute through a
+/// relative `from .. import name` at all, extensions or not.)
+#[test]
+fn builtin_extensions_reach_a_relative_import_of_a_facade_name() {
+    assert_build_runs_as_package(
+        &[
+            ("pkg/__init__.ty", "pub *\n"),
+            ("pkg/text.ty", SLUG_TEXT),
+            ("pkg/app/__init__.ty", ""),
+            ("pkg/app/main.ty", SLUG_CONSUMER),
+        ],
+        "build.pkg.app.main",
+        "hello-world\n",
+    );
+}
+
 // ── W3-03: cross-module `extend User:` seen by a third module ──────────────
 
 #[test]
