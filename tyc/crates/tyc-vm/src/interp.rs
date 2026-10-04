@@ -1943,7 +1943,7 @@ impl Interpreter {
                     .collect();
                 class_attrs.insert(
                     "_field_defaults".to_owned(),
-                    Value::Dict(Rc::new(RefCell::new(defaults))),
+                    Value::Dict(Rc::new(crate::value::FrozenCell::new(defaults))),
                 );
                 bases.push(template);
             }
@@ -2932,7 +2932,7 @@ impl Interpreter {
                         set.insert(k);
                     }
                 }
-                Ok(Value::Set(Rc::new(RefCell::new(set))))
+                Ok(Value::Set(Rc::new(crate::value::FrozenCell::new(set))))
             }
             Expr::Dict(d) => {
                 let mut map: DictMap = IndexMap::new();
@@ -2958,7 +2958,7 @@ impl Interpreter {
                         }
                     }
                 }
-                Ok(Value::Dict(Rc::new(RefCell::new(map))))
+                Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(map))))
             }
             Expr::If(t) => {
                 let cond = self.eval_expr(&t.test, env)?;
@@ -3381,7 +3381,7 @@ impl Interpreter {
                     let (Some(x), Some(y)) = pair else {
                         return Ok(false);
                     };
-                    if !self.cmp_op(CmpOp::Eq, &x, &y)? {
+                    if !x.same_identity(&y) && !self.cmp_op(CmpOp::Eq, &x, &y)? {
                         return Ok(false);
                     }
                 }
@@ -3398,7 +3398,7 @@ impl Interpreter {
                     return Ok(false);
                 };
                 for (x, y) in a.iter().zip(b.iter()) {
-                    if !self.cmp_op(CmpOp::Eq, x, y)? {
+                    if !x.same_identity(y) && !self.cmp_op(CmpOp::Eq, x, y)? {
                         return Ok(false);
                     }
                 }
@@ -3423,7 +3423,7 @@ impl Interpreter {
                     let Some(w) = b.borrow().get(&k).cloned() else {
                         return Ok(false);
                     };
-                    if !self.cmp_op(CmpOp::Eq, &v, &w)? {
+                    if !v.same_identity(&w) && !self.cmp_op(CmpOp::Eq, &v, &w)? {
                         return Ok(false);
                     }
                 }
@@ -3585,7 +3585,7 @@ impl Interpreter {
                 Some(n) => pyhash::small_int_hash(n),
                 None => pyhash::int_hash(&i.to_bigint()),
             },
-            Value::Float(f) => pyhash::float_hash(*f),
+            Value::FloatData(crate::value::VmFloat { value: f, .. }) => pyhash::float_hash(*f),
             Value::Complex(re, im) => pyhash::complex_hash(*re, *im),
             Value::Str(s) => pyhash::str_hash(s),
             Value::Bytes(b) => pyhash::bytes_hash(b),
@@ -3750,12 +3750,9 @@ impl Interpreter {
         // models a total order, so sets are handled before it.
         if let (Value::Set(a), Value::Set(b)) = (l, r) {
             let (a, b) = (a.borrow(), b.borrow());
-            let frozen = crate::value::HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
-            let members = |s: &std::collections::HashSet<crate::value::HashKey>| {
-                s.iter().filter(|k| **k != frozen).count()
-            };
-            let subset = a.iter().all(|k| *k == frozen || b.contains(k));
-            let superset = b.iter().all(|k| *k == frozen || a.contains(k));
+            let members = |s: &std::collections::HashSet<crate::value::HashKey>| s.len();
+            let subset = a.iter().all(|k| b.contains(k));
+            let superset = b.iter().all(|k| a.contains(k));
             let (na, nb) = (members(&a), members(&b));
             return Ok(match op {
                 CmpOp::Lt => subset && na < nb,
@@ -3815,7 +3812,7 @@ impl Interpreter {
             Value::List(l) => {
                 let items: Vec<Value> = l.borrow().clone();
                 for v in &items {
-                    if self.cmp_op(CmpOp::Eq, v, item)? {
+                    if v.same_identity(item) || self.cmp_op(CmpOp::Eq, v, item)? {
                         return Ok(true);
                     }
                 }
@@ -3824,7 +3821,7 @@ impl Interpreter {
             Value::Tuple(t) => {
                 let items = t.clone();
                 for v in items.iter() {
-                    if self.cmp_op(CmpOp::Eq, v, item)? {
+                    if v.same_identity(item) || self.cmp_op(CmpOp::Eq, v, item)? {
                         return Ok(true);
                     }
                 }
@@ -3840,13 +3837,7 @@ impl Interpreter {
             }
             Value::Set(s) => {
                 let key = self.set_probe_key(s, item)?;
-                // The synthetic `__typhon_frozen__` sentinel must not
-                // be observable via `x in s` — a literal `"…frozen…"`
-                // probe would otherwise return True on every
-                // `freeze let`-marked set.
-                if matches!(&key, HashKey::Str(name) if name.as_str() == "__typhon_frozen__") {
-                    return Ok(false);
-                }
+                // Frozen metadata lives outside user-visible container contents.
                 Ok(s.borrow().contains(&key))
             }
             Value::Range { start, stop, step } => match item {
@@ -3871,7 +3862,7 @@ impl Interpreter {
             Value::DictView { items, .. } => {
                 let items = items.clone();
                 for v in &items {
-                    if self.cmp_op(CmpOp::Eq, v, item)? {
+                    if v.same_identity(item) || self.cmp_op(CmpOp::Eq, v, item)? {
                         return Ok(true);
                     }
                 }
@@ -3881,7 +3872,7 @@ impl Interpreter {
             // up to the first match, as CPython does.
             Value::Iter(_) => {
                 while let Some(v) = self.iter_next(container)? {
-                    if self.cmp_op(CmpOp::Eq, &v, item)? {
+                    if v.same_identity(item) || self.cmp_op(CmpOp::Eq, &v, item)? {
                         return Ok(true);
                     }
                 }
@@ -4165,11 +4156,11 @@ impl Interpreter {
                 // `isinstance(value, int)` is `True` for `bool` (bool ⊆ int).
                 "int" => matches!(value, Value::Int(_) | Value::Bool(_)),
                 // Typhon/CPython widen int (and bool) into a float/complex target.
-                "float" => matches!(value, Value::Int(_) | Value::Float(_) | Value::Bool(_)),
+                "float" => matches!(value, Value::Int(_) | Value::FloatData(_) | Value::Bool(_)),
                 "complex" => {
                     matches!(
                         value,
-                        Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Complex(..)
+                        Value::Int(_) | Value::FloatData(_) | Value::Bool(_) | Value::Complex(..)
                     )
                 }
                 "bool" => matches!(value, Value::Bool(_)),
@@ -4782,7 +4773,10 @@ impl Interpreter {
             for (k, v) in kwargs_left.drain(..) {
                 map.insert(HashKey::Str(Rc::new(k)), v);
             }
-            env.set(kw.name.as_str(), Value::Dict(Rc::new(RefCell::new(map))));
+            env.set(
+                kw.name.as_str(),
+                Value::Dict(Rc::new(crate::value::FrozenCell::new(map))),
+            );
         } else if !kwargs_left.is_empty() {
             let names: Vec<String> = kwargs_left.keys().cloned().collect();
             return Err(type_error(format!(
@@ -4839,7 +4833,7 @@ impl Interpreter {
             for (k, v) in kwargs {
                 map.insert(crate::value::HashKey::Str(Rc::new(k.clone())), v.clone());
             }
-            return Ok(Value::Dict(Rc::new(RefCell::new(map))));
+            return Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(map))));
         }
         // Field-less exception subclass with no user/synthesised `__init__`:
         // behave like `BaseException`. Accept the positional args, stash them
@@ -5360,16 +5354,11 @@ impl Interpreter {
                 Ok(s)
             }
             Value::Dict(d) => {
-                let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
-                let is_frozen = matches!(d.borrow().get(&frozen_key), Some(Value::Bool(true)));
-                // Snapshot (key, value) pairs, filtering the synthetic
-                // `__typhon_frozen__` sentinel, before recursing.
+                let is_frozen = d.frozen.get();
+                // Frozen metadata lives outside user-visible container contents.
                 let pairs: Vec<(HashKey, Value)> = d
                     .borrow()
                     .iter()
-                    .filter(|(k, _)| {
-                        !matches!(k, HashKey::Str(name) if name.as_str() == "__typhon_frozen__")
-                    })
                     .map(|(k, val)| (k.clone(), val.clone()))
                     .collect();
                 let wrap = is_frozen && !unwrap_frozen;
@@ -5395,17 +5384,11 @@ impl Interpreter {
                 Ok(s)
             }
             Value::Set(set) => {
-                let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
-                let is_frozen = set.borrow().contains(&frozen_key);
+                let is_frozen = set.frozen.get();
                 // Match `Value::py_str`'s ordering EXACTLY: sort by the
                 // collision-safe `canonical_sort_key` so the repr is stable
                 // and matches CPython for all-numeric / all-string cases.
-                let mut keys: Vec<HashKey> = set
-                    .borrow()
-                    .iter()
-                    .filter(|k| **k != frozen_key)
-                    .cloned()
-                    .collect();
+                let mut keys: Vec<HashKey> = set.borrow().iter().cloned().collect();
                 keys.sort_by_key(|k| k.canonical_sort_key());
                 if keys.is_empty() {
                     return Ok(if is_frozen {
@@ -5497,7 +5480,7 @@ impl Interpreter {
             (Int(a), Sub, Int(b)) => return Ok(Int(a.sub(b))),
             (Int(a), Mult, Int(b)) => return Ok(Int(a.mul(b))),
             (Int(_), Div, Int(b)) if b.is_zero() => return Err(zero_division()),
-            (Int(a), Div, Int(b)) => return Ok(Float(a.to_f64() / b.to_f64())),
+            (Int(a), Div, Int(b)) => return Ok(Value::Float(a.to_f64() / b.to_f64())),
             (Int(_), FloorDiv, Int(b)) if b.is_zero() => return Err(zero_division_floor_mod()),
             (Int(a), FloorDiv, Int(b)) => return Ok(Int(a.div_floor(b))),
             (Int(_), Mod, Int(b)) if b.is_zero() => {
@@ -5510,7 +5493,7 @@ impl Interpreter {
                     if a.is_zero() {
                         return Err(zero_division_negative_power());
                     }
-                    return Ok(Float(a.to_f64().powf(b.to_f64())));
+                    return Ok(Value::Float(a.to_f64().powf(b.to_f64())));
                 }
                 // `pow` takes a `u32` exponent; for ridiculous exponents
                 // (10**million) we'd happily eat all the RAM, so cap at
@@ -5542,16 +5525,34 @@ impl Interpreter {
                 return Ok(Int(a.shr(shift)));
             }
 
-            (Float(a), Add, Float(b)) => return Ok(Float(a + b)),
-            (Float(a), Sub, Float(b)) => return Ok(Float(a - b)),
-            (Float(a), Mult, Float(b)) => return Ok(Float(a * b)),
-            (Float(a), Div, Float(b)) => {
+            (
+                FloatData(crate::value::VmFloat { value: a, .. }),
+                Add,
+                FloatData(crate::value::VmFloat { value: b, .. }),
+            ) => return Ok(Value::Float(a + b)),
+            (
+                FloatData(crate::value::VmFloat { value: a, .. }),
+                Sub,
+                FloatData(crate::value::VmFloat { value: b, .. }),
+            ) => return Ok(Value::Float(a - b)),
+            (
+                FloatData(crate::value::VmFloat { value: a, .. }),
+                Mult,
+                FloatData(crate::value::VmFloat { value: b, .. }),
+            ) => return Ok(Value::Float(a * b)),
+            (
+                FloatData(crate::value::VmFloat { value: a, .. }),
+                Div,
+                FloatData(crate::value::VmFloat { value: b, .. }),
+            ) => {
                 if *b == 0.0 {
                     return Err(zero_division_named("float division by zero"));
                 }
-                return Ok(Float(a / b));
+                return Ok(Value::Float(a / b));
             }
-            (Float(_), FloorDiv, Float(b)) if *b == 0.0 => {
+            (FloatData(_), FloorDiv, FloatData(crate::value::VmFloat { value: b, .. }))
+                if *b == 0.0 =>
+            {
                 return Err(zero_division_named("float floor division by zero"));
             }
             // Float `//` and `%` share CPython's `float_divmod`. `floor(a/b)`
@@ -5559,12 +5560,24 @@ impl Interpreter {
             // `(7.0 / 0.1).floor()` is 70.0 where CPython's fmod-based
             // algorithm gives 69.0. Likewise `%` must carry the divisor's sign
             // even on a zero result (`-3.0 % 3.0 == 0.0`, `7.0 % -7.0 == -0.0`).
-            (Float(a), FloorDiv, Float(b)) => return Ok(Float(float_divmod(*a, *b).0)),
-            (Float(_), Mod, Float(b)) if *b == 0.0 => {
+            (
+                FloatData(crate::value::VmFloat { value: a, .. }),
+                FloorDiv,
+                FloatData(crate::value::VmFloat { value: b, .. }),
+            ) => return Ok(Value::Float(float_divmod(*a, *b).0)),
+            (FloatData(_), Mod, FloatData(crate::value::VmFloat { value: b, .. })) if *b == 0.0 => {
                 return Err(zero_division_named("float modulo by zero"))
             }
-            (Float(a), Mod, Float(b)) => return Ok(Float(float_divmod(*a, *b).1)),
-            (Float(a), Pow, Float(b)) => {
+            (
+                FloatData(crate::value::VmFloat { value: a, .. }),
+                Mod,
+                FloatData(crate::value::VmFloat { value: b, .. }),
+            ) => return Ok(Value::Float(float_divmod(*a, *b).1)),
+            (
+                FloatData(crate::value::VmFloat { value: a, .. }),
+                Pow,
+                FloatData(crate::value::VmFloat { value: b, .. }),
+            ) => {
                 // `0.0 ** -n` is a ZeroDivisionError in CPython, not `inf`.
                 if *a == 0.0 && *b < 0.0 {
                     return Err(zero_division_negative_power());
@@ -5576,7 +5589,7 @@ impl Interpreter {
                     let theta = std::f64::consts::PI * b;
                     return Ok(Complex(r * theta.cos(), r * theta.sin()));
                 }
-                return Ok(Float(a.powf(*b)));
+                return Ok(Value::Float(a.powf(*b)));
             }
             // Complex base raised to a non-negative integer power — repeated
             // multiplication for an exact result (`(1j) ** 2` → `-1+0j`),
@@ -5608,11 +5621,11 @@ impl Interpreter {
         // Mixed int/float — promote to float.
         if matches!(
             (l, r),
-            (Int(_) | Bool(_), Float(_)) | (Float(_), Int(_) | Bool(_))
+            (Int(_) | Bool(_), FloatData(_)) | (FloatData(_), Int(_) | Bool(_))
         ) {
             let a = l.to_float()?;
             let b = r.to_float()?;
-            return self.binop(&Float(a), op, &Float(b));
+            return self.binop(&Value::Float(a), op, &Value::Float(b));
         }
         // Bool ↔ Int.
         if matches!((l, r), (Bool(_), Int(_) | Bool(_)) | (Int(_), Bool(_))) {
@@ -5777,7 +5790,7 @@ impl Interpreter {
                 for (k, v) in b.borrow().iter() {
                     out.insert(k.clone(), v.clone());
                 }
-                return Ok(Dict(Rc::new(RefCell::new(out))));
+                return Ok(Dict(Rc::new(crate::value::FrozenCell::new(out))));
             }
         }
         if matches!(op, BitOr | BitAnd | Sub | BitXor) {
@@ -5789,7 +5802,7 @@ impl Interpreter {
                     BitXor => a.symmetric_difference(&b).cloned().collect(),
                     _ => unreachable!(),
                 };
-                return Ok(Set(Rc::new(RefCell::new(out))));
+                return Ok(Set(Rc::new(crate::value::FrozenCell::new(out))));
             }
         }
 
@@ -5927,7 +5940,7 @@ impl Interpreter {
             UnaryOp::Not => Ok(Value::Bool(!self.is_truthy(v)?)),
             UnaryOp::USub => match v {
                 Value::Int(i) => Ok(Value::Int(-i)),
-                Value::Float(x) => Ok(Value::Float(-*x)),
+                Value::FloatData(crate::value::VmFloat { value: x, .. }) => Ok(Value::Float(-*x)),
                 Value::Bool(b) => Ok(Value::Int(VmInt::from(-(*b as i64)))),
                 Value::Complex(re, im) => Ok(Value::Complex(-*re, -*im)),
                 _ => Err(type_error(format!(
@@ -5936,7 +5949,7 @@ impl Interpreter {
                 ))),
             },
             UnaryOp::UAdd => match v {
-                Value::Int(_) | Value::Float(_) | Value::Complex(_, _) => Ok(v.clone()),
+                Value::Int(_) | Value::FloatData(_) | Value::Complex(_, _) => Ok(v.clone()),
                 Value::Bool(b) => Ok(Value::Int(VmInt::from(*b as i64))),
                 _ => Err(type_error(format!(
                     "bad operand type for unary +: '{}'",
@@ -6436,8 +6449,10 @@ impl Interpreter {
             }
             (Value::Bool(_), "imag") => return Ok(Value::Int(crate::value::VmInt::from(0))),
             (Value::Bool(_), "denominator") => return Ok(Value::Int(crate::value::VmInt::from(1))),
-            (Value::Float(x), "real") => return Ok(Value::Float(*x)),
-            (Value::Float(_), "imag") => return Ok(Value::Float(0.0)),
+            (Value::FloatData(crate::value::VmFloat { value: x, .. }), "real") => {
+                return Ok(Value::Float(*x))
+            }
+            (Value::FloatData(_), "imag") => return Ok(Value::Float(0.0)),
             _ => {}
         }
         // Try instance fields first, then class methods.
@@ -6507,7 +6522,7 @@ impl Interpreter {
                                 );
                             }
                         }
-                        let dict = Value::Dict(Rc::new(RefCell::new(map)));
+                        let dict = Value::Dict(Rc::new(crate::value::FrozenCell::new(map)));
                         if as_json {
                             Ok(Value::Str(Rc::new(crate::builtins::json_dumps_model(
                                 &dict,
@@ -6829,7 +6844,7 @@ impl Interpreter {
                 for (k, v) in f.attrs.borrow().iter() {
                     map.insert(HashKey::Str(Rc::new(k.clone())), v.clone());
                 }
-                Ok(Value::Dict(Rc::new(RefCell::new(map))))
+                Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(map))))
             }
             Value::Native(n) if attr == "__name__" || attr == "__qualname__" => {
                 Ok(Value::Str(Rc::new(n.name.to_string())))
@@ -6873,7 +6888,7 @@ impl Interpreter {
             | Value::Set(_)
             | Value::Tuple(_)
             | Value::Int(_)
-            | Value::Float(_)
+            | Value::FloatData(_)
             | Value::Bool(_)
             | Value::Bytes(_) => {
                 // H5b — accessing an unknown (non-method, non-dunder)
@@ -7406,24 +7421,12 @@ impl Interpreter {
                 }
             }
             Value::Dict(d) => {
-                let keys: Vec<HashKey> = d
-                    .borrow()
-                    .keys()
-                    .filter(|k| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
-                    .cloned()
-                    .collect();
+                let keys: Vec<HashKey> = d.borrow().keys().cloned().collect();
                 IterState::Dict { keys, index: 0 }
             }
             Value::Set(s) => {
-                // Filter the synthetic `__typhon_frozen__` sentinel
-                // `deep_freeze_value` inserts to mark the set
-                // immutable.
-                let keys: Vec<HashKey> = s
-                    .borrow()
-                    .iter()
-                    .filter(|k| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
-                    .cloned()
-                    .collect();
+                // Frozen metadata lives outside user-visible container contents.
+                let keys: Vec<HashKey> = s.borrow().iter().cloned().collect();
                 IterState::Set { keys, index: 0 }
             }
             Value::Iter(it) => return Ok(Value::Iter(it)),
@@ -7840,7 +7843,9 @@ impl Interpreter {
     }
 
     fn eval_setcomp(&mut self, c: &ast::ExprSetComp, env: &EnvRef) -> Result<Value, Unwind> {
-        let out = Rc::new(RefCell::new(std::collections::HashSet::new()));
+        let out = Rc::new(crate::value::FrozenCell::new(
+            std::collections::HashSet::new(),
+        ));
         let elt = c.elt.clone();
         let out_clone = out.clone();
         let leaks = comprehension_walrus_names(&[&c.elt], &c.generators);
@@ -7852,11 +7857,12 @@ impl Interpreter {
             Ok(())
         })?;
         let result = std::mem::take(&mut *out.borrow_mut());
-        Ok(Value::Set(Rc::new(RefCell::new(result))))
+        Ok(Value::Set(Rc::new(crate::value::FrozenCell::new(result))))
     }
 
     fn eval_dictcomp(&mut self, c: &ast::ExprDictComp, env: &EnvRef) -> Result<Value, Unwind> {
-        let out: Rc<RefCell<DictMap>> = Rc::new(RefCell::new(IndexMap::new()));
+        let out: Rc<crate::value::FrozenCell<DictMap>> =
+            Rc::new(crate::value::FrozenCell::new(IndexMap::new()));
         let key_expr = c
             .key
             .clone()
@@ -7877,7 +7883,7 @@ impl Interpreter {
             Ok(())
         })?;
         let result = std::mem::take(&mut *out.borrow_mut());
-        Ok(Value::Dict(Rc::new(RefCell::new(result))))
+        Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(result))))
     }
 
     // ── try/except ─────────────────────────────────────────────────────────
@@ -8700,7 +8706,7 @@ impl Interpreter {
             }
             env.set(
                 rest_name.as_str(),
-                Value::Dict(Rc::new(RefCell::new(rest_map))),
+                Value::Dict(Rc::new(crate::value::FrozenCell::new(rest_map))),
             );
         }
         Ok(true)
@@ -8774,7 +8780,7 @@ impl Interpreter {
                 ("str", Value::Str(_))
                     | ("int", Value::Int(_))
                     | ("int", Value::Bool(_))
-                    | ("float", Value::Float(_))
+                    | ("float", Value::FloatData(_))
                     | ("bool", Value::Bool(_))
                     | ("bytes", Value::Bytes(_))
                     | ("list", Value::List(_))
@@ -8980,7 +8986,7 @@ fn model_dump_value(v: &Value) -> Value {
                     );
                 }
             }
-            Value::Dict(Rc::new(RefCell::new(map)))
+            Value::Dict(Rc::new(crate::value::FrozenCell::new(map)))
         }
         Value::List(items) => Value::List(Rc::new(RefCell::new(
             items.borrow().iter().map(model_dump_value).collect(),
@@ -8991,7 +8997,7 @@ fn model_dump_value(v: &Value) -> Value {
             for (k, item) in d.borrow().iter() {
                 map.insert(k.clone(), model_dump_value(item));
             }
-            Value::Dict(Rc::new(RefCell::new(map)))
+            Value::Dict(Rc::new(crate::value::FrozenCell::new(map)))
         }
         other => other.clone(),
     }
@@ -9370,8 +9376,12 @@ fn builtin_type_method(ty: &'static str, attr: &str) -> Option<Value> {
         "str" => Value::Str(Rc::new(String::new())),
         "bytes" => Value::Bytes(Rc::new(Vec::new())),
         "list" => Value::List(Rc::new(RefCell::new(Vec::new()))),
-        "dict" => Value::Dict(Rc::new(RefCell::new(crate::value::DictMap::new()))),
-        "set" | "frozenset" => Value::Set(Rc::new(RefCell::new(Default::default()))),
+        "dict" => Value::Dict(Rc::new(crate::value::FrozenCell::new(
+            crate::value::DictMap::new(),
+        ))),
+        "set" | "frozenset" => {
+            Value::Set(Rc::new(crate::value::FrozenCell::new(Default::default())))
+        }
         "tuple" => Value::Tuple(Rc::new(Vec::new())),
         "int" | "bool" => Value::Int(crate::value::VmInt::from(0)),
         "float" => Value::Float(0.0),
@@ -9525,13 +9535,13 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
         return match attr {
             "__floordiv__" | "__rfloordiv__" | "__divmod__" | "__int__" | "__float__"
             | "__round__" | "__trunc__" | "__floor__" | "__ceil__" => {
-                matches!(value, Value::Int(_) | Value::Bool(_) | Value::Float(_))
+                matches!(value, Value::Int(_) | Value::Bool(_) | Value::FloatData(_))
             }
             "__radd__" | "__truediv__" | "__rtruediv__" | "__pow__" | "__rpow__" | "__neg__"
             | "__pos__" | "__abs__" => {
                 matches!(
                     value,
-                    Value::Int(_) | Value::Bool(_) | Value::Float(_) | Value::Complex(..)
+                    Value::Int(_) | Value::Bool(_) | Value::FloatData(_) | Value::Complex(..)
                 )
             }
             "__invert__" | "__lshift__" | "__rshift__" | "__index__" => {
@@ -9546,7 +9556,7 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                         | Value::Tuple(_)
                         | Value::Int(_)
                         | Value::Bool(_)
-                        | Value::Float(_)
+                        | Value::FloatData(_)
                         | Value::Complex(..)
                 )
             }
@@ -9557,7 +9567,7 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                         | Value::Bytes(_)
                         | Value::Int(_)
                         | Value::Bool(_)
-                        | Value::Float(_)
+                        | Value::FloatData(_)
                 )
             }
             "__sub__" | "__rsub__" => {
@@ -9566,7 +9576,7 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                     Value::Set(_)
                         | Value::Int(_)
                         | Value::Bool(_)
-                        | Value::Float(_)
+                        | Value::FloatData(_)
                         | Value::Complex(..)
                         | Value::DictView { .. }
                 )
@@ -9604,7 +9614,7 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                         | Value::Tuple(_)
                         | Value::Int(_)
                         | Value::Bool(_)
-                        | Value::Float(_)
+                        | Value::FloatData(_)
                         | Value::Complex(..)
                 )
             }
@@ -9614,7 +9624,7 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                     Value::Range { .. }
                         | Value::Int(_)
                         | Value::Bool(_)
-                        | Value::Float(_)
+                        | Value::FloatData(_)
                         | Value::Complex(..)
                         | Value::None
                 )
@@ -9811,7 +9821,7 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                 | "update"
         ),
         Value::Tuple(_) => matches!(attr, "count" | "index"),
-        Value::Float(_) => matches!(
+        Value::FloatData(_) => matches!(
             attr,
             "is_integer" | "conjugate" | "real" | "imag" | "hex" | "as_integer_ratio"
         ),
@@ -10350,6 +10360,7 @@ fn values_identical(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (None, None) => true,
         (Bool(x), Bool(y)) => x == y,
+        (FloatData(x), FloatData(y)) => x.identity != 0 && x.identity == y.identity,
         (Int(x), Int(y)) => x == y,
         (Str(x), Str(y)) => Rc::ptr_eq(x, y) || x == y,
         (List(x), List(y)) => Rc::ptr_eq(x, y),
@@ -10372,7 +10383,7 @@ fn values_identical(a: &Value, b: &Value) -> bool {
 /// can fail for a reason other than their types (a NaN). `complex` is
 /// deliberately excluded: CPython refuses to order it at all.
 fn both_numeric(l: &Value, r: &Value) -> bool {
-    let numeric = |v: &Value| matches!(v, Value::Int(_) | Value::Float(_) | Value::Bool(_));
+    let numeric = |v: &Value| matches!(v, Value::Int(_) | Value::FloatData(_) | Value::Bool(_));
     numeric(l) && numeric(r)
 }
 
@@ -10887,7 +10898,7 @@ fn require_str_return(v: Value, dunder: &str) -> Result<String, Unwind> {
 fn value_as_complex(v: &Value) -> Option<(f64, f64)> {
     match v {
         Value::Complex(re, im) => Some((*re, *im)),
-        Value::Float(x) => Some((*x, 0.0)),
+        Value::FloatData(crate::value::VmFloat { value: x, .. }) => Some((*x, 0.0)),
         Value::Int(i) => Some((i.to_f64(), 0.0)),
         Value::Bool(b) => Some((*b as i64 as f64, 0.0)),
         _ => None,
@@ -11761,7 +11772,7 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
     // The conversion type implies a *numeric* default alignment (right);
     // zero-pad implies fill='0' and align='=' (sign before pad). Strings
     // default to left-aligned. We approximate by tracking `is_numeric`.
-    let is_numeric = matches!(value, Value::Int(_) | Value::Float(_) | Value::Bool(_));
+    let is_numeric = matches!(value, Value::Int(_) | Value::FloatData(_) | Value::Bool(_));
     if zero_pad && align.is_none() {
         align = Some('=');
         fill = '0';
@@ -11835,7 +11846,7 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
     };
 
     match value {
-        Value::Float(x) => {
+        Value::FloatData(crate::value::VmFloat { value: x, .. }) => {
             let p = precision.unwrap_or(6);
             let (abs, neg) = (x.abs(), *x < 0.0 || x.is_sign_negative());
             // CPython formats NaN and inf with lowercase letters regardless of

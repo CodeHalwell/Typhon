@@ -572,6 +572,9 @@ pub fn install(interp: &mut Interpreter) {
 
     native!("float", |i, args| {
         let v = single(&args, "float")?;
+        if matches!(v, Value::FloatData(_)) {
+            return Ok(v.clone());
+        }
         // A user `__float__` (then `__index__`), as CPython's conversion
         // protocol prescribes.
         // `int(bytearray(b"7"))` — a bytes-like converts like `bytes`.
@@ -731,7 +734,7 @@ pub fn install(interp: &mut Interpreter) {
                 for (k, v) in inst.fields.borrow().iter() {
                     m.insert(HashKey::Str(Rc::new(k.clone())), v.clone());
                 }
-                Ok(Value::Dict(Rc::new(RefCell::new(m))))
+                Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(m))))
             }
             // `vars(module)` returns the module namespace (review: gemini).
             Some(Value::Module(md)) => {
@@ -739,7 +742,7 @@ pub fn install(interp: &mut Interpreter) {
                 for (k, v) in md.members.borrow().iter() {
                     m.insert(HashKey::Str(Rc::new(k.clone())), v.clone());
                 }
-                Ok(Value::Dict(Rc::new(RefCell::new(m))))
+                Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(m))))
             }
             Some(other) => Err(type_error(format!(
                 "vars() argument must have __dict__, not '{}'",
@@ -875,7 +878,7 @@ pub fn install(interp: &mut Interpreter) {
                 out.insert(k);
             }
         }
-        Ok(Value::Set(Rc::new(RefCell::new(out))))
+        Ok(Value::Set(Rc::new(crate::value::FrozenCell::new(out))))
     });
 
     native!("dict", |i, args| {
@@ -883,7 +886,9 @@ pub fn install(interp: &mut Interpreter) {
         if let Some(v) = args.into_iter().next() {
             // `dict(other_dict)` — shallow copy of an existing mapping.
             if let Value::Dict(d) = &v {
-                return Ok(Value::Dict(Rc::new(RefCell::new(d.borrow().clone()))));
+                return Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(
+                    d.borrow().clone(),
+                ))));
             }
             // `dict(mapping_instance)` — a synthesised mapping (e.g. the
             // `defaultdict` shim) exposes the mapping protocol via a `keys`
@@ -901,7 +906,7 @@ pub fn install(interp: &mut Interpreter) {
                         let key = i.settle_key_in_map(&map, key)?;
                         map.insert(key, val);
                     }
-                    return Ok(Value::Dict(Rc::new(RefCell::new(map))));
+                    return Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(map))));
                 }
             }
             let it = i.make_iter(v)?;
@@ -916,7 +921,7 @@ pub fn install(interp: &mut Interpreter) {
                 }
             }
         }
-        Ok(Value::Dict(Rc::new(RefCell::new(map))))
+        Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(map))))
     });
 
     // `slice(stop)` / `slice(start, stop[, step])` — the same marker tuple the
@@ -952,11 +957,8 @@ pub fn install(interp: &mut Interpreter) {
                 out.insert(k);
             }
         }
-        // Insert the `__typhon_frozen__` sentinel so that repr(), py_str(),
-        // and set_is_frozen() all recognise this as a frozenset and not a
-        // plain mutable set. Matches the sentinel path used by deep_freeze_value.
-        out.insert(HashKey::Str(Rc::new("__typhon_frozen__".to_owned())));
-        Ok(Value::Set(Rc::new(RefCell::new(out))))
+        // Frozen metadata lives outside user-visible container contents.
+        Ok(Value::Set(Rc::new(crate::value::FrozenCell::frozen(out))))
     });
 
     native!("repr", |interp, args| Ok(Value::Str(Rc::new(
@@ -1025,7 +1027,7 @@ pub fn install(interp: &mut Interpreter) {
 
     native!("abs", |i, args| match single(&args, "abs")? {
         Value::Int(n) => Ok(Value::Int(n.abs())),
-        Value::Float(x) => Ok(Value::Float(x.abs())),
+        Value::FloatData(crate::value::VmFloat { value: x, .. }) => Ok(Value::Float(x.abs())),
         Value::Bool(b) => Ok(Value::Int(VmInt::from(*b as i64))),
         // `abs(complex)` is the Euclidean magnitude (a float), matching CPython.
         Value::Complex(re, im) => Ok(Value::Float((re * re + im * im).sqrt())),
@@ -1055,7 +1057,7 @@ pub fn install(interp: &mut Interpreter) {
         fn part(v: &Value, what: &str) -> Result<f64, Unwind> {
             match v {
                 Value::Int(n) => Ok(n.to_f64()),
-                Value::Float(x) => Ok(*x),
+                Value::FloatData(crate::value::VmFloat { value: x, .. }) => Ok(*x),
                 Value::Bool(b) => Ok(*b as i64 as f64),
                 _ => Err(type_error(format!(
                     "complex() {what} argument must be a number, not '{}'",
@@ -1389,7 +1391,7 @@ pub fn install(interp: &mut Interpreter) {
                     _ => Ok(Value::Int(i.clone())),
                 }
             }
-            Some(Value::Float(x)) => {
+            Some(Value::FloatData(crate::value::VmFloat { value: x, .. })) => {
                 let x = *x;
                 match args.get(1) {
                     // round(x, ndigits) -> float, round-half-to-even on the
@@ -1856,7 +1858,7 @@ fn builtin_sum(i: &mut Interpreter, iterable: Value, start: Value) -> Result<Val
     let it = i.make_iter(iterable)?;
     let mut result = start;
     loop {
-        if let Value::Float(f0) = result {
+        if let Value::FloatData(crate::value::VmFloat { value: f0, .. }) = result {
             let mut f_result = f0;
             let mut c = 0.0f64;
             loop {
@@ -1869,7 +1871,7 @@ fn builtin_sum(i: &mut Interpreter, iterable: Value, start: Value) -> Result<Val
                     return Ok(Value::Float(f_result));
                 };
                 match &item {
-                    Value::Float(x) => {
+                    Value::FloatData(crate::value::VmFloat { value: x, .. }) => {
                         let x = *x;
                         let t = f_result + x;
                         if f_result.abs() >= x.abs() {
@@ -1941,7 +1943,7 @@ fn math_arg(v: &Value) -> Result<f64, Unwind> {
             }
             Ok(f)
         }
-        Value::Float(x) => Ok(*x),
+        Value::FloatData(crate::value::VmFloat { value: x, .. }) => Ok(*x),
         Value::Bool(b) => Ok(*b as i64 as f64),
         Value::Instance(_) => v.to_float(),
         other => Err(type_error(format!(
@@ -2109,16 +2111,8 @@ fn value_len(v: &Value) -> Result<usize, Unwind> {
         Value::Bytes(b) => b.len(),
         Value::List(l) => l.borrow().len(),
         Value::Tuple(t) => t.len(),
-        Value::Dict(d) => d
-            .borrow()
-            .keys()
-            .filter(|k| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
-            .count(),
-        Value::Set(s) => s
-            .borrow()
-            .iter()
-            .filter(|k| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
-            .count(),
+        Value::Dict(d) => d.borrow().keys().count(),
+        Value::Set(s) => s.borrow().iter().count(),
         Value::Range { start, stop, step } => {
             if *step > 0 {
                 ((stop - start).max(0) as usize).div_ceil(*step as usize)
@@ -2267,7 +2261,7 @@ pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
         // is `True` there. The VM answered `False`, taking the opposite branch
         // from the compiled program on the same source.
         ("int", Value::Bool(_)) => true,
-        ("float", Value::Float(_)) => true,
+        ("float", Value::FloatData(_)) => true,
         ("bool", Value::Bool(_)) => true,
         ("str", Value::Str(_)) => true,
         ("bytes", Value::Bytes(_)) => true,
@@ -2626,7 +2620,7 @@ fn make_collections_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
         );
         class_attrs.insert(
             "_field_defaults".to_owned(),
-            Value::Dict(Rc::new(RefCell::new(field_defaults))),
+            Value::Dict(Rc::new(crate::value::FrozenCell::new(field_defaults))),
         );
         let cls = Rc::new(crate::value::Class {
             name: typename,
@@ -4553,9 +4547,16 @@ fn math_sumprod(interp: &mut Interpreter, p: Value, q: Value) -> Result<Value, U
         }
         if flt_path_enabled {
             let pair = match (&p_i, &q_i) {
-                (Value::Float(a), Value::Float(b)) => Some((*a, *b)),
-                (Value::Float(a), Value::Int(b)) => int_as_double(b).map(|b| (*a, b)),
-                (Value::Int(a), Value::Float(b)) => int_as_double(a).map(|a| (a, *b)),
+                (
+                    Value::FloatData(crate::value::VmFloat { value: a, .. }),
+                    Value::FloatData(crate::value::VmFloat { value: b, .. }),
+                ) => Some((*a, *b)),
+                (Value::FloatData(crate::value::VmFloat { value: a, .. }), Value::Int(b)) => {
+                    int_as_double(b).map(|b| (*a, b))
+                }
+                (Value::Int(a), Value::FloatData(crate::value::VmFloat { value: b, .. })) => {
+                    int_as_double(a).map(|a| (a, *b))
+                }
                 _ => None,
             };
             let folded = pair.map(|(a, b)| tl_fma(a, b, flt_total));
@@ -4993,9 +4994,9 @@ fn stat_tuple(m: &std::fs::Metadata) -> Value {
         int(a),
         int(mt),
         int(c),
-        Value::Float(a as f64 + an as f64 * 1e-9),
-        Value::Float(mt as f64 + mn as f64 * 1e-9),
-        Value::Float(c as f64 + cn as f64 * 1e-9),
+        Value::FloatData(a as f64 + an as f64 * 1e-9),
+        Value::FloatData(mt as f64 + mn as f64 * 1e-9),
+        Value::FloatData(c as f64 + cn as f64 * 1e-9),
         int(a * 1_000_000_000 + an),
         int(mt * 1_000_000_000 + mn),
         int(c * 1_000_000_000 + cn),
@@ -5526,7 +5527,7 @@ fn make_os_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
             for (k, v) in std::env::vars() {
                 m.insert(HashKey::Str(Rc::new(k)), Value::Str(Rc::new(v)));
             }
-            Value::Dict(Rc::new(RefCell::new(m)))
+            Value::Dict(Rc::new(crate::value::FrozenCell::new(m)))
         };
         let mut seed = fs_natives();
         seed.push(("_environ", env_dict.clone()));
@@ -5638,7 +5639,7 @@ pub(crate) fn sys_modules_dict(interp: &Interpreter) -> Value {
             map.insert(HashKey::Str(Rc::new(name.clone())), v.clone());
         }
     }
-    Value::Dict(Rc::new(RefCell::new(map)))
+    Value::Dict(Rc::new(crate::value::FrozenCell::new(map)))
 }
 
 /// The current `sys.stdout` / `sys.stderr` when user code has replaced it
@@ -6203,7 +6204,7 @@ fn make_random_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
                 Value::None => self.seed_int(&num_bigint::BigInt::from(entropy_seed())),
                 Value::Int(n) => self.seed_int(&n.to_bigint()),
                 Value::Bool(b) => self.seed_int(&num_bigint::BigInt::from(*b as i64)),
-                Value::Float(f) => self.seed_int(&num_bigint::BigInt::from(
+                Value::FloatData(crate::value::VmFloat { value: f, .. }) => self.seed_int(&num_bigint::BigInt::from(
                     crate::pyhash::float_hash(*f) as u64,
                 )),
                 Value::Str(s) => self.seed_bytes(s.as_bytes()),
@@ -6757,11 +6758,20 @@ fn make_re_module() -> Value {
     // inline group the Rust engine understands. `ASCII` / `UNICODE` /
     // `LOCALE` / `DEBUG` are accepted and have no effect here.
     fn compile_one(p: &str, flags: i64) -> Result<regex::Regex, Unwind> {
+        if flags & (4 | 128) != 0 || flags & !(2 | 8 | 16 | 32 | 64 | 256) != 0 {
+            return Err(re_error(p, "this flag requires tyc run --compile"));
+        }
+        if flags & 32 != 0 && flags & 256 != 0 {
+            return Err(re_error(p, "ASCII and UNICODE flags are incompatible"));
+        }
         let mut inline = String::new();
         for (bit, letter) in [(2, 'i'), (8, 'm'), (16, 's'), (64, 'x')] {
             if flags & bit != 0 {
                 inline.push(letter);
             }
+        }
+        if flags & 256 != 0 {
+            inline.push_str("-u");
         }
         let source = if inline.is_empty() {
             to_rust_pattern(p)
@@ -7058,7 +7068,10 @@ fn make_re_module() -> Value {
                     Value::Int(VmInt::from(idx as i64)),
                 );
             }
-            attrs.insert("groupindex".into(), Value::Dict(Rc::new(RefCell::new(d))));
+            attrs.insert(
+                "groupindex".into(),
+                Value::Dict(Rc::new(crate::value::FrozenCell::new(d))),
+            );
         }
         // Wrap the attrs in an Instance of the one shared `Pattern` class, so
         // `isinstance(p, re.Pattern)` and `type(p) is re.Pattern` hold. The
@@ -7167,7 +7180,7 @@ fn make_re_module() -> Value {
                     };
                     d.insert(HashKey::Str(Rc::new(name.clone())), v);
                 }
-                Ok(Value::Dict(Rc::new(RefCell::new(d))))
+                Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(d))))
             }))),
         );
         // `.groups()` returns groups 1.. (not group 0).
@@ -8233,9 +8246,16 @@ fn make_heapq_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
         // instead of crashing.
         match (a, b) {
             (Value::Int(x), Value::Int(y)) => x < y,
-            (Value::Float(x), Value::Float(y)) => x < y,
-            (Value::Int(x), Value::Float(y)) => x.to_f64() < *y,
-            (Value::Float(x), Value::Int(y)) => *x < y.to_f64(),
+            (
+                Value::FloatData(crate::value::VmFloat { value: x, .. }),
+                Value::FloatData(crate::value::VmFloat { value: y, .. }),
+            ) => x < y,
+            (Value::Int(x), Value::FloatData(crate::value::VmFloat { value: y, .. })) => {
+                x.to_f64() < *y
+            }
+            (Value::FloatData(crate::value::VmFloat { value: x, .. }), Value::Int(y)) => {
+                *x < y.to_f64()
+            }
             (Value::Str(x), Value::Str(y)) => x < y,
             (Value::Tuple(x), Value::Tuple(y)) => {
                 for (xi, yi) in x.iter().zip(y.iter()) {
@@ -8395,23 +8415,14 @@ fn make_heapq_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
     Ok(make_module("heapq", entries))
 }
 
-/// Whether a `Value::Dict` carries the `__typhon_frozen__` sentinel
-/// (inserted by `deep_freeze_value`). Used by the dict mutators to
-/// raise the same TypeError CPython's MappingProxy produces.
-pub fn dict_is_frozen(d: &Rc<RefCell<DictMap>>) -> bool {
-    let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
-    matches!(d.borrow().get(&frozen_key), Some(Value::Bool(true)))
+// Frozen metadata lives outside user-visible container contents.
+pub fn dict_is_frozen(d: &Rc<crate::value::FrozenCell<DictMap>>) -> bool {
+    d.frozen.get()
 }
 
-/// Whether a `Value::Set` carries the `__typhon_frozen__` sentinel
-/// (inserted by `deep_freeze_value`'s Set arm). `set_method` mutators
-/// (`add`, `remove`, `discard`, `pop`, `clear`, `update`, etc.) refuse
-/// to operate on a frozen set; iteration / len / repr filter the
-/// sentinel out of user-visible output. Review thread codex + copilot
-/// on PR #147.
-pub fn set_is_frozen(s: &Rc<RefCell<std::collections::HashSet<HashKey>>>) -> bool {
-    let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
-    s.borrow().contains(&frozen_key)
+// Frozen metadata lives outside user-visible container contents.
+pub fn set_is_frozen(s: &Rc<crate::value::FrozenCell<std::collections::HashSet<HashKey>>>) -> bool {
+    s.frozen.get()
 }
 
 /// Deep-freeze a value the same way `typhon_runtime.freeze.deep_freeze`
@@ -8427,7 +8438,7 @@ fn deep_freeze_value(v: Value) -> Result<Value, Unwind> {
         Value::None
         | Value::Bool(_)
         | Value::Int(_)
-        | Value::Float(_)
+        | Value::FloatData(_)
         | Value::Complex(..)
         | Value::Str(_)
         | Value::Bytes(_)
@@ -8458,45 +8469,29 @@ fn deep_freeze_value(v: Value) -> Result<Value, Unwind> {
             Ok(Value::Tuple(Rc::new(frozen)))
         }
         Value::Dict(d) => {
-            // Build a fresh dict, freeze each value, then insert a hidden
-            // `__typhon_frozen__` sentinel that the dict method dispatch
-            // table consults before mutation.
+            // Frozen metadata lives outside user-visible container contents.
             let mut new_map: DictMap = IndexMap::new();
             for (k, val) in d.borrow().iter() {
                 let frozen_val = deep_freeze_value(val.clone())?;
                 new_map.insert(k.clone(), frozen_val);
             }
-            new_map.insert(
-                HashKey::Str(Rc::new("__typhon_frozen__".to_owned())),
-                Value::Bool(true),
-            );
-            Ok(Value::Dict(Rc::new(RefCell::new(new_map))))
+            Ok(Value::Dict(Rc::new(crate::value::FrozenCell::frozen(
+                new_map,
+            ))))
         }
         Value::Set(s) => {
-            // Tag the resulting set with the same `__typhon_frozen__`
-            // sentinel the Dict path uses; `set_is_frozen` checks for
-            // it before every mutator and refuses `add`/`remove`/
-            // `clear` (review threads codex and copilot on PR #147).
-            // Iteration / len / repr filter the sentinel so it never
-            // leaks into user-visible output.
-            let mut elements: std::collections::HashSet<HashKey> =
-                s.borrow().iter().cloned().collect();
-            elements.insert(HashKey::Str(Rc::new("__typhon_frozen__".to_owned())));
-            Ok(Value::Set(Rc::new(RefCell::new(elements))))
+            // Frozen metadata lives outside user-visible container contents.
+            let elements: std::collections::HashSet<HashKey> = s.borrow().iter().cloned().collect();
+            Ok(Value::Set(Rc::new(crate::value::FrozenCell::frozen(
+                elements,
+            ))))
         }
         Value::Instance(inst) => {
-            // Freeze every field in place; a frozen-class declaration on
-            // the type already keeps individual field assignments rejected
-            // at desugar time, so this is belt-and-braces.
-            let mut new_fields: crate::value::FieldMap = crate::value::FieldMap::new();
-            for (k, val) in inst.fields.borrow().iter() {
-                new_fields.insert(k.clone(), deep_freeze_value(val.clone())?);
+            if crate::value::class_flag(&inst.class, "__typhon_dc_frozen__", false) {
+                Ok(Value::Instance(inst))
+            } else {
+                Err(type_error("cannot freeze a non-frozen dataclass instance"))
             }
-            Ok(Value::Instance(Rc::new(crate::value::Instance {
-                class: inst.class.clone(),
-                fields: RefCell::new(new_fields),
-                chain: RefCell::new(None),
-            })))
         }
         Value::ResultOk(v) => Ok(Value::ResultOk(Box::new(deep_freeze_value(*v)?))),
         Value::ResultErr(v) => Ok(Value::ResultErr(Box::new(deep_freeze_value(*v)?))),
@@ -8541,7 +8536,9 @@ fn make_pydantic_module() -> Value {
     }));
     let config_dict = nf("ConfigDict", |_i, _args| {
         // Accept any kwargs and ignore — purely a config-record stub.
-        Ok(Value::Dict(Rc::new(RefCell::new(IndexMap::new()))))
+        Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(
+            IndexMap::new(),
+        ))))
     });
     make_module(
         "pydantic",
@@ -9085,7 +9082,7 @@ fn dataclass_convert(v: &Value, as_tuple: bool) -> Value {
                 for (name, x) in values {
                     map.insert(HashKey::Str(Rc::new(name)), dataclass_convert(x, false));
                 }
-                Value::Dict(Rc::new(RefCell::new(map)))
+                Value::Dict(Rc::new(crate::value::FrozenCell::new(map)))
             }
         }
         Value::List(l) => Value::List(Rc::new(RefCell::new(
@@ -9102,7 +9099,7 @@ fn dataclass_convert(v: &Value, as_tuple: bool) -> Value {
             for (k, x) in d.borrow().iter() {
                 map.insert(k.clone(), dataclass_convert(x, as_tuple));
             }
-            Value::Dict(Rc::new(RefCell::new(map)))
+            Value::Dict(Rc::new(crate::value::FrozenCell::new(map)))
         }
         other => other.clone(),
     }
@@ -9247,7 +9244,7 @@ pub fn dispatch_method(
         // ── tuple methods ──────────────────────────────────────────────────
         (Value::Tuple(t), m) => tuple_method(t, m, rest),
         // ── int/float/bool method calls ────────────────────────────────────
-        (Value::Int(_) | Value::Float(_) | Value::Bool(_), m) => num_method(&receiver, m, rest),
+        (Value::Int(_) | Value::FloatData(_) | Value::Bool(_), m) => num_method(&receiver, m, rest),
         _ => Err(attribute_error(format!(
             "'{}' object has no method '{}'",
             receiver.type_name(),
@@ -9289,7 +9286,7 @@ pub fn dict_fromkeys(interp: &mut Interpreter, args: Vec<Value>) -> Result<Value
         let key = interp.settle_key_in_map(&map, key)?;
         map.insert(key, fill.clone());
     }
-    Ok(Value::Dict(Rc::new(RefCell::new(map))))
+    Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(map))))
 }
 
 /// `str.maketrans(x[, y[, z]])` — build the translation table dict that
@@ -9366,7 +9363,7 @@ pub fn str_maketrans(args: &[Value]) -> Result<Value, Unwind> {
             )))
         }
     }
-    Ok(Value::Dict(Rc::new(RefCell::new(map))))
+    Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(map))))
 }
 
 fn str_method(
@@ -10990,7 +10987,7 @@ fn list_method(
 
 fn dict_method(
     interp: &mut Interpreter,
-    d: &Rc<RefCell<DictMap>>,
+    d: &Rc<crate::value::FrozenCell<DictMap>>,
     name: &str,
     args: &[Value],
 ) -> Result<Value, Unwind> {
@@ -11031,26 +11028,19 @@ fn dict_method(
             items: d
                 .borrow()
                 .keys()
-                .filter(|k| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
                 .cloned()
                 .map(HashKey::into_value)
                 .collect(),
         }),
         "values" => Ok(Value::DictView {
             kind: crate::value::DictViewKind::Values,
-            items: d
-                .borrow()
-                .iter()
-                .filter(|(k, _)| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
-                .map(|(_, v)| v.clone())
-                .collect(),
+            items: d.borrow().iter().map(|(_, v)| v.clone()).collect(),
         }),
         "items" => Ok(Value::DictView {
             kind: crate::value::DictViewKind::Items,
             items: d
                 .borrow()
                 .iter()
-                .filter(|(k, _)| !matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__"))
                 .map(|(k, v)| Value::Tuple(Rc::new(vec![k.clone().into_value(), v.clone()])))
                 .collect(),
         }),
@@ -11099,14 +11089,11 @@ fn dict_method(
             d.borrow_mut().clear();
             Ok(Value::None)
         }
-        "copy" => Ok(Value::Dict(Rc::new(RefCell::new(d.borrow().clone())))),
+        "copy" => Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(
+            d.borrow().clone(),
+        )))),
         "popitem" => {
-            // Remove and return the last inserted (key, value) pair (LIFO),
-            // matching CPython 3.7+. `OrderedDict.popitem(last=False)` pops
-            // FIFO instead. `IndexMap` preserves insertion order, so `pop()`
-            // removes the most-recently-added entry and `shift_remove_index(0)`
-            // the oldest. (Frozen dicts are rejected earlier by the
-            // `is_mutator` guard, so no `__typhon_frozen__` sentinel here.)
+            // Frozen metadata lives outside user-visible container contents.
             let last = kw
                 .iter()
                 .find(|(k, _)| k == "last")
@@ -11165,11 +11152,9 @@ fn dict_method(
                 Some(v) => Some(v.to_int()? as usize),
                 None => None,
             };
-            let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
             let mut pairs: Vec<(Value, i64)> = d
                 .borrow()
                 .iter()
-                .filter(|(k, _)| **k != frozen_key)
                 .map(|(k, v)| {
                     let count = match v {
                         Value::Int(n) => n.to_i64().unwrap_or(0),
@@ -11191,12 +11176,8 @@ fn dict_method(
         "elements" => {
             // `elements()` — iterate over each element repeated by its count.
             // Elements with count ≤ 0 are ignored (matches CPython Counter).
-            let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
             let mut out: Vec<Value> = Vec::new();
             for (k, v) in d.borrow().iter() {
-                if *k == frozen_key {
-                    continue;
-                }
                 let count = match v {
                     Value::Int(n) => n.to_i64().unwrap_or(0),
                     _ => 0,
@@ -11213,7 +11194,7 @@ fn dict_method(
 
 fn set_method(
     interp: &mut Interpreter,
-    s: &Rc<RefCell<HashSet<HashKey>>>,
+    s: &Rc<crate::value::FrozenCell<HashSet<HashKey>>>,
     name: &str,
     args: &[Value],
 ) -> Result<Value, Unwind> {
@@ -11249,18 +11230,9 @@ fn set_method(
             Ok(Value::None)
         }
         "copy" => {
-            // `copy()` on a frozen set returns a fresh *unfrozen* copy
-            // (the sentinel is filtered out) — matching CPython's
-            // `frozenset.copy()` returning a new frozenset with the
-            // same elements but no shared mutability link.
-            let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
-            let copied: HashSet<HashKey> = s
-                .borrow()
-                .iter()
-                .filter(|k| **k != frozen_key)
-                .cloned()
-                .collect();
-            Ok(Value::Set(Rc::new(RefCell::new(copied))))
+            let result = crate::value::FrozenCell::new(s.borrow().clone());
+            result.frozen.set(set_is_frozen(s));
+            Ok(Value::Set(Rc::new(result)))
         }
         "union" | "intersection" | "difference" | "symmetric_difference" => {
             let a = set_keys_no_sentinel(s);
@@ -11276,10 +11248,9 @@ fn set_method(
             }
             // A set operation on a `frozenset` yields a `frozenset` — carry the
             // immutability sentinel over so the result stays read-only.
-            if set_is_frozen(s) {
-                acc.insert(HashKey::Str(Rc::new("__typhon_frozen__".to_owned())));
-            }
-            Ok(Value::Set(Rc::new(RefCell::new(acc))))
+            let result = crate::value::FrozenCell::new(acc);
+            result.frozen.set(set_is_frozen(s));
+            Ok(Value::Set(Rc::new(result)))
         }
         "issubset" | "issuperset" | "isdisjoint" => {
             let a = set_keys_no_sentinel(s);
@@ -11303,13 +11274,10 @@ fn set_method(
 }
 
 /// The members of a set, excluding the internal `freeze let` sentinel.
-pub fn set_keys_no_sentinel(s: &Rc<RefCell<HashSet<HashKey>>>) -> HashSet<HashKey> {
-    let frozen_key = HashKey::Str(Rc::new("__typhon_frozen__".to_owned()));
-    s.borrow()
-        .iter()
-        .filter(|k| **k != frozen_key)
-        .cloned()
-        .collect()
+pub fn set_keys_no_sentinel(
+    s: &Rc<crate::value::FrozenCell<HashSet<HashKey>>>,
+) -> HashSet<HashKey> {
+    s.borrow().iter().cloned().collect()
 }
 
 /// Coerce a set-method argument (set / list / tuple / frozenset) into a key set.
@@ -11330,13 +11298,13 @@ fn tuple_method(t: &Rc<Vec<Value>>, name: &str, args: &[Value]) -> Result<Value,
         "count" => {
             let target = single(args, "count")?;
             Ok(Value::Int(VmInt::from(
-                t.iter().filter(|v| v.py_eq(target)).count() as i64,
+                t.iter().filter(|v| v.identical_or_equal(target)).count() as i64,
             )))
         }
         "index" => {
             let target = single(args, "index")?;
             t.iter()
-                .position(|v| v.py_eq(target))
+                .position(|v| v.identical_or_equal(target))
                 .map(|p| Value::Int(VmInt::from(p as i64)))
                 .ok_or_else(|| value_error("tuple.index(x): x not in tuple"))
         }
@@ -11346,7 +11314,9 @@ fn tuple_method(t: &Rc<Vec<Value>>, name: &str, args: &[Value]) -> Result<Value,
 
 fn num_method(v: &Value, name: &str, args: &[Value]) -> Result<Value, Unwind> {
     match (v, name) {
-        (Value::Float(x), "is_integer") => Ok(Value::Bool(x.fract() == 0.0 && x.is_finite())),
+        (Value::FloatData(crate::value::VmFloat { value: x, .. }), "is_integer") => {
+            Ok(Value::Bool(x.fract() == 0.0 && x.is_finite()))
+        }
         // The `numbers.Real` surface every int/float carries. `conjugate()`
         // is the identity for a real; `imag` is always 0 / 0.0.
         (Value::Int(i), "conjugate") => Ok(Value::Int(i.clone())),
@@ -11359,7 +11329,7 @@ fn num_method(v: &Value, name: &str, args: &[Value]) -> Result<Value, Unwind> {
             Value::Int(VmInt::from(i64::from(*b))),
             Value::Int(VmInt::from(1)),
         ]))),
-        (Value::Float(x), "as_integer_ratio") => {
+        (Value::FloatData(crate::value::VmFloat { value: x, .. }), "as_integer_ratio") => {
             if x.is_nan() {
                 return Err(value_error("cannot convert NaN to integer ratio"));
             }
@@ -11389,7 +11359,7 @@ fn num_method(v: &Value, name: &str, args: &[Value]) -> Result<Value, Unwind> {
         // `(2.5).hex()` → `0x1.4000000000000p+1`. IEEE-754 decomposition:
         // sign, an 11-bit biased exponent and a 52-bit mantissa, which is
         // exactly 13 hex digits.
-        (Value::Float(x), "hex") => {
+        (Value::FloatData(crate::value::VmFloat { value: x, .. }), "hex") => {
             let v = *x;
             if v.is_nan() {
                 return Ok(Value::Str(Rc::new("nan".to_owned())));
@@ -11414,7 +11384,9 @@ fn num_method(v: &Value, name: &str, args: &[Value]) -> Result<Value, Unwind> {
             };
             Ok(Value::Str(Rc::new(text)))
         }
-        (Value::Float(x), "conjugate") => Ok(Value::Float(*x)),
+        (Value::FloatData(crate::value::VmFloat { value: x, .. }), "conjugate") => {
+            Ok(Value::Float(*x))
+        }
         (Value::Bool(b), "conjugate") => Ok(Value::Int(VmInt::from(i64::from(*b)))),
         (Value::Int(i), "bit_length") => Ok(Value::Int(VmInt::from(i.bits() as i64))),
         // `(n).bit_count()` — number of set bits in the absolute value.
@@ -11665,7 +11637,9 @@ fn json_write(
         Value::None => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Value::Int(i) => out.push_str(&i.to_string()),
-        Value::Float(x) => out.push_str(&json_float(*x, opts.allow_nan)?),
+        Value::FloatData(crate::value::VmFloat { value: x, .. }) => {
+            out.push_str(&json_float(*x, opts.allow_nan)?)
+        }
         Value::Str(s) => json_string_into(s, opts.ensure_ascii, out),
         Value::List(l) => {
             let items = l.borrow();
@@ -11679,11 +11653,7 @@ fn json_write(
             // rendered form would order `"é"` before `"z"`.
             let mut entries: Vec<(String, String, &Value)> = Vec::with_capacity(d.len());
             for (k, val) in d.iter() {
-                // The `__typhon_frozen__` sentinel a `freeze let` inserts is
-                // not part of the value.
-                if matches!(k, HashKey::Str(s) if s.as_str() == "__typhon_frozen__") {
-                    continue;
-                }
+                // Frozen metadata lives outside user-visible container contents.
                 let key_value = k.clone().into_value();
                 let rendered = json_key(&key_value, opts)?;
                 let sort_key = match &key_value {
@@ -11777,7 +11747,9 @@ fn json_key(v: &Value, opts: &JsonDumpOpts) -> Result<String, Unwind> {
         Value::Str(s) => json_string(s, opts.ensure_ascii),
         Value::Int(i) => json_string(&i.to_string(), true),
         Value::Bool(b) => json_string(if *b { "true" } else { "false" }, true),
-        Value::Float(x) => json_string(&json_float(*x, opts.allow_nan)?, true),
+        Value::FloatData(crate::value::VmFloat { value: x, .. }) => {
+            json_string(&json_float(*x, opts.allow_nan)?, true)
+        }
         Value::None => json_string("null", true),
         other => {
             return Err(type_error(format!(
@@ -12015,7 +11987,7 @@ impl JsonParser<'_> {
         self.skip_ws();
         if self.peek() == Some('}') {
             self.pos += 1;
-            return Ok(Value::Dict(Rc::new(RefCell::new(map))));
+            return Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(map))));
         }
         loop {
             if self.peek() != Some('"') {
@@ -12050,7 +12022,7 @@ impl JsonParser<'_> {
                 _ => return Err(self.err("Expecting ',' delimiter", self.pos)),
             }
         }
-        Ok(Value::Dict(Rc::new(RefCell::new(map))))
+        Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(map))))
     }
     fn parse_array(&mut self) -> Result<Value, Unwind> {
         self.pos += 1; // [
@@ -12230,7 +12202,7 @@ pub fn make_kwargs_sentinel(kwargs: &[(String, Value)]) -> Value {
     }
     Value::Tuple(Rc::new(vec![
         Value::Str(Rc::new(KWARGS_MARKER.to_owned())),
-        Value::Dict(Rc::new(RefCell::new(m))),
+        Value::Dict(Rc::new(crate::value::FrozenCell::new(m))),
     ]))
 }
 

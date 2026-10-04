@@ -659,3 +659,5 @@ interp.root.set("custom", tyc_vm::Value::Int(42.into()));
 ```
 
 The crate is in `tyc/crates/tyc-vm`. See `lib.rs` for the public surface.
+
+Regular-expression imports (`re`) select compiled CPython execution in normal `tyc run`, before user code starts, so dynamic patterns, lookaround, backreferences and Python flags retain their Python semantics. `--no-fallback` explicitly requires the VM subset; unsupported regex syntax or flags raise an error. The VM honours `re.ASCII` for its supported patterns.

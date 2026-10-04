@@ -660,6 +660,90 @@ mod tests {
     /// relative-path assertion in the suite nondeterministic. Serialise them.
     static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    #[test]
+    fn review_nan_identity_in_containers() {
+        assert_eq!(
+            run_capturing(
+                r###"let x: float = float("nan")
+let y: float = float("nan")
+assert not (x == x)
+assert [x] == [x]
+assert (x,) == (x,)
+assert {"n": x} == {"n": x}
+assert x in [x]
+assert not (y in [x])
+assert not ([x] == [y])
+let d: dict[float, int] = {x: 1, y: 2}
+assert len(d) == 2
+assert d[x] == 1
+assert d[y] == 2
+"###
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn review_frozen_metadata_and_instance_identity() {
+        assert_eq!(
+            run_capturing(
+                r###"let key: str = "__typhon_frozen__"
+let d: dict[str, int] = {key: 1}
+d["x"] = 2
+freeze let D: dict[str, int] = d
+assert len(D) == 2
+assert D[key] == 1
+freeze let S: set[str] = {key}
+assert key in S
+assert key in S.union({"x"})
+assert len(S.union({"x"})) == 2
+class Box frozen:
+    values: list[int]
+let b: Box = Box(values=[1])
+freeze let B: Box = b
+assert B is b
+B.values.append(2)
+assert B.values == [1, 2]
+"###
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn review_question_evaluates_prior_arguments_before_success_and_error() {
+        assert_eq!(
+            run_capturing(
+                r###"let calls: list[str] = []
+def first() -> int:
+    calls.append("first")
+    return 1
+def second(fail: bool) -> Result[int, str]:
+    calls.append("second")
+    return Err("bad") if fail else Ok(2)
+def combine(a: int, b: int) -> int:
+    return a + b
+def use(fail: bool) -> Result[int, str]:
+    return Ok(combine(
+        first(),
+        second(fail)?,
+    ))
+let result = use(False)
+assert calls == ["first", "second"]
+assert result.value == 3
+calls.clear()
+let failed = use(True)
+assert calls == ["first", "second"]
+assert failed.error == "bad"
+"###
+            )
+            .unwrap(),
+            0
+        );
+    }
+
     /// The declared list and the resolver must agree: a name in the list
     /// that no longer resolves would send `tyc run` into the VM for a
     /// module it cannot serve, and one the resolver serves but the list

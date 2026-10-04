@@ -501,6 +501,10 @@ fn unmodelled_references(path: &std::path::Path, entry: &std::path::Path) -> Opt
         };
         missing.extend(unmodelled_attribute_references(&module, &mut exports));
         for root in tyc_resolve::collect_imported_roots(&module) {
+            if root == "re" {
+                missing.insert("re (Python regular-expression semantics)".into());
+                continue;
+            }
             if tyc_vm::models_module(&root) || project_roots.contains(&root) {
                 continue;
             }
