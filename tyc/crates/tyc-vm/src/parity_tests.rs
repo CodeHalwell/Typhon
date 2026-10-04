@@ -1184,3 +1184,190 @@ trap("count kw", lambda: "a".count(sub="a"))
 "#,
     );
 }
+
+// ── PR #493 review: VM ↔ CPython parity ───────────────────────────────────
+
+#[test]
+fn pr493_a_class_named_object_is_not_the_builtin_root() {
+    // The builtin `object` placeholder was recognised by its name, so a user
+    // class called `object` was moved to the end of `C(object, B)`'s MRO
+    // (`C().who()` found `B.who`), dropped from `__mro__`, and treated as the
+    // root by `isinstance` / `issubclass`.
+    assert_matches_cpython(
+        "pr493_a_class_named_object_is_not_the_builtin_root",
+        r#"root = object
+plain class object:
+    def who(self) -> str:
+        return "user object"
+plain class B:
+    def who(self) -> str:
+        return "B"
+plain class C(object, B):
+    pass
+show(C().who(), [k.__name__ for k in C.__mro__], len(C.__mro__))
+show(isinstance(5, object), isinstance(C(), object), isinstance(B(), object))
+show(issubclass(int, object), issubclass(C, object), issubclass(B, object))
+plain class D(B, root):
+    pass
+show(isinstance(5, root), isinstance(C(), root), issubclass(C, root), issubclass(object, root))
+show([k.__name__ for k in D.__mro__], D().who())
+"#,
+    );
+}
+
+#[test]
+fn pr493_checked_casts_resolve_a_rebound_target_name() {
+    // The cast picked the container kind (and the `float` / `Any` /
+    // `object` shortcuts) from the target's spelling, so after
+    // `list = tuple` the VM checked `x as! list[int]` against `list` where
+    // the compiled program checks `tuple[int]`.
+    assert_matches_cpython_with(
+        "pr493_checked_casts_resolve_a_rebound_target_name",
+        r#"from typing import Any, List, Optional, Sequence
+plain class Obj:
+    pass
+def cast(label: str, value: object, thunk: Any) -> None:
+    try:
+        r = thunk(value)
+        out.append(label + " = " + repr(r))
+    except BaseException as e:
+        out.append(label + " ! " + type(e).__name__ + ": " + str(e))
+def rebound() -> None:
+    list = tuple
+    float = int
+    L = List
+    Opt = Optional
+    Seq = Sequence
+    object = Obj
+    Any = int
+    cast("list[int] one", (1,), lambda v: __typhon_checked_cast__(v, list[int]))
+    cast("list[int] two", (1, 2), lambda v: __typhon_checked_cast__(v, list[int]))
+    cast("list[int] list", [1], lambda v: __typhon_checked_cast__(v, list[int]))
+    cast("list bare", (1, 2), lambda v: __typhon_checked_cast__(v, list))
+    cast("list bare list", [1], lambda v: __typhon_checked_cast__(v, list))
+    cast("float", 1.5, lambda v: __typhon_checked_cast__(v, float))
+    cast("float int", 2, lambda v: __typhon_checked_cast__(v, float))
+    cast("L[int]", [1], lambda v: __typhon_checked_cast__(v, L[int]))
+    cast("L[int] bad", [1, "a"], lambda v: __typhon_checked_cast__(v, L[int]))
+    cast("Opt[int]", None, lambda v: __typhon_checked_cast__(v, Opt[int]))
+    cast("Opt[int] bad", "a", lambda v: __typhon_checked_cast__(v, Opt[int]))
+    cast("Seq[int] bad", (1, "a"), lambda v: __typhon_checked_cast__(v, Seq[int]))
+    cast("object", 5, lambda v: __typhon_checked_cast__(v, object))
+    cast("object obj", Obj(), lambda v: type(__typhon_checked_cast__(v, object)).__name__)
+    cast("Any", "a", lambda v: __typhon_checked_cast__(v, Any))
+rebound()
+cast("list[int] builtin", (1,), lambda v: __typhon_checked_cast__(v, list[int]))
+cast("object builtin", 5, lambda v: __typhon_checked_cast__(v, object))
+cast("Any builtin", "a", lambda v: __typhon_checked_cast__(v, Any))
+"#,
+        &cast_runtime_py(),
+    );
+}
+
+#[test]
+fn pr493_datetime_and_path_instances_refuse_attribute_writes() {
+    // `freeze let` passes a date / time / timedelta / timezone / path
+    // through as already immutable, but the VM's shims stored attributes
+    // like any plain instance: `d.year = 1`, `d.foo = 1` and `p.foo = 1`
+    // succeeded where CPython's C types (and `PurePath`'s slots) refuse
+    // them — frozen or not.
+    assert_matches_cpython_with(
+        "pr493_datetime_and_path_instances_refuse_attribute_writes",
+        r#"import datetime
+import pathlib
+def attempt(label: str, obj: object, name: str) -> None:
+    trap(label + " set " + name, lambda: setattr(obj, name, 1))
+    trap(label + " del " + name, lambda: delattr(obj, name))
+D = __typhon_freeze__(datetime.date(2020, 1, 2))
+P = __typhon_freeze__(pathlib.PurePosixPath("a/b"))
+objs = [
+    ("D", D),
+    ("datetime", datetime.datetime(2020, 1, 2, 3, 4)),
+    ("time", datetime.time(1, 2)),
+    ("timedelta", datetime.timedelta(1)),
+    ("utc", datetime.timezone.utc),
+    ("tz", datetime.timezone(datetime.timedelta(hours=1))),
+    ("iso", datetime.date(2020, 1, 2).isocalendar()),
+    ("P", P),
+    ("path", pathlib.Path("a/b")),
+]
+names = ["year", "month", "day", "hour", "minute", "second", "microsecond", "tzinfo", "fold",
+         "days", "seconds", "microseconds", "week", "weekday", "foo", "name", "parts",
+         "min", "max", "resolution", "utc", "isoformat", "joinpath", "_drv"]
+for label, obj in objs:
+    for name in names:
+        attempt(label, obj, name)
+show(D, D.year, P, P.name, datetime.timedelta(1).days)
+plain class MyDate(datetime.date):
+    pass
+m = MyDate(2020, 1, 2)
+trap("sub foo", lambda: setattr(m, "foo", 1))
+trap("sub year", lambda: setattr(m, "year", 1))
+trap("sub min", lambda: setattr(m, "min", 1))
+show(m.foo, m.year, m.min)
+plain class Zone(datetime.tzinfo):
+    pass
+z = Zone()
+z.label = "x"
+show(z.label)
+"#,
+        &runtime_py(
+            "TYPHON_RUNTIME_FREEZE_PY",
+            "__typhon_freeze__ = deep_freeze",
+        ),
+    );
+}
+
+#[test]
+fn pr493_set_operators_keep_cpython_result_types_and_identity() {
+    // `frozenset | d.keys()` came back a frozenset (the view's reflected
+    // operator builds a `set`), and `s |= t` / `&=` / `-=` / `^=` rebound
+    // the name to a new set, so an alias (or the object behind a field)
+    // never saw the change.
+    assert_matches_cpython(
+        "pr493_set_operators_keep_cpython_result_types_and_identity",
+        r#"f = frozenset([1, 2])
+d = {"a": 1}
+show(repr(f | d.keys()), repr(d.keys() | f), repr(f - d.keys()), repr(f & d.keys()), repr(f ^ d.keys()))
+show(repr(f | {3}), repr({3} | f), repr(f.union([4])), repr(f.intersection({1})), repr(f.difference([1])), repr(f.symmetric_difference({9})))
+s = {1}
+alias = s
+s |= {2}
+s &= {1, 2, 3}
+s -= {9}
+s ^= {5}
+show(repr(s), repr(alias), s is alias)
+t = {1}
+talias = t
+t |= frozenset([2])
+show(repr(t), t is talias)
+u = {1}
+ualias = u
+u |= d.keys()
+show(repr(u), repr(ualias), u is ualias)
+v = {1, 2}
+v ^= v
+w = {1, 2}
+w -= w
+x = {1, 2}
+x &= x
+x |= x
+show(repr(v), repr(w), repr(x))
+g = frozenset([1])
+galias = g
+g |= {2}
+show(repr(g), repr(galias), g is galias)
+plain class Holder:
+    def __init__(self) -> None:
+        self.items = {1}
+h = Holder()
+keep = h.items
+h.items |= {7}
+show(repr(keep), keep is h.items)
+lst = [{1}]
+first = lst[0]
+lst[0] -= {1}
+show(repr(lst), first is lst[0])
+"#,
+    );
+}

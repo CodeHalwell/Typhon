@@ -264,8 +264,19 @@ impl Interpreter {
             }
         }
         if let Some(name) = base_name(tp) {
+            // The top types accept anything — but only while the name still
+            // means one: `object` may be a user class (`plain class
+            // object:`), and either name may be rebound.
             if matches!(name, "Any" | "object") {
-                return Ok(true);
+                let top = match self.eval_expr(tp, env) {
+                    Ok(Value::Class(c)) => crate::value::is_builtin_object(&c),
+                    Ok(Value::Native(n)) => matches!(n.name, "Any" | "object"),
+                    Ok(_) => false,
+                    Err(_) => true,
+                };
+                if top {
+                    return Ok(true);
+                }
             }
         }
         // Alias recursion over a cyclic value must terminate: a (value,
@@ -298,11 +309,22 @@ impl Interpreter {
                 || self.cast_matches(value, &op.right, env, b, active)?),
             Expr::Subscript(s) => self.cast_matches_subscript(value, s, env, b, active),
             Expr::Name(_) | Expr::Attribute(_) => {
-                let name = base_name(tp).unwrap_or_default().to_owned();
+                let spelled = base_name(tp).unwrap_or_default().to_owned();
+                if spelled == "None" && matches!(tp, Expr::Name(_)) {
+                    return Ok(matches!(value, Value::None));
+                }
+                let target = self.eval_expr(tp, env)?;
+                if let Some(def) = self.alias_named(&spelled, &target) {
+                    return self.cast_matches_alias(value, &def, &[], env, b, active);
+                }
+                // What the name is bound to decides, not how it is spelled:
+                // after `list = tuple`, `x as! list` checks against `tuple`,
+                // as the compiled program (which evaluates the target) does.
+                let Value::Native(native) = &target else {
+                    return self.cast_matches_value(value, &target, tp, env, b);
+                };
+                let name = native.name.to_string();
                 match name.as_str() {
-                    "None" if matches!(tp, Expr::Name(_)) => {
-                        return Ok(matches!(value, Value::None))
-                    }
                     "float" => {
                         return Ok(matches!(
                             value,
@@ -320,16 +342,10 @@ impl Interpreter {
                     }
                     _ => {}
                 }
-                let target = self.eval_expr(tp, env)?;
-                if let Some(def) = self.alias_named(&name, &target) {
-                    return self.cast_matches_alias(value, &def, &[], env, b, active);
-                }
                 if let Some(kind) = kind_of(&name) {
-                    if !matches!(target, Value::Class(_)) {
-                        return self.cast_kind(value, kind, &[], env, b, active);
-                    }
+                    return self.cast_kind(value, kind, &[], env, b, active);
                 }
-                if REFUSED_TYPING.contains(&name.as_str()) && matches!(target, Value::Native(_)) {
+                if REFUSED_TYPING.contains(&name.as_str()) {
                     return Err(type_error(format!(
                         "as! cannot check parameterised target typing.{name}"
                     )));
@@ -438,12 +454,12 @@ impl Interpreter {
     ) -> Result<bool, Unwind> {
         let args = args_of(&s.slice);
         match self.cast_origin(&s.value, env)? {
-            (Origin::Optional, _) => Ok(matches!(value, Value::None)
+            (Origin::Optional, _, _) => Ok(matches!(value, Value::None)
                 || match args.first() {
                     Some(a) => self.cast_matches(value, a, env, b, active)?,
                     None => true,
                 }),
-            (Origin::Union, _) => {
+            (Origin::Union, _, _) => {
                 for a in &args {
                     if self.cast_matches(value, a, env, b, active)? {
                         return Ok(true);
@@ -451,11 +467,11 @@ impl Interpreter {
                 }
                 Ok(false)
             }
-            (Origin::Annotated, _) => match args.first() {
+            (Origin::Annotated, _, _) => match args.first() {
                 Some(a) => self.cast_matches(value, a, env, b, active),
                 None => Ok(true),
             },
-            (Origin::Literal, _) => {
+            (Origin::Literal, _, _) => {
                 for a in &args {
                     let lit = self.eval_expr(a, env)?;
                     if same_exact_type(value, &lit) && self.values_equal(value, &lit)? {
@@ -464,11 +480,11 @@ impl Interpreter {
                 }
                 Ok(false)
             }
-            (Origin::Kind(kind), _) => self.cast_kind(value, kind, &args, env, b, active),
-            (Origin::Refused, Some(def)) => {
+            (Origin::Kind(kind), _, _) => self.cast_kind(value, kind, &args, env, b, active),
+            (Origin::Refused, Some(def), _) => {
                 self.cast_matches_alias(value, &def, &args, env, b, active)
             }
-            (Origin::Refused, None) => Err(type_error(format!(
+            (Origin::Refused, None, _) => Err(type_error(format!(
                 "as! cannot check parameterised target {}",
                 self.cast_display(&Expr::Subscript(s.clone()), env, b)?
             ))),
@@ -476,35 +492,40 @@ impl Interpreter {
     }
 
     /// What a subscript's base denotes, with the alias definition when it
-    /// is a generic `type` alias.
+    /// is a generic `type` alias, and the name of what it resolves to.
     fn cast_origin(
         &mut self,
         base: &Expr,
         env: &EnvRef,
-    ) -> Result<(Origin, Option<Rc<AliasDef>>), Unwind> {
-        let Some(name) = base_name(base).map(str::to_owned) else {
-            return Ok((Origin::Refused, None));
+    ) -> Result<(Origin, Option<Rc<AliasDef>>, String), Unwind> {
+        let Some(spelled) = base_name(base).map(str::to_owned) else {
+            return Ok((Origin::Refused, None, String::new()));
         };
         let resolved = self.eval_expr(base, env).ok();
         if let Some(v) = &resolved {
-            if let Some(def) = self.alias_named(&name, v) {
-                return Ok((Origin::Refused, Some(def)));
+            if let Some(def) = self.alias_named(&spelled, v) {
+                return Ok((Origin::Refused, Some(def), spelled));
             }
             // A user class named like a typing form is still a user class.
             if matches!(v, Value::Class(_)) {
-                return Ok((Origin::Refused, None));
+                return Ok((Origin::Refused, None, spelled));
             }
         }
-        Ok((
-            match name.as_str() {
-                "Optional" => Origin::Optional,
-                "Union" => Origin::Union,
-                "Literal" => Origin::Literal,
-                "Annotated" => Origin::Annotated,
-                other => kind_of(other).map_or(Origin::Refused, Origin::Kind),
-            },
-            None,
-        ))
+        // The origin is what the base is bound to, not how it is spelled:
+        // after `list = tuple`, `list[int]` is `tuple[int]`, and an alias
+        // of a typing form (`L = List`) is that form.
+        let name = match &resolved {
+            Some(Value::Native(n)) => n.name.to_string(),
+            _ => spelled,
+        };
+        let origin = match name.as_str() {
+            "Optional" => Origin::Optional,
+            "Union" => Origin::Union,
+            "Literal" => Origin::Literal,
+            "Annotated" => Origin::Annotated,
+            other => kind_of(other).map_or(Origin::Refused, Origin::Kind),
+        };
+        Ok((origin, None, name))
     }
 
     /// `isinstance(value, origin)` for a container kind, then every element
@@ -765,9 +786,8 @@ impl Interpreter {
                 }
             }
             Expr::Subscript(s) => {
-                let name = base_name(&s.value).unwrap_or_default().to_owned();
                 let args = args_of(&s.slice);
-                let (origin, alias) = self.cast_origin(&s.value, env)?;
+                let (origin, alias, name) = self.cast_origin(&s.value, env)?;
                 let rendered = match origin {
                     Origin::Literal => args
                         .iter()

@@ -906,6 +906,34 @@ impl Interpreter {
                         return Ok(());
                     }
                 }
+                // `set |= / &= / -= / ^= <set or frozenset>` update the set in
+                // place (`set.__ior__` & co., the same tables as `update` /
+                // `intersection_update` / …), so aliases observe the change.
+                // Any other right operand (a dict view) makes the in-place
+                // slot decline and falls back to the binary operator and a
+                // rebind, as in CPython; a frozenset has no in-place slots.
+                if let (Value::Set(target), Value::Set(_)) = (&current, &rhs) {
+                    let method = match a.op {
+                        Operator::BitOr => Some("update"),
+                        Operator::BitAnd => Some("intersection_update"),
+                        Operator::Sub => Some("difference_update"),
+                        Operator::BitXor => Some("symmetric_difference_update"),
+                        _ => None,
+                    };
+                    if let Some(method) = method {
+                        if !crate::builtins::set_is_frozen(target) {
+                            let target = target.clone();
+                            crate::builtins::set_method(
+                                self,
+                                &target,
+                                method,
+                                std::slice::from_ref(&rhs),
+                            )?;
+                            store_back!(self, Value::Set(target))?;
+                            return Ok(());
+                        }
+                    }
+                }
                 let new = self.binop(&current, a.op, &rhs)?;
                 store_back!(self, new)?;
                 Ok(())
@@ -6312,9 +6340,12 @@ impl Interpreter {
                     BitXor => a.symmetric_difference(&b),
                     _ => unreachable!(),
                 };
-                // The result has the left operand's type: `frozenset | set`
-                // is a frozenset.
-                let frozen = matches!(l, Set(s) if crate::builtins::set_is_frozen(s));
+                // The result has the left operand's type when both are sets:
+                // `frozenset | set` is a frozenset. A dict-view operand makes
+                // `frozenset`'s slot decline, and the view's reflected one
+                // builds a `set` (`frozenset | d.keys()` is a set).
+                let frozen =
+                    matches!(l, Set(s) if crate::builtins::set_is_frozen(s)) && matches!(r, Set(_));
                 let cell = crate::value::FrozenCell::new(out);
                 cell.frozen.set(frozen);
                 return Ok(Set(Rc::new(cell)));
@@ -7201,7 +7232,7 @@ impl Interpreter {
                 // `Cls.__mro__` — the C3 linearisation, ending in `object`.
                 if attr == "__mro__" {
                     let mut out: Vec<Value> = class_mro(class)
-                        .filter(|c| !(c.name == "object" && c.bases.is_empty()))
+                        .filter(|c| !crate::value::is_builtin_object(c))
                         .map(|c| Value::Class(c.clone()))
                         .collect();
                     out.push(crate::builtins::make_builtin_type("object"));
@@ -7261,7 +7292,8 @@ impl Interpreter {
                 // `object.__setattr__(obj, name, value)` — the raw attribute
                 // store that bypasses a user `__setattr__` (how a class that
                 // overrides `__setattr__` initialises its own fields).
-                if class.name == "object" && attr == "__setattr__" && class.bases.is_empty() {
+                let builtin_object = crate::value::is_builtin_object(class);
+                if builtin_object && attr == "__setattr__" {
                     return Ok(Value::Native(Rc::new(NativeFn::new(
                         "object.__setattr__",
                         |i, args| {
@@ -7273,7 +7305,19 @@ impl Interpreter {
                         },
                     ))));
                 }
-                if class.name == "object" && attr == "__getattribute__" && class.bases.is_empty() {
+                if builtin_object && attr == "__delattr__" {
+                    return Ok(Value::Native(Rc::new(NativeFn::new(
+                        "object.__delattr__",
+                        |i, args| {
+                            let [obj, name] = <[Value; 2]>::try_from(args).map_err(|_| {
+                                type_error("object.__delattr__() takes exactly 2 arguments")
+                            })?;
+                            i.del_attr_raw(&obj, &name.py_str())?;
+                            Ok(Value::None)
+                        },
+                    ))));
+                }
+                if builtin_object && attr == "__getattribute__" {
                     return Ok(Value::Native(Rc::new(NativeFn::new(
                         "object.__getattribute__",
                         |i, args| {
@@ -7821,19 +7865,43 @@ impl Interpreter {
 
     /// `del obj.attr` / `delattr(obj, attr)`.
     pub(crate) fn del_attr(&mut self, recv: &Value, attr: &str) -> Result<(), Unwind> {
+        if let Value::Instance(inst) = recv {
+            if let Some(err) = frozen_dataclass_error(&inst.class, attr, "delete") {
+                return Err(err);
+            }
+            // A user `__delattr__` intercepts every `del obj.attr` (CPython
+            // protocol); it deletes through `object.__delattr__`.
+            if let Some(m) = self.find_method(&inst.class, "__delattr__") {
+                self.call_value(
+                    Value::BoundMethod {
+                        receiver: Box::new(recv.clone()),
+                        function: m,
+                    },
+                    vec![Value::Str(Rc::new(attr.to_owned()))],
+                    &[],
+                )?;
+                return Ok(());
+            }
+        }
+        self.del_attr_raw(recv, attr)
+    }
+
+    /// `object.__delattr__`: delete an attribute without consulting a user
+    /// `__delattr__` (property deleters and descriptors still apply).
+    pub(crate) fn del_attr_raw(&mut self, recv: &Value, attr: &str) -> Result<(), Unwind> {
         match recv {
             Value::Instance(inst) => {
-                if let Some(err) = frozen_dataclass_error(&inst.class, attr, "delete") {
-                    return Err(err);
-                }
                 if self.delete_via_descriptor(inst, attr)? {
                     return Ok(());
                 }
                 if inst.fields.borrow_mut().shift_remove(attr).is_none() {
-                    return Err(attribute_error(format!(
-                        "'{}' object has no attribute '{}'",
-                        inst.class.name, attr
-                    )));
+                    // An instance without a `__dict__` reports the name as
+                    // an attribute store would.
+                    let msg = slots_violation(&inst.class, attr, &inst.fields.borrow())
+                        .unwrap_or_else(|| {
+                            format!("'{}' object has no attribute '{}'", inst.class.name, attr)
+                        });
+                    return Err(attribute_error(msg));
                 }
                 Ok(())
             }
@@ -10147,10 +10215,10 @@ fn dataclass_missing_arguments(class: &str, missing: &[&str]) -> String {
     )
 }
 
-/// `object.__setattr__` on an instance without a `__dict__` (every class
-/// in its MRO is `@dataclass(slots=True)` or declares `__slots__`): the
-/// AttributeError CPython raises for a name outside the slots, or `None`
-/// when the store is allowed.
+/// `object.__setattr__` (or `__delattr__`) on an instance without a
+/// `__dict__` (every class in its MRO is `@dataclass(slots=True)` or
+/// declares `__slots__`): the AttributeError CPython raises for a name
+/// outside the slots, or `None` when the store is allowed.
 fn slots_violation(
     class: &Rc<Class>,
     attr: &str,
@@ -10179,6 +10247,14 @@ fn slots_violation(
         || declares_slot(class, attr)
     {
         return None;
+    }
+    // A name the class binds (a method, a class attribute) is there to be
+    // found, just not writable through an instance with no `__dict__`.
+    if lookup_class_member(class, attr).is_some() {
+        return Some(format!(
+            "'{}' object attribute '{}' is read-only",
+            class.name, attr
+        ));
     }
     Some(format!(
         "'{}' object has no attribute '{}' and no __dict__ for setting new attributes",
