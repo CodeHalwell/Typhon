@@ -1214,3 +1214,52 @@ show([k.__name__ for k in D.__mro__], D().who())
 "#,
     );
 }
+
+#[test]
+fn pr493_checked_casts_resolve_a_rebound_target_name() {
+    // The cast picked the container kind (and the `float` / `Any` /
+    // `object` shortcuts) from the target's spelling, so after
+    // `list = tuple` the VM checked `x as! list[int]` against `list` where
+    // the compiled program checks `tuple[int]`.
+    assert_matches_cpython_with(
+        "pr493_checked_casts_resolve_a_rebound_target_name",
+        r#"from typing import Any, List, Optional, Sequence
+plain class Obj:
+    pass
+def cast(label: str, value: object, thunk: Any) -> None:
+    try:
+        r = thunk(value)
+        out.append(label + " = " + repr(r))
+    except BaseException as e:
+        out.append(label + " ! " + type(e).__name__ + ": " + str(e))
+def rebound() -> None:
+    list = tuple
+    float = int
+    L = List
+    Opt = Optional
+    Seq = Sequence
+    object = Obj
+    Any = int
+    cast("list[int] one", (1,), lambda v: __typhon_checked_cast__(v, list[int]))
+    cast("list[int] two", (1, 2), lambda v: __typhon_checked_cast__(v, list[int]))
+    cast("list[int] list", [1], lambda v: __typhon_checked_cast__(v, list[int]))
+    cast("list bare", (1, 2), lambda v: __typhon_checked_cast__(v, list))
+    cast("list bare list", [1], lambda v: __typhon_checked_cast__(v, list))
+    cast("float", 1.5, lambda v: __typhon_checked_cast__(v, float))
+    cast("float int", 2, lambda v: __typhon_checked_cast__(v, float))
+    cast("L[int]", [1], lambda v: __typhon_checked_cast__(v, L[int]))
+    cast("L[int] bad", [1, "a"], lambda v: __typhon_checked_cast__(v, L[int]))
+    cast("Opt[int]", None, lambda v: __typhon_checked_cast__(v, Opt[int]))
+    cast("Opt[int] bad", "a", lambda v: __typhon_checked_cast__(v, Opt[int]))
+    cast("Seq[int] bad", (1, "a"), lambda v: __typhon_checked_cast__(v, Seq[int]))
+    cast("object", 5, lambda v: __typhon_checked_cast__(v, object))
+    cast("object obj", Obj(), lambda v: type(__typhon_checked_cast__(v, object)).__name__)
+    cast("Any", "a", lambda v: __typhon_checked_cast__(v, Any))
+rebound()
+cast("list[int] builtin", (1,), lambda v: __typhon_checked_cast__(v, list[int]))
+cast("object builtin", 5, lambda v: __typhon_checked_cast__(v, object))
+cast("Any builtin", "a", lambda v: __typhon_checked_cast__(v, Any))
+"#,
+        &cast_runtime_py(),
+    );
+}
