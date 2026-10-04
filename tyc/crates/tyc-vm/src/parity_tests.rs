@@ -1317,3 +1317,57 @@ show(z.label)
         ),
     );
 }
+
+#[test]
+fn pr493_set_operators_keep_cpython_result_types_and_identity() {
+    // `frozenset | d.keys()` came back a frozenset (the view's reflected
+    // operator builds a `set`), and `s |= t` / `&=` / `-=` / `^=` rebound
+    // the name to a new set, so an alias (or the object behind a field)
+    // never saw the change.
+    assert_matches_cpython(
+        "pr493_set_operators_keep_cpython_result_types_and_identity",
+        r#"f = frozenset([1, 2])
+d = {"a": 1}
+show(repr(f | d.keys()), repr(d.keys() | f), repr(f - d.keys()), repr(f & d.keys()), repr(f ^ d.keys()))
+show(repr(f | {3}), repr({3} | f), repr(f.union([4])), repr(f.intersection({1})), repr(f.difference([1])), repr(f.symmetric_difference({9})))
+s = {1}
+alias = s
+s |= {2}
+s &= {1, 2, 3}
+s -= {9}
+s ^= {5}
+show(repr(s), repr(alias), s is alias)
+t = {1}
+talias = t
+t |= frozenset([2])
+show(repr(t), t is talias)
+u = {1}
+ualias = u
+u |= d.keys()
+show(repr(u), repr(ualias), u is ualias)
+v = {1, 2}
+v ^= v
+w = {1, 2}
+w -= w
+x = {1, 2}
+x &= x
+x |= x
+show(repr(v), repr(w), repr(x))
+g = frozenset([1])
+galias = g
+g |= {2}
+show(repr(g), repr(galias), g is galias)
+plain class Holder:
+    def __init__(self) -> None:
+        self.items = {1}
+h = Holder()
+keep = h.items
+h.items |= {7}
+show(repr(keep), keep is h.items)
+lst = [{1}]
+first = lst[0]
+lst[0] -= {1}
+show(repr(lst), first is lst[0])
+"#,
+    );
+}

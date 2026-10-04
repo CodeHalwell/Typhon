@@ -906,6 +906,34 @@ impl Interpreter {
                         return Ok(());
                     }
                 }
+                // `set |= / &= / -= / ^= <set or frozenset>` update the set in
+                // place (`set.__ior__` & co., the same tables as `update` /
+                // `intersection_update` / …), so aliases observe the change.
+                // Any other right operand (a dict view) makes the in-place
+                // slot decline and falls back to the binary operator and a
+                // rebind, as in CPython; a frozenset has no in-place slots.
+                if let (Value::Set(target), Value::Set(_)) = (&current, &rhs) {
+                    let method = match a.op {
+                        Operator::BitOr => Some("update"),
+                        Operator::BitAnd => Some("intersection_update"),
+                        Operator::Sub => Some("difference_update"),
+                        Operator::BitXor => Some("symmetric_difference_update"),
+                        _ => None,
+                    };
+                    if let Some(method) = method {
+                        if !crate::builtins::set_is_frozen(target) {
+                            let target = target.clone();
+                            crate::builtins::set_method(
+                                self,
+                                &target,
+                                method,
+                                std::slice::from_ref(&rhs),
+                            )?;
+                            store_back!(self, Value::Set(target))?;
+                            return Ok(());
+                        }
+                    }
+                }
                 let new = self.binop(&current, a.op, &rhs)?;
                 store_back!(self, new)?;
                 Ok(())
@@ -6310,9 +6338,12 @@ impl Interpreter {
                     BitXor => a.symmetric_difference(&b),
                     _ => unreachable!(),
                 };
-                // The result has the left operand's type: `frozenset | set`
-                // is a frozenset.
-                let frozen = matches!(l, Set(s) if crate::builtins::set_is_frozen(s));
+                // The result has the left operand's type when both are sets:
+                // `frozenset | set` is a frozenset. A dict-view operand makes
+                // `frozenset`'s slot decline, and the view's reflected one
+                // builds a `set` (`frozenset | d.keys()` is a set).
+                let frozen =
+                    matches!(l, Set(s) if crate::builtins::set_is_frozen(s)) && matches!(r, Set(_));
                 let cell = crate::value::FrozenCell::new(out);
                 cell.frozen.set(frozen);
                 return Ok(Set(Rc::new(cell)));

@@ -11933,7 +11933,7 @@ fn dict_method(
     }
 }
 
-fn set_method(
+pub(crate) fn set_method(
     interp: &mut Interpreter,
     s: &crate::value::RcSet,
     name: &str,
