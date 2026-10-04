@@ -1891,21 +1891,12 @@ pub fn install(interp: &mut Interpreter) {
         ))),
     );
 
-    // `newtype Foo = int` lowers to `Foo = NewType("Foo", int)`. CPython's
-    // `NewType` at runtime is effectively `lambda x: x`, so we mirror that:
-    // a two-argument callable that returns a callable identity function.
-    // VM-mode coverage of #24.
-    root.set(
-        "NewType",
-        Value::Native(Rc::new(NativeFn::new("NewType", |_i, _args| {
-            // Discard `(name, base)`; return an identity callable that
-            // accepts any single argument and returns it unchanged.
-            Ok(Value::Native(Rc::new(NativeFn::new(
-                "NewTypeAlias",
-                |_i, args| Ok(args.into_iter().next().unwrap_or(Value::None)),
-            ))))
-        }))),
-    );
+    // `newtype Foo = int` lowers to `Foo = NewType("Foo", int)`: a
+    // `typing.NewType` object — an identity callable carrying
+    // `__supertype__`, printed `__main__.Foo` (see `new_newtype`). A direct
+    // call is intercepted in `eval_call` to record the base expression for
+    // `as!`.
+    root.set("NewType", newtype_native());
 }
 
 /// `sum(iterable, start)` with CPython 3.12+'s numeric paths: exact integer
@@ -2709,6 +2700,30 @@ fn compile_helper(interp: &mut Interpreter, source: &str, name: &str) -> Result<
 }
 
 /// A class from the `descriptors` shim (`property`), compiled once per run.
+/// The `NewType` callable: `NewType(name, base)` builds the newtype object.
+fn newtype_native() -> Value {
+    Value::Native(Rc::new(NativeFn::new("NewType", |i, args| {
+        let mut args = args.into_iter();
+        let (Some(name), Some(base), None) = (args.next(), args.next(), args.next()) else {
+            return Err(type_error("NewType() takes exactly 2 positional arguments"));
+        };
+        new_newtype(i, name, base, Value::Str(Rc::new("__main__".into())))
+    })))
+}
+
+/// A `typing.NewType` object (the `NewType` class of the descriptors shim).
+pub(crate) fn new_newtype(
+    interp: &mut Interpreter,
+    name: Value,
+    base: Value,
+    module: Value,
+) -> Result<Value, Unwind> {
+    let class = descriptor_shim_class(interp, "NewType")?;
+    let obj = interp.call_value(class, vec![name, base], &[])?;
+    interp.set_attr(&obj, "__module__", module)?;
+    Ok(obj)
+}
+
 pub(crate) fn descriptor_shim_class(interp: &mut Interpreter, name: &str) -> Result<Value, Unwind> {
     const KEY: &str = "__typhon_descriptors__";
     let module = match interp.module_cache.get(KEY) {
@@ -6761,17 +6776,8 @@ fn make_typing_module() -> Value {
     ] {
         entries.push((name, identity_native(name)));
     }
-    // `NewType("Foo", base)` returns an identity callable. Mirrors the
-    // root-level `NewType` builtin for users who import it explicitly.
-    entries.push((
-        "NewType",
-        Value::Native(Rc::new(NativeFn::new("NewType", |_i, _args| {
-            Ok(Value::Native(Rc::new(NativeFn::new(
-                "NewTypeAlias",
-                |_i, args| Ok(args.into_iter().next().unwrap_or(Value::None)),
-            ))))
-        }))),
-    ));
+    // `NewType("Foo", base)`, as the root-level builtin.
+    entries.push(("NewType", newtype_native()));
     // `TypeVar("T", ...)` — return a placeholder. The static type system
     // is the only consumer; at runtime the value just needs to exist.
     entries.push((

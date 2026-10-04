@@ -333,6 +333,25 @@ encodes in `json` as its value, and it keeps its identity as a dict key.
 `StrEnum`'s `auto()` is the lower-cased member name, and a second name
 bound to an existing value is an alias of that member.
 
+### Checked casts (`as!`) follow the target table (beta)
+
+`EXPR as! TYPE` applies the table in `docs/language.md` ("Checked boundary
+casts") exactly as the generated `typhon_runtime/cast.py` does. The VM
+reads the target's syntax, since its typing objects are erased stand-ins:
+a `type` alias is expanded from its definition with its parameters bound
+to the cast's arguments (`Pair[int]`, recursive aliases over finite
+values; a cyclic value fails), a `newtype` checks the base it was declared
+with (including a generic base such as `list[int]`), `Literal[...]` checks
+exact type and value (`True` is not `1`), `Sequence` / `Collection` /
+`AbstractSet` / `Mapping` / `MutableMapping` check kind and elements, an
+`interface` checks member presence (fields as well as methods), and
+targets with no runtime shape — a parameterised user class, `Callable[…]`,
+`Iterator[…]`, `type[…]`, an alias used without its arguments — raise the
+runtime's `TypeError: as! cannot check …`. Failure messages print the
+target as CPython does (`list[int]`, `typing.Sequence[int]`, `Pair[int]`,
+`__main__.UserId`, `<class 'int'>`). `NewType(...)` builds a real newtype
+object (callable, `__supertype__`, printed `__main__.UserId`).
+
 ### Size limits raise, they do not abort (beta)
 
 Everywhere CPython reports a size problem as an exception, so does the VM;

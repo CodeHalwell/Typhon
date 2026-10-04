@@ -49,3 +49,17 @@ class property:
 
     def deleter(self, fdel):
         return type(self)(self.fget, self.fset, fdel, self.__doc__)
+
+
+class NewType:
+    def __init__(self, name, tp):
+        self.__name__ = name
+        self.__qualname__ = name
+        self.__supertype__ = tp
+        self.__module__ = "__main__"
+
+    def __call__(self, x):
+        return x
+
+    def __repr__(self):
+        return self.__module__ + "." + self.__qualname__

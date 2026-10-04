@@ -84,6 +84,12 @@ fn run_python(dir: &Path, py: &str) -> Option<(String, String, i32)> {
 /// Run `probe` (prefixed with [`PRELUDE`]) on the VM and on CPython and
 /// assert the two `out` transcripts are identical.
 pub(crate) fn assert_matches_cpython(test: &str, probe: &str) {
+    assert_matches_cpython_with(test, probe, "");
+}
+
+/// [`assert_matches_cpython`] with `py_header` run first on the CPython side
+/// only — the generated runtime a compiled program would import.
+fn assert_matches_cpython_with(test: &str, probe: &str, py_header: &str) {
     let dir = tempfile::tempdir().unwrap();
     let dump = dir.path().join("transcript.txt");
     let tail = format!(
@@ -91,7 +97,8 @@ pub(crate) fn assert_matches_cpython(test: &str, probe: &str) {
         dump.display().to_string()
     );
     let body = format!("{PRELUDE}{probe}{tail}");
-    let Some((_, py_err, code)) = run_python(dir.path(), &to_python(&body)) else {
+    let python = format!("{py_header}{}", to_python(&body));
+    let Some((_, py_err, code)) = run_python(dir.path(), &python) else {
         return python_missing(test);
     };
     assert_eq!(code, 0, "{test}: the probe fails under python3.13:\n{py_err}");
@@ -740,4 +747,122 @@ print(f(50))
             .unwrap()
     });
     assert_eq!(code.unwrap(), 0);
+}
+
+// ── W5-16: `as!` follows the checked-boundary-cast target table ───────────
+
+/// The generated `typhon_runtime/cast.py` the compiled program imports: the
+/// oracle for `as!`, read from the template `tyc build` writes.
+fn cast_runtime_py() -> String {
+    const BUILD_RS: &str = include_str!("../../tyc/src/commands/build.rs");
+    let start = BUILD_RS
+        .find("const TYPHON_RUNTIME_CAST_PY: &str = \"\\\n")
+        .expect("cast.py template in build.rs");
+    let body = &BUILD_RS[start..];
+    let body = &body[body.find("\"\\\n").unwrap() + 3..];
+    let end = body.find("\n\";").expect("end of the cast.py template");
+    // Undo the Rust string escapes the template uses.
+    let mut out = String::new();
+    let mut chars = body[..end].chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some(other) => out.push(other),
+                None => {}
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out.push_str("\n__typhon_checked_cast__ = checked_cast\n");
+    out
+}
+
+#[test]
+fn w5_16_checked_casts_follow_the_target_table() {
+    // Newtypes and `Literal` were accepted unchecked, `type` aliases
+    // (generic or not) were rejected or accepted wholesale, `Sequence[int]`
+    // / `Mapping[...]` skipped their elements, and parameterised user
+    // classes / `Callable` were accepted where the runtime refuses them.
+    assert_matches_cpython_with(
+        "w5_16_checked_casts_follow_the_target_table",
+        r#"from typing import Any, Literal, Sequence, Mapping, MutableMapping, Optional, Union, Callable, Iterator, Collection, AbstractSet, NewType, Protocol
+from enum import Enum
+UserId = NewType("UserId", int)
+Admin = NewType("Admin", UserId)
+Ids = NewType("Ids", list[int])
+type Pair[T] = tuple[T, T]
+type IntList = list[int]
+type Color = Literal["red", "green"]
+type Json = int | str | list[Json] | dict[str, Json]
+type Wrap[T] = list[T]
+type PairList[T] = list[Pair[T]]
+plain class Named(Protocol):
+    name: str
+plain class Person:
+    def __init__(self, name: str) -> None:
+        self.name = name
+    def __repr__(self) -> str:
+        return "Person(" + self.name + ")"
+plain class Box[T]:
+    def __init__(self, item: T) -> None:
+        self.item = item
+plain class Shade(Enum):
+    DARK = 1
+def cast(label: str, value: object, thunk: Any) -> None:
+    try:
+        r = thunk(value)
+        out.append(label + " = " + repr(r) + (" (same)" if r is value else ""))
+    except BaseException as e:
+        out.append(label + " ! " + type(e).__name__ + ": " + str(e))
+cast("uid", 5, lambda v: __typhon_checked_cast__(v, UserId))
+cast("uid bad", "x", lambda v: __typhon_checked_cast__(v, UserId))
+cast("admin bad", 3.5, lambda v: __typhon_checked_cast__(v, Admin))
+cast("ids", [1, 2], lambda v: __typhon_checked_cast__(v, Ids))
+cast("ids bad", [1, "x"], lambda v: __typhon_checked_cast__(v, Ids))
+cast("pair", (1, 2), lambda v: __typhon_checked_cast__(v, Pair[int]))
+cast("pair bad", (1, "a"), lambda v: __typhon_checked_cast__(v, Pair[int]))
+cast("pair arity", (1, 1), lambda v: __typhon_checked_cast__(v, Pair[int, str]))
+cast("pair unbound", (1, 1), lambda v: __typhon_checked_cast__(v, Pair))
+cast("intlist", [1, 2], lambda v: __typhon_checked_cast__(v, IntList))
+cast("intlist bad", [1, "a"], lambda v: __typhon_checked_cast__(v, IntList))
+cast("color", "red", lambda v: __typhon_checked_cast__(v, Color))
+cast("color bad", "blue", lambda v: __typhon_checked_cast__(v, Color))
+cast("lit bool", True, lambda v: __typhon_checked_cast__(v, Literal[1, 2]))
+cast("lit enum", Shade.DARK, lambda v: __typhon_checked_cast__(v, Literal[Shade.DARK]))
+cast("lit enum bad", 1, lambda v: __typhon_checked_cast__(v, Literal[Shade.DARK]))
+cast("json", {"a": [1, "b", {"c": 2}]}, lambda v: __typhon_checked_cast__(v, Json))
+cast("json bad", {"a": [1.5]}, lambda v: __typhon_checked_cast__(v, Json))
+cyc: list[Any] = []
+cyc.append(cyc)
+cast("json cyc", cyc, lambda v: __typhon_checked_cast__(v, Json))
+cast("wrap nested", [[1, 2]], lambda v: __typhon_checked_cast__(v, Wrap[Pair[int]]))
+cast("pairlist bad", [(1, "a")], lambda v: __typhon_checked_cast__(v, PairList[int]))
+cast("named", Person("a"), lambda v: __typhon_checked_cast__(v, Named))
+cast("named bad", 3, lambda v: __typhon_checked_cast__(v, Named))
+cast("named list", [Person("a"), 3], lambda v: __typhon_checked_cast__(v, list[Named]))
+cast("seq bad", (1, "a"), lambda v: __typhon_checked_cast__(v, Sequence[int]))
+cast("seq bare bad", {1}, lambda v: __typhon_checked_cast__(v, Sequence))
+cast("map bad", {"a": "b"}, lambda v: __typhon_checked_cast__(v, Mapping[str, int]))
+cast("mutmap", {"a": 1}, lambda v: __typhon_checked_cast__(v, MutableMapping[str, int]))
+cast("coll", {1: 2}, lambda v: __typhon_checked_cast__(v, Collection[int]))
+cast("abset keys", {"a": 1}.keys(), lambda v: list(__typhon_checked_cast__(v, AbstractSet[str])))
+cast("frozenset as set", frozenset({1}), lambda v: __typhon_checked_cast__(v, set[int]))
+cast("opt bad", "a", lambda v: __typhon_checked_cast__(v, Optional[int]))
+cast("union3 bad", 1.5, lambda v: __typhon_checked_cast__(v, Union[int, str, None]))
+cast("pipe bad", 1.5, lambda v: __typhon_checked_cast__(v, int | None))
+cast("bool float", True, lambda v: __typhon_checked_cast__(v, float))
+cast("class val", int, lambda v: __typhon_checked_cast__(v, int))
+cast("tuple empty", (), lambda v: __typhon_checked_cast__(v, tuple[()]))
+cast("box", Box(1), lambda v: __typhon_checked_cast__(v, Box[int]))
+cast("list box", [Box(1)], lambda v: __typhon_checked_cast__(v, list[Box[int]]))
+cast("callable", len, lambda v: __typhon_checked_cast__(v, Callable[[int], str]))
+cast("iterator", iter([1]), lambda v: __typhon_checked_cast__(v, Iterator[int]))
+cast("type", int, lambda v: __typhon_checked_cast__(v, type[int]))
+cast("none bad", 0, lambda v: __typhon_checked_cast__(v, None))
+show(UserId, UserId(3), UserId.__supertype__ is int)
+"#,
+        &cast_runtime_py(),
+    );
 }

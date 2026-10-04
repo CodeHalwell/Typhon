@@ -29,6 +29,9 @@ use crate::value::{
     Instance, IterState, NativeFn, ResumeFrame, Value, VmInt,
 };
 
+#[path = "cast.rs"]
+mod cast;
+
 /// One active generator body on the interpreter's generator stack.
 pub enum GenFrame {
     /// Eager materialisation: yielded values are collected into the buffer
@@ -169,6 +172,11 @@ pub struct Interpreter {
     /// `Py_ReprEnter`): met again inside themselves they render as `[...]`
     /// / `{...}`.
     pub repr_active: std::collections::HashSet<usize>,
+    /// Every `type` alias statement executed, by name, for `as!` (see
+    /// `cast`).
+    pub(crate) alias_defs: HashMap<String, Vec<Rc<cast::AliasDef>>>,
+    /// The base expression of each `NewType` object, by object address.
+    pub(crate) newtype_defs: HashMap<usize, cast::NewTypeDef>,
 }
 
 /// Upper bound on values an eagerly-evaluated generator may yield before the
@@ -288,6 +296,8 @@ impl Interpreter {
             running_loop_depth: 0,
             current_function: None,
             repr_active: std::collections::HashSet::new(),
+            alias_defs: HashMap::new(),
+            newtype_defs: HashMap::new(),
             stack_floor: crate::stack::current_thread_stack()
                 .map(|(low, size)| low + crate::stack::safety_margin(size))
                 .unwrap_or(0),
@@ -1029,6 +1039,7 @@ impl Interpreter {
                 // raised `AttributeError: module '…' has no attribute 'Event'`
                 // at the import statement. Bind the alias name so the module
                 // attribute exists.
+                self.register_alias(ta, env);
                 if let Expr::Name(n) = ta.name.as_ref() {
                     let name = n.id.as_str();
                     let val = self.eval_type_alias_value(name, &ta.value, env);
@@ -1747,6 +1758,8 @@ impl Interpreter {
         let mut fields = Vec::new();
         let mut methods: HashMap<String, Rc<Function>> = HashMap::new();
         let mut class_attrs: HashMap<String, Value> = HashMap::new();
+        // A protocol's annotated data members (`interface X: name: str`).
+        let mut protocol_data: Vec<Value> = Vec::new();
         let mut properties: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut classmethods: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -1849,7 +1862,11 @@ impl Interpreter {
                         } else if !has_generated_fields {
                             // A bare annotation in a plain class (`plain
                             // class` / `class!`) creates no attribute and no
-                            // constructor parameter — exactly CPython.
+                            // constructor parameter — exactly CPython. On a
+                            // protocol it is still a member to check for.
+                            if is_protocol {
+                                protocol_data.push(Value::Str(Rc::new(n.id.as_str().to_owned())));
+                            }
                         } else {
                             fields.push(ClassField {
                                 name: n.id.as_str().to_owned(),
@@ -2089,6 +2106,12 @@ impl Interpreter {
             .any(|d| rightmost_name(&d.expression).as_deref() == Some("runtime_checkable"))
         {
             class_attrs.insert("_is_runtime_protocol".to_owned(), Value::Bool(true));
+        }
+        if !protocol_data.is_empty() {
+            class_attrs.insert(
+                "__typhon_protocol_data__".to_owned(),
+                Value::Tuple(Rc::new(protocol_data)),
+            );
         }
         // After every base is known (a `NamedTuple` gains its template base
         // above).
@@ -4238,16 +4261,13 @@ impl Interpreter {
                 && !matches!(c.arguments.args[0], Expr::Starred(_))
             {
                 let value = self.eval_expr(&c.arguments.args[0], env)?;
-                let tp = &c.arguments.args[1];
-                if self.value_matches_cast_type(&value, tp, env) {
-                    return Ok(value);
-                }
-                return Err(type_error(format!(
-                    "as! cast failed: value of type {} does not match {}",
-                    value.type_name(),
-                    format_cast_type_display(tp),
-                )));
+                return self.checked_cast(value, &c.arguments.args[1], env);
             }
+        }
+        // `NewType(name, base)` (what `newtype X = Base` lowers to): record
+        // the base *expression* so `as! X` can check it element by element.
+        if let Some(v) = self.eval_newtype_call(c, env)? {
+            return Ok(v);
         }
         // Fast path for a method call on a user instance — `obj.method(args)`.
         // The generic path evaluates `obj.method` into an intermediate
@@ -4355,172 +4375,48 @@ impl Interpreter {
         Ok((args, kwargs))
     }
 
-    /// Structural runtime check backing `EXPR as! TYPE` in the VM — mirrors
-    /// `typhon_runtime/cast.py::_matches` so `tyc run` and `tyc build && python`
-    /// agree. `tp` is the type-descriptor AST (`int | None`, `dict[str, int]`,
-    /// `Optional[X]`, `tuple[int, ...]`, a user class, …). Conservative: any
-    /// shape it can't model (a TypeVar, an unresolvable name, an unknown
-    /// parameterised origin) is accepted, so the cast only ever rejects a value
-    /// it can prove wrong.
-    /// Match `value` against an `as!` target that has already been resolved to
-    /// a runtime value, mirroring `typhon_runtime/cast.py::_matches`.
-    ///
-    /// Two targets need more than `isinstance`:
-    ///
-    /// * An `interface` lowers to a `Protocol` subclass. Nominal
-    ///   `isinstance` can never succeed against one — the value's class chain
-    ///   does not contain the protocol — so `EXPR as! SomeInterface` always
-    ///   raised `TypeError` inside the guard, making a structurally valid cast
-    ///   to an interface impossible. Interfaces are structural by definition,
-    ///   so check for the members instead.
-    ///
-    /// * A `newtype` lowers to `typing.NewType`, which the VM models as an
-    ///   identity callable. That is not a class, so `isinstance` rejected
-    ///   *everything* — `as! SomeNewtype` could never succeed here either,
-    ///   while the compiled path (before it was fixed) accepted everything
-    ///   unchecked. The VM cannot recover the declared base from the identity
-    ///   shim, so it accepts, which is the documented rule for this matcher:
-    ///   only ever reject a value it can prove wrong.
-    fn value_matches_resolved_target(&mut self, value: &Value, target: &Value) -> bool {
-        if let Value::Native(n) = target {
-            if n.name == "NewTypeAlias" {
-                return true;
-            }
+    /// `NewType(name, base)` called directly: the newtype object, with its
+    /// base expression recorded for `as!`. `None` when `c` is another call.
+    fn eval_newtype_call(
+        &mut self,
+        c: &ast::ExprCall,
+        env: &EnvRef,
+    ) -> Result<Option<Value>, Unwind> {
+        let named = match c.func.as_ref() {
+            Expr::Name(n) => n.id.as_str() == "NewType",
+            Expr::Attribute(a) => a.attr.as_str() == "NewType",
+            _ => false,
+        };
+        if !named || c.arguments.args.len() != 2 || !c.arguments.keywords.is_empty() {
+            return Ok(None);
         }
-        if let Value::Class(cls) = target {
-            if class_is_protocol(cls) {
-                let names = protocol_members(cls);
-                return names
-                    .iter()
-                    .all(|m| self.get_attr(value, m.as_str()).is_ok());
-            }
+        if c.arguments.args.iter().any(|a| matches!(a, Expr::Starred(_))) {
+            return Ok(None);
         }
-        crate::builtins::is_instance_of(value, target)
-    }
-
-    fn value_matches_cast_type(&mut self, value: &Value, tp: &Expr, env: &EnvRef) -> bool {
-        match tp {
-            Expr::NoneLiteral(_) => matches!(value, Value::None),
-            Expr::Name(n) => match n.id.as_str() {
-                "Any" | "object" => true,
-                "None" => matches!(value, Value::None),
-                // `isinstance(value, int)` is `True` for `bool` (bool ⊆ int).
-                "int" => matches!(value, Value::Int(_) | Value::Bool(_)),
-                // Typhon/CPython widen int (and bool) into a float/complex target.
-                "float" => matches!(value, Value::Int(_) | Value::FloatData(_) | Value::Bool(_)),
-                "complex" => {
-                    matches!(
-                        value,
-                        Value::Int(_) | Value::FloatData(_) | Value::Bool(_) | Value::Complex(..)
-                    )
-                }
-                "bool" => matches!(value, Value::Bool(_)),
-                "str" => matches!(value, Value::Str(_)),
-                "bytes" => matches!(value, Value::Bytes(_)),
-                // User class / unknown — resolve the name and use isinstance;
-                // be permissive when it can't be resolved in the VM env.
-                _ => match self.eval_expr(tp, env) {
-                    Ok(cls) => self.value_matches_resolved_target(value, &cls),
-                    Err(_) => true,
+        let func = self.eval_expr(&c.func, env)?;
+        if !matches!(&func, Value::Native(n) if n.name == "NewType") {
+            return Ok(None);
+        }
+        let name = self.eval_expr(&c.arguments.args[0], env)?;
+        // The VM has no runtime generic aliases (`list[int]` does not
+        // evaluate); such a base is kept as its annotation text, and `as!`
+        // checks the recorded expression.
+        let base = match self.eval_expr(&c.arguments.args[1], env) {
+            Ok(v) => v,
+            Err(_) => Value::Str(Rc::new(format_cast_type(&c.arguments.args[1]))),
+        };
+        let module = env.module_scope().get("__name__").unwrap_or(Value::Str(Rc::new("__main__".into())));
+        let obj = crate::builtins::new_newtype(self, name, base, module)?;
+        if let Value::Instance(inst) = &obj {
+            self.newtype_defs.insert(
+                Rc::as_ptr(inst) as *const () as usize,
+                cast::NewTypeDef {
+                    base: Rc::new(c.arguments.args[1].clone()),
+                    env: env.clone(),
                 },
-            },
-            Expr::Attribute(_) => match self.eval_expr(tp, env) {
-                Ok(cls) => self.value_matches_resolved_target(value, &cls),
-                Err(_) => true,
-            },
-            Expr::BinOp(b) if matches!(b.op, Operator::BitOr) => {
-                self.value_matches_cast_type(value, &b.left, env)
-                    || self.value_matches_cast_type(value, &b.right, env)
-            }
-            Expr::Subscript(s) => {
-                let base = match s.value.as_ref() {
-                    Expr::Name(n) => n.id.as_str().to_owned(),
-                    Expr::Attribute(a) => a.attr.as_str().to_owned(),
-                    _ => return true,
-                };
-                let args: Vec<&Expr> = match s.slice.as_ref() {
-                    Expr::Tuple(t) => t.elts.iter().collect(),
-                    other => vec![other],
-                };
-                match base.as_str() {
-                    "Optional" => {
-                        matches!(value, Value::None)
-                            || args
-                                .first()
-                                .is_none_or(|a| self.value_matches_cast_type(value, a, env))
-                    }
-                    "Union" => args
-                        .iter()
-                        .any(|a| self.value_matches_cast_type(value, a, env)),
-                    "list" => match value {
-                        Value::List(l) => {
-                            let Some(elt) = args.first() else { return true };
-                            let items: Vec<Value> = l.borrow().iter().cloned().collect();
-                            items
-                                .iter()
-                                .all(|item| self.value_matches_cast_type(item, elt, env))
-                        }
-                        _ => false,
-                    },
-                    "set" | "frozenset" => match value {
-                        Value::Set(set) => {
-                            let Some(elt) = args.first() else { return true };
-                            let items: Vec<Value> = set
-                                .borrow()
-                                .iter()
-                                .map(|k| k.clone().into_value())
-                                .collect();
-                            items
-                                .iter()
-                                .all(|item| self.value_matches_cast_type(item, elt, env))
-                        }
-                        _ => false,
-                    },
-                    "dict" => match value {
-                        Value::Dict(d) => {
-                            if args.len() != 2 {
-                                return true;
-                            }
-                            let pairs: Vec<(Value, Value)> = d
-                                .borrow()
-                                .iter()
-                                .map(|(k, v)| (k.clone().into_value(), v.clone()))
-                                .collect();
-                            pairs.iter().all(|(k, v)| {
-                                self.value_matches_cast_type(k, args[0], env)
-                                    && self.value_matches_cast_type(v, args[1], env)
-                            })
-                        }
-                        _ => false,
-                    },
-                    "tuple" => match value {
-                        Value::Tuple(t) => {
-                            let items: Vec<Value> = t.iter().cloned().collect();
-                            // `tuple[X, ...]` — homogeneous, any length.
-                            if args.len() == 2 && matches!(args[1], Expr::EllipsisLiteral(_)) {
-                                return items
-                                    .iter()
-                                    .all(|item| self.value_matches_cast_type(item, args[0], env));
-                            }
-                            if args.len() != items.len() {
-                                return false;
-                            }
-                            items
-                                .iter()
-                                .zip(args.iter())
-                                .all(|(item, a)| self.value_matches_cast_type(item, a, env))
-                        }
-                        _ => false,
-                    },
-                    // Unknown parameterised origin (collections.abc.*, etc.) —
-                    // beyond what we model; accept.
-                    _ => true,
-                }
-            }
-            // Anything else (a literal, a call, …) isn't a shape we can check —
-            // be permissive.
-            _ => true,
+            );
         }
+        Ok(Some(obj))
     }
 
     /// Recognise an expression that is a call to `super(...)`. Returns that
@@ -9702,11 +9598,18 @@ pub(crate) fn del_class_attr(interp: &Interpreter, class: &Rc<Class>, attr: &str
 /// The methods a Protocol requires: its own and those of the protocol
 /// classes it extends.
 pub(crate) fn protocol_members(class: &Rc<Class>) -> Vec<String> {
+    // CPython's `__protocol_attrs__`: the methods *and* the annotated data
+    // members of every protocol class in the MRO.
     let mut names: Vec<String> = Vec::new();
     for c in class_mro(class).filter(|c| class_is_protocol(c)) {
-        for k in c.methods.borrow().keys() {
-            if !names.contains(k) {
-                names.push(k.clone());
+        let fields = c.fields.iter().map(|f| f.name.clone());
+        let data: Vec<String> = match c.class_attrs.borrow().get("__typhon_protocol_data__") {
+            Some(Value::Tuple(t)) => t.iter().map(Value::py_str).collect(),
+            _ => Vec::new(),
+        };
+        for k in c.methods.borrow().keys().cloned().chain(fields).chain(data) {
+            if !names.contains(&k) {
+                names.push(k);
             }
         }
     }
@@ -11915,52 +11818,6 @@ fn exc_fallback_args(message: &str) -> Vec<Value> {
         Vec::new()
     } else {
         vec![Value::Str(Rc::new(message.to_owned()))]
-    }
-}
-
-/// Whether builtin exception `kind` is `target` or one of its subclasses in
-/// the standard CPython exception hierarchy. `Exception` / `BaseException`
-/// match everything except the bare base-only kinds. Returns false for
-/// unknown names (user exceptions go through the instance-MRO path instead).
-/// Render a `as!` type-descriptor AST back to a readable string for the
-/// `TypeError` message (`dict[str, int]`, `int | None`, `list[int]`). Kept
-/// close to the `str(tp)` text the compile path's `cast.py` produces.
-/// `str(tp)` of an `as!` target, matching the compiled runtime's
-/// `_format_type` in the failure message: a bare class renders as
-/// `<class 'int'>` (a builtin) or `<class '__main__.User'>` (a user class);
-/// a parametric or union type renders as its annotation text
-/// (`dict[str, int]`, `int | None`), which is what `str()` of a
-/// `types.GenericAlias` / `types.UnionType` gives.
-fn format_cast_type_display(tp: &Expr) -> String {
-    const BUILTIN_TYPES: &[&str] = &[
-        "int",
-        "float",
-        "str",
-        "bool",
-        "bytes",
-        "bytearray",
-        "list",
-        "dict",
-        "set",
-        "frozenset",
-        "tuple",
-        "object",
-        "complex",
-        "type",
-        "range",
-        "slice",
-        "memoryview",
-    ];
-    match tp {
-        Expr::Name(n) => {
-            let name = n.id.as_str();
-            if BUILTIN_TYPES.contains(&name) {
-                format!("<class '{name}'>")
-            } else {
-                format!("<class '__main__.{name}'>")
-            }
-        }
-        other => format_cast_type(other),
     }
 }
 

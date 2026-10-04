@@ -329,6 +329,16 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   as CPython does, and raises `RecursionError` only past CPython's depth,
   where deep `==` / `<` likewise raise instead of answering `False` /
   `TypeError`.
+- **`as!` on the VM follows the checked-cast target table** (W5-16).
+  The VM's cast check disagreed with the compiled runtime in both
+  directions: newtypes and `Literal` targets accepted anything, `type`
+  aliases (`IntList`, `Pair[int]`) were rejected outright or accepted
+  without looking, `Sequence[int]` / `Mapping[...]` skipped their
+  elements, an `interface` with only data members accepted any value, and
+  `Box[int]` / `Callable[...]` were accepted where the runtime refuses
+  them. The VM now expands aliases from their definitions, checks a
+  newtype's declared base, and matches `typhon_runtime/cast.py` case by
+  case, including its refusals and its failure messages.
 - **One front end for every VM entry point** (W5-20). The entry program,
   imported sibling modules and the embedded stdlib shims all go through
   `tyc_syntax::preprocess::expand_and_preprocess_mapped` — the chain
