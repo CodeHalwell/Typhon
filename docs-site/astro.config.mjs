@@ -216,6 +216,7 @@ export default defineConfig({
             { label: 'Purity Errors', slug: 'diagnostics/purity-errors' },
             { label: 'Stub Errors', slug: 'diagnostics/stub-errors' },
             { label: 'Compile & Interface Errors', slug: 'diagnostics/compile-errors' },
+            { label: 'Lints & Performance Advice', slug: 'diagnostics/lints' },
           ],
         },
         {
@@ -258,6 +259,7 @@ export default defineConfig({
           label: 'Project',
           items: [
             { label: 'Roadmap', slug: 'project/roadmap' },
+            { label: 'Compatibility Policy', slug: 'project/compatibility' },
             { label: 'Risks and Mitigations', slug: 'project/risks' },
             { label: 'Prior Art', slug: 'project/prior-art' },
             { label: 'Naming', slug: 'project/naming' },

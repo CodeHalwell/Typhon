@@ -282,6 +282,50 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   permissions, re-pinned actions, cold release builds).
 - Dependabot ignores reverted bumps; `engines.vscode` bumped to `^1.138.0`.
 - The README flagship exhaustiveness claim is scoped to direct matches.
+- After W1-04/W1-05 the claim is full strength again: the README,
+  `docs/language.md` and the docs-site match pages describe exhaustiveness
+  over `Result` payloads, `T?`, `bool`, literal unions and nested sealed
+  unions, with the binary's real `non_exhaustive_match` output.
+- The docs site carries the W2-04 `as!` supported-target table (refused
+  targets are a check-time error, not a silent accept) and the W2-05 frozen
+  binding types (`freeze let` now has a reference section).
+- The docs-site `tyc run` page documents the automatic CPython fallback,
+  `--no-fallback`, and that a program importing `re` runs on compiled
+  CPython (W5-13); it no longer says there is no fallback.
+- The docs-site language reference matches the W1/W2 checker: `del` and
+  `except … as` cannot end a `let`, `typing` names used as runtime values
+  need their import, `go` needs a coroutine, `int ** int` with a negative
+  literal exponent is `float`, and interface conformance (parameter names,
+  optional parameters, writable fields) is described as the checker
+  enforces it — the old "optional parameters match in either direction"
+  sentence was wrong.
+- Every code `tyc explain --list` prints now has a docs-site section: 44
+  codes had only their `docs/diagnostics` page. They are on the existing
+  catalog pages plus a new *Lints & Performance Advice* page, each with an
+  example checked against the binary, and the catalog index lists every
+  code. A `shipped_docs.rs` test fails when a code the compiler declares is
+  missing from `tyc explain --list`, from `docs/diagnostics/`, or from the
+  docs-site catalog and its index. `missing_initialiser` and
+  `python_semantic_drift` are listed but never emitted; their pages say so.
+- New `fmt-corpus` CI job (W7-03 request): a copy of `examples/`,
+  `stress/` and `corpus/valid/` has its code de-formatted (`let x: T = 1` →
+  `let x:T=1`, no space after `,` or `:`, `=` and `->` squeezed, trailing
+  blanks; strings and comments untouched), `tyc fmt` runs over it, and every
+  unit must emit exactly the Python AST the unmodified corpus emits. A file
+  `tyc fmt` refuses only after de-formatting also fails the job. First run:
+  1,224 built units identical, 264 non-building on both sides.
+- `scripts/emitted-ast.py equiv A B` is the emitted-AST equivalence harness
+  (step 0 of `docs/design/sugar-as-ast-nodes.md`): A and B are `tyc`
+  binaries or git revisions; every corpus unit is built with both and the
+  `ast.dump` of every emitted `.py` compared, listing the units that
+  changed. Documented in `docs/differential-testing.md` and
+  `CONTRIBUTING.md`.
+- New compatibility policy for the beta line (`docs/compatibility.md`, and
+  *Project → Compatibility Policy* on the docs site), linked from the
+  README: the additive-on-correct-programs rule, the four categories every
+  narrowing is filed under, the exceptions made since alpha.2, the surface
+  frozen for beta (each form checked against the binary), how deprecations
+  and breaking changes are made after beta, and what counts as a bug.
 - Docs cite only diagnostic codes the binary emits (`tyc explain --list`
   minus `freeze`/`pub`, now language topics), locked in by a guard test.
 - New nullable-operator docs page listing the accepted spellings with the

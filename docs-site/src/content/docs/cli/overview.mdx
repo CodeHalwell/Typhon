@@ -3,6 +3,8 @@ title: tyc CLI Overview
 description: Every tyc subcommand at a glance.
 sidebar:
   order: 1
+banner:
+  content: "This page includes behaviour implemented on <code>main</code> for the unreleased <code>v1.0.0-beta.1</code>. The latest published binary is <code>v1.0.0-alpha.9</code>."
 ---
 
 import { Card, CardGrid } from '@astrojs/starlight/components';
@@ -79,9 +81,11 @@ tyc run             # ← in-process VM, no build dir
 tyc build           # ← when you need emitted .py on disk
 ```
 
-When your program imports CPython libraries the VM doesn't speak natively
-(`numpy`, `requests`, `pandas`, …), use `tyc run --compile` to fall back
-to the build-then-exec path.
+When your program imports a module the VM doesn't model (`numpy`,
+`requests`, `sqlite3`, `re`, …), `tyc run` notices before it starts and
+takes the build-then-exec path itself, printing a `note:`; `tyc run
+--compile` forces that path, and `--no-fallback` forbids it. See
+[`tyc run`](/Typhon/cli/run/#automatic-fallback-to-cpython).
 
 ## In CI
 

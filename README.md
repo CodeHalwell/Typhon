@@ -60,10 +60,9 @@ def main() -> None:
             print(f"timed out after {after_ms}ms")
 ```
 
-Add a third variant to `LoadError` and every `match` over the error itself turns red
-until you handle it. (A `match` on the enclosing `Result` is not yet checked for
-variants nested inside `Ok`/`Err` arms — that gap is tracked work.) That is the
-kind of safety Typhon brings to Python — and it compiles to
+Add a third variant to `LoadError` and every `match` that lists its variants turns red
+until you handle the new one — including this one, where they sit inside `Err(...)`
+arms. That is the kind of safety Typhon brings to Python — and it compiles to
 idiomatic dataclasses + a small generated `Ok`/`Err` helper you can read and debug.
 
 ## Why Typhon
@@ -174,6 +173,7 @@ Focused references in this repo:
 | [docs/vm.md](docs/vm.md) | The in-process tree-walking VM (default for `tyc run`) |
 | [docs/architecture.md](docs/architecture.md) | Compiler pipeline, crate layout, toolchain choices |
 | [docs/diagnostics/](docs/diagnostics/) | One page per `tyc::` code — also surfaced by `tyc explain <code>` |
+| [docs/compatibility.md](docs/compatibility.md) | What the beta line will not break, how breaking changes are made, and what counts as a bug |
 | [docs/roadmap.md](docs/roadmap.md) · [docs/risks.md](docs/risks.md) · [docs/prior-art.md](docs/prior-art.md) | The phased plan, risks, and influences |
 | [editors/vscode/README.md](editors/vscode/README.md) | VS Code extension — syntax highlighting + LSP client |
 
@@ -193,7 +193,7 @@ hardening pass.
 
 - ✅ **The production path is stable.** `tyc build` → CPython 3.13+ carries no runtime dependency on the toolchain; the full `examples/` + `examples/apps/` corpus builds to runnable Python and checks clean.
 - ✅ **The language is additive on *correct* programs** across the whole v0.3.0 → v1.0.0-alpha line — every program that type-checked *and ran correctly* continues to behave identically. (A few deliberate diagnostics reject only code that already crashed at runtime.)
-- ⚠️ **As an alpha, the surface syntax is not yet frozen** — it may change before `1.0.0`, always with a documented migration note.
+- ⚠️ **As an alpha, the surface syntax is not yet frozen** — it may change before `1.0.0`, always with a documented migration note. From `v1.0.0-beta.1` the surface listed in the **[compatibility policy](docs/compatibility.md)** is frozen, and the policy says how a deprecation or breaking change is made.
 - ⏳ **Deferred to beta:** embedded in-process `ty` (the subprocess `[checker] external = "ty"` path ships), typeshed-backed checking for pure-extension libraries, and the function-level HKT tail.
 
 **Want the details?** The full release-by-release history lives in

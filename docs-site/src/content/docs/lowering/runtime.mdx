@@ -176,7 +176,7 @@ The full implementation lives in `tyc/crates/tyc/src/commands/build.rs` under `T
 
 Emitted whenever the `as!` checked boundary cast appears (v0.14.0). Holds `checked_cast(value, tp)`, which backs `EXPR as! TYPE`: it performs a **recursive structural shape check** of `value` against the target type `tp` and returns `value` on success, raising `TypeError` on a mismatch. The check honours `int`→`float` widening (an `int` passes a cast to `float`) and recurses into containers, unions, and parametric types (`x as! int | None`, `d as! dict[str, int]`).
 
-`as!` lowers to a `__typhon_checked_cast__(value, tp)` call routed through this helper on the build path. Under `tyc run` the VM intercepts `__typhon_checked_cast__` before argument evaluation and applies the same structural check natively, so a cast composes in any expression position (v0.15.0) under both runners.
+`as!` lowers to a `__typhon_checked_cast__(value, tp)` call routed through this helper on the build path. Under `tyc run` the VM intercepts `__typhon_checked_cast__` before argument evaluation and applies a structural check natively, so a cast composes in any expression position (v0.15.0) under both runners. The VM's check does not yet cover `Literal`, newtype, generic-alias or interface targets; see the [supported-target table](/Typhon/reference/unsafe/#supported-targets).
 
 ## `typhon_runtime/traceback.py`
 
