@@ -184,7 +184,7 @@ fn assert_in_range(map: &[usize], src: &str) {
 #[test]
 fn question_op_expansion_all_maps_to_its_single_ty_line() {
     // 1: def parse(s: str) -> Result[int, str]:
-    // 2:     let n = int(s)?
+    // 2:     let n = try_result(lambda: int(s), lambda e: str(e))?
     // 3:     return Ok(n)
     //
     // Line 2 lowers to four Python lines (temp assign, isinstance guard,
@@ -193,7 +193,7 @@ fn question_op_expansion_all_maps_to_its_single_ty_line() {
     // three-line file.
     const SRC: &str = "\
 def parse(s: str) -> Result[int, str]:
-    let n = int(s)?
+    let n = try_result(lambda: int(s), lambda e: str(e))?
     return Ok(n)
 ";
     let tmp = tempfile::tempdir().unwrap();
@@ -208,7 +208,7 @@ def parse(s: str) -> Result[int, str]:
         q_lines.len() >= 4,
         "the `?` lowering should emit at least four lines; got {q_lines:?}"
     );
-    let expected = ty_line_of(SRC, "let n = int(s)?");
+    let expected = ty_line_of(SRC, "let n = try_result(lambda: int(s), lambda e: str(e))?");
     assert!(
         q_lines.iter().all(|&v| v == expected),
         "every `?`-expansion line must map to .ty line {expected}; got {q_lines:?}"

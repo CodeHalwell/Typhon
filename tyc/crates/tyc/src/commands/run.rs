@@ -1099,11 +1099,13 @@ mod tests {
 
     #[test]
     fn attribute_scan_checks_from_imported_members_of_modelled_modules() {
-        // `from re import purge` fails at the import under the VM exactly as
-        // `re.purge` would at the read, so it takes the compiled path too.
+        // `from json import detect_encoding` fails at the import under the
+        // VM exactly as `json.detect_encoding` would at the read, so it takes
+        // the compiled path too. (`re` is no example: any `re` import now
+        // takes the compiled path, see `importing_re_takes_the_compiled_path`.)
         assert_eq!(
-            scan_source("from re import purge\n\npurge()\n"),
-            Some(vec!["re.purge".to_owned()])
+            scan_source("from json import detect_encoding\n\nprint(detect_encoding)\n"),
+            Some(vec!["json.detect_encoding".to_owned()])
         );
         // A member the VM has, and a submodule the VM serves, are fine.
         assert_eq!(
@@ -1125,14 +1127,14 @@ mod tests {
     fn attribute_scan_exempts_a_program_defined_attribute_only_after_its_store() {
         // The store comes first: the read is the program's own attribute.
         assert_eq!(
-            scan_source("import re\n\nre.purge = 1\nprint(re.purge)\n"),
+            scan_source("import json\n\njson.detect_encoding = 1\nprint(json.detect_encoding)\n"),
             None
         );
-        // The read comes first: it still reaches the VM's `re`, which has no
-        // `purge`, so the program takes the compiled path.
+        // The read comes first: it still reaches the VM's `json`, which has
+        // no `detect_encoding`, so the program takes the compiled path.
         assert_eq!(
-            scan_source("import re\n\nprint(re.purge)\nre.purge = 1\n"),
-            Some(vec!["re.purge".to_owned()])
+            scan_source("import json\n\nprint(json.detect_encoding)\njson.detect_encoding = 1\n"),
+            Some(vec!["json.detect_encoding".to_owned()])
         );
     }
 
@@ -1155,12 +1157,23 @@ mod tests {
     }
 
     #[test]
+    fn importing_re_takes_the_compiled_path() {
+        // The VM's `re` runs on Rust's regex engine, whose `$`, empty-match,
+        // lookaround and flag semantics differ from Python's (W5-13), so a
+        // program that imports `re` runs on CPython under plain `tyc run`.
+        assert_eq!(
+            scan_source("import re\n\nprint(re.fullmatch(\"a\", \"a\") is not None)\n"),
+            Some(vec!["re (Python regular-expression semantics)".to_owned()])
+        );
+    }
+
+    #[test]
     fn attribute_scan_leaves_a_rebound_alias_alone() {
         // The alias is a parameter (or any other binding) somewhere in the
         // file: a read through it may not be the module, so it is not judged.
         assert_eq!(
             scan_source(
-                "import re\n\ndef f(re: int) -> int:\n    return re.no_such_method()\n\n\
+                "import json\n\ndef f(json: int) -> int:\n    return json.no_such_method()\n\n\
                  print(f(1))\n"
             ),
             None
