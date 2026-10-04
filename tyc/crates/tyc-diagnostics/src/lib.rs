@@ -367,7 +367,7 @@ pub enum TycError {
     #[diagnostic(
         code(tyc::operator_type_mismatch),
         url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/operator_type_mismatch.md"),
-        help("convert one operand so the types match (e.g. `str(n)` / `int(s)`)")
+        help("use operands supported by this operator; for class ordering, define the comparison methods or enable dataclass order=True")
     )]
     OperatorTypeMismatch {
         op: String,
@@ -420,16 +420,13 @@ pub enum TycError {
         note: String,
     },
 
-    /// The error type propagated by `?` from a callee does not match the
-    /// caller's `Result[T, E]` declaration. Distinct from the generic
-    /// `tyc::type_mismatch` so users see immediately that the failure is
-    /// at a `?`-propagation boundary and can act accordingly (convert at
-    /// the boundary, or change one of the function signatures).
-    #[error("`?` propagates `Err[{actual_err}]` into `Result[_, {expected_err}]`")]
+    /// A returned or propagated Err value does not match the enclosing
+    /// Result error type. This covers plain returns and `?` boundaries.
+    #[error("`Err[{actual_err}]` does not match declared `Result[_, {expected_err}]`")]
     #[diagnostic(
         code(tyc::result_error_mismatch),
         url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/result_error_mismatch.md"),
-        help("the `?` operator forwards the callee's `Err` value as-is; convert it with a `match` or change one signature so the error types match")
+        help("return or propagate an `Err` with the declared error type; convert the value with a `match` or change the result signature")
     )]
     ResultErrorMismatch {
         expected_err: String,
@@ -5320,6 +5317,14 @@ fn dedup_vec(v: &mut Vec<TycError>) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn w2_09_operator_help_covers_class_comparisons() {
+        let d = TycError::operator_type_mismatch("<", "Point", "Point", "<test>", "a < b", 0, 5);
+        let help = miette::Diagnostic::help(&d).unwrap().to_string();
+        assert!(!help.contains("str(n)"), "{help}");
+        assert!(help.contains("operator"), "{help}");
+    }
     #[test]
     fn remap_lines_moves_a_diagnostic_onto_the_original_line() {
         // The expanded buffer has two synthesised lines (a temp binding and

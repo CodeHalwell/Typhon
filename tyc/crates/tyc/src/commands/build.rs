@@ -4147,6 +4147,12 @@ def _deep_freeze(value: Any, seen: set[int]) -> Any:
                 return frozenset(_deep_freeze(v, seen) for v in value)
             finally:
                 seen.discard(value_id)
+        if isinstance(value, MappingProxyType):
+            seen.add(value_id)
+            try:
+                return MappingProxyType({k: _deep_freeze(v, seen) for k, v in value.items()})
+            finally:
+                seen.discard(value_id)
         return value
     if isinstance(value, list):
         seen.add(value_id)
@@ -4200,99 +4206,95 @@ const TYPHON_RUNTIME_CAST_PY: &str = "\
 \"\"\"Runtime guard backing Typhon's `as!` checked boundary cast.\"\"\"
 from __future__ import annotations
 
+import collections.abc as abc
 import types
 import typing
 from typing import Any
 
 
 def checked_cast(value: Any, tp: Any) -> Any:
-    \"\"\"Return *value* if it structurally matches *tp*, else raise TypeError.
-
-    Backs `EXPR as! TYPE`. The static type is `TYPE` (the checker handles
-    that); this enforces the same shape at runtime so the boundary cast is
-    sound rather than a blind assertion.
-    \"\"\"
-    if _matches(value, tp):
+    \"\"\"Preserve value identity after checking the documented target shape.\"\"\"
+    if _matches(value, tp, {}, set()):
         return value
     raise TypeError(
         f\"as! cast failed: value of type {type(value).__name__} \"
-        f\"does not match {_format_type(tp)}\"
+        f\"does not match {tp}\"
     )
 
 
-def _matches(value: Any, tp: Any) -> bool:
-    # `Any` / `object` accept anything.
+def _matches(value: Any, tp: Any, bindings: dict, active: set) -> bool:
+    parameters_seen = set()
+    while isinstance(tp, typing.TypeVar):
+        if tp not in bindings or tp in parameters_seen:
+            raise TypeError(f\"as! cannot check unbound type parameter {tp}\")
+        parameters_seen.add(tp)
+        tp = bindings[tp]
     if tp is Any or tp is object:
         return True
-    origin = typing.get_origin(tp)
-    if origin is None:
+    # Alias recursion and cyclic container values must terminate. A pair
+    # stays active only while descending that branch, allowing shared values.
+    pair = (id(value), id(tp))
+    if pair in active:
+        return False
+    active.add(pair)
+    try:
+        if isinstance(tp, typing.TypeAliasType):
+            return _matches(value, tp.__value__, bindings, active)
+        origin = typing.get_origin(tp)
+        args = typing.get_args(tp)
+        if isinstance(origin, typing.TypeAliasType):
+            parameters = origin.__type_params__
+            if len(parameters) != len(args):
+                raise TypeError(f\"as! requires all alias arguments for {origin}\")
+            substitutions = dict(bindings)
+            substitutions.update(zip(parameters, args))
+            return _matches(value, origin.__value__, substitutions, active)
+        if origin is typing.Annotated:
+            return _matches(value, args[0], bindings, active)
+        if origin is typing.Literal:
+            return any(type(value) is type(arg) and value == arg for arg in args)
+        if origin is typing.Union or origin is types.UnionType:
+            return any(_matches(value, arg, bindings, active) for arg in args)
+        if origin in (list, set, frozenset, abc.Sequence, abc.Collection, abc.Set):
+            if not isinstance(value, origin):
+                return False
+            return not args or all(_matches(item, args[0], bindings, active) for item in value)
+        if origin in (dict, abc.Mapping, abc.MutableMapping):
+            if not isinstance(value, origin):
+                return False
+            return not args or all(
+                _matches(k, args[0], bindings, active) and _matches(v, args[1], bindings, active)
+                for k, v in value.items()
+            )
+        if origin is tuple:
+            if not isinstance(value, tuple):
+                return False
+            if not args:
+                return True
+            if len(args) == 2 and args[1] is Ellipsis:
+                return all(_matches(item, args[0], bindings, active) for item in value)
+            return len(args) == len(value) and all(
+                _matches(item, arg, bindings, active) for item, arg in zip(value, args)
+            )
+        if origin is not None:
+            raise TypeError(f\"as! cannot check parameterised target {tp}\")
         if tp is None or tp is type(None):
             return value is None
-        # Typhon widens int -> float (and bool -> int), so mirror that for a
-        # numeric-target cast; otherwise a JSON int cast `as! float` would
-        # spuriously fail.
         if tp is float:
             return isinstance(value, (int, float)) and not isinstance(value, complex)
         if tp is complex:
             return isinstance(value, (int, float, complex))
-        # `newtype Foo = int` lowers to `typing.NewType`, which is a callable,
-        # not a type — `isinstance(tp, type)` is False, so this fell straight
-        # through to `return True` and the cast was completely unchecked on
-        # the compiled path while the VM rejected it. Unwrap to the base type
-        # and check that.
         supertype = getattr(tp, \"__supertype__\", None)
         if supertype is not None:
-            return _matches(value, supertype)
-        # An `interface` lowers to a `Protocol` subclass, and `isinstance`
-        # against a Protocol that is not `@runtime_checkable` *raises*
-        # TypeError — so `EXPR as! SomeInterface` could never succeed, it only
-        # ever blew up inside the guard. Check structurally instead, which is
-        # what an interface means anyway: does the value carry the members?
+            return _matches(value, supertype, bindings, active)
         protocol_attrs = getattr(tp, \"__protocol_attrs__\", None)
         if protocol_attrs is not None:
             return all(hasattr(value, attr) for attr in protocol_attrs)
         if isinstance(tp, type):
             return isinstance(value, tp)
-        # An unrecognised descriptor (e.g. a TypeVar) — be permissive so the
-        # cast only ever rejects shapes it can actually prove wrong.
-        return True
-    args = typing.get_args(tp)
-    if origin is typing.Union or origin is types.UnionType:
-        return any(_matches(value, arg) for arg in args)
-    if origin in (list, set, frozenset):
-        if not isinstance(value, origin):
-            return False
-        return not args or all(_matches(item, args[0]) for item in value)
-    if origin is dict:
-        if not isinstance(value, dict):
-            return False
-        if len(args) != 2:
-            return True
-        key_t, val_t = args
-        return all(
-            _matches(k, key_t) and _matches(v, val_t) for k, v in value.items()
-        )
-    if origin is tuple:
-        if not isinstance(value, tuple):
-            return False
-        # `tuple[X, ...]` — homogeneous, any length.
-        if len(args) == 2 and args[1] is Ellipsis:
-            return all(_matches(item, args[0]) for item in value)
-        if len(args) != len(value):
-            return False
-        return all(_matches(item, arg) for item, arg in zip(value, args))
-    # Other parameterised origins (collections.abc.*, etc.) — check the
-    # erased origin only; element types are beyond what we model here.
-    if isinstance(origin, type):
-        return isinstance(value, origin)
-    return True
-
-
-def _format_type(tp: Any) -> str:
-    try:
-        return str(tp)
-    except Exception:  # pragma: no cover - defensive
-        return repr(tp)
+        raise TypeError(f\"as! cannot check target descriptor {tp}\")
+    finally:
+        active.discard(pair)
 ";
 
 /// Generated `typhon_runtime/traceback.py` — rewrites an uncaught

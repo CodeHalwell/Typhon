@@ -752,3 +752,46 @@ extend User:
 ```
 
 `extend BUILTIN:` (extending the recognised Python built-ins — `str`, `list`, `int`, `dict`, …) is also supported. Each method is extracted at desugar time to a module-level free function `__typhon_ext_<TYPE>__<METHOD>__`, and call sites `x.method(...)` are rewritten to `__typhon_ext_<TYPE>__method(x, ...)` whenever the receiver `x` has a static annotation matching one of the registered built-ins. There is no monkey-patching of built-in types; the rewrite is strictly opt-in by type annotation, so calls on un-annotated receivers continue to raise `AttributeError` at runtime, matching Python's existing semantics. The receiver's type is taken from declarations: an annotated name (a parameter, a `let x: T`, or a module-level constant read from inside a function), an unannotated `let x = EXPR` whose initialiser's type is evident, a literal or f-string, a field or `@property` of a class declared in or imported into the module (`self.title.slug()`, `post.title.slug()`, including inherited and generic fields), a call whose declared return is the builtin (a same-module or imported `def`, an `impl` / static method, a constructor's field, `module.f()`), an awaited `async def`, a subscript on a `list[T]` / `dict[K, V]` / tuple, a `for` or comprehension variable, a chain of type-preserving builtin methods, `str` concatenation / repetition / `%`, and another extension call (`t.slug().shout()`). A `T?` receiver counts as `T` (the checker requires the narrowing). A receiver whose type the pass cannot see — a `match` capture, an unannotated lambda parameter, a `with … as` target, an unannotated module-level binding read inside a function, a stdlib call — is left as a native attribute access and raises `AttributeError` at runtime. The free-function name ends in a double underscore so CPython does not name-mangle it when the rewritten call sits inside a class body.
+
+
+## Checked boundary casts (`as!`)
+
+`EXPR as! TYPE` checks an untyped boundary value and returns the same object.
+A mismatch raises `TypeError`. A target without an enforceable runtime shape
+is refused by the checker and by the generated runtime.
+
+| Target | Check |
+| --- | --- |
+| `int`, `str`, `bool`, `bytes`, `None`, other ordinary classes | `isinstance` (classes are shallow) |
+| `float`, `complex` | Numeric widening is accepted: integers inhabit float targets |
+| `Any`, `object` | Accept any value |
+| Unions and nullable types | At least one member must match |
+| `Literal[...]` | Exact value and primitive type membership |
+| `list[T]`, `set[T]`, `frozenset[T]` | Container kind and every element recursively |
+| `dict[K, V]`, `Mapping[K, V]`, `MutableMapping[K, V]` | Mapping kind and every key/value recursively |
+| `Sequence[T]`, `Collection[T]`, `AbstractSet[T]` | Collection kind and every element recursively |
+| Fixed tuples and `tuple[T, ...]` | Length/slots, or every homogeneous element recursively |
+| Transparent aliases, including generic aliases with concrete arguments | Expand the alias and substitute its arguments; apply the underlying check |
+| Newtypes | Check the underlying base type |
+| Interfaces | Shallow member presence; method bodies and field values are not inspected |
+| Bare type parameters, unbound alias parameters, `Callable`, iterator/awaitable contracts, parameterised user classes, other unknown descriptors | Refused |
+
+Recursive aliases are supported for finite values. Cyclic values fail the cast.
+A shallow class or interface cast establishes the runtime class or member
+surface; it does not inspect the internals of an instance.
+
+
+### Frozen binding types
+
+A `freeze let` annotation describes the input value. The binding uses the
+runtime's recursively frozen shape: `list[T]` becomes `tuple[T, ...]`,
+`dict[K, V]` becomes `Mapping[K, V]`, and `set[T]` becomes `frozenset[T]`.
+Nested container elements are frozen too. Read operations remain available;
+container mutation and list concatenation on a frozen tuple are rejected. A
+new binding receiving a frozen value retains its frozen shape. An immutable
+operation deliberately protected by its matching exception handler is
+reported as a warning, allowing runtime failure probes to remain executable.
+
+Frozen dataclass instances pass through unchanged and retain identity. Their
+fields are not rebuilt or deep-frozen: use immutable field values when the
+instance must be deeply immutable.

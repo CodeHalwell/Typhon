@@ -379,6 +379,24 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   report `tyc::unknown_name`. `Protocol` and the `collections.abc` names
   are unaffected: the build imports them.
 
+### Fourth wave — 2026-10-03 reviews
+
+#### W2 — checker expressions
+
+- W2-05: frozen bindings and aliases carry recursively immutable tuple, Mapping and frozenset types; read-only tuple views and tuple concatenation remain usable. Unhandled mutations reject; deliberate mutations caught by their matching handler warn. Mapping proxies are recursively frozen, while frozen dataclass instances preserve identity and field values. The banking read and caught-failure corpus probes remain accepted.
+
+- W2-04: checked casts expand transparent and concrete generic aliases, enforce Literal membership, preserve NewType base checks, and terminate recursive/cyclic values. Bare parameters and unsupported parameterised contracts are refused; `docs/language.md` records the supported-target table. The emitted CPython runtime rejects the JSON alias repro at the cast.
+
+- W2-02: debug builds support `TYC_REPORT_UNCHECKED=1 tyc check PATH`, reporting per-file Unknown annotation, return and member sites without changing severity. Examples baseline after builtin typing: 266 files, 206 annotated sites, 179 returns, 952 member sites (1337 total). Per-file counts are saved in `code_review/w2-codex/unchecked-examples-baseline.csv`.
+
+- W2-03: shared fields and properties on unions return the union of their types. Direct method calls must satisfy every variant's arity and parameter types and return the union of their results, with generic receiver parameters substituted and async methods returning coroutines.
+
+- W2-19: attribute inference folds receiver chains iteratively and compares recorded narrowing paths without building every receiver prefix. On this Mac, debug checks at 2k/4k/8k links fell from 1.18s/4.84s/34.44s (8k stack abort) to 0.125s/0.210s/0.559s, all successful.
+
+- W2-20: `check_module_with_imports_and_types` exposes the checker's contextual expression types by preprocessed-source byte span, including Callable lambda parameters and match captures, for extension lowering.
+
+- W2-01: builtin calls retain their result and iterator element types, including per-call overloads for `round`, `min`/`max`, numeric conversions and container constructors. `super()` resolves the base method contract. Fresh container copies may widen their elements; constant-false expression branches do not introduce diagnostics. The 1,481-unit checker corpus retains its baseline; no newly rejected unit was added.
+
 ### Third wave — the 2026-09-30 release-readiness review
 
 **Seven ways a check-clean program could crash, closed.** Each of these

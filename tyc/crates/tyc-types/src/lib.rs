@@ -20,6 +20,16 @@
 //! useful diagnostics on a meaningful subset of programs, not full
 //! coverage.
 
+mod builtins;
+mod callables;
+mod class_contracts;
+mod expression_calls;
+mod frozen_context;
+mod mutations;
+mod operators;
+#[cfg(debug_assertions)]
+mod unchecked;
+
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -1093,7 +1103,9 @@ fn task_spawn_callee(call: &ruff_python_ast::ExprCall) -> Option<String> {
 /// receiver whose class shape is known.
 fn callee_is_async(c: &Checker, call: &ruff_python_ast::ExprCall) -> bool {
     match call.func.as_ref() {
-        Expr::Name(n) => c.async_functions.contains(n.id.as_str()),
+        Expr::Name(_) => {
+            matches!(infer_expr_readonly(c,&call.func), Type::Function { ret,.. } if matches!(ret.as_ref(),Type::Generic(head,_) if head=="Coroutine"))
+        }
         Expr::Attribute(a) => {
             let recv = infer_expr_readonly(c, &a.value);
             let class_name = match recv.strip_none() {
@@ -2022,6 +2034,14 @@ pub fn type_from_annotation_with_params(
                                     min_params: None,
                                 };
                             }
+                            Expr::Name(n) if type_params.iter().any(|p| p == n.id.as_str()) => {
+                                return Type::Function {
+                                    params: vec![Type::TypeVar(format!("**{}", n.id))],
+                                    ret: Box::new(ret),
+                                    variadic: true,
+                                    min_params: Some(0),
+                                };
+                            }
                             _ => {}
                         }
                     }
@@ -2365,6 +2385,20 @@ fn bind_typevars_checked(
                 ret: fr,
                 ..
             },
+            Type::Function { ret: ar, .. },
+        ) if callables::parameter_pack(fp).is_some() => {
+            bindings.insert(
+                format!("**{}", callables::parameter_pack(fp).unwrap()),
+                actual.clone(),
+            );
+            bind_typevars_checked(fr, ar, bindings, ctor_vars)?;
+        }
+        (
+            Type::Function {
+                params: fp,
+                ret: fr,
+                ..
+            },
             Type::Function {
                 params: ap,
                 ret: ar,
@@ -2447,18 +2481,32 @@ fn substitute_typevars(ty: &Type, bindings: &std::collections::HashMap<String, T
             ret,
             variadic,
             min_params,
-        } => Type::Function {
-            params: params
-                .iter()
-                .map(|p| substitute_typevars(p, bindings))
-                .collect(),
-            ret: Box::new(substitute_typevars(ret, bindings)),
-            variadic: *variadic,
-            // Carry the required-arity through: dropping it here silently
-            // reverts a substituted signature to "every parameter required",
-            // which is exactly the false positive this field exists to fix.
-            min_params: *min_params,
-        },
+        } => {
+            let pack = callables::parameter_pack(params)
+                .and_then(|name| bindings.get(&format!("**{name}")));
+            let (params, variadic, min_params) = match pack {
+                Some(Type::Function {
+                    params,
+                    variadic,
+                    min_params,
+                    ..
+                }) => (params.clone(), *variadic, *min_params),
+                _ => (
+                    params
+                        .iter()
+                        .map(|p| substitute_typevars(p, bindings))
+                        .collect(),
+                    *variadic,
+                    *min_params,
+                ),
+            };
+            Type::Function {
+                params,
+                ret: Box::new(substitute_typevars(ret, bindings)),
+                variadic,
+                min_params,
+            }
+        }
         other => other.clone(),
     }
 }
@@ -3147,10 +3195,28 @@ impl TypeEnv {
 /// conservative direction: the assignment falls through to the ordinary
 /// nominal check rather than being waved through.
 const READ_VIEW_LATTICE: &[(&str, &[&str])] = &[
-    ("Sequence", &["list", "tuple", "deque", "range", "Sequence"]),
+    (
+        "Sequence",
+        &[
+            "list",
+            "tuple",
+            "tuple_variadic",
+            "deque",
+            "range",
+            "Sequence",
+        ],
+    ),
     (
         "Reversible",
-        &["list", "tuple", "deque", "range", "Sequence", "Reversible"],
+        &[
+            "list",
+            "tuple",
+            "tuple_variadic",
+            "deque",
+            "range",
+            "Sequence",
+            "Reversible",
+        ],
     ),
     // Every iterable: the concrete containers, the dict views (iterating a
     // `dict` itself yields its keys, which is what `dict[K, V]`'s first
@@ -3161,6 +3227,7 @@ const READ_VIEW_LATTICE: &[(&str, &[&str])] = &[
         &[
             "list",
             "tuple",
+            "tuple_variadic",
             "set",
             "frozenset",
             "deque",
@@ -3181,6 +3248,7 @@ const READ_VIEW_LATTICE: &[(&str, &[&str])] = &[
         &[
             "list",
             "tuple",
+            "tuple_variadic",
             "set",
             "frozenset",
             "deque",
@@ -3198,6 +3266,7 @@ const READ_VIEW_LATTICE: &[(&str, &[&str])] = &[
         &[
             "list",
             "tuple",
+            "tuple_variadic",
             "set",
             "frozenset",
             "deque",
@@ -3247,6 +3316,10 @@ const INFER_EXPR_MAX_DEPTH: u32 = 20_000;
 const IS_ASSIGNABLE_MAX_DEPTH: u32 = 256;
 
 struct Checker<'a> {
+    descriptor_uses: std::cell::OnceCell<HashSet<(String, String)>>,
+    expression_types: HashMap<(usize, usize), Type>,
+    attribute_receiver_type: Option<Type>,
+    module: Option<&'a ModModule>,
     path: String,
     source: &'a str,
     resolved: &'a ResolvedModule,
@@ -3815,6 +3888,7 @@ impl InterfaceShape {
 impl<'a> Checker<'a> {
     fn new(path: String, source: &'a str, resolved: &'a ResolvedModule) -> Self {
         Self {
+            module: None,
             path,
             source,
             resolved,
@@ -3843,6 +3917,9 @@ impl<'a> Checker<'a> {
             in_generator: false,
             function_type_bounds: HashMap::new(),
             active_typevar_bounds: HashMap::new(),
+            descriptor_uses: std::cell::OnceCell::new(),
+            expression_types: HashMap::new(),
+            attribute_receiver_type: None,
             active_type_params: Vec::new(),
             interfaces: HashMap::new(),
             class_shapes: HashMap::new(),
@@ -4014,6 +4091,72 @@ impl<'a> Checker<'a> {
             }
             _ => false,
         };
+        fn nested_opaque(c: &Checker, ty: &Type) -> bool {
+            match ty {
+                Type::TypeVar(name) | Type::Class(name) => {
+                    c.active_type_params.iter().any(|p| p == name)
+                }
+                Type::Generic(_, args) | Type::Union(args) => {
+                    args.iter().any(|a| nested_opaque(c, a))
+                }
+                Type::Function { params, ret, .. } => {
+                    params.iter().any(|a| nested_opaque(c, a)) || nested_opaque(c, ret)
+                }
+                _ => false,
+            }
+        }
+        if nested_opaque(self, expected) || nested_opaque(self, actual) {
+            if let (Type::Generic(eh, ea), Type::Generic(ah, aa)) = (expected, actual) {
+                if ea.len() == 1
+                    && !aa.is_empty()
+                    && (read_view_head_accepts(eh, ah) || (eh == "tuple_variadic" && ah == "tuple"))
+                {
+                    let slots = if ah == "tuple" {
+                        aa.as_slice()
+                    } else {
+                        &aa[..1]
+                    };
+                    return Some(slots.iter().all(|a| self.is_assignable(&ea[0], a)));
+                }
+                if eh == "Mapping"
+                    && matches!(ah.as_str(), "dict" | "Mapping")
+                    && ea.len() == aa.len()
+                {
+                    return Some(ea.iter().zip(aa).all(|(e, a)| self.is_assignable(e, a)));
+                }
+            }
+            match (expected, actual) {
+                (
+                    Type::Function {
+                        params: ep,
+                        ret: er,
+                        ..
+                    },
+                    Type::Function {
+                        params: ap,
+                        ret: ar,
+                        ..
+                    },
+                ) if ep.len() == ap.len() => {
+                    return Some(
+                        ep.iter().zip(ap).all(|(e, a)| self.is_assignable(a, e))
+                            && self.is_assignable(er, ar),
+                    )
+                }
+                (Type::Generic(eh, ea), Type::Generic(ah, aa))
+                    if eh == ah && ea.len() == aa.len() =>
+                {
+                    return Some(ea.iter().zip(aa).all(|(e, a)| self.is_assignable(e, a)))
+                }
+                (_, Type::Union(members)) => {
+                    return Some(members.iter().all(|a| self.is_assignable(expected, a)))
+                }
+                (Type::Union(members), _) => {
+                    return Some(members.iter().any(|e| self.is_assignable(e, actual)))
+                }
+                _ => {}
+            }
+        }
         match (expected, actual) {
             (Type::TypeVar(e), Type::TypeVar(a)) if opaque(expected) || opaque(actual) => {
                 Some(e == a)
@@ -4050,6 +4193,11 @@ impl<'a> Checker<'a> {
     }
 
     fn is_assignable_inner(&self, expected: &Type, actual: &Type) -> bool {
+        if matches!(expected, Type::Generic(head, _) if head == "TypeGuard" || head == "TypeIs")
+            && matches!(actual, Type::Bool)
+        {
+            return true;
+        }
         if let Some(verdict) = self.opaque_typevar_verdict(expected, actual) {
             return verdict;
         }
@@ -4061,7 +4209,22 @@ impl<'a> Checker<'a> {
         // `async def` value assignable to a `Callable[..., Awaitable[R]]`
         // parameter.
         if let (Type::Generic(eh, ea), Type::Generic(ah, aa)) = (expected, actual) {
-            if eh == "Awaitable" && ah == "Coroutine" && ea.len() == 1 {
+            if eh == "Coroutine" && ah == "Coroutine" && ea.len() != aa.len() {
+                let e = unwrap_awaitable(expected, &self.classes);
+                let a = unwrap_awaitable(actual, &self.classes);
+                if let (Some(e), Some(a)) = (e, a) {
+                    return self.is_assignable(&e, &a);
+                }
+            }
+            if eh == "Awaitable"
+                && matches!(
+                    ah.as_str(),
+                    "Coroutine" | "Task" | "asyncio.Task" | "Future" | "asyncio.Future"
+                )
+                && ea.len() == 1
+                && (!matches!(ah.as_str(), "Task" | "Future")
+                    || !self.classes.iter().any(|name| name == ah))
+            {
                 // The checker's own shorthand is `Coroutine[R]`; the typeshed
                 // form is `Coroutine[Y, S, R]`.
                 let result = match aa.len() {
@@ -4180,6 +4343,9 @@ impl<'a> Checker<'a> {
             },
         ) = (expected, actual)
         {
+            if callables::parameter_pack(ep).is_some() {
+                return self.is_assignable(er, ar);
+            }
             // `Callable[..., R]` (empty params + variadic) accepts any
             // function with an assignable (covariant) return type.
             if *ev && ep.is_empty() {
@@ -5066,8 +5232,16 @@ impl<'a> Checker<'a> {
             } else {
                 substitute_typevars(&iface_sig.return_type, iface_subst)
             };
+            if iface_sig.is_property {
+                if let Some((getter, _)) = class_contracts::property(self, cls_name, m) {
+                    if !is_self_ref(&iface_ret) && !self.is_assignable(&iface_ret, &getter) {
+                        return false;
+                    }
+                    continue;
+                }
+            }
             match self.find_method(cls_name, m) {
-                Some(cls_sig) if cls_sig.arity == iface_sig.arity => {
+                Some(cls_sig) if class_contracts::method_accepts_contract(iface_sig, cls_sig) => {
                     // `async def` is part of the contract in both directions: a
                     // caller `await`s an interface coroutine method (an `int`
                     // from a sync implementation crashes) and calls a sync one
@@ -5132,6 +5306,12 @@ impl<'a> Checker<'a> {
                 _ => return false,
             }
         }
+        if !iface_shape.fields.is_empty()
+            && (self.frozen_classes.contains(cls_name)
+                || class_contracts::dataclass_option(self, cls_name, "frozen") == Some(true))
+        {
+            return false;
+        }
         for (f, iface_type_raw) in &iface_shape.fields {
             let iface_type = if iface_subst.is_empty() {
                 iface_type_raw.clone()
@@ -5139,17 +5319,18 @@ impl<'a> Checker<'a> {
                 substitute_typevars(iface_type_raw, iface_subst)
             };
             match self.find_field(cls_name, f) {
-                Some(cls_type) if self.is_assignable(&iface_type, cls_type) => {}
+                Some(cls_type)
+                    if self.is_assignable(&iface_type, cls_type)
+                        && self.is_assignable(cls_type, &iface_type) => {}
                 Some(_) => return false, // field present but wrong type
-                // A `@property` of the right type satisfies a field — reading
-                // it yields the value. A plain zero-argument *method* does not:
-                // `obj.f` would be a bound method where the interface promised
-                // the value itself.
-                None if self.find_method(cls_name, f).is_some_and(|s| {
-                    s.is_property
-                        && (s.return_type == Type::Unknown
-                            || self.is_assignable(&iface_type, &s.return_type))
-                }) => {}
+                None if class_contracts::property(self, cls_name, f).is_some_and(
+                    |(getter, setter)| {
+                        setter.is_some_and(|setter| {
+                            self.is_assignable(&iface_type, &getter)
+                                && self.is_assignable(&setter, &iface_type)
+                        })
+                    },
+                ) => {}
                 None => return false,
             }
         }
@@ -5450,12 +5631,29 @@ impl<'a> Checker<'a> {
     /// classes defining `__setattr__` / `__getattr__`. A plain `class` with
     /// fully-known bases emits `@dataclass(slots=True)` and cannot.
     fn class_accepts_undeclared_attrs(&self, name: &str) -> bool {
-        let real = name.strip_prefix("__typhon_impl_").unwrap_or(name);
-        self.is_plain_class(real)
-            || self.is_raw_class(real)
-            || !self.class_hierarchy_fully_known(real)
-            || self.class_defines_getattr(real)
-            || self.find_method(real, "__setattr__").is_some()
+        let mut stack = vec![name
+            .strip_prefix("__typhon_impl_")
+            .unwrap_or(name)
+            .to_owned()];
+        let mut seen = HashSet::new();
+        while let Some(real) = stack.pop() {
+            if !seen.insert(real.clone()) {
+                continue;
+            }
+            if self.is_plain_class(&real)
+                || self.is_raw_class(&real)
+                || class_contracts::dataclass_option(self, &real, "slots") == Some(false)
+                || !self.class_hierarchy_fully_known(&real)
+                || self.class_defines_getattr(&real)
+                || self.find_method(&real, "__setattr__").is_some()
+            {
+                return true;
+            }
+            if let Some(shape) = self.resolve_class_shape(&real) {
+                stack.extend(shape.bases.iter().cloned());
+            }
+        }
+        false
     }
 
     /// Return `true` when every class in `cls_name`'s inheritance chain has a
@@ -6827,7 +7025,46 @@ pub fn check_module_with_imports(
     impl_distributed_lines: &[usize],
     external: Option<&ExternalShapes>,
 ) -> Diagnostics {
+    check_module_with_imports_and_types(
+        path,
+        source,
+        resolved,
+        module,
+        unsafe_lines,
+        frozen_class_lines,
+        impl_distributed_lines,
+        external,
+    )
+    .diagnostics
+}
+
+/// Checked expression types use byte spans in the preprocessed source. The
+/// map records contextual inference, including expected Callable parameters
+/// and typed match captures, rather than reconstructing types during lowering.
+#[derive(Debug)]
+pub struct CheckedModule {
+    pub diagnostics: Diagnostics,
+    pub expression_types: HashMap<(usize, usize), Type>,
+}
+impl CheckedModule {
+    pub fn type_at(&self, span: (usize, usize)) -> Option<&Type> {
+        self.expression_types.get(&span)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn check_module_with_imports_and_types(
+    path: impl Into<String>,
+    source: &str,
+    resolved: &ResolvedModule,
+    module: &ModModule,
+    unsafe_lines: &[usize],
+    frozen_class_lines: &[usize],
+    impl_distributed_lines: &[usize],
+    external: Option<&ExternalShapes>,
+) -> CheckedModule {
     let mut c = Checker::new(path.into(), source, resolved);
+    c.module = Some(module);
     c.unsafe_line_starts = unsafe_byte_starts(source, unsafe_lines);
     let frozen_starts = unsafe_byte_starts(source, frozen_class_lines);
     // Seed cross-module shapes BEFORE the in-module first pass so
@@ -7079,7 +7316,12 @@ pub fn check_module_with_imports(
     // the failure shows in the editor instead of at first import.
     check_freeze_let_freezable(&mut c, &module.body);
 
-    c.diagnostics
+    #[cfg(debug_assertions)]
+    unchecked::report(&c.path, module, &c.expression_types);
+    CheckedModule {
+        diagnostics: c.diagnostics,
+        expression_types: c.expression_types,
+    }
 }
 
 /// Compute the byte offset of the start of each line in `source` that was
@@ -8305,9 +8547,6 @@ fn check_attr_assign_type(c: &mut Checker, target: &Expr, value_type: &Type) {
     let Expr::Attribute(attr) = target else {
         return;
     };
-    if matches!(value_type, Type::Unknown) {
-        return;
-    }
     let recv = infer_expr_readonly(c, &attr.value);
     // A nullable receiver is already reported as `tyc::nullable_use`; peel the
     // `| None` so the field check still applies to the underlying class rather
@@ -8335,7 +8574,36 @@ fn check_attr_assign_type(c: &mut Checker, target: &Expr, value_type: &Type) {
         return;
     }
     let attr_name = attr.attr.as_str();
-    let Some(field_ty) = c.find_field(&real_class, attr_name).cloned() else {
+    if class_contracts::classvar(c, &real_class, attr_name)
+        && !class_contracts::class_object(c, &attr.value)
+    {
+        c.diagnostics.push_error(TycError::generic(format!(
+            "ClassVar `{real_class}.{attr_name}` must be assigned through the class"
+        )));
+        return;
+    }
+    let property = class_contracts::property(c, &real_class, attr_name);
+    if property
+        .as_ref()
+        .is_some_and(|(_, setter)| setter.is_none())
+    {
+        let diagnostic = TycError::generic(format!(
+            "`{real_class}.{attr_name}` is a read-only property"
+        ));
+        if frozen_context::failure_is_caught(c, target, "AttributeError") {
+            c.diagnostics.push_warning(diagnostic);
+        } else {
+            c.diagnostics.push_error(diagnostic);
+        }
+        return;
+    }
+    if matches!(value_type, Type::Unknown) {
+        return;
+    }
+    let field_type = property
+        .and_then(|(_, setter)| setter)
+        .or_else(|| c.find_field(&real_class, attr_name).cloned());
+    let Some(field_ty) = field_type else {
         // Writing a name the class never declared: a `class` emits
         // `@dataclass(slots=True)`, so `self.y = 5` with no `y: …` field
         // raises `AttributeError: 'X' object has no attribute 'y'` at
@@ -8347,8 +8615,7 @@ fn check_attr_assign_type(c: &mut Checker, target: &Expr, value_type: &Type) {
         if c.unsafe_depth == 0
             && !attr_name.starts_with('_')
             && !real_class.contains('.')
-            && !c.is_plain_class(&real_class)
-            && !c.is_raw_class(&real_class)
+            && !c.class_accepts_undeclared_attrs(&real_class)
             && !real_shape.bases.iter().any(|b| b == "BaseModel")
             && c.class_hierarchy_fully_known(&real_class)
             && !c.class_defines_getattr(&real_class)
@@ -9962,6 +10229,9 @@ fn has_runtime_checkable_decorator(decorators: &[ruff_python_ast::Decorator]) ->
 ///    stub layer (which doesn't carry `__enter__` annotations today)
 ///    and stays Unknown rather than misfiring downstream.
 fn with_target_type(c: &Checker, ctx_expr: &Expr, ctx_ty: &Type, is_async: bool) -> Type {
+    if is_async && matches!(ctx_ty,Type::Class(name) if name=="asyncio.TaskGroup") {
+        return ctx_ty.clone();
+    }
     // (1) Factory call. Both bare-name (`acquire()`) and
     // attribute-style (`self.acquire()`, `pool.session()`) callees
     // resolve through the contextmanager_yields registry — we key on
@@ -11262,12 +11532,31 @@ fn try_result_arg_ret_readonly(c: &Checker, arg: &Expr) -> Type {
 /// with `infer_expr` so the thunk / mapper's own diagnostics surface.
 fn infer_try_result_arg_ret(c: &mut Checker, arg: &Expr) -> Type {
     match arg {
-        Expr::Lambda(lam) => infer_expr(c, &lam.body),
+        Expr::Lambda(_) => expression_calls::callback_result(c, arg, vec![]),
         other => match infer_expr(c, other) {
             Type::Function { ret, .. } => *ret,
             _ => Type::Unknown,
         },
     }
+}
+
+fn expression_attr_narrowing(c: &Checker, expr: &Expr) -> Option<Type> {
+    c.env.attr_narrowings.iter().find_map(|(path, ty)| {
+        let mut node = expr;
+        let mut components = path.rsplit('.').peekable();
+        while let Some(component) = components.next() {
+            match node {
+                Expr::Attribute(attr) if attr.attr.as_str() == component => node = &attr.value,
+                Expr::Name(name)
+                    if name.id.as_str() == component && components.peek().is_none() =>
+                {
+                    return Some(ty.clone())
+                }
+                _ => return None,
+            }
+        }
+        None
+    })
 }
 
 fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
@@ -11278,16 +11567,39 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
             .map(|b| b.narrowed.clone())
             .unwrap_or(Type::Unknown),
         Expr::Attribute(a) => {
-            if let Some(path) = attr_path_of(e) {
-                if let Some(narrowed) = c.env.attr_narrowed(&path) {
-                    return narrowed.clone();
-                }
+            if let Some(narrowed) = expression_attr_narrowing(c, e) {
+                return narrowed;
             }
             let recv = infer_expr_readonly(c, &a.value);
+            let recv = match &recv {
+                Type::Class(name) if c.find_method(name, a.attr.as_str()).is_none() => {
+                    c.newtypes.get(name).cloned().unwrap_or(recv)
+                }
+                _ => recv,
+            };
+            if matches!(recv, Type::Str | Type::LitStr(_)) {
+                if let Some(method) = builtin_str_method(a.attr.as_str()) {
+                    return method;
+                }
+            }
+            if let Type::Class(name) | Type::Generic(name, _) = &recv {
+                let real = name.strip_prefix("__typhon_impl_").unwrap_or(name);
+                if let Some((getter, _)) = class_contracts::property(c, real, a.attr.as_str()) {
+                    return substitute_typevars(&getter, &receiver_type_bindings(c, &recv));
+                }
+            }
             // Builtin container methods carry a real signature (`d.get(k)` is
             // `V | None`, `xs.pop()` is `T`), so a wrapping call sees it.
             if let Some(method_type) = builtin_generic_method(&recv, a.attr.as_str()) {
                 return method_type;
+            }
+            if let Type::Class(name) = &recv {
+                if c.enums
+                    .get(name)
+                    .is_some_and(|members| members.iter().any(|member| member == a.attr.as_str()))
+                {
+                    return Type::Class(name.clone());
+                }
             }
             match &recv {
                 Type::Class(class_name) | Type::Generic(class_name, _) => {
@@ -11348,6 +11660,52 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
             }
         }
         Expr::Call(call) => {
+            if let Some(argument) = freeze_call_argument(e) {
+                return frozen_type(&c.unwrap_alias(&infer_expr_readonly(c, argument)));
+            }
+            if matches!(call.func.as_ref(), Expr::Name(n) if n.id.as_str() == "super") {
+                let receiver_class = c.current_class.clone().or_else(|| {
+                    c.env
+                        .lookup("self")
+                        .and_then(|binding| match &binding.narrowed {
+                            Type::Class(name) | Type::Generic(name, _) => Some(name.clone()),
+                            _ => None,
+                        })
+                });
+                if let Some(base) = receiver_class
+                    .as_ref()
+                    .and_then(|name| {
+                        c.class_shapes
+                            .get(name.strip_prefix("__typhon_impl_").unwrap_or(name))
+                    })
+                    .and_then(|shape| shape.bases.first())
+                {
+                    return Type::Class(base.clone());
+                }
+            }
+            if let Expr::Name(name) = call.func.as_ref() {
+                if c.env.lookup(name.id.as_str()).is_none() && builtins::contains(name.id.as_str())
+                {
+                    let args: Vec<Type> = call
+                        .arguments
+                        .args
+                        .iter()
+                        .map(|arg| infer_expr_readonly(c, arg))
+                        .collect();
+                    let kwargs: Vec<(&str, Type)> = call
+                        .arguments
+                        .keywords
+                        .iter()
+                        .filter_map(|kw| {
+                            kw.arg
+                                .as_ref()
+                                .map(|n| (n.as_str(), infer_expr_readonly(c, &kw.value)))
+                        })
+                        .collect();
+                    return builtins::result(name.id.as_str(), &args, &kwargs)
+                        .unwrap_or(Type::Unknown);
+                }
+            }
             // `__typhon_checked_cast__(EXPR, TYPE)` (the lowering of
             // `EXPR as! TYPE`) reads as the target `TYPE` here too, so a
             // `match x as! Shape:` subject or a chained cast resolves.
@@ -11552,7 +11910,12 @@ fn check_builtin_first_argument(
         if let Expr::Name(n) = first {
             c.nullable_use(n.id.as_str(), &accepted, span);
         } else {
-            c.mismatch(&accepted, &actual, span);
+            let value = c.source.get(span.0..span.1).unwrap_or("value").to_owned();
+            if name == "len" {
+                c.nullable_attr_use(&value, &actual.strip_none(), span);
+            } else {
+                c.mismatch(&accepted, &actual, span);
+            }
         }
         return;
     }
@@ -13527,6 +13890,16 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             if let Some(value) = &a.value {
                 let value_type = infer_expr_ctx(c, value, Some(&ann_type));
                 init_type = Some(value_type.clone());
+                // A freeze annotation describes the input; the binding carries
+                // the runtime's recursively immutable output shape.
+                let frozen_annotation = frozen_type(&c.unwrap_alias(&ann_type));
+                if freeze_call_argument(value).is_some()
+                    || (frozen_annotation != ann_type
+                        && c.is_assignable(&frozen_annotation, &value_type)
+                        && !c.is_assignable(&ann_type, &value_type))
+                {
+                    ann_type = frozen_annotation;
+                }
                 // A call in the RHS may reassign a module global via
                 // `global NAME` in the callee, staling a caller narrowing on
                 // that global. Reset for subsequent statements (mirrors the
@@ -13816,18 +14189,34 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     // respect the element type, else it silently corrupts the
                     // invariant: `data[0] = "x"` / `data[0:1] = ["x"]` into a
                     // `list[int]`, or `d[k] = "x"` into a `dict[K, int]`. The
-                    // dict KEY is intentionally not checked here (computed keys
-                    // carry a higher false-positive risk); only the element /
-                    // value type is enforced.
+                    // key/index and element/value types are both checked.
                     let recv_ty = infer_expr_readonly(c, &sub.value);
+                    mutations::index(c, sub, &recv_ty);
                     let span = (
                         a.value.range().start().to_usize(),
                         a.value.range().end().to_usize(),
                     );
                     if let Type::Generic(head, args) = &recv_ty {
+                        if matches!(
+                            head.as_str(),
+                            "Mapping" | "tuple" | "tuple_variadic" | "frozenset"
+                        ) {
+                            let diagnostic = TycError::generic(format!(
+                                "`{}` does not support item assignment",
+                                recv_ty.display()
+                            ));
+                            if frozen_context::failure_is_caught(c, target, "TypeError") {
+                                c.diagnostics.push_warning(diagnostic);
+                            } else {
+                                c.diagnostics.push_error(diagnostic);
+                            }
+                        }
+
                         if head == "list" && args.len() == 1 {
                             let elem = args[0].clone();
-                            if matches!(sub.slice.as_ref(), Expr::Slice(_)) {
+                            if matches!(sub.slice.as_ref(), Expr::Slice(_))
+                                || mutations::slice_object(c, &sub.slice)
+                            {
                                 // `xs[a:b] = it`: `it` must be a sequence of T.
                                 // Skip when the RHS element type is unknown.
                                 if let Some(rhs_elem) = subscript_element_type(&value_type) {
@@ -13913,9 +14302,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             } else {
                 ret
             };
-            let variadic = all_params().any(|pwd| pwd.default.is_some())
-                || f.parameters.vararg.is_some()
-                || f.parameters.kwarg.is_some();
+            let variadic = f.parameters.vararg.is_some();
             // How many parameters the caller must actually supply. This
             // binding *overrides* the one `seed_env_from_scope` installed from
             // `function_signature`, so it has to carry the required-arity too
@@ -14076,7 +14463,13 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                                 }
                                 if first_defaulted.is_none() {
                                     if let Expr::Name(n) = a.target.as_ref() {
-                                        first_defaulted = Some((a, n.id.as_str().to_owned()));
+                                        if class_contracts::descriptor_used(
+                                            c,
+                                            class_name,
+                                            n.id.as_str(),
+                                        ) {
+                                            first_defaulted = Some((a, n.id.as_str().to_owned()));
+                                        }
                                     }
                                 }
                             }
@@ -14132,7 +14525,9 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     && !is_raw
                     && !inherits_required_field
                 {
-                    if let Some((ann, field_name)) = first_defaulted {
+                    if let Some((ann, field_name)) = first_defaulted
+                        .filter(|(_, field)| class_contracts::descriptor_used(c, class_name, field))
+                    {
                         let value_hint = ann
                             .value
                             .as_deref()
@@ -14154,9 +14549,14 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                                         "False".to_owned()
                                     }
                                 }
-                                _ => "its literal value".to_owned(),
+                                Expr::NoneLiteral(_) => "None".to_owned(),
+                                _ => c
+                                    .source
+                                    .get(v.range().start().to_usize()..v.range().end().to_usize())
+                                    .unwrap_or("the declared default")
+                                    .to_owned(),
                             })
-                            .unwrap_or_else(|| "its literal value".to_owned());
+                            .unwrap_or_else(|| "the declared default".to_owned());
                         let class_range = cd.name.range;
                         c.diagnostics
                             .push_warning(TycError::class_attr_shadows_slot(
@@ -14571,8 +14971,26 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // the same operand rules as `x = x op y`; mutable containers have
             // looser in-place semantics (`list += any_iterable`) so we stay
             // permissive there to avoid false positives.
+            for (side, ty) in [(a.target.as_ref(), &l), (a.value.as_ref(), &r)] {
+                if ty.is_nullable() {
+                    report_nullable_operand(c, side, ty);
+                }
+            }
             let l_stripped = l.strip_none();
             let r_stripped = r.strip_none();
+            let result = operators::augmented_result(c, &l_stripped, &r_stripped, a.op, &a.value);
+            let target_type = match a.target.as_ref() {
+                Expr::Name(n) => c
+                    .env
+                    .lookup(n.id.as_str())
+                    .map(|b| b.declared.clone())
+                    .unwrap_or_else(|| l.clone()),
+                _ => l.clone(),
+            };
+            if !c.is_assignable(&target_type, &result) {
+                let span = (a.range.start().to_usize(), a.range.end().to_usize());
+                c.mismatch(&target_type, &result, span);
+            }
             let scalar_target = matches!(
                 l_stripped,
                 Type::Int | Type::Float | Type::Bool | Type::Str | Type::Bytes
@@ -14581,17 +14999,6 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 if let Some(op_str) = arithmetic_op_str(a.op) {
                     let span = (a.range.start().to_usize(), a.range.end().to_usize());
                     if !operator_operands_compatible(a.op, &l_stripped, &r_stripped) {
-                        c.operator_type_mismatch(op_str, &l_stripped, &r_stripped, span);
-                    } else if matches!(l_stripped, Type::Int)
-                        && (matches!(a.op, ruff_python_ast::Operator::Div)
-                            || matches!(r_stripped, Type::Float))
-                    {
-                        // Numeric widening: `x: int; x += 0.5` (or `x /= 2`)
-                        // makes x a float at runtime, which is not assignable
-                        // back to the int target — exactly like `x = x + 0.5`.
-                        // Catches int fields and dict/list[int] elements too
-                        // (their inferred element type is `int`). Same
-                        // diagnostic the reassignment path uses.
                         c.operator_type_mismatch(op_str, &l_stripped, &r_stripped, span);
                     }
                 }
@@ -18338,7 +18745,7 @@ fn is_classvar_annotation(ann: &Expr) -> bool {
 fn is_builtin_generic_head(head: &str) -> bool {
     matches!(
         head,
-        "list" | "dict" | "set" | "tuple" | "str" | "bytes" | "frozenset"
+        "list" | "dict" | "set" | "tuple" | "tuple_variadic" | "Mapping" | "str" | "bytes" | "frozenset"
         // The Result family is Typhon's own closed surface — an unknown
         // method on Ok/Err/Result is always a runtime AttributeError, so
         // flag it at check time (closes the `.unwrap()`-before-it-existed
@@ -18412,7 +18819,19 @@ fn is_known_builtin_generic_attr(head: &str, attr: &str) -> bool {
                 | "copy"
                 | "fromkeys"
         ),
-        "set" | "frozenset" => matches!(
+        "Mapping" => matches!(attr, "get" | "keys" | "values" | "items" | "copy"),
+        "frozenset" => matches!(
+            attr,
+            "copy"
+                | "union"
+                | "intersection"
+                | "difference"
+                | "symmetric_difference"
+                | "issubset"
+                | "issuperset"
+                | "isdisjoint"
+        ),
+        "set" => matches!(
             attr,
             "add"
                 | "remove"
@@ -18432,7 +18851,7 @@ fn is_known_builtin_generic_attr(head: &str, attr: &str) -> bool {
                 | "issuperset"
                 | "isdisjoint"
         ),
-        "tuple" => matches!(attr, "count" | "index"),
+        "tuple" | "tuple_variadic" => matches!(attr, "count" | "index"),
         "str" => matches!(
             attr,
             "lower"
@@ -18549,6 +18968,7 @@ fn is_known_primitive_attr(prim: &str, attr: &str) -> bool {
             "as_integer_ratio"
                 | "bit_count"
                 | "bit_length"
+                | "is_integer"
                 | "conjugate"
                 | "denominator"
                 | "from_bytes"
@@ -18698,10 +19118,19 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
     let Type::Generic(head, args) = recv else {
         return None;
     };
+    if head == "Mapping" && matches!(attr, "get" | "keys" | "values" | "items" | "copy") {
+        return builtin_generic_method(&Type::Generic("dict".into(), args.clone()), attr);
+    }
     if let Some(sig) = builtin_container_mutator(head, attr, args) {
         return Some(sig);
     }
     match (head.as_str(), attr, args.as_slice()) {
+        ("Task", "result", [t]) => Some(Type::Function {
+            params: vec![],
+            ret: Box::new(t.clone()),
+            variadic: false,
+            min_params: Some(0),
+        }),
         ("dict", "get", [k, v]) => {
             // `d.get(k)` → V?  ;  `d.get(k, default)` → also typed as V?
             // (the default may broaden the runtime type, but the static
@@ -19112,7 +19541,7 @@ fn unwrap_awaitable(typ: &Type, user_classes: &[String]) -> Option<Type> {
         return None;
     };
     match (name.as_str(), args.len()) {
-        ("Awaitable", 1) => Some(args[0].clone()),
+        ("Awaitable" | "asyncio.Task" | "asyncio.Future", 1) => Some(args[0].clone()),
         ("Coroutine", 3) => Some(args[2].clone()),
         ("Coroutine", 1) => Some(args[0].clone()),
         ("Task", 1) | ("Future", 1) if !user_classes.iter().any(|c| c == name) => {
@@ -19479,6 +19908,7 @@ fn truthy(t: &Type) -> Option<Type> {
 fn iterable_element_type(ty: &Type) -> Option<Type> {
     match ty {
         // `str` iterates to `str` (one-char strings); `bytes` to `int`.
+        Type::Class(name) if name == "range" => Some(Type::Int),
         Type::Str => Some(Type::Str),
         Type::Bytes => Some(Type::Int),
         Type::Generic(head, args) => match head.as_str() {
@@ -19615,10 +20045,50 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             c.env.restore(snap);
             r
         }
+        Expr::Attribute(_) => {
+            // Fold a receiver chain from the leaf outward. Each receiver is
+            // inferred once, on a bounded stack, instead of nesting the large
+            // expression-inference frame for every attribute.
+            let mut chain = Vec::new();
+            let mut leaf = expr;
+            while let Expr::Attribute(attr) = leaf {
+                chain.push(leaf);
+                leaf = &attr.value;
+            }
+            let mut receiver = infer_expr_ctx(c, leaf, None);
+            for node in chain.into_iter().rev() {
+                c.attribute_receiver_type = Some(receiver);
+                receiver = infer_expr_ctx_inner(
+                    c,
+                    node,
+                    if std::ptr::eq(node, expr) {
+                        expected
+                    } else {
+                        None
+                    },
+                );
+                c.attribute_receiver_type = None;
+                c.expression_types.insert(
+                    (
+                        node.range().start().to_usize(),
+                        node.range().end().to_usize(),
+                    ),
+                    receiver.clone(),
+                );
+            }
+            receiver
+        }
         _ => infer_expr_ctx_inner(c, expr, expected),
     };
     after_expr_effects(c, expr);
     c.infer_depth.set(depth);
+    c.expression_types.insert(
+        (
+            expr.range().start().to_usize(),
+            expr.range().end().to_usize(),
+        ),
+        result.clone(),
+    );
     result
 }
 
@@ -19650,6 +20120,66 @@ fn lambda_structural_type(lam: &ruff_python_ast::ExprLambda) -> Type {
         ret: Box::new(Type::Unknown),
         variadic,
         min_params: (required < n).then_some(required),
+    }
+}
+
+fn checked_cast_target_supported(c: &Checker, target: &Type) -> bool {
+    fn supported(c: &Checker, target: &Type, path: &mut Vec<Type>) -> bool {
+        if path.contains(target) {
+            return true;
+        }
+        path.push(target.clone());
+        let result = match c.unwrap_alias(target) {
+            Type::TypeVar(_)
+            | Type::TypeConstructor(..)
+            | Type::Unknown
+            | Type::Function { .. }
+            | Type::Module(_) => false,
+            Type::Generic(head, args) => {
+                matches!(
+                    head.as_str(),
+                    "list"
+                        | "dict"
+                        | "set"
+                        | "frozenset"
+                        | "tuple"
+                        | "tuple_variadic"
+                        | "Mapping"
+                        | "MutableMapping"
+                        | "Sequence"
+                        | "Collection"
+                        | "AbstractSet"
+                ) && args.iter().all(|arg| supported(c, arg, path))
+            }
+            Type::Union(members) => members.iter().all(|arg| supported(c, arg, path)),
+            _ => true,
+        };
+        path.pop();
+        result
+    }
+    supported(c, target, &mut Vec::new())
+}
+
+/// Static output shape of deep_freeze. User instances, including generic
+/// frozen dataclasses, retain their own type and identity.
+pub fn frozen_type(ty: &Type) -> Type {
+    match ty {
+        Type::Generic(head, args)
+            if matches!(
+                head.as_str(),
+                "list" | "dict" | "set" | "tuple" | "tuple_variadic" | "frozenset" | "Mapping"
+            ) =>
+        {
+            let output = match head.as_str() {
+                "list" => "tuple_variadic",
+                "dict" => "Mapping",
+                "set" => "frozenset",
+                _ => head,
+            };
+            Type::Generic(output.into(), args.iter().map(frozen_type).collect())
+        }
+        Type::Union(members) => Type::union_of(members.iter().map(frozen_type).collect()),
+        _ => ty.clone(),
     }
 }
 
@@ -19836,10 +20366,15 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             Type::Str
         }
         Expr::Name(n) => {
+            if matches!(expected, Some(Type::Function { .. })) {
+                if let Some(factory) = callables::constructor(c, n.id.as_str()) {
+                    return factory;
+                }
+            }
             if let Some(b) = c.env.lookup(n.id.as_str()) {
                 b.narrowed.clone()
             } else {
-                Type::Unknown
+                builtins::value_type(n.id.as_str()).unwrap_or(Type::Unknown)
             }
         }
         Expr::BinOp(b) => {
@@ -19875,6 +20410,21 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 if !operator_operands_compatible(b.op, &l_stripped, &r_stripped) {
                     let span = (b.range.start().to_usize(), b.range.end().to_usize());
                     c.operator_type_mismatch(op_str, &l_stripped, &r_stripped, span);
+                }
+            }
+            if matches!(b.op, Operator::Add) {
+                if let (Type::Generic(lh, la), Type::Generic(rh, ra)) = (&l_stripped, &r_stripped) {
+                    if matches!(lh.as_str(), "tuple" | "tuple_variadic")
+                        && matches!(rh.as_str(), "tuple" | "tuple_variadic")
+                    {
+                        let mut elements = la.clone();
+                        elements.extend(ra.clone());
+                        return if lh == "tuple" && rh == "tuple" {
+                            Type::Generic("tuple".into(), elements)
+                        } else {
+                            Type::Generic("tuple_variadic".into(), vec![Type::union_of(elements)])
+                        };
+                    }
                 }
             }
             // Constant-fold safety lint: literal-zero RHS on `/`, `//`, `%`
@@ -19944,6 +20494,12 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     }
                 }
             }
+            if matches!(b.op, Operator::Pow) {
+                if let Some(result) = operators::power_result(c, &l_stripped, &r_stripped, &b.right)
+                {
+                    return result;
+                }
+            }
             // Newtype arithmetic carve-out. R2-12: `newtype LogIndex = int`
             // is structurally identical to `int` at runtime but the
             // checker treats it as `Class("LogIndex")`. Without this
@@ -19984,7 +20540,13 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         return Type::Class(ln.clone());
                     }
                     // Different newtypes, both numeric-based — explicit reject.
-                    (Some((_, lb)), Some((_, rb))) if is_numeric(lb) && is_numeric(rb) => {
+                    (Some((ln, lb)), Some((rn, rb)))
+                        if ln != rn
+                            && ((is_numeric(lb) && is_numeric(rb))
+                                || (matches!(b.op, Operator::Add)
+                                    && matches!(lb, Type::Str)
+                                    && matches!(rb, Type::Str))) =>
+                    {
                         if let Some(op_str) = arithmetic_op_str(b.op) {
                             let span = (b.range.start().to_usize(), b.range.end().to_usize());
                             c.operator_type_mismatch(op_str, &l_stripped, &r_stripped, span);
@@ -20105,6 +20667,8 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         ordering_operands_compatible(c, &ls, &rs)
                     } else {
                         membership_container_ok(c, &rs)
+                            && (!matches!(rs, Type::Str | Type::LitStr(_))
+                                || c.is_assignable(&Type::Str, lt))
                     };
                     if !compatible {
                         let op_str = match op {
@@ -20116,7 +20680,19 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                             _ => "not in",
                         };
                         let span = (cmp.range.start().to_usize(), cmp.range.end().to_usize());
-                        c.operator_type_mismatch(op_str, &ls, &rs, span);
+                        if frozen_context::failure_is_caught(c, expr, "TypeError") {
+                            c.diagnostics.push_warning(TycError::operator_type_mismatch(
+                                op_str,
+                                ls.display(),
+                                rs.display(),
+                                &c.path,
+                                c.source,
+                                span.0,
+                                span.1.saturating_sub(span.0).max(1),
+                            ));
+                        } else {
+                            c.operator_type_mismatch(op_str, &ls, &rs, span);
+                        }
                     }
                 }
             }
@@ -20137,6 +20713,30 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             }
         }
         Expr::Call(call) => {
+            if let Some(argument) = freeze_call_argument(expr) {
+                let input = infer_expr_ctx(c, argument, expected);
+                return frozen_type(&c.unwrap_alias(&input));
+            }
+            if matches!(call.func.as_ref(), Expr::Name(n) if n.id.as_str() == "super") {
+                let receiver_class = c.current_class.clone().or_else(|| {
+                    c.env
+                        .lookup("self")
+                        .and_then(|binding| match &binding.narrowed {
+                            Type::Class(name) | Type::Generic(name, _) => Some(name.clone()),
+                            _ => None,
+                        })
+                });
+                if let Some(base) = receiver_class
+                    .as_ref()
+                    .and_then(|name| {
+                        c.class_shapes
+                            .get(name.strip_prefix("__typhon_impl_").unwrap_or(name))
+                    })
+                    .and_then(|shape| shape.bases.first())
+                {
+                    return Type::Class(base.clone());
+                }
+            }
             // `EXPR as! TYPE` lowers (in tyc-syntax) to
             // `__typhon_checked_cast__(EXPR, TYPE)`. The cast's static type
             // is the target `TYPE` — read the second argument as a type
@@ -20150,7 +20750,15 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     // Walk the value argument so its own diagnostics still
                     // surface, then discard its (boundary) type.
                     let _ = infer_expr(c, &call.arguments.args[0]);
-                    return type_from_annotation(&call.arguments.args[1], &c.classes);
+                    let target = type_from_annotation_with_params(
+                        &call.arguments.args[1],
+                        &c.classes,
+                        &c.active_type_params,
+                    );
+                    if !checked_cast_target_supported(c, &target) {
+                        c.diagnostics.push_error(TycError::generic(format!("as! cannot check target `{}` at runtime; choose a concrete supported target", target.display())));
+                    }
+                    return target;
                 }
             }
             // `try_result(thunk)` / `try_result(thunk, on_err)` — the
@@ -20168,12 +20776,22 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 {
                     let ok_ty = infer_try_result_arg_ret(c, &call.arguments.args[0]);
                     let err_ty = if call.arguments.args.len() == 2 {
-                        infer_try_result_arg_ret(c, &call.arguments.args[1])
+                        expression_calls::callback_result(
+                            c,
+                            &call.arguments.args[1],
+                            vec![Type::Class("Exception".into())],
+                        )
                     } else {
                         Type::Class("Exception".into())
                     };
                     return Type::Generic("Result".into(), vec![ok_ty, err_ty]);
                 }
+            }
+            if let Some(result) = mutations::update(c, call) {
+                return result;
+            }
+            if let Some(result) = expression_calls::contract(c, call) {
+                return result;
             }
             // B2: a call of shape `first[int]([1, 2, 3])` where `first`
             // is a generic function will type-check (the subscript is
@@ -20327,7 +20945,10 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 {
                     let arg_ty = infer_expr(c, &pos_args[0]);
                     if let Type::Union(members) = &arg_ty {
-                        if let Some(bad) = members.iter().find(|m| !c.member_is_sized(m)) {
+                        if let Some(bad) = members
+                            .iter()
+                            .find(|m| !arg_ty.is_nullable() && !c.member_is_sized(m))
+                        {
                             let span = (
                                 pos_args[0].range().start().to_usize(),
                                 pos_args[0].range().end().to_usize(),
@@ -20337,6 +20958,90 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     }
                 }
                 check_builtin_first_argument(c, fn_name, pos_args);
+                if c.env.lookup(ctor).is_none() && builtins::contains(ctor) {
+                    let actuals: Vec<Type> =
+                        pos_args.iter().enumerate().map(|(i,arg)| {
+                            if i == 1 && matches!(ctor, "isinstance" | "issubclass") && matches!(arg, Expr::BinOp(b) if b.op == ruff_python_ast::Operator::BitOr) {
+                                type_from_annotation_with_params(arg, &c.classes, &[])
+                            } else { infer_expr(c,arg) }
+                        }).collect();
+                    let keywords: Vec<(&str, Type)> = kw_args
+                        .iter()
+                        .filter_map(|kw| {
+                            let actual = infer_expr(c, &kw.value);
+                            kw.arg.as_ref().map(|name| (name.as_str(), actual))
+                        })
+                        .collect();
+                    let names: Vec<&str> = keywords.iter().map(|(name, _)| *name).collect();
+                    let expanded = pos_args.iter().any(|arg| matches!(arg, Expr::Starred(_)))
+                        || kw_args.iter().any(|kw| kw.arg.is_none());
+                    if !expanded && !builtins::valid_arity(ctor, pos_args.len(), &names) {
+                        c.diagnostics.push_error(TycError::generic(format!(
+                            "invalid arguments to builtin `{ctor}`"
+                        )));
+                    }
+                    for (i, actual) in actuals.iter().enumerate() {
+                        if let Some(formal) = builtins::argument_type(ctor, i, None) {
+                            if !c.is_assignable(&formal, actual) {
+                                let arg = &pos_args[i];
+                                c.mismatch(
+                                    &formal,
+                                    actual,
+                                    (arg.range().start().to_usize(), arg.range().end().to_usize()),
+                                );
+                            }
+                        }
+                    }
+                    for kw in kw_args.iter() {
+                        if let Some(name) = &kw.arg {
+                            if let Some(formal) =
+                                builtins::argument_type(ctor, usize::MAX, Some(name.as_str()))
+                            {
+                                if let Some((_, actual)) =
+                                    keywords.iter().find(|(key, _)| *key == name.as_str())
+                                {
+                                    if !c.is_assignable(&formal, actual) {
+                                        c.mismatch(
+                                            &formal,
+                                            actual,
+                                            (
+                                                kw.value.range().start().to_usize(),
+                                                kw.value.range().end().to_usize(),
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let result =
+                        builtins::result(ctor, &actuals, &keywords).unwrap_or(Type::Unknown);
+                    // Constructors allocate a fresh container: its elements may
+                    // widen covariantly into the receiving annotation, unlike
+                    // assignment of an existing mutable container.
+                    if let (Type::Generic(head, args), Some(Type::Generic(ehead, eargs))) =
+                        (&result, expected)
+                    {
+                        if head == ehead
+                            && args.len() == eargs.len()
+                            && matches!(
+                                head.as_str(),
+                                "list" | "set" | "dict" | "frozenset" | "tuple_variadic"
+                            )
+                        {
+                            if args.iter().zip(eargs).all(|(a, e)| c.is_assignable(e, a)) {
+                                return Type::Generic(head.clone(), eargs.clone());
+                            }
+                            // `float` annotations admit integer inhabitants without
+                            // runtime coercion. Without value provenance, a copied
+                            // float-view container cannot prove those are floats.
+                            if args.len() == 1 && args[0] == Type::Float && eargs[0] == Type::Int {
+                                return Type::Generic(head.clone(), vec![Type::Unknown]);
+                            }
+                        }
+                    }
+                    return result;
+                }
             }
 
             // Phase E: blocking-in-async call detection. When the
@@ -20361,6 +21066,111 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     }
                 }
             }
+            if let Expr::Attribute(attr) = call.func.as_ref() {
+                let recv = c.unwrap_alias(&infer_expr_readonly(c, &attr.value));
+                let recv = expand_sealed_union_alias(c, recv, attr.attr.as_str());
+                if let Type::Union(members) = recv {
+                    let signatures: Option<Vec<MethodSig>> = members
+                        .iter()
+                        .map(|m| match m {
+                            Type::Class(name) | Type::Generic(name, _) => c
+                                .find_method(name, attr.attr.as_str())
+                                .cloned()
+                                .map(|mut sig| {
+                                    let bindings = receiver_type_bindings(c, m);
+                                    sig.return_type =
+                                        substitute_typevars(&sig.return_type, &bindings);
+                                    sig.param_types = sig
+                                        .param_types
+                                        .iter()
+                                        .map(|t| substitute_typevars(t, &bindings))
+                                        .collect();
+                                    sig.arity_info.kwonly_types = sig
+                                        .arity_info
+                                        .kwonly_types
+                                        .iter()
+                                        .map(|t| substitute_typevars(t, &bindings))
+                                        .collect();
+                                    sig
+                                }),
+                            _ => None,
+                        })
+                        .collect();
+                    if let Some(signatures) = signatures {
+                        let _ = infer_expr(c, &call.func);
+                        let actuals: Vec<Type> =
+                            pos_args.iter().map(|a| infer_expr(c, a)).collect();
+                        let kw_actuals: Vec<Type> =
+                            kw_args.iter().map(|k| infer_expr(c, &k.value)).collect();
+                        for sig in &signatures {
+                            if !matches!(
+                                check_arity_with_info(&sig.arity_info, pos_args, kw_args),
+                                ArityCheck::Ok
+                            ) {
+                                c.mismatch_with(
+                                    "arguments valid for every union member".into(),
+                                    "incompatible call arguments".into(),
+                                    (call.range.start().to_usize(), call.range.end().to_usize()),
+                                );
+                            }
+                            for (actual, (arg, expected)) in
+                                actuals.iter().zip(pos_args.iter().zip(&sig.param_types))
+                            {
+                                if !c.is_assignable(expected, actual) {
+                                    c.mismatch(
+                                        expected,
+                                        actual,
+                                        (
+                                            arg.range().start().to_usize(),
+                                            arg.range().end().to_usize(),
+                                        ),
+                                    );
+                                }
+                            }
+                            for (kw, actual) in kw_args.iter().zip(&kw_actuals) {
+                                if let Some(name) = &kw.arg {
+                                    let info = &sig.arity_info;
+                                    let expected = info
+                                        .param_names
+                                        .iter()
+                                        .position(|p| p == name.as_str())
+                                        .and_then(|i| sig.param_types.get(i))
+                                        .or_else(|| {
+                                            info.kwonly_names
+                                                .iter()
+                                                .position(|p| p == name.as_str())
+                                                .and_then(|i| info.kwonly_types.get(i))
+                                        });
+                                    if let Some(expected) = expected {
+                                        if !c.is_assignable(expected, actual) {
+                                            c.mismatch(
+                                                expected,
+                                                actual,
+                                                (
+                                                    kw.value.range().start().to_usize(),
+                                                    kw.value.range().end().to_usize(),
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        return Type::union_of(
+                            signatures
+                                .into_iter()
+                                .map(|s| {
+                                    if s.is_async {
+                                        Type::Generic("Coroutine".into(), vec![s.return_type])
+                                    } else {
+                                        s.return_type
+                                    }
+                                })
+                                .collect(),
+                        );
+                    }
+                }
+            }
             let func_type_raw = infer_expr(c, &call.func);
             // Unwrap transparent type aliases (`type Handler = Callable[..., R]`)
             // so that calls through the alias resolve to the underlying
@@ -20370,6 +21180,11 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             // arity check and the return type. FINDINGS E4.
             let func_type = c.unwrap_alias(&func_type_raw);
             let call_span = (call.range.start().to_usize(), call.range.end().to_usize());
+            if let Type::Union(members) = &func_type {
+                if let Some(result) = callables::union_call(c, call, members) {
+                    return result;
+                }
+            }
 
             // `tyc::missing_await` (FINDINGS #49): a *sync* function
             // calling an `async def` without `await` returns a
@@ -20396,9 +21211,14 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             // async function silently read `.value` off the coroutine at
             // runtime. Either way `inside_await` exempts the `await expr?`
             // form. (FINDINGS: async-`?` missing-await.)
-            if (c.in_sync_function || c.in_question_temp_rhs) && c.inside_await == 0 {
+            let expects_awaitable = expected
+                .is_some_and(|ty| unwrap_awaitable(&c.unwrap_alias(ty), &c.classes).is_some());
+            if (c.in_sync_function || c.in_question_temp_rhs)
+                && c.inside_await == 0
+                && !expects_awaitable
+            {
                 if let Expr::Name(n) = call.func.as_ref() {
-                    if c.async_functions.contains(n.id.as_str()) {
+                    if callee_is_async(c, call) {
                         let span = (n.range.start().to_usize(), n.range.end().to_usize());
                         c.missing_await(n.id.as_str(), span);
                     }
@@ -20497,12 +21317,14 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         } else {
                             None
                         };
-                    let arity_info: Option<ArityInfo> = method_arity_info.or_else(|| {
-                        fn_name
-                            .as_deref()
-                            .and_then(|n| c.function_arity_info.get(n))
-                            .cloned()
-                    });
+                    let arity_info: Option<ArityInfo> = method_arity_info
+                        .or_else(|| callables::origin(c, &call.func))
+                        .or_else(|| {
+                            fn_name
+                                .as_deref()
+                                .and_then(|n| c.function_arity_info.get(n))
+                                .cloned()
+                        });
                     let arity_outcome = if let Some(info) = arity_info.as_ref() {
                         check_arity_with_info(info, pos_args, kw_args)
                     } else {
@@ -20514,7 +21336,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         // any total ≤ params.len() (defaults could
                         // cover the rest), and require ≥ params.len()
                         // when the function is variadic.
-                        let total = pos_args.len() + kw_args.len();
+                        let total = pos_args.len();
                         // `min_params` is the number of required
                         // parameters when the callable's origin recorded
                         // it (a `Callable[[…], R]` annotation, a lambda);
@@ -20525,12 +21347,13 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         let has_star = pos_args.iter().any(|e| matches!(e, Expr::Starred(_)))
                             || kw_args.iter().any(|k| k.arg.is_none());
                         let required = min_params.unwrap_or(0);
-                        let ok = if has_star {
+                        let is_pack = callables::parameter_pack(&params).is_some();
+                        let ok = if has_star || is_pack {
                             true
                         } else if variadic {
-                            total >= params.len()
+                            total >= required
                         } else {
-                            total <= params.len() && total >= required
+                            kw_args.is_empty() && total <= params.len() && total >= required
                         };
                         if ok {
                             ArityCheck::Ok
@@ -20706,14 +21529,18 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                             .as_deref()
                             .and_then(|n| c.function_kwarg_types.get(n))
                             .cloned()
+                            .or_else(|| class_contracts::call_kwarg_type(c, &call.func))
                     } else {
                         None
                     };
                     if let Some(param_names) = kwarg_param_names {
                         for kw in kw_args {
                             let Some(ident) = &kw.arg else { continue };
-                            let Some(idx) = param_names.iter().position(|p| p == ident.as_str())
-                            else {
+                            let Some(idx) = param_names.iter().enumerate().find_map(|(i, p)| {
+                                (i >= arity_info.as_ref().map_or(0, |a| a.posonly_count)
+                                    && p == ident.as_str())
+                                .then_some(i)
+                            }) else {
                                 // No positional parameter matches this name.
                                 // Try a kw-only parameter; failing that, the
                                 // argument is absorbed by `**kwargs: T` and
@@ -20952,6 +21779,59 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                             return ret;
                         }
                     }
+                    if func_is_class_name
+                        && c.find_method(&name, "__init__").is_none()
+                        && c.find_method(&name, "__new__").is_none()
+                    {
+                        let builtin = [
+                            "int",
+                            "str",
+                            "float",
+                            "bool",
+                            "list",
+                            "tuple",
+                            "dict",
+                            "set",
+                            "frozenset",
+                        ]
+                        .into_iter()
+                        .find(|base| c.class_derives_from_builtin(&name, &[*base]));
+                        if c.enums.contains_key(&name) || builtin.is_some() {
+                            let keys: Vec<&str> = kw_args
+                                .iter()
+                                .filter_map(|k| k.arg.as_ref().map(|a| a.as_str()))
+                                .collect();
+                            let expanded = pos_args.iter().any(|a| matches!(a, Expr::Starred(_)))
+                                || kw_args.iter().any(|k| k.arg.is_none());
+                            let valid = if c.enums.contains_key(&name) {
+                                pos_args.len() + usize::from(keys.contains(&"value")) == 1
+                                    && keys.iter().all(|k| *k == "value")
+                            } else {
+                                builtins::valid_arity(builtin.unwrap(), pos_args.len(), &keys)
+                            };
+                            if !expanded && !valid {
+                                c.diagnostics.push_error(TycError::generic(format!(
+                                    "invalid constructor arguments to `{name}`"
+                                )));
+                            }
+                            for (i, arg) in pos_args.iter().enumerate() {
+                                let actual = infer_expr(c, arg);
+                                if !c.enums.contains_key(&name) {
+                                    if let Some(expected) =
+                                        builtins::argument_type(builtin.unwrap(), i, None)
+                                    {
+                                        if !c.is_assignable(&expected, &actual) {
+                                            c.mismatch(&expected, &actual, call_span);
+                                        }
+                                    }
+                                }
+                            }
+                            for kw in kw_args {
+                                let _ = infer_expr(c, &kw.value);
+                            }
+                            return Type::Class(name);
+                        }
+                    }
                     if let Some(shape) = effective_class_shape(&name, &c.class_shapes) {
                         // `plain class` / `class!` may carry a hand-written
                         // `__init__` whose parameter names need not match the
@@ -21064,12 +21944,18 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                                     } else {
                                         let supplied = pos_args.len()
                                             + kw_args.iter().filter(|k| k.arg.is_some()).count();
-                                        c.wrong_args(
-                                            &name,
-                                            info.min_positional,
-                                            supplied,
-                                            call_span,
-                                        );
+                                        if supplied == info.min_positional {
+                                            c.diagnostics.push_error(TycError::generic(format!(
+                                                "conflicting constructor arguments to `{name}`"
+                                            )));
+                                        } else {
+                                            c.wrong_args(
+                                                &name,
+                                                info.min_positional,
+                                                supplied,
+                                                call_span,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -21204,16 +22090,31 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
         Expr::Attribute(a) => {
             // Flow-sensitive attribute narrowing: `if self.x is None: return …`
             // narrows `self.x` to non-`None` for the rest of the block.
-            if let Some(path) = attr_path_of(expr) {
-                if let Some(narrowed) = c.env.attr_narrowed(&path) {
-                    return narrowed.clone();
-                }
+            if let Some(narrowed) = expression_attr_narrowing(c, expr) {
+                return narrowed;
             }
-            let recv = infer_expr(c, &a.value);
+            let recv = c
+                .attribute_receiver_type
+                .take()
+                .unwrap_or_else(|| infer_expr(c, &a.value));
             if recv.is_nullable() {
                 check_nullable_receiver(c, &a.value, &recv);
             }
             let attr_name = a.attr.as_str();
+            if let Type::Class(name) = &recv {
+                if c.find_method(name, attr_name).is_none() {
+                    if let Some(base) = c.newtypes.get(name).cloned() {
+                        c.attribute_receiver_type = Some(base);
+                        return infer_expr_ctx_inner(c, expr, expected);
+                    }
+                }
+            }
+            if let Type::Class(name) | Type::Generic(name, _) = &recv {
+                let real = name.strip_prefix("__typhon_impl_").unwrap_or(name);
+                if let Some((getter, _)) = class_contracts::property(c, real, attr_name) {
+                    return substitute_typevars(&getter, &receiver_type_bindings(c, &recv));
+                }
+            }
             // B35: `_t.error` / `_t.value` on an isinstance-narrowed
             // `Generic("Err", [E])` / `Generic("Ok", [T])` resolves to
             // `E` / `T`. The `with`-chain lowering injects exactly this
@@ -21231,6 +22132,14 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 }
                 if head == "Ok" && args.len() == 1 && attr_name == "value" {
                     return args[0].clone();
+                }
+            }
+            if let Type::Class(name) = &recv {
+                if c.enums
+                    .get(name)
+                    .is_some_and(|members| members.iter().any(|member| member == attr_name))
+                {
+                    return Type::Class(name.clone());
                 }
             }
             // Resolve attribute access on known class instances and TypeVar-bounded parameters.
@@ -21268,14 +22177,21 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         .to_usize()
                         .saturating_sub(attr_start)
                         .max(1);
-                    c.diagnostics.push_error(TycError::attribute_not_found(
+                    let diagnostic = TycError::attribute_not_found(
                         attr_name,
                         head.as_str(),
                         &c.path,
                         c.source,
                         attr_start,
                         attr_len,
-                    ));
+                    );
+                    if matches!(head.as_str(), "tuple_variadic" | "Mapping" | "frozenset")
+                        && frozen_context::failure_is_caught(c, expr, "AttributeError")
+                    {
+                        c.diagnostics.push_warning(diagnostic);
+                    } else {
+                        c.diagnostics.push_error(diagnostic);
+                    }
                     return Type::Unknown;
                 }
             }
@@ -21408,7 +22324,11 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         if params.len() < arity {
                             params.resize(arity, Type::Unknown);
                         }
-                        let ret = sig.return_type.clone();
+                        let ret = if sig.is_async {
+                            Type::Generic("Coroutine".into(), vec![sig.return_type.clone()])
+                        } else {
+                            sig.return_type.clone()
+                        };
                         return Type::Function {
                             params,
                             ret: Box::new(ret),
@@ -21505,6 +22425,11 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                             params.resize(sig.arity, Type::Unknown);
                         }
                         let ret = substitute_typevars(&sig.return_type, &bindings);
+                        let ret = if sig.is_async {
+                            Type::Generic("Coroutine".into(), vec![ret])
+                        } else {
+                            ret
+                        };
                         return Type::Function {
                             params,
                             ret: Box::new(ret),
@@ -21643,10 +22568,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         .iter()
                         .map(|m| member_field_type(c, m, attr_name))
                         .collect::<Option<Vec<Type>>>()
-                        .and_then(|tys| {
-                            let first = tys.first()?.clone();
-                            tys.iter().all(|t| *t == first).then_some(first)
-                        });
+                        .map(Type::union_of);
                     if let Some(t) = common {
                         return t;
                     }
@@ -21664,14 +22586,21 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                                 .to_usize()
                                 .saturating_sub(attr_start)
                                 .max(1);
-                            c.diagnostics.push_error(TycError::attribute_not_found(
+                            let diagnostic = TycError::attribute_not_found(
                                 attr_name,
                                 &bad_display,
                                 &c.path,
                                 c.source,
                                 attr_start,
                                 attr_len,
-                            ));
+                            );
+                            if matches!(bad,Type::Generic(head,_) if matches!(head.as_str(),"tuple_variadic" | "Mapping" | "frozenset"))
+                                && frozen_context::failure_is_caught(c, expr, "AttributeError")
+                            {
+                                c.diagnostics.push_warning(diagnostic);
+                            } else {
+                                c.diagnostics.push_error(diagnostic);
+                            }
                         }
                     }
                     Type::Unknown
@@ -21696,6 +22625,14 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     Type::Unknown
                 }
                 Type::Int => {
+                    if attr_name == "is_integer" {
+                        return Type::Function {
+                            params: vec![],
+                            ret: Box::new(Type::Bool),
+                            variadic: false,
+                            min_params: Some(0),
+                        };
+                    }
                     if !is_known_primitive_attr("int", attr_name)
                         && !is_user_builtin_extension(c, "int", attr_name)
                     {
@@ -21795,11 +22732,12 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             // invariant — the runtime hashes/compares against the slot.
             if c.unsafe_depth == 0 && !matches!(s.slice.as_ref(), Expr::Slice(_)) {
                 if let Type::Generic(head, args) = &value_ty {
-                    if head == "dict" && args.len() == 2 {
+                    if matches!(head.as_str(), "dict" | "Mapping") && args.len() == 2 {
                         let key_ty = &args[0];
                         if !is_dynamic_type(key_ty)
                             && !is_dynamic_type(&slice_ty)
                             && !c.is_assignable(key_ty, &slice_ty)
+                            && !class_contracts::enum_key_compatible(c, key_ty, &slice_ty)
                         {
                             let span = (
                                 s.slice.range().start().to_usize(),
@@ -21823,7 +22761,9 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             // trailing `?` — so extracting from a `list[T?]` honestly
             // yields `T?` rather than silently dropping the `None`
             // (the soundness hole).
-            if matches!(s.slice.as_ref(), Expr::Slice(_)) {
+            if matches!(s.slice.as_ref(), Expr::Slice(_))
+                || matches!(&slice_ty, Type::Class(n) if n == "slice" && !c.classes.contains(n))
+            {
                 // A slice (`xs[a:b]`) yields the container itself, not an
                 // element: `list[int][a:b]` is `list[int]`, `str[a:b]` is
                 // `str`. Was always `Unknown`, so `let s: str = xs[1:3]` (xs:
@@ -22034,6 +22974,9 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
         // checker so each side of the ternary sees the right type for
         // `x`.
         Expr::If(e) => {
+            if let Expr::BooleanLiteral(test) = e.test.as_ref() {
+                return infer_expr_ctx(c, if test.value { &e.body } else { &e.orelse }, expected);
+            }
             let _ = infer_expr(c, &e.test);
             let pos = collect_narrowings(c, &e.test, /*negate=*/ false);
             let snap_pre = c.env.snapshot();
@@ -22494,19 +23437,32 @@ fn expand_sealed_union_alias(c: &Checker, recv: Type, attr: &str) -> Type {
 /// The declared type of field / `@property` `attr` on a class member of a
 /// union, or `None` when the member is not a fully-known class or has no
 /// such field.
+fn receiver_type_bindings(c: &Checker, receiver: &Type) -> HashMap<String, Type> {
+    match receiver {
+        Type::Generic(name, args) => c
+            .class_type_params
+            .get(name)
+            .filter(|params| params.len() == args.len())
+            .map(|params| params.iter().cloned().zip(args.iter().cloned()).collect())
+            .unwrap_or_default(),
+        _ => HashMap::new(),
+    }
+}
+
 fn member_field_type(c: &Checker, member: &Type, attr: &str) -> Option<Type> {
-    let Type::Class(name) = member else {
-        return None;
+    let name = match member {
+        Type::Class(name) | Type::Generic(name, _) => name,
+        _ => return None,
     };
     if !c.class_hierarchy_fully_known(name) {
         return None;
     }
-    if let Some(t) = c.find_field(name, attr) {
-        return Some(t.clone());
-    }
-    c.find_method(name, attr)
-        .filter(|sig| sig.is_property)
-        .map(|sig| sig.return_type.clone())
+    let ty = c.find_field(name, attr).cloned().or_else(|| {
+        c.find_method(name, attr)
+            .filter(|sig| sig.is_property)
+            .map(|sig| sig.return_type.clone())
+    })?;
+    Some(substitute_typevars(&ty, &receiver_type_bindings(c, member)))
 }
 
 /// Whether a user class (or one of its known bases) defines any rich
@@ -22514,9 +23470,10 @@ fn member_field_type(c: &Checker, member: &Type, attr: &str) -> Option<Type> {
 /// `b.__gt__(a)`, and `functools.total_ordering` fills the rest in from any
 /// one of them, so one ordering dunder anywhere makes the class orderable.
 fn class_has_ordering_dunder(c: &Checker, name: &str) -> bool {
-    ["__lt__", "__le__", "__gt__", "__ge__"]
-        .iter()
-        .any(|d| c.find_method(name, d).is_some())
+    class_contracts::dataclass_option(c, name, "order") == Some(true)
+        || ["__lt__", "__le__", "__gt__", "__ge__"]
+            .iter()
+            .any(|d| c.find_method(name, d).is_some())
 }
 
 /// `true` when an ordering comparison (`<`, `<=`, `>`, `>=`) between `l` and
@@ -22532,12 +23489,27 @@ fn ordering_operands_compatible(c: &Checker, l: &Type, r: &Type) -> bool {
         return ms.iter().all(|m| ordering_operands_compatible(c, l, m));
     }
     let class_ok = |name: &str| -> bool {
+        if c.enums.contains_key(name)
+            && !c.class_derives_from_builtin(
+                name,
+                &[
+                    "int",
+                    "IntEnum",
+                    "enum.IntEnum",
+                    "str",
+                    "StrEnum",
+                    "enum.StrEnum",
+                ],
+            )
+            && !class_has_ordering_dunder(c, name)
+        {
+            return false;
+        }
         // Anything we cannot see completely (a venv-introspected shape,
         // an unknown base, a `__getattr__` class, an enum whose members
         // may mix in `int` / `str`) stays permissive.
         !c.class_hierarchy_fully_known(name)
             || c.class_defines_getattr(name)
-            || c.enums.contains_key(name)
             || class_has_ordering_dunder(c, name)
     };
     match (l, r) {
@@ -22684,14 +23656,18 @@ fn await_operand_is_shape_checkable(c: &Checker, operand: &Expr) -> bool {
         | Expr::ListComp(_)
         | Expr::DictComp(_)
         | Expr::SetComp(_) => true,
+        Expr::Name(_) | Expr::Attribute(_) => true,
         Expr::Call(call) => match call.func.as_ref() {
             Expr::Name(n) => {
                 let name = n.id.as_str();
+                if callables::decorated(c, name) {
+                    return false;
+                }
                 // Only this module's own declarations: an imported
                 // function's shape carries no async flag, so `await
                 // other.run()` on an `async def` imported from a sibling
                 // module must stay permissive.
-                let sync_def = c.sync_functions.contains(name) && !c.async_functions.contains(name);
+                let sync_def = callables::known_sync(c, &call.func);
                 let own_class = c.local_classes.contains(name)
                     && c.class_shapes.contains_key(name)
                     && !c.is_interface_name(name)
@@ -22720,7 +23696,8 @@ fn await_operand_is_shape_checkable(c: &Checker, operand: &Expr) -> bool {
 /// hierarchy, no `__getattr__`, and a method `name` whose signature is not
 /// `async`.
 fn class_method_is_known_sync(c: &Checker, cls: &str, name: &str) -> bool {
-    !cls.contains('.')
+    !callables::decorated(c, name)
+        && !cls.contains('.')
         && c.local_classes.contains(cls)
         && c.class_shapes.contains_key(cls)
         && c.class_hierarchy_fully_known(cls)
@@ -22841,7 +23818,10 @@ fn operator_operands_compatible(op: Operator, l: &Type, r: &Type) -> bool {
             if let (Type::Generic(ln, _), Type::Generic(rn, _)) = (l, r) {
                 // `list + list`, `tuple + tuple`, and `Counter + Counter`
                 // (multiset addition — `collections.Counter` overloads `+`).
-                if ln == rn && (ln == "list" || ln == "tuple" || ln == "Counter") {
+                if (matches!(ln.as_str(), "tuple" | "tuple_variadic")
+                    && matches!(rn.as_str(), "tuple" | "tuple_variadic"))
+                    || (ln == rn && (ln == "list" || ln == "Counter"))
+                {
                     return true;
                 }
             }
@@ -26785,7 +27765,8 @@ interface Shape:
     def area(self) -> float
 
 interface Named:
-    name: str
+    @property
+    def name(self) -> str
 
 class Async:
     n: int
@@ -29721,7 +30702,7 @@ def f(b: Box) -> int:
 ";
         let d = check(src);
         assert!(
-            d.errors().iter().any(|e| matches!(
+            d.errors().iter().chain(d.warnings()).any(|e| matches!(
                 e,
                 TycError::OperatorTypeMismatch { .. } | TycError::NullableUse { .. }
             )),
@@ -29821,7 +30802,7 @@ impl Box:
         ] {
             let d = check(src);
             assert!(
-                d.errors().iter().any(|e| matches!(
+                d.errors().iter().chain(d.warnings()).any(|e| matches!(
                     e,
                     TycError::OperatorTypeMismatch { .. } | TycError::NullableUse { .. }
                 )),
@@ -34730,7 +35711,7 @@ class Dog:
     name: str
 
 class Person:
-    pet: Dog
+    pet: Pet
 
 let p: Owner = Person(pet=Dog(name=\"Fido\"))
 ";
@@ -34744,10 +35725,8 @@ let p: Owner = Person(pet=Dog(name=\"Fido\"))
 
     #[test]
     fn interface_field_satisfied_by_property_not_by_plain_method() {
-        // Reading `d.name` through `Named` must yield the `str` the interface
-        // promises. A `@property` does; a plain zero-argument method yields a
-        // bound method instead (so `d.name.upper()` raises AttributeError and
-        // `print(d.name)` prints `<bound method …>`), and no longer conforms.
+        // A mutable field contract requires both reads and writes. Neither a
+        // plain method nor a getter-only property supplies that contract.
         let plain = "\
 interface Named:
     name: str
@@ -34775,8 +35754,8 @@ let d: Named = Dog()
 ";
         let d = check(property);
         assert!(
-            !d.has_errors(),
-            "a @property of the right type satisfies the field; errors: {:?}",
+            d.has_errors(),
+            "a read-only property cannot satisfy a writable field; errors: {:?}",
             d.errors()
         );
     }
@@ -37214,7 +38193,7 @@ def relay(r: Response) -> None:
         let src = "\
 class Functor[F[_]]:
     def fmap[A, B](self, fa: F[A], f: B) -> F[B]:
-        return fa
+        raise NotImplementedError
 
 def main() -> None:
     let xs: list[int] = [1, 2, 3]
@@ -37237,7 +38216,7 @@ class Box[T]:
 
 class Functor[F[_]]:
     def fmap[A, B](self, fa: F[A], f: B) -> F[B]:
-        return fa
+        raise NotImplementedError
 
 def main() -> None:
     let b: Box[int] = Box(value=1)
@@ -39242,6 +40221,7 @@ class Foo:
 plain class Config:
     DEBUG: bool = True
     NAME: str = \"app\"
+let debug = Config.DEBUG
 ";
         let d = check_class_kinds(src);
         assert!(
@@ -39261,6 +40241,7 @@ plain class Config:
 class Config:
     DEBUG: bool = True
     NAME: str = \"app\"
+let debug = Config.DEBUG
 ";
         let d = check_class_kinds(src);
         assert!(
@@ -39862,11 +40843,10 @@ def main() -> None:
         }
 
         #[test]
-        fn await_on_a_bare_name_is_left_alone() {
-            // A name may hold a coroutine the checker typed by its result;
-            // the shape gate keeps the check to calls and literals.
+        fn await_on_a_concrete_bare_name_is_rejected() {
+            // Stored coroutines carry a wrapper; an int binding is concrete.
             let d = check("async def main() -> None:\n    let n: int = 1\n    let v: int = await n\n    print(v)\n");
-            assert!(!has_error(&d, mismatch), "{:?}", errors_of(&d));
+            assert!(has_error(&d, mismatch), "{:?}", errors_of(&d));
         }
 
         // ── §3.7 / §3.8 structural rules ─────────────────────────────────
@@ -40053,6 +41033,400 @@ def main() -> None:
                     .collect::<Vec<_>>()
             );
         }
+    }
+    #[test]
+    fn w2_01_builtin_results_and_iteration_are_checked() {
+        for src in [
+            "def label(n: int) -> int:\n    return str(n)\n",
+            "def f() -> None:\n    let s: str = len([1])\n",
+            "def f() -> None:\n    for i in range(3):\n        print(i.upper())\n",
+            "def f() -> None:\n    for i, s in enumerate([1]):\n        print(s.upper())\n",
+            "def f() -> None:\n    for i, s in zip([1], [2]):\n        print(s.upper())\n",
+        ] {
+            assert!(!check(src).errors().is_empty(), "accepted: {src}");
+        }
+    }
+    #[test]
+    fn w2_01_builtin_overloads_and_shadowing_stay_valid() {
+        let src = "def len(x: int) -> str:\n    return str(x)\n\ndef f() -> None:\n    let s: str = len(1)\n    let a: int = round(1.2)\n    let b: float = round(1.2, 1)\n    let c: int = int(\"ff\", 16)\n    let d: list[int] = sorted([1, 2], key=lambda x: -x)\n    let e: int = min(1, 2)\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn w2_01_super_method_contracts() {
+        for body in ["return super().read(1)", "return super().read()"] {
+            let src = format!("class A:\n    n: int\nimpl A:\n    def read(self, n: int) -> int:\n        return n\nclass B(A):\n    n: int\nimpl B:\n    def text(self) -> str:\n        {body}\n");
+            assert!(!check(&src).errors().is_empty(), "accepted: {src}");
+        }
+    }
+    #[test]
+    fn w2_01_fresh_containers_and_dead_branch_controls() {
+        let src = "class Animal:\n    name: str\nclass Dog(Animal):\n    name: str\ndef f() -> None:\n    let dogs: list[Dog] = [Dog(name=\"x\")]\n    let animals: list[Animal] = list(dogs)\n    let xs: list[float] = [1, 2]\n    let ints: set[int] = set(xs)\n    print(float(\"1\")[:0] if False else \"skip\")\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn w2_20_contextual_receiver_query() {
+        let prep = preprocess("from typing import Callable\nlet f: Callable[[str], str] = lambda s: s.upper()\ndef g(xs: list[str]) -> str:\n    match xs:\n        case [item]:\n            return item.upper()\n        case _:\n            return \"\"\n");
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module("<test>".into(), &prep.python_source, &module);
+        let checked = check_module_with_imports_and_types(
+            "<test>",
+            &prep.python_source,
+            &resolved,
+            &module,
+            &[],
+            &[],
+            &[],
+            None,
+        );
+        for needle in ["s.upper()", "item.upper()"] {
+            let start = prep.python_source.find(needle).unwrap();
+            let name_len = needle.find('.').unwrap();
+            assert_eq!(
+                checked.type_at((start, start + name_len)),
+                Some(&Type::Str),
+                "{needle}"
+            );
+        }
+    }
+    #[test]
+    fn w2_19_narrowing_lookup_matches_the_entire_receiver_path() {
+        let source = "x.real.real\n";
+        let module = tyc_syntax::parse_module(source).unwrap().into_syntax();
+        let (resolved, _) = resolve_module("<test>".into(), source, &module);
+        let mut checker = Checker::new("<test>".into(), source, &resolved);
+        let Stmt::Expr(stmt) = &module.body[0] else {
+            panic!()
+        };
+        checker
+            .env
+            .attr_narrowings
+            .insert("x.real".into(), Type::Int);
+        assert_eq!(expression_attr_narrowing(&checker, &stmt.value), None);
+        checker
+            .env
+            .attr_narrowings
+            .insert("x.real.real".into(), Type::Float);
+        assert_eq!(
+            expression_attr_narrowing(&checker, &stmt.value),
+            Some(Type::Float)
+        );
+    }
+    #[test]
+    fn w2_03_union_member_contracts() {
+        for src in [
+            "class A:\n    value: int\nclass B:\n    value: str\ntype U = A | B\ndef f(u: U) -> int:\n    return u.value + 1\n",
+            "class A:\n    n: int\nimpl A:\n    def read(self) -> int:\n        return 1\nclass B:\n    n: int\nimpl B:\n    def read(self) -> int:\n        return 2\ntype U = A | B\ndef f(u: U) -> str:\n    return u.read()\n",
+            "class A:\n    n: int\nimpl A:\n    def read(self, x: int) -> int:\n        return x\nclass B:\n    n: int\nimpl B:\n    def read(self, x: str) -> int:\n        return 2\ntype U = A | B\ndef f(u: U) -> int:\n    return u.read(1)\n",
+            "class A:\n    n: int\nimpl A:\n    def read(self) -> int:\n        return 1\nclass B:\n    n: int\nimpl B:\n    def read(self, x: str) -> int:\n        return 2\ntype U = A | B\ndef f(u: U) -> int:\n    return u.read()\n",
+        ] { assert!(!check(src).errors().is_empty(), "accepted: {src}"); }
+    }
+    #[test]
+    #[cfg(debug_assertions)]
+    fn w2_02_unknown_counts_are_observable() {
+        let source = "def legacy(x):\n    return x\ndef f() -> int:\n    let n: int = legacy(1)\n    return legacy(2)\ndef g(value) -> None:\n    print(value.name)\n";
+        let prep = preprocess(source);
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module("<test>".into(), &prep.python_source, &module);
+        let checked = check_module_with_imports_and_types(
+            "<test>",
+            &prep.python_source,
+            &resolved,
+            &module,
+            &[],
+            &[],
+            &[],
+            None,
+        );
+        assert_eq!(
+            unchecked::counts(&module, &checked.expression_types),
+            unchecked::Counts {
+                annotated: 1,
+                returns: 1,
+                members: 1
+            }
+        );
+    }
+    #[test]
+    fn w2_04_bare_cast_type_parameter_is_refused() {
+        let d = check("from typing import Any\ndef cast[T](x: Any) -> T:\n    return __typhon_checked_cast__(x, T)\n");
+        assert!(!d.errors().is_empty(), "a bare T has no runtime check");
+    }
+    #[test]
+    fn w2_04_recursive_alias_target_remains_supported() {
+        let d = check("from typing import Any\ntype Json = int | list[Json]\ndef f(value: Any) -> Json:\n    return __typhon_checked_cast__(value, Json)\n");
+        assert!(d.errors().is_empty(), "{:?}", d.errors());
+    }
+    #[test]
+    fn w2_05_frozen_container_operations_are_checked() {
+        for src in [
+            "let NAMES: list[str] = __typhon_freeze__([\"a\"])\ndef f() -> None:\n    NAMES.append(\"b\")\n",
+            "let CONFIG: dict[str, int] = __typhon_freeze__({\"a\":1})\ndef f() -> None:\n    CONFIG[\"a\"] = 2\n",
+            "let VALUES: set[int] = __typhon_freeze__({1})\ndef f() -> None:\n    VALUES.add(2)\n",
+            "let CONFIG: dict[str, list[int]] = __typhon_freeze__({\"a\":[1]})\ndef f() -> None:\n    CONFIG[\"a\"].append(2)\n",
+        ] { assert!(!check(src).errors().is_empty(), "accepted: {src}"); }
+    }
+    #[test]
+    fn w2_05_read_views_aliases_and_caught_probe_controls() {
+        let src = "let NAMES: list[str] = __typhon_freeze__([\"a\"])\nlet CONFIG: dict[str, list[int]] = __typhon_freeze__({\"a\":[1]})\ndef f() -> None:\n    let row: list[int] = CONFIG[\"a\"]\n    let text: str = \",\".join(NAMES)\n    print(row[0], text, NAMES + (\"b\",))\n    try:\n        NAMES.append(\"b\")\n    except AttributeError:\n        pass\n    try:\n        CONFIG[\"a\"] = [2]\n    except TypeError:\n        pass\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn w2_05_wrong_handler_and_deferred_function_do_not_hide_mutation() {
+        for body in ["try:\n    NAMES.append(\"b\")\nexcept ValueError:\n    pass\n", "try:\n    def later() -> None:\n        NAMES.append(\"b\")\nexcept AttributeError:\n    pass\n"] {
+            let src=format!("let NAMES: list[str] = __typhon_freeze__([\"a\"])\n{body}");
+            assert!(!check(&src).errors().is_empty(), "{src}");
+        }
+    }
+    #[test]
+    fn w2_06_callable_shapes() {
+        for src in [
+            "from typing import Callable\ndef f(g: Callable[[int], int]) -> int:\n    return g(y=1)\n",
+            "from typing import Callable\ndef deco[**P, R](f: Callable[P, R]) -> Callable[P, R]:\n    return f\ndef add(a: int, b: int = 10) -> int:\n    return a + b\ndef f() -> int:\n    let g = deco(add)\n    return g(1, 2, 3)\n",
+
+            "def add(a: int, b: int = 10) -> int:\n    return a + b\ndef f() -> int:\n    let g = add\n    return g(1, 2, 3)\n",
+        ] { assert!(!check(src).errors().is_empty(), "accepted: {src}"); }
+        for src in [
+            "def add(a: int, b: int = 10) -> int:\n    return a + b\ndef f() -> int:\n    let g = add\n    return g(a=1)\n",
+            "from typing import Callable\nclass Pt:\n    x: int\ndef apply(factory: Callable[[int], Pt]) -> Pt:\n    return factory(1)\ndef f() -> Pt:\n    return apply(Pt)\n",
+            "from typing import Callable\ndef deco[**P, R](f: Callable[P, R]) -> Callable[P, R]:\n    return f\ndef add(a: int, b: int = 10) -> int:\n    return a + b\ndef f() -> int:\n    let g = deco(add)\n    return g(1)\n",
+            "def add(a: int) -> int:\n    return a + 1\ndef f() -> int:\n    let fs = [add, lambda a: a]\n    return fs[0](1)\n",
+        ] { assert!(check(src).errors().is_empty(), "{src}: {:?}",check(src).errors()); }
+    }
+    #[test]
+    fn w2_07_await_contracts() {
+        for src in [
+            "async def f(n: int) -> int:\n    return await n\n",
+            "class Box:\n    value: int\nasync def f(b: Box) -> int:\n    return await b.value\n",
+        ] {
+            assert!(!check(src).errors().is_empty(), "accepted: {src}");
+        }
+        for src in [
+            "from typing import Awaitable\nasync def fetch() -> int:\n    return 1\ndef f() -> Awaitable[int]:\n    return fetch()\n",
+            "from typing import Coroutine\nasync def fetch() -> int:\n    return 1\ndef f() -> Coroutine[None, None, int]:\n    return fetch()\n",
+            "from typing import Awaitable, Callable\ndef deco(f: Callable[[], int]) -> Callable[[], Awaitable[int]]:\n    async def wrapper() -> int:\n        return f()\n    return wrapper\n@deco\ndef fetch() -> int:\n    return 1\nasync def f() -> int:\n    return await fetch()\n",
+            "async def fetch() -> int:\n    return 1\nasync def f() -> int:\n    let stored = fetch()\n    return await stored\n",
+        ] { assert!(check(src).errors().is_empty(), "{src}: {:?}",check(src).errors()); }
+    }
+    #[test]
+    fn w2_08_power_and_augmented_assignment() {
+        for src in [
+            "let n: int = 2 ** -1\n",
+            "def f(exponent: int) -> int:\n    return 2 ** exponent\n",
+            "newtype Count = int\ndef f(n: Count, exponent: int) -> Count:\n    return n ** exponent\n",
+            "def f() -> bool:\n    mut b: bool = True\n    b += 1\n    return b\n",
+            "def f(p: float?) -> float:\n    mut t: float = 1.0\n    t += p\n    return t\n",
+            "def f(exponent: int) -> int:\n    mut n: int = 2\n    n **= exponent\n    return n\n",
+        ] { assert!(!check(src).errors().is_empty(), "accepted: {src}"); }
+        let src="newtype Count = int\ndef f(n: Count) -> Count:\n    return n ** 2\ndef g(exponent: int) -> int | float:\n    return 2 ** exponent\ndef h() -> bool:\n    mut b: bool = True\n    b &= False\n    return b\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn w2_09_ordering_and_membership() {
+        for src in [
+            "enum Color:\n    RED\n    GREEN\ndef f() -> bool:\n    return Color.RED < Color.GREEN\n",
+            "def f() -> bool:\n    return 1 in \"abc\"\n",
+        ] { assert!(!check(src).errors().is_empty(), "accepted: {src}"); }
+        let src="from dataclasses import dataclass\n@dataclass(order=True)\nclass Point:\n    x: int\ndef f() -> bool:\n    return Point(1) < Point(2)\ndef g() -> bool:\n    return \"a\" in \"abc\"\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn w2_09_caught_enum_order_and_mixed_key_controls() {
+        let src="import enum\nclass IntE(enum.IntEnum):\n    ONE = 1\nclass StrE(enum.StrEnum):\n    X = \"x\"\nenum Plain:\n    A\n    B\ndef f() -> None:\n    print({IntE.ONE: 1}[1], {StrE.X: 1}[\"x\"])\n    try:\n        print(Plain.A < Plain.B)\n    except TypeError:\n        pass\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn w2_10_expression_binding_contracts() {
+        for src in [
+            "from typhon_runtime import try_result\ndef f(s: str) -> Result[int, str]:\n    return try_result(lambda: int(s), lambda e: e)\n",
+            "async def fetch() -> int:\n    return 1\nasync def f() -> str:\n    gather:\n        a = fetch()\n    return a\n",
+            "async def fetch() -> int:\n    return 1\nasync def f() -> str:\n    go fetch() -> task\n    return task.result()\n",
+            "async def fetch() -> int:\n    return 1\nasync def f() -> int:\n    gather(strategy=\"best-effort\"):\n        a = fetch()\n    return a\n",
+            "def parse() -> Result[int, str]:\n    return Ok(3)\ndef f() -> Result[str, str]:\n    return parse().map(lambda n: n + 1)\n",
+            "def parse() -> Result[int, str]:\n    return Ok(3)\ndef f() -> Result[int, str]:\n    return parse().map_err(lambda e: len(e))\n",
+            "def parse() -> Result[int, str]:\n    return Ok(3)\ndef f() -> Result[str, str]:\n    return parse().and_then(lambda n: Ok(n + 1))\n",
+        ] { assert!(!check_full(src).errors().is_empty(), "accepted: {src}"); }
+        for src in [
+            "async def fetch() -> int:\n    return 1\nasync def f() -> int:\n    gather:\n        a = fetch()\n    go fetch() -> task\n    return a + task.result()\n",
+            "async def fetch() -> int:\n    return 1\nasync def f() -> int | Exception:\n    gather(strategy=\"best-effort\"):\n        a = fetch()\n    return a\n",
+            "def parse() -> Result[int, str]:\n    return Ok(3)\ndef f() -> Result[str, str]:\n    return parse().map(lambda n: str(n))\n",
+        ] { assert!(check_full(src).errors().is_empty(), "{src}: {:?}",check_full(src).errors()); }
+    }
+    #[test]
+    fn w2_10_task_and_combinator_chain_controls() {
+        let src="class Box[T]:\n    value: T\nimpl[T] Box[T]:\n    async def get(self) -> T:\n        return self.value\nasync def f(box: Box[int]) -> int:\n    go box.get() -> task\n    return await task\ndef parse() -> Result[int, str]:\n    return Ok(3)\ndef g() -> Result[str, str]:\n    return parse().map(lambda n: n + 1).map(lambda n: str(n))\n";
+        assert!(
+            check_full(src).errors().is_empty(),
+            "{:?}",
+            check_full(src).errors()
+        );
+        let src="def parse() -> Result[int, str]:\n    return Ok(3)\ndef g() -> Result[str, str]:\n    return parse().map(lambda n: n + 1).map(lambda n: n + 1)\n";
+        assert!(!check_full(src).errors().is_empty());
+    }
+    #[test]
+    fn w2_11_go_requires_a_coroutine() {
+        let src = "def work() -> int:\n    return 1\nasync def f() -> None:\n    go work()\n";
+        assert!(!check_full(src).errors().is_empty(), "accepted: {src}");
+        let src="async def work() -> int:\n    return 1\nasync def f() -> int:\n    go work() -> task\n    return await task\n";
+        assert!(
+            check_full(src).errors().is_empty(),
+            "{:?}",
+            check_full(src).errors()
+        );
+    }
+    #[test]
+    fn w2_12_nested_type_parameters_are_rigid() {
+        for src in [
+            "def wrap[T](x: T) -> list[T]:\n    return [1]\n",
+            "def opt[T](x: T) -> T?:\n    return 0\n",
+            "def swap[A, B](p: tuple[A, B]) -> tuple[B, A]:\n    return p\n",
+            "from typing import Callable\ndef mapl[A, B](f: Callable[[A], B], xs: list[A]) -> list[B]:\n    return xs\n",
+            "class Container[F[_]]:\n    def wrong[A, B](self, xs: F[A]) -> F[B]:\n        return xs\n",
+        ] { assert!(!check_full(src).errors().is_empty(), "accepted: {src}"); }
+        for src in [
+            "def wrap[T](x: T) -> list[T]:\n    return [x]\n",
+            "def opt[T](x: T) -> T?:\n    return None\n",
+            "def swap[A, B](p: tuple[A, B]) -> tuple[B, A]:\n    return (p[1], p[0])\n",
+            "from typing import Callable\ndef mapl[A, B](f: Callable[[A], B], xs: list[A]) -> list[B]:\n    return [f(x) for x in xs]\n",
+            "class Container[F[_]]:\n    def same[A](self, xs: F[A]) -> F[A]:\n        return xs\n",
+        ] { assert!(check_full(src).errors().is_empty(), "{src}: {:?}",check_full(src).errors()); }
+    }
+    #[test]
+    fn w2_13_newtype_method_results_and_mixing() {
+        for src in [
+            "newtype Email = str\ndef send(e: Email) -> None:\n    pass\ndef f(e: Email) -> None:\n    send(e.lower())\n",
+            "newtype Email = str\nnewtype Name = str\ndef f(e: Email, n: Name) -> str:\n    return e + n\n",
+            "newtype Email = str\ndef f(e: Email) -> list[int]:\n    return e.split(\"@\")\n",
+        ] { assert!(!check(src).errors().is_empty(), "accepted: {src}"); }
+        let src="newtype Email = str\ndef f(e: Email) -> list[str]:\n    return e.split(\"@\")\ndef g(e: Email) -> str:\n    return e.lower()\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn w2_14_container_mutation_contracts() {
+        for src in [
+            "def f(g: dict[str, int]) -> None:\n    g[7] = 8\n",
+            "def f(xs: list[int]) -> None:\n    xs[\"k\"] = 1\n",
+            "def f(g: dict[str, int]) -> None:\n    g.update({3: 4})\n",
+            "def f(g: dict[str, int]) -> None:\n    g.update({\"k\": \"bad\"})\n",
+        ] {
+            assert!(!check(src).errors().is_empty(), "accepted: {src}");
+        }
+        let src="def f(g: dict[str, int], xs: list[int]) -> None:\n    g[\"k\"] = 8\n    xs[0] = 1\n    xs[:] = [1, 2]\n    g.update({\"ok\": 1})\n    g.update(ok=1)\n    g.update([(\"ok\", 1)])\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn w2_15_mutable_interface_contracts() {
+        for src in [
+            "class Animal:\n    tag: str\nclass Dog(Animal):\n    breed: str\ninterface Owner:\n    pet: Animal\nclass Kennel:\n    pet: Dog\ndef f(k: Kennel) -> Owner:\n    return k\n",
+            "interface Owner:\n    pet: int\nclass Kennel frozen:\n    pet: int\ndef f(k: Kennel) -> Owner:\n    return k\n",
+            "interface Owner:\n    pet: int\nclass Kennel:\n    value: int\nimpl Kennel:\n    @property\n    def pet(self) -> int:\n        return self.value\ndef f(k: Kennel) -> Owner:\n    return k\n",
+            "interface Sized:\n    def size(self, item: str) -> int: ...\nclass Bag:\n    value: int\nimpl Bag:\n    def size(self, thing: str) -> int:\n        return len(thing)\ndef f(b: Bag) -> Sized:\n    return b\n",
+        ] { assert!(!check(src).errors().is_empty(), "accepted: {src}"); }
+        let src="interface Sized:\n    def size(self, item: str) -> int: ...\nclass Bag:\n    value: int\nimpl Bag:\n    def size(self, item: str, suffix: str = \"\") -> int:\n        return len(item + suffix)\ndef f(b: Bag) -> Sized:\n    return b\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+
+    #[test]
+    fn w2_15_writable_property_and_readonly_interface_controls() {
+        let src="interface Owner:\n    pet: int\nclass Kennel:\n    value: int\nimpl Kennel:\n    @property\n    def pet(self) -> int:\n        return self.value\n    @pet.setter\n    def pet(self, value: int) -> None:\n        self.value = value\ndef f(k: Kennel) -> Owner:\n    return k\ninterface Readonly:\n    @property\n    def value(self) -> int: ...\ndef g(k: Kennel) -> Readonly:\n    return k\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
+    fn w2_16_attribute_write_contracts() {
+        for src in [
+            "class Temperature:\n    value: float\nimpl Temperature:\n    @property\n    def celsius(self) -> float:\n        return self.value\ndef f(t: Temperature) -> None:\n    t.celsius = 5.0\n",
+            "from typing import ClassVar\nclass Counter:\n    count: ClassVar[int] = 0\ndef f(c: Counter) -> None:\n    c.count = 5\n",
+        ] { assert!(!check_class_kinds(src).errors().is_empty(), "accepted: {src}"); }
+        for src in [
+            "from dataclasses import dataclass\n@dataclass\nclass Counter:\n    value: int\nimpl Counter:\n    def f(self) -> None:\n        self.cache = 5\n",
+            "from dataclasses import dataclass\n@dataclass(slots=False)\nclass Counter:\n    value: int\nimpl Counter:\n    def f(self) -> None:\n        self.cache = 5\n",
+            "plain class Base:\n    value: int\nclass Child(Base):\n    other: int\nimpl Child:\n    def f(self) -> None:\n        self.cache = 5\n",
+            "from typing import ClassVar\nclass Counter:\n    count: ClassVar[int] = 0\ndef f() -> None:\n    Counter.count = 5\n",
+            "class Temperature:\n    value: float\nimpl Temperature:\n    @property\n    def celsius(self) -> float:\n        return self.value\n    @celsius.setter\n    def celsius(self, value: float) -> None:\n        self.value = value\ndef f(t: Temperature) -> float:\n    t.celsius = 5.0\n    return t.celsius\n",
+        ] { assert!(check_class_kinds(src).errors().is_empty(), "{src}: {:?}",check_class_kinds(src).errors()); }
+    }
+    #[test]
+    fn w2_16_cached_property_assignment_is_not_readonly() {
+        let src="from dataclasses import dataclass\nfrom functools import cached_property\n@dataclass\nclass Box:\n    value: int\n    @cached_property\n    def cached(self) -> int:\n        return self.value\ndef f(box: Box) -> int:\n    box.cached = 5\n    return box.cached\n";
+        assert!(
+            check_class_kinds(src).errors().is_empty(),
+            "{:?}",
+            check_class_kinds(src).errors()
+        );
+    }
+    #[test]
+    fn w2_17_builtin_false_positive_controls() {
+        for src in [
+            "def f(xs: list[int]) -> list[int]:\n    xs[slice(0, 1)] = [2]\n    return xs[slice(0, 2)]\n",
+            "from enum import Enum\nclass Choice(str, Enum):\n    A = \"a\"\ndef f() -> Choice:\n    return Choice(\"a\")\n",
+            "def f(n: int) -> bool:\n    return n.is_integer()\n",
+            "def f(v: int?) -> bool:\n    return isinstance(v, int | None)\n",
+            "from enum import IntEnum\nclass Choice(IntEnum):\n    A = 2\ndef f() -> Choice:\n    return Choice(2)\n",
+            "plain class Count(int):\n    pass\ndef f() -> Count:\n    return Count(2)\n",
+            "class Bag:\n    tag: int\nimpl Bag:\n    def add(self, item: str, /, **meta: int) -> None:\n        pass\ndef f(b: Bag) -> None:\n    b.add(\"a\", item=3)\n",
+        ] { assert!(check_full(src).errors().is_empty(), "{src}: {:?}", check_full(src).errors()); }
+    }
+    #[test]
+    fn w2_17_len_has_one_nullable_diagnostic() {
+        let d = check_full("def f(v: str?) -> int:\n    return len(v)\n");
+        assert_eq!(d.errors().len(), 1, "{:?}", d.errors());
+    }
+    #[test]
+    fn w2_18_class_lint_requires_descriptor_use() {
+        for src in [
+            "class Conn:\n    name: str? = None\ndef f() -> Conn:\n    return Conn()\n",
+            "class Conn:\n    name: str? = None\ndef f(Conn: Conn) -> str?:\n    return Conn.name\n",
+        ] { assert!(!check_class_kinds(src).warnings().iter().any(|e| matches!(e,TycError::ClassAttrShadowsSlot{..})), "{src}: {:?}",check_class_kinds(src).warnings()); }
+        let d = check_class_kinds("class Conn:\n    name: str? = None\nlet n = Conn.name\n");
+        assert!(
+            d.warnings()
+                .iter()
+                .any(|e| matches!(e, TycError::ClassAttrShadowsSlot { .. })),
+            "{:?}",
+            d.warnings()
+        );
+        assert!(!d
+            .warnings()
+            .iter()
+            .any(|e| e.to_string().contains("its literal value")));
+    }
+    #[test]
+    fn w2_18_result_error_wording() {
+        let d = check("def f() -> Result[int, str]:\n    return Err(5)\n");
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ResultErrorMismatch { .. })),
+            "{:?}",
+            d.errors()
+        );
+        assert!(!d
+            .errors()
+            .iter()
+            .any(|e| e.to_string().contains("`?` propagates")));
+    }
+    #[test]
+    fn w2_06_preserve_callable_alias_provenance() {
+        for src in [
+            "from typing import Callable\ndef deco[**P, R](f: Callable[P, R]) -> Callable[P, R]:\n    return f\ndef add(a: int, b: int = 10) -> int:\n    return a+b\ndef f() -> int:\n    let g=deco(add)\n    return g(a=1)\n",
+            "from typing import Callable\nclass Pt:\n    x: int\ndef apply(factory: Callable[[int], Pt]) -> Pt:\n    return factory(1)\ndef f() -> Pt:\n    let factory=Pt\n    return apply(factory)\n",
+        ] {assert!(check(src).errors().is_empty(),"{src}: {:?}",check(src).errors());}
+    }
+    #[test]
+    fn w2_11_sync_aliases_and_callable_contracts() {
+        for src in [
+            "def work() -> int:\n    return 1\nasync def f() -> None:\n    let g=work\n    go g()\n",
+            "from typing import Callable\nasync def f(g: Callable[[], int]) -> None:\n    go g()\n",
+        ] {assert!(!check_full(src).errors().is_empty(),"accepted: {src}");}
+        let src="async def work() -> int:\n    return 1\nasync def f() -> None:\n    let g=work\n    go g()\n";
+        assert!(
+            check_full(src).errors().is_empty(),
+            "{:?}",
+            check_full(src).errors()
+        );
     }
 }
 
