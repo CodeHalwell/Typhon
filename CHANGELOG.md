@@ -271,6 +271,16 @@ grouped by workstream (W1–W7).
   above the argument with a `typhon.toml`, never one reached through a
   symlinked directory) are now skipped with a warning, as `tyc fmt .` already
   did.
+- **`tyc init` no longer pins the optimiser knobs, and checks before
+  writing** (W4-14). The scaffold wrote `auto-memoise = false`,
+  `auto-gather = false` and `pgo-memoise = false`, and an explicit
+  `[strictness]` entry beats `[optimise] level` and `-O`, so `tyc build -O`
+  did nothing on every new project; the three lines are gone (they were the
+  defaults) and a comment explains how the knobs follow `[optimise] level`.
+  (Lands with W3-04's `-O` memoise safety.) `tyc init` over an existing
+  `src/main.ty` used to write `typhon.toml` and `tests/` before failing; every
+  refusal now comes first, a symlink at either path counts as present, and
+  both files are written atomically.
 
 #### W5 — VM & harness
 

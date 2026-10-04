@@ -43,28 +43,35 @@ pub fn run(args: InitArgs) -> Result<()> {
     };
 
     let config_path = dir.join("typhon.toml");
-    if config_path.exists() {
-        return Err(miette!("typhon.toml already exists in {}", dir.display()));
-    }
-
     let src_dir = dir.join("src");
     let tests_dir = dir.join("tests");
-    std::fs::create_dir_all(&src_dir).map_err(|e| miette!("cannot create src/: {}", e))?;
-    std::fs::create_dir_all(&tests_dir).map_err(|e| miette!("cannot create tests/: {}", e))?;
-
-    let toml_str = render_typhon_toml(&name);
-    std::fs::write(&config_path, toml_str)
-        .map_err(|e| miette!("cannot write typhon.toml: {}", e))?;
-
     let main_ty_path = src_dir.join("main.ty");
-    if main_ty_path.exists() {
+
+    // Every refusal comes before the first write (W4-14): `src/main.ty`
+    // already present used to fail only after `typhon.toml` and `tests/` were
+    // written, so the re-run then failed on the half-made scaffold. A path
+    // that is a symlink — even a dangling one, which `exists()` reports as
+    // absent — counts as present: the scaffold never writes through a link.
+    let present = |p: &std::path::Path| std::fs::symlink_metadata(p).is_ok();
+    if present(&config_path) {
+        return Err(miette!("typhon.toml already exists in {}", dir.display()));
+    }
+    if present(&main_ty_path) {
         return Err(miette!(
             "src/main.ty already exists in {}; remove it first to re-scaffold",
             dir.display()
         ));
     }
+
+    std::fs::create_dir_all(&src_dir).map_err(|e| miette!("cannot create src/: {}", e))?;
+    std::fs::create_dir_all(&tests_dir).map_err(|e| miette!("cannot create tests/: {}", e))?;
+
+    let toml_str = render_typhon_toml(&name);
+    tyc_format::atomic_write(&config_path, toml_str.as_bytes())
+        .map_err(|e| miette!("cannot write typhon.toml: {}", e))?;
+
     let main_ty = render_main_ty(&name);
-    std::fs::write(&main_ty_path, main_ty)
+    tyc_format::atomic_write(&main_ty_path, main_ty.as_bytes())
         .map_err(|e| miette!("cannot write src/main.ty: {}", e))?;
 
     println!("Initialised Typhon project `{}` in {}", name, dir.display());
@@ -207,7 +214,7 @@ target = "3.13"
 # free-threaded = true   # opt into Python 3.13t free-threaded build
 
 # [optimise]
-# level = 1   # enable auto-memoise/auto-gather/auto-parallel/pgo-memoise
+# level = 1   # enable auto-memoise/auto-gather/auto-parallel/pgo-memoise (as `tyc build -O` does)
 
 [emit]
 class-default = "dataclass"     # only "dataclass" today; use the `model` keyword per class for pydantic
@@ -218,10 +225,9 @@ no-implicit-any = true          # require explicit element types on list/dict/tu
 unused-import = "warn"          # "error" promotes to a build break
 exhaustive-match = "error"      # require `match` on sealed unions to cover every variant
 methods-in-class-body = "warn"  # "error" promotes Rule 4 to a build break
-auto-memoise = false            # cache every pure function via @functools.cache
-auto-gather = false             # fold consecutive awaits into asyncio.TaskGroup
 suggest-gather = true           # advice when independent awaits could run concurrently
-pgo-memoise = false             # promote hot pure fns from typhon-profile.json
+# auto-memoise / auto-gather / auto-parallel / pgo-memoise follow `[optimise] level`
+# (off at 0, on at 1 or under `tyc build -O`); setting one here overrides both.
 require-with = "warn"           # "error" / "off" — open()/socket()/connect() outside `with` is a leak
 blocking-in-async = "warn"      # "error" / "off" — time.sleep / requests.get inside async def
 allow-secret-comptime = false   # silence `tyc::contains_secret_literal` warnings
@@ -458,5 +464,74 @@ mod tests {
                 "sanitising {raw:?} produced an invalid name {out:?}"
             );
         }
+    }
+
+    /// W4-14: the scaffold must not pin the optimiser knobs to `false` — an
+    /// explicit `[strictness]` entry beats `[optimise] level` and `-O`, so the
+    /// pinned scaffold made `tyc build -O` a no-op on every new project.
+    #[test]
+    fn scaffold_leaves_the_optimiser_knobs_to_the_optimise_level() {
+        let toml = render_typhon_toml("opt");
+        for knob in [
+            "auto-memoise",
+            "auto-gather",
+            "auto-parallel",
+            "pgo-memoise",
+        ] {
+            assert!(
+                !toml.lines().any(|l| l.trim_start().starts_with(knob)),
+                "{knob} must not be set in the scaffold:\n{toml}"
+            );
+        }
+        let mut cfg: crate::config::TyphonConfig = toml::from_str(&toml).unwrap();
+        cfg.resolve_optimise(true);
+        assert_eq!(cfg.strictness.auto_memoise, Some(true));
+        assert_eq!(cfg.strictness.auto_gather, Some(true));
+        assert_eq!(cfg.strictness.pgo_memoise, Some(true));
+        assert_eq!(cfg.strictness.auto_parallel, Some(true));
+        let mut cfg: crate::config::TyphonConfig = toml::from_str(&toml).unwrap();
+        cfg.resolve_optimise(false);
+        assert_eq!(cfg.strictness.auto_memoise, Some(false));
+    }
+
+    /// W4-14: `tyc init` into a directory that already has `src/main.ty`
+    /// fails before writing anything (it used to leave a `typhon.toml` and
+    /// `tests/` behind, so the re-run then failed on the `typhon.toml`).
+    #[test]
+    fn init_over_an_existing_main_ty_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/main.ty"), "print(1)\n").unwrap();
+        let err = run(InitArgs {
+            name: None,
+            dir: tmp.path().to_path_buf(),
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("src/main.ty"), "{err}");
+        assert!(!tmp.path().join("typhon.toml").exists());
+        assert!(!tmp.path().join("tests").exists());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("src/main.ty")).unwrap(),
+            "print(1)\n"
+        );
+    }
+
+    /// `tyc init` never writes through a planted symlink.
+    #[cfg(unix)]
+    #[test]
+    fn init_refuses_a_symlinked_manifest_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("victim.txt");
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        // A dangling link: `exists()` is false, so only a symlink-aware write
+        // notices it.
+        std::os::unix::fs::symlink(&victim, proj.join("typhon.toml")).unwrap();
+        assert!(run(InitArgs {
+            name: None,
+            dir: proj.clone(),
+        })
+        .is_err());
+        assert!(!victim.exists(), "wrote through the symlink");
     }
 }
