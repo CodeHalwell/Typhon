@@ -320,6 +320,12 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   `ast.dump` of every emitted `.py` compared, listing the units that
   changed. Documented in `docs/differential-testing.md` and
   `CONTRIBUTING.md`.
+- New compatibility policy for the beta line (`docs/compatibility.md`, and
+  *Project → Compatibility Policy* on the docs site), linked from the
+  README: the additive-on-correct-programs rule, the four categories every
+  narrowing is filed under, the exceptions made since alpha.2, the surface
+  frozen for beta (each form checked against the binary), how deprecations
+  and breaking changes are made after beta, and what counts as a bug.
 - Docs cite only diagnostic codes the binary emits (`tyc explain --list`
   minus `freeze`/`pub`, now language topics), locked in by a guard test.
 - New nullable-operator docs page listing the accepted spellings with the

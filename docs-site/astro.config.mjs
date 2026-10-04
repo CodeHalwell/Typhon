@@ -259,6 +259,7 @@ export default defineConfig({
           label: 'Project',
           items: [
             { label: 'Roadmap', slug: 'project/roadmap' },
+            { label: 'Compatibility Policy', slug: 'project/compatibility' },
             { label: 'Risks and Mitigations', slug: 'project/risks' },
             { label: 'Prior Art', slug: 'project/prior-art' },
             { label: 'Naming', slug: 'project/naming' },
