@@ -229,6 +229,18 @@ grouped by workstream (W1–W7).
   in source order) instead of the `TaskGroup`'s `ExceptionGroup`, so
   `try: await load(-1) except ValueError:` in a *calling* frame catches it
   under `-O` too.
+- **auto-parallel and the reduction rewrite no longer change program
+  semantics** (W3-09). The comprehension rewrite now requires the same
+  bounded, effect-free iterable as the reduction rewrite (a display, a
+  builtin `range(...)`, or a `list` / `tuple` / `set` / `frozenset`-annotated
+  name in scope): `map_pure` reads the whole iterable first, so
+  `[parse(l) for l in lines()]` over a printing generator read lines `4` and
+  `5` before the `ValueError`, and an infinite iterator hung. A parameter,
+  local or comprehension target that shadows a pure function's name is no
+  longer treated as that function (both rewrites). And the reduction rewrite
+  requires each element to be a provable `int`, not just an `int`
+  accumulator: `total += field(r)` with `field -> Any` over `1e16, -1e16`
+  printed `1.0` instead of `0.0`.
 
 #### W4 — CLI, LSP, filesystem safety
 - **LSP definition URIs rebased onto client workspace root.** `goto_definition` now uses the client's declared workspace root URI (preserving symlink prefixes such as `/var/folders` or `/tmp` rather than macOS `/private/var/...`) or open-document URI, preventing editors from opening duplicate tabs on cross-file jumps.

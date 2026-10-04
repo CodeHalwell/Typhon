@@ -477,7 +477,7 @@ mod tests {
 
     #[test]
     fn parallel_opportunity_flags_comprehension_when_off() {
-        let src = "ys: list[int] = [f(x) for x in xs]\n";
+        let src = "xs: list[int] = []\nys: list[int] = [f(x) for x in xs]\n";
         let m = parse(src);
         let diags =
             parallel_opportunity_diagnostics(&m, "x.ty", src, &pure_set(&["f"]), 0, false, false);
@@ -487,7 +487,7 @@ mod tests {
 
     #[test]
     fn parallel_opportunity_silent_for_comprehension_when_on() {
-        let src = "ys: list[int] = [f(x) for x in xs]\n";
+        let src = "xs: list[int] = []\nys: list[int] = [f(x) for x in xs]\n";
         let m = parse(src);
         // auto_parallel on → the comprehension would already be rewritten.
         let diags =

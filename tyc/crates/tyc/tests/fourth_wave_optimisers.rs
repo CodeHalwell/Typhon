@@ -260,3 +260,59 @@ asyncio.run(main())
         );
     }
 }
+
+// ── W3-09: auto-parallel / reductions ──────────────────────────────────────
+
+#[test]
+fn a_parallel_comprehension_does_not_read_ahead_of_a_failing_element() {
+    let src = "\
+from typing import Iterator
+
+@pure
+def parse(s: str) -> int:
+    return int(s)
+
+def lines() -> Iterator[str]:
+    for s in [\"1\", \"2\", \"x\", \"4\", \"5\"]:
+        print(\"read\", s)
+        yield s
+
+def load() -> list[int]:
+    return [parse(l) for l in lines()]
+
+def main() -> None:
+    try:
+        print(load())
+    except ValueError:
+        print(\"bad\")
+
+main()
+";
+    assert_optimised_prints(src, "auto-parallel = true", "read 1\nread 2\nread x\nbad\n");
+}
+
+#[test]
+fn an_int_accumulator_over_any_elements_is_not_reordered() {
+    let src = "\
+import json
+from typing import Any
+
+@pure
+def field(r: str) -> Any:
+    return json.loads(r)
+
+def main() -> None:
+    let rows: list[str] = [\"1e16\", \"-1e16\"]
+    mut total: int = 1
+    for r in rows:
+        total += field(r)
+    print(total)
+
+main()
+";
+    assert_optimised_prints(
+        src,
+        "auto-parallel = true\nauto-parallel-reductions = true",
+        "0.0\n",
+    );
+}

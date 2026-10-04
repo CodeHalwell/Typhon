@@ -219,6 +219,8 @@ Default `false`. Explicit `gather:` blocks are unaffected by this setting.
 
 When `true`, pure list comprehensions whose element is a pure call are rewritten at build time to a `ThreadPoolExecutor.map`. Combine with `[python] free-threaded = true` to release the GIL across workers; on stock CPython the rewrite still runs but the GIL serialises.
 
+The iterable must be bounded and effect-free to materialise — a list / tuple / set display, a builtin `range(...)`, or a name annotated `list` / `tuple` / `set` / `frozenset` in scope — because the parallel map reads the whole iterable before mapping a single element; a generator would otherwise run ahead of the element that raises. A parameter or local that shadows a pure function's name (`def apply(double: Callable[...])`) is never treated as that function.
+
 `parallel-min-size` is the minimum statically-detectable iterable length. Default `64`. When the iterable size cannot be inferred, the threshold is treated as zero — users opting in accept that contract.
 
 ## `auto-parallel-reductions`
@@ -226,6 +228,8 @@ When `true`, pure list comprehensions whose element is a pure call are rewritten
 **Off by default. Requires `auto-parallel = true`.** Extends the `auto-parallel` rewrite to integer accumulator loops: `for x in xs: total += f(x)` with a **plain `int`** accumulator (`mut total: int`) and a pure `f` lowers to `total += sum(map_pure(lambda x: f(x), xs))`. Integer addition is exact and associative/commutative, so summing partial results in any order gives an identical answer.
 
 The iterable must additionally be **provably bounded and effect-free to materialise**, because `map_pure` runs `list(ITER)` before evaluating a single element: a `list`/`tuple`/`set` literal, a bare name annotated `list[...]` / `tuple[...]` / `set[...]` / `frozenset[...]` in the loop's scope, or a direct builtin `range(...)` call. Anything else — an unannotated name, a function/method call result, a generator — is never rewritten: an unbounded iterator would hang where the sequential loop raises on its first element, and a stateful iterator's side effects would all run where the loop stopped early. Note that parallelising a `range` loop materialises the range — an inherent cost of the map-based design.
+
+Each **element** must also provably be an exact `int` / `bool`, not just the accumulator: the loop target over a `range(...)` or an `int`-element container, `int`-annotated names, integer literals, operators other than `/`, comparisons, and calls to functions declared `-> int`. An element typed `Any` (a `json.loads(...)` result) may be a float, and `1 + 1e16 - 1e16` summed in a different order prints a different answer.
 
 <Aside type="caution">
   `float` accumulators are **never** rewritten — reordering IEEE-754 floating-point addition changes the result, so the compiler refuses to silently reorder it. A `float` loop that's otherwise shaped for the rewrite surfaces `tyc::parallel_opportunity` instead, explaining why it was skipped.
