@@ -1,0 +1,11 @@
+['sum', '  of three']
+6
+failed: bad int: x
+-1
+failed: bad int: zz
+-1
+4 5.0
+mixed failure bad int: q
+mixed failure 3
+ok 3
+recovered from bad int: nope

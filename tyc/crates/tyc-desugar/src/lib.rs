@@ -29,6 +29,8 @@ use ruff_python_ast::{
 };
 use ruff_text_size::TextRange;
 
+mod impl_site;
+
 // ── public API ───────────────────────────────────────────────────────────────
 
 /// Output of the module desugaring pass.
@@ -1797,6 +1799,8 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
     let exception_class_names =
         exception_class_names_from(&module_level_classes, &module_class_names);
     let raw_class_infos = collect_raw_class_infos(&m.body, &options.raw_class_line_starts);
+    let module_mutable_names = collect_module_mutable_names(&m.body);
+    let metaclass_names = metaclass_names_from(&module_level_classes, &module_class_names);
     let markers = ClassMarkers {
         raw_starts: &options.raw_class_line_starts,
         frozen_starts: &options.frozen_class_line_starts,
@@ -1807,6 +1811,8 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
         exception_class_names: &exception_class_names,
         module_class_names: &module_class_names,
         raw_class_infos: &raw_class_infos,
+        module_mutable_names: &module_mutable_names,
+        metaclass_names: &metaclass_names,
     };
     let (new_body, transformed_classes) = desugar_stmts(&m.body, markers);
 
@@ -1830,7 +1836,7 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
     // fields, so no transformation is needed there — but the duplicated
     // annotation is harmless under `@dataclass` and keeps the desugared
     // module consistent across run modes.
-    let merged_body = inherit_parent_fields(merged_body);
+    let merged_body = inherit_parent_fields(merged_body, &options.plain_class_line_starts);
 
     // Inject `@functools.cache` on every top-level function name the purity
     // analyser flagged as opted-into memoisation.  Returns whether any cache
@@ -2213,6 +2219,14 @@ struct ClassMarkers<'a> {
     /// deriving from another in-module `class!` can thread the parent's
     /// fields through its own synthesised `__init__`.
     raw_class_infos: &'a HashMap<String, RawClassInfo>,
+    /// Module-level names evidently bound to a `list` / `dict` / `set`
+    /// (by annotation or by value), mapped to that builtin's name — so a
+    /// field defaulting to one gets a per-instance copy (W7-07).
+    module_mutable_names: &'a HashMap<String, &'static str>,
+    /// Names of every module-level class that is (transitively) a
+    /// metaclass — derived from `type` (or `ABCMeta` / `EnumMeta` /
+    /// `EnumType`). A metaclass is never a dataclass (W7-11).
+    metaclass_names: &'a std::collections::HashSet<&'a str>,
 }
 
 /// What a `class!` contributes to the constructors of `class!` subclasses.
@@ -2401,6 +2415,16 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             });
             let is_exception_subclass = has_external_exception_base
                 || markers.exception_class_names.contains(c.name.as_str());
+            // A metaclass (`class Meta(type):`, or a subclass of one) is not
+            // a record type: `@dataclass` gave it an `__init__(self, …)` that
+            // replaced `type.__init__`, so the first class created with it
+            // raised `TypeError` (W7-11). Same rule as exceptions: an external
+            // metaclass base in any scope, or a module class rooted in one.
+            let is_metaclass = c.bases().iter().any(|b| {
+                base_last_segment(b).is_some_and(|seg| {
+                    !markers.module_class_names.contains(seg) && METACLASS_BASES.contains(&seg)
+                })
+            }) || markers.metaclass_names.contains(c.name.as_str());
             // Multi-inheritance with concrete bases conflicts with
             // `slots=True`; emit the decorator without `slots=True` in
             // that case. FINDINGS #102. Also drop `slots=True` for any
@@ -2423,6 +2447,7 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
                 && !is_lazy_proxy
                 && !is_skip_decoration_subclass
                 && !is_exception_subclass
+                && !is_metaclass
                 && !has_dataclass_decorator(&c.decorator_list);
             // Pydantic `model` classes must have `model_config = ConfigDict(extra="forbid")`
             // as their first body statement unless the user already defined it.
@@ -2437,7 +2462,11 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             // pydantic models, protocols, and impl stubs keep their bodies
             // untouched. FINDINGS #62.
             if needs_decorator
-                && rewrite_mutable_field_defaults(&mut new_body, markers.module_class_names)
+                && rewrite_mutable_field_defaults(
+                    &mut new_body,
+                    markers.module_class_names,
+                    markers.module_mutable_names,
+                )
             {
                 body_transformed = true;
             }
@@ -2616,6 +2645,7 @@ fn make_dataclasses_dot_dataclass_decorator_frozen() -> Decorator {
 fn rewrite_mutable_field_defaults(
     body: &mut [Stmt],
     module_class_names: &std::collections::HashSet<&str>,
+    module_mutable_names: &HashMap<String, &'static str>,
 ) -> bool {
     let mut changed = false;
     // Names the class body itself binds: a lambda defined in the body
@@ -2670,6 +2700,17 @@ fn rewrite_mutable_field_defaults(
             // gives every instance a fresh value, which is what the source
             // meant and what the VM does.
             make_lambda_returning(value.as_ref().clone())
+        } else if let Some(kind) =
+            named_mutable_default_kind(value, &a.annotation, module_mutable_names)
+                .filter(|_| !mentions_any_name(value, &class_body_names))
+        {
+            // W7-07: `items: list[int] = BASE` with `BASE` a module-level
+            // list. The default's type is unhashable, so `@dataclass` raised
+            // `ValueError` when the class was created (both surfaces), though
+            // `tyc check` accepted it. Give each instance a shallow copy —
+            // the same fresh-value-per-instance the literal rewrites above
+            // give, and never one list aliased across instances.
+            make_lambda_returning(make_call(kind, value.as_ref().clone()))
         } else {
             continue;
         };
@@ -2677,6 +2718,120 @@ fn rewrite_mutable_field_defaults(
         changed = true;
     }
     changed
+}
+
+/// `list` / `dict` / `set` when `annotation` is (a subscript of) one of
+/// them, or its `typing` alias.
+fn mutable_builtin_of_annotation(annotation: &Expr) -> Option<&'static str> {
+    let name = match annotation {
+        Expr::Subscript(s) => return mutable_builtin_of_annotation(&s.value),
+        Expr::Name(n) => n.id.as_str(),
+        Expr::Attribute(a) => a.attr.as_str(),
+        _ => return None,
+    };
+    match name {
+        "list" | "List" => Some("list"),
+        "dict" | "Dict" => Some("dict"),
+        "set" | "Set" => Some("set"),
+        _ => None,
+    }
+}
+
+/// `list` / `dict` / `set` when `value` evidently builds one.
+fn mutable_builtin_of_value(value: &Expr) -> Option<&'static str> {
+    match value {
+        Expr::List(_) | Expr::ListComp(_) => Some("list"),
+        Expr::Dict(_) | Expr::DictComp(_) => Some("dict"),
+        Expr::Set(_) | Expr::SetComp(_) => Some("set"),
+        Expr::Call(c) => match c.func.as_ref() {
+            Expr::Name(n) => match n.id.as_str() {
+                "list" => Some("list"),
+                "dict" => Some("dict"),
+                "set" => Some("set"),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Module-level names bound to an evident `list` / `dict` / `set`, by their
+/// annotation or their value. A name bound twice to different kinds is left
+/// out.
+fn collect_module_mutable_names(body: &[Stmt]) -> HashMap<String, &'static str> {
+    let mut out: HashMap<String, &'static str> = HashMap::new();
+    let mut conflicting: HashSet<String> = HashSet::new();
+    for stmt in body {
+        let (name, kind) = match stmt {
+            Stmt::AnnAssign(a) => {
+                let Expr::Name(n) = a.target.as_ref() else {
+                    continue;
+                };
+                let kind = mutable_builtin_of_annotation(&a.annotation)
+                    .or_else(|| a.value.as_deref().and_then(mutable_builtin_of_value));
+                (n.id.as_str(), kind)
+            }
+            Stmt::Assign(a) => {
+                let [Expr::Name(n)] = a.targets.as_slice() else {
+                    continue;
+                };
+                (n.id.as_str(), mutable_builtin_of_value(&a.value))
+            }
+            _ => continue,
+        };
+        match (kind, out.get(name)) {
+            (Some(k), None) => {
+                out.insert(name.to_owned(), k);
+            }
+            (Some(k), Some(prev)) if *prev == k => {}
+            _ => {
+                conflicting.insert(name.to_owned());
+            }
+        }
+    }
+    out.retain(|name, _| !conflicting.contains(name));
+    out
+}
+
+/// For a field default that is a plain or dotted name (`BASE`,
+/// `config.DEFAULTS`) whose value is evidently a `list` / `dict` / `set` —
+/// by the field's own annotation, or by a module-level binding of the name —
+/// the builtin to copy it with.
+fn named_mutable_default_kind(
+    value: &Expr,
+    annotation: &Expr,
+    module_mutable_names: &HashMap<String, &'static str>,
+) -> Option<&'static str> {
+    fn is_dotted_name(e: &Expr) -> bool {
+        match e {
+            Expr::Name(_) => true,
+            Expr::Attribute(a) => is_dotted_name(&a.value),
+            _ => false,
+        }
+    }
+    if !is_dotted_name(value) {
+        return None;
+    }
+    mutable_builtin_of_annotation(annotation).or_else(|| match value {
+        Expr::Name(n) => module_mutable_names.get(n.id.as_str()).copied(),
+        _ => None,
+    })
+}
+
+/// `<func>(<arg>)` with `func` a bare name.
+fn make_call(func: &str, arg: Expr) -> Expr {
+    Expr::Call(ExprCall {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        func: Box::new(make_name_load(func)),
+        arguments: Arguments {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            args: Box::new([arg]),
+            keywords: Box::new([]),
+        },
+    })
 }
 
 /// A call to one of this module's classes (`P(x=1)`) or a non-empty
@@ -2717,7 +2872,9 @@ fn mentions_any_name(expr: &Expr, names: &std::collections::HashSet<String>) -> 
         names,
         found: false,
     };
-    ruff_python_ast::visitor::walk_expr(&mut v, expr);
+    // `visit_expr`, not `walk_expr`: the latter only visits children, so a
+    // bare-name default (`items: list[int] = BASE`) was never checked.
+    ruff_python_ast::visitor::Visitor::visit_expr(&mut v, expr);
     v.found
 }
 
@@ -3295,6 +3452,38 @@ fn exception_class_names_from<'a>(
         }
     }
     exc
+}
+
+/// Builtin metaclasses: a class deriving from one is itself a metaclass.
+const METACLASS_BASES: &[&str] = &["type", "ABCMeta", "EnumMeta", "EnumType"];
+
+/// Names of every module-level class that is (transitively) a metaclass:
+/// seeded from an external (non-module) base in [`METACLASS_BASES`], then
+/// closed over module-class inheritance — a subclass of a metaclass is one.
+fn metaclass_names_from<'a>(
+    classes: &'a [(String, Vec<String>)],
+    module_classes: &std::collections::HashSet<&str>,
+) -> std::collections::HashSet<&'a str> {
+    let mut meta: std::collections::HashSet<&'a str> = classes
+        .iter()
+        .filter(|(_, bases)| {
+            bases.iter().any(|b| {
+                !module_classes.contains(b.as_str()) && METACLASS_BASES.contains(&b.as_str())
+            })
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    loop {
+        let before = meta.len();
+        for (name, bases) in classes {
+            if bases.iter().any(|b| meta.contains(b.as_str())) {
+                meta.insert(name.as_str());
+            }
+        }
+        if meta.len() == before {
+            return meta;
+        }
+    }
 }
 
 /// Collect `(class name, base trailing segments)` for every *module-level*
@@ -4232,25 +4421,64 @@ fn merge_impl_blocks(body: Vec<Stmt>) -> (Vec<Stmt>, bool) {
     let mut impl_methods_map: HashMap<String, Vec<Stmt>> = HashMap::new();
     // Pseudo-class indices whose target is foreign: lowered in place to
     // `def __typhon_extend_T__m(self, ...)` + `T.m = __typhon_extend_T__m`.
+    // W7-06: a local-target method whose decorators or defaults read a name
+    // bound after the class is lowered the same way, at its block.
     let mut foreign_patches: HashMap<usize, Vec<Stmt>> = HashMap::new();
+    let targets_of = |target_name: &String| -> Vec<String> {
+        match union_aliases.get(target_name) {
+            Some(variants) => variants.clone(),
+            None => vec![target_name.clone()],
+        }
+    };
+    // Every name the merged class body binds: its own members plus every
+    // `impl` method aimed at it.
+    let mut class_scope: HashMap<String, HashSet<String>> = HashMap::new();
+    for stmt in &body {
+        if let Stmt::ClassDef(c) = stmt {
+            if !c.name.as_str().starts_with(IMPL_PREFIX) {
+                impl_site::class_body_names(
+                    &c.body,
+                    class_scope.entry(c.name.as_str().to_owned()).or_default(),
+                );
+            }
+        }
+    }
+    for (impl_idx, target_name) in &impl_indices {
+        if let Stmt::ClassDef(c) = &body[*impl_idx] {
+            for target in targets_of(target_name) {
+                impl_site::class_body_names(&c.body, class_scope.entry(target).or_default());
+            }
+        }
+    }
+    let planner = impl_site::ImplSitePlanner::new(&body, IMPL_PREFIX);
     for (impl_idx, target_name) in &impl_indices {
         if let Stmt::ClassDef(c) = &body[*impl_idx] {
             let methods: Vec<Stmt> = c.body.iter().map(insert_self_param).collect();
             // Determine the actual target class(es). A union alias expands
             // to every variant; a concrete class is its own target.
-            let targets: Vec<String> = match union_aliases.get(target_name) {
-                Some(variants) => variants.clone(),
-                None => vec![target_name.clone()],
-            };
+            let targets: Vec<String> = targets_of(target_name);
             let all_local = targets
                 .iter()
                 .all(|t| local_classes.contains(t.as_str()) || union_aliases.contains_key(t));
             if all_local {
                 for target in targets {
-                    impl_methods_map
-                        .entry(target)
-                        .or_default()
-                        .extend(methods.iter().cloned());
+                    for method in &methods {
+                        if planner.must_define_at_impl_site(
+                            &target,
+                            *impl_idx,
+                            method,
+                            &class_scope,
+                        ) {
+                            foreign_patches.entry(*impl_idx).or_default().extend(
+                                make_extend_patch_stmts(&target, std::slice::from_ref(method)),
+                            );
+                        } else {
+                            impl_methods_map
+                                .entry(target.clone())
+                                .or_default()
+                                .push(method.clone());
+                        }
+                    }
                 }
             } else {
                 foreign_patches.insert(*impl_idx, make_extend_patch_stmts(target_name, &methods));
@@ -4464,11 +4692,25 @@ fn make_extend_patch_stmts(target: &str, methods: &[Stmt]) -> Vec<Stmt> {
         let module_fn_name = format!("__typhon_extend_{target}__{method_name}");
         let mut renamed = f.clone();
         renamed.name = make_identifier(&module_fn_name);
+        // A module-level function has no `__class__` cell, so a bare
+        // `super()` in it raises `RuntimeError` — spell out the class the
+        // method is attached to, as `rewrite_bare_super` does in a class body.
+        if let Some(self_name) = first_parameter_name(&renamed.parameters) {
+            let rewriter = SuperRewriter {
+                class_name: target.to_owned(),
+                self_name,
+            };
+            for body_stmt in &mut renamed.body {
+                rewriter.visit_stmt(body_stmt);
+            }
+        }
         out.push(Stmt::FunctionDef(renamed));
-        // `Target.method = __typhon_extend_Target__method`
+        // `Target.method = __typhon_extend_Target__method`, attributed to
+        // the method's `def` line (its name's range) in the source map
+        // rather than inheriting the last line of the body above it.
         out.push(Stmt::Assign(StmtAssign {
             node_index: AtomicNodeIndex::NONE,
-            range: TextRange::default(),
+            range: f.name.range,
             targets: vec![Expr::Attribute(ExprAttribute {
                 node_index: AtomicNodeIndex::NONE,
                 range: TextRange::default(),
@@ -4501,7 +4743,7 @@ fn make_extend_patch_stmts(target: &str, methods: &[Stmt]) -> Vec<Stmt> {
 ///
 /// Recurses into nested function/class bodies so a class defined inside a
 /// function still benefits from this transformation.
-fn inherit_parent_fields(body: Vec<Stmt>) -> Vec<Stmt> {
+fn inherit_parent_fields(body: Vec<Stmt>, plain_starts: &[u32]) -> Vec<Stmt> {
     // First pass: collect each class's own field annotations, indexed by name,
     // plus its direct bases so the MRO can be reconstructed.
     let mut field_map: HashMap<String, Vec<Stmt>> = HashMap::new();
@@ -4551,6 +4793,7 @@ fn inherit_parent_fields(body: Vec<Stmt>) -> Vec<Stmt> {
         stmts: Vec<Stmt>,
         field_map: &HashMap<String, Vec<Stmt>>,
         parents: &HashMap<String, Vec<String>>,
+        plain_starts: &[u32],
     ) -> Vec<Stmt> {
         stmts
             .into_iter()
@@ -4559,7 +4802,21 @@ fn inherit_parent_fields(body: Vec<Stmt>) -> Vec<Stmt> {
                     // Recurse so a class defined inside another class
                     // body is also rewritten.
                     let inner = std::mem::take(&mut c.body);
-                    c.body = rewrite(inner, field_map, parents);
+                    c.body = rewrite(inner, field_map, parents, plain_starts);
+
+                    // A `plain class` is emitted exactly as written: it has
+                    // no generated constructor to feed, and an annotated
+                    // assignment in its body is a class attribute. Copying
+                    // the parent's attributes into it shadowed them —
+                    // `Cfg.debug = True` no longer reached a subclass that
+                    // never declared `debug` (W7-11).
+                    if ClassMarkers::marker_covers(
+                        plain_starts,
+                        u32::from(c.range.start()),
+                        u32::from(c.name.range.start()),
+                    ) {
+                        return Stmt::ClassDef(c);
+                    }
 
                     // The class's own field annotations, keyed by name, so a
                     // re-declared parent field can be re-sited (see below).
@@ -4665,14 +4922,14 @@ fn inherit_parent_fields(body: Vec<Stmt>) -> Vec<Stmt> {
                 }
                 Stmt::FunctionDef(mut f) => {
                     let inner = std::mem::take(&mut f.body);
-                    f.body = rewrite(inner, field_map, parents);
+                    f.body = rewrite(inner, field_map, parents, plain_starts);
                     Stmt::FunctionDef(f)
                 }
                 other => other,
             })
             .collect()
     }
-    rewrite(body, &field_map, &parents)
+    rewrite(body, &field_map, &parents, plain_starts)
 }
 
 /// Rewrite a `class!`'s synthesised `__init__` so it also accepts and
@@ -6853,5 +7110,281 @@ class __typhon_impl_Event(object):
             !out.contains("@dataclasses.dataclass"),
             "typing_extensions.TypedDict must not get @dataclasses.dataclass decorator: {out}"
         );
+    }
+
+    // ── W7-06: impl methods whose def-time names come after the class ──────
+
+    /// Index of the first line of `out` containing `needle`.
+    fn line_index(out: &str, needle: &str) -> usize {
+        out.lines()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("`{needle}` not in:\n{out}"))
+    }
+
+    #[test]
+    fn impl_method_with_a_late_default_is_defined_at_the_impl_site() {
+        let src = "\
+class Greeter:
+    name: str
+
+DEFAULT_GREETING = 'hello'
+
+class __typhon_impl_Greeter(object):
+    def greet(word: str = DEFAULT_GREETING) -> str:
+        return word
+
+    def plain() -> str:
+        return 'plain'
+";
+        let out = parse_and_desugar(src);
+        let constant = line_index(&out, "DEFAULT_GREETING = ");
+        let def = line_index(&out, "def __typhon_extend_Greeter__greet(self, word");
+        let attach = line_index(&out, "Greeter.greet = __typhon_extend_Greeter__greet");
+        assert!(constant < def && def < attach, "{out}");
+        // A method with no late name keeps the merged class body.
+        assert!(line_index(&out, "    def plain(self)") < constant, "{out}");
+        assert!(!out.contains("__typhon_impl_"), "{out}");
+    }
+
+    #[test]
+    fn impl_method_with_a_late_decorator_moves_for_every_union_variant() {
+        let src = "\
+class Circle:
+    r: float
+
+class Square:
+    s: float
+
+type Shape = Circle | Square
+
+def tagged(f):
+    return f
+
+class __typhon_impl_Shape(object):
+    @tagged
+    def describe() -> str:
+        return 'shape'
+";
+        let out = parse_and_desugar(src);
+        let deco = line_index(&out, "def tagged(");
+        assert!(
+            deco < line_index(&out, "def __typhon_extend_Circle__describe(self)"),
+            "{out}"
+        );
+        assert!(
+            deco < line_index(&out, "def __typhon_extend_Square__describe(self)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Circle.describe = __typhon_extend_Circle__describe"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Square.describe = __typhon_extend_Square__describe"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn impl_methods_that_ran_before_keep_the_merged_class_body() {
+        for src in [
+            // Bound before the class: hoisting never crashed.
+            "K = 1\nclass C:\n    x: int\nK2 = 2\nclass __typhon_impl_C(object):\n    def m(k: int = K) -> int:\n        return k\n",
+            // A builtin: resolved at the class site.
+            "class C:\n    x: int\nlen = 3\nclass __typhon_impl_C(object):\n    def m(f = len) -> int:\n        return 0\n",
+            // A name from the class namespace (`@x.setter`-style).
+            "class C:\n    x: int\n    def helper(): pass\nhelper = 1\nclass __typhon_impl_C(object):\n    def m(f = helper) -> int:\n        return 0\n",
+            // The impl block precedes the class.
+            "class __typhon_impl_C(object):\n    def m(k: int = K) -> int:\n        return k\nK = 1\nclass C:\n    x: int\n",
+            // A `from … import *` before the class may bind the name.
+            "from os import *\nclass C:\n    x: int\nK = 1\nclass __typhon_impl_C(object):\n    def m(k: int = K) -> int:\n        return k\n",
+        ] {
+            let out = parse_and_desugar(src);
+            assert!(!out.contains("__typhon_extend_"), "must stay merged:\n{src}\n---\n{out}");
+        }
+    }
+
+    #[test]
+    fn impl_methods_needing_class_body_semantics_stay_merged() {
+        let late = "class C:\n    x: int\nK = 1\n";
+        for method in [
+            // Dunder: `__post_init__` / `__init_subclass__` / `__eq__` act at class creation.
+            "    def __post_init__(k: int = K) -> None:\n        pass\n",
+            // Private-name mangling only happens in a class body.
+            "    def m(k: int = K) -> int:\n        return self.__secret\n",
+            // `cached_property` needs `__set_name__`.
+            "    @functools.cached_property\n    def m(k: int = K) -> int:\n        return k\n",
+            "    @abstractmethod\n    def m(k: int = K) -> int:\n        return k\n",
+            // VM dispatch gaps for class-attribute functions.
+            "    @property\n    def m(k: int = K) -> int:\n        return k\n",
+            "    @classmethod\n    def m(k: int = K) -> int:\n        return k\n",
+        ] {
+            let src = format!("{late}class __typhon_impl_C(object):\n{method}");
+            let out = parse_and_desugar(&src);
+            assert!(
+                !out.contains("__typhon_extend_"),
+                "must stay merged:\n{src}\n---\n{out}"
+            );
+        }
+        // A subclass created before the block, or one overriding the method.
+        for src in [
+            "class C:\n    x: int\nclass D(C):\n    pass\nK = 1\nclass __typhon_impl_C(object):\n    def m(k: int = K) -> int:\n        return k\n",
+            "class C:\n    x: int\nK = 1\nclass __typhon_impl_C(object):\n    def m(k: int = K) -> int:\n        return k\nclass D(C):\n    def m(self, k: int = 2) -> int:\n        return super().m(k)\n",
+        ] {
+            let out = parse_and_desugar(src);
+            assert!(!out.contains("__typhon_extend_"), "must stay merged:\n{src}\n---\n{out}");
+        }
+        // A member the class may inherit: the VM finds the base's first.
+        for src in [
+            "class B:\n    x: int\n    def m(self) -> int:\n        return 0\nclass C(B):\n    y: int\nK = 1\nclass __typhon_impl_C(object):\n    def m(k: int = K) -> int:\n        return k\n",
+            "from mod import Ext\nclass C(Ext):\n    y: int\nK = 1\nclass __typhon_impl_C(object):\n    def m(k: int = K) -> int:\n        return k\n",
+        ] {
+            let out = parse_and_desugar(src);
+            assert!(!out.contains("__typhon_extend_"), "must stay merged:\n{src}\n---\n{out}");
+        }
+        // A subclass defined after the block that does not override is fine.
+        let out = parse_and_desugar(
+            "class C:\n    x: int\nK = 1\nclass __typhon_impl_C(object):\n    def m(k: int = K) -> int:\n        return k\nclass D(C):\n    pass\n",
+        );
+        assert!(out.contains("C.m = __typhon_extend_C__m"), "{out}");
+    }
+
+    #[test]
+    fn attached_method_bare_super_names_its_class() {
+        let src = "\
+class Base:
+    x: int
+
+class C(Base):
+    y: int
+
+K = 1
+
+class __typhon_impl_C(object):
+    def m(k: int = K) -> int:
+        return super().m(k)
+";
+        let out = parse_and_desugar(src);
+        assert!(out.contains("return super(C, self).m(k)"), "{out}");
+    }
+
+    // ── W7-07: a mutable default given by name ─────────────────────────────
+
+    #[test]
+    fn named_mutable_default_gets_a_per_instance_copy() {
+        // By the field's annotation.
+        let out =
+            parse_and_desugar("BASE: list[int] = [1]\n\nclass Box:\n    items: list[int] = BASE\n");
+        assert!(
+            out.contains(
+                "items: list[int] = dataclasses.field(default_factory=lambda: list(BASE))"
+            ),
+            "{out}"
+        );
+        // By the module-level binding when the field annotation is abstract.
+        let out = parse_and_desugar(
+            "TABLE = {'a': 1}\n\nclass Box:\n    table: Mapping[str, int] = TABLE\n",
+        );
+        assert!(out.contains("default_factory=lambda: dict(TABLE)"), "{out}");
+        let out = parse_and_desugar("TAGS = set()\n\nclass Box:\n    tags: Set[str] = TAGS\n");
+        assert!(out.contains("default_factory=lambda: set(TAGS)"), "{out}");
+        // A dotted name, typed by the annotation.
+        let out = parse_and_desugar("class Box:\n    items: List[int] = config.DEFAULTS\n");
+        assert!(
+            out.contains("default_factory=lambda: list(config.DEFAULTS)"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn hashable_or_unknown_named_defaults_are_left_alone() {
+        for src in [
+            // Immutable value.
+            "LIMIT = 3\n\nclass Box:\n    n: int = LIMIT\n",
+            "PAIR = (1, 2)\n\nclass Box:\n    p: tuple[int, int] = PAIR\n",
+            // Kind unknown: neither the annotation nor a binding says list/dict/set.
+            "class Box:\n    items: Sequence[int] = make_items\n",
+            // A class-body name: a lambda in the class body cannot see it.
+            "class Box:\n    BASE: ClassVar[list[int]] = [1]\n    items: list[int] = BASE\n",
+            // ClassVar fields are class attributes, never factories.
+            "BASE: list[int] = [1]\n\nclass Box:\n    items: ClassVar[list[int]] = BASE\n",
+            // A name bound to different kinds is ambiguous.
+            "X = [1]\nX = {1}\n\nclass Box:\n    items: Collection[int] = X\n",
+        ] {
+            let out = parse_and_desugar(src);
+            assert!(
+                !out.contains("default_factory=lambda:"),
+                "must be left alone:\n{src}\n---\n{out}"
+            );
+        }
+    }
+
+    // ── W7-11: class emission ──────────────────────────────────────────────
+
+    #[test]
+    fn metaclasses_are_never_dataclasses() {
+        let out = parse_and_desugar(
+            "class Registry(type):\n    pass\n\nclass Strict(Registry):\n    pass\n\nclass Widget(metaclass=Registry):\n    size: int = 3\n",
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        let decorated = |name: &str| {
+            let at = lines
+                .iter()
+                .position(|l| l.starts_with(&format!("class {name}")))
+                .unwrap_or_else(|| panic!("no class {name} in:\n{out}"));
+            at > 0 && lines[at - 1].starts_with("@dataclasses.dataclass")
+        };
+        assert!(!decorated("Registry"), "{out}");
+        assert!(
+            !decorated("Strict"),
+            "a subclass of a metaclass is one:\n{out}"
+        );
+        // A class *using* a metaclass is an ordinary record type.
+        assert!(decorated("Widget"), "{out}");
+        // Dotted and other builtin metaclasses.
+        for src in [
+            "import builtins\nclass M(builtins.type):\n    pass\n",
+            "import enum\nclass M(enum.EnumMeta):\n    pass\n",
+        ] {
+            let out = parse_and_desugar(src);
+            assert!(!out.contains("@dataclasses.dataclass"), "{src}\n---\n{out}");
+        }
+    }
+
+    #[test]
+    fn plain_subclass_keeps_only_its_own_attributes() {
+        let src = "class Cfg:\n    debug: bool = False\n\nclass Other(Cfg):\n    pass\n\nclass Sub(Cfg):\n    debug: bool = True\n";
+        let module = tyc_syntax::parse_module(src).expect("parse").into_syntax();
+        let line_start = |needle: &str| src.find(needle).expect("present") as u32;
+        let plain = vec![
+            line_start("class Cfg"),
+            line_start("class Other"),
+            line_start("class Sub"),
+        ];
+        let out = emit(
+            &desugar_module_with(
+                &module,
+                DesugarOptions {
+                    plain_class_line_starts: plain,
+                    ..Default::default()
+                },
+            )
+            .module,
+        );
+        assert!(!out.contains("@dataclasses.dataclass"), "{out}");
+        // `Other` inherits `debug` from `Cfg` rather than shadowing it.
+        let other = out
+            .split("class Other(Cfg):")
+            .nth(1)
+            .expect("Other emitted");
+        let other_body = other.split("class Sub").next().unwrap_or(other);
+        assert!(!other_body.contains("debug"), "{out}");
+        // `Sub` declares its own and keeps it.
+        let sub = out.split("class Sub(Cfg):").nth(1).expect("Sub emitted");
+        assert!(sub.contains("debug: bool = True"), "{out}");
+        // A dataclass subclass still receives the inherited field copy.
+        let out = parse_and_desugar("class A:\n    x: int\n\nclass B(A):\n    y: int\n");
+        let b = out.split("class B(A):").nth(1).expect("B emitted");
+        assert!(b.contains("x: int"), "{out}");
     }
 }

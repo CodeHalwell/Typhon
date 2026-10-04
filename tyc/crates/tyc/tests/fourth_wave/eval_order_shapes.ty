@@ -1,0 +1,98 @@
+class Parser:
+    src: str
+    pos: int = 0
+
+class Node:
+    start: int
+    text: str
+
+impl Parser:
+    def word(self) -> Result[str, str]:
+        let b: int = self.pos
+        while self.pos < len(self.src) and self.src[self.pos] != " ":
+            self.pos += 1
+        return Ok(self.src[b:self.pos])
+
+    def node(self) -> Result[Node, str]:
+        return Ok(Node(
+            start=self.pos,
+            text=self.word()?,
+        ))
+
+    def span(self) -> Result[str, str]:
+        let s: str = f"{self.pos}-" + self.word()?
+        return Ok(s)
+
+def t(tag: str) -> int:
+    print(tag)
+    return 1
+
+def r(tag: str) -> Result[int, str]:
+    print(tag)
+    return Ok(2)
+
+def g(a: int, b: int) -> int:
+    print("g")
+    return a + b
+
+def add3(a: int, b: int, c: int) -> int:
+    return a + b + c
+
+class Box:
+    items: list[int]
+
+impl Box:
+    def me(self) -> Box:
+        print("me")
+        return self
+
+    def push(self, v: int) -> None:
+        print("push")
+        self.items.append(v)
+
+def nested() -> Result[int, str]:
+    return Ok(add3(g(t("a"), r("b")?), t("c"), r("d")?))
+
+def mixed() -> Result[int, str]:
+    return Ok(add3(r("m1")?, t("m2"), r("m3")?))
+
+def binop() -> Result[int, str]:
+    let x: int = t("left") + r("right")?
+    return Ok(x)
+
+def receiver(b: Box) -> Result[int, str]:
+    b.me().push(r("arg")?)
+    return Ok(len(b.items))
+
+def kwargs() -> Result[int, str]:
+    return Ok(add3(c=t("c"), a=t("a"), b=r("b")?))
+
+def cond() -> Result[int, str]:
+    if t("lhs") < r("rhs")?:
+        return Ok(1)
+    return Ok(0)
+
+def loop() -> Result[int, str]:
+    mut total: int = 0
+    for v in [t("x"), r("y")?]:
+        total += v
+    return Ok(total)
+
+def aug(d: dict[int, int]) -> Result[int, str]:
+    d[t("key")] += r("val")?
+    return Ok(d[1])
+
+def main() -> None:
+    print(Parser(src="hello world").node())
+    let p: Parser = Parser(src="ab cd")
+    print(p.span())
+    print(nested())
+    print(mixed())
+    print(binop())
+    print(receiver(Box(items=[])))
+    print(kwargs())
+    print(cond())
+    print(loop())
+    print(aug({1: 10}))
+
+main()

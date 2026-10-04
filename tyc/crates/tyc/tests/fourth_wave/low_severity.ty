@@ -1,0 +1,38 @@
+def parse(s: str) -> Result[int, str]:
+    if s.isdigit():
+        return Ok(int(s))
+    return Err(f"not a number: {s}")
+
+def report(a: str, b: str) -> Result[str, str]:
+    let text: str = f"""first: {parse(a)?:>3}
+second: {parse(b)? * 2} {{braces}} {a!r}
+end"""
+    return Ok(text)
+
+def total(*args: int) -> int:
+    return sum(args)
+
+interface Shape:
+    def area(self) -> float  # declaration only
+
+class Square:
+    side: float
+
+impl Square:
+    def area(self) -> float:
+        return self.side * self.side
+
+def describe(s: Shape) -> str:
+    return f"{s.area():.1f}"
+
+mut go: int = 2
+mut comptime: int = 3
+let a: int = total(1,
+    go + 10)
+let b: int = total(
+comptime * 3,
+)
+print(a, b)
+print(report("4", "21"))
+print(report("4", "x"))
+print(describe(Square(1.5)))

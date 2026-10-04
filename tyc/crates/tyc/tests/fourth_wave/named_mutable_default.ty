@@ -1,0 +1,20 @@
+from typing import Mapping
+
+let BASE: list[int] = [1]
+let TABLE: dict[str, int] = {"a": 1}
+let TAGS: set[str] = {"x"}
+
+class Box:
+    items: list[int] = BASE
+    table: Mapping[str, int] = TABLE
+    tags: set[str] = TAGS
+    label: str = "box"
+
+let a: Box = Box()
+let b: Box = Box()
+a.items.append(2)
+a.tags.add("y")
+print(a.items, b.items, BASE, a.items is BASE)
+print(sorted(a.tags), sorted(b.tags), sorted(TAGS))
+print(a.table == TABLE, a.table is TABLE, b.label)
+print(Box(items=[9]).items)

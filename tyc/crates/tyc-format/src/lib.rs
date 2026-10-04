@@ -36,6 +36,7 @@ use std::process::{Command, Stdio};
 
 use tyc_diagnostics::TycError;
 use tyc_syntax::{
+    ast_equiv::{compare_python_sources, AstComparison, CompareOptions},
     parse_module,
     preprocess::{
         expand_sugar, postprocess_full, preprocess, preprocess_opts, PreprocessOptions,
@@ -98,13 +99,30 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
         TycError::parse(path, &validation_input, e.to_string(), offset)
     })?;
 
+    // Step 2b: stand a single marker character in for every `?` the
+    // preprocessor rewrote to ` | None`.
+    //
+    // The restore used to be keyed by the byte column of each ` | None` in
+    // the pre-processed line. The spacing pass below moves columns
+    // (`z:int=r | None` → `z: int = r | None`), so the restore silently
+    // missed and the user's `r?` came back as `r | None` — and when the
+    // shifted column landed inside a multi-byte character the indexing
+    // panicked. A marker character travels with its token through any
+    // whitespace edit, so restoration no longer depends on columns at all.
+    let marker = optional_marker_for(source);
+    let marked = mark_optionals(&prep.python_source, &prep.optionals, marker).ok_or_else(|| {
+        TycError::generic(format!(
+            "tyc fmt: could not locate a rewritten `?` in '{path}'; the file was left unchanged"
+        ))
+    })?;
+
     // Step 3: normalise whitespace on the pre-processed source.
     //
     // Phase 0 normalisation rules:
     //   • Strip trailing whitespace from each line.
     //   • Ensure the file ends with exactly one newline.
     //   • Expand tabs to 4 spaces.
-    let (normalised, line_map) = normalise_whitespace_with_map(&prep.python_source);
+    let (normalised, line_map) = normalise_whitespace_with_map(&marked);
 
     // Step 3b: (optional) pipe the pure-Python buffer through `ruff format`
     // when the binary is on $PATH AND the buffer contains nothing that the
@@ -120,12 +138,17 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
     // The Phase-5 vision will replace this with an AST printer that
     // round-trips Typhon sugar end-to-end.
     let can_run_ruff = prep.stripped.is_empty()
+        && prep.bodiless_def_lines.is_empty()
         && prep.optionals.is_empty()
         && prep.lazy_imports.is_empty()
         && !contains_typhon_only_tokens(&normalised);
+    let mut ruff_ran = false;
     let after_ruff = match can_run_ruff.then(ruff_path).flatten() {
         Some(ruff) => match run_ruff_format(&ruff, &normalised, path) {
-            Ok(reformatted) => reformatted,
+            Ok(reformatted) => {
+                ruff_ran = true;
+                reformatted
+            }
             Err(msg) => {
                 eprintln!("tyc fmt: ruff format failed ({msg}); using in-process output");
                 normalised
@@ -154,14 +177,6 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
             keyword: s.keyword,
         })
         .collect();
-    let translated_optionals: Vec<StrippedOptional> = prep
-        .optionals
-        .iter()
-        .map(|o| StrippedOptional {
-            line_index: translate(o.line_index),
-            python_col: o.python_col,
-        })
-        .collect();
     let translated_lazy: Vec<_> = prep
         .lazy_imports
         .iter()
@@ -171,12 +186,10 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
             module: li.module.clone(),
         })
         .collect();
-    let output = postprocess_full(
-        &after_ruff,
-        &translated_stripped,
-        &translated_optionals,
-        &translated_lazy,
-    );
+    // `?` sugar is restored from its marker character, not by column (the
+    // optionals list is deliberately empty here — see step 2b).
+    let output = postprocess_full(&after_ruff, &translated_stripped, &[], &translated_lazy);
+    let output = output.replace(marker, "?");
 
     // Step 4b: repair the builtin-extend restoration.
     //
@@ -217,8 +230,152 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
     let output =
         restore_impl_extend_headers_verbatim(&output, &prep.stripped, &original_lines, &translate);
 
+    // Step 4d: undo the two lowerings `postprocess_full` does not reverse
+    // (W7-12). A one-line `enum Small: A; B` came back as
+    // `enum Small: A = enum.auto(); B = enum.auto()`, and a declaration-only
+    // `def area(self) -> float` (an `interface` method) came back with the
+    // `: ...` the preprocessor appended for the Python parser.
+    let output = restore_enum_one_liners(&output, &prep.stripped, &original_lines, &translate);
+    let output = strip_appended_ellipses(&output, &prep.bodiless_def_lines, &translate);
+
+    // Step 5: self-check — refuse to hand back a different program.
+    //
+    // Every step above is a text edit, and text edits on a language with
+    // sugar the parser does not see have corrupted source in four release
+    // lines (`?` → `| None`, string-literal contents respaced, …) — in the
+    // user's own file, under the one tool people run without reading the
+    // diff. Lower the output exactly as the input was lowered, parse it, and
+    // compare the two module ASTs. Only `ruff format`'s docstring
+    // re-indentation is tolerated, and only when ruff actually ran.
+    if output != source {
+        verify_same_program(&validation_input, &output, ruff_ran, path)?;
+    }
+
     let changed = output != source;
     Ok(FormatResult { output, changed })
+}
+
+/// The formatter's self-check: lower `output` exactly as the input was
+/// lowered (`input_lowered` is that lowering of the original source), parse
+/// both, and fail unless they denote the same module. `ruff_ran` relaxes the
+/// comparison of docstrings to whitespace-insensitive, since `ruff format`
+/// re-indents them.
+#[allow(clippy::result_large_err)]
+fn verify_same_program(
+    input_lowered: &str,
+    output: &str,
+    ruff_ran: bool,
+    path: &str,
+) -> Result<(), TycError> {
+    let output_lowered = preprocess(&expand_sugar(output, true)).python_source;
+    let verdict = compare_python_sources(
+        input_lowered,
+        &output_lowered,
+        CompareOptions {
+            lenient_docstrings: ruff_ran,
+        },
+    );
+    match verdict {
+        AstComparison::Same => Ok(()),
+        AstComparison::Different => Err(TycError::generic(format!(
+            "tyc fmt: refusing to format '{path}': the formatted text parses to a \
+             different program than the original, so the file was left unchanged. \
+             This is a formatter bug — please report it at \
+             https://github.com/CodeHalwell/Typhon/issues with the file attached."
+        ))),
+        AstComparison::AfterDoesNotParse(msg) => Err(TycError::generic(format!(
+            "tyc fmt: refusing to format '{path}': the formatted text does not parse \
+             ({msg}), so the file was left unchanged. This is a formatter bug — please \
+             report it at https://github.com/CodeHalwell/Typhon/issues with the file \
+             attached."
+        ))),
+        // The caller parsed the input lowering before formatting anything, so
+        // this cannot happen; with nothing to compare against there is also
+        // nothing to refuse on.
+        AstComparison::BeforeDoesNotParse(_) => Ok(()),
+    }
+}
+
+/// The text the preprocessor substitutes for a `?` (see
+/// `tyc_syntax::preprocess::rewrite_optionals`).
+const OPTIONAL_REWRITE: &str = " | None";
+
+/// First private-use code point tried as the `?` stand-in. `U+E000` itself is
+/// reserved: [`apply_simple_style_rules_with_paren_depth`] hides string
+/// literals behind it.
+const FIRST_OPTIONAL_MARKER: u32 = 0xE001;
+const LAST_OPTIONAL_MARKER: u32 = 0xF8FF;
+
+/// Pick a private-use character that does not occur anywhere in `source`, so
+/// replacing every occurrence of it with `?` after formatting touches only
+/// the stand-ins this module inserted.
+fn optional_marker_for(source: &str) -> char {
+    (FIRST_OPTIONAL_MARKER..=LAST_OPTIONAL_MARKER)
+        .filter_map(char::from_u32)
+        .find(|c| !source.contains(*c))
+        // A file containing all 6,399 private-use characters is not a real
+        // input; the first one keeps behaviour defined.
+        .unwrap_or('\u{E001}')
+}
+
+/// `true` for a `?` stand-in inserted by [`mark_optionals`]. The spacing
+/// engine treats it like the identifier character it replaced (`r?` ends an
+/// operand exactly as `r` does).
+fn is_optional_marker(c: char) -> bool {
+    (FIRST_OPTIONAL_MARKER..=LAST_OPTIONAL_MARKER).contains(&(c as u32))
+}
+
+/// Replace each ` | None` the preprocessor substituted for a `?` with
+/// `marker`. `optionals` carries the exact `(line, byte column)` of every
+/// substitution in `python_source`, which is still the buffer they were
+/// recorded against, so the columns are valid here (and only here: every
+/// later pass may move them). Returns `None` when a recorded position does
+/// not hold the rewrite — the caller refuses to format rather than restore
+/// the wrong text.
+fn mark_optionals(
+    python_source: &str,
+    optionals: &[StrippedOptional],
+    marker: char,
+) -> Option<String> {
+    if optionals.is_empty() {
+        return Some(python_source.to_owned());
+    }
+    let mut per_line: std::collections::BTreeMap<usize, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for opt in optionals {
+        per_line
+            .entry(opt.line_index)
+            .or_default()
+            .push(opt.python_col);
+    }
+    let mut out = String::with_capacity(python_source.len());
+    for (idx, line) in python_source.split_inclusive('\n').enumerate() {
+        let Some(cols) = per_line.remove(&idx) else {
+            out.push_str(line);
+            continue;
+        };
+        let mut line = line.to_owned();
+        let mut cols = cols;
+        // Right to left, so an earlier column is not moved by a later edit.
+        cols.sort_unstable_by(|a, b| b.cmp(a));
+        cols.dedup();
+        for col in cols {
+            if !line
+                .get(col..)
+                .is_some_and(|tail| tail.starts_with(OPTIONAL_REWRITE))
+            {
+                return None;
+            }
+            let mut buf = [0u8; 4];
+            line.replace_range(
+                col..col + OPTIONAL_REWRITE.len(),
+                marker.encode_utf8(&mut buf),
+            );
+        }
+        out.push_str(&line);
+    }
+    // Every recorded line must exist.
+    per_line.is_empty().then_some(out)
 }
 
 /// Marker prefix the preprocessor uses for the synthesised stub class of
@@ -357,6 +514,87 @@ fn restore_impl_extend_headers_verbatim(
     out
 }
 
+/// Apply `edit` to the lines of `output` whose 0-based index is a key of
+/// `targets`, keeping every line terminator. `edit` returns `None` to keep
+/// the line as it is.
+fn edit_lines<T>(
+    output: &str,
+    targets: &std::collections::HashMap<usize, T>,
+    edit: impl Fn(&str, &T) -> Option<String>,
+) -> String {
+    if targets.is_empty() {
+        return output.to_owned();
+    }
+    let mut out = String::with_capacity(output.len());
+    for (i, line) in output.split_inclusive('\n').enumerate() {
+        let content = line.trim_end_matches(['\n', '\r']);
+        let term = &line[content.len()..];
+        match targets.get(&i).and_then(|t| edit(content, t)) {
+            Some(edited) => out.push_str(&edited),
+            None => out.push_str(content),
+        }
+        out.push_str(term);
+    }
+    out
+}
+
+/// Put back the user's text for every one-line `enum NAME: A; B` header.
+/// The preprocessor turns each bare member on the header line into
+/// `A = enum.auto()`, and `postprocess_full` restores only the `enum`
+/// keyword. A member the user wrote as `A = enum.auto()` is
+/// indistinguishable from a generated one, so the original line (tidied
+/// like every other line) is spliced back rather than the members edited.
+fn restore_enum_one_liners(
+    output: &str,
+    stripped: &[StrippedKeyword],
+    original_lines: &[&str],
+    translate: &impl Fn(usize) -> usize,
+) -> String {
+    use tyc_syntax::lexer::TyphonKeyword;
+
+    let targets: std::collections::HashMap<usize, String> = stripped
+        .iter()
+        .filter(|s| matches!(s.keyword, TyphonKeyword::Enum))
+        .filter_map(|s| {
+            let orig = original_lines.get(s.line_index)?;
+            orig.trim_start()
+                .starts_with("enum ")
+                .then(|| (translate(s.line_index), tidy_header_line(orig)))
+        })
+        .collect();
+    edit_lines(output, &targets, |line, original| {
+        let rest = line.trim_start();
+        (rest.starts_with("enum ") && rest.contains("= enum.auto()")).then(|| original.clone())
+    })
+}
+
+/// Remove the `: ...` the preprocessor appended to each declaration-only
+/// `def … -> T` line. The appended text sits right after the signature,
+/// before any comment, so it is the first `: ...` that is followed only by
+/// whitespace or a comment — a `: ...` inside a default string is not.
+fn strip_appended_ellipses(
+    output: &str,
+    bodiless_def_lines: &[usize],
+    translate: &impl Fn(usize) -> usize,
+) -> String {
+    let targets: std::collections::HashMap<usize, ()> = bodiless_def_lines
+        .iter()
+        .map(|&l| (translate(l), ()))
+        .collect();
+    edit_lines(output, &targets, |line, ()| {
+        let rest = line.trim_start();
+        if !(rest.starts_with("def ") || rest.starts_with("async def ")) {
+            return None;
+        }
+        line.match_indices(": ...").find_map(|(at, m)| {
+            let after = &line[at + m.len()..];
+            let tail = after.trim_start();
+            (tail.is_empty() || tail.starts_with('#'))
+                .then(|| format!("{}{}", &line[..at], after.trim_end()))
+        })
+    })
+}
+
 /// Whether `line` (already stripped of its terminator) reads as a
 /// restored `impl`/`extend` header at any indentation. Accepts both the
 /// surface keywords and a residual lowered `class __typhon_impl_…` /
@@ -422,7 +660,14 @@ fn normalise_whitespace_with_map(source: &str) -> (String, Vec<usize>) {
     // record which output line index this input line landed on.
     let mut line_map: Vec<usize> = Vec::new();
     let mut consecutive_blank = 0u32;
-    let mut in_triple: Option<char> = None;
+    // One lexical mask for the whole buffer — the same scanner every
+    // preprocessor pass uses — so "does this line start (or end) inside a
+    // string literal?" has one answer. This pass used to keep its own
+    // triple-quote tracker, which (a) cleared its state on a line like
+    // `y""" + """p` without noticing the new literal it opens, and (b) knew
+    // nothing of a backslash-continued single-quoted string; both let the
+    // spacing rules rewrite the contents of a literal in the user's file.
+    let mask = tyc_syntax::lexmask::LexMask::new(source);
     // Track whether any real (non-blank, non-shebang, non-comment) line
     // has been emitted yet so the "two blank lines before top-level
     // def/class" rule doesn't fire at the file head. PEP 8.
@@ -437,12 +682,13 @@ fn normalise_whitespace_with_map(source: &str) -> (String, Vec<usize>) {
     // Tracks `(` nesting across lines so multi-line calls keep their
     // kwargs tight (`a=3,` on a continuation line stays `a=3,`, not
     // `a = 3,`). Bracket / brace depth stays line-local because
-    // triple-quoted spans get verbatim treatment and `[ ]` slices
+    // string-content lines get verbatim treatment and `[ ]` slices
     // don't realistically straddle newlines in idiomatic Python.
     let mut paren_depth_carry: i32 = 0;
-    for raw_line in source.lines() {
-        // Is this line *string content* — i.e. inside a triple-quoted literal
-        // that opened on an earlier line?
+    for (line_index, raw_line) in source.lines().enumerate() {
+        // Is this line *string content* — i.e. does it begin inside a
+        // literal that opened on an earlier line (a triple-quoted string, or
+        // a single-quoted one continued with a backslash)?
         //
         // If so it gets no normalisation whatsoever. This used to "keep raw,
         // but still strip trailing spaces and expand the leading tabs so
@@ -452,45 +698,29 @@ fn normalise_whitespace_with_map(source: &str) -> (String, Vec<usize>) {
         // out of `tyc fmt` with different contents — in the user's own source
         // file, in place — and out of `tyc build` with a different constant
         // than the VM had.
-        let starts_inside_triple = in_triple.is_some();
-        let (line_owned, exited_triple) = if let Some(q) = in_triple {
-            let exited = line_closes_triple_quote(raw_line, q);
-            (raw_line.to_owned(), exited)
-        } else {
-            // The line that *opens* a triple quote carries string content
-            // after the delimiter, so its trailing whitespace is data too.
-            let opens_triple = detect_triple_quote_open(raw_line).is_some();
-            let trimmed = if opens_triple {
-                raw_line
-            } else {
-                raw_line.trim_end()
-            };
-            let (rewritten, new_depth) =
-                apply_simple_style_rules_with_paren_depth(trimmed, paren_depth_carry);
-            paren_depth_carry = new_depth.max(0);
-            (rewritten, false)
-        };
-
-        if starts_inside_triple {
+        if mask.line_starts_in_string(line_index) {
             // Verbatim, and short-circuit every rule below: blank-line
             // collapsing would eat blank lines out of a docstring, and the
             // tab expansion at the tail would rewrite its indentation.
             line_map.push(out_line);
-            result.push_str(&line_owned);
+            result.push_str(raw_line);
             result.push('\n');
             out_line += 1;
             consecutive_blank = 0;
-            if exited_triple {
-                in_triple = None;
-            }
             continue;
         }
-
-        if in_triple.is_none() && !exited_triple {
-            in_triple = detect_triple_quote_open(&line_owned);
-        } else if exited_triple {
-            in_triple = None;
-        }
+        // A line that ends inside a literal (it opens a triple-quoted string,
+        // or continues a single-quoted one with a backslash) carries string
+        // content up to its end, so its trailing whitespace is data too.
+        let ends_in_string = mask.line_starts_in_string(line_index + 1);
+        let trimmed = if ends_in_string {
+            raw_line
+        } else {
+            raw_line.trim_end()
+        };
+        let (line_owned, new_depth) =
+            apply_simple_style_rules_with_paren_depth(trimmed, paren_depth_carry);
+        paren_depth_carry = new_depth.max(0);
 
         let line = line_owned.as_str();
         let indent_end = line
@@ -530,10 +760,9 @@ fn normalise_whitespace_with_map(source: &str) -> (String, Vec<usize>) {
         //     `@cached_property\ndef f(...)` and `@a\n@b\ndef f(...)`
         //     must stay glued (otherwise the formatter splits the
         //     decorator from its target). PR #96 P1.
-        let is_top_level_decorator =
-            leading.is_empty() && in_triple.is_none() && rest.starts_with('@');
+        let is_top_level_decorator = leading.is_empty() && !ends_in_string && rest.starts_with('@');
         let is_top_level_def_or_class = leading.is_empty()
-            && in_triple.is_none()
+            && !ends_in_string
             && (rest.starts_with("def ")
                 || rest.starts_with("class ")
                 || rest.starts_with("async def "));
@@ -1045,6 +1274,7 @@ fn is_binary_operand_lhs(prev: Option<char>) -> bool {
         prev,
         Some(c)
             if c.is_ascii_alphanumeric() || c == '_' || c == ')' || c == ']'
+                || is_optional_marker(c)
     )
 }
 
@@ -1142,74 +1372,6 @@ fn is_scientific_exponent_sign(out: &str, next: Option<char>) -> bool {
         }
     }
     true
-}
-
-/// Returns the quote character that opens an *unterminated* triple-quoted
-/// string starting on this line, if any.  When a triple-quoted string is
-/// opened *and* closed on the same line we treat it as fully balanced and
-/// return `None`.
-///
-/// Scanned character-by-character with awareness of regular single- and
-/// double-quoted regions, so a sequence like `x = "'''"` (which contains
-/// `'''` inside a normal string) does not falsely look like a
-/// triple-quote opener.
-fn detect_triple_quote_open(line: &str) -> Option<char> {
-    let mut counts = [0u32, 0u32]; // [single, double]
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    let mut inside: Option<u8> = None;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if let Some(q) = inside {
-            // Inside a regular (non-triple) string. Skip escapes.
-            if b == b'\\' && i + 1 < bytes.len() {
-                i += 2;
-                continue;
-            }
-            if b == q {
-                inside = None;
-            }
-            i += 1;
-            continue;
-        }
-        if (b == b'"' || b == b'\'')
-            && i + 2 < bytes.len()
-            && bytes[i + 1] == b
-            && bytes[i + 2] == b
-        {
-            let idx = if b == b'\'' { 0 } else { 1 };
-            counts[idx] += 1;
-            i += 3;
-            continue;
-        }
-        if b == b'"' || b == b'\'' {
-            inside = Some(b);
-            i += 1;
-            continue;
-        }
-        if b == b'#' {
-            // Comment end — anything past `#` (outside a string) is text.
-            break;
-        }
-        i += 1;
-    }
-    if !counts[0].is_multiple_of(2) {
-        return Some('\'');
-    }
-    if !counts[1].is_multiple_of(2) {
-        return Some('"');
-    }
-    None
-}
-
-/// Whether the remainder of a multi-line triple-quoted string is closed
-/// on this `line` by the matching `q` triple.  The check is intentionally
-/// loose (string match) because once we are *inside* a triple-quoted
-/// region, regular-quote string syntax does not apply — the only way out
-/// is the matching triple.
-fn line_closes_triple_quote(line: &str, q: char) -> bool {
-    let triple: String = std::iter::repeat_n(q, 3).collect();
-    line.contains(&triple)
 }
 
 /// Heuristic check for Typhon-only tokens that the stock `ruff` binary
@@ -1775,11 +1937,17 @@ def run() -> Result[int, str]:
     }
 
     #[test]
-    fn detect_triple_quote_open_ignores_triples_inside_regular_strings() {
-        assert_eq!(detect_triple_quote_open("x = \"'''\""), None);
-        assert_eq!(detect_triple_quote_open("x = '\"\"\"'"), None);
-        // But a real triple-quote opener still produces Some.
-        assert_eq!(detect_triple_quote_open("x = \"\"\"hi"), Some('"'));
+    fn triple_quote_shapes_inside_regular_strings_open_nothing() {
+        // A `'''` / `"""` run inside a regular string is text, not an
+        // opener: the following lines are still code and get normalised.
+        for src in ["x = \"'''\"\ny=1\n", "x = '\"\"\"'\ny=1\n"] {
+            let (out, _) = normalise_whitespace_with_map(src);
+            assert!(out.ends_with("\ny = 1\n"), "got {out:?}");
+        }
+        // But a real triple-quote opener still makes the next line string
+        // content.
+        let (out, _) = normalise_whitespace_with_map("x = \"\"\"hi\ny=1\n\"\"\"\n");
+        assert!(out.contains("\ny=1\n"), "got {out:?}");
     }
 
     /// Serialises every test that mutates `TYC_FMT_DISABLE_RUFF`. Rust
@@ -2539,5 +2707,219 @@ def run() -> Result[int, str]:
                 None => std::env::remove_var("TYC_FMT_DISABLE_RUFF"),
             }
         }
+    }
+
+    /// Run `f` with the external `ruff format` pass disabled, restoring the
+    /// previous value of `TYC_FMT_DISABLE_RUFF` afterwards.
+    fn without_ruff<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = lock_env();
+        let prior = std::env::var_os("TYC_FMT_DISABLE_RUFF");
+        // SAFETY: serialised by `lock_env`; restored before returning.
+        unsafe {
+            std::env::set_var("TYC_FMT_DISABLE_RUFF", "1");
+        }
+        let out = f();
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TYC_FMT_DISABLE_RUFF", v),
+                None => std::env::remove_var("TYC_FMT_DISABLE_RUFF"),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn triple_quote_closing_and_opening_on_one_line_keeps_the_second_string_verbatim() {
+        // W7-02: `line_closes_triple_quote` cleared the in-string state on
+        // `y""" + """p` without noticing a new literal opened on the same
+        // line, so the second string's contents got comma / `#` spacing and
+        // PEP 8 blank lines were inserted before a `def` inside it.
+        let src = concat!(
+            "a: str = \"\"\"x\n",
+            "y\"\"\" + \"\"\"p\n",
+            "q,r  s\n",
+            "#hash\n",
+            "def inner():\n",
+            "    pass\"\"\"\n",
+            "print(a)\n",
+        );
+        let (out, _) = normalise_whitespace_with_map(src);
+        assert_eq!(out, src, "string contents must survive verbatim");
+        let formatted = without_ruff(|| format_source(src, "<test>").unwrap().output);
+        assert_eq!(formatted, src);
+    }
+
+    #[test]
+    fn backslash_continued_string_contents_are_never_reformatted() {
+        // W7-02: the shared lexmask reset a single-quoted string at end of
+        // line, so the continuation of `"a,b\` + newline was read as code
+        // and came back as `c, d e# f"`.
+        for src in [
+            "b: str = \"a,b\\\n    c,d  e#f\"\nprint(b)\n",
+            "b: str = 'x:1\\\n=2,3  #'\nprint(b)\n",
+        ] {
+            let (out, _) = normalise_whitespace_with_map(src);
+            assert_eq!(out, src, "string contents must survive verbatim");
+            let formatted = without_ruff(|| format_source(src, "<test>").unwrap().output);
+            assert_eq!(formatted, src);
+        }
+        // Code after the continued string closes is still formatted.
+        let (out, _) = normalise_whitespace_with_map("b = \"a\\\nb\"\nc=f(1,2)\n");
+        assert_eq!(out, "b = \"a\\\nb\"\nc = f(1, 2)\n");
+    }
+
+    #[test]
+    fn self_check_refuses_output_that_changes_the_program() {
+        // W7-03: the structural guard. Lower the original, then judge a
+        // candidate output against it.
+        let src =
+            "def h(r: Result[int, str]) -> Result[int, str]:\n    let z:int=r?\n    return Ok(z)\n";
+        let lowered = preprocess(&expand_sugar(src, true)).python_source;
+        // A faithful respacing passes.
+        let good = "def h(r: Result[int, str]) -> Result[int, str]:\n    let z: int = r?\n    return Ok(z)\n";
+        assert!(verify_same_program(&lowered, good, false, "t.ty").is_ok());
+        // The W7-01 corruption (`r?` → `r | None`) is refused.
+        let bad = "def h(r: Result[int, str]) -> Result[int, str]:\n    let z: int = r | None\n    return Ok(z)\n";
+        let err = verify_same_program(&lowered, bad, false, "t.ty").unwrap_err();
+        assert!(err.to_string().contains("refusing to format"), "{err}");
+        // A string-content change (the W7-02 corruption) is refused.
+        let s_lowered = preprocess(&expand_sugar("b: str = \"c,d  e#f\"\n", true)).python_source;
+        assert!(
+            verify_same_program(&s_lowered, "b: str = \"c, d e# f\"\n", false, "t.ty").is_err()
+        );
+        // Output that no longer parses is refused.
+        assert!(verify_same_program(&lowered, "def h(:\n", false, "t.ty").is_err());
+        // `let` → `mut` is a different program.
+        let m_lowered = preprocess(&expand_sugar("let x: int = 1\n", true)).python_source;
+        assert!(verify_same_program(&m_lowered, "mut x: int = 1\n", false, "t.ty").is_err());
+    }
+
+    #[test]
+    fn self_check_tolerates_ruff_docstring_reindent_only_when_ruff_ran() {
+        let src = "def f() -> None:\n    \"\"\"Doc.\n\n        more   \n    \"\"\"\n";
+        let lowered = preprocess(&expand_sugar(src, true)).python_source;
+        let reindented = "def f() -> None:\n    \"\"\"Doc.\n\n    more\n    \"\"\"\n";
+        assert!(verify_same_program(&lowered, reindented, true, "t.ty").is_ok());
+        assert!(verify_same_program(&lowered, reindented, false, "t.ty").is_err());
+    }
+
+    #[test]
+    fn format_source_self_check_passes_on_the_sugar_corpus_shapes() {
+        // Every Typhon form the formatter round-trips must survive its own
+        // guard (a false refusal would make `tyc fmt` unusable).
+        let src = concat!(
+            "from typing import Protocol\n",
+            "lazy import js = json\n",
+            "pub let VERSION: str = \"1\"\n",
+            "freeze let CFG = {\"a\": [1,2]}\n",
+            "newtype UserId = int\n",
+            "enum Color: RED; GREEN\n",
+            "interface Shape:\n    def area(self) -> float\n",
+            "class P frozen:\n    x: float\n",
+            "plain class Bag:\n    items: list[str]\n",
+            "model Api:\n    id: int\n",
+            "impl P:\n    def norm(self) -> float:\n        return self.x\n",
+            "def g(x:int) -> Result[int, str]:\n    return Ok(x)\n",
+            "def h(a:int,b:str?=None) -> Result[int, str]:\n",
+            "    let r:int=g(a)?\n",
+            "    let s: str = b if b is not None else \"\"\n",
+            "    let t = r |> str()\n",
+            "    unsafe:\n        let u = js.loads(\"1\")\n",
+            "    return Ok(r + len(s) + len(t))\n",
+        );
+        let out = without_ruff(|| format_source(src, "<test>").map_err(|e| e.to_string()));
+        assert!(
+            out.is_ok(),
+            "self-check refused a faithful format: {:?}",
+            out.err()
+        );
+    }
+
+    #[test]
+    fn format_keeps_postfix_question_when_spacing_shifts_its_column() {
+        // W7-01: the preprocessor rewrites every `?` to ` | None` and records
+        // the column; the spacing pass then moved that column (`z:int=r` →
+        // `z: int = r`) and the column-keyed restore silently skipped, so
+        // the user's file came back with `r | None` where `r?` was.
+        let src = concat!(
+            "def h(x:int) -> Result[int, str]:\n",
+            "    let r: Result[int, str] = g(x)\n",
+            "    let z:int=r?\n",
+            "    print(x,r?)\n",
+            "    let o:int?=None\n",
+            "    return Ok(z)\n",
+        );
+        let out = without_ruff(|| format_source(src, "<test>").unwrap().output);
+        assert!(out.contains("    let z: int = r?\n"), "got:\n{out}");
+        assert!(out.contains("    print(x, r?)\n"), "got:\n{out}");
+        assert!(out.contains("    let o: int? = None\n"), "got:\n{out}");
+        assert!(!out.contains("| None"), "`?` leaked as `| None`:\n{out}");
+    }
+
+    #[test]
+    fn format_handles_nullable_of_a_non_ascii_class() {
+        // W7-01: the shifted column landed inside `Ü` and the restore indexed
+        // the line with it — a "not a char boundary" panic (exit 101).
+        let src = "class Üü:\n    v: int\n\ndef f(a:int,b:Üü?) -> int:\n    return a\n";
+        let out = without_ruff(|| format_source(src, "<test>").unwrap().output);
+        assert!(
+            out.contains("def f(a: int, b: Üü?) -> int:\n"),
+            "got:\n{out}"
+        );
+        assert!(!out.contains("| None"), "`?` leaked as `| None`:\n{out}");
+    }
+
+    #[test]
+    fn format_question_marks_survive_a_marker_char_in_a_string() {
+        // The stand-in character must not collide with one the user wrote.
+        let src = "let s: str = \"\u{E001}\"\nlet n:int?=None\n";
+        let out = without_ruff(|| format_source(src, "<test>").unwrap().output);
+        assert_eq!(out, "let s: str = \"\u{E001}\"\nlet n: int? = None\n");
+    }
+
+    #[test]
+    fn crlf_file_with_a_multiline_string_formats_without_changing_the_program() {
+        // W7-08: fmt writes `\n`; the CRLF original lowered with `\r` inside
+        // the literal, so the W7-03 self-check refused the file. Both sides
+        // now read `\r\n` as `\n`, as Python does.
+        let src = "let s:str = \"\"\"a\r\nb\"\"\"\r\nprint(repr(s))\r\n";
+        let out = without_ruff(|| {
+            format_source(src, "<test>")
+                .map(|r| r.output)
+                .map_err(|e| e.to_string())
+        })
+        .expect("a CRLF file formats");
+        assert_eq!(out, "let s: str = \"\"\"a\nb\"\"\"\nprint(repr(s))\n");
+    }
+
+    fn fmt_without_ruff(src: &str) -> String {
+        without_ruff(|| {
+            format_source(src, "<test>")
+                .map(|r| r.output)
+                .map_err(|e| e.to_string())
+        })
+        .expect("formats")
+    }
+
+    #[test]
+    fn enum_one_liner_keeps_its_bare_members() {
+        // W7-12: the header came back as `enum Small: A = enum.auto(); …`.
+        let src = "enum Small: A; B\n\n\nenum Mixed: X = enum.auto(); Y  # note\n\n\nprint(Small.A, Mixed.Y)\n";
+        assert_eq!(fmt_without_ruff(src), src);
+        assert_eq!(fmt_without_ruff(&fmt_without_ruff(src)), src);
+    }
+
+    #[test]
+    fn declaration_only_defs_do_not_gain_an_ellipsis() {
+        // W7-12: the `: ...` the preprocessor appends for the Python parser
+        // leaked into the formatted file. A `: ...` the user wrote stays.
+        let src = concat!(
+            "interface Shape:\n",
+            "    def area(self) -> float\n",
+            "    def name(self, sep: str = \": ...\") -> str # the name\n",
+            "    async def load(self) -> int\n",
+            "    def done(self) -> bool: ...\n",
+        );
+        assert_eq!(fmt_without_ruff(src), src);
     }
 }

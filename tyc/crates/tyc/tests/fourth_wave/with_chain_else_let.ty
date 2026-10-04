@@ -1,0 +1,47 @@
+def parse_int(s: str) -> Result[int, str]:
+    if s.isdigit():
+        return Ok(int(s))
+    return Err(f"bad int: {s}")
+
+def parse_code(s: str) -> Result[float, int]:
+    if s.isdigit():
+        return Ok(float(s))
+    return Err(len(s))
+
+def total(a: str, b: str, c: str) -> int:
+    with x = parse_int(a)?,
+         y = parse_int(b)?,
+         z = parse_int(c)?:
+        let banner: str = """sum
+  of three"""
+        print(banner.splitlines())
+        return x + y + z
+    else err:
+        let msg: str = f"failed: {err}"
+        print(msg)
+        return -1
+
+def mixed(a: str, b: str) -> str:
+    with n = parse_int(a)?, f = parse_code(b)?:
+        return f"{n} {f}"
+    else problem:
+        let text: str = str(problem)
+        return "mixed failure " + text
+
+def falls_through(a: str, b: str) -> str:
+    mut note: str = "start"
+    with x = parse_int(a)?, y = parse_int(b)?:
+        note = f"ok {x + y}"
+    else err:
+        let why: str = err
+        note = f"recovered from {why}"
+    return note
+
+print(total("1", "2", "3"))
+print(total("1", "x", "3"))
+print(total("1", "2", "zz"))
+print(mixed("4", "5"))
+print(mixed("q", "5"))
+print(mixed("4", "abc"))
+print(falls_through("1", "2"))
+print(falls_through("1", "nope"))

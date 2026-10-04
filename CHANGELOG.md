@@ -80,6 +80,167 @@ beta.1 behaviour, generates working GitHub edit links, and builds without
 unknown-code-language warnings. The symlink-escape regression test now asserts
 stable diagnostic fragments rather than terminal-width-dependent wrapping.
 
+### Fourth wave — 2026-10-03 reviews
+
+#### W7 — preprocessor, fmt, lowering
+
+- **`tyc fmt` no longer rewrites `?` into `| None`, and no longer panics on
+  a nullable non-ASCII type (W7-01).** The `?` restore was keyed by byte
+  column, and the spacing pass moved the column (`let z:int=r?` came back as
+  `let z: int = r | None`, `print(x,r?)` as `print(x, r | None)`); when the
+  moved column fell inside a multi-byte character (`b:Üü?`) the restore
+  panicked. The formatter now carries a marker character through the edits
+  instead of a column, and `postprocess_full` never indexes a line at an
+  unchecked offset.
+- **`tyc fmt` no longer rewrites the contents of string literals, and a
+  backslash-continued string no longer breaks `check`/`build` (W7-02).** Two
+  scanners lost track of strings across lines. The formatter's own
+  triple-quote tracker cleared its state on `y""" + """p` without noticing
+  the second literal open, so that literal got comma / `#` spacing and blank
+  lines before a `def` inside it. The shared lexical mask reset a single-
+  quoted string at end of line even when the line break was escaped
+  (`"a,b\` + newline), so the continuation was read as code: fmt respaced it
+  (`c,d  e#f"` → `c, d e# f"`), and a `?`, `as!` or `rescue` inside it was
+  lowered as sugar (`tyc::parse` on valid code, or a spurious
+  module-level-rescue error). The mask now carries a backslash-continued
+  string onto the next line, and the formatter uses the mask instead of its
+  own tracker. The same fix stops `tyc build` with `[emit] format = true`
+  from trimming trailing spaces inside a string the emitter prints as a
+  triple-quoted literal (`"\n a \n".splitlines()` printed `['', ' a']` on
+  CPython and `['', ' a ']` on the VM).
+- **`tyc fmt` checks its own output before writing (W7-03).** The formatter
+  lowers its output exactly as it lowered the input, parses both, and
+  refuses to write — leaving the file untouched and reporting a formatter
+  bug — unless the two module ASTs are equal (positions, comments and the
+  line-numbered `__typhon_*` temporaries aside; docstring whitespace is
+  tolerated only when `ruff format` ran). The same guard covers the
+  `[emit] format = true` pass over emitted Python in `tyc build`.
+- **Inline `?` keeps Python's evaluation order (W7-04).** The lift that
+  lowers an inline `?` moved its operand above the whole statement, ahead of
+  everything Python evaluates before it — on both execution surfaces, so the
+  differential gate could not see it. `return Ok(Node(start=self.pos,
+  text=self.word()?))` recorded `start` *after* `word()` advanced it;
+  `combine(first(), second()?)` ran `second` first and skipped `first`
+  entirely when `second` returned `Err`; `[side("a"), counter("b")?,
+  side("c")]` ran b, a, c; `d[k()?] = v()?` evaluated the index before the
+  value. A new step hoists, in evaluation order, every expression the
+  statement evaluates before a propagated operand into a `__typhon_ev_N__`
+  temporary — earlier arguments and keyword arguments, earlier display
+  elements, left operands, a computed call receiver (`self.peek().m(…)`),
+  and an assignment's value ahead of a target that holds a `?`. Literals,
+  names, lambdas and dotted-name receivers stay in place; a statement whose
+  operand sits under `and`/`or`, a ternary, a lambda, a comprehension or an
+  f-string is left as before. Two residual differences need a callee that
+  rebinds the exact name or attribute being read: a plain-name or
+  dotted-name receiver is read after the operand, and an augmented
+  assignment (`self.pos += self.advance()?`) loads its target after it.
+- **`gather` works as an ordinary name (W7-05).** A line starting with
+  `gather:` was taken as the `gather:` block form wherever it appeared, so
+  a class attribute `gather: bool = False` became `async with
+  asyncio.TaskGroup()` inside the class body (`SyntaxError` on CPython,
+  `NameError` on the VM), a module-level `gather: int = 3` reported a bogus
+  `tyc::unknown_name`, and a wrapped parameter `gather: bool = False,` was a
+  `tyc::parse` error. The header is now recognised only at the start of a
+  statement, and the one-line form only inside an `async def` body — the one
+  place either form can lower.
+- **An `impl` method can use a name defined after its class (W7-06).**
+  Merging `impl Greeter:` into `class Greeter` evaluated each method's
+  decorators and parameter defaults where the class is, so `def greet(self,
+  word: str = DEFAULT_GREETING)` with `let DEFAULT_GREETING` between the class
+  and the block — or a decorator defined between a sealed-union alias and its
+  `impl` — raised `NameError` on import, on both surfaces. Such a method is
+  now defined at its `impl` block and attached there (`Greeter.greet =
+  __typhon_extend_Greeter__greet`, the cross-module `extend` lowering);
+  every other method keeps the merged class body exactly as before. A method
+  moves only when the hoisted form raised `NameError` and an attribute
+  assignment reproduces the class-body behaviour, so dunders, private
+  (`__x`) names, `cached_property`/`abstractmethod`, and — until `tyc run`
+  dispatches class-attribute functions like CPython — `@property`,
+  `@classmethod`, methods a base may also define, and methods of a class
+  subclassed before the block or overridden by a subclass keep the old
+  placement. The attached method's
+  bare `super()` is spelled out, which also fixes `super()` in a
+  cross-module `extend` method.
+- **A field defaulting to a named list, dict or set no longer fails at
+  class creation (W7-07).** `let BASE: list[int] = [1]` then `class Box:
+  items: list[int] = BASE` passed `tyc check` and raised `ValueError:
+  mutable default … use default_factory` on import, on both surfaces. A
+  plain or dotted name default whose value is evidently a `list` / `dict` /
+  `set` — by the field's annotation, or by the module-level binding of the
+  name — now lowers to `dataclasses.field(default_factory=lambda:
+  list(BASE))` (or `dict` / `set`): each instance gets its own shallow
+  copy, the same fresh-value-per-instance the literal defaults already get.
+- **CRLF files: multi-line strings hold `\n`, as in Python (W7-08).** In a
+  file with `\r\n` line endings, `"""a` / `b"""` evaluated to `'a\r\nb'` on
+  both surfaces (CPython reads `'a\nb'`), and `tyc fmt`, which writes `\n`,
+  changed what the program printed — since W7-03 it refused such files
+  instead. The shared source normalisation (BOM, final newline) now also
+  reads `\r\n` as `\n`; line numbers and columns are unchanged, so
+  diagnostics and source maps point where they did.
+- **A with-chain `else` block may declare names (W7-10).** With two or more
+  bindings, `with x = f()?, y = g()?: … else err: let msg = …` was rejected
+  with a false `tyc::no_block_shadow` (whose "first declared here" label
+  then failed to render): the lowering put a copy of the `else` block under
+  each binding's guard, one after another, so `msg` was declared once per
+  binding. When the `else` block declares a name, the guards are now nested
+  `if` / `else`, so the copies sit in mutually exclusive branches — the
+  ordinary sibling-branch case — each with its own binding's error type,
+  and an `else` block that does not return continues after the chain
+  instead of crashing on `.value`. Other chains are lowered exactly as
+  before. A single shared copy, as the review proposed, would need the
+  checker to type `err` as the union of the bindings' error types and to
+  see the gate after it as exhaustive; without that it rejected valid
+  programs (`tyc::missing_return`, or a re-assignment error when two
+  bindings' `Result` types differ).
+- **Metaclasses and `plain class` subclasses emit as written (W7-11).**
+  `class Meta(type):` (and any subclass of it, or of `ABCMeta` / `EnumMeta`
+  / `EnumType`) no longer gets `@dataclass(slots=True)`, whose generated
+  `__init__` replaced `type.__init__` and raised `TypeError` the first time
+  a class used the metaclass. A `plain class` subclass no longer receives
+  copies of its parent's annotated attributes (that copy exists to feed a
+  dataclass constructor, which a `plain class` does not have), so
+  `Cfg.debug = True` now reaches a subclass that never declared `debug`; a
+  subclass that declares its own keeps it. Both were wrong on CPython; the
+  VM still ignores `metaclass=` and snapshots a base's class attributes
+  when a subclass is created, so it does not yet print the CPython result
+  for either program.
+- **`|>` works in every expression position, with one precedence (W7-09).**
+  The pipe keeps the precedence it always had at statement level — it binds
+  looser than every other expression operator, so its left operand is the
+  whole expression to its left (`not 0 |> add(0)` is `add(not 0, 0)`,
+  `1 < 2 |> f()` is `f(1 < 2)`) and its right operand must be a call or a
+  callable name — and that rule now applies in every expression slot. A
+  slot ends at a bracket, a top-level comma, a dict / slice / lambda `:`, a
+  keyword-argument or default `=`, a comprehension's `for` / `in` / `if`,
+  a statement's `return` / assignment prefix or `if` / `elif` / `while` /
+  `for … in` / `assert` header, and an f-string field's `!` / `:` / `=`.
+  Pipes in list, set and dict displays, comprehensions, subscripts, slices,
+  f-string fields and those headers were a `tyc::parse` error; a pipe after
+  a comma in parentheses swallowed the earlier arguments (`g(a, b |> f())`
+  lowered to `g(f(a, b))`, now `g(a, f(b))`). To pipe into a comparison,
+  parenthesise: `(x |> f()) > 0`.
+- **Four low-severity preprocessor and `tyc fmt` gaps closed (W7-12).**
+  - A module whose emitted Python opens more than 200 brackets at once
+    (list, set and dict displays, comprehensions, calls, subscripts) is a
+    `tyc::parse` error — "too many nested parentheses", CPython's own
+    compile-time `SyntaxError` for that `.py`. `tyc check` and `tyc run`
+    accepted it and `tyc build` emitted a file CPython refused. Grouping
+    parentheses do not count: the emitter drops them, and such a program
+    still compiles.
+  - `go` and `comptime` used as variable names at the start of a
+    continuation line inside brackets are names: `go + 1` was lowered to a
+    task spawn spliced into the argument list (`tyc::go_outside_async`),
+    and a column-0 `comptime * 3` was taken for a `comptime` declaration.
+  - `tyc fmt` no longer writes the lowering back into the file: a one-line
+    `enum Small: A; B` stays as written (it became
+    `enum Small: A = enum.auto(); B = enum.auto()`), and a declaration-only
+    `def area(self) -> float` keeps no `: ...`. A declaration-only `def`
+    with a trailing comment now parses — the appended `: ...` landed inside
+    the comment (`tyc::parse`).
+  - A propagating `?` in a replacement field on a continuation line of a
+    triple-quoted f-string lifts above the statement like one on a bracket
+    continuation line; it was a `tyc::parse` error.
+
 ### Third wave — the 2026-09-30 release-readiness review
 
 **Seven ways a check-clean program could crash, closed.** Each of these
