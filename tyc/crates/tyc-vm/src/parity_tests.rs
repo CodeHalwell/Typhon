@@ -292,3 +292,179 @@ show(functools.reduce(lambda a, b: a * b, [1, 2, 3, 4]))
 "#,
     );
 }
+
+// ── W5-07: C3 method resolution and class namespaces ──────────────────────
+
+#[test]
+fn w5_07_c3_mro_and_cooperative_super() {
+    assert_matches_cpython(
+        "w5_07_c3_mro_and_cooperative_super",
+        r#"plain class A:
+    def who(self) -> str:
+        return "A"
+plain class B(A):
+    def who(self) -> str:
+        return "B>" + super().who()
+plain class C(A):
+    def who(self) -> str:
+        return "C>" + super().who()
+plain class D(B, C):
+    def who(self) -> str:
+        return "D>" + super().who()
+show(D().who())
+show([k.__name__ for k in D.__mro__])
+show(super(B, D()).who())
+plain class R:
+    def __init__(self) -> None:
+        show("R init")
+plain class L(R):
+    def __init__(self) -> None:
+        show("L init")
+        super().__init__()
+plain class M(R):
+    def __init__(self) -> None:
+        show("M init")
+        super().__init__()
+plain class N(L, M):
+    def __init__(self) -> None:
+        show("N init")
+        super().__init__()
+N()
+plain class X1:
+    pass
+plain class X2(X1):
+    pass
+def bad() -> None:
+    plain class X3(X1, X2):
+        pass
+trap("inconsistent mro", bad)
+plain class H:
+    def f(self) -> str:
+        return "method"
+plain class J(H):
+    f = "attr"
+show(J().f, J.f)
+"#,
+    );
+}
+
+#[test]
+fn w5_07_class_attributes_resolve_through_the_mro_at_read_time() {
+    assert_matches_cpython(
+        "w5_07_class_attributes_resolve_through_the_mro_at_read_time",
+        r#"plain class Base:
+    pass
+plain class Sub(Base):
+    pass
+Base.tag = "late"
+show(Sub.tag, Sub().tag)
+def late_method(self: object) -> str:
+    return "late method"
+Base.lm = late_method
+show(Sub().lm())
+plain class DA:
+    x = 1
+plain class DB(DA):
+    x = 2
+show(DB.x, DB().x)
+del DB.x
+show(DB.x, DB().x)
+DA.x = 10
+show(DB.x)
+trap("del inherited", lambda: delattr(DB, "x"))
+plain class IA:
+    items: list[int] = []
+a1 = IA()
+a2 = IA()
+a1.items.append(1)
+show(a2.items, IA.items)
+a1.items = [9]
+show(a1.items, a2.items)
+plain class SA:
+    label = "sa"
+plain class SB(SA):
+    label = "sb"
+    def get(self) -> str:
+        return super().label
+show(SB().get())
+plain class FC:
+    def m(self) -> str:
+        return "old"
+def helper(self: object, n: int) -> int:
+    return n * 2
+FC.double = helper
+FC.m = lambda self: "new"
+show(FC().double(4), FC().m())
+"#,
+    );
+}
+
+#[test]
+fn w5_07_functions_stored_as_class_attributes() {
+    // classmethod / staticmethod / property called as functions, super()
+    // through classmethods and properties, `__init_subclass__`.
+    assert_matches_cpython(
+        "w5_07_functions_stored_as_class_attributes",
+        r#"def _make(cls: type) -> object:
+    return cls()
+def _get(self: object) -> int:
+    return 42
+def _set(self: object, v: int) -> None:
+    show("set", v)
+def _stat(n: int) -> int:
+    return n + 1
+plain class FA:
+    make = classmethod(_make)
+    val = property(_get, _set)
+    st = staticmethod(_stat)
+show(type(FA.make()).__name__, FA().val, FA.st(1), FA().st(2))
+f = FA()
+f.val = 7
+trap("no deleter", lambda: delattr(f, "val"))
+plain class FB(FA):
+    pass
+show(type(FB.make()).__name__, FB().val, type(FA.val).__name__)
+plain class CA:
+    @classmethod
+    def create(cls) -> str:
+        return "CA:" + cls.__name__
+plain class CB(CA):
+    @classmethod
+    def create(cls) -> str:
+        return "CB>" + super().create()
+show(CB.create(), CB().create())
+plain class PA:
+    @property
+    def name(self) -> str:
+        return "pa"
+plain class PB(PA):
+    @property
+    def name(self) -> str:
+        return "pb+" + super().name
+show(PB().name)
+plain class Del:
+    def __init__(self) -> None:
+        self._v = 1
+    @property
+    def v(self) -> int:
+        return self._v
+    @v.deleter
+    def v(self) -> None:
+        show("deleting")
+        del self._v
+d = Del()
+del d.v
+show(hasattr(d, "_v"))
+plain class Registry:
+    subs: list[str] = []
+    def __init_subclass__(cls, tag: str = "", **kw: object) -> None:
+        super().__init_subclass__(**kw)
+        Registry.subs.append(cls.__name__ + ":" + tag)
+plain class R1(Registry, tag="one"):
+    pass
+plain class R2(R1):
+    pass
+show(Registry.subs)
+"#,
+    );
+}

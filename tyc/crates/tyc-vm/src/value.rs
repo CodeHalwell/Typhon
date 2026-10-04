@@ -1747,9 +1747,13 @@ pub struct Class {
     pub fields: Vec<ClassField>,
     /// Class-level attributes (constants, defaults pulled out of class body).
     pub class_attrs: RefCell<HashMap<String, Value>>,
-    /// Base classes in MRO order (after head). For v1 we only walk the chain
-    /// for method lookup; we don't compute C3 linearisation.
+    /// The direct bases, in declaration order (`__bases__`).
     pub bases: Vec<Rc<Class>>,
+    /// The C3 linearisation of the ancestors (`__mro__` without the class
+    /// itself and without the implicit `object`), computed once when the
+    /// class is created. Every attribute lookup, `super()` and `__mro__`
+    /// walk this order, as CPython does.
+    pub mro: Vec<Rc<Class>>,
     /// Method names decorated with `@property` — accessed without `()` and
     /// invoked lazily on attribute read.
     pub properties: RefCell<std::collections::HashSet<String>>,
@@ -1772,6 +1776,53 @@ pub struct Class {
     /// to a nominal `isinstance`, which can never succeed against a protocol —
     /// making `EXPR as! SomeInterface` impossible under `tyc run`.
     pub is_protocol: bool,
+}
+
+/// C3 linearisation of a class with direct `bases`: the ancestors in method
+/// resolution order, without the class itself. `Err` carries the base names
+/// for CPython's "Cannot create a consistent method resolution order (MRO)"
+/// `TypeError`. The VM's placeholder `object` class sorts last, as the
+/// implicit root does in CPython.
+pub fn linearize(bases: &[Rc<Class>]) -> Result<Vec<Rc<Class>>, String> {
+    let is_object = |c: &Rc<Class>| c.name == "object" && c.bases.is_empty();
+    let mut seqs: Vec<Vec<Rc<Class>>> = bases
+        .iter()
+        .map(|b| {
+            let mut seq = vec![b.clone()];
+            seq.extend(b.mro.iter().cloned());
+            seq
+        })
+        .collect();
+    seqs.push(bases.to_vec());
+    let mut out: Vec<Rc<Class>> = Vec::new();
+    loop {
+        seqs.retain(|s| !s.is_empty());
+        if seqs.is_empty() {
+            break;
+        }
+        // The first head that appears in no other sequence's tail.
+        let candidate = seqs.iter().map(|s| s[0].clone()).find(|head| {
+            !seqs
+                .iter()
+                .any(|s| s[1..].iter().any(|c| Rc::ptr_eq(c, head)))
+        });
+        let Some(next) = candidate else {
+            let names: Vec<String> = bases.iter().map(|b| b.name.clone()).collect();
+            return Err(names.join(", "));
+        };
+        for s in seqs.iter_mut() {
+            if Rc::ptr_eq(&s[0], &next) {
+                s.remove(0);
+            }
+        }
+        out.push(next);
+    }
+    // A placeholder `object` reached through some base belongs at the end.
+    if let Some(pos) = out.iter().position(is_object) {
+        let obj = out.remove(pos);
+        out.push(obj);
+    }
+    Ok(out)
 }
 
 #[derive(Clone)]
@@ -3631,6 +3682,7 @@ mod tests {
                 .collect(),
             class_attrs: RefCell::new(class_attrs),
             bases: vec![],
+            mro: vec![],
             properties: RefCell::new(std::collections::HashSet::new()),
             classmethods: RefCell::new(std::collections::HashSet::new()),
             is_exception: false,

@@ -1378,28 +1378,7 @@ impl Interpreter {
                 // `del obj.attr` removes an instance attribute.
                 Expr::Attribute(a) => {
                     let recv = self.eval_expr(&a.value, env)?;
-                    match recv {
-                        Value::Instance(inst) => {
-                            if let Some(err) =
-                                frozen_dataclass_error(&inst.class, a.attr.as_str(), "delete")
-                            {
-                                return Err(err);
-                            }
-                            if inst
-                                .fields
-                                .borrow_mut()
-                                .shift_remove(a.attr.as_str())
-                                .is_none()
-                            {
-                                return Err(attribute_error(format!(
-                                    "'{}' object has no attribute '{}'",
-                                    inst.class.name,
-                                    a.attr.as_str()
-                                )));
-                            }
-                        }
-                        _ => return Err(type_error("cannot delete attribute on this object")),
-                    }
+                    self.del_attr(&recv, a.attr.as_str())?;
                 }
                 _ => return Err(not_implemented("complex delete targets")),
             }
@@ -1764,19 +1743,22 @@ impl Interpreter {
                     // sentinel class-attr key) rather than overriding the
                     // getter method. Evaluating `prop.setter` directly would
                     // fail (`prop` isn't bound during class-body execution).
-                    let mut setter_target: Option<String> = None;
+                    let mut setter_target: Option<(&str, String)> = None;
                     for deco in f.decorator_list.iter() {
                         if let Expr::Attribute(a) = &deco.expression {
-                            if a.attr.as_str() == "setter" {
-                                if let Expr::Name(prop) = a.value.as_ref() {
-                                    setter_target = Some(prop.id.as_str().to_owned());
-                                }
+                            let role = match a.attr.as_str() {
+                                "setter" => "setter",
+                                "deleter" => "deleter",
+                                _ => continue,
+                            };
+                            if let Expr::Name(prop) = a.value.as_ref() {
+                                setter_target = Some((role, prop.id.as_str().to_owned()));
                             }
                         }
                     }
-                    if let Some(prop) = setter_target {
+                    if let Some((role, prop)) = setter_target {
                         class_attrs.insert(
-                            format!("__typhon_setter__{}", prop),
+                            format!("__typhon_{role}__{prop}"),
                             Value::Function(Rc::new(func)),
                         );
                         continue;
@@ -1892,19 +1874,30 @@ impl Interpreter {
         // Names the subclass defines itself — an inherited descriptor marker
         // (`@property` / `@classmethod`) must NOT carry over to a name the
         // subclass has overridden with a plain method.
-        let own_method_names: std::collections::HashSet<String> = methods.keys().cloned().collect();
+        let own_method_names: std::collections::HashSet<String> = methods
+            .keys()
+            .chain(class_attrs.keys())
+            .cloned()
+            .collect();
 
-        // Inherit methods from base classes that aren't already overridden.
+        // C3 linearisation of the ancestors: every lookup, `super()` and
+        // `__mro__` walk it. Methods and user-visible class attributes are
+        // *not* copied into the subclass — CPython resolves them through the
+        // MRO at read time, so an attribute set on a base after a subclass
+        // was created is visible through it, a subclass's own class
+        // attribute shadows an inherited method, and a diamond resolves
+        // `D(B, C)` as D > B > C > A rather than depth-first.
         for base in &bases {
-            for (name, m) in base.methods.borrow().iter() {
-                methods.entry(name.clone()).or_insert_with(|| m.clone());
-            }
             for (name, v) in base.class_attrs.borrow().iter() {
-                // Don't inherit the internal enum sentinels — a subclass
-                // should not be treated as the enum base marker, and each
-                // enum owns its own member list (materialised after this
-                // class is built).
-                if is_enum_sentinel(name) || is_uninherited_marker(name) {
+                // The VM's internal `__typhon_*` class-kind records are still
+                // inherited by copy (they are written once, at class
+                // creation) — except the enum sentinels (a subclass is not
+                // the enum base marker, and each enum owns its member list)
+                // and the per-level markers each class answers for itself.
+                if !name.starts_with("__typhon_")
+                    || is_enum_sentinel(name)
+                    || is_uninherited_marker(name)
+                {
                     continue;
                 }
                 class_attrs.entry(name.clone()).or_insert_with(|| v.clone());
@@ -2081,12 +2074,20 @@ impl Interpreter {
         {
             class_attrs.insert("_is_runtime_protocol".to_owned(), Value::Bool(true));
         }
+        // After every base is known (a `NamedTuple` gains its template base
+        // above).
+        let mro = crate::value::linearize(&bases).map_err(|names| {
+            type_error(format!(
+                "Cannot create a consistent method resolution order (MRO) for bases {names}"
+            ))
+        })?;
         let class = Rc::new(Class {
             name: c.name.as_str().to_owned(),
             methods: RefCell::new(methods),
             fields,
             class_attrs: RefCell::new(class_attrs),
             bases,
+            mro,
             properties: RefCell::new(properties),
             classmethods: RefCell::new(classmethods),
             is_exception,
@@ -2107,7 +2108,77 @@ impl Interpreter {
             self.materialise_enum_members(&class, c);
         }
 
+        self.finish_class_creation(&class, c, env)?;
         Ok(class)
+    }
+
+    /// The two hooks `type.__new__` runs once a class object exists: every
+    /// class attribute whose type defines `__set_name__` learns its owner and
+    /// name, then the nearest ancestor's `__init_subclass__` (an implicit
+    /// classmethod) is called with the class header's keyword arguments —
+    /// how plugin registries and validating base classes work.
+    fn finish_class_creation(
+        &mut self,
+        class: &Rc<Class>,
+        c: &ast::StmtClassDef,
+        env: &EnvRef,
+    ) -> Result<(), Unwind> {
+        let candidates: Vec<(String, Value)> = class
+            .class_attrs
+            .borrow()
+            .iter()
+            .filter(|(k, v)| !k.starts_with("__typhon_") && matches!(v, Value::Instance(_)))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (name, v) in candidates {
+            if let Value::Instance(d) = &v {
+                if let Some(set_name) = self.find_method(&d.class, "__set_name__") {
+                    self.call_value(
+                        Value::BoundMethod {
+                            receiver: Box::new(v.clone()),
+                            function: set_name,
+                        },
+                        vec![Value::Class(class.clone()), Value::Str(Rc::new(name))],
+                        &[],
+                    )?;
+                }
+            }
+        }
+        let mut kwargs: Vec<(String, Value)> = Vec::new();
+        if let Some(args) = &c.arguments {
+            for kw in args.keywords.iter() {
+                match kw.arg.as_ref().map(|a| a.as_str()) {
+                    Some("metaclass") => {}
+                    Some(name) => kwargs.push((name.to_owned(), self.eval_expr(&kw.value, env)?)),
+                    None => {}
+                }
+            }
+        }
+        let hook = class.mro.iter().find_map(|base| {
+            base.methods
+                .borrow()
+                .get("__init_subclass__")
+                .map(|m| (base.clone(), m.clone()))
+        });
+        match hook {
+            Some((owner, init_subclass)) => {
+                self.call_method_with_frame(
+                    &init_subclass,
+                    owner,
+                    Value::Class(class.clone()),
+                    vec![],
+                    &kwargs,
+                )?;
+            }
+            None if !kwargs.is_empty() => {
+                return Err(type_error(format!(
+                    "{}.__init_subclass__() takes no keyword arguments",
+                    class.name
+                )));
+            }
+            None => {}
+        }
+        Ok(())
     }
 
     fn apply_decorator(
@@ -2561,6 +2632,7 @@ impl Interpreter {
                 fields: vec![],
                 class_attrs: RefCell::new(class_attrs),
                 bases: vec![],
+                mro: vec![],
                 properties: RefCell::new(std::collections::HashSet::new()),
                 classmethods: RefCell::new(std::collections::HashSet::new()),
                 is_exception: false,
@@ -2934,6 +3006,9 @@ impl Interpreter {
             Expr::Compare(c) => self.eval_compare(c, env),
             Expr::Call(c) => self.eval_call(c, env),
             Expr::Attribute(a) => {
+                if let Some(sup) = Self::as_super_call(&a.value) {
+                    return self.eval_super_attr(sup, a.attr.as_str(), env);
+                }
                 let receiver = self.eval_expr(&a.value, env)?;
                 self.get_attr(&receiver, a.attr.as_str())
             }
@@ -4181,7 +4256,7 @@ impl Interpreter {
         }
         if let Value::Class(cls) = target {
             if class_is_protocol(cls) {
-                let names: Vec<String> = cls.methods.borrow().keys().cloned().collect();
+                let names = protocol_members(cls);
                 return names
                     .iter()
                     .all(|m| self.get_attr(value, m.as_str()).is_ok());
@@ -4328,6 +4403,120 @@ impl Interpreter {
         None
     }
 
+    /// The `(class to search above, bound object)` pair a `super(...)` call
+    /// denotes: the in-flight method frame for zero-arg `super()`, or the
+    /// explicit `super(Cls, obj)`.
+    fn super_target(
+        &mut self,
+        sup: &ast::ExprCall,
+        env: &EnvRef,
+    ) -> Result<(Rc<Class>, Value), Unwind> {
+        if sup.arguments.args.is_empty() {
+            return self
+                .method_stack
+                .last()
+                .cloned()
+                .ok_or_else(|| type_error("super(): no arguments and no enclosing method"));
+        }
+        // Any arity but 0 or 2 is a `TypeError` in CPython (`super(A, b, c)`).
+        if sup.arguments.args.len() != 2 {
+            return Err(type_error("super() takes 0 or 2 arguments"));
+        }
+        let cls_v = self.eval_expr(&sup.arguments.args[0], env)?;
+        let obj_v = self.eval_expr(&sup.arguments.args[1], env)?;
+        match cls_v {
+            Value::Class(c) => Ok((c, obj_v)),
+            _ => Err(type_error("super() argument 1 must be a class")),
+        }
+    }
+
+    /// The binding `super(owner, obj).attr` resolves to: the first class
+    /// *after* `owner` in the MRO of `obj`'s type (of `obj` itself when it
+    /// is a class — `super()` inside a classmethod) whose own namespace binds
+    /// `attr`. That is what makes a cooperative diamond run every
+    /// `__init__` once, in C3 order.
+    fn super_lookup(
+        &self,
+        owner: &Rc<Class>,
+        obj: &Value,
+        attr: &str,
+    ) -> Option<(Rc<Class>, ClassMember)> {
+        let ty = match obj {
+            Value::Instance(i) => i.class.clone(),
+            Value::Class(c) => c.clone(),
+            _ => owner.clone(),
+        };
+        let mro: Vec<Rc<Class>> = if class_mro(&ty).any(|c| Rc::ptr_eq(c, owner)) {
+            class_mro(&ty)
+                .skip_while(|c| !Rc::ptr_eq(c, owner))
+                .skip(1)
+                .cloned()
+                .collect()
+        } else {
+            owner.mro.clone()
+        };
+        for c in &mro {
+            if let Some(m) = c.methods.borrow().get(attr) {
+                return Some((c.clone(), ClassMember::Method(m.clone())));
+            }
+            if attr.starts_with("__typhon_") {
+                continue;
+            }
+            if let Some(v) = c.class_attrs.borrow().get(attr) {
+                return Some((c.clone(), ClassMember::Attr(v.clone())));
+            }
+        }
+        None
+    }
+
+    /// `super().attr` read as a value (not called): a bound method, the
+    /// class attribute itself, or a property's value.
+    fn eval_super_attr(
+        &mut self,
+        sup: &ast::ExprCall,
+        attr: &str,
+        env: &EnvRef,
+    ) -> Result<Value, Unwind> {
+        let (owner, self_val) = self.super_target(sup, env)?;
+        let Some((found_in, member)) = self.super_lookup(&owner, &self_val, attr) else {
+            return Err(attribute_error(format!(
+                "'super' object has no attribute '{attr}'"
+            )));
+        };
+        match member {
+            ClassMember::Method(m) | ClassMember::Attr(Value::Function(m)) => {
+                if found_in.properties.borrow().contains(attr)
+                    && matches!(self_val, Value::Instance(_))
+                {
+                    return self.call_method_with_frame(&m, found_in, self_val, vec![], &[]);
+                }
+                if m.is_static {
+                    return Ok(Value::Function(m));
+                }
+                let receiver = if m.is_classmethod || found_in.classmethods.borrow().contains(attr)
+                {
+                    match &self_val {
+                        Value::Instance(i) => Value::Class(i.class.clone()),
+                        other => other.clone(),
+                    }
+                } else {
+                    self_val
+                };
+                Ok(Value::BoundMethod {
+                    receiver: Box::new(receiver),
+                    function: m,
+                })
+            }
+            ClassMember::Attr(v) => {
+                let instance = matches!(self_val, Value::Instance(_)).then(|| self_val.clone());
+                match self.descriptor_get(&v, instance, &found_in)? {
+                    Some(bound) => Ok(bound),
+                    None => Ok(v),
+                }
+            }
+        }
+    }
+
     /// Resolve `super(...).attr(args)`. Supports zero-arg `super()` (uses the
     /// in-flight method frame) and two-arg `super(Cls, self)`.
     fn eval_super_method_call(
@@ -4337,114 +4526,95 @@ impl Interpreter {
         outer: &ast::ExprCall,
         env: &EnvRef,
     ) -> Result<Value, Unwind> {
-        // Determine the class to search *above* and the bound `self`.
-        let (start_class, self_val) = if sup.arguments.args.is_empty() {
-            // Zero-arg: pull from the current method frame.
-            self.method_stack
-                .last()
-                .cloned()
-                .ok_or_else(|| type_error("super(): no arguments and no enclosing method"))?
-        } else {
-            // Two-arg form `super(Cls, obj)`. Any other arity is a `TypeError`
-            // in CPython (`super(A, b, c)`); reject it rather than silently
-            // ignoring the extra arguments.
-            if sup.arguments.args.len() != 2 {
-                return Err(type_error("super() takes 0 or 2 arguments"));
+        let (start_class, self_val) = self.super_target(sup, env)?;
+        let found = self.super_lookup(&start_class, &self_val, attr);
+        let (owner, method) = match found {
+            Some((owner, ClassMember::Method(m))) => (owner, m),
+            Some((owner, ClassMember::Attr(Value::Function(m)))) => (owner, m),
+            Some((_, ClassMember::Attr(_))) => {
+                // A non-function class attribute: read it, then call it.
+                let callee = self.eval_super_attr(sup, attr, env)?;
+                let (args, kwargs) = self.eval_call_args(outer, env)?;
+                return self.call_value(callee, args, &kwargs);
             }
-            let cls_v = self.eval_expr(&sup.arguments.args[0], env)?;
-            let obj_v = self.eval_expr(&sup.arguments.args[1], env)?;
-            match cls_v {
-                Value::Class(c) => (c, obj_v),
-                _ => return Err(type_error("super() argument 1 must be a class")),
-            }
-        };
-
-        // Resolve the method starting from the bases of `start_class`.
-        let method = start_class
-            .bases
-            .iter()
-            .find_map(|b| self.find_method(b, attr));
-        let Some(method) = method else {
-            // `super().__init__()` against a base with no such method (e.g.
-            // the implicit `object`) is a no-op, matching CPython for the
-            // synthesised dataclass constructors.
-            if attr == "__init__" {
-                // …except on an exception instance: `BaseException.__init__`
-                // stashes its positional args as `.args`, which drives
-                // `str(e)`/`repr(e)`. The builtin base has no `Value::Class`,
-                // so capture the message here so a hand-written
-                // `super().__init__(f"…")` is reflected by `str(e)`.
-                if let Value::Instance(inst) = &self_val {
-                    if inst.class.is_exception {
-                        let mut exc_args = Vec::with_capacity(outer.arguments.args.len());
-                        for arg in outer.arguments.args.iter() {
-                            if let Expr::Starred(s) = arg {
-                                let v = self.eval_expr(&s.value, env)?;
-                                let it = self.make_iter(v)?;
-                                while let Some(x) = self.iter_next(&it)? {
-                                    exc_args.push(x);
-                                }
-                            } else {
-                                exc_args.push(self.eval_expr(arg, env)?);
-                            }
-                        }
-                        inst.fields
-                            .borrow_mut()
-                            .insert("args".to_owned(), Value::Tuple(Rc::new(exc_args)));
+            None => {
+                // `object.__init_subclass__` — the end of a cooperative
+                // `super().__init_subclass__(**kw)` chain — accepts no
+                // keyword arguments and does nothing.
+                if attr == "__init_subclass__" {
+                    let (_, kwargs) = self.eval_call_args(outer, env)?;
+                    if !kwargs.is_empty() {
+                        let name = match &self_val {
+                            Value::Class(c) => c.name.clone(),
+                            Value::Instance(i) => i.class.name.clone(),
+                            _ => "object".to_owned(),
+                        };
+                        return Err(type_error(format!(
+                            "{name}.__init_subclass__() takes no keyword arguments"
+                        )));
                     }
+                    return Ok(Value::None);
                 }
-                return Ok(Value::None);
+                // `super().__init__()` against a base with no such method
+                // (e.g. the implicit `object`) is a no-op, matching CPython
+                // for the synthesised dataclass constructors.
+                if attr == "__init__" {
+                    // …except on an exception instance: `BaseException.__init__`
+                    // stashes its positional args as `.args`, which drives
+                    // `str(e)`/`repr(e)`. The builtin base has no
+                    // `Value::Class`, so capture the message here so a
+                    // hand-written `super().__init__(f"…")` is reflected by
+                    // `str(e)`.
+                    if let Value::Instance(inst) = &self_val {
+                        if inst.class.is_exception {
+                            let (exc_args, _) = self.eval_call_args(outer, env)?;
+                            inst.fields
+                                .borrow_mut()
+                                .insert("args".to_owned(), Value::Tuple(Rc::new(exc_args)));
+                        }
+                    }
+                    return Ok(Value::None);
+                }
+                return Err(attribute_error(format!(
+                    "'super' object has no attribute '{}'",
+                    attr
+                )));
             }
-            return Err(attribute_error(format!(
-                "'super' object has no attribute '{}'",
-                attr
-            )));
         };
-
-        // Evaluate the call arguments.
-        let mut args = Vec::with_capacity(outer.arguments.args.len());
-        for arg in outer.arguments.args.iter() {
-            if let Expr::Starred(s) = arg {
-                let v = self.eval_expr(&s.value, env)?;
-                let iter = self.make_iter(v)?;
-                while let Some(x) = self.iter_next(&iter)? {
-                    args.push(x);
-                }
-            } else {
-                args.push(self.eval_expr(arg, env)?);
-            }
+        let (args, kwargs) = self.eval_call_args(outer, env)?;
+        if method.is_static {
+            return self.call_function(&method, args, &kwargs, None);
         }
-        let mut kwargs: Vec<(String, Value)> = Vec::with_capacity(outer.arguments.keywords.len());
-        for kw in outer.arguments.keywords.iter() {
-            if let Some(name) = &kw.arg {
-                kwargs.push((name.as_str().to_owned(), self.eval_expr(&kw.value, env)?));
+        let receiver = if method.is_classmethod || owner.classmethods.borrow().contains(attr) {
+            match &self_val {
+                Value::Instance(i) => Value::Class(i.class.clone()),
+                other => other.clone(),
             }
-        }
-
-        // Find the class that actually owns `method` so a chained
-        // `super()` inside it resolves the *next* level up, not itself.
-        let owner = start_class
-            .bases
-            .iter()
-            .find_map(|b| self.method_owner(b, &method))
-            .unwrap_or_else(|| start_class.clone());
-        self.call_method_with_frame(&method, owner, self_val, args, &kwargs)
+        } else {
+            self_val
+        };
+        // The frame names the class that owns `method`, so a chained
+        // `super()` inside it resolves the *next* class in the MRO.
+        self.call_method_with_frame(&method, owner, receiver, args, &kwargs)
     }
 
-    /// Walk `class`'s MRO and return the class whose method table holds
-    /// `func` (by pointer identity).
+    /// The class in `class`'s MRO whose own namespace holds `func` (by
+    /// pointer identity) — the class a method was defined on.
     fn method_owner(&self, class: &Rc<Class>, func: &Rc<Function>) -> Option<Rc<Class>> {
-        if let Some(m) = class.methods.borrow().get(&func.name) {
-            if Rc::ptr_eq(m, func) {
-                return Some(class.clone());
-            }
-        }
-        for base in &class.bases {
-            if let Some(c) = self.method_owner(base, func) {
-                return Some(c);
-            }
-        }
-        None
+        class_mro(class)
+            .find(|c| {
+                c.methods
+                    .borrow()
+                    .get(&func.name)
+                    .is_some_and(|m| Rc::ptr_eq(m, func))
+                    || c.methods.borrow().values().any(|m| Rc::ptr_eq(m, func))
+                    || c
+                        .class_attrs
+                        .borrow()
+                        .values()
+                        .any(|v| matches!(v, Value::Function(f) if Rc::ptr_eq(f, func)))
+            })
+            .cloned()
     }
 
     /// Call `method` bound to `self_val`, pushing a `(owner, self)` frame so
@@ -4530,6 +4700,9 @@ impl Interpreter {
                 // bound to the class object) skip the frame.
                 let owner = match receiver.as_ref() {
                     Value::Instance(inst) => self.method_owner(&inst.class, &function),
+                    // A classmethod bound to its class: `super()` inside it
+                    // climbs that class's MRO.
+                    Value::Class(cls) => self.method_owner(cls, &function),
                     _ => None,
                 };
                 if let Some(owner) = owner {
@@ -5079,26 +5252,26 @@ impl Interpreter {
     }
 
     pub fn find_method(&self, class: &Rc<Class>, name: &str) -> Option<Rc<Function>> {
-        // Fast path: the class's own table. `build_class` flattens inherited
-        // methods down into every subclass, so a normal method (own or
-        // inherited-at-build-time) resolves here in a single probe with no
-        // base-chain walk and no cache overhead — the hot case.
+        // Fast path: the class's own method table — the class itself is the
+        // head of its MRO, so an own method always wins.
         if let Some(m) = class.methods.borrow().get(name) {
             return Some(m.clone());
         }
-        // Miss on the own table: either a genuine negative (a dunder probe like
-        // `__enter__` / `__add__` that most classes lack) or a method added to
-        // a *base* after this class was built. Both otherwise re-walk the whole
-        // base chain on every call, so memoise the resolution here — including
-        // the negative. Cleared wholesale on any impl-merge (see `method_cache`),
-        // which also covers a base gaining a method.
+        // Otherwise walk the MRO, memoising the resolution — including the
+        // negative (a dunder probe like `__enter__` / `__add__` that most
+        // classes lack). Cleared wholesale whenever a class namespace gains,
+        // loses or re-binds a function-valued name (see `method_cache`).
         let cid = Rc::as_ptr(class) as usize;
         if let Some(inner) = self.method_cache.borrow().get(&cid) {
             if let Some(hit) = inner.get(name) {
                 return hit.clone();
             }
         }
-        let resolved = self.resolve_via_bases(class, name);
+        let resolved = match lookup_class_member(class, name) {
+            Some((_, ClassMember::Method(m))) => Some(m),
+            Some((_, ClassMember::Attr(Value::Function(f)))) => Some(f),
+            _ => None,
+        };
         self.method_cache
             .borrow_mut()
             .entry(cid)
@@ -5107,20 +5280,11 @@ impl Interpreter {
         resolved
     }
 
-    /// Resolve `name` through `class`'s base chain only (the own table has
-    /// already been probed by [`find_method`]). Each base's own table is
-    /// likewise base-flattened, so this recurses only for methods added to a
-    /// base after `class` was built.
-    fn resolve_via_bases(&self, class: &Rc<Class>, name: &str) -> Option<Rc<Function>> {
-        for base in &class.bases {
-            if let Some(m) = base.methods.borrow().get(name) {
-                return Some(m.clone());
-            }
-            if let Some(m) = self.resolve_via_bases(base, name) {
-                return Some(m);
-            }
-        }
-        None
+    /// Forget every memoised method resolution — called when a class
+    /// namespace changes in a way that can alter one (a new name, a removed
+    /// name, or a function-valued binding replaced).
+    pub(crate) fn invalidate_method_cache(&self) {
+        self.method_cache.borrow_mut().clear();
     }
 
     /// Drive an awaitable to its value. A `Coroutine` thunk runs its body
@@ -5283,20 +5447,12 @@ impl Interpreter {
     /// `Path.iterdir`.
     fn defining_class_name(&self, receiver: &Value, function: &Rc<Function>) -> Option<String> {
         fn walk(class: &Rc<Class>, function: &Rc<Function>) -> Option<String> {
-            // Depth-first through the bases first: the *most general* class
-            // that still defines this exact function is the one CPython
-            // names, since the derived class inherited it from there.
-            for base in &class.bases {
-                if let Some(found) = walk(base, function) {
-                    return Some(found);
-                }
-            }
-            let own = class
-                .methods
-                .borrow()
-                .values()
-                .any(|m| Rc::ptr_eq(m, function));
-            own.then(|| class.name.clone())
+            // The first class in the MRO whose own namespace holds this exact
+            // function is where it was defined (an inherited method lives
+            // only on its defining class).
+            class_mro(class)
+                .find(|c| c.methods.borrow().values().any(|m| Rc::ptr_eq(m, function)))
+                .map(|c| c.name.clone())
         }
         match receiver {
             Value::Instance(i) => walk(&i.class, function),
@@ -6584,7 +6740,7 @@ impl Interpreter {
                 // CPython: reading it through an instance binds `self`. This
                 // is how cross-module `extend Foo:` methods (lowered to
                 // `Foo.m = __typhon_extend_Foo__m`) dispatch.
-                let class_attr = inst.class.class_attrs.borrow().get(attr).cloned();
+                let class_attr = class_attr_via_mro(&inst.class, attr);
                 if let Some(v) = class_attr {
                     if !is_enum_sentinel(attr) {
                         if let Value::Function(f) = &v {
@@ -6640,26 +6796,12 @@ impl Interpreter {
                 if attr == "__name__" || attr == "__qualname__" {
                     return Ok(Value::Str(Rc::new(class.name.clone())));
                 }
-                // `Cls.__mro__` — the linearised base chain, ending in
-                // `object`. The VM walks bases depth-first for method
-                // lookup rather than computing a C3 linearisation, so this
-                // reports that same order (identical for the single-
-                // inheritance chains that make up almost all real code).
+                // `Cls.__mro__` — the C3 linearisation, ending in `object`.
                 if attr == "__mro__" {
-                    let mut out: Vec<Value> = Vec::new();
-                    let mut stack: Vec<Rc<Class>> = vec![class.clone()];
-                    let mut seen: Vec<*const Class> = Vec::new();
-                    while let Some(c) = stack.pop() {
-                        let ptr = Rc::as_ptr(&c);
-                        if seen.contains(&ptr) {
-                            continue;
-                        }
-                        seen.push(ptr);
-                        out.push(Value::Class(c.clone()));
-                        for base in c.bases.iter().rev() {
-                            stack.push(base.clone());
-                        }
-                    }
+                    let mut out: Vec<Value> = class_mro(class)
+                        .filter(|c| !(c.name == "object" && c.bases.is_empty()))
+                        .map(|c| Value::Class(c.clone()))
+                        .collect();
                     out.push(crate::builtins::make_builtin_type("object"));
                     return Ok(Value::Tuple(Rc::new(out)));
                 }
@@ -6709,22 +6851,35 @@ impl Interpreter {
                         },
                     ))));
                 }
-                let class_attr = class.class_attrs.borrow().get(attr).cloned();
-                if let Some(v) = class_attr {
-                    if let Some(bound) = self.descriptor_get(&v, None, class)? {
-                        return Ok(bound);
+                match lookup_class_member(class, attr) {
+                    Some((_, ClassMember::Attr(v))) => {
+                        // A function stored as a class attribute with
+                        // `@classmethod` binds the class it is read through.
+                        if let Value::Function(f) = &v {
+                            if f.is_classmethod {
+                                return Ok(Value::BoundMethod {
+                                    receiver: Box::new(value.clone()),
+                                    function: f.clone(),
+                                });
+                            }
+                        }
+                        if let Some(bound) = self.descriptor_get(&v, None, class)? {
+                            return Ok(bound);
+                        }
+                        return Ok(v);
                     }
-                    return Ok(v);
-                }
-                if let Some(m) = class.methods.borrow().get(attr) {
-                    // `@classmethod` accessed on the class binds `cls` to the class.
-                    if class.classmethods.borrow().contains(attr) {
-                        return Ok(Value::BoundMethod {
-                            receiver: Box::new(value.clone()),
-                            function: m.clone(),
-                        });
+                    Some((_, ClassMember::Method(m))) => {
+                        // `@classmethod` accessed on the class binds `cls` to
+                        // the class it is read through (a subclass included).
+                        if m.is_classmethod || class.classmethods.borrow().contains(attr) {
+                            return Ok(Value::BoundMethod {
+                                receiver: Box::new(value.clone()),
+                                function: m,
+                            });
+                        }
+                        return Ok(Value::Function(m));
                     }
-                    return Ok(Value::Function(m.clone()));
+                    None => {}
                 }
                 // Pydantic `model` class methods: `Model.model_validate(dict)`
                 // builds an instance from a mapping (validation is not modelled;
@@ -7231,6 +7386,66 @@ impl Interpreter {
         self.set_attr_raw(receiver, attr, value)
     }
 
+    /// `del obj.attr` / `delattr(obj, attr)`.
+    pub(crate) fn del_attr(&mut self, recv: &Value, attr: &str) -> Result<(), Unwind> {
+        match recv {
+            Value::Instance(inst) => {
+                if let Some(err) = frozen_dataclass_error(&inst.class, attr, "delete") {
+                    return Err(err);
+                }
+                if self.delete_via_descriptor(inst, attr)? {
+                    return Ok(());
+                }
+                if inst.fields.borrow_mut().shift_remove(attr).is_none() {
+                    return Err(attribute_error(format!(
+                        "'{}' object has no attribute '{}'",
+                        inst.class.name, attr
+                    )));
+                }
+                Ok(())
+            }
+            Value::Class(c) => del_class_attr(self, c, attr),
+            _ => Err(type_error("cannot delete attribute on this object")),
+        }
+    }
+
+    /// `del obj.attr` through a `@prop.deleter` or a data descriptor's
+    /// `__delete__`; `Ok(false)` when neither applies.
+    fn delete_via_descriptor(&mut self, inst: &Rc<Instance>, attr: &str) -> Result<bool, Unwind> {
+        let receiver = Value::Instance(inst.clone());
+        let deleter = inst
+            .class
+            .class_attrs
+            .borrow()
+            .get(&format!("__typhon_deleter__{attr}"))
+            .cloned();
+        if let Some(Value::Function(deleter)) = deleter {
+            self.call_value(
+                Value::BoundMethod {
+                    receiver: Box::new(receiver),
+                    function: deleter,
+                },
+                vec![],
+                &[],
+            )?;
+            return Ok(true);
+        }
+        if let Some(Value::Instance(d)) = class_attr_via_mro(&inst.class, attr) {
+            if let Some(del) = self.find_method(&d.class, "__delete__") {
+                self.call_value(
+                    Value::BoundMethod {
+                        receiver: Box::new(Value::Instance(d)),
+                        function: del,
+                    },
+                    vec![receiver],
+                    &[],
+                )?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// `object.__setattr__`: store an attribute without consulting a user
     /// `__setattr__` (property setters still apply).
     pub fn set_attr_raw(
@@ -7260,6 +7475,22 @@ impl Interpreter {
                     )?;
                     return Ok(());
                 }
+                // A data descriptor on the class (an object whose type
+                // defines `__set__` — `property(...)`, a hand-written
+                // validator) intercepts the store, as in CPython.
+                if let Some(Value::Instance(d)) = class_attr_via_mro(&i.class, attr) {
+                    if let Some(set) = self.find_method(&d.class, "__set__") {
+                        self.call_value(
+                            Value::BoundMethod {
+                                receiver: Box::new(Value::Instance(d)),
+                                function: set,
+                            },
+                            vec![receiver.clone(), value],
+                            &[],
+                        )?;
+                        return Ok(());
+                    }
+                }
                 // `@dataclass(slots=True)` (Typhon's default class lowering)
                 // and an explicit `__slots__` leave the instance without a
                 // `__dict__`: only the declared slots are assignable.
@@ -7270,7 +7501,7 @@ impl Interpreter {
                 Ok(())
             }
             Value::Class(c) => {
-                c.class_attrs.borrow_mut().insert(attr.to_owned(), value);
+                set_class_attr(self, c, attr, value);
                 Ok(())
             }
             Value::Module(m) => {
@@ -9165,6 +9396,98 @@ fn slice_indices(parts: &[Value], n: i64) -> Result<(i64, i64, i64), Unwind> {
 
 /// Class-kind markers that describe one class body only and must not be
 /// copied into subclasses by the attribute-inheritance flattening.
+/// What a class namespace binds a name to: a `def` in the class body (or
+/// merged from an `impl` block), or any other class attribute.
+pub(crate) enum ClassMember {
+    Method(Rc<Function>),
+    Attr(Value),
+}
+
+/// `class` followed by its C3-linearised ancestors — `__mro__` without the
+/// implicit `object`.
+pub(crate) fn class_mro(class: &Rc<Class>) -> impl Iterator<Item = &Rc<Class>> {
+    std::iter::once(class).chain(class.mro.iter())
+}
+
+/// Resolve `name` the way CPython's `type.__getattribute__` finds a class
+/// attribute: the first class in the MRO whose own namespace binds it wins,
+/// whether as a method or as a plain attribute. Returns that class with the
+/// binding. The VM's internal `__typhon_*` records are never found on an
+/// ancestor here (they are copied per class where they are inherited).
+pub(crate) fn lookup_class_member(class: &Rc<Class>, name: &str) -> Option<(Rc<Class>, ClassMember)> {
+    let internal = name.starts_with("__typhon_");
+    for (depth, c) in class_mro(class).enumerate() {
+        if let Some(m) = c.methods.borrow().get(name) {
+            return Some((c.clone(), ClassMember::Method(m.clone())));
+        }
+        if depth > 0 && internal {
+            continue;
+        }
+        if let Some(v) = c.class_attrs.borrow().get(name) {
+            return Some((c.clone(), ClassMember::Attr(v.clone())));
+        }
+    }
+    None
+}
+
+/// `Cls.attr = value`: one namespace per class, as in CPython — a `def`
+/// the class body bound under `attr` is replaced, not shadowed by a
+/// parallel class attribute. Method resolutions are memoised, so any change
+/// that can alter one (a new name, or a function-valued binding replaced)
+/// drops the cache; re-binding an existing plain attribute (a class-level
+/// counter) does not.
+pub(crate) fn set_class_attr(interp: &Interpreter, class: &Rc<Class>, attr: &str, value: Value) {
+    let had_method = class.methods.borrow_mut().remove(attr).is_some();
+    let previous = class
+        .class_attrs
+        .borrow_mut()
+        .insert(attr.to_owned(), value.clone());
+    let reshapes = had_method
+        || matches!(previous, None | Some(Value::Function(_)))
+        || matches!(value, Value::Function(_));
+    if reshapes {
+        interp.invalidate_method_cache();
+    }
+}
+
+/// `del Cls.attr`: remove the class's own binding (an inherited one is not
+/// the class's to delete — CPython raises `AttributeError`).
+pub(crate) fn del_class_attr(interp: &Interpreter, class: &Rc<Class>, attr: &str) -> Result<(), Unwind> {
+    let had_method = class.methods.borrow_mut().remove(attr).is_some();
+    let had_attr = class.class_attrs.borrow_mut().remove(attr).is_some();
+    if !(had_method || had_attr) {
+        return Err(attribute_error(format!(
+            "type object '{}' has no attribute '{attr}'",
+            class.name
+        )));
+    }
+    interp.invalidate_method_cache();
+    Ok(())
+}
+
+/// The methods a Protocol requires: its own and those of the protocol
+/// classes it extends.
+pub(crate) fn protocol_members(class: &Rc<Class>) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for c in class_mro(class).filter(|c| class_is_protocol(c)) {
+        for k in c.methods.borrow().keys() {
+            if !names.contains(k) {
+                names.push(k.clone());
+            }
+        }
+    }
+    names
+}
+
+/// The value of a class attribute `name` resolved through the MRO, if the
+/// first binding found is a plain attribute (not a method).
+pub(crate) fn class_attr_via_mro(class: &Rc<Class>, name: &str) -> Option<Value> {
+    match lookup_class_member(class, name) {
+        Some((_, ClassMember::Attr(v))) => Some(v),
+        _ => None,
+    }
+}
+
 fn is_uninherited_marker(name: &str) -> bool {
     matches!(
         name,
@@ -9173,6 +9496,7 @@ fn is_uninherited_marker(name: &str) -> bool {
             | "__typhon_hash_none__"
             | "__typhon_module__"
             | "__typhon_generated_init__"
+            | "__typhon_doc__"
     ) || name.starts_with("__typhon_dc_")
 }
 

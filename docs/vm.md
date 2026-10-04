@@ -90,9 +90,9 @@ absent),
 (raises `ZeroDivisionError` with CPython messages), `pow` (2- and 3-arg
 modular), `format`, `ascii`, and `int(str, base)` including `base=0`
 (autodetect `0x` / `0o` / `0b`). `min` / `max` accept `key=` / `default=`
-keyword arguments. Decorator stubs `@property`, `@classmethod`,
-`@staticmethod`, and the `super()` call are present as identity-ish
-builtins since v0.9.0 so decorated methods no longer crash on import.
+keyword arguments. `property`, `classmethod`, `staticmethod` and
+`super()` follow CPython's descriptor and MRO rules (see "Classes: method
+resolution and class namespaces" below).
 
 Since v0.10.0 `type(x)` returns a **real type object**, not a plain
 string. `type(x).__name__` resolves to the type name, `str(type(x))`
@@ -289,6 +289,33 @@ honours them on user-class instances:
   binds the class as `cls`. Both are inherited through bases, and the
   descriptor marker is cleared when a subclass plain method overrides an
   inherited property / classmethod.
+
+### Classes: method resolution and class namespaces (beta)
+
+Attribute lookup follows CPython's object model rather than copying a
+base class's namespace into every subclass:
+
+- **C3 linearisation.** Each class computes its `__mro__` once, by C3,
+  and every lookup, `super()` and `__mro__` walk it — a diamond `D(B, C)`
+  resolves `D > B > C > A`, a cooperative `__init__` diamond runs every
+  `__init__` exactly once, and an inconsistent base order raises CPython's
+  `TypeError: Cannot create a consistent method resolution order (MRO)`.
+- **One namespace per class, read at lookup time.** An attribute set on a
+  base after a subclass was created is visible through the subclass and
+  its instances; a subclass's own class attribute shadows an inherited
+  method; `Cls.f = func` replaces a `def f`; `del Cls.attr` removes the
+  class's own binding (an inherited one raises `AttributeError`).
+- **`super()`** (zero-argument, explicit two-argument, inside a
+  `@classmethod`, and read as a value — `super().name` for a property or
+  class attribute) searches the MRO of the bound object's type *after* the
+  class that defines the running method.
+- **Descriptors.** `property(fget, fset, fdel)`, `classmethod(f)` and
+  `staticmethod(f)` called as functions (or stored on a class later) bind
+  like their decorator forms; `@prop.deleter` is honoured; an object whose
+  type defines `__set__` / `__delete__` intercepts assignment / deletion
+  through an instance, and `__set_name__` is called at class creation.
+- **`__init_subclass__`** of the nearest ancestor runs when a subclass is
+  created, with the class header's keyword arguments.
 
 ## Multi-file projects
 

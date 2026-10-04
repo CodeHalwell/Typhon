@@ -268,6 +268,22 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   dataclass instance returns the same object, and enum members, dates,
   times, timedeltas, timezones and paths pass through unchanged, as in the
   emitted runtime.
+- **C3 method resolution and live class namespaces** (W5-07). The VM
+  computes each class's `__mro__` by C3 and resolves attributes, `super()`
+  and `__mro__` through it, instead of walking bases depth-first and
+  copying every base's methods and class attributes into each subclass at
+  creation. A diamond `D(B, C)` now resolves `D > B > C > A` (it printed
+  `D>B>A`, and a cooperative `__init__` diamond skipped a base); an
+  attribute set on a base after a subclass exists is visible through it; a
+  subclass's own class attribute shadows an inherited method; an
+  inconsistent base order raises CPython's MRO `TypeError`. Also fixed
+  along the way: `classmethod(f)` / `staticmethod(f)` / `property(f)`
+  called as functions bind correctly (`cls` was left unbound and a
+  property read returned a method), `super()` finds class attributes,
+  works inside classmethods and as a value (`super().name`),
+  `__init_subclass__` and `__set_name__` run at class creation, data
+  descriptors' `__set__` / `__delete__` and `@prop.deleter` are honoured,
+  and `del Cls.attr` / `delattr(Cls, …)` work.
 - **One front end for every VM entry point** (W5-20). The entry program,
   imported sibling modules and the embedded stdlib shims all go through
   `tyc_syntax::preprocess::expand_and_preprocess_mapped` — the chain

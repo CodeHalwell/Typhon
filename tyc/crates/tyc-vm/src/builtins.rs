@@ -654,7 +654,7 @@ pub fn install(interp: &mut Interpreter) {
         i.set_attr(&obj, &name, val)?;
         Ok(Value::None)
     });
-    native!("delattr", |_i, args| {
+    native!("delattr", |i, args| {
         let obj = args
             .first()
             .ok_or_else(|| type_error("delattr() requires arguments"))?
@@ -664,23 +664,8 @@ pub fn install(interp: &mut Interpreter) {
             .ok_or_else(|| type_error("delattr() requires a name"))?
             .py_str();
         match &obj {
-            Value::Instance(inst) => {
-                if let Some(err) =
-                    crate::interp::frozen_dataclass_error(&inst.class, &name, "delete")
-                {
-                    return Err(err);
-                }
-                if inst
-                    .fields
-                    .borrow_mut()
-                    .shift_remove(name.as_str())
-                    .is_none()
-                {
-                    return Err(attribute_error(format!(
-                        "'{}' object has no attribute '{}'",
-                        inst.class.name, name
-                    )));
-                }
+            Value::Instance(_) | Value::Class(_) => {
+                i.del_attr(&obj, &name)?;
                 Ok(Value::None)
             }
             _ => Err(type_error(
@@ -692,6 +677,7 @@ pub fn install(interp: &mut Interpreter) {
         fn internal(k: &str) -> bool {
             matches!(k, "__typhon_enum_base__" | "__typhon_enum_members__")
                 || k.starts_with("__typhon_setter__")
+                || k.starts_with("__typhon_deleter__")
         }
         let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         match args.first() {
@@ -699,12 +685,14 @@ pub fn install(interp: &mut Interpreter) {
                 for k in inst.fields.borrow().keys() {
                     names.insert(k.clone());
                 }
-                for k in inst.class.methods.borrow().keys() {
-                    names.insert(k.clone());
-                }
-                for k in inst.class.class_attrs.borrow().keys() {
-                    if !internal(k) {
+                for c in crate::interp::class_mro(&inst.class) {
+                    for k in c.methods.borrow().keys() {
                         names.insert(k.clone());
+                    }
+                    for k in c.class_attrs.borrow().keys() {
+                        if !internal(k) {
+                            names.insert(k.clone());
+                        }
                     }
                 }
             }
@@ -712,12 +700,14 @@ pub fn install(interp: &mut Interpreter) {
                 names.extend(module_dir_names(m));
             }
             Some(Value::Class(c)) => {
-                for k in c.methods.borrow().keys() {
-                    names.insert(k.clone());
-                }
-                for k in c.class_attrs.borrow().keys() {
-                    if !internal(k) {
+                for c in crate::interp::class_mro(c) {
+                    for k in c.methods.borrow().keys() {
                         names.insert(k.clone());
+                    }
+                    for k in c.class_attrs.borrow().keys() {
+                        if !internal(k) {
+                            names.insert(k.clone());
+                        }
                     }
                 }
             }
@@ -1016,7 +1006,7 @@ pub fn install(interp: &mut Interpreter) {
                         "Instance and class checks can only be used with @runtime_checkable protocols",
                     ));
                 }
-                let members: Vec<String> = p.methods.borrow().keys().cloned().collect();
+                let members = crate::interp::protocol_members(p);
                 if members.iter().all(|m| i.get_attr(val, m.as_str()).is_ok()) {
                     return Ok(Value::Bool(true));
                 }
@@ -1518,19 +1508,23 @@ pub fn install(interp: &mut Interpreter) {
         i.call_value(open_fn, pos.to_vec(), &kw)
     });
 
-    // `@property`, `@classmethod`, `@staticmethod`: the VM has no
-    // descriptor protocol, so these decorators reduce to the identity
-    // — the wrapped function is callable as `obj.name()` (not `obj.name`
-    // for property). That's a documented divergence from CPython, but
-    // it lets programs that decorate methods at least import and run.
-    native!("property", |_i, args| {
-        Ok(args.into_iter().next().unwrap_or(Value::None))
+    // `@property`, `@classmethod`, `@staticmethod` as *decorators* in a
+    // class body are recognised by the class builder. Called as functions
+    // (`x = property(get_x)`, `make = classmethod(_make)`, or a function
+    // stored on the class later) they must produce the same descriptors:
+    // `property(...)` builds the `descriptors` shim's data descriptor, and
+    // `classmethod` / `staticmethod` return a copy of the function marked
+    // so attribute reads bind the class / nothing. Returning the bare
+    // function left `cls` unbound and a property read returning a method.
+    native!("property", |i, args| {
+        let cls = descriptor_shim_class(i, "property")?;
+        i.call_value(cls, args, &[])
     });
     native!("classmethod", |_i, args| {
-        Ok(args.into_iter().next().unwrap_or(Value::None))
+        Ok(mark_function(single(&args, "classmethod")?, true, false))
     });
     native!("staticmethod", |_i, args| {
-        Ok(args.into_iter().next().unwrap_or(Value::None))
+        Ok(mark_function(single(&args, "staticmethod")?, false, true))
     });
     // `super()` — return a stub module whose attribute access yields a
     // no-op callable. Just enough to let `super().__init__(...)` synthesised
@@ -1568,6 +1562,7 @@ pub fn install(interp: &mut Interpreter) {
             fields: vec![],
             class_attrs: std::cell::RefCell::new(HashMap::new()),
             bases: vec![],
+            mro: vec![],
             properties: std::cell::RefCell::new(std::collections::HashSet::new()),
             classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
             is_exception: false,
@@ -1584,6 +1579,7 @@ pub fn install(interp: &mut Interpreter) {
                 fields: vec![],
                 class_attrs: std::cell::RefCell::new(HashMap::new()),
                 bases: vec![],
+                mro: vec![],
                 properties: std::cell::RefCell::new(std::collections::HashSet::new()),
                 classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
                 is_exception: false,
@@ -2426,6 +2422,7 @@ mod shims {
     pub const LAZY: &str = include_str!("shims/lazy.py");
     pub const TYPEPARAMS: &str = include_str!("shims/typeparams.py");
     pub const HEAPQ_EXTRA: &str = include_str!("shims/heapq_extra.py");
+    pub const DESCRIPTORS: &str = include_str!("shims/descriptors.py");
 }
 
 fn compile_helpers(interp: &mut Interpreter, source: &str) -> Result<Vec<(String, Value)>, Unwind> {
@@ -2586,9 +2583,12 @@ fn make_collections_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
         );
         let cls = Rc::new(crate::value::Class {
             name: typename,
-            methods: RefCell::new(template.methods.borrow().clone()),
+            // Inherited through the MRO, not copied: CPython names
+            // `Point._make` as defined on the template's class.
+            methods: RefCell::new(HashMap::new()),
             fields: vec![],
             class_attrs: RefCell::new(class_attrs),
+            mro: crate::value::linearize(std::slice::from_ref(&template)).unwrap_or_default(),
             bases: vec![template.clone()],
             properties: RefCell::new(template.properties.borrow().clone()),
             classmethods: RefCell::new(template.classmethods.borrow().clone()),
@@ -2624,6 +2624,56 @@ fn compile_helper(interp: &mut Interpreter, source: &str, name: &str) -> Result<
         .find(|(k, _)| k == name)
         .map(|(_, v)| v)
         .ok_or_else(|| type_error(format!("stdlib shim did not define '{name}'")))
+}
+
+/// A class from the `descriptors` shim (`property`), compiled once per run.
+pub(crate) fn descriptor_shim_class(interp: &mut Interpreter, name: &str) -> Result<Value, Unwind> {
+    const KEY: &str = "__typhon_descriptors__";
+    let module = match interp.module_cache.get(KEY) {
+        Some(v) => v.clone(),
+        None => {
+            let members = compile_helpers(interp, shims::DESCRIPTORS)?;
+            let entries: Vec<(&str, Value)> = members
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.clone()))
+                .collect();
+            let m = make_module("builtins", entries);
+            interp.module_cache.insert(KEY.to_owned(), m.clone());
+            m
+        }
+    };
+    match &module {
+        Value::Module(m) => m
+            .members
+            .borrow()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| type_error(format!("descriptor shim did not define '{name}'"))),
+        _ => Err(type_error("descriptor shim is not a module")),
+    }
+}
+
+/// `classmethod(f)` / `staticmethod(f)`: a copy of the user function `f`
+/// carrying the binding rule. Anything else (a native, a partial) passes
+/// through unchanged, as before.
+fn mark_function(v: &Value, classmethod: bool, staticmethod: bool) -> Value {
+    let Value::Function(f) = v else {
+        return v.clone();
+    };
+    Value::Function(Rc::new(crate::value::Function {
+        name: f.name.clone(),
+        params: f.params.clone(),
+        body: f.body.clone(),
+        defaults: f.defaults.clone(),
+        closure: f.closure.clone(),
+        is_async: f.is_async,
+        is_static: staticmethod || f.is_static,
+        is_classmethod: classmethod || f.is_classmethod,
+        source: f.source.clone(),
+        slot_info: f.slot_info.clone(),
+        generator: f.generator,
+        attrs: RefCell::new(f.attrs.borrow().clone()),
+    }))
 }
 
 /// The PEP 695 / PEP 696 type-parameter classes, compiled once. `TypeVar`,
@@ -7394,6 +7444,7 @@ fn bare_shim_class(name: &str) -> crate::value::Class {
         fields: vec![],
         class_attrs: RefCell::new(HashMap::new()),
         bases: vec![],
+        mro: vec![],
         properties: RefCell::new(HashSet::new()),
         classmethods: RefCell::new(HashSet::new()),
         is_exception: false,
@@ -8503,6 +8554,7 @@ fn make_pydantic_module() -> Value {
         fields: vec![],
         class_attrs: std::cell::RefCell::new(base_model_attrs),
         bases: vec![],
+        mro: vec![],
         properties: std::cell::RefCell::new(std::collections::HashSet::new()),
         classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
         is_exception: false,
@@ -8636,6 +8688,7 @@ pub(crate) fn native_object(class_name: &str, fields: Vec<(&str, Value)>) -> Val
         fields: vec![],
         class_attrs: RefCell::new(HashMap::new()),
         bases: vec![],
+        mro: vec![],
         properties: RefCell::new(std::collections::HashSet::new()),
         classmethods: RefCell::new(std::collections::HashSet::new()),
         is_exception: false,
@@ -9137,6 +9190,7 @@ thread_local! {
             .collect(),
         class_attrs: RefCell::new(HashMap::new()),
         bases: vec![],
+        mro: vec![],
         properties: RefCell::new(HashSet::new()),
         classmethods: RefCell::new(HashSet::new()),
         is_exception: false,
@@ -11815,6 +11869,7 @@ thread_local! {
             fields: vec![],
             class_attrs: RefCell::new(attrs),
             bases: vec![],
+            mro: vec![],
             properties: RefCell::new(HashSet::new()),
             classmethods: RefCell::new(HashSet::new()),
             is_exception: true,
@@ -12215,6 +12270,11 @@ pub fn call_with_kwargs(
     kwargs: &[(String, Value)],
 ) -> Result<Value, Unwind> {
     match n.name {
+        // property(fget=..., fset=..., fdel=..., doc=...)
+        "property" => {
+            let cls = descriptor_shim_class(interp, "property")?;
+            interp.call_value(cls, args, kwargs)
+        }
         // enumerate(iterable, start=N)
         "enumerate" => {
             let mut start: i64 = 0;
@@ -12789,6 +12849,7 @@ pub fn make_builtin_type(name: &str) -> Value {
                     fields: vec![],
                     class_attrs: std::cell::RefCell::new(HashMap::new()),
                     bases: vec![],
+                    mro: vec![],
                     properties: std::cell::RefCell::new(std::collections::HashSet::new()),
                     classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
                     is_exception: false,
