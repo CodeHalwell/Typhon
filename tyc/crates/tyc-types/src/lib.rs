@@ -1021,6 +1021,13 @@ fn callee_is_async(c: &Checker, call: &ruff_python_ast::ExprCall) -> bool {
         Expr::Attribute(a) => {
             let recv = infer_expr_readonly(c, &a.value);
             let class_name = match recv.strip_none() {
+                Type::Module(name) => {
+                    return c
+                        .module_registry
+                        .get(&name)
+                        .and_then(|shapes| shapes.function_arities.get(a.attr.as_str()))
+                        .is_some_and(|info| info.is_async);
+                }
                 Type::Class(name) => name,
                 Type::Generic(name, _) => name,
                 _ => return false,
@@ -3533,6 +3540,10 @@ pub struct ArityInfo {
     pub kwonly_types: Vec<Type>,
     /// Declared return type. `Type::Unknown` when unannotated.
     pub return_type: Type,
+    /// `true` when the free function is declared with `async def`.
+    /// Cross-module consumers need this to type an un-awaited call as
+    /// `Coroutine[..., T]` rather than the declared result `T`.
+    pub is_async: bool,
 }
 
 /// Declared interface (`interface Name:` → `class Name(Protocol):`). Bundles
@@ -6306,15 +6317,14 @@ pub fn extract_module_shapes_with(
     for stmt in &module.body {
         if let Stmt::FunctionDef(f) = stmt {
             let tps = type_param_names_from(f.type_params.as_deref());
-            function_arities.insert(
-                f.name.as_str().to_owned(),
-                arity_info_from_parameters_with_returns(
-                    f.parameters.as_ref(),
-                    f.returns.as_deref(),
-                    &classes,
-                    &tps,
-                ),
+            let mut info = arity_info_from_parameters_with_returns(
+                f.parameters.as_ref(),
+                f.returns.as_deref(),
+                &classes,
+                &tps,
             );
+            info.is_async = f.is_async;
+            function_arities.insert(f.name.as_str().to_owned(), info);
         }
     }
 
@@ -6659,6 +6669,9 @@ pub fn check_module_with_imports(
             c.function_arity_info
                 .entry(name.clone())
                 .or_insert_with(|| info.clone());
+            if info.is_async {
+                c.async_functions.insert(name.clone());
+            }
         }
         // Cross-module sealed unions: an imported `type Event = A | B`
         // must allow variant→union flow at this module's call sites,
@@ -10639,6 +10652,7 @@ fn class_constructor_arity_for(shape: &InterfaceShape, class_name: Option<&str>)
             param_types: Vec::new(),
             kwonly_types: param_types,
             return_type,
+            is_async: false,
         };
     }
     ArityInfo {
@@ -10654,6 +10668,7 @@ fn class_constructor_arity_for(shape: &InterfaceShape, class_name: Option<&str>)
         param_types,
         kwonly_types: Vec::new(),
         return_type,
+        is_async: false,
     }
 }
 
@@ -11494,6 +11509,7 @@ fn arity_info_from_parameters_with_returns(
         param_types,
         kwonly_types,
         return_type,
+        is_async: false,
     }
 }
 
@@ -36413,6 +36429,104 @@ def label(p: Point) -> float:
                 .any(|e| e.to_string().contains("totally_bogus_attr")),
             "must still flag bogus attr on a fully-known cross-module class; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn imported_async_function_call_is_a_coroutine() {
+        let producer_prep = preprocess("pub async def make() -> str:\n    return \"ready\"\n");
+        let producer_module = tyc_syntax::parse_module(&producer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let producer_shapes = extract_module_shapes(&producer_module);
+        let make_info = producer_shapes
+            .function_arities
+            .get("make")
+            .expect("async function exported")
+            .clone();
+        assert!(make_info.is_async);
+
+        let consumer_src = "\
+from producer import make
+
+def use() -> None:
+    let value: str = make()
+";
+        let consumer_prep = preprocess(consumer_src);
+        let consumer_module = tyc_syntax::parse_module(&consumer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module(
+            "<consumer>".to_owned(),
+            &consumer_prep.python_source,
+            &consumer_module,
+        );
+        let mut external = ExternalShapes::default();
+        external
+            .function_arities
+            .insert("make".to_owned(), make_info);
+
+        let d = check_module_with_imports(
+            "<consumer>",
+            &consumer_prep.python_source,
+            &resolved,
+            &consumer_module,
+            &consumer_prep.unsafe_lines,
+            &consumer_prep.frozen_class_lines,
+            &consumer_prep.impl_distributed_lines,
+            Some(&external),
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "an imported async call must not masquerade as its declared result: {d:?}"
+        );
+    }
+
+    #[test]
+    fn module_qualified_async_function_call_is_a_coroutine() {
+        let producer_prep = preprocess("pub async def make() -> str:\n    return \"ready\"\n");
+        let producer_module = tyc_syntax::parse_module(&producer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let producer_shapes = extract_module_shapes(&producer_module);
+
+        let consumer_src = "\
+import producer
+
+def use() -> None:
+    let value: str = producer.make()
+";
+        let consumer_prep = preprocess(consumer_src);
+        let consumer_module = tyc_syntax::parse_module(&consumer_prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module(
+            "<consumer>".to_owned(),
+            &consumer_prep.python_source,
+            &consumer_module,
+        );
+        let mut external = ExternalShapes::default();
+        let mut by_module = HashMap::new();
+        by_module.insert("producer".to_owned(), producer_shapes);
+        external.by_module = std::sync::Arc::new(by_module);
+
+        let d = check_module_with_imports(
+            "<consumer>",
+            &consumer_prep.python_source,
+            &resolved,
+            &consumer_module,
+            &consumer_prep.unsafe_lines,
+            &consumer_prep.frozen_class_lines,
+            &consumer_prep.impl_distributed_lines,
+            Some(&external),
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "a module-qualified async call must be a coroutine: {d:?}"
         );
     }
 
