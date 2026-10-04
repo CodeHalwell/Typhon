@@ -150,6 +150,24 @@ grouped by workstream (W1–W7).
   `TypeVar("T")`, a `Generic[T]` base) they raised `NameError` and now
   report `tyc::unknown_name`. `Protocol` and the `collections.abc` names
   are unaffected: the build imports them.
+- **Diagnostic wording.**
+  - `tyc::non_exhaustive_match` names the subject by what it is. Only a
+    real sealed union is called one; an enum reads
+    "on enum \`Color\`: missing member(s) BLUE", and `Result`, `T?`,
+    `bool` and literal-union subjects are named by their type
+    ("on \`bool\`: missing case(s) False") instead of
+    "on sealed union \`bool\`".
+  - `tyc::unsafe_value_leak` recommends a checked cast spelled on the
+    escaping expression (`data["name"] as! str`) or an annotation inside the
+    block. It recommended `let typed: T = name` outside the block, which is
+    itself reported. A target `as!` cannot check gets only the annotation
+    advice.
+  - `tyc::nullable_use`: when the function already checks the value for
+    `None` above the use (`if self.conn is None: return`) but the narrowing
+    cannot reach it — a call, assignment, `await` or `yield` in between, a
+    check on another path, a closure that may run later — the help says so
+    and suggests copying a field into a local and guarding that, instead of
+    asking for a guard that is already there (W1-03).
 
 #### W2 — checker expressions
 

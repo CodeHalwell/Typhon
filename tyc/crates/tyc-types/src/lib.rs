@@ -6114,7 +6114,11 @@ impl<'a> Checker<'a> {
             },
             other => other.display(),
         };
-        let diag = TycError::nullable_use(name, display, &self.path, self.source, span.0, length);
+        let mut diag =
+            TycError::nullable_use(name, display, &self.path, self.source, span.0, length);
+        if let Some(guard) = prior_none_guard(self.source, name, span.0) {
+            diag = diag.with_existing_guard(name, guard);
+        }
         if warn_only {
             self.diagnostics.push_warning(diag);
         } else {
@@ -6234,18 +6238,42 @@ impl<'a> Checker<'a> {
     }
 
     fn non_exhaustive_match(&mut self, union_name: &str, missing: &str, span: (usize, usize)) {
+        self.push_non_exhaustive(span, |path, source, offset, length| {
+            TycError::non_exhaustive_match(union_name, missing, path, source, offset, length)
+        });
+    }
+
+    /// `tyc::non_exhaustive_match` over an `enum` subject.
+    fn non_exhaustive_enum_match(&mut self, enum_name: &str, missing: &str, span: (usize, usize)) {
+        self.push_non_exhaustive(span, |path, source, offset, length| {
+            TycError::non_exhaustive_enum_match(enum_name, missing, path, source, offset, length)
+        });
+    }
+
+    /// `tyc::non_exhaustive_match` over a closed subject that is not a
+    /// sealed union (`Result`, `T?`, `bool`, a literal union).
+    fn non_exhaustive_closed_match(
+        &mut self,
+        subject_type: &str,
+        missing: &str,
+        span: (usize, usize),
+    ) {
+        self.push_non_exhaustive(span, |path, source, offset, length| {
+            TycError::non_exhaustive_closed_match(subject_type, missing, path, source, offset, length)
+        });
+    }
+
+    fn push_non_exhaustive(
+        &mut self,
+        span: (usize, usize),
+        make: impl FnOnce(&str, &str, usize, usize) -> TycError,
+    ) {
         if self.unsafe_depth > 0 {
             return;
         }
         let length = span.1.saturating_sub(span.0).max(1);
-        self.diagnostics.push_error(TycError::non_exhaustive_match(
-            union_name,
-            missing,
-            &self.path,
-            self.source,
-            span.0,
-            length,
-        ));
+        let err = make(&self.path, self.source, span.0, length);
+        self.diagnostics.push_error(err);
     }
 
     fn typevar_bound_violation(
@@ -8265,6 +8293,82 @@ fn check_unsafe_return_leak(c: &mut Checker, expr: &Expr) {
     check_unsafe_leak_into(c, expr, &ret_ty);
 }
 
+/// The line of an earlier `None` check on `path` — `if path is None:`,
+/// `if path is not None:`, `if not path:`, `assert path`, `while path`,
+/// `isinstance(path, …)` — between the start of the enclosing `def` and
+/// `use_at`, as written. `tyc::nullable_use` re-words its help when the
+/// value is already checked somewhere the checker could not carry the
+/// narrowing from (W1-03): "add a guard" is wrong advice when the guard is
+/// three lines up. A text scan over the checked source, so it only answers
+/// "is there such a check above", never "does it dominate this use".
+fn prior_none_guard<'s>(source: &'s str, path: &str, use_at: usize) -> Option<&'s str> {
+    let is_ident = |seg: &str| {
+        let mut chars = seg.chars();
+        chars
+            .next()
+            .is_some_and(|ch| ch.is_alphabetic() || ch == '_')
+            && chars.all(|ch| ch.is_alphanumeric() || ch == '_')
+    };
+    if path.is_empty() || !path.split('.').all(is_ident) || use_at > source.len() {
+        return None;
+    }
+    let indent_of = |l: &str| l.len() - l.trim_start().len();
+    let use_line_start = source[..use_at].rfind('\n').map_or(0, |i| i + 1);
+    let use_indent = indent_of(&source[use_line_start..]);
+    // Walk back to the header of the enclosing `def` (the module start
+    // otherwise).
+    let mut region_start = 0;
+    let mut pos = use_line_start;
+    while pos > 0 {
+        let prev = source[..pos - 1].rfind('\n').map_or(0, |i| i + 1);
+        let line = &source[prev..pos - 1];
+        let t = line.trim_start();
+        if (t.starts_with("def ") || t.starts_with("async def ")) && indent_of(line) < use_indent {
+            region_start = prev;
+            break;
+        }
+        pos = prev;
+    }
+    let region = &source[region_start..use_at];
+    let continues_path = |ch: char| ch.is_alphanumeric() || ch == '_' || ch == '.';
+    let mut found = None;
+    for (i, _) in region.match_indices(path) {
+        let before = &region[..i];
+        let after = &region[i + path.len()..];
+        if before.chars().next_back().is_some_and(continues_path)
+            || after
+                .chars()
+                .next()
+                .is_some_and(|ch| continues_path(ch) || ch == '[' || ch == '(')
+        {
+            continue;
+        }
+        let rest = after.trim_start_matches([' ', '\t']);
+        let compared = ["is None", "is not None", "== None", "!= None"]
+            .iter()
+            .any(|op| rest.starts_with(op));
+        let last_word = before
+            .trim_end_matches([' ', '\t', '('])
+            .rsplit([' ', '\t', '\n', '('])
+            .next()
+            .unwrap_or("");
+        let tested = matches!(
+            last_word,
+            "if" | "elif" | "while" | "and" | "or" | "not" | "assert"
+        ) && (rest.is_empty()
+            || [":", ")", "\n", "and ", "or ", "else"]
+                .iter()
+                .any(|end| rest.starts_with(end)));
+        let isinstance = before.ends_with("isinstance(") && rest.starts_with(',');
+        if compared || tested || isinstance {
+            let line_start = region[..i].rfind('\n').map_or(0, |j| j + 1);
+            let line_end = region[i..].find('\n').map_or(region.len(), |j| i + j);
+            found = Some(region[line_start..line_end].trim());
+        }
+    }
+    found
+}
+
 /// Shared core of the `unsafe:` value-leak audit (Rule 5 / SKILL §5.9):
 /// fire `tyc::unsafe_value_leak` when a bare `Name` whose binding was
 /// first introduced inside an `unsafe:` block flows OUT into a
@@ -8349,9 +8453,24 @@ fn check_unsafe_leak_into(c: &mut Checker, expr: &Expr, target_ty: &Type) {
     );
     let length = span.1.saturating_sub(span.0).max(1);
     let target_display = target_ty.display();
+    // Suggest the checked cast spelled on the escaping expression itself
+    // (`data["name"] as! str`), parenthesised unless it is a plain operand.
+    let cast = checked_cast_target_supported(c, target_ty).then(|| {
+        let text = c.source.get(span.0..span.1).unwrap_or(name).trim();
+        let plain = matches!(
+            expr,
+            Expr::Name(_) | Expr::Attribute(_) | Expr::Subscript(_) | Expr::Call(_)
+        ) && !text.contains('\n');
+        if plain {
+            format!("{text} as! {target_display}")
+        } else {
+            format!("({}) as! {target_display}", text.replace('\n', " "))
+        }
+    });
     c.diagnostics.push_error(TycError::unsafe_value_leak(
         name,
         target_display,
+        cast,
         &c.path,
         c.source,
         span.0,
@@ -24437,7 +24556,7 @@ fn check_closed_match_exhaustiveness(
                 subject.range().start().to_usize(),
                 subject.range().end().to_usize(),
             );
-            c.non_exhaustive_match(&subject_type.display(), &missing.join(", "), span);
+            c.non_exhaustive_closed_match(&subject_type.display(), &missing.join(", "), span);
         }
     }
 }
@@ -24802,7 +24921,7 @@ fn check_enum_match_exhaustiveness(
         .collect();
     if !missing.is_empty() {
         let missing_str = missing.join(", ");
-        c.non_exhaustive_match(enum_name, &missing_str, subject_span);
+        c.non_exhaustive_enum_match(enum_name, &missing_str, subject_span);
     }
 }
 
@@ -41442,6 +41561,78 @@ def main() -> None:
             "{:?}",
             check_full(src).errors()
         );
+    }
+    fn nullable_helps(d: &Diagnostics) -> Vec<String> {
+        d.errors()
+            .iter()
+            .chain(d.warnings())
+            .filter(|e| matches!(e, TycError::NullableUse { .. }))
+            .map(|e| e.help_text().unwrap())
+            .collect()
+    }
+    #[test]
+    fn nullable_use_help_names_an_existing_guard_it_could_not_use() {
+        // The guard is right there, but `reset(b)` may rebind `b.conn`:
+        // "add a guard" would be wrong advice.
+        let src = "class Conn:\n    n: int\nclass Box:\n    conn: Conn?\ndef reset(b: Box) -> None:\n    b.conn = None\ndef f(b: Box) -> int:\n    if b.conn is None:\n        return 0\n    reset(b)\n    return b.conn.n\n";
+        let helps = nullable_helps(&check(src));
+        assert_eq!(helps.len(), 1, "{helps:?}");
+        assert!(helps[0].contains("already checked above (`if b.conn is None:`)"), "{}", helps[0]);
+        assert!(helps[0].contains("let conn = b.conn"), "{}", helps[0]);
+        // A local reassigned after its guard.
+        let src = "def find() -> str?:\n    return None\ndef f() -> int:\n    mut v: str? = find()\n    if v is None:\n        return 0\n    v = find()\n    return len(v)\n";
+        let helps = nullable_helps(&check(src));
+        assert_eq!(helps.len(), 1, "{helps:?}");
+        assert!(helps[0].contains("already checked above (`if v is None:`)"), "{}", helps[0]);
+        assert!(helps[0].contains("reassigned"), "{}", helps[0]);
+    }
+    #[test]
+    fn nullable_use_help_without_a_guard_still_suggests_one() {
+        for src in [
+            "def find() -> str?:\n    return None\ndef f() -> int:\n    let v: str? = find()\n    return len(v)\n",
+            // A check on a longer path, or in another function, is not a
+            // check on this value.
+            "class Conn:\n    n: int?\nclass Box:\n    conn: Conn?\ndef g(b: Box) -> bool:\n    return b.conn is None\ndef f(b: Box) -> int:\n    if b.conn.n is None:\n        return 0\n    return 1\n",
+        ] {
+            let helps = nullable_helps(&check(src));
+            assert!(!helps.is_empty(), "{src}");
+            assert!(
+                helps.iter().all(|h| h.starts_with("guard the value with")),
+                "{helps:?}"
+            );
+        }
+    }
+    #[test]
+    fn closed_subject_match_is_not_called_a_sealed_union() {
+        let d = check("def f(b: bool) -> int:\n    match b:\n        case True:\n            return 1\n    return 0\n");
+        let msgs: Vec<String> = d
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::NonExhaustiveMatch { .. }))
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(msgs, vec!["non-exhaustive `match` on `bool`: missing case(s) False".to_owned()]);
+        let d = check("class A:\n    n: int\nclass B:\n    n: int\ntype U = A | B\ndef f(u: U) -> int:\n    match u:\n        case A():\n            return 1\n    return 0\n");
+        assert!(
+            d.errors().iter().any(|e| e.to_string().contains("on sealed union `U`")),
+            "{:?}",
+            d.errors()
+        );
+    }
+    #[test]
+    fn unsafe_value_leak_help_recommends_a_checked_cast() {
+        let src = "import json\ndef f(raw: str) -> str:\n    unsafe:\n        let data = json.loads(raw)\n    return data[\"name\"]\n";
+        let prep = preprocess(src);
+        let d = check(src);
+        let helps: Vec<String> = d
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::UnsafeValueLeak { .. }))
+            .map(|e| e.help_text().unwrap())
+            .collect();
+        assert_eq!(helps.len(), 1, "{:?} / {}", d.errors(), prep.python_source);
+        assert!(helps[0].contains("`data[\"name\"] as! str`"), "{}", helps[0]);
+        assert!(!helps[0].contains("let typed"), "{}", helps[0]);
     }
 }
 

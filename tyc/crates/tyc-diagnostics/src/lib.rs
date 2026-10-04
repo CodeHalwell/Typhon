@@ -603,16 +603,22 @@ pub enum TycError {
         span: SourceSpan,
     },
 
-    /// A `match` on a sealed union does not cover all variants and has no wildcard arm.
-    #[error("non-exhaustive `match` on sealed union `{union_name}`: missing variant(s) {missing}")]
+    /// A `match` on a closed subject — a sealed union, an enum, `Result`,
+    /// `T?`, `bool` or a literal union — does not cover every value and has
+    /// no wildcard arm. `subject` is already phrased ("sealed union
+    /// `Shape`", "enum `Color`", "`bool`"): only a real sealed union is
+    /// called one.
+    #[error("non-exhaustive `match` on {subject}: missing {noun} {missing}")]
     #[diagnostic(
         code(tyc::non_exhaustive_match),
-        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/non_exhaustive_match.md"),
-        help("add a `case <Variant>():` arm for each missing variant, or add a `case _:` wildcard arm")
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/non_exhaustive_match.md")
     )]
     NonExhaustiveMatch {
-        union_name: String,
+        subject: String,
+        noun: &'static str,
         missing: String,
+        #[help]
+        help: String,
         #[source_code]
         src: NamedSource<String>,
         #[label("match is not exhaustive")]
@@ -773,11 +779,12 @@ pub enum TycError {
     #[diagnostic(
         code(tyc::unsafe_value_leak),
         url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/unsafe_value_leak.md"),
-        help("re-assert the type before returning, e.g. `let typed: {return_ty} = {name}` outside the unsafe block, or annotate the assignment inside `unsafe:` with `let {name}: {return_ty} = …` so the compiler can verify the cross")
     )]
     UnsafeValueLeak {
         name: String,
         return_ty: String,
+        #[help]
+        help: String,
         #[source_code]
         src: NamedSource<String>,
         #[label("unsafe value crosses into safe-typed return")]
@@ -2569,6 +2576,49 @@ impl TycError {
         }
     }
 
+    /// The rendered `help:` text, for callers (and tests) that do not depend
+    /// on miette themselves.
+    pub fn help_text(&self) -> Option<String> {
+        Diagnostic::help(self).map(|h| h.to_string())
+    }
+
+    /// Re-word a [`TycError::NullableUse`] whose value the function already
+    /// checks for `None` (`guard` is that check's line, as written) in a
+    /// way the checker could not carry to this use. "Add a guard" is wrong
+    /// advice when the guard is three lines up (review 2026-10-03 §4.2,
+    /// W1-03); say why the narrowing may have been lost and how to keep it.
+    /// Any other diagnostic is returned unchanged.
+    #[must_use]
+    pub fn with_existing_guard(mut self, name: &str, guard: &str) -> Self {
+        if let Self::NullableUse { advice, .. } = &mut self {
+            let guard = guard.trim();
+            *advice = match name.rsplit_once('.') {
+                // A field path: the usual cause is a call or assignment in
+                // between that may rebind the field (or another alias of
+                // the object). A local copy cannot be rebound behind the
+                // checker's back.
+                Some((_, field)) => format!(
+                    "`{name}` is already checked above (`{guard}`), but that narrowing does not \
+                     reach this use: a call, assignment, `await` or `yield` in between may have \
+                     changed the field, or the check is on another path. Copy it into a local \
+                     and guard that instead (`let {field} = {name}`, then `if {field} is not \
+                     None:` and use `{field}`), or repeat the check right before this use"
+                ),
+                // A local: it was reassigned in between, the check is on
+                // another path, or this use is in a closure that may run
+                // after a later reassignment.
+                None => format!(
+                    "`{name}` is already checked above (`{guard}`), but that narrowing does not \
+                     reach this use: `{name}` may be reassigned in between, the check may be on \
+                     another path, or this use is inside a closure that can run after a later \
+                     reassignment. Repeat the check right before this use, or bind the checked \
+                     value to a new `let` name and use that"
+                ),
+            };
+        }
+        self
+    }
+
     /// Construct a [`TycError::NullableUse`] diagnostic for a value whose
     /// type is exactly `None` — `None.attr`, `None[0]`, or the result of a
     /// `-> None` function used as a receiver or operand. Same code, since it
@@ -2768,8 +2818,58 @@ impl TycError {
         length: usize,
     ) -> Self {
         Self::NonExhaustiveMatch {
-            union_name: union_name.into(),
+            subject: format!("sealed union `{}`", union_name.into()),
+            noun: "variant(s)",
             missing: missing.into(),
+            help: "add a `case <Variant>():` arm for each missing variant, or add a `case _:` wildcard arm".into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// [`TycError::NonExhaustiveMatch`] over an `enum`: the missing values
+    /// are its members.
+    pub fn non_exhaustive_enum_match(
+        enum_name: impl Into<String>,
+        missing: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        let enum_name = enum_name.into();
+        Self::NonExhaustiveMatch {
+            help: format!(
+                "add a `case {enum_name}.<MEMBER>:` arm for each missing member, or add a `case _:` wildcard arm"
+            ),
+            subject: format!("enum `{enum_name}`"),
+            noun: "member(s)",
+            missing: missing.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// [`TycError::NonExhaustiveMatch`] over any other closed subject —
+    /// `Result[T, E]`, `T?`, `bool` or a literal union — named by its type
+    /// (`on \`bool\``), since it is not a sealed union.
+    pub fn non_exhaustive_closed_match(
+        subject_type: impl Into<String>,
+        missing: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        let missing = missing.into();
+        let example = missing.split(", ").next().unwrap_or("_").to_owned();
+        Self::NonExhaustiveMatch {
+            subject: format!("`{}`", subject_type.into()),
+            noun: "case(s)",
+            help: format!(
+                "add an arm for each missing case (e.g. `case {example}:`), or add a `case _:` wildcard arm"
+            ),
+            missing,
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }
@@ -2893,17 +2993,34 @@ impl TycError {
     }
 
     /// Construct a [`TycError::UnsafeValueLeak`] diagnostic. O14 / FINDINGS #107.
+    ///
+    /// `cast` is the checked cast to suggest (`data as! int`), or `None`
+    /// when the target has no runtime check `as!` could perform (a
+    /// `Callable`, a bare type parameter, …). An annotated re-bind outside
+    /// the block (`let typed: T = name`) is never suggested: it is itself a
+    /// concrete boundary and is reported the same way.
     pub fn unsafe_value_leak(
         name: impl Into<String>,
         return_ty: impl Into<String>,
+        cast: Option<String>,
         path: impl Into<String>,
         source: impl Into<String>,
         offset: usize,
         length: usize,
     ) -> Self {
+        let name = name.into();
+        let return_ty = return_ty.into();
+        let annotate = format!(
+            "annotate the binding inside `unsafe:` (`let {name}: {return_ty} = …`) so the compiler can verify the crossing"
+        );
+        let help = match cast {
+            Some(cast) => format!("check the type at the boundary with `{cast}`, or {annotate}"),
+            None => format!("{annotate}; `as!` cannot check `{return_ty}` at runtime"),
+        };
         Self::UnsafeValueLeak {
-            name: name.into(),
-            return_ty: return_ty.into(),
+            help,
+            name,
+            return_ty,
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }
@@ -5906,8 +6023,22 @@ mod tests {
         let e = TycError::non_exhaustive_match("Shape", "Circle", "a.ty", "match s:", 0, 7);
         assert!(matches!(e, TycError::NonExhaustiveMatch { .. }));
         let msg = e.to_string();
-        assert!(msg.contains("Shape"));
+        assert!(msg.contains("sealed union `Shape`"), "{msg}");
         assert!(msg.contains("Circle"));
+    }
+
+    #[test]
+    fn non_exhaustive_match_names_a_closed_subject_by_its_type() {
+        let e = TycError::non_exhaustive_closed_match("bool", "False", "a.ty", "match b:", 0, 7);
+        let msg = e.to_string();
+        assert_eq!(msg, "non-exhaustive `match` on `bool`: missing case(s) False");
+        let help = miette::Diagnostic::help(&e).unwrap().to_string();
+        assert!(help.contains("`case False:`"), "{help}");
+        let e = TycError::non_exhaustive_enum_match("Color", "BLUE", "a.ty", "match c:", 0, 7);
+        assert_eq!(
+            e.to_string(),
+            "non-exhaustive `match` on enum `Color`: missing member(s) BLUE"
+        );
     }
 
     #[test]
