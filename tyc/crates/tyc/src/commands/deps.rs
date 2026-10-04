@@ -381,6 +381,12 @@ fn pep508(name: &str, version: &str) -> String {
     if v.is_empty() || v == "*" {
         return name.to_owned();
     }
+    // A PEP 508 direct reference (`tyc add pkg@git+https://…`): the URL
+    // follows `name @ `. It used to render as `pkg==git+https://…`, which no
+    // installer accepts (W4-15).
+    if is_direct_reference(v) {
+        return format!("{name} @ {v}");
+    }
     let starts_with_op = ["===", "==", ">=", "<=", "!=", "~=", ">", "<", "@"]
         .iter()
         .any(|op| v.starts_with(op));
@@ -388,6 +394,11 @@ fn pep508(name: &str, version: &str) -> String {
         return format!("{name}{v}");
     }
     format!("{name}=={v}")
+}
+
+/// A dependency "version" that is really a URL: a PEP 508 direct reference.
+fn is_direct_reference(v: &str) -> bool {
+    v.contains("://") || v.starts_with("file:")
 }
 
 fn toml_escape(s: &str) -> String {
@@ -500,10 +511,19 @@ pub(crate) fn apply_owned_keys(doc: &mut toml_edit::DocumentMut, config: &Typhon
     };
 
     project.insert("name", value(default_str(&config.project.name, "untitled")));
-    project.insert(
-        "version",
-        value(default_str(&config.project.version, "0.1.0")),
-    );
+    // A project that declares `dynamic = ["version"]` has its build backend
+    // compute the version; a static `version` beside it is invalid PEP 621
+    // and `uv sync` refused the whole file (W4-15). Leave it to the backend.
+    let dynamic_version = project
+        .get("dynamic")
+        .and_then(Item::as_array)
+        .is_some_and(|a| a.iter().any(|v| v.as_str() == Some("version")));
+    if !dynamic_version {
+        project.insert(
+            "version",
+            value(default_str(&config.project.version, "0.1.0")),
+        );
+    }
     project.insert(
         "requires-python",
         value(requires_python_specifier(&config.python.target)),
@@ -782,6 +802,35 @@ mod tests {
     fn split_spec_handles_pep440_op() {
         assert_eq!(split_spec("requests>=2,<3"), ("requests", Some(">=2,<3")));
         assert_eq!(split_spec("urllib3==1.26.0"), ("urllib3", Some("==1.26.0")));
+    }
+
+    /// W4-15: `tyc add pkg@git+https://…` is a PEP 508 direct reference.
+    #[test]
+    fn pep508_renders_direct_references() {
+        let (name, version) = split_spec("pkg@git+https://github.com/o/pkg@v1.2");
+        assert_eq!(
+            pep508(name, version.unwrap()),
+            "pkg @ git+https://github.com/o/pkg@v1.2"
+        );
+        let (name, version) = split_spec("pkg @ file:///tmp/pkg");
+        assert_eq!(pep508(name, version.unwrap()), "pkg @ file:///tmp/pkg");
+        assert_eq!(pep508("requests", "2.31"), "requests==2.31");
+    }
+
+    /// W4-15: the merge must not add a static `version` beside
+    /// `dynamic = ["version"]` — `uv sync` rejects that combination.
+    #[test]
+    fn merge_respects_a_dynamic_version() {
+        let mut doc: toml_edit::DocumentMut = "[project]\nname = \"p\"\ndynamic = [\"version\"]\n"
+            .parse()
+            .unwrap();
+        let config = crate::config::TyphonConfig::default();
+        apply_owned_keys(&mut doc, &config);
+        let project = doc["project"].as_table().unwrap();
+        assert!(!project.contains_key("version"), "{doc}");
+        let mut doc: toml_edit::DocumentMut = "[project]\nname = \"p\"\n".parse().unwrap();
+        apply_owned_keys(&mut doc, &config);
+        assert!(doc["project"].as_table().unwrap().contains_key("version"));
     }
 
     #[test]

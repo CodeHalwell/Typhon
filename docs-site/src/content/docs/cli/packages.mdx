@@ -19,6 +19,7 @@ Rewrites `[dependencies]` / `[dev-dependencies]` in `typhon.toml`, generates a `
 tyc add requests                      # add a runtime dep at the latest version
 tyc add httpx@0.27                    # add at a specific version
 tyc add --dev pytest@8.2              # dev dep
+tyc add mylib@git+https://github.com/me/mylib@v1   # PEP 508 direct reference
 tyc remove rich                       # remove
 tyc sync                              # materialise pyproject.toml and `uv sync`
 tyc sync --dry-run                    # preview the generated pyproject.toml
@@ -34,7 +35,12 @@ Inserts the package into `[dependencies]` (or `[dev-dependencies]` with `--dev`)
 requests = ">=2.31"      # version range
 rich = "*"               # any version (bare name in tyc add)
 httpx = "0.27"           # bare version → "==0.27"
+mylib = "git+https://github.com/me/mylib@v1"   # URL → "mylib @ git+https://…"
 ```
+
+A value containing `://` (or starting with `file:`) is a [PEP 508 direct reference](https://peps.python.org/pep-0508/) and lands in `pyproject.toml` as `name @ URL`.
+
+When `pyproject.toml` declares `dynamic = ["version"]`, the merge leaves `version` to the build backend instead of writing the static `[project] version` beside it (which `uv sync` rejects).
 
 ## `tyc remove`
 

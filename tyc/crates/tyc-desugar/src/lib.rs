@@ -24,12 +24,13 @@ use ruff_python_ast::name::Name;
 use ruff_python_ast::{
     self as ast, Alias, Arguments, AtomicNodeIndex, Decorator, ExceptHandler, Expr, ExprAttribute,
     ExprBooleanLiteral, ExprCall, ExprContext, ExprName, ExprStringLiteral, Identifier, Keyword,
-    ModModule, Operator, Parameter, ParameterWithDefault, Parameters, Pattern, Stmt, StmtAssign,
-    StmtImport, StmtImportFrom, StringLiteral, StringLiteralFlags, StringLiteralValue,
+    ModModule, Parameter, ParameterWithDefault, Parameters, Pattern, Stmt, StmtAssign, StmtImport,
+    StmtImportFrom, StringLiteral, StringLiteralFlags, StringLiteralValue,
 };
 use ruff_text_size::TextRange;
 
-mod impl_site;
+use tyc_syntax::impl_site;
+use tyc_syntax::impl_site::collect_sealed_union_aliases;
 
 // ── public API ───────────────────────────────────────────────────────────────
 
@@ -47,9 +48,15 @@ pub struct DesugarOutput {
 #[derive(Debug, Clone)]
 pub struct DesugarOptions {
     /// Names of top-level functions to wrap in `@functools.cache`. Populated
-    /// from the purity analyser when the user opts into `@memo` /
-    /// `@pure(memo=True)` / `[strictness] auto-memoise = true`.
+    /// from the purity analyser for an explicit `@memo` /
+    /// `@pure(memo=True)`.
     pub memoise_functions: Vec<String>,
+    /// Names of top-level functions a *silent* optimisation (`auto-memoise`,
+    /// `pgo-memoise`, `-O`) caches: wrapped in
+    /// `@functools.lru_cache(maxsize=AUTO_MEMOISE_MAXSIZE, typed=True)`, so
+    /// equal-but-differently-typed arguments (`1.0` / `True`) never share an
+    /// entry and the cache cannot retain every argument it ever saw.
+    pub auto_memoise_functions: Vec<String>,
     /// Byte offsets (start of the line) at which a `class!` declaration
     /// appears in the *preprocessed* source.  A class whose `TextRange`
     /// starts at or just after one of these offsets is treated as raw and
@@ -123,6 +130,7 @@ impl Default for DesugarOptions {
     fn default() -> Self {
         Self {
             memoise_functions: Vec::new(),
+            auto_memoise_functions: Vec::new(),
             raw_class_line_starts: Vec::new(),
             frozen_class_line_starts: Vec::new(),
             plain_class_line_starts: Vec::new(),
@@ -1841,8 +1849,11 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
     // Inject `@functools.cache` on every top-level function name the purity
     // analyser flagged as opted-into memoisation.  Returns whether any cache
     // decorator was added so we can also inject `import functools` once.
-    let (with_caches, added_cache) =
-        inject_memoise_decorators(merged_body, &options.memoise_functions);
+    let (with_caches, added_cache) = inject_memoise_decorators(
+        merged_body,
+        &options.memoise_functions,
+        &options.auto_memoise_functions,
+    );
 
     let needs_dataclasses = transformed_classes && !has_dataclasses_import(&m.body);
     let needs_functools = added_cache && !has_functools_import(&with_caches);
@@ -1905,7 +1916,11 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
 /// `def f`). Stripping of `@pure` / `@memo` markers, by contrast, recurses
 /// everywhere — otherwise those Typhon-only names would leak into the
 /// emitted Python and raise `NameError` at import time.
-fn inject_memoise_decorators(body: Vec<Stmt>, memoise: &[String]) -> (Vec<Stmt>, bool) {
+fn inject_memoise_decorators(
+    body: Vec<Stmt>,
+    memoise: &[String],
+    auto_memoise: &[String],
+) -> (Vec<Stmt>, bool) {
     let mut added = false;
     // Names this module binds for itself — a user or third-party `pure` /
     // `memo` / `gatherable` is not Typhon's marker and must survive.
@@ -1916,12 +1931,16 @@ fn inject_memoise_decorators(body: Vec<Stmt>, memoise: &[String]) -> (Vec<Stmt>,
             Stmt::FunctionDef(mut f) => {
                 f.decorator_list = strip_purity_decorators_with(f.decorator_list, &shadowed);
                 f.body = strip_purity_decorators_in_body_with(f.body, &shadowed);
-                if memoise.iter().any(|n| n == f.name.as_str())
-                    && !has_cache_decorator(&f.decorator_list)
-                {
-                    f.decorator_list
-                        .insert(0, make_functools_dot_cache_decorator());
-                    added = true;
+                if !has_cache_decorator(&f.decorator_list) {
+                    if memoise.iter().any(|n| n == f.name.as_str()) {
+                        f.decorator_list
+                            .insert(0, make_functools_dot_cache_decorator());
+                        added = true;
+                    } else if auto_memoise.iter().any(|n| n == f.name.as_str()) {
+                        f.decorator_list
+                            .insert(0, make_bounded_typed_lru_cache_decorator());
+                        added = true;
+                    }
                 }
                 Stmt::FunctionDef(f)
             }
@@ -2150,6 +2169,60 @@ fn make_functools_dot_cache_decorator() -> Decorator {
         range: TextRange::default(),
         node_index: AtomicNodeIndex::NONE,
         expression: expr,
+    }
+}
+
+/// Entry bound of the cache a silent memoisation path (`auto-memoise`,
+/// `pgo-memoise`, `-O`) emits.
+pub const AUTO_MEMOISE_MAXSIZE: usize = 1024;
+
+/// Build `@functools.lru_cache(maxsize=AUTO_MEMOISE_MAXSIZE, typed=True)`.
+fn make_bounded_typed_lru_cache_decorator() -> Decorator {
+    let func = Expr::Attribute(ExprAttribute {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        value: Box::new(Expr::Name(ExprName {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            id: Name::new("functools"),
+            ctx: ExprContext::Load,
+        })),
+        attr: make_identifier("lru_cache"),
+        ctx: ExprContext::Load,
+    });
+    let keyword = |name: &str, value: Expr| ruff_python_ast::Keyword {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        arg: Some(make_identifier(name)),
+        value,
+    };
+    let maxsize = Expr::NumberLiteral(ruff_python_ast::ExprNumberLiteral {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        value: ruff_python_ast::Number::Int(ruff_python_ast::Int::from(
+            AUTO_MEMOISE_MAXSIZE as u64,
+        )),
+    });
+    let typed = Expr::BooleanLiteral(ruff_python_ast::ExprBooleanLiteral {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        value: true,
+    });
+    let call = Expr::Call(ExprCall {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        func: Box::new(func),
+        arguments: ruff_python_ast::Arguments {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            args: Box::new([]),
+            keywords: Box::new([keyword("maxsize", maxsize), keyword("typed", typed)]),
+        },
+    });
+    Decorator {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        expression: call,
     }
 }
 
@@ -4177,58 +4250,6 @@ fn make_string_literal_expr(text: &str) -> Expr {
 /// Name prefix the preprocessor gives every `impl` pseudo-class.
 const IMPL_PREFIX: &str = "__typhon_impl_";
 
-/// Walk `expr` collecting every bare `Name` operand of a flat `A | B | …`
-/// union expression. Returns `None` for any other shape so `type X = A`
-/// (single name, no union) and `type X = list[A]` (generic) don't get
-/// mistaken for sealed unions. Mirrors
-/// `tyc_types::extract_sealed_union_variants` so the desugar doesn't need
-/// a cross-crate dep. R2-3.
-fn collect_union_variant_names(expr: &Expr) -> Option<Vec<String>> {
-    let mut names = Vec::new();
-    let mut stack = vec![expr];
-    while let Some(current) = stack.pop() {
-        match current {
-            Expr::Name(n) => names.push(n.id.as_str().to_owned()),
-            // Push `right` first so the stack pops left-to-right: a
-            // `BinOp` reads `A | B | C` as
-            // `BinOp(BinOp(A, B), C)` — pushing left last makes the
-            // visitor descend leftmost first and preserves source
-            // order in `names`. Without this the variants end up in
-            // reverse order, contradicting the docstring on the
-            // caller (`collect_sealed_union_aliases`). PR #129
-            // gemini review.
-            Expr::BinOp(b) if matches!(b.op, Operator::BitOr) => {
-                stack.push(&b.right);
-                stack.push(&b.left);
-            }
-            _ => return None,
-        }
-    }
-    if names.len() >= 2 {
-        Some(names)
-    } else {
-        None
-    }
-}
-
-/// Collect every sealed-union type alias declared at module scope so
-/// `impl Union:` can distribute its methods across every variant.
-/// Keyed by the alias name; values are the ordered variant class names
-/// as they appear in `type Union = A | B | C`. R2-3.
-fn collect_sealed_union_aliases(body: &[Stmt]) -> HashMap<String, Vec<String>> {
-    let mut out = HashMap::new();
-    for stmt in body {
-        if let Stmt::TypeAlias(ta) = stmt {
-            if let Expr::Name(n) = ta.name.as_ref() {
-                if let Some(variants) = collect_union_variant_names(&ta.value) {
-                    out.insert(n.id.as_str().to_owned(), variants);
-                }
-            }
-        }
-    }
-    out
-}
-
 // ── H0: bare `super()` rewrite ─────────────────────────────────────────────
 
 /// Rewrite every bare zero-argument `super()` call appearing inside a method
@@ -4432,24 +4453,7 @@ fn merge_impl_blocks(body: Vec<Stmt>) -> (Vec<Stmt>, bool) {
     };
     // Every name the merged class body binds: its own members plus every
     // `impl` method aimed at it.
-    let mut class_scope: HashMap<String, HashSet<String>> = HashMap::new();
-    for stmt in &body {
-        if let Stmt::ClassDef(c) = stmt {
-            if !c.name.as_str().starts_with(IMPL_PREFIX) {
-                impl_site::class_body_names(
-                    &c.body,
-                    class_scope.entry(c.name.as_str().to_owned()).or_default(),
-                );
-            }
-        }
-    }
-    for (impl_idx, target_name) in &impl_indices {
-        if let Stmt::ClassDef(c) = &body[*impl_idx] {
-            for target in targets_of(target_name) {
-                impl_site::class_body_names(&c.body, class_scope.entry(target).or_default());
-            }
-        }
-    }
+    let class_scope = impl_site::class_scopes(&body, IMPL_PREFIX, &union_aliases);
     let planner = impl_site::ImplSitePlanner::new(&body, IMPL_PREFIX);
     for (impl_idx, target_name) in &impl_indices {
         if let Stmt::ClassDef(c) = &body[*impl_idx] {
@@ -5346,6 +5350,32 @@ class Grand(Child):
             !out.contains("default_factory"),
             "no default_factory rewrite for a ClassVar field; got:\n{out}"
         );
+    }
+
+    /// W3-05: a silent memoisation path emits a bounded, typed cache — an
+    /// untyped `functools.cache` answered `show(True)` with the result for
+    /// `show(1.0)`. An explicit `@memo` keeps `functools.cache`.
+    #[test]
+    fn auto_memoised_functions_get_a_bounded_typed_lru_cache() {
+        let src = "def show(x: int) -> str:\n    return repr(x)\n\ndef fib(n: int) -> int:\n    return n\n";
+        let module = tyc_syntax::parse_module(src)
+            .expect("parse failed")
+            .into_syntax();
+        let out = desugar_module_with(
+            &module,
+            DesugarOptions {
+                memoise_functions: vec!["fib".to_owned()],
+                auto_memoise_functions: vec!["show".to_owned()],
+                ..Default::default()
+            },
+        );
+        let emitted = tyc_emit::emit(&out.module);
+        assert!(
+            emitted.contains("@functools.lru_cache(maxsize=1024, typed=True)\ndef show("),
+            "{emitted}"
+        );
+        assert!(emitted.contains("@functools.cache\ndef fib("), "{emitted}");
+        assert!(emitted.contains("import functools"), "{emitted}");
     }
 
     #[test]
@@ -7247,6 +7277,25 @@ class __typhon_impl_Shape(object):
             "class C:\n    x: int\nK = 1\nclass __typhon_impl_C(object):\n    def m(k: int = K) -> int:\n        return k\nclass D(C):\n    pass\n",
         );
         assert!(out.contains("C.m = __typhon_extend_C__m"), "{out}");
+    }
+
+    #[test]
+    fn impl_method_on_a_builtin_exception_subclass_moves_unless_the_base_has_it() {
+        // `Exception` has no `describe`: nothing to inherit, so the method is
+        // attached at its block like on a base-less class.
+        let out = parse_and_desugar(
+            "class AppError(Exception):\n    code: int\nPREFIX = \"E\"\nclass __typhon_impl_AppError(object):\n    def describe(p: str = PREFIX) -> str:\n        return p\n",
+        );
+        assert!(
+            out.contains("AppError.describe = __typhon_extend_AppError__describe"),
+            "{out}"
+        );
+        // `with_traceback` is an `Exception` member: the VM would find the
+        // inherited one first, so it stays merged.
+        let out = parse_and_desugar(
+            "class AppError(ValueError):\n    code: int\nK = 1\nclass __typhon_impl_AppError(object):\n    def with_traceback(k: int = K) -> int:\n        return k\n",
+        );
+        assert!(!out.contains("__typhon_extend_"), "{out}");
     }
 
     #[test]

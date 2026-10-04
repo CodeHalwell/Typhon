@@ -5,8 +5,10 @@
 
 mod cli;
 mod commands;
-mod config;
 mod signals;
+
+/// `typhon.toml` loading lives in `tyc-venv` so the language server shares it.
+use tyc_venv::config;
 
 use miette::Result;
 

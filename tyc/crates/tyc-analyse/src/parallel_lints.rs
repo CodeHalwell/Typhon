@@ -17,9 +17,12 @@
 //!   [`crate::reductions::detect_reduction_loops`]).
 //!
 //! * `tyc::shared_mut_across_tasks` flags a `go`-spawned same-module function
-//!   that writes module-level mutable state — a `global` assignment or a write
-//!   to a module-level `mut` binding — since under free-threaded Python that
-//!   spawned task runs concurrently with the spawner.
+//!   that writes module-level mutable state — a `global` assignment, a write
+//!   to a module-level `mut` binding, an in-place mutation of module-level
+//!   state (`SEEN[k] = …`, `LOG.append(…)`, `del CACHE[k]`, `Cls.attr = …`),
+//!   or a call to a same-module helper that does any of these — since under
+//!   free-threaded Python that spawned task runs concurrently with the
+//!   spawner.
 
 use std::collections::{HashMap, HashSet};
 
@@ -159,16 +162,25 @@ pub fn shared_mut_across_tasks_diagnostics(
     }
 
     // Cache the "writes shared state" verdict per function name.
-    let mut verdict: HashMap<&str, bool> = HashMap::new();
+    let ctx = SharedWriteCtx {
+        module_names: module_level_names(&module.body),
+        module_muts: &module_muts,
+        fns: module
+            .body
+            .iter()
+            .filter_map(|stmt| match stmt {
+                Stmt::FunctionDef(f) => Some((f.name.as_str(), f)),
+                _ => None,
+            })
+            .collect(),
+        cache: std::cell::RefCell::new(HashMap::new()),
+    };
 
     for spawn in collect_go_spawns(module) {
-        let Some(body) = fn_bodies.get(spawn.callee) else {
+        if !fn_bodies.contains_key(spawn.callee) {
             continue; // not a bare-name same-module def — stay conservative
-        };
-        let writes = *verdict
-            .entry(spawn.callee)
-            .or_insert_with(|| fn_writes_shared_state(body, &module_muts));
-        if writes {
+        }
+        if ctx.writes(spawn.callee, &mut HashSet::new()) {
             let offset = spawn.range.start().to_usize();
             let length = spawn.range.end().to_usize().saturating_sub(offset).max(1);
             diags.push_warning(TycError::shared_mut_across_tasks(
@@ -303,13 +315,324 @@ fn is_spawn_call(call: &ExprCall) -> bool {
     matches!(tasks.value.as_ref(), Expr::Name(n) if n.id.as_str() == "typhon_runtime")
 }
 
-/// True when the function body writes module-level mutable state: an
-/// assignment / augmented-assignment to a name declared `global` in the body,
-/// or to a module-level `mut` binding.
-fn fn_writes_shared_state<'a>(body: &'a [Stmt], module_muts: &HashSet<&str>) -> bool {
-    let mut globals: HashSet<&'a str> = HashSet::new();
-    collect_globals(body, &mut globals);
-    body_writes(body, &globals, module_muts)
+/// Methods that mutate their receiver in place (`list`, `dict`, `set`,
+/// `deque`, `bytearray`): calling one on module-level state from a spawned
+/// task is a shared write.
+const MUTATING_METHODS: &[&str] = &[
+    "append",
+    "extend",
+    "insert",
+    "pop",
+    "remove",
+    "clear",
+    "update",
+    "add",
+    "discard",
+    "setdefault",
+    "popitem",
+    "sort",
+    "reverse",
+    "appendleft",
+    "extendleft",
+    "popleft",
+    "rotate",
+    "difference_update",
+    "intersection_update",
+    "symmetric_difference_update",
+    "__setitem__",
+    "__delitem__",
+];
+
+/// What a function may write on a spawned task's behalf.
+struct SharedWriteCtx<'a, 'm> {
+    /// Every name bound at module level (`let`, `mut`, plain assignment,
+    /// classes): mutating one in place is a shared write.
+    module_names: HashSet<&'a str>,
+    /// Module-level `mut` bindings: rebinding one is a shared write.
+    module_muts: &'m HashSet<&'a str>,
+    fns: HashMap<&'a str, &'a ruff_python_ast::StmtFunctionDef>,
+    cache: std::cell::RefCell<HashMap<&'a str, bool>>,
+}
+
+impl<'a> SharedWriteCtx<'a, '_> {
+    /// True when the same-module function `name` writes module-level state —
+    /// rebinds a `global` / module `mut`, mutates module-level state in place
+    /// (`SEEN[k] = …`, `LOG.append(…)`, `Cls.attr = …`, `del CACHE[k]`) — or
+    /// calls a same-module helper that does.
+    fn writes(&self, name: &'a str, visiting: &mut HashSet<&'a str>) -> bool {
+        if let Some(&known) = self.cache.borrow().get(name) {
+            return known;
+        }
+        let Some(f) = self.fns.get(name) else {
+            return false;
+        };
+        if !visiting.insert(name) {
+            return false;
+        }
+        let mut globals: HashSet<&'a str> = HashSet::new();
+        collect_globals(&f.body, &mut globals);
+        let mut locals: HashSet<&'a str> = HashSet::new();
+        for p in f.parameters.iter() {
+            locals.insert(p.name().as_str());
+        }
+        collect_local_bindings(&f.body, &mut locals);
+        for g in &globals {
+            locals.remove(g);
+        }
+        let mut finder = WriteFinder {
+            globals: &globals,
+            locals: &locals,
+            ctx: self,
+            found: false,
+            helpers: Vec::new(),
+        };
+        for stmt in &f.body {
+            finder.visit_stmt(stmt);
+        }
+        let writes = finder.found
+            || finder
+                .helpers
+                .clone()
+                .into_iter()
+                .any(|h| self.writes(h, visiting));
+        visiting.remove(name);
+        self.cache.borrow_mut().insert(name, writes);
+        writes
+    }
+}
+
+struct WriteFinder<'a, 'c, 'm> {
+    globals: &'c HashSet<&'a str>,
+    locals: &'c HashSet<&'a str>,
+    ctx: &'c SharedWriteCtx<'a, 'm>,
+    found: bool,
+    helpers: Vec<&'a str>,
+}
+
+impl WriteFinder<'_, '_, '_> {
+    fn rebinds_shared(&self, name: &str) -> bool {
+        self.globals.contains(name) || self.ctx.module_muts.contains(name)
+    }
+
+    fn is_shared_root(&self, name: &str) -> bool {
+        !self.locals.contains(name)
+            && (self.globals.contains(name) || self.ctx.module_names.contains(name))
+    }
+
+    /// A store into module-level state: a rebinding of a shared name, or an
+    /// item / attribute store whose root is one.
+    fn target_writes(&self, target: &Expr) -> bool {
+        match target {
+            Expr::Name(n) => self.rebinds_shared(n.id.as_str()),
+            Expr::Subscript(_) | Expr::Attribute(_) => {
+                root_name(target).is_some_and(|r| self.is_shared_root(r))
+            }
+            Expr::Tuple(t) => t.elts.iter().any(|e| self.target_writes(e)),
+            Expr::List(l) => l.elts.iter().any(|e| self.target_writes(e)),
+            Expr::Starred(s) => self.target_writes(&s.value),
+            _ => false,
+        }
+    }
+}
+
+impl<'a> SourceOrderVisitor<'a> for WriteFinder<'a, '_, '_> {
+    fn visit_stmt(&mut self, stmt: &'a Stmt) {
+        match stmt {
+            // A nested `def` / `class` is another frame.
+            Stmt::FunctionDef(_) | Stmt::ClassDef(_) => return,
+            Stmt::Assign(a) => {
+                if a.targets.iter().any(|t| self.target_writes(t)) {
+                    self.found = true;
+                }
+            }
+            Stmt::AnnAssign(a) => {
+                if a.value.is_some() && self.target_writes(&a.target) {
+                    self.found = true;
+                }
+            }
+            Stmt::AugAssign(a) => {
+                if self.target_writes(&a.target) {
+                    self.found = true;
+                }
+            }
+            Stmt::Delete(d) => {
+                if d.targets.iter().any(|t| {
+                    matches!(t, Expr::Subscript(_) | Expr::Attribute(_)) && self.target_writes(t)
+                }) {
+                    self.found = true;
+                }
+            }
+            _ => {}
+        }
+        ruff_python_ast::visitor::source_order::walk_stmt(self, stmt);
+    }
+
+    fn visit_expr(&mut self, e: &'a Expr) {
+        if let Expr::Call(call) = e {
+            match call.func.as_ref() {
+                Expr::Attribute(attr)
+                    if MUTATING_METHODS.contains(&attr.attr.as_str())
+                        && root_name(&attr.value).is_some_and(|r| self.is_shared_root(r)) =>
+                {
+                    self.found = true;
+                }
+                Expr::Name(n)
+                    if !self.locals.contains(n.id.as_str())
+                        && self.ctx.fns.contains_key(n.id.as_str()) =>
+                {
+                    self.helpers.push(n.id.as_str());
+                }
+                _ => {}
+            }
+        }
+        walk_expr(self, e);
+    }
+}
+
+/// The name an item / attribute chain is rooted at (`SEEN` in
+/// `SEEN[k].x`).
+fn root_name(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Name(n) => Some(n.id.as_str()),
+        Expr::Subscript(s) => root_name(&s.value),
+        Expr::Attribute(a) => root_name(&a.value),
+        _ => None,
+    }
+}
+
+/// Every name bound at module level, through module-level control flow
+/// (`let`, `mut`, plain and annotated assignment, `class`).
+fn module_level_names(body: &[Stmt]) -> HashSet<&str> {
+    fn walk<'a>(body: &'a [Stmt], out: &mut HashSet<&'a str>) {
+        for stmt in body {
+            match stmt {
+                Stmt::Assign(a) => {
+                    for t in &a.targets {
+                        if let Expr::Name(n) = t {
+                            out.insert(n.id.as_str());
+                        }
+                    }
+                }
+                Stmt::AnnAssign(a) => {
+                    if let Expr::Name(n) = a.target.as_ref() {
+                        out.insert(n.id.as_str());
+                    }
+                }
+                Stmt::ClassDef(c) => {
+                    out.insert(c.name.as_str());
+                }
+                Stmt::If(s) => {
+                    walk(&s.body, out);
+                    for c in &s.elif_else_clauses {
+                        walk(&c.body, out);
+                    }
+                }
+                Stmt::While(s) => {
+                    walk(&s.body, out);
+                    walk(&s.orelse, out);
+                }
+                Stmt::For(s) => {
+                    walk(&s.body, out);
+                    walk(&s.orelse, out);
+                }
+                Stmt::With(s) => walk(&s.body, out),
+                Stmt::Try(s) => {
+                    walk(&s.body, out);
+                    walk(&s.orelse, out);
+                    walk(&s.finalbody, out);
+                    for h in &s.handlers {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                        walk(&h.body, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    walk(body, &mut out);
+    out
+}
+
+/// Names a function body binds locally (assignment, `for` / `with`
+/// targets, `except … as`), not descending into nested `def` / `class`.
+fn collect_local_bindings<'a>(body: &'a [Stmt], out: &mut HashSet<&'a str>) {
+    fn names<'a>(t: &'a Expr, out: &mut HashSet<&'a str>) {
+        match t {
+            Expr::Name(n) => {
+                out.insert(n.id.as_str());
+            }
+            Expr::Tuple(t) => t.elts.iter().for_each(|e| names(e, out)),
+            Expr::List(l) => l.elts.iter().for_each(|e| names(e, out)),
+            Expr::Starred(s) => names(&s.value, out),
+            _ => {}
+        }
+    }
+    for stmt in body {
+        match stmt {
+            Stmt::Assign(a) => a.targets.iter().for_each(|t| names(t, out)),
+            Stmt::AnnAssign(a) => names(&a.target, out),
+            Stmt::AugAssign(a) => names(&a.target, out),
+            Stmt::FunctionDef(f) => {
+                out.insert(f.name.as_str());
+            }
+            Stmt::ClassDef(c) => {
+                out.insert(c.name.as_str());
+            }
+            Stmt::Import(i) => {
+                for a in &i.names {
+                    let local = a.asname.as_ref().unwrap_or(&a.name);
+                    out.insert(local.as_str().split('.').next().unwrap_or(""));
+                }
+            }
+            Stmt::ImportFrom(i) => {
+                for a in &i.names {
+                    out.insert(a.asname.as_ref().unwrap_or(&a.name).as_str());
+                }
+            }
+            Stmt::If(s) => {
+                collect_local_bindings(&s.body, out);
+                for c in &s.elif_else_clauses {
+                    collect_local_bindings(&c.body, out);
+                }
+            }
+            Stmt::While(s) => {
+                collect_local_bindings(&s.body, out);
+                collect_local_bindings(&s.orelse, out);
+            }
+            Stmt::For(s) => {
+                names(&s.target, out);
+                collect_local_bindings(&s.body, out);
+                collect_local_bindings(&s.orelse, out);
+            }
+            Stmt::With(s) => {
+                for item in &s.items {
+                    if let Some(v) = &item.optional_vars {
+                        names(v, out);
+                    }
+                }
+                collect_local_bindings(&s.body, out);
+            }
+            Stmt::Try(s) => {
+                collect_local_bindings(&s.body, out);
+                collect_local_bindings(&s.orelse, out);
+                collect_local_bindings(&s.finalbody, out);
+                for h in &s.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    if let Some(n) = &h.name {
+                        out.insert(n.as_str());
+                    }
+                    collect_local_bindings(&h.body, out);
+                }
+            }
+            Stmt::Match(s) => {
+                for case in &s.cases {
+                    collect_local_bindings(&case.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Collect every name declared `global` anywhere in the body (recursing into
@@ -357,94 +680,6 @@ fn collect_globals<'a>(body: &'a [Stmt], out: &mut HashSet<&'a str>) {
     }
 }
 
-/// True when any assignment / augmented-assignment in `body` targets a name in
-/// `globals` or `module_muts`. Recurses into nested blocks but not into nested
-/// `def` / `class` (their writes belong to a different frame).
-fn body_writes(body: &[Stmt], globals: &HashSet<&str>, module_muts: &HashSet<&str>) -> bool {
-    let hits = |name: &str| globals.contains(name) || module_muts.contains(name);
-    for stmt in body {
-        match stmt {
-            Stmt::Assign(a) => {
-                if a.targets.iter().any(|t| target_hits(t, &hits)) {
-                    return true;
-                }
-            }
-            Stmt::AnnAssign(a) => {
-                if a.value.is_some() && target_hits(&a.target, &hits) {
-                    return true;
-                }
-            }
-            Stmt::AugAssign(a) => {
-                if target_hits(&a.target, &hits) {
-                    return true;
-                }
-            }
-            Stmt::If(s) => {
-                if body_writes(&s.body, globals, module_muts)
-                    || s.elif_else_clauses
-                        .iter()
-                        .any(|c| body_writes(&c.body, globals, module_muts))
-                {
-                    return true;
-                }
-            }
-            Stmt::While(s) => {
-                if body_writes(&s.body, globals, module_muts)
-                    || body_writes(&s.orelse, globals, module_muts)
-                {
-                    return true;
-                }
-            }
-            Stmt::For(s) => {
-                if body_writes(&s.body, globals, module_muts)
-                    || body_writes(&s.orelse, globals, module_muts)
-                {
-                    return true;
-                }
-            }
-            Stmt::With(s) => {
-                if body_writes(&s.body, globals, module_muts) {
-                    return true;
-                }
-            }
-            Stmt::Try(s) => {
-                if body_writes(&s.body, globals, module_muts)
-                    || body_writes(&s.orelse, globals, module_muts)
-                    || body_writes(&s.finalbody, globals, module_muts)
-                    || s.handlers.iter().any(|h| {
-                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
-                        body_writes(&h.body, globals, module_muts)
-                    })
-                {
-                    return true;
-                }
-            }
-            Stmt::Match(s) => {
-                if s.cases
-                    .iter()
-                    .any(|case| body_writes(&case.body, globals, module_muts))
-                {
-                    return true;
-                }
-            }
-            _ => {}
-        }
-    }
-    false
-}
-
-/// True when an assignment target (a bare name, or a tuple/list unpack) hits a
-/// shared name per `hits`.
-fn target_hits(target: &Expr, hits: &impl Fn(&str) -> bool) -> bool {
-    match target {
-        Expr::Name(n) => hits(n.id.as_str()),
-        Expr::Tuple(t) => t.elts.iter().any(|e| target_hits(e, hits)),
-        Expr::List(l) => l.elts.iter().any(|e| target_hits(e, hits)),
-        Expr::Starred(s) => target_hits(&s.value, hits),
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,7 +712,7 @@ mod tests {
 
     #[test]
     fn parallel_opportunity_flags_comprehension_when_off() {
-        let src = "ys: list[int] = [f(x) for x in xs]\n";
+        let src = "xs: list[int] = []\nys: list[int] = [f(x) for x in xs]\n";
         let m = parse(src);
         let diags =
             parallel_opportunity_diagnostics(&m, "x.ty", src, &pure_set(&["f"]), 0, false, false);
@@ -487,7 +722,7 @@ mod tests {
 
     #[test]
     fn parallel_opportunity_silent_for_comprehension_when_on() {
-        let src = "ys: list[int] = [f(x) for x in xs]\n";
+        let src = "xs: list[int] = []\nys: list[int] = [f(x) for x in xs]\n";
         let m = parse(src);
         // auto_parallel on → the comprehension would already be rewritten.
         let diags =
@@ -641,6 +876,69 @@ async def main() -> None:
             "a module `mut` inside a top-level `if` is shared state"
         );
         assert!(c[0].contains("shared_mut_across_tasks"));
+    }
+
+    #[test]
+    fn shared_mut_flags_in_place_mutation_and_helpers() {
+        // 2026-10-03 review §7.9: subscript stores, mutating method calls and
+        // a helper writing on the task's behalf all race with the spawner.
+        for (body, why) in [
+            ("    SEEN[k] = True\n", "subscript store"),
+            ("    LOG.append(k)\n", "mutating method"),
+            ("    del SEEN[k]\n", "item delete"),
+            ("    Config.level = 3\n", "class attribute store"),
+            ("    record(k)\n", "helper that mutates"),
+        ] {
+            let src = format!(
+                "\
+SEEN: dict[str, bool] = {{}}
+LOG: list[str] = []
+
+class Config:
+    level: int = 0
+
+def record(k: str) -> None:
+    LOG.append(k)
+
+async def worker(k: str) -> None:
+{body}
+async def main() -> None:
+    go worker(\"a\")
+"
+            );
+            let m = parse(&src);
+            assert_eq!(
+                codes(&shared_mut_across_tasks_diagnostics(&m, "x.ty", &src)).len(),
+                1,
+                "{why} must be flagged"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_mut_silent_for_local_and_parameter_mutation() {
+        let src = "\
+LOG: list[str] = []
+
+def helper(xs: list[str]) -> None:
+    xs.append(\"x\")
+
+async def worker(items: list[str]) -> None:
+    let LOG: list[str] = []
+    LOG.append(\"a\")
+    items.append(\"b\")
+    helper(LOG)
+    print(len(LOG))
+
+async def main() -> None:
+    go worker([])
+";
+        let m = parse(src);
+        assert_eq!(
+            codes(&shared_mut_across_tasks_diagnostics(&m, "x.ty", src)).len(),
+            0,
+            "a local shadow, a parameter and a helper mutating its argument are not module state"
+        );
     }
 
     #[test]

@@ -238,7 +238,46 @@ pub(super) fn result(name: &str, args: &[Type], keywords: &[(&str, Type)]) -> Op
     })
 }
 
+/// Builtins that are classes, not functions. Used as a value (`d[list] =
+/// …`, `let t: type = int`, `isinstance(x, zip)`) such a name is the class
+/// object, which a plain `Function` type misrepresents: it would not be
+/// assignable to `type`.
+const BUILTIN_CLASSES: &[&str] = &[
+    "bool",
+    "bytearray",
+    "bytes",
+    "classmethod",
+    "complex",
+    "dict",
+    "enumerate",
+    "filter",
+    "float",
+    "frozenset",
+    "int",
+    "list",
+    "map",
+    "memoryview",
+    "object",
+    "property",
+    "range",
+    "reversed",
+    "set",
+    "slice",
+    "staticmethod",
+    "str",
+    "super",
+    "tuple",
+    "type",
+    "zip",
+];
+
 pub(super) fn value_type(name: &str) -> Option<Type> {
+    // A builtin class used as a value stays untyped, as before builtin
+    // contracts existed; a position expecting a `Callable` is served by
+    // `callables::constructor` before this is reached.
+    if BUILTIN_CLASSES.contains(&name) {
+        return None;
+    }
     let c = CONTRACTS.iter().find(|c| c.name == name)?;
     let count = if c.max == usize::MAX { c.min } else { c.max };
     let params = vec![Type::Unknown; count];

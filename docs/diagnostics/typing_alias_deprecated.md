@@ -5,10 +5,13 @@ Fires when a module imports a deprecated capitalised collection alias from
 prefers the built-in lowercase forms for consistency with the rest of the
 language.
 
+It is a **warning**: the alias still works at runtime, so `tyc check` exits 0
+when it is the only finding.
+
 ## Example
 
 ```ty
-from typing import List  # error: deprecated alias
+from typing import List  # warning: deprecated alias
 def main() -> None:
     let xs: List[int] = [1, 2, 3]
 ```

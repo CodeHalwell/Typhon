@@ -1,5 +1,10 @@
 # tyc::python_semantic_drift
 
+**Not currently emitted.** The code is registered and listed by
+`tyc explain --list`, but no check in the current compiler reports it; the
+drift cases below were fixed in the checker instead. If `tyc check` rejects
+code that runs correctly on CPython, open an issue with the snippet.
+
 Warns when Typhon's type checker rejects an expression that CPython would
 happily evaluate. Used as a regression signal during the Phase 5 Python-
 semantic-alignment audit: Typhon aims to be a stricter superset of Python, so

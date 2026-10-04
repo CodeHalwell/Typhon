@@ -89,6 +89,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "generator_return_type",
         "generic",
         "immutable_assign",
+        "impl_forward_reference",
         "impl_unknown_class",
         "implicit_any",
         "impure_pure_fn",
@@ -140,6 +141,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "pub_star_outside_init",
         "python_semantic_drift",
         "raise_non_exception",
+        "reserved_module_name",
         "resource_not_managed",
         "result_error_mismatch",
         "return_in_except_star",
@@ -338,8 +340,14 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         "resource_not_managed" => {
             include_str!("../../../../../docs/diagnostics/resource_not_managed.md")
         }
+        "reserved_module_name" => {
+            include_str!("../../../../../docs/diagnostics/reserved_module_name.md")
+        }
         "result_error_mismatch" => {
             include_str!("../../../../../docs/diagnostics/result_error_mismatch.md")
+        }
+        "impl_forward_reference" => {
+            include_str!("../../../../../docs/diagnostics/impl_forward_reference.md")
         }
         "return_in_except_star" => {
             include_str!("../../../../../docs/diagnostics/return_in_except_star.md")

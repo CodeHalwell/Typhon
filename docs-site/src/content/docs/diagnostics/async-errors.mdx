@@ -44,9 +44,9 @@ The warning already stands down where `async` is genuinely required despite the 
 Two or more adjacent **independent** awaited calls inside an `async def` could run concurrently. This advice (Hint severity, **on by default**) suggests wrapping them in an explicit `gather:` block, which lowers to an `asyncio.TaskGroup`:
 
 ```python
-async def load(client: Client, uid: int) -> tuple[User, list[Post]]:
-    let user  = await client.get_user(uid)     # 💡 tyc::gather_opportunity —
-    let posts = await client.get_posts(uid)    #    these awaits could run concurrently
+async def load(users: UserApi, posts_api: PostApi, uid: int) -> tuple[User, list[Post]]:
+    let user  = await users.get(uid)           # 💡 tyc::gather_opportunity —
+    let posts = await posts_api.for_user(uid)  #    these awaits could run concurrently
     return (user, posts)
 ```
 
@@ -57,12 +57,14 @@ It **never rewrites** — concurrency is a behaviour change the author opts into
 **Fix:** wrap the independent awaits in a `gather:` block:
 
 ```python
-async def load(client: Client, uid: int) -> tuple[User, list[Post]]:
+async def load(users: UserApi, posts_api: PostApi, uid: int) -> tuple[User, list[Post]]:
     gather:
-        user  = client.get_user(uid)
-        posts = client.get_posts(uid)
+        user  = users.get(uid)
+        posts = posts_api.for_user(uid)
     return (user, posts)
 ```
+
+Awaits on the **same receiver** (`await conn.execute(...)` twice, `await client.login()` then `await client.fetch()`) are treated as dependent and never suggested — the object carries state between the calls, so running them concurrently would reorder it.
 
 Knob: [`[strictness] suggest-gather`](/Typhon/configuration/strictness/) (default `true`). `tyc explain gather_opportunity` documents it offline.
 
@@ -183,6 +185,60 @@ def f(x: object) -> None:
 ```
 
 **Fix:** use static narrowing or a sealed union; or write an explicit predicate function. See [Interfaces](/Typhon/types/interfaces/) for why.
+
+## `tyc::go_outside_async`
+
+A `go` spawn runs where no event loop is running: in module-level code, or
+in a synchronous function that module-level code calls. `spawn` would raise
+`RuntimeError: no running event loop`, leaving the coroutine never awaited.
+
+```python
+async def work() -> None:
+    print("w")
+
+def kick() -> None:
+    go work()
+
+kick()    # ❌ `go` needs a running event loop — `work (via kick)` is spawned from module-level code
+```
+
+**Fix:** spawn from inside a coroutine driven by `asyncio.run`, or run the
+coroutine to completion instead of spawning it (`asyncio.run(work())`):
+
+```python
+import asyncio
+
+async def work() -> None:
+    await asyncio.sleep(0)
+    print("w")
+
+async def kick() -> None:
+    go work()
+    await asyncio.sleep(0.01)
+
+asyncio.run(kick())
+```
+
+A synchronous function that spawns is fine when only coroutines call it;
+the check flags the module-level call that would run it without a loop.
+
+## `tyc::blocking_in_async` (warning)
+
+A known-blocking standard-library call (`time.sleep`, `requests.get`,
+`subprocess.run`, `input`, `socket.recv`, …) appears directly inside an
+`async def`. It stalls the event loop and every other coroutine on it.
+
+```python
+import time
+
+async def poll() -> None:
+    time.sleep(1)    # ⚠ `time.sleep(...)` blocks the event loop
+```
+
+**Fix:** use the async equivalent (`await asyncio.sleep(1)`), or move the
+call to a worker thread with `await asyncio.to_thread(time.sleep, 1)`. Only
+direct calls are flagged, and calls inside `unsafe:` are not. Severity:
+`[strictness] blocking-in-async`.
 
 ## Where next
 

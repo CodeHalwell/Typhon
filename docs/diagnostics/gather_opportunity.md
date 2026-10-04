@@ -7,17 +7,20 @@ run sequentially when they could run concurrently.
 
 Unlike [`tyc::auto_gather_missed`](auto_gather_missed.md), this is
 *callee-agnostic*: it fires for awaited **method calls on imported clients**
-(`await client.get_user(id)` then `await client.get_posts(id)`) — the most
+(`await users.get(id)` then `await posts_api.for_user(id)`) — the most
 common real missed-concurrency shape — not just bare-name calls to same-module
-`async def`s. The suggested fix is the explicit `gather:` block, which works
+`async def`s. Two awaits on the **same receiver** (`await conn.execute(...)`
+twice, `await client.login()` then `await client.fetch()`) are treated as
+dependent and never suggested: the object carries state between the calls
+(a transaction, a session), so running them concurrently reorders it. The suggested fix is the explicit `gather:` block, which works
 for any awaitable with no `@gatherable` decorator or `auto-gather` opt-in.
 
 ## Example
 
 ```ty
-async def load(client: Client, uid: int) -> tuple[User, list[Post]]:
-    let user: User = await client.get_user(uid)       # advice: these 2 awaits
-    let posts: list[Post] = await client.get_posts(uid)  # could run concurrently
+async def load(users: UserApi, posts_api: PostApi, uid: int) -> tuple[User, list[Post]]:
+    let user: User = await users.get(uid)                  # advice: these 2 awaits
+    let posts: list[Post] = await posts_api.for_user(uid)  # could run concurrently
     return (user, posts)
 ```
 
@@ -38,10 +41,10 @@ into, because data-flow independence does not rule out ordering side effects
 Wrap the run in a `gather:` block (lowers to an `asyncio.TaskGroup`):
 
 ```ty
-async def load(client: Client, uid: int) -> tuple[User, list[Post]]:
+async def load(users: UserApi, posts_api: PostApi, uid: int) -> tuple[User, list[Post]]:
     gather:
-        user = client.get_user(uid)
-        posts = client.get_posts(uid)
+        user = users.get(uid)
+        posts = posts_api.for_user(uid)
     return (user, posts)
 ```
 

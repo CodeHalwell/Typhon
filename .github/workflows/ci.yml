@@ -414,6 +414,67 @@ jobs:
           path: valid-corpus-report.tsv
           if-no-files-found: warn
 
+  fmt-corpus:
+    name: tyc fmt over a de-formatted corpus (W7-03)
+    runs-on: ubuntu-latest
+    # `tyc fmt` rewrites files in place and is run without reading the diff,
+    # so a formatter bug silently changes programs. The formatter already
+    # refuses to write output whose lowered AST differs from its input; this
+    # job checks the same property end to end. It copies examples/, stress/
+    # and corpus/valid/, removes optional whitespace from the code
+    # (`let x: T = 1` -> `let x:T=1`, no space after `,` or `:`, `=` and `->`
+    # squeezed, trailing blanks; strings and comments untouched), runs
+    # `tyc fmt` over the copy, builds every unit, and requires each one to
+    # emit exactly the Python AST the unmodified corpus emits. A file `tyc
+    # fmt` refuses also fails the job. Details: docs/differential-testing.md.
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch (toolchain pinned via `with:`)
+        with:
+          toolchain: "1.94"
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        # See the test job: cache failures must not fail CI.
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tyc/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('tyc/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build release tyc binary
+        working-directory: tyc
+        run: cargo build --release --bin tyc
+
+      # The harness parses emitted 3.13 syntax with `ast`, so it needs 3.13.
+      - name: Install Python 3.13
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      # `tyc fmt` wraps `ruff format` when it is on PATH; installing it makes
+      # the gate cover the whole formatter, not only the whitespace pass.
+      # Same pin as the test job.
+      - name: Install ruff
+        run: python3.13 -m pip install --quiet ruff==0.15.8
+
+      - name: De-formatted corpus fmt gate
+        run: python3.13 scripts/emitted-ast.py fmt-gate --tyc tyc/target/release/tyc --jobs 4 --report fmt-corpus-report.tsv
+
+      - name: Upload per-unit fmt-corpus report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fmt-corpus-report
+          path: fmt-corpus-report.tsv
+          if-no-files-found: warn
+
   knob-matrix:
     name: Opt-in knob codegen matrix (T0.4)
     runs-on: ubuntu-latest

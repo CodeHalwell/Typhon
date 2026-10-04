@@ -2164,6 +2164,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "toml",
+ "tyc-diagnostics",
  "tyc-types",
 ]
 

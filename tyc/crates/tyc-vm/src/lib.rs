@@ -536,9 +536,7 @@ pub(crate) fn merge_cross_module_extensions_for_vm(
         if let Some(cached) = loaded.get(&dotted) {
             return cached.clone();
         }
-        let facts = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| merge_sibling_extensions(&text, &dotted, registry, cross_fns));
+        let facts = load_module_extensions(&path, &dotted, registry, cross_fns, 0);
         loaded.insert(dotted, facts.clone());
         facts
     };
@@ -629,17 +627,73 @@ pub(crate) fn merge_cross_module_extensions_for_vm(
     (cross_fns, external)
 }
 
+/// [`merge_sibling_extensions`] for the module at `path`, plus — when it
+/// is a package `__init__.ty` with `pub *` — every module that facade
+/// aggregates (direct sibling modules and sub-packages, recursively), so a
+/// consumer importing through the facade sees their `extend BUILTIN:`
+/// methods and declared types as `tyc check` and `tyc build` do (W3-02).
+/// Each extension maps to the module that declares it, so the injected
+/// `from <module> import __typhon_ext_…` needs no re-export.
+fn load_module_extensions(
+    path: &Path,
+    dotted: &str,
+    registry: &mut tyc_analyse::ExtensionRegistry,
+    cross_fns: &mut std::collections::HashMap<String, String>,
+    depth: usize,
+) -> Option<tyc_analyse::TypeFacts> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let (own, is_facade) = merge_sibling_extensions(&text, dotted, registry, cross_fns)?;
+    let is_init = path.file_name().and_then(|n| n.to_str()) == Some("__init__.ty");
+    if !(is_init && is_facade) || depth > 32 {
+        return Some(own);
+    }
+    let dir = path.parent()?;
+    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    entries.sort();
+    let mut facts = tyc_analyse::TypeFacts::default();
+    for p in entries {
+        let (member, child) = if p.extension().and_then(|e| e.to_str()) == Some("ty") {
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if stem == "__init__" || stem.is_empty() {
+                continue;
+            }
+            (stem.to_owned(), p.clone())
+        } else if p.is_dir() && p.join("__init__.ty").is_file() {
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            (name.to_owned(), p.join("__init__.ty"))
+        } else {
+            continue;
+        };
+        let child_dotted = format!("{dotted}.{member}");
+        if let Some(child_facts) =
+            load_module_extensions(&child, &child_dotted, registry, cross_fns, depth + 1)
+        {
+            facts.merge(child_facts);
+        }
+    }
+    // The facade's own declarations win over what it aggregates.
+    facts.merge(own);
+    Some(facts)
+}
+
 /// Parse a sibling `.ty` source just enough to extract builtin extension
 /// sentinel classes and merge their methods into `registry`. Returns the
 /// sibling's declared field / return types (`None` when it does not
-/// parse), with the lifted extension functions included.
+/// parse), with the lifted extension functions included, and whether the
+/// source carries a `pub *` marker.
 fn merge_sibling_extensions(
     source: &str,
     module_name: &str,
     registry: &mut tyc_analyse::ExtensionRegistry,
     cross_fns: &mut std::collections::HashMap<String, String>,
-) -> Option<tyc_analyse::TypeFacts> {
+) -> Option<(tyc_analyse::TypeFacts, bool)> {
     let prep = preprocess::expand_and_preprocess_mapped(source, false);
+    let is_facade = !prep.pub_star_lines.is_empty();
     let parsed = tyc_syntax::parse_module(&prep.python_source).ok()?;
     let mut sibling_module = parsed.into_syntax();
     let (sibling_registry, _) = tyc_analyse::extract_builtin_extensions(&mut sibling_module);
@@ -652,7 +706,10 @@ fn merge_sibling_extensions(
             });
         }
     }
-    Some(tyc_analyse::collect_module_type_facts(&sibling_module))
+    Some((
+        tyc_analyse::collect_module_type_facts(&sibling_module),
+        is_facade,
+    ))
 }
 
 /// Inject `from <module> import <fn_name>` AST nodes into `module` for

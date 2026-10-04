@@ -280,6 +280,18 @@ pub(super) fn known_sync(c: &Checker, expr: &Expr) -> bool {
         if let Some(value) = alias_value(c, binding.span.0) {
             return resolve(c, value, seen);
         }
+        // `from helpers import work`, where `work` is a plain `def` in a
+        // project `.ty` module (W3: imported known-sync callees).
+        let name = n.id.as_str();
+        if c.imported_sync_functions.contains(name)
+            && c.resolved.scopes.first().is_some_and(|s| {
+                s.bindings.iter().any(|b| {
+                    b.name == name && b.span.0 == binding.span.0 && b.kind == BindingKind::Import
+                })
+            })
+        {
+            return true;
+        }
         let parameter = c
             .resolved
             .scopes

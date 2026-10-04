@@ -37,7 +37,23 @@ pub fn run(args: FmtArgs) -> Result<()> {
     let mut failed = 0usize;
 
     for root in &args.paths {
+        let boundary = project_boundary(root);
         for path in collect_ty_files(root)? {
+            // W4-13: never rewrite a file that resolves outside the project
+            // the path belongs to — `src -> ../elsewhere` in a checked-out
+            // tree used to send `tyc fmt src/` to the link's target.
+            if let Some(project) = &boundary {
+                let resolved = path.canonicalize().unwrap_or_else(|_| path.clone());
+                if !resolved.starts_with(project) {
+                    eprintln!(
+                        "warning: skipping '{}': it resolves to '{}', outside the project '{}'",
+                        path.display(),
+                        resolved.display(),
+                        project.display()
+                    );
+                    continue;
+                }
+            }
             total += 1;
 
             let outcome = if args.check {
@@ -103,6 +119,37 @@ pub fn run(args: FmtArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The canonical directory of the project `path` belongs to: the nearest
+/// ancestor holding a `typhon.toml`, searched from the path as written (from
+/// its parent when the path is itself a symlink, so a link cannot vouch for
+/// its own target). `None` outside a project, where the walk's own symlink
+/// rules apply unchanged.
+fn project_boundary(path: &std::path::Path) -> Option<PathBuf> {
+    // Rebuilt from components so a trailing `/` (`src/`), which makes the OS
+    // resolve a final symlink, is dropped.
+    let absolute: PathBuf = std::path::absolute(path).ok()?.components().collect();
+    let is_link = std::fs::symlink_metadata(&absolute)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    let start = if is_link || absolute.is_file() {
+        absolute.parent()?.to_path_buf()
+    } else {
+        absolute
+    };
+    // A directory that is itself a symlink is not a project root here: a
+    // planted `src -> ../elsewhere` holding its own `typhon.toml` must not
+    // widen the boundary to its target.
+    start
+        .ancestors()
+        .filter(|dir| {
+            !std::fs::symlink_metadata(dir)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+        })
+        .find(|dir| dir.join("typhon.toml").is_file())
+        .and_then(|dir| dir.canonicalize().ok())
 }
 
 #[cfg(test)]
