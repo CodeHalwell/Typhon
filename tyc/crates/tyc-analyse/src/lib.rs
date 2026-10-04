@@ -67,6 +67,13 @@ const MAX_COMPTIME_DEPTH: usize = 64;
 /// build-time constant and stops a runaway build-string well before that.
 const MAX_COMPTIME_STRING_BYTES: usize = 16 * 1024 * 1024;
 
+/// Evaluation-step budget for one `comptime let` binding (every expression
+/// node and statement evaluated counts one step). The depth cap alone does
+/// not bound the work: `f(n) = f(n - 1) + f(n - 1)` stays within 64 frames
+/// while doing 2^64 calls, which hung `tyc check`, `tyc build` and the LSP.
+/// Generous enough for any realistic build-time configuration computation.
+const MAX_COMPTIME_STEPS: u64 = 10_000_000;
+
 pub mod auto_gather;
 pub use auto_gather::{
     collect_gatherable_async_fn_names, detect_gather_opportunities, detect_missed_gathers,
@@ -387,12 +394,21 @@ fn substitute_stmt(stmt: Stmt, values: &HashMap<String, ComptimeValue>) -> Stmt 
                 // class named "T". Rewrite as `type T = int` (PEP 695
                 // `TypeAliasStatement`) so the type-checker's existing
                 // alias-resolution path picks it up automatically.
+                // The inlined literal takes the original initialiser's
+                // range, so a diagnostic on it (a type mismatch against the
+                // annotation) points at the binding, not at line 1.
+                let anchor = ann
+                    .value
+                    .as_deref()
+                    .map(ruff_text_size::Ranged::range)
+                    .unwrap_or(ann.range);
+                let mut value_expr = comptime_value_to_expr(cv);
+                ruff_python_ast::relocate::relocate_expr(&mut value_expr, anchor);
                 if let ComptimeValue::Type(_) = cv {
                     let name_id = n.id.clone();
-                    let value_expr = comptime_value_to_expr(cv);
                     return make_type_alias_stmt(&name_id, value_expr);
                 }
-                ann.value = Some(Box::new(comptime_value_to_expr(cv)));
+                ann.value = Some(Box::new(value_expr));
                 return Stmt::AnnAssign(ann);
             }
         }
@@ -485,6 +501,30 @@ pub fn evaluate_comptime_with_functions(
     bindings: &[ComptimeBinding],
     comptime_function_names: &[String],
 ) -> (HashMap<String, ComptimeValue>, Diagnostics) {
+    evaluate_comptime_inner(module, None, bindings, comptime_function_names)
+}
+
+/// [`evaluate_comptime_with_functions`] with the (preprocessed) source text
+/// the module was parsed from. The source lets the evaluator see what the
+/// parsed AST cannot: a string literal spelling a lone surrogate
+/// (`"\ud800"`) parses to U+FFFD, so inlining the parsed value would change
+/// the string CPython builds; with the source the binding is rejected
+/// instead.
+pub fn evaluate_comptime_in_source(
+    module: &ModModule,
+    source: &str,
+    bindings: &[ComptimeBinding],
+    comptime_function_names: &[String],
+) -> (HashMap<String, ComptimeValue>, Diagnostics) {
+    evaluate_comptime_inner(module, Some(source), bindings, comptime_function_names)
+}
+
+fn evaluate_comptime_inner(
+    module: &ModModule,
+    source: Option<&str>,
+    bindings: &[ComptimeBinding],
+    comptime_function_names: &[String],
+) -> (HashMap<String, ComptimeValue>, Diagnostics) {
     let mut values = HashMap::new();
     let mut diags = Diagnostics::new();
 
@@ -536,6 +576,7 @@ pub fn evaluate_comptime_with_functions(
             }
             Some(expr) => {
                 let mut ctx = EvalContext::new(&functions);
+                ctx.source = source;
                 // Seed the evaluator's scope with previously-evaluated
                 // comptime constants so a later binding can reference an
                 // earlier one (FINDINGS #48). Bindings are evaluated in
@@ -578,6 +619,11 @@ struct EvalContext<'a> {
     /// this whole evaluation (the context threads by `&mut` through recursion,
     /// so it accumulates). Charged against [`MAX_COMPTIME_STRING_BYTES`].
     string_bytes: usize,
+    /// Evaluation steps taken so far; charged against [`MAX_COMPTIME_STEPS`].
+    steps: u64,
+    /// The source the module was parsed from, when the caller has it (see
+    /// [`evaluate_comptime_in_source`]).
+    source: Option<&'a str>,
 }
 
 impl<'a> EvalContext<'a> {
@@ -587,7 +633,23 @@ impl<'a> EvalContext<'a> {
             locals: HashMap::new(),
             depth: 0,
             string_bytes: 0,
+            steps: 0,
+            source: None,
         }
+    }
+
+    /// Charge one evaluation step; fail the binding once the budget is spent
+    /// so exponential recursion inside the depth cap fails the build with a
+    /// diagnostic instead of hanging it (and the LSP).
+    fn tick(&mut self) -> Result<(), String> {
+        self.steps += 1;
+        if self.steps > MAX_COMPTIME_STEPS {
+            return Err(format!(
+                "comptime evaluation exceeded its budget of {MAX_COMPTIME_STEPS} steps \
+                 (exponential recursion in a `comptime def`?) — compute the value at runtime instead"
+            ));
+        }
+        Ok(())
     }
 
     /// Account for a freshly-produced string of `bytes` length; error out once
@@ -671,6 +733,7 @@ fn simple_parameter_names(params: &Parameters) -> Option<Vec<&str>> {
 // ── Expression evaluator ──────────────────────────────────────────────────────
 
 fn eval_expr(expr: &Expr, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue, String> {
+    ctx.tick()?;
     match expr {
         // Numeric literals.
         Expr::NumberLiteral(n) => match &n.value {
@@ -682,7 +745,22 @@ fn eval_expr(expr: &Expr, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue, St
             Number::Complex { .. } => Err("complex literals are not comptime-evaluable".into()),
         },
         // String / boolean / none literals.
-        Expr::StringLiteral(s) => Ok(ComptimeValue::Str(s.value.to_str().to_owned())),
+        Expr::StringLiteral(s) => {
+            if let Some(source) = ctx.source {
+                if let Some(escape) = s
+                    .value
+                    .iter()
+                    .find_map(|part| lone_surrogate_escape(source, part.range, part.flags))
+                {
+                    return Err(format!(
+                        "the string literal spells the lone surrogate `{escape}`, which CPython keeps \
+                         but a comptime value cannot represent — inlining it would change the string; \
+                         build it at runtime instead"
+                    ));
+                }
+            }
+            Ok(ComptimeValue::Str(s.value.to_str().to_owned()))
+        }
         Expr::BooleanLiteral(b) => Ok(ComptimeValue::Bool(b.value)),
         Expr::NoneLiteral(_) => Err("None is not a valid comptime value".into()),
 
@@ -1328,17 +1406,22 @@ fn eval_method_call(
             expect_arity(method, 0, &args)?;
             Ok(ComptimeValue::Str(s.to_lowercase()))
         }
+        // Python's `str.strip()` strips `str.isspace()` characters, which
+        // include U+001C..U+001F (the information separators) that Rust's
+        // `char::is_whitespace` does not.
         (ComptimeValue::Str(s), "strip") => {
             expect_arity(method, 0, &args)?;
-            Ok(ComptimeValue::Str(s.trim().to_owned()))
+            Ok(ComptimeValue::Str(s.trim_matches(python_isspace).to_owned()))
         }
         (ComptimeValue::Str(s), "lstrip") => {
             expect_arity(method, 0, &args)?;
-            Ok(ComptimeValue::Str(s.trim_start().to_owned()))
+            Ok(ComptimeValue::Str(
+                s.trim_start_matches(python_isspace).to_owned(),
+            ))
         }
         (ComptimeValue::Str(s), "rstrip") => {
             expect_arity(method, 0, &args)?;
-            Ok(ComptimeValue::Str(s.trim_end().to_owned()))
+            Ok(ComptimeValue::Str(s.trim_end_matches(python_isspace).to_owned()))
         }
         (ComptimeValue::Str(s), "replace") => {
             expect_arity(method, 2, &args)?;
@@ -1418,6 +1501,50 @@ fn eval_method_call(
     }
 }
 
+/// CPython's `str.isspace()`: Unicode White_Space plus the information
+/// separators U+001C..U+001F (bidirectional class B / S).
+fn python_isspace(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+}
+
+/// The first `\uD800`..`\uDFFF` / `\U0000D800`.. escape a (non-raw) string
+/// literal part spells, read from its source text.
+fn lone_surrogate_escape(
+    source: &str,
+    range: ruff_text_size::TextRange,
+    flags: ruff_python_ast::StringLiteralFlags,
+) -> Option<String> {
+    if flags.prefix().is_raw() {
+        return None;
+    }
+    let text = source.get(range.start().to_usize()..range.end().to_usize())?;
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        let (digits, width) = match bytes.get(i + 1) {
+            Some(b'u') => (4, 2),
+            Some(b'U') => (8, 2),
+            _ => {
+                // Any other escape (including `\\`) consumes two bytes.
+                i += 2;
+                continue;
+            }
+        };
+        let hex = text.get(i + width..i + width + digits)?;
+        if let Ok(cp) = u32::from_str_radix(hex, 16) {
+            if (0xD800..=0xDFFF).contains(&cp) {
+                return Some(text[i..i + width + digits].to_owned());
+            }
+        }
+        i += width + digits;
+    }
+    None
+}
+
 fn expect_arity(method: &str, expected: usize, args: &[ComptimeValue]) -> Result<(), String> {
     if args.len() != expected {
         return Err(format!(
@@ -1490,7 +1617,15 @@ fn eval_user_comptime_call(
     ctx.depth -= 1;
     ctx.locals = previous_locals;
 
-    result.map_err(|e| format!("in comptime call to '{name}': {e}"))
+    // Name the innermost call once: a deep recursion would otherwise wrap
+    // the root cause in one `in comptime call to 'f': ` per frame.
+    result.map_err(|e| {
+        if e.starts_with("in comptime call to '") {
+            e
+        } else {
+            format!("in comptime call to '{name}': {e}")
+        }
+    })
 }
 
 /// Outcome of executing a statement (or sequence) inside a comptime
@@ -1539,6 +1674,7 @@ fn eval_stmts(stmts: &[Stmt], ctx: &mut EvalContext<'_>) -> Result<StmtOutcome, 
 }
 
 fn eval_stmt(stmt: &Stmt, ctx: &mut EvalContext<'_>) -> Result<StmtOutcome, String> {
+    ctx.tick()?;
     match stmt {
         Stmt::Return(r) => {
             let Some(value) = r.value.as_deref() else {
@@ -1820,9 +1956,9 @@ fn eval_binop(
         // ── Pow (`**`) ───────────────────────────────────────────────────────
         (Pow, ComptimeValue::Int(a), ComptimeValue::Int(b)) => {
             if *b < 0 {
-                // Negative exponent → float, matching Python. Use `powf` (not
-                // `powi(*b as i32)`, which truncates a very negative exponent).
-                Ok(ComptimeValue::Float((*a as f64).powf(*b as f64)))
+                // Negative exponent → float, matching Python (CPython computes
+                // `float(a) ** float(b)`, including its error cases).
+                python_float_pow(*a as f64, *b as f64).map(ComptimeValue::Float)
             } else {
                 let exp = u32::try_from(*b)
                     .map_err(|_| "exponent too large in comptime power".to_string())?;
@@ -1837,7 +1973,7 @@ fn eval_binop(
         {
             let a = comptime_as_f64(&lhs);
             let b = comptime_as_f64(&rhs);
-            Ok(ComptimeValue::Float(a.powf(b)))
+            python_float_pow(a, b).map(ComptimeValue::Float)
         }
         _ => Err(format!(
             "operator is not supported between these comptime value types: {:?} {:?} {:?}",
@@ -1847,6 +1983,39 @@ fn eval_binop(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// CPython's `float_pow`, where it differs from IEEE `pow`: `0.0 ** -1`
+/// raises `ZeroDivisionError`, a finite result that overflows raises
+/// `OverflowError` (`10.0 ** 400`), and a negative base raised to a
+/// non-integer power is a `complex` (`(-8.0) ** 0.5`), which no comptime
+/// value can hold. Each is a build-time error rather than an inlined `inf`
+/// / `nan` the program would never have seen.
+fn python_float_pow(a: f64, b: f64) -> Result<f64, String> {
+    if b == 0.0 {
+        return Ok(1.0);
+    }
+    if a == 0.0 && b < 0.0 {
+        return Err(
+            "0.0 cannot be raised to a negative power (CPython raises ZeroDivisionError)".into(),
+        );
+    }
+    if a.is_finite() && a < 0.0 && b.is_finite() && b != b.floor() {
+        return Err(format!(
+            "`{} ** {}` is a complex number in CPython, which a comptime value cannot hold",
+            python_float_repr(a),
+            python_float_repr(b)
+        ));
+    }
+    let r = a.powf(b);
+    if r.is_infinite() && a.is_finite() && b.is_finite() {
+        return Err(format!(
+            "`{} ** {}` overflows a float (CPython raises OverflowError)",
+            python_float_repr(a),
+            python_float_repr(b)
+        ));
+    }
+    Ok(r)
+}
 
 /// CPython's `float_divmod`: `(a // b, a % b)` for floats. The remainder is
 /// `fmod` corrected to take the divisor's sign; the quotient is derived from
@@ -2081,7 +2250,146 @@ mod tests {
         let module = tyc_syntax::parse_module(&prep.python_source)
             .expect("parse failed")
             .into_syntax();
-        evaluate_comptime_with_functions(&module, &prep.comptime_bindings, &prep.comptime_functions)
+        evaluate_comptime_in_source(
+            &module,
+            &prep.python_source,
+            &prep.comptime_bindings,
+            &prep.comptime_functions,
+        )
+    }
+
+    fn first_error(diags: &Diagnostics) -> String {
+        diags
+            .errors()
+            .first()
+            .map(|e| format!("{e:?}"))
+            .unwrap_or_default()
+    }
+
+    // ── W3-10: step budget, CPython-faithful values, diagnostic anchor ──
+
+    #[test]
+    fn exponential_recursion_hits_the_step_budget_instead_of_hanging() {
+        let src = "\
+comptime def f(n: int) -> int:
+    if n == 0:
+        return 1
+    return f(n - 1) + f(n - 1)
+
+comptime let X: int = f(40)
+";
+        let started = std::time::Instant::now();
+        let (values, diags) = eval(src);
+        assert!(!values.contains_key("X"));
+        assert!(first_error(&diags).contains("budget"), "{diags:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the budget must stop the evaluation promptly: {:?}",
+            started.elapsed()
+        );
+        // Ordinary recursion is untouched.
+        let ok = "\
+comptime def fact(n: int) -> int:
+    if n == 0:
+        return 1
+    return n * fact(n - 1)
+
+comptime let X: int = fact(20)
+";
+        let (values, diags) = eval(ok);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(
+            values.get("X"),
+            Some(ComptimeValue::Int(2432902008176640000))
+        ));
+    }
+
+    #[test]
+    fn float_powers_cpython_raises_on_are_build_errors() {
+        for (expr, needle) in [
+            ("10.0 ** 400", "overflows"),
+            ("2 ** 0.5 ** -1 * 10.0 ** 400", "overflows"),
+            ("0.0 ** -1", "negative power"),
+            ("0 ** -1", "negative power"),
+            ("0.0 ** -1.5", "negative power"),
+            ("(-8.0) ** 0.5", "complex"),
+            ("(-8) ** 0.5", "complex"),
+        ] {
+            let (values, diags) = eval(&format!("comptime let F: float = {expr}\n"));
+            assert!(!values.contains_key("F"), "{expr} must not inline a value");
+            assert!(first_error(&diags).contains(needle), "{expr}: {diags:?}");
+        }
+        for (expr, want) in [
+            ("(-8.0) ** 2.0", 64.0),
+            ("(-2.0) ** 3", -8.0),
+            ("2 ** -1", 0.5),
+            ("0.0 ** 0", 1.0),
+            ("10.0 ** -400", 0.0),
+        ] {
+            let (values, diags) = eval(&format!("comptime let F: float = {expr}\n"));
+            assert!(!diags.has_errors(), "{expr}: {:?}", diags.errors());
+            assert!(
+                matches!(values.get("F"), Some(ComptimeValue::Float(f)) if *f == want),
+                "{expr}: {:?}",
+                values.get("F")
+            );
+        }
+    }
+
+    #[test]
+    fn strip_uses_pythons_whitespace() {
+        // CPython's `str.isspace()` includes U+001C..U+001F.
+        let (values, diags) = eval(
+            "comptime let S: str = \"a\\x1cb \\x1c\".strip()\ncomptime let L: str = \"\\x1f x\".lstrip()\n",
+        );
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("S"), Some(ComptimeValue::Str(s)) if s == "a\u{1c}b"));
+        assert!(matches!(values.get("L"), Some(ComptimeValue::Str(s)) if s == "x"));
+    }
+
+    #[test]
+    fn lone_surrogate_literals_are_rejected_not_replaced() {
+        let (values, diags) = eval("comptime let S: str = \"a\\ud800b\"\n");
+        assert!(!values.contains_key("S"), "{:?}", values.get("S"));
+        assert!(first_error(&diags).contains("surrogate"), "{diags:?}");
+        let (_, diags) = eval("comptime let S: str = \"\\U0000DFFF\"\n");
+        assert!(diags.has_errors());
+        // A raw string, an escaped backslash and a real code point are fine.
+        for src in [
+            "comptime let S: str = r\"\\ud800\"\n",
+            "comptime let S: str = \"\\\\ud800\"\n",
+            "comptime let S: str = \"\\u00e9\\ufffd\"\n",
+        ] {
+            let (values, diags) = eval(src);
+            assert!(!diags.has_errors(), "{src}: {:?}", diags.errors());
+            assert!(values.contains_key("S"));
+        }
+    }
+
+    #[test]
+    fn substituted_literals_keep_the_initialisers_range() {
+        let src = "import os\n\ncomptime let PORT: int = \"x\"\n";
+        let prep = preprocess(src);
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .expect("parse failed")
+            .into_syntax();
+        let (values, _) = evaluate_comptime_in_source(
+            &module,
+            &prep.python_source,
+            &prep.comptime_bindings,
+            &prep.comptime_functions,
+        );
+        let original = match &module.body[1] {
+            Stmt::AnnAssign(a) => a.value.as_deref().unwrap().range(),
+            other => panic!("{other:?}"),
+        };
+        let out = substitute_comptime_literals(module, &values, &prep.comptime_functions);
+        let Stmt::AnnAssign(a) = &out.body[1] else {
+            panic!()
+        };
+        use ruff_text_size::Ranged;
+        assert_eq!(a.value.as_deref().unwrap().range(), original);
+        assert!(original.start().to_u32() > 0);
     }
 
     #[test]

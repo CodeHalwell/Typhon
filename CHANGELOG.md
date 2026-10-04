@@ -241,6 +241,17 @@ grouped by workstream (W1–W7).
   requires each element to be a provable `int`, not just an `int`
   accumulator: `total += field(r)` with `field -> Any` over `1e16, -1e16`
   printed `1.0` instead of `0.0`.
+- **comptime: a step budget, CPython-faithful values, and a real anchor**
+  (W3-10). Each `comptime let` now has a 10-million-step evaluation budget,
+  so exponential recursion inside the 64-frame depth cap (`f(n - 1) +
+  f(n - 1)`, `f(40)`) fails with `tyc::comptime` instead of hanging
+  `tyc check`, `tyc build` and the LSP. Values CPython would raise on are
+  build errors rather than inlined `inf` / `nan` / U+FFFD: `10.0 ** 400`,
+  `0.0 ** -1`, `0 ** -1`, `(-8.0) ** 0.5` (complex), and a lone-surrogate
+  string literal (`"\ud800"`); `strip()` / `lstrip()` / `rstrip()` now strip
+  U+001C–U+001F as `str.isspace()` does. A type mismatch on a `comptime let`
+  is reported at the binding instead of line 1, column 1, and a deep
+  recursion's error names the call once instead of once per frame.
 
 #### W4 — CLI, LSP, filesystem safety
 - **LSP definition URIs rebased onto client workspace root.** `goto_definition` now uses the client's declared workspace root URI (preserving symlink prefixes such as `/var/folders` or `/tmp` rather than macOS `/private/var/...`) or open-document URI, preventing editors from opening duplicate tabs on cross-file jumps.

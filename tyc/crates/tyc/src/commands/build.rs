@@ -11,7 +11,7 @@ use clap::Args;
 use miette::{miette, Result};
 use tyc_analyse::{
     analyse_purity_with, class_names_at_marker_starts, collect_gatherable_async_fn_names,
-    detect_missed_gathers, evaluate_comptime_with_functions, extract_builtin_extensions,
+    detect_missed_gathers, evaluate_comptime_in_source, extract_builtin_extensions,
     load_profile_samples, parallel_opportunity_diagnostics, pgo_memoise_targets,
     purity_diagnostics, rewrite_auto_gather, rewrite_builtin_extension_calls_with_facts,
     rewrite_parallel_comprehensions, rewrite_reduction_loops, shared_mut_across_tasks_diagnostics,
@@ -779,8 +779,9 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // Evaluate all `comptime` bindings and substitute their literals into
         // the AST before desugaring. `comptime def` functions registered by
         // the preprocessor are dispatchable from the binding RHSs.
-        let (comptime_values, comptime_diags) = evaluate_comptime_with_functions(
+        let (comptime_values, comptime_diags) = evaluate_comptime_in_source(
             &module,
+            &prep.python_source,
             &prep.comptime_bindings,
             &prep.comptime_functions,
         );

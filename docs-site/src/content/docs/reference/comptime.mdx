@@ -247,7 +247,9 @@ comptime def total(n: int) -> int:
     return acc
 ```
 
-Loops, exceptions, `with`, nested declarations, and imports are rejected by the sandbox; express the computation with arithmetic / ternaries and calls to other `comptime def` functions (recursion depth is capped at 64), or compute it at runtime.
+Loops, exceptions, `with`, nested declarations, and imports are rejected by the sandbox; express the computation with arithmetic / ternaries and calls to other `comptime def` functions (recursion depth is capped at 64, and each binding has a budget of 10 million evaluation steps, so exponential recursion fails the build instead of hanging it), or compute it at runtime.
+
+Where CPython would raise, the evaluator fails the build instead of inlining a value the program never computes: `10.0 ** 400` (CPython: `OverflowError`), `0.0 ** -1` and `0 ** -1` (`ZeroDivisionError`), a negative base to a fractional power such as `(-8.0) ** 0.5` (a `complex` in CPython), and a string literal spelling a lone surrogate (`"\ud800"`). `strip()` removes exactly what `str.isspace()` matches, U+001C–U+001F included.
 
 ## Where next
 

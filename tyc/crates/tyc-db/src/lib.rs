@@ -760,8 +760,9 @@ fn check_pipeline(
     // declaration. Without this, `T` resolves as a distinct nominal
     // class and `def f(x: T)` rejects `int` arguments. Matches the
     // same substitution `tyc build` and `tyc run` apply.
-    let (comptime_values, _comptime_diags) = tyc_analyse::evaluate_comptime_with_functions(
+    let (comptime_values, _comptime_diags) = tyc_analyse::evaluate_comptime_in_source(
         &module,
+        &prep.python_source,
         &prep.comptime_bindings,
         &prep.comptime_functions,
     );
