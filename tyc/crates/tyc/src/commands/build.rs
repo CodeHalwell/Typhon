@@ -2577,6 +2577,11 @@ pub(crate) fn detect_pub_star_diagnostics(
     let mut advice: Vec<tyc_diagnostics::TycError> = Vec::new();
 
     for (path, source) in sources {
+        // Only a `pub *` line is reported, and no sugar expansion writes one,
+        // so a file without both tokens skips the whole pipeline below.
+        if !(source.contains("pub") && source.contains('*')) {
+            continue;
+        }
         let expanded = expand_question_ops(&expand_inline_question_ops(
             &expand_compound_question_headers(&expand_pipes(&expand_with_chains(
                 &expand_go_calls(&expand_gather_blocks(&expand_multiline_guards(
