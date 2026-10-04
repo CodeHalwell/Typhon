@@ -58,7 +58,7 @@ mod platform {
             let mut size: libc::size_t = 0;
             let rc = libc::pthread_attr_getstack(&attr, &mut addr, &mut size);
             libc::pthread_attr_destroy(&mut attr);
-            (rc == 0 && size > 0).then(|| (addr as usize, size))
+            (rc == 0 && size > 0).then_some((addr as usize, size))
         }
     }
 }

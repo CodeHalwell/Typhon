@@ -6,10 +6,8 @@ import asyncio
 
 
 @pure
-def fib(n: int) -> int:
-    if n < 2:
-        return n
-    return fib(n - 1) + fib(n - 2)
+def score(n: int) -> int:
+    return n * n + 3 * n + 1
 
 
 @gatherable
@@ -31,7 +29,10 @@ async def load() -> int:
 
 
 def main() -> None:
-    print(fib(20))
+    mut total: int = 0
+    for i in range(50):
+        total += score(i % 5)
+    print(total)
     print(asyncio.run(load()))
 
 

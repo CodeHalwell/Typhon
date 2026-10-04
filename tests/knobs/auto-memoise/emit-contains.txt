@@ -1,2 +1,2 @@
 import functools
-@functools.cache
+@functools.lru_cache(maxsize=1024, typed=True)\ndef score(n: int) -> int:
