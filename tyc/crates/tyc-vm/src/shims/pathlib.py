@@ -138,6 +138,12 @@ class PurePosixPath:
     # deep_freeze passes this immutable value through, as the
     # emitted typhon_runtime does for the CPython class.
     __typhon_immutable__ = True
+    # No `__dict__`, as in CPython: a path takes no new attributes. The
+    # shim's own state plus CPython 3.13's `PurePath` / `PurePathBase` slots.
+    __slots__ = ("_root", "_tail", "_str", "_raw_paths", "_drv", "_tail_cached",
+                 "_str_normcase_cached", "_parts_normcase_cached", "_hash",
+                 "_raw_path", "_resolving")
+
     def __init__(self, *args):
         raw = []
         for a in args:
@@ -438,6 +444,8 @@ PurePath = PurePosixPath
 # `Path` is rebound to `PosixPath` at the bottom, so `Path(...)` still
 # constructs the concrete class exactly as CPython's `Path.__new__` does.
 class Path(PurePosixPath):
+    __slots__ = ()
+
     @classmethod
     def cwd(cls):
         return cls(os.getcwd())
@@ -696,7 +704,7 @@ class Path(PurePosixPath):
 
 
 class PosixPath(Path):
-    pass
+    __slots__ = ()
 
 
 Path = PosixPath

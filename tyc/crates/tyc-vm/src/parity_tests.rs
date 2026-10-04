@@ -1263,3 +1263,57 @@ cast("Any builtin", "a", lambda v: __typhon_checked_cast__(v, Any))
         &cast_runtime_py(),
     );
 }
+
+#[test]
+fn pr493_datetime_and_path_instances_refuse_attribute_writes() {
+    // `freeze let` passes a date / time / timedelta / timezone / path
+    // through as already immutable, but the VM's shims stored attributes
+    // like any plain instance: `d.year = 1`, `d.foo = 1` and `p.foo = 1`
+    // succeeded where CPython's C types (and `PurePath`'s slots) refuse
+    // them — frozen or not.
+    assert_matches_cpython_with(
+        "pr493_datetime_and_path_instances_refuse_attribute_writes",
+        r#"import datetime
+import pathlib
+def attempt(label: str, obj: object, name: str) -> None:
+    trap(label + " set " + name, lambda: setattr(obj, name, 1))
+    trap(label + " del " + name, lambda: delattr(obj, name))
+D = __typhon_freeze__(datetime.date(2020, 1, 2))
+P = __typhon_freeze__(pathlib.PurePosixPath("a/b"))
+objs = [
+    ("D", D),
+    ("datetime", datetime.datetime(2020, 1, 2, 3, 4)),
+    ("time", datetime.time(1, 2)),
+    ("timedelta", datetime.timedelta(1)),
+    ("utc", datetime.timezone.utc),
+    ("tz", datetime.timezone(datetime.timedelta(hours=1))),
+    ("iso", datetime.date(2020, 1, 2).isocalendar()),
+    ("P", P),
+    ("path", pathlib.Path("a/b")),
+]
+names = ["year", "month", "day", "hour", "minute", "second", "microsecond", "tzinfo", "fold",
+         "days", "seconds", "microseconds", "week", "weekday", "foo", "name", "parts",
+         "min", "max", "resolution", "utc", "isoformat", "joinpath", "_drv"]
+for label, obj in objs:
+    for name in names:
+        attempt(label, obj, name)
+show(D, D.year, P, P.name, datetime.timedelta(1).days)
+plain class MyDate(datetime.date):
+    pass
+m = MyDate(2020, 1, 2)
+trap("sub foo", lambda: setattr(m, "foo", 1))
+trap("sub year", lambda: setattr(m, "year", 1))
+trap("sub min", lambda: setattr(m, "min", 1))
+show(m.foo, m.year, m.min)
+plain class Zone(datetime.tzinfo):
+    pass
+z = Zone()
+z.label = "x"
+show(z.label)
+"#,
+        &runtime_py(
+            "TYPHON_RUNTIME_FREEZE_PY",
+            "__typhon_freeze__ = deep_freeze",
+        ),
+    );
+}
