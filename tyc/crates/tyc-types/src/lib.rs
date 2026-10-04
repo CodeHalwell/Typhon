@@ -2774,9 +2774,11 @@ struct LoopExits {
 /// The envs reaching a loop's head once its body has been checked (`c.env`
 /// is the env at the end of the body): the pre-loop env, every `continue`,
 /// and the end of the body. When a statement in the body always leaves it
-/// (`break` / `continue` / `return` / `raise`), whatever follows is dead and
-/// its end never reaches the head — `while f: break; x = None` must not
-/// widen `x` — so it contributes its declarations but no narrowings.
+/// (`break` / `continue` / `return` / `raise`, judged by the checker-aware
+/// [`stmt_always_exits_aware`], so an open `match` still falls through),
+/// whatever follows is dead and its end never reaches the head — `while f:
+/// break; x = None` must not widen `x` — so it contributes its declarations
+/// but no narrowings.
 fn loop_head_states(
     c: &Checker,
     body: &[Stmt],
@@ -2784,7 +2786,7 @@ fn loop_head_states(
     continues: Vec<TypeEnv>,
 ) -> Vec<TypeEnv> {
     let mut body_end = c.env.snapshot();
-    if body.iter().any(stmt_always_exits) {
+    if body.iter().any(|s| stmt_always_exits_aware(c, s)) {
         body_end.take_narrowings_from(&pre_loop);
     }
     let mut states = vec![body_end, pre_loop];
@@ -12903,7 +12905,7 @@ struct LoopReassigned {
     attrs: std::collections::HashSet<String>,
 }
 
-fn collect_reassigned_names(stmts: &[Stmt], acc: &mut LoopReassigned) {
+fn collect_reassigned_names(c: &Checker, stmts: &[Stmt], acc: &mut LoopReassigned) {
     fn add_target(t: &Expr, acc: &mut LoopReassigned) {
         match t {
             Expr::Name(n) => {
@@ -12946,52 +12948,53 @@ fn collect_reassigned_names(stmts: &[Stmt], acc: &mut LoopReassigned) {
             Stmt::AugAssign(a) => add_target(&a.target, acc),
             Stmt::If(i) => {
                 if !body_always_leaves_loop(&i.body) {
-                    collect_reassigned_names(&i.body, acc);
+                    collect_reassigned_names(c, &i.body, acc);
                 }
                 for clause in &i.elif_else_clauses {
                     if !body_always_leaves_loop(&clause.body) {
-                        collect_reassigned_names(&clause.body, acc);
+                        collect_reassigned_names(c, &clause.body, acc);
                     }
                 }
             }
             Stmt::For(f) => {
-                collect_reassigned_names(&f.body, acc);
-                collect_reassigned_names(&f.orelse, acc);
+                collect_reassigned_names(c, &f.body, acc);
+                collect_reassigned_names(c, &f.orelse, acc);
             }
             Stmt::While(w) => {
-                collect_reassigned_names(&w.body, acc);
-                collect_reassigned_names(&w.orelse, acc);
+                collect_reassigned_names(c, &w.body, acc);
+                collect_reassigned_names(c, &w.orelse, acc);
             }
             Stmt::With(w) => {
                 if !body_always_leaves_loop(&w.body) {
-                    collect_reassigned_names(&w.body, acc);
+                    collect_reassigned_names(c, &w.body, acc);
                 }
             }
             Stmt::Try(t) => {
-                collect_reassigned_names(&t.body, acc);
+                collect_reassigned_names(c, &t.body, acc);
                 for h in &t.handlers {
                     let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
                     if !body_always_leaves_loop(&h.body) {
-                        collect_reassigned_names(&h.body, acc);
+                        collect_reassigned_names(c, &h.body, acc);
                     }
                 }
-                collect_reassigned_names(&t.orelse, acc);
-                collect_reassigned_names(&t.finalbody, acc);
+                collect_reassigned_names(c, &t.orelse, acc);
+                collect_reassigned_names(c, &t.finalbody, acc);
             }
             Stmt::Match(m) => {
                 for case in &m.cases {
                     if !body_always_leaves_loop(&case.body) {
-                        collect_reassigned_names(&case.body, acc);
+                        collect_reassigned_names(c, &case.body, acc);
                     }
                 }
             }
             _ => {}
         }
         // An unconditional exit — a bare `break` / `return` / `raise` /
-        // `continue`, or a compound statement every branch of which leaves —
-        // ends this block's contribution to the back-edge: statements after
-        // it can't carry a value to the next iteration, so stop collecting.
-        if stmt_always_exits(s) {
+        // `continue`, or a compound statement every branch of which leaves
+        // (the checker-aware form: an open `match` can fall through) — ends
+        // this block's contribution to the back-edge: statements after it
+        // can't carry a value to the next iteration, so stop collecting.
+        if stmt_always_exits_aware(c, s) {
             return;
         }
     }
@@ -14393,7 +14396,7 @@ fn widen_loop_carried_narrowings(c: &mut Checker, body: &[Stmt]) {
         return;
     }
     let mut reassigned = LoopReassigned::default();
-    collect_reassigned_names(body, &mut reassigned);
+    collect_reassigned_names(c, body, &mut reassigned);
     for name in &reassigned.names {
         c.env.widen_to_declared(name);
     }
@@ -15663,7 +15666,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // such name to its declared type on entry to each handler; the
             // same goes for attribute paths the body assigns.
             let mut body_writes = LoopReassigned::default();
-            collect_reassigned_names(&t.body, &mut body_writes);
+            collect_reassigned_names(c, &t.body, &mut body_writes);
             for h in &t.handlers {
                 let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
                 // Enter the handler with the pre-`try` narrowings (keeping any
@@ -15738,7 +15741,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 // the normal-path narrowings `finally` never touched.
                 let finally_result = c.env.snapshot();
                 let mut finally_writes = LoopReassigned::default();
-                collect_reassigned_names(&t.finalbody, &mut finally_writes);
+                collect_reassigned_names(c, &t.finalbody, &mut finally_writes);
                 after_try.overlay_finally_delta(&finally_view, &finally_result, &finally_writes);
                 c.env.restore(after_try);
             }

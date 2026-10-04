@@ -981,15 +981,18 @@ def p(xs: list[int]) -> int:
     return y
 "#,
     );
-    // A tail that is reachable still reaches the head, and the state at a
-    // `break` / `continue` still flows on.
+    // A tail that is reachable still reaches the head — including after an
+    // open `match` whose arms all leave, since no arm may match — and the
+    // state at a `break` / `continue` still flows on.
     for body in [
         "    while flag:\n        if flag:\n            break\n        x = None\n",
+        "    while flag:\n        match n:\n            case 1:\n                break\n        x = None\n",
+        "    for _ in range(n):\n        match n:\n            case 1:\n                break\n        x = None\n",
         "    while flag:\n        x = None\n        break\n",
         "    for _ in range(3):\n        x = None\n        continue\n",
     ] {
         assert_rejected(&format!(
-            "def f(flag: bool) -> int:\n    mut x: int? = 1\n{body}    return x\n"
+            "def f(flag: bool, n: int) -> int:\n    mut x: int? = 1\n{body}    return x\n"
         ));
     }
 }
