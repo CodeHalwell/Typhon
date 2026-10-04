@@ -487,6 +487,15 @@ grouped by workstream (W1–W7).
   `describe(s).slug()` stayed a method call, so check and build were clean
   and CPython raised `AttributeError`. A name that is not a submodule now
   resolves through the package, and the helper is imported from it.
+- **`tyc::reserved_module_name` covers reads through a bare
+  `import typhon_runtime`.** The W4-12 check looked only at `from
+  typhon_runtime import …` and `import typhon_runtime.sub`, so a program that
+  defined `typhon_runtime.ty`, called `typhon_runtime.helper()` after a bare
+  `import typhon_runtime`, and used `Result` built cleanly, then raised
+  `AttributeError` once the generated runtime replaced the module. Attribute
+  reads through a bare import (or `… as alias`) are now checked against the
+  generated runtime; a name the file rebinds elsewhere, an attribute it sets
+  itself, and dunders are not counted, so no program that runs is rejected.
 - **A refused `pyproject.toml` no longer leaves `tyc add` half-done.**
   `tyc add` / `tyc remove` refused a symlinked or unparseable
   `pyproject.toml` only after rewriting `typhon.toml`, so the command failed

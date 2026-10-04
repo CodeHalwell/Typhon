@@ -367,6 +367,51 @@ fn a_user_typhon_runtime_the_build_never_replaces_still_builds() {
     assert!(!dir.join("build/typhon_runtime").exists());
 }
 
+/// W4-12: a bare `import typhon_runtime` imports cleanly whatever replaces
+/// the project's module, so the import check passed it — and
+/// `typhon_runtime.helper()` raised `AttributeError` once the generated
+/// runtime won. Attribute reads through the bare import are now checked
+/// against the generated runtime; a read it provides still builds.
+#[test]
+fn attribute_reads_through_a_bare_typhon_runtime_import_are_checked() {
+    let program = |read: &str| {
+        format!(
+            "import typhon_runtime\n\ndef parse(s: str) -> Result[int, str]:\n    return Ok(int(s))\n\n\
+             def main() -> None:\n    print({read})\n    print(parse(\"3\"))\n\nmain()\n"
+        )
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(
+        dir,
+        "rt",
+        &[
+            ("typhon_runtime.ty", "def helper() -> int:\n    return 41\n"),
+            ("main.ty", &program("typhon_runtime.helper()")),
+        ],
+    );
+    let build = tyc()
+        .current_dir(dir)
+        .args(["build", "--no-sync"])
+        .output()
+        .unwrap();
+    let t = text(&build);
+    assert!(!build.status.success(), "{t}");
+    assert!(t.contains("tyc::reserved_module_name"), "{t}");
+    assert!(t.contains("`typhon_runtime.helper`"), "{t}");
+    assert!(!dir.join("build/typhon_runtime").exists(), "{t}");
+
+    std::fs::write(dir.join("src/main.ty"), program("typhon_runtime.__name__")).unwrap();
+    let build = tyc()
+        .current_dir(dir)
+        .args(["build", "--no-sync"])
+        .output()
+        .unwrap();
+    let t = text(&build);
+    assert!(build.status.success(), "{t}");
+    assert!(t.contains("tyc::reserved_module_name"), "{t}");
+}
+
 // ── `tyc fmt` symlink write-through (W4-13, fmt half) ───────────────────────
 
 /// W4-13: `tyc fmt src/` where `src` is a symlink leaving the project used to
