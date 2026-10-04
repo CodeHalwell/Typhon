@@ -10,7 +10,12 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Current release
 
-**[v1.0.0-beta.1](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-beta.1) — 2026-10-04.**
+**[v1.0.0-beta.2](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-beta.2) — 2026-10-04.**
+The first published beta: v1.0.0-beta.1 plus a Windows build fix. The
+beta.1 tag's release build failed on Windows, so no beta.1 binaries were
+published. CI now type-checks the workspace for Windows.
+
+**v1.0.0-beta.1 — 2026-10-04 (tagged, not published).**
 The first beta: four review-remediation waves on top of alpha.9 — the
 2026-09-01 beta-readiness review and the backlog it deferred, the 2026-09-30
 release-readiness review, and the W1–W7 remediation of the six 2026-10-03

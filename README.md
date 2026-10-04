@@ -181,7 +181,7 @@ The single canonical design doc is **[the long-term plan](docs/long-term-plan.md
 
 ## Project status
 
-**Current release: [v1.0.0-beta.1](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-beta.1)** (2026-10-04).
+**Current release: [v1.0.0-beta.2](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-beta.2)** (2026-10-04).
 
 Typhon reached its **first feature-complete alpha** in
 [v1.0.0-alpha](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha): the
@@ -189,7 +189,7 @@ proven production surface *plus* the type-system frontier earlier releases defer
 (higher-kinded type unification, user-generic variance inference, the inter-procedural
 field-init audit). The alpha.2 → alpha.9 point releases that followed were a
 soundness, robustness, performance, release-engineering, and codebase-review
-hardening pass, and **v1.0.0-beta.1**, the first beta, closes four
+hardening pass, and **v1.0.0-beta.2**, the first published beta, closes four
 review-remediation waves and freezes the surface under the
 [compatibility policy](docs/compatibility.md).
 

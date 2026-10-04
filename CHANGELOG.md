@@ -4,6 +4,31 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 1.0.0-beta.2 — 2026-10-04 — first published beta: Windows build fix
+
+The first beta with published binaries: 1.0.0-beta.1 plus one build fix.
+The `v1.0.0-beta.1` tag's release build failed on `x86_64-pc-windows-msvc`,
+so no beta.1 binaries or GitHub Release were published. Everything listed
+under 1.0.0-beta.1 below ships in this release. No language change, and no
+change in behaviour on Linux or macOS.
+
+### Fixed
+
+- **Windows build.** Windows-only VM code had drifted while no CI job
+  compiled it:
+  - The `os.stat` fallback passed an `f64` where `Value::FloatData` now takes
+    a `VmFloat`.
+  - The non-unix `os.symlink` called a helper that no longer exists; it now
+    raises `OSError`.
+  - The `os.umask` fallback left a variable unused, which fails with warnings
+    denied.
+
+### Testing / CI
+
+- The `test` job type-checks the whole workspace for
+  `x86_64-pc-windows-msvc` with warnings denied. A check needs no Windows
+  linker, so it runs on the existing Ubuntu runner.
+
 ## 1.0.0-beta.1 — 2026-10-04 — first beta: four review-remediation waves & a frozen surface
 
 The first beta: four review-remediation waves on top of alpha.9 — the
@@ -1081,11 +1106,6 @@ set operators, frozenset dict keys) did not reproduce.
   - A partial-scope `vm-differential.sh --update` keeps the nobuild entries it
     did not cover.
   - The `perf-gate` CI job fetches tags, so it builds its same-run control.
-- **Windows build.** Windows-only VM code (`os.stat` times, `os.symlink`,
-  `os.umask`) no longer compiled after the fourth wave's VM changes, and no
-  CI job compiled it, so the first beta.1 release build failed on
-  `x86_64-pc-windows-msvc`. It is fixed, and the `test` job now type-checks
-  the workspace for that target.
 - **Build-pipeline speed.** With its control restored, the perf gate measured
   `tyc build` of `examples/47-mini-app` at +44% against alpha.9 (26 ms vs
   18 ms). Three fixes bring it to +5.6% (19 ms vs 18 ms):
