@@ -330,6 +330,19 @@ encodes in `json` as its value, and it keeps its identity as a dict key.
 `StrEnum`'s `auto()` is the lower-cased member name, and a second name
 bound to an existing value is an alias of that member.
 
+### Live dict views and checked iteration (beta)
+
+`dict.keys()` / `.values()` / `.items()` are live views of their dict, as
+in CPython: a key added after the view was taken shows up in it, `len`
+and `in` read the current dict (`k in d.keys()` is a dict lookup, not a
+scan). Iterating a dict, a dict view or a set while the loop body changes
+its size raises CPython's `RuntimeError` ("dictionary changed size during
+iteration" / "Set changed size during iteration"); re-binding an existing
+key's value is fine. `reversed(list)` indexes the live list,
+`reversed(dict)` (and of a view) raises on a size change, `reversed` of a
+range is a range iterator, and a non-sequence (`set`, a generator) is
+refused with `TypeError: '…' object is not reversible`.
+
 ### Sets iterate in CPython's order (beta)
 
 A `set` / `frozenset` is a reproduction of CPython's open-addressing

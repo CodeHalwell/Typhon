@@ -4053,8 +4053,37 @@ impl Interpreter {
                 }
                 _ => Ok(false),
             },
-            Value::DictView { items, .. } => {
-                let items = items.clone();
+            // `k in d.keys()` is a dict lookup, and `(k, v) in d.items()` a
+            // lookup plus a value comparison — not a scan of a copy.
+            Value::DictView {
+                kind: crate::value::DictViewKind::Keys,
+                dict,
+            } => {
+                let dict = dict.clone();
+                self.contains(&Value::Dict(dict), item)
+            }
+            Value::DictView {
+                kind: crate::value::DictViewKind::Items,
+                dict,
+            } => {
+                let Value::Tuple(pair) = item else {
+                    return Ok(false);
+                };
+                if pair.len() != 2 {
+                    return Ok(false);
+                }
+                let Ok(key) = self.hash_key(&pair[0]) else {
+                    return Ok(false);
+                };
+                let key = self.settle_key_dict(dict, key)?;
+                let found = dict.borrow().get(&key).cloned();
+                match found {
+                    Some(v) => Ok(v.same_identity(&pair[1]) || self.cmp_op(CmpOp::Eq, &v, &pair[1])?),
+                    None => Ok(false),
+                }
+            }
+            Value::DictView { kind, dict } => {
+                let items = crate::value::view_items(*kind, dict);
                 for v in &items {
                     if v.same_identity(item) || self.cmp_op(CmpOp::Eq, v, item)? {
                         return Ok(true);
@@ -7782,22 +7811,22 @@ impl Interpreter {
                     index: 0,
                 }
             }
+            // Dict and set iterators walk the live container and raise
+            // CPython's `RuntimeError` if it changes size underneath them.
             Value::Dict(d) => {
-                let keys: Vec<HashKey> = d.borrow().keys().cloned().collect();
-                IterState::Dict { keys, index: 0 }
+                crate::value::IterState::dict_iter(&d, crate::value::DictViewKind::Keys)
             }
             Value::Set(s) => {
-                // Frozen metadata lives outside user-visible container contents.
-                let keys: Vec<HashKey> = s.borrow().iter().cloned().collect();
-                IterState::Set { keys, index: 0 }
+                let used = s.borrow().len();
+                IterState::Set {
+                    set: s,
+                    pos: 0,
+                    used,
+                    remaining: used,
+                }
             }
             Value::Iter(it) => return Ok(Value::Iter(it)),
-            // A dict-view iterates over its materialised items, so
-            // `for k in d.keys()`, `list(d.values())`, `set(d.items())` work.
-            Value::DictView { items, .. } => IterState::List {
-                items: Rc::new(RefCell::new(items)),
-                index: 0,
-            },
+            Value::DictView { kind, dict } => crate::value::IterState::dict_iter(&dict, kind),
             // Iterating an enum class yields its members in definition order.
             Value::Class(ref c) if Self::is_enum_class(c) => {
                 let members = match c.class_attrs.borrow().get("__typhon_enum_members__") {
@@ -7993,23 +8022,100 @@ impl Interpreter {
                         Ok(Some(v))
                     };
                 }
-                IterState::Dict { keys, index } => {
-                    return if *index >= keys.len() {
-                        Ok(None)
-                    } else {
-                        let v = keys[*index].clone().into_value();
-                        *index += 1;
-                        Ok(Some(v))
+                IterState::Dict {
+                    dict,
+                    kind,
+                    index,
+                    used,
+                    remaining,
+                } => {
+                    let d = dict.borrow();
+                    if d.len() != *used {
+                        // Sticky, like CPython's `di_used = -1`.
+                        *used = usize::MAX;
+                        return Err(Unwind::Exception(VmException::new(
+                            "RuntimeError",
+                            "dictionary changed size during iteration",
+                        )));
+                    }
+                    let Some((k, v)) = d.get_index(*index) else {
+                        return Ok(None);
                     };
+                    if *remaining == 0 {
+                        return Err(Unwind::Exception(VmException::new(
+                            "RuntimeError",
+                            "dictionary keys changed during iteration",
+                        )));
+                    }
+                    *index += 1;
+                    *remaining -= 1;
+                    return Ok(Some(match kind {
+                        crate::value::DictViewKind::Keys => k.clone().into_value(),
+                        crate::value::DictViewKind::Values => v.clone(),
+                        crate::value::DictViewKind::Items => {
+                            Value::Tuple(Rc::new(vec![k.clone().into_value(), v.clone()]))
+                        }
+                    }));
                 }
-                IterState::Set { keys, index } => {
-                    return if *index >= keys.len() {
-                        Ok(None)
-                    } else {
-                        let v = keys[*index].clone().into_value();
-                        *index += 1;
-                        Ok(Some(v))
+                IterState::Set {
+                    set,
+                    pos,
+                    used,
+                    remaining,
+                } => {
+                    let s = set.borrow();
+                    if s.len() != *used {
+                        *used = usize::MAX;
+                        return Err(Unwind::Exception(VmException::new(
+                            "RuntimeError",
+                            "Set changed size during iteration",
+                        )));
+                    }
+                    let Some((next, k)) = s.next_entry(*pos) else {
+                        *pos = usize::MAX;
+                        return Ok(None);
                     };
+                    *pos = next;
+                    *remaining = remaining.saturating_sub(1);
+                    return Ok(Some(k.clone().into_value()));
+                }
+                IterState::ListRev { list, index } => {
+                    let l = list.borrow();
+                    if *index == 0 || *index > l.len() {
+                        *index = 0;
+                        return Ok(None);
+                    }
+                    *index -= 1;
+                    return Ok(Some(l[*index].clone()));
+                }
+                IterState::DictRev {
+                    dict,
+                    kind,
+                    index,
+                    used,
+                } => {
+                    let d = dict.borrow();
+                    if d.len() != *used {
+                        *used = usize::MAX;
+                        return Err(Unwind::Exception(VmException::new(
+                            "RuntimeError",
+                            "dictionary changed size during iteration",
+                        )));
+                    }
+                    if *index == 0 {
+                        return Ok(None);
+                    }
+                    *index -= 1;
+                    let Some((k, v)) = d.get_index(*index) else {
+                        return Ok(None);
+                    };
+                    return Ok(Some(match kind {
+                        crate::value::DictViewKind::Keys => k.clone().into_value(),
+                        crate::value::DictViewKind::Values => v.clone(),
+                        crate::value::DictViewKind::Items => {
+                            Value::Tuple(Rc::new(vec![k.clone().into_value(), v.clone()]))
+                        }
+                    }));
                 }
                 IterState::Reversed { items, index } => {
                     return if *index >= items.len() {
@@ -11681,11 +11787,11 @@ fn as_set_operand(v: &Value) -> Result<Option<crate::pyset::PySet>, Unwind> {
         Value::Set(s) => Ok(Some(s.borrow().clone())),
         // A view joins set algebra as `set(view)`: its items added in order.
         Value::DictView {
-            kind: DictViewKind::Keys | DictViewKind::Items,
-            items,
+            kind: kind @ (DictViewKind::Keys | DictViewKind::Items),
+            dict,
         } => {
             let mut out = crate::pyset::PySet::new();
-            for item in items {
+            for item in crate::value::view_items(*kind, dict) {
                 out.insert(item.to_hash_key()?);
             }
             Ok(Some(out))
@@ -13429,34 +13535,26 @@ e = (1+2j) - (3+1j)
     #[test]
     fn dict_view_repr_iter_len_contains() {
         use crate::value::DictViewKind;
+        let mut map: DictMap = IndexMap::new();
+        map.insert(HashKey::Str(Rc::new("a".into())), Value::Int(VmInt::from(1)));
+        map.insert(HashKey::Str(Rc::new("b".into())), Value::Int(VmInt::from(2)));
+        let dict = Rc::new(crate::value::FrozenCell::new(map));
         let keys = Value::DictView {
             kind: DictViewKind::Keys,
-            items: vec![
-                Value::Str(Rc::new("a".into())),
-                Value::Str(Rc::new("b".into())),
-            ],
+            dict: dict.clone(),
         };
         assert_eq!(keys.py_str(), "dict_keys(['a', 'b'])");
         assert_eq!(keys.type_name(), "dict_keys");
 
         let values = Value::DictView {
             kind: DictViewKind::Values,
-            items: vec![Value::Int(VmInt::from(1)), Value::Int(VmInt::from(2))],
+            dict: dict.clone(),
         };
         assert_eq!(values.py_str(), "dict_values([1, 2])");
 
         let items = Value::DictView {
             kind: DictViewKind::Items,
-            items: vec![
-                Value::Tuple(Rc::new(vec![
-                    Value::Str(Rc::new("a".into())),
-                    Value::Int(VmInt::from(1)),
-                ])),
-                Value::Tuple(Rc::new(vec![
-                    Value::Str(Rc::new("b".into())),
-                    Value::Int(VmInt::from(2)),
-                ])),
-            ],
+            dict,
         };
         assert_eq!(items.py_str(), "dict_items([('a', 1), ('b', 2)])");
 

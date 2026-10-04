@@ -563,3 +563,79 @@ show(Color.RED == 1, isinstance(Color.RED, int), list(Color), Color.CRIMSON is C
 "#,
     );
 }
+
+// ── W5-11: changing a dict or set while iterating it ──────────────────────
+
+#[test]
+fn w5_11_mutation_during_iteration_raises() {
+    assert_matches_cpython(
+        "w5_11_mutation_during_iteration_raises",
+        r#"def grow() -> object:
+    d = {1: 1, 2: 2}
+    for k in d:
+        d[k + 10] = 0
+    return d
+trap("grow", grow)
+def shrink() -> object:
+    d = {1: 1, 2: 2, 3: 3}
+    try:
+        for k in d:
+            del d[k]
+    except RuntimeError as e:
+        show("caught", e)
+    return d
+trap("shrink", shrink)
+def same_size() -> object:
+    d = {"a": 1, "b": 2, "c": 3}
+    out = []
+    for k in d:
+        out.append(k)
+        if k == "a":
+            del d["b"]
+            d["d"] = 4
+    return out
+trap("same_size", same_size)
+def setgrow() -> object:
+    s = {1, 2, 3}
+    for x in s:
+        s.add(x + 100)
+    return s
+trap("setgrow", setgrow)
+def setshrink() -> object:
+    s = {1, 2, 3}
+    for x in s:
+        s.discard(x)
+    return s
+trap("setshrink", setshrink)
+def update_ok() -> object:
+    d = {1: 1, 2: 2}
+    for k in d:
+        d[k] = 5
+    return d
+trap("update_ok", update_ok)
+def viewmut() -> None:
+    d = {1: 1}
+    for x in d.values():
+        d[x + 5] = 1
+trap("viewmut", viewmut)
+d = {"a": 1}
+k = d.keys()
+v = d.values()
+it = d.items()
+d["b"] = 2
+show(k, "b" in k, v, it, len(k), ("b", 2) in it, ("b", 3) in it)
+show(d.keys() & {"a", "z"}, d.items() - {("a", 1)})
+l = [1, 2, 3]; r = reversed(l); l.pop(); show(list(r))
+l = [1, 2, 3]; r = reversed(l); l[0] = 9; show(list(r), type(r).__name__)
+show(list(reversed(range(0, 10, 3))), list(reversed(range(10, 0, -3))), list(reversed("abc")))
+dd = {"a": 1, "b": 2}
+show(list(reversed(dd)), list(reversed(dd.items())), type(reversed(dd)).__name__)
+def drev() -> None:
+    d = {"a": 1, "b": 2}
+    for k in reversed(d):
+        d["z"] = 0
+trap("drev", drev)
+trap("set", lambda: reversed({1, 2}))
+"#,
+    );
+}

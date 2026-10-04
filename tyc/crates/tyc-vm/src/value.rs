@@ -1592,10 +1592,50 @@ pub enum Value {
     /// The builtins agent materialises the `items` vector (already containing
     /// the keys, values, or `(k, v)` tuples respectively) and tags it with the
     /// matching `kind`. The VM provides repr, iteration, `len()`, and `in`.
+    /// `dict.keys()` / `.values()` / `.items()`: a *live* view of `dict`
+    /// (CPython's views reflect later changes to the dict).
     DictView {
         kind: DictViewKind,
-        items: Vec<Value>,
+        dict: RcDict,
     },
+}
+
+impl IterState {
+    /// `reversed()` over `dict`'s keys, values or items.
+    pub fn dict_rev(dict: &RcDict, kind: DictViewKind) -> IterState {
+        let used = dict.borrow().len();
+        IterState::DictRev {
+            dict: dict.clone(),
+            kind,
+            index: used,
+            used,
+        }
+    }
+
+    /// A fresh iterator over `dict`'s keys, values or items.
+    pub fn dict_iter(dict: &RcDict, kind: DictViewKind) -> IterState {
+        let used = dict.borrow().len();
+        IterState::Dict {
+            dict: dict.clone(),
+            kind,
+            index: 0,
+            used,
+            remaining: used,
+        }
+    }
+}
+
+/// The current contents of a dict view, in dict order.
+pub fn view_items(kind: DictViewKind, dict: &RcDict) -> Vec<Value> {
+    let d = dict.borrow();
+    match kind {
+        DictViewKind::Keys => d.keys().cloned().map(HashKey::into_value).collect(),
+        DictViewKind::Values => d.values().cloned().collect(),
+        DictViewKind::Items => d
+            .iter()
+            .map(|(k, v)| Value::Tuple(Rc::new(vec![k.clone().into_value(), v.clone()])))
+            .collect(),
+    }
 }
 
 /// Which flavour of dict view a `Value::DictView` represents. Controls the
@@ -1952,13 +1992,36 @@ pub enum IterState {
         chars: Vec<char>,
         index: usize,
     },
+    /// A dict (or dict view) iterator over the live dict: `used` is the
+    /// size it started with (a change raises CPython's `RuntimeError`) and
+    /// `remaining` how many entries it may still yield.
     Dict {
-        keys: Vec<HashKey>,
+        dict: RcDict,
+        kind: DictViewKind,
+        index: usize,
+        used: usize,
+        remaining: usize,
+    },
+    /// `reversed(list)`: yields `list[index - 1]` while that index is still
+    /// inside the (live) list.
+    ListRev {
+        list: RcList,
         index: usize,
     },
-    Set {
-        keys: Vec<HashKey>,
+    /// `reversed(dict)` / `reversed(view)`: `index` counts down the live
+    /// dict's entries; a size change raises.
+    DictRev {
+        dict: RcDict,
+        kind: DictViewKind,
         index: usize,
+        used: usize,
+    },
+    /// A set iterator over the live table (`pos` is a slot index).
+    Set {
+        set: RcSet,
+        pos: usize,
+        used: usize,
+        remaining: usize,
     },
     Enumerate {
         inner: Rc<RefCell<IterState>>,
@@ -2006,13 +2069,37 @@ pub fn iter_type_name(state: &IterState) -> &'static str {
         IterState::List { .. } => "list_iterator",
         IterState::Tuple { .. } => "tuple_iterator",
         IterState::Str { .. } => "str_ascii_iterator",
-        IterState::Dict { .. } => "dict_keyiterator",
+        IterState::Dict {
+            kind: DictViewKind::Keys,
+            ..
+        } => "dict_keyiterator",
+        IterState::Dict {
+            kind: DictViewKind::Values,
+            ..
+        } => "dict_valueiterator",
+        IterState::Dict {
+            kind: DictViewKind::Items,
+            ..
+        } => "dict_itemiterator",
         IterState::Set { .. } => "set_iterator",
         IterState::Enumerate { .. } => "enumerate",
         IterState::Zip { .. } => "zip",
         IterState::Map { .. } => "map",
         IterState::Filter { .. } => "filter",
-        IterState::Reversed { .. } => "list_reverseiterator",
+        IterState::Reversed { .. } => "reversed",
+        IterState::ListRev { .. } => "list_reverseiterator",
+        IterState::DictRev {
+            kind: DictViewKind::Keys,
+            ..
+        } => "dict_reversekeyiterator",
+        IterState::DictRev {
+            kind: DictViewKind::Values,
+            ..
+        } => "dict_reversevalueiterator",
+        IterState::DictRev {
+            kind: DictViewKind::Items,
+            ..
+        } => "dict_reverseitemiterator",
         IterState::Generator(_) | IterState::GenExpr(_) => "generator",
         IterState::UserIter(_) => "iterator",
         IterState::SeqIter { .. } => "iterator",
@@ -2247,7 +2334,7 @@ impl Value {
                     false
                 }
             }
-            Value::DictView { items, .. } => !items.is_empty(),
+            Value::DictView { dict, .. } => !dict.borrow().is_empty(),
             _ => true,
         }
     }
@@ -2873,7 +2960,8 @@ impl Value {
                     ),
                 }
             }
-            Value::DictView { kind, items } => {
+            Value::DictView { kind, dict } => {
+                let items = view_items(*kind, dict);
                 let prefix = match kind {
                     DictViewKind::Keys => "dict_keys",
                     DictViewKind::Values => "dict_values",

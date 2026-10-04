@@ -305,6 +305,14 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   `json` as the value, and `str()` / `format()` follow CPython 3.12+.
   `StrEnum`'s `auto()` gives the lower-cased name, and duplicate values
   become aliases.
+- **Changing a dict or set while iterating it raises** (W5-11). Adding
+  or removing keys inside `for k in d:` completed silently on the VM;
+  CPython raises `RuntimeError: dictionary changed size during
+  iteration` (and `Set changed size during iteration`). Dict and set
+  iterators now walk the live container and raise the same errors. Dict
+  views (`keys()` / `values()` / `items()`) became live views of the dict
+  rather than snapshots (`k in d.keys()` is a lookup), and `reversed()`
+  of a list / dict is live while refusing non-sequences as CPython does.
 - **One front end for every VM entry point** (W5-20). The entry program,
   imported sibling modules and the embedded stdlib shims all go through
   `tyc_syntax::preprocess::expand_and_preprocess_mapped` — the chain

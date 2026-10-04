@@ -134,6 +134,15 @@ impl PySet {
         })
     }
 
+    /// The first member at or after table slot `pos`, with the slot after
+    /// it — how CPython's set iterator walks a table that may change.
+    pub fn next_entry(&self, pos: usize) -> Option<(usize, &HashKey)> {
+        (pos..self.table.len()).find_map(|i| match &self.table[i] {
+            Slot::Active(_, k) => Some((i + 1, k)),
+            _ => None,
+        })
+    }
+
     fn entries(&self) -> impl Iterator<Item = (i64, &HashKey)> + '_ {
         self.table.iter().filter_map(|s| match s {
             Slot::Active(h, k) => Some((*h, k)),

@@ -1145,16 +1145,62 @@ pub fn install(interp: &mut Interpreter) {
                 return i.make_iter(r);
             }
         }
-        let it = i.make_iter(seq)?;
-        let mut out: Vec<Value> = Vec::new();
-        while let Some(v) = i.iter_next(&it)? {
-            out.push(v);
-        }
-        out.reverse();
-        Ok(Value::Iter(Rc::new(RefCell::new(IterState::Reversed {
-            items: Rc::new(out),
-            index: 0,
-        }))))
+        // A list and a dict reverse *live* (CPython's
+        // `list_reverseiterator` indexes the list as it goes; the dict one
+        // raises if the dict changes size); immutable sequences snapshot;
+        // anything that is not a sequence is refused.
+        let state = match seq {
+            Value::List(l) => {
+                let index = l.borrow().len();
+                IterState::ListRev { list: l, index }
+            }
+            Value::Dict(d) => IterState::dict_rev(&d, crate::value::DictViewKind::Keys),
+            Value::DictView { kind, dict } => IterState::dict_rev(&dict, kind),
+            Value::Range { start, stop, step } => {
+                let n = if step > 0 && stop > start {
+                    (stop - start + step - 1) / step
+                } else if step < 0 && start > stop {
+                    (start - stop - step - 1) / -step
+                } else {
+                    0
+                };
+                let last = start + (n - 1) * step;
+                IterState::Range {
+                    current: if n == 0 { 0 } else { last },
+                    stop: if n == 0 { 0 } else { start - step },
+                    step: -step,
+                }
+            }
+            seq @ (Value::Tuple(_) | Value::Str(_) | Value::Bytes(_) | Value::Instance(_)) => {
+                if let Value::Instance(inst) = &seq {
+                    let sequence = i.find_method(&inst.class, "__len__").is_some()
+                        && i.find_method(&inst.class, "__getitem__").is_some();
+                    if !sequence {
+                        return Err(type_error(format!(
+                            "'{}' object is not reversible",
+                            inst.class.name
+                        )));
+                    }
+                }
+                let it = i.make_iter(seq)?;
+                let mut out: Vec<Value> = Vec::new();
+                while let Some(v) = i.iter_next(&it)? {
+                    out.push(v);
+                }
+                out.reverse();
+                IterState::Reversed {
+                    items: Rc::new(out),
+                    index: 0,
+                }
+            }
+            other => {
+                return Err(type_error(format!(
+                    "'{}' object is not reversible",
+                    other.type_display_name()
+                )))
+            }
+        };
+        Ok(Value::Iter(Rc::new(RefCell::new(state))))
     });
 
     native!("enumerate", |i, args| {
@@ -2127,7 +2173,7 @@ fn value_len(v: &Value) -> Result<usize, Unwind> {
             }
         }
         // A dict-view's length is the number of items it exposes.
-        Value::DictView { items, .. } => items.len(),
+        Value::DictView { dict, .. } => dict.borrow().len(),
         other => {
             return Err(type_error(format!(
                 "object of type '{}' has no len()",
@@ -11068,24 +11114,15 @@ fn dict_method(
         }
         "keys" => Ok(Value::DictView {
             kind: crate::value::DictViewKind::Keys,
-            items: d
-                .borrow()
-                .keys()
-                .cloned()
-                .map(HashKey::into_value)
-                .collect(),
+            dict: d.clone(),
         }),
         "values" => Ok(Value::DictView {
             kind: crate::value::DictViewKind::Values,
-            items: d.borrow().iter().map(|(_, v)| v.clone()).collect(),
+            dict: d.clone(),
         }),
         "items" => Ok(Value::DictView {
             kind: crate::value::DictViewKind::Items,
-            items: d
-                .borrow()
-                .iter()
-                .map(|(k, v)| Value::Tuple(Rc::new(vec![k.clone().into_value(), v.clone()])))
-                .collect(),
+            dict: d.clone(),
         }),
         "pop" => {
             let k = interp.dict_probe_key(d, single(args, "pop")?)?;
