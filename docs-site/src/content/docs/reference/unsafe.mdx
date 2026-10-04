@@ -12,7 +12,7 @@ import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
 `unsafe:` opens a lexical region where the checker tolerates `Any`-shaped expressions. Values inside acquire an `Unsafe[T]` marker that cannot cross out without re-assertion.
 
 <Aside type="tip" title="Prefer `as!` at a single boundary">
-  For a one-off untyped boundary — a JSON payload, a sqlite row, a redis value — reach for the [`as!` checked cast](#as-the-checked-boundary-cast) instead. It replaces the whole `unsafe:` + re-assertion dance with one sound, runtime-checked line.
+  For a one-off untyped boundary — a JSON payload, a sqlite row, a redis value — reach for the [`as!` checked cast](#as--the-checked-boundary-cast) instead. It replaces the whole `unsafe:` + re-assertion dance with one sound, runtime-checked line.
 </Aside>
 
 ## Syntax
@@ -164,7 +164,7 @@ The in-process VM intercepts `__typhon_checked_cast__` *before* argument evaluat
 - **A [`.dty` stub](/Typhon/interop/dty-stubs/)** — for a long-lived dependency.
 - **`as!`** — for an ad-hoc one-off shape assertion. It is the sound, runtime-checked upgrade over a bare `unsafe:` re-assertion.
 
-See [The Unsafe Boundary → `as!`](/Typhon/types/unsafe/#as-the-sound-one-line-boundary-cast) for the full treatment.
+See [The Unsafe Boundary → `as!`](/Typhon/types/unsafe/#as--the-sound-one-line-boundary-cast) for the full treatment.
 
 ## When to use
 

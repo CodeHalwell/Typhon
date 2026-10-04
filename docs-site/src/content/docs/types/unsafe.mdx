@@ -12,7 +12,7 @@ import { Aside, TabItem, Tabs } from '@astrojs/starlight/components';
 `unsafe:` is Typhon's escape hatch for talking to code the type system can't reason about — typically untyped third-party libraries or genuinely dynamic Python. It is a **lexical region**, not a per-value cast, with a hidden marker that prevents `Any` from leaking into typed code.
 
 <Aside type="tip" title="At a single boundary, reach for `as!`">
-  When the boundary is a *single* untyped value — a JSON payload, a sqlite row, a redis value — the [`as!` checked cast](#as-the-sound-one-line-boundary-cast) replaces the entire `unsafe:` + re-assertion dance with one sound, runtime-checked line. Read on for `unsafe:`, but prefer `as!` for the one-off case.
+  When the boundary is a *single* untyped value — a JSON payload, a sqlite row, a redis value — the [`as!` checked cast](#as--the-sound-one-line-boundary-cast) replaces the entire `unsafe:` + re-assertion dance with one sound, runtime-checked line. Read on for `unsafe:`, but prefer `as!` for the one-off case.
 </Aside>
 
 ## The shape
@@ -187,7 +187,7 @@ The **left** operand is the whole current syntactic slot — back to the enclosi
 - **A [`.dty` stub](/Typhon/interop/dty-stubs/)** — a long-lived dependency.
 - **`as!`** — an ad-hoc one-off shape assertion, the sound runtime-checked upgrade over a bare `unsafe:` re-assertion.
 
-See [`unsafe` → `as!`](/Typhon/reference/unsafe/#as-the-checked-boundary-cast) for the reference-page summary.
+See [`unsafe` → `as!`](/Typhon/reference/unsafe/#as--the-checked-boundary-cast) for the reference-page summary.
 
 ## When to use `unsafe:`
 
