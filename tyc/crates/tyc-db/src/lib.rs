@@ -17,10 +17,7 @@ use tyc_resolve::{resolve_module_with, LazyImportRemap, ResolveOptions, Resolved
 use tyc_syntax::{
     parse_module,
     preprocess::{
-        expand_compound_question_headers, expand_gather_blocks, expand_go_calls,
-        expand_inline_question_ops, expand_lazy_lets, expand_multiline_guards, expand_pipes,
-        expand_question_ops, expand_typed_let_unpack, expand_with_chains, line_byte_starts,
-        preprocess, validate_extend_usage, validate_lazy_usage, validate_question_ops,
+        line_byte_starts, validate_extend_usage, validate_lazy_usage, validate_question_ops,
         PreprocessResult,
     },
 };
@@ -99,9 +96,35 @@ pub fn preprocessed_full(db: &dyn salsa::Database, file: SourceFile) -> ArcPrepr
     // The mapped chain leaves `line_map` (preprocessed line → `.ty` line) on
     // the result, which `check_pipeline` uses to report the line the user
     // wrote rather than the preprocessed buffer's.
-    ArcPreprocessResult(Arc::new(
-        tyc_syntax::preprocess::expand_and_preprocess_mapped(text, false),
-    ))
+    ArcPreprocessResult(shared_preprocess(text))
+}
+
+/// `expand_and_preprocess_mapped(text, false)`, shared between
+/// [`preprocessed_full`] and the shape pre-pass ([`parse_for_shapes`]):
+/// `tyc build` and `tyc check` extract every file's shapes before checking
+/// it, and both used to run the whole sugar pipeline on the same text. Keyed
+/// by the full source text, so a hit is exact; bounded, so a long-running
+/// language server does not keep every edit it has seen.
+fn shared_preprocess(text: &str) -> Arc<PreprocessResult> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Cache = Mutex<HashMap<String, Arc<PreprocessResult>>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    const CAPACITY: usize = 1024;
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(hit) = cache.lock().ok().and_then(|c| c.get(text).cloned()) {
+        return hit;
+    }
+    let result = Arc::new(tyc_syntax::preprocess::expand_and_preprocess_mapped(
+        text, false,
+    ));
+    if let Ok(mut c) = cache.lock() {
+        if c.len() >= CAPACITY {
+            c.clear();
+        }
+        c.insert(text.to_owned(), Arc::clone(&result));
+    }
+    result
 }
 
 /// Tracked query: the names declared at the top level of the module.
@@ -530,15 +553,10 @@ pub fn extract_shapes_and_facts_for_path(
 }
 
 /// The preprocess + parse front-end shared by the shape extractors.
-fn parse_for_shapes(text: &str) -> Option<(PreprocessResult, tyc_syntax::ast::ModModule)> {
-    let expanded = expand_question_ops(&expand_inline_question_ops(
-        &expand_compound_question_headers(&expand_pipes(&expand_with_chains(&expand_go_calls(
-            &expand_gather_blocks(&expand_multiline_guards(&expand_lazy_lets(
-                &expand_typed_let_unpack(text),
-            ))),
-        )))),
-    ));
-    let prep = preprocess(&expanded);
+fn parse_for_shapes(text: &str) -> Option<(Arc<PreprocessResult>, tyc_syntax::ast::ModModule)> {
+    // The same canonical chain (and so the same result) as the check
+    // pipeline's `preprocessed_full`, which reuses it.
+    let prep = shared_preprocess(text);
     let module = parse_module(&prep.python_source).ok()?.into_syntax();
     Some((prep, module))
 }
