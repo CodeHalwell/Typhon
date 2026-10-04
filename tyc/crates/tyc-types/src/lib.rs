@@ -41224,13 +41224,17 @@ def main() -> None:
     fn w2_08_power_and_augmented_assignment() {
         for src in [
             "let n: int = 2 ** -1\n",
-            "def f(exponent: int) -> int:\n    return 2 ** exponent\n",
-            "newtype Count = int\ndef f(n: Count, exponent: int) -> Count:\n    return n ** exponent\n",
+            "newtype Count = int\ndef f(n: Count) -> Count:\n    return n ** -2\n",
             "def f() -> bool:\n    mut b: bool = True\n    b += 1\n    return b\n",
             "def f(p: float?) -> float:\n    mut t: float = 1.0\n    t += p\n    return t\n",
-            "def f(exponent: int) -> int:\n    mut n: int = 2\n    n **= exponent\n    return n\n",
+            "def f() -> int:\n    mut n: int = 2\n    n **= -1\n    return n\n",
         ] { assert!(!check(src).errors().is_empty(), "accepted: {src}"); }
         let src="newtype Count = int\ndef f(n: Count) -> Count:\n    return n ** 2\ndef g(exponent: int) -> int | float:\n    return 2 ** exponent\ndef h() -> bool:\n    mut b: bool = True\n    b &= False\n    return b\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+        // An exponent of unknown sign keeps the integer type: these run
+        // correctly whenever callers pass non-negative exponents, so
+        // rejecting them would narrow correct programs.
+        let src="def power(base: int, exp: int) -> int:\n    return base ** exp\nnewtype Count = int\ndef f(n: Count, exponent: int) -> Count:\n    return n ** exponent\ndef g(exponent: int) -> int:\n    mut n: int = 2\n    n **= exponent\n    return n\n";
         assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
     }
     #[test]

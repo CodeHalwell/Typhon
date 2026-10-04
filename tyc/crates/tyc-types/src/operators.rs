@@ -46,10 +46,14 @@ pub(super) fn power_result(
             _ => None,
         }
     }
+    // Only a provably negative exponent makes the result a float. An
+    // exponent of unknown sign keeps the integer type: rejecting
+    // `def power(base: int, exp: int) -> int: return base ** exp` would
+    // narrow programs that only ever pass non-negative exponents and run
+    // correctly.
     Some(match negative(exponent) {
-        Some(false) => integer_result,
         Some(true) => Type::Float,
-        None => Type::union_of(vec![integer_result, Type::Float]),
+        Some(false) | None => integer_result,
     })
 }
 

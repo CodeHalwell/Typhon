@@ -104,14 +104,6 @@ stress/round-2026-06-03/repros/vmattr.ty
 stress/round-2026-06-16/proj/
 stress/round-2026-06-16/repros/y01_number_theory.ty
 stress/round-2026-06-21/repros/106-getattr-fallback.ty
-# W2-08 rejects `-> int` returning `int ** int` (a negative exponent gives a
-# float). This program only uses positive exponents and runs under CPython:
-# a narrowing of a correct program, pending a decision on W2-08.
-stress/round-2026-06-21/repros/118-cast-partial.ty
-# W2-08 rejects `-> int` returning `int ** int` (a negative exponent gives a
-# float). This program only uses positive exponents and runs under CPython:
-# a narrowing of a correct program, pending a decision on W2-08.
-stress/round-2026-06-21/repros/78-deep-recursion-bignum.ty
 stress/round-2026-09-01/analyse/b_class_lambda.ty
 stress/round-2026-09-01/analyse/b_ct_m_neg.ty
 stress/round-2026-09-01/analyse/b_r10_fstring_spec.ty
