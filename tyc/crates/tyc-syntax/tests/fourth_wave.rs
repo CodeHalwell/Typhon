@@ -172,13 +172,15 @@ fn assignment_value_is_hoisted_before_a_target_operand() {
 }
 
 #[test]
-fn trivial_siblings_and_dotted_receivers_are_left_alone() {
+fn trivial_siblings_and_name_or_module_receivers_are_left_alone() {
     for src in [
         "def f(a: int) -> Result[int, str]:\n    return Ok(add(a, parse(s)?))\n",
         "def f(out: list[int]) -> Result[int, str]:\n    out.append(parse(s)?)\n    return Ok(0)\n",
-        "def f(self) -> Result[int, str]:\n    self.items.append(parse(s)?)\n    return Ok(0)\n",
+        "import os\ndef f() -> Result[str, str]:\n    return Ok(os.path.join(\"a\", parse(s)?))\n",
         "def f() -> Result[int, str]:\n    return Ok(g([], {}, 1, \"s\", None, lambda x: x, parse(s)?))\n",
         "def f() -> Result[int, str]:\n    let x: int = parse(s)?\n    return Ok(x)\n",
+        // A local target no call can rebind keeps its augmented assignment.
+        "def f() -> Result[int, str]:\n    mut total: int = 0\n    total += parse(s)?\n    return Ok(total)\n",
     ] {
         let out = expand_inline_question_ops(src);
         assert!(
@@ -186,6 +188,80 @@ fn trivial_siblings_and_dotted_receivers_are_left_alone() {
             "nothing needed hoisting:\n{src}\n---\n{out}"
         );
     }
+}
+
+#[test]
+fn a_dotted_receiver_is_read_before_the_operand() {
+    // `parse` may rebind `self.items`; Python appends to the list it read.
+    let out = expand_inline_question_ops(
+        "def f(self) -> Result[int, str]:\n    self.items.append(parse(s)?)\n    return Ok(0)\n",
+    );
+    assert!(
+        line_of(&out, "__typhon_ev_0__ = self.items") < line_of(&out, "= parse(s)"),
+        "{out}"
+    );
+    assert!(out.contains("__typhon_ev_0__.append("), "{out}");
+}
+
+#[test]
+fn a_name_the_operand_can_rebind_is_read_before_it() {
+    // `global x` anywhere in the file: `g` may rebind `x`.
+    let out = expand_inline_question_ops(
+        "mut x: int = 1\ndef g() -> Result[int, str]:\n    global x\n    x = 2\n    return Ok(1)\ndef h() -> Result[int, str]:\n    return Ok(f(x, g()?))\n",
+    );
+    assert!(
+        line_of(&out, "__typhon_ev_0__ = x") < line_of(&out, "= g()"),
+        "{out}"
+    );
+    assert!(out.contains("f(__typhon_ev_0__, "), "{out}");
+    // A walrus in the statement rebinds its target.
+    let out = expand_inline_question_ops(
+        "def h(y: int) -> Result[int, str]:\n    return Ok(f(y, g(y := 3)?))\n",
+    );
+    assert!(
+        line_of(&out, "__typhon_ev_0__ = y") < line_of(&out, "= g(y := 3)"),
+        "{out}"
+    );
+}
+
+#[test]
+fn an_augmented_assignment_loads_its_target_before_the_operand() {
+    let out = expand_inline_question_ops(
+        "def f(self) -> Result[int, str]:\n    self.pos += self.advance()?\n    return Ok(0)\n",
+    );
+    let load = line_of(&out, "__typhon_ev_0__ = self.pos");
+    assert!(load < line_of(&out, "= self.advance()"), "{out}");
+    assert!(out.contains("    __typhon_ev_0__ += __typhon_qi_"), "{out}");
+    assert!(
+        line_of(&out, "self.pos = __typhon_ev_0__") > line_of(&out, "__typhon_ev_0__ +="),
+        "{out}"
+    );
+    // A subscript target: container and index evaluated once, in order.
+    let out = expand_inline_question_ops(
+        "def f(d: dict[int, int]) -> Result[int, str]:\n    d[key()] *= val()?\n    return Ok(0)\n",
+    );
+    assert!(
+        line_of(&out, "__typhon_ev_0__ = key()")
+            < line_of(&out, "__typhon_ev_1__ = d[__typhon_ev_0__]"),
+        "{out}"
+    );
+    assert!(
+        line_of(&out, "__typhon_ev_1__ = d[__typhon_ev_0__]") < line_of(&out, "= val()"),
+        "{out}"
+    );
+    assert!(
+        out.contains("d[__typhon_ev_0__] = __typhon_ev_1__"),
+        "{out}"
+    );
+    // A global name target.
+    let out = expand_inline_question_ops(
+        "mut total: int = 0\ndef h() -> Result[int, str]:\n    global total\n    total += g()?\n    return Ok(total)\n",
+    );
+    assert!(
+        line_of(&out, "__typhon_ev_0__ = total") < line_of(&out, "= g()"),
+        "{out}"
+    );
+    assert!(out.contains("total = __typhon_ev_0__"), "{out}");
 }
 
 #[test]

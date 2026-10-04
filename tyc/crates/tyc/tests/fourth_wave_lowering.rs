@@ -141,6 +141,19 @@ fn inline_question_keeps_python_evaluation_order_across_shapes() {
     );
 }
 
+/// W7-04 residuals: a name the operand rebinds (`global x` in the callee)
+/// and a dotted method receiver are read before the operand, and an
+/// augmented assignment — to a global, an attribute, a subscript — loads its
+/// target before evaluating its value. Expected output from the same
+/// program run as plain Python.
+#[test]
+fn inline_question_reads_names_receivers_and_aug_targets_first() {
+    assert_runs_as(
+        include_str!("fourth_wave/eval_order_residual.ty"),
+        include_str!("fourth_wave/eval_order_residual.expected"),
+    );
+}
+
 /// W7-05: `gather` used as an ordinary name — a class attribute, a module
 /// binding, and a parameter on a continuation line — is not a `gather:`
 /// block. (It was lowered to `async with asyncio.TaskGroup()` in a class

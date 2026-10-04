@@ -41,15 +41,35 @@
 //!
 //! "Trivial" — left in place — means evaluating it can neither have an
 //! effect nor observe one an operand might have: literals (and displays of
-//! them), names, lambdas, `super()`, empty builtin-constructor calls, and
-//! type-expression subscripts (`list[int]`). A call receiver that is a
-//! dotted name (`self.items.append(…)`, `os.path.join(…)`) is also left in
-//! place; a receiver that calls or subscripts (`self.peek().m(…)`) is
-//! hoisted. Two known residual differences, both requiring a callee that
-//! rebinds the very name or attribute being read: a plain name or dotted
-//! receiver read before the operand is read after it, and an augmented
-//! assignment (`self.pos += self.advance()?`) loads its target after the
-//! operand.
+//! them), names no call can rebind, lambdas, `super()`, empty
+//! builtin-constructor calls, and type-expression subscripts (`list[int]`).
+//! A name *can* be rebound by the operand when the file declares it
+//! `global` or `nonlocal` somewhere, or the statement assigns it with a
+//! walrus; such a name is hoisted like any other value (`f(x, g()?)` where
+//! `g` does `global x; x = …` reads the old `x`).
+//!
+//! A call receiver is evaluated before the arguments, so a dotted receiver
+//! (`self.items.append(self.word()?)`) is hoisted: `word()` may rebind
+//! `self.items`, and Python appends to the list it had read. A receiver
+//! that is a plain name follows the name rule; one rooted at an imported
+//! module (`os.path.join(…)`) is left in place.
+//!
+//! An augmented assignment loads its target before evaluating the value, so
+//! one whose value carries a propagated operand and whose target the
+//! operand could change — an attribute, a subscript, or a rebindable name —
+//! is spelled out in Python's order:
+//!
+//! ```text
+//! self.pos += self.advance()?
+//! # becomes
+//! __typhon_ev_0__ = self.pos
+//! __typhon_ev_0__ += self.advance()?
+//! self.pos = __typhon_ev_0__
+//! ```
+//!
+//! (with the container and a non-trivial index hoisted first, so each is
+//! evaluated once). `+=` on the temporary keeps the in-place `__iadd__`
+//! semantics: a list target is extended, not copied.
 //!
 //! Anything the pass cannot model with certainty — a statement the parser
 //! cannot read once its `?`s are masked, `as!` / `rescue` still in it, an
@@ -58,6 +78,7 @@
 //! `if` / `for` / `with` — is left exactly as it was, so the pass can only
 //! ever reorder a statement it fully understands.
 
+use std::collections::HashSet;
 use std::ops::Range;
 
 use ruff_python_ast::{Expr, Stmt};
@@ -130,6 +151,7 @@ fn hoist_once(text: &str, counter: &mut usize) -> Option<(String, Vec<usize>)> {
     }
     starts.push(acc);
     let contexts = q_contexts(text);
+    let names = FileNames::scan(&mask, &lines);
 
     let mut out = MappedOut::with_capacity(text.len() + 64);
     let mut changed = false;
@@ -145,6 +167,7 @@ fn hoist_once(text: &str, counter: &mut usize) -> Option<(String, Vec<usize>)> {
             lines: &lines,
             starts: &starts,
             contexts: &contexts,
+            names: &names,
             first: i,
             end: j,
         };
@@ -168,6 +191,66 @@ fn hoist_once(text: &str, counter: &mut usize) -> Option<(String, Vec<usize>)> {
     changed.then(|| out.finish())
 }
 
+/// File-wide facts about names the walk needs: which names a call may
+/// rebind (declared `global` / `nonlocal` somewhere), and which are bound by
+/// an `import` (a receiver rooted at one is a module, left in place).
+struct FileNames {
+    rebindable: HashSet<String>,
+    imported: HashSet<String>,
+}
+
+impl FileNames {
+    fn scan(mask: &LexMask, lines: &[&str]) -> Self {
+        let mut rebindable = HashSet::new();
+        let mut imported = HashSet::new();
+        let idents = |list: &str| -> Vec<String> {
+            list.split(',')
+                .map(|part| part.trim().trim_matches(['(', ')']).trim())
+                .filter(|part| !part.is_empty())
+                .map(|part| {
+                    // `a.b as c` binds `c`; `a.b` binds `a`.
+                    let bound = part.rsplit(" as ").next().unwrap_or(part).trim();
+                    let bound = if part.contains(" as ") {
+                        bound
+                    } else {
+                        bound.split('.').next().unwrap_or(bound)
+                    };
+                    bound.to_owned()
+                })
+                .collect()
+        };
+        for (li, line) in lines.iter().enumerate() {
+            if !mask.is_logical_line_start(li) || mask.line_starts_in_string(li) {
+                continue;
+            }
+            let raw = line.trim_end_matches(['\n', '\r']);
+            let code = raw[..mask.line_code_end(li).min(raw.len())].trim();
+            let code = code.strip_prefix("pub ").unwrap_or(code);
+            if let Some(rest) = code
+                .strip_prefix("global ")
+                .or_else(|| code.strip_prefix("nonlocal "))
+            {
+                rebindable.extend(idents(rest));
+            } else if let Some(rest) = code.strip_prefix("import ") {
+                imported.extend(idents(rest));
+            } else if let Some(rest) = code.strip_prefix("lazy import ") {
+                // `lazy import np = numpy`
+                if let Some(name) = rest.split('=').next() {
+                    imported.insert(name.trim().to_owned());
+                }
+            } else if code.starts_with("from ") {
+                if let Some((_, rest)) = code.split_once(" import ") {
+                    imported.extend(idents(rest));
+                }
+            }
+        }
+        FileNames {
+            rebindable,
+            imported,
+        }
+    }
+}
+
 /// One logical statement: physical lines `first..end` of `text`.
 struct StmtSpan<'a> {
     text: &'a str,
@@ -175,6 +258,7 @@ struct StmtSpan<'a> {
     lines: &'a [&'a str],
     starts: &'a [usize],
     contexts: &'a [super::QContext<'a>],
+    names: &'a FileNames,
     first: usize,
     end: usize,
 }
@@ -265,10 +349,6 @@ impl StmtSpan<'_> {
                 scratch.replace_range(p..p + 1, " ");
             }
         }
-        if inline_qs.is_empty() {
-            return None;
-        }
-
         // The statement's trailing `?` (lowered by the end-of-line pass): a
         // hoisted expression that ends right before it carries it along.
         let last_line = self.end - 1;
@@ -279,6 +359,9 @@ impl StmtSpan<'_> {
             code.ends_with('?')
                 .then(|| self.starts[last_line] - base + code.len() - 1)
         };
+        if inline_qs.is_empty() && trailing_q.is_none() {
+            return None;
+        }
 
         // A probe the parser can read: every code `?` masked to a space
         // (offsets unchanged), the head indentation dropped, and a compound
@@ -309,9 +392,43 @@ impl StmtSpan<'_> {
             return None;
         };
 
+        // Names this statement could see rebound before it reads them: the
+        // file's `global` / `nonlocal` names and its own walrus targets.
+        let mut rebindable = self.names.rebindable.clone();
+        collect_walrus_targets(stmt, &mut rebindable);
+
+        if let Stmt::AugAssign(aug) = stmt {
+            let value = aug.value.range();
+            let value = value.start().to_usize() + indent_len..value.end().to_usize() + indent_len;
+            let carries_operand = operands
+                .iter()
+                .any(|o| o.start >= value.start && o.end <= value.end)
+                || trailing_q
+                    .is_some_and(|q| q >= value.end && body[value.end..q].trim().is_empty());
+            let target_may_change = match aug.target.as_ref() {
+                Expr::Name(n) => rebindable.contains(n.id.as_str()),
+                Expr::Attribute(_) | Expr::Subscript(_) => true,
+                _ => false,
+            };
+            if carries_operand && target_may_change {
+                return self.spell_out_aug_assign(
+                    aug,
+                    indent_len,
+                    last_code_end,
+                    &rebindable,
+                    counter,
+                );
+            }
+        }
+        if inline_qs.is_empty() {
+            return None;
+        }
+
         let mut plan = Plan {
             offset: indent_len,
             operands: &operands,
+            rebindable: &rebindable,
+            imported: &self.names.imported,
             events: Vec::new(),
         };
         plan.visit_stmt(stmt).ok()?;
@@ -398,12 +515,126 @@ impl StmtSpan<'_> {
     }
 }
 
+impl StmtSpan<'_> {
+    /// `TARGET op= VALUE` whose `VALUE` carries a propagated operand that
+    /// could change `TARGET`: load the target into a temporary first, apply
+    /// the operator to the temporary, store it back — Python's order for an
+    /// augmented assignment. The container and a non-trivial index are
+    /// hoisted so each is evaluated exactly once. `None` (leave the
+    /// statement alone) for a slice target.
+    fn spell_out_aug_assign(
+        &self,
+        aug: &ruff_python_ast::StmtAugAssign,
+        indent_len: usize,
+        last_code_end: usize,
+        rebindable: &HashSet<String>,
+        counter: &mut usize,
+    ) -> Option<Vec<(String, usize)>> {
+        let body = self.body();
+        let indent = &body[..indent_len];
+        let span = |node: &dyn Ranged| -> Range<usize> {
+            let r = node.range();
+            r.start().to_usize() + indent_len..r.end().to_usize() + indent_len
+        };
+        let mut emitted: Vec<(String, usize)> = Vec::new();
+        let next_temp = |counter: &mut usize| {
+            let t = format!("{TEMP_PREFIX}{}__", *counter);
+            *counter += 1;
+            t
+        };
+        // `e` as an operand that is read once, here: its text when reading
+        // it again later cannot differ, else a hoisted temporary.
+        let once = |e: &Expr, emitted: &mut Vec<(String, usize)>, counter: &mut usize| {
+            let r = span(e);
+            let stays = match e {
+                Expr::Name(n) => !rebindable.contains(n.id.as_str()),
+                Expr::StringLiteral(_)
+                | Expr::BytesLiteral(_)
+                | Expr::NumberLiteral(_)
+                | Expr::BooleanLiteral(_)
+                | Expr::NoneLiteral(_) => true,
+                _ => false,
+            };
+            if stays {
+                return body[r].to_owned();
+            }
+            let temp = next_temp(counter);
+            let line = format!("{indent}{temp} = {}\n", &body[r.clone()]);
+            let first = self.line_of(r.start);
+            for (k, l) in line.split_inclusive('\n').enumerate() {
+                emitted.push((l.to_owned(), first + k));
+            }
+            temp
+        };
+        let target = match aug.target.as_ref() {
+            Expr::Name(n) => n.id.as_str().to_owned(),
+            Expr::Attribute(a) => {
+                let container = once(&a.value, &mut emitted, counter);
+                format!("{container}.{}", a.attr.as_str())
+            }
+            Expr::Subscript(s) => {
+                if matches!(s.slice.as_ref(), Expr::Slice(_)) {
+                    return None;
+                }
+                let container = once(&s.value, &mut emitted, counter);
+                let index = once(&s.slice, &mut emitted, counter);
+                format!("{container}[{index}]")
+            }
+            _ => return None,
+        };
+        let target_span = span(aug.target.as_ref());
+        let value_span = span(aug.value.as_ref());
+        let op = body[target_span.end..value_span.start].trim();
+        if !op.ends_with('=') {
+            return None;
+        }
+        let first = self.first;
+        let temp = format!("{TEMP_PREFIX}{}__", *counter);
+        *counter += 1;
+        emitted.push((format!("{indent}{temp} = {target}\n"), first));
+        // The value as written, `?`s included — the later passes lower them
+        // against the temporary's augmented assignment.
+        let value_text = &body[value_span.start..last_code_end.max(value_span.end)];
+        let line = format!("{indent}{temp} {op} {value_text}\n");
+        let value_line = self.line_of(value_span.start);
+        for (k, l) in line.split_inclusive('\n').enumerate() {
+            emitted.push((l.to_owned(), value_line + k));
+        }
+        emitted.push((
+            format!("{indent}{target} = {temp}\n"),
+            self.line_of(last_code_end.saturating_sub(1)),
+        ));
+        Some(emitted)
+    }
+}
+
+/// Every name a walrus in `stmt` binds.
+fn collect_walrus_targets(stmt: &Stmt, out: &mut HashSet<String>) {
+    use ruff_python_ast::visitor::{walk_expr, Visitor};
+    struct V<'o>(&'o mut HashSet<String>);
+    impl<'a> Visitor<'a> for V<'_> {
+        fn visit_expr(&mut self, e: &'a Expr) {
+            if let Expr::Named(n) = e {
+                if let Expr::Name(t) = n.target.as_ref() {
+                    self.0.insert(t.id.as_str().to_owned());
+                }
+            }
+            walk_expr(self, e);
+        }
+    }
+    V(out).visit_stmt(stmt);
+}
+
 /// The evaluation-order walk over one statement.
 struct Plan<'a> {
     /// Probe offset → statement offset (the dropped head indentation).
     offset: usize,
     /// Statement-relative ranges of the inline-propagated operands.
     operands: &'a [Range<usize>],
+    /// Names the operand could rebind before the statement reads them.
+    rebindable: &'a HashSet<String>,
+    /// Names bound by an `import`: a receiver rooted at one is a module.
+    imported: &'a HashSet<String>,
     /// Expressions evaluated before a later operand, in evaluation order.
     events: Vec<Event>,
 }
@@ -522,8 +753,33 @@ impl Plan<'_> {
         if !self.contains_operand(e) {
             return Ok(());
         }
-        let children = eval_children(e)?;
+        let children = eval_children(e, |recv| self.receiver_is_child(recv))?;
         self.visit_ordered(&children)
+    }
+
+    /// Whether a method call's receiver must be evaluated (hoisted) before
+    /// its arguments: anything but `super()`, a name no call can rebind, or
+    /// a dotted name rooted at an imported module.
+    fn receiver_is_child(&self, recv: &Expr) -> bool {
+        if is_super_call(recv) {
+            return false;
+        }
+        match recv {
+            Expr::Name(n) => self.rebindable.contains(n.id.as_str()),
+            _ if is_dotted_name(recv) => {
+                let mut root = recv;
+                while let Expr::Attribute(a) = root {
+                    root = &a.value;
+                }
+                !matches!(root, Expr::Name(n) if self.imported.contains(n.id.as_str()))
+            }
+            _ => true,
+        }
+    }
+
+    /// [`is_trivial`], except that a name a call could rebind is not.
+    fn is_trivial(&self, e: &Expr) -> bool {
+        is_trivial(e, &|name| self.rebindable.contains(name))
     }
 
     /// An expression evaluated before an operand: hoist it, or — for an
@@ -540,7 +796,7 @@ impl Plan<'_> {
             self.events.push(Event::Hoist(range));
             return Ok(());
         }
-        if is_trivial(e) {
+        if self.is_trivial(e) {
             return Ok(());
         }
         match e {
@@ -568,16 +824,18 @@ impl Plan<'_> {
 /// The children of `e` in Python evaluation order, for an `e` that holds an
 /// operand. Shapes whose operands are evaluated conditionally, lazily, or
 /// inside a literal are not modelled.
-fn eval_children(e: &Expr) -> Result<Vec<&Expr>, Unmodelled> {
+fn eval_children(
+    e: &Expr,
+    receiver_is_child: impl Fn(&Expr) -> bool,
+) -> Result<Vec<&Expr>, Unmodelled> {
     Ok(match e {
         Expr::Call(c) => {
             let mut v: Vec<&Expr> = Vec::new();
             match c.func.as_ref() {
-                // `recv.method(…)`: the receiver is evaluated first. A dotted
-                // name is left in place (see the module docs); anything that
-                // calls or subscripts is a real child.
+                // `recv.method(…)`: the receiver is evaluated first (see the
+                // module docs for the receivers left in place).
                 Expr::Attribute(a) => {
-                    if !is_dotted_name(&a.value) && !is_super_call(&a.value) {
+                    if receiver_is_child(&a.value) {
                         v.push(&a.value);
                     }
                 }
@@ -664,10 +922,12 @@ fn is_super_call(e: &Expr) -> bool {
 
 /// An expression whose evaluation neither has an effect nor observes one,
 /// so where it runs relative to a propagated operand cannot matter.
-fn is_trivial(e: &Expr) -> bool {
+/// `rebindable` names a call may rebind, which are not trivial.
+fn is_trivial(e: &Expr, rebindable: &dyn Fn(&str) -> bool) -> bool {
+    let is_trivial = |e: &Expr| is_trivial(e, rebindable);
     match e {
-        Expr::Name(_)
-        | Expr::StringLiteral(_)
+        Expr::Name(n) => !rebindable(n.id.as_str()),
+        Expr::StringLiteral(_)
         | Expr::BytesLiteral(_)
         | Expr::NumberLiteral(_)
         | Expr::BooleanLiteral(_)
@@ -681,7 +941,7 @@ fn is_trivial(e: &Expr) -> bool {
         Expr::Dict(d) => d
             .items
             .iter()
-            .all(|i| i.key.as_ref().is_none_or(is_trivial) && is_trivial(&i.value)),
+            .all(|i| i.key.as_ref().is_none_or(&is_trivial) && is_trivial(&i.value)),
         Expr::Starred(s) => is_trivial(&s.value),
         Expr::Call(c) => {
             is_super_call(e)

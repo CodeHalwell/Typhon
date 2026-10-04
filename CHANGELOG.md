@@ -480,6 +480,22 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   - A propagating `?` in a replacement field on a continuation line of a
     triple-quoted f-string lifts above the statement like one on a bracket
     continuation line; it was a `tyc::parse` error.
+- **Inline `?`: the two W7-04 residuals are closed.** A name the operand
+  can rebind — declared `global` / `nonlocal` anywhere in the file, or a
+  walrus target of the statement — is read before the operand (`f(x, g()?)`
+  where `g` does `global x; x = …` passed the new `x`). A dotted method
+  receiver is evaluated before the arguments
+  (`self.items.append(self.word()?)` appended to the list `word()` had just
+  installed, not the one Python read); a receiver rooted at an imported
+  module (`os.path.join(…)`) stays in place. An augmented assignment whose
+  value carries a propagated operand and whose target that operand could
+  change — an attribute, a subscript, or a rebindable name — loads the
+  target first: `self.pos += self.advance()?` lowers to
+  `__typhon_ev_0__ = self.pos`, `__typhon_ev_0__ += …`,
+  `self.pos = __typhon_ev_0__` (container and non-trivial index hoisted
+  once; `+=` on the temporary keeps the in-place semantics). Both surfaces
+  share the lowering; the new test checks each against the same program run
+  as plain Python.
 - **Secondary diagnostic labels survive a `?` expansion.** Mapping a
   diagnostic from the expanded source back to the `.ty` file moved only its
   primary span; a second label (`first declared here`, `declared here`)
