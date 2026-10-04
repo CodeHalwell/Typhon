@@ -2771,6 +2771,29 @@ struct LoopExits {
     continues: Vec<TypeEnv>,
 }
 
+/// The envs reaching a loop's head once its body has been checked (`c.env`
+/// is the env at the end of the body): the pre-loop env, every `continue`,
+/// and the end of the body. When a statement in the body always leaves it
+/// (`break` / `continue` / `return` / `raise`, judged by the checker-aware
+/// [`stmt_always_exits_aware`], so an open `match` still falls through),
+/// whatever follows is dead and its end never reaches the head — `while f:
+/// break; x = None` must not widen `x` — so it contributes its declarations
+/// but no narrowings.
+fn loop_head_states(
+    c: &Checker,
+    body: &[Stmt],
+    pre_loop: TypeEnv,
+    continues: Vec<TypeEnv>,
+) -> Vec<TypeEnv> {
+    let mut body_end = c.env.snapshot();
+    if body.iter().any(|s| stmt_always_exits_aware(c, s)) {
+        body_end.take_narrowings_from(&pre_loop);
+    }
+    let mut states = vec![body_end, pre_loop];
+    states.extend(continues);
+    states
+}
+
 /// The join of `states` — a narrowing survives only where every state
 /// agrees on it ([`TypeEnv::intersect_narrowings`]). `None` when there are
 /// none (the point is unreachable).
@@ -3076,6 +3099,29 @@ impl TypeEnv {
         }
         self.attr_narrowings
             .retain(|k, v| other.attr_narrowings.get(k) == Some(v));
+    }
+
+    /// Replace `self`'s narrowings with `other`'s, keeping `self`'s bindings:
+    /// one `other` shares (same declaration) takes its narrowed type, any
+    /// other is widened to its declared type. For an env whose own flow is
+    /// dead — the end of a loop body after an unconditional `break` — so it
+    /// contributes its declarations to a join but none of its narrowings.
+    fn take_narrowings_from(&mut self, other: &TypeEnv) {
+        for (i, scope) in self.scopes.iter_mut().enumerate() {
+            let other_scope = other.scopes.get(i);
+            if other_scope.is_some_and(|o| Rc::ptr_eq(scope, o)) {
+                continue;
+            }
+            for (name, b) in Rc::make_mut(scope).iter_mut() {
+                b.narrowed = match other_scope.and_then(|s| s.get(name)) {
+                    Some(ob) if ob.span == b.span && ob.declared == b.declared => {
+                        ob.narrowed.clone()
+                    }
+                    _ => b.declared.clone(),
+                };
+            }
+        }
+        self.attr_narrowings = other.attr_narrowings.clone();
     }
 
     /// Overlay onto `self` the binding and narrowing changes a `finally` block
@@ -12859,7 +12905,7 @@ struct LoopReassigned {
     attrs: std::collections::HashSet<String>,
 }
 
-fn collect_reassigned_names(stmts: &[Stmt], acc: &mut LoopReassigned) {
+fn collect_reassigned_names(c: &Checker, stmts: &[Stmt], acc: &mut LoopReassigned) {
     fn add_target(t: &Expr, acc: &mut LoopReassigned) {
         match t {
             Expr::Name(n) => {
@@ -12902,50 +12948,54 @@ fn collect_reassigned_names(stmts: &[Stmt], acc: &mut LoopReassigned) {
             Stmt::AugAssign(a) => add_target(&a.target, acc),
             Stmt::If(i) => {
                 if !body_always_leaves_loop(&i.body) {
-                    collect_reassigned_names(&i.body, acc);
+                    collect_reassigned_names(c, &i.body, acc);
                 }
                 for clause in &i.elif_else_clauses {
                     if !body_always_leaves_loop(&clause.body) {
-                        collect_reassigned_names(&clause.body, acc);
+                        collect_reassigned_names(c, &clause.body, acc);
                     }
                 }
             }
             Stmt::For(f) => {
-                collect_reassigned_names(&f.body, acc);
-                collect_reassigned_names(&f.orelse, acc);
+                collect_reassigned_names(c, &f.body, acc);
+                collect_reassigned_names(c, &f.orelse, acc);
             }
             Stmt::While(w) => {
-                collect_reassigned_names(&w.body, acc);
-                collect_reassigned_names(&w.orelse, acc);
+                collect_reassigned_names(c, &w.body, acc);
+                collect_reassigned_names(c, &w.orelse, acc);
             }
             Stmt::With(w) => {
                 if !body_always_leaves_loop(&w.body) {
-                    collect_reassigned_names(&w.body, acc);
+                    collect_reassigned_names(c, &w.body, acc);
                 }
             }
             Stmt::Try(t) => {
-                collect_reassigned_names(&t.body, acc);
+                collect_reassigned_names(c, &t.body, acc);
                 for h in &t.handlers {
                     let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
                     if !body_always_leaves_loop(&h.body) {
-                        collect_reassigned_names(&h.body, acc);
+                        collect_reassigned_names(c, &h.body, acc);
                     }
                 }
-                collect_reassigned_names(&t.orelse, acc);
-                collect_reassigned_names(&t.finalbody, acc);
+                collect_reassigned_names(c, &t.orelse, acc);
+                collect_reassigned_names(c, &t.finalbody, acc);
             }
             Stmt::Match(m) => {
                 for case in &m.cases {
                     if !body_always_leaves_loop(&case.body) {
-                        collect_reassigned_names(&case.body, acc);
+                        collect_reassigned_names(c, &case.body, acc);
                     }
                 }
             }
-            // An unconditional exit ends this block's contribution to the
-            // back-edge: statements after it can't carry a value to the next
-            // iteration, so stop collecting here.
-            Stmt::Break(_) | Stmt::Return(_) | Stmt::Raise(_) | Stmt::Continue(_) => return,
             _ => {}
+        }
+        // An unconditional exit — a bare `break` / `return` / `raise` /
+        // `continue`, or a compound statement every branch of which leaves
+        // (the checker-aware form: an open `match` can fall through) — ends
+        // this block's contribution to the back-edge: statements after it
+        // can't carry a value to the next iteration, so stop collecting.
+        if stmt_always_exits_aware(c, s) {
+            return;
         }
     }
 }
@@ -14346,7 +14396,7 @@ fn widen_loop_carried_narrowings(c: &mut Checker, body: &[Stmt]) {
         return;
     }
     let mut reassigned = LoopReassigned::default();
-    collect_reassigned_names(body, &mut reassigned);
+    collect_reassigned_names(c, body, &mut reassigned);
     for name in &reassigned.names {
         c.env.widen_to_declared(name);
     }
@@ -15342,8 +15392,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // invalidated survive the loop: `while running: x = None` left a
             // pre-loop `x: int` narrowing in force after it (review
             // 2026-10-03, W1-07).
-            let mut head_states = vec![c.env.snapshot(), pre_loop];
-            head_states.extend(exits.continues);
+            let head_states = loop_head_states(c, &w.body, pre_loop, exits.continues);
             if let Some(head) = join_envs(head_states) {
                 c.env.restore(head);
             }
@@ -15436,8 +15485,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // used to flow straight on, as if the loop always ran to the end
             // at least once, and the `else` block was never checked at all
             // (review 2026-10-03, W1-06).
-            let mut head_states = vec![c.env.snapshot(), pre_loop];
-            head_states.extend(exits.continues);
+            let head_states = loop_head_states(c, &f.body, pre_loop, exits.continues);
             if let Some(head) = join_envs(head_states) {
                 c.env.restore(head);
             }
@@ -15618,7 +15666,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // such name to its declared type on entry to each handler; the
             // same goes for attribute paths the body assigns.
             let mut body_writes = LoopReassigned::default();
-            collect_reassigned_names(&t.body, &mut body_writes);
+            collect_reassigned_names(c, &t.body, &mut body_writes);
             for h in &t.handlers {
                 let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
                 // Enter the handler with the pre-`try` narrowings (keeping any
@@ -15693,7 +15741,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 // the normal-path narrowings `finally` never touched.
                 let finally_result = c.env.snapshot();
                 let mut finally_writes = LoopReassigned::default();
-                collect_reassigned_names(&t.finalbody, &mut finally_writes);
+                collect_reassigned_names(c, &t.finalbody, &mut finally_writes);
                 after_try.overlay_finally_delta(&finally_view, &finally_result, &finally_writes);
                 c.env.restore(after_try);
             }
@@ -41935,6 +41983,15 @@ def main() -> None:
         }
     }
     #[test]
+    fn deferred_lambda_body_does_not_hide_mutation() {
+        // The body runs when the lambda is called, outside the handler.
+        let src = "let NAMES: list[str] = __typhon_freeze__([\"a\"])\ntry:\n    let later = lambda: NAMES.append(\"b\")\nexcept AttributeError:\n    pass\n";
+        assert!(!check(src).errors().is_empty(), "{src}");
+        // A default runs where the lambda is created, inside the handler.
+        let src = "let NAMES: list[str] = __typhon_freeze__([\"a\"])\ntry:\n    let probe = lambda n=NAMES.append(\"b\"): n\nexcept AttributeError:\n    pass\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
     fn w2_06_callable_shapes() {
         for src in [
             "from typing import Callable\ndef f(g: Callable[[int], int]) -> int:\n    return g(y=1)\n",
@@ -41948,6 +42005,29 @@ def main() -> None:
             "from typing import Callable\ndef deco[**P, R](f: Callable[P, R]) -> Callable[P, R]:\n    return f\ndef add(a: int, b: int = 10) -> int:\n    return a + b\ndef f() -> int:\n    let g = deco(add)\n    return g(1)\n",
             "def add(a: int) -> int:\n    return a + 1\ndef f() -> int:\n    let fs = [add, lambda a: a]\n    return fs[0](1)\n",
         ] { assert!(check(src).errors().is_empty(), "{src}: {:?}",check(src).errors()); }
+    }
+    #[test]
+    fn a_union_of_functions_accepts_keyword_arguments() {
+        const AB: &str =
+            "def a(x: int) -> int:\n    return x\ndef b(x: int) -> str:\n    return str(x)\n";
+        for call in ["h(x=1)", "h(*(1,))", "h(**{\"x\": 1})"] {
+            let src = format!(
+                "{AB}def f(flag: bool) -> int | str:\n    let h = a if flag else b\n    return {call}\n"
+            );
+            assert!(
+                check(&src).errors().is_empty(),
+                "{src}: {:?}",
+                check(&src).errors()
+            );
+        }
+        // Too many positionals, a positional of the wrong type, and an error
+        // inside a keyword value are still reported.
+        for call in ["h(1, 2, x=3)", "h(\"s\", x=1)", "h(x=a(\"s\"))", "h(1, 2)"] {
+            let src = format!(
+                "{AB}def f(flag: bool) -> int | str:\n    let h = a if flag else b\n    return {call}\n"
+            );
+            assert!(!check(&src).errors().is_empty(), "accepted: {src}");
+        }
     }
     #[test]
     fn w2_07_await_contracts() {
@@ -41993,6 +42073,20 @@ def main() -> None:
         assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
     }
     #[test]
+    fn power_sign_follows_unary_minus_over_constant_expressions() {
+        // CPython: `2 ** -(2 ** 3) == 0.00390625`, `2 ** -True == 0.5`.
+        for src in [
+            "def f() -> int:\n    return 2 ** -(2 ** 3)\n",
+            "def f() -> int:\n    return 2 ** -True\n",
+            "def f() -> int:\n    return 2 ** +-(1 ** 0)\n",
+        ] {
+            assert!(!check(src).errors().is_empty(), "accepted: {src}");
+        }
+        // `-(-3)`, `-0` and `-(0 ** 2)` are non-negative: the result is an int.
+        let src = "def f() -> int:\n    return 2 ** -(-3)\ndef g() -> int:\n    return 2 ** -(0)\ndef h() -> int:\n    return 2 ** -(0 ** 2)\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
     fn w2_09_ordering_and_membership() {
         for src in [
             "enum Color:\n    RED\n    GREEN\ndef f() -> bool:\n    return Color.RED < Color.GREEN\n",
@@ -42033,6 +42127,51 @@ def main() -> None:
         );
         let src="def parse() -> Result[int, str]:\n    return Ok(3)\ndef g() -> Result[str, str]:\n    return parse().map(lambda n: n + 1).map(lambda n: n + 1)\n";
         assert!(!check_full(src).errors().is_empty());
+    }
+    #[test]
+    fn w2_10_task_contracts_walk_their_arguments() {
+        // `TaskGroup()` takes no arguments (CPython raises `TypeError`), and
+        // the expressions passed to the task contracts are still checked.
+        for src in [
+            "async def f() -> None:\n    async with asyncio.TaskGroup(1) as tg:\n        pass\n",
+            "async def f() -> None:\n    async with asyncio.TaskGroup(limit=1) as tg:\n        pass\n",
+        ] {
+            let d = check_full(src);
+            assert!(
+                d.errors().iter().any(|e| matches!(e, TycError::WrongArgCount { .. })),
+                "accepted: {src}"
+            );
+        }
+        for src in [
+            "def g(x: int) -> int:\n    return x\nasync def f() -> None:\n    async with asyncio.TaskGroup(g(\"s\")) as tg:\n        pass\n",
+            "def g(x: int) -> str:\n    return str(x)\nasync def work() -> int:\n    return 1\nasync def f() -> int:\n    let t = asyncio.create_task(work(), name=g(\"s\"))\n    return await t\n",
+        ] {
+            let d = check_full(src);
+            assert!(
+                d.errors().iter().any(|e| matches!(e, TycError::TypeMismatch { .. })),
+                "argument not checked: {src}: {:?}",
+                d.errors()
+            );
+        }
+        for src in [
+            "async def f() -> None:\n    async with asyncio.TaskGroup(*()) as tg:\n        pass\n",
+            "async def work() -> int:\n    return 1\nasync def f() -> int:\n    let t = asyncio.create_task(work(), name=\"w\")\n    return await t\n",
+        ] { assert!(check_full(src).errors().is_empty(), "{src}: {:?}", check_full(src).errors()); }
+    }
+    #[test]
+    fn create_task_accepts_the_coroutine_by_keyword() {
+        // `create_task(coro, *, name=None, context=None)`: CPython accepts
+        // `coro=` by keyword, and a `*`/`**` unpacking can supply it.
+        for src in [
+            "async def work() -> int:\n    return 1\nasync def f() -> int:\n    let t = asyncio.create_task(coro=work())\n    return await t\n",
+            "async def work() -> int:\n    return 1\nasync def f() -> None:\n    async with asyncio.TaskGroup() as tg:\n        let t = tg.create_task(coro=work(), name=\"w\")\n    let n: int = t.result()\n",
+            "async def work() -> int:\n    return 1\nasync def f() -> None:\n    let t = asyncio.create_task(*(work(),))\n    await t\n",
+        ] { assert!(check_full(src).errors().is_empty(), "{src}: {:?}", check_full(src).errors()); }
+        for src in [
+            "async def work() -> int:\n    return 1\nasync def f() -> str:\n    let t = asyncio.create_task(coro=work())\n    return await t\n",
+            "async def work() -> int:\n    return 1\nasync def f() -> None:\n    let t = asyncio.create_task(work(), coro=work())\n    await t\n",
+            "async def f() -> None:\n    let t = asyncio.create_task(name=\"w\")\n    await t\n",
+        ] { assert!(!check_full(src).errors().is_empty(), "accepted: {src}"); }
     }
     #[test]
     fn w2_11_go_requires_a_coroutine() {

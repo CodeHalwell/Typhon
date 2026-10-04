@@ -47,6 +47,35 @@ pub(super) fn contract(c: &mut Checker, call: &ruff_python_ast::ExprCall) -> Opt
     let asyncio = matches!(&recv,Type::Module(m) if m=="asyncio")
         || matches!(attr.value.as_ref(),Expr::Name(n) if n.id.as_str()=="asyncio" && c.env.lookup("asyncio").is_none());
     if asyncio && name == "TaskGroup" {
+        // Walk the arguments so their own diagnostics still surface.
+        // `TaskGroup()` takes none: any argument other than an (empty)
+        // `*`/`**` unpacking is a `TypeError` in CPython.
+        for arg in &call.arguments.args {
+            let _ = infer_expr(c, arg);
+        }
+        for kw in &call.arguments.keywords {
+            let _ = infer_expr(c, &kw.value);
+        }
+        let supplied = call
+            .arguments
+            .args
+            .iter()
+            .filter(|arg| !matches!(arg, Expr::Starred(_)))
+            .count()
+            + call
+                .arguments
+                .keywords
+                .iter()
+                .filter(|kw| kw.arg.is_some())
+                .count();
+        if supplied > 0 {
+            c.wrong_args(
+                name,
+                0,
+                supplied,
+                (call.range.start().to_usize(), call.range.end().to_usize()),
+            );
+        }
         return Some(Type::Class("asyncio.TaskGroup".into()));
     }
     let spawn = name == "spawn" && task_spawn_callee(call).is_some();
@@ -94,13 +123,36 @@ pub(super) fn contract(c: &mut Checker, call: &ruff_python_ast::ExprCall) -> Opt
                 unwrap_awaitable(&ty, &c.classes).unwrap_or(Type::Unknown)
             })
             .collect();
+        // `create_task(coro=work())` passes the coroutine by keyword.
+        let coro =
+            call.arguments.keywords.iter().position(|kw| {
+                create_task && kw.arg.as_ref().is_some_and(|n| n.as_str() == "coro")
+            });
+        if let Some(i) = coro {
+            let ty = infer_expr(c, &call.arguments.keywords[i].value);
+            results.push(unwrap_awaitable(&ty, &c.classes).unwrap_or(Type::Unknown));
+        }
         c.inside_await -= 1;
+        // `name=` / `context=` / `return_exceptions=` values are ordinary
+        // expressions; walk them so their own diagnostics still surface.
+        for (i, kw) in call.arguments.keywords.iter().enumerate() {
+            if Some(i) != coro {
+                let _ = infer_expr(c, &kw.value);
+            }
+        }
         if spawn || create_task {
-            if call.arguments.args.len() != 1 {
+            // A `*`/`**` unpacking supplies an unknown number of arguments.
+            let unpacked = call
+                .arguments
+                .args
+                .iter()
+                .any(|arg| matches!(arg, Expr::Starred(_)))
+                || call.arguments.keywords.iter().any(|kw| kw.arg.is_none());
+            if results.len() != 1 && !unpacked {
                 c.wrong_args(
                     name,
                     1,
-                    call.arguments.args.len(),
+                    results.len(),
                     (call.range.start().to_usize(), call.range.end().to_usize()),
                 );
             }
