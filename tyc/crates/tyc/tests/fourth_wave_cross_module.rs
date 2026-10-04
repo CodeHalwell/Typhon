@@ -235,7 +235,7 @@ asyncio.run(main())
         ("main.ty", main),
     ]);
     assert!(!ok, "{out}");
-    assert!(out.contains("a coroutine for go"), "{out}");
+    assert!(out.contains("needs a coroutine"), "{out}");
 }
 
 #[test]

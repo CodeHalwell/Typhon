@@ -344,8 +344,9 @@ grouped by workstream (W1–W7).
   W2-11). `from helpers import work` + `go work()`, where `work` is a plain
   `def` in a project `.ty` module, passed `tyc check` and raised
   `TypeError: a coroutine was expected` from `asyncio.create_task` at
-  runtime; it is now `tyc::type_mismatch` (``expected `a coroutine for
-  go` ``), as for a same-module `def` (`await work()` likewise). Shapes
+  runtime; it is now `tyc::type_mismatch` ("`go` needs a coroutine, but
+  `work()` returns `int`"), as for a same-module `def` (`await work()`
+  likewise). Shapes
   carry a new `ArityInfo::declared_sync` flag, set only for an undecorated
   `def` extracted from `.ty` source — `.dty`, bundled and venv-introspected
   stubs, decorated functions and module-qualified calls stay permissive.

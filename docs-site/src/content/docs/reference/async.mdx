@@ -162,7 +162,7 @@ The spawned call must produce a coroutine. `go` on a function the checker
 knows to be synchronous (a plain `def`, a sync alias, a callable parameter
 typed as returning a non-awaitable, or a plain undecorated `def` imported by
 name from another project `.ty` module) is rejected with `tyc::type_mismatch`
-(``expected `a coroutine for go`, found `None` ``) — `spawn` would raise
+("`go` needs a coroutine, but `work()` returns `None`") — `spawn` would raise
 `TypeError` on it at runtime.
 
 ### Free-threaded variant
