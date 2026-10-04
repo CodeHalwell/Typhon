@@ -81,7 +81,7 @@ tyc migrate --check src/app.py     # preview to stdout (no writes)
 tyc migrate --force src/           # re-migrate, overwriting existing .ty files
 ```
 
-`PATH` is a `.py` file or a directory (migrated recursively). If any target `.ty` already exists, `tyc migrate` refuses before writing anything and names the file; `--force` (`-f`) overwrites instead. A `.ty` that is a symlink is never written through, even with `--force`.
+`PATH` is a `.py` file or a directory (migrated recursively). A directory is migrated whole, `tests/` included; only directories nobody writes by hand are skipped — virtual environments (any directory holding a `pyvenv.cfg`, plus `.venv`, `.tox`, `.nox`), VCS metadata (`.git`, `.hg`, `.svn`, `.bzr`), caches (`__pycache__`, `.mypy_cache`, `.pytest_cache`, …), `node_modules` and `build`. If any target `.ty` already exists, `tyc migrate` refuses before writing anything and names the file; `--force` (`-f`) overwrites instead. A `.ty` that is a symlink is never written through, even with `--force`.
 
 ## `--check` mode
 

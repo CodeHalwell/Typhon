@@ -64,7 +64,7 @@ pub struct MigrateArgs {
 
 pub fn run(args: MigrateArgs) -> Result<()> {
     let path = args.path.clone();
-    let py_files = crate::commands::util::collect_py_files(&path)?;
+    let py_files = crate::commands::util::collect_migration_sources(&path)?;
 
     if py_files.is_empty() {
         return Err(miette!("no .py files found under '{}'", path.display()));

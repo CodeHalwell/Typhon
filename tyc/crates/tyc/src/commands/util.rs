@@ -129,6 +129,20 @@ pub fn collect_py_files(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(acc)
 }
 
+/// Every `.py` file `tyc migrate` converts under `root` (or `root` itself):
+/// the whole tree, tests included, minus what nobody writes by hand —
+/// virtual environments, VCS metadata, caches, `node_modules/` and
+/// `build/` ([`DirFilter::Generated`]). Same symlink-safe walk as
+/// [`collect_py_files`].
+pub fn collect_migration_sources(root: &Path) -> Result<Vec<PathBuf>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut acc = Vec::new();
+    walk_into(root, "py", DirFilter::Generated, true, &mut acc)?;
+    Ok(acc)
+}
+
 /// Variant of [`collect_with_ext`] that skips conventional non-source
 /// directories: `__pycache__/`, `tests/`, `.venv/`, `build/`, and any hidden
 /// `.X` directory. Files are still matched by extension.

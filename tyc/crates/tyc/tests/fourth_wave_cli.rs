@@ -509,3 +509,67 @@ fn ineffective_parallel_settings_warn_but_still_build() {
         text(&out)
     );
 }
+
+// ── `tyc migrate` over a project tree ───────────────────────────────────────
+
+/// `tyc migrate DIR` converts the whole tree, tests included. It briefly
+/// used the build's source walk, which skips every `tests/` and hidden
+/// directory, so a project's test suite was silently left unmigrated while
+/// the command reported success. Only directories nobody writes by hand are
+/// skipped: virtual environments, VCS metadata, caches, `node_modules/` and
+/// `build/`.
+#[test]
+fn migrate_converts_tests_and_skips_only_generated_directories() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let write = |rel: &str, body: &str| {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    };
+    write("pkg/mod.py", "def f(x: int) -> int:\n    return x\n");
+    write(
+        "tests/test_mod.py",
+        "def test_f() -> None:\n    assert True\n",
+    );
+    write(
+        "pkg/tests/test_inner.py",
+        "def test_g() -> None:\n    pass\n",
+    );
+    write(".github/scripts/release.py", "x: int = 1\n");
+    for generated in [
+        ".venv/lib/site.py",
+        "env/lib/site.py",
+        ".git/hooks/hook.py",
+        "node_modules/x/gyp.py",
+        "build/lib/mod.py",
+        "__pycache__/mod.py",
+        ".mypy_cache/x.py",
+    ] {
+        write(generated, "x: int = 1\n");
+    }
+    write("env/pyvenv.cfg", "home = /usr/bin\n");
+
+    let out = tyc().arg("migrate").arg(root).output().unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("migrated 4 file(s)"), "{}", text(&out));
+    for kept in [
+        "pkg/mod.ty",
+        "tests/test_mod.ty",
+        "pkg/tests/test_inner.ty",
+        ".github/scripts/release.ty",
+    ] {
+        assert!(root.join(kept).is_file(), "{kept} was not migrated");
+    }
+    for skipped in [
+        ".venv/lib/site.ty",
+        "env/lib/site.ty",
+        ".git/hooks/hook.ty",
+        "node_modules/x/gyp.ty",
+        "build/lib/mod.ty",
+        "__pycache__/mod.ty",
+        ".mypy_cache/x.ty",
+    ] {
+        assert!(!root.join(skipped).exists(), "{skipped} must be skipped");
+    }
+}
