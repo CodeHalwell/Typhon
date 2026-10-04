@@ -5337,9 +5337,9 @@ fn stat_tuple(m: &std::fs::Metadata) -> Value {
         int(a),
         int(mt),
         int(c),
-        Value::FloatData(a as f64 + an as f64 * 1e-9),
-        Value::FloatData(mt as f64 + mn as f64 * 1e-9),
-        Value::FloatData(c as f64 + cn as f64 * 1e-9),
+        Value::Float(a as f64 + an as f64 * 1e-9),
+        Value::Float(mt as f64 + mn as f64 * 1e-9),
+        Value::Float(c as f64 + cn as f64 * 1e-9),
         int(a * 1_000_000_000 + an),
         int(mt * 1_000_000_000 + mn),
         int(c * 1_000_000_000 + cn),
@@ -5481,7 +5481,10 @@ fn fs_natives() -> Vec<(&'static str, Value)> {
                 #[cfg(unix)]
                 let previous = unsafe { libc::umask(requested as libc::mode_t) } as i64;
                 #[cfg(not(unix))]
-                let previous = 0o022;
+                let previous = {
+                    let _ = requested;
+                    0o022
+                };
                 Ok(Value::Int(VmInt::from(previous)))
             }),
         ),
@@ -5572,13 +5575,16 @@ fn fs_natives() -> Vec<(&'static str, Value)> {
                 #[cfg(unix)]
                 {
                     std::os::unix::fs::symlink(&src, &dst).map_err(|e| fs_unwind(&ddst, e))?;
+                    Ok(Value::None)
                 }
                 #[cfg(not(unix))]
                 {
-                    let _ = (src, ddst);
-                    return Err(os_error("symlink is unsupported on this platform".into()));
+                    let _ = (src, dst, ddst);
+                    Err(Unwind::Exception(crate::error::VmException::new(
+                        "OSError",
+                        "symlink is unsupported on this platform",
+                    )))
                 }
-                Ok(Value::None)
             }),
         ),
         (
