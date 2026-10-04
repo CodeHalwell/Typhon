@@ -41340,6 +41340,15 @@ def main() -> None:
         ] { assert!(check(src).errors().is_empty(), "{src}: {:?}",check(src).errors()); }
     }
     #[test]
+    fn builtin_classes_used_as_values_are_types() {
+        // `corpus/valid/copy.ty` keys a dispatch table by builtin classes.
+        // A builtin class name is the class object, not a plain function.
+        let src = "let d: dict[type, object] = {}\nd[list] = list.copy\nd[int] = 2\nlet t: type = list\nfor k in (int, str, zip):\n    d[k] = 0\nprint(d, t, isinstance(t, type))\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+        // Builtin functions keep their contract types.
+        assert!(!check("let n: str = len\n").errors().is_empty());
+    }
+    #[test]
     fn w2_08_power_and_augmented_assignment() {
         for src in [
             "let n: int = 2 ** -1\n",

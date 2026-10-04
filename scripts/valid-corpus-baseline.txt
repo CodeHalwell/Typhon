@@ -22,10 +22,10 @@
 #
 # Seeded 2026-10-03 against tyc 1.0.0-alpha.9.
 #
-# corpus/valid/textwrap.ty — VM does not model `dict.fromkeys` (the unit
-# builds `unicode_whitespace_trans` with it at class level); CPython runs the
-# unit fine, including its `__main__` demo. VM bug, burn it down.
-corpus/valid/textwrap.ty
+# (corpus/valid/textwrap.ty was seeded here for the VM's missing
+# `dict.fromkeys`; it imports `re`, so since W5-13 plain `tyc run` takes the
+# compiled path for it and it no longer diverges. The VM gap is tracked
+# separately.)
 # NOTE (not a baseline entry — the mechanism cannot pin it): string.ty is
 # `vacuous-runtime` on both surfaces because of an EMITTER bug: an `impl`
 # method whose first parameter is named `cls` (`__init_subclass__`) is
