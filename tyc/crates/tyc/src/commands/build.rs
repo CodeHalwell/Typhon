@@ -328,7 +328,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             if let Some(warn) =
                 crate::commands::check::check_stdlib_module_shadow(path, source, &src_dir_canon)
             {
-                eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn)));
+                eprint_warning(warn);
             }
         }
     }
@@ -493,7 +493,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
 
     // Emit warnings even when there are no errors so they are always visible.
     for warn in all_phase1_diags.warnings() {
-        eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn.clone())));
+        eprint_warning(warn.clone());
     }
 
     if all_phase1_diags.has_errors() {
@@ -855,7 +855,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             for (name, env_key) in tyc_analyse::comptime_secret_bindings(&module, &comptime_values)
             {
                 let warn = TycError::contains_secret_literal(name, env_key);
-                eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn)));
+                eprint_warning(warn);
             }
         }
 
@@ -1559,7 +1559,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 offset,
                 length,
             );
-            eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn)));
+            eprint_warning(warn);
         };
         // Relative imports that escape the source root (`from ..x import …`
         // from a top-level module) crash at import — surface them here.
@@ -1764,6 +1764,15 @@ struct ImportSpec {
     /// The local name bound to the module itself by `import M [as N]` or
     /// `from pkg import submodule`.
     module_alias: Option<String>,
+}
+
+/// Print `warn` as a warning. A diagnostic reported as a warning (a
+/// strictness knob at `"warn"`) is often a variant whose static severity is
+/// `Error`; render it with the warning marker, as `tyc check` does.
+fn eprint_warning(warn: TycError) {
+    let wrapped =
+        tyc_diagnostics::SanitisedDiagnostic::wrap(warn).with_severity(miette::Severity::Warning);
+    eprintln!("{:?}", miette::Report::new_boxed(Box::new(wrapped)));
 }
 
 fn scan_module_imports(
