@@ -2122,6 +2122,50 @@ impl TycError {
         }
     }
 
+    /// The source text and *every* labelled span of this diagnostic, the
+    /// primary span first. A rewrite of the source (`remap_lines`) must move
+    /// each label, not only the primary one: a secondary label left at its
+    /// expanded-text offset points past the end of the original file, and
+    /// miette then refuses to render the snippet at all ("Failed to read
+    /// contents for label `first declared here` … OutOfBounds").
+    pub fn source_and_spans_mut(
+        &mut self,
+    ) -> Option<(&mut NamedSource<String>, Vec<&mut SourceSpan>)> {
+        match self {
+            Self::NoBlockShadow {
+                src,
+                span,
+                decl_span,
+                ..
+            }
+            | Self::TypeReassignMismatch {
+                src,
+                span,
+                decl_span,
+                ..
+            }
+            | Self::UseOfUninitialised {
+                src,
+                span,
+                decl_span,
+                ..
+            } => Some((src, vec![span, decl_span])),
+            Self::ImmutableAssign {
+                src,
+                declaration,
+                assignment,
+                ..
+            } => Some((src, vec![assignment, declaration])),
+            Self::PatternShadowsOuter {
+                src,
+                declaration,
+                capture,
+                ..
+            } => Some((src, vec![capture, declaration])),
+            other => other.source_and_span_mut().map(|(src, span)| (src, vec![span])),
+        }
+    }
+
     pub fn source_and_span_mut(&mut self) -> Option<(&mut NamedSource<String>, &mut SourceSpan)> {
         match self {
             Self::Parse { src, span, .. }
@@ -4001,13 +4045,7 @@ impl Diagnostics {
                 .unwrap_or(original.len());
             original[start..end].trim_end_matches(['\n', '\r']).len()
         };
-        for err in self.errors.iter_mut().chain(self.warnings.iter_mut()) {
-            let Some((src, span)) = err.source_and_span_mut() else {
-                continue;
-            };
-            if src.inner().as_str() != expanded {
-                continue;
-            }
+        let remap = |span: &mut SourceSpan| {
             let offset = span.offset().min(expanded.len());
             let line = match expanded_starts.binary_search(&offset) {
                 Ok(l) => l,
@@ -4022,11 +4060,23 @@ impl Diagnostics {
             let width = original_line_len(target);
             let new_col = col.min(width);
             let new_len = span.len().clamp(1, (width - new_col).max(1));
-            *src = NamedSource::new(original_name, original.to_owned());
             *span = SourceSpan::new(
                 SourceOffset::from(original_starts[target] + new_col),
                 new_len,
             );
+        };
+        for err in self.errors.iter_mut().chain(self.warnings.iter_mut()) {
+            let Some((src, spans)) = err.source_and_spans_mut() else {
+                continue;
+            };
+            if src.inner().as_str() != expanded {
+                continue;
+            }
+            *src = NamedSource::new(original_name, original.to_owned());
+            // Every label moves, not only the primary one.
+            for span in spans {
+                remap(span);
+            }
         }
     }
 
@@ -4036,7 +4086,7 @@ impl Diagnostics {
     /// `/tmp/tyc-script-…/src/main.ty` rather than their own file.
     pub fn rename_source(&mut self, name: &str) {
         for err in self.errors.iter_mut().chain(self.warnings.iter_mut()) {
-            let Some((src, _)) = err.source_and_span_mut() else {
+            let Some((src, _)) = err.source_and_spans_mut() else {
                 continue;
             };
             *src = NamedSource::new(name, src.inner().clone());
@@ -5362,6 +5412,41 @@ mod tests {
             .map(|(s, sp)| (s.clone(), *sp))
             .unwrap();
         assert_eq!(wspan.offset(), 4);
+    }
+
+    #[test]
+    fn remap_lines_moves_secondary_labels_too() {
+        // A `let m` re-declared after a `?` expansion: the "first declared
+        // here" label used to keep its expanded-text offset, which lies past
+        // the end of the shorter original file.
+        let original = "def f() -> int:\n    let m: int = g()?\n    if m:\n        let m: int = 3\n    return m\n";
+        let expanded = "def f() -> int:\n    __q = g()\n    if isinstance(__q, Err):\n        return __q\n    m: int = __q.value\n    if m:\n        m: int = 3\n    return m\n";
+        let line_map = vec![0, 1, 1, 1, 1, 2, 3, 4];
+        let decl = expanded.find("m: int = __q").unwrap();
+        let redecl = expanded.find("m: int = 3").unwrap();
+        let mut diags = super::Diagnostics::new();
+        diags.push_error(super::TycError::no_block_shadow(
+            "m", "f.ty", expanded, decl, 1, redecl, 1,
+        ));
+        diags.push_error(super::TycError::immutable_assign(
+            "m", "f.ty", expanded, decl, 1, redecl, 1,
+        ));
+        diags.remap_lines(expanded, &line_map, "f.ty", original);
+        let first = original.find("m: int = g").unwrap();
+        let second = original.find("m: int = 3").unwrap();
+        let line_of = |o: usize| original[..o].matches('\n').count();
+        for err in diags.errors() {
+            let mut err = err.clone();
+            let (src, spans) = err.source_and_spans_mut().unwrap();
+            assert_eq!(src.inner().as_str(), original);
+            let mut offsets: Vec<usize> = spans.iter().map(|s| s.offset()).collect();
+            offsets.sort_unstable();
+            assert!(offsets.iter().all(|o| *o < original.len()), "{offsets:?}");
+            assert_eq!(
+                offsets.iter().map(|o| line_of(*o)).collect::<Vec<_>>(),
+                vec![line_of(first), line_of(second)],
+            );
+        }
     }
 
     use super::*;

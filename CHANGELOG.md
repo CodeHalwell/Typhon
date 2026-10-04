@@ -459,6 +459,15 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   - A propagating `?` in a replacement field on a continuation line of a
     triple-quoted f-string lifts above the statement like one on a bracket
     continuation line; it was a `tyc::parse` error.
+- **Secondary diagnostic labels survive a `?` expansion.** Mapping a
+  diagnostic from the expanded source back to the `.ty` file moved only its
+  primary span; a second label (`first declared here`, `declared here`)
+  kept its expanded-text offset, and the report printed
+  "Failed to read contents for label … OutOfBounds" instead of the snippet
+  — for example a `let m` re-declared below a line that uses `?`. Every
+  label is now remapped, and `tyc::immutable_assign` /
+  `tyc::pattern_shadows_outer` (two labels, no primary span) point at the
+  original file instead of the expanded text.
 
 ### Third wave — the 2026-09-30 release-readiness review
 
