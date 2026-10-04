@@ -4,10 +4,56 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## Unreleased — beta readiness
+## 1.0.0-beta.1 — 2026-10-04 — first beta: four review-remediation waves & a frozen surface
 
-Four waves on top of alpha.9. The first was the beta-readiness review
-remediation described further down; the second closed the backlog that
+The first beta: four review-remediation waves on top of alpha.9 — the
+2026-09-01 beta-readiness review and the backlog it deferred, the 2026-09-30
+release-readiness review, and the remediation of the six 2026-10-03 full
+reviews (W1–W7). Together they close the ways a check-clean program could
+still crash, miscompile, or behave differently under `tyc run` than under
+CPython: type-checker soundness (field narrowings dropped wherever a call or
+write can reach them, loops joining their exit paths, nullable receivers of
+every shape, union member access, `match` exhaustiveness over `Result`
+payloads, `T?`, `bool`, literal unions and nested sealed unions, and enforced
+`Callable`, `yield` and container-write contracts); lowering (an inline `?`
+keeps Python's evaluation order, `|>` works in every expression position, an
+`impl` method may read a name bound after its class, and `extend BUILTIN`
+reaches every receiver shape and crosses a `pub *` facade); VM ↔ CPython
+parity (C3 method resolution, CPython-ordered sets, value-mixin enums, a
+stdlib-shim audit, and an automatic CPython fallback for programs the VM does
+not model — the differential baseline falls from 167 entries to single
+figures); and tooling, where `tyc fmt` refuses output that changes what a
+program means, `tyc build`, `tyc fmt` and the dependency commands refuse to
+write through symlinks, and the language server survives symlink loops and
+malformed frames. CI gains a `compileall` pass over every emitted module, a
+no-build baseline, the `fmt-corpus`, `fmt-guard` and `valid-corpus` jobs, and
+a non-blocking macOS job.
+
+**No new syntax** — the one newly accepted spelling, `"Node"?` for a nullable
+quoted forward reference, is additive. The new error-level diagnostics fire
+only on programs that already crashed at runtime or emitted Python CPython
+refuses to compile: `tyc::alias_not_a_class` (`case Poly():` or
+`isinstance(x, Poly)` on a `type` alias), `tyc::invalid_pattern` (a `match`
+pattern the CPython compiler rejects), `tyc::impl_forward_reference` (an
+`impl` method that must stay in the class body reading a name bound after the
+class), and `tyc::reserved_module_name` (an error only when a program imports
+from `typhon_runtime` something the generated runtime does not provide;
+otherwise a warning). Apart from the exceptions below, the checks tightened
+under existing codes reject only code that already failed at runtime or relied
+on unsound typing. **One documented exception changes a default:
+`[strictness] nullable-use` now defaults to `"error"`**, so dereferencing a
+nullable field without a guard — a warning since alpha.7 — fails the check;
+`nullable-use = "warn"` relaxes it during a migration. The release's other
+deliberate narrowings on code that may run (`x += 1` on a `let`, `unsafe:`
+containment following derived values, the wider exhaustiveness check, `del` /
+`except … as` ending a `let`) each have an escape and are listed in
+`docs/compatibility.md`, the new compatibility policy. Under it **the surface
+is now frozen for the beta line**: the forms it lists keep their syntax and
+meaning in every beta release, and a deprecation or breaking change follows
+its warn-first process.
+
+The sections below cover the four waves. The first was the beta-readiness
+review remediation described further down; the second closed the backlog that
 review deferred; the third is the 2026-09-30 release-readiness review
 (`docs/reviews/release-readiness-review-2026-09-30.md`); the fourth,
 summarised first, is the remediation of the six 2026-10-03 full reviews,
