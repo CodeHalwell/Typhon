@@ -306,6 +306,9 @@ grouped by workstream (W1–W7).
   switches on advice lints, the other is a no-op), and validation only
   rejects configs that cannot work. The free-threading preset on the docs
   site now uses `target = "3.14t"`.
+- **Docs: `tyc migrate --force`** is now documented in `docs/cli.md` and on
+  the docs site (it overwrites existing `.ty` files; without it the command
+  refuses before writing anything).
 
 #### W5 — VM & harness
 

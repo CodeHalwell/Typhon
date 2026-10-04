@@ -188,6 +188,8 @@ tyc migrate src/app.py
 tyc migrate --check src/app.py
 ```
 
+`--force` (`-f`) overwrites existing `.ty` files. Without it, `tyc migrate` refuses before writing anything when any target `.ty` already exists, and names it; a `.ty` that is a symlink is never written through, even with `--force`.
+
 `--check` is a preview mode: it prints the migrated source to stdout instead of writing `.ty` files, but it does not compare against the input and always exits 0 on a successful migration. CI users who want a fail-on-diff signal should diff `--check` output against a checked-in `.ty`; a native exit-1-on-changes mode is a deliberate follow-up.
 
 ## `tyc ty`
