@@ -167,6 +167,7 @@ pub fn compute(
         source,
         source,
         &[],
+        &[],
         resolved,
         module,
         stdlib_modules,
@@ -191,6 +192,7 @@ pub fn compute_with_original(
     preprocessed: &str,
     original: &str,
     line_shifts: &[usize],
+    line_map: &[usize],
     resolved: &ResolvedModule,
     module: &ModModule,
     stdlib_modules: &[&str],
@@ -236,7 +238,7 @@ pub fn compute_with_original(
     // identifiers the preprocessor injected — e.g. the `NewType` call in
     // a `newtype Foo = Bar` rewrite) are dropped so the TextMate grammar
     // paints the keyword instead of leaking a wrong colour into it.
-    remap_to_original(&mut tokens, source, original, line_shifts);
+    remap_to_original(&mut tokens, source, original, line_shifts, line_map);
     // The LSP encoding requires tokens in document order (each
     // delta-line is non-negative; ties broken by delta-start).
     tokens.sort_by_key(|t| (t.line, t.col));
@@ -271,11 +273,23 @@ fn remap_to_original(
     preprocessed: &str,
     original: &str,
     line_shifts: &[usize],
+    line_map: &[usize],
 ) {
     let orig_line_starts = compute_line_starts(original);
     let prep_line_starts = compute_line_starts(preprocessed);
     tokens.retain_mut(|tok| {
         let prep_line_idx = tok.line as usize;
+        // The original line this preprocessed line came from, through the
+        // sugar chain's expansion table (`?`, `gather:`, with-chains insert
+        // lines); identity when the caller has no table (W4-07).
+        let orig_line_idx = if line_map.is_empty() {
+            prep_line_idx
+        } else {
+            line_map
+                .get(prep_line_idx)
+                .copied()
+                .unwrap_or(prep_line_idx)
+        };
 
         // Convert the token's UTF-16 column back to a byte column within
         // the preprocessed line so we can add the byte-denominated shift.
@@ -298,11 +312,12 @@ fn remap_to_original(
         if let Some(byte) = try_line_match(
             original,
             &orig_line_starts,
-            prep_line_idx,
+            orig_line_idx,
             candidate_byte,
             name,
         ) {
-            let line_text = original_line_text(original, &orig_line_starts, prep_line_idx);
+            let line_text = original_line_text(original, &orig_line_starts, orig_line_idx);
+            tok.line = orig_line_idx as u32;
             tok.col = byte_col_to_utf16(line_text, byte);
             tok.length = name.encode_utf16().count() as u32;
             return true;
@@ -320,7 +335,7 @@ fn remap_to_original(
         // TextMate grammar paints the keyword instead, which beats
         // pinning a colour to the wrong location.
         if let Some((line, byte)) =
-            find_closest_match(original, &orig_line_starts, name, prep_line_idx)
+            find_closest_match(original, &orig_line_starts, name, orig_line_idx)
         {
             let line_text = original_line_text(original, &orig_line_starts, line);
             tok.line = line as u32;
@@ -1978,6 +1993,7 @@ mod tests {
             &prep.python_source,
             original,
             &prep.line_col_shifts(),
+            &prep.line_map,
             &resolved,
             &module,
             &stdlib_refs,
@@ -2251,6 +2267,7 @@ pub def first(x: int?) -> int:
             &prep.python_source,
             original,
             &prep.line_col_shifts(),
+            &prep.line_map,
             &resolved,
             &module,
             &stdlib_refs,

@@ -215,6 +215,16 @@ grouped by workstream (W1–W7).
   and files outside every nested project keep the config found for `DIR`.
   `tyc check examples/` used to report 34 errors from apps resolving each
   other's modules; it is now clean.
+- **LSP hover, definition, completion and semantic tokens follow sugar
+  expansion** (W4-07). Editor positions are mapped through the same expansion
+  line table diagnostics use, with the column recovered by locating the
+  identifier among the lines its source line expanded into. Below a `?`,
+  `gather:` or with-chain, hover named a desugaring temporary
+  (`__typhon_q_0__`), the wrong line's binding or nothing; go-to-definition
+  and the hover range pointed at the expanded buffer's line; member completion
+  read the wrong receiver. Desugaring temporaries (`__typhon_*`) are never
+  offered by hover, definition or completion. Cross-file definitions map back
+  through the target file's own table.
 
 #### W5 — VM & harness
 

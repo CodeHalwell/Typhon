@@ -33,6 +33,7 @@ use tyc_resolve::{
     BindingKind, ClassKind, ImportInfo, Mutability, ResolveOptions, ResolvedModule, SymbolAtOffset,
 };
 
+mod position_map;
 mod semantic;
 mod stdlib_stubs;
 mod venv_introspect;
@@ -881,17 +882,33 @@ impl LanguageServer for Backend {
         let Some(sf) = self.source_file_for(&uri).await else {
             return Ok(None);
         };
-        // Both `preprocessed_text` and `resolved_module` are Salsa-tracked
+        // Both `preprocessed_full` and `resolved_module` are Salsa-tracked
         // queries that hit the cache when the file hasn't changed since the
         // last `check_source_file` call.
-        let (preprocessed, resolved) = {
+        let (original, prep_full, resolved) = {
             let db = self.db.lock().await;
-            (preprocessed_text(&*db, sf), resolved_module_arc(&*db, sf))
+            (
+                sf.text(&*db).clone(),
+                preprocessed_full(&*db, sf),
+                resolved_module_arc(&*db, sf),
+            )
         };
-        let offset = position_to_byte(&preprocessed, position);
+        let preprocessed = prep_full.python_source.as_str();
+        // The editor's position is in the text the user wrote; the resolver
+        // indexed the expanded buffer (W4-07).
+        let positions =
+            position_map::PositionMap::new(&original, preprocessed, &prep_full.line_map);
+        let offset = positions.to_preprocessed(position);
         let Some(symbol) = resolved.symbol_at_offset(offset) else {
             return Ok(None);
         };
+        if position_map::is_desugaring_temporary(&symbol.name)
+            || symbol
+                .definition
+                .is_some_and(|d| position_map::is_desugaring_temporary(&d.name))
+        {
+            return Ok(None);
+        }
 
         // Build the base hover body (kind + name + declaration-site
         // marker) from the resolver's view of the symbol. When the
@@ -911,10 +928,7 @@ impl LanguageServer for Backend {
             body.push_str("\n\n");
             body.push_str(&import_extras);
         }
-        let range = Some(Range {
-            start: byte_to_position(&preprocessed, symbol.span.0),
-            end: byte_to_position(&preprocessed, symbol.span.1),
-        });
+        let range = Some(positions.range_to_original(symbol.span.0, symbol.span.1));
         Ok(Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
@@ -994,6 +1008,7 @@ impl LanguageServer for Backend {
             &preprocessed,
             &original,
             &line_shifts,
+            &prep_full.line_map,
             &resolved,
             &module,
             stdlib,
@@ -1012,10 +1027,20 @@ impl LanguageServer for Backend {
         let Some(sf) = self.source_file_for(&uri).await else {
             return Ok(None);
         };
-        let (preprocessed, resolved) = {
+        let (original, prep_full, resolved) = {
             let db = self.db.lock().await;
-            (preprocessed_text(&*db, sf), resolved_module_arc(&*db, sf))
+            (
+                sf.text(&*db).clone(),
+                preprocessed_full(&*db, sf),
+                resolved_module_arc(&*db, sf),
+            )
         };
+        let preprocessed = prep_full.python_source.clone();
+        // Everything below reads the expanded buffer, so move the editor's
+        // position into it first (W4-07).
+        let position =
+            position_map::PositionMap::new(&original, &preprocessed, &prep_full.line_map)
+                .to_preprocessed_position(position);
         // Mid-type buffers (`os.<cursor>`) typically don't parse — the
         // trailing dot is a syntax error. The cached `ResolvedModule`
         // returned above is empty in that state, so imports aren't
@@ -1133,6 +1158,9 @@ impl LanguageServer for Backend {
             position,
             introspect_ref,
         );
+        // Desugaring temporaries (`__typhon_q_0__`, `__typhon_impl_Point`) are
+        // bindings in the expanded buffer but not names the user can write.
+        items.retain(|item| !position_map::is_desugaring_temporary(&item.label));
 
         // Auto-import suggestions: only meaningful in open-completion
         // context (the receiver / from-import branches already return
@@ -1227,14 +1255,15 @@ impl LanguageServer for Backend {
         let Some(sf) = self.source_file_for(&uri).await else {
             return Ok(None);
         };
-        let (preprocessed, prep_full, resolved) = {
+        let (original, prep_full, resolved) = {
             let db = self.db.lock().await;
             (
-                preprocessed_text(&*db, sf),
+                sf.text(&*db).clone(),
                 preprocessed_full(&*db, sf),
                 resolved_module_arc(&*db, sf),
             )
         };
+        let preprocessed = prep_full.python_source.clone();
         // The editor's `position` is in *original* (pre-preprocess) text
         // coordinates, but `preprocessed` is what the resolver bindings,
         // `symbol_at_offset`, `scope_at_offset`, and the member fast path all
@@ -1246,11 +1275,12 @@ impl LanguageServer for Backend {
         // the preprocessed buffer's coordinate space — without it a short
         // member name like `f` in `comptime let x = u.f()` lands past the
         // token and the cross-file jump silently fails (E1).
-        let offset = map_original_position_to_preprocessed_offset(
-            &preprocessed,
-            &prep_full.0.line_col_shifts(),
-            position,
-        );
+        //
+        // Sugar expansion (`?`, `gather:`, with-chains) also inserts lines, so
+        // the position goes through the expansion line table as well (W4-07).
+        let positions =
+            position_map::PositionMap::new(&original, &preprocessed, &prep_full.line_map);
+        let offset = positions.to_preprocessed(position);
 
         // Member-access cross-file jump: clicking on `Bar` in `f.Bar`
         // (after `import foo as f` / `import pkg.sub`) has no resolver
@@ -1322,12 +1352,12 @@ impl LanguageServer for Backend {
             }
         }
 
+        if position_map::is_desugaring_temporary(&def.name) {
+            return Ok(None);
+        }
         let location = Location {
             uri,
-            range: Range {
-                start: byte_to_position(&preprocessed, def.span.0),
-                end: byte_to_position(&preprocessed, def.span.1),
-            },
+            range: positions.range_to_original(def.span.0, def.span.1),
         };
         Ok(Some(GotoDefinitionResponse::Scalar(location)))
     }
@@ -1755,7 +1785,9 @@ impl Backend {
         let target_uri = path_to_uri(&module_path)?;
         let target_uri_str = target_uri.as_str().to_owned();
 
-        let prep = tyc_syntax::preprocess::preprocess(&original_source);
+        // The same expansion chain the open-document path runs, so the line
+        // table can carry a declaration below a `?` back to its own line.
+        let prep = tyc_syntax::preprocess::expand_and_preprocess_mapped(&original_source, false);
         let raw_class_byte_starts =
             tyc_syntax::preprocess::line_byte_starts(&prep.python_source, &prep.raw_class_lines);
         let resolved = match self
@@ -1786,112 +1818,19 @@ impl Backend {
             // module, so jump to the top of its source file.
             None => (0, 0),
         };
-        // Map preprocessed-source offsets back to original-source offsets
-        // by adding back the bytes preprocess stripped from earlier lines
-        // (each `let ` or `mut ` removed 4 chars from a single line).
-        let (start, end) = (
-            map_preprocessed_offset_to_original(&prep, &original_source, start_prep),
-            map_preprocessed_offset_to_original(&prep, &original_source, end_prep),
-        );
+        // Map the preprocessed span back onto the text on disk.
+        let range =
+            position_map::PositionMap::new(&original_source, &prep.python_source, &prep.line_map)
+                .range_to_original(start_prep, end_prep);
         let client_uri = self
             .path_to_client_uri(&module_path)
             .await
             .unwrap_or(target_uri);
         Some(Location {
             uri: client_uri,
-            range: Range {
-                start: byte_to_position(&original_source, start),
-                end: byte_to_position(&original_source, end),
-            },
+            range,
         })
     }
-}
-
-/// Map an LSP [`Position`] expressed in *original* (pre-preprocess) text
-/// coordinates to a byte offset in the `preprocessed` buffer.
-///
-/// Preprocessing strips leading modifier keywords (`comptime `, `freeze `,
-/// `lazy `, `newtype `, `pub `) from a line, shifting every column on that
-/// line left by the keyword width; it never adds or removes lines.
-/// `line_shifts` is the per-line stripped-prefix byte count from
-/// [`tyc_syntax::preprocess::PreprocessResult::line_col_shifts`] — the same
-/// table the hover / semantic-tokens paths use to reconcile original ↔
-/// preprocessed columns. Subtracting the line's shift from the editor column
-/// puts the offset back into the preprocessed buffer's coordinate space.
-///
-/// The stripped keywords are pure ASCII, so a column's byte width and its
-/// UTF-16 width coincide for the shifted prefix; subtracting the byte shift
-/// from the UTF-16 character index is therefore exact. For lines with no
-/// stripped prefix (shift 0) this is identical to `position_to_byte`.
-fn map_original_position_to_preprocessed_offset(
-    preprocessed: &str,
-    line_shifts: &[usize],
-    position: Position,
-) -> usize {
-    let shift = line_shifts
-        .get(position.line as usize)
-        .copied()
-        .unwrap_or(0);
-    let adjusted = Position {
-        line: position.line,
-        character: position.character.saturating_sub(shift as u32),
-    };
-    position_to_byte(preprocessed, adjusted)
-}
-
-/// Map a byte offset in `preprocessed` text back to a byte offset in
-/// `original`.  Preprocessing only strips characters from the start of a
-/// line (`let ` / `mut `), and lines are not added or removed, so the
-/// mapping per line is "original_line_start + (preprocessed_col + stripped_prefix_len)".
-///
-/// For lines that don't have a stripped prefix the mapping is identity.
-fn map_preprocessed_offset_to_original(
-    prep: &tyc_syntax::preprocess::PreprocessResult,
-    original: &str,
-    prep_offset: usize,
-) -> usize {
-    let prep_text = prep.python_source.as_str();
-    // Walk both strings line-by-line, finding which line `prep_offset`
-    // falls into and the column within that line.
-    let mut line_idx = 0usize;
-    let mut prep_line_start = 0usize;
-    while prep_line_start < prep_text.len() {
-        let line_end = prep_text[prep_line_start..]
-            .find('\n')
-            .map(|i| prep_line_start + i + 1)
-            .unwrap_or(prep_text.len());
-        if prep_offset < line_end {
-            break;
-        }
-        prep_line_start = line_end;
-        line_idx += 1;
-    }
-    let prep_col = prep_offset.saturating_sub(prep_line_start);
-
-    // Find the same line in the original text.
-    let mut orig_line_start = 0usize;
-    for _ in 0..line_idx {
-        let Some(i) = original[orig_line_start..].find('\n') else {
-            return original.len();
-        };
-        orig_line_start += i + 1;
-    }
-
-    // How many bytes did preprocess strip from the start of this line?
-    // Each `let `/`mut ` removed 4 chars; other stripped keywords (impl,
-    // extend, …) become wider lowering forms instead of getting trimmed,
-    // so they don't shift offsets.
-    let stripped_prefix: usize = prep
-        .stripped
-        .iter()
-        .filter(|s| s.line_index == line_idx)
-        .map(|s| match s.keyword {
-            tyc_syntax::lexer::TyphonKeyword::Let | tyc_syntax::lexer::TyphonKeyword::Mut => 4,
-            _ => 0,
-        })
-        .sum();
-
-    (orig_line_start + prep_col + stripped_prefix).min(original.len())
 }
 
 /// Convert an `lsp_types::Uri` into a local filesystem path.  Only `file:`
@@ -5935,6 +5874,180 @@ mod tests {
         assert!(
             utils_src[start_char..].starts_with('f'),
             "range start should sit on `f`, got char {start_char}"
+        );
+    }
+
+    /// Send one request and wait for its response's `result`.
+    async fn request(
+        to: &mut DuplexStream,
+        from: &mut DuplexStream,
+        id: i64,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        send(
+            to,
+            serde_json::json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let msg = recv(from).await;
+                if msg.get("id").and_then(|i| i.as_i64()) == Some(id) {
+                    return msg
+                        .get("result")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                }
+            }
+        })
+        .await
+        .expect("request timed out")
+    }
+
+    async fn hover_text(
+        to: &mut DuplexStream,
+        from: &mut DuplexStream,
+        id: i64,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> String {
+        let result = request(
+            to,
+            from,
+            id,
+            "textDocument/hover",
+            serde_json::json!({"textDocument":{"uri":uri},
+                "position":{"line":line,"character":character}}),
+        )
+        .await;
+        result["contents"]["value"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// The review's repro: a `?` on line 4 expands into four lines.
+    const QUESTION_SRC: &str = "def p(s: str) -> Result[int, str]:\n    return Ok(1)\n\ndef g(s: str) -> Result[int, str]:\n    let a: int = p(s)?\n    return Ok(a)\n\nlet y: int = 3\nprint(y)\n";
+
+    /// W4-07: hover below a line-expanding `?` names the identifier under the
+    /// cursor, never a desugaring temporary or a neighbouring line's binding.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hover_below_question_mark_names_the_right_symbol() {
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, None).await;
+        let uri = "file:///tmp/tyc_lsp_w407_hover/main.ty";
+        did_open(&mut to, uri, QUESTION_SRC).await;
+        next_diagnostics(&mut from, uri).await;
+
+        let a = hover_text(&mut to, &mut from, 10, uri, 4, 8).await;
+        assert!(a.starts_with("**a**"), "hover on `a`: {a}");
+        assert!(!a.contains("__typhon"), "temporary leaked: {a}");
+        let p = hover_text(&mut to, &mut from, 11, uri, 4, 17).await;
+        assert!(p.contains("**p** — *function*"), "hover on `p`: {p}");
+        let a_use = hover_text(&mut to, &mut from, 12, uri, 5, 14).await;
+        assert!(a_use.starts_with("**a**"), "hover on `a` use: {a_use}");
+        let y = hover_text(&mut to, &mut from, 13, uri, 7, 4).await;
+        assert!(y.starts_with("**y**"), "hover on `y`: {y}");
+        let y_use = hover_text(&mut to, &mut from, 14, uri, 8, 6).await;
+        assert!(y_use.starts_with("**y**"), "hover on `y` use: {y_use}");
+
+        // The hover range is reported in the editor's coordinates.
+        let result = request(
+            &mut to,
+            &mut from,
+            15,
+            "textDocument/hover",
+            serde_json::json!({"textDocument":{"uri":uri},
+                "position":{"line":7,"character":4}}),
+        )
+        .await;
+        assert_eq!(result["range"]["start"]["line"].as_u64(), Some(7));
+        assert_eq!(result["range"]["start"]["character"].as_u64(), Some(4));
+        assert_eq!(result["range"]["end"]["character"].as_u64(), Some(5));
+    }
+
+    /// W4-07: go-to-definition below a `?` lands on the declaration's line in
+    /// the editor, not on the expanded buffer's line.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn definition_below_question_mark_lands_on_the_declaration() {
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, None).await;
+        let uri = "file:///tmp/tyc_lsp_w407_def/main.ty";
+        did_open(&mut to, uri, QUESTION_SRC).await;
+        next_diagnostics(&mut from, uri).await;
+
+        let a = goto_definition_request(&mut to, &mut from, 20, uri, 5, 14).await;
+        assert_eq!(a["range"]["start"]["line"].as_u64(), Some(4), "{a}");
+        assert_eq!(a["range"]["start"]["character"].as_u64(), Some(8), "{a}");
+        let y = goto_definition_request(&mut to, &mut from, 21, uri, 8, 6).await;
+        assert_eq!(y["range"]["start"]["line"].as_u64(), Some(7), "{y}");
+        assert_eq!(y["range"]["start"]["character"].as_u64(), Some(4), "{y}");
+    }
+
+    /// W4-07: a constructor call never hovers as the `impl` lowering's class.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hover_on_constructor_hides_impl_lowering() {
+        let src = "class Point:\n    x: int\n\nimpl Point:\n    def norm(self) -> int:\n        return self.x\n\nlet q = Point(x=1)\nprint(q.norm())\n";
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, None).await;
+        let uri = "file:///tmp/tyc_lsp_w407_ctor/main.ty";
+        did_open(&mut to, uri, src).await;
+        next_diagnostics(&mut from, uri).await;
+        let h = hover_text(&mut to, &mut from, 30, uri, 7, 9).await;
+        assert!(h.starts_with("**Point**"), "hover on `Point`: {h}");
+        assert!(!h.contains("__typhon"), "lowering leaked: {h}");
+    }
+
+    /// W4-07: member completion after a `?` uses the receiver under the
+    /// cursor, and open completion never offers desugaring temporaries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completion_below_question_mark_uses_the_cursor_context() {
+        let src = "import os\n\ndef p(s: str) -> Result[int, str]:\n    return Ok(1)\n\ndef g(s: str) -> Result[int, str]:\n    let a: int = p(s)?\n    return Ok(a)\n\nlet d = os.\n";
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, None).await;
+        let uri = "file:///tmp/tyc_lsp_w407_completion/main.ty";
+        did_open(&mut to, uri, src).await;
+        next_diagnostics(&mut from, uri).await;
+        let result = request(
+            &mut to,
+            &mut from,
+            40,
+            "textDocument/completion",
+            serde_json::json!({"textDocument":{"uri":uri},
+                "position":{"line":9,"character":11}}),
+        )
+        .await;
+        let labels: Vec<&str> = result
+            .as_array()
+            .map(|a| a.iter().filter_map(|i| i["label"].as_str()).collect())
+            .unwrap_or_default();
+        assert!(labels.contains(&"path"), "os members expected: {labels:?}");
+        assert!(!labels.contains(&"let"), "generic list leaked: {labels:?}");
+
+        // Open completion inside `g`, below the `?` (in a buffer that parses,
+        // so the resolver has scopes).
+        let uri = "file:///tmp/tyc_lsp_w407_completion/other.ty";
+        did_open(&mut to, uri, QUESTION_SRC).await;
+        next_diagnostics(&mut from, uri).await;
+        let result = request(
+            &mut to,
+            &mut from,
+            41,
+            "textDocument/completion",
+            serde_json::json!({"textDocument":{"uri":uri},
+                "position":{"line":5,"character":4}}),
+        )
+        .await;
+        let labels: Vec<&str> = result
+            .as_array()
+            .map(|a| a.iter().filter_map(|i| i["label"].as_str()).collect())
+            .unwrap_or_default();
+        assert!(labels.contains(&"a"), "`a` in scope: {labels:?}");
+        assert!(
+            labels.iter().all(|l| !l.starts_with("__typhon")),
+            "temporaries offered: {labels:?}"
         );
     }
 
