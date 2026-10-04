@@ -131,7 +131,7 @@ pub fn collect_py_files(root: &Path) -> Result<Vec<PathBuf>> {
 /// Variant of [`collect_with_ext`] that skips conventional non-source
 /// directories: `__pycache__/`, `tests/`, `.venv/`, and any hidden
 /// `.X` directory. Files are still matched by extension.
-fn collect_with_ext_filtered(root: &Path, ext: &str, acc: &mut Vec<PathBuf>) -> Result<()> {
+pub fn collect_with_ext_filtered(root: &Path, ext: &str, acc: &mut Vec<PathBuf>) -> Result<()> {
     let mut visited = HashSet::new();
     let base = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     collect_with_ext_impl(root, &base, ext, acc, &mut visited, true)
@@ -224,6 +224,7 @@ fn collect_with_ext_impl(
                     if name == "__pycache__"
                         || name == "tests"
                         || name == ".venv"
+                        || name == "build"
                         || name.starts_with('.')
                     {
                         continue;
@@ -728,7 +729,7 @@ mod tests {
     #[test]
     fn collect_py_files_skips_excluded_directories() {
         let tmp = tempfile::tempdir().unwrap();
-        for dirname in ["__pycache__", "tests", ".venv", ".hidden"] {
+        for dirname in ["__pycache__", "tests", ".venv", "build", ".hidden"] {
             let d = tmp.path().join(dirname);
             std::fs::create_dir_all(&d).unwrap();
             std::fs::write(d.join("skip.py"), "x = 1").unwrap();

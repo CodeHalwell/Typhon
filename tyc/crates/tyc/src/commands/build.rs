@@ -104,24 +104,24 @@ pub fn run(args: BuildArgs) -> Result<()> {
             args.path.display()
         ));
     }
-    let project_root = args
+    let invocation_path = args
         .path
         .canonicalize()
         .map_err(|e| miette!("cannot resolve path '{}': {}", args.path.display(), e))?;
 
     // Load typhon.toml, anchoring src/out to the directory that contains it
     // so that `tyc build` works correctly when invoked from a subdirectory.
-    let (config_dir, config) = match TyphonConfig::load(&project_root) {
+    let (project_root, config) = match TyphonConfig::load(&invocation_path) {
         Ok(Some((toml_path, cfg))) => {
             let dir = toml_path
                 .parent()
                 .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| project_root.clone());
+                .unwrap_or_else(|| invocation_path.clone());
             (dir, cfg)
         }
         Ok(None) => {
             eprintln!("warning: no typhon.toml found; using defaults");
-            (project_root.clone(), TyphonConfig::default())
+            (invocation_path.clone(), TyphonConfig::default())
         }
         // Lift typed `ConfigError` variants into the structured
         // `TycError` catalog so config-load failures render the same
@@ -183,6 +183,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         Err(e) => return Err(miette!("{e}")),
     };
 
+    let config_dir = project_root.clone();
     let src_dir = config_dir.join(&config.project.src);
 
     // Resolve --out relative to project_root so `tyc build path/to/proj -o build`
@@ -197,7 +198,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             if out.is_absolute() {
                 out
             } else {
-                project_root.join(out)
+                config_dir.join(out)
             }
         }
         None => config_dir.join(&config.project.out),
@@ -209,17 +210,20 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // still enough to catch a symlink *inside* the output tree, and without
     // it `tyc run --compile --temp` could never write its scratch build.
     let (confine_root, confine_label) = if out_is_explicit {
-        // `--check` promises to touch nothing, so the boundary is derived
-        // from the nearest existing ancestor rather than by creating the
-        // directory that a real build would want.
         if !args.check {
             std::fs::create_dir_all(&out_dir)
                 .map_err(|e| miette!("cannot create '{}': {e}", out_dir.display()))?;
         }
         (canonical_or_lexical(&out_dir), "the output directory")
     } else {
-        (project_root.clone(), "the project root")
+        (config_dir.clone(), "the project root")
     };
+
+    // Validate confinement before writing anything (e.g. before updating pyproject.toml
+    // or creating build/ or .venv directories).
+    if !out_is_explicit {
+        validate_output_confinement(&confine_root, confine_label, &out_dir)?;
+    }
 
     let do_format = config.emit.format && !args.no_format;
     // PEP 810 (Python 3.15) ships native `lazy import` syntax with exactly
@@ -2064,6 +2068,42 @@ fn canonical_or_lexical(path: &std::path::Path) -> std::path::PathBuf {
         probe = parent;
     }
     path.to_path_buf()
+}
+
+fn validate_output_confinement(
+    root: &std::path::Path,
+    root_label: &str,
+    out_dir: &std::path::Path,
+) -> Result<()> {
+    if std::fs::symlink_metadata(out_dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        let real = std::fs::canonicalize(out_dir)
+            .map_err(|e| miette!("cannot resolve output dir symlink '{}': {e}", out_dir.display()))?;
+        let root = std::fs::canonicalize(root)
+            .map_err(|e| miette!("cannot resolve output root '{}': {e}", root.display()))?;
+        if !real.starts_with(&root) {
+            return Err(miette!(
+                "refusing to write '{}': its directory resolves to '{}', outside {} '{}'",
+                out_dir.display(),
+                real.display(),
+                root_label,
+                root.display()
+            ));
+        }
+        return Ok(());
+    }
+    let root = std::fs::canonicalize(root)
+        .map_err(|e| miette!("cannot resolve output root '{}': {e}", root.display()))?;
+    let resolved_out = canonical_or_lexical(out_dir);
+    if !resolved_out.starts_with(&root) {
+        return Err(miette!(
+            "refusing to write '{}': its directory resolves to '{}', outside {} '{}'",
+            out_dir.display(),
+            resolved_out.display(),
+            root_label,
+            root.display()
+        ));
+    }
+    Ok(())
 }
 
 fn confine_output_path(
@@ -5974,13 +6014,113 @@ let pet: Animal = Dog(name=\"Rex\")
             source_label: None,
         })
         .expect_err("an escaping output directory must fail the build");
+        let rendered = format!("{err:?}");
         assert!(
-            format!("{err:?}").contains("outside the project root"),
+            err.to_string().contains("outside the project root")
+                || (rendered.contains("outside") && rendered.contains("project root")),
             "error should explain the escape; got {err:?}"
         );
         assert!(
             !outside.path().join("main.py").exists(),
             "nothing may be written outside the project"
+        );
+        assert!(
+            !tmp.path().join("pyproject.toml").exists(),
+            "an escaping output directory must fail before writing pyproject.toml"
+        );
+    }
+
+    #[test]
+    fn build_from_subdirectory_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        scaffold(tmp.path(), "let x: int = 1\n");
+        let src_sub = tmp.path().join("src");
+        run(BuildArgs {
+            path: src_sub,
+            out: None,
+            no_format: true,
+            check: false,
+            no_sync: true,
+            with_ty: false,
+            optimise: false,
+            source_label: None,
+        })
+        .expect("building from a subdirectory must succeed and confine to config_dir");
+        assert!(
+            tmp.path().join("build/main.py").exists(),
+            "emitted output must land in project's build directory"
+        );
+    }
+
+    #[test]
+    fn build_from_nested_subdirectory_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        scaffold(tmp.path(), "let x: int = 1\n");
+        let nested = tmp.path().join("src").join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("sub.ty"), "let y: int = 2\n").unwrap();
+        run(BuildArgs {
+            path: nested,
+            out: None,
+            no_format: true,
+            check: false,
+            no_sync: true,
+            with_ty: false,
+            optimise: false,
+            source_label: None,
+        })
+        .expect("building from a deeply nested subdirectory must succeed");
+        assert!(
+            tmp.path().join("build/main.py").exists(),
+            "emitted output must land in project's build directory"
+        );
+        assert!(
+            tmp.path().join("build/nested/sub.py").exists(),
+            "nested source file must be emitted under build/nested/sub.py"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_refuses_escaping_out_config_without_writing_anything() {
+        let outside = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(proj.join("src")).unwrap();
+        std::fs::write(
+            proj.join("typhon.toml"),
+            "[project]\nname = \"esc\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+             [python]\ntarget = \"3.13\"\n[emit]\nformat = false\n[strictness]\n[env]\n",
+        )
+        .unwrap();
+        std::fs::write(proj.join("src/main.ty"), "let x: int = 1\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), proj.join("build")).unwrap();
+
+        let err = run(BuildArgs {
+            path: proj.clone(),
+            out: None,
+            no_format: true,
+            check: false,
+            no_sync: true,
+            with_ty: false,
+            optimise: false,
+            source_label: None,
+        })
+        .expect_err("escaping out symlink must fail confinement");
+
+        let rendered = format!("{err:?}");
+        assert!(
+            err.to_string().contains("outside the project root")
+                || (rendered.contains("outside") && rendered.contains("project root")),
+            "error must mention outside the project root; got: {rendered}"
+        );
+        assert!(
+            !proj.join("pyproject.toml").exists(),
+            "must not write pyproject.toml when out directory escapes"
+        );
+        assert!(
+            !outside.path().join("main.py").exists(),
+            "must not write into escaping out directory"
         );
     }
 
