@@ -1,0 +1,40 @@
+mut x: int = 1
+
+def bump() -> Result[int, str]:
+    global x
+    x = x + 10
+    return Ok(5)
+
+def pair(a: int, b: int) -> int:
+    return a * 100 + b
+
+def names() -> Result[int, str]:
+    global x
+    x += bump()?
+    let r: int = pair(x, bump()?)
+    return Ok(r)
+
+class Tape:
+    pos: int
+    items: list[int]
+    marks: dict[str, int]
+
+impl Tape:
+    def step(self) -> Result[int, str]:
+        self.pos += 7
+        self.items = [99]
+        self.marks = {"k": 50}
+        return Ok(1)
+
+    def run(self) -> Result[int, str]:
+        self.pos += self.step()?
+        self.items.append(self.step()?)
+        self.marks["k"] += self.step()?
+        return Ok(self.pos)
+
+def main() -> None:
+    print(names(), x)
+    let t = Tape(pos=0, items=[], marks={"k": 0})
+    print(t.run(), t.pos, t.items, t.marks)
+
+main()

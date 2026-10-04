@@ -821,7 +821,13 @@ fn render_diagnostics(
     // same embedded source, so computing it per-diagnostic is
     // O(n_diags × file_size) work. Compute once for the file group and
     // clone the cleaned `NamedSource` into each wrapper.
-    let render_group = |label: &str, groups: &[(String, Vec<&TycError>)]| {
+    // Render each diagnostic with the severity of the bucket it was reported
+    // in: a variant whose derive says `Error` but that was reported as a
+    // warning (a `[strictness]` knob at "warn", a mutation caught by its
+    // handler) otherwise drew the error marker under "warnings".
+    let render_group = |label: &str,
+                        severity: miette::Severity,
+                        groups: &[(String, Vec<&TycError>)]| {
         for (file, items) in groups {
             eprintln!("── {} in {} ──", label, file);
             // Keyed by the buffer each diagnostic actually carries — see
@@ -847,13 +853,14 @@ fn render_diagnostics(
                     }
                     (Some(src), None) => SanitisedDiagnostic::wrap_with_source((*d).clone(), src),
                     (None, _) => SanitisedDiagnostic::wrap((*d).clone()),
-                };
+                }
+                .with_severity(severity);
                 eprintln!("{:?}", miette::Report::new_boxed(Box::new(wrapped)));
             }
         }
     };
-    render_group("warnings", &warnings_by_file);
-    render_group("errors", &errors_by_file);
+    render_group("warnings", miette::Severity::Warning, &warnings_by_file);
+    render_group("errors", miette::Severity::Error, &errors_by_file);
 
     // Per-code tally + `tyc explain` hint. Only emitted when the file
     // produced at least one diagnostic — silence on clean runs.
