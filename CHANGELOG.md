@@ -269,6 +269,15 @@ grouped by workstream (W1–W7).
   warning) and also checks the key of every `env("…")` the binding reads,
   through `comptime def` calls too, so `comptime let DEPLOY_CFG: str =
   env("AWS_SECRET_ACCESS_KEY")` now warns.
+- **`extend BUILTIN:` travels through a `pub *` facade** (W3-02). With
+  `pkg/text.ty` declaring `extend str: def slug(...)` and `pkg/__init__.ty`
+  holding `pub *`, a consumer importing `from pkg import describe` got
+  `tyc::attribute_not_found` on `s.slug()`, and no surface lowered the
+  call. The facade's aggregated shape now carries every
+  constituent's extension methods (sub-packages included), the emitted
+  `__init__.py` re-exports the lifted `__typhon_ext_*` helpers, and the VM
+  loads a facade's constituents' extensions — checker, build and `tyc run`
+  agree.
 
 #### W4 — CLI, LSP, filesystem safety
 - **LSP definition URIs rebased onto client workspace root.** `goto_definition` now uses the client's declared workspace root URI (preserving symlink prefixes such as `/var/folders` or `/tmp` rather than macOS `/private/var/...`) or open-document URI, preventing editors from opening duplicate tabs on cross-file jumps.

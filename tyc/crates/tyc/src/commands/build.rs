@@ -752,6 +752,56 @@ pub fn run(args: BuildArgs) -> Result<()> {
                         }
                     })
                     .collect();
+                // Re-export every constituent's `extend BUILTIN:` helpers
+                // too (`from .text import __typhon_ext_str__slug__`), so the
+                // call-site rewrite in a consumer that imports through the
+                // facade can import them from it (W3-02). They stay out of
+                // `__all__` and the collision check: the checker merges
+                // them first-write-wins.
+                let pkg_dotted = crate::commands::util::path_to_dotted(path, src_root);
+                let mut constituents: Vec<String> = sources
+                    .iter()
+                    .filter_map(|(sib_path, _)| {
+                        let sib_parent = sib_path.parent()?;
+                        let stem = sib_path.file_stem()?.to_str()?;
+                        if sib_parent == parent_dir && stem != "__init__" {
+                            return Some(stem.to_owned());
+                        }
+                        if sib_parent.parent() == Some(parent_dir) && stem == "__init__" {
+                            return Some(sib_parent.file_name()?.to_str()?.to_owned());
+                        }
+                        None
+                    })
+                    .collect();
+                constituents.sort();
+                constituents.dedup();
+                let mut ext_seen: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                let mut import_pieces = import_pieces;
+                for sib in &constituents {
+                    let Some(shape) = project_shapes.get(&format!("{pkg_dotted}.{sib}")) else {
+                        continue;
+                    };
+                    let mut ext_names: Vec<String> = Vec::new();
+                    let mut sentinels: Vec<_> = shape.class_shapes.iter().collect();
+                    sentinels.sort_by(|a, b| a.0.cmp(b.0));
+                    for (cls_name, ext) in sentinels {
+                        let Some(builtin) = cls_name.strip_prefix("__typhon_builtin_ext_") else {
+                            continue;
+                        };
+                        let mut methods: Vec<&String> = ext.methods.keys().collect();
+                        methods.sort();
+                        for method in methods {
+                            let fn_name = tyc_analyse::free_fn_name(builtin, method);
+                            if ext_seen.insert(fn_name.clone()) {
+                                ext_names.push(fn_name);
+                            }
+                        }
+                    }
+                    if !ext_names.is_empty() {
+                        import_pieces.push(format!("from .{sib} import {}", ext_names.join(", ")));
+                    }
+                }
                 if !import_pieces.is_empty() {
                     let import_line = import_pieces.join("; ");
                     prep.python_source =

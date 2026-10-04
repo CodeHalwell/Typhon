@@ -75,6 +75,7 @@ Key points:
 - The method becomes a free function with a Typhon-internal name (`__typhon_ext_<TYPE>__<METHOD>`).
 - The call site `title.to_slug()` is rewritten to `__typhon_ext_str__to_slug(title)` because `title` has the static annotation `str`.
 - **Un-annotated receivers** continue to use native attribute lookup. `some_dynamic.to_slug()` raises `AttributeError` at runtime, matching Python's existing semantics.
+- **Across modules**, an extension is visible in every module that imports from the declaring module. The rewritten call imports the helper (`from text import __typhon_ext_str__to_slug__`). Importing from a `pub *` package facade counts as importing from every module it aggregates: `from pkg import describe` brings `pkg/text.ty`'s extensions into scope, and the facade's `__init__.py` re-exports the helpers.
 
 ## Why this design
 
