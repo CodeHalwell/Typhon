@@ -317,6 +317,19 @@ base class's namespace into every subclass:
 - **`__init_subclass__`** of the nearest ancestor runs when a subclass is
   created, with the class header's keyword arguments.
 
+### Value-mixin enums (beta)
+
+A member of `IntEnum`, `StrEnum`, `IntFlag` or an enum with a data-type
+mixin (`class Mode(str, Enum)`, `class L(int, Enum)`) *is* an instance of
+its value's type, as in CPython: it compares and hashes like its value
+(also inside containers, `sorted`, tuple comparison and dict lookups —
+`{"fast": 1}[Mode.FAST]`), `isinstance(IntEnum.X, int)` holds, it
+encodes in `json` as its value, and it keeps its identity as a dict key.
+`str()` / `format()` show the value for `IntEnum` / `StrEnum` /
+`IntFlag` and `Mode.FAST` for a plain mixin (CPython 3.12+). A
+`StrEnum`'s `auto()` is the lower-cased member name, and a second name
+bound to an existing value is an alias of that member.
+
 ### Sets iterate in CPython's order (beta)
 
 A `set` / `frozenset` is a reproduction of CPython's open-addressing

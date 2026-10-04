@@ -2287,8 +2287,14 @@ pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
         {
             true
         }
-        // Class membership.
-        (_, Value::Instance(inst)) => class_in_chain(&inst.class, &name),
+        // Class membership. A value-mixin enum member (`IntEnum`, `StrEnum`,
+        // `class Mode(str, Enum)`) is also an instance of its value's type.
+        (_, Value::Instance(inst)) => {
+            class_in_chain(&inst.class, &name)
+                || (matches!(cls, Value::Native(_))
+                    && crate::value::enum_mixin_value(val)
+                        .is_some_and(|inner| is_instance_of(&inner, cls)))
+        }
         _ => {
             if let Value::Class(target) = cls {
                 if let Value::Instance(inst) = val {
@@ -11828,10 +11834,16 @@ fn json_write(
             }
             json_write_object(&pairs, opts, level, out)?;
         }
+        // A `str` / `int` / `float` subclass encodes as its value: a
+        // value-mixin enum member (`IntEnum`, `class Mode(str, Enum)`).
+        v @ Value::Instance(_) if crate::value::enum_mixin_value(v).is_some() => {
+            let inner = crate::value::enum_mixin_value(v).expect("checked by the guard");
+            json_write(&inner, opts, level, out)?;
+        }
         other => {
             return Err(type_error(format!(
                 "Object of type {} is not JSON serializable",
-                other.type_name()
+                other.type_display_name()
             )))
         }
     }
@@ -11900,10 +11912,16 @@ fn json_key(v: &Value, opts: &JsonDumpOpts) -> Result<String, Unwind> {
             json_string(&json_float(*x, opts.allow_nan)?, true)
         }
         Value::None => json_string("null", true),
+        // A value-mixin enum member keys as its value (`str` / `int`
+        // subclass).
+        v @ Value::Instance(_) if crate::value::enum_mixin_value(v).is_some() => {
+            let inner = crate::value::enum_mixin_value(v).expect("checked by the guard");
+            return json_key(&inner, opts);
+        }
         other => {
             return Err(type_error(format!(
                 "keys must be str, int, float, bool or None, not {}",
-                other.type_name()
+                other.type_display_name()
             )))
         }
     })

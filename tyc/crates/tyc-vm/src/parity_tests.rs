@@ -522,3 +522,44 @@ show(len(big), list(big)[:5])
 "#,
     );
 }
+
+// ── W5-10: value-mixin enums ──────────────────────────────────────────────
+
+#[test]
+fn w5_10_mixin_enums_behave_as_their_value() {
+    assert_matches_cpython(
+        "w5_10_mixin_enums_behave_as_their_value",
+        r#"import json
+from enum import Enum, IntEnum, StrEnum, IntFlag, auto
+class Mode(str, Enum):
+    FAST = "fast"
+    SLOW = "slow"
+    QUICK = "fast"
+show(Mode.FAST == "fast", {"fast": 1}.get(Mode.FAST), Mode.FAST in ["fast"], "fast" == Mode.FAST)
+show(Mode("fast"), Mode.FAST.value, Mode.FAST.upper(), isinstance(Mode.FAST, str), hash(Mode.FAST) == hash("fast"))
+show(repr(Mode.FAST), str(Mode.FAST), f"{Mode.FAST}", Mode.FAST + "!", len(Mode.FAST))
+show(list(Mode), len(Mode), Mode.QUICK is Mode.FAST, json.dumps({"m": Mode.SLOW}), "-".join([Mode.FAST, Mode.SLOW]))
+class L(int, Enum):
+    ONE = 1
+    TWO = 2
+show(L.ONE == 1, L.ONE + 1, isinstance(L.ONE, int), L.ONE < L.TWO, {1: "a"}[L.ONE], repr(L.ONE), str(L.ONE), L(2))
+class IE(IntEnum):
+    X = 1
+    Y = 2
+show(isinstance(IE.X, int), IE.X == 1, IE.X + IE.Y, str(IE.X), repr(IE.X), f"{IE.Y}", sorted([IE.Y, IE.X]), [1, 2][IE.X])
+show(sorted({IE.Y: 1, IE.X: 2}.items()), json.dumps({"l": IE.X}), json.dumps(IE.Y), [IE.X] == [1], (IE.X, 0) < (IE.Y, 0))
+class SE(StrEnum):
+    ALPHA = auto()
+    BETA = "bee"
+show(SE.ALPHA, SE.ALPHA == "alpha", repr(SE.BETA), isinstance(SE.ALPHA, str), list(SE), SE("bee"))
+class Perm(IntFlag):
+    R = 4
+    W = 2
+show(Perm.R | Perm.W, Perm.R == 4, isinstance(Perm.R, int))
+class Color(Enum):
+    RED = 1
+    CRIMSON = 1
+show(Color.RED == 1, isinstance(Color.RED, int), list(Color), Color.CRIMSON is Color.RED)
+"#,
+    );
+}

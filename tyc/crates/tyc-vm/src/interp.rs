@@ -2826,6 +2826,17 @@ impl Interpreter {
         }))
     }
 
+    /// Whether `class` derives from the VM's enum base class `base`
+    /// (`"StrEnum"`, `"IntEnum"`, …).
+    fn enum_base_named(class: &Rc<Class>, base: &str) -> bool {
+        (class
+            .class_attrs
+            .borrow()
+            .contains_key("__typhon_enum_base__")
+            && class.name == base)
+            || class.bases.iter().any(|b| Self::enum_base_named(b, base))
+    }
+
     /// Whether `class` is a `Flag` or `IntFlag` subclass — the two whose
     /// `auto()` members are numbered by bit rather than by increment.
     fn is_flag_class(class: &Rc<Class>) -> bool {
@@ -2856,6 +2867,8 @@ impl Interpreter {
         // `Flag` and `IntFlag` number their `auto()` members by bit. Read
         // before the `class_attrs` borrow below, which this walk shares.
         let is_flag = Self::is_flag_class(class);
+        // `StrEnum`'s `auto()` is the member name lower-cased.
+        let is_str_enum = Self::enum_base_named(class, "StrEnum");
         // Collect member names in source order (each `NAME = value`
         // assignment in the class body, excluding dunders).
         let mut order: Vec<String> = Vec::new();
@@ -2891,7 +2904,9 @@ impl Interpreter {
                 // from it. In a `Flag` / `IntFlag` each `auto()` is instead
                 // the next *bit* — `A, B, C = 1, 2, 4` — because members
                 // combine bitwise.
-                let raw = if Self::is_enum_auto(&raw) {
+                let raw = if Self::is_enum_auto(&raw) && is_str_enum {
+                    Value::Str(Rc::new(name.to_lowercase()))
+                } else if Self::is_enum_auto(&raw) {
                     last_value = if is_flag {
                         if last_value <= 0 {
                             1
@@ -2910,6 +2925,20 @@ impl Interpreter {
                     }
                     raw
                 };
+                // A second name for an existing value is an *alias* of that
+                // member: the same object, not a new member, and absent
+                // from iteration (`Color.CRIMSON is Color.RED`).
+                if let Some(existing) = member_list.iter().find(|m| match m {
+                    Value::Instance(i) => i
+                        .fields
+                        .borrow()
+                        .get("_value_")
+                        .is_some_and(|v| v.py_eq(&raw)),
+                    _ => false,
+                }) {
+                    attrs.insert(name.clone(), existing.clone());
+                    continue;
+                }
                 let mut fields: crate::value::FieldMap = crate::value::FieldMap::new();
                 fields.insert("name".to_owned(), Value::Str(Rc::new(name.clone())));
                 fields.insert("_name_".to_owned(), Value::Str(Rc::new(name.clone())));
@@ -5697,8 +5726,10 @@ impl Interpreter {
         // Value-mixin members (`StrEnum` / `IntEnum` / `IntFlag`) stringify
         // through their value in CPython 3.11+ — `print(Status.ACTIVE)`
         // shows `active`, `print(Level.HIGH)` shows `2`.
-        if let Some(value) = crate::value::enum_mixin_value(v) {
-            return Some(value.py_str());
+        if crate::value::enum_str_is_value(v) {
+            if let Some(value) = crate::value::enum_mixin_value(v) {
+                return Some(value.py_str());
+            }
         }
         if let Value::Instance(i) = v {
             if let Some(Value::Str(name)) = i.fields.borrow().get("_name_") {

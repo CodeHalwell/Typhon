@@ -644,6 +644,15 @@ pub enum HashKey {
         hash: i64,
         instance: Rc<Instance>,
     },
+    /// A value-mixin enum member (`IntEnum`, `StrEnum`, `class Mode(str,
+    /// Enum)`) used as a key. In CPython the member *is* an `int` / `str`
+    /// subclass instance, so it hashes and compares as its value
+    /// (`{"fast": 1}[Mode.FAST]` works) — but the key is still the member,
+    /// so iterating the keys back gives `Lvl.LOW`, not `1`.
+    Mixin {
+        value: Box<HashKey>,
+        member: Rc<Instance>,
+    },
 }
 
 /// How instances of a class hash and compare as dict/set keys — CPython's
@@ -878,6 +887,22 @@ pub fn flag_member_bits(v: &Value) -> Option<i64> {
     }
 }
 
+/// Whether `str()` / `format()` of an enum member shows its *value*: true
+/// for `StrEnum` / `IntEnum` / `IntFlag` (whose `__str__` is the mixin
+/// type's), false for a plain data-type mixin such as `class Mode(str,
+/// Enum)`, whose members still print `Mode.FAST` (CPython 3.12+).
+pub fn enum_str_is_value(v: &Value) -> bool {
+    fn marker(class: &Rc<Class>) -> bool {
+        (class
+            .class_attrs
+            .borrow()
+            .contains_key("__typhon_enum_base__")
+            && matches!(class.name.as_str(), "StrEnum" | "IntEnum" | "IntFlag"))
+            || class.bases.iter().any(marker)
+    }
+    matches!(v, Value::Instance(inst) if marker(&inst.class))
+}
+
 pub fn enum_mixin_value(v: &Value) -> Option<Value> {
     fn mixin_base(class: &Rc<Class>) -> bool {
         let is_marker = class
@@ -890,8 +915,20 @@ pub fn enum_mixin_value(v: &Value) -> Option<Value> {
         }
         class.bases.iter().any(mixin_base)
     }
+    // `class Mode(str, Enum)` / `class L(int, Enum)`: a data-type mixin makes
+    // every member an instance of that type, exactly as `StrEnum` /
+    // `IntEnum` do — equal to and hashing like its value.
+    fn data_type_mixin(class: &Rc<Class>) -> bool {
+        matches!(
+            class.class_attrs.borrow().get("__typhon_builtin_bases__"),
+            Some(Value::Tuple(names)) if names.iter().any(|n| matches!(
+                n,
+                Value::Str(s) if matches!(s.as_str(), "str" | "int" | "float" | "bytes" | "complex")
+            ))
+        )
+    }
     if let Value::Instance(inst) = v {
-        if mixin_base(&inst.class) {
+        if mixin_base(&inst.class) || (class_is_enum(&inst.class) && data_type_mixin(&inst.class)) {
             return inst.fields.borrow().get("value").cloned();
         }
     }
@@ -978,8 +1015,12 @@ impl HashKey {
     /// with the same members hash equal regardless of insertion
     /// order — review thread copilot on PR #147.
     pub fn canonical_sort_key(&self) -> Vec<u8> {
+        if let HashKey::Mixin { value, .. } = self {
+            return value.canonical_sort_key();
+        }
         let mut out = Vec::with_capacity(16);
         match self {
+            HashKey::Mixin { .. } => unreachable!("handled above"),
             HashKey::NaN(id) => {
                 out.push(9);
                 out.extend_from_slice(&id.to_be_bytes());
@@ -1065,6 +1106,7 @@ impl HashKey {
 
     pub fn into_value(self) -> Value {
         match self {
+            HashKey::Mixin { member, .. } => Value::Instance(member),
             HashKey::NaN(identity) => Value::FloatData(VmFloat {
                 value: f64::NAN,
                 identity,
@@ -1095,6 +1137,8 @@ impl HashKey {
 impl PartialEq for HashKey {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
+            (HashKey::Mixin { value: a, .. }, b) => **a == *b,
+            (a, HashKey::Mixin { value: b, .. }) => *a == **b,
             (HashKey::NaN(a), HashKey::NaN(b)) => a == b,
             (HashKey::None, HashKey::None) => true,
             (HashKey::Bool(a), HashKey::Bool(b)) => a == b,
@@ -1164,6 +1208,7 @@ impl Eq for HashKey {}
 impl std::hash::Hash for HashKey {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match self {
+            HashKey::Mixin { value, .. } => value.hash(state),
             HashKey::NaN(id) => {
                 9u8.hash(state);
                 id.hash(state);
@@ -2254,7 +2299,10 @@ impl Value {
                 // works exactly as it does under CPython (where the member
                 // IS a str / int subclass).
                 if let Some(v) = enum_mixin_value(self) {
-                    return v.to_hash_key();
+                    return Ok(HashKey::Mixin {
+                        value: Box::new(v.to_hash_key()?),
+                        member: inst.clone(),
+                    });
                 }
                 match instance_hash_mode(&inst.class) {
                     HashMode::Unhashable => {
@@ -2330,6 +2378,15 @@ impl Value {
 
     fn py_eq_inner(&self, other: &Value) -> bool {
         use Value::*;
+        // A value-mixin enum member equals its value, inside containers too.
+        if matches!(self, Instance(_)) != matches!(other, Instance(_)) {
+            let (l, r) = (enum_mixin_value(self), enum_mixin_value(other));
+            if l.is_some() || r.is_some() {
+                let l = l.unwrap_or_else(|| self.clone());
+                let r = r.unwrap_or_else(|| other.clone());
+                return l.py_eq_inner(&r);
+            }
+        }
         match (self, other) {
             (None, None) => true,
             (Bool(a), Bool(b)) => a == b,
@@ -2453,6 +2510,18 @@ impl Value {
     fn py_cmp_inner(&self, other: &Value) -> Option<std::cmp::Ordering> {
         use std::cmp::Ordering::*;
         use Value::*;
+        // A value-mixin enum member orders as its value (it *is* an `int` /
+        // `str` subclass instance in CPython).
+        if matches!(self, Instance(_)) || matches!(other, Instance(_)) {
+            let (l, r) = (enum_mixin_value(self), enum_mixin_value(other));
+            if l.is_some() || r.is_some() {
+                let l = l.unwrap_or_else(|| self.clone());
+                let r = r.unwrap_or_else(|| other.clone());
+                if !matches!(l, Instance(_)) && !matches!(r, Instance(_)) {
+                    return l.py_cmp_inner(&r);
+                }
+            }
+        }
         match (self, other) {
             (Int(a), Int(b)) => a.partial_cmp(b),
             (

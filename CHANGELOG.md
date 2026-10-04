@@ -295,6 +295,16 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   `difference_update` and `symmetric_difference_update` exist;
   `frozenset | set` is a `frozenset`; `isinstance(frozenset(), set)` is
   `False`; `frozenset(f) is f`.
+- **Value-mixin enums behave as their value** (W5-10). `class Mode(str,
+  Enum)` members compared unequal to their string (`Mode.FAST == "fast"`
+  was `False`, `{"fast": 1}.get(Mode.FAST)` was `None`), `class L(int,
+  Enum)` likewise, and `isinstance(IntEnum.X, int)` was `False`. Members
+  of `IntEnum` / `StrEnum` / `IntFlag` and of data-type-mixin enums now
+  equal, hash and order as their value (in containers and dict keys too,
+  keeping member identity), are instances of the value's type, encode in
+  `json` as the value, and `str()` / `format()` follow CPython 3.12+.
+  `StrEnum`'s `auto()` gives the lower-cased name, and duplicate values
+  become aliases.
 - **One front end for every VM entry point** (W5-20). The entry program,
   imported sibling modules and the embedded stdlib shims all go through
   `tyc_syntax::preprocess::expand_and_preprocess_mapped` — the chain
