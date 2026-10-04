@@ -13,6 +13,7 @@ pub mod lsp;
 pub mod migrate;
 pub mod profile;
 pub mod repl;
+pub mod reserved;
 pub mod run;
 pub mod source_map;
 pub mod stubtest;

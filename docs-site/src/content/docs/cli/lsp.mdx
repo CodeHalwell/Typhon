@@ -48,18 +48,20 @@ You usually do not run this by hand — the editor extension does. See [Editor S
 
 `tyc lsp` shares the Salsa database with `tyc check`. On `didChange`:
 
-1. Update the in-memory source for the changed file.
-2. Invalidate Salsa nodes downstream of the file.
-3. Re-run `parse` / `resolve` / `check` queries.
-4. Publish diagnostics for affected files.
+1. Update the in-memory source for the changed file at once, so hover and completion see the new text.
+2. Wait for the keystrokes to pause (100 ms), then re-run `parse` / `resolve` / `check` for the file. A burst of edits is checked once; a newer edit supersedes a pending or running check, and a superseded result is never published.
+3. Publish the file's diagnostics, tagged with the document version they were computed from.
+4. Re-check the other open files that import the edited module — only those — so an error a change causes in a consumer appears without touching the consumer. A file changed on disk (a watched-file event) refreshes its open importers the same way; a `typhon.toml` change re-checks every open file.
 
-Median latency for a single-file edit in a 100-module project is well under 100ms.
+The check, and the Salsa queries and semantic-token computation behind hover, completion, go-to-definition and colouring, run on blocking threads rather than the server's async thread, so requests keep being answered while a check runs.
 
 ### Cross-module shape extraction
 
 For the constructor / method arity checks introduced in v0.2.0, the LSP backend maintains a per-project-root registry of `dotted_name → SourceFile` handles so they survive across keystrokes. On each `check_and_publish` it `set_text`-uploads every project file once (a no-op when content matches) and then asks the salsa-tracked `tyc_db::module_shapes_query` for each file's shape. A keystroke in one file only re-runs shape extraction for that file; the current editor buffer is preferred over disk for the file being edited.
 
 `.dty` stubs participate on equal footing with `.ty` source — both flow through the same `ExternalShapes` registry — and stubs win on name collisions. When no `typhon.toml` ancestor is found, the LSP falls back to the per-file salsa-cached check path with no cross-module shape propagation.
+
+The source tree is listed with the same symlink-safe walk `tyc check` uses: a symlink cycle (`src/a -> .`) is visited once, and a link that leaves the source directory is skipped. The listing is cached and refreshed when the editor reports a created or deleted file, when a file missing from the listing is opened, and otherwise every five seconds.
 
 ## Trace logs
 
@@ -77,9 +79,13 @@ Output appears in `View → Output → Typhon`. Other editors have similar setti
 
 Standard JSON-RPC over stdio. The implementation uses `tower-lsp-server` (the active fork of `tower-lsp` that tracks `lsp-types` 0.97+).
 
+A malformed frame does not stop the server: bytes that are not a JSON value (truncated JSON, non-UTF-8) get a `-32700` parse-error reply, and a JSON value that is not a JSON-RPC 2.0 message (an array, a message without `"jsonrpc": "2.0"`) gets `-32600`; the server then reads the next frame. The process exits 0 after `shutdown` + `exit`, and 1 when the client sends `exit` without `shutdown` or closes stdin first.
+
+Reopening a closed file reuses that file's entry in the Salsa database, so opening and closing a file repeatedly does not grow the server's memory.
+
 ## Configuration
 
-The LSP picks up project settings from `typhon.toml` automatically (it walks up from the open file). `[strictness]` settings, `[python] target`, and `[emit]` all flow through.
+The LSP picks up project settings from `typhon.toml` automatically (it walks up from the open file). `[strictness]` settings, `[python] target`, and `[emit]` all flow through. The file is loaded with the same validating loader as the CLI, so a `typhon.toml` that `tyc check` refuses — an absolute or `..` `[project] src`, an unknown key, an invalid value — is refused by the server too, which then checks each open file on its own and reports the error as a diagnostic on `typhon.toml` (on the offending key's line, or the line and column of a TOML syntax error). The report clears once the file is valid again.
 
 ## Common issues
 

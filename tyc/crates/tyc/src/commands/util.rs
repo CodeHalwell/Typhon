@@ -1,6 +1,6 @@
 //! Shared helpers used by multiple `tyc` subcommands.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use miette::{miette, Result};
@@ -11,6 +11,7 @@ use tyc_diagnostics::TycError;
 use tyc_syntax::preprocess::preprocess;
 
 use crate::config::TyphonConfig;
+use tyc_venv::walk::{DirFilter, Walk};
 
 /// Re-classify warnings according to the `[strictness]` config section.
 ///
@@ -129,112 +130,65 @@ pub fn collect_py_files(root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// Variant of [`collect_with_ext`] that skips conventional non-source
-/// directories: `__pycache__/`, `tests/`, `.venv/`, and any hidden
+/// directories: `__pycache__/`, `tests/`, `.venv/`, `build/`, and any hidden
 /// `.X` directory. Files are still matched by extension.
 pub fn collect_with_ext_filtered(root: &Path, ext: &str, acc: &mut Vec<PathBuf>) -> Result<()> {
-    let mut visited = HashSet::new();
-    let base = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    collect_with_ext_impl(root, &base, ext, acc, &mut visited, true)
+    walk_into(root, ext, DirFilter::NonSource, true, acc)
 }
 
 fn collect_with_ext(root: &Path, ext: &str, acc: &mut Vec<PathBuf>) -> Result<()> {
-    let mut visited = HashSet::new();
-    let base = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    collect_with_ext_impl(root, &base, ext, acc, &mut visited, false)
+    walk_into(root, ext, DirFilter::None, true, acc)
 }
 
-/// Whether `path` is a symlink whose target resolves outside `base` (the
-/// canonical root of the walk). A checked-out tree can carry a symlink to
-/// anywhere the user can read or write — `src/linked.ty -> ~/.bashrc` — and
-/// git preserves it, so `tyc fmt src/` would rewrite the target and
-/// `tyc check src/` would walk it. Links that stay inside the tree (a shared
-/// source directory) are still followed; links that leave it are skipped.
-fn symlink_escapes(path: &Path, base: &Path) -> bool {
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return false;
-    };
-    if !meta.file_type().is_symlink() {
-        return false;
-    }
-    match std::fs::canonicalize(path) {
-        Ok(target) => !target.starts_with(base),
-        // A dangling link resolves nowhere useful; skip it either way.
-        Err(_) => true,
-    }
-}
-
-/// Shared source-tree walk behind [`collect_with_ext`] and
-/// [`collect_with_ext_filtered`]; `filtered` selects whether conventional
-/// non-source directories are skipped.
-///
-/// `visited` holds the canonicalised path of every directory already
-/// descended on this walk. Without it, a symlink pointing back up into the
-/// tree is followed as if it were a real directory — `Path::is_dir()` calls
-/// `stat`, not `lstat`, so it reports `true` for a link to a directory. The
-/// only thing that stopped the walk at all was the kernel's 40-link
-/// `ELOOP` ceiling, which bounds the depth but not the branching: one
-/// back-link re-enumerated a three-file project under 41 distinct paths
-/// (every diagnostic reported 41 times, every file checked 41 times), and two
-/// made the walk effectively non-terminating.
-///
-/// Canonicalising also deduplicates a *legitimate* symlinked source
-/// directory, so a linked shared-source tree is checked exactly once instead
-/// of once per link.
-fn collect_with_ext_impl(
+/// The shared symlink-safe walk (`tyc_venv::walk`, also used by `tyc lsp`):
+/// terminates on symlink cycles, skips links that leave the tree (with a
+/// warning when `warn`), and visits entries in sorted order.
+fn walk_into(
     root: &Path,
-    base: &Path,
     ext: &str,
+    filter: DirFilter,
+    warn: bool,
     acc: &mut Vec<PathBuf>,
-    visited: &mut HashSet<PathBuf>,
-    filtered: bool,
 ) -> Result<()> {
-    if symlink_escapes(root, base) {
-        eprintln!(
-            "warning: skipping '{}': symlink resolves outside the source tree",
-            root.display()
-        );
-        return Ok(());
-    }
-    if root.is_file() {
-        if root.extension().map(|e| e == ext).unwrap_or(false) {
-            acc.push(root.to_path_buf());
-        }
-        return Ok(());
-    }
-    if root.is_dir() {
-        // Identity is the canonical path, not the path we arrived by: two
-        // different link paths to one directory must count as one visit. A
-        // directory that cannot be canonicalised (permissions, a race) is
-        // keyed by its literal path — worse deduplication, never a hang,
-        // because the cycle case always canonicalises.
-        let key = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        if !visited.insert(key) {
-            return Ok(());
-        }
-        let entries = std::fs::read_dir(root)
-            .map_err(|e| miette!("cannot read directory {}: {}", root.display(), e))?;
-        let mut paths: Vec<PathBuf> = entries
-            .map(|res| res.map(|e| e.path()))
-            .collect::<std::io::Result<Vec<_>>>()
-            .map_err(|e| miette!("cannot read directory entry in {}: {}", root.display(), e))?;
-        paths.sort();
-        for path in paths {
-            if filtered && path.is_dir() {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name == "__pycache__"
-                        || name == "tests"
-                        || name == ".venv"
-                        || name == "build"
-                        || name.starts_with('.')
-                    {
-                        continue;
-                    }
-                }
+    let walk = Walk {
+        ext,
+        filter,
+        strict: true,
+    };
+    let files = walk
+        .collect(root, &mut |link| {
+            if warn {
+                eprintln!(
+                    "warning: skipping '{}': symlink resolves outside the source tree",
+                    link.display()
+                );
             }
-            collect_with_ext_impl(&path, base, ext, acc, visited, filtered)?;
-        }
-    }
+        })
+        .map_err(|e| miette!("{e}"))?;
+    acc.extend(files);
     Ok(())
+}
+
+/// Every directory strictly below `root` that holds its own `typhon.toml`,
+/// in sorted order, found by the same symlink-safe walk `tyc check` uses for
+/// sources (so a nested project is recognised exactly when its files would be
+/// collected). `tyc check <dir>` checks each one as a separate project.
+pub fn nested_project_dirs(root: &Path) -> Result<Vec<PathBuf>> {
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut manifests = Vec::new();
+    // Quiet: the source walks that follow report any skipped symlink once.
+    walk_into(root, "toml", DirFilter::None, false, &mut manifests)?;
+    let mut dirs: Vec<PathBuf> = manifests
+        .into_iter()
+        .filter(|p| p.file_name().is_some_and(|n| n == "typhon.toml"))
+        .filter_map(|p| p.parent().map(Path::to_path_buf))
+        .filter(|dir| dir != root)
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    Ok(dirs)
 }
 
 /// Aggregate `pub *` package-facade shapes after `collect_project_shapes`.

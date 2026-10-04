@@ -297,6 +297,13 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // are known. After this, `config.strictness.{auto_memoise,auto_gather,
     // auto_parallel,pgo_memoise}` are `Some(_)` and read with `.unwrap_or(false)`.
     // An explicit `[strictness]` entry always wins over the level default.
+    // W4-16: settings that are accepted but cannot take effect.
+    for advisory in config.advisories(args.optimise) {
+        eprintln!(
+            "warning: {}: {advisory}",
+            project_root.join("typhon.toml").display()
+        );
+    }
     config.resolve_optimise(args.optimise);
     if sources_use_model_keyword(&sources) && !config.dependencies.contains_key("pydantic") {
         config
@@ -1643,31 +1650,36 @@ pub fn run(args: BuildArgs) -> Result<()> {
         eprintln!("emitted {} stub(s) (.pyi)", stubs_emitted);
     }
 
+    // W4-12: `typhon_runtime` is reserved for the generated package below.
+    // A project module of that name is shadowed (or overwritten file by file)
+    // whenever the runtime is written; refuse the build only when that breaks
+    // an import the program makes, and warn otherwise.
+    if let Some(user_runtime) = super::reserved::user_runtime(&src_dir) {
+        if needs_runtime {
+            let broken = super::reserved::broken_imports(
+                &sources,
+                &user_runtime,
+                &generated_runtime_files(&config),
+            );
+            if !broken.is_empty() {
+                return Err(super::reserved::reserved_error(&user_runtime, &broken));
+            }
+        }
+        eprintln!(
+            "{:?}",
+            super::reserved::reserved_warning(&user_runtime, needs_runtime)
+        );
+    }
+
     // Emit the typhon_runtime helper alongside the Python output when any
     // source file uses Ok, Err, Result, `go`, `lazy`, etc.  The helper is a
     // generated package the build owns; users do not need to install a
     // separate PyPI package.
     if needs_runtime {
         let runtime_dir = out_dir.join("typhon_runtime");
-        // `parallel.py` is parameterised by the configured execution backend
-        // (`[strictness] parallel-backend`); the rest are static.
-        let parallel_py = typhon_runtime_parallel_py(
-            &config.strictness.parallel_backend,
-            config.strictness.parallel_min_size,
-        );
-        let files = [
-            ("__init__.py", TYPHON_RUNTIME_INIT_PY),
-            ("tasks.py", TYPHON_RUNTIME_TASKS_PY),
-            ("lazy.py", TYPHON_RUNTIME_LAZY_PY),
-            ("stdlib.py", TYPHON_RUNTIME_STDLIB_PY),
-            ("result.py", TYPHON_RUNTIME_RESULT_PY),
-            ("parallel.py", parallel_py.as_str()),
-            ("freeze.py", TYPHON_RUNTIME_FREEZE_PY),
-            ("cast.py", TYPHON_RUNTIME_CAST_PY),
-            ("traceback.py", TYPHON_RUNTIME_TRACEBACK_PY),
-        ];
+        let files = generated_runtime_files(&config);
         if check_mode {
-            for (name, _body) in files {
+            for (name, _body) in &files {
                 let path = runtime_dir.join(name);
                 eprintln!("would write {}", display_relative(&path, &project_root));
                 would_write_count += 1;
@@ -1677,7 +1689,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 .map_err(|e| miette!("cannot create output dir '{}': {e}", out_dir.display()))?;
             std::fs::create_dir_all(&runtime_dir)
                 .map_err(|e| miette!("cannot create '{}': {e}", runtime_dir.display()))?;
-            for (name, body) in files {
+            for (name, body) in &files {
                 let path = runtime_dir.join(name);
                 confine_output_path(&confine_root, confine_label, &path)?;
                 tyc_format::atomic_write(&path, body.as_bytes())
@@ -3288,6 +3300,27 @@ fn build_source_map_v2(
 // `substitute_comptime_literals` re-export at the top of this file.
 // Transformation: `PORT: int = int(env("PORT", "8080"))` →
 // `PORT: int = 8080`.
+
+/// The generated `typhon_runtime/` package: file name → contents.
+/// `parallel.py` is parameterised by the configured execution backend
+/// (`[strictness] parallel-backend`); the rest are static.
+fn generated_runtime_files(config: &TyphonConfig) -> Vec<(&'static str, String)> {
+    let parallel_py = typhon_runtime_parallel_py(
+        &config.strictness.parallel_backend,
+        config.strictness.parallel_min_size,
+    );
+    vec![
+        ("__init__.py", TYPHON_RUNTIME_INIT_PY.to_owned()),
+        ("tasks.py", TYPHON_RUNTIME_TASKS_PY.to_owned()),
+        ("lazy.py", TYPHON_RUNTIME_LAZY_PY.to_owned()),
+        ("stdlib.py", TYPHON_RUNTIME_STDLIB_PY.to_owned()),
+        ("result.py", TYPHON_RUNTIME_RESULT_PY.to_owned()),
+        ("parallel.py", parallel_py),
+        ("freeze.py", TYPHON_RUNTIME_FREEZE_PY.to_owned()),
+        ("cast.py", TYPHON_RUNTIME_CAST_PY.to_owned()),
+        ("traceback.py", TYPHON_RUNTIME_TRACEBACK_PY.to_owned()),
+    ]
+}
 
 /// Generated `typhon_runtime/__init__.py` — exposes `Ok`/`Err`/`Result` plus
 /// the `tasks` and `lazy` submodules at the package root.

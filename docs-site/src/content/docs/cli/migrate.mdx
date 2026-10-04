@@ -6,7 +6,7 @@ sidebar:
 ---
 
 ```
-tyc migrate FILE [--check]
+tyc migrate PATH [--check] [--force]
 ```
 
 Converts typed Python (`.py`) to Typhon (`.ty`) in one pass. Used to bootstrap a Typhon project from an existing typed Python codebase.
@@ -78,7 +78,10 @@ type-checking: the sequence below is still the way to port a real codebase.
 ```bash
 tyc migrate src/app.py             # writes src/app.ty alongside
 tyc migrate --check src/app.py     # preview to stdout (no writes)
+tyc migrate --force src/           # re-migrate, overwriting existing .ty files
 ```
+
+`PATH` is a `.py` file or a directory (migrated recursively). If any target `.ty` already exists, `tyc migrate` refuses before writing anything and names the file; `--force` (`-f`) overwrites instead. A `.ty` that is a symlink is never written through, even with `--force`.
 
 ## `--check` mode
 

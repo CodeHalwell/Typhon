@@ -28,11 +28,25 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 CI treats **all warnings as errors** — keep the tree warning-clean. It runs
-six jobs: `test` (fmt → clippy → test), `test-macos` (same suite on macOS,
-non-blocking while the cross-platform failures land), `security`
-(`cargo-deny`), a perf gate (`scripts/perf-gate.sh`), the VM↔CPython
-`differential` gate (`scripts/vm-differential.sh`), and the opt-in-knob
-`knob-matrix` (`scripts/knob-matrix.sh`).
+nine jobs: `test` (fmt → clippy → test), `test-macos` (same suite on macOS,
+non-blocking while the cross-platform failures land), `fmt-guard` (no
+out-of-scope `cargo fmt` reformats), `security` (`cargo-deny`), a perf gate
+(`scripts/perf-gate.sh`), the VM↔CPython `differential` gate
+(`scripts/vm-differential.sh`), `valid-corpus` (the same gate over
+`corpus/valid/`), `fmt-corpus` (`tyc fmt` over a de-formatted corpus must not
+change any emitted AST — `scripts/emitted-ast.py fmt-gate`), and the
+opt-in-knob `knob-matrix` (`scripts/knob-matrix.sh`).
+
+To check that a change to a lowering does not change any emitted program,
+compare the Python every corpus unit emits under the old and new compiler:
+
+```bash
+python3.13 scripts/emitted-ast.py equiv origin/main HEAD          # two revisions
+python3.13 scripts/emitted-ast.py equiv /tmp/tyc-old tyc/target/release/tyc
+```
+
+It reports each unit whose emitted AST changed; see
+[docs/differential-testing.md](docs/differential-testing.md#4-emitted-ast-equivalence-harness).
 
 ## Working in the Typhon language
 

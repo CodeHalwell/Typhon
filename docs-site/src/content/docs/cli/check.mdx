@@ -51,12 +51,14 @@ Useful as a CI gate when you ship `.dty` stubs.
 
 `tyc check` walks up from the first checked path looking for `typhon.toml`. To target a different project, pass an explicit path: `tyc check path/to/project`.
 
+A directory that holds several projects is checked one project at a time. Every subdirectory with its own `typhon.toml` is checked with that config and its own module set, exactly as `tyc check <that directory>` would check it, so `tyc check examples/` over a folder of independent apps never resolves one app's `from models import Position` against another app's `models`. Files that belong to no nested project are checked together under the config found for the path you passed.
+
 ## Exit codes
 
 | Code | Meaning |
 |------|---------|
 | 0 | No errors. |
-| 1 | At least one error-severity diagnostic, or invalid input (missing path). |
+| 1 | At least one error-severity diagnostic, or invalid input: a missing path, or a path with nothing to check (no `.ty` files — an empty directory, a `.py`-only tree), so a mistyped CI path cannot pass. |
 | 2 | Malformed command line (rejected by the argument parser). |
 
 Warning-severity diagnostics do not change the exit code. To gate CI on warnings as well, raise `[strictness]` levels in `typhon.toml`.

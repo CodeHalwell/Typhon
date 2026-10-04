@@ -295,13 +295,113 @@ grouped by workstream (W1–W7).
 - **Dependencies commands preserve pyproject.toml and reject symlinks.** `tyc sync`, `tyc add`, and `tyc remove` now update `pyproject.toml` via `merge_pyproject` with `atomic_write`, preserving comments, authors, and `[tool.*]` tables while refusing symlinked targets. Edits to `typhon.toml` also enforce atomic writes and reject symlinks.
 - **Migrate overwrite safety, symlink loop protection, and semantic preservation.** `tyc migrate` now uses `util::collect_py_files` to skip `.venv` and `build` directories, avoids symlink loops and escaping symlinks, refuses to overwrite existing `.ty` files without `--force`, and writes atomically. Preserves custom `@dataclass(...)` decorators on plain classes, treats `+=` as reassignment (`mut`), moves method aliases (`__radd__ = __add__`) into `impl` blocks, preserves `from typing import Union` when used at runtime, and protects `Union` arguments inside `isinstance(...)` calls from rewriting.
 - **Build confinement anchored to config directory and validated upfront.** `tyc build` now confines build outputs to `config_dir` (the directory enclosing `typhon.toml`) rather than the invocation path, fixing builds invoked from subdirectories (`cd proj/src && tyc build` or `tyc build src`). Output confinement is validated before writing anything to disk, preventing `pyproject.toml` mutations or empty directory creation when the output destination escapes the project root.
-- **Open consumers refresh when a dependency changes** (W4-09). The LSP
-  re-checks and republishes every open document after an open, edit, close
-  or watched-file change, so a consumer's error appears as soon as the
-  module it imports changes.
+- **Open consumers refresh when a dependency changes** (W4-09). When a
+  module changes — an edit, an unsaved buffer opened or closed, or a
+  watched-file change on disk — the LSP re-checks the open documents that
+  import it, so a consumer's error appears as soon as the module it imports
+  changes. (W4-10 narrowed this from "every open document".)
 - **`tyc install skill` refuses to write through a symlink** (W4-13, install
   half). Every destination component is checked before the first write, and
   writes are atomic.
+- **`tyc check DIR` checks nested projects separately** (W4-06). A directory
+  argument is split at every nested `typhon.toml`; each project is checked
+  with its own config and database, as `tyc check <project>` would check it,
+  and files outside every nested project keep the config found for `DIR`.
+  `tyc check examples/` used to report 34 errors from apps resolving each
+  other's modules; it is now clean.
+- **LSP hover, definition, completion and semantic tokens follow sugar
+  expansion** (W4-07). Editor positions are mapped through the same expansion
+  line table diagnostics use, with the column recovered by locating the
+  identifier among the lines its source line expanded into. Below a `?`,
+  `gather:` or with-chain, hover named a desugaring temporary
+  (`__typhon_q_0__`), the wrong line's binding or nothing; go-to-definition
+  and the hover range pointed at the expanded buffer's line; member completion
+  read the wrong receiver. Desugaring temporaries (`__typhon_*`) are never
+  offered by hover, definition or completion. Cross-file definitions map back
+  through the target file's own table.
+- **The language server survives symlink loops and refuses an escaping
+  `src`** (W4-08). `tyc lsp` lists sources with the CLI's symlink-safe walk
+  (now shared from `tyc-venv`, which also fixes the venv import scan that hung
+  `tyc check` on a `src/a -> .` loop when a dependency was declared) and loads
+  `typhon.toml` with the CLI's validating loader (moved to `tyc-venv` and
+  re-exported as `tyc::config`), so an absolute or `..` `[project] src` is
+  refused instead of walked. `ln -s . src/a; ln -s . src/b` used to stall
+  diagnostics for good. The source listing is cached instead of re-walked on
+  every keystroke.
+- **Language-server robustness** (W4-11). A malformed frame (truncated or
+  non-UTF-8 JSON, non-JSON, a JSON array, a message without `"jsonrpc"`) gets
+  a `-32700` / `-32600` reply and the server keeps reading; tower-lsp-server
+  used to stop after the first one and exit 0. `tyc lsp` exits 1 on `exit`
+  without `shutdown` (the spec's code) or when stdin closes first, 0 after
+  `shutdown`. Reopening a closed document reuses its Salsa input (300 reopen
+  cycles took RSS from 5 MB to 75 MB). An invalid `typhon.toml` is reported as
+  a diagnostic on the file — on the offending key, or at a TOML syntax error —
+  instead of silently falling back to defaults, and clears once fixed.
+- **Language-server performance** (W4-10). Edits are checked once the
+  keystrokes pause (100 ms debounce): a burst of 51 full-text changes used to
+  be checked and published 51 times, the last 9.6 s after the burst. A newer
+  edit supersedes a pending or running check — the check stops between its
+  phases and never publishes a superseded result. An edit refreshes only the
+  open documents that import the edited module, never the edited document a
+  second time (W4-09 re-checked every open document on every keystroke).
+  `semanticTokens/full` is linear (positions came from a scan from offset 0
+  per token: 20k lines took 15.3 s), and its parse and token walk, like the
+  Salsa queries behind hover, completion and go-to-definition, run on a
+  blocking thread instead of the server's single async thread. The check
+  releases the database lock around venv introspection.
+- **`typhon_runtime` is a reserved module name** (W4-12, new
+  `tyc::reserved_module_name`). The runtime package `tyc build` generates
+  replaced a project's own `src/typhon_runtime` module or package: check and
+  build were clean, then the program failed with `ImportError: cannot import
+  name 'helper'`. `tyc build` now fails before writing the runtime when the
+  program imports a name or submodule from `typhon_runtime` that the generated
+  runtime does not provide (a program that could not start); otherwise `tyc
+  build` and `tyc check` warn that the name is reserved. No program that runs
+  today is rejected.
+- **`tyc fmt` refuses to write through a symlink leaving the project**
+  (W4-13, fmt half). `tyc fmt src/` with `src -> ../elsewhere` reformatted the
+  link's target; files that resolve outside the project (the nearest directory
+  above the argument with a `typhon.toml`, never one reached through a
+  symlinked directory) are now skipped with a warning, as `tyc fmt .` already
+  did.
+- **`tyc init` no longer pins the optimiser knobs, and checks before
+  writing** (W4-14). The scaffold wrote `auto-memoise = false`,
+  `auto-gather = false` and `pgo-memoise = false`, and an explicit
+  `[strictness]` entry beats `[optimise] level` and `-O`, so `tyc build -O`
+  did nothing on every new project; the three lines are gone (they were the
+  defaults) and a comment explains how the knobs follow `[optimise] level`.
+  (Lands with W3-04's `-O` memoise safety.) `tyc init` over an existing
+  `src/main.ty` used to write `typhon.toml` and `tests/` before failing; every
+  refusal now comes first, a symlink at either path counts as present, and
+  both files are written atomically.
+- **Smaller CLI fixes** (W4-15).
+  - `tyc check` on a path with nothing to check (an empty directory, a
+    `.py`-only tree, a mistyped path) exits 1 instead of passing, so CI cannot
+    go green without checking anything.
+  - A piped `tyc repl` (a script fed on stdin) exits 1 when any snippet failed
+    to compile or raised; it exited 0.
+  - The `pyproject.toml` merge no longer writes a static `[project] version`
+    when the file declares `dynamic = ["version"]` (`uv sync` rejected the
+    pair).
+  - `tyc add pkg@git+https://…` records a PEP 508 direct reference
+    (`pkg @ git+https://…`) instead of `pkg==git+https://…`.
+  - `tyc debug` writes its wrapper's string literals as Python escapes; Rust's
+    `{:?}` produced `\u{200b}` for a zero-width space in a path, a Python
+    `SyntaxError`.
+  - `tyc trace` rewrites frames inside `ExceptionGroup` tracebacks (the
+    `  |   File "…"` rows every failed `gather:` prints), keeping the gutter.
+- **Warnings for parallel settings that cannot take effect** (W4-16).
+  `[python] free-threaded = true` with a target lacking the `t` suffix, and
+  `[strictness] auto-parallel-reductions = true` while `auto-parallel`
+  resolves to off (after `[optimise] level` and `tyc build -O`), are now
+  reported by `tyc check` and `tyc build`. Decision: warnings, not
+  config-load errors — both combinations build and run today (one only
+  switches on advice lints, the other is a no-op), and validation only
+  rejects configs that cannot work. The free-threading preset on the docs
+  site now uses `target = "3.14t"`.
+- **Docs: `tyc migrate --force`** is now documented in `docs/cli.md` and on
+  the docs site (it overwrites existing `.ty` files; without it the command
+  refuses before writing anything).
 
 #### W5 — VM & harness
 
@@ -375,6 +475,50 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   permissions, re-pinned actions, cold release builds).
 - Dependabot ignores reverted bumps; `engines.vscode` bumped to `^1.138.0`.
 - The README flagship exhaustiveness claim is scoped to direct matches.
+- After W1-04/W1-05 the claim is full strength again: the README,
+  `docs/language.md` and the docs-site match pages describe exhaustiveness
+  over `Result` payloads, `T?`, `bool`, literal unions and nested sealed
+  unions, with the binary's real `non_exhaustive_match` output.
+- The docs site carries the W2-04 `as!` supported-target table (refused
+  targets are a check-time error, not a silent accept) and the W2-05 frozen
+  binding types (`freeze let` now has a reference section).
+- The docs-site `tyc run` page documents the automatic CPython fallback,
+  `--no-fallback`, and that a program importing `re` runs on compiled
+  CPython (W5-13); it no longer says there is no fallback.
+- The docs-site language reference matches the W1/W2 checker: `del` and
+  `except … as` cannot end a `let`, `typing` names used as runtime values
+  need their import, `go` needs a coroutine, `int ** int` with a negative
+  literal exponent is `float`, and interface conformance (parameter names,
+  optional parameters, writable fields) is described as the checker
+  enforces it — the old "optional parameters match in either direction"
+  sentence was wrong.
+- Every code `tyc explain --list` prints now has a docs-site section: 44
+  codes had only their `docs/diagnostics` page. They are on the existing
+  catalog pages plus a new *Lints & Performance Advice* page, each with an
+  example checked against the binary, and the catalog index lists every
+  code. A `shipped_docs.rs` test fails when a code the compiler declares is
+  missing from `tyc explain --list`, from `docs/diagnostics/`, or from the
+  docs-site catalog and its index. `missing_initialiser` and
+  `python_semantic_drift` are listed but never emitted; their pages say so.
+- New `fmt-corpus` CI job (W7-03 request): a copy of `examples/`,
+  `stress/` and `corpus/valid/` has its code de-formatted (`let x: T = 1` →
+  `let x:T=1`, no space after `,` or `:`, `=` and `->` squeezed, trailing
+  blanks; strings and comments untouched), `tyc fmt` runs over it, and every
+  unit must emit exactly the Python AST the unmodified corpus emits. A file
+  `tyc fmt` refuses only after de-formatting also fails the job. First run:
+  1,224 built units identical, 264 non-building on both sides.
+- `scripts/emitted-ast.py equiv A B` is the emitted-AST equivalence harness
+  (step 0 of `docs/design/sugar-as-ast-nodes.md`): A and B are `tyc`
+  binaries or git revisions; every corpus unit is built with both and the
+  `ast.dump` of every emitted `.py` compared, listing the units that
+  changed. Documented in `docs/differential-testing.md` and
+  `CONTRIBUTING.md`.
+- New compatibility policy for the beta line (`docs/compatibility.md`, and
+  *Project → Compatibility Policy* on the docs site), linked from the
+  README: the additive-on-correct-programs rule, the four categories every
+  narrowing is filed under, the exceptions made since alpha.2, the surface
+  frozen for beta (each form checked against the binary), how deprecations
+  and breaking changes are made after beta, and what counts as a bug.
 - Docs cite only diagnostic codes the binary emits (`tyc explain --list`
   minus `freeze`/`pub`, now language topics), locked in by a guard test.
 - New nullable-operator docs page listing the accepted spellings with the

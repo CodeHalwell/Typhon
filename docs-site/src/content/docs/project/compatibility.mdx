@@ -1,0 +1,190 @@
+---
+title: Compatibility Policy
+description: What Typhon promises not to break during the beta line, how breaking changes are made, and what counts as a bug.
+sidebar:
+  order: 2
+---
+
+This page says what Typhon promises not to break, how a change that does
+break something is made, and what counts as a bug. It applies from
+`v1.0.0-beta.1` to `1.0.0`. It writes down the rule the project has
+followed since v0.3.0 and the exceptions it has made, so that each later
+change can be judged against it.
+
+## The rule: additive on correct programs
+
+A **correct program** is one that passes `tyc check` and, after `tyc build`,
+runs on CPython 3.13+ without raising and with the output its author
+intended. Every later release must keep a correct program:
+
+- type-checking (no new error-level diagnostic);
+- building, with emitted Python that behaves the same (the emitted *text*
+  may change);
+- running the same way under `tyc run`.
+
+New syntax, new library coverage, new warnings and new advice are always
+allowed. Removing or changing the meaning of accepted syntax is not.
+
+## New diagnostics
+
+A new **error-level** diagnostic may only fire on code that is not correct.
+The changelog has used four categories since v1.0.0-alpha.2, and every
+narrowing is filed under one of them:
+
+1. **Relaxations.** The checker accepts more. Always allowed.
+2. **Narrowings on code that already fails at runtime.** The program
+   type-checked but was certain to raise: `raise 42`
+   (`tyc::raise_non_exception`), a `with` over a class without
+   `__enter__` (`tyc::not_a_context_manager`), `case Poly():` on a `type`
+   alias (`tyc::alias_not_a_class`). Allowed at error level.
+3. **Narrowings on code that relied on unsound typing.** The program can run,
+   but only because nothing has yet exercised the contract its annotations
+   claim: a `str` written into an `int` field, a `set` passed where a
+   `Sequence` is indexed. Allowed at error level; the fix is to correct the
+   annotation, and `unsafe:` or `as!` is the escape.
+4. **Narrowings on code that may run correctly.** Allowed only with all
+   three of:
+   - an escape — a `[strictness]` key, a `case _:` arm, a rewrite;
+   - a compatibility note in `CHANGELOG.md` naming the change;
+   - a sweep of the example, stress and valid-programs corpora showing no
+     previously clean unit is rejected, or listing the ones that are and
+     why.
+
+   Where the check can flag a program that is correct in practice, it lands
+   at **warn** for at least one release before it becomes an error.
+
+**Warnings and advice** never fail `tyc check` or `tyc build` at their
+default severity, so they may be added in any release. A `[strictness]`
+setting a project chose (for example `unused-import = "error"`) keeps its
+meaning.
+
+## Exceptions so far
+
+Category-4 narrowings, and changes outside the four categories, are
+deliberate exceptions. These are the ones made since v1.0.0-alpha.2:
+
+| Release | Change | Escape |
+|---|---|---|
+| alpha.2 | A subscript assignment of an `object`-typed value into a narrower container (`self._data[name] = value` in a `__setattr__` override) is rejected. Kept as a known rejection: accepting it would let `d["k"] = v` store what `let n: int = v` refuses. | `as!` at the store, or widen the container's value type |
+| alpha.7 | A `match` over a *parametric* sealed union is checked for exhaustiveness. | `case _:`, `[strictness] exhaustive-match` |
+| alpha.7 | Dereferencing a nullable *field* (`self.conn.execute()`) is reported — at warn for one release. | `[strictness] nullable-use` |
+| alpha.7 | `let` immutability is enforced inside loop bodies and through `global` / `nonlocal`. | declare the binding `mut` |
+| beta.1 | `x += 1` on a `let` is rejected, as `x = x + 1` already was. | declare the binding `mut` |
+| beta.1 | `[strictness] nullable-use` defaults to `"error"` (the warn period above ended). | `nullable-use = "warn"` or `"off"` |
+| beta.1 | `unsafe:` containment follows values derived from an unsafe binding (`data["name"]`, `data.count + 1`), not only the bare name. | `value as! T` at the boundary |
+| beta.1 | Exhaustiveness covers `Result` payloads, `T?`, `bool`, literal unions and nested sealed unions; a match that omits a value that never occurs at runtime is now reported. | `case _:`, `[strictness] exhaustive-match` |
+| beta.1 | `del NAME` and `except … as NAME` cannot end a `let`. | declare the binding `mut`, or rename the handler variable |
+
+The VM has changed behaviour too, always towards CPython: arbitrary-precision
+integers (v0.8.0), CPython value semantics for dataclasses, sets and floats
+(v0.11.0), `ExceptionGroup` / `except*` (alpha.7) and an entropy-seeded
+`random` (alpha.8). Each was a bug fix under the definition below.
+
+## The surface frozen for the beta line
+
+These forms keep their syntax and meaning for every beta release. Each was
+checked against the `tyc` binary when this page was written; the reference
+is the [Language Reference](/Typhon/reference/lexical/).
+
+- **Bindings:** `let`, `mut`, declare-only `let NAME: T`, typed tuple unpack
+  `let (a: T, b, *rest) = …`, module-level `freeze let`, `pub` (on every
+  declaration form except `lazy let`), `pub *` in `__init__.ty`,
+  `newtype NAME = T`.
+- **Types:** `T?`, PEP 695 type parameters (`def f[T]`, `class Box[T]`,
+  `impl[T] Box[T]:`), `type NAME = …` aliases and sealed unions (including
+  parametric and string-literal unions), higher-kinded class parameters
+  (`class Functor[F[_]]:`), `interface`, `@covariant` / `@contravariant`.
+- **Classes:** `class`, `class NAME frozen:` and `class NAME[T] frozen(Base):`,
+  `model`, `plain class`, `class!`, `enum`, `impl`, `extend`,
+  `extend BUILTIN:`, and `impl` on a sealed-union alias.
+- **Errors:** `Result[T, E]`, `Ok`, `Err`, the `?` operator, `with`-chains
+  (`with a = f()?, b = g()?: … else err: …`), `try_result(thunk[, mapper])`,
+  postfix `EXPR rescue NAME: ERR` and block `rescue NAME: ERR:`.
+- **Control and readability:** `guard NAME = expr else: …`, the `|>` pipe,
+  `match` with exhaustiveness checking.
+- **Concurrency:** `gather:`, `gather(strategy="best-effort"):`, `go f(x)`,
+  `go f(x) -> handle`, `@gatherable`.
+- **Build time and loading:** `comptime let`, `comptime def`, `env(...)`
+  inside `comptime`, `lazy import ALIAS = MODULE`, and `lazy let` at module
+  level and in an `impl` body.
+- **Boundaries:** `unsafe:` blocks and `EXPR as! TYPE`.
+- **Purity:** `@pure`, `@memo`.
+
+Outside the frozen surface, and free to change during beta with a changelog
+entry:
+
+- forms documented as designed but not implemented: the `lazy[T]` return
+  type, the `lazy let NAME: T:` block form, `pub lazy let`,
+  `model NAME frozen:`, function-level higher-kinded parameters
+  (`def f[F[_]]`);
+- the text of emitted Python (its behaviour is covered by the rule above),
+  the contents of the generated `typhon_runtime/` package, and the wording of
+  diagnostic messages and help text;
+- the code that the opt-in rewrites generate (`auto-gather`,
+  `auto-parallel`, `auto-memoise`, `pgo-memoise`, `[optimise]`); what each
+  rewrite does to a program's behaviour is covered by the rule above;
+- the `tyc-*` Rust crates' APIs.
+
+`tyc::` diagnostic codes, `tyc` subcommands and flags, and `typhon.toml` keys
+are not removed or renamed during beta; new ones may be added.
+
+## Deprecations and breaking changes after beta
+
+A change that would reject or change the meaning of a correct program goes
+through deprecation first:
+
+1. **Deprecate.** The old form keeps working. A warn-level diagnostic names
+   the replacement, with a `[strictness]` key where a project may want to
+   promote or silence it. The changelog records it under *Deprecated*, with
+   the rewrite.
+2. **Wait.** The warning ships in at least one release before anything is
+   removed. No form is removed during the beta line; removals wait for
+   `1.0.0` or later.
+3. **Remove.** The release that removes the form says so in a compatibility
+   note at the top of its changelog entry, with the migration.
+
+A narrowing in category 4 above follows the same path: warn first (as the
+nullable-field check did in alpha.7), then error.
+
+## What counts as a bug
+
+- **A VM ↔ CPython divergence.** `tyc run` must print the same output and
+  exit with the same code as `tyc build` followed by CPython. Every known
+  divergence is listed in `scripts/differential-baseline.txt`, and every line
+  there is a VM bug. The documented limits of the VM's cooperative scheduler
+  (results that depend on task interleaving) are recorded in
+  [`docs/vm.md`](https://github.com/CodeHalwell/Typhon/blob/main/docs/vm.md); a program the VM does not model is
+  [run on CPython](/Typhon/cli/run/#automatic-fallback-to-cpython) instead.
+- **Emitted Python that CPython cannot compile.** An emitter bug, never
+  baselined.
+- **A check-clean program that crashes in a way a documented rule
+  prevents** (a `None` reaching a non-nullable use, a non-exhaustive match
+  falling through): a checker soundness bug.
+- **A correct program that `tyc check` rejects:** a false positive. Typhon is
+  meant to be stricter than Python, not to reject valid Python for no reason;
+  report it with the smallest snippet that shows it.
+- **`tyc fmt` changing what a program means.** `tyc fmt` refuses to write
+  output whose lowered AST differs from its input, and the `fmt-corpus` CI
+  job checks the same over the whole corpus.
+- **A doc that disagrees with the compiler.** The compiler wins and the doc
+  is fixed, unless the compiler is unsound, in which case the compiler is
+  fixed.
+
+Not bugs: a change to the emitted Python text that keeps its behaviour, a
+change to diagnostic wording, and VM speed.
+
+## How the rule is checked
+
+- The example, stress and valid-programs corpora (`examples/`, `stress/`,
+  `corpus/valid/`) are the regression net. Units that are meant to be
+  rejected are pinned in `scripts/nobuild-baseline.txt`; the list fails in
+  both directions, so a new rejection is visible in review.
+- The `differential` and `valid-corpus` CI jobs run every unit on both
+  execution surfaces and compare the results.
+- The `knob-matrix` job builds each opt-in rewrite on and off and requires
+  the same observable behaviour.
+- The `fmt-corpus` job de-formats the corpus, runs `tyc fmt`, and requires
+  every unit to emit the Python AST it emitted before.
+- `scripts/emitted-ast.py equiv OLD NEW` compares the Python every corpus
+  unit emits under two compilers, for changes to a lowering that should not
+  change any program (see [`docs/differential-testing.md`](https://github.com/CodeHalwell/Typhon/blob/main/docs/differential-testing.md#4-emitted-ast-equivalence-harness)).
