@@ -252,6 +252,23 @@ grouped by workstream (W1–W7).
   U+001C–U+001F as `str.isspace()` does. A type mismatch on a `comptime let`
   is reported at the binding instead of line 1, column 1, and a deep
   recursion's error names the call once instead of once per frame.
+- **`tyc::contains_secret_literal` redesigned** (W3-06, warn-level). The
+  165-entry keyword cross-product is replaced by a word matcher shared by
+  the lint and the `tyc build` scan (`tyc-analyse/src/secrets.rs`): the name
+  is split into words (squashed words segmented, so `APIKEYS` now warns), a
+  credential noun (`PASSWORD`, `SECRET`, `TOKEN`, `CREDENTIAL`) or a
+  qualified key noun (`API_KEY`, `DB_PASS`) names a secret, and a metadata
+  word after it (`TOKEN_LIMIT`, `PASSWORD_MIN_LENGTH`, `CREDENTIALS_PATH`,
+  `AUTHORIZATION_URL`, `AWS_ACCESS_KEY_ID`), a counting word (`MAX_TOKENS`)
+  or a non-secret qualifier (`PRIMARY_KEY`, `SORT_KEY`, `PUBLIC_KEY`) rules
+  it out. Ambiguous names (`KEY`, `STRIPE_KEY`, `DATABASE_DSN`,
+  `SESSION_COOKIE`) warn only on a credential-shaped value (known token
+  prefix, PEM private key, URL with a password, long high-entropy run);
+  placeholders (`""`, `"xxxx"`, `"<token>"`) never warn. The build scan
+  fires only on string values (no more `comptime let TOKEN_LIMIT: int`
+  warning) and also checks the key of every `env("…")` the binding reads,
+  through `comptime def` calls too, so `comptime let DEPLOY_CFG: str =
+  env("AWS_SECRET_ACCESS_KEY")` now warns.
 
 #### W4 — CLI, LSP, filesystem safety
 - **LSP definition URIs rebased onto client workspace root.** `goto_definition` now uses the client's declared workspace root URI (preserving symlink prefixes such as `/var/folders` or `/tmp` rather than macOS `/private/var/...`) or open-document URI, preventing editors from opening duplicate tabs on cross-file jumps.

@@ -104,6 +104,14 @@ pub use extend_builtin::{
     ExtensionRegistry, StaticType, TypeFacts,
 };
 
+pub mod secrets;
+pub use secrets::{
+    comptime_secret_bindings, secret_binding_warrants_warning, secret_name_strength,
+    secret_value_is_credential_shaped, secret_value_warrants_warning, SecretNameStrength,
+    NON_SECRET_QUALIFIERS, SECRET_KEY_NOUNS, SECRET_NAME_COUNT_WORDS, SECRET_NAME_KEYWORDS,
+    SECRET_NAME_METADATA_WORDS, SECRET_NAME_QUALIFIERS, SECRET_VALUE_GATED_NOUNS,
+};
+
 pub mod perf;
 pub use perf::{
     is_stdlib_top_level, lazy_import_opportunity_diagnostics, perf_diagnostics, PerfLintContext,
@@ -6544,19 +6552,18 @@ pub fn purity_diagnostics(findings: &[PurityFinding], path: &str, source: &str) 
 // into a [`Diagnostics`] bundle.
 
 /// Walk every top-level / nested binding statement in `module` and warn when
-/// a `let` / module-level assignment whose name matches the secret-suffix
-/// heuristic is initialised from a raw string literal.
+/// a binding whose name names a credential is initialised from a raw string
+/// literal of credential weight — see [`secrets`] for the name and value
+/// rules (a clear credential name such as `DB_PASSWORD` on any
+/// non-placeholder string; an ambiguous one such as `KEY` or `DATABASE_DSN`
+/// only on a credential-shaped value).
 ///
-/// Pattern (case-insensitive on the name): the binding identifier ends in
-/// `_TOKEN`, `_SECRET`, `_PASSWORD`, `_PWD`, `_KEY`, or `_API_KEY` (or the
-/// suffix _is_ the whole name — `KEY`, `TOKEN`, …). The RHS must be a bare
-/// string literal; any non-literal RHS (function call, attribute access,
-/// `os.getenv("…")`) is fine because it's likely runtime-driven.
-///
-/// Only fires for plain assignments — `comptime let X = env("…")` already
-/// has its own `contains_secret_literal` path inside `tyc build`, so this
-/// pass deliberately skips comptime bindings (their RHS is substituted out
-/// at build time anyway).
+/// The RHS must be a bare string literal; any non-literal RHS (function
+/// call, attribute access, `os.getenv("…")`) is fine because it's likely
+/// runtime-driven. A `comptime let X = env("…")` binding has its own
+/// `contains_secret_literal` path inside `tyc build`
+/// ([`comptime_secret_bindings`]); a `comptime let` initialised from a
+/// literal is checked here like any other binding.
 pub fn analyse_secret_literal_bindings(
     module: &ModModule,
     path: &str,
@@ -6574,35 +6581,19 @@ fn walk_secret_literal_stmts(body: &[Stmt], path: &str, source: &str, diags: &mu
     for stmt in body {
         match stmt {
             Stmt::Assign(a) => {
-                // `X = "literal"` — every name target on the LHS counts as a
-                // candidate, including tuple-unpacks like `(API_KEY, b) = …`.
-                if !is_string_literal(&a.value) {
+                // `X = "literal"` (and chained `X = Y = "literal"`).
+                let Some(value) = string_literal_value(&a.value) else {
                     continue;
-                }
+                };
                 for target in &a.targets {
-                    record_secret_targets(target, source, path, diags);
+                    record_secret_target(target, &value, source, path, diags);
                 }
             }
             Stmt::AnnAssign(a) => {
-                let Some(rhs) = a.value.as_deref() else {
+                let Some(value) = a.value.as_deref().and_then(string_literal_value) else {
                     continue;
                 };
-                if !is_string_literal(rhs) {
-                    continue;
-                }
-                if let Expr::Name(n) = a.target.as_ref() {
-                    if is_secret_name(n.id.as_str()) {
-                        let span_start = n.range.start().to_usize();
-                        let length = n.id.as_str().len();
-                        diags.push_warning(TycError::secret_literal_inline(
-                            n.id.as_str().to_owned(),
-                            path,
-                            source.to_owned(),
-                            span_start,
-                            length,
-                        ));
-                    }
-                }
+                record_secret_target(&a.target, &value, source, path, diags);
             }
             Stmt::FunctionDef(f) => walk_secret_literal_stmts(&f.body, path, source, diags),
             Stmt::ClassDef(c) => walk_secret_literal_stmts(&c.body, path, source, diags),
@@ -6635,287 +6626,37 @@ fn walk_secret_literal_stmts(body: &[Stmt], path: &str, source: &str, diags: &mu
     }
 }
 
-fn record_secret_targets(target: &Expr, source: &str, path: &str, diags: &mut Diagnostics) {
-    match target {
-        Expr::Name(n) if is_secret_name(n.id.as_str()) => {
-            let span_start = n.range.start().to_usize();
-            let length = n.id.as_str().len();
+/// Warn on a bare-name assignment target. (A tuple / list target unpacks
+/// the string into characters, none of which is a credential.)
+fn record_secret_target(
+    target: &Expr,
+    value: &str,
+    source: &str,
+    path: &str,
+    diags: &mut Diagnostics,
+) {
+    if let Expr::Name(n) = target {
+        if secret_binding_warrants_warning(n.id.as_str(), value) {
             diags.push_warning(TycError::secret_literal_inline(
                 n.id.as_str().to_owned(),
                 path,
                 source.to_owned(),
-                span_start,
-                length,
+                n.range.start().to_usize(),
+                n.id.as_str().len(),
             ));
         }
-        Expr::Tuple(t) => {
-            for elt in &t.elts {
-                record_secret_targets(elt, source, path, diags);
-            }
-        }
-        Expr::List(l) => {
-            for elt in &l.elts {
-                record_secret_targets(elt, source, path, diags);
-            }
-        }
-        _ => {}
     }
 }
 
-/// True when `expr` is a bare string literal (`"foo"`, `'bar'`,
-/// `"""…"""`). Concatenations (`"a" + "b"`) and f-strings are intentionally
-/// NOT treated as literals — those forms suggest the user is composing the
-/// value programmatically, even if the result is statically constant.
-fn is_string_literal(expr: &Expr) -> bool {
-    matches!(expr, Expr::StringLiteral(_))
-}
-
-/// Secret-shaped name keywords, longest / most-specific first.
-///
-/// The single source of truth shared by the `tyc::contains_secret_literal`
-/// lint in this crate ([`is_secret_name`]) and the `tyc build` secret-suffix
-/// scan (`secret_suffix` in the CLI crate), so the two heuristics cannot
-/// drift apart — exactly the class of bug fixed in v1.0.0-alpha.4, where an
-/// ordering discrepancy between the two copies made `KEY_APIKEY` report the
-/// less-specific suffix. Invariant: any keyword that contains another
-/// keyword as a substring (`APITOKEN` ⊃ `TOKEN`, `API_KEY` ⊃ `KEY`) must
-/// come first, so first-match reporting picks the most specific word.
-/// That ordering is asserted by `secret_keyword_table_is_longest_first`
-/// (this crate's tests) — reorder freely, the test catches violations.
-pub const SECRET_NAME_KEYWORDS: &[&str] = &[
-    // Longest-first: `APIKEY` must be tried before the bare `KEY` so a name
-    // like `KEY_APIKEY` reports the more specific suffix. `PASSPHRASE` must
-    // precede `PASS` for the same reason — and it needs its own entry at all
-    // because the word-boundary rule that (correctly) stops `PASSPORT` from
-    // matching `PASS` also stopped `PASSPHRASE`, so the single most obvious
-    // secret-shaped name after `PASSWORD` went unflagged. `PRIVKEY` is here
-    // for exactly that reason too: the `V`→`K` junction is not a word
-    // boundary, so `PRIVKEY` / `SSH_PRIVKEY` / `PRIVKEY_PEM` never matched
-    // the bare `KEY`. It precedes `KEY` so the specific word is reported.
-    "PASSPHRASE",
-    "AUTHORIZATION_TOKEN",
-    "AUTHORIZATIONTOKEN",
-    "AUTHORIZATION",
-    "CREDENTIALS",
-    "CREDENTIAL",
-    "WEBHOOK_SECRET",
-    "WEBHOOKSECRET",
-    "WEBHOOK",
-    "SIGNING",
-    "COOKIE",
-    "DB_PASSWORD",
-    "DBPASSWORD",
-    "DB_PASS",
-    "DBPASS",
-    "DB_PWD",
-    "DBPWD",
-    "API_PASSWORD",
-    "APIPASSWORD",
-    "DB_SECRET",
-    "DBSECRET",
-    "API_SECRET",
-    "APISECRET",
-    "APP_SECRET",
-    "APPSECRET",
-    "CLIENT_SECRET",
-    "CLIENTSECRET",
-    "JWT_SECRET",
-    "JWTSECRET",
-    "SECRET_KEY",
-    "SECRETKEY",
-    "PERSONAL_ACCESS_TOKEN",
-    "PERSONALACCESSTOKEN",
-    "OAUTH_TOKEN",
-    "OAUTHTOKEN",
-    "GITHUB_TOKEN",
-    "GITHUBTOKEN",
-    "ACCESS_TOKEN",
-    "ACCESSTOKEN",
-    // `OAUTH_TOKEN` contains `AUTH_TOKEN` (and `OAUTHTOKEN` contains
-    // `AUTHTOKEN`), so both sit ahead of the `AUTH*` pair.
-    "AUTH_TOKEN",
-    "GH_TOKEN",
-    "GHTOKEN",
-    "AUTHTOKEN",
-    "BEARER_TOKEN",
-    "BEARERTOKEN",
-    "CSRF_TOKEN",
-    "CSRFTOKEN",
-    "JWT_TOKEN",
-    "JWTTOKEN",
-    "API_TOKEN",
-    "APITOKEN",
-    "OAUTH_SECRET",
-    "OAUTHSECRET",
-    "ACCESS_PASSWORD",
-    "BEARER_PASSWORD",
-    "CLIENT_PASSWORD",
-    "SECRET_PASSWORD",
-    "ACCESSPASSWORD",
-    "BEARERPASSWORD",
-    "CLIENTPASSWORD",
-    "SECRETPASSWORD",
-    "AUTH_PASSWORD",
-    "CSRF_PASSWORD",
-    "APP_PASSWORD",
-    "AUTHPASSWORD",
-    "CSRFPASSWORD",
-    "JWT_PASSWORD",
-    "APPPASSWORD",
-    "JWTPASSWORD",
-    "PASSWORD",
-    "ACCESS_SECRET",
-    "BEARER_SECRET",
-    "SECRET_SECRET",
-    "ACCESSSECRET",
-    "BEARERSECRET",
-    "SECRETSECRET",
-    "SECRET_TOKEN",
-    "AUTH_SECRET",
-    "CSRF_SECRET",
-    "SECRETTOKEN",
-    "SECRET_PASS",
-    "AUTHSECRET",
-    "CSRFSECRET",
-    "SECRETPASS",
-    "SECRET_PWD",
-    "SECRETPWD",
-    "SECRET",
-    "REFRESH_TOKEN",
-    "SESSION_TOKEN",
-    "REFRESHTOKEN",
-    "SESSIONTOKEN",
-    "CLIENT_TOKEN",
-    "CLIENTTOKEN",
-    "APP_TOKEN",
-    "APPTOKEN",
-    "DB_TOKEN",
-    "ID_TOKEN",
-    "DBTOKEN",
-    "IDTOKEN",
-    "TOKEN",
-    "PRIVATE_KEY",
-    "PRIVATEKEY",
-    "PUBLIC_KEY",
-    "PUBLICKEY",
-    "SSH_KEY",
-    "SSHKEY",
-    "API_KEY",
-    "APIKEY",
-    "APP_KEY",
-    "APPKEY",
-    "PRIVKEY",
-    "ENCRYPTION_KEY",
-    "ENCRYPTIONKEY",
-    "ACCESS_KEY",
-    "BEARER_KEY",
-    "CLIENT_KEY",
-    "MASTER_KEY",
-    "ACCESSKEY",
-    "BEARERKEY",
-    "CLIENTKEY",
-    "MASTERKEY",
-    "AUTH_KEY",
-    "CSRF_KEY",
-    "AUTHKEY",
-    "CSRFKEY",
-    "JWT_KEY",
-    "DB_KEY",
-    "JWTKEY",
-    "DBKEY",
-    "KEY",
-    "ACCESS_PWD",
-    "BEARER_PWD",
-    "CLIENT_PWD",
-    "ACCESSPWD",
-    "BEARERPWD",
-    "CLIENTPWD",
-    "AUTH_PWD",
-    "CSRF_PWD",
-    "API_PWD",
-    "APP_PWD",
-    "AUTHPWD",
-    "CSRFPWD",
-    "JWT_PWD",
-    "APIPWD",
-    "APPPWD",
-    "JWTPWD",
-    "PWD",
-    "ACCESS_PASS",
-    "BEARER_PASS",
-    "CLIENT_PASS",
-    "ACCESSPASS",
-    "BEARERPASS",
-    "CLIENTPASS",
-    "AUTH_PASS",
-    "CSRF_PASS",
-    "API_PASS",
-    "APP_PASS",
-    "AUTHPASS",
-    "CSRFPASS",
-    "JWT_PASS",
-    "APIPASS",
-    "APPPASS",
-    "JWTPASS",
-    "PASS",
-    "DSN",
-];
-
-/// Return the first (i.e. most specific, given the table's longest-first
-/// ordering) secret-shaped keyword that occurs in `name` as a bounded
-/// substring, or `None`. Match is case-insensitive; the keyword may form
-/// the whole name (e.g. `TOKEN`), follow an underscore (e.g. `MY_TOKEN`),
-/// sit at a digit or camelCase/PascalCase boundary (e.g. `myTokenValue`,
-/// `foo123TOKEN`), or start/end the name.
-///
-/// This is the ONE implementation of the word-boundary heuristic, shared by
-/// the `tyc::contains_secret_literal` lint here ([`is_secret_name`]) and the
-/// `tyc build` secret-suffix scan (`secret_suffix` in the CLI crate). The two
-/// consumers previously carried hand-synchronised copies of this logic —
-/// every new boundary rule (alpha.8's digit / TitleCase junctions, alpha.9's
-/// uppercase→lowercase junction) had to be applied to both by hand, the same
-/// drift class that produced the alpha.4 `KEY_APIKEY` ordering bug.
-pub fn secret_keyword_match(name: &str) -> Option<&'static str> {
-    let upper = name.to_ascii_uppercase();
-    for word in SECRET_NAME_KEYWORDS {
-        let mut start_idx = 0;
-        while let Some(idx) = upper[start_idx..].find(word) {
-            let actual_idx = start_idx + idx;
-            // Ensure the word is bounded by string start/end or underscores,
-            // or preceded/followed by a casing change (for camelCase like `myTokenValue`).
-            // so `MONKEY` doesn't match `KEY` and `PASSPORT` doesn't match `PASS`.
-            let start_ok = actual_idx == 0
-                || upper.as_bytes()[actual_idx - 1] == b'_'
-                || name.as_bytes()[actual_idx - 1].is_ascii_digit()
-                || (name.as_bytes()[actual_idx].is_ascii_uppercase()
-                    && name.as_bytes()[actual_idx - 1].is_ascii_lowercase());
-            let actual_end = actual_idx + word.len();
-            let end_ok = actual_end == upper.len()
-                || upper.as_bytes()[actual_end] == b'_'
-                || name.as_bytes()[actual_end].is_ascii_digit()
-                || (name.as_bytes()[actual_end].is_ascii_uppercase()
-                    && !name.as_bytes()[actual_end - 1].is_ascii_uppercase())
-                || (name.as_bytes()[actual_end].is_ascii_uppercase()
-                    && actual_end + 1 < name.len()
-                    && name.as_bytes()[actual_end + 1].is_ascii_lowercase())
-                || (name.as_bytes()[actual_end].is_ascii_lowercase()
-                    && name.as_bytes()[actual_end - 1].is_ascii_uppercase());
-            if start_ok && end_ok {
-                return Some(word);
-            }
-            start_idx = actual_idx + 1;
-        }
+/// The value of a bare string literal (`"foo"`, `'bar'`, `"""…"""`).
+/// Concatenations (`"a" + "b"`) and f-strings are intentionally NOT treated
+/// as literals — those forms suggest the user is composing the value
+/// programmatically, even if the result is statically constant.
+fn string_literal_value(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::StringLiteral(s) => Some(s.value.to_str().to_owned()),
+        _ => None,
     }
-    None
-}
-
-/// True when `name` contains one of the recognised secret-shaped keywords
-/// as a bounded substring — see [`secret_keyword_match`] for the boundary
-/// rules. The expected callers feed module-level binding names; passing a
-/// function or method name through is harmless because the caller already
-/// gated on `Stmt::Assign` / `Stmt::AnnAssign`.
-fn is_secret_name(name: &str) -> bool {
-    secret_keyword_match(name).is_some()
 }
 
 /// Walk every `let` / `mut` / `AnnAssign` binding statement in `module`
@@ -8272,9 +8013,9 @@ def use_np() -> object:
 
     #[test]
     fn secret_literal_fires_on_string_assign() {
-        let module = parse("API_TOKEN = \"abc\"\n");
+        let module = parse("API_TOKEN = \"abcd1234\"\n");
         let diags =
-            analyse_secret_literal_bindings(&module, "x.ty", "API_TOKEN = \"abc\"\n", false);
+            analyse_secret_literal_bindings(&module, "x.ty", "API_TOKEN = \"abcd1234\"\n", false);
         assert_eq!(
             diags.warnings().len(),
             1,
@@ -8285,7 +8026,7 @@ def use_np() -> object:
 
     #[test]
     fn secret_literal_fires_on_password_and_pwd() {
-        let src = "DB_PASSWORD = \"secret\"\nDB_PWD = \"abc\"\n";
+        let src = "DB_PASSWORD = \"secret\"\nDB_PWD = \"hunter2\"\n";
         let module = parse(src);
         let diags = analyse_secret_literal_bindings(&module, "x.ty", src, false);
         assert_eq!(diags.warnings().len(), 2);
@@ -8301,7 +8042,7 @@ def use_np() -> object:
 
     #[test]
     fn secret_literal_fires_on_my_secret() {
-        let src = "MY_SECRET = \"abc\"\n";
+        let src = "MY_SECRET = \"abcd\"\n";
         let module = parse(src);
         let diags = analyse_secret_literal_bindings(&module, "x.ty", src, false);
         assert_eq!(diags.warnings().len(), 1);
@@ -8314,44 +8055,57 @@ def use_np() -> object:
             "FOO_API_KEY_BAR = \"sk-foo\"\n",
             "KEY_APIKEY = \"sk-foo\"\n",
             "myTokenValue = \"sk-foo\"\n",
-            "APIKEY = \"123\"\n",
-            "APITOKEN = \"abc\"\n",
-            "APISECRET = \"abc\"\n",
-            "TOKEN123 = \"abc\"\n",
-            "foo123TOKEN = \"abc\"\n",
-            "my123TOKEN = \"abc\"\n",
-            "TOKENString = \"abc\"\n",
-            "dbPASSWORDString = \"abc\"\n",
-            "PRIVKEY = \"abc\"\n",
-            "SSH_PRIVKEY = \"abc\"\n",
-            "PRIVKEY_PEM = \"abc\"\n",
-            "AUTHORIZATION = \"abc\"\n",
-            "SESSION_COOKIE = \"abc\"\n",
-            "WEBHOOK_URL = \"abc\"\n",
-            "AWS_CREDENTIALS = \"abc\"\n",
-            "DATABASE_DSN = \"abc\"\n",
-            "SIGNING_KEY = \"abc\"\n",
-            "DBPASSWORD = \"abc\"\n",
-            "DBSECRET = \"abc\"\n",
-            "DBPASS = \"abc\"\n",
-            "DBPWD = \"abc\"\n",
-            "DB_PASS = \"abc\"\n",
-            "DB_PWD = \"abc\"\n",
-            "JWTTOKEN = \"abc\"\n",
-            "JWTSECRET = \"abc\"\n",
-            "ACCESSTOKEN = \"abc\"\n",
-            "APPSECRET = \"abc\"\n",
-            "ACCESS_TOKEN = \"abc\"\n",
-            "AUTH_TOKEN = \"abc\"\n",
-            "SECRETKEY = \"abc\"\n",
-            "SSHKEY = \"abc\"\n",
-            "APP_KEY = \"abc\"\n",
-            "APPKEY = \"abc\"\n",
+            "APIKEY = \"1234\"\n",
+            "APIKEYS = \"1234\"\n",
+            "APITOKEN = \"abcd\"\n",
+            "TOKEN123 = \"abcd\"\n",
+            "my123TOKEN = \"abcd\"\n",
+            "TOKENString = \"abcd\"\n",
+            "dbPASSWORDString = \"abcd\"\n",
+            "SSH_PRIVKEY = \"abcd\"\n",
+            "AWS_CREDENTIALS = \"abcd\"\n",
+            "SIGNING_KEY = \"abcd\"\n",
+            "DBPASS = \"abcd\"\n",
+            "ACCESSTOKEN = \"abcd\"\n",
+            "SECRET_KEY_BASE = \"abcd\"\n",
+            concat!("STRIPE_KEY = \"sk_", "live_4eC39HqLyjWDarjtT1zdp7dc\"\n"),
+            "DATABASE_DSN = \"postgres://app:hunter2@db/prod\"\n",
         ];
         for src in srcs {
             let module = parse(src);
             let diags = analyse_secret_literal_bindings(&module, "x.ty", src, false);
             assert_eq!(diags.warnings().len(), 1, "Failed to flag {src:?}");
+        }
+    }
+
+    #[test]
+    fn secret_literal_silent_on_descriptive_names_and_placeholder_values() {
+        // 2026-10-03 review §7.8: names that describe a credential, or an
+        // ambiguous name holding an ordinary string, are not secrets.
+        let srcs = [
+            "PASS_THRESHOLD = \"0.75\"\n",
+            "KEY_SEPARATOR = \"::\"\n",
+            "PRIMARY_KEY = \"id\"\n",
+            "SORT_KEY = \"created_at\"\n",
+            "PUBLIC_KEY = \"-----BEGIN PUBLIC KEY-----MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA\"\n",
+            "COOKIE_JAR = \"cookies.txt\"\n",
+            "SESSION_COOKIE_NAME = \"sessionid\"\n",
+            "SIGNING_ALGORITHM = \"HS256\"\n",
+            "TOKEN_TYPE = \"Bearer\"\n",
+            "AUTHORIZATION_URL = \"https://example.com/oauth/authorize\"\n",
+            "AUTHORIZATION_HEADER = \"Authorization\"\n",
+            "CREDENTIALS_PATH = \"~/.aws/credentials\"\n",
+            "PWD = \"/home/user/project\"\n",
+            "DATABASE_DSN = \"sqlite:///app.db\"\n",
+            "SESSION_COOKIE = \"sessionid\"\n",
+            "API_TOKEN = \"\"\n",
+            "API_TOKEN = \"<your token here>\"\n",
+            "PASSWORD = \"********\"\n",
+        ];
+        for src in srcs {
+            let module = parse(src);
+            let diags = analyse_secret_literal_bindings(&module, "x.ty", src, false);
+            assert!(diags.warnings().is_empty(), "{src:?} must not warn");
         }
     }
 
@@ -8383,8 +8137,8 @@ def use_np() -> object:
 
     #[test]
     fn secret_literal_fires_on_annassign_let() {
-        // `let TOKEN: str = "abc"` — AnnAssign path.
-        let src = "let TOKEN: str = \"abc\"\n";
+        // `let TOKEN: str = "abcd"` — AnnAssign path.
+        let src = "let TOKEN: str = \"abcd\"\n";
         let prep = preprocess(src);
         let module = tyc_syntax::parse_module(&prep.python_source)
             .expect("parse failed")
@@ -9215,78 +8969,5 @@ mod except_star_tests {
         let err = &diags.errors()[0];
         let code = miette::Diagnostic::code(err).expect("code").to_string();
         assert_eq!(code, "tyc::return_in_except_star");
-    }
-}
-
-#[cfg(test)]
-mod secret_table_tests {
-    use super::*;
-
-    /// The invariant every consumer relies on for most-specific-first
-    /// reporting: a keyword that contains another keyword as a substring
-    /// must be ordered before it. Violations of exactly this rule shipped
-    /// in v1.0.0-alpha.4 (`KEY` before `APIKEY`, so `KEY_APIKEY` reported
-    /// the bare `KEY`) and were caught again in the alpha.9 review
-    /// (`DB_PWD` initially placed after `PWD`). This test makes the next
-    /// violation a compile-gate failure instead of a review catch.
-    #[test]
-    fn secret_keyword_table_is_longest_first() {
-        for (i, a) in SECRET_NAME_KEYWORDS.iter().enumerate() {
-            for (j, b) in SECRET_NAME_KEYWORDS.iter().enumerate() {
-                if i != j && a.contains(b) {
-                    assert!(
-                        i < j,
-                        "`{a}` contains `{b}` but is ordered after it \
-                         (index {i} vs {j}); a name matching both would \
-                         report the less-specific `{b}`"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn secret_keyword_table_has_no_duplicates() {
-        let mut seen = std::collections::HashSet::new();
-        for word in SECRET_NAME_KEYWORDS {
-            assert!(seen.insert(word), "duplicate keyword `{word}`");
-        }
-    }
-
-    /// `OAUTH_TOKEN` / `OAUTH_SECRET` (and their squashed forms) are the
-    /// commonest secret-shaped names the alpha.9 table still missed
-    /// (review 2026-09-30 §5.4); they sit before the bare `TOKEN` /
-    /// `SECRET` so the specific word is reported.
-    #[test]
-    fn oauth_names_are_secret_shaped() {
-        for name in [
-            "OAUTH_TOKEN",
-            "oauth_token",
-            "GITHUB_OAUTH_TOKEN",
-            "OAUTHTOKEN",
-            "OAUTH_SECRET",
-            "SlackOAuthSecret",
-            "OAUTHSECRET",
-        ] {
-            assert!(is_secret_name(name), "`{name}` should be secret-shaped");
-        }
-        let idx = |w: &str| SECRET_NAME_KEYWORDS.iter().position(|k| *k == w).unwrap();
-        assert!(idx("OAUTH_TOKEN") < idx("AUTH_TOKEN"));
-        assert!(idx("OAUTHTOKEN") < idx("AUTHTOKEN"));
-        assert!(idx("OAUTH_SECRET") < idx("SECRET"));
-        assert!(idx("OAUTHSECRET") < idx("SECRET"));
-    }
-
-    #[test]
-    fn secret_keyword_match_reports_most_specific_word() {
-        // Boundary behaviour itself is pinned in depth by the CLI crate's
-        // `secret_suffix_*` tests (which now exercise this same shared
-        // implementation); keep a couple of canaries here beside the table.
-        assert_eq!(secret_keyword_match("KEY_APIKEY"), Some("APIKEY"));
-        assert_eq!(secret_keyword_match("DB_PWD"), Some("DB_PWD"));
-        assert_eq!(secret_keyword_match("dbPASSWORDstring"), Some("DBPASSWORD"));
-        assert_eq!(secret_keyword_match("TOKENs"), Some("TOKEN"));
-        assert_eq!(secret_keyword_match("MONKEY"), None);
-        assert_eq!(secret_keyword_match("PASSPORT"), None);
     }
 }

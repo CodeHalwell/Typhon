@@ -256,7 +256,15 @@ The round trip has three moving parts worth knowing. `tyc profile` only *produce
 
 **Off by default.** When `true`, this knob silences the `tyc::contains_secret_literal` diagnostic.
 
-That diagnostic flags hardcoded credentials (like `let API_KEY = "test"`) or sensitive environmental variables mapped using `comptime let API_KEY = env("API_KEY")`. While `comptime` substitution is useful, mapping secrets at build time embeds the literal secret directly into the compiled `.py` output, exposing it to anyone who can read the build artifacts.
+That diagnostic flags hardcoded credentials (like `let API_KEY = "sk-live-…"`) and secrets mapped at build time with `comptime let API_KEY: str = env("API_KEY")`. While `comptime` substitution is useful, mapping secrets at build time embeds the literal secret directly into the compiled `.py` output, exposing it to anyone who can read the build artifacts.
+
+It fires when the binding name — or, for a `comptime let`, the key of any `env("…")` it reads — names a credential, and the value is a string that could be one:
+
+- **Clear credential names** (`API_KEY`, `DB_PASSWORD`, `GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`, `SECRET_KEY_BASE`) warn on any string except a placeholder (`""`, `"xxxx"`, `"<your token>"`, `"${TOKEN}"`).
+- **Ambiguous names** (`KEY`, `STRIPE_KEY`, `PWD`, `DATABASE_DSN`, `SESSION_COOKIE`) warn only on a credential-shaped value: a known token prefix (`ghp_`, `sk-`, `AKIA`, `xoxb-`, …), a PEM private key, a URL with an embedded password, or a long high-entropy run of letters and digits.
+- **Descriptive names** never warn: a metadata word after the credential word (`TOKEN_LIMIT`, `PASSWORD_MIN_LENGTH`, `CREDENTIALS_PATH`, `AUTHORIZATION_URL`, `API_KEY_HEADER`, `AWS_ACCESS_KEY_ID`), a counting word (`MAX_TOKENS`), or a non-secret qualifier (`PRIMARY_KEY`, `SORT_KEY`, `PUBLIC_KEY`). Nor does a non-string value (`comptime let TOKEN_LIMIT: int = …`).
+
+So `comptime let DEPLOY_CFG: str = env("AWS_SECRET_ACCESS_KEY")` warns even though `DEPLOY_CFG` is not secret-shaped.
 
 Setting this to `true` disables the warning, which is useful when the literal is intentionally public or part of a test suite, allowing you to document and silence expected findings.
 

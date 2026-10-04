@@ -786,30 +786,18 @@ pub fn run(args: BuildArgs) -> Result<()> {
             &prep.comptime_functions,
         );
 
-        // Phase 5.6 secret-literal lint: flag any comptime binding whose
-        // name looks like a credential (KEY / TOKEN / PASSWORD / SECRET /
-        // PASS / PWD, case-insensitive). The substituted value lands in
-        // the emitted Python as a raw string literal — committing such
-        // build output to a repository leaks the secret.
-        //
-        // Suppression knob: a `[strictness] allow-secret-comptime = true`
-        // toggle in `typhon.toml` should silence this warning.
-        // It is checked using `!config.strictness.allow_secret_comptime` below.
+        // Phase 5.6 secret-literal lint: a `comptime let` whose string value
+        // reads `env("…")` lands in the emitted Python as a raw literal, so
+        // committing the build output leaks it. Fires when the binding name
+        // or an env key it reads names a credential, weighted by the value
+        // (the shared `tyc_analyse::secrets` heuristics — the same ones the
+        // plain-literal lint uses). Silenced by `[strictness]
+        // allow-secret-comptime = true`.
         if !config.strictness.allow_secret_comptime {
-            for name in comptime_values.keys() {
-                if secret_suffix(name).is_none() {
-                    continue;
-                }
-                // Only fire when the RHS actually pulls from `env(...)` — a
-                // hard-coded `comptime let API_KEY = "test"` isn't reading a
-                // secret, just labelling a literal. Pull the actual env-var
-                // key out of the source so the help text points at the right
-                // identifier (the binding name and the env key often differ:
-                // `comptime let API_KEY = env("MY_SERVICE_API_KEY")`).
-                if let Some(env_key) = find_env_key_for_comptime_binding(source, name) {
-                    let warn = TycError::contains_secret_literal(name.clone(), env_key);
-                    eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn)));
-                }
+            for (name, env_key) in tyc_analyse::comptime_secret_bindings(&module, &comptime_values)
+            {
+                let warn = TycError::contains_secret_literal(name, env_key);
+                eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn)));
             }
         }
 
@@ -2148,18 +2136,6 @@ fn display_relative(path: &std::path::Path, project_root: &std::path::Path) -> S
         .unwrap_or_else(|_| path.to_string_lossy().into_owned())
 }
 
-/// Return `Some(suffix)` if `name` looks like a credential identifier.
-/// Used by the secret-comptime lint. Delegates to the single shared
-/// word-boundary matcher in `tyc-analyse` (which also backs the
-/// `tyc::contains_secret_literal` lint), so the two consumers can no
-/// longer drift — the boundary logic used to be a hand-synchronised
-/// copy of that function, the same drift class that produced the
-/// alpha.4 `KEY_APIKEY` ordering bug. The `secret_suffix_*` tests below
-/// pin the shared behaviour from this call site.
-fn secret_suffix(name: &str) -> Option<&'static str> {
-    tyc_analyse::secret_keyword_match(name)
-}
-
 /// Scan `source` for `from .NAME import …` lines and return
 /// `(NAME, snippet)` pairs. Single-dot relative imports only — this
 /// lint targets sibling-file imports, not parent-package `from ..pkg
@@ -2267,51 +2243,6 @@ pub(crate) fn scan_overdeep_relative_imports(
         line_start += line_len;
     }
     out
-}
-
-/// Find the env-var key in a `comptime let NAME ... = env("KEY"...)`
-/// declaration by scanning `source` for the binding's line. Returns the
-/// first quoted string immediately following `env(` on a line that mentions
-/// `NAME`. Returns `None` when the binding's RHS doesn't use `env(...)` —
-/// e.g. `comptime let X = 42`, where the secret lint shouldn't fire.
-fn find_env_key_for_comptime_binding(source: &str, binding_name: &str) -> Option<String> {
-    let needle = "comptime ";
-    for line in source.lines() {
-        let trimmed = line.trim_start();
-        if !trimmed.starts_with(needle) {
-            continue;
-        }
-        // Match either `comptime let NAME` or `comptime mut NAME` or
-        // bare `comptime NAME` (legacy). Cheaply check the binding name
-        // appears before the `=`.
-        let lhs = trimmed.split('=').next().unwrap_or("");
-        let lhs_has_name = lhs.split_whitespace().any(|tok| {
-            tok.trim_end_matches(':')
-                .trim_end_matches(',')
-                .eq(binding_name)
-        });
-        if !lhs_has_name {
-            continue;
-        }
-        // Locate the first `env(` after the `=` and lift the first quoted
-        // string out of its argument list.
-        let after_eq = match trimmed.split_once('=') {
-            Some((_, r)) => r,
-            None => continue,
-        };
-        let env_idx = after_eq.find("env(")?;
-        let after_open = &after_eq[env_idx + "env(".len()..];
-        // Strip optional whitespace and grab the leading `"..."` or `'...'`.
-        let after_ws = after_open.trim_start();
-        let quote = after_ws.chars().next()?;
-        if quote != '"' && quote != '\'' {
-            return None;
-        }
-        let rest = &after_ws[1..];
-        let end = rest.find(quote)?;
-        return Some(rest[..end].to_owned());
-    }
-    None
 }
 
 /// Byte offset of the start of the 0-based `line_idx` line in `source`.
@@ -6277,90 +6208,6 @@ let pet: Animal = Dog(name=\"Rex\")
     }
 
     // ── Pure helpers ───────────────────────────────────────────────────────
-
-    #[test]
-    fn secret_suffix_matches_credential_names() {
-        assert_eq!(secret_suffix("API_KEY"), Some("API_KEY"));
-        assert_eq!(secret_suffix("MyToken"), Some("TOKEN"));
-        assert_eq!(secret_suffix("myTokenValue"), Some("TOKEN"));
-        assert_eq!(secret_suffix("DB_PASSWORD"), Some("DB_PASSWORD"));
-        assert_eq!(secret_suffix("client_secret"), Some("CLIENT_SECRET"));
-        assert_eq!(secret_suffix("PWD"), Some("PWD"));
-        assert_eq!(secret_suffix("API_KEY_FOO"), Some("API_KEY"));
-        assert_eq!(secret_suffix("FOO_API_KEY_BAR"), Some("API_KEY"));
-        assert_eq!(secret_suffix("KEY_APIKEY"), Some("APIKEY"));
-        assert_eq!(secret_suffix("APIKEY"), Some("APIKEY"));
-        assert_eq!(secret_suffix("APITOKEN"), Some("APITOKEN"));
-        assert_eq!(secret_suffix("APISECRET"), Some("APISECRET"));
-        assert_eq!(secret_suffix("API_TOKEN"), Some("API_TOKEN"));
-        assert_eq!(secret_suffix("TOKEN123"), Some("TOKEN"));
-        assert_eq!(secret_suffix("123TOKEN"), Some("TOKEN"));
-        assert_eq!(secret_suffix("my123TOKEN"), Some("TOKEN"));
-        assert_eq!(secret_suffix("TOKENString"), Some("TOKEN"));
-        assert_eq!(secret_suffix("dbPASSWORDString"), Some("DBPASSWORD"));
-        // `PRIVKEY` is reported as itself, not as the bare `KEY` it contains.
-        assert_eq!(secret_suffix("PRIVKEY"), Some("PRIVKEY"));
-        assert_eq!(secret_suffix("SSH_PRIVKEY"), Some("PRIVKEY"));
-        assert_eq!(secret_suffix("PRIVKEY_PEM"), Some("PRIVKEY"));
-
-        // New high-risk keywords consolidated from the Sentinel PR batch.
-        assert_eq!(secret_suffix("DATABASE_DSN"), Some("DSN"));
-        assert_eq!(secret_suffix("SESSION_COOKIE"), Some("COOKIE"));
-        assert_eq!(secret_suffix("SLACK_WEBHOOK_URL"), Some("WEBHOOK"));
-        assert_eq!(secret_suffix("AUTHORIZATION_BEARER"), Some("AUTHORIZATION"));
-        assert_eq!(secret_suffix("MY_CREDENTIALS"), Some("CREDENTIALS"));
-        assert_eq!(secret_suffix("AWS_CREDENTIAL"), Some("CREDENTIAL"));
-        assert_eq!(secret_suffix("SIGNING_CERT"), Some("SIGNING"));
-        assert_eq!(
-            secret_suffix("PERSONAL_ACCESS_TOKEN"),
-            Some("PERSONAL_ACCESS_TOKEN")
-        );
-        assert_eq!(
-            secret_suffix("PERSONALACCESSTOKEN"),
-            Some("PERSONALACCESSTOKEN")
-        );
-        assert_eq!(secret_suffix("OAUTH_TOKEN"), Some("OAUTH_TOKEN"));
-        assert_eq!(secret_suffix("OAUTHTOKEN"), Some("OAUTHTOKEN"));
-        assert_eq!(secret_suffix("GITHUB_TOKEN"), Some("GITHUB_TOKEN"));
-        assert_eq!(secret_suffix("GITHUBTOKEN"), Some("GITHUBTOKEN"));
-        assert_eq!(secret_suffix("GH_TOKEN"), Some("GH_TOKEN"));
-        assert_eq!(secret_suffix("GHTOKEN"), Some("GHTOKEN"));
-        assert_eq!(secret_suffix("ACCESS_TOKEN"), Some("ACCESS_TOKEN"));
-        assert_eq!(secret_suffix("AUTH_TOKEN"), Some("AUTH_TOKEN"));
-        assert_eq!(secret_suffix("BEARER_TOKEN"), Some("BEARER_TOKEN"));
-        assert_eq!(secret_suffix("CSRF_TOKEN"), Some("CSRF_TOKEN"));
-        assert_eq!(secret_suffix("JWT_TOKEN"), Some("JWT_TOKEN"));
-        assert_eq!(secret_suffix("PRIVATE_KEY"), Some("PRIVATE_KEY"));
-        assert_eq!(secret_suffix("PUBLIC_KEY"), Some("PUBLIC_KEY"));
-        assert_eq!(secret_suffix("APPSECRET"), Some("APPSECRET"));
-        assert_eq!(secret_suffix("ACCESSTOKEN"), Some("ACCESSTOKEN"));
-        assert_eq!(secret_suffix("SECRETKEY"), Some("SECRETKEY"));
-        assert_eq!(secret_suffix("SSH_KEY"), Some("SSH_KEY"));
-        assert_eq!(secret_suffix("JWTSECRET"), Some("JWTSECRET"));
-        assert_eq!(secret_suffix("AUTHTOKEN"), Some("AUTHTOKEN"));
-        assert_eq!(secret_suffix("APP_KEY"), Some("APP_KEY"));
-        assert_eq!(secret_suffix("APPKEY"), Some("APPKEY"));
-        assert_eq!(secret_suffix("DBPASSWORD"), Some("DBPASSWORD"));
-        assert_eq!(secret_suffix("DBSECRET"), Some("DBSECRET"));
-        assert_eq!(secret_suffix("DBPASS"), Some("DBPASS"));
-        assert_eq!(secret_suffix("DBPWD"), Some("DBPWD"));
-        assert_eq!(secret_suffix("DB_PASS"), Some("DB_PASS"));
-        // Regression: with an underscore, `PWD` is a validly-bounded match
-        // inside `DB_PWD` too, so `DB_PWD` must precede the bare `PWD` or
-        // the loop reports the less-specific suffix first (P2 review catch
-        // on the PR that introduced this table entry).
-        assert_eq!(secret_suffix("DB_PWD"), Some("DB_PWD"));
-        assert_eq!(secret_suffix("JWTTOKEN"), Some("JWTTOKEN"));
-    }
-
-    #[test]
-    fn secret_suffix_ignores_unrelated_names() {
-        assert_eq!(secret_suffix("PORT"), None);
-        assert_eq!(secret_suffix("MAX_RETRIES"), None);
-        assert_eq!(secret_suffix("USER"), None);
-        assert_eq!(secret_suffix("MONKEY"), None);
-        assert_eq!(secret_suffix("PASSPORT"), None);
-    }
 
     #[test]
     fn scan_relative_py_imports_picks_up_sibling_imports() {
