@@ -614,31 +614,56 @@ aliases, never the runtime. Every call and every read it inspects lands in one o
   `yield`, or a call to a same-module helper that is not itself `@pure`. These are what
   `tyc::impure_pure_fn` reports.
 - **Provably pure** — arithmetic and comparisons, pure builtins (including the container
-  constructors), constructors of same-module classes, calls into a fixed stdlib allow-list
-  (`math`, `cmath`, `operator`, `itertools`, `functools`, `string`, `re`, `json`, `statistics`,
-  `fractions`, `decimal`, `numbers`, `typing`, `enum`, `textwrap`, `unicodedata`, `base64`,
-  `binascii`, `struct`, `bisect`, `heapq`, `copy`, `dataclasses`, `abc`, `collections`,
-  `datetime` constructors, `zoneinfo`, `hashlib`, `hmac`, `difflib`, `ipaddress`, `pathlib`
-  constructors, `urllib.parse`, `html`, `keyword`, `codecs`, `array`, `types`, and the pure
-  string operations of `os.path`), non-mutating methods of a receiver whose builtin type is
-  evident (a literal, a display, a builtin constructor call, an annotated parameter or local, a
-  `let X: str` module constant), mutating methods on a *fresh* local (`out: list[int] = []` then
-  `out.append(...)`), reads of immutable module constants, and calls to other `@pure` helpers.
+  constructors), constructors of same-module classes that run no code of their own (no
+  hand-written `__init__` / `__post_init__` / `__new__` / `__setattr__`, in the class or an `impl`
+  block; no foreign base such as `BaseModel`; no metaclass; no impure `default_factory`), calls
+  into a fixed stdlib allow-list (`math`, `cmath`, `operator`, `itertools`, `functools`, `string`,
+  `re`, `json`, `statistics`, `fractions`, `numbers`, `typing`, `enum`, `textwrap`,
+  `unicodedata`, `base64`, `binascii`, `struct`, `bisect`, `heapq`, `copy`, `dataclasses`, `abc`,
+  `collections`, `datetime` constructors, `zoneinfo`, `hashlib`, `hmac`, `difflib`, `ipaddress`,
+  `pathlib` path construction and the pure-path API, `urllib.parse`, `html`, `keyword`, `codecs`,
+  `array`, `types`, and the pure string operations of `os.path`), non-mutating methods of a
+  receiver whose builtin type is evident (a literal, a display, a builtin constructor call, an
+  annotated parameter or local, a `let X: str` module constant), mutating methods on a *fresh*
+  local (`out: list[int] = []` then `out.append(...)`, or `heapq.heappush(out, x)`), reads of
+  immutable module constants and enum members, and calls to other `@pure` helpers that are
+  themselves provably pure.
 - **Not provably pure** — everything else: a method on a value of unknown type (`p.length()`), a
-  call into a module outside the allow-list (`np.sqrt(x)`, `mylib.helper(x)`), a read of a module
-  `let` whose value could be mutated in place (`TABLE: dict[str, int]`), a `with` block, a
-  computed callee. An explicit `@pure` **trusts the author** here — no diagnostic — but the
-  silent optimisations never act on such a function.
+  call into a module outside the allow-list (`np.sqrt(x)`, `mylib.helper(x)`, anything in
+  `decimal`, whose every operation reads the thread's current context), a filesystem query
+  (`Path.cwd()`, `Path.exists(p)`), a stdlib function that mutates a non-fresh first argument
+  (`heapq.heappush(QUEUE, x)`, `bisect.insort`, `operator.setitem`), a read of a module `let`
+  whose value could be mutated in place (`TABLE: dict[str, int]`), a read of a class attribute
+  (`Config.DEBUG` can be rebound at runtime), a constructor that runs code, a `with` block, a
+  nested `def` / `class`, a function-local import, a computed callee, whatever an `assert`
+  evaluates, a call to a `@pure` helper whose own check was inconclusive, and recursion (direct
+  or mutual). An explicit `@pure` **trusts the author** here — no diagnostic — but the silent
+  optimisations never act on such a function.
 
-The silent paths (`auto-memoise`, `pgo-memoise`, and the callee set of `auto-parallel`) require
-the function to be *provably* pure. `auto-memoise` and `pgo-memoise` additionally require a
-cache-safe signature: every parameter annotated with an immutable, hashable type and an immutable
-return type — scalars, `str` / `bytes`, `tuple[...]` / `frozenset[...]` of such, `Result` /
-`Ok` / `Err` of such, `Literal`, enums, `NamedTuple`s, `frozen` classes, `@dataclass(frozen=True)`
-classes. A function returning `list[int]`, an `Iterator`, or an ordinary (mutable) class is never
-auto-cached, because `functools.cache` would hand every caller the same object. An explicit
-`@memo` keeps its contract: it is honoured whenever nothing provably impure is found, whatever the
-return type — the author asked for the shared object.
+The silent paths (`auto-memoise`, `pgo-memoise`, `-O`, and the callee set of `auto-parallel`)
+require the function to be *provably* pure. A plain `@pure` under `auto-memoise` / `-O` is held to
+the same bar — `@pure` is a purity claim, not a cacheability claim. `auto-memoise` and
+`pgo-memoise` additionally require a cache-safe signature:
+
+- the return type is **deeply** immutable — scalars, `str` / `bytes`, `Decimal`, `datetime`
+  values, paths, `tuple[...]` / `frozenset[...]` of such, `Result` / `Ok` / `Err` of such,
+  `Literal`, enums, and `NamedTuple`s / `frozen` classes / `@dataclass(frozen=True)` classes
+  whose every field is itself deeply immutable (a `frozen` class with a `list` field is not);
+- every parameter is a **sound cache key**: two arguments that compare equal must be
+  indistinguishable to the function. `int`, `str`, `bytes`, `bool`, `None`, `Literal`, enums and
+  their unions qualify at the top level; `float` does not (`0.0 == -0.0`, yet `repr` tells them
+  apart), nor do `Decimal`, `datetime`, paths, callables or mutable classes. Inside a `tuple` /
+  `frozenset` / frozen-class field only `bool`, `None`, enums and other key-safe `frozen` classes
+  qualify, since `(True,) == (1,)`.
+
+Type names are resolved before they are trusted: a user class called `Path`, `Flag`, `Decimal`
+or `date` is not the stdlib type. A function returning `list[int]`, an `Iterator`, a `Callable`
+or an ordinary (mutable) class is never auto-cached, because a cache would hand every caller the
+same object. A silent path emits `@functools.lru_cache(maxsize=1024, typed=True)`: typed so `1`,
+`1.0` and `True` never share an entry, bounded so the cache cannot retain every argument it ever
+saw. An explicit `@memo` keeps its contract: it is honoured whenever nothing provably impure is
+found, whatever the signature, and emits `@functools.cache` — the author asked for the shared
+object.
 
 ## Compile-time evaluation (`comptime`)
 

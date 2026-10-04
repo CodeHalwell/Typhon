@@ -47,9 +47,15 @@ pub struct DesugarOutput {
 #[derive(Debug, Clone)]
 pub struct DesugarOptions {
     /// Names of top-level functions to wrap in `@functools.cache`. Populated
-    /// from the purity analyser when the user opts into `@memo` /
-    /// `@pure(memo=True)` / `[strictness] auto-memoise = true`.
+    /// from the purity analyser for an explicit `@memo` /
+    /// `@pure(memo=True)`.
     pub memoise_functions: Vec<String>,
+    /// Names of top-level functions a *silent* optimisation (`auto-memoise`,
+    /// `pgo-memoise`, `-O`) caches: wrapped in
+    /// `@functools.lru_cache(maxsize=AUTO_MEMOISE_MAXSIZE, typed=True)`, so
+    /// equal-but-differently-typed arguments (`1.0` / `True`) never share an
+    /// entry and the cache cannot retain every argument it ever saw.
+    pub auto_memoise_functions: Vec<String>,
     /// Byte offsets (start of the line) at which a `class!` declaration
     /// appears in the *preprocessed* source.  A class whose `TextRange`
     /// starts at or just after one of these offsets is treated as raw and
@@ -123,6 +129,7 @@ impl Default for DesugarOptions {
     fn default() -> Self {
         Self {
             memoise_functions: Vec::new(),
+            auto_memoise_functions: Vec::new(),
             raw_class_line_starts: Vec::new(),
             frozen_class_line_starts: Vec::new(),
             plain_class_line_starts: Vec::new(),
@@ -1841,8 +1848,11 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
     // Inject `@functools.cache` on every top-level function name the purity
     // analyser flagged as opted-into memoisation.  Returns whether any cache
     // decorator was added so we can also inject `import functools` once.
-    let (with_caches, added_cache) =
-        inject_memoise_decorators(merged_body, &options.memoise_functions);
+    let (with_caches, added_cache) = inject_memoise_decorators(
+        merged_body,
+        &options.memoise_functions,
+        &options.auto_memoise_functions,
+    );
 
     let needs_dataclasses = transformed_classes && !has_dataclasses_import(&m.body);
     let needs_functools = added_cache && !has_functools_import(&with_caches);
@@ -1905,7 +1915,11 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
 /// `def f`). Stripping of `@pure` / `@memo` markers, by contrast, recurses
 /// everywhere — otherwise those Typhon-only names would leak into the
 /// emitted Python and raise `NameError` at import time.
-fn inject_memoise_decorators(body: Vec<Stmt>, memoise: &[String]) -> (Vec<Stmt>, bool) {
+fn inject_memoise_decorators(
+    body: Vec<Stmt>,
+    memoise: &[String],
+    auto_memoise: &[String],
+) -> (Vec<Stmt>, bool) {
     let mut added = false;
     // Names this module binds for itself — a user or third-party `pure` /
     // `memo` / `gatherable` is not Typhon's marker and must survive.
@@ -1916,12 +1930,16 @@ fn inject_memoise_decorators(body: Vec<Stmt>, memoise: &[String]) -> (Vec<Stmt>,
             Stmt::FunctionDef(mut f) => {
                 f.decorator_list = strip_purity_decorators_with(f.decorator_list, &shadowed);
                 f.body = strip_purity_decorators_in_body_with(f.body, &shadowed);
-                if memoise.iter().any(|n| n == f.name.as_str())
-                    && !has_cache_decorator(&f.decorator_list)
-                {
-                    f.decorator_list
-                        .insert(0, make_functools_dot_cache_decorator());
-                    added = true;
+                if !has_cache_decorator(&f.decorator_list) {
+                    if memoise.iter().any(|n| n == f.name.as_str()) {
+                        f.decorator_list
+                            .insert(0, make_functools_dot_cache_decorator());
+                        added = true;
+                    } else if auto_memoise.iter().any(|n| n == f.name.as_str()) {
+                        f.decorator_list
+                            .insert(0, make_bounded_typed_lru_cache_decorator());
+                        added = true;
+                    }
                 }
                 Stmt::FunctionDef(f)
             }
@@ -2150,6 +2168,60 @@ fn make_functools_dot_cache_decorator() -> Decorator {
         range: TextRange::default(),
         node_index: AtomicNodeIndex::NONE,
         expression: expr,
+    }
+}
+
+/// Entry bound of the cache a silent memoisation path (`auto-memoise`,
+/// `pgo-memoise`, `-O`) emits.
+pub const AUTO_MEMOISE_MAXSIZE: usize = 1024;
+
+/// Build `@functools.lru_cache(maxsize=AUTO_MEMOISE_MAXSIZE, typed=True)`.
+fn make_bounded_typed_lru_cache_decorator() -> Decorator {
+    let func = Expr::Attribute(ExprAttribute {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        value: Box::new(Expr::Name(ExprName {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            id: Name::new("functools"),
+            ctx: ExprContext::Load,
+        })),
+        attr: make_identifier("lru_cache"),
+        ctx: ExprContext::Load,
+    });
+    let keyword = |name: &str, value: Expr| ruff_python_ast::Keyword {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        arg: Some(make_identifier(name)),
+        value,
+    };
+    let maxsize = Expr::NumberLiteral(ruff_python_ast::ExprNumberLiteral {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        value: ruff_python_ast::Number::Int(ruff_python_ast::Int::from(
+            AUTO_MEMOISE_MAXSIZE as u64,
+        )),
+    });
+    let typed = Expr::BooleanLiteral(ruff_python_ast::ExprBooleanLiteral {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        value: true,
+    });
+    let call = Expr::Call(ExprCall {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        func: Box::new(func),
+        arguments: ruff_python_ast::Arguments {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            args: Box::new([]),
+            keywords: Box::new([keyword("maxsize", maxsize), keyword("typed", typed)]),
+        },
+    });
+    Decorator {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        expression: call,
     }
 }
 
@@ -5346,6 +5418,32 @@ class Grand(Child):
             !out.contains("default_factory"),
             "no default_factory rewrite for a ClassVar field; got:\n{out}"
         );
+    }
+
+    /// W3-05: a silent memoisation path emits a bounded, typed cache — an
+    /// untyped `functools.cache` answered `show(True)` with the result for
+    /// `show(1.0)`. An explicit `@memo` keeps `functools.cache`.
+    #[test]
+    fn auto_memoised_functions_get_a_bounded_typed_lru_cache() {
+        let src = "def show(x: int) -> str:\n    return repr(x)\n\ndef fib(n: int) -> int:\n    return n\n";
+        let module = tyc_syntax::parse_module(src)
+            .expect("parse failed")
+            .into_syntax();
+        let out = desugar_module_with(
+            &module,
+            DesugarOptions {
+                memoise_functions: vec!["fib".to_owned()],
+                auto_memoise_functions: vec!["show".to_owned()],
+                ..Default::default()
+            },
+        );
+        let emitted = tyc_emit::emit(&out.module);
+        assert!(
+            emitted.contains("@functools.lru_cache(maxsize=1024, typed=True)\ndef show("),
+            "{emitted}"
+        );
+        assert!(emitted.contains("@functools.cache\ndef fib("), "{emitted}");
+        assert!(emitted.contains("import functools"), "{emitted}");
     }
 
     #[test]

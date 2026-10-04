@@ -3134,6 +3134,20 @@ comptime let P: tuple[int, int] = pair(1, 2)
 
 // ── Purity analysis ───────────────────────────────────────────────────────────
 
+/// Which cache decorator the desugarer puts on a memoised function (see
+/// [`PurityFinding::cache_decision`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheKind {
+    /// An explicit `@memo` / `@pure(memo=True)`: `@functools.cache`.
+    Explicit,
+    /// A silent optimisation (`auto-memoise`, `pgo-memoise`, `-O`): a
+    /// bounded, typed `@functools.lru_cache` (`tyc_desugar`'s
+    /// `AUTO_MEMOISE_MAXSIZE`) — typed so `1`, `1.0` and `True` never share
+    /// an entry, and bounded so a cache keyed on, say, every document a
+    /// process renders cannot retain them all for the life of the process.
+    Auto,
+}
+
 /// Outcome of [`analyse_purity`] for one function.
 #[derive(Debug, Clone)]
 pub struct PurityFinding {
@@ -3145,6 +3159,13 @@ pub struct PurityFinding {
     /// `true` if the user opted into memoisation alongside the purity check
     /// (`@memo`, `@pure(memo=True)`, or the project-wide auto-memoise toggle).
     pub memoise: bool,
+    /// `true` only for an explicit `@memo` / `@pure(memo=True)`: the author
+    /// asked for this function to be cached. `memoise` alone may come from
+    /// `auto-memoise` / `-O`, where caching is a silent optimisation that
+    /// must not change what the program prints — so a plain `@pure` (a
+    /// purity claim, not a cacheability claim) under `-O` is held to the
+    /// same cache-safety proof as any inferred candidate.
+    pub explicit_memo: bool,
     /// Empty when nothing in the body is *provably* impure; otherwise the
     /// first proven violation — I/O, a clock or entropy read, `raise`, a
     /// mutation of module state or of an argument, a read of `mut` module
@@ -3191,6 +3212,25 @@ impl PurityFinding {
             && self.uncacheable_params.is_none()
     }
 
+    /// How (and whether) the desugarer should cache this function:
+    ///
+    /// - an explicit `@memo` / `@pure(memo=True)` is honoured once nothing
+    ///   provably impure was found ([`CacheKind::Explicit`], an unbounded
+    ///   `functools.cache`, as documented);
+    /// - any other memoise request — `auto-memoise`, `-O`, or a plain
+    ///   `@pure` under either — needs the full silent-path proof of
+    ///   [`Self::auto_cacheable`] ([`CacheKind::Auto`], a bounded, typed
+    ///   `functools.lru_cache`).
+    pub fn cache_decision(&self) -> Option<CacheKind> {
+        if self.explicit_memo {
+            self.violation.is_none().then_some(CacheKind::Explicit)
+        } else if self.memoise && self.auto_cacheable() {
+            Some(CacheKind::Auto)
+        } else {
+            None
+        }
+    }
+
     /// `true` when the optimiser may treat *calls* to the function as
     /// side-effect-free (the `auto-parallel` callee set). An explicit
     /// `@pure` / `@memo` is trusted once nothing provably impure is found;
@@ -3232,15 +3272,110 @@ pub fn analyse_purity_with(
     // names (pure constructors) and which of them are immutable, the
     // user-defined functions and whether each is declared pure, and the
     // import aliases so a callee can be resolved to its module path.
-    let scope = ModuleScope::collect(&module.body, auto_memoise, frozen_classes);
-    analyse_stmts(
+    let scope = ModuleScope::collect(&module.body, frozen_classes);
+    let callees = analyse_stmts(
         &module.body,
         &scope,
         auto_memoise,
         &mut out,
         /*async_context=*/ false,
     );
+    propagate_transitive_purity(&mut out, &callees);
     out
+}
+
+/// A function is only *provably* pure when every module function it calls
+/// (or passes around as a value) is provably pure too, and it is not
+/// recursive. The per-function walk trusts a `@pure` callee's declaration;
+/// this pass withdraws the proof — as `unproven`, never as a violation, so
+/// no diagnostic changes — from any function whose callee's own check was
+/// inconclusive, and from every function on a call cycle: a cache wrapper
+/// adds C-stack depth to each recursive frame, so recursion that runs fine
+/// uncached can raise `RecursionError` once cached.
+fn propagate_transitive_purity(findings: &mut [PurityFinding], callees: &[HashSet<String>]) {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum State {
+        Visiting,
+        Done(bool),
+    }
+    let index: HashMap<String, usize> = findings
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.name.clone(), i))
+        .collect();
+    let mut state: Vec<Option<State>> = vec![None; findings.len()];
+    // Per-function reason when the transitive proof fails.
+    let mut reasons: Vec<Option<String>> = vec![None; findings.len()];
+
+    fn visit(
+        i: usize,
+        findings: &[PurityFinding],
+        callees: &[HashSet<String>],
+        index: &HashMap<String, usize>,
+        state: &mut Vec<Option<State>>,
+        reasons: &mut Vec<Option<String>>,
+    ) -> bool {
+        match state[i] {
+            Some(State::Done(ok)) => return ok,
+            Some(State::Visiting) => return false,
+            None => {}
+        }
+        state[i] = Some(State::Visiting);
+        let mut ok = findings[i].is_provably_pure();
+        if ok {
+            let mut deps: Vec<&String> = callees[i].iter().collect();
+            deps.sort();
+            for dep in deps {
+                let Some(&j) = index.get(dep) else {
+                    // Not analysed (not declared pure): the walk has already
+                    // reported the call itself.
+                    continue;
+                };
+                let dep_ok = if state[j] == Some(State::Visiting) {
+                    reasons[i] = Some(if j == i {
+                        format!(
+                            "`{}` is recursive — a cache wrapper adds stack depth to every \
+                             recursive frame, so the analyser never caches it silently",
+                            findings[i].name
+                        )
+                    } else {
+                        format!(
+                            "`{}` is mutually recursive with `{dep}` — a cache wrapper adds \
+                             stack depth to every recursive frame",
+                            findings[i].name
+                        )
+                    });
+                    false
+                } else {
+                    let r = visit(j, findings, callees, index, state, reasons);
+                    if !r && reasons[i].is_none() {
+                        reasons[i] = Some(format!(
+                            "calls `{dep}`, which is not provably pure or cache-safe to inline \
+                             into a cached result"
+                        ));
+                    }
+                    r
+                };
+                if !dep_ok {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        state[i] = Some(State::Done(ok));
+        ok
+    }
+
+    for i in 0..findings.len() {
+        visit(i, findings, callees, &index, &mut state, &mut reasons);
+    }
+    for (i, f) in findings.iter_mut().enumerate() {
+        if f.is_provably_pure() && state[i] == Some(State::Done(false)) {
+            f.unproven = reasons[i]
+                .take()
+                .or_else(|| Some("depends on a function that is not provably pure".to_owned()));
+        }
+    }
 }
 
 /// Names of the classes whose `class` keyword sits on one of the marker
@@ -3303,9 +3438,29 @@ struct ModuleScope {
     /// pure callables (the default `@dataclass(slots=True)` emission has
     /// no side effects).
     class_names: Vec<String>,
-    /// Module-level classes whose instances are immutable and hashable:
-    /// `frozen` classes, enums, `NamedTuple`s, `@dataclass(frozen=True)`.
+    /// Module-level classes whose instances are *deeply* immutable: enums,
+    /// and `frozen` classes / `NamedTuple`s / `@dataclass(frozen=True)`
+    /// whose every field is itself deeply immutable (a `frozen` class with
+    /// a `list` field hands every caller of a cached function the same
+    /// list).
     immutable_classes: HashSet<String>,
+    /// Module-level enum classes (members are singletons and cannot be
+    /// reassigned).
+    enum_classes: HashSet<String>,
+    /// Module-level `frozen` dataclasses whose instances are sound cache
+    /// keys: no custom `__eq__` / `__hash__`, and every field a value whose
+    /// equality implies indistinguishability (see
+    /// [`ModuleScope::annotation_is_cache_key`]).
+    key_safe_classes: HashSet<String>,
+    /// Module-level classes whose construction provably runs no user code:
+    /// no hand-written `__init__` / `__post_init__` / `__new__` /
+    /// `__setattr__`, no foreign base, no metaclass, no impure default
+    /// factory.
+    pure_ctor_classes: HashSet<String>,
+    /// Every name bound at module top level (classes, functions,
+    /// assignments, imports), so a builtin type name the module shadows is
+    /// not trusted as the builtin.
+    top_level_bound: HashSet<String>,
     /// User-defined function name → whether the function is itself declared
     /// pure (`@pure` / `@memo` / `@pure(memo=True)` / auto-memoise). When
     /// a `@pure` function calls another module-defined function, the callee
@@ -3319,19 +3474,19 @@ struct ModuleScope {
 }
 
 impl ModuleScope {
-    fn collect(body: &[Stmt], auto_memoise: bool, frozen_classes: &HashSet<String>) -> Self {
+    fn collect(body: &[Stmt], frozen_classes: &HashSet<String>) -> Self {
         let mut s = Self::default();
         let shadowed_markers = user_bound_marker_names(body);
-        // Classes first: annotation immutability below needs to know them.
-        s.immutable_classes = frozen_classes.clone();
+        // Imports and top-level names first: resolving a type name in an
+        // annotation needs both. Then classes: annotation immutability
+        // below needs to know them.
+        s.collect_imports_and_names(body);
         for stmt in body {
             if let Stmt::ClassDef(c) = stmt {
                 s.class_names.push(c.name.as_str().to_owned());
-                if class_def_is_immutable(c) {
-                    s.immutable_classes.insert(c.name.as_str().to_owned());
-                }
             }
         }
+        s.classify_classes(body, frozen_classes);
         // Rebinding evidence anywhere in the module: `global NAME` inside a
         // function, a module-level `+=`, a second assignment, a loop target.
         let mut rebound: HashSet<String> = HashSet::new();
@@ -3413,7 +3568,7 @@ impl ModuleScope {
                         s.module_names.push(name.to_owned());
                         let state = if rebound.contains(name) {
                             ModuleState::Mutable
-                        } else if annotation_is_immutable(&a.annotation, &s.immutable_classes) {
+                        } else if s.annotation_is_constant(&a.annotation) {
                             ModuleState::Immutable
                         } else {
                             ModuleState::Opaque
@@ -3425,24 +3580,35 @@ impl ModuleScope {
                     }
                 }
                 Stmt::FunctionDef(f) => {
-                    let (declared, _) =
-                        decorator_intent(&f.decorator_list, auto_memoise, &shadowed_markers);
+                    let (declared, _) = decorator_intent(&f.decorator_list, &shadowed_markers);
                     s.user_functions
                         .insert(f.name.as_str().to_owned(), declared);
                 }
+                _ => {}
+            }
+        }
+        s
+    }
+
+    /// Fill `imports` and `top_level_bound`.
+    fn collect_imports_and_names(&mut self, body: &[Stmt]) {
+        for stmt in body {
+            match stmt {
                 Stmt::Import(i) => {
                     for alias in &i.names {
                         let full = alias.name.as_str();
                         match &alias.asname {
                             Some(asname) => {
-                                s.imports
+                                self.imports
                                     .insert(asname.as_str().to_owned(), full.to_owned());
+                                self.top_level_bound.insert(asname.as_str().to_owned());
                             }
                             None => {
                                 // `import a.b` binds `a`, which resolves to
                                 // the `a` package.
                                 let head = full.split('.').next().unwrap_or(full);
-                                s.imports.insert(head.to_owned(), head.to_owned());
+                                self.imports.insert(head.to_owned(), head.to_owned());
+                                self.top_level_bound.insert(head.to_owned());
                             }
                         }
                     }
@@ -3459,13 +3625,505 @@ impl ModuleScope {
                             continue;
                         }
                         let bound = alias.asname.as_ref().map(|a| a.as_str()).unwrap_or(name);
-                        s.imports.insert(bound.to_owned(), format!("{base}.{name}"));
+                        self.imports
+                            .insert(bound.to_owned(), format!("{base}.{name}"));
+                        self.top_level_bound.insert(bound.to_owned());
                     }
+                }
+                Stmt::ClassDef(c) => {
+                    self.top_level_bound.insert(c.name.as_str().to_owned());
+                }
+                Stmt::FunctionDef(f) => {
+                    self.top_level_bound.insert(f.name.as_str().to_owned());
+                }
+                Stmt::Assign(a) => {
+                    for t in &a.targets {
+                        self.top_level_bound.extend(bound_names_in_target(t));
+                    }
+                }
+                Stmt::AnnAssign(a) => {
+                    self.top_level_bound
+                        .extend(bound_names_in_target(&a.target));
                 }
                 _ => {}
             }
         }
-        s
+    }
+
+    /// What a type expression's head names: a builtin, a resolved stdlib /
+    /// third-party path, a module class, or nothing provable. A user class
+    /// called `Path`, `Flag`, `Decimal` or `date` is *not* the stdlib type.
+    fn type_ref(&self, head: &Expr) -> TypeRef {
+        match head {
+            Expr::Name(n) => {
+                let name = n.id.as_str();
+                if self.class_names.iter().any(|c| c == name) {
+                    return TypeRef::User(name.to_owned());
+                }
+                if let Some(full) = self.imports.get(name) {
+                    return TypeRef::Path(normalise_type_path(full));
+                }
+                if self.top_level_bound.contains(name) {
+                    return TypeRef::Unknown;
+                }
+                if is_builtin_type_name(name) {
+                    return TypeRef::Builtin(name.to_owned());
+                }
+                // Typing constructs and Typhon prelude names usable without
+                // an import.
+                match name {
+                    "Literal" | "LiteralString" | "Never" | "NoReturn" | "Optional" | "Union"
+                    | "Annotated" | "Final" | "ClassVar" | "Callable" | "Tuple" | "FrozenSet"
+                    | "Type" | "Generic" | "NamedTuple" | "Any" => {
+                        TypeRef::Path(format!("typing.{name}"))
+                    }
+                    "Result" | "Ok" | "Err" => TypeRef::Path(format!("typhon.{name}")),
+                    _ => TypeRef::Unknown,
+                }
+            }
+            Expr::Attribute(_) => {
+                let Some(raw) = dotted_path(head) else {
+                    return TypeRef::Unknown;
+                };
+                let root = raw.split('.').next().unwrap_or("");
+                if self.imports.contains_key(root) {
+                    return TypeRef::Path(normalise_type_path(&self.resolve_path(&raw)));
+                }
+                // The `enum NAME:` keyword lowers to `class NAME(enum.Enum)`
+                // before `import enum` is injected at emit time.
+                if root == "enum" && !self.top_level_bound.contains("enum") {
+                    return TypeRef::Path(raw);
+                }
+                TypeRef::Unknown
+            }
+            Expr::Subscript(sub) => self.type_ref(&sub.value),
+            Expr::StringLiteral(lit) => {
+                // A quoted forward reference to a module class.
+                let text = lit.value.to_str().trim();
+                if self.class_names.iter().any(|c| c == text) {
+                    TypeRef::User(text.to_owned())
+                } else {
+                    TypeRef::Unknown
+                }
+            }
+            _ => TypeRef::Unknown,
+        }
+    }
+
+    /// `true` when values of the annotated type are deeply immutable, so a
+    /// cache may hand the same object to every caller. Unknown heads (user
+    /// classes that are not deeply immutable, `Any`, `object`, protocols,
+    /// containers, callables) are `false`.
+    fn annotation_is_immutable(&self, ann: &Expr) -> bool {
+        self.annotation_is_immutable_in(ann, &self.immutable_classes, true)
+    }
+
+    /// [`Self::annotation_is_immutable`], minus `Decimal`: a module binding
+    /// whose value is read and computed with inside a pure body must not
+    /// depend on ambient state, and every `Decimal` operation reads the
+    /// thread's current context.
+    fn annotation_is_constant(&self, ann: &Expr) -> bool {
+        self.annotation_is_immutable_in(ann, &self.immutable_classes, false)
+    }
+
+    fn annotation_is_immutable_in(
+        &self,
+        ann: &Expr,
+        immutable_classes: &HashSet<String>,
+        allow_decimal: bool,
+    ) -> bool {
+        let rec = |a: &Expr| self.annotation_is_immutable_in(a, immutable_classes, allow_decimal);
+        match ann {
+            Expr::NoneLiteral(_)
+            | Expr::EllipsisLiteral(_)
+            | Expr::NumberLiteral(_)
+            | Expr::BooleanLiteral(_)
+            | Expr::BytesLiteral(_) => true,
+            Expr::BinOp(b) if matches!(b.op, ruff_python_ast::Operator::BitOr) => {
+                rec(&b.left) && rec(&b.right)
+            }
+            Expr::Name(_) | Expr::Attribute(_) | Expr::StringLiteral(_) => {
+                match self.type_ref(ann) {
+                    TypeRef::Builtin(b) => matches!(
+                        b.as_str(),
+                        "int"
+                            | "float"
+                            | "str"
+                            | "bool"
+                            | "bytes"
+                            | "complex"
+                            | "range"
+                            | "tuple"
+                            | "frozenset"
+                    ),
+                    TypeRef::User(c) => immutable_classes.contains(&c),
+                    TypeRef::Path(p) => {
+                        (allow_decimal || p != "decimal.Decimal") && stdlib_type_is_immutable(&p)
+                    }
+                    TypeRef::Unknown => false,
+                }
+            }
+            Expr::Subscript(sub) => {
+                let args: Vec<&Expr> = match sub.slice.as_ref() {
+                    Expr::Tuple(t) => t.elts.iter().collect(),
+                    other => vec![other],
+                };
+                match self.type_ref(&sub.value) {
+                    TypeRef::Builtin(b) if matches!(b.as_str(), "tuple" | "frozenset" | "type") => {
+                        args.iter().all(|a| rec(a))
+                    }
+                    TypeRef::Path(p) => match p.as_str() {
+                        "typing.Literal" => true,
+                        "typing.Annotated" => args.first().is_some_and(|a| rec(a)),
+                        "typing.Tuple" | "typing.FrozenSet" | "typing.Optional"
+                        | "typing.Union" | "typing.Type" | "typing.Final" | "typing.ClassVar"
+                        | "typhon.Result" | "typhon.Ok" | "typhon.Err" => {
+                            args.iter().all(|a| rec(a))
+                        }
+                        _ => false,
+                    },
+                    // A generic user class: immutable when the class is, and
+                    // every type argument is.
+                    TypeRef::User(c) => {
+                        immutable_classes.contains(&c) && args.iter().all(|a| rec(a))
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// `true` when a parameter of the annotated type is a sound key for the
+    /// typed cache a silent memoisation path emits: two arguments that
+    /// compare (and hash) equal are indistinguishable to the function. At
+    /// the top level `typed=True` separates `1` / `1.0` / `True` and a
+    /// subclass from its base, so `int` / `str` / `bytes` are fine; `float`
+    /// is not (`0.0 == -0.0`, yet `repr` tells them apart), nor are
+    /// `Decimal` (`Decimal("1.0") == Decimal("1.00")`), timezone-aware
+    /// `datetime`s, paths, or callables. Inside a tuple / frozenset / frozen
+    /// class field `typed=True` no longer applies, so only values with no
+    /// equal-but-different subclass instance qualify (`bool`, `None`,
+    /// enums, key-safe frozen classes): `(True,) == (1,)`.
+    fn annotation_is_cache_key(&self, ann: &Expr) -> bool {
+        self.cache_key_in(ann, &self.key_safe_classes, false)
+    }
+
+    fn cache_key_in(&self, ann: &Expr, key_safe: &HashSet<String>, nested: bool) -> bool {
+        match ann {
+            Expr::NoneLiteral(_) => true,
+            Expr::EllipsisLiteral(_) => nested,
+            Expr::BinOp(b) if matches!(b.op, ruff_python_ast::Operator::BitOr) => {
+                self.cache_key_in(&b.left, key_safe, nested)
+                    && self.cache_key_in(&b.right, key_safe, nested)
+            }
+            Expr::Name(_) | Expr::Attribute(_) | Expr::StringLiteral(_) => {
+                match self.type_ref(ann) {
+                    TypeRef::Builtin(b) => match b.as_str() {
+                        "bool" => true,
+                        "int" | "str" | "bytes" => !nested,
+                        _ => false,
+                    },
+                    TypeRef::User(c) => self.enum_classes.contains(&c) || key_safe.contains(&c),
+                    TypeRef::Path(_) | TypeRef::Unknown => false,
+                }
+            }
+            Expr::Subscript(sub) => {
+                let args: Vec<&Expr> = match sub.slice.as_ref() {
+                    Expr::Tuple(t) => t.elts.iter().collect(),
+                    other => vec![other],
+                };
+                let all_nested = || args.iter().all(|a| self.cache_key_in(a, key_safe, true));
+                match self.type_ref(&sub.value) {
+                    TypeRef::Builtin(b) if matches!(b.as_str(), "tuple" | "frozenset") => {
+                        all_nested()
+                    }
+                    TypeRef::Path(p) => match p.as_str() {
+                        "typing.Literal" => !nested,
+                        "typing.Annotated" => args
+                            .first()
+                            .is_some_and(|a| self.cache_key_in(a, key_safe, nested)),
+                        "typing.Tuple" | "typing.FrozenSet" => all_nested(),
+                        "typing.Optional" | "typing.Union" => {
+                            args.iter().all(|a| self.cache_key_in(a, key_safe, nested))
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Classify the module's classes: enums, deeply immutable classes,
+    /// key-safe frozen classes and pure constructors (see the fields).
+    fn classify_classes(&mut self, body: &[Stmt], frozen_markers: &HashSet<String>) {
+        const IMPL_PREFIX: &str = "__typhon_impl_";
+        let defs: Vec<&ruff_python_ast::StmtClassDef> = body
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::ClassDef(c) if !c.name.as_str().starts_with(IMPL_PREFIX) => Some(c),
+                _ => None,
+            })
+            .collect();
+        // Methods per class, including `impl` / `extend` blocks.
+        let mut methods: HashMap<String, HashSet<String>> = HashMap::new();
+        for stmt in body {
+            if let Stmt::ClassDef(c) = stmt {
+                let target = c
+                    .name
+                    .as_str()
+                    .strip_prefix(IMPL_PREFIX)
+                    .unwrap_or(c.name.as_str());
+                let entry = methods.entry(target.to_owned()).or_default();
+                for item in &c.body {
+                    if let Stmt::FunctionDef(f) = item {
+                        entry.insert(f.name.as_str().to_owned());
+                    }
+                }
+            }
+        }
+        let bases_of = |c: &ruff_python_ast::StmtClassDef| -> Vec<Expr> {
+            c.arguments
+                .as_deref()
+                .map(|a| a.args.to_vec())
+                .unwrap_or_default()
+        };
+        let is_enum_path = |p: &str| {
+            matches!(
+                p,
+                "enum.Enum"
+                    | "enum.IntEnum"
+                    | "enum.StrEnum"
+                    | "enum.Flag"
+                    | "enum.IntFlag"
+                    | "enum.ReprEnum"
+            )
+        };
+        // Enums (to a fixed point: an enum may derive from a module enum).
+        loop {
+            let mut changed = false;
+            for c in &defs {
+                let name = c.name.as_str();
+                if self.enum_classes.contains(name) {
+                    continue;
+                }
+                let is_enum = bases_of(c).iter().any(|b| match self.type_ref(b) {
+                    TypeRef::Path(p) => is_enum_path(&p),
+                    TypeRef::User(u) => self.enum_classes.contains(&u),
+                    _ => false,
+                });
+                if is_enum {
+                    self.enum_classes.insert(name.to_owned());
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let is_named_tuple = |c: &ruff_python_ast::StmtClassDef| {
+            bases_of(c)
+                .iter()
+                .any(|b| matches!(self.type_ref(b), TypeRef::Path(p) if p == "typing.NamedTuple"))
+        };
+        let frozen_dataclass = |c: &ruff_python_ast::StmtClassDef| {
+            frozen_markers.contains(c.name.as_str())
+                || c.decorator_list.iter().any(|d| match &d.expression {
+                    Expr::Call(call) => {
+                        decorator_is_dataclass(&call.func)
+                            && call.arguments.keywords.iter().any(|k| {
+                                k.arg.as_ref().is_some_and(|a| a.as_str() == "frozen")
+                                    && matches!(&k.value, Expr::BooleanLiteral(b) if b.value)
+                            })
+                    }
+                    _ => false,
+                })
+        };
+        // Instance fields: annotated class-body names, minus `ClassVar`s.
+        let fields = |c: &ruff_python_ast::StmtClassDef| -> Vec<(Expr, Option<Expr>)> {
+            c.body
+                .iter()
+                .filter_map(|s| match s {
+                    Stmt::AnnAssign(a) if matches!(a.target.as_ref(), Expr::Name(_)) => {
+                        let is_classvar = matches!(
+                            self.type_ref(&a.annotation),
+                            TypeRef::Path(p) if p == "typing.ClassVar"
+                        );
+                        (!is_classvar)
+                            .then(|| ((*a.annotation).clone(), a.value.as_deref().cloned()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let neutral_base = |b: &Expr| -> bool {
+            match self.type_ref(b) {
+                TypeRef::Path(p) => {
+                    p == "typing.Generic" || p == "typing.NamedTuple" || is_enum_path(&p)
+                }
+                TypeRef::Builtin(b) => b == "object",
+                _ => false,
+            }
+        };
+
+        // Deeply immutable classes: greatest fixed point.
+        let mut immutable: HashSet<String> = defs
+            .iter()
+            .filter(|c| {
+                self.enum_classes.contains(c.name.as_str())
+                    || is_named_tuple(c)
+                    || frozen_dataclass(c)
+            })
+            .map(|c| c.name.as_str().to_owned())
+            .collect();
+        loop {
+            let mut removed = Vec::new();
+            for c in &defs {
+                let name = c.name.as_str();
+                if !immutable.contains(name) || self.enum_classes.contains(name) {
+                    continue;
+                }
+                let bases_ok = bases_of(c).iter().all(|b| {
+                    neutral_base(b)
+                        || matches!(self.type_ref(b), TypeRef::User(u) if immutable.contains(&u))
+                });
+                let fields_ok = fields(c)
+                    .iter()
+                    .all(|(ann, _)| self.annotation_is_immutable_in(ann, &immutable, true));
+                if !bases_ok || !fields_ok {
+                    removed.push(name.to_owned());
+                }
+            }
+            if removed.is_empty() {
+                break;
+            }
+            for r in removed {
+                immutable.remove(&r);
+            }
+        }
+        // Key-safe frozen dataclasses: greatest fixed point.
+        let mut key_safe: HashSet<String> = defs
+            .iter()
+            .filter(|c| {
+                let name = c.name.as_str();
+                frozen_dataclass(c)
+                    && !is_named_tuple(c)
+                    && !self.enum_classes.contains(name)
+                    && !methods.get(name).is_some_and(|m| {
+                        m.contains("__eq__") || m.contains("__hash__") || m.contains("__ne__")
+                    })
+            })
+            .map(|c| c.name.as_str().to_owned())
+            .collect();
+        loop {
+            let mut removed = Vec::new();
+            for c in &defs {
+                let name = c.name.as_str();
+                if !key_safe.contains(name) {
+                    continue;
+                }
+                let bases_ok = bases_of(c).iter().all(|b| {
+                    matches!(self.type_ref(b), TypeRef::Path(p) if p == "typing.Generic")
+                        || matches!(self.type_ref(b), TypeRef::Builtin(o) if o == "object")
+                        || matches!(self.type_ref(b), TypeRef::User(u) if key_safe.contains(&u))
+                });
+                let fields_ok = fields(c)
+                    .iter()
+                    .all(|(ann, _)| self.cache_key_in(ann, &key_safe, true));
+                // A subclass instance passed where the base is expected
+                // shares the base's `typed` slot, so every module subclass
+                // must be key-safe too.
+                let subclasses_ok = defs.iter().all(|sub| {
+                    !bases_of(sub)
+                        .iter()
+                        .any(|b| matches!(self.type_ref(b), TypeRef::User(u) if u == name))
+                        || key_safe.contains(sub.name.as_str())
+                });
+                if !bases_ok || !fields_ok || !subclasses_ok {
+                    removed.push(name.to_owned());
+                }
+            }
+            if removed.is_empty() {
+                break;
+            }
+            for r in removed {
+                key_safe.remove(&r);
+            }
+        }
+        // Pure constructors: greatest fixed point.
+        let ctor_hooks = [
+            "__init__",
+            "__post_init__",
+            "__new__",
+            "__setattr__",
+            "__missing__",
+            "_missing_",
+        ];
+        let mut pure: HashSet<String> = defs
+            .iter()
+            .filter(|c| {
+                let name = c.name.as_str();
+                let no_hooks = !methods
+                    .get(name)
+                    .is_some_and(|m| ctor_hooks.iter().any(|h| m.contains(*h)));
+                let plain_decorators = c.decorator_list.iter().all(|d| match &d.expression {
+                    Expr::Call(call) => decorator_is_dataclass(&call.func),
+                    other => decorator_is_dataclass(other),
+                });
+                let no_metaclass = c.arguments.as_deref().is_none_or(|a| a.keywords.is_empty());
+                no_hooks && plain_decorators && no_metaclass
+            })
+            .map(|c| c.name.as_str().to_owned())
+            .collect();
+        loop {
+            let mut removed = Vec::new();
+            for c in &defs {
+                let name = c.name.as_str();
+                if !pure.contains(name) {
+                    continue;
+                }
+                let bases_ok = bases_of(c).iter().all(|b| {
+                    neutral_base(b)
+                        || matches!(self.type_ref(b), TypeRef::User(u) if pure.contains(&u))
+                });
+                let factories_ok = fields(c).iter().all(|(_, value)| match value {
+                    Some(Expr::Call(call)) if decorator_is_field(&call.func) => {
+                        call.arguments.keywords.iter().all(|k| {
+                            if k
+                                .arg
+                                .as_ref()
+                                .is_none_or(|a| a.as_str() != "default_factory")
+                            {
+                                return true;
+                            }
+                            match &k.value {
+                                Expr::Name(n) => {
+                                    let f = n.id.as_str();
+                                    (is_builtin_type_name(f) && !self.top_level_bound.contains(f))
+                                        || pure.contains(f)
+                                }
+                                _ => false,
+                            }
+                        })
+                    }
+                    _ => true,
+                });
+                if !bases_ok || !factories_ok {
+                    removed.push(name.to_owned());
+                }
+            }
+            if removed.is_empty() {
+                break;
+            }
+            for r in removed {
+                pure.remove(&r);
+            }
+        }
+        self.immutable_classes = immutable;
+        self.key_safe_classes = key_safe;
+        self.pure_ctor_classes = pure;
     }
 
     /// Expand the leading import alias of a dotted call path:
@@ -3505,6 +4163,18 @@ pub(crate) fn collect_global_declarations(body: &[Stmt], into: &mut HashSet<Stri
     }
 }
 
+/// `true` when a binding target is made only of bare names (through tuple /
+/// list unpacking and starred elements).
+fn bound_names_only(target: &Expr) -> bool {
+    match target {
+        Expr::Name(_) => true,
+        Expr::Tuple(t) => t.elts.iter().all(bound_names_only),
+        Expr::List(l) => l.elts.iter().all(bound_names_only),
+        Expr::Starred(s) => bound_names_only(&s.value),
+        _ => false,
+    }
+}
+
 /// Bare names bound by an assignment / loop / `with` target, including
 /// tuple and list unpacking and starred elements.
 fn bound_names_in_target(target: &Expr) -> Vec<String> {
@@ -3522,140 +4192,104 @@ fn bound_names_in_target(target: &Expr) -> Vec<String> {
     out
 }
 
-/// A class whose instances are immutable and hashable by construction: an
-/// enum, a `NamedTuple`, or an explicit `@dataclass(frozen=True)`. (`class
-/// NAME frozen:` is reported by the preprocessor and arrives through
-/// [`analyse_purity_with`].)
-fn class_def_is_immutable(c: &ruff_python_ast::StmtClassDef) -> bool {
-    if let Some(args) = c.arguments.as_deref() {
-        for base in &args.args {
-            let last = match base {
-                Expr::Name(n) => n.id.as_str(),
-                Expr::Attribute(a) => a.attr.as_str(),
-                Expr::Subscript(s) => match s.value.as_ref() {
-                    Expr::Name(n) => n.id.as_str(),
-                    Expr::Attribute(a) => a.attr.as_str(),
-                    _ => "",
-                },
-                _ => "",
-            };
-            if matches!(
-                last,
-                "Enum" | "IntEnum" | "StrEnum" | "Flag" | "IntFlag" | "ReprEnum" | "NamedTuple"
-            ) {
-                return true;
-            }
-        }
-    }
-    c.decorator_list.iter().any(|d| match &d.expression {
-        Expr::Call(call) => {
-            let is_dataclass = match call.func.as_ref() {
-                Expr::Name(n) => n.id.as_str() == "dataclass",
-                Expr::Attribute(a) => a.attr.as_str() == "dataclass",
-                _ => false,
-            };
-            is_dataclass
-                && call.arguments.keywords.iter().any(|k| {
-                    k.arg.as_ref().is_some_and(|a| a.as_str() == "frozen")
-                        && matches!(&k.value, Expr::BooleanLiteral(b) if b.value)
-                })
-        }
-        _ => false,
-    })
+/// What the head of a type expression denotes (see [`ModuleScope::type_ref`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TypeRef {
+    /// An unshadowed builtin type (`int`, `tuple`, ...).
+    Builtin(String),
+    /// A dotted path resolved through the module's imports (or an implicit
+    /// typing / Typhon prelude name): `decimal.Decimal`, `typing.Literal`.
+    Path(String),
+    /// A class declared in this module.
+    User(String),
+    /// Nothing provable.
+    Unknown,
 }
 
-/// Type heads whose values are immutable and hashable.
-fn is_immutable_type_head(head: &str) -> bool {
+/// Builtin type names a module can shadow.
+fn is_builtin_type_name(name: &str) -> bool {
     matches!(
-        head,
+        name,
         "int"
             | "float"
             | "str"
             | "bool"
             | "bytes"
             | "complex"
-            | "None"
-            | "NoneType"
-            | "tuple"
-            | "Tuple"
-            | "frozenset"
-            | "FrozenSet"
             | "range"
-            | "Decimal"
-            | "Fraction"
-            | "datetime"
-            | "date"
-            | "time"
-            | "timedelta"
-            | "timezone"
-            | "UUID"
-            | "PurePath"
-            | "PurePosixPath"
-            | "PureWindowsPath"
-            | "Path"
-            | "PosixPath"
-            | "WindowsPath"
-            | "Pattern"
-            | "Enum"
-            | "IntEnum"
-            | "StrEnum"
-            | "Flag"
-            | "IntFlag"
-            | "Literal"
-            | "LiteralString"
-            | "Never"
-            | "NoReturn"
-            | "Callable"
+            | "tuple"
+            | "frozenset"
+            | "type"
+            | "object"
+            | "list"
+            | "dict"
+            | "set"
+            | "bytearray"
     )
 }
 
-/// `true` when values of the annotated type are immutable and hashable, so
-/// a cache may both key on them and hand them out to every caller. Unknown
-/// heads (user classes that are not frozen, `Any`, `object`, protocols,
-/// containers) are `false`.
-fn annotation_is_immutable(ann: &Expr, immutable_classes: &HashSet<String>) -> bool {
-    match ann {
-        Expr::Name(n) => {
-            is_immutable_type_head(n.id.as_str()) || immutable_classes.contains(n.id.as_str())
+/// Fold the aliases of one type onto a single path (`typing_extensions.X`
+/// and `collections.abc.Callable` → `typing.X`).
+fn normalise_type_path(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("typing_extensions.") {
+        return format!("typing.{rest}");
+    }
+    if let Some(rest) = path.strip_prefix("collections.abc.") {
+        return format!("typing.{rest}");
+    }
+    path.to_owned()
+}
+
+/// Resolved stdlib types whose values are immutable.
+fn stdlib_type_is_immutable(path: &str) -> bool {
+    matches!(
+        path,
+        "decimal.Decimal"
+            | "fractions.Fraction"
+            | "datetime.datetime"
+            | "datetime.date"
+            | "datetime.time"
+            | "datetime.timedelta"
+            | "datetime.timezone"
+            | "uuid.UUID"
+            | "pathlib.PurePath"
+            | "pathlib.PurePosixPath"
+            | "pathlib.PureWindowsPath"
+            | "pathlib.Path"
+            | "pathlib.PosixPath"
+            | "pathlib.WindowsPath"
+            | "re.Pattern"
+            | "typing.Pattern"
+            | "enum.Enum"
+            | "enum.IntEnum"
+            | "enum.StrEnum"
+            | "enum.Flag"
+            | "enum.IntFlag"
+            | "typing.LiteralString"
+            | "typing.Never"
+            | "typing.NoReturn"
+    )
+}
+
+/// `@dataclass` / `@dataclasses.dataclass` (the callee of a decorator).
+fn decorator_is_dataclass(func: &Expr) -> bool {
+    match func {
+        Expr::Name(n) => n.id.as_str() == "dataclass",
+        Expr::Attribute(a) => {
+            a.attr.as_str() == "dataclass"
+                && matches!(a.value.as_ref(), Expr::Name(n) if n.id.as_str() == "dataclasses")
         }
-        Expr::Attribute(a) => is_immutable_type_head(a.attr.as_str()),
-        Expr::NoneLiteral(_)
-        | Expr::EllipsisLiteral(_)
-        | Expr::NumberLiteral(_)
-        | Expr::BooleanLiteral(_)
-        | Expr::BytesLiteral(_) => true,
-        // A quoted forward reference (`"Point"`); the string values inside
-        // `Literal[...]` never reach here (that head is accepted whole).
-        Expr::StringLiteral(s) => {
-            let text = s.value.to_str().trim();
-            is_immutable_type_head(text) || immutable_classes.contains(text)
-        }
-        Expr::BinOp(b) if matches!(b.op, ruff_python_ast::Operator::BitOr) => {
-            annotation_is_immutable(&b.left, immutable_classes)
-                && annotation_is_immutable(&b.right, immutable_classes)
-        }
-        Expr::Subscript(s) => {
-            let head = match s.value.as_ref() {
-                Expr::Name(n) => n.id.as_str(),
-                Expr::Attribute(a) => a.attr.as_str(),
-                _ => return false,
-            };
-            let args: Vec<&Expr> = match s.slice.as_ref() {
-                Expr::Tuple(t) => t.elts.iter().collect(),
-                other => vec![other],
-            };
-            match head {
-                "Literal" => true,
-                "Callable" => true,
-                "Annotated" => args
-                    .first()
-                    .is_some_and(|a| annotation_is_immutable(a, immutable_classes)),
-                "tuple" | "Tuple" | "frozenset" | "FrozenSet" | "Result" | "Ok" | "Err"
-                | "Optional" | "Union" | "type" | "Type" | "Final" | "ClassVar" => args
-                    .iter()
-                    .all(|a| annotation_is_immutable(a, immutable_classes)),
-                _ => false,
-            }
+        _ => false,
+    }
+}
+
+/// `field(...)` / `dataclasses.field(...)`.
+fn decorator_is_field(func: &Expr) -> bool {
+    match func {
+        Expr::Name(n) => n.id.as_str() == "field",
+        Expr::Attribute(a) => {
+            a.attr.as_str() == "field"
+                && matches!(a.value.as_ref(), Expr::Name(n) if n.id.as_str() == "dataclasses")
         }
         _ => false,
     }
@@ -3751,7 +4385,8 @@ fn analyse_stmts(
     auto_memoise: bool,
     out: &mut Vec<PurityFinding>,
     _async_context: bool,
-) {
+) -> Vec<HashSet<String>> {
+    let mut callees = Vec::new();
     // Only the OUTER call (the recursion entry from `analyse_purity`)
     // visits top-level functions, which is the only scope the desugarer
     // can rewrite by name. Recursing into function/class bodies would
@@ -3763,8 +4398,8 @@ fn analyse_stmts(
     let shadowed_markers = user_bound_marker_names(body);
     for stmt in body {
         if let Stmt::FunctionDef(f) = stmt {
-            let (declared, memo) =
-                decorator_intent(&f.decorator_list, auto_memoise, &shadowed_markers);
+            let (declared, explicit_memo) = decorator_intent(&f.decorator_list, &shadowed_markers);
+            let memo = explicit_memo || auto_memoise;
             // Run the purity check whenever the user opted in OR the
             // project asked for automatic caching. Auto-memoise never
             // produces an error (see `purity_diagnostics`); it just
@@ -3776,6 +4411,7 @@ fn analyse_stmts(
                     name: f.name.as_str().to_owned(),
                     declared_pure: declared,
                     memoise: memo,
+                    explicit_memo,
                     violation: verdict.violation,
                     unproven: verdict.unproven,
                     unshareable_return: verdict.unshareable_return,
@@ -3785,28 +4421,29 @@ fn analyse_stmts(
                         f.range.start().to_usize() + f.name.as_str().len(),
                     ),
                 });
+                callees.push(verdict.callees);
             }
         }
     }
+    callees
 }
 
-/// Inspect a decorator list. Returns `(declared_pure, memoise)`:
+/// Inspect a decorator list. Returns `(declared_pure, explicit_memo)`:
 ///   - `declared_pure` is `true` if `@pure`, `@pure(...)`, or `@memo` appears
 ///     — i.e. the user explicitly opted in to having the analyser enforce
 ///     purity. `auto_memoise` does **not** flip this flag; it only opts the
 ///     project into automatic caching of already-passable functions, not
 ///     into hard purity errors for ordinary impure code.
-///   - `memoise` is `true` if the user asked for caching: `@memo`,
-///     `@pure(memo=True)`, or `auto_memoise`. The desugarer only injects
-///     `@functools.cache` when the function ALSO passes the purity check;
-///     `auto_memoise` is therefore a silent best-effort, never a hard error.
+///   - `explicit_memo` is `true` if the user asked for caching: `@memo` or
+///     `@pure(memo=True)`. `auto-memoise` is folded in by the caller; it is
+///     a silent best-effort held to the stricter cache-safety proof, never
+///     a hard error.
 fn decorator_intent(
     decorators: &[Decorator],
-    auto_memoise: bool,
     shadowed: &std::collections::HashSet<String>,
 ) -> (bool, bool) {
     let mut declared = false;
-    let mut memoise = auto_memoise;
+    let mut memoise = false;
     for d in decorators {
         // A `pure` / `memo` this module defines or imports for itself is the
         // user's decorator, not Typhon's marker. Reading it as the marker made
@@ -3874,6 +4511,9 @@ struct PurityVerdict {
     unproven: Option<String>,
     unshareable_return: Option<String>,
     uncacheable_params: Option<String>,
+    /// Module functions the body calls or passes around as values (for
+    /// [`propagate_transitive_purity`]).
+    callees: HashSet<String>,
 }
 
 fn check_purity(f: &ruff_python_ast::StmtFunctionDef, module: &ModuleScope) -> PurityVerdict {
@@ -3893,15 +4533,15 @@ fn check_purity(f: &ruff_python_ast::StmtFunctionDef, module: &ModuleScope) -> P
         return verdict;
     }
     // Cache-safety of the signature (silent memoisation paths only): every
-    // parameter provably hashable *and* immutable, the return value
-    // immutable. Neither is a purity violation.
+    // parameter a sound cache key, the return value deeply immutable.
+    // Neither is a purity violation.
     verdict.uncacheable_params = uncacheable_param_reason(parameters, module);
     verdict.unshareable_return = match f.returns.as_deref() {
         None => Some(format!(
             "`{}` has no return annotation, so its result cannot be proven safe to share from a cache",
             f.name.as_str()
         )),
-        Some(ann) if annotation_is_immutable(ann, &module.immutable_classes) => None,
+        Some(ann) if module.annotation_is_immutable(ann) => None,
         Some(ann) => Some(format!(
             "`{}` returns `{}`, a mutable or lazy value that a shared cache would alias between callers",
             f.name.as_str(),
@@ -3918,6 +4558,7 @@ fn check_purity(f: &ruff_python_ast::StmtFunctionDef, module: &ModuleScope) -> P
         locals: bindings.names,
         builtin_typed: bindings.types,
         fresh: bindings.fresh,
+        callees: HashSet::new(),
     };
     for pwd in parameters
         .posonlyargs
@@ -3938,6 +4579,7 @@ fn check_purity(f: &ruff_python_ast::StmtFunctionDef, module: &ModuleScope) -> P
     walk_stmts_purity(body, &mut ctx);
     verdict.violation = ctx.violation;
     verdict.unproven = ctx.unproven;
+    verdict.callees = ctx.callees;
     verdict
 }
 
@@ -4041,10 +4683,11 @@ fn uncacheable_param_reason(parameters: &Parameters, module: &ModuleScope) -> Op
                     "parameter `{name}` has no annotation, so it cannot be proven hashable and immutable"
                 ))
             }
-            Some(ann) if annotation_is_immutable(ann, &module.immutable_classes) => {}
+            Some(ann) if module.annotation_is_cache_key(ann) => {}
             Some(ann) => {
                 return Some(format!(
-                    "parameter `{name}: {}` is not provably hashable and immutable — a cache keyed on it would go stale if the caller mutates it",
+                    "parameter `{name}: {}` is not a sound cache key — its values may be mutable, \
+                     or compare equal while behaving differently (`0.0` / `-0.0`, `(1,)` / `(True,)`)",
                     annotation_text(ann)
                 ))
             }
@@ -4262,9 +4905,25 @@ struct PurityCtx<'a> {
     /// comprehension, builtin constructor or module class constructor):
     /// mutating them in place is unobservable outside the function.
     fresh: HashSet<String>,
+    /// Module functions called or referenced as values.
+    callees: HashSet<String>,
 }
 
 impl PurityCtx<'_> {
+    /// Walk `f` with every *violation* it finds demoted to `unproven`. Used
+    /// for positions the walker historically ignored (an `assert`): what
+    /// they do still decides whether a silent optimisation may cache the
+    /// function, but an explicit `@pure` that passed before must not start
+    /// failing with `tyc::impure_pure_fn` — the program ran correctly.
+    fn demoted(&mut self, f: impl FnOnce(&mut Self)) {
+        let before = self.violation.take();
+        f(self);
+        if let Some(found) = self.violation.take() {
+            self.unproven(found);
+        }
+        self.violation = before;
+    }
+
     fn fail(&mut self, reason: impl Into<String>) {
         if self.violation.is_none() {
             self.violation = Some(reason.into());
@@ -4372,6 +5031,11 @@ fn walk_stmt_purity(stmt: &Stmt, ctx: &mut PurityCtx) {
                 return;
             }
             walk_expr_purity(&s.iter, ctx);
+            if !bound_names_only(&s.target) {
+                // `for obj.x in ...` / `for xs[0] in ...` writes through a
+                // receiver on every iteration.
+                ctx.unproven("binds a loop target through an attribute or subscript");
+            }
             walk_stmts_purity(&s.body, ctx);
             walk_stmts_purity(&s.orelse, ctx);
         }
@@ -4399,9 +5063,34 @@ fn walk_stmt_purity(stmt: &Stmt, ctx: &mut PurityCtx) {
             }
         }
         Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {
-            // Nested defs / classes are out of scope for purity propagation.
+            // Nested defs / classes are out of scope for purity propagation:
+            // their bodies are not walked, so a closure that keeps state
+            // (`make_counter`) must not reach a silent cache.
+            ctx.unproven(
+                "defines a nested function or class whose body is not checked — a cached \
+                 result could share its state between callers",
+            );
         }
-        _ => {}
+        Stmt::Assert(a) => {
+            // Walked for the silent optimisation paths only (see `demoted`):
+            // `assert validate(x)` runs `validate` on every call.
+            ctx.demoted(|ctx| {
+                walk_expr_purity(&a.test, ctx);
+                if let Some(msg) = &a.msg {
+                    walk_expr_purity(msg, ctx);
+                }
+            });
+        }
+        Stmt::Import(_) | Stmt::ImportFrom(_) => {
+            // A function-local import runs the module's top level on first
+            // use.
+            ctx.unproven("imports a module inside the body, which may run module-level code");
+        }
+        Stmt::TypeAlias(_)
+        | Stmt::Pass(_)
+        | Stmt::Break(_)
+        | Stmt::Continue(_)
+        | Stmt::IpyEscapeCommand(_) => {}
     }
 }
 
@@ -4418,6 +5107,15 @@ fn walk_expr_purity(expr: &Expr, ctx: &mut PurityCtx) {
                 }
                 CallVerdict::Unproven(reason) => ctx.unproven(reason),
                 CallVerdict::Pure => {}
+            }
+            if let Expr::Name(n) = c.func.as_ref() {
+                let callee = n.id.as_str();
+                if !ctx.is_param(callee)
+                    && !ctx.is_local(callee)
+                    && ctx.module.user_functions.get(callee) == Some(&true)
+                {
+                    ctx.callees.insert(callee.to_owned());
+                }
             }
             // The receiver of a method call is walked for the reads it
             // performs; the callee name itself was classified above. A
@@ -4472,7 +5170,25 @@ fn walk_expr_purity(expr: &Expr, ctx: &mut PurityCtx) {
                 walk_expr_purity(e, ctx);
             }
         }
-        Expr::Attribute(a) => walk_expr_purity(&a.value, ctx),
+        Expr::Attribute(a) => {
+            if let Expr::Name(n) = a.value.as_ref() {
+                let root = n.id.as_str();
+                if !ctx.is_param(root)
+                    && !ctx.is_local(root)
+                    && ctx.module.class_names.iter().any(|c| c == root)
+                    && !ctx.module.enum_classes.contains(root)
+                {
+                    // `Config.DEBUG`: a class attribute can be rebound at
+                    // runtime, so a cached result could go stale. Enum members
+                    // cannot be reassigned.
+                    ctx.unproven(format!(
+                        "reads class attribute `{root}.{}`, which can be rebound at runtime",
+                        a.attr.as_str()
+                    ));
+                }
+            }
+            walk_expr_purity(&a.value, ctx)
+        }
         Expr::Subscript(s) => {
             walk_expr_purity(&s.value, ctx);
             walk_expr_purity(&s.slice, ctx);
@@ -4634,7 +5350,10 @@ fn check_name_read(name: &str, ctx: &mut PurityCtx) {
         return;
     }
     match ctx.module.user_functions.get(name) {
-        Some(true) => return,
+        Some(true) => {
+            ctx.callees.insert(name.to_owned());
+            return;
+        }
         Some(false) => {
             ctx.unproven(format!(
                 "passes helper `{name}` around as a value, and `{name}` is not declared pure"
@@ -4750,6 +5469,9 @@ fn classify_call(c: &ExprCall, ctx: &PurityCtx) -> CallVerdict {
                 ));
             }
             if let Some(path) = ctx.module.imports.get(callee) {
+                if let Some(v) = mutating_stdlib_verdict(path, c, ctx) {
+                    return v;
+                }
                 return module_path_verdict(path);
             }
             if callee == "next" {
@@ -4773,18 +5495,32 @@ fn classify_call(c: &ExprCall, ctx: &PurityCtx) -> CallVerdict {
                     "`{callee}(...)` exposes object identity or live state, which is not provably pure"
                 ));
             }
+            if ctx.module.class_names.iter().any(|k| k == callee) {
+                return if ctx.module.pure_ctor_classes.contains(callee) {
+                    CallVerdict::Pure
+                } else {
+                    CallVerdict::Unproven(format!(
+                        "constructs `{callee}`, whose construction may run code (a hand-written \
+                         `__init__` / `__post_init__`, a base class or a default factory)"
+                    ))
+                };
+            }
             match check_callee_purity(callee, ctx.module) {
                 None => CallVerdict::Pure,
                 Some(reason) => CallVerdict::Impure(reason),
             }
         }
-        Expr::Attribute(a) => classify_method_call(a, ctx),
+        Expr::Attribute(a) => classify_method_call(a, c, ctx),
         // `fns[i](x)`, `(lambda: ...)()`, `f()(x)`: the callee is computed.
         _ => CallVerdict::Unproven("calls through a computed callee".to_owned()),
     }
 }
 
-fn classify_method_call(a: &ruff_python_ast::ExprAttribute, ctx: &PurityCtx) -> CallVerdict {
+fn classify_method_call(
+    a: &ruff_python_ast::ExprAttribute,
+    call: &ExprCall,
+    ctx: &PurityCtx,
+) -> CallVerdict {
     let method = a.attr.as_str();
     if is_io_method(method) {
         return CallVerdict::Impure(format!(
@@ -4807,8 +5543,11 @@ fn classify_method_call(a: &ruff_python_ast::ExprAttribute, ctx: &PurityCtx) -> 
     if let Some(base) = dotted_path(&a.value) {
         let head = base.split('.').next().unwrap_or("");
         if ctx.module.imports.contains_key(head) && !ctx.is_param(head) && !ctx.is_local(head) {
-            let path = format!("{base}.{method}");
-            return module_path_verdict(&ctx.module.resolve_path(&path));
+            let path = ctx.module.resolve_path(&format!("{base}.{method}"));
+            if let Some(v) = mutating_stdlib_verdict(&path, call, ctx) {
+                return v;
+            }
+            return module_path_verdict(&path);
         }
     }
     if is_logging_method(method) && looks_like_logger(&root) {
@@ -4885,6 +5624,61 @@ fn builtin_method_verdict(head: &str, method: &str) -> CallVerdict {
     }
 }
 
+/// Stdlib functions in otherwise-pure modules that mutate their first
+/// argument in place: `heapq.heappush(QUEUE, x)` is `QUEUE.append(x)` by
+/// another name.
+fn stdlib_mutates_first_arg(path: &str) -> bool {
+    match path.rsplit_once('.') {
+        Some(("heapq", f)) => matches!(
+            f,
+            "heappush" | "heappop" | "heapify" | "heapreplace" | "heappushpop"
+        ),
+        Some(("bisect", f)) => matches!(f, "insort" | "insort_left" | "insort_right"),
+        Some(("operator", f)) => {
+            matches!(f, "setitem" | "delitem" | "iconcat")
+                || (f.starts_with('i') && f.len() > 2 && {
+                    let rest = &f[1..];
+                    matches!(
+                        rest,
+                        "add"
+                            | "and"
+                            | "floordiv"
+                            | "lshift"
+                            | "mod"
+                            | "mul"
+                            | "matmul"
+                            | "or"
+                            | "pow"
+                            | "rshift"
+                            | "sub"
+                            | "truediv"
+                            | "xor"
+                    )
+                })
+        }
+        _ => false,
+    }
+}
+
+/// `Some(verdict)` when `path` is a [`stdlib_mutates_first_arg`] function:
+/// pure only when its first argument is a fresh local the function built.
+/// Never a violation (an explicit `@pure` that passed before keeps passing);
+/// otherwise unproven, so no silent cache is put on it.
+fn mutating_stdlib_verdict(path: &str, call: &ExprCall, ctx: &PurityCtx) -> Option<CallVerdict> {
+    if !stdlib_mutates_first_arg(path) {
+        return None;
+    }
+    if let Some(Expr::Name(n)) = call.arguments.args.first() {
+        let name = n.id.as_str();
+        if ctx.is_local(name) && !ctx.is_param(name) && ctx.fresh.contains(name) {
+            return Some(CallVerdict::Pure);
+        }
+    }
+    Some(CallVerdict::Unproven(format!(
+        "`{path}(...)` mutates its first argument, which is not a fresh local"
+    )))
+}
+
 /// Verdict for a call resolved to a dotted module path (`math.sqrt`,
 /// `datetime.datetime`, `numpy.zeros`).
 fn module_path_verdict(path: &str) -> CallVerdict {
@@ -4914,7 +5708,9 @@ fn path_is_in_pure_module(path: &str) -> bool {
         "json",
         "statistics",
         "fractions",
-        "decimal",
+        // `decimal` is deliberately absent: every `Decimal` operation reads
+        // the thread's current context (`localcontext(prec=5)`), so a
+        // cached result goes stale when the caller changes it.
         "numbers",
         "typing",
         "typing_extensions",
@@ -4936,7 +5732,6 @@ fn path_is_in_pure_module(path: &str) -> bool {
         "hmac",
         "difflib",
         "ipaddress",
-        "pathlib",
         "urllib.parse",
         "html",
         "keyword",
@@ -4963,6 +5758,15 @@ fn path_is_in_pure_module(path: &str) -> bool {
     }
     if path.starts_with("typhon_runtime.") {
         return true;
+    }
+    // `pathlib`: building a path and the pure-path API are lexical, but a
+    // concrete path's class methods and queries (`Path.cwd()`,
+    // `Path.exists(p)`, `Path.stat(p)`) read the filesystem.
+    if let Some(rest) = path.strip_prefix("pathlib.") {
+        return matches!(rest, "Path" | "PosixPath" | "WindowsPath")
+            || rest.starts_with("PurePath")
+            || rest.starts_with("PurePosixPath")
+            || rest.starts_with("PureWindowsPath");
     }
     PURE_MODULES.iter().any(|m| {
         path == *m
@@ -7577,7 +8381,7 @@ mod purity_tests {
         let src = "\
 import math
 import json
-from decimal import Decimal
+from fractions import Fraction
 SEP: str = \", \"
 LIMIT: int = 10
 
@@ -7586,7 +8390,7 @@ def f(xs: tuple[int, ...], s: str) -> str:
     parts = [str(x) for x in xs]
     out: list[str] = []
     out.append(s.upper())
-    return SEP.join(parts) + json.dumps(math.sqrt(LIMIT)) + str(Decimal(\"1.5\")) + \", \".join(out)
+    return SEP.join(parts) + json.dumps(math.sqrt(LIMIT)) + str(Fraction(3, 2)) + \", \".join(out)
 ";
         let f = analyse(src);
         assert!(f[0].violation.is_none(), "{:?}", f[0].violation);
@@ -7653,7 +8457,7 @@ def f(xs: tuple[int, ...], s: str) -> str:
 
     #[test]
     fn frozen_classes_are_cache_safe_through_analyse_purity_with() {
-        let src = "class Point:\n    x: float\n\ndef scale(p: Point, k: float) -> Point:\n    return Point(x=p.x * k)\n";
+        let src = "class Point:\n    x: bool\n\ndef scale(p: Point, k: bool) -> Point:\n    return Point(x=p.x and k)\n";
         let module = tyc_syntax::parse_module(src).unwrap().into_syntax();
         let plain = analyse_purity(&module, true);
         let scale = plain.iter().find(|f| f.name == "scale").unwrap();
@@ -7720,6 +8524,211 @@ def f(xs: tuple[int, ...], s: str) -> str:
         // A marker past the class name (the body line) covers nothing.
         let body_line = src.find("    y: int").unwrap() as u32;
         assert!(class_names_at_marker_starts(&module, &[body_line]).is_empty());
+    }
+
+    // ── W3-04 / W3-05: silent memoisation must never change program output ──
+
+    /// Cache decision for `name` under `auto-memoise` / `-O`, with `frozen`
+    /// naming the `class NAME frozen:` classes.
+    fn auto_decision(src: &str, name: &str, frozen: &[&str]) -> Option<CacheKind> {
+        let module = tyc_syntax::parse_module(src)
+            .expect("parse failed")
+            .into_syntax();
+        let frozen: HashSet<String> = frozen.iter().map(|s| (*s).to_owned()).collect();
+        let findings = analyse_purity_with(&module, true, &frozen);
+        let f = findings
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("no finding for {name}"));
+        f.cache_decision()
+    }
+
+    fn explicit_findings(src: &str) -> Vec<PurityFinding> {
+        let module = tyc_syntax::parse_module(src)
+            .expect("parse failed")
+            .into_syntax();
+        analyse_purity(&module, false)
+    }
+
+    #[test]
+    fn plain_pure_under_o_needs_the_cache_safety_proof() {
+        // `@pure` is a purity claim, not a cacheability claim: a mutable
+        // return is shared between callers once cached.
+        let src = "@pure\ndef window(n: int) -> list[int]:\n    return list(range(n))\n";
+        assert_eq!(auto_decision(src, "window", &[]), None);
+        // An explicit `@memo` is still honoured as written.
+        let memo = explicit_findings(
+            "@memo\ndef window(n: int) -> list[int]:\n    return list(range(n))\n",
+        );
+        assert_eq!(memo[0].cache_decision(), Some(CacheKind::Explicit));
+        // A cache-safe `@pure` is cached by `-O`, as a bounded typed cache.
+        let ok = "@pure\ndef add(a: int, b: int) -> int:\n    return a + b\n";
+        assert_eq!(auto_decision(ok, "add", &[]), Some(CacheKind::Auto));
+        // `@pure` without `-O` caches nothing.
+        let plain = explicit_findings(ok);
+        assert_eq!(plain[0].cache_decision(), None);
+    }
+
+    #[test]
+    fn recursive_functions_are_never_cached_silently() {
+        let direct =
+            "@pure\ndef depth(n: int) -> int:\n    return 0 if n == 0 else depth(n - 1) + 1\n";
+        assert_eq!(auto_decision(direct, "depth", &[]), None);
+        let mutual = "@pure\ndef even(n: int) -> bool:\n    return True if n == 0 else odd(n - 1)\n\n@pure\ndef odd(n: int) -> bool:\n    return False if n == 0 else even(n - 1)\n";
+        assert_eq!(auto_decision(mutual, "even", &[]), None);
+        assert_eq!(auto_decision(mutual, "odd", &[]), None);
+        // An explicit `@memo` recursion (the textbook `fib`) is unchanged,
+        // and recursion is never a purity *error*.
+        let fib = explicit_findings(
+            "@memo\ndef fib(n: int) -> int:\n    return n if n < 2 else fib(n - 1) + fib(n - 2)\n",
+        );
+        assert!(fib[0].violation.is_none());
+        assert_eq!(fib[0].cache_decision(), Some(CacheKind::Explicit));
+    }
+
+    #[test]
+    fn mutable_dataclass_and_float_params_are_not_cache_keys() {
+        // stress/.../05-knn-toy.ty: `@pure def dist(a: Point, ...)` on a
+        // mutable dataclass raised `unhashable type: 'Point'` under -O.
+        let knn = "class Point:\n    x: float\n    y: float\n\n@pure\ndef dist(a: Point, b: Point) -> float:\n    return (a.x - b.x) ** 2 + (a.y - b.y) ** 2\n";
+        assert_eq!(auto_decision(knn, "dist", &[]), None);
+        // `show(True)` after `show(1.0)`, `show(-0.0)` after `show(0.0)`.
+        let show = "def show(x: float) -> str:\n    return repr(x)\n";
+        assert_eq!(auto_decision(show, "show", &[]), None);
+        // `(True,) == (1,)`: an int inside a tuple key is not sound.
+        let tup = "def f(t: tuple[int, ...]) -> str:\n    return repr(t)\n";
+        assert_eq!(auto_decision(tup, "f", &[]), None);
+        let tup_bool = "def f(t: tuple[bool, ...]) -> int:\n    return len(t)\n";
+        assert_eq!(auto_decision(tup_bool, "f", &[]), Some(CacheKind::Auto));
+        // Top-level int / str / bytes / Optional are fine (typed=True).
+        let ok = "def f(a: int, b: str, c: bytes, d: int | None) -> int:\n    return a\n";
+        assert_eq!(auto_decision(ok, "f", &[]), Some(CacheKind::Auto));
+    }
+
+    #[test]
+    fn callables_are_neither_cache_keys_nor_shareable_results() {
+        let apply = "from typing import Callable\ndef apply_all(f: Callable[[int], int], xs: tuple[int, ...]) -> int:\n    return 0\n";
+        assert_eq!(auto_decision(apply, "apply_all", &[]), None);
+        let counter = "from typing import Callable\ndef make_counter(start: int) -> Callable[[], int]:\n    def step() -> int:\n        return start\n    return step\n";
+        assert_eq!(auto_decision(counter, "make_counter", &[]), None);
+        let f = explicit_findings(
+            "@pure\ndef g(start: int) -> int:\n    def step() -> int:\n        return start\n    return start\n",
+        );
+        assert!(
+            f[0].violation.is_none(),
+            "nested defs are never a purity error"
+        );
+        assert!(f[0].unproven.is_some(), "a nested def is not provably pure");
+    }
+
+    #[test]
+    fn user_classes_named_like_stdlib_immutables_are_not_trusted() {
+        for (src, name) in [
+            ("class Flag:\n    on: bool\n\ndef f(x: Flag) -> int:\n    return 1\n", "f"),
+            ("class Path:\n    s: str\n\ndef f(x: int) -> Path:\n    return Path(s=str(x))\n", "f"),
+            ("class Decimal:\n    v: int\n\ndef f(x: int) -> Decimal:\n    return Decimal(v=x)\n", "f"),
+            ("class UUID:\n    v: int\n\ndef f(x: UUID) -> int:\n    return 1\n", "f"),
+            ("class date:\n    d: int\n\ndef f(x: int) -> date:\n    return date(d=x)\n", "f"),
+            ("class Pattern:\n    p: str\n\ndef f(x: int) -> Pattern:\n    return Pattern(p=str(x))\n", "f"),
+            ("import mymod\ndef f(x: mymod.Flag) -> int:\n    return 1\n", "f"),
+            ("import mymod\ndef f(x: int) -> mymod.Decimal:\n    return mymod.Decimal(x)\n", "f"),
+            // An unimported `Decimal` cannot be resolved either.
+            ("def f(x: int) -> Decimal:\n    return x\n", "f"),
+        ] {
+            assert_eq!(auto_decision(src, name, &[]), None, "{src}");
+        }
+        // The real stdlib types still resolve.
+        let real =
+            "from datetime import date\ndef f(x: int) -> date:\n    return date(2020, 1, x)\n";
+        assert_eq!(auto_decision(real, "f", &[]), Some(CacheKind::Auto));
+    }
+
+    #[test]
+    fn frozen_classes_are_only_deeply_immutable_when_their_fields_are() {
+        let boxed = "class Box:\n    items: list[int]\n\ndef make(n: int) -> Box:\n    return Box(items=[n])\n\ndef size(b: Box) -> int:\n    return len(b.items)\n";
+        assert_eq!(auto_decision(boxed, "make", &["Box"]), None);
+        assert_eq!(auto_decision(boxed, "size", &["Box"]), None);
+        let nt = "from typing import NamedTuple\nclass Pair(NamedTuple):\n    xs: list[int]\n\ndef make(n: int) -> Pair:\n    return Pair(xs=[n])\n";
+        assert_eq!(auto_decision(nt, "make", &[]), None);
+        let dc = "import dataclasses\n@dataclasses.dataclass(frozen=True)\nclass Cfg:\n    tags: list[str]\n\ndef make(n: int) -> Cfg:\n    return Cfg(tags=[str(n)])\n";
+        assert_eq!(auto_decision(dc, "make", &[]), None);
+        // A frozen class of immutable fields is a shareable result ...
+        let ok = "class P:\n    x: float\n    tag: str\n\ndef make(n: int) -> P:\n    return P(x=float(n), tag=\"t\")\n";
+        assert_eq!(auto_decision(ok, "make", &["P"]), Some(CacheKind::Auto));
+        // ... but a float field makes it an unsound cache *key*.
+        let key = "class P:\n    x: float\n\ndef f(p: P) -> str:\n    return repr(p.x)\n";
+        assert_eq!(auto_decision(key, "f", &["P"]), None);
+        // A custom `__eq__` (in an impl block) too.
+        let eq = "class K:\n    b: bool\n\nclass __typhon_impl_K(object):\n    def __eq__(self, other: object) -> bool:\n        return True\n\ndef f(k: K) -> bool:\n    return k.b\n";
+        assert_eq!(auto_decision(eq, "f", &["K"]), None);
+        let key_ok = "class K:\n    b: bool\n\ndef f(k: K) -> bool:\n    return k.b\n";
+        assert_eq!(auto_decision(key_ok, "f", &["K"]), Some(CacheKind::Auto));
+    }
+
+    #[test]
+    fn asserts_are_walked_for_silent_caching_only() {
+        let validate = "def validate(x: int) -> bool:\n    print(x)\n    return True\n\ndef check(x: int) -> int:\n    assert validate(x)\n    return x\n";
+        assert_eq!(auto_decision(validate, "check", &[]), None);
+        // examples/testing/test_calculator.ty: test functions were memoised.
+        let test = "def add(a: int, b: int) -> int:\n    return a + b\n\ndef test_add() -> None:\n    assert add(1, 2) == 3\n";
+        assert_eq!(auto_decision(test, "test_add", &[]), None);
+        // An explicit `@pure` with an impure assert is not a new error.
+        let f = explicit_findings(
+            "@pure\ndef check(x: int) -> int:\n    assert print(x) is None\n    return x\n",
+        );
+        assert!(f[0].violation.is_none(), "{:?}", f[0].violation);
+        assert!(f[0].unproven.is_some());
+    }
+
+    #[test]
+    fn constructors_with_side_effects_and_class_attributes_are_unproven() {
+        let post_init = "class P:\n    x: int\n\nclass __typhon_impl_P(object):\n    def __post_init__(self) -> None:\n        print(\"made\")\n\ndef mk(x: int) -> int:\n    let p = P(x=x)\n    return p.x\n";
+        // `let` is stripped before this pass; parse the stripped form.
+        let post_init = post_init.replace("let ", "");
+        assert_eq!(auto_decision(&post_init, "mk", &[]), None);
+        let plain_init = "class Bag:\n    def __init__(self) -> None:\n        print(\"bag\")\n\ndef mk(x: int) -> int:\n    b = Bag()\n    return x\n";
+        assert_eq!(auto_decision(plain_init, "mk", &[]), None);
+        let foreign_base = "from pydantic import BaseModel\nclass M(BaseModel):\n    x: int\n\ndef mk(x: int) -> int:\n    m = M(x=x)\n    return m.x\n";
+        assert_eq!(auto_decision(foreign_base, "mk", &[]), None);
+        let classvar = "from typing import ClassVar\nclass Config:\n    DEBUG: ClassVar[bool] = False\n\ndef f(x: int) -> int:\n    return x + 1 if Config.DEBUG else x\n";
+        assert_eq!(auto_decision(classvar, "f", &[]), None);
+        // A plain dataclass constructor and an enum member read stay pure.
+        let ok = "import enum\nclass Color(enum.Enum):\n    RED = 1\n\nclass P:\n    x: int\n\ndef f(x: int) -> int:\n    p = P(x=x)\n    return p.x if Color.RED.value == 1 else 0\n";
+        assert_eq!(auto_decision(ok, "f", &[]), Some(CacheKind::Auto));
+        // None of this is a purity error for an explicit `@pure`.
+        let f = explicit_findings(&post_init.replace("def mk", "@pure\ndef mk"));
+        assert!(f[0].violation.is_none(), "{:?}", f[0].violation);
+    }
+
+    #[test]
+    fn stdlib_calls_that_read_the_world_or_mutate_arguments_are_unproven() {
+        for src in [
+            "from pathlib import Path\ndef f(x: int) -> str:\n    return str(Path.cwd())\n",
+            "from pathlib import Path\ndef f(p: str) -> bool:\n    return Path.exists(Path(p))\n",
+            "import decimal\ndef f(x: str) -> str:\n    return str(decimal.Decimal(x) / 3)\n",
+            "from decimal import Decimal\ndef f(x: str) -> str:\n    return str(Decimal(x) / 3)\n",
+            "import heapq\nQUEUE: list[int] = []\n\ndef f(x: int) -> int:\n    heapq.heappush(QUEUE, x)\n    return x\n",
+            "import bisect\nXS: list[int] = []\n\ndef f(x: int) -> int:\n    bisect.insort(XS, x)\n    return x\n",
+            "import operator\nXS: list[int] = [0]\n\ndef f(x: int) -> int:\n    operator.setitem(XS, 0, x)\n    return x\n",
+            "from heapq import heappush\nQUEUE: list[int] = []\n\ndef f(x: int) -> int:\n    heappush(QUEUE, x)\n    return x\n",
+        ] {
+            assert_eq!(auto_decision(src, "f", &[]), None, "{src}");
+        }
+        // No new purity *error* for the explicit form.
+        let f = explicit_findings("import heapq\nQUEUE: list[int] = []\n\n@pure\ndef f(x: int) -> int:\n    heapq.heappush(QUEUE, x)\n    return x\n");
+        assert!(f[0].violation.is_none(), "{:?}", f[0].violation);
+        // A fresh local heap is fine.
+        let fresh = "import heapq\ndef f(x: int) -> int:\n    h: list[int] = []\n    heapq.heappush(h, x)\n    return h[0]\n";
+        assert_eq!(auto_decision(fresh, "f", &[]), Some(CacheKind::Auto));
+    }
+
+    #[test]
+    fn purity_is_not_trusted_transitively_through_an_inconclusive_helper() {
+        let src = "TABLE: dict[str, int] = {}\n\n@pure\ndef look(k: str) -> int:\n    return TABLE.get(k, 0)\n\ndef total(k: str) -> int:\n    return look(k) + 1\n";
+        assert_eq!(auto_decision(src, "look", &[]), None);
+        assert_eq!(auto_decision(src, "total", &[]), None);
+        let ok = "@pure\ndef inc(k: int) -> int:\n    return k + 1\n\ndef total(k: int) -> int:\n    return inc(k) + 1\n";
+        assert_eq!(auto_decision(ok, "total", &[]), Some(CacheKind::Auto));
     }
 }
 

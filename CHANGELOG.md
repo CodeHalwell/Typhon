@@ -195,6 +195,31 @@ grouped by workstream (W1–W7).
   annotation, and `match` sequence / mapping / `as` / or-pattern captures
   take the subject's type, so `x.slug()` on such a receiver is rewritten to
   the `extend BUILTIN` function instead of raising `AttributeError`.
+- **`-O` / `auto-memoise` can no longer change what a program prints**
+  (W3-04, W3-05). A plain `@pure` under `-O` is held to the full
+  cache-safety proof — `@pure` is a purity claim, not a cacheability claim —
+  so `@pure def window(n) -> list[int]` is no longer cached (a caller's
+  `append` leaked into the next call) and `stress/…/05-knn-toy.ty` no longer
+  fails with `unhashable type: 'Point'`. The silent paths (`auto-memoise`,
+  `pgo-memoise`, `-O`) now also refuse: recursive functions (direct or
+  mutual — the cache wrapper deepens every frame, turning a working depth
+  into `RecursionError`); `float`, `Decimal`, path, datetime and `Callable`
+  parameters, and `int` / `str` inside a tuple key (`0.0 == -0.0`,
+  `(True,) == (1,)`); `Callable` results; `frozen` classes / `NamedTuple`s
+  with a mutable field; user classes named like stdlib types (`Flag`,
+  `Path`, `Decimal`, `UUID`, `date`, `Pattern` are resolved through the
+  imports first); constructors that run code (`__post_init__`, a
+  hand-written `__init__`, a foreign base); class-attribute reads; whatever
+  an `assert` evaluates; `decimal` (context-dependent), `Path.cwd()` /
+  `Path.exists`, and `heapq.heappush` / `bisect.insort` /
+  `operator.setitem` on a non-fresh argument; nested `def`s; and a call to a
+  `@pure` helper whose own check was inconclusive. A silent path emits
+  `@functools.lru_cache(maxsize=1024, typed=True)` — typed, so `show(True)`
+  no longer returns the cached `show(1.0)`, and bounded, so a cache keyed on
+  every rendered document or crawled URL no longer retains them all. An
+  explicit `@memo` keeps `@functools.cache`. None of this adds a
+  `tyc::impure_pure_fn` error: every new finding is "not provably pure",
+  which only withholds the optimisation.
 
 #### W4 — CLI, LSP, filesystem safety
 - **LSP definition URIs rebased onto client workspace root.** `goto_definition` now uses the client's declared workspace root URI (preserving symlink prefixes such as `/var/folders` or `/tmp` rather than macOS `/private/var/...`) or open-document URI, preventing editors from opening duplicate tabs on cross-file jumps.

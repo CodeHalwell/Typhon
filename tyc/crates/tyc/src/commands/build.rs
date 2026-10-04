@@ -15,7 +15,7 @@ use tyc_analyse::{
     load_profile_samples, parallel_opportunity_diagnostics, pgo_memoise_targets,
     purity_diagnostics, rewrite_auto_gather, rewrite_builtin_extension_calls_with_facts,
     rewrite_parallel_comprehensions, rewrite_reduction_loops, shared_mut_across_tasks_diagnostics,
-    substitute_comptime_literals, ClassFacts, ProfileSample, StaticType, TypeFacts,
+    substitute_comptime_literals, CacheKind, ClassFacts, ProfileSample, StaticType, TypeFacts,
 };
 use tyc_db::{check_file_with_imports, extract_shapes_and_facts_for_path, TycDatabase};
 use tyc_desugar::{desugar_module_with, DesugarOptions};
@@ -853,18 +853,18 @@ pub fn run(args: BuildArgs) -> Result<()> {
             ));
         }
         // An explicit `@memo` / `@pure(memo=True)` is honoured once nothing
-        // provably impure was found; an `auto-memoise` candidate must be
-        // provably pure with cache-safe parameters and return type.
-        let mut memoise_targets: Vec<String> = purity_findings
+        // provably impure was found (`@functools.cache`). Every silent path —
+        // `auto-memoise`, `-O`, and a plain `@pure` under either — needs the
+        // full cache-safety proof and gets a bounded, typed `lru_cache`
+        // (W3-04: `@pure` is a purity claim, not a cacheability claim).
+        let memoise_targets: Vec<String> = purity_findings
             .iter()
-            .filter(|f| {
-                f.memoise
-                    && if f.declared_pure {
-                        f.violation.is_none()
-                    } else {
-                        f.auto_cacheable()
-                    }
-            })
+            .filter(|f| f.cache_decision() == Some(CacheKind::Explicit))
+            .map(|f| f.name.clone())
+            .collect();
+        let mut auto_memoise_targets: Vec<String> = purity_findings
+            .iter()
+            .filter(|f| f.cache_decision() == Some(CacheKind::Auto))
             .map(|f| f.name.clone())
             .collect();
 
@@ -891,8 +891,8 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 config.strictness.pgo_min_calls,
             );
             for name in promoted {
-                if !memoise_targets.contains(&name) {
-                    memoise_targets.push(name);
+                if !memoise_targets.contains(&name) && !auto_memoise_targets.contains(&name) {
+                    auto_memoise_targets.push(name);
                 }
             }
         }
@@ -1208,6 +1208,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             &module,
             DesugarOptions {
                 memoise_functions: memoise_targets,
+                auto_memoise_functions: auto_memoise_targets,
                 raw_class_line_starts,
                 frozen_class_line_starts,
                 plain_class_line_starts,
@@ -1568,6 +1569,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             &module,
             DesugarOptions {
                 memoise_functions: Vec::new(),
+                auto_memoise_functions: Vec::new(),
                 raw_class_line_starts,
                 frozen_class_line_starts,
                 plain_class_line_starts,
@@ -5322,6 +5324,63 @@ def fib(n: int) -> int:
         assert!(
             py.contains("cache"),
             "@memo should inject @functools.cache decorator; got:\n{py}"
+        );
+    }
+
+    /// W3-04: `-O` held a plain `@pure` only to "nothing provably impure",
+    /// so `@pure def window(n) -> list[int]` was cached and a caller's
+    /// `append` leaked into the next call. It now needs the cache-safety
+    /// proof; a cache-safe function gets a bounded, typed `lru_cache`.
+    #[test]
+    fn optimise_holds_plain_pure_to_the_cache_safety_proof() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = "\
+@pure
+def window(n: int) -> list[int]:
+    return list(range(n))
+
+@pure
+def add(a: int, b: int) -> int:
+    return a + b
+
+@pure
+def depth(n: int) -> int:
+    return 0 if n == 0 else depth(n - 1) + 1
+";
+        let (_, out_dir) = scaffold(tmp.path(), src);
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+            check: false,
+            no_sync: true,
+            with_ty: false,
+            optimise: true,
+            source_label: None,
+        })
+        .unwrap();
+        let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
+        let decorated = |name: &str| {
+            let at = py.find(&format!("def {name}(")).unwrap();
+            py[..at].trim_end().ends_with(')')
+                && py[..at]
+                    .trim_end()
+                    .rsplit('\n')
+                    .next()
+                    .unwrap()
+                    .starts_with('@')
+        };
+        assert!(
+            !decorated("window"),
+            "a mutable result must not be cached:\n{py}"
+        );
+        assert!(
+            !decorated("depth"),
+            "recursion must not be cached silently:\n{py}"
+        );
+        assert!(
+            py.contains("@functools.lru_cache(maxsize=1024, typed=True)\ndef add("),
+            "a cache-safe @pure gets a bounded typed cache under -O:\n{py}"
         );
     }
 

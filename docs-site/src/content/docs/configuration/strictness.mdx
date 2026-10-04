@@ -50,13 +50,13 @@ allow-secret-comptime = false
 | `suggest-gather` | bool | `true` | Emit the advice-level [`tyc::gather_opportunity`](/Typhon/diagnostics/async-errors/#tycgather_opportunity-advice) hint when 2+ adjacent independent awaited calls could be wrapped in a `gather:` block. Never rewrites, never blocks a build. |
 | `suggest-perf` | bool | `true` | Emit the advice-level `tyc::perf_*` micro-optimisation family (six lints) plus [`tyc::lazy_import_opportunity`](/Typhon/pitfalls/performance/#automatic-performance-advice). Never rewrites, never blocks a build. |
 | `suggest-parallel` | bool | `true` | Emit the advice-level `tyc::parallel_opportunity` / `tyc::shared_mut_across_tasks` hints. Both additionally require `[python] free-threaded = true` to fire. Never rewrites, never blocks a build. |
-| `auto-memoise` | bool | `false` | Insert `@functools.cache` on every function the analyser infers as pure. **Off by default — caches extend lifetimes invisibly.** |
+| `auto-memoise` | bool | `false` | Insert a bounded, typed `@functools.lru_cache` on every function the analyser proves pure and cache-safe. **Off by default — caches extend lifetimes invisibly.** |
 | `auto-gather` | bool | `false` | Fold straight-line independent `await` runs into `asyncio.TaskGroup`, but only for `@gatherable`-decorated callees (same-module or imported from another project module). |
 | `auto-parallel` | bool | `false` | Rewrite pure list comprehensions over large iterables to a `ThreadPoolExecutor.map` (needs `free-threaded`). |
 | `auto-parallel-reductions` | bool | `false` | Parallelise `int`-only accumulator loops (`for x in xs: total += f(x)` with `mut total: int` and a pure `f`) the same way `auto-parallel` handles comprehensions. Requires `auto-parallel = true`. `float` accumulators are never rewritten — reordering IEEE-754 addition changes the result — and the iterable must be provably bounded and effect-free to materialise (a container literal, a container-annotated name, or a builtin `range(...)` call). |
 | `parallel-min-size` | int | `64` | Minimum iterable size for `auto-parallel` to fire. When the size can't be statically inferred, treated as zero. |
 | `parallel-backend` | `"threads"` \| `"interpreters"` | `"threads"` | Execution backend for `auto-parallel` / `auto-parallel-reductions` rewrites. `"interpreters"` tries a PEP 734 `InterpreterPoolExecutor` (3.14+) first, falling back transparently to the thread pool on an older runtime or an unshareable mapped callable. |
-| `pgo-memoise` | bool | `false` | Promote hot pure functions to `@functools.cache` based on `typhon-profile.json` from a prior `tyc profile` run. |
+| `pgo-memoise` | bool | `false` | Promote hot pure, cache-safe functions to a bounded, typed `@functools.lru_cache` based on `typhon-profile.json` from a prior `tyc profile` run. |
 | `pgo-min-calls` | int | `100` | Threshold for `pgo-memoise`. |
 | `allow-secret-comptime` | bool | `false` | When true, silences the `tyc::contains_secret_literal` warning that flags hardcoded secrets or environment variables mapped at build time. |
 
@@ -193,7 +193,7 @@ suggest-parallel = false
 
 ## `auto-memoise`
 
-**Off by default.** When on, every function the analyser can *prove* pure — with immutable, hashable parameters and an immutable return type — gets `@functools.cache`. The runtime impact:
+**Off by default.** When on, every function the analyser can *prove* pure — with parameters that are sound cache keys (no `float`, callables or mutable classes) and a deeply immutable return type, and not recursive — gets `@functools.lru_cache(maxsize=1024, typed=True)`. A plain `@pure` is held to the same bar. The runtime impact:
 
 - Cached arguments stay alive forever (or until the cache is cleared).
 - Cached return values stay alive forever.
@@ -242,7 +242,7 @@ Any other value is rejected at config load.
 
 ## `pgo-memoise`
 
-When `true`, `tyc build` reads `typhon-profile.json` (from a prior [`tyc profile`](/Typhon/cli/profile/) run) and promotes every pure function whose observed call count meets `pgo-min-calls` to `@functools.cache`, even if the user did not write `@memo`. Complements `auto-memoise` (which caches every pure function regardless of profile data).
+When `true`, `tyc build` reads `typhon-profile.json` (from a prior [`tyc profile`](/Typhon/cli/profile/) run) and promotes every provably pure, cache-safe function whose observed call count meets `pgo-min-calls` to a bounded, typed `@functools.lru_cache`, even if the user did not write `@memo`. Complements `auto-memoise` (which caches every pure function regardless of profile data).
 
 Missing profile file is not an error — PGO is best-effort: nothing is promoted and nothing is reported.
 
