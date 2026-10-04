@@ -1184,3 +1184,33 @@ trap("count kw", lambda: "a".count(sub="a"))
 "#,
     );
 }
+
+// ── PR #493 review: VM ↔ CPython parity ───────────────────────────────────
+
+#[test]
+fn pr493_a_class_named_object_is_not_the_builtin_root() {
+    // The builtin `object` placeholder was recognised by its name, so a user
+    // class called `object` was moved to the end of `C(object, B)`'s MRO
+    // (`C().who()` found `B.who`), dropped from `__mro__`, and treated as the
+    // root by `isinstance` / `issubclass`.
+    assert_matches_cpython(
+        "pr493_a_class_named_object_is_not_the_builtin_root",
+        r#"root = object
+plain class object:
+    def who(self) -> str:
+        return "user object"
+plain class B:
+    def who(self) -> str:
+        return "B"
+plain class C(object, B):
+    pass
+show(C().who(), [k.__name__ for k in C.__mro__], len(C.__mro__))
+show(isinstance(5, object), isinstance(C(), object), isinstance(B(), object))
+show(issubclass(int, object), issubclass(C, object), issubclass(B, object))
+plain class D(B, root):
+    pass
+show(isinstance(5, root), isinstance(C(), root), issubclass(C, root), issubclass(object, root))
+show([k.__name__ for k in D.__mro__], D().who())
+"#,
+    );
+}

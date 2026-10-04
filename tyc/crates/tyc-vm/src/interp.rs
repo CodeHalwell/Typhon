@@ -7199,7 +7199,7 @@ impl Interpreter {
                 // `Cls.__mro__` — the C3 linearisation, ending in `object`.
                 if attr == "__mro__" {
                     let mut out: Vec<Value> = class_mro(class)
-                        .filter(|c| !(c.name == "object" && c.bases.is_empty()))
+                        .filter(|c| !crate::value::is_builtin_object(c))
                         .map(|c| Value::Class(c.clone()))
                         .collect();
                     out.push(crate::builtins::make_builtin_type("object"));
@@ -7259,7 +7259,8 @@ impl Interpreter {
                 // `object.__setattr__(obj, name, value)` — the raw attribute
                 // store that bypasses a user `__setattr__` (how a class that
                 // overrides `__setattr__` initialises its own fields).
-                if class.name == "object" && attr == "__setattr__" && class.bases.is_empty() {
+                let builtin_object = crate::value::is_builtin_object(class);
+                if builtin_object && attr == "__setattr__" {
                     return Ok(Value::Native(Rc::new(NativeFn::new(
                         "object.__setattr__",
                         |i, args| {
@@ -7271,7 +7272,7 @@ impl Interpreter {
                         },
                     ))));
                 }
-                if class.name == "object" && attr == "__getattribute__" && class.bases.is_empty() {
+                if builtin_object && attr == "__getattribute__" {
                     return Ok(Value::Native(Rc::new(NativeFn::new(
                         "object.__getattribute__",
                         |i, args| {

@@ -1887,13 +1887,42 @@ pub struct Class {
     pub is_protocol: bool,
 }
 
+thread_local! {
+    /// The VM's placeholder for the builtin `object` class, bound as
+    /// `object` in every interpreter's root scope. It is one object per
+    /// thread so it can be told apart from a user class that is also named
+    /// `object` (`plain class object:`) by identity rather than by name.
+    static BUILTIN_OBJECT: Rc<Class> = Rc::new(Class {
+        name: "object".to_owned(),
+        methods: RefCell::new(HashMap::new()),
+        fields: vec![],
+        class_attrs: RefCell::new(HashMap::new()),
+        bases: vec![],
+        mro: vec![],
+        properties: RefCell::new(std::collections::HashSet::new()),
+        classmethods: RefCell::new(std::collections::HashSet::new()),
+        is_exception: false,
+        is_protocol: false,
+    });
+}
+
+/// The VM's builtin `object` class (see `BUILTIN_OBJECT`).
+pub fn builtin_object_class() -> Rc<Class> {
+    BUILTIN_OBJECT.with(Rc::clone)
+}
+
+/// Whether `c` is the builtin `object` class, not merely a class named so.
+pub fn is_builtin_object(c: &Rc<Class>) -> bool {
+    BUILTIN_OBJECT.with(|o| Rc::ptr_eq(o, c))
+}
+
 /// C3 linearisation of a class with direct `bases`: the ancestors in method
 /// resolution order, without the class itself. `Err` carries the base names
 /// for CPython's "Cannot create a consistent method resolution order (MRO)"
 /// `TypeError`. The VM's placeholder `object` class sorts last, as the
 /// implicit root does in CPython.
 pub fn linearize(bases: &[Rc<Class>]) -> Result<Vec<Rc<Class>>, String> {
-    let is_object = |c: &Rc<Class>| c.name == "object" && c.bases.is_empty();
+    let is_object = is_builtin_object;
     let mut seqs: Vec<Vec<Rc<Class>>> = bases
         .iter()
         .map(|b| {

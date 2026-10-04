@@ -1638,22 +1638,9 @@ pub fn install(interp: &mut Interpreter) {
     // `object` exists as a placeholder so synthesised bases (`class
     // __typhon_impl_Foo(object):` from impl-block lowering, or user code
     // declaring an explicit `object` base) don't trip up name resolution.
-    // The VM treats it as a no-op base class.
-    root.set(
-        "object",
-        Value::Class(Rc::new(crate::value::Class {
-            name: "object".to_owned(),
-            methods: std::cell::RefCell::new(HashMap::new()),
-            fields: vec![],
-            class_attrs: std::cell::RefCell::new(HashMap::new()),
-            bases: vec![],
-            mro: vec![],
-            properties: std::cell::RefCell::new(std::collections::HashSet::new()),
-            classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
-            is_exception: false,
-            is_protocol: false,
-        })),
-    );
+    // The VM treats it as a no-op base class, and recognises it by identity
+    // (`value::is_builtin_object`): a user class may be named `object` too.
+    root.set("object", Value::Class(crate::value::builtin_object_class()));
     // Common typing names that show up as zero-effort bases.
     for name in ["Protocol", "BaseModel", "Generic", "TypedDict"] {
         root.set(
@@ -2270,6 +2257,9 @@ pub(crate) fn is_subclass_of(sub: &Value, cls: &Value) -> bool {
     if let Value::Tuple(t) = cls {
         return t.iter().any(|c| is_subclass_of(sub, c));
     }
+    if let Some(target) = user_class_named_object(cls) {
+        return matches!(sub, Value::Class(c) if class_in_chain_rc(c, target));
+    }
     let want = match cls {
         Value::Native(n) => n.name.to_owned(),
         Value::Class(c) => c.name.clone(),
@@ -2317,7 +2307,20 @@ fn protocol_targets(cls: &Value) -> Vec<Value> {
     }
 }
 
+/// A user class that is merely *named* `object` (`plain class object:`):
+/// an ordinary class, related only to its own subclasses — not the root
+/// every value is an instance of.
+fn user_class_named_object(cls: &Value) -> Option<&Rc<crate::value::Class>> {
+    match cls {
+        Value::Class(c) if c.name == "object" && !crate::value::is_builtin_object(c) => Some(c),
+        _ => None,
+    }
+}
+
 pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
+    if let Some(target) = user_class_named_object(cls) {
+        return matches!(val, Value::Instance(i) if class_in_chain_rc(&i.class, target));
+    }
     let want_name = match cls {
         Value::Native(n) => Some(n.name.to_owned()),
         Value::Class(c) => Some(c.name.clone()),
