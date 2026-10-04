@@ -134,6 +134,21 @@ pub(super) fn union_call(
         .iter()
         .map(|a| infer_expr(c, a))
         .collect();
+    let keywords = &call.arguments.keywords;
+    for kw in keywords {
+        let _ = infer_expr(c, &kw.value);
+    }
+    // A function type records no parameter names, so a keyword can fill any
+    // parameter of a variant, and a `*`/`**` unpacking supplies an unknown
+    // number of arguments: the only count left to check is too many
+    // positionals. Positionals after a `*` unpacking have no fixed slot.
+    let star = call
+        .arguments
+        .args
+        .iter()
+        .position(|a| matches!(a, Expr::Starred(_)));
+    let positional = &actuals[..star.unwrap_or(actuals.len())];
+    let open = !keywords.is_empty() || star.is_some();
     let mut returns = Vec::new();
     for member in members {
         let Type::Function {
@@ -145,18 +160,17 @@ pub(super) fn union_call(
         else {
             unreachable!()
         };
-        if !call.arguments.keywords.is_empty()
-            || actuals.len() < min_params.unwrap_or(params.len())
-            || (!variadic && actuals.len() > params.len())
+        if (!open && actuals.len() < min_params.unwrap_or(params.len()))
+            || (!variadic && positional.len() > params.len())
         {
             c.wrong_args("<callable variant>", params.len(), actuals.len(), span);
         }
-        for (param, actual) in params.iter().zip(&actuals) {
+        for (param, actual) in params.iter().zip(positional) {
             if !c.is_assignable(param, actual) {
                 c.mismatch(param, actual, span);
             }
         }
-        returns.push(bind_typevars_and_substitute(params, &actuals, ret));
+        returns.push(bind_typevars_and_substitute(params, positional, ret));
     }
     Some(Type::union_of(returns))
 }

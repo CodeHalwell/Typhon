@@ -42004,6 +42004,29 @@ def main() -> None:
         ] { assert!(check(src).errors().is_empty(), "{src}: {:?}",check(src).errors()); }
     }
     #[test]
+    fn a_union_of_functions_accepts_keyword_arguments() {
+        const AB: &str =
+            "def a(x: int) -> int:\n    return x\ndef b(x: int) -> str:\n    return str(x)\n";
+        for call in ["h(x=1)", "h(*(1,))", "h(**{\"x\": 1})"] {
+            let src = format!(
+                "{AB}def f(flag: bool) -> int | str:\n    let h = a if flag else b\n    return {call}\n"
+            );
+            assert!(
+                check(&src).errors().is_empty(),
+                "{src}: {:?}",
+                check(&src).errors()
+            );
+        }
+        // Too many positionals, a positional of the wrong type, and an error
+        // inside a keyword value are still reported.
+        for call in ["h(1, 2, x=3)", "h(\"s\", x=1)", "h(x=a(\"s\"))", "h(1, 2)"] {
+            let src = format!(
+                "{AB}def f(flag: bool) -> int | str:\n    let h = a if flag else b\n    return {call}\n"
+            );
+            assert!(!check(&src).errors().is_empty(), "accepted: {src}");
+        }
+    }
+    #[test]
     fn w2_07_await_contracts() {
         for src in [
             "async def f(n: int) -> int:\n    return await n\n",
