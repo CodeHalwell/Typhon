@@ -585,7 +585,14 @@ fn repl_rejects_type_error_block_keeps_session() {
         .write_all(b"let x: int = 1\nlet y: int = \"oops\"\nprint(x)\n:quit\n")
         .unwrap();
     let out = child.wait_with_output().unwrap();
-    assert!(out.status.success(), "repl should not crash on type error");
+    // The session survives the bad block and keeps going; a piped session
+    // then exits 1 because a snippet failed (W4-15), not on a crash.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a piped session with a failed snippet exits 1; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     // First block ok → 1 isn't auto-printed but x is still in scope for `print(x)`.
     assert!(
@@ -1220,7 +1227,7 @@ else:
 #[test]
 fn repl_dedent_terminator_closes_block_and_runs_next_line() {
     // Typed by hand:
-    //   def greet():
+    //   def greet() -> None:
     //       print("hi")
     //   print("after")     ← dedent-to-0 terminator
     // The REPL should treat the first two lines as one `def` block, then
@@ -1241,7 +1248,9 @@ fn repl_dedent_terminator_closes_block_and_runs_next_line() {
         .stdin
         .as_mut()
         .unwrap()
-        .write_all(b"def greet():\n    print(\"hi\")\nprint(\"after\")\n:quit\n")
+        // `-> None`: an unannotated `def` is itself a compile error, and a
+        // piped session now exits 1 when any snippet fails (W4-15).
+        .write_all(b"def greet() -> None:\n    print(\"hi\")\nprint(\"after\")\n:quit\n")
         .unwrap();
     let out = child.wait_with_output().unwrap();
     assert!(

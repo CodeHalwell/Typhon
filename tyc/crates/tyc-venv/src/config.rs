@@ -1,4 +1,10 @@
 //! `typhon.toml` configuration file parsing.
+//!
+//! Lives in `tyc-venv`, the crate the CLI and the language server already
+//! share, so `tyc lsp` loads and validates a project exactly as `tyc check`
+//! does (W4-08, W4-11): the same unknown-key rejection, the same `[project]
+//! src` confinement, the same error text. The `tyc` binary re-exports it as
+//! `crate::config`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -182,7 +188,7 @@ pub struct StrictnessConfig {
     /// Severity for `tyc::method_in_class_body` (Rule 4: methods live in
     /// `impl Name:`, not in the class body). `"warn"` (default) is the
     /// shipped behaviour and matches every other "nudge" diagnostic.
-    /// `"error"` promotes it through [`crate::commands::util::apply_strictness`]
+    /// `"error"` promotes it through the CLI's `apply_strictness`
     /// so CI breaks on the form. `"off"` suppresses the diagnostic
     /// entirely — useful for codebases still mid-migration.
     pub methods_in_class_body: String,
@@ -411,18 +417,7 @@ impl TyphonConfig {
         loop {
             let candidate = dir.join("typhon.toml");
             if candidate.exists() {
-                let text = std::fs::read_to_string(&candidate).map_err(|e| {
-                    crate::config::ConfigError::Io {
-                        path: candidate.to_string_lossy().into_owned(),
-                        cause: e.to_string(),
-                    }
-                })?;
-                let config: Self =
-                    toml::from_str(&text).map_err(|e| crate::config::ConfigError::Parse {
-                        path: candidate.to_string_lossy().into_owned(),
-                        cause: e.to_string(),
-                    })?;
-                config.validate(&candidate)?;
+                let config = Self::load_file(&candidate)?;
                 return Ok(Some((candidate, config)));
             }
             if !dir.pop() {
@@ -430,6 +425,27 @@ impl TyphonConfig {
             }
         }
         Ok(None)
+    }
+
+    /// Read, parse and [`validate`](Self::validate) the `typhon.toml` at
+    /// `path` (no ancestor search). The language server loads a project
+    /// through this so it accepts and rejects exactly what the CLI does.
+    pub fn load_file(path: &Path) -> Result<Self, crate::config::ConfigError> {
+        let text = std::fs::read_to_string(path).map_err(|e| crate::config::ConfigError::Io {
+            path: path.to_string_lossy().into_owned(),
+            cause: e.to_string(),
+        })?;
+        Self::parse_str(&text, path)
+    }
+
+    /// Parse and validate `typhon.toml` text; `path` names it in errors.
+    pub fn parse_str(text: &str, path: &Path) -> Result<Self, crate::config::ConfigError> {
+        let config: Self = toml::from_str(text).map_err(|e| crate::config::ConfigError::Parse {
+            path: path.to_string_lossy().into_owned(),
+            cause: e.to_string(),
+        })?;
+        config.validate(path)?;
+        Ok(config)
     }
 
     /// Serialize this config back to TOML.
@@ -611,6 +627,39 @@ impl TyphonConfig {
         Ok(())
     }
 
+    /// Settings that are accepted but cannot do what they say (W4-16), as
+    /// warning messages. `cli_force_level1` is `tyc build -O`.
+    ///
+    /// These are warnings, not [`validate`](Self::validate) errors, by
+    /// design: validation that rejects a config must only reject configs that
+    /// cannot work, and both combinations below work today — the setting is
+    /// a no-op (or only changes which advice lints fire), so the program
+    /// builds and runs exactly as it would without it.
+    pub fn advisories(&self, cli_force_level1: bool) -> Vec<String> {
+        let mut out = Vec::new();
+        let target = self.python.target.trim();
+        if self.python.free_threaded && !target.ends_with('t') {
+            out.push(format!(
+                "`[python] free-threaded = true` with `target = \"{target}\"`: the free-threaded \
+                 CPython build is the `t` target (`\"{target}t\"`). On a GIL build the \
+                 parallelism advice this enables cannot pay off. Set `target = \"{target}t\"`, \
+                 or remove `free-threaded`."
+            ));
+        }
+        let level1 = cli_force_level1 || self.optimise.level >= 1;
+        let auto_parallel = self.strictness.auto_parallel.unwrap_or(level1);
+        if self.strictness.auto_parallel_reductions && !auto_parallel {
+            out.push(
+                "`[strictness] auto-parallel-reductions = true` does nothing without \
+                 `auto-parallel`: reductions are rewritten only alongside the comprehension \
+                 rewrite. Set `auto-parallel = true` (or `[optimise] level = 1`, or build \
+                 with `-O`), or remove `auto-parallel-reductions`."
+                    .to_owned(),
+            );
+        }
+        out
+    }
+
     /// Resolve the four optimise-gated strictness knobs (`auto-memoise`,
     /// `auto-gather`, `auto-parallel`, `pgo-memoise`) to concrete values,
     /// honouring `[optimise] level` and an optional CLI `-O`/`--optimise`
@@ -643,7 +692,7 @@ impl TyphonConfig {
 /// rather than the minor-only [`parse_python_minor`] in `build.rs` — is
 /// the correct comparison basis: a hypothetical future `"4.0"` compares
 /// `>= (3, 15)` as a version, whereas its minor `0` would not.
-pub(crate) fn parse_python_target(s: &str) -> Option<(u32, u32)> {
+pub fn parse_python_target(s: &str) -> Option<(u32, u32)> {
     let mut parts = s.split('.');
     let major: u32 = parts.next()?.parse().ok()?;
     let minor_raw = parts.next()?;
@@ -726,6 +775,24 @@ pub enum ConfigError {
         key: String,
         value: String,
     },
+}
+
+impl ConfigError {
+    /// The `typhon.toml` key the error is about, when it names one — what an
+    /// editor highlights.
+    pub fn key(&self) -> Option<&str> {
+        match self {
+            ConfigError::Io { .. } | ConfigError::Parse { .. } => None,
+            ConfigError::UnsupportedPythonTarget { .. } => Some("target"),
+            ConfigError::InvalidClassDefault { .. } => Some("class-default"),
+            ConfigError::InvalidModelExtra { .. } => Some("model-extra"),
+            ConfigError::InvalidSeverity { key, .. } => Some(key),
+            ConfigError::InvalidChecker { .. } => Some("external"),
+            ConfigError::InvalidOptimiseLevel { .. } => Some("level"),
+            ConfigError::InvalidParallelBackend { .. } => Some("parallel-backend"),
+            ConfigError::ProjectPathEscapesRoot { key, .. } => Some(key),
+        }
+    }
 }
 
 impl std::fmt::Display for ConfigError {
@@ -1512,5 +1579,44 @@ parallel-backend = \"interpreters\"
                 other => panic!("expected InvalidParallelBackend for {v:?}, got {other:?}"),
             }
         }
+    }
+
+    /// W4-16: accepted-but-ineffective settings are reported as advisories,
+    /// never rejected — both configs below build and run today.
+    #[test]
+    fn advisories_flag_ineffective_parallel_settings() {
+        let parse = |t: &str| TyphonConfig::parse_str(t, Path::new("typhon.toml")).unwrap();
+        let free = parse("[python]\ntarget = \"3.13\"\nfree-threaded = true\n");
+        let msgs = free.advisories(false);
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(msgs[0].contains("3.13t"), "{msgs:?}");
+        assert!(
+            parse("[python]\ntarget = \"3.14t\"\nfree-threaded = true\n")
+                .advisories(false)
+                .is_empty()
+        );
+
+        let red = parse("[strictness]\nauto-parallel-reductions = true\n");
+        assert!(red.advisories(false)[0].contains("auto-parallel-reductions"));
+        // `-O` and `[optimise] level = 1` turn auto-parallel on.
+        assert!(red.advisories(true).is_empty());
+        assert!(
+            parse("[optimise]\nlevel = 1\n[strictness]\nauto-parallel-reductions = true\n")
+                .advisories(false)
+                .is_empty()
+        );
+        assert!(
+            parse("[strictness]\nauto-parallel = true\nauto-parallel-reductions = true\n")
+                .advisories(false)
+                .is_empty()
+        );
+        // An explicit `auto-parallel = false` wins over `-O`.
+        assert_eq!(
+            parse("[strictness]\nauto-parallel = false\nauto-parallel-reductions = true\n")
+                .advisories(true)
+                .len(),
+            1
+        );
+        assert!(TyphonConfig::default().advisories(true).is_empty());
     }
 }

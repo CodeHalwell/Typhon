@@ -146,6 +146,19 @@ class Counter frozen:
 freeze let CFG = Counter(value=0)    # ✅ check-time validated
 ```
 
+## `tyc::reserved_module_name`
+
+The project defines its own `typhon_runtime` module or package directly under the source root. That name is reserved for the runtime package `tyc build` generates next to the emitted Python whenever the program uses `Result` / `Ok` / `Err`, `go`, `lazy`, `freeze` or `try_result`, or imports `typhon_runtime`; the generated package replaces the project's.
+
+```text
+src/typhon_runtime/__init__.ty    # def helper() -> int: …
+src/main.ty                       # from typhon_runtime import helper … Ok(helper())
+```
+
+`tyc build` stops with an error when the program imports something from `typhon_runtime` that the generated runtime does not provide — the program could not start (`ImportError: cannot import name 'helper'`). In every other case it, like `tyc check`, only warns.
+
+**Fix:** rename the module (for example to `runtime_helpers`) and update its imports.
+
 ## `tyc::unknown_module` (warning)
 
 In a project with a `typhon.toml`, an import names a module that is not in

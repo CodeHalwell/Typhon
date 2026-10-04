@@ -377,6 +377,8 @@ class-body execution, iteration is in declaration order, and
 
 `Result[T, E]` is a sealed sum type with two constructors, `Ok(T)` and `Err(E)`. Emits as a tagged dataclass in a generated `typhon_runtime/` module — no PyPI dependency.
 
+The module name `typhon_runtime` is reserved for that generated package: a project module or package of the same name directly under the source root is replaced whenever the runtime is written. `tyc check` and `tyc build` warn about it ([`tyc::reserved_module_name`](diagnostics/reserved_module_name.md)), and `tyc build` fails when the program imports something from `typhon_runtime` that the generated runtime does not provide.
+
 ### The `?` operator
 
 `?` suffix on a `Result`-typed expression unwraps `Ok` and short-circuits `Err` to the enclosing function. The checker enforces that `?` appears only inside a function whose return type is a compatible `Result`. Desugaring is a localised `if isinstance(_x, Err): return _x; v = _x.value` pattern — not try/except, to keep stack traces clean.

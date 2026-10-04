@@ -73,10 +73,13 @@ pub fn rewrite_traceback(text: &str, map_dir: Option<&Path>) -> String {
         if !remapped {
             continue;
         }
-        // A source row under the frame: indented, and not a frame itself.
+        // A source row under the frame: indented (inside the same gutter),
+        // and not a frame itself.
+        let (gutter, _) = split_gutter(line);
         if i < lines.len()
             && lines[i].starts_with(' ')
-            && !lines[i].trim_start().starts_with("File \"")
+            && !split_gutter(lines[i]).1.starts_with("File \"")
+            && !split_gutter(lines[i]).1.is_empty()
         {
             let py_dir = frame_file(line)
                 .and_then(|p| {
@@ -87,7 +90,9 @@ pub fn rewrite_traceback(text: &str, map_dir: Option<&Path>) -> String {
                 .unwrap_or_default();
             match ty_source_row(&rewritten, &py_dir, &mut sources) {
                 Some(text) => {
-                    out.push_str("    ");
+                    // CPython indents the row two columns past the frame.
+                    out.push_str(gutter);
+                    out.push_str("  ");
                     out.push_str(&text);
                     out.push('\n');
                     i += 1;
@@ -114,16 +119,24 @@ pub fn rewrite_traceback(text: &str, map_dir: Option<&Path>) -> String {
     out
 }
 
+/// Split a traceback row into its gutter and its text. The gutter is the
+/// leading run of spaces — plus, inside an `ExceptionGroup` traceback (every
+/// `gather:` failure), the `|` rails CPython draws: `  |   File "…"`.
+fn split_gutter(line: &str) -> (&str, &str) {
+    let body = line.trim_start_matches([' ', '|']);
+    line.split_at(line.len() - body.len())
+}
+
 /// The path inside a `File "PATH", line N` frame row.
 fn frame_file(line: &str) -> Option<String> {
-    let rest = line.trim_start().strip_prefix("File \"")?;
+    let rest = split_gutter(line).1.strip_prefix("File \"")?;
     let end = rest.find('"')?;
     Some(rest[..end].to_owned())
 }
 
 /// A 3.11+ column-anchor row (`    ~~~~^^^^`) under a source row.
 fn is_anchor_row(line: &str) -> bool {
-    let body = line.trim();
+    let body = split_gutter(line).1.trim();
     !body.is_empty() && body.chars().all(|c| c == '~' || c == '^')
 }
 
@@ -134,7 +147,7 @@ fn ty_source_row(
     py_dir: &str,
     sources: &mut HashMap<String, Option<Vec<String>>>,
 ) -> Option<String> {
-    let rest = frame.trim_start().strip_prefix("File \"")?;
+    let rest = split_gutter(frame).1.strip_prefix("File \"")?;
     let path_end = rest.find('"')?;
     let path = &rest[..path_end];
     let (line_no, _, _) = parse_line_suffix(&rest[path_end + 1..])?;
@@ -159,8 +172,7 @@ fn ty_source_row(
 
 /// Try to rewrite one frame line; return it unchanged when no rewrite applies.
 fn try_rewrite_frame(line: &str, map_dir: Option<&Path>) -> String {
-    let trimmed = line.trim_start();
-    let leading_spaces = line.len() - trimmed.len();
+    let (gutter, trimmed) = split_gutter(line);
 
     let Some(rest) = trimmed.strip_prefix("File \"") else {
         return line.to_owned();
@@ -188,8 +200,7 @@ fn try_rewrite_frame(line: &str, map_dir: Option<&Path>) -> String {
     let ty_path = resolve_ty_path(py_path, &map.source);
     let new_after = apply_line_map(&map, after_path);
 
-    let indent = " ".repeat(leading_spaces);
-    format!("{indent}File \"{ty_path}\"{new_after}")
+    format!("{gutter}File \"{ty_path}\"{new_after}")
 }
 
 // ── line mapping ──────────────────────────────────────────────────────────────
@@ -464,5 +475,46 @@ mod tests {
         assert!(result.contains("line 10"), "line preserved");
         assert!(result.contains("greet()"), "code line preserved");
         assert!(result.contains("TypeError"), "exception preserved");
+    }
+
+    /// W4-15: frames inside an `ExceptionGroup` traceback (every `gather:`
+    /// failure) carry a `  |   ` gutter; they were left on `.py` lines.
+    #[test]
+    fn rewrite_traceback_rewrites_exception_group_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let py = dir.path().join("main.py");
+        let map = dir.path().join("main.py.map");
+        let ty = dir.path().join("main.ty");
+        std::fs::write(&py, "").unwrap();
+        std::fs::write(&ty, "def f() -> None:\n    raise ValueError(\"x\")\n").unwrap();
+        std::fs::write(
+            &map,
+            r#"{"version":2,"source":"main.ty","line_strategy":"table","lines":[1,1,2]}"#,
+        )
+        .unwrap();
+        let text = format!(
+            "  + Exception Group Traceback (most recent call last):\n  |   File \"{py}\", line 3, in <module>\n  |     raise_it()\n  | ExceptionGroup: errors (1 sub-exception)\n  +-+---------------- 1 ----------------\n    | Traceback (most recent call last):\n    |   File \"{py}\", line 3, in f\n    |     __typhon_x__ = 1\n    |     ~~~~^^^\n    | ValueError: x\n    +------------------------------------\n",
+            py = py.display()
+        );
+        let result = rewrite_traceback(&text, None);
+        assert!(
+            !result.contains("main.py\""),
+            "every frame is remapped:\n{result}"
+        );
+        assert!(
+            result.contains("  |   File \"") && result.contains("    |   File \""),
+            "the gutters are kept:\n{result}"
+        );
+        assert!(result.contains(", line 2, in f"), "{result}");
+        assert!(
+            result.contains("    |     raise ValueError(\"x\")"),
+            "the .ty row is shown inside the gutter:\n{result}"
+        );
+        assert!(!result.contains("__typhon_x__"), "{result}");
+        assert!(!result.contains("~~~~^^^"), "{result}");
+        assert!(
+            result.contains("+------------------------------------"),
+            "{result}"
+        );
     }
 }

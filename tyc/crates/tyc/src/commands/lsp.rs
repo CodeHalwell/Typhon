@@ -27,6 +27,12 @@ pub struct LspArgs {
 
 pub fn run(args: LspArgs) -> Result<()> {
     let level = tyc_lsp::LogLevel::parse(&args.log_level);
-    tyc_lsp::run_stdio(level);
+    // Non-zero when the client exits without `shutdown` (W4-11): the LSP
+    // spec's exit code for `exit` before `shutdown`, and the signal a client
+    // uses to decide whether to restart the server.
+    let code = tyc_lsp::run_stdio(level);
+    if code != 0 {
+        std::process::exit(code);
+    }
     Ok(())
 }

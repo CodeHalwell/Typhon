@@ -7,6 +7,10 @@ sidebar:
 
 The compiler generates a small `typhon_runtime/` package alongside your code whenever the emitted Python references any of its helpers — that is, whenever the program uses `Result` / `Ok` / `Err`, `go` (spawn), `lazy import` / `lazy let`, `map_pure`, `deep_freeze`, `checked_cast` (the `as!` cast, v0.14.0), or `try_result` (v0.15.0). This page lists what's in it. The exact source below is what `tyc build` writes verbatim — search for `TYPHON_RUNTIME_*_PY` in `tyc/crates/tyc/src/commands/build.rs` to read the templates.
 
+:::caution[`typhon_runtime` is a reserved name]
+Do not name a module of your own `typhon_runtime`. The generated package replaces it whenever it is written, so `tyc check` and `tyc build` warn ([`tyc::reserved_module_name`](/Typhon/diagnostics/compile-errors/#tycreserved_module_name)) when the source root holds a `typhon_runtime.ty` or a `typhon_runtime/` package, and `tyc build` fails when the program imports a name from it that the generated runtime does not provide — such a program could not start.
+:::
+
 ## `typhon_runtime/__init__.py`
 
 Always emitted when any of the runtime helpers are needed. Re-exports `Ok` / `Err` / `Result` so callers can `from typhon_runtime import Ok, Err`, and re-exports the `lazy`, `tasks`, `result`, `parallel`, `stdlib` submodules under dotted paths.

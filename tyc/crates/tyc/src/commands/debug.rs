@@ -339,6 +339,37 @@ pub fn run(args: DebugArgs) -> Result<()> {
     Ok(())
 }
 
+/// `s` as a double-quoted Python string literal. Backslashes, quotes and
+/// control characters are escaped, and every non-ASCII character becomes a
+/// `\uXXXX` / `\UXXXXXXXX` escape, so the literal is plain ASCII and means
+/// exactly `s` to Python whatever the wrapper file's encoding.
+fn python_str_literal(s: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                let _ = write!(out, "\\x{:02x}", c as u32);
+            }
+            c if c.is_ascii() => out.push(c),
+            c if (c as u32) <= 0xffff => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => {
+                let _ = write!(out, "\\U{:08x}", c as u32);
+            }
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Write a one-shot Python wrapper script to a tempfile that subclasses
 /// `pdb.Pdb`, loads the project's `.py.map` sidecars, and prints the
 /// originating `.ty:line` next to every paused frame.
@@ -354,20 +385,16 @@ fn write_typhon_pdb_wrapper(
     use std::io::Write;
     let entry_str = entry.to_string_lossy().into_owned();
     let map_dir = out_dir.to_string_lossy().into_owned();
-    // Quoting strategy: emit each path as a Python double-quoted
-    // string literal via Rust's `{:?}` formatter. Rust's debug
-    // format escapes `\` and `"` per the Rust string spec, which
-    // happens to be a valid subset of Python's string-literal
-    // escaping — so a Windows path like `C:\foo\bar.py` round-trips
-    // as `"C:\\foo\\bar.py"`. The previous version used a raw
-    // `r"..."` prefix, which silently double-escaped backslashes
-    // (file lookups would then miss on Windows) and could not end
-    // in a backslash. FINDINGS — gemini review of PR #105.
-    let entry_lit = format!("{:?}", entry_str);
-    let map_dir_lit = format!("{:?}", map_dir);
+    // Every value is spliced in as a Python string literal built by
+    // `python_str_literal`. Rust's `{:?}` (used before W4-15) is not
+    // Python syntax: it writes `\u{200b}`, which Python rejects as a
+    // truncated `\uXXXX` escape, so a path with a zero-width space broke
+    // the wrapper. (A raw `r"..."` before that could not end in `\`.)
+    let entry_lit = python_str_literal(&entry_str);
+    let map_dir_lit = python_str_literal(&map_dir);
     let break_cmds: String = breakpoint_cmds
         .iter()
-        .map(|c| format!("    {:?},\n", c))
+        .map(|c| format!("    {},\n", python_str_literal(c)))
         .collect();
 
     let body = format!(
@@ -852,5 +879,32 @@ mod tests {
         let spec = parse_breakpoint_spec("missing.ty:1").unwrap();
         let err = translate_breakpoint(&spec, &src, &out).unwrap_err();
         assert!(err.contains("no .py.map"), "got: {err}");
+    }
+
+    /// W4-15: the wrapper's string literals are Python syntax. Rust's `{:?}`
+    /// wrote `\u{200b}` for a zero-width space — a Python `SyntaxError`
+    /// (truncated `\uXXXX` escape) for any project path containing one.
+    #[test]
+    fn python_str_literal_round_trips_through_python() {
+        let nasty = "dir\u{200b}/a \"b\" \\c\\\t\u{1f600}\u{7f}é";
+        let lit = python_str_literal(nasty);
+        assert!(lit.is_ascii(), "{lit}");
+        assert!(!lit.contains("\\u{"), "Rust escape leaked: {lit}");
+        let Ok(out) = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(format!(
+                "import sys; sys.stdout.buffer.write({lit}.encode('utf-8'))"
+            ))
+            .output()
+        else {
+            eprintln!("skipping: no python3 on PATH");
+            return;
+        };
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), nasty);
     }
 }

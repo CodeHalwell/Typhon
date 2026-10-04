@@ -1,4 +1,7 @@
-//! Venv-driven signature introspection for the type checker.
+//! Venv-driven signature introspection for the type checker, plus the
+//! project plumbing the CLI and the language server share: `typhon.toml`
+//! loading and validation ([`config`]) and the symlink-safe source walk
+//! ([`walk`]).
 //!
 //! When a project imports a third-party Python package that ships no
 //! `.dty` stub (the common case for things installed via `uv add`),
@@ -42,6 +45,9 @@
 //!   wrong-arity third-party calls surface as live editor diagnostics. The
 //!   cache reuses per-module results across keystrokes and invalidates on a
 //!   `.venv/pyvenv.cfg` mtime change (a `uv sync`).
+
+pub mod config;
+pub mod walk;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1369,29 +1375,19 @@ fn is_valid_dotted_name(s: &str) -> bool {
 }
 
 fn collect_ty_files_for_scan(root: &Path) -> Option<Vec<PathBuf>> {
-    let mut files: Vec<PathBuf> = Vec::new();
-    if root.is_file() {
-        files.push(root.to_path_buf());
-        return Some(files);
-    }
-    if !root.is_dir() {
+    if !root.exists() {
         return None;
     }
-    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("ty") {
-                files.push(path);
-            }
-        }
+    // The shared symlink-safe walk: the hand-rolled stack walk this replaced
+    // had no loop guard, so a `src/a -> .` link hung both `tyc check` and the
+    // language server whenever a dependency was declared (W4-08).
+    walk::Walk {
+        ext: "ty",
+        filter: walk::DirFilter::None,
+        strict: false,
     }
-    Some(files)
+    .collect_quiet(root)
+    .ok()
 }
 
 /// Walk every `.ty` file under `paths`, introspect each third-party

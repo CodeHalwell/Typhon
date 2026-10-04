@@ -60,23 +60,201 @@ pub struct CheckArgs {
     pub with_ty: bool,
 }
 
-pub fn run(args: CheckArgs) -> Result<()> {
-    // Load strictness config from `typhon.toml`, anchoring the search to the
-    // first checked path (or CWD when none is provided) so that
-    // `tyc check path/to/project` uses that project's config, not the caller's.
-    let config_start = args
-        .paths
-        .first()
-        .map(|p| {
-            if p.is_file() {
-                p.parent()
-                    .map(|d| d.to_path_buf())
-                    .unwrap_or_else(|| PathBuf::from("."))
-            } else {
-                p.clone()
+/// One project's share of a `tyc check` invocation (W4-06).
+///
+/// `tyc check <dir>` used to load one `typhon.toml` and put every file under
+/// `<dir>` into one database, so two apps under a common parent saw each
+/// other's modules: `tyc check examples/` reported 34 errors across apps that
+/// are each clean on their own. A directory argument is now split at every
+/// nested `typhon.toml`: each nested project is checked as if the user had run
+/// `tyc check <that project>`, with its own config and database, and the files
+/// that belong to no nested project keep the original behaviour.
+#[derive(Debug, Clone)]
+struct CheckScope {
+    /// Where the `typhon.toml` search starts (the scope's first root).
+    config_start: PathBuf,
+    /// Files and directories to walk, as the user (or the partition) named them.
+    roots: Vec<PathBuf>,
+    /// Nested project directories whose files belong to another scope.
+    exclude: Vec<PathBuf>,
+}
+
+impl CheckScope {
+    /// `true` when `path` (as produced by walking one of `roots`) belongs to
+    /// this scope rather than to a nested project.
+    fn owns(&self, path: &std::path::Path) -> bool {
+        !self.exclude.iter().any(|dir| path.starts_with(dir))
+    }
+
+    /// [`collect_ty_files`] over `root`, minus files of nested projects.
+    fn ty_files(&self, root: &std::path::Path) -> Result<Vec<PathBuf>> {
+        let mut files = collect_ty_files(root)?;
+        files.retain(|f| self.owns(f));
+        Ok(files)
+    }
+
+    /// [`collect_dty_files`] over `root`, minus files of nested projects.
+    fn dty_files(&self, root: &std::path::Path) -> Result<Vec<PathBuf>> {
+        let mut files = collect_dty_files(root)?;
+        files.retain(|f| self.owns(f));
+        Ok(files)
+    }
+}
+
+/// The `typhon.toml` search start for a path argument: a file's directory, or
+/// the directory itself.
+fn config_start_for(path: Option<&PathBuf>) -> PathBuf {
+    path.map(|p| {
+        if p.is_file() {
+            p.parent()
+                .map(|d| d.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("."))
+        } else {
+            p.clone()
+        }
+    })
+    .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Split `paths` into one scope per project (see [`CheckScope`]). Without any
+/// nested `typhon.toml` this is the single scope `tyc check` always used.
+fn partition_by_project(paths: &[PathBuf]) -> Result<Vec<CheckScope>> {
+    let mut base = CheckScope {
+        config_start: config_start_for(paths.first()),
+        roots: paths.to_vec(),
+        exclude: Vec::new(),
+    };
+    let mut nested_scopes: Vec<CheckScope> = Vec::new();
+    for path in paths.iter().filter(|p| p.is_dir()) {
+        let nested = crate::commands::util::nested_project_dirs(path)?;
+        for dir in &nested {
+            if nested_scopes.iter().any(|s| s.roots[0] == *dir) {
+                continue;
             }
-        })
-        .unwrap_or_else(|| PathBuf::from("."));
+            nested_scopes.push(CheckScope {
+                config_start: dir.clone(),
+                roots: vec![dir.clone()],
+                exclude: nested
+                    .iter()
+                    .filter(|other| *other != dir && other.starts_with(dir))
+                    .cloned()
+                    .collect(),
+            });
+        }
+        base.exclude.extend(nested);
+    }
+    if nested_scopes.is_empty() {
+        return Ok(vec![base]);
+    }
+    // Keep the outer scope only when something is left in it once the nested
+    // projects are carved out — `tyc check apps/` over a directory of
+    // projects has no loose files of its own.
+    let mut scopes = Vec::new();
+    let base_has_files = base.roots.iter().any(|root| {
+        base.ty_files(root).is_ok_and(|f| !f.is_empty())
+            || base.dty_files(root).is_ok_and(|f| !f.is_empty())
+    });
+    if base_has_files {
+        scopes.push(base);
+    }
+    scopes.extend(nested_scopes);
+    Ok(scopes)
+}
+
+/// What one [`CheckScope`] produced, for the combined summary line.
+#[derive(Default)]
+struct ScopeOutcome {
+    file_count: usize,
+    error_count: usize,
+    warning_count: usize,
+    error_codes: std::collections::HashSet<String>,
+    unintrospectable_fatal: bool,
+}
+
+pub fn run(args: CheckArgs) -> Result<()> {
+    let scopes = partition_by_project(&args.paths)?;
+    let mut total = ScopeOutcome::default();
+    for scope in &scopes {
+        let outcome = check_scope(&args, scope)?;
+        total.file_count += outcome.file_count;
+        total.error_count += outcome.error_count;
+        total.warning_count += outcome.warning_count;
+        total.error_codes.extend(outcome.error_codes);
+        total.unintrospectable_fatal |= outcome.unintrospectable_fatal;
+    }
+    let file_count = total.file_count;
+
+    if total.error_count > 0 {
+        let unique = total.error_codes.len();
+        return Err(miette!(
+            "{} error{} ({} unique code{}) in {} file{}{}",
+            total.error_count,
+            if total.error_count == 1 { "" } else { "s" },
+            unique,
+            if unique == 1 { "" } else { "s" },
+            file_count,
+            if file_count == 1 { "" } else { "s" },
+            if total.warning_count > 0 {
+                format!(" and {} warning(s)", total.warning_count)
+            } else {
+                String::new()
+            },
+        ));
+    }
+
+    // `[strictness] unintrospectable-dependency = "error"` escalates a
+    // skipped third-party check into a hard failure (already reported above).
+    if total.unintrospectable_fatal {
+        return Err(miette!(
+            "declared dependencies could not be introspected (see message above); \
+             failing because `[strictness] unintrospectable-dependency = \"error\"`"
+        ));
+    }
+
+    if file_count == 0 {
+        // Checking nothing is a failure (W4-15): an empty directory or a
+        // mistyped / `.py`-only path used to exit 0, so CI went green
+        // without checking anything. The hint (FINDINGS #39) names what was
+        // looked for and the `--stubs` path, since a directory of `.dty`
+        // files without `.ty` siblings is not picked up by default.
+        let display_paths: Vec<String> = args
+            .paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let joined = if display_paths.is_empty() {
+            ".".to_owned()
+        } else {
+            display_paths.join(", ")
+        };
+        return Err(miette!(
+            "no checkable files in {joined}: looked for `.ty` source files. \
+             To check stubs recursively, run `tyc check --stubs {joined}`; \
+             to check a single `.dty` stub pass it directly."
+        ));
+    }
+
+    if !args.quiet_success {
+        if total.warning_count > 0 {
+            println!(
+                "checked {} file(s) — {} warning(s)",
+                file_count, total.warning_count
+            );
+        } else {
+            println!("checked {} file(s) — no errors", file_count);
+        }
+    }
+    Ok(())
+}
+
+/// Check one [`CheckScope`] with its own config and database, render its
+/// diagnostics, and report the counts. Errors in the scope are returned as
+/// counts, not as `Err`, so every scope is checked before `run` fails.
+fn check_scope(args: &CheckArgs, scope: &CheckScope) -> Result<ScopeOutcome> {
+    // Load strictness config from `typhon.toml`, anchoring the search to the
+    // scope's first path (or CWD when none is provided) so that
+    // `tyc check path/to/project` uses that project's config, not the caller's.
+    let config_start = scope.config_start.clone();
     let (config, has_project_config, project_root) = match TyphonConfig::load(&config_start) {
         // `TyphonConfig::load` walks ancestors searching for `typhon.toml`,
         // so the returned path may live in a parent of `config_start`. The
@@ -126,7 +304,7 @@ pub fn run(args: CheckArgs) -> Result<()> {
     // standalone `.ty` file being checked outside a project context should
     // not be penalised for importing third-party packages that happen not to
     // be listed anywhere.
-    let project_modules = collect_project_modules(&args.paths, &config.project.src);
+    let project_modules = collect_project_modules(scope, &config.project.src);
     let mut extra_modules: Vec<String> = config
         .dependencies
         .keys()
@@ -186,7 +364,7 @@ pub fn run(args: CheckArgs) -> Result<()> {
         .and_then(|n| n.to_str())
         .unwrap_or(&config.project.src)
         .to_owned();
-    let mut shape_map = collect_project_shapes(&args.paths, &src_root_name);
+    let mut shape_map = collect_project_shapes(scope, &src_root_name);
     // Aggregate `pub *` package facades into their __init__ shape so a
     // downstream `from <pkg> import X` resolves through the facade the
     // same way it does at build time. Without this, cross-module flow
@@ -196,8 +374,8 @@ pub fn run(args: CheckArgs) -> Result<()> {
     // exhaustiveness checker accepted. (Bug 2 from v0.9.0 stress.)
     {
         let mut all_paths: Vec<PathBuf> = Vec::new();
-        for root in &args.paths {
-            if let Ok(files) = collect_ty_files(root) {
+        for root in &scope.roots {
+            if let Ok(files) = scope.ty_files(root) {
                 all_paths.extend(files);
             }
             // `.dty` stubs participate in the shape map on equal footing
@@ -205,7 +383,7 @@ pub fn run(args: CheckArgs) -> Result<()> {
             // see them too — otherwise a `pub *` facade implemented as
             // `__init__.dty` or a sibling `.dty` module wouldn't be
             // re-exported. (Copilot PR review on check.rs.)
-            if let Ok(files) = collect_dty_files(root) {
+            if let Ok(files) = scope.dty_files(root) {
                 all_paths.extend(files);
             }
         }
@@ -229,6 +407,26 @@ pub fn run(args: CheckArgs) -> Result<()> {
     // degrades gracefully (it'll just under-match rather than panic).
     let src_dir = project_root.join(&config.project.src);
     let src_dir_canon = src_dir.canonicalize().unwrap_or(src_dir);
+    // W4-16: settings that are accepted but cannot take effect.
+    if has_project_config {
+        for advisory in config.advisories(false) {
+            eprintln!(
+                "warning: {}: {advisory}",
+                project_root.join("typhon.toml").display()
+            );
+        }
+    }
+    // W4-12: `typhon_runtime` is reserved for the runtime `tyc build`
+    // generates. Whether the build would break depends on the desugared
+    // program, which `tyc check` does not produce, so `check` only warns.
+    if has_project_config {
+        if let Some(user_runtime) = super::reserved::user_runtime(&src_dir_canon) {
+            eprintln!(
+                "{:?}",
+                super::reserved::reserved_warning(&user_runtime, false)
+            );
+        }
+    }
 
     // Venv-introspection enrichment: shell to the project's
     // `.venv/bin/python` and ask `inspect.signature` for the real
@@ -248,8 +446,16 @@ pub fn run(args: CheckArgs) -> Result<()> {
             .iter()
             .map(|m| m.split('.').next().unwrap_or(m).to_owned())
             .collect();
+        // The scope's own `.ty` files, not its roots: a root may hold
+        // nested projects whose imports are not this project's.
+        let mut scan_files: Vec<PathBuf> = Vec::new();
+        for root in &scope.roots {
+            if let Ok(files) = scope.ty_files(root) {
+                scan_files.extend(files);
+            }
+        }
         unintrospectable_deps = tyc_venv::enrich_project_shapes_with_venv(
-            &args.paths,
+            &scan_files,
             &project_root,
             &project_module_set,
             allowed_top_level,
@@ -267,8 +473,8 @@ pub fn run(args: CheckArgs) -> Result<()> {
         );
     let project_shapes = std::sync::Arc::new(shape_map);
 
-    for root in &args.paths {
-        let ty_files = collect_ty_files(root)?;
+    for root in &scope.roots {
+        let ty_files = scope.ty_files(root)?;
 
         // FINDINGS #39: when the user points `tyc check` at a single
         // `.dty` stub file (e.g. `tyc check lib.dty`), the
@@ -414,7 +620,7 @@ pub fn run(args: CheckArgs) -> Result<()> {
         // module.  Mismatches are reported through the standard diagnostics
         // channel so CI treats them like any other check error.
         if args.stubs {
-            for path in collect_dty_files(root)? {
+            for path in scope.dty_files(root)? {
                 file_count += 1;
                 let source = match std::fs::read_to_string(&path) {
                     Ok(s) => s,
@@ -513,34 +719,15 @@ pub fn run(args: CheckArgs) -> Result<()> {
 
     render_diagnostics(&diags, &distributed_by_path);
 
-    if diags.has_errors() {
-        return Err(miette!(
-            "{} error{} ({} unique code{}) in {} file{}{}",
-            diags.error_count(),
-            if diags.error_count() == 1 { "" } else { "s" },
-            unique_code_count(diags.errors()),
-            if unique_code_count(diags.errors()) == 1 {
-                ""
-            } else {
-                "s"
-            },
-            file_count,
-            if file_count == 1 { "" } else { "s" },
-            if diags.warning_count() > 0 {
-                format!(" and {} warning(s)", diags.warning_count())
-            } else {
-                String::new()
-            },
-        ));
-    }
-
-    // `[strictness] unintrospectable-dependency = "error"` escalates a
-    // skipped third-party check into a hard failure (already reported above).
-    if unintrospectable_fatal {
-        return Err(miette!(
-            "declared dependencies could not be introspected (see message above); \
-             failing because `[strictness] unintrospectable-dependency = \"error\"`"
-        ));
+    let outcome = ScopeOutcome {
+        file_count,
+        error_count: diags.error_count(),
+        warning_count: diags.warning_count(),
+        error_codes: error_codes(diags.errors()),
+        unintrospectable_fatal,
+    };
+    if diags.has_errors() || unintrospectable_fatal {
+        return Ok(outcome);
     }
 
     // `--with-ty`: the Typhon check passed; now build to a throwaway
@@ -568,41 +755,7 @@ pub fn run(args: CheckArgs) -> Result<()> {
             })?;
         }
     }
-
-    if !args.quiet_success {
-        if file_count == 0 {
-            // FINDINGS #39: a silent "checked 0 file(s)" leaves the
-            // user wondering whether the run actually did anything.
-            // Print an actionable hint pointing at what we looked for
-            // and at the `--stubs` flag (the recursive stub-discovery
-            // path), so the user sees that a directory of `.dty` files
-            // without any `.ty` siblings isn't picked up by default.
-            let display_paths: Vec<String> = args
-                .paths
-                .iter()
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect();
-            let joined = if display_paths.is_empty() {
-                ".".to_owned()
-            } else {
-                display_paths.join(", ")
-            };
-            println!(
-                "no checkable files in {joined}: looked for `.ty` source files. \
-                 To check stubs recursively, run `tyc check --stubs {joined}`; \
-                 to check a single `.dty` stub pass it directly."
-            );
-        } else if diags.warning_count() > 0 {
-            println!(
-                "checked {} file(s) — {} warning(s)",
-                file_count,
-                diags.warning_count()
-            );
-        } else {
-            println!("checked {} file(s) — no errors", file_count);
-        }
-    }
-    Ok(())
+    Ok(outcome)
 }
 
 /// Capture the preprocessor's recorded `impl_distributed_lines` for
@@ -808,14 +961,14 @@ fn extract_path_hint(err: &TycError) -> Option<String> {
 /// Count unique diagnostic codes across an error slice — fed into the
 /// summary line so the user gets "3 errors (2 unique codes)" rather
 /// than just a raw count. Helps recognise repeated patterns.
-fn unique_code_count(items: &[TycError]) -> usize {
+fn error_codes(items: &[TycError]) -> std::collections::HashSet<String> {
     use miette::Diagnostic;
     let mut codes: std::collections::HashSet<String> = std::collections::HashSet::new();
     for item in items {
         let code = item.code().map(|c| c.to_string()).unwrap_or_default();
         codes.insert(code);
     }
-    codes.len()
+    codes
 }
 
 /// True when `name` is the top-level name of a Python stdlib module
@@ -1029,15 +1182,15 @@ fn run_secondary_passes(
 /// `<src_root>/foo/bar.{ty,dty}`. `.dty` stubs win on duplicates
 /// (preferred since they're the authored Typhon surface).
 fn collect_project_shapes(
-    paths: &[PathBuf],
+    scope: &CheckScope,
     src_root: &str,
 ) -> std::collections::HashMap<String, tyc_db::ModuleShapes> {
     let mut shapes: std::collections::HashMap<String, tyc_db::ModuleShapes> =
         std::collections::HashMap::new();
     // Stubs first so the `.ty` insertion below skips them — `.dty`
     // is the source of truth for the public Typhon surface.
-    for root in paths {
-        if let Ok(files) = collect_dty_files(root) {
+    for root in &scope.roots {
+        if let Ok(files) = scope.dty_files(root) {
             for file in files {
                 let dotted = ty_path_to_dotted(&file, src_root);
                 if let Ok(text) = std::fs::read_to_string(&file) {
@@ -1047,7 +1200,7 @@ fn collect_project_shapes(
                 }
             }
         }
-        if let Ok(files) = collect_ty_files(root) {
+        if let Ok(files) = scope.ty_files(root) {
             for file in files {
                 let dotted = ty_path_to_dotted(&file, src_root);
                 if shapes.contains_key(&dotted) {
@@ -1065,10 +1218,10 @@ fn collect_project_shapes(
     shapes
 }
 
-fn collect_project_modules(paths: &[PathBuf], src_root: &str) -> Vec<String> {
+fn collect_project_modules(scope: &CheckScope, src_root: &str) -> Vec<String> {
     let mut modules: Vec<String> = Vec::new();
-    for root in paths {
-        if let Ok(files) = collect_ty_files(root) {
+    for root in &scope.roots {
+        if let Ok(files) = scope.ty_files(root) {
             for file in files {
                 let dotted = ty_path_to_dotted(&file, src_root);
                 if !modules.contains(&dotted) {
@@ -1079,7 +1232,7 @@ fn collect_project_modules(paths: &[PathBuf], src_root: &str) -> Vec<String> {
         // `.dty` stubs are project modules too — `from stubs.fakelib
         // import X` against a `stubs/fakelib.dty` must not warn
         // `unknown_module` (the stub IS the module's Typhon surface).
-        if let Ok(files) = collect_dty_files(root) {
+        if let Ok(files) = scope.dty_files(root) {
             for file in files {
                 let dotted = ty_path_to_dotted(&file, src_root);
                 if !modules.contains(&dotted) {
