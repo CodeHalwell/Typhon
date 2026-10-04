@@ -209,6 +209,12 @@ grouped by workstream (W1–W7).
 - **`tyc install skill` refuses to write through a symlink** (W4-13, install
   half). Every destination component is checked before the first write, and
   writes are atomic.
+- **`tyc check DIR` checks nested projects separately** (W4-06). A directory
+  argument is split at every nested `typhon.toml`; each project is checked
+  with its own config and database, as `tyc check <project>` would check it,
+  and files outside every nested project keep the config found for `DIR`.
+  `tyc check examples/` used to report 34 errors from apps resolving each
+  other's modules; it is now clean.
 
 #### W5 — VM & harness
 

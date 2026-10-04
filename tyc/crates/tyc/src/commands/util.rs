@@ -134,13 +134,45 @@ pub fn collect_py_files(root: &Path) -> Result<Vec<PathBuf>> {
 pub fn collect_with_ext_filtered(root: &Path, ext: &str, acc: &mut Vec<PathBuf>) -> Result<()> {
     let mut visited = HashSet::new();
     let base = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    collect_with_ext_impl(root, &base, ext, acc, &mut visited, true)
+    collect_with_ext_impl(root, &base, ext, acc, &mut visited, true, true)
 }
 
 fn collect_with_ext(root: &Path, ext: &str, acc: &mut Vec<PathBuf>) -> Result<()> {
     let mut visited = HashSet::new();
     let base = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    collect_with_ext_impl(root, &base, ext, acc, &mut visited, false)
+    collect_with_ext_impl(root, &base, ext, acc, &mut visited, false, true)
+}
+
+/// Every directory strictly below `root` that holds its own `typhon.toml`,
+/// in sorted order, found by the same symlink-safe walk `tyc check` uses for
+/// sources (so a nested project is recognised exactly when its files would be
+/// collected). `tyc check <dir>` checks each one as a separate project.
+pub fn nested_project_dirs(root: &Path) -> Result<Vec<PathBuf>> {
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut visited = HashSet::new();
+    let base = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut manifests = Vec::new();
+    // Quiet: the source walks that follow report any skipped symlink once.
+    collect_with_ext_impl(
+        root,
+        &base,
+        "toml",
+        &mut manifests,
+        &mut visited,
+        false,
+        false,
+    )?;
+    let mut dirs: Vec<PathBuf> = manifests
+        .into_iter()
+        .filter(|p| p.file_name().is_some_and(|n| n == "typhon.toml"))
+        .filter_map(|p| p.parent().map(Path::to_path_buf))
+        .filter(|dir| dir != root)
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    Ok(dirs)
 }
 
 /// Whether `path` is a symlink whose target resolves outside `base` (the
@@ -187,12 +219,15 @@ fn collect_with_ext_impl(
     acc: &mut Vec<PathBuf>,
     visited: &mut HashSet<PathBuf>,
     filtered: bool,
+    warn: bool,
 ) -> Result<()> {
     if symlink_escapes(root, base) {
-        eprintln!(
-            "warning: skipping '{}': symlink resolves outside the source tree",
-            root.display()
-        );
+        if warn {
+            eprintln!(
+                "warning: skipping '{}': symlink resolves outside the source tree",
+                root.display()
+            );
+        }
         return Ok(());
     }
     if root.is_file() {
@@ -231,7 +266,7 @@ fn collect_with_ext_impl(
                     }
                 }
             }
-            collect_with_ext_impl(&path, base, ext, acc, visited, filtered)?;
+            collect_with_ext_impl(&path, base, ext, acc, visited, filtered, warn)?;
         }
     }
     Ok(())

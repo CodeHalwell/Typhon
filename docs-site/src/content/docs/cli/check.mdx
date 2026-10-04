@@ -51,6 +51,8 @@ Useful as a CI gate when you ship `.dty` stubs.
 
 `tyc check` walks up from the first checked path looking for `typhon.toml`. To target a different project, pass an explicit path: `tyc check path/to/project`.
 
+A directory that holds several projects is checked one project at a time. Every subdirectory with its own `typhon.toml` is checked with that config and its own module set, exactly as `tyc check <that directory>` would check it, so `tyc check examples/` over a folder of independent apps never resolves one app's `from models import Position` against another app's `models`. Files that belong to no nested project are checked together under the config found for the path you passed.
+
 ## Exit codes
 
 | Code | Meaning |
