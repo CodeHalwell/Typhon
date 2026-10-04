@@ -10,6 +10,32 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Current release
 
+**[v1.0.0-beta.1](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-beta.1) — 2026-10-04.**
+The first beta: four review-remediation waves on top of alpha.9 — the
+2026-09-01 beta-readiness review and the backlog it deferred, the 2026-09-30
+release-readiness review, and the W1–W7 remediation of the six 2026-10-03
+full reviews. Type-checker soundness: field narrowings are dropped wherever a
+call or write can reach them, loops join their exit paths, nullable receivers
+of every shape and union member access are checked, and `match`
+exhaustiveness covers `Result` payloads, `T?`, `bool`, literal unions and
+nested sealed unions. Lowering: an inline `?` keeps Python's evaluation order,
+`|>` works in every expression position, an `impl` method may read a name
+bound after its class, and `extend BUILTIN` reaches every receiver shape.
+`tyc run` gains C3 method resolution, CPython-ordered sets, value-mixin enums,
+a stdlib-shim audit and an automatic CPython fallback for programs the VM does
+not model. `tyc fmt` refuses output that changes what a program means, the
+CLI and the language server no longer write through or walk out of the
+project along a symlink, and CI gains `compileall`, no-build-baseline,
+`fmt-corpus`, `fmt-guard`, `valid-corpus` and macOS jobs. No new syntax beyond
+the additive `"Node"?` spelling. The new error-level diagnostics
+(`tyc::alias_not_a_class`, `tyc::invalid_pattern`,
+`tyc::impl_forward_reference`, and `tyc::reserved_module_name` when the
+program could not start) fire only on code that already crashed. One
+documented exception changes a default: `[strictness] nullable-use` is now
+`"error"`. It and the release's other deliberate narrowings are listed with
+their escapes in the new [compatibility policy](compatibility.md), under which
+the surface is now frozen for the beta line.
+
 **[v1.0.0-alpha.9](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.9) — 2026-08-21.**
 A maintenance release on top of alpha.8, with no language change. The
 warn-level `tyc::contains_secret_literal` keyword table grows from 16 entries

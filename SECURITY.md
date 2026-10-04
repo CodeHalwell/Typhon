@@ -1,6 +1,6 @@
 # Security Policy
 
-Typhon is pre-1.0 (currently the `v1.0.0-alpha.x` series). We take security reports
+Typhon is pre-1.0 (currently the `v1.0.0-beta.x` series). We take security reports
 seriously and will respond as quickly as we can.
 
 ## Reporting a vulnerability
@@ -74,4 +74,4 @@ rather than run somewhere shared.
 
 ## Supported versions
 
-During the alpha series, only the latest released version receives fixes.
+During the beta series, only the latest released version receives fixes.

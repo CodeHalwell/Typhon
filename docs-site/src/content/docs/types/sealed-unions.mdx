@@ -3,8 +3,6 @@ title: Sealed Unions
 description: type X = A | B | C is closed; match must be exhaustive.
 sidebar:
   order: 7
-banner:
-  content: "This page includes behaviour implemented on <code>main</code> for the unreleased <code>v1.0.0-beta.1</code>. The latest published binary is <code>v1.0.0-alpha.9</code>."
 ---
 
 A *sealed* union, declared with the `type` keyword, is a closed sum: every inhabitant is one of the variants listed in the alias. The checker uses this to enforce exhaustive `match` over the union — directly, inside the `Ok` / `Err` arms of a `Result[T, E]` whose error (or value) type is the union, and through unions nested inside another union, which flatten to their leaf classes. Adding a new variant fails every such `match` site that doesn't cover it.
