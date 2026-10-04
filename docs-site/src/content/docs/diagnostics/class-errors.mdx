@@ -97,6 +97,25 @@ The methods would otherwise lower into a free-floating `__typhon_impl_NAME` pseu
 
 **Fix:** declare `class Account:` first, or fix the name to match an existing class in this module. `extend Account:` (the alias for user-defined classes) reports the same diagnostic.
 
+## `tyc::impl_forward_reference`
+
+An `impl` method that stays in its class body reads, in a decorator or a parameter default, a name bound only after the class. Those expressions run when the `class` statement runs — before the name exists — so importing the module raises `NameError`:
+
+```python
+class Greeter:
+    name: str
+
+let DEFAULT_GREETING: str = "hello"
+
+impl Greeter:
+    def __call__(self, word: str = DEFAULT_GREETING) -> str:   # ❌
+        return f"{word}, {self.name}"
+```
+
+Most methods in this position are defined at their `impl` block instead and attached to the class there, so they just work. A special method (`__call__`, `__eq__`, …), a `@property` / `@classmethod` / `@cached_property` / `@abstractmethod`, a method using a private `__name`, a method a base class may define, or one on a class subclassed before the block has to stay in the class body; the diagnostic says which.
+
+**Fix:** bind the name above the class, or default the parameter to `None` and resolve the name inside the method body.
+
 ## `tyc::missing_field_init`
 
 An instance constructed via `X.__new__(X)` / `object.__new__(X)` (bypassing the auto-generated `__init__`) escapes the function — returned, passed as an argument — without every required field having been assigned:

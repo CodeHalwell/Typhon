@@ -496,6 +496,23 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   once; `+=` on the temporary keeps the in-place semantics). Both surfaces
   share the lowering; the new test checks each against the same program run
   as plain Python.
+- **`impl` methods that must stay in the class body: W7-06 residuals.** A
+  method on a class whose only unseen bases are builtin exceptions
+  (`class AppError(Exception)`) is now attached at its `impl` block too when
+  the base does not define that name (`Exception` has a fixed member list),
+  so `impl AppError: def describe(self, p: str = PREFIX)` with `PREFIX`
+  bound after the class imports instead of raising `NameError`. A method
+  that still has to stay merged — a special method, a private `__name`
+  user, a `@property` / `@classmethod` / `@cached_property` /
+  `@abstractmethod`, a method a base may define, a class subclassed before
+  the block — and reads a name bound only after the class is a new
+  check-time error, `tyc::impl_forward_reference`, naming the reason,
+  instead of a `NameError` on import (the program already crashed on both
+  surfaces). It stays silent when the name might be bound before the class
+  after all: a star import above it, a `global NAME` in any function, or
+  `globals()` / `exec` / `setattr` / `sys.modules` / `builtins` use. The
+  placement planner moved from `tyc-desugar` to `tyc_syntax::impl_site`, so
+  the desugarer and the resolver make the same decision.
 - **Secondary diagnostic labels survive a `?` expansion.** Mapping a
   diagnostic from the expanded source back to the `.ty` file moved only its
   primary span; a second label (`first declared here`, `declared here`)

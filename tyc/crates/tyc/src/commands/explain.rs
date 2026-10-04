@@ -89,6 +89,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "generator_return_type",
         "generic",
         "immutable_assign",
+        "impl_forward_reference",
         "impl_unknown_class",
         "implicit_any",
         "impure_pure_fn",
@@ -340,6 +341,9 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         }
         "result_error_mismatch" => {
             include_str!("../../../../../docs/diagnostics/result_error_mismatch.md")
+        }
+        "impl_forward_reference" => {
+            include_str!("../../../../../docs/diagnostics/impl_forward_reference.md")
         }
         "return_in_except_star" => {
             include_str!("../../../../../docs/diagnostics/return_in_except_star.md")

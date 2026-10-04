@@ -20,7 +20,6 @@
 //! useful diagnostics on a meaningful subset of programs, not full
 //! coverage.
 
-mod builtin_exceptions;
 mod builtins;
 mod callables;
 mod class_contracts;
@@ -5705,7 +5704,7 @@ impl<'a> Checker<'a> {
                 Some(shape) if shape.partial => return None,
                 Some(_) => {}
                 None if name == "object" => continue,
-                None if builtin_exceptions::is_builtin_exception(name) => {
+                None if tyc_syntax::builtin_exceptions::is_builtin_exception(name) => {
                     out.push(name.to_owned());
                     continue;
                 }
@@ -5863,7 +5862,9 @@ impl<'a> Checker<'a> {
                 match self.builtin_exception_bases(name) {
                     Some(bases) => {
                         declared
-                            || bases.iter().any(|b| builtin_exceptions::has_attr(b, attr))
+                            || bases
+                                .iter()
+                                .any(|b| tyc_syntax::builtin_exceptions::has_attr(b, attr))
                             || self.module_may_store_attr(attr)
                     }
                     None => true,

@@ -1701,6 +1701,7 @@ pub fn resolve_module_with(
     r.report_unknown_names();
     r.report_unused_imports();
     r.report_main_not_called();
+    report_impl_forward_references(&mut r, &module.body);
 
     // Collect class-kind metadata for the type checker. `plain class`
     // names are scraped by name from the original Typhon source (robust
@@ -1733,6 +1734,29 @@ pub fn resolve_module_with(
     let mut diagnostics = r.diagnostics;
     diagnostics.dedup();
     (resolved, diagnostics)
+}
+
+/// `tyc::impl_forward_reference`: an `impl` method that stays merged into
+/// its class body although a decorator or parameter default reads a name
+/// bound only after the class — importing the module raises `NameError`
+/// (W7-06). The decision is the one `tyc-desugar` makes when it places the
+/// methods (`tyc_syntax::impl_site`), so this fires exactly on the methods
+/// the build leaves in the class body.
+fn report_impl_forward_references(r: &mut Resolver, body: &[Stmt]) {
+    for e in tyc_syntax::impl_site::merged_name_errors(body, "__typhon_impl_") {
+        let offset = e.range.start().to_usize();
+        let length = e.range.len().to_usize();
+        r.diagnostics.push_error(TycError::impl_forward_reference(
+            &e.name,
+            &e.class,
+            &e.method,
+            e.why,
+            r.path.clone(),
+            r.source.to_owned(),
+            offset,
+            length,
+        ));
+    }
 }
 
 /// Scan original Typhon source for `plain class NAME ...` (and
@@ -3723,6 +3747,66 @@ mod tests {
 
     fn resolve(src: &str) -> (ResolvedModule, Diagnostics) {
         resolve_with_options(src, ResolveOptions::default())
+    }
+
+    fn impl_forward_refs(src: &str) -> Vec<String> {
+        let (_, d) = resolve(src);
+        d.errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::ImplForwardReference { .. }))
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn merged_impl_method_reading_a_late_name_is_reported() {
+        let late = "class C:\n    x: int\nK = 1\n";
+        for method in [
+            "    def __call__(k: int = K) -> int:\n        return k\n",
+            "    def m(k: int = K) -> int:\n        return self.__secret\n",
+            "    @property\n    def m(k: int = K) -> int:\n        return k\n",
+            "    @classmethod\n    def m(k: int = K) -> int:\n        return k\n",
+        ] {
+            let src = format!("{late}class __typhon_impl_C(object):\n{method}");
+            let errs = impl_forward_refs(&src);
+            assert_eq!(errs.len(), 1, "{src}: {errs:?}");
+            assert!(
+                errs[0].contains("`K` is not bound yet when class `C` is created"),
+                "{errs:?}"
+            );
+        }
+        // A subclass before the block; a base-defined name.
+        for src in [
+            "class C:\n    x: int\nclass D(C):\n    pass\nK = 1\nclass __typhon_impl_C(object):\n    def m(k: int = K) -> int:\n        return k\n",
+            "from mod import Ext\nclass C(Ext):\n    y: int\nK = 1\nclass __typhon_impl_C(object):\n    def m(k: int = K) -> int:\n        return k\n",
+            // A decorator defined after the class.
+            "class C:\n    x: int\ndef deco(f):\n    return f\nclass __typhon_impl_C(object):\n    @deco\n    def __repr__() -> str:\n        return \"c\"\n",
+        ] {
+            assert_eq!(impl_forward_refs(src).len(), 1, "{src}");
+        }
+    }
+
+    #[test]
+    fn impl_methods_that_run_are_not_reported() {
+        for src in [
+            // Attached at its block (W7-06): runs.
+            "class C:\n    x: int\nK = 1\nclass __typhon_impl_C(object):\n    def m(k: int = K) -> int:\n        return k\n",
+            // Bound before the class.
+            "K = 0\nclass C:\n    x: int\nK = 1\nclass __typhon_impl_C(object):\n    def __call__(k: int = K) -> int:\n        return k\n",
+            // A star import above the class may bind it.
+            "from os import *\nclass C:\n    x: int\nK = 1\nclass __typhon_impl_C(object):\n    def __call__(k: int = K) -> int:\n        return k\n",
+            // A function may bind it with `global` before the class runs.
+            "def setup() -> None:\n    global K\n    K = 0\nsetup()\nclass C:\n    x: int\nK = 1\nclass __typhon_impl_C(object):\n    def __call__(k: int = K) -> int:\n        return k\n",
+            // The namespace is written dynamically.
+            "globals()[\"K\"] = 0\nclass C:\n    x: int\nK = 1\nclass __typhon_impl_C(object):\n    def __call__(k: int = K) -> int:\n        return k\n",
+            // The class body binds the name.
+            "class C:\n    x: int\n    K = 2\nK = 1\nclass __typhon_impl_C(object):\n    def __call__(k: int = K) -> int:\n        return k\n",
+            // Only annotations and the body read it.
+            "class C:\n    x: int\nK = 1\nclass __typhon_impl_C(object):\n    def __call__(k: K = None) -> int:\n        return K\n",
+        ] {
+            let errs = impl_forward_refs(src);
+            assert!(errs.is_empty(), "{src}: {errs:?}");
+        }
     }
 
     #[test]

@@ -109,13 +109,14 @@ fn extra_attrs(name: &str) -> Option<&'static [&'static str]> {
 }
 
 /// Whether `name` is a builtin exception class.
-pub(crate) fn is_builtin_exception(name: &str) -> bool {
+pub fn is_builtin_exception(name: &str) -> bool {
     extra_attrs(name).is_some()
 }
 
 /// Whether instances of builtin exception `name` have the public attribute
-/// `attr`. `false` for a name that is not a builtin exception.
-pub(crate) fn has_attr(name: &str, attr: &str) -> bool {
+/// `attr`. `false` for a name that is not a builtin exception. Underscore
+/// names are not listed: callers treat them as unknown.
+pub fn has_attr(name: &str, attr: &str) -> bool {
     extra_attrs(name).is_some_and(|extra| BASE.contains(&attr) || extra.contains(&attr))
 }
 

@@ -178,6 +178,40 @@ fn impl_methods_see_names_bound_before_their_block() {
     );
 }
 
+/// W7-06 residual: a builtin exception base has a known member list, so a
+/// method it does not define is attached at its `impl` block too (it stayed
+/// merged and raised `NameError` on import, on both surfaces).
+#[test]
+fn impl_method_on_an_exception_subclass_sees_a_later_name() {
+    assert_runs_as(
+        include_str!("fourth_wave/impl_site_exception.ty"),
+        include_str!("fourth_wave/impl_site_exception.expected"),
+    );
+}
+
+/// W7-06 residual: a method that has to stay in the class body (here a
+/// special method) and reads a name bound after the class is a check-time
+/// `tyc::impl_forward_reference`, not a `NameError` on import.
+#[test]
+fn merged_impl_method_reading_a_later_name_is_a_check_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    scaffold(
+        dir,
+        "class Greeter:\n    name: str\n\nlet DEFAULT_GREETING: str = \"hello\"\n\nimpl Greeter:\n    def __call__(self, word: str = DEFAULT_GREETING) -> str:\n        return f\"{word}, {self.name}\"\n\nprint(Greeter(name=\"ada\")())\n",
+    );
+    let out = tyc()
+        .current_dir(dir)
+        .args(["check", "src"])
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(text.contains("tyc::impl_forward_reference"), "{text}");
+}
+
 /// W7-07: a field whose default is a module-level list / dict / set given by
 /// name imports (it raised `ValueError: mutable default` on both surfaces)
 /// and every instance gets its own shallow copy.

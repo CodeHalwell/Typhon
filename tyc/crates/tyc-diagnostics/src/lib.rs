@@ -2027,6 +2027,35 @@ pub enum TycError {
         #[label("not allowed inside an `except*` handler")]
         span: SourceSpan,
     },
+
+    /// An `impl` method that is merged into its class body reads, in a
+    /// decorator or a parameter default, a name bound only after the class.
+    /// Those expressions run when the `class` statement runs, before the
+    /// name exists, so importing the module raises `NameError` on both
+    /// execution surfaces. Methods that can be attached at their `impl`
+    /// block instead are moved there (W7-06); this reports the rest — a
+    /// special method, a private-name method, a `@property` /
+    /// `@classmethod` / `@cached_property` / `@abstractmethod`, a method a
+    /// base may define, or a class subclassed before the block.
+    #[error(
+        "`{name}` is not bound yet when class `{class}` is created, but `{method}` reads it there"
+    )]
+    #[diagnostic(
+        severity(Error),
+        code(tyc::impl_forward_reference),
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/impl_forward_reference.md")
+    )]
+    ImplForwardReference {
+        name: String,
+        class: String,
+        method: String,
+        #[help]
+        help: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("read when `class {class}` runs — raises `NameError` on import")]
+        span: SourceSpan,
+    },
 }
 
 impl TycError {
@@ -2122,7 +2151,8 @@ impl TycError {
             | Self::FrozenInheritanceConflict { src, span, .. }
             | Self::RaiseNonException { src, span, .. }
             | Self::NotAContextManager { src, span, .. }
-            | Self::ReturnInExceptStar { src, span, .. } => {
+            | Self::ReturnInExceptStar { src, span, .. }
+            | Self::ImplForwardReference { src, span, .. } => {
                 let _ = span;
                 Some(src.inner().as_str())
             }
@@ -2265,7 +2295,8 @@ impl TycError {
             | Self::FrozenInheritanceConflict { src, span, .. }
             | Self::RaiseNonException { src, span, .. }
             | Self::NotAContextManager { src, span, .. }
-            | Self::ReturnInExceptStar { src, span, .. } => Some((src, span)),
+            | Self::ReturnInExceptStar { src, span, .. }
+            | Self::ImplForwardReference { src, span, .. } => Some((src, span)),
             #[allow(unreachable_patterns)]
             _ => None,
         }
@@ -3996,6 +4027,38 @@ impl TycError {
     ) -> Self {
         Self::ReturnInExceptStar {
             keyword: keyword.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::ImplForwardReference`] error. `why` says what
+    /// keeps `method` in the class body instead of at its `impl` block.
+    #[allow(clippy::too_many_arguments)]
+    pub fn impl_forward_reference(
+        name: impl Into<String>,
+        class: impl Into<String>,
+        method: impl Into<String>,
+        why: &str,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        let name = name.into();
+        let class = class.into();
+        let method = method.into();
+        let help = format!(
+            "`{method}` must stay in the body of `class {class}` ({why}), and a method's \
+             decorators and parameter defaults run when its class is created. Bind `{name}` \
+             above `class {class}`, or default the parameter to `None` and read `{name}` inside \
+             the method body"
+        );
+        Self::ImplForwardReference {
+            name,
+            class,
+            method,
+            help,
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
         }
