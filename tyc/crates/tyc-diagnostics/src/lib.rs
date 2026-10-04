@@ -688,7 +688,7 @@ pub enum TycError {
     #[diagnostic(
         code(tyc::lazy_usage),
         url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/lazy_usage.md"),
-        help("`lazy` supports `lazy import name = module` and `lazy val NAME: T = expr` only")
+        help("`lazy` supports `lazy import name = module` and `lazy let NAME: T = expr` only")
     )]
     LazyUsage {
         message: String,
@@ -1736,10 +1736,11 @@ pub enum TycError {
         span: SourceSpan,
     },
 
-    /// A `comptime let` binding whose name matches a secret-suffix heuristic
-    /// (`*KEY`, `*TOKEN`, `*PASSWORD`, `*SECRET`, `*PASS`, `*PWD`) inlines its
-    /// env value at build time, so the emitted Python contains the raw secret
-    /// as a string literal. Read the env var at runtime instead.
+    /// A `comptime let` binding whose name matches the shared secret-keyword
+    /// table (`tyc_analyse::SECRET_NAME_KEYWORDS`, longest-first with word
+    /// boundaries) inlines its env value at build time, so the emitted
+    /// Python contains the raw secret as a string literal. Read the env var
+    /// at runtime instead.
     #[error("comptime binding `{name}` inlines a secret-shaped value at build time")]
     #[diagnostic(
         severity(Warning),
@@ -1749,11 +1750,11 @@ pub enum TycError {
     )]
     ContainsSecretLiteral { name: String, env_key: String },
 
-    /// A plain `let` / module-level binding whose name matches the
-    /// secret-suffix heuristic (`*KEY`, `*TOKEN`, `*PASSWORD`, `*SECRET`,
-    /// `*PWD`, `*API_KEY`) is initialised from a raw string literal
-    /// instead of an environment lookup. Committing such a literal hard-
-    /// codes a credential into the source tree.
+    /// A plain `let` / module-level binding whose name matches the shared
+    /// secret-keyword table (`tyc_analyse::SECRET_NAME_KEYWORDS`,
+    /// longest-first with word boundaries) is initialised from a raw string
+    /// literal instead of an environment lookup. Committing such a literal
+    /// hard-codes a credential into the source tree.
     #[error("binding `{name}` looks like a credential but is initialised from a string literal")]
     #[diagnostic(
         severity(Warning),
@@ -4943,7 +4944,8 @@ fn impl_header_name(raw: &str) -> Option<String> {
     let trimmed = raw.trim_start();
     let after = if let Some(s) = trimmed.strip_prefix("impl ") {
         s
-    } else if let Some(s) = trimmed.strip_prefix("impl[") {
+    } else {
+        let s = trimmed.strip_prefix("impl[")?;
         // Skip the `[T, …]` impl type-param list.
         let mut depth = 1i32;
         let mut end = None;
@@ -4961,8 +4963,6 @@ fn impl_header_name(raw: &str) -> Option<String> {
             }
         }
         s[end?..].trim_start()
-    } else {
-        return None;
     };
     let header = after.trim_end();
     let body = header.strip_suffix(':')?;

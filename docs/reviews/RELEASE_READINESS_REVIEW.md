@@ -43,7 +43,7 @@ test suite pass, and the perf gate is within threshold.
 | LOW — BOM not stripped; comptime "(no location)" | ⛔ Deferred | Low value; the safe fix touches offset-mapping and isn't worth the risk in this pass |
 
 > **2026-07-28 correction — H6's ✅ was premature when first written.** The
-> [2026-07-28 codebase review](docs/codebase-review-2026-07-28.md) found sub-fixes (2) and (3)
+> [2026-07-28 codebase review](codebase-review-2026-07-28.md) found sub-fixes (2) and (3)
 > were each real but partial, and this row described them as complete. (3) invalidated global
 > narrowing from exactly three statement arms — assign, annotated assign, and a bare call — so
 > `if refresh():`, `while poll():`, `for row in reload():`, `assert reconnect()`,

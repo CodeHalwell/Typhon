@@ -247,7 +247,7 @@ Python 3.13 ships an experimental free-threaded build; 3.14 (Phase II) makes it 
 
 #### `go` spawn
 
-`go f(x)` schedules `f(x)` in the background: an `asyncio.Task` in async contexts, a `ThreadPoolExecutor.submit` future on free-threaded builds for CPU-bound functions. The form `go f(x) -> fut` binds the task handle.
+`go f(x)` schedules `f(x)` in the background: an `asyncio.Task` in async contexts, always lowered through `typhon_runtime.tasks.spawn` (there is no `ThreadPoolExecutor` lowering for `go`, including on free-threaded builds). The form `go f(x) -> fut` binds the task handle.
 
 **`go` does not lower to a bare `asyncio.create_task`.** Python's event loop holds only weak references to scheduled tasks, so a fire-and-forget `create_task(...)` whose handle is not retained can be garbage-collected mid-flight. `go` therefore lowers via a small helper in `typhon_runtime`:
 

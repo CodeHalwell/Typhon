@@ -250,3 +250,166 @@ fn docs_do_not_teach_the_prefix_frozen_modifier() {
         offenders.join("\n")
     );
 }
+
+/// Every `tyc::<code>` named in the live documentation must be a code the
+/// binary actually emits. Doc pages kept citing `tyc::comptime_env_missing`,
+/// `tyc::lazy_from_import` and `tyc::default_mismatch` long after those codes
+/// never existed — each renders as a confident, unresolvable link. This test
+/// extracts every code token from the live doc surfaces and checks it against
+/// `tyc explain --list`, so a rename or a typo fails loudly instead of
+/// shipping a dead reference.
+#[test]
+fn docs_only_name_emitted_diagnostic_codes() {
+    let root = repo_root();
+
+    // The binary is the source of truth, not a checked-in list.
+    let out = tyc()
+        .arg("explain")
+        .arg("--list")
+        .output()
+        .expect("tyc explain --list runs");
+    assert!(out.status.success(), "`tyc explain --list` must succeed");
+    let listing = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let emitted: std::collections::HashSet<String> = code_tokens(&listing).into_iter().collect();
+    assert!(
+        !emitted.is_empty(),
+        "`tyc explain --list` produced no codes to check against"
+    );
+
+    // Frozen historical records: dated reviews, audits, design proposals and
+    // the roadmap name codes that were proposed, renamed or never built.
+    // They are history and must not be rewritten to match the present.
+    let historical: &[&str] = &[
+        "docs/reviews/adversarial-audit-50agent-2026-06-28.md",
+        "docs/reviews/adversarial-review-2026-06-28.md",
+        "docs/reviews/codebase-review-2026-07-28.md",
+        "docs/reviews/codebase-review-2026-07-28-findings.md",
+        "docs/reviews/beta-readiness-review-2026-09-01.md",
+        "docs/reviews/project-review-2026-05-16.md",
+        "docs/reviews/release-readiness-2026-07-20.md",
+        "docs/reviews/release-readiness-review-2026-09-30.md",
+        "docs/reviews/RELEASE_READINESS_REVIEW.md",
+        "docs/alpha-release-plan.md",
+        "docs/roadmap.md",
+    ];
+    let historical_dirs: &[&str] = &["docs/design"];
+
+    // Tokens that are deliberately not emitted codes: worked-example
+    // placeholders used by the authoring guides (`internals/adding-diagnostic`
+    // walks through a fictional `tyc::my_new_check`; `reading` and
+    // `internals/workspace` use `tyc::some_code` / `tyc::CODE_NAME` the same
+    // way). Anything else must resolve in `tyc explain --list` — including
+    // the `freeze` / `pub` family names, which are pages, not codes.
+    let allowed: &[&str] = &[
+        "some_code",
+        "code",
+        "code_name",
+        "CODE",
+        "CODE_NAME",
+        "my_new_check",
+    ];
+
+    let mut offenders = Vec::new();
+    for rel in [
+        "docs",
+        "docs-site/src/content/docs",
+        ".claude/skills/typhon",
+        // The copy of the skill embedded in the crate ships with the binary.
+        "tyc/crates/tyc/skill",
+    ] {
+        let dir = root.join(rel);
+        if !dir.is_dir() {
+            continue;
+        }
+        let mut stack = vec![dir];
+        while let Some(d) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if !matches!(
+                    path.extension().and_then(|e| e.to_str()),
+                    Some("md" | "mdx")
+                ) {
+                    continue;
+                }
+                let rel_path = path
+                    .strip_prefix(&root)
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_default();
+                if historical.iter().any(|h| rel_path == *h)
+                    || historical_dirs
+                        .iter()
+                        .any(|h| rel_path == *h || rel_path.starts_with(&format!("{h}/")))
+                {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for (n, line) in text.lines().enumerate() {
+                    // `## tyc::foo (reserved)` headers name a code on
+                    // purpose: the name is held for a future rule and the
+                    // section says it is not emitted yet.
+                    if line.contains("reserved") {
+                        continue;
+                    }
+                    for token in code_tokens(line) {
+                        // Family-prefix prose (`tyc::perf_*`) leaves a
+                        // trailing-underscore fragment; no real code ends
+                        // in `_`.
+                        if token.ends_with('_') {
+                            continue;
+                        }
+                        if allowed.contains(&token.as_str()) {
+                            continue;
+                        }
+                        if !emitted.contains(&token) {
+                            offenders.push(format!("{}:{}: tyc::{}", path.display(), n + 1, token));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "docs name `tyc::` codes the binary does not emit:\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// Pull `tyc::<code>` tokens out of text. A token is the maximal run of
+/// ASCII alphanumerics and underscores after the prefix; an empty run (a
+/// bare `tyc::` in prose) yields nothing.
+fn code_tokens(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i + 5 <= bytes.len() {
+        if &bytes[i..i + 5] == b"tyc::" {
+            let mut j = i + 5;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            if j > i + 5 {
+                if let Ok(token) = std::str::from_utf8(&bytes[i + 5..j]) {
+                    out.push(token.to_owned());
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}

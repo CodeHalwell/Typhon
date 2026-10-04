@@ -2979,7 +2979,7 @@ pub fn postprocess_full(
     // Sort descending by line_index; for identical line_index values preserve
     // original order (stable sort) so that `val` is restored before `comptime`
     // on the same line, allowing `comptime` to be prepended on top.
-    insertions.sort_by(|a, b| b.0.cmp(&a.0));
+    insertions.sort_by_key(|a| std::cmp::Reverse(a.0));
     for (line_idx, kw) in insertions {
         if line_idx >= lines.len() {
             continue;
@@ -5278,7 +5278,7 @@ fn parse_typed_let_unpack(body: &str) -> Option<TypedLetUnpack> {
         let slots = parse_outer_tuple_annotation(outer);
         match slots {
             Some(slots) if slots.len() == captures.len() => {
-                for (cap, slot) in captures.iter_mut().zip(slots.into_iter()) {
+                for (cap, slot) in captures.iter_mut().zip(slots) {
                     if cap.annotation.is_none() {
                         cap.annotation = Some(slot);
                         saw_annotation = true;

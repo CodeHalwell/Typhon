@@ -171,16 +171,19 @@ Declare in `typhon.toml`:
 required = ["DATABASE_URL", "API_KEY"]
 ```
 
-Missing required vars fail the build with `tyc::comptime_env_missing`.
+Missing required vars fail the build with `tyc::comptime`.
 
 ## Failure modes
 
-- **Missing required env var.** `tyc::comptime_env_missing`.
-- **Cast failure.** `int("abc")` raises `ValueError` at build time → `tyc::comptime_eval_failed`.
-- **Recursion limit hit.** `tyc::comptime_recursion_limit`.
-- **Unsupported form.** `tyc::comptime_unsupported`.
+Every comptime failure reports under the single `tyc::comptime` code, with the
+trigger spelled out in the message:
 
-The diagnostics are formatted to point at the source span that triggered the failure, with the underlying exception included for cast errors.
+- **Missing required env var** — `env("DATABASE_URL")` with `DATABASE_URL` unset and listed in `[env] required`: "required environment variable 'DATABASE_URL' is not set".
+- **Cast failure** — `int("abc")`: "cannot parse 'abc' as int".
+- **Recursion limit hit** — `comptime def` calls are recursion-checked (depth limit 64); a self-recursive call fails the build instead of hanging it.
+- **Unsupported form** — e.g. a `for` loop in a `comptime def` body: "`for-loop` is not supported inside a comptime function body".
+
+The diagnostics are formatted to point at the source span that triggered the failure, with the underlying reason included.
 
 ## Where the sandbox lives
 

@@ -1,14 +1,14 @@
 # Differential and knob-coverage gates
 
 Two CI gates, added in response to items **T0.2** and **T0.4** of
-[`codebase-review-2026-07-28.md`](codebase-review-2026-07-28.md). Both live in
+[`codebase-review-2026-07-28.md`](reviews/codebase-review-2026-07-28.md). Both live in
 `scripts/`, run locally with no network access, and refuse to run at all rather
 than run partially — a gate that passes vacuously is worse than no gate, because
 it reads as coverage.
 
 | Gate | Script | CI job | What it proves |
 |---|---|---|---|
-| VM ↔ CPython differential | `scripts/vm-differential.sh` | `differential` | `tyc run` behaves identically to `tyc build` + CPython 3.13 over the whole `.ty` corpus |
+| VM ↔ CPython differential | `scripts/vm-differential.sh` | `differential`, `valid-corpus` | `tyc run` behaves identically to `tyc build` + CPython 3.13 over `examples/` + `stress/` (plus `corpus/valid/` under its own baseline — see below) |
 | Opt-in knob codegen matrix | `scripts/knob-matrix.sh` | `knob-matrix` | Every opt-in codegen knob actually fires, and does not change observable behaviour |
 
 Both require a release binary and a CPython **3.13+** interpreter reachable as
@@ -175,6 +175,8 @@ The gate keeps the list honest from both ends, but asymmetrically:
 ```bash
 scripts/vm-differential.sh                       # whole corpus, gate against the baseline
 scripts/vm-differential.sh --scope examples      # examples/ only
+scripts/vm-differential.sh --scope valid \       # corpus/valid/ against its own baseline
+    --baseline scripts/valid-corpus-baseline.txt
 scripts/vm-differential.sh --jobs 16             # parallelism (default: nproc)
 scripts/vm-differential.sh --report r.tsv        # full per-unit TSV
 scripts/vm-differential.sh --update              # rewrite the baseline from this run
@@ -187,6 +189,33 @@ TMPDIR=/tmp/triage scripts/vm-differential.sh \
     --filter 'examples/57-iterators-generators' --keep
 # then diff cpy.out / vm.out and read vm.err in the kept workdir
 ```
+
+### The valid-programs corpus (`--scope valid`, W6-18)
+
+`corpus/valid/` holds real, ordinary libraries (seeded from CPython 3.13's
+stdlib via `tyc migrate`, hand-fixed once — see `corpus/valid/README.md`),
+kept green by the `valid-corpus` CI job: `tyc check corpus/valid/` (every new
+diagnostic is swept over ordinary code, so a false positive like W1-01/W1-02
+fails fast) plus the same harness over `--scope valid`. The valid scope has
+its **own** baseline file, so the two gates evolve independently — and `all`
+stays `examples` + `stress`, so the main baseline never sees valid units.
+
+The valid corpus is stdlib-only by design, so unlike the main baseline it has
+no third-party package set to keep in sync. Its seed triage (2026-10-03,
+alpha.9) is recorded in `corpus/valid/README.md`: four units agree
+byte-for-byte, `heapq` agrees including its doctests, `textwrap` is a
+baselined VM bug (`dict.fromkeys` unmodelled), and `string.ty` is
+`vacuous-runtime` on both surfaces (an emitter bug in explicit
+`__init_subclass__()` calls — out of scope for the corpus, which stays
+faithful to upstream).
+
+**Do not `--update` a custom `--baseline`.** `--update` rewrites `$BASELINE`
+(which honours `--baseline`) **and** the shared
+`scripts/nobuild-baseline.txt` (which does not) from *this run's* units, so an
+`--update --scope valid` would truncate the main nobuild list to the valid
+units. Grow `scripts/valid-corpus-baseline.txt` by hand from a `--report` run
+after triaging each entry; all seven seed units build, so nothing valid
+belongs in the nobuild list today.
 
 Runtime is roughly **75 s** for the full 1130-unit corpus at `--jobs 8` on a
 4-core machine; CI runs it at `--jobs 2`. CI used `--jobs 4` until v1.0.0-alpha.9:

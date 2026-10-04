@@ -16,6 +16,13 @@ updates:
       interval: "weekly"
     labels: ["dependencies", "rust"]
     open-pull-requests-limit: 5
+    ignore:
+      # get-size2 0.11 drags a duplicate compact_str into the graph, which
+      # breaks the vendored Ruff build (ruff_python_ast `get-size`
+      # feature); the tree holds compact_str 0.9.1 via get-size2 0.8.
+      # Re-check on 0.12+.
+      - dependency-name: "get-size2"
+        versions: [">= 0.11, < 0.12"]
 
   # Docs site (Astro + Starlight).
   - package-ecosystem: "npm"
@@ -30,3 +37,9 @@ updates:
     schedule:
       interval: "weekly"
     labels: ["dependencies", "editor"]
+    ignore:
+      # vscode-languageclient 10.x was merged and had to be reverted
+      # (2a8477df); hold the 9.x line until the 10.x breakage is
+      # understood. Re-check on 11+.
+      - dependency-name: "vscode-languageclient"
+        versions: [">= 10, < 11"]

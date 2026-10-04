@@ -79,6 +79,108 @@ jobs:
           TYC_REQUIRE_PYTHON: "1"
           TYC_REQUIRE_RUFF: "1"
 
+  test-macos:
+    name: Test (macOS)
+    runs-on: macos-latest
+    # Non-blocking while the day-one cross-platform failures land (W4-01,
+    # W4-02, W5-01, W5-02). Flip to a hard gate after ~1 week green.
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: tyc
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch (toolchain pinned via `with:`)
+        with:
+          toolchain: "1.94"
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        # Same convention as the Linux job: the cache is an optimization,
+        # never a correctness requirement.
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tyc/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('tyc/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # Same loud-interpreter convention as the Linux job: a missing
+      # interpreter must fail loudly, never skip silently.
+      - name: Install Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install ruff (format-stage source-map tests)
+        run: python -m pip install --quiet ruff==0.15.8
+
+      - name: Tests
+        run: cargo test --workspace
+        env:
+          TYC_REQUIRE_PYTHON: "1"
+          TYC_REQUIRE_RUFF: "1"
+
+  fmt-guard:
+    name: Formatter scope guard
+    runs-on: ubuntu-latest
+    # `cargo fmt` must never reformat a file the change did not otherwise
+    # touch: a drive-by reformat hides in review and conflicts with every
+    # parallel workstream. This job fails when `cargo fmt --check` flags a
+    # `.rs` file outside the change's own file list.
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch (toolchain pinned via `with:`)
+        with:
+          toolchain: "1.94"
+          components: rustfmt
+
+      - name: Fail on out-of-scope reformats
+        working-directory: tyc
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          if ! git rev-parse --verify --quiet "$base" >/dev/null; then
+            # No base commit (e.g. a new branch's first push): compare
+            # against the empty tree, i.e. require a fully clean tree.
+            base="4b825dc642cb6b88a060e54bf8d69288fbee4904"
+          fi
+          # Files the change itself touches (added, copied, modified,
+          # renamed — not deleted or type-changed). `git diff --name-only`
+          # prints repo-root-relative paths whatever the cwd is.
+          mapfile -t changed < <(git diff --name-only --diff-filter=ACMR "$base"...HEAD -- '*.rs' | sort -u)
+          # Files rustfmt would rewrite, normalised the same way. rustfmt
+          # prints absolute paths with a trailing `:line:`; $PWD here is
+          # <root>/tyc.
+          mapfile -t unformatted < <(cargo fmt -- --check 2>&1 | sed -n 's|^Diff in \(.*\)$|\1|p' | sed -e 's|:[0-9]*:$||' -e 's|:[0-9]*$||' -e "s|^$PWD/|tyc/|" | sort -u)
+          if [ "${#unformatted[@]}" -eq 0 ]; then
+            echo "tree is rustfmt-clean"
+            exit 0
+          fi
+          offenders=$(comm -23 <(printf '%s\n' "${unformatted[@]}") <(printf '%s\n' "${changed[@]}"))
+          if [ -n "$offenders" ]; then
+            echo "::error::cargo fmt would reformat files this change does not touch:"
+            printf '%s\n' "$offenders"
+            exit 1
+          fi
+          echo "rustfmt touches only files in this change (or the tree is clean)"
+
   security:
     name: Security audit
     runs-on: ubuntu-latest
@@ -244,6 +346,72 @@ jobs:
         with:
           name: differential-report
           path: differential-report.tsv
+          if-no-files-found: warn
+
+  valid-corpus:
+    name: Valid-programs corpus (W6-18)
+    runs-on: ubuntu-latest
+    # corpus/valid/ is real, ordinary libraries (migrated stdlib), hand-fixed
+    # once and kept green. The stress corpus is mostly programs written to
+    # break the checker; the W1-01/W1-02 false-positive regressions got
+    # through for lack of a corpus like this one. Two gates, both fail shut:
+    #   * `tyc check corpus/valid/` — every new diagnostic is swept over
+    #     ordinary code automatically. Warnings are tolerated (advice lints
+    #     such as lazy_import_opportunity fire on faithful migrations);
+    #     errors fail.
+    #   * the VM <-> CPython differential over --scope valid, pinned by
+    #     scripts/valid-corpus-baseline.txt (same both-directions-fail
+    #     contract as the main differential job, OWN baseline file so the two
+    #     gates evolve independently).
+    # The corpus is stdlib-only by design, so unlike the differential job this
+    # needs no third-party runtime packages.
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch (toolchain pinned via `with:`)
+        with:
+          toolchain: "1.94"
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        # See the test job: cache failures must not fail CI.
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tyc/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('tyc/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build release tyc binary
+        working-directory: tyc
+        run: cargo build --release --bin tyc
+
+      - name: Install Python 3.13
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      # The checker's false-positive sweep: ordinary code must stay clean.
+      - name: Check valid corpus
+        run: tyc/target/release/tyc check corpus/valid/
+        env:
+          TYC_REQUIRE_PYTHON: "1"
+
+      - name: Differential harness (corpus/valid)
+        run: scripts/vm-differential.sh --scope valid --baseline scripts/valid-corpus-baseline.txt --jobs 2 --report valid-corpus-report.tsv
+        env:
+          TYC_REQUIRE_PYTHON: "1"
+
+      - name: Upload valid-corpus differential report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: valid-corpus-report
+          path: valid-corpus-report.tsv
           if-no-files-found: warn
 
   knob-matrix:

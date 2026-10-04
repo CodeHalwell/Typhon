@@ -186,7 +186,7 @@ intended lowering is below; for now, hand-write the generator.
 ## `lazy from` is rejected
 
 ```python
-lazy from numpy import array     # ❌ tyc::lazy_from_import
+lazy from numpy import array     # ❌ tyc::lazy_usage
 ```
 
 PEP 690's analysis: `from`-imports eagerly resolve attributes, defeating deferral. The diagnostic redirects you to `lazy import numpy`.

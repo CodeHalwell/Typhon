@@ -42,7 +42,10 @@ jobs:
         run: npm run compile
 
       - name: Package extension
-        run: npx --yes @vscode/vsce package --allow-missing-repository --out typhon.vsix
+        # Pinned: an unpinned `npx --yes @vscode/vsce` floats to whatever the
+        # registry serves that day (@vscode/vsce@3.2.1 verified, engines
+        # node>=20 matches this job's node 20).
+        run: npx --yes @vscode/vsce@3.2.1 package --allow-missing-repository --out typhon.vsix
 
       - name: Upload VSIX artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

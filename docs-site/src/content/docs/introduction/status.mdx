@@ -9,7 +9,7 @@ import { Aside } from '@astrojs/starlight/components';
 
 Typhon is in **active development**, and has reached its first *feature-complete* alpha.
 
-**The current release is [v1.0.0-alpha.9](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.9)** (2026-08-21).
+**The current release is [v1.0.0-alpha.9](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha.9)** (2026-08-21). Whether to tag `v1.0.0-beta.1` is still an open decision — until then, any page carrying an "unreleased (`main`)" banner describes behaviour implemented on `main` for the unreleased beta, not behaviour in the alpha.9 binary you install.
 
 The [v1.0.0-alpha](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-alpha) milestone brought the proven production surface together with the type-system frontier earlier releases deferred — higher-kinded type unification, user-generic variance inference, and the general inter-procedural field-init audit. The **alpha.2 → alpha.9** point releases since have been a hardening pass across five fronts:
 
@@ -168,7 +168,7 @@ A fresh adversarial sweep (~35 programs run through both `tyc run` and `tyc buil
 
 ### Project plumbing
 
-- ✅ CI — five jobs on every push to `main` / `dev/**` / `claude/**`: `test` (`cargo fmt --check` → `clippy -D warnings` → `cargo test --workspace`), `security` (`cargo-deny` advisories / licences / source bans), `perf-gate` (the build-pipeline performance regression gate), `differential` (the VM ↔ CPython differential gate over the full example + stress corpus), and `knob-matrix` (the opt-in-knob codegen matrix).
+- ✅ CI — eight jobs on every push to `main` / `dev/**` / `claude/**`: `test` (`cargo fmt --check` → `clippy -D warnings` → `cargo test --workspace`), `test-macos` (the test suite on macOS), `fmt-guard` (no out-of-scope `cargo fmt` reformats), `security` (`cargo-deny` advisories / licences / source bans), `perf-gate` (the build-pipeline performance regression gate), `differential` (the VM ↔ CPython differential gate over the full example + stress corpus), `knob-matrix` (the opt-in-knob codegen matrix), and `valid-corpus` (`tyc check` plus the VM ↔ CPython differential over the `corpus/valid/` valid-programs corpus).
 - ✅ Generated `typhon_runtime/` ships as local source — no PyPI dependency.
 
 ## Landed in v0.9.0 (stress-test cleanup release)

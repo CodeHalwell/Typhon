@@ -1012,7 +1012,7 @@ Required env vars are declared in `typhon.toml`:
 required = ["DATABASE_URL"]
 ```
 
-Missing required env → build fails with `tyc::comptime` (named `comptime_env_missing` in some docs).
+Missing required env → build fails with `tyc::comptime`.
 
 ---
 

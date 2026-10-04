@@ -60,8 +60,10 @@ def main() -> None:
             print(f"timed out after {after_ms}ms")
 ```
 
-Add a third variant to `LoadError` and **every `match` site turns red** until you
-handle it. That is the kind of safety Typhon brings to Python — and it compiles to
+Add a third variant to `LoadError` and every `match` over the error itself turns red
+until you handle it. (A `match` on the enclosing `Result` is not yet checked for
+variants nested inside `Ok`/`Err` arms — that gap is tracked work.) That is the
+kind of safety Typhon brings to Python — and it compiles to
 idiomatic dataclasses + a small generated `Ok`/`Err` helper you can read and debug.
 
 ## Why Typhon

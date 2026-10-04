@@ -11,6 +11,14 @@ remediation described further down; the second closed the backlog that
 review deferred; the third — the 2026-09-30 release-readiness review
 (`docs/release-readiness-review-2026-09-30.md`) — is summarised first.
 
+**Post-review fixes.** Cross-module free-function shapes now retain whether a
+function is `async`, so both `from provider import make; make()` and
+`import provider; provider.make()` type as coroutines until awaited instead of
+masquerading as the declared result type. The docs site labels unreleased
+beta.1 behaviour, generates working GitHub edit links, and builds without
+unknown-code-language warnings. The symlink-escape regression test now asserts
+stable diagnostic fragments rather than terminal-width-dependent wrapping.
+
 ### Third wave — the 2026-09-30 release-readiness review
 
 **Seven ways a check-clean program could crash, closed.** Each of these
@@ -776,6 +784,40 @@ workspace cannot choose the binary. The bundled `httpx` stub types
 `Response.url` as `httpx.URL` (it was `str`), returns `str?` from
 `Headers.get`, drops the removed-in-0.28 `proxies=` / `app=`, and models
 the exception hierarchy so `except httpx.HTTPStatusError` checks.
+
+### Fourth wave — 2026-10-03 reviews
+
+#### W6 — CI, docs & hygiene
+
+- Clippy passes on Rust 1.98 as well as the pinned 1.94 (`question_mark`,
+  `unnecessary_sort_by`, `useless_conversion` at three sites).
+- `.gitignore` covers `.DS_Store` and the root `/.venv/`.
+- Docs-site "Edit page" links point at each file's real location (the
+  `baseUrl` double-prefix is gone).
+- Pages describing unreleased beta.1 behaviour carry a banner, and
+  `status.mdx` names alpha.9 as the current release.
+- New non-blocking macOS CI job; workflows hardened (least-privilege
+  permissions, re-pinned actions, cold release builds).
+- Dependabot ignores reverted bumps; `engines.vscode` bumped to `^1.138.0`.
+- The README flagship exhaustiveness claim is scoped to direct matches.
+- Docs cite only diagnostic codes the binary emits (`tyc explain --list`
+  minus `freeze`/`pub`, now language topics), locked in by a guard test.
+- New nullable-operator docs page listing the accepted spellings with the
+  real warning.
+- The docs site registers the Typhon grammar (no more unknown-code-language
+  build warnings); the gitignore block uses a known lexer.
+- `go` lowering docs match the binary (`tasks.spawn`, no thread pool).
+- Secret-lint comments describe the shared keyword table.
+- `|>` precedence docs match the parser.
+- Stale job counts fixed, `--no-sync` documented, review note, CONTRIBUTING.
+- Reviews moved to `docs/reviews/` with repaired links.
+- New `fmt-guard` CI job (no out-of-scope reformats); fuzz/sharding
+  recommendations recorded.
+- New `corpus/valid/` valid-programs corpus (~2.3k lines of migrated
+  stdlib, hand-fixed once) with its own `valid-corpus` CI job (a `tyc check`
+  false-positive sweep plus a scoped VM ↔ CPython differential); the seed
+  triage baselines one VM bug (`dict.fromkeys`) and records one emitter bug
+  (explicit `__init_subclass__()` calls).
 
 ### The alpha.9 release-readiness review remediation
 

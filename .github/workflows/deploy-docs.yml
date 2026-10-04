@@ -10,8 +10,6 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 # Allow only one concurrent deployment, skipping runs queued between in-progress
 # and latest queued. Don't cancel in-progress runs — let production deploys finish.
@@ -50,6 +48,12 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    # The build job runs `npm ci` (third-party install scripts) and must
+    # not hold deployment credentials: `pages: write` / `id-token: write`
+    # live only on this job.
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
