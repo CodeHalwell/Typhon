@@ -38,12 +38,15 @@ let xs: list[int] = []           # empty container; annotation required
        let x: int = 1   # ✅
    ```
 
-2. **`let` bindings cannot be reassigned.**
+2. **`let` bindings cannot be reassigned or deleted.** `del x` and an
+   `except … as x` handler (which deletes `x` when it ends) count as
+   assignments too.
 
    ```python
    def f() -> None:
        let x: int = 1
        x = 2            # ❌ tyc::immutable_assign
+       del x            # ❌ tyc::immutable_assign
    ```
 
 3. **`mut` bindings can be reassigned at the same type or a subtype.**

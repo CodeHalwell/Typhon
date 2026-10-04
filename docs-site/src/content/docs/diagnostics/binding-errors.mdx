@@ -3,6 +3,8 @@ title: Binding Errors
 description: Diagnostics around let / mut, binding kinds, and imports.
 sidebar:
   order: 3
+banner:
+  content: "This page includes behaviour implemented on <code>main</code> for the unreleased <code>v1.0.0-beta.1</code>. The latest published binary is <code>v1.0.0-alpha.9</code>."
 ---
 
 ## `tyc::missing_binding_kind`
@@ -81,6 +83,30 @@ def go() -> None:
 ```
 
 **Fix:** declare it `mut CONFIG: str = "a"` at module level if it is meant to be rebound. Also enforced since **v1.0.0-alpha.7**; before that the assignment silently created a separate function-local binding, leaving the module constant unchecked and clobbered at run time.
+
+### Through `del` and `except … as`
+
+`del NAME` removes a binding, and so does `except E as NAME` (Python deletes
+the name when the handler ends). Either one would make a `let` vanish, and a
+later read would raise `NameError` / `UnboundLocalError`, so both count as an
+assignment to the `let`:
+
+```python
+let LIMIT: int = 3
+
+def report(raw: str) -> None:
+    let err: str = "none"
+    try:
+        print(int(raw))
+    except ValueError as err:   # ❌ the handler would delete `err`
+        print("bad input")
+
+del LIMIT                       # ❌
+```
+
+**Fix:** use a fresh name for the handler (`except ValueError as exc:`), or
+declare the binding `mut` if it is meant to be deleted. A `for` or
+`with … as` target may still rebind a `let`.
 
 ## `tyc::unused_import`
 

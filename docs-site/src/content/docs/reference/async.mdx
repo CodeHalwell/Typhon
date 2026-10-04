@@ -3,6 +3,8 @@ title: async, await, gather, go
 description: Asynchronous primitives and Typhon's concurrency helpers.
 sidebar:
   order: 12
+banner:
+  content: "This page includes behaviour implemented on <code>main</code> for the unreleased <code>v1.0.0-beta.1</code>. The latest published binary is <code>v1.0.0-alpha.9</code>."
 ---
 
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
@@ -155,6 +157,12 @@ await email_task
 ```
 
 The `-> handle` form binds the spawn result so you can join later.
+
+The spawned call must produce a coroutine. `go` on a function the checker
+knows to be synchronous (a plain `def`, a sync alias, a callable parameter
+typed as returning a non-awaitable) is rejected with `tyc::type_mismatch`
+(``expected `a coroutine for go`, found `None` ``) — `spawn` would raise
+`TypeError` on it at runtime.
 
 ### Free-threaded variant
 
