@@ -1042,6 +1042,46 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   `tyc::pattern_shadows_outer` (two labels, no primary span) point at the
   original file instead of the expanded text.
 
+#### PR #493 review follow-ups
+
+Fixes for the Copilot and Codex review comments on the integration PR. Each
+claim was reproduced before it was fixed; two VM claims (frozenset results of
+set operators, frozenset dict keys) did not reproduce.
+
+- **Checker false positives on valid code.** A call through a union of
+  functions (`h = a if flag else b; h(x=1)`) no longer fails with
+  `tyc::arg_count`. Keyword and `*` / `**` calls check only for too many
+  positional arguments, plus the keyword values. A loop body that always
+  exits (`break` / `return` / `continue` / `raise`) no longer feeds its dead
+  tail into the loop head, so `while flag: break; x = None` does not make `x`
+  nullable after the loop. `asyncio.create_task(coro=work())` is accepted.
+- **Checker soundness.** `asyncio.TaskGroup(...)` arguments are checked and
+  rejected with `tyc::arg_count`, since CPython raises `TypeError`, and the
+  keyword values of `create_task` / `gather` are checked. A lambda inside a
+  `try` is a deferred scope for the frozen-mutation handler scan. An
+  exponent's sign is tracked through unary `-` / `+`, `**` and bool literals,
+  so `2 ** -(2 ** 3)` is a `float`.
+- **`?` evaluation order.** A `list()` / `dict()` / `set()` / `tuple()` /
+  `frozenset()` / `super()` call stays in place only when the module never
+  rebinds the name; otherwise it is hoisted like any call. A method's lookup
+  (a property, a callable field) now happens before a later `?` operand, as in
+  Python.
+- **VM parity.**
+  - `datetime` and `pathlib` shim instances refuse attribute writes and
+    deletes with CPython's messages.
+  - `frozenset | d.keys()` returns a set.
+  - `s |= t` and the other in-place set operators update `s` in place, so
+    aliases see the change.
+  - `as!` resolves a rebound target name (`list = tuple`) before choosing its
+    check.
+  - A user class named `object` is no longer mistaken for the builtin.
+- **Gates.**
+  - `scripts/emitted-ast.py` and `tyc_syntax::ast_equiv` canonicalise
+    generated names only in identifiers, never inside strings.
+  - A partial-scope `vm-differential.sh --update` keeps the nobuild entries it
+    did not cover.
+  - The `perf-gate` CI job fetches tags, so it builds its same-run control.
+
 ### Third wave — the 2026-09-30 release-readiness review
 
 **Seven ways a check-clean program could crash, closed.** Each of these
