@@ -15,7 +15,7 @@ internalise only this section, you can already read and write most Typhon:
 3. **`T` cannot hold `None`.** Use `T?` (sugar for `T | None`) when a value is optional, and narrow it (`is None`, `guard`, early return, `match`) before use.
 4. **Methods live in `impl` blocks, not in `class`.** Write `impl Foo:` with explicit `self`. For an ordinary `class` / `model`, the constructor is generated and a hand-written `__init__` is rejected; the raw-class escape hatches (`class!` and `plain class`) deliberately keep your own `__init__`.
 5. **`Any` only enters through `unsafe:` or `.dty` stubs.** Re-assert a concrete type at the boundary; for a one-off value, `EXPR as! TYPE` is the sound one-liner.
-6. **Direct `match` on a sealed union must be exhaustive.** Add a variant and every `match` over that union errors until you handle it — no silent fall-through. (A `match` on `Result[T, E]` is not yet checked for variants nested inside the `Ok`/`Err` arms.)
+6. **`match` on a closed type must be exhaustive.** Sealed unions (nested ones flatten to their leaf classes), enums, `Result[T, E]` (including a closed payload inside `Ok` / `Err`), `T?`, `bool` and string-literal unions. Add a variant and every `match` over that union errors until you handle it — no silent fall-through.
 7. **Errors flow as `Result[T, E]`, not exceptions.** `Ok`/`Err` and the `?` operator make failure visible in signatures; bridge to exceptions only at library boundaries.
 8. **Declare-only `let NAME: T` must be definitely assigned** before it's read — the first assignment on every non-diverging path is its initialiser.
 
@@ -107,6 +107,15 @@ type Shape = Circle | Rectangle | Triangle
 ```
 
 declares a finite, sealed sum type. `match` on a sealed union must cover every variant or include a wildcard. The single biggest static-safety win over current Python and mechanically simple to implement.
+
+The same `tyc::non_exhaustive_match` check covers every closed subject:
+
+- a union nested in another (`type Shape = Circle | Poly` with `type Poly = Rect | Tri`) flattens to its leaf classes, so arms for `Circle`, `Rect` and `Tri` are exhaustive. The alias itself is not a class: `case Poly():` and `isinstance(x, Poly)` raise `TypeError` on CPython and report `tyc::alias_not_a_class`;
+- `Result[T, E]` must handle `Ok` and `Err`, and when `E` (or `T`) is a sealed union, enum, `bool` or literal union the payload patterns must cover it (`Err(NotFound(..))`, `Err(Timeout(..))`, …);
+- `T?` must handle `None` once its arms cover `T`;
+- `bool` and string-literal unions must cover every value.
+
+`tyc::missing_return` follows the same rules, and `[strictness] exhaustive-match` sets the severity of all of them.
 
 ### Function signatures (Rule 1)
 

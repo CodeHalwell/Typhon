@@ -282,6 +282,10 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   permissions, re-pinned actions, cold release builds).
 - Dependabot ignores reverted bumps; `engines.vscode` bumped to `^1.138.0`.
 - The README flagship exhaustiveness claim is scoped to direct matches.
+- After W1-04/W1-05 the claim is full strength again: the README,
+  `docs/language.md` and the docs-site match pages describe exhaustiveness
+  over `Result` payloads, `T?`, `bool`, literal unions and nested sealed
+  unions, with the binary's real `non_exhaustive_match` output.
 - Docs cite only diagnostic codes the binary emits (`tyc explain --list`
   minus `freeze`/`pub`, now language topics), locked in by a guard test.
 - New nullable-operator docs page listing the accepted spellings with the
