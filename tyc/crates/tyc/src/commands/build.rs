@@ -1012,7 +1012,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // Default-on concurrency nudge. Flag every remaining run of 2+
         // adjacent independent awaited calls inside an `async def` —
         // most commonly awaited method calls on imported clients
-        // (`await client.get_user(id)` then `await client.get_posts(id)`),
+        // (`await users.get(id)` then `await posts_api.for_user(id)`),
         // which `auto-gather` never folds — so the user can wrap them in
         // an explicit `gather:` block and run them concurrently. Runs
         // already folded by `auto-gather` above are gone from the AST, so

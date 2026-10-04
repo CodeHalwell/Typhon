@@ -288,6 +288,23 @@ grouped by workstream (W1–W7).
   imported function. A module that does not import B is still rejected:
   nothing guarantees B's patch ran. The docs-site `extend` page now shows
   the real lowering (a module-level patch, not a merged class body).
+- **Lint false positives and negatives** (W3-11; warn / advice level).
+  `shared_mut_across_tasks` now sees in-place mutation of module state
+  (`SEEN[k] = …`, `LOG.append(…)`, `del CACHE[k]`, `Cls.attr = …`) and a
+  same-module helper writing on the spawned task's behalf; a parameter or
+  local of the same name is not module state. `gather_opportunity` treats
+  two awaits on the same receiver (`conn.execute` twice, `client.login()`
+  then `client.fetch()`) as dependent. `blocking_in_async` follows import
+  aliases (`from time import sleep`, `import time as t`, `import
+  subprocess as sp`). `resource_not_managed` no longer fires on
+  `self.fh = open(…)`, a handle closed in a later `finally`, or one handed
+  to `ExitStack.enter_context` / `closing`, and now flags handles used and
+  dropped inline (`open(p).read()`, `json.load(open(p))`).
+  `perf_membership_in_loop` is silent for lists whose elements are not
+  provably hashable and when the loop may mutate the list through a call;
+  `perf_sorted_first` is silent inside a `try` catching `IndexError` /
+  `LookupError`. Under `[strictness] require-with = "error"` or
+  `blocking-in-async = "error"` the newly-caught shapes fail the build.
 
 #### W4 — CLI, LSP, filesystem safety
 - **LSP definition URIs rebased onto client workspace root.** `goto_definition` now uses the client's declared workspace root URI (preserving symlink prefixes such as `/var/folders` or `/tmp` rather than macOS `/private/var/...`) or open-document URI, preventing editors from opening duplicate tabs on cross-file jumps.

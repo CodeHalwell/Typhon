@@ -1132,6 +1132,11 @@ struct OpportunityCandidate<'a> {
     /// breaks the run.
     deps: Box<[Expr]>,
     call_range: TextRange,
+    /// The receiver of a method call (`conn` in `await conn.execute(…)`).
+    /// Two awaits on the same receiver are dependent: the object carries
+    /// state between them (a transaction, a login session), so running
+    /// them concurrently reorders that state.
+    receiver: Option<ruff_python_ast::comparable::ComparableExpr<'a>>,
 }
 
 /// Match `NAME = await CALL(...)` / `NAME: T = await CALL(...)` for *any*
@@ -1170,10 +1175,17 @@ fn parse_opportunity_candidate<'a>(stmt: &'a Stmt) -> Option<OpportunityCandidat
     deps.push((*call.func).clone());
     deps.extend(call.arguments.args.iter().cloned());
     deps.extend(call.arguments.keywords.iter().map(|k| k.value.clone()));
+    let receiver = match call.func.as_ref() {
+        Expr::Attribute(attr) => Some(ruff_python_ast::comparable::ComparableExpr::from(
+            attr.value.as_ref(),
+        )),
+        _ => None,
+    };
     Some(OpportunityCandidate {
         bind,
         deps: deps.into_boxed_slice(),
         call_range: call.range,
+        receiver,
     })
 }
 
@@ -1192,6 +1204,9 @@ fn collect_opportunity_run<'a>(body: &'a [Stmt], start: usize) -> Vec<Opportunit
             break;
         }
         if bound.contains(cand.bind) {
+            break;
+        }
+        if cand.receiver.is_some() && run.iter().any(|prev| prev.receiver == cand.receiver) {
             break;
         }
         bound.insert(cand.bind);
@@ -1970,17 +1985,37 @@ async def load() -> int:
     #[test]
     fn opportunity_flags_independent_method_awaits() {
         // The common real case the missed-gather detector deliberately
-        // ignores: two awaited method calls on an imported client with
+        // ignores: two awaited method calls on imported clients with
         // no data dependency between them.
         let src = "\
-async def load(client, uid):
-    a = await client.get_user(uid)
-    b = await client.get_posts(uid)
+async def load(users, posts, uid):
+    a = await users.get(uid)
+    b = await posts.get(uid)
     return (a, b)
 ";
         let module = parse_module(src);
         let ops = detect_gather_opportunities(&module);
         assert_eq!(ops.len(), 1, "expected 1 opportunity; got {ops:?}");
+        assert_eq!(ops[0].count, 2);
+    }
+
+    #[test]
+    fn opportunity_treats_awaits_on_one_receiver_as_dependent() {
+        // 2026-10-03 review §7.9: the receiver carries state between the
+        // calls (a transaction, a login session), so they are not
+        // independent even without a data dependency.
+        let src = "\
+async def save(conn, client):
+    a = await conn.execute(\"INSERT\")
+    b = await conn.execute(\"UPDATE\")
+    c = await client.login()
+    d = await client.fetch()
+    return (a, b, c, d)
+";
+        let module = parse_module(src);
+        let ops = detect_gather_opportunities(&module);
+        // `b` / `c` on different receivers are the only independent pair.
+        assert_eq!(ops.len(), 1, "{ops:?}");
         assert_eq!(ops[0].count, 2);
     }
 
@@ -1993,8 +2028,8 @@ async def load(client, uid):
         let src = "\
 async def load(client, uid):
     async with client.session() as s:
-        a = await s.get_user(uid)
-        b = await s.get_posts(uid)
+        a = await s.users.get(uid)
+        b = await s.posts.get(uid)
         return (a, b)
 ";
         let module = parse_module(src);
@@ -2063,10 +2098,10 @@ async def load(client):
     #[test]
     fn opportunity_counts_three_in_a_row() {
         let src = "\
-async def load(client):
-    a = await client.get_a()
-    b = await client.get_b()
-    c = await client.get_c()
+async def load(a_api, b_api, c_api):
+    a = await a_api.get()
+    b = await b_api.get()
+    c = await c_api.get()
     return (a, b, c)
 ";
         let module = parse_module(src);

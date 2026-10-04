@@ -4987,9 +4987,9 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     /// Source with two independent awaited calls → one gather opportunity.
-    const GATHER_SRC: &str = "async def load(client, uid):\n    \
-        a = await client.get_user(uid)\n    \
-        b = await client.get_posts(uid)\n    \
+    const GATHER_SRC: &str = "async def load(users, posts, uid):\n    \
+        a = await users.get(uid)\n    \
+        b = await posts.get(uid)\n    \
         return (a, b)\n";
 
     /// Spin up the real server over an in-memory pipe; return the client-side

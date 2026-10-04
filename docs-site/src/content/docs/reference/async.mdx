@@ -113,9 +113,9 @@ Without `@gatherable`, the rewrite doesn't fire. There's no diagnostic when call
 Independent of `auto-gather`, `tyc check` and `tyc build` surface a [`tyc::gather_opportunity`](/Typhon/diagnostics/async-errors/) advice (Hint severity, **on by default**) wherever 2+ adjacent independent awaited calls appear inside an `async def`, suggesting you wrap them in an explicit `gather:` block so they run concurrently in an `asyncio.TaskGroup`:
 
 ```python
-async def load(client: Client, uid: int) -> tuple[User, list[Post]]:
-    let user  = await client.get_user(uid)     # 💡 these two awaits
-    let posts = await client.get_posts(uid)    #    could run concurrently
+async def load(users: UserApi, posts_api: PostApi, uid: int) -> tuple[User, list[Post]]:
+    let user  = await users.get(uid)           # 💡 these two awaits
+    let posts = await posts_api.for_user(uid)  #    could run concurrently
     return (user, posts)
 ```
 

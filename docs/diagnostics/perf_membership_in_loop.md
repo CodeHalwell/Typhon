@@ -7,6 +7,13 @@ loop, where `NAME` is a `list`-annotated (or list-literal) binding that the
 loop never mutates. Each iteration re-scans the whole list — O(n) per test,
 O(n·m) over the loop.
 
+It stays silent when the advice would not be safe to follow: when the
+elements are not provably hashable (`list[list[int]]`, `list[object]`, a user
+class — a `set` of them raises `TypeError`; `list[int]`, `list[str]`,
+`list[tuple[int, str]]` and constant literals qualify), and when the loop may
+mutate the list indirectly — by passing it to a call, or by calling a
+same-module function that mutates it (`remember(x)` appending to `SEEN`).
+
 ## Example
 
 ```ty

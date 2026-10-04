@@ -121,6 +121,55 @@ def f(xs: list[int]) -> int:
     assert_eq!(count(&codes(src), "perf_membership_in_loop"), 1);
 }
 
+#[test]
+fn membership_in_loop_silent_when_a_helper_mutates_the_list() {
+    // 2026-10-03 review §7.9: converting `seen` to a set before the loop
+    // would break the deduplication the helper performs.
+    let src = "\
+SEEN: list[int] = []
+
+def remember(x: int) -> None:
+    SEEN.append(x)
+
+def add_to(bucket: list[int], x: int) -> None:
+    bucket.append(x)
+
+def f(xs: list[int], out: list[int]) -> None:
+    for x in xs:
+        if x not in SEEN:
+            remember(x)
+    for x in xs:
+        if x not in out:
+            add_to(out, x)
+";
+    assert_eq!(count(&codes(src), "perf_membership_in_loop"), 0);
+}
+
+#[test]
+fn membership_in_loop_silent_for_unhashable_elements() {
+    // `set(rows)` would raise `TypeError: unhashable type: 'list'`.
+    let src = "\
+def f(rows: list[list[int]], xs: list[list[int]], objs: list[object]) -> int:
+    mut hits: int = 0
+    for x in xs:
+        if x in rows:
+            hits += 1
+        if x in objs:
+            hits += 1
+    return hits
+";
+    assert_eq!(count(&codes(src), "perf_membership_in_loop"), 0);
+    let hashable = "\
+def f(pairs: list[tuple[int, str]], xs: list[tuple[int, str]]) -> int:
+    mut hits: int = 0
+    for x in xs:
+        if x in pairs:
+            hits += 1
+    return hits
+";
+    assert_eq!(count(&codes(hashable), "perf_membership_in_loop"), 1);
+}
+
 // ── lint 2: perf_list_shift_in_loop ───────────────────────────────────────────
 
 #[test]
@@ -308,6 +357,34 @@ def f(xs: list[int]) -> int:
     return sorted(xs)[-1]
 ";
     assert_eq!(count(&codes(src), "perf_sorted_first"), 1);
+}
+
+#[test]
+fn sorted_first_silent_inside_except_index_error() {
+    // `min(xs)` raises `ValueError` on an empty list where `sorted(xs)[0]`
+    // raises the `IndexError` the handler catches.
+    let src = "\
+def first(xs: list[int]) -> int:
+    try:
+        return sorted(xs)[0]
+    except IndexError:
+        return -1
+
+def last(xs: list[int]) -> int:
+    try:
+        return sorted(xs)[-1]
+    except (KeyError, LookupError):
+        return -1
+";
+    assert_eq!(count(&codes(src), "perf_sorted_first"), 0);
+    let outside = "\
+def first(xs: list[int]) -> int:
+    try:
+        return sorted(xs)[0]
+    except ValueError:
+        return -1
+";
+    assert_eq!(count(&codes(outside), "perf_sorted_first"), 1);
 }
 
 #[test]

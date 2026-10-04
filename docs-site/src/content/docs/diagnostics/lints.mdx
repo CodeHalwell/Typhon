@@ -14,7 +14,10 @@ your code for any of them.
 
 The result of a resource-returning call (`open`, `socket.socket`,
 `sqlite3.connect`, `tempfile.NamedTemporaryFile`, …) is bound without a
-`with`, so it is closed only when the garbage collector gets to it.
+`with` — or used and dropped inline (`open(p).read()`, `json.load(open(p))`)
+— so it is closed only when the garbage collector gets to it. A handle stored
+on an object (`self.fh = open(p)`), closed in a later `finally:
+f.close()`, given to `ExitStack.enter_context(...)` or returned is managed.
 
 ```python
 def load_config(path: str) -> str:
@@ -63,7 +66,10 @@ Gated by [`[strictness] suggest-perf`](/Typhon/configuration/strictness/#suggest
 ### `tyc::perf_membership_in_loop` (advice)
 
 `x in some_list` in an `if` / `while` condition inside a loop, where the
-list never changes in the loop: each test is a linear scan.
+list never changes in the loop: each test is a linear scan. Silent when the
+elements are not provably hashable (`list[list[int]]` — a `set` of them would
+raise `TypeError`) or when the loop may mutate the list indirectly (passing it
+to a call, or calling a same-module helper that mutates it).
 
 ```python
 def count_allowed(kinds: list[str], allowed: list[str]) -> int:
@@ -129,7 +135,9 @@ def cheapest(prices: list[int]) -> int:
     return sorted(prices)[0]    # ☞ `sorted(...)[0]` sorts the whole sequence to take one element
 ```
 
-**Fix:** `min(prices)` / `max(prices)`.
+**Fix:** `min(prices)` / `max(prices)`. Not suggested inside a `try` that
+catches `IndexError` / `LookupError`: on an empty list `min` raises
+`ValueError` instead.
 
 ### `tyc::perf_keys_membership` (advice)
 

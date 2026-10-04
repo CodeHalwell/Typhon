@@ -135,11 +135,11 @@ let f = open("data.txt")          # ⚠️ tyc::resource_not_managed
 - `"error"` — promote once the codebase has migrated to `with` (or an explicit `try` / `finally`).
 - `"off"` — drop the diagnostic.
 
-Bodies of `@contextmanager` / `@asynccontextmanager` factories are exempt — acquiring the resource is their job.
+Bodies of `@contextmanager` / `@asynccontextmanager` factories are exempt — acquiring the resource is their job. So is a handle stored on an object (`self.fh = open(p)`), closed in a later `try` / `finally: f.close()`, handed to `ExitStack.enter_context(...)` / `contextlib.closing(...)`, or returned. A handle used and dropped inline — `open(p).read()`, `json.load(open(p))` — is flagged.
 
 ## `blocking-in-async`
 
-Severity for `tyc::blocking_in_async`: a direct call to a known-blocking stdlib function (`time.sleep`, `requests.get` / `post` / …, `urllib.request.urlopen`, `subprocess.run` / `call` / `check_output`, `input`, `socket.recv`) inside an `async def` stalls the event loop.
+Severity for `tyc::blocking_in_async`: a direct call to a known-blocking stdlib function (`time.sleep`, `requests.get` / `post` / …, `urllib.request.urlopen`, `subprocess.run` / `call` / `check_output`, `input`, `socket.recv`) inside an `async def` stalls the event loop. Import aliases are followed (`from time import sleep`, `import time as t`, `import subprocess as sp`).
 
 ```python
 async def poll() -> None:
