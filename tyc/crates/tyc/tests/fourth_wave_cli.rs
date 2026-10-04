@@ -366,3 +366,54 @@ fn a_user_typhon_runtime_the_build_never_replaces_still_builds() {
     assert!(dir.join("build/typhon_runtime.py").exists());
     assert!(!dir.join("build/typhon_runtime").exists());
 }
+
+// ── `tyc fmt` symlink write-through (W4-13, fmt half) ───────────────────────
+
+/// W4-13: `tyc fmt src/` where `src` is a symlink leaving the project used to
+/// reformat the files at the link's target. `tyc fmt .` already skipped it.
+#[cfg(unix)]
+#[test]
+fn fmt_does_not_write_through_a_src_symlink_leaving_the_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(proj.join("typhon.toml"), "[project]\nname = \"p\"\n").unwrap();
+    let victim = "def f():\n\tpass\n";
+    std::fs::write(outside.join("victim.ty"), victim).unwrap();
+    std::os::unix::fs::symlink(&outside, proj.join("src")).unwrap();
+
+    // Even when the link's target carries its own `typhon.toml`.
+    std::fs::write(outside.join("typhon.toml"), "[project]\nname = \"o\"\n").unwrap();
+    for arg in ["src", "src/", "src/victim.ty"] {
+        let out = tyc()
+            .current_dir(&proj)
+            .args(["fmt", arg])
+            .output()
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(outside.join("victim.ty")).unwrap(),
+            victim,
+            "`tyc fmt {arg}` wrote outside the project: {}",
+            text(&out)
+        );
+        assert!(text(&out).contains("outside the project"), "{}", text(&out));
+    }
+
+    // A symlink that stays inside the project is still followed.
+    std::fs::remove_file(proj.join("src")).unwrap();
+    std::fs::create_dir_all(proj.join("code")).unwrap();
+    std::fs::write(proj.join("code/inside.ty"), victim).unwrap();
+    std::os::unix::fs::symlink(proj.join("code"), proj.join("src")).unwrap();
+    let out = tyc()
+        .current_dir(&proj)
+        .args(["fmt", "src"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    assert_ne!(
+        std::fs::read_to_string(proj.join("code/inside.ty")).unwrap(),
+        victim
+    );
+}

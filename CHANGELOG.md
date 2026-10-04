@@ -265,6 +265,12 @@ grouped by workstream (W1–W7).
   runtime does not provide (a program that could not start); otherwise `tyc
   build` and `tyc check` warn that the name is reserved. No program that runs
   today is rejected.
+- **`tyc fmt` refuses to write through a symlink leaving the project**
+  (W4-13, fmt half). `tyc fmt src/` with `src -> ../elsewhere` reformatted the
+  link's target; files that resolve outside the project (the nearest directory
+  above the argument with a `typhon.toml`, never one reached through a
+  symlinked directory) are now skipped with a warning, as `tyc fmt .` already
+  did.
 
 #### W5 — VM & harness
 

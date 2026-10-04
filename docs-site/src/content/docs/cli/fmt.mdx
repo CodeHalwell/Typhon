@@ -105,6 +105,10 @@ suite:
   `__typhon_guard_N` temporary, whose number is derived from the source line
   it came from; source maps are regenerated for the new line numbers.
 
+## Symlinks
+
+`tyc fmt` never rewrites a file that resolves outside the project it was pointed at (the nearest directory above the path with a `typhon.toml`). A checked-out `src -> ../elsewhere` link, or a link inside the tree that leaves it, is skipped with a warning instead of being written through; a link that stays inside the project is followed. A file that is itself a symlink is never written through either.
+
 ## What about `tyc fmt` on `.dty`?
 
 Not today — `tyc fmt` collects `.ty` files only; a `.dty` path, or the `.dty` files under a directory, are skipped untouched. Stubs are short signature lists, so hand-formatting them is cheap, and `tyc check --stubs` still validates them.
