@@ -798,6 +798,27 @@ a real Rust frame plus argument binding — exactly the cost Tier 2 (a
 bytecode VM) targets. [`docs/vm-performance-plan.md`](vm-performance-plan.md)
 has the full measured tables, the root-cause breakdown, and the tiers.
 
+Four operations used to be *quadratic* rather than merely slower, and
+are linear since v1.0.0-beta.1 (measured on an M-series Mac, release
+build; times for the whole loop):
+
+| Loop | Size | Before | After | CPython 3.13 |
+|---|---|---|---|---|
+| `del d[k]` over every key | 80k keys | 19.0 s | 0.03 s | 0.01 s |
+| `OrderedDict.popitem(last=False)` until empty | 60k items | 47.8 s | 0.16 s | 0.01 s |
+| `deque.popleft()` until empty | 200k items | quadratic | 0.73 s | 0.01 s |
+| `while i < len(s): s[i]` | 200k non-ASCII chars | quadratic | 0.10 s | 0.02 s |
+
+A dict deletes by leaving a hole, as CPython's does, and compacts once
+holes outnumber live keys; `len(dict)` no longer counts the keys; a
+`deque` keeps a head offset instead of shifting its list; and a long
+string remembers whether it is ASCII (and, if not, where each character
+starts), so `len(s)`, `s[i]` and `s[a:b]` stop rescanning it. One
+behaviour follows CPython only loosely: a dict mutated during iteration
+*without* changing size (a delete and an insert) may yield a different
+set of remaining keys than CPython, whose answer depends on when its
+table resizes; CPython documents that case as unreliable.
+
 A bytecode VM — the point at which rough CPython parity on most code
 becomes realistic — is designed as Tier 2 of that plan but not yet
 started; see [`docs/vm-performance-plan.md`](vm-performance-plan.md).

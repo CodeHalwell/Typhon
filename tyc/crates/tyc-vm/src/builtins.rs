@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use indexmap::IndexMap;
 
 use crate::error::{attribute_error, index_error, key_error, type_error, value_error, Unwind};
 use crate::interp::{normalize_index, Interpreter};
@@ -725,7 +724,7 @@ pub fn install(interp: &mut Interpreter) {
     native!("vars", |_i, args| {
         match args.first() {
             Some(Value::Instance(inst)) => {
-                let mut m: DictMap = IndexMap::new();
+                let mut m: DictMap = DictMap::new();
                 for (k, v) in inst.fields.borrow().iter() {
                     m.insert(HashKey::Str(Rc::new(k.clone())), v.clone());
                 }
@@ -733,7 +732,7 @@ pub fn install(interp: &mut Interpreter) {
             }
             // `vars(module)` returns the module namespace (review: gemini).
             Some(Value::Module(md)) => {
-                let mut m: DictMap = IndexMap::new();
+                let mut m: DictMap = DictMap::new();
                 for (k, v) in md.members.borrow().iter() {
                     m.insert(HashKey::Str(Rc::new(k.clone())), v.clone());
                 }
@@ -885,7 +884,7 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("dict", |i, args| {
-        let mut map: DictMap = IndexMap::new();
+        let mut map: DictMap = DictMap::new();
         if let Some(v) = args.into_iter().next() {
             // `dict(other_dict)` — shallow copy of an existing mapping.
             if let Value::Dict(d) = &v {
@@ -2188,12 +2187,12 @@ fn value_len(v: &Value) -> Result<usize, Unwind> {
         }
     }
     Ok(match v {
-        Value::Str(s) => s.chars().count(),
+        Value::Str(s) => crate::strindex::char_len(s),
         Value::Bytes(b) => b.len(),
         Value::List(l) => l.borrow().len(),
         Value::Tuple(t) => t.len(),
-        Value::Dict(d) => d.borrow().keys().count(),
-        Value::Set(s) => s.borrow().iter().count(),
+        Value::Dict(d) => d.borrow().len(),
+        Value::Set(s) => s.borrow().len(),
         Value::Range { start, stop, step } => {
             if *step > 0 {
                 ((stop - start).max(0) as usize).div_ceil(*step as usize)
@@ -2656,7 +2655,7 @@ fn make_collections_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
         if defaults.len() > fields.len() {
             return Err(type_error("Got more default values than field names"));
         }
-        let mut field_defaults: DictMap = IndexMap::new();
+        let mut field_defaults: DictMap = DictMap::new();
         let offset = fields.len() - defaults.len();
         for (name, d) in fields[offset..].iter().zip(defaults) {
             field_defaults.insert(HashKey::Str(Rc::new(name.clone())), d);
@@ -5857,7 +5856,7 @@ fn public_members(members: Vec<(String, Value)>) -> Vec<(String, Value)> {
 fn make_os_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
     cached_shim_module(interp, "os", |interp| {
         let env_dict = {
-            let mut m: DictMap = IndexMap::new();
+            let mut m: DictMap = DictMap::new();
             for (k, v) in std::env::vars() {
                 m.insert(HashKey::Str(Rc::new(k)), Value::Str(Rc::new(v)));
             }
@@ -6800,7 +6799,7 @@ fn make_random_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
                 let n = match seq {
                     Value::List(l) => l.borrow().len(),
                     Value::Tuple(t) => t.len(),
-                    Value::Str(s) => s.chars().count(),
+                    Value::Str(s) => crate::strindex::char_len(s),
                     Value::Bytes(b) => b.len(),
                     Value::Range { .. } | Value::Instance(_) => value_len(seq)?,
                     other => {
@@ -7409,7 +7408,7 @@ fn make_re_module() -> Value {
             Value::Int(VmInt::from(p_rc.captures_len().saturating_sub(1) as i64)),
         );
         {
-            let mut d: DictMap = IndexMap::new();
+            let mut d: DictMap = DictMap::new();
             for (name, idx) in name_indices(&p_rc) {
                 d.insert(
                     HashKey::Str(Rc::new(name)),
@@ -7520,7 +7519,7 @@ fn make_re_module() -> Value {
         attrs.insert(
             "groupdict".into(),
             Value::Native(Rc::new(NativeFn::new("groupdict", move |_i, _args| {
-                let mut d: DictMap = IndexMap::new();
+                let mut d: DictMap = DictMap::new();
                 for (name, idx) in &names_d {
                     let v = match gt_d.get(*idx) {
                         Some(Some(s)) => Value::Str(Rc::new(s.clone())),
@@ -8836,7 +8835,7 @@ fn deep_freeze_value(v: Value) -> Result<Value, Unwind> {
         }
         Value::Dict(d) => {
             // Frozen metadata lives outside user-visible container contents.
-            let mut new_map: DictMap = IndexMap::new();
+            let mut new_map: DictMap = DictMap::new();
             for (k, val) in d.borrow().iter() {
                 let frozen_val = deep_freeze_value(val.clone())?;
                 new_map.insert(k.clone(), frozen_val);
@@ -8917,7 +8916,7 @@ fn make_pydantic_module() -> Value {
     let config_dict = nf("ConfigDict", |_i, _args| {
         // Accept any kwargs and ignore — purely a config-record stub.
         Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(
-            IndexMap::new(),
+            DictMap::new(),
         ))))
     });
     make_module(
@@ -9459,7 +9458,7 @@ fn dataclass_convert(v: &Value, as_tuple: bool) -> Value {
                     values.map(|(_, x)| dataclass_convert(x, true)).collect(),
                 ))
             } else {
-                let mut map: DictMap = IndexMap::new();
+                let mut map: DictMap = DictMap::new();
                 for (name, x) in values {
                     map.insert(HashKey::Str(Rc::new(name)), dataclass_convert(x, false));
                 }
@@ -9476,7 +9475,7 @@ fn dataclass_convert(v: &Value, as_tuple: bool) -> Value {
             t.iter().map(|x| dataclass_convert(x, as_tuple)).collect(),
         )),
         Value::Dict(d) => {
-            let mut map: DictMap = IndexMap::new();
+            let mut map: DictMap = DictMap::new();
             for (k, x) in d.borrow().iter() {
                 map.insert(k.clone(), dataclass_convert(x, as_tuple));
             }
@@ -9660,7 +9659,7 @@ pub fn dict_fromkeys(interp: &mut Interpreter, args: Vec<Value>) -> Result<Value
         .next()
         .ok_or_else(|| type_error("fromkeys expected at least 1 argument, got 0"))?;
     let fill = it.next().unwrap_or(Value::None);
-    let mut map: DictMap = IndexMap::new();
+    let mut map: DictMap = DictMap::new();
     let iter = interp.make_iter(iterable)?;
     while let Some(k) = interp.iter_next(&iter)? {
         // Last write wins on a duplicate key, matching CPython.
@@ -9687,7 +9686,7 @@ pub fn str_maketrans(args: &[Value]) -> Result<Value, Unwind> {
             ))),
         }
     };
-    let mut map: DictMap = IndexMap::new();
+    let mut map: DictMap = DictMap::new();
     match args.len() {
         1 => {
             let Value::Dict(d) = &args[0] else {
@@ -11431,9 +11430,8 @@ fn dict_method(
         "pop" => {
             let k = interp.dict_probe_key(d, single(args, "pop")?)?;
             let default = args.get(1).cloned();
-            // `shift_remove` preserves the insertion order of remaining
-            // keys (matches CPython `dict.pop` semantics).
-            match d.borrow_mut().shift_remove(&k) {
+            // Removal leaves the remaining keys in insertion order.
+            match d.borrow_mut().remove(&k) {
                 Some(v) => Ok(v),
                 None => default.ok_or_else(|| crate::error::key_error_for(&k.clone().into_value())),
             }
@@ -11467,7 +11465,7 @@ fn dict_method(
             let k = interp.dict_probe_key(d, single(args, "setdefault")?)?;
             let default = args.get(1).cloned().unwrap_or(Value::None);
             let mut m = d.borrow_mut();
-            Ok(m.entry(k).or_insert(default).clone())
+            Ok(m.get_or_insert(k, default).clone())
         }
         "clear" => {
             d.borrow_mut().clear();
@@ -11486,7 +11484,7 @@ fn dict_method(
             let popped = if last {
                 d.borrow_mut().pop()
             } else {
-                d.borrow_mut().shift_remove_index(0)
+                d.borrow_mut().pop_first()
             };
             match popped {
                 Some((k, v)) => Ok(Value::Tuple(Rc::new(vec![k.into_value(), v]))),
@@ -11495,8 +11493,7 @@ fn dict_method(
         }
         "move_to_end" => {
             // OrderedDict.move_to_end(key, last=True): reposition an existing
-            // key at either end, preserving the relative order of the rest
-            // (`shift_remove` keeps order; plain `swap_remove` would not).
+            // key at either end, preserving the relative order of the rest.
             let key = args
                 .first()
                 .ok_or_else(|| type_error("move_to_end() requires a key"))?;
@@ -11507,18 +11504,14 @@ fn dict_method(
                 .map(|(_, v)| v.truthy())
                 .unwrap_or(true);
             let mut m = d.borrow_mut();
-            let Some(v) = m.shift_remove(&key) else {
+            let Some(v) = m.remove(&key) else {
                 return Err(key_error(key.into_value().py_repr()));
             };
             if last {
                 m.insert(key, v);
             } else {
-                // Re-insert at the front in place. `shift_insert(0, ..)` shifts
-                // the existing entries up by one without rebuilding/reallocating
-                // the whole map — O(n) shift, no per-entry clone — so the LRU
-                // idiom `move_to_end(k, last=False)` stays linear rather than
-                // quadratic over a sequence of front-moves.
-                m.shift_insert(0, key, v);
+                // Re-insert at the front: O(n), as the rest shift up.
+                m.insert_first(key, v);
             }
             Ok(Value::None)
         }
@@ -12571,7 +12564,7 @@ impl JsonParser<'_> {
     }
     fn parse_object(&mut self) -> Result<Value, Unwind> {
         self.pos += 1; // {
-        let mut map: DictMap = IndexMap::new();
+        let mut map: DictMap = DictMap::new();
         self.skip_ws();
         if self.peek() == Some('}') {
             self.pos += 1;
@@ -12784,7 +12777,7 @@ const KWARGS_MARKER: &str = "__typhon_kwargs_sentinel__";
 
 /// Encode keyword arguments as a sentinel tuple appended to a method's args.
 pub fn make_kwargs_sentinel(kwargs: &[(String, Value)]) -> Value {
-    let mut m: DictMap = IndexMap::new();
+    let mut m: DictMap = DictMap::new();
     for (k, v) in kwargs {
         m.insert(HashKey::Str(Rc::new(k.clone())), v.clone());
     }

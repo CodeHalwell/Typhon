@@ -2171,6 +2171,7 @@ dependencies = [
 name = "tyc-vm"
 version = "1.0.0-alpha.9"
 dependencies = [
+ "hashbrown 0.17.1",
  "indexmap",
  "libc",
  "num-bigint",

@@ -3178,7 +3178,7 @@ impl Interpreter {
                 Ok(Value::Set(Rc::new(crate::value::FrozenCell::new(set))))
             }
             Expr::Dict(d) => {
-                let mut map: DictMap = IndexMap::new();
+                let mut map: DictMap = DictMap::new();
                 for item in &d.items {
                     match (&item.key, &item.value) {
                         (Some(k), v) => {
@@ -5217,7 +5217,7 @@ impl Interpreter {
         }
 
         if let Some(kw) = &params.kwarg {
-            let mut map: DictMap = IndexMap::new();
+            let mut map: DictMap = DictMap::new();
             for (k, v) in kwargs_left.drain(..) {
                 map.insert(HashKey::Str(Rc::new(k)), v);
             }
@@ -6582,10 +6582,11 @@ impl Interpreter {
                         )))
                     }
                 };
-                let chars: Vec<char> = s.chars().collect();
-                let idx = normalize_index(i, chars.len())
+                let idx = normalize_index(i, crate::strindex::char_len(s))
                     .ok_or_else(|| index_error("string index out of range"))?;
-                Ok(Value::Str(Rc::new(chars[idx].to_string())))
+                let c = crate::strindex::char_at(s, idx)
+                    .ok_or_else(|| index_error("string index out of range"))?;
+                Ok(Value::Str(Rc::new(c.to_string())))
             }
             Value::Dict(d) => {
                 // A plain `Value::Dict` has no associated class, so the
@@ -6742,7 +6743,7 @@ impl Interpreter {
         let len = match target {
             Value::List(l) => l.borrow().len(),
             Value::Tuple(t) => t.len(),
-            Value::Str(s) => s.chars().count(),
+            Value::Str(s) => crate::strindex::char_len(s),
             Value::Bytes(b) => b.len(),
             _ => {
                 return Err(type_error(format!(
@@ -6759,6 +6760,15 @@ impl Interpreter {
             return Err(value_error("slice step cannot be zero"));
         }
         let (start, stop, step_i) = compute_slice(lower, upper, step_i, len)?;
+        // A contiguous substring is cut by offset, not by listing indices.
+        if let (Value::Str(s), 1) = (target, step_i) {
+            let (start, stop) = (start.max(0) as usize, stop.max(0) as usize);
+            return Ok(Value::Str(Rc::new(if start >= stop {
+                String::new()
+            } else {
+                crate::strindex::char_range(s, start, stop)
+            })));
+        }
         let mut indices: Vec<usize> = Vec::new();
         if step_i > 0 {
             let mut idx = start;
@@ -6831,10 +6841,10 @@ impl Interpreter {
             }
             Value::Dict(d) => {
                 let k = self.dict_probe_key(d, key)?;
-                // `shift_remove` preserves insertion order (matches Python's
-                // `del d[k]` on an insertion-ordered dict).
+                // Removal keeps the rest in insertion order, as `del d[k]`
+                // does.
                 d.borrow_mut()
-                    .shift_remove(&k)
+                    .remove(&k)
                     .map(|_| ())
                     .ok_or_else(|| crate::error::key_error_for(key))
             }
@@ -7094,7 +7104,7 @@ impl Interpreter {
                     let inst = inst.clone();
                     let as_json = attr == "model_dump_json";
                     let nf = NativeFn::new("model_dump", move |_i, _args| {
-                        let mut map: DictMap = IndexMap::new();
+                        let mut map: DictMap = DictMap::new();
                         let fields = inst.fields.borrow();
                         for field in &inst.class.fields {
                             if let Some(v) = fields.get(&field.name) {
@@ -7190,7 +7200,7 @@ impl Interpreter {
                 // snapshot `mappingproxy`; the VM's `__typhon_*` records
                 // are not part of it).
                 if attr == "__dict__" && !class.class_attrs.borrow().contains_key("__dict__") {
-                    let mut map: DictMap = IndexMap::new();
+                    let mut map: DictMap = DictMap::new();
                     if let Some(Value::Str(m)) = class.class_attrs.borrow().get("__typhon_module__") {
                         map.insert(
                             HashKey::Str(Rc::new("__module__".into())),
@@ -8325,6 +8335,11 @@ impl Interpreter {
                     used,
                     remaining,
                 } => {
+                    // An exhausted iterator has let go of its dict (CPython
+                    // clears `di_dict`): later mutation is not its business.
+                    if *index == usize::MAX {
+                        return Ok(None);
+                    }
                     let d = dict.borrow();
                     if d.len() != *used {
                         // Sticky, like CPython's `di_used = -1`.
@@ -8334,7 +8349,10 @@ impl Interpreter {
                             "dictionary changed size during iteration",
                         )));
                     }
-                    let Some((k, v)) = d.get_index(*index) else {
+                    // `index` is a slot position: holes left by deletions
+                    // are stepped over, as CPython's iterator does.
+                    let Some((next, k, v)) = d.next_slot(*index) else {
+                        *index = usize::MAX;
                         return Ok(None);
                     };
                     if *remaining == 0 {
@@ -8343,7 +8361,7 @@ impl Interpreter {
                             "dictionary keys changed during iteration",
                         )));
                     }
-                    *index += 1;
+                    *index = next;
                     *remaining -= 1;
                     return Ok(Some(match kind {
                         crate::value::DictViewKind::Keys => k.clone().into_value(),
@@ -8359,6 +8377,9 @@ impl Interpreter {
                     used,
                     remaining,
                 } => {
+                    if *pos == usize::MAX {
+                        return Ok(None);
+                    }
                     let s = set.borrow();
                     if s.len() != *used {
                         *used = usize::MAX;
@@ -8390,6 +8411,9 @@ impl Interpreter {
                     index,
                     used,
                 } => {
+                    if *index == usize::MAX {
+                        return Ok(None);
+                    }
                     let d = dict.borrow();
                     if d.len() != *used {
                         *used = usize::MAX;
@@ -8398,13 +8422,11 @@ impl Interpreter {
                             "dictionary changed size during iteration",
                         )));
                     }
-                    if *index == 0 {
-                        return Ok(None);
-                    }
-                    *index -= 1;
-                    let Some((k, v)) = d.get_index(*index) else {
+                    let Some((at, k, v)) = d.prev_slot(*index) else {
+                        *index = usize::MAX;
                         return Ok(None);
                     };
+                    *index = at;
                     return Ok(Some(match kind {
                         crate::value::DictViewKind::Keys => k.clone().into_value(),
                         crate::value::DictViewKind::Values => v.clone(),
@@ -8624,7 +8646,7 @@ impl Interpreter {
 
     fn eval_dictcomp(&mut self, c: &ast::ExprDictComp, env: &EnvRef) -> Result<Value, Unwind> {
         let out: Rc<crate::value::FrozenCell<DictMap>> =
-            Rc::new(crate::value::FrozenCell::new(IndexMap::new()));
+            Rc::new(crate::value::FrozenCell::new(DictMap::new()));
         let key_expr = c
             .key
             .clone()
@@ -9472,7 +9494,7 @@ impl Interpreter {
         }
         if let Some(rest_name) = &m.rest {
             // Build a new dict of the keys we *didn't* consume.
-            let mut rest_map: DictMap = IndexMap::new();
+            let mut rest_map: DictMap = DictMap::new();
             for (k, v) in d.borrow().iter() {
                 if !matched_keys.iter().any(|seen| seen == k) {
                     rest_map.insert(k.clone(), v.clone());
@@ -9750,7 +9772,7 @@ fn decorator_simple_name(e: &Expr) -> Option<String> {
 fn model_dump_value(v: &Value) -> Value {
     match v {
         Value::Instance(inner) if crate::value::class_is_pydantic_model(&inner.class) => {
-            let mut map: DictMap = IndexMap::new();
+            let mut map: DictMap = DictMap::new();
             let fields = inner.fields.borrow();
             for field in &inner.class.fields {
                 if let Some(f) = fields.get(&field.name) {
@@ -9767,7 +9789,7 @@ fn model_dump_value(v: &Value) -> Value {
         ))),
         Value::Tuple(items) => Value::Tuple(Rc::new(items.iter().map(model_dump_value).collect())),
         Value::Dict(d) => {
-            let mut map: DictMap = IndexMap::new();
+            let mut map: DictMap = DictMap::new();
             for (k, item) in d.borrow().iter() {
                 map.insert(k.clone(), model_dump_value(item));
             }
@@ -10152,16 +10174,12 @@ fn user_hash_candidates_in_map(
     hash: i64,
     probe: &Rc<Instance>,
 ) -> Vec<Rc<Instance>> {
-    use indexmap::map::raw_entry_v1::RawEntryApiV1;
-    use std::hash::BuildHasher;
     let mut out = Vec::new();
-    let h = map.hasher().hash_one(HashKey::UserHashed {
+    let probe_key = HashKey::UserHashed {
         hash,
         instance: probe.clone(),
-    });
-    // A predicate that never matches walks the whole probe sequence, so
-    // every stored key with this user hash is visited.
-    let _ = map.raw_entry_v1().from_hash(h, |k| {
+    };
+    map.for_each_colliding_key(&probe_key, |k| {
         if let HashKey::UserHashed {
             hash: kh,
             instance: ki,
@@ -10171,7 +10189,6 @@ fn user_hash_candidates_in_map(
                 out.push(ki.clone());
             }
         }
-        false
     });
     out
 }
@@ -14025,7 +14042,7 @@ e = (1+2j) - (3+1j)
     #[test]
     fn dict_view_repr_iter_len_contains() {
         use crate::value::DictViewKind;
-        let mut map: DictMap = IndexMap::new();
+        let mut map: DictMap = DictMap::new();
         map.insert(HashKey::Str(Rc::new("a".into())), Value::Int(VmInt::from(1)));
         map.insert(HashKey::Str(Rc::new("b".into())), Value::Int(VmInt::from(2)));
         let dict = Rc::new(crate::value::FrozenCell::new(map));

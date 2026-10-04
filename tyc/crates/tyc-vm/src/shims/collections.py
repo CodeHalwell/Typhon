@@ -309,30 +309,17 @@ class OrderedDict(_MappingBase):
         self._data = {}
         self.update(*args, **kwargs)
 
+    # `_data` is a VM dict, whose native `move_to_end` / `popitem(last=)`
+    # work in place (taking from the front is O(1)).
     def move_to_end(self, key, last=True):
         if key not in self._data:
             raise KeyError(key)
-        v = self._data[key]
-        del self._data[key]
-        if last:
-            self._data[key] = v
-        else:
-            items = list(self._data.items())
-            self._data.clear()
-            self._data[key] = v
-            for k, val in items:
-                self._data[k] = val
+        self._data.move_to_end(key, last=last)
 
     def popitem(self, last=True):
         if not self._data:
             raise KeyError("dictionary is empty")
-        if last:
-            k, v = self._data.popitem()
-            return (k, v)
-        k = list(self._data.keys())[0]
-        v = self._data[k]
-        del self._data[k]
-        return (k, v)
+        return self._data.popitem(last=last)
 
     def __eq__(self, other):
         if isinstance(other, OrderedDict):
@@ -498,6 +485,10 @@ class ChainMap(_MappingBase):
 
 
 class deque:
+    # The items are `_data[_head:]`. Taking from the left advances `_head`
+    # (compacting once the dead prefix is half the list) and adding on the
+    # left fills spare room kept before `_head`, so both ends are amortised
+    # O(1) as in CPython — a plain list paid O(n) per `popleft`.
     def __init__(self, iterable=None, maxlen=None):
         if maxlen is not None:
             if not isinstance(maxlen, int):
@@ -506,31 +497,57 @@ class deque:
                 raise ValueError("maxlen must be non-negative")
         self.maxlen = maxlen
         self._data = []
+        self._head = 0
         if iterable is not None:
             for x in iterable:
                 self.append(x)
 
+    def _items(self):
+        if self._head:
+            self._data = self._data[self._head:]
+            self._head = 0
+        return self._data
+
+    def _drop_left(self):
+        v = self._data[self._head]
+        self._data[self._head] = None
+        self._head += 1
+        if self._head == len(self._data):
+            self._data = []
+            self._head = 0
+        elif self._head > 16 and self._head * 2 > len(self._data):
+            self._data = self._data[self._head:]
+            self._head = 0
+        return v
+
     def append(self, x):
         self._data.append(x)
-        if self.maxlen is not None and len(self._data) > self.maxlen:
-            del self._data[0]
+        if self.maxlen is not None and len(self._data) - self._head > self.maxlen:
+            self._drop_left()
 
     def appendleft(self, x):
-        self._data.insert(0, x)
-        if self.maxlen is not None and len(self._data) > self.maxlen:
+        if self._head == 0:
+            room = max(8, len(self._data))
+            self._data = [None] * room + self._data
+            self._head = room
+        self._head -= 1
+        self._data[self._head] = x
+        if self.maxlen is not None and len(self._data) - self._head > self.maxlen:
             self._data.pop()
 
     def pop(self):
-        if not self._data:
+        if len(self._data) == self._head:
             raise IndexError("pop from an empty deque")
-        return self._data.pop()
+        v = self._data.pop()
+        if len(self._data) == self._head:
+            self._data = []
+            self._head = 0
+        return v
 
     def popleft(self):
-        if not self._data:
+        if len(self._data) == self._head:
             raise IndexError("pop from an empty deque")
-        v = self._data[0]
-        del self._data[0]
-        return v
+        return self._drop_left()
 
     def extend(self, iterable):
         for x in list(iterable):
@@ -542,111 +559,114 @@ class deque:
 
     def clear(self):
         self._data = []
+        self._head = 0
 
     def copy(self):
-        return deque(self._data, self.maxlen)
+        return deque(self._data[self._head:], self.maxlen)
 
     def count(self, x):
-        return self._data.count(x)
+        return self._items().count(x)
 
     def index(self, x, *args):
-        return self._data.index(x, *args)
+        return self._items().index(x, *args)
 
     def insert(self, i, x):
-        if self.maxlen is not None and len(self._data) >= self.maxlen:
+        if self.maxlen is not None and len(self) >= self.maxlen:
             raise IndexError("deque already at its maximum size")
-        self._data.insert(i, x)
+        self._items().insert(i, x)
 
     def remove(self, x):
-        if x not in self._data:
+        items = self._items()
+        if x not in items:
             raise ValueError("%r is not in deque" % (x,))
-        self._data.remove(x)
+        items.remove(x)
 
     def reverse(self):
-        self._data.reverse()
+        self._items().reverse()
 
     def rotate(self, n=1):
-        length = len(self._data)
+        items = self._items()
+        length = len(items)
         if length == 0:
             return
         n = n % length
         if n:
-            self._data = self._data[-n:] + self._data[:-n]
+            self._data = items[-n:] + items[:-n]
 
     def __len__(self):
-        return len(self._data)
+        return len(self._data) - self._head
 
     def __bool__(self):
-        return len(self._data) > 0
+        return len(self._data) > self._head
 
     def __iter__(self):
-        return iter(list(self._data))
+        return iter(self._data[self._head:])
 
     def __reversed__(self):
-        return iter(self._data[::-1])
+        return iter(self._data[self._head:][::-1])
 
     def __contains__(self, x):
-        return x in self._data
+        return x in self._data[self._head:]
+
+    def _slot(self, i):
+        n = len(self._data) - self._head
+        if i >= n or i < -n:
+            raise IndexError("deque index out of range")
+        return self._head + (i if i >= 0 else i + n)
 
     def __getitem__(self, i):
         if not isinstance(i, int):
             raise TypeError("sequence index must be integer, not '%s'" % type(i).__name__)
-        if i >= len(self._data) or i < -len(self._data):
-            raise IndexError("deque index out of range")
-        return self._data[i]
+        return self._data[self._slot(i)]
 
     def __setitem__(self, i, v):
-        if i >= len(self._data) or i < -len(self._data):
-            raise IndexError("deque index out of range")
-        self._data[i] = v
+        self._data[self._slot(i)] = v
 
     def __delitem__(self, i):
-        if i >= len(self._data) or i < -len(self._data):
-            raise IndexError("deque index out of range")
-        del self._data[i]
+        del self._data[self._slot(i)]
 
     def __eq__(self, other):
         if isinstance(other, deque):
-            return self._data == other._data
+            return self._data[self._head:] == other._data[other._head:]
         return False
 
     def __ne__(self, other):
         return not self.__eq__(other)
 
     def __lt__(self, other):
-        return self._data < other._data
+        return self._data[self._head:] < other._data[other._head:]
 
     def __le__(self, other):
-        return self._data <= other._data
+        return self._data[self._head:] <= other._data[other._head:]
 
     def __gt__(self, other):
-        return self._data > other._data
+        return self._data[self._head:] > other._data[other._head:]
 
     def __ge__(self, other):
-        return self._data >= other._data
+        return self._data[self._head:] >= other._data[other._head:]
 
     def __add__(self, other):
         if not isinstance(other, deque):
             raise TypeError("can only concatenate deque (not \"%s\") to deque" % type(other).__name__)
-        return deque(self._data + other._data, self.maxlen)
+        return deque(self._data[self._head:] + other._data[other._head:], self.maxlen)
 
     def __iadd__(self, other):
         self.extend(other)
         return self
 
     def __mul__(self, n):
-        return deque(self._data * n, self.maxlen)
+        return deque(self._data[self._head:] * n, self.maxlen)
 
     def __rmul__(self, n):
-        return deque(self._data * n, self.maxlen)
+        return deque(self._data[self._head:] * n, self.maxlen)
 
     def __hash__(self):
         raise TypeError("unhashable type: 'collections.deque'")
 
     def __repr__(self):
         if self.maxlen is None:
-            return "deque(%r)" % self._data
-        return "deque(%r, maxlen=%d)" % (self._data, self.maxlen)
+            return "deque(%r)" % self._data[self._head:]
+        return "deque(%r, maxlen=%d)" % (self._data[self._head:], self.maxlen)
 
 
 class _NamedTupleBase:

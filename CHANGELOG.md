@@ -365,6 +365,15 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   runtime `int | str` unions in `isinstance`. The remaining known gaps
   (type-alias objects, `__del__`, metaclasses, lone surrogates) are listed
   in `docs/vm.md`.
+- **Four VM performance cliffs are linear now** (W5-22). `del d[k]` /
+  `d.pop(k)` shifted every later key (draining 80k keys took 19 s, now
+  0.03 s): a dict deletes by leaving a hole, as CPython's does.
+  `OrderedDict.popitem(last=False)` (47.8 s for 60k items, now 0.16 s),
+  `deque.popleft` / `appendleft`, and `len(s)` / `s[i]` / `s[a:b]` on a
+  long string no longer rescan their whole container per call; `len()`
+  of a dict or set no longer counts its keys. An exhausted dict or set
+  iterator now ignores later mutation (it raised `RuntimeError` where
+  CPython raises `StopIteration`).
 - **One front end for every VM entry point** (W5-20). The entry program,
   imported sibling modules and the embedded stdlib shims all go through
   `tyc_syntax::preprocess::expand_and_preprocess_mapped` — the chain

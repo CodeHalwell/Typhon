@@ -82,12 +82,9 @@ use ruff_python_ast::{Parameters, Stmt};
 /// Reference-counted, interior-mutable list. Cloning a `Value::List` aliases
 /// the same storage.
 pub type RcList = Rc<RefCell<Vec<Value>>>;
-/// Dicts use `IndexMap` so insertion order is preserved on iteration —
-/// matching CPython 3.7+ semantics (FINDINGS #18). Previously a `HashMap`
-/// gave non-deterministic iteration order, which made `tyc run` and
-/// `tyc build && python build/main.py` produce different stdout for any
-/// program that prints a dict literal.
-pub type DictMap = IndexMap<HashKey, Value>;
+/// Dicts preserve insertion order on iteration — matching CPython 3.7+
+/// semantics (FINDINGS #18) — and delete in O(1); see `pydict`.
+pub type DictMap = crate::pydict::PyDict;
 /// Container storage with metadata outside the user-visible contents.
 /// Clones of a Value share this flag along with the underlying storage.
 #[derive(Debug)]
@@ -1619,11 +1616,14 @@ pub enum Value {
 impl IterState {
     /// `reversed()` over `dict`'s keys, values or items.
     pub fn dict_rev(dict: &RcDict, kind: DictViewKind) -> IterState {
-        let used = dict.borrow().len();
+        let (used, end) = {
+            let d = dict.borrow();
+            (d.len(), d.slot_end())
+        };
         IterState::DictRev {
             dict: dict.clone(),
             kind,
-            index: used,
+            index: end,
             used,
         }
     }

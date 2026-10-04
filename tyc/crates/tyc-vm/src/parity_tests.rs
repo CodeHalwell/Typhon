@@ -1093,3 +1093,59 @@ asyncio.run(main())
 "#,
     );
 }
+
+// ── W5-22: performance cliffs (the fast paths must keep CPython's answers) ──
+
+#[test]
+fn w5_22_fast_paths_keep_cpython_semantics() {
+    assert_matches_cpython(
+        "w5_22_fast_paths_keep_cpython_semantics",
+        r#"from collections import OrderedDict, deque
+d = {k: k * k for k in range(40)}
+for k in range(0, 40, 3):
+    del d[k]
+show(len(d), list(d)[:5], list(reversed(d))[:5], next(iter(d)), d.popitem())
+for k in range(1, 30):
+    d.pop(k, None)
+d[3] = "back"
+d[100] = "new"
+show(d, list(d.items())[-2:], list(reversed(d.values())))
+it = iter(d)
+show(next(it), next(it))
+d[3] = "again"
+show(list(it))
+del d[37]
+trap("after delete", lambda: next(it))
+e = dict.fromkeys(range(10))
+for k in list(e):
+    if k % 2:
+        del e[k]
+e.setdefault(1, "one")
+show(e, {**e}, e == {0: None, 2: None, 4: None, 6: None, 8: None, 1: "one"})
+o = OrderedDict((k, str(k)) for k in range(6))
+show(o.popitem(last=False), o.popitem(), o)
+o.move_to_end(2, last=False)
+o.move_to_end(1)
+show(o, list(reversed(o)), len(o), bool(o))
+q = deque(range(5))
+q.appendleft(-1)
+q.extendleft([-3, -2])
+show(q, q.popleft(), q.pop(), q[0], q[-1], len(q), 3 in q)
+for _ in range(40):
+    q.append(q.popleft())
+show(q, q.index(0), list(q)[2:4])
+q.rotate(-2)
+show(q, deque(maxlen=2) == deque(), deque([1, 2, 3], maxlen=2))
+r = deque()
+for i in range(30):
+    r.appendleft(i)
+    if i % 4 == 0:
+        r.pop()
+show(r, len(r), r[3], r[-3])
+s = "aé€😀" * 40
+show(len(s), s[3], s[-1], s[5:9], s[150:], s[2:157:37], s.index("😀", 50))
+a = "x" * 100 + "y"
+show(len(a), a[100], a[95:], a[-1])
+"#,
+    );
+}

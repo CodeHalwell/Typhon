@@ -36,6 +36,8 @@ pub mod limits;
 pub mod pyset;
 pub mod slots;
 mod stack;
+pub(crate) mod pydict;
+pub(crate) mod strindex;
 mod unicode_data;
 pub mod value;
 
