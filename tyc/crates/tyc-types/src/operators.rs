@@ -1,5 +1,6 @@
 //! Result typing shared by arithmetic expressions and augmented assignments.
 use super::*;
+use std::cmp::Ordering;
 
 pub(super) fn power_result(
     c: &Checker,
@@ -22,27 +23,38 @@ pub(super) fn power_result(
     } else {
         left.clone()
     };
-    fn negative(expr: &Expr) -> Option<bool> {
+    /// The sign of a constant integer expression — `Less`, `Equal` (zero)
+    /// or `Greater` — or `None` when the syntax does not prove it.
+    fn sign(expr: &Expr) -> Option<Ordering> {
         match expr {
-            Expr::NumberLiteral(n) if matches!(n.value, Number::Int(_)) => Some(false),
-            Expr::BooleanLiteral(_) => Some(false),
-            Expr::BinOp(b)
-                if matches!(b.op, Operator::Pow)
-                    && negative(&b.left) == Some(false)
-                    && negative(&b.right) == Some(false) =>
-            {
-                Some(false)
+            Expr::NumberLiteral(n) if matches!(n.value, Number::Int(_)) => {
+                Some(if is_literal_zero(expr) {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                })
             }
-
-            Expr::UnaryOp(u)
-                if matches!(u.op, ruff_python_ast::UnaryOp::USub)
-                    && matches!(u.operand.as_ref(),Expr::NumberLiteral(n) if matches!(n.value,Number::Int(_))) =>
-            {
-                Some(!is_literal_zero(&u.operand))
+            Expr::BooleanLiteral(b) => Some(if b.value {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            }),
+            // `a ** b` over a non-negative base and exponent: `0 ** 0 == 1`,
+            // `0 ** b == 0` for `b > 0`, positive otherwise.
+            Expr::BinOp(b) if matches!(b.op, Operator::Pow) => {
+                match (sign(&b.left)?, sign(&b.right)?) {
+                    (Ordering::Equal, Ordering::Greater) => Some(Ordering::Equal),
+                    (Ordering::Equal | Ordering::Greater, Ordering::Equal | Ordering::Greater) => {
+                        Some(Ordering::Greater)
+                    }
+                    _ => None,
+                }
             }
-            Expr::UnaryOp(u) if matches!(u.op, ruff_python_ast::UnaryOp::UAdd) => {
-                negative(&u.operand)
-            }
+            Expr::UnaryOp(u) => match u.op {
+                ruff_python_ast::UnaryOp::USub => sign(&u.operand).map(Ordering::reverse),
+                ruff_python_ast::UnaryOp::UAdd => sign(&u.operand),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -51,9 +63,9 @@ pub(super) fn power_result(
     // `def power(base: int, exp: int) -> int: return base ** exp` would
     // narrow programs that only ever pass non-negative exponents and run
     // correctly.
-    Some(match negative(exponent) {
-        Some(true) => Type::Float,
-        Some(false) | None => integer_result,
+    Some(match sign(exponent) {
+        Some(Ordering::Less) => Type::Float,
+        Some(Ordering::Equal | Ordering::Greater) | None => integer_result,
     })
 }
 

@@ -42002,6 +42002,20 @@ def main() -> None:
         assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
     }
     #[test]
+    fn power_sign_follows_unary_minus_over_constant_expressions() {
+        // CPython: `2 ** -(2 ** 3) == 0.00390625`, `2 ** -True == 0.5`.
+        for src in [
+            "def f() -> int:\n    return 2 ** -(2 ** 3)\n",
+            "def f() -> int:\n    return 2 ** -True\n",
+            "def f() -> int:\n    return 2 ** +-(1 ** 0)\n",
+        ] {
+            assert!(!check(src).errors().is_empty(), "accepted: {src}");
+        }
+        // `-(-3)`, `-0` and `-(0 ** 2)` are non-negative: the result is an int.
+        let src = "def f() -> int:\n    return 2 ** -(-3)\ndef g() -> int:\n    return 2 ** -(0)\ndef h() -> int:\n    return 2 ** -(0 ** 2)\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
     fn w2_09_ordering_and_membership() {
         for src in [
             "enum Color:\n    RED\n    GREEN\ndef f() -> bool:\n    return Color.RED < Color.GREEN\n",
