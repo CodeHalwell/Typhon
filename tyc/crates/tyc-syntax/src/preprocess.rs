@@ -6483,6 +6483,13 @@ pub fn expand_question_one_liners(source: &str) -> String {
 
 /// [`expand_question_one_liners`] plus an output-line → input-line table.
 pub fn expand_question_one_liners_mapped(source: &str) -> (String, Vec<usize>) {
+    // Only lines with a propagating `?` are split.
+    if !source.contains('?') {
+        return (
+            source.to_owned(),
+            identity_line_map(text_line_count(source)),
+        );
+    }
     let mut out = MappedOut::with_capacity(source.len() + 64);
     let mut in_string: Option<StringMode> = None;
     let entry_brackets = q_contexts(source);
@@ -6560,6 +6567,13 @@ pub fn expand_question_one_liners_mapped(source: &str) -> (String, Vec<usize>) {
 /// [`expand_compound_question_headers`] plus an output-line → input-line
 /// table.
 pub fn expand_compound_question_headers_mapped(source: &str) -> (String, Vec<usize>) {
+    // Only headers with a propagating `?` are rewritten.
+    if !source.contains('?') {
+        return (
+            source.to_owned(),
+            identity_line_map(text_line_count(source)),
+        );
+    }
     // One-line compound statements (`while f()?: n += 1`) must be header +
     // body before the header rewrite can see the condition on its own.
     let (current, map) = expand_question_one_liners_mapped(source);
@@ -6799,6 +6813,13 @@ pub fn expand_inline_question_ops(source: &str) -> String {
 
 /// [`expand_inline_question_ops`] plus an output-line → input-line table.
 pub fn expand_inline_question_ops_mapped(source: &str) -> (String, Vec<usize>) {
+    // Nothing to lift without a `?`: skip the sub-passes' lexical scans.
+    if !source.contains('?') {
+        return (
+            source.to_owned(),
+            identity_line_map(text_line_count(source)),
+        );
+    }
     // Every pipeline runs this pass, so it is where a one-line compound
     // statement or a `;`-joined line carrying a `?` is split first (a no-op
     // when the compound-header rewrite already ran). The lift below places
@@ -8119,6 +8140,13 @@ pub fn expand_with_chains_mapped(source: &str) -> (String, Vec<usize>) {
 }
 
 fn expand_with_chains_once_mapped(source: &str) -> (String, Vec<usize>) {
+    // A with-chain needs the `with` keyword; skip the lexical scan without it.
+    if !source.contains("with") {
+        return (
+            source.to_owned(),
+            identity_line_map(text_line_count(source)),
+        );
+    }
     let mut out = MappedOut::with_capacity(source.len());
     let mut counter: usize = 0;
     let lines: Vec<&str> = source.split_inclusive('\n').collect();
@@ -9482,6 +9510,19 @@ pub fn expand_go_calls(source: &str) -> String {
 
 /// [`expand_go_calls`] plus an output-line → input-line table.
 pub fn expand_go_calls_mapped(source: &str) -> (String, Vec<usize>) {
+    // A `go` statement starts its line (both passes below match only a line
+    // whose code begins `go `), so a source where no line does is returned
+    // unchanged without their two whole-source lexical scans. That is most
+    // files, and this pass runs on several paths per file.
+    if !source
+        .lines()
+        .any(|line| line.trim_start().starts_with("go "))
+    {
+        return (
+            source.to_owned(),
+            identity_line_map(text_line_count(source)),
+        );
+    }
     let (joined, join_map) = join_go_continuations(source);
     let source = joined.as_str();
     // `go` is a statement keyword. On a line that continues an open bracket
