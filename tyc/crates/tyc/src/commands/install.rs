@@ -130,6 +130,24 @@ fn run_skill(args: SkillArgs) -> Result<()> {
         ));
     }
 
+    // Preflight the entire manifest before the first asset is written. Walk
+    // from the explicit project root so a linked .claude directory cannot
+    // redirect either directory creation or writes outside that root.
+    std::fs::create_dir_all(&args.dir)
+        .map_err(|e| miette!("cannot create {}: {e}", args.dir.display()))?;
+    for (rel, _) in SKILL_FILES {
+        let mut dest = args.dir.clone();
+        for part in Path::new(SKILL_SUBDIR).join(rel).components() {
+            dest.push(part);
+            if std::fs::symlink_metadata(&dest).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(miette!(
+                    "refusing to install through symlink '{}'",
+                    dest.display()
+                ));
+            }
+        }
+    }
+
     // Create each unique destination directory once. The manifest shares a
     // handful of directories (the root and `references/`), so re-running
     // create_dir_all per file would be redundant I/O; the set keeps it general
@@ -162,7 +180,8 @@ fn run_skill(args: SkillArgs) -> Result<()> {
 }
 
 fn write_file(dest: &Path, contents: &str) -> Result<()> {
-    std::fs::write(dest, contents).map_err(|e| miette!("cannot write {}: {}", dest.display(), e))
+    tyc_format::atomic_write(dest, contents.as_bytes())
+        .map_err(|e| miette!("cannot write {}: {}", dest.display(), e))
 }
 
 #[cfg(test)]
@@ -175,6 +194,36 @@ mod tests {
             force,
             list,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_symlink_preflight_preserves_every_asset_and_victim() {
+        for force in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("project");
+            let skill = root.join(SKILL_SUBDIR);
+            std::fs::create_dir_all(&skill).unwrap();
+            let victim = tmp.path().join("victim.md");
+            std::fs::write(&victim, "original").unwrap();
+            std::os::unix::fs::symlink(&victim, skill.join("REFERENCE.md")).unwrap();
+            assert!(run_skill(args(&root, force, false)).is_err());
+            assert_eq!(std::fs::read_to_string(&victim).unwrap(), "original");
+            assert!(!skill.join("SKILL.md").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_symlink_parent_is_refused_before_directory_creation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".claude")).unwrap();
+        assert!(run_skill(args(&root, true, false)).is_err());
+        assert!(!outside.join("skills").exists());
     }
 
     #[test]
