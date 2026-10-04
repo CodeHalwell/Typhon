@@ -3,6 +3,8 @@ title: Match Errors
 description: Diagnostics around exhaustive matching on sealed unions.
 sidebar:
   order: 7
+banner:
+  content: "This page includes behaviour implemented on <code>main</code> for the unreleased <code>v1.0.0-beta.1</code>. The latest published binary is <code>v1.0.0-alpha.9</code>."
 ---
 
 ## `tyc::non_exhaustive_match`
@@ -148,6 +150,60 @@ match xs:
 Alternatives of a `|` pattern are checked independently, since each binds
 on its own path: `case [a] | (a,):` is legal, and CPython *requires* both
 sides to bind the same set of names.
+
+## `tyc::alias_not_a_class`
+
+A `type` alias used where Python needs a class: as a `match` class pattern
+(`case Poly():`) or as the second argument of `isinstance`.
+
+```python
+class Circle frozen:
+    r: float
+class Rect frozen:
+    w: float
+class Tri frozen:
+    b: float
+
+type Poly = Rect | Tri
+type Shape = Circle | Poly
+
+def describe(s: Shape) -> str:
+    match s:
+        case Circle():
+            return "round"
+        case Poly():                  # ❌ tyc::alias_not_a_class
+            return "polygon"
+
+def is_poly(s: Shape) -> bool:
+    return isinstance(s, Poly)        # ❌ tyc::alias_not_a_class
+```
+
+```
+  × `Poly` is a type alias, not a class: `case Poly():` raises `TypeError` at
+  │ runtime
+  help: match its variants instead: `case Rect() | Tri():`
+```
+
+`type Poly = Rect | Tri` emits a PEP 695 `type` statement, which creates a
+`typing.TypeAliasType` object, not a class. CPython raises `TypeError` the
+first time such a pattern or `isinstance` call runs, so `tyc check` rejects
+it. The help text lists the alias's variants.
+
+**Fix:** match or test the variants.
+
+```python
+def describe(s: Shape) -> str:
+    match s:
+        case Circle():
+            return "round"
+        case Rect() | Tri():
+            return "polygon"
+
+def is_poly(s: Shape) -> bool:
+    return isinstance(s, (Rect, Tri))
+```
+
+Full page: [`docs/diagnostics/alias_not_a_class.md`](https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/alias_not_a_class.md) (also `tyc explain alias_not_a_class`).
 
 ## Where next
 
