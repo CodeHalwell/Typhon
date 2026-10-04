@@ -651,7 +651,10 @@ on the old behaviour will see different — correct — results):
   MRO.
 - `freeze let` deeply freezes (list → tuple, dict → mappingproxy,
   recursive); mutators on a frozen dict raise `TypeError` matching
-  CPython.
+  CPython. Since beta a frozen dict also *is* a `mappingproxy`:
+  `type(D).__name__` names it and `isinstance(D, dict)` is `False`, and a
+  frozen dataclass instance passes through unchanged (same object, fields
+  not rebuilt), as the generated runtime does.
 - `comptime let X = ...` inlines via the substitution pass shared
   with `tyc build`.
 - `lazy import M = N` uses the simpler `import M as N` rewrite.

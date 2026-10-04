@@ -2331,7 +2331,9 @@ pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
         ("list", Value::List(_)) => true,
         ("tuple", Value::Tuple(t)) => !crate::value::is_slice_marker(t),
         ("slice", Value::Tuple(t)) => crate::value::is_slice_marker(t),
-        ("dict", Value::Dict(_)) => true,
+        // A `freeze let` dict is a `mappingproxy`, which is not a `dict`.
+        ("dict", Value::Dict(d)) => !dict_is_frozen(d),
+        ("mappingproxy", Value::Dict(d)) => dict_is_frozen(d),
         ("set", Value::Set(s)) => !set_is_frozen(s),
         ("frozenset", Value::Set(s)) => set_is_frozen(s),
         ("range", Value::Range { .. }) => true,

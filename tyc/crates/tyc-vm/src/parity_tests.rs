@@ -751,16 +751,15 @@ print(f(50))
 
 // ── W5-16: `as!` follows the checked-boundary-cast target table ───────────
 
-/// The generated `typhon_runtime/cast.py` the compiled program imports: the
-/// oracle for `as!`, read from the template `tyc build` writes.
-fn cast_runtime_py() -> String {
+/// A generated `typhon_runtime` module the compiled program imports — the
+/// oracle a probe's CPython side runs — read from the template in
+/// `tyc build` (`const NAME: &str = "\` … `";`), with `alias` appended.
+fn runtime_py(name: &str, alias: &str) -> String {
     const BUILD_RS: &str = include_str!("../../tyc/src/commands/build.rs");
-    let start = BUILD_RS
-        .find("const TYPHON_RUNTIME_CAST_PY: &str = \"\\\n")
-        .expect("cast.py template in build.rs");
-    let body = &BUILD_RS[start..];
-    let body = &body[body.find("\"\\\n").unwrap() + 3..];
-    let end = body.find("\n\";").expect("end of the cast.py template");
+    let marker = format!("const {name}: &str = \"\\\n");
+    let start = BUILD_RS.find(&marker).expect("runtime template in build.rs");
+    let body = &BUILD_RS[start + marker.len()..];
+    let end = body.find("\n\";").expect("end of the runtime template");
     // Undo the Rust string escapes the template uses.
     let mut out = String::new();
     let mut chars = body[..end].chars();
@@ -775,8 +774,17 @@ fn cast_runtime_py() -> String {
             out.push(c);
         }
     }
-    out.push_str("\n__typhon_checked_cast__ = checked_cast\n");
+    out.push('\n');
+    out.push_str(alias);
+    out.push('\n');
     out
+}
+
+fn cast_runtime_py() -> String {
+    runtime_py(
+        "TYPHON_RUNTIME_CAST_PY",
+        "__typhon_checked_cast__ = checked_cast",
+    )
 }
 
 #[test]
@@ -864,5 +872,42 @@ cast("none bad", 0, lambda v: __typhon_checked_cast__(v, None))
 show(UserId, UserId(3), UserId.__supertype__ is int)
 "#,
         &cast_runtime_py(),
+    );
+}
+
+// ── W5-17: `freeze let` values ────────────────────────────────────────────
+
+#[test]
+fn w5_17_frozen_values_match_the_runtime() {
+    // A frozen dataclass instance passes through `freeze let` unchanged
+    // (its fields are not rebuilt), and a frozen dict is a `mappingproxy`
+    // — which `type()` names and `isinstance(_, dict)` rejects.
+    assert_matches_cpython_with(
+        "w5_17_frozen_values_match_the_runtime",
+        r#"from dataclasses import dataclass
+@dataclass(frozen=True)
+plain class B:
+    values: list[int]
+b = B([1])
+f = __typhon_freeze__(b)
+f.values.append(2)
+show(f, f is b, b.values)
+d = __typhon_freeze__({"a": [1, 2], "b": {"c": 3}})
+show(type(d).__name__, type(d["a"]).__name__, type(d["b"]).__name__, d)
+show(isinstance(d, dict), str(d), repr(d), len(d), d["a"])
+s = __typhon_freeze__({1, 2})
+show(type(s).__name__, s, isinstance(s, set), isinstance(s, frozenset))
+l = __typhon_freeze__([1, [2, 3], {"k": {4}}])
+show(type(l).__name__, l, type(l[2]).__name__)
+trap("setitem", lambda: d.__setitem__("x", 1))
+trap("dict(d)", lambda: dict(d))
+trap("copy type", lambda: type(d.copy()).__name__)
+trap("union", lambda: d | {"z": 1})
+trap("eq", lambda: d == {"a": (1, 2), "b": {"c": 3}})
+"#,
+        &runtime_py(
+            "TYPHON_RUNTIME_FREEZE_PY",
+            "__typhon_freeze__ = deep_freeze",
+        ),
     );
 }

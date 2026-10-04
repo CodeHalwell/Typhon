@@ -339,6 +339,11 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   them. The VM now expands aliases from their definitions, checks a
   newtype's declared base, and matches `typhon_runtime/cast.py` case by
   case, including its refusals and its failure messages.
+- **`freeze let` values match the runtime's** (W5-17). A frozen dict
+  reported `type(D).__name__ == "dict"` and `isinstance(D, dict)` on the
+  VM; the generated runtime makes it a `mappingproxy`, which is not a
+  `dict`. Both now agree. (Frozen dataclass instances already passed
+  through unchanged; a parity test now pins that against the runtime.)
 - **One front end for every VM entry point** (W5-20). The entry program,
   imported sibling modules and the embedded stdlib shims all go through
   `tyc_syntax::preprocess::expand_and_preprocess_mapped` — the chain

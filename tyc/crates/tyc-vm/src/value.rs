@@ -2296,6 +2296,8 @@ impl Value {
             Value::Tuple(t) if is_slice_marker(t) => "slice",
             Value::Tuple(t) if is_ellipsis_marker(t) => "ellipsis",
             Value::Tuple(_) => "tuple",
+            // A `freeze let` dict is CPython's read-only `mappingproxy`.
+            Value::Dict(d) if d.frozen.get() => "mappingproxy",
             Value::Dict(_) => "dict",
             Value::Set(s) if s.frozen.get() => "frozenset",
             Value::Set(_) => "set",
