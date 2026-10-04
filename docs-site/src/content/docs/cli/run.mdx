@@ -8,13 +8,13 @@ banner:
 ---
 
 ```
-tyc run [PATH] [--compile] [--entry FILE] [--temp] [--no-build] [--python PATH] [-- ARGS...]
+tyc run [PATH] [--compile] [--no-fallback] [--entry FILE] [--temp] [--no-build] [--python PATH] [-- ARGS...]
 ```
 
 Runs a Typhon program. Two execution modes:
 
 - **VM (default).** Walks the parsed `.ty` source directly using the in-process [`tyc-vm`](/Typhon/cli/run/#the-vm-mode) tree-walking interpreter. No `.py` is written, no `build/` directory is created, no CPython process is spawned.
-- **`--compile`** (alias **`--no-vm`**). Falls back to the legacy "build then exec CPython" path. Required when your program imports CPython libraries the VM doesn't speak natively (`numpy`, `requests`, `pandas`, `pydantic`, …).
+- **`--compile`** (alias **`--no-vm`**). Builds the project and runs the emitted Python under CPython — the same thing `tyc run` does on its own when the program imports a module the VM does not model (see [Automatic fallback](#automatic-fallback-to-cpython)).
 
 ## Examples
 
@@ -46,7 +46,7 @@ The VM is in-process and tree-walking — every iteration of the inner loop touc
 - **Insertion-ordered dicts** (since v0.8.0 via `indexmap::IndexMap`) — `tyc run` and `tyc build && python` print dicts in the same order.
 - **Full f-string format flags** (since v0.8.0) — zero-pad, alternate-form, fill-align, sign, width, comma / `_` thousands separator (v0.9.0), precision, type.
 - **~50 builtins** including `print`, `range`, `sorted`, `zip`, `enumerate`, `frozenset` (hashable as dict keys since v0.9.0), `open` (read/write/append/binary modes since v0.9.0), `@property` / `@classmethod` / `@staticmethod` / `super()` stubs (v0.9.0). v0.10.0 adds `divmod`, `pow` (2- and 3-arg modular), `format`, `ascii`, `int(str, base)` (incl. `base=0`); `min` / `max` accept `key=` / `default=`.
-- **Native stdlib.** `math` (v0.10.0: `gcd` / `lcm` / `factorial` / `isqrt` / `comb` / `perm`), `os`, `sys`, `json` (v0.10.0: `dumps(indent=…)`), `time` (v0.10.0: `perf_counter` / `process_time`), `random` (v0.1.x), plus `re`, `typing`, `collections`, `functools`, `itertools`, `dataclasses`, `pathlib` (v0.8.0), plus `collections.deque`, `heapq`, `contextlib.contextmanager` (v0.9.0), and `pydantic.BaseModel` whose `model_validate` / `model_dump` / `model_dump_json` construct and round-trip flat `model` classes since v0.10.0. v0.11.0 adds native `enum` (`enum.Enum`, `enum.auto()`, declaration-order iteration, CPython-matching repr) and `datetime` (naïve / UTC) shims; `collections.defaultdict` now actually invokes the factory on missing-key access via the subscript `__missing__` hook; `pathlib` gains `__truediv__` (`Path("a") / "b"`), `.suffixes`, `.parts`; `re.Match.group(n)` / `.groups()` / `.groupdict()` return the real capture groups; `itertools.groupby` honours `key=`; `builtins.round` uses banker's rounding. Also resolvable: `os.path`, `collections.abc` and `abc` (identity natives for the abstract types and `@abstractmethod`; v0.15.6), and `asyncio` (the cooperative-sequential shim described below). Any other module raises `ImportError` naming `--compile` — there is no automatic fallback.
+- **Native stdlib.** `math` (v0.10.0: `gcd` / `lcm` / `factorial` / `isqrt` / `comb` / `perm`), `os`, `sys`, `json` (v0.10.0: `dumps(indent=…)`), `time` (v0.10.0: `perf_counter` / `process_time`), `random` (v0.1.x), plus `re` (used only under `--no-fallback`; see below), `typing`, `collections`, `functools`, `itertools`, `dataclasses`, `pathlib` (v0.8.0), plus `collections.deque`, `heapq`, `contextlib.contextmanager` (v0.9.0), and `pydantic.BaseModel` whose `model_validate` / `model_dump` / `model_dump_json` construct and round-trip flat `model` classes since v0.10.0. v0.11.0 adds native `enum` (`enum.Enum`, `enum.auto()`, declaration-order iteration, CPython-matching repr) and `datetime` (naïve / UTC) shims; `collections.defaultdict` now actually invokes the factory on missing-key access via the subscript `__missing__` hook; `pathlib` gains `__truediv__` (`Path("a") / "b"`), `.suffixes`, `.parts`; `re.Match.group(n)` / `.groups()` / `.groupdict()` return the real capture groups; `itertools.groupby` honours `key=`; `builtins.round` uses banker's rounding. Also resolvable: `os.path`, `collections.abc` and `abc` (identity natives for the abstract types and `@abstractmethod`; v0.15.6), and `asyncio` (the cooperative-sequential shim described below). Any other module takes the [automatic fallback](#automatic-fallback-to-cpython) to CPython.
 - **Multi-file projects** (since v0.9.0). Sibling `.ty` modules load from the project source root on demand; relative imports (`from .repo import x`) resolve through a `Value::Module` cache. `tyc run --compile` spawns `python -m <pkg>.main` for the compiled path.
 - **`str` / `list` / `dict` / `set`** methods dispatched through a Rust registry; `list` also exposes `deque`'s `popleft` / `appendleft` / `extendleft` / `rotate` (v0.9.0). v0.10.0 fills in the missing `str` methods (`center` / `ljust` / `rjust` / `zfill` / `partition` / `removeprefix` / `expandtabs` / … and `chars`-honouring `strip`), the named `set` algebra (`union` / `intersection` / `difference` / `symmetric_difference` / `issubset` / `isdisjoint` / `update`), `list.sort(key=, reverse=)`, and `dict(other)` / `dict(**kwargs)`. v0.11.0 adds `bytes` methods (`decode` / `hex` / `fromhex` / `count` / `find` / `rfind` / `startswith` / `endswith` / `split` / `strip`) and the pure-keyword form `str.split(maxsplit=…)`. v1.0.0-beta.1 completes the `bytes` surface (the `is*` predicates, `title` / `capitalize` / `swapcase`, `partition` / `rpartition`, `ljust` / `rjust` / `center` / `zfill`, `removeprefix` / `removesuffix`, `expandtabs`, `splitlines`, `hex(sep, group)`) and puts the `str` character predicates on generated Unicode tables, so `isdigit` / `isdecimal` / `isnumeric` are the three separate questions CPython asks, `isprintable` also drives `repr()`'s escaping, and `title` / `capitalize` use the titlecase mapping (`ǆ` → `ǅ`, `ß` → `Ss`).
 - **VM value semantics align with CPython** (v0.11.0). Dataclass instance equality is value-based (class-identity keyed so cross-module same-name classes no longer collide); `repr` is `Name(field=value, ...)`; instances are hashable via `HashKey::Instance` so frozen-dataclass dict / set keys work. Set / frozenset equality is order-independent and repr sorts elements by canonical key. Float `repr` matches CPython's shortest round-tripping form with scientific notation for exp < -4 or ≥ 16 (`e+NN` / `e-NN`, ≥ 2 exponent digits), `-0.0` preserved.
@@ -54,7 +54,7 @@ The VM is in-process and tree-walking — every iteration of the inner loop touc
 - **`comptime let` substitution** runs before VM interpretation (since v0.9.0) — `comptime let PORT = int(env("PORT", "8080"))` produces the same inlined literal under both modes.
 - **`class!` synthesised `__init__`** runs (since v0.9.0) — typed exceptions like `class! HttpError(Exception): code: int` work end-to-end including `except HttpError as e: print(e.code)`.
 
-`async` / `await` / `gather:` / `go` run under a *cooperative sequential* scheduler: a coroutine is forced to completion at its `await` / `asyncio.run` / `TaskGroup` / `spawn` point, so results match CPython whenever correctness doesn't depend on task *interleaving* (a producer/consumer hand-off through an `asyncio.Queue` fails loudly with a pointer to `--compile` rather than deadlocking). Features the VM still doesn't support — lazy / unbounded generators (finite `yield` works since v0.10.0 but `while True: yield` hits the 1M-item cap), `generator.send()` / two-way generators, pydantic *validation* (`model_validate` builds the model, nested sub-models included since v1.0.0-beta.1, but never raises `ValidationError`), template strings (`t"…"`), and the long tail of the CPython stdlib — raise `NotImplementedError` (or `ImportError` for a module the VM doesn't ship) at runtime, naming the responsible feature and telling you to re-run with `--compile`. `@contextmanager` and `@asynccontextmanager` generator bodies do run between setup and teardown since v1.0.0-beta.1.
+`async` / `await` / `gather:` / `go` run under a *cooperative sequential* scheduler: a coroutine is forced to completion at its `await` / `asyncio.run` / `TaskGroup` / `spawn` point, so results match CPython whenever correctness doesn't depend on task *interleaving* (a producer/consumer hand-off through an `asyncio.Queue` fails loudly with a pointer to `--compile` rather than deadlocking). Features the VM still doesn't support — lazy / unbounded generators (finite `yield` works since v0.10.0 but `while True: yield` hits the 1M-item cap), `generator.send()` / two-way generators, pydantic *validation* (`model_validate` builds the model, nested sub-models included since v1.0.0-beta.1, but never raises `ValidationError`), template strings (`t"…"`), and the long tail of the CPython stdlib — raise `NotImplementedError` at runtime, naming the responsible feature and telling you to re-run with `--compile`. (A module the VM doesn't ship never gets that far: the import scan sends the program to CPython before it starts.) `@contextmanager` and `@asynccontextmanager` generator bodies do run between setup and teardown since v1.0.0-beta.1.
 
 See [The Typhon VM](https://github.com/CodeHalwell/Typhon/blob/main/docs/vm.md) for the full feature table.
 
@@ -62,7 +62,33 @@ See [The Typhon VM](https://github.com/CodeHalwell/Typhon/blob/main/docs/vm.md) 
 
 The VM is the fast path for iterating on pure-Typhon code: stack traces land on `.ty` lines directly, no `tyc trace` remapping needed, and you skip the build + `uv sync` round-trip every time you tweak a line of code. `--compile` is the wide-compatibility path: any third-party Python library, any free-threaded extension, the full Python ecosystem.
 
-For pure-Typhon work the VM is the default. The moment your program does `import numpy`, switch to `--compile`.
+For pure-Typhon work the VM is the default. A program that imports `numpy` (or anything else the VM does not model) does not need `--compile`: `tyc run` notices the import and runs it under CPython by itself.
+
+## Automatic fallback to CPython
+
+Before executing anything, `tyc run` scans the program's imports. If one names a module the VM does not model — `numpy`, `sqlite3`, `subprocess`, any third-party package — or reads a `module.attr` the VM's model of a module does not export, it prints a `note:` naming it, builds the project and runs it under CPython, exactly as `tyc run --compile` does. Nothing half-executes on the VM first, so output and exit code are the compiled path's.
+
+```
+$ tyc run main.ty
+note: `sqlite3` is not modelled by the in-process VM — running via `--compile` (build + CPython) so the program behaves as it does after `tyc build`. Pass `--no-fallback` to require the VM.
+```
+
+**`re` always takes this path.** A program that imports `re` runs on compiled CPython under a normal `tyc run`, so dynamic patterns, lookaround, backreferences and every Python regex flag keep CPython's semantics. The VM has its own `re` subset (backed by a Rust regex engine, honouring `re.ASCII` for the patterns it supports); it is used only with `--no-fallback`, where unsupported syntax or flags raise an error instead of matching differently:
+
+```python
+import re
+
+def main() -> None:
+    let m = re.search(r"(?<=a)b", "ab")
+    if m is not None:
+        print(m.group(0))
+
+main()
+```
+
+`tyc run` prints `b` (via CPython). `tyc run --no-fallback` raises `PatternError: … look-around, including look-ahead and look-behind, is not supported`.
+
+**`--no-fallback`** turns the scan into a hard failure: an unmodelled import raises the VM's own `ModuleNotFoundError` instead of switching to CPython. Use it to keep a run hermetic, or to find out whether the VM covers a program.
 
 ## Exit code propagation
 
@@ -108,12 +134,13 @@ tyc run --compile --temp           # nothing left behind after exit
 | Flag | Mode | Effect |
 |------|------|--------|
 | `--compile` (alias `--no-vm`) | switch | Build to `.py` and exec CPython instead of using the VM. |
+| `--no-fallback` | VM | Never fall back to CPython; an import the VM does not model fails with `ModuleNotFoundError`. |
 | `--entry FILE` | compile only | Entry-point file relative to the build dir. Default `main.py`. |
-| `--python PATH` | compile only | Python interpreter. Given explicitly it always wins; left out, the project's `.venv` is preferred, then `python3.<minor>` for `[python] target`, then `python3`. |
+| `--python PATH` | compiled path | Python interpreter for `--compile` and for the automatic fallback. Given explicitly it always wins; left out, the project's `.venv` is preferred, then `python3.<minor>` for `[python] target`, then `python3`. |
 | `--temp` / `-t` | compile only | Build into a tempdir that is deleted on exit. Mutually exclusive with `--no-build`. |
 | `--no-build` | compile only | Skip rebuilding; assume the persistent `build/` is current. |
 
-The compile-only flags (`--entry`, `--python`, `--temp`, `--no-build`) are rejected by clap unless `--compile` is also given, so a mistaken combination fails fast at the CLI rather than being silently ignored.
+The compile-only flags (`--entry`, `--temp`, `--no-build`) are rejected by clap unless `--compile` is also given, so a mistaken combination fails fast at the CLI rather than being silently ignored. `--python` is accepted without `--compile`, because the automatic fallback uses it too.
 
 ## What `tyc run` is not
 

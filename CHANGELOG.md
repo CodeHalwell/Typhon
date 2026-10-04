@@ -289,6 +289,9 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
 - The docs site carries the W2-04 `as!` supported-target table (refused
   targets are a check-time error, not a silent accept) and the W2-05 frozen
   binding types (`freeze let` now has a reference section).
+- The docs-site `tyc run` page documents the automatic CPython fallback,
+  `--no-fallback`, and that a program importing `re` runs on compiled
+  CPython (W5-13); it no longer says there is no fallback.
 - Docs cite only diagnostic codes the binary emits (`tyc explain --list`
   minus `freeze`/`pub`, now language topics), locked in by a guard test.
 - New nullable-operator docs page listing the accepted spellings with the
