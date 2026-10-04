@@ -20,6 +20,7 @@
 //! useful diagnostics on a meaningful subset of programs, not full
 //! coverage.
 
+mod builtin_exceptions;
 mod builtins;
 mod callables;
 mod class_contracts;
@@ -3317,6 +3318,11 @@ const IS_ASSIGNABLE_MAX_DEPTH: u32 = 256;
 
 struct Checker<'a> {
     descriptor_uses: std::cell::OnceCell<HashSet<(String, String)>>,
+    /// Attribute names this module writes on a receiver other than `self`
+    /// (`err.code = 404`, `cls.code = 1`); `None` when it calls `setattr`,
+    /// `vars` or touches `__dict__`, which can write any name. Computed on
+    /// first use by [`Checker::module_may_store_attr`].
+    dynamic_attr_stores: std::cell::OnceCell<Option<HashSet<String>>>,
     expression_types: HashMap<(usize, usize), Type>,
     attribute_receiver_type: Option<Type>,
     module: Option<&'a ModModule>,
@@ -3918,6 +3924,7 @@ impl<'a> Checker<'a> {
             function_type_bounds: HashMap::new(),
             active_typevar_bounds: HashMap::new(),
             descriptor_uses: std::cell::OnceCell::new(),
+            dynamic_attr_stores: std::cell::OnceCell::new(),
             expression_types: HashMap::new(),
             attribute_receiver_type: None,
             active_type_params: Vec::new(),
@@ -5682,6 +5689,105 @@ impl<'a> Checker<'a> {
         true
     }
 
+    /// The builtin exception classes `cls_name` inherits from, when every
+    /// class in its hierarchy is either a non-partial project class or a
+    /// builtin exception; `None` when any other unseen base (a framework
+    /// class, a venv type) could supply attributes the checker cannot list.
+    fn builtin_exception_bases(&self, cls_name: &str) -> Option<Vec<String>> {
+        let mut out = Vec::new();
+        let mut stack: Vec<&str> = vec![cls_name];
+        let mut visited: HashSet<&str> = HashSet::new();
+        while let Some(name) = stack.pop() {
+            if !visited.insert(name) {
+                continue;
+            }
+            match self.class_shapes.get(name) {
+                Some(shape) if shape.partial => return None,
+                Some(_) => {}
+                None if name == "object" => continue,
+                None if builtin_exceptions::is_builtin_exception(name) => {
+                    out.push(name.to_owned());
+                    continue;
+                }
+                None => return None,
+            }
+            if let Some(parents) = self.class_parents.get(name) {
+                stack.extend(parents.iter().map(String::as_str));
+            }
+        }
+        Some(out)
+    }
+
+    /// Whether this module may write attribute `attr` onto an object from
+    /// outside its class body: a store through a receiver other than
+    /// `self` (`err.code = 404`, `cls.code = 1`, `obj.code += 1`), or any
+    /// `setattr` / `vars` / `__dict__` use, which can write any name.
+    fn module_may_store_attr(&self, attr: &str) -> bool {
+        use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
+        struct Scan {
+            stores: HashSet<String>,
+            dynamic: bool,
+        }
+        impl Scan {
+            fn target(&mut self, t: &Expr) {
+                match t {
+                    Expr::Attribute(a) => {
+                        if !matches!(a.value.as_ref(), Expr::Name(n) if n.id.as_str() == "self") {
+                            self.stores.insert(a.attr.as_str().to_owned());
+                        }
+                    }
+                    Expr::Tuple(x) => x.elts.iter().for_each(|e| self.target(e)),
+                    Expr::List(x) => x.elts.iter().for_each(|e| self.target(e)),
+                    Expr::Starred(x) => self.target(&x.value),
+                    _ => {}
+                }
+            }
+        }
+        impl<'a> Visitor<'a> for Scan {
+            fn visit_stmt(&mut self, stmt: &'a Stmt) {
+                match stmt {
+                    Stmt::Assign(a) => a.targets.iter().for_each(|t| self.target(t)),
+                    Stmt::AugAssign(a) => self.target(&a.target),
+                    Stmt::AnnAssign(a) => self.target(&a.target),
+                    Stmt::For(f) => self.target(&f.target),
+                    Stmt::With(w) => w
+                        .items
+                        .iter()
+                        .filter_map(|i| i.optional_vars.as_deref())
+                        .for_each(|t| self.target(t)),
+                    _ => {}
+                }
+                walk_stmt(self, stmt);
+            }
+            fn visit_expr(&mut self, expr: &'a Expr) {
+                match expr {
+                    Expr::Name(n) if matches!(n.id.as_str(), "setattr" | "vars") => {
+                        self.dynamic = true;
+                    }
+                    Expr::Attribute(a) if a.attr.as_str() == "__dict__" => self.dynamic = true,
+                    Expr::Named(n) => self.target(&n.target),
+                    _ => {}
+                }
+                walk_expr(self, expr);
+            }
+        }
+        self.dynamic_attr_stores
+            .get_or_init(|| {
+                let mut scan = Scan {
+                    stores: HashSet::new(),
+                    dynamic: false,
+                };
+                if let Some(module) = self.module {
+                    for stmt in &module.body {
+                        scan.visit_stmt(stmt);
+                    }
+                }
+                (!scan.dynamic).then_some(scan.stores)
+            })
+            .as_ref()
+            .is_none_or(|stores| stores.contains(attr))
+    }
+
     /// SOUNDNESS (union use sites): return `true` when attribute / method
     /// `attr` is definitely supported by member type `member`, or when
     /// `member` is foreign / dynamic enough that we can't soundly flag it
@@ -5739,10 +5845,29 @@ impl<'a> Checker<'a> {
                 }
             }
             Type::Class(name) => {
-                if !self.class_hierarchy_fully_known(name) || self.class_defines_getattr(name) {
+                if self.class_defines_getattr(name) {
                     return true;
                 }
-                self.find_method(name, attr).is_some() || self.find_field(name, attr).is_some()
+                let declared =
+                    self.find_method(name, attr).is_some() || self.find_field(name, attr).is_some();
+                if self.class_hierarchy_fully_known(name) {
+                    return declared;
+                }
+                // A base the checker cannot see may supply `attr` — unless
+                // every such base is a builtin exception, whose attributes
+                // are a fixed table (`except (A, B) as e: e.code` where only
+                // `A` declares `code` and both derive from `Exception`).
+                // An instance of such a class has a `__dict__`, so a write
+                // of `attr` anywhere in the module (`err.code = 404`) keeps
+                // it permissive.
+                match self.builtin_exception_bases(name) {
+                    Some(bases) => {
+                        declared
+                            || bases.iter().any(|b| builtin_exceptions::has_attr(b, attr))
+                            || self.module_may_store_attr(attr)
+                    }
+                    None => true,
+                }
             }
             // Nested union — recurse (every member must support it).
             Type::Union(ms) => ms.iter().all(|m| self.member_supports_attr(m, attr)),
@@ -41737,6 +41862,48 @@ def main() -> None:
             let src = format!("{pre}{body}");
             let d = check(&src);
             assert!(d.errors().is_empty(), "{src}: {:?}", d.errors());
+        }
+    }
+    fn union_attr_errors(src: &str) -> Vec<String> {
+        check(src)
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::AttributeNotFound { .. }))
+            .map(ToString::to_string)
+            .collect()
+    }
+    #[test]
+    fn union_member_missing_on_a_builtin_exception_subclass_is_rejected() {
+        let pre = "class A(Exception):\n    code: int\nclass B(Exception):\n    pass\nclass C(ValueError):\n    pass\nclass D(C):\n    pass\n";
+        for body in [
+            "def main() -> None:\n    try:\n        raise B()\n    except (A, B) as e:\n        print(e.code)\n",
+            "type E = A | C\ndef f(e: E) -> int:\n    return e.code\n",
+            "def f(e: A | D) -> int:\n    return e.code\n",
+        ] {
+            let src = format!("{pre}{body}");
+            let errs = union_attr_errors(&src);
+            assert_eq!(errs.len(), 1, "{src}: {errs:?}");
+        }
+    }
+    #[test]
+    fn union_member_supplied_by_the_base_or_written_dynamically_is_accepted() {
+        let pre = "class A(Exception):\n    code: int\n";
+        for body in [
+            // `SystemExit` has `code`; `OSError` has `errno`; every
+            // exception has `args`.
+            "class B(SystemExit):\n    pass\ndef f(e: A | B) -> None:\n    print(e.code, e.args)\n",
+            "class B(OSError):\n    pass\nclass C(OSError):\n    pass\ndef f(e: B | C) -> None:\n    print(e.errno, e.filename)\n",
+            // `B` declares it as a method.
+            "class B(Exception):\n    pass\nimpl B:\n    def code(self) -> int:\n        return 1\ndef f(e: A | B) -> None:\n    print(e.code)\n",
+            // An instance attribute written outside the class.
+            "class B(Exception):\n    pass\ndef make() -> B:\n    let err = B()\n    err.code = 404\n    return err\ndef f(e: A | B) -> None:\n    print(e.code)\n",
+            "class B(Exception):\n    pass\ndef make() -> B:\n    let err = B()\n    setattr(err, \"code\", 404)\n    return err\ndef f(e: A | B) -> None:\n    print(e.code)\n",
+            // A base the checker cannot see may supply anything.
+            "from somewhere import Base\nclass B(Base):\n    pass\ndef f(e: A | B) -> None:\n    print(e.code)\n",
+        ] {
+            let src = format!("{pre}{body}");
+            let errs = union_attr_errors(&src);
+            assert!(errs.is_empty(), "{src}: {errs:?}");
         }
     }
     fn nullable_helps(d: &Diagnostics) -> Vec<String> {
