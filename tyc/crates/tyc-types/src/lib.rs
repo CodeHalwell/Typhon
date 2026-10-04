@@ -42065,6 +42065,21 @@ def main() -> None:
         ] { assert!(check_full(src).errors().is_empty(), "{src}: {:?}", check_full(src).errors()); }
     }
     #[test]
+    fn create_task_accepts_the_coroutine_by_keyword() {
+        // `create_task(coro, *, name=None, context=None)`: CPython accepts
+        // `coro=` by keyword, and a `*`/`**` unpacking can supply it.
+        for src in [
+            "async def work() -> int:\n    return 1\nasync def f() -> int:\n    let t = asyncio.create_task(coro=work())\n    return await t\n",
+            "async def work() -> int:\n    return 1\nasync def f() -> None:\n    async with asyncio.TaskGroup() as tg:\n        let t = tg.create_task(coro=work(), name=\"w\")\n    let n: int = t.result()\n",
+            "async def work() -> int:\n    return 1\nasync def f() -> None:\n    let t = asyncio.create_task(*(work(),))\n    await t\n",
+        ] { assert!(check_full(src).errors().is_empty(), "{src}: {:?}", check_full(src).errors()); }
+        for src in [
+            "async def work() -> int:\n    return 1\nasync def f() -> str:\n    let t = asyncio.create_task(coro=work())\n    return await t\n",
+            "async def work() -> int:\n    return 1\nasync def f() -> None:\n    let t = asyncio.create_task(work(), coro=work())\n    await t\n",
+            "async def f() -> None:\n    let t = asyncio.create_task(name=\"w\")\n    await t\n",
+        ] { assert!(!check_full(src).errors().is_empty(), "accepted: {src}"); }
+    }
+    #[test]
     fn w2_11_go_requires_a_coroutine() {
         let src = "def work() -> int:\n    return 1\nasync def f() -> None:\n    go work()\n";
         assert!(!check_full(src).errors().is_empty(), "accepted: {src}");
