@@ -265,6 +265,54 @@ fn an_augmented_assignment_loads_its_target_before_the_operand() {
 }
 
 #[test]
+fn a_call_to_a_shadowed_builtin_is_hoisted_like_any_call() {
+    // A user `list()` / `super()` is an ordinary call, which Python runs
+    // before the operand (PR #493 review: the spelling alone made it
+    // trivial, so `q()` ran first).
+    let out = expand_inline_question_ops(
+        "def list() -> int:\n    return 1\ndef run() -> Result[int, str]:\n    return Ok(combine(list(), q()?))\n",
+    );
+    assert!(
+        line_of(&out, "__typhon_ev_0__ = list()") < line_of(&out, "= q()"),
+        "{out}"
+    );
+    let out = expand_inline_question_ops(
+        "def super() -> int:\n    return 1\ndef run() -> Result[int, str]:\n    print(super(), q()?)\n    return Ok(0)\n",
+    );
+    assert!(
+        line_of(&out, "__typhon_ev_0__ = super()") < line_of(&out, "= q()"),
+        "{out}"
+    );
+    // Bound any other way — a parameter, an assignment, an import, a star
+    // import, a class — likewise.
+    for src in [
+        "def run(list: Maker) -> Result[int, str]:\n    return Ok(combine(list(), q()?))\n",
+        "dict = make\ndef run() -> Result[int, str]:\n    return Ok(combine(dict(), q()?))\n",
+        "from helpers import set\ndef run() -> Result[int, str]:\n    return Ok(combine(set(), q()?))\n",
+        "from helpers import *\ndef run() -> Result[int, str]:\n    return Ok(combine(tuple(), q()?))\n",
+        "class frozenset:\n    pass\ndef run() -> Result[int, str]:\n    return Ok(combine(frozenset(), q()?))\n",
+    ] {
+        let out = expand_inline_question_ops(src);
+        assert!(
+            line_of(&out, "__typhon_ev_0__ = ") < line_of(&out, "= q()"),
+            "{src}\n---\n{out}"
+        );
+    }
+    // The builtins themselves stay in place, also when the file names them
+    // in a comment, a string, an attribute or a type.
+    for src in [
+        "def run(xs: list[int]) -> Result[int, str]:\n    # list = the old one\n    let s: str = \"list = 1\"\n    obj.list = 3\n    return Ok(combine(list(), q()?))\n",
+        "class C(B):\n    def m(self) -> Result[int, str]:\n        return Ok(combine(super(), q()?))\n",
+    ] {
+        let out = expand_inline_question_ops(src);
+        assert!(
+            !out.contains("__typhon_ev_"),
+            "nothing needed hoisting:\n{src}\n---\n{out}"
+        );
+    }
+}
+
+#[test]
 fn unmodelled_shapes_are_left_exactly_as_before() {
     // An operand under a conditional is not reordered (the checker rejects
     // the placement; the lowering must not invent an order for it).

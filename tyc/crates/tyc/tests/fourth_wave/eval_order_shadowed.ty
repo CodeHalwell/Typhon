@@ -1,0 +1,26 @@
+def list() -> int:
+    print("list")
+    return 1
+
+def super() -> int:
+    print("super")
+    return 2
+
+def q(ok: bool) -> Result[int, str]:
+    print("q")
+    if ok:
+        return Ok(10)
+    return Err("bad")
+
+def combine(a: int, b: int) -> int:
+    return a + b
+
+def run(ok: bool) -> Result[int, str]:
+    print(super(), q(ok)?)
+    return Ok(combine(list(), q(ok)?))
+
+def main() -> None:
+    print(run(True))
+    print(run(False))
+
+main()

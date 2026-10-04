@@ -918,7 +918,11 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   `self.pos = __typhon_ev_0__` (container and non-trivial index hoisted
   once; `+=` on the temporary keeps the in-place semantics). Both surfaces
   share the lowering; the new test checks each against the same program run
-  as plain Python.
+  as plain Python. `super()` and the empty builtin constructor calls
+  (`list()`, `dict()`, …) stay in place only while the name is provably the
+  builtin — bound nowhere in the file and not reachable through an
+  `import *`; a user `def list()` / `def super()` is hoisted like any other
+  call (it ran after the operand, and not at all when the operand failed).
 - **`impl` methods that must stay in the class body: W7-06 residuals.** A
   method on a class whose only unseen bases are builtin exceptions
   (`class AppError(Exception)`) is now attached at its `impl` block too when

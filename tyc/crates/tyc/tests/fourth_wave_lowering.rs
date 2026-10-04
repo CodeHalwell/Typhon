@@ -154,6 +154,18 @@ fn inline_question_reads_names_receivers_and_aug_targets_first() {
     );
 }
 
+/// PR #493 review: `list()` / `super()` are only left in place when they
+/// are the builtins. A user function of that name is an ordinary call,
+/// evaluated before the operand — and still run when the operand fails.
+/// Expected output from the same program run as plain Python.
+#[test]
+fn inline_question_hoists_calls_to_shadowed_builtins() {
+    assert_runs_as(
+        include_str!("fourth_wave/eval_order_shadowed.ty"),
+        include_str!("fourth_wave/eval_order_shadowed.expected"),
+    );
+}
+
 /// W7-05: `gather` used as an ordinary name — a class attribute, a module
 /// binding, and a parameter on a continuation line — is not a `gather:`
 /// block. (It was lowered to `async with asyncio.TaskGroup()` in a class

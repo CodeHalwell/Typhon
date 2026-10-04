@@ -42,11 +42,15 @@
 //! "Trivial" — left in place — means evaluating it can neither have an
 //! effect nor observe one an operand might have: literals (and displays of
 //! them), names no call can rebind, lambdas, `super()`, empty
-//! builtin-constructor calls, and type-expression subscripts (`list[int]`).
-//! A name *can* be rebound by the operand when the file declares it
-//! `global` or `nonlocal` somewhere, or the statement assigns it with a
-//! walrus; such a name is hoisted like any other value (`f(x, g()?)` where
-//! `g` does `global x; x = …` reads the old `x`).
+//! builtin-constructor calls (`list()`, `dict()`, …), and type-expression
+//! subscripts (`list[int]`). A name *can* be rebound by the operand when the
+//! file declares it `global` or `nonlocal` somewhere, or the statement
+//! assigns it with a walrus; such a name is hoisted like any other value
+//! (`f(x, g()?)` where `g` does `global x; x = …` reads the old `x`).
+//! `super()` and the empty constructor calls are trivial only while the
+//! callee is provably the builtin — the name is bound nowhere in the file
+//! and no `import *` could bind it. A user `def list()` / `def super()` is
+//! an ordinary call and is hoisted like one.
 //!
 //! A call receiver is evaluated before the arguments, so a dotted receiver
 //! (`self.items.append(self.word()?)`) is hoisted: `word()` may rebind
@@ -151,7 +155,7 @@ fn hoist_once(text: &str, counter: &mut usize) -> Option<(String, Vec<usize>)> {
     }
     starts.push(acc);
     let contexts = q_contexts(text);
-    let names = FileNames::scan(&mask, &lines);
+    let names = FileNames::scan(text, &mask, &lines);
 
     let mut out = MappedOut::with_capacity(text.len() + 64);
     let mut changed = false;
@@ -191,16 +195,23 @@ fn hoist_once(text: &str, counter: &mut usize) -> Option<(String, Vec<usize>)> {
     changed.then(|| out.finish())
 }
 
+/// Builtins whose calls the walk treats as trivial (see the module docs),
+/// as long as the file never binds the name itself.
+const TRIVIAL_BUILTINS: [&str; 6] = ["list", "dict", "set", "tuple", "frozenset", "super"];
+
 /// File-wide facts about names the walk needs: which names a call may
-/// rebind (declared `global` / `nonlocal` somewhere), and which are bound by
-/// an `import` (a receiver rooted at one is a module, left in place).
+/// rebind (declared `global` / `nonlocal` somewhere), which are bound by
+/// an `import` (a receiver rooted at one is a module, left in place), and
+/// which of [`TRIVIAL_BUILTINS`] the file may bind (so a call to it is not
+/// provably the builtin).
 struct FileNames {
     rebindable: HashSet<String>,
     imported: HashSet<String>,
+    shadowed_builtins: HashSet<&'static str>,
 }
 
 impl FileNames {
-    fn scan(mask: &LexMask, lines: &[&str]) -> Self {
+    fn scan(text: &str, mask: &LexMask, lines: &[&str]) -> Self {
         let mut rebindable = HashSet::new();
         let mut imported = HashSet::new();
         let idents = |list: &str| -> Vec<String> {
@@ -219,6 +230,7 @@ impl FileNames {
                 })
                 .collect()
         };
+        let mut star_import = false;
         for (li, line) in lines.iter().enumerate() {
             if !mask.is_logical_line_start(li) || mask.line_starts_in_string(li) {
                 continue;
@@ -240,15 +252,87 @@ impl FileNames {
                 }
             } else if code.starts_with("from ") {
                 if let Some((_, rest)) = code.split_once(" import ") {
+                    star_import |= rest.trim().trim_matches(['(', ')']).trim() == "*";
                     imported.extend(idents(rest));
                 }
             }
         }
+        let shadowed_builtins = if star_import {
+            TRIVIAL_BUILTINS.into_iter().collect()
+        } else {
+            TRIVIAL_BUILTINS
+                .into_iter()
+                .filter(|name| may_bind(text, mask, name))
+                .collect()
+        };
         FileNames {
             rebindable,
             imported,
+            shadowed_builtins,
         }
     }
+
+    /// `name` (one of [`TRIVIAL_BUILTINS`]) certainly denotes the builtin.
+    fn is_builtin(&self, name: &str) -> bool {
+        TRIVIAL_BUILTINS.contains(&name) && !self.shadowed_builtins.contains(name)
+    }
+}
+
+/// Whether `text` may bind `name` anywhere. Deliberately over-approximate —
+/// a false "may bind" only costs a harmless hoist, a false "never binds"
+/// reorders a user function's call. Every code occurrence of the
+/// identifier, other than an attribute (`x.list`), counts as a possible
+/// binding unless it is a call or subscript (`list(…)`, `list[int]`) not
+/// introduced by a declaring keyword (`def list(…)`, `class list[T]`).
+fn may_bind(text: &str, mask: &LexMask, name: &str) -> bool {
+    let bytes = text.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80;
+    let mut from = 0usize;
+    while let Some(rel) = text[from..].find(name) {
+        let at = from + rel;
+        let end = at + name.len();
+        from = end;
+        if !mask.is_code(at)
+            || (at > 0 && is_ident(bytes[at - 1]))
+            || (end < bytes.len() && is_ident(bytes[end]))
+        {
+            continue;
+        }
+        let before = text[..at].trim_end_matches([' ', '\t']);
+        if before.ends_with('.') {
+            continue;
+        }
+        let prev_word = before
+            .rsplit(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .next()
+            .unwrap_or("");
+        let declared = before.ends_with('!')
+            || matches!(
+                prev_word,
+                "def"
+                    | "class"
+                    | "type"
+                    | "interface"
+                    | "enum"
+                    | "newtype"
+                    | "extend"
+                    | "impl"
+                    | "let"
+                    | "mut"
+                    | "as"
+                    | "import"
+                    | "global"
+                    | "nonlocal"
+                    | "for"
+                    | "del"
+            );
+        let after = text[end..].trim_start_matches([' ', '\t']);
+        let used = after.starts_with('(') || after.starts_with('[');
+        if declared || !used {
+            return true;
+        }
+    }
+    false
 }
 
 /// One logical statement: physical lines `first..end` of `text`.
@@ -428,7 +512,7 @@ impl StmtSpan<'_> {
             offset: indent_len,
             operands: &operands,
             rebindable: &rebindable,
-            imported: &self.names.imported,
+            names: self.names,
             events: Vec::new(),
         };
         plan.visit_stmt(stmt).ok()?;
@@ -633,8 +717,9 @@ struct Plan<'a> {
     operands: &'a [Range<usize>],
     /// Names the operand could rebind before the statement reads them.
     rebindable: &'a HashSet<String>,
-    /// Names bound by an `import`: a receiver rooted at one is a module.
-    imported: &'a HashSet<String>,
+    /// File-wide name facts: imports, and which trivial builtins the file
+    /// may shadow.
+    names: &'a FileNames,
     /// Expressions evaluated before a later operand, in evaluation order.
     events: Vec<Event>,
 }
@@ -761,7 +846,7 @@ impl Plan<'_> {
     /// its arguments: anything but `super()`, a name no call can rebind, or
     /// a dotted name rooted at an imported module.
     fn receiver_is_child(&self, recv: &Expr) -> bool {
-        if is_super_call(recv) {
+        if is_super_call(recv, &|n| self.names.is_builtin(n)) {
             return false;
         }
         match recv {
@@ -771,15 +856,18 @@ impl Plan<'_> {
                 while let Expr::Attribute(a) = root {
                     root = &a.value;
                 }
-                !matches!(root, Expr::Name(n) if self.imported.contains(n.id.as_str()))
+                !matches!(root, Expr::Name(n) if self.names.imported.contains(n.id.as_str()))
             }
             _ => true,
         }
     }
 
-    /// [`is_trivial`], except that a name a call could rebind is not.
+    /// [`is_trivial`] with this statement's rebindable names and the
+    /// file's shadowed builtins.
     fn is_trivial(&self, e: &Expr) -> bool {
-        is_trivial(e, &|name| self.rebindable.contains(name))
+        is_trivial(e, &|name| self.rebindable.contains(name), &|name| {
+            self.names.is_builtin(name)
+        })
     }
 
     /// An expression evaluated before an operand: hoist it, or — for an
@@ -913,18 +1001,24 @@ fn is_dotted_name(e: &Expr) -> bool {
     }
 }
 
-/// `super()` with no arguments.
-fn is_super_call(e: &Expr) -> bool {
+/// `super()` with no arguments, where `super` is the builtin.
+fn is_super_call(e: &Expr, is_builtin: &dyn Fn(&str) -> bool) -> bool {
     matches!(e, Expr::Call(c)
         if c.arguments.is_empty()
-            && matches!(c.func.as_ref(), Expr::Name(n) if n.id.as_str() == "super"))
+            && matches!(c.func.as_ref(), Expr::Name(n) if n.id.as_str() == "super")
+            && is_builtin("super"))
 }
 
 /// An expression whose evaluation neither has an effect nor observes one,
 /// so where it runs relative to a propagated operand cannot matter.
-/// `rebindable` names a call may rebind, which are not trivial.
-fn is_trivial(e: &Expr, rebindable: &dyn Fn(&str) -> bool) -> bool {
-    let is_trivial = |e: &Expr| is_trivial(e, rebindable);
+/// `rebindable` names a call may rebind, which are not trivial; a call is
+/// trivial only to a builtin `is_builtin` vouches for.
+fn is_trivial(
+    e: &Expr,
+    rebindable: &dyn Fn(&str) -> bool,
+    is_builtin: &dyn Fn(&str) -> bool,
+) -> bool {
+    let is_trivial = |e: &Expr| is_trivial(e, rebindable, is_builtin);
     match e {
         Expr::Name(n) => !rebindable(n.id.as_str()),
         Expr::StringLiteral(_)
@@ -944,20 +1038,20 @@ fn is_trivial(e: &Expr, rebindable: &dyn Fn(&str) -> bool) -> bool {
             .all(|i| i.key.as_ref().is_none_or(&is_trivial) && is_trivial(&i.value)),
         Expr::Starred(s) => is_trivial(&s.value),
         Expr::Call(c) => {
-            is_super_call(e)
+            is_super_call(e, is_builtin)
                 || (c.arguments.is_empty()
                     && matches!(c.func.as_ref(), Expr::Name(n)
-                        if matches!(n.id.as_str(), "list" | "dict" | "set" | "tuple" | "frozenset")))
+                        if matches!(n.id.as_str(), "list" | "dict" | "set" | "tuple" | "frozenset")
+                            && is_builtin(n.id.as_str())))
         }
         // A type expression (`list[int]`, `Box[str]`, `dict[str, int]`):
         // hoisting it would hide it from the checker's type-argument reading.
         Expr::Subscript(s) => match s.value.as_ref() {
             Expr::Name(n) => {
                 let id = n.id.as_str();
-                matches!(
-                    id,
-                    "list" | "dict" | "set" | "frozenset" | "tuple" | "type" | "Callable"
-                ) || id.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                (matches!(id, "list" | "dict" | "set" | "frozenset" | "tuple") && is_builtin(id))
+                    || matches!(id, "type" | "Callable")
+                    || id.chars().next().is_some_and(|c| c.is_ascii_uppercase())
             }
             _ => false,
         },
