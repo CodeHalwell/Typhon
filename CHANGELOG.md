@@ -286,6 +286,9 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   `docs/language.md` and the docs-site match pages describe exhaustiveness
   over `Result` payloads, `T?`, `bool`, literal unions and nested sealed
   unions, with the binary's real `non_exhaustive_match` output.
+- The docs site carries the W2-04 `as!` supported-target table (refused
+  targets are a check-time error, not a silent accept) and the W2-05 frozen
+  binding types (`freeze let` now has a reference section).
 - Docs cite only diagnostic codes the binary emits (`tyc explain --list`
   minus `freeze`/`pub`, now language topics), locked in by a guard test.
 - New nullable-operator docs page listing the accepted spellings with the
