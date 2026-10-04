@@ -3718,15 +3718,34 @@ def run():
     fn dataclass_with_custom_args_emits_plain_class() {
         let src = "from dataclasses import dataclass\n@dataclass(order=True)\nclass Item:\n    priority: int\n";
         let out = migrate_source(src);
-        assert!(out.contains("from dataclasses import dataclass"), "import must be kept; got:\n{out}");
-        assert!(out.contains("@dataclass(order=True)"), "decorator must be kept; got:\n{out}");
-        assert!(out.contains("plain class Item:"), "must emit plain class; got:\n{out}");
+        assert!(
+            out.contains("from dataclasses import dataclass"),
+            "import must be kept; got:\n{out}"
+        );
+        assert!(
+            out.contains("@dataclass(order=True)"),
+            "decorator must be kept; got:\n{out}"
+        );
+        assert!(
+            out.contains("plain class Item:"),
+            "must emit plain class; got:\n{out}"
+        );
 
-        let src_eq = "from dataclasses import dataclass\n@dataclass(eq=False)\nclass Entity:\n    id: int\n";
+        let src_eq =
+            "from dataclasses import dataclass\n@dataclass(eq=False)\nclass Entity:\n    id: int\n";
         let out_eq = migrate_source(src_eq);
-        assert!(out_eq.contains("from dataclasses import dataclass"), "import must be kept; got:\n{out_eq}");
-        assert!(out_eq.contains("@dataclass(eq=False)"), "decorator must be kept; got:\n{out_eq}");
-        assert!(out_eq.contains("plain class Entity:"), "must emit plain class; got:\n{out_eq}");
+        assert!(
+            out_eq.contains("from dataclasses import dataclass"),
+            "import must be kept; got:\n{out_eq}"
+        );
+        assert!(
+            out_eq.contains("@dataclass(eq=False)"),
+            "decorator must be kept; got:\n{out_eq}"
+        );
+        assert!(
+            out_eq.contains("plain class Entity:"),
+            "must emit plain class; got:\n{out_eq}"
+        );
     }
 
     #[test]
@@ -3735,17 +3754,31 @@ def run():
         let out = migrate_source(src);
         assert!(out.contains("impl MyNum:"), "got:\n{out}");
         let impl_idx = out.find("impl MyNum:").unwrap();
-        let alias_idx = out.find("__radd__ = __add__").expect("alias must exist in output");
-        assert!(alias_idx > impl_idx, "alias must move to impl block; got:\n{out}");
+        let alias_idx = out
+            .find("__radd__ = __add__")
+            .expect("alias must exist in output");
+        assert!(
+            alias_idx > impl_idx,
+            "alias must move to impl block; got:\n{out}"
+        );
     }
 
     #[test]
     fn isinstance_union_preserved_and_not_rewritten_to_question_mark() {
         let src = "from typing import Union\n\ndef check(v: object) -> bool:\n    return isinstance(v, Union[int, None])\n";
         let out = migrate_source(src);
-        assert!(!out.contains("int?"), "must not rewrite to int? inside isinstance; got:\n{out}");
-        assert!(out.contains("isinstance(v, Union[int, None])"), "got:\n{out}");
-        assert!(out.contains("from typing import Union"), "Union import must be preserved; got:\n{out}");
+        assert!(
+            !out.contains("int?"),
+            "must not rewrite to int? inside isinstance; got:\n{out}"
+        );
+        assert!(
+            out.contains("isinstance(v, Union[int, None])"),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains("from typing import Union"),
+            "Union import must be preserved; got:\n{out}"
+        );
     }
 
     #[test]
@@ -3770,7 +3803,10 @@ def run():
         };
         let err = super::run(args).unwrap_err();
         assert!(err.to_string().contains("already exists"), "got: {err}");
-        assert_eq!(std::fs::read_to_string(&ty_file).unwrap(), "# hand edited\n");
+        assert_eq!(
+            std::fs::read_to_string(&ty_file).unwrap(),
+            "# hand edited\n"
+        );
     }
 
     #[test]
@@ -3787,7 +3823,10 @@ def run():
             force: true,
         };
         super::run(args).unwrap();
-        assert_ne!(std::fs::read_to_string(&ty_file).unwrap(), "# hand edited\n");
+        assert_ne!(
+            std::fs::read_to_string(&ty_file).unwrap(),
+            "# hand edited\n"
+        );
     }
 
     #[test]

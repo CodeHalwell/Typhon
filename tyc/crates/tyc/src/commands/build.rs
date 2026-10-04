@@ -2076,8 +2076,12 @@ fn validate_output_confinement(
     out_dir: &std::path::Path,
 ) -> Result<()> {
     if std::fs::symlink_metadata(out_dir).is_ok_and(|m| m.file_type().is_symlink()) {
-        let real = std::fs::canonicalize(out_dir)
-            .map_err(|e| miette!("cannot resolve output dir symlink '{}': {e}", out_dir.display()))?;
+        let real = std::fs::canonicalize(out_dir).map_err(|e| {
+            miette!(
+                "cannot resolve output dir symlink '{}': {e}",
+                out_dir.display()
+            )
+        })?;
         let root = std::fs::canonicalize(root)
             .map_err(|e| miette!("cannot resolve output root '{}': {e}", root.display()))?;
         if !real.starts_with(&root) {
