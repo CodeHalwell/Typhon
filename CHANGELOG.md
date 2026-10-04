@@ -909,8 +909,17 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   where `g` does `global x; x = …` passed the new `x`). A dotted method
   receiver is evaluated before the arguments
   (`self.items.append(self.word()?)` appended to the list `word()` had just
-  installed, not the one Python read); a receiver rooted at an imported
-  module (`os.path.join(…)`) stays in place. An augmented assignment whose
+  installed, not the one Python read); a receiver rooted at an eagerly
+  imported module (`os.path.join(…)`) or a builtin `super()` stays in place.
+  The method lookup moves with the receiver, as in Python, where the whole
+  callable is evaluated before any argument: `p.handler(p.swap()?)` called
+  the handler `swap()` had just installed, and a `@property` supplying the
+  callable ran after the operand. A receiver — a plain name too — is
+  hoisted into a temporary, which is what the checker reads (the call keeps
+  its method-call shape, so signatures, overloads and keyword arguments are
+  checked as written); after checking, both surfaces read `recv.method`
+  into that temporary (extension-method calls on builtins excepted — their
+  lookup is static). An augmented assignment whose
   value carries a propagated operand and whose target that operand could
   change — an attribute, a subscript, or a rebindable name — loads the
   target first: `self.pos += self.advance()?` lowers to

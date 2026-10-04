@@ -36,6 +36,8 @@ mod eval_order;
 mod fstring_fields;
 mod pipe_slots;
 
+pub use eval_order::attach_method_lookups;
+
 /// One stripped keyword and the 0-based line index in the source where it
 /// appeared.
 #[derive(Debug, Clone)]

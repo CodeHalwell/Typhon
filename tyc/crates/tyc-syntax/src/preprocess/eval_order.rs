@@ -52,11 +52,24 @@
 //! and no `import *` could bind it. A user `def list()` / `def super()` is
 //! an ordinary call and is hoisted like one.
 //!
-//! A call receiver is evaluated before the arguments, so a dotted receiver
-//! (`self.items.append(self.word()?)`) is hoisted: `word()` may rebind
-//! `self.items`, and Python appends to the list it had read. A receiver
-//! that is a plain name follows the name rule; one rooted at an imported
-//! module (`os.path.join(…)`) is left in place.
+//! A call's callee is evaluated before its arguments. For a method call
+//! that is the receiver *and* the attribute lookup, which may run a
+//! property, a descriptor or `__getattr__`, or find an attribute the
+//! operand rebinds. This pass hoists the receiver — also a plain name —
+//! so `p.handler(p.swap()?)` becomes `__typhon_ev_0__ = p` above the lifted
+//! `p.swap()` and `__typhon_ev_0__.handler(…)` in the statement. That is
+//! what the type checker reads: the call keeps its method-call shape, so
+//! its signature, overloads and keyword arguments are checked as written.
+//! After checking, [`attach_method_lookups`] moves the lookup into the
+//! temporary on both execution surfaces (`__typhon_ev_0__ = p.handler` …
+//! `__typhon_ev_0__(…)`), which is Python's order. `self.items.append(
+//! self.word()?)` thus appends to the list Python read before `word()`
+//! replaced it. Left in place: the receiver of `super().m(…)`, and one
+//! rooted at an eagerly imported module (`os.path.join(…)`) — reading
+//! those runs no user code, so only an operand that rebinds the base
+//! class's or the module's attribute could observe the order. (A
+//! `lazy import` binding is not exempt: its first attribute read runs the
+//! import.)
 //!
 //! An augmented assignment loads its target before evaluating the value, so
 //! one whose value carries a propagated operand and whose target the
@@ -201,9 +214,9 @@ const TRIVIAL_BUILTINS: [&str; 6] = ["list", "dict", "set", "tuple", "frozenset"
 
 /// File-wide facts about names the walk needs: which names a call may
 /// rebind (declared `global` / `nonlocal` somewhere), which are bound by
-/// an `import` (a receiver rooted at one is a module, left in place), and
-/// which of [`TRIVIAL_BUILTINS`] the file may bind (so a call to it is not
-/// provably the builtin).
+/// an eager `import` (a method receiver rooted at one is a module, left in
+/// place), and which of [`TRIVIAL_BUILTINS`] the file may bind (so a call
+/// to it is not provably the builtin).
 struct FileNames {
     rebindable: HashSet<String>,
     imported: HashSet<String>,
@@ -245,11 +258,6 @@ impl FileNames {
                 rebindable.extend(idents(rest));
             } else if let Some(rest) = code.strip_prefix("import ") {
                 imported.extend(idents(rest));
-            } else if let Some(rest) = code.strip_prefix("lazy import ") {
-                // `lazy import np = numpy`
-                if let Some(name) = rest.split('=').next() {
-                    imported.insert(name.trim().to_owned());
-                }
             } else if code.starts_with("from ") {
                 if let Some((_, rest)) = code.split_once(" import ") {
                     star_import |= rest.trim().trim_matches(['(', ')']).trim() == "*";
@@ -825,13 +833,7 @@ impl Plan<'_> {
     /// `children` are evaluated in this order. Everything before the last
     /// child that holds an operand is hoisted; that child is walked.
     fn visit_ordered(&mut self, children: &[&Expr]) -> Walk {
-        let Some(last) = children.iter().rposition(|c| self.contains_operand(*c)) else {
-            return Ok(());
-        };
-        for c in &children[..last] {
-            self.hoist_candidate(c)?;
-        }
-        self.visit_expr(children[last])
+        self.visit_ordered_with_receiver(children, None)
     }
 
     fn visit_expr(&mut self, e: &Expr) -> Walk {
@@ -839,27 +841,68 @@ impl Plan<'_> {
             return Ok(());
         }
         let children = eval_children(e, |recv| self.receiver_is_child(recv))?;
-        self.visit_ordered(&children)
+        // A method call's receiver child is hoisted by its own rule.
+        let receiver = match e {
+            Expr::Call(c) => match c.func.as_ref() {
+                Expr::Attribute(a)
+                    if children
+                        .first()
+                        .is_some_and(|first| std::ptr::eq(*first, a.value.as_ref())) =>
+                {
+                    Some(a.value.as_ref())
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        self.visit_ordered_with_receiver(&children, receiver)
     }
 
-    /// Whether a method call's receiver must be evaluated (hoisted) before
-    /// its arguments: anything but `super()`, a name no call can rebind, or
-    /// a dotted name rooted at an imported module.
+    /// [`Self::visit_ordered`], where `receiver` (one of `children`) is a
+    /// method call's receiver.
+    fn visit_ordered_with_receiver(&mut self, children: &[&Expr], receiver: Option<&Expr>) -> Walk {
+        let Some(last) = children.iter().rposition(|c| self.contains_operand(*c)) else {
+            return Ok(());
+        };
+        for c in &children[..last] {
+            if receiver.is_some_and(|r| std::ptr::eq(*c, r)) {
+                self.hoist_receiver(c)?;
+            } else {
+                self.hoist_candidate(c)?;
+            }
+        }
+        self.visit_expr(children[last])
+    }
+
+    /// Whether a method call's receiver is evaluated (hoisted) before its
+    /// arguments: anything but a builtin `super()` or a dotted name rooted
+    /// at an eagerly imported module (see the module docs).
     fn receiver_is_child(&self, recv: &Expr) -> bool {
         if is_super_call(recv, &|n| self.names.is_builtin(n)) {
             return false;
         }
-        match recv {
-            Expr::Name(n) => self.rebindable.contains(n.id.as_str()),
-            _ if is_dotted_name(recv) => {
-                let mut root = recv;
-                while let Expr::Attribute(a) = root {
-                    root = &a.value;
-                }
-                !matches!(root, Expr::Name(n) if self.names.imported.contains(n.id.as_str()))
-            }
-            _ => true,
+        if !is_dotted_name(recv) {
+            return true;
         }
+        let mut root = recv;
+        while let Expr::Attribute(a) = root {
+            root = &a.value;
+        }
+        !matches!(root, Expr::Name(n) if self.names.imported.contains(n.id.as_str()))
+    }
+
+    /// A method call's receiver, evaluated before a later operand. Unlike
+    /// [`Self::hoist_candidate`], a plain name — or a receiver that is
+    /// exactly an operand — is hoisted even when reading it is trivial: the
+    /// temporary is where [`attach_method_lookups`] moves the lookup. A
+    /// receiver that already is one of those temporaries stays.
+    fn hoist_receiver(&mut self, e: &Expr) -> Walk {
+        let range = self.range(e);
+        if matches!(e, Expr::Name(n) if !is_temp(n.id.as_str())) || self.operands.contains(&range) {
+            self.events.push(Event::Hoist(range));
+            return Ok(());
+        }
+        self.hoist_candidate(e)
     }
 
     /// [`is_trivial`] with this statement's rebindable names and the
@@ -920,8 +963,9 @@ fn eval_children(
         Expr::Call(c) => {
             let mut v: Vec<&Expr> = Vec::new();
             match c.func.as_ref() {
-                // `recv.method(…)`: the receiver is evaluated first (see the
-                // module docs for the receivers left in place).
+                // `recv.method(…)`: the receiver is evaluated first, and the
+                // lookup with it once checked (see the module docs for the
+                // receivers left in place).
                 Expr::Attribute(a) => {
                     if receiver_is_child(&a.value) {
                         v.push(&a.value);
@@ -1057,4 +1101,146 @@ fn is_trivial(
         },
         _ => false,
     }
+}
+
+/// `__typhon_ev_N__`: a temporary this pass introduced.
+fn is_temp(name: &str) -> bool {
+    name.strip_prefix(TEMP_PREFIX)
+        .and_then(|rest| rest.strip_suffix("__"))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Run after type checking, on the module both execution surfaces run
+/// (`tyc build`'s emitter and the VM): move each hoisted method receiver's
+/// attribute lookup into its temporary, so the callable is evaluated before
+/// the arguments, as in Python (see the module docs).
+///
+/// `T = recv` … `T.m(args)` becomes `T = recv.m` … `T(args)` for every
+/// `__typhon_ev_N__` temporary that is assigned once and read once, as the
+/// receiver of a method call. The checker never sees this form: it reads
+/// the method call as written, with its signature, overloads and keyword
+/// arguments. Run it after the builtin-extension rewrite, which has already
+/// turned an extension call `T.pad(…)` into `__typhon_ext_str__pad__(T, …)`
+/// — that call is left alone (an extension method has no attribute to look
+/// up, and looking up a builtin's own method runs no user code).
+pub fn attach_method_lookups(module: &mut ruff_python_ast::ModModule) {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    use ruff_python_ast::visitor::transformer::{self, Transformer};
+    use ruff_python_ast::visitor::{self, Visitor};
+    use ruff_python_ast::{AtomicNodeIndex, ExprAttribute, ExprContext, ExprName, Identifier};
+
+    #[derive(Default)]
+    struct Uses {
+        assigned: usize,
+        loads: usize,
+        as_receiver: usize,
+    }
+    #[derive(Default)]
+    struct Count(HashMap<String, Uses>);
+    impl<'a> Visitor<'a> for Count {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            if let Stmt::Assign(a) = stmt {
+                if let [Expr::Name(n)] = a.targets.as_slice() {
+                    if is_temp(n.id.as_str()) {
+                        self.0.entry(n.id.to_string()).or_default().assigned += 1;
+                    }
+                }
+            }
+            visitor::walk_stmt(self, stmt);
+        }
+        fn visit_expr(&mut self, e: &'a Expr) {
+            match e {
+                Expr::Name(n) if n.ctx.is_load() && is_temp(n.id.as_str()) => {
+                    self.0.entry(n.id.to_string()).or_default().loads += 1;
+                }
+                Expr::Call(c) => {
+                    if let Expr::Attribute(a) = c.func.as_ref() {
+                        if let Expr::Name(n) = a.value.as_ref() {
+                            if is_temp(n.id.as_str()) {
+                                self.0.entry(n.id.to_string()).or_default().as_receiver += 1;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            visitor::walk_expr(self, e);
+        }
+    }
+
+    let mut count = Count::default();
+    for stmt in &module.body {
+        count.visit_stmt(stmt);
+    }
+    let eligible: HashSet<String> = count
+        .0
+        .into_iter()
+        .filter(|(_, u)| u.assigned == 1 && u.loads == 1 && u.as_receiver == 1)
+        .map(|(name, _)| name)
+        .collect();
+    if eligible.is_empty() {
+        return;
+    }
+
+    /// `T.m(…)` → `T(…)`, remembering `m` for `T`.
+    struct Calls<'e> {
+        eligible: &'e HashSet<String>,
+        lookups: RefCell<HashMap<String, Identifier>>,
+    }
+    impl Transformer for Calls<'_> {
+        fn visit_expr(&self, expr: &mut Expr) {
+            transformer::walk_expr(self, expr);
+            let Expr::Call(call) = expr else { return };
+            let hit = match call.func.as_ref() {
+                Expr::Attribute(a) => match a.value.as_ref() {
+                    Expr::Name(n) if self.eligible.contains(n.id.as_str()) => {
+                        Some((n.clone(), a.attr.clone(), a.range))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some((name, attr, range)) = hit {
+                self.lookups.borrow_mut().insert(name.id.to_string(), attr);
+                *call.func = Expr::Name(ExprName { range, ..name });
+            }
+        }
+    }
+
+    /// `T = recv` → `T = recv.m`.
+    struct Assigns(HashMap<String, Identifier>);
+    impl Transformer for Assigns {
+        fn visit_stmt(&self, stmt: &mut Stmt) {
+            if let Stmt::Assign(a) = stmt {
+                let attr = match a.targets.as_slice() {
+                    [Expr::Name(n)] => self.0.get(n.id.as_str()).cloned(),
+                    _ => None,
+                };
+                if let Some(attr) = attr {
+                    let range = a.value.range();
+                    let receiver = std::mem::replace(
+                        a.value.as_mut(),
+                        Expr::NoneLiteral(ruff_python_ast::ExprNoneLiteral::default()),
+                    );
+                    *a.value = Expr::Attribute(ExprAttribute {
+                        node_index: AtomicNodeIndex::NONE,
+                        range,
+                        value: Box::new(receiver),
+                        attr,
+                        ctx: ExprContext::Load,
+                    });
+                }
+            }
+            transformer::walk_stmt(self, stmt);
+        }
+    }
+
+    let calls = Calls {
+        eligible: &eligible,
+        lookups: RefCell::new(HashMap::new()),
+    };
+    calls.visit_body(&mut module.body);
+    Assigns(calls.lookups.into_inner()).visit_body(&mut module.body);
 }

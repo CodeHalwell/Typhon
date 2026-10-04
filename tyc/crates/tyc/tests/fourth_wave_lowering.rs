@@ -166,6 +166,20 @@ fn inline_question_hoists_calls_to_shadowed_builtins() {
     );
 }
 
+/// PR #493 review: a method call's whole callable — receiver and attribute
+/// lookup — is evaluated before its arguments: a property that supplies the
+/// callable runs before the operand, and a callable attribute the operand
+/// rebinds is read first. Extension methods on builtins (bound as values
+/// once hoisted) and `super().m(…)` keep working. Expected output from the
+/// same program run as plain Python.
+#[test]
+fn inline_question_evaluates_the_method_lookup_first() {
+    assert_runs_as(
+        include_str!("fourth_wave/eval_order_callee.ty"),
+        include_str!("fourth_wave/eval_order_callee.expected"),
+    );
+}
+
 /// W7-05: `gather` used as an ordinary name — a class attribute, a module
 /// binding, and a parameter on a continuation line — is not a `gather:`
 /// block. (It was lowered to `async with asyncio.TaskGroup()` in a class

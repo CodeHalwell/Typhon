@@ -172,11 +172,12 @@ fn assignment_value_is_hoisted_before_a_target_operand() {
 }
 
 #[test]
-fn trivial_siblings_and_name_or_module_receivers_are_left_alone() {
+fn trivial_siblings_and_module_callees_are_left_alone() {
     for src in [
         "def f(a: int) -> Result[int, str]:\n    return Ok(add(a, parse(s)?))\n",
-        "def f(out: list[int]) -> Result[int, str]:\n    out.append(parse(s)?)\n    return Ok(0)\n",
         "import os\ndef f() -> Result[str, str]:\n    return Ok(os.path.join(\"a\", parse(s)?))\n",
+        "from os import path\ndef f() -> Result[str, str]:\n    return Ok(path.join(\"a\", parse(s)?))\n",
+        "class C(B):\n    def m(self) -> Result[int, str]:\n        return Ok(super().m(parse(s)?))\n",
         "def f() -> Result[int, str]:\n    return Ok(g([], {}, 1, \"s\", None, lambda x: x, parse(s)?))\n",
         "def f() -> Result[int, str]:\n    let x: int = parse(s)?\n    return Ok(x)\n",
         // A local target no call can rebind keeps its augmented assignment.
@@ -201,6 +202,117 @@ fn a_dotted_receiver_is_read_before_the_operand() {
         "{out}"
     );
     assert!(out.contains("__typhon_ev_0__.append("), "{out}");
+}
+
+/// The `(receiver, attribute)` a temporary is assigned from, and whether it
+/// is then called directly, in a module `attach_method_lookups` ran over.
+fn attached_lookup(src: &str, temp: &str) -> (Option<(String, String)>, bool) {
+    use tyc_syntax::ast::visitor::{walk_expr, walk_stmt, Visitor};
+    use tyc_syntax::ast::{Expr, Stmt};
+    struct Find<'t> {
+        temp: &'t str,
+        assigned: Option<(String, String)>,
+        called: bool,
+    }
+    impl<'a> Visitor<'a> for Find<'_> {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            if let Stmt::Assign(a) = stmt {
+                if let [Expr::Name(n)] = a.targets.as_slice() {
+                    if n.id.as_str() == self.temp {
+                        if let Expr::Attribute(attr) = a.value.as_ref() {
+                            let recv = match attr.value.as_ref() {
+                                Expr::Name(r) => r.id.to_string(),
+                                _ => "<expr>".to_owned(),
+                            };
+                            self.assigned = Some((recv, attr.attr.to_string()));
+                        }
+                    }
+                }
+            }
+            walk_stmt(self, stmt);
+        }
+        fn visit_expr(&mut self, e: &'a Expr) {
+            if let Expr::Call(c) = e {
+                if matches!(c.func.as_ref(), Expr::Name(n) if n.id.as_str() == self.temp) {
+                    self.called = true;
+                }
+            }
+            walk_expr(self, e);
+        }
+    }
+    let mut module = tyc_syntax::parse_module(&lower(src)).unwrap().into_syntax();
+    tyc_syntax::preprocess::attach_method_lookups(&mut module);
+    let mut find = Find {
+        temp,
+        assigned: None,
+        called: false,
+    };
+    for stmt in &module.body {
+        find.visit_stmt(stmt);
+    }
+    (find.assigned, find.called)
+}
+
+#[test]
+fn a_method_lookup_is_evaluated_before_the_operand() {
+    // PR #493 review: Python evaluates the whole callable — receiver and
+    // attribute lookup (a property, a descriptor, `__getattr__`, or an
+    // attribute the operand rebinds) — before the arguments. The checker
+    // reads the receiver hoisted and the call as written; after checking,
+    // both surfaces move the lookup into the temporary.
+    for (src, recv, attr) in [
+        (
+            "def f(p: Provider) -> Result[int, str]:\n    return Ok(p.callback(p.swap()?))\n",
+            "p",
+            "callback",
+        ),
+        (
+            "def f(out: list[int]) -> Result[int, str]:\n    out.append(parse(s)?)\n    return Ok(0)\n",
+            "out",
+            "append",
+        ),
+        (
+            "def f(self) -> Result[int, str]:\n    return Ok(self.items.get(k, parse(s)?))\n",
+            "<expr>",
+            "get",
+        ),
+        (
+            "lazy import np = numpy\ndef f() -> Result[int, str]:\n    return Ok(np.asarray(parse(s)?))\n",
+            "np",
+            "asarray",
+        ),
+    ] {
+        let out = expand_inline_question_ops(src);
+        let hoist = if recv == "<expr>" {
+            "__typhon_ev_0__ = self.items".to_owned()
+        } else {
+            format!("__typhon_ev_0__ = {recv}")
+        };
+        assert!(
+            line_of(&out, &hoist) < line_of(&out, "__typhon_qi_0__ = "),
+            "{src}\n---\n{out}"
+        );
+        assert!(
+            out.contains(&format!("__typhon_ev_0__.{attr}(")),
+            "{src}\n---\n{out}"
+        );
+        let (assigned, called) = attached_lookup(src, "__typhon_ev_0__");
+        assert_eq!(
+            assigned,
+            Some((recv.to_owned(), attr.to_owned())),
+            "{src}\n---\n{}",
+            lower(src)
+        );
+        assert!(called, "{src}");
+    }
+    // An augmented assignment's temporary is no receiver: it keeps its
+    // `self.pos` load and is never called.
+    let src =
+        "def f(self) -> Result[int, str]:\n    self.pos += self.advance()?\n    return Ok(0)\n";
+    assert_eq!(
+        attached_lookup(src, "__typhon_ev_0__"),
+        (Some(("self".to_owned(), "pos".to_owned())), false)
+    );
 }
 
 #[test]

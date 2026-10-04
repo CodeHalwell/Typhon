@@ -518,9 +518,11 @@ pub(crate) fn compile_to_python(source: &str) -> Result<String> {
         return Err(miette!("{first}"));
     }
 
-    let module = tyc_syntax::parse_module(&prep.python_source)
+    let mut module = tyc_syntax::parse_module(&prep.python_source)
         .map(|p| p.into_syntax())
         .map_err(|e| miette!("parse error: {e}"))?;
+    // Inline `?` evaluation order, as `tyc build` lowers it.
+    tyc_syntax::preprocess::attach_method_lookups(&mut module);
 
     let desugar = desugar_module_with(&module, DesugarOptions::default());
     let (py, _offsets) = emit_python_with_line_offsets(&desugar.module);

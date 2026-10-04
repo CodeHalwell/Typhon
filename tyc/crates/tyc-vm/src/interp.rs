@@ -2568,6 +2568,8 @@ impl Interpreter {
                 let _ = tyc_analyse::rewrite_builtin_extension_calls(&mut module, &registry);
             }
         }
+        // Inline `?` evaluation order, as for the entry module (lib.rs).
+        tyc_syntax::preprocess::attach_method_lookups(&mut module);
 
         // Evaluate the module body in a fresh child scope of root; copy
         // every named binding into a Module namespace so attribute

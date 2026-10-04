@@ -1208,6 +1208,10 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 inject_cross_module_ext_imports(&mut module, &cross_module_used);
             }
         }
+        // Inline `?` evaluation order: the method lookup of each hoisted
+        // receiver moves up with it (after the extension rewrite, which owns
+        // extension calls on those receivers). The VM runs the same step.
+        tyc_syntax::preprocess::attach_method_lookups(&mut module);
 
         // Phase 4 loop parallelisation: rewrite `[f(x) for x in xs]` runs
         // whose callee is in the pure-function set into thread-pool maps.
