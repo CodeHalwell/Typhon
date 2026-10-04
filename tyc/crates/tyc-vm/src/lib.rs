@@ -31,8 +31,13 @@ pub mod error;
 pub mod ffi;
 pub mod hashes;
 pub mod interp;
+pub mod limits;
+pub(crate) mod pydict;
 pub mod pyhash;
+pub mod pyset;
 pub mod slots;
+mod stack;
+pub(crate) mod strindex;
 mod unicode_data;
 pub mod value;
 
@@ -60,89 +65,23 @@ pub fn run_source(
     origin: Option<&Path>,
     script_args: &[String],
 ) -> Result<i32, VmError> {
-    // Apply the same surface-syntax expansions as `tyc build` so the parser
-    // sees identical input. `gather:`, `go`, `with`-chains, pipes and `?`
-    // all get lowered to plain Python before parsing.
-    //
-    // Note: we deliberately call `expand_lazy_lets` instead of the full
-    // `expand_lazy_imports`. The full version lowers `lazy import np =
-    // numpy` to a `__TyphonLazy_np_` proxy class that uses descriptor
-    // protocol and `__getattr__` — neither of which the VM models. The
-    // simpler `preprocess` pass below already rewrites `lazy import ALIAS
-    // = MODULE` to a plain `import MODULE as ALIAS`, which is the right
-    // shape for an in-process VM (no point deferring an import that's
-    // about to be evaluated eagerly anyway).
-    let expanded = preprocess::expand_all(source);
-    let prep = preprocess::preprocess(&expanded);
+    run_source_reporting(source, origin, script_args, &mut |tb| eprint!("{tb}"))
+}
 
-    let parsed = tyc_syntax::parse_module(&prep.python_source).map_err(|e| {
+/// [`run_source`], handing the rendered traceback of an uncaught exception
+/// to `report` instead of writing it to stderr.
+fn run_source_reporting(
+    source: &str,
+    origin: Option<&Path>,
+    script_args: &[String],
+    report: &mut dyn FnMut(&str),
+) -> Result<i32, VmError> {
+    let (mut module, prep) = front_end(source, FrontEnd::Program).map_err(|e| {
         let where_ = origin
             .map(|p| format!("{}: ", p.display()))
             .unwrap_or_default();
         VmError::Parse(format!("{where_}{e}"))
     })?;
-    let mut module = parsed.into_syntax();
-
-    // Evaluate `comptime` bindings and inline the resulting literals into
-    // the AST so the VM doesn't try to execute `env(...)` (a build-only
-    // intrinsic). `comptime def` bodies are stripped at the same time so
-    // a NameError from one of their build-only calls can't surface at
-    // runtime. Matches the substitution pass `tyc build` runs before
-    // desugaring.
-    let (comptime_values, _comptime_diags) = tyc_analyse::evaluate_comptime_with_functions(
-        &module,
-        &prep.comptime_bindings,
-        &prep.comptime_functions,
-    );
-    module = tyc_analyse::substitute_comptime_literals(
-        module,
-        &comptime_values,
-        &prep.comptime_functions,
-    );
-
-    // Collect `@memo` / `@pure(memo=True)` opt-ins exactly like `tyc build`
-    // does, so the desugar pass below injects `@functools.cache` instead of
-    // silently stripping the marker (which left memoised recursion running
-    // exponentially under the VM while the build path returned instantly).
-    let memoise_targets: Vec<String> = tyc_analyse::analyse_purity(&module, false)
-        .into_iter()
-        .filter(|f| f.violation.is_none() && f.memoise)
-        .map(|f| f.name)
-        .collect();
-
-    // Hand the VM the desugared module so it sees the same shape as the
-    // compile path: dataclass-decorated user classes, merged impl blocks,
-    // injected runtime imports, and so on. FINDINGS #21 follow-up.
-    // Running the full desugar pass also rewrites \`extend\` user-classes
-    // into method merges; the builtin-extension rewrite below handles the
-    // \`extend str:\` / \`extend list:\` shape that desugar leaves alone.
-    //
-    // Pass the preprocessor's class-kind markers (plain / raw / frozen) so
-    // the VM desugars `plain class` / `class!` / `class … frozen` exactly
-    // like `tyc build` — otherwise a `plain class` would be wrongly
-    // decorated as a `@dataclass` and its class-level constants treated as
-    // slots.
-    let desugar_out = tyc_desugar::desugar_module_with(
-        &module,
-        tyc_desugar::DesugarOptions {
-            memoise_functions: memoise_targets,
-            raw_class_line_starts: preprocess::line_byte_starts(
-                &prep.python_source,
-                &prep.raw_class_lines,
-            ),
-            frozen_class_line_starts: preprocess::line_byte_starts(
-                &prep.python_source,
-                &prep.frozen_class_lines,
-            ),
-            plain_class_line_starts: preprocess::line_byte_starts(
-                &prep.python_source,
-                &prep.plain_class_lines,
-            ),
-            pub_names: prep.pub_names.clone(),
-            ..Default::default()
-        },
-    );
-    module = desugar_out.module;
 
     // FINDINGS #21: rewrite \`x.method(args)\` to \`__typhon_ext_TYPE__method
     // (x, args)\` for every receiver statically annotated as a built-in
@@ -185,11 +124,13 @@ pub fn run_source(
     // Source info for traceback frames: file name + line table over the
     // preprocessed source (line-preserving for ordinary statements, so
     // frame numbers match the user's .ty lines).
-    interp.current_source = Some(std::rc::Rc::new(interp::SourceInfo::new(
+    interp.current_source = Some(std::rc::Rc::new(interp::SourceInfo::mapped(
         origin
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| "<source>".to_string()),
         &prep.python_source,
+        source,
+        &prep.line_map,
     )));
     // Seed sys.argv before any user code (or import sys) can observe it.
     let argv0 = origin
@@ -263,41 +204,259 @@ pub fn run_source(
             Ok(code)
         }
         Err(Unwind::Exception(exc)) => {
-            eprintln!("Traceback (most recent call last):");
-            // Frames accumulate innermost-first as the exception bubbles
-            // through `call_function`; CPython prints outermost-first.
-            // The module-level frame (where the failing call chain
-            // started) renders first, from the interpreter's final
-            // statement offset.
-            if let Some(si) = &interp.current_source {
-                let line = si.line_of(interp.current_offset);
-                eprintln!("  File \"{}\", line {}, in <module>", si.name, line);
-                if let Some(text) = si.line_text(line) {
-                    eprintln!("    {text}");
-                }
-            }
-            for frame in exc.frames.iter().rev() {
-                match (&frame.file, frame.line) {
-                    (Some(file), Some(line)) => {
-                        eprintln!("  File \"{file}\", line {line}, in {}", frame.function);
-                        if let Some(text) = &frame.line_text {
-                            eprintln!("    {text}");
-                        }
-                    }
-                    _ => eprintln!("  in {}", frame.function),
-                }
-            }
-            if exc.message.is_empty() {
-                eprintln!("{}", exc.kind);
-            } else {
-                eprintln!("{}: {}", exc.kind, exc.message);
-            }
+            report(&render_uncaught(&mut interp, &exc));
             Ok(1)
         }
         Err(Unwind::Break | Unwind::Continue | Unwind::QuestionMark(_) | Unwind::Yield(_)) => {
             Err(VmError::runtime("unexpected control-flow at module level"))
         }
     }
+}
+
+/// Print an uncaught exception the way CPython's default excepthook does:
+/// any chained exception first (its `__cause__`, else its `__context__`
+/// unless suppressed) with the "direct cause" / "during handling"
+/// separator, then this exception's traceback — outermost frame first,
+/// three copies of a repeated frame and "[Previous line repeated N more
+/// times]" for the rest — and its `Kind: str(exc)` line.
+fn render_uncaught(interp: &mut Interpreter, exc: &VmException) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    // The module-level frame (where the failing call chain started) comes
+    // from the interpreter's final statement offset; the rest accumulated
+    // innermost-first as the exception bubbled through `call_function`.
+    let mut frames: Vec<error::Frame> = exc.frames.iter().rev().cloned().collect();
+    if let Some(si) = &interp.current_source {
+        let line = si.line_of(interp.current_offset);
+        frames.insert(
+            0,
+            error::Frame {
+                function: "<module>".to_owned(),
+                line: Some(line),
+                file: Some(si.name.clone()),
+                line_text: si.line_text(line),
+                repeat: 0,
+            },
+        );
+    }
+    let mut seen: Vec<Value> = Vec::new();
+    if let Some(v) = &exc.value {
+        seen.push(v.clone());
+        render_chained(interp, v, &mut seen, &mut out);
+    }
+    out.push_str("Traceback (most recent call last):\n");
+    render_frames(&frames, &mut out);
+    let headline = match &exc.value {
+        Some(v) => exception_headline(interp, v, &exc.kind),
+        None if exc.message.is_empty() => exc.kind.clone(),
+        None => format!("{}: {}", exc.kind, exc.message),
+    };
+    let _ = writeln!(out, "{headline}");
+    out
+}
+
+/// Print the exception `v` is chained to, recursively, followed by the
+/// separator CPython prints before `v`'s own traceback.
+fn render_chained(interp: &mut Interpreter, v: &Value, seen: &mut Vec<Value>, out: &mut String) {
+    use std::fmt::Write as _;
+    let Some(chain) = value::exception_chain(v) else {
+        return;
+    };
+    let (next, separator) = match (&chain.cause, &chain.context) {
+        (Some(cause), _) if !matches!(cause, Value::None) => (
+            cause.clone(),
+            "The above exception was the direct cause of the following exception:",
+        ),
+        (_, Some(context)) if !chain.suppress_context => (
+            context.clone(),
+            "During handling of the above exception, another exception occurred:",
+        ),
+        _ => return,
+    };
+    if seen
+        .iter()
+        .any(|s| value::exception_values_identical(s, &next))
+    {
+        return;
+    }
+    seen.push(next.clone());
+    render_chained(interp, &next, seen, out);
+    if let Some(tb) = value::exception_chain(&next).and_then(|c| c.traceback.clone()) {
+        out.push_str("Traceback (most recent call last):\n");
+        let frames: Vec<error::Frame> = tb.iter().rev().cloned().collect();
+        render_frames(&frames, out);
+    }
+    let kind = match &next {
+        Value::Exception { kind, .. } => (**kind).clone(),
+        Value::Instance(i) => i.class.name.clone(),
+        _ => "Exception".to_owned(),
+    };
+    let _ = writeln!(out, "{}", exception_headline(interp, &next, &kind));
+    let _ = writeln!(out, "\n{separator}\n");
+}
+
+/// `Kind: str(exc)`, or the bare kind when `str(exc)` is empty.
+fn exception_headline(interp: &mut Interpreter, v: &Value, kind: &str) -> String {
+    let message = interp.str_of(v).unwrap_or_default();
+    if message.is_empty() {
+        kind.to_owned()
+    } else {
+        format!("{kind}: {message}")
+    }
+}
+
+/// Render frames outermost-first, collapsing a run of identical frames
+/// past the third into CPython's "[Previous line repeated N more times]".
+fn render_frames(frames: &[error::Frame], out: &mut String) {
+    use std::fmt::Write as _;
+    const RECURSIVE_CUTOFF: u64 = 3;
+    let mut last: Option<(&Option<String>, Option<u32>, &str)> = None;
+    let mut count: u64 = 0;
+    let flush = |count: u64, out: &mut String| {
+        if count > RECURSIVE_CUTOFF {
+            let more = count - RECURSIVE_CUTOFF;
+            let s = if more > 1 { "s" } else { "" };
+            let _ = writeln!(out, "  [Previous line repeated {more} more time{s}]");
+        }
+    };
+    for frame in frames {
+        let key = (&frame.file, frame.line, frame.function.as_str());
+        if last != Some(key) {
+            flush(count, out);
+            last = Some(key);
+            count = 0;
+        }
+        for _ in 0..=frame.repeat {
+            count += 1;
+            if count > RECURSIVE_CUTOFF {
+                continue;
+            }
+            match (&frame.file, frame.line) {
+                (Some(file), Some(line)) => {
+                    let _ = writeln!(out, "  File \"{file}\", line {line}, in {}", frame.function);
+                    if let Some(text) = &frame.line_text {
+                        let _ = writeln!(out, "    {text}");
+                    }
+                }
+                _ => {
+                    let _ = writeln!(out, "  in {}", frame.function);
+                }
+            }
+        }
+    }
+    flush(count, out);
+}
+
+/// Which caller a [`front_end`] run serves.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrontEnd {
+    /// A `.ty` program file: the entry module or an imported sibling.
+    Program,
+    /// An embedded stdlib shim: plain Python validated against CPython, so
+    /// every class is emitted exactly as written (no `@dataclass`
+    /// decoration, no synthesised `__init__`) and there is no `@memo` or
+    /// `comptime` to evaluate.
+    Shim,
+}
+
+/// The one front end every VM entry point shares — the entry program, an
+/// imported sibling module, and the embedded stdlib shims. It runs the
+/// canonical sugar chain plus the preprocessor
+/// ([`preprocess::expand_and_preprocess_mapped`], the exact chain
+/// `tyc check` / `tyc build` run), parses, inlines `comptime` values and
+/// desugars, so the VM can never drift from the compiled path's pass order
+/// again (each caller used to assemble the ten-pass chain by hand, and the
+/// copies ran `expand_lazy_lets` before `expand_typed_let_unpack`).
+///
+/// `lazy import` stays an eager import (`rewrite_lazy_imports = false`):
+/// the full lowering produces a descriptor-and-`__getattr__` proxy class,
+/// and there is no point deferring an import the VM is about to evaluate.
+///
+/// The returned `PreprocessResult::line_map` maps a `python_source` line to
+/// the line the user wrote (both 0-based); tracebacks use it.
+pub(crate) fn front_end(
+    source: &str,
+    kind: FrontEnd,
+) -> Result<(ruff_python_ast::ModModule, preprocess::PreprocessResult), String> {
+    let prep = preprocess::expand_and_preprocess_mapped(source, false);
+    let parsed = tyc_syntax::parse_module(&prep.python_source).map_err(|e| e.to_string())?;
+    let mut module = parsed.into_syntax();
+    if kind == FrontEnd::Shim {
+        let plain_class_lines: Vec<usize> = prep
+            .python_source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.trim_start().starts_with("class "))
+            .map(|(i, _)| i)
+            .collect();
+        let desugar_out = tyc_desugar::desugar_module_with(
+            &module,
+            tyc_desugar::DesugarOptions {
+                plain_class_line_starts: preprocess::line_byte_starts(
+                    &prep.python_source,
+                    &plain_class_lines,
+                ),
+                ..Default::default()
+            },
+        );
+        return Ok((desugar_out.module, prep));
+    }
+
+    // Evaluate `comptime` bindings and inline the resulting literals into
+    // the AST so the VM doesn't try to execute `env(...)` (a build-only
+    // intrinsic). `comptime def` bodies are stripped at the same time so
+    // a NameError from one of their build-only calls can't surface at
+    // runtime. Matches the substitution pass `tyc build` runs before
+    // desugaring.
+    let (comptime_values, _comptime_diags) = tyc_analyse::evaluate_comptime_with_functions(
+        &module,
+        &prep.comptime_bindings,
+        &prep.comptime_functions,
+    );
+    module = tyc_analyse::substitute_comptime_literals(
+        module,
+        &comptime_values,
+        &prep.comptime_functions,
+    );
+
+    // Collect `@memo` / `@pure(memo=True)` opt-ins exactly like `tyc build`
+    // does, so the desugar pass below injects `@functools.cache` instead of
+    // silently stripping the marker (which left memoised recursion running
+    // exponentially under the VM while the build path returned instantly).
+    let memoise_targets: Vec<String> = tyc_analyse::analyse_purity(&module, false)
+        .into_iter()
+        .filter(|f| f.violation.is_none() && f.memoise)
+        .map(|f| f.name)
+        .collect();
+
+    // Hand the VM the desugared module so it sees the same shape as the
+    // compile path: dataclass-decorated user classes, merged impl blocks,
+    // injected runtime imports, and so on. The preprocessor's class-kind
+    // markers (plain / raw / frozen) are threaded through so `plain class`
+    // / `class!` / `class … frozen` desugar exactly like `tyc build` —
+    // otherwise a `plain class` would be wrongly decorated as a
+    // `@dataclass` and its class-level constants treated as slots.
+    let desugar_out = tyc_desugar::desugar_module_with(
+        &module,
+        tyc_desugar::DesugarOptions {
+            memoise_functions: memoise_targets,
+            raw_class_line_starts: preprocess::line_byte_starts(
+                &prep.python_source,
+                &prep.raw_class_lines,
+            ),
+            frozen_class_line_starts: preprocess::line_byte_starts(
+                &prep.python_source,
+                &prep.frozen_class_lines,
+            ),
+            plain_class_line_starts: preprocess::line_byte_starts(
+                &prep.python_source,
+                &prep.plain_class_lines,
+            ),
+            pub_names: prep.pub_names.clone(),
+            ..Default::default()
+        },
+    );
+    Ok((desugar_out.module, prep))
 }
 
 /// Pre-scan sibling `.ty` files referenced by the entry module's imports,
@@ -533,8 +692,7 @@ fn merge_sibling_extensions(
     registry: &mut tyc_analyse::ExtensionRegistry,
     cross_fns: &mut std::collections::HashMap<String, String>,
 ) -> Option<(tyc_analyse::TypeFacts, bool)> {
-    let expanded = preprocess::expand_all(source);
-    let prep = preprocess::preprocess(&expanded);
+    let prep = preprocess::expand_and_preprocess_mapped(source, false);
     let is_facade = !prep.pub_star_lines.is_empty();
     let parsed = tyc_syntax::parse_module(&prep.python_source).ok()?;
     let mut sibling_module = parsed.into_syntax();
@@ -672,6 +830,212 @@ pub fn modelled_module_exports(
         _ => None,
     }
 }
+
+/// Every builtin name a CPython 3.13 program can use: the public
+/// `dir(builtins)` plus the dunders a program can name.
+const PYTHON_BUILTINS: &[&str] = &[
+    "ArithmeticError",
+    "AssertionError",
+    "AttributeError",
+    "BaseException",
+    "BaseExceptionGroup",
+    "BlockingIOError",
+    "BrokenPipeError",
+    "BufferError",
+    "BytesWarning",
+    "ChildProcessError",
+    "ConnectionAbortedError",
+    "ConnectionError",
+    "ConnectionRefusedError",
+    "ConnectionResetError",
+    "DeprecationWarning",
+    "EOFError",
+    "Ellipsis",
+    "EncodingWarning",
+    "EnvironmentError",
+    "Exception",
+    "ExceptionGroup",
+    "False",
+    "FileExistsError",
+    "FileNotFoundError",
+    "FloatingPointError",
+    "FutureWarning",
+    "GeneratorExit",
+    "IOError",
+    "ImportError",
+    "ImportWarning",
+    "IndentationError",
+    "IndexError",
+    "InterruptedError",
+    "IsADirectoryError",
+    "KeyError",
+    "KeyboardInterrupt",
+    "LookupError",
+    "MemoryError",
+    "ModuleNotFoundError",
+    "NameError",
+    "None",
+    "NotADirectoryError",
+    "NotImplemented",
+    "NotImplementedError",
+    "OSError",
+    "OverflowError",
+    "PendingDeprecationWarning",
+    "PermissionError",
+    "ProcessLookupError",
+    "PythonFinalizationError",
+    "RecursionError",
+    "ReferenceError",
+    "ResourceWarning",
+    "RuntimeError",
+    "RuntimeWarning",
+    "StopAsyncIteration",
+    "StopIteration",
+    "SyntaxError",
+    "SyntaxWarning",
+    "SystemError",
+    "SystemExit",
+    "TabError",
+    "TimeoutError",
+    "True",
+    "TypeError",
+    "UnboundLocalError",
+    "UnicodeDecodeError",
+    "UnicodeEncodeError",
+    "UnicodeError",
+    "UnicodeTranslateError",
+    "UnicodeWarning",
+    "UserWarning",
+    "ValueError",
+    "Warning",
+    "ZeroDivisionError",
+    "abs",
+    "aiter",
+    "all",
+    "anext",
+    "any",
+    "ascii",
+    "bin",
+    "bool",
+    "breakpoint",
+    "bytearray",
+    "bytes",
+    "callable",
+    "chr",
+    "classmethod",
+    "compile",
+    "complex",
+    "copyright",
+    "credits",
+    "delattr",
+    "dict",
+    "dir",
+    "divmod",
+    "enumerate",
+    "eval",
+    "exec",
+    "exit",
+    "filter",
+    "float",
+    "format",
+    "frozenset",
+    "getattr",
+    "globals",
+    "hasattr",
+    "hash",
+    "help",
+    "hex",
+    "id",
+    "input",
+    "int",
+    "isinstance",
+    "issubclass",
+    "iter",
+    "len",
+    "license",
+    "list",
+    "locals",
+    "map",
+    "max",
+    "memoryview",
+    "min",
+    "next",
+    "object",
+    "oct",
+    "open",
+    "ord",
+    "pow",
+    "print",
+    "property",
+    "quit",
+    "range",
+    "repr",
+    "reversed",
+    "round",
+    "set",
+    "setattr",
+    "slice",
+    "sorted",
+    "staticmethod",
+    "str",
+    "sum",
+    "super",
+    "tuple",
+    "type",
+    "vars",
+    "zip",
+    "__import__",
+    "__build_class__",
+    "__debug__",
+];
+
+/// Whether `name` is a CPython builtin the VM does not provide (`exec`,
+/// `memoryview`, `globals`). `tyc run`'s pre-run scan sends a program that
+/// uses one down the compiled path rather than into a `NameError`.
+pub fn unmodelled_builtin(probe: &Interpreter, name: &str) -> bool {
+    PYTHON_BUILTINS.contains(&name) && probe.root.get(name).is_none()
+}
+
+/// Whether the VM accepts keyword `kw` when calling `name` — a builtin when
+/// `module` is `None`, else that VM-modelled module's attribute. `None` when
+/// the answer is not known here (the callee is not a VM-provided function,
+/// or it forwards keywords somewhere this cannot see), which the pre-run
+/// scan treats as "leave it to the VM".
+pub fn call_accepts_keyword(
+    probe: &mut Interpreter,
+    module: Option<&str>,
+    name: &str,
+    kw: &str,
+) -> Option<bool> {
+    let callee = match module {
+        None => probe.root.get(name)?,
+        Some(m) => {
+            if !models_module(m) {
+                return None;
+            }
+            let Ok(module) = probe.import_module(m) else {
+                return None;
+            };
+            probe.get_attr(&module, name).ok()?
+        }
+    };
+    match callee {
+        Value::Native(n) => crate::builtins::native_accepts_keyword(n.name, kw),
+        Value::Function(f) => {
+            let p = &f.params;
+            let named = p
+                .args
+                .iter()
+                .chain(p.kwonlyargs.iter())
+                .any(|a| a.parameter.name.as_str() == kw);
+            Some(named || p.kwarg.is_some())
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod parity_tests;
 
 #[cfg(test)]
 mod tests {

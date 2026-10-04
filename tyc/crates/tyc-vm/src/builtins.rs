@@ -8,8 +8,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use indexmap::IndexMap;
-
 use crate::error::{attribute_error, index_error, key_error, type_error, value_error, Unwind};
 use crate::interp::{normalize_index, Interpreter};
 use crate::value::{DictMap, HashKey, IterState, Module, NativeFn, Value, VmInt};
@@ -408,6 +406,7 @@ pub fn install(interp: &mut Interpreter) {
                 }
             };
             let cleaned: String = digits.chars().filter(|&c| c != '_').collect();
+            crate::limits::check_str_to_int(cleaned.len(), base as u32)?;
             return match num_bigint::BigInt::parse_bytes(cleaned.as_bytes(), base as u32) {
                 Some(n) => Ok(Value::Int(VmInt::from(if neg { -n } else { n }))),
                 None => Err(value_error(format!(
@@ -415,6 +414,10 @@ pub fn install(interp: &mut Interpreter) {
                     base, s
                 ))),
             };
+        }
+        if let Value::Str(s) = v {
+            let digits = s.chars().filter(char::is_ascii_digit).count();
+            crate::limits::check_str_to_int(digits, 10)?;
         }
         Ok(Value::Int(VmInt::from(v.to_bigint()?)))
     });
@@ -542,7 +545,7 @@ pub fn install(interp: &mut Interpreter) {
         if let Some(formatted) = interp.try_user_format(v, &spec)? {
             return Ok(Value::Str(Rc::new(formatted)));
         }
-        let base = interp.str_of(v)?;
+        let base = interp.format_default(v, &spec)?;
         Ok(Value::Str(Rc::new(crate::interp::format_with_spec_pub(
             v, &base, &spec,
         )?)))
@@ -654,7 +657,7 @@ pub fn install(interp: &mut Interpreter) {
         i.set_attr(&obj, &name, val)?;
         Ok(Value::None)
     });
-    native!("delattr", |_i, args| {
+    native!("delattr", |i, args| {
         let obj = args
             .first()
             .ok_or_else(|| type_error("delattr() requires arguments"))?
@@ -664,23 +667,8 @@ pub fn install(interp: &mut Interpreter) {
             .ok_or_else(|| type_error("delattr() requires a name"))?
             .py_str();
         match &obj {
-            Value::Instance(inst) => {
-                if let Some(err) =
-                    crate::interp::frozen_dataclass_error(&inst.class, &name, "delete")
-                {
-                    return Err(err);
-                }
-                if inst
-                    .fields
-                    .borrow_mut()
-                    .shift_remove(name.as_str())
-                    .is_none()
-                {
-                    return Err(attribute_error(format!(
-                        "'{}' object has no attribute '{}'",
-                        inst.class.name, name
-                    )));
-                }
+            Value::Instance(_) | Value::Class(_) => {
+                i.del_attr(&obj, &name)?;
                 Ok(Value::None)
             }
             _ => Err(type_error(
@@ -692,6 +680,7 @@ pub fn install(interp: &mut Interpreter) {
         fn internal(k: &str) -> bool {
             matches!(k, "__typhon_enum_base__" | "__typhon_enum_members__")
                 || k.starts_with("__typhon_setter__")
+                || k.starts_with("__typhon_deleter__")
         }
         let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         match args.first() {
@@ -699,12 +688,14 @@ pub fn install(interp: &mut Interpreter) {
                 for k in inst.fields.borrow().keys() {
                     names.insert(k.clone());
                 }
-                for k in inst.class.methods.borrow().keys() {
-                    names.insert(k.clone());
-                }
-                for k in inst.class.class_attrs.borrow().keys() {
-                    if !internal(k) {
+                for c in crate::interp::class_mro(&inst.class) {
+                    for k in c.methods.borrow().keys() {
                         names.insert(k.clone());
+                    }
+                    for k in c.class_attrs.borrow().keys() {
+                        if !internal(k) {
+                            names.insert(k.clone());
+                        }
                     }
                 }
             }
@@ -712,12 +703,14 @@ pub fn install(interp: &mut Interpreter) {
                 names.extend(module_dir_names(m));
             }
             Some(Value::Class(c)) => {
-                for k in c.methods.borrow().keys() {
-                    names.insert(k.clone());
-                }
-                for k in c.class_attrs.borrow().keys() {
-                    if !internal(k) {
+                for c in crate::interp::class_mro(c) {
+                    for k in c.methods.borrow().keys() {
                         names.insert(k.clone());
+                    }
+                    for k in c.class_attrs.borrow().keys() {
+                        if !internal(k) {
+                            names.insert(k.clone());
+                        }
                     }
                 }
             }
@@ -730,7 +723,7 @@ pub fn install(interp: &mut Interpreter) {
     native!("vars", |_i, args| {
         match args.first() {
             Some(Value::Instance(inst)) => {
-                let mut m: DictMap = IndexMap::new();
+                let mut m: DictMap = DictMap::new();
                 for (k, v) in inst.fields.borrow().iter() {
                     m.insert(HashKey::Str(Rc::new(k.clone())), v.clone());
                 }
@@ -738,7 +731,7 @@ pub fn install(interp: &mut Interpreter) {
             }
             // `vars(module)` returns the module namespace (review: gemini).
             Some(Value::Module(md)) => {
-                let mut m: DictMap = IndexMap::new();
+                let mut m: DictMap = DictMap::new();
                 for (k, v) in md.members.borrow().iter() {
                     m.insert(HashKey::Str(Rc::new(k.clone())), v.clone());
                 }
@@ -809,7 +802,14 @@ pub fn install(interp: &mut Interpreter) {
             Some(Value::Bytes(b)) => Ok(Value::Bytes(b)),
             // bytes(int) -> that many zero bytes.
             Some(Value::Int(n)) => {
-                let n = n.to_usize().ok_or_else(|| value_error("negative count"))?;
+                if n.is_negative() {
+                    return Err(value_error("negative count"));
+                }
+                let n = n
+                    .to_usize()
+                    .filter(|n| *n <= isize::MAX as usize)
+                    .ok_or_else(crate::limits::index_overflow)?;
+                crate::limits::ensure_alloc(n)?;
                 Ok(Value::Bytes(Rc::new(vec![0u8; n])))
             }
             // bytes(str) requires an encoding in Python; not supported here.
@@ -869,20 +869,21 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("set", |i, args| {
-        let mut out = HashSet::new();
-        if let Some(v) = args.into_iter().next() {
-            let it = i.make_iter(v)?;
-            while let Some(x) = i.iter_next(&it)? {
-                let k = i.hash_key(&x)?;
-                let k = i.settle_key_in_set(&out, k)?;
-                out.insert(k);
-            }
+        if args.len() > 1 {
+            return Err(type_error(format!(
+                "set expected at most 1 argument, got {}",
+                args.len()
+            )));
         }
+        let out = match args.into_iter().next() {
+            Some(v) => i.set_from_value(v)?,
+            None => crate::pyset::PySet::new(),
+        };
         Ok(Value::Set(Rc::new(crate::value::FrozenCell::new(out))))
     });
 
     native!("dict", |i, args| {
-        let mut map: DictMap = IndexMap::new();
+        let mut map: DictMap = DictMap::new();
         if let Some(v) = args.into_iter().next() {
             // `dict(other_dict)` — shallow copy of an existing mapping.
             if let Value::Dict(d) = &v {
@@ -948,15 +949,22 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("frozenset", |i, args| {
-        let mut out = HashSet::new();
-        if let Some(v) = args.into_iter().next() {
-            let it = i.make_iter(v)?;
-            while let Some(x) = i.iter_next(&it)? {
-                let k = i.hash_key(&x)?;
-                let k = i.settle_key_in_set(&out, k)?;
-                out.insert(k);
+        if args.len() > 1 {
+            return Err(type_error(format!(
+                "frozenset expected at most 1 argument, got {}",
+                args.len()
+            )));
+        }
+        // `frozenset(f)` of a frozenset is that same object.
+        if let Some(Value::Set(s)) = args.first() {
+            if set_is_frozen(s) {
+                return Ok(args[0].clone());
             }
         }
+        let out = match args.into_iter().next() {
+            Some(v) => i.set_from_value(v)?,
+            None => crate::pyset::PySet::new(),
+        };
         // Frozen metadata lives outside user-visible container contents.
         Ok(Value::Set(Rc::new(crate::value::FrozenCell::frozen(out))))
     });
@@ -965,7 +973,13 @@ pub fn install(interp: &mut Interpreter) {
         interp.repr_of(single(&args, "repr")?)?
     ))));
 
-    native!("type", |_i, args| {
+    native!("type", |i, args| {
+        if args.len() == 3 {
+            return type_new(i, &args);
+        }
+        if args.len() != 1 {
+            return Err(type_error("type() takes 1 or 3 arguments"));
+        }
         let v = single(&args, "type")?;
         // Return a real type object so `type(x).__name__`, `str(type(x))`
         // (→ `<class 'int'>`), and `type(x) == int` / `== SomeClass` all work.
@@ -992,7 +1006,7 @@ pub fn install(interp: &mut Interpreter) {
         ) {
             return Err(type_error("issubclass() arg 1 must be a class"));
         }
-        let cls = i.force_alias(&args[1]);
+        let cls = union_members(&i.force_alias(&args[1]));
         Ok(Value::Bool(is_subclass_of(&sub, &cls)))
     });
     native!("isinstance", |i, args| {
@@ -1004,7 +1018,7 @@ pub fn install(interp: &mut Interpreter) {
         // above `A`/`B`) used at runtime before the post-body resolution
         // pass has run — otherwise it would still be its name-string
         // fallback and the test would silently return the wrong result.
-        let cls = i.force_alias(&args[1]);
+        let cls = union_members(&i.force_alias(&args[1]));
         // A `@runtime_checkable` Protocol is matched *structurally* — the
         // value has to answer every member the protocol declares — and a
         // Protocol without the decorator is not usable here at all, both as
@@ -1016,7 +1030,7 @@ pub fn install(interp: &mut Interpreter) {
                         "Instance and class checks can only be used with @runtime_checkable protocols",
                     ));
                 }
-                let members: Vec<String> = p.methods.borrow().keys().cloned().collect();
+                let members = crate::interp::protocol_members(p);
                 if members.iter().all(|m| i.get_attr(val, m.as_str()).is_ok()) {
                     return Ok(Value::Bool(true));
                 }
@@ -1147,16 +1161,62 @@ pub fn install(interp: &mut Interpreter) {
                 return i.make_iter(r);
             }
         }
-        let it = i.make_iter(seq)?;
-        let mut out: Vec<Value> = Vec::new();
-        while let Some(v) = i.iter_next(&it)? {
-            out.push(v);
-        }
-        out.reverse();
-        Ok(Value::Iter(Rc::new(RefCell::new(IterState::Reversed {
-            items: Rc::new(out),
-            index: 0,
-        }))))
+        // A list and a dict reverse *live* (CPython's
+        // `list_reverseiterator` indexes the list as it goes; the dict one
+        // raises if the dict changes size); immutable sequences snapshot;
+        // anything that is not a sequence is refused.
+        let state = match seq {
+            Value::List(l) => {
+                let index = l.borrow().len();
+                IterState::ListRev { list: l, index }
+            }
+            Value::Dict(d) => IterState::dict_rev(&d, crate::value::DictViewKind::Keys),
+            Value::DictView { kind, dict } => IterState::dict_rev(&dict, kind),
+            Value::Range { start, stop, step } => {
+                let n = if step > 0 && stop > start {
+                    (stop - start + step - 1) / step
+                } else if step < 0 && start > stop {
+                    (start - stop - step - 1) / -step
+                } else {
+                    0
+                };
+                let last = start + (n - 1) * step;
+                IterState::Range {
+                    current: if n == 0 { 0 } else { last },
+                    stop: if n == 0 { 0 } else { start - step },
+                    step: -step,
+                }
+            }
+            seq @ (Value::Tuple(_) | Value::Str(_) | Value::Bytes(_) | Value::Instance(_)) => {
+                if let Value::Instance(inst) = &seq {
+                    let sequence = i.find_method(&inst.class, "__len__").is_some()
+                        && i.find_method(&inst.class, "__getitem__").is_some();
+                    if !sequence {
+                        return Err(type_error(format!(
+                            "'{}' object is not reversible",
+                            inst.class.name
+                        )));
+                    }
+                }
+                let it = i.make_iter(seq)?;
+                let mut out: Vec<Value> = Vec::new();
+                while let Some(v) = i.iter_next(&it)? {
+                    out.push(v);
+                }
+                out.reverse();
+                IterState::Reversed {
+                    items: Rc::new(out),
+                    index: 0,
+                }
+            }
+            other => {
+                return Err(type_error(format!(
+                    "'{}' object is not reversible",
+                    other.type_display_name()
+                )))
+            }
+        };
+        Ok(Value::Iter(Rc::new(RefCell::new(state))))
     });
 
     native!("enumerate", |i, args| {
@@ -1399,12 +1459,27 @@ pub fn install(interp: &mut Interpreter) {
                     // round-ties-to-even, matching CPython (so 2.675, which is
                     // really 2.67499..., rounds to 2.67).
                     Some(n) if !matches!(n, Value::None) => {
-                        let n = n.to_int()? as i32;
-                        if !x.is_finite() {
+                        // CPython clamps `ndigits` to `Py_ssize_t`, returns `x`
+                        // itself past the last representable decimal place and
+                        // a signed zero before the largest one
+                        // (`NDIGITS_MAX` / `NDIGITS_MIN` in floatobject.c).
+                        let n: i64 = match n {
+                            Value::Int(v) => v.to_i64().unwrap_or(if v.is_negative() {
+                                i64::MIN
+                            } else {
+                                i64::MAX
+                            }),
+                            other => other.to_int()?,
+                        };
+                        if !x.is_finite() || n > 323 {
                             return Ok(Value::Float(x));
                         }
+                        if n < -308 {
+                            return Ok(Value::Float(0.0 * x));
+                        }
+                        let n = n as i32;
                         if n >= 0 {
-                            let s = format!("{:.*}", n as usize, x);
+                            let s = crate::limits::fixed(x, n as usize);
                             Ok(Value::Float(s.parse::<f64>().unwrap_or(x)))
                         } else {
                             // Round to a negative decimal place (tens, hundreds…).
@@ -1518,19 +1593,23 @@ pub fn install(interp: &mut Interpreter) {
         i.call_value(open_fn, pos.to_vec(), &kw)
     });
 
-    // `@property`, `@classmethod`, `@staticmethod`: the VM has no
-    // descriptor protocol, so these decorators reduce to the identity
-    // — the wrapped function is callable as `obj.name()` (not `obj.name`
-    // for property). That's a documented divergence from CPython, but
-    // it lets programs that decorate methods at least import and run.
-    native!("property", |_i, args| {
-        Ok(args.into_iter().next().unwrap_or(Value::None))
+    // `@property`, `@classmethod`, `@staticmethod` as *decorators* in a
+    // class body are recognised by the class builder. Called as functions
+    // (`x = property(get_x)`, `make = classmethod(_make)`, or a function
+    // stored on the class later) they must produce the same descriptors:
+    // `property(...)` builds the `descriptors` shim's data descriptor, and
+    // `classmethod` / `staticmethod` return a copy of the function marked
+    // so attribute reads bind the class / nothing. Returning the bare
+    // function left `cls` unbound and a property read returning a method.
+    native!("property", |i, args| {
+        let cls = descriptor_shim_class(i, "property")?;
+        i.call_value(cls, args, &[])
     });
     native!("classmethod", |_i, args| {
-        Ok(args.into_iter().next().unwrap_or(Value::None))
+        Ok(mark_function(single(&args, "classmethod")?, true, false))
     });
     native!("staticmethod", |_i, args| {
-        Ok(args.into_iter().next().unwrap_or(Value::None))
+        Ok(mark_function(single(&args, "staticmethod")?, false, true))
     });
     // `super()` — return a stub module whose attribute access yields a
     // no-op callable. Just enough to let `super().__init__(...)` synthesised
@@ -1568,6 +1647,7 @@ pub fn install(interp: &mut Interpreter) {
             fields: vec![],
             class_attrs: std::cell::RefCell::new(HashMap::new()),
             bases: vec![],
+            mro: vec![],
             properties: std::cell::RefCell::new(std::collections::HashSet::new()),
             classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
             is_exception: false,
@@ -1584,6 +1664,7 @@ pub fn install(interp: &mut Interpreter) {
                 fields: vec![],
                 class_attrs: std::cell::RefCell::new(HashMap::new()),
                 bases: vec![],
+                mro: vec![],
                 properties: std::cell::RefCell::new(std::collections::HashSet::new()),
                 classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
                 is_exception: false,
@@ -1819,19 +1900,17 @@ pub fn install(interp: &mut Interpreter) {
         ))),
     );
 
-    // `newtype Foo = int` lowers to `Foo = NewType("Foo", int)`. CPython's
-    // `NewType` at runtime is effectively `lambda x: x`, so we mirror that:
-    // a two-argument callable that returns a callable identity function.
-    // VM-mode coverage of #24.
+    // `newtype Foo = int` lowers to `Foo = NewType("Foo", int)`: a
+    // `typing.NewType` object — an identity callable carrying
+    // `__supertype__`, printed `__main__.Foo` (see `new_newtype`). A direct
+    // call is intercepted in `eval_call` to record the base expression for
+    // `as!`.
+    root.set("NewType", newtype_native());
+    // `NotImplemented`: one shared singleton (identity matters — `is`).
     root.set(
-        "NewType",
-        Value::Native(Rc::new(NativeFn::new("NewType", |_i, _args| {
-            // Discard `(name, base)`; return an identity callable that
-            // accepts any single argument and returns it unchanged.
-            Ok(Value::Native(Rc::new(NativeFn::new(
-                "NewTypeAlias",
-                |_i, args| Ok(args.into_iter().next().unwrap_or(Value::None)),
-            ))))
+        "NotImplemented",
+        Value::Native(Rc::new(NativeFn::new("NotImplemented", |_i, _args| {
+            Err(type_error("'NotImplementedType' object is not callable"))
         }))),
     );
 }
@@ -2107,12 +2186,12 @@ fn value_len(v: &Value) -> Result<usize, Unwind> {
         }
     }
     Ok(match v {
-        Value::Str(s) => s.chars().count(),
+        Value::Str(s) => crate::strindex::char_len(s),
         Value::Bytes(b) => b.len(),
         Value::List(l) => l.borrow().len(),
         Value::Tuple(t) => t.len(),
-        Value::Dict(d) => d.borrow().keys().count(),
-        Value::Set(s) => s.borrow().iter().count(),
+        Value::Dict(d) => d.borrow().len(),
+        Value::Set(s) => s.borrow().len(),
         Value::Range { start, stop, step } => {
             if *step > 0 {
                 ((stop - start).max(0) as usize).div_ceil(*step as usize)
@@ -2123,7 +2202,7 @@ fn value_len(v: &Value) -> Result<usize, Unwind> {
             }
         }
         // A dict-view's length is the number of items it exposes.
-        Value::DictView { items, .. } => items.len(),
+        Value::DictView { dict, .. } => dict.borrow().len(),
         other => {
             return Err(type_error(format!(
                 "object of type '{}' has no len()",
@@ -2256,6 +2335,7 @@ pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
         // Without this arm `isinstance(x, object)` was uniformly `False`,
         // which silently inverts any control flow written around it.
         ("object", _) => true,
+        ("NoneType", Value::None) => true,
         ("int", Value::Int(_)) => true,
         // `bool` is a subclass of `int` in CPython, so `isinstance(True, int)`
         // is `True` there. The VM answered `False`, taking the opposite branch
@@ -2268,9 +2348,11 @@ pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
         ("list", Value::List(_)) => true,
         ("tuple", Value::Tuple(t)) => !crate::value::is_slice_marker(t),
         ("slice", Value::Tuple(t)) => crate::value::is_slice_marker(t),
-        ("dict", Value::Dict(_)) => true,
-        ("set", Value::Set(_)) => true,
-        ("frozenset", Value::Set(_)) => true,
+        // A `freeze let` dict is a `mappingproxy`, which is not a `dict`.
+        ("dict", Value::Dict(d)) => !dict_is_frozen(d),
+        ("mappingproxy", Value::Dict(d)) => dict_is_frozen(d),
+        ("set", Value::Set(s)) => !set_is_frozen(s),
+        ("frozenset", Value::Set(s)) => set_is_frozen(s),
         ("range", Value::Range { .. }) => true,
         ("complex", Value::Complex(..)) => true,
         ("Ok", Value::ResultOk(_)) => true,
@@ -2283,8 +2365,14 @@ pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
         {
             true
         }
-        // Class membership.
-        (_, Value::Instance(inst)) => class_in_chain(&inst.class, &name),
+        // Class membership. A value-mixin enum member (`IntEnum`, `StrEnum`,
+        // `class Mode(str, Enum)`) is also an instance of its value's type.
+        (_, Value::Instance(inst)) => {
+            class_in_chain(&inst.class, &name)
+                || (matches!(cls, Value::Native(_))
+                    && crate::value::enum_mixin_value(val)
+                        .is_some_and(|inner| is_instance_of(&inner, cls)))
+        }
         _ => {
             if let Value::Class(target) = cls {
                 if let Value::Instance(inst) = val {
@@ -2426,6 +2514,7 @@ mod shims {
     pub const LAZY: &str = include_str!("shims/lazy.py");
     pub const TYPEPARAMS: &str = include_str!("shims/typeparams.py");
     pub const HEAPQ_EXTRA: &str = include_str!("shims/heapq_extra.py");
+    pub const DESCRIPTORS: &str = include_str!("shims/descriptors.py");
 }
 
 fn compile_helpers(interp: &mut Interpreter, source: &str) -> Result<Vec<(String, Value)>, Unwind> {
@@ -2449,50 +2538,12 @@ fn compile_shim(
     source: &str,
     seed: Vec<(&str, Value)>,
 ) -> Result<(Vec<(String, Value)>, crate::env::EnvRef), Unwind> {
-    use tyc_syntax::preprocess;
-    let expanded = preprocess::expand_question_ops(&preprocess::expand_inline_question_ops(
-        // Shared with the CLI: the VM omitted both of these, so an
-        // inline `?` (`f(g()?)`, `elif h()? > 1:`) failed to parse under
-        // `tyc run` on a program `tyc build` compiles and runs.
-        &preprocess::expand_compound_question_headers(&preprocess::expand_pipes(
-            &preprocess::expand_with_chains(&preprocess::expand_go_calls(
-                &preprocess::expand_gather_blocks(&preprocess::expand_multiline_guards(
-                    &preprocess::expand_typed_let_unpack(&preprocess::expand_lazy_lets(source)),
-                )),
-            )),
-        )),
-    ));
-    let prep = preprocess::preprocess(&expanded);
-    let parsed = tyc_syntax::parse_module(&prep.python_source).map_err(|e| {
+    let (module, _prep) = crate::front_end(source, crate::FrontEnd::Shim).map_err(|e| {
         crate::error::Unwind::Exception(crate::error::VmException::new(
             "ImportError",
             format!("internal stdlib shim parse error: {e}"),
         ))
     })?;
-    let mut module = parsed.into_syntax();
-    // Shim sources are plain Python validated against CPython: every class
-    // is emitted exactly as written (no `@dataclass` decoration, no
-    // synthesised `__init__`), so the VM's dataclass semantics — slots
-    // enforcement, field-tuple hashing, generated constructors — never
-    // apply to a helper class CPython would run as a bare class.
-    let plain_class_lines: Vec<usize> = prep
-        .python_source
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| line.trim_start().starts_with("class "))
-        .map(|(i, _)| i)
-        .collect();
-    let desugar_out = tyc_desugar::desugar_module_with(
-        &module,
-        tyc_desugar::DesugarOptions {
-            plain_class_line_starts: preprocess::line_byte_starts(
-                &prep.python_source,
-                &plain_class_lines,
-            ),
-            ..Default::default()
-        },
-    );
-    module = desugar_out.module;
 
     let env = crate::env::Env::new_module(&interp.root);
     for (name, value) in seed {
@@ -2603,7 +2654,7 @@ fn make_collections_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
         if defaults.len() > fields.len() {
             return Err(type_error("Got more default values than field names"));
         }
-        let mut field_defaults: DictMap = IndexMap::new();
+        let mut field_defaults: DictMap = DictMap::new();
         let offset = fields.len() - defaults.len();
         for (name, d) in fields[offset..].iter().zip(defaults) {
             field_defaults.insert(HashKey::Str(Rc::new(name.clone())), d);
@@ -2624,9 +2675,12 @@ fn make_collections_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
         );
         let cls = Rc::new(crate::value::Class {
             name: typename,
-            methods: RefCell::new(template.methods.borrow().clone()),
+            // Inherited through the MRO, not copied: CPython names
+            // `Point._make` as defined on the template's class.
+            methods: RefCell::new(HashMap::new()),
             fields: vec![],
             class_attrs: RefCell::new(class_attrs),
+            mro: crate::value::linearize(std::slice::from_ref(&template)).unwrap_or_default(),
             bases: vec![template.clone()],
             properties: RefCell::new(template.properties.borrow().clone()),
             classmethods: RefCell::new(template.classmethods.borrow().clone()),
@@ -2662,6 +2716,279 @@ fn compile_helper(interp: &mut Interpreter, source: &str, name: &str) -> Result<
         .find(|(k, _)| k == name)
         .map(|(_, v)| v)
         .ok_or_else(|| type_error(format!("stdlib shim did not define '{name}'")))
+}
+
+/// A class from the `descriptors` shim (`property`), compiled once per run.
+/// `type(name, bases, namespace)`: a new class, as a `class` statement with
+/// that body would make it (functions become methods, everything else a
+/// class attribute; builtin bases are recorded by name).
+fn type_new(interp: &Interpreter, args: &[Value]) -> Result<Value, Unwind> {
+    let name = match &args[0] {
+        Value::Str(s) => (**s).clone(),
+        other => {
+            return Err(type_error(format!(
+                "type.__new__() argument 1 must be str, not {}",
+                other.type_display_name()
+            )))
+        }
+    };
+    let Value::Tuple(base_values) = &args[1] else {
+        return Err(type_error(format!(
+            "type.__new__() argument 2 must be tuple, not {}",
+            args[1].type_display_name()
+        )));
+    };
+    let Value::Dict(ns) = &args[2] else {
+        return Err(type_error(format!(
+            "type.__new__() argument 3 must be dict, not {}",
+            args[2].type_display_name()
+        )));
+    };
+    let mut bases = Vec::new();
+    let mut builtin_bases = Vec::new();
+    let mut exc_bases = Vec::new();
+    for b in base_values.iter() {
+        match b {
+            Value::Class(c) => bases.push(c.clone()),
+            Value::Native(n) if n.name == "object" => {}
+            Value::Native(n) if crate::interp::name_is_exception_base(n.name) => {
+                exc_bases.push(Value::Str(Rc::new(n.name.to_owned())))
+            }
+            Value::Native(n) => builtin_bases.push(Value::Str(Rc::new(n.name.to_owned()))),
+            other => {
+                return Err(type_error(format!(
+                    "type.__new__() bases must be types, not {}",
+                    other.type_display_name()
+                )))
+            }
+        }
+    }
+    let mut methods = HashMap::new();
+    let mut class_attrs = HashMap::new();
+    for (k, v) in ns.borrow().iter() {
+        let HashKey::Str(key) = k else {
+            continue;
+        };
+        match v {
+            Value::Function(f) => {
+                methods.insert((**key).clone(), f.clone());
+            }
+            other => {
+                class_attrs.insert((**key).clone(), other.clone());
+            }
+        }
+    }
+    if !builtin_bases.is_empty() {
+        class_attrs.insert(
+            "__typhon_builtin_bases__".to_owned(),
+            Value::Tuple(Rc::new(builtin_bases)),
+        );
+    }
+    let is_exception = bases.iter().any(|b| b.is_exception) || !exc_bases.is_empty();
+    if !exc_bases.is_empty() {
+        class_attrs.insert(
+            "__typhon_exc_bases__".to_owned(),
+            Value::Tuple(Rc::new(exc_bases)),
+        );
+    }
+    class_attrs.insert(
+        "__typhon_module__".to_owned(),
+        Value::Str(Rc::new(interp.current_module_name.clone())),
+    );
+    let mro = crate::value::linearize(&bases).map_err(|names| {
+        type_error(format!(
+            "Cannot create a consistent method resolution order (MRO) for bases {names}"
+        ))
+    })?;
+    Ok(Value::Class(Rc::new(crate::value::Class {
+        name,
+        methods: RefCell::new(methods),
+        fields: vec![],
+        class_attrs: RefCell::new(class_attrs),
+        mro,
+        bases,
+        properties: RefCell::new(Default::default()),
+        classmethods: RefCell::new(Default::default()),
+        is_exception,
+        is_protocol: false,
+    })))
+}
+
+/// The `typing` / `collections.abc` names the VM models as inert identity
+/// stand-ins (see `make_typing_module`).
+pub(crate) fn is_typing_form(name: &str) -> bool {
+    matches!(
+        name,
+        "Callable"
+            | "Optional"
+            | "Union"
+            | "List"
+            | "Dict"
+            | "Set"
+            | "Tuple"
+            | "FrozenSet"
+            | "Protocol"
+            | "Iterable"
+            | "Iterator"
+            | "Sequence"
+            | "Mapping"
+            | "MutableMapping"
+            | "MutableSequence"
+            | "MutableSet"
+            | "ClassVar"
+            | "Final"
+            | "Literal"
+            | "Type"
+            | "Generic"
+            | "Awaitable"
+            | "Coroutine"
+            | "AsyncIterable"
+            | "AsyncIterator"
+            | "Generator"
+            | "AsyncGenerator"
+            | "ContextManager"
+            | "AsyncContextManager"
+            | "Annotated"
+            | "TypeGuard"
+            | "TypeIs"
+            | "Required"
+            | "NotRequired"
+            | "Unpack"
+            | "Concatenate"
+            | "OrderedDict"
+            | "DefaultDict"
+            | "Counter"
+            | "Deque"
+            | "ChainMap"
+            | "AbstractSet"
+            | "Collection"
+            | "Container"
+            | "Reversible"
+            | "ItemsView"
+            | "KeysView"
+            | "ValuesView"
+            | "MappingView"
+            | "IO"
+    )
+}
+
+/// The builtin type names the VM models as native constructors.
+pub(crate) fn is_builtin_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "int"
+            | "float"
+            | "complex"
+            | "str"
+            | "bool"
+            | "bytes"
+            | "bytearray"
+            | "list"
+            | "dict"
+            | "set"
+            | "frozenset"
+            | "tuple"
+            | "object"
+            | "type"
+            | "range"
+            | "slice"
+            | "memoryview"
+            | "NoneType"
+    )
+}
+
+/// A runtime `X | Y` union (the descriptors shim's `UnionType`) as the
+/// tuple of its members `isinstance` / `issubclass` accept; anything else
+/// unchanged. `None` among the members stands for `NoneType`.
+fn union_members(cls: &Value) -> Value {
+    if let Value::Instance(inst) = cls {
+        if inst.class.name == "UnionType" {
+            if let Some(Value::Tuple(args)) = inst.fields.borrow().get("__args__") {
+                return Value::Tuple(Rc::new(
+                    args.iter()
+                        .map(|a| match a {
+                            Value::None => make_builtin_type("NoneType"),
+                            other => other.clone(),
+                        })
+                        .collect(),
+                ));
+            }
+        }
+    }
+    cls.clone()
+}
+
+/// The `NewType` callable: `NewType(name, base)` builds the newtype object.
+fn newtype_native() -> Value {
+    Value::Native(Rc::new(NativeFn::new("NewType", |i, args| {
+        let mut args = args.into_iter();
+        let (Some(name), Some(base), None) = (args.next(), args.next(), args.next()) else {
+            return Err(type_error("NewType() takes exactly 2 positional arguments"));
+        };
+        new_newtype(i, name, base, Value::Str(Rc::new("__main__".into())))
+    })))
+}
+
+/// A `typing.NewType` object (the `NewType` class of the descriptors shim).
+pub(crate) fn new_newtype(
+    interp: &mut Interpreter,
+    name: Value,
+    base: Value,
+    module: Value,
+) -> Result<Value, Unwind> {
+    let class = descriptor_shim_class(interp, "NewType")?;
+    let obj = interp.call_value(class, vec![name, base], &[])?;
+    interp.set_attr(&obj, "__module__", module)?;
+    Ok(obj)
+}
+
+pub(crate) fn descriptor_shim_class(interp: &mut Interpreter, name: &str) -> Result<Value, Unwind> {
+    const KEY: &str = "__typhon_descriptors__";
+    let module = match interp.module_cache.get(KEY) {
+        Some(v) => v.clone(),
+        None => {
+            let members = compile_helpers(interp, shims::DESCRIPTORS)?;
+            let entries: Vec<(&str, Value)> = members
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.clone()))
+                .collect();
+            let m = make_module("builtins", entries);
+            interp.module_cache.insert(KEY.to_owned(), m.clone());
+            m
+        }
+    };
+    match &module {
+        Value::Module(m) => m
+            .members
+            .borrow()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| type_error(format!("descriptor shim did not define '{name}'"))),
+        _ => Err(type_error("descriptor shim is not a module")),
+    }
+}
+
+/// `classmethod(f)` / `staticmethod(f)`: a copy of the user function `f`
+/// carrying the binding rule. Anything else (a native, a partial) passes
+/// through unchanged, as before.
+fn mark_function(v: &Value, classmethod: bool, staticmethod: bool) -> Value {
+    let Value::Function(f) = v else {
+        return v.clone();
+    };
+    Value::Function(Rc::new(crate::value::Function {
+        name: f.name.clone(),
+        params: f.params.clone(),
+        body: f.body.clone(),
+        defaults: f.defaults.clone(),
+        closure: f.closure.clone(),
+        is_async: f.is_async,
+        is_static: staticmethod || f.is_static,
+        is_classmethod: classmethod || f.is_classmethod,
+        source: f.source.clone(),
+        slot_info: f.slot_info.clone(),
+        generator: f.generator,
+        attrs: RefCell::new(f.attrs.borrow().clone()),
+    }))
 }
 
 /// The PEP 695 / PEP 696 type-parameter classes, compiled once. `TypeVar`,
@@ -3384,9 +3711,22 @@ fn make_math_module() -> Value {
             (
                 "prod",
                 nf("prod", |i, args| {
-                    // math.prod(iterable, *, start=1) — multiply all elements.
-                    let it = i.make_iter(single(&args, "prod")?.clone())?;
-                    let mut acc = Value::Int(VmInt::from(1));
+                    // math.prod(iterable, *, start=1) — multiply all elements
+                    // (`start` arrives at position 1; see `native_keyword_params`).
+                    if args.len() > 2 {
+                        return Err(type_error(format!(
+                            "prod() takes exactly 1 positional argument ({} given)",
+                            args.len()
+                        )));
+                    }
+                    let it = i.make_iter(
+                        args.first()
+                            .ok_or_else(|| {
+                                type_error("prod() takes exactly 1 positional argument (0 given)")
+                            })?
+                            .clone(),
+                    )?;
+                    let mut acc = args.get(1).cloned().unwrap_or(Value::Int(VmInt::from(1)));
                     while let Some(v) = i.iter_next(&it)? {
                         acc = i.binop(&acc, ruff_python_ast::Operator::Mult, &v)?;
                     }
@@ -5433,7 +5773,12 @@ fn fs_natives() -> Vec<(&'static str, Value)> {
             "_fs_urandom",
             nf("_fs_urandom", |_i, args| {
                 use std::hash::{BuildHasher, Hasher};
-                let n = single(&args, "urandom")?.to_int()?.max(0) as usize;
+                let n = crate::limits::ssize_arg(single(&args, "urandom")?)?;
+                if n < 0 {
+                    return Err(value_error("negative argument not allowed"));
+                }
+                let n = n as usize;
+                crate::limits::ensure_alloc(n)?;
                 let mut out = Vec::with_capacity(n);
                 while out.len() < n {
                     let word = std::collections::hash_map::RandomState::new()
@@ -5523,7 +5868,7 @@ fn public_members(members: Vec<(String, Value)>) -> Vec<(String, Value)> {
 fn make_os_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
     cached_shim_module(interp, "os", |interp| {
         let env_dict = {
-            let mut m: DictMap = IndexMap::new();
+            let mut m: DictMap = DictMap::new();
             for (k, v) in std::env::vars() {
                 m.insert(HashKey::Str(Rc::new(k)), Value::Str(Rc::new(v)));
             }
@@ -5739,6 +6084,31 @@ fn make_sys_module(interp: &Interpreter) -> Value {
                 }),
             ),
             (
+                "get_int_max_str_digits",
+                nf("get_int_max_str_digits", |_i, _args| {
+                    Ok(Value::Int(VmInt::from(
+                        crate::limits::int_max_str_digits() as i64
+                    )))
+                }),
+            ),
+            (
+                "set_int_max_str_digits",
+                nf("set_int_max_str_digits", |_i, args| {
+                    let (pos, kw) = split_kwargs(&args);
+                    let v = pos
+                        .first()
+                        .cloned()
+                        .or_else(|| kw.iter().find(|(k, _)| k == "maxdigits").map(|(_, v)| v.clone()))
+                        .ok_or_else(|| type_error("set_int_max_str_digits() missing required argument 'maxdigits' (pos 1)"))?;
+                    let n = crate::limits::ssize_arg(&v)?;
+                    if n != 0 && n < 640 {
+                        return Err(value_error("maxdigits must be 0 or larger than 640"));
+                    }
+                    crate::limits::set_int_max_str_digits(n.max(0) as usize);
+                    Ok(Value::None)
+                }),
+            ),
+            (
                 "getrecursionlimit",
                 nf("getrecursionlimit", |i, _args| {
                     Ok(Value::Int(VmInt::from(i.max_stack_depth as i64)))
@@ -5875,18 +6245,27 @@ fn make_json_module() -> Value {
             ("JSONDecodeError", Value::Class(json_decode_error_class())),
             (
                 "loads",
-                nf("loads", |_i, args| {
-                    json_loads(&single(&args, "loads")?.py_str())
+                nf("loads", |interp, args| {
+                    let text = args
+                        .first()
+                        .ok_or_else(|| type_error("loads() missing required argument 's'"))?
+                        .py_str();
+                    let value = json_loads(&text)?;
+                    json_apply_hooks(interp, value, &args[1..])
                 }),
             ),
             (
                 "load",
                 nf("load", |interp, args| {
                     // json.load(fp) — read() the file-like, then loads().
-                    let fp = single(&args, "load")?.clone();
+                    let fp = args
+                        .first()
+                        .ok_or_else(|| type_error("load() missing required argument 'fp'"))?
+                        .clone();
                     let read = interp.get_attr(&fp, "read")?;
                     let body = interp.call_value(read, vec![], &[])?;
-                    json_loads(&body.py_str())
+                    let value = json_loads(&body.py_str())?;
+                    json_apply_hooks(interp, value, &args[1..])
                 }),
             ),
             (
@@ -6443,7 +6822,7 @@ fn make_random_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
                 let n = match seq {
                     Value::List(l) => l.borrow().len(),
                     Value::Tuple(t) => t.len(),
-                    Value::Str(s) => s.chars().count(),
+                    Value::Str(s) => crate::strindex::char_len(s),
                     Value::Bytes(b) => b.len(),
                     Value::Range { .. } | Value::Instance(_) => value_len(seq)?,
                     other => {
@@ -6662,17 +7041,8 @@ fn make_typing_module() -> Value {
     ] {
         entries.push((name, identity_native(name)));
     }
-    // `NewType("Foo", base)` returns an identity callable. Mirrors the
-    // root-level `NewType` builtin for users who import it explicitly.
-    entries.push((
-        "NewType",
-        Value::Native(Rc::new(NativeFn::new("NewType", |_i, _args| {
-            Ok(Value::Native(Rc::new(NativeFn::new(
-                "NewTypeAlias",
-                |_i, args| Ok(args.into_iter().next().unwrap_or(Value::None)),
-            ))))
-        }))),
-    ));
+    // `NewType("Foo", base)`, as the root-level builtin.
+    entries.push(("NewType", newtype_native()));
     // `TypeVar("T", ...)` — return a placeholder. The static type system
     // is the only consumer; at runtime the value just needs to exist.
     entries.push((
@@ -7061,7 +7431,7 @@ fn make_re_module() -> Value {
             Value::Int(VmInt::from(p_rc.captures_len().saturating_sub(1) as i64)),
         );
         {
-            let mut d: DictMap = IndexMap::new();
+            let mut d: DictMap = DictMap::new();
             for (name, idx) in name_indices(&p_rc) {
                 d.insert(
                     HashKey::Str(Rc::new(name)),
@@ -7172,7 +7542,7 @@ fn make_re_module() -> Value {
         attrs.insert(
             "groupdict".into(),
             Value::Native(Rc::new(NativeFn::new("groupdict", move |_i, _args| {
-                let mut d: DictMap = IndexMap::new();
+                let mut d: DictMap = DictMap::new();
                 for (name, idx) in &names_d {
                     let v = match gt_d.get(*idx) {
                         Some(Some(s)) => Value::Str(Rc::new(s.clone())),
@@ -7432,6 +7802,7 @@ fn bare_shim_class(name: &str) -> crate::value::Class {
         fields: vec![],
         class_attrs: RefCell::new(HashMap::new()),
         bases: vec![],
+        mro: vec![],
         properties: RefCell::new(HashSet::new()),
         classmethods: RefCell::new(HashSet::new()),
         is_exception: false,
@@ -7871,7 +8242,8 @@ fn make_asyncio_module() -> Value {
                             std::thread::sleep(std::time::Duration::from_secs_f64(secs));
                         }
                     }
-                    Ok(Value::None)
+                    // `asyncio.sleep(delay, result=None)` resolves to `result`.
+                    Ok(args.get(1).cloned().unwrap_or(Value::None))
                 }),
             ),
             (
@@ -8187,10 +8559,27 @@ fn make_collections_abc_module() -> Value {
 
 fn make_abc_module() -> Value {
     let mut entries: Vec<(&str, Value)> = Vec::new();
+    // `@abstractmethod` marks the function (`__isabstractmethod__`) and
+    // returns it; `instantiate` refuses an ABC with one still unimplemented.
+    entries.push((
+        "abstractmethod",
+        nf("abstractmethod", |i, args| {
+            let f = single(&args, "abstractmethod")?.clone();
+            match &f {
+                Value::Function(func) => {
+                    func.attrs
+                        .borrow_mut()
+                        .insert("__isabstractmethod__".to_owned(), Value::Bool(true));
+                }
+                Value::Instance(_) => i.set_attr(&f, "__isabstractmethod__", Value::Bool(true))?,
+                _ => {}
+            }
+            Ok(f)
+        }),
+    ));
     for name in [
         "ABC",
         "ABCMeta",
-        "abstractmethod",
         "abstractproperty",
         "abstractclassmethod",
         "abstractstaticmethod",
@@ -8321,44 +8710,80 @@ fn make_heapq_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
             return Err(type_error("nsmallest(n, iterable) takes 2 arguments"));
         }
         let n = args[0].to_int()?;
+        let key = args.get(2).filter(|k| !matches!(k, Value::None)).cloned();
         let it = i.make_iter(args[1].clone())?;
-        let mut items: Vec<Value> = Vec::new();
+        // `(sort key, item)`, ordered stably on the key alone.
+        let mut items: Vec<(Value, Value)> = Vec::new();
         while let Some(x) = i.iter_next(&it)? {
-            items.push(x);
+            let k = match &key {
+                Some(f) => i.call_value(f.clone(), vec![x.clone()], &[])?,
+                None => x.clone(),
+            };
+            items.push((k, x));
         }
-        items.sort_by(|a, b| {
-            if value_lt(a, b) {
-                std::cmp::Ordering::Less
-            } else if value_lt(b, a) {
-                std::cmp::Ordering::Greater
+        let mut error = None;
+        items.sort_by(|(a, _), (b, _)| {
+            let ord = if error.is_some() {
+                Ok(std::cmp::Ordering::Equal)
             } else {
-                std::cmp::Ordering::Equal
-            }
+                i.value_cmp(a, b)
+            };
+            let ord = match ord {
+                Ok(o) => o,
+                Err(e) => {
+                    error.get_or_insert(e);
+                    std::cmp::Ordering::Equal
+                }
+            };
+            ord
         });
+        if let Some(e) = error {
+            return Err(e);
+        }
         items.truncate(n.max(0) as usize);
-        Ok(Value::List(Rc::new(RefCell::new(items))))
+        Ok(Value::List(Rc::new(RefCell::new(
+            items.into_iter().map(|(_, x)| x).collect(),
+        ))))
     });
     let nlargest = nf("nlargest", |i, args| {
         if args.len() < 2 {
             return Err(type_error("nlargest(n, iterable) takes 2 arguments"));
         }
         let n = args[0].to_int()?;
+        let key = args.get(2).filter(|k| !matches!(k, Value::None)).cloned();
         let it = i.make_iter(args[1].clone())?;
-        let mut items: Vec<Value> = Vec::new();
+        // `(sort key, item)`, ordered stably on the key alone.
+        let mut items: Vec<(Value, Value)> = Vec::new();
         while let Some(x) = i.iter_next(&it)? {
-            items.push(x);
+            let k = match &key {
+                Some(f) => i.call_value(f.clone(), vec![x.clone()], &[])?,
+                None => x.clone(),
+            };
+            items.push((k, x));
         }
-        items.sort_by(|a, b| {
-            if value_lt(b, a) {
-                std::cmp::Ordering::Less
-            } else if value_lt(a, b) {
-                std::cmp::Ordering::Greater
+        let mut error = None;
+        items.sort_by(|(a, _), (b, _)| {
+            let ord = if error.is_some() {
+                Ok(std::cmp::Ordering::Equal)
             } else {
-                std::cmp::Ordering::Equal
-            }
+                i.value_cmp(a, b)
+            };
+            let ord = match ord {
+                Ok(o) => o,
+                Err(e) => {
+                    error.get_or_insert(e);
+                    std::cmp::Ordering::Equal
+                }
+            };
+            ord.reverse()
         });
+        if let Some(e) = error {
+            return Err(e);
+        }
         items.truncate(n.max(0) as usize);
-        Ok(Value::List(Rc::new(RefCell::new(items))))
+        Ok(Value::List(Rc::new(RefCell::new(
+            items.into_iter().map(|(_, x)| x).collect(),
+        ))))
     });
     // `heappushpop(heap, item)`: push then pop, in one sift — the popped
     // value is `item` itself when it is no larger than the current root.
@@ -8421,7 +8846,7 @@ pub fn dict_is_frozen(d: &Rc<crate::value::FrozenCell<DictMap>>) -> bool {
 }
 
 // Frozen metadata lives outside user-visible container contents.
-pub fn set_is_frozen(s: &Rc<crate::value::FrozenCell<std::collections::HashSet<HashKey>>>) -> bool {
+pub fn set_is_frozen(s: &crate::value::RcSet) -> bool {
     s.frozen.get()
 }
 
@@ -8470,7 +8895,7 @@ fn deep_freeze_value(v: Value) -> Result<Value, Unwind> {
         }
         Value::Dict(d) => {
             // Frozen metadata lives outside user-visible container contents.
-            let mut new_map: DictMap = IndexMap::new();
+            let mut new_map: DictMap = DictMap::new();
             for (k, val) in d.borrow().iter() {
                 let frozen_val = deep_freeze_value(val.clone())?;
                 new_map.insert(k.clone(), frozen_val);
@@ -8481,7 +8906,8 @@ fn deep_freeze_value(v: Value) -> Result<Value, Unwind> {
         }
         Value::Set(s) => {
             // Frozen metadata lives outside user-visible container contents.
-            let elements: std::collections::HashSet<HashKey> = s.borrow().iter().cloned().collect();
+            // `frozenset(s)`: a copy of the set's table.
+            let elements = s.borrow().copy();
             Ok(Value::Set(Rc::new(crate::value::FrozenCell::frozen(
                 elements,
             ))))
@@ -8541,6 +8967,7 @@ fn make_pydantic_module() -> Value {
         fields: vec![],
         class_attrs: std::cell::RefCell::new(base_model_attrs),
         bases: vec![],
+        mro: vec![],
         properties: std::cell::RefCell::new(std::collections::HashSet::new()),
         classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
         is_exception: false,
@@ -8549,7 +8976,7 @@ fn make_pydantic_module() -> Value {
     let config_dict = nf("ConfigDict", |_i, _args| {
         // Accept any kwargs and ignore — purely a config-record stub.
         Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(
-            IndexMap::new(),
+            DictMap::new(),
         ))))
     });
     make_module(
@@ -8674,6 +9101,7 @@ pub(crate) fn native_object(class_name: &str, fields: Vec<(&str, Value)>) -> Val
         fields: vec![],
         class_attrs: RefCell::new(HashMap::new()),
         bases: vec![],
+        mro: vec![],
         properties: RefCell::new(std::collections::HashSet::new()),
         classmethods: RefCell::new(std::collections::HashSet::new()),
         is_exception: false,
@@ -9090,7 +9518,7 @@ fn dataclass_convert(v: &Value, as_tuple: bool) -> Value {
                     values.map(|(_, x)| dataclass_convert(x, true)).collect(),
                 ))
             } else {
-                let mut map: DictMap = IndexMap::new();
+                let mut map: DictMap = DictMap::new();
                 for (name, x) in values {
                     map.insert(HashKey::Str(Rc::new(name)), dataclass_convert(x, false));
                 }
@@ -9107,7 +9535,7 @@ fn dataclass_convert(v: &Value, as_tuple: bool) -> Value {
             t.iter().map(|x| dataclass_convert(x, as_tuple)).collect(),
         )),
         Value::Dict(d) => {
-            let mut map: DictMap = IndexMap::new();
+            let mut map: DictMap = DictMap::new();
             for (k, x) in d.borrow().iter() {
                 map.insert(k.clone(), dataclass_convert(x, as_tuple));
             }
@@ -9175,6 +9603,7 @@ thread_local! {
             .collect(),
         class_attrs: RefCell::new(HashMap::new()),
         bases: vec![],
+        mro: vec![],
         properties: RefCell::new(HashSet::new()),
         classmethods: RefCell::new(HashSet::new()),
         is_exception: false,
@@ -9216,6 +9645,281 @@ fn split_kwargs_map(args: &[Value]) -> (&[Value], HashMap<String, Value>) {
     (args, HashMap::new())
 }
 
+// ── Keyword arguments to builtin functions and methods ──────────────────
+
+/// A parameter's default, used to fill a position skipped over when a later
+/// parameter is given by keyword (`s.split(maxsplit=1)` is `s.split(None, 1)`).
+#[derive(Clone, Copy)]
+pub(crate) enum ParamDefault {
+    Required,
+    None,
+    Int(i64),
+    Bool(bool),
+    Str(&'static str),
+    Bytes(&'static [u8]),
+}
+
+impl ParamDefault {
+    fn value(self) -> Option<Value> {
+        Some(match self {
+            ParamDefault::Required => return None,
+            ParamDefault::None => Value::None,
+            ParamDefault::Int(n) => Value::Int(VmInt::from(n)),
+            ParamDefault::Bool(b) => Value::Bool(b),
+            ParamDefault::Str(t) => Value::Str(Rc::new(t.to_owned())),
+            ParamDefault::Bytes(b) => Value::Bytes(Rc::new(b.to_vec())),
+        })
+    }
+}
+
+/// What a builtin function or method accepts by keyword, after CPython
+/// 3.13's signature. `positional` lists the parameters that can be given
+/// either way, starting at position `first` (earlier ones are
+/// positional-only); a keyword naming one of them is moved into its
+/// position, so the implementation only ever reads positions. `keyword_only`
+/// names stay keywords (the implementation reads them from the kwargs
+/// sentinel), and `any_keyword` passes every keyword through (`**kwargs`).
+pub(crate) struct KeywordParams {
+    pub first: usize,
+    pub positional: &'static [(&'static str, ParamDefault)],
+    pub keyword_only: &'static [&'static str],
+    pub any_keyword: bool,
+}
+
+const fn kp(
+    first: usize,
+    positional: &'static [(&'static str, ParamDefault)],
+    keyword_only: &'static [&'static str],
+) -> KeywordParams {
+    KeywordParams {
+        first,
+        positional,
+        keyword_only,
+        any_keyword: false,
+    }
+}
+
+const ANY_KEYWORD: KeywordParams = KeywordParams {
+    first: 0,
+    positional: &[],
+    keyword_only: &[],
+    any_keyword: true,
+};
+
+use ParamDefault as D;
+
+const ENCODE: &[(&str, ParamDefault)] =
+    &[("encoding", D::Str("utf-8")), ("errors", D::Str("strict"))];
+const SPLIT: &[(&str, ParamDefault)] = &[("sep", D::None), ("maxsplit", D::Int(-1))];
+
+/// The keyword parameters of the builtin-type methods the VM implements
+/// (generated from `inspect.signature` under CPython 3.13). A method not
+/// listed takes no keyword arguments.
+pub(crate) fn method_keyword_params(ty: &str, method: &str) -> Option<KeywordParams> {
+    Some(match (ty, method) {
+        ("str", "encode") | ("bytes", "decode") => kp(0, ENCODE, &[]),
+        ("str" | "bytes", "expandtabs") => kp(0, &[("tabsize", D::Int(8))], &[]),
+        ("str" | "bytes", "split" | "rsplit") => kp(0, SPLIT, &[]),
+        ("str" | "bytes", "splitlines") => kp(0, &[("keepends", D::Bool(false))], &[]),
+        ("str", "replace") => kp(2, &[("count", D::Int(-1))], &[]),
+        ("str", "format") => ANY_KEYWORD,
+        ("bytes", "translate") => kp(1, &[("delete", D::Bytes(b""))], &[]),
+        ("bytes", "hex") => kp(0, &[("sep", D::None), ("bytes_per_sep", D::Int(1))], &[]),
+        ("list", "sort") => kp(0, &[], &["key", "reverse"]),
+        ("dict", "update") => ANY_KEYWORD,
+        // VM-internal: the `OrderedDict` shim drives its backing dict with
+        // these (`dict` itself has no such keywords).
+        ("dict", "popitem") => kp(0, &[], &["last"]),
+        ("dict", "move_to_end") => kp(1, &[("last", D::Bool(true))], &[]),
+        ("int" | "bool", "to_bytes") => kp(
+            0,
+            &[("length", D::Int(1)), ("byteorder", D::Str("big"))],
+            &["signed"],
+        ),
+        _ => return None,
+    })
+}
+
+/// Move keyword arguments that name positional parameters into their
+/// positions, check the rest, and return the call's arguments with any
+/// remaining keywords back in a sentinel. `display` names the callable in
+/// errors (`split`, or `str.count` for "takes no keyword arguments").
+pub(crate) fn bind_keywords(
+    params: Option<&KeywordParams>,
+    short_name: &str,
+    qualified_name: &str,
+    mut positional: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Vec<Value>, Unwind> {
+    if kwargs.is_empty() {
+        return Ok(positional);
+    }
+    let Some(params) = params else {
+        return Err(type_error(format!(
+            "{qualified_name}() takes no keyword arguments"
+        )));
+    };
+    if params.any_keyword {
+        positional.push(make_kwargs_sentinel(&kwargs));
+        return Ok(positional);
+    }
+    let mut by_position: Vec<Option<Value>> = vec![None; params.positional.len()];
+    let mut rest: Vec<(String, Value)> = Vec::new();
+    for (k, v) in kwargs {
+        if let Some(at) = params.positional.iter().position(|(p, _)| *p == k) {
+            let position = params.first + at;
+            if position < positional.len() {
+                return Err(type_error(format!(
+                    "argument for {short_name}() given by name ('{k}') and position ({})",
+                    position + 1
+                )));
+            }
+            by_position[at] = Some(v);
+        } else if params.keyword_only.contains(&k.as_str()) {
+            rest.push((k, v));
+        } else {
+            return Err(type_error(format!(
+                "{short_name}() got an unexpected keyword argument '{k}'"
+            )));
+        }
+    }
+    if let Some(last) = by_position.iter().rposition(Option::is_some) {
+        for (at, given) in by_position.into_iter().enumerate().take(last + 1) {
+            let position = params.first + at;
+            if position < positional.len() {
+                continue;
+            }
+            if position > positional.len() {
+                // A positional-only parameter before `first` is missing.
+                return Err(type_error(format!(
+                    "{short_name}() missing required argument (pos {})",
+                    positional.len() + 1
+                )));
+            }
+            let value = match given {
+                Some(v) => v,
+                None => params.positional[at].1.value().ok_or_else(|| {
+                    type_error(format!(
+                        "{short_name}() missing required argument '{}' (pos {})",
+                        params.positional[at].0,
+                        position + 1
+                    ))
+                })?,
+            };
+            positional.push(value);
+        }
+    }
+    if !rest.is_empty() {
+        positional.push(make_kwargs_sentinel(&rest));
+    }
+    Ok(positional)
+}
+
+/// The keyword parameters of native functions that have no bespoke
+/// keyword handling in [`call_with_kwargs`], in the positional order the
+/// native reads them. A keyword-only CPython parameter (`math.prod`'s
+/// `start`, `json.loads`'s hooks) is listed here too: the native takes it
+/// at that position.
+pub(crate) fn native_keyword_params(name: &str) -> Option<KeywordParams> {
+    const LOADS: &[(&str, ParamDefault)] = &[
+        ("cls", D::None),
+        ("object_hook", D::None),
+        ("parse_float", D::None),
+        ("parse_int", D::None),
+        ("parse_constant", D::None),
+        ("object_pairs_hook", D::None),
+    ];
+    Some(match name {
+        "round" => kp(0, &[("number", D::Required), ("ndigits", D::None)], &[]),
+        "int" => kp(1, &[("base", D::Int(10))], &[]),
+        "prod" => kp(1, &[("start", D::Int(1))], &[]),
+        "nlargest" | "nsmallest" => kp(
+            0,
+            &[
+                ("n", D::Required),
+                ("iterable", D::Required),
+                ("key", D::None),
+            ],
+            &[],
+        ),
+        "loads" => kp(1, LOADS, &[]),
+        "sleep" => kp(0, &[("delay", D::Required), ("result", D::None)], &[]),
+        "wait_for" => kp(1, &[("timeout", D::Required)], &[]),
+        "lru_cache" => kp(
+            0,
+            &[("maxsize", D::Int(128)), ("typed", D::Bool(false))],
+            &[],
+        ),
+        "load" => kp(1, LOADS, &[]),
+        _ => return None,
+    })
+}
+
+/// Whether native `name` accepts keyword `kw`: the bespoke keyword arms of
+/// [`call_with_kwargs`] (by what each reads), then the table above. `None`
+/// for a native that forwards keywords on (`partial`, `dict`, a shim class).
+pub(crate) fn native_accepts_keyword(name: &str, kw: &str) -> Option<bool> {
+    let bespoke: Option<&[&str]> = match name {
+        "enumerate" => Some(&["start"]),
+        "zip" => Some(&["strict"]),
+        "min" | "max" => Some(&["key", "default"]),
+        "sorted" => Some(&["key", "reverse"]),
+        // `repr=` / `compare=` / `init=` … are accepted but not modelled.
+        "field" => Some(&["default", "default_factory"]),
+        // `default=` / `cls=` / `skipkeys=` are accepted but not honoured.
+        "dumps" | "dump" => Some(&[
+            "indent",
+            "sort_keys",
+            "ensure_ascii",
+            "allow_nan",
+            "separators",
+            "check_circular",
+        ]),
+        "groupby" => Some(&["key", "iterable"]),
+        "print" => Some(&["sep", "end", "file", "flush"]),
+        "sum" => Some(&["start"]),
+        "gather" => Some(&["return_exceptions"]),
+        "Queue" => Some(&["maxsize"]),
+        "pow" => Some(&["base", "exp", "mod"]),
+        "Ok" => Some(&["value"]),
+        "Err" => Some(&["error"]),
+        "isclose" => Some(&["rel_tol", "abs_tol"]),
+        "nextafter" => Some(&["steps"]),
+        "property"
+        | "dict"
+        | "ConfigDict"
+        | "dataclass"
+        | "dataclasses.replace"
+        | "mkdir"
+        | "makedirs"
+        | "contextmanager_factory"
+        | "namedtuple"
+        | "open"
+        | "str"
+        | "bytes"
+        | "bytearray"
+        | "from_bytes"
+        | "partial"
+        | "partial_call"
+        | "compile"
+        | "match"
+        | "search"
+        | "fullmatch"
+        | "findall"
+        | "finditer"
+        | "sub"
+        | "subn"
+        | "split" => return None,
+        _ => None,
+    };
+    if let Some(names) = bespoke {
+        return Some(names.contains(&kw));
+    }
+    Some(native_keyword_params(name).is_some_and(|p| {
+        p.any_keyword || p.positional.iter().any(|(n, _)| *n == kw) || p.keyword_only.contains(&kw)
+    }))
+}
+
 pub fn dispatch_method(
     interp: &mut Interpreter,
     name: &str,
@@ -9225,6 +9929,30 @@ pub fn dispatch_method(
         .first()
         .cloned()
         .ok_or_else(|| type_error("method called without receiver"))?;
+    // Keywords arrive as a trailing sentinel (`call_value`); bind them to
+    // the method's CPython signature so every handler sees positions.
+    let args = {
+        let (pos, kw) = split_kwargs(&args);
+        if kw.is_empty() {
+            args
+        } else {
+            let ty = match &receiver {
+                Value::Set(s) if set_is_frozen(s) => "frozenset",
+                other => other.type_name(),
+            };
+            let params = method_keyword_params(ty, name);
+            if params.is_none() && !crate::interp::builtin_has_attr_pub(&receiver, name) {
+                // Not a method of this type: the handler's AttributeError.
+                pos.to_vec()
+            } else {
+                let qualified = format!("{ty}.{name}");
+                let mut bound =
+                    bind_keywords(params.as_ref(), name, &qualified, pos[1..].to_vec(), kw)?;
+                bound.insert(0, receiver.clone());
+                bound
+            }
+        }
+    };
     let (rest, kwargs) = split_kwargs_map(&args[1..]);
     // The universal dunders CPython exposes on every object. They are
     // ordinary methods there (`(5).__repr__()`, `"a".__len__()`), and the
@@ -9288,9 +10016,9 @@ pub fn dict_fromkeys(interp: &mut Interpreter, args: Vec<Value>) -> Result<Value
     let mut it = args.into_iter();
     let iterable = it
         .next()
-        .ok_or_else(|| type_error("fromkeys() expected at least 1 argument, got 0"))?;
+        .ok_or_else(|| type_error("fromkeys expected at least 1 argument, got 0"))?;
     let fill = it.next().unwrap_or(Value::None);
-    let mut map: DictMap = IndexMap::new();
+    let mut map: DictMap = DictMap::new();
     let iter = interp.make_iter(iterable)?;
     while let Some(k) = interp.iter_next(&iter)? {
         // Last write wins on a duplicate key, matching CPython.
@@ -9317,7 +10045,7 @@ pub fn str_maketrans(args: &[Value]) -> Result<Value, Unwind> {
             ))),
         }
     };
-    let mut map: DictMap = IndexMap::new();
+    let mut map: DictMap = DictMap::new();
     match args.len() {
         1 => {
             let Value::Dict(d) = &args[0] else {
@@ -9465,6 +10193,9 @@ fn str_method(
             let pieces: Vec<String> = match sep_arg {
                 Some(v) => {
                     let sep = v.py_str();
+                    if sep.is_empty() {
+                        return Err(value_error("empty separator"));
+                    }
                     split_with_sep(s, &sep, maxsplit, from_right)
                 }
                 None => split_whitespace_max(s, maxsplit, from_right),
@@ -9705,7 +10436,7 @@ fn str_method(
             Value::Str(Rc::new(s.strip_suffix(&p).unwrap_or(s).to_owned()))
         }
         "center" | "ljust" | "rjust" => {
-            let width = single(args, name)?.to_int()?.max(0) as usize;
+            let width = crate::limits::ssize_arg(single(args, name)?)?.max(0) as usize;
             // `fillchar` (optional) must be exactly one character.
             let fill = match args.get(1) {
                 Some(Value::Str(fs)) => {
@@ -9731,6 +10462,7 @@ fn str_method(
                 Value::Str(s.clone())
             } else {
                 let pad = width - len;
+                crate::limits::ensure_alloc_items(pad, fill.len_utf8())?;
                 let pad_str = |n: usize| fill.to_string().repeat(n);
                 let out = match name {
                     "ljust" => format!("{}{}", s, pad_str(pad)),
@@ -9750,11 +10482,12 @@ fn str_method(
             }
         }
         "zfill" => {
-            let width = single(args, "zfill")?.to_int().unwrap_or(0).max(0) as usize;
+            let width = crate::limits::ssize_arg(single(args, "zfill")?)?.max(0) as usize;
             let len = s.chars().count();
             if len >= width {
                 Value::Str(s.clone())
             } else {
+                crate::limits::ensure_alloc(width - len)?;
                 let pad = "0".repeat(width - len);
                 let out = if let Some(rest) = s.strip_prefix('-') {
                     format!("-{}{}", pad, rest)
@@ -9801,7 +10534,7 @@ fn str_method(
             // Expand tabs so the next column is a multiple of `tabsize`
             // (CPython semantics), resetting the column on newlines.
             let tabsize = match args.first() {
-                Some(v) => v.to_int()?.max(0) as usize,
+                Some(v) => crate::limits::c_int_arg(v)?.max(0) as usize,
                 None => 8,
             };
             let mut out = String::with_capacity(s.len());
@@ -9811,6 +10544,7 @@ fn str_method(
                     '\t' => {
                         if tabsize > 0 {
                             let spaces = tabsize - (column % tabsize);
+                            crate::limits::ensure_alloc(out.len().saturating_add(spaces))?;
                             out.push_str(&" ".repeat(spaces));
                             column += spaces;
                         }
@@ -10132,7 +10866,7 @@ fn str_format_inner(
                     None => {
                         // The default stringification honours a user
                         // `__str__` (via `str_of`), matching `print` / `str`.
-                        let default = interp.str_of(&value)?;
+                        let default = interp.format_default(&value, &spec)?;
                         if spec.is_empty() {
                             default
                         } else {
@@ -10389,7 +11123,7 @@ fn bytes_method(
         }
         "ljust" | "rjust" | "center" => {
             let width = match args.first() {
-                Some(v) => v.to_int()?.max(0) as usize,
+                Some(v) => crate::limits::ssize_arg(v)?.max(0) as usize,
                 None => return Err(type_error(format!("bytes.{name} requires a width"))),
             };
             let fill = match args.get(1) {
@@ -10399,6 +11133,7 @@ fn bytes_method(
             if b.len() >= width {
                 Value::Bytes(Rc::new(b.to_vec()))
             } else {
+                crate::limits::ensure_alloc(width)?;
                 let pad = width - b.len();
                 let mut out = Vec::with_capacity(width);
                 let (before, after) = match name {
@@ -10415,12 +11150,13 @@ fn bytes_method(
         }
         "zfill" => {
             let width = match args.first() {
-                Some(v) => v.to_int()?.max(0) as usize,
+                Some(v) => crate::limits::ssize_arg(v)?.max(0) as usize,
                 None => return Err(type_error("bytes.zfill requires a width")),
             };
             if b.len() >= width {
                 Value::Bytes(Rc::new(b.to_vec()))
             } else {
+                crate::limits::ensure_alloc(width)?;
                 // A leading sign stays in front of the zeros.
                 let signed = matches!(b.first(), Some(b'+') | Some(b'-'));
                 let mut out = Vec::with_capacity(width);
@@ -10442,7 +11178,9 @@ fn bytes_method(
         }
         "expandtabs" => {
             let size = match args.first() {
-                Some(v) if !matches!(v, Value::None) => v.to_int()?.max(0) as usize,
+                Some(v) if !matches!(v, Value::None) => {
+                    crate::limits::c_int_arg(v)?.max(0) as usize
+                }
                 _ => 8,
             };
             let mut out: Vec<u8> = Vec::with_capacity(b.len());
@@ -10451,6 +11189,7 @@ fn bytes_method(
                 match c {
                     b'\t' => {
                         let advance = if size == 0 { 0 } else { size - column % size };
+                        crate::limits::ensure_alloc(out.len().saturating_add(advance))?;
                         out.extend(std::iter::repeat_n(b' ', advance));
                         column += advance;
                     }
@@ -10879,7 +11618,7 @@ fn list_method(
             for (k, v) in &kw {
                 match k.as_str() {
                     "reverse" => reverse = v.truthy(),
-                    "key" => key_fn = Some(v.clone()),
+                    "key" => key_fn = Some(v.clone()).filter(|v| !matches!(v, Value::None)),
                     _ => {
                         return Err(type_error(format!(
                             "sort() got an unexpected keyword argument '{}'",
@@ -11030,6 +11769,8 @@ fn dict_method(
         )));
     }
     match name {
+        // A classmethod, reached through an instance (`{}.fromkeys(xs)`).
+        "fromkeys" if !dict_is_frozen(d) => dict_fromkeys(interp, args.to_vec()),
         "get" => {
             let k = interp.dict_probe_key(d, single(args, "get")?)?;
             let default = args.get(1).cloned().unwrap_or(Value::None);
@@ -11037,31 +11778,21 @@ fn dict_method(
         }
         "keys" => Ok(Value::DictView {
             kind: crate::value::DictViewKind::Keys,
-            items: d
-                .borrow()
-                .keys()
-                .cloned()
-                .map(HashKey::into_value)
-                .collect(),
+            dict: d.clone(),
         }),
         "values" => Ok(Value::DictView {
             kind: crate::value::DictViewKind::Values,
-            items: d.borrow().iter().map(|(_, v)| v.clone()).collect(),
+            dict: d.clone(),
         }),
         "items" => Ok(Value::DictView {
             kind: crate::value::DictViewKind::Items,
-            items: d
-                .borrow()
-                .iter()
-                .map(|(k, v)| Value::Tuple(Rc::new(vec![k.clone().into_value(), v.clone()])))
-                .collect(),
+            dict: d.clone(),
         }),
         "pop" => {
             let k = interp.dict_probe_key(d, single(args, "pop")?)?;
             let default = args.get(1).cloned();
-            // `shift_remove` preserves the insertion order of remaining
-            // keys (matches CPython `dict.pop` semantics).
-            match d.borrow_mut().shift_remove(&k) {
+            // Removal leaves the remaining keys in insertion order.
+            match d.borrow_mut().remove(&k) {
                 Some(v) => Ok(v),
                 None => default.ok_or_else(|| crate::error::key_error_for(&k.clone().into_value())),
             }
@@ -11095,7 +11826,7 @@ fn dict_method(
             let k = interp.dict_probe_key(d, single(args, "setdefault")?)?;
             let default = args.get(1).cloned().unwrap_or(Value::None);
             let mut m = d.borrow_mut();
-            Ok(m.entry(k).or_insert(default).clone())
+            Ok(m.get_or_insert(k, default).clone())
         }
         "clear" => {
             d.borrow_mut().clear();
@@ -11114,7 +11845,7 @@ fn dict_method(
             let popped = if last {
                 d.borrow_mut().pop()
             } else {
-                d.borrow_mut().shift_remove_index(0)
+                d.borrow_mut().pop_first()
             };
             match popped {
                 Some((k, v)) => Ok(Value::Tuple(Rc::new(vec![k.into_value(), v]))),
@@ -11123,30 +11854,25 @@ fn dict_method(
         }
         "move_to_end" => {
             // OrderedDict.move_to_end(key, last=True): reposition an existing
-            // key at either end, preserving the relative order of the rest
-            // (`shift_remove` keeps order; plain `swap_remove` would not).
+            // key at either end, preserving the relative order of the rest.
             let key = args
                 .first()
                 .ok_or_else(|| type_error("move_to_end() requires a key"))?;
             let key = interp.dict_probe_key(d, key)?;
-            let last = kw
-                .iter()
-                .find(|(k, _)| k == "last")
-                .map(|(_, v)| v.truthy())
+            let last = args
+                .get(1)
+                .or_else(|| kw.iter().find(|(k, _)| k == "last").map(|(_, v)| v))
+                .map(Value::truthy)
                 .unwrap_or(true);
             let mut m = d.borrow_mut();
-            let Some(v) = m.shift_remove(&key) else {
+            let Some(v) = m.remove(&key) else {
                 return Err(key_error(key.into_value().py_repr()));
             };
             if last {
                 m.insert(key, v);
             } else {
-                // Re-insert at the front in place. `shift_insert(0, ..)` shifts
-                // the existing entries up by one without rebuilding/reallocating
-                // the whole map — O(n) shift, no per-entry clone — so the LRU
-                // idiom `move_to_end(k, last=False)` stays linear rather than
-                // quadratic over a sequence of front-moves.
-                m.shift_insert(0, key, v);
+                // Re-insert at the front: O(n), as the rest shift up.
+                m.insert_first(key, v);
             }
             Ok(Value::None)
         }
@@ -11206,26 +11932,60 @@ fn dict_method(
 
 fn set_method(
     interp: &mut Interpreter,
-    s: &Rc<crate::value::FrozenCell<HashSet<HashKey>>>,
+    s: &crate::value::RcSet,
     name: &str,
     args: &[Value],
 ) -> Result<Value, Unwind> {
-    // Refuse mutators on a `freeze let`-tagged set so the VM matches
-    // the compile path's `frozenset` semantics (review thread codex
-    // and copilot on PR #147). Read-only methods are unaffected.
+    use crate::pyset::PySet;
+    let frozen = set_is_frozen(s);
+    let type_name = if frozen { "frozenset" } else { "set" };
+    // Refuse mutators on a frozenset (and a `freeze let`-tagged set) so the
+    // VM matches the compile path's `frozenset` semantics. Read-only
+    // methods are unaffected.
     let is_mutator = matches!(
         name,
-        "add" | "remove" | "discard" | "pop" | "clear" | "update"
+        "add"
+            | "remove"
+            | "discard"
+            | "pop"
+            | "clear"
+            | "update"
+            | "intersection_update"
+            | "difference_update"
+            | "symmetric_difference_update"
     );
-    if is_mutator && set_is_frozen(s) {
+    if is_mutator && frozen {
         return Err(attribute_error(format!(
             "'frozenset' object has no attribute '{}'",
             name
         )));
     }
+    let new_value = |set: PySet| {
+        let cell = crate::value::FrozenCell::new(set);
+        cell.frozen.set(frozen);
+        Value::Set(Rc::new(cell))
+    };
+    // The members of a non-set operand, in iteration order.
+    fn operand_keys(interp: &mut Interpreter, v: &Value) -> Result<Vec<HashKey>, Unwind> {
+        let it = interp.make_iter(v.clone())?;
+        let mut keys = Vec::new();
+        while let Some(x) = interp.iter_next(&it)? {
+            keys.push(interp.hash_key(&x)?);
+        }
+        Ok(keys)
+    }
+    // A set operand as a table (a set's own, a dict's keys, or the
+    // iterable collected as `set(it)` would).
+    fn operand_set(interp: &mut Interpreter, v: &Value) -> Result<PySet, Unwind> {
+        match v {
+            Value::Set(o) => Ok(o.borrow().clone()),
+            other => interp.set_from_value(other.clone()),
+        }
+    }
     match name {
         "add" => {
-            let k = interp.set_probe_key(s, single(args, "add")?)?;
+            let x = single(args, "add")?;
+            let k = interp.set_probe_key(s, x)?;
             s.borrow_mut().insert(k);
             Ok(Value::None)
         }
@@ -11237,70 +11997,153 @@ fn set_method(
             }
             Ok(Value::None)
         }
+        "pop" => {
+            if !args.is_empty() {
+                return Err(type_error(format!(
+                    "set.pop() takes no arguments ({} given)",
+                    args.len()
+                )));
+            }
+            match s.borrow_mut().pop() {
+                Some(k) => Ok(k.into_value()),
+                None => Err(Unwind::Exception(
+                    crate::error::VmException::new("KeyError", "'pop from an empty set'")
+                        .with_value(Value::Exception {
+                            kind: Rc::new("KeyError".to_owned()),
+                            message: Rc::new("'pop from an empty set'".to_owned()),
+                            args: Rc::new(vec![Value::Str(Rc::new(
+                                "pop from an empty set".to_owned(),
+                            ))]),
+                            chain: None,
+                        }),
+                )),
+            }
+        }
         "clear" => {
             s.borrow_mut().clear();
             Ok(Value::None)
         }
         "copy" => {
-            let result = crate::value::FrozenCell::new(s.borrow().clone());
-            result.frozen.set(set_is_frozen(s));
-            Ok(Value::Set(Rc::new(result)))
-        }
-        "union" | "intersection" | "difference" | "symmetric_difference" => {
-            let a = set_keys_no_sentinel(s);
-            let mut acc: HashSet<HashKey> = a;
-            for arg in args {
-                let b = value_to_key_set(arg)?;
-                acc = match name {
-                    "union" => acc.union(&b).cloned().collect(),
-                    "intersection" => acc.intersection(&b).cloned().collect(),
-                    "difference" => acc.difference(&b).cloned().collect(),
-                    _ => acc.symmetric_difference(&b).cloned().collect(),
-                };
+            // `frozenset.copy()` is the object itself.
+            if frozen {
+                return Ok(Value::Set(s.clone()));
             }
-            // A set operation on a `frozenset` yields a `frozenset` — carry the
-            // immutability sentinel over so the result stays read-only.
-            let result = crate::value::FrozenCell::new(acc);
-            result.frozen.set(set_is_frozen(s));
-            Ok(Value::Set(Rc::new(result)))
+            Ok(new_value(s.borrow().copy()))
         }
-        "issubset" | "issuperset" | "isdisjoint" => {
-            let a = set_keys_no_sentinel(s);
-            let b = value_to_key_set(single(args, name)?)?;
-            let result = match name {
-                "issubset" => a.is_subset(&b),
-                "issuperset" => a.is_superset(&b),
-                _ => a.is_disjoint(&b),
-            };
-            Ok(Value::Bool(result))
+        "union" => {
+            let mut acc = s.borrow().copy();
+            for arg in args {
+                if let Value::Set(o) = arg {
+                    if Rc::ptr_eq(o, s) {
+                        continue;
+                    }
+                }
+                interp.set_update_from(&mut acc, arg.clone())?;
+            }
+            Ok(new_value(acc))
         }
         "update" => {
             for arg in args {
-                let b = value_to_key_set(arg)?;
-                s.borrow_mut().extend(b);
+                if let Value::Set(o) = arg {
+                    if Rc::ptr_eq(o, s) {
+                        continue;
+                    }
+                }
+                let mut acc = std::mem::take(&mut *s.borrow_mut());
+                let r = interp.set_update_from(&mut acc, arg.clone());
+                *s.borrow_mut() = acc;
+                r?;
             }
             Ok(Value::None)
         }
-        _ => Err(attribute_error(format!("set has no method '{}'", name))),
-    }
-}
-
-/// The members of a set, excluding the internal `freeze let` sentinel.
-pub fn set_keys_no_sentinel(
-    s: &Rc<crate::value::FrozenCell<HashSet<HashKey>>>,
-) -> HashSet<HashKey> {
-    s.borrow().iter().cloned().collect()
-}
-
-/// Coerce a set-method argument (set / list / tuple / frozenset) into a key set.
-fn value_to_key_set(v: &Value) -> Result<HashSet<HashKey>, Unwind> {
-    match v {
-        Value::Set(other) => Ok(set_keys_no_sentinel(other)),
-        Value::List(l) => l.borrow().iter().map(|x| x.to_hash_key()).collect(),
-        Value::Tuple(t) => t.iter().map(|x| x.to_hash_key()).collect(),
-        _ => Err(type_error(format!(
-            "'{}' object is not a valid set operand",
-            v.type_name()
+        "intersection" | "intersection_update" => {
+            let mut acc = s.borrow().clone();
+            if args.is_empty() {
+                acc = acc.copy();
+            }
+            for arg in args {
+                acc = match arg {
+                    Value::Set(o) => acc.intersection(&o.borrow()),
+                    other => {
+                        let keys = operand_keys(interp, other)?;
+                        acc.intersection_keys(keys)
+                    }
+                };
+            }
+            if name == "intersection_update" {
+                *s.borrow_mut() = acc;
+                return Ok(Value::None);
+            }
+            Ok(new_value(acc))
+        }
+        "difference" | "difference_update" => {
+            let mut acc = if name == "difference" {
+                match args.first() {
+                    None => s.borrow().copy(),
+                    Some(Value::Set(o)) => s.borrow().difference(&o.borrow()),
+                    Some(Value::Dict(d)) => {
+                        let keys: PySet = d.borrow().keys().cloned().collect();
+                        s.borrow().difference(&keys)
+                    }
+                    Some(other) => {
+                        let keys = operand_keys(interp, other)?;
+                        let mut acc = s.borrow().copy();
+                        acc.difference_update_keys(keys);
+                        acc
+                    }
+                }
+            } else {
+                s.borrow().clone()
+            };
+            let rest = if name == "difference" {
+                args.get(1..).unwrap_or(&[])
+            } else {
+                args
+            };
+            for arg in rest {
+                match arg {
+                    Value::Set(o) if Rc::ptr_eq(o, s) => acc.clear(),
+                    Value::Set(o) => acc.difference_update(&o.borrow()),
+                    other => {
+                        let keys = operand_keys(interp, other)?;
+                        acc.difference_update_keys(keys);
+                    }
+                }
+            }
+            if name == "difference_update" {
+                *s.borrow_mut() = acc;
+                return Ok(Value::None);
+            }
+            Ok(new_value(acc))
+        }
+        "symmetric_difference" => {
+            let other = operand_set(interp, single(args, name)?)?;
+            Ok(new_value(s.borrow().symmetric_difference(&other)))
+        }
+        "symmetric_difference_update" => {
+            let arg = single(args, name)?;
+            if let Value::Set(o) = arg {
+                if Rc::ptr_eq(o, s) {
+                    s.borrow_mut().clear();
+                    return Ok(Value::None);
+                }
+            }
+            let other = operand_set(interp, arg)?;
+            s.borrow_mut().symmetric_difference_update(&other);
+            Ok(Value::None)
+        }
+        "issubset" | "issuperset" | "isdisjoint" => {
+            let other = operand_set(interp, single(args, name)?)?;
+            let a = s.borrow();
+            let result = match name {
+                "issubset" => a.is_subset(&other),
+                "issuperset" => a.is_superset(&other),
+                _ => a.is_disjoint(&other),
+            };
+            Ok(Value::Bool(result))
+        }
+        _ => Err(attribute_error(format!(
+            "'{type_name}' object has no attribute '{name}'"
         ))),
     }
 }
@@ -11325,6 +12168,11 @@ fn tuple_method(t: &Rc<Vec<Value>>, name: &str, args: &[Value]) -> Result<Value,
 }
 
 fn num_method(v: &Value, name: &str, args: &[Value]) -> Result<Value, Unwind> {
+    // `bool` is an `int` subclass: the int methods it does not override
+    // (`True.bit_length()`, `False.to_bytes(1)`) answer for its value.
+    if let (Value::Bool(b), "bit_length" | "bit_count" | "to_bytes" | "is_integer") = (v, name) {
+        return num_method(&Value::Int(VmInt::from(i64::from(*b))), name, args);
+    }
     match (v, name) {
         (Value::FloatData(crate::value::VmFloat { value: x, .. }), "is_integer") => {
             Ok(Value::Bool(x.fract() == 0.0 && x.is_finite()))
@@ -11414,7 +12262,14 @@ fn num_method(v: &Value, name: &str, args: &[Value]) -> Result<Value, Unwind> {
             let (pos, kw) = split_kwargs(args);
             let kwarg = |name: &str| kw.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
             let length = match pos.first().cloned().or_else(|| kwarg("length")) {
-                Some(n) => n.to_int()?.max(0) as usize,
+                Some(n) => {
+                    let n = crate::limits::ssize_arg(&n)?;
+                    if n < 0 {
+                        return Err(value_error("length argument must be non-negative"));
+                    }
+                    crate::limits::ensure_alloc(n as usize)?;
+                    n as usize
+                }
                 None => 1,
             };
             let big_endian = match pos.get(1).cloned().or_else(|| kwarg("byteorder")) {
@@ -11517,6 +12372,40 @@ pub struct JsonDumpOpts {
     /// "Object of type X is not JSON serializable" — but pydantic's
     /// `model_dump_json` renders nested models that way.
     pub instances_as_objects: bool,
+    /// `check_circular`: a container met again inside itself raises
+    /// `ValueError: Circular reference detected` (CPython's default).
+    pub check_circular: bool,
+}
+
+/// CPython's JSON encoder recurses through `Py_EnterRecursiveCall`, whose C
+/// recursion budget (10,000 in 3.13, less the frames below `json.dumps`)
+/// runs out at this nesting depth.
+const JSON_MAX_DEPTH: usize = 9998;
+
+/// The containers being encoded, by address (CPython's `markers`).
+type JsonMarkers = std::collections::HashSet<usize>;
+
+/// Enter a container at nesting `level`: the recursion limit, then the
+/// circular-reference check. `addr` is `None` for an empty container,
+/// which CPython writes before it consults its markers.
+fn json_enter(
+    level: usize,
+    addr: Option<usize>,
+    opts: &JsonDumpOpts,
+    markers: &mut JsonMarkers,
+) -> Result<(), Unwind> {
+    if level >= JSON_MAX_DEPTH {
+        return Err(Unwind::Exception(crate::error::VmException::new(
+            "RecursionError",
+            "maximum recursion depth exceeded while encoding a JSON object",
+        )));
+    }
+    if let (true, Some(addr)) = (opts.check_circular, addr) {
+        if !markers.insert(addr) {
+            return Err(value_error("Circular reference detected"));
+        }
+    }
+    Ok(())
 }
 
 impl JsonDumpOpts {
@@ -11530,6 +12419,7 @@ impl JsonDumpOpts {
             item_sep: ", ".to_owned(),
             key_sep: ": ".to_owned(),
             instances_as_objects: false,
+            check_circular: true,
         }
     }
 
@@ -11544,6 +12434,7 @@ impl JsonDumpOpts {
             item_sep: ",".to_owned(),
             key_sep: ":".to_owned(),
             instances_as_objects: true,
+            check_circular: true,
         }
     }
 }
@@ -11602,7 +12493,8 @@ pub fn json_dump_opts_from_kwargs(
                     _ => return Err(type_error("separators must be a pair of two strings")),
                 }
             }
-            "default" | "cls" | "skipkeys" | "check_circular" => {}
+            "check_circular" => opts.check_circular = interp.is_truthy(v)?,
+            "default" | "cls" | "skipkeys" => {}
             other => {
                 return Err(type_error(format!(
                     "dumps() got an unexpected keyword argument '{other}'"
@@ -11621,7 +12513,7 @@ pub fn json_dump_opts_from_kwargs(
 /// non-finite float under `allow_nan=False`.
 pub fn json_dumps_with(v: &Value, opts: &JsonDumpOpts) -> Result<String, Unwind> {
     let mut out = String::new();
-    json_write(v, opts, 0, &mut out)?;
+    json_write(v, opts, 0, &mut JsonMarkers::new(), &mut out)?;
     Ok(out)
 }
 
@@ -11643,6 +12535,31 @@ fn json_write(
     v: &Value,
     opts: &JsonDumpOpts,
     level: usize,
+    markers: &mut JsonMarkers,
+    out: &mut String,
+) -> Result<(), Unwind> {
+    // A container's address while it is being encoded, for the
+    // circular-reference markers.
+    let container = match v {
+        Value::List(l) => Some((Rc::as_ptr(l) as *const () as usize, l.borrow().is_empty())),
+        Value::Tuple(t) => Some((Rc::as_ptr(t) as *const () as usize, t.is_empty())),
+        Value::Dict(d) => Some((Rc::as_ptr(d) as *const () as usize, d.borrow().is_empty())),
+        _ => None,
+    };
+    if let Some((addr, empty)) = container {
+        json_enter(level, (!empty).then_some(addr), opts, markers)?;
+        let result = json_write_inner(v, opts, level, markers, out);
+        markers.remove(&addr);
+        return result;
+    }
+    json_write_inner(v, opts, level, markers, out)
+}
+
+fn json_write_inner(
+    v: &Value,
+    opts: &JsonDumpOpts,
+    level: usize,
+    markers: &mut JsonMarkers,
     out: &mut String,
 ) -> Result<(), Unwind> {
     match v {
@@ -11655,9 +12572,9 @@ fn json_write(
         Value::Str(s) => json_string_into(s, opts.ensure_ascii, out),
         Value::List(l) => {
             let items = l.borrow();
-            json_write_seq(&items, opts, level, out)?;
+            json_write_seq(&items, opts, level, markers, out)?;
         }
-        Value::Tuple(t) => json_write_seq(t, opts, level, out)?,
+        Value::Tuple(t) => json_write_seq(t, opts, level, markers, out)?,
         Value::Dict(d) => {
             let d = d.borrow();
             // (sort key, rendered key, value). Sorting uses the original
@@ -11679,7 +12596,7 @@ fn json_write(
             }
             let pairs: Vec<(String, &Value)> =
                 entries.into_iter().map(|(_, k, v)| (k, v)).collect();
-            json_write_object(&pairs, opts, level, out)?;
+            json_write_object(&pairs, opts, level, markers, out)?;
         }
         Value::Instance(inst) if opts.instances_as_objects && !inst.class.fields.is_empty() => {
             let fields = inst.fields.borrow();
@@ -11689,12 +12606,26 @@ fn json_write(
                     pairs.push((json_string(&f.name, opts.ensure_ascii), val));
                 }
             }
-            json_write_object(&pairs, opts, level, out)?;
+            json_enter(
+                level,
+                Some(Rc::as_ptr(inst) as *const () as usize),
+                opts,
+                markers,
+            )?;
+            let result = json_write_object(&pairs, opts, level, markers, out);
+            markers.remove(&(Rc::as_ptr(inst) as *const () as usize));
+            result?;
+        }
+        // A `str` / `int` / `float` subclass encodes as its value: a
+        // value-mixin enum member (`IntEnum`, `class Mode(str, Enum)`).
+        v @ Value::Instance(_) if crate::value::enum_mixin_value(v).is_some() => {
+            let inner = crate::value::enum_mixin_value(v).expect("checked by the guard");
+            json_write(&inner, opts, level, markers, out)?;
         }
         other => {
             return Err(type_error(format!(
                 "Object of type {} is not JSON serializable",
-                other.type_name()
+                other.type_display_name()
             )))
         }
     }
@@ -11705,6 +12636,7 @@ fn json_write_seq(
     items: &[Value],
     opts: &JsonDumpOpts,
     level: usize,
+    markers: &mut JsonMarkers,
     out: &mut String,
 ) -> Result<(), Unwind> {
     if items.is_empty() {
@@ -11717,7 +12649,7 @@ fn json_write_seq(
             out.push_str(&opts.item_sep);
         }
         json_newline(opts, level + 1, out);
-        json_write(item, opts, level + 1, out)?;
+        json_write(item, opts, level + 1, markers, out)?;
     }
     json_newline(opts, level, out);
     out.push(']');
@@ -11728,6 +12660,7 @@ fn json_write_object(
     pairs: &[(String, &Value)],
     opts: &JsonDumpOpts,
     level: usize,
+    markers: &mut JsonMarkers,
     out: &mut String,
 ) -> Result<(), Unwind> {
     if pairs.is_empty() {
@@ -11742,7 +12675,7 @@ fn json_write_object(
         json_newline(opts, level + 1, out);
         out.push_str(key);
         out.push_str(&opts.key_sep);
-        json_write(val, opts, level + 1, out)?;
+        json_write(val, opts, level + 1, markers, out)?;
     }
     json_newline(opts, level, out);
     out.push('}');
@@ -11763,10 +12696,16 @@ fn json_key(v: &Value, opts: &JsonDumpOpts) -> Result<String, Unwind> {
             json_string(&json_float(*x, opts.allow_nan)?, true)
         }
         Value::None => json_string("null", true),
+        // A value-mixin enum member keys as its value (`str` / `int`
+        // subclass).
+        v @ Value::Instance(_) if crate::value::enum_mixin_value(v).is_some() => {
+            let inner = crate::value::enum_mixin_value(v).expect("checked by the guard");
+            return json_key(&inner, opts);
+        }
         other => {
             return Err(type_error(format!(
                 "keys must be str, int, float, bool or None, not {}",
-                other.type_name()
+                other.type_display_name()
             )))
         }
     })
@@ -11853,6 +12792,7 @@ thread_local! {
             fields: vec![],
             class_attrs: RefCell::new(attrs),
             bases: vec![],
+            mro: vec![],
             properties: RefCell::new(HashSet::new()),
             classmethods: RefCell::new(HashSet::new()),
             is_exception: true,
@@ -11914,6 +12854,85 @@ pub(crate) fn json_loads_value(_interp: &mut Interpreter, raw: &Value) -> Result
             other.type_display_name()
         ))),
     }
+}
+
+/// `json.loads(…, cls=, object_hook=, parse_float=, parse_int=,
+/// parse_constant=, object_pairs_hook=)`: `hooks` are those six, by
+/// position. The object hooks run on each decoded object innermost-first,
+/// in document order — the order CPython's decoder completes them in.
+fn json_apply_hooks(
+    interp: &mut Interpreter,
+    value: Value,
+    hooks: &[Value],
+) -> Result<Value, Unwind> {
+    let hook = |at: usize| hooks.get(at).filter(|v| !matches!(v, Value::None)).cloned();
+    for (at, name) in [
+        (0, "cls"),
+        (2, "parse_float"),
+        (3, "parse_int"),
+        (4, "parse_constant"),
+    ] {
+        if hook(at).is_some() {
+            return Err(Unwind::Exception(crate::error::VmException::new(
+                "NotImplementedError",
+                format!(
+                    "json.loads({name}=...) is not modelled by the VM; run with `tyc run --compile`"
+                ),
+            )));
+        }
+    }
+    let pairs_hook = hook(5);
+    let object_hook = hook(1);
+    if pairs_hook.is_none() && object_hook.is_none() {
+        return Ok(value);
+    }
+    fn walk(
+        interp: &mut Interpreter,
+        v: Value,
+        pairs_hook: &Option<Value>,
+        object_hook: &Option<Value>,
+    ) -> Result<Value, Unwind> {
+        match v {
+            Value::List(l) => {
+                let items: Vec<Value> = l.borrow().clone();
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    out.push(walk(interp, item, pairs_hook, object_hook)?);
+                }
+                Ok(Value::List(Rc::new(RefCell::new(out))))
+            }
+            Value::Dict(d) => {
+                let entries: Vec<(HashKey, Value)> = d
+                    .borrow()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                let mut decoded = Vec::with_capacity(entries.len());
+                for (k, item) in entries {
+                    decoded.push((k, walk(interp, item, pairs_hook, object_hook)?));
+                }
+                if let Some(h) = pairs_hook {
+                    let pairs: Vec<Value> = decoded
+                        .into_iter()
+                        .map(|(k, v)| Value::Tuple(Rc::new(vec![k.into_value(), v])))
+                        .collect();
+                    return interp.call_value(
+                        h.clone(),
+                        vec![Value::List(Rc::new(RefCell::new(pairs)))],
+                        &[],
+                    );
+                }
+                let map: DictMap = decoded.into_iter().collect();
+                let obj = Value::Dict(Rc::new(crate::value::FrozenCell::new(map)));
+                match object_hook {
+                    Some(h) => interp.call_value(h.clone(), vec![obj], &[]),
+                    None => Ok(obj),
+                }
+            }
+            other => Ok(other),
+        }
+    }
+    walk(interp, value, &pairs_hook, &object_hook)
 }
 
 fn json_loads(s: &str) -> Result<Value, Unwind> {
@@ -11995,7 +13014,7 @@ impl JsonParser<'_> {
     }
     fn parse_object(&mut self) -> Result<Value, Unwind> {
         self.pos += 1; // {
-        let mut map: DictMap = IndexMap::new();
+        let mut map: DictMap = DictMap::new();
         self.skip_ws();
         if self.peek() == Some('}') {
             self.pos += 1;
@@ -12208,7 +13227,7 @@ const KWARGS_MARKER: &str = "__typhon_kwargs_sentinel__";
 
 /// Encode keyword arguments as a sentinel tuple appended to a method's args.
 pub fn make_kwargs_sentinel(kwargs: &[(String, Value)]) -> Value {
-    let mut m: DictMap = IndexMap::new();
+    let mut m: DictMap = DictMap::new();
     for (k, v) in kwargs {
         m.insert(HashKey::Str(Rc::new(k.clone())), v.clone());
     }
@@ -12253,6 +13272,11 @@ pub fn call_with_kwargs(
     kwargs: &[(String, Value)],
 ) -> Result<Value, Unwind> {
     match n.name {
+        // property(fget=..., fset=..., fdel=..., doc=...)
+        "property" => {
+            let cls = descriptor_shim_class(interp, "property")?;
+            interp.call_value(cls, args, kwargs)
+        }
         // enumerate(iterable, start=N)
         "enumerate" => {
             let mut start: i64 = 0;
@@ -12416,11 +13440,11 @@ pub fn call_with_kwargs(
             for (k, v) in kwargs {
                 match k.as_str() {
                     "reverse" => reverse = v.truthy(),
-                    "key" => key_fn = Some(v.clone()),
+                    // `key=None` is the identity, as in CPython.
+                    "key" => key_fn = Some(v.clone()).filter(|v| !matches!(v, Value::None)),
                     _ => {
                         return Err(type_error(format!(
-                            "sorted() got unexpected keyword: '{}'",
-                            k
+                            "sort() got an unexpected keyword argument '{k}'"
                         )))
                     }
                 }
@@ -12778,16 +13802,17 @@ pub fn call_with_kwargs(
             args.push(make_kwargs_sentinel(kwargs));
             (n.func)(interp, args)
         }
-        _ => {
-            if kwargs.is_empty() {
+        _ => match native_keyword_params(n.name) {
+            Some(params) => {
+                let args = bind_keywords(Some(&params), n.name, n.name, args, kwargs.to_vec())?;
                 (n.func)(interp, args)
-            } else {
-                Err(type_error(format!(
-                    "{}() does not accept keyword arguments",
-                    n.name
-                )))
             }
-        }
+            None if kwargs.is_empty() => (n.func)(interp, args),
+            None => Err(type_error(format!(
+                "{}() does not accept keyword arguments",
+                n.name
+            ))),
+        },
     }
 }
 
@@ -12827,6 +13852,7 @@ pub fn make_builtin_type(name: &str) -> Value {
                     fields: vec![],
                     class_attrs: std::cell::RefCell::new(HashMap::new()),
                     bases: vec![],
+                    mro: vec![],
                     properties: std::cell::RefCell::new(std::collections::HashSet::new()),
                     classmethods: std::cell::RefCell::new(std::collections::HashSet::new()),
                     is_exception: false,

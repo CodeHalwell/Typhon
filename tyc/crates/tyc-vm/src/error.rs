@@ -54,6 +54,9 @@ pub struct Frame {
     pub file: Option<String>,
     /// The source line's text, for CPython-style traceback rendering.
     pub line_text: Option<String>,
+    /// How many more times this identical frame repeats directly below
+    /// itself (deep recursion is stored run-length encoded).
+    pub repeat: u32,
 }
 
 impl VmException {

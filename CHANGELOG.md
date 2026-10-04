@@ -523,6 +523,138 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   dataclass instance returns the same object, and enum members, dates,
   times, timedeltas, timezones and paths pass through unchanged, as in the
   emitted runtime.
+- **C3 method resolution and live class namespaces** (W5-07). The VM
+  computes each class's `__mro__` by C3 and resolves attributes, `super()`
+  and `__mro__` through it, instead of walking bases depth-first and
+  copying every base's methods and class attributes into each subclass at
+  creation. A diamond `D(B, C)` now resolves `D > B > C > A` (it printed
+  `D>B>A`, and a cooperative `__init__` diamond skipped a base); an
+  attribute set on a base after a subclass exists is visible through it; a
+  subclass's own class attribute shadows an inherited method; an
+  inconsistent base order raises CPython's MRO `TypeError`. Also fixed
+  along the way: `classmethod(f)` / `staticmethod(f)` / `property(f)`
+  called as functions bind correctly (`cls` was left unbound and a
+  property read returned a method), `super()` finds class attributes,
+  works inside classmethods and as a value (`super().name`),
+  `__init_subclass__` and `__set_name__` run at class creation, data
+  descriptors' `__set__` / `__delete__` and `@prop.deleter` are honoured,
+  and `del Cls.attr` / `delattr(Cls, …)` work.
+- **Sets iterate in CPython's order** (W5-08). VM sets were a Rust
+  `HashSet` with a random seed — a different iteration order on every
+  run — while `repr` sorted, so the VM even disagreed with itself
+  (`s = {-1, 0, 1}; print(s, list(s))`). Sets are now a reproduction of
+  CPython's table with CPython's hashes, so iteration, `repr`, `pop()` and
+  every set operation match CPython (`{5, 3, 1, 100, 33, 2}` prints
+  `{1, 33, 3, 100, 5, 2}`; strings match under `PYTHONHASHSEED=0`). Also:
+  the set methods accept any iterable; `pop`, `intersection_update`,
+  `difference_update` and `symmetric_difference_update` exist;
+  `frozenset | set` is a `frozenset`; `isinstance(frozenset(), set)` is
+  `False`; `frozenset(f) is f`.
+- **Value-mixin enums behave as their value** (W5-10). `class Mode(str,
+  Enum)` members compared unequal to their string (`Mode.FAST == "fast"`
+  was `False`, `{"fast": 1}.get(Mode.FAST)` was `None`), `class L(int,
+  Enum)` likewise, and `isinstance(IntEnum.X, int)` was `False`. Members
+  of `IntEnum` / `StrEnum` / `IntFlag` and of data-type-mixin enums now
+  equal, hash and order as their value (in containers and dict keys too,
+  keeping member identity), are instances of the value's type, encode in
+  `json` as the value, and `str()` / `format()` follow CPython 3.12+.
+  `StrEnum`'s `auto()` gives the lower-cased name, and duplicate values
+  become aliases.
+- **Changing a dict or set while iterating it raises** (W5-11). Adding
+  or removing keys inside `for k in d:` completed silently on the VM;
+  CPython raises `RuntimeError: dictionary changed size during
+  iteration` (and `Set changed size during iteration`). Dict and set
+  iterators now walk the live container and raise the same errors. Dict
+  views (`keys()` / `values()` / `items()`) became live views of the dict
+  rather than snapshots (`k in d.keys()` is a lookup), and `reversed()`
+  of a list / dict is live while refusing non-sequences as CPython does.
+- **Oversized results raise instead of aborting `tyc run`** (W5-12).
+  `"a" * 2**62`, `bytes(2**62)`, `zfill` / `ljust` / `rjust` / `center`,
+  `to_bytes`, `os.urandom` and huge f-string / `format` widths aborted the
+  process (exit 134) and `bytes(2**63)` panicked; they now raise CPython's
+  `MemoryError` / `OverflowError`. Float precisions of 65,536 and more
+  panicked in Rust's formatter and now format exactly ("precision too big"
+  past `INT_MAX`); `round(x, n)` clamps `n` as CPython does. A
+  self-referential `json.dumps` overflowed the native stack and now
+  raises `ValueError: Circular reference detected` (`RecursionError`
+  past 9,997 levels). A raised `sys.setrecursionlimit` no longer lets deep
+  recursion overflow the native stack: the VM checks its remaining stack
+  on every call and raises `RecursionError`. `repr` of nested lists past
+  100 levels printed `[...]`; it now detects self-reference by identity,
+  as CPython does, and raises `RecursionError` only past CPython's depth,
+  where deep `==` / `<` likewise raise instead of answering `False` /
+  `TypeError`.
+- **`as!` on the VM follows the checked-cast target table** (W5-16).
+  The VM's cast check disagreed with the compiled runtime in both
+  directions: newtypes and `Literal` targets accepted anything, `type`
+  aliases (`IntList`, `Pair[int]`) were rejected outright or accepted
+  without looking, `Sequence[int]` / `Mapping[...]` skipped their
+  elements, an `interface` with only data members accepted any value, and
+  `Box[int]` / `Callable[...]` were accepted where the runtime refuses
+  them. The VM now expands aliases from their definitions, checks a
+  newtype's declared base, and matches `typhon_runtime/cast.py` case by
+  case, including its refusals and its failure messages.
+- **`freeze let` values match the runtime's** (W5-17). A frozen dict
+  reported `type(D).__name__ == "dict"` and `isinstance(D, dict)` on the
+  VM; the generated runtime makes it a `mappingproxy`, which is not a
+  `dict`. Both now agree. (Frozen dataclass instances already passed
+  through unchanged; a parity test now pins that against the runtime.)
+- **Remaining silent VM divergences closed** (W5-18). The VM now matches
+  CPython on: correctly rounded float `repr` ties; `OverflowError` for
+  ints too large for a float (`float(10**400)`, `10**400 // 3.0`), for
+  `2.0**10000` and for an over-large `int / int` (now correctly rounded:
+  `10**400 / 10**399` is `10.0`, not `nan`); the 4,300-digit int/str
+  limit with `sys.get/set_int_max_str_digits`; `f"{x!s:<8}"`;
+  `f"{None:>6}"`, `format(1, ',_')`, `'%c' % 0x110000`, `'abc'.split('')`
+  and `1 in "abc"` raising; huge slice bounds clipping and huge indices
+  raising `IndexError`; `raise e from e`; `iter(g) is g`;
+  `True.bit_length()`; set-like comparisons of keys / items views;
+  `dict.fromkeys` / `str.maketrans` (dispatched on their first argument
+  before — the lead's `corpus/valid/textwrap.ty` case); three-argument
+  `type()`; class decorators (they were silently skipped, so
+  `@total_ordering` and registry decorators had no effect);
+  `Cls.__dict__`; abstract-class instantiation errors;
+  `@dataclass(order=True)` and `repr=False`; 3.13 docstring dedenting;
+  `in` through `__iter__` / `__getitem__`; `__await__`; `NotImplemented`;
+  `Box[int]` / `list[int]` generic aliases (and `class Named(Box[int])`);
+  runtime `int | str` unions in `isinstance`. The remaining known gaps
+  (type-alias objects, `__del__`, metaclasses, lone surrogates) are listed
+  in `docs/vm.md`.
+- **Four VM performance cliffs are linear now** (W5-22). `del d[k]` /
+  `d.pop(k)` shifted every later key (draining 80k keys took 19 s, now
+  0.03 s): a dict deletes by leaving a hole, as CPython's does.
+  `OrderedDict.popitem(last=False)` (47.8 s for 60k items, now 0.16 s),
+  `deque.popleft` / `appendleft`, and `len(s)` / `s[i]` / `s[a:b]` on a
+  long string no longer rescan their whole container per call; `len()`
+  of a dict or set no longer counts its keys. An exhausted dict or set
+  iterator now ignores later mutation (it raised `RuntimeError` where
+  CPython raises `StopIteration`).
+- **Keyword arguments bind like CPython's, and the pre-run scan covers
+  builtins and keywords** (W5-21, partial). Builtin-type methods bind
+  keywords to their 3.13 signatures — before, a keyword reached most
+  methods as a stray positional tuple (`s.replace("a", "b", count=2)`
+  raised, `b.hex(sep=":")` was silently ignored, `d.get(k, default=0)`
+  returned `None` where CPython raises). `round(ndigits=)`, `int(base=)`,
+  `math.prod(start=)`, `heapq.nlargest(key=)`, `json.loads(object_hook=)`
+  and friends are accepted. `tyc run` routes a program to the compiled
+  path when it uses a CPython builtin the VM lacks (`exec`, `memoryview`,
+  `globals`, …), `.add_note()`, or a keyword the VM would reject or
+  ignore.
+- **One front end for every VM entry point** (W5-20). The entry program,
+  imported sibling modules and the embedded stdlib shims all go through
+  `tyc_syntax::preprocess::expand_and_preprocess_mapped` — the chain
+  `tyc check` and `tyc build` run — instead of two hand-assembled copies
+  that had drifted (they ran `expand_lazy_lets` before
+  `expand_typed_let_unpack`, the reverse of the canonical order).
+- **VM tracebacks report the `.ty` source** (W5-19). Frames carry the line
+  the user wrote and its text — an 8-line file with one `?` no longer
+  reports `line 10`, and an `as!` frame no longer shows
+  `__typhon_checked_cast__(…)`. Uncaught chained exceptions print their
+  cause / context sections, deep recursion collapses into "[Previous line
+  repeated N more times]", and a user-raised `KeyError` keeps its quotes.
+  The recursion limit now counts the module frame, so a program that
+  catches `RecursionError` sees the depth CPython reports (one less than
+  before).
 
 #### W6 — CI, docs & hygiene
 
