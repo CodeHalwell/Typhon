@@ -157,7 +157,7 @@ grouped by workstream (W1–W7).
 
 - W2-04: checked casts expand transparent and concrete generic aliases, enforce Literal membership, preserve NewType base checks, and terminate recursive/cyclic values. Bare parameters and unsupported parameterised contracts are refused; `docs/language.md` records the supported-target table. The emitted CPython runtime rejects the JSON alias repro at the cast.
 
-- W2-02: debug builds support `TYC_REPORT_UNCHECKED=1 tyc check PATH`, reporting per-file Unknown annotation, return and member sites without changing severity. Examples baseline after builtin typing: 266 files, 206 annotated sites, 179 returns, 952 member sites (1337 total). Per-file counts are saved in `code_review/w2-codex/unchecked-examples-baseline.csv`.
+- W2-02: debug builds support `TYC_REPORT_UNCHECKED=1 tyc check PATH`, reporting per-file Unknown annotation, return and member sites without changing severity. Examples baseline after builtin typing: 266 files, 206 annotated sites, 179 returns, 952 member sites (1337 total). Per-file counts are kept with the W2 reports on the `fix/W2-codex` branch.
 
 - W2-03: shared fields and properties on unions return the union of their types. Direct method calls must satisfy every variant's arity and parameter types and return the union of their results, with generic receiver parameters substituted and async methods returning coroutines.
 
@@ -166,6 +166,20 @@ grouped by workstream (W1–W7).
 - W2-20: `check_module_with_imports_and_types` exposes the checker's contextual expression types by preprocessed-source byte span, including Callable lambda parameters and match captures, for extension lowering.
 
 - W2-01: builtin calls retain their result and iterator element types, including per-call overloads for `round`, `min`/`max`, numeric conversions and container constructors. `super()` resolves the base method contract. Fresh container copies may widen their elements; constant-false expression branches do not introduce diagnostics. The 1,481-unit checker corpus retains its baseline; no newly rejected unit was added.
+
+- W2-06: `Callable` contracts are enforced: aliases respect defaults and maximum arity, a positional `Callable` rejects keyword substitution, class factories are accepted, ParamSpec keeps argument shapes and keyword names, and unions of functions and lambdas stay callable.
+- W2-07: `await` operands are checked on concrete names and fields, and stored coroutines keep their wrapper type.
+- W2-08: powers and augmented assignments are typed by their result. A provably negative integer exponent (`2 ** -1`, `n **= -1`) gives `float`; an exponent of unknown sign keeps `int`, so `def power(base: int, exp: int) -> int` still checks. `bool += int` and nullable augmented operands are rejected.
+- W2-09: `@dataclass(order=True)` ordering is recognised, plain enum ordering is rejected unless caught, and `in` on a `str` requires a `str` operand.
+- W2-10: `gather` results, `go` task handles, exception-mapper parameters and chained `Result` combinators carry their inferred types.
+- W2-11: `go` on a callee known to be synchronous (including sync aliases and callable parameters) is rejected.
+- W2-12: generic type parameters stay rigid inside nested types in a generic body.
+- W2-13: newtypes keep their base type's method contracts (`Email.split()` is `list[str]`), and distinct string newtypes do not mix.
+- W2-14: container writes check keys, indices and `update()` payloads.
+- W2-15: interface conformance rejects covariant mutable fields, frozen implementations of writable fields, getter-only properties for writable members, and incompatible parameter names.
+- W2-16: property and `ClassVar` writes are checked, with inherited slot semantics.
+- W2-17: builtin constructors accept their keywords (int methods, enum and builtin-subclass constructors, positional-only parameters, `isinstance` union targets); a nullable `len()` argument reports one diagnostic.
+- W2-18: the class-attribute slot lint fires only on class-level accesses, and the `Result` error wording covers plain returns as well as `?`.
 
 #### W3 — cross-module & analysis passes
 
@@ -251,7 +265,9 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   and NaN dict keys match CPython's identity-first comparison.
 - **The frozen marker no longer collides with user data** (W5-15). Frozen
   dicts and sets carry the flag outside their contents; freezing a frozen
-  dataclass instance returns the same object.
+  dataclass instance returns the same object, and enum members, dates,
+  times, timedeltas, timezones and paths pass through unchanged, as in the
+  emitted runtime.
 
 #### W6 — CI, docs & hygiene
 
