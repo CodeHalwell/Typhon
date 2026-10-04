@@ -730,6 +730,33 @@ fn unmodelled_attribute_references(
         }
         missing.insert(format!("{module}.{member}"));
     }
+    // Task scheduling (see `ASYNC_SCHEDULING`). `go` and `gather:` arrive
+    // here already expanded, to `typhon_runtime.tasks.spawn(…)` and an
+    // `asyncio.TaskGroup` (or `asyncio.gather`).
+    for (root, chain, _) in &scan.loads {
+        if root == "typhon_runtime"
+            && chain.len() == 2
+            && chain[0] == "tasks"
+            && chain[1] == "spawn"
+        {
+            missing.insert("go (CPython task scheduling)".into());
+            continue;
+        }
+        let Some(first) = chain.first() else {
+            continue;
+        };
+        if !scan.shadowed.contains(root)
+            && scan.aliases.get(root).is_some_and(|m| m == "asyncio")
+            && ASYNC_SCHEDULING.contains(&first.as_str())
+        {
+            missing.insert(format!("asyncio.{first} (CPython task scheduling)"));
+        }
+    }
+    for (module, member) in &scan.from_imports {
+        if module == "asyncio" && ASYNC_SCHEDULING.contains(&member.as_str()) {
+            missing.insert(format!("asyncio.{member} (CPython task scheduling)"));
+        }
+    }
     missing
 }
 
@@ -774,6 +801,41 @@ enum KeywordCallee {
 /// Attributes of builtin values the VM does not model, which a program
 /// reaches only by name (`e.add_note(…)`, `e.__notes__`).
 const UNMODELLED_ATTRIBUTES: &[&str] = &["add_note", "__notes__"];
+
+/// `asyncio` members whose effect depends on CPython's event-loop
+/// scheduling. The VM runs a coroutine to completion as soon as it is
+/// created, so a program that creates tasks, waits on several, or bounds
+/// an await in time interleaves (and times out) differently: a task body
+/// printed before `create_task` returned, `wait_for` ignored its timeout.
+const ASYNC_SCHEDULING: &[&str] = &[
+    "Barrier",
+    "BoundedSemaphore",
+    "Condition",
+    "Event",
+    "LifoQueue",
+    "Lock",
+    "PriorityQueue",
+    "Queue",
+    "Runner",
+    "Semaphore",
+    "TaskGroup",
+    "all_tasks",
+    "as_completed",
+    "create_task",
+    "current_task",
+    "ensure_future",
+    "gather",
+    "get_event_loop",
+    "get_running_loop",
+    "new_event_loop",
+    "run_coroutine_threadsafe",
+    "shield",
+    "timeout",
+    "timeout_at",
+    "to_thread",
+    "wait",
+    "wait_for",
+];
 
 impl AttributeScan {
     fn define(&mut self, path: String, at: usize) {
@@ -1179,6 +1241,37 @@ mod tests {
             scan_source("import json\nimport math\nprint(round(2.5, ndigits=0), int(\"ff\", base=16), math.prod([2], start=3), json.loads(\"{}\", object_hook=dict), \"a b\".split(maxsplit=1))\n"),
             None
         );
+    }
+
+    #[test]
+    fn scan_routes_task_scheduling_to_cpython() {
+        let task = "import asyncio\nasync def w() -> None:\n    await asyncio.sleep(0)\nasync def main() -> None:\n    let t = asyncio.create_task(w())\n    print(\"created\")\n    await t\nasyncio.run(main())\n";
+        let got = scan_source(task).unwrap_or_default();
+        assert!(
+            got.contains(&"asyncio.create_task (CPython task scheduling)".to_owned()),
+            "{got:?}"
+        );
+        let from = "from asyncio import wait_for\nimport asyncio\nasync def w() -> int:\n    await asyncio.sleep(0)\n    return 1\nasync def main() -> None:\n    print(await wait_for(w(), 0.5))\nasyncio.run(main())\n";
+        let got = scan_source(from).unwrap_or_default();
+        assert!(
+            got.contains(&"asyncio.wait_for (CPython task scheduling)".to_owned()),
+            "{got:?}"
+        );
+        let go = "import asyncio\nasync def w() -> None:\n    await asyncio.sleep(0)\nasync def main() -> None:\n    go w()\n    await asyncio.sleep(0)\nasyncio.run(main())\n";
+        let got = scan_source(go).unwrap_or_default();
+        assert!(
+            got.contains(&"go (CPython task scheduling)".to_owned()),
+            "{got:?}"
+        );
+        let gather = "import asyncio\nasync def w(n: int) -> int:\n    await asyncio.sleep(0)\n    return n\nasync def main() -> None:\n    gather:\n        a = w(1)\n        b = w(2)\n    print(a, b)\nasyncio.run(main())\n";
+        let got = scan_source(gather).unwrap_or_default();
+        assert!(
+            got.contains(&"asyncio.TaskGroup (CPython task scheduling)".to_owned()),
+            "{got:?}"
+        );
+        // Plain sequential awaits schedule nothing: they stay on the VM.
+        let sequential = "import asyncio\nasync def w() -> int:\n    await asyncio.sleep(0)\n    return 1\nasync def main() -> None:\n    let v = await w()\n    print(v)\nasyncio.run(main())\n";
+        assert_eq!(scan_source(sequential), None);
     }
 
     #[test]

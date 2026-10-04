@@ -73,6 +73,8 @@ $ tyc run main.ty
 note: `sqlite3` is not modelled by the in-process VM — running via `--compile` (build + CPython) so the program behaves as it does after `tyc build`. Pass `--no-fallback` to require the VM.
 ```
 
+**Programs that schedule tasks take this path too.** The VM's scheduler is sequential: it runs a coroutine to completion as soon as it is created. A program that uses `go`, `gather:`, or an `asyncio` member whose effect depends on the event loop (`create_task`, `gather`, `wait`, `wait_for`, `timeout`, `as_completed`, `TaskGroup`, `shield`, `to_thread`, the queues and locks, the event-loop accessors) would print in a different order or ignore a timeout, so it runs on CPython. A program that only awaits coroutines one after another stays on the VM.
+
 **`re` always takes this path.** A program that imports `re` runs on compiled CPython under a normal `tyc run`, so dynamic patterns, lookaround, backreferences and every Python regex flag keep CPython's semantics. The VM has its own `re` subset (backed by a Rust regex engine, honouring `re.ASCII` for the patterns it supports); it is used only with `--no-fallback`, where unsupported syntax or flags raise an error instead of matching differently:
 
 ```python

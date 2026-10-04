@@ -476,6 +476,18 @@ VM lacks (`exec`, `eval`-style `compile`, `memoryview`, `globals`,
 module function a keyword the VM would reject or ignore
 (`json.dumps(default=)`, `dataclasses.field(repr=)`, `json.loads(parse_float=)`).
 
+A program that **schedules tasks** takes the compiled path too (W5-09):
+one that uses `go`, `gather:`, or an `asyncio` member whose effect
+depends on the event loop — `create_task`, `ensure_future`, `gather`,
+`wait`, `wait_for`, `timeout` / `timeout_at`, `as_completed`,
+`TaskGroup`, `shield`, `to_thread`, `Queue` and the other queues,
+`Lock` / `Event` / `Condition` / `Semaphore` / `Barrier`, `Runner`,
+`current_task` / `all_tasks`, and the event-loop accessors. The VM's
+scheduler is sequential: it runs a coroutine to completion when it is
+created, so such a program would print in a different order or ignore a
+timeout. A program that only awaits coroutines one after another stays
+on the VM. `--no-fallback` keeps the VM, with its sequential ordering.
+
 ## Multi-file projects
 
 Since v0.9.0 the VM loads sibling `.ty` modules from the project source
@@ -581,10 +593,12 @@ message:
   between exceptions collected from handler bodies, and an uncaught group
   prints the summary line (`ExceptionGroup: g (2 sub-exceptions)`) rather
   than CPython's nested `+-+---- 1 ----` traceback tree. Inherent to
-  sequential execution: the VM cannot cancel sibling tasks, so a
-  multi-failure `gather:` may report more members than CPython would — and
-  the body of a `TaskGroup` sees a failed task's exception at the `await`
-  rather than the `CancelledError` a real cancellation would deliver.
+  sequential execution, and only reachable with `--no-fallback` since
+  W5-09 routes task-scheduling programs to CPython: the VM cannot cancel
+  sibling tasks, so a multi-failure `gather:` may report more members than
+  CPython would — and the body of a `TaskGroup` sees a failed task's
+  exception at the `await` rather than the `CancelledError` a real
+  cancellation would deliver.
 - **Lazy / unbounded generators.** Finite `yield` / `yield from` work
   since v0.10.0 via eager materialisation, but the worst case
   (`while True: yield`) hits the `GENERATOR_CAP = 1_000_000` ceiling and

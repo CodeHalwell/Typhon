@@ -203,6 +203,7 @@ grouped by workstream (W1–W7).
 - A union member read on classes derived from builtin exceptions is checked. The union member check skipped every class with a base it could not see, and every exception class has one, so `except (A, B) as e: e.code` passed when only `A` defines `code` and raised `AttributeError` whenever a `B` was caught. A builtin exception base now counts as known through a fixed table of its public attributes (`args`, `SystemExit.code`, `OSError.errno`, …). Still permissive: any other unseen base, a `__getattr__`, and an attribute the module writes on a non-`self` receiver (`err.code = 404`) or through `setattr` / `vars` / `__dict__`. Corpus: 0 newly rejected.
 - Diagnostic rendering fixes from the docs audit:
   - `tyc check` draws each diagnostic with the marker of the bucket it was reported in, so a warning no longer shows the error `×` (a `[strictness]` knob at `"warn"`, a mutation caught by its handler). `tyc::unknown_module` and `tyc::typing_alias_deprecated` are always warnings and say so on every surface; their doc pages, which called them errors, are corrected (both run fine at runtime when the module is installed / the alias is used, so they stay warnings and `tyc check` exits 0).
+  - `tyc build` does the same for the warnings it prints itself (the strictness-filtered check results, `stdlib_module_shadow`, the build-time secret scan and `orphan_py_import`); `tyc run` already renders through `tyc check`.
   - An item assignment into a frozen `Mapping` / tuple / `frozenset` (W2-05) is reported at the assignment instead of under "(no location)".
   - Messages name `tuple[T, ...]` instead of the internal `tuple_variadic`.
   - `go` on a call that is not a coroutine reads "`go` needs a coroutine, but `work(1)` returns `int`" instead of "expected `a coroutine for go`".
@@ -655,6 +656,18 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   The recursion limit now counts the module frame, so a program that
   catches `RecursionError` sees the depth CPython reports (one less than
   before).
+- **Programs that schedule tasks run on CPython under `tyc run`** (W5-09).
+  The VM runs a coroutine to completion when it is created, so
+  `create_task` printed the task body before the caller continued,
+  `asyncio.wait_for` ignored its timeout, `gather:` / `asyncio.gather`
+  did not interleave, and `go` ran the spawned task before the spawning
+  code went on — all silently, with exit 0. The pre-run scan now sends a
+  program that uses `go`, `gather:` or an `asyncio` scheduling member
+  (`create_task`, `ensure_future`, `gather`, `wait`, `wait_for`,
+  `timeout`, `as_completed`, `TaskGroup`, `shield`, `to_thread`, the
+  queues and locks, the event-loop accessors) to the compiled path, with
+  a `note:` naming the member. Sequential `await` chains stay on the VM.
+  A CPython-style ready queue in the VM remains open work.
 
 #### W6 — CI, docs & hygiene
 
