@@ -3,6 +3,8 @@ title: let and mut
 description: Binding-immutability keywords — the reference page.
 sidebar:
   order: 2
+banner:
+  content: "This page includes behaviour implemented on <code>main</code> for the unreleased <code>v1.0.0-beta.1</code>. The latest published binary is <code>v1.0.0-alpha.9</code>."
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
@@ -36,12 +38,15 @@ let xs: list[int] = []           # empty container; annotation required
        let x: int = 1   # ✅
    ```
 
-2. **`let` bindings cannot be reassigned.**
+2. **`let` bindings cannot be reassigned or deleted.** `del x` and an
+   `except … as x` handler (which deletes `x` when it ends) count as
+   assignments too.
 
    ```python
    def f() -> None:
        let x: int = 1
        x = 2            # ❌ tyc::immutable_assign
+       del x            # ❌ tyc::immutable_assign
    ```
 
 3. **`mut` bindings can be reassigned at the same type or a subtype.**
@@ -175,6 +180,51 @@ with labels on both the use site and the declaration. Any second
 assignment to a declared-only `let` still fires
 `tyc::immutable_assign` — the first assignment IS the initialiser,
 not a free reassignment.
+
+## `freeze let`
+
+`let` locks the binding; `freeze let` also locks the value. It is allowed at
+module level only, and the value is deep-frozen when the module loads:
+`list` becomes `tuple`, `dict` becomes a read-only `MappingProxyType`, `set`
+becomes `frozenset`, recursively. An instance of a non-`frozen` class is
+rejected at check time (`tyc::freeze_not_freezable`); any other value with no
+immutable equivalent raises `TypeError` when the module loads.
+
+### Frozen binding types
+
+The annotation on a `freeze let` describes the *input* value. The binding
+itself has the frozen shape: `list[T]` becomes `tuple[T, ...]`,
+`dict[K, V]` becomes `Mapping[K, V]` and `set[T]` becomes `frozenset[T]`,
+and nested container elements are frozen too. Reads stay available; mutation
+is rejected.
+
+```python
+class Point frozen:
+    x: int
+    y: int
+
+freeze let HOSTS: list[str] = ["a", "b"]
+freeze let LIMITS: dict[str, list[int]] = {"port": [80, 443]}
+freeze let ORIGIN = Point(x=0, y=0)
+
+def main() -> None:
+    let first: str = HOSTS[0]                    # ✅ reads work
+    let more: tuple[str, ...] = HOSTS + ("c",)   # ✅ tuple concatenation
+    let ports: tuple[int, ...] = LIMITS["port"]  # ✅ the nested list is a tuple
+    HOSTS.append("c")                            # ❌ no `append` on a tuple
+    LIMITS["port"].append(8080)                  # ❌ same, one level down
+    let bad = HOSTS + ["c"]                      # ❌ tuple + list
+```
+
+A new binding that receives a frozen value keeps the frozen shape
+(`let alias = HOSTS` then `alias.append(...)` is rejected too). A mutation
+deliberately wrapped in a handler for the exception it raises
+(`try: CFG["k"] = 1` / `except TypeError:`) is reported as a warning instead
+of an error, so a program can probe the runtime failure.
+
+Instances of `frozen` classes pass through unchanged and keep their identity.
+Their fields are not rebuilt or deep-frozen: give the class immutable field
+types when the instance must be deeply immutable.
 
 ## Emit
 

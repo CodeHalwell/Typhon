@@ -1,13 +1,19 @@
 ---
 title: Match Errors
-description: Diagnostics around exhaustive matching on sealed unions.
+description: Diagnostics around exhaustive matching on sealed unions, Result, nullable, bool and literal subjects.
 sidebar:
   order: 7
+banner:
+  content: "This page includes behaviour implemented on <code>main</code> for the unreleased <code>v1.0.0-beta.1</code>. The latest published binary is <code>v1.0.0-alpha.9</code>."
 ---
 
 ## `tyc::non_exhaustive_match`
 
-A `match` on a sealed union doesn't cover every variant:
+A `match` on a closed type doesn't cover every value. Closed types are sealed
+unions (including unions nested inside one), enums, `Result[T, E]`, nullable
+`T?`, `bool` and string-literal unions — see
+[What "exhaustive" means](#what-exhaustive-means). The commonest case is a
+sealed union missing a variant:
 
 ```python
 type Shape = Circle | Rectangle | Triangle
@@ -20,12 +26,22 @@ def area(s: Shape) -> float:
 ```
 
 ```
-error[tyc::non_exhaustive_match]: match does not cover variant `Triangle`
- ┌─ src/shapes.ty:4:5
- │
-4 │     match s:
- │     ^^^^^^^^ add `case Triangle(base, height): ...` or use `case _:`
+tyc::non_exhaustive_match
+
+  × non-exhaustive `match` on sealed union `Shape`: missing variant(s)
+  │ Triangle
+    ╭─[src/shapes.ty:4:11]
+  4 │     match s:
+    ·           ┬
+    ·           ╰── match is not exhaustive
+    ╰────
+  help: add a `case <Variant>():` arm for each missing variant, or add a `case
+        _:` wildcard arm
 ```
+
+The same wording is used for every closed subject, including ones that are
+not sealed unions (``on sealed union `bool` ``, ``on sealed union `int | None` ``).
+
 
 **Fix:** add the missing variant, or use `case _:` for a deliberate catch-all (opts out of exhaustiveness for the rest of the union).
 
@@ -49,7 +65,50 @@ Keep it at `"error"` outside of refactor windows.
 
 ## What "exhaustive" means
 
-The checker counts variants listed on the `type X = A | B | C` alias. If the `match` covers every variant exactly once (either explicitly or via `_`), it's exhaustive.
+The checker counts variants listed on the `type X = A | B | C` alias. If the `match` covers every variant exactly once (either explicitly or via `_`), it's exhaustive. The same rule applies to every closed subject:
+
+| Subject | Must cover |
+|---|---|
+| Sealed union `type X = A \| B` | every variant class |
+| Nested sealed union (`type Shape = Circle \| Poly`, `type Poly = Rect \| Tri`) | every *leaf* class: `Circle`, `Rect`, `Tri` |
+| `enum` | every member |
+| `Result[T, E]` | `Ok` and `Err`; when `T` or `E` is itself closed, the payload patterns must cover it (`Err(NotFound(..))` and `Err(Timeout(..))` for `E = NotFound \| Timeout`) |
+| `T?` | `None` as well as `T` |
+| `bool` | `True` and `False` |
+| String-literal union `type Dir = "n" \| "s"` | every literal |
+
+```python
+class NotFound frozen:
+    path: str
+class Timeout frozen:
+    after_ms: int
+class Denied frozen:
+    user: str
+
+type LoadError = NotFound | Timeout | Denied
+
+def describe(r: Result[str, LoadError]) -> str:
+    match r:                                   # ❌ missing Err(Denied)
+        case Ok(body):
+            return body
+        case Err(NotFound(path)):
+            return f"missing: {path}"
+        case Err(Timeout(after_ms)):
+            return f"timed out after {after_ms}ms"
+```
+
+```
+  × non-exhaustive `match` on sealed union `Result[str, LoadError]`: missing
+  │ variant(s) Err(Denied)
+```
+
+A match over `int?` with only `case int() as n:` reports `None` missing; a
+match over `bool` with only `case True:` reports `False`. A function whose
+`match` is the last statement also reports `tyc::missing_return` for the
+same gap, because the uncovered value falls through to an implicit `None`.
+
+A `case` naming a nested alias (`case Poly():`) does not cover its variants;
+it is rejected with [`tyc::alias_not_a_class`](#tycalias_not_a_class).
 
 Guards (`case X(...) if cond:`) don't satisfy exhaustiveness for the variant — you still need an unguarded fallback. Since v0.8.0 a fully-guarded variant where *every* arm carries a guard is treated as exhaustive (pragmatic heuristic — pathologically-incomplete guard cascades will no longer be flagged).
 
@@ -148,6 +207,60 @@ match xs:
 Alternatives of a `|` pattern are checked independently, since each binds
 on its own path: `case [a] | (a,):` is legal, and CPython *requires* both
 sides to bind the same set of names.
+
+## `tyc::alias_not_a_class`
+
+A `type` alias used where Python needs a class: as a `match` class pattern
+(`case Poly():`) or as the second argument of `isinstance`.
+
+```python
+class Circle frozen:
+    r: float
+class Rect frozen:
+    w: float
+class Tri frozen:
+    b: float
+
+type Poly = Rect | Tri
+type Shape = Circle | Poly
+
+def describe(s: Shape) -> str:
+    match s:
+        case Circle():
+            return "round"
+        case Poly():                  # ❌ tyc::alias_not_a_class
+            return "polygon"
+
+def is_poly(s: Shape) -> bool:
+    return isinstance(s, Poly)        # ❌ tyc::alias_not_a_class
+```
+
+```
+  × `Poly` is a type alias, not a class: `case Poly():` raises `TypeError` at
+  │ runtime
+  help: match its variants instead: `case Rect() | Tri():`
+```
+
+`type Poly = Rect | Tri` emits a PEP 695 `type` statement, which creates a
+`typing.TypeAliasType` object, not a class. CPython raises `TypeError` the
+first time such a pattern or `isinstance` call runs, so `tyc check` rejects
+it. The help text lists the alias's variants.
+
+**Fix:** match or test the variants.
+
+```python
+def describe(s: Shape) -> str:
+    match s:
+        case Circle():
+            return "round"
+        case Rect() | Tri():
+            return "polygon"
+
+def is_poly(s: Shape) -> bool:
+    return isinstance(s, (Rect, Tri))
+```
+
+Full page: [`docs/diagnostics/alias_not_a_class.md`](https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/alias_not_a_class.md) (also `tyc explain alias_not_a_class`).
 
 ## Where next
 

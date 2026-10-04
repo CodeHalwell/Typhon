@@ -26,15 +26,18 @@ use tower_lsp_server::ls_types::{
 use tower_lsp_server::{jsonrpc, Client, LanguageServer, LspService, Server};
 use tyc_db::{
     check_source_file, check_source_file_with_imports, module_shapes_query, preprocessed_full,
-    preprocessed_text, resolved_module_arc, set_source_text, ModuleShapes, SourceFile, TycDatabase,
+    preprocessed_text, resolved_module_arc, set_source_text, ArcPreprocessResult, ModuleShapes,
+    SourceFile, TycDatabase,
 };
 use tyc_diagnostics::TycError;
 use tyc_resolve::{
     BindingKind, ClassKind, ImportInfo, Mutability, ResolveOptions, ResolvedModule, SymbolAtOffset,
 };
 
+mod position_map;
 mod semantic;
 mod stdlib_stubs;
+mod transport;
 mod venv_introspect;
 
 /// Manual resolved-module cache for cross-file import resolution.
@@ -82,6 +85,57 @@ type LintOptionsCache =
 type SeverityOverridesCache =
     Arc<Mutex<HashMap<std::path::PathBuf, (Option<u64>, tyc_diagnostics::SeverityOverrides)>>>;
 
+/// One project's source listing (`.dty` stubs, `.ty` sources) from the shared
+/// symlink-safe walk, with the time it was taken.
+#[derive(Debug, Clone)]
+struct SourceWalk {
+    taken: std::time::Instant,
+    dty: Vec<std::path::PathBuf>,
+    ty: Vec<std::path::PathBuf>,
+}
+
+/// How long a cached [`SourceWalk`] serves checks before the tree is walked
+/// again. Watched-file create/delete events and opening a file the listing
+/// does not contain refresh it sooner; the bound covers editors that send
+/// neither.
+const SOURCE_WALK_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Per-source-directory [`SourceWalk`] cache. A plain `std` mutex: it is only
+/// touched from blocking threads, for the length of a lookup or a walk.
+type SourceWalkCache = Arc<std::sync::Mutex<HashMap<std::path::PathBuf, SourceWalk>>>;
+
+/// The project's sources, from the cache when fresh. `current` is the file
+/// being checked: a listing that lacks it (a file created since the walk) is
+/// refreshed rather than served.
+fn project_sources(
+    cache: &SourceWalkCache,
+    src_dir: &std::path::Path,
+    current: Option<&std::path::Path>,
+) -> SourceWalk {
+    let mut guard = match cache.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if let Some(walk) = guard.get(src_dir) {
+        let fresh = walk.taken.elapsed() < SOURCE_WALK_TTL;
+        let knows_current = current.is_none_or(|c| {
+            !c.starts_with(src_dir)
+                || c.extension().is_none_or(|e| e != "ty")
+                || walk.ty.iter().any(|f| f == c)
+        });
+        if fresh && knows_current {
+            return walk.clone();
+        }
+    }
+    let walk = SourceWalk {
+        taken: std::time::Instant::now(),
+        dty: collect_files_with_ext(src_dir, "dty"),
+        ty: collect_files_with_ext(src_dir, "ty"),
+    };
+    guard.insert(src_dir.to_path_buf(), walk.clone());
+    walk
+}
+
 /// The Typhon LSP backend. Holds a single shared salsa database and the
 /// `Client` handle used to send notifications back to the editor.
 ///
@@ -89,6 +143,7 @@ type SeverityOverridesCache =
 /// `check_source_file` call can run on a blocking executor thread without
 /// pinning the async runtime — concurrent `hover` and `shutdown`
 /// requests stay responsive while a file is being checked.
+#[derive(Clone)]
 pub struct Backend {
     client: Client,
     db: Arc<Mutex<TycDatabase>>,
@@ -192,6 +247,98 @@ pub struct Backend {
     severity_overrides_cache: SeverityOverridesCache,
     /// Declared workspace root URI from the client (`InitializeParams`).
     workspace_root: Arc<Mutex<Option<Uri>>>,
+    /// Cached per-project source listings (W4-08): the walk used to run on
+    /// every keystroke.
+    source_walks: SourceWalkCache,
+    /// Set by the `shutdown` request. `exit` (or the client hanging up)
+    /// without it is an abnormal termination: exit code 1, per the spec.
+    shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
+    /// Salsa inputs of documents the client closed, by URI. Salsa never frees
+    /// an input, so a reopen reuses the old one instead of allocating another
+    /// (W4-11: 300 reopen cycles grew RSS from 5 MB to 75 MB).
+    closed_documents: Arc<Mutex<HashMap<String, SourceFile>>>,
+    /// `typhon.toml` files currently reported invalid, with the reported
+    /// message, so a fix clears the report and an unchanged error is not
+    /// republished on every keystroke.
+    config_errors: Arc<Mutex<HashMap<std::path::PathBuf, String>>>,
+    /// Latest version the client sent for each open document. Edits that
+    /// arrive out of order never overwrite newer text, and every publish
+    /// carries the version its text came from.
+    doc_versions: Arc<std::sync::Mutex<HashMap<String, i32>>>,
+    /// Per-document check generation (W4-10). Every edit, close or refresh
+    /// bumps it; a scheduled check runs only if its generation is still
+    /// current when its debounce expires, stops between phases once it is
+    /// not, and never publishes a superseded result.
+    check_generations: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+}
+
+/// How long an edit waits for the next keystroke before it is checked
+/// (W4-10). A burst of edits is checked once, after the last one.
+const EDIT_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Lock a `std` mutex, recovering the data if a panicking holder poisoned it.
+fn lock_std<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match m.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    }
+}
+
+/// `true` when `gen` is still `uri`'s current check generation.
+fn generation_is_current(
+    generations: &std::sync::Mutex<HashMap<String, u64>>,
+    uri: &str,
+    gen: u64,
+) -> bool {
+    lock_std(generations).get(uri) == Some(&gen)
+}
+
+/// Whether the module `module` (dotted, within the project whose sources
+/// live in `src_dir`) is imported by the document at `path`, per its resolved
+/// imports. A package and its submodules count as related in both directions
+/// (`from pkg import x` reaches `pkg.x` through a facade). A document that did
+/// not resolve (a parse error) counts as an importer: re-checking it is the
+/// safe answer.
+fn imports_module(
+    resolved: &ResolvedModule,
+    path: &std::path::Path,
+    src_dir: &std::path::Path,
+    module: &str,
+) -> bool {
+    if resolved.scopes.is_empty() {
+        return true;
+    }
+    let related = |name: &str| {
+        name == module
+            || module.starts_with(&format!("{name}."))
+            || name.starts_with(&format!("{module}."))
+    };
+    resolved
+        .scopes
+        .iter()
+        .flat_map(|scope| scope.bindings.iter())
+        .filter_map(|b| b.import_info.as_ref())
+        .any(|info| {
+            let base = if info.level > 0 {
+                canonical_relative_module(path, src_dir, &info.module, info.level)
+            } else {
+                Some(info.module.clone())
+            };
+            let Some(base) = base else {
+                return false;
+            };
+            if !base.is_empty() && related(&base) {
+                return true;
+            }
+            info.member.as_ref().is_some_and(|member| {
+                let full = if base.is_empty() {
+                    member.clone()
+                } else {
+                    format!("{base}.{member}")
+                };
+                related(&full)
+            })
+        })
 }
 
 impl std::fmt::Debug for Backend {
@@ -201,6 +348,80 @@ impl std::fmt::Debug for Backend {
 }
 
 impl Backend {
+    /// A backend with empty caches, talking to `client`. `shutdown_requested`
+    /// is raised when the client sends `shutdown`.
+    fn new(
+        client: Client,
+        log_level: LogLevel,
+        shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Backend {
+            client,
+            db: Arc::new(Mutex::new(TycDatabase::new())),
+            log_level,
+            documents: Arc::new(Mutex::new(HashMap::new())),
+            resolved_cache: Arc::new(Mutex::new(HashMap::new())),
+            introspection: Arc::new(Mutex::new(HashMap::new())),
+            signature_caches: Arc::new(Mutex::new(HashMap::new())),
+            project_indexes: Arc::new(Mutex::new(HashMap::new())),
+            project_files: Arc::new(Mutex::new(HashMap::new())),
+            prewarmed_versions: Arc::new(Mutex::new(HashMap::new())),
+            lint_options_cache: Arc::new(Mutex::new(HashMap::new())),
+            severity_overrides_cache: Arc::new(Mutex::new(HashMap::new())),
+            workspace_root: Arc::new(Mutex::new(None)),
+            source_walks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            shutdown_requested,
+            closed_documents: Arc::new(Mutex::new(HashMap::new())),
+            config_errors: Arc::new(Mutex::new(HashMap::new())),
+            doc_versions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            check_generations: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Report an invalid `typhon.toml` on the file itself, the way `tyc
+    /// check` refuses to run on it, and clear the report once it is valid
+    /// again (W4-11: the server used to fall back to defaults silently).
+    async fn report_config(&self, lookup: &WorkspaceLookup) {
+        let (toml_path, message, error) = match lookup {
+            WorkspaceLookup::Invalid(path, err) => (path.clone(), Some(err.to_string()), Some(err)),
+            WorkspaceLookup::Project(root, _) => (root.join("typhon.toml"), None, None),
+            WorkspaceLookup::None => return,
+        };
+        {
+            let mut reported = self.config_errors.lock().await;
+            match &message {
+                Some(m) if reported.get(&toml_path) == Some(m) => return,
+                Some(m) => {
+                    reported.insert(toml_path.clone(), m.clone());
+                }
+                None => {
+                    if reported.remove(&toml_path).is_none() {
+                        return;
+                    }
+                }
+            }
+        }
+        let Some(uri) = self.path_to_client_uri(&toml_path).await else {
+            return;
+        };
+        let diagnostics = match (message, error) {
+            (Some(message), Some(error)) => {
+                let text = std::fs::read_to_string(&toml_path).unwrap_or_default();
+                vec![Diagnostic {
+                    range: config_error_range(&text, error),
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    source: Some("tyc".to_owned()),
+                    message,
+                    ..Default::default()
+                }]
+            }
+            _ => Vec::new(),
+        };
+        self.client
+            .publish_diagnostics(uri, diagnostics, None)
+            .await;
+    }
+
     /// Convert an internal path to a client-facing URI.
     ///
     /// Keeps canonical paths internal for identity and equality. When returning
@@ -261,25 +482,111 @@ impl Backend {
         path_to_uri(path)
     }
 
+    /// Re-check every open document (debounced, without cascading) — for a
+    /// `typhon.toml` change, which can affect any of them.
     async fn refresh_open_documents(&self) {
-        let open: Vec<(String, SourceFile)> = {
-            let docs = self.documents.lock().await;
-            docs.iter().map(|(uri, sf)| (uri.clone(), *sf)).collect()
-        };
-        for (uri_str, sf) in open {
-            let text = {
-                let db = self.db.lock().await;
-                sf.text(&*db).clone()
-            };
-            // Publish with the document's last known version rather than
-            // `None`: an unversioned `publishDiagnostics` can't be superseded
-            // by the client, so a refresh racing the user's typing could
-            // clobber newer, versioned diagnostics. (PR #192 review.)
-            let version = self.prewarmed_versions.lock().await.get(&uri_str).copied();
+        let open: Vec<String> = self.documents.lock().await.keys().cloned().collect();
+        for uri_str in open {
             if let Ok(uri) = Uri::from_str(&uri_str) {
-                self.check_and_publish(uri, text, version).await;
+                let gen = self.begin_check(&uri_str);
+                self.spawn_check(uri, gen, EDIT_DEBOUNCE, false);
             }
         }
+    }
+
+    /// Start a new check generation for `uri`, superseding any check that is
+    /// pending or running for it. Returns the new generation.
+    fn begin_check(&self, uri: &str) -> u64 {
+        let mut gens = lock_std(&self.check_generations);
+        let gen = gens.entry(uri.to_owned()).or_insert(0);
+        *gen += 1;
+        *gen
+    }
+
+    /// Check `uri` after `delay`, unless a newer generation supersedes `gen`
+    /// first. With `cascade`, the open documents that import it are then
+    /// refreshed (an edit changes what they see; a refresh does not).
+    fn spawn_check(&self, uri: Uri, gen: u64, delay: std::time::Duration, cascade: bool) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            if !generation_is_current(&this.check_generations, uri.as_str(), gen) {
+                return;
+            }
+            if this.check_document(&uri, gen).await && cascade {
+                if let Some(path) = uri_to_path(&uri) {
+                    this.refresh_importers(&path).await;
+                }
+            }
+        });
+    }
+
+    /// Re-check the open documents that import the module at `changed` —
+    /// only those, never `changed` itself, debounced and without cascading
+    /// further (W4-10). W4-09 re-checked every open document on every edit.
+    async fn refresh_importers(&self, changed: &std::path::Path) {
+        let Some((root, src_dir)) = find_workspace_layout(changed) else {
+            return;
+        };
+        let src_root_name = src_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("src")
+            .to_owned();
+        let changed_module = path_to_dotted(changed, &src_root_name);
+        let changed_key = path_lookup_key(changed);
+        let candidates: Vec<(String, std::path::PathBuf, SourceFile)> = {
+            let docs = self.documents.lock().await;
+            docs.iter()
+                .filter_map(|(uri, sf)| {
+                    let path = uri_str_to_path(uri)?;
+                    (path_lookup_key(&path) != changed_key).then(|| (uri.clone(), path, *sf))
+                })
+                .collect()
+        };
+        if candidates.is_empty() {
+            return;
+        }
+        let db = Arc::clone(&self.db);
+        let importers: Vec<String> = tokio::task::spawn_blocking(move || {
+            let db = db.blocking_lock();
+            candidates
+                .into_iter()
+                .filter(|(_, path, sf)| {
+                    find_workspace_layout(path).is_some_and(|(r, _)| r == root)
+                        && imports_module(
+                            &resolved_module_arc(&*db, *sf),
+                            path,
+                            &src_dir,
+                            &changed_module,
+                        )
+                })
+                .map(|(uri, _, _)| uri)
+                .collect()
+        })
+        .await
+        .unwrap_or_default();
+        for uri_str in importers {
+            if let Ok(uri) = Uri::from_str(&uri_str) {
+                let gen = self.begin_check(&uri_str);
+                self.spawn_check(uri, gen, EDIT_DEBOUNCE, false);
+            }
+        }
+    }
+
+    /// `true` when the open document `uri` holds text that differs from the
+    /// file on disk — what its importers see changes when it opens or closes.
+    async fn differs_from_disk(&self, uri: &Uri, sf: SourceFile) -> bool {
+        let Some(path) = uri_to_path(uri) else {
+            return false;
+        };
+        let text = {
+            let db = self.db.lock().await;
+            sf.text(&*db).clone()
+        };
+        std::fs::read_to_string(&path).map_or(true, |disk| disk != text)
     }
 
     /// True if a message at `level` should be forwarded to the editor.
@@ -308,18 +615,19 @@ impl Backend {
         }
     }
 
-    /// Run the check pipeline on `text` and publish any resulting diagnostics
-    /// (warnings + errors) back to the editor. `version` is forwarded so the
-    /// editor can drop stale results.
-    ///
-    /// The check itself runs inside [`tokio::task::spawn_blocking`] because
-    /// the compiler pipeline is CPU-bound and synchronous; keeping it off
-    /// the runtime thread lets other LSP requests (hover, shutdown) make
-    /// progress concurrently.
-    async fn check_and_publish(&self, uri: Uri, text: String, version: Option<i32>) {
-        let uri_str = uri.as_str().to_owned();
-        let db = Arc::clone(&self.db);
-
+    /// Store `text` as the content of `uri_str` (creating, or reusing a
+    /// closed document's, Salsa input). An edit older than the version
+    /// already stored is ignored, so out-of-order notifications never roll
+    /// the buffer back. Hover and completion read the new text immediately;
+    /// only the check is debounced.
+    async fn update_document(&self, uri_str: &str, text: String, version: Option<i32>) {
+        if let Some(v) = version {
+            let mut versions = lock_std(&self.doc_versions);
+            if versions.get(uri_str).is_some_and(|&old| old > v) {
+                return;
+            }
+            versions.insert(uri_str.to_owned(), v);
+        }
         // Upsert the SourceFile in the Salsa database.
         //
         // On `did_open` we create a fresh entity; on `did_change` we push the
@@ -329,42 +637,78 @@ impl Backend {
         // *other* files stay cached. `set_source_text` compares before it
         // writes — raw `set_text` does not (F56) — so a `did_change` that
         // delivers byte-identical text (a formatter round-trip, an editor
-        // re-sync) leaves the whole cache warm. We hold the db lock only for
-        // this short operation so hover/completion requests can still acquire
-        // it while the heavy `check_source_file` runs on the blocking thread.
-        let source_file: SourceFile = {
-            let existing = {
-                let docs = self.documents.lock().await;
-                docs.get(&uri_str).copied()
-            };
+        // re-sync) leaves the whole cache warm.
+        let open = {
+            let docs = self.documents.lock().await;
+            docs.get(uri_str).copied()
+        };
+        // A document reopened after a close gets its old input back.
+        let existing = match open {
+            Some(sf) => Some(sf),
+            None => self.closed_documents.lock().await.remove(uri_str),
+        };
+        let source_file = {
             let mut db_guard = self.db.lock().await;
+            // Re-check under the db lock: a newer edit may have been stored
+            // while this one waited for it.
+            if let Some(v) = version {
+                if lock_std(&self.doc_versions)
+                    .get(uri_str)
+                    .is_some_and(|&newest| newest > v)
+                {
+                    return;
+                }
+            }
             if let Some(sf) = existing {
-                set_source_text(&mut db_guard, sf, text.clone());
+                set_source_text(&mut db_guard, sf, text);
                 sf
             } else {
-                SourceFile::new(&*db_guard, uri_str.clone(), text.clone())
+                SourceFile::new(&*db_guard, uri_str.to_owned(), text)
             }
         };
+        self.documents
+            .lock()
+            .await
+            .insert(uri_str.to_owned(), source_file);
+    }
 
-        // Cache the Salsa handle; raw text is stored inside Salsa itself and
-        // retrieved via `source_file.text(db)` when needed.
-        //
-        // The same pass snapshots every open document's handle keyed by
-        // filesystem path, so the cross-module shape builder below can read
-        // sibling modules from their live buffers instead of from disk (F57).
-        // `SourceFile` is `Copy`, so this is a cheap handle snapshot — the
-        // text stays in Salsa and is only read under the db lock inside the
-        // blocking closure. Taking it here (rather than inside the closure)
-        // keeps the `documents` lock off the blocking thread entirely.
+    /// Run the check pipeline on the open document `uri` and publish its
+    /// diagnostics (warnings + errors), tagged with the version its text came
+    /// from. Returns `false` when the document is not open or `gen` was
+    /// superseded before the result could be published.
+    ///
+    /// The check runs inside [`tokio::task::spawn_blocking`] because the
+    /// compiler pipeline is CPU-bound and synchronous. It holds the database
+    /// lock in two phases — registering the project's inputs, then checking —
+    /// and releases it around the venv enrichment (which may shell to
+    /// Python), so hover and completion are not stuck behind that. Between
+    /// phases it stops as soon as a newer edit supersedes `gen` (W4-10).
+    async fn check_document(&self, uri: &Uri, gen: u64) -> bool {
+        let uri_str = uri.as_str().to_owned();
+        let db = Arc::clone(&self.db);
+        let Some(source_file) = self.documents.lock().await.get(&uri_str).copied() else {
+            return false;
+        };
+        let version = lock_std(&self.doc_versions).get(&uri_str).copied();
+        let text = {
+            let db = self.db.lock().await;
+            source_file.text(&*db).clone()
+        };
+
+        // Snapshot every open document's handle keyed by filesystem path, so
+        // the cross-module shape builder below can read sibling modules from
+        // their live buffers instead of from disk (F57). `SourceFile` is
+        // `Copy`, so this is a cheap handle snapshot — the text stays in Salsa
+        // and is only read under the db lock inside the blocking closure.
         let open_docs: HashMap<std::path::PathBuf, SourceFile> = {
-            let mut docs = self.documents.lock().await;
-            docs.insert(uri_str.clone(), source_file);
+            let docs = self.documents.lock().await;
             docs.iter()
                 .filter_map(|(doc_uri, sf)| {
                     uri_str_to_path(doc_uri).map(|p| (path_lookup_key(&p), *sf))
                 })
                 .collect()
         };
+        let uri = uri.clone();
 
         // Resolve the project root once on the async side so the
         // blocking closure (which holds the salsa db lock) only needs
@@ -378,8 +722,15 @@ impl Backend {
         // this file already uses.
         let path_for_root =
             uri_to_path(&uri).unwrap_or_else(|| std::path::PathBuf::from(uri.path().as_str()));
-        let workspace = find_workspace_layout(&path_for_root);
+        let lookup = lookup_workspace(&path_for_root);
+        self.report_config(&lookup).await;
+        let workspace = match lookup {
+            WorkspaceLookup::Project(root, src) => Some((root, src)),
+            _ => None,
+        };
         let project_files_arc = Arc::clone(&self.project_files);
+        let source_walks_arc = Arc::clone(&self.source_walks);
+        let current_path = path_lookup_key(&path_for_root);
 
         // Per-project venv signature caches, for folding third-party shapes
         // into the check so wrong-typed / wrong-arity third-party calls show
@@ -396,9 +747,13 @@ impl Backend {
 
         let uri_str_for_check = uri_str.clone();
         let text_for_check = text.clone();
+        let generations = Arc::clone(&self.check_generations);
         let result = tokio::task::spawn_blocking(move || {
-            // Hold the mutex only for the duration of the salsa call.
-            let mut db = db.blocking_lock();
+            let still_current = || generation_is_current(&generations, &uri_str_for_check, gen);
+            let db_arc = db;
+            // Phase 1, under the db lock: register the project's inputs and
+            // build the cross-module shape registry.
+            let mut db = db_arc.blocking_lock();
             // Build the project-wide shape registry inside the
             // blocking closure so the salsa-cached
             // `module_shapes_query` does the heavy lifting: only the
@@ -411,17 +766,25 @@ impl Backend {
             // is served from its live buffer input (`open_docs`), so
             // cross-module diagnostics react to unsaved edits in any
             // module within one keystroke, not just the edited one.
-            let project_shapes = if let Some((_root, src_dir)) = workspace.as_ref() {
+            let registry = if let Some((_root, src_dir)) = workspace.as_ref() {
                 let src_root_name = src_dir
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("src")
                     .to_owned();
+                // The project's source listing, from the shared symlink-safe
+                // walk and cached across keystrokes (W4-08).
+                let sources = project_sources(
+                    &source_walks_arc,
+                    &path_lookup_key(src_dir),
+                    Some(&current_path),
+                );
                 #[allow(clippy::explicit_auto_deref)]
                 let mut shapes = build_project_shapes_salsa(
                     &mut *db,
                     &project_files_arc,
                     src_dir,
+                    &sources,
                     &src_root_name,
                     &uri_str_for_check,
                     &text_for_check,
@@ -432,6 +795,16 @@ impl Backend {
                 // `tyc build`. Before venv enrichment (which skips modules
                 // already in the map).
                 tyc_db::seed_bundled_stubs(&mut shapes);
+                Some((shapes, sources))
+            } else {
+                None
+            };
+            drop(db);
+            if !still_current() {
+                return None;
+            }
+            // Venv enrichment may shell to Python: done without the db lock.
+            let project_shapes = if let Some((mut shapes, sources)) = registry {
                 // Fold venv-introspected third-party shapes into the project
                 // map so the cross-module check flags wrong-typed / -arity
                 // calls to installed dependencies live in the editor. All of
@@ -464,11 +837,7 @@ impl Backend {
                         if let Ok(mut vs) = sig_cache.lock() {
                             let project_module_set: std::collections::HashSet<String> =
                                 shapes.keys().cloned().collect();
-                            let _ = vs.enrich_into(
-                                std::slice::from_ref(src_dir),
-                                &project_module_set,
-                                &mut shapes,
-                            );
+                            let _ = vs.enrich_into(&sources.ty, &project_module_set, &mut shapes);
                         };
                     }
                 }
@@ -476,6 +845,11 @@ impl Backend {
             } else {
                 std::sync::Arc::new(std::collections::HashMap::new())
             };
+            if !still_current() {
+                return None;
+            }
+            // Phase 2, under the db lock again: the check itself.
+            let mut db = db_arc.blocking_lock();
             #[allow(clippy::explicit_auto_deref)]
             let mut diags = if project_shapes.is_empty() {
                 // No workspace layout discovered — fall back to the
@@ -610,21 +984,28 @@ impl Backend {
                 );
                 diags.extend(lint_diags);
             }
-            (diags, mapping_source)
+            Some((diags, mapping_source))
         })
         .await;
 
         let (diags, mapping_source) = match result {
-            Ok(value) => value,
+            Ok(Some(value)) => value,
+            // Superseded by a newer edit between phases.
+            Ok(None) => return false,
             Err(e) => {
                 self.log(
                     MessageType::ERROR,
                     format!("tyc-lsp: check task panicked: {e}"),
                 )
                 .await;
-                return;
+                return false;
             }
         };
+        // A result for text the user has since changed is not published; the
+        // newer generation's check publishes instead.
+        if !generation_is_current(&self.check_generations, &uri_str, gen) {
+            return false;
+        }
 
         let mut out = Vec::with_capacity(diags.error_count() + diags.warning_count());
         for err in diags.errors() {
@@ -663,6 +1044,7 @@ impl Backend {
         // before the first one had a chance to populate the cache.
         self.spawn_introspection_prewarm(uri_for_prewarm, version)
             .await;
+        true
     }
 
     /// Spawn a detached task that introspects every third-party
@@ -816,14 +1198,29 @@ impl LanguageServer for Backend {
     }
 
     async fn shutdown(&self) -> jsonrpc::Result<()> {
+        self.shutdown_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let doc = params.text_document;
-        self.check_and_publish(doc.uri, doc.text, Some(doc.version))
+        let uri_str = doc.uri.as_str().to_owned();
+        let gen = self.begin_check(&uri_str);
+        self.update_document(&uri_str, doc.text, Some(doc.version))
             .await;
-        self.refresh_open_documents().await;
+        // First diagnostics without a debounce.
+        self.check_document(&doc.uri, gen).await;
+        // Importers saw the file on disk; refresh them only if the buffer
+        // says something else.
+        let sf = self.documents.lock().await.get(&uri_str).copied();
+        if let Some(sf) = sf {
+            if self.differs_from_disk(&doc.uri, sf).await {
+                if let Some(path) = uri_to_path(&doc.uri) {
+                    self.refresh_importers(&path).await;
+                }
+            }
+        }
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -832,37 +1229,82 @@ impl LanguageServer for Backend {
         let Some(change) = params.content_changes.into_iter().next() else {
             return;
         };
-        self.check_and_publish(
-            params.text_document.uri,
-            change.text,
-            Some(params.text_document.version),
-        )
-        .await;
-        self.refresh_open_documents().await;
+        let uri = params.text_document.uri;
+        let uri_str = uri.as_str().to_owned();
+        // Supersede any pending or running check before the text changes,
+        // then store the text now (hover and completion see it at once) and
+        // check once the burst of keystrokes pauses (W4-10).
+        let gen = self.begin_check(&uri_str);
+        self.update_document(&uri_str, change.text, Some(params.text_document.version))
+            .await;
+        self.spawn_check(uri, gen, EDIT_DEBOUNCE, true);
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
-        let relevant = params.changes.iter().any(|change| {
-            uri_to_path(&change.uri).is_some_and(|p| {
-                p.file_name().is_some_and(|n| n == "typhon.toml")
-                    || p.extension().is_some_and(|e| e == "ty" || e == "dty")
-            })
-        });
-        if !relevant {
+        let mut config_changed = false;
+        let mut sources_changed: Vec<std::path::PathBuf> = Vec::new();
+        for change in &params.changes {
+            let Some(path) = uri_to_path(&change.uri) else {
+                continue;
+            };
+            if path.file_name().is_some_and(|n| n == "typhon.toml") {
+                config_changed = true;
+            } else if path.extension().is_some_and(|e| e == "ty" || e == "dty") {
+                sources_changed.push(path);
+            }
+        }
+        if !config_changed && sources_changed.is_empty() {
             return;
         }
         self.resolved_cache.lock().await.clear();
-        self.refresh_open_documents().await;
+        // A source was created, deleted or changed: the next check walks the
+        // tree again rather than serving the cached listing.
+        lock_std(&self.source_walks).clear();
+        if config_changed {
+            // Settings can change any document's diagnostics.
+            self.refresh_open_documents().await;
+            return;
+        }
+        let open: std::collections::HashSet<std::path::PathBuf> = {
+            let docs = self.documents.lock().await;
+            docs.keys()
+                .filter_map(|u| uri_str_to_path(u))
+                .map(|p| path_lookup_key(&p))
+                .collect()
+        };
+        for path in sources_changed {
+            // An open document's buffer, not its file, is what everyone sees;
+            // saving it changes nothing.
+            if open.contains(&path_lookup_key(&path)) {
+                continue;
+            }
+            self.refresh_importers(&path).await;
+        }
     }
+
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         // Clear diagnostics when the user closes a file so stale errors do
         // not linger in the editor.
         let uri = params.text_document.uri;
         let uri_str = uri.as_str().to_owned();
-        {
+        // Cancel any pending or running check of the closed document.
+        self.begin_check(&uri_str);
+        let closed = {
             let mut docs = self.documents.lock().await;
-            docs.remove(&uri_str);
+            docs.remove(&uri_str)
+        };
+        // Importers now see the file on disk instead of the buffer.
+        let refresh = match closed {
+            Some(sf) => self.differs_from_disk(&uri, sf).await,
+            None => false,
+        };
+        if let Some(sf) = closed {
+            self.closed_documents
+                .lock()
+                .await
+                .insert(uri_str.clone(), sf);
         }
+        lock_std(&self.doc_versions).remove(&uri_str);
         {
             // Drop the per-document debounce entry so reopening the
             // file re-runs the prewarm (the venv may have changed
@@ -871,8 +1313,14 @@ impl LanguageServer for Backend {
             versions.remove(&uri_str);
         }
         self.evict_resolved_cache(&uri_str).await;
-        self.client.publish_diagnostics(uri, Vec::new(), None).await;
-        self.refresh_open_documents().await;
+        self.client
+            .publish_diagnostics(uri.clone(), Vec::new(), None)
+            .await;
+        if refresh {
+            if let Some(path) = uri_to_path(&uri) {
+                self.refresh_importers(&path).await;
+            }
+        }
     }
 
     async fn hover(&self, params: HoverParams) -> jsonrpc::Result<Option<Hover>> {
@@ -881,17 +1329,28 @@ impl LanguageServer for Backend {
         let Some(sf) = self.source_file_for(&uri).await else {
             return Ok(None);
         };
-        // Both `preprocessed_text` and `resolved_module` are Salsa-tracked
+        // Both `preprocessed_full` and `resolved_module` are Salsa-tracked
         // queries that hit the cache when the file hasn't changed since the
         // last `check_source_file` call.
-        let (preprocessed, resolved) = {
-            let db = self.db.lock().await;
-            (preprocessed_text(&*db, sf), resolved_module_arc(&*db, sf))
+        let Some((original, prep_full, resolved)) = self.document_queries(sf).await else {
+            return Ok(None);
         };
-        let offset = position_to_byte(&preprocessed, position);
+        let preprocessed = prep_full.python_source.as_str();
+        // The editor's position is in the text the user wrote; the resolver
+        // indexed the expanded buffer (W4-07).
+        let positions =
+            position_map::PositionMap::new(&original, preprocessed, &prep_full.line_map);
+        let offset = positions.to_preprocessed(position);
         let Some(symbol) = resolved.symbol_at_offset(offset) else {
             return Ok(None);
         };
+        if position_map::is_desugaring_temporary(&symbol.name)
+            || symbol
+                .definition
+                .is_some_and(|d| position_map::is_desugaring_temporary(&d.name))
+        {
+            return Ok(None);
+        }
 
         // Build the base hover body (kind + name + declaration-site
         // marker) from the resolver's view of the symbol. When the
@@ -911,10 +1370,7 @@ impl LanguageServer for Backend {
             body.push_str("\n\n");
             body.push_str(&import_extras);
         }
-        let range = Some(Range {
-            start: byte_to_position(&preprocessed, symbol.span.0),
-            end: byte_to_position(&preprocessed, symbol.span.1),
-        });
+        let range = Some(positions.range_to_original(symbol.span.0, symbol.span.1));
         Ok(Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
@@ -945,41 +1401,11 @@ impl LanguageServer for Backend {
         // entry has gone away (e.g. concurrent close); falling back to
         // the *preprocessed* text would defeat the remap, since the
         // whole point is to translate into the original Typhon source.
-        let (preprocessed, resolved, prep_full, salsa_text) = {
-            let db = self.db.lock().await;
-            (
-                preprocessed_text(&*db, sf),
-                resolved_module_arc(&*db, sf),
-                preprocessed_full(&*db, sf),
-                sf.text(&*db).clone(),
-            )
+        // `original` is the document's own (pre-preprocess) text, which the
+        // client renders the colours over.
+        let Some((original, prep_full, resolved)) = self.document_queries(sf).await else {
+            return Ok(None);
         };
-        // Original (pre-preprocess) source: read from the editor's open
-        // buffer when we have it, fall back to the SourceFile's stored
-        // Typhon text. The semantic-tokens client uses this to render
-        // colours, so we want the freshest version of the buffer.
-        let original = self.document_text(&uri).await.unwrap_or(salsa_text);
-        let line_shifts = prep_full.0.line_col_shifts();
-        // Parse the preprocessed source for the AST walk
-        // (attribute-access tokens). `parse_module` is fast — the
-        // type checker already does it on every check pass — but the
-        // result isn't currently Salsa-cached for the LSP, so we
-        // re-parse here. Cheap enough at the file sizes we expect;
-        // can be promoted to a tracked query later if profiling
-        // says it matters.
-        let module = match tyc_syntax::parse_module(&preprocessed) {
-            Ok(p) => p.into_syntax(),
-            Err(_) => {
-                // Parse errors are surfaced through diagnostics
-                // already; the semantic-tokens stream stays empty so
-                // the editor falls back to the TextMate grammar
-                // without a confusing partial colouring.
-                return Ok(Some(SemanticTokensResult::Tokens(
-                    tower_lsp_server::ls_types::SemanticTokens::default(),
-                )));
-            }
-        };
-        let stdlib = tyc_resolve::python_stdlib_modules();
         // Build the callee → signature map the kwarg pass consults.
         // Walks the resolver's top-level bindings to find every
         // imported class / function name, then asks the introspection
@@ -990,16 +1416,36 @@ impl LanguageServer for Backend {
         // affecting the rest of the file.
         let (callee_signatures, attribute_kinds) =
             self.build_callee_signatures(&uri, &resolved).await;
-        let tokens = semantic::compute_with_original(
-            &preprocessed,
-            &original,
-            &line_shifts,
-            &resolved,
-            &module,
-            stdlib,
-            &callee_signatures,
-            &attribute_kinds,
-        );
+        // The parse and the token walk are CPU work over the whole file: on a
+        // blocking thread, not the server's async thread (W4-10).
+        let tokens = tokio::task::spawn_blocking(move || {
+            let preprocessed = prep_full.python_source.as_str();
+            let line_shifts = prep_full.0.line_col_shifts();
+            // Parse the preprocessed source for the AST walk
+            // (attribute-access tokens). The result isn't Salsa-cached for
+            // the LSP, so we re-parse here.
+            let module = match tyc_syntax::parse_module(preprocessed) {
+                Ok(p) => p.into_syntax(),
+                // Parse errors are surfaced through diagnostics already; the
+                // semantic-tokens stream stays empty so the editor falls back
+                // to the TextMate grammar without a confusing partial
+                // colouring.
+                Err(_) => return tower_lsp_server::ls_types::SemanticTokens::default(),
+            };
+            semantic::compute_with_original(
+                preprocessed,
+                &original,
+                &line_shifts,
+                &prep_full.line_map,
+                &resolved,
+                &module,
+                tyc_resolve::python_stdlib_modules(),
+                &callee_signatures,
+                &attribute_kinds,
+            )
+        })
+        .await
+        .unwrap_or_default();
         Ok(Some(SemanticTokensResult::Tokens(tokens)))
     }
 
@@ -1012,10 +1458,15 @@ impl LanguageServer for Backend {
         let Some(sf) = self.source_file_for(&uri).await else {
             return Ok(None);
         };
-        let (preprocessed, resolved) = {
-            let db = self.db.lock().await;
-            (preprocessed_text(&*db, sf), resolved_module_arc(&*db, sf))
+        let Some((original, prep_full, resolved)) = self.document_queries(sf).await else {
+            return Ok(None);
         };
+        let preprocessed = prep_full.python_source.clone();
+        // Everything below reads the expanded buffer, so move the editor's
+        // position into it first (W4-07).
+        let position =
+            position_map::PositionMap::new(&original, &preprocessed, &prep_full.line_map)
+                .to_preprocessed_position(position);
         // Mid-type buffers (`os.<cursor>`) typically don't parse — the
         // trailing dot is a syntax error. The cached `ResolvedModule`
         // returned above is empty in that state, so imports aren't
@@ -1133,6 +1584,9 @@ impl LanguageServer for Backend {
             position,
             introspect_ref,
         );
+        // Desugaring temporaries (`__typhon_q_0__`, `__typhon_impl_Point`) are
+        // bindings in the expanded buffer but not names the user can write.
+        items.retain(|item| !position_map::is_desugaring_temporary(&item.label));
 
         // Auto-import suggestions: only meaningful in open-completion
         // context (the receiver / from-import branches already return
@@ -1227,14 +1681,10 @@ impl LanguageServer for Backend {
         let Some(sf) = self.source_file_for(&uri).await else {
             return Ok(None);
         };
-        let (preprocessed, prep_full, resolved) = {
-            let db = self.db.lock().await;
-            (
-                preprocessed_text(&*db, sf),
-                preprocessed_full(&*db, sf),
-                resolved_module_arc(&*db, sf),
-            )
+        let Some((original, prep_full, resolved)) = self.document_queries(sf).await else {
+            return Ok(None);
         };
+        let preprocessed = prep_full.python_source.clone();
         // The editor's `position` is in *original* (pre-preprocess) text
         // coordinates, but `preprocessed` is what the resolver bindings,
         // `symbol_at_offset`, `scope_at_offset`, and the member fast path all
@@ -1246,11 +1696,12 @@ impl LanguageServer for Backend {
         // the preprocessed buffer's coordinate space — without it a short
         // member name like `f` in `comptime let x = u.f()` lands past the
         // token and the cross-file jump silently fails (E1).
-        let offset = map_original_position_to_preprocessed_offset(
-            &preprocessed,
-            &prep_full.0.line_col_shifts(),
-            position,
-        );
+        //
+        // Sugar expansion (`?`, `gather:`, with-chains) also inserts lines, so
+        // the position goes through the expansion line table as well (W4-07).
+        let positions =
+            position_map::PositionMap::new(&original, &preprocessed, &prep_full.line_map);
+        let offset = positions.to_preprocessed(position);
 
         // Member-access cross-file jump: clicking on `Bar` in `f.Bar`
         // (after `import foo as f` / `import pkg.sub`) has no resolver
@@ -1322,12 +1773,12 @@ impl LanguageServer for Backend {
             }
         }
 
+        if position_map::is_desugaring_temporary(&def.name) {
+            return Ok(None);
+        }
         let location = Location {
             uri,
-            range: Range {
-                start: byte_to_position(&preprocessed, def.span.0),
-                end: byte_to_position(&preprocessed, def.span.1),
-            },
+            range: positions.range_to_original(def.span.0, def.span.1),
         };
         Ok(Some(GotoDefinitionResponse::Scalar(location)))
     }
@@ -1494,6 +1945,28 @@ impl Backend {
     async fn source_file_for(&self, uri: &Uri) -> Option<SourceFile> {
         let docs = self.documents.lock().await;
         docs.get(uri.as_str()).copied()
+    }
+
+    /// The document's text, full preprocess result and resolved module.
+    /// Salsa computes them on a blocking thread (W4-10): after an edit the
+    /// first request re-runs preprocess + parse + resolve, which used to
+    /// happen on the server's single async thread and stall every other
+    /// request behind it. `None` if the blocking task panicked.
+    async fn document_queries(
+        &self,
+        sf: SourceFile,
+    ) -> Option<(String, ArcPreprocessResult, Arc<ResolvedModule>)> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || {
+            let db = db.blocking_lock();
+            (
+                sf.text(&*db).clone(),
+                preprocessed_full(&*db, sf),
+                resolved_module_arc(&*db, sf),
+            )
+        })
+        .await
+        .ok()
     }
 
     /// Render the import-specific addition to a hover body: the
@@ -1755,7 +2228,9 @@ impl Backend {
         let target_uri = path_to_uri(&module_path)?;
         let target_uri_str = target_uri.as_str().to_owned();
 
-        let prep = tyc_syntax::preprocess::preprocess(&original_source);
+        // The same expansion chain the open-document path runs, so the line
+        // table can carry a declaration below a `?` back to its own line.
+        let prep = tyc_syntax::preprocess::expand_and_preprocess_mapped(&original_source, false);
         let raw_class_byte_starts =
             tyc_syntax::preprocess::line_byte_starts(&prep.python_source, &prep.raw_class_lines);
         let resolved = match self
@@ -1786,112 +2261,19 @@ impl Backend {
             // module, so jump to the top of its source file.
             None => (0, 0),
         };
-        // Map preprocessed-source offsets back to original-source offsets
-        // by adding back the bytes preprocess stripped from earlier lines
-        // (each `let ` or `mut ` removed 4 chars from a single line).
-        let (start, end) = (
-            map_preprocessed_offset_to_original(&prep, &original_source, start_prep),
-            map_preprocessed_offset_to_original(&prep, &original_source, end_prep),
-        );
+        // Map the preprocessed span back onto the text on disk.
+        let range =
+            position_map::PositionMap::new(&original_source, &prep.python_source, &prep.line_map)
+                .range_to_original(start_prep, end_prep);
         let client_uri = self
             .path_to_client_uri(&module_path)
             .await
             .unwrap_or(target_uri);
         Some(Location {
             uri: client_uri,
-            range: Range {
-                start: byte_to_position(&original_source, start),
-                end: byte_to_position(&original_source, end),
-            },
+            range,
         })
     }
-}
-
-/// Map an LSP [`Position`] expressed in *original* (pre-preprocess) text
-/// coordinates to a byte offset in the `preprocessed` buffer.
-///
-/// Preprocessing strips leading modifier keywords (`comptime `, `freeze `,
-/// `lazy `, `newtype `, `pub `) from a line, shifting every column on that
-/// line left by the keyword width; it never adds or removes lines.
-/// `line_shifts` is the per-line stripped-prefix byte count from
-/// [`tyc_syntax::preprocess::PreprocessResult::line_col_shifts`] — the same
-/// table the hover / semantic-tokens paths use to reconcile original ↔
-/// preprocessed columns. Subtracting the line's shift from the editor column
-/// puts the offset back into the preprocessed buffer's coordinate space.
-///
-/// The stripped keywords are pure ASCII, so a column's byte width and its
-/// UTF-16 width coincide for the shifted prefix; subtracting the byte shift
-/// from the UTF-16 character index is therefore exact. For lines with no
-/// stripped prefix (shift 0) this is identical to `position_to_byte`.
-fn map_original_position_to_preprocessed_offset(
-    preprocessed: &str,
-    line_shifts: &[usize],
-    position: Position,
-) -> usize {
-    let shift = line_shifts
-        .get(position.line as usize)
-        .copied()
-        .unwrap_or(0);
-    let adjusted = Position {
-        line: position.line,
-        character: position.character.saturating_sub(shift as u32),
-    };
-    position_to_byte(preprocessed, adjusted)
-}
-
-/// Map a byte offset in `preprocessed` text back to a byte offset in
-/// `original`.  Preprocessing only strips characters from the start of a
-/// line (`let ` / `mut `), and lines are not added or removed, so the
-/// mapping per line is "original_line_start + (preprocessed_col + stripped_prefix_len)".
-///
-/// For lines that don't have a stripped prefix the mapping is identity.
-fn map_preprocessed_offset_to_original(
-    prep: &tyc_syntax::preprocess::PreprocessResult,
-    original: &str,
-    prep_offset: usize,
-) -> usize {
-    let prep_text = prep.python_source.as_str();
-    // Walk both strings line-by-line, finding which line `prep_offset`
-    // falls into and the column within that line.
-    let mut line_idx = 0usize;
-    let mut prep_line_start = 0usize;
-    while prep_line_start < prep_text.len() {
-        let line_end = prep_text[prep_line_start..]
-            .find('\n')
-            .map(|i| prep_line_start + i + 1)
-            .unwrap_or(prep_text.len());
-        if prep_offset < line_end {
-            break;
-        }
-        prep_line_start = line_end;
-        line_idx += 1;
-    }
-    let prep_col = prep_offset.saturating_sub(prep_line_start);
-
-    // Find the same line in the original text.
-    let mut orig_line_start = 0usize;
-    for _ in 0..line_idx {
-        let Some(i) = original[orig_line_start..].find('\n') else {
-            return original.len();
-        };
-        orig_line_start += i + 1;
-    }
-
-    // How many bytes did preprocess strip from the start of this line?
-    // Each `let `/`mut ` removed 4 chars; other stripped keywords (impl,
-    // extend, …) become wider lowering forms instead of getting trimmed,
-    // so they don't shift offsets.
-    let stripped_prefix: usize = prep
-        .stripped
-        .iter()
-        .filter(|s| s.line_index == line_idx)
-        .map(|s| match s.keyword {
-            tyc_syntax::lexer::TyphonKeyword::Let | tyc_syntax::lexer::TyphonKeyword::Mut => 4,
-            _ => 0,
-        })
-        .sum();
-
-    (orig_line_start + prep_col + stripped_prefix).min(original.len())
 }
 
 /// Convert an `lsp_types::Uri` into a local filesystem path.  Only `file:`
@@ -2009,10 +2391,12 @@ fn from_hex(b: u8) -> Option<u8> {
 /// `.dty` stubs are registered first; the second pass over `.ty`
 /// files skips dotted names already in the map so authored stubs
 /// remain the authoritative surface for any module.
+#[allow(clippy::too_many_arguments)]
 fn build_project_shapes_salsa(
     db: &mut TycDatabase,
     project_files: &Arc<Mutex<HashMap<std::path::PathBuf, HashMap<String, SourceFile>>>>,
     src_dir: &std::path::Path,
+    sources: &SourceWalk,
     src_root_name: &str,
     current_uri: &str,
     current_text: &str,
@@ -2031,9 +2415,7 @@ fn build_project_shapes_salsa(
 
     // `.dty` stubs first, so `.ty` insertions skip them on
     // collisions — authored stubs are the source of truth.
-    let dty_files = collect_files_with_ext(src_dir, "dty");
-    let ty_files = collect_files_with_ext(src_dir, "ty");
-    for file in dty_files.iter().chain(ty_files.iter()) {
+    for file in sources.dty.iter().chain(sources.ty.iter()) {
         let dotted = path_to_dotted(file, src_root_name);
         if shapes.contains_key(&dotted) {
             continue;
@@ -2117,37 +2499,16 @@ fn upsert_source_file(
     }
 }
 
-/// Recursive file collection that mirrors the CLI's
-/// `collect_with_ext` — copied here so this crate stays free of a
-/// reverse dependency on the CLI binary crate.
+/// Every `.{ext}` file under `root`, sorted, through the shared symlink-safe
+/// walk the CLI uses (`tyc_venv::walk`): it terminates on symlink cycles and
+/// skips links that leave the tree. The copy this replaced had no loop guard,
+/// so `ln -s . src/a; ln -s . src/b` stalled the server for good (W4-08).
 fn collect_files_with_ext(root: &std::path::Path, ext: &str) -> Vec<std::path::PathBuf> {
-    let mut acc = Vec::new();
-    collect_files_inner(root, ext, &mut acc);
+    let mut acc = tyc_venv::walk::Walk::lenient(ext)
+        .collect_quiet(root)
+        .unwrap_or_default();
     acc.sort();
     acc
-}
-
-fn collect_files_inner(root: &std::path::Path, ext: &str, acc: &mut Vec<std::path::PathBuf>) {
-    if root.is_file() {
-        if root.extension().and_then(|e| e.to_str()) == Some(ext) {
-            acc.push(root.to_path_buf());
-        }
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with('.') || name == "__pycache__" {
-                    continue;
-                }
-            }
-        }
-        collect_files_inner(&path, ext, acc);
-    }
 }
 
 /// Map a file path to its dotted Python module name. Identical
@@ -2193,40 +2554,113 @@ fn uri_matches_path(uri: &str, path: &std::path::Path) -> bool {
     }
 }
 
-/// Walk up from `file_path` looking for a `typhon.toml`.  Returns
-/// `(project_root, src_dir)` — `src_dir` defaults to `project_root/src`
-/// when the toml does not specify, matching `tyc init`'s scaffolding.
-fn find_workspace_layout(
-    file_path: &std::path::Path,
-) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-    let mut dir = file_path.parent()?.to_path_buf();
+/// The project a document belongs to, per the nearest `typhon.toml`.
+#[derive(Debug)]
+enum WorkspaceLookup {
+    /// No `typhon.toml` above the file: single-file mode.
+    None,
+    /// A valid project: `(project_root, src_dir)`.
+    Project(std::path::PathBuf, std::path::PathBuf),
+    /// A `typhon.toml` the CLI would refuse: its path and the CLI's error.
+    Invalid(std::path::PathBuf, tyc_venv::config::ConfigError),
+}
+
+/// Walk up from `file_path` to the nearest `typhon.toml` and load it with the
+/// CLI's validating loader (`tyc_venv::config`), so the server accepts and
+/// rejects exactly what `tyc check` does. In particular an absolute or `..`
+/// `[project] src` is refused instead of walked (W4-08) — `src = "/"` used to
+/// walk the whole filesystem on every keystroke.
+fn lookup_workspace(file_path: &std::path::Path) -> WorkspaceLookup {
+    let Some(parent) = file_path.parent() else {
+        return WorkspaceLookup::None;
+    };
+    let mut dir = parent.to_path_buf();
     loop {
         let candidate = dir.join("typhon.toml");
         if candidate.exists() {
-            let src = parse_src_dir(&candidate).unwrap_or_else(|| "src".to_owned());
-            let src_dir = dir.join(src);
-            return Some((dir, src_dir));
+            return match tyc_venv::config::TyphonConfig::load_file(&candidate) {
+                Ok(config) => {
+                    let src_dir = dir.join(&config.project.src);
+                    WorkspaceLookup::Project(dir, src_dir)
+                }
+                Err(e) => WorkspaceLookup::Invalid(candidate, e),
+            };
         }
         if !dir.pop() {
-            return None;
+            return WorkspaceLookup::None;
         }
     }
 }
 
-/// Pull out the `[project] src` field from `typhon.toml`.
-///
-/// Uses the `toml` crate so inline-table values, end-of-line comments,
-/// nested tables, and the array-of-tables syntax are handled correctly
-/// (the previous line-by-line scanner choked on any of those).  Returns
-/// `None` when the file is unreadable, malformed, or doesn't carry a
-/// `[project] src = "…"` entry — callers fall through to the default
-/// `"src"` directory in that case.
+/// `(project_root, src_dir)` for `file_path`'s project — `src_dir` defaults to
+/// `project_root/src`, matching `tyc init`. `None` outside a project and for a
+/// project whose `typhon.toml` is invalid (the server then checks the file on
+/// its own and reports the config error on `typhon.toml`).
+fn find_workspace_layout(
+    file_path: &std::path::Path,
+) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    match lookup_workspace(file_path) {
+        WorkspaceLookup::Project(root, src) => Some((root, src)),
+        _ => None,
+    }
+}
+
+/// Where in `typhon.toml` (`text`) an error belongs: the line and column a
+/// TOML syntax error names, else the line assigning the key the error is
+/// about, else the top of the file.
+fn config_error_range(text: &str, error: &tyc_venv::config::ConfigError) -> Range {
+    let whole_line = |line: usize| -> Range {
+        let len = text
+            .lines()
+            .nth(line)
+            .map_or(0, |l| l.encode_utf16().count());
+        Range {
+            start: Position {
+                line: line as u32,
+                character: 0,
+            },
+            end: Position {
+                line: line as u32,
+                character: len as u32,
+            },
+        }
+    };
+    if let tyc_venv::config::ConfigError::Parse { cause, .. } = error {
+        // `TOML parse error at line 3, column 5`
+        let at = |marker: &str| -> Option<usize> {
+            let rest = &cause[cause.find(marker)? + marker.len()..];
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            digits.parse().ok()
+        };
+        if let (Some(line), Some(col)) = (at("at line "), at(", column ")) {
+            let line = line.saturating_sub(1);
+            let mut range = whole_line(line);
+            range.start.character = (col.saturating_sub(1) as u32).min(range.end.character);
+            return range;
+        }
+        return whole_line(0);
+    }
+    if let Some(key) = error.key() {
+        for (i, line) in text.lines().enumerate() {
+            let trimmed = line.trim_start();
+            let rest = trimmed
+                .strip_prefix(key)
+                .or_else(|| trimmed.strip_prefix(&format!("\"{key}\"")));
+            if rest.is_some_and(|r| r.trim_start().starts_with('=')) {
+                return whole_line(i);
+            }
+        }
+    }
+    whole_line(0)
+}
+
+/// `[project] src` from a valid `typhon.toml` (the CLI's loader; `None` when
+/// the file is unreadable or invalid).
+#[cfg(test)]
 fn parse_src_dir(toml_path: &std::path::Path) -> Option<String> {
-    let text = std::fs::read_to_string(toml_path).ok()?;
-    let parsed: toml::Value = toml::from_str(&text).ok()?;
-    let project = parsed.get("project")?.as_table()?;
-    let src = project.get("src")?.as_str()?;
-    Some(src.to_owned())
+    tyc_venv::config::TyphonConfig::load_file(toml_path)
+        .ok()
+        .map(|c| c.project.src)
 }
 
 /// Read the `[strictness]` knobs that gate the editor advisory lints
@@ -2825,7 +3259,11 @@ impl LogLevel {
 /// `log_level` controls the severity threshold for messages the backend
 /// forwards to the editor via `client.log_message`. Messages below the
 /// threshold are dropped.
-pub fn run_stdio(log_level: LogLevel) {
+/// Serve LSP on stdin/stdout until the client sends `exit` or hangs up.
+/// Returns the process exit code: 0 after a `shutdown` request, 1 otherwise
+/// (the spec's rule for `exit`; a client that vanishes without `shutdown` is
+/// not a clean exit either).
+pub fn run_stdio(log_level: LogLevel) -> i32 {
     // Match the CLI's deep-recursion headroom (see `tyc/src/main.rs`): the
     // recursive-descent parser and the AST/type walkers can recurse as deep
     // as the user nests brackets/expressions, which overflows the default
@@ -2840,26 +3278,47 @@ pub fn run_stdio(log_level: LogLevel) {
         .build()
         .expect("failed to start tokio runtime for tyc-lsp");
 
-    runtime.block_on(async {
-        let stdin = tokio::io::stdin();
-        let stdout = tokio::io::stdout();
-        let (service, socket) = LspService::new(move |client| Backend {
-            client,
-            db: Arc::new(Mutex::new(TycDatabase::new())),
-            log_level,
-            documents: Arc::new(Mutex::new(HashMap::new())),
-            resolved_cache: Arc::new(Mutex::new(HashMap::new())),
-            introspection: Arc::new(Mutex::new(HashMap::new())),
-            signature_caches: Arc::new(Mutex::new(HashMap::new())),
-            project_indexes: Arc::new(Mutex::new(HashMap::new())),
-            project_files: Arc::new(Mutex::new(HashMap::new())),
-            prewarmed_versions: Arc::new(Mutex::new(HashMap::new())),
-            lint_options_cache: Arc::new(Mutex::new(HashMap::new())),
-            severity_overrides_cache: Arc::new(Mutex::new(HashMap::new())),
-            workspace_root: Arc::new(Mutex::new(None)),
-        });
-        Server::new(stdin, stdout, socket).serve(service).await;
+    let shutdown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&shutdown_requested);
+    runtime.block_on(async move {
+        // The transport guard (W4-11) sits between stdio and the library:
+        // stdin → guard → server, and server → relay → writer → stdout, with
+        // the guard's error replies joining the writer's queue a whole frame
+        // at a time.
+        let (to_server, server_in) = tokio::io::duplex(1 << 16);
+        let (server_out, from_server) = tokio::io::duplex(1 << 16);
+        let (frames_tx, frames_rx) = tokio::sync::mpsc::unbounded_channel();
+        let writer = tokio::spawn(transport::write_frames(tokio::io::stdout(), frames_rx));
+        let guard = tokio::spawn(transport::guard_input(
+            tokio::io::BufReader::new(tokio::io::stdin()),
+            to_server,
+            frames_tx.clone(),
+        ));
+        let relay = tokio::spawn(transport::relay_output(
+            tokio::io::BufReader::new(from_server),
+            frames_tx,
+        ));
+
+        let (service, socket) =
+            LspService::new(move |client| Backend::new(client, log_level, flag));
+        Server::new(server_in, server_out, socket)
+            .serve(service)
+            .await;
+
+        // `serve` dropped its output end, so the relay drains and stops. The
+        // guard may still be parked on a stdin read the client never closes.
+        let _ = relay.await;
+        guard.abort();
+        let _ = guard.await;
+        let _ = writer.await;
     });
+    // Don't wait for a blocking stdin read that will never complete.
+    runtime.shutdown_background();
+    if shutdown_requested.load(std::sync::atomic::Ordering::SeqCst) {
+        0
+    } else {
+        1
+    }
 }
 
 /// Typhon-specific keywords that the LSP advertises in completion.  Kept
@@ -4349,6 +4808,16 @@ fn byte_to_position(source: &str, target: usize) -> Position {
 mod tests {
     use super::*;
 
+    /// A fresh [`SourceWalk`] of `src`, for tests that build the registry
+    /// directly.
+    fn walk_of(src: &std::path::Path) -> SourceWalk {
+        SourceWalk {
+            taken: std::time::Instant::now(),
+            dty: collect_files_with_ext(src, "dty"),
+            ty: collect_files_with_ext(src, "ty"),
+        }
+    }
+
     #[test]
     fn advisory_severity_maps_advice_to_hint() {
         // `gather_opportunity` is declared `severity(Advice)` → faint HINT.
@@ -4526,20 +4995,12 @@ mod tests {
     /// Spin up the real server over an in-memory pipe; return the client-side
     /// (writer, reader) duplex halves.
     fn spawn_backend() -> (DuplexStream, DuplexStream) {
-        let (service, socket) = LspService::new(|client| Backend {
-            client,
-            db: Arc::new(Mutex::new(TycDatabase::new())),
-            log_level: LogLevel::Error,
-            documents: Arc::new(Mutex::new(HashMap::new())),
-            resolved_cache: Arc::new(Mutex::new(HashMap::new())),
-            introspection: Arc::new(Mutex::new(HashMap::new())),
-            signature_caches: Arc::new(Mutex::new(HashMap::new())),
-            project_indexes: Arc::new(Mutex::new(HashMap::new())),
-            project_files: Arc::new(Mutex::new(HashMap::new())),
-            prewarmed_versions: Arc::new(Mutex::new(HashMap::new())),
-            lint_options_cache: Arc::new(Mutex::new(HashMap::new())),
-            severity_overrides_cache: Arc::new(Mutex::new(HashMap::new())),
-            workspace_root: Arc::new(Mutex::new(None)),
+        let (service, socket) = LspService::new(|client| {
+            Backend::new(
+                client,
+                LogLevel::Error,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
         });
         let (to_server, server_in) = tokio::io::duplex(64 * 1024);
         let (server_out, from_server) = tokio::io::duplex(64 * 1024);
@@ -5938,6 +6399,567 @@ mod tests {
         );
     }
 
+    /// Send one request and wait for its response's `result`.
+    async fn request(
+        to: &mut DuplexStream,
+        from: &mut DuplexStream,
+        id: i64,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        send(
+            to,
+            serde_json::json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let msg = recv(from).await;
+                if msg.get("id").and_then(|i| i.as_i64()) == Some(id) {
+                    return msg
+                        .get("result")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                }
+            }
+        })
+        .await
+        .expect("request timed out")
+    }
+
+    async fn hover_text(
+        to: &mut DuplexStream,
+        from: &mut DuplexStream,
+        id: i64,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> String {
+        let result = request(
+            to,
+            from,
+            id,
+            "textDocument/hover",
+            serde_json::json!({"textDocument":{"uri":uri},
+                "position":{"line":line,"character":character}}),
+        )
+        .await;
+        result["contents"]["value"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// The review's repro: a `?` on line 4 expands into four lines.
+    const QUESTION_SRC: &str = "def p(s: str) -> Result[int, str]:\n    return Ok(1)\n\ndef g(s: str) -> Result[int, str]:\n    let a: int = p(s)?\n    return Ok(a)\n\nlet y: int = 3\nprint(y)\n";
+
+    /// W4-07: hover below a line-expanding `?` names the identifier under the
+    /// cursor, never a desugaring temporary or a neighbouring line's binding.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hover_below_question_mark_names_the_right_symbol() {
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, None).await;
+        let uri = "file:///tmp/tyc_lsp_w407_hover/main.ty";
+        did_open(&mut to, uri, QUESTION_SRC).await;
+        next_diagnostics(&mut from, uri).await;
+
+        let a = hover_text(&mut to, &mut from, 10, uri, 4, 8).await;
+        assert!(a.starts_with("**a**"), "hover on `a`: {a}");
+        assert!(!a.contains("__typhon"), "temporary leaked: {a}");
+        let p = hover_text(&mut to, &mut from, 11, uri, 4, 17).await;
+        assert!(p.contains("**p** — *function*"), "hover on `p`: {p}");
+        let a_use = hover_text(&mut to, &mut from, 12, uri, 5, 14).await;
+        assert!(a_use.starts_with("**a**"), "hover on `a` use: {a_use}");
+        let y = hover_text(&mut to, &mut from, 13, uri, 7, 4).await;
+        assert!(y.starts_with("**y**"), "hover on `y`: {y}");
+        let y_use = hover_text(&mut to, &mut from, 14, uri, 8, 6).await;
+        assert!(y_use.starts_with("**y**"), "hover on `y` use: {y_use}");
+
+        // The hover range is reported in the editor's coordinates.
+        let result = request(
+            &mut to,
+            &mut from,
+            15,
+            "textDocument/hover",
+            serde_json::json!({"textDocument":{"uri":uri},
+                "position":{"line":7,"character":4}}),
+        )
+        .await;
+        assert_eq!(result["range"]["start"]["line"].as_u64(), Some(7));
+        assert_eq!(result["range"]["start"]["character"].as_u64(), Some(4));
+        assert_eq!(result["range"]["end"]["character"].as_u64(), Some(5));
+    }
+
+    /// W4-07: go-to-definition below a `?` lands on the declaration's line in
+    /// the editor, not on the expanded buffer's line.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn definition_below_question_mark_lands_on_the_declaration() {
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, None).await;
+        let uri = "file:///tmp/tyc_lsp_w407_def/main.ty";
+        did_open(&mut to, uri, QUESTION_SRC).await;
+        next_diagnostics(&mut from, uri).await;
+
+        let a = goto_definition_request(&mut to, &mut from, 20, uri, 5, 14).await;
+        assert_eq!(a["range"]["start"]["line"].as_u64(), Some(4), "{a}");
+        assert_eq!(a["range"]["start"]["character"].as_u64(), Some(8), "{a}");
+        let y = goto_definition_request(&mut to, &mut from, 21, uri, 8, 6).await;
+        assert_eq!(y["range"]["start"]["line"].as_u64(), Some(7), "{y}");
+        assert_eq!(y["range"]["start"]["character"].as_u64(), Some(4), "{y}");
+    }
+
+    /// W4-07: a constructor call never hovers as the `impl` lowering's class.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hover_on_constructor_hides_impl_lowering() {
+        let src = "class Point:\n    x: int\n\nimpl Point:\n    def norm(self) -> int:\n        return self.x\n\nlet q = Point(x=1)\nprint(q.norm())\n";
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, None).await;
+        let uri = "file:///tmp/tyc_lsp_w407_ctor/main.ty";
+        did_open(&mut to, uri, src).await;
+        next_diagnostics(&mut from, uri).await;
+        let h = hover_text(&mut to, &mut from, 30, uri, 7, 9).await;
+        assert!(h.starts_with("**Point**"), "hover on `Point`: {h}");
+        assert!(!h.contains("__typhon"), "lowering leaked: {h}");
+    }
+
+    /// W4-07: member completion after a `?` uses the receiver under the
+    /// cursor, and open completion never offers desugaring temporaries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completion_below_question_mark_uses_the_cursor_context() {
+        let src = "import os\n\ndef p(s: str) -> Result[int, str]:\n    return Ok(1)\n\ndef g(s: str) -> Result[int, str]:\n    let a: int = p(s)?\n    return Ok(a)\n\nlet d = os.\n";
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, None).await;
+        let uri = "file:///tmp/tyc_lsp_w407_completion/main.ty";
+        did_open(&mut to, uri, src).await;
+        next_diagnostics(&mut from, uri).await;
+        let result = request(
+            &mut to,
+            &mut from,
+            40,
+            "textDocument/completion",
+            serde_json::json!({"textDocument":{"uri":uri},
+                "position":{"line":9,"character":11}}),
+        )
+        .await;
+        let labels: Vec<&str> = result
+            .as_array()
+            .map(|a| a.iter().filter_map(|i| i["label"].as_str()).collect())
+            .unwrap_or_default();
+        assert!(labels.contains(&"path"), "os members expected: {labels:?}");
+        assert!(!labels.contains(&"let"), "generic list leaked: {labels:?}");
+
+        // Open completion inside `g`, below the `?` (in a buffer that parses,
+        // so the resolver has scopes).
+        let uri = "file:///tmp/tyc_lsp_w407_completion/other.ty";
+        did_open(&mut to, uri, QUESTION_SRC).await;
+        next_diagnostics(&mut from, uri).await;
+        let result = request(
+            &mut to,
+            &mut from,
+            41,
+            "textDocument/completion",
+            serde_json::json!({"textDocument":{"uri":uri},
+                "position":{"line":5,"character":4}}),
+        )
+        .await;
+        let labels: Vec<&str> = result
+            .as_array()
+            .map(|a| a.iter().filter_map(|i| i["label"].as_str()).collect())
+            .unwrap_or_default();
+        assert!(labels.contains(&"a"), "`a` in scope: {labels:?}");
+        assert!(
+            labels.iter().all(|l| !l.starts_with("__typhon")),
+            "temporaries offered: {labels:?}"
+        );
+    }
+
+    /// W4-08: a symlink loop in the source tree must not hang the server.
+    /// `ln -s . src/a; ln -s . src/b` made the old walk enumerate an
+    /// exponential number of paths, so no diagnostics ever arrived.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn symlink_loop_in_src_does_not_hang() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname=\"x\"\nsrc=\"src\"\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("util.ty"), "def f() -> int:\n    return 1\n").unwrap();
+        let main_src = "from util import f\nlet s: str = f()\n";
+        std::fs::write(src.join("main.ty"), main_src).unwrap();
+        std::os::unix::fs::symlink(".", src.join("a")).unwrap();
+        std::os::unix::fs::symlink(".", src.join("b")).unwrap();
+
+        let uri = format!("file://{}", src.join("main.ty").display());
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, None).await;
+        did_open(&mut to, &uri, main_src).await;
+        let diags = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            next_diagnostics(&mut from, &uri),
+        )
+        .await
+        .expect("a symlink loop must not stall diagnostics");
+        // The project is still checked across modules (once per file).
+        assert!(
+            diags.iter().any(|d| d["code"]
+                .as_str()
+                .is_some_and(|c| c.contains("type_mismatch"))),
+            "cross-module check expected: {diags:?}"
+        );
+    }
+
+    /// W4-08: `[project] src` outside the project is rejected, as the CLI
+    /// rejects it — the server must not read (or walk) that directory.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn src_outside_the_project_is_not_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("proj");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("util.ty"), "def f() -> int:\n    return 1\n").unwrap();
+        for src_value in [outside.display().to_string(), "../outside".to_owned()] {
+            std::fs::write(
+                project.join("typhon.toml"),
+                format!("[project]\nname=\"x\"\nsrc=\"{src_value}\"\n"),
+            )
+            .unwrap();
+            let main_src = "from util import f\nlet s: str = f()\n";
+            let main = project.join("main.ty");
+            std::fs::write(&main, main_src).unwrap();
+            let uri = format!("file://{}", main.display());
+            let (mut to, mut from) = spawn_backend();
+            handshake(&mut to, &mut from, None).await;
+            did_open(&mut to, &uri, main_src).await;
+            let diags = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                next_diagnostics(&mut from, &uri),
+            )
+            .await
+            .expect("diagnostics");
+            assert!(
+                !diags.iter().any(|d| d["code"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("type_mismatch"))),
+                "src = {src_value:?} must not be read: {diags:?}"
+            );
+        }
+    }
+
+    /// [`spawn_backend`], also handing back the backend's open-document map.
+    fn spawn_backend_with_documents() -> (
+        DuplexStream,
+        DuplexStream,
+        Arc<Mutex<HashMap<String, SourceFile>>>,
+    ) {
+        let mut documents = None;
+        let (service, socket) = LspService::new(|client| {
+            let backend = Backend::new(
+                client,
+                LogLevel::Error,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            );
+            documents = Some(Arc::clone(&backend.documents));
+            backend
+        });
+        let (to_server, server_in) = tokio::io::duplex(64 * 1024);
+        let (server_out, from_server) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            Server::new(server_in, server_out, socket)
+                .serve(service)
+                .await
+        });
+        (to_server, from_server, documents.unwrap())
+    }
+
+    /// W4-11: reopening a closed document reuses its Salsa input. Each
+    /// `didOpen` after a `didClose` used to allocate a fresh, never-freed
+    /// `SourceFile` (300 reopen cycles: 5 MB → 75 MB RSS).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reopening_a_document_reuses_its_input() {
+        let (mut to, mut from, documents) = spawn_backend_with_documents();
+        handshake(&mut to, &mut from, None).await;
+        let uri = "file:///tmp/tyc_lsp_w411_reopen/main.ty";
+        // Drain the server's output so its writes never block.
+        tokio::spawn(async move {
+            loop {
+                recv(&mut from).await;
+            }
+        });
+        // Wait until the document is (or is not) in the open set.
+        let settle = |want_open: bool| {
+            let documents = Arc::clone(&documents);
+            async move {
+                tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                    loop {
+                        if let Some(sf) = documents.lock().await.get(uri).copied() {
+                            if want_open {
+                                return Some(sf);
+                            }
+                        } else if !want_open {
+                            return None;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("document state")
+            }
+        };
+        let mut handles = Vec::new();
+        for i in 0..3 {
+            did_open(&mut to, uri, &format!("let x: int = {i}\n")).await;
+            handles.push(settle(true).await.unwrap());
+            send(
+                &mut to,
+                serde_json::json!({"jsonrpc":"2.0","method":"textDocument/didClose",
+                    "params":{"textDocument":{"uri":uri}}}),
+            )
+            .await;
+            settle(false).await;
+        }
+        assert!(
+            handles.windows(2).all(|w| w[0] == w[1]),
+            "every reopen must reuse the first input"
+        );
+    }
+
+    /// W4-11: a `typhon.toml` the CLI rejects is reported on the file itself
+    /// (the server used to fall back to defaults in silence), and the report
+    /// clears once the file is fixed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invalid_typhon_toml_is_reported_on_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let toml_path = tmp.path().join("typhon.toml");
+        std::fs::write(
+            &toml_path,
+            "[project]\nname = \"x\"\n\n[strictness]\nnullable-use = \"eror\"\n",
+        )
+        .unwrap();
+        let main_src = "let x: int = 1\n";
+        std::fs::write(src.join("main.ty"), main_src).unwrap();
+        let main_uri = format!("file://{}", src.join("main.ty").display());
+        let toml_uri = format!("file://{}", toml_path.display());
+
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, None).await;
+        did_open(&mut to, &main_uri, main_src).await;
+        let diags = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            next_diagnostics(&mut from, &toml_uri),
+        )
+        .await
+        .expect("typhon.toml diagnostics");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        let d = &diags[0];
+        assert_eq!(d["severity"].as_i64(), Some(1), "{d}");
+        assert!(
+            d["message"].as_str().unwrap().contains("nullable-use"),
+            "{d}"
+        );
+        assert_eq!(d["range"]["start"]["line"].as_u64(), Some(4), "{d}");
+
+        // Fix it and tell the server; the report goes away.
+        std::fs::write(&toml_path, "[project]\nname = \"x\"\n").unwrap();
+        send(
+            &mut to,
+            serde_json::json!({"jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles",
+                "params":{"changes":[{"uri":toml_uri,"type":2}]}}),
+        )
+        .await;
+        let cleared = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            next_diagnostics(&mut from, &toml_uri),
+        )
+        .await
+        .expect("cleared typhon.toml diagnostics");
+        assert!(cleared.is_empty(), "{cleared:?}");
+    }
+
+    async fn did_change(to: &mut DuplexStream, uri: &str, version: i32, text: &str) {
+        send(
+            to,
+            serde_json::json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{
+                "textDocument":{"uri":uri,"version":version},
+                "contentChanges":[{"text":text}]}}),
+        )
+        .await;
+    }
+
+    /// Every `publishDiagnostics` that arrives within `window`, as
+    /// `(uri, version, diagnostics)`.
+    async fn publishes_within(
+        from: &mut DuplexStream,
+        window: std::time::Duration,
+    ) -> Vec<(String, Option<i64>, Vec<serde_json::Value>)> {
+        let mut out = Vec::new();
+        let deadline = tokio::time::Instant::now() + window;
+        while let Ok(msg) = tokio::time::timeout_at(deadline, recv(from)).await {
+            if msg.get("method").and_then(|m| m.as_str()) == Some("textDocument/publishDiagnostics")
+            {
+                out.push((
+                    msg["params"]["uri"].as_str().unwrap_or_default().to_owned(),
+                    msg["params"]["version"].as_i64(),
+                    msg["params"]["diagnostics"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default(),
+                ));
+            }
+        }
+        out
+    }
+
+    /// W4-10: a burst of edits is checked once, not once per keystroke
+    /// (51 full-text changes used to produce 51 checks and publishes).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_burst_of_edits_is_checked_once() {
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, None).await;
+        let uri = "file:///tmp/tyc_lsp_w410_burst/main.ty";
+        did_open(&mut to, uri, "let x: int = 0\n").await;
+        publishes_within(&mut from, std::time::Duration::from_millis(500)).await;
+        for v in 2..=31 {
+            did_change(&mut to, uri, v, &format!("let x: int = {v}\n")).await;
+        }
+        did_change(&mut to, uri, 32, "let x: int = \"oops\"\n").await;
+        let published = publishes_within(&mut from, std::time::Duration::from_secs(3)).await;
+        let mine: Vec<_> = published.iter().filter(|p| p.0 == uri).collect();
+        assert!(
+            mine.len() <= 3,
+            "31 edits produced {} publishes: {:?}",
+            mine.len(),
+            mine.iter().map(|p| p.1).collect::<Vec<_>>()
+        );
+        let last = mine.last().expect("the final version is published");
+        assert_eq!(last.1, Some(32));
+        assert!(
+            last.2.iter().any(|d| d["code"]
+                .as_str()
+                .is_some_and(|c| c.contains("type_mismatch"))),
+            "{:?}",
+            last.2
+        );
+    }
+
+    /// W4-10 (the cost W4-09 introduced): an edit re-checks the open
+    /// documents that import the edited module — and only those — and never
+    /// checks the edited document twice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_edit_refreshes_only_importers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname=\"x\"\nsrc=\"src\"\n",
+        )
+        .unwrap();
+        let provider = "def value() -> int:\n    return 1\n";
+        let consumer = "from provider import value\nlet x: int = value()\n";
+        let unrelated = "let y: int = 2\n";
+        for (name, text) in [
+            ("provider.ty", provider),
+            ("consumer.ty", consumer),
+            ("unrelated.ty", unrelated),
+        ] {
+            std::fs::write(src.join(name), text).unwrap();
+        }
+        let uri = |n: &str| format!("file://{}", src.join(n).display());
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, None).await;
+        for (name, text) in [
+            ("provider.ty", provider),
+            ("consumer.ty", consumer),
+            ("unrelated.ty", unrelated),
+        ] {
+            did_open(&mut to, &uri(name), text).await;
+        }
+        publishes_within(&mut from, std::time::Duration::from_secs(2)).await;
+
+        // Change the provider's return type, unsaved.
+        did_change(
+            &mut to,
+            &uri("provider.ty"),
+            2,
+            "def value() -> str:\n    return \"a\"\n",
+        )
+        .await;
+        let published = publishes_within(&mut from, std::time::Duration::from_secs(3)).await;
+        let count = |n: &str| published.iter().filter(|p| p.0 == uri(n)).count();
+        assert_eq!(count("provider.ty"), 1, "{published:?}");
+        assert_eq!(count("unrelated.ty"), 0, "{published:?}");
+        let consumer_diags = published
+            .iter()
+            .rfind(|p| p.0 == uri("consumer.ty"))
+            .expect("the importer is refreshed");
+        assert!(
+            consumer_diags.2.iter().any(|d| d["code"]
+                .as_str()
+                .is_some_and(|c| c.contains("type_mismatch"))),
+            "{consumer_diags:?}"
+        );
+    }
+
+    /// W4-09 (kept by W4-10): a dependency changed on disk refreshes the open
+    /// consumer once the editor reports the change.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dependency_changed_on_disk_refreshes_its_importer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname=\"x\"\nsrc=\"src\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("provider.ty"),
+            "def value() -> int:\n    return 1\n",
+        )
+        .unwrap();
+        let consumer = "from provider import value\nlet x: int = value()\n";
+        std::fs::write(src.join("consumer.ty"), consumer).unwrap();
+        let consumer_uri = format!("file://{}", src.join("consumer.ty").display());
+        let provider_uri = format!("file://{}", src.join("provider.ty").display());
+
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, None).await;
+        did_open(&mut to, &consumer_uri, consumer).await;
+        let first = next_diagnostics(&mut from, &consumer_uri).await;
+        assert!(first.is_empty(), "{first:?}");
+
+        std::fs::write(
+            src.join("provider.ty"),
+            "def value() -> str:\n    return \"a\"\n",
+        )
+        .unwrap();
+        send(
+            &mut to,
+            serde_json::json!({"jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles",
+                "params":{"changes":[{"uri":provider_uri,"type":2}]}}),
+        )
+        .await;
+        let refreshed = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            next_diagnostics(&mut from, &consumer_uri),
+        )
+        .await
+        .expect("the importer is refreshed");
+        assert!(
+            refreshed.iter().any(|d| d["code"]
+                .as_str()
+                .is_some_and(|c| c.contains("type_mismatch"))),
+            "{refreshed:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn goto_definition_in_symlinked_workspace_root() {
@@ -6993,6 +8015,7 @@ def f() -> None:
             &mut db,
             &project_files,
             &src,
+            &walk_of(&src),
             "src",
             "",
             "",
@@ -7015,8 +8038,16 @@ def f() -> None:
         let mut open_docs = HashMap::new();
         open_docs.insert(path_lookup_key(&thing_path), doc);
 
-        let shapes =
-            build_project_shapes_salsa(&mut db, &project_files, &src, "src", "", "", &open_docs);
+        let shapes = build_project_shapes_salsa(
+            &mut db,
+            &project_files,
+            &src,
+            &walk_of(&src),
+            "src",
+            "",
+            "",
+            &open_docs,
+        );
         let live = &shapes["thing"].class_shapes["Thing"];
         assert!(
             live.fields.contains_key("b"),
@@ -7040,6 +8071,7 @@ def f() -> None:
             &mut db,
             &project_files,
             &src,
+            &walk_of(&src),
             "src",
             "",
             "",
@@ -7060,6 +8092,7 @@ def f() -> None:
             &mut db,
             &project_files,
             &src,
+            &walk_of(&src),
             "src",
             "",
             "",
@@ -7082,6 +8115,7 @@ def f() -> None:
             &mut db,
             &project_files,
             &src,
+            &walk_of(&src),
             "src",
             "",
             "",

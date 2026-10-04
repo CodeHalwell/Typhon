@@ -81,6 +81,8 @@ if __name__ == "__main__":
 
 You'll edit this as the project grows. See [`typhon.toml` Overview](/Typhon/configuration/overview/) for every key.
 
+The generated `typhon.toml` leaves the optimiser knobs (`auto-memoise`, `auto-gather`, `auto-parallel`, `pgo-memoise`) unset, so they follow `[optimise] level`: off by default, on with `level = 1` or under `tyc build -O`. Writing one of them into `[strictness]` overrides both.
+
 ## Flags
 
 | Flag | Default | Effect |
@@ -92,6 +94,7 @@ You'll edit this as the project grows. See [`typhon.toml` Overview](/Typhon/conf
 - It does **not** run `git init`. Run that yourself if you want a repository.
 - It does **not** install dependencies. Use [`tyc add`](/Typhon/cli/packages/) for that, or run `tyc build` and let the bundled `uv sync` step handle it.
 - It does **not** create a virtualenv. The first `tyc build` materialises `.venv` via `uv sync` automatically.
+- It does **not** overwrite anything. An existing `typhon.toml` or `src/main.ty` — or a symlink at either path — stops it before it writes a single file.
 
 ## Where next
 

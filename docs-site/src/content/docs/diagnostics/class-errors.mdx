@@ -193,6 +193,144 @@ class Bucket:
 
 The warning still fires on immutable literals (`int = 3`, `str = "x"`) where the slot-descriptor pitfall genuinely applies.
 
+## `tyc::duplicate_method`
+
+Two `impl` / `extend` blocks for the same class define the same method. The
+blocks are merged into one class body, where the second definition would
+silently replace the first.
+
+```python
+class Box:
+    value: int
+
+impl Box:
+    def get(self) -> int:
+        return self.value
+
+extend Box:
+    def get(self) -> int:    # ❌ method `get` is defined more than once on `Box`
+        return self.value * 2
+```
+
+**Fix:** rename one (`get_doubled`), delete the copy, or merge the blocks.
+
+## `tyc::field_default_ordering`
+
+A field without a default follows a field with one. The generated
+`__init__` follows declaration order, and Python refuses a non-default
+parameter after a default one — the class would fail with `TypeError` at
+import.
+
+```python
+class Worker:
+    name: str
+    retries: int = 3
+    queue_size: int    # ❌ (no default) is declared after `retries` (has a default)
+```
+
+**Fix:** move every field without a default above the defaulted ones.
+`model` classes are exempt (Pydantic orders its own fields).
+
+## `tyc::frozen_inheritance_conflict`
+
+A `frozen` class and its in-module dataclass base disagree on frozen-ness.
+CPython raises `TypeError: cannot inherit frozen dataclass from a non-frozen
+one` (or the reverse) when the module is imported.
+
+```python
+class Shape:
+    name: str
+
+class Square frozen(Shape):    # ❌ frozen class, non-frozen base
+    side: float
+```
+
+**Fix:** make both `frozen` (`class Shape frozen:`) or neither. Bases from
+other modules or non-dataclass bases are not compared.
+
+## `tyc::newtype_violation`
+
+A `newtype` constructor receives a value of the wrong base type.
+
+```python
+newtype UserId = int
+
+def main() -> None:
+    let bad: UserId = UserId("seven")    # ❌ expected `UserId`, found bare `str`
+    print(bad)
+```
+
+**Fix:** pass a value of the base type: `UserId(7)`. Passing a bare `int`
+where a `UserId` is expected, or one newtype where another is expected, is
+reported as [`tyc::type_mismatch`](/Typhon/diagnostics/type-errors/#tyctype_mismatch).
+
+## `tyc::newtype_invalid_base`
+
+A `newtype` declares a literal, not a type, as its base.
+
+```python
+newtype Color = "red"    # ❌ `newtype Color` base must be a type, not `string literal`
+```
+
+**Fix:** wrap a type (`newtype UserId = int`). For a fixed set of strings,
+use a literal union (`type Color = "red" | "green" | "blue"`) or an `enum`.
+
+## `tyc::self_outside_impl`
+
+`self` is read in a function that has no `self` — anywhere outside an
+`impl` method body.
+
+```python
+def area() -> float:
+    return self.width * self.height    # ❌ cannot find 'self' in scope
+```
+
+**Fix:** move the function into an `impl` block of the class it belongs to:
+
+```python
+class Rect:
+    width: float
+    height: float
+
+impl Rect:
+    def area(self) -> float:
+        return self.width * self.height
+```
+
+## `tyc::not_a_context_manager`
+
+The subject of a `with` (or `async with`) is a class from this module that
+lacks `__enter__` / `__exit__` (or `__aenter__` / `__aexit__`). CPython raises
+`TypeError` at the `with` statement.
+
+```python
+class Plain:
+    label: str
+
+def main() -> None:
+    with Plain(label="world") as p:    # ❌ `Plain` is not a context manager: it has no `__enter__` method
+        print(p.label)
+```
+
+**Fix:** implement the protocol in an `impl` block, or use a
+`@contextmanager` factory. Classes with a base from another module, and
+values of unknown type, are not checked.
+
+## `tyc::raise_non_exception`
+
+A `raise` operand is provably not an exception: a literal, another
+primitive, or an instance of a class that does not derive from
+`BaseException`. CPython raises `TypeError: exceptions must derive from
+BaseException`.
+
+```python
+def f() -> int:
+    raise 42    # ❌ cannot raise `int`
+```
+
+**Fix:** raise an exception (`raise ValueError("bad input")`), or return an
+`Err(...)` for an error the caller should handle.
+
 ## Where next
 
 - [Classes and Models (tour)](/Typhon/tour/classes/) — teaching page.

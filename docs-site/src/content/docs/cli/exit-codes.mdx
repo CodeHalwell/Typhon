@@ -18,12 +18,12 @@ sidebar:
 
 | Command | 0 means | Non-zero means |
 |---------|---------|----------------|
-| `tyc check` | No errors. | 1 if any error-severity diagnostic or the input is invalid; 2 if the command line is malformed. |
+| `tyc check` | No errors. | 1 if any error-severity diagnostic, the input is invalid, or there was nothing to check (no `.ty` files under the paths); 2 if the command line is malformed. |
 | `tyc check --stubs` | No drift. | 1 if any `tyc::stub_mismatch` at error severity (the [`stub-check`](/Typhon/configuration/strictness/#stub-check) default). |
 | `tyc build` | Build succeeded. | 1 if any error-severity diagnostic stops emission. |
 | `tyc fmt` | No changes / changes written. | 1 (with `--check`) if any file would change. |
 | `tyc run` | Script exited 0. | **Propagates the script's exit code** verbatim. |
-| `tyc repl` | Clean exit. | 130 on Ctrl-C. |
+| `tyc repl` | Clean exit. | 130 on Ctrl-C. With stdin piped (a script fed in), 1 if any snippet failed to compile or raised. |
 | `tyc debug` | Debugger exited 0. | Whatever the debugger exits with. |
 | `tyc trace` | Traceback remapped. | 1 if the file is unreadable / not a valid traceback. |
 | `tyc profile` | Instrumented build written. | 1 if the build or the instrumentation failed. (`tyc profile` does not run the program — you do, and the profile is written on its exit.) |
@@ -31,6 +31,7 @@ sidebar:
 | `tyc ty` | `ty` returned 0. | Propagates `ty`'s exit code. |
 | `tyc stubtest` | `mypy.stubtest` returned 0. | Propagates mypy's exit code. |
 | `tyc add` / `remove` / `sync` | Manifest updated and `uv sync` succeeded. | 1 if uv missing; non-zero from uv on resolution failure. |
+| `tyc lsp` | The client sent `shutdown` before `exit`. | 1 when the client sends `exit` without `shutdown` (the LSP spec's rule) or closes stdin without it. |
 
 ## Severity-to-exit-code mapping
 

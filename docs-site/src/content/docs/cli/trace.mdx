@@ -30,7 +30,7 @@ python build/main.py 2>&1 | tyc trace
 5. Replace the source row CPython printed under the frame with the real `.ty` row, and drop the column anchors (`~~~~^^^^`) — their columns refer to the emitted line, not this one.
 6. Print the remapped traceback.
 
-The output looks like a normal Python traceback, but the frames are `.ty` paths and line numbers.
+The output looks like a normal Python traceback, but the frames are `.ty` paths and line numbers. Frames inside an `ExceptionGroup` traceback (every failed `gather:` block prints one) are rewritten too, keeping CPython's `  |   ` gutter.
 
 Step 5 matters as much as step 4. Rewriting only the header leaves a frame reading `File "src/main.ty", line 10` above a row of emitted Python — sometimes a generated name like `__typhon_qi_0__` — that does not exist at `main.ty:10`, so opening the line named in the traceback shows something else. Where the `.ty` file is not readable from where `tyc trace` runs (a traceback pasted from another machine), the original row is kept rather than dropped.
 
