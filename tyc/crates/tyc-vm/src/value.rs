@@ -3574,7 +3574,10 @@ fn format_float(x: f64) -> String {
 /// the long forms need the check.
 fn tie_break_even(s: &str, x: f64) -> String {
     let mantissa_end = s.find(['e', 'E']).unwrap_or(s.len());
-    let digits: Vec<u8> = s[..mantissa_end].bytes().filter(u8::is_ascii_digit).collect();
+    let digits: Vec<u8> = s[..mantissa_end]
+        .bytes()
+        .filter(u8::is_ascii_digit)
+        .collect();
     let lead = digits.iter().take_while(|d| **d == b'0').count();
     let k = digits.len() - lead;
     if k < 16 {

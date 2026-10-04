@@ -108,7 +108,11 @@ pub fn char_at(s: &Rc<String>, i: usize) -> Option<char> {
 /// `s[start:stop]` for character indices with `start <= stop <= len(s)`.
 pub fn char_range(s: &Rc<String>, start: usize, stop: usize) -> String {
     if s.len() < CACHE_FROM {
-        return s.chars().skip(start).take(stop.saturating_sub(start)).collect();
+        return s
+            .chars()
+            .skip(start)
+            .take(stop.saturating_sub(start))
+            .collect();
     }
     match offsets(s) {
         None => s[start.min(s.len())..stop.min(s.len())].to_owned(),

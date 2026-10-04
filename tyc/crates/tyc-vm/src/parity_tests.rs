@@ -48,9 +48,7 @@ def trap(label: str, thunk: object) -> None:
 
 /// The probe as plain Python: the only Typhon spellings probes use.
 fn to_python(probe: &str) -> String {
-    probe
-        .replace("plain class ", "class ")
-        .replace("mut ", "")
+    probe.replace("plain class ", "class ").replace("mut ", "")
 }
 
 fn python_missing(test: &str) {
@@ -101,7 +99,10 @@ fn assert_matches_cpython_with(test: &str, probe: &str, py_header: &str) {
     let Some((_, py_err, code)) = run_python(dir.path(), &python) else {
         return python_missing(test);
     };
-    assert_eq!(code, 0, "{test}: the probe fails under python3.13:\n{py_err}");
+    assert_eq!(
+        code, 0,
+        "{test}: the probe fails under python3.13:\n{py_err}"
+    );
     let expected = std::fs::read_to_string(&dump).unwrap();
     std::fs::remove_file(&dump).unwrap();
     let vm = on_worker(|| crate::run_source(&body, None, &[]));
@@ -757,7 +758,9 @@ print(f(50))
 fn runtime_py(name: &str, alias: &str) -> String {
     const BUILD_RS: &str = include_str!("../../tyc/src/commands/build.rs");
     let marker = format!("const {name}: &str = \"\\\n");
-    let start = BUILD_RS.find(&marker).expect("runtime template in build.rs");
+    let start = BUILD_RS
+        .find(&marker)
+        .expect("runtime template in build.rs");
     let body = &BUILD_RS[start + marker.len()..];
     let end = body.find("\n\";").expect("end of the runtime template");
     // Undo the Rust string escapes the template uses.

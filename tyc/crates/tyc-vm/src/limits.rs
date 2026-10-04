@@ -142,7 +142,8 @@ pub fn check_int_to_str(n: &VmInt) -> Result<(), Unwind> {
     let bits = b.bits();
     // `bits` binary digits hold between ⌊(bits-1)·log10 2⌋+1 and
     // ⌊bits·log10 2⌋+1 decimal digits.
-    let at_least = ((bits.saturating_sub(1)) as f64 * std::f64::consts::LOG10_2).floor() as usize + 1;
+    let at_least =
+        ((bits.saturating_sub(1)) as f64 * std::f64::consts::LOG10_2).floor() as usize + 1;
     let at_most = (bits as f64 * std::f64::consts::LOG10_2).floor() as usize + 1;
     let too_long = if at_least > limit {
         true

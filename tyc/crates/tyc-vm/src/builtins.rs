@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::rc::Rc;
 
-
 use crate::error::{attribute_error, index_error, key_error, type_error, value_error, Unwind};
 use crate::interp::{normalize_index, Interpreter};
 use crate::value::{DictMap, HashKey, IterState, Module, NativeFn, Value, VmInt};
@@ -6074,7 +6073,9 @@ fn make_sys_module(interp: &Interpreter) -> Value {
             (
                 "get_int_max_str_digits",
                 nf("get_int_max_str_digits", |_i, _args| {
-                    Ok(Value::Int(VmInt::from(crate::limits::int_max_str_digits() as i64)))
+                    Ok(Value::Int(VmInt::from(
+                        crate::limits::int_max_str_digits() as i64
+                    )))
                 }),
             ),
             (
@@ -10819,7 +10820,9 @@ fn bytes_method(
         }
         "expandtabs" => {
             let size = match args.first() {
-                Some(v) if !matches!(v, Value::None) => crate::limits::c_int_arg(v)?.max(0) as usize,
+                Some(v) if !matches!(v, Value::None) => {
+                    crate::limits::c_int_arg(v)?.max(0) as usize
+                }
                 _ => 8,
             };
             let mut out: Vec<u8> = Vec::with_capacity(b.len());
@@ -11645,16 +11648,17 @@ fn set_method(
             }
             match s.borrow_mut().pop() {
                 Some(k) => Ok(k.into_value()),
-                None => Err(Unwind::Exception(crate::error::VmException::new(
-                    "KeyError",
-                    "'pop from an empty set'",
-                )
-                .with_value(Value::Exception {
-                    kind: Rc::new("KeyError".to_owned()),
-                    message: Rc::new("'pop from an empty set'".to_owned()),
-                    args: Rc::new(vec![Value::Str(Rc::new("pop from an empty set".to_owned()))]),
-                    chain: None,
-                }))),
+                None => Err(Unwind::Exception(
+                    crate::error::VmException::new("KeyError", "'pop from an empty set'")
+                        .with_value(Value::Exception {
+                            kind: Rc::new("KeyError".to_owned()),
+                            message: Rc::new("'pop from an empty set'".to_owned()),
+                            args: Rc::new(vec![Value::Str(Rc::new(
+                                "pop from an empty set".to_owned(),
+                            ))]),
+                            chain: None,
+                        }),
+                )),
             }
         }
         "clear" => {
@@ -11733,7 +11737,11 @@ fn set_method(
             } else {
                 s.borrow().clone()
             };
-            let rest = if name == "difference" { args.get(1..).unwrap_or(&[]) } else { args };
+            let rest = if name == "difference" {
+                args.get(1..).unwrap_or(&[])
+            } else {
+                args
+            };
             for arg in rest {
                 match arg {
                     Value::Set(o) if Rc::ptr_eq(o, s) => acc.clear(),
@@ -12240,7 +12248,12 @@ fn json_write_inner(
                     pairs.push((json_string(&f.name, opts.ensure_ascii), val));
                 }
             }
-            json_enter(level, Some(Rc::as_ptr(inst) as *const () as usize), opts, markers)?;
+            json_enter(
+                level,
+                Some(Rc::as_ptr(inst) as *const () as usize),
+                opts,
+                markers,
+            )?;
             let result = json_write_object(&pairs, opts, level, markers, out);
             markers.remove(&(Rc::as_ptr(inst) as *const () as usize));
             result?;

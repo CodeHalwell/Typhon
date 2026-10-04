@@ -253,7 +253,9 @@ impl Interpreter {
         if let Expr::Name(n) = tp {
             if let Some(slot) = b.get(n.id.as_str()) {
                 return match slot.clone() {
-                    Some(arg) => self.cast_matches(value, &arg.expr, &arg.env, &arg.bindings, active),
+                    Some(arg) => {
+                        self.cast_matches(value, &arg.expr, &arg.env, &arg.bindings, active)
+                    }
                     None => Err(type_error(format!(
                         "as! cannot check unbound type parameter {}",
                         n.id.as_str()
@@ -291,10 +293,9 @@ impl Interpreter {
     ) -> Result<bool, Unwind> {
         match tp {
             Expr::NoneLiteral(_) => Ok(matches!(value, Value::None)),
-            Expr::BinOp(op) if matches!(op.op, Operator::BitOr) => {
-                Ok(self.cast_matches(value, &op.left, env, b, active)?
-                    || self.cast_matches(value, &op.right, env, b, active)?)
-            }
+            Expr::BinOp(op) if matches!(op.op, Operator::BitOr) => Ok(self
+                .cast_matches(value, &op.left, env, b, active)?
+                || self.cast_matches(value, &op.right, env, b, active)?),
             Expr::Subscript(s) => self.cast_matches_subscript(value, s, env, b, active),
             Expr::Name(_) | Expr::Attribute(_) => {
                 let name = base_name(tp).unwrap_or_default().to_owned();
@@ -311,7 +312,10 @@ impl Interpreter {
                     "complex" => {
                         return Ok(matches!(
                             value,
-                            Value::Int(_) | Value::Bool(_) | Value::FloatData(_) | Value::Complex(..)
+                            Value::Int(_)
+                                | Value::Bool(_)
+                                | Value::FloatData(_)
+                                | Value::Complex(..)
                         ))
                     }
                     _ => {}
@@ -461,7 +465,9 @@ impl Interpreter {
                 Ok(false)
             }
             (Origin::Kind(kind), _) => self.cast_kind(value, kind, &args, env, b, active),
-            (Origin::Refused, Some(def)) => self.cast_matches_alias(value, &def, &args, env, b, active),
+            (Origin::Refused, Some(def)) => {
+                self.cast_matches_alias(value, &def, &args, env, b, active)
+            }
             (Origin::Refused, None) => Err(type_error(format!(
                 "as! cannot check parameterised target {}",
                 self.cast_display(&Expr::Subscript(s.clone()), env, b)?
@@ -583,9 +589,16 @@ impl Interpreter {
                 matches!(value, Value::Str(_) | Value::Bytes(_) | Value::Range { .. })
                     || builtin("list")
                     || builtin("tuple")
-                    || ["Sequence", "MutableSequence", "deque", "bytearray", "UserList", "UserString"]
-                        .iter()
-                        .any(|n| abc(n))
+                    || [
+                        "Sequence",
+                        "MutableSequence",
+                        "deque",
+                        "bytearray",
+                        "UserList",
+                        "UserString",
+                    ]
+                    .iter()
+                    .any(|n| abc(n))
             }
             Kind::AbstractSet => {
                 builtin("set")
@@ -634,7 +647,12 @@ impl Interpreter {
         Ok(match value {
             Value::List(l) => l.borrow().clone(),
             Value::Tuple(t) => t.as_ref().clone(),
-            Value::Set(s) => s.borrow().iter().cloned().map(HashKey::into_value).collect(),
+            Value::Set(s) => s
+                .borrow()
+                .iter()
+                .cloned()
+                .map(HashKey::into_value)
+                .collect(),
             _ => {
                 let it = self.make_iter(value.clone())?;
                 let mut out = Vec::new();
@@ -691,7 +709,9 @@ impl Interpreter {
                     return Ok("None".to_owned());
                 }
                 match self.eval_expr(tp, env) {
-                    Ok(Value::Class(c)) if self.alias_named(&name, &Value::Class(c.clone())).is_none() => {
+                    Ok(Value::Class(c))
+                        if self.alias_named(&name, &Value::Class(c.clone())).is_none() =>
+                    {
                         Ok(format!("<class '{}'>", class_qualified(&c)))
                     }
                     Ok(Value::Native(n)) if is_builtin_type(n.name) => {

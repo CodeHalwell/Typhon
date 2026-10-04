@@ -116,9 +116,10 @@ impl PyDict {
     pub fn insert(&mut self, key: HashKey, value: Value) -> Option<Value> {
         let hash = hash_of(&key);
         let slots = &self.slots;
-        if let Some(&i) = self.table.find(hash, |&i| {
-            slots[i].as_ref().is_some_and(|e| e.key == key)
-        }) {
+        if let Some(&i) = self
+            .table
+            .find(hash, |&i| slots[i].as_ref().is_some_and(|e| e.key == key))
+        {
             let e = self.slots[i].as_mut().expect("table points at a live slot");
             return Some(std::mem::replace(&mut e.value, value));
         }
@@ -133,9 +134,8 @@ impl PyDict {
         let i = self.slots.len();
         self.slots.push(Some(Entry { hash, key, value }));
         let slots = &self.slots;
-        self.table.insert_unique(hash, i, |&j| {
-            slots[j].as_ref().map_or(0, |e| e.hash)
-        });
+        self.table
+            .insert_unique(hash, i, |&j| slots[j].as_ref().map_or(0, |e| e.hash));
         self.live += 1;
     }
 
@@ -164,9 +164,7 @@ impl PyDict {
         let slots = &self.slots;
         let entry = self
             .table
-            .find_entry(hash, |&i| {
-                slots[i].as_ref().is_some_and(|e| e.key == *key)
-            })
+            .find_entry(hash, |&i| slots[i].as_ref().is_some_and(|e| e.key == *key))
             .ok()?;
         let (i, _) = entry.remove();
         self.take_slot(i)
@@ -296,7 +294,10 @@ impl PyDict {
     }
 
     pub fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = (&HashKey, &mut Value)> {
-        self.slots.iter_mut().flatten().map(|e| (&e.key, &mut e.value))
+        self.slots
+            .iter_mut()
+            .flatten()
+            .map(|e| (&e.key, &mut e.value))
     }
 
     pub fn keys(&self) -> impl DoubleEndedIterator<Item = &HashKey> + ExactSizeIterator {
@@ -351,11 +352,9 @@ impl<'a> Iterator for Iter<'a> {
     type Item = (&'a HashKey, &'a Value);
 
     fn next(&mut self) -> Option<Self::Item> {
-        for e in self.slots.by_ref() {
-            if let Some(e) = e {
-                self.remaining -= 1;
-                return Some((&e.key, &e.value));
-            }
+        if let Some(e) = self.slots.by_ref().flatten().next() {
+            self.remaining -= 1;
+            return Some((&e.key, &e.value));
         }
         None
     }
@@ -428,7 +427,10 @@ mod tests {
     use super::*;
 
     fn k(n: i64) -> HashKey {
-        Value::Int(n.into()).to_hash_key().ok().expect("int keys hash")
+        match Value::Int(n.into()).to_hash_key() {
+            Ok(k) => k,
+            Err(_) => panic!("int keys hash"),
+        }
     }
 
     fn keys(d: &PyDict) -> Vec<String> {
@@ -446,16 +448,33 @@ mod tests {
         }
         assert_eq!(d.len(), 10);
         assert_eq!(keys(&d)[0], "90");
-        assert_eq!(d.first().map(|(k, _)| k.clone().into_value().py_repr()), Some("90".into()));
+        assert_eq!(
+            d.first().map(|(k, _)| k.clone().into_value().py_repr()),
+            Some("90".into())
+        );
         d.insert(k(5), Value::None);
         assert_eq!(keys(&d).last().cloned(), Some("5".into()));
         assert!(d.contains_key(&k(95)) && !d.contains_key(&k(3)));
-        assert_eq!(d.pop_first().map(|(k, _)| k.into_value().py_repr()), Some("90".into()));
-        assert_eq!(d.pop().map(|(k, _)| k.into_value().py_repr()), Some("5".into()));
-        assert_eq!(d.get_index(2).map(|(k, _)| k.clone().into_value().py_repr()), Some("93".into()));
+        assert_eq!(
+            d.pop_first().map(|(k, _)| k.into_value().py_repr()),
+            Some("90".into())
+        );
+        assert_eq!(
+            d.pop().map(|(k, _)| k.into_value().py_repr()),
+            Some("5".into())
+        );
+        assert_eq!(
+            d.get_index(2)
+                .map(|(k, _)| k.clone().into_value().py_repr()),
+            Some("93".into())
+        );
         d.insert_first(k(42), Value::None);
         assert_eq!(keys(&d)[..2], ["42".to_string(), "91".to_string()]);
-        let rev: Vec<_> = d.iter().rev().map(|(k, _)| k.clone().into_value().py_repr()).collect();
+        let rev: Vec<_> = d
+            .iter()
+            .rev()
+            .map(|(k, _)| k.clone().into_value().py_repr())
+            .collect();
         assert_eq!(rev[0], "99");
         d.retain(|k, _| k.clone().into_value().py_repr() != "42");
         assert_eq!(d.len(), 9);

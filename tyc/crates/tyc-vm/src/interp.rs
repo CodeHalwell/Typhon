@@ -1929,11 +1929,8 @@ impl Interpreter {
         // Names the subclass defines itself — an inherited descriptor marker
         // (`@property` / `@classmethod`) must NOT carry over to a name the
         // subclass has overridden with a plain method.
-        let own_method_names: std::collections::HashSet<String> = methods
-            .keys()
-            .chain(class_attrs.keys())
-            .cloned()
-            .collect();
+        let own_method_names: std::collections::HashSet<String> =
+            methods.keys().chain(class_attrs.keys()).cloned().collect();
 
         // C3 linearisation of the ancestors: every lookup, `super()` and
         // `__mro__` walk it. Methods and user-visible class attributes are
@@ -4317,7 +4314,9 @@ impl Interpreter {
                 let key = self.settle_key_dict(dict, key)?;
                 let found = dict.borrow().get(&key).cloned();
                 match found {
-                    Some(v) => Ok(v.same_identity(&pair[1]) || self.cmp_op(CmpOp::Eq, &v, &pair[1])?),
+                    Some(v) => {
+                        Ok(v.same_identity(&pair[1]) || self.cmp_op(CmpOp::Eq, &v, &pair[1])?)
+                    }
                     None => Ok(false),
                 }
             }
@@ -4591,7 +4590,11 @@ impl Interpreter {
         if !named || c.arguments.args.len() != 2 || !c.arguments.keywords.is_empty() {
             return Ok(None);
         }
-        if c.arguments.args.iter().any(|a| matches!(a, Expr::Starred(_))) {
+        if c.arguments
+            .args
+            .iter()
+            .any(|a| matches!(a, Expr::Starred(_)))
+        {
             return Ok(None);
         }
         let func = self.eval_expr(&c.func, env)?;
@@ -4606,7 +4609,10 @@ impl Interpreter {
             Ok(v) => v,
             Err(_) => Value::Str(Rc::new(format_cast_type(&c.arguments.args[1]))),
         };
-        let module = env.module_scope().get("__name__").unwrap_or(Value::Str(Rc::new("__main__".into())));
+        let module = env
+            .module_scope()
+            .get("__name__")
+            .unwrap_or(Value::Str(Rc::new("__main__".into())));
         let obj = crate::builtins::new_newtype(self, name, base, module)?;
         if let Value::Instance(inst) = &obj {
             self.newtype_defs.insert(
@@ -4838,8 +4844,7 @@ impl Interpreter {
                     .get(&func.name)
                     .is_some_and(|m| Rc::ptr_eq(m, func))
                     || c.methods.borrow().values().any(|m| Rc::ptr_eq(m, func))
-                    || c
-                        .class_attrs
+                    || c.class_attrs
                         .borrow()
                         .values()
                         .any(|v| matches!(v, Value::Function(f) if Rc::ptr_eq(f, func)))
@@ -6405,7 +6410,8 @@ impl Interpreter {
             Class(_) | None => true,
             _ => false,
         };
-        if op == BitOr && type_like(l) && type_like(r) && !(matches!(l, None) && matches!(r, None)) {
+        if op == BitOr && type_like(l) && type_like(r) && !(matches!(l, None) && matches!(r, None))
+        {
             let union = crate::builtins::descriptor_shim_class(self, "_union")?;
             return self.call_value(union, vec![l.clone(), r.clone()], &[]);
         }
@@ -6667,7 +6673,10 @@ impl Interpreter {
             // `list[int]` / `dict[str, int]`: a `types.GenericAlias` —
             // callable, printed `list[int]`.
             Value::Native(n)
-                if matches!(n.name, "list" | "dict" | "set" | "frozenset" | "tuple" | "type") =>
+                if matches!(
+                    n.name,
+                    "list" | "dict" | "set" | "frozenset" | "tuple" | "type"
+                ) =>
             {
                 let args = match key {
                     Value::Tuple(t) => Value::Tuple(t.clone()),
@@ -7201,7 +7210,8 @@ impl Interpreter {
                 // are not part of it).
                 if attr == "__dict__" && !class.class_attrs.borrow().contains_key("__dict__") {
                     let mut map: DictMap = DictMap::new();
-                    if let Some(Value::Str(m)) = class.class_attrs.borrow().get("__typhon_module__") {
+                    if let Some(Value::Str(m)) = class.class_attrs.borrow().get("__typhon_module__")
+                    {
                         map.insert(
                             HashKey::Str(Rc::new("__module__".into())),
                             Value::Str(m.clone()),
@@ -9961,7 +9971,10 @@ pub(crate) fn class_mro(class: &Rc<Class>) -> impl Iterator<Item = &Rc<Class>> {
 /// whether as a method or as a plain attribute. Returns that class with the
 /// binding. The VM's internal `__typhon_*` records are never found on an
 /// ancestor here (they are copied per class where they are inherited).
-pub(crate) fn lookup_class_member(class: &Rc<Class>, name: &str) -> Option<(Rc<Class>, ClassMember)> {
+pub(crate) fn lookup_class_member(
+    class: &Rc<Class>,
+    name: &str,
+) -> Option<(Rc<Class>, ClassMember)> {
     let internal = name.starts_with("__typhon_");
     for (depth, c) in class_mro(class).enumerate() {
         if let Some(m) = c.methods.borrow().get(name) {
@@ -9999,7 +10012,11 @@ pub(crate) fn set_class_attr(interp: &Interpreter, class: &Rc<Class>, attr: &str
 
 /// `del Cls.attr`: remove the class's own binding (an inherited one is not
 /// the class's to delete — CPython raises `AttributeError`).
-pub(crate) fn del_class_attr(interp: &Interpreter, class: &Rc<Class>, attr: &str) -> Result<(), Unwind> {
+pub(crate) fn del_class_attr(
+    interp: &Interpreter,
+    class: &Rc<Class>,
+    attr: &str,
+) -> Result<(), Unwind> {
     let had_method = class.methods.borrow_mut().remove(attr).is_some();
     let had_attr = class.class_attrs.borrow_mut().remove(attr).is_some();
     if !(had_method || had_attr) {
@@ -11430,9 +11447,9 @@ fn sequence_index(key: &Value, seq: &str) -> Result<i64, Unwind> {
 /// `Py_ssize_t` (`[1][-(2**70)]`).
 fn index_int(key: &Value) -> Result<i64, Unwind> {
     match key {
-        Value::Int(n) => n.to_i64().ok_or_else(|| {
-            index_error("cannot fit 'int' into an index-sized integer")
-        }),
+        Value::Int(n) => n
+            .to_i64()
+            .ok_or_else(|| index_error("cannot fit 'int' into an index-sized integer")),
         other => other.to_int(),
     }
 }
@@ -11441,9 +11458,10 @@ fn index_int(key: &Value) -> Result<i64, Unwind> {
 /// (`'abc'[2**64:]` is `''`).
 fn slice_bound(v: &Value) -> Result<i64, Unwind> {
     match v {
-        Value::Int(n) => Ok(n
-            .to_i64()
-            .unwrap_or(if n.is_negative() { i64::MIN } else { i64::MAX })),
+        Value::Int(n) => {
+            Ok(n.to_i64()
+                .unwrap_or(if n.is_negative() { i64::MIN } else { i64::MAX }))
+        }
         other => other.to_int(),
     }
 }
@@ -12277,8 +12295,10 @@ fn is_constant_expr(e: &Expr) -> bool {
         | Expr::NoneLiteral(_)
         | Expr::EllipsisLiteral(_) => true,
         Expr::UnaryOp(u) => {
-            matches!(u.op, ast::UnaryOp::USub | ast::UnaryOp::UAdd | ast::UnaryOp::Invert)
-                && matches!(u.operand.as_ref(), Expr::NumberLiteral(_))
+            matches!(
+                u.op,
+                ast::UnaryOp::USub | ast::UnaryOp::UAdd | ast::UnaryOp::Invert
+            ) && matches!(u.operand.as_ref(), Expr::NumberLiteral(_))
         }
         Expr::Tuple(t) => t.elts.iter().all(is_constant_expr),
         _ => false,
@@ -14043,8 +14063,14 @@ e = (1+2j) - (3+1j)
     fn dict_view_repr_iter_len_contains() {
         use crate::value::DictViewKind;
         let mut map: DictMap = DictMap::new();
-        map.insert(HashKey::Str(Rc::new("a".into())), Value::Int(VmInt::from(1)));
-        map.insert(HashKey::Str(Rc::new("b".into())), Value::Int(VmInt::from(2)));
+        map.insert(
+            HashKey::Str(Rc::new("a".into())),
+            Value::Int(VmInt::from(1)),
+        );
+        map.insert(
+            HashKey::Str(Rc::new("b".into())),
+            Value::Int(VmInt::from(2)),
+        );
         let dict = Rc::new(crate::value::FrozenCell::new(map));
         let keys = Value::DictView {
             kind: DictViewKind::Keys,

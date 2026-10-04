@@ -156,7 +156,11 @@ impl PySet {
         let mut perturb = hash as u64;
         let mut i = (hash as u64 as usize) & mask;
         loop {
-            let probes = if i + LINEAR_PROBES <= mask { LINEAR_PROBES } else { 0 };
+            let probes = if i + LINEAR_PROBES <= mask {
+                LINEAR_PROBES
+            } else {
+                0
+            };
             for j in 0..=probes {
                 match &self.table[i + j] {
                     Slot::Empty => return None,
@@ -165,7 +169,11 @@ impl PySet {
                 }
             }
             perturb >>= PERTURB_SHIFT;
-            i = (i.wrapping_mul(5).wrapping_add(1).wrapping_add(perturb as usize)) & mask;
+            i = (i
+                .wrapping_mul(5)
+                .wrapping_add(1)
+                .wrapping_add(perturb as usize))
+                & mask;
         }
     }
 
@@ -194,7 +202,11 @@ impl PySet {
         let mut i = (hash as u64 as usize) & mask;
         let mut freeslot: Option<usize> = None;
         let unused = 'probe: loop {
-            let probes = if i + LINEAR_PROBES <= mask { LINEAR_PROBES } else { 0 };
+            let probes = if i + LINEAR_PROBES <= mask {
+                LINEAR_PROBES
+            } else {
+                0
+            };
             for j in 0..=probes {
                 match &self.table[i + j] {
                     Slot::Empty => break 'probe i + j,
@@ -208,7 +220,11 @@ impl PySet {
                 }
             }
             perturb >>= PERTURB_SHIFT;
-            i = (i.wrapping_mul(5).wrapping_add(1).wrapping_add(perturb as usize)) & mask;
+            i = (i
+                .wrapping_mul(5)
+                .wrapping_add(1)
+                .wrapping_add(perturb as usize))
+                & mask;
         };
         if let Some(slot) = freeslot {
             self.used += 1;
@@ -219,7 +235,11 @@ impl PySet {
         self.used += 1;
         self.table[unused] = Slot::Active(hash, key);
         if self.fill * 5 >= mask * 3 {
-            let minused = if self.used > 50000 { self.used * 2 } else { self.used * 4 };
+            let minused = if self.used > 50000 {
+                self.used * 2
+            } else {
+                self.used * 4
+            };
             self.resize(minused);
         }
         true
@@ -245,7 +265,11 @@ impl PySet {
                 }
             }
             perturb >>= PERTURB_SHIFT;
-            i = (i.wrapping_mul(5).wrapping_add(1).wrapping_add(perturb as usize)) & mask;
+            i = (i
+                .wrapping_mul(5)
+                .wrapping_add(1)
+                .wrapping_add(perturb as usize))
+                & mask;
         }
     }
 
@@ -430,7 +454,11 @@ impl PySet {
     /// "If more than 1/4th are dummies, then resize them away."
     fn purge_dummies(&mut self) {
         if self.fill - self.used > self.mask() / 4 {
-            let minused = if self.used > 50000 { self.used * 2 } else { self.used * 4 };
+            let minused = if self.used > 50000 {
+                self.used * 2
+            } else {
+                self.used * 4
+            };
             self.resize(minused);
         }
     }
@@ -558,7 +586,10 @@ mod tests {
             .map(|n| HashKey::Int(VmInt::from(n)))
             .collect();
         assert_eq!(ints(&s), vec![1, 33, 3, 100, 5, 2]);
-        let s: PySet = [-1, 0, 1].into_iter().map(|n| HashKey::Int(VmInt::from(n))).collect();
+        let s: PySet = [-1, 0, 1]
+            .into_iter()
+            .map(|n| HashKey::Int(VmInt::from(n)))
+            .collect();
         assert_eq!(ints(&s), vec![0, 1, -1]);
     }
 }
