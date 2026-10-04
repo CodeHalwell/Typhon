@@ -180,8 +180,10 @@ pub enum TycError {
     /// (`List`, `Dict`, `Tuple`, `Set`, `FrozenSet`, `Type`) — Typhon prefers
     /// the built-in lowercase forms (PEP 585) for consistency with the rest
     /// of the language.
+    /// Always reported as a warning: `typing.List` still works at runtime.
     #[error("`from typing import {name}` is deprecated in Typhon")]
     #[diagnostic(
+        severity(Warning),
         code(tyc::typing_alias_deprecated),
         url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/typing_alias_deprecated.md"),
         help("Use the built-in lowercase `{lower}` instead — `{lower}[T]` works directly without importing anything.")
@@ -662,6 +664,24 @@ pub enum TycError {
         url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/generic.md")
     )]
     Generic { message: String },
+
+    /// [`TycError::Generic`] at a source location (same code). Used where a
+    /// check has no dedicated diagnostic but does know where the problem is
+    /// — an item assignment into an immutable container — so the report is
+    /// not filed under "(no location)".
+    #[error("{message}")]
+    #[diagnostic(
+        code(tyc::generic),
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/generic.md")
+    )]
+    GenericAt {
+        message: String,
+        label: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("{label}")]
+        span: SourceSpan,
+    },
 
     /// The `?` error-propagation operator was used in a position where
     /// it cannot lower correctly. Two common reasons: (a) the enclosing
@@ -1275,8 +1295,11 @@ pub enum TycError {
     /// listed in `typhon.toml`'s dependencies. The build would later
     /// fail at import time with `ModuleNotFoundError`; surface the
     /// typo / missing dep at check time instead. FINDINGS #79.
+    /// Always reported as a warning: the module may still be installed in
+    /// the environment the program runs in.
     #[error("module `{module}` is not in the stdlib, the project, or `typhon.toml` dependencies")]
     #[diagnostic(
+        severity(Warning),
         code(tyc::unknown_module),
         url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/unknown_module.md"),
         help("Either fix the import name, add `{module}` to the `[dependencies]` table in `typhon.toml` (then run `tyc sync`), or create a sibling `.ty` file with the right name.")
@@ -2056,6 +2079,25 @@ pub enum TycError {
         #[label("read when `class {class}` runs — raises `NameError` on import")]
         span: SourceSpan,
     },
+
+    /// `go f(…)` where `f(…)` is not a coroutine: `go` schedules an
+    /// awaitable as a task, and a plain value makes `create_task` raise
+    /// `TypeError`. Same code as any other type mismatch (W2-11), worded for
+    /// the `go` form.
+    #[error("`go` needs a coroutine, but `{call}` returns `{actual}`")]
+    #[diagnostic(
+        code(tyc::type_mismatch),
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/type_mismatch.md"),
+        help("make the callee `async def` (then `go` runs it as a task), or call it directly without `go`")
+    )]
+    GoNeedsCoroutine {
+        call: String,
+        actual: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("not a coroutine")]
+        span: SourceSpan,
+    },
 }
 
 impl TycError {
@@ -2152,7 +2194,9 @@ impl TycError {
             | Self::RaiseNonException { src, span, .. }
             | Self::NotAContextManager { src, span, .. }
             | Self::ReturnInExceptStar { src, span, .. }
-            | Self::ImplForwardReference { src, span, .. } => {
+            | Self::ImplForwardReference { src, span, .. }
+            | Self::GoNeedsCoroutine { src, span, .. }
+            | Self::GenericAt { src, span, .. } => {
                 let _ = span;
                 Some(src.inner().as_str())
             }
@@ -2296,7 +2340,9 @@ impl TycError {
             | Self::RaiseNonException { src, span, .. }
             | Self::NotAContextManager { src, span, .. }
             | Self::ReturnInExceptStar { src, span, .. }
-            | Self::ImplForwardReference { src, span, .. } => Some((src, span)),
+            | Self::ImplForwardReference { src, span, .. }
+            | Self::GoNeedsCoroutine { src, span, .. }
+            | Self::GenericAt { src, span, .. } => Some((src, span)),
             #[allow(unreachable_patterns)]
             _ => None,
         }
@@ -4032,6 +4078,42 @@ impl TycError {
         }
     }
 
+    /// Construct a [`TycError::GenericAt`]: a free-form message at a
+    /// location, with `label` under the span.
+    pub fn generic_at(
+        message: impl Into<String>,
+        label: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::GenericAt {
+            message: message.into(),
+            label: label.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::GoNeedsCoroutine`]. `call` is the spawned
+    /// expression as written (`work(1)`), `actual` its type.
+    pub fn go_needs_coroutine(
+        call: impl Into<String>,
+        actual: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::GoNeedsCoroutine {
+            call: call.into(),
+            actual: actual.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
     /// Construct a [`TycError::ImplForwardReference`] error. `why` says what
     /// keeps `method` in the class body instead of at its `impl` block.
     #[allow(clippy::too_many_arguments)]
@@ -4242,6 +4324,24 @@ impl Diagnostics {
                 .unwrap_or(line)
                 .min(original_starts.len().saturating_sub(1));
             let width = original_line_len(target);
+            // A rewritten line (`go f(x)` → `…spawn(f(x))`) shifts columns,
+            // so the carried column can land past the expression. When the
+            // spanned text appears on the original line, anchor to the
+            // occurrence nearest the carried column instead.
+            let snippet = expanded
+                .get(offset..(offset + span.len()).min(expanded.len()))
+                .filter(|t| !t.is_empty() && !t.contains('\n'));
+            let original_line = &original[original_starts[target]..original_starts[target] + width];
+            let found = snippet.and_then(|t| {
+                original_line
+                    .match_indices(t)
+                    .map(|(at, _)| at)
+                    .min_by_key(|at| at.abs_diff(col))
+            });
+            if let (Some(at), Some(t)) = (found, snippet) {
+                *span = SourceSpan::new(SourceOffset::from(original_starts[target] + at), t.len());
+                return;
+            }
             let new_col = col.min(width);
             let new_len = span.len().clamp(1, (width - new_col).max(1));
             *span = SourceSpan::new(
@@ -4766,9 +4866,24 @@ pub struct SanitisedDiagnostic {
     /// position in the first (real-source-aligned) block, so the
     /// rendered line number never exceeds the file's real line count.
     block_remap: Option<BlockRemap>,
+    /// The severity to render with, when the caller knows it better than
+    /// the variant's static one: a diagnostic pushed as a warning (a
+    /// strictness knob at `"warn"`, a mutation caught by its handler) is
+    /// still a variant whose derive says `Error`, and rendered with the
+    /// error marker under a "warnings" heading.
+    severity: Option<miette::Severity>,
 }
 
 impl SanitisedDiagnostic {
+    /// Render with `severity` instead of the variant's own. Renderers pass
+    /// the bucket the diagnostic was reported in (`Diagnostics::warnings()`
+    /// → `Severity::Warning`).
+    #[must_use]
+    pub fn with_severity(mut self, severity: miette::Severity) -> Self {
+        self.severity = Some(severity);
+        self
+    }
+
     /// Build a wrapper that masks synthetic preprocess output from the
     /// rendered source listing. When the inner diagnostic doesn't carry
     /// a `NamedSource` (e.g. `TycError::Io`) the wrapper is a no-op
@@ -4787,6 +4902,7 @@ impl SanitisedDiagnostic {
             inner,
             sanitised,
             block_remap,
+            severity: None,
         }
     }
 
@@ -4802,6 +4918,7 @@ impl SanitisedDiagnostic {
             inner,
             sanitised: Some(sanitised),
             block_remap,
+            severity: None,
         }
     }
 
@@ -4836,6 +4953,7 @@ impl SanitisedDiagnostic {
             inner,
             sanitised: Some(sanitised),
             block_remap,
+            severity: None,
         }
     }
 }
@@ -5437,7 +5555,7 @@ impl miette::Diagnostic for SanitisedDiagnostic {
         self.inner.code()
     }
     fn severity(&self) -> Option<miette::Severity> {
-        self.inner.severity()
+        self.severity.or_else(|| self.inner.severity())
     }
     fn help<'b>(&'b self) -> Option<Box<dyn std::fmt::Display + 'b>> {
         self.inner.help()
@@ -6092,6 +6210,41 @@ mod tests {
         let msg = e.to_string();
         assert!(msg.contains("sealed union `Shape`"), "{msg}");
         assert!(msg.contains("Circle"));
+    }
+
+    #[test]
+    fn warning_only_codes_render_as_warnings() {
+        use miette::{Diagnostic, Severity};
+        let src = "import flask\nfrom typing import List\n";
+        let m = TycError::unknown_module("flask", "a.ty", src, 7, 5);
+        let t = TycError::typing_alias_deprecated("List", "list", "a.ty", src, 32, 4);
+        assert_eq!(m.severity(), Some(Severity::Warning));
+        assert_eq!(t.severity(), Some(Severity::Warning));
+        // A variant that is an error by default renders with the severity of
+        // the bucket it was reported in.
+        let caught = TycError::generic_at(
+            "`Mapping[str, int]` does not support item assignment",
+            "here",
+            "a.ty",
+            src,
+            0,
+            6,
+        );
+        let wrapped = SanitisedDiagnostic::wrap(caught.clone()).with_severity(Severity::Warning);
+        assert_eq!(wrapped.severity(), Some(Severity::Warning));
+        assert_eq!(SanitisedDiagnostic::wrap(caught.clone()).severity(), None);
+        // ...and carries its location.
+        let mut caught = caught;
+        assert!(caught.source_and_span_mut().is_some());
+    }
+
+    #[test]
+    fn go_on_a_plain_value_reads_as_a_sentence() {
+        let e = TycError::go_needs_coroutine("work(1)", "int", "a.ty", "go work(1)", 3, 7);
+        assert_eq!(
+            e.to_string(),
+            "`go` needs a coroutine, but `work(1)` returns `int`"
+        );
     }
 
     #[test]

@@ -14462,10 +14462,15 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                             head.as_str(),
                             "Mapping" | "tuple" | "tuple_variadic" | "frozenset"
                         ) {
-                            let diagnostic = TycError::generic(format!(
-                                "`{}` does not support item assignment",
-                                recv_ty.display()
-                            ));
+                            let at = target.range();
+                            let diagnostic = TycError::generic_at(
+                                format!("`{}` does not support item assignment", recv_ty.display()),
+                                "item assignment raises `TypeError` here",
+                                &c.path,
+                                c.source,
+                                at.start().to_usize(),
+                                at.len().to_usize(),
+                            );
                             if frozen_context::failure_is_caught(c, target, "TypeError") {
                                 c.diagnostics.push_warning(diagnostic);
                             } else {
@@ -22504,13 +22509,15 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         .to_usize()
                         .saturating_sub(attr_start)
                         .max(1);
+                    // `tuple_variadic` is the internal head of `tuple[T, ...]`;
+                    // name the type as written.
+                    let shown = if head == "tuple_variadic" {
+                        recv.display()
+                    } else {
+                        head.clone()
+                    };
                     let diagnostic = TycError::attribute_not_found(
-                        attr_name,
-                        head.as_str(),
-                        &c.path,
-                        c.source,
-                        attr_start,
-                        attr_len,
+                        attr_name, &shown, &c.path, c.source, attr_start, attr_len,
                     );
                     if matches!(head.as_str(), "tuple_variadic" | "Mapping" | "frozenset")
                         && frozen_context::failure_is_caught(c, expr, "AttributeError")
@@ -41916,6 +41923,41 @@ def main() -> None:
             let errs = union_attr_errors(&src);
             assert!(errs.is_empty(), "{src}: {errs:?}");
         }
+    }
+    #[test]
+    fn caught_frozen_mutations_name_the_type_and_keep_their_location() {
+        let src = "let NAMES: list[str] = __typhon_freeze__([\"a\"])\nlet CONFIG: dict[str, int] = __typhon_freeze__({\"a\": 1})\ndef f() -> None:\n    try:\n        NAMES.append(\"b\")\n    except AttributeError:\n        pass\n    try:\n        CONFIG[\"a\"] = 2\n    except TypeError:\n        pass\n";
+        let d = check(src);
+        assert!(d.errors().is_empty(), "{:?}", d.errors());
+        let msgs: Vec<String> = d.warnings().iter().map(ToString::to_string).collect();
+        assert!(
+            msgs.iter()
+                .any(|m| m == "attribute `append` is not defined on `tuple[str, ...]`"),
+            "{msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("tuple_variadic")),
+            "{msgs:?}"
+        );
+        let item = d
+            .warnings()
+            .iter()
+            .find(|w| w.to_string().contains("does not support item assignment"))
+            .expect("item-assignment warning");
+        assert!(item.clone().source_and_span_mut().is_some(), "{item:?}");
+    }
+    #[test]
+    fn go_on_a_synchronous_call_says_it_needs_a_coroutine() {
+        let d = check_full(
+            "def work(n: int) -> int:\n    return n\nasync def f() -> None:\n    go work(1)\n",
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| e.to_string() == "`go` needs a coroutine, but `work(1)` returns `int`"),
+            "{:?}",
+            d.errors()
+        );
     }
     fn nullable_helps(d: &Diagnostics) -> Vec<String> {
         d.errors()
