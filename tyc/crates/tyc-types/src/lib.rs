@@ -12279,9 +12279,18 @@ fn seed_env_from_scope(c: &mut Checker, scope: ScopeId) {
                     } else {
                         vec![Type::Unknown; info.param_names.len()]
                     };
+                    // An imported `async def` returns a coroutine, exactly
+                    // like a same-module one (whose binding carries
+                    // `Coroutine[T]`), so an un-awaited call does not
+                    // masquerade as `T`.
+                    let ret = if info.is_async {
+                        Type::Generic("Coroutine".into(), vec![info.return_type.clone()])
+                    } else {
+                        info.return_type.clone()
+                    };
                     Type::Function {
                         params,
-                        ret: Box::new(info.return_type.clone()),
+                        ret: Box::new(ret),
                         variadic: info.max_positional.is_none(),
                         // Real required-arity, so a function whose trailing
                         // parameters carry defaults can satisfy a narrower
