@@ -2727,7 +2727,7 @@ impl Interpreter {
         marker(class)
     }
 
-    fn is_enum_member(value: &Value) -> bool {
+    pub(crate) fn is_enum_member(value: &Value) -> bool {
         if let Value::Instance(i) = value {
             return Self::is_enum_class(&i.class) && i.fields.borrow().contains_key("_name_");
         }

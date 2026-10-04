@@ -277,6 +277,9 @@ def _parse_isoformat_time(tstr):
 
 
 class timedelta:
+    # deep_freeze passes this immutable value through, as the
+    # emitted typhon_runtime does for the CPython class.
+    __typhon_immutable__ = True
     def __init__(self, days=0, seconds=0, microseconds=0, milliseconds=0, minutes=0, hours=0, weeks=0):
         d = 0
         s = 0
@@ -466,6 +469,9 @@ timedelta.resolution = timedelta(microseconds=1)
 
 
 class tzinfo:
+    # deep_freeze passes this immutable value through, as the
+    # emitted typhon_runtime does for the CPython class.
+    __typhon_immutable__ = True
     def tzname(self, dt):
         raise NotImplementedError("tzinfo subclass must override tzname()")
 
@@ -570,6 +576,9 @@ _EPOCH_ORD = _ymd2ord(1970, 1, 1)
 
 
 class date:
+    # deep_freeze passes this immutable value through, as the
+    # emitted typhon_runtime does for the CPython class.
+    __typhon_immutable__ = True
     def __init__(self, year, month, day):
         _check_date_fields(year, month, day)
         self.year = year
@@ -778,6 +787,9 @@ def _fields_from_timestamp(t):
 
 
 class time:
+    # deep_freeze passes this immutable value through, as the
+    # emitted typhon_runtime does for the CPython class.
+    __typhon_immutable__ = True
     def __init__(self, hour=0, minute=0, second=0, microsecond=0, tzinfo=None, fold=0):
         _check_time_fields(hour, minute, second, microsecond, fold)
         _check_tzinfo_arg(tzinfo)

@@ -135,6 +135,9 @@ class _Parents:
 
 
 class PurePosixPath:
+    # deep_freeze passes this immutable value through, as the
+    # emitted typhon_runtime does for the CPython class.
+    __typhon_immutable__ = True
     def __init__(self, *args):
         raw = []
         for a in args:

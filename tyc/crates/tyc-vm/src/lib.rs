@@ -685,6 +685,31 @@ assert d[y] == 2
     }
 
     #[test]
+    fn freeze_passes_immutable_values_through_like_the_runtime() {
+        // The emitted runtime's `deep_freeze` returns enum members, dates,
+        // timedeltas, timezones and paths unchanged; the VM must too.
+        assert_eq!(
+            run_capturing(
+                r###"import datetime
+from pathlib import Path
+enum Mode:
+    FAST
+    SLOW
+let d = datetime.date(2026, 1, 2)
+let p = Path("a")
+freeze let CFG = {"mode": Mode.FAST, "d": d, "dt": datetime.datetime(2026, 1, 2), "td": datetime.timedelta(days=1), "tz": datetime.timezone.utc, "p": p}
+assert CFG["mode"] is Mode.FAST
+assert CFG["d"] is d
+assert CFG["p"] is p
+assert CFG["td"] == datetime.timedelta(days=1)
+"###
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn review_frozen_metadata_and_instance_identity() {
         assert_eq!(
             run_capturing(

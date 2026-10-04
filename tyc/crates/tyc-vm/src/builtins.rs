@@ -8487,7 +8487,19 @@ fn deep_freeze_value(v: Value) -> Result<Value, Unwind> {
             ))))
         }
         Value::Instance(inst) => {
-            if crate::value::class_flag(&inst.class, "__typhon_dc_frozen__", false) {
+            // Like the emitted runtime's `deep_freeze`: an enum member, a
+            // date / time / timedelta / tzinfo or path (the shims mark those
+            // `__typhon_immutable__`) and a frozen dataclass instance all
+            // pass through unchanged. Anything else has no immutable
+            // equivalent.
+            fn immutable_shim(class: &Rc<crate::value::Class>) -> bool {
+                crate::value::class_flag(class, "__typhon_immutable__", false)
+                    || class.bases.iter().any(immutable_shim)
+            }
+            if crate::value::class_flag(&inst.class, "__typhon_dc_frozen__", false)
+                || immutable_shim(&inst.class)
+                || crate::interp::Interpreter::is_enum_member(&Value::Instance(inst.clone()))
+            {
                 Ok(Value::Instance(inst))
             } else {
                 Err(type_error("cannot freeze a non-frozen dataclass instance"))
