@@ -19558,6 +19558,28 @@ fn extract_err_generic_param(typ: &Type) -> Option<Type> {
 /// `return value` payloads are accepted unchecked. Used by the
 /// `c.in_generator` early-return in `check_stmt::Return` (FINDINGS
 /// O6, refined per Codex review on PR #94).
+/// The element type `T` a generator annotated `-> Iterator[T]` /
+/// `Iterable[T]` / `Generator[T, S, R]` (or an async form) must `yield`.
+/// `None` for any other annotation, including the bare names.
+fn generator_yield_type(typ: &Type) -> Option<Type> {
+    match typ {
+        Type::Generic(name, args)
+            if matches!(
+                name.as_str(),
+                "Iterator"
+                    | "Iterable"
+                    | "Generator"
+                    | "AsyncIterator"
+                    | "AsyncIterable"
+                    | "AsyncGenerator"
+            ) && !args.is_empty() =>
+        {
+            Some(args[0].clone())
+        }
+        _ => None,
+    }
+}
+
 fn extract_generator_return_type(typ: &Type) -> Option<Type> {
     if let Type::Generic(name, args) = typ {
         if name == "Generator" && args.len() == 3 {
@@ -20169,7 +20191,11 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
         Expr::Lambda(lam) => {
             let snap = c.env.snapshot();
             widen_captured_names(c, lam.range.start().to_usize());
+            // A `yield` in a lambda body makes the *lambda* a generator; it
+            // does not yield from the enclosing function.
+            let saved_in_generator = std::mem::replace(&mut c.in_generator, false);
             let r = infer_expr_ctx_inner(c, expr, expected);
+            c.in_generator = saved_in_generator;
             c.env.restore(snap);
             r
         }
@@ -23265,6 +23291,42 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             c.env.restore_scope_narrowings(comp_saved);
             let elt = widen_fresh_element(c, elt, elt_expected.as_ref());
             Type::Generic("set".into(), vec![elt])
+        }
+        // `yield v` in a generator annotated `-> Iterator[T]` /
+        // `Generator[T, S, R]` / `AsyncIterator[T]` (and the `Iterable`
+        // forms) must produce a `T`: the consumer is typed against it.
+        // `yield maybe_int` in `-> Iterator[int]` used to pass unchecked —
+        // the operand was not even inferred. A bare `yield` produces `None`.
+        // The expression's own value (what `send` passes in) stays
+        // `Unknown`.
+        Expr::Yield(y) => {
+            let element = if c.in_generator {
+                c.current_return
+                    .as_ref()
+                    .and_then(|r| generator_yield_type(&c.unwrap_alias(r)))
+            } else {
+                None
+            };
+            let element = element.filter(|t| !matches!(t, Type::Unknown | Type::Any));
+            let actual = match y.value.as_deref() {
+                Some(value) => infer_expr_ctx(c, value, element.as_ref()),
+                None => Type::None,
+            };
+            if let Some(element) = element {
+                if !matches!(actual, Type::Unknown) && !c.is_assignable(&element, &actual) {
+                    let at = y.value.as_deref().map_or(y.range, |v| v.range());
+                    c.mismatch(
+                        &element,
+                        &actual,
+                        (at.start().to_usize(), at.end().to_usize()),
+                    );
+                }
+            }
+            Type::Unknown
+        }
+        Expr::YieldFrom(y) => {
+            let _ = infer_expr_ctx(c, &y.value, None);
+            Type::Unknown
         }
         Expr::Generator(comp) => {
             let elt_expected = match expected {
@@ -41636,6 +41698,44 @@ def main() -> None:
             "def find() -> str?:\n    return None\ndef main() -> None:\n    let v: str? = find()\n    if v is not None:\n        let g = lambda w=v.upper(): w\n        print(g())\n",
         ] {
             let d = check(src);
+            assert!(d.errors().is_empty(), "{src}: {:?}", d.errors());
+        }
+    }
+    #[test]
+    fn yielded_values_are_checked_against_the_element_type() {
+        let pre = "from typing import Iterator, Generator, AsyncIterator, Iterable\ndef maybe() -> int?:\n    return None\n";
+        for body in [
+            "def gen() -> Iterator[int]:\n    let m: int? = maybe()\n    yield m\n",
+            "def gen() -> Iterator[int]:\n    yield \"s\"\n",
+            "def gen() -> Iterable[int]:\n    yield 1.5\n",
+            "def gen() -> Generator[int, None, str]:\n    yield \"s\"\n    return \"done\"\n",
+            "async def gen() -> AsyncIterator[str]:\n    yield 1\n",
+            "def gen() -> Iterator[int]:\n    yield\n",
+            "def gen() -> Iterator[list[int]]:\n    yield [\"a\"]\n",
+        ] {
+            let src = format!("{pre}{body}");
+            assert!(
+                check(&src).errors().iter().any(|e| matches!(e, TycError::TypeMismatch { .. })),
+                "accepted: {src}"
+            );
+        }
+    }
+    #[test]
+    fn yields_of_the_element_type_are_accepted() {
+        let pre = "from typing import Iterator, Generator, AsyncIterator\nfrom contextlib import contextmanager\ndef maybe() -> int?:\n    return None\n";
+        for body in [
+            "def gen() -> Iterator[int?]:\n    yield maybe()\n    yield 1\n    yield None\n",
+            "def gen() -> Iterator[float]:\n    yield 1\n    yield 2.5\n",
+            "def gen() -> Iterator[list[int]]:\n    yield []\n",
+            "@contextmanager\ndef ctx() -> Iterator[None]:\n    yield\n",
+            "def gen() -> Generator[int, str, None]:\n    let got = yield 1\n    print(got)\n",
+            "def gen() -> Iterator:\n    yield \"anything\"\n",
+            "def gen() -> Iterator[int]:\n    yield from [1, 2]\n    def inner() -> Iterator[str]:\n        yield \"s\"\n    for s in inner():\n        yield len(s)\n",
+            "async def gen() -> AsyncIterator[int]:\n    yield 1\n",
+            "def gen() -> Iterator[int]:\n    let m: int? = maybe()\n    if m is not None:\n        yield m\n",
+        ] {
+            let src = format!("{pre}{body}");
+            let d = check(&src);
             assert!(d.errors().is_empty(), "{src}: {:?}", d.errors());
         }
     }
