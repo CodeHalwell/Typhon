@@ -1152,3 +1152,35 @@ show(len(a), a[100], a[95:], a[-1])
 "#,
     );
 }
+
+// ── W5-21: keyword arguments bind to CPython's signatures ─────────────────
+
+#[test]
+fn w5_21_keyword_arguments_bind_like_cpython() {
+    assert_matches_cpython(
+        "w5_21_keyword_arguments_bind_like_cpython",
+        r#"import functools
+import heapq
+import json
+import math
+trap("round", lambda: (round(3.14159, ndigits=2), round(number=2.5)))
+trap("int base", lambda: (int("ff", base=16), functools.partial(int, base=2)("101")))
+trap("prod start", lambda: math.prod([2, 3], start=5))
+trap("nlargest", lambda: (heapq.nlargest(2, [1, 5, 3], key=lambda x: -x), heapq.nsmallest(2, [1, 5, 3], key=lambda x: -x)))
+trap("loads hooks", lambda: (json.loads('{"a": {"b": 1}}', object_hook=lambda d: sorted(d)), json.loads('{"a": 1, "b": 2}', object_pairs_hook=lambda p: p)))
+trap("replace", lambda: "aaa".replace("a", "b", count=2))
+trap("split", lambda: ("a b c".split(maxsplit=1), b"a b".split(sep=b" ", maxsplit=1), "a\tb".expandtabs(tabsize=2)))
+trap("encode", lambda: ("é".encode(errors="replace", encoding="ascii"), b"a".decode(encoding="ascii")))
+trap("to_bytes", lambda: ((5).to_bytes(2, byteorder="little"), (-5).to_bytes(2, "big", signed=True)))
+trap("hex sep", lambda: (b"\x01\x02".hex(sep=":"), b"\x01\x02\x03".hex(sep="-", bytes_per_sep=-2)))
+trap("splitlines", lambda: "a\nb".splitlines(keepends=True))
+trap("sorted None", lambda: sorted([3, 1], key=None, reverse=True))
+trap("dict.pop kw", lambda: {}.pop("k", default=1))
+trap("list.index kw", lambda: [1, 2].index(2, start=0))
+trap("dict.get kw", lambda: {}.get("a", default=2))
+trap("unknown kw", lambda: "a".split(foo=1))
+trap("twice", lambda: "a".split("a", sep="b"))
+trap("count kw", lambda: "a".count(sub="a"))
+"#,
+    );
+}

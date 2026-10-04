@@ -455,6 +455,27 @@ consulted; `Named.__mro__` omits `typing.Generic`; a lone surrogate
 yields U+FFFD); and a generator that falls back to eager collection (see
 "What the VM does not support yet") runs its side effects at call time.
 
+### Keyword arguments and the pre-run scan (beta)
+
+A builtin-type method binds keyword arguments to its CPython 3.13
+signature: `s.replace("a", "b", count=2)`, `s.split(maxsplit=1)`,
+`n.to_bytes(2, byteorder="little")` and `b.hex(sep=":")` work, a method
+CPython gives no keywords (`d.get(k, default=0)`) raises CPython's
+`TypeError`, and an unknown or doubled keyword raises its message.
+`round(ndigits=)`, `int(base=)`, `math.prod(start=)`,
+`heapq.nlargest/nsmallest(key=)`, `json.loads/load(object_hook=,
+object_pairs_hook=)`, `asyncio.sleep(result=)`, `asyncio.wait_for(timeout=)`,
+`functools.lru_cache(maxsize=, typed=)` and `sorted(key=None)` are
+accepted too.
+
+Before running, `tyc run` also sends a program down the compiled path
+(as it does for an unmodelled import) when it uses a CPython builtin the
+VM lacks (`exec`, `eval`-style `compile`, `memoryview`, `globals`,
+`locals`, `aiter`, `anext`, `breakpoint`, `help`, `__import__`), calls
+`.add_note()` / reads `.__notes__`, or passes a builtin or VM-modelled
+module function a keyword the VM would reject or ignore
+(`json.dumps(default=)`, `dataclasses.field(repr=)`, `json.loads(parse_float=)`).
+
 ## Multi-file projects
 
 Since v0.9.0 the VM loads sibling `.ty` modules from the project source

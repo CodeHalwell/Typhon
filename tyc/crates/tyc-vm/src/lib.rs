@@ -774,6 +774,209 @@ pub fn modelled_module_exports(
     }
 }
 
+/// Every builtin name a CPython 3.13 program can use: the public
+/// `dir(builtins)` plus the dunders a program can name.
+const PYTHON_BUILTINS: &[&str] = &[
+    "ArithmeticError",
+    "AssertionError",
+    "AttributeError",
+    "BaseException",
+    "BaseExceptionGroup",
+    "BlockingIOError",
+    "BrokenPipeError",
+    "BufferError",
+    "BytesWarning",
+    "ChildProcessError",
+    "ConnectionAbortedError",
+    "ConnectionError",
+    "ConnectionRefusedError",
+    "ConnectionResetError",
+    "DeprecationWarning",
+    "EOFError",
+    "Ellipsis",
+    "EncodingWarning",
+    "EnvironmentError",
+    "Exception",
+    "ExceptionGroup",
+    "False",
+    "FileExistsError",
+    "FileNotFoundError",
+    "FloatingPointError",
+    "FutureWarning",
+    "GeneratorExit",
+    "IOError",
+    "ImportError",
+    "ImportWarning",
+    "IndentationError",
+    "IndexError",
+    "InterruptedError",
+    "IsADirectoryError",
+    "KeyError",
+    "KeyboardInterrupt",
+    "LookupError",
+    "MemoryError",
+    "ModuleNotFoundError",
+    "NameError",
+    "None",
+    "NotADirectoryError",
+    "NotImplemented",
+    "NotImplementedError",
+    "OSError",
+    "OverflowError",
+    "PendingDeprecationWarning",
+    "PermissionError",
+    "ProcessLookupError",
+    "PythonFinalizationError",
+    "RecursionError",
+    "ReferenceError",
+    "ResourceWarning",
+    "RuntimeError",
+    "RuntimeWarning",
+    "StopAsyncIteration",
+    "StopIteration",
+    "SyntaxError",
+    "SyntaxWarning",
+    "SystemError",
+    "SystemExit",
+    "TabError",
+    "TimeoutError",
+    "True",
+    "TypeError",
+    "UnboundLocalError",
+    "UnicodeDecodeError",
+    "UnicodeEncodeError",
+    "UnicodeError",
+    "UnicodeTranslateError",
+    "UnicodeWarning",
+    "UserWarning",
+    "ValueError",
+    "Warning",
+    "ZeroDivisionError",
+    "abs",
+    "aiter",
+    "all",
+    "anext",
+    "any",
+    "ascii",
+    "bin",
+    "bool",
+    "breakpoint",
+    "bytearray",
+    "bytes",
+    "callable",
+    "chr",
+    "classmethod",
+    "compile",
+    "complex",
+    "copyright",
+    "credits",
+    "delattr",
+    "dict",
+    "dir",
+    "divmod",
+    "enumerate",
+    "eval",
+    "exec",
+    "exit",
+    "filter",
+    "float",
+    "format",
+    "frozenset",
+    "getattr",
+    "globals",
+    "hasattr",
+    "hash",
+    "help",
+    "hex",
+    "id",
+    "input",
+    "int",
+    "isinstance",
+    "issubclass",
+    "iter",
+    "len",
+    "license",
+    "list",
+    "locals",
+    "map",
+    "max",
+    "memoryview",
+    "min",
+    "next",
+    "object",
+    "oct",
+    "open",
+    "ord",
+    "pow",
+    "print",
+    "property",
+    "quit",
+    "range",
+    "repr",
+    "reversed",
+    "round",
+    "set",
+    "setattr",
+    "slice",
+    "sorted",
+    "staticmethod",
+    "str",
+    "sum",
+    "super",
+    "tuple",
+    "type",
+    "vars",
+    "zip",
+    "__import__",
+    "__build_class__",
+    "__debug__",
+];
+
+/// Whether `name` is a CPython builtin the VM does not provide (`exec`,
+/// `memoryview`, `globals`). `tyc run`'s pre-run scan sends a program that
+/// uses one down the compiled path rather than into a `NameError`.
+pub fn unmodelled_builtin(probe: &Interpreter, name: &str) -> bool {
+    PYTHON_BUILTINS.contains(&name) && probe.root.get(name).is_none()
+}
+
+/// Whether the VM accepts keyword `kw` when calling `name` — a builtin when
+/// `module` is `None`, else that VM-modelled module's attribute. `None` when
+/// the answer is not known here (the callee is not a VM-provided function,
+/// or it forwards keywords somewhere this cannot see), which the pre-run
+/// scan treats as "leave it to the VM".
+pub fn call_accepts_keyword(
+    probe: &mut Interpreter,
+    module: Option<&str>,
+    name: &str,
+    kw: &str,
+) -> Option<bool> {
+    let callee = match module {
+        None => probe.root.get(name)?,
+        Some(m) => {
+            if !models_module(m) {
+                return None;
+            }
+            let Ok(module) = probe.import_module(m) else {
+                return None;
+            };
+            probe.get_attr(&module, name).ok()?
+        }
+    };
+    match callee {
+        Value::Native(n) => crate::builtins::native_accepts_keyword(n.name, kw),
+        Value::Function(f) => {
+            let p = &f.params;
+            let named = p
+                .args
+                .iter()
+                .chain(p.kwonlyargs.iter())
+                .any(|a| a.parameter.name.as_str() == kw);
+            Some(named || p.kwarg.is_some())
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod parity_tests;
 

@@ -374,6 +374,17 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   of a dict or set no longer counts its keys. An exhausted dict or set
   iterator now ignores later mutation (it raised `RuntimeError` where
   CPython raises `StopIteration`).
+- **Keyword arguments bind like CPython's, and the pre-run scan covers
+  builtins and keywords** (W5-21, partial). Builtin-type methods bind
+  keywords to their 3.13 signatures — before, a keyword reached most
+  methods as a stray positional tuple (`s.replace("a", "b", count=2)`
+  raised, `b.hex(sep=":")` was silently ignored, `d.get(k, default=0)`
+  returned `None` where CPython raises). `round(ndigits=)`, `int(base=)`,
+  `math.prod(start=)`, `heapq.nlargest(key=)`, `json.loads(object_hook=)`
+  and friends are accepted. `tyc run` routes a program to the compiled
+  path when it uses a CPython builtin the VM lacks (`exec`, `memoryview`,
+  `globals`, …), `.add_note()`, or a keyword the VM would reject or
+  ignore.
 - **One front end for every VM entry point** (W5-20). The entry program,
   imported sibling modules and the embedded stdlib shims all go through
   `tyc_syntax::preprocess::expand_and_preprocess_mapped` — the chain

@@ -10464,6 +10464,11 @@ fn builtin_type_method(ty: &'static str, attr: &str) -> Option<Value> {
     ))))
 }
 
+/// [`builtin_has_attr`] for the method dispatcher in `builtins`.
+pub(crate) fn builtin_has_attr_pub(value: &Value, attr: &str) -> bool {
+    builtin_has_attr(value, attr)
+}
+
 fn builtin_has_attr(value: &Value, attr: &str) -> bool {
     if attr.starts_with("__") && attr.ends_with("__") {
         // Dunders every builtin value carries.

@@ -3711,9 +3711,22 @@ fn make_math_module() -> Value {
             (
                 "prod",
                 nf("prod", |i, args| {
-                    // math.prod(iterable, *, start=1) — multiply all elements.
-                    let it = i.make_iter(single(&args, "prod")?.clone())?;
-                    let mut acc = Value::Int(VmInt::from(1));
+                    // math.prod(iterable, *, start=1) — multiply all elements
+                    // (`start` arrives at position 1; see `native_keyword_params`).
+                    if args.len() > 2 {
+                        return Err(type_error(format!(
+                            "prod() takes exactly 1 positional argument ({} given)",
+                            args.len()
+                        )));
+                    }
+                    let it = i.make_iter(
+                        args.first()
+                            .ok_or_else(|| {
+                                type_error("prod() takes exactly 1 positional argument (0 given)")
+                            })?
+                            .clone(),
+                    )?;
+                    let mut acc = args.get(1).cloned().unwrap_or(Value::Int(VmInt::from(1)));
                     while let Some(v) = i.iter_next(&it)? {
                         acc = i.binop(&acc, ruff_python_ast::Operator::Mult, &v)?;
                     }
@@ -6232,18 +6245,27 @@ fn make_json_module() -> Value {
             ("JSONDecodeError", Value::Class(json_decode_error_class())),
             (
                 "loads",
-                nf("loads", |_i, args| {
-                    json_loads(&single(&args, "loads")?.py_str())
+                nf("loads", |interp, args| {
+                    let text = args
+                        .first()
+                        .ok_or_else(|| type_error("loads() missing required argument 's'"))?
+                        .py_str();
+                    let value = json_loads(&text)?;
+                    json_apply_hooks(interp, value, &args[1..])
                 }),
             ),
             (
                 "load",
                 nf("load", |interp, args| {
                     // json.load(fp) — read() the file-like, then loads().
-                    let fp = single(&args, "load")?.clone();
+                    let fp = args
+                        .first()
+                        .ok_or_else(|| type_error("load() missing required argument 'fp'"))?
+                        .clone();
                     let read = interp.get_attr(&fp, "read")?;
                     let body = interp.call_value(read, vec![], &[])?;
-                    json_loads(&body.py_str())
+                    let value = json_loads(&body.py_str())?;
+                    json_apply_hooks(interp, value, &args[1..])
                 }),
             ),
             (
@@ -8220,7 +8242,8 @@ fn make_asyncio_module() -> Value {
                             std::thread::sleep(std::time::Duration::from_secs_f64(secs));
                         }
                     }
-                    Ok(Value::None)
+                    // `asyncio.sleep(delay, result=None)` resolves to `result`.
+                    Ok(args.get(1).cloned().unwrap_or(Value::None))
                 }),
             ),
             (
@@ -8687,44 +8710,80 @@ fn make_heapq_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
             return Err(type_error("nsmallest(n, iterable) takes 2 arguments"));
         }
         let n = args[0].to_int()?;
+        let key = args.get(2).filter(|k| !matches!(k, Value::None)).cloned();
         let it = i.make_iter(args[1].clone())?;
-        let mut items: Vec<Value> = Vec::new();
+        // `(sort key, item)`, ordered stably on the key alone.
+        let mut items: Vec<(Value, Value)> = Vec::new();
         while let Some(x) = i.iter_next(&it)? {
-            items.push(x);
+            let k = match &key {
+                Some(f) => i.call_value(f.clone(), vec![x.clone()], &[])?,
+                None => x.clone(),
+            };
+            items.push((k, x));
         }
-        items.sort_by(|a, b| {
-            if value_lt(a, b) {
-                std::cmp::Ordering::Less
-            } else if value_lt(b, a) {
-                std::cmp::Ordering::Greater
+        let mut error = None;
+        items.sort_by(|(a, _), (b, _)| {
+            let ord = if error.is_some() {
+                Ok(std::cmp::Ordering::Equal)
             } else {
-                std::cmp::Ordering::Equal
-            }
+                i.value_cmp(a, b)
+            };
+            let ord = match ord {
+                Ok(o) => o,
+                Err(e) => {
+                    error.get_or_insert(e);
+                    std::cmp::Ordering::Equal
+                }
+            };
+            ord
         });
+        if let Some(e) = error {
+            return Err(e);
+        }
         items.truncate(n.max(0) as usize);
-        Ok(Value::List(Rc::new(RefCell::new(items))))
+        Ok(Value::List(Rc::new(RefCell::new(
+            items.into_iter().map(|(_, x)| x).collect(),
+        ))))
     });
     let nlargest = nf("nlargest", |i, args| {
         if args.len() < 2 {
             return Err(type_error("nlargest(n, iterable) takes 2 arguments"));
         }
         let n = args[0].to_int()?;
+        let key = args.get(2).filter(|k| !matches!(k, Value::None)).cloned();
         let it = i.make_iter(args[1].clone())?;
-        let mut items: Vec<Value> = Vec::new();
+        // `(sort key, item)`, ordered stably on the key alone.
+        let mut items: Vec<(Value, Value)> = Vec::new();
         while let Some(x) = i.iter_next(&it)? {
-            items.push(x);
+            let k = match &key {
+                Some(f) => i.call_value(f.clone(), vec![x.clone()], &[])?,
+                None => x.clone(),
+            };
+            items.push((k, x));
         }
-        items.sort_by(|a, b| {
-            if value_lt(b, a) {
-                std::cmp::Ordering::Less
-            } else if value_lt(a, b) {
-                std::cmp::Ordering::Greater
+        let mut error = None;
+        items.sort_by(|(a, _), (b, _)| {
+            let ord = if error.is_some() {
+                Ok(std::cmp::Ordering::Equal)
             } else {
-                std::cmp::Ordering::Equal
-            }
+                i.value_cmp(a, b)
+            };
+            let ord = match ord {
+                Ok(o) => o,
+                Err(e) => {
+                    error.get_or_insert(e);
+                    std::cmp::Ordering::Equal
+                }
+            };
+            ord.reverse()
         });
+        if let Some(e) = error {
+            return Err(e);
+        }
         items.truncate(n.max(0) as usize);
-        Ok(Value::List(Rc::new(RefCell::new(items))))
+        Ok(Value::List(Rc::new(RefCell::new(
+            items.into_iter().map(|(_, x)| x).collect(),
+        ))))
     });
     // `heappushpop(heap, item)`: push then pop, in one sift — the popped
     // value is `item` itself when it is no larger than the current root.
@@ -9586,6 +9645,281 @@ fn split_kwargs_map(args: &[Value]) -> (&[Value], HashMap<String, Value>) {
     (args, HashMap::new())
 }
 
+// ── Keyword arguments to builtin functions and methods ──────────────────
+
+/// A parameter's default, used to fill a position skipped over when a later
+/// parameter is given by keyword (`s.split(maxsplit=1)` is `s.split(None, 1)`).
+#[derive(Clone, Copy)]
+pub(crate) enum ParamDefault {
+    Required,
+    None,
+    Int(i64),
+    Bool(bool),
+    Str(&'static str),
+    Bytes(&'static [u8]),
+}
+
+impl ParamDefault {
+    fn value(self) -> Option<Value> {
+        Some(match self {
+            ParamDefault::Required => return None,
+            ParamDefault::None => Value::None,
+            ParamDefault::Int(n) => Value::Int(VmInt::from(n)),
+            ParamDefault::Bool(b) => Value::Bool(b),
+            ParamDefault::Str(t) => Value::Str(Rc::new(t.to_owned())),
+            ParamDefault::Bytes(b) => Value::Bytes(Rc::new(b.to_vec())),
+        })
+    }
+}
+
+/// What a builtin function or method accepts by keyword, after CPython
+/// 3.13's signature. `positional` lists the parameters that can be given
+/// either way, starting at position `first` (earlier ones are
+/// positional-only); a keyword naming one of them is moved into its
+/// position, so the implementation only ever reads positions. `keyword_only`
+/// names stay keywords (the implementation reads them from the kwargs
+/// sentinel), and `any_keyword` passes every keyword through (`**kwargs`).
+pub(crate) struct KeywordParams {
+    pub first: usize,
+    pub positional: &'static [(&'static str, ParamDefault)],
+    pub keyword_only: &'static [&'static str],
+    pub any_keyword: bool,
+}
+
+const fn kp(
+    first: usize,
+    positional: &'static [(&'static str, ParamDefault)],
+    keyword_only: &'static [&'static str],
+) -> KeywordParams {
+    KeywordParams {
+        first,
+        positional,
+        keyword_only,
+        any_keyword: false,
+    }
+}
+
+const ANY_KEYWORD: KeywordParams = KeywordParams {
+    first: 0,
+    positional: &[],
+    keyword_only: &[],
+    any_keyword: true,
+};
+
+use ParamDefault as D;
+
+const ENCODE: &[(&str, ParamDefault)] =
+    &[("encoding", D::Str("utf-8")), ("errors", D::Str("strict"))];
+const SPLIT: &[(&str, ParamDefault)] = &[("sep", D::None), ("maxsplit", D::Int(-1))];
+
+/// The keyword parameters of the builtin-type methods the VM implements
+/// (generated from `inspect.signature` under CPython 3.13). A method not
+/// listed takes no keyword arguments.
+pub(crate) fn method_keyword_params(ty: &str, method: &str) -> Option<KeywordParams> {
+    Some(match (ty, method) {
+        ("str", "encode") | ("bytes", "decode") => kp(0, ENCODE, &[]),
+        ("str" | "bytes", "expandtabs") => kp(0, &[("tabsize", D::Int(8))], &[]),
+        ("str" | "bytes", "split" | "rsplit") => kp(0, SPLIT, &[]),
+        ("str" | "bytes", "splitlines") => kp(0, &[("keepends", D::Bool(false))], &[]),
+        ("str", "replace") => kp(2, &[("count", D::Int(-1))], &[]),
+        ("str", "format") => ANY_KEYWORD,
+        ("bytes", "translate") => kp(1, &[("delete", D::Bytes(b""))], &[]),
+        ("bytes", "hex") => kp(0, &[("sep", D::None), ("bytes_per_sep", D::Int(1))], &[]),
+        ("list", "sort") => kp(0, &[], &["key", "reverse"]),
+        ("dict", "update") => ANY_KEYWORD,
+        // VM-internal: the `OrderedDict` shim drives its backing dict with
+        // these (`dict` itself has no such keywords).
+        ("dict", "popitem") => kp(0, &[], &["last"]),
+        ("dict", "move_to_end") => kp(1, &[("last", D::Bool(true))], &[]),
+        ("int" | "bool", "to_bytes") => kp(
+            0,
+            &[("length", D::Int(1)), ("byteorder", D::Str("big"))],
+            &["signed"],
+        ),
+        _ => return None,
+    })
+}
+
+/// Move keyword arguments that name positional parameters into their
+/// positions, check the rest, and return the call's arguments with any
+/// remaining keywords back in a sentinel. `display` names the callable in
+/// errors (`split`, or `str.count` for "takes no keyword arguments").
+pub(crate) fn bind_keywords(
+    params: Option<&KeywordParams>,
+    short_name: &str,
+    qualified_name: &str,
+    mut positional: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Vec<Value>, Unwind> {
+    if kwargs.is_empty() {
+        return Ok(positional);
+    }
+    let Some(params) = params else {
+        return Err(type_error(format!(
+            "{qualified_name}() takes no keyword arguments"
+        )));
+    };
+    if params.any_keyword {
+        positional.push(make_kwargs_sentinel(&kwargs));
+        return Ok(positional);
+    }
+    let mut by_position: Vec<Option<Value>> = vec![None; params.positional.len()];
+    let mut rest: Vec<(String, Value)> = Vec::new();
+    for (k, v) in kwargs {
+        if let Some(at) = params.positional.iter().position(|(p, _)| *p == k) {
+            let position = params.first + at;
+            if position < positional.len() {
+                return Err(type_error(format!(
+                    "argument for {short_name}() given by name ('{k}') and position ({})",
+                    position + 1
+                )));
+            }
+            by_position[at] = Some(v);
+        } else if params.keyword_only.contains(&k.as_str()) {
+            rest.push((k, v));
+        } else {
+            return Err(type_error(format!(
+                "{short_name}() got an unexpected keyword argument '{k}'"
+            )));
+        }
+    }
+    if let Some(last) = by_position.iter().rposition(Option::is_some) {
+        for (at, given) in by_position.into_iter().enumerate().take(last + 1) {
+            let position = params.first + at;
+            if position < positional.len() {
+                continue;
+            }
+            if position > positional.len() {
+                // A positional-only parameter before `first` is missing.
+                return Err(type_error(format!(
+                    "{short_name}() missing required argument (pos {})",
+                    positional.len() + 1
+                )));
+            }
+            let value = match given {
+                Some(v) => v,
+                None => params.positional[at].1.value().ok_or_else(|| {
+                    type_error(format!(
+                        "{short_name}() missing required argument '{}' (pos {})",
+                        params.positional[at].0,
+                        position + 1
+                    ))
+                })?,
+            };
+            positional.push(value);
+        }
+    }
+    if !rest.is_empty() {
+        positional.push(make_kwargs_sentinel(&rest));
+    }
+    Ok(positional)
+}
+
+/// The keyword parameters of native functions that have no bespoke
+/// keyword handling in [`call_with_kwargs`], in the positional order the
+/// native reads them. A keyword-only CPython parameter (`math.prod`'s
+/// `start`, `json.loads`'s hooks) is listed here too: the native takes it
+/// at that position.
+pub(crate) fn native_keyword_params(name: &str) -> Option<KeywordParams> {
+    const LOADS: &[(&str, ParamDefault)] = &[
+        ("cls", D::None),
+        ("object_hook", D::None),
+        ("parse_float", D::None),
+        ("parse_int", D::None),
+        ("parse_constant", D::None),
+        ("object_pairs_hook", D::None),
+    ];
+    Some(match name {
+        "round" => kp(0, &[("number", D::Required), ("ndigits", D::None)], &[]),
+        "int" => kp(1, &[("base", D::Int(10))], &[]),
+        "prod" => kp(1, &[("start", D::Int(1))], &[]),
+        "nlargest" | "nsmallest" => kp(
+            0,
+            &[
+                ("n", D::Required),
+                ("iterable", D::Required),
+                ("key", D::None),
+            ],
+            &[],
+        ),
+        "loads" => kp(1, LOADS, &[]),
+        "sleep" => kp(0, &[("delay", D::Required), ("result", D::None)], &[]),
+        "wait_for" => kp(1, &[("timeout", D::Required)], &[]),
+        "lru_cache" => kp(
+            0,
+            &[("maxsize", D::Int(128)), ("typed", D::Bool(false))],
+            &[],
+        ),
+        "load" => kp(1, LOADS, &[]),
+        _ => return None,
+    })
+}
+
+/// Whether native `name` accepts keyword `kw`: the bespoke keyword arms of
+/// [`call_with_kwargs`] (by what each reads), then the table above. `None`
+/// for a native that forwards keywords on (`partial`, `dict`, a shim class).
+pub(crate) fn native_accepts_keyword(name: &str, kw: &str) -> Option<bool> {
+    let bespoke: Option<&[&str]> = match name {
+        "enumerate" => Some(&["start"]),
+        "zip" => Some(&["strict"]),
+        "min" | "max" => Some(&["key", "default"]),
+        "sorted" => Some(&["key", "reverse"]),
+        // `repr=` / `compare=` / `init=` … are accepted but not modelled.
+        "field" => Some(&["default", "default_factory"]),
+        // `default=` / `cls=` / `skipkeys=` are accepted but not honoured.
+        "dumps" | "dump" => Some(&[
+            "indent",
+            "sort_keys",
+            "ensure_ascii",
+            "allow_nan",
+            "separators",
+            "check_circular",
+        ]),
+        "groupby" => Some(&["key", "iterable"]),
+        "print" => Some(&["sep", "end", "file", "flush"]),
+        "sum" => Some(&["start"]),
+        "gather" => Some(&["return_exceptions"]),
+        "Queue" => Some(&["maxsize"]),
+        "pow" => Some(&["base", "exp", "mod"]),
+        "Ok" => Some(&["value"]),
+        "Err" => Some(&["error"]),
+        "isclose" => Some(&["rel_tol", "abs_tol"]),
+        "nextafter" => Some(&["steps"]),
+        "property"
+        | "dict"
+        | "ConfigDict"
+        | "dataclass"
+        | "dataclasses.replace"
+        | "mkdir"
+        | "makedirs"
+        | "contextmanager_factory"
+        | "namedtuple"
+        | "open"
+        | "str"
+        | "bytes"
+        | "bytearray"
+        | "from_bytes"
+        | "partial"
+        | "partial_call"
+        | "compile"
+        | "match"
+        | "search"
+        | "fullmatch"
+        | "findall"
+        | "finditer"
+        | "sub"
+        | "subn"
+        | "split" => return None,
+        _ => None,
+    };
+    if let Some(names) = bespoke {
+        return Some(names.contains(&kw));
+    }
+    Some(native_keyword_params(name).is_some_and(|p| {
+        p.any_keyword || p.positional.iter().any(|(n, _)| *n == kw) || p.keyword_only.contains(&kw)
+    }))
+}
+
 pub fn dispatch_method(
     interp: &mut Interpreter,
     name: &str,
@@ -9595,6 +9929,30 @@ pub fn dispatch_method(
         .first()
         .cloned()
         .ok_or_else(|| type_error("method called without receiver"))?;
+    // Keywords arrive as a trailing sentinel (`call_value`); bind them to
+    // the method's CPython signature so every handler sees positions.
+    let args = {
+        let (pos, kw) = split_kwargs(&args);
+        if kw.is_empty() {
+            args
+        } else {
+            let ty = match &receiver {
+                Value::Set(s) if set_is_frozen(s) => "frozenset",
+                other => other.type_name(),
+            };
+            let params = method_keyword_params(ty, name);
+            if params.is_none() && !crate::interp::builtin_has_attr_pub(&receiver, name) {
+                // Not a method of this type: the handler's AttributeError.
+                pos.to_vec()
+            } else {
+                let qualified = format!("{ty}.{name}");
+                let mut bound =
+                    bind_keywords(params.as_ref(), name, &qualified, pos[1..].to_vec(), kw)?;
+                bound.insert(0, receiver.clone());
+                bound
+            }
+        }
+    };
     let (rest, kwargs) = split_kwargs_map(&args[1..]);
     // The universal dunders CPython exposes on every object. They are
     // ordinary methods there (`(5).__repr__()`, `"a".__len__()`), and the
@@ -11260,7 +11618,7 @@ fn list_method(
             for (k, v) in &kw {
                 match k.as_str() {
                     "reverse" => reverse = v.truthy(),
-                    "key" => key_fn = Some(v.clone()),
+                    "key" => key_fn = Some(v.clone()).filter(|v| !matches!(v, Value::None)),
                     _ => {
                         return Err(type_error(format!(
                             "sort() got an unexpected keyword argument '{}'",
@@ -11501,10 +11859,10 @@ fn dict_method(
                 .first()
                 .ok_or_else(|| type_error("move_to_end() requires a key"))?;
             let key = interp.dict_probe_key(d, key)?;
-            let last = kw
-                .iter()
-                .find(|(k, _)| k == "last")
-                .map(|(_, v)| v.truthy())
+            let last = args
+                .get(1)
+                .or_else(|| kw.iter().find(|(k, _)| k == "last").map(|(_, v)| v))
+                .map(Value::truthy)
                 .unwrap_or(true);
             let mut m = d.borrow_mut();
             let Some(v) = m.remove(&key) else {
@@ -12498,6 +12856,85 @@ pub(crate) fn json_loads_value(_interp: &mut Interpreter, raw: &Value) -> Result
     }
 }
 
+/// `json.loads(…, cls=, object_hook=, parse_float=, parse_int=,
+/// parse_constant=, object_pairs_hook=)`: `hooks` are those six, by
+/// position. The object hooks run on each decoded object innermost-first,
+/// in document order — the order CPython's decoder completes them in.
+fn json_apply_hooks(
+    interp: &mut Interpreter,
+    value: Value,
+    hooks: &[Value],
+) -> Result<Value, Unwind> {
+    let hook = |at: usize| hooks.get(at).filter(|v| !matches!(v, Value::None)).cloned();
+    for (at, name) in [
+        (0, "cls"),
+        (2, "parse_float"),
+        (3, "parse_int"),
+        (4, "parse_constant"),
+    ] {
+        if hook(at).is_some() {
+            return Err(Unwind::Exception(crate::error::VmException::new(
+                "NotImplementedError",
+                format!(
+                    "json.loads({name}=...) is not modelled by the VM; run with `tyc run --compile`"
+                ),
+            )));
+        }
+    }
+    let pairs_hook = hook(5);
+    let object_hook = hook(1);
+    if pairs_hook.is_none() && object_hook.is_none() {
+        return Ok(value);
+    }
+    fn walk(
+        interp: &mut Interpreter,
+        v: Value,
+        pairs_hook: &Option<Value>,
+        object_hook: &Option<Value>,
+    ) -> Result<Value, Unwind> {
+        match v {
+            Value::List(l) => {
+                let items: Vec<Value> = l.borrow().clone();
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    out.push(walk(interp, item, pairs_hook, object_hook)?);
+                }
+                Ok(Value::List(Rc::new(RefCell::new(out))))
+            }
+            Value::Dict(d) => {
+                let entries: Vec<(HashKey, Value)> = d
+                    .borrow()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                let mut decoded = Vec::with_capacity(entries.len());
+                for (k, item) in entries {
+                    decoded.push((k, walk(interp, item, pairs_hook, object_hook)?));
+                }
+                if let Some(h) = pairs_hook {
+                    let pairs: Vec<Value> = decoded
+                        .into_iter()
+                        .map(|(k, v)| Value::Tuple(Rc::new(vec![k.into_value(), v])))
+                        .collect();
+                    return interp.call_value(
+                        h.clone(),
+                        vec![Value::List(Rc::new(RefCell::new(pairs)))],
+                        &[],
+                    );
+                }
+                let map: DictMap = decoded.into_iter().collect();
+                let obj = Value::Dict(Rc::new(crate::value::FrozenCell::new(map)));
+                match object_hook {
+                    Some(h) => interp.call_value(h.clone(), vec![obj], &[]),
+                    None => Ok(obj),
+                }
+            }
+            other => Ok(other),
+        }
+    }
+    walk(interp, value, &pairs_hook, &object_hook)
+}
+
 fn json_loads(s: &str) -> Result<Value, Unwind> {
     let mut p = JsonParser {
         doc: s,
@@ -13003,11 +13440,11 @@ pub fn call_with_kwargs(
             for (k, v) in kwargs {
                 match k.as_str() {
                     "reverse" => reverse = v.truthy(),
-                    "key" => key_fn = Some(v.clone()),
+                    // `key=None` is the identity, as in CPython.
+                    "key" => key_fn = Some(v.clone()).filter(|v| !matches!(v, Value::None)),
                     _ => {
                         return Err(type_error(format!(
-                            "sorted() got unexpected keyword: '{}'",
-                            k
+                            "sort() got an unexpected keyword argument '{k}'"
                         )))
                     }
                 }
@@ -13365,16 +13802,17 @@ pub fn call_with_kwargs(
             args.push(make_kwargs_sentinel(kwargs));
             (n.func)(interp, args)
         }
-        _ => {
-            if kwargs.is_empty() {
+        _ => match native_keyword_params(n.name) {
+            Some(params) => {
+                let args = bind_keywords(Some(&params), n.name, n.name, args, kwargs.to_vec())?;
                 (n.func)(interp, args)
-            } else {
-                Err(type_error(format!(
-                    "{}() does not accept keyword arguments",
-                    n.name
-                )))
             }
-        }
+            None if kwargs.is_empty() => (n.func)(interp, args),
+            None => Err(type_error(format!(
+                "{}() does not accept keyword arguments",
+                n.name
+            ))),
+        },
     }
 }
 
