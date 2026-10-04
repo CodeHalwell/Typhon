@@ -307,6 +307,13 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   missing from `tyc explain --list`, from `docs/diagnostics/`, or from the
   docs-site catalog and its index. `missing_initialiser` and
   `python_semantic_drift` are listed but never emitted; their pages say so.
+- New `fmt-corpus` CI job (W7-03 request): a copy of `examples/`,
+  `stress/` and `corpus/valid/` has its code de-formatted (`let x: T = 1` →
+  `let x:T=1`, no space after `,` or `:`, `=` and `->` squeezed, trailing
+  blanks; strings and comments untouched), `tyc fmt` runs over it, and every
+  unit must emit exactly the Python AST the unmodified corpus emits. A file
+  `tyc fmt` refuses only after de-formatting also fails the job. First run:
+  1,224 built units identical, 264 non-building on both sides.
 - `scripts/emitted-ast.py equiv A B` is the emitted-AST equivalence harness
   (step 0 of `docs/design/sugar-as-ast-nodes.md`): A and B are `tyc`
   binaries or git revisions; every corpus unit is built with both and the
