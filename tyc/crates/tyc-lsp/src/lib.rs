@@ -261,6 +261,27 @@ impl Backend {
         path_to_uri(path)
     }
 
+    async fn refresh_open_documents(&self) {
+        let open: Vec<(String, SourceFile)> = {
+            let docs = self.documents.lock().await;
+            docs.iter().map(|(uri, sf)| (uri.clone(), *sf)).collect()
+        };
+        for (uri_str, sf) in open {
+            let text = {
+                let db = self.db.lock().await;
+                sf.text(&*db).clone()
+            };
+            // Publish with the document's last known version rather than
+            // `None`: an unversioned `publishDiagnostics` can't be superseded
+            // by the client, so a refresh racing the user's typing could
+            // clobber newer, versioned diagnostics. (PR #192 review.)
+            let version = self.prewarmed_versions.lock().await.get(&uri_str).copied();
+            if let Ok(uri) = Uri::from_str(&uri_str) {
+                self.check_and_publish(uri, text, version).await;
+            }
+        }
+    }
+
     /// True if a message at `level` should be forwarded to the editor.
     fn should_log(&self, level: MessageType) -> bool {
         // `MessageType` ranking, low-to-high: LOG < INFO < WARNING < ERROR.
@@ -802,6 +823,7 @@ impl LanguageServer for Backend {
         let doc = params.text_document;
         self.check_and_publish(doc.uri, doc.text, Some(doc.version))
             .await;
+        self.refresh_open_documents().await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -816,49 +838,22 @@ impl LanguageServer for Backend {
             Some(params.text_document.version),
         )
         .await;
+        self.refresh_open_documents().await;
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
-        // The VS Code client watches `**/typhon.toml`, `**/*.ty`, `**/*.dty`
-        // (see `synchronize.fileEvents`). Before this handler existed the
-        // notification was a silent no-op, so a `typhon.toml` edit didn't
-        // refresh diagnostics until the user re-touched a source file.
-        //
-        // Only a `typhon.toml` change warrants re-checking *open* documents
-        // here: a `.ty` / `.dty` change to the file being edited is already
-        // handled by `did_change`, and the per-root lint cache is mtime-keyed
-        // so the new `[strictness]` is picked up by the re-check below without
-        // an explicit invalidation. `uri_to_path` is the codebase's robust
-        // Uri→PathBuf conversion (percent-decoding, Windows `/C:/…` prefixes).
-        let config_changed = params.changes.iter().any(|change| {
-            uri_to_path(&change.uri)
-                .and_then(|p| p.file_name().map(|n| n == "typhon.toml"))
-                .unwrap_or(false)
+        let relevant = params.changes.iter().any(|change| {
+            uri_to_path(&change.uri).is_some_and(|p| {
+                p.file_name().is_some_and(|n| n == "typhon.toml")
+                    || p.extension().is_some_and(|e| e == "ty" || e == "dty")
+            })
         });
-        if !config_changed {
+        if !relevant {
             return;
         }
-
-        let open: Vec<(String, SourceFile)> = {
-            let docs = self.documents.lock().await;
-            docs.iter().map(|(uri, sf)| (uri.clone(), *sf)).collect()
-        };
-        for (uri_str, sf) in open {
-            let text = {
-                let db = self.db.lock().await;
-                sf.text(&*db).clone()
-            };
-            // Publish with the document's last known version rather than
-            // `None`: an unversioned `publishDiagnostics` can't be superseded
-            // by the client, so a refresh racing the user's typing could
-            // clobber newer, versioned diagnostics. (PR #192 review.)
-            let version = self.prewarmed_versions.lock().await.get(&uri_str).copied();
-            if let Ok(uri) = Uri::from_str(&uri_str) {
-                self.check_and_publish(uri, text, version).await;
-            }
-        }
+        self.resolved_cache.lock().await.clear();
+        self.refresh_open_documents().await;
     }
-
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         // Clear diagnostics when the user closes a file so stale errors do
         // not linger in the editor.
@@ -877,6 +872,7 @@ impl LanguageServer for Backend {
         }
         self.evict_resolved_cache(&uri_str).await;
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
+        self.refresh_open_documents().await;
     }
 
     async fn hover(&self, params: HoverParams) -> jsonrpc::Result<Option<Hover>> {
