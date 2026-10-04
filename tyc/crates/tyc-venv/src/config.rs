@@ -627,6 +627,39 @@ impl TyphonConfig {
         Ok(())
     }
 
+    /// Settings that are accepted but cannot do what they say (W4-16), as
+    /// warning messages. `cli_force_level1` is `tyc build -O`.
+    ///
+    /// These are warnings, not [`validate`](Self::validate) errors, by
+    /// design: validation that rejects a config must only reject configs that
+    /// cannot work, and both combinations below work today — the setting is
+    /// a no-op (or only changes which advice lints fire), so the program
+    /// builds and runs exactly as it would without it.
+    pub fn advisories(&self, cli_force_level1: bool) -> Vec<String> {
+        let mut out = Vec::new();
+        let target = self.python.target.trim();
+        if self.python.free_threaded && !target.ends_with('t') {
+            out.push(format!(
+                "`[python] free-threaded = true` with `target = \"{target}\"`: the free-threaded \
+                 CPython build is the `t` target (`\"{target}t\"`). On a GIL build the \
+                 parallelism advice this enables cannot pay off. Set `target = \"{target}t\"`, \
+                 or remove `free-threaded`."
+            ));
+        }
+        let level1 = cli_force_level1 || self.optimise.level >= 1;
+        let auto_parallel = self.strictness.auto_parallel.unwrap_or(level1);
+        if self.strictness.auto_parallel_reductions && !auto_parallel {
+            out.push(
+                "`[strictness] auto-parallel-reductions = true` does nothing without \
+                 `auto-parallel`: reductions are rewritten only alongside the comprehension \
+                 rewrite. Set `auto-parallel = true` (or `[optimise] level = 1`, or build \
+                 with `-O`), or remove `auto-parallel-reductions`."
+                    .to_owned(),
+            );
+        }
+        out
+    }
+
     /// Resolve the four optimise-gated strictness knobs (`auto-memoise`,
     /// `auto-gather`, `auto-parallel`, `pgo-memoise`) to concrete values,
     /// honouring `[optimise] level` and an optional CLI `-O`/`--optimise`
@@ -1546,5 +1579,44 @@ parallel-backend = \"interpreters\"
                 other => panic!("expected InvalidParallelBackend for {v:?}, got {other:?}"),
             }
         }
+    }
+
+    /// W4-16: accepted-but-ineffective settings are reported as advisories,
+    /// never rejected — both configs below build and run today.
+    #[test]
+    fn advisories_flag_ineffective_parallel_settings() {
+        let parse = |t: &str| TyphonConfig::parse_str(t, Path::new("typhon.toml")).unwrap();
+        let free = parse("[python]\ntarget = \"3.13\"\nfree-threaded = true\n");
+        let msgs = free.advisories(false);
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(msgs[0].contains("3.13t"), "{msgs:?}");
+        assert!(
+            parse("[python]\ntarget = \"3.14t\"\nfree-threaded = true\n")
+                .advisories(false)
+                .is_empty()
+        );
+
+        let red = parse("[strictness]\nauto-parallel-reductions = true\n");
+        assert!(red.advisories(false)[0].contains("auto-parallel-reductions"));
+        // `-O` and `[optimise] level = 1` turn auto-parallel on.
+        assert!(red.advisories(true).is_empty());
+        assert!(
+            parse("[optimise]\nlevel = 1\n[strictness]\nauto-parallel-reductions = true\n")
+                .advisories(false)
+                .is_empty()
+        );
+        assert!(
+            parse("[strictness]\nauto-parallel = true\nauto-parallel-reductions = true\n")
+                .advisories(false)
+                .is_empty()
+        );
+        // An explicit `auto-parallel = false` wins over `-O`.
+        assert_eq!(
+            parse("[strictness]\nauto-parallel = false\nauto-parallel-reductions = true\n")
+                .advisories(true)
+                .len(),
+            1
+        );
+        assert!(TyphonConfig::default().advisories(true).is_empty());
     }
 }

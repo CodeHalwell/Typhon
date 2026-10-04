@@ -297,6 +297,15 @@ grouped by workstream (W1–W7).
     `SyntaxError`.
   - `tyc trace` rewrites frames inside `ExceptionGroup` tracebacks (the
     `  |   File "…"` rows every failed `gather:` prints), keeping the gutter.
+- **Warnings for parallel settings that cannot take effect** (W4-16).
+  `[python] free-threaded = true` with a target lacking the `t` suffix, and
+  `[strictness] auto-parallel-reductions = true` while `auto-parallel`
+  resolves to off (after `[optimise] level` and `tyc build -O`), are now
+  reported by `tyc check` and `tyc build`. Decision: warnings, not
+  config-load errors — both combinations build and run today (one only
+  switches on advice lints, the other is a no-op), and validation only
+  rejects configs that cannot work. The free-threading preset on the docs
+  site now uses `target = "3.14t"`.
 
 #### W5 — VM & harness
 

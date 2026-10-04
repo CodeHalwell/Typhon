@@ -471,3 +471,41 @@ fn piped_repl_exit_code_reflects_failed_snippets() {
     let raised = run("raise ValueError(\"boom\")\n");
     assert!(!raised.status.success(), "{}", text(&raised));
 }
+
+// ── config advisories (W4-16) ────────────────────────────────────────────────
+
+/// W4-16: `free-threaded = true` on a GIL target and
+/// `auto-parallel-reductions` without `auto-parallel` are accepted (both work
+/// today) but reported, by `tyc check` and `tyc build` alike.
+#[test]
+fn ineffective_parallel_settings_warn_but_still_build() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(
+        dir.join("typhon.toml"),
+        "[project]\nname = \"adv\"\n\n[python]\ntarget = \"3.13\"\nfree-threaded = true\n\n\
+         [strictness]\nauto-parallel-reductions = true\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("src/main.ty"), "print(1)\n").unwrap();
+    for cmd in [&["check", "src"][..], &["build", "--no-sync"][..]] {
+        let out = tyc().current_dir(dir).args(cmd).output().unwrap();
+        let t = text(&out);
+        assert!(out.status.success(), "{cmd:?}: {t}");
+        assert!(t.contains("\"3.13t\""), "{cmd:?}: {t}");
+        assert!(t.contains("auto-parallel-reductions"), "{cmd:?}: {t}");
+    }
+    // `-O` turns auto-parallel on, so only the free-threaded warning remains.
+    let out = tyc()
+        .current_dir(dir)
+        .args(["build", "--no-sync", "-O"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        !text(&out).contains("auto-parallel-reductions"),
+        "{}",
+        text(&out)
+    );
+}

@@ -297,6 +297,13 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // are known. After this, `config.strictness.{auto_memoise,auto_gather,
     // auto_parallel,pgo_memoise}` are `Some(_)` and read with `.unwrap_or(false)`.
     // An explicit `[strictness]` entry always wins over the level default.
+    // W4-16: settings that are accepted but cannot take effect.
+    for advisory in config.advisories(args.optimise) {
+        eprintln!(
+            "warning: {}: {advisory}",
+            project_root.join("typhon.toml").display()
+        );
+    }
     config.resolve_optimise(args.optimise);
     if sources_use_model_keyword(&sources) && !config.dependencies.contains_key("pydantic") {
         config
