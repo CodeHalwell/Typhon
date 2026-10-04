@@ -541,6 +541,18 @@ if [ "$UPDATE" = "1" ]; then
         cat "$DIVERGED"
     } > "$BASELINE"
     echo "baseline rewritten: ${BASELINE#$REPO_ROOT/}  ($N_DIV entry/entries)"
+    # Every scope shares one nobuild baseline. Keep the entries for units
+    # this run did not cover, so `--scope valid` / `--scope examples` /
+    # `--filter` with `--update` rewrites only its own slice instead of
+    # erasing the rest of the list.
+    NB_MERGED="$SCRATCH/nobuild_merged.txt"
+    if [ -f "$NOBUILD_BASELINE" ]; then
+        grep -vE '^\s*(#|$)' "$NOBUILD_BASELINE" | sed 's/[[:space:]]*$//' | sort -u \
+            | comm -23 - <(sort -u "$UNITS") > "$NB_MERGED"
+    else
+        : > "$NB_MERGED"
+    fi
+    sort -u "$NB_MERGED" "$NOBUILT" -o "$NB_MERGED"
     {
         echo "# scripts/nobuild-baseline.txt"
         echo "#"
@@ -558,9 +570,9 @@ if [ "$UPDATE" = "1" ]; then
         echo "# Generated $(date -u +%Y-%m-%d) against $("$TYC" --version 2>/dev/null | head -1)"
         echo "# Scope: $SCOPE${FILTER:+  filter=/$FILTER/}"
         echo "#"
-        cat "$NOBUILT"
+        cat "$NB_MERGED"
     } > "$NOBUILD_BASELINE"
-    echo "baseline rewritten: ${NOBUILD_BASELINE#$REPO_ROOT/}  ($N_NOBUILD entry/entries)"
+    echo "baseline rewritten: ${NOBUILD_BASELINE#$REPO_ROOT/}  ($(wc -l < "$NB_MERGED" | tr -d ' ') entry/entries)"
     exit 0
 fi
 
