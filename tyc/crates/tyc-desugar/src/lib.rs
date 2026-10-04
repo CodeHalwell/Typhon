@@ -24,12 +24,13 @@ use ruff_python_ast::name::Name;
 use ruff_python_ast::{
     self as ast, Alias, Arguments, AtomicNodeIndex, Decorator, ExceptHandler, Expr, ExprAttribute,
     ExprBooleanLiteral, ExprCall, ExprContext, ExprName, ExprStringLiteral, Identifier, Keyword,
-    ModModule, Operator, Parameter, ParameterWithDefault, Parameters, Pattern, Stmt, StmtAssign,
-    StmtImport, StmtImportFrom, StringLiteral, StringLiteralFlags, StringLiteralValue,
+    ModModule, Parameter, ParameterWithDefault, Parameters, Pattern, Stmt, StmtAssign, StmtImport,
+    StmtImportFrom, StringLiteral, StringLiteralFlags, StringLiteralValue,
 };
 use ruff_text_size::TextRange;
 
-mod impl_site;
+use tyc_syntax::impl_site;
+use tyc_syntax::impl_site::collect_sealed_union_aliases;
 
 // ── public API ───────────────────────────────────────────────────────────────
 
@@ -4249,58 +4250,6 @@ fn make_string_literal_expr(text: &str) -> Expr {
 /// Name prefix the preprocessor gives every `impl` pseudo-class.
 const IMPL_PREFIX: &str = "__typhon_impl_";
 
-/// Walk `expr` collecting every bare `Name` operand of a flat `A | B | …`
-/// union expression. Returns `None` for any other shape so `type X = A`
-/// (single name, no union) and `type X = list[A]` (generic) don't get
-/// mistaken for sealed unions. Mirrors
-/// `tyc_types::extract_sealed_union_variants` so the desugar doesn't need
-/// a cross-crate dep. R2-3.
-fn collect_union_variant_names(expr: &Expr) -> Option<Vec<String>> {
-    let mut names = Vec::new();
-    let mut stack = vec![expr];
-    while let Some(current) = stack.pop() {
-        match current {
-            Expr::Name(n) => names.push(n.id.as_str().to_owned()),
-            // Push `right` first so the stack pops left-to-right: a
-            // `BinOp` reads `A | B | C` as
-            // `BinOp(BinOp(A, B), C)` — pushing left last makes the
-            // visitor descend leftmost first and preserves source
-            // order in `names`. Without this the variants end up in
-            // reverse order, contradicting the docstring on the
-            // caller (`collect_sealed_union_aliases`). PR #129
-            // gemini review.
-            Expr::BinOp(b) if matches!(b.op, Operator::BitOr) => {
-                stack.push(&b.right);
-                stack.push(&b.left);
-            }
-            _ => return None,
-        }
-    }
-    if names.len() >= 2 {
-        Some(names)
-    } else {
-        None
-    }
-}
-
-/// Collect every sealed-union type alias declared at module scope so
-/// `impl Union:` can distribute its methods across every variant.
-/// Keyed by the alias name; values are the ordered variant class names
-/// as they appear in `type Union = A | B | C`. R2-3.
-fn collect_sealed_union_aliases(body: &[Stmt]) -> HashMap<String, Vec<String>> {
-    let mut out = HashMap::new();
-    for stmt in body {
-        if let Stmt::TypeAlias(ta) = stmt {
-            if let Expr::Name(n) = ta.name.as_ref() {
-                if let Some(variants) = collect_union_variant_names(&ta.value) {
-                    out.insert(n.id.as_str().to_owned(), variants);
-                }
-            }
-        }
-    }
-    out
-}
-
 // ── H0: bare `super()` rewrite ─────────────────────────────────────────────
 
 /// Rewrite every bare zero-argument `super()` call appearing inside a method
@@ -4504,24 +4453,7 @@ fn merge_impl_blocks(body: Vec<Stmt>) -> (Vec<Stmt>, bool) {
     };
     // Every name the merged class body binds: its own members plus every
     // `impl` method aimed at it.
-    let mut class_scope: HashMap<String, HashSet<String>> = HashMap::new();
-    for stmt in &body {
-        if let Stmt::ClassDef(c) = stmt {
-            if !c.name.as_str().starts_with(IMPL_PREFIX) {
-                impl_site::class_body_names(
-                    &c.body,
-                    class_scope.entry(c.name.as_str().to_owned()).or_default(),
-                );
-            }
-        }
-    }
-    for (impl_idx, target_name) in &impl_indices {
-        if let Stmt::ClassDef(c) = &body[*impl_idx] {
-            for target in targets_of(target_name) {
-                impl_site::class_body_names(&c.body, class_scope.entry(target).or_default());
-            }
-        }
-    }
+    let class_scope = impl_site::class_scopes(&body, IMPL_PREFIX, &union_aliases);
     let planner = impl_site::ImplSitePlanner::new(&body, IMPL_PREFIX);
     for (impl_idx, target_name) in &impl_indices {
         if let Stmt::ClassDef(c) = &body[*impl_idx] {
@@ -7345,6 +7277,25 @@ class __typhon_impl_Shape(object):
             "class C:\n    x: int\nK = 1\nclass __typhon_impl_C(object):\n    def m(k: int = K) -> int:\n        return k\nclass D(C):\n    pass\n",
         );
         assert!(out.contains("C.m = __typhon_extend_C__m"), "{out}");
+    }
+
+    #[test]
+    fn impl_method_on_a_builtin_exception_subclass_moves_unless_the_base_has_it() {
+        // `Exception` has no `describe`: nothing to inherit, so the method is
+        // attached at its block like on a base-less class.
+        let out = parse_and_desugar(
+            "class AppError(Exception):\n    code: int\nPREFIX = \"E\"\nclass __typhon_impl_AppError(object):\n    def describe(p: str = PREFIX) -> str:\n        return p\n",
+        );
+        assert!(
+            out.contains("AppError.describe = __typhon_extend_AppError__describe"),
+            "{out}"
+        );
+        // `with_traceback` is an `Exception` member: the VM would find the
+        // inherited one first, so it stays merged.
+        let out = parse_and_desugar(
+            "class AppError(ValueError):\n    code: int\nK = 1\nclass __typhon_impl_AppError(object):\n    def with_traceback(k: int = K) -> int:\n        return k\n",
+        );
+        assert!(!out.contains("__typhon_extend_"), "{out}");
     }
 
     #[test]

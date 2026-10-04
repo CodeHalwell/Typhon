@@ -1,0 +1,18 @@
+class AppError(Exception):
+    code: int
+
+let PREFIX: str = "E"
+
+impl AppError:
+    def describe(self, prefix: str = PREFIX) -> str:
+        return f"{prefix}{self.code}"
+
+def main() -> None:
+    let e = AppError(code=42)
+    print(e.describe())
+    try:
+        raise AppError(code=7)
+    except AppError as err:
+        print(err.describe("X"))
+
+main()

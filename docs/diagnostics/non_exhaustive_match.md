@@ -45,6 +45,13 @@ The same check runs on every subject whose values form a closed set:
 An arm with a guard (`case Ok(v) if v > 0:`) never counts towards coverage.
 `[strictness] exhaustive-match` sets the level of every form.
 
+The message names the subject by what it is: `on sealed union \`Shape\`:
+missing variant(s) Triangle`, `on enum \`Color\`: missing member(s) BLUE`,
+and, for the other closed subjects, the subject's type —
+`on \`bool\`: missing case(s) False`,
+`on \`int | None\`: missing case(s) None`,
+`on \`Result[str, NotFound | Timeout | Denied]\`: missing case(s) Err(Denied)`.
+
 ## Why
 
 Sealed unions list their variants exhaustively, which lets the type checker

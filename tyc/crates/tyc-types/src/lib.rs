@@ -3317,6 +3317,11 @@ const IS_ASSIGNABLE_MAX_DEPTH: u32 = 256;
 
 struct Checker<'a> {
     descriptor_uses: std::cell::OnceCell<HashSet<(String, String)>>,
+    /// Attribute names this module writes on a receiver other than `self`
+    /// (`err.code = 404`, `cls.code = 1`); `None` when it calls `setattr`,
+    /// `vars` or touches `__dict__`, which can write any name. Computed on
+    /// first use by [`Checker::module_may_store_attr`].
+    dynamic_attr_stores: std::cell::OnceCell<Option<HashSet<String>>>,
     expression_types: HashMap<(usize, usize), Type>,
     attribute_receiver_type: Option<Type>,
     module: Option<&'a ModModule>,
@@ -3931,6 +3936,7 @@ impl<'a> Checker<'a> {
             function_type_bounds: HashMap::new(),
             active_typevar_bounds: HashMap::new(),
             descriptor_uses: std::cell::OnceCell::new(),
+            dynamic_attr_stores: std::cell::OnceCell::new(),
             expression_types: HashMap::new(),
             attribute_receiver_type: None,
             active_type_params: Vec::new(),
@@ -5695,6 +5701,105 @@ impl<'a> Checker<'a> {
         true
     }
 
+    /// The builtin exception classes `cls_name` inherits from, when every
+    /// class in its hierarchy is either a non-partial project class or a
+    /// builtin exception; `None` when any other unseen base (a framework
+    /// class, a venv type) could supply attributes the checker cannot list.
+    fn builtin_exception_bases(&self, cls_name: &str) -> Option<Vec<String>> {
+        let mut out = Vec::new();
+        let mut stack: Vec<&str> = vec![cls_name];
+        let mut visited: HashSet<&str> = HashSet::new();
+        while let Some(name) = stack.pop() {
+            if !visited.insert(name) {
+                continue;
+            }
+            match self.class_shapes.get(name) {
+                Some(shape) if shape.partial => return None,
+                Some(_) => {}
+                None if name == "object" => continue,
+                None if tyc_syntax::builtin_exceptions::is_builtin_exception(name) => {
+                    out.push(name.to_owned());
+                    continue;
+                }
+                None => return None,
+            }
+            if let Some(parents) = self.class_parents.get(name) {
+                stack.extend(parents.iter().map(String::as_str));
+            }
+        }
+        Some(out)
+    }
+
+    /// Whether this module may write attribute `attr` onto an object from
+    /// outside its class body: a store through a receiver other than
+    /// `self` (`err.code = 404`, `cls.code = 1`, `obj.code += 1`), or any
+    /// `setattr` / `vars` / `__dict__` use, which can write any name.
+    fn module_may_store_attr(&self, attr: &str) -> bool {
+        use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
+        struct Scan {
+            stores: HashSet<String>,
+            dynamic: bool,
+        }
+        impl Scan {
+            fn target(&mut self, t: &Expr) {
+                match t {
+                    Expr::Attribute(a) => {
+                        if !matches!(a.value.as_ref(), Expr::Name(n) if n.id.as_str() == "self") {
+                            self.stores.insert(a.attr.as_str().to_owned());
+                        }
+                    }
+                    Expr::Tuple(x) => x.elts.iter().for_each(|e| self.target(e)),
+                    Expr::List(x) => x.elts.iter().for_each(|e| self.target(e)),
+                    Expr::Starred(x) => self.target(&x.value),
+                    _ => {}
+                }
+            }
+        }
+        impl<'a> Visitor<'a> for Scan {
+            fn visit_stmt(&mut self, stmt: &'a Stmt) {
+                match stmt {
+                    Stmt::Assign(a) => a.targets.iter().for_each(|t| self.target(t)),
+                    Stmt::AugAssign(a) => self.target(&a.target),
+                    Stmt::AnnAssign(a) => self.target(&a.target),
+                    Stmt::For(f) => self.target(&f.target),
+                    Stmt::With(w) => w
+                        .items
+                        .iter()
+                        .filter_map(|i| i.optional_vars.as_deref())
+                        .for_each(|t| self.target(t)),
+                    _ => {}
+                }
+                walk_stmt(self, stmt);
+            }
+            fn visit_expr(&mut self, expr: &'a Expr) {
+                match expr {
+                    Expr::Name(n) if matches!(n.id.as_str(), "setattr" | "vars") => {
+                        self.dynamic = true;
+                    }
+                    Expr::Attribute(a) if a.attr.as_str() == "__dict__" => self.dynamic = true,
+                    Expr::Named(n) => self.target(&n.target),
+                    _ => {}
+                }
+                walk_expr(self, expr);
+            }
+        }
+        self.dynamic_attr_stores
+            .get_or_init(|| {
+                let mut scan = Scan {
+                    stores: HashSet::new(),
+                    dynamic: false,
+                };
+                if let Some(module) = self.module {
+                    for stmt in &module.body {
+                        scan.visit_stmt(stmt);
+                    }
+                }
+                (!scan.dynamic).then_some(scan.stores)
+            })
+            .as_ref()
+            .is_none_or(|stores| stores.contains(attr))
+    }
+
     /// SOUNDNESS (union use sites): return `true` when attribute / method
     /// `attr` is definitely supported by member type `member`, or when
     /// `member` is foreign / dynamic enough that we can't soundly flag it
@@ -5752,10 +5857,31 @@ impl<'a> Checker<'a> {
                 }
             }
             Type::Class(name) => {
-                if !self.class_hierarchy_fully_known(name) || self.class_defines_getattr(name) {
+                if self.class_defines_getattr(name) {
                     return true;
                 }
-                self.find_method(name, attr).is_some() || self.find_field(name, attr).is_some()
+                let declared =
+                    self.find_method(name, attr).is_some() || self.find_field(name, attr).is_some();
+                if self.class_hierarchy_fully_known(name) {
+                    return declared;
+                }
+                // A base the checker cannot see may supply `attr` — unless
+                // every such base is a builtin exception, whose attributes
+                // are a fixed table (`except (A, B) as e: e.code` where only
+                // `A` declares `code` and both derive from `Exception`).
+                // An instance of such a class has a `__dict__`, so a write
+                // of `attr` anywhere in the module (`err.code = 404`) keeps
+                // it permissive.
+                match self.builtin_exception_bases(name) {
+                    Some(bases) => {
+                        declared
+                            || bases
+                                .iter()
+                                .any(|b| tyc_syntax::builtin_exceptions::has_attr(b, attr))
+                            || self.module_may_store_attr(attr)
+                    }
+                    None => true,
+                }
             }
             // Nested union — recurse (every member must support it).
             Type::Union(ms) => ms.iter().all(|m| self.member_supports_attr(m, attr)),
@@ -6127,7 +6253,11 @@ impl<'a> Checker<'a> {
             },
             other => other.display(),
         };
-        let diag = TycError::nullable_use(name, display, &self.path, self.source, span.0, length);
+        let mut diag =
+            TycError::nullable_use(name, display, &self.path, self.source, span.0, length);
+        if let Some(guard) = prior_none_guard(self.source, name, span.0) {
+            diag = diag.with_existing_guard(name, guard);
+        }
         if warn_only {
             self.diagnostics.push_warning(diag);
         } else {
@@ -6247,18 +6377,49 @@ impl<'a> Checker<'a> {
     }
 
     fn non_exhaustive_match(&mut self, union_name: &str, missing: &str, span: (usize, usize)) {
+        self.push_non_exhaustive(span, |path, source, offset, length| {
+            TycError::non_exhaustive_match(union_name, missing, path, source, offset, length)
+        });
+    }
+
+    /// `tyc::non_exhaustive_match` over an `enum` subject.
+    fn non_exhaustive_enum_match(&mut self, enum_name: &str, missing: &str, span: (usize, usize)) {
+        self.push_non_exhaustive(span, |path, source, offset, length| {
+            TycError::non_exhaustive_enum_match(enum_name, missing, path, source, offset, length)
+        });
+    }
+
+    /// `tyc::non_exhaustive_match` over a closed subject that is not a
+    /// sealed union (`Result`, `T?`, `bool`, a literal union).
+    fn non_exhaustive_closed_match(
+        &mut self,
+        subject_type: &str,
+        missing: &str,
+        span: (usize, usize),
+    ) {
+        self.push_non_exhaustive(span, |path, source, offset, length| {
+            TycError::non_exhaustive_closed_match(
+                subject_type,
+                missing,
+                path,
+                source,
+                offset,
+                length,
+            )
+        });
+    }
+
+    fn push_non_exhaustive(
+        &mut self,
+        span: (usize, usize),
+        make: impl FnOnce(&str, &str, usize, usize) -> TycError,
+    ) {
         if self.unsafe_depth > 0 {
             return;
         }
         let length = span.1.saturating_sub(span.0).max(1);
-        self.diagnostics.push_error(TycError::non_exhaustive_match(
-            union_name,
-            missing,
-            &self.path,
-            self.source,
-            span.0,
-            length,
-        ));
+        let err = make(&self.path, self.source, span.0, length);
+        self.diagnostics.push_error(err);
     }
 
     fn typevar_bound_violation(
@@ -8339,6 +8500,82 @@ fn check_unsafe_return_leak(c: &mut Checker, expr: &Expr) {
     check_unsafe_leak_into(c, expr, &ret_ty);
 }
 
+/// The line of an earlier `None` check on `path` — `if path is None:`,
+/// `if path is not None:`, `if not path:`, `assert path`, `while path`,
+/// `isinstance(path, …)` — between the start of the enclosing `def` and
+/// `use_at`, as written. `tyc::nullable_use` re-words its help when the
+/// value is already checked somewhere the checker could not carry the
+/// narrowing from (W1-03): "add a guard" is wrong advice when the guard is
+/// three lines up. A text scan over the checked source, so it only answers
+/// "is there such a check above", never "does it dominate this use".
+fn prior_none_guard<'s>(source: &'s str, path: &str, use_at: usize) -> Option<&'s str> {
+    let is_ident = |seg: &str| {
+        let mut chars = seg.chars();
+        chars
+            .next()
+            .is_some_and(|ch| ch.is_alphabetic() || ch == '_')
+            && chars.all(|ch| ch.is_alphanumeric() || ch == '_')
+    };
+    if path.is_empty() || !path.split('.').all(is_ident) || use_at > source.len() {
+        return None;
+    }
+    let indent_of = |l: &str| l.len() - l.trim_start().len();
+    let use_line_start = source[..use_at].rfind('\n').map_or(0, |i| i + 1);
+    let use_indent = indent_of(&source[use_line_start..]);
+    // Walk back to the header of the enclosing `def` (the module start
+    // otherwise).
+    let mut region_start = 0;
+    let mut pos = use_line_start;
+    while pos > 0 {
+        let prev = source[..pos - 1].rfind('\n').map_or(0, |i| i + 1);
+        let line = &source[prev..pos - 1];
+        let t = line.trim_start();
+        if (t.starts_with("def ") || t.starts_with("async def ")) && indent_of(line) < use_indent {
+            region_start = prev;
+            break;
+        }
+        pos = prev;
+    }
+    let region = &source[region_start..use_at];
+    let continues_path = |ch: char| ch.is_alphanumeric() || ch == '_' || ch == '.';
+    let mut found = None;
+    for (i, _) in region.match_indices(path) {
+        let before = &region[..i];
+        let after = &region[i + path.len()..];
+        if before.chars().next_back().is_some_and(continues_path)
+            || after
+                .chars()
+                .next()
+                .is_some_and(|ch| continues_path(ch) || ch == '[' || ch == '(')
+        {
+            continue;
+        }
+        let rest = after.trim_start_matches([' ', '\t']);
+        let compared = ["is None", "is not None", "== None", "!= None"]
+            .iter()
+            .any(|op| rest.starts_with(op));
+        let last_word = before
+            .trim_end_matches([' ', '\t', '('])
+            .rsplit([' ', '\t', '\n', '('])
+            .next()
+            .unwrap_or("");
+        let tested = matches!(
+            last_word,
+            "if" | "elif" | "while" | "and" | "or" | "not" | "assert"
+        ) && (rest.is_empty()
+            || [":", ")", "\n", "and ", "or ", "else"]
+                .iter()
+                .any(|end| rest.starts_with(end)));
+        let isinstance = before.ends_with("isinstance(") && rest.starts_with(',');
+        if compared || tested || isinstance {
+            let line_start = region[..i].rfind('\n').map_or(0, |j| j + 1);
+            let line_end = region[i..].find('\n').map_or(region.len(), |j| i + j);
+            found = Some(region[line_start..line_end].trim());
+        }
+    }
+    found
+}
+
 /// Shared core of the `unsafe:` value-leak audit (Rule 5 / SKILL §5.9):
 /// fire `tyc::unsafe_value_leak` when a bare `Name` whose binding was
 /// first introduced inside an `unsafe:` block flows OUT into a
@@ -8423,9 +8660,24 @@ fn check_unsafe_leak_into(c: &mut Checker, expr: &Expr, target_ty: &Type) {
     );
     let length = span.1.saturating_sub(span.0).max(1);
     let target_display = target_ty.display();
+    // Suggest the checked cast spelled on the escaping expression itself
+    // (`data["name"] as! str`), parenthesised unless it is a plain operand.
+    let cast = checked_cast_target_supported(c, target_ty).then(|| {
+        let text = c.source.get(span.0..span.1).unwrap_or(name).trim();
+        let plain = matches!(
+            expr,
+            Expr::Name(_) | Expr::Attribute(_) | Expr::Subscript(_) | Expr::Call(_)
+        ) && !text.contains('\n');
+        if plain {
+            format!("{text} as! {target_display}")
+        } else {
+            format!("({}) as! {target_display}", text.replace('\n', " "))
+        }
+    });
     c.diagnostics.push_error(TycError::unsafe_value_leak(
         name,
         target_display,
+        cast,
         &c.path,
         c.source,
         span.0,
@@ -14461,10 +14713,15 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                             head.as_str(),
                             "Mapping" | "tuple" | "tuple_variadic" | "frozenset"
                         ) {
-                            let diagnostic = TycError::generic(format!(
-                                "`{}` does not support item assignment",
-                                recv_ty.display()
-                            ));
+                            let at = target.range();
+                            let diagnostic = TycError::generic_at(
+                                format!("`{}` does not support item assignment", recv_ty.display()),
+                                "item assignment raises `TypeError` here",
+                                &c.path,
+                                c.source,
+                                at.start().to_usize(),
+                                at.len().to_usize(),
+                            );
                             if frozen_context::failure_is_caught(c, target, "TypeError") {
                                 c.diagnostics.push_warning(diagnostic);
                             } else {
@@ -19690,6 +19947,28 @@ fn extract_err_generic_param(typ: &Type) -> Option<Type> {
 /// `return value` payloads are accepted unchecked. Used by the
 /// `c.in_generator` early-return in `check_stmt::Return` (FINDINGS
 /// O6, refined per Codex review on PR #94).
+/// The element type `T` a generator annotated `-> Iterator[T]` /
+/// `Iterable[T]` / `Generator[T, S, R]` (or an async form) must `yield`.
+/// `None` for any other annotation, including the bare names.
+fn generator_yield_type(typ: &Type) -> Option<Type> {
+    match typ {
+        Type::Generic(name, args)
+            if matches!(
+                name.as_str(),
+                "Iterator"
+                    | "Iterable"
+                    | "Generator"
+                    | "AsyncIterator"
+                    | "AsyncIterable"
+                    | "AsyncGenerator"
+            ) && !args.is_empty() =>
+        {
+            Some(args[0].clone())
+        }
+        _ => None,
+    }
+}
+
 fn extract_generator_return_type(typ: &Type) -> Option<Type> {
     if let Type::Generic(name, args) = typ {
         if name == "Generator" && args.len() == 3 {
@@ -20301,7 +20580,11 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
         Expr::Lambda(lam) => {
             let snap = c.env.snapshot();
             widen_captured_names(c, lam.range.start().to_usize());
+            // A `yield` in a lambda body makes the *lambda* a generator; it
+            // does not yield from the enclosing function.
+            let saved_in_generator = std::mem::replace(&mut c.in_generator, false);
             let r = infer_expr_ctx_inner(c, expr, expected);
+            c.in_generator = saved_in_generator;
             c.env.restore(snap);
             r
         }
@@ -20350,6 +20633,40 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
         result.clone(),
     );
     result
+}
+
+/// Type-check the body of a lambda that has no expected `Callable` type.
+/// Every parameter is bound as `Unknown` in a fresh scope — shadowing any
+/// outer name of the same spelling — so only diagnostics that hold for any
+/// argument values fire: the free variables the body reads, the calls it
+/// makes on them, its literals. Defaults are not inferred here: they are
+/// evaluated where the lambda is written, under the narrowings
+/// `widen_captured_names` has already dropped for the body.
+fn infer_lambda_body_unannotated(c: &mut Checker, lam: &ruff_python_ast::ExprLambda) {
+    c.env.enter();
+    if let Some(params) = lam.parameters.as_deref() {
+        let names = params
+            .posonlyargs
+            .iter()
+            .chain(params.args.iter())
+            .chain(params.kwonlyargs.iter())
+            .map(|pwd| &pwd.parameter)
+            .chain(params.vararg.iter().map(|p| p.as_ref()))
+            .chain(params.kwarg.iter().map(|p| p.as_ref()));
+        for param in names {
+            let name = param.name.as_str();
+            let start = param.name.range.start().to_usize();
+            c.env.declare(TypeBinding {
+                name: name.to_owned(),
+                declared: Type::Unknown,
+                narrowed: Type::Unknown,
+                span: (start, start + name.len()),
+                from_unsafe: c.unsafe_depth > 0,
+            });
+        }
+    }
+    let _ = infer_expr_ctx(c, &lam.body, None);
+    c.env.leave();
 }
 
 /// The structural type of a lambda with no expected `Callable` to check it
@@ -20488,6 +20805,12 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             };
             let shape = lambda_structural_type(lam);
             let Some((exp_params, exp_ret)) = expected_fn else {
+                // No contract to check against — but the body is still
+                // code: `lambda: v.upper()` with `v: str?` crashes when it
+                // runs. Check it with every parameter `Unknown` (so only
+                // errors that hold whatever the arguments are fire) and keep
+                // the structural shape as the lambda's type.
+                infer_lambda_body_unannotated(c, lam);
                 return shape;
             };
             let (variadic, min_params) = match &shape {
@@ -22437,13 +22760,15 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         .to_usize()
                         .saturating_sub(attr_start)
                         .max(1);
+                    // `tuple_variadic` is the internal head of `tuple[T, ...]`;
+                    // name the type as written.
+                    let shown = if head == "tuple_variadic" {
+                        recv.display()
+                    } else {
+                        head.clone()
+                    };
                     let diagnostic = TycError::attribute_not_found(
-                        attr_name,
-                        head.as_str(),
-                        &c.path,
-                        c.source,
-                        attr_start,
-                        attr_len,
+                        attr_name, &shown, &c.path, c.source, attr_start, attr_len,
                     );
                     if matches!(head.as_str(), "tuple_variadic" | "Mapping" | "frozenset")
                         && frozen_context::failure_is_caught(c, expr, "AttributeError")
@@ -23357,6 +23682,42 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             c.env.restore_scope_narrowings(comp_saved);
             let elt = widen_fresh_element(c, elt, elt_expected.as_ref());
             Type::Generic("set".into(), vec![elt])
+        }
+        // `yield v` in a generator annotated `-> Iterator[T]` /
+        // `Generator[T, S, R]` / `AsyncIterator[T]` (and the `Iterable`
+        // forms) must produce a `T`: the consumer is typed against it.
+        // `yield maybe_int` in `-> Iterator[int]` used to pass unchecked —
+        // the operand was not even inferred. A bare `yield` produces `None`.
+        // The expression's own value (what `send` passes in) stays
+        // `Unknown`.
+        Expr::Yield(y) => {
+            let element = if c.in_generator {
+                c.current_return
+                    .as_ref()
+                    .and_then(|r| generator_yield_type(&c.unwrap_alias(r)))
+            } else {
+                None
+            };
+            let element = element.filter(|t| !matches!(t, Type::Unknown | Type::Any));
+            let actual = match y.value.as_deref() {
+                Some(value) => infer_expr_ctx(c, value, element.as_ref()),
+                None => Type::None,
+            };
+            if let Some(element) = element {
+                if !matches!(actual, Type::Unknown) && !c.is_assignable(&element, &actual) {
+                    let at = y.value.as_deref().map_or(y.range, |v| v.range());
+                    c.mismatch(
+                        &element,
+                        &actual,
+                        (at.start().to_usize(), at.end().to_usize()),
+                    );
+                }
+            }
+            Type::Unknown
+        }
+        Expr::YieldFrom(y) => {
+            let _ = infer_expr_ctx(c, &y.value, None);
+            Type::Unknown
         }
         Expr::Generator(comp) => {
             let elt_expected = match expected {
@@ -24688,7 +25049,7 @@ fn check_closed_match_exhaustiveness(
                 subject.range().start().to_usize(),
                 subject.range().end().to_usize(),
             );
-            c.non_exhaustive_match(&subject_type.display(), &missing.join(", "), span);
+            c.non_exhaustive_closed_match(&subject_type.display(), &missing.join(", "), span);
         }
     }
 }
@@ -25053,7 +25414,7 @@ fn check_enum_match_exhaustiveness(
         .collect();
     if !missing.is_empty() {
         let missing_str = missing.join(", ");
-        c.non_exhaustive_match(enum_name, &missing_str, subject_span);
+        c.non_exhaustive_enum_match(enum_name, &missing_str, subject_span);
     }
 }
 
@@ -41834,6 +42195,241 @@ def main() -> None:
             "{:?}",
             check_full(src).errors()
         );
+    }
+    #[test]
+    fn lambda_body_without_a_callable_contract_is_checked() {
+        for src in [
+            "def find() -> str?:\n    return None\ndef main() -> None:\n    let v: str? = find()\n    let g = lambda: v.upper()\n    print(g)\n",
+            "def find() -> str?:\n    return None\ndef main() -> None:\n    let v: str? = find()\n    print(list(map(lambda x: x + len(v), [1])))\n",
+            "def main() -> None:\n    let n: int = 1\n    let g = lambda: n.upper()\n    print(g)\n",
+            // A captured name reassigned after the lambda loses its narrowing.
+            "def find() -> str?:\n    return None\ndef main() -> None:\n    mut v: str? = find()\n    if v is not None:\n        let g = lambda: v.upper()\n        v = None\n        print(g())\n",
+        ] {
+            assert!(!check(src).errors().is_empty(), "accepted: {src}");
+        }
+    }
+    #[test]
+    fn lambda_body_without_a_contract_keeps_its_parameters_unknown() {
+        for src in [
+            // Parameters are `Unknown` and shadow outer names of the same
+            // spelling.
+            "def find() -> str?:\n    return None\ndef main() -> None:\n    let v: str? = find()\n    let g = lambda v, *a, k=1, **kw: v.upper() + a.whatever + kw.other(k)\n    print(g, v)\n",
+            // A narrowing that still holds when the body runs is kept.
+            "def find() -> str?:\n    return None\ndef main() -> None:\n    let v: str? = find()\n    if v is not None:\n        let g = lambda: v.upper()\n        print(g())\n",
+            "def main() -> None:\n    let xs: list[str] = [\"b\", \"a\"]\n    print(sorted(xs, key=lambda s: s.lower()), (lambda: [y for y in xs])())\n",
+            // Defaults are evaluated where the lambda is written.
+            "def find() -> str?:\n    return None\ndef main() -> None:\n    let v: str? = find()\n    if v is not None:\n        let g = lambda w=v.upper(): w\n        print(g())\n",
+        ] {
+            let d = check(src);
+            assert!(d.errors().is_empty(), "{src}: {:?}", d.errors());
+        }
+    }
+    #[test]
+    fn yielded_values_are_checked_against_the_element_type() {
+        let pre = "from typing import Iterator, Generator, AsyncIterator, Iterable\ndef maybe() -> int?:\n    return None\n";
+        for body in [
+            "def gen() -> Iterator[int]:\n    let m: int? = maybe()\n    yield m\n",
+            "def gen() -> Iterator[int]:\n    yield \"s\"\n",
+            "def gen() -> Iterable[int]:\n    yield 1.5\n",
+            "def gen() -> Generator[int, None, str]:\n    yield \"s\"\n    return \"done\"\n",
+            "async def gen() -> AsyncIterator[str]:\n    yield 1\n",
+            "def gen() -> Iterator[int]:\n    yield\n",
+            "def gen() -> Iterator[list[int]]:\n    yield [\"a\"]\n",
+        ] {
+            let src = format!("{pre}{body}");
+            assert!(
+                check(&src)
+                    .errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+                "accepted: {src}"
+            );
+        }
+    }
+    #[test]
+    fn yields_of_the_element_type_are_accepted() {
+        let pre = "from typing import Iterator, Generator, AsyncIterator\nfrom contextlib import contextmanager\ndef maybe() -> int?:\n    return None\n";
+        for body in [
+            "def gen() -> Iterator[int?]:\n    yield maybe()\n    yield 1\n    yield None\n",
+            "def gen() -> Iterator[float]:\n    yield 1\n    yield 2.5\n",
+            "def gen() -> Iterator[list[int]]:\n    yield []\n",
+            "@contextmanager\ndef ctx() -> Iterator[None]:\n    yield\n",
+            "def gen() -> Generator[int, str, None]:\n    let got = yield 1\n    print(got)\n",
+            "def gen() -> Iterator:\n    yield \"anything\"\n",
+            "def gen() -> Iterator[int]:\n    yield from [1, 2]\n    def inner() -> Iterator[str]:\n        yield \"s\"\n    for s in inner():\n        yield len(s)\n",
+            "async def gen() -> AsyncIterator[int]:\n    yield 1\n",
+            "def gen() -> Iterator[int]:\n    let m: int? = maybe()\n    if m is not None:\n        yield m\n",
+        ] {
+            let src = format!("{pre}{body}");
+            let d = check(&src);
+            assert!(d.errors().is_empty(), "{src}: {:?}", d.errors());
+        }
+    }
+    fn union_attr_errors(src: &str) -> Vec<String> {
+        check(src)
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::AttributeNotFound { .. }))
+            .map(ToString::to_string)
+            .collect()
+    }
+    #[test]
+    fn union_member_missing_on_a_builtin_exception_subclass_is_rejected() {
+        let pre = "class A(Exception):\n    code: int\nclass B(Exception):\n    pass\nclass C(ValueError):\n    pass\nclass D(C):\n    pass\n";
+        for body in [
+            "def main() -> None:\n    try:\n        raise B()\n    except (A, B) as e:\n        print(e.code)\n",
+            "type E = A | C\ndef f(e: E) -> int:\n    return e.code\n",
+            "def f(e: A | D) -> int:\n    return e.code\n",
+        ] {
+            let src = format!("{pre}{body}");
+            let errs = union_attr_errors(&src);
+            assert_eq!(errs.len(), 1, "{src}: {errs:?}");
+        }
+    }
+    #[test]
+    fn union_member_supplied_by_the_base_or_written_dynamically_is_accepted() {
+        let pre = "class A(Exception):\n    code: int\n";
+        for body in [
+            // `SystemExit` has `code`; `OSError` has `errno`; every
+            // exception has `args`.
+            "class B(SystemExit):\n    pass\ndef f(e: A | B) -> None:\n    print(e.code, e.args)\n",
+            "class B(OSError):\n    pass\nclass C(OSError):\n    pass\ndef f(e: B | C) -> None:\n    print(e.errno, e.filename)\n",
+            // `B` declares it as a method.
+            "class B(Exception):\n    pass\nimpl B:\n    def code(self) -> int:\n        return 1\ndef f(e: A | B) -> None:\n    print(e.code)\n",
+            // An instance attribute written outside the class.
+            "class B(Exception):\n    pass\ndef make() -> B:\n    let err = B()\n    err.code = 404\n    return err\ndef f(e: A | B) -> None:\n    print(e.code)\n",
+            "class B(Exception):\n    pass\ndef make() -> B:\n    let err = B()\n    setattr(err, \"code\", 404)\n    return err\ndef f(e: A | B) -> None:\n    print(e.code)\n",
+            // A base the checker cannot see may supply anything.
+            "from somewhere import Base\nclass B(Base):\n    pass\ndef f(e: A | B) -> None:\n    print(e.code)\n",
+        ] {
+            let src = format!("{pre}{body}");
+            let errs = union_attr_errors(&src);
+            assert!(errs.is_empty(), "{src}: {errs:?}");
+        }
+    }
+    #[test]
+    fn caught_frozen_mutations_name_the_type_and_keep_their_location() {
+        let src = "let NAMES: list[str] = __typhon_freeze__([\"a\"])\nlet CONFIG: dict[str, int] = __typhon_freeze__({\"a\": 1})\ndef f() -> None:\n    try:\n        NAMES.append(\"b\")\n    except AttributeError:\n        pass\n    try:\n        CONFIG[\"a\"] = 2\n    except TypeError:\n        pass\n";
+        let d = check(src);
+        assert!(d.errors().is_empty(), "{:?}", d.errors());
+        let msgs: Vec<String> = d.warnings().iter().map(ToString::to_string).collect();
+        assert!(
+            msgs.iter()
+                .any(|m| m == "attribute `append` is not defined on `tuple[str, ...]`"),
+            "{msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("tuple_variadic")),
+            "{msgs:?}"
+        );
+        let item = d
+            .warnings()
+            .iter()
+            .find(|w| w.to_string().contains("does not support item assignment"))
+            .expect("item-assignment warning");
+        assert!(item.clone().source_and_span_mut().is_some(), "{item:?}");
+    }
+    #[test]
+    fn go_on_a_synchronous_call_says_it_needs_a_coroutine() {
+        let d = check_full(
+            "def work(n: int) -> int:\n    return n\nasync def f() -> None:\n    go work(1)\n",
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| e.to_string() == "`go` needs a coroutine, but `work(1)` returns `int`"),
+            "{:?}",
+            d.errors()
+        );
+    }
+    fn nullable_helps(d: &Diagnostics) -> Vec<String> {
+        d.errors()
+            .iter()
+            .chain(d.warnings())
+            .filter(|e| matches!(e, TycError::NullableUse { .. }))
+            .map(|e| e.help_text().unwrap())
+            .collect()
+    }
+    #[test]
+    fn nullable_use_help_names_an_existing_guard_it_could_not_use() {
+        // The guard is right there, but `reset(b)` may rebind `b.conn`:
+        // "add a guard" would be wrong advice.
+        let src = "class Conn:\n    n: int\nclass Box:\n    conn: Conn?\ndef reset(b: Box) -> None:\n    b.conn = None\ndef f(b: Box) -> int:\n    if b.conn is None:\n        return 0\n    reset(b)\n    return b.conn.n\n";
+        let helps = nullable_helps(&check(src));
+        assert_eq!(helps.len(), 1, "{helps:?}");
+        assert!(
+            helps[0].contains("already checked above (`if b.conn is None:`)"),
+            "{}",
+            helps[0]
+        );
+        assert!(helps[0].contains("let conn = b.conn"), "{}", helps[0]);
+        // A local reassigned after its guard.
+        let src = "def find() -> str?:\n    return None\ndef f() -> int:\n    mut v: str? = find()\n    if v is None:\n        return 0\n    v = find()\n    return len(v)\n";
+        let helps = nullable_helps(&check(src));
+        assert_eq!(helps.len(), 1, "{helps:?}");
+        assert!(
+            helps[0].contains("already checked above (`if v is None:`)"),
+            "{}",
+            helps[0]
+        );
+        assert!(helps[0].contains("reassigned"), "{}", helps[0]);
+    }
+    #[test]
+    fn nullable_use_help_without_a_guard_still_suggests_one() {
+        for src in [
+            "def find() -> str?:\n    return None\ndef f() -> int:\n    let v: str? = find()\n    return len(v)\n",
+            // A check on a longer path, or in another function, is not a
+            // check on this value.
+            "class Conn:\n    n: int?\nclass Box:\n    conn: Conn?\ndef g(b: Box) -> bool:\n    return b.conn is None\ndef f(b: Box) -> int:\n    if b.conn.n is None:\n        return 0\n    return 1\n",
+        ] {
+            let helps = nullable_helps(&check(src));
+            assert!(!helps.is_empty(), "{src}");
+            assert!(
+                helps.iter().all(|h| h.starts_with("guard the value with")),
+                "{helps:?}"
+            );
+        }
+    }
+    #[test]
+    fn closed_subject_match_is_not_called_a_sealed_union() {
+        let d = check("def f(b: bool) -> int:\n    match b:\n        case True:\n            return 1\n    return 0\n");
+        let msgs: Vec<String> = d
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::NonExhaustiveMatch { .. }))
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            msgs,
+            vec!["non-exhaustive `match` on `bool`: missing case(s) False".to_owned()]
+        );
+        let d = check("class A:\n    n: int\nclass B:\n    n: int\ntype U = A | B\ndef f(u: U) -> int:\n    match u:\n        case A():\n            return 1\n    return 0\n");
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| e.to_string().contains("on sealed union `U`")),
+            "{:?}",
+            d.errors()
+        );
+    }
+    #[test]
+    fn unsafe_value_leak_help_recommends_a_checked_cast() {
+        let src = "import json\ndef f(raw: str) -> str:\n    unsafe:\n        let data = json.loads(raw)\n    return data[\"name\"]\n";
+        let prep = preprocess(src);
+        let d = check(src);
+        let helps: Vec<String> = d
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::UnsafeValueLeak { .. }))
+            .map(|e| e.help_text().unwrap())
+            .collect();
+        assert_eq!(helps.len(), 1, "{:?} / {}", d.errors(), prep.python_source);
+        assert!(
+            helps[0].contains("`data[\"name\"] as! str`"),
+            "{}",
+            helps[0]
+        );
+        assert!(!helps[0].contains("let typed"), "{}", helps[0]);
     }
 }
 

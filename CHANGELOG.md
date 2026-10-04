@@ -150,6 +150,24 @@ grouped by workstream (W1–W7).
   `TypeVar("T")`, a `Generic[T]` base) they raised `NameError` and now
   report `tyc::unknown_name`. `Protocol` and the `collections.abc` names
   are unaffected: the build imports them.
+- **Diagnostic wording.**
+  - `tyc::non_exhaustive_match` names the subject by what it is. Only a
+    real sealed union is called one; an enum reads
+    "on enum \`Color\`: missing member(s) BLUE", and `Result`, `T?`,
+    `bool` and literal-union subjects are named by their type
+    ("on \`bool\`: missing case(s) False") instead of
+    "on sealed union \`bool\`".
+  - `tyc::unsafe_value_leak` recommends a checked cast spelled on the
+    escaping expression (`data["name"] as! str`) or an annotation inside the
+    block. It recommended `let typed: T = name` outside the block, which is
+    itself reported. A target `as!` cannot check gets only the annotation
+    advice.
+  - `tyc::nullable_use`: when the function already checks the value for
+    `None` above the use (`if self.conn is None: return`) but the narrowing
+    cannot reach it — a call, assignment, `await` or `yield` in between, a
+    check on another path, a closure that may run later — the help says so
+    and suggests copying a field into a local and guarding that, instead of
+    asking for a guard that is already there (W1-03).
 
 #### W2 — checker expressions
 
@@ -180,6 +198,15 @@ grouped by workstream (W1–W7).
 - W2-16: property and `ClassVar` writes are checked, with inherited slot semantics.
 - W2-17: builtin constructors accept their keywords (int methods, enum and builtin-subclass constructors, positional-only parameters, `isinstance` union targets); a nullable `len()` argument reports one diagnostic.
 - W2-18: the class-attribute slot lint fires only on class-level accesses, and the `Result` error wording covers plain returns as well as `?`.
+- A lambda with no expected `Callable` type has its body checked. `let g = lambda: v.upper()` with `v: str?` passed, because only a lambda checked against a `Callable` contract had its body inferred. Its parameters are `Unknown` (and shadow outer names), so only errors that hold for any argument fire: free variables, the calls made on them, literals. A captured name reassigned after the lambda is read at its declared type, as for a contract-checked lambda. Corpus: 0 newly rejected.
+- `yield` is checked against the generator's element type. In a function annotated `-> Iterator[T]`, `Iterable[T]`, `Generator[T, S, R]` or an async form, `yield v` must produce a `T` (a bare `yield` produces `None`): `yield maybe_int` with `maybe_int: int?` in `-> Iterator[int]` passed, and the operand was not inferred at all, so `yield v.upper()` on a nullable `v` passed too. `yield from` operands are inferred. A `yield` inside a lambda is not attributed to the enclosing function. Corpus: 0 newly rejected.
+- A union member read on classes derived from builtin exceptions is checked. The union member check skipped every class with a base it could not see, and every exception class has one, so `except (A, B) as e: e.code` passed when only `A` defines `code` and raised `AttributeError` whenever a `B` was caught. A builtin exception base now counts as known through a fixed table of its public attributes (`args`, `SystemExit.code`, `OSError.errno`, …). Still permissive: any other unseen base, a `__getattr__`, and an attribute the module writes on a non-`self` receiver (`err.code = 404`) or through `setattr` / `vars` / `__dict__`. Corpus: 0 newly rejected.
+- Diagnostic rendering fixes from the docs audit:
+  - `tyc check` draws each diagnostic with the marker of the bucket it was reported in, so a warning no longer shows the error `×` (a `[strictness]` knob at `"warn"`, a mutation caught by its handler). `tyc::unknown_module` and `tyc::typing_alias_deprecated` are always warnings and say so on every surface; their doc pages, which called them errors, are corrected (both run fine at runtime when the module is installed / the alias is used, so they stay warnings and `tyc check` exits 0).
+  - An item assignment into a frozen `Mapping` / tuple / `frozenset` (W2-05) is reported at the assignment instead of under "(no location)".
+  - Messages name `tuple[T, ...]` instead of the internal `tuple_variadic`.
+  - `go` on a call that is not a coroutine reads "`go` needs a coroutine, but `work(1)` returns `int`" instead of "expected `a coroutine for go`".
+  - A diagnostic on a rewritten line (`go f(x)`, a `?` expansion) is anchored to the spanned text on the original line when it appears there, instead of the carried-over column (which could land past the end of the expression).
 
 #### W3 — cross-module & analysis passes
 
@@ -722,6 +749,48 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   - A propagating `?` in a replacement field on a continuation line of a
     triple-quoted f-string lifts above the statement like one on a bracket
     continuation line; it was a `tyc::parse` error.
+- **Inline `?`: the two W7-04 residuals are closed.** A name the operand
+  can rebind — declared `global` / `nonlocal` anywhere in the file, or a
+  walrus target of the statement — is read before the operand (`f(x, g()?)`
+  where `g` does `global x; x = …` passed the new `x`). A dotted method
+  receiver is evaluated before the arguments
+  (`self.items.append(self.word()?)` appended to the list `word()` had just
+  installed, not the one Python read); a receiver rooted at an imported
+  module (`os.path.join(…)`) stays in place. An augmented assignment whose
+  value carries a propagated operand and whose target that operand could
+  change — an attribute, a subscript, or a rebindable name — loads the
+  target first: `self.pos += self.advance()?` lowers to
+  `__typhon_ev_0__ = self.pos`, `__typhon_ev_0__ += …`,
+  `self.pos = __typhon_ev_0__` (container and non-trivial index hoisted
+  once; `+=` on the temporary keeps the in-place semantics). Both surfaces
+  share the lowering; the new test checks each against the same program run
+  as plain Python.
+- **`impl` methods that must stay in the class body: W7-06 residuals.** A
+  method on a class whose only unseen bases are builtin exceptions
+  (`class AppError(Exception)`) is now attached at its `impl` block too when
+  the base does not define that name (`Exception` has a fixed member list),
+  so `impl AppError: def describe(self, p: str = PREFIX)` with `PREFIX`
+  bound after the class imports instead of raising `NameError`. A method
+  that still has to stay merged — a special method, a private `__name`
+  user, a `@property` / `@classmethod` / `@cached_property` /
+  `@abstractmethod`, a method a base may define, a class subclassed before
+  the block — and reads a name bound only after the class is a new
+  check-time error, `tyc::impl_forward_reference`, naming the reason,
+  instead of a `NameError` on import (the program already crashed on both
+  surfaces). It stays silent when the name might be bound before the class
+  after all: a star import above it, a `global NAME` in any function, or
+  `globals()` / `exec` / `setattr` / `sys.modules` / `builtins` use. The
+  placement planner moved from `tyc-desugar` to `tyc_syntax::impl_site`, so
+  the desugarer and the resolver make the same decision.
+- **Secondary diagnostic labels survive a `?` expansion.** Mapping a
+  diagnostic from the expanded source back to the `.ty` file moved only its
+  primary span; a second label (`first declared here`, `declared here`)
+  kept its expanded-text offset, and the report printed
+  "Failed to read contents for label … OutOfBounds" instead of the snippet
+  — for example a `let m` re-declared below a line that uses `?`. Every
+  label is now remapped, and `tyc::immutable_assign` /
+  `tyc::pattern_shadows_outer` (two labels, no primary span) point at the
+  original file instead of the expanded text.
 
 ### Third wave — the 2026-09-30 release-readiness review
 

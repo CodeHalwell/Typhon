@@ -79,11 +79,17 @@ pub(super) fn contract(c: &mut Checker, call: &ruff_python_ast::ExprCall) -> Opt
                     && await_operand_is_shape_checkable(c, arg)
                     && definitely_not_awaitable(c, &ty)
                 {
-                    c.mismatch_with(
-                        "a coroutine for go".into(),
+                    let (start, end) =
+                        (arg.range().start().to_usize(), arg.range().end().to_usize());
+                    let call_text = c.source.get(start..end).unwrap_or("the spawned call");
+                    c.diagnostics.push_error(TycError::go_needs_coroutine(
+                        call_text,
                         ty.display(),
-                        (arg.range().start().to_usize(), arg.range().end().to_usize()),
-                    );
+                        &c.path,
+                        c.source,
+                        start,
+                        end - start,
+                    ));
                 }
                 unwrap_awaitable(&ty, &c.classes).unwrap_or(Type::Unknown)
             })
