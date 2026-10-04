@@ -417,3 +417,57 @@ fn fmt_does_not_write_through_a_src_symlink_leaving_the_project() {
         victim
     );
 }
+
+// ── smaller CLI issues (W4-15) ───────────────────────────────────────────────
+
+/// W4-15: `tyc check` on a path with nothing to check exits non-zero — an
+/// empty directory or a `.py`-only path used to pass, so CI went green on a
+/// mistyped path.
+#[test]
+fn check_with_nothing_to_check_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("script.py"), "print(1)\n").unwrap();
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("no checkable files"), "{}", text(&out));
+    let out = tyc()
+        .arg("check")
+        .arg(tmp.path().join("does-not-exist"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{}", text(&out));
+}
+
+/// W4-15: a piped `tyc repl` exits non-zero when a snippet fails to compile
+/// or raises; it used to exit 0.
+#[test]
+fn piped_repl_exit_code_reflects_failed_snippets() {
+    use std::io::Write;
+    let run = |input: &str| {
+        let mut child = tyc()
+            .arg("repl")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let ok = run("print(1 + 1)\n");
+    if text(&ok).contains("no Python interpreter found") {
+        eprintln!("skipping: no python on PATH");
+        return;
+    }
+    assert!(ok.status.success(), "{}", text(&ok));
+    let compile_error = run("print(1)\nlet x: int = \"s\"\nprint(2)\n");
+    assert!(!compile_error.status.success(), "{}", text(&compile_error));
+    assert!(text(&compile_error).contains("1 snippet failed"));
+    let raised = run("raise ValueError(\"boom\")\n");
+    assert!(!raised.status.success(), "{}", text(&raised));
+}

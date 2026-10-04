@@ -14,7 +14,7 @@ Typhon ships a single binary, `tyc`, that handles every stage of the workflow. S
 | `tyc lsp` | Run as a Language Server on stdio. `--log-level {error,warn,info,debug}` (default `info`) sets the threshold for the status messages forwarded to the editor over `window/logMessage`; `--stdio` is accepted as a no-op for `vscode-languageclient`. |
 | `tyc init` | Scaffold a new project: `typhon.toml`, `src/`, `tests/`. The generated `src/main.ty` includes a frozen dataclass, an `impl` block, a `mut` binding, and a `Result`/`?`/`match` example; the generated `typhon.toml` ships every `[strictness]` / `[emit]` key with a comment. |
 | `tyc install skill` | Write the embedded `typhon` Claude skill (`SKILL.md` + sibling reference docs + the `references/` example programs) into `.claude/skills/typhon/` of the current project. The skill is bundled into the binary at build time, so it works offline. `--force` overwrites an existing copy, `--dir PATH` targets another root, `--list` previews the files without writing. |
-| `tyc trace` | Map a Python traceback (a file argument, or stdin when omitted) back to Typhon source via `.py.map` files. Every row is rewritten, not just the `File "…", line N` header: the source row under each frame becomes the real `.ty` row and the column anchors are dropped, so no emitted Python is shown under a `.ty` line. `--map-dir DIR` adds a directory to search for sidecars; by default each frame's map is located from its own `.py` path (`<dir>/.sourcemaps/<rel>.py.map`, then a legacy adjacent `.py.map`). |
+| `tyc trace` | Map a Python traceback (a file argument, or stdin when omitted) back to Typhon source via `.py.map` files. Every row is rewritten, not just the `File "…", line N` header: the source row under each frame becomes the real `.ty` row and the column anchors are dropped, so no emitted Python is shown under a `.ty` line. Frames inside an `ExceptionGroup` traceback (`  |   File "…"`, as every failed `gather:` prints) are rewritten too. `--map-dir DIR` adds a directory to search for sidecars; by default each frame's map is located from its own `.py` path (`<dir>/.sourcemaps/<rel>.py.map`, then a legacy adjacent `.py.map`). |
 | `tyc profile` | Build, then instrument every top-level function in the emitted code for hot-function detection (advanced, opt-in). `--out DIR` overrides the build directory. See [`tyc profile`](#tyc-profile) for the round trip into `[strictness] pgo-memoise`. |
 | `tyc migrate` | Convert typed Python (`.py`) to Typhon (`.ty`): rewrites `Optional[T]`/`T \| None` → `T?`, adds `let`/`mut` to module-level annotated assigns *and* function-body plain assignments, strips `@dataclass` decorators. |
 | `tyc ty` | Build the project and run Astral's `ty` checker against the emitted Python. Requires `ty` on `PATH` (`pip install ty`). Supports `--watch` for continuous feedback. |
@@ -382,11 +382,13 @@ tyc sync
 tyc sync --dry-run
 ```
 
+`tyc add name@git+https://…` (any value containing `://`, or starting with `file:`) records a [PEP 508 direct reference](https://peps.python.org/pep-0508/), rendered as `name @ URL` in `pyproject.toml`. When `pyproject.toml` declares `dynamic = ["version"]`, the merge leaves `version` to the build backend rather than adding a static one, which `uv sync` would reject.
+
 `--no-sync` on `tyc add` / `tyc remove` skips the `uv` install step — useful for batching edits and running `tyc sync` once at the end. `--dev` on either targets `[dev-dependencies]`, and `--dir DIR` (default `.`) selects the project whose `typhon.toml` to edit; `tyc sync` takes the project directory as its positional argument instead.
 
 ## CI integration
 
-`tyc check` is the recommended command for CI: it runs everything up to the analyser without emitting `.py` output, so it fails fast on type errors without producing artifacts.
+`tyc check` is the recommended command for CI: it runs everything up to the analyser without emitting `.py` output, so it fails fast on type errors without producing artifacts. A path with nothing to check (no `.ty` files) exits 1, so a mistyped path cannot pass. A piped `tyc repl` (a script fed on stdin) exits 1 when any snippet failed to compile or raised.
 
 ## Editor integration
 

@@ -281,6 +281,22 @@ grouped by workstream (W1–W7).
   `src/main.ty` used to write `typhon.toml` and `tests/` before failing; every
   refusal now comes first, a symlink at either path counts as present, and
   both files are written atomically.
+- **Smaller CLI fixes** (W4-15).
+  - `tyc check` on a path with nothing to check (an empty directory, a
+    `.py`-only tree, a mistyped path) exits 1 instead of passing, so CI cannot
+    go green without checking anything.
+  - A piped `tyc repl` (a script fed on stdin) exits 1 when any snippet failed
+    to compile or raised; it exited 0.
+  - The `pyproject.toml` merge no longer writes a static `[project] version`
+    when the file declares `dynamic = ["version"]` (`uv sync` rejected the
+    pair).
+  - `tyc add pkg@git+https://…` records a PEP 508 direct reference
+    (`pkg @ git+https://…`) instead of `pkg==git+https://…`.
+  - `tyc debug` writes its wrapper's string literals as Python escapes; Rust's
+    `{:?}` produced `\u{200b}` for a zero-width space in a path, a Python
+    `SyntaxError`.
+  - `tyc trace` rewrites frames inside `ExceptionGroup` tracebacks (the
+    `  |   File "…"` rows every failed `gather:` prints), keeping the gutter.
 
 #### W5 — VM & harness
 

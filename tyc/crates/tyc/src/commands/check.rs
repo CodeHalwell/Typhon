@@ -211,30 +211,31 @@ pub fn run(args: CheckArgs) -> Result<()> {
         ));
     }
 
+    if file_count == 0 {
+        // Checking nothing is a failure (W4-15): an empty directory or a
+        // mistyped / `.py`-only path used to exit 0, so CI went green
+        // without checking anything. The hint (FINDINGS #39) names what was
+        // looked for and the `--stubs` path, since a directory of `.dty`
+        // files without `.ty` siblings is not picked up by default.
+        let display_paths: Vec<String> = args
+            .paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let joined = if display_paths.is_empty() {
+            ".".to_owned()
+        } else {
+            display_paths.join(", ")
+        };
+        return Err(miette!(
+            "no checkable files in {joined}: looked for `.ty` source files. \
+             To check stubs recursively, run `tyc check --stubs {joined}`; \
+             to check a single `.dty` stub pass it directly."
+        ));
+    }
+
     if !args.quiet_success {
-        if file_count == 0 {
-            // FINDINGS #39: a silent "checked 0 file(s)" leaves the
-            // user wondering whether the run actually did anything.
-            // Print an actionable hint pointing at what we looked for
-            // and at the `--stubs` flag (the recursive stub-discovery
-            // path), so the user sees that a directory of `.dty` files
-            // without any `.ty` siblings isn't picked up by default.
-            let display_paths: Vec<String> = args
-                .paths
-                .iter()
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect();
-            let joined = if display_paths.is_empty() {
-                ".".to_owned()
-            } else {
-                display_paths.join(", ")
-            };
-            println!(
-                "no checkable files in {joined}: looked for `.ty` source files. \
-                 To check stubs recursively, run `tyc check --stubs {joined}`; \
-                 to check a single `.dty` stub pass it directly."
-            );
-        } else if total.warning_count > 0 {
+        if total.warning_count > 0 {
             println!(
                 "checked {} file(s) — {} warning(s)",
                 file_count, total.warning_count

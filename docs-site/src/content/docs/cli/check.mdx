@@ -58,7 +58,7 @@ A directory that holds several projects is checked one project at a time. Every 
 | Code | Meaning |
 |------|---------|
 | 0 | No errors. |
-| 1 | At least one error-severity diagnostic, or invalid input (missing path). |
+| 1 | At least one error-severity diagnostic, or invalid input: a missing path, or a path with nothing to check (no `.ty` files — an empty directory, a `.py`-only tree), so a mistyped CI path cannot pass. |
 | 2 | Malformed command line (rejected by the argument parser). |
 
 Warning-severity diagnostics do not change the exit code. To gate CI on warnings as well, raise `[strictness]` levels in `typhon.toml`.

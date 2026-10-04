@@ -19,6 +19,8 @@ tyc repl --load src/lib.ty        # pre-load a .ty file as the initial session
 tyc repl --python python3.13      # use a specific interpreter
 ```
 
+With stdin piped (`tyc repl < snippets.ty`), the prompts are omitted and the exit code is 1 if any snippet failed to compile or raised, so a scripted session can gate CI.
+
 ## Session model
 
 The REPL accumulates **all** source you enter. On each prompt:

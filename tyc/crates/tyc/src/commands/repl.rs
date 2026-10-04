@@ -97,6 +97,9 @@ pub fn run(args: ReplArgs) -> Result<()> {
     let mut stdout = stdout.lock();
 
     let mut buf = String::new();
+    // Snippets that failed to compile or raised. A piped session (a script
+    // fed on stdin) exits non-zero when any did (W4-15); it used to exit 0.
+    let mut failures = 0usize;
     // Holds a line that closed a previous multi-line block as its
     // dedent-to-0 terminator. When set, it is processed as the next
     // top-level prompt instead of reading stdin.
@@ -205,12 +208,24 @@ pub fn run(args: ReplArgs) -> Result<()> {
                     }
                 }
                 Ok(None) => {}
-                Err(e) => eprintln!("runtime: {e}"),
+                Err(e) => {
+                    failures += 1;
+                    eprintln!("runtime: {e}");
+                }
             },
-            Err(e) => eprintln!("error: {e}"),
+            Err(e) => {
+                failures += 1;
+                eprintln!("error: {e}");
+            }
         }
     }
 
+    if !interactive && failures > 0 {
+        return Err(miette!(
+            "{failures} snippet{} failed",
+            if failures == 1 { "" } else { "s" }
+        ));
+    }
     Ok(())
 }
 
