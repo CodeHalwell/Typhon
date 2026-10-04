@@ -25,6 +25,26 @@ def area(s: Shape) -> float:
     # error: missing `Triangle`
 ```
 
+## Other closed subjects
+
+The same check runs on every subject whose values form a closed set:
+
+- **Nested sealed unions.** With `type Poly = Rect | Tri` and
+  `type Shape = Circle | Poly`, a `match` over a `Shape` must cover the
+  leaf classes `Circle`, `Rect` and `Tri` (`case Poly():` is not a class
+  pattern: see `tyc::alias_not_a_class`).
+- **`Result[T, E]`.** Both `Ok` and `Err` must be matched. When `E` (or `T`)
+  is a sealed union, enum, `bool` or literal union, the payload patterns
+  must cover it too: `case Err(NotFound())` and `case Err(Timeout())` over
+  `Result[str, NotFound | Timeout | Denied]` report `Err(Denied)` missing.
+- **Nullable subjects.** A `match` over `T?` must handle `None` once its
+  arms cover `T` (`case int():` alone over an `int?` reports `None`).
+- **`bool` and literal unions.** `case True:` alone reports `False`;
+  `type Color = "red" | "green" | "blue"` reports any colour left out.
+
+An arm with a guard (`case Ok(v) if v > 0:`) never counts towards coverage.
+`[strictness] exhaustive-match` sets the level of every form.
+
 ## Why
 
 Sealed unions list their variants exhaustively, which lets the type checker

@@ -883,8 +883,16 @@ fn close_sync_spawners(c: &mut Checker, body: &[Stmt]) {
             if f.is_async || c.sync_spawners.contains_key(f.name.as_str()) {
                 continue;
             }
-            let known: std::collections::HashSet<String> =
-                c.sync_spawners.keys().cloned().collect();
+            // A name the function binds itself — a parameter, a local, a
+            // nested `def` — shadows the module-level spawner of the same
+            // name (review 2026-10-03 §4.6).
+            let locals = function_local_names(f);
+            let known: std::collections::HashSet<String> = c
+                .sync_spawners
+                .keys()
+                .filter(|k| !locals.contains(k.as_str()))
+                .cloned()
+                .collect();
             if let Some(callee) = body_calls_one_of(&f.body, &known) {
                 let spawned = c.sync_spawners.get(&callee).cloned().unwrap_or_default();
                 c.sync_spawners.insert(
@@ -898,6 +906,74 @@ fn close_sync_spawners(c: &mut Checker, body: &[Stmt]) {
             break;
         }
     }
+}
+
+/// Every name `f` binds in its own scope: parameters, assignment / loop /
+/// `with` / walrus targets, nested `def` and `class` names, and local
+/// imports.
+fn function_local_names(f: &ruff_python_ast::StmtFunctionDef) -> std::collections::HashSet<String> {
+    let mut out: std::collections::HashSet<String> = f
+        .parameters
+        .iter()
+        .map(|p| p.name().as_str().to_owned())
+        .collect();
+    out.extend(collect_assign_sites(&f.body).into_iter().map(|(n, _)| n));
+    fn defs(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
+        for s in stmts {
+            match s {
+                Stmt::FunctionDef(d) => {
+                    out.insert(d.name.as_str().to_owned());
+                }
+                Stmt::ClassDef(d) => {
+                    out.insert(d.name.as_str().to_owned());
+                }
+                Stmt::Import(i) => {
+                    for a in &i.names {
+                        let local = a.asname.as_ref().map(|n| n.as_str()).unwrap_or_else(|| {
+                            a.name.as_str().split('.').next().unwrap_or(a.name.as_str())
+                        });
+                        out.insert(local.to_owned());
+                    }
+                }
+                Stmt::ImportFrom(i) => {
+                    for a in &i.names {
+                        out.insert(a.asname.as_ref().unwrap_or(&a.name).as_str().to_owned());
+                    }
+                }
+                Stmt::If(i) => {
+                    defs(&i.body, out);
+                    for c in &i.elif_else_clauses {
+                        defs(&c.body, out);
+                    }
+                }
+                Stmt::For(x) => {
+                    defs(&x.body, out);
+                    defs(&x.orelse, out);
+                }
+                Stmt::While(x) => {
+                    defs(&x.body, out);
+                    defs(&x.orelse, out);
+                }
+                Stmt::With(x) => defs(&x.body, out),
+                Stmt::Try(x) => {
+                    defs(&x.body, out);
+                    for h in &x.handlers {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                        if let Some(n) = &h.name {
+                            out.insert(n.as_str().to_owned());
+                        }
+                        defs(&h.body, out);
+                    }
+                    defs(&x.orelse, out);
+                    defs(&x.finalbody, out);
+                }
+                Stmt::Match(m) => m.cases.iter().for_each(|c| defs(&c.body, out)),
+                _ => {}
+            }
+        }
+    }
+    defs(&f.body, &mut out);
+    out
 }
 
 /// The first bare-name callee in `body` (nested `def` / `class` bodies
@@ -2637,6 +2713,28 @@ struct TypeBinding {
 /// top-level definitions: 4 000 one-`if` functions took 35 s.
 type ScopeMap = Rc<HashMap<String, TypeBinding>>;
 
+/// The envs reaching a loop's `break`s and `continue`s, recorded while its
+/// body is checked.
+#[derive(Debug, Default)]
+struct LoopExits {
+    /// Source range of the loop statement.
+    range: (usize, usize),
+    breaks: Vec<TypeEnv>,
+    continues: Vec<TypeEnv>,
+}
+
+/// The join of `states` — a narrowing survives only where every state
+/// agrees on it ([`TypeEnv::intersect_narrowings`]). `None` when there are
+/// none (the point is unreachable).
+fn join_envs(states: Vec<TypeEnv>) -> Option<TypeEnv> {
+    let mut it = states.into_iter();
+    let mut joined = it.next()?;
+    for s in it {
+        joined.intersect_narrowings(&s);
+    }
+    Some(joined)
+}
+
 /// Type-environment stack — a map of name → TypeBinding per scope.
 #[derive(Debug, Default, Clone)]
 struct TypeEnv {
@@ -2763,6 +2861,17 @@ impl TypeEnv {
         let sub_prefix = format!("{path}.");
         self.attr_narrowings
             .retain(|k, _| k != path && !k.starts_with(&sub_prefix));
+    }
+
+    /// Drop the narrowings on paths below `root` (`root.a`, `root.a.b`, …)
+    /// for which `stale` holds of the path's segments after `root`.
+    fn clear_attr_narrowings_under(&mut self, root: &str, stale: impl Fn(&[&str]) -> bool) {
+        let prefix = format!("{root}.");
+        self.attr_narrowings
+            .retain(|k, _| match k.strip_prefix(&prefix) {
+                Some(rest) => !stale(&rest.split('.').collect::<Vec<_>>()),
+                None => true,
+            });
     }
 
     /// Drop every narrowing whose path ends in `.field` (and their
@@ -3186,6 +3295,29 @@ struct Checker<'a> {
     /// (review 2026-09-30 §3.4). Empty for the overwhelmingly common
     /// function with no `nonlocal` anywhere beneath it.
     nonlocals_rebound_by_call: std::collections::HashSet<String>,
+    /// Nested `def`s of the function being checked that can rebind its
+    /// locals through `nonlocal` (directly or by calling another such `def`)
+    /// and are only ever *called* by name, never passed or stored: writer
+    /// name → the locals it rebinds. A call to one of them resets exactly
+    /// those narrowings; any other call cannot reach it (review 2026-10-03
+    /// §4.5). Writers that escape are in `nonlocals_rebound_by_call`.
+    nonlocal_writer_calls: HashMap<String, std::collections::HashSet<String>>,
+    /// Which fields a call into this module's own functions, constructors
+    /// and methods can write — what a statement-position call may do to the
+    /// narrowings of an object passed to it. See [`FieldWriteSummary`].
+    field_writes: FieldWriteSummary,
+    /// Names bound by a `type X = …` statement. Each is a `TypeAliasType`
+    /// at runtime, not a class (see [`is_type_alias_name`]).
+    pep695_aliases: HashSet<String>,
+    /// One frame per enclosing loop being checked: the env at every `break`
+    /// and `continue` in its body, joined into the loop-head and post-loop
+    /// states (review 2026-10-03, W1-06 / W1-07).
+    loop_exits: Vec<LoopExits>,
+    /// Per enclosing function body (the module first): every name it
+    /// assigns, with the offset the assignment takes effect at. Lets a
+    /// lambda or nested `def` drop narrowings of captured names that are
+    /// reassigned after it is created (see [`widen_captured_names`]).
+    assign_sites: Vec<Vec<(String, usize)>>,
     /// For each declared function name, its inferred signature type.
     function_signatures: HashMap<String, Type>,
     /// Per-function arity metadata that doesn't fit in `Type::Function`
@@ -3691,7 +3823,12 @@ impl<'a> Checker<'a> {
             is_assignable_path: std::cell::RefCell::new(Vec::new()),
             classes: Vec::new(),
             globals_rebound_by_call: std::collections::HashSet::new(),
+            field_writes: FieldWriteSummary::default(),
+            pep695_aliases: HashSet::new(),
+            loop_exits: Vec::new(),
+            assign_sites: Vec::new(),
             nonlocals_rebound_by_call: std::collections::HashSet::new(),
+            nonlocal_writer_calls: HashMap::new(),
             function_signatures: HashMap::new(),
             function_arity_info: HashMap::new(),
             function_kwarg_types: HashMap::new(),
@@ -4486,6 +4623,98 @@ impl<'a> Checker<'a> {
     /// as follow-up).
     fn unwrap_alias(&self, ty: &Type) -> Type {
         self.unwrap_alias_inner(ty, 0)
+    }
+
+    /// Replace every `type` alias whose right-hand side is nullable
+    /// (`type OptStr = str | None`, `= str?`, `= User | None`) by that
+    /// right-hand side, inside `ty`. Such an alias was an opaque nominal
+    /// `Class("OptStr")` to every nullable check and narrowing, so
+    /// `s.upper()` on an `OptStr` was accepted and `if s is None: return`
+    /// could not narrow it (review 2026-10-03 §4.8, W1-11). Other aliases
+    /// keep their name.
+    fn expand_nullable_aliases(&self, ty: &Type) -> Type {
+        self.expand_nullable_aliases_inner(ty, 0)
+    }
+
+    fn expand_nullable_aliases_inner(&self, ty: &Type, depth: u8) -> Type {
+        if depth >= 8 {
+            return ty.clone();
+        }
+        match ty {
+            Type::Class(name) => match self.type_aliases.get(name.as_str()) {
+                Some((params, rhs)) if params.is_empty() => {
+                    let rhs = self.unwrap_alias(rhs);
+                    if rhs.is_nullable() {
+                        self.expand_nullable_aliases_inner(&rhs, depth + 1)
+                    } else {
+                        ty.clone()
+                    }
+                }
+                _ => ty.clone(),
+            },
+            Type::Union(xs) => Type::union_of(
+                xs.iter()
+                    .map(|x| self.expand_nullable_aliases_inner(x, depth + 1))
+                    .collect(),
+            ),
+            Type::Generic(h, args) => Type::Generic(
+                h.clone(),
+                args.iter()
+                    .map(|a| self.expand_nullable_aliases_inner(a, depth + 1))
+                    .collect(),
+            ),
+            Type::Function {
+                params,
+                ret,
+                variadic,
+                min_params,
+            } => Type::Function {
+                params: params
+                    .iter()
+                    .map(|p| self.expand_nullable_aliases_inner(p, depth + 1))
+                    .collect(),
+                ret: Box::new(self.expand_nullable_aliases_inner(ret, depth + 1)),
+                variadic: *variadic,
+                min_params: *min_params,
+            },
+            _ => ty.clone(),
+        }
+    }
+
+    /// Apply [`expand_nullable_aliases`](Self::expand_nullable_aliases) to
+    /// every signature and class shape collected for this module.
+    fn expand_nullable_aliases_in_shapes(&mut self) {
+        let has_nullable_alias = self
+            .type_aliases
+            .iter()
+            .any(|(_, (params, rhs))| params.is_empty() && self.unwrap_alias(rhs).is_nullable());
+        if !has_nullable_alias {
+            return;
+        }
+        let sigs: Vec<(String, Type)> = self
+            .function_signatures
+            .iter()
+            .map(|(k, v)| (k.clone(), self.expand_nullable_aliases(v)))
+            .collect();
+        self.function_signatures.extend(sigs);
+        let shapes: Vec<(String, InterfaceShape)> = self
+            .class_shapes
+            .iter()
+            .map(|(k, shape)| {
+                let mut s = shape.clone();
+                for t in s.fields.values_mut() {
+                    *t = self.expand_nullable_aliases(t);
+                }
+                for m in s.methods.values_mut() {
+                    m.return_type = self.expand_nullable_aliases(&m.return_type);
+                    for p in m.param_types.iter_mut() {
+                        *p = self.expand_nullable_aliases(p);
+                    }
+                }
+                (k.clone(), s)
+            })
+            .collect();
+        self.class_shapes.extend(shapes);
     }
 
     /// Walk `ty` and rewrite every `Class("alias.X")` whose prefix
@@ -5790,6 +6019,22 @@ impl<'a> Checker<'a> {
         ));
     }
 
+    fn alias_not_a_class(&mut self, alias: &str, form: &str, fix: &str, span: (usize, usize)) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
+        let length = span.1.saturating_sub(span.0).max(1);
+        self.diagnostics.push_error(TycError::alias_not_a_class(
+            alias,
+            form,
+            fix,
+            &self.path,
+            self.source,
+            span.0,
+            length,
+        ));
+    }
+
     fn non_exhaustive_match(&mut self, union_name: &str, missing: &str, span: (usize, usize)) {
         if self.unsafe_depth > 0 {
             return;
@@ -6767,11 +7012,13 @@ pub fn check_module_with_imports(
     // First pass: collect class names + function signatures so forward
     // references work.
     collect_call_rebound_globals(&module.body, &mut c.globals_rebound_by_call);
+    c.field_writes = FieldWriteSummary::collect(&module.body);
     // Frozen-ness first: the class pass infers type-parameter variance and
     // needs to know which classes are `frozen` (their fields are
     // read-only, hence covariant).
     populate_frozen_classes(&mut c, &module.body, &frozen_starts);
     collect_classes_and_functions(&mut c, &module.body);
+    c.expand_nullable_aliases_in_shapes();
     check_override_compatibility(&mut c, &module.body);
     check_frozen_inheritance(&mut c, &module.body);
     // Cross-function field-init audit pre-pass: identify helper
@@ -6790,9 +7037,11 @@ pub fn check_module_with_imports(
     // - `Ok`/`Err` may be used before the `from typhon_runtime import`
     //   injection happens (the desugar pass adds it later).
     seed_typhon_builtins(&mut c);
+    c.assign_sites.push(collect_assign_sites(&module.body));
     for stmt in &module.body {
         check_stmt(&mut c, stmt);
     }
+    c.assign_sites.pop();
     c.env.leave();
 
     // Phase C: resource discipline. Walk the body for bound
@@ -7794,12 +8043,13 @@ fn check_unsafe_leak_into(c: &mut Checker, expr: &Expr, target_ty: &Type) {
     if c.unsafe_depth > 0 {
         return;
     }
-    let Some(name) = (match expr {
-        Expr::Name(n) => Some(n.id.as_str()),
-        _ => None,
-    }) else {
+    // A value *derived* from an unsafe binding — `data["name"]`,
+    // `data.count + 1`, `[x for x in data]`, `lambda: data` — carries its
+    // lack of a type just as the bare name does (review 2026-10-03 §3.6).
+    let Some(name) = unsafe_root_name(c, expr) else {
         return;
     };
+    let derived = !matches!(expr, Expr::Name(_));
     // Check the current environment first: if a safe-scope rebind
     // outside the `unsafe:` block has re-introduced the name with
     // its own concrete type (`let value: int = value` after the
@@ -7829,8 +8079,27 @@ fn check_unsafe_leak_into(c: &mut Checker, expr: &Expr, target_ty: &Type) {
     // target via the normal nominal/structural rules (i.e. the user
     // annotated the unsafe binding with a concrete type and the check
     // passed), the cross is sound — no diagnostic needed.
-    if c.is_assignable(target_ty, &declared) && !matches!(declared, Type::Unknown) {
+    if !derived && c.is_assignable(target_ty, &declared) && !matches!(declared, Type::Unknown) {
         return;
+    }
+    // A derived value of an *annotated* unsafe binding has a real type;
+    // trust it when it fits. One of an untyped binding never does.
+    if derived && !matches!(declared, Type::Unknown | Type::Any) {
+        // The `unsafe:` scope is gone by now; infer with the binding's
+        // recorded type back in view.
+        c.env.enter();
+        c.env.declare(TypeBinding {
+            name: name.to_owned(),
+            declared: declared.clone(),
+            narrowed: declared.clone(),
+            span: (0, 0),
+            from_unsafe: false,
+        });
+        let actual = infer_expr_readonly(c, expr);
+        c.env.leave();
+        if !matches!(actual, Type::Unknown | Type::Any) && c.is_assignable(target_ty, &actual) {
+            return;
+        }
     }
     let span = (
         expr.range().start().to_usize(),
@@ -7846,6 +8115,90 @@ fn check_unsafe_leak_into(c: &mut Checker, expr: &Expr, target_ty: &Type) {
         span.0,
         length,
     ));
+}
+
+/// The name of the `unsafe:`-origin binding `expr`'s value is derived from,
+/// if any: the binding itself, or a subscript, attribute, method call,
+/// arithmetic, conditional, literal, comprehension or lambda built on it.
+/// A plain call `f(data)` returns `f`'s declared type and is not derived;
+/// neither is `data as! T`, which lowers to such a call.
+fn unsafe_root_name<'a>(c: &Checker, expr: &'a Expr) -> Option<&'a str> {
+    let is_unsafe = |name: &str| match c.env.lookup(name) {
+        Some(b) => b.from_unsafe,
+        None => c.unsafe_origin_bindings.contains_key(name),
+    };
+    match expr {
+        Expr::Name(n) => is_unsafe(n.id.as_str()).then_some(n.id.as_str()),
+        Expr::Subscript(s) => unsafe_root_name(c, &s.value),
+        Expr::Attribute(a) => unsafe_root_name(c, &a.value),
+        Expr::Call(call) => match call.func.as_ref() {
+            Expr::Attribute(a) => unsafe_root_name(c, &a.value),
+            _ => None,
+        },
+        Expr::BinOp(b) => unsafe_root_name(c, &b.left).or_else(|| unsafe_root_name(c, &b.right)),
+        Expr::UnaryOp(u) => unsafe_root_name(c, &u.operand),
+        Expr::BoolOp(b) => b.values.iter().find_map(|v| unsafe_root_name(c, v)),
+        Expr::If(i) => unsafe_root_name(c, &i.body).or_else(|| unsafe_root_name(c, &i.orelse)),
+        Expr::Await(a) => unsafe_root_name(c, &a.value),
+        Expr::Starred(s) => unsafe_root_name(c, &s.value),
+        Expr::Named(n) => unsafe_root_name(c, &n.value),
+        Expr::List(l) => l.elts.iter().find_map(|e| unsafe_root_name(c, e)),
+        Expr::Tuple(t) => t.elts.iter().find_map(|e| unsafe_root_name(c, e)),
+        Expr::Set(s) => s.elts.iter().find_map(|e| unsafe_root_name(c, e)),
+        Expr::Dict(d) => d.items.iter().find_map(|i| {
+            i.key
+                .as_ref()
+                .and_then(|k| unsafe_root_name(c, k))
+                .or_else(|| unsafe_root_name(c, &i.value))
+        }),
+        Expr::ListComp(l) => l
+            .generators
+            .iter()
+            .find_map(|g| unsafe_root_name(c, &g.iter)),
+        Expr::SetComp(l) => l
+            .generators
+            .iter()
+            .find_map(|g| unsafe_root_name(c, &g.iter)),
+        Expr::Generator(l) => l
+            .generators
+            .iter()
+            .find_map(|g| unsafe_root_name(c, &g.iter)),
+        Expr::DictComp(l) => l
+            .generators
+            .iter()
+            .find_map(|g| unsafe_root_name(c, &g.iter)),
+        // A lambda that reads an unsafe binding hands it out when called.
+        Expr::Lambda(l) => {
+            let params: HashSet<&str> = l
+                .parameters
+                .as_deref()
+                .map(|p| p.iter().map(|a| a.name().as_str()).collect())
+                .unwrap_or_default();
+            collect_names_in_expr_all(&l.body)
+                .into_iter()
+                .find(|n| !params.contains(n) && is_unsafe(n))
+        }
+        _ => None,
+    }
+}
+
+/// Every `Name` read anywhere in `expr`.
+fn collect_names_in_expr_all(expr: &Expr) -> Vec<&str> {
+    use ruff_python_ast::visitor::source_order::{walk_expr, SourceOrderVisitor};
+    struct V<'a> {
+        names: Vec<&'a str>,
+    }
+    impl<'a> SourceOrderVisitor<'a> for V<'a> {
+        fn visit_expr(&mut self, e: &'a Expr) {
+            if let Expr::Name(n) = e {
+                self.names.push(n.id.as_str());
+            }
+            walk_expr(self, e);
+        }
+    }
+    let mut v = V { names: Vec::new() };
+    v.visit_expr(expr);
+    v.names
 }
 
 /// Collect the set of `Name` ids occurring in an expression that
@@ -8738,6 +9091,7 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                 if let Expr::Name(n) = ta.name.as_ref() {
                     let union_name = n.id.as_str().to_owned();
                     c.classes.push(union_name.clone());
+                    c.pep695_aliases.insert(union_name.clone());
                     if let Some(variants) = extract_sealed_union_variants(&ta.value) {
                         c.sealed_unions.insert(union_name.clone(), variants);
                     }
@@ -12123,55 +12477,959 @@ impl Checker<'_> {
     }
 }
 
-/// Names declared `nonlocal` by any `def` nested (at any depth) inside
-/// `body`. Lambdas cannot declare `nonlocal`, and a nested class body's own
-/// methods are walked too, since `nonlocal` there still targets the
-/// enclosing function's scope.
-fn collect_nested_nonlocals(body: &[Stmt]) -> std::collections::HashSet<String> {
-    fn walk(stmts: &[Stmt], nested: bool, acc: &mut std::collections::HashSet<String>) {
+/// The nested `def`s of `body` that can rebind a local of `body` through
+/// `nonlocal`, split by whether they escape. Returns the locals any
+/// *escaping* writer rebinds — those reset on every call, since anything may
+/// end up calling it — and, for writers only ever called by name, writer →
+/// the locals it rebinds (directly, or by calling another writer).
+fn collect_nonlocal_writers(
+    body: &[Stmt],
+) -> (
+    std::collections::HashSet<String>,
+    HashMap<String, std::collections::HashSet<String>>,
+) {
+    use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
+    // Nested `def`s at any statement depth of `body` (not inside another
+    // def), and the methods of classes nested there — which are called
+    // through an attribute, so they always count as escaping.
+    fn defs<'a>(stmts: &'a [Stmt], out: &mut Vec<(&'a ruff_python_ast::StmtFunctionDef, bool)>) {
         for s in stmts {
             match s {
-                Stmt::Nonlocal(nl) if nested => {
-                    acc.extend(nl.names.iter().map(|n| n.as_str().to_owned()));
+                Stmt::FunctionDef(f) => out.push((f, false)),
+                Stmt::ClassDef(cd) => {
+                    for m in &cd.body {
+                        if let Stmt::FunctionDef(f) = m {
+                            out.push((f, true));
+                        }
+                    }
                 }
-                Stmt::FunctionDef(f) => walk(&f.body, true, acc),
-                Stmt::ClassDef(cd) => walk(&cd.body, nested, acc),
                 Stmt::If(i) => {
-                    walk(&i.body, nested, acc);
-                    for clause in &i.elif_else_clauses {
-                        walk(&clause.body, nested, acc);
+                    defs(&i.body, out);
+                    for c in &i.elif_else_clauses {
+                        defs(&c.body, out);
                     }
                 }
                 Stmt::For(f) => {
-                    walk(&f.body, nested, acc);
-                    walk(&f.orelse, nested, acc);
+                    defs(&f.body, out);
+                    defs(&f.orelse, out);
                 }
                 Stmt::While(w) => {
-                    walk(&w.body, nested, acc);
-                    walk(&w.orelse, nested, acc);
+                    defs(&w.body, out);
+                    defs(&w.orelse, out);
                 }
-                Stmt::With(w) => walk(&w.body, nested, acc),
+                Stmt::With(w) => defs(&w.body, out),
                 Stmt::Try(t) => {
-                    walk(&t.body, nested, acc);
+                    defs(&t.body, out);
                     for h in &t.handlers {
                         let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
-                        walk(&h.body, nested, acc);
+                        defs(&h.body, out);
                     }
-                    walk(&t.orelse, nested, acc);
-                    walk(&t.finalbody, nested, acc);
+                    defs(&t.orelse, out);
+                    defs(&t.finalbody, out);
                 }
-                Stmt::Match(m) => {
-                    for case in &m.cases {
-                        walk(&case.body, nested, acc);
+                Stmt::Match(m) => m.cases.iter().for_each(|c| defs(&c.body, out)),
+                _ => {}
+            }
+        }
+    }
+    // `nonlocal` names anywhere in a def, the names it calls, and every name
+    // it (or `body`) reads other than as a call's callee.
+    #[derive(Default)]
+    struct Scan {
+        nonlocals: std::collections::HashSet<String>,
+        calls: std::collections::HashSet<String>,
+        loads: std::collections::HashSet<String>,
+    }
+    impl<'a> Visitor<'a> for Scan {
+        fn visit_stmt(&mut self, s: &'a Stmt) {
+            if let Stmt::Nonlocal(nl) = s {
+                self.nonlocals
+                    .extend(nl.names.iter().map(|n| n.as_str().to_owned()));
+            }
+            walk_stmt(self, s);
+        }
+        fn visit_expr(&mut self, e: &'a Expr) {
+            match e {
+                Expr::Call(call) => {
+                    if let Expr::Name(f) = call.func.as_ref() {
+                        self.calls.insert(f.id.as_str().to_owned());
+                        for a in &call.arguments.args {
+                            self.visit_expr(a);
+                        }
+                        for k in &call.arguments.keywords {
+                            self.visit_expr(&k.value);
+                        }
+                        return;
+                    }
+                }
+                Expr::Name(n) => {
+                    self.loads.insert(n.id.as_str().to_owned());
+                }
+                _ => {}
+            }
+            walk_expr(self, e);
+        }
+    }
+    let mut nested = Vec::new();
+    defs(body, &mut nested);
+    if nested.is_empty() {
+        return Default::default();
+    }
+    let mut per_def: HashMap<String, Scan> = HashMap::new();
+    for (f, is_method) in &nested {
+        let mut s = Scan::default();
+        for st in &f.body {
+            s.visit_stmt(st);
+        }
+        // Two defs may share a name (a method and a function, or a
+        // redefinition); keep the union of what they do.
+        let key = if *is_method {
+            format!(".{}", f.name)
+        } else {
+            f.name.as_str().to_owned()
+        };
+        let entry = per_def.entry(key).or_default();
+        entry.nonlocals.extend(s.nonlocals);
+        entry.calls.extend(s.calls);
+        entry.loads.extend(s.loads);
+    }
+    // Writers, closed over "calls a writer".
+    let mut writes: HashMap<String, std::collections::HashSet<String>> = per_def
+        .iter()
+        .filter(|(_, s)| !s.nonlocals.is_empty())
+        .map(|(n, s)| (n.clone(), s.nonlocals.clone()))
+        .collect();
+    loop {
+        let mut changed = false;
+        for (name, s) in &per_def {
+            let mut acc: std::collections::HashSet<String> =
+                writes.get(name).cloned().unwrap_or_default();
+            let before = acc.len();
+            for callee in &s.calls {
+                if callee != name {
+                    if let Some(w) = writes.get(callee) {
+                        acc.extend(w.iter().cloned());
+                    }
+                }
+            }
+            if acc.len() != before {
+                writes.insert(name.clone(), acc);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // A writer read as a value anywhere — passed, stored, returned — escapes.
+    let mut all = Scan::default();
+    for st in body {
+        all.visit_stmt(st);
+    }
+    let mut escaped = std::collections::HashSet::new();
+    let mut called = HashMap::new();
+    for (name, w) in writes {
+        if name.starts_with('.') || all.loads.contains(&name) {
+            escaped.extend(w);
+        } else {
+            called.insert(name, w);
+        }
+    }
+    (escaped, called)
+}
+
+/// What a call into this module's own code can do to the fields of an object
+/// handed to it, built once per module by [`FieldWriteSummary::collect`].
+///
+/// A statement-position call used to drop every field narrowing of every
+/// bare-name argument (review 2026-09-30 §3.8), so `print(it)`,
+/// `out.append(it)` and `logging.info("%s", it)` made a just-checked
+/// `it.price is not None` stale (review 2026-10-03 §4.3). The summary keeps
+/// the invalidation where a callee can actually write the field — a local
+/// `clear(b)` that does `b.value = None` — and drops it where it cannot.
+///
+/// Calls resolved inside a summarised body follow the same rules as at a call
+/// site, with one documented gap: a method call on a receiver of unknown type
+/// whose name no local class defines (`session.add(it)`) is taken to be a
+/// builtin- or library-object method that rebinds no field of its arguments.
+#[derive(Default)]
+struct FieldWriteSummary {
+    /// Local free function, or local class (its constructor), → the field
+    /// names it may write, transitively through local calls. `None`: it may
+    /// write anything, because it calls code whose body is not visible here.
+    funcs: HashMap<String, Option<HashSet<String>>>,
+    /// Method name → the union over every local class's method of that name.
+    methods: HashMap<String, Option<HashSet<String>>>,
+    /// Module-level import bindings: local name → dotted source module
+    /// (a leading `.` for a relative import).
+    imports: HashMap<String, String>,
+    /// Python builtin names, cached for the per-call-site lookup.
+    builtins: HashSet<&'static str>,
+}
+
+/// What a statement-position call may do to its arguments' field narrowings.
+enum ArgEffect {
+    /// Rebinds no field of an argument: builtins, the stdlib, methods of
+    /// builtin values.
+    Nothing,
+    /// May write exactly these field names.
+    Fields(HashSet<String>),
+    /// May write anything.
+    Anything,
+}
+
+impl ArgEffect {
+    fn from_summary(w: &Option<HashSet<String>>) -> ArgEffect {
+        match w {
+            Some(fields) if fields.is_empty() => ArgEffect::Nothing,
+            Some(fields) => ArgEffect::Fields(fields.clone()),
+            None => ArgEffect::Anything,
+        }
+    }
+}
+
+fn is_stdlib_dotted(module: &str) -> bool {
+    if module.starts_with('.') {
+        return false;
+    }
+    let root = module.split('.').next().unwrap_or(module);
+    tyc_resolve::python_stdlib_modules().contains(&root)
+}
+
+impl FieldWriteSummary {
+    fn collect(body: &[Stmt]) -> Self {
+        #[derive(Default)]
+        struct Direct {
+            writes: HashSet<String>,
+            unknown: bool,
+            funcs: HashSet<String>,
+            methods: HashSet<String>,
+        }
+        struct Facts<'a> {
+            d: Direct,
+            ctor: bool,
+            local_funcs: &'a HashSet<String>,
+            local_methods: &'a HashSet<String>,
+            imports: &'a HashMap<String, String>,
+            builtins: &'a HashSet<&'static str>,
+        }
+        impl Facts<'_> {
+            fn target(&mut self, t: &Expr) {
+                match t {
+                    Expr::Attribute(a) => {
+                        let own_field = self.ctor
+                            && matches!(a.value.as_ref(), Expr::Name(n) if matches!(n.id.as_str(), "self" | "cls"));
+                        if !own_field {
+                            self.d.writes.insert(a.attr.as_str().to_owned());
+                        }
+                    }
+                    Expr::Tuple(x) => x.elts.iter().for_each(|e| self.target(e)),
+                    Expr::List(x) => x.elts.iter().for_each(|e| self.target(e)),
+                    Expr::Starred(s) => self.target(&s.value),
+                    _ => {}
+                }
+            }
+            fn literal_field(&mut self, args: &[Expr], upto: usize) {
+                match args.iter().take(upto).find_map(|a| match a {
+                    Expr::StringLiteral(s) => Some(s.value.to_str().to_owned()),
+                    _ => None,
+                }) {
+                    Some(f) => {
+                        self.d.writes.insert(f);
+                    }
+                    None => self.d.unknown = true,
+                }
+            }
+            fn call(&mut self, call: &ruff_python_ast::ExprCall) {
+                let args = &call.arguments.args;
+                match call.func.as_ref() {
+                    Expr::Name(n) => {
+                        let f = n.id.as_str();
+                        if self.local_funcs.contains(f) {
+                            self.d.funcs.insert(f.to_owned());
+                        } else if let Some(m) = self.imports.get(f) {
+                            if !is_stdlib_dotted(m) {
+                                self.d.unknown = true;
+                            }
+                        } else if matches!(f, "setattr" | "delattr") {
+                            self.literal_field(args, 2);
+                        } else if !self.builtins.contains(f) {
+                            self.d.unknown = true;
+                        }
+                    }
+                    Expr::Attribute(a) => {
+                        let m = a.attr.as_str();
+                        if matches!(m, "__setattr__" | "__delattr__") {
+                            self.literal_field(args, 2);
+                        } else if let Some(module) = match a.value.as_ref() {
+                            Expr::Name(r) => self.imports.get(r.id.as_str()),
+                            _ => None,
+                        } {
+                            if !is_stdlib_dotted(module) {
+                                self.d.unknown = true;
+                            }
+                        } else if self.local_methods.contains(m) {
+                            self.d.methods.insert(m.to_owned());
+                        }
+                    }
+                    _ => self.d.unknown = true,
+                }
+            }
+        }
+        impl<'a> ruff_python_ast::visitor::Visitor<'a> for Facts<'_> {
+            fn visit_stmt(&mut self, s: &'a Stmt) {
+                match s {
+                    Stmt::Assign(a) => a.targets.iter().for_each(|t| self.target(t)),
+                    Stmt::AugAssign(a) => self.target(&a.target),
+                    Stmt::AnnAssign(a) if a.value.is_some() => self.target(&a.target),
+                    Stmt::Delete(d) => d.targets.iter().for_each(|t| self.target(t)),
+                    Stmt::For(f) => self.target(&f.target),
+                    Stmt::With(w) => w
+                        .items
+                        .iter()
+                        .filter_map(|i| i.optional_vars.as_deref())
+                        .for_each(|t| self.target(t)),
+                    _ => {}
+                }
+                ruff_python_ast::visitor::walk_stmt(self, s);
+            }
+            fn visit_expr(&mut self, e: &'a Expr) {
+                if let Expr::Call(call) = e {
+                    self.call(call);
+                }
+                ruff_python_ast::visitor::walk_expr(self, e);
+            }
+        }
+
+        let mut imports: HashMap<String, String> = HashMap::new();
+        let mut local_funcs: HashSet<String> = HashSet::new();
+        let mut local_methods: HashSet<String> = HashSet::new();
+        for s in body {
+            match s {
+                Stmt::Import(i) => {
+                    for a in &i.names {
+                        let dotted = a.name.as_str();
+                        let local = match &a.asname {
+                            Some(n) => n.as_str(),
+                            None => dotted.split('.').next().unwrap_or(dotted),
+                        };
+                        imports.insert(local.to_owned(), dotted.to_owned());
+                    }
+                }
+                Stmt::ImportFrom(i) => {
+                    let module = format!(
+                        "{}{}",
+                        ".".repeat(i.level as usize),
+                        i.module.as_ref().map(|m| m.as_str()).unwrap_or("")
+                    );
+                    for a in &i.names {
+                        let local = a.asname.as_ref().unwrap_or(&a.name).as_str();
+                        imports.insert(local.to_owned(), module.clone());
+                    }
+                }
+                Stmt::FunctionDef(f) => {
+                    local_funcs.insert(f.name.as_str().to_owned());
+                }
+                Stmt::ClassDef(cd) => {
+                    local_funcs.insert(cd.name.as_str().to_owned());
+                    for m in &cd.body {
+                        if let Stmt::FunctionDef(f) = m {
+                            local_methods.insert(f.name.as_str().to_owned());
+                        }
                     }
                 }
                 _ => {}
             }
         }
+        // A local definition shadows an import of the same name.
+        imports.retain(|k, _| !local_funcs.contains(k));
+        let builtins = tyc_resolve::builtin_names();
+
+        let facts = |body: &[Stmt], ctor: bool| -> Direct {
+            use ruff_python_ast::visitor::Visitor;
+            let mut v = Facts {
+                d: Direct::default(),
+                ctor,
+                local_funcs: &local_funcs,
+                local_methods: &local_methods,
+                imports: &imports,
+                builtins: &builtins,
+            };
+            for s in body {
+                v.visit_stmt(s);
+            }
+            v.d
+        };
+        fn merge_direct(into: &mut Direct, from: Direct) {
+            into.writes.extend(from.writes);
+            into.unknown |= from.unknown;
+            into.funcs.extend(from.funcs);
+            into.methods.extend(from.methods);
+        }
+        // "f:<name>" for functions and constructors, "m:<name>" for methods.
+        let mut direct: HashMap<String, Direct> = HashMap::new();
+        for s in body {
+            match s {
+                Stmt::FunctionDef(f) => {
+                    let d = facts(&f.body, false);
+                    merge_direct(direct.entry(format!("f:{}", f.name)).or_default(), d);
+                }
+                Stmt::ClassDef(cd) => {
+                    let ctor_key = format!("f:{}", cd.name);
+                    direct.entry(ctor_key.clone()).or_default();
+                    for m in &cd.body {
+                        if let Stmt::FunctionDef(f) = m {
+                            let name = f.name.as_str();
+                            let ctor = matches!(name, "__init__" | "__post_init__" | "__new__");
+                            let d = facts(&f.body, ctor);
+                            if ctor {
+                                let again = facts(&f.body, ctor);
+                                merge_direct(direct.entry(ctor_key.clone()).or_default(), again);
+                            }
+                            merge_direct(direct.entry(format!("m:{name}")).or_default(), d);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut sum: HashMap<String, Option<HashSet<String>>> = direct
+            .iter()
+            .map(|(k, d)| (k.clone(), (!d.unknown).then(|| d.writes.clone())))
+            .collect();
+        loop {
+            let mut changed = false;
+            for (key, d) in &direct {
+                let edges = d
+                    .funcs
+                    .iter()
+                    .map(|f| format!("f:{f}"))
+                    .chain(d.methods.iter().map(|m| format!("m:{m}")));
+                for callee in edges {
+                    let Some(from) = sum.get(&callee).cloned() else {
+                        continue;
+                    };
+                    let Some(Some(into)) = sum.get_mut(key) else {
+                        continue;
+                    };
+                    match from {
+                        None => {
+                            sum.insert(key.clone(), None);
+                            changed = true;
+                            break;
+                        }
+                        Some(fields) => {
+                            let before = into.len();
+                            into.extend(fields);
+                            changed |= into.len() != before;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut out = FieldWriteSummary {
+            imports,
+            builtins,
+            ..FieldWriteSummary::default()
+        };
+        for (k, w) in sum {
+            if let Some(name) = k.strip_prefix("f:") {
+                out.funcs.insert(name.to_owned(), w);
+            } else if let Some(name) = k.strip_prefix("m:") {
+                out.methods.insert(name.to_owned(), w);
+            }
+        }
+        out
     }
-    let mut acc = std::collections::HashSet::new();
-    walk(body, false, &mut acc);
-    acc
+}
+
+/// Whether `t` is a builtin value whose methods never rebind a field of an
+/// argument (`out.append(it)`, `"{}".format(it)`, `seen.add(it)`).
+fn is_builtin_value_type(t: &Type) -> bool {
+    match t {
+        Type::Int | Type::Str | Type::Bool | Type::Float | Type::Bytes | Type::LitStr(_) => true,
+        Type::Generic(h, _) => matches!(
+            h.as_str(),
+            "list"
+                | "dict"
+                | "set"
+                | "frozenset"
+                | "tuple"
+                | "tuple_variadic"
+                | "deque"
+                | "defaultdict"
+                | "OrderedDict"
+                | "Counter"
+        ),
+        _ => false,
+    }
+}
+
+/// What the statement-position call `call` may do to the field narrowings of
+/// an object passed to it. See [`FieldWriteSummary`].
+fn call_arg_effect(c: &Checker, call: &ruff_python_ast::ExprCall) -> ArgEffect {
+    let s = &c.field_writes;
+    match call.func.as_ref() {
+        Expr::Name(n) => {
+            let f = n.id.as_str();
+            if let Some(w) = s.funcs.get(f) {
+                return ArgEffect::from_summary(w);
+            }
+            if let Some(m) = s.imports.get(f) {
+                return if is_stdlib_dotted(m) {
+                    ArgEffect::Nothing
+                } else {
+                    ArgEffect::Anything
+                };
+            }
+            // A local variable or parameter holding a callable is opaque.
+            if matches!(f, "setattr" | "delattr") || c.env.lookup(f).is_some() {
+                return ArgEffect::Anything;
+            }
+            if s.builtins.contains(f) {
+                ArgEffect::Nothing
+            } else {
+                ArgEffect::Anything
+            }
+        }
+        Expr::Attribute(a) => {
+            if let Expr::Name(r) = a.value.as_ref() {
+                if let Some(m) = s.imports.get(r.id.as_str()) {
+                    return if is_stdlib_dotted(m) {
+                        ArgEffect::Nothing
+                    } else {
+                        ArgEffect::Anything
+                    };
+                }
+            }
+            let recv = infer_expr_readonly(c, &a.value);
+            match &recv {
+                Type::Module(m) if is_stdlib_dotted(m) => ArgEffect::Nothing,
+                t if is_builtin_value_type(t) => ArgEffect::Nothing,
+                Type::Class(name) if s.funcs.contains_key(name.as_str()) => {
+                    match s.methods.get(a.attr.as_str()) {
+                        Some(w) => ArgEffect::from_summary(w),
+                        None => ArgEffect::Anything,
+                    }
+                }
+                _ => ArgEffect::Anything,
+            }
+        }
+        _ => ArgEffect::Anything,
+    }
+}
+
+/// Drop the narrowings a method call `recv.m(…)` may have made stale, where
+/// `effect` is what `m` can write and `recv_path` is `recv`'s access path.
+///
+/// The method runs with `recv` as `self`, so it can rewrite fields *below*
+/// `recv_path` — but not the slot `recv` itself was read from: after
+/// `if self.conn is None: return`, `self.conn.execute("x")` leaves
+/// `self.conn` non-`None` (review 2026-10-03 §4.2). The one exception is a
+/// local method known to write a field named like that slot, which may have
+/// reached it through an alias, so the slot is dropped too.
+fn invalidate_receiver_fields(c: &mut Checker, recv: &Expr, recv_path: &str, effect: &ArgEffect) {
+    if matches!(effect, ArgEffect::Nothing) {
+        return;
+    }
+    if let (ArgEffect::Fields(fields), Some((_, slot))) = (effect, recv_path.rsplit_once('.')) {
+        if fields.contains(slot) {
+            c.env.clear_attr_narrowing(recv_path);
+            return;
+        }
+    }
+    let frozen = matches!(
+        infer_expr_readonly(c, recv),
+        Type::Class(n) if c.frozen_classes.contains(n.as_str())
+    );
+    let skip = usize::from(frozen);
+    c.env
+        .clear_attr_narrowings_under(recv_path, |segments| match effect {
+            ArgEffect::Nothing => false,
+            ArgEffect::Anything => segments.len() > skip,
+            ArgEffect::Fields(fields) => segments.iter().skip(skip).any(|s| fields.contains(*s)),
+        });
+}
+
+/// Drop the field narrowings rooted at `root` that a call with `effect` may
+/// have made stale. A `frozen` root's own fields cannot be rebound (the
+/// emitted dataclass raises), so only paths below them are dropped.
+fn invalidate_arg_fields(c: &mut Checker, root: &str, effect: &ArgEffect) {
+    if matches!(effect, ArgEffect::Nothing) {
+        return;
+    }
+    let frozen_root = matches!(
+        c.env.lookup(root).map(|b| &b.narrowed),
+        Some(Type::Class(n)) if c.frozen_classes.contains(n.as_str())
+    );
+    let skip = usize::from(frozen_root);
+    c.env
+        .clear_attr_narrowings_under(root, |segments| match effect {
+            ArgEffect::Nothing => false,
+            ArgEffect::Anything => segments.len() > skip,
+            ArgEffect::Fields(fields) => segments.iter().skip(skip).any(|s| fields.contains(*s)),
+        });
+}
+
+/// Every name `body` assigns — not counting nested `def` / `class` /
+/// lambda bodies, which bind their own locals — with the offset the
+/// assignment takes effect at (the end of an assignment statement, so the
+/// RHS of `v = make(lambda: v)` still counts as before it).
+fn collect_assign_sites(body: &[Stmt]) -> Vec<(String, usize)> {
+    struct V {
+        out: Vec<(String, usize)>,
+    }
+    fn names(t: &Expr, at: usize, out: &mut Vec<(String, usize)>) {
+        match t {
+            Expr::Name(n) => out.push((n.id.as_str().to_owned(), at)),
+            Expr::Tuple(x) => x.elts.iter().for_each(|e| names(e, at, out)),
+            Expr::List(x) => x.elts.iter().for_each(|e| names(e, at, out)),
+            Expr::Starred(s) => names(&s.value, at, out),
+            _ => {}
+        }
+    }
+    impl<'a> ruff_python_ast::visitor::Visitor<'a> for V {
+        fn visit_stmt(&mut self, s: &'a Stmt) {
+            let end = s.range().end().to_usize();
+            match s {
+                Stmt::FunctionDef(_) | Stmt::ClassDef(_) => return,
+                Stmt::Assign(a) => a.targets.iter().for_each(|t| names(t, end, &mut self.out)),
+                Stmt::AugAssign(a) => names(&a.target, end, &mut self.out),
+                Stmt::AnnAssign(a) if a.value.is_some() => names(&a.target, end, &mut self.out),
+                Stmt::Delete(d) => d.targets.iter().for_each(|t| names(t, end, &mut self.out)),
+                Stmt::For(f) => names(
+                    &f.target,
+                    f.target.range().start().to_usize(),
+                    &mut self.out,
+                ),
+                Stmt::With(w) => {
+                    for item in &w.items {
+                        if let Some(t) = item.optional_vars.as_deref() {
+                            names(t, t.range().start().to_usize(), &mut self.out);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            ruff_python_ast::visitor::walk_stmt(self, s);
+        }
+        fn visit_expr(&mut self, e: &'a Expr) {
+            match e {
+                Expr::Lambda(_) => return,
+                Expr::Named(n) => names(&n.target, n.range.end().to_usize(), &mut self.out),
+                _ => {}
+            }
+            ruff_python_ast::visitor::walk_expr(self, e);
+        }
+    }
+    use ruff_python_ast::visitor::Visitor;
+    let mut v = V { out: Vec::new() };
+    for s in body {
+        v.visit_stmt(s);
+    }
+    v.out
+}
+
+/// Widen the narrowings of names a closure created at offset `at` captures
+/// but the enclosing body reassigns after `at`, or anywhere inside a loop
+/// around `at` (the back-edge re-runs earlier assignments after the closure
+/// exists). Such a closure may run after the reassignment, so the narrowing
+/// in force where it is written does not hold inside it: `if v is not None:
+/// f = lambda: v.upper(); v = None; f()` (review 2026-10-03 §4.8).
+fn widen_captured_names(c: &mut Checker, at: usize) {
+    let Some(sites) = c.assign_sites.last() else {
+        return;
+    };
+    let loops: Vec<(usize, usize)> = c
+        .loop_exits
+        .iter()
+        .map(|f| f.range)
+        .filter(|r| r.0 <= at && at < r.1)
+        .collect();
+    let stale: Vec<String> = sites
+        .iter()
+        .filter(|(_, off)| *off > at || loops.iter().any(|r| r.0 <= *off && *off < r.1))
+        .map(|(n, _)| n.clone())
+        .collect();
+    for name in stale {
+        c.env.widen_to_declared(&name);
+    }
+}
+
+/// Flow effects of an expression that has just been inferred, applied in
+/// evaluation order: a call may rewrite fields its callee can reach, and a
+/// `yield` hands control to the caller, which may change any object.
+fn after_expr_effects(c: &mut Checker, expr: &Expr) {
+    match expr {
+        Expr::Call(call) => {
+            // A direct call to a nested `def` that rebinds a local through
+            // `nonlocal` resets exactly that local.
+            if let Expr::Name(f) = call.func.as_ref() {
+                if let Some(names) = c.nonlocal_writer_calls.get(f.id.as_str()).cloned() {
+                    c.env.reset_local_narrowings(&names);
+                }
+            }
+            invalidate_after_call(c, call);
+        }
+        // The caller runs between `yield` and the next statement; any field
+        // it can see may have changed (review 2026-10-03 §3.11).
+        Expr::Yield(_) | Expr::YieldFrom(_) => c.env.attr_narrowings.clear(),
+        _ => {}
+    }
+}
+
+/// Pop a comprehension's scope, carrying out the names a walrus inside it
+/// bound: PEP 572 binds them in the enclosing scope, holding the *last*
+/// value assigned — whatever the filter's narrowing said about each one —
+/// so they come out at their declared type. They used to vanish with the
+/// scope, leaving `u` in `[u for v in xs if (u := v) is not None]` an
+/// unchecked `Unknown` afterwards when it may hold `None` (review
+/// 2026-10-03 §3.11).
+fn leave_comprehension_scope(c: &mut Checker, comp: &Expr) {
+    let carried: Vec<TypeBinding> = walrus_targets_in(comp)
+        .iter()
+        .filter_map(|n| c.env.scopes.last().and_then(|s| s.get(n.as_str())).cloned())
+        .collect();
+    c.env.leave();
+    for mut b in carried {
+        b.narrowed = b.declared.clone();
+        c.env.declare(b);
+    }
+}
+
+/// Names bound by a walrus anywhere in `expr` (not inside a nested lambda).
+fn walrus_targets_in(expr: &Expr) -> Vec<String> {
+    use ruff_python_ast::visitor::{walk_expr, Visitor};
+    struct V(Vec<String>);
+    impl<'a> Visitor<'a> for V {
+        fn visit_expr(&mut self, e: &'a Expr) {
+            match e {
+                Expr::Lambda(_) => return,
+                Expr::Named(n) => {
+                    if let Expr::Name(t) = n.target.as_ref() {
+                        self.0.push(t.id.as_str().to_owned());
+                    }
+                }
+                _ => {}
+            }
+            walk_expr(self, e);
+        }
+    }
+    let mut v = V(Vec::new());
+    v.visit_expr(expr);
+    v.0
+}
+
+/// Drop the field narrowings a call may have made stale — on its receiver,
+/// on every bare-name argument, and, for a callee known to write fields
+/// `F`, on every path through a field in `F` (an alias of any object may
+/// have reached it: `h.reset()` where `h.b is b`). Runs for every call as
+/// it is inferred, so `let n: int = clear(b)` and `print(clear(b),
+/// b.value + 1)` are covered, not only a call in statement position
+/// (review 2026-10-03 §3.11, GPT-6 Codex F04).
+fn invalidate_after_call(c: &mut Checker, call: &ruff_python_ast::ExprCall) {
+    if c.env.attr_narrowings.is_empty() {
+        return;
+    }
+    let effect = call_arg_effect(c, call);
+    if let Expr::Attribute(recv_attr) = call.func.as_ref() {
+        if let Some(recv_path) = attr_path_of(&recv_attr.value) {
+            invalidate_receiver_fields(c, &recv_attr.value, &recv_path, &effect);
+        }
+    }
+    for arg in call
+        .arguments
+        .args
+        .iter()
+        .chain(call.arguments.keywords.iter().map(|k| &k.value))
+    {
+        if let Expr::Name(n) = arg {
+            invalidate_arg_fields(c, n.id.as_str(), &effect);
+        }
+    }
+    if let ArgEffect::Fields(fields) = &effect {
+        let frozen_roots: HashSet<String> = c
+            .env
+            .attr_narrowings
+            .keys()
+            .filter_map(|k| k.split('.').next())
+            .filter(|root| {
+                matches!(
+                    c.env.lookup(root).map(|b| &b.narrowed),
+                    Some(Type::Class(n)) if c.frozen_classes.contains(n.as_str())
+                )
+            })
+            .map(str::to_owned)
+            .collect();
+        c.env.attr_narrowings.retain(|k, _| {
+            let mut segs = k.split('.');
+            let root = segs.next().unwrap_or("");
+            let skip = usize::from(frozen_roots.contains(root));
+            !segs.skip(skip).any(|s| fields.contains(s))
+        });
+    }
+}
+
+/// The object expression an attribute target writes into (`a.b` in
+/// `a.b.c = v`).
+fn attr_base(target: &Expr) -> Option<&Expr> {
+    match target {
+        Expr::Attribute(a) => Some(&a.value),
+        _ => None,
+    }
+}
+
+/// The static type of the object that owns the last field of `path`
+/// (`p.addr` for `p.addr.city`), following declared field types from the
+/// root binding. `None` when any step is unknown.
+fn path_owner_type(c: &Checker, path: &str) -> Option<Type> {
+    let segs: Vec<&str> = path.split('.').collect();
+    let (root, fields) = segs.split_first()?;
+    let mut t = c.env.lookup(root)?.narrowed.clone();
+    for (i, f) in fields.iter().enumerate() {
+        if i + 1 == fields.len() {
+            return Some(t);
+        }
+        let partial = segs[..=i + 1].join(".");
+        t = match c.env.attr_narrowed(&partial) {
+            Some(n) => n.clone(),
+            None => match t.strip_none() {
+                Type::Class(name) => c.find_field(&name, f)?.clone(),
+                _ => return None,
+            },
+        };
+    }
+    None
+}
+
+/// Whether two objects of static types `a` and `b` can be the same object:
+/// some class of one is the other or a subclass of it. Anything this cannot
+/// decide may alias.
+fn may_alias(c: &Checker, a: &Type, b: &Type) -> bool {
+    let classes = |t: &Type| -> Option<Vec<String>> {
+        match t.strip_none() {
+            Type::Class(n) => Some(vec![n]),
+            Type::Union(xs) => xs
+                .iter()
+                .map(|x| match x {
+                    Type::Class(n) => Some(n.clone()),
+                    Type::None => Some("None".to_owned()),
+                    _ => None,
+                })
+                .collect(),
+            _ => None,
+        }
+    };
+    let (Some(xs), Some(ys)) = (classes(a), classes(b)) else {
+        return true;
+    };
+    xs.iter().any(|x| {
+        ys.iter().any(|y| {
+            x == y
+                || !c.class_hierarchy_fully_known(x)
+                || !c.class_hierarchy_fully_known(y)
+                || c.class_inherits_from(x, y)
+                || c.class_inherits_from(y, x)
+        })
+    })
+}
+
+/// After `<owner>.field = value`, drop the narrowings of `field` on other
+/// objects that may be the same object and whose narrowed type `value` no
+/// longer fits — `keep` (the written path itself) excepted. Before, every
+/// `*.field` narrowing went, so `if src.name is not None: dst.name =
+/// src.name; src.name.upper()` was rejected, and so was `p.email` after an
+/// unrelated `acc.email = "x"` (review 2026-10-03 §4.4). Paths *below* an
+/// aliased `field` always go: the object they read through was replaced.
+fn clear_aliased_field_narrowings(
+    c: &mut Checker,
+    field: &str,
+    keep: &str,
+    owner: &Type,
+    value: &Type,
+) {
+    let suffix = format!(".{field}");
+    let inner = format!(".{field}.");
+    let stale: Vec<String> = c
+        .env
+        .attr_narrowings
+        .iter()
+        .filter(|(k, _)| k.as_str() != keep)
+        .filter_map(|(k, narrowed)| {
+            let ends = k.ends_with(&suffix);
+            let below = k.contains(&inner);
+            if !ends && !below {
+                return None;
+            }
+            let field_path = if ends {
+                k.clone()
+            } else {
+                k[..k.find(&inner)? + suffix.len()].to_owned()
+            };
+            let aliases = path_owner_type(c, &field_path).is_none_or(|o| may_alias(c, &o, owner));
+            if !aliases {
+                return None;
+            }
+            let still_fits = ends
+                && !below
+                && !matches!(value, Type::Unknown | Type::Any)
+                && c.is_assignable(narrowed, value);
+            (!still_fits).then(|| k.clone())
+        })
+        .collect();
+    for k in stale {
+        c.env.clear_attr_narrowing(&k);
+    }
+}
+
+/// Bind the `as` name of an `except` handler to what it catches: the class
+/// of `except ValueError as e`, the union of `except (A, B) as e`, and
+/// `BaseException` for a bare `except … as e` (which cannot be written,
+/// but a type the checker cannot read gives `Unknown`). It was never bound,
+/// so `return Err(e)` in a `-> Result[int, str]`, `let m: int = e` and
+/// `e.code` where only one of `(A, B)` has `code` all passed (review
+/// 2026-10-03 §3.2). `except*` binds an `ExceptionGroup`, left `Unknown`.
+fn bind_except_name(c: &mut Checker, h: &ruff_python_ast::ExceptHandlerExceptHandler, star: bool) {
+    let Some(name) = &h.name else {
+        return;
+    };
+    let ty = if star {
+        Type::Unknown
+    } else {
+        match h.type_.as_deref() {
+            None => Type::Class("BaseException".to_owned()),
+            Some(Expr::Tuple(tup)) => {
+                let members: Vec<Type> = tup
+                    .elts
+                    .iter()
+                    .map(|e| type_from_annotation(e, &c.classes))
+                    .collect();
+                if members
+                    .iter()
+                    .any(|m| matches!(m, Type::Unknown | Type::Any))
+                {
+                    Type::Unknown
+                } else {
+                    Type::union_of(members)
+                }
+            }
+            Some(e) => match type_from_annotation(e, &c.classes) {
+                t @ (Type::Class(_) | Type::Generic(..)) => t,
+                _ => Type::Unknown,
+            },
+        }
+    };
+    let start = name.range.start().to_usize();
+    c.env.declare(TypeBinding {
+        name: name.as_str().to_owned(),
+        declared: ty.clone(),
+        narrowed: ty,
+        span: (start, start + name.as_str().len()),
+        from_unsafe: c.unsafe_depth > 0,
+    });
 }
 
 /// Evaluate an expression appearing in statement position, invalidating global
@@ -12263,10 +13521,12 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             let mut ann_type = if bare_final {
                 Type::Unknown
             } else {
-                type_from_annotation(&a.annotation, &c.classes)
+                c.expand_nullable_aliases(&type_from_annotation(&a.annotation, &c.classes))
             };
+            let mut init_type: Option<Type> = None;
             if let Some(value) = &a.value {
                 let value_type = infer_expr_ctx(c, value, Some(&ann_type));
+                init_type = Some(value_type.clone());
                 // A call in the RHS may reassign a module global via
                 // `global NAME` in the callee, staling a caller narrowing on
                 // that global. Reset for subsequent statements (mirrors the
@@ -12354,10 +13614,28 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 if c.env.lookup(n.id.as_str()).is_some() {
                     c.reassigned_names.insert(n.id.as_str().to_owned());
                 }
+                // A nullable declaration with a definitely non-`None`
+                // initializer starts out narrowed, exactly as the same value
+                // assigned on the next line would narrow it: `mut x: int? = 5`
+                // is an `int` until something rebinds it. Without this a loop
+                // that re-assigns `x` from an `int` left `x` nullable after
+                // the loop once loop exits were joined (review 2026-10-03,
+                // W1-06 / W1-07).
+                let narrowed = match &init_type {
+                    Some(v)
+                        if ann_type.is_nullable()
+                            && !v.is_nullable()
+                            && !matches!(v, Type::Unknown | Type::Any | Type::None)
+                            && c.is_assignable(&ann_type, v) =>
+                    {
+                        ann_type.strip_none()
+                    }
+                    _ => ann_type.clone(),
+                };
                 c.env.declare(TypeBinding {
                     name: n.id.as_str().to_owned(),
-                    declared: ann_type.clone(),
-                    narrowed: ann_type,
+                    declared: ann_type,
+                    narrowed,
                     span,
                     from_unsafe,
                 });
@@ -12505,11 +13783,21 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         // the same field narrowed under any OTHER root goes too
                         // (review 2026-09-30 §3.8).
                         if let Some(field) = path.rsplit('.').next() {
-                            c.env.clear_attr_narrowings_of_field(field, &path);
+                            let owner = attr_base(target)
+                                .map(|b| infer_expr_readonly(c, b))
+                                .unwrap_or(Type::Unknown);
+                            clear_aliased_field_narrowings(c, field, &path, &owner, &value_type);
                         }
                         if !value_type.is_nullable() && !matches!(value_type, Type::Unknown) {
                             c.env.narrow_attr(path, value_type.clone());
                         }
+                    } else if let Expr::Attribute(a) = target {
+                        // `reg["k"].v = None` / `hs[0].name = None`: the object
+                        // has no access path, so it may be any object of a
+                        // compatible type whose `v` is narrowed (review
+                        // 2026-10-03 §3.11, §4.8).
+                        let owner = infer_expr_readonly(c, &a.value);
+                        clear_aliased_field_narrowings(c, a.attr.as_str(), "", &owner, &value_type);
                     }
                 } else if matches!(target, Expr::Tuple(_) | Expr::List(_)) {
                     // Tuple/list unpack. A `let`/`mut` form introduces fresh
@@ -12608,11 +13896,16 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         .unwrap_or(Type::Unknown)
                 })
                 .collect();
+            let params: Vec<Type> = params
+                .iter()
+                .map(|p| c.expand_nullable_aliases(p))
+                .collect();
             let ret = f
                 .returns
                 .as_deref()
                 .map(|r| type_from_annotation_with_params(r, &classes, &tps))
                 .unwrap_or(Type::Unknown);
+            let ret = c.expand_nullable_aliases(&ret);
             // An `async def` value is a coroutine-returning callable (see the
             // module-level signature pass for the same wrapping).
             let ret = if f.is_async {
@@ -13098,6 +14391,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // narrowing snapshot has been restored.
             let narrowings = collect_narrowings(c, &w.test, /*negate=*/ false);
             let snap_pre = c.env.snapshot();
+            let pre_loop = snap_pre.clone();
             // Iteration-2 soundness: a name reassigned inside the body holds,
             // at the top of the second and later passes, whatever the previous
             // pass last assigned — not the pre-loop narrowed value. Widen those
@@ -13115,34 +14409,47 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // ending in one is still widened (`body_always_leaves_loop`).
             widen_loop_carried_narrowings(c, &w.body);
             apply_narrowings(c, &narrowings);
+            c.loop_exits.push(LoopExits {
+                range: (w.range.start().to_usize(), w.range.end().to_usize()),
+                ..LoopExits::default()
+            });
             for s in &w.body {
                 check_stmt(c, s);
             }
-            c.env.restore(snap_pre);
-            // `while ... else:` runs exactly when the loop test became
-            // false without a `break`, so the negated narrowing holds
-            // at the top of the orelse block — the dual of the
-            // positive narrowing applied to the body. Mirrors the
-            // `if` checker's else-branch handling.
+            let exits = c.loop_exits.pop().unwrap_or_default();
+            drop(snap_pre);
+            // The loop head — where TEST is evaluated again — is reached
+            // before the first pass, from the end of the body and from every
+            // `continue`; it holds only what all three agree on. Restoring the
+            // pre-loop env here instead (as before) let a narrowing the body
+            // invalidated survive the loop: `while running: x = None` left a
+            // pre-loop `x: int` narrowing in force after it (review
+            // 2026-10-03, W1-07).
+            let mut head_states = vec![c.env.snapshot(), pre_loop];
+            head_states.extend(exits.continues);
+            if let Some(head) = join_envs(head_states) {
+                c.env.restore(head);
+            }
+            // `while ... else:` runs exactly when TEST became false without a
+            // `break`, so the negated narrowing holds at the top of the
+            // `else` block and on the natural exit — `while y is None:
+            // y = load()` leaves `y` non-`None` (B25).
             let neg = collect_narrowings(c, &w.test, /*negate=*/ true);
-            let snap_pre = c.env.snapshot();
             apply_narrowings(c, &neg);
             for s in &w.orelse {
                 check_stmt(c, s);
             }
-            c.env.restore(snap_pre);
-            // B25: post-loop narrowing. A `while TEST: BODY` that has
-            // no `break` in the body can only exit through TEST going
-            // false (the natural-exit path) — so the negation of TEST
-            // holds at the join point after the loop. Apply the
-            // negated narrowings persistently so code like
-            //   while y is None: y = load()
-            //   return y + 1            # y is `int` here
-            // checks cleanly. A `break` inside the body would leave
-            // the loop while TEST is still true; in that case we have
-            // no information at the join and skip the apply.
-            if !body_can_break(&w.body) {
-                apply_narrowings(c, &neg);
+            // After the loop: the natural exit (unless TEST is constant
+            // true, or the `else` always leaves) joined with every `break`.
+            let natural_exit = !is_constant_true(&w.test)
+                && (w.orelse.is_empty() || !body_always_exits(&w.orelse));
+            let mut post_states = Vec::new();
+            if natural_exit {
+                post_states.push(c.env.snapshot());
+            }
+            post_states.extend(exits.breaks);
+            if let Some(post) = join_envs(post_states) {
+                c.env.restore(post);
             }
         }
         Stmt::For(f) => {
@@ -13181,6 +14488,8 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // unmodelled shapes (`Unknown`, user classes, bare containers)
             // fall back to `Unknown` so we stay permissive.
             let elem_ty = iterable_element_type(&iter_ty).unwrap_or(Type::Unknown);
+            // The zero-iteration path: the env before the target is bound.
+            let pre_loop = c.env.snapshot();
             // Bind the loop target(s). A tuple target (`for k, v in d.items()`)
             // destructures the element `tuple[K, V]` per slot; previously only
             // a bare `Expr::Name` target was bound and tuple slots fell to
@@ -13196,8 +14505,45 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // every path) — there is then no back-edge, so no stale carry to
             // widen. A `continue` still reaches the back-edge, so it is widened.
             widen_loop_carried_narrowings(c, &f.body);
+            c.loop_exits.push(LoopExits {
+                range: (f.range.start().to_usize(), f.range.end().to_usize()),
+                ..LoopExits::default()
+            });
             for s in &f.body {
                 check_stmt(c, s);
+            }
+            let exits = c.loop_exits.pop().unwrap_or_default();
+            // The iterator is re-polled before the first pass, after the end
+            // of the body and after every `continue`; exhausting it there
+            // runs the `else` block and leaves the loop. The body's state
+            // used to flow straight on, as if the loop always ran to the end
+            // at least once, and the `else` block was never checked at all
+            // (review 2026-10-03, W1-06).
+            let mut head_states = vec![c.env.snapshot(), pre_loop];
+            head_states.extend(exits.continues);
+            if let Some(head) = join_envs(head_states) {
+                c.env.restore(head);
+            }
+            for s in &f.orelse {
+                check_stmt(c, s);
+            }
+            let mut post_states = Vec::new();
+            if f.orelse.is_empty() || !body_always_exits(&f.orelse) {
+                post_states.push(c.env.snapshot());
+            }
+            post_states.extend(exits.breaks);
+            if let Some(post) = join_envs(post_states) {
+                c.env.restore(post);
+            }
+        }
+        Stmt::Break(_) => {
+            if let Some(frame) = c.loop_exits.last_mut() {
+                frame.breaks.push(c.env.snapshot());
+            }
+        }
+        Stmt::Continue(_) => {
+            if let Some(frame) = c.loop_exits.last_mut() {
+                frame.continues.push(c.env.snapshot());
             }
         }
         Stmt::Expr(e) => {
@@ -13210,43 +14556,8 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             if c.call_can_rebind() && expr_contains_call(&e.value) {
                 reset_globals_after_call(c);
             }
-            // A bare method-call statement (`self.reset()`, `conn.close()`) may
-            // mutate a field of its receiver, so a prior attribute narrowing
-            // (`if self.x is not None:`) is stale afterwards. Clear narrowings
-            // rooted at the receiver. Scoped to a call in *statement* position
-            // (an almost-always-mutating side-effect call) to avoid the
-            // false positives that invalidating on every nested method call
-            // would cause on the common `self.helper(); self.x.foo()` shape.
-            // `await self.reset()` parses as `Await(Call(...))`, so peel a
-            // leading `await` before the call match — the awaited form is just
-            // as mutating a statement-position call as the sync one, and the
-            // alpha.2 fix only matched the bare `Call`.
-            let call_expr = match e.value.as_ref() {
-                Expr::Await(a) => a.value.as_ref(),
-                other => other,
-            };
-            if let Expr::Call(call) = call_expr {
-                if let Expr::Attribute(recv_attr) = call.func.as_ref() {
-                    if let Some(recv_path) = attr_path_of(&recv_attr.value) {
-                        c.env.clear_attr_narrowing(&recv_path);
-                    }
-                }
-                // An object handed to a call in statement position
-                // (`clear(b)`, `self.reset(b)`) can have its fields rewritten
-                // by the callee just as a method call on it can, so the
-                // narrowings rooted at every bare-name argument are stale
-                // too (review 2026-09-30 §3.8).
-                for arg in call
-                    .arguments
-                    .args
-                    .iter()
-                    .chain(call.arguments.keywords.iter().map(|k| &k.value))
-                {
-                    if let Expr::Name(n) = arg {
-                        c.env.clear_attr_narrowing(n.id.as_str());
-                    }
-                }
-            }
+            // Field narrowings a call can invalidate are dropped as each call
+            // is inferred, in evaluation order (see `invalidate_after_call`).
         }
         Stmt::AugAssign(a) => {
             // The target can run a call too: `xs[bump()] += 1`.
@@ -13397,6 +14708,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 for path in &body_writes.attrs {
                     c.env.clear_attr_narrowing(path);
                 }
+                bind_except_name(c, h, t.is_star);
                 for s in &h.body {
                     check_stmt(c, s);
                 }
@@ -13468,8 +14780,26 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // narrowing the caller held on such a global, exactly as a call in
             // any other statement position does (`eval_stmt_expr`).
             let subject_type = eval_stmt_expr(c, &m.subject);
+            // Types already fully matched by an earlier unguarded arm
+            // (`case Fish():`, `case None:`). A later arm only sees what is
+            // left, so `case _:` after `case Fish():` over `Dog | Cat | Fish`
+            // narrows the subject to `Dog | Cat` (review 2026-10-03 §4.1/§4.7).
+            let mut excluded: Vec<Type> = Vec::new();
             for case in &m.cases {
                 check_pattern_class_fields(c, &case.pattern);
+                check_alias_class_patterns(c, &case.pattern);
+                let residual = match m.subject.as_ref() {
+                    Expr::Name(_) if !excluded.is_empty() => {
+                        let expanded = expand_sealed_alias_for_narrowing(c, &subject_type);
+                        let mut rest = expanded.clone();
+                        for x in &excluded {
+                            rest = strip_variant(&rest, x);
+                        }
+                        (rest != expanded && !matches!(rest, Type::Unknown)).then_some(rest)
+                    }
+                    _ => None,
+                };
+                let case_subject = residual.clone().unwrap_or_else(|| subject_type.clone());
                 // Enter scope and bind pattern names FIRST so guard expressions
                 // (e.g. `case Circle(radius=r) if r > 0:`) can reference them.
                 // A class pattern narrows the *subject variable* inside the
@@ -13487,12 +14817,13 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 // sound conservative choice there.
                 let narrow_to = match m.subject.as_ref() {
                     Expr::Name(_) => pattern_narrowed_type(&case.pattern)
-                        .filter(|t| c.is_assignable(&subject_type, t)),
+                        .filter(|t| c.is_assignable(&subject_type, t))
+                        .or_else(|| residual.clone()),
                     _ => None,
                 };
                 let snap = narrow_to.as_ref().map(|_| c.env.snapshot());
                 c.env.enter();
-                bind_pattern_names(c, &case.pattern, &subject_type);
+                bind_pattern_names(c, &case.pattern, &case_subject);
                 if let (Expr::Name(subj), Some(t)) = (m.subject.as_ref(), narrow_to) {
                     c.env.narrow(subj.id.as_str(), t);
                 }
@@ -13506,6 +14837,11 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 c.env.leave();
                 if let Some(snap) = snap {
                     c.env.restore(snap);
+                }
+                if case.guard.is_none() {
+                    if let Some(t) = irrefutable_pattern_type(&case.pattern) {
+                        excluded.push(t);
+                    }
                 }
             }
             // Exhaustiveness check: sealed unions and enums (both are
@@ -13526,6 +14862,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     m.subject.range().end().to_usize(),
                 );
                 if let Some(variants) = c.sealed_unions.get(union_name.as_str()).cloned() {
+                    let variants = flatten_sealed_variants(c, &variants);
                     check_match_exhaustiveness(c, &m.cases, union_name, &variants, subject_span);
                 } else if let Some(members) = c.enums.get(union_name.as_str()).cloned() {
                     check_enum_match_exhaustiveness(
@@ -13535,7 +14872,11 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         &members,
                         subject_span,
                     );
+                } else {
+                    check_closed_match_exhaustiveness(c, &m.cases, &subject_type, &m.subject);
                 }
+            } else {
+                check_closed_match_exhaustiveness(c, &m.cases, &subject_type, &m.subject);
             }
         }
         // `assert <test>` permanently narrows subsequent code in the
@@ -13721,7 +15062,9 @@ fn check_function(
     let (name, name_span_offset, name_span_len) = name_info;
     let classes = c.classes.clone();
     let ret_type = match returns {
-        Some(r) => type_from_annotation_with_params(r, &classes, type_params),
+        Some(r) => {
+            c.expand_nullable_aliases(&type_from_annotation_with_params(r, &classes, type_params))
+        }
         None => Type::Unknown,
     };
 
@@ -13846,6 +15189,12 @@ fn check_function(
     // of a nested `def` — `leave()` only pops this body's own scope, so without
     // this restore the mutation to an outer frame's `narrowed` field persists.
     let saved_scope_narrowings = c.env.snapshot_scope_narrowings();
+    // A captured name the enclosing body reassigns after this `def` (or
+    // inside a loop around it) may hold any of those values when the body
+    // runs, so its narrowing at the `def` does not hold inside (review
+    // 2026-10-03 §4.8). Undone by the restore above on exit.
+    widen_captured_names(c, name_span_offset);
+    c.assign_sites.push(collect_assign_sites(body));
     c.env.enter();
     // Attribute narrowings (`self.x` non-null) belong to the enclosing
     // function body — a different `self` is in scope here, so start clean.
@@ -13857,10 +15206,9 @@ fn check_function(
     // Locals a nested `def` of THIS body declares `nonlocal` (see
     // `nonlocals_rebound_by_call`); the enclosing function's set is
     // restored on exit.
-    let saved_nonlocals = std::mem::replace(
-        &mut c.nonlocals_rebound_by_call,
-        collect_nested_nonlocals(body),
-    );
+    let (escaped_nonlocals, writer_calls) = collect_nonlocal_writers(body);
+    let saved_nonlocals = std::mem::replace(&mut c.nonlocals_rebound_by_call, escaped_nonlocals);
+    let saved_writer_calls = std::mem::replace(&mut c.nonlocal_writer_calls, writer_calls);
 
     // Declare parameters with their annotation types. Type parameters resolve
     // to `Any` until a real inference engine lands. Inside a class body, an
@@ -13882,7 +15230,11 @@ fn check_function(
         let is_self_receiver = positional_first_name.as_deref() == Some(param_name)
             && (param_name == "self" || param_name == "cls");
         let t = match &pwd.parameter.annotation {
-            Some(ann) => type_from_annotation_with_params(ann, &classes, type_params),
+            Some(ann) => c.expand_nullable_aliases(&type_from_annotation_with_params(
+                ann,
+                &classes,
+                type_params,
+            )),
             None => {
                 if is_self_receiver {
                     // `extend BUILTIN:` is lowered to a
@@ -14014,10 +15366,12 @@ fn check_function(
     }
 
     c.env.leave();
+    c.assign_sites.pop();
     c.env.restore_scope_narrowings(saved_scope_narrowings);
     c.env.attr_narrowings = saved_attr_narrowings;
     c.reassigned_names = saved_reassigned_names;
     c.nonlocals_rebound_by_call = saved_nonlocals;
+    c.nonlocal_writer_calls = saved_writer_calls;
     c.current_return = saved_return;
     c.unsafe_origin_bindings = saved_unsafe_origins;
     c.active_typevar_bounds = saved_bounds;
@@ -16031,15 +17385,16 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
         Type::Class(n) => n.as_str(),
         Type::Generic(head, _) => {
             if head == "Result" {
-                let variants = ["Ok", "Err"];
-                let mut covered: HashSet<&str> = HashSet::new();
-                for case in cases {
-                    if case.guard.is_some() {
-                        continue;
-                    }
-                    collect_matched_class_names(&case.pattern, &mut covered);
-                }
-                return variants.iter().all(|&v| covered.contains(v));
+                // `Ok` and `Err`, each with its payload checked against the
+                // `Result`'s own `T` / `E` where those are closed sets — so
+                // `Err(NotFound())` + `Err(Timeout())` does not cover a
+                // `Denied` member of `E` (review 2026-10-03 §3.3).
+                let pats: Vec<&Pattern> = cases
+                    .iter()
+                    .filter(|cs| cs.guard.is_none())
+                    .map(|cs| &cs.pattern)
+                    .collect();
+                return missing_cases(c, &pats, ty, 0).is_some_and(|m| m.is_empty());
             }
             head.as_str()
         }
@@ -16052,6 +17407,7 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
         _ => return false,
     };
     if let Some(variants) = c.sealed_unions.get(class_name).cloned() {
+        let variants = flatten_sealed_variants(c, &variants);
         let mut covered: HashSet<&str> = HashSet::new();
         let mut covered_with_guards: HashSet<&str> = HashSet::new();
         let mut has_guarded_wildcard = false;
@@ -16755,7 +18111,9 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                                     let replacement = if !negate {
                                         Some(guard_args[0].clone())
                                     } else if head == "TypeIs" {
-                                        Some(strip_variant(&b.narrowed, &guard_args[0]))
+                                        let base = pending_name_narrowing(out, target.id.as_str())
+                                            .unwrap_or_else(|| b.narrowed.clone());
+                                        Some(strip_variant_expanding(c, &base, &guard_args[0]))
                                     } else {
                                         None
                                     };
@@ -16776,8 +18134,13 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                         let new_type = type_from_annotation(&pos_args[1], &c.classes);
                         if let Some(b) = c.env.lookup(target.id.as_str()) {
                             let replacement = if negate {
-                                // Best-effort: strip the type out of the union.
-                                strip_variant(&b.narrowed, &new_type)
+                                // Strip the type out of the union, starting from
+                                // what an earlier operand of the same condition
+                                // already narrowed it to, and seeing through a
+                                // sealed-union alias (review 2026-10-03 §4.1).
+                                let base = pending_name_narrowing(out, target.id.as_str())
+                                    .unwrap_or_else(|| b.narrowed.clone());
+                                strip_variant_expanding(c, &base, &new_type)
                             } else {
                                 // Preserve generic parameters when narrowing
                                 // `Result[T, E]` against `Ok` or `Err`.
@@ -16805,13 +18168,12 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                         // reassignment.
                         if let Some(path) = attr_path_of(&pos_args[0]) {
                             let new_type = type_from_annotation(&pos_args[1], &c.classes);
-                            let current = c
-                                .env
-                                .attr_narrowed(&path)
-                                .cloned()
+                            let current = pending_attr_narrowing(out, &path)
+                                .filter(|_| negate)
+                                .or_else(|| c.env.attr_narrowed(&path).cloned())
                                 .unwrap_or_else(|| infer_expr_readonly(c, &pos_args[0]));
                             let replacement = if negate {
-                                strip_variant(&current, &new_type)
+                                strip_variant_expanding(c, &current, &new_type)
                             } else {
                                 refine_isinstance_target(&current, &new_type)
                             };
@@ -16867,6 +18229,42 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                             name: n.id.as_str().to_owned(),
                             attr_path: None,
                             replacement: b.narrowed.strip_none(),
+                        });
+                    }
+                }
+            }
+        }
+        Expr::Named(nd) => {
+            // `(xs := d.get("a"))` is truthy-tested like the name it binds:
+            // `if (xs := …) and len(xs) > 0` (review 2026-10-03 §4.7).
+            if !negate {
+                if let Expr::Name(n) = nd.target.as_ref() {
+                    if let Some(b) = c.env.lookup(n.id.as_str()) {
+                        if b.narrowed.is_nullable() {
+                            out.push(Narrowing {
+                                name: n.id.as_str().to_owned(),
+                                attr_path: None,
+                                replacement: b.narrowed.strip_none(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Expr::Attribute(_) => {
+            // Truthy narrowing on an attribute path, the counterpart of the
+            // `Name` arm: `if head.nxt: head.nxt.v`, `if not self.data:
+            // return`, `a.b.v if a.b else 0`, `a.b and a.b.v > 5`. Only the
+            // true branch narrows, for the same reason (review 2026-10-03
+            // §4.2).
+            if !negate {
+                if let Some(path) = attr_path_of(test) {
+                    let current = attr_expr_type_with_pending(c, test, out);
+                    if current.is_nullable() {
+                        out.push(Narrowing {
+                            name: String::new(),
+                            attr_path: Some(path),
+                            replacement: current.strip_none(),
                         });
                     }
                 }
@@ -17771,13 +19169,145 @@ fn strip_variant(typ: &Type, variant: &Type) -> Type {
         return out;
     }
     if let Type::Union(xs) = typ {
-        let kept: Vec<Type> = xs.iter().filter(|t| *t != variant).cloned().collect();
+        let kept: Vec<Type> = xs
+            .iter()
+            .filter(|t| !same_runtime_class(t, variant))
+            .cloned()
+            .collect();
         Type::union_of(kept)
-    } else if typ == variant {
+    } else if same_runtime_class(typ, variant) {
         Type::Unknown
     } else {
         typ.clone()
     }
+}
+
+/// Whether every value of `member` is an instance of the class `variant`
+/// names, for the negative branch of `isinstance`: equal types, or a
+/// parameterised builtin container against its bare class —
+/// `isinstance(x, list)` removes `list[int]` (review 2026-10-03 §4.7).
+fn same_runtime_class(member: &Type, variant: &Type) -> bool {
+    if member == variant {
+        return true;
+    }
+    let head = match variant {
+        Type::Class(h) => h.as_str(),
+        Type::Generic(h, args) if args.is_empty() => h.as_str(),
+        _ => return false,
+    };
+    match member {
+        Type::Generic(h, _) => {
+            h == head
+                || (head == "tuple" && h == "tuple_variadic")
+                || (head == "dict"
+                    && matches!(h.as_str(), "defaultdict" | "OrderedDict" | "Counter"))
+        }
+        _ => false,
+    }
+}
+
+/// Expand every sealed-union alias in `t` — the alias itself, a union that
+/// contains one (`Pet?`), or an alias nested inside another
+/// (`type Shape = Circle | Poly`, `type Poly = Rect | Tri`) — into the union
+/// of its leaf variant classes.
+///
+/// A sealed union declared with `type Event = A | B` is a `Type::Class("Event")`
+/// until something expands it, and `strip_variant` compares by equality, so
+/// stripping `A` from the unexpanded alias removed nothing: the negative
+/// branch of `isinstance(e, A)` kept the whole union, and the union member
+/// check then rejected `e.b_field` on correct code (review 2026-10-03 §4.1,
+/// a regression from the 09-30 union member check). Parametric aliases expand
+/// to bare variant classes, matching `expand_sealed_union_alias`.
+fn expand_sealed_alias_for_narrowing(c: &Checker, t: &Type) -> Type {
+    fn walk(c: &Checker, t: &Type, depth: usize, out: &mut Vec<Type>) {
+        if depth > 32 {
+            out.push(t.clone());
+            return;
+        }
+        let name = match t {
+            Type::Union(xs) => {
+                for x in xs {
+                    walk(c, x, depth + 1, out);
+                }
+                return;
+            }
+            Type::Class(n) => n.as_str(),
+            Type::Generic(n, _) if !is_builtin_generic_head(n) => n.as_str(),
+            _ => {
+                out.push(t.clone());
+                return;
+            }
+        };
+        // Only aliases whose every variant is a user class expand: a
+        // variant named after a builtin (`type IntTree = int | list[…]`)
+        // would become a nominal `Class("int")`, which is not `int`.
+        let user_class = |v: &String| {
+            !is_builtin_generic_head(v)
+                && !matches!(
+                    v.as_str(),
+                    "int"
+                        | "str"
+                        | "float"
+                        | "bool"
+                        | "bytes"
+                        | "bytearray"
+                        | "complex"
+                        | "object"
+                        | "type"
+                        | "None"
+                )
+        };
+        match c.sealed_unions.get(name) {
+            Some(variants) if !variants.is_empty() && variants.iter().all(user_class) => {
+                for v in variants {
+                    walk(c, &Type::Class(v.clone()), depth + 1, out);
+                }
+            }
+            _ => out.push(t.clone()),
+        }
+    }
+    let mut out = Vec::new();
+    walk(c, t, 0, &mut out);
+    Type::union_of(out)
+}
+
+/// `strip_variant`, seeing through sealed-union aliases. The expanded form
+/// is only used when it actually removes something, so a type the variant
+/// has nothing to do with keeps its original (alias) spelling.
+fn strip_variant_expanding(c: &Checker, typ: &Type, variant: &Type) -> Type {
+    let direct = strip_variant(typ, variant);
+    if direct != *typ {
+        return direct;
+    }
+    let expanded = expand_sealed_alias_for_narrowing(c, typ);
+    if expanded == *typ {
+        return direct;
+    }
+    let stripped = strip_variant(&expanded, &expand_sealed_alias_for_narrowing(c, variant));
+    if stripped == expanded || matches!(stripped, Type::Unknown) {
+        direct
+    } else {
+        stripped
+    }
+}
+
+/// The type an earlier operand of the same condition has already narrowed
+/// `name` to, if any. `not (isinstance(p, A) or isinstance(p, B))` narrows
+/// `p` twice; each step must start from the previous one, or the last
+/// replacement (computed from the declared type) silently undoes the first.
+fn pending_name_narrowing(out: &[Narrowing], name: &str) -> Option<Type> {
+    out.iter()
+        .rev()
+        .find(|n| n.attr_path.is_none() && n.name == name)
+        .map(|n| n.replacement.clone())
+}
+
+/// Attribute-path counterpart of [`pending_name_narrowing`].
+fn pending_attr_narrowing(out: &[Narrowing], path: &str) -> Option<Type> {
+    out.iter()
+        .rev()
+        .find(|n| n.attr_path.as_deref() == Some(path))
+        .map(|n| n.replacement.clone())
 }
 
 fn apply_narrowings(c: &mut Checker, ns: &[Narrowing]) {
@@ -18074,7 +19604,20 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
         return Type::Unknown;
     }
     c.infer_depth.set(depth + 1);
-    let result = infer_expr_ctx_inner(c, expr, expected);
+    let result = match expr {
+        // A lambda body runs later, when captured names may have been
+        // reassigned; check it without their narrowings, and let nothing it
+        // does leak into the enclosing flow.
+        Expr::Lambda(lam) => {
+            let snap = c.env.snapshot();
+            widen_captured_names(c, lam.range.start().to_usize());
+            let r = infer_expr_ctx_inner(c, expr, expected);
+            c.env.restore(snap);
+            r
+        }
+        _ => infer_expr_ctx_inner(c, expr, expected),
+    };
+    after_expr_effects(c, expr);
     c.infer_depth.set(depth);
     result
 }
@@ -18755,6 +20298,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 // `@runtime_checkable` are exempt — the user acknowledged the
                 // weaker guarantee.
                 if fn_name.id.as_str() == "isinstance" && pos_args.len() == 2 {
+                    check_isinstance_alias(c, &pos_args[1]);
                     if let Expr::Name(t) = &pos_args[1] {
                         if let Some(iface) = c.interfaces.get(t.id.as_str()) {
                             if !iface.runtime_checkable {
@@ -20587,7 +22131,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             c.env.enter();
             infer_comprehension_generators(c, &comp.generators);
             let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
-            c.env.leave();
+            leave_comprehension_scope(c, expr);
             c.env.restore_scope_narrowings(comp_saved);
             // A comprehension builds a *fresh* list, so — like a list literal —
             // it takes the annotated element type whenever every element fits
@@ -20606,7 +22150,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             c.env.enter();
             infer_comprehension_generators(c, &comp.generators);
             let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
-            c.env.leave();
+            leave_comprehension_scope(c, expr);
             c.env.restore_scope_narrowings(comp_saved);
             let elt = widen_fresh_element(c, elt, elt_expected.as_ref());
             Type::Generic("set".into(), vec![elt])
@@ -20624,7 +22168,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             c.env.enter();
             infer_comprehension_generators(c, &comp.generators);
             let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
-            c.env.leave();
+            leave_comprehension_scope(c, expr);
             c.env.restore_scope_narrowings(comp_saved);
             // A generator expression is an `Iterator[T]`.
             Type::Generic("Iterator".into(), vec![elt])
@@ -20668,7 +22212,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     c.mismatch(ve, &v, span);
                 }
             }
-            c.env.leave();
+            leave_comprehension_scope(c, expr);
             c.env.restore_scope_narrowings(comp_saved);
             Type::Generic("dict".into(), vec![k, v])
         }
@@ -20786,11 +22330,10 @@ fn assign_unpacking_target(c: &mut Checker, target: &Expr, elem_ty: &Type) {
         }
         // `(self.x, y) = (None, 1)` rebinds the attribute, so any narrowing on
         // that path — and on anything below it — is stale.
-        Expr::Attribute(_) => {
-            if let Some(path) = attr_path_of(target) {
-                c.env.clear_attr_narrowing(&path);
-            }
-        }
+        Expr::Attribute(a) => match attr_path_of(target) {
+            Some(path) => c.env.clear_attr_narrowing(&path),
+            None => c.env.clear_attr_narrowings_of_field(a.attr.as_str(), ""),
+        },
         Expr::Tuple(t) => {
             let slots: Option<&Vec<Type>> = match elem_ty {
                 Type::Generic(h, a) if h == "tuple" && a.len() == t.elts.len() => Some(a),
@@ -21526,11 +23069,425 @@ fn check_match_exhaustiveness(
     }
 }
 
+/// The leaf variants of a sealed union, with nested sealed aliases expanded:
+/// `type Shape = Circle | Poly`, `type Poly = Rect | Tri` → `Circle, Rect,
+/// Tri`. Only the leaves are classes a `case` can name; `Poly` itself is a
+/// `TypeAliasType` (review 2026-10-03 §3.5).
+fn flatten_sealed_variants(c: &Checker, variants: &[String]) -> Vec<String> {
+    fn walk(c: &Checker, vs: &[String], depth: usize, out: &mut Vec<String>) {
+        for v in vs {
+            match c.sealed_unions.get(v.as_str()) {
+                Some(inner) if depth < 32 && !c.class_shapes.contains_key(v.as_str()) => {
+                    walk(c, inner, depth + 1, out)
+                }
+                _ => {
+                    if !out.contains(v) {
+                        out.push(v.clone());
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(c, variants, 0, &mut out);
+    out
+}
+
+/// Whether `name` is a `type` alias rather than a class: a sealed union
+/// (local or imported) or any `type X = …` statement of this module.
+fn is_type_alias_name(c: &Checker, name: &str) -> bool {
+    (c.sealed_unions.contains_key(name) || c.pep695_aliases.contains(name))
+        && !c.class_shapes.contains_key(name)
+        && !c.enums.contains_key(name)
+}
+
+/// `Rect() | Tri()` / `(Rect, Tri)` for an alias's leaf variants, for the
+/// `alias_not_a_class` help text.
+fn alias_variant_fix(c: &Checker, alias: &str, isinstance: bool) -> String {
+    let leaves = c
+        .sealed_unions
+        .get(alias)
+        .map(|v| flatten_sealed_variants(c, v))
+        .unwrap_or_default();
+    if leaves.is_empty() {
+        return format!("use the classes `{alias}` stands for instead");
+    }
+    if isinstance {
+        format!(
+            "test its variants instead: `isinstance(x, ({}))`",
+            leaves.join(", ")
+        )
+    } else {
+        let arms: Vec<String> = leaves.iter().map(|l| format!("{l}()")).collect();
+        format!("match its variants instead: `case {}:`", arms.join(" | "))
+    }
+}
+
+/// Report a `type` alias used as a `match` class pattern, anywhere in
+/// `pattern` (review 2026-10-03 §3.5).
+fn check_alias_class_patterns(c: &mut Checker, pattern: &Pattern) {
+    match pattern {
+        Pattern::MatchClass(mc) => {
+            if let Expr::Name(n) = mc.cls.as_ref() {
+                let name = n.id.as_str();
+                if is_type_alias_name(c, name) {
+                    let fix = alias_variant_fix(c, name, false);
+                    let span = (n.range.start().to_usize(), n.range.end().to_usize());
+                    c.alias_not_a_class(name, &format!("`case {name}():`"), &fix, span);
+                }
+            }
+            for p in &mc.arguments.patterns {
+                check_alias_class_patterns(c, p);
+            }
+            for k in &mc.arguments.keywords {
+                check_alias_class_patterns(c, &k.pattern);
+            }
+        }
+        Pattern::MatchAs(a) => {
+            if let Some(inner) = &a.pattern {
+                check_alias_class_patterns(c, inner);
+            }
+        }
+        Pattern::MatchOr(o) => o
+            .patterns
+            .iter()
+            .for_each(|p| check_alias_class_patterns(c, p)),
+        Pattern::MatchSequence(s) => s
+            .patterns
+            .iter()
+            .for_each(|p| check_alias_class_patterns(c, p)),
+        Pattern::MatchMapping(m) => m
+            .patterns
+            .iter()
+            .for_each(|p| check_alias_class_patterns(c, p)),
+        Pattern::MatchStar(_) | Pattern::MatchValue(_) | Pattern::MatchSingleton(_) => {}
+    }
+}
+
+/// Report a `type` alias as `isinstance`'s second argument, alone or in a
+/// tuple (review 2026-10-03 §3.5).
+fn check_isinstance_alias(c: &mut Checker, arg: &Expr) {
+    let names: Vec<&ruff_python_ast::ExprName> = match arg {
+        Expr::Name(n) => vec![n],
+        Expr::Tuple(t) => t
+            .elts
+            .iter()
+            .filter_map(|e| match e {
+                Expr::Name(n) => Some(n),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    for n in names {
+        let name = n.id.as_str();
+        if is_type_alias_name(c, name) {
+            let fix = alias_variant_fix(c, name, true);
+            let span = (n.range.start().to_usize(), n.range.end().to_usize());
+            c.alias_not_a_class(name, &format!("`isinstance(x, {name})`"), &fix, span);
+        }
+    }
+}
+
+/// Pattern coverage of a closed type, for `match` exhaustiveness and
+/// `missing_return` (review 2026-10-03 §3.3). `Some(missing)` lists what of
+/// `ty` no pattern in `pats` matches — empty when they are exhaustive —
+/// and `None` when `ty` is not a set this check can decompose (an open
+/// `str` matched only by literals).
+///
+/// Leaf user classes stay as lenient as the sealed-union check has always
+/// been: any class pattern naming the class (or a base) covers it,
+/// whatever its sub-patterns. Only `Ok` / `Err` payloads are followed into.
+fn missing_cases(c: &Checker, pats: &[&Pattern], ty: &Type, depth: usize) -> Option<Vec<String>> {
+    fn flatten<'a>(p: &'a Pattern, out: &mut Vec<&'a Pattern>) {
+        match p {
+            Pattern::MatchAs(a) => match &a.pattern {
+                Some(inner) => flatten(inner, out),
+                None => out.push(p),
+            },
+            Pattern::MatchOr(o) => o.patterns.iter().for_each(|q| flatten(q, out)),
+            _ => out.push(p),
+        }
+    }
+    fn class_name(p: &Pattern) -> Option<&str> {
+        match p {
+            Pattern::MatchClass(mc) => match mc.cls.as_ref() {
+                Expr::Name(n) => Some(n.id.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    // `int()` / `int(x)`: a builtin class pattern with irrefutable
+    // sub-patterns matches every value of that builtin.
+    fn builtin_total(pats: &[&Pattern], builtin: &str) -> bool {
+        pats.iter().any(|p| match p {
+            Pattern::MatchClass(mc) => {
+                class_name(p) == Some(builtin)
+                    && mc.arguments.keywords.is_empty()
+                    && mc.arguments.patterns.iter().all(is_capture_or_underscore)
+            }
+            _ => false,
+        })
+    }
+    if depth > 16 {
+        return None;
+    }
+    let mut flat: Vec<&Pattern> = Vec::new();
+    for p in pats {
+        flatten(p, &mut flat);
+    }
+    if flat.iter().any(|p| is_wildcard_pattern(p)) {
+        return Some(Vec::new());
+    }
+    match ty {
+        Type::Union(xs) => {
+            let mut missing = Vec::new();
+            for x in xs {
+                missing.extend(missing_cases(c, &flat, x, depth + 1)?);
+            }
+            Some(missing)
+        }
+        Type::None => {
+            let covered = flat.iter().any(|p| {
+                matches!(p, Pattern::MatchSingleton(s) if matches!(s.value, ruff_python_ast::Singleton::None))
+            });
+            Some(if covered {
+                Vec::new()
+            } else {
+                vec!["None".to_owned()]
+            })
+        }
+        Type::Bool => {
+            if builtin_total(&flat, "bool") || builtin_total(&flat, "int") {
+                return Some(Vec::new());
+            }
+            let mut missing = Vec::new();
+            for (v, name) in [(true, "True"), (false, "False")] {
+                if !flat.iter().any(|p| pattern_bool_value(p) == Some(v)) {
+                    missing.push(name.to_owned());
+                }
+            }
+            Some(missing)
+        }
+        Type::LitStr(s) => {
+            let covered = builtin_total(&flat, "str")
+                || flat
+                    .iter()
+                    .any(|p| pattern_str_value(p).as_deref() == Some(s.as_str()));
+            Some(if covered {
+                Vec::new()
+            } else {
+                vec![format!("{s:?}")]
+            })
+        }
+        Type::Int | Type::Str | Type::Float | Type::Bytes => {
+            let name = match ty {
+                Type::Int => "int",
+                Type::Str => "str",
+                Type::Float => "float",
+                _ => "bytes",
+            };
+            builtin_total(&flat, name).then(Vec::new)
+        }
+        Type::Generic(h, args) if h == "Result" && args.len() == 2 => {
+            let mut missing = result_half(c, &flat, "Ok", &args[0], depth);
+            missing.extend(result_half(c, &flat, "Err", &args[1], depth));
+            Some(missing)
+        }
+        Type::Generic(h, args) if (h == "Ok" || h == "Err") && args.len() == 1 => {
+            Some(result_half(c, &flat, h, &args[0], depth))
+        }
+        Type::Class(name) | Type::Generic(name, _) => {
+            let name = name.as_str();
+            if let Some(members) = c.enums.get(name) {
+                let mut covered: HashSet<&str> = HashSet::new();
+                for p in &flat {
+                    let _ = enum_pattern_covered_members(p, name, &mut covered);
+                }
+                return Some(
+                    members
+                        .iter()
+                        .filter(|m| !covered.contains(m.as_str()))
+                        .map(|m| format!("{name}.{m}"))
+                        .collect(),
+                );
+            }
+            if let Some(variants) = c.sealed_unions.get(name) {
+                let leaves = flatten_sealed_variants(c, variants);
+                let user_class = |v: &String| {
+                    !is_builtin_generic_head(v)
+                        && !matches!(
+                            v.as_str(),
+                            "int" | "str" | "float" | "bool" | "bytes" | "None" | "object"
+                        )
+                };
+                if !leaves.iter().all(user_class) {
+                    return None;
+                }
+                let mut missing = Vec::new();
+                for v in &leaves {
+                    missing.extend(missing_cases(c, &flat, &Type::Class(v.clone()), depth + 1)?);
+                }
+                return Some(missing);
+            }
+            if let Some((params, rhs)) = c.type_aliases.get(name) {
+                if params.is_empty() && !matches!(rhs, Type::Unknown | Type::Any) {
+                    let rhs = rhs.clone();
+                    return missing_cases(c, &flat, &rhs, depth + 1);
+                }
+                return None;
+            }
+            if !c.class_shapes.contains_key(name) {
+                return None;
+            }
+            let covered = flat.iter().any(|p| {
+                class_name(p).is_some_and(|n| n == name || c.class_inherits_from(name, n))
+            });
+            Some(if covered {
+                Vec::new()
+            } else {
+                vec![name.to_owned()]
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The `Ok` or `Err` half of a `Result` coverage check: `[ctor]` when no
+/// arm matches that constructor at all, `ctor(<missing>)` for the parts of
+/// the payload type `inner` its arms leave out, nothing when they cover it
+/// — or when `inner` is an open type the payload patterns cannot be checked
+/// against (the arms are then trusted, as before).
+fn result_half(
+    c: &Checker,
+    flat: &[&Pattern],
+    ctor: &str,
+    inner: &Type,
+    depth: usize,
+) -> Vec<String> {
+    let field = if ctor == "Ok" { "value" } else { "error" };
+    let mut subs: Vec<&Pattern> = Vec::new();
+    let mut any = false;
+    for p in flat {
+        let Pattern::MatchClass(mc) = p else {
+            continue;
+        };
+        let Expr::Name(n) = mc.cls.as_ref() else {
+            continue;
+        };
+        if n.id.as_str() != ctor {
+            continue;
+        }
+        any = true;
+        match (
+            mc.arguments.patterns.first(),
+            mc.arguments
+                .keywords
+                .iter()
+                .find(|k| k.attr.as_str() == field),
+        ) {
+            (Some(sp), _) => subs.push(sp),
+            (None, Some(k)) => subs.push(&k.pattern),
+            // `Ok()` matches every `Ok`.
+            (None, None) => return Vec::new(),
+        }
+    }
+    if !any {
+        return vec![ctor.to_owned()];
+    }
+    match missing_cases(c, &subs, inner, depth + 1) {
+        Some(m) => m.into_iter().map(|x| format!("{ctor}({x})")).collect(),
+        None => Vec::new(),
+    }
+}
+
+/// The type a closed-subject exhaustiveness check runs against, when the
+/// subject is a closed set the sealed-union and enum checks do not see:
+/// `Result[…]`, `bool`, a string literal or literal union, or a union that
+/// includes `None` (review 2026-10-03 §3.3). A transparent alias resolves
+/// to its right-hand side.
+fn closed_match_subject(c: &Checker, t: &Type, depth: usize) -> Option<Type> {
+    if depth > 8 {
+        return None;
+    }
+    match t {
+        Type::Generic(h, _) if matches!(h.as_str(), "Result" | "Ok" | "Err") => Some(t.clone()),
+        Type::Bool | Type::LitStr(_) => Some(t.clone()),
+        Type::Union(xs) if xs.iter().any(|x| matches!(x, Type::None | Type::LitStr(_))) => {
+            Some(t.clone())
+        }
+        Type::Class(n) => match c.type_aliases.get(n.as_str()) {
+            Some((params, rhs)) if params.is_empty() => closed_match_subject(c, rhs, depth + 1),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `tyc::non_exhaustive_match` for a closed subject (see
+/// [`closed_match_subject`]): `Err(Denied)` missing from a `Result` match,
+/// `None` from a match over `int?`, `False` from a match over `bool`.
+fn check_closed_match_exhaustiveness(
+    c: &mut Checker,
+    cases: &[MatchCase],
+    subject_type: &Type,
+    subject: &Expr,
+) {
+    let Some(closed) = closed_match_subject(c, subject_type, 0) else {
+        return;
+    };
+    let pats: Vec<&Pattern> = cases
+        .iter()
+        .filter(|cs| cs.guard.is_none())
+        .map(|cs| &cs.pattern)
+        .collect();
+    if let Some(missing) = missing_cases(c, &pats, &closed, 0) {
+        if !missing.is_empty() {
+            let span = (
+                subject.range().start().to_usize(),
+                subject.range().end().to_usize(),
+            );
+            c.non_exhaustive_match(&subject_type.display(), &missing.join(", "), span);
+        }
+    }
+}
+
 /// The type a class pattern narrows its match subject to inside the arm:
 /// `case Action(...)` → `Action`; `case A() | B()` → `A | B`;
 /// `case Action() as a` → `Action`. Returns `None` for patterns that
 /// don't pin down a class (wildcards, captures, literals, sequences,
 /// mappings) — the subject keeps its declared type in those arms.
+/// The type a pattern matches *every* value of, when it does: a class
+/// pattern whose sub-patterns are all bare captures / wildcards
+/// (`Fish()`, `Fish(f)`), `None`, an `as` around one, or an or-pattern of
+/// them. Used to narrow later `match` arms to what is left.
+fn irrefutable_pattern_type(pattern: &Pattern) -> Option<Type> {
+    fn is_bare(p: &Pattern) -> bool {
+        matches!(p, Pattern::MatchAs(a) if a.pattern.is_none())
+    }
+    match pattern {
+        Pattern::MatchClass(mc)
+            if mc.arguments.patterns.iter().all(is_bare)
+                && mc.arguments.keywords.iter().all(|k| is_bare(&k.pattern)) =>
+        {
+            pattern_narrowed_type(pattern)
+        }
+        Pattern::MatchSingleton(s) if matches!(s.value, ruff_python_ast::Singleton::None) => {
+            Some(Type::None)
+        }
+        Pattern::MatchAs(a) => a.pattern.as_deref().and_then(irrefutable_pattern_type),
+        Pattern::MatchOr(or) => {
+            let mut parts = Vec::with_capacity(or.patterns.len());
+            for p in &or.patterns {
+                parts.push(irrefutable_pattern_type(p)?);
+            }
+            Some(Type::union_of(parts))
+        }
+        _ => None,
+    }
+}
+
 fn pattern_narrowed_type(pattern: &Pattern) -> Option<Type> {
     match pattern {
         Pattern::MatchClass(mc) => match mc.cls.as_ref() {
@@ -22255,6 +24212,24 @@ fn collect_pattern_capture_names(p: &Pattern, out: &mut Vec<String>) {
 /// not a union of candidates — a subclass pattern over a base-typed subject —
 /// and to the subject itself when the pattern says nothing about the type.
 fn as_capture_type(c: &Checker, subject: &Type, inner: &Pattern) -> Type {
+    // `case Dog() | Cat() as an:` captures whatever any alternative matched,
+    // not the whole subject (review 2026-10-03 §4.1).
+    if let Pattern::MatchOr(or) = inner {
+        return Type::union_of(
+            or.patterns
+                .iter()
+                .map(|p| as_capture_type(c, subject, p))
+                .collect(),
+        );
+    }
+    // A sealed-union alias subject is a single `Class("Pet")` that every
+    // variant is assignable to; expand it so the variants can be filtered.
+    let expanded = expand_sealed_alias_for_narrowing(c, subject);
+    let subject = if matches!(inner, Pattern::MatchClass(_)) {
+        &expanded
+    } else {
+        subject
+    };
     let head = match inner {
         Pattern::MatchClass(mc) => match mc.cls.as_ref() {
             Expr::Name(n) => n.id.as_str().to_owned(),
@@ -38080,3 +40055,6 @@ def main() -> None:
         }
     }
 }
+
+#[cfg(test)]
+mod flow_tests;

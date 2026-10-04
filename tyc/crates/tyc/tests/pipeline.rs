@@ -1118,7 +1118,9 @@ fn vm_run_binds_forward_declared_sealed_union_alias() {
     // for `from shapes import AB` — the eager bind falls back to a name
     // placeholder, corrected by the post-body resolution pass before the
     // module's attributes are snapshotted. Regression for the Codex review
-    // on PR #187.
+    // on PR #187. (The import itself fails if the binding is missing. The
+    // test used to also print `isinstance(A(v=1), AB)`, which CPython
+    // rejects with `TypeError` and is now `tyc::alias_not_a_class`.)
     let project = tempfile::tempdir().unwrap();
     let src = project.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
@@ -1143,8 +1145,7 @@ fn vm_run_binds_forward_declared_sealed_union_alias() {
                     case A(v):\n            return v\n        \
                     case B(v):\n            return v * 2\n\n\
             def main() -> None:\n    \
-                print(pick(B(v=10)))\n    \
-                print(isinstance(A(v=1), AB))\n\n\
+                print(pick(B(v=10)))\n\n\
             if __name__ == \"__main__\":\n    main()\n",
     )
     .unwrap();
@@ -1159,10 +1160,7 @@ fn vm_run_binds_forward_declared_sealed_union_alias() {
         "run with a forward-declared imported alias must succeed: {combined}"
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("20") && stdout.contains("True"),
-        "expected `20` and `True`, got: {combined}"
-    );
+    assert!(stdout.contains("20"), "expected `20`, got: {combined}");
 }
 
 #[test]

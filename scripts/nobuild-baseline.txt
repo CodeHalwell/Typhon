@@ -61,6 +61,7 @@ stress/round-2026-05-20/cases/139_too_many_args.ty
 stress/round-2026-05-20/cases/15_match_guard_missing.ty
 stress/round-2026-05-20/cases/24_pure_violation.ty
 stress/round-2026-05-20/cases/25_pure_io_indirect.ty
+stress/round-2026-05-20/cases/33_unsafe_leak.ty
 stress/round-2026-05-20/cases/39_interface_partial.ty
 stress/round-2026-05-20/cases/42_class_frozen_assign.ty
 stress/round-2026-05-20/cases/45_immutable_violation.ty

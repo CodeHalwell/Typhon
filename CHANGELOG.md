@@ -241,6 +241,144 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
     triple-quoted f-string lifts above the statement like one on a bracket
     continuation line; it was a `tyc::parse` error.
 
+### Fourth wave — 2026-10-03 reviews
+
+#### W1 — checker flow, narrowing, exhaustiveness
+
+- **Narrowing over a sealed-union alias works on the negative branch
+  again (regression from the third wave).** With `type Pet = Dog | Cat | Fish`,
+  the `else` of `isinstance(p, Dog)`, the code after `if isinstance(p, Dog):
+  return`, `not isinstance(p, (Dog, Cat))`, an `… or …` early exit, a
+  ternary, a comprehension filter, a `case _:` after `case Fish():`, and a
+  `case Dog() | Cat() as an:` capture all kept the whole alias, so the
+  third wave's union member check rejected correct code such as `p.fins`.
+  The alias now expands to its variants before a variant is stripped, a
+  second strip in the same condition starts from the first, an unguarded
+  irrefutable arm narrows later arms to what is left, and an or-pattern
+  capture is the union of what its alternatives match. Programs that read a
+  member some variant still lacks are rejected as before.
+- **Passing an object to a call no longer forgets its field narrowings
+  unless the callee can write them (regression from the third wave).**
+  `if it.price is not None: print(it); t += it.price` — and the same with
+  `out.append(it)`, `logging.info("%s", it)`, a local helper that never
+  writes `price`, or any call on a `frozen` object's own fields — was
+  rejected. The checker now summarises, per module, which fields each local
+  function, constructor and method can write (transitively through local
+  calls), and a statement-position call invalidates only those. Builtins,
+  the standard library and methods of builtin values write none; an
+  imported non-stdlib function, a callable parameter, `setattr` and
+  anything else it cannot see may still write any field, so
+  `clear(b)` with `b.value = None` inside stays rejected.
+- **`nullable-use = "error"` stays the default; the narrowing gaps it
+  exposed are closed.** A method call `self.conn.execute(…)` no longer drops
+  the narrowing of `self.conn` itself, only of fields below it that the
+  method can write; `self.log("x")` keeps `self.conn` narrowed unless `log`
+  can write `conn`. Attribute paths now narrow on truthiness like plain
+  names: `if head.nxt: head.nxt.v`, `if not self.data: return`,
+  `head.nxt.v if head.nxt else 0`, `head.nxt and head.nxt.v > 5`.
+- **`match` exhaustiveness covers every closed subject.** A `Result[T, E]`
+  match must handle `Ok` and `Err`, and when `E` (or `T`) is a sealed
+  union, enum, `bool` or literal union, the payload patterns must cover it:
+  the README's `match load(...)` with `Err(NotFound(..))` and
+  `Err(Timeout(..))` now reports `Err(Denied)` missing instead of falling
+  through. A match over `T?` must handle `None` once its arms cover `T`;
+  `bool` and literal-union subjects must cover every value. `missing_return`
+  follows the same rules for `Result`. All forms report
+  `tyc::non_exhaustive_match` and honour `[strictness] exhaustive-match`.
+  Over the example and stress corpus no previously clean unit is rejected.
+- **Nested sealed unions flatten to their leaf classes.** With
+  `type Poly = Rect | Tri` and `type Shape = Circle | Poly`, arms for
+  `Circle`, `Rect` and `Tri` are exhaustive (they used to report "missing
+  Poly").
+- **New `tyc::alias_not_a_class` (error).** `case Poly():` and
+  `isinstance(x, Poly)` on a `type` alias were accepted and raise
+  `TypeError` on CPython (a `type` statement makes a `TypeAliasType`, not a
+  class). The help text lists the variants to match or test instead.
+- **Loops join their exit paths.** The `else:` suite of a `for` loop was
+  never type-checked (`for … else: let bad: str = 1` passed). After a
+  `while` loop the checker restored the pre-loop state, so a narrowing the
+  body invalidated (`while running: x = None`, or `b.v = None`) survived
+  the loop; after a `for` loop the body's state flowed on as if the loop
+  always ran, so `last = v` in the body made a nullable `last` look set even
+  for an empty iterable. The loop head now joins the pre-loop state, the
+  end of the body and every `continue`; after the loop the checker joins
+  the natural exit (the `else` suite, with the negated `while` test) and
+  every `break`. A nullable declaration with a non-`None` initializer
+  (`mut x: int? = 5`) now starts out narrowed, as the same value assigned
+  on the next line would. No previously clean corpus unit changes.
+- **Field narrowings are invalidated wherever a call or write can reach
+  them.** Every call now drops the narrowings its callee can write as it is
+  evaluated, not only a call in statement position: `let n: int = clear(b)`,
+  `print(clear(b), b.value + 1)` and `case 1 if clear(b):` no longer keep a
+  stale `b.value`. A callee known to write field `f` drops `f` on every
+  object, since it may reach one through an alias (`h.reset()` with
+  `h.b is b`). A write through an object with no access path
+  (`reg["k"].v = None`, `hs[0].name = None`) drops that field everywhere.
+  `yield` drops field narrowings, since the caller runs in between. A
+  lambda or nested `def` no longer keeps the narrowing of a captured name
+  that the enclosing body reassigns after it (or inside a loop around it).
+- **Fewer false invalidations.** A field write no longer drops the
+  same-named field's narrowing on every object: only on objects whose
+  static type can alias the written one, and only when the written value no
+  longer fits the narrowing. `if src.name is not None: dst.name = src.name;
+  src.name.upper()` and `acc.email = None` next to an unrelated
+  `p.email` narrowing now check. A nested `def` that rebinds a local
+  through `nonlocal` resets that local only on a call that can reach it
+  (calling it, or a nested `def` that calls it); once it escapes (stored,
+  passed, returned, or a nested class method) every call still resets it,
+  as before.
+- **A `type` alias over a nullable type is nullable.** With
+  `type OptStr = str | None` (or `= str?`, `= User | None`), a parameter,
+  annotated binding, field or return typed `OptStr` was an opaque name to
+  every nullable check: `s.upper()` was accepted and crashes on `None`, and
+  `if s is None: return ""` could not narrow `s`. Such aliases now expand to
+  their right-hand side; messages show `str | None` where they showed
+  `OptStr`.
+- **`except E as e` binds `e` to `E`** (the union for `except (A, B) as
+  e`). It was never bound, so `return Err(e)` in a `-> Result[int, str]`
+  function and `let m: int = e` passed. Block `rescue` lowers to the same
+  handler and is covered too.
+- **`unsafe:` containment follows derived values (deliberate narrowing).**
+  `tyc::unsafe_value_leak` only tracked the bare name, so after
+  `unsafe: let data = json.loads(raw)`, `return data["name"]` from a
+  `-> str` function — and `pair[0]`, `data.count + 1`, `[x for x in data]`,
+  `data.get("k")` or a lambda reading `data` — crossed into typed code
+  unchecked. Values built from an unsafe binding now carry its origin, as
+  Rule 5 specifies. This rejects programs that happen to run correctly when
+  the untyped value has the right shape, in the same way the existing
+  bare-name check does; the stress probe
+  `stress/round-2026-05-20/cases/33_unsafe_leak.ty` is one, and moves to
+  `scripts/nobuild-baseline.txt`. Re-assert at the boundary with
+  `value as! T`, or annotate the binding inside the block. The
+  `unsafe_value_leak` doc page no longer recommends an annotated re-bind
+  outside the block, which is itself reported.
+- **`del NAME` and `except … as NAME` cannot end a `let`.** Both remove the
+  binding (an `except … as` name is deleted when the handler ends), so a
+  module constant or local `let` could vanish and a later read would raise
+  `NameError` / `UnboundLocalError`. Both now report
+  `tyc::immutable_assign`. A `for` or `with … as` target rebinding a `let`
+  stays allowed, as decided in R2-17.
+- **Older narrowing gaps.** `isinstance(x, list)` / `dict` / `tuple` now
+  removes `list[int]` / `dict[…]` / `tuple[…]` on the negative branch; a
+  walrus is truthy-narrowed like the name it binds
+  (`if (xs := d.get("a")) and len(xs) > 0`); and a walrus inside a
+  comprehension binds in the enclosing scope at its declared type, as PEP
+  572 specifies (it used to disappear with the comprehension and read as
+  an unchecked `Unknown`, though it may hold `None`).
+- **The transitive `go_outside_async` scan respects shadowing.** A sync
+  function whose parameter (or local, nested `def` or import) is named like
+  a module-level spawner no longer counts as calling that spawner, so
+  `def schedule(start): start()` called at module level is not reported
+  because a module-level `def start(): go work(1)` exists.
+- **`typing` names used as values need their import.** `Union`, `Optional`,
+  `Any`, `List`/`Dict`/`Set`/`Tuple`/`FrozenSet`, `Type`, `TypeVar`,
+  `Generic`, `Self`, `ClassVar`, `Final`, `Literal` and `NoReturn` stay
+  usable without an import inside annotations and `type` statements, which
+  the emitted module never evaluates; as runtime values (`t is Union`,
+  `TypeVar("T")`, a `Generic[T]` base) they raised `NameError` and now
+  report `tyc::unknown_name`. `Protocol` and the `collections.abc` names
+  are unaffected: the build imports them.
+
 ### Third wave — the 2026-09-30 release-readiness review
 
 **Seven ways a check-clean program could crash, closed.** Each of these
