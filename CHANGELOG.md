@@ -299,6 +299,14 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   optional parameters, writable fields) is described as the checker
   enforces it — the old "optional parameters match in either direction"
   sentence was wrong.
+- Every code `tyc explain --list` prints now has a docs-site section: 44
+  codes had only their `docs/diagnostics` page. They are on the existing
+  catalog pages plus a new *Lints & Performance Advice* page, each with an
+  example checked against the binary, and the catalog index lists every
+  code. A `shipped_docs.rs` test fails when a code the compiler declares is
+  missing from `tyc explain --list`, from `docs/diagnostics/`, or from the
+  docs-site catalog and its index. `missing_initialiser` and
+  `python_semantic_drift` are listed but never emitted; their pages say so.
 - Docs cite only diagnostic codes the binary emits (`tyc explain --list`
   minus `freeze`/`pub`, now language topics), locked in by a guard test.
 - New nullable-operator docs page listing the accepted spellings with the

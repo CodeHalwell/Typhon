@@ -233,6 +233,63 @@ CPython raises `UnboundLocalError` / `NameError` on the path that skipped the as
 
 **Fix:** give the name a default before the branch, loop or `try`, or `return` in the arm that has nothing to assign. Advice-level — the build continues.
 
+## `tyc::no_block_shadow`
+
+A `let` / `mut` inside a nested block re-declares a name the function
+already bound. Python has no block scope, so the inner declaration would
+rebind the outer name rather than create a new one.
+
+```python
+def main(flag: bool) -> None:
+    let x: int = 1
+    if flag:
+        let x: int = 2    # ❌ cannot shadow `x` — Typhon names are function-scoped
+        print(x)
+```
+
+**Fix:** give the inner value its own name (`let inner: int = 2`), or make
+the outer binding `mut` and assign to it. Sibling branches (`if` / `elif` /
+`else`, separate `case` arms) may each declare the same name.
+
+## `tyc::use_of_uninitialised`
+
+A declare-only `let NAME: T` is read on a path where nothing assigned it.
+
+```python
+def pick(cond: bool) -> int:
+    let x: int
+    if cond:
+        x = 5
+    return x    # ❌ `x` may be used before it is initialised
+```
+
+**Fix:** assign on every path that reaches the read (add the `else: x = 10`
+arm), or initialise at the declaration. Branches that `return`, `raise`,
+`break` or `continue` do not need to assign; loop bodies never count, since
+they may run zero times. Ordinary locals get the advice-level
+[`tyc::possibly_unbound`](#tycpossibly_unbound) instead.
+
+## `tyc::missing_initialiser` (not currently emitted)
+
+Listed by `tyc explain --list`, but no check in the current compiler emits
+it. A declare-only `let NAME: T` is legal: the first assignment on each path
+is its initialiser, a read before that reports
+[`tyc::use_of_uninitialised`](#tycuse_of_uninitialised), and a declaration
+that is never assigned or read produces no diagnostic.
+
+## `tyc::empty_collection_no_annotation` (warning)
+
+An empty `[]`, `{}` or `set()` is bound without an annotation, so its element
+type is unknown and later element-type mistakes go unchecked.
+
+```python
+def main() -> None:
+    let xs = []    # ⚠ empty list literal `[]` without a type annotation
+    print(xs)
+```
+
+**Fix:** annotate the binding: `let xs: list[int] = []`.
+
 ## `tyc::shadowing_in_same_scope` (reserved)
 
 Future-reserved diagnostic for confusing shadowing patterns. **Not yet emitted by the compiler.** A `let x` followed by another `let x` in the same scope is currently accepted (Typhon treats it as legitimate shadowing). The diagnostic name is reserved so the eventual rule has a stable code from day one.

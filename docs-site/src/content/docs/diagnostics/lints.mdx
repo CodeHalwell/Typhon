@@ -1,0 +1,167 @@
+---
+title: Lints & Performance Advice
+description: Warning-level lints and the advice-level tyc::perf_* family — none of them fail a build.
+sidebar:
+  order: 12
+---
+
+These diagnostics never fail `tyc check` or `tyc build` at their default
+severity. Warnings (⚠) point at code that works but is risky; advice (☞)
+points at a cheaper way to write the same thing. The compiler never rewrites
+your code for any of them.
+
+## `tyc::resource_not_managed` (warning)
+
+The result of a resource-returning call (`open`, `socket.socket`,
+`sqlite3.connect`, `tempfile.NamedTemporaryFile`, …) is bound without a
+`with`, so it is closed only when the garbage collector gets to it.
+
+```python
+def load_config(path: str) -> str:
+    let f = open(path)    # ⚠ `open(...)` returns a resource that should be managed by `with`
+    return f.read()
+```
+
+**Fix:**
+
+```python
+def load_config(path: str) -> str:
+    with open(path) as f:
+        return f.read()
+```
+
+Severity: `[strictness] require-with` (`"warn"` by default; `"error"` or
+`"off"`).
+
+## `tyc::contains_secret_literal` (warning)
+
+A binding whose name looks like a credential (`API_KEY`, `DB_PASSWORD`,
+`GITHUB_TOKEN`, … — a shared table of keywords matched on word boundaries,
+so `MONKEY` is not `KEY`) holds the secret in the source or in the build
+output. Two forms report it:
+
+- a plain `let` / module-level binding initialised from a string literal —
+  `tyc check` and `tyc build`;
+- a `comptime let` initialised from `env(...)`, whose value `tyc build`
+  inlines into the emitted Python as a literal — reported by `tyc build`.
+
+```python
+let DB_PASSWORD: str = "hunter2"                        # ⚠ looks like a credential
+comptime let API_KEY: str = env("API_KEY", "dev-key")   # ⚠ at tyc build
+```
+
+**Fix:** read the value at runtime (`os.environ["API_KEY"]`).
+`[strictness] allow-secret-comptime = true` silences both forms. The full
+keyword table is on the
+[diagnostic page](https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/contains_secret_literal.md).
+
+## The performance advice family
+
+Gated by [`[strictness] suggest-perf`](/Typhon/configuration/strictness/#suggest-perf)
+(default `true`). Each lint fires only on unambiguous local evidence.
+
+### `tyc::perf_membership_in_loop` (advice)
+
+`x in some_list` in an `if` / `while` condition inside a loop, where the
+list never changes in the loop: each test is a linear scan.
+
+```python
+def count_allowed(kinds: list[str], allowed: list[str]) -> int:
+    mut hits: int = 0
+    for k in kinds:
+        if k in allowed:    # ☞ linear membership scan of list `allowed` repeats on every loop iteration
+            hits += 1
+    return hits
+```
+
+**Fix:** build `let allowed_set: set[str] = set(allowed)` before the loop
+and test against it.
+
+### `tyc::perf_list_shift_in_loop` (advice)
+
+`pop(0)` or `insert(0, …)` on a list inside a loop: each call shifts every
+element.
+
+```python
+def drain(queue: list[int]) -> None:
+    while queue:
+        let item: int = queue.pop(0)    # ☞ `pop(0)` shifts every list element (O(n)) on each loop iteration
+        print(item)
+```
+
+**Fix:** use `collections.deque` and `popleft()` / `appendleft()`.
+
+### `tyc::perf_str_concat_in_loop` (advice)
+
+A `str` grown with `+=` inside a loop copies the whole string each time.
+
+```python
+def render(rows: list[str]) -> str:
+    mut out: str = ""
+    for row in rows:
+        out += row + "\n"    # ☞ string `out` grown by `+=` in a loop is quadratic
+    return out
+```
+
+**Fix:** append the pieces to a `list[str]` and `"".join(...)` once.
+
+### `tyc::perf_sort_in_loop` (advice)
+
+`sorted(xs)` or `xs.sort()` inside a loop on data the loop does not change.
+
+```python
+def firsts(queries: list[int], points: list[int]) -> list[int]:
+    mut out: list[int] = []
+    for q in queries:
+        let ordered: list[int] = sorted(points)    # ☞ a loop-invariant collection is sorted on every iteration
+        out.append(ordered[0] + q)
+    return out
+```
+
+**Fix:** sort once before the loop.
+
+### `tyc::perf_sorted_first` (advice)
+
+`sorted(xs)[0]` or `sorted(xs)[-1]` sorts everything to read one element.
+
+```python
+def cheapest(prices: list[int]) -> int:
+    return sorted(prices)[0]    # ☞ `sorted(...)[0]` sorts the whole sequence to take one element
+```
+
+**Fix:** `min(prices)` / `max(prices)`.
+
+### `tyc::perf_keys_membership` (advice)
+
+`x in d.keys()` builds a view to answer what `x in d` answers directly.
+
+```python
+def has(config: dict[str, int], name: str) -> bool:
+    return name in config.keys()    # ☞ membership test against `.keys()` allocates a view
+```
+
+**Fix:** `name in config`.
+
+### `tyc::lazy_import_opportunity` (advice)
+
+A module-level `import` of a non-stdlib package whose name is used only
+inside function bodies, in a module that is not a script. Every importer
+pays its load time at startup even if it never calls those functions.
+
+```python
+import yaml    # ☞ `yaml` is imported at module scope but used only inside function bodies
+
+def load(text: str) -> object:
+    return yaml.safe_load(text)
+```
+
+**Fix:** `lazy import yaml = yaml` defers the import to the first use
+(native PEP 810 lazy import on a 3.15 target). Stdlib modules, names used at
+module level or in annotations, re-exported names, and script-shaped modules
+(a `main()` or an `if __name__ == "__main__":` guard) are not flagged.
+
+## Where next
+
+- [Performance gotchas](/Typhon/pitfalls/performance/) — the same family with more context.
+- [`[strictness]`](/Typhon/configuration/strictness/) — the severity knobs.
+- [Reading Diagnostics](/Typhon/diagnostics/reading/) — the format and the full index.

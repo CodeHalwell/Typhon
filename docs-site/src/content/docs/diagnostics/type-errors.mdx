@@ -229,6 +229,134 @@ comptime let PORT: int = int(env("PORT"))    # ❌ if PORT is not declared in [e
 
 **Fix:** declare the env var in `[env] required`, supply a default via `env("NAME", "fallback")`, or simplify the expression to a comptime-supported form (literals, arithmetic, `env(...)`, `int()` / `str()` / `float()`).
 
+## `tyc::missing_argument`
+
+A call leaves one or more required parameters unfilled. The message names
+them, which [`tyc::arg_count`](#tycarg_count) cannot do once some arguments
+were passed by keyword.
+
+```python
+def connect(host: str, port: int, timeout: float = 5.0) -> None:
+    print(host, port, timeout)
+
+def main() -> None:
+    connect(timeout=2.0)    # ❌ missing required arguments to `connect`: `host`, `port`
+```
+
+**Fix:** pass the named arguments: `connect("localhost", 8080, timeout=2.0)`.
+
+## `tyc::missing_return`
+
+A function declares a non-`None` return type, but some path reaches the end
+of the body without `return` or `raise` — Python would return `None` there.
+
+```python
+def classify(n: int) -> str:
+    if n > 0:
+        return "positive"
+    if n < 0:
+        return "negative"
+    # ❌ falls off the end when n == 0
+```
+
+**Fix:** cover the path (`return "zero"`), or widen the return type to
+`str?`. A call that cannot return — `sys.exit(...)`, `os.abort()`,
+`assert False`, a function declared `-> NoReturn` — counts as an exit. A
+`match` that is not exhaustive (see [Match Errors](/Typhon/diagnostics/match-errors/))
+leaves a path open and reports this code as well.
+
+## `tyc::operator_type_mismatch`
+
+A binary operator is applied to operand types Python rejects at runtime
+(`str + int`, `list + dict`, `1 in "abc"`), or to two distinct `newtype`s
+that share a base.
+
+```python
+def main() -> None:
+    let result: str = "x" + 1    # ❌ unsupported operand types for `+`: `str` and `int`
+    print(result)
+```
+
+**Fix:** convert one side (`"x" + str(1)`). The check only fires when both
+operand types are fully known and neither is a user class that may define
+its own operator method.
+
+## `tyc::tuple_index_out_of_range`
+
+A constant index into a fixed-arity tuple is out of range.
+
+```python
+def main() -> None:
+    let t: tuple[int, int] = (1, 2)
+    print(t[2])    # ❌ tuple has 2 element(s); index 2 is out of range
+```
+
+**Fix:** use an index in range, or a homogeneous `tuple[int, ...]` if the
+length really varies.
+
+## `tyc::kind_mismatch`
+
+A higher-kinded type parameter (`F[_]`) is applied to the wrong number of
+type arguments, or bound to two different constructors in one call.
+
+```python
+class Functor[F[_]]:
+    pass
+
+impl[F[_]] Functor[F]:
+    def both[A](self, x: F[A], y: F[A]) -> None:
+        return None
+
+def main() -> None:
+    let xs: list[int] = [1, 2, 3]
+    let ss: set[int] = {1, 2, 3}
+    Functor().both(xs, ss)    # ❌ type constructor `F` is bound to both `list` and `set`
+```
+
+**Fix:** pass arguments whose outer constructors agree (two `list`s here),
+and apply `F` to exactly as many arguments as its kind declares.
+
+## `tyc::implicit_any`
+
+A bare collection annotation (`list`, `dict`, `tuple`, `set`, `frozenset`)
+on a binding has no element type, so it would mean `list[Any]`.
+
+```python
+def main() -> None:
+    let names: list = ["a", "b"]    # ❌ bare `list` annotation has implicit `Any` element type
+    print(names)
+```
+
+**Fix:** spell out the element types: `let names: list[str] = ["a", "b"]`.
+
+## `tyc::div_by_zero_literal`
+
+`/`, `//` or `%` with a literal zero divisor (`0`, `0.0`, `-0`, `-0.0`)
+always raises `ZeroDivisionError`.
+
+```python
+def average(values: list[float]) -> float:
+    return sum(values) / 0    # ❌ division by literal zero
+```
+
+**Fix:** divide by the real quantity and guard the empty case. The check is
+constant-folding only; a variable divisor is never flagged.
+
+```python
+def average(values: list[float]) -> float?:
+    if len(values) == 0:
+        return None
+    return sum(values) / len(values)
+```
+
+## `tyc::python_semantic_drift` (not currently emitted)
+
+Listed by `tyc explain --list` and kept for the case where Typhon rejects an
+expression CPython accepts — a checker bug, reported as a warning so builds
+keep working while the rule is fixed. No check in the current compiler
+emits it. If `tyc check` rejects code that runs correctly on CPython, file
+an issue with the snippet.
+
 ## Suppressed inside `unsafe:`
 
 Most type-checking diagnostics are suppressed inside an `unsafe:` block — the type checker tracks an `unsafe_depth` and stops emitting errors while it is greater than zero. Boundary checks at assignment sites *outside* the block still apply. See [The Unsafe Boundary](/Typhon/types/unsafe/).

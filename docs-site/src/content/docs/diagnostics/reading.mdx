@@ -45,20 +45,20 @@ error[tyc::nullable_use]: cannot pass `str | None` where `str` is required
 
 ## Stable codes
 
-Every diagnostic has a `tyc::*` code. The catalog is enumerated across the following pages, grouped by what triggers them:
+Every diagnostic has a `tyc::*` code, and every code `tyc explain --list` prints has a section on one of the pages below, grouped by what triggers them (a test in `tyc/crates/tyc/tests/shipped_docs.rs` keeps it that way). The cards after the first eleven are release notes, not an index:
 
 <CardGrid>
   <Card title="Type & Inference Errors" icon="warning">
-    [→](/Typhon/diagnostics/type-errors/) — `missing_annotation`, `type_mismatch`, `arg_count`, `not_callable`, `unknown_name`, `attribute_not_found`, `generic`, `typevar_bound`, `generator_return_type`, `cyclic_type_alias`, `comptime`, `operator_type_mismatch`, `tuple_index_out_of_range`, `python_semantic_drift`.
+    [→](/Typhon/diagnostics/type-errors/) — `missing_annotation`, `type_mismatch`, `arg_count`, `missing_argument`, `missing_return`, `not_callable`, `unknown_name`, `attribute_not_found`, `generic`, `typevar_bound`, `generator_return_type`, `cyclic_type_alias`, `comptime`, `operator_type_mismatch`, `tuple_index_out_of_range`, `kind_mismatch`, `implicit_any`, `div_by_zero_literal`, `python_semantic_drift` (not currently emitted).
   </Card>
   <Card title="Binding Errors" icon="document">
-    [→](/Typhon/diagnostics/binding-errors/) — `missing_binding_kind`, `immutable_assign`, `unused_import`, `no_block_shadow`, `pattern_shadows_outer`, `mutable_default_param`, `loop_closure_capture`, `is_literal_comparison`.
+    [→](/Typhon/diagnostics/binding-errors/) — `missing_binding_kind`, `immutable_assign`, `unused_import`, `pattern_shadows_outer`, `mutable_default_param`, `loop_closure_capture`, `is_literal_comparison`, `possibly_unbound`, `no_block_shadow`, `use_of_uninitialised`, `missing_initialiser` (not currently emitted), `empty_collection_no_annotation`.
   </Card>
   <Card title="Nullability Errors" icon="puzzle">
     [→](/Typhon/diagnostics/nullability/) — `nullable_use`.
   </Card>
   <Card title="Class Errors" icon="setting">
-    [→](/Typhon/diagnostics/class-errors/) — `manual_init`, `frozen_assign`, `method_in_class_body`, `duplicate_class`, `impl_unknown_class`, `extend_builtin`, `class_attr_shadows_slot`, `self_outside_impl`, `missing_field_init`.
+    [→](/Typhon/diagnostics/class-errors/) — `manual_init`, `frozen_assign`, `method_in_class_body`, `duplicate_class`, `impl_unknown_class`, `missing_field_init`, `extend_builtin`, `class_attr_shadows_slot`, `duplicate_method`, `field_default_ordering`, `frozen_inheritance_conflict`, `newtype_violation`, `newtype_invalid_base`, `self_outside_impl`, `not_a_context_manager`, `raise_non_exception`.
   </Card>
   <Card title="Result Errors" icon="approve-check">
     [→](/Typhon/diagnostics/result-errors/) — `invalid_question_op`, `result_error_mismatch`.
@@ -67,7 +67,7 @@ Every diagnostic has a `tyc::*` code. The catalog is enumerated across the follo
     [→](/Typhon/diagnostics/match-errors/) — `non_exhaustive_match`, `invalid_pattern`, `alias_not_a_class`.
   </Card>
   <Card title="Async Errors" icon="rocket">
-    [→](/Typhon/diagnostics/async-errors/) — `missing_await`, `async_without_await`, `auto_gather_missed`, `interface_isinstance`.
+    [→](/Typhon/diagnostics/async-errors/) — `missing_await`, `async_without_await`, `gather_opportunity`, `auto_gather_missed`, `parallel_opportunity`, `shared_mut_across_tasks`, `return_in_except_star`, `interface_isinstance`, `go_outside_async`, `blocking_in_async`.
   </Card>
   <Card title="Purity Errors" icon="forward-slash">
     [→](/Typhon/diagnostics/purity-errors/) — `impure_pure_fn`.
@@ -76,7 +76,10 @@ Every diagnostic has a `tyc::*` code. The catalog is enumerated across the follo
     [→](/Typhon/diagnostics/stub-errors/) — `stub_mismatch`.
   </Card>
   <Card title="Compile & Interface Errors" icon="error">
-    [→](/Typhon/diagnostics/compile-errors/) — `io`, `parse`, `interface_not_conforming`, `lazy_usage`, `unknown_module`, `unknown_kwarg`, `typevar_import_rejected`, `typing_alias_deprecated`, `freeze_not_freezable`, `incompatible_override`.
+    [→](/Typhon/diagnostics/compile-errors/) — `io`, `parse`, `interface_not_conforming`, `incompatible_override`, `lazy_usage`, `freeze_not_freezable`, `unknown_module`, `unknown_kwarg`, `typevar_import_rejected`, `typing_alias_deprecated`, `typing_alias_in_annotation`, `unsafe_value_leak`, `invalid_config_value`, `pub_name_collision`, `pub_star_outside_init`, `stdlib_module_shadow`, `orphan_py_import`, `main_not_called`.
+  </Card>
+  <Card title="Lints & Performance Advice" icon="rocket">
+    [→](/Typhon/diagnostics/lints/) — `resource_not_managed`, `contains_secret_literal`, `perf_membership_in_loop`, `perf_list_shift_in_loop`, `perf_str_concat_in_loop`, `perf_sort_in_loop`, `perf_sorted_first`, `perf_keys_membership`, `lazy_import_opportunity`.
   </Card>
   <Card title="Phase 5 Interop & Lints" icon="information">
     Added in v0.1.6 — `orphan_py_import` (relative `.py` outside `src/`), `contains_secret_literal` (credential-named comptime literal), `invalid_config_value` (unknown `[emit] class-default` / etc.), `main_not_called` (script defines `main()` but never calls it).

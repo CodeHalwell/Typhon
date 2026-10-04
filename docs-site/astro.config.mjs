@@ -216,6 +216,7 @@ export default defineConfig({
             { label: 'Purity Errors', slug: 'diagnostics/purity-errors' },
             { label: 'Stub Errors', slug: 'diagnostics/stub-errors' },
             { label: 'Compile & Interface Errors', slug: 'diagnostics/compile-errors' },
+            { label: 'Lints & Performance Advice', slug: 'diagnostics/lints' },
           ],
         },
         {
