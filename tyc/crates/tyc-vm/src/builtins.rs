@@ -2449,50 +2449,12 @@ fn compile_shim(
     source: &str,
     seed: Vec<(&str, Value)>,
 ) -> Result<(Vec<(String, Value)>, crate::env::EnvRef), Unwind> {
-    use tyc_syntax::preprocess;
-    let expanded = preprocess::expand_question_ops(&preprocess::expand_inline_question_ops(
-        // Shared with the CLI: the VM omitted both of these, so an
-        // inline `?` (`f(g()?)`, `elif h()? > 1:`) failed to parse under
-        // `tyc run` on a program `tyc build` compiles and runs.
-        &preprocess::expand_compound_question_headers(&preprocess::expand_pipes(
-            &preprocess::expand_with_chains(&preprocess::expand_go_calls(
-                &preprocess::expand_gather_blocks(&preprocess::expand_multiline_guards(
-                    &preprocess::expand_typed_let_unpack(&preprocess::expand_lazy_lets(source)),
-                )),
-            )),
-        )),
-    ));
-    let prep = preprocess::preprocess(&expanded);
-    let parsed = tyc_syntax::parse_module(&prep.python_source).map_err(|e| {
+    let (module, _prep) = crate::front_end(source, crate::FrontEnd::Shim).map_err(|e| {
         crate::error::Unwind::Exception(crate::error::VmException::new(
             "ImportError",
             format!("internal stdlib shim parse error: {e}"),
         ))
     })?;
-    let mut module = parsed.into_syntax();
-    // Shim sources are plain Python validated against CPython: every class
-    // is emitted exactly as written (no `@dataclass` decoration, no
-    // synthesised `__init__`), so the VM's dataclass semantics — slots
-    // enforcement, field-tuple hashing, generated constructors — never
-    // apply to a helper class CPython would run as a bare class.
-    let plain_class_lines: Vec<usize> = prep
-        .python_source
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| line.trim_start().starts_with("class "))
-        .map(|(i, _)| i)
-        .collect();
-    let desugar_out = tyc_desugar::desugar_module_with(
-        &module,
-        tyc_desugar::DesugarOptions {
-            plain_class_line_starts: preprocess::line_byte_starts(
-                &prep.python_source,
-                &plain_class_lines,
-            ),
-            ..Default::default()
-        },
-    );
-    module = desugar_out.module;
 
     let env = crate::env::Env::new_module(&interp.root);
     for (name, value) in seed {

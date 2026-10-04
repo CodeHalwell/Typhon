@@ -60,89 +60,12 @@ pub fn run_source(
     origin: Option<&Path>,
     script_args: &[String],
 ) -> Result<i32, VmError> {
-    // Apply the same surface-syntax expansions as `tyc build` so the parser
-    // sees identical input. `gather:`, `go`, `with`-chains, pipes and `?`
-    // all get lowered to plain Python before parsing.
-    //
-    // Note: we deliberately call `expand_lazy_lets` instead of the full
-    // `expand_lazy_imports`. The full version lowers `lazy import np =
-    // numpy` to a `__TyphonLazy_np_` proxy class that uses descriptor
-    // protocol and `__getattr__` — neither of which the VM models. The
-    // simpler `preprocess` pass below already rewrites `lazy import ALIAS
-    // = MODULE` to a plain `import MODULE as ALIAS`, which is the right
-    // shape for an in-process VM (no point deferring an import that's
-    // about to be evaluated eagerly anyway).
-    let expanded = preprocess::expand_all(source);
-    let prep = preprocess::preprocess(&expanded);
-
-    let parsed = tyc_syntax::parse_module(&prep.python_source).map_err(|e| {
+    let (mut module, prep) = front_end(source, FrontEnd::Program).map_err(|e| {
         let where_ = origin
             .map(|p| format!("{}: ", p.display()))
             .unwrap_or_default();
         VmError::Parse(format!("{where_}{e}"))
     })?;
-    let mut module = parsed.into_syntax();
-
-    // Evaluate `comptime` bindings and inline the resulting literals into
-    // the AST so the VM doesn't try to execute `env(...)` (a build-only
-    // intrinsic). `comptime def` bodies are stripped at the same time so
-    // a NameError from one of their build-only calls can't surface at
-    // runtime. Matches the substitution pass `tyc build` runs before
-    // desugaring.
-    let (comptime_values, _comptime_diags) = tyc_analyse::evaluate_comptime_with_functions(
-        &module,
-        &prep.comptime_bindings,
-        &prep.comptime_functions,
-    );
-    module = tyc_analyse::substitute_comptime_literals(
-        module,
-        &comptime_values,
-        &prep.comptime_functions,
-    );
-
-    // Collect `@memo` / `@pure(memo=True)` opt-ins exactly like `tyc build`
-    // does, so the desugar pass below injects `@functools.cache` instead of
-    // silently stripping the marker (which left memoised recursion running
-    // exponentially under the VM while the build path returned instantly).
-    let memoise_targets: Vec<String> = tyc_analyse::analyse_purity(&module, false)
-        .into_iter()
-        .filter(|f| f.violation.is_none() && f.memoise)
-        .map(|f| f.name)
-        .collect();
-
-    // Hand the VM the desugared module so it sees the same shape as the
-    // compile path: dataclass-decorated user classes, merged impl blocks,
-    // injected runtime imports, and so on. FINDINGS #21 follow-up.
-    // Running the full desugar pass also rewrites \`extend\` user-classes
-    // into method merges; the builtin-extension rewrite below handles the
-    // \`extend str:\` / \`extend list:\` shape that desugar leaves alone.
-    //
-    // Pass the preprocessor's class-kind markers (plain / raw / frozen) so
-    // the VM desugars `plain class` / `class!` / `class … frozen` exactly
-    // like `tyc build` — otherwise a `plain class` would be wrongly
-    // decorated as a `@dataclass` and its class-level constants treated as
-    // slots.
-    let desugar_out = tyc_desugar::desugar_module_with(
-        &module,
-        tyc_desugar::DesugarOptions {
-            memoise_functions: memoise_targets,
-            raw_class_line_starts: preprocess::line_byte_starts(
-                &prep.python_source,
-                &prep.raw_class_lines,
-            ),
-            frozen_class_line_starts: preprocess::line_byte_starts(
-                &prep.python_source,
-                &prep.frozen_class_lines,
-            ),
-            plain_class_line_starts: preprocess::line_byte_starts(
-                &prep.python_source,
-                &prep.plain_class_lines,
-            ),
-            pub_names: prep.pub_names.clone(),
-            ..Default::default()
-        },
-    );
-    module = desugar_out.module;
 
     // FINDINGS #21: rewrite \`x.method(args)\` to \`__typhon_ext_TYPE__method
     // (x, args)\` for every receiver statically annotated as a built-in
@@ -298,6 +221,118 @@ pub fn run_source(
             Err(VmError::runtime("unexpected control-flow at module level"))
         }
     }
+}
+
+/// Which caller a [`front_end`] run serves.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrontEnd {
+    /// A `.ty` program file: the entry module or an imported sibling.
+    Program,
+    /// An embedded stdlib shim: plain Python validated against CPython, so
+    /// every class is emitted exactly as written (no `@dataclass`
+    /// decoration, no synthesised `__init__`) and there is no `@memo` or
+    /// `comptime` to evaluate.
+    Shim,
+}
+
+/// The one front end every VM entry point shares — the entry program, an
+/// imported sibling module, and the embedded stdlib shims. It runs the
+/// canonical sugar chain plus the preprocessor
+/// ([`preprocess::expand_and_preprocess_mapped`], the exact chain
+/// `tyc check` / `tyc build` run), parses, inlines `comptime` values and
+/// desugars, so the VM can never drift from the compiled path's pass order
+/// again (each caller used to assemble the ten-pass chain by hand, and the
+/// copies ran `expand_lazy_lets` before `expand_typed_let_unpack`).
+///
+/// `lazy import` stays an eager import (`rewrite_lazy_imports = false`):
+/// the full lowering produces a descriptor-and-`__getattr__` proxy class,
+/// and there is no point deferring an import the VM is about to evaluate.
+///
+/// The returned `PreprocessResult::line_map` maps a `python_source` line to
+/// the line the user wrote (both 0-based); tracebacks use it.
+pub(crate) fn front_end(
+    source: &str,
+    kind: FrontEnd,
+) -> Result<(ruff_python_ast::ModModule, preprocess::PreprocessResult), String> {
+    let prep = preprocess::expand_and_preprocess_mapped(source, false);
+    let parsed = tyc_syntax::parse_module(&prep.python_source).map_err(|e| e.to_string())?;
+    let mut module = parsed.into_syntax();
+    if kind == FrontEnd::Shim {
+        let plain_class_lines: Vec<usize> = prep
+            .python_source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.trim_start().starts_with("class "))
+            .map(|(i, _)| i)
+            .collect();
+        let desugar_out = tyc_desugar::desugar_module_with(
+            &module,
+            tyc_desugar::DesugarOptions {
+                plain_class_line_starts: preprocess::line_byte_starts(
+                    &prep.python_source,
+                    &plain_class_lines,
+                ),
+                ..Default::default()
+            },
+        );
+        return Ok((desugar_out.module, prep));
+    }
+
+    // Evaluate `comptime` bindings and inline the resulting literals into
+    // the AST so the VM doesn't try to execute `env(...)` (a build-only
+    // intrinsic). `comptime def` bodies are stripped at the same time so
+    // a NameError from one of their build-only calls can't surface at
+    // runtime. Matches the substitution pass `tyc build` runs before
+    // desugaring.
+    let (comptime_values, _comptime_diags) = tyc_analyse::evaluate_comptime_with_functions(
+        &module,
+        &prep.comptime_bindings,
+        &prep.comptime_functions,
+    );
+    module = tyc_analyse::substitute_comptime_literals(
+        module,
+        &comptime_values,
+        &prep.comptime_functions,
+    );
+
+    // Collect `@memo` / `@pure(memo=True)` opt-ins exactly like `tyc build`
+    // does, so the desugar pass below injects `@functools.cache` instead of
+    // silently stripping the marker (which left memoised recursion running
+    // exponentially under the VM while the build path returned instantly).
+    let memoise_targets: Vec<String> = tyc_analyse::analyse_purity(&module, false)
+        .into_iter()
+        .filter(|f| f.violation.is_none() && f.memoise)
+        .map(|f| f.name)
+        .collect();
+
+    // Hand the VM the desugared module so it sees the same shape as the
+    // compile path: dataclass-decorated user classes, merged impl blocks,
+    // injected runtime imports, and so on. The preprocessor's class-kind
+    // markers (plain / raw / frozen) are threaded through so `plain class`
+    // / `class!` / `class … frozen` desugar exactly like `tyc build` —
+    // otherwise a `plain class` would be wrongly decorated as a
+    // `@dataclass` and its class-level constants treated as slots.
+    let desugar_out = tyc_desugar::desugar_module_with(
+        &module,
+        tyc_desugar::DesugarOptions {
+            memoise_functions: memoise_targets,
+            raw_class_line_starts: preprocess::line_byte_starts(
+                &prep.python_source,
+                &prep.raw_class_lines,
+            ),
+            frozen_class_line_starts: preprocess::line_byte_starts(
+                &prep.python_source,
+                &prep.frozen_class_lines,
+            ),
+            plain_class_line_starts: preprocess::line_byte_starts(
+                &prep.python_source,
+                &prep.plain_class_lines,
+            ),
+            pub_names: prep.pub_names.clone(),
+            ..Default::default()
+        },
+    );
+    Ok((desugar_out.module, prep))
 }
 
 /// Pre-scan sibling `.ty` files referenced by the entry module's imports,
@@ -480,8 +515,7 @@ fn merge_sibling_extensions(
     registry: &mut tyc_analyse::ExtensionRegistry,
     cross_fns: &mut std::collections::HashMap<String, String>,
 ) -> Option<tyc_analyse::TypeFacts> {
-    let expanded = preprocess::expand_all(source);
-    let prep = preprocess::preprocess(&expanded);
+    let prep = preprocess::expand_and_preprocess_mapped(source, false);
     let parsed = tyc_syntax::parse_module(&prep.python_source).ok()?;
     let mut sibling_module = parsed.into_syntax();
     let (sibling_registry, _) = tyc_analyse::extract_builtin_extensions(&mut sibling_module);

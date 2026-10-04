@@ -268,6 +268,12 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   dataclass instance returns the same object, and enum members, dates,
   times, timedeltas, timezones and paths pass through unchanged, as in the
   emitted runtime.
+- **One front end for every VM entry point** (W5-20). The entry program,
+  imported sibling modules and the embedded stdlib shims all go through
+  `tyc_syntax::preprocess::expand_and_preprocess_mapped` — the chain
+  `tyc check` and `tyc build` run — instead of two hand-assembled copies
+  that had drifted (they ran `expand_lazy_lets` before
+  `expand_typed_let_unpack`, the reverse of the canonical order).
 
 #### W6 — CI, docs & hygiene
 

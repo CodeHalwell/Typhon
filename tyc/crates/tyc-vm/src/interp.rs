@@ -2265,78 +2265,21 @@ impl Interpreter {
             ))
         })?;
 
-        // Run the same preprocess + desugar pipeline lib.rs uses for the
-        // top-level entry, so the imported module sees identical surface
-        // syntax handling.
-        use tyc_syntax::preprocess;
-        let expanded = preprocess::expand_question_ops(&preprocess::expand_inline_question_ops(
-            // Shared with the CLI: the VM omitted both of these, so an
-            // inline `?` (`f(g()?)`, `elif h()? > 1:`) failed to parse under
-            // `tyc run` on a program `tyc build` compiles and runs.
-            &preprocess::expand_compound_question_headers(&preprocess::expand_pipes(
-                &preprocess::expand_with_chains(&preprocess::expand_go_calls(
-                    &preprocess::expand_gather_blocks(&preprocess::expand_multiline_guards(
-                        &preprocess::expand_typed_let_unpack(&preprocess::expand_lazy_lets(
-                            &source,
-                        )),
-                    )),
-                )),
-            )),
-        ));
-        let prep = preprocess::preprocess(&expanded);
+        // Run the same front end lib.rs uses for the top-level entry (the
+        // canonical sugar chain, preprocess, comptime, `@memo`, desugar), so
+        // the imported module sees identical surface syntax handling.
+        let (mut module, prep) =
+            crate::front_end(&source, crate::FrontEnd::Program).map_err(|e| {
+                crate::error::Unwind::Exception(crate::error::VmException::new(
+                    "ImportError",
+                    format!("parse error in '{}': {e}", path.display()),
+                ))
+            })?;
         self.lazy_import_aliases.extend(
             prep.lazy_imports
                 .iter()
                 .map(|li| (li.module.clone(), li.alias.clone())),
         );
-        let parsed = tyc_syntax::parse_module(&prep.python_source).map_err(|e| {
-            crate::error::Unwind::Exception(crate::error::VmException::new(
-                "ImportError",
-                format!("parse error in '{}': {e}", path.display()),
-            ))
-        })?;
-        let mut module = parsed.into_syntax();
-        let (comptime_values, _diags) = tyc_analyse::evaluate_comptime_with_functions(
-            &module,
-            &prep.comptime_bindings,
-            &prep.comptime_functions,
-        );
-        module = tyc_analyse::substitute_comptime_literals(
-            module,
-            &comptime_values,
-            &prep.comptime_functions,
-        );
-        // Mirror the entry-module pipeline (lib.rs): thread the `@memo`
-        // opt-ins and the preprocessor's class-kind markers through to
-        // desugar, so a sibling module's `@memo def` is actually memoised
-        // and its `class X frozen:` / `plain class` / `class!` forms keep
-        // their declared shape under `tyc run`.
-        let memoise_targets: Vec<String> = tyc_analyse::analyse_purity(&module, false)
-            .into_iter()
-            .filter(|f| f.violation.is_none() && f.memoise)
-            .map(|f| f.name)
-            .collect();
-        let desugar_out = tyc_desugar::desugar_module_with(
-            &module,
-            tyc_desugar::DesugarOptions {
-                memoise_functions: memoise_targets,
-                raw_class_line_starts: preprocess::line_byte_starts(
-                    &prep.python_source,
-                    &prep.raw_class_lines,
-                ),
-                frozen_class_line_starts: preprocess::line_byte_starts(
-                    &prep.python_source,
-                    &prep.frozen_class_lines,
-                ),
-                plain_class_line_starts: preprocess::line_byte_starts(
-                    &prep.python_source,
-                    &prep.plain_class_lines,
-                ),
-                pub_names: prep.pub_names.clone(),
-                ..Default::default()
-            },
-        );
-        module = desugar_out.module;
         let (mut registry, _stats) = tyc_analyse::extract_builtin_extensions(&mut module);
         // Store the module's own extension registry for cross-module
         // rewrite (#202) before the merge below adds its imports' entries.
