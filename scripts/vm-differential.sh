@@ -177,7 +177,9 @@ UNITS="$SCRATCH/units.txt"
 # hundreds of broken entries with no error. Use -exec dirname (POSIX) and
 # refuse to continue if it finds nothing.
 find "${ROOTS[@]}" -name typhon.toml -exec dirname {} \; | sort -u > "$PROJECTS"
-if [ ! -s "$PROJECTS" ]; then
+# corpus/valid holds standalone files only, so an empty project list is
+# expected there; every other scope has project apps.
+if [ ! -s "$PROJECTS" ] && [ "$SCOPE" != "valid" ]; then
     echo "error: project discovery found no ${ROOTS[*]}/*/typhon.toml." >&2
     echo "       Either there are no project units, or find failed (wrong working" >&2
     echo "       directory, unreadable trees). Refusing to run against a corpus that" >&2
