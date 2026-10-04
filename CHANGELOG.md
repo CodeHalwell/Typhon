@@ -1081,6 +1081,16 @@ set operators, frozenset dict keys) did not reproduce.
   - A partial-scope `vm-differential.sh --update` keeps the nobuild entries it
     did not cover.
   - The `perf-gate` CI job fetches tags, so it builds its same-run control.
+- **Build-pipeline speed.** With its control restored, the perf gate measured
+  `tyc build` of `examples/47-mini-app` at +44% against alpha.9 (26 ms vs
+  18 ms). Three fixes bring it to +5.6% (19 ms vs 18 ms):
+  - The `go`, `?` and with-chain passes skip their whole-source lexical
+    scans when the file has no `go` line, no `?` or no `with`.
+  - The `pub *` scan in `tyc build` no longer runs the whole sugar pipeline
+    on files that contain neither `pub` nor `*`.
+  - The shape pre-pass and the check share one expand-and-preprocess per
+    file, where each used to run it.
+  Output is unchanged; the corpus check is identical before and after.
 
 ### Third wave — the 2026-09-30 release-readiness review
 
