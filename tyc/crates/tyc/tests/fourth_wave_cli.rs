@@ -288,3 +288,81 @@ mod lsp_transport {
         assert_eq!(s.exit_code(), 1);
     }
 }
+
+// ── reserved `typhon_runtime` (W4-12) ───────────────────────────────────────
+
+/// W4-12: a project module named `typhon_runtime` is replaced by the
+/// generated runtime whenever the program needs it. When the program imports
+/// a name of its own from it, the build used to succeed and the program then
+/// failed with `ImportError: cannot import name 'helper'`; it now fails to
+/// build with `tyc::reserved_module_name`, and `tyc check` warns.
+#[test]
+fn a_user_typhon_runtime_that_the_runtime_would_replace_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(
+        dir,
+        "rt",
+        &[
+            (
+                "typhon_runtime/__init__.ty",
+                "def helper() -> int:\n    return 41\n",
+            ),
+            (
+                "main.ty",
+                "from typhon_runtime import helper\n\ndef f() -> Result[int, str]:\n    return Ok(helper() + 1)\n\nprint(f())\n",
+            ),
+        ],
+    );
+    let check = tyc()
+        .current_dir(dir)
+        .args(["check", "src"])
+        .output()
+        .unwrap();
+    assert!(check.status.success(), "{}", text(&check));
+    assert!(
+        text(&check).contains("tyc::reserved_module_name"),
+        "{}",
+        text(&check)
+    );
+
+    let build = tyc()
+        .current_dir(dir)
+        .args(["build", "--no-sync"])
+        .output()
+        .unwrap();
+    assert!(!build.status.success(), "{}", text(&build));
+    let t = text(&build);
+    assert!(t.contains("tyc::reserved_module_name"), "{t}");
+    assert!(t.contains("helper"), "{t}");
+}
+
+/// W4-12: a `typhon_runtime` module the generated runtime never replaces (no
+/// `.ty` file uses a runtime feature or imports it — importing it is itself
+/// what pulls the generated runtime in) keeps building, with a warning.
+#[test]
+fn a_user_typhon_runtime_the_build_never_replaces_still_builds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(
+        dir,
+        "rt",
+        &[
+            ("typhon_runtime.ty", "def helper() -> int:\n    return 41\n"),
+            ("main.ty", "print(1 + 1)\n"),
+        ],
+    );
+    let build = tyc()
+        .current_dir(dir)
+        .args(["build", "--no-sync"])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "{}", text(&build));
+    assert!(
+        text(&build).contains("tyc::reserved_module_name"),
+        "{}",
+        text(&build)
+    );
+    assert!(dir.join("build/typhon_runtime.py").exists());
+    assert!(!dir.join("build/typhon_runtime").exists());
+}

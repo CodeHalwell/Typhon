@@ -256,6 +256,15 @@ grouped by workstream (W1–W7).
   Salsa queries behind hover, completion and go-to-definition, run on a
   blocking thread instead of the server's single async thread. The check
   releases the database lock around venv introspection.
+- **`typhon_runtime` is a reserved module name** (W4-12, new
+  `tyc::reserved_module_name`). The runtime package `tyc build` generates
+  replaced a project's own `src/typhon_runtime` module or package: check and
+  build were clean, then the program failed with `ImportError: cannot import
+  name 'helper'`. `tyc build` now fails before writing the runtime when the
+  program imports a name or submodule from `typhon_runtime` that the generated
+  runtime does not provide (a program that could not start); otherwise `tyc
+  build` and `tyc check` warn that the name is reserved. No program that runs
+  today is rejected.
 
 #### W5 — VM & harness
 

@@ -406,6 +406,17 @@ fn check_scope(args: &CheckArgs, scope: &CheckScope) -> Result<ScopeOutcome> {
     // degrades gracefully (it'll just under-match rather than panic).
     let src_dir = project_root.join(&config.project.src);
     let src_dir_canon = src_dir.canonicalize().unwrap_or(src_dir);
+    // W4-12: `typhon_runtime` is reserved for the runtime `tyc build`
+    // generates. Whether the build would break depends on the desugared
+    // program, which `tyc check` does not produce, so `check` only warns.
+    if has_project_config {
+        if let Some(user_runtime) = super::reserved::user_runtime(&src_dir_canon) {
+            eprintln!(
+                "{:?}",
+                super::reserved::reserved_warning(&user_runtime, false)
+            );
+        }
+    }
 
     // Venv-introspection enrichment: shell to the project's
     // `.venv/bin/python` and ask `inspect.signature` for the real
