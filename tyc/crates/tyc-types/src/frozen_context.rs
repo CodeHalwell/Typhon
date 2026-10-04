@@ -29,9 +29,23 @@ pub(super) fn failure_is_caught(c: &Checker, expr: &Expr, error: &str) -> bool {
             if expr.range() == self.target && self.protected {
                 self.found = true;
             }
-            if !self.found {
-                visitor::walk_expr(self, expr);
+            if self.found {
+                return;
             }
+            // A lambda's defaults run where it is created, but its body runs
+            // later — outside any handler around the lambda expression —
+            // just like a nested `def`.
+            if let Expr::Lambda(lambda) = expr {
+                if let Some(parameters) = &lambda.parameters {
+                    self.visit_parameters(parameters);
+                }
+                let prior = self.protected;
+                self.protected = false;
+                self.visit_expr(&lambda.body);
+                self.protected = prior;
+                return;
+            }
+            visitor::walk_expr(self, expr);
         }
         fn visit_stmt(&mut self, stmt: &'a Stmt) {
             if self.found {

@@ -41935,6 +41935,15 @@ def main() -> None:
         }
     }
     #[test]
+    fn deferred_lambda_body_does_not_hide_mutation() {
+        // The body runs when the lambda is called, outside the handler.
+        let src = "let NAMES: list[str] = __typhon_freeze__([\"a\"])\ntry:\n    let later = lambda: NAMES.append(\"b\")\nexcept AttributeError:\n    pass\n";
+        assert!(!check(src).errors().is_empty(), "{src}");
+        // A default runs where the lambda is created, inside the handler.
+        let src = "let NAMES: list[str] = __typhon_freeze__([\"a\"])\ntry:\n    let probe = lambda n=NAMES.append(\"b\"): n\nexcept AttributeError:\n    pass\n";
+        assert!(check(src).errors().is_empty(), "{:?}", check(src).errors());
+    }
+    #[test]
     fn w2_06_callable_shapes() {
         for src in [
             "from typing import Callable\ndef f(g: Callable[[int], int]) -> int:\n    return g(y=1)\n",
