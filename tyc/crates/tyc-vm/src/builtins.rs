@@ -408,6 +408,7 @@ pub fn install(interp: &mut Interpreter) {
                 }
             };
             let cleaned: String = digits.chars().filter(|&c| c != '_').collect();
+            crate::limits::check_str_to_int(cleaned.len(), base as u32)?;
             return match num_bigint::BigInt::parse_bytes(cleaned.as_bytes(), base as u32) {
                 Some(n) => Ok(Value::Int(VmInt::from(if neg { -n } else { n }))),
                 None => Err(value_error(format!(
@@ -415,6 +416,10 @@ pub fn install(interp: &mut Interpreter) {
                     base, s
                 ))),
             };
+        }
+        if let Value::Str(s) = v {
+            let digits = s.chars().filter(char::is_ascii_digit).count();
+            crate::limits::check_str_to_int(digits, 10)?;
         }
         Ok(Value::Int(VmInt::from(v.to_bigint()?)))
     });
@@ -542,7 +547,7 @@ pub fn install(interp: &mut Interpreter) {
         if let Some(formatted) = interp.try_user_format(v, &spec)? {
             return Ok(Value::Str(Rc::new(formatted)));
         }
-        let base = interp.str_of(v)?;
+        let base = interp.format_default(v, &spec)?;
         Ok(Value::Str(Rc::new(crate::interp::format_with_spec_pub(
             v, &base, &spec,
         )?)))
@@ -970,7 +975,13 @@ pub fn install(interp: &mut Interpreter) {
         interp.repr_of(single(&args, "repr")?)?
     ))));
 
-    native!("type", |_i, args| {
+    native!("type", |i, args| {
+        if args.len() == 3 {
+            return type_new(i, &args);
+        }
+        if args.len() != 1 {
+            return Err(type_error("type() takes 1 or 3 arguments"));
+        }
         let v = single(&args, "type")?;
         // Return a real type object so `type(x).__name__`, `str(type(x))`
         // (→ `<class 'int'>`), and `type(x) == int` / `== SomeClass` all work.
@@ -997,7 +1008,7 @@ pub fn install(interp: &mut Interpreter) {
         ) {
             return Err(type_error("issubclass() arg 1 must be a class"));
         }
-        let cls = i.force_alias(&args[1]);
+        let cls = union_members(&i.force_alias(&args[1]));
         Ok(Value::Bool(is_subclass_of(&sub, &cls)))
     });
     native!("isinstance", |i, args| {
@@ -1009,7 +1020,7 @@ pub fn install(interp: &mut Interpreter) {
         // above `A`/`B`) used at runtime before the post-body resolution
         // pass has run — otherwise it would still be its name-string
         // fallback and the test would silently return the wrong result.
-        let cls = i.force_alias(&args[1]);
+        let cls = union_members(&i.force_alias(&args[1]));
         // A `@runtime_checkable` Protocol is matched *structurally* — the
         // value has to answer every member the protocol declares — and a
         // Protocol without the decorator is not usable here at all, both as
@@ -1897,6 +1908,13 @@ pub fn install(interp: &mut Interpreter) {
     // call is intercepted in `eval_call` to record the base expression for
     // `as!`.
     root.set("NewType", newtype_native());
+    // `NotImplemented`: one shared singleton (identity matters — `is`).
+    root.set(
+        "NotImplemented",
+        Value::Native(Rc::new(NativeFn::new("NotImplemented", |_i, _args| {
+            Err(type_error("'NotImplementedType' object is not callable"))
+        }))),
+    );
 }
 
 /// `sum(iterable, start)` with CPython 3.12+'s numeric paths: exact integer
@@ -2319,6 +2337,7 @@ pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
         // Without this arm `isinstance(x, object)` was uniformly `False`,
         // which silently inverts any control flow written around it.
         ("object", _) => true,
+        ("NoneType", Value::None) => true,
         ("int", Value::Int(_)) => true,
         // `bool` is a subclass of `int` in CPython, so `isinstance(True, int)`
         // is `True` there. The VM answered `False`, taking the opposite branch
@@ -2702,6 +2721,205 @@ fn compile_helper(interp: &mut Interpreter, source: &str, name: &str) -> Result<
 }
 
 /// A class from the `descriptors` shim (`property`), compiled once per run.
+/// `type(name, bases, namespace)`: a new class, as a `class` statement with
+/// that body would make it (functions become methods, everything else a
+/// class attribute; builtin bases are recorded by name).
+fn type_new(interp: &Interpreter, args: &[Value]) -> Result<Value, Unwind> {
+    let name = match &args[0] {
+        Value::Str(s) => (**s).clone(),
+        other => {
+            return Err(type_error(format!(
+                "type.__new__() argument 1 must be str, not {}",
+                other.type_display_name()
+            )))
+        }
+    };
+    let Value::Tuple(base_values) = &args[1] else {
+        return Err(type_error(format!(
+            "type.__new__() argument 2 must be tuple, not {}",
+            args[1].type_display_name()
+        )));
+    };
+    let Value::Dict(ns) = &args[2] else {
+        return Err(type_error(format!(
+            "type.__new__() argument 3 must be dict, not {}",
+            args[2].type_display_name()
+        )));
+    };
+    let mut bases = Vec::new();
+    let mut builtin_bases = Vec::new();
+    let mut exc_bases = Vec::new();
+    for b in base_values.iter() {
+        match b {
+            Value::Class(c) => bases.push(c.clone()),
+            Value::Native(n) if n.name == "object" => {}
+            Value::Native(n) if crate::interp::name_is_exception_base(n.name) => {
+                exc_bases.push(Value::Str(Rc::new(n.name.to_owned())))
+            }
+            Value::Native(n) => builtin_bases.push(Value::Str(Rc::new(n.name.to_owned()))),
+            other => {
+                return Err(type_error(format!(
+                    "type.__new__() bases must be types, not {}",
+                    other.type_display_name()
+                )))
+            }
+        }
+    }
+    let mut methods = HashMap::new();
+    let mut class_attrs = HashMap::new();
+    for (k, v) in ns.borrow().iter() {
+        let HashKey::Str(key) = k else {
+            continue;
+        };
+        match v {
+            Value::Function(f) => {
+                methods.insert((**key).clone(), f.clone());
+            }
+            other => {
+                class_attrs.insert((**key).clone(), other.clone());
+            }
+        }
+    }
+    if !builtin_bases.is_empty() {
+        class_attrs.insert(
+            "__typhon_builtin_bases__".to_owned(),
+            Value::Tuple(Rc::new(builtin_bases)),
+        );
+    }
+    let is_exception = bases.iter().any(|b| b.is_exception) || !exc_bases.is_empty();
+    if !exc_bases.is_empty() {
+        class_attrs.insert(
+            "__typhon_exc_bases__".to_owned(),
+            Value::Tuple(Rc::new(exc_bases)),
+        );
+    }
+    class_attrs.insert(
+        "__typhon_module__".to_owned(),
+        Value::Str(Rc::new(interp.current_module_name.clone())),
+    );
+    let mro = crate::value::linearize(&bases).map_err(|names| {
+        type_error(format!(
+            "Cannot create a consistent method resolution order (MRO) for bases {names}"
+        ))
+    })?;
+    Ok(Value::Class(Rc::new(crate::value::Class {
+        name,
+        methods: RefCell::new(methods),
+        fields: vec![],
+        class_attrs: RefCell::new(class_attrs),
+        mro,
+        bases,
+        properties: RefCell::new(Default::default()),
+        classmethods: RefCell::new(Default::default()),
+        is_exception,
+        is_protocol: false,
+    })))
+}
+
+/// The `typing` / `collections.abc` names the VM models as inert identity
+/// stand-ins (see `make_typing_module`).
+pub(crate) fn is_typing_form(name: &str) -> bool {
+    matches!(
+        name,
+        "Callable"
+            | "Optional"
+            | "Union"
+            | "List"
+            | "Dict"
+            | "Set"
+            | "Tuple"
+            | "FrozenSet"
+            | "Protocol"
+            | "Iterable"
+            | "Iterator"
+            | "Sequence"
+            | "Mapping"
+            | "MutableMapping"
+            | "MutableSequence"
+            | "MutableSet"
+            | "ClassVar"
+            | "Final"
+            | "Literal"
+            | "Type"
+            | "Generic"
+            | "Awaitable"
+            | "Coroutine"
+            | "AsyncIterable"
+            | "AsyncIterator"
+            | "Generator"
+            | "AsyncGenerator"
+            | "ContextManager"
+            | "AsyncContextManager"
+            | "Annotated"
+            | "TypeGuard"
+            | "TypeIs"
+            | "Required"
+            | "NotRequired"
+            | "Unpack"
+            | "Concatenate"
+            | "OrderedDict"
+            | "DefaultDict"
+            | "Counter"
+            | "Deque"
+            | "ChainMap"
+            | "AbstractSet"
+            | "Collection"
+            | "Container"
+            | "Reversible"
+            | "ItemsView"
+            | "KeysView"
+            | "ValuesView"
+            | "MappingView"
+            | "IO"
+    )
+}
+
+/// The builtin type names the VM models as native constructors.
+pub(crate) fn is_builtin_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "int"
+            | "float"
+            | "complex"
+            | "str"
+            | "bool"
+            | "bytes"
+            | "bytearray"
+            | "list"
+            | "dict"
+            | "set"
+            | "frozenset"
+            | "tuple"
+            | "object"
+            | "type"
+            | "range"
+            | "slice"
+            | "memoryview"
+            | "NoneType"
+    )
+}
+
+/// A runtime `X | Y` union (the descriptors shim's `UnionType`) as the
+/// tuple of its members `isinstance` / `issubclass` accept; anything else
+/// unchanged. `None` among the members stands for `NoneType`.
+fn union_members(cls: &Value) -> Value {
+    if let Value::Instance(inst) = cls {
+        if inst.class.name == "UnionType" {
+            if let Some(Value::Tuple(args)) = inst.fields.borrow().get("__args__") {
+                return Value::Tuple(Rc::new(
+                    args.iter()
+                        .map(|a| match a {
+                            Value::None => make_builtin_type("NoneType"),
+                            other => other.clone(),
+                        })
+                        .collect(),
+                ));
+            }
+        }
+    }
+    cls.clone()
+}
+
 /// The `NewType` callable: `NewType(name, base)` builds the newtype object.
 fn newtype_native() -> Value {
     Value::Native(Rc::new(NativeFn::new("NewType", |i, args| {
@@ -5855,6 +6073,29 @@ fn make_sys_module(interp: &Interpreter) -> Value {
                 }),
             ),
             (
+                "get_int_max_str_digits",
+                nf("get_int_max_str_digits", |_i, _args| {
+                    Ok(Value::Int(VmInt::from(crate::limits::int_max_str_digits() as i64)))
+                }),
+            ),
+            (
+                "set_int_max_str_digits",
+                nf("set_int_max_str_digits", |_i, args| {
+                    let (pos, kw) = split_kwargs(&args);
+                    let v = pos
+                        .first()
+                        .cloned()
+                        .or_else(|| kw.iter().find(|(k, _)| k == "maxdigits").map(|(_, v)| v.clone()))
+                        .ok_or_else(|| type_error("set_int_max_str_digits() missing required argument 'maxdigits' (pos 1)"))?;
+                    let n = crate::limits::ssize_arg(&v)?;
+                    if n != 0 && n < 640 {
+                        return Err(value_error("maxdigits must be 0 or larger than 640"));
+                    }
+                    crate::limits::set_int_max_str_digits(n.max(0) as usize);
+                    Ok(Value::None)
+                }),
+            ),
+            (
                 "getrecursionlimit",
                 nf("getrecursionlimit", |i, _args| {
                     Ok(Value::Int(VmInt::from(i.max_stack_depth as i64)))
@@ -8295,10 +8536,27 @@ fn make_collections_abc_module() -> Value {
 
 fn make_abc_module() -> Value {
     let mut entries: Vec<(&str, Value)> = Vec::new();
+    // `@abstractmethod` marks the function (`__isabstractmethod__`) and
+    // returns it; `instantiate` refuses an ABC with one still unimplemented.
+    entries.push((
+        "abstractmethod",
+        nf("abstractmethod", |i, args| {
+            let f = single(&args, "abstractmethod")?.clone();
+            match &f {
+                Value::Function(func) => {
+                    func.attrs
+                        .borrow_mut()
+                        .insert("__isabstractmethod__".to_owned(), Value::Bool(true));
+                }
+                Value::Instance(_) => i.set_attr(&f, "__isabstractmethod__", Value::Bool(true))?,
+                _ => {}
+            }
+            Ok(f)
+        }),
+    ));
     for name in [
         "ABC",
         "ABCMeta",
-        "abstractmethod",
         "abstractproperty",
         "abstractclassmethod",
         "abstractstaticmethod",
@@ -9400,7 +9658,7 @@ pub fn dict_fromkeys(interp: &mut Interpreter, args: Vec<Value>) -> Result<Value
     let mut it = args.into_iter();
     let iterable = it
         .next()
-        .ok_or_else(|| type_error("fromkeys() expected at least 1 argument, got 0"))?;
+        .ok_or_else(|| type_error("fromkeys expected at least 1 argument, got 0"))?;
     let fill = it.next().unwrap_or(Value::None);
     let mut map: DictMap = IndexMap::new();
     let iter = interp.make_iter(iterable)?;
@@ -9577,6 +9835,9 @@ fn str_method(
             let pieces: Vec<String> = match sep_arg {
                 Some(v) => {
                     let sep = v.py_str();
+                    if sep.is_empty() {
+                        return Err(value_error("empty separator"));
+                    }
                     split_with_sep(s, &sep, maxsplit, from_right)
                 }
                 None => split_whitespace_max(s, maxsplit, from_right),
@@ -10247,7 +10508,7 @@ fn str_format_inner(
                     None => {
                         // The default stringification honours a user
                         // `__str__` (via `str_of`), matching `print` / `str`.
-                        let default = interp.str_of(&value)?;
+                        let default = interp.format_default(&value, &spec)?;
                         if spec.is_empty() {
                             default
                         } else {
@@ -11148,6 +11409,8 @@ fn dict_method(
         )));
     }
     match name {
+        // A classmethod, reached through an instance (`{}.fromkeys(xs)`).
+        "fromkeys" if !dict_is_frozen(d) => dict_fromkeys(interp, args.to_vec()),
         "get" => {
             let k = interp.dict_probe_key(d, single(args, "get")?)?;
             let default = args.get(1).cloned().unwrap_or(Value::None);
@@ -11546,6 +11809,11 @@ fn tuple_method(t: &Rc<Vec<Value>>, name: &str, args: &[Value]) -> Result<Value,
 }
 
 fn num_method(v: &Value, name: &str, args: &[Value]) -> Result<Value, Unwind> {
+    // `bool` is an `int` subclass: the int methods it does not override
+    // (`True.bit_length()`, `False.to_bytes(1)`) answer for its value.
+    if let (Value::Bool(b), "bit_length" | "bit_count" | "to_bytes" | "is_integer") = (v, name) {
+        return num_method(&Value::Int(VmInt::from(i64::from(*b))), name, args);
+    }
     match (v, name) {
         (Value::FloatData(crate::value::VmFloat { value: x, .. }), "is_integer") => {
             Ok(Value::Bool(x.fract() == 0.0 && x.is_finite()))

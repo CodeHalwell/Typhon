@@ -63,3 +63,91 @@ class NewType:
 
     def __repr__(self):
         return self.__module__ + "." + self.__qualname__
+
+
+def _type_repr(t):
+    if t is None:
+        return "None"
+    r = repr(t)
+    if r == "<class 'NoneType'>":
+        return "None"
+    if r == "Ellipsis":
+        return "..."
+    if r.startswith("<class '") and r.endswith("'>"):
+        return r[8:-2]
+    return r
+
+
+class UnionType:
+    def __init__(self, args, typing_form=False):
+        self.__args__ = args
+        self._typing_form = typing_form
+
+    def __repr__(self):
+        if not self._typing_form:
+            return " | ".join([_type_repr(a) for a in self.__args__])
+        # A union with a `typing` generic in it is `typing.Union`.
+        if len(self.__args__) == 2 and None in self.__args__:
+            other = [a for a in self.__args__ if a is not None][0]
+            return "typing.Optional[" + _type_repr(other) + "]"
+        parts = ["NoneType" if a is None else _type_repr(a) for a in self.__args__]
+        return "typing.Union[" + ", ".join(parts) + "]"
+
+    def __or__(self, other):
+        return _union(self, other)
+
+    def __ror__(self, other):
+        return _union(other, self)
+
+    def __eq__(self, other):
+        if not isinstance(other, UnionType):
+            return NotImplemented
+        return set(self.__args__) == set(other.__args__)
+
+    def __hash__(self):
+        return hash(frozenset(self.__args__))
+
+
+def _union(a, b):
+    args = []
+    typing_form = False
+    for t in (a, b):
+        parts = t.__args__ if isinstance(t, UnionType) else (t,)
+        if isinstance(t, UnionType) and t._typing_form:
+            typing_form = True
+        for p in parts:
+            # A user generic class's alias is `typing`'s (the builtin
+            # `list[int]` is a `types.GenericAlias`, which `|` keeps plain).
+            if isinstance(p, _GenericAlias) and type(p.__origin__).__name__ == "type":
+                typing_form = True
+            if p not in args:
+                args.append(p)
+    if len(args) == 1:
+        return args[0]
+    return UnionType(tuple(args), typing_form)
+
+
+class _GenericAlias:
+    def __init__(self, origin, args):
+        self.__origin__ = origin
+        self.__args__ = args
+
+    def __call__(self, *args, **kwargs):
+        return self.__origin__(*args, **kwargs)
+
+    def __repr__(self):
+        return _type_repr(self.__origin__) + "[" + ", ".join([_type_repr(a) for a in self.__args__]) + "]"
+
+    def __eq__(self, other):
+        if not isinstance(other, _GenericAlias):
+            return NotImplemented
+        return self.__origin__ is other.__origin__ and self.__args__ == other.__args__
+
+    def __hash__(self):
+        return hash((self.__origin__, self.__args__))
+
+    def __or__(self, other):
+        return _union(self, other)
+
+    def __ror__(self, other):
+        return _union(other, self)

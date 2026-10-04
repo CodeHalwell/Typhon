@@ -8,9 +8,11 @@
 //! `ValueError` in the same places, and a program may catch them, so every
 //! size a program controls goes through one of these helpers first.
 
-use crate::error::VmException;
+use std::cell::Cell;
+
 use crate::error::Unwind;
-use crate::value::Value;
+use crate::error::VmException;
+use crate::value::{Value, VmInt};
 
 /// CPython's bare `MemoryError` (it carries no message).
 pub fn memory_error() -> Unwind {
@@ -105,6 +107,76 @@ pub fn c_int_arg(v: &Value) -> Result<i32, Unwind> {
         Value::Bool(b) => Ok(i32::from(*b)),
         other => i32::try_from(other.to_int()?).map_err(|_| too_large()),
     }
+}
+
+// ── The int/str conversion length limit (CPython 3.11+) ───────────────
+
+/// CPython's default `sys.get_int_max_str_digits()`.
+pub const DEFAULT_INT_MAX_STR_DIGITS: usize = 4300;
+
+thread_local! {
+    /// `sys.set_int_max_str_digits(n)`; 0 disables the limit. One VM runs
+    /// per thread, and `Interpreter::new` resets it.
+    static INT_MAX_STR_DIGITS: Cell<usize> = const { Cell::new(DEFAULT_INT_MAX_STR_DIGITS) };
+}
+
+pub fn int_max_str_digits() -> usize {
+    INT_MAX_STR_DIGITS.with(Cell::get)
+}
+
+pub fn set_int_max_str_digits(n: usize) {
+    INT_MAX_STR_DIGITS.with(|c| c.set(n));
+}
+
+/// `ValueError` when converting `n` to decimal text would exceed the
+/// limit. Only ints far beyond `i64` can, and most are decided from their
+/// bit length without converting.
+pub fn check_int_to_str(n: &VmInt) -> Result<(), Unwind> {
+    let limit = int_max_str_digits();
+    let VmInt::Big(b) = n else {
+        return Ok(());
+    };
+    if limit == 0 {
+        return Ok(());
+    }
+    let bits = b.bits();
+    // `bits` binary digits hold between ⌊(bits-1)·log10 2⌋+1 and
+    // ⌊bits·log10 2⌋+1 decimal digits.
+    let at_least = ((bits.saturating_sub(1)) as f64 * std::f64::consts::LOG10_2).floor() as usize + 1;
+    let at_most = (bits as f64 * std::f64::consts::LOG10_2).floor() as usize + 1;
+    let too_long = if at_least > limit {
+        true
+    } else if at_most <= limit {
+        false
+    } else {
+        b.magnitude().to_str_radix(10).len() > limit
+    };
+    if too_long {
+        return Err(Unwind::Exception(VmException::new(
+            "ValueError",
+            format!(
+                "Exceeds the limit ({limit} digits) for integer string conversion; \
+                 use sys.set_int_max_str_digits() to increase the limit"
+            ),
+        )));
+    }
+    Ok(())
+}
+
+/// `ValueError` when an `int()` literal in a base that is not a power of two
+/// has more digits than the limit.
+pub fn check_str_to_int(digits: usize, base: u32) -> Result<(), Unwind> {
+    let limit = int_max_str_digits();
+    if limit == 0 || base.is_power_of_two() || digits <= limit {
+        return Ok(());
+    }
+    Err(Unwind::Exception(VmException::new(
+        "ValueError",
+        format!(
+            "Exceeds the limit ({limit} digits) for integer string conversion: \
+             value has {digits} digits; use sys.set_int_max_str_digits() to increase the limit"
+        ),
+    )))
 }
 
 /// A finite double's exact decimal expansion has at most 1074 digits after

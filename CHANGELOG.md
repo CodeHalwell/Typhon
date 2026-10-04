@@ -344,6 +344,27 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   VM; the generated runtime makes it a `mappingproxy`, which is not a
   `dict`. Both now agree. (Frozen dataclass instances already passed
   through unchanged; a parity test now pins that against the runtime.)
+- **Remaining silent VM divergences closed** (W5-18). The VM now matches
+  CPython on: correctly rounded float `repr` ties; `OverflowError` for
+  ints too large for a float (`float(10**400)`, `10**400 // 3.0`), for
+  `2.0**10000` and for an over-large `int / int` (now correctly rounded:
+  `10**400 / 10**399` is `10.0`, not `nan`); the 4,300-digit int/str
+  limit with `sys.get/set_int_max_str_digits`; `f"{x!s:<8}"`;
+  `f"{None:>6}"`, `format(1, ',_')`, `'%c' % 0x110000`, `'abc'.split('')`
+  and `1 in "abc"` raising; huge slice bounds clipping and huge indices
+  raising `IndexError`; `raise e from e`; `iter(g) is g`;
+  `True.bit_length()`; set-like comparisons of keys / items views;
+  `dict.fromkeys` / `str.maketrans` (dispatched on their first argument
+  before — the lead's `corpus/valid/textwrap.ty` case); three-argument
+  `type()`; class decorators (they were silently skipped, so
+  `@total_ordering` and registry decorators had no effect);
+  `Cls.__dict__`; abstract-class instantiation errors;
+  `@dataclass(order=True)` and `repr=False`; 3.13 docstring dedenting;
+  `in` through `__iter__` / `__getitem__`; `__await__`; `NotImplemented`;
+  `Box[int]` / `list[int]` generic aliases (and `class Named(Box[int])`);
+  runtime `int | str` unions in `isinstance`. The remaining known gaps
+  (type-alias objects, `__del__`, metaclasses, lone surrogates) are listed
+  in `docs/vm.md`.
 - **One front end for every VM entry point** (W5-20). The entry program,
   imported sibling modules and the embedded stdlib shims all go through
   `tyc_syntax::preprocess::expand_and_preprocess_mapped` — the chain

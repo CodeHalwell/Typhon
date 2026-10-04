@@ -402,6 +402,59 @@ copied from a constant `frozenset`, `set(other_set)` copies its table,
 `set` methods accept any iterable, including `intersection_update`,
 `difference_update`, `symmetric_difference_update` and `pop`.
 
+### Smaller CPython details (beta)
+
+- **Floats.** `repr` picks the correctly rounded digits when several
+  shortest strings round-trip (`(-4819706.21)**2` is `…712.562`). An int
+  too large for a float raises `OverflowError` wherever it is converted
+  (`float(10**400)`, `10**400 // 3.0`), `int / int` is correctly rounded
+  without converting the operands first (`10**400 / 10**399` is `10.0`),
+  and a finite `**` that overflows raises `OverflowError: (34, 'Result too
+  large')`.
+- **The int/str digit limit.** Converting an int of more than 4,300
+  decimal digits to text, or parsing one from text, raises CPython's
+  `ValueError`; `sys.get_int_max_str_digits()` /
+  `sys.set_int_max_str_digits(n)` read and move the limit (0 disables it).
+  Hex/octal/binary conversions are unlimited, as in CPython.
+- **Formatting.** `f"{x!s:<8}"` formats the converted string; a non-empty
+  spec on `None` / a list / a tuple / a dict / a set is
+  `TypeError: unsupported format string passed to NoneType.__format__`;
+  `','` with `'_'` is a `ValueError`; `'%c'` checks its range.
+- **Indexing.** A slice bound beyond the index range is clipped
+  (`'abc'[2**64:]` is `''`); an index beyond it raises
+  `IndexError: cannot fit 'int' into an index-sized integer`.
+- **Containment.** `1 in "abc"` is a `TypeError`; a class with only
+  `__iter__` or `__getitem__` supports `in` by iteration.
+- **Classes.** Class decorators run (`@total_ordering`, registries, any
+  decorator returning a replacement); `type(name, bases, ns)` builds a
+  class; `Cls.__dict__` is a read-only view of the class namespace;
+  `class X(ABC)` refuses instantiation while an `@abstractmethod` is
+  unimplemented; `@dataclass(order=True)` compares field tuples and
+  `@dataclass(repr=False)` falls back to the inherited `repr`; docstrings
+  are dedented as CPython 3.13's compiler does; `Box[int]` on a generic
+  class (PEP 695 or `Generic[T]`) is a callable generic alias usable as a
+  base, `list[int]` prints `list[int]`, a class's own `__class_getitem__`
+  is honoured, and `int | str` / `A | None` are runtime unions that
+  `isinstance` and `issubclass` accept.
+- **Protocols.** `NotImplemented` exists; a comparison or arithmetic dunder
+  returning it defers to the reflected method and then to CPython's
+  default (identity for `==`, `TypeError` otherwise). `await obj` drives
+  `obj.__await__()` to its return value. `raise e from e` records the
+  cause; `iter(g) is g` for a generator; `True.bit_length()` works; keys /
+  items views compare with sets and each other as sets do.
+- **`dict.fromkeys` / `str.maketrans`** are class methods (they were
+  dispatched as unbound methods of their first argument).
+
+Still different from CPython (each a known gap, not a silent wrong
+answer you can rely on): a PEP 695 `type` alias is bound to its value
+rather than a `TypeAliasType` object, so `isinstance(x, Alias)` works on
+the VM where CPython raises `TypeError` and `Alias.__value__` is missing;
+`__del__` never runs; a metaclass's `__call__` / `__new__` are not
+consulted; `Named.__mro__` omits `typing.Generic`; a lone surrogate
+(`"\ud800"`) cannot be represented in a Rust `String` (`'%c' % 0xD800`
+yields U+FFFD); and a generator that falls back to eager collection (see
+"What the VM does not support yet") runs its side effects at call time.
+
 ## Multi-file projects
 
 Since v0.9.0 the VM loads sibling `.ty` modules from the project source

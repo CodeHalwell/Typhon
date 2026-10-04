@@ -911,3 +911,185 @@ trap("eq", lambda: d == {"a": (1, 2), "b": {"c": 3}})
         ),
     );
 }
+
+// ── W5-18: remaining silent divergences ───────────────────────────────────
+
+#[test]
+fn w5_18_dict_fromkeys_and_class_level_calls() {
+    // `dict.fromkeys` was dispatched as an unbound method on its first
+    // argument (`list has no method 'fromkeys'`); corpus/valid/textwrap.ty
+    // builds a translation table with it in a class body.
+    assert_matches_cpython(
+        "w5_18_dict_fromkeys_and_class_level_calls",
+        r#"plain class Wrapper:
+    whitespace = "\t\n\x0b\x0c\r "
+    trans = dict.fromkeys(map(ord, whitespace), ord(" "))
+show(Wrapper.trans, "a\tb".translate(Wrapper.trans))
+show(dict.fromkeys(["a", "b"], 0), dict.fromkeys("ab"), {}.fromkeys([1, 1, 2], []))
+d = dict.fromkeys(range(3))
+show(d, type(d).__name__, str.maketrans("ab", "xy"), "abc".translate(str.maketrans("ab", "xy")))
+trap("no args", lambda: dict.fromkeys())
+"#,
+    );
+}
+
+#[test]
+fn w5_18_values_and_errors_match_cpython() {
+    assert_matches_cpython(
+        "w5_18_values_and_errors_match_cpython",
+        r#"import sys
+trap("float tie", lambda: (-4819706.21) ** 2)
+trap("float tie2", lambda: 1e15 + 0.3)
+trap("fstr conv", lambda: f"{True!s:<8}|{'a'!r:>5}|")
+trap("type3", lambda: type("X", (), {"a": 1}).a)
+trap("type3 bad", lambda: type("Q", [], {}))
+trap("split empty", lambda: "abc".split(""))
+trap("float big", lambda: float(10**400))
+trap("pow big", lambda: 2.0 ** 10000)
+trap("floordiv big", lambda: 10**400 // 3.0)
+trap("truediv", lambda: (10**400 / 10**399, -(10**400) / 3 < 0, 7 / -2, (2**80 + 1) / 2**27))
+trap("truediv big", lambda: 10**400 / 3)
+trap("neg pow big", lambda: (10**400) ** -1)
+trap("%c", lambda: "%c" % 0x110000)
+trap("%c str", lambda: "%c" % "ab")
+trap("fmt ,_", lambda: format(1, ",_"))
+trap("int str limit", lambda: len(str(10**5000)))
+trap("str int limit", lambda: int("1" * 5000))
+trap("hex big", lambda: format(10**5000, "x")[:4])
+sys.set_int_max_str_digits(0)
+trap("unlimited", lambda: len(str(10**5000)))
+sys.set_int_max_str_digits(4300)
+trap("slice huge", lambda: "abc"[2**64:] + "abc"[: -(2**70)])
+trap("index huge", lambda: [1][-(2**70)])
+def raise_from() -> object:
+    try:
+        e = ValueError("x")
+        raise e from e
+    except ValueError as err:
+        return (err.__cause__ is err, err is e)
+trap("raise from self", raise_from)
+trap("None fmt", lambda: f"{None:>6}")
+trap("list fmt", lambda: format([1], "x"))
+trap("int in str", lambda: 1 in "abc")
+trap("bit_length", lambda: (True.bit_length(), (5).bit_length()))
+trap("keys views", lambda: ({1: 2}.keys() <= {1: 2, 3: 4}.keys(), {1: 2}.keys() == {1}, {1: 2}.items() == {(1, 2)}, {1: 2}.keys() == [1]))
+trap("unions", lambda: (repr(int | str), repr(int | None), isinstance(1, int | str), isinstance(None, int | None), issubclass(bool, int | str)))
+def g() -> object:
+    yield 1
+gen = g()
+trap("iter gen", lambda: iter(gen) is gen)
+"#,
+    );
+}
+
+#[test]
+fn w5_18_object_model_matches_cpython() {
+    assert_matches_cpython(
+        "w5_18_object_model_matches_cpython",
+        r#"import asyncio
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from functools import total_ordering
+plain class Abs(ABC):
+    @abstractmethod
+    def f(self) -> int: ...
+    @abstractmethod
+    def b(self) -> int: ...
+plain class Half(Abs):
+    def f(self) -> int:
+        return 1
+plain class Full(Half):
+    def b(self) -> int:
+        return 2
+trap("abstract", lambda: Abs())
+trap("half", lambda: Half())
+show(Full().f() + Full().b())
+@dataclass(repr=False)
+plain class NR:
+    a: int
+show(repr(NR(1))[:12])
+plain class Doc:
+    """
+    Indented doc.
+      More.
+    """
+def fdoc() -> None:
+    """First line.
+
+        Body.
+    """
+show(repr(Doc.__doc__), repr(fdoc.__doc__))
+plain class Seq:
+    def __init__(self, n: int) -> None:
+        self.n = n
+    def __getitem__(self, i: int) -> int:
+        if i >= self.n:
+            raise IndexError
+        return i * 10
+show(20 in Seq(5), 25 in Seq(5))
+@total_ordering
+plain class TO:
+    def __init__(self, v: int) -> None:
+        self.v = v
+    def __eq__(self, o: object) -> bool:
+        return self.v == o.v
+    def __lt__(self, o: "TO") -> bool:
+        return self.v < o.v
+show(TO(1) <= TO(2), TO(3) >= TO(2), TO(1) > TO(2))
+@dataclass(order=True)
+plain class OD:
+    a: int
+    b: str = "x"
+show(OD(1) < OD(2), [o.a for o in sorted([OD(3), OD(1), OD(2)])], OD(1, "a") < OD(1, "b"))
+registry: list[str] = []
+def register(cls: type) -> type:
+    registry.append(cls.__name__)
+    return cls
+@register
+plain class Reg:
+    pass
+show(registry, "__lt__" in TO.__dict__, "__le__" in TO.__dict__)
+plain class V:
+    def __init__(self, x: int) -> None:
+        self.x = x
+    def __eq__(self, o: object) -> bool:
+        if not isinstance(o, V):
+            return NotImplemented
+        return self.x == o.x
+    def __add__(self, o: object) -> "V":
+        if isinstance(o, V):
+            return V(self.x + o.x)
+        return NotImplemented
+    def __radd__(self, o: object) -> "V":
+        if isinstance(o, int):
+            return V(self.x + o)
+        return NotImplemented
+show(V(1) == V(1), V(1) == 1, (3 + V(2)).x, repr(NotImplemented))
+trap("add bad", lambda: V(1) + "s")
+plain class Box[T]:
+    def __init__(self, v: T) -> None:
+        self.v = v
+plain class Named(Box[int]):
+    pass
+show(Named(3).v, Box[int], Box[int](5).v, list[int], tuple[int, ...], Box[int] | None)
+plain class Plain:
+    pass
+trap("plain subscript", lambda: Plain[int])
+X = type("X", (ValueError,), {"code": 7})
+try:
+    raise X("boom")
+except ValueError as e:
+    show("caught", type(e).__name__, e, e.code)
+plain class Fut:
+    def __init__(self, v: int) -> None:
+        self.v = v
+    def __await__(self) -> object:
+        if False:
+            yield
+        return self.v * 2
+async def main() -> None:
+    show("awaited", await Fut(21))
+asyncio.run(main())
+"#,
+    );
+}

@@ -773,6 +773,9 @@ pub fn class_is_frozen_dataclass(class: &Rc<Class>) -> bool {
 /// natives print as classes (`<class 'int'>`, `<class 'ValueError'>`),
 /// everything else as `<built-in function name>`.
 pub fn native_repr(name: &str) -> String {
+    if name == "NotImplemented" {
+        return name.to_owned();
+    }
     let is_type = matches!(
         name,
         "int"
@@ -1638,6 +1641,12 @@ impl IterState {
     }
 }
 
+/// `NotImplemented`: the singleton a binary or comparison dunder returns to
+/// decline. The VM binds one native of that name (see `builtins`).
+pub fn is_not_implemented(v: &Value) -> bool {
+    matches!(v, Value::Native(n) if n.name == "NotImplemented")
+}
+
 /// The current contents of a dict view, in dict order.
 pub fn view_items(kind: DictViewKind, dict: &RcDict) -> Vec<Value> {
     let d = dict.borrow();
@@ -2302,6 +2311,7 @@ impl Value {
             Value::Set(s) if s.frozen.get() => "frozenset",
             Value::Set(_) => "set",
             Value::Range { .. } => "range",
+            Value::Native(n) if n.name == "NotImplemented" => "NotImplementedType",
             Value::Native(_) | Value::Function(_) | Value::BoundMethod { .. } => "function",
             Value::Class(_) => "type",
             // Don't leak the class name into a `'static str`. Callers that
@@ -2772,7 +2782,16 @@ impl Value {
     pub fn to_float(&self) -> Result<f64, Unwind> {
         match self {
             Value::FloatData(crate::value::VmFloat { value: x, .. }) => Ok(*x),
-            Value::Int(i) => Ok(i.to_f64()),
+            Value::Int(i) => {
+                let x = i.to_f64();
+                if x.is_infinite() {
+                    return Err(Unwind::Exception(crate::error::VmException::new(
+                        "OverflowError",
+                        "int too large to convert to float",
+                    )));
+                }
+                Ok(x)
+            }
             Value::Bool(b) => Ok(*b as i64 as f64),
             Value::Bytes(b) => {
                 parse_decimal_str::<f64>(&String::from_utf8_lossy(b)).map_err(|_| {
@@ -3261,8 +3280,23 @@ fn instance_repr_inner(inst: &Instance) -> String {
             return format!("<{}.{}: {}>", inst.class.name, name, val.py_repr());
         }
     }
+    // `@dataclass(repr=False)` generates no `__repr__`: the nearest
+    // ancestor's applies — another dataclass's (its own fields), else
+    // `object.__repr__`.
+    let mut repr_fields = &inst.class.fields;
+    if class_is_dataclass(&inst.class) && !class_flag(&inst.class, "__typhon_dc_repr__", true) {
+        match inst
+            .class
+            .mro
+            .iter()
+            .find(|c| class_is_dataclass(c) && class_flag(c, "__typhon_dc_repr__", true))
+        {
+            Some(provider) => repr_fields = &provider.fields,
+            None => return object_default_repr(inst),
+        }
+    }
     let mut parts: Vec<String> = Vec::with_capacity(fields.len());
-    for cf in &inst.class.fields {
+    for cf in repr_fields {
         if let Some(v) = fields.get(&cf.name) {
             parts.push(format!("{}={}", cf.name, v.py_repr()));
         }
@@ -3525,58 +3559,57 @@ fn format_float(x: f64) -> String {
     }
 }
 
-/// CPython's shortest float repr breaks an *exact* tie toward the even last
-/// digit; Rust's Ryū picks the larger one, so `1e15 + 0.3` — exactly
-/// `1000000000000000.25` — printed as `…0.3` under `tyc run` and `…0.2`
-/// after `tyc build`.
+/// CPython's `repr` is the shortest digit string that round-trips and, when
+/// several strings of that length do, the one *closest* to the double's
+/// exact value (ties to even) — David Gay's `dtoa` mode 0. Rust's shortest
+/// formatter finds the same length but not always the same digits:
+/// `(-4819706.21)**2` is exactly `23229567950712.5625`, and Rust prints
+/// `…712.563` where CPython prints `…712.562`; `1e15 + 0.3` (exactly
+/// `…0.25`) likewise.
 ///
-/// The tie has to be established, not guessed: `3.3000000000000003` also has
-/// a neighbour that round-trips, but it is genuinely the closer of the two
-/// and both surfaces print it. So compare against the double's exact decimal
-/// expansion and only swap when the digit after the repr's last is a `5`
-/// with nothing but zeros behind it.
+/// The closest string of that length is the correctly rounded one, which
+/// Rust's fixed-precision formatting produces (it rounds ties to even, as
+/// C does); use it whenever it also round-trips. Below 16 significant
+/// digits a double's rounding interval holds only one candidate, so only
+/// the long forms need the check.
 fn tie_break_even(s: &str, x: f64) -> String {
-    let digits: Vec<u8> = s.bytes().filter(u8::is_ascii_digit).collect();
-    // A tie needs the full 17 significant digits, and only an odd last digit
-    // can be replaced by an even neighbour.
-    if digits.len() < 16 || (digits[digits.len() - 1] - b'0').is_multiple_of(2) {
+    let mantissa_end = s.find(['e', 'E']).unwrap_or(s.len());
+    let digits: Vec<u8> = s[..mantissa_end].bytes().filter(u8::is_ascii_digit).collect();
+    let lead = digits.iter().take_while(|d| **d == b'0').count();
+    let k = digits.len() - lead;
+    if k < 16 {
         return s.to_owned();
     }
-    let significant = digits.iter().skip_while(|d| **d == b'0').count();
-    // A double's exact decimal expansion is finite, and only one that
-    // *terminates* in a `5` can be a tie — 80 significant digits is far more
-    // than such a value needs.
-    let exact = format!("{:.*e}", 80, x.abs());
-    let mantissa: Vec<u8> = exact[..exact.find('e').unwrap_or(exact.len())]
+    let rounded = format!("{:.*e}", k - 1, x.abs());
+    let best: Vec<u8> = rounded[..rounded.find('e').unwrap_or(rounded.len())]
         .bytes()
         .filter(u8::is_ascii_digit)
         .collect();
-    if mantissa.len() <= significant
-        || mantissa[significant] != b'5'
-        || mantissa[significant + 1..].iter().any(|d| *d != b'0')
+    if best.len() != k || best[..] == digits[lead..] {
+        return s.to_owned();
+    }
+    // Put the correctly rounded digits in place of the shortest ones.
+    let mut seen = 0usize;
+    let candidate: String = s
+        .char_indices()
+        .map(|(i, c)| {
+            if i < mantissa_end && c.is_ascii_digit() {
+                seen += 1;
+                if seen > lead {
+                    return best[seen - lead - 1] as char;
+                }
+            }
+            c
+        })
+        .collect();
+    if candidate
+        .parse::<f64>()
+        .is_ok_and(|v| v.to_bits() == x.to_bits())
     {
-        return s.to_owned();
+        candidate
+    } else {
+        s.to_owned()
     }
-    let mantissa_end = s.find(['e', 'E']).unwrap_or(s.len());
-    let Some(last) = s[..mantissa_end].rfind(|c: char| c.is_ascii_digit()) else {
-        return s.to_owned();
-    };
-    let digit = s.as_bytes()[last];
-    // The last digit is odd, so both neighbours are digits and both even;
-    // whichever round-trips is the one CPython prints.
-    for neighbour in [digit + 1, digit - 1] {
-        let mut candidate = String::with_capacity(s.len());
-        candidate.push_str(&s[..last]);
-        candidate.push(neighbour as char);
-        candidate.push_str(&s[last + 1..]);
-        if candidate
-            .parse::<f64>()
-            .is_ok_and(|v| v.to_bits() == x.to_bits())
-        {
-            return candidate;
-        }
-    }
-    s.to_owned()
 }
 
 /// Format a float in CPython's scientific-notation style: shortest
@@ -3586,14 +3619,13 @@ fn format_float_scientific(x: f64) -> String {
     // Rust's `{:e}` gives a shortest mantissa with a base-10 exponent but
     // formats the exponent without a sign or zero-padding (`1e20`,
     // `1.5e-5`). Reformat the exponent to CPython's `e+NN` / `e-NN`.
-    let raw = format!("{:e}", x);
+    let raw = tie_break_even(&format!("{:e}", x), x);
     let (mantissa, exp_str) = match raw.split_once('e') {
         Some((m, e)) => (m, e),
         None => return raw,
     };
     let exp: i32 = exp_str.parse().unwrap_or(0);
     let sign = if exp < 0 { '-' } else { '+' };
-    let mantissa = tie_break_even(mantissa, x);
     format!("{}e{}{:02}", mantissa, sign, exp.abs())
 }
 
