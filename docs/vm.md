@@ -637,12 +637,29 @@ listed there as a non-goal for now.
 
 ## Diagnostics
 
-Runtime failures surface as `Traceback (most recent call last):` followed
-by `KIND: MESSAGE`. The traceback is intentionally minimal in v1 — it
-names the function frame but not the source line. Source-line tracebacks
-inside the VM are a tracked follow-up; for now, programs that need full
-traceback fidelity should run under `tyc run --compile` and use
-`tyc trace` on the captured stderr.
+An uncaught exception prints a CPython-format traceback on stderr and
+exits with status 1:
+
+- every frame names the file, the **line in the `.ty` source** and the
+  function, followed by that source line as written — the VM maps the
+  preprocessed buffer back through the same line table `tyc check` uses,
+  so `?`, with-chains, `rescue`, `gather:` and `as!` above a frame no
+  longer shift its line or show lowered Python;
+- a chained exception prints first, with CPython's separator: "The above
+  exception was the direct cause of the following exception:" for
+  `raise … from e`, "During handling of the above exception, another
+  exception occurred:" for an exception raised in an `except` or `finally`
+  (suppressed by `from None`);
+- a run of more than three identical frames (deep recursion) collapses into
+  `[Previous line repeated N more times]`;
+- the last line is `Kind: str(exc)` (so `KeyError: 'missing'` keeps its
+  quotes).
+
+Two cosmetic differences remain: the file name is the path `tyc run` was
+given rather than an absolute path, and CPython 3.13's `~~~^^^` position
+markers are not drawn (the compiled path's remapped tracebacks omit them
+too). The recursion limit counts the module frame, as CPython does: at the
+default of 1000, the 999th nested call is the last that fits.
 
 ## Talking to the VM from Rust
 

@@ -1383,6 +1383,17 @@ pub fn with_exception_cause(v: Value, cause: Value) -> Value {
     })
 }
 
+/// Attach the traceback recorded when the exception was caught.
+pub fn with_exception_traceback(v: Value, frames: Rc<Vec<crate::error::Frame>>) -> Value {
+    update_exception_chain(v, |c| c.traceback = Some(frames))
+}
+
+/// Whether `v` already carries a recorded traceback.
+pub fn has_exception_traceback(v: Option<&Value>) -> bool {
+    v.and_then(exception_chain)
+        .is_some_and(|c| c.traceback.is_some())
+}
+
 /// Record the exception that was being handled when this one was raised
 /// (`__context__`). Never overwrites a context already set, and never chains
 /// an exception to itself — both would build a cycle CPython does not.
@@ -1466,6 +1477,10 @@ pub struct ExcChain {
     pub cause: Option<Value>,
     pub context: Option<Value>,
     pub suppress_context: bool,
+    /// The frames the exception unwound through before it was caught,
+    /// innermost first, ending in the catching frame — what an uncaught
+    /// exception chained to this one prints for it.
+    pub traceback: Option<Rc<Vec<crate::error::Frame>>>,
 }
 
 #[derive(Clone)]

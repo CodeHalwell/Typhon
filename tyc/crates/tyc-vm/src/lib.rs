@@ -60,6 +60,17 @@ pub fn run_source(
     origin: Option<&Path>,
     script_args: &[String],
 ) -> Result<i32, VmError> {
+    run_source_reporting(source, origin, script_args, &mut |tb| eprint!("{tb}"))
+}
+
+/// [`run_source`], handing the rendered traceback of an uncaught exception
+/// to `report` instead of writing it to stderr.
+fn run_source_reporting(
+    source: &str,
+    origin: Option<&Path>,
+    script_args: &[String],
+    report: &mut dyn FnMut(&str),
+) -> Result<i32, VmError> {
     let (mut module, prep) = front_end(source, FrontEnd::Program).map_err(|e| {
         let where_ = origin
             .map(|p| format!("{}: ", p.display()))
@@ -108,11 +119,13 @@ pub fn run_source(
     // Source info for traceback frames: file name + line table over the
     // preprocessed source (line-preserving for ordinary statements, so
     // frame numbers match the user's .ty lines).
-    interp.current_source = Some(std::rc::Rc::new(interp::SourceInfo::new(
+    interp.current_source = Some(std::rc::Rc::new(interp::SourceInfo::mapped(
         origin
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| "<source>".to_string()),
         &prep.python_source,
+        source,
+        &prep.line_map,
     )));
     // Seed sys.argv before any user code (or import sys) can observe it.
     let argv0 = origin
@@ -186,41 +199,147 @@ pub fn run_source(
             Ok(code)
         }
         Err(Unwind::Exception(exc)) => {
-            eprintln!("Traceback (most recent call last):");
-            // Frames accumulate innermost-first as the exception bubbles
-            // through `call_function`; CPython prints outermost-first.
-            // The module-level frame (where the failing call chain
-            // started) renders first, from the interpreter's final
-            // statement offset.
-            if let Some(si) = &interp.current_source {
-                let line = si.line_of(interp.current_offset);
-                eprintln!("  File \"{}\", line {}, in <module>", si.name, line);
-                if let Some(text) = si.line_text(line) {
-                    eprintln!("    {text}");
-                }
-            }
-            for frame in exc.frames.iter().rev() {
-                match (&frame.file, frame.line) {
-                    (Some(file), Some(line)) => {
-                        eprintln!("  File \"{file}\", line {line}, in {}", frame.function);
-                        if let Some(text) = &frame.line_text {
-                            eprintln!("    {text}");
-                        }
-                    }
-                    _ => eprintln!("  in {}", frame.function),
-                }
-            }
-            if exc.message.is_empty() {
-                eprintln!("{}", exc.kind);
-            } else {
-                eprintln!("{}: {}", exc.kind, exc.message);
-            }
+            report(&render_uncaught(&mut interp, &exc));
             Ok(1)
         }
         Err(Unwind::Break | Unwind::Continue | Unwind::QuestionMark(_) | Unwind::Yield(_)) => {
             Err(VmError::runtime("unexpected control-flow at module level"))
         }
     }
+}
+
+/// Print an uncaught exception the way CPython's default excepthook does:
+/// any chained exception first (its `__cause__`, else its `__context__`
+/// unless suppressed) with the "direct cause" / "during handling"
+/// separator, then this exception's traceback — outermost frame first,
+/// three copies of a repeated frame and "[Previous line repeated N more
+/// times]" for the rest — and its `Kind: str(exc)` line.
+fn render_uncaught(interp: &mut Interpreter, exc: &VmException) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    // The module-level frame (where the failing call chain started) comes
+    // from the interpreter's final statement offset; the rest accumulated
+    // innermost-first as the exception bubbled through `call_function`.
+    let mut frames: Vec<error::Frame> = exc.frames.iter().rev().cloned().collect();
+    if let Some(si) = &interp.current_source {
+        let line = si.line_of(interp.current_offset);
+        frames.insert(
+            0,
+            error::Frame {
+                function: "<module>".to_owned(),
+                line: Some(line),
+                file: Some(si.name.clone()),
+                line_text: si.line_text(line),
+                repeat: 0,
+            },
+        );
+    }
+    let mut seen: Vec<Value> = Vec::new();
+    if let Some(v) = &exc.value {
+        seen.push(v.clone());
+        render_chained(interp, v, &mut seen, &mut out);
+    }
+    out.push_str("Traceback (most recent call last):\n");
+    render_frames(&frames, &mut out);
+    let headline = match &exc.value {
+        Some(v) => exception_headline(interp, v, &exc.kind),
+        None if exc.message.is_empty() => exc.kind.clone(),
+        None => format!("{}: {}", exc.kind, exc.message),
+    };
+    let _ = writeln!(out, "{headline}");
+    out
+}
+
+/// Print the exception `v` is chained to, recursively, followed by the
+/// separator CPython prints before `v`'s own traceback.
+fn render_chained(interp: &mut Interpreter, v: &Value, seen: &mut Vec<Value>, out: &mut String) {
+    use std::fmt::Write as _;
+    let Some(chain) = value::exception_chain(v) else {
+        return;
+    };
+    let (next, separator) = match (&chain.cause, &chain.context) {
+        (Some(cause), _) if !matches!(cause, Value::None) => (
+            cause.clone(),
+            "The above exception was the direct cause of the following exception:",
+        ),
+        (_, Some(context)) if !chain.suppress_context => (
+            context.clone(),
+            "During handling of the above exception, another exception occurred:",
+        ),
+        _ => return,
+    };
+    if seen
+        .iter()
+        .any(|s| value::exception_values_identical(s, &next))
+    {
+        return;
+    }
+    seen.push(next.clone());
+    render_chained(interp, &next, seen, out);
+    if let Some(tb) = value::exception_chain(&next).and_then(|c| c.traceback.clone()) {
+        out.push_str("Traceback (most recent call last):\n");
+        let frames: Vec<error::Frame> = tb.iter().rev().cloned().collect();
+        render_frames(&frames, out);
+    }
+    let kind = match &next {
+        Value::Exception { kind, .. } => (**kind).clone(),
+        Value::Instance(i) => i.class.name.clone(),
+        _ => "Exception".to_owned(),
+    };
+    let _ = writeln!(out, "{}", exception_headline(interp, &next, &kind));
+    let _ = writeln!(out, "\n{separator}\n");
+}
+
+/// `Kind: str(exc)`, or the bare kind when `str(exc)` is empty.
+fn exception_headline(interp: &mut Interpreter, v: &Value, kind: &str) -> String {
+    let message = interp.str_of(v).unwrap_or_default();
+    if message.is_empty() {
+        kind.to_owned()
+    } else {
+        format!("{kind}: {message}")
+    }
+}
+
+/// Render frames outermost-first, collapsing a run of identical frames
+/// past the third into CPython's "[Previous line repeated N more times]".
+fn render_frames(frames: &[error::Frame], out: &mut String) {
+    use std::fmt::Write as _;
+    const RECURSIVE_CUTOFF: u64 = 3;
+    let mut last: Option<(&Option<String>, Option<u32>, &str)> = None;
+    let mut count: u64 = 0;
+    let flush = |count: u64, out: &mut String| {
+        if count > RECURSIVE_CUTOFF {
+            let more = count - RECURSIVE_CUTOFF;
+            let s = if more > 1 { "s" } else { "" };
+            let _ = writeln!(out, "  [Previous line repeated {more} more time{s}]");
+        }
+    };
+    for frame in frames {
+        let key = (&frame.file, frame.line, frame.function.as_str());
+        if last != Some(key) {
+            flush(count, out);
+            last = Some(key);
+            count = 0;
+        }
+        for _ in 0..=frame.repeat {
+            count += 1;
+            if count > RECURSIVE_CUTOFF {
+                continue;
+            }
+            match (&frame.file, frame.line) {
+                (Some(file), Some(line)) => {
+                    let _ = writeln!(out, "  File \"{file}\", line {line}, in {}", frame.function);
+                    if let Some(text) = &frame.line_text {
+                        let _ = writeln!(out, "    {text}");
+                    }
+                }
+                _ => {
+                    let _ = writeln!(out, "  in {}", frame.function);
+                }
+            }
+        }
+    }
+    flush(count, out);
 }
 
 /// Which caller a [`front_end`] run serves.
@@ -649,6 +768,9 @@ pub fn modelled_module_exports(
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod parity_tests;
 
 #[cfg(test)]
 mod tests {

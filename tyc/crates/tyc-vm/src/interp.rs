@@ -156,6 +156,10 @@ pub struct Interpreter {
     /// caller is a coroutine or a sync helper: it is the dynamic extent of
     /// the loop that matters, exactly as in CPython.
     pub running_loop_depth: usize,
+    /// The function whose body is executing (`None` at module level) — the
+    /// frame a caught exception's `__traceback__` ends in, so a chained
+    /// traceback names the catching function the way CPython's does.
+    pub current_function: Option<Rc<Function>>,
 }
 
 /// Upper bound on values an eagerly-evaluated generator may yield before the
@@ -177,6 +181,9 @@ pub struct SourceInfo {
     pub name: String,
     pub line_starts: Vec<usize>,
     pub lines: Vec<String>,
+    /// Parsed-buffer line → user-source line (0-based); empty when the
+    /// two coincide. See [`SourceInfo::mapped`].
+    pub line_map: Vec<usize>,
 }
 
 impl SourceInfo {
@@ -191,13 +198,44 @@ impl SourceInfo {
             name: name.into(),
             line_starts,
             lines: source.lines().map(|l| l.to_owned()).collect(),
+            line_map: Vec::new(),
         }
     }
-    /// 1-based line number containing `offset`.
+    /// A source whose AST offsets index `python_source` (the preprocessed,
+    /// sugar-expanded buffer the parser saw) while frames must report the
+    /// line the user wrote: `line_map[i]` is the 0-based `original` line
+    /// that `python_source` line `i` came from (the table
+    /// `preprocess::expand_and_preprocess_mapped` composes, the same one
+    /// `tyc check` reports through). Without it every `?`, with-chain,
+    /// `rescue` or `gather:` above a frame shifted its line number, and the
+    /// printed text was the lowered Python (`__typhon_checked_cast__(…)`).
+    pub fn mapped(
+        name: impl Into<String>,
+        python_source: &str,
+        original: &str,
+        line_map: &[usize],
+    ) -> Self {
+        let mut info = Self::new(name, python_source);
+        if !line_map.is_empty() {
+            let original = original.strip_prefix('\u{feff}').unwrap_or(original);
+            info.lines = original.lines().map(|l| l.to_owned()).collect();
+            info.line_map = line_map.to_vec();
+        }
+        info
+    }
+    /// 1-based line number containing `offset` — in the user's source when
+    /// the info carries a line map, else in the parsed buffer.
     pub fn line_of(&self, offset: usize) -> u32 {
-        match self.line_starts.binary_search(&offset) {
-            Ok(i) => (i + 1) as u32,
-            Err(i) => i as u32,
+        let raw = match self.line_starts.binary_search(&offset) {
+            Ok(i) => i + 1,
+            Err(i) => i,
+        };
+        if self.line_map.is_empty() || raw == 0 {
+            return raw as u32;
+        }
+        match self.line_map.get(raw - 1) {
+            Some(&orig) => (orig + 1) as u32,
+            None => raw as u32,
         }
     }
     pub fn line_text(&self, line: u32) -> Option<String> {
@@ -239,6 +277,7 @@ impl Interpreter {
             builtin_ext_registries: HashMap::new(),
             method_cache: RefCell::new(HashMap::new()),
             running_loop_depth: 0,
+            current_function: None,
         };
         crate::builtins::install(&mut interp);
         interp
@@ -461,7 +500,7 @@ impl Interpreter {
                 std::mem::take(&mut st.resume),
             )
         };
-        if self.stack_depth >= self.max_stack_depth {
+        if self.recursion_exhausted() {
             g.borrow_mut().running = false;
             return Err(Unwind::Exception(VmException::new(
                 "RecursionError",
@@ -471,6 +510,7 @@ impl Interpreter {
         self.stack_depth += 1;
         let caller_offset = self.current_offset;
         let caller_source = self.current_source.clone();
+        let caller_function = self.current_function.replace(function.clone());
         if function.source.is_some() {
             self.current_source = function.source.clone();
         }
@@ -521,6 +561,7 @@ impl Interpreter {
         };
         self.current_offset = caller_offset;
         self.current_source = caller_source;
+        self.current_function = caller_function;
         result
     }
 
@@ -609,14 +650,45 @@ impl Interpreter {
         result
     }
 
+    /// Whether one more Python-level frame would exceed the recursion limit.
+    /// CPython counts the module's own frame against `sys.getrecursionlimit()`
+    /// (at the default 1000, 999 nested calls fit), so the VM's call depth
+    /// stops one short of the limit.
+    fn recursion_exhausted(&self) -> bool {
+        self.stack_depth + 1 >= self.max_stack_depth
+    }
+
     /// Append a traceback frame for `function` to an escaping exception,
     /// stamped with the raise-site line read against the active source.
     fn stamp_frame(&self, e: &mut VmException, function: &str) {
-        // CPython prints every frame; cap ours so deep recursion doesn't
-        // render a megabyte of repeats.
+        let line = self
+            .current_source
+            .as_ref()
+            .map(|si| si.line_of(self.current_offset));
+        // Run-length encode consecutive identical frames (deep recursion):
+        // the renderer prints three and CPython's "[Previous line repeated
+        // N more times]", which needs the true count.
+        if let Some(last) = e.frames.last_mut() {
+            let same_file = match (&last.file, &self.current_source) {
+                (Some(f), Some(si)) => *f == si.name,
+                (None, None) => true,
+                _ => false,
+            };
+            if last.function == function && last.line == line && same_file {
+                last.repeat += 1;
+                return;
+            }
+        }
+        // CPython prints every frame; cap the distinct ones so a deep
+        // mutual recursion doesn't render a megabyte of frames.
         if e.frames.len() >= 64 {
             return;
         }
+        e.frames.push(self.frame_here(function));
+    }
+
+    /// A traceback frame for `function` at the current statement.
+    fn frame_here(&self, function: &str) -> crate::error::Frame {
         let (line, file, line_text) = match &self.current_source {
             Some(si) => {
                 let line = si.line_of(self.current_offset);
@@ -624,12 +696,38 @@ impl Interpreter {
             }
             None => (None, None, None),
         };
-        e.frames.push(crate::error::Frame {
+        crate::error::Frame {
             function: function.to_owned(),
             line,
             file,
             line_text,
-        });
+            repeat: 0,
+        }
+    }
+
+    /// Give a just-caught exception its `__traceback__`: the frames it
+    /// unwound through plus the catching frame (the function, or
+    /// `<module>`, whose `try` caught it — at the line that raised), as
+    /// CPython's traceback for a handled exception reads. Stored on the
+    /// exception value so a later uncaught exception chained to it (`raise
+    /// … from e`, or one raised while handling it) prints the "The above
+    /// exception was the direct cause …" / "During handling …" sections.
+    fn record_caught_traceback(&self, exc: &mut VmException) {
+        let mut frames = exc.frames.clone();
+        let name = self
+            .current_function
+            .as_ref()
+            .map(|f| f.name.clone())
+            .unwrap_or_else(|| "<module>".to_owned());
+        frames.push(self.frame_here(&name));
+        let value = exc
+            .value
+            .take()
+            .unwrap_or_else(|| exception_binding_value(exc));
+        exc.value = Some(crate::value::with_exception_traceback(
+            value,
+            Rc::new(frames),
+        ));
     }
 
     /// A loop's `else` clause, resumable across a `yield` inside it.
@@ -2339,9 +2437,11 @@ impl Interpreter {
             Value::Str(Rc::new(path.to_string_lossy().into_owned())),
         );
         let saved_source = self.current_source.clone();
-        self.current_source = Some(Rc::new(SourceInfo::new(
+        self.current_source = Some(Rc::new(SourceInfo::mapped(
             path.to_string_lossy().into_owned(),
             &prep.python_source,
+            &source,
+            &prep.line_map,
         )));
         // Enter the loaded module's package so its own relative imports
         // resolve from where it lives, not from where the import chain
@@ -4502,7 +4602,7 @@ impl Interpreter {
         kwargs: &[(String, Value)],
         receiver: Option<Value>,
     ) -> Result<Value, Unwind> {
-        if self.stack_depth >= self.max_stack_depth {
+        if self.recursion_exhausted() {
             return Err(Unwind::Exception(VmException::new(
                 "RecursionError",
                 "maximum recursion depth exceeded",
@@ -4519,6 +4619,7 @@ impl Interpreter {
         // def-time captures) to its own file, not the caller's.
         let caller_offset = self.current_offset;
         let caller_source = self.current_source.clone();
+        let caller_function = self.current_function.replace(f.clone());
         if f.source.is_some() {
             self.current_source = f.source.clone();
         }
@@ -4597,6 +4698,7 @@ impl Interpreter {
         };
         self.current_offset = caller_offset;
         self.current_source = caller_source;
+        self.current_function = caller_function;
         result
     }
 
@@ -7882,6 +7984,8 @@ impl Interpreter {
                         }
                         match matched {
                             Some(index) => {
+                                let mut exc = exc;
+                                self.record_caught_traceback(&mut exc);
                                 let ExceptHandler::ExceptHandler(h) = &t.handlers[index];
                                 // If the raised exception carried a
                                 // user-constructed Instance (typical for
@@ -7932,7 +8036,17 @@ impl Interpreter {
                     // if finally itself raises, that wins (D5).
                     Stage::Finally(result)
                 }
-                Stage::Finally(pending) => {
+                Stage::Finally(mut pending) => {
+                    // An exception on its way out becomes the `__context__`
+                    // of anything the `finally` body raises; capture its
+                    // traceback now, while the offset is still its raise site.
+                    if let Err(Unwind::Exception(e)) = &mut pending {
+                        if !t.finalbody.is_empty()
+                            && !crate::value::has_exception_traceback(e.value.as_ref())
+                        {
+                            self.record_caught_traceback(e);
+                        }
+                    }
                     return match self.exec_block(&t.finalbody, env) {
                         Ok(()) => pending,
                         Err(Unwind::Yield(v)) => {

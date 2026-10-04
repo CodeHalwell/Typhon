@@ -274,6 +274,15 @@ stable diagnostic fragments rather than terminal-width-dependent wrapping.
   `tyc check` and `tyc build` run — instead of two hand-assembled copies
   that had drifted (they ran `expand_lazy_lets` before
   `expand_typed_let_unpack`, the reverse of the canonical order).
+- **VM tracebacks report the `.ty` source** (W5-19). Frames carry the line
+  the user wrote and its text — an 8-line file with one `?` no longer
+  reports `line 10`, and an `as!` frame no longer shows
+  `__typhon_checked_cast__(…)`. Uncaught chained exceptions print their
+  cause / context sections, deep recursion collapses into "[Previous line
+  repeated N more times]", and a user-raised `KeyError` keeps its quotes.
+  The recursion limit now counts the module frame, so a program that
+  catches `RecursionError` sees the depth CPython reports (one less than
+  before).
 
 #### W6 — CI, docs & hygiene
 
