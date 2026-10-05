@@ -227,7 +227,17 @@ textarea:focus-visible,
 
 /* Starlight specific focus fixes */
 .sl-link-card {
-  transition: border-color 120ms ease, transform 120ms ease, box-shadow 120ms ease, background-color 120ms ease;
+  transition: border-color 120ms ease, transform 120ms ease, box-shadow 120ms ease, background-color 120ms ease, outline 120ms ease, outline-offset 120ms ease;
+}
+
+.sl-link-card:has(a:focus-visible) {
+  outline: 2px solid var(--sl-color-accent);
+  outline-offset: 2px;
+  border-radius: 0.5rem;
+}
+
+.sl-link-card a:focus-visible {
+  outline: none;
 }
 
 .sl-link-card:hover,
