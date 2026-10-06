@@ -6426,4 +6426,57 @@ let pet: Animal = Dog(name=\"Rex\")
             1
         );
     }
+
+    /// The generated `deep_freeze` keeps a Python 3.15 `frozendict`
+    /// (PEP 814) as a `frozendict`, freezes its values, and still rejects
+    /// a cycle through one. Calls the helper directly, because the checker
+    /// does not know the `frozendict` name yet. Needs `python3.15`: skipped
+    /// without it, unless `TYC_REQUIRE_PYTHON315` is set (the CI test job
+    /// sets it).
+    #[test]
+    fn runtime_deep_freeze_handles_py315_frozendict() {
+        let have_py315 = std::process::Command::new("python3.15")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !have_py315 {
+            if std::env::var_os("TYC_REQUIRE_PYTHON315").is_some() {
+                panic!("TYC_REQUIRE_PYTHON315 is set but python3.15 is not on PATH");
+            }
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("freeze.py"), TYPHON_RUNTIME_FREEZE_PY).unwrap();
+        let script = "\
+from freeze import deep_freeze
+r = deep_freeze(frozendict(a=[1, {2}], b=frozendict(c=[3])))
+assert type(r) is frozendict, type(r)
+assert r == frozendict(a=(1, frozenset({2})), b=frozendict(c=(3,))), r
+assert type(r['b']) is frozendict
+lst = []
+lst.append(frozendict(x=lst))
+try:
+    deep_freeze(lst)
+except TypeError as e:
+    assert 'cycle' in str(e), e
+else:
+    raise AssertionError('cycle through a frozendict was not rejected')
+print('ok')
+";
+        let out = std::process::Command::new("python3.15")
+            .args([
+                "-I",
+                "-c",
+                &format!("import sys; sys.path.insert(0, '.')\n{script}"),
+            ])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "ok",
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }

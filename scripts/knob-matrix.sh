@@ -176,11 +176,22 @@ for name in "${NAMES[@]}"; do
 
     # A fixture whose emitted Python needs a newer CPython than the one under
     # test is build-only here by design; a newer-interpreter leg executes it.
+    # A malformed value or a failed probe is a fixture failure, never a skip:
+    # either would otherwise turn execution coverage off silently.
     min_py="$(meta "$fx" min-python "")"
     if [ -n "$min_py" ] && [ "$run_mode" != "none" ]; then
-        if ! "$PYTHON313" -c "import sys; sys.exit(sys.version_info[:2] < tuple(map(int, '$min_py'.split('.'))))" >/dev/null 2>&1; then
-            run_mode="none"
-            reduced_by_design=": needs Python $min_py+"
+        if ! [[ "$min_py" =~ ^3\.[0-9]+$ ]]; then
+            echo "      meta.conf: min-python='$min_py' is not of the form 3.N"
+            problems="y"
+        else
+            new_enough="$("$PYTHON313" -c "import sys; print(int(sys.version_info[:2] >= (3, ${min_py#3.})))" 2>&1)"
+            case "$new_enough" in
+                1) ;;
+                0) run_mode="none"
+                   reduced_by_design=": needs Python $min_py+" ;;
+                *) echo "      could not compare $PYTHON313 against min-python=$min_py: $new_enough"
+                   problems="y" ;;
+            esac
         fi
     fi
 
