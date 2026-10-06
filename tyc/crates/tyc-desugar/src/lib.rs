@@ -2834,7 +2834,7 @@ fn mutable_builtin_of_value(value: &Expr) -> Option<&'static str> {
 /// out.
 fn collect_module_mutable_names(body: &[Stmt]) -> HashMap<String, &'static str> {
     let mut out: HashMap<String, &'static str> = HashMap::new();
-    let mut conflicting: HashSet<String> = HashSet::new();
+    let mut conflicting: HashSet<&str> = HashSet::new();
     for stmt in body {
         let (name, kind) = match stmt {
             Stmt::AnnAssign(a) => {
@@ -2859,11 +2859,11 @@ fn collect_module_mutable_names(body: &[Stmt]) -> HashMap<String, &'static str> 
             }
             (Some(k), Some(prev)) if *prev == k => {}
             _ => {
-                conflicting.insert(name.to_owned());
+                conflicting.insert(name);
             }
         }
     }
-    out.retain(|name, _| !conflicting.contains(name));
+    out.retain(|name, _| !conflicting.contains(name.as_str()));
     out
 }
 
@@ -4856,7 +4856,7 @@ fn inherit_parent_fields(body: Vec<Stmt>, plain_starts: &[u32]) -> Vec<Stmt> {
                         tyc_syntax::mro::field_collection_order(c.name.as_str(), parents);
 
                     let mut inherited: Vec<Stmt> = Vec::new();
-                    let mut placed: std::collections::HashSet<String> =
+                    let mut placed: std::collections::HashSet<&str> =
                         std::collections::HashSet::new();
                     for ancestor in &ancestors {
                         let Some(parent_fields) = field_map.get(ancestor) else {
@@ -4868,7 +4868,7 @@ fn inherit_parent_fields(body: Vec<Stmt>, plain_starts: &[u32]) -> Vec<Stmt> {
                                 continue;
                             };
                             let fname = nf.id.as_str();
-                            if !placed.insert(fname.to_owned()) {
+                            if !placed.insert(fname) {
                                 continue;
                             }
                             // A child re-declaration overrides the type but
@@ -4889,6 +4889,7 @@ fn inherit_parent_fields(body: Vec<Stmt>, plain_starts: &[u32]) -> Vec<Stmt> {
                             _ => true,
                         });
                     }
+                    drop(placed);
 
                     if !inherited.is_empty() {
                         // FINDINGS #22: a `class!` subclass gets a synthesised
