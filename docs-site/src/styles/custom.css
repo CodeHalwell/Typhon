@@ -226,6 +226,21 @@ textarea:focus-visible,
 }
 
 /* Starlight specific focus fixes */
+.sl-link-button {
+  transition: transform 120ms ease, box-shadow 120ms ease, background-color 120ms ease, filter 120ms ease;
+}
+
+.sl-link-button:hover,
+.sl-link-button:focus-visible {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px color-mix(in srgb, var(--sl-color-accent) 20%, transparent);
+}
+
+.sl-link-button:active {
+  transform: translateY(0);
+  box-shadow: 0 2px 6px color-mix(in srgb, var(--sl-color-accent) 15%, transparent);
+}
+
 .sl-link-card {
   transition: border-color 120ms ease, transform 120ms ease, box-shadow 120ms ease, background-color 120ms ease;
 }
@@ -259,11 +274,15 @@ textarea:focus-visible,
   .card:active,
   .sl-link-card:hover,
   .sl-link-card:focus-within,
-  .sl-link-card:active {
+  .sl-link-card:active,
+  .sl-link-button:hover,
+  .sl-link-button:focus-visible,
+  .sl-link-button:active {
     transform: none;
   }
   .card,
   .sl-link-card,
+  .sl-link-button,
   .sl-link-card .icon,
   table tbody tr,
   .sl-markdown-content a:not(:where(.not-content *)),

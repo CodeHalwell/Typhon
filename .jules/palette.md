@@ -69,3 +69,6 @@
 ## 2024-08-23 - [Remove tabindex="0" from abbr tags]
 **Learning:** Adding `tabindex="0"` to non-interactive `<abbr>` elements makes them focusable for screen readers but fails WCAG 1.4.13 (Content on Hover or Focus) for sighted keyboard users. Standard browser tooltips (`title` attribute) do not display on keyboard focus, making this pattern inaccessible.
 **Action:** Removed `tabindex="0"` from `<abbr>` tags. If tooltips are needed for keyboard users, a custom tooltip component must be used instead of relying on the native `title` attribute on `<abbr>`.
+## 2026-10-06 - [Add tactile hover and active states to hero CTA buttons]
+**Learning:** Found that the primary CTA buttons (`.sl-link-button`) on the landing page lacked any tactile feedback (hover/active transforms or shadows), making them feel unresponsive compared to `.card` and `.sl-link-card` components which already had these interactions.
+**Action:** Added smooth `transform: translateY(-2px)` and `box-shadow` on hover, and a pressed state on `:active` to `.sl-link-button` in `custom.css` to unify the interaction model across the site. Ensured these new animations respect `@media (prefers-reduced-motion: reduce)`.
