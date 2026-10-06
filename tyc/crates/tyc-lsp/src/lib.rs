@@ -25,7 +25,7 @@ use tower_lsp_server::ls_types::{
 };
 use tower_lsp_server::{jsonrpc, Client, LanguageServer, LspService, Server};
 use tyc_db::{
-    check_source_file, check_source_file_with_imports, module_shapes_query, preprocessed_full,
+    check_source_file, check_source_file_with_imports_opts, module_shapes_query, preprocessed_full,
     preprocessed_text, resolved_module_arc, set_source_text, ArcPreprocessResult, ModuleShapes,
     SourceFile, TycDatabase,
 };
@@ -848,6 +848,35 @@ impl Backend {
             if !still_current() {
                 return None;
             }
+            // The project's `[strictness]` lint knobs and `[python] target`,
+            // through a fingerprint-keyed cache: hash the file (cheap) and
+            // reuse the parsed knobs while it is unchanged. Only a real edit
+            // triggers the toml parse, so this is fresh even without a
+            // file-watcher event yet avoids per-keystroke parsing. The read
+            // runs *outside* the db lock — holding it across `std::fs` I/O
+            // would block concurrent checks; a racing double-miss just reads
+            // twice and stores the same value. (PR #192 review.)
+            let opts = workspace
+                .as_ref()
+                .map(|(root, _)| {
+                    let stamp = config_fingerprint(root);
+                    if let Some((cached_stamp, opts)) =
+                        lint_options_cache_arc.blocking_lock().get(root).copied()
+                    {
+                        if cached_stamp.is_some() && cached_stamp == stamp {
+                            return opts;
+                        }
+                    }
+                    let opts = read_lint_options(root);
+                    lint_options_cache_arc
+                        .blocking_lock()
+                        .insert(root.clone(), (stamp, opts));
+                    opts
+                })
+                .unwrap_or_default();
+            let check_options = tyc_db::CheckOptions {
+                python_minor: opts.python_minor,
+            };
             // Phase 2, under the db lock again: the check itself.
             let mut db = db_arc.blocking_lock();
             #[allow(clippy::explicit_auto_deref)]
@@ -869,7 +898,12 @@ impl Backend {
                 // (`uri_str_for_check` / `text_for_check` are
                 // consumed in the `build_project_shapes_salsa` call
                 // above so we don't need to thread them again here.)
-                check_source_file_with_imports(&mut *db, source_file, &project_shapes)
+                check_source_file_with_imports_opts(
+                    &mut *db,
+                    source_file,
+                    &project_shapes,
+                    check_options,
+                )
             };
             // Apply the project's `[strictness]` severity knobs, through the
             // same `tyc-diagnostics` rules the CLI uses. Without this the
@@ -924,33 +958,6 @@ impl Backend {
             // from the project's `typhon.toml` so a `suggest-gather = false`
             // silences the editor hint exactly as it does the CLI.
             if let Ok(parsed) = tyc_syntax::parse_module(&mapping_source) {
-                let opts = workspace
-                    .as_ref()
-                    .map(|(root, _)| {
-                        // mtime-keyed cache: `stat` the file (cheap) and reuse
-                        // the parsed knobs while the mtime is unchanged. Only a
-                        // real edit triggers the `read_to_string` + toml parse,
-                        // so this is fresh even without a file-watcher event yet
-                        // avoids per-keystroke parsing. Both the `stat` and the
-                        // read run *outside* the lock — holding it across
-                        // `std::fs` I/O would block concurrent checks; a racing
-                        // double-miss just reads twice and stores the same
-                        // value. (PR #192 review.)
-                        let stamp = config_fingerprint(root);
-                        if let Some((cached_stamp, opts)) =
-                            lint_options_cache_arc.blocking_lock().get(root).copied()
-                        {
-                            if cached_stamp.is_some() && cached_stamp == stamp {
-                                return opts;
-                            }
-                        }
-                        let opts = read_lint_options(root);
-                        lint_options_cache_arc
-                            .blocking_lock()
-                            .insert(root.clone(), (stamp, opts));
-                        opts
-                    })
-                    .unwrap_or_default();
                 // `lazy_import_opportunity` needs preprocess-derived facts
                 // that don't survive into the AST (already-lazy import
                 // aliases, `pub` names, `pub *`). Pull them from the cached
@@ -2678,6 +2685,20 @@ fn read_lint_options(root: &std::path::Path) -> tyc_analyse::LintOptions {
     let Ok(parsed) = toml::from_str::<toml::Value>(&text) else {
         return opts;
     };
+    // `[python] target` gates target-specific builtins and syntax in the
+    // checker (`frozendict`, PEP 810 `lazy from`) — the same value
+    // `tyc check` derives through `PythonConfig::target_minor`.
+    if let Some(minor) = parsed
+        .get("python")
+        .and_then(|p| p.as_table())
+        .and_then(|t| t.get("target"))
+        .and_then(|v| v.as_str())
+        .and_then(tyc_venv::config::parse_python_target)
+        .filter(|(major, _)| *major == 3)
+        .and_then(|(_, minor)| u8::try_from(minor).ok())
+    {
+        opts.python_minor = minor;
+    }
     // `[python] free-threaded` gates the parallel advice lints.
     if let Some(b) = parsed
         .get("python")

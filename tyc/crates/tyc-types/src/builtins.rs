@@ -12,6 +12,7 @@ enum ResultRule {
     Slice,
     Container(&'static str),
     Dict,
+    FrozenDict,
     Same,
     Round,
     Sum,
@@ -56,6 +57,8 @@ const CONTRACTS: &[Contract] = &[
     contract!("set", 0, 1, &[], ResultRule::Container("set")),
     contract!("frozenset", 0, 1, &[], ResultRule::Container("frozenset")),
     contract!("dict", 0, 1, &["*"], ResultRule::Dict),
+    // Python 3.15 (PEP 814); `tyc::requires_python` on an older target.
+    contract!("frozendict", 0, 1, &["*"], ResultRule::FrozenDict),
     contract!("abs", 1, 1, &[], ResultRule::Same),
     contract!("round", 1, 2, &["number", "ndigits"], ResultRule::Round),
     contract!("sum", 1, 2, &["start"], ResultRule::Sum),
@@ -153,10 +156,18 @@ pub(super) fn result(name: &str, args: &[Type], keywords: &[(&str, Type)]) -> Op
         ResultRule::Range => Type::Class("range".into()),
         ResultRule::Container(head) => generic(head, vec![elem()]),
         ResultRule::Iterator => generic("Iterator", vec![elem()]),
-        ResultRule::Dict => {
+        ResultRule::Dict | ResultRule::FrozenDict => {
+            let out = if matches!(c.result, ResultRule::FrozenDict) {
+                "frozendict"
+            } else {
+                "dict"
+            };
             if let Type::Generic(head, params) = &first {
-                if matches!(head.as_str(), "dict" | "Mapping" | "MutableMapping") {
-                    return Some(generic("dict", params.clone()));
+                if matches!(
+                    head.as_str(),
+                    "dict" | "Mapping" | "MutableMapping" | "frozendict"
+                ) {
+                    return Some(generic(out, params.clone()));
                 }
             }
             let pair = elem();
@@ -167,10 +178,10 @@ pub(super) fn result(name: &str, args: &[Type], keywords: &[(&str, Type)]) -> Op
                 _ => (Type::Unknown, Type::Unknown),
             };
             if keywords.is_empty() {
-                generic("dict", vec![key, value])
+                generic(out, vec![key, value])
             } else {
                 generic(
-                    "dict",
+                    out,
                     vec![
                         Type::Str,
                         Type::union_of(keywords.iter().map(|(_, v)| v.clone()).collect()),
@@ -253,6 +264,7 @@ const BUILTIN_CLASSES: &[&str] = &[
     "filter",
     "float",
     "frozenset",
+    "frozendict",
     "int",
     "list",
     "map",

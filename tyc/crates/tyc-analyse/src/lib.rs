@@ -115,7 +115,8 @@ pub use secrets::{
 
 pub mod perf;
 pub use perf::{
-    is_stdlib_top_level, lazy_import_opportunity_diagnostics, perf_diagnostics, PerfLintContext,
+    is_stdlib_top_level, is_stdlib_top_level_for, lazy_import_opportunity_diagnostics,
+    perf_diagnostics, PerfLintContext,
 };
 
 // ── Shared editor / CLI lint advisories ───────────────────────────────────────
@@ -154,6 +155,11 @@ pub struct LintOptions {
     /// `[strictness] parallel-min-size` — matches the rewrite's threshold so
     /// the advice fires on exactly the shapes that would be rewritten.
     pub parallel_min_size: u64,
+    /// `[python] target` minor version (`13` for `"3.13"`, `15` for
+    /// `"3.15"`). Target-aware passes key off it: the language server also
+    /// hands it to the type checker so `frozendict` / `lazy from` gating
+    /// matches `tyc check`.
+    pub python_minor: u8,
 }
 
 impl Default for LintOptions {
@@ -171,6 +177,7 @@ impl Default for LintOptions {
             auto_parallel: false,
             auto_parallel_reductions: false,
             parallel_min_size: 64,
+            python_minor: 13,
         }
     }
 }

@@ -444,8 +444,22 @@ fn run_vm(args: RunArgs) -> Result<()> {
             with_ty: false,
         })?;
     }
-    let code = tyc_vm::run_file(&entry, &args.script_args).map_err(|e| miette!("{e}"))?;
+    let code = tyc_vm::run_file_for_target(&entry, &args.script_args, vm_python_minor(&entry))
+        .map_err(|e| miette!("{e}"))?;
     std::process::exit(code);
+}
+
+/// The `[python] target` minor version of the project `entry` belongs to
+/// (`13` — the oldest target — for a standalone file), so the VM follows the
+/// same target-dependent runtime behaviour as the compiled program.
+fn vm_python_minor(entry: &std::path::Path) -> u8 {
+    let dir = entry
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    dir.and_then(|d| TyphonConfig::load(&d).ok().flatten())
+        .map(|(_, cfg)| cfg.python.target_minor())
+        .unwrap_or(13)
 }
 
 /// Modules the program imports, and `module.attr` names it reads, that the

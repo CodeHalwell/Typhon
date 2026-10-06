@@ -13,7 +13,7 @@ use miette::{miette, Result};
 use tyc_analyse::{
     analyse_purity, editor_lint_diagnostics, evaluate_comptime_in_source, purity_diagnostics,
 };
-use tyc_db::{check_file_with_imports, extract_shapes_for_path, TycDatabase};
+use tyc_db::{check_file_with_imports_opts, extract_shapes_for_path, CheckOptions, TycDatabase};
 use tyc_diagnostics::{Diagnostics, SanitisedDiagnostic, TycError};
 use tyc_emit::{compare_modules, StubTestKind};
 #[cfg(test)]
@@ -304,6 +304,11 @@ fn check_scope(args: &CheckArgs, scope: &CheckScope) -> Result<ScopeOutcome> {
     // standalone `.ty` file being checked outside a project context should
     // not be penalised for importing third-party packages that happen not to
     // be listed anywhere.
+    // The project's `[python] target` gates target-specific builtins and
+    // syntax (`frozendict`, PEP 810 `lazy from`) in the checker.
+    let check_options = CheckOptions {
+        python_minor: config.python.target_minor(),
+    };
     let project_modules = collect_project_modules(scope, &config.project.src);
     let mut extra_modules: Vec<String> = config
         .dependencies
@@ -546,8 +551,13 @@ fn check_scope(args: &CheckArgs, scope: &CheckScope) -> Result<ScopeOutcome> {
 
             let path_key = path.to_string_lossy().into_owned();
             record_distributed_lines(&mut distributed_by_path, &path_key, &source);
-            let file_diags =
-                check_file_with_imports(&mut db, path_key, source.clone(), &project_shapes);
+            let file_diags = check_file_with_imports_opts(
+                &mut db,
+                path_key,
+                source.clone(),
+                &project_shapes,
+                check_options,
+            );
             diags.extend(file_diags);
 
             // R2-4: warn if the module name collides with a Python
@@ -559,7 +569,12 @@ fn check_scope(args: &CheckArgs, scope: &CheckScope) -> Result<ScopeOutcome> {
             // emitted `.py` is not on `sys.path` and so cannot
             // intercept stdlib imports.
             if has_project_config {
-                if let Some(warning) = check_stdlib_module_shadow(&path, &source, &src_dir_canon) {
+                if let Some(warning) = check_stdlib_module_shadow_for(
+                    &path,
+                    &source,
+                    &src_dir_canon,
+                    check_options.python_minor,
+                ) {
                     diags.push_warning(warning);
                 }
                 // Relative imports that escape the source root (`from ..x
@@ -610,6 +625,7 @@ fn check_scope(args: &CheckArgs, scope: &CheckScope) -> Result<ScopeOutcome> {
                     auto_parallel,
                     auto_parallel_reductions: config.strictness.auto_parallel_reductions,
                     parallel_min_size: config.strictness.parallel_min_size,
+                    python_minor: config.python.target_minor(),
                 },
             );
             diags.extend(analysis_diags);
@@ -631,8 +647,13 @@ fn check_scope(args: &CheckArgs, scope: &CheckScope) -> Result<ScopeOutcome> {
                 };
                 let path_key = path.to_string_lossy().into_owned();
                 record_distributed_lines(&mut distributed_by_path, &path_key, &source);
-                let file_diags =
-                    check_file_with_imports(&mut db, path_key, source.clone(), &project_shapes);
+                let file_diags = check_file_with_imports_opts(
+                    &mut db,
+                    path_key,
+                    source.clone(),
+                    &project_shapes,
+                    check_options,
+                );
                 diags.extend(file_diags);
 
                 // R2-4: same stdlib-name shadow check for `.dty` stubs
@@ -643,9 +664,12 @@ fn check_scope(args: &CheckArgs, scope: &CheckScope) -> Result<ScopeOutcome> {
                 // project context emits no `build/` so the runtime
                 // collision can't happen. PR #129 copilot review.
                 if has_project_config {
-                    if let Some(warning) =
-                        check_stdlib_module_shadow(&path, &source, &src_dir_canon)
-                    {
+                    if let Some(warning) = check_stdlib_module_shadow_for(
+                        &path,
+                        &source,
+                        &src_dir_canon,
+                        check_options.python_minor,
+                    ) {
                         diags.push_warning(warning);
                     }
                 }
@@ -1014,13 +1038,27 @@ fn pub_star_line_offset(source: &str, line_idx: usize) -> usize {
     offset
 }
 
+#[cfg(test)]
 pub(crate) fn check_stdlib_module_shadow(
     path: &std::path::Path,
     source: &str,
     src_dir: &std::path::Path,
 ) -> Option<TycError> {
+    check_stdlib_module_shadow_for(path, source, src_dir, 13)
+}
+
+/// [`check_stdlib_module_shadow`] against the stdlib of the `3.<python_minor>`
+/// target — a `profiling.ty` shadows 3.15's new `profiling` package, but
+/// nothing on 3.13.
+pub(crate) fn check_stdlib_module_shadow_for(
+    path: &std::path::Path,
+    source: &str,
+    src_dir: &std::path::Path,
+    python_minor: u8,
+) -> Option<TycError> {
     let stem = path.file_stem()?.to_str()?;
-    if !stdlib_top_level_contains(stem) {
+    if !stdlib_top_level_contains(stem) && !tyc_analyse::is_stdlib_top_level_for(stem, python_minor)
+    {
         return None;
     }
     // Only fire when the file sits AT the top of the configured
@@ -1356,6 +1394,22 @@ mod tests {
             diag.is_some(),
             "expected a warning for a project module named `types` at the top of src/"
         );
+    }
+
+    #[test]
+    fn stdlib_module_shadow_follows_the_target_stdlib() {
+        // `profiling` is new in Python 3.15 (PEP 799), `annotationlib` in 3.14.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        let src_canon = src.canonicalize().unwrap();
+        for (file, since) in [("profiling.ty", 15), ("annotationlib.ty", 14)] {
+            let path = write_ty(&src, file, "pub let X: int = 1\n");
+            for minor in 13..=15u8 {
+                let diag = check_stdlib_module_shadow_for(&path, "", &src_canon, minor);
+                assert_eq!(diag.is_some(), minor >= since, "{file} on 3.{minor}");
+            }
+        }
     }
 
     #[test]

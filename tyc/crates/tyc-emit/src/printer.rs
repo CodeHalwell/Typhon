@@ -79,6 +79,13 @@ pub struct Emitter {
 
 const INDENT_WIDTH: usize = 4;
 
+/// Loop variables of the nested comprehension a PEP 798 unpacking lowers to
+/// on a pre-3.15 target. Dunder-suffixed so a class body does not mangle
+/// them; a comprehension's targets are local to it, so they never escape.
+const PEP798_ITEM: &str = "__typhon_item__";
+const PEP798_KEY: &str = "__typhon_key__";
+const PEP798_VALUE: &str = "__typhon_value__";
+
 impl Emitter {
     pub fn new() -> Self {
         Self {
@@ -125,6 +132,31 @@ impl Emitter {
     /// TypeAlias for the configured target.
     fn lower_pep695(&self) -> bool {
         self.target_minor > 0 && self.target_minor < 12
+    }
+
+    /// True when PEP 798 unpacking in comprehensions (`[*xs for xs in
+    /// groups]`, `{**m for m in maps}`) must be rewritten as a nested
+    /// comprehension: the syntax is Python 3.15+. An unset target (`tyc
+    /// fmt`) prints the source form unchanged.
+    fn lower_pep798(&self) -> bool {
+        self.target_minor > 0 && self.target_minor < 15
+    }
+
+    /// The `lazy ` keyword for an import the parser read as PEP 810 lazy
+    /// (`lazy import json`, `lazy from json import dumps`), or `""`.
+    ///
+    /// Printed only where CPython accepts it: a 3.15+ target (or an unset
+    /// one — `tyc fmt` keeps the source form) and the module's top level. A
+    /// nested lazy import is a `SyntaxError` on 3.15 (and `tyc check` rejects
+    /// a nested `lazy from`), so it, like every lazy import on an older
+    /// target, is printed as the plain import it always ran as.
+    fn lazy_prefix(&self, is_lazy: bool) -> &'static str {
+        let native = self.target_minor == 0 || self.target_minor >= 15;
+        if is_lazy && native && self.indent == 0 {
+            "lazy "
+        } else {
+            ""
+        }
     }
 
     pub fn finish(self) -> String {
@@ -769,7 +801,8 @@ impl Emitter {
             }
 
             Stmt::Import(i) => {
-                self.fill("import ");
+                self.fill(self.lazy_prefix(i.is_lazy));
+                self.write("import ");
                 let mut first = true;
                 for alias in &i.names {
                     if !first {
@@ -784,7 +817,8 @@ impl Emitter {
             // `level` is now a plain `u32` rather than `Option<Int>`; emit
             // that many leading dots.
             Stmt::ImportFrom(i) => {
-                self.fill("from ");
+                self.fill(self.lazy_prefix(i.is_lazy));
+                self.write("from ");
                 for _ in 0..i.level {
                     self.write(".");
                 }
@@ -1144,33 +1178,55 @@ impl Emitter {
 
             Expr::ListComp(l) => {
                 self.write("[");
-                self.emit_expr(&l.elt);
-                for gen in &l.generators {
-                    self.emit_comprehension(gen);
-                }
+                self.emit_comprehension_body(&l.elt, &l.generators);
                 self.write("]");
             }
 
             Expr::SetComp(s) => {
                 self.write("{");
-                self.emit_expr(&s.elt);
-                for gen in &s.generators {
-                    self.emit_comprehension(gen);
-                }
+                self.emit_comprehension_body(&s.elt, &s.generators);
                 self.write("}");
             }
 
-            // Ruff makes `key` an `Option<Expr>`; treat a missing key as
-            // an unreachable codepath in valid Python but stay defensive.
+            // Ruff makes `key` an `Option<Expr>`: `None` is a PEP 798 dict
+            // unpacking, `{**m for m in maps}` (Python 3.15+).
             Expr::DictComp(d) => {
                 self.write("{");
-                if let Some(key) = &d.key {
-                    self.emit_expr(key);
-                    self.write(": ");
-                }
-                self.emit_expr(&d.value);
-                for gen in &d.generators {
-                    self.emit_comprehension(gen);
+                match &d.key {
+                    Some(key) => {
+                        self.emit_expr(key);
+                        self.write(": ");
+                        self.emit_expr(&d.value);
+                        for gen in &d.generators {
+                            self.emit_comprehension(gen);
+                        }
+                    }
+                    None if self.lower_pep798() => {
+                        // `{**m for m in maps}` merges each mapping in turn,
+                        // later keys winning — exactly what a nested
+                        // comprehension over `m.items()` does, and `m` is
+                        // still evaluated once per outer iteration.
+                        self.write(PEP798_KEY);
+                        self.write(": ");
+                        self.write(PEP798_VALUE);
+                        for gen in &d.generators {
+                            self.emit_comprehension(gen);
+                        }
+                        self.write(" for ");
+                        self.write(PEP798_KEY);
+                        self.write(", ");
+                        self.write(PEP798_VALUE);
+                        self.write(" in ");
+                        self.emit_postfix_operand(&d.value);
+                        self.write(".items()");
+                    }
+                    None => {
+                        self.write("**");
+                        self.emit_operand_above(&d.value, bin_op_precedence(&Operator::BitOr) - 1);
+                        for gen in &d.generators {
+                            self.emit_comprehension(gen);
+                        }
+                    }
                 }
                 self.write("}");
             }
@@ -1178,10 +1234,7 @@ impl Emitter {
             // `GeneratorExp` is now `Expr::Generator`.
             Expr::Generator(g) => {
                 self.write("(");
-                self.emit_expr(&g.elt);
-                for gen in &g.generators {
-                    self.emit_comprehension(gen);
-                }
+                self.emit_comprehension_body(&g.elt, &g.generators);
                 self.write(")");
             }
 
@@ -1760,6 +1813,45 @@ impl Emitter {
             self.write("**");
         }
         self.emit_expr(&kw.value);
+    }
+
+    /// The element and `for` clauses of a list / set comprehension or a
+    /// generator expression. A PEP 798 unpacking element (`*xs`, Python
+    /// 3.15+) on an older target becomes one more `for` clause over the
+    /// unpacked iterable — `[*xs for xs in groups]` is
+    /// `[item for xs in groups for item in xs]`, which is how PEP 798
+    /// itself defines it.
+    fn emit_comprehension_body(&mut self, elt: &Expr, generators: &[Comprehension]) {
+        match elt {
+            Expr::Starred(starred) if self.lower_pep798() => {
+                self.write(PEP798_ITEM);
+                for gen in generators {
+                    self.emit_comprehension(gen);
+                }
+                self.write(" for ");
+                self.write(PEP798_ITEM);
+                self.write(" in ");
+                self.emit_operand_above(&starred.value, IF_EXP_PRECEDENCE);
+            }
+            _ => {
+                self.emit_expr(elt);
+                for gen in generators {
+                    self.emit_comprehension(gen);
+                }
+            }
+        }
+    }
+
+    /// `expr` as the receiver of a postfix (`.attr`, call, subscript),
+    /// parenthesised unless it is already a primary.
+    fn emit_postfix_operand(&mut self, expr: &Expr) {
+        if needs_paren_for_postfix(expr) {
+            self.write("(");
+            self.emit_expr(expr);
+            self.write(")");
+        } else {
+            self.emit_expr(expr);
+        }
     }
 
     fn emit_comprehension(&mut self, gen: &Comprehension) {
@@ -2602,6 +2694,83 @@ mod tests {
     fn round_trip(src: &str) -> String {
         let parsed = parse_module(src).expect("parse failed");
         emit(parsed.syntax())
+    }
+
+    /// Emit `src` for the `3.<minor>` target, as `tyc build` does.
+    fn emit_for(src: &str, minor: u8) -> String {
+        let parsed = parse_module(src).expect("parse failed");
+        crate::emit_python_with_line_offsets_for_target(parsed.syntax(), minor).0
+    }
+
+    #[test]
+    fn pep798_unpacking_is_native_on_315_and_lowered_before() {
+        let src = "a = [*xs for xs in groups]\n\
+                   b = {*xs for xs in groups if xs}\n\
+                   c = (*xs for xs in groups)\n\
+                   d = {**m for m in maps}\n\
+                   e = [*xs async for xs in agroups]\n";
+        let native = emit_for(src, 15);
+        for form in [
+            "[*xs for xs in groups]",
+            "{*xs for xs in groups if xs}",
+            "(*xs for xs in groups)",
+            "{**m for m in maps}",
+            "[*xs async for xs in agroups]",
+        ] {
+            assert!(
+                native.contains(form),
+                "3.15 keeps `{form}` native; got:\n{native}"
+            );
+        }
+        let lowered = emit_for(src, 13);
+        for form in [
+            "[__typhon_item__ for xs in groups for __typhon_item__ in xs]",
+            "{__typhon_item__ for xs in groups if xs for __typhon_item__ in xs}",
+            "(__typhon_item__ for xs in groups for __typhon_item__ in xs)",
+            "{__typhon_key__: __typhon_value__ for m in maps for __typhon_key__, __typhon_value__ in m.items()}",
+            "[__typhon_item__ async for xs in agroups for __typhon_item__ in xs]",
+        ] {
+            assert!(lowered.contains(form), "3.13 lowers to `{form}`; got:\n{lowered}");
+        }
+        assert!(
+            !lowered.contains('*'),
+            "no unpacking may survive on 3.13; got:\n{lowered}"
+        );
+        // An unset target (`tyc fmt`) prints the source form.
+        assert!(emit_for(src, 0).contains("{**m for m in maps}"));
+    }
+
+    #[test]
+    fn pep798_lowering_parenthesises_non_primary_operands() {
+        let out = emit_for(
+            "d = {**(a or b) for _ in r}\nl = [*(a if c else b) for _ in r]\n",
+            14,
+        );
+        assert!(out.contains("in (a or b).items()"), "got:\n{out}");
+        assert!(out.contains("in (a if c else b)]"), "got:\n{out}");
+        let native = emit_for("d = {**(a or b) for _ in r}\n", 15);
+        assert!(native.contains("{**(a or b) for _ in r}"), "got:\n{native}");
+    }
+
+    #[test]
+    fn pep810_lazy_keyword_only_where_cpython_accepts_it() {
+        let src =
+            "lazy import json\nlazy from os import path as p\nif True:\n    lazy import csv\n";
+        let native = emit_for(src, 15);
+        assert!(native.contains("lazy import json\n"), "got:\n{native}");
+        assert!(
+            native.contains("lazy from os import path as p\n"),
+            "got:\n{native}"
+        );
+        assert!(
+            native.contains("    import csv\n") && !native.contains("lazy import csv"),
+            "a nested lazy import is a SyntaxError on 3.15 and stays eager; got:\n{native}"
+        );
+        let old = emit_for(src, 14);
+        assert!(
+            !old.contains("lazy"),
+            "no `lazy` keyword before 3.15; got:\n{old}"
+        );
     }
 
     /// Locate a Python 3.12+ interpreter on `PATH`; returns `None` to skip.

@@ -91,18 +91,32 @@ pub type DictMap = crate::pydict::PyDict;
 pub struct FrozenCell<T> {
     values: RefCell<T>,
     pub frozen: std::cell::Cell<bool>,
+    /// A frozen dict that is a Python 3.15 `frozendict` (PEP 814) rather
+    /// than a `mappingproxy`: hashable, and its `str` is its `repr`. Only
+    /// ever set together with `frozen`, and only on dicts.
+    pub frozendict: std::cell::Cell<bool>,
 }
 impl<T> FrozenCell<T> {
     pub fn new(values: T) -> Self {
         Self {
             values: RefCell::new(values),
             frozen: std::cell::Cell::new(false),
+            frozendict: std::cell::Cell::new(false),
         }
     }
     pub fn frozen(values: T) -> Self {
         Self {
             values: RefCell::new(values),
             frozen: std::cell::Cell::new(true),
+            frozendict: std::cell::Cell::new(false),
+        }
+    }
+    /// A `frozendict` (Python 3.15) holding `values`.
+    pub fn frozendict(values: T) -> Self {
+        Self {
+            values: RefCell::new(values),
+            frozen: std::cell::Cell::new(true),
+            frozendict: std::cell::Cell::new(true),
         }
     }
 }
@@ -625,6 +639,10 @@ pub enum HashKey {
     /// their hashed representation so two frozensets with the same members
     /// in different insertion order hash equal.
     FrozenSet(Rc<Vec<HashKey>>),
+    /// A `frozendict` (Python 3.15) used as a dict key / set member: its
+    /// items in insertion order. Equality and hashing are order-independent,
+    /// as CPython's are (`hash(fd) == hash(frozenset(fd.items()))`).
+    FrozenDict(Rc<Vec<(HashKey, HashKey)>>),
     /// A (frozen) dataclass instance used as a dict/set key. CPython makes
     /// `@dataclass(frozen=True)` instances hashable via the hash of the
     /// field tuple. The original instance is retained so iterating the
@@ -1020,6 +1038,25 @@ fn frozenset_canonical(items: &[HashKey]) -> Vec<Vec<u8>> {
     keys
 }
 
+/// The sorted canonical encodings of a `frozendict` key's items, so two
+/// frozendicts with the same items in a different order encode equally.
+fn frozendict_canonical(items: &[(HashKey, HashKey)]) -> Vec<Vec<u8>> {
+    let mut pairs: Vec<Vec<u8>> = items
+        .iter()
+        .map(|(k, v)| {
+            let (k, v) = (k.canonical_sort_key(), v.canonical_sort_key());
+            let mut pair = Vec::with_capacity(k.len() + v.len() + 8);
+            pair.extend_from_slice(&(k.len() as u32).to_be_bytes());
+            pair.extend_from_slice(&k);
+            pair.extend_from_slice(&(v.len() as u32).to_be_bytes());
+            pair.extend_from_slice(&v);
+            pair
+        })
+        .collect();
+    pairs.sort();
+    pairs
+}
+
 impl HashKey {
     /// Stable, collision-safe sort key. Two distinct `HashKey` values
     /// have distinct sort keys (the discriminant byte differs across
@@ -1075,6 +1112,14 @@ impl HashKey {
                 // Members are kept in the frozenset's iteration order;
                 // sort their encodings so equal frozensets encode equally.
                 for inner in frozenset_canonical(items) {
+                    out.extend_from_slice(&(inner.len() as u32).to_be_bytes());
+                    out.extend_from_slice(&inner);
+                }
+            }
+            HashKey::FrozenDict(items) => {
+                out.push(11);
+                out.extend_from_slice(&(items.len() as u32).to_be_bytes());
+                for inner in frozendict_canonical(items) {
                     out.extend_from_slice(&(inner.len() as u32).to_be_bytes());
                     out.extend_from_slice(&inner);
                 }
@@ -1138,6 +1183,13 @@ impl HashKey {
                 // Surface back as a frozenset.
                 Value::Set(Rc::new(crate::value::FrozenCell::frozen(set)))
             }
+            HashKey::FrozenDict(items) => {
+                let mut map = DictMap::new();
+                for (k, v) in items.iter() {
+                    map.insert(k.clone(), v.clone().into_value());
+                }
+                Value::Dict(Rc::new(crate::value::FrozenCell::frozendict(map)))
+            }
             HashKey::Instance { instance, .. } => Value::Instance(instance),
             HashKey::Identity(instance) => Value::Instance(instance),
             HashKey::Class(c) => Value::Class(c),
@@ -1193,6 +1245,9 @@ impl PartialEq for HashKey {
                 // order, so compare their sorted canonical encodings.
                 a.len() == b.len() && frozenset_canonical(a) == frozenset_canonical(b)
             }
+            (HashKey::FrozenDict(a), HashKey::FrozenDict(b)) => {
+                a.len() == b.len() && frozendict_canonical(a) == frozendict_canonical(b)
+            }
             // Instance keys compare on their canonical projection: same
             // class name and equal field set. The original `instance`
             // Rc is ignored so two distinct-but-equal instances match.
@@ -1247,6 +1302,7 @@ impl std::hash::Hash for HashKey {
             HashKey::Str(s) => s.hash(state),
             HashKey::Tuple(items) => items.hash(state),
             HashKey::FrozenSet(items) => frozenset_canonical(items).hash(state),
+            HashKey::FrozenDict(items) => frozendict_canonical(items).hash(state),
             // Hash only the canonical projection so it stays consistent
             // with `Eq` (which ignores the retained `instance` Rc).
             HashKey::Instance { key, .. } => key.hash(state),
@@ -2173,7 +2229,9 @@ impl fmt::Debug for Value {
             Value::Tuple(t) => write!(f, "{:?}", &t[..]),
             Value::Dict(d) => {
                 let is_frozen = d.frozen.get();
-                if is_frozen {
+                if d.frozendict.get() {
+                    write!(f, "frozendict({{")?;
+                } else if is_frozen {
                     write!(f, "mappingproxy({{")?;
                 } else {
                     write!(f, "{{")?;
@@ -2270,15 +2328,26 @@ fn float_to_bigint(x: f64) -> Result<BigInt, Unwind> {
 
 /// A dict's `{k: v, …}` rendering. `wrap_frozen` adds the `mappingproxy(…)`
 /// wrapper a `freeze`-marked dict shows under `repr` — CPython's proxy
-/// delegates `__str__` to the mapping it wraps, so only `repr` names it.
+/// delegates `__str__` to the mapping it wraps, so only `repr` names it. A
+/// `frozendict` always names itself: its `str` is its `repr`.
 fn dict_render(v: &Value, wrap_frozen: bool) -> String {
     let Value::Dict(d) = v else {
         return String::new();
     };
-    let wrap = wrap_frozen && d.frozen.get();
+    if d.frozendict.get() && d.borrow().is_empty() {
+        return "frozendict()".to_owned();
+    }
+    let open = if d.frozendict.get() {
+        "frozendict({"
+    } else if wrap_frozen && d.frozen.get() {
+        "mappingproxy({"
+    } else {
+        "{"
+    };
+    let wrap = open != "{";
     let d = d.borrow();
     let mut s = String::new();
-    s.push_str(if wrap { "mappingproxy({" } else { "{" });
+    s.push_str(open);
     for (emitted, (k, v)) in d.iter().enumerate() {
         if emitted > 0 {
             s.push_str(", ");
@@ -2334,7 +2403,9 @@ impl Value {
             Value::Tuple(t) if is_slice_marker(t) => "slice",
             Value::Tuple(t) if is_ellipsis_marker(t) => "ellipsis",
             Value::Tuple(_) => "tuple",
-            // A `freeze let` dict is CPython's read-only `mappingproxy`.
+            // A Python 3.15 `frozendict`; otherwise a frozen (`freeze let`
+            // on an older target) dict is CPython's read-only `mappingproxy`.
+            Value::Dict(d) if d.frozendict.get() => "frozendict",
             Value::Dict(d) if d.frozen.get() => "mappingproxy",
             Value::Dict(_) => "dict",
             Value::Set(s) if s.frozen.get() => "frozenset",
@@ -2494,6 +2565,15 @@ impl Value {
                 Ok(HashKey::Class(c.clone()))
             }
             Value::Native(n) => Ok(HashKey::BuiltinType(n.name)),
+            // A `frozendict` is hashable when its values are; a
+            // `mappingproxy` (or plain dict) is not.
+            Value::Dict(d) if d.frozendict.get() => {
+                let mut items = Vec::with_capacity(d.borrow().len());
+                for (k, v) in d.borrow().iter() {
+                    items.push((k.clone(), v.to_hash_key()?));
+                }
+                Ok(HashKey::FrozenDict(Rc::new(items)))
+            }
             other => Err(type_error(format!(
                 "unhashable type: '{}'",
                 other.type_name()

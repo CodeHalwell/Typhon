@@ -115,15 +115,43 @@ impl Cache:
 
 Note the class-level form lives in an **`impl` block**, not in the class body itself — methods (including `lazy let` properties) belong in `impl` per [Rule 4](/Typhon/tour/five-rules/). Putting it inside the `class` body fires the standard `tyc::method_in_class_body` diagnostic.
 
+PEP 810's own spellings are accepted too: `lazy import numpy` and `lazy import numpy as np` work on every target. On a `[python] target = "3.15"` project, `lazy from module import name` is also accepted at module level and emitted as the native Python 3.15 statement.
+
 Unsupported forms (rejected with `tyc::lazy_usage`):
 
 ```python
-lazy from numpy import array          # ❌ `lazy from ... import ...` not supported
+lazy from numpy import array          # ❌ before 3.15: needs `[python] target = "3.15"`
+lazy from numpy import *              # ❌ PEP 810 forbids a lazy star import
+lazy from __future__ import annotations   # ❌ `__future__` imports cannot be lazy
 def f() -> None:
+    lazy from json import loads       # ❌ lazy imports are module-level only
     lazy let x: int = 1               # ❌ function-body `lazy let` not supported
 ```
 
-**Fix:** rewrite to one of the supported forms above. For per-call laziness inside a function body, use a plain function or `functools.cache` directly.
+**Fix:** rewrite to one of the supported forms above. On 3.13 / 3.14, defer the module (`lazy import np = numpy`) and reach members through it. For per-call laziness inside a function body, use a plain function or `functools.cache` directly.
+
+## `tyc::requires_python`
+
+A builtin that only exists from a later CPython release than the project's `[python] target` — today `frozendict` (Python 3.15, PEP 814) on a 3.13 or 3.14 project. The emitted Python would raise `NameError` on the target interpreter, so it is rejected at check time. Annotations count (`def f(m: frozendict[str, int])`).
+
+```python
+# typhon.toml: [python] target = "3.13"
+let defaults = frozendict(retries=3)    # ❌ frozendict is new in Python 3.15
+```
+
+**Fix:** set `[python] target = "3.15"`, or use `types.MappingProxyType` / `freeze let` on the older target. A module that imports its own `frozendict` (the PyPI backport) is not checked.
+
+## `tyc::removed_in_python`
+
+An import or call of a stdlib API the project's `[python] target` removed: the `sre_compile` / `sre_constants` / `sre_parse` modules, `glob.glob0` / `glob1`, `typing.no_type_check_decorator`, `NamedTuple("P", x=int)` keyword fields and a fields-less functional `TypedDict` on 3.15; `ast.Num` / `Str` / `Bytes` / `NameConstant` / `Ellipsis`, `pkgutil.find_loader` / `get_loader`, `pty.master_open` / `slave_open`, `sqlite3.version` / `version_info`, `urllib.request.URLopener` / `FancyURLopener` and the old `importlib.abc` resource classes on 3.14. The emitted Python would raise `ImportError`, `AttributeError` or `TypeError` there.
+
+```python
+# typhon.toml: [python] target = "3.15"
+from typing import NamedTuple
+let Point = NamedTuple("Point", x=int, y=int)    # ❌ keyword fields were removed in Python 3.15
+```
+
+**Fix:** use the replacement the message names (`NamedTuple("Point", [("x", int), ("y", int)])`, `ast.Constant`, `re`, …), or keep the older target until the code is migrated. Nothing is reported on a target that still ships the API.
 
 ## `tyc::freeze_not_freezable` (v0.9.0)
 
@@ -308,7 +336,9 @@ ahead of the standard library and intercepts every `import types`,
 including the standard library's own.
 
 **Fix:** rename the file (`lang_types.ty`) and update its imports. Checked
-only in a project with a `typhon.toml`.
+only in a project with a `typhon.toml`, against the standard library of its
+`[python] target` — `profiling.ty` shadows Python 3.15's new `profiling`
+package, `annotationlib.ty` / `compression.ty` the 3.14 additions.
 
 ## `tyc::orphan_py_import` (warning)
 

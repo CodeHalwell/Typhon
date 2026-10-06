@@ -78,7 +78,10 @@ pub(super) fn update(c: &mut Checker, call: &ruff_python_ast::ExprCall) -> Optio
         let actual = infer_expr(c, arg);
         let slots = match &actual {
             Type::Generic(h, a)
-                if matches!(h.as_str(), "dict" | "Mapping" | "MutableMapping") && a.len() == 2 =>
+                if matches!(
+                    h.as_str(),
+                    "dict" | "Mapping" | "MutableMapping" | "frozendict"
+                ) && a.len() == 2 =>
             {
                 Some((a[0].clone(), a[1].clone()))
             }
@@ -110,7 +113,7 @@ pub(super) fn update(c: &mut Checker, call: &ruff_python_ast::ExprCall) -> Optio
         } else {
             let actual = infer_expr(c, &keyword.value);
             if let Type::Generic(h, a) = &actual {
-                if matches!(h.as_str(), "dict" | "Mapping") && a.len() == 2 {
+                if matches!(h.as_str(), "dict" | "Mapping" | "frozendict") && a.len() == 2 {
                     for (expected, actual) in args.iter().zip(a) {
                         if !c.is_assignable(expected, actual) {
                             c.mismatch(expected, actual, span);

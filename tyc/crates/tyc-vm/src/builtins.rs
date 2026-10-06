@@ -925,6 +925,22 @@ pub fn install(interp: &mut Interpreter) {
         Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(map))))
     });
 
+    // `frozendict(...)` (Python 3.15, PEP 814): `dict(...)`'s argument
+    // forms, frozen. The checker reports `tyc::requires_python` for it on an
+    // older target, so a program only reaches this on a 3.15+ one.
+    native!("frozendict", |i, args| {
+        let ctor = i
+            .root
+            .get("dict")
+            .ok_or_else(|| type_error("frozendict: the dict constructor is unavailable"))?;
+        match i.call_value(ctor, args, &[])? {
+            Value::Dict(d) => Ok(Value::Dict(Rc::new(crate::value::FrozenCell::frozendict(
+                d.borrow().clone(),
+            )))),
+            other => Ok(other),
+        }
+    });
+
     // `slice(stop)` / `slice(start, stop[, step])` — the same marker tuple the
     // subscript syntax builds, so `isinstance(x, slice)`, `.start` and
     // `.indices()` work on both.
@@ -1863,9 +1879,9 @@ pub fn install(interp: &mut Interpreter) {
     // under `tyc build && python build/main.py`.
     root.set(
         "__typhon_freeze__",
-        Value::Native(Rc::new(NativeFn::new("__typhon_freeze__", |_i, args| {
+        Value::Native(Rc::new(NativeFn::new("__typhon_freeze__", |i, args| {
             let v = args.into_iter().next().unwrap_or(Value::None);
-            deep_freeze_value(v)
+            deep_freeze_value(v, i.python_minor >= 15)
         }))),
     );
 
@@ -2351,9 +2367,11 @@ pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
         ("list", Value::List(_)) => true,
         ("tuple", Value::Tuple(t)) => !crate::value::is_slice_marker(t),
         ("slice", Value::Tuple(t)) => crate::value::is_slice_marker(t),
-        // A `freeze let` dict is a `mappingproxy`, which is not a `dict`.
+        // A `freeze let` dict is a `mappingproxy` (a `frozendict` from Python
+        // 3.15); neither is a `dict`.
         ("dict", Value::Dict(d)) => !dict_is_frozen(d),
-        ("mappingproxy", Value::Dict(d)) => dict_is_frozen(d),
+        ("mappingproxy", Value::Dict(d)) => dict_is_frozen(d) && !d.frozendict.get(),
+        ("frozendict", Value::Dict(d)) => d.frozendict.get(),
         ("set", Value::Set(s)) => !set_is_frozen(s),
         ("frozenset", Value::Set(s)) => set_is_frozen(s),
         ("range", Value::Range { .. }) => true,
@@ -3451,9 +3469,9 @@ fn make_typhon_runtime_module(interp: &Interpreter) -> Value {
         "typhon_runtime.freeze",
         vec![(
             "deep_freeze",
-            nf("deep_freeze", |_i, args| {
+            nf("deep_freeze", |i, args| {
                 let v = args.into_iter().next().unwrap_or(Value::None);
-                deep_freeze_value(v)
+                deep_freeze_value(v, i.python_minor >= 15)
             }),
         )],
     );
@@ -8866,7 +8884,10 @@ pub fn set_is_frozen(s: &crate::value::RcSet) -> bool {
 /// (open file handles, generators) raises `TypeError`. The marker is
 /// stored as a sentinel entry whose presence the list/dict/set method
 /// dispatch table checks before mutating.
-fn deep_freeze_value(v: Value) -> Result<Value, Unwind> {
+/// `frozendict` selects the Python 3.15 lowering: a dict freezes to a
+/// `frozendict` rather than a `mappingproxy`.
+fn deep_freeze_value(v: Value, frozendict: bool) -> Result<Value, Unwind> {
+    let deep_freeze_value = |v: Value| deep_freeze_value(v, frozendict);
     match v {
         Value::Coroutine(_) => Err(type_error("cannot freeze a coroutine object".to_string())),
         Value::None
@@ -8909,9 +8930,11 @@ fn deep_freeze_value(v: Value) -> Result<Value, Unwind> {
                 let frozen_val = deep_freeze_value(val.clone())?;
                 new_map.insert(k.clone(), frozen_val);
             }
-            Ok(Value::Dict(Rc::new(crate::value::FrozenCell::frozen(
-                new_map,
-            ))))
+            Ok(Value::Dict(Rc::new(if frozendict {
+                crate::value::FrozenCell::frozendict(new_map)
+            } else {
+                crate::value::FrozenCell::frozen(new_map)
+            })))
         }
         Value::Set(s) => {
             // Frozen metadata lives outside user-visible container contents.
@@ -9896,6 +9919,7 @@ pub(crate) fn native_accepts_keyword(name: &str, kw: &str) -> Option<bool> {
         "nextafter" => Some(&["steps"]),
         "property"
         | "dict"
+        | "frozendict"
         | "ConfigDict"
         | "dataclass"
         | "dataclasses.replace"
@@ -10021,6 +10045,16 @@ fn strip_chars(args: &[Value], method: &str) -> Result<Option<Vec<char>>, Unwind
 /// classmethod on the `dict` type object, so the unbound-method
 /// dispatcher (which routes `T.m(x)` to `x.m(...)`) can't model it;
 /// `interp.rs` intercepts `dict.fromkeys` and calls here directly.
+/// `frozendict.fromkeys(iterable[, value])` (Python 3.15).
+pub fn frozendict_fromkeys(interp: &mut Interpreter, args: Vec<Value>) -> Result<Value, Unwind> {
+    match dict_fromkeys(interp, args)? {
+        Value::Dict(d) => Ok(Value::Dict(Rc::new(crate::value::FrozenCell::frozendict(
+            d.borrow().clone(),
+        )))),
+        other => Ok(other),
+    }
+}
+
 pub fn dict_fromkeys(interp: &mut Interpreter, args: Vec<Value>) -> Result<Value, Unwind> {
     let mut it = args.into_iter();
     let iterable = it
@@ -11772,14 +11806,21 @@ fn dict_method(
             | "__delitem__"
     );
     if is_mutator && dict_is_frozen(d) {
+        let kind = if d.frozendict.get() {
+            "frozendict"
+        } else {
+            "mappingproxy"
+        };
         return Err(attribute_error(format!(
-            "'mappingproxy' object has no attribute '{}'",
-            name
+            "'{kind}' object has no attribute '{name}'"
         )));
     }
     match name {
         // A classmethod, reached through an instance (`{}.fromkeys(xs)`).
         "fromkeys" if !dict_is_frozen(d) => dict_fromkeys(interp, args.to_vec()),
+        "fromkeys" if d.frozendict.get() => frozendict_fromkeys(interp, args.to_vec()),
+        // An immutable `frozendict` is its own copy, as in CPython.
+        "copy" if d.frozendict.get() => Ok(Value::Dict(d.clone())),
         "get" => {
             let k = interp.dict_probe_key(d, single(args, "get")?)?;
             let default = args.get(1).cloned().unwrap_or(Value::None);
@@ -13573,6 +13614,23 @@ pub fn call_with_kwargs(
                 let mut m = d.borrow_mut();
                 for (k, v) in kwargs {
                     m.insert(HashKey::Str(Rc::new(k.clone())), v.clone());
+                }
+            }
+            Ok(base)
+        }
+        // `frozendict(a=1)` / `frozendict(other, c=3)` (Python 3.15): as for
+        // `dict`, the keyword pairs become entries of the (fresh) result.
+        "frozendict" => {
+            let base = (n.func)(interp, args)?;
+            if let Value::Dict(d) = &base {
+                if !kwargs.is_empty() {
+                    let mut map = d.borrow().clone();
+                    for (k, v) in kwargs {
+                        map.insert(HashKey::Str(Rc::new(k.clone())), v.clone());
+                    }
+                    return Ok(Value::Dict(Rc::new(crate::value::FrozenCell::frozendict(
+                        map,
+                    ))));
                 }
             }
             Ok(base)

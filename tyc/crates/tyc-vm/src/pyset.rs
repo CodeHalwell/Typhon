@@ -54,6 +54,15 @@ pub fn key_hash(k: &HashKey) -> i64 {
             let hs: Vec<i64> = items.iter().map(key_hash).collect();
             pyhash::frozenset_hash(&hs)
         }
+        // CPython: `hash(fd) == hash(frozenset(fd.items()))`, each item a
+        // `(key, value)` tuple.
+        HashKey::FrozenDict(items) => {
+            let hs: Vec<i64> = items
+                .iter()
+                .map(|(k, v)| pyhash::tuple_hash(&[key_hash(k), key_hash(v)]))
+                .collect();
+            pyhash::frozenset_hash(&hs)
+        }
         // A frozen dataclass hashes as the tuple of its fields in
         // declaration order (the key stores them sorted by name).
         HashKey::Instance { instance, key } => {

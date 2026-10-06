@@ -2090,6 +2090,181 @@ fn build_emits_typhon_runtime_when_only_lazy_import_used() {
     );
 }
 
+// ── Python 3.15 syntax: PEP 798 / PEP 810 `lazy from` ────────────────────────
+
+/// A `python3.15` on `PATH`, for executing 3.15-target output; `None` skips.
+/// `TYC_REQUIRE_PYTHON315=1` turns the skip into a panic (CI sets it in the
+/// job that installs 3.15).
+fn python315() -> Option<String> {
+    let found = Command::new("python3.15")
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if !found && std::env::var_os("TYC_REQUIRE_PYTHON315").is_some() {
+        panic!("TYC_REQUIRE_PYTHON315 is set but no python3.15 was found on PATH");
+    }
+    found.then(|| "python3.15".to_owned())
+}
+
+fn run_with(py: &str, dir: &Path) -> String {
+    let out = Command::new(py)
+        .arg(dir.join("build").join("main.py"))
+        .output()
+        .expect("python should spawn");
+    assert!(
+        out.status.success(),
+        "main.py exited non-zero under {py}:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+const PEP798_SRC: &str = "def main() -> None:\n\
+    \x20   let groups: list[list[int]] = [[1, 2], [3], []]\n\
+    \x20   let maps: list[dict[str, int]] = [{\"a\": 1}, {\"b\": 2}, {\"a\": 3}]\n\
+    \x20   let flat: list[int] = [*g for g in groups]\n\
+    \x20   let uniq: set[int] = {*g for g in groups if g}\n\
+    \x20   let merged: dict[str, int] = {**m for m in maps}\n\
+    \x20   let total: int = sum(*g for g in groups)\n\
+    \x20   print(flat, sorted(uniq), merged, total)\n\
+    \n\
+    main()\n";
+const PEP798_OUT: &str = "[1, 2, 3] [1, 2, 3] {'a': 3, 'b': 2} 6\n";
+
+#[test]
+fn build_pep798_unpacking_is_lowered_on_3_13_and_runs() {
+    // 3.13 cannot parse `[*g for g in groups]`; the emitter rewrites each
+    // PEP 798 form as the nested comprehension PEP 798 defines it to be.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(tmp.path(), "3.13", PEP798_SRC);
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    assert!(
+        !py.contains("*g for") && !py.contains("**m for"),
+        "no PEP 798 syntax may reach a 3.13 build; got:\n{py}"
+    );
+    if let Some(out) = run_main(tmp.path()) {
+        assert_eq!(out, PEP798_OUT);
+    }
+}
+
+#[test]
+fn build_pep798_unpacking_is_native_on_3_15() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(tmp.path(), "3.15", PEP798_SRC);
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    for form in [
+        "[*g for g in groups]",
+        "{**m for m in maps}",
+        "(*g for g in groups)",
+    ] {
+        assert!(py.contains(form), "3.15 keeps `{form}`; got:\n{py}");
+    }
+    if let Some(py315) = python315() {
+        assert_eq!(run_with(&py315, tmp.path()), PEP798_OUT);
+    }
+}
+
+#[test]
+fn build_pep810_lazy_from_is_native_on_3_15() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(
+        tmp.path(),
+        "3.15",
+        "lazy from json import dumps\nlazy from os.path import basename as base\n\
+         print(dumps([1]), base(\"/a/b.txt\"))\n",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    assert!(py.contains("lazy from json import dumps\n"), "got:\n{py}");
+    assert!(
+        py.contains("lazy from os.path import basename as base\n"),
+        "got:\n{py}"
+    );
+    assert!(
+        !tmp.path().join("build/typhon_runtime").exists(),
+        "a native lazy import needs no generated runtime"
+    );
+    if let Some(py315) = python315() {
+        assert_eq!(run_with(&py315, tmp.path()), "[1] b.txt\n");
+    }
+}
+
+const FREEZE_SRC: &str = "import json\n\
+    freeze let CONFIG = {\"port\": 8080, \"hosts\": [\"a\", \"b\"]}\n\
+    print(type(CONFIG).__name__, CONFIG[\"hosts\"])\n\
+    print(json.dumps(CONFIG), {CONFIG: 1}[CONFIG])\n";
+
+#[test]
+fn build_freeze_let_dict_is_a_frozendict_on_3_15() {
+    // On 3.15 a frozen dict is a `frozendict` (PEP 814): hashable and
+    // JSON-serialisable, where a `mappingproxy` is neither.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(tmp.path(), "3.15", FREEZE_SRC);
+    build(tmp.path());
+    let freeze =
+        std::fs::read_to_string(tmp.path().join("build/typhon_runtime/freeze.py")).unwrap();
+    assert!(freeze.contains("return frozendict({"), "got:\n{freeze}");
+    let expected = "frozendict ('a', 'b')\n{\"port\": 8080, \"hosts\": [\"a\", \"b\"]} 1\n";
+    if let Some(py315) = python315() {
+        assert_eq!(run_with(&py315, tmp.path()), expected);
+    }
+    // The VM follows the project's target.
+    let vm = tyc().arg("run").arg(tmp.path()).output().unwrap();
+    assert!(
+        vm.status.success(),
+        "{}",
+        String::from_utf8_lossy(&vm.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&vm.stdout), expected);
+}
+
+#[test]
+fn build_freeze_let_dict_stays_mappingproxy_on_3_13() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(
+        tmp.path(),
+        "3.13",
+        "freeze let CONFIG = {\"port\": 8080}\nprint(type(CONFIG).__name__)\n",
+    );
+    build(tmp.path());
+    let freeze =
+        std::fs::read_to_string(tmp.path().join("build/typhon_runtime/freeze.py")).unwrap();
+    assert!(
+        !freeze.contains("frozendict"),
+        "3.13 runtime is unchanged; got:\n{freeze}"
+    );
+    if let Some(out) = run_main(tmp.path()) {
+        assert_eq!(out, "mappingproxy\n");
+    }
+    let vm = tyc().arg("run").arg(tmp.path()).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&vm.stdout), "mappingproxy\n");
+}
+
+#[test]
+fn check_lazy_from_before_3_15_names_the_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(
+        tmp.path(),
+        "3.14",
+        "lazy from json import dumps\nprint(dumps(1))\n",
+    );
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "`lazy from` must be rejected before 3.15"
+    );
+    let text =
+        String::from_utf8_lossy(&out.stderr).to_string() + &String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("tyc::lazy_usage"), "got:\n{text}");
+    assert!(
+        text.contains("3.15"),
+        "the error must point at the 3.15 target; got:\n{text}"
+    );
+}
+
 // ── PEP 810 native lazy imports (3.15+ targets) ───────────────────────────────
 
 #[test]

@@ -21,7 +21,11 @@ use tyc_syntax::{
         PreprocessResult,
     },
 };
-use tyc_types::{check_module_with_imports, ExternalShapes, InterfaceShape};
+use tyc_types::{check_module_with_options, ExternalShapes, InterfaceShape};
+
+/// Re-export so the CLI and LSP can pass the project's `[python] target`
+/// without depending on `tyc-types` directly.
+pub use tyc_types::CheckOptions;
 
 /// Re-export so downstream crates (CLI, LSP) can name the type
 /// without depending on `tyc-types` directly.
@@ -272,7 +276,7 @@ unsafe impl salsa::SalsaValue for ArcDiagnostics {}
 /// path can never drift from the project path again (F55).
 #[salsa::tracked(returns(clone))]
 fn check_diagnostics(db: &dyn salsa::Database, file: SourceFile) -> ArcDiagnostics {
-    ArcDiagnostics::new(check_pipeline(db, file, None))
+    ArcDiagnostics::new(check_pipeline(db, file, None, CheckOptions::default()))
 }
 
 /// Tracked query: parse and resolve the preprocessed source of a file.
@@ -681,8 +685,20 @@ pub fn check_file_with_imports(
     text: String,
     shapes_by_module: &std::sync::Arc<std::collections::HashMap<String, ModuleShapes>>,
 ) -> Diagnostics {
+    check_file_with_imports_opts(db, path, text, shapes_by_module, CheckOptions::default())
+}
+
+/// [`check_file_with_imports`] with explicit [`CheckOptions`] (the project's
+/// `[python] target`). `tyc check` and `tyc build` use this.
+pub fn check_file_with_imports_opts(
+    db: &mut TycDatabase,
+    path: String,
+    text: String,
+    shapes_by_module: &std::sync::Arc<std::collections::HashMap<String, ModuleShapes>>,
+    options: CheckOptions,
+) -> Diagnostics {
     let file = SourceFile::new(db, path, text);
-    check_source_file_with_imports(db, file, shapes_by_module)
+    check_source_file_with_imports_opts(db, file, shapes_by_module, options)
 }
 
 /// Cross-module variant of [`check_source_file`] that consults a pre-
@@ -700,7 +716,18 @@ pub fn check_source_file_with_imports(
     file: SourceFile,
     shapes_by_module: &std::sync::Arc<std::collections::HashMap<String, ModuleShapes>>,
 ) -> Diagnostics {
-    check_pipeline(&*db, file, Some(shapes_by_module))
+    check_source_file_with_imports_opts(db, file, shapes_by_module, CheckOptions::default())
+}
+
+/// [`check_source_file_with_imports`] with explicit [`CheckOptions`] (the
+/// project's `[python] target`). The language server uses this.
+pub fn check_source_file_with_imports_opts(
+    db: &mut TycDatabase,
+    file: SourceFile,
+    shapes_by_module: &std::sync::Arc<std::collections::HashMap<String, ModuleShapes>>,
+    options: CheckOptions,
+) -> Diagnostics {
+    check_pipeline(&*db, file, Some(shapes_by_module), options)
 }
 
 /// The one true check pipeline, shared by the Salsa-tracked
@@ -718,6 +745,7 @@ fn check_pipeline(
     db: &dyn salsa::Database,
     file: SourceFile,
     shapes_by_module: Option<&std::sync::Arc<std::collections::HashMap<String, ModuleShapes>>>,
+    options: CheckOptions,
 ) -> Diagnostics {
     let path = file.path(db).clone();
     let text = file.text(db).clone();
@@ -737,7 +765,7 @@ fn check_pipeline(
             1,
         ));
     }
-    for err in validate_lazy_usage(&text) {
+    for err in validate_lazy_usage(&text, options.python_minor) {
         diags.push_error(TycError::lazy_usage(
             err.message,
             &path,
@@ -827,7 +855,7 @@ fn check_pipeline(
     // in-module-only pass (`check_module_with`).
     let external = shapes_by_module
         .map(|s| build_external_shapes(&resolved_arc, s, std::path::Path::new(&path)));
-    let type_diags = check_module_with_imports(
+    let type_diags = check_module_with_options(
         path.clone(),
         &prep.python_source,
         &resolved_arc,
@@ -836,7 +864,9 @@ fn check_pipeline(
         &prep.frozen_class_lines,
         &prep.impl_distributed_lines,
         external.as_ref(),
-    );
+        options,
+    )
+    .diagnostics;
     diags.extend(type_diags);
 
     // Every diagnostic above is anchored to the preprocessed buffer; report

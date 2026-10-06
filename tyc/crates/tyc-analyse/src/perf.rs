@@ -53,6 +53,23 @@ pub fn is_stdlib_top_level(name: &str) -> bool {
     STDLIB_TOP_LEVEL.contains(&name)
 }
 
+/// Top-level stdlib modules added after Python 3.13, with the minor version
+/// that added them.
+const STDLIB_ADDED_AFTER_313: &[(&str, u8)] = &[
+    ("annotationlib", 14),
+    ("compression", 14),
+    ("profiling", 15),
+];
+
+/// [`is_stdlib_top_level`] for the `3.<python_minor>` target: also the
+/// modules a later release added (`profiling` is 3.15's).
+pub fn is_stdlib_top_level_for(name: &str, python_minor: u8) -> bool {
+    is_stdlib_top_level(name)
+        || STDLIB_ADDED_AFTER_313
+            .iter()
+            .any(|(module, since)| *module == name && python_minor >= *since)
+}
+
 /// The curated set of Python 3.13 stdlib top-level module names. Restricted
 /// to top-level modules (subpackages like `urllib.parse` are excluded).
 const STDLIB_TOP_LEVEL: &[&str] = &[

@@ -45,7 +45,7 @@ straight from a failed build to the corresponding documentation.
 - [`tyc::is_literal_comparison`](./is_literal_comparison.md) — warning: `is` / `is not` against a literal compares identity, not value.
 - [`tyc::kind_mismatch`](./kind_mismatch.md) — higher-kinded type constructor applied with the wrong arity or bound to conflicting constructors.
 - [`tyc::lazy_import_opportunity`](./lazy_import_opportunity.md) — advice: heavy module imported eagerly but used rarely — a `lazy import` candidate.
-- [`tyc::lazy_usage`](./lazy_usage.md) — unsupported form under the `lazy` keyword.
+- [`tyc::lazy_usage`](./lazy_usage.md) — unsupported form under the `lazy` keyword (`lazy from` before a 3.15 target, or a form PEP 810 forbids).
 - [`tyc::loop_closure_capture`](./loop_closure_capture.md) — warning: closure created in a loop captures the loop variable by reference, not value.
 - [`tyc::main_not_called`](./main_not_called.md) — advice: `def main()` defined but never called.
 - [`tyc::manual_init`](./manual_init.md) — class body declared `__init__` directly.
@@ -80,12 +80,14 @@ straight from a failed build to the corresponding documentation.
 - [`tyc::pub_star_outside_init`](./pub_star_outside_init.md) — advice: `pub *` outside `__init__.ty` is a no-op and the marker should be removed.
 - [`tyc::python_semantic_drift`](./python_semantic_drift.md) — warning: Typhon rejects an expression CPython accepts.
 - [`tyc::raise_non_exception`](./raise_non_exception.md) — `raise` operand is provably not a `BaseException` — would crash with `TypeError` at runtime.
+- [`tyc::removed_in_python`](./removed_in_python.md) — an import or call of a stdlib API the `[python] target` removed (`sre_compile`, `typing.no_type_check_decorator`, `NamedTuple("P", x=int)` on 3.15; `ast.Num` on 3.14).
+- [`tyc::requires_python`](./requires_python.md) — a builtin newer than the `[python] target` (`frozendict` before 3.15) — the emitted Python would raise `NameError`.
 - [`tyc::resource_not_managed`](./resource_not_managed.md) — bare assignment of a context-manager-returning call (`open`, `socket.socket`, `sqlite3.connect`, `tempfile.*`) not wrapped in `with`.
 - [`tyc::result_error_mismatch`](./result_error_mismatch.md) — `?` forwards an `Err` whose type doesn't match the enclosing `Result`.
 - [`tyc::return_in_except_star`](./return_in_except_star.md) — `return` / `break` / `continue` inside an `except*` handler — CPython rejects it at compile time, so the emitted Python would not import.
 - [`tyc::self_outside_impl`](./self_outside_impl.md) — `self` referenced outside an `impl` method body.
 - [`tyc::shared_mut_across_tasks`](./shared_mut_across_tasks.md) — advice (free-threaded targets): a `go`-spawned function writes shared mutable module state — a data race under real concurrency.
-- [`tyc::stdlib_module_shadow`](./stdlib_module_shadow.md) — warning: project `.ty` file's stem matches a Python 3.13 stdlib top-level module name (`types`, `json`, `io`, …) and would intercept stdlib imports on `sys.path`.
+- [`tyc::stdlib_module_shadow`](./stdlib_module_shadow.md) — warning: project `.ty` file's stem matches a stdlib top-level module name of the `[python] target` (`types`, `json`, `io`, … — plus `annotationlib` / `compression` from 3.14 and `profiling` from 3.15) and would intercept stdlib imports on `sys.path`.
 - [`tyc::stub_mismatch`](./stub_mismatch.md) — `.dty` stub disagrees with the implementation module.
 - [`tyc::tuple_index_out_of_range`](./tuple_index_out_of_range.md) — constant index out of range for a fixed-arity tuple.
 - [`tyc::type_mismatch`](./type_mismatch.md) — value of one type used where another was expected.

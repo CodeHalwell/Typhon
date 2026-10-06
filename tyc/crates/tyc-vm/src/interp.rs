@@ -116,6 +116,10 @@ pub struct Interpreter {
     /// tells the import statement to bind a deferred proxy instead —
     /// `typhon_runtime.lazy.lazy_import` semantics).
     pub lazy_import_aliases: std::collections::HashSet<(String, String)>,
+    /// The `[python] target` minor version (`3.X`) the program is run as.
+    /// A `freeze let` dict is a `frozendict` from 3.15 and a `mappingproxy`
+    /// before it, exactly as the generated `typhon_runtime.freeze` does.
+    pub python_minor: u8,
     /// Names of modules currently being loaded via `try_load_typhon_module`.
     /// Guards against a module that imports itself (directly or through a
     /// cycle) re-entering the loader and overflowing the host stack — e.g.
@@ -287,6 +291,7 @@ impl Interpreter {
             gen_stack: Vec::new(),
             current_module_name: "__main__".to_owned(),
             lazy_import_aliases: std::collections::HashSet::new(),
+            python_minor: 13,
             loading_modules: std::collections::HashSet::new(),
             method_stack: Vec::new(),
             active_exceptions: Vec::new(),
@@ -3308,10 +3313,14 @@ impl Interpreter {
                 };
                 let iterable = self.eval_expr(&first.iter, env)?;
                 let it = self.make_iter(iterable)?;
-                let mut iters: Vec<Option<Value>> = (0..g.generators.len()).map(|_| None).collect();
+                // PEP 798: `(*xs for xs in groups)` yields every item of each
+                // `xs` — one more `for` clause over it, as PEP 798 defines it.
+                let node = unpacking_generator_as_nested(g).unwrap_or_else(|| g.clone());
+                let mut iters: Vec<Option<Value>> =
+                    (0..node.generators.len()).map(|_| None).collect();
                 iters[0] = Some(it);
                 let state = GenExprState {
-                    node: Rc::new(g.clone()),
+                    node: Rc::new(node),
                     env: Env::new_child(env),
                     iters,
                     finished: false,
@@ -3960,6 +3969,20 @@ impl Interpreter {
                 let mut hs = Vec::with_capacity(members.len());
                 for x in &members {
                     hs.push(self.hash_value(x)?);
+                }
+                pyhash::frozenset_hash(&hs)
+            }
+            // CPython: `hash(fd) == hash(frozenset(fd.items()))`.
+            Value::Dict(d) if d.frozendict.get() => {
+                let items: Vec<(Value, Value)> = d
+                    .borrow()
+                    .iter()
+                    .map(|(k, v)| (k.clone().into_value(), v.clone()))
+                    .collect();
+                let mut hs = Vec::with_capacity(items.len());
+                for (k, v) in &items {
+                    let pair = [self.hash_value(k)?, self.hash_value(v)?];
+                    hs.push(pyhash::tuple_hash(&pair));
                 }
                 pyhash::frozenset_hash(&hs)
             }
@@ -5878,15 +5901,23 @@ impl Interpreter {
             }
             Value::Dict(d) => {
                 let is_frozen = d.frozen.get();
+                let is_frozendict = d.frozendict.get();
                 // Frozen metadata lives outside user-visible container contents.
                 let pairs: Vec<(HashKey, Value)> = d
                     .borrow()
                     .iter()
                     .map(|(k, val)| (k.clone(), val.clone()))
                     .collect();
-                let wrap = is_frozen && !unwrap_frozen;
+                // A `frozendict`'s `str` is its `repr` (only a `mappingproxy`
+                // delegates `str` to the mapping it wraps).
+                if is_frozendict && pairs.is_empty() {
+                    return Ok("frozendict()".to_string());
+                }
+                let wrap = is_frozendict || (is_frozen && !unwrap_frozen);
                 let mut s = String::new();
-                if wrap {
+                if is_frozendict {
+                    s.push_str("frozendict({");
+                } else if wrap {
                     s.push_str("mappingproxy({");
                 } else {
                     s.push('{');
@@ -5961,6 +5992,20 @@ impl Interpreter {
                     parts.push(self.repr_hashkey(inner, depth + 1)?);
                 }
                 Ok(format!("frozenset({{{}}})", parts.join(", ")))
+            }
+            HashKey::FrozenDict(items) => {
+                if items.is_empty() {
+                    return Ok("frozendict()".to_string());
+                }
+                let mut parts: Vec<String> = Vec::with_capacity(items.len());
+                for (k, v) in items.iter() {
+                    parts.push(format!(
+                        "{}: {}",
+                        self.repr_hashkey(k, depth + 1)?,
+                        self.repr_hashkey(v, depth + 1)?
+                    ));
+                }
+                Ok(format!("frozendict({{{}}})", parts.join(", ")))
             }
             other => self.repr_of_depth(&other.clone().into_value(), depth),
         }
@@ -6322,7 +6367,15 @@ impl Interpreter {
                 for (k, v) in b.borrow().iter() {
                     out.insert(k.clone(), v.clone());
                 }
-                return Ok(Dict(Rc::new(crate::value::FrozenCell::new(out))));
+                // The left operand picks the type: `frozendict | dict` is a
+                // `frozendict`, while `dict | frozendict` and
+                // `mappingproxy | dict` are plain dicts.
+                let cell = if a.frozendict.get() {
+                    crate::value::FrozenCell::frozendict(out)
+                } else {
+                    crate::value::FrozenCell::new(out)
+                };
+                return Ok(Dict(Rc::new(cell)));
             }
         }
         if matches!(op, BitOr | BitAnd | Sub | BitXor) {
@@ -6708,7 +6761,7 @@ impl Interpreter {
             Value::Native(n)
                 if matches!(
                     n.name,
-                    "list" | "dict" | "set" | "frozenset" | "tuple" | "type"
+                    "list" | "dict" | "set" | "frozenset" | "frozendict" | "tuple" | "type"
                 ) =>
             {
                 let args = match key {
@@ -6882,6 +6935,12 @@ impl Interpreter {
                 Ok(())
             }
             Value::Dict(d) => {
+                if crate::builtins::dict_is_frozen(d) {
+                    return Err(type_error(format!(
+                        "'{}' object does not support item deletion",
+                        target.type_name()
+                    )));
+                }
                 let k = self.dict_probe_key(d, key)?;
                 // Removal keeps the rest in insertion order, as `del d[k]`
                 // does.
@@ -7598,6 +7657,12 @@ impl Interpreter {
                     crate::builtins::dict_fromkeys(interp, args)
                 })),
             )),
+            Value::Native(nf) if nf.name == "frozendict" && attr == "fromkeys" => {
+                Ok(Value::Native(Rc::new(NativeFn::new(
+                    "frozendict.fromkeys",
+                    crate::builtins::frozendict_fromkeys,
+                ))))
+            }
             Value::Native(nf) if nf.name == "str" && attr == "maketrans" => Ok(Value::Native(
                 Rc::new(NativeFn::new("str.maketrans", |_interp, args| {
                     crate::builtins::str_maketrans(&args)
@@ -7611,7 +7676,14 @@ impl Interpreter {
             Value::Native(nf)
                 if matches!(
                     nf.name,
-                    "str" | "list" | "dict" | "set" | "frozenset" | "tuple" | "bytes"
+                    "str"
+                        | "list"
+                        | "dict"
+                        | "set"
+                        | "frozenset"
+                        | "frozendict"
+                        | "tuple"
+                        | "bytes"
                 ) =>
             {
                 let attr_name: Rc<str> = Rc::from(attr);
@@ -8074,9 +8146,10 @@ impl Interpreter {
             }
             Value::Dict(d) => {
                 if crate::builtins::dict_is_frozen(d) {
-                    return Err(type_error(
-                        "'mappingproxy' object does not support item assignment",
-                    ));
+                    return Err(type_error(format!(
+                        "'{}' object does not support item assignment",
+                        target.type_name()
+                    )));
                 }
                 let k = self.dict_probe_key(d, key)?;
                 d.borrow_mut().insert(k, value);
@@ -8700,8 +8773,11 @@ impl Interpreter {
         let out_clone = out.clone();
         let leaks = comprehension_walrus_names(&[&c.elt], &c.generators);
         self.run_comprehension_leaking(&c.generators, &leaks, env, &mut move |this, scope| {
-            let v = this.eval_expr(&elt, scope)?;
-            out_clone.borrow_mut().push(v);
+            // `eval_unpackable` also serves a PEP 798 element: `[*xs for xs
+            // in groups]` appends every item of `xs`.
+            let mut items = Vec::with_capacity(1);
+            this.eval_unpackable(&elt, scope, &mut items)?;
+            out_clone.borrow_mut().extend(items);
             Ok(())
         })?;
         let result = std::mem::take(&mut *out.borrow_mut());
@@ -8714,6 +8790,17 @@ impl Interpreter {
         let out_clone = out.clone();
         let leaks = comprehension_walrus_names(&[&c.elt], &c.generators);
         self.run_comprehension_leaking(&c.generators, &leaks, env, &mut move |this, scope| {
+            // PEP 798: `{*xs for xs in groups}` adds every item of `xs`.
+            if let Expr::Starred(starred) = elt.as_ref() {
+                let iterable = this.eval_expr(&starred.value, scope)?;
+                let it = this.make_iter(iterable)?;
+                while let Some(v) = this.iter_next(&it)? {
+                    let k = this.hash_key(&v)?;
+                    let k = this.settle_key_set(&out_clone, k)?;
+                    out_clone.borrow_mut().insert(k);
+                }
+                return Ok(());
+            }
             let v = this.eval_expr(&elt, scope)?;
             let k = this.hash_key(&v)?;
             let k = this.settle_key_set(&out_clone, k)?;
@@ -8727,10 +8814,8 @@ impl Interpreter {
     fn eval_dictcomp(&mut self, c: &ast::ExprDictComp, env: &EnvRef) -> Result<Value, Unwind> {
         let out: Rc<crate::value::FrozenCell<DictMap>> =
             Rc::new(crate::value::FrozenCell::new(DictMap::new()));
-        let key_expr = c
-            .key
-            .clone()
-            .ok_or_else(|| type_error("dict comprehension missing key"))?;
+        // `key: None` is PEP 798 dict unpacking, `{**m for m in maps}`.
+        let key_expr = c.key.clone();
         let value_expr = c.value.clone();
         let out_clone = out.clone();
         let mut parts: Vec<&Expr> = vec![&c.value];
@@ -8739,7 +8824,27 @@ impl Interpreter {
         }
         let leaks = comprehension_walrus_names(&parts, &c.generators);
         self.run_comprehension_leaking(&c.generators, &leaks, env, &mut move |this, scope| {
-            let key_value = this.eval_expr(&key_expr, scope)?;
+            let Some(key_expr) = key_expr.as_deref() else {
+                // Merge the mapping in, later keys winning — `dict.update`.
+                let mapping = this.eval_expr(&value_expr, scope)?;
+                let Value::Dict(src) = &mapping else {
+                    return Err(type_error(format!(
+                        "'{}' object is not a mapping",
+                        mapping.type_name()
+                    )));
+                };
+                let entries: Vec<(HashKey, Value)> = src
+                    .borrow()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                for (k, v) in entries {
+                    let k = this.settle_key_dict(&out_clone, k)?;
+                    out_clone.borrow_mut().insert(k, v);
+                }
+                return Ok(());
+            };
+            let key_value = this.eval_expr(key_expr, scope)?;
             let k = this.hash_key(&key_value)?;
             let k = this.settle_key_dict(&out_clone, k)?;
             let v = this.eval_expr(&value_expr, scope)?;
@@ -9912,7 +10017,9 @@ pub(crate) fn frozen_dataclass_error(class: &Rc<Class>, attr: &str, verb: &str) 
 fn mutable_default_type(default: &Value) -> Option<String> {
     match default {
         Value::List(_) => Some("<class 'list'>".to_owned()),
-        Value::Dict(_) => Some("<class 'dict'>".to_owned()),
+        // A `frozendict` / `mappingproxy` is hashable, so dataclasses
+        // accepts it as a default.
+        Value::Dict(d) if !crate::builtins::dict_is_frozen(d) => Some("<class 'dict'>".to_owned()),
         Value::Set(s) if !crate::builtins::set_is_frozen(s) => Some("<class 'set'>".to_owned()),
         Value::Instance(inst) => {
             if matches!(
@@ -12001,6 +12108,36 @@ fn expr_has_yield(e: &Expr) -> bool {
     }
 }
 
+/// A PEP 798 unpacking generator, `(*xs for xs in groups)`, rewritten as
+/// the nested generator PEP 798 defines it to be:
+/// `(item for xs in groups for item in xs)`. `None` for any other
+/// generator. The loop name is local to the generator's own scope.
+fn unpacking_generator_as_nested(g: &ast::ExprGenerator) -> Option<ast::ExprGenerator> {
+    let Expr::Starred(starred) = g.elt.as_ref() else {
+        return None;
+    };
+    const ITEM: &str = "__typhon_item__";
+    let name = |ctx| {
+        Expr::Name(ast::ExprName {
+            node_index: ast::AtomicNodeIndex::NONE,
+            range: starred.range,
+            id: ast::name::Name::new_static(ITEM),
+            ctx,
+        })
+    };
+    let mut nested = g.clone();
+    nested.elt = Box::new(name(ast::ExprContext::Load));
+    nested.generators.push(ast::Comprehension {
+        range: starred.range,
+        node_index: ast::AtomicNodeIndex::NONE,
+        target: name(ast::ExprContext::Store),
+        iter: (*starred.value).clone(),
+        ifs: Vec::new(),
+        is_async: false,
+    });
+    Some(nested)
+}
+
 fn comprehension_has_yield(generators: &[ast::Comprehension]) -> bool {
     generators
         .iter()
@@ -13386,6 +13523,121 @@ mod vm_tests {
         let mut interp = Interpreter::new();
         let res = interp.run_module(&module);
         (interp, res)
+    }
+
+    /// PEP 814 (Python 3.15): `frozendict`. Expected values are CPython
+    /// 3.15's.
+    #[test]
+    fn pep814_frozendict_matches_cpython() {
+        let src = r#"
+fd = frozendict(a=1, b=2)
+r = repr(fd)
+s = str(fd)
+empty = repr(frozendict())
+merged = repr(fd | {"c": 3})
+rmerged = repr({"c": 3} | fd)
+eq = fd == {"a": 1, "b": 2}
+inst = (isinstance(fd, frozendict), isinstance(fd, dict))
+same_copy = fd.copy() is fd
+keys = list(fd)
+got = fd.get("z", 9)
+fromkeys = repr(frozendict.fromkeys("ab", 0))
+h = hash(fd) == hash(frozenset(fd.items()))
+as_key = {fd: "ok"}[frozendict(b=2, a=1)]
+tname = type(fd).__name__
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        let get = |name: &str| interp.root.get(name).unwrap().py_str();
+        assert_eq!(get("r"), "frozendict({'a': 1, 'b': 2})");
+        assert_eq!(get("s"), "frozendict({'a': 1, 'b': 2})");
+        assert_eq!(get("empty"), "frozendict()");
+        assert_eq!(get("merged"), "frozendict({'a': 1, 'b': 2, 'c': 3})");
+        assert_eq!(get("rmerged"), "{'c': 3, 'a': 1, 'b': 2}");
+        assert_eq!(get("eq"), "True");
+        assert_eq!(get("inst"), "(True, False)");
+        assert_eq!(get("same_copy"), "True");
+        assert_eq!(get("keys"), "['a', 'b']");
+        assert_eq!(get("got"), "9");
+        assert_eq!(get("fromkeys"), "frozendict({'a': 0, 'b': 0})");
+        assert_eq!(get("h"), "True");
+        assert_eq!(get("as_key"), "ok");
+        assert_eq!(get("tname"), "frozendict");
+    }
+
+    #[test]
+    fn pep814_frozendict_is_immutable_like_cpython() {
+        for (src, kind, message) in [
+            (
+                "fd = frozendict(a=1)\nfd['a'] = 2\n",
+                "TypeError",
+                "'frozendict' object does not support item assignment",
+            ),
+            (
+                "fd = frozendict(a=1)\ndel fd['a']\n",
+                "TypeError",
+                "'frozendict' object does not support item deletion",
+            ),
+            (
+                "fd = frozendict(a=1)\nfd.update({})\n",
+                "AttributeError",
+                "'frozendict' object has no attribute 'update'",
+            ),
+            (
+                "hash(frozendict(a=[1]))\n",
+                "TypeError",
+                "unhashable type: 'list'",
+            ),
+        ] {
+            let (_, res) = parse_and_run(src);
+            let Err(Unwind::Exception(exc)) = res else {
+                panic!("{src:?} must raise");
+            };
+            assert_eq!(
+                (exc.kind.as_str(), exc.message.as_str()),
+                (kind, message),
+                "{src:?}"
+            );
+        }
+    }
+
+    /// PEP 798 (Python 3.15): unpacking in comprehensions. Expected values
+    /// are CPython 3.15's.
+    #[test]
+    fn pep798_unpacking_comprehensions() {
+        let src = r#"
+groups = [[1, 2], [3], []]
+maps = [{"a": 1}, {"b": 2}, {"a": 3}]
+flat = [*g for g in groups]
+uniq = {*g for g in groups if g}
+lazy = list((*g for g in groups))
+merged = {**m for m in maps}
+total = sum(*g for g in groups)
+nested = [*[*y for y in x] for x in [groups]]
+order = list({**m for m in maps})
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        let get = |name: &str| interp.root.get(name).unwrap().py_str();
+        assert_eq!(get("flat"), "[1, 2, 3]");
+        assert_eq!(get("uniq"), "{1, 2, 3}");
+        assert_eq!(get("lazy"), "[1, 2, 3]");
+        assert_eq!(get("merged"), "{'a': 3, 'b': 2}");
+        assert_eq!(get("total"), "6");
+        assert_eq!(get("nested"), "[1, 2, 3]");
+        assert_eq!(get("order"), "['a', 'b']");
+    }
+
+    #[test]
+    fn pep798_unpacking_errors_match_cpython() {
+        let (_, res) = parse_and_run("d = {**x for x in [1]}\n");
+        let Err(Unwind::Exception(exc)) = res else {
+            panic!("`**` over an int must raise");
+        };
+        assert_eq!(exc.kind, "TypeError");
+        assert_eq!(exc.message, "'int' object is not a mapping");
+        let (_, res) = parse_and_run("s = list((*x for x in [1]))\n");
+        assert!(matches!(res, Err(Unwind::Exception(e)) if e.kind == "TypeError"));
     }
 
     /// FINDINGS #19 — `2 ** 100` and other big-integer arithmetic must

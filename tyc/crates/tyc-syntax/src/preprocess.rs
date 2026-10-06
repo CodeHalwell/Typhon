@@ -73,6 +73,11 @@ pub struct LazyImport {
     pub alias: String,
     /// The module being imported (`numpy` in `lazy import np = numpy`).
     pub module: String,
+    /// Written in PEP 810's own spelling — `lazy import numpy` or
+    /// `lazy import numpy as np` — rather than Typhon's
+    /// `lazy import np = numpy`. `tyc fmt` restores the spelling the user
+    /// wrote.
+    pub native_spelling: bool,
 }
 
 /// A `comptime` binding whose RHS must be evaluated at build time.
@@ -617,6 +622,7 @@ pub fn preprocess_opts_mapped(
                             line_index,
                             alias: alias.clone(),
                             module: module.clone(),
+                            native_spelling: !lazy_import_code(after).contains('='),
                         });
                         // Emit a standard Python import so downstream passes see a
                         // valid import statement.
@@ -1719,10 +1725,15 @@ fn restore_newtype_decl(content: &str) -> Option<String> {
 /// Parse the tail of a `lazy import` line: `ALIAS = MODULE`.
 ///
 /// Returns `(alias, module)` on success, `None` if the syntax is malformed.
+/// The code part of a `lazy import` tail: a trailing `# comment` stripped,
+/// so that `lazy import np = numpy  # noqa` is handled correctly rather than
+/// failing the identifier check.
+fn lazy_import_code(tail: &str) -> &str {
+    tail.split('#').next().unwrap_or("").trim()
+}
+
 fn parse_lazy_import(tail: &str) -> Option<(String, String)> {
-    // Strip a trailing `# comment` so that `lazy import np = numpy  # noqa`
-    // is handled correctly rather than failing the identifier check.
-    let code = tail.split('#').next().unwrap_or("").trim();
+    let code = lazy_import_code(tail);
     let Some(eq) = code.find('=') else {
         // PEP 810 spelling with no alias: `lazy import pandas`, and
         // `lazy import pandas as pd`. Both are unambiguous — the alias is the
@@ -3307,7 +3318,13 @@ pub fn postprocess_full(
         if li.line_index >= lines.len() {
             continue;
         }
-        lines[li.line_index] = format!("lazy import {} = {}", li.alias, li.module);
+        lines[li.line_index] = if !li.native_spelling {
+            format!("lazy import {} = {}", li.alias, li.module)
+        } else if li.alias == li.module {
+            format!("lazy import {}", li.module)
+        } else {
+            format!("lazy import {} as {}", li.module, li.alias)
+        };
     }
 
     let mut result = lines.join("\n");
@@ -3332,39 +3349,80 @@ pub struct LazyUsageError {
 
 /// Scan `source` for `lazy` constructs that Typhon rejects.
 ///
-/// Currently flagged:
-/// - `lazy from x import a, b` — `from` imports defeat deferral because the
-///   names must be bound eagerly; reject in favour of `lazy import x = x` and
-///   member access through the lazy module proxy.
-pub fn validate_lazy_usage(source: &str) -> Vec<LazyUsageError> {
+/// `python_minor` is the `[python] target` minor version (`15` for
+/// `"3.15"`). Currently flagged:
+/// - `lazy from x import a, b` on a pre-3.15 target — binding a *name* lazily
+///   needs the PEP 810 lazy proxy CPython 3.15 provides; Typhon's own
+///   lowering can only defer a whole module (`lazy import x = x`).
+/// - on a 3.15+ target, the `lazy from` forms PEP 810 itself rejects:
+///   `lazy from x import *`, `lazy from __future__ import …`, and a
+///   `lazy from` anywhere but the module's top level (CPython forbids lazy
+///   imports inside functions, classes and `try` blocks).
+pub fn validate_lazy_usage(source: &str, python_minor: u8) -> Vec<LazyUsageError> {
     let mut errors = Vec::new();
     let mut byte_offset: usize = 0;
     let mut in_string: Option<StringMode> = None;
     for (line_index, line) in source.split_inclusive('\n').enumerate() {
         let raw = line.trim_end_matches(['\n', '\r']);
         let pre = in_string;
-        let _ = scan_line_code_end(raw, &mut in_string);
+        let code_end = scan_line_code_end(raw, &mut in_string);
         if pre.is_none() {
             let indent_len = raw.find(|c: char| !c.is_whitespace()).unwrap_or(raw.len());
-            let body = &raw[indent_len..];
+            let body = &raw[indent_len..code_end.max(indent_len)];
             if let Some(rest) = body.strip_prefix("lazy ") {
-                if rest.starts_with("from ") {
-                    errors.push(LazyUsageError {
-                        line_index,
-                        offset: byte_offset + indent_len,
-                        message: "`lazy from … import …` is not supported; \
-                                  Typhon's lazy imports defer module loading, \
-                                  which is incompatible with eagerly binding \
-                                  specific names. Use `lazy import x = x` and \
-                                  access members through the lazy proxy."
-                            .to_owned(),
-                    });
+                if let Some(from_tail) = rest.trim_start().strip_prefix("from ") {
+                    if let Some(message) = lazy_from_violation(from_tail, indent_len, python_minor)
+                    {
+                        errors.push(LazyUsageError {
+                            line_index,
+                            offset: byte_offset + indent_len,
+                            message,
+                        });
+                    }
                 }
             }
         }
         byte_offset += line.len();
     }
     errors
+}
+
+/// Why a `lazy from <from_tail>` line is rejected, if it is. `from_tail` is
+/// the text after `lazy from `, comment stripped.
+fn lazy_from_violation(from_tail: &str, indent_len: usize, python_minor: u8) -> Option<String> {
+    if python_minor < 15 {
+        return Some(
+            "`lazy from … import …` needs Python 3.15 (PEP 810 binds each imported \
+             name to a lazy proxy, which older interpreters lack). Set \
+             `[python] target = \"3.15\"` in typhon.toml, or write \
+             `lazy import x = x` and reach members through the alias."
+                .to_owned(),
+        );
+    }
+    if indent_len > 0 {
+        return Some(
+            "`lazy from … import …` is only allowed at the top level of a module: \
+             PEP 810 forbids lazy imports inside functions, classes and `try` \
+             blocks. Move it to module scope, or drop `lazy`."
+                .to_owned(),
+        );
+    }
+    let module = from_tail.split_whitespace().next().unwrap_or("");
+    if module == "__future__" {
+        return Some("`__future__` imports cannot be lazy (PEP 810); drop `lazy`.".to_owned());
+    }
+    let names = from_tail
+        .split_once(" import ")
+        .map(|(_, names)| names.trim().trim_start_matches('(').trim_start())
+        .unwrap_or("");
+    if names.starts_with('*') {
+        return Some(
+            "`lazy from … import *` is not allowed (PEP 810): name the imported \
+             members, or use `lazy import x = x`."
+                .to_owned(),
+        );
+    }
+    None
 }
 
 // ── `extend` usage validation ────────────────────────────────────────────────
@@ -14475,15 +14533,62 @@ def run() -> Result[str, str]:
 
     #[test]
     fn validate_lazy_usage_flags_lazy_from() {
-        let errors = validate_lazy_usage("lazy from numpy import array\n");
+        let errors = validate_lazy_usage("lazy from numpy import array\n", 13);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].message.contains("lazy from"));
     }
 
     #[test]
     fn validate_lazy_usage_silent_on_lazy_import() {
-        let errors = validate_lazy_usage("lazy import np = numpy\n");
+        let errors = validate_lazy_usage("lazy import np = numpy\n", 13);
         assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn validate_lazy_usage_pre_315_points_at_the_target() {
+        let errors = validate_lazy_usage("lazy from json import dumps\n", 14);
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].message.contains("target = \"3.15\""),
+            "{}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn validate_lazy_usage_accepts_pep810_from_imports_on_315() {
+        for src in [
+            "lazy from json import dumps\n",
+            "lazy from json import dumps as d, loads\n",
+            "lazy from . import sibling\n",
+            "lazy from .pkg import (\n    a,\n    b,\n)\n",
+            "lazy from json import dumps  # deferred\n",
+        ] {
+            assert!(
+                validate_lazy_usage(src, 15).is_empty(),
+                "{src:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_lazy_usage_rejects_what_pep810_rejects() {
+        let star = validate_lazy_usage("lazy from json import *\n", 15);
+        assert_eq!(star.len(), 1);
+        assert!(star[0].message.contains("import *"));
+        let future = validate_lazy_usage("lazy from __future__ import annotations\n", 15);
+        assert_eq!(future.len(), 1);
+        assert!(future[0].message.contains("__future__"));
+        let nested = validate_lazy_usage("def f() -> None:\n    lazy from json import dumps\n", 15);
+        assert_eq!(nested.len(), 1);
+        assert!(nested[0].message.contains("top level"));
+        assert_eq!(nested[0].line_index, 1);
+    }
+
+    #[test]
+    fn validate_lazy_usage_ignores_lazy_from_inside_strings() {
+        let src = "DOC = \"\"\"\nlazy from json import *\n\"\"\"\n";
+        assert!(validate_lazy_usage(src, 13).is_empty());
     }
 
     // ── gather block ─────────────────────────────────────────────────────────

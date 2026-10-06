@@ -27,6 +27,7 @@ mod expression_calls;
 mod frozen_context;
 mod mutations;
 mod operators;
+mod target_gate;
 #[cfg(debug_assertions)]
 mod unchecked;
 
@@ -401,7 +402,12 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
             // bidirectional assignability on K for both, and on V
             // for MutableMapping. (See review thread on PR #147 from
             // gemini-code-assist / copilot.)
-            if an == "Mapping" && aa.len() == 2 && bn == "dict" && bb.len() == 2 {
+            // A `frozendict` (Python 3.15) is a read-only mapping too.
+            if an == "Mapping"
+                && aa.len() == 2
+                && matches!(bn.as_str(), "dict" | "frozendict")
+                && bb.len() == 2
+            {
                 return types_equivalent(&aa[0], &bb[0]) && assignable(&aa[1], &bb[1]);
             }
             if an == "MutableMapping" && aa.len() == 2 && bn == "dict" && bb.len() == 2 {
@@ -748,6 +754,19 @@ fn builtin_dunder_methods(head: &str) -> &'static [&'static str] {
         "__repr__",
         "__str__",
     ];
+    // Hashable mapping: `frozendict` (Python 3.15).
+    const HASHABLE_MAPPING: &[&str] = &[
+        "__len__",
+        "__iter__",
+        "__getitem__",
+        "__contains__",
+        "__hash__",
+        "__bool__",
+        "__eq__",
+        "__ne__",
+        "__repr__",
+        "__str__",
+    ];
     // Hashable set: `frozenset`.
     const HASHABLE_SET: &[&str] = &[
         "__len__",
@@ -775,6 +794,7 @@ fn builtin_dunder_methods(head: &str) -> &'static [&'static str] {
         "tuple" | "tuple_variadic" | "str" | "bytes" | "range" => HASHABLE_INDEXABLE,
         "list" | "bytearray" => UNHASHABLE_INDEXABLE,
         "dict" => UNHASHABLE_MAPPING,
+        "frozendict" => HASHABLE_MAPPING,
         "frozenset" => HASHABLE_SET,
         "set" => UNHASHABLE_SET,
         _ => &[],
@@ -1516,7 +1536,7 @@ fn check_explicit_typearg_constructor(
 fn is_bare_container_name(name: &str) -> bool {
     matches!(
         name,
-        "list" | "dict" | "tuple" | "set" | "frozenset" | "deque"
+        "list" | "dict" | "tuple" | "set" | "frozenset" | "frozendict" | "deque"
     )
 }
 
@@ -1583,6 +1603,9 @@ pub fn generic_param_variance(head: &str, idx: usize) -> Variance {
         | ("AbstractSet", 0)
         | ("FrozenSet", 0)
         | ("frozenset", 0)
+        // `frozendict[K, V]` (Python 3.15) is a read-only mapping: covariant
+        // in V like `Mapping`, invariant in K (keys are hashed / compared).
+        | ("frozendict", 1)
         // `tuple` / `Tuple` are handled by the early-return above so every
         // fixed-arity slot is covariant; they remain documented here for
         // discoverability.
@@ -1735,6 +1758,7 @@ fn expr_is_type_shaped(expr: &Expr, classes: &[String], type_params: &[String]) 
         "dict",
         "set",
         "frozenset",
+        "frozendict",
         "tuple",
         "range",
         "bytearray",
@@ -3521,6 +3545,10 @@ struct Checker<'a> {
     /// `def f() -> Iterator[int]: ... return` is accepted instead of
     /// being flagged as `expected Iterator[int], found None`.
     in_generator: bool,
+    /// The `[python] target` minor version (`3.X`) the program is checked
+    /// against. Gates builtins that only exist from a given CPython release
+    /// (`frozendict` is 3.15+) — see [`CheckOptions`].
+    python_minor: u8,
     /// Bounds declared on PEP 695 type parameters, keyed by function name.
     /// E.g. `def f[T: Interface](x: T)` populates `{"f": {"T": Class("Interface")}}`.
     /// Checked at call sites via `Checker::check_call_typevar_bounds`.
@@ -3979,6 +4007,7 @@ impl<'a> Checker<'a> {
             async_enclosing_depth: 0,
             sync_spawners: HashMap::new(),
             in_generator: false,
+            python_minor: MIN_PYTHON_MINOR,
             function_type_bounds: HashMap::new(),
             active_typevar_bounds: HashMap::new(),
             descriptor_uses: std::cell::OnceCell::new(),
@@ -4184,7 +4213,7 @@ impl<'a> Checker<'a> {
                     return Some(slots.iter().all(|a| self.is_assignable(&ea[0], a)));
                 }
                 if eh == "Mapping"
-                    && matches!(ah.as_str(), "dict" | "Mapping")
+                    && matches!(ah.as_str(), "dict" | "Mapping" | "frozendict")
                     && ea.len() == aa.len()
                 {
                     return Some(ea.iter().zip(aa).all(|(e, a)| self.is_assignable(e, a)));
@@ -4690,7 +4719,11 @@ impl<'a> Checker<'a> {
             // both. The class-hierarchy-aware `is_assignable` carries
             // the same one-way primitive widening as `assignable`, so
             // bidirectional checks here actually enforce invariance.
-            if an == "Mapping" && aa.len() == 2 && bn == "dict" && bb.len() == 2 {
+            if an == "Mapping"
+                && aa.len() == 2
+                && matches!(bn.as_str(), "dict" | "frozendict")
+                && bb.len() == 2
+            {
                 return self.is_assignable(&aa[0], &bb[0])
                     && self.is_assignable(&bb[0], &aa[0])
                     && self.is_assignable(&aa[1], &bb[1]);
@@ -7331,6 +7364,29 @@ impl CheckedModule {
     }
 }
 
+/// The oldest CPython minor version Typhon emits for (`[python] target =
+/// "3.13"`). A checker run with no explicit [`CheckOptions`] assumes it.
+pub const MIN_PYTHON_MINOR: u8 = 13;
+
+/// Per-run settings the checker cannot derive from the module itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckOptions {
+    /// The `[python] target` minor version (`3.X`): `13` for `"3.13"` /
+    /// `"3.13t"`, `15` for `"3.15"`. A builtin that only exists from a later
+    /// release (`frozendict`, `sentinel` — 3.15) used on an older target is
+    /// `tyc::requires_python`, since the emitted Python would raise
+    /// `NameError` there.
+    pub python_minor: u8,
+}
+
+impl Default for CheckOptions {
+    fn default() -> Self {
+        Self {
+            python_minor: MIN_PYTHON_MINOR,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn check_module_with_imports_and_types(
     path: impl Into<String>,
@@ -7342,8 +7398,37 @@ pub fn check_module_with_imports_and_types(
     impl_distributed_lines: &[usize],
     external: Option<&ExternalShapes>,
 ) -> CheckedModule {
+    check_module_with_options(
+        path,
+        source,
+        resolved,
+        module,
+        unsafe_lines,
+        frozen_class_lines,
+        impl_distributed_lines,
+        external,
+        CheckOptions::default(),
+    )
+}
+
+/// [`check_module_with_imports_and_types`] with explicit [`CheckOptions`] —
+/// the entry point the CLI and the language server use, so the checker sees
+/// the project's `[python] target`.
+#[allow(clippy::too_many_arguments)]
+pub fn check_module_with_options(
+    path: impl Into<String>,
+    source: &str,
+    resolved: &ResolvedModule,
+    module: &ModModule,
+    unsafe_lines: &[usize],
+    frozen_class_lines: &[usize],
+    impl_distributed_lines: &[usize],
+    external: Option<&ExternalShapes>,
+    options: CheckOptions,
+) -> CheckedModule {
     let mut c = Checker::new(path.into(), source, resolved);
     c.module = Some(module);
+    c.python_minor = options.python_minor;
     c.unsafe_line_starts = unsafe_byte_starts(source, unsafe_lines);
     let frozen_starts = unsafe_byte_starts(source, frozen_class_lines);
     // Seed cross-module shapes BEFORE the in-module first pass so
@@ -7596,6 +7681,12 @@ pub fn check_module_with_imports_and_types(
     // surface a `tyc::freeze_not_freezable` diagnostic up-front so
     // the failure shows in the editor instead of at first import.
     check_freeze_let_freezable(&mut c, &module.body);
+
+    // `[python] target` gating: builtins newer than the target
+    // (`tyc::requires_python`) and stdlib APIs it no longer ships
+    // (`tyc::removed_in_python`).
+    let path = c.path.clone();
+    target_gate::check(module, c.python_minor, &path, source, &mut c.diagnostics);
 
     #[cfg(debug_assertions)]
     unchecked::report(&c.path, module, &c.expression_types);
@@ -12209,7 +12300,10 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
         }
         Expr::Call(call) => {
             if let Some(argument) = freeze_call_argument(e) {
-                return frozen_type(&c.unwrap_alias(&infer_expr_readonly(c, argument)));
+                return frozen_type_for(
+                    &c.unwrap_alias(&infer_expr_readonly(c, argument)),
+                    c.python_minor,
+                );
             }
             if matches!(call.func.as_ref(), Expr::Name(n) if n.id.as_str() == "super") {
                 let receiver_class = c.current_class.clone().or_else(|| {
@@ -12349,6 +12443,7 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
                         args[0].clone()
                     }
                     "dict" | "Mapping" | "MutableMapping" | "defaultdict" | "OrderedDict"
+                    | "frozendict"
                         if args.len() == 2 =>
                     {
                         args[1].clone()
@@ -14454,7 +14549,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 init_type = Some(value_type.clone());
                 // A freeze annotation describes the input; the binding carries
                 // the runtime's recursively immutable output shape.
-                let frozen_annotation = frozen_type(&c.unwrap_alias(&ann_type));
+                let frozen_annotation = frozen_type_for(&c.unwrap_alias(&ann_type), c.python_minor);
                 if freeze_call_argument(value).is_some()
                     || (frozen_annotation != ann_type
                         && c.is_assignable(&frozen_annotation, &value_type)
@@ -14761,7 +14856,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     if let Type::Generic(head, args) = &recv_ty {
                         if matches!(
                             head.as_str(),
-                            "Mapping" | "tuple" | "tuple_variadic" | "frozenset"
+                            "Mapping" | "tuple" | "tuple_variadic" | "frozenset" | "frozendict"
                         ) {
                             let at = target.range();
                             let diagnostic = TycError::generic_at(
@@ -19311,6 +19406,7 @@ fn is_builtin_generic_head(head: &str) -> bool {
     matches!(
         head,
         "list" | "dict" | "set" | "tuple" | "tuple_variadic" | "Mapping" | "str" | "bytes" | "frozenset"
+        | "frozendict"
         // The Result family is Typhon's own closed surface — an unknown
         // method on Ok/Err/Result is always a runtime AttributeError, so
         // flag it at check time (closes the `.unwrap()`-before-it-existed
@@ -19385,6 +19481,12 @@ fn is_known_builtin_generic_attr(head: &str, attr: &str) -> bool {
                 | "fromkeys"
         ),
         "Mapping" => matches!(attr, "get" | "keys" | "values" | "items" | "copy"),
+        // `frozendict` (Python 3.15) has no mutators: `fd.update(…)` is an
+        // `AttributeError` at runtime.
+        "frozendict" => matches!(
+            attr,
+            "get" | "keys" | "values" | "items" | "copy" | "fromkeys"
+        ),
         "frozenset" => matches!(
             attr,
             "copy"
@@ -19685,6 +19787,21 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
     };
     if head == "Mapping" && matches!(attr, "get" | "keys" | "values" | "items" | "copy") {
         return builtin_generic_method(&Type::Generic("dict".into(), args.clone()), attr);
+    }
+    if head == "frozendict" {
+        return match attr {
+            "get" | "keys" | "values" | "items" => {
+                builtin_generic_method(&Type::Generic("dict".into(), args.clone()), attr)
+            }
+            // `frozendict.copy()` returns the frozendict itself.
+            "copy" => Some(Type::Function {
+                params: vec![],
+                ret: Box::new(recv.clone()),
+                variadic: false,
+                min_params: Some(0),
+            }),
+            _ => None,
+        };
     }
     if let Some(sig) = builtin_container_mutator(head, attr, args) {
         return Some(sig);
@@ -20510,7 +20627,9 @@ fn iterable_element_type(ty: &Type) -> Option<Type> {
                 Some(args[0].clone())
             }
             // Iterating a mapping yields its KEYS.
-            "dict" | "Mapping" | "MutableMapping" if args.len() == 2 => Some(args[0].clone()),
+            "dict" | "Mapping" | "MutableMapping" | "frozendict" if args.len() == 2 => {
+                Some(args[0].clone())
+            }
             // Fixed-arity tuple — iteration yields the union of every slot.
             "tuple" if !args.is_empty() => Some(Type::union_of(args.clone())),
             _ => None,
@@ -20788,22 +20907,48 @@ fn checked_cast_target_supported(c: &Checker, target: &Type) -> bool {
 /// Static output shape of deep_freeze. User instances, including generic
 /// frozen dataclasses, retain their own type and identity.
 pub fn frozen_type(ty: &Type) -> Type {
+    frozen_type_for(ty, MIN_PYTHON_MINOR)
+}
+
+/// [`frozen_type`] for the `3.<python_minor>` target: from Python 3.15 the
+/// generated `deep_freeze` turns a `dict` into a `frozendict` (hashable, and
+/// JSON-serialisable) instead of a `MappingProxyType`, so its static shape is
+/// `frozendict[K, V]` rather than the read-only `Mapping[K, V]`.
+pub fn frozen_type_for(ty: &Type, python_minor: u8) -> Type {
     match ty {
         Type::Generic(head, args)
             if matches!(
                 head.as_str(),
-                "list" | "dict" | "set" | "tuple" | "tuple_variadic" | "frozenset" | "Mapping"
+                "list"
+                    | "dict"
+                    | "set"
+                    | "tuple"
+                    | "tuple_variadic"
+                    | "frozenset"
+                    | "Mapping"
+                    | "frozendict"
             ) =>
         {
             let output = match head.as_str() {
                 "list" => "tuple_variadic",
+                "dict" if python_minor >= 15 => "frozendict",
                 "dict" => "Mapping",
                 "set" => "frozenset",
                 _ => head,
             };
-            Type::Generic(output.into(), args.iter().map(frozen_type).collect())
+            Type::Generic(
+                output.into(),
+                args.iter()
+                    .map(|a| frozen_type_for(a, python_minor))
+                    .collect(),
+            )
         }
-        Type::Union(members) => Type::union_of(members.iter().map(frozen_type).collect()),
+        Type::Union(members) => Type::union_of(
+            members
+                .iter()
+                .map(|m| frozen_type_for(m, python_minor))
+                .collect(),
+        ),
         _ => ty.clone(),
     }
 }
@@ -21346,7 +21491,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
         Expr::Call(call) => {
             if let Some(argument) = freeze_call_argument(expr) {
                 let input = infer_expr_ctx(c, argument, expected);
-                return frozen_type(&c.unwrap_alias(&input));
+                return frozen_type_for(&c.unwrap_alias(&input), c.python_minor);
             }
             if matches!(call.func.as_ref(), Expr::Name(n) if n.id.as_str() == "super") {
                 let receiver_class = c.current_class.clone().or_else(|| {
@@ -22818,8 +22963,10 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     let diagnostic = TycError::attribute_not_found(
                         attr_name, &shown, &c.path, c.source, attr_start, attr_len,
                     );
-                    if matches!(head.as_str(), "tuple_variadic" | "Mapping" | "frozenset")
-                        && frozen_context::failure_is_caught(c, expr, "AttributeError")
+                    if matches!(
+                        head.as_str(),
+                        "tuple_variadic" | "Mapping" | "frozenset" | "frozendict"
+                    ) && frozen_context::failure_is_caught(c, expr, "AttributeError")
                     {
                         c.diagnostics.push_warning(diagnostic);
                     } else {
@@ -23227,7 +23374,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                                 attr_start,
                                 attr_len,
                             );
-                            if matches!(bad,Type::Generic(head,_) if matches!(head.as_str(),"tuple_variadic" | "Mapping" | "frozenset"))
+                            if matches!(bad,Type::Generic(head,_) if matches!(head.as_str(),"tuple_variadic" | "Mapping" | "frozenset" | "frozendict"))
                                 && frozen_context::failure_is_caught(c, expr, "AttributeError")
                             {
                                 c.diagnostics.push_warning(diagnostic);
@@ -23365,7 +23512,8 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             // invariant — the runtime hashes/compares against the slot.
             if c.unsafe_depth == 0 && !matches!(s.slice.as_ref(), Expr::Slice(_)) {
                 if let Type::Generic(head, args) = &value_ty {
-                    if matches!(head.as_str(), "dict" | "Mapping") && args.len() == 2 {
+                    if matches!(head.as_str(), "dict" | "Mapping" | "frozendict") && args.len() == 2
+                    {
                         let key_ty = &args[0];
                         if !is_dynamic_type(key_ty)
                             && !is_dynamic_type(&slice_ty)
@@ -23531,12 +23679,10 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     // `**mapping`: infer the mapping with the surrounding
                     // dict's expected type, then split its K/V.
                     let m = infer_expr_ctx(c, &item.value, map_expected.as_ref());
-                    if let Type::Generic(name, args) = &m {
-                        if name == "dict" && args.len() == 2 {
-                            keys.push(args[0].clone());
-                            vals.push(args[1].clone());
-                            continue;
-                        }
+                    if let Some((k, v)) = mapping_key_value_types(&m) {
+                        keys.push(k);
+                        vals.push(v);
+                        continue;
                     }
                     // Anything else (Any, Unknown, weird mapping type): fall
                     // back to Unknown for both slots so we don't fabricate
@@ -23706,7 +23852,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             let comp_saved = c.env.snapshot_scope_narrowings();
             c.env.enter();
             infer_comprehension_generators(c, &comp.generators);
-            let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
+            let elt = infer_comprehension_element(c, &comp.elt, elt_expected.as_ref());
             leave_comprehension_scope(c, expr);
             c.env.restore_scope_narrowings(comp_saved);
             // A comprehension builds a *fresh* list, so — like a list literal —
@@ -23725,7 +23871,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             let comp_saved = c.env.snapshot_scope_narrowings();
             c.env.enter();
             infer_comprehension_generators(c, &comp.generators);
-            let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
+            let elt = infer_comprehension_element(c, &comp.elt, elt_expected.as_ref());
             leave_comprehension_scope(c, expr);
             c.env.restore_scope_narrowings(comp_saved);
             let elt = widen_fresh_element(c, elt, elt_expected.as_ref());
@@ -23779,7 +23925,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             let comp_saved = c.env.snapshot_scope_narrowings();
             c.env.enter();
             infer_comprehension_generators(c, &comp.generators);
-            let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
+            let elt = infer_comprehension_element(c, &comp.elt, elt_expected.as_ref());
             leave_comprehension_scope(c, expr);
             c.env.restore_scope_narrowings(comp_saved);
             // A generator expression is an `Iterator[T]`.
@@ -23795,7 +23941,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             let comp_saved = c.env.snapshot_scope_narrowings();
             c.env.enter();
             infer_comprehension_generators(c, &comp.generators);
-            let k = match comp.key.as_ref() {
+            let (k, v) = match comp.key.as_ref() {
                 Some(key) => {
                     // Infer the key honestly (no coercing hint) so its real
                     // type is checked against the annotated `dict[K, V]` key —
@@ -23810,25 +23956,107 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                             c.mismatch(ke, &kt, span);
                         }
                     }
-                    kt
+                    let v = infer_expr_ctx(c, &comp.value, v_expected.as_ref());
+                    if let Some(ve) = &v_expected {
+                        if !c.is_assignable(ve, &v) {
+                            let span = (
+                                comp.value.range().start().to_usize(),
+                                comp.value.range().end().to_usize(),
+                            );
+                            c.mismatch(ve, &v, span);
+                        }
+                    }
+                    (kt, v)
                 }
-                None => Type::Unknown,
-            };
-            let v = infer_expr_ctx(c, &comp.value, v_expected.as_ref());
-            if let Some(ve) = &v_expected {
-                if !c.is_assignable(ve, &v) {
+                // PEP 798 dict unpacking, `{**m for m in maps}`: the result
+                // merges every mapping, so its key / value types are the
+                // mapping's — checked against the annotation slot by slot,
+                // like a `key: value` pair.
+                None => {
+                    let m = infer_expr(c, &comp.value);
                     let span = (
                         comp.value.range().start().to_usize(),
                         comp.value.range().end().to_usize(),
                     );
-                    c.mismatch(ve, &v, span);
+                    if c.unsafe_depth == 0 && definitely_not_a_mapping(&m) {
+                        c.mismatch_with("a mapping".to_string(), m.display(), span);
+                    }
+                    let (kt, vt) =
+                        mapping_key_value_types(&m).unwrap_or((Type::Unknown, Type::Unknown));
+                    if let Some(ke) = &k_expected {
+                        if !c.is_assignable(ke, &kt) {
+                            c.mismatch(ke, &kt, span);
+                        }
+                    }
+                    if let Some(ve) = &v_expected {
+                        if !c.is_assignable(ve, &vt) {
+                            c.mismatch(ve, &vt, span);
+                        }
+                    }
+                    (kt, vt)
                 }
-            }
+            };
             leave_comprehension_scope(c, expr);
             c.env.restore_scope_narrowings(comp_saved);
             Type::Generic("dict".into(), vec![k, v])
         }
         _ => Type::Unknown,
+    }
+}
+
+/// The element type a list / set comprehension or generator expression
+/// contributes per iteration. A PEP 798 unpacking element
+/// (`[*xs for xs in groups]`) contributes every element of its iterable, so
+/// its type is the iterable's element type; a `*` over a value that is
+/// provably not iterable raises `TypeError` and is reported as the `for`
+/// statement reports it.
+fn infer_comprehension_element(c: &mut Checker, elt: &Expr, expected: Option<&Type>) -> Type {
+    let Expr::Starred(starred) = elt else {
+        return infer_expr_ctx(c, elt, expected);
+    };
+    let iter_ty = infer_expr(c, &starred.value);
+    if c.unsafe_depth == 0
+        && (matches!(iter_ty, Type::Int | Type::Float | Type::None)
+            || class_definitely_not_iterable(c, &iter_ty))
+    {
+        let span = (
+            starred.value.range().start().to_usize(),
+            starred.value.range().end().to_usize(),
+        );
+        c.mismatch_with("an iterable".to_string(), iter_ty.display(), span);
+    }
+    iterable_element_type(&iter_ty).unwrap_or(Type::Unknown)
+}
+
+/// `(K, V)` of a mapping type: the builtin and `typing` mappings plus the
+/// `collections` ones whose items the checker models. `None` when `ty` is not
+/// a modelled mapping (the caller stays permissive).
+fn mapping_key_value_types(ty: &Type) -> Option<(Type, Type)> {
+    let Type::Generic(head, args) = ty else {
+        return None;
+    };
+    match (head.as_str(), args.as_slice()) {
+        (
+            "dict" | "Mapping" | "MutableMapping" | "frozendict" | "defaultdict" | "OrderedDict"
+            | "ChainMap",
+            [k, v],
+        ) => Some((k.clone(), v.clone())),
+        ("Counter", [k]) => Some((k.clone(), Type::Int)),
+        _ => None,
+    }
+}
+
+/// Whether `**value` over a value of type `ty` certainly raises `TypeError:
+/// 'X' object is not a mapping`: scalars, strings and the non-mapping
+/// builtin containers. Anything dynamic or user-defined stays permissive.
+fn definitely_not_a_mapping(ty: &Type) -> bool {
+    match ty {
+        Type::Int | Type::Float | Type::Bool | Type::None | Type::Str | Type::Bytes => true,
+        Type::Generic(head, _) => matches!(
+            head.as_str(),
+            "list" | "set" | "frozenset" | "tuple" | "tuple_variadic" | "deque"
+        ),
+        _ => false,
     }
 }
 
@@ -27303,6 +27531,194 @@ def describe(m: Maybe[int]) -> str:
                 .any(|e| matches!(e, TycError::TypeMismatch { .. })),
             "valid dict comprehension must pass: {:?}",
             ok.errors()
+        );
+    }
+
+    /// `check` against the `3.<minor>` target.
+    fn check_for(src: &str, minor: u8) -> Diagnostics {
+        let prep = preprocess(src);
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module("<test>".to_owned(), &prep.python_source, &module);
+        check_module_with_options(
+            "<test>",
+            &prep.python_source,
+            &resolved,
+            &module,
+            &prep.unsafe_lines,
+            &prep.frozen_class_lines,
+            &prep.impl_distributed_lines,
+            None,
+            CheckOptions {
+                python_minor: minor,
+            },
+        )
+        .diagnostics
+    }
+
+    fn requires_python_count(d: &Diagnostics) -> usize {
+        d.errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::RequiresPython { .. }))
+            .count()
+    }
+
+    // ── PEP 814: `frozendict` (Python 3.15) ─────────────────────────────
+
+    #[test]
+    fn frozendict_requires_a_315_target() {
+        let src = "def f(m: frozendict[str, int]) -> int:\n    return len(m)\n\
+                   let fd: frozendict[str, int] = frozendict(a=1)\nprint(f(fd))\n";
+        let old = check_for(src, 13);
+        assert_eq!(requires_python_count(&old), 3, "{:?}", old.errors());
+        let new = check_for(src, 15);
+        assert!(new.errors().is_empty(), "{:?}", new.errors());
+        // The PyPI backport binds the name itself: not the builtin.
+        let backport = "from frozendict import frozendict\nlet fd = frozendict(a=1)\nprint(fd)\n";
+        assert_eq!(requires_python_count(&check_for(backport, 13)), 0);
+    }
+
+    #[test]
+    fn frozendict_is_a_read_only_hashable_mapping() {
+        let ok = "from collections.abc import Mapping\n\
+                  def total(m: Mapping[str, int]) -> int:\n    return sum(m.values())\n\
+                  def main() -> None:\n\
+                  \x20   let fd: frozendict[str, int] = frozendict({\"a\": 1})\n\
+                  \x20   let n: int = fd[\"a\"] + total(fd)\n\
+                  \x20   let m: int? = fd.get(\"b\")\n\
+                  \x20   let seen: set[frozendict[str, int]] = {fd}\n\
+                  \x20   let back: dict[str, int] = dict(fd)\n\
+                  \x20   let same: frozendict[str, int] = fd.copy()\n\
+                  \x20   let keys: list[str] = [k for k in fd]\n\
+                  \x20   print(n, m, seen, back, same, keys)\n";
+        let d = check_for(ok, 15);
+        assert!(d.errors().is_empty(), "{:?}", d.errors());
+        for (bad, why) in [
+            ("    fd[\"a\"] = 2\n", "item assignment raises TypeError"),
+            ("    fd.update({})\n", "frozendict has no mutators"),
+            ("    let v: str = fd[\"a\"]\n", "values are int"),
+        ] {
+            let src = format!(
+                "def main() -> None:\n    let fd: frozendict[str, int] = frozendict(a=1)\n{bad}"
+            );
+            assert!(!check_for(&src, 15).errors().is_empty(), "{why}: {src}");
+        }
+    }
+
+    #[test]
+    fn freeze_let_dict_is_a_frozendict_on_315() {
+        let src = "freeze let CFG = {\"port\": 8080}\n\
+                   let key: set[frozendict[str, int]] = {CFG}\nprint(key)\n";
+        let d = check_for(src, 15);
+        assert!(d.errors().is_empty(), "{:?}", d.errors());
+        // Before 3.15 a frozen dict is a read-only `Mapping`, not a frozendict.
+        let src13 = "from collections.abc import Mapping\nfreeze let CFG = {\"port\": 8080}\n\
+                     let m: Mapping[str, int] = CFG\nprint(m)\n";
+        assert!(check_for(src13, 13).errors().is_empty());
+    }
+
+    // ── `tyc::removed_in_python` ────────────────────────────────────────
+
+    fn removed_count(d: &Diagnostics) -> usize {
+        d.errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::RemovedInPython { .. }))
+            .count()
+    }
+
+    #[test]
+    fn removed_in_python_fires_only_from_the_removing_release() {
+        let src = "import sre_compile\nimport glob\nfrom typing import no_type_check_decorator, NamedTuple\n\
+                   let a = glob.glob0(\".\", \"x\")\nlet P = NamedTuple(\"P\", x=int)\nprint(sre_compile, a, P, no_type_check_decorator)\n";
+        assert_eq!(removed_count(&check_for(src, 13)), 0);
+        assert_eq!(removed_count(&check_for(src, 14)), 0);
+        assert_eq!(
+            removed_count(&check_for(src, 15)),
+            4,
+            "{:?}",
+            check_for(src, 15).errors()
+        );
+        let ast_src = "import ast\nfrom pkgutil import find_loader\nlet n = ast.Num(1)\nprint(n, find_loader)\n";
+        assert_eq!(removed_count(&check_for(ast_src, 13)), 0);
+        assert_eq!(removed_count(&check_for(ast_src, 14)), 2);
+    }
+
+    #[test]
+    fn removed_in_python_leaves_valid_forms_alone() {
+        let src = "from typing import NamedTuple, TypedDict\nimport glob\n\
+                   let P = NamedTuple(\"P\", [(\"x\", int)])\nlet T = TypedDict(\"T\", {})\n\
+                   print(P, T, glob.glob(\"*\"))\n";
+        assert_eq!(
+            removed_count(&check_for(src, 15)),
+            0,
+            "{:?}",
+            check_for(src, 15).errors()
+        );
+    }
+
+    // ── PEP 798: unpacking in comprehensions (Python 3.15 syntax) ───────
+
+    fn mismatches(src: &str) -> usize {
+        check(src)
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::TypeMismatch { .. }))
+            .count()
+    }
+
+    #[test]
+    fn pep798_unpacking_comprehensions_take_the_element_type() {
+        let src = "def f(groups: list[list[int]], maps: list[dict[str, int]]) -> None:\n\
+                   \x20   let flat: list[int] = [*g for g in groups]\n\
+                   \x20   let uniq: set[int] = {*g for g in groups if len(g) > 1}\n\
+                   \x20   let lazy: Iterator[int] = (*g for g in groups)\n\
+                   \x20   let merged: dict[str, int] = {**m for m in maps}\n\
+                   \x20   let total: int = sum(*g for g in groups)\n\
+                   \x20   print(flat, uniq, lazy, merged, total)\n";
+        let d = check(src);
+        assert!(
+            d.errors().is_empty(),
+            "valid PEP 798 forms must pass: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn pep798_element_type_is_checked_against_the_annotation() {
+        // Before, the starred element inferred as `Unknown`, so a wrong
+        // annotation slipped through.
+        let list = "def f(groups: list[list[str]]) -> None:\n\
+                    \x20   let flat: list[int] = [*g for g in groups]\n\
+                    \x20   print(flat)\n";
+        assert!(
+            mismatches(list) >= 1,
+            "list[str] items into list[int] must be rejected"
+        );
+        let dict = "def f(maps: list[dict[str, str]]) -> None:\n\
+                    \x20   let merged: dict[str, int] = {**m for m in maps}\n\
+                    \x20   print(merged)\n";
+        assert!(
+            mismatches(dict) >= 1,
+            "dict[str, str] merged into dict[str, int] must be rejected"
+        );
+    }
+
+    #[test]
+    fn pep798_unpacking_a_non_iterable_or_non_mapping_is_rejected() {
+        let star = "def f(n: int) -> None:\n\
+                    \x20   let xs: list[int] = [*n for _ in range(2)]\n\
+                    \x20   print(xs)\n";
+        assert!(
+            mismatches(star) >= 1,
+            "`*` over an int raises TypeError at runtime"
+        );
+        let double = "def f(groups: list[list[int]]) -> None:\n\
+                      \x20   let d: dict[int, int] = {**g for g in groups}\n\
+                      \x20   print(d)\n";
+        assert!(
+            mismatches(double) >= 1,
+            "`**` over a list raises TypeError at runtime"
         );
     }
 

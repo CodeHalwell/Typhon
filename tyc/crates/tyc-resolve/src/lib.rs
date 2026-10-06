@@ -3568,6 +3568,10 @@ pub fn builtin_names() -> std::collections::HashSet<&'static str> {
         "classmethod",
         "staticmethod",
         "frozenset",
+        // Python 3.15 (PEP 814). Resolved on every target so an older one
+        // reports the clearer `tyc::requires_python` from the checker
+        // instead of `unknown_name`.
+        "frozendict",
         // Built-in types
         "int",
         "str",

@@ -83,6 +83,19 @@ impl Default for PythonConfig {
     }
 }
 
+impl PythonConfig {
+    /// The target's minor version (`13` for `"3.13"` / `"3.13t"`, `15` for
+    /// `"3.15"`). [`TyphonConfig::validate`] rejects anything below 3.13, so
+    /// an unparseable value can only reach here unvalidated; it reads as the
+    /// 3.13 floor, the most conservative choice for feature gating.
+    pub fn target_minor(&self) -> u8 {
+        parse_python_target(&self.target)
+            .filter(|(major, _)| *major == 3)
+            .and_then(|(_, minor)| u8::try_from(minor).ok())
+            .unwrap_or(13)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct EmitConfig {

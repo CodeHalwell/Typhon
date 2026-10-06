@@ -750,13 +750,51 @@ pub enum TycError {
     #[diagnostic(
         code(tyc::lazy_usage),
         url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/lazy_usage.md"),
-        help("`lazy` supports `lazy import name = module` and `lazy let NAME: T = expr` only")
+        help("`lazy` supports `lazy import name = module` (or PEP 810's `lazy import module [as name]`), `lazy let NAME: T = expr`, and — on a `[python] target = \"3.15\"` project — module-level `lazy from module import name`")
     )]
     LazyUsage {
         message: String,
         #[source_code]
         src: NamedSource<String>,
         #[label("unsupported lazy form here")]
+        span: SourceSpan,
+    },
+
+    /// A builtin or form that only exists from a later CPython release than
+    /// the project's `[python] target` (`frozendict` is Python 3.15+). The
+    /// emitted Python would raise `NameError` / `SyntaxError` on the target.
+    #[error("{message}")]
+    #[diagnostic(
+        code(tyc::requires_python),
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/requires_python.md"),
+        help("{help}")
+    )]
+    RequiresPython {
+        message: String,
+        help: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("needs a newer `[python] target`")]
+        span: SourceSpan,
+    },
+
+    /// A stdlib module or name the project's `[python] target` no longer
+    /// ships (`sre_compile`, `typing.no_type_check_decorator` — removed in
+    /// Python 3.15). The emitted import would raise `ImportError` there.
+    #[error("{message}")]
+    #[diagnostic(
+        code(tyc::removed_in_python),
+        url(
+            "https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/removed_in_python.md"
+        ),
+        help("{help}")
+    )]
+    RemovedInPython {
+        message: String,
+        help: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("removed in the target Python")]
         span: SourceSpan,
     },
 
@@ -2155,6 +2193,8 @@ impl TycError {
             | Self::InvalidQuestionOp { src, span, .. }
             | Self::UnusedImport { src, span, .. }
             | Self::LazyUsage { src, span, .. }
+            | Self::RequiresPython { src, span, .. }
+            | Self::RemovedInPython { src, span, .. }
             | Self::ExtendBuiltin { src, span, .. }
             | Self::StdlibModuleShadow { src, span, .. }
             | Self::UnsafeValueLeak { src, span, .. }
@@ -2302,6 +2342,8 @@ impl TycError {
             | Self::InvalidQuestionOp { src, span, .. }
             | Self::UnusedImport { src, span, .. }
             | Self::LazyUsage { src, span, .. }
+            | Self::RequiresPython { src, span, .. }
+            | Self::RemovedInPython { src, span, .. }
             | Self::ExtendBuiltin { src, span, .. }
             | Self::StdlibModuleShadow { src, span, .. }
             | Self::UnsafeValueLeak { src, span, .. }
@@ -3063,6 +3105,40 @@ impl TycError {
     ) -> Self {
         Self::LazyUsage {
             message: message.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::RequiresPython`] diagnostic.
+    pub fn requires_python(
+        message: impl Into<String>,
+        help: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::RequiresPython {
+            message: message.into(),
+            help: help.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::RemovedInPython`] diagnostic.
+    pub fn removed_in_python(
+        message: impl Into<String>,
+        help: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::RemovedInPython {
+            message: message.into(),
+            help: help.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

@@ -17,7 +17,9 @@ use tyc_analyse::{
     rewrite_parallel_comprehensions, rewrite_reduction_loops, shared_mut_across_tasks_diagnostics,
     substitute_comptime_literals, CacheKind, ClassFacts, ProfileSample, StaticType, TypeFacts,
 };
-use tyc_db::{check_file_with_imports, extract_shapes_and_facts_for_path, TycDatabase};
+use tyc_db::{
+    check_file_with_imports_opts, extract_shapes_and_facts_for_path, CheckOptions, TycDatabase,
+};
 use tyc_desugar::{desugar_module_with, DesugarOptions};
 use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_emit::{emit_python_with_source_for_target, emit_stub};
@@ -325,9 +327,12 @@ pub fn run(args: BuildArgs) -> Result<()> {
     {
         let src_dir_canon = src_dir.canonicalize().unwrap_or_else(|_| src_dir.clone());
         for (path, source) in &sources {
-            if let Some(warn) =
-                crate::commands::check::check_stdlib_module_shadow(path, source, &src_dir_canon)
-            {
+            if let Some(warn) = crate::commands::check::check_stdlib_module_shadow_for(
+                path,
+                source,
+                &src_dir_canon,
+                config.python.target_minor(),
+            ) {
                 eprint_warning(warn);
             }
         }
@@ -476,11 +481,14 @@ pub fn run(args: BuildArgs) -> Result<()> {
     let project_shapes = std::sync::Arc::new(project_shapes);
 
     for (path, source) in &sources {
-        let file_diags = check_file_with_imports(
+        let file_diags = check_file_with_imports_opts(
             &mut db,
             path.to_string_lossy().into_owned(),
             source.clone(),
             &project_shapes,
+            CheckOptions {
+                python_minor: config.python.target_minor(),
+            },
         );
         all_phase1_diags.extend(file_diags);
     }
@@ -3391,7 +3399,10 @@ fn generated_runtime_files(config: &TyphonConfig) -> Vec<(&'static str, String)>
         ("stdlib.py", TYPHON_RUNTIME_STDLIB_PY.to_owned()),
         ("result.py", TYPHON_RUNTIME_RESULT_PY.to_owned()),
         ("parallel.py", parallel_py),
-        ("freeze.py", TYPHON_RUNTIME_FREEZE_PY.to_owned()),
+        (
+            "freeze.py",
+            typhon_runtime_freeze_py(config.python.target_minor()),
+        ),
         ("cast.py", TYPHON_RUNTIME_CAST_PY.to_owned()),
         ("traceback.py", TYPHON_RUNTIME_TRACEBACK_PY.to_owned()),
     ]
@@ -4141,6 +4152,54 @@ def unwrap_or_else(r: object, f: Callable[[_E], _T]) -> _T:
 /// CPython (3.13t+) escapes the GIL entirely and yields linear scaling
 /// for CPU-bound `fn`s.  On stock CPython the workers still serialise on
 /// the GIL — correctness is preserved, only the speedup is lost.
+/// `typhon_runtime/freeze.py` for the `3.<python_minor>` target.
+///
+/// From Python 3.15 a frozen `dict` becomes a `frozendict` (PEP 814) rather
+/// than a `MappingProxyType`: it is hashable — so a `freeze let` value can be
+/// a dict key, a set member or a `@memo` argument — and `json.dumps` accepts
+/// it. Older targets get the `MappingProxyType` helper byte-for-byte.
+fn typhon_runtime_freeze_py(python_minor: u8) -> String {
+    if python_minor < 15 {
+        return TYPHON_RUNTIME_FREEZE_PY.to_owned();
+    }
+    let mut out = TYPHON_RUNTIME_FREEZE_PY.to_owned();
+    for (from, to, count) in FREEZE_PY_FROZENDICT_EDITS {
+        assert_eq!(
+            out.matches(from).count(),
+            *count,
+            "freeze.py template drifted: `{from}`"
+        );
+        out = out.replace(from, to);
+    }
+    out
+}
+
+/// The edits that turn the `MappingProxyType` `freeze.py` into the 3.15
+/// `frozendict` one: `(pattern, replacement, occurrences)`. The occurrence
+/// count pins the template, so a change to it cannot silently skip an edit.
+const FREEZE_PY_FROZENDICT_EDITS: &[(&str, &str, usize)] = &[
+    (
+        "_FROZEN_CONTAINERS = (tuple, frozenset, MappingProxyType, range, bytes)",
+        "_FROZEN_CONTAINERS = (tuple, frozenset, frozendict, MappingProxyType, range, bytes)",
+        1,
+    ),
+    (
+        "Recursively replaces `list → tuple`, `dict → MappingProxyType`,",
+        "Recursively replaces `list → tuple`, `dict → frozendict`,",
+        1,
+    ),
+    (
+        "        if isinstance(value, MappingProxyType):",
+        "        if isinstance(value, (frozendict, MappingProxyType)):",
+        1,
+    ),
+    (
+        "return MappingProxyType({k: _deep_freeze(v, seen) for k, v in value.items()})",
+        "return frozendict({k: _deep_freeze(v, seen) for k, v in value.items()})",
+        2,
+    ),
+];
+
 /// Generated `typhon_runtime/freeze.py` — recursive deep-freeze helper.
 ///
 /// `deep_freeze(value)` walks the value and replaces every mutable
@@ -4757,6 +4816,17 @@ def _try_interpreters(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn freeze_py_is_mappingproxy_before_315_and_frozendict_from_315() {
+        // 3.13 / 3.14 runtimes are byte-for-byte the historical helper.
+        assert_eq!(typhon_runtime_freeze_py(13), TYPHON_RUNTIME_FREEZE_PY);
+        assert_eq!(typhon_runtime_freeze_py(14), TYPHON_RUNTIME_FREEZE_PY);
+        let py315 = typhon_runtime_freeze_py(15);
+        assert!(py315.contains("return frozendict({k: _deep_freeze(v, seen)"));
+        assert!(!py315.contains("return MappingProxyType("));
+        assert!(py315.contains("isinstance(value, (frozendict, MappingProxyType))"));
+    }
 
     /// Scaffold a minimal project under `dir` and return the src and build paths.
     fn scaffold(

@@ -184,6 +184,7 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
             line_index: translate(li.line_index),
             alias: li.alias.clone(),
             module: li.module.clone(),
+            native_spelling: li.native_spelling,
         })
         .collect();
     // `?` sugar is restored from its marker character, not by column (the
@@ -1837,6 +1838,33 @@ def run() -> Result[int, str]:
         assert!(
             result.output.contains("lazy import np = numpy"),
             "lazy import must be preserved by formatter, got:\n{}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn format_keeps_pep810_spellings() {
+        // `lazy import json` / `lazy import os.path as osp` are PEP 810's own
+        // spelling (valid Python 3.15); the formatter must not rewrite them
+        // into Typhon's `lazy import json = json`.
+        let src = "lazy import json\nlazy import os.path as osp\nlazy from csv import reader\n\n\
+                   x = [*g for g in [[1]]]\n";
+        let result = format_source(src, "<test>").unwrap();
+        for line in [
+            "lazy import json\n",
+            "lazy import os.path as osp\n",
+            "lazy from csv import reader\n",
+            "[*g for g in [[1]]]",
+        ] {
+            assert!(
+                result.output.contains(line),
+                "lost `{line}`; got:\n{}",
+                result.output
+            );
+        }
+        assert!(
+            !result.output.contains("json = json"),
+            "got:\n{}",
             result.output
         );
     }
