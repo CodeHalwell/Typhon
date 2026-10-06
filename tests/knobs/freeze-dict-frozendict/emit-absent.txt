@@ -1,0 +1,1 @@
+return MappingProxyType({k: _deep_freeze(v, seen) for k, v in value.items()})

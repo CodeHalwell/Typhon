@@ -1,0 +1,16 @@
+# `[emit] freeze-dict = "frozendict"` makes `freeze let` freeze a dict to a
+# PEP 814 `frozendict` instead of a `MappingProxyType`; the switch lives in the
+# generated `typhon_runtime/freeze.py`. It needs a 3.15 target, whose
+# `frozendict` builtin python3.13 lacks, so this fixture is build-only
+# (meta.conf: run=none); the control build is the same 3.15 project on the
+# default `freeze-dict = "mappingproxy"`. `build_features.rs` runs both under
+# python3.15.
+freeze let CONFIG = {"port": 8080, "hosts": ["a", "b"]}
+
+
+def main() -> None:
+    print(CONFIG["port"])
+
+
+if __name__ == "__main__":
+    main()

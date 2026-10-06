@@ -602,6 +602,16 @@ Plus `tyc::unsafe_value_leak`, `tyc::pattern_shadows_outer`, and `tyc::extend_bu
 
 The v0.3.0 → v1.0.0-beta.2 line is **additive on *correct* programs**. Every program that type-checked *and ran correctly* continues to behave identically; the new language forms in the whole window are the **`enum` keyword** (v0.11.0), the **`as!` checked boundary cast** (v0.14.0, made to compose everywhere in v0.15.0), and the **`rescue` exception-boundary sugar** (v1.0.0-alpha). Several deliberate narrowings exist, each rejecting only programs that already crashed at runtime (or relied on an unsound narrowing): v1.0.0-alpha.2's three conservative diagnostics, v1.0.0-alpha.3's four flow-narrowing invalidation fixes, v1.0.0-alpha.4's H5 scope-blind class-unification fix, and v1.0.0-alpha.7's batch of type-checker/resolver soundness closures (parametric sealed-union exhaustiveness, `let` immutability in loops and through `global`/`nonlocal`, plus one warn-level addition — nullable-field dereference). v1.0.0-beta.1 adds four error-level diagnostics that fire only on already-crashing code (`alias_not_a_class`, `invalid_pattern`, `impl_forward_reference`, `reserved_module_name`) and makes the deliberate exceptions listed in `docs/compatibility.md` — chiefly `[strictness] nullable-use` defaulting to `"error"`, which turns that alpha.7 warning into an error. v1.0.0-alpha.5 and v1.0.0-alpha.6 added no new diagnostics — alpha.5's rewrites are opt-in or advice-only, and alpha.6's only diagnostic change is warn-level: six more secret-name keyword shapes. The behaviour changes are all in the **VM**: the v0.8.0 switch to arbitrary-precision integers, the v0.11.0 alignment of VM value semantics with CPython (value-based dataclass equality / repr / hashing, order-independent set equality, CPython-matching float repr), v1.0.0-alpha.7's `ExceptionGroup`/`except*` modelling (PEP 654), and v1.0.0-alpha.8's entropy-seeded default for an unseeded `random` — programs that relied on the old VM behaviour now compute different (correct) results. (An unseeded `random` under `tyc run` was repeatable before alpha.8 and is not now; seed explicitly if you were relying on that.) Highlights newest-first:
 
+### Unreleased — Python 3.15 support
+
+The `[python] target` now drives what the checker, the VM and the emitter accept and produce (`CheckOptions` / `LintOptions` carry the target minor). All of it is type-checked and runs under `tyc run` on every target; only the lowering changes. Full detail: REFERENCE.md §15, `docs/language.md` "Python 3.15 features".
+
+- **PEP 798** `[*xs for xs in groups]` / `{**m for m in maps}` — native on 3.15, nested comprehension on 3.13 / 3.14 (previously emitted verbatim, which older CPython rejects).
+- **PEP 810** `lazy import m` and (3.15 only) `lazy from m import n`, emitted natively on 3.15.
+- **`frozendict`** (PEP 814), **typed sentinels** (PEP 661: module-level `NAME = sentinel("NAME")` is its own type and narrows with `is`), **`TypeForm[T]`** (PEP 747), and unary-`+` literal patterns (`case +1:`).
+- **`[emit] freeze-dict = "frozendict"`** — opt-in, 3.15+ only: `freeze let` dicts become `frozendict` instead of `MappingProxyType`.
+- Two error-level diagnostics that fire only on code that fails on the target: **`tyc::requires_python`** (a builtin / stdlib API newer than the target) and **`tyc::removed_in_python`** (one the target removed).
+
 ### v1.0.0-beta.1 — first beta
 
 Four review-remediation waves on top of alpha.9: the 2026-09-01 beta-readiness review and its deferred backlog, the 2026-09-30 release-readiness review, and the W1–W7 remediation of the six 2026-10-03 full reviews. The surface listed in `docs/compatibility.md` is frozen for the beta line.
@@ -1249,10 +1259,11 @@ Default off until 3.14 is the default Python.
 
 ```python
 lazy import np = numpy           # ✅ deferred via bespoke `__TyphonLazy_np_` proxy class
-lazy from numpy import array     # ❌ rejected at parse time (PEP 690 reasoning)
+lazy import numpy as np          # ✅ PEP 810 spelling, same lowering
+lazy from numpy import array     # ✅ on a 3.15+ target only; ❌ tyc::lazy_usage on 3.13 / 3.14
 ```
 
-`lazy from ... import` defeats deferral (it eagerly touches attributes on the source module) and is a hard parse error. Redirect to `lazy import` + dotted access.
+`lazy from ... import` needs CPython 3.15's native PEP 810 support — no helper can bind a single imported name lazily — so on 3.13 / 3.14 it is `tyc::lazy_usage`; redirect to `lazy import` + dotted access. `lazy from` must sit at module top level, and `lazy from __future__ …` / `lazy from m import *` are rejected (PEP 810).
 
 On a **3.15+ target**, `lazy import ALIAS = MODULE` lowers to the native [PEP 810](https://peps.python.org/pep-0810/) `lazy import MODULE as ALIAS` statement instead of the `__TyphonLazy_*` proxy class — no `typhon_runtime` dependency, and a project whose only runtime-touching feature was `lazy import` ships no generated `typhon_runtime/` package at all on that target. 3.13 / 3.14 output is unchanged.
 
@@ -1339,7 +1350,7 @@ src = "src"
 out = "build"
 
 [python]
-target = "3.13"                  # **required: 3.13+ only**. Valid: "3.13" / "3.13t" / "3.14" / "3.14t" / "3.15" / "3.15t". Older values are rejected at config load. 3.15+ unlocks native PEP 810 lazy-import lowering (see §11).
+target = "3.13"                  # **required: 3.13+ only**. Valid: "3.13" / "3.13t" / "3.14" / "3.14t" / "3.15" / "3.15t". Older values are rejected at config load. 3.15+ unlocks native PEP 810 lazy imports (see §11), native PEP 798 / unary-`+` emission, and the 3.15 builtins and stdlib APIs (REFERENCE.md §15); using one on an older target is tyc::requires_python, using a removed API is tyc::removed_in_python.
 free-threaded = false            # requires 3.13t/3.14t/3.15t; off by default
 
 [optimise]
@@ -1351,6 +1362,7 @@ format = true                    # post-process through ruff format
 model-extra = "forbid"           # "forbid" | "allow" | "ignore"
 skip-decoration-bases = []       # extra base-class names suppressing the auto @dataclass decoration. Matched by last segment.
 traceback-remap = false          # (v0.14.0) inject a `.ty`-source traceback remapper into the entry `__main__`
+freeze-dict = "mappingproxy"     # or "frozendict" (3.15+ targets only): what `freeze let` turns a dict into. Opt-in: str()/.copy() differ
 # pyi-stubs is always on — every .dty emits a .pyi
 
 [strictness]
@@ -1603,7 +1615,7 @@ Consumers:
 
 ## 19. Diagnostics catalog (top tier)
 
-The recurring diagnostic codes and what they actually mean. **See [DIAGNOSTICS.md](DIAGNOSTICS.md) for the exhaustive reference** (`tyc explain --list` prints all 94 codes the compiler ships as of v1.0.0-beta.1) — what follows is the daily-driver subset.
+The recurring diagnostic codes and what they actually mean. **See [DIAGNOSTICS.md](DIAGNOSTICS.md) for the exhaustive reference** (`tyc explain --list` prints all 97 codes the compiler ships, including the Python 3.15 target checks) — what follows is the daily-driver subset.
 
 | Code | Meaning | Fix |
 |---|---|---|

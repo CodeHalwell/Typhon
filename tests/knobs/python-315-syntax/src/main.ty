@@ -1,0 +1,28 @@
+# `[python] target = "3.15"` emits PEP 798 comprehension unpacking and unary-`+`
+# literal patterns as written; a 3.13 / 3.14 target rewrites them (a nested
+# comprehension, the `+` dropped), since older CPython rejects both. The ON
+# build is 3.15 syntax that python3.13 cannot compile, so this fixture is
+# build-only (meta.conf: run=none); the control build pins the 3.13 rewrite.
+# `build_features.rs` runs both lowerings under python3.15.
+def flatten(groups: list[list[int]]) -> list[int]:
+    return [*g for g in groups]
+
+
+def merge(layers: list[dict[str, int]]) -> dict[str, int]:
+    return {**layer for layer in layers}
+
+
+def describe(n: int) -> str:
+    match n:
+        case +1:
+            return "one"
+        case _:
+            return "other"
+
+
+def main() -> None:
+    print(flatten([[1, 2], [3]]), merge([{"a": 1}, {"a": 2}]), describe(1))
+
+
+if __name__ == "__main__":
+    main()

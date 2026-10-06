@@ -34,6 +34,8 @@ match n:
         return "small"
 ```
 
+Python 3.15 also accepts a leading `+` on a numeric literal (`case +1:`, `case 1 - +2j:`). Typhon keeps it on a 3.15 target and drops it on older ones, where it would be a syntax error; the pattern matches the same values either way.
+
 ### Capture pattern
 
 ```python

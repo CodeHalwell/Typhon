@@ -333,6 +333,8 @@ span source lines (e.g. a decorator plus the `def` it sits on).
 | `model-extra-allow` | `[emit] model-extra` | `ConfigDict(extra="allow")` |
 | `skip-decoration-bases` | `[emit] skip-decoration-bases` | `@dataclasses.dataclass` suppressed on the listed base's subclass |
 | `lazy-import-pep810` | `[python] target = "3.15"` | native `lazy import json as js` instead of the runtime proxy (build-only — python3.13 cannot parse PEP 810) |
+| `python-315-syntax` | `[python] target = "3.15"` | PEP 798 `[*g for g in groups]` / `{**layer for …}` and `case +1:` as written; the 3.13 control gets the nested-comprehension rewrite and `case 1:` (build-only — python3.13 cannot parse either; `build_features.rs` runs both under python3.15) |
+| `freeze-dict-frozendict` | `[emit] freeze-dict = "frozendict"` | `frozendict(…)` instead of `MappingProxyType(…)` in the generated `freeze.py` (build-only — python3.13 has no `frozendict`) |
 
 ### Running it
 

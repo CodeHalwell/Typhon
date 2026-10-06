@@ -4,6 +4,106 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## Unreleased — Python 3.15 support
+
+Typhon adopts what CPython 3.15 adds. Every feature is type-checked and runs
+under `tyc run` on every target; the `[python] target` only decides how it
+lowers. A `3.15` / `3.15t` target emits the new syntax natively; `3.13` and
+`3.14` get an equivalent rewrite, or — where no faithful rewrite exists — a
+check-time diagnostic in place of the `NameError` / `ImportError` /
+`SyntaxError` the emitted Python would hit on that interpreter. Output for a
+program that was already accepted is unchanged on every target. Full
+reference: "Python 3.15 features" in `docs/language.md` and the docs-site
+page of the same name.
+
+### Added
+
+- **Unpacking in comprehensions (PEP 798).** `[*xs for xs in groups]`,
+  `{*xs for …}`, `(*xs for …)` and `{**m for m in maps}` are typed (element
+  type of the iterable; key and value types of the mapping, `Counter`,
+  `defaultdict`, `ChainMap` and friends included) and run under the VM.
+  Unpacking a value that is not iterable, or `**` of a value that is not a
+  mapping, is a type error. A 3.15 target emits them as written; older
+  targets get the nested comprehension (`[x for xs in groups for x in xs]`,
+  `{k: v for m in maps for k, v in m.items()}`), whose results are identical.
+  Before this, the parser accepted the form and the emitter wrote it out
+  verbatim, which CPython 3.13 / 3.14 refuse to compile.
+- **PEP 810 lazy imports, both spellings.** `lazy import json` and
+  `lazy from pathlib import Path` are accepted next to Typhon's
+  `lazy import ALIAS = MODULE`, and a 3.15 target emits the spelling the
+  source used. `lazy from` needs a 3.15 target (there is no runtime-helper
+  equivalent that binds a name lazily); on 3.13 / 3.14 it is
+  `tyc::lazy_usage`, naming the target. PEP 810's own restrictions on it
+  are reported too: `lazy from` must sit at module top level, and
+  `lazy from __future__ …` / `lazy from m import *` are rejected.
+- **`frozendict` (PEP 814).** A builtin typed as `frozendict[K, V]`: a
+  `Mapping[K, V]` covariant in `V`, hashable, with `|` returning a
+  `frozendict`, `copy()` returning itself and every mutator (`fd[k] = v`,
+  `del fd[k]`, `.update`, `.pop`, …) reported. The VM models it with
+  CPython 3.15's `repr`, hash, equality and error messages.
+- **`[emit] freeze-dict = "frozendict"`.** Opt-in, 3.15+ targets only:
+  `freeze let` freezes a dict to a `frozendict` (typed `frozendict[K, V]`)
+  instead of a `MappingProxyType` (typed `Mapping[K, V]`), so a frozen value
+  is hashable and `json.dumps` accepts it. `tyc run` follows the setting.
+  It is not tied to the target because the two print differently and
+  `.copy()` returns a different type; the default stays `"mappingproxy"`, and
+  the generated `typhon_runtime.freeze` module is byte-identical to before
+  unless the knob is set. Setting it on an older target is
+  `tyc::invalid_config_value`.
+- **Typed sentinels (PEP 661).** A module-level `NAME = sentinel("NAME")`
+  gives `NAME` its own singleton type, distinct from `None`:
+  `default: int | MISSING = MISSING` works, `is MISSING` / `is not MISSING`
+  narrow, and using an un-narrowed `int | MISSING` as an `int` is reported.
+  The VM's `sentinel` matches CPython's `repr`, identity and truthiness.
+- **`TypeForm[T]` (PEP 747).** An argument passed to a `TypeForm[T]`
+  parameter is read as a type expression, so `load(dict[str, int], raw)`
+  returns `dict[str, int]`. `TypeForm` is covariant. The VM's `typing` shim
+  resolves `TypeForm` and `disjoint_base` (PEP 800).
+- **Unary `+` in literal patterns.** `case +1:` and `case 1 - +2j:` parse
+  (`1 + -2j` stays invalid). A 3.15 target keeps the `+`; older targets drop
+  it, which matches the same values. The vendored Ruff parser reports the
+  form as version-gated syntax instead of a hard error (documented in
+  `tyc/vendor/README.md` as the fork's third source-level change).
+- **`tyc::requires_python`** (error). A builtin, stdlib module or stdlib name
+  newer than the target: `frozendict` and `sentinel`; the `profiling` and
+  `math.integer` modules; `typing.TypeForm` / `disjoint_base`, `math.fmax` /
+  `fmin` / `isnormal` / `issubnormal` / `signbit`, `re.prefixmatch`,
+  `sys.get_lazy_imports` / `set_lazy_imports`, the new `threading` iterator
+  helpers and `types.LazyImportType` / `FrameLocalsProxyType` on 3.15; the
+  `annotationlib`, `compression`, `string.templatelib` and
+  `concurrent.interpreters` modules on 3.14. A name the module binds itself,
+  a project module and a declared dependency of the same name are not
+  gated.
+- **`tyc::removed_in_python`** (error). A stdlib API the target removed:
+  `sre_compile` / `sre_constants` / `sre_parse`, `glob.glob0` / `glob1`,
+  `typing.no_type_check_decorator`, `NamedTuple("P", x=int)` keyword fields
+  and a fields-less functional `NamedTuple` / `TypedDict` on 3.15; `ast.Num`
+  and friends, `pkgutil.find_loader` / `get_loader`, `pty.master_open` /
+  `slave_open`, `sqlite3.version` / `version_info`, `urllib.request`'s
+  `URLopener` / `FancyURLopener` and the old `importlib.abc` resource classes
+  on 3.14.
+
+Both new diagnostics have `docs/diagnostics/` pages and `tyc explain`
+entries, and fire only on code that would fail on the configured target.
+
+### Changed
+
+- The checker, linter and language server read `[python] target`
+  (`CheckOptions` / `LintOptions` carry the target minor), so the
+  `tyc::stdlib_module_shadow` warning follows the target's stdlib: a project
+  module named `annotationlib` or `compression` is flagged on 3.14+, one
+  named `profiling` on 3.15+.
+- `tyc::lazy_usage` messages and docs describe the PEP 810 forms.
+
+### Testing
+
+- Checker, VM, emitter, preprocessor, formatter and config unit tests for
+  each feature, plus `build_features` integration tests comparing emitted
+  output on 3.13 and 3.15 targets. The tests that execute emitted 3.15 code
+  run when a `python3.15` is on `PATH`; CI's `test` job installs one beside
+  3.13 and sets `TYC_REQUIRE_PYTHON315=1`, which makes a missing interpreter
+  a failure rather than a skip.
+
 ## 1.0.0-beta.2 — 2026-10-04 — first published beta: Windows build fix
 
 The first beta with published binaries: 1.0.0-beta.1 plus one build fix.

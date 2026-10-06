@@ -132,14 +132,24 @@ def f() -> None:
 
 ## `tyc::requires_python`
 
-A builtin that only exists from a later CPython release than the project's `[python] target` — today `frozendict` (Python 3.15, PEP 814) on a 3.13 or 3.14 project. The emitted Python would raise `NameError` on the target interpreter, so it is rejected at check time. Annotations count (`def f(m: frozendict[str, int])`).
+Something that only exists from a later CPython release than the project's `[python] target`. The emitted Python would raise `NameError`, `ImportError` or `AttributeError` on the target interpreter, so it is rejected at check time.
+
+| New in | What |
+|---|---|
+| 3.15 | the builtins `frozendict` (PEP 814) and `sentinel` (PEP 661) |
+| 3.15 | the `profiling` package (PEP 799) and `math.integer` (PEP 791) |
+| 3.15 | `typing.TypeForm` (PEP 747), `typing.disjoint_base` (PEP 800), `math.fmax` / `fmin` / `isnormal` / `issubnormal` / `signbit`, `re.prefixmatch`, `sys.set_lazy_imports` / `get_lazy_imports`, `threading.synchronized_iterator` / `serialize_iterator` / `concurrent_tee`, `types.LazyImportType` / `FrameLocalsProxyType` |
+| 3.14 | the `annotationlib` (PEP 749), `compression` (PEP 784), `string.templatelib` (PEP 750) and `concurrent.interpreters` (PEP 734) modules |
+
+A builtin counts wherever it is named, annotations included (`def f(m: frozendict[str, int])`). A stdlib module or name counts in an `import`, a `from … import`, or a `module.name` read through a plain `import module`.
 
 ```python
 # typhon.toml: [python] target = "3.13"
 let defaults = frozendict(retries=3)    # ❌ frozendict is new in Python 3.15
+from typing import TypeForm             # ❌ typing.TypeForm is new in Python 3.15
 ```
 
-**Fix:** set `[python] target = "3.15"`, or use `types.MappingProxyType` / `freeze let` on the older target. A module that imports its own `frozendict` (the PyPI backport) is not checked.
+**Fix:** set `[python] target = "3.15"`, or use what the older target has (`types.MappingProxyType` or `freeze let`, `typing_extensions.TypeForm`). Names that are not the stdlib's are left alone: a module that binds its own `frozendict` (the PyPI backport), a project module called `profiling.ty`, or a declared dependency named like a new stdlib module. See [Python 3.15 features](/Typhon/reference/python-315/).
 
 ## `tyc::removed_in_python`
 

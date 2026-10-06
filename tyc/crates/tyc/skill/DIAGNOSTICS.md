@@ -743,14 +743,16 @@ Warn-level — never fails the build. Silence with `[strictness] allow-secret-co
 
 ### `tyc::lazy_usage` — error
 
-A `lazy` form other than `lazy import name = module` or `lazy let NAME: T = expr`.
+A `lazy` form Typhon cannot lower for the `[python] target`. Accepted everywhere: `lazy import ALIAS = MODULE`, `lazy import MODULE [as ALIAS]` (PEP 810 spelling) and module-level `lazy let NAME: T = expr`. `lazy from MODULE import NAME` needs a 3.15+ target (PEP 810 binds the name natively; there is no helper equivalent). On 3.15, PEP 810's rules apply to it: module top level only, no `lazy from __future__ …`, no `lazy from m import *`.
 
 ```ty
-lazy from heavy import Thing   # error
+lazy from heavy import Thing   # error on 3.13 / 3.14 — needs Python 3.15 (PEP 810)
+def f() -> None:
+    lazy from json import loads # error on 3.15 too — top level only
 lazy let X: T:                  # error — colon-block form does not parse
 ```
 
-**Fix:** Use a supported form — `lazy import heavy` then `heavy.Thing`, or `lazy let X: T = expr`.
+**Fix:** On 3.13 / 3.14, `lazy import heavy` then `heavy.Thing`; or set `[python] target = "3.15"`. Move `lazy from` to module level.
 
 ---
 
@@ -892,7 +894,34 @@ A project `.ty` file's stem matches a Python 3.13 stdlib top-level module name (
 # src/types.ty     ← warning
 ```
 
+The stdlib list follows the `[python] target`: `annotationlib` and `compression` count from 3.14, `profiling` from 3.15.
+
 **Fix:** Rename (e.g. `lang_types.ty`, `records.ty`).
+
+### `tyc::requires_python` — error
+
+Something newer than the `[python] target`: the 3.15 builtins `frozendict` / `sentinel`; the `profiling` and `math.integer` modules; `typing.TypeForm` / `disjoint_base`, `math.fmax` / `fmin` / `isnormal` / `issubnormal` / `signbit`, `re.prefixmatch`, `sys.get_lazy_imports` / `set_lazy_imports`, `threading.synchronized_iterator` / `serialize_iterator` / `concurrent_tee`, `types.LazyImportType` / `FrameLocalsProxyType`; and the 3.14 modules `annotationlib`, `compression`, `string.templatelib`, `concurrent.interpreters`. The emitted Python would hit `NameError` / `ImportError` on the target.
+
+```ty
+# [python] target = "3.13"
+let d = frozendict(a=1)        # error — new in Python 3.15 (PEP 814)
+from typing import TypeForm    # error — new in Python 3.15 (PEP 747)
+```
+
+A name the module binds itself (`from frozendict import frozendict`), a project module and a declared dependency of the same name are not gated.
+
+**Fix:** `[python] target = "3.15"`, or the older target's equivalent (`MappingProxyType` / `freeze let`, `typing_extensions.TypeForm`).
+
+### `tyc::removed_in_python` — error
+
+A stdlib API the `[python] target` removed. 3.15: `sre_compile` / `sre_constants` / `sre_parse`, `glob.glob0` / `glob1`, `typing.no_type_check_decorator`, `NamedTuple("P", x=int)` keyword fields, fields-less functional `NamedTuple` / `TypedDict`. 3.14: `ast.Num` / `Str` / `Bytes` / `NameConstant` / `Ellipsis`, `pkgutil.find_loader` / `get_loader`, `pty.master_open` / `slave_open`, `sqlite3.version` / `version_info`, `urllib.request.URLopener` / `FancyURLopener`, `importlib.abc.ResourceReader` / `Traversable` / `TraversableResources`.
+
+```ty
+# [python] target = "3.15"
+let Point = NamedTuple("Point", x=int, y=int)   # error — removed in Python 3.15
+```
+
+**Fix:** The replacement the message names (`NamedTuple("Point", [("x", int), ("y", int)])`, `ast.Constant`, `re`, …), or keep the older target.
 
 ### `tyc::typevar_import_rejected` — error
 
@@ -1149,7 +1178,7 @@ def embed(text: str) -> object:
 
 Silent on stdlib modules, eager uses, script-shaped modules (an `if __name__ == "__main__":` guard or a top-level `def main()` — the lint targets *library* modules), re-exported names (`pub`, `__all__`, `pub *`, or the file is an `__init__`), and files already using `lazy import`.
 
-**Fix:** `lazy import np = numpy`. (`lazy from numpy import asarray` stays rejected — use dotted access.) On a Python 3.15 target this lowers to a native PEP 810 `lazy import` statement instead of the `typhon_runtime` helper.
+**Fix:** `lazy import np = numpy`. (`lazy from numpy import asarray` needs a 3.15 target — use dotted access on older ones.) On a Python 3.15 target this lowers to a native PEP 810 `lazy import` statement instead of the `typhon_runtime` helper.
 
 ### `tyc::parallel_opportunity` — advice (`suggest-parallel`; only when `[python] free-threaded = true`)
 
@@ -1202,7 +1231,7 @@ Standard values for severity keys are `"off"`, `"warn"`, `"error"`. The `suggest
 
 ## Severity-only summary
 
-**Errors** (block the build by default): `arg_count`, `attribute_not_found`, `comptime`, `cyclic_type_alias`, `div_by_zero_literal`, `duplicate_class`, `duplicate_method`, `extend_builtin`, `field_default_ordering`, `frozen_assign`, `generator_return_type`, `generic`, `immutable_assign`, `impl_unknown_class`, `implicit_any`, `impure_pure_fn`, `interface_isinstance`, `interface_not_conforming`, `invalid_config_value`, `invalid_pattern`, `invalid_question_op`, `io`, `lazy_usage`, `manual_init`, `method_in_class_body` (default warn but commonly bumped), `missing_annotation`, `missing_argument`, `missing_await`, `missing_binding_kind`, `missing_field_init`, `missing_initialiser`, `missing_return`, `newtype_violation`, `no_block_shadow`, `non_exhaustive_match`, `not_callable`, `nullable_use`, `operator_type_mismatch`, `parse`, `pattern_shadows_outer`, `pub_name_collision`, `result_error_mismatch`, `return_in_except_star`, `self_outside_impl`, `stub_mismatch`, `tuple_index_out_of_range`, `type_mismatch`, `typevar_bound`, `typevar_import_rejected`, `typing_alias_deprecated`, `unknown_kwarg`, `unknown_module`, `unknown_name`, `unsafe_value_leak`, `unused_import`, `use_of_uninitialised`.
+**Errors** (block the build by default): `arg_count`, `attribute_not_found`, `comptime`, `cyclic_type_alias`, `div_by_zero_literal`, `duplicate_class`, `duplicate_method`, `extend_builtin`, `field_default_ordering`, `frozen_assign`, `generator_return_type`, `generic`, `immutable_assign`, `impl_unknown_class`, `implicit_any`, `impure_pure_fn`, `interface_isinstance`, `interface_not_conforming`, `invalid_config_value`, `invalid_pattern`, `invalid_question_op`, `io`, `lazy_usage`, `manual_init`, `method_in_class_body` (default warn but commonly bumped), `missing_annotation`, `missing_argument`, `missing_await`, `missing_binding_kind`, `missing_field_init`, `missing_initialiser`, `missing_return`, `newtype_violation`, `no_block_shadow`, `non_exhaustive_match`, `not_callable`, `nullable_use`, `operator_type_mismatch`, `parse`, `pattern_shadows_outer`, `pub_name_collision`, `removed_in_python`, `requires_python`, `result_error_mismatch`, `return_in_except_star`, `self_outside_impl`, `stub_mismatch`, `tuple_index_out_of_range`, `type_mismatch`, `typevar_bound`, `typevar_import_rejected`, `typing_alias_deprecated`, `unknown_kwarg`, `unknown_module`, `unknown_name`, `unsafe_value_leak`, `unused_import`, `use_of_uninitialised`.
 
 **Warnings**: `async_without_await`, `class_attr_shadows_slot`, `blocking_in_async`, `contains_secret_literal`, `orphan_py_import`, `python_semantic_drift`, `resource_not_managed`, `stdlib_module_shadow`.
 

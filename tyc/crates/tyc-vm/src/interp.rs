@@ -13550,6 +13550,32 @@ keyed = {MISSING: 1}[MISSING]
         assert_eq!(get("keyed"), "1");
     }
 
+    /// PEP 747 `TypeForm` and PEP 800 `@disjoint_base` (Python 3.15) are
+    /// erased at runtime; the VM only has to resolve the imports.
+    #[test]
+    fn pep747_typeform_and_pep800_disjoint_base_resolve() {
+        let src = r#"
+from typing import TypeForm, cast, disjoint_base
+
+def load[T](form: TypeForm[T], raw: object) -> T:
+    return cast(form, raw)
+
+@disjoint_base
+class Base:
+    pass
+
+counts = load(dict[str, int], {"a": 1})
+maybe = load(int | None, None)
+name = Base.__name__
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        let get = |name: &str| interp.root.get(name).unwrap().py_str();
+        assert_eq!(get("counts"), "{'a': 1}");
+        assert_eq!(get("maybe"), "None");
+        assert_eq!(get("name"), "Base");
+    }
+
     /// PEP 814 (Python 3.15): `frozendict`. Expected values are CPython
     /// 3.15's.
     #[test]

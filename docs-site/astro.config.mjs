@@ -137,6 +137,7 @@ export default defineConfig({
             { label: 'Imports', slug: 'reference/imports' },
             { label: 'Operators and Precedence', slug: 'reference/operators' },
             { label: 'Grammar Cheat Sheet', slug: 'reference/grammar' },
+            { label: 'Python 3.15 features', slug: 'reference/python-315' },
           ],
         },
         {

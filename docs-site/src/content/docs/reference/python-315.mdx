@@ -1,0 +1,153 @@
+---
+title: Python 3.15 features
+description: What Python 3.15 adds to Typhon source, and how each feature lowers on older targets.
+sidebar:
+  order: 22
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+Typhon reads the project's [`[python] target`](/Typhon/configuration/python/) and adopts what each CPython release adds. Python 3.15 brings these to Typhon source:
+
+| Feature | On a 3.15+ target | On 3.13 / 3.14 |
+|---|---|---|
+| [PEP 798](https://peps.python.org/pep-0798/) unpacking in comprehensions: `[*xs for xs in groups]`, `{**m for m in maps}` | emitted natively | rewritten to the equivalent nested comprehension |
+| [PEP 810](https://peps.python.org/pep-0810/) lazy imports: `lazy import m`, `lazy from m import n` | native `lazy` statements | `lazy import` via the runtime helper; `lazy from` is `tyc::lazy_usage` |
+| [PEP 814](https://peps.python.org/pep-0814/) `frozendict` | builtin, typed as a read-only hashable `frozendict[K, V]` | `tyc::requires_python` |
+| [PEP 661](https://peps.python.org/pep-0661/) `sentinel` | builtin; a module-level `NAME = sentinel("NAME")` has its own type | `tyc::requires_python` |
+| [PEP 747](https://peps.python.org/pep-0747/) `TypeForm[T]` | a `TypeForm[T]` parameter binds `T` from a type-expression argument | `tyc::requires_python` on the import |
+| Unary `+` literal patterns: `case +1:`, `case 1 - +2j:` | emitted natively | the `+` is dropped |
+
+Every feature is type-checked, and runs under `tyc run`, on every target; only the lowering changes.
+
+## Target gating
+
+Using a 3.15 builtin or stdlib API on an older target is [`tyc::requires_python`](/Typhon/diagnostics/compile-errors/#tycrequires_python) — the emitted Python would raise `NameError` or `ImportError` there. Using an API the target has *removed* (`sre_compile`, `glob.glob0`, `NamedTuple("P", x=int)`, `ast.Num`, …) is [`tyc::removed_in_python`](/Typhon/diagnostics/compile-errors/#tycremoved_in_python). Both fire only on code that would fail on the configured target, so moving between targets never changes what a correct program does.
+
+## Unpacking in comprehensions (PEP 798)
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    def flatten(groups: list[list[int]]) -> list[int]:
+        return [*g for g in groups]              # list[int]
+
+    def merge(layers: list[dict[str, int]]) -> dict[str, int]:
+        return {**layer for layer in layers}     # later layers win
+    ```
+  </TabItem>
+  <TabItem label="Emitted (3.15)">
+    ```python
+    def flatten(groups: list[list[int]]) -> list[int]:
+        return [*g for g in groups]
+
+    def merge(layers: list[dict[str, int]]) -> dict[str, int]:
+        return {**layer for layer in layers}
+    ```
+  </TabItem>
+  <TabItem label="Emitted (3.13 / 3.14)">
+    ```python
+    def flatten(groups: list[list[int]]) -> list[int]:
+        return [__typhon_item__ for g in groups for __typhon_item__ in g]
+
+    def merge(layers: list[dict[str, int]]) -> dict[str, int]:
+        return {
+            __typhon_key__: __typhon_value__
+            for layer in layers
+            for __typhon_key__, __typhon_value__ in layer.items()
+        }
+    ```
+  </TabItem>
+</Tabs>
+
+`[*xs for …]`, `{*xs for …}` and `(*xs for …)` take the iterable's element type; `{**m for …}` takes the mapping's key and value types. Unpacking a value that is not iterable (`[*n for …]` with `n: int`) or not a mapping is a type error.
+
+## Lazy imports (PEP 810)
+
+On a 3.15 target both PEP 810 spellings are emitted as native `lazy` statements, and Typhon's own `lazy import ALIAS = MODULE` lowers to `lazy import MODULE as ALIAS`:
+
+```python
+lazy import json
+lazy from pathlib import Path
+```
+
+`lazy from` needs a 3.15 target — there is no runtime-helper equivalent that binds individual names lazily. PEP 810's own rules apply to it: it must sit at module top level, and `lazy from __future__ …` and `lazy from m import *` are rejected. See [`lazy`](/Typhon/reference/lazy/) for the full surface.
+
+## `frozendict` (PEP 814)
+
+```python
+let defaults: frozendict[str, int] = frozendict(retries=3, timeout=30)
+let overridden = defaults | {"retries": 5}        # still a frozendict
+let cache: dict[frozendict[str, int], str] = {defaults: "ok"}   # hashable
+```
+
+`frozendict[K, V]` is a `Mapping[K, V]` (covariant in `V`), hashable when its values are, and has no mutators: `fd[k] = v`, `del fd[k]` and `fd.update(…)` are reported.
+
+`freeze let` keeps producing a `MappingProxyType` by default. Set [`[emit] freeze-dict = "frozendict"`](/Typhon/configuration/emit/#freeze-dict) on a 3.15 target to freeze dicts to `frozendict` instead, so a frozen config can be a dict key, a set member or a `@memo` argument:
+
+```python
+freeze let CONFIG = {"port": 8080, "hosts": ["a", "b"]}
+print(CONFIG)
+# freeze-dict = "frozendict": frozendict({'port': 8080, 'hosts': ('a', 'b')})
+# default ("mappingproxy"):   {'port': 8080, 'hosts': ('a', 'b')}
+```
+
+<Aside type="note">
+  The knob is opt-in because the two values print differently and `.copy()` returns a different type, so switching changes a program's output. Raising the target alone never does.
+</Aside>
+
+## Sentinels (PEP 661)
+
+```python
+MISSING = sentinel("MISSING")
+
+def lookup(table: dict[str, int], key: str, default: int | MISSING = MISSING) -> int:
+    let found: int? = table.get(key)
+    if found is not None:
+        return found
+    if default is MISSING:
+        raise KeyError(key)
+    return default                         # narrowed to int
+```
+
+A module-level `NAME = sentinel("NAME")` gives `NAME` its own singleton type, distinct from `None`, so "argument not supplied" and "explicitly `None`" stay apart. `is NAME` / `is not NAME` narrow; using an un-narrowed `int | MISSING` as an `int` — arithmetic, attribute access, assignment — is reported.
+
+## `TypeForm[T]` (PEP 747)
+
+```python
+from typing import TypeForm, cast
+
+def load[T](form: TypeForm[T], raw: object) -> T:
+    return cast(form, raw)
+
+let counts: dict[str, int] = load(dict[str, int], data)   # T = dict[str, int]
+let maybe: int? = load(int | None, value)
+```
+
+An argument passed to a `TypeForm[T]` parameter is read as a type expression, so the call's return type follows it. `TypeForm` is covariant.
+
+## Unary `+` in literal patterns
+
+```python
+match reading:
+    case +1:
+        print("unit")
+    case 1 - +2j:
+        print("complex")
+```
+
+Python 3.15 accepts a leading `+` on a numeric literal pattern (`1 + -2j` is still invalid). Older targets get the same pattern with the `+` removed, which matches exactly the same values.
+
+## New and removed stdlib APIs
+
+The checker knows the stdlib surface each target adds and removes. A sample:
+
+| Added in 3.15 | Removed in 3.15 |
+|---|---|
+| `frozendict`, `sentinel` builtins | `sre_compile`, `sre_constants`, `sre_parse` |
+| `math.integer`, `profiling` modules | `glob.glob0`, `glob.glob1` |
+| `math.fmax`, `math.fmin`, `math.isnormal`, `math.issubnormal`, `math.signbit` | `typing.no_type_check_decorator` |
+| `re.prefixmatch`, `sys.get_lazy_imports` / `set_lazy_imports` | `NamedTuple("P", x=int)` keyword fields |
+| `typing.TypeForm`, `typing.disjoint_base` | `TypedDict("T")` with no fields |
+
+The full tables live on the [`tyc::requires_python`](/Typhon/diagnostics/compile-errors/#tycrequires_python) and [`tyc::removed_in_python`](/Typhon/diagnostics/compile-errors/#tycremoved_in_python) entries. A project dependency that happens to share a new module's name (a PyPI `profiling` package, say) is not gated.

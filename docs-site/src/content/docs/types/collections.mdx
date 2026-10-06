@@ -189,6 +189,14 @@ let evens: set[int] = {n for n in nums if n % 2 == 0}
 let by_value: dict[int, int] = {n: n * n for n in nums}
 ```
 
+On a Python 3.15 target a comprehension can also unpack ([PEP 798](https://peps.python.org/pep-0798/)); older targets get the equivalent nested comprehension:
+
+```python
+let groups: list[list[int]] = [[1, 2], [3]]
+let flat: list[int] = [*g for g in groups]                   # [1, 2, 3]
+let merged: dict[str, int] = {**m for m in [{"a": 1}, {"b": 2}]}
+```
+
 Generator expressions exist; their type is `Iterator[T]`:
 
 ```python
@@ -235,7 +243,7 @@ The standard library distinction holds:
 | Mutable | Immutable |
 |---------|-----------|
 | `list[T]` | `tuple[T, ...]`, `tuple[A, B]` |
-| `dict[K, V]` | `MappingProxyType[K, V]` (read-only view) |
+| `dict[K, V]` | `MappingProxyType[K, V]` (read-only view), `frozendict[K, V]` (Python 3.15+, hashable) |
 | `set[T]` | `frozenset[T]` |
 
 For deep immutability inside a `frozen` class, use immutable containers (`tuple`, `frozenset`) for the field types.
@@ -263,7 +271,7 @@ names(dogs)                       # ✅ since v0.9.0
 | `Collection[T]` | covariant on `T` | `list[T]`, `tuple[T, ...]`, `set[T]`, `frozenset[T]` |
 | `Container[T]` | covariant on `T` | every collection with `__contains__` |
 | `Reversible[T]` | covariant on `T` | `list[T]`, `tuple[T, ...]` |
-| `Mapping[K, V]` | K invariant, V covariant | `dict[K, V]`, `MappingProxyType[K, V]` |
+| `Mapping[K, V]` | K invariant, V covariant | `dict[K, V]`, `MappingProxyType[K, V]`, `frozendict[K, V]` |
 | `MutableMapping[K, V]` | K invariant, V covariant | `dict[K, V]` |
 
 Use the concrete `list[T]` / `dict[K, V]` only when the function must mutate. For pure consumption, the read-view spelling is more accurate and accepts more callers:

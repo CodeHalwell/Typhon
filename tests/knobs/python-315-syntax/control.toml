@@ -1,0 +1,11 @@
+[project]
+name = "knob-python-315-syntax"
+version = "0.1.0"
+src = "src"
+out = "build"
+
+[python]
+target = "3.13"
+
+[emit]
+format = false

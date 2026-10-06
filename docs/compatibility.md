@@ -48,6 +48,16 @@ narrowing is filed under one of them:
    Where the check can flag a program that is correct in practice, it lands
    at **warn** for at least one release before it becomes an error.
 
+**Target-gated diagnostics** are category 2. The `[python] target` names
+the interpreter the emitted Python runs on, so code that would fail there is
+not correct for that project: a 3.15 builtin on a 3.13 target
+(`tyc::requires_python`), an API the target removed
+(`tyc::removed_in_python`), `lazy from` before 3.15 (`tyc::lazy_usage`).
+Raising the target changes only the emitted text of a correct program, never
+what it does; a lowering that would change observable behaviour, such as
+`freeze let` producing a `frozendict`, stays behind an opt-in key
+(`[emit] freeze-dict`).
+
 **Warnings and advice** never fail `tyc check` or `tyc build` at their
 default severity, so they may be added in any release. A `[strictness]`
 setting a project chose (for example `unused-import = "error"`) keeps its

@@ -67,11 +67,17 @@ jobs:
       # interpreter those tests skip — and a skip nothing observes is
       # indistinguishable from a pass, so this job was reporting green for a
       # tier that never ran. `TYC_REQUIRE_PYTHON` turns a missing interpreter
-      # into a failure rather than a silent skip.
+      # into a failure rather than a silent skip. 3.15 is installed beside it
+      # for the tests that execute 3.15-target output (native PEP 798 / PEP 810
+      # syntax, `frozendict`); `TYC_REQUIRE_PYTHON315` is their loud
+      # counterpart. 3.13 is listed last, so it stays the default `python`.
       - name: Install Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.13"
+          python-version: |
+            3.15
+            3.13
+          allow-prereleases: true
 
       # The format-stage source-map tests (tests/source_map.rs) only exercise
       # the reflow/re-key logic when `ruff format` actually reflows — without
@@ -86,6 +92,7 @@ jobs:
         run: cargo test --workspace
         env:
           TYC_REQUIRE_PYTHON: "1"
+          TYC_REQUIRE_PYTHON315: "1"
           TYC_REQUIRE_RUFF: "1"
 
   test-macos:

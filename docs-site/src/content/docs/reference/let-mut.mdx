@@ -183,8 +183,9 @@ not a free reassignment.
 
 `let` locks the binding; `freeze let` also locks the value. It is allowed at
 module level only, and the value is deep-frozen when the module loads:
-`list` becomes `tuple`, `dict` becomes a read-only `MappingProxyType`, `set`
-becomes `frozenset`, recursively. An instance of a non-`frozen` class is
+`list` becomes `tuple`, `dict` becomes a read-only `MappingProxyType` (or a
+`frozendict` with [`[emit] freeze-dict = "frozendict"`](/Typhon/configuration/emit/#freeze-dict)
+on a 3.15 target), `set` becomes `frozenset`, recursively. An instance of a non-`frozen` class is
 rejected at check time (`tyc::freeze_not_freezable`); any other value with no
 immutable equivalent raises `TypeError` when the module loads.
 
@@ -192,7 +193,8 @@ immutable equivalent raises `TypeError` when the module loads.
 
 The annotation on a `freeze let` describes the *input* value. The binding
 itself has the frozen shape: `list[T]` becomes `tuple[T, ...]`,
-`dict[K, V]` becomes `Mapping[K, V]` and `set[T]` becomes `frozenset[T]`,
+`dict[K, V]` becomes `Mapping[K, V]` (`frozendict[K, V]` under
+`freeze-dict = "frozendict"`) and `set[T]` becomes `frozenset[T]`,
 and nested container elements are frozen too. Reads stay available; mutation
 is rejected.
 

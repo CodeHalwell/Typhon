@@ -203,18 +203,19 @@ Python's event loop holds **weak** refs to tasks. A fire-and-forget task whose h
 
 ---
 
-## 10. `lazy from foo import bar`
+## 10. `lazy from foo import bar` on a 3.13 / 3.14 target
 
 ```python
+# [python] target = "3.13"
 lazy from numpy import array
 ```
 
 ```
-error[tyc::lazy_usage]: `lazy from ... import ...` is rejected — `from` imports eagerly
-                       touch attributes on the source module and defeat deferral
+error[tyc::lazy_usage]: `lazy from … import …` needs Python 3.15 (PEP 810 binds each
+                       imported name to a lazy proxy, which older interpreters lack)
 ```
 
-**Fix:** `lazy import np = numpy`, then `np.array(...)`.
+**Fix:** `lazy import np = numpy`, then `np.array(...)` — or set `[python] target = "3.15"`, where `lazy from` is emitted as CPython's native PEP 810 statement. `lazy from` must sit at module top level (PEP 810).
 
 ---
 

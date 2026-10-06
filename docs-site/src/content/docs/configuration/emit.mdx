@@ -14,6 +14,7 @@ format = true
 skip-decoration-bases = []
 model-extra = "forbid"
 traceback-remap = false
+freeze-dict = "mappingproxy"
 ```
 
 | Key | Type | Default | Description |
@@ -23,6 +24,7 @@ traceback-remap = false
 | `skip-decoration-bases` | list of strings | `[]` | Extra base-class names that suppress the automatic `@dataclass(slots=True)` decorator. |
 | `model-extra` | `"forbid"` \| `"ignore"` \| `"allow"` | `"forbid"` | Value for `ConfigDict(extra=…)` injected into every `model` class. |
 | `traceback-remap` | bool | `false` | Inject a runtime `sys.excepthook` into the entry module so uncaught-exception tracebacks point at `.ty` source instead of emitted `.py`. |
+| `freeze-dict` | `"mappingproxy"` \| `"frozendict"` | `"mappingproxy"` | What `freeze let` turns a dict into. `"frozendict"` needs a 3.15+ `[python] target`. |
 
 ## `class-default`
 
@@ -83,6 +85,29 @@ It only touches the **entry** script — library imports never trip the `__main_
 
 <Aside type="note">
   Default-off keeps existing projects and runtime-free entry points byte-for-byte unchanged. A project with no other runtime feature stays free of the generated `typhon_runtime/` package; enabling this knob is what pulls the runtime in for the entry module.
+</Aside>
+
+## `freeze-dict`
+
+Chooses what a `freeze let` binding turns a `dict` into.
+
+| Value | Runtime value | Static type |
+|-------|---------------|-------------|
+| `"mappingproxy"` (default) | a read-only `types.MappingProxyType` view | `Mapping[K, V]` |
+| `"frozendict"` | Python 3.15's [PEP 814](https://peps.python.org/pep-0814/) builtin | `frozendict[K, V]` |
+
+```toml
+[python]
+target = "3.15"
+
+[emit]
+freeze-dict = "frozendict"
+```
+
+A `frozendict` is hashable, so a frozen config can be a dict key, a set member or a `@memo` argument, and `json.dumps` accepts it. `"frozendict"` needs a `[python] target` of `"3.15"` or newer; on an older target it is rejected at config load with `tyc::invalid_config_value`. `tyc run` follows the setting.
+
+<Aside type="caution">
+  It is opt-in rather than tied to the target because the two differ observably: `str()` of a frozen dict prints `frozendict({...})` instead of `{...}`, and `.copy()` returns a `frozendict` instead of a `dict`. Moving an existing project to a 3.15 target leaves its output unchanged until you set this key.
 </Aside>
 
 ## Always-on behaviour

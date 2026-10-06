@@ -1,0 +1,3 @@
+return [*g for g in groups]
+return {**layer for layer in layers}
+case +1:

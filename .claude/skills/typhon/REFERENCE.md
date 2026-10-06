@@ -914,9 +914,11 @@ _loader.exec_module(np)         # deferred — only runs on first attribute acce
 
 The exact emission uses a small thread-safe proxy class so concurrent first accesses serialise around the underlying load.
 
-`lazy from numpy import array` is **rejected at parse time** (`tyc::lazy_usage`). Use `lazy import numpy` and dotted access.
+The PEP 810 spelling `lazy import numpy` / `lazy import numpy as np` is accepted on every target and lowers the same way.
 
 On a **3.15+ `[python] target`**, the lowering above is skipped entirely: `lazy import np = numpy` instead emits the native PEP 810 `lazy import numpy as np` statement — no proxy class, no `typhon_runtime` involvement. 3.13 / 3.14 targets keep the proxy-class emission shown above, byte-for-byte.
+
+`lazy from numpy import array` is accepted **only on a 3.15+ target**, where it is emitted as the native statement; on 3.13 / 3.14 it is `tyc::lazy_usage` (no helper can bind a single name lazily) — use `lazy import numpy` and dotted access. PEP 810's rules apply to it: module top level only, and `lazy from __future__ …` / `lazy from m import *` are rejected. (An indented `lazy import m` is accepted and lowers to a plain `import m`.)
 
 ### 7.2 Module-level `lazy let`
 
@@ -1311,3 +1313,76 @@ Modelled shapes: scalars (`int` / `str` / `bool` / `float` / `bytes` / `None`), 
 - `tyc ty` (v0.5.0) consumes to remap `ty`'s `.py:LINE:COL` diagnostics back to `.ty` coordinates
 - `tyc lsp` consumes for go-to-definition across the `.ty` ↔ `.py` boundary
 - `typhon_runtime/traceback.py` (v0.14.0, when `[emit] traceback-remap = true`) consumes them at **runtime**: the installed `sys.excepthook` reads the sidecars from the running script's `.sourcemaps/` dir and rewrites an uncaught exception's frames to `.ty` — header, source row and all — the `tyc trace` mapping, applied automatically
+
+---
+
+## 15. Python 3.15 features
+
+The `[python] target` decides how these lower; all of them type-check and run under `tyc run` on every target. Using a 3.15 builtin or stdlib API on an older target is `tyc::requires_python`; using an API the target removed is `tyc::removed_in_python`.
+
+| Feature | 3.15+ target | 3.13 / 3.14 |
+|---|---|---|
+| PEP 798 `[*xs for xs in groups]`, `{*xs for …}`, `(*xs for …)`, `{**m for m in maps}` | native | nested comprehension (`[x for xs in groups for x in xs]`, `{k: v for m in maps for k, v in m.items()}`) |
+| PEP 810 `lazy import m`, `lazy from m import n` | native statements | `lazy import` via helper; `lazy from` is `tyc::lazy_usage` |
+| PEP 814 `frozendict[K, V]` | builtin | `tyc::requires_python` |
+| PEP 661 `NAME = sentinel("NAME")` | builtin | `tyc::requires_python` |
+| PEP 747 `typing.TypeForm[T]` | from `typing` | `tyc::requires_python` (use `typing_extensions`) |
+| `case +1:` / `case 1 - +2j:` | native | `+` dropped |
+
+### 15.1 Unpacking in comprehensions (PEP 798)
+
+```ty
+def flatten(groups: list[list[int]]) -> list[int]:
+    return [*g for g in groups]              # element type of the iterable
+
+def merge(layers: list[dict[str, int]]) -> dict[str, int]:
+    return {**layer for layer in layers}     # later layers win
+```
+
+`*` of a non-iterable (`int`, `float`, `None`, a class with no `__iter__`) and `**` of a non-mapping are type errors.
+
+### 15.2 `frozendict` (PEP 814)
+
+```ty
+let defaults: frozendict[str, int] = frozendict(retries=3, timeout=30)
+let overridden = defaults | {"retries": 5}            # frozendict[str, int]
+let cache: dict[frozendict[str, int], str] = {defaults: "ok"}   # hashable
+```
+
+A `Mapping[K, V]`, covariant in `V`. `copy()` returns the same type. No mutators: `fd[k] = v`, `del fd[k]`, `.update`, `.pop`, `.setdefault`, `.clear` are errors. It is not a `dict`: `isinstance(fd, dict)` is `False` at runtime.
+
+`[emit] freeze-dict = "frozendict"` (3.15+ targets only; default `"mappingproxy"`) makes `freeze let` freeze dicts to `frozendict` (binding typed `frozendict[K, V]`) instead of `MappingProxyType` (typed `Mapping[K, V]`). Opt-in because `str()` and `.copy()` differ observably.
+
+### 15.3 Typed sentinels (PEP 661)
+
+```ty
+MISSING = sentinel("MISSING")
+
+def lookup(table: dict[str, int], key: str, default: int | MISSING = MISSING) -> int:
+    let found: int? = table.get(key)
+    if found is not None:
+        return found
+    if default is MISSING:
+        raise KeyError(key)
+    return default                           # narrowed to int
+```
+
+Only a **module-level** `NAME = sentinel("NAME")` gets its own type (the name usable in annotations). `is NAME` / `is not NAME` narrow; arithmetic, attribute access or assignment on an un-narrowed `T | NAME` is an error. `repr(NAME)` is `NAME` unless `repr=` is passed; sentinels are truthy and compare by identity.
+
+### 15.4 `TypeForm[T]` (PEP 747)
+
+```ty
+from typing import TypeForm, cast
+
+def load[T](form: TypeForm[T], raw: object) -> T:
+    return cast(form, raw)
+
+let counts: dict[str, int] = load(dict[str, int], data)   # T = dict[str, int]
+let maybe: int? = load(int | None, value)                 # T = int | None
+```
+
+An argument to a `TypeForm[T]` parameter is read as a type expression. `TypeForm` is covariant.
+
+### 15.5 Unary `+` literal patterns
+
+`case +1:` and `case 1 - +2j:` parse; `1 + -2j` stays invalid. Older targets get the pattern with the `+` removed (same matches).

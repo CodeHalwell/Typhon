@@ -183,13 +183,13 @@ intended lowering is below; for now, hand-write the generator.
 
 `return [...]` rewrites to a generator emission. Useful when the caller may only need a prefix.
 
-## `lazy from` is rejected
+## `lazy from` — native on 3.15, rejected before
 
 ```python
-lazy from numpy import array     # ❌ tyc::lazy_usage
+lazy from numpy import array     # 3.15+: emitted verbatim — 3.13 / 3.14: ❌ tyc::lazy_usage
 ```
 
-PEP 690's analysis: `from`-imports eagerly resolve attributes, defeating deferral. The diagnostic redirects you to `lazy import numpy`.
+Binding a *name* lazily needs the per-name proxy CPython 3.15 implements; the module-level proxy above cannot provide it. So on a 3.15+ target `lazy from` is emitted as written (module top level only, per PEP 810), and on older targets the diagnostic redirects you to `lazy import numpy = numpy`.
 
 ## Where next
 

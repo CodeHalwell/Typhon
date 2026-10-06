@@ -598,7 +598,7 @@ Typhon source:
 |---|---|---|
 | [PEP 798](https://peps.python.org/pep-0798/) unpacking in comprehensions: `[*xs for xs in groups]`, `{*xs for …}`, `(*xs for …)`, `{**m for m in maps}` | emitted natively | rewritten to the equivalent nested comprehension (`[x for xs in groups for x in xs]`, `{k: v for m in maps for k, v in m.items()}`) |
 | [PEP 810](https://peps.python.org/pep-0810/) lazy imports: `lazy import m`, `lazy from m import n` | native `lazy` statements | `lazy import` via the runtime helper; `lazy from` is `tyc::lazy_usage` |
-| [PEP 814](https://peps.python.org/pep-0814/) `frozendict` | builtin, typed as a read-only hashable `frozendict[K, V]`; `freeze let` freezes dicts to it | `tyc::requires_python` |
+| [PEP 814](https://peps.python.org/pep-0814/) `frozendict` | builtin, typed as a read-only hashable `frozendict[K, V]`; with `[emit] freeze-dict = "frozendict"`, `freeze let` freezes dicts to it | `tyc::requires_python` |
 | [PEP 661](https://peps.python.org/pep-0661/) `sentinel` | builtin; a module-level `NAME = sentinel("NAME")` has its own type | `tyc::requires_python` |
 | [PEP 747](https://peps.python.org/pep-0747/) `TypeForm[T]` | a `TypeForm[T]` parameter binds `T` from a type-expression argument | `tyc::requires_python` on the import |
 | Unary `+` literal patterns: `case +1:`, `case 1 - +2j:` | emitted natively | the `+` is dropped |
@@ -633,14 +633,20 @@ let cache: dict[frozendict[str, int], str] = {defaults: "ok"}   # hashable
 
 `frozendict[K, V]` is a `Mapping[K, V]` (covariant in `V`), hashable when its
 values are, and has no mutators: `fd[k] = v`, `del fd[k]` and `fd.update(…)`
-are reported. On a 3.15+ target `freeze let` freezes a dict to a `frozendict`
-instead of a `MappingProxyType`, so a frozen config can be a dict key, a set
-member or an argument to a `@memo` function, and `json.dumps` accepts it:
+are reported.
+
+Setting `[emit] freeze-dict = "frozendict"` (a 3.15+ target only) makes
+`freeze let` freeze a dict to a `frozendict` instead of a `MappingProxyType`,
+so a frozen config can be a dict key, a set member or an argument to a
+`@memo` function, and `json.dumps` accepts it. It is opt-in because the two
+differ observably — `str(CONFIG)` prints `frozendict({...})` rather than
+`{...}`, and `.copy()` returns a `frozendict` rather than a `dict`:
 
 ```python
 freeze let CONFIG = {"port": 8080, "hosts": ["a", "b"]}
-# 3.15+: frozendict({'port': 8080, 'hosts': ('a', 'b')})
-# 3.13 / 3.14: mappingproxy({'port': 8080, 'hosts': ('a', 'b')})
+print(CONFIG)
+# freeze-dict = "frozendict": frozendict({'port': 8080, 'hosts': ('a', 'b')})
+# default ("mappingproxy"):   {'port': 8080, 'hosts': ('a', 'b')}
 ```
 
 ### Sentinels (PEP 661)
@@ -648,7 +654,7 @@ freeze let CONFIG = {"port": 8080, "hosts": ["a", "b"]}
 ```python
 MISSING = sentinel("MISSING")
 
-def get(table: dict[str, int], key: str, default: int | MISSING = MISSING) -> int:
+def lookup(table: dict[str, int], key: str, default: int | MISSING = MISSING) -> int:
     let found: int? = table.get(key)
     if found is not None:
         return found
@@ -920,8 +926,9 @@ surface; it does not inspect the internals of an instance.
 
 A `freeze let` annotation describes the input value. The binding uses the
 runtime's recursively frozen shape: `list[T]` becomes `tuple[T, ...]`,
-`dict[K, V]` becomes `Mapping[K, V]` (`frozendict[K, V]` on a 3.15+ target —
-see below), and `set[T]` becomes `frozenset[T]`.
+`dict[K, V]` becomes `Mapping[K, V]` (`frozendict[K, V]` with
+`[emit] freeze-dict = "frozendict"` — see "Python 3.15 features"), and
+`set[T]` becomes `frozenset[T]`.
 Nested container elements are frozen too. Read operations remain available;
 container mutation and list concatenation on a frozen tuple are rejected. A
 new binding receiving a frozen value retains its frozen shape. An immutable
