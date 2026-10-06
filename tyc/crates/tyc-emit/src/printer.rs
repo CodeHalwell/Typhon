@@ -79,6 +79,40 @@ pub struct Emitter {
 
 const INDENT_WIDTH: usize = 4;
 
+/// A literal-pattern value with its unary `+` signs removed: `+1` → `1`,
+/// `+1 - +2j` → `1 - 2j`. Only the shapes a literal pattern can take — a
+/// signed number, or a real ± imaginary sum — are rewritten.
+fn strip_pattern_unary_plus(value: &Expr) -> std::borrow::Cow<'_, Expr> {
+    use std::borrow::Cow;
+    fn strip(expr: &Expr) -> Option<Expr> {
+        match expr {
+            Expr::UnaryOp(u) if matches!(u.op, UnaryOp::UAdd) => {
+                Some(strip(&u.operand).unwrap_or_else(|| (*u.operand).clone()))
+            }
+            Expr::BinOp(b) => {
+                let left = strip(&b.left);
+                let right = strip(&b.right);
+                if left.is_none() && right.is_none() {
+                    return None;
+                }
+                let mut out = b.clone();
+                if let Some(l) = left {
+                    out.left = Box::new(l);
+                }
+                if let Some(r) = right {
+                    out.right = Box::new(r);
+                }
+                Some(Expr::BinOp(out))
+            }
+            _ => None,
+        }
+    }
+    match strip(value) {
+        Some(stripped) => Cow::Owned(stripped),
+        None => Cow::Borrowed(value),
+    }
+}
+
 /// Loop variables of the nested comprehension a PEP 798 unpacking lowers to
 /// on a pre-3.15 target. Dunder-suffixed so a class body does not mangle
 /// them; a comprehension's targets are local to it, so they never escape.
@@ -139,6 +173,12 @@ impl Emitter {
     /// comprehension: the syntax is Python 3.15+. An unset target (`tyc
     /// fmt`) prints the source form unchanged.
     fn lower_pep798(&self) -> bool {
+        self.target_minor > 0 && self.target_minor < 15
+    }
+
+    /// True when a unary `+` in a literal pattern (`case +1:`, Python 3.15+)
+    /// must be dropped for the configured target.
+    fn lower_unary_plus_patterns(&self) -> bool {
         self.target_minor > 0 && self.target_minor < 15
     }
 
@@ -1943,7 +1983,15 @@ impl Emitter {
 
     fn emit_pattern(&mut self, pattern: &Pattern) {
         match pattern {
-            Pattern::MatchValue(v) => self.emit_expr(&v.value),
+            Pattern::MatchValue(v) => {
+                if self.lower_unary_plus_patterns() {
+                    // `case +1:` / `case 1 - +2j:` are Python 3.15 syntax;
+                    // the `+` changes nothing, so drop it for older targets.
+                    self.emit_expr(&strip_pattern_unary_plus(&v.value));
+                } else {
+                    self.emit_expr(&v.value);
+                }
+            }
             // `PatternMatchSingleton` now carries a `Singleton` enum directly
             // (None / True / False) instead of a wrapped `Constant`.
             Pattern::MatchSingleton(s) => match s.value {
@@ -2750,6 +2798,22 @@ mod tests {
         assert!(out.contains("in (a if c else b)]"), "got:\n{out}");
         let native = emit_for("d = {**(a or b) for _ in r}\n", 15);
         assert!(native.contains("{**(a or b) for _ in r}"), "got:\n{native}");
+    }
+
+    #[test]
+    fn unary_plus_literal_patterns_are_native_on_315_and_dropped_before() {
+        let src = "match x:\n    case +1:\n        pass\n    case +1.5 - +2j:\n        pass\n    case -1:\n        pass\n";
+        let native = emit_for(src, 15);
+        assert!(native.contains("case +1:"), "got:\n{native}");
+        assert!(native.contains("case +1.5 - +2"), "got:\n{native}");
+        let lowered = emit_for(src, 13);
+        assert!(lowered.contains("case 1:"), "got:\n{lowered}");
+        assert!(lowered.contains("case 1.5 - 2"), "got:\n{lowered}");
+        assert!(
+            lowered.contains("case -1:"),
+            "a unary minus is kept; got:\n{lowered}"
+        );
+        assert!(!lowered.contains('+'), "got:\n{lowered}");
     }
 
     #[test]

@@ -188,6 +188,22 @@ mod tests {
     }
 
     #[test]
+    fn python_315_syntax_parses() {
+        // PEP 798, PEP 810 and unary-plus literal patterns: the emitter
+        // lowers them for older targets, so the parser accepts them always.
+        for src in [
+            "x = [*g for g in groups]\n",
+            "x = {**m for m in maps}\n",
+            "lazy from json import dumps\n",
+            "match x:\n    case +1:\n        pass\n    case 1 - +2j:\n        pass\n",
+        ] {
+            assert!(parse_module(src).is_ok(), "{src:?} must parse");
+        }
+        // CPython 3.15 still rejects a `-`-signed imaginary part.
+        assert!(parse_module("match x:\n    case 1 + -2j:\n        pass\n").is_err());
+    }
+
+    #[test]
     fn plain_python_still_parses() {
         let parsed = parse_module("def f(x: int) -> int:\n    return x * 2\n").expect("parse");
         assert_eq!(parsed.into_syntax().body.len(), 1);

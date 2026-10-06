@@ -1629,6 +1629,8 @@ pub fn generic_param_variance(head: &str, idx: usize) -> Variance {
         // typing spec calls this position covariant.
         | ("Type", 0)
         | ("type", 0) => Variance::Covariant,
+        // PEP 747: `TypeForm[int]` is a `TypeForm[int | str]`.
+        ("TypeForm", 0) => Variance::Covariant,
 
         // `Counter[T]` from `collections` extends `dict[T, int]`
         // and supports `__setitem__` / `update` — a `Counter[Dog]`
@@ -3553,6 +3555,10 @@ struct Checker<'a> {
     /// E.g. `def f[T: Interface](x: T)` populates `{"f": {"T": Class("Interface")}}`.
     /// Checked at call sites via `Checker::check_call_typevar_bounds`.
     function_type_bounds: HashMap<String, HashMap<String, Type>>,
+    /// Module-level PEP 661 sentinels (`MISSING = sentinel("MISSING")`,
+    /// Python 3.15). Each has its own singleton type, `Type::Class(name)`,
+    /// usable in annotations (`int | MISSING`) and narrowed by `is`.
+    sentinels: HashSet<String>,
     /// The bounds in effect for the function body currently being checked.
     /// Populated by `check_function` from `function_type_bounds` so that
     /// `Expr::Attribute` resolution can look up what interface a `T: Iface`
@@ -4009,6 +4015,7 @@ impl<'a> Checker<'a> {
             in_generator: false,
             python_minor: MIN_PYTHON_MINOR,
             function_type_bounds: HashMap::new(),
+            sentinels: HashSet::new(),
             active_typevar_bounds: HashMap::new(),
             descriptor_uses: std::cell::OnceCell::new(),
             dynamic_attr_stores: std::cell::OnceCell::new(),
@@ -7369,7 +7376,7 @@ impl CheckedModule {
 pub const MIN_PYTHON_MINOR: u8 = 13;
 
 /// Per-run settings the checker cannot derive from the module itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckOptions {
     /// The `[python] target` minor version (`3.X`): `13` for `"3.13"` /
     /// `"3.13t"`, `15` for `"3.15"`. A builtin that only exists from a later
@@ -7377,12 +7384,28 @@ pub struct CheckOptions {
     /// `tyc::requires_python`, since the emitted Python would raise
     /// `NameError` there.
     pub python_minor: u8,
+    /// Import roots of the project's declared dependencies. A dependency
+    /// that shares a newer stdlib module's name (a PyPI `profiling` on a
+    /// 3.13 project) is what the import loads, so it is not gated.
+    pub dependency_roots: std::sync::Arc<[String]>,
 }
 
 impl Default for CheckOptions {
     fn default() -> Self {
         Self {
             python_minor: MIN_PYTHON_MINOR,
+            dependency_roots: std::sync::Arc::from(Vec::new()),
+        }
+    }
+}
+
+impl CheckOptions {
+    /// Options for the `3.<python_minor>` target with no declared
+    /// dependencies.
+    pub fn for_target(python_minor: u8) -> Self {
+        Self {
+            python_minor,
+            ..Self::default()
         }
     }
 }
@@ -7429,6 +7452,13 @@ pub fn check_module_with_options(
     let mut c = Checker::new(path.into(), source, resolved);
     c.module = Some(module);
     c.python_minor = options.python_minor;
+    c.sentinels = module_sentinels(module);
+    // A sentinel's singleton type is a closed, fully-known class with no
+    // members: `default + 1` or `default.bit_length()` on an un-narrowed
+    // `int | MISSING` raises at runtime, and is reported.
+    for name in &c.sentinels {
+        c.class_shapes.entry(name.clone()).or_default();
+    }
     c.unsafe_line_starts = unsafe_byte_starts(source, unsafe_lines);
     let frozen_starts = unsafe_byte_starts(source, frozen_class_lines);
     // Seed cross-module shapes BEFORE the in-module first pass so
@@ -7686,7 +7716,25 @@ pub fn check_module_with_options(
     // (`tyc::requires_python`) and stdlib APIs it no longer ships
     // (`tyc::removed_in_python`).
     let path = c.path.clone();
-    target_gate::check(module, c.python_minor, &path, source, &mut c.diagnostics);
+    let mut project_roots: HashSet<String> = external
+        .map(|ext| {
+            ext.by_module
+                .keys()
+                .filter_map(|k| k.split('.').next())
+                .filter(|root| !root.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    project_roots.extend(options.dependency_roots.iter().cloned());
+    target_gate::check(
+        module,
+        c.python_minor,
+        &path,
+        source,
+        &project_roots,
+        &mut c.diagnostics,
+    );
 
     #[cfg(debug_assertions)]
     unchecked::report(&c.path, module, &c.expression_types);
@@ -14697,6 +14745,13 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             c.in_question_temp_rhs = a.targets.len() == 1 && is_question_op_temp(&a.targets[0]);
             let value_type = infer_expr(c, &a.value);
             c.in_question_temp_rhs = saved_q;
+            // PEP 661: `MISSING = sentinel("MISSING")` binds a value of its
+            // own singleton type, so `int | MISSING` admits it and `is
+            // MISSING` narrows it away.
+            let value_type = match sentinel_definition(c, a) {
+                Some(name) => Type::Class(name.to_owned()),
+                None => value_type,
+            };
             // A call in the RHS (`let n = clear()`) may reassign a module global
             // via a `global NAME` in the callee, invalidating any narrowing the
             // caller established on that global. Reset here — before this
@@ -19107,14 +19162,40 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                         },
                         _ => None,
                     };
-                    if let (Some(n), Expr::NoneLiteral(_)) = (left_name, &cmp.comparators[0]) {
+                    if let (Some(n), Some(sentinel)) =
+                        (left_name, sentinel_operand(c, &cmp.comparators[0]))
+                    {
+                        // `x is MISSING` / `x is not MISSING` (PEP 661): the
+                        // sentinel's singleton type in, or out.
+                        if let Some(b) = c.env.lookup(n.id.as_str()) {
+                            let singleton = Type::Class(sentinel.to_owned());
+                            let replacement = if want_none {
+                                singleton
+                            } else {
+                                let base = pending_name_narrowing(out, n.id.as_str())
+                                    .unwrap_or_else(|| b.narrowed.clone());
+                                strip_variant_expanding(c, &base, &singleton)
+                            };
+                            out.push(Narrowing {
+                                name: n.id.as_str().to_owned(),
+                                attr_path: None,
+                                replacement,
+                            });
+                        }
+                    } else if let (Some(n), Expr::NoneLiteral(_)) = (left_name, &cmp.comparators[0])
+                    {
                         if let Some(b) = c.env.lookup(n.id.as_str()) {
                             // x is None  → name becomes None
                             // x is not None → name becomes declared without None
+                            // — starting from what an earlier operand of the
+                            // same condition already narrowed it to
+                            // (`x is not MISSING and x is not None`).
                             let replacement = if want_none {
                                 Type::None
                             } else {
-                                b.narrowed.strip_none()
+                                pending_name_narrowing(out, n.id.as_str())
+                                    .unwrap_or_else(|| b.narrowed.clone())
+                                    .strip_none()
                             };
                             out.push(Narrowing {
                                 name: n.id.as_str().to_owned(),
@@ -21163,6 +21244,22 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 if ty.is_nullable() {
                     report_nullable_operand(c, side, ty);
                 }
+                // A PEP 661 sentinel has no operators: `default + 1` on an
+                // un-narrowed `int | MISSING` raises `TypeError` at runtime.
+                // `|` is exempt — `int | MISSING` is a runtime type union.
+                if !matches!(b.op, Operator::BitOr) && c.unsafe_depth == 0 {
+                    if let Some(sentinel) = sentinel_member(c, ty) {
+                        let span = (
+                            side.range().start().to_usize(),
+                            side.range().end().to_usize(),
+                        );
+                        c.mismatch_with(
+                            format!("a value that is not {sentinel}"),
+                            ty.display(),
+                            span,
+                        );
+                    }
+                }
             }
             let l_stripped = l.strip_none();
             let r_stripped = r.strip_none();
@@ -22218,6 +22315,18 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         } else {
                             break;
                         };
+                        // PEP 747: a `TypeForm[T]` parameter takes a *type
+                        // expression* — `parse(dict[str, int], raw)` binds
+                        // `T = dict[str, int]`, so the call returns that.
+                        if let Some(form) = type_form_argument(c, &expected, arg) {
+                            if !c.is_assignable(&expected, &form) {
+                                let span =
+                                    (arg.range().start().to_usize(), arg.range().end().to_usize());
+                                c.mismatch(&expected, &form, span);
+                            }
+                            actuals.push(form);
+                            continue;
+                        }
                         let actual = infer_expr_ctx(c, arg, Some(&expected));
                         // Check the nullable-use case first: when the actual
                         // is nullable and the parameter is not, `nullable_use`
@@ -24001,6 +24110,116 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             Type::Generic("dict".into(), vec![k, v])
         }
         _ => Type::Unknown,
+    }
+}
+
+/// The `TypeForm[...]` an argument passed to a `TypeForm[T]` parameter
+/// denotes (PEP 747, Python 3.15): the argument read as a type expression —
+/// `dict[str, int]`, `int | None`, `Point` — or, for a name already holding a
+/// type form, that form. `None` when the parameter is not a `TypeForm`.
+fn type_form_argument(c: &Checker, param: &Type, arg: &Expr) -> Option<Type> {
+    let Type::Generic(head, args) = c.unwrap_alias(param) else {
+        return None;
+    };
+    if head != "TypeForm" || args.len() != 1 {
+        return None;
+    }
+    if let Expr::Name(n) = arg {
+        if let Some(b) = c.env.lookup(n.id.as_str()) {
+            if matches!(&b.narrowed, Type::Generic(h, _) if h == "TypeForm") {
+                return Some(b.narrowed.clone());
+            }
+        }
+    }
+    let form = type_from_annotation_with_params(arg, &c.classes, &c.active_type_params);
+    Some(Type::Generic("TypeForm".into(), vec![form]))
+}
+
+/// The module-level PEP 661 sentinels `module` defines: every
+/// `NAME = sentinel("…")` (or `let NAME = sentinel("…")`) at its top level,
+/// unless the module binds `sentinel` itself (an import or a definition, so
+/// the call is not the builtin).
+fn module_sentinels(module: &ModModule) -> HashSet<String> {
+    let rebinds_sentinel = module.body.iter().any(|stmt| match stmt {
+        Stmt::FunctionDef(f) => f.name.as_str() == "sentinel",
+        Stmt::ClassDef(cd) => cd.name.as_str() == "sentinel",
+        Stmt::Import(i) => i
+            .names
+            .iter()
+            .any(|a| a.asname.as_ref().unwrap_or(&a.name).as_str() == "sentinel"),
+        Stmt::ImportFrom(f) => f
+            .names
+            .iter()
+            .any(|a| a.asname.as_ref().unwrap_or(&a.name).as_str() == "sentinel"),
+        Stmt::Assign(a) => a
+            .targets
+            .iter()
+            .any(|t| matches!(t, Expr::Name(n) if n.id.as_str() == "sentinel")),
+        _ => false,
+    });
+    if rebinds_sentinel {
+        return HashSet::new();
+    }
+    module
+        .body
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::Assign(a) if a.targets.len() == 1 && is_sentinel_call(&a.value) => {
+                match &a.targets[0] {
+                    Expr::Name(n) => Some(n.id.as_str().to_owned()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The module sentinel `ty` is, or has as a union member.
+fn sentinel_member<'a>(c: &Checker, ty: &'a Type) -> Option<&'a str> {
+    match ty {
+        Type::Class(name) if c.sentinels.contains(name) => Some(name),
+        Type::Union(members) => members.iter().find_map(|m| sentinel_member(c, m)),
+        _ => None,
+    }
+}
+
+/// Whether `expr` is a call of the builtin `sentinel`.
+fn is_sentinel_call(expr: &Expr) -> bool {
+    matches!(expr, Expr::Call(call) if matches!(call.func.as_ref(), Expr::Name(f) if f.id.as_str() == "sentinel"))
+}
+
+/// The sentinel `a` defines, when it is one of the module's
+/// [`module_sentinels`] assignments.
+fn sentinel_definition<'a>(c: &Checker, a: &'a ruff_python_ast::StmtAssign) -> Option<&'a str> {
+    if a.targets.len() != 1 || !is_sentinel_call(&a.value) {
+        return None;
+    }
+    match &a.targets[0] {
+        Expr::Name(n) if c.sentinels.contains(n.id.as_str()) => Some(n.id.as_str()),
+        _ => None,
+    }
+}
+
+/// The sentinel `expr` names, when it is a bare reference to one of the
+/// module's sentinels that is not shadowed (its binding still holds the
+/// sentinel's singleton type).
+fn sentinel_operand<'a>(c: &Checker, expr: &'a Expr) -> Option<&'a str> {
+    let Expr::Name(n) = expr else {
+        return None;
+    };
+    let name = n.id.as_str();
+    if !c.sentinels.contains(name) {
+        return None;
+    }
+    // Function bodies can be checked before the module-level assignment
+    // types the binding, so an as-yet-untyped binding counts too; a binding
+    // holding anything else is a local that shadows the sentinel.
+    match c.env.lookup(name) {
+        Some(b) if matches!(&b.declared, Type::Class(cls) if cls == name) => Some(name),
+        Some(b) if matches!(b.declared, Type::Unknown) => Some(name),
+        None => Some(name),
+        _ => None,
     }
 }
 
@@ -27550,9 +27769,7 @@ def describe(m: Maybe[int]) -> str:
             &prep.frozen_class_lines,
             &prep.impl_distributed_lines,
             None,
-            CheckOptions {
-                python_minor: minor,
-            },
+            CheckOptions::for_target(minor),
         )
         .diagnostics
     }
@@ -27616,6 +27833,140 @@ def describe(m: Maybe[int]) -> str:
         let src13 = "from collections.abc import Mapping\nfreeze let CFG = {\"port\": 8080}\n\
                      let m: Mapping[str, int] = CFG\nprint(m)\n";
         assert!(check_for(src13, 13).errors().is_empty());
+    }
+
+    // ── PEP 661: `sentinel` (Python 3.15) ───────────────────────────────
+
+    const SENTINEL_PRELUDE: &str = "MISSING = sentinel(\"MISSING\")\n";
+
+    #[test]
+    fn sentinel_is_a_singleton_type_narrowed_by_is() {
+        let src = format!(
+            "{SENTINEL_PRELUDE}\
+             def get(default: int | MISSING = MISSING) -> int:\n\
+             \x20   if default is MISSING:\n\
+             \x20       return 0\n\
+             \x20   return default + default.bit_length()\n\
+             def get2(default: int | None | MISSING = MISSING) -> int:\n\
+             \x20   if default is not MISSING and default is not None:\n\
+             \x20       return default + 1\n\
+             \x20   return 0\n\
+             def pick() -> int | MISSING:\n\
+             \x20   return MISSING\n\
+             print(get(), get2(), pick())\n"
+        );
+        let d = check_for(&src, 15);
+        assert!(d.errors().is_empty(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn sentinel_must_be_narrowed_before_use() {
+        for body in [
+            "    return default + 1\n",
+            "    return default.bit_length()\n",
+            "    let n: int = default\n    return n\n",
+        ] {
+            let src = format!(
+                "{SENTINEL_PRELUDE}def get(default: int | MISSING = MISSING) -> int:\n{body}"
+            );
+            assert!(
+                !check_for(&src, 15).errors().is_empty(),
+                "un-narrowed use must fail: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn sentinel_requires_a_315_target() {
+        let d = check_for(SENTINEL_PRELUDE, 14);
+        assert_eq!(requires_python_count(&d), 1, "{:?}", d.errors());
+        assert!(check_for(SENTINEL_PRELUDE, 15).errors().is_empty());
+    }
+
+    // ── PEP 747: `TypeForm[T]` (Python 3.15) ────────────────────────────
+
+    const TYPEFORM_PRELUDE: &str = "from typing import TypeForm, cast\n\
+        def load[T](form: TypeForm[T], raw: object) -> T:\n\
+        \x20   return cast(form, raw)\n\
+        class Point:\n\
+        \x20   x: int\n";
+
+    #[test]
+    fn typeform_binds_the_type_expression_argument() {
+        let src = format!(
+            "{TYPEFORM_PRELUDE}\
+             let a: dict[str, int] = load(dict[str, int], {{}})\n\
+             let b: int? = load(int | None, None)\n\
+             let p: Point = load(Point, Point(x=1))\n\
+             print(a, b, p)\n"
+        );
+        let d = check_for(&src, 15);
+        assert!(d.errors().is_empty(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn typeform_result_is_checked_against_the_annotation() {
+        let src =
+            format!("{TYPEFORM_PRELUDE}let bad: list[int] = load(list[str], [])\nprint(bad)\n");
+        assert!(mismatches_for(&src, 15) >= 1);
+        let narrow = format!(
+            "{TYPEFORM_PRELUDE}def only_ints(form: TypeForm[int]) -> None:\n    pass\nonly_ints(str)\n"
+        );
+        assert!(
+            mismatches_for(&narrow, 15) >= 1,
+            "TypeForm[str] is not a TypeForm[int]"
+        );
+        let widen = format!(
+            "{TYPEFORM_PRELUDE}def any_num(form: TypeForm[int | float]) -> None:\n    pass\nany_num(int)\n"
+        );
+        assert_eq!(mismatches_for(&widen, 15), 0, "TypeForm is covariant");
+    }
+
+    fn mismatches_for(src: &str, minor: u8) -> usize {
+        check_for(src, minor)
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::TypeMismatch { .. }))
+            .count()
+    }
+
+    #[test]
+    fn a_dependency_named_like_a_new_stdlib_module_is_not_gated() {
+        // A 3.13 project depending on a PyPI `profiling` imports that.
+        let src = "import profiling\nprint(profiling)\n";
+        let prep = preprocess(src);
+        let module = tyc_syntax::parse_module(&prep.python_source).unwrap().into_syntax();
+        let (resolved, _) = resolve_module("<test>".to_owned(), &prep.python_source, &module);
+        let checked = check_module_with_options(
+            "<test>",
+            &prep.python_source,
+            &resolved,
+            &module,
+            &[],
+            &[],
+            &[],
+            None,
+            CheckOptions {
+                python_minor: 13,
+                dependency_roots: std::sync::Arc::from(vec!["profiling".to_owned()]),
+            },
+        );
+        assert_eq!(requires_python_count(&checked.diagnostics), 0);
+        assert_eq!(requires_python_count(&check_for(src, 13)), 1);
+    }
+
+    #[test]
+    fn new_stdlib_apis_require_their_release() {
+        let src =
+            "from typing import TypeForm\nimport math\nimport annotationlib\nimport profiling\n\
+                   print(TypeForm, math.signbit(-1.0), annotationlib, profiling)\n";
+        assert_eq!(requires_python_count(&check_for(src, 13)), 4);
+        assert_eq!(
+            requires_python_count(&check_for(src, 14)),
+            3,
+            "annotationlib is 3.14's"
+        );
+        assert_eq!(requires_python_count(&check_for(src, 15)), 0);
     }
 
     // ── `tyc::removed_in_python` ────────────────────────────────────────

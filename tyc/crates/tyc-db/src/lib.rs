@@ -765,7 +765,8 @@ fn check_pipeline(
             1,
         ));
     }
-    for err in validate_lazy_usage(&text, options.python_minor) {
+    let python_minor = options.python_minor;
+    for err in validate_lazy_usage(&text, python_minor) {
         diags.push_error(TycError::lazy_usage(
             err.message,
             &path,

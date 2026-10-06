@@ -5,11 +5,11 @@ use ruff_python_ast::{
 };
 use ruff_text_size::{Ranged, TextSize};
 
-use crate::ParseErrorType;
 use crate::parser::progress::ParserProgress;
 use crate::parser::{Parser, RecoveryContextKind, SequenceMatchPatternParentheses, recovery};
 use crate::token::TokenValue;
 use crate::token_set::TokenSet;
+use crate::{ParseErrorType, UnsupportedSyntaxErrorKind};
 
 use super::expression::ExpressionContext;
 
@@ -467,7 +467,9 @@ impl Parser<'_> {
                 })
             }
             kind => {
-                // The `+` is only for better error recovery.
+                // Typhon fork: a unary `+` literal pattern is Python 3.15
+                // syntax (`case +1:`), recorded as unsupported syntax for
+                // older versions rather than rejected outright.
                 if let Some(unary_arithmetic_op) = kind.as_unary_arithmetic_operator() {
                     if matches!(
                         self.peek(),
@@ -478,12 +480,15 @@ impl Parser<'_> {
                             ExpressionContext::default(),
                         );
 
+                        // test_ok unary_plus_literal_pattern_py315
+                        // # parse_options: {"target-version": "3.15"}
+                        // match x:
+                        //     case +1: ...
+                        //     case +1.5 - +2j: ...
                         if unary_expr.op.is_u_add() {
-                            self.add_error(
-                                ParseErrorType::OtherError(
-                                    "Unary '+' is not allowed as a literal pattern".to_string(),
-                                ),
-                                &unary_expr,
+                            self.add_unsupported_syntax_error(
+                                UnsupportedSyntaxErrorKind::UnaryPlusInLiteralPattern,
+                                unary_expr.range(),
                             );
                         }
 
@@ -589,7 +594,14 @@ impl Parser<'_> {
 
         let rhs_pattern = self.parse_match_pattern_lhs(AllowStarPattern::No);
         let rhs_value = if let Pattern::MatchValue(rhs) = rhs_pattern {
-            if !is_complex_number(&rhs.value) {
+            // Python 3.15 also accepts a `+`-signed imaginary part
+            // (`1 - +2j`); a `-` one stays an error, as in CPython.
+            let plus_signed_complex = matches!(
+                rhs.value.as_ref(),
+                Expr::UnaryOp(ast::ExprUnaryOp { op: ast::UnaryOp::UAdd, operand, .. })
+                    if is_complex_number(operand)
+            );
+            if !is_complex_number(&rhs.value) && !plus_signed_complex {
                 self.add_error(ParseErrorType::ExpectedImaginaryNumber, &rhs);
             }
             rhs.value

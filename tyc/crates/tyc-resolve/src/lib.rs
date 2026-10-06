@@ -255,6 +255,8 @@ pub fn python_stdlib_modules() -> &'static [&'static str] {
         "_thread",
         "abc",
         "aifc",
+        // Python 3.14 (PEP 749); the checker gates it by `[python] target`.
+        "annotationlib",
         "argparse",
         "array",
         "ast",
@@ -281,6 +283,8 @@ pub fn python_stdlib_modules() -> &'static [&'static str] {
         "collections",
         "colorsys",
         "compileall",
+        // Python 3.14 (PEP 784); the checker gates it by `[python] target`.
+        "compression",
         "concurrent",
         "configparser",
         "contextlib",
@@ -376,6 +380,8 @@ pub fn python_stdlib_modules() -> &'static [&'static str] {
         "posixpath",
         "pprint",
         "profile",
+        // Python 3.15 (PEP 799); the checker gates it by `[python] target`.
+        "profiling",
         "pstats",
         "pty",
         "pwd",
@@ -3568,10 +3574,11 @@ pub fn builtin_names() -> std::collections::HashSet<&'static str> {
         "classmethod",
         "staticmethod",
         "frozenset",
-        // Python 3.15 (PEP 814). Resolved on every target so an older one
-        // reports the clearer `tyc::requires_python` from the checker
-        // instead of `unknown_name`.
+        // Python 3.15 (PEP 814 / PEP 661). Resolved on every target so an
+        // older one reports the clearer `tyc::requires_python` from the
+        // checker instead of `unknown_name`.
         "frozendict",
+        "sentinel",
         // Built-in types
         "int",
         "str",

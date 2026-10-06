@@ -13,6 +13,7 @@ enum ResultRule {
     Container(&'static str),
     Dict,
     FrozenDict,
+    Sentinel,
     Same,
     Round,
     Sum,
@@ -59,6 +60,10 @@ const CONTRACTS: &[Contract] = &[
     contract!("dict", 0, 1, &["*"], ResultRule::Dict),
     // Python 3.15 (PEP 814); `tyc::requires_python` on an older target.
     contract!("frozendict", 0, 1, &["*"], ResultRule::FrozenDict),
+    // Python 3.15 (PEP 661). A module-level `NAME = sentinel("NAME")` binding
+    // gets its own singleton type in the checker; the bare call is a
+    // `sentinel` instance.
+    contract!("sentinel", 1, 1, &["repr"], ResultRule::Sentinel),
     contract!("abs", 1, 1, &[], ResultRule::Same),
     contract!("round", 1, 2, &["number", "ndigits"], ResultRule::Round),
     contract!("sum", 1, 2, &["start"], ResultRule::Sum),
@@ -153,6 +158,7 @@ pub(super) fn result(name: &str, args: &[Type], keywords: &[(&str, Type)]) -> Op
         ResultRule::Float => Type::Float,
         ResultRule::Bool => Type::Bool,
         ResultRule::Slice => Type::Class("slice".into()),
+        ResultRule::Sentinel => Type::Class("sentinel".into()),
         ResultRule::Range => Type::Class("range".into()),
         ResultRule::Container(head) => generic(head, vec![elem()]),
         ResultRule::Iterator => generic("Iterator", vec![elem()]),
@@ -273,6 +279,7 @@ const BUILTIN_CLASSES: &[&str] = &[
     "property",
     "range",
     "reversed",
+    "sentinel",
     "set",
     "slice",
     "staticmethod",

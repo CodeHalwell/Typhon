@@ -304,11 +304,6 @@ fn check_scope(args: &CheckArgs, scope: &CheckScope) -> Result<ScopeOutcome> {
     // standalone `.ty` file being checked outside a project context should
     // not be penalised for importing third-party packages that happen not to
     // be listed anywhere.
-    // The project's `[python] target` gates target-specific builtins and
-    // syntax (`frozendict`, PEP 810 `lazy from`) in the checker.
-    let check_options = CheckOptions {
-        python_minor: config.python.target_minor(),
-    };
     let project_modules = collect_project_modules(scope, &config.project.src);
     let mut extra_modules: Vec<String> = config
         .dependencies
@@ -347,6 +342,13 @@ fn check_scope(args: &CheckArgs, scope: &CheckScope) -> Result<ScopeOutcome> {
     // Build the import-vetting HashSets exactly once; the per-file
     // unknown-module pass reuses them via `check_unknown_modules_with`.
     let vetting_ctx = tyc_resolve::ImportVettingContext::new(&project_modules, &extra_modules);
+    // The project's `[python] target` gates target-specific builtins and
+    // syntax (`frozendict`, PEP 810 `lazy from`) in the checker; declared
+    // dependencies are exempt from the newer-stdlib-module gate.
+    let check_options = CheckOptions {
+        python_minor: config.python.target_minor(),
+        dependency_roots: dependency_import_roots(&extra_modules),
+    };
 
     // Project-wide shape registry: dotted module name → public class /
     // function shapes the module exports. Built once before the per-file
@@ -556,7 +558,7 @@ fn check_scope(args: &CheckArgs, scope: &CheckScope) -> Result<ScopeOutcome> {
                 path_key,
                 source.clone(),
                 &project_shapes,
-                check_options,
+                check_options.clone(),
             );
             diags.extend(file_diags);
 
@@ -652,7 +654,7 @@ fn check_scope(args: &CheckArgs, scope: &CheckScope) -> Result<ScopeOutcome> {
                     path_key,
                     source.clone(),
                     &project_shapes,
-                    check_options,
+                    check_options.clone(),
                 );
                 diags.extend(file_diags);
 
@@ -1050,6 +1052,21 @@ pub(crate) fn check_stdlib_module_shadow(
 /// [`check_stdlib_module_shadow`] against the stdlib of the `3.<python_minor>`
 /// target — a `profiling.ty` shadows 3.15's new `profiling` package, but
 /// nothing on 3.13.
+/// Import roots of dependency names: the first dotted segment, with a
+/// distribution name's `-` read as `_` (`agent-framework` → `agent_framework`).
+pub(crate) fn dependency_import_roots<S: AsRef<str>>(names: &[S]) -> std::sync::Arc<[String]> {
+    let mut roots: Vec<String> = names
+        .iter()
+        .map(|n| {
+            let n = n.as_ref();
+            n.split('.').next().unwrap_or(n).replace('-', "_")
+        })
+        .collect();
+    roots.sort();
+    roots.dedup();
+    std::sync::Arc::from(roots)
+}
+
 pub(crate) fn check_stdlib_module_shadow_for(
     path: &std::path::Path,
     source: &str,

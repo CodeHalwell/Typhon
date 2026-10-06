@@ -24,7 +24,7 @@ and re-apply the Typhon-specific extensions described below.
 
 ## Typhon-specific extensions
 
-Two source-level changes ride on top of the upstream code:
+Three source-level changes ride on top of the upstream code:
 
 1. **`Mutability` enum + field** — `ruff_python_ast::Mutability` (`Let` /
    `Mut`) and a `mutability: Option<Mutability>` field on `StmtAssign`
@@ -48,6 +48,14 @@ Two source-level changes ride on top of the upstream code:
    separated by newlines" on ordinary code — `match` is the conventional
    name for a regex result, and it is what made `tyc migrate` emit an
    unparseable `.ty` for CPython's own `dataclasses` module.
+
+3. **Unary `+` literal patterns** — Python 3.15 accepts `case +1:` and a
+   `+`-signed imaginary part (`case 1 - +2j:`). Upstream rejected the `+`
+   outright; the fork records it as the
+   `UnsupportedSyntaxErrorKind::UnaryPlusInLiteralPattern` note (added in
+   3.15) instead, in `ruff_python_parser/src/parser/pattern.rs`, and
+   `tyc-emit` drops the `+` when the `[python] target` predates 3.15. A
+   `-`-signed imaginary part (`1 + -2j`) stays a parse error, as in CPython.
 
 Smoke tests at `vendor/ruff_python_parser/tests/typhon_mutability.rs` and
 `crates/tyc-syntax/src/ruff.rs::tests` cover the new shapes.

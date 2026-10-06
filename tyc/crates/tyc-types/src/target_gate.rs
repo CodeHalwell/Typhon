@@ -22,7 +22,39 @@ use ruff_python_ast::{self as ast, Expr, ModModule, Stmt};
 use tyc_diagnostics::{Diagnostics, TycError};
 
 /// Builtins added after Python 3.13: `(name, minor version, origin)`.
-const NEW_BUILTINS: &[(&str, u8, &str)] = &[("frozendict", 15, "PEP 814")];
+const NEW_BUILTINS: &[(&str, u8, &str)] =
+    &[("frozendict", 15, "PEP 814"), ("sentinel", 15, "PEP 661")];
+
+/// Stdlib modules added after Python 3.13: `(module, minor version, origin)`.
+const NEW_MODULES: &[(&str, u8, &str)] = &[
+    ("annotationlib", 14, "PEP 749"),
+    ("compression", 14, "PEP 784"),
+    ("concurrent.interpreters", 14, "PEP 734"),
+    ("string.templatelib", 14, "PEP 750"),
+    ("math.integer", 15, "PEP 791"),
+    ("profiling", 15, "PEP 799"),
+];
+
+/// Stdlib names added after Python 3.13: `(module, name, minor version,
+/// origin)` — `origin` names the PEP, when there is one.
+const NEW_NAMES: &[(&str, &str, u8, &str)] = &[
+    ("math", "fmax", 15, ""),
+    ("math", "fmin", 15, ""),
+    ("math", "integer", 15, "PEP 791"),
+    ("math", "isnormal", 15, ""),
+    ("math", "issubnormal", 15, ""),
+    ("math", "signbit", 15, ""),
+    ("re", "prefixmatch", 15, ""),
+    ("sys", "get_lazy_imports", 15, "PEP 810"),
+    ("sys", "set_lazy_imports", 15, "PEP 810"),
+    ("threading", "concurrent_tee", 15, ""),
+    ("threading", "serialize_iterator", 15, ""),
+    ("threading", "synchronized_iterator", 15, ""),
+    ("types", "FrameLocalsProxyType", 15, ""),
+    ("types", "LazyImportType", 15, "PEP 810"),
+    ("typing", "TypeForm", 15, "PEP 747"),
+    ("typing", "disjoint_base", 15, "PEP 800"),
+];
 
 /// Stdlib modules removed after Python 3.13: `(module, removed in, advice)`.
 const REMOVED_MODULES: &[(&str, u8, &str)] = &[
@@ -112,12 +144,15 @@ const REMOVED_NAMES: &[(&str, &str, u8, &str)] = &[
     ),
 ];
 
-/// Run both gates over `module`.
+/// Run both gates over `module`. `project_roots` are the top-level names of
+/// the project's own modules: a project module that shares a new stdlib
+/// module's name (`profiling.ty`) is the import's target, not the stdlib.
 pub(super) fn check(
     module: &ModModule,
     python_minor: u8,
     path: &str,
     source: &str,
+    project_roots: &HashSet<String>,
     diagnostics: &mut Diagnostics,
 ) {
     let mut bound = BoundNames::default();
@@ -126,6 +161,7 @@ pub(super) fn check(
         python_minor,
         path,
         source,
+        project_roots,
         bound: &bound.names,
         modules: HashMap::new(),
         typing_names: HashMap::new(),
@@ -142,6 +178,8 @@ struct Gate<'a> {
     python_minor: u8,
     path: &'a str,
     source: &'a str,
+    /// Top-level names of the project's own modules.
+    project_roots: &'a HashSet<String>,
     /// Every name the module binds anywhere: a gated builtin bound here is
     /// the module's own (or an imported backport) and is not checked.
     bound: &'a HashSet<String>,
@@ -156,14 +194,30 @@ struct Gate<'a> {
 
 impl Gate<'_> {
     fn requires(&mut self, name: &str, since: u8, origin: &str, range: ruff_text_size::TextRange) {
+        self.requires_with(name, since, origin, "NameError", range);
+    }
+
+    fn requires_with(
+        &mut self,
+        name: &str,
+        since: u8,
+        origin: &str,
+        error: &str,
+        range: ruff_text_size::TextRange,
+    ) {
+        let origin = if origin.is_empty() {
+            String::new()
+        } else {
+            format!(" ({origin})")
+        };
         let message = format!(
-            "`{name}` is new in Python {} ({origin}), but this project targets Python {}",
+            "`{name}` is new in Python {}{origin}, but this project targets Python {}",
             target(since),
             target(self.python_minor),
         );
         let help = format!(
             "set `[python] target = \"{}\"` (or newer) in typhon.toml — the emitted Python would \
-             raise `NameError` on {}",
+             raise `{error}` on {}",
             target(since),
             target(self.python_minor),
         );
@@ -191,6 +245,35 @@ impl Gate<'_> {
             range.start().to_usize(),
             range.len().to_usize(),
         ));
+    }
+
+    /// A stdlib module newer than the target that `module` names (itself or
+    /// a submodule of it), unless it is the project's own module.
+    fn new_module(&self, module: &str) -> Option<(&'static str, u8, &'static str)> {
+        let root = module.split('.').next().unwrap_or(module);
+        if self.project_roots.contains(root) {
+            return None;
+        }
+        NEW_MODULES
+            .iter()
+            .find(|(m, since, _)| {
+                (module == *m || module.starts_with(&format!("{m}."))) && self.python_minor < *since
+            })
+            .copied()
+    }
+
+    /// A stdlib name newer than the target.
+    fn new_name(&self, module: &str, name: &str) -> Option<(u8, &'static str)> {
+        if self
+            .project_roots
+            .contains(module.split('.').next().unwrap_or(module))
+        {
+            return None;
+        }
+        NEW_NAMES
+            .iter()
+            .find(|(m, n, since, _)| *m == module && *n == name && self.python_minor < *since)
+            .map(|(_, _, since, origin)| (*since, *origin))
     }
 
     fn removed_module(&self, module: &str) -> Option<(u8, &'static str)> {
@@ -282,6 +365,9 @@ impl<'ast> Visitor<'ast> for Gate<'_> {
                     if let Some((since, advice)) = self.removed_module(module) {
                         self.removed(format!("the `{module}` module"), since, advice, alias.range);
                     }
+                    if let Some((new, since, origin)) = self.new_module(module) {
+                        self.requires_with(new, since, origin, "ModuleNotFoundError", alias.range);
+                    }
                     match &alias.asname {
                         Some(asname) => {
                             self.modules.insert(asname.to_string(), module.to_owned());
@@ -299,11 +385,23 @@ impl<'ast> Visitor<'ast> for Gate<'_> {
                 let module = f.module.as_ref().map(|m| m.as_str()).unwrap_or("");
                 if let Some((since, advice)) = self.removed_module(module) {
                     self.removed(format!("the `{module}` module"), since, advice, f.range);
+                } else if let Some((new, since, origin)) = self.new_module(module) {
+                    self.requires_with(new, since, origin, "ModuleNotFoundError", f.range);
                 } else {
                     for alias in &f.names {
                         let name = alias.name.as_str();
                         if let Some((since, advice)) = self.removed_name(module, name) {
                             self.removed(format!("`{module}.{name}`"), since, advice, alias.range);
+                        }
+                        if let Some((since, origin)) = self.new_name(module, name) {
+                            let qualified = format!("{module}.{name}");
+                            self.requires_with(
+                                &qualified,
+                                since,
+                                origin,
+                                "ImportError",
+                                alias.range,
+                            );
                         }
                         let local = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
                         if module == "typing" {
@@ -335,6 +433,10 @@ impl<'ast> Visitor<'ast> for Gate<'_> {
                     let attr = a.attr.as_str();
                     if let Some((since, advice)) = self.removed_name(&module, attr) {
                         self.removed(format!("`{module}.{attr}`"), since, advice, a.range);
+                    }
+                    if let Some((since, origin)) = self.new_name(&module, attr) {
+                        let qualified = format!("{module}.{attr}");
+                        self.requires_with(&qualified, since, origin, "AttributeError", a.range);
                     }
                 }
             }

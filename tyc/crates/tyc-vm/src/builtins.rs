@@ -1621,6 +1621,18 @@ pub fn install(interp: &mut Interpreter) {
         let cls = descriptor_shim_class(i, "property")?;
         i.call_value(cls, args, &[])
     });
+    // `sentinel(name, /, *, repr=None)` (Python 3.15, PEP 661). The checker
+    // reports `tyc::requires_python` for it on an older target.
+    native!("sentinel", |i, args| {
+        if args.len() != 1 {
+            return Err(type_error(format!(
+                "sentinel() takes exactly 1 positional argument ({} given)",
+                args.len()
+            )));
+        }
+        let cls = descriptor_shim_class(i, "sentinel")?;
+        i.call_value(cls, args, &[])
+    });
     native!("classmethod", |_i, args| {
         Ok(mark_function(single(&args, "classmethod")?, true, false))
     });
@@ -9916,6 +9928,7 @@ pub(crate) fn native_accepts_keyword(name: &str, kw: &str) -> Option<bool> {
         "Ok" => Some(&["value"]),
         "Err" => Some(&["error"]),
         "isclose" => Some(&["rel_tol", "abs_tol"]),
+        "sentinel" => Some(&["repr"]),
         "nextafter" => Some(&["steps"]),
         "property"
         | "dict"
@@ -13325,6 +13338,16 @@ pub fn call_with_kwargs(
         // property(fget=..., fset=..., fdel=..., doc=...)
         "property" => {
             let cls = descriptor_shim_class(interp, "property")?;
+            interp.call_value(cls, args, kwargs)
+        }
+        // sentinel(name, repr=...)
+        "sentinel" => {
+            if let Some((k, _)) = kwargs.iter().find(|(k, _)| k != "repr") {
+                return Err(type_error(format!(
+                    "sentinel() got an unexpected keyword argument '{k}'"
+                )));
+            }
+            let cls = descriptor_shim_class(interp, "sentinel")?;
             interp.call_value(cls, args, kwargs)
         }
         // enumerate(iterable, start=N)

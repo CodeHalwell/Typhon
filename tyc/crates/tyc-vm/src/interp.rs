@@ -13525,6 +13525,31 @@ mod vm_tests {
         (interp, res)
     }
 
+    /// PEP 661 (Python 3.15): `sentinel`. Expected values are CPython
+    /// 3.15's.
+    #[test]
+    fn pep661_sentinel_matches_cpython() {
+        let src = r#"
+MISSING = sentinel("MISSING")
+CUSTOM = sentinel("CUSTOM", repr="<custom>")
+r = repr(MISSING)
+s = str(MISSING)
+c = repr(CUSTOM)
+ident = (MISSING is MISSING, MISSING == sentinel("MISSING"), bool(MISSING))
+tname = type(MISSING).__name__
+keyed = {MISSING: 1}[MISSING]
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        let get = |name: &str| interp.root.get(name).unwrap().py_str();
+        assert_eq!(get("r"), "MISSING");
+        assert_eq!(get("s"), "MISSING");
+        assert_eq!(get("c"), "<custom>");
+        assert_eq!(get("ident"), "(True, False, True)");
+        assert_eq!(get("tname"), "sentinel");
+        assert_eq!(get("keyed"), "1");
+    }
+
     /// PEP 814 (Python 3.15): `frozendict`. Expected values are CPython
     /// 3.15's.
     #[test]

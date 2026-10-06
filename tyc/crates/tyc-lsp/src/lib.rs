@@ -876,6 +876,16 @@ impl Backend {
                 .unwrap_or_default();
             let check_options = tyc_db::CheckOptions {
                 python_minor: opts.python_minor,
+                dependency_roots: workspace
+                    .as_ref()
+                    .map(|(root, _)| {
+                        let mut roots: Vec<String> = tyc_venv::allowed_top_level_from_project(root)
+                            .into_iter()
+                            .collect();
+                        roots.sort();
+                        std::sync::Arc::from(roots)
+                    })
+                    .unwrap_or_else(|| std::sync::Arc::from(Vec::new())),
             };
             // Phase 2, under the db lock again: the check itself.
             let mut db = db_arc.blocking_lock();

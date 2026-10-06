@@ -151,3 +151,21 @@ class _GenericAlias:
 
     def __ror__(self, other):
         return _union(other, self)
+
+
+# `sentinel(name, /, *, repr=None)` — Python 3.15's PEP 661 builtin. A unique
+# object compared by identity, truthy, whose `repr` / `str` is its name (or
+# the `repr=` given). `copy` hands the object itself back.
+class sentinel:
+    def __init__(self, name, repr=None):
+        self.__name__ = name
+        self.__typhon_repr__ = name if repr is None else repr
+
+    def __repr__(self):
+        return self.__typhon_repr__
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self

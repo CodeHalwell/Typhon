@@ -488,6 +488,13 @@ pub fn run(args: BuildArgs) -> Result<()> {
             &project_shapes,
             CheckOptions {
                 python_minor: config.python.target_minor(),
+                dependency_roots: crate::commands::check::dependency_import_roots(
+                    &config
+                        .dependencies
+                        .keys()
+                        .chain(config.dev_dependencies.keys())
+                        .collect::<Vec<_>>(),
+                ),
             },
         );
         all_phase1_diags.extend(file_diags);

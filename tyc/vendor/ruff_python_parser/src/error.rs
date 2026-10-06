@@ -722,6 +722,17 @@ pub enum UnsupportedSyntaxErrorKind {
     /// [`typing.TypeVar`]: https://docs.python.org/3/library/typing.html#typevar
     TypeParameterList,
     LazyImportStatement,
+    /// Represents a unary `+` in a literal pattern before Python 3.15
+    /// (Typhon fork addition; see `vendor/README.md`).
+    ///
+    /// ## Examples
+    ///
+    /// ```python
+    /// match x:
+    ///     case +1: ...
+    ///     case 1 - +2j: ...
+    /// ```
+    UnaryPlusInLiteralPattern,
     TypeAliasStatement,
     TypeParamDefault,
 
@@ -1002,6 +1013,9 @@ impl Display for UnsupportedSyntaxError {
             }
             UnsupportedSyntaxErrorKind::TypeParameterList => "Cannot use type parameter lists",
             UnsupportedSyntaxErrorKind::LazyImportStatement => "Cannot use `lazy` import statement",
+            UnsupportedSyntaxErrorKind::UnaryPlusInLiteralPattern => {
+                "Cannot use unary `+` in a literal pattern"
+            }
             UnsupportedSyntaxErrorKind::TypeAliasStatement => "Cannot use `type` alias statement",
             UnsupportedSyntaxErrorKind::TypeParamDefault => {
                 "Cannot set default type for a type parameter"
@@ -1099,6 +1113,9 @@ impl UnsupportedSyntaxErrorKind {
             }
             UnsupportedSyntaxErrorKind::TypeParameterList => Change::Added(PythonVersion::PY312),
             UnsupportedSyntaxErrorKind::LazyImportStatement => Change::Added(PythonVersion::PY315),
+            UnsupportedSyntaxErrorKind::UnaryPlusInLiteralPattern => {
+                Change::Added(PythonVersion::PY315)
+            }
             UnsupportedSyntaxErrorKind::TypeAliasStatement => Change::Added(PythonVersion::PY312),
             UnsupportedSyntaxErrorKind::TypeParamDefault => Change::Added(PythonVersion::PY313),
             UnsupportedSyntaxErrorKind::Pep701FString(_) => Change::Added(PythonVersion::PY312),
