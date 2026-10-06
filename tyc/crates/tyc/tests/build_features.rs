@@ -2198,11 +2198,18 @@ const FREEZE_SRC: &str = "import json\n\
     print(json.dumps(CONFIG), {CONFIG: 1}[CONFIG])\n";
 
 #[test]
-fn build_freeze_let_dict_is_a_frozendict_on_3_15() {
-    // On 3.15 a frozen dict is a `frozendict` (PEP 814): hashable and
-    // JSON-serialisable, where a `mappingproxy` is neither.
+fn build_freeze_let_dict_is_a_frozendict_when_chosen() {
+    // `[emit] freeze-dict = "frozendict"` (3.15+): a frozen dict is a
+    // `frozendict` (PEP 814) — hashable and JSON-serialisable, where a
+    // `mappingproxy` is neither.
     let tmp = tempfile::tempdir().unwrap();
     scaffold_target(tmp.path(), "3.15", FREEZE_SRC);
+    let toml = std::fs::read_to_string(tmp.path().join("typhon.toml")).unwrap();
+    std::fs::write(
+        tmp.path().join("typhon.toml"),
+        toml.replace("[emit]\n", "[emit]\nfreeze-dict = \"frozendict\"\n"),
+    )
+    .unwrap();
     build(tmp.path());
     let freeze =
         std::fs::read_to_string(tmp.path().join("build/typhon_runtime/freeze.py")).unwrap();
@@ -2211,7 +2218,7 @@ fn build_freeze_let_dict_is_a_frozendict_on_3_15() {
     if let Some(py315) = python315() {
         assert_eq!(run_with(&py315, tmp.path()), expected);
     }
-    // The VM follows the project's target.
+    // The VM follows the project's setting.
     let vm = tyc().arg("run").arg(tmp.path()).output().unwrap();
     assert!(
         vm.status.success(),
@@ -2222,25 +2229,54 @@ fn build_freeze_let_dict_is_a_frozendict_on_3_15() {
 }
 
 #[test]
-fn build_freeze_let_dict_stays_mappingproxy_on_3_13() {
-    let tmp = tempfile::tempdir().unwrap();
-    scaffold_target(
-        tmp.path(),
-        "3.13",
-        "freeze let CONFIG = {\"port\": 8080}\nprint(type(CONFIG).__name__)\n",
-    );
-    build(tmp.path());
-    let freeze =
-        std::fs::read_to_string(tmp.path().join("build/typhon_runtime/freeze.py")).unwrap();
-    assert!(
-        !freeze.contains("frozendict"),
-        "3.13 runtime is unchanged; got:\n{freeze}"
-    );
-    if let Some(out) = run_main(tmp.path()) {
-        assert_eq!(out, "mappingproxy\n");
+fn build_freeze_let_dict_stays_mappingproxy_by_default() {
+    // The default is unchanged on every target, 3.15 included: switching a
+    // correct program's frozen dicts to `frozendict` would change its output.
+    for target in ["3.13", "3.15"] {
+        let tmp = tempfile::tempdir().unwrap();
+        scaffold_target(
+            tmp.path(),
+            target,
+            "freeze let CONFIG = {\"port\": 8080}\nprint(type(CONFIG).__name__, CONFIG)\n",
+        );
+        build(tmp.path());
+        let freeze =
+            std::fs::read_to_string(tmp.path().join("build/typhon_runtime/freeze.py")).unwrap();
+        assert!(
+            !freeze.contains("frozendict"),
+            "{target}: runtime unchanged; got:\n{freeze}"
+        );
+        let expected = "mappingproxy {'port': 8080}\n";
+        let python = if target == "3.15" {
+            python315()
+        } else {
+            python()
+        };
+        if let Some(py) = python {
+            assert_eq!(run_with(&py, tmp.path()), expected);
+        }
+        let vm = tyc().arg("run").arg(tmp.path()).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&vm.stdout), expected, "{target}");
     }
-    let vm = tyc().arg("run").arg(tmp.path()).output().unwrap();
-    assert_eq!(String::from_utf8_lossy(&vm.stdout), "mappingproxy\n");
+}
+
+#[test]
+fn freeze_dict_frozendict_needs_a_3_15_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(tmp.path(), "3.14", "freeze let CONFIG = {\"port\": 8080}\n");
+    let toml = std::fs::read_to_string(tmp.path().join("typhon.toml")).unwrap();
+    std::fs::write(
+        tmp.path().join("typhon.toml"),
+        toml.replace("[emit]\n", "[emit]\nfreeze-dict = \"frozendict\"\n"),
+    )
+    .unwrap();
+    let out = tyc().arg("build").arg(tmp.path()).output().unwrap();
+    assert!(!out.status.success());
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        text.contains("freeze-dict") && text.contains("3.15"),
+        "got:\n{text}"
+    );
 }
 
 #[test]

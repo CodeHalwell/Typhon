@@ -347,6 +347,7 @@ fn check_scope(args: &CheckArgs, scope: &CheckScope) -> Result<ScopeOutcome> {
     // dependencies are exempt from the newer-stdlib-module gate.
     let check_options = CheckOptions {
         python_minor: config.python.target_minor(),
+        freeze_to_frozendict: config.emit.freeze_to_frozendict(),
         dependency_roots: dependency_import_roots(&extra_modules),
     };
 
@@ -628,6 +629,7 @@ fn check_scope(args: &CheckArgs, scope: &CheckScope) -> Result<ScopeOutcome> {
                     auto_parallel_reductions: config.strictness.auto_parallel_reductions,
                     parallel_min_size: config.strictness.parallel_min_size,
                     python_minor: config.python.target_minor(),
+                    freeze_to_frozendict: config.emit.freeze_to_frozendict(),
                 },
             );
             diags.extend(analysis_diags);

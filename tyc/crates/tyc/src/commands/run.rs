@@ -444,22 +444,24 @@ fn run_vm(args: RunArgs) -> Result<()> {
             with_ty: false,
         })?;
     }
-    let code = tyc_vm::run_file_for_target(&entry, &args.script_args, vm_python_minor(&entry))
+    let code = tyc_vm::run_file_with(&entry, &args.script_args, vm_options(&entry))
         .map_err(|e| miette!("{e}"))?;
     std::process::exit(code);
 }
 
-/// The `[python] target` minor version of the project `entry` belongs to
-/// (`13` — the oldest target — for a standalone file), so the VM follows the
-/// same target-dependent runtime behaviour as the compiled program.
-fn vm_python_minor(entry: &std::path::Path) -> u8 {
+/// The runtime-affecting settings of the project `entry` belongs to (the
+/// defaults for a standalone file), so the VM behaves like the compiled
+/// program built from the same `typhon.toml`.
+fn vm_options(entry: &std::path::Path) -> tyc_vm::VmOptions {
     let dir = entry
         .canonicalize()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
     dir.and_then(|d| TyphonConfig::load(&d).ok().flatten())
-        .map(|(_, cfg)| cfg.python.target_minor())
-        .unwrap_or(13)
+        .map(|(_, cfg)| tyc_vm::VmOptions {
+            freeze_to_frozendict: cfg.emit.freeze_to_frozendict(),
+        })
+        .unwrap_or_default()
 }
 
 /// Modules the program imports, and `module.attr` names it reads, that the

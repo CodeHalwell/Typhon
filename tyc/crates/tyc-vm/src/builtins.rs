@@ -1893,7 +1893,7 @@ pub fn install(interp: &mut Interpreter) {
         "__typhon_freeze__",
         Value::Native(Rc::new(NativeFn::new("__typhon_freeze__", |i, args| {
             let v = args.into_iter().next().unwrap_or(Value::None);
-            deep_freeze_value(v, i.python_minor >= 15)
+            deep_freeze_value(v, i.freeze_to_frozendict)
         }))),
     );
 
@@ -3483,7 +3483,7 @@ fn make_typhon_runtime_module(interp: &Interpreter) -> Value {
             "deep_freeze",
             nf("deep_freeze", |i, args| {
                 let v = args.into_iter().next().unwrap_or(Value::None);
-                deep_freeze_value(v, i.python_minor >= 15)
+                deep_freeze_value(v, i.freeze_to_frozendict)
             }),
         )],
     );

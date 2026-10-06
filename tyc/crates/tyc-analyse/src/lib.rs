@@ -160,6 +160,9 @@ pub struct LintOptions {
     /// hands it to the type checker so `frozendict` / `lazy from` gating
     /// matches `tyc check`.
     pub python_minor: u8,
+    /// `[emit] freeze-dict = "frozendict"` — handed to the type checker by
+    /// the language server, as `tyc check` does.
+    pub freeze_to_frozendict: bool,
 }
 
 impl Default for LintOptions {
@@ -178,6 +181,7 @@ impl Default for LintOptions {
             auto_parallel_reductions: false,
             parallel_min_size: 64,
             python_minor: 13,
+            freeze_to_frozendict: false,
         }
     }
 }

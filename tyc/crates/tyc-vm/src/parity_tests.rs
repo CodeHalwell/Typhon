@@ -134,7 +134,13 @@ fn tracebacks(probe: &str) -> Option<(String, String)> {
     let mut vm_err = String::new();
     let code = on_worker(|| {
         let mut sink = |s: &str| vm_err.push_str(s);
-        run_source_reporting(probe, Some(&origin), &[], 13, &mut sink)
+        run_source_reporting(
+            probe,
+            Some(&origin),
+            &[],
+            crate::VmOptions::default(),
+            &mut sink,
+        )
     });
     assert_eq!(code.unwrap(), 1);
     Some((vm_err, py_err))
@@ -169,7 +175,13 @@ main()
     let mut err = String::new();
     let code = on_worker(|| {
         let mut sink = |s: &str| err.push_str(s);
-        run_source_reporting(src, Some(Path::new("tb.ty")), &[], 13, &mut sink)
+        run_source_reporting(
+            src,
+            Some(Path::new("tb.ty")),
+            &[],
+            crate::VmOptions::default(),
+            &mut sink,
+        )
     });
     assert_eq!(code.unwrap(), 1);
     assert_eq!(

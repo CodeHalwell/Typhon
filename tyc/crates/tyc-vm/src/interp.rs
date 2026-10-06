@@ -116,10 +116,10 @@ pub struct Interpreter {
     /// tells the import statement to bind a deferred proxy instead —
     /// `typhon_runtime.lazy.lazy_import` semantics).
     pub lazy_import_aliases: std::collections::HashSet<(String, String)>,
-    /// The `[python] target` minor version (`3.X`) the program is run as.
-    /// A `freeze let` dict is a `frozendict` from 3.15 and a `mappingproxy`
-    /// before it, exactly as the generated `typhon_runtime.freeze` does.
-    pub python_minor: u8,
+    /// `[emit] freeze-dict = "frozendict"`: a `freeze let` dict is a
+    /// `frozendict` (Python 3.15) rather than a `mappingproxy`, exactly as
+    /// the generated `typhon_runtime.freeze` does.
+    pub freeze_to_frozendict: bool,
     /// Names of modules currently being loaded via `try_load_typhon_module`.
     /// Guards against a module that imports itself (directly or through a
     /// cycle) re-entering the loader and overflowing the host stack — e.g.
@@ -291,7 +291,7 @@ impl Interpreter {
             gen_stack: Vec::new(),
             current_module_name: "__main__".to_owned(),
             lazy_import_aliases: std::collections::HashSet::new(),
-            python_minor: 13,
+            freeze_to_frozendict: false,
             loading_modules: std::collections::HashSet::new(),
             method_stack: Vec::new(),
             active_exceptions: Vec::new(),

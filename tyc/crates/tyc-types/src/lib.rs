@@ -3551,6 +3551,8 @@ struct Checker<'a> {
     /// against. Gates builtins that only exist from a given CPython release
     /// (`frozendict` is 3.15+) — see [`CheckOptions`].
     python_minor: u8,
+    /// `[emit] freeze-dict = "frozendict"` — see [`CheckOptions`].
+    freeze_to_frozendict: bool,
     /// Bounds declared on PEP 695 type parameters, keyed by function name.
     /// E.g. `def f[T: Interface](x: T)` populates `{"f": {"T": Class("Interface")}}`.
     /// Checked at call sites via `Checker::check_call_typevar_bounds`.
@@ -4014,6 +4016,7 @@ impl<'a> Checker<'a> {
             sync_spawners: HashMap::new(),
             in_generator: false,
             python_minor: MIN_PYTHON_MINOR,
+            freeze_to_frozendict: false,
             function_type_bounds: HashMap::new(),
             sentinels: HashSet::new(),
             active_typevar_bounds: HashMap::new(),
@@ -7384,6 +7387,10 @@ pub struct CheckOptions {
     /// `tyc::requires_python`, since the emitted Python would raise
     /// `NameError` there.
     pub python_minor: u8,
+    /// `[emit] freeze-dict = "frozendict"`: `freeze let` turns a dict into a
+    /// `frozendict` (typed `frozendict[K, V]`) instead of a `MappingProxyType`
+    /// (typed `Mapping[K, V]`).
+    pub freeze_to_frozendict: bool,
     /// Import roots of the project's declared dependencies. A dependency
     /// that shares a newer stdlib module's name (a PyPI `profiling` on a
     /// 3.13 project) is what the import loads, so it is not gated.
@@ -7394,6 +7401,7 @@ impl Default for CheckOptions {
     fn default() -> Self {
         Self {
             python_minor: MIN_PYTHON_MINOR,
+            freeze_to_frozendict: false,
             dependency_roots: std::sync::Arc::from(Vec::new()),
         }
     }
@@ -7452,6 +7460,7 @@ pub fn check_module_with_options(
     let mut c = Checker::new(path.into(), source, resolved);
     c.module = Some(module);
     c.python_minor = options.python_minor;
+    c.freeze_to_frozendict = options.freeze_to_frozendict;
     c.sentinels = module_sentinels(module);
     // A sentinel's singleton type is a closed, fully-known class with no
     // members: `default + 1` or `default.bit_length()` on an un-narrowed
@@ -12350,7 +12359,7 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
             if let Some(argument) = freeze_call_argument(e) {
                 return frozen_type_for(
                     &c.unwrap_alias(&infer_expr_readonly(c, argument)),
-                    c.python_minor,
+                    c.freeze_to_frozendict,
                 );
             }
             if matches!(call.func.as_ref(), Expr::Name(n) if n.id.as_str() == "super") {
@@ -14597,7 +14606,8 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 init_type = Some(value_type.clone());
                 // A freeze annotation describes the input; the binding carries
                 // the runtime's recursively immutable output shape.
-                let frozen_annotation = frozen_type_for(&c.unwrap_alias(&ann_type), c.python_minor);
+                let frozen_annotation =
+                    frozen_type_for(&c.unwrap_alias(&ann_type), c.freeze_to_frozendict);
                 if freeze_call_argument(value).is_some()
                     || (frozen_annotation != ann_type
                         && c.is_assignable(&frozen_annotation, &value_type)
@@ -20988,14 +20998,14 @@ fn checked_cast_target_supported(c: &Checker, target: &Type) -> bool {
 /// Static output shape of deep_freeze. User instances, including generic
 /// frozen dataclasses, retain their own type and identity.
 pub fn frozen_type(ty: &Type) -> Type {
-    frozen_type_for(ty, MIN_PYTHON_MINOR)
+    frozen_type_for(ty, false)
 }
 
-/// [`frozen_type`] for the `3.<python_minor>` target: from Python 3.15 the
+/// [`frozen_type`] under `[emit] freeze-dict`: with `"frozendict"` the
 /// generated `deep_freeze` turns a `dict` into a `frozendict` (hashable, and
 /// JSON-serialisable) instead of a `MappingProxyType`, so its static shape is
 /// `frozendict[K, V]` rather than the read-only `Mapping[K, V]`.
-pub fn frozen_type_for(ty: &Type, python_minor: u8) -> Type {
+pub fn frozen_type_for(ty: &Type, frozendict: bool) -> Type {
     match ty {
         Type::Generic(head, args)
             if matches!(
@@ -21012,7 +21022,7 @@ pub fn frozen_type_for(ty: &Type, python_minor: u8) -> Type {
         {
             let output = match head.as_str() {
                 "list" => "tuple_variadic",
-                "dict" if python_minor >= 15 => "frozendict",
+                "dict" if frozendict => "frozendict",
                 "dict" => "Mapping",
                 "set" => "frozenset",
                 _ => head,
@@ -21020,14 +21030,14 @@ pub fn frozen_type_for(ty: &Type, python_minor: u8) -> Type {
             Type::Generic(
                 output.into(),
                 args.iter()
-                    .map(|a| frozen_type_for(a, python_minor))
+                    .map(|a| frozen_type_for(a, frozendict))
                     .collect(),
             )
         }
         Type::Union(members) => Type::union_of(
             members
                 .iter()
-                .map(|m| frozen_type_for(m, python_minor))
+                .map(|m| frozen_type_for(m, frozendict))
                 .collect(),
         ),
         _ => ty.clone(),
@@ -21588,7 +21598,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
         Expr::Call(call) => {
             if let Some(argument) = freeze_call_argument(expr) {
                 let input = infer_expr_ctx(c, argument, expected);
-                return frozen_type_for(&c.unwrap_alias(&input), c.python_minor);
+                return frozen_type_for(&c.unwrap_alias(&input), c.freeze_to_frozendict);
             }
             if matches!(call.func.as_ref(), Expr::Name(n) if n.id.as_str() == "super") {
                 let receiver_class = c.current_class.clone().or_else(|| {
@@ -27824,15 +27834,44 @@ def describe(m: Maybe[int]) -> str:
     }
 
     #[test]
-    fn freeze_let_dict_is_a_frozendict_on_315() {
+    fn freeze_let_dict_is_a_frozendict_when_chosen() {
         let src = "freeze let CFG = {\"port\": 8080}\n\
                    let key: set[frozendict[str, int]] = {CFG}\nprint(key)\n";
-        let d = check_for(src, 15);
-        assert!(d.errors().is_empty(), "{:?}", d.errors());
-        // Before 3.15 a frozen dict is a read-only `Mapping`, not a frozendict.
-        let src13 = "from collections.abc import Mapping\nfreeze let CFG = {\"port\": 8080}\n\
-                     let m: Mapping[str, int] = CFG\nprint(m)\n";
-        assert!(check_for(src13, 13).errors().is_empty());
+        let prep = preprocess(src);
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = resolve_module("<test>".to_owned(), &prep.python_source, &module);
+        let checked = check_module_with_options(
+            "<test>",
+            &prep.python_source,
+            &resolved,
+            &module,
+            &prep.unsafe_lines,
+            &prep.frozen_class_lines,
+            &prep.impl_distributed_lines,
+            None,
+            CheckOptions {
+                freeze_to_frozendict: true,
+                ..CheckOptions::for_target(15)
+            },
+        );
+        assert!(
+            checked.diagnostics.errors().is_empty(),
+            "{:?}",
+            checked.diagnostics.errors()
+        );
+        // By default — on every target — a frozen dict is a read-only
+        // `Mapping` (a `MappingProxyType` at runtime), not a frozendict.
+        let mapping = "from collections.abc import Mapping\nfreeze let CFG = {\"port\": 8080}\n\
+                       let m: Mapping[str, int] = CFG\nprint(m)\n";
+        for minor in [13, 15] {
+            assert!(check_for(mapping, minor).errors().is_empty());
+        }
+        assert!(
+            !check_for(src, 15).errors().is_empty(),
+            "a mappingproxy is not hashable"
+        );
     }
 
     // ── PEP 661: `sentinel` (Python 3.15) ───────────────────────────────
@@ -27935,7 +27974,9 @@ def describe(m: Maybe[int]) -> str:
         // A 3.13 project depending on a PyPI `profiling` imports that.
         let src = "import profiling\nprint(profiling)\n";
         let prep = preprocess(src);
-        let module = tyc_syntax::parse_module(&prep.python_source).unwrap().into_syntax();
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
         let (resolved, _) = resolve_module("<test>".to_owned(), &prep.python_source, &module);
         let checked = check_module_with_options(
             "<test>",
@@ -27947,8 +27988,8 @@ def describe(m: Maybe[int]) -> str:
             &[],
             None,
             CheckOptions {
-                python_minor: 13,
                 dependency_roots: std::sync::Arc::from(vec!["profiling".to_owned()]),
+                ..CheckOptions::for_target(13)
             },
         );
         assert_eq!(requires_python_count(&checked.diagnostics), 0);

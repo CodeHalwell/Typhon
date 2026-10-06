@@ -53,20 +53,27 @@ use tyc_syntax::preprocess;
 /// after the script path. Returns the process exit code that `tyc run`
 /// should propagate.
 pub fn run_file(path: &Path, script_args: &[String]) -> Result<i32, VmError> {
-    run_file_for_target(path, script_args, 13)
+    run_file_with(path, script_args, VmOptions::default())
 }
 
-/// [`run_file`] for the project's `[python] target` minor version (`15` for
-/// `"3.15"`). Target-dependent runtime behaviour follows it — a `freeze let`
-/// dict is a `frozendict` from 3.15, a `mappingproxy` before.
-pub fn run_file_for_target(
+/// Project settings that change what a program does at runtime, so the VM
+/// matches the compiled program built from the same `typhon.toml`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VmOptions {
+    /// `[emit] freeze-dict = "frozendict"`: a `freeze let` dict is a Python
+    /// 3.15 `frozendict` rather than a `mappingproxy`.
+    pub freeze_to_frozendict: bool,
+}
+
+/// [`run_file`] with the project's [`VmOptions`].
+pub fn run_file_with(
     path: &Path,
     script_args: &[String],
-    python_minor: u8,
+    options: VmOptions,
 ) -> Result<i32, VmError> {
     let source = std::fs::read_to_string(path)
         .map_err(|e| VmError::Io(format!("cannot read '{}': {e}", path.display())))?;
-    run_source_reporting(&source, Some(path), script_args, python_minor, &mut |tb| {
+    run_source_reporting(&source, Some(path), script_args, options, &mut |tb| {
         eprint!("{tb}")
     })
 }
@@ -78,7 +85,13 @@ pub fn run_source(
     origin: Option<&Path>,
     script_args: &[String],
 ) -> Result<i32, VmError> {
-    run_source_reporting(source, origin, script_args, 13, &mut |tb| eprint!("{tb}"))
+    run_source_reporting(
+        source,
+        origin,
+        script_args,
+        VmOptions::default(),
+        &mut |tb| eprint!("{tb}"),
+    )
 }
 
 /// [`run_source`], handing the rendered traceback of an uncaught exception
@@ -87,7 +100,7 @@ fn run_source_reporting(
     source: &str,
     origin: Option<&Path>,
     script_args: &[String],
-    python_minor: u8,
+    options: VmOptions,
     report: &mut dyn FnMut(&str),
 ) -> Result<i32, VmError> {
     let (mut module, prep) = front_end(source, FrontEnd::Program).map_err(|e| {
@@ -133,7 +146,7 @@ fn run_source_reporting(
     preprocess::attach_method_lookups(&mut module);
 
     let mut interp = Interpreter::new();
-    interp.python_minor = python_minor;
+    interp.freeze_to_frozendict = options.freeze_to_frozendict;
     interp.lazy_import_aliases = prep
         .lazy_imports
         .iter()

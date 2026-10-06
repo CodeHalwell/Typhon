@@ -876,6 +876,7 @@ impl Backend {
                 .unwrap_or_default();
             let check_options = tyc_db::CheckOptions {
                 python_minor: opts.python_minor,
+                freeze_to_frozendict: opts.freeze_to_frozendict,
                 dependency_roots: workspace
                     .as_ref()
                     .map(|(root, _)| {
@@ -2709,6 +2710,13 @@ fn read_lint_options(root: &std::path::Path) -> tyc_analyse::LintOptions {
     {
         opts.python_minor = minor;
     }
+    // `[emit] freeze-dict = "frozendict"` changes `freeze let`'s static type.
+    opts.freeze_to_frozendict = parsed
+        .get("emit")
+        .and_then(|e| e.as_table())
+        .and_then(|t| t.get("freeze-dict"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|v| v.trim() == "frozendict");
     // `[python] free-threaded` gates the parallel advice lints.
     if let Some(b) = parsed
         .get("python")

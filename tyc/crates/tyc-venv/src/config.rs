@@ -125,6 +125,13 @@ pub struct EmitConfig {
     /// dependency-free.
     #[serde(default, rename = "traceback-remap")]
     pub traceback_remap: bool,
+    /// What a `freeze let` turns a dict into: `"mappingproxy"` (the default,
+    /// a read-only `types.MappingProxyType` view) or `"frozendict"` (Python
+    /// 3.15's PEP 814 builtin — hashable and JSON-serialisable; needs a
+    /// `[python] target` of `"3.15"` or newer). Opt-in, because the two
+    /// differ observably (`str`, `.copy()`, `type()`).
+    #[serde(default = "default_freeze_dict", rename = "freeze-dict")]
+    pub freeze_dict: String,
 }
 
 impl Default for EmitConfig {
@@ -135,9 +142,25 @@ impl Default for EmitConfig {
             skip_decoration_bases: Vec::new(),
             model_extra: "forbid".into(),
             traceback_remap: false,
+            freeze_dict: default_freeze_dict(),
         }
     }
 }
+
+impl EmitConfig {
+    /// `[emit] freeze-dict = "frozendict"`: `freeze let` freezes a dict to a
+    /// `frozendict`.
+    pub fn freeze_to_frozendict(&self) -> bool {
+        self.freeze_dict.trim() == "frozendict"
+    }
+}
+
+fn default_freeze_dict() -> String {
+    "mappingproxy".into()
+}
+
+/// Accepted values for `[emit] freeze-dict`.
+pub const ALLOWED_FREEZE_DICTS: &[&str] = &["mappingproxy", "frozendict"];
 
 /// Accepted values for `[emit] class-default`. Anything else is rejected by
 /// [`TyphonConfig::validate`] — including the empty string and historical
@@ -539,6 +562,26 @@ impl TyphonConfig {
                 allowed: ALLOWED_MODEL_EXTRAS.join(", "),
             });
         }
+        // `[emit] freeze-dict`: an allowed value, and `"frozendict"` only on
+        // a target that has the builtin (Python 3.15, PEP 814).
+        let fd = self.emit.freeze_dict.trim();
+        if !ALLOWED_FREEZE_DICTS.contains(&fd) {
+            return Err(ConfigError::InvalidFreezeDict {
+                path: source_path.to_string_lossy().into_owned(),
+                value: self.emit.freeze_dict.clone(),
+                reason: format!("allowed values are {}", ALLOWED_FREEZE_DICTS.join(", ")),
+            });
+        }
+        if fd == "frozendict" && (major, minor) < (3, 15) {
+            return Err(ConfigError::InvalidFreezeDict {
+                path: source_path.to_string_lossy().into_owned(),
+                value: self.emit.freeze_dict.clone(),
+                reason: format!(
+                    "`frozendict` is new in Python 3.15 (PEP 814) and `[python] target` is \
+                     \"{raw}\"; set `target = \"3.15\"` or newer, or keep `\"mappingproxy\"`"
+                ),
+            });
+        }
         // Reject an unknown `[strictness]` severity string. These take
         // `"off"` / `"warn"` / `"error"`; a typo (`"eror"`) or wrong case
         // (`"WARN"`) used to be silently ignored, reverting to the default —
@@ -754,6 +797,13 @@ pub enum ConfigError {
         value: String,
         allowed: String,
     },
+    /// `[emit] freeze-dict` is outside [`ALLOWED_FREEZE_DICTS`], or is
+    /// `"frozendict"` on a target before Python 3.15.
+    InvalidFreezeDict {
+        path: String,
+        value: String,
+        reason: String,
+    },
     InvalidSeverity {
         path: String,
         key: String,
@@ -799,6 +849,7 @@ impl ConfigError {
             ConfigError::UnsupportedPythonTarget { .. } => Some("target"),
             ConfigError::InvalidClassDefault { .. } => Some("class-default"),
             ConfigError::InvalidModelExtra { .. } => Some("model-extra"),
+            ConfigError::InvalidFreezeDict { .. } => Some("freeze-dict"),
             ConfigError::InvalidSeverity { key, .. } => Some(key),
             ConfigError::InvalidChecker { .. } => Some("external"),
             ConfigError::InvalidOptimiseLevel { .. } => Some("level"),
@@ -845,6 +896,16 @@ impl std::fmt::Display for ConfigError {
                 write!(
                     f,
                     "invalid `[emit] model-extra = \"{value}\"` in '{path}': allowed values are {allowed}",
+                )
+            }
+            ConfigError::InvalidFreezeDict {
+                path,
+                value,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "invalid `[emit] freeze-dict = \"{value}\"` in '{path}': {reason}",
                 )
             }
             ConfigError::InvalidSeverity {
@@ -1148,6 +1209,41 @@ skip-decoration-bases = [\"BaseModel\", \"Enum\"]
         assert_eq!(parse_python_target(""), None);
         assert_eq!(parse_python_target("3"), None);
         assert_eq!(parse_python_target("abc"), None);
+    }
+
+    #[test]
+    fn target_minor_reads_the_minor_version() {
+        for (target, minor) in [("3.13", 13), ("3.14t", 14), ("3.15", 15), ("3.15.1", 15)] {
+            let cfg = PythonConfig {
+                target: target.to_owned(),
+                free_threaded: false,
+            };
+            assert_eq!(cfg.target_minor(), minor, "{target}");
+        }
+    }
+
+    // ── freeze-dict tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn freeze_dict_defaults_to_mappingproxy_and_frozendict_needs_315() {
+        let path = Path::new("typhon.toml");
+        let mut cfg = TyphonConfig::default();
+        assert!(!cfg.emit.freeze_to_frozendict());
+        cfg.emit.freeze_dict = "frozendict".to_owned();
+        for (target, ok) in [
+            ("3.13", false),
+            ("3.14t", false),
+            ("3.15", true),
+            ("3.15t", true),
+        ] {
+            cfg.python.target = target.to_owned();
+            assert_eq!(cfg.validate(path).is_ok(), ok, "{target}");
+        }
+        cfg.emit.freeze_dict = "frozenset".to_owned();
+        assert!(matches!(
+            cfg.validate(path),
+            Err(ConfigError::InvalidFreezeDict { .. })
+        ));
     }
 
     // ── model-extra tests ─────────────────────────────────────────────────

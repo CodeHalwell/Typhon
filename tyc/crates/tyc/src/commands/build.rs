@@ -164,6 +164,14 @@ pub fn run(args: BuildArgs) -> Result<()> {
             let err = TycError::invalid_config_value("checker.external", value, allowed, path);
             return Err(miette::Report::new_boxed(Box::new(err)));
         }
+        Err(crate::config::ConfigError::InvalidFreezeDict {
+            path,
+            value,
+            reason,
+        }) => {
+            let err = TycError::invalid_config_value("emit.freeze-dict", value, reason, path);
+            return Err(miette::Report::new_boxed(Box::new(err)));
+        }
         Err(crate::config::ConfigError::InvalidOptimiseLevel { path, value }) => {
             let err = TycError::invalid_config_value(
                 "optimise.level",
@@ -488,6 +496,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             &project_shapes,
             CheckOptions {
                 python_minor: config.python.target_minor(),
+                freeze_to_frozendict: config.emit.freeze_to_frozendict(),
                 dependency_roots: crate::commands::check::dependency_import_roots(
                     &config
                         .dependencies
@@ -3408,7 +3417,7 @@ fn generated_runtime_files(config: &TyphonConfig) -> Vec<(&'static str, String)>
         ("parallel.py", parallel_py),
         (
             "freeze.py",
-            typhon_runtime_freeze_py(config.python.target_minor()),
+            typhon_runtime_freeze_py(config.emit.freeze_to_frozendict()),
         ),
         ("cast.py", TYPHON_RUNTIME_CAST_PY.to_owned()),
         ("traceback.py", TYPHON_RUNTIME_TRACEBACK_PY.to_owned()),
@@ -4159,14 +4168,15 @@ def unwrap_or_else(r: object, f: Callable[[_E], _T]) -> _T:
 /// CPython (3.13t+) escapes the GIL entirely and yields linear scaling
 /// for CPU-bound `fn`s.  On stock CPython the workers still serialise on
 /// the GIL — correctness is preserved, only the speedup is lost.
-/// `typhon_runtime/freeze.py` for the `3.<python_minor>` target.
+/// `typhon_runtime/freeze.py`.
 ///
-/// From Python 3.15 a frozen `dict` becomes a `frozendict` (PEP 814) rather
-/// than a `MappingProxyType`: it is hashable — so a `freeze let` value can be
-/// a dict key, a set member or a `@memo` argument — and `json.dumps` accepts
-/// it. Older targets get the `MappingProxyType` helper byte-for-byte.
-fn typhon_runtime_freeze_py(python_minor: u8) -> String {
-    if python_minor < 15 {
+/// With `[emit] freeze-dict = "frozendict"` (a Python 3.15+ target) a frozen
+/// `dict` becomes a `frozendict` (PEP 814) rather than a `MappingProxyType`:
+/// it is hashable — so a `freeze let` value can be a dict key, a set member
+/// or a `@memo` argument — and `json.dumps` accepts it. The default keeps the
+/// `MappingProxyType` helper byte-for-byte.
+fn typhon_runtime_freeze_py(frozendict: bool) -> String {
+    if !frozendict {
         return TYPHON_RUNTIME_FREEZE_PY.to_owned();
     }
     let mut out = TYPHON_RUNTIME_FREEZE_PY.to_owned();
@@ -4825,11 +4835,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn freeze_py_is_mappingproxy_before_315_and_frozendict_from_315() {
-        // 3.13 / 3.14 runtimes are byte-for-byte the historical helper.
-        assert_eq!(typhon_runtime_freeze_py(13), TYPHON_RUNTIME_FREEZE_PY);
-        assert_eq!(typhon_runtime_freeze_py(14), TYPHON_RUNTIME_FREEZE_PY);
-        let py315 = typhon_runtime_freeze_py(15);
+    fn freeze_py_is_mappingproxy_unless_frozendict_is_chosen() {
+        // The default runtime is byte-for-byte the historical helper.
+        assert_eq!(typhon_runtime_freeze_py(false), TYPHON_RUNTIME_FREEZE_PY);
+        let py315 = typhon_runtime_freeze_py(true);
         assert!(py315.contains("return frozendict({k: _deep_freeze(v, seen)"));
         assert!(!py315.contains("return MappingProxyType("));
         assert!(py315.contains("isinstance(value, (frozendict, MappingProxyType))"));

@@ -562,7 +562,8 @@ The same pass watches every *ordinary* local of a function — a name the body b
 ## Lazy loading
 
 - `lazy import np = numpy` → defers module loading until first attribute access. On a **3.13 / 3.14 target** this lowers to a call to the generated `typhon_runtime.lazy.lazy_import` helper (which wraps the stdlib `importlib.util.LazyLoader`). On a **3.15+ target** it lowers to native [PEP 810](https://peps.python.org/pep-0810/) syntax instead — see below.
-- `lazy from foo import a, b` is **rejected** at parse time: PEP 690 notes that `from`-imports eagerly touch attributes on the source module and therefore defeat deferral. Use `lazy import foo` and access `foo.a` / `foo.b`. (Note: PEP 810 permits a `lazy from … import` form upstream, but Typhon keeps the single `lazy import ALIAS = MODULE` surface for now — supporting the `from` form is a future surface decision.)
+- PEP 810's own spellings — `lazy import numpy` and `lazy import numpy as np` — are accepted on every target and lower exactly like `lazy import np = numpy`. `tyc fmt` keeps whichever spelling you wrote.
+- `lazy from foo import a, b` binds each *name* to a deferred object, which needs the lazy proxy CPython 3.15 provides natively. It is accepted on a **3.15+ target** (at module top level — PEP 810 forbids lazy imports inside functions, classes and `try` blocks, as well as `lazy from … import *` and `lazy from __future__`) and emitted as written. On 3.13 / 3.14 it is rejected with `tyc::lazy_usage`, which names the target; use `lazy import foo = foo` and access `foo.a` / `foo.b` there.
 - `lazy let` module-level bindings → cached getter with a sentinel + lock helper in `typhon_runtime` (not `functools.cached_property`, which is instance-scoped, race-prone, and writable after first evaluation). The proxy forwards attribute access, calls, indexing, iteration, `len`, truthiness, equality, hashing, every arithmetic / bitwise / comparison operator, `divmod`, `round`, `math.trunc` / `floor` / `ceil`, `int` / `float` / `complex` / `operator.index`, `format` (so `f"{RATE:.2f}"` works), `in`, `reversed` and the context-manager protocol, so a lazily-computed primitive is transparent in ordinary expressions.
 - `lazy let` instance-level bindings on effectively immutable classes → `functools.cached_property`.
 - `lazy[list[T]]` return types → generator functions instead of materialised lists.
@@ -583,7 +584,98 @@ np = __typhon_lazy_import("numpy")
 lazy import numpy as np
 ```
 
+`lazy from json import dumps` is emitted verbatim on the same targets.
+
 A project whose only runtime-touching feature was `lazy import` therefore ships **no** generated `typhon_runtime/` package on a 3.15+ target. The change is `tyc build`-only and only on 3.15+ — 3.13 / 3.14 output is byte-for-byte unchanged, and `tyc check` / `tyc run` are unaffected. (If `[checker] external = "ty"` is enabled, run it with a PEP 810-aware `ty`; an older `ty` build will reject the native `lazy import` syntax in the emitted Python.)
+
+## Python 3.15 features
+
+Typhon tracks the project's `[python] target` (see `docs/configuration.md`)
+and adopts what each CPython release adds. Python 3.15 brings these to
+Typhon source:
+
+| Feature | On a 3.15+ target | On 3.13 / 3.14 |
+|---|---|---|
+| [PEP 798](https://peps.python.org/pep-0798/) unpacking in comprehensions: `[*xs for xs in groups]`, `{*xs for …}`, `(*xs for …)`, `{**m for m in maps}` | emitted natively | rewritten to the equivalent nested comprehension (`[x for xs in groups for x in xs]`, `{k: v for m in maps for k, v in m.items()}`) |
+| [PEP 810](https://peps.python.org/pep-0810/) lazy imports: `lazy import m`, `lazy from m import n` | native `lazy` statements | `lazy import` via the runtime helper; `lazy from` is `tyc::lazy_usage` |
+| [PEP 814](https://peps.python.org/pep-0814/) `frozendict` | builtin, typed as a read-only hashable `frozendict[K, V]`; `freeze let` freezes dicts to it | `tyc::requires_python` |
+| [PEP 661](https://peps.python.org/pep-0661/) `sentinel` | builtin; a module-level `NAME = sentinel("NAME")` has its own type | `tyc::requires_python` |
+| [PEP 747](https://peps.python.org/pep-0747/) `TypeForm[T]` | a `TypeForm[T]` parameter binds `T` from a type-expression argument | `tyc::requires_python` on the import |
+| Unary `+` literal patterns: `case +1:`, `case 1 - +2j:` | emitted natively | the `+` is dropped |
+
+Everything is checked and run by the VM on every target; only the lowering
+changes. Using a 3.15 builtin or stdlib API on an older target is
+`tyc::requires_python` (the emitted Python would raise `NameError` or
+`ImportError` there), and an API the target *removed* (`sre_compile`,
+`NamedTuple("P", x=int)`, `ast.Num` …) is `tyc::removed_in_python`.
+
+### Unpacking in comprehensions (PEP 798)
+
+```python
+def flatten(groups: list[list[int]]) -> list[int]:
+    return [*g for g in groups]              # list[int]
+
+def merge(layers: list[dict[str, int]]) -> dict[str, int]:
+    return {**layer for layer in layers}     # later layers win
+```
+
+The element type of `[*xs for …]` is the iterable's element type; `{**m for
+…}` takes the mapping's key and value types. Unpacking a value that is not
+iterable (`[*n for …]` with `n: int`) or not a mapping is a type error.
+
+### `frozendict` (PEP 814)
+
+```python
+let defaults: frozendict[str, int] = frozendict(retries=3, timeout=30)
+let overridden = defaults | {"retries": 5}        # still a frozendict
+let cache: dict[frozendict[str, int], str] = {defaults: "ok"}   # hashable
+```
+
+`frozendict[K, V]` is a `Mapping[K, V]` (covariant in `V`), hashable when its
+values are, and has no mutators: `fd[k] = v`, `del fd[k]` and `fd.update(…)`
+are reported. On a 3.15+ target `freeze let` freezes a dict to a `frozendict`
+instead of a `MappingProxyType`, so a frozen config can be a dict key, a set
+member or an argument to a `@memo` function, and `json.dumps` accepts it:
+
+```python
+freeze let CONFIG = {"port": 8080, "hosts": ["a", "b"]}
+# 3.15+: frozendict({'port': 8080, 'hosts': ('a', 'b')})
+# 3.13 / 3.14: mappingproxy({'port': 8080, 'hosts': ('a', 'b')})
+```
+
+### Sentinels (PEP 661)
+
+```python
+MISSING = sentinel("MISSING")
+
+def get(table: dict[str, int], key: str, default: int | MISSING = MISSING) -> int:
+    let found: int? = table.get(key)
+    if found is not None:
+        return found
+    if default is MISSING:
+        raise KeyError(key)
+    return default                         # narrowed to int
+```
+
+A module-level `NAME = sentinel("NAME")` gives `NAME` its own singleton type,
+distinct from `None`, so "argument not supplied" and "explicitly `None`" stay
+apart. `is NAME` / `is not NAME` narrow; using an un-narrowed `int | MISSING`
+as an `int` (arithmetic, attribute access, assignment) is reported.
+
+### `TypeForm[T]` (PEP 747)
+
+```python
+from typing import TypeForm, cast
+
+def load[T](form: TypeForm[T], raw: object) -> T:
+    return cast(form, raw)
+
+let counts: dict[str, int] = load(dict[str, int], data)   # T = dict[str, int]
+let maybe: int? = load(int | None, value)
+```
+
+An argument passed to a `TypeForm[T]` parameter is read as a type expression,
+so the call's return type follows it. `TypeForm` is covariant.
 
 ## Stubs and Python interop
 
@@ -828,7 +920,8 @@ surface; it does not inspect the internals of an instance.
 
 A `freeze let` annotation describes the input value. The binding uses the
 runtime's recursively frozen shape: `list[T]` becomes `tuple[T, ...]`,
-`dict[K, V]` becomes `Mapping[K, V]`, and `set[T]` becomes `frozenset[T]`.
+`dict[K, V]` becomes `Mapping[K, V]` (`frozendict[K, V]` on a 3.15+ target —
+see below), and `set[T]` becomes `frozenset[T]`.
 Nested container elements are frozen too. Read operations remain available;
 container mutation and list concatenation on a frozen tuple are rejected. A
 new binding receiving a frozen value retains its frozen shape. An immutable
