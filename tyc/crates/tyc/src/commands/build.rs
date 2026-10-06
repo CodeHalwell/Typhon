@@ -4156,6 +4156,7 @@ const TYPHON_RUNTIME_FREEZE_PY: &str = "\
 \"\"\"Deep-freeze helper backing Typhon's `freeze let` keyword.\"\"\"
 from __future__ import annotations
 
+import builtins as _builtins
 import datetime as _datetime
 import decimal as _decimal
 import enum as _enum
@@ -4194,8 +4195,15 @@ _FROZEN_PRIMITIVES = (
     _types.BuiltinFunctionType,
 )
 
+# Python 3.15's builtin `frozendict` (PEP 814) is immutable but holds
+# arbitrary values, so it is descended into like `MappingProxyType`. On
+# 3.13 / 3.14 the name does not exist and this stays `None`.
+_frozendict = getattr(_builtins, \"frozendict\", None)
+
 # Containers that are already immutable at runtime — pass through unchanged.
-_FROZEN_CONTAINERS = (tuple, frozenset, MappingProxyType, range, bytes)
+_FROZEN_CONTAINERS = (tuple, frozenset, MappingProxyType, range, bytes) + (
+    (_frozendict,) if _frozendict is not None else ()
+)
 
 
 def deep_freeze(value: Any) -> Any:
@@ -4247,6 +4255,12 @@ def _deep_freeze(value: Any, seen: set[int]) -> Any:
             seen.add(value_id)
             try:
                 return MappingProxyType({k: _deep_freeze(v, seen) for k, v in value.items()})
+            finally:
+                seen.discard(value_id)
+        if _frozendict is not None and isinstance(value, _frozendict):
+            seen.add(value_id)
+            try:
+                return _frozendict({k: _deep_freeze(v, seen) for k, v in value.items()})
             finally:
                 seen.discard(value_id)
         return value

@@ -45,7 +45,14 @@
 #   stderr-contains.txt   substrings required in CPython stderr
 #   typhon-profile.json   committed profile data (pgo-memoise)
 #   meta.conf             run=both|none, expect-exit=N, vm-diverges=yes,
-#                         requires-module=NAME
+#                         requires-module=NAME, min-python=3.N
+#
+# `min-python` marks a fixture whose emitted Python uses syntax or stdlib only
+# a newer CPython has (e.g. the PEP 810 lowering needs 3.15). Under an older
+# interpreter its execution half is skipped *by design* and reported as such;
+# that is not a reduction, because the CI job running that interpreter's
+# leg is where it executes. Run the matrix with PYTHON313=python3.15 to cover
+# those fixtures.
 # In a marker file, a literal `\n` is expanded to a real newline so one marker
 # can span source lines.
 #
@@ -165,6 +172,17 @@ for name in "${NAMES[@]}"; do
     vm_diverges="$(meta "$fx" vm-diverges no)"
     needs_mod="$(meta "$fx" requires-module "")"
     reduced=""
+    reduced_by_design=""
+
+    # A fixture whose emitted Python needs a newer CPython than the one under
+    # test is build-only here by design; a newer-interpreter leg executes it.
+    min_py="$(meta "$fx" min-python "")"
+    if [ -n "$min_py" ] && [ "$run_mode" != "none" ]; then
+        if ! "$PYTHON313" -c "import sys; sys.exit(sys.version_info[:2] < tuple(map(int, '$min_py'.split('.'))))" >/dev/null 2>&1; then
+            run_mode="none"
+            reduced_by_design=": needs Python $min_py+"
+        fi
+    fi
 
     # A fixture may need a third-party module to *execute* (its codegen half
     # never does). Rather than skip silently — a skip nothing observes reads as
@@ -219,7 +237,7 @@ for name in "${NAMES[@]}"; do
 
     if [ "$run_mode" = "none" ]; then
         if [ -z "$problems" ]; then
-            echo "ok (build-only)${reduced}"; PASS=$((PASS+1))
+            echo "ok (build-only${reduced_by_design})${reduced}"; PASS=$((PASS+1))
             [ -n "$reduced" ] && REDUCED_NAMES+=("$name")
         else echo "FAIL"; FAIL=$((FAIL+1)); FAILED_NAMES+=("$name"); fi
         continue

@@ -61,8 +61,9 @@ host language to support it.
 - **Primitives** — `int`, `float`, `bool`, `str`, `bytes`, `None`,
   `complex` (already immutable, passed through)
 - **Already-immutable containers** — `tuple`, `frozenset`,
-  `MappingProxyType`, `range`, `bytes` (descended into for nested
-  values where applicable)
+  `MappingProxyType`, `range`, `bytes`, and on CPython 3.15+ the
+  builtin `frozendict` (descended into for nested values where
+  applicable)
 - **Mutable containers** — `list → tuple`, `dict →
   MappingProxyType`, `set → frozenset` (recursively)
 - **Frozen dataclasses** — passed through unchanged (their

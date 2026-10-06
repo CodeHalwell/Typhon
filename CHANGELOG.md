@@ -4,6 +4,41 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## Unreleased — Python 3.15 support
+
+CPython 3.15 joins 3.13 in CI as an interpreter for emitted code. The
+minimum supported version and the default `[python] target` stay at 3.13,
+so no emitted program changes. No language change.
+
+### Fixed
+
+- **`deep_freeze` accepts a 3.15 `frozendict`.** `freeze let` over a value
+  holding PEP 814's builtin `frozendict` raised `TypeError` ("cannot freeze
+  frozendict") on CPython 3.15. The generated `typhon_runtime/freeze.py`
+  now treats it like `MappingProxyType`: it stays a `frozendict` and its
+  values are frozen. On 3.13 and 3.14 the runtime is unchanged in
+  behaviour.
+- **`tyc repl` finds `python3.14` and `python3.15`.** Interpreter discovery
+  tried only `python3.13`, `python3.12` and `python3`, so a machine with
+  only a newer versioned interpreter fell through to whatever `python3`
+  was.
+
+### Testing / CI
+
+- Two new jobs run existing gates under CPython 3.15:
+  `differential-py315` (the VM ↔ CPython differential over `examples/`,
+  `stress/` and `corpus/valid/`) and `knob-matrix-py315` (the opt-in knob
+  matrix). Every unit that ran on 3.13 still runs on 3.15. Eight stress
+  units print differently because CPython itself changed (3.14/3.15 error
+  message wording, compensated `sum` over mixed int/float, pathlib treating
+  a trailing `.` as a suffix); the VM keeps 3.13's behaviour and those units
+  are listed in the new `scripts/differential-baseline-py315.txt`, which
+  `scripts/vm-differential.sh --extra-baseline` unions with the main
+  baseline.
+- The PEP 810 knob fixture now executes. `scripts/knob-matrix.sh` gains a
+  `min-python=3.N` fixture key: below that interpreter a fixture is
+  build-only by design, and the 3.15 leg runs it under CPython and the VM.
+
 ## 1.0.0-beta.2 — 2026-10-04 — first published beta: Windows build fix
 
 The first beta with published binaries: 1.0.0-beta.1 plus one build fix.
