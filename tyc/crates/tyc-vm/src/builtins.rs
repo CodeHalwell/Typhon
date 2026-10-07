@@ -6082,11 +6082,13 @@ fn make_sys_module(interp: &Interpreter) -> Value {
             ("stderr", make_std_stream("sys.stderr", true)),
             ("stdin", make_stdin_stream()),
             ("maxsize", Value::Int(VmInt::from(i64::MAX))),
+            // The project's `[python] target`, so `sys.version_info >=
+            // (3, 15)` guards take the branch the target interpreter would.
             (
                 "version_info",
                 Value::Tuple(Rc::new(vec![
-                    Value::Int(VmInt::from(3)),
-                    Value::Int(VmInt::from(13)),
+                    Value::Int(VmInt::from(crate::python_target().0)),
+                    Value::Int(VmInt::from(crate::python_target().1)),
                     Value::Int(VmInt::from(0)),
                     Value::Str(Rc::new("final".to_owned())),
                     Value::Int(VmInt::from(0)),

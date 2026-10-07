@@ -75,6 +75,13 @@ run.
 - **`{**d for d in ds}` emitted a set comprehension.** The printer dropped
   the `**` of a keyless dict comprehension, so the 3.15 build wrote
   `{d for d in ds}` and failed at runtime with "unhashable type: 'dict'".
+- **`tyc run` follows `[python] target`.** The VM reported
+  `sys.version_info` as 3.13 whatever the target, so a
+  `sys.version_info >= (3, 15)` guard took a different branch under
+  `tyc run` than on the 3.15 interpreter a 3.15-target build runs on. It
+  now reports the target's version, and on a 3.15 target
+  `PurePath.is_reserved()` (removed in 3.15) raises `AttributeError` as it
+  does in CPython. 3.13-target programs see no change.
 - **The VM accepts `TypedDict` class keywords.** `class T(TypedDict,
   total=False)`, and 3.15's `closed=` / `extra_items=`, raised
   "`__init_subclass__()` takes no keyword arguments" under `tyc run`; the
