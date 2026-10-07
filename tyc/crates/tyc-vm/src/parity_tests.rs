@@ -655,6 +655,19 @@ plain class Kept:
     del a
     del (b, c)
 show(hasattr(Kept, "a"), hasattr(Kept, "b"), hasattr(Kept, "c"))
+plain class Gone:
+    def f(self) -> int:
+        return 1
+    del f
+    @property
+    def p(self) -> int:
+        return 1
+    del p
+    @classmethod
+    def k(cls) -> int:
+        return 1
+    del k
+show(hasattr(Gone, "f"), hasattr(Gone, "p"), hasattr(Gone, "k"), hasattr(Gone(), "p"))
 def nested() -> object:
     x = 1
     def mid() -> object:
@@ -750,6 +763,11 @@ async def odd() -> None:
     async for x in ListAiter():
         show("list", x)
 trap("aiter list", lambda: asyncio.run(odd()))
+async def over(it: object) -> None:
+    async for x in it:
+        show(x)
+for it in ([1], (1,), "a", b"a", {1: 2}, {1}, range(1), frozenset({1})):
+    trap("sync iterable", lambda: asyncio.run(over(it)))
 "#,
     );
 }

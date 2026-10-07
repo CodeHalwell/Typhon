@@ -23,7 +23,7 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 - **`del` under `tyc run`.** `del (a, b)` and `del [xs[0], d["k"]]` work
   instead of raising `NotImplementedError`; `del` honours `global` and
   `nonlocal` declarations; `del` in a class body unbinds the class
-  attribute; and deleting an unbound name raises `NameError` (module or
+  attribute (a deleted method or property included); and deleting an unbound name raises `NameError` (module or
   class scope) or `UnboundLocalError` (function scope) as CPython does,
   where the VM used to do nothing.
 - **`bytes.translate` and `bytes.maketrans` under `tyc run`.** Both were
@@ -35,7 +35,9 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   source hit the 1,000,000-item cap even when the loop `break`s. Each
   `__anext__` now runs just before the body that consumes its item, and a
   plain `for` or `list()` over such an object raises CPython's
-  `TypeError` instead of driving `__anext__`.
+  `TypeError` instead of driving `__anext__`. `async for` over a list,
+  tuple, string, dict, set or range raises CPython's `TypeError` too,
+  where the VM iterated it.
 - **`tyc run` no longer runs a generator early without saying so.** A
   generator (or generator lambda) whose `yield` the VM cannot suspend (in
   a loop test, a `with` item, or two in one expression) ran its whole body at the call, so its
@@ -52,7 +54,7 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   Mixin)`, `class ML(list)`, `class Meta(type)`).
 - **`tyc run` sends more programs it cannot run faithfully to CPython.**
   A class with a custom `metaclass=` (anything but the real `ABCMeta` or
-  `type`), a class defining or assigning `__del__`, and any use of `with_traceback` / `__traceback__`
+  `type`, including `abc.ABCMeta` after the program reassigns it), a class defining or assigning `__del__`, and any use of `with_traceback` / `__traceback__`
   now take the compiled path with a `note:`. Before, the VM silently
   skipped the metaclass and the finaliser, and raised `AttributeError` for
   the traceback attributes.

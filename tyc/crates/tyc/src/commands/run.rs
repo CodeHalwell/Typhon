@@ -675,6 +675,10 @@ fn unmodelled_attribute_references(
         .metaclass_roots
         .iter()
         .any(|root| scan.program_bound.contains(root))
+        || scan
+            .metaclass_attrs
+            .iter()
+            .any(|attr| scan.stored_attributes.contains(attr))
     {
         missing.insert("a custom metaclass".to_owned());
     }
@@ -811,6 +815,12 @@ struct AttributeScan {
     /// spelling (`abc` for `abc.ABCMeta`): modelled only while the program
     /// does not bind that name itself.
     metaclass_roots: Vec<String>,
+    /// The attribute each dotted metaclass spelling selects (`ABCMeta` for
+    /// `abc.ABCMeta`): modelled only while no attribute of that name is
+    /// ever stored or deleted (`abc.ABCMeta = Custom`).
+    metaclass_attrs: Vec<String>,
+    /// Every attribute name the program stores or deletes.
+    stored_attributes: std::collections::HashSet<String>,
 }
 
 /// What a keyword-passing call calls, as far as the syntax tells.
@@ -1060,6 +1070,9 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                         if let Some(root) = expr_root_name(&kw.value) {
                             self.metaclass_roots.push(root.to_owned());
                         }
+                        if let ruff_python_ast::Expr::Attribute(a) = &kw.value {
+                            self.metaclass_attrs.push(a.attr.as_str().to_owned());
+                        }
                     } else {
                         custom_metaclass = true;
                     }
@@ -1103,6 +1116,7 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                     if matches!(a.ctx, ExprContext::Load) {
                         self.loads.push((root, chain, at));
                     } else {
+                        self.stored_attributes.insert(a.attr.as_str().to_owned());
                         // `mod.x = …` / `del mod.x`: every prefix the store
                         // touches is the program's own.
                         let mut path = root;
@@ -1450,6 +1464,10 @@ mod tests {
             scan_source(own),
             Some(vec!["a custom metaclass".to_owned()])
         );
+        let patched = "import abc\nplain class Custom(type):\n    pass\nabc.ABCMeta = Custom\nplain class W(metaclass=abc.ABCMeta):\n    pass\nprint(W())\n";
+        assert!(scan_source(patched)
+            .unwrap_or_default()
+            .contains(&"a custom metaclass".to_owned()));
         let fin =
             "plain class D:\n    def __del__(self) -> None:\n        print(\"bye\")\nprint(D())\n";
         assert_eq!(

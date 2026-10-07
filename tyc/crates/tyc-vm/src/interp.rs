@@ -1211,6 +1211,9 @@ impl Interpreter {
             None => {
                 let iterable = self.eval_expr(&s.iter, env)?;
                 let generator = as_generator(&iterable);
+                if s.is_async {
+                    reject_sync_only_async_iterable(&iterable)?;
+                }
                 self.async_iteration = s.is_async;
                 let iter = self.make_iter(iterable);
                 self.async_iteration = false;
@@ -2012,18 +2015,26 @@ impl Interpreter {
                 // `NameError`, as in CPython's class namespace.
                 Stmt::Delete(d) => {
                     self.exec_delete(d, &body_ns)?;
-                    fn unbind(t: &Expr, attrs: &mut HashMap<String, Value>) {
+                    fn deleted_names<'e>(t: &'e Expr, out: &mut Vec<&'e str>) {
                         match t {
-                            Expr::Name(n) => {
-                                attrs.remove(n.id.as_str());
-                            }
-                            Expr::Tuple(t) => t.elts.iter().for_each(|e| unbind(e, attrs)),
-                            Expr::List(l) => l.elts.iter().for_each(|e| unbind(e, attrs)),
+                            Expr::Name(n) => out.push(n.id.as_str()),
+                            Expr::Tuple(t) => t.elts.iter().for_each(|e| deleted_names(e, out)),
+                            Expr::List(l) => l.elts.iter().for_each(|e| deleted_names(e, out)),
                             _ => {}
                         }
                     }
-                    for t in &d.targets {
-                        unbind(t, &mut class_attrs);
+                    let mut names = Vec::new();
+                    d.targets.iter().for_each(|t| deleted_names(t, &mut names));
+                    // A deleted `def` takes its method, property and
+                    // classmethod registrations with it.
+                    for name in names {
+                        class_attrs.remove(name);
+                        methods.remove(name);
+                        properties.remove(name);
+                        classmethods.remove(name);
+                        for role in ["cached_prop", "setter", "deleter"] {
+                            class_attrs.remove(&format!("__typhon_{role}__{name}"));
+                        }
                     }
                 }
                 Stmt::Pass(_) => {}
@@ -11984,6 +11995,27 @@ fn resume_mismatch(frame: &ResumeFrame) -> Unwind {
 }
 
 /// The lazy generator behind an iterator value, if it is one.
+/// `async for` over a builtin synchronous container is CPython's
+/// `TypeError`: none of them defines `__aiter__`.
+fn reject_sync_only_async_iterable(v: &Value) -> Result<(), Unwind> {
+    if matches!(
+        v,
+        Value::List(_)
+            | Value::Tuple(_)
+            | Value::Str(_)
+            | Value::Bytes(_)
+            | Value::Dict(_)
+            | Value::Set(_)
+            | Value::Range { .. }
+    ) {
+        return Err(type_error(format!(
+            "'async for' requires an object with __aiter__ method, got {}",
+            v.type_display_name()
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn as_generator(v: &Value) -> Option<Rc<RefCell<GeneratorState>>> {
     if let Value::Iter(it) = v {
         if let IterState::Generator(g) = &*it.borrow() {
