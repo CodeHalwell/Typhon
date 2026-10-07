@@ -1740,6 +1740,12 @@ pub struct NativeFn {
     /// CPython's `TypeError`, and only a coroutine, a task, or a flagged
     /// native's result gets through.
     pub awaitable: bool,
+    /// The native stands in for a Python *function* — the wrapper a
+    /// decorator such as `@contextmanager` or `@functools.cache` returns.
+    /// Stored on a class and read through an instance, it binds that
+    /// instance as its first argument, as CPython's function descriptor
+    /// does. Other natives model C builtins, which do not bind.
+    pub method_like: bool,
 }
 
 impl NativeFn {
@@ -1751,6 +1757,7 @@ impl NativeFn {
             name,
             func: Box::new(f),
             awaitable: false,
+            method_like: false,
         }
     }
 
@@ -1764,7 +1771,41 @@ impl NativeFn {
             name,
             func: Box::new(f),
             awaitable: true,
+            method_like: false,
         }
+    }
+
+    /// A native that binds like a Python function — see
+    /// [`NativeFn::method_like`].
+    pub fn new_method_like<F>(name: &'static str, f: F) -> Self
+    where
+        F: Fn(&mut crate::interp::Interpreter, Vec<Value>) -> Result<Value, Unwind> + 'static,
+    {
+        NativeFn {
+            name,
+            func: Box::new(f),
+            awaitable: false,
+            method_like: true,
+        }
+    }
+
+    /// `native` with `receiver` bound as its first argument — the method
+    /// object a read through an instance makes. With no receiver it is the
+    /// same callable minus the binding behaviour, which is what
+    /// `@staticmethod` makes of a method-like wrapper.
+    pub fn rebind(native: &Rc<NativeFn>, receiver: Option<Value>) -> Value {
+        let inner = native.clone();
+        Value::Native(Rc::new(NativeFn {
+            name: native.name,
+            func: Box::new(move |interp, mut args| {
+                if let Some(r) = &receiver {
+                    args.insert(0, r.clone());
+                }
+                (inner.func)(interp, args)
+            }),
+            awaitable: native.awaitable,
+            method_like: false,
+        }))
     }
 }
 

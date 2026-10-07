@@ -996,19 +996,7 @@ pub fn install(interp: &mut Interpreter) {
         if args.len() != 1 {
             return Err(type_error("type() takes 1 or 3 arguments"));
         }
-        let v = single(&args, "type")?;
-        // Return a real type object so `type(x).__name__`, `str(type(x))`
-        // (→ `<class 'int'>`), and `type(x) == int` / `== SomeClass` all work.
-        // User instances map to their declaring class; builtins map to a
-        // lightweight class object named after the type.
-        Ok(match v {
-            Value::Instance(i) => Value::Class(i.class.clone()),
-            Value::Class(_) => make_builtin_type("type"),
-            // `type(some_exception).__name__` should be the concrete kind
-            // (e.g. `TypeError`), not the generic `Exception`.
-            Value::Exception { kind, .. } => make_builtin_type(kind.as_str()),
-            other => make_builtin_type(other.type_name()),
-        })
+        Ok(type_of(single(&args, "type")?))
     });
 
     native!("issubclass", |i, args| {
@@ -9074,10 +9062,12 @@ fn make_contextlib_module(interp: &mut Interpreter) -> Value {
     // the body up to its `yield` (the yielded value is what `as` binds) and
     // `__exit__` resumes it — throwing the `with` body's exception in at the
     // `yield` when there is one — so setup and teardown run around the block
-    // exactly as under CPython's `contextlib._GeneratorContextManager`.
+    // exactly as under CPython's `contextlib._GeneratorContextManager`. The
+    // factory is a plain function there (`functools.wraps`), so on a class
+    // it binds `self` like the method it decorates.
     let contextmanager = nf("contextmanager", |_i, args| {
         let func = args.into_iter().next().unwrap_or(Value::None);
-        Ok(Value::Native(Rc::new(NativeFn::new(
+        Ok(Value::Native(Rc::new(NativeFn::new_method_like(
             "contextmanager_factory",
             move |i, call_args| {
                 let (pos, kw) = split_kwargs(&call_args);
@@ -9088,7 +9078,7 @@ fn make_contextlib_module(interp: &mut Interpreter) -> Value {
     });
     let asynccontextmanager = nf("asynccontextmanager", |_i, args| {
         let func = args.into_iter().next().unwrap_or(Value::None);
-        Ok(Value::Native(Rc::new(NativeFn::new(
+        Ok(Value::Native(Rc::new(NativeFn::new_method_like(
             "asynccontextmanager_factory",
             move |i, call_args| {
                 let (pos, kw) = split_kwargs(&call_args);
@@ -9794,6 +9784,155 @@ pub(crate) fn method_keyword_params(ty: &str, method: &str) -> Option<KeywordPar
     })
 }
 
+/// How a builtin method takes its positional arguments. CPython words a
+/// wrong count differently for each C calling convention, so a method is
+/// listed under the one it uses.
+#[derive(Clone, Copy)]
+enum MethodArity {
+    /// `METH_NOARGS`: `list.clear() takes no arguments (1 given)`.
+    NoArgs,
+    /// `METH_O`: `list.append() takes exactly one argument (2 given)`.
+    One,
+    /// `_PyArg_CheckPositional` over `min..=max` positions:
+    /// `insert expected 2 arguments, got 1`.
+    Positional(usize, usize),
+    /// Argument Clinic with keyword parameters: `split() takes at most 2
+    /// arguments (3 given)`. With keyword-only parameters the message says
+    /// "positional" (`to_bytes`, `sort`).
+    Clinic {
+        min: usize,
+        max: usize,
+        kw_only: bool,
+    },
+}
+
+/// The positional arity of the builtin-type methods, by the receiver's
+/// `type_name` (generated from `inspect.signature` and the `TypeError`s
+/// CPython 3.13 raises one argument either side of it). A method that is
+/// not listed (`str.format`, `set.union(*others)`) is not checked here.
+fn method_arity(ty: &str, method: &str) -> Option<MethodArity> {
+    use MethodArity::{NoArgs, One, Positional};
+    const fn clinic(min: usize, max: usize) -> MethodArity {
+        MethodArity::Clinic {
+            min,
+            max,
+            kw_only: false,
+        }
+    }
+    Some(match (ty, method) {
+        ("list", "clear" | "copy" | "reverse") => NoArgs,
+        ("list", "append" | "count" | "extend" | "remove") | ("tuple", "count") => One,
+        ("list", "insert") => Positional(2, 2),
+        ("list", "pop") => Positional(0, 1),
+        ("list" | "tuple", "index") => Positional(1, 3),
+        ("list", "sort") => MethodArity::Clinic {
+            min: 0,
+            max: 0,
+            kw_only: true,
+        },
+        // A `freeze let` dict is a `mappingproxy`, which has only the
+        // read-only methods; the rest stay the handler's AttributeError.
+        ("dict" | "mappingproxy", "copy" | "items" | "keys" | "values") => NoArgs,
+        ("dict" | "mappingproxy", "get") => Positional(1, 2),
+        ("dict", "clear" | "popitem") => NoArgs,
+        ("dict", "pop" | "setdefault") => Positional(1, 2),
+        ("dict", "update") => Positional(0, 1),
+        ("set" | "frozenset", "copy") | ("set", "clear" | "pop") => NoArgs,
+        (
+            "set" | "frozenset",
+            "isdisjoint" | "issubset" | "issuperset" | "symmetric_difference",
+        )
+        | ("set", "add" | "discard" | "remove" | "symmetric_difference_update") => One,
+        (
+            "str" | "bytes",
+            "capitalize" | "isalnum" | "isalpha" | "isascii" | "isdigit" | "islower" | "isspace"
+            | "istitle" | "isupper" | "lower" | "swapcase" | "title" | "upper",
+        )
+        | ("str", "casefold" | "isdecimal" | "isidentifier" | "isnumeric" | "isprintable") => {
+            NoArgs
+        }
+        (
+            "str" | "bytes",
+            "join" | "partition" | "removeprefix" | "removesuffix" | "rpartition" | "zfill",
+        )
+        | ("str", "format_map" | "translate") => One,
+        ("str" | "bytes", "center" | "ljust" | "rjust") => Positional(1, 2),
+        (
+            "str" | "bytes",
+            "count" | "find" | "index" | "rfind" | "rindex" | "startswith" | "endswith",
+        ) => Positional(1, 3),
+        ("str" | "bytes", "lstrip" | "rstrip" | "strip") => Positional(0, 1),
+        ("str" | "bytes", "split" | "rsplit") | ("str", "encode") | ("bytes", "decode" | "hex") => {
+            clinic(0, 2)
+        }
+        ("str" | "bytes", "expandtabs" | "splitlines") => clinic(0, 1),
+        ("str", "replace") => clinic(2, 3),
+        ("bytes", "replace") => Positional(2, 3),
+        ("bytes", "translate") => clinic(1, 2),
+        (
+            "int" | "bool",
+            "as_integer_ratio" | "bit_count" | "bit_length" | "conjugate" | "is_integer",
+        )
+        | ("float", "as_integer_ratio" | "conjugate" | "hex" | "is_integer") => NoArgs,
+        ("int" | "bool", "to_bytes") => MethodArity::Clinic {
+            min: 0,
+            max: 2,
+            kw_only: true,
+        },
+        _ => return None,
+    })
+}
+
+/// CPython's `TypeError` for calling `ty.method` with `n` positional
+/// arguments, or `None` when `n` fits (or the method is not tabled).
+fn method_arity_error(ty: &str, method: &str, n: usize) -> Option<Unwind> {
+    let s = |k: usize| if k == 1 { "" } else { "s" };
+    // The message names the type that defines the method: `True.bit_length(1)`
+    // reports `int.bit_length()`.
+    let owner = if ty == "bool" { "int" } else { ty };
+    let msg = match method_arity(ty, method)? {
+        MethodArity::NoArgs if n != 0 => {
+            format!("{owner}.{method}() takes no arguments ({n} given)")
+        }
+        MethodArity::One if n != 1 => {
+            format!("{owner}.{method}() takes exactly one argument ({n} given)")
+        }
+        MethodArity::Positional(min, max) if min == max && n != min => {
+            format!("{method} expected {min} argument{}, got {n}", s(min))
+        }
+        MethodArity::Positional(min, _) if n < min => {
+            format!(
+                "{method} expected at least {min} argument{}, got {n}",
+                s(min)
+            )
+        }
+        MethodArity::Positional(_, max) if n > max => {
+            format!(
+                "{method} expected at most {max} argument{}, got {n}",
+                s(max)
+            )
+        }
+        MethodArity::Clinic { min, .. } if n < min => {
+            format!(
+                "{method}() takes at least {min} positional argument{} ({n} given)",
+                s(min)
+            )
+        }
+        MethodArity::Clinic {
+            max: 0,
+            kw_only: true,
+            ..
+        } if n > 0 => format!("{method}() takes no positional arguments"),
+        MethodArity::Clinic { max, kw_only, .. } if n > max => format!(
+            "{method}() takes at most {max} {}argument{} ({n} given)",
+            if kw_only { "positional " } else { "" },
+            s(max)
+        ),
+        _ => return None,
+    };
+    Some(type_error(msg))
+}
+
 /// Move keyword arguments that name positional parameters into their
 /// positions, check the rest, and return the call's arguments with any
 /// remaining keywords back in a sentinel. `display` names the callable in
@@ -10010,6 +10149,14 @@ pub fn dispatch_method(
         }
     };
     let (rest, kwargs) = split_kwargs_map(&args[1..]);
+    // CPython checks the positional count before the method body runs:
+    // `xs.append(1, 2)` is a `TypeError`, not an append of `1`, and
+    // `d.get(k, a, b)` does not quietly drop `b`. Keyword-only arguments
+    // still ride in the trailing sentinel, which is not a position.
+    let positional = split_kwargs(rest).0.len();
+    if let Some(err) = method_arity_error(receiver.type_name(), name, positional) {
+        return Err(err);
+    }
     // The universal dunders CPython exposes on every object. They are
     // ordinary methods there (`(5).__repr__()`, `"a".__len__()`), and the
     // per-type tables below do not carry them.
@@ -11870,16 +12017,24 @@ fn dict_method(
                 None => default.ok_or_else(|| crate::error::key_error_for(&k.clone().into_value())),
             }
         }
+        // `dict.update([other], **kwargs)`: the mapping or pairs first, then
+        // the keywords, a later write winning. Both parts are optional.
         "update" => {
-            let arg = single(args, "update")?;
-            match arg {
-                Value::Dict(other) => {
-                    for (k, v) in other.borrow().iter() {
-                        d.borrow_mut().insert(k.clone(), v.clone());
+            match args.first() {
+                None => {}
+                Some(Value::Dict(other)) => {
+                    // Snapshot first: `d.update(d)` would otherwise borrow
+                    // the one dict mutably while iterating it.
+                    let entries: Vec<(HashKey, Value)> = other
+                        .borrow()
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    for (k, v) in entries {
+                        d.borrow_mut().insert(k, v);
                     }
-                    Ok(Value::None)
                 }
-                _ => {
+                Some(arg) => {
                     let it = interp.make_iter(arg.clone())?;
                     while let Some(pair) = interp.iter_next(&it)? {
                         if let Value::Tuple(t) = pair {
@@ -11891,9 +12046,13 @@ fn dict_method(
                         }
                         return Err(type_error("dict update needs pairs"));
                     }
-                    Ok(Value::None)
                 }
             }
+            for (k, v) in kw {
+                let key = interp.dict_probe_key(d, &Value::Str(Rc::new(k)))?;
+                d.borrow_mut().insert(key, v);
+            }
+            Ok(Value::None)
         }
         "setdefault" => {
             let k = interp.dict_probe_key(d, single(args, "setdefault")?)?;
@@ -12250,6 +12409,8 @@ fn num_method(v: &Value, name: &str, args: &[Value]) -> Result<Value, Unwind> {
         (Value::FloatData(crate::value::VmFloat { value: x, .. }), "is_integer") => {
             Ok(Value::Bool(x.fract() == 0.0 && x.is_finite()))
         }
+        // `int.is_integer()` (3.12+) exists for duck-typing with `float`.
+        (Value::Int(_), "is_integer") => Ok(Value::Bool(true)),
         // The `numbers.Real` surface every int/float carries. `conjugate()`
         // is the identity for a real; `imag` is always 0 / 0.0.
         (Value::Int(i), "conjugate") => Ok(Value::Int(i.clone())),
@@ -13935,6 +14096,21 @@ pub(crate) fn is_builtin_type_class(c: &Rc<crate::value::Class>) -> bool {
             .get(&c.name)
             .is_some_and(|cached| Rc::ptr_eq(cached, c))
     })
+}
+
+/// `type(v)` / `v.__class__`: a real type object, so `type(x).__name__`,
+/// `str(type(x))` (→ `<class 'int'>`), `type(x) == int` and `type(x) is int`
+/// all work. User instances map to their declaring class; builtins map to a
+/// lightweight class object named after the type.
+pub(crate) fn type_of(v: &Value) -> Value {
+    match v {
+        Value::Instance(i) => Value::Class(i.class.clone()),
+        Value::Class(_) => make_builtin_type("type"),
+        // `type(some_exception).__name__` should be the concrete kind
+        // (e.g. `TypeError`), not the generic `Exception`.
+        Value::Exception { kind, .. } => make_builtin_type(kind.as_str()),
+        other => make_builtin_type(other.type_name()),
+    }
 }
 
 /// A lightweight type object for a built-in type (`int`, `str`, …) — an empty

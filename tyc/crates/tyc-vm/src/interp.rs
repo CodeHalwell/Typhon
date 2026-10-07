@@ -1869,6 +1869,13 @@ impl Interpreter {
                     for deco in f.decorator_list.iter().rev() {
                         v = self.apply_decorator(deco, v, &body_ns)?;
                     }
+                    // A method-like wrapper (`@contextmanager`, `@cache`)
+                    // under `@staticmethod` must not bind `self` on reads.
+                    if let Value::Native(n) = &v {
+                        if n.method_like && has_deco("staticmethod") {
+                            v = NativeFn::rebind(n, None);
+                        }
+                    }
                     // The class body binds the decorator's *result* to the
                     // `def`'s own name — CPython does not consult the
                     // returned function's `__name__`. Registering under the
@@ -1893,6 +1900,9 @@ impl Interpreter {
                         }
                         methods.insert(declared, func.clone());
                     } else {
+                        if is_classmethod {
+                            classmethods.insert(declared.clone());
+                        }
                         class_attrs.insert(declared, v);
                     }
                 }
@@ -2326,7 +2336,9 @@ impl Interpreter {
     fn wrap_memo(&mut self, target: Value) -> Value {
         let cache: Rc<RefCell<HashMap<HashKey, Value>>> = Rc::new(RefCell::new(HashMap::new()));
         let inner = target;
-        let func = NativeFn::new("memo", move |interp, args| {
+        // `functools.cache`'s wrapper binds like a function, so a cached
+        // method still receives `self`.
+        let func = NativeFn::new_method_like("memo", move |interp, args| {
             // Hash all positional arguments together.
             let mut keys = Vec::with_capacity(args.len());
             for a in &args {
@@ -4797,6 +4809,9 @@ impl Interpreter {
                 })
             }
             ClassMember::Attr(v) => {
+                if let Some(bound) = bind_method_like(&v, &self_val, &found_in, attr) {
+                    return Ok(bound);
+                }
                 let instance = matches!(self_val, Value::Instance(_)).then(|| self_val.clone());
                 match self.descriptor_get(&v, instance, &found_in)? {
                     Some(bound) => Ok(bound),
@@ -7120,14 +7135,11 @@ impl Interpreter {
         }
         // `x.__class__` is an *attribute*, not a method: `(1 + 2).__class__`
         // is the `int` type object. Returning a bound method made
-        // `(1 + 2).__class__.__name__` read `"method"`.
-        if attr == "__class__" {
-            if let Value::Instance(inst) = value {
-                return Ok(Value::Class(inst.class.clone()));
-            }
-            if !matches!(value, Value::Class(_) | Value::Module(_)) {
-                return Ok(crate::builtins::make_builtin_type(value.type_name()));
-            }
+        // `(1 + 2).__class__.__name__` read `"method"`. It is the very object
+        // `type(x)` returns (an exception's concrete kind included), so
+        // `x.__class__ is type(x)` holds.
+        if attr == "__class__" && !matches!(value, Value::Class(_) | Value::Module(_)) {
+            return Ok(crate::builtins::type_of(value));
         }
         // `int` / `float` carry the `numbers` tower's read-only components.
         // `int` is exactly its own numerator over 1; `float` has no
@@ -7249,6 +7261,9 @@ impl Interpreter {
                                 receiver,
                                 function: f.clone(),
                             });
+                        }
+                        if let Some(bound) = bind_method_like(&v, value, &inst.class, attr) {
+                            return Ok(bound);
                         }
                         if let Some(bound) =
                             self.descriptor_get(&v, Some(value.clone()), &inst.class)?
@@ -7398,6 +7413,9 @@ impl Interpreter {
                                     function: f.clone(),
                                 });
                             }
+                        }
+                        if let Some(bound) = bind_method_like(&v, value, class, attr) {
+                            return Ok(bound);
                         }
                         if let Some(bound) = self.descriptor_get(&v, None, class)? {
                             return Ok(bound);
@@ -9926,6 +9944,30 @@ fn namespace_package(name: &str) -> Value {
     }))
 }
 
+/// A method-like native (see [`NativeFn::method_like`]) read off `owner`
+/// through `obj`: bound to the instance, or to its class when `owner`
+/// declares `attr` a `@classmethod`. `None` for any other value, and for a
+/// plain method read off the class itself, which stays an unbound function.
+fn bind_method_like(v: &Value, obj: &Value, owner: &Rc<Class>, attr: &str) -> Option<Value> {
+    let Value::Native(n) = v else {
+        return None;
+    };
+    if !n.method_like {
+        return None;
+    }
+    let receiver = if owner.classmethods.borrow().contains(attr) {
+        match obj {
+            Value::Instance(i) => Value::Class(i.class.clone()),
+            other => other.clone(),
+        }
+    } else if matches!(obj, Value::Instance(_)) {
+        obj.clone()
+    } else {
+        return None;
+    };
+    Some(NativeFn::rebind(n, Some(receiver)))
+}
+
 fn decorator_simple_name(e: &Expr) -> Option<String> {
     match e {
         Expr::Name(n) => Some(n.id.as_str().to_owned()),
@@ -11591,6 +11633,13 @@ fn values_identical(a: &Value, b: &Value) -> bool {
         (Instance(x), Instance(y)) => Rc::ptr_eq(x, y),
         (Module(x), Module(y)) => Rc::ptr_eq(x, y),
         (Class(x), Class(y)) => Rc::ptr_eq(x, y),
+        // `type(d) is dict`: `type()` hands back the cached stand-in class
+        // for a builtin, while the name `dict` is its constructor native.
+        // CPython has a single type object for both. A user class that
+        // merely shares the name is not the stand-in.
+        (Class(c), Native(n)) | (Native(n), Class(c)) => {
+            c.name == n.name && crate::builtins::is_builtin_type_class(c)
+        }
         // A function object is one `Rc`, so `g is f` after `g = f` (and
         // `wrapper.__wrapped__ is f`) holds, as in CPython.
         (Function(x), Function(y)) => Rc::ptr_eq(x, y),
