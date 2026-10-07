@@ -1,3 +1,5 @@
+from collections.abc import Mapping
+
 from .ids import Currency
 
 
@@ -52,7 +54,7 @@ pub def format_money(amount: Money, ccy: Currency) -> str:
 pub def convert(amount: Money, from_ccy: Currency, to_ccy: Currency) -> Result[Money, FxError]:
     if str(from_ccy) == str(to_ccy):
         return Ok(amount)
-    let from_row: dict[str, float]? = FX_RATES.get(str(from_ccy))
+    let from_row: Mapping[str, float]? = FX_RATES.get(str(from_ccy))
     if from_row is None:
         return Err(FxError(
             from_ccy=str(from_ccy),

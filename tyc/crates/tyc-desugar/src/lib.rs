@@ -31,6 +31,12 @@ use ruff_text_size::TextRange;
 
 use tyc_syntax::impl_site;
 use tyc_syntax::impl_site::collect_sealed_union_aliases;
+// Shared with `tyc-types`, which must accept exactly the field defaults
+// copied here (W7-07).
+use tyc_syntax::field_defaults::{
+    class_body_names, collect_module_mutable_names, is_classvar_annotation,
+    named_mutable_default_kind,
+};
 
 // ── public API ───────────────────────────────────────────────────────────────
 
@@ -2509,7 +2515,9 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             // Skip the dataclass decorator for Pydantic model classes,
             // Protocol classes, TypedDict subclasses, NamedTuple subclasses,
             // and lazy proxies; they already carry the right shape or are
-            // incompatible with dataclass.
+            // incompatible with dataclass. `class_copies_named_defaults` in
+            // `tyc-types` mirrors this gate (it decides which field defaults
+            // are checked as their W7-07 copy); keep the two in step.
             let needs_decorator = !is_raw
                 && !is_plain
                 && !is_pydantic
@@ -2723,22 +2731,7 @@ fn rewrite_mutable_field_defaults(
     let mut changed = false;
     // Names the class body itself binds: a lambda defined in the body
     // cannot see them, so a default that mentions one is left alone.
-    let class_body_names: std::collections::HashSet<String> = body
-        .iter()
-        .filter_map(|s| match s {
-            Stmt::AnnAssign(a) => match a.target.as_ref() {
-                Expr::Name(n) => Some(n.id.as_str().to_owned()),
-                _ => None,
-            },
-            Stmt::Assign(a) => a.targets.iter().find_map(|t| match t {
-                Expr::Name(n) => Some(n.id.as_str().to_owned()),
-                _ => None,
-            }),
-            Stmt::FunctionDef(f) => Some(f.name.as_str().to_owned()),
-            Stmt::ClassDef(c) => Some(c.name.as_str().to_owned()),
-            _ => None,
-        })
-        .collect();
+    let class_body_names = class_body_names(body);
     for stmt in body.iter_mut() {
         let Stmt::AnnAssign(a) = stmt else { continue };
         // A `ClassVar[...]` field is a class-level constant, not an instance
@@ -2791,105 +2784,6 @@ fn rewrite_mutable_field_defaults(
         changed = true;
     }
     changed
-}
-
-/// `list` / `dict` / `set` when `annotation` is (a subscript of) one of
-/// them, or its `typing` alias.
-fn mutable_builtin_of_annotation(annotation: &Expr) -> Option<&'static str> {
-    let name = match annotation {
-        Expr::Subscript(s) => return mutable_builtin_of_annotation(&s.value),
-        Expr::Name(n) => n.id.as_str(),
-        Expr::Attribute(a) => a.attr.as_str(),
-        _ => return None,
-    };
-    match name {
-        "list" | "List" => Some("list"),
-        "dict" | "Dict" => Some("dict"),
-        "set" | "Set" => Some("set"),
-        _ => None,
-    }
-}
-
-/// `list` / `dict` / `set` when `value` evidently builds one.
-fn mutable_builtin_of_value(value: &Expr) -> Option<&'static str> {
-    match value {
-        Expr::List(_) | Expr::ListComp(_) => Some("list"),
-        Expr::Dict(_) | Expr::DictComp(_) => Some("dict"),
-        Expr::Set(_) | Expr::SetComp(_) => Some("set"),
-        Expr::Call(c) => match c.func.as_ref() {
-            Expr::Name(n) => match n.id.as_str() {
-                "list" => Some("list"),
-                "dict" => Some("dict"),
-                "set" => Some("set"),
-                _ => None,
-            },
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-/// Module-level names bound to an evident `list` / `dict` / `set`, by their
-/// annotation or their value. A name bound twice to different kinds is left
-/// out.
-fn collect_module_mutable_names(body: &[Stmt]) -> HashMap<String, &'static str> {
-    let mut out: HashMap<String, &'static str> = HashMap::new();
-    let mut conflicting: HashSet<String> = HashSet::new();
-    for stmt in body {
-        let (name, kind) = match stmt {
-            Stmt::AnnAssign(a) => {
-                let Expr::Name(n) = a.target.as_ref() else {
-                    continue;
-                };
-                let kind = mutable_builtin_of_annotation(&a.annotation)
-                    .or_else(|| a.value.as_deref().and_then(mutable_builtin_of_value));
-                (n.id.as_str(), kind)
-            }
-            Stmt::Assign(a) => {
-                let [Expr::Name(n)] = a.targets.as_slice() else {
-                    continue;
-                };
-                (n.id.as_str(), mutable_builtin_of_value(&a.value))
-            }
-            _ => continue,
-        };
-        match (kind, out.get(name)) {
-            (Some(k), None) => {
-                out.insert(name.to_owned(), k);
-            }
-            (Some(k), Some(prev)) if *prev == k => {}
-            _ => {
-                conflicting.insert(name.to_owned());
-            }
-        }
-    }
-    out.retain(|name, _| !conflicting.contains(name));
-    out
-}
-
-/// For a field default that is a plain or dotted name (`BASE`,
-/// `config.DEFAULTS`) whose value is evidently a `list` / `dict` / `set` —
-/// by the field's own annotation, or by a module-level binding of the name —
-/// the builtin to copy it with.
-fn named_mutable_default_kind(
-    value: &Expr,
-    annotation: &Expr,
-    module_mutable_names: &HashMap<String, &'static str>,
-) -> Option<&'static str> {
-    fn is_dotted_name(e: &Expr) -> bool {
-        match e {
-            Expr::Name(_) => true,
-            Expr::Attribute(a) => is_dotted_name(&a.value),
-            _ => false,
-        }
-    }
-    if !is_dotted_name(value) {
-        return None;
-    }
-    mutable_builtin_of_annotation(annotation).or_else(|| match value {
-        Expr::Name(n) => module_mutable_names.get(n.id.as_str()).copied(),
-        _ => None,
-    })
 }
 
 /// `<func>(<arg>)` with `func` a bare name.
@@ -3856,20 +3750,6 @@ fn raw_class_init_insert_pos(body: &[Stmt]) -> usize {
         }
     }
     idx
-}
-
-/// True when `ann` is `ClassVar[...]`, in any spelling the language accepts —
-/// bare, `typing.ClassVar`, or an aliased module (`t.ClassVar`).
-fn is_classvar_annotation(ann: &Expr) -> bool {
-    let head = match ann {
-        Expr::Subscript(s) => s.value.as_ref(),
-        other => other,
-    };
-    match head {
-        Expr::Name(n) => n.id.as_str() == "ClassVar",
-        Expr::Attribute(a) => a.attr.as_str() == "ClassVar",
-        _ => false,
-    }
 }
 
 /// Strip the default value from each top-level `AnnAssign` whose target

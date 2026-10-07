@@ -216,9 +216,14 @@ def main() -> None:
     let bad = HOSTS + ["c"]                      # ❌ tuple + list
 ```
 
-A new binding that receives a frozen value keeps the frozen shape
-(`let alias = HOSTS` then `alias.append(...)` is rejected too). A mutation
-deliberately wrapped in a handler for the exception it raises
+A new binding without an annotation that receives a frozen value keeps the
+frozen shape (`let alias = HOSTS` then `alias.append(...)` is rejected too).
+An annotated binding stores the value as it is, so the annotation must
+describe the frozen value — `tuple[T, ...]`, `frozenset[T]`, `Mapping[K, V]`
+(or `frozendict[K, V]`), or a read-only view such as `Sequence[T]`:
+`let ports: list[int] = LIMITS["port"]` is a `tyc::type_mismatch`. Copy
+explicitly (`list(LIMITS["port"])`) when a mutable container is wanted. A
+mutation deliberately wrapped in a handler for the exception it raises
 (`try: CFG["k"] = 1` / `except TypeError:`) is reported as a warning instead
 of an error, so a program can probe the runtime failure.
 
