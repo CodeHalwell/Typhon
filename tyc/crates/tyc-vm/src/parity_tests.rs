@@ -1993,6 +1993,24 @@ class C:
 trap("plain class", lambda: eg.split(C))
 trap("empty derive", lambda: eg.derive([]))
 show(repr(eg.split(())), eg.subgroup(()))
+class X:
+    def __repr__(self) -> str:
+        return "XX"
+class P:
+    def __call__(self, e: BaseException) -> bool:
+        return isinstance(e, ValueError)
+show(repr(ExceptionGroup("h", [ValueError(X())])))
+show(repr(eg.split(P())))
+show(repr(eg.derive([KeyboardInterrupt()])))
+trap("non-exception derive", lambda: eg.derive([1]))
+try:
+    try:
+        raise KeyError(1)
+    except KeyError as k:
+        raise ExceptionGroup("c", [ValueError("a"), TypeError("b")]) from k
+except ExceptionGroup as caught:
+    m, r = caught.split(ValueError)
+    show(repr(m.__cause__), repr(r.__context__), m.__suppress_context__)
 "#,
     );
 }

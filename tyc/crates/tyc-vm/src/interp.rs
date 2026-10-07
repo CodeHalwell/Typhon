@@ -6499,10 +6499,8 @@ impl Interpreter {
                 })
             }
             // `repr(KeyError(obj))` shows each argument's own repr, which
-            // may be a user `__repr__`.
-            Value::Exception { kind, args, .. }
-                if !args.is_empty() && !crate::value::is_exception_group_kind(kind) =>
-            {
+            // may be a user `__repr__` (a group's `(message, subs)` too).
+            Value::Exception { kind, args, .. } if !args.is_empty() => {
                 let mut parts = Vec::with_capacity(args.len());
                 for a in args.iter() {
                     parts.push(self.repr_of_depth(a, depth + 1)?);
@@ -9969,6 +9967,9 @@ impl Interpreter {
                 rest.push(sub);
             }
         }
+        // A derived side keeps the source group's cause, context and
+        // traceback, as CPython's `split` copies them.
+        let chain = crate::value::exception_chain(group);
         let build = |items: Vec<Value>| {
             if items.is_empty() {
                 None
@@ -9979,8 +9980,9 @@ impl Interpreter {
                 // by `except* ValueError` binds an *ExceptionGroup* on the
                 // matched side (verified on 3.13), not the parent's kind.
                 let kind = crate::value::exception_group_kind_for(&items);
-                Some(crate::value::make_exception_group(
-                    kind, &message, items, false,
+                Some(crate::value::with_exception_chain(
+                    crate::value::make_exception_group(kind, &message, items, false),
+                    chain.clone(),
                 ))
             }
         };
@@ -10023,6 +10025,15 @@ impl Interpreter {
                     "second argument (exceptions) must be a non-empty sequence",
                 )));
             }
+            if let Some(i) = items
+                .iter()
+                .position(|v| !crate::value::is_exception_value(v))
+            {
+                return Err(Unwind::Exception(crate::error::VmException::new(
+                    "ValueError",
+                    format!("Item {i} of second argument (exceptions) is not an exception"),
+                )));
+            }
             let kind = crate::value::exception_group_kind_for(&items);
             return Ok(crate::value::make_exception_group(
                 kind,
@@ -10037,10 +10048,11 @@ impl Interpreter {
             _ => false,
         };
         let by_type = is_type(&arg) || matches!(&arg, Value::Tuple(t) if t.iter().all(is_type));
-        let callable = matches!(
-            arg,
-            Value::Function(_) | Value::Native(_) | Value::BoundMethod { .. }
-        );
+        let callable = match &arg {
+            Value::Function(_) | Value::Native(_) | Value::BoundMethod { .. } => true,
+            Value::Instance(inst) => self.find_method(&inst.class, "__call__").is_some(),
+            _ => false,
+        };
         if !by_type && !callable {
             return Err(type_error(
                 "expected an exception type, a tuple of exception types, or a callable (other than a class)",
@@ -10094,10 +10106,14 @@ impl Interpreter {
                 rest.push(sub);
             }
         }
+        let chain = crate::value::exception_chain(group);
         let build = |items: Vec<Value>| {
             (!items.is_empty()).then(|| {
                 let kind = crate::value::exception_group_kind_for(&items);
-                crate::value::make_exception_group(kind, &message, items, false)
+                crate::value::with_exception_chain(
+                    crate::value::make_exception_group(kind, &message, items, false),
+                    chain.clone(),
+                )
             })
         };
         Ok((build(matched), build(rest)))

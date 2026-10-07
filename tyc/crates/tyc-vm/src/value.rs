@@ -1283,8 +1283,8 @@ impl std::hash::Hash for HashKey {
 // including CPython's auto-downcast of a `BaseExceptionGroup` whose members
 // are all ordinary `Exception`s), `.exceptions` / `.message`, `str()` /
 // `repr()`, `except*` splitting/binding/re-raise, and the `asyncio.TaskGroup`
-// failure path. What is NOT modelled: `.split()` / `.subgroup()` / `.derive()`
-// as user-callable methods, `__notes__`, and CPython's nested
+// failure path, and `.split()` / `.subgroup()` / `.derive()` as methods.
+// What is NOT modelled: `__notes__`, and CPython's nested
 // "Exception Group Traceback" rendering for an uncaught group (the VM prints
 // the single summary line).
 
@@ -1379,6 +1379,25 @@ pub fn exception_chain(v: &Value) -> Option<Rc<ExcChain>> {
         Value::Exception { chain, .. } => chain.clone(),
         Value::Instance(i) => i.chain.borrow().clone(),
         _ => None,
+    }
+}
+
+/// `v` with its exception chain replaced by `chain` — how a derived
+/// exception group inherits its source's cause, context and traceback.
+pub fn with_exception_chain(v: Value, chain: Option<Rc<ExcChain>>) -> Value {
+    match v {
+        Value::Exception {
+            kind,
+            message,
+            args,
+            ..
+        } => Value::Exception {
+            kind,
+            message,
+            args,
+            chain,
+        },
+        other => other,
     }
 }
 
