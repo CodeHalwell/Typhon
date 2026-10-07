@@ -8418,12 +8418,10 @@ impl Interpreter {
             // iterate the backing mapping's keys).
             Value::Instance(ref inst) => {
                 // `async for x in obj:` — the async iteration protocol.
-                // Async generators are materialised eagerly so the sync and
-                // async loops share this path, but a *hand-written* async
-                // iterator defines `__aiter__` / `__anext__` and has no
-                // `__iter__` at all, so it has to be recognised here.
-                // `__anext__` is a coroutine: force it at each step, and
-                // treat `StopAsyncIteration` as the end.
+                // Async generators share the sync loop's path, but a
+                // *hand-written* async iterator defines `__aiter__` /
+                // `__anext__` and has no `__iter__` at all, so it has to be
+                // recognised here.
                 if self.find_method(&inst.class, "__iter__").is_none()
                     && self.find_method(&inst.class, "__aiter__").is_some()
                 {
@@ -8442,42 +8440,14 @@ impl Interpreter {
                     let Value::Instance(target) = &aiter else {
                         return self.make_iter(aiter);
                     };
-                    let Some(anext) = self.find_method(&target.class, "__anext__") else {
+                    if self.find_method(&target.class, "__anext__").is_none() {
                         return self.make_iter(aiter.clone());
-                    };
-                    // Drain it here: the VM's async model completes every
-                    // coroutine at its force point, so a lazily-stepped
-                    // async iterator would have no observable difference
-                    // and this keeps the iterator state machine simple.
-                    let mut out: Vec<Value> = Vec::new();
-                    loop {
-                        let step = self.call_value(
-                            Value::BoundMethod {
-                                receiver: Box::new(aiter.clone()),
-                                function: anext.clone(),
-                            },
-                            vec![],
-                            &[],
-                        );
-                        let step = match step {
-                            Ok(coro) => self.force_awaitable(coro),
-                            Err(e) => Err(e),
-                        };
-                        match step {
-                            Ok(item) => out.push(item),
-                            Err(Unwind::Exception(e)) if e.kind == "StopAsyncIteration" => break,
-                            Err(other) => return Err(other),
-                        }
-                        if out.len() > GENERATOR_CAP {
-                            return Err(crate::error::Unwind::Exception(
-                                crate::error::VmException::new(
-                                    "RuntimeError",
-                                    "async iterator produced more than 1,000,000 items — the VM                                      materialises async iteration eagerly; run with                                      `tyc run --compile` for an unbounded one",
-                                ),
-                            ));
-                        }
                     }
-                    return self.make_iter(Value::List(Rc::new(RefCell::new(out))));
+                    // Step it lazily: each `__anext__` runs just before the
+                    // loop body that consumes its item, as in CPython.
+                    return Ok(Value::Iter(Rc::new(RefCell::new(
+                        IterState::AsyncUserIter(aiter),
+                    ))));
                 }
                 if let Some(m) = self.find_method(&inst.class, "__iter__") {
                     let iter_val = self.call_value(
@@ -8545,6 +8515,7 @@ impl Interpreter {
             Generator(Rc<RefCell<GeneratorState>>),
             GenExpr(Rc<RefCell<GenExprState>>),
             UserIter(Value),
+            AsyncUserIter(Value),
             SeqIter(Value, usize),
         }
 
@@ -8722,6 +8693,7 @@ impl Interpreter {
                 IterState::Generator(g) => Recurse::Generator(g.clone()),
                 IterState::GenExpr(g) => Recurse::GenExpr(g.clone()),
                 IterState::UserIter(obj) => Recurse::UserIter(obj.clone()),
+                IterState::AsyncUserIter(obj) => Recurse::AsyncUserIter(obj.clone()),
                 IterState::SeqIter { obj, index } => {
                     let i = *index;
                     *index += 1;
@@ -8800,6 +8772,20 @@ impl Interpreter {
                 Err(Unwind::Exception(e)) if e.kind == "StopIteration" => Ok(None),
                 Err(e) => Err(e),
             },
+            // `__anext__` returns an awaitable: force it, and treat
+            // `StopAsyncIteration` as the end.
+            Recurse::AsyncUserIter(obj) => {
+                let step = match self.call_dunder0(&obj, "__anext__") {
+                    Ok(Some(coro)) => self.force_awaitable(coro),
+                    Ok(None) => return Ok(None),
+                    Err(e) => Err(e),
+                };
+                match step {
+                    Ok(item) => Ok(Some(item)),
+                    Err(Unwind::Exception(e)) if e.kind == "StopAsyncIteration" => Ok(None),
+                    Err(e) => Err(e),
+                }
+            }
             // Legacy sequence protocol: `obj[i]` until IndexError.
             Recurse::SeqIter(obj, i) => {
                 match self.subscript(&obj, &Value::Int(VmInt::from(i as i64))) {

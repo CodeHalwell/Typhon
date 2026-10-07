@@ -649,6 +649,44 @@ trap("uneven", lambda: bytes.maketrans(b"ab", b"x"))
     );
 }
 
+// ── `async for` over a hand-written async iterator ────────────────────────
+
+#[test]
+fn async_for_steps_a_user_async_iterator_lazily() {
+    assert_matches_cpython(
+        "async_for_steps_a_user_async_iterator_lazily",
+        r#"import asyncio
+plain class Ticker:
+    def __init__(self, n: int) -> None:
+        self.i = 0
+        self.n = n
+    def __aiter__(self) -> "Ticker":
+        return self
+    async def __anext__(self) -> int:
+        if self.i >= self.n:
+            raise StopAsyncIteration
+        self.i += 1
+        show("step", self.i)
+        return self.i
+plain class Forever:
+    def __aiter__(self) -> "Forever":
+        return self
+    async def __anext__(self) -> int:
+        return 1
+async def main() -> None:
+    async for v in Ticker(3):
+        show("body", v)
+    total = 0
+    async for w in Forever():
+        total += w
+        if total >= 5:
+            break
+    show("total", total)
+asyncio.run(main())
+"#,
+    );
+}
+
 // ── W5-11: changing a dict or set while iterating it ──────────────────────
 
 #[test]

@@ -2114,6 +2114,10 @@ pub enum IterState {
     /// A user iterator object (an instance whose class defines `__next__`),
     /// stepped through `__next__` on demand.
     UserIter(Value),
+    /// A user async iterator (`__aiter__` / `__anext__`) driven by
+    /// `async for`, stepped through `__anext__` on demand so each step's
+    /// side effects interleave with the loop body as in CPython.
+    AsyncUserIter(Value),
     /// The legacy sequence protocol: `obj[0]`, `obj[1]`, … until `IndexError`.
     SeqIter {
         obj: Value,
@@ -2161,6 +2165,7 @@ pub fn iter_type_name(state: &IterState) -> &'static str {
         } => "dict_reverseitemiterator",
         IterState::Generator(_) | IterState::GenExpr(_) => "generator",
         IterState::UserIter(_) => "iterator",
+        IterState::AsyncUserIter(_) => "async_iterator",
         IterState::SeqIter { .. } => "iterator",
     }
 }

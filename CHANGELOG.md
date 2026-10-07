@@ -26,6 +26,11 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 - **`bytes.translate` and `bytes.maketrans` under `tyc run`.** Both were
   missing, so a program using them failed with `AttributeError` in the VM
   but ran on CPython.
+- **`async for` over a hand-written async iterator under `tyc run`.** The
+  VM used to call `__anext__` until exhaustion before the loop body ran
+  once, so output interleaved differently from CPython and an endless
+  source hit the 1,000,000-item cap even when the loop `break`s. Each
+  `__anext__` now runs just before the body that consumes its item.
 
 ### Documentation
 
