@@ -7429,4 +7429,229 @@ main()
 "#;
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
+
+    /// `type(x) is T` / `x.__class__ is T`: CPython has one type object per
+    /// builtin, but `type()` handed back a stand-in class while the name
+    /// `dict` is the constructor native, so every such identity test was
+    /// `False` (`type(x) == T` already held).
+    #[test]
+    fn builtin_type_objects_keep_identity() {
+        let src = r#"
+plain class P:
+    pass
+
+def local_dict() -> object:
+    plain class dict:
+        pass
+    return dict()
+
+def main() -> None:
+    let d: dict[str, int] = {"a": 1}
+    let l: list[int] = [1]
+    assert type(d) is dict and d.__class__ is dict and dict is type(d)
+    assert type(l) is list and type({1}) is set and type(frozenset([1])) is frozenset
+    assert type((1,)) is tuple and type("a") is str and type(b"") is bytes
+    assert type(1) is int and type(1.5) is float and type(True) is bool and type(range(2)) is range
+    assert (1).__class__ is int and "x".__class__ is str and type(d) is type({"b": 2})
+    assert type(d) is not list and not (type(d) is not dict) and type(True) is not int
+    let p = P()
+    assert type(p) is P and p.__class__ is P and type(P) is type and type(type(1)) is type
+    try:
+        raise ValueError("x")
+    except ValueError as e:
+        assert type(e) is ValueError and e.__class__ is ValueError
+        assert type(e) is not Exception and e.__class__.__name__ == "ValueError"
+    # A user class that merely shares a builtin's name is not that type.
+    let o = local_dict()
+    assert type(o) is not dict and type(o).__name__ == "dict"
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// A `@contextmanager` method (class body or `impl`) is a function on
+    /// CPython, so reading it through an instance binds `self`. The VM's
+    /// native factory did not, and `with m.lock() as k:` raised
+    /// `lock() missing required argument: 'self'`. `@functools.cache` (what
+    /// `@memo` lowers to) had the same hole.
+    #[test]
+    fn decorated_methods_bind_self_like_functions() {
+        let src = r#"
+from contextlib import contextmanager, asynccontextmanager
+from collections.abc import Iterator, AsyncIterator
+from functools import cache
+import asyncio
+
+class IntPool:
+    n: int
+
+impl IntPool:
+    @contextmanager
+    def acquire(self) -> Iterator[int]:
+        yield self.n
+
+plain class Mutex:
+    def __init__(self) -> None:
+        self.held = False
+
+    @contextmanager
+    def lock(self, tag: str = "t") -> Iterator[str]:
+        self.held = True
+        try:
+            yield tag + "!"
+        finally:
+            self.held = False
+
+    @asynccontextmanager
+    async def alock(self, tag: str) -> AsyncIterator[str]:
+        self.held = True
+        yield tag.upper()
+        self.held = False
+
+    @staticmethod
+    @contextmanager
+    def quiet(x: int) -> Iterator[int]:
+        yield x * 2
+
+    @classmethod
+    @contextmanager
+    def make(cls, x: int) -> Iterator[str]:
+        yield cls.__name__ + str(x)
+
+    @cache
+    def twice(self, x: int) -> int:
+        return x * 2
+
+    @staticmethod
+    @cache
+    def square(x: int) -> int:
+        return x * x
+
+plain class SubMutex(Mutex):
+    @contextmanager
+    def lock(self, tag: str = "s") -> Iterator[str]:
+        with super().lock("sub-" + tag) as inner:
+            yield inner
+
+let pool = IntPool(3)
+with pool.acquire() as c:
+    assert c == 3
+let m = Mutex()
+with m.lock() as k:
+    assert k == "t!" and m.held
+assert not m.held
+with m.lock(tag="kw") as k2:
+    assert k2 == "kw!"
+let bound = m.lock
+with bound("b") as k3:
+    assert k3 == "b!"
+with Mutex.lock(m, "u") as k4:
+    assert k4 == "u!"
+with Mutex.quiet(4) as q:
+    assert q == 8
+with m.quiet(5) as q2:
+    assert q2 == 10
+with Mutex.make(7) as mk:
+    assert mk == "Mutex7"
+with SubMutex().make(1) as smk:
+    assert smk == "SubMutex1"
+with SubMutex().lock() as sk:
+    assert sk == "sub-s!"
+assert m.twice(4) == 8 and Mutex.square(3) == 9 and m.square(4) == 16
+
+async def run() -> str:
+    async with m.alock("a") as v:
+        assert m.held
+        return v
+
+assert asyncio.run(run()) == "A"
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// Builtin methods check their positional count first, with CPython
+    /// 3.13's wording for each calling convention. The VM used to read the
+    /// arguments it wanted and ignore the rest: `xs.append(1, 2)` appended
+    /// `1`, and `d.get(k, a, b)` returned `a`.
+    #[test]
+    fn builtin_method_arity_matches_cpython() {
+        let src = r#"
+from collections.abc import Callable
+
+def err(thunk: Callable[[], object]) -> str:
+    try:
+        thunk()
+    except TypeError as e:
+        return str(e)
+    return "no error"
+
+mut xs: list[int] = [3, 1, 2]
+assert err(lambda: xs.append(1, 2)) == "list.append() takes exactly one argument (2 given)"
+assert err(lambda: xs.append()) == "list.append() takes exactly one argument (0 given)"
+assert err(lambda: xs.extend([1], [2])) == "list.extend() takes exactly one argument (2 given)"
+assert err(lambda: xs.insert(0)) == "insert expected 2 arguments, got 1"
+assert err(lambda: xs.pop(0, 1)) == "pop expected at most 1 argument, got 2"
+assert err(lambda: xs.remove()) == "list.remove() takes exactly one argument (0 given)"
+assert err(lambda: xs.clear(1)) == "list.clear() takes no arguments (1 given)"
+assert err(lambda: xs.index(1, 0, 3, 4)) == "index expected at most 3 arguments, got 4"
+assert err(lambda: xs.sort(None)) == "sort() takes no positional arguments"
+assert err(lambda: list.append(xs, 1, 2)) == "list.append() takes exactly one argument (2 given)"
+assert xs == [3, 1, 2]
+mut s: set[int] = {1}
+assert err(lambda: s.add(1, 2)) == "set.add() takes exactly one argument (2 given)"
+assert err(lambda: s.discard()) == "set.discard() takes exactly one argument (0 given)"
+assert err(lambda: frozenset([1]).issubset()) == "frozenset.issubset() takes exactly one argument (0 given)"
+assert s == {1}
+mut d: dict[str, int] = {"a": 1}
+assert err(lambda: d.get("a", 1, 2)) == "get expected at most 2 arguments, got 3"
+assert err(lambda: d.get()) == "get expected at least 1 argument, got 0"
+assert err(lambda: d.get("a", default=0)) == "dict.get() takes no keyword arguments"
+assert err(lambda: d.pop("a", 1, 2)) == "pop expected at most 2 arguments, got 3"
+assert err(lambda: d.setdefault("a", 1, 2)) == "setdefault expected at most 2 arguments, got 3"
+assert err(lambda: d.keys(1)) == "dict.keys() takes no arguments (1 given)"
+assert err(lambda: d.update({}, {})) == "update expected at most 1 argument, got 2"
+assert d == {"a": 1}
+assert err(lambda: "a".upper(1)) == "str.upper() takes no arguments (1 given)"
+assert err(lambda: "a,b".split(",", 1, 2)) == "split() takes at most 2 arguments (3 given)"
+assert err(lambda: "a".replace("a")) == "replace() takes at least 2 positional arguments (1 given)"
+assert err(lambda: "a".strip("a", "b")) == "strip expected at most 1 argument, got 2"
+assert err(lambda: "a".startswith()) == "startswith expected at least 1 argument, got 0"
+assert err(lambda: (1, 2).count()) == "tuple.count() takes exactly one argument (0 given)"
+assert err(lambda: (5).bit_length(1)) == "int.bit_length() takes no arguments (1 given)"
+assert err(lambda: True.bit_length(1)) == "int.bit_length() takes no arguments (1 given)"
+assert err(lambda: (5).to_bytes(1, "big", 3)) == "to_bytes() takes at most 2 positional arguments (3 given)"
+assert err(lambda: (1.5).hex(1)) == "float.hex() takes no arguments (1 given)"
+assert err(lambda: b"a".replace(b"a")) == "replace expected at least 2 arguments, got 1"
+# Correct calls are untouched, keyword-mapped and keyword-only ones included.
+xs.append(9)
+assert xs == [3, 1, 2, 9] and xs.pop() == 9 and d.get("zz", 5) == 5
+assert "a b c".split(maxsplit=1) == ["a", "b c"] and "a b".split(None, 1) == ["a", "b"]
+assert (5).to_bytes(2, "little", signed=True) == b"\x05\x00"
+xs.sort(key=lambda v: -v)
+assert xs == [3, 2, 1] and "{}{}".format(1, 2) == "12"
+s.update({2}, [3])
+assert s == {1, 2, 3}
+# `dict.update` takes an optional mapping plus keywords, as on CPython.
+d.update({"b": 2}, c=3)
+d.update(e=5)
+d.update()
+d.update([("f", 6)], g=7)
+assert d == {"a": 1, "b": 2, "c": 3, "e": 5, "f": 6, "g": 7}
+d.update(d, a=0)
+assert d == {"a": 0, "b": 2, "c": 3, "e": 5, "f": 6, "g": 7}
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// `int.is_integer()` (3.12+) was missing: `AttributeError`.
+    #[test]
+    fn int_is_integer_exists() {
+        let src = r#"
+assert (3).is_integer() and (-7).is_integer() and (2 ** 100).is_integer()
+assert True.is_integer() and int.is_integer(5) and not (2.5).is_integer()
+assert hasattr(3, "is_integer") and getattr(3, "is_integer")()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
 }

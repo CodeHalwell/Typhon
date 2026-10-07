@@ -1371,3 +1371,187 @@ show(repr(lst), first is lst[0])
 "#,
     );
 }
+
+// ── 2026-10-07 root-cause investigation: VM ↔ CPython parity ──────────────
+
+#[test]
+fn rc_type_objects_are_the_builtin_names() {
+    // `type(d) is dict` and `d.__class__ is dict` were `False`: `type()`
+    // returned a stand-in class while `dict` is the constructor native.
+    assert_matches_cpython(
+        "rc_type_objects_are_the_builtin_names",
+        r#"plain class P:
+    pass
+def local_dict() -> object:
+    plain class dict:
+        pass
+    return dict()
+d = {"a": 1}
+show(type(d) is dict, d.__class__ is dict, dict is type(d), type(d) is not dict, type(d) is list)
+show(type([1]) is list, type({1}) is set, type(frozenset()) is frozenset, type((1,)) is tuple)
+show(type("a") is str, type(1) is int, type(1.5) is float, type(True) is bool, type(True) is int)
+show(type(b"") is bytes, type(range(1)) is range, (1).__class__ is int, type(d) is type({}))
+p = P()
+show(type(p) is P, p.__class__ is P, type(P) is type, type(type(1)) is type)
+try:
+    raise ValueError("x")
+except ValueError as e:
+    show(type(e) is ValueError, e.__class__ is ValueError, type(e) is Exception, e.__class__.__name__)
+o = local_dict()
+show(type(o) is dict, type(o).__name__)
+"#,
+    );
+}
+
+#[test]
+fn rc_decorated_methods_bind_self() {
+    // A method wrapped by `@contextmanager` / `@cache` is a function on
+    // CPython and binds `self`; the VM's native wrapper did not.
+    assert_matches_cpython(
+        "rc_decorated_methods_bind_self",
+        r#"from contextlib import contextmanager
+from functools import cache, lru_cache
+plain class Mutex:
+    def __init__(self) -> None:
+        self.held = False
+    @contextmanager
+    def lock(self, tag="t"):
+        self.held = True
+        try:
+            yield tag + "!"
+        finally:
+            self.held = False
+    @staticmethod
+    @contextmanager
+    def quiet(x):
+        yield x * 2
+    @classmethod
+    @contextmanager
+    def make(cls, x):
+        yield cls.__name__ + str(x)
+    @cache
+    def twice(self, x):
+        return x * 2
+    @staticmethod
+    @cache
+    def square(x):
+        return x * x
+    @classmethod
+    @lru_cache(maxsize=None)
+    def tag(cls, x):
+        return cls.__name__ + str(x)
+plain class Sub(Mutex):
+    @contextmanager
+    def lock(self, tag="s"):
+        with super().lock("sub-" + tag) as inner:
+            yield inner
+m = Mutex()
+with m.lock() as k:
+    show(k, m.held)
+show(m.held)
+with m.lock(tag="kw") as k:
+    show(k)
+bound = m.lock
+with bound("b") as k:
+    show(k)
+with Mutex.lock(m, "u") as k:
+    show(k)
+with Mutex.quiet(4) as q:
+    show(q)
+with m.quiet(5) as q:
+    show(q)
+with Mutex.make(7) as q:
+    show(q)
+with Sub().make(1) as q:
+    show(q)
+with Sub().lock() as q:
+    show(q)
+show(m.twice(4), Mutex.square(3), m.square(4), Mutex.tag(1), Sub().tag(2))
+# Read off the class, a plain method stays unbound (the VM's wording for a
+# missing argument differs, so only the type is compared).
+try:
+    Mutex.twice(4)
+except TypeError as e:
+    show("unbound", type(e).__name__)
+"#,
+    );
+}
+
+#[test]
+fn rc_builtin_method_arity_raises() {
+    // `xs.append(1, 2)` appended `1` and `d.get(k, a, b)` returned `a`;
+    // CPython checks the positional count before the body runs.
+    assert_matches_cpython(
+        "rc_builtin_method_arity_raises",
+        r#"xs = [3, 1, 2]
+s = {1}
+d = {"a": 1}
+trap("append2", lambda: xs.append(1, 2))
+trap("append0", lambda: xs.append())
+trap("extend2", lambda: xs.extend([1], [2]))
+trap("insert1", lambda: xs.insert(0))
+trap("insert3", lambda: xs.insert(0, 1, 2))
+trap("pop2", lambda: xs.pop(0, 1))
+trap("remove0", lambda: xs.remove())
+trap("clear1", lambda: xs.clear(1))
+trap("index4", lambda: xs.index(1, 0, 3, 4))
+trap("count2", lambda: xs.count(1, 2))
+trap("sort1", lambda: xs.sort(None))
+trap("list.append", lambda: list.append(xs, 1, 2))
+trap("add2", lambda: s.add(1, 2))
+trap("discard0", lambda: s.discard())
+trap("issubset2", lambda: s.issubset({1}, {2}))
+trap("fs issubset0", lambda: frozenset([1]).issubset())
+trap("fs add", lambda: frozenset([1]).add(1))
+trap("get3", lambda: d.get("a", 1, 2))
+trap("get0", lambda: d.get())
+trap("get kw", lambda: d.get("a", default=0))
+trap("pop kw", lambda: d.pop("a", default=0))
+trap("pop0", lambda: d.pop())
+trap("setdefault3", lambda: d.setdefault("a", 1, 2))
+trap("keys1", lambda: d.keys(1))
+trap("update2", lambda: d.update({}, {}))
+trap("upper1", lambda: "a".upper(1))
+trap("split3", lambda: "a,b".split(",", 1, 2))
+trap("replace1", lambda: "a".replace("a"))
+trap("replace4", lambda: "a".replace("a", "b", 1, 2))
+trap("join0", lambda: "a".join())
+trap("strip2", lambda: "a".strip("a", "b"))
+trap("startswith0", lambda: "a".startswith())
+trap("center0", lambda: "a".center())
+trap("encode3", lambda: "a".encode("utf-8", "strict", 1))
+trap("tuple count0", lambda: (1, 2).count())
+trap("bit_length1", lambda: (5).bit_length(1))
+trap("bool bit_length1", lambda: True.bit_length(1))
+trap("to_bytes3", lambda: (5).to_bytes(1, "big", 3))
+trap("float hex1", lambda: (1.5).hex(1))
+trap("bytes split3", lambda: b"a b".split(b" ", 1, 2))
+trap("bytes replace1", lambda: b"a".replace(b"a"))
+show(xs, s, d)
+trap("ok append", lambda: (xs.append(9), xs)[1])
+trap("ok get", lambda: d.get("zz", 5))
+trap("ok split", lambda: "a b c".split(maxsplit=1))
+trap("ok to_bytes", lambda: (5).to_bytes(2, "little", signed=True))
+trap("ok sort", lambda: (xs.sort(key=lambda v: -v), xs)[1])
+trap("ok update", lambda: (d.update({"b": 2}, c=3), d.update(e=5), d.update(), d)[3])
+trap("ok self update", lambda: (d.update(d, a=0), d)[1])
+trap("ok set update", lambda: (s.update({2}, [3]), s)[1])
+"#,
+    );
+}
+
+#[test]
+fn rc_int_is_integer() {
+    assert_matches_cpython(
+        "rc_int_is_integer",
+        r#"trap("int", lambda: (3).is_integer())
+trap("neg", lambda: (-7).is_integer())
+trap("big", lambda: (2 ** 100).is_integer())
+trap("bool", lambda: True.is_integer())
+trap("unbound", lambda: int.is_integer(5))
+trap("float", lambda: (2.5).is_integer())
+trap("arg", lambda: (3).is_integer(1))
+trap("hasattr", lambda: hasattr(3, "is_integer"))
+"#,
+    );
+}
