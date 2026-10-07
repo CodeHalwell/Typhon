@@ -37,6 +37,12 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   side effects came out in the wrong order. The pre-run scan now sends such
   a program to CPython with a `note:`, as it already does for unmodelled
   modules. `--no-fallback` keeps the old behaviour.
+- **`__mro__` and `__bases__` of builtin types and exceptions under
+  `tyc run`.** `ValueError.__mro__` and `bool.__mro__` raised
+  `AttributeError`, and a class deriving from a builtin exception listed
+  only itself and `object`. They now give CPython's chain
+  (`AppError, ValueError, Exception, BaseException, object`), and
+  `__bases__` works on every class.
 
 ### Documentation
 

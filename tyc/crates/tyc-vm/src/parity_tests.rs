@@ -687,6 +687,40 @@ asyncio.run(main())
     );
 }
 
+// ── `__mro__` / `__bases__` of builtin types and exceptions ──────────────
+
+#[test]
+fn builtin_mro_and_bases_match_cpython() {
+    assert_matches_cpython(
+        "builtin_mro_and_bases_match_cpython",
+        r#"names = lambda cs: [c.__name__ for c in cs]
+class AppError(ValueError):
+    pass
+class Deeper(AppError):
+    pass
+plain class Base:
+    pass
+plain class Child(Base):
+    pass
+plain class Mixin:
+    pass
+plain class Both(Child, Mixin):
+    pass
+plain class PlainErr(ValueError):
+    pass
+plain class Sub(PlainErr):
+    pass
+show(names(ValueError.__mro__), names(KeyError.__mro__), names(FileNotFoundError.__mro__), names(KeyboardInterrupt.__mro__))
+show(names(AppError.__mro__), names(Deeper.__mro__), names(AppError.__bases__), names(Deeper.__bases__))
+show(names(type(ValueError("x")).__mro__), names(type(KeyError("k")).__bases__), names(Exception.__bases__))
+show(names(bool.__mro__), names(int.__mro__), names(bool.__bases__), names(str.__bases__))
+show(names(Child.__mro__), names(Both.__mro__), names(Both.__bases__), names(Base.__bases__))
+show(names(type(True).__mro__), names(ExceptionGroup.__mro__), names(UnicodeDecodeError.__mro__))
+show(names(Sub.__bases__), names(Sub.__mro__), names(PlainErr.__bases__))
+"#,
+    );
+}
+
 // ── W5-11: changing a dict or set while iterating it ──────────────────────
 
 #[test]

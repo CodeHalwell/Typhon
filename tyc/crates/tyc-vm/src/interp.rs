@@ -2765,6 +2765,107 @@ impl Interpreter {
         }))))
     }
 
+    /// `Cls.__mro__` (the C3 linearisation, ending in `object`) or
+    /// `Cls.__bases__`. A builtin exception a class derives from — recorded
+    /// by name rather than as a base class — contributes its own place in
+    /// the standard hierarchy (`AppError, ValueError, Exception,
+    /// BaseException, object`), as does a builtin type's stand-in class
+    /// (`type(ValueError())`, `type(True)`).
+    fn class_mro_or_bases(&self, class: &Rc<Class>, mro: bool) -> Value {
+        let type_of = |name: &str| {
+            self.root
+                .get(name)
+                .unwrap_or_else(|| crate::builtins::make_builtin_type(name))
+        };
+        let object = crate::builtins::make_builtin_type("object");
+        let is_stand_in = matches!(
+            crate::builtins::make_builtin_type(&class.name),
+            Value::Class(c) if Rc::ptr_eq(&c, class)
+        );
+        if is_stand_in {
+            let mut chain: Vec<Value> = vec![Value::Class(class.clone())];
+            if let Some(names) = builtin_exc_mro(&class.name) {
+                chain.extend(names[1..].iter().map(|n| type_of(n)));
+            } else if class.name == "bool" {
+                chain.push(type_of("int"));
+            }
+            if class.name != "object" {
+                chain.push(object.clone());
+            }
+            return Value::Tuple(Rc::new(if mro {
+                chain
+            } else {
+                chain.get(1).cloned().into_iter().collect()
+            }));
+        }
+        // The recorded names are syntactic (`*Error` bases); only those
+        // naming a builtin exception constructor are not already in
+        // `bases` / the MRO as user classes.
+        let exc_bases = |c: &Rc<Class>| -> Vec<String> {
+            match c.class_attrs.borrow().get("__typhon_exc_bases__") {
+                Some(Value::Tuple(t)) => t
+                    .iter()
+                    .map(|v| v.py_str())
+                    .filter(|n| matches!(self.root.get(n), Some(Value::Native(_))))
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+        if !mro {
+            let mut seen: Vec<Rc<Class>> = Vec::new();
+            for c in class.bases.iter() {
+                if !crate::value::is_builtin_object(c) && !seen.iter().any(|s| Rc::ptr_eq(s, c)) {
+                    seen.push(c.clone());
+                }
+            }
+            let mut bases: Vec<Value> = seen.into_iter().map(Value::Class).collect();
+            // A recorded name a base also records was inherited with the
+            // base's class attributes, not written in this class's header.
+            let inherited: Vec<String> = class.bases.iter().flat_map(exc_bases).collect();
+            bases.extend(
+                exc_bases(class)
+                    .iter()
+                    .filter(|n| !inherited.contains(n))
+                    .map(|n| type_of(n)),
+            );
+            if bases.is_empty() {
+                bases.push(object);
+            }
+            return Value::Tuple(Rc::new(bases));
+        }
+        let mut out: Vec<Value> = Vec::new();
+        let mut builtin: Vec<String> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        let mut seen: Vec<Rc<Class>> = Vec::new();
+        for c in class_mro(class).filter(|c| !crate::value::is_builtin_object(c)) {
+            if seen.iter().any(|s| Rc::ptr_eq(s, c)) {
+                continue;
+            }
+            seen.push(c.clone());
+            out.push(Value::Class(c.clone()));
+            names.extend(exc_bases(c));
+        }
+        for n in &names {
+            if let Some(chain) = builtin_exc_mro(n) {
+                for link in chain {
+                    if !builtin.iter().any(|b| b == link) {
+                        builtin.push(link.to_owned());
+                    }
+                }
+            }
+        }
+        // Keep the shared tail (`Exception`, `BaseException`) last when two
+        // builtin bases contribute it.
+        builtin.sort_by_key(|n| match n.as_str() {
+            "Exception" => 1,
+            "BaseException" => 2,
+            _ => 0,
+        });
+        out.extend(builtin.iter().map(|n| type_of(n)));
+        out.push(object);
+        Value::Tuple(Rc::new(out))
+    }
+
     /// Build a native `enum` module exposing `Enum` (and the common
     /// variants) as base classes. Each carries a sentinel class attr
     /// (`__typhon_enum_base__`) so `build_class` can recognise a subclass
@@ -7404,13 +7505,8 @@ impl Interpreter {
                     return Ok(Value::Str(Rc::new(class.name.clone())));
                 }
                 // `Cls.__mro__` — the C3 linearisation, ending in `object`.
-                if attr == "__mro__" {
-                    let mut out: Vec<Value> = class_mro(class)
-                        .filter(|c| !crate::value::is_builtin_object(c))
-                        .map(|c| Value::Class(c.clone()))
-                        .collect();
-                    out.push(crate::builtins::make_builtin_type("object"));
-                    return Ok(Value::Tuple(Rc::new(out)));
+                if attr == "__mro__" || attr == "__bases__" {
+                    return Ok(self.class_mro_or_bases(class, attr == "__mro__"));
                 }
                 // `Cls.__dict__` — the class's own namespace, read-only (a
                 // snapshot `mappingproxy`; the VM's `__typhon_*` records
@@ -7699,6 +7795,29 @@ impl Interpreter {
             }
             Value::Native(n) if attr == "__name__" || attr == "__qualname__" => {
                 Ok(Value::Str(Rc::new(n.name.to_string())))
+            }
+            // `ValueError.__mro__` / `KeyError.__bases__` — a builtin
+            // exception type's place in the standard hierarchy.
+            Value::Native(n)
+                if (attr == "__mro__" || attr == "__bases__")
+                    && (builtin_exc_mro(n.name).is_some()
+                        || crate::builtins::is_builtin_type_name(n.name)) =>
+            {
+                let Value::Class(stand_in) = crate::builtins::make_builtin_type(n.name) else {
+                    unreachable!("make_builtin_type returns a class");
+                };
+                let value_in = value;
+                let mut value = self.class_mro_or_bases(&stand_in, attr == "__mro__");
+                // The chain starts with the type itself: here that is the
+                // native constructor the program named, not its stand-in.
+                if attr == "__mro__" {
+                    if let Value::Tuple(t) = &value {
+                        let mut items = (**t).clone();
+                        items[0] = value_in.clone();
+                        value = Value::Tuple(Rc::new(items));
+                    }
+                }
+                Ok(value)
             }
             // `bytearray` is a shim *class* behind a constructor native, so
             // a class-level read (`bytearray.fromhex(...)`) resolves through
@@ -12721,9 +12840,22 @@ pub fn builtin_exc_is_a(kind: &str, target: &str) -> bool {
                 | "BaseExceptionGroup"
         );
     }
-    // Direct parent in the standard hierarchy (subset covering the common
-    // intermediate bases programs actually catch).
-    fn parent(name: &str) -> Option<&'static str> {
+    let mut cur = kind;
+    while let Some(p) = builtin_exc_parent(cur) {
+        if p == target {
+            return true;
+        }
+        cur = p;
+    }
+    false
+}
+
+/// Direct parent of a builtin exception in the standard hierarchy below
+/// `Exception` (the subset covering the intermediate bases programs
+/// actually catch); `None` for a type whose parent is `Exception` or
+/// `BaseException` itself.
+fn builtin_exc_parent(name: &str) -> Option<&'static str> {
+    {
         Some(match name {
             "ExceptionGroup" => "BaseExceptionGroup",
             "ZeroDivisionError" | "OverflowError" | "FloatingPointError" => "ArithmeticError",
@@ -12758,14 +12890,55 @@ pub fn builtin_exc_is_a(kind: &str, target: &str) -> bool {
             _ => return None,
         })
     }
-    let mut cur = kind;
-    while let Some(p) = parent(cur) {
-        if p == target {
-            return true;
-        }
+}
+
+/// The `__mro__` names of a builtin exception type, ending in
+/// `BaseException` (the caller appends `object`): `KeyError` gives
+/// `KeyError, LookupError, Exception, BaseException`. `None` when `name` is
+/// not a builtin exception.
+pub(crate) fn builtin_exc_mro(name: &str) -> Option<Vec<&str>> {
+    let base_only = matches!(
+        name,
+        "KeyboardInterrupt" | "SystemExit" | "GeneratorExit" | "BaseExceptionGroup"
+    );
+    let is_exception = base_only
+        || matches!(
+            name,
+            "BaseException"
+                | "Exception"
+                | "StopIteration"
+                | "StopAsyncIteration"
+                | "ExceptionGroup"
+        )
+        || name.ends_with("Error")
+        || name.ends_with("Warning");
+    if !is_exception {
+        return None;
+    }
+    // `IOError` / `EnvironmentError` are aliases of `OSError`.
+    let name = match name {
+        "IOError" | "EnvironmentError" => "OSError",
+        other => other,
+    };
+    let mut out = vec![name];
+    let mut cur = name;
+    while let Some(p) = builtin_exc_parent(cur) {
+        out.push(p);
         cur = p;
     }
-    false
+    match cur {
+        "BaseException" => {}
+        // `class ExceptionGroup(BaseExceptionGroup, Exception)`.
+        "BaseExceptionGroup" if name == "ExceptionGroup" => {
+            out.extend(["Exception", "BaseException"])
+        }
+        "BaseExceptionGroup" | "KeyboardInterrupt" | "SystemExit" | "GeneratorExit" => {
+            out.push("BaseException")
+        }
+        "Exception" => out.push("BaseException"),
+        _ => out.extend(["Exception", "BaseException"]),
+    }
+    Some(out)
 }
 
 /// Collect the names of walrus (`:=`) assignment targets appearing anywhere
