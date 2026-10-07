@@ -1988,6 +1988,11 @@ show(repr(eg.split(pred)))
 show(repr(eg.split((TypeError, KeyError))))
 show(eg.subgroup(lambda e: True) is eg)
 trap("bad", lambda: eg.split(3))
+class C:
+    pass
+trap("plain class", lambda: eg.split(C))
+trap("empty derive", lambda: eg.derive([]))
+show(repr(eg.split(())), eg.subgroup(()))
 "#,
     );
 }

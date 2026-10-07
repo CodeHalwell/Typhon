@@ -10017,6 +10017,12 @@ impl Interpreter {
                     )))
                 }
             };
+            if items.is_empty() {
+                return Err(Unwind::Exception(crate::error::VmException::new(
+                    "ValueError",
+                    "second argument (exceptions) must be a non-empty sequence",
+                )));
+            }
             let kind = crate::value::exception_group_kind_for(&items);
             return Ok(crate::value::make_exception_group(
                 kind,
@@ -10026,12 +10032,11 @@ impl Interpreter {
             ));
         }
         let is_type = |v: &Value| match v {
-            Value::Class(_) => true,
+            Value::Class(c) => c.is_exception,
             Value::Native(n) => builtin_exc_mro(n.name).is_some(),
             _ => false,
         };
-        let by_type = is_type(&arg)
-            || matches!(&arg, Value::Tuple(t) if !t.is_empty() && t.iter().all(is_type));
+        let by_type = is_type(&arg) || matches!(&arg, Value::Tuple(t) if t.iter().all(is_type));
         let callable = matches!(
             arg,
             Value::Function(_) | Value::Native(_) | Value::BoundMethod { .. }
