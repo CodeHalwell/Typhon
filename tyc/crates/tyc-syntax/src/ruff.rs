@@ -85,10 +85,18 @@ pub struct UnsupportedSyntax {
 /// A source that does not parse at all yields nothing: [`parse_module`]
 /// already reports that.
 ///
-/// A `lazy` import is never reported: Typhon's own `lazy import` predates
+/// Only syntax newer than the 3.13 floor is reported (3.14's t-strings and
+/// unparenthesised `except A, B:`, 3.15's comprehension unpacking). A
+/// `lazy` import is never reported: Typhon's own `lazy import` predates
 /// PEP 810 and lowers per target, and the forms it does not lower have
 /// their own diagnostic.
+///
+/// The re-parse runs only when the text could hold one of those forms, so
+/// most files pay a byte scan rather than a second parse.
 pub fn unsupported_syntax(source: &str, major: u8, minor: u8) -> Vec<UnsupportedSyntax> {
+    if (major, minor) >= (3, 15) || !may_hold_newer_syntax(source) {
+        return Vec::new();
+    }
     let options = ruff_python_parser::ParseOptions::from(ruff_python_parser::Mode::Module)
         .with_target_version(ruff_python_ast::PythonVersion { major, minor });
     let parsed = ruff_python_parser::parse_unchecked(source, options);
@@ -99,9 +107,12 @@ pub fn unsupported_syntax(source: &str, major: u8, minor: u8) -> Vec<Unsupported
         .unsupported_syntax_errors()
         .iter()
         .filter(|e| {
-            !matches!(
+            use ruff_python_parser::UnsupportedSyntaxErrorKind as K;
+            matches!(
                 e.kind,
-                ruff_python_parser::UnsupportedSyntaxErrorKind::LazyImportStatement
+                K::UnpackingInComprehension(_)
+                    | K::UnparenthesizedExceptionTypes
+                    | K::TemplateStrings
             )
         })
         .map(|e| UnsupportedSyntax {
@@ -109,6 +120,58 @@ pub fn unsupported_syntax(source: &str, major: u8, minor: u8) -> Vec<Unsupported
             message: e.to_string(),
         })
         .collect()
+}
+
+/// Cheap pre-filter for [`unsupported_syntax`]: whether `source` could hold
+/// one of the forms it reports. Errs towards `true`; only a `false` skips
+/// the parse.
+///
+/// - comprehension unpacking starts with `[*`, `{*` or `(*` (spaces
+///   allowed after the bracket);
+/// - an unparenthesised `except A, B:` has a comma outside brackets
+///   between `except` and its colon;
+/// - a t-string has a `t` / `T` prefix (optionally with `r`) that starts a
+///   token, right before a quote.
+pub fn may_hold_newer_syntax(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'[' | b'{' | b'(' => {
+                let rest = &bytes[i + 1..];
+                let skip = rest.iter().take_while(|c| **c == b' ').count();
+                if rest.get(skip) == Some(&b'*') {
+                    return true;
+                }
+            }
+            b't' | b'T' if i == 0 || !ident(bytes[i - 1]) => {
+                let mut j = i + 1;
+                if matches!(bytes.get(j), Some(b'r' | b'R')) {
+                    j += 1;
+                }
+                if matches!(bytes.get(j), Some(b'"' | b'\'')) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    source.lines().any(|line| {
+        let Some(clause) = line.trim_start().strip_prefix("except") else {
+            return false;
+        };
+        let mut depth = 0i32;
+        for c in clause.bytes() {
+            match c {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                b',' if depth == 0 => return true,
+                b':' if depth == 0 => return false,
+                _ => {}
+            }
+        }
+        false
+    })
 }
 
 /// Cheap pre-filter: whether the source's own code brackets (not those in

@@ -1185,6 +1185,9 @@ pub(crate) fn check_target_syntax(path: &str, source: &str, target: &str) -> Dia
     let Some((major, minor)) = python_target_u8(target) else {
         return Diagnostics::new();
     };
+    if !tyc_analyse::target_version_check_may_fire(source, major, minor) {
+        return Diagnostics::new();
+    }
     let (expanded, expanded_to_source) = expand_sugar_mapped(source, true);
     let (mut prep, prep_to_expanded) = preprocess_mapped(&expanded);
     prep.line_map = compose_line_maps(&prep_to_expanded, &expanded_to_source);

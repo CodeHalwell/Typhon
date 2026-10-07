@@ -227,6 +227,13 @@ pub fn target_version_diagnostics(path: &str, source: &str, major: u8, minor: u8
             usize::from(hit.range.len()),
         ));
     }
+    // Parse again only when a newer builtin's name appears in the text.
+    let may_use_newer_builtin = NEWER_BUILTINS
+        .iter()
+        .any(|(name, added)| (major, minor) < *added && source.contains(name));
+    if !may_use_newer_builtin {
+        return diags;
+    }
     if let Ok(parsed) = tyc_syntax::parse_module(source) {
         for (name, added, range) in newer_builtin_uses(&parsed.into_syntax(), (major, minor)) {
             diags.push_error(TycError::requires_newer_python(
@@ -242,6 +249,17 @@ pub fn target_version_diagnostics(path: &str, source: &str, major: u8, minor: u8
         }
     }
     diags
+}
+
+/// Whether [`target_version_diagnostics`] could report anything for
+/// `source` on Python `major.minor`: a byte scan that lets callers skip
+/// preprocessing and parsing for the check on most files. Works on the
+/// `.ty` text as well as the preprocessed Python.
+pub fn target_version_check_may_fire(source: &str, major: u8, minor: u8) -> bool {
+    ((major, minor) < (3, 15) && tyc_syntax::may_hold_newer_syntax(source))
+        || NEWER_BUILTINS
+            .iter()
+            .any(|(name, added)| (major, minor) < *added && source.contains(name))
 }
 
 /// Builtins newer than the 3.13 floor, with the version that added them.
@@ -372,7 +390,9 @@ pub fn editor_lint_diagnostics(
     // `[python] target`, which the shared pipeline does not carry.
     // `tyc build` calls `target_version_diagnostics` itself.
     if let Some((major, minor)) = opts.python_target {
-        diags.extend(target_version_diagnostics(path, source, major, minor));
+        if target_version_check_may_fire(source, major, minor) {
+            diags.extend(target_version_diagnostics(path, source, major, minor));
+        }
     }
     diags.extend(analyse_empty_collection_bindings(module, path, source));
     diags.extend(analyse_typing_alias_annotations(module, path, source));
@@ -8060,6 +8080,17 @@ mod lint_tests {
         // A module's own `frozendict` is not the builtin.
         let own = "class frozendict:\n    x: int\ndef sentinel(n: str) -> str:\n    return n\nprint(frozendict(x=1), sentinel(\"a\"))\n";
         assert!(target_errors(own, (3, 13)).is_empty());
+    }
+
+    #[test]
+    fn target_syntax_flags_3_14_forms_on_3_13() {
+        for src in [
+            "let name = \"x\"\nlet t = t\"hi {name}\"\n",
+            "try:\n    pass\nexcept ValueError, TypeError:\n    pass\n",
+        ] {
+            assert_eq!(target_errors(src, (3, 13)).len(), 1, "{src:?}");
+            assert!(target_errors(src, (3, 14)).is_empty(), "{src:?}");
+        }
     }
 
     #[test]
