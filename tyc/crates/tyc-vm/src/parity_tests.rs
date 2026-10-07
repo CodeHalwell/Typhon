@@ -635,6 +635,10 @@ class MixAuto(Flag):
     B = 4
     C = auto()
 show(NegAuto.B.value, NegAutoI.B.value, MixAuto.C.value)
+class BoolAuto(Flag):
+    A = True
+    B = auto()
+show(BoolAuto.B.value)
 show(list(Neg), list(Neg.A))
 "#,
     );
@@ -941,6 +945,15 @@ async def lambda_default_genexp() -> None:
     async for v in g:
         show("lam", v)
 asyncio.run(lambda_default_genexp())
+plain class GenexpAiter:
+    def __aiter__(self) -> object:
+        return (x async for x in source())
+async def genexp_aiter() -> None:
+    async for x in GenexpAiter():
+        show("ai", x)
+    mut nested = ((await fetch(z) for z in [1]) for _ in [1])
+    show(type(nested).__name__)
+asyncio.run(genexp_aiter())
 plain class AwaitableIter:
     def __init__(self) -> None:
         self.n = 0
@@ -1004,6 +1017,15 @@ fn builtin_mro_and_bases_match_cpython() {
         r#"names = lambda cs: [c.__name__ for c in cs]
 class AppError(ValueError):
     pass
+class Computed(type(ValueError())):
+    pass
+show(names(Computed.__mro__), issubclass(Computed, Exception))
+def raise_computed() -> None:
+    try:
+        raise Computed("boom")
+    except ValueError as e:
+        show("caught", type(e).__name__, e)
+raise_computed()
 class Deeper(AppError):
     pass
 plain class Base:

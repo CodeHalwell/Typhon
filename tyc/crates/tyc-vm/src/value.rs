@@ -1858,6 +1858,13 @@ pub fn genexpr_is_async(st: &GenExprState) -> bool {
             match expr {
                 _ if self.found => {}
                 ruff_python_ast::Expr::Await(_) => self.found = true,
+                // A nested generator expression owns the awaits in its body;
+                // only its outermost iterable runs here.
+                ruff_python_ast::Expr::Generator(g) => {
+                    if let Some(first) = g.generators.first() {
+                        self.visit_expr(&first.iter);
+                    }
+                }
                 // A lambda's body is its own scope; its defaults run here.
                 ruff_python_ast::Expr::Lambda(l) => {
                     if let Some(params) = &l.parameters {

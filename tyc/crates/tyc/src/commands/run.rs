@@ -927,8 +927,16 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for DelBinding {
             Expr::Name(n) if matches!(n.ctx, ExprContext::Store) => {
                 self.found |= n.id.as_str() == "__del__"
             }
-            // A lambda body is its own scope.
-            Expr::Lambda(_) => {}
+            // A lambda body is its own scope; its defaults run here.
+            Expr::Lambda(l) => {
+                if let Some(params) = &l.parameters {
+                    for p in params.iter_non_variadic_params() {
+                        if let Some(d) = p.default() {
+                            self.visit_expr(d);
+                        }
+                    }
+                }
+            }
             _ => ruff_python_ast::visitor::walk_expr(self, expr),
         }
     }
@@ -1617,6 +1625,10 @@ mod tests {
             .contains(&"a custom metaclass".to_owned()));
         let header = "def cleanup(self: object) -> None:\n    print(\"bye\")\nplain class D:\n    def f(self, x: object = (__del__ := cleanup)) -> None:\n        pass\nprint(D())\n";
         assert!(scan_source(header)
+            .unwrap_or_default()
+            .contains(&"a `__del__` finaliser".to_owned()));
+        let lambda_default = "def cleanup(self: object) -> None:\n    print(\"bye\")\nplain class D:\n    f = lambda x=(__del__ := cleanup): None\nprint(D())\n";
+        assert!(scan_source(lambda_default)
             .unwrap_or_default()
             .contains(&"a `__del__` finaliser".to_owned()));
         let captured =

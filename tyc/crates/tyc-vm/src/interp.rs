@@ -1709,9 +1709,30 @@ impl Interpreter {
         // `__bases__`.
         let mut header_bases: Vec<Value> = Vec::new();
         let mut header_has_builtin = false;
+        // Builtin exception bases reached through a computed expression
+        // (`type(ValueError())`), which the header-name scan below misses.
+        let mut computed_exc_bases: Vec<Value> = Vec::new();
         if let Some(args) = &c.arguments {
             for arg in args.args.iter() {
                 let v = self.eval_expr(arg, env)?;
+                if let Value::Class(sc) = &v {
+                    if crate::builtins::is_builtin_type_class(sc)
+                        && name_is_exception_base(&sc.name)
+                    {
+                        computed_exc_bases.push(Value::Str(Rc::new(sc.name.clone())));
+                    }
+                }
+                // A computed builtin base (`class E(type(ValueError()))`)
+                // arrives as the `type(x)` stand-in; it means the builtin of
+                // that name, as if the header had spelt it.
+                let v = match v {
+                    Value::Class(c) if crate::builtins::is_builtin_type_class(&c) => self
+                        .builtin_globals
+                        .get(&c.name)
+                        .cloned()
+                        .unwrap_or(Value::Class(c)),
+                    other => other,
+                };
                 match v {
                     Value::Class(c) => {
                         if crate::value::is_builtin_object(&c) {
@@ -2142,7 +2163,7 @@ impl Interpreter {
         // in this class's base list. They're dropped from `bases` (the VM has
         // no `Value::Class` for builtin exceptions), so record them here so
         // `except KeyError` can catch a user `class MyKeyError(KeyError):`.
-        let builtin_exc_bases: Vec<Value> = c
+        let mut builtin_exc_bases: Vec<Value> = c
             .arguments
             .as_ref()
             .map(|args| {
@@ -2154,6 +2175,7 @@ impl Interpreter {
                     .collect()
             })
             .unwrap_or_default();
+        builtin_exc_bases.extend(computed_exc_bases);
         let is_exception = bases.iter().any(|b| b.is_exception) || !builtin_exc_bases.is_empty();
         // Never inherited: a base's record describes the base's header.
         class_attrs.remove("__typhon_header_bases__");
@@ -3421,6 +3443,11 @@ impl Interpreter {
                     if let Some(v) = i.to_i64() {
                         flag_high = Some(flag_high.map_or(v, |h| h.max(v)));
                     }
+                }
+                // `A = True` is the integer 1 to `auto()`.
+                if let Value::Bool(b) = &raw {
+                    let v = *b as i64;
+                    flag_high = Some(flag_high.map_or(v, |h| h.max(v)));
                 }
                 // A second name for an existing value is an *alias* of that
                 // member: the same object, not a new member, and absent
@@ -8832,7 +8859,10 @@ impl Interpreter {
                     // An async generator returned from `__aiter__` runs on
                     // the shared generator path; anything else without
                     // `__anext__` is CPython's `TypeError`.
-                    if as_generator(&aiter).is_some() {
+                    let async_genexpr = matches!(&aiter, Value::Iter(it)
+                        if matches!(&*it.borrow(), IterState::GenExpr(g)
+                            if crate::value::genexpr_is_async(&g.borrow())));
+                    if as_generator(&aiter).is_some() || async_genexpr {
                         return self.make_iter(aiter);
                     }
                     let has_anext = matches!(&aiter, Value::Instance(target)

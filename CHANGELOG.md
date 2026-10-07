@@ -8,6 +8,15 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ### Fixed
 
+- **Builtin-type bases, bool flag values and nested genexps.** Under
+  `tyc run`, a class whose base is computed (`class E(type(ValueError()))`)
+  now inherits from the real builtin, so its `__mro__`, `issubclass` and
+  `except` behaviour match CPython. A `True` member feeds a flag's next
+  `auto()` (`A = True; B = auto()` gives `B == 2`). An `__aiter__` that
+  returns an async generator expression is iterated. A nested generator
+  expression no longer makes its enclosing one async unless the `await` is
+  in its first iterable. The pre-run scan also sees `__del__` bound in a
+  lambda default.
 - **Awaitables, flag `auto()` and star imports.** An `__await__` iterator
   that finishes with `StopIteration(value)` now gives `value` as the
   await's result under `tyc run` (it was `None`); a flag `auto()` after a
