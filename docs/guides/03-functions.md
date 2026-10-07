@@ -287,7 +287,7 @@ back to the file header. Nested `def` follows the same scoping rules as
 in Python: the helper is recreated every call, captures the enclosing
 function's locals, and isn't visible outside.
 
-> Nested `lazy from X import Y` is **not** supported — `lazy import` is
+> Nested `lazy from X import Y` is **not** supported — lazy imports are
 > module-level only. Reach for `lazy import np = numpy` at module level
 > plus `np.array(...)` at the use site.
 

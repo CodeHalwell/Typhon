@@ -483,6 +483,11 @@ pub fn run(args: BuildArgs) -> Result<()> {
             &project_shapes,
         );
         all_phase1_diags.extend(file_diags);
+        all_phase1_diags.extend(crate::commands::check::check_target_syntax(
+            &path.to_string_lossy(),
+            source,
+            &config.python.target,
+        ));
     }
 
     // Apply strictness rules (e.g. promote unused-import warnings to errors).
@@ -1394,6 +1399,15 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // the `.py.map` sidecar stays valid at line granularity.
         if native_lazy_imports && !prep.lazy_imports.is_empty() {
             python_src = prefix_native_lazy_imports(&python_src, &prep.lazy_imports);
+        }
+        // `lazy from M import …` (PEP 810) went through as a plain
+        // from-import; stamp the `lazy ` back on the same way. Older
+        // targets never get here with one: `tyc::requires_newer_python`.
+        if native_lazy_imports {
+            let lazy_from = lazy_from_import_keys(&prep);
+            if !lazy_from.is_empty() {
+                python_src = prefix_native_lazy_from_imports(&python_src, &lazy_from);
+            }
         }
 
         let rel = path
@@ -2978,6 +2992,98 @@ fn prefix_native_lazy_imports(src: &str, lazy_imports: &[LazyImport]) -> String 
     out
 }
 
+/// The module-level from-imports the preprocessor stripped a `lazy ` off,
+/// each as its [`import_from_key`].
+fn lazy_from_import_keys(prep: &tyc_syntax::preprocess::PreprocessResult) -> Vec<String> {
+    let lines: Vec<&str> = prep.python_source.lines().collect();
+    prep.stripped
+        .iter()
+        .filter(|s| s.keyword == tyc_syntax::lexer::TyphonKeyword::Lazy)
+        .filter_map(|s| {
+            let first = lines.get(s.line_index)?;
+            if !first.starts_with("from ") {
+                return None;
+            }
+            module_level_import_from_key(&lines, s.line_index).map(|(key, _)| key)
+        })
+        .collect()
+}
+
+/// `from M import a, b as c` in one canonical spelling, whatever the
+/// line breaks and parentheses.
+fn import_from_key(f: &tyc_syntax::ast::StmtImportFrom) -> String {
+    let names: Vec<String> = f
+        .names
+        .iter()
+        .map(|a| match &a.asname {
+            Some(asname) => format!("{} as {asname}", a.name),
+            None => a.name.to_string(),
+        })
+        .collect();
+    format!(
+        "{}{} import {}",
+        ".".repeat(f.level as usize),
+        f.module.as_ref().map(|m| m.as_str()).unwrap_or(""),
+        names.join(", ")
+    )
+}
+
+/// The from-import statement starting at `lines[start]` (it may continue
+/// over a parenthesised or backslash-continued tail): its
+/// [`import_from_key`] and the number of lines it spans.
+fn module_level_import_from_key(lines: &[&str], start: usize) -> Option<(String, usize)> {
+    let mut text = String::new();
+    let mut depth: i32 = 0;
+    let mut end = start;
+    while let Some(line) = lines.get(end) {
+        text.push_str(line);
+        text.push('\n');
+        end += 1;
+        let code = line.split('#').next().unwrap_or("");
+        depth += code.matches('(').count() as i32 - code.matches(')').count() as i32;
+        if depth <= 0 && !code.trim_end().ends_with('\\') {
+            break;
+        }
+    }
+    let parsed = tyc_syntax::parse_module(&text).ok()?.into_syntax();
+    match parsed.body.as_slice() {
+        [tyc_syntax::ast::Stmt::ImportFrom(f)] => Some((import_from_key(f), end - start)),
+        _ => None,
+    }
+}
+
+/// Prefix `lazy ` on the first module-level from-import matching each of
+/// `keys` (once each), as [`prefix_native_lazy_imports`] does for
+/// `lazy import`. Line count is unchanged, so the `.py.map` stays valid.
+fn prefix_native_lazy_from_imports(src: &str, keys: &[String]) -> String {
+    let lines: Vec<&str> = src.split_inclusive('\n').collect();
+    let bare: Vec<&str> = lines
+        .iter()
+        .map(|l| l.trim_end_matches(['\n', '\r']))
+        .collect();
+    let mut claimed = vec![false; keys.len()];
+    let mut out = String::with_capacity(src.len() + keys.len() * 5);
+    let mut i = 0;
+    while i < lines.len() {
+        if bare[i].starts_with("from ") && claimed.iter().any(|c| !c) {
+            if let Some((key, span)) = module_level_import_from_key(&bare, i) {
+                if let Some(k) = (0..keys.len()).find(|&k| !claimed[k] && keys[k] == key) {
+                    claimed[k] = true;
+                    out.push_str("lazy ");
+                }
+                for line in &lines[i..i + span] {
+                    out.push_str(line);
+                }
+                i += span;
+                continue;
+            }
+        }
+        out.push_str(lines[i]);
+        i += 1;
+    }
+    out
+}
+
 /// Minimal JSON string escape for paths used in the `.py.map` body.  Only
 /// backslashes and double quotes need escaping; the rest of ASCII passes
 /// through unchanged.  Non-ASCII bytes (e.g. UTF-8 multi-byte sequences) are
@@ -3391,11 +3497,44 @@ fn generated_runtime_files(config: &TyphonConfig) -> Vec<(&'static str, String)>
         ("stdlib.py", TYPHON_RUNTIME_STDLIB_PY.to_owned()),
         ("result.py", TYPHON_RUNTIME_RESULT_PY.to_owned()),
         ("parallel.py", parallel_py),
-        ("freeze.py", TYPHON_RUNTIME_FREEZE_PY.to_owned()),
+        ("freeze.py", typhon_runtime_freeze_py(config)),
         ("cast.py", TYPHON_RUNTIME_CAST_PY.to_owned()),
         ("traceback.py", TYPHON_RUNTIME_TRACEBACK_PY.to_owned()),
     ]
 }
+
+/// `freeze.py` for the project's target. On a 3.15+ `[python] target` a
+/// frozen `dict` becomes the builtin `frozendict` (PEP 814) — immutable,
+/// hashable and picklable — instead of a read-only `MappingProxyType`
+/// view; older targets get [`TYPHON_RUNTIME_FREEZE_PY`] unchanged.
+fn typhon_runtime_freeze_py(config: &TyphonConfig) -> String {
+    let native_frozendict = crate::config::parse_python_target(&config.python.target)
+        .is_some_and(|major_minor| major_minor >= (3, 15));
+    if !native_frozendict {
+        return TYPHON_RUNTIME_FREEZE_PY.to_owned();
+    }
+    TYPHON_RUNTIME_FREEZE_PY
+        .replacen(
+            FREEZE_DICT_BRANCH,
+            &FREEZE_DICT_BRANCH.replacen(
+                "MappingProxyType(",
+                "(_frozendict or MappingProxyType)(",
+                1,
+            ),
+            1,
+        )
+        .replacen(
+            "`dict → MappingProxyType`,\n    `set → frozenset`.",
+            "`dict → frozendict`,\n    `set → frozenset`.",
+            1,
+        )
+}
+
+/// The `dict` arm of [`TYPHON_RUNTIME_FREEZE_PY`]'s `_deep_freeze`.
+const FREEZE_DICT_BRANCH: &str = "    if isinstance(value, dict):
+        seen.add(value_id)
+        try:
+            return MappingProxyType(";
 
 /// Generated `typhon_runtime/__init__.py` — exposes `Ok`/`Err`/`Result` plus
 /// the `tasks` and `lazy` submodules at the package root.
@@ -4156,6 +4295,7 @@ const TYPHON_RUNTIME_FREEZE_PY: &str = "\
 \"\"\"Deep-freeze helper backing Typhon's `freeze let` keyword.\"\"\"
 from __future__ import annotations
 
+import builtins as _builtins
 import datetime as _datetime
 import decimal as _decimal
 import enum as _enum
@@ -4194,8 +4334,15 @@ _FROZEN_PRIMITIVES = (
     _types.BuiltinFunctionType,
 )
 
+# Python 3.15's builtin `frozendict` (PEP 814) is immutable but holds
+# arbitrary values, so it is descended into like `MappingProxyType`. On
+# 3.13 / 3.14 the name does not exist and this stays `None`.
+_frozendict = getattr(_builtins, \"frozendict\", None)
+
 # Containers that are already immutable at runtime — pass through unchanged.
-_FROZEN_CONTAINERS = (tuple, frozenset, MappingProxyType, range, bytes)
+_FROZEN_CONTAINERS = (tuple, frozenset, MappingProxyType, range, bytes) + (
+    (_frozendict,) if _frozendict is not None else ()
+)
 
 
 def deep_freeze(value: Any) -> Any:
@@ -4247,6 +4394,12 @@ def _deep_freeze(value: Any, seen: set[int]) -> Any:
             seen.add(value_id)
             try:
                 return MappingProxyType({k: _deep_freeze(v, seen) for k, v in value.items()})
+            finally:
+                seen.discard(value_id)
+        if _frozendict is not None and isinstance(value, _frozendict):
+            seen.add(value_id)
+            try:
+                return _frozendict({k: _deep_freeze(v, seen) for k, v in value.items()})
             finally:
                 seen.discard(value_id)
         return value
@@ -6410,6 +6563,112 @@ let pet: Animal = Dog(name=\"Rex\")
         assert_eq!(
             scan_overdeep_relative_imports("from ...top import t\n", 2).len(),
             1
+        );
+    }
+
+    /// The generated `deep_freeze` keeps a Python 3.15 `frozendict`
+    /// (PEP 814) as a `frozendict`, freezes its values, and still rejects
+    /// a cycle through one. Calls the helper directly, because the checker
+    /// does not know the `frozendict` name yet. Needs `python3.15`: skipped
+    /// without it, unless `TYC_REQUIRE_PYTHON315` is set (the CI test job
+    /// sets it).
+    #[test]
+    fn runtime_deep_freeze_handles_py315_frozendict() {
+        let have_py315 = std::process::Command::new("python3.15")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !have_py315 {
+            if std::env::var_os("TYC_REQUIRE_PYTHON315").is_some() {
+                panic!("TYC_REQUIRE_PYTHON315 is set but python3.15 is not on PATH");
+            }
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("freeze.py"), TYPHON_RUNTIME_FREEZE_PY).unwrap();
+        let script = "\
+from freeze import deep_freeze
+r = deep_freeze(frozendict(a=[1, {2}], b=frozendict(c=[3])))
+assert type(r) is frozendict, type(r)
+assert r == frozendict(a=(1, frozenset({2})), b=frozendict(c=(3,))), r
+assert type(r['b']) is frozendict
+lst = []
+lst.append(frozendict(x=lst))
+try:
+    deep_freeze(lst)
+except TypeError as e:
+    assert 'cycle' in str(e), e
+else:
+    raise AssertionError('cycle through a frozendict was not rejected')
+print('ok')
+";
+        let out = std::process::Command::new("python3.15")
+            .args([
+                "-I",
+                "-c",
+                &format!("import sys; sys.path.insert(0, '.')\n{script}"),
+            ])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "ok",
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// On a 3.15+ target `freeze let` turns a dict into a builtin
+    /// `frozendict`; older targets keep the `MappingProxyType` runtime
+    /// byte for byte.
+    #[test]
+    fn runtime_deep_freeze_makes_frozendicts_on_3_15_targets() {
+        let mut config = TyphonConfig::default();
+        config.python.target = "3.13".to_owned();
+        assert_eq!(typhon_runtime_freeze_py(&config), TYPHON_RUNTIME_FREEZE_PY);
+        config.python.target = "3.15".to_owned();
+        let freeze_py = typhon_runtime_freeze_py(&config);
+        assert!(
+            freeze_py
+                .contains("return (_frozendict or MappingProxyType)({k: _deep_freeze(v, seen)"),
+            "the dict arm was not rewritten:\n{freeze_py}"
+        );
+        let have_py315 = std::process::Command::new("python3.15")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !have_py315 {
+            if std::env::var_os("TYC_REQUIRE_PYTHON315").is_some() {
+                panic!("TYC_REQUIRE_PYTHON315 is set but python3.15 is not on PATH");
+            }
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("freeze.py"), freeze_py).unwrap();
+        let script = "\
+from freeze import deep_freeze
+r = deep_freeze({'a': [1, {'b': 2}], 'c': {3}})
+assert type(r) is frozendict, type(r)
+assert type(r['a'][1]) is frozendict, type(r['a'][1])
+assert r == frozendict(a=(1, frozendict(b=2)), c=frozenset({3})), r
+assert hash(deep_freeze({'x': 1})) == hash(frozendict(x=1))
+print('ok')
+";
+        let out = std::process::Command::new("python3.15")
+            .args([
+                "-I",
+                "-c",
+                &format!("import sys; sys.path.insert(0, '.')\n{script}"),
+            ])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "ok",
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 }

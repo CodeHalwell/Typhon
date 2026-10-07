@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use indexmap::IndexMap;
 use num_bigint::BigInt;
-use num_traits::Signed;
+use num_traits::{Signed, Zero};
 use ruff_python_ast::{
     self as ast, BoolOp, CmpOp, ExceptHandler, Expr, FStringPart, InterpolatedStringElement,
     ModModule, Mutability, Number, Operator, Parameters, Pattern, Stmt, UnaryOp,
@@ -65,6 +65,12 @@ type MethodTableCache = HashMap<String, Option<Rc<Function>>>;
 
 pub struct Interpreter {
     pub root: EnvRef,
+    /// Set only while an `async for` builds its iterator: the one place a
+    /// hand-written `__aiter__` / `__anext__` object is iterable.
+    async_iteration: bool,
+    /// The builtins as installed, before the program can rebind any of
+    /// them: a class's `__bases__` keeps the real `list` after `list = 7`.
+    builtin_globals: HashMap<String, Value>,
     pub stack_depth: usize,
     pub max_stack_depth: usize,
     /// Byte offset (into the current source) of the statement being
@@ -269,6 +275,8 @@ impl Interpreter {
             root: root.clone(),
             stack_depth: 0,
             current_offset: 0,
+            async_iteration: false,
+            builtin_globals: HashMap::new(),
             current_source: None,
             // Match CPython's default `sys.getrecursionlimit()` of 1000
             // (FINDINGS #31). The tree-walking interpreter still pays a
@@ -306,6 +314,7 @@ impl Interpreter {
                 .unwrap_or(0),
         };
         crate::builtins::install(&mut interp);
+        interp.builtin_globals = interp.root.snapshot().into_iter().collect();
         interp
     }
 
@@ -636,6 +645,17 @@ impl Interpreter {
                     return Ok(None);
                 };
                 let it = iters[depth].clone().unwrap_or(Value::None);
+                // PEP 798 `(*x for ...)`: one slot past the clauses holds the
+                // iterator being spread; drain it before advancing a clause.
+                if depth == node.generators.len() {
+                    match self.iter_next(&it)? {
+                        Some(v) => return Ok(Some(v)),
+                        None => {
+                            iters[depth] = None;
+                            continue;
+                        }
+                    }
+                }
                 let clause = &node.generators[depth];
                 match self.iter_next(&it)? {
                     None => {
@@ -658,6 +678,11 @@ impl Interpreter {
                             continue;
                         }
                         if depth + 1 == node.generators.len() {
+                            if let Expr::Starred(star) = node.elt.as_ref() {
+                                let spread = self.eval_expr(&star.value, &env)?;
+                                iters[depth + 1] = Some(self.make_iter(spread)?);
+                                continue;
+                            }
                             return Ok(Some(self.eval_expr(&node.elt, &env)?));
                         }
                         let next_iterable =
@@ -1207,7 +1232,13 @@ impl Interpreter {
             None => {
                 let iterable = self.eval_expr(&s.iter, env)?;
                 let generator = as_generator(&iterable);
-                (self.make_iter(iterable)?, generator, false)
+                if s.is_async {
+                    reject_sync_only_async_iterable(&iterable)?;
+                }
+                self.async_iteration = s.is_async;
+                let iter = self.make_iter(iterable);
+                self.async_iteration = false;
+                (iter?, generator, false)
             }
             Some(ResumeFrame::ForBody { iter }) => (iter, None, true),
             Some(ResumeFrame::LoopElse) => return self.exec_loop_else(&s.orelse, env),
@@ -1434,24 +1465,59 @@ impl Interpreter {
     /// `del target, …`.
     fn exec_delete(&mut self, d: &ast::StmtDelete, env: &EnvRef) -> Result<(), Unwind> {
         for t in &d.targets {
-            match t {
-                Expr::Name(n) => {
-                    env.delete(n.id.as_str());
+            self.delete_target(t, env)?;
+        }
+        Ok(())
+    }
+
+    /// One `del` target; a tuple or list target deletes each element in
+    /// turn (`del (a, b)`, `del [xs[0], d["k"]]`).
+    fn delete_target(&mut self, t: &Expr, env: &EnvRef) -> Result<(), Unwind> {
+        match t {
+            Expr::Name(n) => {
+                let name = n.id.as_str();
+                if !env.delete(name) {
+                    return Err(match env.delete_scope(name) {
+                        crate::env::DeleteScope::Global => {
+                            name_error(format!("name '{name}' is not defined"))
+                        }
+                        crate::env::DeleteScope::Local => Unwind::Exception(VmException::new(
+                            "UnboundLocalError",
+                            format!(
+                                "cannot access local variable '{name}' where it is not \
+                                     associated with a value"
+                            ),
+                        )),
+                        crate::env::DeleteScope::Free => name_error(format!(
+                            "cannot access free variable '{name}' where it is not \
+                                 associated with a value in enclosing scope"
+                        )),
+                    });
                 }
-                Expr::Subscript(sub) => {
-                    let target = self.eval_expr(&sub.value, env)?;
-                    // Slice-aware: `del lst[i:j]` evaluates the slice
-                    // to the `__slice__` marker `del_subscript` handles.
-                    let key = self.eval_subscript_index(&sub.slice, env)?;
-                    self.del_subscript(&target, &key)?;
-                }
-                // `del obj.attr` removes an instance attribute.
-                Expr::Attribute(a) => {
-                    let recv = self.eval_expr(&a.value, env)?;
-                    self.del_attr(&recv, a.attr.as_str())?;
-                }
-                _ => return Err(not_implemented("complex delete targets")),
             }
+            Expr::Tuple(tup) => {
+                for e in &tup.elts {
+                    self.delete_target(e, env)?;
+                }
+            }
+            Expr::List(list) => {
+                for e in &list.elts {
+                    self.delete_target(e, env)?;
+                }
+            }
+            Expr::Subscript(sub) => {
+                let target = self.eval_expr(&sub.value, env)?;
+                // Slice-aware: `del lst[i:j]` evaluates the slice
+                // to the `__slice__` marker `del_subscript` handles.
+                let key = self.eval_subscript_index(&sub.slice, env)?;
+                self.del_subscript(&target, &key)?;
+            }
+            // `del obj.attr` removes an instance attribute.
+            Expr::Attribute(a) => {
+                let recv = self.eval_expr(&a.value, env)?;
+                self.del_attr(&recv, a.attr.as_str())?;
+            }
+            _ => return Err(not_implemented("complex delete targets")),
         }
         Ok(())
     }
@@ -1654,17 +1720,72 @@ impl Interpreter {
         // are constructor natives, not `Class`es; remember their names so
         // `isinstance(x, dict)` still answers like CPython.
         let mut builtin_bases: Vec<Value> = Vec::new();
+        // The header's class bases and builtin type / exception bases,
+        // interleaved in declaration order, for the C3 `__mro__` /
+        // `__bases__`.
+        let mut header_bases: Vec<Value> = Vec::new();
+        let mut header_has_builtin = false;
+        // Builtin exception bases reached through a computed expression
+        // (`type(ValueError())`), which the header-name scan below misses.
+        let mut computed_exc_bases: Vec<Value> = Vec::new();
         if let Some(args) = &c.arguments {
             for arg in args.args.iter() {
                 let v = self.eval_expr(arg, env)?;
+                if let Value::Class(sc) = &v {
+                    if crate::builtins::is_builtin_type_class(sc)
+                        && name_is_exception_base(&sc.name)
+                    {
+                        computed_exc_bases.push(Value::Str(Rc::new(sc.name.clone())));
+                    }
+                }
+                // A computed builtin base (`class E(type(ValueError()))`)
+                // arrives as the `type(x)` stand-in; it means the builtin of
+                // that name, as if the header had spelt it.
+                let v = match v {
+                    Value::Class(c) if crate::builtins::is_builtin_type_class(&c) => self
+                        .builtin_globals
+                        .get(&c.name)
+                        .cloned()
+                        .unwrap_or(Value::Class(c)),
+                    other => other,
+                };
                 match v {
-                    Value::Class(c) => bases.push(c),
+                    Value::Class(c) => {
+                        if crate::value::is_builtin_object(&c) {
+                            // An explicit `object` base stays in `__bases__`.
+                            header_has_builtin = true;
+                            header_bases.push(Value::Str(Rc::new("object".to_owned())));
+                        } else {
+                            header_bases.push(Value::Class(c.clone()));
+                        }
+                        bases.push(c)
+                    }
                     // `class Named(Box[int])`: a generic alias's
                     // `__mro_entries__` is its origin class.
                     Value::Instance(inst) if inst.class.name == "_GenericAlias" => {
                         if let Some(Value::Class(origin)) = inst.fields.borrow().get("__origin__") {
+                            header_bases.push(Value::Class(origin.clone()));
                             bases.push(origin.clone());
                         }
+                    }
+                    // Other subclassable builtins the VM does not model as
+                    // a base still belong in `__mro__` / `__bases__`.
+                    Value::Native(n) if matches!(n.name, "type" | "complex" | "bytearray") => {
+                        header_has_builtin = true;
+                        header_bases.push(Value::Str(Rc::new(n.name.to_owned())));
+                    }
+                    Value::Native(n)
+                        if builtin_exc_mro(n.name).is_some()
+                            && matches!(
+                                self.builtin_globals.get(n.name),
+                                Some(Value::Native(_))
+                            ) =>
+                    {
+                        header_has_builtin = true;
+                        header_bases.push(Value::Str(Rc::new(n.name.to_owned())));
+                        // An aliased base (`Alias = ValueError`) is missed by
+                        // the header-name scan below.
+                        computed_exc_bases.push(Value::Str(Rc::new(n.name.to_owned())));
                     }
                     Value::Module(_) => {
                         // e.g. `typing.Protocol` referenced as `Protocol` — ignored for v1.
@@ -1684,6 +1805,8 @@ impl Interpreter {
                                 | "object"
                         ) =>
                     {
+                        header_has_builtin = true;
+                        header_bases.push(Value::Str(Rc::new(n.name.to_owned())));
                         builtin_bases.push(Value::Str(Rc::new(n.name.to_owned())));
                     }
                     _ => {
@@ -1706,6 +1829,7 @@ impl Interpreter {
         // method body resolves a bare name, so a class attribute must never
         // shadow a module global inside one.
         let body_ns = Env::new_child(&body_env);
+        body_ns.mark_class_namespace();
 
         // A class is dataclass-shaped (annotated assigns are instance fields)
         // when it carries a `@dataclass` decorator. A `plain class` emits a
@@ -1873,6 +1997,11 @@ impl Interpreter {
                     // `obj.greet()` raised `attribute not found`.
                     let declared = f.name.as_str().to_owned();
                     body_ns.set(&declared, v.clone());
+                    // `global f` / `nonlocal f` in the class body sends the
+                    // `def` to the outer binding; the class gains no method.
+                    if body_ns.declared_outer(&declared) {
+                        continue;
+                    }
                     if let Value::Function(func) = &v {
                         if is_property {
                             properties.insert(declared.clone());
@@ -1931,7 +2060,38 @@ impl Interpreter {
                     for t in &a.targets {
                         if let Expr::Name(n) = t {
                             body_ns.set(n.id.as_str(), v.clone());
-                            class_attrs.insert(n.id.as_str().to_owned(), v.clone());
+                            // A `global` / `nonlocal` name binds outside the
+                            // class, not as a class attribute.
+                            if !body_ns.declared_outer(n.id.as_str()) {
+                                class_attrs.insert(n.id.as_str().to_owned(), v.clone());
+                            }
+                        }
+                    }
+                }
+                Stmt::Global(_) | Stmt::Nonlocal(_) => self.exec_stmt(stmt, &body_ns)?,
+                // `del name` unbinds a class attribute; an absent one is a
+                // `NameError`, as in CPython's class namespace.
+                Stmt::Delete(d) => {
+                    self.exec_delete(d, &body_ns)?;
+                    fn deleted_names<'e>(t: &'e Expr, out: &mut Vec<&'e str>) {
+                        match t {
+                            Expr::Name(n) => out.push(n.id.as_str()),
+                            Expr::Tuple(t) => t.elts.iter().for_each(|e| deleted_names(e, out)),
+                            Expr::List(l) => l.elts.iter().for_each(|e| deleted_names(e, out)),
+                            _ => {}
+                        }
+                    }
+                    let mut names = Vec::new();
+                    d.targets.iter().for_each(|t| deleted_names(t, &mut names));
+                    // A deleted `def` takes its method, property and
+                    // classmethod registrations with it.
+                    for name in names {
+                        class_attrs.remove(name);
+                        methods.remove(name);
+                        properties.remove(name);
+                        classmethods.remove(name);
+                        for role in ["cached_prop", "setter", "deleter"] {
+                            class_attrs.remove(&format!("__typhon_{role}__{name}"));
                         }
                     }
                 }
@@ -2025,7 +2185,7 @@ impl Interpreter {
         // in this class's base list. They're dropped from `bases` (the VM has
         // no `Value::Class` for builtin exceptions), so record them here so
         // `except KeyError` can catch a user `class MyKeyError(KeyError):`.
-        let builtin_exc_bases: Vec<Value> = c
+        let mut builtin_exc_bases: Vec<Value> = c
             .arguments
             .as_ref()
             .map(|args| {
@@ -2037,7 +2197,23 @@ impl Interpreter {
                     .collect()
             })
             .unwrap_or_default();
+        for b in computed_exc_bases {
+            let dup = builtin_exc_bases
+                .iter()
+                .any(|x| matches!((x, &b), (Value::Str(a), Value::Str(c)) if a == c));
+            if !dup {
+                builtin_exc_bases.push(b);
+            }
+        }
         let is_exception = bases.iter().any(|b| b.is_exception) || !builtin_exc_bases.is_empty();
+        // Never inherited: a base's record describes the base's header.
+        class_attrs.remove("__typhon_header_bases__");
+        if header_has_builtin {
+            class_attrs.insert(
+                "__typhon_header_bases__".to_owned(),
+                Value::Tuple(Rc::new(header_bases)),
+            );
+        }
         if !builtin_exc_bases.is_empty() {
             class_attrs.insert(
                 "__typhon_exc_bases__".to_owned(),
@@ -2257,11 +2433,20 @@ impl Interpreter {
                 }
             }
         }
+        // `TypedDict`'s own class keywords (`total`, and PEP 728's `closed` /
+        // `extra_items`) are consumed by its metaclass, never passed on to
+        // `__init_subclass__`.
+        let is_typed_dict = std::iter::once(class)
+            .chain(class.mro.iter())
+            .any(|k| k.class_attrs.borrow().contains_key("__typhon_typed_dict__"));
         let mut kwargs: Vec<(String, Value)> = Vec::new();
         if let Some(args) = &c.arguments {
             for kw in args.keywords.iter() {
                 match kw.arg.as_ref().map(|a| a.as_str()) {
                     Some("metaclass") => {}
+                    Some("total" | "closed" | "extra_items") if is_typed_dict => {
+                        self.eval_expr(&kw.value, env)?;
+                    }
                     Some(name) => kwargs.push((name.to_owned(), self.eval_expr(&kw.value, env)?)),
                     None => {}
                 }
@@ -2730,6 +2915,93 @@ impl Interpreter {
         }))))
     }
 
+    /// `Cls.__mro__` (the C3 linearisation, ending in `object`) or
+    /// `Cls.__bases__`. A builtin exception a class derives from — recorded
+    /// by name rather than as a base class — contributes its own place in
+    /// the standard hierarchy (`AppError, ValueError, Exception,
+    /// BaseException, object`), as does a builtin type's stand-in class
+    /// (`type(ValueError())`, `type(True)`).
+    fn class_mro_or_bases(&self, class: &Rc<Class>, mro: bool) -> Value {
+        let type_of = |name: &str| {
+            self.builtin_globals
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| crate::builtins::make_builtin_type(name))
+        };
+        let object = crate::builtins::make_builtin_type("object");
+        let is_stand_in = matches!(
+            crate::builtins::make_builtin_type(&class.name),
+            Value::Class(c) if Rc::ptr_eq(&c, class)
+        );
+        if is_stand_in {
+            let mut chain: Vec<Value> = vec![Value::Class(class.clone())];
+            if let Some(names) = builtin_exc_mro(&class.name) {
+                chain.extend(names[1..].iter().map(|n| type_of(n)));
+            } else if class.name == "bool" {
+                chain.push(type_of("int"));
+            }
+            if class.name != "object" {
+                chain.push(object.clone());
+            }
+            return Value::Tuple(Rc::new(if mro {
+                chain
+            } else if class.name == "ExceptionGroup" {
+                // `class ExceptionGroup(BaseExceptionGroup, Exception)`.
+                vec![type_of("BaseExceptionGroup"), type_of("Exception")]
+            } else {
+                chain.get(1).cloned().into_iter().collect()
+            }));
+        }
+        let to_value = |node: &MroNode| match node {
+            MroNode::User(c) => Value::Class(c.clone()),
+            MroNode::Builtin(n) => type_of(n),
+        };
+        if !mro {
+            let mut bases: Vec<Value> = Vec::new();
+            let mut seen: Vec<MroNode> = Vec::new();
+            for node in header_mro_bases(class) {
+                if !seen.contains(&node) {
+                    bases.push(to_value(&node));
+                    seen.push(node);
+                }
+            }
+            if bases.is_empty() {
+                bases.push(object);
+            }
+            return Value::Tuple(Rc::new(bases));
+        }
+        let mut out: Vec<Value> = match c3_linearise(class) {
+            // An explicit `object` base is placed last, with the implicit one.
+            Some(lin) => lin
+                .iter()
+                .filter(|n| !matches!(n, MroNode::Builtin(b) if b == "object"))
+                .map(to_value)
+                .collect(),
+            // An inconsistent hierarchy CPython would have rejected at
+            // class creation: list the user MRO then the builtin chains.
+            None => {
+                let mut out: Vec<Value> = Vec::new();
+                let mut builtin: Vec<String> = Vec::new();
+                for c in class_mro(class).filter(|c| !crate::value::is_builtin_object(c)) {
+                    out.push(Value::Class(c.clone()));
+                    for node in header_mro_bases(c) {
+                        if let MroNode::Builtin(n) = node {
+                            for link in builtin_exc_mro(&n).unwrap_or_default() {
+                                if !builtin.iter().any(|b| b == link) {
+                                    builtin.push(link.to_owned());
+                                }
+                            }
+                        }
+                    }
+                }
+                out.extend(builtin.iter().map(|n| type_of(n)));
+                out
+            }
+        };
+        out.push(object);
+        Value::Tuple(Rc::new(out))
+    }
+
     /// Build a native `enum` module exposing `Enum` (and the common
     /// variants) as base classes. Each carries a sentinel class attr
     /// (`__typhon_enum_base__`) so `build_class` can recognise a subclass
@@ -2823,6 +3095,8 @@ impl Interpreter {
                 return Ok(needle.clone());
             }
         }
+        // A declared value is found before a flag's missing-value
+        // normalisation (`class N(Flag): B = -3` makes `N(-3)` be `N.B`).
         if let Some(members) = Self::enum_members(class) {
             for m in &members {
                 if let Value::Instance(i) = m {
@@ -2832,6 +3106,11 @@ impl Interpreter {
                         }
                     }
                 }
+            }
+        }
+        if crate::value::is_flag_class(class) {
+            if let Some(found) = self.flag_lookup_by_value(class, needle) {
+                return found;
             }
         }
         Err(value_error(format!(
@@ -2903,42 +3182,211 @@ impl Interpreter {
     /// matches exactly, otherwise the composite pseudo-member CPython
     /// synthesises — `.name` is the set bits' names joined with `|`
     /// (`None` when no bit is set), and `repr` is `<Style.BOLD|UNDERLINE: 5>`.
-    fn flag_member_for(class: &Rc<Class>, bits: i64) -> Value {
+    /// Pseudo-members are cached on the class, so `(A | B) is (A | B)` holds
+    /// as it does in CPython.
+    fn flag_member_for(class: &Rc<Class>, bits: BigInt) -> Value {
         let members = Self::enum_members(class).unwrap_or_default();
         for m in &members {
-            if crate::value::flag_member_bits(m) == Some(bits) {
+            if crate::value::flag_member_bits(m).as_ref() == Some(&bits) {
                 return m.clone();
             }
         }
+        let cache_key = format!("__typhon_flag_pseudo_{bits}__");
+        if let Some(cached) = class.class_attrs.borrow().get(&cache_key) {
+            return cached.clone();
+        }
+        // CPython 3.13's `Flag._missing_`: name the single-bit members the
+        // value contains (definition order); if it also has bits outside
+        // them, add every other member it contains (aliases like `RW`), and
+        // finally any bits still unnamed as a number: `<P.A|C|AB|8: 15>`.
+        let member_name = |m: &Value| match m {
+            Value::Instance(i) => match i.fields.borrow().get("_name_") {
+                Some(Value::Str(n)) => Some((**n).clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let singles = Self::flag_canonical_members(class);
+        let singles_mask = Self::flag_mask(&singles);
         let mut names: Vec<String> = Vec::new();
-        for m in &members {
+        let mut combined = BigInt::zero();
+        let mut taken: Vec<BigInt> = Vec::new();
+        for m in &singles {
             let Some(mb) = crate::value::flag_member_bits(m) else {
                 continue;
             };
-            if mb != 0 && bits & mb == mb {
-                if let Value::Instance(i) = m {
-                    if let Some(Value::Str(n)) = i.fields.borrow().get("_name_") {
-                        names.push((**n).clone());
-                    }
+            if &bits & &mb == mb {
+                names.extend(member_name(m));
+                combined |= &mb;
+                taken.push(mb);
+            }
+        }
+        if !(&bits & !&singles_mask).is_zero() {
+            for m in &members {
+                let Some(mb) = crate::value::flag_member_bits(m) else {
+                    continue;
+                };
+                if !mb.is_zero() && &bits & &mb == mb && !taken.contains(&mb) {
+                    names.extend(member_name(m));
+                    combined |= &mb;
+                    taken.push(mb);
                 }
             }
+        }
+        let unknown = &bits ^ &combined;
+        if combined.is_zero() {
+            names.clear();
+        } else if !unknown.is_zero() {
+            names.push(unknown.to_string());
         }
         let name = if names.is_empty() {
             Value::None
         } else {
             Value::Str(Rc::new(names.join("|")))
         };
-        let value = Value::Int(crate::value::VmInt::from(bits));
+        let value = Value::Int(crate::value::VmInt::from_bigint(bits));
         let mut fields: crate::value::FieldMap = crate::value::FieldMap::new();
         fields.insert("name".to_owned(), name.clone());
         fields.insert("_name_".to_owned(), name);
         fields.insert("value".to_owned(), value.clone());
         fields.insert("_value_".to_owned(), value);
-        Value::Instance(Rc::new(Instance {
+        let member = Value::Instance(Rc::new(Instance {
             class: class.clone(),
             fields: RefCell::new(fields),
             chain: RefCell::new(None),
-        }))
+        }));
+        class
+            .class_attrs
+            .borrow_mut()
+            .insert(cache_key, member.clone());
+        member
+    }
+
+    /// Every bit some member of a `Flag` class sets (CPython's
+    /// `_flag_mask_`).
+    fn flag_mask(members: &[Value]) -> BigInt {
+        members
+            .iter()
+            .filter_map(crate::value::flag_member_bits)
+            .filter(|b| b.is_positive())
+            .fold(BigInt::zero(), |acc, b| acc | b)
+    }
+
+    /// The canonical (single-bit) members of a `Flag` class, in definition
+    /// order — what iterating the class or one of its values yields. CPython
+    /// 3.11+ treats zero-valued and multi-bit members as aliases, absent from
+    /// iteration and from `len()`.
+    fn flag_canonical_members(class: &Rc<Class>) -> Vec<Value> {
+        Self::enum_members(class)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| {
+                crate::value::flag_member_bits(m)
+                    .is_some_and(|b| b.is_positive() && b.magnitude().count_ones() == 1)
+            })
+            .collect()
+    }
+
+    /// The canonical members whose bits a `Flag` value contains —
+    /// `list(Perm.R | Perm.W)` is `[Perm.R, Perm.W]`. As in CPython 3.13,
+    /// members declared in bit order are yielded bit by bit (lowest first),
+    /// with `None` for a declared bit no single-bit member names
+    /// (`class N(Flag): A = 3`); otherwise in definition order.
+    pub(crate) fn flag_decompose(v: &Value) -> Option<Vec<Value>> {
+        let bits = crate::value::flag_member_bits(v)?;
+        let Value::Instance(inst) = v else {
+            return None;
+        };
+        let canonical = Self::flag_canonical_members(&inst.class);
+        let canonical_bits: Vec<BigInt> = canonical
+            .iter()
+            .filter_map(crate::value::flag_member_bits)
+            .collect();
+        if !canonical_bits.windows(2).all(|w| w[0] < w[1]) {
+            return Some(
+                canonical
+                    .into_iter()
+                    .zip(canonical_bits)
+                    .filter(|(_, b)| &bits & b == *b)
+                    .map(|(m, _)| m)
+                    .collect(),
+            );
+        }
+        let mut rest = bits & Self::flag_mask(&Self::enum_members(&inst.class).unwrap_or_default());
+        let mut out = Vec::new();
+        while !rest.is_zero() {
+            let bit = &rest & -&rest;
+            rest ^= &bit;
+            out.push(
+                canonical_bits
+                    .iter()
+                    .position(|b| *b == bit)
+                    .map_or(Value::None, |i| canonical[i].clone()),
+            );
+        }
+        Some(out)
+    }
+
+    /// `Perm(6)` on a `Flag` / `IntFlag` class: the member or composite
+    /// pseudo-member for those bits. A `Flag` (boundary `STRICT`) rejects
+    /// bits no member declares with CPython's message; an `IntFlag`
+    /// (boundary `KEEP`) keeps them, and reads a negative value as the
+    /// complement within its members' bits.
+    fn flag_lookup_by_value(
+        &self,
+        class: &Rc<Class>,
+        needle: &Value,
+    ) -> Option<Result<Value, Unwind>> {
+        let bits = match needle {
+            Value::Int(i) => i.to_bigint(),
+            Value::Bool(b) => BigInt::from(i64::from(*b)),
+            _ => return None,
+        };
+        Some(
+            Self::flag_normalise(class, bits)
+                .map(|bits| Self::flag_member_for(class, bits))
+                .map_err(value_error),
+        )
+    }
+
+    /// CPython's `Flag._missing_` value check: a negative value counts
+    /// down from the flag's all-bits mask, and a value outside the
+    /// declared bits is an error for a `Flag` (`STRICT`) and kept by an
+    /// `IntFlag` (`KEEP`). `Err` is the `ValueError` message.
+    fn flag_normalise(class: &Rc<Class>, bits: BigInt) -> Result<BigInt, String> {
+        let mask = Self::flag_mask(&Self::enum_members(class).unwrap_or_default());
+        let bit_length = |n: &BigInt| n.magnitude().bits();
+        let one = BigInt::from(1);
+        let all_bits: BigInt = (&one << bit_length(&mask)) - 1;
+        let mut value = bits;
+        let in_range = !&all_bits <= value && value <= all_bits;
+        if !in_range || !(&value & (&all_bits ^ &mask)).is_zero() {
+            if !crate::value::is_int_flag_class(class) {
+                let max_bits = bit_length(&value).max(bit_length(&mask));
+                let width = max_bits as usize;
+                let enum_bin = |n: &BigInt| {
+                    let digits: BigInt = n & ((&one << max_bits) - 1);
+                    let sign = if n.is_negative() { 1 } else { 0 };
+                    format!("0b{sign} {:0>width$}", digits.to_str_radix(2))
+                };
+                return Err(format!(
+                    "<flag '{}'> invalid value {}\n    given {}\n  allowed {}",
+                    class.name,
+                    value,
+                    enum_bin(&value),
+                    enum_bin(&mask)
+                ));
+            }
+            if value.is_negative() {
+                let span: BigInt = &all_bits + 1;
+                let own: BigInt = &one << bit_length(&value);
+                value += span.max(own);
+            }
+        }
+        if value.is_negative() {
+            value += all_bits + 1;
+        }
+        Ok(value)
     }
 
     /// Whether `class` derives from the VM's enum base class `base`
@@ -2955,17 +3403,7 @@ impl Interpreter {
     /// Whether `class` is a `Flag` or `IntFlag` subclass — the two whose
     /// `auto()` members are numbered by bit rather than by increment.
     fn is_flag_class(class: &Rc<Class>) -> bool {
-        fn marker(class: &Rc<Class>) -> bool {
-            if class
-                .class_attrs
-                .borrow()
-                .contains_key("__typhon_enum_base__")
-            {
-                return matches!(class.name.as_str(), "Flag" | "IntFlag");
-            }
-            class.bases.iter().any(marker)
-        }
-        marker(class)
+        crate::value::is_flag_class(class)
     }
 
     pub(crate) fn is_enum_member(value: &Value) -> bool {
@@ -3006,6 +3444,9 @@ impl Interpreter {
             // continues from it (CPython: `A = 10; B = auto()` ⇒ `B == 11`).
             // Starts at 0 so a leading `auto()` yields 1.
             let mut last_value: i64 = 0;
+            // The largest value any earlier member declared (CPython's
+            // `max(last_values)` in `Flag._generate_next_value_`).
+            let mut flag_high: Option<BigInt> = None;
             for name in &order {
                 let Some(raw) = attrs.get(name).cloned() else {
                     continue;
@@ -3022,16 +3463,20 @@ impl Interpreter {
                 let raw = if Self::is_enum_auto(&raw) && is_str_enum {
                     Value::Str(Rc::new(name.to_lowercase()))
                 } else if Self::is_enum_auto(&raw) {
-                    last_value = if is_flag {
-                        if last_value <= 0 {
-                            1
-                        } else {
-                            last_value << 1
-                        }
+                    // A flag's `auto()` is the bit above the largest earlier
+                    // value's high bit (`AB = 3; D = auto()` ⇒ `D == 4`); a
+                    // negative value counts by its magnitude's bit length
+                    // (`A = -1; B = auto()` ⇒ `B == 2`).
+                    if is_flag {
+                        let bit = match &flag_high {
+                            None => BigInt::from(1),
+                            Some(v) => BigInt::from(1) << v.magnitude().bits(),
+                        };
+                        Value::Int(VmInt::from_bigint(bit))
                     } else {
-                        last_value + 1
-                    };
-                    Value::Int(VmInt::from(last_value))
+                        last_value += 1;
+                        Value::Int(VmInt::from(last_value))
+                    }
                 } else {
                     if let Value::Int(i) = &raw {
                         if let Some(v) = i.to_i64() {
@@ -3040,6 +3485,18 @@ impl Interpreter {
                     }
                     raw
                 };
+                // `A = True` is the integer 1 to `auto()`.
+                let as_int = match &raw {
+                    Value::Int(i) => Some(i.to_bigint()),
+                    Value::Bool(b) => Some(BigInt::from(i64::from(*b))),
+                    _ => None,
+                };
+                if let Some(v) = as_int {
+                    flag_high = Some(match flag_high.take() {
+                        Some(h) => h.max(v),
+                        None => v,
+                    });
+                }
                 // A second name for an existing value is an *alias* of that
                 // member: the same object, not a new member, and absent
                 // from iteration (`Color.CRIMSON is Color.RED`).
@@ -3111,9 +3568,20 @@ impl Interpreter {
             Expr::NoneLiteral(_) => Ok(Value::None),
             Expr::EllipsisLiteral(_) => Ok(crate::value::ellipsis_value()),
             Expr::FString(f) => self.eval_fstring(f, env),
-            Expr::Name(n) => env
-                .get_name_node(n)
-                .ok_or_else(|| name_error(format!("name '{}' is not defined", n.id.as_str()))),
+            Expr::Name(n) => env.get_name_node(n).ok_or_else(|| {
+                let name = n.id.as_str();
+                if env.reads_deleted_local(name) {
+                    Unwind::Exception(VmException::new(
+                        "UnboundLocalError",
+                        format!(
+                            "cannot access local variable '{name}' where it is not \
+                             associated with a value"
+                        ),
+                    ))
+                } else {
+                    name_error(format!("name '{name}' is not defined"))
+                }
+            }),
             Expr::BinOp(b) => {
                 let left = self.eval_expr(&b.left, env)?;
                 let right = self.eval_expr(&b.right, env)?;
@@ -3217,13 +3685,11 @@ impl Interpreter {
                         (None, v) => {
                             // {**other}
                             let other = self.eval_expr(v, env)?;
-                            match other {
-                                Value::Dict(d) => {
-                                    for (k, v) in d.borrow().iter() {
-                                        map.insert(k.clone(), v.clone());
-                                    }
-                                }
-                                _ => return Err(type_error("** unpack expected a mapping")),
+                            let Some(pairs) = self.mapping_pairs(&other)? else {
+                                return Err(type_error("** unpack expected a mapping"));
+                            };
+                            for (k, v) in pairs {
+                                map.insert(k, v);
                             }
                         }
                     }
@@ -3308,7 +3774,10 @@ impl Interpreter {
                 };
                 let iterable = self.eval_expr(&first.iter, env)?;
                 let it = self.make_iter(iterable)?;
-                let mut iters: Vec<Option<Value>> = (0..g.generators.len()).map(|_| None).collect();
+                // A starred element (PEP 798) gets one extra slot for the
+                // iterator it spreads; see `genexp_next`.
+                let slots = g.generators.len() + usize::from(g.elt.is_starred_expr());
+                let mut iters: Vec<Option<Value>> = (0..slots).map(|_| None).collect();
                 iters[0] = Some(it);
                 let state = GenExprState {
                     node: Rc::new(g.clone()),
@@ -3755,6 +4224,36 @@ impl Interpreter {
     /// Hash key for `v`, running a user `__hash__` where the class defines
     /// one (`value::instance_hash_mode`); every other value keys
     /// structurally through `Value::to_hash_key`.
+    /// The `(key, value)` pairs of a `**` operand: a dict, or an object
+    /// with CPython's mapping protocol (`keys()` plus `__getitem__`, as on
+    /// a `frozendict`). `None` when the value is not a mapping.
+    pub fn mapping_pairs(&mut self, v: &Value) -> Result<Option<Vec<(HashKey, Value)>>, Unwind> {
+        match v {
+            Value::Dict(d) => Ok(Some(
+                d.borrow()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            )),
+            Value::Instance(_) => {
+                let keys = match self.get_attr(v, "keys") {
+                    Ok(keys) => keys,
+                    Err(Unwind::Exception(e)) if e.kind == "AttributeError" => return Ok(None),
+                    Err(e) => return Err(e),
+                };
+                let keys = self.call_value(keys, vec![], &[])?;
+                let it = self.make_iter(keys)?;
+                let mut pairs = Vec::new();
+                while let Some(k) = self.iter_next(&it)? {
+                    let value = self.subscript(v, &k)?;
+                    pairs.push((self.hash_key(&k)?, value));
+                }
+                Ok(Some(pairs))
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub fn hash_key(&mut self, v: &Value) -> Result<HashKey, Unwind> {
         if let Value::Instance(inst) = v {
             if crate::value::enum_mixin_value(v).is_none() {
@@ -4407,12 +4906,19 @@ impl Interpreter {
             },
             Value::Instance(i) => {
                 // `Style.BOLD in style` — a plain `Flag` member contains
-                // another when its bits are a superset.
-                if let (Some(cb), Some(ib)) = (
-                    crate::value::flag_member_bits(container),
-                    crate::value::flag_member_bits(item),
-                ) {
-                    return Ok(ib != 0 && cb & ib == ib);
+                // another when its bits are a superset (the empty flag is in every one).
+                // Only a member of the same flag class may be tested.
+                if let Some(cb) = crate::value::flag_member_bits(container) {
+                    let same_class =
+                        matches!(item, Value::Instance(it) if Rc::ptr_eq(&it.class, &i.class));
+                    if let (true, Some(ib)) = (same_class, crate::value::flag_member_bits(item)) {
+                        return Ok(&cb & &ib == ib);
+                    }
+                    return Err(type_error(format!(
+                        "unsupported operand type(s) for 'in': '{}' and '{}'",
+                        item.type_display_name(),
+                        container.type_display_name()
+                    )));
                 }
                 // `x in obj` → obj.__contains__(x).
                 if let Some(m) = self.find_method(&i.class, "__contains__") {
@@ -4587,17 +5093,15 @@ impl Interpreter {
                 None => {
                     // **kwargs spread
                     let v = self.eval_expr(&kw.value, env)?;
-                    match v {
-                        Value::Dict(d) => {
-                            for (k, val) in d.borrow().iter() {
-                                if let HashKey::Str(s) = k {
-                                    kwargs.push(((**s).clone(), val.clone()));
-                                } else {
-                                    return Err(type_error("keywords must be strings"));
-                                }
-                            }
+                    let Some(pairs) = self.mapping_pairs(&v)? else {
+                        return Err(type_error("** argument must be a mapping"));
+                    };
+                    for (k, val) in pairs {
+                        if let HashKey::Str(s) = k {
+                            kwargs.push(((*s).clone(), val));
+                        } else {
+                            return Err(type_error("keywords must be strings"));
                         }
-                        _ => return Err(type_error("** argument must be a mapping")),
                     }
                 }
             }
@@ -5578,18 +6082,30 @@ impl Interpreter {
     /// non-awaitable operand unchanged, so `await 1` / `await sync_call()`
     /// ran on under `tyc run` and raised after `tyc build`.
     pub fn await_value(&mut self, v: Value) -> Result<Value, Unwind> {
-        match &v {
-            Value::Coroutine(_) => self.force_awaitable(v),
-            Value::Module(m) if m.name == "Task" => self.force_awaitable(v),
-            // An `__await__`-bearing object: driven to its result (see
-            // `force_awaitable`).
-            Value::Instance(inst) if self.find_method(&inst.class, "__await__").is_some() => {
-                self.force_awaitable(v)
-            }
-            other => Err(type_error(format!(
+        if !self.is_awaitable(&v) {
+            return Err(type_error(format!(
                 "object {} can't be used in 'await' expression",
-                await_type_name(other)
-            ))),
+                await_type_name(&v)
+            )));
+        }
+        self.force_awaitable(v)
+    }
+
+    /// CPython's awaitables: a coroutine, a task / future, or an object
+    /// whose type defines `__await__`.
+    pub fn is_awaitable(&self, v: &Value) -> bool {
+        match v {
+            // Calling an `async def` that contains `yield` makes an async
+            // *generator*, which is iterated, never awaited.
+            Value::Coroutine(t) => {
+                matches!(
+                    t.function.generator,
+                    crate::value::GeneratorKind::NotGenerator
+                )
+            }
+            Value::Module(m) => m.name == "Task",
+            Value::Instance(inst) => self.find_method(&inst.class, "__await__").is_some(),
+            _ => false,
         }
     }
 
@@ -5640,6 +6156,42 @@ impl Interpreter {
                         "__await__() returned non-iterator of type '{}'",
                         it.type_display_name()
                     )));
+                }
+                // A user iterator finishes with `StopIteration(value)`; that
+                // value is the await's result. `iter(user_iterator)` wraps
+                // the same object.
+                let it = match &it {
+                    Value::Iter(state) => match &*state.borrow() {
+                        IterState::UserIter(inner) => inner.clone(),
+                        _ => it.clone(),
+                    },
+                    _ => it,
+                };
+                if let Value::Instance(_) = &it {
+                    loop {
+                        match self.call_dunder0(&it, "__next__") {
+                            Ok(_) => {}
+                            Err(Unwind::Exception(e)) if exc_is_a(&e, "StopIteration") => {
+                                return Ok(match &e.value {
+                                    Some(Value::Exception { args, .. }) => {
+                                        args.first().cloned().unwrap_or(Value::None)
+                                    }
+                                    // A user `StopIteration` subclass keeps
+                                    // its args on the instance.
+                                    Some(Value::Instance(inst)) => {
+                                        match inst.fields.borrow().get("args") {
+                                            Some(Value::Tuple(a)) => {
+                                                a.first().cloned().unwrap_or(Value::None)
+                                            }
+                                            _ => Value::None,
+                                        }
+                                    }
+                                    _ => Value::None,
+                                });
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
                 }
                 let it = self.make_iter(it)?;
                 while self.iter_next(&it)?.is_some() {}
@@ -5698,6 +6250,10 @@ impl Interpreter {
                 if let Some(r) = self.call_dunder0(v, "__len__")? {
                     return Ok(r.to_int()? != 0);
                 }
+            }
+            // A `Flag` value is falsy when no bit is set (`Perm(0)`).
+            if let Some(bits) = crate::value::flag_member_bits(v) {
+                return Ok(!bits.is_zero());
             }
         }
         Ok(v.truthy())
@@ -5981,8 +6537,16 @@ impl Interpreter {
             }
         }
         if let Value::Instance(i) = v {
-            if let Some(Value::Str(name)) = i.fields.borrow().get("_name_") {
-                return Some(format!("{}.{}", i.class.name, name));
+            match i.fields.borrow().get("_name_") {
+                Some(Value::Str(name)) => return Some(format!("{}.{}", i.class.name, name)),
+                // A nameless `Flag` pseudo-member (no bits set) prints as
+                // `Perm(0)`.
+                Some(Value::None) => {
+                    if let Some(bits) = crate::value::flag_member_bits(v) {
+                        return Some(format!("{}({bits})", i.class.name));
+                    }
+                }
+                _ => {}
             }
         }
         None
@@ -6402,23 +6966,55 @@ impl Interpreter {
             }
         }
 
-        // A plain `enum.Flag` combines into composite pseudo-members —
-        // `Style.BOLD | Style.UNDERLINE` is a `Style`, not an int (which is
-        // what `IntFlag` gives, through the mixin path just below).
+        // `enum.Flag` / `enum.IntFlag` members combine into composite
+        // pseudo-members — `Style.BOLD | Style.UNDERLINE` is a `Style`, and
+        // so is `Perm.R | 1` for an `IntFlag` (CPython keeps the flag type
+        // whenever the other operand is a plain int).
         if matches!(op, BitOr | BitAnd | BitXor) {
-            if let (Value::Instance(li), Value::Instance(ri)) = (l, r) {
-                if Rc::ptr_eq(&li.class, &ri.class) {
-                    if let (Some(lb), Some(rb)) = (
-                        crate::value::flag_member_bits(l),
-                        crate::value::flag_member_bits(r),
-                    ) {
-                        let bits = match op {
-                            BitOr => lb | rb,
-                            BitAnd => lb & rb,
-                            _ => lb ^ rb,
-                        };
-                        return Ok(Self::flag_member_for(&li.class, bits));
-                    }
+            let flag_operands = match (l, r) {
+                // Two `IntFlag`s of different classes: the left one's
+                // `__or__` takes the right as a plain int, as in CPython.
+                (Value::Instance(li), Value::Instance(ri))
+                    if Rc::ptr_eq(&li.class, &ri.class)
+                        || (crate::value::is_int_flag_class(&li.class)
+                            && crate::value::is_int_flag_class(&ri.class)) =>
+                {
+                    crate::value::flag_member_bits(l)
+                        .zip(crate::value::flag_member_bits(r))
+                        .map(|bits| (li.class.clone(), bits))
+                }
+                (Value::Instance(fi), Value::Int(n)) | (Value::Int(n), Value::Instance(fi))
+                    if crate::value::is_int_flag_class(&fi.class) =>
+                {
+                    let flag = if matches!(l, Value::Instance(_)) {
+                        l
+                    } else {
+                        r
+                    };
+                    crate::value::flag_member_bits(flag)
+                        .zip(Some(n.to_bigint()))
+                        .map(|bits| (fi.class.clone(), bits))
+                }
+                // `P.B | True` keeps the flag type; `True | P.B` is
+                // `bool.__or__`'s plain int, handled below.
+                (Value::Instance(fi), Value::Bool(b))
+                    if crate::value::is_int_flag_class(&fi.class) =>
+                {
+                    crate::value::flag_member_bits(l)
+                        .map(|bits| (fi.class.clone(), (bits, BigInt::from(*b as i64))))
+                }
+                _ => Option::None,
+            };
+            if let Some((class, (lb, rb))) = flag_operands {
+                let bits = match op {
+                    BitOr => lb | rb,
+                    BitAnd => lb & rb,
+                    _ => lb ^ rb,
+                };
+                // `IntFlag(value | other)`: a negative result goes through
+                // the `KEEP` boundary like any other `IntFlag` value.
+                if let Ok(bits) = Self::flag_normalise(&class, bits) {
+                    return Ok(Self::flag_member_for(&class, bits));
                 }
             }
         }
@@ -6507,6 +7103,22 @@ impl Interpreter {
                     return Ok(r);
                 }
             }
+            // `~Perm.R` complements within the bits the flag's members
+            // declare (CPython 3.11+); an `IntFlag` inverts through its
+            // `KEEP` boundary, so unnamed bits are complemented too.
+            if op == UnaryOp::Invert {
+                if let (Some(bits), Value::Instance(inst)) = (crate::value::flag_member_bits(v), v)
+                {
+                    let mask =
+                        Self::flag_mask(&Self::enum_members(&inst.class).unwrap_or_default());
+                    let inverted = if crate::value::is_int_flag_class(&inst.class) {
+                        Self::flag_normalise(&inst.class, !&bits).unwrap_or(&mask & !&bits)
+                    } else {
+                        &mask & !&bits
+                    };
+                    return Ok(Self::flag_member_for(&inst.class, inverted));
+                }
+            }
             // A value-mixin enum member (`IntEnum` / `IntFlag` / `StrEnum`)
             // IS its value in CPython, so `-Colour.RED` is `-1`. Unwrap and
             // retry, exactly as the comparison path does.
@@ -6562,7 +7174,11 @@ impl Interpreter {
         // where `idx` is a class defining `__index__`).
         let key_owned;
         let key = match key {
-            Value::Instance(i) if self.find_method(&i.class, "__index__").is_some() => {
+            // A dict key is hashed as itself, never through `__index__`.
+            Value::Instance(i)
+                if !matches!(target, Value::Dict(_))
+                    && self.find_method(&i.class, "__index__").is_some() =>
+            {
                 key_owned = self.call_dunder0(key, "__index__")?.unwrap_or(Value::None);
                 &key_owned
             }
@@ -6862,6 +7478,22 @@ impl Interpreter {
     }
 
     fn del_subscript(&mut self, target: &Value, key: &Value) -> Result<(), Unwind> {
+        // A user `__delitem__` receives the key exactly as written, a slice
+        // included (the `bytearray` shim's slice delete), so it has to come
+        // before the list-only slice dispatch below.
+        if let Value::Instance(i) = target {
+            if let Some(m) = self.find_method(&i.class, "__delitem__") {
+                self.call_value(
+                    Value::BoundMethod {
+                        receiver: Box::new(target.clone()),
+                        function: m,
+                    },
+                    vec![key.clone()],
+                    &[],
+                )?;
+                return Ok(());
+            }
+        }
         // Slice deletion: `del lst[i:j]` / `del lst[::2]`.
         if let Value::Tuple(t) = key {
             if t.len() == 4 {
@@ -6872,6 +7504,19 @@ impl Interpreter {
                 }
             }
         }
+        // Honour a user `__index__` on a sequence index (a dict key is
+        // hashed as itself).
+        let key_owned;
+        let key = match key {
+            Value::Instance(i)
+                if !matches!(target, Value::Dict(_))
+                    && self.find_method(&i.class, "__index__").is_some() =>
+            {
+                key_owned = self.call_dunder0(key, "__index__")?.unwrap_or(Value::None);
+                &key_owned
+            }
+            _ => key,
+        };
         match target {
             Value::List(l) => {
                 let i = key.to_int()?;
@@ -6882,6 +7527,11 @@ impl Interpreter {
                 Ok(())
             }
             Value::Dict(d) => {
+                if crate::builtins::dict_is_frozen(d) {
+                    return Err(type_error(
+                        "'mappingproxy' object does not support item deletion",
+                    ));
+                }
                 let k = self.dict_probe_key(d, key)?;
                 // Removal keeps the rest in insertion order, as `del d[k]`
                 // does.
@@ -6890,24 +7540,11 @@ impl Interpreter {
                     .map(|_| ())
                     .ok_or_else(|| crate::error::key_error_for(key))
             }
-            // `del obj[key]` → `obj.__delitem__(key)`.
-            Value::Instance(i) => {
-                if let Some(m) = self.find_method(&i.class, "__delitem__") {
-                    self.call_value(
-                        Value::BoundMethod {
-                            receiver: Box::new(target.clone()),
-                            function: m,
-                        },
-                        vec![key.clone()],
-                        &[],
-                    )?;
-                    return Ok(());
-                }
-                Err(type_error(format!(
-                    "'{}' object does not support item deletion",
-                    i.class.name
-                )))
-            }
+            // An instance without `__delitem__` (handled above).
+            Value::Instance(i) => Err(type_error(format!(
+                "'{}' object does not support item deletion",
+                i.class.name
+            ))),
             _ => Err(type_error("delete on unsupported target")),
         }
     }
@@ -7230,13 +7867,8 @@ impl Interpreter {
                     return Ok(Value::Str(Rc::new(class.name.clone())));
                 }
                 // `Cls.__mro__` — the C3 linearisation, ending in `object`.
-                if attr == "__mro__" {
-                    let mut out: Vec<Value> = class_mro(class)
-                        .filter(|c| !crate::value::is_builtin_object(c))
-                        .map(|c| Value::Class(c.clone()))
-                        .collect();
-                    out.push(crate::builtins::make_builtin_type("object"));
-                    return Ok(Value::Tuple(Rc::new(out)));
+                if attr == "__mro__" || attr == "__bases__" {
+                    return Ok(self.class_mro_or_bases(class, attr == "__mro__"));
                 }
                 // `Cls.__dict__` — the class's own namespace, read-only (a
                 // snapshot `mappingproxy`; the VM's `__typhon_*` records
@@ -7526,11 +8158,38 @@ impl Interpreter {
             Value::Native(n) if attr == "__name__" || attr == "__qualname__" => {
                 Ok(Value::Str(Rc::new(n.name.to_string())))
             }
+            // `ValueError.__mro__` / `KeyError.__bases__` — a builtin
+            // exception type's place in the standard hierarchy.
+            Value::Native(n)
+                if (attr == "__mro__" || attr == "__bases__")
+                    && (builtin_exc_mro(n.name).is_some()
+                        || crate::builtins::is_builtin_type_name(n.name)) =>
+            {
+                let Value::Class(stand_in) = crate::builtins::make_builtin_type(n.name) else {
+                    unreachable!("make_builtin_type returns a class");
+                };
+                let value_in = value;
+                let mut value = self.class_mro_or_bases(&stand_in, attr == "__mro__");
+                // The chain starts with the type itself: here that is the
+                // native constructor the program named, not its stand-in.
+                if attr == "__mro__" {
+                    if let Value::Tuple(t) = &value {
+                        let mut items = (**t).clone();
+                        items[0] = value_in.clone();
+                        value = Value::Tuple(Rc::new(items));
+                    }
+                }
+                Ok(value)
+            }
             // `bytearray` is a shim *class* behind a constructor native, so
             // a class-level read (`bytearray.fromhex(...)`) resolves through
             // the class itself.
             Value::Native(n) if n.name == "bytearray" => {
                 let cls = crate::builtins::bytearray_class(self)?;
+                self.get_attr(&cls, attr)
+            }
+            Value::Native(n) if n.name == "frozendict" => {
+                let cls = crate::builtins::py315_builtin_class(self, "frozendict")?;
                 self.get_attr(&cls, attr)
             }
             // A builtin *type* — the VM models `int` / `str` / `list` / … as
@@ -7578,6 +8237,17 @@ impl Interpreter {
                         attr
                     )));
                 }
+                // Static methods (`b"".maketrans`, `{}.fromkeys`) reached
+                // through an instance take no receiver.
+                let static_owner = match (value, attr) {
+                    (Value::Str(_), "maketrans") => Some("str"),
+                    (Value::Bytes(_), "maketrans") => Some("bytes"),
+                    (Value::Dict(_), "fromkeys") => Some("dict"),
+                    _ => None,
+                };
+                if let Some(m) = static_owner.and_then(|ty| builtin_type_method(ty, attr)) {
+                    return Ok(m);
+                }
                 // Return a native fn whose first arg is the receiver — the
                 // method registry in `builtins` does the actual dispatch.
                 let r = value.clone();
@@ -7601,6 +8271,11 @@ impl Interpreter {
             Value::Native(nf) if nf.name == "str" && attr == "maketrans" => Ok(Value::Native(
                 Rc::new(NativeFn::new("str.maketrans", |_interp, args| {
                     crate::builtins::str_maketrans(&args)
+                })),
+            )),
+            Value::Native(nf) if nf.name == "bytes" && attr == "maketrans" => Ok(Value::Native(
+                Rc::new(NativeFn::new("bytes.maketrans", |_interp, args| {
+                    crate::builtins::bytes_maketrans(&args)
                 })),
             )),
             // Unbound builtin-type methods: `str.strip(x)`, `list.append(xs, v)`,
@@ -8054,10 +8729,14 @@ impl Interpreter {
                 }
             }
         }
-        // Honour a user `__index__` on the subscript key.
+        // Honour a user `__index__` on a sequence index (a dict key is
+        // hashed as itself).
         let key_owned;
         let key = match key {
-            Value::Instance(i) if self.find_method(&i.class, "__index__").is_some() => {
+            Value::Instance(i)
+                if !matches!(target, Value::Dict(_))
+                    && self.find_method(&i.class, "__index__").is_some() =>
+            {
                 key_owned = self.call_dunder0(key, "__index__")?.unwrap_or(Value::None);
                 &key_owned
             }
@@ -8213,12 +8892,30 @@ impl Interpreter {
             }
             Value::Iter(it) => return Ok(Value::Iter(it)),
             Value::DictView { kind, dict } => crate::value::IterState::dict_iter(&dict, kind),
-            // Iterating an enum class yields its members in definition order.
+            // Iterating an enum class yields its members in definition order
+            // (a `Flag`'s canonical, single-bit members only).
             Value::Class(ref c) if Self::is_enum_class(c) => {
-                let members = match c.class_attrs.borrow().get("__typhon_enum_members__") {
-                    Some(Value::List(l)) => l.borrow().clone(),
-                    _ => Vec::new(),
+                let members = if Self::is_flag_class(c) {
+                    Self::flag_canonical_members(c)
+                } else {
+                    Self::enum_members(c).unwrap_or_default()
                 };
+                IterState::List {
+                    items: Rc::new(RefCell::new(members)),
+                    index: 0,
+                }
+            }
+            // Iterating a `Flag` value yields the members it contains.
+            Value::Instance(_) if crate::value::flag_member_bits(&v).is_some() => {
+                // CPython's `_iter_bits_lsb` refuses a negative value
+                // (`class F(Flag): A = -1`).
+                if let Some(bits) = crate::value::flag_member_bits(&v).filter(|b| b.is_negative()) {
+                    return Err(Unwind::Exception(crate::error::VmException::new(
+                        "ValueError",
+                        format!("{bits} is not a positive integer"),
+                    )));
+                }
+                let members = Self::flag_decompose(&v).unwrap_or_default();
                 IterState::List {
                     items: Rc::new(RefCell::new(members)),
                     index: 0,
@@ -8229,15 +8926,17 @@ impl Interpreter {
             // iterate the backing mapping's keys).
             Value::Instance(ref inst) => {
                 // `async for x in obj:` — the async iteration protocol.
-                // Async generators are materialised eagerly so the sync and
-                // async loops share this path, but a *hand-written* async
-                // iterator defines `__aiter__` / `__anext__` and has no
-                // `__iter__` at all, so it has to be recognised here.
-                // `__anext__` is a coroutine: force it at each step, and
-                // treat `StopAsyncIteration` as the end.
-                if self.find_method(&inst.class, "__iter__").is_none()
-                    && self.find_method(&inst.class, "__aiter__").is_some()
-                {
+                // Async generators share the sync loop's path, but a
+                // *hand-written* async iterator defines `__aiter__` /
+                // `__anext__`, which `async for` prefers over any `__iter__`.
+                let async_iteration = std::mem::take(&mut self.async_iteration);
+                if async_iteration && self.find_method(&inst.class, "__aiter__").is_none() {
+                    return Err(type_error(format!(
+                        "'async for' requires an object with __aiter__ method, got {}",
+                        v.type_display_name()
+                    )));
+                }
+                if async_iteration {
                     let aiter = match self.find_method(&inst.class, "__aiter__") {
                         Some(m) => self.call_value(
                             Value::BoundMethod {
@@ -8249,46 +8948,48 @@ impl Interpreter {
                         )?,
                         None => v.clone(),
                     };
-                    let aiter = self.force_awaitable(aiter)?;
-                    let Value::Instance(target) = &aiter else {
-                        return self.make_iter(aiter);
-                    };
-                    let Some(anext) = self.find_method(&target.class, "__anext__") else {
-                        return self.make_iter(aiter.clone());
-                    };
-                    // Drain it here: the VM's async model completes every
-                    // coroutine at its force point, so a lazily-stepped
-                    // async iterator would have no observable difference
-                    // and this keeps the iterator state machine simple.
-                    let mut out: Vec<Value> = Vec::new();
-                    loop {
-                        let step = self.call_value(
-                            Value::BoundMethod {
-                                receiver: Box::new(aiter.clone()),
-                                function: anext.clone(),
-                            },
-                            vec![],
-                            &[],
-                        );
-                        let step = match step {
-                            Ok(coro) => self.force_awaitable(coro),
-                            Err(e) => Err(e),
-                        };
-                        match step {
-                            Ok(item) => out.push(item),
-                            Err(Unwind::Exception(e)) if e.kind == "StopAsyncIteration" => break,
-                            Err(other) => return Err(other),
-                        }
-                        if out.len() > GENERATOR_CAP {
-                            return Err(crate::error::Unwind::Exception(
-                                crate::error::VmException::new(
-                                    "RuntimeError",
-                                    "async iterator produced more than 1,000,000 items — the VM                                      materialises async iteration eagerly; run with                                      `tyc run --compile` for an unbounded one",
-                                ),
+                    // CPython never awaits `__aiter__`'s result: a coroutine
+                    // (an `async def __aiter__`) has no `__anext__`. An
+                    // async generator arrives as a thunk too, and is fine.
+                    if let Value::Coroutine(thunk) = &aiter {
+                        if !body_is_generator(&thunk.function.body) {
+                            return Err(type_error(
+                                "'async for' received an object from __aiter__ that does not implement __anext__: coroutine",
                             ));
                         }
                     }
-                    return self.make_iter(Value::List(Rc::new(RefCell::new(out))));
+                    // Only an async-generator thunk needs materialising; any
+                    // other `__aiter__` result is used as is (CPython never
+                    // calls its `__await__`).
+                    let aiter = if matches!(aiter, Value::Coroutine(_)) {
+                        self.force_awaitable(aiter)?
+                    } else {
+                        aiter
+                    };
+                    // An async generator returned from `__aiter__` runs on
+                    // the shared generator path; anything else without
+                    // `__anext__` is CPython's `TypeError`.
+                    let async_genexpr = matches!(&aiter, Value::Iter(it)
+                        if matches!(&*it.borrow(), IterState::GenExpr(g)
+                            if crate::value::genexpr_is_async(&g.borrow())));
+                    let async_gen =
+                        as_generator(&aiter).is_some_and(|g| g.borrow().function.is_async);
+                    if async_gen || async_genexpr {
+                        return self.make_iter(aiter);
+                    }
+                    let has_anext = matches!(&aiter, Value::Instance(target)
+                        if self.find_method(&target.class, "__anext__").is_some());
+                    if !has_anext {
+                        return Err(type_error(format!(
+                            "'async for' received an object from __aiter__ that does not implement __anext__: {}",
+                            aiter.type_display_name()
+                        )));
+                    }
+                    // Step it lazily: each `__anext__` runs just before the
+                    // loop body that consumes its item, as in CPython.
+                    return Ok(Value::Iter(Rc::new(RefCell::new(
+                        IterState::AsyncUserIter(aiter),
+                    ))));
                 }
                 if let Some(m) = self.find_method(&inst.class, "__iter__") {
                     let iter_val = self.call_value(
@@ -8356,6 +9057,7 @@ impl Interpreter {
             Generator(Rc<RefCell<GeneratorState>>),
             GenExpr(Rc<RefCell<GenExprState>>),
             UserIter(Value),
+            AsyncUserIter(Value),
             SeqIter(Value, usize),
         }
 
@@ -8533,6 +9235,7 @@ impl Interpreter {
                 IterState::Generator(g) => Recurse::Generator(g.clone()),
                 IterState::GenExpr(g) => Recurse::GenExpr(g.clone()),
                 IterState::UserIter(obj) => Recurse::UserIter(obj.clone()),
+                IterState::AsyncUserIter(obj) => Recurse::AsyncUserIter(obj.clone()),
                 IterState::SeqIter { obj, index } => {
                     let i = *index;
                     *index += 1;
@@ -8611,6 +9314,36 @@ impl Interpreter {
                 Err(Unwind::Exception(e)) if e.kind == "StopIteration" => Ok(None),
                 Err(e) => Err(e),
             },
+            // `__anext__` returns an awaitable: force it, and treat
+            // `StopAsyncIteration` as the end.
+            Recurse::AsyncUserIter(obj) => {
+                let step = match self.call_dunder0(&obj, "__anext__") {
+                    // Only a real awaitable may come back (a sync `def
+                    // __anext__` returning a plain value, a builtin type, a
+                    // user instance without `__await__` ... is rejected).
+                    Ok(Some(item)) if !self.is_awaitable(&item) => {
+                        let ty = match &item {
+                            Value::Native(n) if crate::builtins::is_builtin_type_name(n.name) => {
+                                "type".to_owned()
+                            }
+                            Value::Native(_) => "builtin_function_or_method".to_owned(),
+                            Value::Coroutine(_) => "async_generator".to_owned(),
+                            other => other.type_display_name().to_string(),
+                        };
+                        Err(type_error(format!(
+                            "'async for' received an invalid object from __anext__: {ty}"
+                        )))
+                    }
+                    Ok(Some(coro)) => self.force_awaitable(coro),
+                    Ok(None) => return Ok(None),
+                    Err(e) => Err(e),
+                };
+                match step {
+                    Ok(item) => Ok(Some(item)),
+                    Err(Unwind::Exception(e)) if exc_is_a(&e, "StopAsyncIteration") => Ok(None),
+                    Err(e) => Err(e),
+                }
+            }
             // Legacy sequence protocol: `obj[i]` until IndexError.
             Recurse::SeqIter(obj, i) => {
                 match self.subscript(&obj, &Value::Int(VmInt::from(i as i64))) {
@@ -8676,7 +9409,14 @@ impl Interpreter {
         }
         let g = &gens[i];
         let iter_val = self.eval_expr(&g.iter, env)?;
-        let it = self.make_iter(iter_val)?;
+        // `[x async for x in it]` follows the `async for` statement's protocol.
+        if g.is_async {
+            reject_sync_only_async_iterable(&iter_val)?;
+        }
+        self.async_iteration = g.is_async;
+        let it = self.make_iter(iter_val);
+        self.async_iteration = false;
+        let it = it?;
         while let Some(v) = self.iter_next(&it)? {
             self.assign_target(&g.target, v, env, None)?;
             let mut ok = true;
@@ -8700,6 +9440,15 @@ impl Interpreter {
         let out_clone = out.clone();
         let leaks = comprehension_walrus_names(&[&c.elt], &c.generators);
         self.run_comprehension_leaking(&c.generators, &leaks, env, &mut move |this, scope| {
+            // PEP 798: `[*x for ...]` spreads each `x` into the result.
+            if let Expr::Starred(star) = elt.as_ref() {
+                let spread = this.eval_expr(&star.value, scope)?;
+                let it = this.make_iter(spread)?;
+                while let Some(v) = this.iter_next(&it)? {
+                    out_clone.borrow_mut().push(v);
+                }
+                return Ok(());
+            }
             let v = this.eval_expr(&elt, scope)?;
             out_clone.borrow_mut().push(v);
             Ok(())
@@ -8714,10 +9463,23 @@ impl Interpreter {
         let out_clone = out.clone();
         let leaks = comprehension_walrus_names(&[&c.elt], &c.generators);
         self.run_comprehension_leaking(&c.generators, &leaks, env, &mut move |this, scope| {
-            let v = this.eval_expr(&elt, scope)?;
-            let k = this.hash_key(&v)?;
-            let k = this.settle_key_set(&out_clone, k)?;
-            out_clone.borrow_mut().insert(k);
+            // PEP 798: `{*x for ...}` spreads each `x` into the result.
+            let items = if let Expr::Starred(star) = elt.as_ref() {
+                let spread = this.eval_expr(&star.value, scope)?;
+                let it = this.make_iter(spread)?;
+                let mut items = Vec::new();
+                while let Some(v) = this.iter_next(&it)? {
+                    items.push(v);
+                }
+                items
+            } else {
+                vec![this.eval_expr(&elt, scope)?]
+            };
+            for v in items {
+                let k = this.hash_key(&v)?;
+                let k = this.settle_key_set(&out_clone, k)?;
+                out_clone.borrow_mut().insert(k);
+            }
             Ok(())
         })?;
         let result = std::mem::take(&mut *out.borrow_mut());
@@ -8727,10 +9489,9 @@ impl Interpreter {
     fn eval_dictcomp(&mut self, c: &ast::ExprDictComp, env: &EnvRef) -> Result<Value, Unwind> {
         let out: Rc<crate::value::FrozenCell<DictMap>> =
             Rc::new(crate::value::FrozenCell::new(DictMap::new()));
-        let key_expr = c
-            .key
-            .clone()
-            .ok_or_else(|| type_error("dict comprehension missing key"))?;
+        // No key means PEP 798's `{**d for ...}`: `value` is the mapping
+        // to merge in.
+        let key_expr = c.key.clone();
         let value_expr = c.value.clone();
         let out_clone = out.clone();
         let mut parts: Vec<&Expr> = vec![&c.value];
@@ -8739,7 +9500,21 @@ impl Interpreter {
         }
         let leaks = comprehension_walrus_names(&parts, &c.generators);
         self.run_comprehension_leaking(&c.generators, &leaks, env, &mut move |this, scope| {
-            let key_value = this.eval_expr(&key_expr, scope)?;
+            let Some(key_expr) = &key_expr else {
+                let mapping = this.eval_expr(&value_expr, scope)?;
+                let Some(pairs) = this.mapping_pairs(&mapping)? else {
+                    return Err(type_error(format!(
+                        "'{}' object is not a mapping",
+                        mapping.type_name()
+                    )));
+                };
+                for (k, v) in pairs {
+                    let k = this.settle_key_dict(&out_clone, k)?;
+                    out_clone.borrow_mut().insert(k, v);
+                }
+                return Ok(());
+            };
+            let key_value = this.eval_expr(key_expr, scope)?;
             let k = this.hash_key(&key_value)?;
             let k = this.settle_key_dict(&out_clone, k)?;
             let v = this.eval_expr(&value_expr, scope)?;
@@ -9804,6 +10579,15 @@ fn await_type_name(v: &Value) -> String {
         Value::Instance(inst) => inst.class.name.clone(),
         Value::Class(_) => "type".to_owned(),
         Value::Exception { kind, .. } => (**kind).clone(),
+        // Calling an `async def` holding a `yield` makes an async generator.
+        Value::Coroutine(t)
+            if !matches!(
+                t.function.generator,
+                crate::value::GeneratorKind::NotGenerator
+            ) =>
+        {
+            "async_generator".to_owned()
+        }
         other => other.type_name().to_owned(),
     }
 }
@@ -10413,6 +11197,12 @@ fn builtin_type_method(ty: &'static str, attr: &str) -> Option<Value> {
                 |_i, args| crate::builtins::str_maketrans(&args),
             ))))
         }
+        ("bytes", "maketrans") => {
+            return Some(Value::Native(Rc::new(NativeFn::new(
+                "maketrans",
+                |_i, args| crate::builtins::bytes_maketrans(&args),
+            ))))
+        }
         _ => {}
     }
     let probe = match ty {
@@ -10770,6 +11560,7 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                 | "strip"
                 | "swapcase"
                 | "title"
+                | "maketrans"
                 | "translate"
                 | "upper"
                 | "zfill"
@@ -10813,6 +11604,8 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                 | "rjust"
                 | "rpartition"
                 | "swapcase"
+                | "maketrans"
+                | "translate"
                 | "title"
                 | "zfill"
         ),
@@ -11559,6 +12352,59 @@ fn resume_mismatch(frame: &ResumeFrame) -> Unwind {
 }
 
 /// The lazy generator behind an iterator value, if it is one.
+/// `async for` over a builtin synchronous container is CPython's
+/// `TypeError`: none of them defines `__aiter__`.
+fn reject_sync_only_async_iterable(v: &Value) -> Result<(), Unwind> {
+    // A synchronous iterator (`iter(xs)`, a sync generator) has no
+    // `__aiter__` either; only an async generator's iterator does.
+    let sync_iterator = match v {
+        Value::Iter(it) => match &*it.borrow() {
+            IterState::Generator(g) => !g.borrow().function.is_async,
+            // `(x async for x in src)` is an async generator.
+            IterState::GenExpr(g) => !crate::value::genexpr_is_async(&g.borrow()),
+            IterState::AsyncUserIter(_) => false,
+            _ => true,
+        },
+        _ => false,
+    };
+    // A plain coroutine has no `__aiter__` either (an async generator
+    // call arrives as a coroutine thunk too, and is iterable).
+    let coroutine = matches!(v, Value::Coroutine(t)
+        if matches!(t.function.generator, crate::value::GeneratorKind::NotGenerator));
+    // A class is iterated through its metaclass, and neither `type` nor
+    // `EnumType` defines `__aiter__`.
+    if let Value::Class(c) = v {
+        let meta = if Interpreter::is_enum_class(c) {
+            "EnumType"
+        } else {
+            "type"
+        };
+        return Err(type_error(format!(
+            "'async for' requires an object with __aiter__ method, got {meta}"
+        )));
+    }
+    if sync_iterator
+        || coroutine
+        || matches!(
+            v,
+            Value::List(_)
+                | Value::Tuple(_)
+                | Value::Str(_)
+                | Value::Bytes(_)
+                | Value::Dict(_)
+                | Value::Set(_)
+                | Value::Range { .. }
+                | Value::DictView { .. }
+        )
+    {
+        return Err(type_error(format!(
+            "'async for' requires an object with __aiter__ method, got {}",
+            v.type_display_name()
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn as_generator(v: &Value) -> Option<Rc<RefCell<GeneratorState>>> {
     if let Value::Iter(it) = v {
         if let IterState::Generator(g) = &*it.borrow() {
@@ -11594,7 +12440,7 @@ pub(crate) fn stop_iteration_for(it: &Value) -> Unwind {
 
 /// Classify a function body: not a generator, a lazily-resumable generator,
 /// or one that must run eagerly (see [`GeneratorKind`]).
-fn generator_kind(is_async: bool, body: &[Stmt]) -> GeneratorKind {
+pub(crate) fn generator_kind(is_async: bool, body: &[Stmt]) -> GeneratorKind {
     // An `async def` containing a `yield` is an async *generator*, and the
     // resumable tree-walk drives it exactly as it drives a sync one — the
     // VM forces every `await` inline, so nothing in the body needs a
@@ -11675,8 +12521,10 @@ fn first_effect(e: &Expr) -> FirstEffect {
         | Expr::BytesLiteral(_)
         | Expr::BooleanLiteral(_)
         | Expr::NoneLiteral(_)
-        | Expr::EllipsisLiteral(_)
-        | Expr::Lambda(_) => Pure,
+        | Expr::EllipsisLiteral(_) => Pure,
+        // Creating a lambda evaluates its parameter defaults, and nothing
+        // else.
+        Expr::Lambda(l) => first_effect_all(lambda_defaults(l)),
         Expr::Tuple(t) => first_effect_all(t.elts.iter()),
         Expr::List(l) => first_effect_all(l.elts.iter()),
         Expr::Starred(s) => first_effect(&s.value),
@@ -11781,11 +12629,19 @@ fn first_effect(e: &Expr) -> FirstEffect {
     }
 }
 
+/// A lambda's parameter defaults, which run when the lambda is created.
+fn lambda_defaults(l: &ast::ExprLambda) -> impl Iterator<Item = &Expr> {
+    l.parameters
+        .iter()
+        .flat_map(|p| p.iter_non_variadic_params())
+        .filter_map(|p| p.default())
+}
+
 fn count_yields(e: &Expr) -> usize {
     use ruff_python_ast::Expr::*;
     match e {
         Yield(_) | YieldFrom(_) => 1,
-        Lambda(_) => 0,
+        Lambda(l) => lambda_defaults(l).map(count_yields).sum(),
         BoolOp(x) => x.values.iter().map(count_yields).sum(),
         BinOp(x) => count_yields(&x.left) + count_yields(&x.right),
         UnaryOp(x) => count_yields(&x.operand),
@@ -11852,7 +12708,8 @@ fn value_lazy_ok(e: &Expr) -> bool {
 fn stmt_lazy_ok(s: &Stmt) -> bool {
     use ruff_python_ast::Stmt::*;
     match s {
-        FunctionDef(_) | ClassDef(_) => true,
+        // A yield in a nested `def` / `class` header cannot be resumed.
+        FunctionDef(_) | ClassDef(_) => !stmt_has_yield(s),
         Expr(e) => value_lazy_ok(&e.value),
         Assign(a) => !a.targets.iter().any(expr_has_yield) && value_lazy_ok(&a.value),
         AnnAssign(a) => !expr_has_yield(&a.target) && a.value.as_deref().is_none_or(value_lazy_ok),
@@ -11906,7 +12763,7 @@ fn stmt_lazy_ok(s: &Stmt) -> bool {
         }
         Assert(a) => !expr_has_yield(&a.test) && !a.msg.as_deref().is_some_and(expr_has_yield),
         Delete(d) => !d.targets.iter().any(expr_has_yield),
-        _ => true,
+        _ => !stmt_has_yield(s),
     }
 }
 
@@ -11917,104 +12774,81 @@ fn body_is_generator(body: &[Stmt]) -> bool {
 }
 
 fn stmt_has_yield(s: &Stmt) -> bool {
-    use ruff_python_ast::Stmt::*;
-    match s {
-        // Nested function / class scopes own their own yields.
-        FunctionDef(_) | ClassDef(_) => false,
-        Expr(e) => expr_has_yield(&e.value),
-        Return(r) => r.value.as_deref().is_some_and(expr_has_yield),
-        Assign(a) => expr_has_yield(&a.value),
-        AugAssign(a) => expr_has_yield(&a.value),
-        AnnAssign(a) => a.value.as_deref().is_some_and(expr_has_yield),
-        If(x) => {
-            expr_has_yield(&x.test)
-                || body_is_generator(&x.body)
-                || x.elif_else_clauses
-                    .iter()
-                    .any(|c| body_is_generator(&c.body))
-        }
-        While(x) => {
-            expr_has_yield(&x.test) || body_is_generator(&x.body) || body_is_generator(&x.orelse)
-        }
-        For(x) => {
-            expr_has_yield(&x.iter) || body_is_generator(&x.body) || body_is_generator(&x.orelse)
-        }
-        With(x) => {
-            x.items.iter().any(|i| expr_has_yield(&i.context_expr)) || body_is_generator(&x.body)
-        }
-        Match(x) => {
-            expr_has_yield(&x.subject) || x.cases.iter().any(|c| body_is_generator(&c.body))
-        }
-        Try(x) => {
-            body_is_generator(&x.body)
-                || x.handlers.iter().any(|h| {
-                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
-                    body_is_generator(&h.body)
-                })
-                || body_is_generator(&x.orelse)
-                || body_is_generator(&x.finalbody)
-        }
-        _ => false,
-    }
+    let mut finder = YieldFinder::default();
+    ruff_python_ast::visitor::Visitor::visit_stmt(&mut finder, s);
+    finder.found
 }
 
 fn expr_has_yield(e: &Expr) -> bool {
-    use ruff_python_ast::Expr::*;
-    match e {
-        Yield(_) | YieldFrom(_) => true,
-        // A lambda is its own scope — its (rare) yields aren't ours.
-        Lambda(_) => false,
-        BoolOp(x) => x.values.iter().any(expr_has_yield),
-        BinOp(x) => expr_has_yield(&x.left) || expr_has_yield(&x.right),
-        UnaryOp(x) => expr_has_yield(&x.operand),
-        Compare(x) => expr_has_yield(&x.left) || x.comparators.iter().any(expr_has_yield),
-        Call(x) => {
-            expr_has_yield(&x.func)
-                || x.arguments.args.iter().any(expr_has_yield)
-                || x.arguments
-                    .keywords
-                    .iter()
-                    .any(|k| expr_has_yield(&k.value))
+    let mut finder = YieldFinder::default();
+    ruff_python_ast::visitor::Visitor::visit_expr(&mut finder, e);
+    finder.found
+}
+
+/// Finds a `yield` / `yield from` belonging to the current function scope,
+/// in any expression position of any statement (an `assert` test, a `del`
+/// or assignment target, an `except` type, a `match` guard, ...). A nested
+/// `def` / `class` / lambda owns the yields in its body; only its header
+/// (decorators, defaults, annotations, bases), which runs in the enclosing
+/// scope, is ours.
+#[derive(Default)]
+struct YieldFinder {
+    found: bool,
+}
+
+impl<'a> ruff_python_ast::visitor::Visitor<'a> for YieldFinder {
+    fn visit_stmt(&mut self, stmt: &'a Stmt) {
+        if self.found {
+            return;
         }
-        Tuple(x) => x.elts.iter().any(expr_has_yield),
-        List(x) => x.elts.iter().any(expr_has_yield),
-        Set(x) => x.elts.iter().any(expr_has_yield),
-        Starred(x) => expr_has_yield(&x.value),
-        If(x) => expr_has_yield(&x.test) || expr_has_yield(&x.body) || expr_has_yield(&x.orelse),
-        Named(x) => expr_has_yield(&x.value),
-        Await(x) => expr_has_yield(&x.value),
-        Subscript(x) => expr_has_yield(&x.value) || expr_has_yield(&x.slice),
-        Attribute(x) => expr_has_yield(&x.value),
-        // Comprehensions: only the outermost iterable runs in the enclosing
-        // scope, so a `yield` there belongs to us. (Yields elsewhere in a
-        // comprehension are a SyntaxError, so scanning them is harmless.)
-        ListComp(x) => comprehension_has_yield(&x.generators) || expr_has_yield(&x.elt),
-        SetComp(x) => comprehension_has_yield(&x.generators) || expr_has_yield(&x.elt),
-        Generator(x) => comprehension_has_yield(&x.generators) || expr_has_yield(&x.elt),
-        DictComp(x) => {
-            comprehension_has_yield(&x.generators)
-                || x.key.as_deref().is_some_and(expr_has_yield)
-                || expr_has_yield(&x.value)
+        match stmt {
+            Stmt::FunctionDef(f) => {
+                for d in &f.decorator_list {
+                    self.visit_expr(&d.expression);
+                }
+                // Defaults and annotations are evaluated when the `def` runs.
+                for p in f.parameters.iter() {
+                    if let Some(d) = p.default() {
+                        self.visit_expr(d);
+                    }
+                    if let Some(a) = p.annotation() {
+                        self.visit_expr(a);
+                    }
+                }
+                if let Some(r) = &f.returns {
+                    self.visit_expr(r);
+                }
+            }
+            Stmt::ClassDef(c) => {
+                for d in &c.decorator_list {
+                    self.visit_expr(&d.expression);
+                }
+                if let Some(args) = &c.arguments {
+                    self.visit_arguments(args);
+                }
+            }
+            _ => ruff_python_ast::visitor::walk_stmt(self, stmt),
         }
-        FString(x) => fstring_has_yield(x),
-        _ => false,
     }
-}
 
-fn comprehension_has_yield(generators: &[ast::Comprehension]) -> bool {
-    generators
-        .iter()
-        .any(|g| expr_has_yield(&g.iter) || g.ifs.iter().any(expr_has_yield))
-}
-
-fn fstring_has_yield(f: &ast::ExprFString) -> bool {
-    f.value.iter().any(|part| match part {
-        FStringPart::Literal(_) => false,
-        FStringPart::FString(fs) => fs.elements.iter().any(|el| match el {
-            InterpolatedStringElement::Literal(_) => false,
-            InterpolatedStringElement::Interpolation(interp) => expr_has_yield(&interp.expression),
-        }),
-    })
+    fn visit_expr(&mut self, expr: &'a Expr) {
+        if self.found {
+            return;
+        }
+        match expr {
+            Expr::Yield(_) | Expr::YieldFrom(_) => self.found = true,
+            Expr::Lambda(l) => {
+                if let Some(params) = &l.parameters {
+                    for p in params.iter_non_variadic_params() {
+                        if let Some(d) = p.default() {
+                            self.visit_expr(d);
+                        }
+                    }
+                }
+            }
+            _ => ruff_python_ast::visitor::walk_expr(self, expr),
+        }
+    }
 }
 
 /// Enforce that `__str__` / `__repr__` returned a `str` (CPython raises
@@ -12327,6 +13161,15 @@ pub(crate) fn name_is_exception_base(name: &str) -> bool {
 /// subclass of it). Reads the `__typhon_exc_bases__` record stamped on each
 /// class by `build_class`, since builtin exception bases have no
 /// `Value::Class` to walk.
+/// Whether a raised exception is a builtin `target` or a subclass of it,
+/// a user subclass included.
+fn exc_is_a(e: &VmException, target: &str) -> bool {
+    e.kind == target
+        || builtin_exc_is_a(&e.kind, target)
+        || matches!(&e.value, Some(Value::Instance(inst))
+            if class_has_builtin_exc_base(&inst.class, target))
+}
+
 pub(crate) fn class_has_builtin_exc_base(class: &Rc<Class>, target: &str) -> bool {
     if let Some(Value::Tuple(names)) = class.class_attrs.borrow().get("__typhon_exc_bases__") {
         for nm in names.iter() {
@@ -12465,8 +13308,13 @@ pub(crate) fn format_cast_type(tp: &Expr) -> String {
     }
 }
 
-/// [`Interpreter::enum_members`] for the builtins agent.
+/// [`Interpreter::enum_members`] for the builtins agent — a `Flag` class's
+/// canonical members only, as `len()` counts them.
 pub(crate) fn enum_members_pub(class: &Rc<Class>) -> Option<Vec<Value>> {
+    if crate::value::is_flag_class(class) {
+        return Interpreter::enum_members(class)
+            .map(|_| Interpreter::flag_canonical_members(class));
+    }
     Interpreter::enum_members(class)
 }
 
@@ -12529,9 +13377,22 @@ pub fn builtin_exc_is_a(kind: &str, target: &str) -> bool {
                 | "BaseExceptionGroup"
         );
     }
-    // Direct parent in the standard hierarchy (subset covering the common
-    // intermediate bases programs actually catch).
-    fn parent(name: &str) -> Option<&'static str> {
+    let mut cur = kind;
+    while let Some(p) = builtin_exc_parent(cur) {
+        if p == target {
+            return true;
+        }
+        cur = p;
+    }
+    false
+}
+
+/// Direct parent of a builtin exception in the standard hierarchy below
+/// `Exception` (the subset covering the intermediate bases programs
+/// actually catch); `None` for a type whose parent is `Exception` or
+/// `BaseException` itself.
+fn builtin_exc_parent(name: &str) -> Option<&'static str> {
+    {
         Some(match name {
             "ExceptionGroup" => "BaseExceptionGroup",
             "ZeroDivisionError" | "OverflowError" | "FloatingPointError" => "ArithmeticError",
@@ -12566,14 +13427,138 @@ pub fn builtin_exc_is_a(kind: &str, target: &str) -> bool {
             _ => return None,
         })
     }
-    let mut cur = kind;
-    while let Some(p) = parent(cur) {
-        if p == target {
-            return true;
+}
+
+/// The `__mro__` names of a builtin exception type, ending in
+/// `BaseException` (the caller appends `object`): `KeyError` gives
+/// `KeyError, LookupError, Exception, BaseException`. `None` when `name` is
+/// not a builtin exception.
+/// One entry of a class's full `__mro__`: a user class, or a builtin type
+/// or exception the VM models as a native constructor rather than a
+/// `Class`.
+#[derive(Clone)]
+enum MroNode {
+    User(Rc<Class>),
+    Builtin(String),
+}
+
+impl PartialEq for MroNode {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (MroNode::User(a), MroNode::User(b)) => Rc::ptr_eq(a, b),
+            (MroNode::Builtin(a), MroNode::Builtin(b)) => a == b,
+            _ => false,
         }
+    }
+}
+
+/// A class's direct bases in header order, builtin types and exceptions
+/// included — read from the `__typhon_header_bases__` record when the
+/// header named one, else just its user bases.
+fn header_mro_bases(class: &Rc<Class>) -> Vec<MroNode> {
+    if let Some(Value::Tuple(t)) = class.class_attrs.borrow().get("__typhon_header_bases__") {
+        return t
+            .iter()
+            .filter_map(|v| match v {
+                Value::Class(c) if !crate::value::is_builtin_object(c) => {
+                    Some(MroNode::User(c.clone()))
+                }
+                Value::Str(n) => Some(MroNode::Builtin(n.to_string())),
+                _ => None,
+            })
+            .collect();
+    }
+    class
+        .bases
+        .iter()
+        .filter(|c| !crate::value::is_builtin_object(c))
+        .map(|c| MroNode::User(c.clone()))
+        .collect()
+}
+
+/// The C3 linearisation of `class` over user classes, builtin types and
+/// builtin exception chains, without the implicit `object`. `None` when the bases admit no
+/// consistent order.
+fn c3_linearise(class: &Rc<Class>) -> Option<Vec<MroNode>> {
+    let heads = header_mro_bases(class);
+    let mut seqs: Vec<Vec<MroNode>> = Vec::new();
+    for head in &heads {
+        seqs.push(match head {
+            MroNode::User(c) => c3_linearise(c)?,
+            MroNode::Builtin(n) => builtin_exc_mro(n)
+                .unwrap_or_else(|| vec![n.as_str()])
+                .into_iter()
+                .map(|l| MroNode::Builtin(l.to_owned()))
+                .collect(),
+        });
+    }
+    seqs.push(heads);
+    let mut out = vec![MroNode::User(class.clone())];
+    loop {
+        seqs.retain(|s| !s.is_empty());
+        if seqs.is_empty() {
+            return Some(out);
+        }
+        let next = seqs
+            .iter()
+            .map(|s| &s[0])
+            .find(|cand| !seqs.iter().any(|s| s[1..].contains(cand)))?
+            .clone();
+        for s in seqs.iter_mut() {
+            if s[0] == next {
+                s.remove(0);
+            }
+        }
+        out.push(next);
+    }
+}
+
+pub(crate) fn builtin_exc_mro(name: &str) -> Option<Vec<&str>> {
+    let base_only = matches!(
+        name,
+        "KeyboardInterrupt"
+            | "SystemExit"
+            | "GeneratorExit"
+            | "BaseExceptionGroup"
+            | "CancelledError"
+    );
+    let is_exception = base_only
+        || matches!(
+            name,
+            "BaseException"
+                | "Exception"
+                | "StopIteration"
+                | "StopAsyncIteration"
+                | "ExceptionGroup"
+        )
+        || name.ends_with("Error")
+        || name.ends_with("Warning");
+    if !is_exception {
+        return None;
+    }
+    // `IOError` / `EnvironmentError` are aliases of `OSError`.
+    let name = match name {
+        "IOError" | "EnvironmentError" => "OSError",
+        other => other,
+    };
+    let mut out = vec![name];
+    let mut cur = name;
+    while let Some(p) = builtin_exc_parent(cur) {
+        out.push(p);
         cur = p;
     }
-    false
+    match cur {
+        "BaseException" => {}
+        // `class ExceptionGroup(BaseExceptionGroup, Exception)`.
+        "BaseExceptionGroup" if name == "ExceptionGroup" => {
+            out.extend(["Exception", "BaseException"])
+        }
+        "BaseExceptionGroup" | "KeyboardInterrupt" | "SystemExit" | "GeneratorExit"
+        | "CancelledError" => out.push("BaseException"),
+        "Exception" => out.push("BaseException"),
+        _ => out.extend(["Exception", "BaseException"]),
+    }
+    Some(out)
 }
 
 /// Collect the names of walrus (`:=`) assignment targets appearing anywhere

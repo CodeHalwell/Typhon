@@ -104,7 +104,7 @@ Scaffold a new project. With `NAME`, the scaffold lands in `<DIR>/<NAME>/` (`--d
 
 ```
 NAME/
-├── typhon.toml      # every [strictness]/[emit] key commented
+├── typhon.toml      # the commonly-tuned [strictness]/[emit] keys, commented
 ├── src/
 │   └── main.ty      # canonical "Hello, world" — frozen dataclass + impl + Result/?/match
 └── tests/

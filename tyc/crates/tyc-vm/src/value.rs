@@ -856,46 +856,47 @@ pub fn slice_repr(items: &[Value]) -> String {
     )
 }
 
-/// When `v` is a member of an enum class that mixes in a value type
-/// (`StrEnum`, `IntEnum`, `IntFlag` — detected by walking the base chain
-/// for the VM's `__typhon_enum_base__`-tagged marker classes of those
-/// names), return the member's underlying `value`. CPython makes such
-/// members genuine `str` / `int` subclasses, so equality, ordering,
-/// hashing, and `str()` all flow through the value; plain `Enum` members
-/// intentionally return `None` here (`Color.RED == 1` is False).
-/// Whether `class` is a plain `enum.Flag` subclass — one whose members
-/// combine into composite pseudo-members under `|` / `&` / `^` / `~` but,
-/// unlike `IntFlag`, are *not* ints. `IntFlag` deliberately answers `false`
-/// here: its members already flow through their int mixin.
-pub fn is_plain_flag_class(class: &Rc<Class>) -> bool {
-    fn marker(class: &Rc<Class>) -> Option<&'static str> {
-        if class
-            .class_attrs
-            .borrow()
-            .contains_key("__typhon_enum_base__")
-        {
-            return match class.name.as_str() {
-                "Flag" => Some("Flag"),
-                "IntFlag" => Some("IntFlag"),
-                _ => None,
-            };
-        }
-        class.bases.iter().find_map(marker)
+/// The VM enum marker base (`"Flag"` / `"IntFlag"`) a flag class derives
+/// from, or `None` for every other class.
+fn flag_marker(class: &Rc<Class>) -> Option<&'static str> {
+    if class
+        .class_attrs
+        .borrow()
+        .contains_key("__typhon_enum_base__")
+    {
+        return match class.name.as_str() {
+            "Flag" => Some("Flag"),
+            "IntFlag" => Some("IntFlag"),
+            _ => None,
+        };
     }
-    marker(class) == Some("Flag")
+    class.bases.iter().find_map(flag_marker)
 }
 
-/// The integer a `Flag` member carries, if it is one.
-pub fn flag_member_bits(v: &Value) -> Option<i64> {
+/// Whether `class` is an `enum.Flag` or `enum.IntFlag` subclass — one whose
+/// members combine into composite pseudo-members under `|` / `&` / `^` /
+/// `~`. `IntFlag` members are additionally ints (through their mixin).
+pub fn is_flag_class(class: &Rc<Class>) -> bool {
+    flag_marker(class).is_some()
+}
+
+/// Whether `class` is an `enum.IntFlag` subclass, whose boundary is `KEEP`
+/// (unknown bits survive) and whose members are ints.
+pub fn is_int_flag_class(class: &Rc<Class>) -> bool {
+    flag_marker(class) == Some("IntFlag")
+}
+
+/// The integer a `Flag` / `IntFlag` member carries, if it is one.
+pub fn flag_member_bits(v: &Value) -> Option<BigInt> {
     let Value::Instance(inst) = v else {
         return None;
     };
-    if !is_plain_flag_class(&inst.class) {
+    if !is_flag_class(&inst.class) {
         return None;
     }
     match inst.fields.borrow().get("_value_") {
-        Some(Value::Int(i)) => i.to_i64(),
-        Some(Value::Bool(b)) => Some(i64::from(*b)),
+        Some(Value::Int(i)) => Some(i.to_bigint()),
+        Some(Value::Bool(b)) => Some(BigInt::from(i64::from(*b))),
         _ => None,
     }
 }
@@ -916,6 +917,13 @@ pub fn enum_str_is_value(v: &Value) -> bool {
     matches!(v, Value::Instance(inst) if marker(&inst.class))
 }
 
+/// When `v` is a member of an enum class that mixes in a value type
+/// (`StrEnum`, `IntEnum`, `IntFlag` — detected by walking the base chain
+/// for the VM's `__typhon_enum_base__`-tagged marker classes of those
+/// names), return the member's underlying `value`. CPython makes such
+/// members genuine `str` / `int` subclasses, so equality, ordering,
+/// hashing, and `str()` all flow through the value; plain `Enum` members
+/// intentionally return `None` here (`Color.RED == 1` is False).
 pub fn enum_mixin_value(v: &Value) -> Option<Value> {
     fn mixin_base(class: &Rc<Class>) -> bool {
         let is_marker = class
@@ -1834,6 +1842,60 @@ pub struct GeneratorState {
 
 /// A lazy generator expression `(elt for … in … if …)`: the comprehension AST
 /// plus one live iterator per `for` clause.
+/// Whether a generator expression is an *async* one, which makes the value
+/// an `async_generator` rather than a `generator`: it has an `async for`
+/// clause, or an `await` in its element, a filter or an inner iterable
+/// (`(await f(x) for x in xs)`). The outermost iterable runs in the
+/// enclosing scope, so an `await` there does not count.
+pub fn genexpr_is_async(st: &GenExprState) -> bool {
+    use ruff_python_ast::visitor::{self, Visitor};
+    #[derive(Default)]
+    struct AwaitFinder {
+        found: bool,
+    }
+    impl<'a> Visitor<'a> for AwaitFinder {
+        fn visit_expr(&mut self, expr: &'a ruff_python_ast::Expr) {
+            match expr {
+                _ if self.found => {}
+                ruff_python_ast::Expr::Await(_) => self.found = true,
+                // A nested generator expression owns the awaits in its body;
+                // only its outermost iterable runs here.
+                ruff_python_ast::Expr::Generator(g) => {
+                    if let Some(first) = g.generators.first() {
+                        self.visit_expr(&first.iter);
+                    }
+                }
+                // A lambda's body is its own scope; its defaults run here.
+                ruff_python_ast::Expr::Lambda(l) => {
+                    if let Some(params) = &l.parameters {
+                        for p in params.iter_non_variadic_params() {
+                            if let Some(d) = p.default() {
+                                self.visit_expr(d);
+                            }
+                        }
+                    }
+                }
+                _ => visitor::walk_expr(self, expr),
+            }
+        }
+    }
+    let node = &st.node;
+    if node.generators.iter().any(|c| c.is_async) {
+        return true;
+    }
+    let mut finder = AwaitFinder::default();
+    finder.visit_expr(&node.elt);
+    for (i, c) in node.generators.iter().enumerate() {
+        if i > 0 {
+            finder.visit_expr(&c.iter);
+        }
+        for cond in &c.ifs {
+            finder.visit_expr(cond);
+        }
+    }
+    finder.found
+}
+
 pub struct GenExprState {
     pub node: Rc<ruff_python_ast::ExprGenerator>,
     /// The comprehension's private scope (targets bind here).
@@ -2106,6 +2168,10 @@ pub enum IterState {
     /// A user iterator object (an instance whose class defines `__next__`),
     /// stepped through `__next__` on demand.
     UserIter(Value),
+    /// A user async iterator (`__aiter__` / `__anext__`) driven by
+    /// `async for`, stepped through `__anext__` on demand so each step's
+    /// side effects interleave with the loop body as in CPython.
+    AsyncUserIter(Value),
     /// The legacy sequence protocol: `obj[0]`, `obj[1]`, … until `IndexError`.
     SeqIter {
         obj: Value,
@@ -2151,8 +2217,11 @@ pub fn iter_type_name(state: &IterState) -> &'static str {
             kind: DictViewKind::Items,
             ..
         } => "dict_reverseitemiterator",
+        IterState::Generator(g) if g.borrow().function.is_async => "async_generator",
+        IterState::GenExpr(g) if genexpr_is_async(&g.borrow()) => "async_generator",
         IterState::Generator(_) | IterState::GenExpr(_) => "generator",
         IterState::UserIter(_) => "iterator",
+        IterState::AsyncUserIter(_) => "async_iterator",
         IterState::SeqIter { .. } => "iterator",
     }
 }
@@ -3307,6 +3376,10 @@ fn instance_repr_inner(inst: &Instance) -> String {
     if class_is_enum(&inst.class) {
         if let (Some(Value::Str(name)), Some(val)) = (fields.get("_name_"), fields.get("_value_")) {
             return format!("<{}.{}: {}>", inst.class.name, name, val.py_repr());
+        }
+        // A `Flag` pseudo-member with no bits set has no name: `<Perm: 0>`.
+        if let (Some(Value::None), Some(val)) = (fields.get("_name_"), fields.get("_value_")) {
+            return format!("<{}: {}>", inst.class.name, val.py_repr());
         }
     }
     // `@dataclass(repr=False)` generates no `__repr__`: the nearest

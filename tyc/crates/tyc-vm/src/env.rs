@@ -32,12 +32,26 @@ use crate::value::Value;
 
 pub type EnvRef = Rc<Env>;
 
+/// See [`Env::delete_scope`].
+pub enum DeleteScope {
+    Global,
+    Local,
+    Free,
+}
+
 pub struct Env {
     bindings: RefCell<HashMap<String, Value>>,
     /// Names declared `global NAME` in this function — assigns reach to module scope.
     globals: RefCell<HashSet<String>>,
     /// Names declared `nonlocal NAME` — assigns reach to the nearest enclosing function scope.
     nonlocals: RefCell<HashSet<String>>,
+    /// Plain-binding names `del` removed from this scope. They stay owned
+    /// here, so a later `nonlocal` write or `del` from an inner function
+    /// stops at this scope instead of reaching further out.
+    deleted: RefCell<HashSet<String>>,
+    /// A class body's namespace: `del` of an absent name there raises
+    /// `NameError`, not `UnboundLocalError`.
+    class_namespace: std::cell::Cell<bool>,
     parent: Option<EnvRef>,
     /// The module-global scope. The root env points to itself.
     module: RefCell<Option<EnvRef>>,
@@ -54,6 +68,8 @@ impl Env {
             bindings: RefCell::new(HashMap::new()),
             globals: RefCell::new(HashSet::new()),
             nonlocals: RefCell::new(HashSet::new()),
+            deleted: RefCell::new(HashSet::new()),
+            class_namespace: std::cell::Cell::new(false),
             parent: None,
             module: RefCell::new(None),
             slot_info: None,
@@ -77,6 +93,8 @@ impl Env {
             bindings: RefCell::new(HashMap::new()),
             globals: RefCell::new(HashSet::new()),
             nonlocals: RefCell::new(HashSet::new()),
+            deleted: RefCell::new(HashSet::new()),
+            class_namespace: std::cell::Cell::new(false),
             parent: Some(parent.clone()),
             module: RefCell::new(parent.module.borrow().clone()),
             slot_info: None,
@@ -93,11 +111,18 @@ impl Env {
             bindings: RefCell::new(HashMap::new()),
             globals: RefCell::new(HashSet::new()),
             nonlocals: RefCell::new(HashSet::new()),
+            deleted: RefCell::new(HashSet::new()),
+            class_namespace: std::cell::Cell::new(false),
             parent: Some(closure.clone()),
             module: RefCell::new(closure.module.borrow().clone()),
             slot_info: Some(slot_info),
             slots: RefCell::new(vec![None; n]),
         })
+    }
+
+    /// Mark this env as a class body's namespace.
+    pub fn mark_class_namespace(&self) {
+        self.class_namespace.set(true);
     }
 
     pub fn module_scope(&self) -> EnvRef {
@@ -113,6 +138,11 @@ impl Env {
 
     pub fn declare_nonlocal(&self, name: &str) {
         self.nonlocals.borrow_mut().insert(name.to_string());
+    }
+
+    /// Whether `name` is declared `global` or `nonlocal` in this scope.
+    pub fn declared_outer(&self, name: &str) -> bool {
+        self.globals.borrow().contains(name) || self.nonlocals.borrow().contains(name)
     }
 
     /// Look up `name` in this scope only (no parent walk).
@@ -132,6 +162,11 @@ impl Env {
                 if let Some(v) = &self.slots.borrow()[k as usize] {
                     return Some(v.clone());
                 }
+                // A local unbound by `del` stays unbound: CPython raises
+                // `UnboundLocalError` rather than reading an outer name.
+                if self.deleted_local(name) {
+                    return None;
+                }
                 // Unbound slot (read-before-assign) → consult enclosing scopes,
                 // matching the VM's existing fall-through behaviour.
                 return self.parent.as_ref().and_then(|p| p.get(name));
@@ -142,10 +177,40 @@ impl Env {
         if let Some(v) = self.bindings.borrow().get(name) {
             return Some(v.clone());
         }
+        if self.deleted_local(name) {
+            return None;
+        }
         if let Some(parent) = &self.parent {
             return parent.get(name);
         }
         None
+    }
+
+    /// Whether `name` is a function local of this scope that a `del` has
+    /// unbound (and nothing has rebound since). A module or class scope's
+    /// deleted name still falls through to the builtins, as in CPython.
+    pub fn deleted_local(&self, name: &str) -> bool {
+        let deleted = self.deleted.borrow();
+        !deleted.is_empty()
+            && deleted.contains(name)
+            && !self.bindings.borrow().contains_key(name)
+            && matches!(self.delete_scope(name), DeleteScope::Local)
+    }
+
+    /// Whether reading `name` from this scope hits a local unbound by `del`
+    /// — the read raises `UnboundLocalError` instead of `NameError`.
+    pub fn reads_deleted_local(&self, name: &str) -> bool {
+        let mut cur: Option<&Env> = Some(self);
+        while let Some(env) = cur {
+            if env.get_own(name).is_some() {
+                return false;
+            }
+            if env.deleted_local(name) {
+                return true;
+            }
+            cur = env.parent.as_deref();
+        }
+        false
     }
 
     /// Read a `Name` node — the hot expression-lookup path. Uses the node-index
@@ -157,6 +222,9 @@ impl Env {
                 if let Some(v) = &self.slots.borrow()[k as usize] {
                     return Some(v.clone());
                 }
+                if self.deleted_local(n.id.as_str()) {
+                    return None;
+                }
                 return self.parent.as_ref().and_then(|p| p.get(n.id.as_str()));
             }
             let name = n.id.as_str();
@@ -164,6 +232,9 @@ impl Env {
                 if let Some(v) = self.bindings.borrow().get(name) {
                     return Some(v.clone());
                 }
+            }
+            if self.deleted_local(name) {
+                return None;
             }
             return self.parent.as_ref().and_then(|p| p.get(name));
         }
@@ -191,8 +262,8 @@ impl Env {
                         return;
                     }
                 }
-                if env.bindings.borrow().contains_key(name) {
-                    env.bindings.borrow_mut().insert(name.into(), value);
+                if env.owns_binding(name) {
+                    env.bind_here(name, value);
                     return;
                 }
                 cur = env.parent.clone();
@@ -205,7 +276,7 @@ impl Env {
                 return;
             }
         }
-        self.bindings.borrow_mut().insert(name.into(), value);
+        self.bind_here(name, value);
     }
 
     /// Set `name = value` rewriting in the nearest scope that already binds
@@ -224,7 +295,7 @@ impl Env {
                 return;
             }
         }
-        self.bindings.borrow_mut().insert(name.into(), value);
+        self.bind_here(name, value);
     }
 
     /// Store into a `Name` node target — the hot assignment path. Uses the
@@ -240,16 +311,88 @@ impl Env {
         self.assign_or_create(n.id.as_str(), value);
     }
 
+    /// Unbind `name` (`del name`), honouring `global` / `nonlocal`
+    /// declarations the way [`Env::set`] does. Returns whether it was bound.
     pub fn delete(&self, name: &str) -> bool {
+        if self.globals.borrow().contains(name) {
+            return self.module_scope().delete_here(name);
+        }
+        if self.nonlocals.borrow().contains(name) {
+            // The enclosing scope `nonlocal` names is the nearest one that
+            // owns the name — as a slot even when it is currently unbound,
+            // so a second `del` fails there instead of reaching further out.
+            let mut cur = self.parent.clone();
+            while let Some(env) = cur {
+                let owns_slot = env
+                    .slot_info
+                    .as_ref()
+                    .is_some_and(|info| info.slot_of_name(name).is_some());
+                if owns_slot || env.owns_binding(name) {
+                    return env.delete_here(name);
+                }
+                cur = env.parent.clone();
+            }
+            return false;
+        }
+        self.delete_here(name)
+    }
+
+    /// Which kind of scope a `del` of `name` resolves in, for the error an
+    /// unbound name raises: a declared global or a module-level name gives
+    /// `NameError`, a function local `UnboundLocalError`, a `nonlocal` the
+    /// free-variable `NameError`.
+    pub fn delete_scope(&self, name: &str) -> DeleteScope {
+        if self.nonlocals.borrow().contains(name) {
+            DeleteScope::Free
+        } else if self.globals.borrow().contains(name)
+            || self.class_namespace.get()
+            || std::ptr::eq(self, Rc::as_ptr(&self.module_scope()))
+        {
+            DeleteScope::Global
+        } else {
+            DeleteScope::Local
+        }
+    }
+
+    fn delete_here(&self, name: &str) -> bool {
         if let Some(info) = &self.slot_info {
             if let Some(k) = info.slot_of_name(name) {
-                let mut slots = self.slots.borrow_mut();
-                let existed = slots[k as usize].is_some();
-                slots[k as usize] = None;
+                let existed = {
+                    let mut slots = self.slots.borrow_mut();
+                    let existed = slots[k as usize].is_some();
+                    slots[k as usize] = None;
+                    existed
+                };
+                // Remembered so a later read does not fall through to an
+                // enclosing scope's binding of the same name.
+                if existed {
+                    self.deleted.borrow_mut().insert(name.to_string());
+                }
                 return existed;
             }
         }
-        self.bindings.borrow_mut().remove(name).is_some()
+        let existed = self.bindings.borrow_mut().remove(name).is_some();
+        if existed {
+            self.deleted.borrow_mut().insert(name.to_string());
+        }
+        existed
+    }
+
+    /// Whether `name` is a plain binding of this scope — bound now, or
+    /// unbound by a `del` since.
+    fn owns_binding(&self, name: &str) -> bool {
+        self.bindings.borrow().contains_key(name) || self.deleted.borrow().contains(name)
+    }
+
+    /// Insert a plain binding, clearing any `del` tombstone for it.
+    fn bind_here(&self, name: &str, value: Value) {
+        {
+            let mut deleted = self.deleted.borrow_mut();
+            if !deleted.is_empty() {
+                deleted.remove(name);
+            }
+        }
+        self.bindings.borrow_mut().insert(name.into(), value);
     }
 
     /// Iterate over all (name, value) pairs in this scope only — both plain

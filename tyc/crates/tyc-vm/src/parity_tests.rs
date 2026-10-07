@@ -572,6 +572,574 @@ show(Color.RED == 1, isinstance(Color.RED, int), list(Color), Color.CRIMSON is C
     );
 }
 
+// ── Flag / IntFlag composites ─────────────────────────────────────────────
+
+#[test]
+fn flag_and_int_flag_composites_match_cpython() {
+    assert_matches_cpython(
+        "flag_and_int_flag_composites_match_cpython",
+        r#"from enum import Flag, IntFlag, auto
+class P(IntFlag):
+    R = 4
+    W = 2
+    X = 1
+    RW = 6
+class C(Flag):
+    A = auto()
+    B = auto()
+    AB = 3
+    D = auto()
+show(repr(P.R | P.W), P.R | P.W, repr(P(7)), repr(P(6)), P(6) is P.RW, repr(P(15)), repr(P(8)), P(8).name)
+show(list(P), list(P(7)), len(P(7)), len(P), repr(P.R | 1), repr(1 | P.R), repr(P.R & 2), P.R + 0, repr(~P.R), repr(P(-1)))
+show(repr(C(7)), list(C), len(C), list(C(7)), repr(~C.A), repr(C.A ^ C.AB), C(3) is C.AB, (C.A | C.D) is (C.D | C.A))
+show(bool(C(0)), repr(C(0)), str(C(0)), str(P(0)), repr(~C(0)), C(0) in C.A, C.AB in C(7), list(C(0)), C["AB"])
+show(P(7) == 7, hash(P.R) == hash(4), {P.R: 1}[4], f"{C.A}", format(P.R))
+show(len(P(8)), len(P(9)), len(P.RW), len(C.AB), len(C(0)))
+class Q(IntFlag):
+    A = 1
+    B = 2
+show(repr(Q(-8)), repr(Q(-1)), repr(Q(-3)), repr(Q.A | -8), repr(Q.A ^ -1), repr(-8 | Q.A), repr(~Q(8)), repr(C(-1)), repr(C(-8)))
+trap("strict negative", lambda: C(-17))
+class N(Flag):
+    A = 3
+    B = 4
+class Other(IntFlag):
+    Y = 2
+show(list(N.A), list(N(7)), list(N), len(N.A), repr(Other.Y & Q.A), type(Q.A | Other.Y).__name__, int(Q.A ^ Other.Y))
+trap("foreign in", lambda: Q.A in Other.Y)
+trap("int in", lambda: 1 in Other.Y)
+class PA(IntFlag):
+    A = 1
+    AB = 3
+    C = 4
+class FA(Flag):
+    A = 1
+    AB = 3
+    C = 4
+show(PA(15).name, repr(PA(15)), PA(7).name, PA(11).name, repr(PA(8)), FA(7).name, FA(5).name)
+show(repr(Q.B | True), repr(Q.B & True), repr(Q.B ^ True), repr(True | Q.B))
+trap("strict", lambda: C(8))
+class Neg(Flag):
+    A = 1
+    B = -3
+show(len(Neg.B), Neg.B.value)
+trap("negative iter", lambda: list(Neg.B))
+class NegAuto(Flag):
+    A = -1
+    B = auto()
+class NegAutoI(IntFlag):
+    A = -3
+    B = auto()
+class MixAuto(Flag):
+    A = -1
+    B = 4
+    C = auto()
+show(NegAuto.B.value, NegAutoI.B.value, MixAuto.C.value)
+class BoolAuto(Flag):
+    A = True
+    B = auto()
+show(BoolAuto.B.value)
+class NegMember(Flag):
+    A = 1
+    B = -3
+class NegMemberI(IntFlag):
+    A = 1
+    B = -3
+show(NegMember(-3) is NegMember.B, NegMemberI(-3) is NegMemberI.B)
+class Big(IntFlag):
+    LOW = 1
+    BIG = 1 << 70
+    NEXT = auto()
+class BigF(Flag):
+    A = 1
+    B = 1 << 64
+show(repr(Big.LOW | Big.BIG), Big.NEXT.value, list(Big.LOW | Big.BIG | Big.NEXT), len(Big.BIG | Big.LOW))
+show(repr(~Big.LOW), repr(Big(1 << 80)), repr(Big.BIG | (1 << 90)), Big.BIG in (Big.BIG | Big.LOW), bool(Big.BIG & Big.LOW))
+show(repr(BigF(BigF.A.value | BigF.B.value)), repr(~BigF.A), list(BigF), repr(BigF.A ^ BigF.B))
+trap("big strict", lambda: BigF(1 << 65))
+show(list(Neg), list(Neg.A))
+"#,
+    );
+}
+
+// ── `del` targets and scopes ──────────────────────────────────────────────
+
+#[test]
+fn del_targets_and_scopes_match_cpython() {
+    assert_matches_cpython(
+        "del_targets_and_scopes_match_cpython",
+        r#"plain class Bag:
+    def __delitem__(self, k: object) -> None:
+        show("delitem", k)
+mut bag = Bag()
+del bag[1:2]
+del bag[::2]
+del bag[3]
+mut ba = bytearray(b"abcd")
+del ba[1:3]
+show(ba)
+plain class Key:
+    def __index__(self) -> int:
+        return 1
+    def __hash__(self) -> int:
+        return 99
+mut xs = [1, 2, 3]
+del xs[Key()]
+show(xs)
+mut dk = {1: "one"}
+show("absent", Key() in dk)
+dk[Key()] = "key"
+show(len(dk), dk[1])
+plain class Holder:
+    x = 1
+mut proxy = Holder.__dict__
+def drop() -> None:
+    del proxy["x"]
+trap("proxy del", drop)
+show(hasattr(Holder, "x"))
+g = 1
+def drop_global() -> None:
+    global g
+    del g
+def drop_twice() -> None:
+    c = 3
+    del c
+    del c
+def outer() -> object:
+    n = 1
+    def inner() -> None:
+        nonlocal n
+        del n
+    inner()
+    return "n" in dir()
+mut xs = [1, 2, 3, 4]
+mut d = {"k": 1, "j": 2}
+a, b = 1, 2
+del (a, b), [xs[0], d["k"]]
+show("a" in dir(), "b" in dir(), xs, d)
+drop_global()
+show("g" in dir())
+trap("again", drop_global)
+trap("twice", drop_twice)
+trap("nonlocal", outer)
+def class_del() -> None:
+    plain class K:
+        del missing
+trap("class body", class_del)
+plain class Kept:
+    a = 1
+    b = 2
+    c = 3
+    del a
+    del (b, c)
+show(hasattr(Kept, "a"), hasattr(Kept, "b"), hasattr(Kept, "c"))
+mut gx = 1
+mut gy = 1
+plain class Decl:
+    global gx, gy
+    del gx
+    gy = 5
+trap("gx gone", lambda: gx)
+show(gy, hasattr(Decl, "gy"))
+plain class DeclDef:
+    global gx
+    def gx() -> int:
+        return 3
+show(gx(), hasattr(DeclDef, "gx"))
+plain class Gone:
+    def f(self) -> int:
+        return 1
+    del f
+    @property
+    def p(self) -> int:
+        return 1
+    del p
+    @classmethod
+    def k(cls) -> int:
+        return 1
+    del k
+show(hasattr(Gone, "f"), hasattr(Gone, "p"), hasattr(Gone, "k"), hasattr(Gone(), "p"))
+mut shadow = 99
+def del_then_read() -> None:
+    mut shadow = 1
+    del shadow
+    show(shadow)
+trap("deleted local", del_then_read)
+def del_then_rebind() -> None:
+    mut shadow = 1
+    del shadow
+    shadow = 5
+    show("rebound", shadow)
+del_then_rebind()
+def nested() -> object:
+    x = 1
+    def mid() -> object:
+        x = 2
+        def inner() -> None:
+            nonlocal x
+            del x
+            del x
+        trap("second del", inner)
+    mid()
+    return x
+trap("outer kept", nested)
+"#,
+    );
+}
+
+// ── bytes.translate / bytes.maketrans ─────────────────────────────────────
+
+#[test]
+fn bytes_translate_matches_cpython() {
+    assert_matches_cpython(
+        "bytes_translate_matches_cpython",
+        r#"t = bytes.maketrans(b"ab", b"xy")
+show(len(t), t[97], b"aabbc".translate(t), b"abc".translate(None, b"b"), b"abcab".translate(t, b"c"))
+show(b"abc".translate(None), b"abc".translate(t, delete=b"a"))
+trap("short", lambda: b"x".translate(b"short"))
+trap("uneven", lambda: bytes.maketrans(b"ab", b"x"))
+trap("extra", lambda: b"x".translate(None, b"", b"extra"))
+trap("int table", lambda: bytes.maketrans(97, 98))
+show(bytes.maketrans(bytearray(b"a"), bytearray(b"b"))[97], b"ab".translate(None, bytearray(b"b")))
+trap("int delete", lambda: b"x".translate(None, 120))
+trap("int translate", lambda: b"x".translate(5))
+show(b"a".maketrans(b"a", b"b")[97], "a".maketrans("a", "b"), {}.fromkeys("ab", 0), hasattr(b"", "maketrans"))
+"#,
+    );
+}
+
+// ── `async for` over a hand-written async iterator ────────────────────────
+
+#[test]
+fn async_for_steps_a_user_async_iterator_lazily() {
+    assert_matches_cpython(
+        "async_for_steps_a_user_async_iterator_lazily",
+        r#"import asyncio
+plain class Ticker:
+    def __init__(self, n: int) -> None:
+        self.i = 0
+        self.n = n
+    def __aiter__(self) -> "Ticker":
+        return self
+    async def __anext__(self) -> int:
+        if self.i >= self.n:
+            raise StopAsyncIteration
+        self.i += 1
+        show("step", self.i)
+        return self.i
+plain class Forever:
+    def __aiter__(self) -> "Forever":
+        return self
+    async def __anext__(self) -> int:
+        return 1
+async def main() -> None:
+    async for v in Ticker(3):
+        show("body", v)
+    total = 0
+    async for w in Forever():
+        total += w
+        if total >= 5:
+            break
+    show("total", total)
+asyncio.run(main())
+def sync_for() -> None:
+    for x in Ticker(1):
+        show(x)
+trap("sync for", sync_for)
+trap("sync list", lambda: list(Ticker(1)))
+plain class ListAiter:
+    def __aiter__(self) -> object:
+        return [1, 2]
+plain class Both:
+    def __init__(self) -> None:
+        self.done = False
+    def __iter__(self) -> object:
+        return iter(["sync"])
+    def __aiter__(self) -> "Both":
+        return self
+    async def __anext__(self) -> str:
+        if self.done:
+            raise StopAsyncIteration
+        self.done = True
+        return "async"
+async def odd() -> None:
+    async for b in Both():
+        show("both", b)
+    async for x in ListAiter():
+        show("list", x)
+trap("aiter list", lambda: asyncio.run(odd()))
+async def over(it: object) -> None:
+    async for x in it:
+        show(x)
+for it in ([1], (1,), "a", b"a", {1: 2}, {1}, range(1), frozenset({1})):
+    trap("sync iterable", lambda: asyncio.run(over(it)))
+plain class SyncOnly:
+    def __iter__(self) -> object:
+        return iter([1])
+trap("sync instance", lambda: asyncio.run(over(SyncOnly())))
+trap("sync iterator", lambda: asyncio.run(over(iter([1]))))
+def sync_gen() -> object:
+    yield 1
+trap("sync generator", lambda: asyncio.run(over(sync_gen())))
+async def agen() -> object:
+    yield 2
+asyncio.run(over(agen()))
+plain class CoroAiter:
+    async def __aiter__(self) -> "CoroAiter":
+        return self
+    async def __anext__(self) -> int:
+        raise StopAsyncIteration
+trap("coroutine aiter", lambda: asyncio.run(over(CoroAiter())))
+plain class GenAiter:
+    async def __aiter__(self) -> object:
+        yield 7
+asyncio.run(over(GenAiter()))
+plain class SyncAnext:
+    def __aiter__(self) -> "SyncAnext":
+        return self
+    def __anext__(self) -> int:
+        return 1
+trap("sync anext", lambda: asyncio.run(over(SyncAnext())))
+plain class Token:
+    pass
+plain class TokenAnext:
+    def __aiter__(self) -> "TokenAnext":
+        return self
+    def __anext__(self) -> Token:
+        return Token()
+trap("instance anext", lambda: asyncio.run(over(TokenAnext())))
+plain class TypeAnext:
+    def __aiter__(self) -> "TypeAnext":
+        return self
+    def __anext__(self) -> object:
+        return int
+trap("type anext", lambda: asyncio.run(over(TypeAnext())))
+plain class SleepAnext:
+    def __init__(self) -> None:
+        self.n = 0
+    def __aiter__(self) -> "SleepAnext":
+        return self
+    def __anext__(self) -> object:
+        self.n += 1
+        if self.n > 2:
+            raise StopAsyncIteration
+        return asyncio.sleep(0, self.n)
+asyncio.run(over(SleepAnext()))
+d = {1: 2}
+for view in (d.keys(), d.values(), d.items()):
+    trap("dict view", lambda: asyncio.run(over(view)))
+plain class AgenAnext:
+    def __aiter__(self) -> "AgenAnext":
+        return self
+    async def __anext__(self) -> object:
+        yield 1
+trap("agen anext", lambda: asyncio.run(over(AgenAnext())))
+async def source() -> object:
+    yield 1
+    yield 2
+async def genexp() -> None:
+    mut values = (x async for x in source())
+    show(type(values).__name__)
+    async for x in values:
+        show("gx", x)
+    mut plain = (x for x in [1])
+    trap("sync genexp", lambda: asyncio.run(over(plain)))
+asyncio.run(genexp())
+async def fetch(x: int) -> int:
+    return x * 10
+async def await_genexp() -> None:
+    mut g = (await fetch(x) for x in [1, 2])
+    show(type(g).__name__)
+    async for v in g:
+        show("v", v)
+    mut h = (x for x in [1] if await fetch(x))
+    show(type(h).__name__)
+asyncio.run(await_genexp())
+async def coro_list() -> list[int]:
+    return [1, 2]
+trap("coroutine iterable", lambda: asyncio.run(over(coro_list())))
+async def lambda_default_genexp() -> None:
+    mut g = ((lambda x=await fetch(3): x)() for _ in [1])
+    show(type(g).__name__)
+    async for v in g:
+        show("lam", v)
+asyncio.run(lambda_default_genexp())
+plain class GenexpAiter:
+    def __aiter__(self) -> object:
+        return (x async for x in source())
+async def genexp_aiter() -> None:
+    async for x in GenexpAiter():
+        show("ai", x)
+    mut nested = ((await fetch(z) for z in [1]) for _ in [1])
+    show(type(nested).__name__)
+asyncio.run(genexp_aiter())
+plain class AwaitableIter:
+    def __init__(self) -> None:
+        self.n = 0
+    def __aiter__(self) -> "AwaitableIter":
+        return self
+    def __await__(self) -> object:
+        show("await called")
+        return iter([])
+    async def __anext__(self) -> int:
+        self.n += 1
+        if self.n > 2:
+            raise StopAsyncIteration
+        return self.n
+async def both_loop() -> None:
+    async for x in AwaitableIter():
+        show("b", x)
+asyncio.run(both_loop())
+async def await_agen() -> None:
+    await source()
+trap("await agen", lambda: asyncio.run(await_agen()))
+plain class StopWith:
+    def __iter__(self) -> "StopWith":
+        return self
+    def __next__(self) -> int:
+        raise StopIteration(42)
+plain class Aw:
+    def __await__(self) -> StopWith:
+        return StopWith()
+plain class AwAnext:
+    def __init__(self) -> None:
+        self.n = 0
+    def __aiter__(self) -> "AwAnext":
+        return self
+    def __anext__(self) -> Aw:
+        self.n += 1
+        if self.n > 1:
+            raise StopAsyncIteration
+        return Aw()
+async def await_result() -> None:
+    async for x in AwAnext():
+        show("aw item", x)
+    show("aw await", await Aw())
+asyncio.run(await_result())
+async def comp() -> None:
+    show("comp", [x async for x in Both()])
+asyncio.run(comp())
+async def comp_list() -> None:
+    xs = [1]
+    show([x async for x in xs])
+trap("sync comp", lambda: asyncio.run(comp_list()))
+class Done(StopAsyncIteration):
+    pass
+class DoneWith(StopIteration):
+    pass
+plain class StopSub:
+    def __iter__(self) -> "StopSub":
+        return self
+    def __next__(self) -> int:
+        raise DoneWith(7)
+plain class AwSub:
+    def __await__(self) -> StopSub:
+        return StopSub()
+plain class AwWrapped:
+    def __await__(self) -> object:
+        return iter(StopWith())
+plain class SubEnd:
+    def __aiter__(self) -> "SubEnd":
+        return self
+    async def __anext__(self) -> int:
+        raise Done()
+async def sub_end() -> None:
+    async for x in SubEnd():
+        show("never", x)
+    show("sub end", await AwSub(), await AwWrapped())
+asyncio.run(sub_end())
+from enum import Enum
+class Colour(Enum):
+    RED = 1
+async def over_class(c: object) -> None:
+    async for x in c:
+        show(x)
+trap("enum class", lambda: asyncio.run(over_class(Colour)))
+trap("plain class", lambda: asyncio.run(over_class(SubEnd)))
+from typing import Iterator
+def sync_gen() -> Iterator[int]:
+    yield 1
+plain class SyncGenAiter:
+    def __aiter__(self) -> object:
+        return sync_gen()
+trap("sync gen aiter", lambda: asyncio.run(over_class(SyncGenAiter())))
+"#,
+    );
+}
+
+// ── `__mro__` / `__bases__` of builtin types and exceptions ──────────────
+
+#[test]
+fn builtin_mro_and_bases_match_cpython() {
+    assert_matches_cpython(
+        "builtin_mro_and_bases_match_cpython",
+        r#"names = lambda cs: [c.__name__ for c in cs]
+class AppError(ValueError):
+    pass
+class Computed(type(ValueError())):
+    pass
+show(names(Computed.__mro__), issubclass(Computed, Exception))
+def raise_computed() -> None:
+    try:
+        raise Computed("boom")
+    except ValueError as e:
+        show("caught", type(e).__name__, e)
+raise_computed()
+Alias = ValueError
+ValueError = 3
+class Aliased(Alias):
+    pass
+show(names(Aliased.__mro__), names(Aliased.__bases__), issubclass(Aliased, Exception))
+import asyncio
+show(names(asyncio.CancelledError.__mro__), names(asyncio.CancelledError.__bases__))
+ValueError = Alias
+class Deeper(AppError):
+    pass
+plain class Base:
+    pass
+plain class Child(Base):
+    pass
+plain class Mixin:
+    pass
+plain class Both(Child, Mixin):
+    pass
+plain class PlainErr(ValueError):
+    pass
+plain class Sub(PlainErr):
+    pass
+show(names(ValueError.__mro__), names(KeyError.__mro__), names(FileNotFoundError.__mro__), names(KeyboardInterrupt.__mro__))
+show(names(AppError.__mro__), names(Deeper.__mro__), names(AppError.__bases__), names(Deeper.__bases__))
+show(names(type(ValueError("x")).__mro__), names(type(KeyError("k")).__bases__), names(Exception.__bases__))
+show(names(bool.__mro__), names(int.__mro__), names(bool.__bases__), names(str.__bases__))
+show(names(Child.__mro__), names(Both.__mro__), names(Both.__bases__), names(Base.__bases__))
+show(names(type(True).__mro__), names(ExceptionGroup.__mro__), names(UnicodeDecodeError.__mro__))
+show(names(Sub.__bases__), names(Sub.__mro__), names(PlainErr.__bases__), names(ExceptionGroup.__bases__))
+plain class ErrFirst(ValueError, Mixin):
+    pass
+plain class MixFirst(Mixin, KeyError):
+    pass
+plain class Join(ErrFirst, KeyError):
+    pass
+show(names(ErrFirst.__mro__), names(ErrFirst.__bases__), names(MixFirst.__mro__), names(Join.__mro__), names(Join.__bases__))
+plain class ML(list):
+    pass
+plain class MixList(Mixin, dict):
+    pass
+show(names(ML.__bases__), names(ML.__mro__), names(MixList.__mro__), names(MixList.__bases__))
+plain class Meta(type):
+    pass
+show(names(Meta.__bases__), names(Meta.__mro__))
+plain class WithObject(Mixin, object):
+    pass
+plain class OnlyObject(object):
+    pass
+show(names(WithObject.__bases__), names(WithObject.__mro__), names(OnlyObject.__bases__), names(OnlyObject.__mro__))
+list = 7
+show(ML.__bases__[0] == list, names(ML.__mro__))
+"#,
+    );
+}
+
 // ── W5-11: changing a dict or set while iterating it ──────────────────────
 
 #[test]
@@ -1368,6 +1936,24 @@ lst = [{1}]
 first = lst[0]
 lst[0] -= {1}
 show(repr(lst), first is lst[0])
+"#,
+    );
+}
+
+// ── A `yield` in any expression position makes a generator ───────────────
+
+#[test]
+fn yield_in_a_dict_display_makes_a_generator() {
+    assert_matches_cpython(
+        "yield_in_a_dict_display_makes_a_generator",
+        r#"from typing import Generator
+def g() -> Generator[int, object, None]:
+    show({1: (yield 1)})
+    show({"a": (yield 2)})
+it = g()
+show(next(it))
+show(it.send(5))
+trap("end", lambda: it.send(6))
 "#,
     );
 }

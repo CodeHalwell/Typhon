@@ -183,13 +183,14 @@ intended lowering is below; for now, hand-write the generator.
 
 `return [...]` rewrites to a generator emission. Useful when the caller may only need a prefix.
 
-## `lazy from` is rejected
+## `lazy from` (3.15 targets)
 
 ```python
-lazy from numpy import array     # ❌ tyc::lazy_usage
+lazy from numpy import array     # Typhon, [python] target = "3.15"
+lazy from numpy import array     # emitted Python: PEP 810's native statement
 ```
 
-PEP 690's analysis: `from`-imports eagerly resolve attributes, defeating deferral. The diagnostic redirects you to `lazy import numpy`.
+There is no lowering for older targets: without PEP 810 a from-import has to load the module to bind the name. On 3.13 / 3.14 it is `tyc::requires_newer_python`, which points you to `lazy import np = numpy`.
 
 ## Where next
 

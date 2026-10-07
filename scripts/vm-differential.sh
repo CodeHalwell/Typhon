@@ -57,6 +57,11 @@
 #     --timeout N                   per-side wall-clock seconds (default: 20)
 #     --update                      rewrite the baseline from this run's result
 #     --baseline PATH               alternate expectations file
+#     --extra-baseline PATH         additional expectations, unioned with the
+#       baseline. Used by the CPython 3.15 leg: the VM matches 3.13's error
+#       messages and float `sum`, so the units whose stdout changed in 3.15
+#       itself live in scripts/differential-baseline-py315.txt rather than
+#       in a copy of the whole baseline. Not combinable with --update.
 #     --report PATH                 write the full per-unit TSV report here
 #     --keep                        keep the scratch workdirs for inspection
 #     -h|--help
@@ -87,6 +92,7 @@ TIMEOUT=20
 UPDATE=0
 KEEP=0
 REPORT=""
+EXTRA_BASELINE=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -95,6 +101,7 @@ while [ $# -gt 0 ]; do
         --jobs)     JOBS="$2"; shift 2 ;;
         --timeout)  TIMEOUT="$2"; shift 2 ;;
         --baseline) BASELINE="$2"; shift 2 ;;
+        --extra-baseline) EXTRA_BASELINE="$2"; shift 2 ;;
         --report)   REPORT="$2"; shift 2 ;;
         --update)   UPDATE=1; shift ;;
         --keep)     KEEP=1; shift ;;
@@ -103,6 +110,11 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+if [ "$UPDATE" = "1" ] && [ -n "$EXTRA_BASELINE" ]; then
+    echo "error: --update rewrites --baseline only; drop --extra-baseline and edit" >&2
+    echo "       '$EXTRA_BASELINE' by hand." >&2
+    exit 2
+fi
 
 # ---------------------------------------------------------------- preflight --
 if [ ! -x "$TYC" ]; then
@@ -227,7 +239,7 @@ echo "  tyc      : $TYC"
 echo "  python   : $PYTHON313 ($("$PYTHON313" --version 2>&1))"
 echo "  scope    : $SCOPE${FILTER:+  filter=/$FILTER/}"
 echo "  units    : $TOTAL   (jobs=$JOBS, per-side timeout=${TIMEOUT}s)"
-echo "  baseline : ${BASELINE#$REPO_ROOT/}"
+echo "  baseline : ${BASELINE#$REPO_ROOT/}${EXTRA_BASELINE:+ + ${EXTRA_BASELINE#$REPO_ROOT/}}"
 echo "  declared : ${NONDET#$REPO_ROOT/}  ($N_DECLARED_TOTAL nondeterministic-by-construction)"
 echo
 
@@ -581,9 +593,14 @@ if [ ! -f "$BASELINE" ]; then
     echo "       create it with: scripts/vm-differential.sh --update" >&2
     exit 2
 fi
+if [ -n "$EXTRA_BASELINE" ] && [ ! -f "$EXTRA_BASELINE" ]; then
+    echo "error: extra baseline '$EXTRA_BASELINE' does not exist." >&2
+    exit 2
+fi
 
 EXPECTED="$SCRATCH/expected.txt"
-grep -vE '^\s*(#|$)' "$BASELINE" | sed 's/[[:space:]]*$//' | sort -u > "$EXPECTED"
+cat "$BASELINE" ${EXTRA_BASELINE:+"$EXTRA_BASELINE"} \
+    | grep -vE '^\s*(#|$)' | sed 's/[[:space:]]*$//' | sort -u > "$EXPECTED"
 
 # ---- structural integrity of the nondeterministic declarations --------------
 # Both checks are scope-independent and deterministic, so they can hard-fail
@@ -720,14 +737,14 @@ if [ "$N_NEW" -gt 0 ]; then
     echo
     echo "  The VM must behave identically to \`tyc build\` + CPython. Fix the VM,"
     echo "  or — if the divergence is pre-existing and out of scope — append the"
-    echo "  unit id to ${BASELINE#$REPO_ROOT/} with a comment explaining why."
+    echo "  unit id to ${EXTRA_BASELINE:-$BASELINE} with a comment explaining why." | sed "s|$REPO_ROOT/||"
     echo
 fi
 
 if [ "$N_FIXED" -gt 0 ]; then
     status=1
     echo "FAIL: $N_FIXED baseline entry/entries no longer diverge — remove them"
-    echo "      from ${BASELINE#$REPO_ROOT/} (the baseline must only shrink, never rot):"
+    echo "      from ${BASELINE#$REPO_ROOT/}${EXTRA_BASELINE:+ or ${EXTRA_BASELINE#$REPO_ROOT/}} (the baseline must only shrink, never rot):"
     sed 's/^/  - /' "$FIXED"
     echo
 fi

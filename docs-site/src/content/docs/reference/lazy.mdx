@@ -60,19 +60,13 @@ The in-process VM (`tyc run`) uses a simpler lowering for `lazy import name = mo
 
 Before v0.9.0 `lazy import np = numpy` raised `ImportError` under `tyc run` (the compiled proxy class generation didn't apply); since v0.9.0 the same source runs cleanly under both modes.
 
-### `lazy from` is rejected
+### `lazy from` needs a 3.15 target
 
 ```python
-lazy from numpy import array    # ❌ rejected at check time
+lazy from numpy import array    # ✅ on [python] target = "3.15"; an error on 3.13 / 3.14
 ```
 
-```
-error[tyc::lazy_usage]: `lazy from … import` is not allowed because it eagerly
-                        touches attributes on the source module — use
-                        `lazy import numpy` plus `numpy.array(...)`
-```
-
-PEP 690 explains why: `from`-imports eagerly resolve attributes, defeating deferral.
+On a 3.15+ target `lazy from` lowers to the native [PEP 810](https://peps.python.org/pep-0810/) statement, which makes each imported name lazy. On 3.13 and 3.14 it is [`tyc::requires_newer_python`](/Typhon/diagnostics/compile-errors/): without PEP 810 a from-import has to load the module to bind the name, so use `lazy import np = numpy` plus `np.array(...)` there. `lazy from numpy import *`, `lazy from __future__ import …` and a `lazy from` inside a function or block are `tyc::lazy_usage` errors on every target, as they are in CPython 3.15. Under `tyc run` a `lazy from` loads its module at the import statement.
 
 ## `lazy let` (module-level)
 
@@ -166,13 +160,13 @@ def primes_up_to(n: int) -> Iterator[int]:
 
 ## Common mistakes
 
-### `lazy from` import
+### `lazy from` on an older target
 
 ```python
-lazy from numpy import array    # ❌
+lazy from numpy import array    # ❌ before [python] target = "3.15"
 ```
 
-Use `lazy import np = numpy` plus `np.array(...)`.
+Use `lazy import np = numpy` plus `np.array(...)`, or raise the target to 3.15.
 
 ### Mutating a `lazy let`
 

@@ -796,7 +796,7 @@ fn check_cross_module_extend_str_no_attribute_not_found() {
 
 #[test]
 fn build_rewrites_attribute_and_call_receivers_of_str_extension() {
-    // docs/release-readiness-review-2026-09-30.md §5: a call of an
+    // docs/reviews/release-readiness-review-2026-09-30.md §5: a call of an
     // `extend BUILTIN` method on an attribute or call receiver passed
     // `tyc check` but was never lowered, so CPython raised
     // `AttributeError: 'str' object has no attribute 'slug'`.
@@ -2090,6 +2090,80 @@ fn build_emits_typhon_runtime_when_only_lazy_import_used() {
     );
 }
 
+// ── target-gated syntax (tyc::requires_newer_python) ──────────────────
+
+const PEP798_SRC: &str = "\
+def main() -> None:
+    let lists: list[list[int]] = [[1], [2, 3]]
+    let flat: list[int] = [*xs for xs in lists]
+    print(flat)
+
+if __name__ == \"__main__\":
+    main()
+";
+
+#[test]
+fn check_rejects_3_15_syntax_on_older_targets() {
+    // A PEP 798 unpacking comprehension needs Python 3.15. On a 3.13 or 3.14
+    // target the emitted `.py` would not compile, so check and build refuse.
+    for target in ["3.13", "3.14"] {
+        let tmp = tempfile::tempdir().unwrap();
+        scaffold_target(tmp.path(), target, PEP798_SRC);
+        let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !out.status.success(),
+            "{target}: check must fail; got:\n{text}"
+        );
+        assert!(
+            text.contains("tyc::requires_newer_python") && text.contains("main.ty:3"),
+            "{target}: expected the diagnostic at main.ty:3; got:\n{text}"
+        );
+        let build = tyc().arg("build").arg(tmp.path()).output().unwrap();
+        assert!(!build.status.success(), "{target}: build must fail");
+        assert!(
+            !tmp.path().join("build").join("main.py").exists(),
+            "{target}: no .py may be written"
+        );
+    }
+}
+
+#[test]
+fn check_accepts_3_15_syntax_on_a_3_15_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(tmp.path(), "3.15", PEP798_SRC);
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn typhon_lazy_import_is_not_judged_against_the_target_grammar() {
+    // `lazy import` is Typhon syntax on every target; only a 3.15 build
+    // turns it into the native PEP 810 statement.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(
+        tmp.path(),
+        "3.13",
+        "lazy import js = json\nprint(js.dumps(1))\n",
+    );
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 // ── PEP 810 native lazy imports (3.15+ targets) ───────────────────────────────
 
 #[test]
@@ -2284,6 +2358,62 @@ fn build_native_lazy_import_sourcemap_round_trips_on_3_15() {
         map_entries, py_lines,
         "source-map `lines` entries ({map_entries}) must match emitted line count ({py_lines})",
     );
+}
+
+#[test]
+fn build_lazy_from_import_lowers_to_native_pep810_on_3_15() {
+    // `lazy from M import …` checks as a plain from-import and comes back
+    // out as PEP 810's native form, parenthesised spellings included.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(
+        tmp.path(),
+        "3.15",
+        "from os import sep\nlazy from json import dumps, loads as parse\nlazy from os.path import (\n    join,\n    basename,\n)\n\ndef main() -> None:\n    print(dumps(parse(\"[1]\")), join(\"a\", \"b\"), basename(\"/x/y\"), sep)\n",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    for want in [
+        "lazy from json import dumps, loads as parse",
+        "lazy from os.path import join, basename",
+    ] {
+        assert!(
+            py.lines().any(|l| l == want),
+            "missing `{want}`; got:\n{py}"
+        );
+    }
+    assert!(
+        py.lines().any(|l| l == "from os import sep"),
+        "a plain from-import must stay eager; got:\n{py}"
+    );
+}
+
+#[test]
+fn lazy_from_import_needs_a_3_15_target() {
+    // Before 3.15 `lazy from` is `tyc::requires_newer_python`; its
+    // SyntaxError forms are `tyc::lazy_usage` on every target.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(
+        tmp.path(),
+        "3.13",
+        "lazy from json import dumps\nprint(dumps(1))\n",
+    );
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    let text =
+        String::from_utf8_lossy(&out.stderr).into_owned() + &String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("tyc::requires_newer_python"), "{text}");
+
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(
+        tmp.path(),
+        "3.15",
+        "lazy from json import *\nprint(dumps(1))\n",
+    );
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    let text =
+        String::from_utf8_lossy(&out.stderr).into_owned() + &String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("tyc::lazy_usage"), "{text}");
 }
 
 #[test]

@@ -354,6 +354,12 @@ class PurePosixPath:
         return bool(self._root)
 
     def is_reserved(self):
+        # Removed in Python 3.15; follow the project's target.
+        import sys
+        if sys.version_info >= (3, 15):
+            raise AttributeError(
+                "'%s' object has no attribute 'is_reserved'" % type(self).__name__
+            )
         return False
 
     def is_relative_to(self, other, *_deprecated):
