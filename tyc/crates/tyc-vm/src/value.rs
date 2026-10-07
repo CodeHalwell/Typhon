@@ -1842,6 +1842,12 @@ pub struct GeneratorState {
 
 /// A lazy generator expression `(elt for … in … if …)`: the comprehension AST
 /// plus one live iterator per `for` clause.
+/// Whether a generator expression is an *async* one (`(x async for x in a)`),
+/// which makes the value an `async_generator` rather than a `generator`.
+pub fn genexpr_is_async(st: &GenExprState) -> bool {
+    st.node.generators.iter().any(|c| c.is_async)
+}
+
 pub struct GenExprState {
     pub node: Rc<ruff_python_ast::ExprGenerator>,
     /// The comprehension's private scope (targets bind here).
@@ -2163,6 +2169,8 @@ pub fn iter_type_name(state: &IterState) -> &'static str {
             kind: DictViewKind::Items,
             ..
         } => "dict_reverseitemiterator",
+        IterState::Generator(g) if g.borrow().function.is_async => "async_generator",
+        IterState::GenExpr(g) if genexpr_is_async(&g.borrow()) => "async_generator",
         IterState::Generator(_) | IterState::GenExpr(_) => "generator",
         IterState::UserIter(_) => "iterator",
         IterState::AsyncUserIter(_) => "async_iterator",

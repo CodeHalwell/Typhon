@@ -882,6 +882,26 @@ asyncio.run(over(SleepAnext()))
 d = {1: 2}
 for view in (d.keys(), d.values(), d.items()):
     trap("dict view", lambda: asyncio.run(over(view)))
+plain class AgenAnext:
+    def __aiter__(self) -> "AgenAnext":
+        return self
+    async def __anext__(self) -> object:
+        yield 1
+trap("agen anext", lambda: asyncio.run(over(AgenAnext())))
+async def source() -> object:
+    yield 1
+    yield 2
+async def genexp() -> None:
+    mut values = (x async for x in source())
+    show(type(values).__name__)
+    async for x in values:
+        show("gx", x)
+    mut plain = (x for x in [1])
+    trap("sync genexp", lambda: asyncio.run(over(plain)))
+asyncio.run(genexp())
+async def await_agen() -> None:
+    await source()
+trap("await agen", lambda: asyncio.run(await_agen()))
 async def comp() -> None:
     show("comp", [x async for x in Both()])
 asyncio.run(comp())

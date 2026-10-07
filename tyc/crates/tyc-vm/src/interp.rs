@@ -5975,7 +5975,14 @@ impl Interpreter {
     /// whose type defines `__await__`.
     pub fn is_awaitable(&self, v: &Value) -> bool {
         match v {
-            Value::Coroutine(_) => true,
+            // Calling an `async def` that contains `yield` makes an async
+            // *generator*, which is iterated, never awaited.
+            Value::Coroutine(t) => {
+                matches!(
+                    t.function.generator,
+                    crate::value::GeneratorKind::NotGenerator
+                )
+            }
             Value::Module(m) => m.name == "Task",
             Value::Instance(inst) => self.find_method(&inst.class, "__await__").is_some(),
             _ => false,
@@ -9137,6 +9144,7 @@ impl Interpreter {
                                 "type".to_owned()
                             }
                             Value::Native(_) => "builtin_function_or_method".to_owned(),
+                            Value::Coroutine(_) => "async_generator".to_owned(),
                             other => other.type_display_name().to_string(),
                         };
                         Err(type_error(format!(
@@ -10353,6 +10361,15 @@ fn await_type_name(v: &Value) -> String {
         Value::Instance(inst) => inst.class.name.clone(),
         Value::Class(_) => "type".to_owned(),
         Value::Exception { kind, .. } => (**kind).clone(),
+        // Calling an `async def` holding a `yield` makes an async generator.
+        Value::Coroutine(t)
+            if !matches!(
+                t.function.generator,
+                crate::value::GeneratorKind::NotGenerator
+            ) =>
+        {
+            "async_generator".to_owned()
+        }
         other => other.type_name().to_owned(),
     }
 }
@@ -12123,6 +12140,8 @@ fn reject_sync_only_async_iterable(v: &Value) -> Result<(), Unwind> {
     let sync_iterator = match v {
         Value::Iter(it) => match &*it.borrow() {
             IterState::Generator(g) => !g.borrow().function.is_async,
+            // `(x async for x in src)` is an async generator.
+            IterState::GenExpr(g) => !crate::value::genexpr_is_async(&g.borrow()),
             IterState::AsyncUserIter(_) => false,
             _ => true,
         },

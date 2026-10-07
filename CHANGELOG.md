@@ -8,6 +8,12 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ### Fixed
 
+- **Async generators are not awaitables.** Calling an `async def` that
+  contains `yield` yields an async generator under `tyc run`: `await` on it
+  and returning one from `__anext__` now raise CPython's `TypeError`
+  naming `async_generator`, and `async for` over an async generator
+  expression (`(x async for x in src)`) iterates instead of being rejected
+  as a synchronous iterator.
 - **`del obj[...]` parity.** A user `__delitem__` now receives slice keys
   (`del obj[1:2]`, the `bytearray` shim's slice delete); `del xs[k]`
   honours `k.__index__`; `del` on a class's `__dict__` mappingproxy raises
