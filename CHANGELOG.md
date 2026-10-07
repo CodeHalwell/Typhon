@@ -8,6 +8,12 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ### Fixed
 
+- **`del obj[...]` parity.** A user `__delitem__` now receives slice keys
+  (`del obj[1:2]`, the `bytearray` shim's slice delete); `del xs[k]`
+  honours `k.__index__`; `del` on a class's `__dict__` mappingproxy raises
+  `TypeError`; and a dict key is no longer coerced through `__index__` on
+  lookup, store or delete. Yields in a nested `def`'s annotations now make
+  the enclosing function a generator too.
 - **Generator detection sees every `yield`.** A function whose only
   `yield` sits in a dict display, an `assert`, an `elif` test, a `del` or
   assignment target, or a nested `def`'s default is now a generator under

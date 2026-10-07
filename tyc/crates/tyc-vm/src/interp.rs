@@ -7011,7 +7011,11 @@ impl Interpreter {
         // where `idx` is a class defining `__index__`).
         let key_owned;
         let key = match key {
-            Value::Instance(i) if self.find_method(&i.class, "__index__").is_some() => {
+            // A dict key is hashed as itself, never through `__index__`.
+            Value::Instance(i)
+                if !matches!(target, Value::Dict(_))
+                    && self.find_method(&i.class, "__index__").is_some() =>
+            {
                 key_owned = self.call_dunder0(key, "__index__")?.unwrap_or(Value::None);
                 &key_owned
             }
@@ -7311,6 +7315,22 @@ impl Interpreter {
     }
 
     fn del_subscript(&mut self, target: &Value, key: &Value) -> Result<(), Unwind> {
+        // A user `__delitem__` receives the key exactly as written, a slice
+        // included (the `bytearray` shim's slice delete), so it has to come
+        // before the list-only slice dispatch below.
+        if let Value::Instance(i) = target {
+            if let Some(m) = self.find_method(&i.class, "__delitem__") {
+                self.call_value(
+                    Value::BoundMethod {
+                        receiver: Box::new(target.clone()),
+                        function: m,
+                    },
+                    vec![key.clone()],
+                    &[],
+                )?;
+                return Ok(());
+            }
+        }
         // Slice deletion: `del lst[i:j]` / `del lst[::2]`.
         if let Value::Tuple(t) = key {
             if t.len() == 4 {
@@ -7321,6 +7341,19 @@ impl Interpreter {
                 }
             }
         }
+        // Honour a user `__index__` on a sequence index (a dict key is
+        // hashed as itself).
+        let key_owned;
+        let key = match key {
+            Value::Instance(i)
+                if !matches!(target, Value::Dict(_))
+                    && self.find_method(&i.class, "__index__").is_some() =>
+            {
+                key_owned = self.call_dunder0(key, "__index__")?.unwrap_or(Value::None);
+                &key_owned
+            }
+            _ => key,
+        };
         match target {
             Value::List(l) => {
                 let i = key.to_int()?;
@@ -7331,6 +7364,11 @@ impl Interpreter {
                 Ok(())
             }
             Value::Dict(d) => {
+                if crate::builtins::dict_is_frozen(d) {
+                    return Err(type_error(
+                        "'mappingproxy' object does not support item deletion",
+                    ));
+                }
                 let k = self.dict_probe_key(d, key)?;
                 // Removal keeps the rest in insertion order, as `del d[k]`
                 // does.
@@ -7339,24 +7377,11 @@ impl Interpreter {
                     .map(|_| ())
                     .ok_or_else(|| crate::error::key_error_for(key))
             }
-            // `del obj[key]` → `obj.__delitem__(key)`.
-            Value::Instance(i) => {
-                if let Some(m) = self.find_method(&i.class, "__delitem__") {
-                    self.call_value(
-                        Value::BoundMethod {
-                            receiver: Box::new(target.clone()),
-                            function: m,
-                        },
-                        vec![key.clone()],
-                        &[],
-                    )?;
-                    return Ok(());
-                }
-                Err(type_error(format!(
-                    "'{}' object does not support item deletion",
-                    i.class.name
-                )))
-            }
+            // An instance without `__delitem__` (handled above).
+            Value::Instance(i) => Err(type_error(format!(
+                "'{}' object does not support item deletion",
+                i.class.name
+            ))),
             _ => Err(type_error("delete on unsupported target")),
         }
     }
@@ -8526,10 +8551,14 @@ impl Interpreter {
                 }
             }
         }
-        // Honour a user `__index__` on the subscript key.
+        // Honour a user `__index__` on a sequence index (a dict key is
+        // hashed as itself).
         let key_owned;
         let key = match key {
-            Value::Instance(i) if self.find_method(&i.class, "__index__").is_some() => {
+            Value::Instance(i)
+                if !matches!(target, Value::Dict(_))
+                    && self.find_method(&i.class, "__index__").is_some() =>
+            {
                 key_owned = self.call_dunder0(key, "__index__")?.unwrap_or(Value::None);
                 &key_owned
             }
@@ -12494,7 +12523,8 @@ fn expr_has_yield(e: &Expr) -> bool {
 /// in any expression position of any statement (an `assert` test, a `del`
 /// or assignment target, an `except` type, a `match` guard, ...). A nested
 /// `def` / `class` / lambda owns the yields in its body; only its header
-/// (decorators, defaults, bases), which runs in the enclosing scope, is ours.
+/// (decorators, defaults, annotations, bases), which runs in the enclosing
+/// scope, is ours.
 #[derive(Default)]
 struct YieldFinder {
     found: bool,
@@ -12510,10 +12540,17 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for YieldFinder {
                 for d in &f.decorator_list {
                     self.visit_expr(&d.expression);
                 }
-                for p in f.parameters.iter_non_variadic_params() {
+                // Defaults and annotations are evaluated when the `def` runs.
+                for p in f.parameters.iter() {
                     if let Some(d) = p.default() {
                         self.visit_expr(d);
                     }
+                    if let Some(a) = p.annotation() {
+                        self.visit_expr(a);
+                    }
+                }
+                if let Some(r) = &f.returns {
+                    self.visit_expr(r);
                 }
             }
             Stmt::ClassDef(c) => {

@@ -635,7 +635,36 @@ show(list(Neg), list(Neg.A))
 fn del_targets_and_scopes_match_cpython() {
     assert_matches_cpython(
         "del_targets_and_scopes_match_cpython",
-        r#"g = 1
+        r#"plain class Bag:
+    def __delitem__(self, k: object) -> None:
+        show("delitem", k)
+mut bag = Bag()
+del bag[1:2]
+del bag[::2]
+del bag[3]
+mut ba = bytearray(b"abcd")
+del ba[1:3]
+show(ba)
+plain class Key:
+    def __index__(self) -> int:
+        return 1
+    def __hash__(self) -> int:
+        return 99
+mut xs = [1, 2, 3]
+del xs[Key()]
+show(xs)
+mut dk = {1: "one"}
+show("absent", Key() in dk)
+dk[Key()] = "key"
+show(len(dk), dk[1])
+plain class Holder:
+    x = 1
+mut proxy = Holder.__dict__
+def drop() -> None:
+    del proxy["x"]
+trap("proxy del", drop)
+show(hasattr(Holder, "x"))
+g = 1
 def drop_global() -> None:
     global g
     del g

@@ -1517,6 +1517,8 @@ mod tests {
             "    assert (yield 1)",
             "    if False:\n        pass\n    elif (yield 1):\n        pass",
             "    def inner(x: object = (yield 1)) -> None:\n        pass",
+            "    def inner(x: (yield 1)) -> None:\n        pass",
+            "    def inner() -> (yield 1):\n        pass",
         ] {
             let src = format!("def g() -> object:\n{body}\nprint(list(g()))\n");
             assert!(scan_source(&src).is_some(), "{src}");
