@@ -1134,6 +1134,39 @@ except TypeError as e:
     }
 
     #[test]
+    fn py315_frozendict_and_sentinel() {
+        assert_eq!(
+            run_capturing(
+                r###"from collections.abc import Mapping
+let fd = frozendict(a=1, b=2)
+assert repr(fd) == "frozendict({'a': 1, 'b': 2})" and str(frozendict()) == "frozendict()"
+assert fd == {"a": 1, "b": 2} and {"a": 1, "b": 2} == fd and fd == frozendict(b=2, a=1)
+assert hash(fd) == hash(frozendict(b=2, a=1)) and {fd: 1}[frozendict(a=1, b=2)] == 1
+assert type(fd | {"c": 3}).__name__ == "frozendict" and type({"c": 3} | fd).__name__ == "dict"
+assert {**fd} == {"a": 1, "b": 2} and dict(fd) == {"a": 1, "b": 2}
+def kw(**k: int) -> int:
+    return len(k)
+assert kw(**fd) == 2
+assert isinstance(fd, frozendict) and isinstance(fd, Mapping) and not isinstance(fd, dict)
+assert frozendict.fromkeys("ab", 0) == {"a": 0, "b": 0} and fd.copy() is fd
+try:
+    fd["a"] = 5
+    assert False
+except TypeError as e:
+    assert str(e) == "'frozendict' object does not support item assignment"
+freeze let F = frozendict(x=[1, 2])
+assert type(F).__name__ == "frozendict" and F["x"] == (1, 2)
+let M = sentinel("MISSING")
+assert repr(M) == "MISSING" and str(M) == "MISSING" and M.__name__ == "MISSING"
+assert type(M).__name__ == "sentinel" and M is M and M != sentinel("MISSING") and bool(M)
+"###
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn freeze_passes_immutable_values_through_like_the_runtime() {
         // The emitted runtime's `deep_freeze` returns enum members, dates,
         // timedeltas, timezones and paths unchanged; the VM must too.

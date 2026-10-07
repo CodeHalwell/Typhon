@@ -1,4 +1,4 @@
-# tyc::unsupported_syntax_for_target
+# tyc::requires_newer_python
 
 Fires when a file uses Python syntax that the project's `[python] target`
 cannot parse: for example a Python 3.15 unpacking comprehension in a project
@@ -15,7 +15,7 @@ def main() -> None:
 ```
 
 ```text
-Error: tyc::unsupported_syntax_for_target
+Error: tyc::requires_newer_python
 
   × Cannot use iterable unpacking in a list comprehension on Python 3.13
   │ (syntax was added in Python 3.15)

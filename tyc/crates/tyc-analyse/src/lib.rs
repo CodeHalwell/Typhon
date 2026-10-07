@@ -155,7 +155,7 @@ pub struct LintOptions {
     /// the advice fires on exactly the shapes that would be rewritten.
     pub parallel_min_size: u64,
     /// `[python] target` as `(major, minor)`. When set, syntax that target
-    /// cannot parse is reported as `tyc::unsupported_syntax_for_target` (an
+    /// cannot parse is reported as `tyc::requires_newer_python` (an
     /// error). `None` skips the check.
     pub python_target: Option<(u8, u8)>,
 }
@@ -202,6 +202,146 @@ pub fn gather_opportunity_diagnostics(module: &ModModule, path: &str, source: &s
     diags
 }
 
+/// `tyc::requires_newer_python`: every construct in the preprocessed
+/// `source` that Python `major.minor` does not have.
+///
+/// The front end parses against the newest grammar and knows the newest
+/// builtins, so without this a 3.15-only construct (`[*xs for xs in
+/// lists]`, `frozendict(...)`) type-checks on a 3.13 target, `tyc build`
+/// copies it into the `.py`, and CPython 3.13 refuses to compile or run it.
+/// Every hit is code that already failed on its target, so the check
+/// narrows nothing that ran. Spans are offsets into `source`; callers remap
+/// them to the `.ty` text like their other diagnostics.
+///
+/// `source` must be preprocessed with Typhon's `lazy import` still in a
+/// form every target parses (either expansion does: the native PEP 810
+/// statement only appears in a 3.15 build's emitted Python).
+pub fn target_version_diagnostics(path: &str, source: &str, major: u8, minor: u8) -> Diagnostics {
+    let mut diags = Diagnostics::new();
+    for hit in tyc_syntax::unsupported_syntax(source, major, minor) {
+        diags.push_error(TycError::requires_newer_python(
+            hit.message,
+            path.to_owned(),
+            source.to_owned(),
+            usize::from(hit.range.start()),
+            usize::from(hit.range.len()),
+        ));
+    }
+    if let Ok(parsed) = tyc_syntax::parse_module(source) {
+        for (name, added, range) in newer_builtin_uses(&parsed.into_syntax(), (major, minor)) {
+            diags.push_error(TycError::requires_newer_python(
+                format!(
+                    "`{name}` is a builtin added in Python 3.{} and the project targets {major}.{minor}",
+                    added.1
+                ),
+                path.to_owned(),
+                source.to_owned(),
+                usize::from(range.start()),
+                usize::from(range.len()),
+            ));
+        }
+    }
+    diags
+}
+
+/// Builtins newer than the 3.13 floor, with the version that added them.
+const NEWER_BUILTINS: &[(&str, (u8, u8))] = &[
+    // PEP 814
+    ("frozendict", (3, 15)),
+    // PEP 661
+    ("sentinel", (3, 15)),
+];
+
+/// Every read of a [`NEWER_BUILTINS`] name `target` does not have. A module
+/// that binds the name anywhere (its own `frozendict` class, an import, a
+/// parameter) is left alone: that name may well not be the builtin.
+fn newer_builtin_uses(
+    module: &ModModule,
+    target: (u8, u8),
+) -> Vec<(&'static str, (u8, u8), TextRange)> {
+    use ruff_python_ast::visitor::source_order::{
+        walk_expr, walk_parameter, walk_pattern, walk_stmt, SourceOrderVisitor,
+    };
+    use ruff_python_ast::{ExprContext, Parameter, Pattern};
+    #[derive(Default)]
+    struct V {
+        bound: HashSet<String>,
+        reads: Vec<(String, TextRange)>,
+    }
+    impl<'ast> SourceOrderVisitor<'ast> for V {
+        fn visit_stmt(&mut self, stmt: &'ast Stmt) {
+            match stmt {
+                Stmt::FunctionDef(f) => {
+                    self.bound.insert(f.name.to_string());
+                }
+                Stmt::ClassDef(c) => {
+                    self.bound.insert(c.name.to_string());
+                }
+                Stmt::Import(i) => {
+                    for alias in &i.names {
+                        let name = alias.asname.as_ref().unwrap_or(&alias.name);
+                        let first = name.as_str().split('.').next().unwrap_or_default();
+                        self.bound.insert(first.to_owned());
+                    }
+                }
+                Stmt::ImportFrom(i) => {
+                    for alias in &i.names {
+                        let name = alias.asname.as_ref().unwrap_or(&alias.name);
+                        self.bound.insert(name.to_string());
+                    }
+                }
+                Stmt::Try(t) => {
+                    for handler in &t.handlers {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = handler;
+                        if let Some(name) = &h.name {
+                            self.bound.insert(name.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            walk_stmt(self, stmt);
+        }
+        fn visit_expr(&mut self, expr: &'ast Expr) {
+            if let Expr::Name(n) = expr {
+                match n.ctx {
+                    ExprContext::Load => self.reads.push((n.id.to_string(), n.range)),
+                    _ => {
+                        self.bound.insert(n.id.to_string());
+                    }
+                }
+            }
+            walk_expr(self, expr);
+        }
+        fn visit_parameter(&mut self, parameter: &'ast Parameter) {
+            self.bound.insert(parameter.name.to_string());
+            walk_parameter(self, parameter);
+        }
+        fn visit_pattern(&mut self, pattern: &'ast Pattern) {
+            let captured = match pattern {
+                Pattern::MatchAs(m) => m.name.as_ref(),
+                Pattern::MatchStar(m) => m.name.as_ref(),
+                Pattern::MatchMapping(m) => m.rest.as_ref(),
+                _ => None,
+            };
+            if let Some(name) = captured {
+                self.bound.insert(name.to_string());
+            }
+            walk_pattern(self, pattern);
+        }
+    }
+    let mut v = V::default();
+    v.visit_body(&module.body);
+    v.reads
+        .into_iter()
+        .filter(|(name, _)| !v.bound.contains(name))
+        .filter_map(|(name, range)| {
+            let &(builtin, added) = NEWER_BUILTINS.iter().find(|(b, _)| *b == name)?;
+            (target < added).then_some((builtin, added, range))
+        })
+        .collect()
+}
+
 /// Run the pure-AST advisory lints that should fire identically in
 /// `tyc check` and live in the editor (the LSP). Spans are byte offsets
 /// into `source`, which must be the *preprocessed* Python the `module`
@@ -216,33 +356,6 @@ pub fn gather_opportunity_diagnostics(module: &ModModule, path: &str, source: &s
 /// are already `lazy`, the module's `pub` names, and whether it has a
 /// `pub *`. Pass [`perf::PerfLintContext::default`] when they're
 /// unavailable (a standalone buffer); the perf family degrades gracefully.
-/// `tyc::unsupported_syntax_for_target`: every construct in the
-/// preprocessed `source` that Python `major.minor` cannot parse.
-///
-/// The front end parses against the newest grammar, so without this a
-/// 3.15-only construct (`[*xs for xs in lists]`) type-checks on a 3.13
-/// target, `tyc build` copies it into the `.py`, and CPython 3.13 refuses to
-/// compile it. Every hit is code that already failed on its target, so the
-/// check narrows nothing that ran. Spans are offsets into `source`; callers
-/// remap them to the `.ty` text like their other diagnostics.
-///
-/// `source` must be preprocessed with Typhon's `lazy import` still in a
-/// form every target parses (either expansion does: the native PEP 810
-/// statement only appears in a 3.15 build's emitted Python).
-pub fn target_syntax_diagnostics(path: &str, source: &str, major: u8, minor: u8) -> Diagnostics {
-    let mut diags = Diagnostics::new();
-    for hit in tyc_syntax::unsupported_syntax(source, major, minor) {
-        diags.push_error(TycError::unsupported_syntax_for_target(
-            hit.message,
-            path.to_owned(),
-            source.to_owned(),
-            usize::from(hit.range.start()),
-            usize::from(hit.range.len()),
-        ));
-    }
-    diags
-}
-
 pub fn editor_lint_diagnostics(
     module: &ModModule,
     path: &str,
@@ -257,9 +370,9 @@ pub fn editor_lint_diagnostics(
     // does not. Calling it from both would double-report it in `tyc check`.
     // The one error raised here rather than in `tyc-db`: the check needs
     // `[python] target`, which the shared pipeline does not carry.
-    // `tyc build` calls `target_syntax_diagnostics` itself.
+    // `tyc build` calls `target_version_diagnostics` itself.
     if let Some((major, minor)) = opts.python_target {
-        diags.extend(target_syntax_diagnostics(path, source, major, minor));
+        diags.extend(target_version_diagnostics(path, source, major, minor));
     }
     diags.extend(analyse_empty_collection_bindings(module, path, source));
     diags.extend(analyse_typing_alias_annotations(module, path, source));
@@ -7929,15 +8042,24 @@ mod lint_tests {
         let src = "let lists = [[1], [2]]\nlet flat = [*xs for xs in lists]\n";
         let on_313 = target_errors(src, (3, 13));
         assert!(
-            on_313
-                .iter()
-                .any(|c| c.contains("unsupported_syntax_for_target")),
-            "expected unsupported_syntax_for_target on 3.13; got {on_313:?}"
+            on_313.iter().any(|c| c.contains("requires_newer_python")),
+            "expected requires_newer_python on 3.13; got {on_313:?}"
         );
         assert!(
             target_errors(src, (3, 15)).is_empty(),
             "3.15 has comprehension unpacking"
         );
+    }
+
+    #[test]
+    fn newer_builtins_are_gated_on_the_target() {
+        let src = "let fd = frozendict(a=1)\nlet m = sentinel(\"M\")\nprint(fd, m)\n";
+        let on_313 = target_errors(src, (3, 13));
+        assert_eq!(on_313.len(), 2, "{on_313:?}");
+        assert!(target_errors(src, (3, 15)).is_empty());
+        // A module's own `frozendict` is not the builtin.
+        let own = "class frozendict:\n    x: int\ndef sentinel(n: str) -> str:\n    return n\nprint(frozendict(x=1), sentinel(\"a\"))\n";
+        assert!(target_errors(own, (3, 13)).is_empty());
     }
 
     #[test]

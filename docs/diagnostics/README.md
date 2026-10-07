@@ -86,7 +86,7 @@ straight from a failed build to the corresponding documentation.
 - [`tyc::self_outside_impl`](./self_outside_impl.md) — `self` referenced outside an `impl` method body.
 - [`tyc::shared_mut_across_tasks`](./shared_mut_across_tasks.md) — advice (free-threaded targets): a `go`-spawned function writes shared mutable module state — a data race under real concurrency.
 - [`tyc::stdlib_module_shadow`](./stdlib_module_shadow.md) — warning: project `.ty` file's stem matches a Python 3.13 stdlib top-level module name (`types`, `json`, `io`, …) and would intercept stdlib imports on `sys.path`.
-- [`tyc::unsupported_syntax_for_target`](./unsupported_syntax_for_target.md) — syntax the project's `[python] target` cannot parse (e.g. a 3.15 unpacking comprehension on a 3.13 target); the emitted `.py` would not compile there.
+- [`tyc::requires_newer_python`](./requires_newer_python.md) — syntax the project's `[python] target` cannot parse (e.g. a 3.15 unpacking comprehension on a 3.13 target); the emitted `.py` would not compile there.
 - [`tyc::stub_mismatch`](./stub_mismatch.md) — `.dty` stub disagrees with the implementation module.
 - [`tyc::tuple_index_out_of_range`](./tuple_index_out_of_range.md) — constant index out of range for a fixed-arity tuple.
 - [`tyc::type_mismatch`](./type_mismatch.md) — value of one type used where another was expected.

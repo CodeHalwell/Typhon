@@ -868,6 +868,23 @@ pub fn install(interp: &mut Interpreter) {
         i.call_value(cls, pos.to_vec(), &kw)
     });
 
+    native!("frozendict", |i, args| {
+        let (pos, kw) = split_kwargs(&args);
+        let cls = py315_builtin_class(i, "frozendict")?;
+        i.call_value(cls, pos.to_vec(), &kw)
+    });
+
+    native!("sentinel", |i, args| {
+        if args.len() != 1 {
+            return Err(type_error(format!(
+                "sentinel() takes exactly 1 positional argument ({} given)",
+                args.len()
+            )));
+        }
+        let cls = py315_builtin_class(i, "sentinel")?;
+        i.call_value(cls, args, &[])
+    });
+
     native!("set", |i, args| {
         if args.len() > 1 {
             return Err(type_error(format!(
@@ -2514,6 +2531,7 @@ mod shims {
     pub const CSV: &str = include_str!("shims/csv.py");
     pub const FUNCTOOLS_EXTRA: &str = include_str!("shims/functools_extra.py");
     pub const BYTEARRAY: &str = include_str!("shims/bytearray.py");
+    pub const PY315_BUILTINS: &str = include_str!("shims/py315_builtins.py");
     pub const LAZY: &str = include_str!("shims/lazy.py");
     pub const TYPEPARAMS: &str = include_str!("shims/typeparams.py");
     pub const HEAPQ_EXTRA: &str = include_str!("shims/heapq_extra.py");
@@ -3118,6 +3136,17 @@ fn lazy_value_class(interp: &mut Interpreter) -> Result<Value, Unwind> {
 
 pub(crate) fn bytearray_class(interp: &mut Interpreter) -> Result<Value, Unwind> {
     cached_helper_class(interp, "__shim_bytearray__", shims::BYTEARRAY, "bytearray")
+}
+
+/// The Python 3.15 builtin classes `frozendict` (PEP 814) and `sentinel`
+/// (PEP 661), cached. Shim classes behind constructor natives, like
+/// `bytearray`.
+pub(crate) fn py315_builtin_class(interp: &mut Interpreter, name: &str) -> Result<Value, Unwind> {
+    let cache = match name {
+        "frozendict" => "__shim_frozendict__",
+        _ => "__shim_sentinel__",
+    };
+    cached_helper_class(interp, cache, shims::PY315_BUILTINS, name)
 }
 
 fn defaultdict_class(interp: &mut Interpreter) -> Result<Value, Unwind> {
@@ -8931,6 +8960,29 @@ fn deep_freeze_value(v: Value) -> Result<Value, Unwind> {
                 crate::value::class_flag(class, "__typhon_immutable__", false)
                     || class.bases.iter().any(immutable_shim)
             }
+            // A 3.15 `frozendict` is already immutable; like the emitted
+            // runtime, keep it a `frozendict` and freeze its values.
+            if inst.class.name == "frozendict"
+                && crate::value::class_flag(&inst.class, "__typhon_frozendict__", false)
+            {
+                let data = inst.fields.borrow().get("_data").cloned();
+                if let Some(Value::Dict(d)) = data {
+                    let mut frozen: DictMap = DictMap::new();
+                    for (k, val) in d.borrow().iter() {
+                        frozen.insert(k.clone(), deep_freeze_value(val.clone())?);
+                    }
+                    let mut fields = crate::value::FieldMap::new();
+                    fields.insert(
+                        "_data".to_owned(),
+                        Value::Dict(Rc::new(crate::value::FrozenCell::new(frozen))),
+                    );
+                    return Ok(Value::Instance(Rc::new(crate::value::Instance {
+                        class: inst.class.clone(),
+                        fields: RefCell::new(fields),
+                        chain: RefCell::new(None),
+                    })));
+                }
+            }
             if crate::value::class_flag(&inst.class, "__typhon_dc_frozen__", false)
                 || immutable_shim(&inst.class)
                 || crate::interp::Interpreter::is_enum_member(&Value::Instance(inst.clone()))
@@ -9907,6 +9959,7 @@ pub(crate) fn native_accepts_keyword(name: &str, kw: &str) -> Option<bool> {
         | "str"
         | "bytes"
         | "bytearray"
+        | "frozendict"
         | "from_bytes"
         | "partial"
         | "partial_call"
@@ -13751,6 +13804,7 @@ pub fn call_with_kwargs(
         | "str"
         | "bytes"
         | "bytearray"
+        | "frozendict"
         | "from_bytes"
         | "partial"
         | "partial_call" => {

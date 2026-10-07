@@ -1177,9 +1177,9 @@ pub(crate) fn python_target_u8(target: &str) -> Option<(u8, u8)> {
     Some((u8::try_from(major).ok()?, u8::try_from(minor).ok()?))
 }
 
-/// `tyc::unsupported_syntax_for_target` for `tyc build`, which does not run
+/// `tyc::requires_newer_python` for `tyc build`, which does not run
 /// the editor-lint pass `tyc check` reports it from. See
-/// [`tyc_analyse::target_syntax_diagnostics`].
+/// [`tyc_analyse::target_version_diagnostics`].
 pub(crate) fn check_target_syntax(path: &str, source: &str, target: &str) -> Diagnostics {
     let Some((major, minor)) = python_target_u8(target) else {
         return Diagnostics::new();
@@ -1187,7 +1187,8 @@ pub(crate) fn check_target_syntax(path: &str, source: &str, target: &str) -> Dia
     let (expanded, expanded_to_source) = expand_sugar_mapped(source, true);
     let (mut prep, prep_to_expanded) = preprocess_mapped(&expanded);
     prep.line_map = compose_line_maps(&prep_to_expanded, &expanded_to_source);
-    let mut diags = tyc_analyse::target_syntax_diagnostics(path, &prep.python_source, major, minor);
+    let mut diags =
+        tyc_analyse::target_version_diagnostics(path, &prep.python_source, major, minor);
     diags.remap_lines(&prep.python_source, &prep.line_map, path, source);
     diags
 }

@@ -2692,7 +2692,7 @@ fn read_lint_options(root: &std::path::Path) -> tyc_analyse::LintOptions {
         opts.free_threaded = b;
     }
     // `[python] target` (default 3.13, as in the CLI) gates
-    // `tyc::unsupported_syntax_for_target`.
+    // `tyc::requires_newer_python`.
     let target = parsed
         .get("python")
         .and_then(|p| p.as_table())

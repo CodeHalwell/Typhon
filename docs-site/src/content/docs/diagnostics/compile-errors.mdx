@@ -159,7 +159,7 @@ src/main.ty                       # from typhon_runtime import helper … Ok(hel
 
 **Fix:** rename the module (for example to `runtime_helpers`) and update its imports.
 
-## `tyc::unsupported_syntax_for_target`
+## `tyc::requires_newer_python`
 
 The file uses Python syntax the project's `[python] target` cannot parse, such as `[*xs for xs in lists]` (PEP 798, Python 3.15) in a project targeting 3.13, or `except A, B:` / `t"..."` (Python 3.14). The emitted `.py` would fail to compile on the target interpreter, so `tyc check`, `tyc build` and `tyc run` reject it. Typhon's own `lazy import` is not affected.
 

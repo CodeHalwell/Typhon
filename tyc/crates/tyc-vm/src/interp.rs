@@ -3233,13 +3233,11 @@ impl Interpreter {
                         (None, v) => {
                             // {**other}
                             let other = self.eval_expr(v, env)?;
-                            match other {
-                                Value::Dict(d) => {
-                                    for (k, v) in d.borrow().iter() {
-                                        map.insert(k.clone(), v.clone());
-                                    }
-                                }
-                                _ => return Err(type_error("** unpack expected a mapping")),
+                            let Some(pairs) = self.mapping_pairs(&other)? else {
+                                return Err(type_error("** unpack expected a mapping"));
+                            };
+                            for (k, v) in pairs {
+                                map.insert(k, v);
                             }
                         }
                     }
@@ -3774,6 +3772,36 @@ impl Interpreter {
     /// Hash key for `v`, running a user `__hash__` where the class defines
     /// one (`value::instance_hash_mode`); every other value keys
     /// structurally through `Value::to_hash_key`.
+    /// The `(key, value)` pairs of a `**` operand: a dict, or an object
+    /// with CPython's mapping protocol (`keys()` plus `__getitem__`, as on
+    /// a `frozendict`). `None` when the value is not a mapping.
+    pub fn mapping_pairs(&mut self, v: &Value) -> Result<Option<Vec<(HashKey, Value)>>, Unwind> {
+        match v {
+            Value::Dict(d) => Ok(Some(
+                d.borrow()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            )),
+            Value::Instance(_) => {
+                let keys = match self.get_attr(v, "keys") {
+                    Ok(keys) => keys,
+                    Err(Unwind::Exception(e)) if e.kind == "AttributeError" => return Ok(None),
+                    Err(e) => return Err(e),
+                };
+                let keys = self.call_value(keys, vec![], &[])?;
+                let it = self.make_iter(keys)?;
+                let mut pairs = Vec::new();
+                while let Some(k) = self.iter_next(&it)? {
+                    let value = self.subscript(v, &k)?;
+                    pairs.push((self.hash_key(&k)?, value));
+                }
+                Ok(Some(pairs))
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub fn hash_key(&mut self, v: &Value) -> Result<HashKey, Unwind> {
         if let Value::Instance(inst) = v {
             if crate::value::enum_mixin_value(v).is_none() {
@@ -4606,17 +4634,15 @@ impl Interpreter {
                 None => {
                     // **kwargs spread
                     let v = self.eval_expr(&kw.value, env)?;
-                    match v {
-                        Value::Dict(d) => {
-                            for (k, val) in d.borrow().iter() {
-                                if let HashKey::Str(s) = k {
-                                    kwargs.push(((**s).clone(), val.clone()));
-                                } else {
-                                    return Err(type_error("keywords must be strings"));
-                                }
-                            }
+                    let Some(pairs) = self.mapping_pairs(&v)? else {
+                        return Err(type_error("** argument must be a mapping"));
+                    };
+                    for (k, val) in pairs {
+                        if let HashKey::Str(s) = k {
+                            kwargs.push(((*s).clone(), val));
+                        } else {
+                            return Err(type_error("keywords must be strings"));
                         }
-                        _ => return Err(type_error("** argument must be a mapping")),
                     }
                 }
             }
@@ -7552,6 +7578,10 @@ impl Interpreter {
                 let cls = crate::builtins::bytearray_class(self)?;
                 self.get_attr(&cls, attr)
             }
+            Value::Native(n) if n.name == "frozendict" => {
+                let cls = crate::builtins::py315_builtin_class(self, "frozendict")?;
+                self.get_attr(&cls, attr)
+            }
             // A builtin *type* — the VM models `int` / `str` / `list` / … as
             // native constructors, so `int.from_bytes(b, "big")` and the
             // unbound-method form CPython also exposes (`str.upper(s)`,
@@ -8781,17 +8811,12 @@ impl Interpreter {
         self.run_comprehension_leaking(&c.generators, &leaks, env, &mut move |this, scope| {
             let Some(key_expr) = &key_expr else {
                 let mapping = this.eval_expr(&value_expr, scope)?;
-                let Value::Dict(src) = mapping else {
+                let Some(pairs) = this.mapping_pairs(&mapping)? else {
                     return Err(type_error(format!(
                         "'{}' object is not a mapping",
                         mapping.type_name()
                     )));
                 };
-                let pairs: Vec<_> = src
-                    .borrow()
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
                 for (k, v) in pairs {
                     let k = this.settle_key_dict(&out_clone, k)?;
                     out_clone.borrow_mut().insert(k, v);

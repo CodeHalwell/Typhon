@@ -401,7 +401,11 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
             // bidirectional assignability on K for both, and on V
             // for MutableMapping. (See review thread on PR #147 from
             // gemini-code-assist / copilot.)
-            if an == "Mapping" && aa.len() == 2 && bn == "dict" && bb.len() == 2 {
+            if an == "Mapping"
+                && aa.len() == 2
+                && matches!(bn.as_str(), "dict" | "frozendict")
+                && bb.len() == 2
+            {
                 return types_equivalent(&aa[0], &bb[0]) && assignable(&aa[1], &bb[1]);
             }
             if an == "MutableMapping" && aa.len() == 2 && bn == "dict" && bb.len() == 2 {
@@ -748,6 +752,19 @@ fn builtin_dunder_methods(head: &str) -> &'static [&'static str] {
         "__repr__",
         "__str__",
     ];
+    // Hashable read-only mapping: `frozendict` (3.15).
+    const HASHABLE_MAPPING: &[&str] = &[
+        "__len__",
+        "__iter__",
+        "__getitem__",
+        "__contains__",
+        "__bool__",
+        "__eq__",
+        "__ne__",
+        "__hash__",
+        "__repr__",
+        "__str__",
+    ];
     // Hashable set: `frozenset`.
     const HASHABLE_SET: &[&str] = &[
         "__len__",
@@ -775,6 +792,7 @@ fn builtin_dunder_methods(head: &str) -> &'static [&'static str] {
         "tuple" | "tuple_variadic" | "str" | "bytes" | "range" => HASHABLE_INDEXABLE,
         "list" | "bytearray" => UNHASHABLE_INDEXABLE,
         "dict" => UNHASHABLE_MAPPING,
+        "frozendict" => HASHABLE_MAPPING,
         "frozenset" => HASHABLE_SET,
         "set" => UNHASHABLE_SET,
         _ => &[],
@@ -1619,6 +1637,9 @@ pub fn generic_param_variance(head: &str, idx: usize) -> Variance {
         // exactly) and covariant in V (values flow out via __getitem__).
         ("Mapping", 0) => Variance::Invariant,
         ("Mapping", 1) => Variance::Covariant,
+        // `frozendict[K, V]` (3.15) is read-only: Mapping's variance.
+        ("frozendict", 0) => Variance::Invariant,
+        ("frozendict", 1) => Variance::Covariant,
         // ── ItemsView[K, V] — same variance as Mapping: K is keyed,
         // V flows out. Read-only view, so the keys-invariant rule
         // still applies (an `ItemsView[int, str]` consumer might call
@@ -1735,6 +1756,8 @@ fn expr_is_type_shaped(expr: &Expr, classes: &[String], type_params: &[String]) 
         "dict",
         "set",
         "frozenset",
+        "frozendict",
+        "sentinel",
         "tuple",
         "range",
         "bytearray",
@@ -4184,7 +4207,7 @@ impl<'a> Checker<'a> {
                     return Some(slots.iter().all(|a| self.is_assignable(&ea[0], a)));
                 }
                 if eh == "Mapping"
-                    && matches!(ah.as_str(), "dict" | "Mapping")
+                    && matches!(ah.as_str(), "dict" | "Mapping" | "frozendict")
                     && ea.len() == aa.len()
                 {
                     return Some(ea.iter().zip(aa).all(|(e, a)| self.is_assignable(e, a)));
@@ -4690,7 +4713,11 @@ impl<'a> Checker<'a> {
             // both. The class-hierarchy-aware `is_assignable` carries
             // the same one-way primitive widening as `assignable`, so
             // bidirectional checks here actually enforce invariance.
-            if an == "Mapping" && aa.len() == 2 && bn == "dict" && bb.len() == 2 {
+            if an == "Mapping"
+                && aa.len() == 2
+                && matches!(bn.as_str(), "dict" | "frozendict")
+                && bb.len() == 2
+            {
                 return self.is_assignable(&aa[0], &bb[0])
                     && self.is_assignable(&bb[0], &aa[0])
                     && self.is_assignable(&aa[1], &bb[1]);
@@ -12349,6 +12376,7 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
                         args[0].clone()
                     }
                     "dict" | "Mapping" | "MutableMapping" | "defaultdict" | "OrderedDict"
+                    | "frozendict"
                         if args.len() == 2 =>
                     {
                         args[1].clone()
@@ -14761,7 +14789,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     if let Type::Generic(head, args) = &recv_ty {
                         if matches!(
                             head.as_str(),
-                            "Mapping" | "tuple" | "tuple_variadic" | "frozenset"
+                            "Mapping" | "tuple" | "tuple_variadic" | "frozenset" | "frozendict"
                         ) {
                             let at = target.range();
                             let diagnostic = TycError::generic_at(
@@ -18727,6 +18755,7 @@ fn builtin_class_pattern_name(t: &Type) -> Option<&'static str> {
             "dict" => Some("dict"),
             "set" => Some("set"),
             "frozenset" => Some("frozenset"),
+            "frozendict" => Some("frozendict"),
             _ => None,
         },
         _ => None,
@@ -19311,6 +19340,7 @@ fn is_builtin_generic_head(head: &str) -> bool {
     matches!(
         head,
         "list" | "dict" | "set" | "tuple" | "tuple_variadic" | "Mapping" | "str" | "bytes" | "frozenset"
+        | "frozendict"
         // The Result family is Typhon's own closed surface — an unknown
         // method on Ok/Err/Result is always a runtime AttributeError, so
         // flag it at check time (closes the `.unwrap()`-before-it-existed
@@ -19385,6 +19415,10 @@ fn is_known_builtin_generic_attr(head: &str, attr: &str) -> bool {
                 | "fromkeys"
         ),
         "Mapping" => matches!(attr, "get" | "keys" | "values" | "items" | "copy"),
+        "frozendict" => matches!(
+            attr,
+            "get" | "keys" | "values" | "items" | "copy" | "fromkeys"
+        ),
         "frozenset" => matches!(
             attr,
             "copy"
@@ -19685,6 +19719,20 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
     };
     if head == "Mapping" && matches!(attr, "get" | "keys" | "values" | "items" | "copy") {
         return builtin_generic_method(&Type::Generic("dict".into(), args.clone()), attr);
+    }
+    if head == "frozendict" {
+        return match attr {
+            "get" | "keys" | "values" | "items" => {
+                builtin_generic_method(&Type::Generic("dict".into(), args.clone()), attr)
+            }
+            "copy" => Some(Type::Function {
+                params: vec![],
+                ret: Box::new(recv.clone()),
+                variadic: false,
+                min_params: Some(0),
+            }),
+            _ => None,
+        };
     }
     if let Some(sig) = builtin_container_mutator(head, attr, args) {
         return Some(sig);
@@ -20510,7 +20558,9 @@ fn iterable_element_type(ty: &Type) -> Option<Type> {
                 Some(args[0].clone())
             }
             // Iterating a mapping yields its KEYS.
-            "dict" | "Mapping" | "MutableMapping" if args.len() == 2 => Some(args[0].clone()),
+            "dict" | "Mapping" | "MutableMapping" | "frozendict" if args.len() == 2 => {
+                Some(args[0].clone())
+            }
             // Fixed-arity tuple — iteration yields the union of every slot.
             "tuple" if !args.is_empty() => Some(Type::union_of(args.clone())),
             _ => None,
@@ -22818,8 +22868,10 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     let diagnostic = TycError::attribute_not_found(
                         attr_name, &shown, &c.path, c.source, attr_start, attr_len,
                     );
-                    if matches!(head.as_str(), "tuple_variadic" | "Mapping" | "frozenset")
-                        && frozen_context::failure_is_caught(c, expr, "AttributeError")
+                    if matches!(
+                        head.as_str(),
+                        "tuple_variadic" | "Mapping" | "frozenset" | "frozendict"
+                    ) && frozen_context::failure_is_caught(c, expr, "AttributeError")
                     {
                         c.diagnostics.push_warning(diagnostic);
                     } else {
@@ -23227,7 +23279,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                                 attr_start,
                                 attr_len,
                             );
-                            if matches!(bad,Type::Generic(head,_) if matches!(head.as_str(),"tuple_variadic" | "Mapping" | "frozenset"))
+                            if matches!(bad,Type::Generic(head,_) if matches!(head.as_str(),"tuple_variadic" | "Mapping" | "frozenset" | "frozendict"))
                                 && frozen_context::failure_is_caught(c, expr, "AttributeError")
                             {
                                 c.diagnostics.push_warning(diagnostic);
@@ -23365,7 +23417,8 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             // invariant — the runtime hashes/compares against the slot.
             if c.unsafe_depth == 0 && !matches!(s.slice.as_ref(), Expr::Slice(_)) {
                 if let Type::Generic(head, args) = &value_ty {
-                    if matches!(head.as_str(), "dict" | "Mapping") && args.len() == 2 {
+                    if matches!(head.as_str(), "dict" | "Mapping" | "frozendict") && args.len() == 2
+                    {
                         let key_ty = &args[0];
                         if !is_dynamic_type(key_ty)
                             && !is_dynamic_type(&slice_ty)
@@ -25934,7 +25987,9 @@ fn as_capture_type(c: &Checker, subject: &Type, inner: &Pattern) -> Type {
             | ("bool", Type::Bool)
             | ("float", Type::Float)
             | ("bytes", Type::Bytes) => true,
-            ("list" | "dict" | "set" | "frozenset", Type::Generic(h, _)) => h == head.as_str(),
+            ("list" | "dict" | "set" | "frozenset" | "frozendict", Type::Generic(h, _)) => {
+                h == head.as_str()
+            }
             ("tuple", Type::Generic(h, _)) => h == "tuple" || h == "tuple_variadic",
             (_, Type::Class(cn)) | (_, Type::Generic(cn, _)) => {
                 cn == head.as_str() || c.is_assignable(&Type::Class(head.clone()), t)
@@ -27334,6 +27389,23 @@ def describe(m: Maybe[int]) -> str:
                     .any(|e| matches!(e, TycError::TypeMismatch { .. })),
                 "wrong spread element type must be rejected: {src:?}"
             );
+        }
+    }
+
+    #[test]
+    fn frozendict_is_a_typed_read_only_mapping() {
+        let ok = check(
+            "from collections.abc import Mapping\ndef f() -> None:\n    let fd = frozendict(a=1)\n    let n: int = fd[\"a\"] + 1\n    let view: Mapping[str, int] = fd\n    let keyed: dict[frozendict[str, int], str] = {fd: \"k\"}\n    for k, v in fd.items():\n        print(k.upper(), v + 1)\n    print(n, view, keyed, fd.get(\"a\"), fd.copy())\n",
+        );
+        assert!(ok.errors().is_empty(), "{:?}", ok.errors());
+        for src in [
+            // The value type is known.
+            "def f() -> None:\n    let fd = frozendict(a=1)\n    let s: str = fd[\"a\"]\n    print(s)\n",
+            // No mutators.
+            "def f() -> None:\n    let fd = frozendict(a=1)\n    fd.update({\"b\": 2})\n",
+            "def f() -> None:\n    let fd = frozendict(a=1)\n    fd[\"a\"] = 2\n",
+        ] {
+            assert!(!check(src).errors().is_empty(), "must be rejected: {src:?}");
         }
     }
 

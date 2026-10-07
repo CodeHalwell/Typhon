@@ -1,0 +1,30 @@
+# `[python] target = "3.15"` unlocks 3.15-only syntax and builtins, which
+# `tyc::requires_newer_python` rejects on older targets: PEP 798 unpacking
+# comprehensions, `frozendict` (PEP 814) and `sentinel` (PEP 661). The
+# emitted file is 3.15 Python, so meta.conf's `min-python=3.15` keeps it
+# build-only under python3.13; the CI 3.15 leg runs it and compares the VM.
+let MISSING = sentinel("MISSING")
+
+
+def lookup(table: frozendict[str, int], key: str, default: int | sentinel = MISSING) -> str:
+    if key in table:
+        return str(table[key])
+    if default is MISSING:
+        return "missing"
+    return f"default {default}"
+
+
+def main() -> None:
+    let rows: list[list[int]] = [[3, 1], [], [2]]
+    let flat: list[int] = [*row for row in rows]
+    let distinct: set[int] = {*row for row in rows}
+    let parts: list[dict[str, int]] = [{"a": 1}, {"b": 2}, {"a": 3}]
+    let merged: dict[str, int] = {**part for part in parts}
+    let table = frozendict(merged)
+    print(flat, sorted(distinct), merged)
+    print(table, table | {"c": 4}, hash(table) == hash(frozendict(b=2, a=3)))
+    print(lookup(table, "a"), lookup(table, "z"), lookup(table, "z", 0), MISSING)
+
+
+if __name__ == "__main__":
+    main()

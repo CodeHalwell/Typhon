@@ -2090,7 +2090,7 @@ fn build_emits_typhon_runtime_when_only_lazy_import_used() {
     );
 }
 
-// ── target-gated syntax (tyc::unsupported_syntax_for_target) ──────────────────
+// ── target-gated syntax (tyc::requires_newer_python) ──────────────────
 
 const PEP798_SRC: &str = "\
 def main() -> None:
@@ -2120,7 +2120,7 @@ fn check_rejects_3_15_syntax_on_older_targets() {
             "{target}: check must fail; got:\n{text}"
         );
         assert!(
-            text.contains("tyc::unsupported_syntax_for_target") && text.contains("main.ty:3"),
+            text.contains("tyc::requires_newer_python") && text.contains("main.ty:3"),
             "{target}: expected the diagnostic at main.ty:3; got:\n{text}"
         );
         let build = tyc().arg("build").arg(tmp.path()).output().unwrap();
