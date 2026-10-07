@@ -118,7 +118,7 @@ Note the class-level form lives in an **`impl` block**, not in the class body it
 Unsupported forms (rejected with `tyc::lazy_usage`):
 
 ```python
-lazy from numpy import array          # ❌ `lazy from ... import ...` not supported
+lazy from numpy import *              # ❌ star imports cannot be lazy (`lazy from` itself needs a 3.15 target)
 def f() -> None:
     lazy let x: int = 1               # ❌ function-body `lazy let` not supported
 ```
@@ -161,7 +161,7 @@ src/main.ty                       # from typhon_runtime import helper … Ok(hel
 
 ## `tyc::requires_newer_python`
 
-The file uses Python syntax or a builtin the project's `[python] target` does not have, such as `[*xs for xs in lists]` (PEP 798), `frozendict` (PEP 814) or `sentinel` (PEP 661), all Python 3.15, in a project targeting 3.13, or `except A, B:` / `t"..."` (Python 3.14). The emitted `.py` would fail to compile or run on the target interpreter, so `tyc check`, `tyc build`, `tyc run` and the editor reject it. Typhon's own `lazy import` is not affected, and neither is a module that defines its own `frozendict` or `sentinel`.
+The file uses Python syntax or a builtin the project's `[python] target` does not have, such as `[*xs for xs in lists]` (PEP 798), `frozendict` (PEP 814), `sentinel` (PEP 661) or `lazy from M import …` (PEP 810), all Python 3.15, in a project targeting 3.13, or `except A, B:` / `t"..."` (Python 3.14). The emitted `.py` would fail to compile or run on the target interpreter, so `tyc check`, `tyc build`, `tyc run` and the editor reject it. Typhon's own `lazy import ALIAS = MODULE` is not affected, and neither is a module that defines its own `frozendict` or `sentinel`.
 
 ```typhon
 # [python] target = "3.13"

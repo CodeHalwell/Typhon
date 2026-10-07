@@ -48,6 +48,7 @@ version-gated. Above the 3.13 floor that is:
 | `*` / `**` unpacking in comprehensions, `[*xs for xs in lists]` (PEP 798) | 3.15 |
 | the `frozendict` builtin (PEP 814) | 3.15 |
 | the `sentinel` builtin (PEP 661) | 3.15 |
+| `lazy from M import …` (PEP 810) | 3.15 |
 
 A module that binds `frozendict` or `sentinel` itself (its own class, a
 function, an import, a parameter) is not checked for that name: there it may
@@ -62,7 +63,8 @@ For a builtin the message reads:
 
 Typhon's own `lazy import ALIAS = MODULE` is not affected: it compiles on
 every target, and only becomes the native PEP 810 statement in the emitted
-Python of a 3.15 build.
+Python of a 3.15 build. `lazy from M import …` has no pre-3.15 lowering, so
+it needs the 3.15 target.
 
 ## Severity
 

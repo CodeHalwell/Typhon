@@ -2361,6 +2361,62 @@ fn build_native_lazy_import_sourcemap_round_trips_on_3_15() {
 }
 
 #[test]
+fn build_lazy_from_import_lowers_to_native_pep810_on_3_15() {
+    // `lazy from M import …` checks as a plain from-import and comes back
+    // out as PEP 810's native form, parenthesised spellings included.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(
+        tmp.path(),
+        "3.15",
+        "from os import sep\nlazy from json import dumps, loads as parse\nlazy from os.path import (\n    join,\n    basename,\n)\n\ndef main() -> None:\n    print(dumps(parse(\"[1]\")), join(\"a\", \"b\"), basename(\"/x/y\"), sep)\n",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    for want in [
+        "lazy from json import dumps, loads as parse",
+        "lazy from os.path import join, basename",
+    ] {
+        assert!(
+            py.lines().any(|l| l == want),
+            "missing `{want}`; got:\n{py}"
+        );
+    }
+    assert!(
+        py.lines().any(|l| l == "from os import sep"),
+        "a plain from-import must stay eager; got:\n{py}"
+    );
+}
+
+#[test]
+fn lazy_from_import_needs_a_3_15_target() {
+    // Before 3.15 `lazy from` is `tyc::requires_newer_python`; its
+    // SyntaxError forms are `tyc::lazy_usage` on every target.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(
+        tmp.path(),
+        "3.13",
+        "lazy from json import dumps\nprint(dumps(1))\n",
+    );
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    let text =
+        String::from_utf8_lossy(&out.stderr).into_owned() + &String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("tyc::requires_newer_python"), "{text}");
+
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(
+        tmp.path(),
+        "3.15",
+        "lazy from json import *\nprint(dumps(1))\n",
+    );
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    let text =
+        String::from_utf8_lossy(&out.stderr).into_owned() + &String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("tyc::lazy_usage"), "{text}");
+}
+
+#[test]
 fn build_native_lazy_import_3_13_output_runs() {
     // The 3.13 runtime-helper path still produces runnable Python. Use a
     // stdlib module (`json`) so the lazy import resolves at first use without

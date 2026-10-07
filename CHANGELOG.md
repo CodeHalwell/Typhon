@@ -45,6 +45,16 @@ run.
   are no longer treated as stdlib on any target, and `cProfile`, `pyexpat`
   and a few other present roots were missing and are added. The diagnostic
   stays a warning.
+- **`lazy from M import …` on 3.15 targets (PEP 810).** A module-level
+  `lazy from json import dumps, loads as parse` now compiles to CPython
+  3.15's native lazy from-import, which defers loading until a name is
+  used. On 3.13 and 3.14 targets it stays an error, now
+  `tyc::requires_newer_python` rather than `tyc::lazy_usage`, since there
+  is no way to defer it there. `lazy from M import *`,
+  `lazy from __future__ import …` and a `lazy from` below module level
+  remain `tyc::lazy_usage` errors on every target; CPython 3.15 rejects
+  them too. `tyc check` and `tyc run` treat the import as an ordinary
+  from-import.
 - **TypedDict `extra_items` (PEP 728).** A dict literal checked against
   `class T(TypedDict, extra_items=V)` may carry undeclared keys whose
   values are `V`s; other undeclared keys are still rejected.

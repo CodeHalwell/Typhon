@@ -137,13 +137,13 @@ def main() -> None:
 
 ### What's *not* allowed
 
-`lazy from foo import a, b` is **rejected at parse time**:
+`lazy from foo import a, b` needs `[python] target = "3.15"` or later, where it lowers to PEP 810's native lazy from-import. On 3.13 and 3.14 it is rejected with `tyc::requires_newer_python`:
 
 ```python
-lazy from numpy import array         # ❌
+lazy from numpy import array         # ❌ before a 3.15 target
 ```
 
-PEP 690 (which originally proposed deferred imports) notes that `from`-imports eagerly touch attributes on the source module — they defeat lazy loading. The diagnostic redirects you to:
+Without PEP 810, a from-import has to load the module to bind the name, which defeats lazy loading. The diagnostic redirects you to:
 
 ```python
 lazy import numpy
@@ -380,13 +380,13 @@ comptime let NOW: float = time.time()    # ❌ comptime sandbox forbids time.*
 
 Fix: compute at runtime, cache with `lazy let`.
 
-**Calling `lazy from foo import bar`:**
+**Calling `lazy from foo import bar` on a 3.13 / 3.14 target:**
 
 ```python
-lazy from numpy import array    # ❌ rejected at parse time
+lazy from numpy import array    # ❌ tyc::requires_newer_python before 3.15
 ```
 
-Fix: `lazy import numpy`, then use `numpy.array(...)`.
+Fix: `lazy import numpy`, then use `numpy.array(...)`, or target 3.15.
 
 **Writing a decorator factory:**
 
@@ -665,7 +665,7 @@ field on each variant statically typed.
 
 - **Pipes** thread a value into the next call's first positional slot.
 - **`comptime`** evaluates bindings and functions at build time; fails the build on missing required env vars.
-- **`lazy import`** defers module loading until first attribute access; `lazy from` is rejected.
+- **`lazy import`** defers module loading until first attribute access; `lazy from` needs a 3.15 target.
 - **`@pure`/`@memo`** verify the six purity conditions and opt into `functools.cache`.
 - **`unsafe:`** is the lexical boundary into untyped Python; values must be re-asserted to cross out.
 - **`.dty` stubs** describe third-party APIs; `tyc check --stubs` catches drift.

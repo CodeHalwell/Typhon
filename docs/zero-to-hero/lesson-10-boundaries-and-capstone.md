@@ -57,7 +57,7 @@ The sandbox is hermetic (no I/O, no loops, no imports) — pass everything in as
 lazy import np = numpy           # numpy isn't imported until you touch `np`
 ```
 
-(`lazy from numpy import array` is rejected — it defeats the deferral.)
+(`lazy from numpy import array` needs a Python 3.15 target — before PEP 810 it would defeat the deferral.)
 
 **Pipes** read left-to-right instead of inside-out:
 

@@ -600,7 +600,7 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 - Pure-function detection bound to the six-condition rule (sync, hashable args, no I/O, no entropy/clocks, no mutable module state, no exceptions). `@functools.cache` / `lru_cache` emission only with an explicit opt-in.
 - `gather` block, lowered to `asyncio.TaskGroup` by default. `gather(strategy="best-effort"):` for the `asyncio.gather(..., return_exceptions=True)` shape.
 - `go` lowered through `typhon_runtime.tasks.spawn` with a strong-ref registry.
-- Lazy imports (`lazy import np = numpy` only — `lazy from x import a, b` is rejected because it defeats deferral) and `lazy let` (cached getter for module-level, `cached_property` for instance-level on effectively immutable objects).
+- Lazy imports (`lazy import np = numpy` on every target; `lazy from x import a, b` only on 3.15+ targets, where PEP 810 makes it genuinely lazy) and `lazy let` (cached getter for module-level, `cached_property` for instance-level on effectively immutable objects).
 - Pipe operator, guards, extension methods.
 - `.dty` stub files, `.pyi` interop emission, and `tyc check --stubs` (stubtest port).
 

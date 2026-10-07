@@ -60,8 +60,8 @@ def embed(text: str) -> object:
     return np.asarray(tokenize(text))
 ```
 
-Note `lazy from numpy import asarray` is rejected — deferral needs the module
-object, so use `lazy import np = numpy` and dotted access.
+Note `lazy from numpy import asarray` needs a Python 3.15 target (PEP 810);
+on older targets use `lazy import np = numpy` and dotted access.
 
 Silence the whole family project-wide with `[strictness] suggest-perf = false`.
 

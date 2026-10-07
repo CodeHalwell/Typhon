@@ -983,6 +983,16 @@ impl Backend {
                     &text_for_check,
                 );
                 diags.extend(lint_diags);
+                // `lazy from` is gone from the preprocessed buffer, so its
+                // target gate reads the editor text directly.
+                if let Some((major, minor)) = opts.python_target {
+                    diags.extend(tyc_analyse::lazy_from_target_diagnostics(
+                        &uri_str_for_check,
+                        &text_for_check,
+                        major,
+                        minor,
+                    ));
+                }
             }
             Some((diags, mapping_source))
         })

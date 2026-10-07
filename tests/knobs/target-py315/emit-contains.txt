@@ -3,3 +3,4 @@
 {**part for part in parts}
 frozendict(merged)
 sentinel("MISSING")
+lazy from textwrap import shorten

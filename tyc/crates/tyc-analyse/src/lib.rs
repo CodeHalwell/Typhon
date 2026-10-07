@@ -251,6 +251,30 @@ pub fn target_version_diagnostics(path: &str, source: &str, major: u8, minor: u8
     diags
 }
 
+/// `tyc::requires_newer_python` for each module-level `lazy from … import …`
+/// (PEP 810) in the `.ty` `source` when the target is before 3.15. The
+/// preprocessor strips the `lazy`, so this reads the `.ty` text, not the
+/// preprocessed Python [`target_version_diagnostics`] takes.
+pub fn lazy_from_target_diagnostics(path: &str, source: &str, major: u8, minor: u8) -> Diagnostics {
+    let mut diags = Diagnostics::new();
+    if (major, minor) >= (3, 15) {
+        return diags;
+    }
+    for offset in tyc_syntax::preprocess::lazy_from_import_offsets(source) {
+        diags.push_error(TycError::requires_newer_python(
+            format!(
+                "`lazy from … import …` needs Python 3.15 (PEP 810) and the project targets {major}.{minor}; \
+                 use `lazy import ALIAS = MODULE` instead"
+            ),
+            path.to_owned(),
+            source.to_owned(),
+            offset,
+            "lazy from".len(),
+        ));
+    }
+    diags
+}
+
 /// Whether [`target_version_diagnostics`] could report anything for
 /// `source` on Python `major.minor`: a byte scan that lets callers skip
 /// preprocessing and parsing for the check on most files. Works on the

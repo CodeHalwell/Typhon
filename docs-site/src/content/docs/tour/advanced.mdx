@@ -140,13 +140,13 @@ def main() -> None:
 
 ### What's *not* allowed
 
-`lazy from foo import a, b` is **rejected at parse time**:
+`lazy from foo import a, b` needs `[python] target = "3.15"` or later, where it lowers to PEP 810's native lazy from-import. On 3.13 and 3.14 it is rejected with `tyc::requires_newer_python`:
 
 ```python
-lazy from numpy import array         # ❌
+lazy from numpy import array         # ❌ before a 3.15 target
 ```
 
-PEP 690 (which originally proposed deferred imports) notes that `from`-imports eagerly touch attributes on the source module — they defeat lazy loading. The diagnostic redirects you to:
+Without PEP 810, a from-import has to load the module to bind the name, which defeats lazy loading. The diagnostic redirects you to:
 
 ```python
 lazy import numpy

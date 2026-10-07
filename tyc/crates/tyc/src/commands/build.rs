@@ -1400,6 +1400,15 @@ pub fn run(args: BuildArgs) -> Result<()> {
         if native_lazy_imports && !prep.lazy_imports.is_empty() {
             python_src = prefix_native_lazy_imports(&python_src, &prep.lazy_imports);
         }
+        // `lazy from M import …` (PEP 810) went through as a plain
+        // from-import; stamp the `lazy ` back on the same way. Older
+        // targets never get here with one: `tyc::requires_newer_python`.
+        if native_lazy_imports {
+            let lazy_from = lazy_from_import_keys(&prep);
+            if !lazy_from.is_empty() {
+                python_src = prefix_native_lazy_from_imports(&python_src, &lazy_from);
+            }
+        }
 
         let rel = path
             .strip_prefix(&src_dir)
@@ -2979,6 +2988,98 @@ fn prefix_native_lazy_imports(src: &str, lazy_imports: &[LazyImport]) -> String 
         if !prefixed {
             out.push_str(line);
         }
+    }
+    out
+}
+
+/// The module-level from-imports the preprocessor stripped a `lazy ` off,
+/// each as its [`import_from_key`].
+fn lazy_from_import_keys(prep: &tyc_syntax::preprocess::PreprocessResult) -> Vec<String> {
+    let lines: Vec<&str> = prep.python_source.lines().collect();
+    prep.stripped
+        .iter()
+        .filter(|s| s.keyword == tyc_syntax::lexer::TyphonKeyword::Lazy)
+        .filter_map(|s| {
+            let first = lines.get(s.line_index)?;
+            if !first.starts_with("from ") {
+                return None;
+            }
+            module_level_import_from_key(&lines, s.line_index).map(|(key, _)| key)
+        })
+        .collect()
+}
+
+/// `from M import a, b as c` in one canonical spelling, whatever the
+/// line breaks and parentheses.
+fn import_from_key(f: &tyc_syntax::ast::StmtImportFrom) -> String {
+    let names: Vec<String> = f
+        .names
+        .iter()
+        .map(|a| match &a.asname {
+            Some(asname) => format!("{} as {asname}", a.name),
+            None => a.name.to_string(),
+        })
+        .collect();
+    format!(
+        "{}{} import {}",
+        ".".repeat(f.level as usize),
+        f.module.as_ref().map(|m| m.as_str()).unwrap_or(""),
+        names.join(", ")
+    )
+}
+
+/// The from-import statement starting at `lines[start]` (it may continue
+/// over a parenthesised or backslash-continued tail): its
+/// [`import_from_key`] and the number of lines it spans.
+fn module_level_import_from_key(lines: &[&str], start: usize) -> Option<(String, usize)> {
+    let mut text = String::new();
+    let mut depth: i32 = 0;
+    let mut end = start;
+    while let Some(line) = lines.get(end) {
+        text.push_str(line);
+        text.push('\n');
+        end += 1;
+        let code = line.split('#').next().unwrap_or("");
+        depth += code.matches('(').count() as i32 - code.matches(')').count() as i32;
+        if depth <= 0 && !code.trim_end().ends_with('\\') {
+            break;
+        }
+    }
+    let parsed = tyc_syntax::parse_module(&text).ok()?.into_syntax();
+    match parsed.body.as_slice() {
+        [tyc_syntax::ast::Stmt::ImportFrom(f)] => Some((import_from_key(f), end - start)),
+        _ => None,
+    }
+}
+
+/// Prefix `lazy ` on the first module-level from-import matching each of
+/// `keys` (once each), as [`prefix_native_lazy_imports`] does for
+/// `lazy import`. Line count is unchanged, so the `.py.map` stays valid.
+fn prefix_native_lazy_from_imports(src: &str, keys: &[String]) -> String {
+    let lines: Vec<&str> = src.split_inclusive('\n').collect();
+    let bare: Vec<&str> = lines
+        .iter()
+        .map(|l| l.trim_end_matches(['\n', '\r']))
+        .collect();
+    let mut claimed = vec![false; keys.len()];
+    let mut out = String::with_capacity(src.len() + keys.len() * 5);
+    let mut i = 0;
+    while i < lines.len() {
+        if bare[i].starts_with("from ") && claimed.iter().any(|c| !c) {
+            if let Some((key, span)) = module_level_import_from_key(&bare, i) {
+                if let Some(k) = (0..keys.len()).find(|&k| !claimed[k] && keys[k] == key) {
+                    claimed[k] = true;
+                    out.push_str("lazy ");
+                }
+                for line in &lines[i..i + span] {
+                    out.push_str(line);
+                }
+                i += span;
+                continue;
+            }
+        }
+        out.push_str(lines[i]);
+        i += 1;
     }
     out
 }

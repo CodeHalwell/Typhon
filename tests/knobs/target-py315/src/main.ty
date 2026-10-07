@@ -1,8 +1,11 @@
 # `[python] target = "3.15"` unlocks 3.15-only syntax and builtins, which
 # `tyc::requires_newer_python` rejects on older targets: PEP 798 unpacking
-# comprehensions, `frozendict` (PEP 814) and `sentinel` (PEP 661). The
+# comprehensions, `frozendict` (PEP 814), `sentinel` (PEP 661) and
+# `lazy from … import …` (PEP 810). The
 # emitted file is 3.15 Python, so meta.conf's `min-python=3.15` keeps it
 # build-only under python3.13; the CI 3.15 leg runs it and compares the VM.
+lazy from textwrap import shorten
+
 let MISSING = sentinel("MISSING")
 
 
@@ -24,6 +27,7 @@ def main() -> None:
     print(flat, sorted(distinct), merged)
     print(table, table | {"c": 4}, hash(table) == hash(frozendict(b=2, a=3)))
     print(lookup(table, "a"), lookup(table, "z"), lookup(table, "z", 0), MISSING)
+    print(shorten("lazy from imports load on first use", width=20))
 
 
 if __name__ == "__main__":

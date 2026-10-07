@@ -615,6 +615,16 @@ fn check_scope(args: &CheckArgs, scope: &CheckScope) -> Result<ScopeOutcome> {
                 },
             );
             diags.extend(analysis_diags);
+            // `lazy from` is stripped by the preprocessor, so its target
+            // gate reads the `.ty` text.
+            if let Some((major, minor)) = python_target_u8(&config.python.target) {
+                diags.extend(tyc_analyse::lazy_from_target_diagnostics(
+                    &path.to_string_lossy(),
+                    &source,
+                    major,
+                    minor,
+                ));
+            }
         }
 
         // `--stubs`: parse + type-check every `.dty` stub, then compare its
@@ -1185,15 +1195,17 @@ pub(crate) fn check_target_syntax(path: &str, source: &str, target: &str) -> Dia
     let Some((major, minor)) = python_target_u8(target) else {
         return Diagnostics::new();
     };
+    let mut diags = tyc_analyse::lazy_from_target_diagnostics(path, source, major, minor);
     if !tyc_analyse::target_version_check_may_fire(source, major, minor) {
-        return Diagnostics::new();
+        return diags;
     }
     let (expanded, expanded_to_source) = expand_sugar_mapped(source, true);
     let (mut prep, prep_to_expanded) = preprocess_mapped(&expanded);
     prep.line_map = compose_line_maps(&prep_to_expanded, &expanded_to_source);
-    let mut diags =
+    let mut syntax =
         tyc_analyse::target_version_diagnostics(path, &prep.python_source, major, minor);
-    diags.remap_lines(&prep.python_source, &prep.line_map, path, source);
+    syntax.remap_lines(&prep.python_source, &prep.line_map, path, source);
+    diags.extend(syntax);
     diags
 }
 
