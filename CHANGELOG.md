@@ -8,6 +8,14 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ### Fixed
 
+- **Exception subclasses as loop and await terminators.** Under
+  `tyc run`, an `__anext__` that raises a user subclass of
+  `StopAsyncIteration` ends an `async for`, and an `__await__` iterator
+  that finishes with a `StopIteration` subclass gives that exception's
+  value as the await's result, as in CPython. `async for` over a class (an
+  enum class included) raises CPython's `TypeError`, and a builtin
+  exception base reached through an alias (`Alias = ValueError`) keeps its
+  exception hierarchy even after the original name is rebound.
 - **Builtin-type bases, bool flag values and nested genexps.** Under
   `tyc run`, a class whose base is computed (`class E(type(ValueError()))`)
   now inherits from the real builtin, so its `__mro__`, `issubclass` and

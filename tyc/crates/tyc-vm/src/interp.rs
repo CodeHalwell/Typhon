@@ -1760,10 +1760,16 @@ impl Interpreter {
                     }
                     Value::Native(n)
                         if builtin_exc_mro(n.name).is_some()
-                            && matches!(self.root.get(n.name), Some(Value::Native(_))) =>
+                            && matches!(
+                                self.builtin_globals.get(n.name),
+                                Some(Value::Native(_))
+                            ) =>
                     {
                         header_has_builtin = true;
                         header_bases.push(Value::Str(Rc::new(n.name.to_owned())));
+                        // An aliased base (`Alias = ValueError`) is missed by
+                        // the header-name scan below.
+                        computed_exc_bases.push(Value::Str(Rc::new(n.name.to_owned())));
                     }
                     Value::Module(_) => {
                         // e.g. `typing.Protocol` referenced as `Protocol` — ignored for v1.
@@ -2175,7 +2181,14 @@ impl Interpreter {
                     .collect()
             })
             .unwrap_or_default();
-        builtin_exc_bases.extend(computed_exc_bases);
+        for b in computed_exc_bases {
+            let dup = builtin_exc_bases
+                .iter()
+                .any(|x| matches!((x, &b), (Value::Str(a), Value::Str(c)) if a == c));
+            if !dup {
+                builtin_exc_bases.push(b);
+            }
+        }
         let is_exception = bases.iter().any(|b| b.is_exception) || !builtin_exc_bases.is_empty();
         // Never inherited: a base's record describes the base's header.
         class_attrs.remove("__typhon_header_bases__");
@@ -6086,10 +6099,20 @@ impl Interpreter {
                     loop {
                         match self.call_dunder0(&it, "__next__") {
                             Ok(_) => {}
-                            Err(Unwind::Exception(e)) if e.kind == "StopIteration" => {
+                            Err(Unwind::Exception(e)) if exc_is_a(&e, "StopIteration") => {
                                 return Ok(match &e.value {
                                     Some(Value::Exception { args, .. }) => {
                                         args.first().cloned().unwrap_or(Value::None)
+                                    }
+                                    // A user `StopIteration` subclass keeps
+                                    // its args on the instance.
+                                    Some(Value::Instance(inst)) => {
+                                        match inst.fields.borrow().get("args") {
+                                            Some(Value::Tuple(a)) => {
+                                                a.first().cloned().unwrap_or(Value::None)
+                                            }
+                                            _ => Value::None,
+                                        }
                                     }
                                     _ => Value::None,
                                 });
@@ -9228,7 +9251,7 @@ impl Interpreter {
                 };
                 match step {
                     Ok(item) => Ok(Some(item)),
-                    Err(Unwind::Exception(e)) if e.kind == "StopAsyncIteration" => Ok(None),
+                    Err(Unwind::Exception(e)) if exc_is_a(&e, "StopAsyncIteration") => Ok(None),
                     Err(e) => Err(e),
                 }
             }
@@ -12222,6 +12245,18 @@ fn reject_sync_only_async_iterable(v: &Value) -> Result<(), Unwind> {
     // call arrives as a coroutine thunk too, and is iterable).
     let coroutine = matches!(v, Value::Coroutine(t)
         if matches!(t.function.generator, crate::value::GeneratorKind::NotGenerator));
+    // A class is iterated through its metaclass, and neither `type` nor
+    // `EnumType` defines `__aiter__`.
+    if let Value::Class(c) = v {
+        let meta = if Interpreter::is_enum_class(c) {
+            "EnumType"
+        } else {
+            "type"
+        };
+        return Err(type_error(format!(
+            "'async for' requires an object with __aiter__ method, got {meta}"
+        )));
+    }
     if sync_iterator
         || coroutine
         || matches!(
@@ -12990,6 +13025,15 @@ pub(crate) fn name_is_exception_base(name: &str) -> bool {
 /// subclass of it). Reads the `__typhon_exc_bases__` record stamped on each
 /// class by `build_class`, since builtin exception bases have no
 /// `Value::Class` to walk.
+/// Whether a raised exception is a builtin `target` or a subclass of it,
+/// a user subclass included.
+fn exc_is_a(e: &VmException, target: &str) -> bool {
+    e.kind == target
+        || builtin_exc_is_a(&e.kind, target)
+        || matches!(&e.value, Some(Value::Instance(inst))
+            if class_has_builtin_exc_base(&inst.class, target))
+}
+
 pub(crate) fn class_has_builtin_exc_base(class: &Rc<Class>, target: &str) -> bool {
     if let Some(Value::Tuple(names)) = class.class_attrs.borrow().get("__typhon_exc_bases__") {
         for nm in names.iter() {

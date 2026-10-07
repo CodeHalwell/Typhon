@@ -1004,6 +1004,36 @@ async def comp_list() -> None:
     xs = [1]
     show([x async for x in xs])
 trap("sync comp", lambda: asyncio.run(comp_list()))
+class Done(StopAsyncIteration):
+    pass
+class DoneWith(StopIteration):
+    pass
+plain class StopSub:
+    def __iter__(self) -> "StopSub":
+        return self
+    def __next__(self) -> int:
+        raise DoneWith(7)
+plain class AwSub:
+    def __await__(self) -> StopSub:
+        return StopSub()
+plain class SubEnd:
+    def __aiter__(self) -> "SubEnd":
+        return self
+    async def __anext__(self) -> int:
+        raise Done()
+async def sub_end() -> None:
+    async for x in SubEnd():
+        show("never", x)
+    show("sub end", await AwSub())
+asyncio.run(sub_end())
+from enum import Enum
+class Colour(Enum):
+    RED = 1
+async def over_class(c: object) -> None:
+    async for x in c:
+        show(x)
+trap("enum class", lambda: asyncio.run(over_class(Colour)))
+trap("plain class", lambda: asyncio.run(over_class(SubEnd)))
 "#,
     );
 }
@@ -1026,6 +1056,12 @@ def raise_computed() -> None:
     except ValueError as e:
         show("caught", type(e).__name__, e)
 raise_computed()
+Alias = ValueError
+ValueError = 3
+class Aliased(Alias):
+    pass
+show(names(Aliased.__mro__), names(Aliased.__bases__), issubclass(Aliased, Exception))
+ValueError = Alias
 class Deeper(AppError):
     pass
 plain class Base:
