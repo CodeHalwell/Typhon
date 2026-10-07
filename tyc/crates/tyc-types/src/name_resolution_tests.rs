@@ -2769,3 +2769,601 @@ both()
     );
     assert_eq!(errors.len(), 2, "{errors:?}");
 }
+
+/// `check`, with the resolver told which declarations are `plain class` /
+/// `class!`, as `tyc-db` tells it.
+fn check_with_class_markers(src: &str) -> Diagnostics {
+    let prep = preprocess(src);
+    let module = tyc_syntax::parse_module(&prep.python_source)
+        .unwrap()
+        .into_syntax();
+    let options = ResolveOptions {
+        raw_class_byte_starts: line_byte_starts(&prep.python_source, &prep.raw_class_lines),
+        original_source: Some(src.to_owned()),
+        plain_class_byte_starts: Some(line_byte_starts(
+            &prep.python_source,
+            &prep.plain_class_lines,
+        )),
+        ..ResolveOptions::default()
+    };
+    let (resolved, _) =
+        resolve_module_with("<test>".to_owned(), &prep.python_source, &module, options);
+    check_module_with(
+        "<test>",
+        &prep.python_source,
+        &resolved,
+        &module,
+        &prep.unsafe_lines,
+        &prep.frozen_class_lines,
+        &prep.impl_distributed_lines,
+    )
+}
+
+#[test]
+fn a_method_both_shadowing_classes_declare_is_still_a_member() {
+    // The same signature on both: interface conformance and `__call__`
+    // read it (review N1, l05 / l06).
+    assert_clean(
+        r#"
+from collections.abc import Callable
+
+interface Shape:
+    def area(self) -> float
+
+class Circle:
+    r: float
+
+impl Circle:
+    def area(self) -> float:
+        return 3.0 * self.r
+
+class Res:
+    name: str
+
+impl Res:
+    def __call__(self, x: int) -> int:
+        return x + 1
+
+def total(s: Shape) -> float:
+    return s.area()
+
+def apply(g: Callable[[int], int]) -> int:
+    return g(1)
+
+def f() -> float:
+    class Circle:
+        r: float
+
+    impl Circle:
+        def area(self) -> float:
+            return 2.0 * self.r
+
+    let s: Shape = Circle(r=1.0)
+    return total(Circle(r=1.0)) + s.area()
+
+def g() -> int:
+    class Res:
+        name: str
+
+    impl Res:
+        def __call__(self, x: int) -> int:
+            return x * 3
+
+    let h: Callable[[int], int] = Res(name="e")
+    return apply(Res(name="e")) + h(2)
+
+print(f(), g(), total(Circle(r=1.0)), apply(Res(name="o")))
+"#,
+    );
+    // Different signatures: present, but which one is called is not judged.
+    assert_clean(
+        r#"
+from collections.abc import Callable
+
+interface Shape:
+    def area(self) -> float
+
+class Circle:
+    r: float
+
+impl Circle:
+    def area(self, k: int) -> float:
+        return k * self.r
+
+class Res:
+    name: str
+
+impl Res:
+    def __call__(self, x: int, y: int) -> int:
+        return x + y
+
+def total(s: Shape) -> float:
+    return s.area()
+
+def apply(g: Callable[[int], int]) -> int:
+    return g(1)
+
+def f(outer: Circle) -> float:
+    class Circle:
+        r: float
+
+    impl Circle:
+        def area(self) -> float:
+            return 2.0 * self.r
+
+    return total(Circle(r=1.0)) + outer.area(2)
+
+def g() -> int:
+    class Res:
+        name: str
+
+    impl Res:
+        def __call__(self, x: int) -> int:
+            return x * 3
+
+    let r = Res(name="e")
+    return apply(r) + r(4)
+"#,
+    );
+    // Control: a member neither class declares is still missing.
+    let errors = only_errors(
+        r#"
+interface Shape:
+    def area(self) -> float
+
+class Circle:
+    r: float
+
+def total(s: Shape) -> float:
+    return s.area()
+
+def f() -> float:
+    class Circle:
+        r: float
+    return total(Circle(r=1.0))
+"#,
+        |e| matches!(e, TycError::InterfaceNotConforming { .. }),
+    );
+    assert_eq!(errors.len(), 1, "{errors:?}");
+}
+
+#[test]
+fn a_shadowing_local_accepts_values_of_the_shadowed_type() {
+    // Review N2 (a02): later values fit the module binding's declared type,
+    // as they did when the local was taken for a reassignment of it.
+    assert_clean(
+        r#"
+mut cache: int? = None
+mut total: float = 0.0
+mut best: float = 0.0
+
+def f(xs: list[int]) -> int?:
+    mut cache = None
+    for x in xs:
+        if x > 2:
+            cache = x
+    return cache
+
+def g(xs: list[int]) -> float:
+    mut total = 0
+    for x in xs:
+        total = total + x * 0.5
+    return total
+
+def h() -> float:
+    mut total = 0
+    total += 2.5
+    return total
+
+def find_int(xs: list[int]) -> int:
+    mut best = 0
+    for x in xs:
+        if x > best:
+            best = x
+    return best
+
+def outer() -> int:
+    mut best = 1
+    def inner() -> float:
+        mut total = 0
+        total = total + 0.5
+        return total
+    return best + int(inner())
+
+print(f([1, 3]), g([1, 2]), h(), find_int([3, 1]), outer())
+"#,
+    );
+    // Controls: a value fitting neither type, and the same body with no
+    // module binding to shadow.
+    let errors = only_errors(
+        r#"
+mut cache: str? = None
+
+def f(xs: list[int]) -> int?:
+    mut cache = None
+    for x in xs:
+        if x > 2:
+            cache = x
+    return cache
+
+def g(xs: list[int]) -> float:
+    mut fresh = 0
+    for x in xs:
+        fresh = fresh + x * 0.5
+    return fresh
+"#,
+        |e| matches!(e, TycError::TypeReassignMismatch { .. }),
+    );
+    assert_eq!(errors.len(), 2, "{errors:?}");
+}
+
+#[test]
+fn a_module_decorator_named_like_a_keeping_one_is_judged_by_its_types() {
+    // Review R10: a user `def cache` / `def pure` that drops a parameter,
+    // and a `Concatenate` decorator, are not signature-keeping.
+    for name in ["cache", "pure"] {
+        assert_clean(&format!(
+            r#"
+from typing import Callable
+
+class Repo:
+    name: str
+
+def {name}(f: Callable[[Repo, str, dict[str, str]], str]) -> Callable[[Repo, str], str]:
+    let store: dict[str, str] = {{}}
+    def wrapper(self: Repo, key: str) -> str:
+        return f(self, key, store)
+    return wrapper
+
+impl Repo:
+    @{name}
+    def find(self, key: str, store: dict[str, str]) -> str:
+        return self.name + key
+
+def lookup[T: Repo](r: T) -> str:
+    return r.find("k2")
+
+def main() -> None:
+    let r: Repo = Repo(name="r")
+    let g = r.find
+    print(Repo.find(r, "k"), lookup(r), g("k3"))
+"#
+        ));
+    }
+    assert_clean(
+        r#"
+from typing import Callable, Concatenate, Any
+
+class Db:
+    url: str
+
+class Repo:
+    name: str
+
+def with_db[**P, R](f: Callable[Concatenate[Repo, Db, P], R]) -> Callable[Concatenate[Repo, P], R]:
+    let w: Any = f
+    return w
+
+impl Repo:
+    @with_db
+    def find(self, db: Db, key: str) -> str:
+        return self.name + key
+
+def lookup[T: Repo](r: T) -> str:
+    return r.find("k2")
+"#,
+    );
+}
+
+#[test]
+fn a_freeze_let_dict_calls_the_builtin_extension() {
+    // Review R18: the desugar rewrites by the `dict[...]` annotation, so the
+    // extension's signature applies, nested values included.
+    assert_clean(
+        r#"
+extend dict:
+    def get(self, key: str, default: int = 0, strict: bool = False) -> int:
+        return 7
+
+freeze let CONFIG: dict[str, int] = {"a": 1}
+freeze let CFG: dict[str, dict[str, int]] = {"db": {"a": 1}}
+
+def main() -> None:
+    print(CONFIG.get("z", 1, True), CONFIG.get("a", default=5))
+    print(CFG["db"].get("zz", 9), CFG["db"].get("a", default=5))
+"#,
+    );
+    // Control: without the extension it is `dict.get`.
+    let errors = only_errors(
+        r#"
+freeze let CFG: dict[str, dict[str, int]] = {"db": {"a": 1}}
+
+def main() -> None:
+    print(CFG["db"].get("a", default=5))
+"#,
+        |e| matches!(e, TycError::UnknownKwarg { .. }),
+    );
+    assert_eq!(errors.len(), 1, "{errors:?}");
+}
+
+#[test]
+fn a_dict_head_named_get_is_the_collections_one_only() {
+    // Review R37: a user generic class named `Counter` keeps its own `get`;
+    // `extend Counter:` patches the collections class; a `freeze let` of an
+    // `Any` value may be any `Mapping`.
+    let errors = only_errors(
+        r#"
+class Counter[T]:
+    n: int = 0
+
+impl[T] Counter[T]:
+    def get(self, key: T, default: int = 0) -> int:
+        return default + 10
+
+    def total(self, key: T, start: int, step: int) -> int:
+        return start + step
+
+def main() -> None:
+    let c: Counter[str] = Counter()
+    print(c.get("z", default=3), c.get("z", 1))
+    let r: str = c.get("z", 1)
+    print(r)
+"#,
+        |e| matches!(e, TycError::TypeMismatch { .. }),
+    );
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_clean(
+        r#"
+from collections import Counter
+from collections.abc import Mapping
+from typing import Any
+
+extend Counter:
+    def get(self, key: str, default: int = 0) -> int:
+        return default + 1000
+
+def make() -> Any:
+    return {"a": 1}
+
+freeze let M: Mapping[str, int] = make()
+
+def main() -> None:
+    let c: Counter[str] = Counter("ab")
+    print(c.get("z", default=3), M.get("z", default=5))
+"#,
+    );
+    // Control: `OrderedDict` is a C type, which `extend` cannot patch.
+    let errors = only_errors(
+        r#"
+from collections import OrderedDict
+
+extend OrderedDict:
+    def get(self, key: str, default: int = 0) -> int:
+        return default
+
+def main() -> None:
+    let o: OrderedDict[str, int] = OrderedDict()
+    print(o.get("z", default=3))
+"#,
+        |e| matches!(e, TycError::UnknownKwarg { .. }),
+    );
+    assert_eq!(errors.len(), 1, "{errors:?}");
+}
+
+#[test]
+fn a_method_effect_follows_each_classs_resolution_order() {
+    // Review R19: `D(A, B)` reaches `A.reset` through a `B`-typed receiver,
+    // and a diamond resolves `R.reset` before `Base.reset`.
+    for (classes, param) in [
+        (
+            "class A:\n    conn: Conn?\n\nimpl A:\n    def reset(self) -> None:\n        self.conn = None\n\nclass B:\n    conn: Conn?\n\nimpl B:\n    def reset(self) -> None:\n        pass\n\nclass D(A, B):\n    pass\n",
+            "B",
+        ),
+        (
+            "class Base:\n    conn: Conn?\n\nimpl Base:\n    def reset(self) -> None:\n        pass\n\nclass L(Base):\n    pass\n\nclass R(Base):\n    pass\n\nimpl R:\n    def reset(self) -> None:\n        self.conn = None\n\nclass D(L, R):\n    pass\n",
+            "D",
+        ),
+        (
+            "class Base:\n    conn: Conn?\n\nimpl Base:\n    def reset(self) -> None:\n        pass\n\nclass L(Base):\n    pass\n\nclass R(Base):\n    pass\n\nimpl R:\n    def reset(self) -> None:\n        self.conn = None\n\nclass D(L, R):\n    pass\n",
+            "L",
+        ),
+    ] {
+        let src = format!(
+            "{CONN}\n{classes}\ndef use(b: {param}) -> int:\n    if b.conn is not None:\n        b.reset()\n        return b.conn.query()\n    return 0\n"
+        );
+        let d = check(&src);
+        assert_eq!(nullable_uses(&d), 1, "{src}\n{:?}", messages(&d));
+    }
+    // Control: `D(B, A)` resolves `B.reset`, which writes nothing.
+    let src = format!(
+        "{CONN}\nclass A:\n    conn: Conn?\n\nimpl A:\n    def reset(self) -> None:\n        self.conn = None\n\nclass B:\n    conn: Conn?\n\nimpl B:\n    def reset(self) -> None:\n        pass\n\nclass D(B, A):\n    pass\n\ndef use(b: B) -> int:\n    if b.conn is not None:\n        b.reset()\n        return b.conn.query()\n    return 0\n"
+    );
+    let d = check(&src);
+    assert_eq!(nullable_uses(&d), 0, "{:?}", messages(&d));
+}
+
+#[test]
+fn await_judges_every_def_the_call_may_resolve_to() {
+    // Review R23: a diamond resolves `C.run` (decorated) before `A.run`, and
+    // a later `def` in the same body replaces the earlier one.
+    let asyncify = r#"
+import asyncio
+from collections.abc import Callable, Coroutine
+from typing import Any
+
+def asyncify[**P, R](f: Callable[P, R]) -> Callable[P, Coroutine[Any, Any, R]]:
+    async def inner(*args: P.args, **kwargs: P.kwargs) -> R:
+        await asyncio.sleep(0)
+        return f(*args, **kwargs)
+    return inner
+"#;
+    assert_clean(&format!(
+        r#"{asyncify}
+class A:
+    n: int
+
+impl A:
+    def run(self) -> int:
+        return self.n
+
+class B(A):
+    pass
+
+class C(A):
+    pass
+
+impl C:
+    @asyncify
+    def run(self) -> int:
+        return self.n + 1
+
+class D(B, C):
+    pass
+
+class Worker:
+    n: int
+
+impl Worker:
+    def run(self) -> int:
+        return self.n
+
+    @asyncify
+    def run(self) -> int:
+        return self.n + 1
+
+async def go(w: D, k: Worker) -> int:
+    return await w.run() + await k.run()
+"#
+    ));
+    // Control: a plain synchronous method is still not awaitable.
+    let errors = only_errors(
+        r#"
+class A:
+    n: int
+
+impl A:
+    def run(self) -> int:
+        return self.n
+
+class B(A):
+    pass
+
+async def go(w: B) -> int:
+    return await w.run()
+"#,
+        |e| matches!(e, TycError::TypeMismatch { .. }),
+    );
+    assert_eq!(errors.len(), 1, "{errors:?}");
+}
+
+#[test]
+fn a_local_class_kind_is_the_local_declarations() {
+    // Review R26: a local dataclass shadowing a module `plain class`, and a
+    // local `plain class` that must not make the module dataclass plain.
+    for src in [
+        "plain class Point:\n    x: int = 0\n\ndef f() -> int:\n    class Point:\n        x: int\n        y: int\n    let p = Point(x=1, y=2)\n    let q = Point(1, 2)\n    let mk = Point\n    return p.x + q.y + mk(x=1, y=2).x\n\nprint(f(), Point().x)\n",
+        "class Point:\n    x: int\n    y: int\n\ndef f() -> int:\n    plain class Point:\n        x: int = 4\n    let p = Point()\n    return p.x\n\ndef g() -> int:\n    return Point(x=1, y=2).y\n\nprint(f(), g(), Point(x=1, y=2).y)\n",
+    ] {
+        let d = check_with_class_markers(src);
+        assert!(d.errors().is_empty(), "{src}\n{:?}", messages(&d));
+    }
+    // Controls: each `plain class` without `__init__` still takes no
+    // arguments where its name means it.
+    let src = "plain class Bag:\n    x: int = 0\n\nclass Point:\n    x: int\n\ndef f() -> int:\n    plain class Point:\n        x: int = 4\n    return Point(x=1).x\n\nprint(f(), Bag(x=1).x)\n";
+    let d = check_with_class_markers(src);
+    let arity = d
+        .errors()
+        .iter()
+        .filter(|e| matches!(e, TycError::WrongArgCount { .. }))
+        .count();
+    assert_eq!(arity, 2, "{:?}", messages(&d));
+}
+
+#[test]
+fn a_function_local_stdlib_import_still_names_the_resource() {
+    // Review N23: a function-local `import` binds the stdlib module itself,
+    // in its own body and in closures over it.
+    let src = r#"
+def probe() -> None:
+    import socket
+    let s = socket.socket()
+    s.close()
+
+def temp() -> None:
+    import tempfile
+    let t = tempfile.NamedTemporaryFile()
+    t.close()
+
+def db() -> None:
+    import sqlite3
+    let c = sqlite3.connect(":memory:")
+    c.close()
+
+def outer() -> None:
+    import socket
+    def inner() -> None:
+        let s = socket.socket()
+        s.close()
+    inner()
+
+def text(path: str) -> None:
+    from io import open
+    let f = open(path)
+    f.close()
+"#;
+    assert_eq!(
+        resource_warnings(src).len(),
+        5,
+        "{:?}",
+        resource_warnings(src)
+    );
+    // Review R25: an `open` imported from anywhere else is not the builtin.
+    let src = r#"
+from os import open, O_RDONLY
+from doors import open as open_door
+
+def fd(path: str) -> int:
+    let n = open(path, O_RDONLY)
+    return n
+
+def local(path: str) -> None:
+    from doors import open
+    let d = open(path)
+    print(d, open_door(path))
+"#;
+    assert!(
+        resource_warnings(src).is_empty(),
+        "{:?}",
+        resource_warnings(src)
+    );
+}
+
+#[test]
+fn typing_protocol_bounds_are_not_compared_by_name() {
+    // Review N4: `str` is `Sized` and `Hashable` without any nominal
+    // relation saying so.
+    assert_clean(
+        r#"
+from typing import Sized, Hashable, SupportsFloat, SupportsInt, SupportsAbs
+
+def size[S: Sized](s: S) -> int:
+    return len(s)
+
+def outer() -> int:
+    def sz[S: Sized](s: S) -> int:
+        return len(s)
+    def hs[H: Hashable](h: H) -> H:
+        return h
+    def fl[F: SupportsFloat](x: F) -> float:
+        return float(x)
+    def it[I: SupportsInt](x: I) -> int:
+        return int(x)
+    def ab[A: SupportsAbs[int]](x: A) -> int:
+        return abs(x)
+    print(hs("k"), hs(3), fl(2), it(2.5), ab(-3))
+    return sz([1]) + sz("ab") + size({"a": 1})
+
+print(outer())
+"#,
+    );
+}

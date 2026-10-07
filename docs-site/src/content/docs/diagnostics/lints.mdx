@@ -18,6 +18,9 @@ The result of a resource-returning call (`open`, `socket.socket`,
 — so it is closed only when the garbage collector gets to it. A handle stored
 on an object (`self.fh = open(p)`), closed in a later `finally:
 f.close()`, given to `ExitStack.enter_context(...)` or returned is managed.
+The name must mean that callee: an `import socket` inside the function
+does, while a parameter, local or `def` named `open`, or an `open` imported
+from elsewhere (`from os import open`), does not.
 
 ```python
 def load_config(path: str) -> str:
