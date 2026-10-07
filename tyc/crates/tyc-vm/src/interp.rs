@@ -9431,30 +9431,23 @@ impl Interpreter {
         // Try to resolve to a name (e.g. `ValueError`); if it isn't bound,
         // accept any name match against the exception's `kind`.
         if let Expr::Name(n) = type_expr {
+            // A bound name catches what it is bound to: `IOError` is
+            // `OSError`, `Alias = ValueError` and `ERRORS = (KeyError,
+            // IndexError)` catch as their targets do, and a user class
+            // catches its own instances and subclasses — never a different
+            // class that merely shares its `__name__`.
+            if let Ok(target) = self.eval_expr(type_expr, env) {
+                return Ok(self.exception_matches_value(&target, exc));
+            }
+            // An unbound name matches by spelling: directly, through the
+            // builtin hierarchy (`except LookupError` catching `KeyError`),
+            // or through a builtin base recorded on a user class
+            // (`class MyKeyError(KeyError):`, which has no `Value::Class`).
             let name = n.id.as_str();
-            // Direct name match, or a builtin-exception-hierarchy match
-            // (e.g. `except ArithmeticError` catching `ZeroDivisionError`,
-            // `except LookupError` catching `KeyError`/`IndexError`,
-            // `except OSError` catching `FileNotFoundError`).
-            if name == exc.kind || builtin_exc_is_a(&exc.kind, name) {
-                return Ok(true);
-            }
-            // `except KeyError` catching `class MyKeyError(KeyError):` —
-            // the builtin base is recorded on the class (it has no
-            // `Value::Class`), so consult it directly.
-            if let Some(Value::Instance(inst)) = &exc.value {
-                if class_has_builtin_exc_base(&inst.class, name) {
-                    return Ok(true);
-                }
-            }
-            // Otherwise the handler catches what the name is bound to:
-            // `IOError` is `OSError`, and `Alias = ValueError` or
-            // `ERRORS = (KeyError, IndexError)` catch as their targets do. An
-            // unbound name matches by spelling only (above).
-            return match self.eval_expr(type_expr, env) {
-                Ok(target) => Ok(self.exception_matches_value(&target, exc)),
-                Err(_) => Ok(false),
-            };
+            return Ok(name == exc.kind
+                || builtin_exc_is_a(&exc.kind, name)
+                || matches!(&exc.value, Some(Value::Instance(inst))
+                    if class_has_builtin_exc_base(&inst.class, name)));
         }
         // An attribute-qualified class — `except json.JSONDecodeError`,
         // `except asyncio.CancelledError`, `except errors.AppError` — resolves
@@ -9480,11 +9473,19 @@ impl Interpreter {
                     if class_has_builtin_exc_base(&inst.class, name))
         };
         match target {
-            Value::Class(target) => {
+            // A builtin stand-in (what `type(e)` returns) stands for its
+            // builtin name.
+            Value::Class(target) if crate::builtins::is_builtin_type_class(target) => {
                 by_name(&target.name)
-                    || matches!(&exc.value, Some(Value::Instance(inst))
-                        if class_is_subclass(&inst.class, target))
             }
+            // A user class: identity / MRO for an instance; it never catches
+            // a builtin-kind exception. Only an exception that carries no
+            // value falls back to the spelling it was raised under.
+            Value::Class(target) => match &exc.value {
+                Some(Value::Instance(inst)) => class_is_subclass(&inst.class, target),
+                Some(_) => false,
+                None => exc.kind == target.name,
+            },
             Value::Native(nf) => by_name(nf.name),
             Value::Tuple(items) => items
                 .iter()
@@ -13797,6 +13798,83 @@ keyed = {MISSING: 1}[MISSING]
         assert_eq!(get("ident"), "(True, False, True)");
         assert_eq!(get("tname"), "sentinel");
         assert_eq!(get("keyed"), "1");
+    }
+
+    /// An `except` target catches what its name is bound to: a user class
+    /// catches its own instances and subclasses, never a distinct class that
+    /// merely shares its `__name__`; `IOError` is `OSError`; an alias or a
+    /// tuple catches as its members do. Expected values are CPython 3.13's.
+    #[test]
+    fn except_matches_the_bound_class_not_its_name() {
+        let src = r#"
+class Error(Exception):
+    pass
+AErr = Error
+class Error(Exception):
+    pass
+BErr = Error
+
+def catch(raiser, handler):
+    try:
+        raiser()
+    except handler:
+        return "caught"
+    except Exception:
+        return "escaped"
+    return "none"
+
+def raise_a():
+    raise AErr("a")
+def raise_b():
+    raise BErr("b")
+def raise_io():
+    raise IOError("disk")
+def raise_key():
+    raise KeyError("k")
+
+class MyKey(KeyError):
+    pass
+def raise_mykey():
+    raise MyKey("m")
+
+class TimeoutError2(Exception):
+    pass
+UserTimeout = TimeoutError2
+def raise_timeout():
+    raise TimeoutError("t")
+
+Alias = ValueError
+def raise_value():
+    raise ValueError("v")
+
+r = [
+    catch(raise_b, AErr),
+    catch(raise_a, AErr),
+    catch(raise_b, (AErr, KeyError)),
+    catch(raise_io, IOError),
+    catch(raise_io, OSError),
+    catch(raise_mykey, KeyError),
+    catch(raise_mykey, LookupError),
+    catch(raise_timeout, UserTimeout),
+    catch(raise_value, Alias),
+    catch(raise_key, (Alias, LookupError)),
+]
+try:
+    raise_a()
+except Error:
+    last = "wrong"
+except AErr:
+    last = "right"
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        let get = |name: &str| interp.root.get(name).unwrap().py_str();
+        assert_eq!(
+            get("r"),
+            "['escaped', 'caught', 'escaped', 'caught', 'caught', 'caught', 'caught', \
+             'escaped', 'caught', 'caught']"
+        );
+        assert_eq!(get("last"), "right");
     }
 
     /// PEP 747 `TypeForm` and PEP 800 `@disjoint_base` (Python 3.15) are
