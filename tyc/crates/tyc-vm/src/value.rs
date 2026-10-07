@@ -1842,10 +1842,43 @@ pub struct GeneratorState {
 
 /// A lazy generator expression `(elt for … in … if …)`: the comprehension AST
 /// plus one live iterator per `for` clause.
-/// Whether a generator expression is an *async* one (`(x async for x in a)`),
-/// which makes the value an `async_generator` rather than a `generator`.
+/// Whether a generator expression is an *async* one, which makes the value
+/// an `async_generator` rather than a `generator`: it has an `async for`
+/// clause, or an `await` in its element, a filter or an inner iterable
+/// (`(await f(x) for x in xs)`). The outermost iterable runs in the
+/// enclosing scope, so an `await` there does not count.
 pub fn genexpr_is_async(st: &GenExprState) -> bool {
-    st.node.generators.iter().any(|c| c.is_async)
+    use ruff_python_ast::visitor::{self, Visitor};
+    #[derive(Default)]
+    struct AwaitFinder {
+        found: bool,
+    }
+    impl<'a> Visitor<'a> for AwaitFinder {
+        fn visit_expr(&mut self, expr: &'a ruff_python_ast::Expr) {
+            match expr {
+                _ if self.found => {}
+                ruff_python_ast::Expr::Await(_) => self.found = true,
+                // A lambda is its own scope.
+                ruff_python_ast::Expr::Lambda(_) => {}
+                _ => visitor::walk_expr(self, expr),
+            }
+        }
+    }
+    let node = &st.node;
+    if node.generators.iter().any(|c| c.is_async) {
+        return true;
+    }
+    let mut finder = AwaitFinder::default();
+    finder.visit_expr(&node.elt);
+    for (i, c) in node.generators.iter().enumerate() {
+        if i > 0 {
+            finder.visit_expr(&c.iter);
+        }
+        for cond in &c.ifs {
+            finder.visit_expr(cond);
+        }
+    }
+    finder.found
 }
 
 pub struct GenExprState {

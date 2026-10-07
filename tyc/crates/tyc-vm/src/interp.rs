@@ -8810,7 +8810,14 @@ impl Interpreter {
                             ));
                         }
                     }
-                    let aiter = self.force_awaitable(aiter)?;
+                    // Only an async-generator thunk needs materialising; any
+                    // other `__aiter__` result is used as is (CPython never
+                    // calls its `__await__`).
+                    let aiter = if matches!(aiter, Value::Coroutine(_)) {
+                        self.force_awaitable(aiter)?
+                    } else {
+                        aiter
+                    };
                     // An async generator returned from `__aiter__` runs on
                     // the shared generator path; anything else without
                     // `__anext__` is CPython's `TypeError`.

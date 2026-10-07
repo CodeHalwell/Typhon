@@ -15,6 +15,11 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   CPython does (`A = -1; B = auto()` makes `B == 2`); and a
   `from m import *` sends a program with a bare `metaclass=ABCMeta` to
   CPython, since the star import could have rebound the name.
+- **More async-iteration parity.** A generator expression with an `await`
+  in its element or a filter (`(await f(x) for x in xs)`) is an async
+  generator under `tyc run`, as in CPython, so `async for` iterates it; and
+  an `__aiter__` result whose class also defines `__await__` is used as the
+  iterator rather than awaited.
 - **Async generators are not awaitables.** Calling an `async def` that
   contains `yield` yields an async generator under `tyc run`: `await` on it
   and returning one from `__anext__` now raise CPython's `TypeError`

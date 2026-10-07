@@ -910,6 +910,33 @@ async def genexp() -> None:
     mut plain = (x for x in [1])
     trap("sync genexp", lambda: asyncio.run(over(plain)))
 asyncio.run(genexp())
+async def fetch(x: int) -> int:
+    return x * 10
+async def await_genexp() -> None:
+    mut g = (await fetch(x) for x in [1, 2])
+    show(type(g).__name__)
+    async for v in g:
+        show("v", v)
+    mut h = (x for x in [1] if await fetch(x))
+    show(type(h).__name__)
+asyncio.run(await_genexp())
+plain class AwaitableIter:
+    def __init__(self) -> None:
+        self.n = 0
+    def __aiter__(self) -> "AwaitableIter":
+        return self
+    def __await__(self) -> object:
+        show("await called")
+        return iter([])
+    async def __anext__(self) -> int:
+        self.n += 1
+        if self.n > 2:
+            raise StopAsyncIteration
+        return self.n
+async def both_loop() -> None:
+    async for x in AwaitableIter():
+        show("b", x)
+asyncio.run(both_loop())
 async def await_agen() -> None:
     await source()
 trap("await agen", lambda: asyncio.run(await_agen()))
