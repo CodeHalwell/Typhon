@@ -8,6 +8,19 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ### Fixed
 
+- **Generator detection sees every `yield`.** A function whose only
+  `yield` sits in a dict display, an `assert`, an `elif` test, a `del` or
+  assignment target, or a nested `def`'s default is now a generator under
+  `tyc run`: a dict-display yield runs lazily on the VM, and positions it
+  cannot suspend at route the program to CPython. Before, such a function
+  ran as a plain function and raised `yield outside of a generator`.
+- **More `async for` / class-body / flag parity.** `async for` over a dict
+  view, and a sync `__anext__` returning any non-awaitable (a builtin type
+  included), raise CPython's `TypeError`; a `def` after `global f` in a
+  class body binds the global and adds no method; iterating a negative
+  `Flag` value raises `ValueError: -1 is not a positive integer`; and
+  `from abc import ABCMeta as abc` no longer makes `metaclass=abc.ABCMeta`
+  look like the real `ABCMeta` to the pre-run scan.
 - **`enum.Flag` / `enum.IntFlag` under `tyc run`.** The VM now matches
   CPython 3.13 for flag values: `Perm(6)` returns the composite instead of
   raising `ValueError`; `IntFlag` members combine into `<Perm.R|W: 6>`

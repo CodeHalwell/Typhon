@@ -682,6 +682,10 @@ fn unmodelled_attribute_references(
             .metaclass_bare_names
             .iter()
             .any(|name| scan.abc_module_names.contains(name))
+        || scan
+            .metaclass_dotted_roots
+            .iter()
+            .any(|root| scan.abc_meta_names.contains(root))
     {
         missing.insert("a custom metaclass".to_owned());
     }
@@ -827,6 +831,12 @@ struct AttributeScan {
     /// Each bare-name metaclass spelling (`metaclass=ABCMeta`): not the real
     /// class when that name is the `abc` module.
     metaclass_bare_names: Vec<String>,
+    /// Names bound to `abc.ABCMeta` itself (`from abc import ABCMeta as
+    /// abc`): trusted as a bare metaclass, never as the root of a dotted one
+    /// (`metaclass=abc.ABCMeta` is then `ABCMeta.ABCMeta`).
+    abc_meta_names: std::collections::HashSet<String>,
+    /// The root of each dotted metaclass spelling (`abc` for `abc.ABCMeta`).
+    metaclass_dotted_roots: Vec<String>,
     /// Every attribute name the program stores or deletes, directly or by
     /// `setattr` / `delattr` (`*` when the name is not a literal).
     stored_attributes: std::collections::HashSet<String>,
@@ -1083,6 +1093,8 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                         && alias.name.as_str() == "ABCMeta";
                     if !is_abc_meta {
                         self.program_bound.insert(bound.to_owned());
+                    } else {
+                        self.abc_meta_names.insert(bound.to_owned());
                     }
                     if let Some(module) = &modelled_source {
                         if alias.name.as_str() != "*" {
@@ -1130,7 +1142,10 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                         }
                         match &kw.value {
                             ruff_python_ast::Expr::Attribute(a) => {
-                                self.metaclass_attrs.push(a.attr.as_str().to_owned())
+                                self.metaclass_attrs.push(a.attr.as_str().to_owned());
+                                if let Some(root) = expr_root_name(&kw.value) {
+                                    self.metaclass_dotted_roots.push(root.to_owned());
+                                }
                             }
                             ruff_python_ast::Expr::Name(n) => {
                                 self.metaclass_bare_names.push(n.id.as_str().to_owned())
@@ -1495,6 +1510,17 @@ mod tests {
         // A lambda is its own generator scope.
         let lam = "let g = lambda: (yield (yield 1))\nprint(list(g()))\n";
         assert!(scan_source(lam).is_some());
+        // A yield in any statement's expression makes the function a
+        // generator, wherever it sits (an `assert` test, an `elif` test, a
+        // nested `def`'s default).
+        for body in [
+            "    assert (yield 1)",
+            "    if False:\n        pass\n    elif (yield 1):\n        pass",
+            "    def inner(x: object = (yield 1)) -> None:\n        pass",
+        ] {
+            let src = format!("def g() -> object:\n{body}\nprint(list(g()))\n");
+            assert!(scan_source(&src).is_some(), "{src}");
+        }
         // An ordinary generator runs lazily and stays on the VM.
         let lazy = "def g() -> object:\n    mut n = 0\n    while True:\n        yield n\n        n += 1\nprint(next(g()))\n";
         assert_eq!(scan_source(lazy), None);
@@ -1556,6 +1582,11 @@ mod tests {
         let module_alias =
             "import abc as ABCMeta\nplain class W(metaclass=ABCMeta):\n    pass\nprint(W())\n";
         assert!(scan_source(module_alias)
+            .unwrap_or_default()
+            .contains(&"a custom metaclass".to_owned()));
+        // `ABCMeta` imported under the module's name is not `abc.ABCMeta`.
+        let meta_alias = "from abc import ABCMeta as abc\nplain class W(metaclass=abc.ABCMeta):\n    pass\nprint(W())\n";
+        assert!(scan_source(meta_alias)
             .unwrap_or_default()
             .contains(&"a custom metaclass".to_owned()));
         let computed = "import abc\ndef holder() -> object:\n    return abc\nplain class W(metaclass=holder().ABCMeta):\n    pass\nprint(W())\n";

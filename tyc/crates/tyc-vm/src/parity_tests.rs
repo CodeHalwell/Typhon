@@ -623,6 +623,8 @@ class Neg(Flag):
     A = 1
     B = -3
 show(len(Neg.B), Neg.B.value)
+trap("negative iter", lambda: list(Neg.B))
+show(list(Neg), list(Neg.A))
 "#,
     );
 }
@@ -677,6 +679,11 @@ plain class Decl:
     gy = 5
 trap("gx gone", lambda: gx)
 show(gy, hasattr(Decl, "gy"))
+plain class DeclDef:
+    global gx
+    def gx() -> int:
+        return 3
+show(gx(), hasattr(DeclDef, "gx"))
 plain class Gone:
     def f(self) -> int:
         return 1
@@ -826,6 +833,26 @@ plain class TokenAnext:
     def __anext__(self) -> Token:
         return Token()
 trap("instance anext", lambda: asyncio.run(over(TokenAnext())))
+plain class TypeAnext:
+    def __aiter__(self) -> "TypeAnext":
+        return self
+    def __anext__(self) -> object:
+        return int
+trap("type anext", lambda: asyncio.run(over(TypeAnext())))
+plain class SleepAnext:
+    def __init__(self) -> None:
+        self.n = 0
+    def __aiter__(self) -> "SleepAnext":
+        return self
+    def __anext__(self) -> object:
+        self.n += 1
+        if self.n > 2:
+            raise StopAsyncIteration
+        return asyncio.sleep(0, self.n)
+asyncio.run(over(SleepAnext()))
+d = {1: 2}
+for view in (d.keys(), d.values(), d.items()):
+    trap("dict view", lambda: asyncio.run(over(view)))
 async def comp() -> None:
     show("comp", [x async for x in Both()])
 asyncio.run(comp())
@@ -1689,6 +1716,24 @@ lst = [{1}]
 first = lst[0]
 lst[0] -= {1}
 show(repr(lst), first is lst[0])
+"#,
+    );
+}
+
+// ── A `yield` in any expression position makes a generator ───────────────
+
+#[test]
+fn yield_in_a_dict_display_makes_a_generator() {
+    assert_matches_cpython(
+        "yield_in_a_dict_display_makes_a_generator",
+        r#"from typing import Generator
+def g() -> Generator[int, object, None]:
+    show({1: (yield 1)})
+    show({"a": (yield 2)})
+it = g()
+show(next(it))
+show(it.send(5))
+trap("end", lambda: it.send(6))
 "#,
     );
 }

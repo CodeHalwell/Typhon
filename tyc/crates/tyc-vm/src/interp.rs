@@ -1954,6 +1954,11 @@ impl Interpreter {
                     // `obj.greet()` raised `attribute not found`.
                     let declared = f.name.as_str().to_owned();
                     body_ns.set(&declared, v.clone());
+                    // `global f` / `nonlocal f` in the class body sends the
+                    // `def` to the outer binding; the class gains no method.
+                    if body_ns.declared_outer(&declared) {
+                        continue;
+                    }
                     if let Value::Function(func) = &v {
                         if is_property {
                             properties.insert(declared.clone());
@@ -5957,18 +5962,23 @@ impl Interpreter {
     /// non-awaitable operand unchanged, so `await 1` / `await sync_call()`
     /// ran on under `tyc run` and raised after `tyc build`.
     pub fn await_value(&mut self, v: Value) -> Result<Value, Unwind> {
-        match &v {
-            Value::Coroutine(_) => self.force_awaitable(v),
-            Value::Module(m) if m.name == "Task" => self.force_awaitable(v),
-            // An `__await__`-bearing object: driven to its result (see
-            // `force_awaitable`).
-            Value::Instance(inst) if self.find_method(&inst.class, "__await__").is_some() => {
-                self.force_awaitable(v)
-            }
-            other => Err(type_error(format!(
+        if !self.is_awaitable(&v) {
+            return Err(type_error(format!(
                 "object {} can't be used in 'await' expression",
-                await_type_name(other)
-            ))),
+                await_type_name(&v)
+            )));
+        }
+        self.force_awaitable(v)
+    }
+
+    /// CPython's awaitables: a coroutine, a task / future, or an object
+    /// whose type defines `__await__`.
+    pub fn is_awaitable(&self, v: &Value) -> bool {
+        match v {
+            Value::Coroutine(_) => true,
+            Value::Module(m) => m.name == "Task",
+            Value::Instance(inst) => self.find_method(&inst.class, "__await__").is_some(),
+            _ => false,
         }
     }
 
@@ -8690,6 +8700,14 @@ impl Interpreter {
             }
             // Iterating a `Flag` value yields the members it contains.
             Value::Instance(_) if crate::value::flag_member_bits(&v).is_some() => {
+                // CPython's `_iter_bits_lsb` refuses a negative value
+                // (`class F(Flag): A = -1`).
+                if let Some(bits) = crate::value::flag_member_bits(&v).filter(|b| *b < 0) {
+                    return Err(Unwind::Exception(crate::error::VmException::new(
+                        "ValueError",
+                        format!("{bits} is not a positive integer"),
+                    )));
+                }
                 let members = Self::flag_decompose(&v).unwrap_or_default();
                 IterState::List {
                     items: Rc::new(RefCell::new(members)),
@@ -9081,36 +9099,19 @@ impl Interpreter {
             // `StopAsyncIteration` as the end.
             Recurse::AsyncUserIter(obj) => {
                 let step = match self.call_dunder0(&obj, "__anext__") {
-                    // A plain value is not awaitable (a sync `def __anext__`).
-                    Ok(Some(item))
-                        if matches!(
-                            item,
-                            Value::None
-                                | Value::Bool(_)
-                                | Value::Int(_)
-                                | Value::FloatData(_)
-                                | Value::Complex(..)
-                                | Value::Str(_)
-                                | Value::Bytes(_)
-                                | Value::List(_)
-                                | Value::Tuple(_)
-                                | Value::Dict(_)
-                                | Value::Set(_)
-                                | Value::Range { .. }
-                        ) =>
-                    {
+                    // Only a real awaitable may come back (a sync `def
+                    // __anext__` returning a plain value, a builtin type, a
+                    // user instance without `__await__` ... is rejected).
+                    Ok(Some(item)) if !self.is_awaitable(&item) => {
+                        let ty = match &item {
+                            Value::Native(n) if crate::builtins::is_builtin_type_name(n.name) => {
+                                "type".to_owned()
+                            }
+                            Value::Native(_) => "builtin_function_or_method".to_owned(),
+                            other => other.type_display_name().to_string(),
+                        };
                         Err(type_error(format!(
-                            "'async for' received an invalid object from __anext__: {}",
-                            item.type_display_name()
-                        )))
-                    }
-                    // A user instance is awaitable only through `__await__`.
-                    Ok(Some(Value::Instance(inst)))
-                        if self.find_method(&inst.class, "__await__").is_none() =>
-                    {
-                        Err(type_error(format!(
-                            "'async for' received an invalid object from __anext__: {}",
-                            Value::Instance(inst).type_display_name()
+                            "'async for' received an invalid object from __anext__: {ty}"
                         )))
                     }
                     Ok(Some(coro)) => self.force_awaitable(coro),
@@ -12108,6 +12109,7 @@ fn reject_sync_only_async_iterable(v: &Value) -> Result<(), Unwind> {
                 | Value::Dict(_)
                 | Value::Set(_)
                 | Value::Range { .. }
+                | Value::DictView { .. }
         )
     {
         return Err(type_error(format!(
@@ -12411,7 +12413,8 @@ fn value_lazy_ok(e: &Expr) -> bool {
 fn stmt_lazy_ok(s: &Stmt) -> bool {
     use ruff_python_ast::Stmt::*;
     match s {
-        FunctionDef(_) | ClassDef(_) => true,
+        // A yield in a nested `def` / `class` header cannot be resumed.
+        FunctionDef(_) | ClassDef(_) => !stmt_has_yield(s),
         Expr(e) => value_lazy_ok(&e.value),
         Assign(a) => !a.targets.iter().any(expr_has_yield) && value_lazy_ok(&a.value),
         AnnAssign(a) => !expr_has_yield(&a.target) && a.value.as_deref().is_none_or(value_lazy_ok),
@@ -12465,7 +12468,7 @@ fn stmt_lazy_ok(s: &Stmt) -> bool {
         }
         Assert(a) => !expr_has_yield(&a.test) && !a.msg.as_deref().is_some_and(expr_has_yield),
         Delete(d) => !d.targets.iter().any(expr_has_yield),
-        _ => true,
+        _ => !stmt_has_yield(s),
     }
 }
 
@@ -12476,104 +12479,73 @@ fn body_is_generator(body: &[Stmt]) -> bool {
 }
 
 fn stmt_has_yield(s: &Stmt) -> bool {
-    use ruff_python_ast::Stmt::*;
-    match s {
-        // Nested function / class scopes own their own yields.
-        FunctionDef(_) | ClassDef(_) => false,
-        Expr(e) => expr_has_yield(&e.value),
-        Return(r) => r.value.as_deref().is_some_and(expr_has_yield),
-        Assign(a) => expr_has_yield(&a.value),
-        AugAssign(a) => expr_has_yield(&a.value),
-        AnnAssign(a) => a.value.as_deref().is_some_and(expr_has_yield),
-        If(x) => {
-            expr_has_yield(&x.test)
-                || body_is_generator(&x.body)
-                || x.elif_else_clauses
-                    .iter()
-                    .any(|c| body_is_generator(&c.body))
-        }
-        While(x) => {
-            expr_has_yield(&x.test) || body_is_generator(&x.body) || body_is_generator(&x.orelse)
-        }
-        For(x) => {
-            expr_has_yield(&x.iter) || body_is_generator(&x.body) || body_is_generator(&x.orelse)
-        }
-        With(x) => {
-            x.items.iter().any(|i| expr_has_yield(&i.context_expr)) || body_is_generator(&x.body)
-        }
-        Match(x) => {
-            expr_has_yield(&x.subject) || x.cases.iter().any(|c| body_is_generator(&c.body))
-        }
-        Try(x) => {
-            body_is_generator(&x.body)
-                || x.handlers.iter().any(|h| {
-                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
-                    body_is_generator(&h.body)
-                })
-                || body_is_generator(&x.orelse)
-                || body_is_generator(&x.finalbody)
-        }
-        _ => false,
-    }
+    let mut finder = YieldFinder::default();
+    ruff_python_ast::visitor::Visitor::visit_stmt(&mut finder, s);
+    finder.found
 }
 
 fn expr_has_yield(e: &Expr) -> bool {
-    use ruff_python_ast::Expr::*;
-    match e {
-        Yield(_) | YieldFrom(_) => true,
-        // A lambda is its own scope — its (rare) yields aren't ours.
-        Lambda(_) => false,
-        BoolOp(x) => x.values.iter().any(expr_has_yield),
-        BinOp(x) => expr_has_yield(&x.left) || expr_has_yield(&x.right),
-        UnaryOp(x) => expr_has_yield(&x.operand),
-        Compare(x) => expr_has_yield(&x.left) || x.comparators.iter().any(expr_has_yield),
-        Call(x) => {
-            expr_has_yield(&x.func)
-                || x.arguments.args.iter().any(expr_has_yield)
-                || x.arguments
-                    .keywords
-                    .iter()
-                    .any(|k| expr_has_yield(&k.value))
+    let mut finder = YieldFinder::default();
+    ruff_python_ast::visitor::Visitor::visit_expr(&mut finder, e);
+    finder.found
+}
+
+/// Finds a `yield` / `yield from` belonging to the current function scope,
+/// in any expression position of any statement (an `assert` test, a `del`
+/// or assignment target, an `except` type, a `match` guard, ...). A nested
+/// `def` / `class` / lambda owns the yields in its body; only its header
+/// (decorators, defaults, bases), which runs in the enclosing scope, is ours.
+#[derive(Default)]
+struct YieldFinder {
+    found: bool,
+}
+
+impl<'a> ruff_python_ast::visitor::Visitor<'a> for YieldFinder {
+    fn visit_stmt(&mut self, stmt: &'a Stmt) {
+        if self.found {
+            return;
         }
-        Tuple(x) => x.elts.iter().any(expr_has_yield),
-        List(x) => x.elts.iter().any(expr_has_yield),
-        Set(x) => x.elts.iter().any(expr_has_yield),
-        Starred(x) => expr_has_yield(&x.value),
-        If(x) => expr_has_yield(&x.test) || expr_has_yield(&x.body) || expr_has_yield(&x.orelse),
-        Named(x) => expr_has_yield(&x.value),
-        Await(x) => expr_has_yield(&x.value),
-        Subscript(x) => expr_has_yield(&x.value) || expr_has_yield(&x.slice),
-        Attribute(x) => expr_has_yield(&x.value),
-        // Comprehensions: only the outermost iterable runs in the enclosing
-        // scope, so a `yield` there belongs to us. (Yields elsewhere in a
-        // comprehension are a SyntaxError, so scanning them is harmless.)
-        ListComp(x) => comprehension_has_yield(&x.generators) || expr_has_yield(&x.elt),
-        SetComp(x) => comprehension_has_yield(&x.generators) || expr_has_yield(&x.elt),
-        Generator(x) => comprehension_has_yield(&x.generators) || expr_has_yield(&x.elt),
-        DictComp(x) => {
-            comprehension_has_yield(&x.generators)
-                || x.key.as_deref().is_some_and(expr_has_yield)
-                || expr_has_yield(&x.value)
+        match stmt {
+            Stmt::FunctionDef(f) => {
+                for d in &f.decorator_list {
+                    self.visit_expr(&d.expression);
+                }
+                for p in f.parameters.iter_non_variadic_params() {
+                    if let Some(d) = p.default() {
+                        self.visit_expr(d);
+                    }
+                }
+            }
+            Stmt::ClassDef(c) => {
+                for d in &c.decorator_list {
+                    self.visit_expr(&d.expression);
+                }
+                if let Some(args) = &c.arguments {
+                    self.visit_arguments(args);
+                }
+            }
+            _ => ruff_python_ast::visitor::walk_stmt(self, stmt),
         }
-        FString(x) => fstring_has_yield(x),
-        _ => false,
     }
-}
 
-fn comprehension_has_yield(generators: &[ast::Comprehension]) -> bool {
-    generators
-        .iter()
-        .any(|g| expr_has_yield(&g.iter) || g.ifs.iter().any(expr_has_yield))
-}
-
-fn fstring_has_yield(f: &ast::ExprFString) -> bool {
-    f.value.iter().any(|part| match part {
-        FStringPart::Literal(_) => false,
-        FStringPart::FString(fs) => fs.elements.iter().any(|el| match el {
-            InterpolatedStringElement::Literal(_) => false,
-            InterpolatedStringElement::Interpolation(interp) => expr_has_yield(&interp.expression),
-        }),
-    })
+    fn visit_expr(&mut self, expr: &'a Expr) {
+        if self.found {
+            return;
+        }
+        match expr {
+            Expr::Yield(_) | Expr::YieldFrom(_) => self.found = true,
+            Expr::Lambda(l) => {
+                if let Some(params) = &l.parameters {
+                    for p in params.iter_non_variadic_params() {
+                        if let Some(d) = p.default() {
+                            self.visit_expr(d);
+                        }
+                    }
+                }
+            }
+            _ => ruff_python_ast::visitor::walk_expr(self, expr),
+        }
+    }
 }
 
 /// Enforce that `__str__` / `__repr__` returned a `str` (CPython raises
