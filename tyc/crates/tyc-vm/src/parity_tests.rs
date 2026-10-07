@@ -643,8 +643,10 @@ trap("class body", class_del)
 plain class Kept:
     a = 1
     b = 2
+    c = 3
     del a
-show(hasattr(Kept, "a"), Kept.b)
+    del (b, c)
+show(hasattr(Kept, "a"), hasattr(Kept, "b"), hasattr(Kept, "c"))
 def nested() -> object:
     x = 1
     def mid() -> object:
@@ -673,6 +675,9 @@ show(b"abc".translate(None), b"abc".translate(t, delete=b"a"))
 trap("short", lambda: b"x".translate(b"short"))
 trap("uneven", lambda: bytes.maketrans(b"ab", b"x"))
 trap("extra", lambda: b"x".translate(None, b"", b"extra"))
+trap("int table", lambda: bytes.maketrans(97, 98))
+trap("int delete", lambda: b"x".translate(None, 120))
+trap("int translate", lambda: b"x".translate(5))
 "#,
     );
 }
@@ -716,6 +721,27 @@ def sync_for() -> None:
         show(x)
 trap("sync for", sync_for)
 trap("sync list", lambda: list(Ticker(1)))
+plain class ListAiter:
+    def __aiter__(self) -> object:
+        return [1, 2]
+plain class Both:
+    def __init__(self) -> None:
+        self.done = False
+    def __iter__(self) -> object:
+        return iter(["sync"])
+    def __aiter__(self) -> "Both":
+        return self
+    async def __anext__(self) -> str:
+        if self.done:
+            raise StopAsyncIteration
+        self.done = True
+        return "async"
+async def odd() -> None:
+    async for b in Both():
+        show("both", b)
+    async for x in ListAiter():
+        show("list", x)
+trap("aiter list", lambda: asyncio.run(odd()))
 "#,
     );
 }

@@ -2008,10 +2008,18 @@ impl Interpreter {
                 // `NameError`, as in CPython's class namespace.
                 Stmt::Delete(d) => {
                     self.exec_delete(d, &body_ns)?;
-                    for t in &d.targets {
-                        if let Expr::Name(n) = t {
-                            class_attrs.remove(n.id.as_str());
+                    fn unbind(t: &Expr, attrs: &mut HashMap<String, Value>) {
+                        match t {
+                            Expr::Name(n) => {
+                                attrs.remove(n.id.as_str());
+                            }
+                            Expr::Tuple(t) => t.elts.iter().for_each(|e| unbind(e, attrs)),
+                            Expr::List(l) => l.elts.iter().for_each(|e| unbind(e, attrs)),
+                            _ => {}
                         }
+                    }
+                    for t in &d.targets {
+                        unbind(t, &mut class_attrs);
                     }
                 }
                 Stmt::Pass(_) => {}
@@ -8601,10 +8609,8 @@ impl Interpreter {
                 // `async for x in obj:` — the async iteration protocol.
                 // Async generators share the sync loop's path, but a
                 // *hand-written* async iterator defines `__aiter__` /
-                // `__anext__` and has no `__iter__` at all, so it has to be
-                // recognised here.
+                // `__anext__`, which `async for` prefers over any `__iter__`.
                 if std::mem::take(&mut self.async_iteration)
-                    && self.find_method(&inst.class, "__iter__").is_none()
                     && self.find_method(&inst.class, "__aiter__").is_some()
                 {
                     let aiter = match self.find_method(&inst.class, "__aiter__") {
@@ -8619,11 +8625,19 @@ impl Interpreter {
                         None => v.clone(),
                     };
                     let aiter = self.force_awaitable(aiter)?;
-                    let Value::Instance(target) = &aiter else {
+                    // An async generator returned from `__aiter__` runs on
+                    // the shared generator path; anything else without
+                    // `__anext__` is CPython's `TypeError`.
+                    if as_generator(&aiter).is_some() {
                         return self.make_iter(aiter);
-                    };
-                    if self.find_method(&target.class, "__anext__").is_none() {
-                        return self.make_iter(aiter.clone());
+                    }
+                    let has_anext = matches!(&aiter, Value::Instance(target)
+                        if self.find_method(&target.class, "__anext__").is_some());
+                    if !has_anext {
+                        return Err(type_error(format!(
+                            "'async for' received an object from __aiter__ that does not implement __anext__: {}",
+                            aiter.type_display_name()
+                        )));
                     }
                     // Step it lazily: each `__anext__` runs just before the
                     // loop body that consumes its item, as in CPython.

@@ -679,7 +679,9 @@ fn unmodelled_attribute_references(
         missing.insert("a custom metaclass".to_owned());
     }
     for attr in UNMODELLED_ATTRIBUTES {
-        if scan.attribute_names.contains(*attr) && !scan.shadowed.contains(*attr) {
+        // Only a method the program defines can stand behind `x.attr`; a
+        // bare name bound elsewhere says nothing about the receiver.
+        if scan.attribute_names.contains(*attr) && !scan.function_names.contains(*attr) {
             missing.insert(format!(".{attr}"));
         }
     }
@@ -800,6 +802,8 @@ struct AttributeScan {
     /// Class-level features the VM ignores: a custom `metaclass=` and a
     /// `__del__` finaliser.
     class_features: std::collections::BTreeSet<String>,
+    /// Names of every `def` in the program.
+    function_names: std::collections::HashSet<String>,
     /// Names bound to something other than the builtin `type`, the `abc`
     /// module or `abc.ABCMeta`: by `def`, `class`, assignment, or an import
     /// from anywhere else.
@@ -992,6 +996,7 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
             Stmt::FunctionDef(f) => {
                 self.shadowed.insert(f.name.as_str().to_owned());
                 self.program_bound.insert(f.name.as_str().to_owned());
+                self.function_names.insert(f.name.as_str().to_owned());
             }
             Stmt::ClassDef(c) => {
                 self.shadowed.insert(c.name.as_str().to_owned());
@@ -1018,7 +1023,16 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                 }
                 // The VM never runs finalisers.
                 // `def __del__` or a class-level `__del__ = fn` binding.
-                let is_del = |e: &ruff_python_ast::Expr| matches!(e, ruff_python_ast::Expr::Name(n) if n.id.as_str() == "__del__");
+                fn is_del(e: &ruff_python_ast::Expr) -> bool {
+                    use ruff_python_ast::Expr;
+                    match e {
+                        Expr::Name(n) => n.id.as_str() == "__del__",
+                        Expr::Tuple(t) => t.elts.iter().any(is_del),
+                        Expr::List(l) => l.elts.iter().any(is_del),
+                        Expr::Starred(s) => is_del(&s.value),
+                        _ => false,
+                    }
+                }
                 let has_del = c.body.iter().any(|st| match st {
                     Stmt::FunctionDef(f) => f.name.as_str() == "__del__",
                     Stmt::Assign(a) => a.targets.iter().any(is_del),
@@ -1408,6 +1422,11 @@ mod tests {
             scan_source(fin),
             Some(vec!["a `__del__` finaliser".to_owned()])
         );
+        let destructured = "def bye(self: object) -> None:\n    print(\"bye\")\nplain class F:\n    __del__, marker = (bye, 1)\nprint(F())\n";
+        assert_eq!(
+            scan_source(destructured),
+            Some(vec!["a `__del__` finaliser".to_owned()])
+        );
         let assigned = "def bye(self: object) -> None:\n    print(\"bye\")\nplain class E:\n    __del__ = bye\nprint(E())\n";
         assert_eq!(
             scan_source(assigned),
@@ -1415,6 +1434,9 @@ mod tests {
         );
         let tb = "try:\n    raise ValueError(\"x\")\nexcept ValueError as e:\n    print(e.__traceback__)\n";
         assert_eq!(scan_source(tb), Some(vec![".__traceback__".to_owned()]));
+        // A bare name does not hide the attribute.
+        let bare = "let __traceback__ = 1\ntry:\n    raise ValueError(\"x\")\nexcept ValueError as e:\n    print(e.__traceback__, __traceback__)\n";
+        assert_eq!(scan_source(bare), Some(vec![".__traceback__".to_owned()]));
     }
 
     #[test]

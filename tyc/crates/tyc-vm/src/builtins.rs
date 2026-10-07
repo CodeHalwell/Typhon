@@ -10055,7 +10055,7 @@ pub fn bytes_maketrans(args: &[Value]) -> Result<Value, Unwind> {
             args.len()
         )));
     };
-    let (from, to) = (bytes_arg(from)?, bytes_arg(to)?);
+    let (from, to) = (bytes_like_arg(from)?, bytes_like_arg(to)?);
     if from.len() != to.len() {
         return Err(value_error("maketrans arguments must have same length"));
     }
@@ -11216,7 +11216,7 @@ fn bytes_method(
                 }
                 Some(Value::None) => None,
                 Some(v) => {
-                    let t = bytes_arg(v)?;
+                    let t = bytes_like_arg(v)?;
                     if t.len() != 256 {
                         return Err(value_error("translation table must be 256 characters long"));
                     }
@@ -11224,7 +11224,7 @@ fn bytes_method(
                 }
             };
             let delete = match args.get(1) {
-                Some(v) => bytes_arg(v)?,
+                Some(v) => bytes_like_arg(v)?,
                 None => Vec::new(),
             };
             let out: Vec<u8> = b
@@ -11502,6 +11502,18 @@ pub(crate) fn is_attribute_error_unwind(u: &Unwind) -> bool {
 
 fn is_attribute_error(u: &Unwind) -> bool {
     matches!(u, Unwind::Exception(e) if e.kind == "AttributeError")
+}
+
+/// [`bytes_arg`] without its scalar-int coercion: `bytes.maketrans` and
+/// `bytes.translate` take only bytes-like values.
+fn bytes_like_arg(v: &Value) -> Result<Vec<u8>, Unwind> {
+    if matches!(v, Value::Int(_) | Value::Bool(_)) {
+        return Err(type_error(format!(
+            "a bytes-like object is required, not '{}'",
+            v.type_display_name()
+        )));
+    }
+    bytes_arg(v)
 }
 
 fn bytes_arg(v: &Value) -> Result<Vec<u8>, Unwind> {
