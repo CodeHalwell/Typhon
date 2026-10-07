@@ -599,6 +599,56 @@ trap("strict", lambda: C(8))
     );
 }
 
+// ── `del` targets and scopes ──────────────────────────────────────────────
+
+#[test]
+fn del_targets_and_scopes_match_cpython() {
+    assert_matches_cpython(
+        "del_targets_and_scopes_match_cpython",
+        r#"g = 1
+def drop_global() -> None:
+    global g
+    del g
+def drop_twice() -> None:
+    c = 3
+    del c
+    del c
+def outer() -> object:
+    n = 1
+    def inner() -> None:
+        nonlocal n
+        del n
+    inner()
+    return "n" in dir()
+mut xs = [1, 2, 3, 4]
+mut d = {"k": 1, "j": 2}
+a, b = 1, 2
+del (a, b), [xs[0], d["k"]]
+show("a" in dir(), "b" in dir(), xs, d)
+drop_global()
+show("g" in dir())
+trap("again", drop_global)
+trap("twice", drop_twice)
+trap("nonlocal", outer)
+"#,
+    );
+}
+
+// ── bytes.translate / bytes.maketrans ─────────────────────────────────────
+
+#[test]
+fn bytes_translate_matches_cpython() {
+    assert_matches_cpython(
+        "bytes_translate_matches_cpython",
+        r#"t = bytes.maketrans(b"ab", b"xy")
+show(len(t), t[97], b"aabbc".translate(t), b"abc".translate(None, b"b"), b"abcab".translate(t, b"c"))
+show(b"abc".translate(None), b"abc".translate(t, delete=b"a"))
+trap("short", lambda: b"x".translate(b"short"))
+trap("uneven", lambda: bytes.maketrans(b"ab", b"x"))
+"#,
+    );
+}
+
 // ── W5-11: changing a dict or set while iterating it ──────────────────────
 
 #[test]

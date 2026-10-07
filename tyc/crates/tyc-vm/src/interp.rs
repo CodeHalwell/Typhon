@@ -1434,24 +1434,59 @@ impl Interpreter {
     /// `del target, …`.
     fn exec_delete(&mut self, d: &ast::StmtDelete, env: &EnvRef) -> Result<(), Unwind> {
         for t in &d.targets {
-            match t {
-                Expr::Name(n) => {
-                    env.delete(n.id.as_str());
+            self.delete_target(t, env)?;
+        }
+        Ok(())
+    }
+
+    /// One `del` target; a tuple or list target deletes each element in
+    /// turn (`del (a, b)`, `del [xs[0], d["k"]]`).
+    fn delete_target(&mut self, t: &Expr, env: &EnvRef) -> Result<(), Unwind> {
+        match t {
+            Expr::Name(n) => {
+                let name = n.id.as_str();
+                if !env.delete(name) {
+                    return Err(match env.delete_scope(name) {
+                        crate::env::DeleteScope::Global => {
+                            name_error(format!("name '{name}' is not defined"))
+                        }
+                        crate::env::DeleteScope::Local => Unwind::Exception(VmException::new(
+                            "UnboundLocalError",
+                            format!(
+                                "cannot access local variable '{name}' where it is not \
+                                     associated with a value"
+                            ),
+                        )),
+                        crate::env::DeleteScope::Free => name_error(format!(
+                            "cannot access free variable '{name}' where it is not \
+                                 associated with a value in enclosing scope"
+                        )),
+                    });
                 }
-                Expr::Subscript(sub) => {
-                    let target = self.eval_expr(&sub.value, env)?;
-                    // Slice-aware: `del lst[i:j]` evaluates the slice
-                    // to the `__slice__` marker `del_subscript` handles.
-                    let key = self.eval_subscript_index(&sub.slice, env)?;
-                    self.del_subscript(&target, &key)?;
-                }
-                // `del obj.attr` removes an instance attribute.
-                Expr::Attribute(a) => {
-                    let recv = self.eval_expr(&a.value, env)?;
-                    self.del_attr(&recv, a.attr.as_str())?;
-                }
-                _ => return Err(not_implemented("complex delete targets")),
             }
+            Expr::Tuple(tup) => {
+                for e in &tup.elts {
+                    self.delete_target(e, env)?;
+                }
+            }
+            Expr::List(list) => {
+                for e in &list.elts {
+                    self.delete_target(e, env)?;
+                }
+            }
+            Expr::Subscript(sub) => {
+                let target = self.eval_expr(&sub.value, env)?;
+                // Slice-aware: `del lst[i:j]` evaluates the slice
+                // to the `__slice__` marker `del_subscript` handles.
+                let key = self.eval_subscript_index(&sub.slice, env)?;
+                self.del_subscript(&target, &key)?;
+            }
+            // `del obj.attr` removes an instance attribute.
+            Expr::Attribute(a) => {
+                let recv = self.eval_expr(&a.value, env)?;
+                self.del_attr(&recv, a.attr.as_str())?;
+            }
+            _ => return Err(not_implemented("complex delete targets")),
         }
         Ok(())
     }
@@ -7742,6 +7777,11 @@ impl Interpreter {
                     crate::builtins::str_maketrans(&args)
                 })),
             )),
+            Value::Native(nf) if nf.name == "bytes" && attr == "maketrans" => Ok(Value::Native(
+                Rc::new(NativeFn::new("bytes.maketrans", |_interp, args| {
+                    crate::builtins::bytes_maketrans(&args)
+                })),
+            )),
             // Unbound builtin-type methods: `str.strip(x)`, `list.append(xs, v)`,
             // `dict.get(d, k)`. The type constructors are registered as natives
             // named after the type; accessing a method on one yields a function
@@ -10562,6 +10602,12 @@ fn builtin_type_method(ty: &'static str, attr: &str) -> Option<Value> {
                 |_i, args| crate::builtins::str_maketrans(&args),
             ))))
         }
+        ("bytes", "maketrans") => {
+            return Some(Value::Native(Rc::new(NativeFn::new(
+                "maketrans",
+                |_i, args| crate::builtins::bytes_maketrans(&args),
+            ))))
+        }
         _ => {}
     }
     let probe = match ty {
@@ -10962,6 +11008,7 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                 | "rjust"
                 | "rpartition"
                 | "swapcase"
+                | "translate"
                 | "title"
                 | "zfill"
         ),

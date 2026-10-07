@@ -10048,6 +10048,26 @@ pub fn dict_fromkeys(interp: &mut Interpreter, args: Vec<Value>) -> Result<Value
 /// and `y` map char-by-char, and an optional `z` lists characters mapped
 /// to `None` (deleted). A staticmethod on the `str` type object, so
 /// `interp.rs` intercepts it the same way as `dict.fromkeys`.
+/// `bytes.maketrans(from, to)` — the 256-byte table `bytes.translate` takes,
+/// mapping each byte of `from` to the byte at the same index of `to`.
+pub fn bytes_maketrans(args: &[Value]) -> Result<Value, Unwind> {
+    let [from, to] = args else {
+        return Err(type_error(format!(
+            "maketrans expected 2 arguments, got {}",
+            args.len()
+        )));
+    };
+    let (from, to) = (bytes_arg(from)?, bytes_arg(to)?);
+    if from.len() != to.len() {
+        return Err(value_error("maketrans arguments must have same length"));
+    }
+    let mut table: Vec<u8> = (0..=255u8).collect();
+    for (f, t) in from.iter().zip(to.iter()) {
+        table[*f as usize] = *t;
+    }
+    Ok(Value::Bytes(Rc::new(table)))
+}
+
 pub fn str_maketrans(args: &[Value]) -> Result<Value, Unwind> {
     let as_str = |v: &Value| -> Result<String, Unwind> {
         match v {
@@ -11180,6 +11200,35 @@ fn bytes_method(
                 out.extend_from_slice(if signed { &b[1..] } else { b });
                 Value::Bytes(Rc::new(out))
             }
+        }
+        // `.translate(table, delete=b"")` — drop the `delete` bytes, then map
+        // each remaining byte through the 256-byte `table` (`None` keeps it).
+        "translate" => {
+            let table = match args.first() {
+                None => {
+                    return Err(type_error(
+                        "translate() takes at least 1 argument (0 given)",
+                    ))
+                }
+                Some(Value::None) => None,
+                Some(v) => {
+                    let t = bytes_arg(v)?;
+                    if t.len() != 256 {
+                        return Err(value_error("translation table must be 256 characters long"));
+                    }
+                    Some(t)
+                }
+            };
+            let delete = match args.get(1) {
+                Some(v) => bytes_arg(v)?,
+                None => Vec::new(),
+            };
+            let out: Vec<u8> = b
+                .iter()
+                .filter(|byte| !delete.contains(byte))
+                .map(|&byte| table.as_ref().map_or(byte, |t| t[byte as usize]))
+                .collect();
+            Value::Bytes(Rc::new(out))
         }
         "removeprefix" => {
             let p = bytes_arg(single(args, "removeprefix")?)?;

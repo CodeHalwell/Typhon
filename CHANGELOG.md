@@ -18,6 +18,14 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   cached so `(A | B) is (B | A)`; a `Flag` given an undeclared bit raises
   CPython's `invalid value` error while an `IntFlag` keeps it; and
   `auto()` after a multi-bit member picks the next free bit.
+- **`del` under `tyc run`.** `del (a, b)` and `del [xs[0], d["k"]]` work
+  instead of raising `NotImplementedError`; `del` honours `global` and
+  `nonlocal` declarations; and deleting an unbound name raises `NameError`
+  (module scope) or `UnboundLocalError` (function scope) as CPython does,
+  where the VM used to do nothing.
+- **`bytes.translate` and `bytes.maketrans` under `tyc run`.** Both were
+  missing, so a program using them failed with `AttributeError` in the VM
+  but ran on CPython.
 
 ## 1.0.0-beta.2 — 2026-10-04 — first published beta: Windows build fix
 

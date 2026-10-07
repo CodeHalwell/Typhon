@@ -32,6 +32,13 @@ use crate::value::Value;
 
 pub type EnvRef = Rc<Env>;
 
+/// See [`Env::delete_scope`].
+pub enum DeleteScope {
+    Global,
+    Local,
+    Free,
+}
+
 pub struct Env {
     bindings: RefCell<HashMap<String, Value>>,
     /// Names declared `global NAME` in this function — assigns reach to module scope.
@@ -240,7 +247,42 @@ impl Env {
         self.assign_or_create(n.id.as_str(), value);
     }
 
+    /// Unbind `name` (`del name`), honouring `global` / `nonlocal`
+    /// declarations the way [`Env::set`] does. Returns whether it was bound.
     pub fn delete(&self, name: &str) -> bool {
+        if self.globals.borrow().contains(name) {
+            return self.module_scope().delete_here(name);
+        }
+        if self.nonlocals.borrow().contains(name) {
+            let mut cur = self.parent.clone();
+            while let Some(env) = cur {
+                if env.delete_here(name) {
+                    return true;
+                }
+                cur = env.parent.clone();
+            }
+            return false;
+        }
+        self.delete_here(name)
+    }
+
+    /// Which kind of scope a `del` of `name` resolves in, for the error an
+    /// unbound name raises: a declared global or a module-level name gives
+    /// `NameError`, a function local `UnboundLocalError`, a `nonlocal` the
+    /// free-variable `NameError`.
+    pub fn delete_scope(&self, name: &str) -> DeleteScope {
+        if self.nonlocals.borrow().contains(name) {
+            DeleteScope::Free
+        } else if self.globals.borrow().contains(name)
+            || std::ptr::eq(self, Rc::as_ptr(&self.module_scope()))
+        {
+            DeleteScope::Global
+        } else {
+            DeleteScope::Local
+        }
+    }
+
+    fn delete_here(&self, name: &str) -> bool {
         if let Some(info) = &self.slot_info {
             if let Some(k) = info.slot_of_name(name) {
                 let mut slots = self.slots.borrow_mut();
