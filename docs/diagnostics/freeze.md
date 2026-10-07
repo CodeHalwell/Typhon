@@ -6,7 +6,9 @@ helper that recursively replaces every mutable container in the
 tree with an immutable equivalent — `list → tuple`, `dict →
 MappingProxyType`, `set → frozenset`. The binding itself is `let`
 (so it cannot be reassigned) and the value cannot be mutated
-through any reference.
+through any reference. On a 3.15+ `[python] target` a `dict`
+becomes a builtin `frozendict` (PEP 814) instead, which is also
+hashable and picklable.
 
 ## Example
 
@@ -65,7 +67,8 @@ host language to support it.
   builtin `frozendict` (descended into for nested values where
   applicable)
 - **Mutable containers** — `list → tuple`, `dict →
-  MappingProxyType`, `set → frozenset` (recursively)
+  MappingProxyType` (`frozendict` on a 3.15+ target), `set →
+  frozenset` (recursively)
 - **Frozen dataclasses** — passed through unchanged (their
   field-level frozenness already prevents reassignment)
 

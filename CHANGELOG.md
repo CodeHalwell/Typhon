@@ -55,6 +55,13 @@ run.
   remain `tyc::lazy_usage` errors on every target; CPython 3.15 rejects
   them too. `tyc check` and `tyc run` treat the import as an ordinary
   from-import.
+- **`freeze let` makes a dict a `frozendict` on 3.15 targets.** With
+  `[python] target` 3.15 or later, a frozen `dict` is now CPython 3.15's
+  builtin `frozendict` (PEP 814) rather than a `MappingProxyType` view, so
+  it is genuinely immutable, hashable and picklable. This changes the
+  `repr` and `type` of frozen dicts in existing 3.15-target programs;
+  3.13 and 3.14 targets, and the generated runtime they get, are
+  unchanged. `tyc run` follows the target too.
 - **TypedDict `extra_items` (PEP 728).** A dict literal checked against
   `class T(TypedDict, extra_items=V)` may carry undeclared keys whose
   values are `V`s; other undeclared keys are still rejected.

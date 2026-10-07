@@ -3497,11 +3497,44 @@ fn generated_runtime_files(config: &TyphonConfig) -> Vec<(&'static str, String)>
         ("stdlib.py", TYPHON_RUNTIME_STDLIB_PY.to_owned()),
         ("result.py", TYPHON_RUNTIME_RESULT_PY.to_owned()),
         ("parallel.py", parallel_py),
-        ("freeze.py", TYPHON_RUNTIME_FREEZE_PY.to_owned()),
+        ("freeze.py", typhon_runtime_freeze_py(config)),
         ("cast.py", TYPHON_RUNTIME_CAST_PY.to_owned()),
         ("traceback.py", TYPHON_RUNTIME_TRACEBACK_PY.to_owned()),
     ]
 }
+
+/// `freeze.py` for the project's target. On a 3.15+ `[python] target` a
+/// frozen `dict` becomes the builtin `frozendict` (PEP 814) — immutable,
+/// hashable and picklable — instead of a read-only `MappingProxyType`
+/// view; older targets get [`TYPHON_RUNTIME_FREEZE_PY`] unchanged.
+fn typhon_runtime_freeze_py(config: &TyphonConfig) -> String {
+    let native_frozendict = crate::config::parse_python_target(&config.python.target)
+        .is_some_and(|major_minor| major_minor >= (3, 15));
+    if !native_frozendict {
+        return TYPHON_RUNTIME_FREEZE_PY.to_owned();
+    }
+    TYPHON_RUNTIME_FREEZE_PY
+        .replacen(
+            FREEZE_DICT_BRANCH,
+            &FREEZE_DICT_BRANCH.replacen(
+                "MappingProxyType(",
+                "(_frozendict or MappingProxyType)(",
+                1,
+            ),
+            1,
+        )
+        .replacen(
+            "`dict → MappingProxyType`,\n    `set → frozenset`.",
+            "`dict → frozendict`,\n    `set → frozenset`.",
+            1,
+        )
+}
+
+/// The `dict` arm of [`TYPHON_RUNTIME_FREEZE_PY`]'s `_deep_freeze`.
+const FREEZE_DICT_BRANCH: &str = "    if isinstance(value, dict):
+        seen.add(value_id)
+        try:
+            return MappingProxyType(";
 
 /// Generated `typhon_runtime/__init__.py` — exposes `Ok`/`Err`/`Result` plus
 /// the `tasks` and `lazy` submodules at the package root.
@@ -6567,6 +6600,59 @@ except TypeError as e:
     assert 'cycle' in str(e), e
 else:
     raise AssertionError('cycle through a frozendict was not rejected')
+print('ok')
+";
+        let out = std::process::Command::new("python3.15")
+            .args([
+                "-I",
+                "-c",
+                &format!("import sys; sys.path.insert(0, '.')\n{script}"),
+            ])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "ok",
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// On a 3.15+ target `freeze let` turns a dict into a builtin
+    /// `frozendict`; older targets keep the `MappingProxyType` runtime
+    /// byte for byte.
+    #[test]
+    fn runtime_deep_freeze_makes_frozendicts_on_3_15_targets() {
+        let mut config = TyphonConfig::default();
+        config.python.target = "3.13".to_owned();
+        assert_eq!(typhon_runtime_freeze_py(&config), TYPHON_RUNTIME_FREEZE_PY);
+        config.python.target = "3.15".to_owned();
+        let freeze_py = typhon_runtime_freeze_py(&config);
+        assert!(
+            freeze_py
+                .contains("return (_frozendict or MappingProxyType)({k: _deep_freeze(v, seen)"),
+            "the dict arm was not rewritten:\n{freeze_py}"
+        );
+        let have_py315 = std::process::Command::new("python3.15")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !have_py315 {
+            if std::env::var_os("TYC_REQUIRE_PYTHON315").is_some() {
+                panic!("TYC_REQUIRE_PYTHON315 is set but python3.15 is not on PATH");
+            }
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("freeze.py"), freeze_py).unwrap();
+        let script = "\
+from freeze import deep_freeze
+r = deep_freeze({'a': [1, {'b': 2}], 'c': {3}})
+assert type(r) is frozendict, type(r)
+assert type(r['a'][1]) is frozendict, type(r['a'][1])
+assert r == frozendict(a=(1, frozendict(b=2)), c=frozenset({3})), r
+assert hash(deep_freeze({'x': 1})) == hash(frozendict(x=1))
 print('ok')
 ";
         let out = std::process::Command::new("python3.15")

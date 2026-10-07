@@ -49,6 +49,25 @@ pub use value::Value;
 
 use tyc_syntax::preprocess;
 
+/// The project's `[python] target` minor version (the major is 3). `tyc run`
+/// sets it before running; it decides the few behaviours that differ by
+/// target, such as `freeze let` making a dict a `frozendict` on 3.15+.
+static PYTHON_TARGET_MINOR: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(13);
+
+/// Set the `[python] target` the VM runs as (default 3.13). Process-wide.
+pub fn set_python_target(major: u8, minor: u8) {
+    let minor = if major > 3 { u8::MAX } else { minor };
+    PYTHON_TARGET_MINOR.store(minor, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The `[python] target` set by [`set_python_target`].
+pub(crate) fn python_target() -> (u8, u8) {
+    (
+        3,
+        PYTHON_TARGET_MINOR.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Run a Typhon source file with the VM. `script_args` populates `sys.argv`
 /// after the script path. Returns the process exit code that `tyc run`
 /// should propagate.

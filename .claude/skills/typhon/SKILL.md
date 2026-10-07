@@ -557,7 +557,7 @@ freeze let CONFIG = {"port": 8080, "hosts": ["a", "b"]}
 # CONFIG["hosts"].append("c")    # ❌ AttributeError at runtime — tuple, not list
 ```
 
-Module-level only in v1. Lowers to a `__typhon_freeze__(...)` call against `typhon_runtime.freeze.deep_freeze`, which recursively converts `list → tuple`, `dict → MappingProxyType`, `set → frozenset`, descends into nested values, and raises `TypeError` at startup on anything without a clean immutable equivalent (file handles, sockets, generators, non-frozen dataclasses). Frozen dataclasses pass through unchanged.
+Module-level only in v1. Lowers to a `__typhon_freeze__(...)` call against `typhon_runtime.freeze.deep_freeze`, which recursively converts `list → tuple`, `dict → MappingProxyType` (a hashable builtin `frozendict` on a 3.15+ target), `set → frozenset`, descends into nested values, and raises `TypeError` at startup on anything without a clean immutable equivalent (file handles, sockets, generators, non-frozen dataclasses). Frozen dataclasses pass through unchanged.
 
 Stacks with `pub` (v0.6.0): `pub freeze let X = …` parses.
 

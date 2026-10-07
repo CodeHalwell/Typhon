@@ -1880,9 +1880,9 @@ pub fn install(interp: &mut Interpreter) {
     // under `tyc build && python build/main.py`.
     root.set(
         "__typhon_freeze__",
-        Value::Native(Rc::new(NativeFn::new("__typhon_freeze__", |_i, args| {
+        Value::Native(Rc::new(NativeFn::new("__typhon_freeze__", |i, args| {
             let v = args.into_iter().next().unwrap_or(Value::None);
-            deep_freeze_value(v)
+            deep_freeze_for_target(i, v)
         }))),
     );
 
@@ -3482,9 +3482,9 @@ fn make_typhon_runtime_module(interp: &Interpreter) -> Value {
         "typhon_runtime.freeze",
         vec![(
             "deep_freeze",
-            nf("deep_freeze", |_i, args| {
+            nf("deep_freeze", |i, args| {
                 let v = args.into_iter().next().unwrap_or(Value::None);
-                deep_freeze_value(v)
+                deep_freeze_for_target(i, v)
             }),
         )],
     );
@@ -8898,6 +8898,73 @@ pub fn dict_is_frozen(d: &Rc<crate::value::FrozenCell<DictMap>>) -> bool {
 // Frozen metadata lives outside user-visible container contents.
 pub fn set_is_frozen(s: &crate::value::RcSet) -> bool {
     s.frozen.get()
+}
+
+/// [`deep_freeze_value`], then — on a 3.15+ `[python] target`, where the
+/// emitted runtime freezes a `dict` into a builtin `frozendict` rather than
+/// a `MappingProxyType` — every frozen dict in the result becomes the
+/// `frozendict` shim.
+fn deep_freeze_for_target(interp: &mut Interpreter, v: Value) -> Result<Value, Unwind> {
+    let frozen = deep_freeze_value(v)?;
+    if crate::python_target() < (3, 15) {
+        return Ok(frozen);
+    }
+    let Value::Class(class) = py315_builtin_class(interp, "frozendict")? else {
+        return Ok(frozen);
+    };
+    Ok(frozen_dicts_to_frozendict(&class, frozen))
+}
+
+fn frozen_dicts_to_frozendict(class: &Rc<crate::value::Class>, v: Value) -> Value {
+    let rebuild = |d: &Rc<crate::value::FrozenCell<DictMap>>| -> DictMap {
+        let mut map = DictMap::new();
+        for (k, val) in d.borrow().iter() {
+            map.insert(k.clone(), frozen_dicts_to_frozendict(class, val.clone()));
+        }
+        map
+    };
+    match v {
+        Value::Tuple(items) => Value::Tuple(Rc::new(
+            items
+                .iter()
+                .cloned()
+                .map(|x| frozen_dicts_to_frozendict(class, x))
+                .collect(),
+        )),
+        Value::Dict(d) if dict_is_frozen(&d) => {
+            let mut fields = crate::value::FieldMap::new();
+            fields.insert(
+                "_data".to_owned(),
+                Value::Dict(Rc::new(crate::value::FrozenCell::new(rebuild(&d)))),
+            );
+            Value::Instance(Rc::new(crate::value::Instance {
+                class: class.clone(),
+                fields: RefCell::new(fields),
+                chain: RefCell::new(None),
+            }))
+        }
+        Value::Instance(inst) if Rc::ptr_eq(&inst.class, class) => {
+            let data = inst.fields.borrow().get("_data").cloned();
+            match data {
+                Some(Value::Dict(d)) => {
+                    let mut fields = crate::value::FieldMap::new();
+                    fields.insert(
+                        "_data".to_owned(),
+                        Value::Dict(Rc::new(crate::value::FrozenCell::new(rebuild(&d)))),
+                    );
+                    Value::Instance(Rc::new(crate::value::Instance {
+                        class: inst.class.clone(),
+                        fields: RefCell::new(fields),
+                        chain: RefCell::new(None),
+                    }))
+                }
+                _ => Value::Instance(inst),
+            }
+        }
+        Value::ResultOk(x) => Value::ResultOk(Box::new(frozen_dicts_to_frozendict(class, *x))),
+        Value::ResultErr(x) => Value::ResultErr(Box::new(frozen_dicts_to_frozendict(class, *x))),
+        other => other,
+    }
 }
 
 /// Deep-freeze a value the same way `typhon_runtime.freeze.deep_freeze`

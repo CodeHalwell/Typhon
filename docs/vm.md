@@ -742,7 +742,8 @@ on the old behaviour will see different — correct — results):
   CPython. Since beta a frozen dict also *is* a `mappingproxy`:
   `type(D).__name__` names it and `isinstance(D, dict)` is `False`, and a
   frozen dataclass instance passes through unchanged (same object, fields
-  not rebuilt), as the generated runtime does.
+  not rebuilt), as the generated runtime does. On a 3.15+ `[python] target`
+  a frozen dict is a `frozendict` instead, as it is in the compiled output.
 - `comptime let X = ...` inlines via the substitution pass shared
   with `tyc build`.
 - `lazy import M = N` uses the simpler `import M as N` rewrite.

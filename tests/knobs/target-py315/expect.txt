@@ -1,4 +1,5 @@
 [3, 1, 2] [1, 2, 3] {'a': 3, 'b': 2}
 frozendict({'a': 3, 'b': 2}) frozendict({'a': 3, 'b': 2, 'c': 4}) True
 3 missing default 0 MISSING
+frozendict({'a': (1, 2)}) True
 lazy from [...]

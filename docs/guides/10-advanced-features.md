@@ -503,7 +503,7 @@ The deep-freeze is applied at module import time by `typhon_runtime.freeze.deep_
 
 | Python value | Frozen equivalent |
 |---|---|
-| `dict` | `types.MappingProxyType` |
+| `dict` | `types.MappingProxyType` (`frozendict` on a 3.15+ target) |
 | `list` | `tuple` |
 | `set` | `frozenset` |
 | `frozen` dataclass | unchanged |

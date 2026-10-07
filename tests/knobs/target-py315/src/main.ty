@@ -7,6 +7,8 @@
 lazy from textwrap import shorten
 
 let MISSING = sentinel("MISSING")
+# On a 3.15 target `freeze let` makes a dict a (hashable) `frozendict`.
+freeze let LIMITS: dict[str, list[int]] = {"a": [1, 2]}
 
 
 def lookup(table: frozendict[str, int], key: str, default: int | sentinel = MISSING) -> str:
@@ -27,6 +29,7 @@ def main() -> None:
     print(flat, sorted(distinct), merged)
     print(table, table | {"c": 4}, hash(table) == hash(frozendict(b=2, a=3)))
     print(lookup(table, "a"), lookup(table, "z"), lookup(table, "z", 0), MISSING)
+    print(LIMITS, hash(LIMITS) == hash(frozendict(a=(1, 2))))
     print(shorten("lazy from imports load on first use", width=20))
 
 

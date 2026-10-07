@@ -183,8 +183,9 @@ not a free reassignment.
 
 `let` locks the binding; `freeze let` also locks the value. It is allowed at
 module level only, and the value is deep-frozen when the module loads:
-`list` becomes `tuple`, `dict` becomes a read-only `MappingProxyType`, `set`
-becomes `frozenset`, recursively. An instance of a non-`frozen` class is
+`list` becomes `tuple`, `dict` becomes a read-only `MappingProxyType` (a
+hashable builtin `frozendict` on a 3.15+ `[python] target`), `set` becomes
+`frozenset`, recursively. An instance of a non-`frozen` class is
 rejected at check time (`tyc::freeze_not_freezable`); any other value with no
 immutable equivalent raises `TypeError` when the module loads.
 

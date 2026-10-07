@@ -864,6 +864,8 @@ surface; it does not inspect the internals of an instance.
 A `freeze let` annotation describes the input value. The binding uses the
 runtime's recursively frozen shape: `list[T]` becomes `tuple[T, ...]`,
 `dict[K, V]` becomes `Mapping[K, V]`, and `set[T]` becomes `frozenset[T]`.
+At runtime the dict is a `MappingProxyType`, or a builtin `frozendict` on a
+3.15+ `[python] target`.
 Nested container elements are frozen too. Read operations remain available;
 container mutation and list concatenation on a frozen tuple are rejected. A
 new binding receiving a frozen value retains its frozen shape. An immutable
