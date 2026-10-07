@@ -27,7 +27,7 @@ Three kinds of drift:
 
 Only when you run `tyc check --stubs`. Drift is **not** part of the default `tyc check` because the runtime-introspection step is expensive (it imports the module).
 
-For thorough checking, pair `tyc check --stubs` (AST diff) with `tyc stubtest` (runtime introspection via `mypy --stubtest`).
+For thorough checking, pair `tyc check --stubs` (AST diff) with `tyc stubtest` (runtime introspection via `python -m mypy.stubtest`).
 
 ## Fixing
 

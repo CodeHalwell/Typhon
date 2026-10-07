@@ -2178,6 +2178,12 @@ fn modular_inverse(a: &num_bigint::BigInt, m: &num_bigint::BigInt) -> Option<num
 }
 
 fn value_len(v: &Value) -> Result<usize, Unwind> {
+    // `len(Perm.R | Perm.W)` is the value's `int.bit_count()`
+    // (`Flag.__len__`): the set bits of its magnitude, unnamed `IntFlag`
+    // bits included.
+    if let Some(bits) = crate::value::flag_member_bits(v) {
+        return Ok(bits.magnitude().count_ones() as usize);
+    }
     // A `StrEnum` member *is* its string, so `len(StrE.X)` is the value's.
     if let Some(inner) = crate::value::enum_mixin_value(v) {
         return value_len(&inner);
@@ -9364,14 +9370,11 @@ fn async_generator_context_manager(gen: Value) -> Value {
 
 /// `functools` shim.
 ///
-/// Implemented: `cache` / `lru_cache` (memoising wrapper, identical
-/// semantics to the `@memo` decorator), `reduce`, `partial` (returns a
-/// callable that prepends the captured args), `cached_property`
-/// (identity wrapper — see FINDINGS #26: callers must invoke the
-/// resulting method as `obj.x()` rather than `obj.x` because the VM
-/// has no descriptor protocol).
-///
-/// `wraps`, `singledispatch`, and `total_ordering` are not implemented.
+/// Implemented natively: `cache` / `lru_cache` (memoising wrapper,
+/// identical semantics to the `@memo` decorator), `reduce`, `partial`
+/// (returns a callable that prepends the captured args) and
+/// `cached_property`. `wraps`, `total_ordering` and `singledispatch` come
+/// from the `functools_extra.py` shim.
 fn make_functools_module(interp: &mut Interpreter) -> Value {
     fn make_cache(_i: &mut Interpreter, args: Vec<Value>) -> Result<Value, Unwind> {
         let inner = args.into_iter().next().unwrap_or(Value::None);
@@ -10178,6 +10181,26 @@ pub fn dict_fromkeys(interp: &mut Interpreter, args: Vec<Value>) -> Result<Value
 /// and `y` map char-by-char, and an optional `z` lists characters mapped
 /// to `None` (deleted). A staticmethod on the `str` type object, so
 /// `interp.rs` intercepts it the same way as `dict.fromkeys`.
+/// `bytes.maketrans(from, to)` — the 256-byte table `bytes.translate` takes,
+/// mapping each byte of `from` to the byte at the same index of `to`.
+pub fn bytes_maketrans(args: &[Value]) -> Result<Value, Unwind> {
+    let [from, to] = args else {
+        return Err(type_error(format!(
+            "maketrans expected 2 arguments, got {}",
+            args.len()
+        )));
+    };
+    let (from, to) = (bytes_like_arg(from)?, bytes_like_arg(to)?);
+    if from.len() != to.len() {
+        return Err(value_error("maketrans arguments must have same length"));
+    }
+    let mut table: Vec<u8> = (0..=255u8).collect();
+    for (f, t) in from.iter().zip(to.iter()) {
+        table[*f as usize] = *t;
+    }
+    Ok(Value::Bytes(Rc::new(table)))
+}
+
 pub fn str_maketrans(args: &[Value]) -> Result<Value, Unwind> {
     let as_str = |v: &Value| -> Result<String, Unwind> {
         match v {
@@ -11311,6 +11334,45 @@ fn bytes_method(
                 Value::Bytes(Rc::new(out))
             }
         }
+        // `.translate(table, delete=b"")` — drop the `delete` bytes, then map
+        // each remaining byte through the 256-byte `table` (`None` keeps it).
+        "translate" => {
+            if args.len() > 2 {
+                return Err(type_error(format!(
+                    "translate() takes at most 2 arguments ({} given)",
+                    args.len()
+                )));
+            }
+            let table = match args.first() {
+                None => {
+                    return Err(type_error(
+                        "translate() takes at least 1 argument (0 given)",
+                    ))
+                }
+                Some(Value::None) => None,
+                Some(v) => {
+                    let t = bytes_like_arg(v)?;
+                    if t.len() != 256 {
+                        return Err(value_error("translation table must be 256 characters long"));
+                    }
+                    Some(t)
+                }
+            };
+            let delete = match args.get(1) {
+                Some(v) => bytes_like_arg(v)?,
+                None => Vec::new(),
+            };
+            let mut deleted = [false; 256];
+            for &byte in &delete {
+                deleted[byte as usize] = true;
+            }
+            let out: Vec<u8> = b
+                .iter()
+                .filter(|&&byte| !deleted[byte as usize])
+                .map(|&byte| table.as_ref().map_or(byte, |t| t[byte as usize]))
+                .collect();
+            Value::Bytes(Rc::new(out))
+        }
         "removeprefix" => {
             let p = bytes_arg(single(args, "removeprefix")?)?;
             Value::Bytes(Rc::new(b.strip_prefix(p.as_slice()).unwrap_or(b).to_vec()))
@@ -11579,6 +11641,21 @@ pub(crate) fn is_attribute_error_unwind(u: &Unwind) -> bool {
 
 fn is_attribute_error(u: &Unwind) -> bool {
     matches!(u, Unwind::Exception(e) if e.kind == "AttributeError")
+}
+
+/// [`bytes_arg`] without its scalar-int coercion: `bytes.maketrans` and
+/// `bytes.translate` take only bytes-like values.
+fn bytes_like_arg(v: &Value) -> Result<Vec<u8>, Unwind> {
+    if matches!(v, Value::Int(_) | Value::Bool(_)) {
+        return Err(type_error(format!(
+            "a bytes-like object is required, not '{}'",
+            v.type_display_name()
+        )));
+    }
+    match bytearray_bytes(v) {
+        Some(b) => Ok(b),
+        None => bytes_arg(v),
+    }
 }
 
 fn bytes_arg(v: &Value) -> Result<Vec<u8>, Unwind> {

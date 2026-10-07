@@ -509,6 +509,9 @@ fn unmodelled_references(path: &std::path::Path, entry: &std::path::Path) -> Opt
             continue;
         };
         missing.extend(unmodelled_attribute_references(&module, &mut exports));
+        if tyc_vm::module_has_eager_generator(&module) {
+            missing.insert("a generator whose yield the VM cannot suspend".into());
+        }
         for root in tyc_resolve::collect_imported_roots(&module) {
             if root == "re" {
                 missing.insert("re (Python regular-expression semantics)".into());
@@ -670,8 +673,44 @@ fn unmodelled_attribute_references(
             }
         }
     }
+    missing.extend(scan.class_features.iter().cloned());
+    // `C.__del__ = f` / `setattr(C, "__del__", f)` installs a finaliser
+    // after the class exists.
+    if scan.stored_attributes.contains("__del__") {
+        missing.insert("a `__del__` finaliser".to_owned());
+    }
+    if scan
+        .metaclass_roots
+        .iter()
+        .any(|root| scan.program_bound.contains(root))
+        || scan.metaclass_attrs.iter().any(|attr| {
+            scan.stored_attributes.contains(attr) || scan.stored_attributes.contains("*")
+        })
+        || scan
+            .metaclass_bare_names
+            .iter()
+            .any(|name| scan.abc_module_names.contains(name))
+        // A dotted metaclass is trusted only through a name `import abc`
+        // bound (`from abc import *` binds `ABCMeta`, not `abc`).
+        || scan
+            .metaclass_dotted_roots
+            .iter()
+            .any(|root| !scan.abc_module_names.contains(root))
+        || (scan.star_imported && !scan.metaclass_bare_names.is_empty())
+        // A bare `ABCMeta` has to have been imported from `abc` under that
+        // name; otherwise CPython raises `NameError`.
+        || scan
+            .metaclass_bare_names
+            .iter()
+            .any(|name| name == "ABCMeta" && !scan.abc_meta_names.contains(name))
+    {
+        missing.insert("a custom metaclass".to_owned());
+    }
     for attr in UNMODELLED_ATTRIBUTES {
-        if scan.attribute_names.contains(*attr) && !scan.shadowed.contains(*attr) {
+        // Falling back is always safe, so no binding elsewhere in the
+        // program exempts the attribute: the scan cannot tell which
+        // receiver a same-named definition belongs to.
+        if scan.attribute_names.contains(*attr) {
             missing.insert(format!(".{attr}"));
         }
     }
@@ -789,6 +828,41 @@ struct AttributeScan {
     attribute_names: std::collections::BTreeSet<String>,
     /// Calls passing keyword arguments: the callee and the keyword names.
     keyword_calls: Vec<(KeywordCallee, Vec<String>)>,
+    /// Class-level features the VM ignores: a custom `metaclass=` and a
+    /// `__del__` finaliser.
+    class_features: std::collections::BTreeSet<String>,
+    /// Names bound to something other than the builtin `type`, the `abc`
+    /// module or `abc.ABCMeta`: by `def`, `class`, assignment, or an import
+    /// from anywhere else.
+    program_bound: std::collections::HashSet<String>,
+    /// The root name of each `metaclass=ABCMeta` / `metaclass=type`
+    /// spelling (`abc` for `abc.ABCMeta`): modelled only while the program
+    /// does not bind that name itself.
+    metaclass_roots: Vec<String>,
+    /// The attribute each dotted metaclass spelling selects (`ABCMeta` for
+    /// `abc.ABCMeta`): modelled only while no attribute of that name is
+    /// ever stored or deleted (`abc.ABCMeta = Custom`).
+    metaclass_attrs: Vec<String>,
+    /// Names bound to the `abc` module itself (`import abc as ABCMeta`).
+    abc_module_names: std::collections::HashSet<String>,
+    /// Each bare-name metaclass spelling (`metaclass=ABCMeta`): not the real
+    /// class when that name is the `abc` module.
+    metaclass_bare_names: Vec<String>,
+    /// The root of each dotted metaclass spelling (`abc` for `abc.ABCMeta`).
+    metaclass_dotted_roots: Vec<String>,
+    /// Names `from abc import ABCMeta` (or `from abc import *`) bound to
+    /// the real `ABCMeta`; a bare `metaclass=ABCMeta` must be one of them.
+    abc_meta_names: std::collections::HashSet<String>,
+    /// Whether a `from m import *` (other than from `abc`) could rebind a
+    /// bare metaclass name.
+    star_imported: bool,
+    /// How many `def` / `class` bodies enclose the statement being visited.
+    /// Only a module-level `import abc` / `from abc import ABCMeta` binds a
+    /// name a module-level class header can see.
+    scope_depth: usize,
+    /// Every attribute name the program stores or deletes, directly or by
+    /// `setattr` / `delattr` (`*` when the name is not a literal).
+    stored_attributes: std::collections::HashSet<String>,
 }
 
 /// What a keyword-passing call calls, as far as the syntax tells.
@@ -803,7 +877,112 @@ enum KeywordCallee {
 
 /// Attributes of builtin values the VM does not model, which a program
 /// reaches only by name (`e.add_note(…)`, `e.__notes__`).
-const UNMODELLED_ATTRIBUTES: &[&str] = &["add_note", "__notes__"];
+const UNMODELLED_ATTRIBUTES: &[&str] =
+    &["add_note", "__notes__", "with_traceback", "__traceback__"];
+
+/// The last segment of a name or dotted attribute (`abc.ABCMeta` →
+/// `ABCMeta`).
+fn base_last_segment(expr: &ruff_python_ast::Expr) -> Option<&str> {
+    match expr {
+        ruff_python_ast::Expr::Name(n) => Some(n.id.as_str()),
+        ruff_python_ast::Expr::Attribute(a) => Some(a.attr.as_str()),
+        _ => None,
+    }
+}
+
+/// Finds any binding of `__del__` in one class body — `def`, assignment,
+/// loop or `with` target, import alias — without entering nested function
+/// or class scopes.
+#[derive(Default)]
+struct DelBinding {
+    found: bool,
+}
+
+impl<'a> ruff_python_ast::visitor::Visitor<'a> for DelBinding {
+    fn visit_stmt(&mut self, stmt: &'a ruff_python_ast::Stmt) {
+        use ruff_python_ast::Stmt;
+        match stmt {
+            // A nested `def` or `class` body is its own scope, but its
+            // header (decorators, defaults, annotations, bases) runs here.
+            Stmt::FunctionDef(f) => {
+                self.found |= f.name.as_str() == "__del__";
+                for d in &f.decorator_list {
+                    self.visit_decorator(d);
+                }
+                if let Some(tp) = &f.type_params {
+                    self.visit_type_params(tp);
+                }
+                self.visit_parameters(&f.parameters);
+                if let Some(r) = &f.returns {
+                    self.visit_annotation(r);
+                }
+            }
+            Stmt::ClassDef(c) => {
+                self.found |= c.name.as_str() == "__del__";
+                for d in &c.decorator_list {
+                    self.visit_decorator(d);
+                }
+                if let Some(args) = &c.arguments {
+                    self.visit_arguments(args);
+                }
+            }
+            Stmt::Import(imp) => {
+                self.found |= imp
+                    .names
+                    .iter()
+                    .any(|a| a.asname.as_ref().map_or(a.name.as_str(), |n| n.as_str()) == "__del__")
+            }
+            Stmt::ImportFrom(imp) => {
+                self.found |= imp
+                    .names
+                    .iter()
+                    .any(|a| a.asname.as_ref().map_or(a.name.as_str(), |n| n.as_str()) == "__del__")
+            }
+            _ => ruff_python_ast::visitor::walk_stmt(self, stmt),
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &'a ruff_python_ast::Expr) {
+        use ruff_python_ast::{Expr, ExprContext};
+        match expr {
+            Expr::Name(n) if matches!(n.ctx, ExprContext::Store) => {
+                self.found |= n.id.as_str() == "__del__"
+            }
+            // A lambda body is its own scope; its defaults run here.
+            Expr::Lambda(l) => {
+                if let Some(params) = &l.parameters {
+                    for p in params.iter_non_variadic_params() {
+                        if let Some(d) = p.default() {
+                            self.visit_expr(d);
+                        }
+                    }
+                }
+            }
+            _ => ruff_python_ast::visitor::walk_expr(self, expr),
+        }
+    }
+
+    fn visit_pattern(&mut self, pattern: &'a ruff_python_ast::Pattern) {
+        use ruff_python_ast::Pattern;
+        let captured = match pattern {
+            Pattern::MatchAs(p) => p.name.as_ref(),
+            Pattern::MatchStar(p) => p.name.as_ref(),
+            Pattern::MatchMapping(p) => p.rest.as_ref(),
+            _ => None,
+        };
+        self.found |= captured.is_some_and(|n| n.as_str() == "__del__");
+        ruff_python_ast::visitor::walk_pattern(self, pattern);
+    }
+}
+
+/// The leftmost name of a name or dotted attribute (`abc.ABCMeta` → `abc`).
+fn expr_root_name(expr: &ruff_python_ast::Expr) -> Option<&str> {
+    match expr {
+        ruff_python_ast::Expr::Name(n) => Some(n.id.as_str()),
+        ruff_python_ast::Expr::Attribute(a) => expr_root_name(&a.value),
+        _ => None,
+    }
+}
 
 /// `asyncio` members whose effect depends on CPython's event-loop
 /// scheduling. The VM runs a coroutine to completion as soon as it is
@@ -888,6 +1067,15 @@ fn attribute_chain(attr: &ruff_python_ast::ExprAttribute) -> Option<(String, Vec
     }
 }
 
+impl AttributeScan {
+    /// A parameter, `except … as`, or pattern capture: shadows the name and
+    /// rebinds it away from any builtin metaclass.
+    fn bind_local(&mut self, name: String) {
+        self.program_bound.insert(name.clone());
+        self.shadowed.insert(name);
+    }
+}
+
 impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
     fn visit_stmt(&mut self, stmt: &'a ruff_python_ast::Stmt) {
         use ruff_python_ast::Stmt;
@@ -896,10 +1084,22 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                 for alias in &imp.names {
                     let module = alias.name.as_str();
                     match &alias.asname {
-                        Some(asname) => self.bind_import(asname.as_str(), module),
+                        Some(asname) => {
+                            if module != "abc" {
+                                self.program_bound.insert(asname.as_str().to_owned());
+                            } else if self.scope_depth == 0 {
+                                self.abc_module_names.insert(asname.as_str().to_owned());
+                            }
+                            self.bind_import(asname.as_str(), module)
+                        }
                         // `import a.b.c` binds `a`, to the package `a`.
                         None => {
                             let root = module.split('.').next().unwrap_or(module);
+                            if root != "abc" {
+                                self.program_bound.insert(root.to_owned());
+                            } else if self.scope_depth == 0 {
+                                self.abc_module_names.insert(root.to_owned());
+                            }
                             self.bind_import(root, root);
                         }
                     }
@@ -919,6 +1119,26 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                         .map(|a| a.as_str())
                         .unwrap_or(alias.name.as_str());
                     self.shadowed.insert(bound.to_owned());
+                    let from_abc =
+                        imp.level == 0 && imp.module.as_ref().is_some_and(|m| m.as_str() == "abc");
+                    let is_abc_meta = from_abc && alias.name.as_str() == "ABCMeta";
+                    // `from m import *` can bind any name, `ABCMeta` and
+                    // `type` included.
+                    if alias.name.as_str() == "*" && !from_abc {
+                        self.star_imported = true;
+                    }
+                    let module_level = self.scope_depth == 0;
+                    if is_abc_meta {
+                        if module_level {
+                            self.abc_meta_names.insert(bound.to_owned());
+                        }
+                    } else if from_abc && alias.name.as_str() == "*" {
+                        if module_level {
+                            self.abc_meta_names.insert("ABCMeta".to_owned());
+                        }
+                    } else {
+                        self.program_bound.insert(bound.to_owned());
+                    }
                     if let Some(module) = &modelled_source {
                         if alias.name.as_str() != "*" {
                             self.from_imports
@@ -929,9 +1149,69 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
             }
             Stmt::FunctionDef(f) => {
                 self.shadowed.insert(f.name.as_str().to_owned());
+                self.program_bound.insert(f.name.as_str().to_owned());
             }
             Stmt::ClassDef(c) => {
                 self.shadowed.insert(c.name.as_str().to_owned());
+                self.program_bound.insert(c.name.as_str().to_owned());
+                // The VM honours only `ABCMeta` (and the default `type`); any
+                // other metaclass's `__call__` / `__new__` is never consulted.
+                // A program-defined class spelt `ABCMeta` is checked once
+                // the whole module has been scanned.
+                let mut custom_metaclass = false;
+                for kw in c.keywords() {
+                    // `**kwargs` in a class header can carry `metaclass=`.
+                    if kw.arg.is_none() {
+                        custom_metaclass = true;
+                        continue;
+                    }
+                    if kw.arg.as_ref().is_none_or(|a| a.as_str() != "metaclass") {
+                        continue;
+                    }
+                    if matches!(base_last_segment(&kw.value), Some("ABCMeta") | Some("type")) {
+                        // Only a bare name or `module.ABCMeta` is trusted:
+                        // `get_holder().ABCMeta` or `abc.ABC.ABCMeta` could
+                        // be anything.
+                        let exact = match &kw.value {
+                            ruff_python_ast::Expr::Name(_) => true,
+                            ruff_python_ast::Expr::Attribute(a) => {
+                                matches!(a.value.as_ref(), ruff_python_ast::Expr::Name(_))
+                            }
+                            _ => false,
+                        };
+                        match expr_root_name(&kw.value).filter(|_| exact) {
+                            Some(root) => self.metaclass_roots.push(root.to_owned()),
+                            None => custom_metaclass = true,
+                        }
+                        match &kw.value {
+                            ruff_python_ast::Expr::Attribute(a) => {
+                                self.metaclass_attrs.push(a.attr.as_str().to_owned());
+                                if let Some(root) = expr_root_name(&kw.value) {
+                                    self.metaclass_dotted_roots.push(root.to_owned());
+                                }
+                            }
+                            ruff_python_ast::Expr::Name(n) => {
+                                self.metaclass_bare_names.push(n.id.as_str().to_owned())
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        custom_metaclass = true;
+                    }
+                }
+                if custom_metaclass {
+                    self.class_features.insert("a custom metaclass".to_owned());
+                }
+                // The VM never runs finalisers: any binding of `__del__` in
+                // the class body counts.
+                let mut del = DelBinding::default();
+                for st in &c.body {
+                    del.visit_stmt(st);
+                }
+                if del.found {
+                    self.class_features
+                        .insert("a `__del__` finaliser".to_owned());
+                }
             }
             Stmt::TypeAlias(t) => {
                 if let ruff_python_ast::Expr::Name(n) = t.name.as_ref() {
@@ -940,7 +1220,10 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
             }
             _ => {}
         }
+        let nested = matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_));
+        self.scope_depth += usize::from(nested);
         ruff_python_ast::visitor::walk_stmt(self, stmt);
+        self.scope_depth -= usize::from(nested);
     }
 
     fn visit_expr(&mut self, expr: &'a ruff_python_ast::Expr) {
@@ -949,6 +1232,7 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
             // A store or delete of the bare name rebinds it.
             Expr::Name(n) if !matches!(n.ctx, ExprContext::Load) => {
                 self.shadowed.insert(n.id.as_str().to_owned());
+                self.program_bound.insert(n.id.as_str().to_owned());
             }
             Expr::Attribute(a) => {
                 self.attribute_names.insert(a.attr.as_str().to_owned());
@@ -957,6 +1241,7 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                     if matches!(a.ctx, ExprContext::Load) {
                         self.loads.push((root, chain, at));
                     } else {
+                        self.stored_attributes.insert(a.attr.as_str().to_owned());
                         // `mod.x = …` / `del mod.x`: every prefix the store
                         // touches is the program's own.
                         let mut path = root;
@@ -998,6 +1283,14 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                 }
                 if let Expr::Name(func) = call.func.as_ref() {
                     if matches!(func.id.as_str(), "setattr" | "delattr") {
+                        // A dynamic name could be any attribute: `*` stands
+                        // for all of them.
+                        match call.arguments.args.get(1) {
+                            Some(Expr::StringLiteral(name)) => self
+                                .stored_attributes
+                                .insert(name.value.to_str().to_owned()),
+                            _ => self.stored_attributes.insert("*".to_owned()),
+                        };
                         if let [Expr::Name(target), Expr::StringLiteral(name), ..] =
                             call.arguments.args.as_ref()
                         {
@@ -1016,7 +1309,7 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
 
     fn visit_parameters(&mut self, parameters: &'a ruff_python_ast::Parameters) {
         for param in parameters.iter() {
-            self.shadowed.insert(param.name().as_str().to_owned());
+            self.bind_local(param.name().as_str().to_owned());
         }
         ruff_python_ast::visitor::walk_parameters(self, parameters);
     }
@@ -1024,7 +1317,7 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
     fn visit_except_handler(&mut self, handler: &'a ruff_python_ast::ExceptHandler) {
         let ruff_python_ast::ExceptHandler::ExceptHandler(h) = handler;
         if let Some(name) = &h.name {
-            self.shadowed.insert(name.as_str().to_owned());
+            self.bind_local(name.as_str().to_owned());
         }
         ruff_python_ast::visitor::walk_except_handler(self, handler);
     }
@@ -1034,17 +1327,17 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
         match pattern {
             Pattern::MatchAs(p) => {
                 if let Some(name) = &p.name {
-                    self.shadowed.insert(name.as_str().to_owned());
+                    self.bind_local(name.as_str().to_owned());
                 }
             }
             Pattern::MatchStar(p) => {
                 if let Some(name) = &p.name {
-                    self.shadowed.insert(name.as_str().to_owned());
+                    self.bind_local(name.as_str().to_owned());
                 }
             }
             Pattern::MatchMapping(p) => {
                 if let Some(rest) = &p.rest {
-                    self.shadowed.insert(rest.as_str().to_owned());
+                    self.bind_local(rest.as_str().to_owned());
                 }
             }
             _ => {}
@@ -1251,6 +1544,200 @@ mod tests {
             scan_source("import json\nimport math\nprint(round(2.5, ndigits=0), int(\"ff\", base=16), math.prod([2], start=3), json.loads(\"{}\", object_hook=dict), \"a b\".split(maxsplit=1))\n"),
             None
         );
+    }
+
+    #[test]
+    fn scan_routes_eager_generators_to_cpython() {
+        // Two yields in one expression: the VM would run the body eagerly.
+        let eager =
+            "def g() -> object:\n    print(\"start\")\n    yield (yield 1)\nprint(list(g()))\n";
+        assert_eq!(
+            scan_source(eager),
+            Some(vec![
+                "a generator whose yield the VM cannot suspend".to_owned()
+            ])
+        );
+        // The same check reaches methods and nested functions.
+        let method = "plain class C:\n    def g(self) -> object:\n        def inner() -> object:\n            yield (yield 1)\n        return inner()\nprint(C())\n";
+        assert!(scan_source(method).is_some());
+        // A lambda is its own generator scope.
+        let lam = "let g = lambda: (yield (yield 1))\nprint(list(g()))\n";
+        assert!(scan_source(lam).is_some());
+        // A yield in any statement's expression makes the function a
+        // generator, wherever it sits (an `assert` test, an `elif` test, a
+        // nested `def`'s default).
+        for body in [
+            "    assert (yield 1)",
+            "    if False:\n        pass\n    elif (yield 1):\n        pass",
+            "    def inner(x: object = (yield 1)) -> None:\n        pass",
+            "    def inner(x: (yield 1)) -> None:\n        pass",
+            "    def inner() -> (yield 1):\n        pass",
+        ] {
+            let src = format!("def g() -> object:\n{body}\nprint(list(g()))\n");
+            assert!(scan_source(&src).is_some(), "{src}");
+        }
+        // A lambda default runs before the yield in the same expression.
+        let lambda_default = "def side() -> int:\n    return 1\ndef g() -> object:\n    show = ((lambda y=side(): y), (yield 1))\nprint(list(g()))\n";
+        assert!(scan_source(lambda_default).is_some());
+        // An ordinary generator runs lazily and stays on the VM.
+        let lazy = "def g() -> object:\n    mut n = 0\n    while True:\n        yield n\n        n += 1\nprint(next(g()))\n";
+        assert_eq!(scan_source(lazy), None);
+    }
+
+    #[test]
+    fn scan_routes_metaclasses_finalisers_and_tracebacks() {
+        let meta =
+            "plain class M(type):\n    pass\nplain class W(metaclass=M):\n    pass\nprint(W())\n";
+        assert_eq!(
+            scan_source(meta),
+            Some(vec!["a custom metaclass".to_owned()])
+        );
+        // `ABCMeta` is modelled.
+        let abc = "import abc\nplain class A(metaclass=abc.ABCMeta):\n    pass\nprint(A)\n";
+        assert_eq!(scan_source(abc), None);
+        let from_abc =
+            "from abc import ABCMeta\nplain class A(metaclass=ABCMeta):\n    pass\nprint(A)\n";
+        assert_eq!(scan_source(from_abc), None);
+        let star_abc = "from abc import *\nplain class A(metaclass=ABCMeta):\n    pass\nprint(A)\n";
+        assert_eq!(scan_source(star_abc), None);
+        // An import inside a function binds nothing a module-level header
+        // can see.
+        let nested_import = "def hidden() -> None:\n    from abc import ABCMeta\nplain class W(metaclass=ABCMeta):\n    pass\nprint(W())\n";
+        assert!(scan_source(nested_import)
+            .unwrap_or_default()
+            .contains(&"a custom metaclass".to_owned()));
+        // A bare `ABCMeta` nothing bound is CPython's `NameError`.
+        for unbound in [
+            "import abc\nplain class W(metaclass=ABCMeta):\n    pass\nprint(W())\n",
+            "from abc import ABCMeta as AM\nplain class W(metaclass=ABCMeta):\n    pass\nprint(W())\n",
+        ] {
+            assert!(scan_source(unbound)
+                .unwrap_or_default()
+                .contains(&"a custom metaclass".to_owned()));
+        }
+        // A program's own class spelt `ABCMeta` is not, nor one imported
+        // from elsewhere.
+        let foreign =
+            "from custom import ABCMeta\nplain class W(metaclass=ABCMeta):\n    pass\nprint(W())\n";
+        assert!(scan_source(foreign)
+            .unwrap_or_default()
+            .contains(&"a custom metaclass".to_owned()));
+        let aliased =
+            "import custom as abc\nplain class W(metaclass=abc.ABCMeta):\n    pass\nprint(W())\n";
+        assert!(scan_source(aliased)
+            .unwrap_or_default()
+            .contains(&"a custom metaclass".to_owned()));
+        let param = "def make(ABCMeta: object) -> object:\n    plain class W(metaclass=ABCMeta):\n        pass\n    return W\nprint(make(type))\n";
+        assert_eq!(
+            scan_source(param),
+            Some(vec!["a custom metaclass".to_owned()])
+        );
+        let own = "plain class ABCMeta(type):\n    pass\nplain class W(metaclass=ABCMeta):\n    pass\nprint(W())\n";
+        assert_eq!(
+            scan_source(own),
+            Some(vec!["a custom metaclass".to_owned()])
+        );
+        let patched = "import abc\nplain class Custom(type):\n    pass\nabc.ABCMeta = Custom\nplain class W(metaclass=abc.ABCMeta):\n    pass\nprint(W())\n";
+        assert!(scan_source(patched)
+            .unwrap_or_default()
+            .contains(&"a custom metaclass".to_owned()));
+        for set in [
+            "setattr(abc, \"ABCMeta\", Custom)",
+            "setattr(abc, \"ABC\" + \"Meta\", Custom)",
+        ] {
+            let src = format!("import abc\nplain class Custom(type):\n    pass\n{set}\nplain class W(metaclass=abc.ABCMeta):\n    pass\nprint(W())\n");
+            assert!(scan_source(&src)
+                .unwrap_or_default()
+                .contains(&"a custom metaclass".to_owned()));
+        }
+        let deep = "import abc\nplain class W(metaclass=abc.ABC.ABCMeta):\n    pass\nprint(W())\n";
+        assert!(scan_source(deep)
+            .unwrap_or_default()
+            .contains(&"a custom metaclass".to_owned()));
+        let module_alias =
+            "import abc as ABCMeta\nplain class W(metaclass=ABCMeta):\n    pass\nprint(W())\n";
+        assert!(scan_source(module_alias)
+            .unwrap_or_default()
+            .contains(&"a custom metaclass".to_owned()));
+        // `from abc import *` binds `ABCMeta`, not the module name `abc`.
+        let unbound_root =
+            "from abc import *\nplain class W(metaclass=abc.ABCMeta):\n    pass\nprint(W)\n";
+        assert!(scan_source(unbound_root)
+            .unwrap_or_default()
+            .contains(&"a custom metaclass".to_owned()));
+        // A star import could bind `ABCMeta` to anything; `abc`'s own is real.
+        let star = "from helper import *\nfrom abc import ABCMeta\nplain class W(metaclass=ABCMeta):\n    pass\nprint(W())\n";
+        assert!(scan_source(star)
+            .unwrap_or_default()
+            .contains(&"a custom metaclass".to_owned()));
+        let abc_star = "from abc import *\nplain class W(metaclass=ABCMeta):\n    pass\nprint(W)\n";
+        assert!(!scan_source(abc_star)
+            .unwrap_or_default()
+            .contains(&"a custom metaclass".to_owned()));
+        // `ABCMeta` imported under the module's name is not `abc.ABCMeta`.
+        let meta_alias = "from abc import ABCMeta as abc\nplain class W(metaclass=abc.ABCMeta):\n    pass\nprint(W())\n";
+        assert!(scan_source(meta_alias)
+            .unwrap_or_default()
+            .contains(&"a custom metaclass".to_owned()));
+        let computed = "import abc\ndef holder() -> object:\n    return abc\nplain class W(metaclass=holder().ABCMeta):\n    pass\nprint(W())\n";
+        assert!(scan_source(computed)
+            .unwrap_or_default()
+            .contains(&"a custom metaclass".to_owned()));
+        let header = "def cleanup(self: object) -> None:\n    print(\"bye\")\nplain class D:\n    def f(self, x: object = (__del__ := cleanup)) -> None:\n        pass\nprint(D())\n";
+        assert!(scan_source(header)
+            .unwrap_or_default()
+            .contains(&"a `__del__` finaliser".to_owned()));
+        for installed in [
+            "def cleanup(self: object) -> None:\n    print(\"bye\")\nplain class C:\n    pass\nsetattr(C, \"__del__\", cleanup)\nprint(C())\n",
+            "def cleanup(self: object) -> None:\n    print(\"bye\")\nplain class C:\n    pass\nC.__del__ = cleanup\nprint(C())\n",
+        ] {
+            assert!(scan_source(installed)
+                .unwrap_or_default()
+                .contains(&"a `__del__` finaliser".to_owned()));
+        }
+        let lambda_default = "def cleanup(self: object) -> None:\n    print(\"bye\")\nplain class D:\n    f = lambda x=(__del__ := cleanup): None\nprint(D())\n";
+        assert!(scan_source(lambda_default)
+            .unwrap_or_default()
+            .contains(&"a `__del__` finaliser".to_owned()));
+        let captured =
+            "plain class D:\n    match 1:\n        case __del__:\n            pass\nprint(D())\n";
+        assert!(scan_source(captured)
+            .unwrap_or_default()
+            .contains(&"a `__del__` finaliser".to_owned()));
+        let fin =
+            "plain class D:\n    def __del__(self) -> None:\n        print(\"bye\")\nprint(D())\n";
+        assert_eq!(
+            scan_source(fin),
+            Some(vec!["a `__del__` finaliser".to_owned()])
+        );
+        let looped = "def bye(self: object) -> None:\n    print(\"bye\")\nplain class G:\n    for __del__ in [bye]:\n        pass\nprint(G())\n";
+        assert_eq!(
+            scan_source(looped),
+            Some(vec!["a `__del__` finaliser".to_owned()])
+        );
+        let imported = "plain class H:\n    from os import getcwd as __del__\nprint(H())\n";
+        assert!(scan_source(imported)
+            .unwrap_or_default()
+            .contains(&"a `__del__` finaliser".to_owned()));
+        let unpacked = "plain class M(type):\n    pass\nlet opts = {\"metaclass\": M}\nplain class W(**opts):\n    pass\nprint(W())\n";
+        assert!(scan_source(unpacked)
+            .unwrap_or_default()
+            .contains(&"a custom metaclass".to_owned()));
+        let destructured = "def bye(self: object) -> None:\n    print(\"bye\")\nplain class F:\n    __del__, marker = (bye, 1)\nprint(F())\n";
+        assert_eq!(
+            scan_source(destructured),
+            Some(vec!["a `__del__` finaliser".to_owned()])
+        );
+        let assigned = "def bye(self: object) -> None:\n    print(\"bye\")\nplain class E:\n    __del__ = bye\nprint(E())\n";
+        assert_eq!(
+            scan_source(assigned),
+            Some(vec!["a `__del__` finaliser".to_owned()])
+        );
+        let tb = "try:\n    raise ValueError(\"x\")\nexcept ValueError as e:\n    print(e.__traceback__)\n";
+        assert_eq!(scan_source(tb), Some(vec![".__traceback__".to_owned()]));
+        // A bare name does not hide the attribute.
+        let bare = "let __traceback__ = 1\ntry:\n    raise ValueError(\"x\")\nexcept ValueError as e:\n    print(e.__traceback__, __traceback__)\n";
+        assert_eq!(scan_source(bare), Some(vec![".__traceback__".to_owned()]));
     }
 
     #[test]

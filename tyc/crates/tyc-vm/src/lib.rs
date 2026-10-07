@@ -1011,6 +1011,66 @@ const PYTHON_BUILTINS: &[&str] = &[
     "__debug__",
 ];
 
+/// Whether `module` defines a generator whose `yield` sits where the
+/// tree-walk cannot suspend (a loop test, a `with` item, two yields in one
+/// expression, …). The VM runs such a generator eagerly — its whole body at
+/// the call — so its side effects happen early and `send()` cannot reach it.
+/// `tyc run`'s pre-run scan sends a program that has one down the compiled
+/// path instead.
+pub fn module_has_eager_generator(module: &ruff_python_ast::ModModule) -> bool {
+    use ruff_python_ast::visitor::{self, Visitor};
+    use ruff_python_ast::Stmt;
+
+    #[derive(Default)]
+    struct Scan {
+        found: bool,
+    }
+    impl<'a> Visitor<'a> for Scan {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            if self.found {
+                return;
+            }
+            if let Stmt::FunctionDef(f) = stmt {
+                if matches!(
+                    interp::generator_kind(f.is_async, &f.body),
+                    value::GeneratorKind::Eager
+                ) {
+                    self.found = true;
+                    return;
+                }
+            }
+            visitor::walk_stmt(self, stmt);
+        }
+        // A lambda is its own generator scope: the VM runs its body as
+        // `return <body>`.
+        fn visit_expr(&mut self, expr: &'a ruff_python_ast::Expr) {
+            if self.found {
+                return;
+            }
+            if let ruff_python_ast::Expr::Lambda(l) = expr {
+                let body = [Stmt::Return(ruff_python_ast::StmtReturn {
+                    node_index: Default::default(),
+                    range: l.range,
+                    value: Some(l.body.clone()),
+                })];
+                if matches!(
+                    interp::generator_kind(false, &body),
+                    value::GeneratorKind::Eager
+                ) {
+                    self.found = true;
+                    return;
+                }
+            }
+            visitor::walk_expr(self, expr);
+        }
+    }
+    let mut scan = Scan::default();
+    for stmt in &module.body {
+        scan.visit_stmt(stmt);
+    }
+    scan.found
+}
+
 /// Whether `name` is a CPython builtin the VM does not provide (`exec`,
 /// `memoryview`, `globals`). `tyc run`'s pre-run scan sends a program that
 /// uses one down the compiled path rather than into a `NameError`.
@@ -3010,7 +3070,7 @@ if log != ["cb", "exit a"]:
 
     #[test]
     fn extend_builtin_attribute_and_call_receivers_dispatch() {
-        // docs/release-readiness-review-2026-09-30.md §5: an extension
+        // docs/reviews/release-readiness-review-2026-09-30.md §5: an extension
         // method called on an attribute (`p.title.slug()`), a call
         // (`make().slug()`), an `impl` method call (`p.url().slug()`) or a
         // chained extension call (`make().slug().slug()`) was never
@@ -6403,8 +6463,8 @@ main()
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
 
-    /// `del` on a slot local unbinds it; a later read falls through to the
-    /// module scope, matching the pre-slot behaviour.
+    /// `del` on a slot local unbinds it; a later read raises
+    /// `UnboundLocalError` as in CPython, never reading the module's `x`.
     #[test]
     fn slot_del_unbinds() {
         let src = r#"
@@ -6416,8 +6476,11 @@ def f() -> int:
     return x
 
 def main() -> None:
-    if f() != 7:
-        raise ValueError("del did not unbind the slot")
+    try:
+        f()
+    except UnboundLocalError:
+        return
+    raise ValueError("del did not unbind the slot")
 
 main()
 "#;

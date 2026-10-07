@@ -1388,11 +1388,11 @@ enum Color:
 def naturals() -> Iterator[int]:
     mut n: int = 0
     while True:
-        yield n                  # ❌ under tyc run: collected eagerly → RuntimeError at 1M
+        yield n                  # ✅ lazy under tyc run (was eager before beta)
         n = n + 1
 ```
 
-**Trigger:** a `yield` function that never terminates, or one you only want to pull a few values from. **Diagnostic:** `RuntimeError` once `GENERATOR_CAP = 1_000_000` is hit. **Why:** the tree-walking VM can't suspend a frame (`Rc` values aren't `Send`), so generators run to completion and return an iterator over the *collected* values. **Fix:** finite generators are fine under `tyc run`; for genuinely infinite / lazy ones use `tyc build && python build/main.py`, which emits a real Python generator.
+**Resolved:** VM generators are now lazy, so this streams under `tyc run` as it does on CPython. The pitfall remains only for a `yield` the tree-walk cannot suspend — in a loop test, a `with` item, a call argument after another call, or two yields in one expression. That generator falls back to eager collection and raises `RuntimeError` at `GENERATOR_CAP = 1_000_000`. **Fix:** move the `yield` onto its own statement, or use `tyc build`.
 
 ## 78. `@contextmanager` generator driven by a `with` under `tyc run` (v0.10.0)
 
@@ -1400,11 +1400,11 @@ def naturals() -> Iterator[int]:
 @contextmanager
 def timer() -> Iterator[None]:
     let start: float = time.perf_counter()
-    yield                        # ❌ under tyc run: setup+teardown both run at call time
+    yield                        # ✅ the with body runs here under tyc run (beta.1+)
     print(time.perf_counter() - start)
 ```
 
-**Trigger:** a generator-based context manager used in a `with` block. **Why:** eager generator collection runs the setup *and* teardown at call time, so the `with` body can't execute between them. The decorator is recognised and `@contextmanager` *factory bodies* are exempt from `resource_not_managed`, but the driven-by-`with` case needs the real Python coroutine. **Fix:** `tyc build` for these; class-based `__enter__` / `__exit__` and `open()` work under the VM.
+**Resolved in v1.0.0-beta.1:** `@contextmanager` and `@asynccontextmanager` factories run lazily under the VM, so the `with` body executes between setup and teardown. The old behaviour (setup and teardown both at call time) survives only when the factory's `yield` sits where the tree-walk cannot suspend (see 77).
 
 ## 79. A wrong-*typed* argument to a third-party call now fails `tyc check` (v0.12.0)
 

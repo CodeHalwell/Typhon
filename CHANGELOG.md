@@ -4,6 +4,165 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## Unreleased — gap fixes
+
+### Fixed
+
+- **Negative flag members, wrapped await iterators and more fallbacks.**
+  Under `tyc run`, a declared negative `Flag` member is found by value
+  (`N(-3) is N.B`), and an `__await__` returning `iter(user_iterator)`
+  gives that iterator's `StopIteration` value as the result. The pre-run
+  scan sends to CPython a program that installs `__del__` after the
+  class exists (`setattr(C, "__del__", f)`), a generator whose lambda
+  default runs before a `yield` in the same expression, and a module-level
+  `metaclass=ABCMeta` whose only import sits inside a function.
+- **`maketrans` on instances, `CancelledError` and `__aiter__` results.**
+  Under `tyc run`, `b"".maketrans(...)`, `"".maketrans(...)` and
+  `{}.fromkeys(...)` work through an instance as well as the type;
+  `asyncio.CancelledError.__mro__` is `(CancelledError, BaseException,
+  object)`; and an `__aiter__` that returns a plain generator raises
+  CPython's `TypeError`. The pre-run scan sends a bare
+  `metaclass=ABCMeta` that was never imported from `abc` under that name
+  to CPython, which raises `NameError` for it.
+- **Flags wider than 64 bits.** `Flag` / `IntFlag` values are now big
+  integers under `tyc run`, so a member such as `BIG = 1 << 70` combines,
+  inverts, iterates, prints and numbers the next `auto()` as CPython does,
+  rather than behaving like a plain int.
+- **Exception subclasses as loop and await terminators.** Under
+  `tyc run`, an `__anext__` that raises a user subclass of
+  `StopAsyncIteration` ends an `async for`, and an `__await__` iterator
+  that finishes with a `StopIteration` subclass gives that exception's
+  value as the await's result, as in CPython. `async for` over a class (an
+  enum class included) raises CPython's `TypeError`, and a builtin
+  exception base reached through an alias (`Alias = ValueError`) keeps its
+  exception hierarchy even after the original name is rebound.
+- **Builtin-type bases, bool flag values and nested genexps.** Under
+  `tyc run`, a class whose base is computed (`class E(type(ValueError()))`)
+  now inherits from the real builtin, so its `__mro__`, `issubclass` and
+  `except` behaviour match CPython. A `True` member feeds a flag's next
+  `auto()` (`A = True; B = auto()` gives `B == 2`). An `__aiter__` that
+  returns an async generator expression is iterated. A nested generator
+  expression no longer makes its enclosing one async unless the `await` is
+  in its first iterable. The pre-run scan also sees `__del__` bound in a
+  lambda default.
+- **Awaitables, flag `auto()` and star imports.** An `__await__` iterator
+  that finishes with `StopIteration(value)` now gives `value` as the
+  await's result under `tyc run` (it was `None`); a flag `auto()` after a
+  negative member takes the next bit above that value's magnitude, as
+  CPython does (`A = -1; B = auto()` makes `B == 2`); and a
+  `from m import *` sends a program with a bare `metaclass=ABCMeta` to
+  CPython, since the star import could have rebound the name.
+- **A deleted local stays deleted.** Under `tyc run`, reading a function
+  local after `del` raises `UnboundLocalError` as CPython does, instead of
+  reading a module-level binding of the same name. `async for` over a plain
+  coroutine raises CPython's `TypeError`; a lambda default containing
+  `await` makes a generator expression async; and the pre-run scan trusts
+  a dotted `metaclass=abc.ABCMeta` only when `abc` was bound by
+  `import abc`.
+- **More async-iteration parity.** A generator expression with an `await`
+  in its element or a filter (`(await f(x) for x in xs)`) is an async
+  generator under `tyc run`, as in CPython, so `async for` iterates it; and
+  an `__aiter__` result whose class also defines `__await__` is used as the
+  iterator rather than awaited.
+- **Async generators are not awaitables.** Calling an `async def` that
+  contains `yield` yields an async generator under `tyc run`: `await` on it
+  and returning one from `__anext__` now raise CPython's `TypeError`
+  naming `async_generator`, and `async for` over an async generator
+  expression (`(x async for x in src)`) iterates instead of being rejected
+  as a synchronous iterator.
+- **`del obj[...]` parity.** A user `__delitem__` now receives slice keys
+  (`del obj[1:2]`, the `bytearray` shim's slice delete); `del xs[k]`
+  honours `k.__index__`; `del` on a class's `__dict__` mappingproxy raises
+  `TypeError`; and a dict key is no longer coerced through `__index__` on
+  lookup, store or delete. Yields in a nested `def`'s annotations now make
+  the enclosing function a generator too.
+- **Generator detection sees every `yield`.** A function whose only
+  `yield` sits in a dict display, an `assert`, an `elif` test, a `del` or
+  assignment target, or a nested `def`'s default is now a generator under
+  `tyc run`: a dict-display yield runs lazily on the VM, and positions it
+  cannot suspend at route the program to CPython. Before, such a function
+  ran as a plain function and raised `yield outside of a generator`.
+- **More `async for` / class-body / flag parity.** `async for` over a dict
+  view, and a sync `__anext__` returning any non-awaitable (a builtin type
+  included), raise CPython's `TypeError`; a `def` after `global f` in a
+  class body binds the global and adds no method; iterating a negative
+  `Flag` value raises `ValueError: -1 is not a positive integer`; and
+  `from abc import ABCMeta as abc` no longer makes `metaclass=abc.ABCMeta`
+  look like the real `ABCMeta` to the pre-run scan.
+- **`enum.Flag` / `enum.IntFlag` under `tyc run`.** The VM now matches
+  CPython 3.13 for flag values: `Perm(6)` returns the composite instead of
+  raising `ValueError`; `IntFlag` members combine into `<Perm.R|W: 6>`
+  (also with a plain int, as in `Perm.R | 1`) rather than a bare `int`;
+  `~member` complements within the declared bits; iterating a flag value
+  or class yields only its single-bit members, and `len()` of a value
+  counts its set bits;
+  `Perm(0)` is falsy and prints as `Perm(0)` / `<Perm: 0>`; composites are
+  cached so `(A | B) is (B | A)`; a `Flag` given an undeclared bit raises
+  CPython's `invalid value` error while an `IntFlag` keeps it; negative
+  values (`Perm(-1)`, `Perm.R | -8`) follow CPython's boundary rules; and
+  `auto()` after a multi-bit member picks the next free bit. `P.B | True`
+  keeps the `IntFlag` type, and a composite that also contains an alias
+  is named in CPython's order (`<P.A|C|AB|8: 15>`).
+- **`del` under `tyc run`.** `del (a, b)` and `del [xs[0], d["k"]]` work
+  instead of raising `NotImplementedError`; `del` honours `global` and
+  `nonlocal` declarations; `del` in a class body unbinds the class
+  attribute (a deleted method or property included) and honours the class
+  body's own `global` / `nonlocal` declarations; and deleting an unbound name raises `NameError` (module or
+  class scope) or `UnboundLocalError` (function scope) as CPython does,
+  where the VM used to do nothing.
+- **`bytes.translate` and `bytes.maketrans` under `tyc run`.** Both were
+  missing (they take `bytes` or `bytearray` arguments), so a program using them failed with `AttributeError` in the VM
+  but ran on CPython.
+- **`async for` over a hand-written async iterator under `tyc run`.** The
+  VM used to call `__anext__` until exhaustion before the loop body ran
+  once, so output interleaved differently from CPython and an endless
+  source hit the 1,000,000-item cap even when the loop `break`s. Each
+  `__anext__` now runs just before the body that consumes its item, and a
+  plain `for` or `list()` over such an object raises CPython's
+  `TypeError` instead of driving `__anext__`. `async for` over a list,
+  tuple, string, dict, set, range, a synchronous iterator or generator, or
+  a class without `__aiter__`, or over
+  an `async def __aiter__`, raises CPython's `TypeError` too, where the VM
+  iterated it. Async comprehensions (`[x async for x in it]`) follow the
+  same protocol, and a plain value (or a non-awaitable instance) returned
+  from a synchronous `__anext__` is CPython's `TypeError`.
+- **`tyc run` no longer runs a generator early without saying so.** A
+  generator (or generator lambda) whose `yield` the VM cannot suspend (in
+  a loop test, a `with` item, or two in one expression) ran its whole body at the call, so its
+  side effects came out in the wrong order. The pre-run scan now sends such
+  a program to CPython with a `note:`, as it already does for unmodelled
+  modules. `--no-fallback` keeps the old behaviour.
+- **`__mro__` and `__bases__` of builtin types and exceptions under
+  `tyc run`.** `ValueError.__mro__` and `bool.__mro__` raised
+  `AttributeError`, and a class deriving from a builtin exception listed
+  only itself and `object`. They now give CPython's chain
+  (`AppError, ValueError, Exception, BaseException, object`), and
+  `__bases__` works on every class, with the C3 order kept when a builtin
+  type or exception is mixed with other bases (`class E(ValueError,
+  Mixin)`, `class ML(list)`, `class Meta(type)`).
+- **`tyc run` sends more programs it cannot run faithfully to CPython.**
+  A class with a custom `metaclass=` (anything but the real `ABCMeta` or
+  `type`, including `abc.ABCMeta` after the program reassigns it or
+  `setattr`s it, `ABCMeta` read off a computed value, and the `abc` module itself under
+  an `ABCMeta` alias), a class defining or assigning `__del__`, and any use of `with_traceback` / `__traceback__`
+  now take the compiled path with a `note:`. Before, the VM silently
+  skipped the metaclass and the finaliser, and raised `AttributeError` for
+  the traceback attributes.
+
+### Documentation
+
+- The VM docs (`docs/vm.md`, `tyc run` page, bundled skill) no longer say
+  generators are eager and `send()` is unsupported. Generators have been
+  lazy for a while; only a `yield` the tree-walk cannot suspend still falls
+  back to eager collection.
+- `tyc check --help` describes what `--stubs` actually does (a surface diff
+  against the sibling implementation), not the old parse-only behaviour.
+- The docs site names the real stubtest command, `python -m mypy.stubtest`.
+- `tyc init` docs no longer claim the generated `typhon.toml` lists every
+  key. `TYPE_SYSTEM_FRONTIER.md` records that integer accumulator loops
+  already parallelise. Four comments pointing at moved review files are
+  fixed.
+
 ## Unreleased — Python 3.15 support
 
 CPython 3.15 joins 3.13 in CI as an interpreter for emitted code, and a
