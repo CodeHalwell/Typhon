@@ -341,7 +341,8 @@ fn check_scope(args: &CheckArgs, scope: &CheckScope) -> Result<ScopeOutcome> {
     extra_modules.dedup();
     // Build the import-vetting HashSets exactly once; the per-file
     // unknown-module pass reuses them via `check_unknown_modules_with`.
-    let vetting_ctx = tyc_resolve::ImportVettingContext::new(&project_modules, &extra_modules);
+    let vetting_ctx = tyc_resolve::ImportVettingContext::new(&project_modules, &extra_modules)
+        .with_python_target(python_target_u8(&config.python.target).unwrap_or((3, 13)));
 
     // Project-wide shape registry: dotted module name → public class /
     // function shapes the module exports. Built once before the per-file

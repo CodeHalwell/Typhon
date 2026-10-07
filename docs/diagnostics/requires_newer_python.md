@@ -1,8 +1,8 @@
 # tyc::requires_newer_python
 
-Fires when a file uses Python syntax that the project's `[python] target`
-cannot parse: for example a Python 3.15 unpacking comprehension in a project
-that targets 3.13.
+Fires when a file uses Python syntax or a builtin that the project's
+`[python] target` does not have: for example a Python 3.15 unpacking
+comprehension, or `frozendict`, in a project that targets 3.13.
 
 ## Example
 
@@ -24,8 +24,8 @@ Error: tyc::requires_newer_python
    ·                            ─┬─
    ·                             ╰── needs a newer Python than the project targets
    ╰────
-  help: raise `[python] target` in typhon.toml to a version that has this
-        syntax, or rewrite it without the newer form
+  help: raise `[python] target` in typhon.toml to a version that has it, or
+        rewrite the code without it
 ```
 
 ## Why
@@ -34,16 +34,31 @@ Error: tyc::requires_newer_python
 check a 3.15-only construct type-checked on a 3.13 target, `tyc build` copied
 it into the `.py`, and CPython 3.13 refused to compile the file. The program
 could never have run on its target, so rejecting it at `tyc check` changes no
-program that worked.
+program that worked. The same holds for a builtin the target lacks: on 3.13,
+`frozendict(...)` is a `NameError` (and was `tyc::unknown_name` before this
+check existed).
 
 The syntax covered is whatever the vendored parser knows to be
 version-gated. Above the 3.13 floor that is:
 
-| Syntax | Needs |
+| Feature | Needs |
 |---|---|
 | `except A, B:` without parentheses (PEP 758) | 3.14 |
 | template strings, `t"..."` (PEP 750) | 3.14 |
 | `*` / `**` unpacking in comprehensions, `[*xs for xs in lists]` (PEP 798) | 3.15 |
+| the `frozendict` builtin (PEP 814) | 3.15 |
+| the `sentinel` builtin (PEP 661) | 3.15 |
+
+A module that binds `frozendict` or `sentinel` itself (its own class, a
+function, an import, a parameter) is not checked for that name: there it may
+well not be the builtin.
+
+For a builtin the message reads:
+
+```text
+  × `frozendict` is a builtin added in Python 3.15 and the project targets
+  │ 3.13
+```
 
 Typhon's own `lazy import ALIAS = MODULE` is not affected: it compiles on
 every target, and only becomes the native PEP 810 statement in the emitted
@@ -51,11 +66,11 @@ Python of a 3.15 build.
 
 ## Severity
 
-Error, in `tyc check`, `tyc build` and `tyc run`.
+Error, in `tyc check`, `tyc build`, `tyc run` and the editor.
 
 ## Fix
 
-Either raise the target to a version with the syntax:
+Either raise the target to a version that has it:
 
 ```toml
 [python]

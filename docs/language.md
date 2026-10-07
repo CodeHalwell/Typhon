@@ -585,6 +585,38 @@ lazy import numpy as np
 
 A project whose only runtime-touching feature was `lazy import` therefore ships **no** generated `typhon_runtime/` package on a 3.15+ target. The change is `tyc build`-only and only on 3.15+ — 3.13 / 3.14 output is byte-for-byte unchanged, and `tyc check` / `tyc run` are unaffected. (If `[checker] external = "ty"` is enabled, run it with a PEP 810-aware `ty`; an older `ty` build will reject the native `lazy import` syntax in the emitted Python.)
 
+### Newer-Python syntax and builtins
+
+`[python] target` decides which Python features a program may use. Syntax and builtins newer than the target are rejected with `tyc::requires_newer_python` (an error) in `tyc check`, `tyc build`, `tyc run` and the editor, because the emitted `.py` could not compile or run there. Above the 3.13 floor:
+
+| Feature | Needs |
+|---|---|
+| `except A, B:` without parentheses (PEP 758) | 3.14 |
+| template strings, `t"..."` (PEP 750) | 3.14 |
+| unpacking comprehensions, `[*xs for xs in lists]`, `{**d for d in ds}` (PEP 798) | 3.15 |
+| `frozendict` (PEP 814) and `sentinel` (PEP 661) builtins | 3.15 |
+
+Typhon's own `lazy import` works on every target (see above). A module that defines its own `frozendict` or `sentinel` is not affected.
+
+On a 3.15 target:
+
+- **Unpacking comprehensions** spread each item into the result. `[*xs for xs in lists]` is a `list[T]` when `lists` holds iterables of `T`, and `{**d for d in ds}` is a `dict[K, V]` when `ds` holds `dict[K, V]` (or `Mapping[K, V]`) values.
+- **`frozendict[K, V]`** is a hashable, read-only mapping. Subscripts and `get` / `keys` / `values` / `items` / `copy` / `fromkeys` are typed like `dict`'s; it has no mutators, item assignment is rejected, and it is assignable to `Mapping[K, V]`. `fd | other` is a `frozendict`. `freeze let` keeps a `frozendict` a `frozendict` and freezes its values.
+- **`sentinel("NAME")`** makes a unique marker object that prints as `NAME`. `sentinel` is also usable as an annotation: `def get(key: str, default: int | sentinel = MISSING) -> int`.
+
+```typhon
+# typhon.toml: [python] target = "3.15"
+let MISSING = sentinel("MISSING")
+
+def main() -> None:
+    let rows: list[list[int]] = [[3, 1], [], [2]]
+    let flat: list[int] = [*row for row in rows]
+    let table = frozendict(a=1, b=2)
+    print(flat, table | {"c": 3}, MISSING)
+```
+
+Stdlib imports are vetted against the target too: `import sre_parse` is `tyc::unknown_module` on 3.15 (the module was removed), and `import annotationlib` is accepted from 3.14.
+
 ## Stubs and Python interop
 
 Typhon authors `.dty` stubs; the compiler emits standard PEP 561 `.pyi` for interop. Both formats coexist by design:
