@@ -1895,3 +1895,475 @@ assert CFG.get("a") == 1 and CFG.get("z", 2) == 2 and type(CFG).__name__ == TYPE
         assert_eq!(code.unwrap(), 0, "{ty}");
     }
 }
+
+#[test]
+fn rc3_except_handlers_catch_what_the_name_is_bound_to() {
+    // `IOError` / `EnvironmentError` are bound to the `OSError` constructor,
+    // so a raise builds an `OSError`; the handler compared its *spelling*
+    // ("IOError") with that kind and caught nothing. A handler now catches
+    // what its name is bound to — aliases, user aliases, tuples in a name.
+    assert_matches_cpython(
+        "rc3_except_handlers_catch_what_the_name_is_bound_to",
+        r#"def catch(raiser, handler_label):
+    try:
+        raiser()
+    except IOError as e:
+        return handler_label + " io " + type(e).__name__
+    except Exception as e:
+        return handler_label + " other " + type(e).__name__
+def raise_io():
+    raise IOError("disk full")
+def raise_env():
+    raise EnvironmentError("e")
+def raise_os():
+    raise OSError("o")
+def raise_fnf():
+    raise FileNotFoundError("f")
+def raise_open():
+    open("/nonexistent-tyc-probe/dir/file")
+def raise_key():
+    raise KeyError("k")
+for label, r in [("io", raise_io), ("env", raise_env), ("os", raise_os), ("fnf", raise_fnf), ("open", raise_open), ("key", raise_key)]:
+    show(catch(r, label))
+def tuple_form():
+    try:
+        raise IOError("x")
+    except (ValueError, IOError) as e:
+        return "tuple " + type(e).__name__
+show(tuple_form())
+def env_perm():
+    try:
+        raise PermissionError("p")
+    except EnvironmentError as e:
+        return "perm " + type(e).__name__
+show(env_perm())
+def star():
+    try:
+        raise ExceptionGroup("g", [IOError("x"), ValueError("v")])
+    except* IOError as eg:
+        show("star io", len(eg.exceptions), type(eg.exceptions[0]).__name__)
+    except* ValueError as eg:
+        show("star v", len(eg.exceptions))
+star()
+Alias = ValueError
+ERRS = (KeyError, IndexError)
+def alias():
+    try:
+        raise ValueError("v")
+    except Alias as e:
+        return "alias " + type(e).__name__
+def errs():
+    try:
+        [][1]
+    except ERRS as e:
+        return "errs " + type(e).__name__
+show(alias(), errs())
+class StorageError(IOError):
+    pass
+def user_sub():
+    try:
+        raise StorageError("s")
+    except OSError as e:
+        return "user " + type(e).__name__
+show(user_sub())
+def raise_sub():
+    raise StorageError("s")
+show(catch(raise_sub, "sub"))
+show(issubclass(StorageError, OSError), issubclass(StorageError, IOError), isinstance(StorageError("x"), OSError))
+class IOErrorLike(Exception):
+    pass
+def lookalike():
+    try:
+        raise IOErrorLike("z")
+    except OSError:
+        return "wrong"
+    except IOErrorLike:
+        return "lookalike"
+show(lookalike())
+"#,
+    );
+}
+
+#[test]
+fn rc3_global_reads_skip_enclosing_function_frames() {
+    // `global X` routed writes to the module but reads walked the enclosing
+    // function frames first, so a nested function saw its parent's local.
+    assert_matches_cpython(
+        "rc3_global_reads_skip_enclosing_function_frames",
+        r#"X = 1
+def outer():
+    X = 2
+    def inner():
+        global X
+        show("inner sees", X)
+        X = 5
+        show("inner after", X)
+        def innermost():
+            return X
+        show("innermost", innermost(), [X for _ in range(2)])
+    inner()
+    show("outer", X)
+outer()
+show("module", X)
+def outer2():
+    V = 3
+    def inner2():
+        global V
+        V = 7
+        del V
+        try:
+            show(V)
+        except NameError as e:
+            show("deleted", e)
+    inner2()
+    show("outer2", V)
+outer2()
+COUNT = 0
+def bump():
+    global COUNT
+    COUNT += 1
+    return COUNT
+def wrap():
+    COUNT = 100
+    bump()
+    return bump() + COUNT
+show(wrap(), COUNT)
+def uses_builtin():
+    global len
+    return len([1, 2, 3])
+show(uses_builtin())
+"#,
+    );
+}
+
+#[test]
+fn rc3_augmented_assignment_calls_inplace_dunders() {
+    // `x op= y` never looked up `__iadd__` / `__ior__` / …: a class with only
+    // `__iadd__` crashed, an accumulator lost its identity, `dict |=` and
+    // `os.environ |=` rebound the name to a fresh dict.
+    assert_matches_cpython(
+        "rc3_augmented_assignment_calls_inplace_dunders",
+        r#"import os
+from collections import deque, Counter, OrderedDict, UserDict, UserList
+plain class Bag:
+    def __init__(self):
+        self.items = []
+    def __iadd__(self, o):
+        self.items.extend(o)
+        return self
+mut b = Bag()
+alias = b
+b += [1, 2]
+show(type(b).__name__, b is alias, alias.items)
+plain class Both:
+    def __init__(self, n):
+        self.n = n
+    def __add__(self, o):
+        return Both(self.n + o)
+    def __iadd__(self, o):
+        self.n += o * 10
+        return self
+mut bo = Both(1)
+bo0 = bo
+bo += 2
+show(bo.n, bo is bo0)
+plain class Declines:
+    def __init__(self, v):
+        self.v = v
+    def __iadd__(self, o):
+        return NotImplemented
+    def __add__(self, o):
+        return Declines(self.v + o)
+mut dc = Declines(1)
+dc0 = dc
+dc += 5
+show(dc.v, dc is dc0, dc0.v)
+plain class Flags:
+    def __init__(self):
+        self.bits = 0
+    def __ior__(self, o):
+        self.bits |= o
+        return self
+    def __iand__(self, o):
+        self.bits &= o
+        return self
+    def __ixor__(self, o):
+        self.bits ^= o
+        return self
+    def __isub__(self, o):
+        self.bits -= o
+        return self
+    def __imul__(self, o):
+        self.bits *= o
+        return self
+    def __ilshift__(self, o):
+        self.bits <<= o
+        return self
+mut fl = Flags()
+fl0 = fl
+fl |= 6
+fl &= 3
+fl -= 1
+fl *= 10
+fl ^= 1
+fl <<= 2
+show(fl.bits, fl is fl0)
+plain class Holder:
+    def __init__(self):
+        self.acc = Bag()
+h = Holder()
+h.acc += [7]
+store = {"k": Bag()}
+store["k"] += [8]
+show(h.acc.items, store["k"].items)
+mut q = deque([1])
+q0 = q
+q += [2, 3]
+show(q, q is q0)
+mut d = {"a": 1}
+e = d
+d |= {"b": 2}
+d |= [("c", 3)]
+show(d, e, d is e)
+mut c = Counter("aab")
+c0 = c
+c += Counter("b")
+c -= {"a": 1}
+c |= Counter("zzz")
+show(sorted(c.items()), c is c0)
+mut od = OrderedDict(a=1)
+od0 = od
+od |= {"b": 2}
+show(list(od.items()), od is od0)
+mut ud = UserDict({"a": 1})
+ud0 = ud
+ud |= {"b": 2}
+show(ud.data, ud is ud0)
+mut ul = UserList([1])
+ul0 = ul
+ul += [2]
+ul *= 2
+show(ul.data, ul is ul0)
+mut ba = bytearray(b"ab")
+ba0 = ba
+ba += b"cd"
+show(ba, ba is ba0)
+mut t = (1,)
+t0 = t
+t += (2,)
+show(t, t0, t is t0)
+mut n = 5
+n += 1
+n **= 2
+show(n)
+env = os.environ
+os.environ |= {"TYC_PROBE_IOR": "i"}
+show(type(os.environ).__name__, os.environ is env, env["TYC_PROBE_IOR"], os.path.expandvars("$TYC_PROBE_IOR"))
+"#,
+    );
+}
+
+#[test]
+fn rc3_type_objects_call_and_relate_like_cpython() {
+    // `type(x)` of a builtin value is a stand-in class that was not
+    // callable (`raise type(e)(msg) from e`, `type(default)(raw)`), and the
+    // metaclass stand-ins round 2 introduced dropped `type` from their bases.
+    assert_matches_cpython(
+        "rc3_type_objects_call_and_relate_like_cpython",
+        r#"from enum import Enum
+from abc import ABC, ABCMeta
+from typing import Protocol, TypedDict
+class Color(Enum):
+    RED = 1
+plain class Shape(ABC):
+    def area(self):
+        return 1.0
+class P(Protocol):
+    def m(self) -> int: ...
+class TD(TypedDict):
+    a: int
+plain class Plain:
+    pass
+def is_class(c):
+    return issubclass(type(c), type)
+show(is_class(Color), is_class(Shape), is_class(Plain), is_class(Color.RED), is_class(P), is_class(TD))
+for cls in [Color, Shape, P, TD, Plain]:
+    show([k.__name__ for k in type(cls).__mro__])
+show(type(Shape) is ABCMeta, isinstance(Shape, ABCMeta), isinstance(P, ABCMeta), isinstance(Color, ABCMeta), isinstance(Plain, ABCMeta))
+show(issubclass(type(P), ABCMeta), issubclass(type(Shape), ABCMeta), issubclass(type(Color), ABCMeta), issubclass(ABCMeta, type))
+show(isinstance(Color, type), isinstance(type(Color), type), isinstance(Color, type(Color)))
+def reraise():
+    try:
+        int("x")
+    except ValueError as e:
+        raise type(e)("wrapped: " + str(e)) from e
+try:
+    reraise()
+except Exception as ex:
+    show(type(ex).__name__, ex, type(ex.__cause__).__name__)
+def raise_bare():
+    try:
+        raise type(KeyError("k"))
+    except KeyError as e:
+        return "bare " + type(e).__name__ + " " + repr(e.args)
+show(raise_bare())
+def parse(default, raw):
+    return type(default)(raw)
+trap("parse", lambda: (parse(0, "42"), parse(1.0, "2"), parse("", 3), parse([], (1, 2))))
+trap("builtins", lambda: (type(1)("5"), type({})(a=1), type(True)(0), type(())([1]), sorted(type({1})([3, 2])), type(b"")(2)))
+trap("empty", lambda: (type(0)(), type("")(), type([])(), type(None)()))
+trap("exc", lambda: (repr(type(KeyError("k"))("other")), type(IOError("x"))("y").args))
+trap("type3", lambda: (lambda D: (D.__name__, D().z, isinstance(D(), Plain)))(type(Plain)("D", (Plain,), {"z": 3})))
+trap("typetype", lambda: type(type(1))(5) is int)
+"#,
+    );
+}
+
+#[test]
+fn rc3_index_arguments_and_bytes_join_match_cpython() {
+    // `list.index` / `tuple.index` bounds and `bytes.split` maxsplit refused
+    // an `IntEnum` member or an `__index__` object; `bytes.join` dropped a
+    // generator's items (`b''`) and joined ints as bytes.
+    assert_matches_cpython(
+        "rc3_index_arguments_and_bytes_join_match_cpython",
+        r#"from enum import IntEnum
+class Ix(IntEnum):
+    ONE = 1
+    TWO = 2
+plain class Idx:
+    def __init__(self, v):
+        self.v = v
+    def __index__(self):
+        return self.v
+plain class BadIdx:
+    def __index__(self):
+        return "no"
+plain class NoIdx:
+    pass
+trap("list start", lambda: [1, 2, 3].index(3, Ix.ONE))
+trap("list start miss", lambda: [1, 2, 3].index(1, Ix.ONE))
+trap("list stop", lambda: [1, 2, 3].index(3, 0, Ix.TWO))
+trap("tuple start", lambda: (1, 2, 3).index(3, Ix.ONE))
+trap("tuple start miss", lambda: (1, 2, 3).index(1, Ix.ONE))
+trap("list __index__", lambda: ([1, 2, 3].index(3, Idx(1)), [1, 2, 3].index(3, Idx(-1)), (1, 2, 3).index(2, Idx(0), Idx(2))))
+trap("bad __index__", lambda: [1, 2, 3].index(3, BadIdx()))
+trap("no __index__", lambda: [1, 2, 3].index(3, NoIdx()))
+trap("float bound", lambda: [1, 2, 3].index(3, 1.0))
+trap("split", lambda: (b"a b c".split(b" ", Ix.ONE), b"a b c".rsplit(b" ", Ix.ONE), b"a b c".split(b" ", Idx(1)), b"a b c".split(None, Ix.ONE)))
+trap("split kw", lambda: b"a b c".split(b" ", maxsplit=Ix.ONE))
+trap("split float", lambda: b"a b c".split(b" ", 1.5))
+trap("split no __index__", lambda: b"a b c".split(b" ", NoIdx()))
+trap("join gen", lambda: b"-".join(x for x in [b"a", b"b"]))
+trap("join iter", lambda: b"-".join(iter([b"a", b"b"])))
+trap("join map", lambda: b"-".join(map(lambda s: s.encode(), ["x", "y"])))
+trap("join ints", lambda: b"-".join([1, 2]))
+trap("join mixed", lambda: b"-".join([b"a", 2]))
+trap("join str", lambda: b"-".join(["a"]))
+trap("join bytes", lambda: b"-".join(b"ab"))
+trap("join tuple", lambda: b"-".join((b"a", bytearray(b"b"))))
+trap("join empty", lambda: (b"-".join([]), b"-".join(x for x in [])))
+trap("join int", lambda: b"-".join(5))
+"#,
+    );
+}
+
+#[test]
+fn rc3_environ_and_dict_shims_behave_as_mappings() {
+    // Round 2 made `os.environ` an `os._Environ` mapping; mapping patterns,
+    // `as! Mapping[...]`, `json.dumps(..., default=)` and `Counter(...)`
+    // still assumed a dict. The `defaultdict` shim also lacked most dict
+    // methods.
+    assert_matches_cpython(
+        "rc3_environ_and_dict_shims_behave_as_mappings",
+        r#"import os
+import json
+from json import dumps
+from collections import Counter, OrderedDict, defaultdict, ChainMap, UserDict
+from collections.abc import Mapping, MutableMapping
+os.environ["TYC_PROBE_M"] = "m"
+def mm(x):
+    match x:
+        case {"TYC_PROBE_M": v, **rest}:
+            return "env " + v + " " + str("TYC_PROBE_M" in rest) + " " + type(rest).__name__
+        case {"a": 1, **rest}:
+            return "a1 " + repr(rest)
+        case {"b": v}:
+            return "b " + repr(v)
+        case _:
+            return "other"
+for label, subject in [("environ", os.environ), ("Counter", Counter("abb")), ("Counter1", Counter("a")), ("OrderedDict", OrderedDict(a=1, c=3)), ("defaultdict", defaultdict(int, {"b": 0})), ("UserDict", UserDict({"a": 1, "z": 9})), ("ChainMap", ChainMap({"b": 2})), ("list", [1]), ("dict", {"b": 5})]:
+    trap("match " + label, lambda: mm(subject))
+trap("match no factory call", lambda: (lambda d: (mm(d), len(d)))(defaultdict(int)))
+trap("isinstance", lambda: (isinstance(os.environ, Mapping), isinstance(os.environ, MutableMapping), isinstance(os.environ, dict), isinstance(UserDict(), MutableMapping), isinstance(ChainMap(), Mapping)))
+trap("Counter environ", lambda: Counter(os.environ)["TYC_PROBE_M"])
+trap("Counter UserDict", lambda: Counter(UserDict({"a": 5}))["a"])
+trap("Counter str values", lambda: Counter({"a": "x"})["a"])
+trap("Counter ChainMap", lambda: sorted(Counter(ChainMap({"a": 2}, {"b": 3})).items()))
+trap("Counter update", lambda: (lambda c: (c.update({"a": 5}), sorted(c.items()))[1])(Counter("ab")))
+trap("Counter subtract", lambda: (lambda c: (c.subtract(UserDict({"b": 3})), sorted(c.items()))[1])(Counter("aab")))
+trap("json Counter", lambda: (json.dumps(Counter("aab")), json.dumps(OrderedDict(a=1)), json.dumps(defaultdict(list, {"a": [1]}))))
+trap("json UserDict", lambda: json.dumps(UserDict({"a": 1})))
+trap("json environ", lambda: json.dumps(os.environ)[:1])
+trap("json default environ", lambda: dumps(os.environ, default=dict)[:1])
+kw = {"default": lambda o: "E"}
+trap("json default kw", lambda: json.dumps([os.environ, {1}], **kw))
+trap("json default nested", lambda: dumps({"env": os.environ, "s": {3}}, default=lambda o: sorted(o) if isinstance(o, set) else "env"))
+plain class Pt:
+    def __init__(self):
+        self.x = 1
+trap("json default obj", lambda: dumps([Pt()], default=lambda o: type(o).__name__))
+trap("json default self", lambda: dumps(Pt(), default=lambda o: o))
+trap("json default raises", lambda: dumps(Pt(), default=lambda o: 1 / 0))
+trap("json default none", lambda: dumps(Pt(), default=None))
+trap("json default indent", lambda: dumps({"a": {1}}, default=list, indent=2))
+trap("json default sort", lambda: dumps({"b": Pt(), "a": 1}, default=lambda o: o.x, sort_keys=True))
+trap("json Counter default", lambda: dumps(Counter("ab"), default=lambda o: "never"))
+dd = defaultdict(list)
+dd["a"].append(1)
+trap("dd pop", lambda: (dd.pop("a"), dd.pop("zz", 7)))
+trap("dd pop miss", lambda: dd.pop("zz"))
+trap("dd setdefault", lambda: (dd.setdefault("c", [3]), dd.setdefault("c", [4])))
+trap("dd update", lambda: (dd.update({"d": [4]}), dd.update([("e", [5])]), dd.update(f=[6]), sorted(dd))[3])
+trap("dd del miss", lambda: dd.__delitem__("nope"))
+trap("dd or", lambda: (dd | {"z": [0]}, type(dd | {}).__name__, {"y": [9]} | dd, type({} | dd).__name__))
+trap("dd copy", lambda: (lambda c: (type(c).__name__, c.default_factory is list, c == dd, c is dd))(dd.copy()))
+trap("dd popitem", lambda: dd.popitem())
+trap("dd clear", lambda: (dd.clear(), len(dd))[1])
+trap("dd popitem empty", lambda: dd.popitem())
+trap("dd ctor", lambda: (defaultdict(int, a=1), defaultdict(int, {"a": 1}, b=2), defaultdict(list, [("a", [1])]), defaultdict()))
+trap("dd reversed", lambda: list(reversed(defaultdict(int, {"a": 1, "b": 2}))))
+mut dd2 = defaultdict(int, {"a": 1})
+dd2_alias = dd2
+dd2 |= {"b": 2}
+show(dd2, dd2 is dd2_alias)
+"#,
+    );
+}
+
+#[test]
+fn rc3_environ_passes_mapping_casts() {
+    // `os.environ as! Mapping[str, str]` failed once round 2 made it an
+    // `os._Environ` (it is a `MutableMapping`, not a dict).
+    assert_matches_cpython_with(
+        "rc3_environ_passes_mapping_casts",
+        r#"import os
+from typing import Any, Mapping, MutableMapping
+from collections import ChainMap, UserDict, Counter
+os.environ["TYC_PROBE_CAST"] = "c"
+def cast(label: str, value: object, thunk: Any) -> None:
+    try:
+        r = thunk(value)
+        out.append(label + " = " + type(r).__name__ + (" (same)" if r is value else ""))
+    except BaseException as e:
+        out.append(label + " ! " + type(e).__name__)
+cast("environ Mapping", os.environ, lambda v: __typhon_checked_cast__(v, Mapping[str, str]))
+cast("environ MutableMapping", os.environ, lambda v: __typhon_checked_cast__(v, MutableMapping[str, str]))
+cast("environ dict", os.environ, lambda v: __typhon_checked_cast__(v, dict[str, str]))
+cast("environ Mapping[str, int]", os.environ, lambda v: __typhon_checked_cast__(v, Mapping[str, int]))
+cast("ChainMap Mapping", ChainMap({"a": 1}), lambda v: __typhon_checked_cast__(v, Mapping[str, int]))
+cast("UserDict MutableMapping", UserDict({"a": 1}), lambda v: __typhon_checked_cast__(v, MutableMapping[str, int]))
+cast("Counter Mapping", Counter("ab"), lambda v: __typhon_checked_cast__(v, Mapping[str, int]))
+"#,
+        &cast_runtime_py(),
+    );
+}

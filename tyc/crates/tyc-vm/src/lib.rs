@@ -7868,4 +7868,313 @@ assert repr(frozendict) == "<class 'frozendict'>" and type(fd) is frozendict
 "#;
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
+
+    /// Names resolve to what they are bound to (pinned from CPython 3.13):
+    /// an `except` handler catches what its name is bound to — `IOError` /
+    /// `EnvironmentError` are `OSError`, so they catch the `OSError` an
+    /// `IOError(...)` builds — and `global X` in a nested function reads the
+    /// module's `X`, not the enclosing function's local.
+    #[test]
+    fn handlers_and_global_reads_resolve_the_bound_name() {
+        let src = r#"
+def caught(raiser: object) -> str:
+    try:
+        raiser()
+    except IOError as e:
+        return "io " + type(e).__name__
+    except Exception as e:
+        return "other " + type(e).__name__
+    return "none"
+
+def raise_io() -> None:
+    raise IOError("disk full")
+def raise_env() -> None:
+    raise EnvironmentError("e")
+def raise_os() -> None:
+    raise OSError("o")
+def raise_fnf() -> None:
+    raise FileNotFoundError("f")
+def raise_key() -> None:
+    raise KeyError("k")
+assert caught(raise_io) == "io OSError" and caught(raise_env) == "io OSError"
+assert caught(raise_os) == "io OSError" and caught(raise_fnf) == "io FileNotFoundError"
+assert caught(raise_key) == "other KeyError"
+try:
+    raise IOError("x")
+except (ValueError, IOError) as e:
+    assert type(e) is OSError
+try:
+    raise PermissionError("p")
+except EnvironmentError as e:
+    assert type(e).__name__ == "PermissionError"
+mut star: list[str] = []
+try:
+    raise ExceptionGroup("g", [IOError("x"), ValueError("v")])
+except* IOError as eg:
+    star.append("io " + str(len(eg.exceptions)))
+except* ValueError as eg:
+    star.append("v " + str(len(eg.exceptions)))
+assert star == ["io 1", "v 1"]
+Alias = ValueError
+ERRS = (KeyError, IndexError)
+try:
+    raise ValueError("v")
+except Alias as e:
+    assert str(e) == "v"
+try:
+    print([][1])
+except ERRS as e:
+    assert type(e).__name__ == "IndexError"
+plain class StorageError(IOError):
+    pass
+try:
+    raise StorageError("s")
+except OSError as e:
+    assert type(e).__name__ == "StorageError"
+assert issubclass(StorageError, OSError) and isinstance(StorageError("x"), OSError)
+plain class IOErrorLike(Exception):
+    pass
+try:
+    try:
+        raise IOErrorLike("z")
+    except OSError:
+        assert False, "a lookalike name is not OSError"
+except IOErrorLike:
+    pass
+
+mut X: int = 1
+mut seen: list[object] = []
+def outer() -> None:
+    let X: int = 2
+    def inner() -> None:
+        global X
+        seen.append(X)
+        X = 5
+        seen.append(X)
+        def innermost() -> int:
+            return X
+        seen.append(innermost())
+    inner()
+    seen.append(X)
+outer()
+assert seen == [1, 5, 5, 2] and X == 5
+def outer2() -> int:
+    let V: int = 3
+    def inner2() -> None:
+        global V
+        V = 7
+        del V
+    inner2()
+    return V
+def read_v() -> object:
+    try:
+        return V
+    except NameError:
+        return "unbound"
+assert outer2() == 3 and read_v() == "unbound"
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// Augmented assignment tries the in-place dunder first and type
+    /// objects behave as types (pinned from CPython 3.13): `x += y` calls
+    /// `__iadd__` (falling back to `__add__` on a missing method or
+    /// `NotImplemented`), `dict |=` updates in place, calling `type(x)` calls
+    /// the type, and a metaclass stand-in is a subclass of `type`.
+    #[test]
+    fn inplace_dunders_and_callable_type_objects() {
+        let src = r#"
+import os
+from collections import deque, Counter
+from enum import Enum
+from abc import ABC, ABCMeta
+
+plain class Bag:
+    def __init__(self) -> None:
+        self.items: list[int] = []
+    def __iadd__(self, o: list[int]) -> "Bag":
+        self.items.extend(o)
+        return self
+mut b = Bag()
+let alias = b
+b += [1, 2]
+assert b is alias and alias.items == [1, 2]
+plain class Both:
+    def __init__(self, n: int) -> None:
+        self.n = n
+    def __add__(self, o: int) -> "Both":
+        return Both(self.n + o)
+    def __iadd__(self, o: int) -> "Both":
+        self.n += o * 10
+        return self
+mut bo = Both(1)
+bo += 2
+assert bo.n == 21
+plain class Declines:
+    def __init__(self, v: int) -> None:
+        self.v = v
+    def __iadd__(self, o: int) -> object:
+        return NotImplemented
+    def __add__(self, o: int) -> "Declines":
+        return Declines(self.v + o)
+mut dc = Declines(1)
+let dc0 = dc
+dc += 5
+assert dc.v == 6 and dc is not dc0 and dc0.v == 1
+mut d: dict[str, int] = {"a": 1}
+let e = d
+d |= {"b": 2}
+d |= [("c", 3)]
+assert e == {"a": 1, "b": 2, "c": 3} and d is e
+mut q = deque([1])
+let q0 = q
+q += [2, 3]
+assert q is q0 and list(q) == [1, 2, 3]
+mut c = Counter("aab")
+let c0 = c
+c += Counter("b")
+c -= {"a": 1}
+assert c is c0 and sorted(c.items()) == [("a", 1), ("b", 2)]
+let env = os.environ
+os.environ |= {"TYC_PIN_IOR": "i"}
+assert os.environ is env and type(os.environ).__name__ == "_Environ"
+assert os.path.expandvars("$TYC_PIN_IOR") == "i"
+mut t = (1,)
+let t0 = t
+t += (2,)
+assert t == (1, 2) and t0 == (1,)
+
+class Color(Enum):
+    RED = 1
+plain class Shape(ABC):
+    pass
+plain class Plain:
+    pass
+def is_class(c: object) -> bool:
+    return issubclass(type(c), type)
+assert is_class(Color) and is_class(Shape) and is_class(Plain) and not is_class(Color.RED)
+assert [k.__name__ for k in type(Color).__mro__] == ["EnumType", "type", "object"]
+assert [k.__name__ for k in type(Shape).__mro__] == ["ABCMeta", "type", "object"]
+assert isinstance(Shape, ABCMeta) and not isinstance(Color, ABCMeta) and issubclass(ABCMeta, type)
+
+def reraise() -> None:
+    try:
+        int("x")
+    except ValueError as err:
+        raise type(err)("wrapped: " + str(err)) from err
+try:
+    reraise()
+except Exception as ex:
+    assert type(ex) is ValueError and str(ex) == "wrapped: invalid literal for int() with base 10: 'x'"
+    assert type(ex.__cause__) is ValueError
+def parse(default: object, raw: object) -> object:
+    return type(default)(raw)
+assert parse(0, "42") == 42 and parse(1.0, "2") == 2.0 and parse("", 3) == "3" and parse([], (1, 2)) == [1, 2]
+assert type({})(a=1) == {"a": 1} and type(True)(0) is False and type(None)() is None
+assert repr(type(KeyError("k"))("other")) == "KeyError('other')"
+let D = type(Plain)("D", (Plain,), {"z": 3})
+assert D.__name__ == "D" and D().z == 3 and isinstance(D(), Plain)
+try:
+    raise type(KeyError("k"))
+except KeyError as bare:
+    assert bare.args == ()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// `os.environ` and the dict shims behave as the mappings they are
+    /// (pinned from CPython 3.13), `__index__` arguments are read, and
+    /// `bytes.join` takes any iterable of bytes-likes only.
+    #[test]
+    fn mapping_shims_index_arguments_and_bytes_join() {
+        let src = r#"
+import os
+import json
+from json import dumps
+from collections import Counter, OrderedDict, defaultdict, ChainMap, UserDict
+from collections.abc import Callable, Mapping, MutableMapping
+from enum import IntEnum
+
+def err(thunk: Callable[[], object]) -> str:
+    try:
+        thunk()
+    except Exception as e:
+        return type(e).__name__ + ": " + str(e)
+    return "no error"
+
+os.environ["TYC_PIN_M"] = "m"
+def mm(x: object) -> str:
+    match x:
+        case {"TYC_PIN_M": v, **rest}:
+            return "env " + str(v) + " " + str("TYC_PIN_M" in rest) + " " + type(rest).__name__
+        case {"a": 1, **rest}:
+            return "a1 " + repr(rest)
+        case {"b": v}:
+            return "b " + repr(v)
+        case _:
+            return "other"
+assert mm(os.environ) == "env m False dict"
+assert mm(Counter("abb")) == "a1 {'b': 2}" and mm(OrderedDict(a=1, c=3)) == "a1 {'c': 3}"
+assert mm(defaultdict(int, {"b": 0})) == "b 0" and mm(UserDict({"a": 1, "z": 9})) == "a1 {'z': 9}"
+assert mm(ChainMap({"b": 2})) == "b 2" and mm([1]) == "other"
+let empty_dd = defaultdict(int)
+assert mm(empty_dd) == "other" and len(empty_dd) == 0
+let raw: object = os.environ
+let m = raw as! Mapping[str, str]
+let mmut = raw as! MutableMapping[str, str]
+assert m["TYC_PIN_M"] == "m" and mmut is os.environ
+assert isinstance(os.environ, Mapping) and not isinstance(os.environ, dict)
+assert Counter(os.environ)["TYC_PIN_M"] == "m" and Counter(UserDict({"a": 5}))["a"] == 5
+assert Counter({"a": "x"})["a"] == "x"
+assert sorted(Counter(ChainMap({"a": 2}, {"b": 3})).items()) == [("a", 2), ("b", 3)]
+assert json.dumps(Counter("aab")) == '{"a": 2, "b": 1}' and json.dumps(defaultdict(list, {"a": [1]})) == '{"a": [1]}'
+assert err(lambda: json.dumps(os.environ)) == "TypeError: Object of type _Environ is not JSON serializable"
+assert dumps(os.environ, default=dict)[:1] == "{"
+let kw = {"default": lambda o: "E"}
+assert json.dumps([os.environ, {1}], **kw) == '["E", "E"]'
+assert dumps({"a": {1}}, default=list, indent=2) == '{\n  "a": [\n    1\n  ]\n}'
+plain class Pt:
+    pass
+assert err(lambda: dumps(Pt(), default=lambda o: o)) == "ValueError: Circular reference detected"
+assert err(lambda: dumps(Pt(), default=None)) == "TypeError: Object of type Pt is not JSON serializable"
+
+let dd: defaultdict[str, list[int]] = defaultdict(list)
+dd["a"].append(1)
+assert dd.pop("a") == [1] and dd.pop("zz", 7) == 7 and err(lambda: dd.pop("zz")) == "KeyError: 'zz'"
+assert dd.setdefault("c", [3]) == [3] and dd.setdefault("c", [4]) == [3]
+dd.update({"d": [4]})
+dd.update([("e", [5])], f=[6])
+del dd["d"]
+assert sorted(dd) == ["c", "e", "f"] and err(lambda: dd.__delitem__("nope")) == "KeyError: 'nope'"
+assert type(dd | {"z": [0]}).__name__ == "defaultdict" and type({"y": [9]} | dd).__name__ == "defaultdict"
+let cp = dd.copy()
+assert type(cp) is defaultdict and cp.default_factory is list and cp == dd and cp is not dd
+assert dd.popitem() == ("f", [6])
+dd.clear()
+assert len(dd) == 0 and err(lambda: dd.popitem()) == "KeyError: 'popitem(): dictionary is empty'"
+assert repr(defaultdict(int, a=1)) == "defaultdict(<class 'int'>, {'a': 1})"
+assert repr(defaultdict(list, [("a", [1])])) == "defaultdict(<class 'list'>, {'a': [1]})"
+
+class Ix(IntEnum):
+    ONE = 1
+    TWO = 2
+plain class Idx:
+    def __init__(self, v: int) -> None:
+        self.v = v
+    def __index__(self) -> int:
+        return self.v
+assert [1, 2, 3].index(3, Ix.ONE) == 2 and (1, 2, 3).index(3, Ix.ONE) == 2
+assert err(lambda: [1, 2, 3].index(3, 0, Ix.TWO)) == "ValueError: 3 is not in list"
+assert err(lambda: (1, 2, 3).index(1, Ix.ONE)) == "ValueError: tuple.index(x): x not in tuple"
+assert [1, 2, 3].index(3, Idx(-1)) == 2 and (1, 2, 3).index(2, Idx(0), Idx(2)) == 1
+assert b"a b c".split(b" ", Ix.ONE) == [b"a", b"b c"] and b"a b c".rsplit(b" ", Idx(1)) == [b"a b", b"c"]
+assert err(lambda: [1, 2, 3].index(3, 1.0)) == "TypeError: slice indices must be integers or have an __index__ method"
+assert b"-".join(x for x in [b"a", b"b"]) == b"a-b" and b"-".join(iter([b"a"])) == b"a"
+assert b"-".join((b"a", bytearray(b"b"))) == b"a-b" and b"-".join(x for x in []) == b""
+assert err(lambda: b"-".join([1, 2])) == "TypeError: sequence item 0: expected a bytes-like object, int found"
+assert err(lambda: b"-".join([b"a", "b"])) == "TypeError: sequence item 1: expected a bytes-like object, str found"
+assert err(lambda: b"-".join(5)) == "TypeError: can only join an iterable"
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
 }

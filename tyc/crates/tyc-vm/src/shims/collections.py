@@ -5,6 +5,15 @@
 # `most_common` / `elements` / `rotate` / `move_to_end` APIs all behave as in
 # CPython. Validated against the real module (see validate_collections.py).
 
+def _is_mapping(obj):
+    # `isinstance(obj, collections.abc.Mapping)`: a dict (or a dict-subclass
+    # shim), or a class marked as a Mapping (`os.environ`, `UserDict`). The
+    # mark is read off the class: importing `collections.abc` from here would
+    # re-enter this module while it loads.
+    if isinstance(obj, dict) or isinstance(obj, _MappingBase):
+        return True
+    return "Mapping" in getattr(type(obj), "__typhon_builtin_bases__", ())
+
 
 class _MappingBase:
     def __getitem__(self, key):
@@ -127,19 +136,24 @@ class Counter(_MappingBase):
         self._data = {}
         self._count(iterable, kwargs)
 
+    # CPython's `Counter.update`: a `Mapping` (a dict, `os.environ`, another
+    # Counter) has its counts copied into an empty counter (`dict.update`) or
+    # added to the existing ones (`count + self.get(elem, 0)`); any other
+    # iterable has its elements counted.
     def _count(self, iterable, kwargs):
         if iterable is not None:
-            if isinstance(iterable, _MappingBase):
-                for k in list(iterable._data.keys()):
-                    self._data[k] = self._data.get(k, 0) + iterable._data[k]
-            elif isinstance(iterable, dict):
-                for k in list(iterable.keys()):
-                    self._data[k] = self._data.get(k, 0) + iterable[k]
+            if _is_mapping(iterable):
+                if self._data:
+                    for k in list(iterable.keys()):
+                        self._data[k] = iterable[k] + self._data.get(k, 0)
+                else:
+                    for k in list(iterable.keys()):
+                        self._data[k] = iterable[k]
             else:
                 for x in iterable:
                     self._data[x] = self._data.get(x, 0) + 1
-        for k in kwargs:
-            self._data[k] = self._data.get(k, 0) + kwargs[k]
+        if kwargs:
+            self._count(kwargs, {})
 
     def __missing__(self, key):
         return 0
@@ -153,10 +167,9 @@ class Counter(_MappingBase):
 
     def subtract(self, iterable=None, **kwargs):
         if iterable is not None:
-            if isinstance(iterable, _MappingBase) or isinstance(iterable, dict):
-                src = iterable._data if isinstance(iterable, _MappingBase) else iterable
-                for k in list(src.keys()):
-                    self._data[k] = self._data.get(k, 0) - src[k]
+            if _is_mapping(iterable):
+                for k in list(iterable.keys()):
+                    self._data[k] = self._data.get(k, 0) - iterable[k]
             else:
                 for x in iterable:
                     self._data[x] = self._data.get(x, 0) - 1
@@ -286,19 +299,20 @@ class Counter(_MappingBase):
                 result._data[k] = 0 - self._data[k]
         return result
 
+    # The in-place operators read `other` through `items()` / `[]`, as in
+    # CPython, so the right operand may be any mapping (`c += {"a": 1}`).
     def __iadd__(self, other):
-        for k in list(other._data.keys()):
-            self._data[k] = self._data.get(k, 0) + other._data[k]
+        for k, count in list(other.items()):
+            self._data[k] = self._data.get(k, 0) + count
         return self._keep_positive()
 
     def __isub__(self, other):
-        for k in list(other._data.keys()):
-            self._data[k] = self._data.get(k, 0) - other._data[k]
+        for k, count in list(other.items()):
+            self._data[k] = self._data.get(k, 0) - count
         return self._keep_positive()
 
     def __ior__(self, other):
-        for k in list(other._data.keys()):
-            other_count = other._data[k]
+        for k, other_count in list(other.items()):
             if other_count > self[k]:
                 self._data[k] = other_count
         return self._keep_positive()
@@ -358,6 +372,9 @@ class OrderedDict(_MappingBase):
 
 
 class ChainMap(_MappingBase):
+    # A `collections.abc.MutableMapping`, not a dict, as in CPython.
+    __typhon_builtin_bases__ = ("MutableMapping", "Mapping")
+
     def __init__(self, *maps):
         self.maps = list(maps) if maps else [{}]
 
@@ -796,6 +813,10 @@ def _namedtuple_fields(field_names):
 
 
 class UserDict:
+    # A `collections.abc.MutableMapping`, as in CPython: `isinstance`,
+    # `as! Mapping[...]` and mapping patterns accept it.
+    __typhon_builtin_bases__ = ("MutableMapping", "Mapping")
+
     def __init__(self, dict=None, /, **kwargs):
         self.data = {}
         if dict is not None:

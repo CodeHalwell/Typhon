@@ -2326,6 +2326,19 @@ fn builtin_type_is_a(name: &str, want: &str) -> bool {
         // Only an exception type is below `Exception` / `BaseException`.
         || (crate::value::is_exception_type_name(name)
             && crate::interp::builtin_exc_is_a(name, want))
+        // A metaclass is a `type` (and `_ProtocolMeta` an `ABCMeta`).
+        || metaclass_parents(name).contains(&want)
+}
+
+/// The bases above a metaclass stand-in, nearest first, up to (not
+/// including) `object`: `_ProtocolMeta` → `ABCMeta`, `type`. Empty for
+/// anything that is not a metaclass the VM models.
+fn metaclass_parents(name: &str) -> &'static [&'static str] {
+    match name {
+        "_ProtocolMeta" => &["ABCMeta", "type"],
+        "EnumType" | "ABCMeta" | "_TypedDictMeta" => &["type"],
+        _ => &[],
+    }
 }
 
 /// The Protocol classes among an `isinstance` target (which may be a tuple
@@ -2397,8 +2410,15 @@ pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
         // a builtin type, which the VM keeps as its constructor native.
         ("type", Value::Class(_)) => true,
         ("type", Value::Native(n)) => crate::value::native_is_type(n.name),
-        (meta, Value::Class(c)) if matches!(cls, Value::Class(m) if is_builtin_stand_in(m)) => {
-            metaclass_name(c) == meta
+        // `isinstance(Color, type(Color))`, and `isinstance(Shape,
+        // abc.ABCMeta)` through the `abc` module's native: the class's
+        // metaclass or one of its bases (`_ProtocolMeta` is an `ABCMeta`).
+        (meta, Value::Class(c))
+            if matches!(cls, Value::Class(m) if is_builtin_stand_in(m))
+                || (matches!(cls, Value::Native(_)) && !metaclass_parents(meta).is_empty()) =>
+        {
+            let own = metaclass_name(c);
+            own == meta || metaclass_parents(own).contains(&meta)
         }
         // Exception kind match — exact, or through the builtin exception
         // hierarchy (`isinstance(e, Exception)` where e is a ValueError;
@@ -2427,7 +2447,18 @@ pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
     }
 }
 
-fn class_in_chain(c: &Rc<crate::value::Class>, name: &str) -> bool {
+/// Whether instances of `class` are mappings to `match` and to `as!
+/// Mapping[...]`: a shim CPython defines as a `dict` subclass (`Counter`,
+/// `OrderedDict`, `defaultdict`) or as a `collections.abc` mapping
+/// (`os.environ`'s `_Environ`, `UserDict`, `ChainMap`), or a user subclass of
+/// one.
+pub(crate) fn is_mapping_class(class: &Rc<crate::value::Class>) -> bool {
+    ["dict", "Mapping", "MutableMapping", "UserDict"]
+        .iter()
+        .any(|name| class_in_chain(class, name))
+}
+
+pub(crate) fn class_in_chain(c: &Rc<crate::value::Class>, name: &str) -> bool {
     if c.name == name {
         return true;
     }
@@ -2734,19 +2765,15 @@ fn make_collections_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
     });
     entries.push(("namedtuple", namedtuple));
     entries.push(("abc", make_collections_abc_module()));
-    let defaultdict = nf("defaultdict", |i, mut args| {
-        // `defaultdict(factory[, mapping])` constructs a synthesised mapping
-        // instance whose `__missing__` calls `factory()` to materialise a
-        // default for absent keys (foundation `__missing__` hook). The
-        // backing store is a plain dict held in `self._data`.
-        let factory = if args.is_empty() {
-            Value::None
-        } else {
-            args.remove(0)
-        };
+    let defaultdict = nf("defaultdict", |i, args| {
+        // `defaultdict(factory[, mapping_or_pairs], **kwargs)` constructs a
+        // synthesised mapping instance whose `__missing__` calls `factory()`
+        // to materialise a default for absent keys (foundation `__missing__`
+        // hook). The backing store is a plain dict held in `self._data`.
+        // Keywords arrive as the trailing sentinel (`call_with_kwargs`).
+        let (pos, kw) = split_kwargs(&args);
         let cls = defaultdict_class(i)?;
-        let initial = args.into_iter().next().unwrap_or(Value::None);
-        i.call_value(cls, vec![factory, initial], &[])
+        i.call_value(cls, pos.to_vec(), &kw)
     });
     entries.push(("defaultdict", defaultdict));
     Ok(make_module("collections", entries))
@@ -3090,12 +3117,12 @@ const DEFAULTDICT_SRC: &str = r#"
 class defaultdict:
     __typhon_builtin_bases__ = ("dict", "defaultdict")
     __typhon_builtin_type__ = True
-    def __init__(self, default_factory, initial):
+    # `defaultdict(default_factory=None, /, [mapping_or_pairs], **kwargs)`:
+    # everything after the factory is what `dict(...)` takes.
+    def __init__(self, default_factory=None, *args, **kwargs):
         self._data = {}
         self.default_factory = default_factory
-        if initial is not None:
-            for k in initial:
-                self._data[k] = initial[k]
+        self.update(*args, **kwargs)
     def __getitem__(self, key):
         if key in self._data:
             return self._data[key]
@@ -3141,6 +3168,58 @@ class defaultdict:
         if isinstance(other, defaultdict):
             return self._data != other._data
         return self._data != other
+    # The rest of the `dict` methods, which never consult the factory.
+    def __delitem__(self, key):
+        if key not in self._data:
+            raise KeyError(key)
+        del self._data[key]
+    def pop(self, key, *default):
+        if len(default) > 1:
+            raise TypeError("pop expected at most 2 arguments, got %d" % (len(default) + 1))
+        if key in self._data:
+            value = self._data[key]
+            del self._data[key]
+            return value
+        if default:
+            return default[0]
+        raise KeyError(key)
+    def popitem(self):
+        if not self._data:
+            raise KeyError("popitem(): dictionary is empty")
+        return self._data.popitem()
+    def setdefault(self, key, default=None):
+        if key not in self._data:
+            self._data[key] = default
+        return self._data[key]
+    def update(self, *args, **kwargs):
+        if len(args) > 1:
+            raise TypeError("update expected at most 1 argument, got %d" % len(args))
+        if args:
+            self._data.update(args[0]._data if isinstance(args[0], defaultdict) else args[0])
+        self._data.update(kwargs)
+    def clear(self):
+        self._data.clear()
+    def copy(self):
+        return defaultdict(self.default_factory, self._data)
+    def __copy__(self):
+        return self.copy()
+    def __or__(self, other):
+        if not isinstance(other, dict):
+            return NotImplemented
+        new = self.copy()
+        new.update(other)
+        return new
+    def __ror__(self, other):
+        if not isinstance(other, dict):
+            return NotImplemented
+        new = defaultdict(self.default_factory, other)
+        new.update(self)
+        return new
+    def __ior__(self, other):
+        self.update(other)
+        return self
+    def __reversed__(self):
+        return reversed(list(self._data))
 "#;
 
 /// The `_NamedTupleBase` template from the `collections` shim, cached.
@@ -10148,6 +10227,41 @@ pub(crate) fn native_accepts_keyword(name: &str, kw: &str) -> Option<bool> {
     }))
 }
 
+/// Replace each argument at `positions` that is an instance standing for an
+/// integer — a value-mixin enum member, or an object with `__index__` — by
+/// that integer. Anything else is left for the method to accept or refuse.
+fn index_args(
+    interp: &mut Interpreter,
+    mut args: Vec<Value>,
+    positions: &[usize],
+) -> Result<Vec<Value>, Unwind> {
+    for &pos in positions {
+        let Some(v @ Value::Instance(inst)) = args.get(pos) else {
+            continue;
+        };
+        if let Some(inner @ (Value::Int(_) | Value::Bool(_))) = crate::value::enum_mixin_value(v) {
+            args[pos] = inner;
+            continue;
+        }
+        let Some(method) = interp.find_method(&inst.class, "__index__") else {
+            continue;
+        };
+        let bound = Value::BoundMethod {
+            receiver: Box::new(v.clone()),
+            function: method,
+        };
+        let result = interp.call_value(bound, vec![], &[])?;
+        if !matches!(result, Value::Int(_) | Value::Bool(_)) {
+            return Err(type_error(format!(
+                "__index__ returned non-int (type {})",
+                result.type_display_name()
+            )));
+        }
+        args[pos] = result;
+    }
+    Ok(args)
+}
+
 pub fn dispatch_method(
     interp: &mut Interpreter,
     name: &str,
@@ -10181,6 +10295,30 @@ pub fn dispatch_method(
             }
         }
     };
+    // `list.index` / `tuple.index` bounds and the `bytes.split` maxsplit are
+    // `__index__` arguments in CPython: an `IntEnum` member or an object
+    // with `__index__` stands for its integer.
+    let mut args = match (&receiver, name) {
+        (Value::List(_) | Value::Tuple(_), "index") => index_args(interp, args, &[2, 3])?,
+        (Value::Bytes(_), "split" | "rsplit") => index_args(interp, args, &[2])?,
+        _ => args,
+    };
+    // `bytes.join` takes any iterable (a generator, a set, `map(...)`):
+    // drain it here, where the interpreter can drive it.
+    if let (Value::Bytes(_), "join", Some(it)) = (&receiver, name, args.get(1)) {
+        // A non-iterable stays as it is, for the method's own TypeError.
+        let drained = match it {
+            Value::List(_) | Value::Tuple(_) => None,
+            other => interp.make_iter(other.clone()).ok(),
+        };
+        if let Some(it) = drained {
+            let mut items = Vec::new();
+            while let Some(v) = interp.iter_next(&it)? {
+                items.push(v);
+            }
+            args[1] = Value::List(Rc::new(RefCell::new(items)));
+        }
+    }
     let (rest, kwargs) = split_kwargs_map(&args[1..]);
     // CPython checks the positional count before the method body runs:
     // `xs.append(1, 2)` is a `TypeError`, not an append of `1`, and
@@ -11632,19 +11770,27 @@ fn bytes_method(
             Value::Bytes(Rc::new(replace_bytes(b, &from, &to, max)))
         }
         "join" => {
-            // b",".join([b"a", b"b"]) -> b"a,b"
+            // b",".join([b"a", b"b"]) -> b"a,b". `dispatch_method` has
+            // already drained any other iterable into a list.
             let it = single(args, "join")?;
             let parts: Vec<Value> = match it {
                 Value::List(l) => l.borrow().clone(),
                 Value::Tuple(t) => t.to_vec(),
-                _ => Vec::new(),
+                _ => return Err(type_error("can only join an iterable")),
             };
             let mut out: Vec<u8> = Vec::new();
             for (i, part) in parts.iter().enumerate() {
                 if i > 0 {
                     out.extend_from_slice(b);
                 }
-                out.extend_from_slice(&bytes_arg(part)?);
+                // Only a bytes-like item joins: an int is not one.
+                let bytes = bytes_like(part).ok_or_else(|| {
+                    type_error(format!(
+                        "sequence item {i}: expected a bytes-like object, {} found",
+                        part.type_display_name()
+                    ))
+                })?;
+                out.extend_from_slice(&bytes);
             }
             Value::Bytes(Rc::new(out))
         }
@@ -12083,7 +12229,7 @@ fn list_method(
     }
 }
 
-fn dict_method(
+pub(crate) fn dict_method(
     interp: &mut Interpreter,
     d: &Rc<crate::value::FrozenCell<DictMap>>,
     name: &str,
@@ -12782,6 +12928,9 @@ pub struct JsonDumpOpts {
     /// `check_circular`: a container met again inside itself raises
     /// `ValueError: Circular reference detected` (CPython's default).
     pub check_circular: bool,
+    /// `default=`: called on a value the encoder cannot serialise, whose
+    /// result is encoded in its place.
+    pub default: Option<Value>,
 }
 
 /// CPython's JSON encoder recurses through `Py_EnterRecursiveCall`, whose C
@@ -12827,6 +12976,7 @@ impl JsonDumpOpts {
             key_sep: ": ".to_owned(),
             instances_as_objects: false,
             check_circular: true,
+            default: None,
         }
     }
 
@@ -12842,6 +12992,7 @@ impl JsonDumpOpts {
             key_sep: ":".to_owned(),
             instances_as_objects: true,
             check_circular: true,
+            default: None,
         }
     }
 }
@@ -12849,9 +13000,9 @@ impl JsonDumpOpts {
 /// Decode the keyword arguments of `json.dumps` / `json.dump`.
 ///
 /// Mirrors CPython: an `indent` switches the default item separator from
-/// `", "` to `","` unless `separators` is given explicitly; `default=`,
-/// `cls=`, `skipkeys=` and `check_circular=` are accepted and ignored (the VM
-/// has no encoder subclassing and detects no cycles).
+/// `", "` to `","` unless `separators` is given explicitly; `default=` is
+/// kept for [`json_dumps_in`] to call; `cls=` and `skipkeys=` are accepted
+/// and ignored (the VM has no encoder subclassing).
 pub fn json_dump_opts_from_kwargs(
     interp: &mut Interpreter,
     kwargs: &[(String, Value)],
@@ -12901,7 +13052,8 @@ pub fn json_dump_opts_from_kwargs(
                 }
             }
             "check_circular" => opts.check_circular = interp.is_truthy(v)?,
-            "default" | "cls" | "skipkeys" => {}
+            "default" => opts.default = (!matches!(v, Value::None)).then(|| v.clone()),
+            "cls" | "skipkeys" => {}
             other => {
                 return Err(type_error(format!(
                     "dumps() got an unexpected keyword argument '{other}'"
@@ -12920,7 +13072,26 @@ pub fn json_dump_opts_from_kwargs(
 /// non-finite float under `allow_nan=False`.
 pub fn json_dumps_with(v: &Value, opts: &JsonDumpOpts) -> Result<String, Unwind> {
     let mut out = String::new();
-    json_write(v, opts, 0, &mut JsonMarkers::new(), &mut out)?;
+    json_write(v, opts, 0, &mut JsonMarkers::new(), &mut None, &mut out)?;
+    Ok(out)
+}
+
+/// [`json_dumps_with`] that can call back into the program: the `default=`
+/// hook replaces a value the encoder cannot serialise.
+pub fn json_dumps_in(
+    interp: &mut Interpreter,
+    v: &Value,
+    opts: &JsonDumpOpts,
+) -> Result<String, Unwind> {
+    let mut out = String::new();
+    json_write(
+        v,
+        opts,
+        0,
+        &mut JsonMarkers::new(),
+        &mut Some(interp),
+        &mut out,
+    )?;
     Ok(out)
 }
 
@@ -12928,6 +13099,10 @@ pub fn json_dumps_with(v: &Value, opts: &JsonDumpOpts) -> Result<String, Unwind>
 pub fn json_dumps_model(v: &Value) -> Result<String, Unwind> {
     json_dumps_with(v, &JsonDumpOpts::pydantic_compact())
 }
+
+/// The interpreter a `default=` hook runs on (`None` when the caller has
+/// none, so `default=` cannot be honoured).
+type JsonHook<'a> = Option<&'a mut Interpreter>;
 
 fn json_newline(opts: &JsonDumpOpts, level: usize, out: &mut String) {
     if let Some(unit) = &opts.indent {
@@ -12943,6 +13118,7 @@ fn json_write(
     opts: &JsonDumpOpts,
     level: usize,
     markers: &mut JsonMarkers,
+    hook: &mut JsonHook<'_>,
     out: &mut String,
 ) -> Result<(), Unwind> {
     // A container's address while it is being encoded, for the
@@ -12955,11 +13131,24 @@ fn json_write(
     };
     if let Some((addr, empty)) = container {
         json_enter(level, (!empty).then_some(addr), opts, markers)?;
-        let result = json_write_inner(v, opts, level, markers, out);
+        let result = json_write_inner(v, opts, level, markers, hook, out);
         markers.remove(&addr);
         return result;
     }
-    json_write_inner(v, opts, level, markers, out)
+    json_write_inner(v, opts, level, markers, hook, out)
+}
+
+/// The entries of a shim class that is a `dict` subclass in CPython
+/// (`Counter`, `OrderedDict`, `defaultdict`), which `json` encodes as the
+/// dict it is.
+fn json_dict_subclass_data(inst: &Rc<crate::value::Instance>) -> Option<Value> {
+    if !class_in_chain(&inst.class, "dict") {
+        return None;
+    }
+    match inst.fields.borrow().get("_data") {
+        Some(data @ Value::Dict(_)) => Some(data.clone()),
+        _ => None,
+    }
 }
 
 fn json_write_inner(
@@ -12967,6 +13156,7 @@ fn json_write_inner(
     opts: &JsonDumpOpts,
     level: usize,
     markers: &mut JsonMarkers,
+    hook: &mut JsonHook<'_>,
     out: &mut String,
 ) -> Result<(), Unwind> {
     match v {
@@ -12978,12 +13168,14 @@ fn json_write_inner(
         }
         Value::Str(s) => json_string_into(s, opts.ensure_ascii, out),
         Value::List(l) => {
-            let items = l.borrow();
-            json_write_seq(&items, opts, level, markers, out)?;
+            // A snapshot, so a `default=` hook that touches the list cannot
+            // collide with the borrow.
+            let items = l.borrow().clone();
+            json_write_seq(&items, opts, level, markers, hook, out)?;
         }
-        Value::Tuple(t) => json_write_seq(t, opts, level, markers, out)?,
+        Value::Tuple(t) => json_write_seq(t, opts, level, markers, hook, out)?,
         Value::Dict(d) => {
-            let d = d.borrow();
+            let d = d.borrow().clone();
             // (sort key, rendered key, value). Sorting uses the original
             // string key, as CPython's `sorted(dct.items())` does — the
             // rendered form would order `"é"` before `"z"`.
@@ -13003,10 +13195,10 @@ fn json_write_inner(
             }
             let pairs: Vec<(String, &Value)> =
                 entries.into_iter().map(|(_, k, v)| (k, v)).collect();
-            json_write_object(&pairs, opts, level, markers, out)?;
+            json_write_object(&pairs, opts, level, markers, hook, out)?;
         }
         Value::Instance(inst) if opts.instances_as_objects && !inst.class.fields.is_empty() => {
-            let fields = inst.fields.borrow();
+            let fields = inst.fields.borrow().clone();
             let mut pairs: Vec<(String, &Value)> = Vec::with_capacity(inst.class.fields.len());
             for f in &inst.class.fields {
                 if let Some(val) = fields.get(&f.name) {
@@ -13019,7 +13211,7 @@ fn json_write_inner(
                 opts,
                 markers,
             )?;
-            let result = json_write_object(&pairs, opts, level, markers, out);
+            let result = json_write_object(&pairs, opts, level, markers, hook, out);
             markers.remove(&(Rc::as_ptr(inst) as *const () as usize));
             result?;
         }
@@ -13027,16 +13219,47 @@ fn json_write_inner(
         // value-mixin enum member (`IntEnum`, `class Mode(str, Enum)`).
         v @ Value::Instance(_) if crate::value::enum_mixin_value(v).is_some() => {
             let inner = crate::value::enum_mixin_value(v).expect("checked by the guard");
-            json_write(&inner, opts, level, markers, out)?;
+            json_write(&inner, opts, level, markers, hook, out)?;
+        }
+        Value::Instance(inst) if json_dict_subclass_data(inst).is_some() => {
+            let data = json_dict_subclass_data(inst).expect("checked by the guard");
+            json_write(&data, opts, level, markers, hook, out)?;
         }
         other => {
+            // `default=`: CPython marks the object as being encoded, calls
+            // `default(o)` and encodes what it returns in its place.
+            if let (Some(default), Some(interp)) = (opts.default.clone(), hook.as_deref_mut()) {
+                let addr = json_heap_addr(other);
+                json_enter(level, addr, opts, markers)?;
+                let replaced = interp.call_value(default, vec![other.clone()], &[]);
+                let result = replaced.and_then(|r| json_write(&r, opts, level, markers, hook, out));
+                if let Some(addr) = addr {
+                    markers.remove(&addr);
+                }
+                return result;
+            }
             return Err(type_error(format!(
                 "Object of type {} is not JSON serializable",
                 other.type_display_name()
-            )))
+            )));
         }
     }
     Ok(())
+}
+
+/// The identity of a heap value handed to `default=`, for the
+/// circular-reference markers (`None` for a value with no identity).
+fn json_heap_addr(v: &Value) -> Option<usize> {
+    Some(match v {
+        Value::Instance(i) => Rc::as_ptr(i) as *const () as usize,
+        Value::Set(s) => Rc::as_ptr(s) as *const () as usize,
+        Value::Bytes(b) => Rc::as_ptr(b) as *const () as usize,
+        Value::Class(c) => Rc::as_ptr(c) as *const () as usize,
+        Value::Function(f) => Rc::as_ptr(f) as *const () as usize,
+        Value::Native(n) => Rc::as_ptr(n) as *const () as usize,
+        Value::Module(m) => Rc::as_ptr(m) as *const () as usize,
+        _ => return None,
+    })
 }
 
 fn json_write_seq(
@@ -13044,6 +13267,7 @@ fn json_write_seq(
     opts: &JsonDumpOpts,
     level: usize,
     markers: &mut JsonMarkers,
+    hook: &mut JsonHook<'_>,
     out: &mut String,
 ) -> Result<(), Unwind> {
     if items.is_empty() {
@@ -13056,7 +13280,7 @@ fn json_write_seq(
             out.push_str(&opts.item_sep);
         }
         json_newline(opts, level + 1, out);
-        json_write(item, opts, level + 1, markers, out)?;
+        json_write(item, opts, level + 1, markers, hook, out)?;
     }
     json_newline(opts, level, out);
     out.push(']');
@@ -13068,6 +13292,7 @@ fn json_write_object(
     opts: &JsonDumpOpts,
     level: usize,
     markers: &mut JsonMarkers,
+    hook: &mut JsonHook<'_>,
     out: &mut String,
 ) -> Result<(), Unwind> {
     if pairs.is_empty() {
@@ -13082,7 +13307,7 @@ fn json_write_object(
         json_newline(opts, level + 1, out);
         out.push_str(key);
         out.push_str(&opts.key_sep);
-        json_write(val, opts, level + 1, markers, out)?;
+        json_write(val, opts, level + 1, markers, hook, out)?;
     }
     json_newline(opts, level, out);
     out.push('}');
@@ -13961,7 +14186,7 @@ pub fn call_with_kwargs(
                 .first()
                 .ok_or_else(|| type_error("dumps() missing argument"))?;
             let opts = json_dump_opts_from_kwargs(interp, kwargs)?;
-            Ok(Value::Str(Rc::new(json_dumps_with(obj, &opts)?)))
+            Ok(Value::Str(Rc::new(json_dumps_in(interp, obj, &opts)?)))
         }
         // `json.dump(obj, fp, **same options)`.
         "dump" => {
@@ -13969,7 +14194,7 @@ pub fn call_with_kwargs(
                 return Err(type_error("dump() requires (obj, fp)"));
             }
             let opts = json_dump_opts_from_kwargs(interp, kwargs)?;
-            let serialised = json_dumps_with(&args[0], &opts)?;
+            let serialised = json_dumps_in(interp, &args[0], &opts)?;
             let write = interp.get_attr(&args[1], "write")?;
             interp.call_value(write, vec![Value::Str(Rc::new(serialised))], &[])?;
             Ok(Value::None)
@@ -14229,9 +14454,10 @@ pub fn call_with_kwargs(
         // Natives that unpack their keyword arguments themselves (through
         // `split_kwargs`): `math.isclose(rel_tol=, abs_tol=)`,
         // `math.nextafter(steps=)`, and the `re` functions and `Pattern`
-        // methods (`flags=`, `count=`, `maxsplit=`, `pos=`, `endpos=`).
+        // methods (`flags=`, `count=`, `maxsplit=`, `pos=`, `endpos=`), and
+        // `collections.defaultdict(factory, **entries)`.
         "isclose" | "nextafter" | "compile" | "match" | "search" | "fullmatch" | "findall"
-        | "finditer" | "sub" | "subn" | "split" => {
+        | "finditer" | "sub" | "subn" | "split" | "defaultdict" => {
             let mut args = args;
             args.push(make_kwargs_sentinel(kwargs));
             (n.func)(interp, args)
@@ -14298,6 +14524,8 @@ pub(crate) fn builtin_stand_in_mro(c: &Rc<crate::value::Class>) -> Option<Vec<Va
     let mut names: Vec<&str> = vec![name];
     if name == "bool" {
         names.push("int");
+    } else if !metaclass_parents(name).is_empty() {
+        names.extend(metaclass_parents(name));
     } else if crate::value::is_exception_type_name(name) {
         let mut cur = name;
         while let Some(parent) = crate::interp::builtin_exc_parent(cur) {
@@ -14322,6 +14550,34 @@ pub(crate) fn builtin_stand_in_mro(c: &Rc<crate::value::Class>) -> Option<Vec<Va
 /// The address `id()` and `hash()` report for a builtin type object: the
 /// constructor native bound to its name, so `id(type(1)) == id(int)` agrees
 /// with `type(1) is int`. `None` for anything else.
+/// The constructor native a builtin stand-in class (`type(1)`, `type(e)`)
+/// calls through to: the builtin bound to its name, when that is the type's
+/// own native (`int`, `ValueError`, `type`). `None` for any other class.
+pub(crate) fn builtin_stand_in_constructor(
+    interp: &Interpreter,
+    c: &Rc<crate::value::Class>,
+) -> Option<Value> {
+    // Cheap pre-filter: a stand-in is an empty class.
+    if !c.bases.is_empty()
+        || !c.fields.is_empty()
+        || !c.methods.borrow().is_empty()
+        || !is_builtin_stand_in(c)
+    {
+        return None;
+    }
+    // `type(None)()` is `None`, the type's one instance.
+    if c.name == "NoneType" {
+        return Some(nf("NoneType", |_i, args| match args.is_empty() {
+            true => Ok(Value::None),
+            false => Err(type_error("NoneType takes no arguments")),
+        }));
+    }
+    match interp.root.get(&c.name) {
+        Some(Value::Native(n)) if n.name == c.name => Some(Value::Native(n)),
+        _ => None,
+    }
+}
+
 pub(crate) fn builtin_type_native_addr(interp: &Interpreter, v: &Value) -> Option<usize> {
     let Value::Class(c) = v else {
         return None;

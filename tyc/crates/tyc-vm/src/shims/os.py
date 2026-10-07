@@ -548,6 +548,11 @@ def _environ_str(value):
 
 
 class _Environ:
+    # A `collections.abc.MutableMapping` (not a dict), so `isinstance`,
+    # `as! Mapping[str, str]`, mapping patterns and `Counter(os.environ)`
+    # treat it as one.
+    __typhon_builtin_bases__ = ("MutableMapping", "Mapping")
+
     def __init__(self, data):
         self._data = data
 

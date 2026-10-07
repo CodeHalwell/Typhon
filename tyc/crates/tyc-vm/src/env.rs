@@ -125,8 +125,30 @@ impl Env {
         self.bindings.borrow().get(name).cloned()
     }
 
+    /// A read of a name this scope declared `global`: it skips every
+    /// enclosing function frame and resolves in the module scope (then the
+    /// builtins), as `set` already writes there. `None` when the name is not
+    /// declared global here.
+    fn global_read(&self, name: &str) -> Option<Option<Value>> {
+        {
+            let globals = self.globals.borrow();
+            if globals.is_empty() || !globals.contains(name) {
+                return None;
+            }
+        }
+        let module = self.module_scope();
+        // `global X` at module level is a no-op, not a redirect loop.
+        if std::ptr::eq(Rc::as_ptr(&module), self) {
+            return None;
+        }
+        Some(module.get(name))
+    }
+
     /// Look up `name` walking parent links until the module scope.
     pub fn get(&self, name: &str) -> Option<Value> {
+        if let Some(found) = self.global_read(name) {
+            return found;
+        }
         if let Some(info) = &self.slot_info {
             if let Some(k) = info.slot_of_name(name) {
                 if let Some(v) = &self.slots.borrow()[k as usize] {
@@ -152,6 +174,9 @@ impl Env {
     /// slot cache to avoid hashing when this env is the owning frame; otherwise
     /// identical to [`Env::get`].
     pub fn get_name_node(&self, n: &ExprName) -> Option<Value> {
+        if let Some(found) = self.global_read(n.id.as_str()) {
+            return found;
+        }
         if let Some(info) = &self.slot_info {
             if let Some(k) = info.slot_of_node(n) {
                 if let Some(v) = &self.slots.borrow()[k as usize] {
@@ -241,6 +266,9 @@ impl Env {
     }
 
     pub fn delete(&self, name: &str) -> bool {
+        if self.global_read(name).is_some() {
+            return self.module_scope().delete(name);
+        }
         if let Some(info) = &self.slot_info {
             if let Some(k) = info.slot_of_name(name) {
                 let mut slots = self.slots.borrow_mut();

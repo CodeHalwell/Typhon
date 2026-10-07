@@ -868,6 +868,45 @@ impl Interpreter {
                     };
                 }
 
+                // `x op= y` tries `type(x).__iop__` first (`__iadd__`,
+                // `__ior__`, …); only a missing method or a `NotImplemented`
+                // result falls back to the binary operator and a rebind. So a
+                // user accumulator mutates in place and keeps its identity,
+                // and the shims' in-place methods (`deque +=`, `Counter |=`,
+                // `os.environ |=`) update the object every alias sees.
+                if let (Value::Instance(inst), Some(dunder)) = (&current, inplace_dunder(a.op)) {
+                    if let Some(m) = self.find_method(&inst.class, dunder) {
+                        let res = self.call_value(
+                            Value::BoundMethod {
+                                receiver: Box::new(current.clone()),
+                                function: m,
+                            },
+                            vec![rhs.clone()],
+                            &[],
+                        )?;
+                        if !crate::value::is_not_implemented(&res) {
+                            store_back!(self, res)?;
+                            return Ok(());
+                        }
+                    }
+                }
+                // `dict |= other` is `dict.update(other)` in place (any
+                // mapping or iterable of pairs), so aliases observe it. A
+                // `freeze let` mappingproxy / frozendict has no `__ior__` and
+                // falls back to `|` and a rebind, as in CPython.
+                if let (Value::Dict(target), Operator::BitOr) = (&current, a.op) {
+                    if !crate::builtins::dict_is_frozen(target) {
+                        let target = target.clone();
+                        crate::builtins::dict_method(
+                            self,
+                            &target,
+                            "update",
+                            std::slice::from_ref(&rhs),
+                        )?;
+                        store_back!(self, Value::Dict(target))?;
+                        return Ok(());
+                    }
+                }
                 // In-place mutation for a mutable list target: CPython's
                 // `list.__iadd__` (`+=`) and `list.__imul__` (`*=`) mutate the
                 // existing object rather than rebinding, so aliases
@@ -1401,8 +1440,7 @@ impl Interpreter {
                 // `raise StopIteration` yields a StopIteration value,
                 // not the constructor function.
                 match v {
-                    Value::Native(_) => self.call_value(v, vec![], &[])?,
-                    Value::Class(ref c) => self.instantiate(c, vec![], &[])?,
+                    Value::Native(_) | Value::Class(_) => self.call_value(v, vec![], &[])?,
                     other => other,
                 }
             }
@@ -1425,8 +1463,7 @@ impl Interpreter {
             Some(c) => {
                 let cause = self.eval_expr(c, env)?;
                 let cause = match cause {
-                    Value::Native(_) => self.call_value(cause, vec![], &[])?,
-                    Value::Class(ref cls) => self.instantiate(cls, vec![], &[])?,
+                    Value::Native(_) | Value::Class(_) => self.call_value(cause, vec![], &[])?,
                     other => other,
                 };
                 crate::value::with_exception_cause(exc, cause)
@@ -2048,6 +2085,13 @@ impl Interpreter {
                     .iter()
                     .filter_map(base_trailing_name)
                     .filter(|n| name_is_exception_base(n))
+                    // `class E(IOError)` records the OSError it names, so
+                    // `except OSError` / `issubclass(E, OSError)` see it — unless
+                    // `IOError` here is a user class of that name.
+                    .map(|n| match bases.iter().any(|b| b.name == n) {
+                        true => n,
+                        false => canonical_exc_name(n),
+                    })
                     .map(|n| Value::Str(Rc::new(n.to_owned())))
                     .collect()
             })
@@ -5066,7 +5110,15 @@ impl Interpreter {
                     self.call_function(&function, full_args, kwargs, None)
                 }
             }
-            Value::Class(c) => self.instantiate(&c, args, kwargs),
+            Value::Class(c) => {
+                // `type(x)` of a builtin value is a cached stand-in class;
+                // calling it calls the type itself, as `type(e)(msg)` and
+                // `type(default)(raw)` do in CPython.
+                if let Some(ctor) = crate::builtins::builtin_stand_in_constructor(self, &c) {
+                    return self.call_value(ctor, args, kwargs);
+                }
+                self.instantiate(&c, args, kwargs)
+            }
             // An instance is callable when its class defines `__call__`.
             Value::Instance(ref inst) => {
                 if let Some(call) = self.find_method(&inst.class, "__call__") {
@@ -9387,48 +9439,57 @@ impl Interpreter {
             if name == exc.kind || builtin_exc_is_a(&exc.kind, name) {
                 return Ok(true);
             }
-            // Class-hierarchy match: if the exception carries a user
-            // Instance, walk its MRO against the named class.
+            // `except KeyError` catching `class MyKeyError(KeyError):` —
+            // the builtin base is recorded on the class (it has no
+            // `Value::Class`), so consult it directly.
             if let Some(Value::Instance(inst)) = &exc.value {
-                if let Ok(Value::Class(target)) = self.eval_expr(type_expr, env) {
-                    if class_is_subclass(&inst.class, &target) {
-                        return Ok(true);
-                    }
-                }
-                // `except KeyError` catching `class MyKeyError(KeyError):` —
-                // the builtin base is recorded on the class (it has no
-                // `Value::Class`), so consult it directly.
                 if class_has_builtin_exc_base(&inst.class, name) {
                     return Ok(true);
                 }
             }
-            return Ok(false);
+            // Otherwise the handler catches what the name is bound to:
+            // `IOError` is `OSError`, and `Alias = ValueError` or
+            // `ERRORS = (KeyError, IndexError)` catch as their targets do. An
+            // unbound name matches by spelling only (above).
+            return match self.eval_expr(type_expr, env) {
+                Ok(target) => Ok(self.exception_matches_value(&target, exc)),
+                Err(_) => Ok(false),
+            };
         }
         // An attribute-qualified class — `except json.JSONDecodeError`,
         // `except asyncio.CancelledError`, `except errors.AppError` — resolves
-        // to whatever the module exports: a user (or VM-synthesised) class,
-        // matched by identity / MRO / recorded builtin base, or a native
-        // exception constructor, matched by the kind it constructs. Anything
-        // that fails to evaluate does not match (CPython would raise at the
-        // handler; the VM stays lenient).
+        // to whatever the module exports. Anything that fails to evaluate
+        // does not match (CPython would raise at the handler; the VM stays
+        // lenient).
         match self.eval_expr(type_expr, env) {
-            Ok(Value::Class(target)) => {
-                if target.name == exc.kind || builtin_exc_is_a(&exc.kind, &target.name) {
-                    return Ok(true);
-                }
-                if let Some(Value::Instance(inst)) = &exc.value {
-                    if class_is_subclass(&inst.class, &target)
-                        || class_has_builtin_exc_base(&inst.class, &target.name)
-                    {
-                        return Ok(true);
-                    }
-                }
-                Ok(false)
+            Ok(target) => Ok(self.exception_matches_value(&target, exc)),
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// Whether an evaluated `except` target catches `exc`: a user (or
+    /// VM-synthesised) class, matched by identity / MRO / recorded builtin
+    /// base; a native exception constructor, matched by the kind it
+    /// constructs (so `IOError`, bound to the `OSError` native, catches an
+    /// `OSError`); or a tuple of either.
+    fn exception_matches_value(&self, target: &Value, exc: &VmException) -> bool {
+        let by_name = |name: &str| {
+            name == exc.kind
+                || builtin_exc_is_a(&exc.kind, name)
+                || matches!(&exc.value, Some(Value::Instance(inst))
+                    if class_has_builtin_exc_base(&inst.class, name))
+        };
+        match target {
+            Value::Class(target) => {
+                by_name(&target.name)
+                    || matches!(&exc.value, Some(Value::Instance(inst))
+                        if class_is_subclass(&inst.class, target))
             }
-            Ok(Value::Native(nf)) => {
-                Ok(nf.name == exc.kind || builtin_exc_is_a(&exc.kind, nf.name))
-            }
-            _ => Ok(false),
+            Value::Native(nf) => by_name(nf.name),
+            Value::Tuple(items) => items
+                .iter()
+                .any(|item| self.exception_matches_value(item, exc)),
+            _ => false,
         }
     }
 
@@ -9730,8 +9791,12 @@ impl Interpreter {
         subject: &Value,
         env: &EnvRef,
     ) -> Result<bool, Unwind> {
-        let Value::Dict(d) = subject else {
-            return Ok(false);
+        let d = match subject {
+            Value::Dict(d) => d,
+            Value::Instance(inst) if crate::builtins::is_mapping_class(&inst.class) => {
+                return self.pattern_match_mapping_object(m, subject, env);
+            }
+            _ => return Ok(false),
         };
         // Evaluate the key expressions, then look each up in the dict.
         let mut matched_keys: Vec<HashKey> = Vec::with_capacity(m.keys.len());
@@ -9753,6 +9818,57 @@ impl Interpreter {
             for (k, v) in d.borrow().iter() {
                 if !matched_keys.iter().any(|seen| seen == k) {
                     rest_map.insert(k.clone(), v.clone());
+                }
+            }
+            env.set(
+                rest_name.as_str(),
+                Value::Dict(Rc::new(crate::value::FrozenCell::new(rest_map))),
+            );
+        }
+        Ok(true)
+    }
+
+    /// A mapping pattern against a mapping that is not a dict (`os.environ`,
+    /// a `Counter`, a `UserDict`): CPython's `MATCH_KEYS` probes each key with
+    /// `subject.get(key, <dummy>)`, and `**rest` is `dict(subject)` less the
+    /// matched keys.
+    fn pattern_match_mapping_object(
+        &mut self,
+        m: &ast::PatternMatchMapping,
+        subject: &Value,
+        env: &EnvRef,
+    ) -> Result<bool, Unwind> {
+        // A class the VM models only by name (a user `dict` subclass) has no
+        // `get` to probe with; it never matched before, and still does not.
+        let Ok(get) = self.get_attr(subject, "get") else {
+            return Ok(false);
+        };
+        // A fresh list is a dummy no mapping can hold: `get` hands back this
+        // very object only for a missing key.
+        let missing = Rc::new(RefCell::new(Vec::new()));
+        let mut matched_keys: Vec<HashKey> = Vec::with_capacity(m.keys.len());
+        for (key_expr, pat) in m.keys.iter().zip(m.patterns.iter()) {
+            let key_val = self.eval_expr(key_expr, env)?;
+            let value = self.call_value(
+                get.clone(),
+                vec![key_val.clone(), Value::List(missing.clone())],
+                &[],
+            )?;
+            if matches!(&value, Value::List(l) if Rc::ptr_eq(l, &missing)) {
+                return Ok(false);
+            }
+            if !self.pattern_matches(pat, &value, env)? {
+                return Ok(false);
+            }
+            matched_keys.push(self.hash_key(&key_val)?);
+        }
+        if let Some(rest_name) = &m.rest {
+            let pairs = self.mapping_protocol_items(subject)?.unwrap_or_default();
+            let mut rest_map: DictMap = DictMap::new();
+            for (k, v) in pairs {
+                let key = self.hash_key(&k)?;
+                if !matched_keys.contains(&key) {
+                    rest_map.insert(key, v);
                 }
             }
             env.set(
@@ -12358,6 +12474,25 @@ fn binop_dunder(op: Operator) -> Option<&'static str> {
     })
 }
 
+/// The in-place dunder an augmented assignment (`x op= y`) tries first.
+fn inplace_dunder(op: Operator) -> Option<&'static str> {
+    Some(match op {
+        Operator::Add => "__iadd__",
+        Operator::Sub => "__isub__",
+        Operator::Mult => "__imul__",
+        Operator::MatMult => "__imatmul__",
+        Operator::Div => "__itruediv__",
+        Operator::FloorDiv => "__ifloordiv__",
+        Operator::Mod => "__imod__",
+        Operator::Pow => "__ipow__",
+        Operator::LShift => "__ilshift__",
+        Operator::RShift => "__irshift__",
+        Operator::BitOr => "__ior__",
+        Operator::BitXor => "__ixor__",
+        Operator::BitAnd => "__iand__",
+    })
+}
+
 /// The reflected dunder dispatched to on the right operand when the left has none.
 fn binop_reflected_dunder(op: Operator) -> Option<&'static str> {
     Some(match op {
@@ -12777,6 +12912,15 @@ pub fn builtin_exc_is_a(kind: &str, target: &str) -> bool {
         cur = p;
     }
     false
+}
+
+/// Python 3 keeps `IOError` and `EnvironmentError` only as aliases of
+/// `OSError` (the builtins bind them to the `OSError` constructor).
+pub(crate) fn canonical_exc_name(name: &str) -> &str {
+    match name {
+        "IOError" | "EnvironmentError" => "OSError",
+        _ => name,
+    }
 }
 
 /// The direct parent of a builtin exception kind in the standard hierarchy
