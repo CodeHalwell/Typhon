@@ -27,7 +27,7 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   class scope) or `UnboundLocalError` (function scope) as CPython does,
   where the VM used to do nothing.
 - **`bytes.translate` and `bytes.maketrans` under `tyc run`.** Both were
-  missing, so a program using them failed with `AttributeError` in the VM
+  missing (they take `bytes` or `bytearray` arguments), so a program using them failed with `AttributeError` in the VM
   but ran on CPython.
 - **`async for` over a hand-written async iterator under `tyc run`.** The
   VM used to call `__anext__` until exhaustion before the loop body ran
@@ -38,7 +38,8 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   `TypeError` instead of driving `__anext__`. `async for` over a list,
   tuple, string, dict, set, range or a class without `__aiter__`, or over
   an `async def __aiter__`, raises CPython's `TypeError` too, where the VM
-  iterated it.
+  iterated it. Async comprehensions (`[x async for x in it]`) follow the
+  same protocol.
 - **`tyc run` no longer runs a generator early without saying so.** A
   generator (or generator lambda) whose `yield` the VM cannot suspend (in
   a loop test, a `with` item, or two in one expression) ran its whole body at the call, so its

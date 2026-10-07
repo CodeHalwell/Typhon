@@ -701,6 +701,7 @@ trap("short", lambda: b"x".translate(b"short"))
 trap("uneven", lambda: bytes.maketrans(b"ab", b"x"))
 trap("extra", lambda: b"x".translate(None, b"", b"extra"))
 trap("int table", lambda: bytes.maketrans(97, 98))
+show(bytes.maketrans(bytearray(b"a"), bytearray(b"b"))[97], b"ab".translate(None, bytearray(b"b")))
 trap("int delete", lambda: b"x".translate(None, 120))
 trap("int translate", lambda: b"x".translate(5))
 "#,
@@ -786,6 +787,13 @@ plain class GenAiter:
     async def __aiter__(self) -> object:
         yield 7
 asyncio.run(over(GenAiter()))
+async def comp() -> None:
+    show("comp", [x async for x in Both()])
+asyncio.run(comp())
+async def comp_list() -> None:
+    xs = [1]
+    show([x async for x in xs])
+trap("sync comp", lambda: asyncio.run(comp_list()))
 "#,
     );
 }

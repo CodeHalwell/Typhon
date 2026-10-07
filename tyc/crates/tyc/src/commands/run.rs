@@ -860,8 +860,30 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for DelBinding {
     fn visit_stmt(&mut self, stmt: &'a ruff_python_ast::Stmt) {
         use ruff_python_ast::Stmt;
         match stmt {
-            Stmt::FunctionDef(f) => self.found |= f.name.as_str() == "__del__",
-            Stmt::ClassDef(c) => self.found |= c.name.as_str() == "__del__",
+            // A nested `def` or `class` body is its own scope, but its
+            // header (decorators, defaults, annotations, bases) runs here.
+            Stmt::FunctionDef(f) => {
+                self.found |= f.name.as_str() == "__del__";
+                for d in &f.decorator_list {
+                    self.visit_decorator(d);
+                }
+                if let Some(tp) = &f.type_params {
+                    self.visit_type_params(tp);
+                }
+                self.visit_parameters(&f.parameters);
+                if let Some(r) = &f.returns {
+                    self.visit_annotation(r);
+                }
+            }
+            Stmt::ClassDef(c) => {
+                self.found |= c.name.as_str() == "__del__";
+                for d in &c.decorator_list {
+                    self.visit_decorator(d);
+                }
+                if let Some(args) = &c.arguments {
+                    self.visit_arguments(args);
+                }
+            }
             Stmt::Import(imp) => {
                 self.found |= imp
                     .names
@@ -1497,6 +1519,10 @@ mod tests {
                 .unwrap_or_default()
                 .contains(&"a custom metaclass".to_owned()));
         }
+        let header = "def cleanup(self: object) -> None:\n    print(\"bye\")\nplain class D:\n    def f(self, x: object = (__del__ := cleanup)) -> None:\n        pass\nprint(D())\n";
+        assert!(scan_source(header)
+            .unwrap_or_default()
+            .contains(&"a `__del__` finaliser".to_owned()));
         let captured =
             "plain class D:\n    match 1:\n        case __del__:\n            pass\nprint(D())\n";
         assert!(scan_source(captured)

@@ -9120,7 +9120,14 @@ impl Interpreter {
         }
         let g = &gens[i];
         let iter_val = self.eval_expr(&g.iter, env)?;
-        let it = self.make_iter(iter_val)?;
+        // `[x async for x in it]` follows the `async for` statement's protocol.
+        if g.is_async {
+            reject_sync_only_async_iterable(&iter_val)?;
+        }
+        self.async_iteration = g.is_async;
+        let it = self.make_iter(iter_val);
+        self.async_iteration = false;
+        let it = it?;
         while let Some(v) = self.iter_next(&it)? {
             self.assign_target(&g.target, v, env, None)?;
             let mut ok = true;

@@ -11514,7 +11514,10 @@ fn bytes_like_arg(v: &Value) -> Result<Vec<u8>, Unwind> {
             v.type_display_name()
         )));
     }
-    bytes_arg(v)
+    match bytearray_bytes(v) {
+        Some(b) => Ok(b),
+        None => bytes_arg(v),
+    }
 }
 
 fn bytes_arg(v: &Value) -> Result<Vec<u8>, Unwind> {
