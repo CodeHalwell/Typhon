@@ -624,6 +624,17 @@ class Neg(Flag):
     B = -3
 show(len(Neg.B), Neg.B.value)
 trap("negative iter", lambda: list(Neg.B))
+class NegAuto(Flag):
+    A = -1
+    B = auto()
+class NegAutoI(IntFlag):
+    A = -3
+    B = auto()
+class MixAuto(Flag):
+    A = -1
+    B = 4
+    C = auto()
+show(NegAuto.B.value, NegAutoI.B.value, MixAuto.C.value)
 show(list(Neg), list(Neg.A))
 "#,
     );
@@ -902,6 +913,29 @@ asyncio.run(genexp())
 async def await_agen() -> None:
     await source()
 trap("await agen", lambda: asyncio.run(await_agen()))
+plain class StopWith:
+    def __iter__(self) -> "StopWith":
+        return self
+    def __next__(self) -> int:
+        raise StopIteration(42)
+plain class Aw:
+    def __await__(self) -> StopWith:
+        return StopWith()
+plain class AwAnext:
+    def __init__(self) -> None:
+        self.n = 0
+    def __aiter__(self) -> "AwAnext":
+        return self
+    def __anext__(self) -> Aw:
+        self.n += 1
+        if self.n > 1:
+            raise StopAsyncIteration
+        return Aw()
+async def await_result() -> None:
+    async for x in AwAnext():
+        show("aw item", x)
+    show("aw await", await Aw())
+asyncio.run(await_result())
 async def comp() -> None:
     show("comp", [x async for x in Both()])
 asyncio.run(comp())

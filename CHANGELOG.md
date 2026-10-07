@@ -8,6 +8,13 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ### Fixed
 
+- **Awaitables, flag `auto()` and star imports.** An `__await__` iterator
+  that finishes with `StopIteration(value)` now gives `value` as the
+  await's result under `tyc run` (it was `None`); a flag `auto()` after a
+  negative member takes the next bit above that value's magnitude, as
+  CPython does (`A = -1; B = auto()` makes `B == 2`); and a
+  `from m import *` sends a program with a bare `metaclass=ABCMeta` to
+  CPython, since the star import could have rebound the name.
 - **Async generators are not awaitables.** Calling an `async def` that
   contains `yield` yields an async generator under `tyc run`: `await` on it
   and returning one from `__anext__` now raise CPython's `TypeError`

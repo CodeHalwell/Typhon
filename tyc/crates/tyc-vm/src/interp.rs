@@ -3377,7 +3377,9 @@ impl Interpreter {
             // continues from it (CPython: `A = 10; B = auto()` ⇒ `B == 11`).
             // Starts at 0 so a leading `auto()` yields 1.
             let mut last_value: i64 = 0;
-            let mut flag_high: i64 = 0;
+            // The largest value any earlier member declared (CPython's
+            // `max(last_values)` in `Flag._generate_next_value_`).
+            let mut flag_high: Option<i64> = None;
             for name in &order {
                 let Some(raw) = attrs.get(name).cloned() else {
                     continue;
@@ -3394,13 +3396,14 @@ impl Interpreter {
                 let raw = if Self::is_enum_auto(&raw) && is_str_enum {
                     Value::Str(Rc::new(name.to_lowercase()))
                 } else if Self::is_enum_auto(&raw) {
-                    // A flag's `auto()` is the bit above the highest one any
-                    // earlier member sets (`AB = 3; D = auto()` ⇒ `D == 4`).
+                    // A flag's `auto()` is the bit above the largest earlier
+                    // value's high bit (`AB = 3; D = auto()` ⇒ `D == 4`); a
+                    // negative value counts by its magnitude's bit length
+                    // (`A = -1; B = auto()` ⇒ `B == 2`).
                     last_value = if is_flag {
-                        if flag_high <= 0 {
-                            1
-                        } else {
-                            1 << (64 - flag_high.leading_zeros())
+                        match flag_high {
+                            None => 1,
+                            Some(v) => 1 << (64 - v.unsigned_abs().leading_zeros()),
                         }
                     } else {
                         last_value + 1
@@ -3415,7 +3418,9 @@ impl Interpreter {
                     raw
                 };
                 if let Value::Int(i) = &raw {
-                    flag_high = flag_high.max(i.to_i64().unwrap_or(0));
+                    if let Some(v) = i.to_i64() {
+                        flag_high = Some(flag_high.map_or(v, |h| h.max(v)));
+                    }
                 }
                 // A second name for an existing value is an *alias* of that
                 // member: the same object, not a new member, and absent
@@ -6036,6 +6041,24 @@ impl Interpreter {
                         "__await__() returned non-iterator of type '{}'",
                         it.type_display_name()
                     )));
+                }
+                // A user iterator finishes with `StopIteration(value)`; that
+                // value is the await's result.
+                if let Value::Instance(_) = &it {
+                    loop {
+                        match self.call_dunder0(&it, "__next__") {
+                            Ok(_) => {}
+                            Err(Unwind::Exception(e)) if e.kind == "StopIteration" => {
+                                return Ok(match &e.value {
+                                    Some(Value::Exception { args, .. }) => {
+                                        args.first().cloned().unwrap_or(Value::None)
+                                    }
+                                    _ => Value::None,
+                                });
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
                 }
                 let it = self.make_iter(it)?;
                 while self.iter_next(&it)?.is_some() {}
