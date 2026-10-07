@@ -1957,3 +1957,37 @@ trap("end", lambda: it.send(6))
 "#,
     );
 }
+
+// ── Exception str/repr over user args; ExceptionGroup split/subgroup/derive ──
+
+#[test]
+fn exception_str_and_repr_follow_their_args() {
+    assert_matches_cpython(
+        "exception_str_and_repr_follow_their_args",
+        r#"class E(Exception):
+    pass
+show(str(E([1, 2])), repr(E([1, 2])))
+show(str(KeyError("k")), repr(KeyError("k")))
+show(str(ValueError(1, 2)), repr(ValueError(1, 2)), repr(ValueError()))
+show(str(E()), str(E(3)), repr([E("x"), TypeError(None)]))
+"#,
+    );
+}
+
+#[test]
+fn exception_group_split_subgroup_and_derive() {
+    assert_matches_cpython(
+        "exception_group_split_subgroup_and_derive",
+        r#"def pred(e: BaseException) -> bool:
+    return isinstance(e, TypeError)
+eg = ExceptionGroup("g", [ValueError("a"), TypeError("b"), ExceptionGroup("inner", [ValueError("c"), KeyError("k")])])
+show(repr(eg.split(ValueError)))
+show(repr(eg.subgroup(TypeError)), eg.subgroup(OSError))
+show(str(eg.derive([KeyError("z")])), repr(eg.derive([KeyError("z")])))
+show(repr(eg.split(pred)))
+show(repr(eg.split((TypeError, KeyError))))
+show(eg.subgroup(lambda e: True) is eg)
+trap("bad", lambda: eg.split(3))
+"#,
+    );
+}

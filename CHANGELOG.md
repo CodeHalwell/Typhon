@@ -8,6 +8,12 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ### Fixed
 
+- **Exception text and `ExceptionGroup` methods.** Under `tyc run`,
+  `str()` and `repr()` of an exception follow its arguments as CPython
+  does (`str(E([1, 2]))` is `[1, 2]`, `str(KeyError("k"))` is `'k'`,
+  `str(ValueError(1, 2))` is `(1, 2)`), and `ExceptionGroup.split`,
+  `.subgroup` and `.derive` work with a type, a tuple of types or a
+  predicate, splitting nested groups while keeping their structure.
 - **Negative flag members, wrapped await iterators and more fallbacks.**
   Under `tyc run`, a declared negative `Flag` member is found by value
   (`N(-3) is N.B`), and an `__await__` returning `iter(user_iterator)`
