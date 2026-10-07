@@ -2003,6 +2003,7 @@ show(repr(ExceptionGroup("h", [ValueError(X())])))
 show(repr(eg.split(P())))
 show(repr(eg.derive([KeyboardInterrupt()])))
 trap("non-exception derive", lambda: eg.derive([1]))
+trap("builtin type", lambda: eg.split(bool))
 try:
     try:
         raise KeyError(1)

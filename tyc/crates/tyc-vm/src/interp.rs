@@ -10049,7 +10049,9 @@ impl Interpreter {
         };
         let by_type = is_type(&arg) || matches!(&arg, Value::Tuple(t) if t.iter().all(is_type));
         let callable = match &arg {
-            Value::Function(_) | Value::Native(_) | Value::BoundMethod { .. } => true,
+            // A builtin type such as `bool` is a class, not a predicate.
+            Value::Native(n) => !crate::builtins::is_builtin_type_name(n.name),
+            Value::Function(_) | Value::BoundMethod { .. } => true,
             Value::Instance(inst) => self.find_method(&inst.class, "__call__").is_some(),
             _ => false,
         };
