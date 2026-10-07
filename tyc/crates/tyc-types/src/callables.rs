@@ -29,8 +29,66 @@ pub(super) fn constructor(c: &Checker, name: &str) -> Option<Type> {
     })
 }
 
+/// Whether the bare name `name` reads the module-level function or import
+/// that the name-keyed tables (`function_arity_info`, `function_signatures`,
+/// `function_type_bounds`, …) describe: the binding in scope is that
+/// module-scope `def` / import, or nothing binds the name. A parameter, a
+/// local, a loop target or a nested `def` of the same name is some other
+/// callable.
+pub(super) fn binds_module_function(c: &Checker, name: &str) -> bool {
+    if binds_locally(c, name) {
+        return false;
+    }
+    let Some(binding) = c.env.lookup(name) else {
+        return true;
+    };
+    c.resolved.scopes.first().is_some_and(|s| {
+        s.bindings.iter().any(|b| {
+            b.name == name
+                && b.span.0 == binding.span.0
+                && matches!(b.kind, BindingKind::Function | BindingKind::Import)
+        })
+    })
+}
+
+/// Whether the body of the function being checked binds `name` itself, which
+/// makes it a local there for the whole body — a walrus does so even where
+/// the env still narrows the module binding in place.
+fn binds_locally(c: &Checker, name: &str) -> bool {
+    c.function_scope != 0
+        && c.resolved
+            .scopes
+            .get(c.function_scope)
+            .is_some_and(|s| s.lookup_local(name).is_some())
+}
+
+/// Where `name`'s binding in scope was declared: the env's, or — when the
+/// env still shows the module binding although the function body binds
+/// `name` itself (see [`binds_locally`]) — the body's own.
+fn binding_start(c: &Checker, name: &str) -> Option<usize> {
+    if c.env.scope_of(name) == Some(0) && binds_locally(c, name) {
+        return c
+            .resolved
+            .scopes
+            .get(c.function_scope)?
+            .lookup_local(name)
+            .map(|b| b.span.0);
+    }
+    c.env.lookup(name).map(|b| b.span.0)
+}
+
 pub(super) fn origin(c: &Checker, expr: &Expr) -> Option<ArityInfo> {
     fn resolve(c: &Checker, expr: &Expr, seen: &mut HashSet<usize>) -> Option<ArityInfo> {
+        // `let g = u.greet` / `let f = helpers.parse`: the alias calls what
+        // the attribute resolves to.
+        if let Expr::Attribute(a) = expr {
+            let recv = infer_expr_readonly(c, &a.value);
+            let receiver_is_class = matches!(
+                a.value.as_ref(),
+                Expr::Name(n) if c.classes.iter().any(|cn| cn == n.id.as_str())
+            );
+            return method_callee_arity(c, &recv, receiver_is_class, a.attr.as_str());
+        }
         if let Expr::Lambda(lam) = expr {
             return lam
                 .parameters
@@ -65,8 +123,8 @@ pub(super) fn origin(c: &Checker, expr: &Expr) -> Option<ArityInfo> {
             }
         }
         let Expr::Name(n) = expr else { return None };
-        let binding = c.env.lookup(n.id.as_str())?;
-        if !seen.insert(binding.span.0) {
+        let start = binding_start(c, n.id.as_str())?;
+        if !seen.insert(start) {
             return None;
         }
         struct Find<'a> {
@@ -95,7 +153,7 @@ pub(super) fn origin(c: &Checker, expr: &Expr) -> Option<ArityInfo> {
             }
         }
         let mut find = Find {
-            start: binding.span.0,
+            start,
             value: None,
             function: None,
         };
@@ -114,7 +172,18 @@ pub(super) fn origin(c: &Checker, expr: &Expr) -> Option<ArityInfo> {
         if let Some(value) = find.value {
             return resolve(c, value, seen);
         }
-        c.function_arity_info.get(n.id.as_str()).cloned()
+        // An imported function. A parameter, loop target or other untraced
+        // local of the same name holds some other callable: its own
+        // (structural) type is all that is known about it.
+        if binds_module_function(c, n.id.as_str()) {
+            return c.function_arity_info.get(n.id.as_str()).cloned();
+        }
+        None
+    }
+    // The outermost expression is the callee itself: an attribute callee's
+    // arity comes from `infer_expr`, which resolved its receiver for real.
+    if matches!(expr, Expr::Attribute(_)) {
+        return None;
     }
     resolve(c, expr, &mut HashSet::new())
 }
@@ -199,7 +268,7 @@ pub(super) fn decorated(c: &Checker, name: &str) -> bool {
     scan.found
 }
 
-fn alias_value<'a>(c: &Checker<'a>, start: usize) -> Option<&'a Expr> {
+pub(super) fn alias_value<'a>(c: &Checker<'a>, start: usize) -> Option<&'a Expr> {
     struct Find<'a> {
         start: usize,
         value: Option<&'a Expr>,

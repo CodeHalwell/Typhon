@@ -2840,4 +2840,227 @@ def f(x: str?) -> None:
         let diags = check_source_file(&mut db, sf);
         assert!(!diags.has_errors(), "{:?}", diags.errors());
     }
+
+    // ── Name-keyed tables only describe what a name actually resolves to ──
+
+    fn check_main(main: &str, modules: &[(&str, &str)], options: CheckOptions) -> Diagnostics {
+        let registry = build_registry(modules);
+        let mut db = TycDatabase::new();
+        check_file_with_imports_opts(&mut db, "main.ty".into(), main.into(), &registry, options)
+    }
+
+    const GET_HELPERS: &str = "\
+pub def get(table: dict[str, int], key: str, default: int) -> int:
+    let found: int? = table.get(key)
+    if found is not None:
+        return found
+    return default
+";
+
+    #[test]
+    fn an_imported_function_does_not_type_a_same_named_method_call() {
+        // `from helpers import get` used to arity-check `d.get(\"a\")`
+        // against the imported `get`, in the importer and in `helpers`.
+        let main = "\
+from helpers import get
+
+def main() -> None:
+    let d: dict[str, int] = {\"a\": 1}
+    let v: int? = d.get(\"a\")
+    print(v, get(d, \"a\", 0))
+";
+        let diags = check_main(main, &[("helpers", GET_HELPERS)], CheckOptions::default());
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        let registry = build_registry(&[("helpers", GET_HELPERS)]);
+        let mut db = TycDatabase::new();
+        let diags =
+            check_file_with_imports(&mut db, "helpers.ty".into(), GET_HELPERS.into(), &registry);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
+    fn module_qualified_and_imported_calls_keep_their_arity_checks() {
+        let main = "\
+import helpers
+from helpers import get
+
+def main() -> None:
+    let d: dict[str, int] = {\"a\": 1}
+    print(helpers.get(d), get(d))
+";
+        let diags = check_main(main, &[("helpers", GET_HELPERS)], CheckOptions::default());
+        let missing: Vec<String> = diags
+            .errors()
+            .iter()
+            .filter(|e| {
+                matches!(e, TycError::MissingArgument { missing, .. }
+                    if missing.iter().any(|m| m == "key"))
+            })
+            .map(|e| e.to_string())
+            .collect();
+        assert_eq!(missing.len(), 2, "{:?}", diags.errors());
+        assert!(
+            missing.iter().any(|m| m.contains("`helpers.get`")),
+            "{missing:?}"
+        );
+    }
+
+    #[test]
+    fn a_lazy_from_import_keeps_its_arity_check_on_a_315_target() {
+        let helpers = "\
+pub def fetch(url: str) -> str:
+    return url
+";
+        let main = "\
+lazy from helpers import fetch
+
+def main() -> None:
+    print(fetch())
+";
+        let diags = check_main(main, &[("helpers", helpers)], CheckOptions::for_target(15));
+        assert!(
+            diags.errors().iter().any(|e| matches!(
+                e,
+                TycError::MissingArgument { name, .. } if name == "fetch"
+            )),
+            "{:?}",
+            diags.errors()
+        );
+    }
+
+    const GEOMETRY: &str = "\
+pub class Point frozen:
+    x: int
+    y: int
+
+pub class Mut:
+    x: int
+";
+
+    #[test]
+    fn a_local_class_is_not_an_imported_frozen_class_of_the_same_name() {
+        // proj_freeze / projF: `import geometry` seeds the frozen `Point`
+        // under its source name; the local mutable `Point` must win.
+        let main = "\
+import geometry
+
+class Point:
+    x: int
+
+class Point3(Point):
+    z: int
+
+freeze let ORIGIN = geometry.Point(x=0, y=0)
+
+def main() -> None:
+    mut p: Point = Point(x=1)
+    p.x = 2
+    let q: Point3 = Point3(x=1, z=2)
+    print(ORIGIN.x, p.x, q.z)
+";
+        let diags = check_main(main, &[("geometry", GEOMETRY)], CheckOptions::default());
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        // The same with only a member import touching the module.
+        let main = "\
+from geometry import Mut
+
+class Point:
+    x: int
+
+def main() -> None:
+    mut p: Point = Point(x=1)
+    p.x = 2
+    print(p.x, Mut(x=1).x)
+";
+        let diags = check_main(main, &[("geometry", GEOMETRY)], CheckOptions::default());
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
+    fn freeze_let_judges_a_constructor_by_the_class_it_names() {
+        let freezable = |value: &str| {
+            let main =
+                format!("import geometry\n\nclass Point:\n    x: int\n\nfreeze let V = {value}\n");
+            let diags = check_main(&main, &[("geometry", GEOMETRY)], CheckOptions::default());
+            !diags
+                .errors()
+                .iter()
+                .any(|e| matches!(e, TycError::FreezeNotFreezable { .. }))
+        };
+        // The local mutable `Point` crashes `deep_freeze` at startup.
+        assert!(!freezable("Point(x=0)"));
+        // `geometry.Point` is frozen; `geometry.Mut` is not.
+        assert!(freezable("geometry.Point(x=0, y=0)"));
+        assert!(!freezable("geometry.Mut(x=0)"));
+    }
+
+    #[test]
+    fn local_classes_win_over_imported_enums_aliases_and_newtypes() {
+        // projE / projN: only a function is imported, but the touched
+        // module's enum, alias and newtype were seeded by source name.
+        let palette = "\
+from enum import Enum
+
+pub class Color(Enum):
+    RED = 1
+    BLUE = 2
+
+pub type Id = int
+pub newtype UserId = int
+
+pub def describe(n: int) -> str:
+    return str(n)
+";
+        let main = "\
+from palette import describe
+
+class Color:
+    r: int
+
+class Id:
+    v: int
+
+class UserId:
+    v: int
+
+def main() -> None:
+    let c: Color = Color(r=1)
+    let i: Id = Id(v=2)
+    let u: UserId = UserId(v=3)
+    print(c.r, i.v, u.v, describe(3))
+";
+        let diags = check_main(main, &[("palette", palette)], CheckOptions::default());
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        // Control: the imported newtype still widens where it is used.
+        let main = "\
+from palette import UserId
+
+def show(n: int) -> int:
+    return n
+
+print(show(UserId(3)))
+";
+        let diags = check_main(main, &[("palette", palette)], CheckOptions::default());
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
+    fn an_imported_frozen_class_still_rejects_field_writes() {
+        let main = "\
+from geometry import Point
+
+def main() -> None:
+    mut p: Point = Point(x=1, y=2)
+    p.x = 3
+";
+        let diags = check_main(main, &[("geometry", GEOMETRY)], CheckOptions::default());
+        assert!(
+            diags
+                .errors()
+                .iter()
+                .any(|e| matches!(e, TycError::FrozenAssign { .. })),
+            "{:?}",
+            diags.errors()
+        );
+    }
 }

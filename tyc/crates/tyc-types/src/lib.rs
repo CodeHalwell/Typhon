@@ -2835,11 +2835,31 @@ fn join_envs(states: Vec<TypeEnv>) -> Option<TypeEnv> {
     Some(joined)
 }
 
+/// What a frame on [`TypeEnv::scopes`] models, as far as name visibility
+/// goes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum FrameKind {
+    /// The module, a block (a `match` arm) or a comprehension: visible to
+    /// everything nested in it.
+    #[default]
+    Plain,
+    /// A class body. Python never makes it an enclosing scope of a function
+    /// defined in it, so a method body cannot read a sibling method or a
+    /// class-level field by bare name — the name resolves to the module.
+    Class,
+    /// A function body, once its parameter defaults (evaluated in the
+    /// enclosing scope) have been checked.
+    Function,
+}
+
 /// Type-environment stack — a map of name → TypeBinding per scope.
 #[derive(Debug, Default, Clone)]
 struct TypeEnv {
     /// `scopes[i].get(name)` → binding.
     scopes: Vec<ScopeMap>,
+    /// `kinds[i]` is what `scopes[i]` models; the two are pushed and popped
+    /// together.
+    kinds: Vec<FrameKind>,
     /// Flow-sensitive narrowings keyed by attribute access path
     /// (`"self.value"`, `"b.value"`). Lets `if self.x is None: return …`
     /// narrow `self.x` to non-`None` for the rest of the block. Cleared
@@ -2851,9 +2871,31 @@ struct TypeEnv {
 impl TypeEnv {
     fn enter(&mut self) {
         self.scopes.push(Rc::new(HashMap::new()));
+        self.kinds.push(FrameKind::Plain);
+    }
+    /// Enter a class body (see [`FrameKind::Class`]).
+    fn enter_class(&mut self) {
+        self.enter();
+        if let Some(kind) = self.kinds.last_mut() {
+            *kind = FrameKind::Class;
+        }
+    }
+    /// Mark the innermost frame as a function body (see
+    /// [`FrameKind::Function`]).
+    fn mark_function_frame(&mut self) {
+        if let Some(kind) = self.kinds.last_mut() {
+            *kind = FrameKind::Function;
+        }
     }
     fn leave(&mut self) {
         self.scopes.pop();
+        self.kinds.pop();
+    }
+    /// Whether frame `i` is invisible from the innermost frame: a class body
+    /// seen from inside a function nested in it.
+    fn hidden(&self, i: usize) -> bool {
+        self.kinds.get(i) == Some(&FrameKind::Class)
+            && self.kinds[i + 1..].contains(&FrameKind::Function)
     }
     fn declare(&mut self, b: TypeBinding) {
         if let Some(top) = self.scopes.last_mut() {
@@ -2861,17 +2903,21 @@ impl TypeEnv {
         }
     }
     fn lookup(&self, name: &str) -> Option<&TypeBinding> {
-        for scope in self.scopes.iter().rev() {
+        for (i, scope) in self.scopes.iter().enumerate().rev() {
             if let Some(b) = scope.get(name) {
-                return Some(b);
+                if !self.hidden(i) {
+                    return Some(b);
+                }
             }
         }
         None
     }
-    /// The index of the innermost scope holding `name`. Resolving read-only
-    /// first is what lets a mutation `make_mut` exactly one scope.
+    /// The index of the innermost visible scope holding `name`. Resolving
+    /// read-only first is what lets a mutation `make_mut` exactly one scope.
     fn scope_of(&self, name: &str) -> Option<usize> {
-        self.scopes.iter().rposition(|s| s.contains_key(name))
+        (0..self.scopes.len())
+            .rev()
+            .find(|&i| self.scopes[i].contains_key(name) && !self.hidden(i))
     }
     /// Apply a narrowing within the topmost frame for the given name.
     fn narrow(&mut self, name: &str, new_type: Type) {
@@ -3491,6 +3537,13 @@ struct Checker<'a> {
     /// call sites to type-check keyword arguments absorbed by
     /// `**kwargs: T` against `T`.
     function_kwarg_types: HashMap<String, Type>,
+    /// The [`ArityInfo`] of the attribute callee `infer_expr` resolved last
+    /// (see [`method_callee_arity`]), keyed by that attribute's span. A call
+    /// reads it for its own `func`: a method, a TypeVar bound's method or a
+    /// module function is arity-checked against what the receiver actually
+    /// resolves to, never against a same-named entry of the name-keyed
+    /// tables above.
+    attr_callee_arity: Option<((usize, usize), ArityInfo)>,
     /// Names of `async def` functions declared at module top level.
     /// Used by the call-site arm to emit `tyc::missing_await`
     /// (FINDINGS #49) when a sync context calls one without `await`.
@@ -3556,18 +3609,19 @@ struct Checker<'a> {
     python_minor: u8,
     /// `[emit] freeze-dict = "frozendict"` — see [`CheckOptions`].
     freeze_to_frozendict: bool,
-    /// Bounds declared on PEP 695 type parameters, keyed by function name.
-    /// E.g. `def f[T: Interface](x: T)` populates `{"f": {"T": Class("Interface")}}`.
-    /// Checked at call sites via `Checker::check_call_typevar_bounds`.
+    /// Bounds declared on PEP 695 type parameters of module-level functions,
+    /// keyed by function name. E.g. `def f[T: Interface](x: T)` populates
+    /// `{"f": {"T": Class("Interface")}}`. Checked at call sites via
+    /// `Checker::check_call_typevar_bounds`.
     function_type_bounds: HashMap<String, HashMap<String, Type>>,
     /// Module-level PEP 661 sentinels (`MISSING = sentinel("MISSING")`,
     /// Python 3.15). Each has its own singleton type, `Type::Class(name)`,
     /// usable in annotations (`int | MISSING`) and narrowed by `is`.
     sentinels: HashSet<String>,
-    /// The bounds in effect for the function body currently being checked.
-    /// Populated by `check_function` from `function_type_bounds` so that
-    /// `Expr::Attribute` resolution can look up what interface a `T: Iface`
-    /// parameter conforms to.
+    /// The bounds in effect for the function body currently being checked:
+    /// that `def`'s own, set by `check_function`, so that `Expr::Attribute`
+    /// resolution can look up what interface a `T: Iface` parameter
+    /// conforms to.
     active_typevar_bounds: HashMap<String, Type>,
     /// The PEP 695 type parameters of the function body currently being
     /// checked (`def first[T](xs: list[T]) -> T`). Inside that body a `T` is
@@ -3684,6 +3738,10 @@ struct Checker<'a> {
     /// Return type of the function whose body we are currently checking
     /// (None at module scope).
     current_return: Option<Type>,
+    /// The resolver scope of that function body (the module's, `0`, at
+    /// module scope): the names it binds are its locals, whatever the env
+    /// shows.
+    function_scope: ScopeId,
     /// Name of the class whose body we are currently checking, including
     /// the `__typhon_impl_<NAME>` pseudo-class form. Used to give an
     /// unannotated `self` parameter the enclosing class's type so writes
@@ -3765,8 +3823,13 @@ struct Checker<'a> {
     /// which is conceptually `_GeneratorContextManager[T]` but is
     /// rarely annotated as such. R3-3. Populated during the function-
     /// signature pre-scan from `@contextmanager` / `@asynccontextmanager`
-    /// (bare-name and `contextlib.<name>` forms).
+    /// (bare-name and `contextlib.<name>` forms). Module-level functions
+    /// only, keyed by name.
     contextmanager_yields: HashMap<String, Type>,
+    /// The same for method-form factories (`impl Pool: @contextmanager def
+    /// acquire(self)`), keyed by (class, method) — the class without its
+    /// `__typhon_impl_` prefix — and looked up through the receiver's class.
+    method_contextmanager_yields: HashMap<(String, String), Type>,
 }
 
 /// Per-function arity metadata kept alongside `Type::Function` so the
@@ -4014,6 +4077,7 @@ impl<'a> Checker<'a> {
             function_signatures: HashMap::new(),
             function_arity_info: HashMap::new(),
             function_kwarg_types: HashMap::new(),
+            attr_callee_arity: None,
             async_functions: std::collections::HashSet::new(),
             sync_functions: std::collections::HashSet::new(),
             imported_sync_functions: std::collections::HashSet::new(),
@@ -4055,6 +4119,7 @@ impl<'a> Checker<'a> {
             env: TypeEnv::default(),
             diagnostics: Diagnostics::new(),
             current_return: None,
+            function_scope: 0,
             current_class: None,
             dataclass_field_decl: false,
             uninit_instances: HashMap::new(),
@@ -4062,6 +4127,7 @@ impl<'a> Checker<'a> {
             partial_returning_fns: HashMap::new(),
             module_registry: std::sync::Arc::new(HashMap::new()),
             contextmanager_yields: HashMap::new(),
+            method_contextmanager_yields: HashMap::new(),
         }
     }
 
@@ -6547,9 +6613,10 @@ impl<'a> Checker<'a> {
     /// Validate that each inferred TypeVar binding at a call site satisfies
     /// the bound declared on the function's type parameter.
     ///
-    /// `fn_name` is used to look up stored bounds; when no bounds are
-    /// recorded for that function this is a no-op. Violations are emitted
-    /// as `tyc::typevar_bound` diagnostics at `call_span`.
+    /// `fn_name` is used to look up stored bounds — the caller passes it only
+    /// when the bare name still reads the module-level function; when no
+    /// bounds are recorded for that function this is a no-op. Violations are
+    /// emitted as `tyc::typevar_bound` diagnostics at `call_span`.
     fn check_call_typevar_bounds(
         &mut self,
         fn_name: &str,
@@ -7661,6 +7728,8 @@ pub fn check_module_with_options(
         // bindings; the type comes from the lookup below.
     }
 
+    drop_externally_seeded_local_names(&mut c, &module.body);
+
     // First pass: collect class names + function signatures so forward
     // references work.
     collect_call_rebound_globals(&module.body, &mut c.globals_rebound_by_call);
@@ -7792,6 +7861,46 @@ fn unsafe_byte_starts(source: &str, unsafe_lines: &[usize]) -> Vec<u32> {
     }
     starts.sort_unstable();
     starts
+}
+
+/// Forget what the cross-module seeding recorded about a name this module
+/// declares itself. Shapes reached only through an imported signature are
+/// seeded under their *source* names (`Point`, `UserId`), so a module that
+/// declares its own mutable `class Point:` must not inherit an imported
+/// `Point`'s frozen-ness — nor a local `class UserId:` an imported newtype's
+/// base. The local declaration passes then record what this module says.
+/// Runs before them, independently of whether this module has a frozen
+/// class of its own.
+fn drop_externally_seeded_local_names(c: &mut Checker, body: &[Stmt]) {
+    for stmt in body {
+        let name = match stmt {
+            Stmt::ClassDef(cd) => cd.name.as_str(),
+            Stmt::TypeAlias(ta) => match ta.name.as_ref() {
+                Expr::Name(n) => n.id.as_str(),
+                _ => continue,
+            },
+            Stmt::Assign(a) => match extract_newtype_decl(a) {
+                Some((name, _)) => {
+                    drop_external_type_facts(c, &name);
+                    continue;
+                }
+                None => continue,
+            },
+            _ => continue,
+        };
+        if name.starts_with("__typhon_") {
+            continue;
+        }
+        drop_external_type_facts(c, name);
+    }
+}
+
+fn drop_external_type_facts(c: &mut Checker, name: &str) {
+    c.newtypes.remove(name);
+    c.type_aliases.remove(name);
+    c.enums.remove(name);
+    c.frozen_classes.remove(name);
+    c.frozen_classes.remove(&format!("__typhon_impl_{name}"));
 }
 
 /// Populate [`Checker::frozen_classes`] from the preprocessor's
@@ -9353,26 +9462,31 @@ const BLOCKING_CALLEES: &[&str] = &[
 /// The dotted callee path of `func` with module-level import aliases
 /// expanded, for matching [`BLOCKING_CALLEES`]: `t.sleep` after `import time
 /// as t` and `sleep` after `from time import sleep` are both `time.sleep`.
-/// A head bound in an inner scope (a parameter, a local) is not the import,
-/// so the path is returned as written; so is a relative import.
+/// A head bound in an inner scope (a parameter, a local) or to anything but
+/// an import at module level (a `requests` dict, a `def input`) is not a
+/// stdlib callee at all, so there is no path; an unbound head (the builtin
+/// `input`) or a relative import is returned as written.
 fn canonical_callee_path(c: &Checker, func: &Expr) -> Option<String> {
     let path = dotted_name_of(func)?;
     let (head, rest) = match path.split_once('.') {
         Some((h, r)) => (h, Some(r)),
         None => (path.as_str(), None),
     };
-    if c.env.scope_of(head) != Some(0) {
-        return Some(path);
+    match c.env.scope_of(head) {
+        None => return Some(path),
+        Some(0) => {}
+        Some(_) => return None,
     }
-    let Some(info) = c
+    let span = c.env.lookup(head)?.span.0;
+    let info = c
         .resolved
         .scopes
-        .first()
-        .and_then(|scope| scope.bindings.iter().find(|b| b.name == head))
-        .and_then(|b| b.import_info.as_ref())
-    else {
-        return Some(path);
-    };
+        .first()?
+        .bindings
+        .iter()
+        .find(|b| b.name == head && b.span.0 == span)?
+        .import_info
+        .as_ref()?;
     if info.level > 0 {
         return Some(path);
     }
@@ -9670,6 +9784,49 @@ fn check_freeze_argument(c: &mut Checker, binding: &str, arg: &Expr) {
     walk_freeze_expr(c, binding, arg);
 }
 
+/// The registry module a module-level dotted name refers to through a bare
+/// `import` (`geometry`, `g` after `import geometry as g`, `pkg.sub` after
+/// `import pkg.sub`). Read from the resolver, so it holds after the module
+/// body's env is gone.
+fn imported_module_of(c: &Checker, value: &Expr) -> Option<String> {
+    let dotted = dotted_name_of(value)?;
+    let (head, rest) = match dotted.split_once('.') {
+        Some((h, r)) => (h, Some(r)),
+        None => (dotted.as_str(), None),
+    };
+    let info = c
+        .resolved
+        .scopes
+        .first()?
+        .bindings
+        .iter()
+        .find(|b| b.name == head && b.kind == BindingKind::Import)?
+        .import_info
+        .as_ref()?;
+    if info.member.is_some() || info.level > 0 {
+        return None;
+    }
+    let module = match rest {
+        Some(rest) => format!("{}.{rest}", info.module),
+        None => info.module.clone(),
+    };
+    c.module_registry.contains_key(&module).then_some(module)
+}
+
+fn report_not_freezable(c: &mut Checker, binding: &str, class: &str, span: TextRange) {
+    c.diagnostics.push_error(TycError::freeze_not_freezable(
+        binding.to_owned(),
+        class.to_owned(),
+        c.path.clone(),
+        c.source,
+        span.start().to_usize(),
+        span.end()
+            .to_usize()
+            .saturating_sub(span.start().to_usize())
+            .max(1),
+    ));
+}
+
 fn walk_freeze_expr(c: &mut Checker, binding: &str, expr: &Expr) {
     match expr {
         // Literals — always freezable.
@@ -9716,9 +9873,25 @@ fn walk_freeze_expr(c: &mut Checker, binding: &str, expr: &Expr) {
         // `Foo(...)` on a non-`frozen` class produces a value whose
         // fields are mutable; `deep_freeze` rejects it.
         Expr::Call(call) => {
+            // `mod.Point(...)` is that module's `Point`, not a local class
+            // of the same name; any other attribute callee (a method, a
+            // factory) is left to the runtime, like an unknown name.
             let head = match call.func.as_ref() {
                 Expr::Name(n) => Some(n.id.as_str()),
-                Expr::Attribute(a) => Some(a.attr.as_str()),
+                Expr::Attribute(a) => {
+                    if let Some(m) = imported_module_of(c, &a.value) {
+                        let attr = a.attr.as_str();
+                        let non_frozen = c.module_registry.get(m.as_str()).is_some_and(|shapes| {
+                            shapes.class_shapes.contains_key(attr)
+                                && !shapes.frozen_classes.contains(attr)
+                        });
+                        if non_frozen {
+                            report_not_freezable(c, binding, &format!("{m}.{attr}"), call.range);
+                            return;
+                        }
+                    }
+                    None
+                }
                 _ => None,
             };
             if let Some(head) = head {
@@ -9743,18 +9916,7 @@ fn walk_freeze_expr(c: &mut Checker, binding: &str, expr: &Expr) {
                 // shape data for).
                 let user_class_known = c.classes.iter().any(|s| s == head);
                 if !always_ok && user_class_known && !c.frozen_classes.contains(head) {
-                    let span = call.range;
-                    c.diagnostics.push_error(TycError::freeze_not_freezable(
-                        binding.to_owned(),
-                        head.to_owned(),
-                        c.path.clone(),
-                        c.source,
-                        span.start().to_usize(),
-                        span.end()
-                            .to_usize()
-                            .saturating_sub(span.start().to_usize())
-                            .max(1),
-                    ));
+                    report_not_freezable(c, binding, head, call.range);
                     return;
                 }
                 // newtype constructor — base must be freezable
@@ -10656,16 +10818,19 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
     // (`impl Pool: @contextmanager def acquire(self): yield Conn()`)
     // live inside a `ClassDef` body and aren't visited by the
     // top-level FunctionDef pass above. Walk every class body and
-    // record the same yield type under the METHOD name, matching
-    // `with_target_type`'s attribute-callee lookup key.
+    // record the same yield type under its (class, method) pair, which
+    // `with_target_type` reaches through the receiver's class — never
+    // under the bare method name a module function may also have.
     for stmt in body {
         if let Stmt::ClassDef(cd) = stmt {
+            let class = cd.name.as_str();
+            let class = class.strip_prefix("__typhon_impl_").unwrap_or(class);
             for item in &cd.body {
                 if let Stmt::FunctionDef(f) = item {
                     if has_contextmanager_decorator(&f.decorator_list) {
                         if let Some(yield_ty) = extract_first_yield_type(&f.body, &classes) {
-                            c.contextmanager_yields
-                                .insert(f.name.as_str().to_owned(), yield_ty);
+                            c.method_contextmanager_yields
+                                .insert((class.to_owned(), f.name.as_str().to_owned()), yield_ty);
                         }
                     }
                 }
@@ -11087,21 +11252,27 @@ fn with_target_type(c: &Checker, ctx_expr: &Expr, ctx_ty: &Type, is_async: bool)
     if is_async && matches!(ctx_ty,Type::Class(name) if name=="asyncio.TaskGroup") {
         return ctx_ty.clone();
     }
-    // (1) Factory call. Both bare-name (`acquire()`) and
-    // attribute-style (`self.acquire()`, `pool.session()`) callees
-    // resolve through the contextmanager_yields registry — we key on
-    // the method/function name in both cases, which matches how the
-    // pre-scan populates the registry.
+    // (1) Factory call. A bare name (`acquire()`) reads the module-level
+    // factory when it still names it; an attribute callee
+    // (`self.acquire()`, `pool.session()`) the method its receiver's class
+    // resolves to.
     if let Expr::Call(call) = ctx_expr {
-        let name_opt = match call.func.as_ref() {
-            Expr::Name(n) => Some(n.id.as_str()),
-            Expr::Attribute(a) => Some(a.attr.as_str()),
+        let yield_ty = match call.func.as_ref() {
+            Expr::Name(n) if callables::binds_module_function(c, n.id.as_str()) => {
+                c.contextmanager_yields.get(n.id.as_str()).cloned()
+            }
+            Expr::Attribute(a) => {
+                let recv = c
+                    .expression_types
+                    .get(&expr_span(&a.value))
+                    .cloned()
+                    .unwrap_or_else(|| infer_expr_readonly(c, &a.value));
+                method_contextmanager_yield(c, &recv, a.attr.as_str())
+            }
             _ => None,
         };
-        if let Some(name) = name_opt {
-            if let Some(yield_ty) = c.contextmanager_yields.get(name) {
-                return yield_ty.clone();
-            }
+        if let Some(yield_ty) = yield_ty {
+            return yield_ty;
         }
     }
     // (2) Class-based context manager via __enter__ / __aenter__.
@@ -11130,6 +11301,35 @@ fn with_target_type(c: &Checker, ctx_expr: &Expr, ctx_ty: &Type, is_async: bool)
         }
     }
     Type::Unknown
+}
+
+/// The yield type of the `@contextmanager` method `method` that a receiver
+/// of type `recv` calls: the first class along its hierarchy defining
+/// `method` decides, as [`Checker::find_method`] resolves it.
+fn method_contextmanager_yield(c: &Checker, recv: &Type, method: &str) -> Option<Type> {
+    let (Type::Class(class) | Type::Generic(class, _)) = recv else {
+        return None;
+    };
+    let mut stack: Vec<String> = vec![class.clone()];
+    let mut visited: HashSet<String> = HashSet::new();
+    while let Some(name) = stack.pop() {
+        if !visited.insert(name.clone()) {
+            continue;
+        }
+        if let Some(shape) = c.resolve_class_shape(&name) {
+            if shape.methods.contains_key(method) {
+                return c
+                    .method_contextmanager_yields
+                    .get(&(name, method.to_owned()))
+                    .cloned();
+            }
+            stack.extend(shape.bases.iter().cloned());
+        }
+        if let Some(parents) = c.class_parents.get(&name) {
+            stack.extend(parents.iter().cloned());
+        }
+    }
+    None
 }
 
 fn has_contextmanager_decorator(decorators: &[ruff_python_ast::Decorator]) -> bool {
@@ -12312,59 +12512,99 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-/// Resolve the `ArityInfo` for a method-call target of the form
-/// `<receiver>.<method>(...)`. Walks the receiver's static type to find
-/// the matching [`MethodSig`] and returns its stored `arity_info`,
-/// which already excludes the implicit `self` / `cls` receiver. Returns
-/// `None` when:
-///
-/// - the receiver isn't a known class instance (e.g. `Any`, a foreign
-///   type from `unsafe:`, or an unresolved name),
-/// - the attribute doesn't name a method on that class, or
-/// - the receiver IS the class name (`User.greet`, an unbound-method
-///   access) — those call sites would need to fill `self` themselves and
-///   are still handled by the legacy permissive shape until we model
-///   them properly.
-///
-/// Class-qualified calls into `@classmethod` and `@staticmethod`
-/// targets are accepted because the arity info already accounts for
-/// the absent (or auto-bound) receiver.
-fn method_arity_info_for_attribute(
+/// The full [`ArityInfo`] of the callee `recv.attr` names, exactly as
+/// `infer_expr`'s `Expr::Attribute` arm records it for a call: the
+/// receiver's own [`MethodSig`] (a TypeVar receiver reads its bound's), or a
+/// module function's — so keyword names, defaults, `*args` and kw-only
+/// parameters are the callee's and never a same-named module-level
+/// function's. Used for an alias of a bound method (`let g = u.greet`).
+/// `receiver_is_class` is the unbound form `Cls.method(inst, …)`: an
+/// instance method then takes the receiver as its first positional, exactly
+/// where `infer_expr` inserts it into the callee's `Type::Function`. `None`
+/// for a property, a name with no known method, or any other receiver — a
+/// builtin value's method keeps its structural signature.
+fn method_callee_arity(
     c: &Checker,
-    attr: &ruff_python_ast::ExprAttribute,
+    recv: &Type,
+    receiver_is_class: bool,
+    attr: &str,
 ) -> Option<ArityInfo> {
-    // The same Expr::Attribute resolution path the call site uses to
-    // pick a method's return type, mirrored here so we can grab the
-    // richer arity surface that `Type::Function` discards.
-    let recv = infer_expr_readonly(c, &attr.value);
-    let class_name = match &recv {
-        Type::Class(n) => n.clone(),
-        Type::Generic(n, _) => n.clone(),
+    let (class_name, may_be_unbound) = match recv {
+        Type::Class(n) => (n.as_str(), true),
+        Type::Generic(n, _) => (n.as_str(), false),
+        Type::TypeVar(tv) => match c.active_typevar_bounds.get(tv.as_str()) {
+            Some(Type::Class(bound)) => (bound.as_str(), false),
+            _ => return None,
+        },
+        Type::Module(m) => {
+            return c
+                .module_registry
+                .get(m)
+                .and_then(|shapes| shapes.function_arities.get(attr))
+                .cloned();
+        }
         _ => return None,
     };
-    let receiver_is_class_name = matches!(
-        attr.value.as_ref(),
-        Expr::Name(n) if c.classes.iter().any(|cn| cn == n.id.as_str())
-    );
-    let sig = c.find_method(&class_name, attr.attr.as_str())?;
+    let sig = c.find_method(class_name, attr)?;
     if sig.is_property {
         return None;
     }
-    // For `ClassName.method(instance, ...)` (unbound-method form),
-    // an extra positional is required for the receiver. Modelling
-    // that re-adds the `self` slot to `param_names`; without it the
-    // call would falsely arity-fail. Keep the existing permissive
-    // shape there for now to avoid regressing class-qualified calls.
-    if receiver_is_class_name && !sig.is_static && !sig.is_classmethod {
-        return None;
+    let unbound = may_be_unbound && receiver_is_class && takes_explicit_receiver(sig, attr);
+    Some(method_sig_arity(sig, class_name, unbound))
+}
+
+/// The callee `ArityInfo` of `class_name`'s method `sig`; `unbound` puts the
+/// receiver back as the first positional (see [`method_callee_arity`]).
+fn method_sig_arity(sig: &MethodSig, class_name: &str, unbound: bool) -> ArityInfo {
+    let info = sig.arity_info.clone();
+    if unbound {
+        with_receiver_slot(info, Type::Class(class_name.to_owned()))
+    } else {
+        info
     }
-    Some(sig.arity_info.clone())
+}
+
+/// Whether `Cls.method(…)` passes the receiver explicitly: an instance
+/// method does; a static method, a class method and the implicit class
+/// methods `__init_subclass__` / `__class_getitem__` do not.
+fn takes_explicit_receiver(sig: &MethodSig, attr: &str) -> bool {
+    !sig.is_static
+        && !sig.is_classmethod
+        && !matches!(attr, "__init_subclass__" | "__class_getitem__")
+}
+
+/// `expr`'s byte range, the key of the per-node side tables.
+fn expr_span(expr: &Expr) -> (usize, usize) {
+    (
+        expr.range().start().to_usize(),
+        expr.range().end().to_usize(),
+    )
+}
+
+/// The inverse of [`strip_receiver_from_arity`]: the receiver back as the
+/// first positional parameter, for an unbound `Cls.method(inst, …)` call.
+/// The signature does not record the receiver's name; it is `self` in
+/// practice.
+fn with_receiver_slot(mut info: ArityInfo, receiver: Type) -> ArityInfo {
+    let aligned = |len: usize| len == info.param_names.len();
+    if aligned(info.required_positional.len()) {
+        info.required_positional.insert(0, true);
+    }
+    if aligned(info.param_types.len()) {
+        info.param_types.insert(0, receiver);
+    }
+    info.param_names.insert(0, "self".to_owned());
+    info.min_positional += 1;
+    info.max_positional = info.max_positional.map(|n| n + 1);
+    if info.posonly_count > 0 {
+        info.posonly_count += 1;
+    }
+    info
 }
 
 /// A side-effect-free variant of [`infer_expr`] that walks the same
-/// match arms but avoids emitting diagnostics. Used by
-/// [`method_arity_info_for_attribute`] to peek at the receiver's static
-/// type before the surrounding call-site machinery walks it for real.
+/// match arms but avoids emitting diagnostics. Used to peek at a
+/// receiver's static type outside the inference pass itself.
 /// Covers `Name`, `Attribute`, and `Call` so chained shapes like
 /// `get_client().method(...)` correctly resolve the method's arity;
 /// without the `Expr::Call` arm, the chained-call receiver would fall
@@ -14206,6 +14446,34 @@ fn is_builtin_value_type(t: &Type) -> bool {
     }
 }
 
+/// When the bare name `name` reads a function-local parameter, loop target
+/// or value binding, `Some` of the name it aliases (`let r = reset` →
+/// `Some(Some("reset"))`; anything else → `Some(None)`). `None` for a
+/// module-level binding, a nested `def`, or no binding at all.
+fn local_value_binding<'a>(c: &Checker<'a>, name: &str) -> Option<Option<&'a str>> {
+    let binding = c.env.lookup(name)?;
+    if c.env.scope_of(name)? == 0 {
+        return None;
+    }
+    let resolved = c
+        .resolved
+        .scopes
+        .iter()
+        .flat_map(|s| &s.bindings)
+        .find(|b| b.name == name && b.span.0 == binding.span.0)?;
+    match resolved.kind {
+        BindingKind::Parameter | BindingKind::Loop => Some(None),
+        // Only a `let` alias is known to still hold its initial value.
+        BindingKind::Value => Some(match callables::alias_value(c, binding.span.0) {
+            Some(Expr::Name(target)) if resolved.mutability == tyc_resolve::Mutability::Let => {
+                Some(target.id.as_str())
+            }
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
 /// What the statement-position call `call` may do to the field narrowings of
 /// an object passed to it. See [`FieldWriteSummary`].
 fn call_arg_effect(c: &Checker, call: &ruff_python_ast::ExprCall) -> ArgEffect {
@@ -14213,6 +14481,18 @@ fn call_arg_effect(c: &Checker, call: &ruff_python_ast::ExprCall) -> ArgEffect {
     match call.func.as_ref() {
         Expr::Name(n) => {
             let f = n.id.as_str();
+            // A parameter, loop target or local value holding a callable is
+            // opaque, whatever a module-level function of that name writes —
+            // unless it is a plain alias of one (`let r = reset`).
+            if let Some(local) = local_value_binding(c, f) {
+                return match local {
+                    Some(alias) if callables::binds_module_function(c, alias) => s
+                        .funcs
+                        .get(alias)
+                        .map_or(ArgEffect::Anything, ArgEffect::from_summary),
+                    _ => ArgEffect::Anything,
+                };
+            }
             if let Some(w) = s.funcs.get(f) {
                 return ArgEffect::from_summary(w);
             }
@@ -15150,11 +15430,11 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
         }
         Stmt::FunctionDef(f) => {
             let tps = type_param_names_from(f.type_params.as_deref());
+            // The body sees this def's own bounds. The name-keyed
+            // `function_type_bounds` (call sites) holds module-level defs
+            // only, from the signature pre-pass: a method or nested def of
+            // the same name must neither read nor overwrite it.
             let bounds = type_param_bounds_from(f.type_params.as_deref(), &c.classes.clone());
-            if !bounds.is_empty() {
-                c.function_type_bounds
-                    .insert(f.name.as_str().to_owned(), bounds);
-            }
             check_function(
                 c,
                 (
@@ -15165,7 +15445,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 f.parameters.as_ref(),
                 &f.body,
                 f.returns.as_deref(),
-                &tps,
+                (&tps, bounds),
                 f.is_async,
             );
             // Bind the nested function's name to its callable type so a
@@ -15546,7 +15826,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     }
                 }
             }
-            c.env.enter();
+            c.env.enter_class();
             let saved_class = c.current_class.replace(cd.name.as_str().to_owned());
             // W7-07: the desugar copies a dataclass field's named default per
             // instance, unless the default reads a name the class body binds
@@ -16396,7 +16676,7 @@ fn check_function(
     parameters: &ruff_python_ast::Parameters,
     body: &[Stmt],
     returns: Option<&Expr>,
-    type_params: &[String],
+    (type_params, type_param_bounds): (&[String], HashMap<String, Type>),
     is_async: bool,
 ) {
     let (name, name_span_offset, name_span_len) = name_info;
@@ -16477,6 +16757,10 @@ fn check_function(
     }
 
     let saved_return = c.current_return.replace(ret_type.clone());
+    let saved_function_scope = std::mem::replace(
+        &mut c.function_scope,
+        c.resolved.scope_at_offset(name_span_offset),
+    );
     // `unsafe_origin_bindings` survives the env-scope restore that
     // follows the `if True:` body, but it must NOT survive a function
     // boundary — otherwise an unsafe leak diagnosed in one function
@@ -16505,12 +16789,7 @@ fn check_function(
     // Load the TypeVar bounds for this function so the body's attribute
     // accesses (e.g. `x.greet()` where `x: T` and `T: Greeter`) can resolve
     // against the bound's interface shape.
-    let saved_bounds = std::mem::take(&mut c.active_typevar_bounds);
-    c.active_typevar_bounds = c
-        .function_type_bounds
-        .get(name)
-        .cloned()
-        .unwrap_or_default();
+    let saved_bounds = std::mem::replace(&mut c.active_typevar_bounds, type_param_bounds);
     // The body's own type parameters are opaque inside it (see
     // `active_type_params`). Compiler-synthesised helpers keep the permissive
     // reading — their bodies are generated, not user-written.
@@ -16655,6 +16934,8 @@ fn check_function(
             }
         }
     }
+    // From here on a class body around this `def` is out of sight.
+    c.env.mark_function_frame();
 
     for stmt in body {
         check_stmt(c, stmt);
@@ -16713,6 +16994,7 @@ fn check_function(
     c.nonlocals_rebound_by_call = saved_nonlocals;
     c.nonlocal_writer_calls = saved_writer_calls;
     c.current_return = saved_return;
+    c.function_scope = saved_function_scope;
     c.unsafe_origin_bindings = saved_unsafe_origins;
     c.active_typevar_bounds = saved_bounds;
     c.active_type_params = saved_type_params;
@@ -18269,13 +18551,20 @@ fn call_never_returns(c: &Checker, expr: &Expr) -> bool {
     match call.func.as_ref() {
         Expr::Name(n) => {
             let name = n.id.as_str();
-            if matches!(name, "exit" | "quit") {
+            // The builtin, or `from sys import exit`; a parameter or local of
+            // that name is judged by its own type below.
+            if matches!(name, "exit" | "quit")
+                && binding_kind(c, name).is_none_or(|kind| kind == BindingKind::Import)
+            {
                 return true;
             }
-            matches!(
-                c.function_signatures.get(name),
-                Some(Type::Function { ret, .. }) if is_noreturn_type(ret)
-            )
+            // What the name holds where it is called — a parameter shadowing
+            // a module-level `NoReturn` function is not that function.
+            let callee = match c.env.lookup(name) {
+                Some(binding) => Some(&binding.narrowed),
+                None => c.function_signatures.get(name),
+            };
+            matches!(callee, Some(Type::Function { ret, .. }) if is_noreturn_type(ret))
         }
         Expr::Attribute(a) => {
             let module = match a.value.as_ref() {
@@ -18285,10 +18574,38 @@ fn call_never_returns(c: &Checker, expr: &Expr) -> bool {
             matches!(
                 (module, a.attr.as_str()),
                 ("sys", "exit") | ("os", "_exit") | ("os", "abort")
-            )
+            ) && names_stdlib_module(c, module)
         }
         _ => false,
     }
+}
+
+/// The resolver kind of the binding `name` reads, when the env has one the
+/// resolver recorded.
+fn binding_kind(c: &Checker, name: &str) -> Option<BindingKind> {
+    let binding = c.env.lookup(name)?;
+    c.resolved
+        .scopes
+        .iter()
+        .flat_map(|s| &s.bindings)
+        .find(|b| b.name == name && b.span.0 == binding.span.0)
+        .map(|b| b.kind)
+}
+
+/// Whether the bare name `module` reads the stdlib module of that name: an
+/// `import os` binds it, or nothing does (the call then raises anyway). A
+/// parameter `os: Job` does not.
+fn names_stdlib_module(c: &Checker, module: &str) -> bool {
+    let Some(binding) = c.env.lookup(module) else {
+        return true;
+    };
+    c.resolved.scopes.iter().flat_map(|s| &s.bindings).any(|b| {
+        b.name == module
+            && b.span.0 == binding.span.0
+            && b.import_info.as_ref().is_some_and(|info| {
+                info.module == module && info.member.is_none() && info.level == 0
+            })
+    })
 }
 
 /// `NoReturn` / `Never` (bare or `typing.`-qualified) as a return type.
@@ -19546,10 +19863,14 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                 // `if is_str_list(xs):` the first argument *is* the guarded
                 // type (PEP 647). `TypeIs[T]` (PEP 742) additionally narrows
                 // the false branch by removing `T`; `TypeGuard` says nothing
-                // about it.
-                if let Some(Type::Function { ret, .. }) =
-                    c.function_signatures.get(fn_name.id.as_str())
-                {
+                // about it. The callee is what the name holds where it is
+                // called: a parameter shadowing a module guard is its own
+                // `Callable`, a guard only if its type says so.
+                let callee = match c.env.lookup(fn_name.id.as_str()) {
+                    Some(binding) => Some(&binding.narrowed),
+                    None => c.function_signatures.get(fn_name.id.as_str()),
+                };
+                if let Some(Type::Function { ret, .. }) = callee {
                     if let Type::Generic(head, guard_args) = ret.as_ref() {
                         if (head == "TypeGuard" || head == "TypeIs") && guard_args.len() == 1 {
                             if let Some(Expr::Name(target)) = pos_args.first() {
@@ -20160,6 +20481,40 @@ fn builtin_str_method(attr: &str) -> Option<Type> {
     }
 }
 
+/// The full [`ArityInfo`] of a builtin method whose `Type::Function` cannot
+/// say enough: `dict.get(key, default=None, /)` takes one or two
+/// arguments, positionally only — `d.get(k, default=0)` and `d.get(k, a, b)`
+/// raise `TypeError` (a `Mapping`'s Python-level `get` takes `default=`, so
+/// it keeps the permissive signature).
+fn builtin_method_arity(recv: &Type, attr: &str, method: &Type) -> Option<ArityInfo> {
+    let Type::Generic(head, _) = recv else {
+        return None;
+    };
+    let Type::Function { params, ret, .. } = method else {
+        return None;
+    };
+    if attr != "get" || !matches!(head.as_str(), "dict" | "frozendict") {
+        return None;
+    }
+    let key = params.first().cloned().unwrap_or(Type::Unknown);
+    Some(ArityInfo {
+        param_names: vec!["key".to_owned(), "default".to_owned()],
+        min_positional: 1,
+        required_positional: vec![true, false],
+        max_positional: Some(2),
+        posonly_count: 2,
+        kwonly_names: Vec::new(),
+        kwonly_required: Vec::new(),
+        has_kwarg: false,
+        vararg_type: None,
+        param_types: vec![key, Type::Unknown],
+        kwonly_types: Vec::new(),
+        return_type: ret.as_ref().clone(),
+        is_async: false,
+        declared_sync: false,
+    })
+}
+
 fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
     let Type::Generic(head, args) = recv else {
         return None;
@@ -20195,8 +20550,9 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
         ("dict", "get", [k, v]) => {
             // `d.get(k)` → V?  ;  `d.get(k, default)` → also typed as V?
             // (the default may broaden the runtime type, but the static
-            // contract Typhon advertises is "V?"). Variadic so 1- and
-            // 2-arg call sites both pass the arity check.
+            // contract Typhon advertises is "V?"). Variadic so a
+            // `Mapping`'s `get(key, default=…)` passes; a call on a real
+            // `dict` is arity-checked by [`builtin_method_arity`].
             let ret = Type::union_of(vec![v.clone(), Type::None]);
             Some(Type::Function {
                 params: vec![k.clone()],
@@ -22342,7 +22698,14 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     }
                 }
             }
+            c.attr_callee_arity = None;
             let func_type_raw = infer_expr(c, &call.func);
+            let callee_span = expr_span(&call.func);
+            let attr_callee_arity = c
+                .attr_callee_arity
+                .take()
+                .filter(|(span, _)| *span == callee_span)
+                .map(|(_, info)| info);
             // Unwrap transparent type aliases (`type Handler = Callable[..., R]`)
             // so that calls through the alias resolve to the underlying
             // `Type::Function` rather than the alias name. Without this,
@@ -22404,7 +22767,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             let at_module_level = c.current_return.is_none() && c.async_enclosing_depth == 0;
             if at_module_level && c.unsafe_depth == 0 {
                 let offender = task_spawn_callee(call).or_else(|| match call.func.as_ref() {
-                    Expr::Name(n) => c
+                    Expr::Name(n) if callables::binds_module_function(c, n.id.as_str()) => c
                         .sync_spawners
                         .get(n.id.as_str())
                         .map(|spawned| format!("{spawned} (via {})", n.id.as_str())),
@@ -22448,19 +22811,27 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     // count must match `params.len()` exactly unless
                     // `variadic`, and kwargs are accepted iff the
                     // structural type spelled `*args` / `**kwargs`.
+                    // The name-keyed tables (`function_arity_info`,
+                    // `function_kwarg_types`) describe module-level and
+                    // imported functions, so only a bare name that still
+                    // reads one of those may key them. An attribute callee
+                    // carries its own `ArityInfo` from `infer_expr` (the
+                    // receiver's method, or the `module.fn` entry); its bare
+                    // attribute name is only a label.
+                    let table_key: Option<&str> = match call.func.as_ref() {
+                        Expr::Name(n) if callables::binds_module_function(c, n.id.as_str()) => {
+                            Some(n.id.as_str())
+                        }
+                        _ => None,
+                    };
                     let fn_name: Option<String> = match call.func.as_ref() {
                         Expr::Name(n) => Some(n.id.as_str().to_owned()),
                         Expr::Attribute(a) => {
-                            // For `module.fn(...)` callees (bare-import
-                            // dotted access) the arity was stashed
-                            // under the qualified `module.attr` key to
-                            // avoid collisions between modules that
-                            // export the same name. Mirror that
-                            // qualification here so the lookup hits
-                            // the right entry. The plain attribute
-                            // name still covers method-call /
-                            // instance-attribute callees.
-                            let recv = infer_expr_readonly(c, &a.value);
+                            let recv = c
+                                .expression_types
+                                .get(&expr_span(&a.value))
+                                .cloned()
+                                .unwrap_or_else(|| infer_expr_readonly(c, &a.value));
                             match recv {
                                 Type::Module(m) => Some(format!("{}.{}", m, a.attr.as_str())),
                                 _ => Some(a.attr.as_str().to_owned()),
@@ -22472,27 +22843,10 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     // below (`infer_expr_ctx`, `c.mismatch`,
                     // `c.nullable_use`) don't fight an outstanding
                     // immutable borrow of `c.function_arity_info`.
-                    //
-                    // Method calls (`obj.foo(...)`) carry `ArityInfo` on
-                    // the resolved `MethodSig` rather than in the
-                    // module-level `function_arity_info` map, so we
-                    // look there first whenever the call func is an
-                    // attribute access on a known class instance. This
-                    // closes the long-standing gap where method calls
-                    // missing required args (e.g.
-                    // `user.greet()` for `def greet(self, prefix: str)`)
-                    // bypassed `tyc::arg_count`.
-                    let method_arity_info: Option<ArityInfo> =
-                        if let Expr::Attribute(a) = call.func.as_ref() {
-                            method_arity_info_for_attribute(c, a)
-                        } else {
-                            None
-                        };
-                    let arity_info: Option<ArityInfo> = method_arity_info
+                    let arity_info: Option<ArityInfo> = attr_callee_arity
                         .or_else(|| callables::origin(c, &call.func))
                         .or_else(|| {
-                            fn_name
-                                .as_deref()
+                            table_key
                                 .and_then(|n| c.function_arity_info.get(n))
                                 .cloned()
                         });
@@ -22708,11 +23062,11 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         .map(|info| info.has_kwarg)
                         .unwrap_or(false);
                     let kwarg_value_type: Option<Type> = if has_kwarg {
-                        fn_name
-                            .as_deref()
-                            .and_then(|n| c.function_kwarg_types.get(n))
-                            .cloned()
-                            .or_else(|| class_contracts::call_kwarg_type(c, &call.func))
+                        class_contracts::call_kwarg_type(c, &call.func).or_else(|| {
+                            table_key
+                                .and_then(|n| c.function_kwarg_types.get(n))
+                                .cloned()
+                        })
                     } else {
                         None
                     };
@@ -22803,14 +23157,9 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     // result instead of `Any`.
                     // Also check that each inferred binding satisfies the
                     // TypeVar's declared bound (e.g. `T: Interface`).
-                    if let Expr::Name(fn_name_expr) = call.func.as_ref() {
+                    if let Some(fn_name) = table_key {
                         c.check_call_typevar_bounds(
-                            fn_name_expr.id.as_str(),
-                            &params,
-                            &actuals,
-                            &ret,
-                            expected,
-                            call_span,
+                            fn_name, &params, &actuals, &ret, expected, call_span,
                         );
                     }
                     // Bidirectional pass: if any TypeVar in `ret` is still
@@ -22856,11 +23205,10 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     // is V-compatible. Without this, the one-arg signature
                     // (`V | None`) leaks into the two-arg call site even
                     // though Python guarantees a non-None return when a
-                    // default is supplied. The default may be supplied
-                    // positionally (`d.get("a", 0)`) or by keyword
-                    // (`d.get("a", default=0)`); both forms are handled
-                    // by looking for either shape before falling through
-                    // to the nullable signature.
+                    // default is supplied. A keyword `default=0` is a
+                    // `TypeError` (`dict.get` is positional-only), already
+                    // reported by the arity check; it still types the result
+                    // here so the one mistake is reported once.
                     if let Expr::Attribute(attr) = call.func.as_ref() {
                         if attr.attr.as_str() == "get" {
                             let default_expr: Option<&Expr> = if pos_args.len() == 2 {
@@ -23327,6 +23675,9 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             }
             // Resolve attribute access on known class instances and TypeVar-bounded parameters.
             if let Some(method_type) = builtin_generic_method(&recv, attr_name) {
+                if let Some(info) = builtin_method_arity(&recv, attr_name, &method_type) {
+                    c.attr_callee_arity = Some((expr_span(expr), info));
+                }
                 return method_type;
             }
             // Builtin generic heads (list / dict / set / tuple / str / bytes /
@@ -23447,6 +23798,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         };
                         let ret = info.return_type.clone();
                         let variadic = info.max_positional.is_none();
+                        c.attr_callee_arity = Some((expr_span(expr), info.clone()));
                         c.function_arity_info.entry(qualified).or_insert(info);
                         return Type::Function {
                             params,
@@ -23485,6 +23837,9 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             // (an `impl U:` distributed method does), check it against the
             // variants exactly like a structural union.
             let recv = expand_sealed_union_alias(c, recv, attr_name);
+            // Each arm below that builds a `Type::Function` from a
+            // `MethodSig` also records that signature's `ArityInfo` for the
+            // call (`attr_callee_arity`).
             match &recv {
                 Type::Class(class_name) => {
                     let class_name = class_name.clone();
@@ -23501,10 +23856,13 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         }
                         let mut arity = sig.arity;
                         let mut params = sig.param_types.clone();
-                        if receiver_is_class_name && !sig.is_static && !sig.is_classmethod {
+                        let unbound =
+                            receiver_is_class_name && takes_explicit_receiver(sig, attr_name);
+                        if unbound {
                             arity = arity.saturating_add(1);
                             params.insert(0, Type::Class(class_name.clone()));
                         }
+                        let callee = method_sig_arity(sig, &class_name, unbound);
                         // Pad with Unknowns if the recorded param_types is
                         // shorter than the recorded arity (defensive — both
                         // should be derived from the same source).
@@ -23516,6 +23874,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         } else {
                             sig.return_type.clone()
                         };
+                        c.attr_callee_arity = Some((expr_span(expr), callee));
                         return Type::Function {
                             params,
                             ret: Box::new(ret),
@@ -23617,6 +23976,8 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         } else {
                             ret
                         };
+                        c.attr_callee_arity =
+                            Some((expr_span(expr), method_sig_arity(&sig, &class_name, false)));
                         return Type::Function {
                             params,
                             ret: Box::new(ret),
@@ -23685,6 +24046,8 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                             }
                             let arity = sig.arity;
                             let ret = sig.return_type.clone();
+                            let callee = method_sig_arity(sig, &bound_name, false);
+                            c.attr_callee_arity = Some((expr_span(expr), callee));
                             return Type::Function {
                                 params: vec![Type::Unknown; arity],
                                 ret: Box::new(ret),
@@ -43769,3 +44132,6 @@ def main() -> None:
 
 #[cfg(test)]
 mod flow_tests;
+
+#[cfg(test)]
+mod name_resolution_tests;
