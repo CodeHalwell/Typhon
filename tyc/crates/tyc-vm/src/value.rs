@@ -3325,7 +3325,7 @@ fn class_is_enum(class: &Class) -> bool {
 /// `Some` only when the instance carries the stashed `args` tuple, so
 /// field-carrying exceptions (which keep dataclass-style rendering) and
 /// ordinary instances are unaffected.
-fn exception_instance_args(inst: &Instance) -> Option<Rc<Vec<Value>>> {
+pub(crate) fn exception_instance_args(inst: &Instance) -> Option<Rc<Vec<Value>>> {
     if !inst.class.is_exception {
         return None;
     }
@@ -3338,7 +3338,7 @@ fn exception_instance_args(inst: &Instance) -> Option<Rc<Vec<Value>>> {
 /// Whether an exception class derives (directly or through its user base
 /// chain) from the builtin `KeyError`. Reads the `__typhon_exc_bases__`
 /// record stamped on each class by the interpreter's `build_class`.
-fn class_derives_from_keyerror(class: &Class) -> bool {
+pub(crate) fn class_derives_from_keyerror(class: &Class) -> bool {
     if class.name == "KeyError" {
         return true;
     }

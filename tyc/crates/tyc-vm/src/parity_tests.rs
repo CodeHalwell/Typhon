@@ -1970,6 +1970,14 @@ show(str(E([1, 2])), repr(E([1, 2])))
 show(str(KeyError("k")), repr(KeyError("k")))
 show(str(ValueError(1, 2)), repr(ValueError(1, 2)), repr(ValueError()))
 show(str(E()), str(E(3)), repr([E("x"), TypeError(None)]))
+class X:
+    def __str__(self) -> str:
+        return "sx"
+    def __repr__(self) -> str:
+        return "rx"
+class K(KeyError):
+    pass
+show(str(E(X())), repr(E(X())), str(E(X(), 1)), repr([E(X())]), str(K(X())))
 "#,
     );
 }

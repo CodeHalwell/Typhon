@@ -6285,6 +6285,21 @@ impl Interpreter {
                 }
             }
         }
+        // The same for a user exception class that doesn't define `__str__`.
+        if let Value::Instance(i) = v {
+            if let Some(args) = crate::value::exception_instance_args(i) {
+                if self.find_method(&i.class, "__str__").is_none() {
+                    match args.len() {
+                        0 => {}
+                        1 if crate::value::class_derives_from_keyerror(&i.class) => {
+                            return self.repr_of(&args[0])
+                        }
+                        1 => return self.str_of(&args[0]),
+                        _ => return self.repr_of(&Value::Tuple(args)),
+                    }
+                }
+            }
+        }
         if Self::is_container(v) {
             // `str(x)` and `repr(x)` agree for every container except a
             // frozen dict: CPython's `mappingproxy` delegates `__str__` to
@@ -6506,6 +6521,17 @@ impl Interpreter {
                     parts.push(self.repr_of_depth(a, depth + 1)?);
                 }
                 Ok(format!("{kind}({})", parts.join(", ")))
+            }
+            Value::Instance(i)
+                if crate::value::exception_instance_args(i).is_some()
+                    && self.find_method(&i.class, "__repr__").is_none() =>
+            {
+                let args = crate::value::exception_instance_args(i).unwrap_or_default();
+                let mut parts = Vec::with_capacity(args.len());
+                for a in args.iter() {
+                    parts.push(self.repr_of_depth(a, depth + 1)?);
+                }
+                Ok(format!("{}({})", i.class.name, parts.join(", ")))
             }
             // Scalars, instances (incl. enum members → `instance_repr`),
             // Result Ok/Err, etc. keep the existing dunder / `py_repr` path.
