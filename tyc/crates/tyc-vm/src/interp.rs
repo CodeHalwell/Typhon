@@ -2273,11 +2273,20 @@ impl Interpreter {
                 }
             }
         }
+        // `TypedDict`'s own class keywords (`total`, and PEP 728's `closed` /
+        // `extra_items`) are consumed by its metaclass, never passed on to
+        // `__init_subclass__`.
+        let is_typed_dict = std::iter::once(class)
+            .chain(class.mro.iter())
+            .any(|k| k.class_attrs.borrow().contains_key("__typhon_typed_dict__"));
         let mut kwargs: Vec<(String, Value)> = Vec::new();
         if let Some(args) = &c.arguments {
             for kw in args.keywords.iter() {
                 match kw.arg.as_ref().map(|a| a.as_str()) {
                     Some("metaclass") => {}
+                    Some("total" | "closed" | "extra_items") if is_typed_dict => {
+                        self.eval_expr(&kw.value, env)?;
+                    }
                     Some(name) => kwargs.push((name.to_owned(), self.eval_expr(&kw.value, env)?)),
                     None => {}
                 }

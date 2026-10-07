@@ -45,12 +45,23 @@ run.
   are no longer treated as stdlib on any target, and `cProfile`, `pyexpat`
   and a few other present roots were missing and are added. The diagnostic
   stays a warning.
+- **TypedDict `extra_items` (PEP 728).** A dict literal checked against
+  `class T(TypedDict, extra_items=V)` may carry undeclared keys whose
+  values are `V`s; other undeclared keys are still rejected.
+- **`TypeForm` and `disjoint_base` under `tyc run`.** The VM's `typing`
+  module now exposes 3.15's `TypeForm` (PEP 747) and `@disjoint_base`
+  (PEP 800), and 3.13's `ReadOnly`, so programs using them no longer fall
+  back to CPython.
 
 ### Fixed
 
 - **`{**d for d in ds}` emitted a set comprehension.** The printer dropped
   the `**` of a keyless dict comprehension, so the 3.15 build wrote
   `{d for d in ds}` and failed at runtime with "unhashable type: 'dict'".
+- **The VM accepts `TypedDict` class keywords.** `class T(TypedDict,
+  total=False)`, and 3.15's `closed=` / `extra_items=`, raised
+  "`__init_subclass__()` takes no keyword arguments" under `tyc run`; the
+  keywords now go to `TypedDict` as they do in CPython.
 - **The VM's `**` unpacking accepts any mapping.** Dict displays, calls and
   dict comprehensions took only a real `dict`; they now accept any object
   with `keys()` and `__getitem__`, as CPython does.

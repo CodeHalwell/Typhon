@@ -2872,6 +2872,8 @@ pub(crate) fn is_typing_form(name: &str) -> bool {
             | "Annotated"
             | "TypeGuard"
             | "TypeIs"
+            | "TypeForm"
+            | "ReadOnly"
             | "Required"
             | "NotRequired"
             | "Unpack"
@@ -7047,8 +7049,11 @@ fn make_typing_module() -> Value {
         // `typing` only has to expose the name so the import resolves.
         "TypeGuard",
         "TypeIs",
+        // `TypeForm` (PEP 747) is new in 3.15; `ReadOnly` (PEP 705) in 3.13.
+        "TypeForm",
         "TypeAlias",
         "Required",
+        "ReadOnly",
         "NotRequired",
         "Unpack",
         "Concatenate",
@@ -7112,9 +7117,16 @@ fn make_typing_module() -> Value {
             Ok(args.into_iter().next().unwrap_or(Value::None))
         }))),
     ));
-    // `@override` / `@final` / `@no_type_check` — checker-only decorators
-    // CPython also implements as the identity.
-    for name in ["override", "final", "no_type_check", "dataclass_transform"] {
+    // `@override` / `@final` / `@no_type_check` / `@disjoint_base` (3.15,
+    // PEP 800) — checker-only decorators CPython also implements as the
+    // identity.
+    for name in [
+        "override",
+        "final",
+        "no_type_check",
+        "dataclass_transform",
+        "disjoint_base",
+    ] {
         entries.push((
             name,
             Value::Native(Rc::new(NativeFn::new(name, |_i, args| {

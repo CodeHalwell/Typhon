@@ -7443,6 +7443,45 @@ main()
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
 
+    /// `TypedDict`'s class keywords (`total`, PEP 728's `closed` /
+    /// `extra_items`) belong to its metaclass; the VM passed them on to
+    /// `__init_subclass__` and raised. The 3.15 `typing` names `TypeForm`
+    /// and `disjoint_base` (and 3.13's `ReadOnly`) import and erase.
+    #[test]
+    fn typed_dict_class_keywords_and_newer_typing_names() {
+        let src = r#"
+from typing import TypedDict, TypeForm, ReadOnly, disjoint_base
+
+class Partial(TypedDict, total=False):
+    name: str
+
+class Extra(TypedDict, extra_items=int):
+    name: ReadOnly[str]
+
+class Closed(TypedDict, closed=True):
+    name: str
+
+@disjoint_base
+plain class Base:
+    pass
+
+def ident(t: TypeForm[int]) -> TypeForm[int]:
+    return t
+
+def main() -> None:
+    let p: Partial = {}
+    let e: Extra = {"name": "y", "n": 1}
+    let c: Closed = {"name": "z"}
+    if p != {} or e != {"name": "y", "n": 1} or c["name"] != "z":
+        raise AssertionError("TypedDict with class keywords wrong")
+    if ident(int) is not int or not isinstance(Base(), Base):
+        raise AssertionError("newer typing names wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
     /// `class X(NamedTuple)` is a tuple and `class X(TypedDict)` is a dict in
     /// CPython. The VM built a plain instance for both, so `p[0]` and
     /// `u["name"]` raised `'instance' object is not subscriptable` on

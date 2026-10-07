@@ -3596,6 +3596,10 @@ struct Checker<'a> {
     /// All classes declared in the module along with their declared member
     /// names.  Used for structural conformance against an interface.
     class_shapes: HashMap<String, InterfaceShape>,
+    /// PEP 728: the `extra_items=T` type of each `TypedDict` that declares
+    /// one. A dict literal may then carry keys beyond the declared fields,
+    /// each with a `T` value.
+    typed_dict_extra_items: HashMap<String, Type>,
     /// PEP 695 type-parameter names declared on each generic class.
     /// `class Box[T]: ...` populates `{"Box": ["T"]}`. Empty for
     /// non-generic classes. Used to drive bidirectional inference at
@@ -4011,6 +4015,7 @@ impl<'a> Checker<'a> {
             active_type_params: Vec::new(),
             interfaces: HashMap::new(),
             class_shapes: HashMap::new(),
+            typed_dict_extra_items: HashMap::new(),
             class_type_params: HashMap::new(),
             hkt_param_names: std::collections::HashSet::new(),
             class_param_variance: HashMap::new(),
@@ -10020,6 +10025,14 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
         if let Stmt::ClassDef(cd) = stmt {
             let name = cd.name.as_str().to_owned();
             let shape = collect_class_shape(cd, &classes);
+            if let Some(extra) = cd.arguments.as_deref().and_then(|a| {
+                a.keywords
+                    .iter()
+                    .find(|k| k.arg.as_ref().is_some_and(|n| n.as_str() == "extra_items"))
+            }) {
+                c.typed_dict_extra_items
+                    .insert(name.clone(), type_from_annotation(&extra.value, &classes));
+            }
             if class_inherits_protocol(cd) {
                 let runtime_checkable = has_runtime_checkable_decorator(&cd.decorator_list);
                 c.interfaces.insert(
@@ -20415,7 +20428,12 @@ fn try_infer_typed_dict_literal(
             Expr::StringLiteral(s) => s.value.to_str().to_owned(),
             _ => return None,
         };
-        let field_ty = shape.fields.get(&key_name)?;
+        let field_ty = match shape.fields.get(&key_name) {
+            Some(t) => t,
+            None => c.typed_dict_extra_items.get(class_name)?,
+        }
+        .clone();
+        let field_ty = &field_ty;
         // Type-check the value against the declared field type. If the
         // inferred type isn't assignable, surface the same error the
         // constructor call form would and abort the match so the dict-
@@ -27404,6 +27422,23 @@ def describe(m: Maybe[int]) -> str:
             // No mutators.
             "def f() -> None:\n    let fd = frozendict(a=1)\n    fd.update({\"b\": 2})\n",
             "def f() -> None:\n    let fd = frozendict(a=1)\n    fd[\"a\"] = 2\n",
+        ] {
+            assert!(!check(src).errors().is_empty(), "must be rejected: {src:?}");
+        }
+    }
+
+    #[test]
+    fn typed_dict_extra_items_types_undeclared_keys() {
+        // PEP 728: `extra_items=T` admits undeclared keys whose value is a `T`.
+        let ok = check(
+            "from typing import TypedDict\nclass Extra(TypedDict, extra_items=int):\n    name: str\ndef f() -> None:\n    let e: Extra = {\"name\": \"y\", \"n\": 1}\n    print(e)\n",
+        );
+        assert!(ok.errors().is_empty(), "{:?}", ok.errors());
+        for src in [
+            // The extra value must be the declared `extra_items` type.
+            "from typing import TypedDict\nclass Extra(TypedDict, extra_items=int):\n    name: str\ndef f() -> None:\n    let e: Extra = {\"name\": \"y\", \"n\": \"no\"}\n    print(e)\n",
+            // Without `extra_items`, an undeclared key is still rejected.
+            "from typing import TypedDict\nclass Plain(TypedDict):\n    name: str\ndef f() -> None:\n    let e: Plain = {\"name\": \"y\", \"n\": 1}\n    print(e)\n",
         ] {
             assert!(!check(src).errors().is_empty(), "must be rejected: {src:?}");
         }
