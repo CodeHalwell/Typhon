@@ -69,3 +69,7 @@
 ## 2024-08-23 - [Remove tabindex="0" from abbr tags]
 **Learning:** Adding `tabindex="0"` to non-interactive `<abbr>` elements makes them focusable for screen readers but fails WCAG 1.4.13 (Content on Hover or Focus) for sighted keyboard users. Standard browser tooltips (`title` attribute) do not display on keyboard focus, making this pattern inaccessible.
 **Action:** Removed `tabindex="0"` from `<abbr>` tags. If tooltips are needed for keyboard users, a custom tooltip component must be used instead of relying on the native `title` attribute on `<abbr>`.
+
+## 2025-02-23 - Unifying Interactive Elevation Feedback Across Components
+**Learning:** While large container components (like feature cards) often receive attention for physical hover/active states (transform elevation, box-shadows), primary action buttons in hero sections are frequently missed. This inconsistency causes primary CTAs to feel "flat" and less interactive than secondary informational elements. Aligning the interaction design language (e.g., matching the `translateY` and shadow spread of `.card` components onto `.sl-link-button`) significantly unifies the tactile feel of the app and reinforces the primary actions.
+**Action:** When adding micro-interactions (like hover/active states) to interactive containers, immediately verify that primary navigational buttons share the identical physical behavior to maintain a consistent interaction language. Always remember to disable these specific transforms in `prefers-reduced-motion` media queries.

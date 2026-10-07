@@ -243,6 +243,22 @@ textarea:focus-visible,
   box-shadow: 0 2px 6px color-mix(in srgb, var(--sl-color-accent) 15%, transparent);
 }
 
+/* Add tactile feedback to primary action buttons */
+.sl-link-button:not(.minimal) {
+  transition: border-color 120ms ease, transform 120ms ease, box-shadow 120ms ease, background-color 120ms ease !important;
+}
+
+.sl-link-button:not(.minimal):hover,
+.sl-link-button:not(.minimal):focus-visible {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px color-mix(in srgb, var(--sl-color-accent) 20%, transparent);
+}
+
+.sl-link-button:not(.minimal):active {
+  transform: translateY(0);
+  box-shadow: 0 2px 6px color-mix(in srgb, var(--sl-color-accent) 15%, transparent);
+}
+
 .sl-link-card .icon {
   transition: color 120ms ease;
 }
@@ -259,7 +275,10 @@ textarea:focus-visible,
   .card:active,
   .sl-link-card:hover,
   .sl-link-card:focus-within,
-  .sl-link-card:active {
+  .sl-link-card:active,
+  .sl-link-button:not(.minimal):hover,
+  .sl-link-button:not(.minimal):focus-visible,
+  .sl-link-button:not(.minimal):active {
     transform: none;
   }
   .card,
@@ -267,8 +286,9 @@ textarea:focus-visible,
   .sl-link-card .icon,
   table tbody tr,
   .sl-markdown-content a:not(:where(.not-content *)),
-  starlight-tabs .tab > [role="tab"] {
-    transition: none;
+  starlight-tabs .tab > [role="tab"],
+  .sl-link-button:not(.minimal) {
+    transition: none !important;
   }
 }
 
