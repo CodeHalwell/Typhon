@@ -1706,7 +1706,13 @@ impl Interpreter {
                 let v = self.eval_expr(arg, env)?;
                 match v {
                     Value::Class(c) => {
-                        header_bases.push(Value::Class(c.clone()));
+                        if crate::value::is_builtin_object(&c) {
+                            // An explicit `object` base stays in `__bases__`.
+                            header_has_builtin = true;
+                            header_bases.push(Value::Str(Rc::new("object".to_owned())));
+                        } else {
+                            header_bases.push(Value::Class(c.clone()));
+                        }
                         bases.push(c)
                     }
                     // `class Named(Box[int])`: a generic alias's
@@ -1748,10 +1754,8 @@ impl Interpreter {
                                 | "object"
                         ) =>
                     {
-                        if n.name != "object" {
-                            header_has_builtin = true;
-                            header_bases.push(Value::Str(Rc::new(n.name.to_owned())));
-                        }
+                        header_has_builtin = true;
+                        header_bases.push(Value::Str(Rc::new(n.name.to_owned())));
                         builtin_bases.push(Value::Str(Rc::new(n.name.to_owned())));
                     }
                     _ => {
@@ -2880,7 +2884,12 @@ impl Interpreter {
             return Value::Tuple(Rc::new(bases));
         }
         let mut out: Vec<Value> = match c3_linearise(class) {
-            Some(lin) => lin.iter().map(to_value).collect(),
+            // An explicit `object` base is placed last, with the implicit one.
+            Some(lin) => lin
+                .iter()
+                .filter(|n| !matches!(n, MroNode::Builtin(b) if b == "object"))
+                .map(to_value)
+                .collect(),
             // An inconsistent hierarchy CPython would have rejected at
             // class creation: list the user MRO then the builtin chains.
             None => {
@@ -3170,18 +3179,43 @@ impl Interpreter {
     }
 
     /// The canonical members whose bits a `Flag` value contains —
-    /// `list(Perm.R | Perm.W)` is `[Perm.R, Perm.W]`.
+    /// `list(Perm.R | Perm.W)` is `[Perm.R, Perm.W]`. As in CPython 3.13,
+    /// members declared in bit order are yielded bit by bit (lowest first),
+    /// with `None` for a declared bit no single-bit member names
+    /// (`class N(Flag): A = 3`); otherwise in definition order.
     pub(crate) fn flag_decompose(v: &Value) -> Option<Vec<Value>> {
         let bits = crate::value::flag_member_bits(v)?;
         let Value::Instance(inst) = v else {
             return None;
         };
-        Some(
-            Self::flag_canonical_members(&inst.class)
-                .into_iter()
-                .filter(|m| crate::value::flag_member_bits(m).is_some_and(|b| bits & b == b))
-                .collect(),
-        )
+        let canonical = Self::flag_canonical_members(&inst.class);
+        let canonical_bits: Vec<i64> = canonical
+            .iter()
+            .filter_map(crate::value::flag_member_bits)
+            .collect();
+        if !canonical_bits.windows(2).all(|w| w[0] < w[1]) {
+            return Some(
+                canonical
+                    .into_iter()
+                    .zip(canonical_bits)
+                    .filter(|(_, b)| bits & b == *b)
+                    .map(|(m, _)| m)
+                    .collect(),
+            );
+        }
+        let mut rest = bits & Self::flag_mask(&Self::enum_members(&inst.class).unwrap_or_default());
+        let mut out = Vec::new();
+        while rest != 0 {
+            let bit = rest & rest.wrapping_neg();
+            rest &= !bit;
+            out.push(
+                canonical_bits
+                    .iter()
+                    .position(|b| *b == bit)
+                    .map_or(Value::None, |i| canonical[i].clone()),
+            );
+        }
+        Some(out)
     }
 
     /// `Perm(6)` on a `Flag` / `IntFlag` class: the member or composite
@@ -6719,7 +6753,13 @@ impl Interpreter {
         // whenever the other operand is a plain int).
         if matches!(op, BitOr | BitAnd | BitXor) {
             let flag_operands = match (l, r) {
-                (Value::Instance(li), Value::Instance(ri)) if Rc::ptr_eq(&li.class, &ri.class) => {
+                // Two `IntFlag`s of different classes: the left one's
+                // `__or__` takes the right as a plain int, as in CPython.
+                (Value::Instance(li), Value::Instance(ri))
+                    if Rc::ptr_eq(&li.class, &ri.class)
+                        || (crate::value::is_int_flag_class(&li.class)
+                            && crate::value::is_int_flag_class(&ri.class)) =>
+                {
                     crate::value::flag_member_bits(l)
                         .zip(crate::value::flag_member_bits(r))
                         .map(|bits| (li.class.clone(), bits))

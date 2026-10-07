@@ -600,6 +600,12 @@ class Q(IntFlag):
     B = 2
 show(repr(Q(-8)), repr(Q(-1)), repr(Q(-3)), repr(Q.A | -8), repr(Q.A ^ -1), repr(-8 | Q.A), repr(~Q(8)), repr(C(-1)), repr(C(-8)))
 trap("strict negative", lambda: C(-17))
+class N(Flag):
+    A = 3
+    B = 4
+class Other(IntFlag):
+    Y = 2
+show(list(N.A), list(N(7)), list(N), len(N.A), repr(Other.Y & Q.A), type(Q.A | Other.Y).__name__, int(Q.A ^ Other.Y))
 trap("strict", lambda: C(8))
 "#,
     );
@@ -791,6 +797,11 @@ show(names(ML.__bases__), names(ML.__mro__), names(MixList.__mro__), names(MixLi
 plain class Meta(type):
     pass
 show(names(Meta.__bases__), names(Meta.__mro__))
+plain class WithObject(Mixin, object):
+    pass
+plain class OnlyObject(object):
+    pass
+show(names(WithObject.__bases__), names(WithObject.__mro__), names(OnlyObject.__bases__), names(OnlyObject.__mro__))
 "#,
     );
 }
