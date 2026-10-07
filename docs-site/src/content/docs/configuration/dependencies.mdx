@@ -53,7 +53,7 @@ See [`tyc add` / `remove` / `sync`](/Typhon/cli/packages/).
 
 1. Reads `[dependencies]` and `[dev-dependencies]` from `typhon.toml`.
 2. Generates a `pyproject.toml` (using your `[project]` metadata).
-3. Runs `uv sync`.
+3. Runs `uv sync --python <target>`, pinned to the `[python] target` so `.venv` uses the Python the code was checked against (changing the target recreates `.venv`).
 
 The generated `pyproject.toml` is overwritten on every `tyc sync`. Don't hand-edit it.
 
