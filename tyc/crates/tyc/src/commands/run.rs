@@ -1114,9 +1114,17 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                         continue;
                     }
                     if matches!(base_last_segment(&kw.value), Some("ABCMeta") | Some("type")) {
-                        // Only a name or a dotted chain off a name is
-                        // trusted: `get_holder().ABCMeta` could be anything.
-                        match expr_root_name(&kw.value) {
+                        // Only a bare name or `module.ABCMeta` is trusted:
+                        // `get_holder().ABCMeta` or `abc.ABC.ABCMeta` could
+                        // be anything.
+                        let exact = match &kw.value {
+                            ruff_python_ast::Expr::Name(_) => true,
+                            ruff_python_ast::Expr::Attribute(a) => {
+                                matches!(a.value.as_ref(), ruff_python_ast::Expr::Name(_))
+                            }
+                            _ => false,
+                        };
+                        match expr_root_name(&kw.value).filter(|_| exact) {
                             Some(root) => self.metaclass_roots.push(root.to_owned()),
                             None => custom_metaclass = true,
                         }
@@ -1541,6 +1549,10 @@ mod tests {
                 .unwrap_or_default()
                 .contains(&"a custom metaclass".to_owned()));
         }
+        let deep = "import abc\nplain class W(metaclass=abc.ABC.ABCMeta):\n    pass\nprint(W())\n";
+        assert!(scan_source(deep)
+            .unwrap_or_default()
+            .contains(&"a custom metaclass".to_owned()));
         let module_alias =
             "import abc as ABCMeta\nplain class W(metaclass=ABCMeta):\n    pass\nprint(W())\n";
         assert!(scan_source(module_alias)

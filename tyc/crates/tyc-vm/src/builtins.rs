@@ -11228,9 +11228,13 @@ fn bytes_method(
                 Some(v) => bytes_like_arg(v)?,
                 None => Vec::new(),
             };
+            let mut deleted = [false; 256];
+            for &byte in &delete {
+                deleted[byte as usize] = true;
+            }
             let out: Vec<u8> = b
                 .iter()
-                .filter(|byte| !delete.contains(byte))
+                .filter(|&&byte| !deleted[byte as usize])
                 .map(|&byte| table.as_ref().map_or(byte, |t| t[byte as usize]))
                 .collect();
             Value::Bytes(Rc::new(out))
