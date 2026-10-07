@@ -887,7 +887,7 @@ pub fn is_int_flag_class(class: &Rc<Class>) -> bool {
 }
 
 /// The integer a `Flag` / `IntFlag` member carries, if it is one.
-pub fn flag_member_bits(v: &Value) -> Option<i64> {
+pub fn flag_member_bits(v: &Value) -> Option<BigInt> {
     let Value::Instance(inst) = v else {
         return None;
     };
@@ -895,8 +895,8 @@ pub fn flag_member_bits(v: &Value) -> Option<i64> {
         return None;
     }
     match inst.fields.borrow().get("_value_") {
-        Some(Value::Int(i)) => i.to_i64(),
-        Some(Value::Bool(b)) => Some(i64::from(*b)),
+        Some(Value::Int(i)) => Some(i.to_bigint()),
+        Some(Value::Bool(b)) => Some(BigInt::from(i64::from(*b))),
         _ => None,
     }
 }

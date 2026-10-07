@@ -639,6 +639,17 @@ class BoolAuto(Flag):
     A = True
     B = auto()
 show(BoolAuto.B.value)
+class Big(IntFlag):
+    LOW = 1
+    BIG = 1 << 70
+    NEXT = auto()
+class BigF(Flag):
+    A = 1
+    B = 1 << 64
+show(repr(Big.LOW | Big.BIG), Big.NEXT.value, list(Big.LOW | Big.BIG | Big.NEXT), len(Big.BIG | Big.LOW))
+show(repr(~Big.LOW), repr(Big(1 << 80)), repr(Big.BIG | (1 << 90)), Big.BIG in (Big.BIG | Big.LOW), bool(Big.BIG & Big.LOW))
+show(repr(BigF(BigF.A.value | BigF.B.value)), repr(~BigF.A), list(BigF), repr(BigF.A ^ BigF.B))
+trap("big strict", lambda: BigF(1 << 65))
 show(list(Neg), list(Neg.A))
 "#,
     );

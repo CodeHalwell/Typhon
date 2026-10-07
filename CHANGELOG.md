@@ -8,6 +8,10 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ### Fixed
 
+- **Flags wider than 64 bits.** `Flag` / `IntFlag` values are now big
+  integers under `tyc run`, so a member such as `BIG = 1 << 70` combines,
+  inverts, iterates, prints and numbers the next `auto()` as CPython does,
+  rather than behaving like a plain int.
 - **Exception subclasses as loop and await terminators.** Under
   `tyc run`, an `__anext__` that raises a user subclass of
   `StopAsyncIteration` ends an `async for`, and an `__await__` iterator

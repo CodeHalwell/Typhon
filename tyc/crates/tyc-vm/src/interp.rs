@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use indexmap::IndexMap;
 use num_bigint::BigInt;
-use num_traits::Signed;
+use num_traits::{Signed, Zero};
 use ruff_python_ast::{
     self as ast, BoolOp, CmpOp, ExceptHandler, Expr, FStringPart, InterpolatedStringElement,
     ModModule, Mutability, Number, Operator, Parameters, Pattern, Stmt, UnaryOp,
@@ -3157,10 +3157,10 @@ impl Interpreter {
     /// (`None` when no bit is set), and `repr` is `<Style.BOLD|UNDERLINE: 5>`.
     /// Pseudo-members are cached on the class, so `(A | B) is (A | B)` holds
     /// as it does in CPython.
-    fn flag_member_for(class: &Rc<Class>, bits: i64) -> Value {
+    fn flag_member_for(class: &Rc<Class>, bits: BigInt) -> Value {
         let members = Self::enum_members(class).unwrap_or_default();
         for m in &members {
-            if crate::value::flag_member_bits(m) == Some(bits) {
+            if crate::value::flag_member_bits(m).as_ref() == Some(&bits) {
                 return m.clone();
             }
         }
@@ -3182,34 +3182,34 @@ impl Interpreter {
         let singles = Self::flag_canonical_members(class);
         let singles_mask = Self::flag_mask(&singles);
         let mut names: Vec<String> = Vec::new();
-        let mut combined = 0i64;
-        let mut taken: Vec<i64> = Vec::new();
+        let mut combined = BigInt::zero();
+        let mut taken: Vec<BigInt> = Vec::new();
         for m in &singles {
             let Some(mb) = crate::value::flag_member_bits(m) else {
                 continue;
             };
-            if bits & mb == mb {
+            if &bits & &mb == mb {
                 names.extend(member_name(m));
-                combined |= mb;
+                combined |= &mb;
                 taken.push(mb);
             }
         }
-        if bits & !singles_mask != 0 {
+        if !(&bits & !&singles_mask).is_zero() {
             for m in &members {
                 let Some(mb) = crate::value::flag_member_bits(m) else {
                     continue;
                 };
-                if mb != 0 && bits & mb == mb && !taken.contains(&mb) {
+                if !mb.is_zero() && &bits & &mb == mb && !taken.contains(&mb) {
                     names.extend(member_name(m));
-                    combined |= mb;
+                    combined |= &mb;
                     taken.push(mb);
                 }
             }
         }
-        let unknown = bits ^ combined;
-        if combined == 0 {
+        let unknown = &bits ^ &combined;
+        if combined.is_zero() {
             names.clear();
-        } else if unknown != 0 {
+        } else if !unknown.is_zero() {
             names.push(unknown.to_string());
         }
         let name = if names.is_empty() {
@@ -3217,7 +3217,7 @@ impl Interpreter {
         } else {
             Value::Str(Rc::new(names.join("|")))
         };
-        let value = Value::Int(crate::value::VmInt::from(bits));
+        let value = Value::Int(crate::value::VmInt::from_bigint(bits));
         let mut fields: crate::value::FieldMap = crate::value::FieldMap::new();
         fields.insert("name".to_owned(), name.clone());
         fields.insert("_name_".to_owned(), name);
@@ -3237,12 +3237,12 @@ impl Interpreter {
 
     /// Every bit some member of a `Flag` class sets (CPython's
     /// `_flag_mask_`).
-    fn flag_mask(members: &[Value]) -> i64 {
+    fn flag_mask(members: &[Value]) -> BigInt {
         members
             .iter()
             .filter_map(crate::value::flag_member_bits)
-            .filter(|b| *b > 0)
-            .fold(0, |acc, b| acc | b)
+            .filter(|b| b.is_positive())
+            .fold(BigInt::zero(), |acc, b| acc | b)
     }
 
     /// The canonical (single-bit) members of a `Flag` class, in definition
@@ -3253,7 +3253,10 @@ impl Interpreter {
         Self::enum_members(class)
             .unwrap_or_default()
             .into_iter()
-            .filter(|m| crate::value::flag_member_bits(m).is_some_and(|b| b.count_ones() == 1))
+            .filter(|m| {
+                crate::value::flag_member_bits(m)
+                    .is_some_and(|b| b.is_positive() && b.magnitude().count_ones() == 1)
+            })
             .collect()
     }
 
@@ -3268,7 +3271,7 @@ impl Interpreter {
             return None;
         };
         let canonical = Self::flag_canonical_members(&inst.class);
-        let canonical_bits: Vec<i64> = canonical
+        let canonical_bits: Vec<BigInt> = canonical
             .iter()
             .filter_map(crate::value::flag_member_bits)
             .collect();
@@ -3277,16 +3280,16 @@ impl Interpreter {
                 canonical
                     .into_iter()
                     .zip(canonical_bits)
-                    .filter(|(_, b)| bits & b == *b)
+                    .filter(|(_, b)| &bits & b == *b)
                     .map(|(m, _)| m)
                     .collect(),
             );
         }
         let mut rest = bits & Self::flag_mask(&Self::enum_members(&inst.class).unwrap_or_default());
         let mut out = Vec::new();
-        while rest != 0 {
-            let bit = rest & rest.wrapping_neg();
-            rest &= !bit;
+        while !rest.is_zero() {
+            let bit = &rest & -&rest;
+            rest ^= &bit;
             out.push(
                 canonical_bits
                     .iter()
@@ -3308,8 +3311,8 @@ impl Interpreter {
         needle: &Value,
     ) -> Option<Result<Value, Unwind>> {
         let bits = match needle {
-            Value::Int(i) => i.to_i64()?,
-            Value::Bool(b) => i64::from(*b),
+            Value::Int(i) => i.to_bigint(),
+            Value::Bool(b) => BigInt::from(i64::from(*b)),
             _ => return None,
         };
         Some(
@@ -3323,38 +3326,40 @@ impl Interpreter {
     /// down from the flag's all-bits mask, and a value outside the
     /// declared bits is an error for a `Flag` (`STRICT`) and kept by an
     /// `IntFlag` (`KEEP`). `Err` is the `ValueError` message.
-    fn flag_normalise(class: &Rc<Class>, bits: i64) -> Result<i64, String> {
-        // i128 so the `2 ** bit_length` bounds never overflow.
-        let mask = i128::from(Self::flag_mask(
-            &Self::enum_members(class).unwrap_or_default(),
-        ));
-        let bit_length = |n: i128| 128 - n.unsigned_abs().leading_zeros();
-        let all_bits = (1i128 << bit_length(mask)) - 1;
-        let mut value = i128::from(bits);
-        if !(!all_bits <= value && value <= all_bits) || value & (all_bits ^ mask) != 0 {
+    fn flag_normalise(class: &Rc<Class>, bits: BigInt) -> Result<BigInt, String> {
+        let mask = Self::flag_mask(&Self::enum_members(class).unwrap_or_default());
+        let bit_length = |n: &BigInt| n.magnitude().bits();
+        let one = BigInt::from(1);
+        let all_bits: BigInt = (&one << bit_length(&mask)) - 1;
+        let mut value = bits;
+        let in_range = !&all_bits <= value && value <= all_bits;
+        if !in_range || !(&value & (&all_bits ^ &mask)).is_zero() {
             if !crate::value::is_int_flag_class(class) {
-                let max_bits = bit_length(value).max(bit_length(mask)) as usize;
-                let enum_bin = |n: i128| {
-                    let digits = n & ((1i128 << max_bits) - 1);
-                    let sign = if n < 0 { 1 } else { 0 };
-                    format!("0b{sign} {digits:0>max_bits$b}")
+                let max_bits = bit_length(&value).max(bit_length(&mask));
+                let width = max_bits as usize;
+                let enum_bin = |n: &BigInt| {
+                    let digits: BigInt = n & ((&one << max_bits) - 1);
+                    let sign = if n.is_negative() { 1 } else { 0 };
+                    format!("0b{sign} {:0>width$}", digits.to_str_radix(2))
                 };
                 return Err(format!(
                     "<flag '{}'> invalid value {}\n    given {}\n  allowed {}",
                     class.name,
                     value,
-                    enum_bin(value),
-                    enum_bin(mask)
+                    enum_bin(&value),
+                    enum_bin(&mask)
                 ));
             }
-            if value < 0 {
-                value += (all_bits + 1).max(1i128 << bit_length(value));
+            if value.is_negative() {
+                let span: BigInt = &all_bits + 1;
+                let own: BigInt = &one << bit_length(&value);
+                value += span.max(own);
             }
         }
-        if value < 0 {
+        if value.is_negative() {
             value += all_bits + 1;
         }
-        i64::try_from(value).map_err(|_| format!("{bits} is not a valid {}", class.name))
+        Ok(value)
     }
 
     /// Whether `class` derives from the VM's enum base class `base`
@@ -3414,7 +3419,7 @@ impl Interpreter {
             let mut last_value: i64 = 0;
             // The largest value any earlier member declared (CPython's
             // `max(last_values)` in `Flag._generate_next_value_`).
-            let mut flag_high: Option<i64> = None;
+            let mut flag_high: Option<BigInt> = None;
             for name in &order {
                 let Some(raw) = attrs.get(name).cloned() else {
                     continue;
@@ -3435,15 +3440,16 @@ impl Interpreter {
                     // value's high bit (`AB = 3; D = auto()` ⇒ `D == 4`); a
                     // negative value counts by its magnitude's bit length
                     // (`A = -1; B = auto()` ⇒ `B == 2`).
-                    last_value = if is_flag {
-                        match flag_high {
-                            None => 1,
-                            Some(v) => 1 << (64 - v.unsigned_abs().leading_zeros()),
-                        }
+                    if is_flag {
+                        let bit = match &flag_high {
+                            None => BigInt::from(1),
+                            Some(v) => BigInt::from(1) << v.magnitude().bits(),
+                        };
+                        Value::Int(VmInt::from_bigint(bit))
                     } else {
-                        last_value + 1
-                    };
-                    Value::Int(VmInt::from(last_value))
+                        last_value += 1;
+                        Value::Int(VmInt::from(last_value))
+                    }
                 } else {
                     if let Value::Int(i) = &raw {
                         if let Some(v) = i.to_i64() {
@@ -3452,15 +3458,17 @@ impl Interpreter {
                     }
                     raw
                 };
-                if let Value::Int(i) = &raw {
-                    if let Some(v) = i.to_i64() {
-                        flag_high = Some(flag_high.map_or(v, |h| h.max(v)));
-                    }
-                }
                 // `A = True` is the integer 1 to `auto()`.
-                if let Value::Bool(b) = &raw {
-                    let v = *b as i64;
-                    flag_high = Some(flag_high.map_or(v, |h| h.max(v)));
+                let as_int = match &raw {
+                    Value::Int(i) => Some(i.to_bigint()),
+                    Value::Bool(b) => Some(BigInt::from(i64::from(*b))),
+                    _ => None,
+                };
+                if let Some(v) = as_int {
+                    flag_high = Some(match flag_high.take() {
+                        Some(h) => h.max(v),
+                        None => v,
+                    });
                 }
                 // A second name for an existing value is an *alias* of that
                 // member: the same object, not a new member, and absent
@@ -4846,7 +4854,7 @@ impl Interpreter {
                     let same_class =
                         matches!(item, Value::Instance(it) if Rc::ptr_eq(&it.class, &i.class));
                     if let (true, Some(ib)) = (same_class, crate::value::flag_member_bits(item)) {
-                        return Ok(cb & ib == ib);
+                        return Ok(&cb & &ib == ib);
                     }
                     return Err(type_error(format!(
                         "unsupported operand type(s) for 'in': '{}' and '{}'",
@@ -6181,7 +6189,7 @@ impl Interpreter {
             }
             // A `Flag` value is falsy when no bit is set (`Perm(0)`).
             if let Some(bits) = crate::value::flag_member_bits(v) {
-                return Ok(bits != 0);
+                return Ok(!bits.is_zero());
             }
         }
         Ok(v.truthy())
@@ -6920,7 +6928,7 @@ impl Interpreter {
                         r
                     };
                     crate::value::flag_member_bits(flag)
-                        .zip(n.to_i64())
+                        .zip(Some(n.to_bigint()))
                         .map(|bits| (fi.class.clone(), bits))
                 }
                 // `P.B | True` keeps the flag type; `True | P.B` is
@@ -6929,7 +6937,7 @@ impl Interpreter {
                     if crate::value::is_int_flag_class(&fi.class) =>
                 {
                     crate::value::flag_member_bits(l)
-                        .map(|bits| (fi.class.clone(), (bits, *b as i64)))
+                        .map(|bits| (fi.class.clone(), (bits, BigInt::from(*b as i64))))
                 }
                 _ => Option::None,
             };
@@ -7040,9 +7048,9 @@ impl Interpreter {
                     let mask =
                         Self::flag_mask(&Self::enum_members(&inst.class).unwrap_or_default());
                     let inverted = if crate::value::is_int_flag_class(&inst.class) {
-                        Self::flag_normalise(&inst.class, !bits).unwrap_or(mask & !bits)
+                        Self::flag_normalise(&inst.class, !&bits).unwrap_or(&mask & !&bits)
                     } else {
-                        mask & !bits
+                        &mask & !&bits
                     };
                     return Ok(Self::flag_member_for(&inst.class, inverted));
                 }
@@ -8822,7 +8830,7 @@ impl Interpreter {
             Value::Instance(_) if crate::value::flag_member_bits(&v).is_some() => {
                 // CPython's `_iter_bits_lsb` refuses a negative value
                 // (`class F(Flag): A = -1`).
-                if let Some(bits) = crate::value::flag_member_bits(&v).filter(|b| *b < 0) {
+                if let Some(bits) = crate::value::flag_member_bits(&v).filter(|b| b.is_negative()) {
                     return Err(Unwind::Exception(crate::error::VmException::new(
                         "ValueError",
                         format!("{bits} is not a positive integer"),

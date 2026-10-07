@@ -2165,7 +2165,7 @@ fn value_len(v: &Value) -> Result<usize, Unwind> {
     // (`Flag.__len__`): the set bits of its magnitude, unnamed `IntFlag`
     // bits included.
     if let Some(bits) = crate::value::flag_member_bits(v) {
-        return Ok(bits.unsigned_abs().count_ones() as usize);
+        return Ok(bits.magnitude().count_ones() as usize);
     }
     // A `StrEnum` member *is* its string, so `len(StrE.X)` is the value's.
     if let Some(inner) = crate::value::enum_mixin_value(v) {
