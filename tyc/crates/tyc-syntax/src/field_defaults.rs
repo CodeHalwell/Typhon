@@ -305,6 +305,42 @@ pub struct ModuleClassKinds {
     module_classes: HashSet<String>,
     exception_classes: HashSet<String>,
     metaclasses: HashSet<String>,
+    /// Name start offsets of the classes in function and class bodies that
+    /// are exceptions / metaclasses through a base class their own scope or
+    /// an enclosing one declares (`class Timeout(Failure)` beside
+    /// `class Failure(Exception)` in the same function).
+    nested_exceptions: HashSet<u32>,
+    nested_metaclasses: HashSet<u32>,
+}
+
+/// Whether a class is an exception and whether it is a metaclass.
+#[derive(Debug, Clone, Copy, Default)]
+struct ClassKind {
+    exception: bool,
+    metaclass: bool,
+}
+
+/// One scope's view of its base-class names, for the nested closure.
+struct ClassFrame {
+    /// The classes the scope declares, by name.
+    classes: HashMap<String, ClassKind>,
+    /// Other names a function binds locally: a base naming one is a value of
+    /// unknown class.
+    opaque: HashSet<String>,
+    /// Names a function declares `global`, resolved at the module.
+    globals: HashSet<String>,
+    /// A class body, which the scopes nested in it do not see.
+    is_class_body: bool,
+}
+
+/// What a base name in a nested class resolves to.
+enum BaseClass {
+    /// Not bound in any scope that declares classes: a builtin or an import,
+    /// judged by its name.
+    External,
+    Known(ClassKind),
+    /// A local value, or something the closure does not follow.
+    Opaque,
 }
 
 impl ModuleClassKinds {
@@ -320,25 +356,31 @@ impl ModuleClassKinds {
     /// `class LexError: line: int` is a Result error-variant dataclass, so
     /// `class Detailed(LexError):` stays a dataclass too. Metaclasses are
     /// closed the same way from [`METACLASS_BASES`].
+    ///
+    /// The classes of each function and class body are then closed within
+    /// that scope: a base naming a class the scope or an enclosing one
+    /// declares takes that class's kinds (a function-local
+    /// `class Timeout(Failure)` under `class Failure(Exception)`), one naming
+    /// a local value takes none, and any other is judged by its name.
     pub fn collect(body: &[Stmt]) -> Self {
-        let mut classes: Vec<(String, Vec<String>)> = Vec::new();
+        let mut classes = Vec::new();
         collect_class_bases_into(body, &mut classes);
-        let module_classes: HashSet<String> = classes.iter().map(|(n, _)| n.clone()).collect();
+        let module_classes: HashSet<String> = classes.iter().map(|e| e.name.clone()).collect();
         let close = |seed: &dyn Fn(&str) -> bool| {
             let mut out: HashSet<String> = classes
                 .iter()
-                .filter(|(_, bases)| {
-                    bases
+                .filter(|e| {
+                    e.bases
                         .iter()
                         .any(|b| !module_classes.contains(b.as_str()) && seed(b))
                 })
-                .map(|(name, _)| name.clone())
+                .map(|e| e.name.clone())
                 .collect();
             loop {
                 let before = out.len();
-                for (name, bases) in &classes {
-                    if bases.iter().any(|b| out.contains(b.as_str())) {
-                        out.insert(name.clone());
+                for e in &classes {
+                    if e.bases.iter().any(|b| out.contains(b.as_str())) {
+                        out.insert(e.name.clone());
                     }
                 }
                 if out.len() == before {
@@ -348,11 +390,178 @@ impl ModuleClassKinds {
         };
         let exception_classes = close(&name_is_exception_base);
         let metaclasses = close(&|b: &str| METACLASS_BASES.contains(&b));
-        Self {
+        let module = ClassFrame {
+            classes: module_classes
+                .iter()
+                .map(|n| {
+                    let kind = ClassKind {
+                        exception: exception_classes.contains(n),
+                        metaclass: metaclasses.contains(n),
+                    };
+                    (n.clone(), kind)
+                })
+                .collect(),
+            opaque: HashSet::new(),
+            globals: HashSet::new(),
+            is_class_body: false,
+        };
+        let mut out = Self {
             module_classes,
             exception_classes,
             metaclasses,
+            nested_exceptions: HashSet::new(),
+            nested_metaclasses: HashSet::new(),
+        };
+        out.classify_scopes_in(body, &mut vec![module]);
+        out
+    }
+
+    /// Close the exception / metaclass kinds over the classes of every
+    /// function and class body declared in `body` (through its control
+    /// flow), each against its own scope and the enclosing ones.
+    fn classify_scopes_in(&mut self, body: &[Stmt], chain: &mut Vec<ClassFrame>) {
+        for stmt in body {
+            match stmt {
+                Stmt::FunctionDef(f) => {
+                    let bindings = ScopeBindings::of_function(f);
+                    self.classify_scope(&f.body, bindings, false, chain);
+                }
+                Stmt::ClassDef(c) => {
+                    self.classify_scope(&c.body, ScopeBindings::default(), true, chain);
+                }
+                Stmt::If(i) => {
+                    self.classify_scopes_in(&i.body, chain);
+                    for clause in &i.elif_else_clauses {
+                        self.classify_scopes_in(&clause.body, chain);
+                    }
+                }
+                Stmt::For(f) => {
+                    self.classify_scopes_in(&f.body, chain);
+                    self.classify_scopes_in(&f.orelse, chain);
+                }
+                Stmt::While(w) => {
+                    self.classify_scopes_in(&w.body, chain);
+                    self.classify_scopes_in(&w.orelse, chain);
+                }
+                Stmt::With(w) => self.classify_scopes_in(&w.body, chain),
+                Stmt::Try(t) => {
+                    self.classify_scopes_in(&t.body, chain);
+                    for h in &t.handlers {
+                        let ExceptHandler::ExceptHandler(h) = h;
+                        self.classify_scopes_in(&h.body, chain);
+                    }
+                    self.classify_scopes_in(&t.orelse, chain);
+                    self.classify_scopes_in(&t.finalbody, chain);
+                }
+                Stmt::Match(m) => {
+                    for case in &m.cases {
+                        self.classify_scopes_in(&case.body, chain);
+                    }
+                }
+                _ => {}
+            }
         }
+    }
+
+    fn classify_scope(
+        &mut self,
+        body: &[Stmt],
+        bindings: ScopeBindings,
+        is_class_body: bool,
+        chain: &mut Vec<ClassFrame>,
+    ) {
+        let mut entries = Vec::new();
+        collect_class_bases_into(body, &mut entries);
+        let own: HashSet<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        let ScopeBindings {
+            kinds,
+            globals,
+            nonlocals,
+            ..
+        } = bindings;
+        let opaque: HashSet<String> = kinds
+            .into_keys()
+            .filter(|n| !own.contains(n.as_str()) && !globals.contains(n) && !nonlocals.contains(n))
+            .collect();
+        // A base the scope does not declare, looked up where Python looks
+        // it up: the function's own locals, the enclosing functions (class
+        // bodies are skipped), the module.
+        let resolve = |base: &str| -> BaseClass {
+            if opaque.contains(base) {
+                return BaseClass::Opaque;
+            }
+            let frames: Box<dyn Iterator<Item = &ClassFrame>> = if globals.contains(base) {
+                Box::new(chain.iter().take(1))
+            } else {
+                Box::new(chain.iter().rev())
+            };
+            for frame in frames.filter(|f| !f.is_class_body) {
+                if let Some(&kind) = frame.classes.get(base) {
+                    return BaseClass::Known(kind);
+                }
+                if frame.opaque.contains(base) {
+                    return BaseClass::Opaque;
+                }
+                if frame.globals.contains(base) {
+                    return match chain[0].classes.get(base) {
+                        Some(&kind) => BaseClass::Known(kind),
+                        None => BaseClass::External,
+                    };
+                }
+            }
+            BaseClass::External
+        };
+        let close = |seed: &dyn Fn(&str) -> bool, known: &dyn Fn(ClassKind) -> bool| {
+            let mut out: HashSet<&str> = entries
+                .iter()
+                .filter(|e| {
+                    e.bases.iter().any(|b| {
+                        !own.contains(b.as_str())
+                            && match resolve(b) {
+                                BaseClass::External => seed(b),
+                                BaseClass::Known(kind) => known(kind),
+                                BaseClass::Opaque => false,
+                            }
+                    })
+                })
+                .map(|e| e.name.as_str())
+                .collect();
+            loop {
+                let before = out.len();
+                for e in &entries {
+                    if e.bases.iter().any(|b| out.contains(b.as_str())) {
+                        out.insert(e.name.as_str());
+                    }
+                }
+                if out.len() == before {
+                    return out;
+                }
+            }
+        };
+        let exceptions = close(&name_is_exception_base, &|k| k.exception);
+        let metaclasses = close(&|b: &str| METACLASS_BASES.contains(&b), &|k| k.metaclass);
+        let mut classes = HashMap::new();
+        for e in &entries {
+            let kind = ClassKind {
+                exception: exceptions.contains(e.name.as_str()),
+                metaclass: metaclasses.contains(e.name.as_str()),
+            };
+            if kind.exception {
+                self.nested_exceptions.insert(e.start);
+            }
+            if kind.metaclass {
+                self.nested_metaclasses.insert(e.start);
+            }
+            classes.insert(e.name.clone(), kind);
+        }
+        chain.push(ClassFrame {
+            classes,
+            opaque,
+            globals,
+            is_class_body,
+        });
+        self.classify_scopes_in(body, chain);
+        chain.pop();
     }
 
     /// Names of every module-level class.
@@ -361,16 +570,24 @@ impl ModuleClassKinds {
     }
 
     /// `c` has an external exception base — in any scope, nested classes
-    /// included — or is a module class rooted in one.
+    /// included — or is a module class rooted in one, or a nested class
+    /// rooted in one its own or an enclosing scope declares.
     pub fn is_exception_class(&self, c: &StmtClassDef) -> bool {
         self.has_external_base(c, name_is_exception_base)
             || self.exception_classes.contains(c.name.as_str())
+            || self
+                .nested_exceptions
+                .contains(&u32::from(c.name.range.start()))
     }
 
-    /// `c` has an external metaclass base, or is a module class rooted in one.
+    /// `c` has an external metaclass base, or is a module class rooted in one,
+    /// or a nested class rooted in one its scopes declare.
     pub fn is_metaclass(&self, c: &StmtClassDef) -> bool {
         self.has_external_base(c, |b| METACLASS_BASES.contains(&b))
             || self.metaclasses.contains(c.name.as_str())
+            || self
+                .nested_metaclasses
+                .contains(&u32::from(c.name.range.start()))
     }
 
     fn has_external_base(&self, c: &StmtClassDef, pred: impl Fn(&str) -> bool) -> bool {
@@ -380,8 +597,17 @@ impl ModuleClassKinds {
     }
 }
 
-/// `(class name, base trailing segments)` for every module-level class def.
-fn collect_class_bases_into(body: &[Stmt], out: &mut Vec<(String, Vec<String>)>) {
+/// A class declaration and the trailing segments of its bases.
+struct ClassEntry {
+    name: String,
+    /// Offset of the class name.
+    start: u32,
+    bases: Vec<String>,
+}
+
+/// Every class def in one scope's `body`, through its control flow but not
+/// into nested function or class bodies.
+fn collect_class_bases_into(body: &[Stmt], out: &mut Vec<ClassEntry>) {
     for stmt in body {
         match stmt {
             Stmt::ClassDef(c) => {
@@ -390,7 +616,11 @@ fn collect_class_bases_into(body: &[Stmt], out: &mut Vec<(String, Vec<String>)>)
                     .iter()
                     .filter_map(|b| base_last_segment(b).map(|s| s.to_owned()))
                     .collect();
-                out.push((c.name.as_str().to_owned(), bases));
+                out.push(ClassEntry {
+                    name: c.name.as_str().to_owned(),
+                    start: u32::from(c.name.range.start()),
+                    bases,
+                });
             }
             Stmt::If(i) => {
                 collect_class_bases_into(&i.body, out);
@@ -464,7 +694,9 @@ pub fn skips_dataclass_decoration(
 /// local shadows the module binding: one evidently bound to a `list` / `dict`
 /// / `set` supplies that kind, one evidently bound to something else
 /// (`let BASE: tuple[int, ...] = …`) removes it, and one whose kind is not
-/// evident leaves the outer answer in place.
+/// evident leaves the outer answer in place. A local's kind covers what nested
+/// functions assign to it through `nonlocal`; a name a function declares
+/// `global` reads the module's binding again.
 #[derive(Debug, Clone, Default)]
 pub struct ClassDefaultScopes {
     /// Index 0 is the module's own names; one more per function that
@@ -501,7 +733,8 @@ impl ClassDefaultScopes {
                 }
                 Stmt::FunctionDef(f) => {
                     let mut names = self.scopes[scope].clone();
-                    for (name, kind) in function_local_kinds(f) {
+                    let (locals, globals) = function_local_kinds(f);
+                    for (name, kind) in locals {
                         match kind {
                             LocalKind::Mutable(k) => {
                                 names.insert(name, k);
@@ -511,6 +744,15 @@ impl ClassDefaultScopes {
                             }
                             LocalKind::Unknown => {}
                         }
+                    }
+                    // A `global` name reads the module's binding, past any
+                    // enclosing function's local of the same name — in this
+                    // function and in the scopes nested in it.
+                    for name in globals {
+                        match self.scopes[0].get(&name) {
+                            Some(&k) => names.insert(name, k),
+                            None => names.remove(&name),
+                        };
                     }
                     let inner = if names == self.scopes[scope] {
                         scope
@@ -606,133 +848,208 @@ fn binding_kind(annotation: Option<&Expr>, value: Option<&Expr>) -> LocalKind {
     }
 }
 
-/// Every name `f` binds in its own scope — parameters, assignment, `for`,
-/// `with`, `except`, import, `del`, pattern-capture and walrus targets,
-/// nested `def` / `class` names — with what each evidently holds across all
-/// its bindings. `global` / `nonlocal` names are not the function's own.
-fn function_local_kinds(f: &StmtFunctionDef) -> HashMap<String, LocalKind> {
-    struct Locals {
-        kinds: HashMap<String, LocalKind>,
-        foreign: HashSet<String>,
-    }
-    impl Locals {
-        fn bind(&mut self, name: &str, kind: LocalKind) {
-            self.kinds
-                .entry(name.to_owned())
-                .and_modify(|k| *k = k.join(kind))
-                .or_insert(kind);
+/// What one scope binds, as far as the field defaults of the classes in it
+/// care.
+#[derive(Default)]
+struct ScopeBindings {
+    /// Every name the scope's own statements bind — parameters, assignment,
+    /// `for`, `with`, `except`, import, `del`, pattern-capture and walrus
+    /// targets, nested `def` / `class` names, and the names it declares
+    /// `global` / `nonlocal` and then assigns — with what each evidently
+    /// holds across all those bindings.
+    kinds: HashMap<String, LocalKind>,
+    globals: HashSet<String>,
+    nonlocals: HashSet<String>,
+    /// What the scope's nested functions and classes assign through
+    /// `nonlocal` to names they do not bind themselves.
+    nested_writes: HashMap<String, LocalKind>,
+}
+
+fn join_into(map: &mut HashMap<String, LocalKind>, name: &str, kind: LocalKind) {
+    map.entry(name.to_owned())
+        .and_modify(|k| *k = k.join(kind))
+        .or_insert(kind);
+}
+
+impl ScopeBindings {
+    fn of_function(f: &StmtFunctionDef) -> Self {
+        let mut out = Self::default();
+        let params = &f.parameters;
+        for p in params.iter_non_variadic_params() {
+            let kind = binding_kind(p.parameter.annotation.as_deref(), None);
+            out.bind(p.parameter.name.as_str(), kind);
         }
-        fn bind_target(&mut self, target: &Expr) {
-            match target {
-                Expr::Name(n) => self.bind(n.id.as_str(), LocalKind::Unknown),
-                Expr::Tuple(t) => t.elts.iter().for_each(|e| self.bind_target(e)),
-                Expr::List(l) => l.elts.iter().for_each(|e| self.bind_target(e)),
-                Expr::Starred(s) => self.bind_target(&s.value),
-                _ => {}
+        for p in params.vararg.iter().chain(params.kwarg.iter()) {
+            out.bind(p.name.as_str(), LocalKind::Unknown);
+        }
+        for s in &f.body {
+            out.visit_stmt(s);
+        }
+        out
+    }
+
+    fn of_class_body(body: &[Stmt]) -> Self {
+        let mut out = Self::default();
+        for s in body {
+            out.visit_stmt(s);
+        }
+        out
+    }
+
+    /// What a nested `def` (`is_function`) or class body with these bindings
+    /// assigns to an enclosing function's names: its own `nonlocal` names,
+    /// plus whatever its nested scopes write that it does not bind itself (a
+    /// class body binds nothing they can see).
+    fn escaping_writes(self, is_function: bool) -> HashMap<String, LocalKind> {
+        let mut out = HashMap::new();
+        for name in &self.nonlocals {
+            if let Some(&k) = self.kinds.get(name) {
+                join_into(&mut out, name, k);
             }
         }
-    }
-    impl<'a> Visitor<'a> for Locals {
-        fn visit_stmt(&mut self, stmt: &'a Stmt) {
-            match stmt {
-                // A nested scope binds only its own name here.
-                Stmt::FunctionDef(d) => return self.bind(d.name.as_str(), LocalKind::Unknown),
-                Stmt::ClassDef(d) => return self.bind(d.name.as_str(), LocalKind::Unknown),
-                Stmt::Assign(a) => match a.targets.as_slice() {
-                    [Expr::Name(n)] => self.bind(n.id.as_str(), binding_kind(None, Some(&a.value))),
-                    targets => targets.iter().for_each(|t| self.bind_target(t)),
-                },
-                Stmt::AnnAssign(a) => {
-                    if let Expr::Name(n) = a.target.as_ref() {
-                        self.bind(
-                            n.id.as_str(),
-                            binding_kind(Some(&a.annotation), a.value.as_deref()),
-                        );
-                    }
-                }
-                // `+=` keeps the value's kind.
-                Stmt::AugAssign(_) => {}
-                Stmt::For(s) => self.bind_target(&s.target),
-                Stmt::With(w) => {
-                    for item in &w.items {
-                        if let Some(v) = &item.optional_vars {
-                            self.bind_target(v);
-                        }
-                    }
-                }
-                Stmt::Delete(d) => d.targets.iter().for_each(|t| self.bind_target(t)),
-                Stmt::Import(i) => {
-                    for a in &i.names {
-                        let bound = match &a.asname {
-                            Some(alias) => alias.as_str(),
-                            None => a.name.as_str().split('.').next().unwrap_or_default(),
-                        };
-                        self.bind(bound, LocalKind::Unknown);
-                    }
-                }
-                Stmt::ImportFrom(i) => {
-                    for a in &i.names {
-                        self.bind(
-                            a.asname.as_ref().unwrap_or(&a.name).as_str(),
-                            LocalKind::Unknown,
-                        );
-                    }
-                }
-                Stmt::Global(g) => self.foreign.extend(g.names.iter().map(|n| n.to_string())),
-                Stmt::Nonlocal(g) => self.foreign.extend(g.names.iter().map(|n| n.to_string())),
-                Stmt::TypeAlias(t) => self.bind_target(&t.name),
-                Stmt::Try(t) => {
-                    for h in &t.handlers {
-                        let ExceptHandler::ExceptHandler(h) = h;
-                        if let Some(name) = &h.name {
-                            self.bind(name.as_str(), LocalKind::Unknown);
-                        }
-                    }
-                }
-                _ => {}
-            }
-            walk_stmt(self, stmt);
-        }
-        fn visit_expr(&mut self, expr: &'a Expr) {
-            match expr {
-                // A lambda's walrus binds in the lambda.
-                Expr::Lambda(_) => {}
-                Expr::Named(n) => {
-                    self.bind_target(&n.target);
-                    walk_expr(self, expr);
-                }
-                _ => walk_expr(self, expr),
+        for (name, k) in self.nested_writes {
+            let absorbed = is_function
+                && (self.globals.contains(&name)
+                    || (self.kinds.contains_key(&name) && !self.nonlocals.contains(&name)));
+            if !absorbed {
+                join_into(&mut out, &name, k);
             }
         }
-        fn visit_pattern(&mut self, pattern: &'a Pattern) {
-            let name = match pattern {
-                Pattern::MatchAs(p) => p.name.as_ref(),
-                Pattern::MatchStar(p) => p.name.as_ref(),
-                Pattern::MatchMapping(p) => p.rest.as_ref(),
-                _ => None,
-            };
-            if let Some(name) = name {
-                self.bind(name.as_str(), LocalKind::Unknown);
-            }
-            walk_pattern(self, pattern);
+        out
+    }
+
+    fn bind(&mut self, name: &str, kind: LocalKind) {
+        join_into(&mut self.kinds, name, kind);
+    }
+
+    fn bind_target(&mut self, target: &Expr) {
+        match target {
+            Expr::Name(n) => self.bind(n.id.as_str(), LocalKind::Unknown),
+            Expr::Tuple(t) => t.elts.iter().for_each(|e| self.bind_target(e)),
+            Expr::List(l) => l.elts.iter().for_each(|e| self.bind_target(e)),
+            Expr::Starred(s) => self.bind_target(&s.value),
+            _ => {}
         }
     }
-    let mut locals = Locals {
-        kinds: HashMap::new(),
-        foreign: HashSet::new(),
-    };
-    let params = &f.parameters;
-    for p in params.iter_non_variadic_params() {
-        let kind = binding_kind(p.parameter.annotation.as_deref(), None);
-        locals.bind(p.parameter.name.as_str(), kind);
+
+    fn absorb_nested(&mut self, writes: HashMap<String, LocalKind>) {
+        for (name, k) in writes {
+            join_into(&mut self.nested_writes, &name, k);
+        }
     }
-    for p in params.vararg.iter().chain(params.kwarg.iter()) {
-        locals.bind(p.name.as_str(), LocalKind::Unknown);
+}
+
+impl<'a> Visitor<'a> for ScopeBindings {
+    fn visit_stmt(&mut self, stmt: &'a Stmt) {
+        match stmt {
+            // A nested scope binds only its own name here; what it assigns
+            // through `nonlocal` is collected separately.
+            Stmt::FunctionDef(d) => {
+                self.bind(d.name.as_str(), LocalKind::Unknown);
+                let writes = Self::of_function(d).escaping_writes(true);
+                return self.absorb_nested(writes);
+            }
+            Stmt::ClassDef(d) => {
+                self.bind(d.name.as_str(), LocalKind::Unknown);
+                let writes = Self::of_class_body(&d.body).escaping_writes(false);
+                return self.absorb_nested(writes);
+            }
+            Stmt::Assign(a) => match a.targets.as_slice() {
+                [Expr::Name(n)] => self.bind(n.id.as_str(), binding_kind(None, Some(&a.value))),
+                targets => targets.iter().for_each(|t| self.bind_target(t)),
+            },
+            Stmt::AnnAssign(a) => {
+                if let Expr::Name(n) = a.target.as_ref() {
+                    self.bind(
+                        n.id.as_str(),
+                        binding_kind(Some(&a.annotation), a.value.as_deref()),
+                    );
+                }
+            }
+            // `+=` keeps the value's kind.
+            Stmt::AugAssign(_) => {}
+            Stmt::For(s) => self.bind_target(&s.target),
+            Stmt::With(w) => {
+                for item in &w.items {
+                    if let Some(v) = &item.optional_vars {
+                        self.bind_target(v);
+                    }
+                }
+            }
+            Stmt::Delete(d) => d.targets.iter().for_each(|t| self.bind_target(t)),
+            Stmt::Import(i) => {
+                for a in &i.names {
+                    let bound = match &a.asname {
+                        Some(alias) => alias.as_str(),
+                        None => a.name.as_str().split('.').next().unwrap_or_default(),
+                    };
+                    self.bind(bound, LocalKind::Unknown);
+                }
+            }
+            Stmt::ImportFrom(i) => {
+                for a in &i.names {
+                    self.bind(
+                        a.asname.as_ref().unwrap_or(&a.name).as_str(),
+                        LocalKind::Unknown,
+                    );
+                }
+            }
+            Stmt::Global(g) => self.globals.extend(g.names.iter().map(|n| n.to_string())),
+            Stmt::Nonlocal(g) => self.nonlocals.extend(g.names.iter().map(|n| n.to_string())),
+            Stmt::TypeAlias(t) => self.bind_target(&t.name),
+            Stmt::Try(t) => {
+                for h in &t.handlers {
+                    let ExceptHandler::ExceptHandler(h) = h;
+                    if let Some(name) = &h.name {
+                        self.bind(name.as_str(), LocalKind::Unknown);
+                    }
+                }
+            }
+            _ => {}
+        }
+        walk_stmt(self, stmt);
     }
-    for s in &f.body {
-        locals.visit_stmt(s);
+    fn visit_expr(&mut self, expr: &'a Expr) {
+        match expr {
+            // A lambda's walrus binds in the lambda.
+            Expr::Lambda(_) => {}
+            Expr::Named(n) => {
+                self.bind_target(&n.target);
+                walk_expr(self, expr);
+            }
+            _ => walk_expr(self, expr),
+        }
     }
-    let Locals { mut kinds, foreign } = locals;
-    kinds.retain(|name, _| !foreign.contains(name));
-    kinds
+    fn visit_pattern(&mut self, pattern: &'a Pattern) {
+        let name = match pattern {
+            Pattern::MatchAs(p) => p.name.as_ref(),
+            Pattern::MatchStar(p) => p.name.as_ref(),
+            Pattern::MatchMapping(p) => p.rest.as_ref(),
+            _ => None,
+        };
+        if let Some(name) = name {
+            self.bind(name.as_str(), LocalKind::Unknown);
+        }
+        walk_pattern(self, pattern);
+    }
+}
+
+/// The names `f` binds in its own scope, with what each evidently holds —
+/// joined with what its nested functions assign to them through `nonlocal`
+/// — and the names it declares `global`, which read the module's binding.
+/// Its `nonlocal` names are the enclosing function's.
+fn function_local_kinds(f: &StmtFunctionDef) -> (HashMap<String, LocalKind>, HashSet<String>) {
+    let ScopeBindings {
+        mut kinds,
+        globals,
+        nonlocals,
+        nested_writes,
+    } = ScopeBindings::of_function(f);
+    kinds.retain(|name, _| !globals.contains(name) && !nonlocals.contains(name));
+    for (name, k) in nested_writes {
+        if let Some(own) = kinds.get_mut(&name) {
+            *own = own.join(k);
+        }
+    }
+    (kinds, globals)
 }

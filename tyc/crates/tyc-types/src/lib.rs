@@ -9907,6 +9907,84 @@ fn attr_target_field_type(c: &Checker, target: &Expr) -> Option<Type> {
     (!matches!(field, Type::Unknown) && !mentions_type_param(&field)).then_some(field)
 }
 
+/// Whether a string literal read under `expected` is that literal's singleton
+/// type: `expected` is, or has a union member that is, a string-literal type,
+/// through `type` aliases at any level (`Mode | None` with
+/// `type Mode = "fast" | "slow"`, as `Mode?` spells it).
+fn expects_literal_str(c: &Checker, expected: &Type, depth: u8) -> bool {
+    match c.unwrap_alias(expected) {
+        Type::LitStr(_) => true,
+        Type::Union(members) if depth < 8 => {
+            members.iter().any(|m| expects_literal_str(c, m, depth + 1))
+        }
+        _ => false,
+    }
+}
+
+/// Whether inferring `value` again has no effect but its type: a literal, a
+/// name, or a display / conditional built only from those. Such a value can
+/// be read under a second expected type.
+fn reinference_is_pure(value: &Expr) -> bool {
+    match value {
+        Expr::StringLiteral(_)
+        | Expr::BytesLiteral(_)
+        | Expr::NumberLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::NoneLiteral(_)
+        | Expr::EllipsisLiteral(_)
+        | Expr::Name(_) => true,
+        Expr::UnaryOp(u) => reinference_is_pure(&u.operand),
+        Expr::Starred(s) => reinference_is_pure(&s.value),
+        Expr::List(l) => l.elts.iter().all(reinference_is_pure),
+        Expr::Tuple(t) => t.elts.iter().all(reinference_is_pure),
+        Expr::Set(s) => s.elts.iter().all(reinference_is_pure),
+        Expr::Dict(d) => d.items.iter().all(|item| {
+            item.key.as_ref().is_none_or(reinference_is_pure) && reinference_is_pure(&item.value)
+        }),
+        Expr::If(e) => {
+            reinference_is_pure(&e.test)
+                && reinference_is_pure(&e.body)
+                && reinference_is_pure(&e.orelse)
+        }
+        _ => false,
+    }
+}
+
+/// Whether `value`'s inferred type can depend on the type it is read under:
+/// a string literal, a display or comprehension, a lambda, a call whose
+/// result binds a type parameter (or whose callee is not known), or a
+/// conditional / boolean operand / walrus / `await` around one.
+fn reads_expected_type(c: &Checker, value: &Expr) -> bool {
+    match value {
+        Expr::StringLiteral(_)
+        | Expr::List(_)
+        | Expr::Tuple(_)
+        | Expr::Set(_)
+        | Expr::Dict(_)
+        | Expr::ListComp(_)
+        | Expr::SetComp(_)
+        | Expr::DictComp(_)
+        | Expr::Generator(_)
+        | Expr::Lambda(_) => true,
+        Expr::If(e) => reads_expected_type(c, &e.body) || reads_expected_type(c, &e.orelse),
+        Expr::BoolOp(b) => b.values.iter().any(|v| reads_expected_type(c, v)),
+        Expr::Named(n) => reads_expected_type(c, &n.value),
+        Expr::Await(a) => reads_expected_type(c, &a.value),
+        Expr::Starred(s) => reads_expected_type(c, &s.value),
+        Expr::Call(call) => match infer_expr_readonly(c, &call.func) {
+            Type::Function { ret, .. } => mentions_type_param(&ret),
+            // A constructor: of a generic class, or of one whose shape is
+            // not known here.
+            Type::Class(name) => {
+                c.class_type_params.contains_key(&name)
+                    || c.class_shapes.get(&name).is_none_or(|shape| shape.partial)
+            }
+            _ => true,
+        },
+        _ => false,
+    }
+}
+
 /// Whether `target` (`h.x`) reads a `@property`, which may return a
 /// different object on every read: what one read was narrowed to says
 /// nothing about the next.
@@ -15666,13 +15744,35 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 // A module-level `lazy let NAME: T = E` binds what `E`
                 // evaluates to on first use, so `E` is what `T` describes.
                 let value = lazy_let_factory_body(value).unwrap_or(value);
-                // An attribute target also stores into its field, which may be
+                // An attribute target also stores into its field. A field
                 // narrower than the annotation (`self.mode: str = "slow"` with
-                // `mode: Mode`). Inferring under the field keeps a literal or a
-                // display at the precision the field check below needs; a
-                // value that fits the field then fits the annotation too.
-                let expected = match attr_target_field_type(c, &a.target) {
-                    Some(field) if !bare_final && c.is_assignable(&ann_type, &field) => field,
+                // `mode: Mode`) is what the value is read under: a literal or
+                // a display keeps the precision the field check below needs,
+                // and a value that fits the field fits the annotation too.
+                // Any other field (a TypedDict under a `Mapping` annotation)
+                // leaves the annotation's reading as it always was; a value
+                // whose inference has no other effect is then read under the
+                // field as well — first, so the annotation's reading is the
+                // one that stands.
+                let field = if bare_final {
+                    None
+                } else {
+                    attr_target_field_type(c, &a.target)
+                };
+                let under_field = field
+                    .as_ref()
+                    .is_some_and(|f| c.is_assignable(&ann_type, f));
+                let field_reading = field
+                    .as_ref()
+                    .filter(|_| !under_field && reinference_is_pure(value))
+                    .map(|f| {
+                        let saved = std::mem::replace(&mut c.diagnostics, Diagnostics::new());
+                        let read = infer_expr_ctx(c, value, Some(f));
+                        c.diagnostics = saved;
+                        read
+                    });
+                let expected = match &field {
+                    Some(f) if under_field => f.clone(),
                     _ => ann_type.clone(),
                 };
                 let value_type = infer_expr_ctx(c, value, Some(&expected));
@@ -15749,14 +15849,23 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 // Field declarations inside a class body have no value
                 // and a bare-name target, so they don't hit this branch.
                 // The stored value must fit the field as well as the
-                // annotation, as for `a.b = ...`; one that already failed the
-                // annotation is checked as the type it claims, so a single
-                // bad value is reported once.
+                // annotation, as for `a.b = ...`, read as the field reads it
+                // when the annotation's reading does not fit; one that already
+                // failed the annotation is checked as the type it claims, so a
+                // single bad value is reported once. A value read only under
+                // an annotation that is not a supertype of the field, whose
+                // type depends on what it is read under (a display, a literal,
+                // a lambda, a call to a generic), says nothing certain about
+                // the field and is not checked against it.
                 check_attr_assign_not_frozen(c, a.target.as_ref());
-                let stored = if value_fits {
-                    value_type.clone()
-                } else {
-                    ann_type.clone()
+                let stored = match (&field, field_reading) {
+                    _ if !value_fits => ann_type.clone(),
+                    (Some(f), _) if c.is_assignable(f, &value_type) => value_type.clone(),
+                    (Some(_), Some(read)) => read,
+                    (Some(_), None) if !under_field && reads_expected_type(c, value) => {
+                        Type::Unknown
+                    }
+                    _ => value_type.clone(),
                 };
                 check_attr_assign_type(c, a.target.as_ref(), &stored);
                 // Audit hook: `c.field = ...` writes mark the field
@@ -17590,7 +17699,13 @@ fn check_function(
         {
             if let (Some(ann), Some(default_expr)) = (&pwd.parameter.annotation, &pwd.default) {
                 let ann_type = type_from_annotation_with_params(ann, &classes, type_params);
-                let default_type = infer_expr(c, default_expr);
+                let mut default_type = infer_expr(c, default_expr);
+                // A literal or display reads as the annotation asks, as an
+                // annotated binding's value does: `m: Mode = "fast"` is the
+                // literal, `xs: tuple[float, ...] = (1, 2)` holds floats.
+                if !c.is_assignable(&ann_type, &default_type) && reinference_is_pure(default_expr) {
+                    default_type = infer_expr_ctx(c, default_expr, Some(&ann_type));
+                }
                 if !c.is_assignable(&ann_type, &default_type) {
                     let span = (
                         default_expr.range().start().to_usize(),
@@ -20547,6 +20662,15 @@ fn type_identity_narrowing(
         t => t,
     };
     let replace = |current: &Type| {
+        // A type variable, `Unknown` or `Any` subject (or a union holding
+        // one) may accept every replacement — a class type parameter read
+        // through `self` in an `impl[T]` method is not opaque there — so the
+        // guard below cannot tell a `T` from a `bool`, and there is no
+        // intersection to narrow to. Leave it as it was.
+        let open = |t: &Type| matches!(t, Type::Unknown | Type::Any | Type::TypeVar(_));
+        if open(current) || matches!(current, Type::Union(members) if members.iter().any(open)) {
+            return None;
+        }
         let r = container_pattern_narrowing(c, current, head)
             .unwrap_or_else(|| refine_isinstance_target(current, &class_type));
         c.is_assignable(current, &r).then_some(r)
@@ -22593,12 +22717,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
         // unannotated bindings (`let s = "hi"` should still be `str`).
         Expr::StringLiteral(s) => {
             let value = s.value.to_str().to_owned();
-            let wants_literal = match expected.map(|t| c.unwrap_alias(t)) {
-                Some(Type::LitStr(_)) => true,
-                Some(Type::Union(vs)) => vs.iter().any(|v| matches!(v, Type::LitStr(_))),
-                _ => false,
-            };
-            if wants_literal {
+            if expected.is_some_and(|t| expects_literal_str(c, t, 0)) {
                 Type::LitStr(value)
             } else {
                 Type::Str

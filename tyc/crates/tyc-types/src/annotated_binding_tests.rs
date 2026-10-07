@@ -475,6 +475,142 @@ def main() -> None:\n    let j: Job = Job()\n    j.reset()\n    j.mode: str = \"
     }
 }
 
+/// The annotation and the field each read the value under their own type: a
+/// field that is not a subtype of the annotation (a TypedDict under a
+/// `Mapping` or `dict` annotation) or an alias under `?` still sees the value
+/// at its full precision, and the annotation is checked exactly as before.
+#[test]
+fn an_annotated_attribute_target_reads_the_value_under_each_type_separately() {
+    let src = "from collections.abc import Mapping\nfrom typing import TypedDict\n\
+type Mode = \"fast\" | \"slow\"\n\
+class Cfg(TypedDict):\n    a: int\n\
+class Job:\n    cfg: Cfg\n    mode: Mode? = None\n    pair: tuple[float, Mode] = (0.0, \"fast\")\n\
+impl Job:\n    def reset(self, fast: bool) -> None:\n\
+\x20       self.cfg: Mapping[str, object] = {\"a\": 1}\n\
+\x20       self.cfg: dict[str, int] = {\"a\": 2}\n\
+\x20       self.mode: str? = \"slow\"\n\
+\x20       self.mode: object = \"fast\" if fast else None\n\
+\x20       self.pair: tuple[float, str] = (1, \"slow\")\n\
+def main() -> None:\n    let j: Job = Job({\"a\": 0})\n    j.reset(True)\n    print(j)\n";
+    assert_clean(&check(src), src);
+    // A value the field rejects under its own reading is reported, once.
+    for body in [
+        "        self.mode: str? = \"medium\"\n",
+        "        self.mode: object = \"fast\" if fast else \"medium\"\n",
+        "        self.pair: tuple[float, str] = (1, \"medium\")\n",
+    ] {
+        let bad = format!(
+            "type Mode = \"fast\" | \"slow\"\n\
+             class Job:\n    mode: Mode? = None\n    pair: tuple[float, Mode] = (0.0, \"fast\")\n\
+             impl Job:\n    def reset(self, fast: bool) -> None:\n{body}"
+        );
+        let d = check(&bad);
+        assert_mismatch(&d, &bad);
+        assert_eq!(d.errors().len(), 1, "{bad}: {:?}", messages(&d));
+    }
+    // An effectful value is read once: under a narrower field, or under the
+    // annotation — where a display, literal or generic call whose type
+    // depends on that reading is not held against the field.
+    let effectful = "from collections.abc import Mapping, Sequence\nfrom typing import TypedDict\n\
+type Mode = \"fast\" | \"slow\"\n\
+class Cfg(TypedDict):\n    a: int\n\
+def one() -> int:\n    return 1\n\
+def flag() -> bool:\n    return True\n\
+def empty[T]() -> list[T]:\n    return []\n\
+class Job:\n    cfg: Cfg\n    mode: Mode = \"fast\"\n    items: list[float] = []\n\
+impl Job:\n    def reset(self) -> None:\n\
+\x20       self.cfg: Mapping[str, object] = {\"a\": one()}\n\
+\x20       self.mode: str = \"slow\" if flag() else \"fast\"\n\
+\x20       self.items: Sequence[object] = empty()\n\
+def main() -> None:\n    let j: Job = Job({\"a\": 0})\n    j.reset()\n    print(j)\n";
+    assert_clean(&check(effectful), effectful);
+    // A call is still checked inside, and reported once; its result is
+    // checked against the field whichever type annotates it.
+    let call = "class Job:\n    n: int = 0\n\
+def make(x: int) -> int:\n    return x\n\
+impl Job:\n    def reset(self) -> None:\n        self.n: int = make(\"x\")\n";
+    let d = check(call);
+    assert_eq!(d.errors().len(), 1, "{:?}", messages(&d));
+    for ann in ["int", "object"] {
+        let bad = format!(
+            "class Job:\n    name: str = \"\"\n\
+             def make() -> int:\n    return 1\n\
+             impl Job:\n    def reset(self) -> None:\n        self.name: {ann} = make()\n"
+        );
+        let d = check(&bad);
+        assert_mismatch(&d, &bad);
+        assert_eq!(d.errors().len(), 1, "{bad}: {:?}", messages(&d));
+    }
+}
+
+/// A string literal under `Alias?` (`Alias | None`, an alias of a literal
+/// union) is that literal, as it is under the bare alias — and a parameter
+/// default reads as its annotation asks, as an annotated binding does.
+#[test]
+fn a_string_literal_fits_an_optional_literal_alias() {
+    let src = "type Mode = \"fast\" | \"slow\"\n\
+type MaybeMode = Mode | None\n\
+class Job:\n    mode: Mode? = None\n\
+def run(m: Mode? = \"fast\") -> Mode?:\n    return m\n\
+def main() -> None:\n\
+\x20   let m: Mode? = \"slow\"\n    let n: MaybeMode = \"fast\"\n    let o: Mode | int | None = \"slow\"\n\
+\x20   let j: Job = Job(\"slow\")\n    let k: Job = Job(mode=\"fast\")\n\
+\x20   print(m, n, o, j, k, run(\"slow\"), run())\n";
+    assert_clean(&check(src), src);
+    let defaults = "type Mode = \"fast\" | \"slow\"\n\
+def run(m: Mode = \"fast\", w: tuple[float, ...] = (1, 2), d: dict[str, Mode] = {}) -> None:\n    print(m, w, d)\n";
+    assert_clean(&check(defaults), defaults);
+    for bad in [
+        "type Mode = \"fast\" | \"slow\"\nlet m: Mode? = \"medium\"\n",
+        "type Mode = \"fast\" | \"slow\"\ndef run(m: Mode? = \"medium\") -> None:\n    print(m)\n",
+        "type Mode = \"fast\" | \"slow\"\nclass Job:\n    mode: Mode? = None\nlet j: Job = Job(\"medium\")\n",
+    ] {
+        assert!(!check(bad).errors().is_empty(), "accepted:\n{bad}");
+    }
+}
+
+/// The named-default table the checker shares with the desugar follows
+/// `global` and `nonlocal`: a nested `global BASE` reads the module's list
+/// (copied), and a `nonlocal` rebind to a tuple stops a local list from
+/// standing in for the default.
+#[test]
+fn a_named_default_follows_global_and_nonlocal_declarations() {
+    let global = "mut BASE: list[int] = [1, 2]\n\
+def outer() -> None:\n    let BASE: list[int] | tuple[int, ...] = (7, 8)\n\
+\x20   def inner() -> None:\n        global BASE\n\
+\x20       class Cfg:\n            items: list[int] | None = BASE\n\
+\x20       print(Cfg().items)\n    inner()\n";
+    assert_clean(&check_class_kinds(global), global);
+    let nonlocal = "from collections.abc import Sequence\n\
+def outer() -> None:\n    mut LOC: Sequence[int] = [1]\n\
+\x20   def inner() -> None:\n        nonlocal LOC\n        LOC = (2, 3)\n\
+\x20   inner()\n\
+\x20   class C:\n        items: list[int] | None = LOC\n    print(C().items)\n";
+    assert_mismatch(&check_class_kinds(nonlocal), nonlocal);
+    // A rebind that keeps the list keeps the copy.
+    let same = nonlocal.replace("LOC = (2, 3)", "LOC = [2, 3]");
+    assert_clean(&check_class_kinds(&same), &same);
+}
+
+/// A function-local subclass of a function-local exception is emitted
+/// without `@dataclass`, as at module level, so its named default is
+/// checked as written there too.
+#[test]
+fn a_local_exception_subclass_keeps_its_default_as_written() {
+    let src = format!(
+        "{FIELD_PRELUDE}def main() -> None:\n    class Failure(Exception):\n        pass\n\
+\x20   class Timeout(Failure):\n        codes: list[int] = T\n    print(Timeout().codes)\n"
+    );
+    assert_mismatch(&check_class_kinds(&src), &src);
+    // Raising one with a message, and a local metaclass chain, check clean.
+    let ok = "def make() -> None:\n    class Failure(Exception):\n        pass\n\
+\x20   class Timeout(Failure):\n        pass\n\
+\x20   try:\n        raise Timeout(\"slow\")\n    except Failure as e:\n        print(\"caught\", e)\n\
+\x20   class LMeta(type):\n        pass\n    class LMeta2(LMeta):\n        pass\n\
+\x20   class Uses(metaclass=LMeta2):\n        x: int = 0\n    print(Uses().x)\n";
+    assert_clean(&check_class_kinds(ok), ok);
+}
+
 // ── `lazy let` ───────────────────────────────────────────────────────────
 
 #[test]
@@ -582,6 +718,29 @@ def main() -> None:\n    print(passthrough(True), same(1.5), show(UserId(7)), pi
 def f(a: Animal, x: int | str) -> int:\n    if type(a) is Dog:\n        print(a.bark())\n\
 \x20   if type(x) is int:\n        return x + 1\n    return 0\n";
     assert_clean(&check(narrows), narrows);
+}
+
+/// A class type parameter read through `self` infers as `Unknown`, which
+/// accepts any replacement: `type(self.item) is bool` leaves it as it was
+/// rather than turning a `T` into a `bool`.
+#[test]
+fn type_identity_leaves_an_unknown_subject_alone() {
+    let src = "class Animal:\n    name: str\nclass Dog(Animal):\n    pass\n\
+class Box[T]:\n    item: T\n\
+impl[T] Box[T]:\n    def get(self) -> T:\n        if type(self.item) is bool:\n            return self.item\n        return self.item\n\
+\x20   def get2(self) -> T:\n        let it = self.item\n        if type(it) is bool:\n            return it\n        return it\n\
+\x20   def get3(self) -> T:\n        if self.item.__class__ == int:\n            return self.item\n        return self.item\n\
+class Pen[T: Animal]:\n    pet: T\n\
+impl[T: Animal] Pen[T]:\n    def pet_of(self) -> T:\n        if type(self.pet) is Dog:\n            return self.pet\n        return self.pet\n\
+def main() -> None:\n    print(Box(True).get(), Box(3).get2(), Box(1).get3(), Pen(Dog(\"rex\")).pet_of().name)\n";
+    assert_clean(&check(src), src);
+    // The class-body method form.
+    let body = "class Box[T]:\n    item: T\n\n    def get(self) -> T:\n\
+\x20       if type(self.item) is bool:\n            return self.item\n        return self.item\n";
+    assert_clean(&check(body), body);
+    // A known subject still narrows, and a wrong use is still caught.
+    let bad = "def f(x: int | str) -> None:\n    if type(x) is int:\n        print(x.upper())\n";
+    assert!(!check(bad).errors().is_empty(), "accepted:\n{bad}");
 }
 
 /// A name in `C`'s place that is bound to a value — a `let`, a parameter, a

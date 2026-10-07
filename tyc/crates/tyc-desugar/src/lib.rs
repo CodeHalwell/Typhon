@@ -6988,6 +6988,180 @@ def make():
         assert!(out.contains("default_factory=lambda: list(BASE)"), "{out}");
     }
 
+    /// `global BASE` in a nested function reads the module's `BASE`, not the
+    /// enclosing function's local of that name — in the function and in the
+    /// scopes nested in it.
+    #[test]
+    fn a_nested_global_reads_the_module_binding_past_an_enclosing_local() {
+        let list_over_tuple = "BASE: list[int] = [1, 2]
+
+def outer():
+    BASE: tuple[int, ...] = (7, 8)
+    def inner():
+        global BASE
+        class Cfg:
+            items: Sequence[int] = BASE
+        def deeper():
+            class Deep:
+                items: Sequence[int] = BASE
+            return Deep()
+        return Cfg(), deeper()
+    return inner()
+";
+        let out = parse_and_desugar(list_over_tuple);
+        assert_eq!(
+            out.matches("default_factory=lambda: list(BASE)").count(),
+            2,
+            "{out}"
+        );
+        // The mirror image: a module tuple is stored as written.
+        let tuple_over_list = "BASE: tuple[int, ...] = (1, 2)
+
+def outer():
+    BASE: list[int] = [7, 8]
+    def inner():
+        global BASE
+        class Cfg:
+            items: Sequence[int] = BASE
+        return Cfg()
+    return inner()
+";
+        let out = parse_and_desugar(tuple_over_list);
+        assert!(!out.contains("default_factory=lambda:"), "{out}");
+        // A name the module never binds is not copied.
+        let out = parse_and_desugar(
+            "def outer():
+    BASE = [7, 8]
+    def inner():
+        global BASE
+        class Cfg:
+            items: Sequence[int] = BASE
+        return Cfg()
+    return inner()
+",
+        );
+        assert!(!out.contains("default_factory=lambda:"), "{out}");
+        // Without `global`, the enclosing local still decides.
+        let out = parse_and_desugar(
+            "BASE: tuple[int, ...] = (1, 2)
+
+def outer():
+    BASE: list[int] = [7, 8]
+    def inner():
+        class Cfg:
+            items: Sequence[int] = BASE
+        return Cfg()
+    return inner()
+",
+        );
+        assert!(out.contains("default_factory=lambda: list(BASE)"), "{out}");
+    }
+
+    /// A nested function that rebinds a local through `nonlocal` changes what
+    /// the local may hold: its assignments join the owner's, and a mix of
+    /// kinds leaves the outer answer in place.
+    #[test]
+    fn a_nonlocal_rebind_joins_the_owning_functions_kind() {
+        // `[1]` then `(2, 3)`: stored as written, as before the local was
+        // looked at.
+        let out = parse_and_desugar(
+            "def outer():
+    LOC: Sequence[int] = [1]
+    def inner():
+        nonlocal LOC
+        LOC = (2, 3)
+    inner()
+    class C:
+        items: Sequence[int] = LOC
+    return C()
+",
+        );
+        assert!(!out.contains("default_factory=lambda:"), "{out}");
+        // `(1,)` then `[2, 3]` over a module list: the module's answer.
+        let out = parse_and_desugar(
+            "LOC: list[int] = [0]
+
+def outer():
+    LOC: Sequence[int] = (1,)
+    def inner():
+        nonlocal LOC
+        LOC = [2, 3]
+    inner()
+    class C:
+        items: Sequence[int] = LOC
+    return C()
+",
+        );
+        assert!(out.contains("default_factory=lambda: list(LOC)"), "{out}");
+        // Through a method of a nested class and a doubly nested function.
+        for writer in [
+            "    class K:
+        def m(self):
+            nonlocal LOC
+            LOC = (2, 3)
+",
+            "    def mid():
+        def inner():
+            nonlocal LOC
+            LOC = (2, 3)
+        inner()
+",
+            "    def mid():
+        nonlocal LOC
+        def inner():
+            nonlocal LOC
+            LOC = (2, 3)
+        inner()
+",
+        ] {
+            let src = format!(
+                "def outer():
+    LOC: Sequence[int] = [1]
+{writer}    class C:
+        items: Sequence[int] = LOC
+    return C()
+"
+            );
+            let out = parse_and_desugar(&src);
+            assert!(
+                !out.contains("default_factory=lambda:"),
+                "{src}\n---\n{out}"
+            );
+        }
+        // Lists on both sides stay a list, and a middle function that binds
+        // its own `LOC` absorbs the rebind.
+        for src in [
+            "def outer():
+    LOC: Sequence[int] = [1]
+    def inner():
+        nonlocal LOC
+        LOC = [2, 3]
+    inner()
+    class C:
+        items: Sequence[int] = LOC
+    return C()
+",
+            "def outer():
+    LOC: Sequence[int] = [1]
+    def mid():
+        LOC = [5]
+        def inner():
+            nonlocal LOC
+            LOC = (2, 3)
+        inner()
+    class C:
+        items: Sequence[int] = LOC
+    return C()
+",
+        ] {
+            let out = parse_and_desugar(src);
+            assert!(
+                out.contains("default_factory=lambda: list(LOC)"),
+                "{src}\n---\n{out}"
+            );
+        }
+    }
+
     /// A class under module-level control flow is emitted as written.
     #[test]
     fn a_class_under_control_flow_is_not_decorated() {
@@ -7032,6 +7206,95 @@ if True:
         ] {
             let out = parse_and_desugar(src);
             assert!(!out.contains("@dataclasses.dataclass"), "{src}\n---\n{out}");
+        }
+    }
+
+    /// A function-local subclass of a function-local exception or metaclass
+    /// is one too, as at module level — and so is one of a module exception,
+    /// or of an exception an enclosing function declares.
+    #[test]
+    fn local_subclasses_of_local_exceptions_and_metaclasses_are_not_dataclasses() {
+        let out = parse_and_desugar(
+            "class Base(Exception):
+    pass
+
+def make():
+    class Failure(Exception):
+        pass
+    class Timeout(Failure):
+        pass
+    class Slow(Base):
+        pass
+    class LMeta(type):
+        pass
+    class LMeta2(LMeta):
+        pass
+    class Uses(metaclass=LMeta2):
+        x: int = 0
+    def inner():
+        class Late(Timeout):
+            pass
+        class Record:
+            y: int = 0
+        return Late, Record
+    class Holder:
+        class Inner(Failure):
+            pass
+    raise Timeout('slow')
+",
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        let decorated = |name: &str| {
+            let at = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with(&format!("class {name}")))
+                .unwrap_or_else(|| panic!("no class {name} in:\n{out}"));
+            at > 0
+                && lines[at - 1]
+                    .trim_start()
+                    .starts_with("@dataclasses.dataclass")
+        };
+        for name in [
+            "Failure", "Timeout", "Slow", "LMeta", "LMeta2", "Late", "Inner",
+        ] {
+            assert!(!decorated(name), "{name} decorated:\n{out}");
+        }
+        for name in ["Uses", "Record", "Holder"] {
+            assert!(decorated(name), "{name} not decorated:\n{out}");
+        }
+        // A base naming a local value, or a local dataclass, is no exception.
+        let out = parse_and_desugar(
+            "class Failure(Exception):
+    pass
+
+def make(Failure: type):
+    class Timeout(Failure):
+        pass
+    return Timeout
+
+def other():
+    class Failure:
+        code: int = 0
+    class Timeout(Failure):
+        pass
+    return Timeout
+",
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        let timeouts: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.trim_start().starts_with("class Timeout("))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(timeouts.len(), 2, "{out}");
+        for at in timeouts {
+            assert!(
+                lines[at - 1]
+                    .trim_start()
+                    .starts_with("@dataclasses.dataclass"),
+                "{out}"
+            );
         }
     }
 
