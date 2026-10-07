@@ -159,6 +159,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "unknown_module",
         "unknown_name",
         "unsafe_value_leak",
+        "unsupported_syntax_for_target",
         "unused_import",
         "use_of_uninitialised",
     ]
@@ -342,6 +343,9 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         }
         "reserved_module_name" => {
             include_str!("../../../../../docs/diagnostics/reserved_module_name.md")
+        }
+        "unsupported_syntax_for_target" => {
+            include_str!("../../../../../docs/diagnostics/unsupported_syntax_for_target.md")
         }
         "result_error_mismatch" => {
             include_str!("../../../../../docs/diagnostics/result_error_mismatch.md")

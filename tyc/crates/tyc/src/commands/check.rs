@@ -610,6 +610,7 @@ fn check_scope(args: &CheckArgs, scope: &CheckScope) -> Result<ScopeOutcome> {
                     auto_parallel,
                     auto_parallel_reductions: config.strictness.auto_parallel_reductions,
                     parallel_min_size: config.strictness.parallel_min_size,
+                    python_target: python_target_u8(&config.python.target),
                 },
             );
             diags.extend(analysis_diags);
@@ -1166,6 +1167,28 @@ fn run_secondary_passes(
     // against the `.ty` text and line the user wrote.
     diags.remap_lines(&prep.python_source, &prep.line_map, path, source);
 
+    diags
+}
+
+/// `[python] target` as the `(major, minor)` pair the parser takes; `None`
+/// for a value config validation would reject anyway.
+pub(crate) fn python_target_u8(target: &str) -> Option<(u8, u8)> {
+    let (major, minor) = crate::config::parse_python_target(target)?;
+    Some((u8::try_from(major).ok()?, u8::try_from(minor).ok()?))
+}
+
+/// `tyc::unsupported_syntax_for_target` for `tyc build`, which does not run
+/// the editor-lint pass `tyc check` reports it from. See
+/// [`tyc_analyse::target_syntax_diagnostics`].
+pub(crate) fn check_target_syntax(path: &str, source: &str, target: &str) -> Diagnostics {
+    let Some((major, minor)) = python_target_u8(target) else {
+        return Diagnostics::new();
+    };
+    let (expanded, expanded_to_source) = expand_sugar_mapped(source, true);
+    let (mut prep, prep_to_expanded) = preprocess_mapped(&expanded);
+    prep.line_map = compose_line_maps(&prep_to_expanded, &expanded_to_source);
+    let mut diags = tyc_analyse::target_syntax_diagnostics(path, &prep.python_source, major, minor);
+    diags.remap_lines(&prep.python_source, &prep.line_map, path, source);
     diags
 }
 

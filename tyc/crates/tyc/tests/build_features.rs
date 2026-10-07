@@ -2090,6 +2090,80 @@ fn build_emits_typhon_runtime_when_only_lazy_import_used() {
     );
 }
 
+// ── target-gated syntax (tyc::unsupported_syntax_for_target) ──────────────────
+
+const PEP798_SRC: &str = "\
+def main() -> None:
+    let lists: list[list[int]] = [[1], [2, 3]]
+    let flat: list[int] = [*xs for xs in lists]
+    print(flat)
+
+if __name__ == \"__main__\":
+    main()
+";
+
+#[test]
+fn check_rejects_3_15_syntax_on_older_targets() {
+    // A PEP 798 unpacking comprehension needs Python 3.15. On a 3.13 or 3.14
+    // target the emitted `.py` would not compile, so check and build refuse.
+    for target in ["3.13", "3.14"] {
+        let tmp = tempfile::tempdir().unwrap();
+        scaffold_target(tmp.path(), target, PEP798_SRC);
+        let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !out.status.success(),
+            "{target}: check must fail; got:\n{text}"
+        );
+        assert!(
+            text.contains("tyc::unsupported_syntax_for_target") && text.contains("main.ty:3"),
+            "{target}: expected the diagnostic at main.ty:3; got:\n{text}"
+        );
+        let build = tyc().arg("build").arg(tmp.path()).output().unwrap();
+        assert!(!build.status.success(), "{target}: build must fail");
+        assert!(
+            !tmp.path().join("build").join("main.py").exists(),
+            "{target}: no .py may be written"
+        );
+    }
+}
+
+#[test]
+fn check_accepts_3_15_syntax_on_a_3_15_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(tmp.path(), "3.15", PEP798_SRC);
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn typhon_lazy_import_is_not_judged_against_the_target_grammar() {
+    // `lazy import` is Typhon syntax on every target; only a 3.15 build
+    // turns it into the native PEP 810 statement.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(
+        tmp.path(),
+        "3.13",
+        "lazy import js = json\nprint(js.dumps(1))\n",
+    );
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 // ── PEP 810 native lazy imports (3.15+ targets) ───────────────────────────────
 
 #[test]

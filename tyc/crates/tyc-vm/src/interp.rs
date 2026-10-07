@@ -636,6 +636,17 @@ impl Interpreter {
                     return Ok(None);
                 };
                 let it = iters[depth].clone().unwrap_or(Value::None);
+                // PEP 798 `(*x for ...)`: one slot past the clauses holds the
+                // iterator being spread; drain it before advancing a clause.
+                if depth == node.generators.len() {
+                    match self.iter_next(&it)? {
+                        Some(v) => return Ok(Some(v)),
+                        None => {
+                            iters[depth] = None;
+                            continue;
+                        }
+                    }
+                }
                 let clause = &node.generators[depth];
                 match self.iter_next(&it)? {
                     None => {
@@ -658,6 +669,11 @@ impl Interpreter {
                             continue;
                         }
                         if depth + 1 == node.generators.len() {
+                            if let Expr::Starred(star) = node.elt.as_ref() {
+                                let spread = self.eval_expr(&star.value, &env)?;
+                                iters[depth + 1] = Some(self.make_iter(spread)?);
+                                continue;
+                            }
                             return Ok(Some(self.eval_expr(&node.elt, &env)?));
                         }
                         let next_iterable =
@@ -3308,7 +3324,10 @@ impl Interpreter {
                 };
                 let iterable = self.eval_expr(&first.iter, env)?;
                 let it = self.make_iter(iterable)?;
-                let mut iters: Vec<Option<Value>> = (0..g.generators.len()).map(|_| None).collect();
+                // A starred element (PEP 798) gets one extra slot for the
+                // iterator it spreads; see `genexp_next`.
+                let slots = g.generators.len() + usize::from(g.elt.is_starred_expr());
+                let mut iters: Vec<Option<Value>> = (0..slots).map(|_| None).collect();
                 iters[0] = Some(it);
                 let state = GenExprState {
                     node: Rc::new(g.clone()),
@@ -8700,6 +8719,15 @@ impl Interpreter {
         let out_clone = out.clone();
         let leaks = comprehension_walrus_names(&[&c.elt], &c.generators);
         self.run_comprehension_leaking(&c.generators, &leaks, env, &mut move |this, scope| {
+            // PEP 798: `[*x for ...]` spreads each `x` into the result.
+            if let Expr::Starred(star) = elt.as_ref() {
+                let spread = this.eval_expr(&star.value, scope)?;
+                let it = this.make_iter(spread)?;
+                while let Some(v) = this.iter_next(&it)? {
+                    out_clone.borrow_mut().push(v);
+                }
+                return Ok(());
+            }
             let v = this.eval_expr(&elt, scope)?;
             out_clone.borrow_mut().push(v);
             Ok(())
@@ -8714,10 +8742,23 @@ impl Interpreter {
         let out_clone = out.clone();
         let leaks = comprehension_walrus_names(&[&c.elt], &c.generators);
         self.run_comprehension_leaking(&c.generators, &leaks, env, &mut move |this, scope| {
-            let v = this.eval_expr(&elt, scope)?;
-            let k = this.hash_key(&v)?;
-            let k = this.settle_key_set(&out_clone, k)?;
-            out_clone.borrow_mut().insert(k);
+            // PEP 798: `{*x for ...}` spreads each `x` into the result.
+            let items = if let Expr::Starred(star) = elt.as_ref() {
+                let spread = this.eval_expr(&star.value, scope)?;
+                let it = this.make_iter(spread)?;
+                let mut items = Vec::new();
+                while let Some(v) = this.iter_next(&it)? {
+                    items.push(v);
+                }
+                items
+            } else {
+                vec![this.eval_expr(&elt, scope)?]
+            };
+            for v in items {
+                let k = this.hash_key(&v)?;
+                let k = this.settle_key_set(&out_clone, k)?;
+                out_clone.borrow_mut().insert(k);
+            }
             Ok(())
         })?;
         let result = std::mem::take(&mut *out.borrow_mut());
@@ -8727,10 +8768,9 @@ impl Interpreter {
     fn eval_dictcomp(&mut self, c: &ast::ExprDictComp, env: &EnvRef) -> Result<Value, Unwind> {
         let out: Rc<crate::value::FrozenCell<DictMap>> =
             Rc::new(crate::value::FrozenCell::new(DictMap::new()));
-        let key_expr = c
-            .key
-            .clone()
-            .ok_or_else(|| type_error("dict comprehension missing key"))?;
+        // No key means PEP 798's `{**d for ...}`: `value` is the mapping
+        // to merge in.
+        let key_expr = c.key.clone();
         let value_expr = c.value.clone();
         let out_clone = out.clone();
         let mut parts: Vec<&Expr> = vec![&c.value];
@@ -8739,7 +8779,26 @@ impl Interpreter {
         }
         let leaks = comprehension_walrus_names(&parts, &c.generators);
         self.run_comprehension_leaking(&c.generators, &leaks, env, &mut move |this, scope| {
-            let key_value = this.eval_expr(&key_expr, scope)?;
+            let Some(key_expr) = &key_expr else {
+                let mapping = this.eval_expr(&value_expr, scope)?;
+                let Value::Dict(src) = mapping else {
+                    return Err(type_error(format!(
+                        "'{}' object is not a mapping",
+                        mapping.type_name()
+                    )));
+                };
+                let pairs: Vec<_> = src
+                    .borrow()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                for (k, v) in pairs {
+                    let k = this.settle_key_dict(&out_clone, k)?;
+                    out_clone.borrow_mut().insert(k, v);
+                }
+                return Ok(());
+            };
+            let key_value = this.eval_expr(key_expr, scope)?;
             let k = this.hash_key(&key_value)?;
             let k = this.settle_key_dict(&out_clone, k)?;
             let v = this.eval_expr(&value_expr, scope)?;

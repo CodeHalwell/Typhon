@@ -23706,7 +23706,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             let comp_saved = c.env.snapshot_scope_narrowings();
             c.env.enter();
             infer_comprehension_generators(c, &comp.generators);
-            let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
+            let elt = infer_comprehension_element(c, &comp.elt, elt_expected.as_ref());
             leave_comprehension_scope(c, expr);
             c.env.restore_scope_narrowings(comp_saved);
             // A comprehension builds a *fresh* list, so — like a list literal —
@@ -23725,7 +23725,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             let comp_saved = c.env.snapshot_scope_narrowings();
             c.env.enter();
             infer_comprehension_generators(c, &comp.generators);
-            let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
+            let elt = infer_comprehension_element(c, &comp.elt, elt_expected.as_ref());
             leave_comprehension_scope(c, expr);
             c.env.restore_scope_narrowings(comp_saved);
             let elt = widen_fresh_element(c, elt, elt_expected.as_ref());
@@ -23779,7 +23779,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             let comp_saved = c.env.snapshot_scope_narrowings();
             c.env.enter();
             infer_comprehension_generators(c, &comp.generators);
-            let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
+            let elt = infer_comprehension_element(c, &comp.elt, elt_expected.as_ref());
             leave_comprehension_scope(c, expr);
             c.env.restore_scope_narrowings(comp_saved);
             // A generator expression is an `Iterator[T]`.
@@ -23795,6 +23795,34 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             let comp_saved = c.env.snapshot_scope_narrowings();
             c.env.enter();
             infer_comprehension_generators(c, &comp.generators);
+            // PEP 798 `{**d for d in ds}`: no key, and `value` is a mapping
+            // whose key and value types become the result's.
+            if comp.key.is_none() {
+                let mapping = infer_expr(c, &comp.value);
+                let (k, v) = match c.unwrap_alias(&mapping) {
+                    Type::Generic(h, a)
+                        if matches!(h.as_str(), "dict" | "Mapping" | "MutableMapping")
+                            && a.len() == 2 =>
+                    {
+                        (a[0].clone(), a[1].clone())
+                    }
+                    _ => (Type::Unknown, Type::Unknown),
+                };
+                let span = (
+                    comp.value.range().start().to_usize(),
+                    comp.value.range().end().to_usize(),
+                );
+                for (expected, actual) in [(&k_expected, &k), (&v_expected, &v)] {
+                    if let Some(e) = expected {
+                        if !c.is_assignable(e, actual) {
+                            c.mismatch(e, actual, span);
+                        }
+                    }
+                }
+                leave_comprehension_scope(c, expr);
+                c.env.restore_scope_narrowings(comp_saved);
+                return Type::Generic("dict".into(), vec![k, v]);
+            }
             let k = match comp.key.as_ref() {
                 Some(key) => {
                     // Infer the key honestly (no coercing hint) so its real
@@ -23829,6 +23857,19 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             Type::Generic("dict".into(), vec![k, v])
         }
         _ => Type::Unknown,
+    }
+}
+
+/// The element type a list / set / generator comprehension produces. A
+/// PEP 798 starred element (`[*xs for xs in lists]`) spreads `xs`, so it
+/// contributes `xs`'s element type.
+fn infer_comprehension_element(c: &mut Checker, elt: &Expr, expected: Option<&Type>) -> Type {
+    match elt {
+        Expr::Starred(star) => {
+            let spread = infer_expr(c, &star.value);
+            iterable_element_type(&c.unwrap_alias(&spread)).unwrap_or(Type::Unknown)
+        }
+        _ => infer_expr_ctx(c, elt, expected),
     }
 }
 
@@ -27274,6 +27315,26 @@ def describe(m: Maybe[int]) -> str:
             "matching-element `+=` must pass: {:?}",
             ok.errors()
         );
+    }
+
+    #[test]
+    fn pep_798_unpacking_comprehensions_are_element_typed() {
+        let ok = check(
+            "def f() -> None:\n    let xss: list[list[int]] = [[1], [2]]\n    let ds: list[dict[str, int]] = [{\"a\": 1}]\n    let xs: list[int] = [*x for x in xss]\n    let s: set[int] = {*x for x in xss}\n    let m: dict[str, int] = {**d for d in ds}\n    print(xs, s, m)\n",
+        );
+        assert!(ok.errors().is_empty(), "{:?}", ok.errors());
+        for src in [
+            "def f() -> None:\n    let xss: list[list[int]] = [[1]]\n    let xs: list[str] = [*x for x in xss]\n    print(xs)\n",
+            "def f() -> None:\n    let ds: list[dict[str, int]] = [{\"a\": 1}]\n    let m: dict[str, str] = {**d for d in ds}\n    print(m)\n",
+        ] {
+            assert!(
+                check(src)
+                    .errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+                "wrong spread element type must be rejected: {src:?}"
+            );
+        }
     }
 
     #[test]

@@ -760,6 +760,23 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// Syntax the project's `[python] target` cannot parse, such as a
+    /// 3.15-only unpacking comprehension on a 3.13 target. The emitted `.py`
+    /// would fail to compile on that interpreter.
+    #[error("{message}")]
+    #[diagnostic(
+        code(tyc::unsupported_syntax_for_target),
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/unsupported_syntax_for_target.md"),
+        help("raise `[python] target` in typhon.toml to a version that has this syntax, or rewrite it without the newer form")
+    )]
+    UnsupportedSyntaxForTarget {
+        message: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("needs a newer Python than the project targets")]
+        span: SourceSpan,
+    },
+
     /// An `extend` declaration named a Python built-in type.
     #[error("{message}")]
     #[diagnostic(
@@ -2156,6 +2173,7 @@ impl TycError {
             | Self::UnusedImport { src, span, .. }
             | Self::LazyUsage { src, span, .. }
             | Self::ExtendBuiltin { src, span, .. }
+            | Self::UnsupportedSyntaxForTarget { src, span, .. }
             | Self::StdlibModuleShadow { src, span, .. }
             | Self::UnsafeValueLeak { src, span, .. }
             | Self::StubMismatch { src, span, .. }
@@ -2303,6 +2321,7 @@ impl TycError {
             | Self::UnusedImport { src, span, .. }
             | Self::LazyUsage { src, span, .. }
             | Self::ExtendBuiltin { src, span, .. }
+            | Self::UnsupportedSyntaxForTarget { src, span, .. }
             | Self::StdlibModuleShadow { src, span, .. }
             | Self::UnsafeValueLeak { src, span, .. }
             | Self::StubMismatch { src, span, .. }
@@ -3093,6 +3112,21 @@ impl TycError {
     ) -> Self {
         Self::StdlibModuleShadow {
             name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::UnsupportedSyntaxForTarget`] diagnostic.
+    pub fn unsupported_syntax_for_target(
+        message: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::UnsupportedSyntaxForTarget {
+            message: message.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

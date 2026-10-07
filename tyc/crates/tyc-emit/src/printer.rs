@@ -1167,8 +1167,14 @@ impl Emitter {
                 if let Some(key) = &d.key {
                     self.emit_expr(key);
                     self.write(": ");
+                    self.emit_expr(&d.value);
+                } else {
+                    // PEP 798 `{**d for d in ds}`: no key, and `value` is the
+                    // mapping to unpack (a `bitwise_or` operand, as in a
+                    // dict display).
+                    self.write("**");
+                    self.emit_operand_above(&d.value, bin_op_precedence(&Operator::BitOr) - 1);
                 }
-                self.emit_expr(&d.value);
                 for gen in &d.generators {
                     self.emit_comprehension(gen);
                 }
@@ -2548,6 +2554,21 @@ mod tests {
             plain.contains("await f()") && !plain.contains("await (f())"),
             "a primary await operand must not gain parens; got:\n{plain}"
         );
+    }
+
+    #[test]
+    fn pep_798_unpacking_comprehensions_keep_their_stars() {
+        // `{**d for d in ds}` has no key; dropping the `**` emitted a set
+        // comprehension of dicts.
+        let dict = round_trip("m = {**d for d in ds}\n");
+        assert!(dict.contains("{**d for d in ds}"), "got:\n{dict}");
+        let paren = round_trip("m = {**(a if p else b) for p in ps}\n");
+        assert!(
+            paren.contains("{**(a if p else b) for p in ps}"),
+            "got:\n{paren}"
+        );
+        let list = round_trip("xs = [*x for x in xss]\n");
+        assert!(list.contains("[*x for x in xss]"), "got:\n{list}");
     }
 
     #[test]

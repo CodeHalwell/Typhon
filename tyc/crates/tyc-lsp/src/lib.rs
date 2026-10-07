@@ -2671,7 +2671,11 @@ fn parse_src_dir(toml_path: &std::path::Path) -> Option<String> {
 /// an editor buffer in a project without an explicit `[strictness]` table
 /// still gets the on-by-default advice, exactly like `tyc check`.
 fn read_lint_options(root: &std::path::Path) -> tyc_analyse::LintOptions {
-    let mut opts = tyc_analyse::LintOptions::default();
+    let mut opts = tyc_analyse::LintOptions {
+        // The CLI's default `[python] target`, for files outside a project.
+        python_target: Some((3, 13)),
+        ..tyc_analyse::LintOptions::default()
+    };
     let Ok(text) = std::fs::read_to_string(root.join("typhon.toml")) else {
         return opts;
     };
@@ -2687,6 +2691,16 @@ fn read_lint_options(root: &std::path::Path) -> tyc_analyse::LintOptions {
     {
         opts.free_threaded = b;
     }
+    // `[python] target` (default 3.13, as in the CLI) gates
+    // `tyc::unsupported_syntax_for_target`.
+    let target = parsed
+        .get("python")
+        .and_then(|p| p.as_table())
+        .and_then(|t| t.get("target"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("3.13");
+    opts.python_target = tyc_venv::config::parse_python_target(target)
+        .and_then(|(major, minor)| Some((u8::try_from(major).ok()?, u8::try_from(minor).ok()?)));
     // `[optimise] level = 1` flips the `auto-parallel` default on.
     let optimise_level1 = parsed
         .get("optimise")
@@ -4838,6 +4852,18 @@ mod tests {
             !opts.allow_secret_comptime,
             "secret-literal lint defaults on"
         );
+    }
+
+    #[test]
+    fn read_lint_options_reads_python_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(read_lint_options(tmp.path()).python_target, Some((3, 13)));
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname = \"x\"\nsrc = \"src\"\n[python]\ntarget = \"3.15\"\n",
+        )
+        .unwrap();
+        assert_eq!(read_lint_options(tmp.path()).python_target, Some((3, 15)));
     }
 
     #[test]

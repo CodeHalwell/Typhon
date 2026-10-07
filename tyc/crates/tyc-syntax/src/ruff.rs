@@ -63,6 +63,54 @@ pub fn parse_module(source: &str) -> Result<Parsed<ModModule>, ParseError> {
     Ok(parsed)
 }
 
+/// One construct in `source` that the target CPython cannot parse, such as
+/// a 3.15-only comprehension unpacking on a 3.13 target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedSyntax {
+    /// Byte range of the construct in `source`.
+    pub range: TextRange,
+    /// Human-readable reason, naming the construct and the versions, e.g.
+    /// "Cannot use iterable unpacking in a list comprehension on Python 3.13
+    /// (syntax was added in Python 3.15)".
+    pub message: String,
+}
+
+/// Every construct in `source` that needs a newer Python than
+/// `major.minor`, in source order.
+///
+/// [`parse_module`] parses against the newest grammar, so a program using
+/// 3.15-only syntax type-checks on a 3.13 target and only fails when
+/// CPython 3.13 compiles the emitted `.py`. This re-parses with the target
+/// version and returns what the vendored parser flags as unsupported there.
+/// A source that does not parse at all yields nothing: [`parse_module`]
+/// already reports that.
+///
+/// A `lazy` import is never reported: Typhon's own `lazy import` predates
+/// PEP 810 and lowers per target, and the forms it does not lower have
+/// their own diagnostic.
+pub fn unsupported_syntax(source: &str, major: u8, minor: u8) -> Vec<UnsupportedSyntax> {
+    let options = ruff_python_parser::ParseOptions::from(ruff_python_parser::Mode::Module)
+        .with_target_version(ruff_python_ast::PythonVersion { major, minor });
+    let parsed = ruff_python_parser::parse_unchecked(source, options);
+    if !parsed.errors().is_empty() {
+        return Vec::new();
+    }
+    parsed
+        .unsupported_syntax_errors()
+        .iter()
+        .filter(|e| {
+            !matches!(
+                e.kind,
+                ruff_python_parser::UnsupportedSyntaxErrorKind::LazyImportStatement
+            )
+        })
+        .map(|e| UnsupportedSyntax {
+            range: e.range,
+            message: e.to_string(),
+        })
+        .collect()
+}
+
 /// Cheap pre-filter: whether the source's own code brackets (not those in
 /// strings, comments or f-string fields) ever nest past the limit. The
 /// emitted Python can only nest that deep if the source does.

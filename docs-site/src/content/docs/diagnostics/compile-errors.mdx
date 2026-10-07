@@ -159,6 +159,18 @@ src/main.ty                       # from typhon_runtime import helper … Ok(hel
 
 **Fix:** rename the module (for example to `runtime_helpers`) and update its imports.
 
+## `tyc::unsupported_syntax_for_target`
+
+The file uses Python syntax the project's `[python] target` cannot parse, such as `[*xs for xs in lists]` (PEP 798, Python 3.15) in a project targeting 3.13, or `except A, B:` / `t"..."` (Python 3.14). The emitted `.py` would fail to compile on the target interpreter, so `tyc check`, `tyc build` and `tyc run` reject it. Typhon's own `lazy import` is not affected.
+
+```typhon
+# [python] target = "3.13"
+let flat: list[int] = [*xs for xs in lists]   # ❌ needs Python 3.15
+let flat: list[int] = [x for xs in lists for x in xs]   # ✅
+```
+
+**Fix:** raise `[python] target`, or use a form the target accepts.
+
 ## `tyc::unknown_module` (warning)
 
 In a project with a `typhon.toml`, an import names a module that is not in

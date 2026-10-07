@@ -1109,6 +1109,31 @@ assert d[y] == 2
     }
 
     #[test]
+    fn pep_798_unpacking_comprehensions() {
+        assert_eq!(
+            run_capturing(
+                r###"let lists = [[1, 2], [3], []]
+assert [*xs for xs in lists] == [1, 2, 3]
+assert {*xs for xs in lists} == {1, 2, 3}
+assert {**d for d in [{"a": 1}, {"b": 2, "a": 3}]} == {"a": 3, "b": 2}
+let g = (*xs for xs in lists)
+assert next(g) == 1
+assert list(g) == [2, 3]
+assert [*range(n) for n in range(4) if n % 2 == 1] == [0, 0, 1, 2]
+assert [*a for xs in [[[1], [2]], [[3]]] for a in xs] == [1, 2, 3]
+try:
+    print({**x for x in [1]})
+    assert False
+except TypeError as e:
+    assert str(e) == "'int' object is not a mapping"
+"###
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn freeze_passes_immutable_values_through_like_the_runtime() {
         // The emitted runtime's `deep_freeze` returns enum members, dates,
         // timedeltas, timezones and paths unchanged; the VM must too.

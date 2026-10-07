@@ -154,6 +154,10 @@ pub struct LintOptions {
     /// `[strictness] parallel-min-size` — matches the rewrite's threshold so
     /// the advice fires on exactly the shapes that would be rewritten.
     pub parallel_min_size: u64,
+    /// `[python] target` as `(major, minor)`. When set, syntax that target
+    /// cannot parse is reported as `tyc::unsupported_syntax_for_target` (an
+    /// error). `None` skips the check.
+    pub python_target: Option<(u8, u8)>,
 }
 
 impl Default for LintOptions {
@@ -171,6 +175,7 @@ impl Default for LintOptions {
             auto_parallel: false,
             auto_parallel_reductions: false,
             parallel_min_size: 64,
+            python_target: None,
         }
     }
 }
@@ -211,6 +216,33 @@ pub fn gather_opportunity_diagnostics(module: &ModModule, path: &str, source: &s
 /// are already `lazy`, the module's `pub` names, and whether it has a
 /// `pub *`. Pass [`perf::PerfLintContext::default`] when they're
 /// unavailable (a standalone buffer); the perf family degrades gracefully.
+/// `tyc::unsupported_syntax_for_target`: every construct in the
+/// preprocessed `source` that Python `major.minor` cannot parse.
+///
+/// The front end parses against the newest grammar, so without this a
+/// 3.15-only construct (`[*xs for xs in lists]`) type-checks on a 3.13
+/// target, `tyc build` copies it into the `.py`, and CPython 3.13 refuses to
+/// compile it. Every hit is code that already failed on its target, so the
+/// check narrows nothing that ran. Spans are offsets into `source`; callers
+/// remap them to the `.ty` text like their other diagnostics.
+///
+/// `source` must be preprocessed with Typhon's `lazy import` still in a
+/// form every target parses (either expansion does: the native PEP 810
+/// statement only appears in a 3.15 build's emitted Python).
+pub fn target_syntax_diagnostics(path: &str, source: &str, major: u8, minor: u8) -> Diagnostics {
+    let mut diags = Diagnostics::new();
+    for hit in tyc_syntax::unsupported_syntax(source, major, minor) {
+        diags.push_error(TycError::unsupported_syntax_for_target(
+            hit.message,
+            path.to_owned(),
+            source.to_owned(),
+            usize::from(hit.range.start()),
+            usize::from(hit.range.len()),
+        ));
+    }
+    diags
+}
+
 pub fn editor_lint_diagnostics(
     module: &ModModule,
     path: &str,
@@ -223,6 +255,12 @@ pub fn editor_lint_diagnostics(
     // here. It is an error, not a lint, so it runs on the shared check
     // pipeline in `tyc-db` — which `tyc build` also reaches, and this hook
     // does not. Calling it from both would double-report it in `tyc check`.
+    // The one error raised here rather than in `tyc-db`: the check needs
+    // `[python] target`, which the shared pipeline does not carry.
+    // `tyc build` calls `target_syntax_diagnostics` itself.
+    if let Some((major, minor)) = opts.python_target {
+        diags.extend(target_syntax_diagnostics(path, source, major, minor));
+    }
     diags.extend(analyse_empty_collection_bindings(module, path, source));
     diags.extend(analyse_typing_alias_annotations(module, path, source));
     diags.extend(analyse_mutable_default_params(module, path, source));
@@ -7858,6 +7896,75 @@ mod lint_tests {
     }
 
     // ── Shared editor / CLI advisory aggregator ─────────────────────────────
+
+    fn error_codes(diags: &Diagnostics) -> Vec<String> {
+        diags
+            .errors()
+            .iter()
+            .filter_map(|e| e.code().map(|c| c.to_string()))
+            .collect()
+    }
+
+    fn target_errors(src: &str, target: (u8, u8)) -> Vec<String> {
+        let prep = tyc_syntax::preprocess::expand_and_preprocess_mapped(src, false);
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .expect("parse failed")
+            .into_syntax();
+        let opts = LintOptions {
+            python_target: Some(target),
+            ..LintOptions::default()
+        };
+        let diags = editor_lint_diagnostics(
+            &module,
+            "x.ty",
+            &prep.python_source,
+            opts,
+            &PerfLintContext::default(),
+        );
+        error_codes(&diags)
+    }
+
+    #[test]
+    fn target_syntax_flags_3_15_comprehension_unpacking_on_3_13() {
+        let src = "let lists = [[1], [2]]\nlet flat = [*xs for xs in lists]\n";
+        let on_313 = target_errors(src, (3, 13));
+        assert!(
+            on_313
+                .iter()
+                .any(|c| c.contains("unsupported_syntax_for_target")),
+            "expected unsupported_syntax_for_target on 3.13; got {on_313:?}"
+        );
+        assert!(
+            target_errors(src, (3, 15)).is_empty(),
+            "3.15 has comprehension unpacking"
+        );
+    }
+
+    #[test]
+    fn target_syntax_ignores_typhon_lazy_import() {
+        // Typhon's own `lazy import` predates PEP 810 and works on every
+        // target; it must not be judged against the target grammar.
+        let src = "lazy import json\nprint(json.dumps(1))\n";
+        assert!(
+            target_errors(src, (3, 13)).is_empty(),
+            "Typhon lazy import is valid on 3.13"
+        );
+    }
+
+    #[test]
+    fn target_syntax_check_is_off_without_a_target() {
+        let src = "let flat = [*xs for xs in [[1]]]\n";
+        let prep = preprocess(src);
+        let module = parse(src);
+        let diags = editor_lint_diagnostics(
+            &module,
+            "x.ty",
+            &prep.python_source,
+            LintOptions::default(),
+            &PerfLintContext::default(),
+        );
+        assert!(error_codes(&diags).is_empty());
+    }
 
     #[test]
     fn editor_lint_diagnostics_bundles_gather_and_lints() {

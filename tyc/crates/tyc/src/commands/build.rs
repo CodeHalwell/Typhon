@@ -483,6 +483,11 @@ pub fn run(args: BuildArgs) -> Result<()> {
             &project_shapes,
         );
         all_phase1_diags.extend(file_diags);
+        all_phase1_diags.extend(crate::commands::check::check_target_syntax(
+            &path.to_string_lossy(),
+            source,
+            &config.python.target,
+        ));
     }
 
     // Apply strictness rules (e.g. promote unused-import warnings to errors).
