@@ -69,3 +69,6 @@
 ## 2024-08-23 - [Remove tabindex="0" from abbr tags]
 **Learning:** Adding `tabindex="0"` to non-interactive `<abbr>` elements makes them focusable for screen readers but fails WCAG 1.4.13 (Content on Hover or Focus) for sighted keyboard users. Standard browser tooltips (`title` attribute) do not display on keyboard focus, making this pattern inaccessible.
 **Action:** Removed `tabindex="0"` from `<abbr>` tags. If tooltips are needed for keyboard users, a custom tooltip component must be used instead of relying on the native `title` attribute on `<abbr>`.
+## 2026-06-28 - [Equitable tactile feedback for Hero buttons]
+**Learning:** Found that primary CTA `.sl-link-button` components on the hero landing page lacked hover and active transitions, failing to provide tactile feedback while surrounding `.sl-link-card` elements did.
+**Action:** Added hover/focus/active transitions with `transform: translateY` and `box-shadow` directly to `.sl-link-button` and its `.minimal` variant. Crucially, updated the `@media (prefers-reduced-motion: reduce)` block to explicitly nullify these transforms and transitions for accessibility compliance.
