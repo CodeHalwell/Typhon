@@ -6271,6 +6271,35 @@ impl Interpreter {
         if let Some(s) = self.enum_member_repr(v) {
             return Ok(s);
         }
+        // An exception's `str()` renders its arguments, which may have a
+        // user `__str__` / `__repr__`.
+        if let Value::Exception { kind, args, .. } = v {
+            let os_error_form = args.len() >= 2 && crate::builtins::is_os_error_kind(kind);
+            let plain = !crate::value::is_exception_group_kind(kind) && !os_error_form;
+            if plain {
+                match args.len() {
+                    0 => {}
+                    1 if kind.as_str() == "KeyError" => return self.repr_of(&args[0]),
+                    1 => return self.str_of(&args[0]),
+                    _ => return self.repr_of(&Value::Tuple(args.clone())),
+                }
+            }
+        }
+        // The same for a user exception class that doesn't define `__str__`.
+        if let Value::Instance(i) = v {
+            if let Some(args) = crate::value::exception_instance_args(i) {
+                if self.find_method(&i.class, "__str__").is_none() {
+                    match args.len() {
+                        0 => {}
+                        1 if crate::value::class_derives_from_keyerror(&i.class) => {
+                            return self.repr_of(&args[0])
+                        }
+                        1 => return self.str_of(&args[0]),
+                        _ => return self.repr_of(&Value::Tuple(args)),
+                    }
+                }
+            }
+        }
         if Self::is_container(v) {
             // `str(x)` and `repr(x)` agree for every container except a
             // frozen dict: CPython's `mappingproxy` delegates `__str__` to
@@ -6483,6 +6512,26 @@ impl Interpreter {
                 } else {
                     format!("{{{body}}}")
                 })
+            }
+            // `repr(KeyError(obj))` shows each argument's own repr, which
+            // may be a user `__repr__` (a group's `(message, subs)` too).
+            Value::Exception { kind, args, .. } if !args.is_empty() => {
+                let mut parts = Vec::with_capacity(args.len());
+                for a in args.iter() {
+                    parts.push(self.repr_of_depth(a, depth + 1)?);
+                }
+                Ok(format!("{kind}({})", parts.join(", ")))
+            }
+            Value::Instance(i)
+                if crate::value::exception_instance_args(i).is_some()
+                    && self.find_method(&i.class, "__repr__").is_none() =>
+            {
+                let args = crate::value::exception_instance_args(i).unwrap_or_default();
+                let mut parts = Vec::with_capacity(args.len());
+                for a in args.iter() {
+                    parts.push(self.repr_of_depth(a, depth + 1)?);
+                }
+                Ok(format!("{}({})", i.class.name, parts.join(", ")))
             }
             // Scalars, instances (incl. enum members → `instance_repr`),
             // Result Ok/Err, etc. keep the existing dunder / `py_repr` path.
@@ -8423,6 +8472,21 @@ impl Interpreter {
                 "message" if crate::value::is_exception_group_kind(kind.as_str()) => {
                     Ok(Value::Str(message.clone()))
                 }
+                // `eg.split(T)` / `eg.subgroup(T)` / `eg.derive(excs)`.
+                "split" | "subgroup" | "derive"
+                    if crate::value::is_exception_group_kind(kind.as_str()) =>
+                {
+                    let group = value.clone();
+                    let method: &'static str = match attr {
+                        "split" => "split",
+                        "subgroup" => "subgroup",
+                        _ => "derive",
+                    };
+                    Ok(Value::Native(Rc::new(NativeFn::new(
+                        method,
+                        move |interp, args| interp.exception_group_method(&group, method, args),
+                    ))))
+                }
                 _ => Err(attribute_error(format!(
                     "'{}' has no attribute '{}'",
                     kind, attr
@@ -9929,6 +9993,9 @@ impl Interpreter {
                 rest.push(sub);
             }
         }
+        // A derived side keeps the source group's cause, context and
+        // traceback, as CPython's `split` copies them.
+        let chain = crate::value::exception_chain(group);
         let build = |items: Vec<Value>| {
             if items.is_empty() {
                 None
@@ -9939,10 +10006,143 @@ impl Interpreter {
                 // by `except* ValueError` binds an *ExceptionGroup* on the
                 // matched side (verified on 3.13), not the parent's kind.
                 let kind = crate::value::exception_group_kind_for(&items);
-                Some(crate::value::make_exception_group(
-                    kind, &message, items, false,
+                Some(crate::value::with_exception_chain(
+                    crate::value::make_exception_group(kind, &message, items, false),
+                    chain.clone(),
                 ))
             }
+        };
+        Ok((build(matched), build(rest)))
+    }
+
+    /// `BaseExceptionGroup.split` / `.subgroup` / `.derive` called as
+    /// methods. The condition is an exception type, a tuple of them, or a
+    /// predicate called with each exception (the group itself first).
+    fn exception_group_method(
+        &mut self,
+        group: &Value,
+        method: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, Unwind> {
+        let [arg] = <[Value; 1]>::try_from(args).map_err(|a| {
+            type_error(format!(
+                "{method}() takes exactly one argument ({} given)",
+                a.len()
+            ))
+        })?;
+        if method == "derive" {
+            let message = match group {
+                Value::Exception { message, .. } => (**message).clone(),
+                _ => String::new(),
+            };
+            let items = match &arg {
+                Value::List(l) => l.borrow().clone(),
+                Value::Tuple(t) => (**t).clone(),
+                other => {
+                    return Err(type_error(format!(
+                        "second argument (exceptions) must be a sequence, not {}",
+                        other.type_display_name()
+                    )))
+                }
+            };
+            if items.is_empty() {
+                return Err(Unwind::Exception(crate::error::VmException::new(
+                    "ValueError",
+                    "second argument (exceptions) must be a non-empty sequence",
+                )));
+            }
+            if let Some(i) = items
+                .iter()
+                .position(|v| !crate::value::is_exception_value(v))
+            {
+                return Err(Unwind::Exception(crate::error::VmException::new(
+                    "ValueError",
+                    format!("Item {i} of second argument (exceptions) is not an exception"),
+                )));
+            }
+            let kind = crate::value::exception_group_kind_for(&items);
+            return Ok(crate::value::make_exception_group(
+                kind,
+                &message,
+                items,
+                matches!(arg, Value::Tuple(_)),
+            ));
+        }
+        let is_type = |v: &Value| match v {
+            Value::Class(c) => c.is_exception,
+            Value::Native(n) => builtin_exc_mro(n.name).is_some(),
+            _ => false,
+        };
+        let by_type = is_type(&arg) || matches!(&arg, Value::Tuple(t) if t.iter().all(is_type));
+        let callable = match &arg {
+            // A builtin type such as `bool` is a class, not a predicate.
+            Value::Native(n) => !crate::builtins::is_builtin_type_name(n.name),
+            Value::Function(_) | Value::BoundMethod { .. } => true,
+            Value::Instance(inst) => self.find_method(&inst.class, "__call__").is_some(),
+            _ => false,
+        };
+        if !by_type && !callable {
+            return Err(type_error(
+                "expected an exception type, a tuple of exception types, or a callable (other than a class)",
+            ));
+        }
+        let isinstance = self.builtin_globals.get("isinstance").cloned();
+        let mut matches = |interp: &mut Self, v: &Value| -> Result<bool, Unwind> {
+            let r = if by_type {
+                let f = isinstance.clone().unwrap_or(Value::None);
+                interp.call_value(f, vec![v.clone(), arg.clone()], &[])?
+            } else {
+                interp.call_value(arg.clone(), vec![v.clone()], &[])?
+            };
+            interp.is_truthy(&r)
+        };
+        let (m, r) = self.split_group_by(group, &mut matches)?;
+        Ok(match method {
+            "subgroup" => m.unwrap_or(Value::None),
+            _ => Value::Tuple(Rc::new(vec![
+                m.unwrap_or(Value::None),
+                r.unwrap_or(Value::None),
+            ])),
+        })
+    }
+
+    /// The splitting behind [`Self::split_exception_group`] with an
+    /// arbitrary leaf test.
+    fn split_group_by(
+        &mut self,
+        group: &Value,
+        matches: &mut dyn FnMut(&mut Self, &Value) -> Result<bool, Unwind>,
+    ) -> Result<(Option<Value>, Option<Value>), Unwind> {
+        if matches(self, group)? {
+            return Ok((Some(group.clone()), None));
+        }
+        let message = match group {
+            Value::Exception { message, .. } => (**message).clone(),
+            _ => return Ok((None, Some(group.clone()))),
+        };
+        let subs = crate::value::exception_group_subs(group).unwrap_or_default();
+        let mut matched: Vec<Value> = Vec::new();
+        let mut rest: Vec<Value> = Vec::new();
+        for sub in subs {
+            if crate::value::exception_group_subs(&sub).is_some() {
+                let (m, r) = self.split_group_by(&sub, matches)?;
+                matched.extend(m);
+                rest.extend(r);
+            } else if matches(self, &sub)? {
+                matched.push(sub);
+            } else {
+                rest.push(sub);
+            }
+        }
+        let chain = crate::value::exception_chain(group);
+        let build = |items: Vec<Value>| {
+            (!items.is_empty()).then(|| {
+                let kind = crate::value::exception_group_kind_for(&items);
+                crate::value::with_exception_chain(
+                    crate::value::make_exception_group(kind, &message, items, false),
+                    chain.clone(),
+                )
+            })
         };
         Ok((build(matched), build(rest)))
     }
