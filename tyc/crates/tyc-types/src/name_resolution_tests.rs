@@ -3608,3 +3608,40 @@ main()
 "#,
     );
 }
+
+/// A `plain class` declared in a class body that shares a module class's
+/// name is called as the plain class it is inside that body — directly and
+/// in a class body nested in a function.
+#[test]
+fn a_class_body_plain_class_keeps_its_kind() {
+    assert_clean(
+        r#"
+class Point:
+    x: int
+    y: int
+
+class Holder:
+    plain class Point:
+        x: int = 7
+    print(Point().x)
+
+print(Holder.__name__)
+"#,
+    );
+    assert_clean(
+        r#"
+class Point:
+    x: int
+    y: int
+
+def make() -> None:
+    class H:
+        plain class Point:
+            x: int = 7
+        print(Point().x)
+    print(H.__name__)
+
+make()
+"#,
+    );
+}

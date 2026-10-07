@@ -18228,13 +18228,64 @@ fn scope_class_kinds_to_module(c: &mut Checker, module: &ModModule) {
     let Some(kinds) = declared_class_kinds(c, &defs) else {
         return;
     };
+    // Class bodies get no scoped view of their own (function bodies do), so
+    // a name some class body declares `plain` / `class!` keeps the
+    // name-keyed membership it always had.
+    let mut nested = Vec::new();
+    class_body_class_defs(&module.body, false, &mut nested);
+    let nested = declared_class_kinds(c, &nested).unwrap_or_default();
+    let nested_plain = |name: &str| nested.get(name).is_some_and(|k| k.0);
+    let nested_raw = |name: &str| nested.get(name).is_some_and(|k| k.1);
     for (name, (plain, raw)) in kinds {
-        if !plain {
+        if !plain && !nested_plain(&name) {
             c.plain_classes.remove(&name);
         }
-        if !raw {
+        if !raw && !nested_raw(&name) {
             c.raw_classes.remove(&name);
         }
+    }
+}
+
+/// Every class declared directly in some class body under `body`, at any
+/// depth (function bodies and compound statements included); `in_class`
+/// says whether `body` itself is a class body.
+fn class_body_class_defs<'a>(
+    body: &'a [Stmt],
+    in_class: bool,
+    out: &mut Vec<&'a ruff_python_ast::StmtClassDef>,
+) {
+    use ruff_python_ast::visitor::{walk_stmt, Visitor};
+    struct Collect<'a, 'o> {
+        in_class: bool,
+        out: &'o mut Vec<&'a ruff_python_ast::StmtClassDef>,
+    }
+    impl<'a> Visitor<'a> for Collect<'a, '_> {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            match stmt {
+                Stmt::ClassDef(cd) => {
+                    if self.in_class {
+                        self.out.push(cd);
+                    }
+                    let saved = std::mem::replace(&mut self.in_class, true);
+                    for s in &cd.body {
+                        self.visit_stmt(s);
+                    }
+                    self.in_class = saved;
+                }
+                Stmt::FunctionDef(f) => {
+                    let saved = std::mem::replace(&mut self.in_class, false);
+                    for s in &f.body {
+                        self.visit_stmt(s);
+                    }
+                    self.in_class = saved;
+                }
+                _ => walk_stmt(self, stmt),
+            }
+        }
+    }
+    let mut collect = Collect { in_class, out };
+    for stmt in body {
+        collect.visit_stmt(stmt);
     }
 }
 
