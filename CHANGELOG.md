@@ -19,7 +19,8 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   cached so `(A | B) is (B | A)`; a `Flag` given an undeclared bit raises
   CPython's `invalid value` error while an `IntFlag` keeps it; negative
   values (`Perm(-1)`, `Perm.R | -8`) follow CPython's boundary rules; and
-  `auto()` after a multi-bit member picks the next free bit.
+  `auto()` after a multi-bit member picks the next free bit. `P.B | True`
+  keeps the `IntFlag` type.
 - **`del` under `tyc run`.** `del (a, b)` and `del [xs[0], d["k"]]` work
   instead of raising `NotImplementedError`; `del` honours `global` and
   `nonlocal` declarations; `del` in a class body unbinds the class
@@ -37,7 +38,8 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   `__anext__` now runs just before the body that consumes its item, and a
   plain `for` or `list()` over such an object raises CPython's
   `TypeError` instead of driving `__anext__`. `async for` over a list,
-  tuple, string, dict, set, range or a class without `__aiter__`, or over
+  tuple, string, dict, set, range, a synchronous iterator or generator, or
+  a class without `__aiter__`, or over
   an `async def __aiter__`, raises CPython's `TypeError` too, where the VM
   iterated it. Async comprehensions (`[x async for x in it]`) follow the
   same protocol, and a plain value returned from a synchronous `__anext__`
@@ -59,7 +61,8 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 - **`tyc run` sends more programs it cannot run faithfully to CPython.**
   A class with a custom `metaclass=` (anything but the real `ABCMeta` or
   `type`, including `abc.ABCMeta` after the program reassigns it or
-  `setattr`s it, and `ABCMeta` read off a computed value), a class defining or assigning `__del__`, and any use of `with_traceback` / `__traceback__`
+  `setattr`s it, `ABCMeta` read off a computed value, and the `abc` module itself under
+  an `ABCMeta` alias), a class defining or assigning `__del__`, and any use of `with_traceback` / `__traceback__`
   now take the compiled path with a `note:`. Before, the VM silently
   skipped the metaclass and the finaliser, and raised `AttributeError` for
   the traceback attributes.

@@ -608,6 +608,7 @@ class Other(IntFlag):
 show(list(N.A), list(N(7)), list(N), len(N.A), repr(Other.Y & Q.A), type(Q.A | Other.Y).__name__, int(Q.A ^ Other.Y))
 trap("foreign in", lambda: Q.A in Other.Y)
 trap("int in", lambda: 1 in Other.Y)
+show(repr(Q.B | True), repr(Q.B & True), repr(Q.B ^ True), repr(True | Q.B))
 trap("strict", lambda: C(8))
 class Neg(Flag):
     A = 1
@@ -785,6 +786,13 @@ plain class SyncOnly:
     def __iter__(self) -> object:
         return iter([1])
 trap("sync instance", lambda: asyncio.run(over(SyncOnly())))
+trap("sync iterator", lambda: asyncio.run(over(iter([1]))))
+def sync_gen() -> object:
+    yield 1
+trap("sync generator", lambda: asyncio.run(over(sync_gen())))
+async def agen() -> object:
+    yield 2
+asyncio.run(over(agen()))
 plain class CoroAiter:
     async def __aiter__(self) -> "CoroAiter":
         return self

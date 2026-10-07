@@ -678,6 +678,10 @@ fn unmodelled_attribute_references(
         || scan.metaclass_attrs.iter().any(|attr| {
             scan.stored_attributes.contains(attr) || scan.stored_attributes.contains("*")
         })
+        || scan
+            .metaclass_bare_names
+            .iter()
+            .any(|name| scan.abc_module_names.contains(name))
     {
         missing.insert("a custom metaclass".to_owned());
     }
@@ -818,6 +822,11 @@ struct AttributeScan {
     /// `abc.ABCMeta`): modelled only while no attribute of that name is
     /// ever stored or deleted (`abc.ABCMeta = Custom`).
     metaclass_attrs: Vec<String>,
+    /// Names bound to the `abc` module itself (`import abc as ABCMeta`).
+    abc_module_names: std::collections::HashSet<String>,
+    /// Each bare-name metaclass spelling (`metaclass=ABCMeta`): not the real
+    /// class when that name is the `abc` module.
+    metaclass_bare_names: Vec<String>,
     /// Every attribute name the program stores or deletes, directly or by
     /// `setattr` / `delattr` (`*` when the name is not a literal).
     stored_attributes: std::collections::HashSet<String>,
@@ -1037,6 +1046,8 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                         Some(asname) => {
                             if module != "abc" {
                                 self.program_bound.insert(asname.as_str().to_owned());
+                            } else {
+                                self.abc_module_names.insert(asname.as_str().to_owned());
                             }
                             self.bind_import(asname.as_str(), module)
                         }
@@ -1045,6 +1056,8 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                             let root = module.split('.').next().unwrap_or(module);
                             if root != "abc" {
                                 self.program_bound.insert(root.to_owned());
+                            } else {
+                                self.abc_module_names.insert(root.to_owned());
                             }
                             self.bind_import(root, root);
                         }
@@ -1107,8 +1120,14 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                             Some(root) => self.metaclass_roots.push(root.to_owned()),
                             None => custom_metaclass = true,
                         }
-                        if let ruff_python_ast::Expr::Attribute(a) = &kw.value {
-                            self.metaclass_attrs.push(a.attr.as_str().to_owned());
+                        match &kw.value {
+                            ruff_python_ast::Expr::Attribute(a) => {
+                                self.metaclass_attrs.push(a.attr.as_str().to_owned())
+                            }
+                            ruff_python_ast::Expr::Name(n) => {
+                                self.metaclass_bare_names.push(n.id.as_str().to_owned())
+                            }
+                            _ => {}
                         }
                     } else {
                         custom_metaclass = true;
@@ -1522,6 +1541,11 @@ mod tests {
                 .unwrap_or_default()
                 .contains(&"a custom metaclass".to_owned()));
         }
+        let module_alias =
+            "import abc as ABCMeta\nplain class W(metaclass=ABCMeta):\n    pass\nprint(W())\n";
+        assert!(scan_source(module_alias)
+            .unwrap_or_default()
+            .contains(&"a custom metaclass".to_owned()));
         let computed = "import abc\ndef holder() -> object:\n    return abc\nplain class W(metaclass=holder().ABCMeta):\n    pass\nprint(W())\n";
         assert!(scan_source(computed)
             .unwrap_or_default()

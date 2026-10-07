@@ -6799,6 +6799,14 @@ impl Interpreter {
                         .zip(n.to_i64())
                         .map(|bits| (fi.class.clone(), bits))
                 }
+                // `P.B | True` keeps the flag type; `True | P.B` is
+                // `bool.__or__`'s plain int, handled below.
+                (Value::Instance(fi), Value::Bool(b))
+                    if crate::value::is_int_flag_class(&fi.class) =>
+                {
+                    crate::value::flag_member_bits(l)
+                        .map(|bits| (fi.class.clone(), (bits, *b as i64)))
+                }
                 _ => Option::None,
             };
             if let Some((class, (lb, rb))) = flag_operands {
@@ -12048,16 +12056,28 @@ fn resume_mismatch(frame: &ResumeFrame) -> Unwind {
 /// `async for` over a builtin synchronous container is CPython's
 /// `TypeError`: none of them defines `__aiter__`.
 fn reject_sync_only_async_iterable(v: &Value) -> Result<(), Unwind> {
-    if matches!(
-        v,
-        Value::List(_)
-            | Value::Tuple(_)
-            | Value::Str(_)
-            | Value::Bytes(_)
-            | Value::Dict(_)
-            | Value::Set(_)
-            | Value::Range { .. }
-    ) {
+    // A synchronous iterator (`iter(xs)`, a sync generator) has no
+    // `__aiter__` either; only an async generator's iterator does.
+    let sync_iterator = match v {
+        Value::Iter(it) => match &*it.borrow() {
+            IterState::Generator(g) => !g.borrow().function.is_async,
+            IterState::AsyncUserIter(_) => false,
+            _ => true,
+        },
+        _ => false,
+    };
+    if sync_iterator
+        || matches!(
+            v,
+            Value::List(_)
+                | Value::Tuple(_)
+                | Value::Str(_)
+                | Value::Bytes(_)
+                | Value::Dict(_)
+                | Value::Set(_)
+                | Value::Range { .. }
+        )
+    {
         return Err(type_error(format!(
             "'async for' requires an object with __aiter__ method, got {}",
             v.type_display_name()
