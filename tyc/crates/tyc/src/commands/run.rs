@@ -1101,8 +1101,11 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                         continue;
                     }
                     if matches!(base_last_segment(&kw.value), Some("ABCMeta") | Some("type")) {
-                        if let Some(root) = expr_root_name(&kw.value) {
-                            self.metaclass_roots.push(root.to_owned());
+                        // Only a name or a dotted chain off a name is
+                        // trusted: `get_holder().ABCMeta` could be anything.
+                        match expr_root_name(&kw.value) {
+                            Some(root) => self.metaclass_roots.push(root.to_owned()),
+                            None => custom_metaclass = true,
                         }
                         if let ruff_python_ast::Expr::Attribute(a) = &kw.value {
                             self.metaclass_attrs.push(a.attr.as_str().to_owned());
@@ -1519,6 +1522,10 @@ mod tests {
                 .unwrap_or_default()
                 .contains(&"a custom metaclass".to_owned()));
         }
+        let computed = "import abc\ndef holder() -> object:\n    return abc\nplain class W(metaclass=holder().ABCMeta):\n    pass\nprint(W())\n";
+        assert!(scan_source(computed)
+            .unwrap_or_default()
+            .contains(&"a custom metaclass".to_owned()));
         let header = "def cleanup(self: object) -> None:\n    print(\"bye\")\nplain class D:\n    def f(self, x: object = (__del__ := cleanup)) -> None:\n        pass\nprint(D())\n";
         assert!(scan_source(header)
             .unwrap_or_default()

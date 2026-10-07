@@ -23,7 +23,8 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 - **`del` under `tyc run`.** `del (a, b)` and `del [xs[0], d["k"]]` work
   instead of raising `NotImplementedError`; `del` honours `global` and
   `nonlocal` declarations; `del` in a class body unbinds the class
-  attribute (a deleted method or property included); and deleting an unbound name raises `NameError` (module or
+  attribute (a deleted method or property included) and honours the class
+  body's own `global` / `nonlocal` declarations; and deleting an unbound name raises `NameError` (module or
   class scope) or `UnboundLocalError` (function scope) as CPython does,
   where the VM used to do nothing.
 - **`bytes.translate` and `bytes.maketrans` under `tyc run`.** Both were
@@ -39,7 +40,8 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   tuple, string, dict, set, range or a class without `__aiter__`, or over
   an `async def __aiter__`, raises CPython's `TypeError` too, where the VM
   iterated it. Async comprehensions (`[x async for x in it]`) follow the
-  same protocol.
+  same protocol, and a plain value returned from a synchronous `__anext__`
+  is CPython's `TypeError`.
 - **`tyc run` no longer runs a generator early without saying so.** A
   generator (or generator lambda) whose `yield` the VM cannot suspend (in
   a loop test, a `with` item, or two in one expression) ran its whole body at the call, so its
@@ -57,7 +59,7 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 - **`tyc run` sends more programs it cannot run faithfully to CPython.**
   A class with a custom `metaclass=` (anything but the real `ABCMeta` or
   `type`, including `abc.ABCMeta` after the program reassigns it or
-  `setattr`s it), a class defining or assigning `__del__`, and any use of `with_traceback` / `__traceback__`
+  `setattr`s it, and `ABCMeta` read off a computed value), a class defining or assigning `__del__`, and any use of `with_traceback` / `__traceback__`
   now take the compiled path with a `note:`. Before, the VM silently
   skipped the metaclass and the finaliser, and raised `AttributeError` for
   the traceback attributes.

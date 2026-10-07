@@ -659,6 +659,14 @@ plain class Kept:
     del a
     del (b, c)
 show(hasattr(Kept, "a"), hasattr(Kept, "b"), hasattr(Kept, "c"))
+mut gx = 1
+mut gy = 1
+plain class Decl:
+    global gx, gy
+    del gx
+    gy = 5
+trap("gx gone", lambda: gx)
+show(gy, hasattr(Decl, "gy"))
 plain class Gone:
     def f(self) -> int:
         return 1
@@ -787,6 +795,12 @@ plain class GenAiter:
     async def __aiter__(self) -> object:
         yield 7
 asyncio.run(over(GenAiter()))
+plain class SyncAnext:
+    def __aiter__(self) -> "SyncAnext":
+        return self
+    def __anext__(self) -> int:
+        return 1
+trap("sync anext", lambda: asyncio.run(over(SyncAnext())))
 async def comp() -> None:
     show("comp", [x async for x in Both()])
 asyncio.run(comp())

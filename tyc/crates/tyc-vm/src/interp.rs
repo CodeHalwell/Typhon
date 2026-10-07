@@ -2007,10 +2007,15 @@ impl Interpreter {
                     for t in &a.targets {
                         if let Expr::Name(n) = t {
                             body_ns.set(n.id.as_str(), v.clone());
-                            class_attrs.insert(n.id.as_str().to_owned(), v.clone());
+                            // A `global` / `nonlocal` name binds outside the
+                            // class, not as a class attribute.
+                            if !body_ns.declared_outer(n.id.as_str()) {
+                                class_attrs.insert(n.id.as_str().to_owned(), v.clone());
+                            }
                         }
                     }
                 }
+                Stmt::Global(_) | Stmt::Nonlocal(_) => self.exec_stmt(stmt, &body_ns)?,
                 // `del name` unbinds a class attribute; an absent one is a
                 // `NameError`, as in CPython's class namespace.
                 Stmt::Delete(d) => {
@@ -9045,6 +9050,29 @@ impl Interpreter {
             // `StopAsyncIteration` as the end.
             Recurse::AsyncUserIter(obj) => {
                 let step = match self.call_dunder0(&obj, "__anext__") {
+                    // A plain value is not awaitable (a sync `def __anext__`).
+                    Ok(Some(item))
+                        if matches!(
+                            item,
+                            Value::None
+                                | Value::Bool(_)
+                                | Value::Int(_)
+                                | Value::FloatData(_)
+                                | Value::Complex(..)
+                                | Value::Str(_)
+                                | Value::Bytes(_)
+                                | Value::List(_)
+                                | Value::Tuple(_)
+                                | Value::Dict(_)
+                                | Value::Set(_)
+                                | Value::Range { .. }
+                        ) =>
+                    {
+                        Err(type_error(format!(
+                            "'async for' received an invalid object from __anext__: {}",
+                            item.type_display_name()
+                        )))
+                    }
                     Ok(Some(coro)) => self.force_awaitable(coro),
                     Ok(None) => return Ok(None),
                     Err(e) => Err(e),

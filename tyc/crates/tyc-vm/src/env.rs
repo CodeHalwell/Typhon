@@ -140,6 +140,11 @@ impl Env {
         self.nonlocals.borrow_mut().insert(name.to_string());
     }
 
+    /// Whether `name` is declared `global` or `nonlocal` in this scope.
+    pub fn declared_outer(&self, name: &str) -> bool {
+        self.globals.borrow().contains(name) || self.nonlocals.borrow().contains(name)
+    }
+
     /// Look up `name` in this scope only (no parent walk).
     pub fn get_own(&self, name: &str) -> Option<Value> {
         if let Some(info) = &self.slot_info {
