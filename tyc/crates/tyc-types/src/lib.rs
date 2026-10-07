@@ -21930,9 +21930,49 @@ fn names_collections_class(c: &Checker, head: &str) -> bool {
                     "collections" | "typing" | "typing_extensions"
                 )
         }),
-        // `collections.Counter[str]`, or a type reached through a signature.
-        None => !c.class_shapes.contains_key(head),
+        // `collections.Counter[str]`, or a type reached through a signature —
+        // unless a class of that name is declared anywhere this program could
+        // mean instead: a function-local class here, or a class in another
+        // project module reached through its signatures.
+        None => {
+            !c.class_shapes.contains_key(head)
+                && !c
+                    .module_registry
+                    .values()
+                    .any(|m| m.class_shapes.contains_key(head))
+                && !c
+                    .module
+                    .is_some_and(|m| declares_class_named(&m.body, head))
+        }
     }
+}
+
+/// Whether `body` declares a class named `name` at any depth (function and
+/// class bodies included).
+fn declares_class_named(body: &[Stmt], name: &str) -> bool {
+    use ruff_python_ast::visitor::{walk_stmt, Visitor};
+    struct Find<'n> {
+        name: &'n str,
+        found: bool,
+    }
+    impl<'a> Visitor<'a> for Find<'_> {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            if let Stmt::ClassDef(cd) = stmt {
+                if cd.name.as_str() == self.name {
+                    self.found = true;
+                    return;
+                }
+            }
+            if !self.found {
+                walk_stmt(self, stmt);
+            }
+        }
+    }
+    let mut find = Find { name, found: false };
+    for stmt in body {
+        find.visit_stmt(stmt);
+    }
+    find.found
 }
 
 /// The module-level `freeze let` binding `expr` reads, directly or through

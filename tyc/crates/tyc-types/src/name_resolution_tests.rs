@@ -3544,3 +3544,24 @@ if __name__ == "__main__":
 "#,
     );
 }
+
+/// A user class that shares a collections class's name (`Counter`) keeps its
+/// own `get`, here declared inside a function.
+#[test]
+fn a_local_class_named_like_a_collections_class_keeps_its_own_get() {
+    assert_clean(
+        r#"
+def main() -> None:
+    class Counter[T]:
+        n: int = 0
+
+        def get(self, key: T, default: int = 0) -> int:
+            return default + 10
+
+    let c: Counter[str] = Counter()
+    print(c.get("z", default=3))
+
+main()
+"#,
+    );
+}
