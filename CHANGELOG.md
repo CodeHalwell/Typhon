@@ -31,6 +31,12 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   once, so output interleaved differently from CPython and an endless
   source hit the 1,000,000-item cap even when the loop `break`s. Each
   `__anext__` now runs just before the body that consumes its item.
+- **`tyc run` no longer runs a generator early without saying so.** A
+  generator whose `yield` the VM cannot suspend (in a loop test, a `with`
+  item, or two in one expression) ran its whole body at the call, so its
+  side effects came out in the wrong order. The pre-run scan now sends such
+  a program to CPython with a `note:`, as it already does for unmodelled
+  modules. `--no-fallback` keeps the old behaviour.
 
 ### Documentation
 

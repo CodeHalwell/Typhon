@@ -506,6 +506,9 @@ fn unmodelled_references(path: &std::path::Path, entry: &std::path::Path) -> Opt
             continue;
         };
         missing.extend(unmodelled_attribute_references(&module, &mut exports));
+        if tyc_vm::module_has_eager_generator(&module) {
+            missing.insert("a generator whose yield the VM cannot suspend".into());
+        }
         for root in tyc_resolve::collect_imported_roots(&module) {
             if root == "re" {
                 missing.insert("re (Python regular-expression semantics)".into());
@@ -1241,6 +1244,25 @@ mod tests {
             scan_source("import json\nimport math\nprint(round(2.5, ndigits=0), int(\"ff\", base=16), math.prod([2], start=3), json.loads(\"{}\", object_hook=dict), \"a b\".split(maxsplit=1))\n"),
             None
         );
+    }
+
+    #[test]
+    fn scan_routes_eager_generators_to_cpython() {
+        // Two yields in one expression: the VM would run the body eagerly.
+        let eager =
+            "def g() -> object:\n    print(\"start\")\n    yield (yield 1)\nprint(list(g()))\n";
+        assert_eq!(
+            scan_source(eager),
+            Some(vec![
+                "a generator whose yield the VM cannot suspend".to_owned()
+            ])
+        );
+        // The same check reaches methods and nested functions.
+        let method = "plain class C:\n    def g(self) -> object:\n        def inner() -> object:\n            yield (yield 1)\n        return inner()\nprint(C())\n";
+        assert!(scan_source(method).is_some());
+        // An ordinary generator runs lazily and stays on the VM.
+        let lazy = "def g() -> object:\n    mut n = 0\n    while True:\n        yield n\n        n += 1\nprint(next(g()))\n";
+        assert_eq!(scan_source(lazy), None);
     }
 
     #[test]

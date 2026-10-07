@@ -992,6 +992,44 @@ const PYTHON_BUILTINS: &[&str] = &[
     "__debug__",
 ];
 
+/// Whether `module` defines a generator whose `yield` sits where the
+/// tree-walk cannot suspend (a loop test, a `with` item, two yields in one
+/// expression, …). The VM runs such a generator eagerly — its whole body at
+/// the call — so its side effects happen early and `send()` cannot reach it.
+/// `tyc run`'s pre-run scan sends a program that has one down the compiled
+/// path instead.
+pub fn module_has_eager_generator(module: &ruff_python_ast::ModModule) -> bool {
+    use ruff_python_ast::visitor::{self, Visitor};
+    use ruff_python_ast::Stmt;
+
+    #[derive(Default)]
+    struct Scan {
+        found: bool,
+    }
+    impl<'a> Visitor<'a> for Scan {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            if self.found {
+                return;
+            }
+            if let Stmt::FunctionDef(f) = stmt {
+                if matches!(
+                    interp::generator_kind(f.is_async, &f.body),
+                    value::GeneratorKind::Eager
+                ) {
+                    self.found = true;
+                    return;
+                }
+            }
+            visitor::walk_stmt(self, stmt);
+        }
+    }
+    let mut scan = Scan::default();
+    for stmt in &module.body {
+        scan.visit_stmt(stmt);
+    }
+    scan.found
+}
+
 /// Whether `name` is a CPython builtin the VM does not provide (`exec`,
 /// `memoryview`, `globals`). `tyc run`'s pre-run scan sends a program that
 /// uses one down the compiled path rather than into a `NameError`.

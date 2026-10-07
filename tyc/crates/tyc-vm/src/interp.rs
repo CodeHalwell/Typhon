@@ -11776,7 +11776,7 @@ pub(crate) fn stop_iteration_for(it: &Value) -> Unwind {
 
 /// Classify a function body: not a generator, a lazily-resumable generator,
 /// or one that must run eagerly (see [`GeneratorKind`]).
-fn generator_kind(is_async: bool, body: &[Stmt]) -> GeneratorKind {
+pub(crate) fn generator_kind(is_async: bool, body: &[Stmt]) -> GeneratorKind {
     // An `async def` containing a `yield` is an async *generator*, and the
     // resumable tree-walk drives it exactly as it drives a sync one — the
     // VM forces every `await` inline, so nothing in the body needs a

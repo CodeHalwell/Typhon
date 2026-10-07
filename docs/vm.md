@@ -614,7 +614,9 @@ message:
   expression falls back to eager collection: the body runs to completion
   at call time (capped at `GENERATOR_CAP = 1_000_000` items), so its side
   effects happen early, an unbounded one hits the cap, and `send()` /
-  `throw()` cannot reach it.
+  `throw()` cannot reach it. A plain `tyc run` therefore sends a program
+  with such a generator to CPython with a `note:`; only `--no-fallback`
+  keeps it on the VM.
 - Template strings (`t"…"`).
 - IPython escape commands.
 - A `with` / `async with` over anything that is neither `open()`, a
