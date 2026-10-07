@@ -1680,6 +1680,98 @@ asyncio.run(main())
     assert_eq!(blocking, 2, "{:?}", d.warnings());
 }
 
+// ── resource_not_managed: only the builtin / stdlib resource callees ─────
+
+fn resource_warnings(src: &str) -> Vec<String> {
+    check(src)
+        .warnings()
+        .iter()
+        .filter(|w| matches!(w, TycError::ResourceNotManaged { .. }))
+        .map(|w| w.to_string())
+        .collect()
+}
+
+#[test]
+fn a_user_binding_named_like_a_resource_callee_is_not_the_resource() {
+    // A module-level `def open` (the review repro), assigned and inline.
+    let door = r#"
+class Door:
+    name: str
+    is_open: bool
+
+def open(name: str) -> Door:
+    return Door(name=name, is_open=True)
+
+def front() -> bool:
+    let d = open("front")
+    return d.is_open
+
+def back() -> bool:
+    return open("back").is_open
+
+def main() -> None:
+    print(front(), back())
+
+if __name__ == "__main__":
+    main()
+"#;
+    assert!(
+        resource_warnings(door).is_empty(),
+        "{:?}",
+        resource_warnings(door)
+    );
+    // A parameter, a local and a loop target of the same name.
+    for src in [
+        "from collections.abc import Callable\n\ndef f(open: Callable[[str], int]) -> int:\n    let h = open(\"x\")\n    return h\n",
+        "from collections.abc import Callable\n\ndef f(socket: Callable[[], int]) -> int:\n    let s = socket()\n    return s\n",
+        "def mk(p: str) -> int:\n    return len(p)\n\ndef f() -> int:\n    let open = mk\n    let h = open(\"x\")\n    return h\n",
+        "from collections.abc import Callable\n\ndef f(fs: list[Callable[[str], int]]) -> int:\n    mut t = 0\n    for open in fs:\n        let h = open(\"x\")\n        t += h\n    return t\n",
+        "from collections.abc import Callable\n\ndef outer(open: Callable[[str], int]) -> Callable[[], int]:\n    def inner() -> int:\n        let h = open(\"x\")\n        return h\n    return inner\n",
+    ] {
+        assert!(resource_warnings(src).is_empty(), "{src}\n{:?}", resource_warnings(src));
+    }
+}
+
+#[test]
+fn builtin_and_stdlib_resource_callees_still_warn() {
+    let src = r#"
+import socket
+import tempfile
+
+def g(name: str) -> int:
+    return len(name)
+
+def f(path: str, open_: int) -> None:
+    let h = open(path)
+    let s = socket.socket()
+    let t = tempfile.TemporaryFile()
+    print(open(path).read(), g(path), open_)
+"#;
+    assert_eq!(
+        resource_warnings(src).len(),
+        4,
+        "{:?}",
+        resource_warnings(src)
+    );
+    // A same-named binding in a sibling function does not hide the builtin.
+    let sibling = r#"
+from collections.abc import Callable
+
+def a(open: Callable[[str], int]) -> int:
+    return open("x")
+
+def b(path: str) -> None:
+    let h = open(path)
+    print(h)
+"#;
+    assert_eq!(
+        resource_warnings(sibling).len(),
+        1,
+        "{:?}",
+        resource_warnings(sibling)
+    );
+}
+
 // ── dict.get is positional-only and takes one or two arguments ───────────
 
 #[test]

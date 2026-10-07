@@ -9727,16 +9727,42 @@ const REQUIRE_WITH_CALLEES: &[&str] = &[
     "tempfile.TemporaryFile",
 ];
 
-/// Return the dotted callee path of `expr` if it is a `Call` whose
-/// callee is a bare or dotted name; otherwise `None`. Used to match
-/// against [`REQUIRE_WITH_CALLEES`] without false positives on
-/// arbitrary expressions.
-fn dotted_callee_path(expr: &Expr) -> Option<String> {
-    let call = match expr {
-        Expr::Call(c) => c,
-        _ => return None,
+/// The [`REQUIRE_WITH_CALLEES`] entry `expr` calls, if it is a `Call`
+/// whose callee is a bare or dotted name in the table. The table is keyed
+/// on the builtin `open` and on stdlib module paths, so a head that an
+/// enclosing scope binds (a parameter, a local) or that module scope binds
+/// to anything but an import (a user `def open`) names some other callable.
+/// Phase C runs after the walk has left every scope, so bindings come from
+/// the resolver's scope table rather than the env.
+fn require_with_callee(c: &Checker, expr: &Expr) -> Option<String> {
+    let Expr::Call(call) = expr else {
+        return None;
     };
-    dotted_name_of(&call.func)
+    let name = dotted_name_of(&call.func)?;
+    if !REQUIRE_WITH_CALLEES.contains(&name.as_str()) {
+        return None;
+    }
+    let head = name.split('.').next().unwrap_or(&name);
+    let scopes = &c.resolved.scopes;
+    let innermost = c.resolved.scope_at_offset(expr.range().start().to_usize());
+    let mut id = Some(innermost);
+    while let Some(scope) = id.filter(|&i| i != 0).and_then(|i| scopes.get(i)) {
+        // A class body's names are not visible from functions nested in it.
+        let visible = scope.id == innermost || scope.kind != tyc_resolve::ScopeKind::Class;
+        if visible && scope.lookup_local(head).is_some() {
+            return None;
+        }
+        id = scope.parent;
+    }
+    let mut module_bindings = scopes
+        .first()
+        .into_iter()
+        .flat_map(|s| s.bindings.iter())
+        .filter(|b| b.name == head)
+        .peekable();
+    let user_bound =
+        module_bindings.peek().is_some() && module_bindings.all(|b| b.kind != BindingKind::Import);
+    (!user_bound).then_some(name)
 }
 
 fn dotted_name_of(expr: &Expr) -> Option<String> {
@@ -10213,11 +10239,13 @@ fn closed_in_later_finally(name: &str, rest: &[Stmt]) -> bool {
 /// or `None` when it stores it somewhere longer-lived (`self.fh = open(…)`
 /// hands it to an object that manages it) or closes it in a later
 /// `finally`.
-fn unmanaged_resource_assignment(targets: &[&Expr], value: &Expr, rest: &[Stmt]) -> Option<String> {
-    let name = dotted_callee_path(value)?;
-    if !REQUIRE_WITH_CALLEES.iter().any(|p| *p == name) {
-        return None;
-    }
+fn unmanaged_resource_assignment(
+    c: &Checker,
+    targets: &[&Expr],
+    value: &Expr,
+    rest: &[Stmt],
+) -> Option<String> {
+    let name = require_with_callee(c, value)?;
     let mut locals = Vec::new();
     for t in targets {
         match t {
@@ -10238,19 +10266,18 @@ fn unmanaged_resource_assignment(targets: &[&Expr], value: &Expr, rest: &[Stmt])
 /// handled by the statement walk, so only these two positions count.
 fn check_inline_resource_exprs(c: &mut Checker, stmt: &Stmt) {
     use ruff_python_ast::visitor::{walk_expr, Visitor};
-    struct Finder {
+    struct Finder<'c, 'a> {
+        c: &'c Checker<'a>,
         found: Vec<(String, TextRange)>,
     }
-    impl Finder {
+    impl Finder<'_, '_> {
         fn note(&mut self, e: &Expr) {
-            if let Some(name) = dotted_callee_path(e) {
-                if REQUIRE_WITH_CALLEES.iter().any(|p| *p == name) {
-                    self.found.push((name, e.range()));
-                }
+            if let Some(name) = require_with_callee(self.c, e) {
+                self.found.push((name, e.range()));
             }
         }
     }
-    impl<'a> Visitor<'a> for Finder {
+    impl<'a> Visitor<'a> for Finder<'_, '_> {
         fn visit_stmt(&mut self, _stmt: &'a Stmt) {
             // Nested statements are walked by `check_resource_discipline`.
         }
@@ -10283,7 +10310,10 @@ fn check_inline_resource_exprs(c: &mut Checker, stmt: &Stmt) {
             walk_expr(self, e);
         }
     }
-    let mut finder = Finder { found: Vec::new() };
+    let mut finder = Finder {
+        c,
+        found: Vec::new(),
+    };
     let exprs: Vec<&Expr> = match stmt {
         Stmt::Expr(e) => vec![e.value.as_ref()],
         Stmt::Assign(a) => vec![a.value.as_ref()],
@@ -10322,7 +10352,7 @@ fn check_resource_discipline_stmt(c: &mut Checker, stmt: &Stmt, rest: &[Stmt]) {
     match stmt {
         Stmt::Assign(a) => {
             let targets: Vec<&Expr> = a.targets.iter().collect();
-            if let Some(name) = unmanaged_resource_assignment(&targets, a.value.as_ref(), rest) {
+            if let Some(name) = unmanaged_resource_assignment(c, &targets, a.value.as_ref(), rest) {
                 {
                     let span = (
                         a.value.range().start().to_usize(),
@@ -10341,7 +10371,7 @@ fn check_resource_discipline_stmt(c: &mut Checker, stmt: &Stmt, rest: &[Stmt]) {
         Stmt::AnnAssign(a) => {
             if let Some(v) = a.value.as_ref() {
                 if let Some(name) =
-                    unmanaged_resource_assignment(&[a.target.as_ref()], v.as_ref(), rest)
+                    unmanaged_resource_assignment(c, &[a.target.as_ref()], v.as_ref(), rest)
                 {
                     {
                         let span = (v.range().start().to_usize(), v.range().end().to_usize());
