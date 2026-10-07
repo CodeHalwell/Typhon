@@ -592,16 +592,17 @@ def outer() -> None:\n    mut LOC: Sequence[int] = [1]\n\
     assert_clean(&check_class_kinds(&same), &same);
 }
 
-/// A function-local subclass of a function-local exception is emitted
-/// without `@dataclass`, as at module level, so its named default is
-/// checked as written there too.
+/// A field-less function-local subclass of a function-local exception is
+/// emitted without `@dataclass` (its dataclass `__init__` took no message).
+/// One that declares fields keeps `@dataclass`, as it always had, so its
+/// named default is copied and accepted.
 #[test]
 fn a_local_exception_subclass_keeps_its_default_as_written() {
     let src = format!(
         "{FIELD_PRELUDE}def main() -> None:\n    class Failure(Exception):\n        pass\n\
 \x20   class Timeout(Failure):\n        codes: list[int] = T\n    print(Timeout().codes)\n"
     );
-    assert_mismatch(&check_class_kinds(&src), &src);
+    assert_clean(&check_class_kinds(&src), &src);
     // Raising one with a message, and a local metaclass chain, check clean.
     let ok = "def make() -> None:\n    class Failure(Exception):\n        pass\n\
 \x20   class Timeout(Failure):\n        pass\n\

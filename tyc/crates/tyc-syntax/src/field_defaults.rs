@@ -511,6 +511,12 @@ impl ModuleClassKinds {
             }
             BaseClass::External
         };
+        // A class that declares fields is one only through an external base
+        // (as [`ModuleClassKinds::is_exception_class`]'s external-base test
+        // says anyway): one rooted in a module or local class keeps its
+        // `@dataclass` — positional class patterns, `==` and `repr` — as it
+        // always had. Only a field-less one, whose dataclass `__init__` took
+        // no arguments (`raise Timeout("slow")` raised `TypeError`), changes.
         let close = |seed: &dyn Fn(&str) -> bool, known: &dyn Fn(ClassKind) -> bool| {
             let mut out: HashSet<&str> = entries
                 .iter()
@@ -519,7 +525,7 @@ impl ModuleClassKinds {
                         !own.contains(b.as_str())
                             && match resolve(b) {
                                 BaseClass::External => seed(b),
-                                BaseClass::Known(kind) => known(kind),
+                                BaseClass::Known(kind) => !e.has_fields && known(kind),
                                 BaseClass::Opaque => false,
                             }
                     })
@@ -529,7 +535,7 @@ impl ModuleClassKinds {
             loop {
                 let before = out.len();
                 for e in &entries {
-                    if e.bases.iter().any(|b| out.contains(b.as_str())) {
+                    if !e.has_fields && e.bases.iter().any(|b| out.contains(b.as_str())) {
                         out.insert(e.name.as_str());
                     }
                 }
@@ -603,6 +609,8 @@ struct ClassEntry {
     /// Offset of the class name.
     start: u32,
     bases: Vec<String>,
+    /// The body declares an annotated field.
+    has_fields: bool,
 }
 
 /// Every class def in one scope's `body`, through its control flow but not
@@ -620,6 +628,9 @@ fn collect_class_bases_into(body: &[Stmt], out: &mut Vec<ClassEntry>) {
                     name: c.name.as_str().to_owned(),
                     start: u32::from(c.name.range.start()),
                     bases,
+                    has_fields: c.body.iter().any(|s| {
+                        matches!(s, Stmt::AnnAssign(a) if matches!(a.target.as_ref(), Expr::Name(_)))
+                    }),
                 });
             }
             Stmt::If(i) => {

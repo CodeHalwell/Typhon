@@ -7379,6 +7379,36 @@ def other():
                 "{out}"
             );
         }
+        // One that declares fields keeps `@dataclass`, as it always had: its
+        // positional class patterns, `==` and `repr` depend on it.
+        let out = parse_and_desugar(
+            "class AppError(Exception):
+    pass
+
+def handler():
+    class HttpError(AppError):
+        status: int
+        reason: str = ''
+    class Failure(Exception):
+        pass
+    class Coded(Failure):
+        code: int
+    return HttpError, Coded
+",
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        for name in ["HttpError", "Coded"] {
+            let at = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with(&format!("class {name}(")))
+                .unwrap_or_else(|| panic!("no class {name} in:\n{out}"));
+            assert!(
+                lines[at - 1]
+                    .trim_start()
+                    .starts_with("@dataclasses.dataclass"),
+                "{name} not decorated:\n{out}"
+            );
+        }
     }
 
     #[test]
