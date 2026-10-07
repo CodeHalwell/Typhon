@@ -357,12 +357,19 @@ fn char_suffix_after(old: &str, new: &str) -> String {
     new[common_bytes..].to_owned()
 }
 
-/// Probe `PATH` for the best available Python interpreter (3.13 first,
-/// falling back to 3.12, then plain `python3`). Returns `None` when none
-/// of them spawn successfully — callers should surface that as a clear
-/// error rather than letting the eventual subprocess fail.
+/// Probe `PATH` for the best available Python interpreter (3.13 first, then
+/// the newer supported 3.14 / 3.15, falling back to 3.12, then plain
+/// `python3`). Returns `None` when none of them spawn successfully —
+/// callers should surface that as a clear error rather than letting the
+/// eventual subprocess fail.
 fn discover_python() -> Option<String> {
-    for candidate in ["python3.13", "python3.12", "python3"] {
+    for candidate in [
+        "python3.13",
+        "python3.14",
+        "python3.15",
+        "python3.12",
+        "python3",
+    ] {
         if Command::new(candidate)
             .arg("--version")
             .stdin(Stdio::null())
@@ -646,7 +653,14 @@ mod tests {
         // CI always provides at least one Python; skip when absent.
         if let Some(name) = discover_python() {
             assert!(
-                ["python3.13", "python3.12", "python3"].contains(&name.as_str()),
+                [
+                    "python3.13",
+                    "python3.14",
+                    "python3.15",
+                    "python3.12",
+                    "python3"
+                ]
+                .contains(&name.as_str()),
                 "unexpected interpreter: {name}"
             );
         }

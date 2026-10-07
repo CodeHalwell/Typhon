@@ -153,15 +153,15 @@ Python exceptions still exist; they are the right tool at the Typhon/Python boun
 
 **Cost:** `comptime` is more limited than `zig comptime`. The features it covers (env validation, derived constants, feature flags) are the high-leverage 80%. The rest belongs at runtime, possibly behind `lazy let`.
 
-## 15. `lazy from x import y` is rejected at parse time
+## 15. `lazy from x import y` only on Python 3.15 targets
 
-**Alternative considered:** allow `lazy from numpy import array` and emit a proxy for each named import.
+**Alternative considered:** allow `lazy from numpy import array` on every target and emit a proxy for each named import.
 
-**Decision:** `lazy from ... import ...` is a hard parse error. Use `lazy import np = numpy` plus `np.array(...)` instead.
+**Decision:** `lazy from ... import ...` is accepted only when `[python] target` is 3.15 or later, where it lowers to PEP 810's native statement. On older targets it is `tyc::requires_newer_python`; use `lazy import np = numpy` plus `np.array(...)` there.
 
-**Why:** PEP 690's deferred-import analysis showed that `from ... import x` eagerly touches `x` on the source module — which defeats deferral. Allowing the form would have given users false confidence in laziness that they don't actually get. Rejecting at parse time and offering the alternative in the diagnostic message is clearer.
+**Why:** without interpreter support, `from ... import x` has to load the module to bind `x`, which defeats deferral; a per-name proxy would have given users false confidence in laziness they don't actually get. PEP 810 makes the bound name itself lazy, so on 3.15 the form means what it says.
 
-**Cost:** one extra line of diagnostic copy. Users adjust within seconds.
+**Cost:** the same source is valid on one target and not another. The diagnostic names the target and the alternative.
 
 ## 16. The diagnostic surface lives in `miette`, not custom rendering
 

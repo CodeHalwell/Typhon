@@ -868,6 +868,23 @@ pub fn install(interp: &mut Interpreter) {
         i.call_value(cls, pos.to_vec(), &kw)
     });
 
+    native!("frozendict", |i, args| {
+        let (pos, kw) = split_kwargs(&args);
+        let cls = py315_builtin_class(i, "frozendict")?;
+        i.call_value(cls, pos.to_vec(), &kw)
+    });
+
+    native!("sentinel", |i, args| {
+        if args.len() != 1 {
+            return Err(type_error(format!(
+                "sentinel() takes exactly 1 positional argument ({} given)",
+                args.len()
+            )));
+        }
+        let cls = py315_builtin_class(i, "sentinel")?;
+        i.call_value(cls, args, &[])
+    });
+
     native!("set", |i, args| {
         if args.len() > 1 {
             return Err(type_error(format!(
@@ -1863,9 +1880,9 @@ pub fn install(interp: &mut Interpreter) {
     // under `tyc build && python build/main.py`.
     root.set(
         "__typhon_freeze__",
-        Value::Native(Rc::new(NativeFn::new("__typhon_freeze__", |_i, args| {
+        Value::Native(Rc::new(NativeFn::new("__typhon_freeze__", |i, args| {
             let v = args.into_iter().next().unwrap_or(Value::None);
-            deep_freeze_value(v)
+            deep_freeze_for_target(i, v)
         }))),
     );
 
@@ -2514,6 +2531,7 @@ mod shims {
     pub const CSV: &str = include_str!("shims/csv.py");
     pub const FUNCTOOLS_EXTRA: &str = include_str!("shims/functools_extra.py");
     pub const BYTEARRAY: &str = include_str!("shims/bytearray.py");
+    pub const PY315_BUILTINS: &str = include_str!("shims/py315_builtins.py");
     pub const LAZY: &str = include_str!("shims/lazy.py");
     pub const TYPEPARAMS: &str = include_str!("shims/typeparams.py");
     pub const HEAPQ_EXTRA: &str = include_str!("shims/heapq_extra.py");
@@ -2854,6 +2872,8 @@ pub(crate) fn is_typing_form(name: &str) -> bool {
             | "Annotated"
             | "TypeGuard"
             | "TypeIs"
+            | "TypeForm"
+            | "ReadOnly"
             | "Required"
             | "NotRequired"
             | "Unpack"
@@ -3118,6 +3138,17 @@ fn lazy_value_class(interp: &mut Interpreter) -> Result<Value, Unwind> {
 
 pub(crate) fn bytearray_class(interp: &mut Interpreter) -> Result<Value, Unwind> {
     cached_helper_class(interp, "__shim_bytearray__", shims::BYTEARRAY, "bytearray")
+}
+
+/// The Python 3.15 builtin classes `frozendict` (PEP 814) and `sentinel`
+/// (PEP 661), cached. Shim classes behind constructor natives, like
+/// `bytearray`.
+pub(crate) fn py315_builtin_class(interp: &mut Interpreter, name: &str) -> Result<Value, Unwind> {
+    let cache = match name {
+        "frozendict" => "__shim_frozendict__",
+        _ => "__shim_sentinel__",
+    };
+    cached_helper_class(interp, cache, shims::PY315_BUILTINS, name)
 }
 
 fn defaultdict_class(interp: &mut Interpreter) -> Result<Value, Unwind> {
@@ -3451,9 +3482,9 @@ fn make_typhon_runtime_module(interp: &Interpreter) -> Value {
         "typhon_runtime.freeze",
         vec![(
             "deep_freeze",
-            nf("deep_freeze", |_i, args| {
+            nf("deep_freeze", |i, args| {
                 let v = args.into_iter().next().unwrap_or(Value::None);
-                deep_freeze_value(v)
+                deep_freeze_for_target(i, v)
             }),
         )],
     );
@@ -6051,11 +6082,13 @@ fn make_sys_module(interp: &Interpreter) -> Value {
             ("stderr", make_std_stream("sys.stderr", true)),
             ("stdin", make_stdin_stream()),
             ("maxsize", Value::Int(VmInt::from(i64::MAX))),
+            // The project's `[python] target`, so `sys.version_info >=
+            // (3, 15)` guards take the branch the target interpreter would.
             (
                 "version_info",
                 Value::Tuple(Rc::new(vec![
-                    Value::Int(VmInt::from(3)),
-                    Value::Int(VmInt::from(13)),
+                    Value::Int(VmInt::from(crate::python_target().0)),
+                    Value::Int(VmInt::from(crate::python_target().1)),
                     Value::Int(VmInt::from(0)),
                     Value::Str(Rc::new("final".to_owned())),
                     Value::Int(VmInt::from(0)),
@@ -7018,8 +7051,11 @@ fn make_typing_module() -> Value {
         // `typing` only has to expose the name so the import resolves.
         "TypeGuard",
         "TypeIs",
+        // `TypeForm` (PEP 747) is new in 3.15; `ReadOnly` (PEP 705) in 3.13.
+        "TypeForm",
         "TypeAlias",
         "Required",
+        "ReadOnly",
         "NotRequired",
         "Unpack",
         "Concatenate",
@@ -7083,9 +7119,16 @@ fn make_typing_module() -> Value {
             Ok(args.into_iter().next().unwrap_or(Value::None))
         }))),
     ));
-    // `@override` / `@final` / `@no_type_check` — checker-only decorators
-    // CPython also implements as the identity.
-    for name in ["override", "final", "no_type_check", "dataclass_transform"] {
+    // `@override` / `@final` / `@no_type_check` / `@disjoint_base` (3.15,
+    // PEP 800) — checker-only decorators CPython also implements as the
+    // identity.
+    for name in [
+        "override",
+        "final",
+        "no_type_check",
+        "dataclass_transform",
+        "disjoint_base",
+    ] {
         entries.push((
             name,
             Value::Native(Rc::new(NativeFn::new(name, |_i, args| {
@@ -8859,6 +8902,73 @@ pub fn set_is_frozen(s: &crate::value::RcSet) -> bool {
     s.frozen.get()
 }
 
+/// [`deep_freeze_value`], then — on a 3.15+ `[python] target`, where the
+/// emitted runtime freezes a `dict` into a builtin `frozendict` rather than
+/// a `MappingProxyType` — every frozen dict in the result becomes the
+/// `frozendict` shim.
+fn deep_freeze_for_target(interp: &mut Interpreter, v: Value) -> Result<Value, Unwind> {
+    let frozen = deep_freeze_value(v)?;
+    if crate::python_target() < (3, 15) {
+        return Ok(frozen);
+    }
+    let Value::Class(class) = py315_builtin_class(interp, "frozendict")? else {
+        return Ok(frozen);
+    };
+    Ok(frozen_dicts_to_frozendict(&class, frozen))
+}
+
+fn frozen_dicts_to_frozendict(class: &Rc<crate::value::Class>, v: Value) -> Value {
+    let rebuild = |d: &Rc<crate::value::FrozenCell<DictMap>>| -> DictMap {
+        let mut map = DictMap::new();
+        for (k, val) in d.borrow().iter() {
+            map.insert(k.clone(), frozen_dicts_to_frozendict(class, val.clone()));
+        }
+        map
+    };
+    match v {
+        Value::Tuple(items) => Value::Tuple(Rc::new(
+            items
+                .iter()
+                .cloned()
+                .map(|x| frozen_dicts_to_frozendict(class, x))
+                .collect(),
+        )),
+        Value::Dict(d) if dict_is_frozen(&d) => {
+            let mut fields = crate::value::FieldMap::new();
+            fields.insert(
+                "_data".to_owned(),
+                Value::Dict(Rc::new(crate::value::FrozenCell::new(rebuild(&d)))),
+            );
+            Value::Instance(Rc::new(crate::value::Instance {
+                class: class.clone(),
+                fields: RefCell::new(fields),
+                chain: RefCell::new(None),
+            }))
+        }
+        Value::Instance(inst) if Rc::ptr_eq(&inst.class, class) => {
+            let data = inst.fields.borrow().get("_data").cloned();
+            match data {
+                Some(Value::Dict(d)) => {
+                    let mut fields = crate::value::FieldMap::new();
+                    fields.insert(
+                        "_data".to_owned(),
+                        Value::Dict(Rc::new(crate::value::FrozenCell::new(rebuild(&d)))),
+                    );
+                    Value::Instance(Rc::new(crate::value::Instance {
+                        class: inst.class.clone(),
+                        fields: RefCell::new(fields),
+                        chain: RefCell::new(None),
+                    }))
+                }
+                _ => Value::Instance(inst),
+            }
+        }
+        Value::ResultOk(x) => Value::ResultOk(Box::new(frozen_dicts_to_frozendict(class, *x))),
+        Value::ResultErr(x) => Value::ResultErr(Box::new(frozen_dicts_to_frozendict(class, *x))),
+        other => other,
+    }
+}
+
 /// Deep-freeze a value the same way `typhon_runtime.freeze.deep_freeze`
 /// does in the compile path: list → tuple of frozen elements, dict and
 /// set get marked frozen so subsequent mutation operations refuse, and
@@ -8930,6 +9040,29 @@ fn deep_freeze_value(v: Value) -> Result<Value, Unwind> {
             fn immutable_shim(class: &Rc<crate::value::Class>) -> bool {
                 crate::value::class_flag(class, "__typhon_immutable__", false)
                     || class.bases.iter().any(immutable_shim)
+            }
+            // A 3.15 `frozendict` is already immutable; like the emitted
+            // runtime, keep it a `frozendict` and freeze its values.
+            if inst.class.name == "frozendict"
+                && crate::value::class_flag(&inst.class, "__typhon_frozendict__", false)
+            {
+                let data = inst.fields.borrow().get("_data").cloned();
+                if let Some(Value::Dict(d)) = data {
+                    let mut frozen: DictMap = DictMap::new();
+                    for (k, val) in d.borrow().iter() {
+                        frozen.insert(k.clone(), deep_freeze_value(val.clone())?);
+                    }
+                    let mut fields = crate::value::FieldMap::new();
+                    fields.insert(
+                        "_data".to_owned(),
+                        Value::Dict(Rc::new(crate::value::FrozenCell::new(frozen))),
+                    );
+                    return Ok(Value::Instance(Rc::new(crate::value::Instance {
+                        class: inst.class.clone(),
+                        fields: RefCell::new(fields),
+                        chain: RefCell::new(None),
+                    })));
+                }
             }
             if crate::value::class_flag(&inst.class, "__typhon_dc_frozen__", false)
                 || immutable_shim(&inst.class)
@@ -9907,6 +10040,7 @@ pub(crate) fn native_accepts_keyword(name: &str, kw: &str) -> Option<bool> {
         | "str"
         | "bytes"
         | "bytearray"
+        | "frozendict"
         | "from_bytes"
         | "partial"
         | "partial_call"
@@ -13751,6 +13885,7 @@ pub fn call_with_kwargs(
         | "str"
         | "bytes"
         | "bytearray"
+        | "frozendict"
         | "from_bytes"
         | "partial"
         | "partial_call" => {

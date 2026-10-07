@@ -401,7 +401,11 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
             // bidirectional assignability on K for both, and on V
             // for MutableMapping. (See review thread on PR #147 from
             // gemini-code-assist / copilot.)
-            if an == "Mapping" && aa.len() == 2 && bn == "dict" && bb.len() == 2 {
+            if an == "Mapping"
+                && aa.len() == 2
+                && matches!(bn.as_str(), "dict" | "frozendict")
+                && bb.len() == 2
+            {
                 return types_equivalent(&aa[0], &bb[0]) && assignable(&aa[1], &bb[1]);
             }
             if an == "MutableMapping" && aa.len() == 2 && bn == "dict" && bb.len() == 2 {
@@ -748,6 +752,19 @@ fn builtin_dunder_methods(head: &str) -> &'static [&'static str] {
         "__repr__",
         "__str__",
     ];
+    // Hashable read-only mapping: `frozendict` (3.15).
+    const HASHABLE_MAPPING: &[&str] = &[
+        "__len__",
+        "__iter__",
+        "__getitem__",
+        "__contains__",
+        "__bool__",
+        "__eq__",
+        "__ne__",
+        "__hash__",
+        "__repr__",
+        "__str__",
+    ];
     // Hashable set: `frozenset`.
     const HASHABLE_SET: &[&str] = &[
         "__len__",
@@ -775,6 +792,7 @@ fn builtin_dunder_methods(head: &str) -> &'static [&'static str] {
         "tuple" | "tuple_variadic" | "str" | "bytes" | "range" => HASHABLE_INDEXABLE,
         "list" | "bytearray" => UNHASHABLE_INDEXABLE,
         "dict" => UNHASHABLE_MAPPING,
+        "frozendict" => HASHABLE_MAPPING,
         "frozenset" => HASHABLE_SET,
         "set" => UNHASHABLE_SET,
         _ => &[],
@@ -1619,6 +1637,9 @@ pub fn generic_param_variance(head: &str, idx: usize) -> Variance {
         // exactly) and covariant in V (values flow out via __getitem__).
         ("Mapping", 0) => Variance::Invariant,
         ("Mapping", 1) => Variance::Covariant,
+        // `frozendict[K, V]` (3.15) is read-only: Mapping's variance.
+        ("frozendict", 0) => Variance::Invariant,
+        ("frozendict", 1) => Variance::Covariant,
         // ── ItemsView[K, V] — same variance as Mapping: K is keyed,
         // V flows out. Read-only view, so the keys-invariant rule
         // still applies (an `ItemsView[int, str]` consumer might call
@@ -1735,6 +1756,8 @@ fn expr_is_type_shaped(expr: &Expr, classes: &[String], type_params: &[String]) 
         "dict",
         "set",
         "frozenset",
+        "frozendict",
+        "sentinel",
         "tuple",
         "range",
         "bytearray",
@@ -3573,6 +3596,10 @@ struct Checker<'a> {
     /// All classes declared in the module along with their declared member
     /// names.  Used for structural conformance against an interface.
     class_shapes: HashMap<String, InterfaceShape>,
+    /// PEP 728: the `extra_items=T` type of each `TypedDict` that declares
+    /// one. A dict literal may then carry keys beyond the declared fields,
+    /// each with a `T` value.
+    typed_dict_extra_items: HashMap<String, Type>,
     /// PEP 695 type-parameter names declared on each generic class.
     /// `class Box[T]: ...` populates `{"Box": ["T"]}`. Empty for
     /// non-generic classes. Used to drive bidirectional inference at
@@ -3988,6 +4015,7 @@ impl<'a> Checker<'a> {
             active_type_params: Vec::new(),
             interfaces: HashMap::new(),
             class_shapes: HashMap::new(),
+            typed_dict_extra_items: HashMap::new(),
             class_type_params: HashMap::new(),
             hkt_param_names: std::collections::HashSet::new(),
             class_param_variance: HashMap::new(),
@@ -4184,7 +4212,7 @@ impl<'a> Checker<'a> {
                     return Some(slots.iter().all(|a| self.is_assignable(&ea[0], a)));
                 }
                 if eh == "Mapping"
-                    && matches!(ah.as_str(), "dict" | "Mapping")
+                    && matches!(ah.as_str(), "dict" | "Mapping" | "frozendict")
                     && ea.len() == aa.len()
                 {
                     return Some(ea.iter().zip(aa).all(|(e, a)| self.is_assignable(e, a)));
@@ -4690,7 +4718,11 @@ impl<'a> Checker<'a> {
             // both. The class-hierarchy-aware `is_assignable` carries
             // the same one-way primitive widening as `assignable`, so
             // bidirectional checks here actually enforce invariance.
-            if an == "Mapping" && aa.len() == 2 && bn == "dict" && bb.len() == 2 {
+            if an == "Mapping"
+                && aa.len() == 2
+                && matches!(bn.as_str(), "dict" | "frozendict")
+                && bb.len() == 2
+            {
                 return self.is_assignable(&aa[0], &bb[0])
                     && self.is_assignable(&bb[0], &aa[0])
                     && self.is_assignable(&aa[1], &bb[1]);
@@ -9993,6 +10025,14 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
         if let Stmt::ClassDef(cd) = stmt {
             let name = cd.name.as_str().to_owned();
             let shape = collect_class_shape(cd, &classes);
+            if let Some(extra) = cd.arguments.as_deref().and_then(|a| {
+                a.keywords
+                    .iter()
+                    .find(|k| k.arg.as_ref().is_some_and(|n| n.as_str() == "extra_items"))
+            }) {
+                c.typed_dict_extra_items
+                    .insert(name.clone(), type_from_annotation(&extra.value, &classes));
+            }
             if class_inherits_protocol(cd) {
                 let runtime_checkable = has_runtime_checkable_decorator(&cd.decorator_list);
                 c.interfaces.insert(
@@ -12349,6 +12389,7 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
                         args[0].clone()
                     }
                     "dict" | "Mapping" | "MutableMapping" | "defaultdict" | "OrderedDict"
+                    | "frozendict"
                         if args.len() == 2 =>
                     {
                         args[1].clone()
@@ -14761,7 +14802,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     if let Type::Generic(head, args) = &recv_ty {
                         if matches!(
                             head.as_str(),
-                            "Mapping" | "tuple" | "tuple_variadic" | "frozenset"
+                            "Mapping" | "tuple" | "tuple_variadic" | "frozenset" | "frozendict"
                         ) {
                             let at = target.range();
                             let diagnostic = TycError::generic_at(
@@ -18727,6 +18768,7 @@ fn builtin_class_pattern_name(t: &Type) -> Option<&'static str> {
             "dict" => Some("dict"),
             "set" => Some("set"),
             "frozenset" => Some("frozenset"),
+            "frozendict" => Some("frozendict"),
             _ => None,
         },
         _ => None,
@@ -19311,6 +19353,7 @@ fn is_builtin_generic_head(head: &str) -> bool {
     matches!(
         head,
         "list" | "dict" | "set" | "tuple" | "tuple_variadic" | "Mapping" | "str" | "bytes" | "frozenset"
+        | "frozendict"
         // The Result family is Typhon's own closed surface — an unknown
         // method on Ok/Err/Result is always a runtime AttributeError, so
         // flag it at check time (closes the `.unwrap()`-before-it-existed
@@ -19385,6 +19428,10 @@ fn is_known_builtin_generic_attr(head: &str, attr: &str) -> bool {
                 | "fromkeys"
         ),
         "Mapping" => matches!(attr, "get" | "keys" | "values" | "items" | "copy"),
+        "frozendict" => matches!(
+            attr,
+            "get" | "keys" | "values" | "items" | "copy" | "fromkeys"
+        ),
         "frozenset" => matches!(
             attr,
             "copy"
@@ -19685,6 +19732,20 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
     };
     if head == "Mapping" && matches!(attr, "get" | "keys" | "values" | "items" | "copy") {
         return builtin_generic_method(&Type::Generic("dict".into(), args.clone()), attr);
+    }
+    if head == "frozendict" {
+        return match attr {
+            "get" | "keys" | "values" | "items" => {
+                builtin_generic_method(&Type::Generic("dict".into(), args.clone()), attr)
+            }
+            "copy" => Some(Type::Function {
+                params: vec![],
+                ret: Box::new(recv.clone()),
+                variadic: false,
+                min_params: Some(0),
+            }),
+            _ => None,
+        };
     }
     if let Some(sig) = builtin_container_mutator(head, attr, args) {
         return Some(sig);
@@ -20367,7 +20428,12 @@ fn try_infer_typed_dict_literal(
             Expr::StringLiteral(s) => s.value.to_str().to_owned(),
             _ => return None,
         };
-        let field_ty = shape.fields.get(&key_name)?;
+        let field_ty = match shape.fields.get(&key_name) {
+            Some(t) => t,
+            None => c.typed_dict_extra_items.get(class_name)?,
+        }
+        .clone();
+        let field_ty = &field_ty;
         // Type-check the value against the declared field type. If the
         // inferred type isn't assignable, surface the same error the
         // constructor call form would and abort the match so the dict-
@@ -20510,7 +20576,9 @@ fn iterable_element_type(ty: &Type) -> Option<Type> {
                 Some(args[0].clone())
             }
             // Iterating a mapping yields its KEYS.
-            "dict" | "Mapping" | "MutableMapping" if args.len() == 2 => Some(args[0].clone()),
+            "dict" | "Mapping" | "MutableMapping" | "frozendict" if args.len() == 2 => {
+                Some(args[0].clone())
+            }
             // Fixed-arity tuple — iteration yields the union of every slot.
             "tuple" if !args.is_empty() => Some(Type::union_of(args.clone())),
             _ => None,
@@ -22818,8 +22886,10 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     let diagnostic = TycError::attribute_not_found(
                         attr_name, &shown, &c.path, c.source, attr_start, attr_len,
                     );
-                    if matches!(head.as_str(), "tuple_variadic" | "Mapping" | "frozenset")
-                        && frozen_context::failure_is_caught(c, expr, "AttributeError")
+                    if matches!(
+                        head.as_str(),
+                        "tuple_variadic" | "Mapping" | "frozenset" | "frozendict"
+                    ) && frozen_context::failure_is_caught(c, expr, "AttributeError")
                     {
                         c.diagnostics.push_warning(diagnostic);
                     } else {
@@ -23227,7 +23297,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                                 attr_start,
                                 attr_len,
                             );
-                            if matches!(bad,Type::Generic(head,_) if matches!(head.as_str(),"tuple_variadic" | "Mapping" | "frozenset"))
+                            if matches!(bad,Type::Generic(head,_) if matches!(head.as_str(),"tuple_variadic" | "Mapping" | "frozenset" | "frozendict"))
                                 && frozen_context::failure_is_caught(c, expr, "AttributeError")
                             {
                                 c.diagnostics.push_warning(diagnostic);
@@ -23365,7 +23435,8 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             // invariant — the runtime hashes/compares against the slot.
             if c.unsafe_depth == 0 && !matches!(s.slice.as_ref(), Expr::Slice(_)) {
                 if let Type::Generic(head, args) = &value_ty {
-                    if matches!(head.as_str(), "dict" | "Mapping") && args.len() == 2 {
+                    if matches!(head.as_str(), "dict" | "Mapping" | "frozendict") && args.len() == 2
+                    {
                         let key_ty = &args[0];
                         if !is_dynamic_type(key_ty)
                             && !is_dynamic_type(&slice_ty)
@@ -23706,7 +23777,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             let comp_saved = c.env.snapshot_scope_narrowings();
             c.env.enter();
             infer_comprehension_generators(c, &comp.generators);
-            let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
+            let elt = infer_comprehension_element(c, &comp.elt, elt_expected.as_ref());
             leave_comprehension_scope(c, expr);
             c.env.restore_scope_narrowings(comp_saved);
             // A comprehension builds a *fresh* list, so — like a list literal —
@@ -23725,7 +23796,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             let comp_saved = c.env.snapshot_scope_narrowings();
             c.env.enter();
             infer_comprehension_generators(c, &comp.generators);
-            let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
+            let elt = infer_comprehension_element(c, &comp.elt, elt_expected.as_ref());
             leave_comprehension_scope(c, expr);
             c.env.restore_scope_narrowings(comp_saved);
             let elt = widen_fresh_element(c, elt, elt_expected.as_ref());
@@ -23779,7 +23850,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             let comp_saved = c.env.snapshot_scope_narrowings();
             c.env.enter();
             infer_comprehension_generators(c, &comp.generators);
-            let elt = infer_expr_ctx(c, &comp.elt, elt_expected.as_ref());
+            let elt = infer_comprehension_element(c, &comp.elt, elt_expected.as_ref());
             leave_comprehension_scope(c, expr);
             c.env.restore_scope_narrowings(comp_saved);
             // A generator expression is an `Iterator[T]`.
@@ -23795,6 +23866,34 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             let comp_saved = c.env.snapshot_scope_narrowings();
             c.env.enter();
             infer_comprehension_generators(c, &comp.generators);
+            // PEP 798 `{**d for d in ds}`: no key, and `value` is a mapping
+            // whose key and value types become the result's.
+            if comp.key.is_none() {
+                let mapping = infer_expr(c, &comp.value);
+                let (k, v) = match c.unwrap_alias(&mapping) {
+                    Type::Generic(h, a)
+                        if matches!(h.as_str(), "dict" | "Mapping" | "MutableMapping")
+                            && a.len() == 2 =>
+                    {
+                        (a[0].clone(), a[1].clone())
+                    }
+                    _ => (Type::Unknown, Type::Unknown),
+                };
+                let span = (
+                    comp.value.range().start().to_usize(),
+                    comp.value.range().end().to_usize(),
+                );
+                for (expected, actual) in [(&k_expected, &k), (&v_expected, &v)] {
+                    if let Some(e) = expected {
+                        if !c.is_assignable(e, actual) {
+                            c.mismatch(e, actual, span);
+                        }
+                    }
+                }
+                leave_comprehension_scope(c, expr);
+                c.env.restore_scope_narrowings(comp_saved);
+                return Type::Generic("dict".into(), vec![k, v]);
+            }
             let k = match comp.key.as_ref() {
                 Some(key) => {
                     // Infer the key honestly (no coercing hint) so its real
@@ -23829,6 +23928,19 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             Type::Generic("dict".into(), vec![k, v])
         }
         _ => Type::Unknown,
+    }
+}
+
+/// The element type a list / set / generator comprehension produces. A
+/// PEP 798 starred element (`[*xs for xs in lists]`) spreads `xs`, so it
+/// contributes `xs`'s element type.
+fn infer_comprehension_element(c: &mut Checker, elt: &Expr, expected: Option<&Type>) -> Type {
+    match elt {
+        Expr::Starred(star) => {
+            let spread = infer_expr(c, &star.value);
+            iterable_element_type(&c.unwrap_alias(&spread)).unwrap_or(Type::Unknown)
+        }
+        _ => infer_expr_ctx(c, elt, expected),
     }
 }
 
@@ -25893,7 +26005,9 @@ fn as_capture_type(c: &Checker, subject: &Type, inner: &Pattern) -> Type {
             | ("bool", Type::Bool)
             | ("float", Type::Float)
             | ("bytes", Type::Bytes) => true,
-            ("list" | "dict" | "set" | "frozenset", Type::Generic(h, _)) => h == head.as_str(),
+            ("list" | "dict" | "set" | "frozenset" | "frozendict", Type::Generic(h, _)) => {
+                h == head.as_str()
+            }
             ("tuple", Type::Generic(h, _)) => h == "tuple" || h == "tuple_variadic",
             (_, Type::Class(cn)) | (_, Type::Generic(cn, _)) => {
                 cn == head.as_str() || c.is_assignable(&Type::Class(head.clone()), t)
@@ -27274,6 +27388,60 @@ def describe(m: Maybe[int]) -> str:
             "matching-element `+=` must pass: {:?}",
             ok.errors()
         );
+    }
+
+    #[test]
+    fn pep_798_unpacking_comprehensions_are_element_typed() {
+        let ok = check(
+            "def f() -> None:\n    let xss: list[list[int]] = [[1], [2]]\n    let ds: list[dict[str, int]] = [{\"a\": 1}]\n    let xs: list[int] = [*x for x in xss]\n    let s: set[int] = {*x for x in xss}\n    let m: dict[str, int] = {**d for d in ds}\n    print(xs, s, m)\n",
+        );
+        assert!(ok.errors().is_empty(), "{:?}", ok.errors());
+        for src in [
+            "def f() -> None:\n    let xss: list[list[int]] = [[1]]\n    let xs: list[str] = [*x for x in xss]\n    print(xs)\n",
+            "def f() -> None:\n    let ds: list[dict[str, int]] = [{\"a\": 1}]\n    let m: dict[str, str] = {**d for d in ds}\n    print(m)\n",
+        ] {
+            assert!(
+                check(src)
+                    .errors()
+                    .iter()
+                    .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+                "wrong spread element type must be rejected: {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn frozendict_is_a_typed_read_only_mapping() {
+        let ok = check(
+            "from collections.abc import Mapping\ndef f() -> None:\n    let fd = frozendict(a=1)\n    let n: int = fd[\"a\"] + 1\n    let view: Mapping[str, int] = fd\n    let keyed: dict[frozendict[str, int], str] = {fd: \"k\"}\n    for k, v in fd.items():\n        print(k.upper(), v + 1)\n    print(n, view, keyed, fd.get(\"a\"), fd.copy())\n",
+        );
+        assert!(ok.errors().is_empty(), "{:?}", ok.errors());
+        for src in [
+            // The value type is known.
+            "def f() -> None:\n    let fd = frozendict(a=1)\n    let s: str = fd[\"a\"]\n    print(s)\n",
+            // No mutators.
+            "def f() -> None:\n    let fd = frozendict(a=1)\n    fd.update({\"b\": 2})\n",
+            "def f() -> None:\n    let fd = frozendict(a=1)\n    fd[\"a\"] = 2\n",
+        ] {
+            assert!(!check(src).errors().is_empty(), "must be rejected: {src:?}");
+        }
+    }
+
+    #[test]
+    fn typed_dict_extra_items_types_undeclared_keys() {
+        // PEP 728: `extra_items=T` admits undeclared keys whose value is a `T`.
+        let ok = check(
+            "from typing import TypedDict\nclass Extra(TypedDict, extra_items=int):\n    name: str\ndef f() -> None:\n    let e: Extra = {\"name\": \"y\", \"n\": 1}\n    print(e)\n",
+        );
+        assert!(ok.errors().is_empty(), "{:?}", ok.errors());
+        for src in [
+            // The extra value must be the declared `extra_items` type.
+            "from typing import TypedDict\nclass Extra(TypedDict, extra_items=int):\n    name: str\ndef f() -> None:\n    let e: Extra = {\"name\": \"y\", \"n\": \"no\"}\n    print(e)\n",
+            // Without `extra_items`, an undeclared key is still rejected.
+            "from typing import TypedDict\nclass Plain(TypedDict):\n    name: str\ndef f() -> None:\n    let e: Plain = {\"name\": \"y\", \"n\": 1}\n    print(e)\n",
+        ] {
+            assert!(!check(src).errors().is_empty(), "must be rejected: {src:?}");
+        }
     }
 
     #[test]

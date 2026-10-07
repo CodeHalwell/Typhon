@@ -49,6 +49,25 @@ pub use value::Value;
 
 use tyc_syntax::preprocess;
 
+/// The project's `[python] target` minor version (the major is 3). `tyc run`
+/// sets it before running; it decides the few behaviours that differ by
+/// target, such as `freeze let` making a dict a `frozendict` on 3.15+.
+static PYTHON_TARGET_MINOR: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(13);
+
+/// Set the `[python] target` the VM runs as (default 3.13). Process-wide.
+pub fn set_python_target(major: u8, minor: u8) {
+    let minor = if major > 3 { u8::MAX } else { minor };
+    PYTHON_TARGET_MINOR.store(minor, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The `[python] target` set by [`set_python_target`].
+pub(crate) fn python_target() -> (u8, u8) {
+    (
+        3,
+        PYTHON_TARGET_MINOR.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Run a Typhon source file with the VM. `script_args` populates `sys.argv`
 /// after the script path. Returns the process exit code that `tyc run`
 /// should propagate.
@@ -1101,6 +1120,64 @@ let d: dict[float, int] = {x: 1, y: 2}
 assert len(d) == 2
 assert d[x] == 1
 assert d[y] == 2
+"###
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn pep_798_unpacking_comprehensions() {
+        assert_eq!(
+            run_capturing(
+                r###"let lists = [[1, 2], [3], []]
+assert [*xs for xs in lists] == [1, 2, 3]
+assert {*xs for xs in lists} == {1, 2, 3}
+assert {**d for d in [{"a": 1}, {"b": 2, "a": 3}]} == {"a": 3, "b": 2}
+let g = (*xs for xs in lists)
+assert next(g) == 1
+assert list(g) == [2, 3]
+assert [*range(n) for n in range(4) if n % 2 == 1] == [0, 0, 1, 2]
+assert [*a for xs in [[[1], [2]], [[3]]] for a in xs] == [1, 2, 3]
+try:
+    print({**x for x in [1]})
+    assert False
+except TypeError as e:
+    assert str(e) == "'int' object is not a mapping"
+"###
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn py315_frozendict_and_sentinel() {
+        assert_eq!(
+            run_capturing(
+                r###"from collections.abc import Mapping
+let fd = frozendict(a=1, b=2)
+assert repr(fd) == "frozendict({'a': 1, 'b': 2})" and str(frozendict()) == "frozendict()"
+assert fd == {"a": 1, "b": 2} and {"a": 1, "b": 2} == fd and fd == frozendict(b=2, a=1)
+assert hash(fd) == hash(frozendict(b=2, a=1)) and {fd: 1}[frozendict(a=1, b=2)] == 1
+assert type(fd | {"c": 3}).__name__ == "frozendict" and type({"c": 3} | fd).__name__ == "dict"
+assert {**fd} == {"a": 1, "b": 2} and dict(fd) == {"a": 1, "b": 2}
+def kw(**k: int) -> int:
+    return len(k)
+assert kw(**fd) == 2
+assert isinstance(fd, frozendict) and isinstance(fd, Mapping) and not isinstance(fd, dict)
+assert frozendict.fromkeys("ab", 0) == {"a": 0, "b": 0} and fd.copy() is fd
+try:
+    fd["a"] = 5
+    assert False
+except TypeError as e:
+    assert str(e) == "'frozendict' object does not support item assignment"
+freeze let F = frozendict(x=[1, 2])
+assert type(F).__name__ == "frozendict" and F["x"] == (1, 2)
+let M = sentinel("MISSING")
+assert repr(M) == "MISSING" and str(M) == "MISSING" and M.__name__ == "MISSING"
+assert type(M).__name__ == "sentinel" and M is M and M != sentinel("MISSING") and bool(M)
 "###
             )
             .unwrap(),
@@ -7379,6 +7456,45 @@ def main() -> None:
         raise AssertionError("as_integer_ratio wrong")
     if bytes.fromhex("6162") != b"ab":
         raise AssertionError("bytes.fromhex wrong")
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// `TypedDict`'s class keywords (`total`, PEP 728's `closed` /
+    /// `extra_items`) belong to its metaclass; the VM passed them on to
+    /// `__init_subclass__` and raised. The 3.15 `typing` names `TypeForm`
+    /// and `disjoint_base` (and 3.13's `ReadOnly`) import and erase.
+    #[test]
+    fn typed_dict_class_keywords_and_newer_typing_names() {
+        let src = r#"
+from typing import TypedDict, TypeForm, ReadOnly, disjoint_base
+
+class Partial(TypedDict, total=False):
+    name: str
+
+class Extra(TypedDict, extra_items=int):
+    name: ReadOnly[str]
+
+class Closed(TypedDict, closed=True):
+    name: str
+
+@disjoint_base
+plain class Base:
+    pass
+
+def ident(t: TypeForm[int]) -> TypeForm[int]:
+    return t
+
+def main() -> None:
+    let p: Partial = {}
+    let e: Extra = {"name": "y", "n": 1}
+    let c: Closed = {"name": "z"}
+    if p != {} or e != {"name": "y", "n": 1} or c["name"] != "z":
+        raise AssertionError("TypedDict with class keywords wrong")
+    if ident(int) is not int or not isinstance(Base(), Base):
+        raise AssertionError("newer typing names wrong")
 
 main()
 "#;

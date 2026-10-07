@@ -743,14 +743,27 @@ Warn-level — never fails the build. Silence with `[strictness] allow-secret-co
 
 ### `tyc::lazy_usage` — error
 
-A `lazy` form other than `lazy import name = module` or `lazy let NAME: T = expr`.
+A `lazy` form other than `lazy import name = module`, `lazy let NAME: T = expr`, or (3.15+ targets) module-level `lazy from module import names`.
 
 ```ty
-lazy from heavy import Thing   # error
+lazy from heavy import *       # error — star imports cannot be lazy
 lazy let X: T:                  # error — colon-block form does not parse
 ```
 
 **Fix:** Use a supported form — `lazy import heavy` then `heavy.Thing`, or `lazy let X: T = expr`.
+
+---
+
+### `tyc::requires_newer_python` — error
+
+Syntax or a builtin newer than `[python] target`: `except A, B:` and `t"..."` (3.14); `[*xs for xs in lists]` / `{**d for d in ds}` (PEP 798), `frozendict`, `sentinel` and `lazy from M import …` (3.15). Fires in check, build, run and the editor.
+
+```ty
+# [python] target = "3.13"
+let flat: list[int] = [*xs for xs in lists]   # error — needs 3.15
+```
+
+**Fix:** raise `[python] target`, or rewrite in a form the target has.
 
 ---
 

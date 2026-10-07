@@ -914,7 +914,7 @@ _loader.exec_module(np)         # deferred — only runs on first attribute acce
 
 The exact emission uses a small thread-safe proxy class so concurrent first accesses serialise around the underlying load.
 
-`lazy from numpy import array` is **rejected at parse time** (`tyc::lazy_usage`). Use `lazy import numpy` and dotted access.
+`lazy from numpy import array` needs a 3.15+ target (PEP 810); before that it is `tyc::requires_newer_python`. Use `lazy import numpy` and dotted access there.
 
 On a **3.15+ `[python] target`**, the lowering above is skipped entirely: `lazy import np = numpy` instead emits the native PEP 810 `lazy import numpy as np` statement — no proxy class, no `typhon_runtime` involvement. 3.13 / 3.14 targets keep the proxy-class emission shown above, byte-for-byte.
 

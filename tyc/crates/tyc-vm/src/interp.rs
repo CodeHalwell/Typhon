@@ -636,6 +636,17 @@ impl Interpreter {
                     return Ok(None);
                 };
                 let it = iters[depth].clone().unwrap_or(Value::None);
+                // PEP 798 `(*x for ...)`: one slot past the clauses holds the
+                // iterator being spread; drain it before advancing a clause.
+                if depth == node.generators.len() {
+                    match self.iter_next(&it)? {
+                        Some(v) => return Ok(Some(v)),
+                        None => {
+                            iters[depth] = None;
+                            continue;
+                        }
+                    }
+                }
                 let clause = &node.generators[depth];
                 match self.iter_next(&it)? {
                     None => {
@@ -658,6 +669,11 @@ impl Interpreter {
                             continue;
                         }
                         if depth + 1 == node.generators.len() {
+                            if let Expr::Starred(star) = node.elt.as_ref() {
+                                let spread = self.eval_expr(&star.value, &env)?;
+                                iters[depth + 1] = Some(self.make_iter(spread)?);
+                                continue;
+                            }
                             return Ok(Some(self.eval_expr(&node.elt, &env)?));
                         }
                         let next_iterable =
@@ -2257,11 +2273,20 @@ impl Interpreter {
                 }
             }
         }
+        // `TypedDict`'s own class keywords (`total`, and PEP 728's `closed` /
+        // `extra_items`) are consumed by its metaclass, never passed on to
+        // `__init_subclass__`.
+        let is_typed_dict = std::iter::once(class)
+            .chain(class.mro.iter())
+            .any(|k| k.class_attrs.borrow().contains_key("__typhon_typed_dict__"));
         let mut kwargs: Vec<(String, Value)> = Vec::new();
         if let Some(args) = &c.arguments {
             for kw in args.keywords.iter() {
                 match kw.arg.as_ref().map(|a| a.as_str()) {
                     Some("metaclass") => {}
+                    Some("total" | "closed" | "extra_items") if is_typed_dict => {
+                        self.eval_expr(&kw.value, env)?;
+                    }
                     Some(name) => kwargs.push((name.to_owned(), self.eval_expr(&kw.value, env)?)),
                     None => {}
                 }
@@ -3217,13 +3242,11 @@ impl Interpreter {
                         (None, v) => {
                             // {**other}
                             let other = self.eval_expr(v, env)?;
-                            match other {
-                                Value::Dict(d) => {
-                                    for (k, v) in d.borrow().iter() {
-                                        map.insert(k.clone(), v.clone());
-                                    }
-                                }
-                                _ => return Err(type_error("** unpack expected a mapping")),
+                            let Some(pairs) = self.mapping_pairs(&other)? else {
+                                return Err(type_error("** unpack expected a mapping"));
+                            };
+                            for (k, v) in pairs {
+                                map.insert(k, v);
                             }
                         }
                     }
@@ -3308,7 +3331,10 @@ impl Interpreter {
                 };
                 let iterable = self.eval_expr(&first.iter, env)?;
                 let it = self.make_iter(iterable)?;
-                let mut iters: Vec<Option<Value>> = (0..g.generators.len()).map(|_| None).collect();
+                // A starred element (PEP 798) gets one extra slot for the
+                // iterator it spreads; see `genexp_next`.
+                let slots = g.generators.len() + usize::from(g.elt.is_starred_expr());
+                let mut iters: Vec<Option<Value>> = (0..slots).map(|_| None).collect();
                 iters[0] = Some(it);
                 let state = GenExprState {
                     node: Rc::new(g.clone()),
@@ -3755,6 +3781,36 @@ impl Interpreter {
     /// Hash key for `v`, running a user `__hash__` where the class defines
     /// one (`value::instance_hash_mode`); every other value keys
     /// structurally through `Value::to_hash_key`.
+    /// The `(key, value)` pairs of a `**` operand: a dict, or an object
+    /// with CPython's mapping protocol (`keys()` plus `__getitem__`, as on
+    /// a `frozendict`). `None` when the value is not a mapping.
+    pub fn mapping_pairs(&mut self, v: &Value) -> Result<Option<Vec<(HashKey, Value)>>, Unwind> {
+        match v {
+            Value::Dict(d) => Ok(Some(
+                d.borrow()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            )),
+            Value::Instance(_) => {
+                let keys = match self.get_attr(v, "keys") {
+                    Ok(keys) => keys,
+                    Err(Unwind::Exception(e)) if e.kind == "AttributeError" => return Ok(None),
+                    Err(e) => return Err(e),
+                };
+                let keys = self.call_value(keys, vec![], &[])?;
+                let it = self.make_iter(keys)?;
+                let mut pairs = Vec::new();
+                while let Some(k) = self.iter_next(&it)? {
+                    let value = self.subscript(v, &k)?;
+                    pairs.push((self.hash_key(&k)?, value));
+                }
+                Ok(Some(pairs))
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub fn hash_key(&mut self, v: &Value) -> Result<HashKey, Unwind> {
         if let Value::Instance(inst) = v {
             if crate::value::enum_mixin_value(v).is_none() {
@@ -4587,17 +4643,15 @@ impl Interpreter {
                 None => {
                     // **kwargs spread
                     let v = self.eval_expr(&kw.value, env)?;
-                    match v {
-                        Value::Dict(d) => {
-                            for (k, val) in d.borrow().iter() {
-                                if let HashKey::Str(s) = k {
-                                    kwargs.push(((**s).clone(), val.clone()));
-                                } else {
-                                    return Err(type_error("keywords must be strings"));
-                                }
-                            }
+                    let Some(pairs) = self.mapping_pairs(&v)? else {
+                        return Err(type_error("** argument must be a mapping"));
+                    };
+                    for (k, val) in pairs {
+                        if let HashKey::Str(s) = k {
+                            kwargs.push(((*s).clone(), val));
+                        } else {
+                            return Err(type_error("keywords must be strings"));
                         }
-                        _ => return Err(type_error("** argument must be a mapping")),
                     }
                 }
             }
@@ -7533,6 +7587,10 @@ impl Interpreter {
                 let cls = crate::builtins::bytearray_class(self)?;
                 self.get_attr(&cls, attr)
             }
+            Value::Native(n) if n.name == "frozendict" => {
+                let cls = crate::builtins::py315_builtin_class(self, "frozendict")?;
+                self.get_attr(&cls, attr)
+            }
             // A builtin *type* — the VM models `int` / `str` / `list` / … as
             // native constructors, so `int.from_bytes(b, "big")` and the
             // unbound-method form CPython also exposes (`str.upper(s)`,
@@ -8700,6 +8758,15 @@ impl Interpreter {
         let out_clone = out.clone();
         let leaks = comprehension_walrus_names(&[&c.elt], &c.generators);
         self.run_comprehension_leaking(&c.generators, &leaks, env, &mut move |this, scope| {
+            // PEP 798: `[*x for ...]` spreads each `x` into the result.
+            if let Expr::Starred(star) = elt.as_ref() {
+                let spread = this.eval_expr(&star.value, scope)?;
+                let it = this.make_iter(spread)?;
+                while let Some(v) = this.iter_next(&it)? {
+                    out_clone.borrow_mut().push(v);
+                }
+                return Ok(());
+            }
             let v = this.eval_expr(&elt, scope)?;
             out_clone.borrow_mut().push(v);
             Ok(())
@@ -8714,10 +8781,23 @@ impl Interpreter {
         let out_clone = out.clone();
         let leaks = comprehension_walrus_names(&[&c.elt], &c.generators);
         self.run_comprehension_leaking(&c.generators, &leaks, env, &mut move |this, scope| {
-            let v = this.eval_expr(&elt, scope)?;
-            let k = this.hash_key(&v)?;
-            let k = this.settle_key_set(&out_clone, k)?;
-            out_clone.borrow_mut().insert(k);
+            // PEP 798: `{*x for ...}` spreads each `x` into the result.
+            let items = if let Expr::Starred(star) = elt.as_ref() {
+                let spread = this.eval_expr(&star.value, scope)?;
+                let it = this.make_iter(spread)?;
+                let mut items = Vec::new();
+                while let Some(v) = this.iter_next(&it)? {
+                    items.push(v);
+                }
+                items
+            } else {
+                vec![this.eval_expr(&elt, scope)?]
+            };
+            for v in items {
+                let k = this.hash_key(&v)?;
+                let k = this.settle_key_set(&out_clone, k)?;
+                out_clone.borrow_mut().insert(k);
+            }
             Ok(())
         })?;
         let result = std::mem::take(&mut *out.borrow_mut());
@@ -8727,10 +8807,9 @@ impl Interpreter {
     fn eval_dictcomp(&mut self, c: &ast::ExprDictComp, env: &EnvRef) -> Result<Value, Unwind> {
         let out: Rc<crate::value::FrozenCell<DictMap>> =
             Rc::new(crate::value::FrozenCell::new(DictMap::new()));
-        let key_expr = c
-            .key
-            .clone()
-            .ok_or_else(|| type_error("dict comprehension missing key"))?;
+        // No key means PEP 798's `{**d for ...}`: `value` is the mapping
+        // to merge in.
+        let key_expr = c.key.clone();
         let value_expr = c.value.clone();
         let out_clone = out.clone();
         let mut parts: Vec<&Expr> = vec![&c.value];
@@ -8739,7 +8818,21 @@ impl Interpreter {
         }
         let leaks = comprehension_walrus_names(&parts, &c.generators);
         self.run_comprehension_leaking(&c.generators, &leaks, env, &mut move |this, scope| {
-            let key_value = this.eval_expr(&key_expr, scope)?;
+            let Some(key_expr) = &key_expr else {
+                let mapping = this.eval_expr(&value_expr, scope)?;
+                let Some(pairs) = this.mapping_pairs(&mapping)? else {
+                    return Err(type_error(format!(
+                        "'{}' object is not a mapping",
+                        mapping.type_name()
+                    )));
+                };
+                for (k, v) in pairs {
+                    let k = this.settle_key_dict(&out_clone, k)?;
+                    out_clone.borrow_mut().insert(k, v);
+                }
+                return Ok(());
+            };
+            let key_value = this.eval_expr(key_expr, scope)?;
             let k = this.hash_key(&key_value)?;
             let k = this.settle_key_dict(&out_clone, k)?;
             let v = this.eval_expr(&value_expr, scope)?;

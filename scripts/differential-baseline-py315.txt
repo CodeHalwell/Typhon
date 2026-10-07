@@ -1,0 +1,33 @@
+# scripts/differential-baseline-py315.txt
+#
+# Extra expected VM <-> CPython divergences when the CPython side is 3.15.
+# Used only by the differential job's 3.15 leg, unioned with
+# scripts/differential-baseline.txt via:
+#     PYTHON313=python3.15 scripts/vm-differential.sh \
+#         --extra-baseline scripts/differential-baseline-py315.txt
+#
+# The VM reproduces CPython 3.13 — the minimum supported target — so these
+# units diverge only because CPython 3.15 itself changed what they print.
+# None of them is a Typhon or emitter bug; the same emitted Python prints
+# the 3.13 text under python3.13. Same both-directions rule as the main
+# baseline: an entry that stops diverging fails the gate.
+
+# 3.15: sum() of mixed int/float uses compensated summation throughout, so
+# sum([1e20, 1, -1e20]) is 1.0 rather than 0.0.
+stress/round-2026-09-01/vm/fsum.ty
+# 3.15: an unhashable dict key / set element raises
+# "cannot use 'T' as a dict key (unhashable type: 'T')".
+stress/round-2026-09-01/vm/hsh.ty
+stress/round-2026-09-01/vm/p10.ty
+# 3.14+: zero-division messages are unified to "division by zero" and
+# list.index() says "list.index(x): x not in list"; plus the unhashable
+# message above.
+stress/round-2026-09-01/vm/p5.ty
+stress/round-2026-09-01/vm/sil.ty
+# 3.14+: datetime's out-of-range day / month messages name the bounds
+# (p12 also hits the pathlib change below).
+stress/round-2026-09-01/vm/p12.ty
+stress/round-2026-09-01/vm/sw_dt.ty
+# 3.14+: pathlib treats a trailing dot as a suffix, so Path("b.").suffix
+# is "." rather than "".
+stress/round-2026-09-01/vm/sw_path.ty
