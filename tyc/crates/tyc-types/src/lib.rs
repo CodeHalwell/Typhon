@@ -16172,11 +16172,18 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     // is checked again with the local declared as that type,
                     // as it was when this was taken for a reassignment of the
                     // shadowed binding (see `check_function_body`).
+                    // A shadowed binding that is itself a shadowing local (an
+                    // enclosing function's) stands for what it shadows.
                     let shadowed_declared = c
                         .env
                         .lookup(n.id.as_str())
                         .filter(|_| binds_local)
-                        .map(|b| b.declared.clone())
+                        .map(|b| {
+                            c.shadow_locals
+                                .get(&b.span.0)
+                                .cloned()
+                                .unwrap_or_else(|| b.declared.clone())
+                        })
                         .filter(|declared| c.is_assignable(declared, &value_type));
                     let existing = c
                         .env
@@ -26648,7 +26655,12 @@ fn assign_unpacking_target(c: &mut Checker, target: &Expr, elem_ty: &Type) {
             let name = n.id.as_str();
             if let Some(existing) = c.env.lookup(name) {
                 let declared = existing.declared.clone();
+                let start = existing.span.0;
                 if !c.is_assignable(&declared, elem_ty) {
+                    // A shadowing local the slot's value only fits as the
+                    // shadowed binding's type is re-checked as that type, as
+                    // on the single-name `Stmt::Assign` path.
+                    note_shadowed_fit(c, start, elem_ty);
                     let span = (n.range.start().to_usize(), n.range.end().to_usize());
                     c.mismatch(&declared, elem_ty, span);
                 }

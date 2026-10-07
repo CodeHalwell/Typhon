@@ -3453,3 +3453,51 @@ fn a_long_shadowing_chain_keeps_the_bodys_diagnostics() {
     let errors = only_errors(&src, |e| matches!(e, TycError::TypeMismatch { .. }));
     assert_eq!(errors.len(), 2, "{errors:?}");
 }
+
+/// An unpacking assignment to a shadowing local re-checks it as the shadowed
+/// type, as a single-name assignment does (tuple, parenthesised and list
+/// targets), and a local shadowing an enclosing function's shadowing local
+/// stands for the module binding that one shadows.
+#[test]
+fn shadowing_locals_widen_through_unpacking_and_nested_functions() {
+    for target in ["b, c = 0.5, 1", "(b, c) = (0.5, 2)", "[b, c] = [1.5, 2.5]"] {
+        assert_clean(&format!(
+            "b: float = 0.0\n\ndef unpack() -> float:\n    mut b = 0\n    mut c = 0\n    {target}\n    return b + c\n\nprint(unpack())\n"
+        ));
+    }
+    assert_clean(
+        r#"
+mut cache: int? = None
+
+def last(xs: list[int]) -> int?:
+    mut cache = None
+    mut i = 0
+    for x in xs:
+        cache, i = x, i + 1
+    return cache
+
+print(last([1, 3]))
+"#,
+    );
+    assert_clean(
+        r#"
+total: float = 0.0
+
+def outer() -> float:
+    let total = 0
+    def inner() -> float:
+        mut total = 2
+        total = total / 4
+        return total
+    return total + inner()
+
+print(outer())
+"#,
+    );
+    // A value that fits neither is still reported.
+    let errors = only_errors(
+        "b: float = 0.0\n\ndef unpack() -> float:\n    mut b = 0\n    mut c = 0\n    b, c = \"x\", 1\n    return b + c\n\nprint(unpack())\n",
+        |e| matches!(e, TycError::TypeMismatch { .. } | TycError::OperatorTypeMismatch { .. }),
+    );
+    assert!(!errors.is_empty(), "accepted a str into a float shadow");
+}
