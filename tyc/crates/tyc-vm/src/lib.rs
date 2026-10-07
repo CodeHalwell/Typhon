@@ -1022,6 +1022,28 @@ pub fn module_has_eager_generator(module: &ruff_python_ast::ModModule) -> bool {
             }
             visitor::walk_stmt(self, stmt);
         }
+        // A lambda is its own generator scope: the VM runs its body as
+        // `return <body>`.
+        fn visit_expr(&mut self, expr: &'a ruff_python_ast::Expr) {
+            if self.found {
+                return;
+            }
+            if let ruff_python_ast::Expr::Lambda(l) = expr {
+                let body = [Stmt::Return(ruff_python_ast::StmtReturn {
+                    node_index: Default::default(),
+                    range: l.range,
+                    value: Some(l.body.clone()),
+                })];
+                if matches!(
+                    interp::generator_kind(false, &body),
+                    value::GeneratorKind::Eager
+                ) {
+                    self.found = true;
+                    return;
+                }
+            }
+            visitor::walk_expr(self, expr);
+        }
     }
     let mut scan = Scan::default();
     for stmt in &module.body {

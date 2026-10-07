@@ -49,6 +49,9 @@ pub struct Env {
     /// here, so a later `nonlocal` write or `del` from an inner function
     /// stops at this scope instead of reaching further out.
     deleted: RefCell<HashSet<String>>,
+    /// A class body's namespace: `del` of an absent name there raises
+    /// `NameError`, not `UnboundLocalError`.
+    class_namespace: std::cell::Cell<bool>,
     parent: Option<EnvRef>,
     /// The module-global scope. The root env points to itself.
     module: RefCell<Option<EnvRef>>,
@@ -66,6 +69,7 @@ impl Env {
             globals: RefCell::new(HashSet::new()),
             nonlocals: RefCell::new(HashSet::new()),
             deleted: RefCell::new(HashSet::new()),
+            class_namespace: std::cell::Cell::new(false),
             parent: None,
             module: RefCell::new(None),
             slot_info: None,
@@ -90,6 +94,7 @@ impl Env {
             globals: RefCell::new(HashSet::new()),
             nonlocals: RefCell::new(HashSet::new()),
             deleted: RefCell::new(HashSet::new()),
+            class_namespace: std::cell::Cell::new(false),
             parent: Some(parent.clone()),
             module: RefCell::new(parent.module.borrow().clone()),
             slot_info: None,
@@ -107,11 +112,17 @@ impl Env {
             globals: RefCell::new(HashSet::new()),
             nonlocals: RefCell::new(HashSet::new()),
             deleted: RefCell::new(HashSet::new()),
+            class_namespace: std::cell::Cell::new(false),
             parent: Some(closure.clone()),
             module: RefCell::new(closure.module.borrow().clone()),
             slot_info: Some(slot_info),
             slots: RefCell::new(vec![None; n]),
         })
+    }
+
+    /// Mark this env as a class body's namespace.
+    pub fn mark_class_namespace(&self) {
+        self.class_namespace.set(true);
     }
 
     pub fn module_scope(&self) -> EnvRef {
@@ -288,6 +299,7 @@ impl Env {
         if self.nonlocals.borrow().contains(name) {
             DeleteScope::Free
         } else if self.globals.borrow().contains(name)
+            || self.class_namespace.get()
             || std::ptr::eq(self, Rc::as_ptr(&self.module_scope()))
         {
             DeleteScope::Global

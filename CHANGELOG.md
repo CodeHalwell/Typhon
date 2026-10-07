@@ -17,12 +17,14 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   counts its set bits;
   `Perm(0)` is falsy and prints as `Perm(0)` / `<Perm: 0>`; composites are
   cached so `(A | B) is (B | A)`; a `Flag` given an undeclared bit raises
-  CPython's `invalid value` error while an `IntFlag` keeps it; and
+  CPython's `invalid value` error while an `IntFlag` keeps it; negative
+  values (`Perm(-1)`, `Perm.R | -8`) follow CPython's boundary rules; and
   `auto()` after a multi-bit member picks the next free bit.
 - **`del` under `tyc run`.** `del (a, b)` and `del [xs[0], d["k"]]` work
   instead of raising `NotImplementedError`; `del` honours `global` and
-  `nonlocal` declarations; and deleting an unbound name raises `NameError`
-  (module scope) or `UnboundLocalError` (function scope) as CPython does,
+  `nonlocal` declarations; `del` in a class body unbinds the class
+  attribute; and deleting an unbound name raises `NameError` (module or
+  class scope) or `UnboundLocalError` (function scope) as CPython does,
   where the VM used to do nothing.
 - **`bytes.translate` and `bytes.maketrans` under `tyc run`.** Both were
   missing, so a program using them failed with `AttributeError` in the VM
@@ -33,8 +35,8 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   source hit the 1,000,000-item cap even when the loop `break`s. Each
   `__anext__` now runs just before the body that consumes its item.
 - **`tyc run` no longer runs a generator early without saying so.** A
-  generator whose `yield` the VM cannot suspend (in a loop test, a `with`
-  item, or two in one expression) ran its whole body at the call, so its
+  generator (or generator lambda) whose `yield` the VM cannot suspend (in
+  a loop test, a `with` item, or two in one expression) ran its whole body at the call, so its
   side effects came out in the wrong order. The pre-run scan now sends such
   a program to CPython with a `note:`, as it already does for unmodelled
   modules. `--no-fallback` keeps the old behaviour.
@@ -44,7 +46,8 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   only itself and `object`. They now give CPython's chain
   (`AppError, ValueError, Exception, BaseException, object`), and
   `__bases__` works on every class, with the C3 order kept when a builtin
-  exception is mixed with other bases (`class E(ValueError, Mixin)`).
+  type or exception is mixed with other bases (`class E(ValueError,
+  Mixin)`, `class ML(list)`).
 - **`tyc run` sends more programs it cannot run faithfully to CPython.**
   A class with a custom `metaclass=` (anything but the real `ABCMeta` or
   `type`), a class defining or assigning `__del__`, and any use of `with_traceback` / `__traceback__`

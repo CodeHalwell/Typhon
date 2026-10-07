@@ -800,8 +800,9 @@ struct AttributeScan {
     /// Class-level features the VM ignores: a custom `metaclass=` and a
     /// `__del__` finaliser.
     class_features: std::collections::BTreeSet<String>,
-    /// Names the program binds itself — by `def`, `class` or assignment,
-    /// not by import.
+    /// Names bound to something other than the builtin `type`, the `abc`
+    /// module or `abc.ABCMeta`: by `def`, `class`, assignment, or an import
+    /// from anywhere else.
     program_bound: std::collections::HashSet<String>,
     /// The root name of each `metaclass=ABCMeta` / `metaclass=type`
     /// spelling (`abc` for `abc.ABCMeta`): modelled only while the program
@@ -934,10 +935,18 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                 for alias in &imp.names {
                     let module = alias.name.as_str();
                     match &alias.asname {
-                        Some(asname) => self.bind_import(asname.as_str(), module),
+                        Some(asname) => {
+                            if module != "abc" {
+                                self.program_bound.insert(asname.as_str().to_owned());
+                            }
+                            self.bind_import(asname.as_str(), module)
+                        }
                         // `import a.b.c` binds `a`, to the package `a`.
                         None => {
                             let root = module.split('.').next().unwrap_or(module);
+                            if root != "abc" {
+                                self.program_bound.insert(root.to_owned());
+                            }
                             self.bind_import(root, root);
                         }
                     }
@@ -957,6 +966,12 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                         .map(|a| a.as_str())
                         .unwrap_or(alias.name.as_str());
                     self.shadowed.insert(bound.to_owned());
+                    let is_abc_meta = imp.level == 0
+                        && imp.module.as_ref().is_some_and(|m| m.as_str() == "abc")
+                        && alias.name.as_str() == "ABCMeta";
+                    if !is_abc_meta {
+                        self.program_bound.insert(bound.to_owned());
+                    }
                     if let Some(module) = &modelled_source {
                         if alias.name.as_str() != "*" {
                             self.from_imports
@@ -1334,6 +1349,9 @@ mod tests {
         // The same check reaches methods and nested functions.
         let method = "plain class C:\n    def g(self) -> object:\n        def inner() -> object:\n            yield (yield 1)\n        return inner()\nprint(C())\n";
         assert!(scan_source(method).is_some());
+        // A lambda is its own generator scope.
+        let lam = "let g = lambda: (yield (yield 1))\nprint(list(g()))\n";
+        assert!(scan_source(lam).is_some());
         // An ordinary generator runs lazily and stays on the VM.
         let lazy = "def g() -> object:\n    mut n = 0\n    while True:\n        yield n\n        n += 1\nprint(next(g()))\n";
         assert_eq!(scan_source(lazy), None);
@@ -1353,7 +1371,18 @@ mod tests {
         let from_abc =
             "from abc import ABCMeta\nplain class A(metaclass=ABCMeta):\n    pass\nprint(A)\n";
         assert_eq!(scan_source(from_abc), None);
-        // A program's own class spelt `ABCMeta` is not.
+        // A program's own class spelt `ABCMeta` is not, nor one imported
+        // from elsewhere.
+        let foreign =
+            "from custom import ABCMeta\nplain class W(metaclass=ABCMeta):\n    pass\nprint(W())\n";
+        assert!(scan_source(foreign)
+            .unwrap_or_default()
+            .contains(&"a custom metaclass".to_owned()));
+        let aliased =
+            "import custom as abc\nplain class W(metaclass=abc.ABCMeta):\n    pass\nprint(W())\n";
+        assert!(scan_source(aliased)
+            .unwrap_or_default()
+            .contains(&"a custom metaclass".to_owned()));
         let own = "plain class ABCMeta(type):\n    pass\nplain class W(metaclass=ABCMeta):\n    pass\nprint(W())\n";
         assert_eq!(
             scan_source(own),

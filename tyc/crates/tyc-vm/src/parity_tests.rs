@@ -595,6 +595,11 @@ show(repr(C(7)), list(C), len(C), list(C(7)), repr(~C.A), repr(C.A ^ C.AB), C(3)
 show(bool(C(0)), repr(C(0)), str(C(0)), str(P(0)), repr(~C(0)), C(0) in C.A, C.AB in C(7), list(C(0)), C["AB"])
 show(P(7) == 7, hash(P.R) == hash(4), {P.R: 1}[4], f"{C.A}", format(P.R))
 show(len(P(8)), len(P(9)), len(P.RW), len(C.AB), len(C(0)))
+class Q(IntFlag):
+    A = 1
+    B = 2
+show(repr(Q(-8)), repr(Q(-1)), repr(Q(-3)), repr(Q.A | -8), repr(Q.A ^ -1), repr(-8 | Q.A), repr(~Q(8)), repr(C(-1)), repr(C(-8)))
+trap("strict negative", lambda: C(-17))
 trap("strict", lambda: C(8))
 "#,
     );
@@ -631,6 +636,15 @@ show("g" in dir())
 trap("again", drop_global)
 trap("twice", drop_twice)
 trap("nonlocal", outer)
+def class_del() -> None:
+    plain class K:
+        del missing
+trap("class body", class_del)
+plain class Kept:
+    a = 1
+    b = 2
+    del a
+show(hasattr(Kept, "a"), Kept.b)
 def nested() -> object:
     x = 1
     def mid() -> object:
@@ -738,6 +752,11 @@ plain class MixFirst(Mixin, KeyError):
 plain class Join(ErrFirst, KeyError):
     pass
 show(names(ErrFirst.__mro__), names(ErrFirst.__bases__), names(MixFirst.__mro__), names(Join.__mro__), names(Join.__bases__))
+plain class ML(list):
+    pass
+plain class MixList(Mixin, dict):
+    pass
+show(names(ML.__bases__), names(ML.__mro__), names(MixList.__mro__), names(MixList.__bases__))
 "#,
     );
 }

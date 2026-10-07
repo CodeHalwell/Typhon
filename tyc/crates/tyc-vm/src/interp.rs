@@ -1689,10 +1689,11 @@ impl Interpreter {
         // are constructor natives, not `Class`es; remember their names so
         // `isinstance(x, dict)` still answers like CPython.
         let mut builtin_bases: Vec<Value> = Vec::new();
-        // The header's class bases and builtin exception bases, interleaved
-        // in declaration order, for the C3 `__mro__` / `__bases__`.
+        // The header's class bases and builtin type / exception bases,
+        // interleaved in declaration order, for the C3 `__mro__` /
+        // `__bases__`.
         let mut header_bases: Vec<Value> = Vec::new();
-        let mut header_has_exc = false;
+        let mut header_has_builtin = false;
         if let Some(args) = &c.arguments {
             for arg in args.args.iter() {
                 let v = self.eval_expr(arg, env)?;
@@ -1713,7 +1714,7 @@ impl Interpreter {
                         if builtin_exc_mro(n.name).is_some()
                             && matches!(self.root.get(n.name), Some(Value::Native(_))) =>
                     {
-                        header_has_exc = true;
+                        header_has_builtin = true;
                         header_bases.push(Value::Str(Rc::new(n.name.to_owned())));
                     }
                     Value::Module(_) => {
@@ -1734,6 +1735,10 @@ impl Interpreter {
                                 | "object"
                         ) =>
                     {
+                        if n.name != "object" {
+                            header_has_builtin = true;
+                            header_bases.push(Value::Str(Rc::new(n.name.to_owned())));
+                        }
                         builtin_bases.push(Value::Str(Rc::new(n.name.to_owned())));
                     }
                     _ => {
@@ -1756,6 +1761,7 @@ impl Interpreter {
         // method body resolves a bare name, so a class attribute must never
         // shadow a module global inside one.
         let body_ns = Env::new_child(&body_env);
+        body_ns.mark_class_namespace();
 
         // A class is dataclass-shaped (annotated assigns are instance fields)
         // when it carries a `@dataclass` decorator. A `plain class` emits a
@@ -1985,6 +1991,16 @@ impl Interpreter {
                         }
                     }
                 }
+                // `del name` unbinds a class attribute; an absent one is a
+                // `NameError`, as in CPython's class namespace.
+                Stmt::Delete(d) => {
+                    self.exec_delete(d, &body_ns)?;
+                    for t in &d.targets {
+                        if let Expr::Name(n) = t {
+                            class_attrs.remove(n.id.as_str());
+                        }
+                    }
+                }
                 Stmt::Pass(_) => {}
                 Stmt::Expr(_) => {} // docstrings etc.
                 _ => {}
@@ -2090,7 +2106,7 @@ impl Interpreter {
         let is_exception = bases.iter().any(|b| b.is_exception) || !builtin_exc_bases.is_empty();
         // Never inherited: a base's record describes the base's header.
         class_attrs.remove("__typhon_header_bases__");
-        if header_has_exc {
+        if header_has_builtin {
             class_attrs.insert(
                 "__typhon_header_bases__".to_owned(),
                 Value::Tuple(Rc::new(header_bases)),
@@ -3162,27 +3178,49 @@ impl Interpreter {
             Value::Bool(b) => i64::from(*b),
             _ => return None,
         };
-        let members = Self::enum_members(class).unwrap_or_default();
-        let mask = Self::flag_mask(&members);
-        if crate::value::is_int_flag_class(class) {
-            let bits = if bits < 0 { mask & bits } else { bits };
-            return Some(Ok(Self::flag_member_for(class, bits)));
-        }
-        if bits < 0 || bits & !mask != 0 {
-            if bits < 0 {
-                return None;
+        Some(
+            Self::flag_normalise(class, bits)
+                .map(|bits| Self::flag_member_for(class, bits))
+                .map_err(value_error),
+        )
+    }
+
+    /// CPython's `Flag._missing_` value check: a negative value counts
+    /// down from the flag's all-bits mask, and a value outside the
+    /// declared bits is an error for a `Flag` (`STRICT`) and kept by an
+    /// `IntFlag` (`KEEP`). `Err` is the `ValueError` message.
+    fn flag_normalise(class: &Rc<Class>, bits: i64) -> Result<i64, String> {
+        // i128 so the `2 ** bit_length` bounds never overflow.
+        let mask = i128::from(Self::flag_mask(
+            &Self::enum_members(class).unwrap_or_default(),
+        ));
+        let bit_length = |n: i128| 128 - n.unsigned_abs().leading_zeros();
+        let all_bits = (1i128 << bit_length(mask)) - 1;
+        let mut value = i128::from(bits);
+        if !(!all_bits <= value && value <= all_bits) || value & (all_bits ^ mask) != 0 {
+            if !crate::value::is_int_flag_class(class) {
+                let max_bits = bit_length(value).max(bit_length(mask)) as usize;
+                let enum_bin = |n: i128| {
+                    let digits = n & ((1i128 << max_bits) - 1);
+                    let sign = if n < 0 { 1 } else { 0 };
+                    format!("0b{sign} {digits:0>max_bits$b}")
+                };
+                return Err(format!(
+                    "<flag '{}'> invalid value {}\n    given {}\n  allowed {}",
+                    class.name,
+                    value,
+                    enum_bin(value),
+                    enum_bin(mask)
+                ));
             }
-            let max_bits = (64 - bits.leading_zeros()).max(64 - mask.leading_zeros()) as usize;
-            let enum_bin = |n: i64| format!("0b0 {:0>width$b}", n, width = max_bits);
-            return Some(Err(value_error(format!(
-                "<flag '{}'> invalid value {}\n    given {}\n  allowed {}",
-                class.name,
-                bits,
-                enum_bin(bits),
-                enum_bin(mask)
-            ))));
+            if value < 0 {
+                value += (all_bits + 1).max(1i128 << bit_length(value));
+            }
         }
-        Some(Ok(Self::flag_member_for(class, bits)))
+        if value < 0 {
+            value += all_bits + 1;
+        }
+        i64::try_from(value).map_err(|_| format!("{bits} is not a valid {}", class.name))
     }
 
     /// Whether `class` derives from the VM's enum base class `base`
@@ -6685,7 +6723,9 @@ impl Interpreter {
                     BitAnd => lb & rb,
                     _ => lb ^ rb,
                 };
-                if bits >= 0 {
+                // `IntFlag(value | other)`: a negative result goes through
+                // the `KEEP` boundary like any other `IntFlag` value.
+                if let Ok(bits) = Self::flag_normalise(&class, bits) {
                     return Ok(Self::flag_member_for(&class, bits));
                 }
             }
@@ -6776,13 +6816,19 @@ impl Interpreter {
                 }
             }
             // `~Perm.R` complements within the bits the flag's members
-            // declare (CPython 3.11+), for `Flag` and `IntFlag` alike.
+            // declare (CPython 3.11+); an `IntFlag` inverts through its
+            // `KEEP` boundary, so unnamed bits are complemented too.
             if op == UnaryOp::Invert {
                 if let (Some(bits), Value::Instance(inst)) = (crate::value::flag_member_bits(v), v)
                 {
                     let mask =
                         Self::flag_mask(&Self::enum_members(&inst.class).unwrap_or_default());
-                    return Ok(Self::flag_member_for(&inst.class, mask & !bits));
+                    let inverted = if crate::value::is_int_flag_class(&inst.class) {
+                        Self::flag_normalise(&inst.class, !bits).unwrap_or(mask & !bits)
+                    } else {
+                        mask & !bits
+                    };
+                    return Ok(Self::flag_member_for(&inst.class, inverted));
                 }
             }
             // A value-mixin enum member (`IntEnum` / `IntFlag` / `StrEnum`)
@@ -12894,8 +12940,9 @@ fn builtin_exc_parent(name: &str) -> Option<&'static str> {
 /// `BaseException` (the caller appends `object`): `KeyError` gives
 /// `KeyError, LookupError, Exception, BaseException`. `None` when `name` is
 /// not a builtin exception.
-/// One entry of a class's full `__mro__`: a user class, or a builtin
-/// exception the VM models as a native constructor rather than a `Class`.
+/// One entry of a class's full `__mro__`: a user class, or a builtin type
+/// or exception the VM models as a native constructor rather than a
+/// `Class`.
 #[derive(Clone)]
 enum MroNode {
     User(Rc<Class>),
@@ -12912,9 +12959,9 @@ impl PartialEq for MroNode {
     }
 }
 
-/// A class's direct bases in header order, builtin exceptions included —
-/// read from the `__typhon_header_bases__` record when the header named
-/// one, else just its user bases.
+/// A class's direct bases in header order, builtin types and exceptions
+/// included — read from the `__typhon_header_bases__` record when the
+/// header named one, else just its user bases.
 fn header_mro_bases(class: &Rc<Class>) -> Vec<MroNode> {
     if let Some(Value::Tuple(t)) = class.class_attrs.borrow().get("__typhon_header_bases__") {
         return t
@@ -12936,8 +12983,8 @@ fn header_mro_bases(class: &Rc<Class>) -> Vec<MroNode> {
         .collect()
 }
 
-/// The C3 linearisation of `class` over user classes and builtin exception
-/// chains, without the implicit `object`. `None` when the bases admit no
+/// The C3 linearisation of `class` over user classes, builtin types and
+/// builtin exception chains, without the implicit `object`. `None` when the bases admit no
 /// consistent order.
 fn c3_linearise(class: &Rc<Class>) -> Option<Vec<MroNode>> {
     let heads = header_mro_bases(class);
@@ -12945,7 +12992,8 @@ fn c3_linearise(class: &Rc<Class>) -> Option<Vec<MroNode>> {
     for head in &heads {
         seqs.push(match head {
             MroNode::User(c) => c3_linearise(c)?,
-            MroNode::Builtin(n) => builtin_exc_mro(n)?
+            MroNode::Builtin(n) => builtin_exc_mro(n)
+                .unwrap_or_else(|| vec![n.as_str()])
                 .into_iter()
                 .map(|l| MroNode::Builtin(l.to_owned()))
                 .collect(),
