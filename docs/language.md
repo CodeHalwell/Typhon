@@ -37,6 +37,14 @@ Narrowing forms the checker recognises:
 
 - `is None` / `is not None`
 - `isinstance(x, T)` (including tuple-of-types `isinstance(x, (A, B))`)
+- `type(x) is C`, `type(x) == C` and `x.__class__ is C` — the branch where the
+  test holds only (an instance of a subclass fails it, so the other branch
+  keeps the full type); `C` must name a class, and a TypeVar, newtype or
+  literal-union subject keeps its type
+- container class patterns re-head an abstract subject: under `case dict():`
+  a `Mapping[K, V]` is a `dict[K, V]`, under `case list():` a `Sequence[T]`
+  is a `list[T]`; a `match` on an attribute (`match self.cfg:`) narrows that
+  attribute
 - `guard x = expr else: ...` early-return
 - `if x is None: return` / `raise` / `break` / `continue` early-exit
 - Exhaustive `match` arms — covers sealed unions, `Result`, and since

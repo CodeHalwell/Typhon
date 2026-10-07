@@ -4,7 +4,7 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## Unreleased — Python 3.15 support
+## Unreleased — Python 3.15 support and checker soundness fixes
 
 Typhon adopts what CPython 3.15 adds. Every feature is type-checked and runs
 under `tyc run` on every target; the `[python] target` only decides how it
@@ -15,6 +15,14 @@ check-time diagnostic in place of the `NameError` / `ImportError` /
 program that was already accepted is unchanged on every target. Full
 reference: "Python 3.15 features" in `docs/language.md` and the docs-site
 page of the same name.
+
+The second half of this section fixes two families of checker bugs and the
+VM ↔ CPython divergences found while root-causing them: an annotated binding
+whose declared type was silently replaced by the value's frozen shape, and
+name-keyed tables (function arities, type facts, summaries) consulted for an
+unrelated entity that merely shared a name. Every newly reported program
+crashes at runtime or carries an annotation that misstates the runtime value;
+see *Compatibility* below.
 
 ### Added
 
@@ -95,6 +103,143 @@ entries, and fire only on code that would fail on the configured target.
   named `profiling` on 3.15+.
 - `tyc::lazy_usage` messages and docs describe the PEP 810 forms.
 
+### Fixed — annotated bindings enforce their declared type
+
+- **An annotation is no longer replaced by the value's frozen shape.** An
+  annotated `let`, `mut`, `pub let`, module-level `X: T = v`, `comptime let`
+  or typed tuple-unpack leg whose value fitted only the annotation's frozen
+  shape (`let l: list[int] = t` with `t` a tuple; `set` from a `frozenset`;
+  `dict` from a `Mapping` or `frozendict`; nested, Optional, union and alias
+  forms) was accepted and the binding silently re-typed to `tuple` /
+  `frozenset` / `Mapping`. It is now `tyc::type_mismatch`, and the binding
+  keeps its declared type, which also removes the follow-on false positives
+  (`mut m: list[int] = t; m = [1, 2]` reported "cannot assign", and
+  `l.append(…)` reported a missing attribute on `tuple`). An *unannotated*
+  binding of a frozen value keeps the frozen shape, and `freeze let` is
+  unchanged. This reverses the beta.1 (W2-05) acceptance of annotated aliases
+  of frozen values; the escape is to annotate what the value is
+  (`tuple[int, ...]`, `Mapping[K, V]`) or to copy it (`list(x)`).
+- **Dataclass field defaults keep working where the desugar copies them.**
+  `items: list[int] = T` with `T` a module tuple is lowered to
+  `default_factory=lambda: list(T)` (W7-07) and stays accepted. The checker
+  now takes that decision from the same code the desugar uses
+  (`tyc_syntax::field_defaults`), one level deep and independent of
+  `[emit] freeze-dict`, so classes the desugar does not decorate — exceptions,
+  metaclasses, `plain class`, `class!`, `model`, `ClassVar` fields, classes
+  nested under `if`/`for`/`with`/`try` — get no such allowance, and their
+  uncopied frozen defaults (which crashed on the first mutation) are reported.
+- **New narrowings, so correct code that inspects a `Mapping` keeps
+  checking.** `case dict()` / `list()` / `tuple()` / `set()` / `frozenset()`
+  re-head an abstract subject (`Mapping[K, V]` to `dict[K, V]`,
+  `Sequence[T]` to `list[T]`, …), including `as` captures; `match` on an
+  attribute subject narrows that attribute; and `type(x) is C`,
+  `type(x) == C` and `x.__class__ is C` narrow the branch where the test
+  holds (only when `C` is a class name and the result fits the current type,
+  so TypeVars, newtypes and literal unions keep theirs). This also clears
+  pre-existing false positives when such a value is passed or returned.
+- **Narrowings of an attribute path are dropped when its root name is
+  rebound** — by a `for` target, walrus, `with … as`, `match` capture,
+  augmented assignment, `del`, `except … as`, or a callee's `global` /
+  `nonlocal` rebind — for `isinstance` narrowings as well as the new ones.
+- `self.x: T = v` checks `v` against `T` and against the field `x`
+  (previously neither); `lazy let NAME: T = E` checks `E` against `T`, and an
+  unannotated `lazy let` is typed from `E`.
+- `collections.abc.Set` and `typing.AbstractSet` are read-only set views that
+  accept `set`, `frozenset` and dict key views; `Set` from `collections.abc`
+  was treated as the mutable `typing.Set`.
+- Desugar: a dataclass default naming a function local is copied according to
+  that local, not to a module-level list/dict/set of the same name (a
+  shadowing tuple was wrapped in `list(…)`), and a local list/dict/set default
+  is copied instead of raising dataclass's mutable-default `ValueError`.
+- `examples/apps/04-event-sourced-banking` reads its frozen FX table as
+  `Mapping[str, float]?`.
+
+### Fixed — names resolve to what they are bound to
+
+- **A method call is checked against the method, not a same-named
+  function.** `table.get(key)` inside a module-level `def get(…)` reported a
+  false `tyc::missing_argument`; a module-level or from-imported function
+  also lent its parameter types, keyword names and `**kwargs` type to any
+  method sharing its name, and could mask real errors (`xs.append(1, 2)`).
+  An attribute callee's arity now comes from its receiver's signature, for
+  every receiver expression and for unbound `Cls.method(inst, …)` (including
+  `mod.Cls.method`), TypeVar-bound receivers and bound-method aliases
+  (`let g = u.greet`). A method behind a signature-changing decorator is
+  checked against the decorator's declared `Callable`, or left unchecked.
+- **A parameter, local or loop variable named like a module function uses its
+  own type** for arity, keyword arguments, `TypeGuard` narrowing, `NoReturn`,
+  TypeVar bounds, field-write effects, `with` targets and `go` spawner
+  tracking. An unannotated function-local `let x = …` named like a module
+  def, import or global now creates a local instead of being checked as a
+  reassignment of the module binding.
+- **Class bodies no longer leak into method bodies** (Python scoping): a
+  method's call to a module function is not checked against a sibling method
+  of the same name, and a class field no longer shadows a builtin inside
+  methods. Parameter defaults still see the class scope, as in Python.
+- `@contextmanager` methods are keyed by class; each def keeps its own TypeVar
+  bounds (a method or nested def no longer overwrites or inherits a module
+  function's, and nested generic defs are checked at call sites); field-write
+  summaries are kept per `(class, method)`.
+- **Cross-module type facts follow the import.** Frozen classes, newtypes,
+  aliases, enums and sealed unions from a touched module applied to any class
+  with the same bare name, giving false `tyc::frozen_assign`,
+  `tyc::non_exhaustive_match` and attribute errors on an unrelated local or
+  imported class. A fact now applies only where the name refers to that
+  module's entity, and an imported function's signature keeps meaning its
+  defining module's type when a same-named local class exists (such
+  diagnostics name it qualified, e.g. `geometry.Point`).
+- `tyc::blocking_in_async`, `tyc::resource_not_managed`, the purity check and
+  `tyc::shared_mut_across_tasks` look at what a name is bound to: a local
+  `requests` dict, a local `time`, a user-defined `open()` or a parameter
+  named `worker` no longer match the stdlib entity.
+- `dict.get(k, default=v)` and `d.get(k, a, b)` are reported: `get` is
+  positional-only on `dict`, `frozendict`, `defaultdict`, `OrderedDict`,
+  `Counter`, dict subclasses and `freeze let` dicts, and CPython raises
+  `TypeError`. A user `extend dict: def get(…)` uses its own signature.
+
+### Fixed — VM ↔ CPython parity (`tyc run`)
+
+- `type(x) is C` and `x.__class__ is C` hold for builtin types, exceptions,
+  `bytearray`, `property`, `defaultdict` and 3.15's `sentinel`;
+  `type(C)` of an enum / ABC / Protocol / TypedDict class is its metaclass;
+  `issubclass(type(e), Exception)` and `isinstance(cls, type)` match CPython;
+  builtin stand-ins expose `__mro__`; dicts keyed by builtin types keep the
+  type objects.
+- Method-form `@contextmanager` / `@asynccontextmanager` and `@cache` /
+  `@lru_cache` / `@memo` methods receive `self` (they raised "missing
+  required argument: 'self'").
+- Builtin methods check their positional-argument count with CPython's
+  messages (`xs.append(1, 2)` appended `1`; `d.get(k, a, b)` returned `a`),
+  and the optional arguments of `tuple.index`, `bytes.split` / `rsplit`,
+  `rfind`, `rindex`, `startswith` and friends are honoured instead of
+  ignored. `int.is_integer()` exists. `dict.update` takes keywords alongside a
+  positional mapping, and `d.update(d)` no longer panics.
+- `os.environ` is a `Mapping` like CPython's, so `os.environ.get(k,
+  default=v)` works; `Counter` / `OrderedDict` / `defaultdict` / `frozendict`
+  `get` are positional-only.
+
+### Compatibility
+
+Each newly reported program either fails at runtime or relies on an
+annotation that misstates the runtime value (categories 2 and 3 in
+`docs/compatibility.md`):
+
+- an annotated binding receiving a tuple, frozenset, `Mapping` or `frozendict`
+  for a `list`, `set` or `dict` annotation (category 3; annotate the frozen
+  type, or copy) — including the beta.1 W2-05 annotated-alias form and a
+  caught-failure probe such as `let row: list[int] = CFG["a"]; try:
+  row.append(…)`;
+- uncopied frozen defaults on exceptions, metaclasses and non-dataclass
+  classes (category 2);
+- unbound-method, TypeVar-receiver and alias calls with the wrong arguments,
+  `dict.get(k, default=…)`, and method calls a same-named function used to
+  mask (category 2);
+- code relying on a narrowing that survived a rebinding of its root
+  (category 3).
+
+The example, stress and valid-program corpora check identically before and
+after, apart from the banking example's annotation.
+
 ### Testing
 
 - Checker, VM, emitter, preprocessor, formatter and config unit tests for
@@ -103,6 +248,10 @@ entries, and fire only on code that would fail on the configured target.
   run when a `python3.15` is on `PATH`; CI's `test` job installs one beside
   3.13 and sets `TYC_REQUIRE_PYTHON315=1`, which makes a missing interpreter
   a failure rather than a skip.
+- The checker fixes come with `annotated_binding_tests.rs` and
+  `name_resolution_tests.rs` (tyc-types) plus cross-module tyc-db tests; each
+  bug's repro fails on the previous checker. The VM fixes are pinned against
+  CPython's output in `parity_tests.rs` and the VM unit tests.
 
 ## 1.0.0-beta.2 — 2026-10-04 — first published beta: Windows build fix
 

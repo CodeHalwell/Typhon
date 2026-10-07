@@ -78,6 +78,22 @@ def f(x: int | str | None) -> str:
   Tuple-of-types narrows to the union of the named types, not to a single specific one.
 </aside>
 
+### `type(x) is C`
+
+`type(x) is C`, `type(x) == C` and `x.__class__ is C` narrow the branch where the test holds. The other branch keeps the full type, because an instance of a subclass of `C` fails the test:
+
+```python
+from collections.abc import Mapping
+
+def size(m: Mapping[str, int]) -> int:
+    if type(m) is dict:
+        let d: dict[str, int] = m    # narrowed to dict[str, int]
+        d["seen"] = 1
+    return len(m)
+```
+
+`C` must name a class (a local variable holding one does not count), and a TypeVar, newtype or literal-union subject keeps its declared type.
+
 ### `guard` early-return
 
 ```python
@@ -137,6 +153,8 @@ def label(x: object) -> str:
 ```
 
 Exhaustiveness also recognises `case None:` + `case str() as s:` as covering a `str?` subject — no `missing_return` even without a wildcard.
+
+A container pattern re-heads an abstract subject: under `case dict():` a `Mapping[K, V]` subject is a `dict[K, V]`, and under `case list():` a `Sequence[T]` is a `list[T]`, element types kept. A `match` on an attribute (`match self.cfg:`) narrows that attribute inside the arm, until the attribute or its root is written.
 
 ### `assert x is not None` (v0.9.0)
 
