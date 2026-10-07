@@ -1346,8 +1346,9 @@ fn build_external_shapes(
 }
 
 /// For each module this one imports from (or imports outright), the types it
-/// declares under a name this module binds to something other than that very
-/// type: a declaration of its own, or an import of another module's name.
+/// declares under a name this module provably binds to something other than
+/// that very type: a declaration of its own, or an import of another
+/// module's different declaration.
 fn colliding_type_names(
     bindings: &[tyc_resolve::Binding],
     shapes_by_module: &std::collections::HashMap<String, ModuleShapes>,
@@ -1357,6 +1358,32 @@ fn colliding_type_names(
         .iter()
         .filter_map(|b| b.import_info.as_ref().map(canon))
         .collect();
+    // Whether `b` binds `name` to something other than `module`'s type of
+    // that name. A `from X import N` is the same class when `X` re-exports
+    // it: a `pub *` facade publishes a copy of its facts, and a module that
+    // only imports it publishes nothing under that name. Only `X`'s own,
+    // different declaration (or a function) is another entity; an `X` the
+    // registry does not know may re-export too, so it is not counted.
+    let binds_other =
+        |b: &tyc_resolve::Binding, module: &str, name: &str, shapes: &ModuleShapes| {
+            let Some(info) = &b.import_info else {
+                return true;
+            };
+            let Some(member) = info.member.as_deref() else {
+                return true;
+            };
+            let source = canon(info);
+            if source == module && member == name {
+                return false;
+            }
+            let Some(source_shapes) = shapes_by_module.get(&source) else {
+                return false;
+            };
+            if source_shapes.declared_type_names().contains(member) {
+                return !shapes.declares_same_type(name, source_shapes, member);
+            }
+            source_shapes.function_arities.contains_key(member)
+        };
     let mut out = std::collections::HashMap::new();
     for module in touched {
         let Some(shapes) = shapes_by_module.get(&module) else {
@@ -1366,12 +1393,9 @@ fn colliding_type_names(
             .declared_type_names()
             .into_iter()
             .filter(|name| {
-                bindings.iter().any(|b| {
-                    b.name == *name
-                        && !b.import_info.as_ref().is_some_and(|info| {
-                            info.member.as_deref() == Some(*name) && canon(info) == module
-                        })
-                })
+                bindings
+                    .iter()
+                    .any(|b| b.name == *name && binds_other(b, &module, name, shapes))
             })
             .map(str::to_owned)
             .collect();
@@ -3433,5 +3457,194 @@ def main() -> None:
             .filter(|e| matches!(e, TycError::MissingArgument { .. }))
             .count();
         assert_eq!(missing, 2, "{:?}", diags.errors());
+    }
+
+    // ── A facade or re-export import is the class it re-exports ──────────
+
+    fn check_in(
+        path: &str,
+        text: &str,
+        registry: std::collections::HashMap<String, ModuleShapes>,
+    ) -> Diagnostics {
+        let mut db = TycDatabase::new();
+        check_file_with_imports_opts(
+            &mut db,
+            path.into(),
+            text.into(),
+            &std::sync::Arc::new(registry),
+            CheckOptions::default(),
+        )
+    }
+
+    #[test]
+    fn a_facade_import_names_the_aggregated_class() {
+        // Review N0 (F1): `from pkg import Animal`, `pkg/__init__` a `pub *`
+        // aggregate of `pkg.base`, beside `from pkg.base import adopt`.
+        let base = "\
+pub class Animal:
+    name: str
+
+pub class Rock:
+    kg: int
+
+pub type Thing = Animal | Rock
+
+pub enum Mood:
+    HAPPY
+    SAD
+
+pub class Box[T]:
+    item: T
+
+pub def adopt(n: str) -> Animal:
+    return Animal(name=n)
+
+pub def describe(a: Animal) -> str:
+    return a.name
+
+pub def boxed(a: Animal) -> Box[Animal]:
+    return Box(item=a)
+
+pub def mood() -> Mood:
+    return Mood.HAPPY
+";
+        let main = "\
+from pkg import Animal, Thing, Mood, Box
+from pkg.base import adopt, describe, boxed, mood
+
+class Dog(Animal):
+    breed: str
+
+def kind(t: Thing) -> str:
+    return \"thing\"
+
+def feel() -> str:
+    match mood():
+        case Mood.HAPPY:
+            return \":)\"
+        case Mood.SAD:
+            return \":(\"
+
+def main() -> None:
+    print(kind(adopt(\"a\")))
+    print(describe(Dog(name=\"rex\", breed=\"lab\")))
+    let b: Box[Animal] = boxed(adopt(\"b\"))
+    print(b.item.name, feel())
+";
+        let mut registry = (*build_registry(&[("pkg.base", base)])).clone();
+        // What the `pub *` aggregation publishes for the package.
+        let facade = registry["pkg.base"].clone();
+        registry.insert("pkg".into(), facade);
+        let diags = check_in("main.ty", main, registry);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
+    fn a_reexporting_module_import_names_the_original_class() {
+        // Review N0 (m10 / m16): `api` imports `Point` from `geometry`
+        // and declares none of its own; and a package-relative facade.
+        let geometry = "\
+pub class Point:
+    x: int
+
+pub class Line:
+    a: Point
+    b: Point
+
+pub type Figure = Point | Line
+
+pub def origin() -> Point:
+    return Point(x=0)
+";
+        let api = "\
+from geometry import Point
+
+pub def mk(x: int) -> Point:
+    return Point(x=x)
+";
+        let main = "\
+from api import Point, mk
+from geometry import Figure, Line, origin
+
+def show(f: Figure) -> str:
+    match f:
+        case Point(x=x):
+            return f\"p{x}\"
+        case Line():
+            return \"line\"
+
+def main() -> None:
+    let p: Point = origin()
+    print(show(mk(3)), show(p), show(Line(a=Point(x=1), b=Point(x=2))))
+";
+        let registry = (*build_registry(&[("geometry", geometry), ("api", api)])).clone();
+        let diags = check_in("main.ty", main, registry);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        let user = "\
+pub class User:
+    name: str
+
+pub class Guest:
+    tag: str
+
+pub type Principal = User | Guest
+
+pub def load_user(name: str) -> User:
+    return User(name=name)
+";
+        let service = "\
+from .models import User, Guest, Principal
+from .models.user import load_user
+
+pub def who(p: Principal) -> str:
+    match p:
+        case User(name=n):
+            return n
+        case Guest(tag=t):
+            return t
+
+pub def run() -> str:
+    return who(load_user(\"ann\"))
+";
+        let mut registry =
+            (*build_registry(&[("app.models.user", user), ("app.service", service)])).clone();
+        let facade = registry["app.models.user"].clone();
+        registry.insert("app.models".into(), facade);
+        let diags = check_in("app/service.ty", service, registry);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
+    fn an_import_of_a_different_same_named_class_still_qualifies() {
+        // `api` declares a `Point` of its own (frozen), `geometry` another
+        // (mutable): `origin()`'s point may be written, `api.Point`'s not.
+        let api = "\
+pub class Point frozen:
+    x: int
+";
+        let geometry = "\
+pub class Point:
+    x: int
+
+pub def origin() -> Point:
+    return Point(x=0)
+";
+        let main = "\
+from api import Point
+from geometry import origin
+
+def main() -> None:
+    let o = origin()
+    o.x = 7
+    let p = Point(x=1)
+    p.x = 2
+";
+        let diags = check_main(
+            main,
+            &[("api", api), ("geometry", geometry)],
+            CheckOptions::default(),
+        );
+        assert_eq!(frozen_writes(&diags), 1, "{:?}", diags.errors());
+        assert_eq!(diags.errors().len(), 1, "{:?}", diags.errors());
     }
 }

@@ -74,6 +74,14 @@ The current registry of resource-returning callees:
 - `tempfile.TemporaryDirectory`
 - `tempfile.TemporaryFile`
 
+The name has to mean that callee where it is called: a bare `open` that
+nothing binds, or one imported from `builtins` / `io` (or `codecs`,
+`gzip`, `bz2`, `lzma`, `tarfile`, `shelve`, `dbm`), and a module the code
+imports itself — at module level or inside the function
+(`import socket`). A parameter, local or `def` of that name, or an `open`
+imported from anywhere else (`from os import open`, which returns a file
+descriptor), is some other callable and is not reported.
+
 Project-specific classes can opt in via a `.dty` annotation in a
 future release.
 

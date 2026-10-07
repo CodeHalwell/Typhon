@@ -3784,6 +3784,28 @@ struct Checker<'a> {
     /// an imported `fastapi.HTTPException` (an exception with no locally-known
     /// bases) never false-positives.
     local_classes: std::collections::HashSet<String>,
+    /// The names that mean a `plain class` / `class!` where the body being
+    /// checked stands: the module's own declarations at first, then, inside a
+    /// function, its local classes' (see [`shadow_outer_classes`]). The
+    /// resolver's sets are by bare name across every scope, so a nested
+    /// `plain class Point` would otherwise make a module `Point` plain too.
+    plain_classes: std::collections::HashSet<String>,
+    raw_classes: std::collections::HashSet<String>,
+    /// `(class, method)` pairs a function-local class and the outer class it
+    /// shadows both declare with different signatures: while the body is
+    /// checked the member exists but either signature may be the one called,
+    /// so structural checks do not judge it.
+    either_methods: std::collections::HashSet<(String, String)>,
+    /// Unannotated function locals declared with their value's type although
+    /// they shadow an enclosing binding, by declaration offset: that
+    /// binding's declared type, which the value fits.
+    shadow_locals: HashMap<usize, Type>,
+    /// The ones a later value fitting only the shadowed type was assigned to
+    /// in the pass over the current function body ...
+    shadow_pending: std::collections::HashSet<usize>,
+    /// ... and so are declared with the shadowed type when the body is
+    /// checked again (see [`check_function_body`]).
+    shadow_widen: std::collections::HashSet<usize>,
     /// Per-class set of attribute names assigned through `self`
     /// (`self.NAME = ...`) inside a method body but NOT declared as a
     /// class-level annotated field. Consulted by `find_field` so reads of
@@ -4199,6 +4221,12 @@ impl<'a> Checker<'a> {
             class_parents: HashMap::new(),
             class_base_tails: HashMap::new(),
             local_classes: std::collections::HashSet::new(),
+            plain_classes: resolved.plain_classes.clone(),
+            raw_classes: resolved.raw_classes.clone(),
+            either_methods: std::collections::HashSet::new(),
+            shadow_locals: HashMap::new(),
+            shadow_pending: std::collections::HashSet::new(),
+            shadow_widen: std::collections::HashSet::new(),
             self_attrs: HashMap::new(),
             class_var_attrs: HashMap::new(),
             unsafe_depth: 0,
@@ -4240,7 +4268,7 @@ impl<'a> Checker<'a> {
     /// hand-written `__init__` is legal — both `tyc::class_attr_shadows_slot`
     /// and `tyc::manual_init` must be suppressed for it.
     fn is_plain_class(&self, name: &str) -> bool {
-        self.resolved.plain_classes.contains(name)
+        self.plain_classes.contains(name)
     }
 
     /// True iff `name` was declared with `class! NAME(...):` (raw class).
@@ -4248,7 +4276,7 @@ impl<'a> Checker<'a> {
     /// decorator and may carry a hand-written `__init__` preserved
     /// verbatim — so `tyc::manual_init` must not fire on it.
     fn is_raw_class(&self, name: &str) -> bool {
-        self.resolved.raw_classes.contains(name)
+        self.raw_classes.contains(name)
     }
 
     /// True iff `name` (or any of its known base classes) defines a
@@ -4663,6 +4691,14 @@ impl<'a> Checker<'a> {
         // implicit `self`), and re-run the function-to-function check above.
         // Only *relaxes* assignability, so it can't introduce a false positive.
         if let (Type::Function { .. }, Type::Class(cls_name)) = (expected, actual) {
+            // Either of two `__call__`s (a function-local class shadowing
+            // another): present, but not judged.
+            if self
+                .either_methods
+                .contains(&(cls_name.clone(), "__call__".to_owned()))
+            {
+                return true;
+            }
             if let Some(sig) = self.find_method(cls_name, "__call__") {
                 let call_ty = Type::Function {
                     params: sig.param_types.clone(),
@@ -5503,6 +5539,14 @@ impl<'a> Checker<'a> {
             n == iface_name || n == iface_bare
         };
         for (m, iface_sig) in &iface_shape.methods {
+            // A function-local class and the class it shadows both declare
+            // `m`, differently: the member is there, its signature unjudged.
+            if self
+                .either_methods
+                .contains(&(cls_name.to_owned(), m.clone()))
+            {
+                continue;
+            }
             // Skip the return check when the interface method returns the same
             // interface type to avoid infinite recursion for self-referential
             // interfaces (e.g. `def next(self) -> Node`).
@@ -6737,7 +6781,7 @@ impl<'a> Checker<'a> {
         for tv_name in tv_names {
             let inferred = &bindings[tv_name];
             if let Some(bound) = bounds.get(tv_name) {
-                if !self.is_assignable(bound, inferred) {
+                if !self.is_assignable(bound, inferred) && !self.is_unmodelled_protocol(bound) {
                     self.typevar_bound_violation(
                         tv_name,
                         &inferred.display(),
@@ -6747,6 +6791,33 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+    }
+
+    /// Whether `bound` is one of `typing` / `collections.abc`'s structural
+    /// protocols that the checker compares nominally (`Sized`, `Hashable`,
+    /// `SupportsInt`, …): a `str` *is* `Sized`, but no class relationship
+    /// says so, so a failed nominal check proves nothing. A class of this
+    /// module named like one is that class.
+    fn is_unmodelled_protocol(&self, bound: &Type) -> bool {
+        let (Type::Class(name) | Type::Generic(name, _)) = bound else {
+            return false;
+        };
+        if self.local_classes.contains(name.as_str()) || self.interfaces.contains_key(name) {
+            return false;
+        }
+        matches!(
+            class_name_tail(name),
+            "Sized"
+                | "Hashable"
+                | "SupportsInt"
+                | "SupportsFloat"
+                | "SupportsComplex"
+                | "SupportsBytes"
+                | "SupportsIndex"
+                | "SupportsAbs"
+                | "SupportsRound"
+                | "Buffer"
+        )
     }
 
     /// Collect the set of higher-kinded type-constructor *variable* names
@@ -7006,6 +7077,31 @@ impl ModuleShapes {
             .map(String::as_str)
             .filter(|name| !name.starts_with("__typhon_"))
             .collect()
+    }
+
+    /// Whether the type this module declares as `name` and the one `other`
+    /// declares as `other_name` are the same declaration as far as their
+    /// published facts can tell. A `pub *` facade carries a copy of every
+    /// fact of each type it aggregates, so equal facts are the evidence of a
+    /// re-export; two distinct types that agree on all of them are treated
+    /// as one, which only ever leaves names unqualified (permissive).
+    pub fn declares_same_type(&self, name: &str, other: &ModuleShapes, other_name: &str) -> bool {
+        let classes = match (
+            self.class_shapes.get(name),
+            other.class_shapes.get(other_name),
+        ) {
+            (Some(a), Some(b)) => shapes_equivalent(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        classes
+            && self.class_type_params.get(name) == other.class_type_params.get(other_name)
+            && self.interfaces.get(name) == other.interfaces.get(other_name)
+            && self.enums.get(name) == other.enums.get(other_name)
+            && self.frozen_classes.contains(name) == other.frozen_classes.contains(other_name)
+            && self.newtypes.get(name) == other.newtypes.get(other_name)
+            && self.type_aliases.get(name) == other.type_aliases.get(other_name)
+            && self.sealed_unions.get(name) == other.sealed_unions.get(other_name)
     }
 
     /// These shapes with every reference to a type they declare under one of
@@ -7734,6 +7830,7 @@ pub fn check_module_with_options(
 ) -> CheckedModule {
     let mut c = Checker::new(path.into(), source, resolved);
     c.module = Some(module);
+    scope_class_kinds_to_module(&mut c, module);
     c.python_minor = options.python_minor;
     c.freeze_to_frozendict = options.freeze_to_frozendict;
     c.sentinels = module_sentinels(module);
@@ -9743,14 +9840,44 @@ fn require_with_callee(c: &Checker, expr: &Expr) -> Option<String> {
         return None;
     }
     let head = name.split('.').next().unwrap_or(&name);
+    // An import binding names the table's callee when it imports the
+    // stdlib module itself (`import socket`, in any scope), or, for a bare
+    // `open`, the builtin or a stdlib module's file-opening `open` — not
+    // `os.open` (a file descriptor) or a project module's own `open`.
+    let imports_callee = |b: &tyc_resolve::Binding| {
+        b.import_info.as_ref().is_some_and(|info| {
+            info.level == 0
+                && match info.member.as_deref() {
+                    None => head != "open" && info.module.split('.').next() == Some(head),
+                    Some(member) => {
+                        head == "open"
+                            && member == "open"
+                            && matches!(
+                                info.module.as_str(),
+                                "builtins"
+                                    | "io"
+                                    | "codecs"
+                                    | "gzip"
+                                    | "bz2"
+                                    | "lzma"
+                                    | "tarfile"
+                                    | "shelve"
+                                    | "dbm"
+                            )
+                    }
+                }
+        })
+    };
     let scopes = &c.resolved.scopes;
     let innermost = c.resolved.scope_at_offset(expr.range().start().to_usize());
     let mut id = Some(innermost);
     while let Some(scope) = id.filter(|&i| i != 0).and_then(|i| scopes.get(i)) {
         // A class body's names are not visible from functions nested in it.
         let visible = scope.id == innermost || scope.kind != tyc_resolve::ScopeKind::Class;
-        if visible && scope.lookup_local(head).is_some() {
-            return None;
+        if visible {
+            if let Some(b) = scope.lookup_local(head) {
+                return imports_callee(b).then_some(name);
+            }
         }
         id = scope.parent;
     }
@@ -9760,9 +9887,8 @@ fn require_with_callee(c: &Checker, expr: &Expr) -> Option<String> {
         .flat_map(|s| s.bindings.iter())
         .filter(|b| b.name == head)
         .peekable();
-    let user_bound =
-        module_bindings.peek().is_some() && module_bindings.all(|b| b.kind != BindingKind::Import);
-    (!user_bound).then_some(name)
+    let names_callee = module_bindings.peek().is_none() || module_bindings.any(imports_callee);
+    names_callee.then_some(name)
 }
 
 fn dotted_name_of(expr: &Expr) -> Option<String> {
@@ -11985,30 +12111,35 @@ fn decorator_keeps_signature(deco: &Expr, defs: &ModuleDefs, classes: &[String])
         Expr::Attribute(a) => a.attr.as_str(),
         _ => return false,
     };
-    if matches!(
-        name,
-        "staticmethod"
-            | "classmethod"
-            | "property"
-            | "cached_property"
-            | "_typhon_cached_property"
-            | "setter"
-            | "getter"
-            | "deleter"
-            | "abstractmethod"
-            | "override"
-            | "final"
-            | "overload"
-            | "deprecated"
-            | "contextmanager"
-            | "asynccontextmanager"
-            | "cache"
-            | "lru_cache"
-            | "wraps"
-            | "memo"
-            | "pure"
-            | "gatherable"
-    ) {
+    // A module `def` is judged by its own types, whatever its name: a user
+    // `def cache(f: …) -> …` is not `functools.cache`.
+    let module_def = matches!(target, Expr::Name(_)) && defs.contains_key(name);
+    if !module_def
+        && matches!(
+            name,
+            "staticmethod"
+                | "classmethod"
+                | "property"
+                | "cached_property"
+                | "_typhon_cached_property"
+                | "setter"
+                | "getter"
+                | "deleter"
+                | "abstractmethod"
+                | "override"
+                | "final"
+                | "overload"
+                | "deprecated"
+                | "contextmanager"
+                | "asynccontextmanager"
+                | "cache"
+                | "lru_cache"
+                | "wraps"
+                | "memo"
+                | "pure"
+                | "gatherable"
+        )
+    {
         return true;
     }
     let Expr::Name(n) = deco else {
@@ -12026,6 +12157,14 @@ fn decorator_keeps_signature(deco: &Expr, defs: &ModuleDefs, classes: &[String])
         .next()
         .and_then(|p| p.parameter.annotation.as_deref());
     match (first, f.returns.as_deref()) {
+        // `Concatenate[…, P]` is not modelled: both sides would read alike
+        // although the decorator adds or drops parameters.
+        (Some(takes), Some(gives))
+            if annotation_mentions(takes, "Concatenate")
+                || annotation_mentions(gives, "Concatenate") =>
+        {
+            false
+        }
         (Some(takes), Some(gives)) => {
             let takes = type_from_annotation_with_params(takes, classes, &tps);
             // `Callable[..., R]` (or `Any`) in and out says nothing about
@@ -12041,6 +12180,22 @@ fn decorator_keeps_signature(deco: &Expr, defs: &ModuleDefs, classes: &[String])
             };
             !erased && takes == type_from_annotation_with_params(gives, classes, &tps)
         }
+        _ => false,
+    }
+}
+
+/// Whether the annotation `expr` names `name` anywhere in it (`Concatenate`
+/// in `Callable[Concatenate[Repo, P], R]`).
+fn annotation_mentions(expr: &Expr, name: &str) -> bool {
+    match expr {
+        Expr::Name(n) => n.id.as_str() == name,
+        Expr::Attribute(a) => a.attr.as_str() == name || annotation_mentions(&a.value, name),
+        Expr::Subscript(s) => {
+            annotation_mentions(&s.value, name) || annotation_mentions(&s.slice, name)
+        }
+        Expr::Tuple(t) => t.elts.iter().any(|e| annotation_mentions(e, name)),
+        Expr::List(l) => l.elts.iter().any(|e| annotation_mentions(e, name)),
+        Expr::BinOp(b) => annotation_mentions(&b.left, name) || annotation_mentions(&b.right, name),
         _ => false,
     }
 }
@@ -15086,10 +15241,12 @@ fn call_arg_effect(c: &Checker, call: &ruff_python_ast::ExprCall) -> ArgEffect {
 }
 
 /// What `recv.m(…)` may write when `recv` is typed as the local class `cls`:
-/// the definition `cls` resolves `m` to, plus every override in a local
-/// subclass (the object may be one). An interface-typed receiver may be any
-/// conforming class, and a definition outside this module is not known, so
-/// those take the union over every local class's `m`.
+/// the definition `m` resolves to on `cls` and on every local subclass of it
+/// (the object may be one), each by its own method resolution order — a
+/// subclass that inherits `m` from another base reaches that base's. An
+/// interface-typed receiver may be any conforming class, and a definition
+/// outside this module is not known, so those take the union over every
+/// local class's `m`.
 fn method_effect(c: &Checker, cls: &str, m: &str) -> ArgEffect {
     let s = &c.field_writes;
     let union = || {
@@ -15100,18 +15257,21 @@ fn method_effect(c: &Checker, cls: &str, m: &str) -> ArgEffect {
     if c.is_interface_name(cls) {
         return union();
     }
-    let Some(definer) = method_definer(c, cls, m) else {
-        return union();
-    };
-    let overrides = s
-        .class_methods
+    let subclasses = c
+        .class_parents
         .keys()
-        .filter(|(owner, method)| {
-            method == m && owner != &definer && c.class_inherits_from(owner, cls)
-        })
-        .map(|(owner, _)| owner.clone());
+        .filter(|owner| owner.as_str() != cls && c.class_inherits_from(owner, cls));
+    let mut definers = HashSet::new();
+    for class in std::iter::once(cls).chain(subclasses.map(String::as_str)) {
+        match method_definer(c, class, m) {
+            Some(definer) => {
+                definers.insert(definer);
+            }
+            None => return union(),
+        }
+    }
     let mut writes = HashSet::new();
-    for owner in std::iter::once(definer.clone()).chain(overrides) {
+    for owner in definers {
         match s.class_methods.get(&(owner, m.to_owned())) {
             Some(Some(fields)) => writes.extend(fields.iter().cloned()),
             Some(None) => return ArgEffect::Anything,
@@ -15125,35 +15285,48 @@ fn method_effect(c: &Checker, cls: &str, m: &str) -> ArgEffect {
     }
 }
 
-/// The local class whose own `m` a call on a `cls` resolves to, walking
-/// `cls`'s bases; `None` when the walk meets a class from elsewhere that may
-/// define `m`, or no class defines it.
+/// The local class whose own `m` a call on a `cls` resolves to, in `cls`'s
+/// C3 method resolution order; `None` when that order cannot be computed,
+/// when it meets a class from elsewhere that may define `m` (or whose
+/// ancestry is not known), or when no class defines `m`.
 fn method_definer(c: &Checker, cls: &str, m: &str) -> Option<String> {
     let s = &c.field_writes;
+    let mro = tyc_syntax::mro::c3_linearise(cls, &c.class_parents)?;
+    for current in mro {
+        if s.class_methods
+            .contains_key(&(current.clone(), m.to_owned()))
+        {
+            return Some(current);
+        }
+        if !s.funcs.contains_key(current.as_str()) && class_may_define(c, &current, m) {
+            return None;
+        }
+    }
+    None
+}
+
+/// Whether the class `cls`, declared somewhere other than this module, may
+/// define `m` itself or through an ancestor this module cannot see: its
+/// shape (and every base's) is known to lack `m`, or it may.
+fn class_may_define(c: &Checker, cls: &str, m: &str) -> bool {
     let mut stack = vec![cls.to_owned()];
     let mut seen = HashSet::new();
     while let Some(current) = stack.pop() {
         if !seen.insert(current.clone()) {
             continue;
         }
-        if s.class_methods
-            .contains_key(&(current.clone(), m.to_owned()))
-        {
-            return Some(current);
+        let Some(shape) = c.resolve_class_shape(&current) else {
+            return true;
+        };
+        if shape.methods.contains_key(m) {
+            return true;
         }
-        if !s.funcs.contains_key(current.as_str()) {
-            // Not declared here: unknown unless its shape says it lacks `m`.
-            let shape = c.resolve_class_shape(&current)?;
-            if shape.methods.contains_key(m) {
-                return None;
-            }
-            stack.extend(shape.bases.iter().rev().cloned());
-        }
+        stack.extend(shape.bases.iter().cloned());
         if let Some(parents) = c.class_parents.get(&current) {
-            stack.extend(parents.iter().rev().cloned());
+            stack.extend(parents.iter().cloned());
         }
     }
-    None
+    false
 }
 
 /// Drop the narrowings a method call `recv.m(…)` may have made stale, where
@@ -15878,6 +16051,18 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     if binds_local {
                         c.reassigned_names.insert(n.id.as_str().to_owned());
                     }
+                    // A new local whose first value fits the declared type of
+                    // the binding it shadows takes the value's type, unless a
+                    // later value fits only the shadowed type: then the body
+                    // is checked again with the local declared as that type,
+                    // as it was when this was taken for a reassignment of the
+                    // shadowed binding (see `check_function_body`).
+                    let shadowed_declared = c
+                        .env
+                        .lookup(n.id.as_str())
+                        .filter(|_| binds_local)
+                        .map(|b| b.declared.clone())
+                        .filter(|declared| c.is_assignable(declared, &value_type));
                     let existing = c
                         .env
                         .lookup(n.id.as_str())
@@ -15898,6 +16083,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         // that explains `mut` allows new values of the
                         // same type, not a new type).
                         if !c.is_assignable(&b.declared, &value_type) {
+                            note_shadowed_fit(c, b.span.0, &value_type);
                             let vspan = (
                                 a.value.range().start().to_usize(),
                                 a.value.range().end().to_usize(),
@@ -15940,10 +16126,25 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                             // annotated case above.
                             c.unsafe_origin_bindings.remove(n.id.as_str());
                         }
+                        let (declared, narrowed) = match shadowed_declared {
+                            Some(declared) if c.shadow_widen.contains(&span.0) => {
+                                let narrowed = if matches!(value_type, Type::Unknown) {
+                                    declared.clone()
+                                } else {
+                                    value_type.clone()
+                                };
+                                (declared, narrowed)
+                            }
+                            Some(declared) => {
+                                c.shadow_locals.insert(span.0, declared);
+                                (value_type.clone(), value_type.clone())
+                            }
+                            None => (value_type.clone(), value_type.clone()),
+                        };
                         c.env.declare(TypeBinding {
                             name: n.id.as_str().to_owned(),
-                            declared: value_type.clone(),
-                            narrowed: value_type.clone(),
+                            declared,
+                            narrowed,
                             span,
                             from_unsafe,
                         });
@@ -16327,13 +16528,15 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 // class-level constant would shadow. The
                 // `class_attr_shadows_slot` warning (and the reasoning that
                 // backs it) does not apply — suppress it for plain classes.
-                let is_plain = c.is_plain_class(class_name);
+                // Both checks below only suppress diagnostics, so they keep
+                // the resolver's by-name sets: any declaration of the name.
+                let is_plain = c.resolved.plain_classes.contains(class_name);
+                let is_raw = c.resolved.raw_classes.contains(class_name);
                 // A `class!` emits a bare class too (no `@dataclass`, no
                 // slots), and a subclass that inherits a *required* field
                 // from a known base is an instance type, not a namespace of
                 // constants, whatever its own fields default to (review
                 // 2026-09-30 §4.4).
-                let is_raw = c.is_raw_class(class_name);
                 let inherits_required_field = c
                     .class_shapes
                     .get(class_name)
@@ -16438,7 +16641,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         // only applies to a normal `class` / `model` whose
                         // constructor IS generated.
                         if method == "__init__" {
-                            if c.is_plain_class(class_name) || c.is_raw_class(class_name) {
+                            if is_plain || is_raw {
                                 continue;
                             }
                             c.diagnostics.push_error(TycError::manual_init(
@@ -16835,6 +17038,11 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 _ => l.clone(),
             };
             if !c.is_assignable(&target_type, &result) {
+                if let Expr::Name(n) = a.target.as_ref() {
+                    if let Some(start) = c.env.lookup(n.id.as_str()).map(|b| b.span.0) {
+                        note_shadowed_fit(c, start, &result);
+                    }
+                }
                 let span = (a.range.start().to_usize(), a.range.end().to_usize());
                 c.mismatch(&target_type, &result, span);
             }
@@ -17606,9 +17814,7 @@ fn check_function(
     c.function_scope = c.resolved.scope_at_offset(name_span_offset);
     let shadowed_classes = shadow_outer_classes(c, body);
 
-    for stmt in body {
-        check_stmt(c, stmt);
-    }
+    check_function_body(c, body);
     restore_outer_classes(c, shadowed_classes);
 
     // R3-8 definite-assignment analysis. Walk the function body once,
@@ -17676,9 +17882,195 @@ fn check_function(
     c.in_generator = saved_in_generator;
 }
 
+/// Check the statements of a function body. A local that shadows an
+/// enclosing binding is declared with its first value's type; where a later
+/// value fits only the shadowed binding's declared type (`mut total = 0`
+/// under a module `total: float`, then `total = total + 0.5`), the body is
+/// checked again with that local declared as the shadowed type. That is how
+/// the local was typed when it was taken for a reassignment of the shadowed
+/// binding, so every program accepted then is accepted still, and one the
+/// value's type suits keeps its precision.
+fn check_function_body(c: &mut Checker, body: &[Stmt]) {
+    let mut outer_pending = std::mem::take(&mut c.shadow_pending);
+    // A local of an enclosing body (rebound through `nonlocal`) is that
+    // body's to widen.
+    let own = |s: &usize| {
+        body.first().zip(body.last()).is_some_and(|(f, l)| {
+            (f.range().start().to_usize()..l.range().end().to_usize()).contains(s)
+        })
+    };
+    let outer_diagnostics = std::mem::take(&mut c.diagnostics);
+    let start = (
+        c.env.snapshot(),
+        c.reassigned_names.clone(),
+        c.uninit_instances.clone(),
+        c.unsafe_origin_bindings.clone(),
+    );
+    // Each pass widens at least one more local, so this ends; the bound only
+    // guards against a pass that keeps finding the same ones.
+    for _ in 0..8 {
+        for stmt in body {
+            check_stmt(c, stmt);
+        }
+        let (mine, theirs): (Vec<usize>, Vec<usize>) = c.shadow_pending.drain().partition(own);
+        outer_pending.extend(theirs);
+        let fresh: Vec<usize> = mine
+            .into_iter()
+            .filter(|s| !c.shadow_widen.contains(s))
+            .collect();
+        if fresh.is_empty() {
+            break;
+        }
+        c.shadow_widen.extend(fresh);
+        c.diagnostics = Diagnostics::new();
+        c.env.restore(start.0.clone());
+        c.reassigned_names = start.1.clone();
+        c.uninit_instances = start.2.clone();
+        c.unsafe_origin_bindings = start.3.clone();
+    }
+    let body_diagnostics = std::mem::replace(&mut c.diagnostics, outer_diagnostics);
+    c.diagnostics.extend(body_diagnostics);
+    c.shadow_pending = outer_pending;
+}
+
+/// A value of type `value` reaches the shadowing local declared at `start`
+/// and does not fit the type it was declared with: if it fits the shadowed
+/// binding's, the body is checked again with that type (see
+/// [`check_function_body`]).
+fn note_shadowed_fit(c: &mut Checker, start: usize, value: &Type) {
+    if c.shadow_locals
+        .get(&start)
+        .is_some_and(|shadowed| c.is_assignable(shadowed, value))
+    {
+        c.shadow_pending.insert(start);
+    }
+}
+
 /// What a function-local class replaced of a same-named outer class's
 /// facts while the body is checked: `(name, shape, frozen, parents)`.
 type ShadowedClass = (String, Option<InterfaceShape>, bool, Option<Vec<String>>);
+
+/// What [`shadow_outer_classes`] replaced while a function body is checked:
+/// each shadowed class's facts, the `plain class` / `class!` membership of
+/// every local class name, and the unjudged methods.
+#[derive(Default)]
+struct ShadowedClasses {
+    blends: Vec<ShadowedClass>,
+    kinds: Vec<(String, bool, bool)>,
+    either_methods: Option<std::collections::HashSet<(String, String)>>,
+}
+
+/// The classes a scope's body declares, through its compound statements but
+/// not into a nested `def` or `class` body.
+fn scope_class_defs<'a>(body: &'a [Stmt], out: &mut Vec<&'a ruff_python_ast::StmtClassDef>) {
+    for stmt in body {
+        match stmt {
+            Stmt::ClassDef(cd) => out.push(cd),
+            Stmt::If(s) => {
+                scope_class_defs(&s.body, out);
+                for clause in &s.elif_else_clauses {
+                    scope_class_defs(&clause.body, out);
+                }
+            }
+            Stmt::For(s) => {
+                scope_class_defs(&s.body, out);
+                scope_class_defs(&s.orelse, out);
+            }
+            Stmt::While(s) => {
+                scope_class_defs(&s.body, out);
+                scope_class_defs(&s.orelse, out);
+            }
+            Stmt::With(s) => scope_class_defs(&s.body, out),
+            Stmt::Try(s) => {
+                scope_class_defs(&s.body, out);
+                for h in &s.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    scope_class_defs(&h.body, out);
+                }
+                scope_class_defs(&s.orelse, out);
+                scope_class_defs(&s.finalbody, out);
+            }
+            Stmt::Match(s) => {
+                for case in &s.cases {
+                    scope_class_defs(&case.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// For each class name `defs` declare: whether every declaration of it is a
+/// `plain class`, and whether every one is a `class!` — read off the
+/// declaration markers, so `None` when the caller passed none.
+fn declared_class_kinds(
+    c: &Checker,
+    defs: &[&ruff_python_ast::StmtClassDef],
+) -> Option<HashMap<String, (bool, bool)>> {
+    use tyc_syntax::field_defaults::marker_covers;
+    let markers = c.resolved.class_markers.as_ref()?;
+    let mut kinds: HashMap<String, (bool, bool)> = HashMap::new();
+    for cd in defs {
+        let start = u32::from(cd.range.start());
+        let name_start = u32::from(cd.name.range.start());
+        let plain = marker_covers(&markers.plain, start, name_start);
+        let raw = marker_covers(&markers.raw, start, name_start);
+        let entry = kinds
+            .entry(cd.name.as_str().to_owned())
+            .or_insert((plain, raw));
+        entry.0 &= plain;
+        entry.1 &= raw;
+    }
+    Some(kinds)
+}
+
+/// Narrow the `plain class` / `class!` name sets to what module scope
+/// declares: a name the module declares only as an ordinary class is not
+/// plain there because some function declares a `plain class` of that name
+/// (that function's body sees its own, see [`shadow_outer_classes`]).
+fn scope_class_kinds_to_module(c: &mut Checker, module: &ModModule) {
+    let mut defs = Vec::new();
+    scope_class_defs(&module.body, &mut defs);
+    let Some(kinds) = declared_class_kinds(c, &defs) else {
+        return;
+    };
+    for (name, (plain, raw)) in kinds {
+        if !plain {
+            c.plain_classes.remove(&name);
+        }
+        if !raw {
+            c.raw_classes.remove(&name);
+        }
+    }
+}
+
+/// Whether two method signatures say the same of every call.
+fn method_sigs_agree(a: &MethodSig, b: &MethodSig) -> bool {
+    let (x, y) = (&a.arity_info, &b.arity_info);
+    a.arity == b.arity
+        && a.return_type == b.return_type
+        && a.param_types == b.param_types
+        && a.is_property == b.is_property
+        && a.is_static == b.is_static
+        && a.is_classmethod == b.is_classmethod
+        && a.is_async == b.is_async
+        && matches!(
+            (&a.decorated, &b.decorated),
+            (DecoratedSignature::Def, DecoratedSignature::Def)
+        )
+        && x.param_names == y.param_names
+        && x.min_positional == y.min_positional
+        && x.required_positional == y.required_positional
+        && x.max_positional == y.max_positional
+        && x.posonly_count == y.posonly_count
+        && x.kwonly_names == y.kwonly_names
+        && x.kwonly_required == y.kwonly_required
+        && x.has_kwarg == y.has_kwarg
+        && x.vararg_type == y.vararg_type
+        && x.param_types == y.param_types
+        && x.kwonly_types == y.kwonly_types
+        && x.return_type == y.return_type
+}
 
 /// A class declared in a function body is what its name means in the whole
 /// body, even where the module (or an import) has a class of that name. Types
@@ -17686,47 +18078,23 @@ type ShadowedClass = (String, Option<InterfaceShape>, bool, Option<Vec<String>>)
 /// outer class reads the same name there: until the body is checked the name
 /// stands for either class — what both say of a member, frozen only when both
 /// are, and with a base of unknown shape, so a member neither knows about and
-/// a constructor call are not judged.
-fn shadow_outer_classes(c: &mut Checker, body: &[Stmt]) -> Vec<ShadowedClass> {
-    fn collect<'a>(body: &'a [Stmt], out: &mut Vec<&'a ruff_python_ast::StmtClassDef>) {
-        for stmt in body {
-            match stmt {
-                Stmt::ClassDef(cd) => out.push(cd),
-                Stmt::If(s) => {
-                    collect(&s.body, out);
-                    for clause in &s.elif_else_clauses {
-                        collect(&clause.body, out);
-                    }
-                }
-                Stmt::For(s) => {
-                    collect(&s.body, out);
-                    collect(&s.orelse, out);
-                }
-                Stmt::While(s) => {
-                    collect(&s.body, out);
-                    collect(&s.orelse, out);
-                }
-                Stmt::With(s) => collect(&s.body, out),
-                Stmt::Try(s) => {
-                    collect(&s.body, out);
-                    for h in &s.handlers {
-                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
-                        collect(&h.body, out);
-                    }
-                    collect(&s.orelse, out);
-                    collect(&s.finalbody, out);
-                }
-                Stmt::Match(s) => {
-                    for case in &s.cases {
-                        collect(&case.body, out);
-                    }
-                }
-                _ => {}
-            }
+/// a constructor call are not judged. Whether the name is a `plain class` /
+/// `class!` is the local declaration's say.
+fn shadow_outer_classes(c: &mut Checker, body: &[Stmt]) -> ShadowedClasses {
+    let mut defs = Vec::new();
+    scope_class_defs(body, &mut defs);
+    let mut saved = ShadowedClasses::default();
+    if defs.is_empty() {
+        return saved;
+    }
+    if let Some(kinds) = declared_class_kinds(c, &defs) {
+        for (name, (plain, raw)) in kinds {
+            let was_plain = c.plain_classes.contains(&name);
+            let was_raw = c.raw_classes.contains(&name);
+            set_class_kind(c, &name, plain, raw);
+            saved.kinds.push((name, was_plain, was_raw));
         }
     }
-    let mut defs = Vec::new();
-    collect(body, &mut defs);
     let shadowing: Vec<&ruff_python_ast::StmtClassDef> = defs
         .iter()
         .copied()
@@ -17736,11 +18104,11 @@ fn shadow_outer_classes(c: &mut Checker, body: &[Stmt]) -> Vec<ShadowedClass> {
         })
         .collect();
     if shadowing.is_empty() {
-        return Vec::new();
+        return saved;
     }
+    saved.either_methods = Some(c.either_methods.clone());
     let classes = c.classes.clone();
     let module_defs = c.module.map(|m| module_defs(&m.body)).unwrap_or_default();
-    let mut saved = Vec::new();
     for cd in shadowing {
         let name = cd.name.as_str();
         let mut local = collect_class_shape(cd, &classes, &module_defs);
@@ -17766,10 +18134,21 @@ fn shadow_outer_classes(c: &mut Checker, body: &[Stmt]) -> Vec<ShadowedClass> {
             // Whichever class a call constructs, it is not judged.
             either.field_defaults.insert(field.clone());
         }
-        // A method both declare may be either signature.
+        // A method one class declares, or both alike, has that signature. One
+        // both declare differently may be either: it stays out of the shape,
+        // so a call through it is not judged, and is recorded so interface
+        // conformance and `__call__` count it as present.
         for (method, sig) in local.methods.iter().chain(&outer.methods) {
-            if !(local.methods.contains_key(method) && outer.methods.contains_key(method)) {
-                either.methods.insert(method.clone(), sig.clone());
+            match (local.methods.get(method), outer.methods.get(method)) {
+                (Some(a), Some(b)) if !method_sigs_agree(a, b) => {
+                    c.either_methods.insert((name.to_owned(), method.clone()));
+                }
+                _ => {
+                    either
+                        .methods
+                        .entry(method.clone())
+                        .or_insert_with(|| sig.clone());
+                }
             }
         }
         let start = u32::from(cd.range.start());
@@ -17787,14 +18166,31 @@ fn shadow_outer_classes(c: &mut Checker, body: &[Stmt]) -> Vec<ShadowedClass> {
         let old_parents = c
             .class_parents
             .insert(name.to_owned(), vec!["__typhon_unknown_base__".to_owned()]);
-        saved.push((name.to_owned(), old_shape, old_frozen, old_parents));
+        saved
+            .blends
+            .push((name.to_owned(), old_shape, old_frozen, old_parents));
     }
     saved
 }
 
+/// Make `name` a `plain class` / `class!` (or not) where the body being
+/// checked stands.
+fn set_class_kind(c: &mut Checker, name: &str, plain: bool, raw: bool) {
+    if plain {
+        c.plain_classes.insert(name.to_owned());
+    } else {
+        c.plain_classes.remove(name);
+    }
+    if raw {
+        c.raw_classes.insert(name.to_owned());
+    } else {
+        c.raw_classes.remove(name);
+    }
+}
+
 /// Put back what [`shadow_outer_classes`] replaced, innermost last-in first.
-fn restore_outer_classes(c: &mut Checker, saved: Vec<ShadowedClass>) {
-    for (name, shape, frozen, parents) in saved.into_iter().rev() {
+fn restore_outer_classes(c: &mut Checker, saved: ShadowedClasses) {
+    for (name, shape, frozen, parents) in saved.blends.into_iter().rev() {
         match shape {
             Some(shape) => {
                 c.class_shapes.insert(name.clone(), shape);
@@ -17818,6 +18214,12 @@ fn restore_outer_classes(c: &mut Checker, saved: Vec<ShadowedClass>) {
                 c.class_parents.remove(&name);
             }
         }
+    }
+    for (name, plain, raw) in saved.kinds {
+        set_class_kind(c, &name, plain, raw);
+    }
+    if let Some(either) = saved.either_methods {
+        c.either_methods = either;
     }
 }
 
@@ -21347,7 +21749,19 @@ fn inherits_dict_get(c: &Checker, recv: &Type) -> bool {
     match recv {
         Type::Generic(head, _) => {
             matches!(head.as_str(), "defaultdict" | "OrderedDict" | "Counter")
+                && names_collections_class(c, head)
                 && !is_user_builtin_extension(c, head, "get")
+                // `extend Counter: def get(…)` patches the class itself — a
+                // Python class. `OrderedDict` and `defaultdict` are C types,
+                // so patching them raises at import.
+                && !(head == "Counter"
+                    && [head.clone(), format!("__typhon_impl_{head}")]
+                        .iter()
+                        .any(|name| {
+                            c.class_shapes
+                                .get(name)
+                                .is_some_and(|s| s.methods.contains_key("get"))
+                        }))
         }
         Type::Class(name) => {
             c.find_method(name, "get").is_none() && c.class_derives_from_builtin(name, DICTS)
@@ -21356,22 +21770,150 @@ fn inherits_dict_get(c: &Checker, recv: &Type) -> bool {
     }
 }
 
-/// Whether `expr` reads a module-level `freeze let` binding, or a value
-/// nested in one (`CFG["db"]`): deep-frozen, a dict there is a
-/// `mappingproxy` or a `frozendict`.
-fn reads_freeze_let(c: &Checker, expr: &Expr) -> bool {
+/// Whether the generic head `head` (`Counter`, `OrderedDict`, …) is the
+/// `collections` class of that name here, rather than a class of this
+/// module or one imported from somewhere else.
+fn names_collections_class(c: &Checker, head: &str) -> bool {
+    if c.local_classes.contains(head) {
+        return false;
+    }
+    match c.resolved.scopes.first().and_then(|s| s.lookup_local(head)) {
+        Some(b) => b.import_info.as_ref().is_some_and(|info| {
+            info.level == 0
+                && matches!(
+                    info.module.as_str(),
+                    "collections" | "typing" | "typing_extensions"
+                )
+        }),
+        // `collections.Counter[str]`, or a type reached through a signature.
+        None => !c.class_shapes.contains_key(head),
+    }
+}
+
+/// The module-level `freeze let` binding `expr` reads, directly or through
+/// subscripts (`CFG["db"]`), with those subscripts outermost-last: `None`
+/// when `expr` reads no such binding.
+fn freeze_let_read<'e>(c: &Checker, expr: &'e Expr) -> Option<(usize, Vec<&'e Expr>)> {
     match expr {
-        Expr::Subscript(s) => reads_freeze_let(c, &s.value),
+        Expr::Subscript(s) => {
+            let (start, mut slices) = freeze_let_read(c, &s.value)?;
+            slices.push(&s.slice);
+            Some((start, slices))
+        }
         Expr::Name(n) => {
             let name = n.id.as_str();
-            c.env.scope_of(name) == Some(0)
-                && !callables::binds_locally(c, name)
-                && c.env.lookup(name).is_some_and(|b| {
-                    callables::alias_value(c, b.span.0)
-                        .is_some_and(|value| freeze_call_argument(value).is_some())
-                })
+            if c.env.scope_of(name) != Some(0) || callables::binds_locally(c, name) {
+                return None;
+            }
+            let start = c.env.lookup(name)?.span.0;
+            callables::alias_value(c, start)
+                .and_then(freeze_call_argument)
+                .map(|_| (start, Vec::new()))
         }
-        _ => false,
+        _ => None,
+    }
+}
+
+/// The type of the element `ty[slice]` holds, where that is plain from `ty`
+/// alone: a mapping's value, a sequence's element, a fixed tuple's slot at a
+/// literal index.
+fn subscript_element(ty: &Type, slice: &Expr) -> Option<Type> {
+    let Type::Generic(head, args) = ty else {
+        return None;
+    };
+    match (head.as_str(), args.as_slice()) {
+        (
+            "dict" | "Mapping" | "MutableMapping" | "defaultdict" | "OrderedDict" | "frozendict",
+            [_, value],
+        ) => Some(value.clone()),
+        ("list" | "Sequence" | "tuple_variadic", [elem]) => Some(elem.clone()),
+        ("tuple", slots) => {
+            let Expr::NumberLiteral(ruff_python_ast::ExprNumberLiteral {
+                value: ruff_python_ast::Number::Int(index),
+                ..
+            }) = slice
+            else {
+                return None;
+            };
+            slots.get(index.as_usize()?).cloned()
+        }
+        _ => None,
+    }
+}
+
+/// Whether a `freeze let` read (see [`freeze_let_read`]) is a dict once
+/// frozen — a `mappingproxy` or `frozendict`, whose `get` is `dict.get`:
+/// the value frozen there is statically a dict. `deep_freeze` passes any
+/// other `Mapping` (a frozen dataclass one, say) through unchanged, so a
+/// value of unknown type is not judged.
+fn freeze_let_reads_dict(c: &Checker, expr: &Expr) -> bool {
+    let Some((start, slices)) = freeze_let_read(c, expr) else {
+        return false;
+    };
+    let Some(mut value) = callables::alias_value(c, start).and_then(freeze_call_argument) else {
+        return false;
+    };
+    // Into the literal while the subscripts pick its items out.
+    let mut slices = slices.as_slice();
+    while let Some((slice, rest)) = slices.split_first() {
+        let item = match (value, slice) {
+            (Expr::Dict(d), Expr::StringLiteral(key)) => d.items.iter().find_map(|item| {
+                matches!(&item.key, Some(Expr::StringLiteral(k)) if k.value.to_str() == key.value.to_str())
+                    .then_some(&item.value)
+            }),
+            (
+                Expr::List(ruff_python_ast::ExprList { elts, .. })
+                | Expr::Tuple(ruff_python_ast::ExprTuple { elts, .. }),
+                Expr::NumberLiteral(ruff_python_ast::ExprNumberLiteral {
+                    value: ruff_python_ast::Number::Int(i),
+                    ..
+                }),
+            ) => i.as_usize().and_then(|i| elts.get(i)),
+            _ => None,
+        };
+        let Some(item) = item else { break };
+        value = item;
+        slices = rest;
+    }
+    if slices.is_empty() {
+        match value {
+            Expr::Dict(_) | Expr::DictComp(_) => return true,
+            Expr::Call(call) if matches!(call.func.as_ref(), Expr::Name(n) if n.id.as_str() == "dict") => {
+                return true
+            }
+            _ => {}
+        }
+    }
+    let mut ty = infer_expr_readonly(c, value);
+    for slice in slices {
+        match subscript_element(&ty, slice) {
+            Some(next) => ty = next,
+            None => return false,
+        }
+    }
+    matches!(&ty, Type::Generic(head, _)
+        if matches!(head.as_str(), "dict" | "defaultdict" | "OrderedDict" | "Counter" | "frozendict"))
+}
+
+/// The builtin head a `freeze let` read is annotated with (`dict` for
+/// `freeze let CFG: dict[str, int]`, and for `CFG2["db"]` under
+/// `dict[str, dict[str, int]]`): the head the desugar rewrites a user
+/// `extend dict:` method call by. `None` without an annotation.
+fn freeze_let_annotated_head(c: &Checker, expr: &Expr) -> Option<String> {
+    let (start, slices) = freeze_let_read(c, expr)?;
+    let annotation = c.module?.body.iter().find_map(|stmt| match stmt {
+        Stmt::AnnAssign(a) if a.target.range().start().to_usize() == start => {
+            Some(a.annotation.as_ref())
+        }
+        _ => None,
+    })?;
+    let mut ty = type_from_annotation(annotation, &c.classes);
+    for slice in slices {
+        ty = subscript_element(&ty, slice)?;
+    }
+    match ty {
+        Type::Generic(head, _) => Some(head),
+        _ => None,
     }
 }
 
@@ -24198,10 +24740,15 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     // `let r: int = a(5)` was wrongly rejected AND a wrong
                     // `let r: SomeClass = a(5)` was wrongly accepted.
                     if !func_is_class_name {
-                        if let Some(ret) = c
-                            .find_method(&name, "__call__")
-                            .map(|m| m.return_type.clone())
-                        {
+                        // Either of two `__call__`s: called, not judged.
+                        let either_call = c
+                            .either_methods
+                            .contains(&(name.clone(), "__call__".to_owned()))
+                            .then_some(Type::Unknown);
+                        if let Some(ret) = either_call.or_else(|| {
+                            c.find_method(&name, "__call__")
+                                .map(|m| m.return_type.clone())
+                        }) {
                             for a in pos_args.iter() {
                                 let _ = infer_expr(c, a);
                             }
@@ -24582,6 +25129,15 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 // method at the calls the desugar rewrites (receivers typed
                 // as that builtin): the call sees the extension's signature.
                 if let Type::Generic(head, _) = &recv {
+                    // A `freeze let` is typed by its frozen view (`Mapping`),
+                    // but the desugar rewrites by the head it is annotated
+                    // with (`dict`).
+                    let head = match head.as_str() {
+                        "Mapping" | "frozendict" => {
+                            freeze_let_annotated_head(c, &a.value).unwrap_or_else(|| head.clone())
+                        }
+                        _ => head.clone(),
+                    };
                     let sentinel = format!("__typhon_builtin_ext_{head}");
                     if let Some(sig) = c
                         .class_shapes
@@ -24606,7 +25162,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 // permissive `collections.abc.Mapping.get`.
                 let as_dict = match &recv {
                     Type::Generic(head, args)
-                        if head == "Mapping" && reads_freeze_let(c, &a.value) =>
+                        if head == "Mapping" && freeze_let_reads_dict(c, &a.value) =>
                     {
                         Type::Generic("dict".into(), args.clone())
                     }
@@ -26408,9 +26964,14 @@ fn class_method_is_known_sync(c: &Checker, cls: &str, name: &str) -> bool {
     // A decorator may make a sync method awaitable — the `def` this call
     // resolves to; any `def` of that name when it is not one of this
     // module's class bodies.
-    let undecorated = match callables::method_def(c, cls, name) {
-        Some(f) => f.decorator_list.iter().all(|d| {
-            matches!(&d.expression, Expr::Name(n) if matches!(n.id.as_str(), "staticmethod" | "classmethod"))
+    let undecorated = match callables::method_defs(c, cls, name) {
+        // Any `def` of the name in the class the call resolves to may be the
+        // one that runs (the last does): all must be plain, synchronous ones.
+        Some(defs) => defs.iter().all(|f| {
+            !f.is_async
+                && f.decorator_list.iter().all(|d| {
+                    matches!(&d.expression, Expr::Name(n) if matches!(n.id.as_str(), "staticmethod" | "classmethod"))
+                })
         }),
         None => !callables::decorated(c, name),
     };

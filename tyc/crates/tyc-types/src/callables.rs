@@ -306,24 +306,22 @@ pub(super) fn class_decorated(c: &Checker, name: &str) -> bool {
     scan.found
 }
 
-/// The `def` that `cls.name` resolves to among this module's top-level class
-/// bodies and their `impl` blocks, walking `cls`'s bases first-to-last.
-/// `None` when the walk reaches a class whose body is not here before
-/// finding the method, or never finds it.
-pub(super) fn method_def<'a>(
+/// Every `def` of `name` in the class body (and `impl` blocks) that
+/// `cls.name` resolves to among this module's top-level classes, in `cls`'s
+/// C3 method resolution order: a later `def` in the same body replaces an
+/// earlier one at runtime, so a caller judging decorators sees them all.
+/// `None` when the order cannot be computed, when it reaches a class whose
+/// body is not here before finding the method, or when it never finds it.
+pub(super) fn method_defs<'a>(
     c: &Checker<'a>,
     cls: &str,
     name: &str,
-) -> Option<&'a ruff_python_ast::StmtFunctionDef> {
+) -> Option<Vec<&'a ruff_python_ast::StmtFunctionDef>> {
     let module = c.module?;
-    let mut stack = vec![cls.to_owned()];
-    let mut seen = HashSet::new();
-    while let Some(current) = stack.pop() {
-        if !seen.insert(current.clone()) {
-            continue;
-        }
+    for current in tyc_syntax::mro::c3_linearise(cls, &c.class_parents)? {
         let pseudo = format!("__typhon_impl_{current}");
         let mut declared = false;
+        let mut defs = Vec::new();
         for stmt in &module.body {
             let Stmt::ClassDef(cd) = stmt else { continue };
             if cd.name.as_str() != current && cd.name.as_str() != pseudo {
@@ -333,7 +331,7 @@ pub(super) fn method_def<'a>(
             for item in &cd.body {
                 if let Stmt::FunctionDef(f) = item {
                     if f.name.as_str() == name {
-                        return Some(f);
+                        defs.push(f);
                     }
                 }
             }
@@ -341,8 +339,8 @@ pub(super) fn method_def<'a>(
         if !declared {
             return None;
         }
-        if let Some(parents) = c.class_parents.get(&current) {
-            stack.extend(parents.iter().rev().cloned());
+        if !defs.is_empty() {
+            return Some(defs);
         }
     }
     None
