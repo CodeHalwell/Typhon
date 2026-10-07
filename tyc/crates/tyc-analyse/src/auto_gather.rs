@@ -205,14 +205,15 @@ fn rewrite_stmts(
     // Move into an iterator so we can take ownership of each stmt without
     // cloning. We need lookahead for run-detection, so peek at the upcoming
     // slice via an index into the source `Vec`.
-    let mut i = 0;
-    while i < body.len() {
+    let mut iter = body.into_iter();
+    while !iter.as_slice().is_empty() {
         // A run inside a `try` body (or a `with` body, whose manager may
         // suppress exceptions) is never folded: a `TaskGroup` re-raises a
         // task's exception wrapped in an `ExceptionGroup`, so the handler
         // that caught `ValueError` sequentially would no longer match.
         if inside_async && !guarded {
-            let run = collect_run(&body, i, eligible);
+            let slice = iter.as_slice();
+            let run = collect_run(slice, 0, eligible);
             if run.len() >= 2 {
                 // Emit the synthesized async-with + result-extracts directly
                 // into the enclosing block; no `if True:` wrapper so the
@@ -222,19 +223,22 @@ fn rewrite_stmts(
                 out.extend(synthesized);
                 stats.rewrites += 1;
                 stats.awaits_folded += run.len();
-                i += run.len();
+                let advance = run.len();
+                drop(run);
+                if advance > 0 {
+                    iter.nth(advance - 1);
+                }
                 continue;
             }
         }
         out.push(recurse_stmt(
-            body[i].clone(),
+            iter.next().unwrap(),
             eligible,
             inside_async,
             counter,
             stats,
             guarded,
         ));
-        i += 1;
     }
     out
 }
