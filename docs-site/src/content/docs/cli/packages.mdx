@@ -50,7 +50,7 @@ Drops the package from `[dependencies]` (or `[dev-dependencies]` with `--dev`) a
 
 ## `tyc sync`
 
-Materialises a `pyproject.toml` from `typhon.toml`'s `[dependencies]` / `[dev-dependencies]` and runs `uv sync`. The generated `pyproject.toml` is overwritten on every sync (don't hand-edit it).
+Materialises a `pyproject.toml` from `typhon.toml`'s `[dependencies]` / `[dev-dependencies]` and runs `uv sync`, pinned to the `[python] target` with `--python`. The generated `pyproject.toml` is overwritten on every sync (don't hand-edit it).
 
 `--dry-run` prints what would be written without writing.
 

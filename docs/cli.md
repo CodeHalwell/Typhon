@@ -58,8 +58,10 @@ Python environment for the project:
    non-destructive: header comments, `[tool.*]` tables, and any
    `[project]` keys the user manages themselves (`authors`, `readme`,
    `classifiers`, …) are preserved byte-for-byte.
-2. **`uv sync`.** Materialises `.venv` (creating it on first run) and
-   installs the manifest. When `uv` isn't on `PATH`, or when `uv sync`
+2. **`uv sync --python <target>`.** Materialises `.venv` (creating it on
+   first run) and installs the manifest, pinned to the `[python] target`
+   (`3.13`, `3.15t`, …) so `.venv` runs the Python the code was checked
+   against; changing the target recreates `.venv` on the next build. When `uv` isn't on `PATH`, or when `uv sync`
    itself returns non-zero, the failure is downgraded to a warning so
    the `.py` artefacts still land — the codegen output is useful
    regardless of whether the install step resolved.

@@ -6,6 +6,14 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ## Unreleased — gap fixes
 
+### Changed
+
+- **`uv sync` is pinned to the `[python] target`.** `tyc build`, `tyc sync`,
+  `tyc add` and `tyc remove` now run `uv sync --python <target>`. Previously
+  uv picked any interpreter meeting `requires-python = ">=3.13"`, so `.venv`
+  could run a newer Python than the one the code was checked against.
+  Changing the target now recreates `.venv` on the next sync.
+
 ### Fixed
 
 - **Exception text and `ExceptionGroup` methods.** Under `tyc run`,

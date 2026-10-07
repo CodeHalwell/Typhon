@@ -112,7 +112,7 @@ pub fn run_add(args: AddArgs) -> Result<()> {
     if args.no_sync {
         return Ok(());
     }
-    run_uv_sync(&project_root)
+    run_uv_sync(&project_root, &config)
 }
 
 pub fn run_remove(args: RemoveArgs) -> Result<()> {
@@ -148,7 +148,7 @@ pub fn run_remove(args: RemoveArgs) -> Result<()> {
     if args.no_sync {
         return Ok(());
     }
-    run_uv_sync(&project_root)
+    run_uv_sync(&project_root, &config)
 }
 
 pub fn run_sync(args: SyncArgs) -> Result<()> {
@@ -183,7 +183,7 @@ pub fn run_sync(args: SyncArgs) -> Result<()> {
     }
     merge_pyproject(&project_root, &config)?;
     println!("wrote {}", path.display());
-    run_uv_sync(&project_root)
+    run_uv_sync(&project_root, &config)
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -491,7 +491,7 @@ pub fn bootstrap_python_env_with(
 ) -> Result<()> {
     merge_pyproject(project_root, config)?;
     if !skip_sync {
-        run_uv_sync_warning(project_root);
+        run_uv_sync_warning(project_root, config);
     }
     Ok(())
 }
@@ -635,7 +635,7 @@ pub(crate) fn apply_owned_keys(doc: &mut toml_edit::DocumentMut, config: &Typhon
 /// even when the install step trips over a transient issue (no network,
 /// uv resolver error, etc.). The explicit-intent commands (`tyc sync` /
 /// `tyc add` / `tyc remove`) keep their hard-error behaviour.
-fn run_uv_sync_warning(project_root: &Path) {
+fn run_uv_sync_warning(project_root: &Path, config: &TyphonConfig) {
     if !has_uv() {
         eprintln!(
             "warning: `uv` not found on PATH — pyproject.toml was updated \
@@ -644,10 +644,7 @@ fn run_uv_sync_warning(project_root: &Path) {
         );
         return;
     }
-    let status = Command::new("uv")
-        .arg("sync")
-        .current_dir(project_root)
-        .status();
+    let status = uv_sync_command(project_root, config).status();
     match status {
         Ok(s) if s.success() => {}
         Ok(s) => {
@@ -657,7 +654,7 @@ fn run_uv_sync_warning(project_root: &Path) {
     }
 }
 
-fn run_uv_sync(project_root: &Path) -> Result<()> {
+fn run_uv_sync(project_root: &Path, config: &TyphonConfig) -> Result<()> {
     if !has_uv() {
         eprintln!(
             "warning: `uv` not found on PATH — typhon.toml updated but no install was run. \
@@ -665,15 +662,41 @@ fn run_uv_sync(project_root: &Path) -> Result<()> {
         );
         return Ok(());
     }
-    let status = Command::new("uv")
-        .arg("sync")
-        .current_dir(project_root)
+    let status = uv_sync_command(project_root, config)
         .status()
         .map_err(|e| miette!("cannot spawn `uv`: {e}"))?;
     if !status.success() {
         return Err(miette!("`uv sync` failed with status {status}"));
     }
     Ok(())
+}
+
+/// `uv sync` pinned to the project's `[python] target`. Without the pin uv
+/// picks any interpreter satisfying `requires-python = ">=3.13"` — often a
+/// newer one than the target — so `.venv` (and the introspection and
+/// `tyc run --compile` that use it) ran on a different Python from the one
+/// the code was checked against.
+fn uv_sync_command(project_root: &Path, config: &TyphonConfig) -> Command {
+    let mut cmd = Command::new("uv");
+    cmd.arg("sync")
+        .arg("--python")
+        .arg(uv_python_request(config))
+        .current_dir(project_root);
+    cmd
+}
+
+/// The `uv --python` request for a `[python] target`: its `major.minor`,
+/// keeping the free-threaded `t` (uv reads `3.13t` directly). A patch-level
+/// target such as `3.13.2` would make uv demand that exact patch, so it is
+/// trimmed to `3.13`, which any 3.13 security release satisfies.
+fn uv_python_request(config: &TyphonConfig) -> String {
+    let target = default_str(&config.python.target, "3.13");
+    let (version, threaded) = match target.strip_suffix('t') {
+        Some(v) => (v, "t"),
+        None => (target, ""),
+    };
+    let minor: Vec<&str> = version.splitn(3, '.').take(2).collect();
+    format!("{}{threaded}", minor.join("."))
 }
 
 fn has_uv() -> bool {
@@ -1188,6 +1211,26 @@ lint = [\"ruff\"]
                 expected,
                 "target {target:?}"
             );
+        }
+    }
+
+    #[test]
+    fn uv_sync_is_pinned_to_the_python_target() {
+        for (target, expected) in [
+            ("3.13", "3.13"),
+            ("3.15", "3.15"),
+            ("3.14t", "3.14t"),
+            ("3.13.2", "3.13"),
+            ("", "3.13"),
+        ] {
+            let mut cfg = TyphonConfig::default();
+            cfg.python.target = target.to_owned();
+            let cmd = uv_sync_command(std::path::Path::new("."), &cfg);
+            let args: Vec<_> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(args, ["sync", "--python", expected], "target {target:?}");
         }
     }
 
