@@ -328,13 +328,7 @@ pub(super) fn method_defs<'a>(
                 continue;
             }
             declared = true;
-            for item in &cd.body {
-                if let Stmt::FunctionDef(f) = item {
-                    if f.name.as_str() == name {
-                        defs.push(f);
-                    }
-                }
-            }
+            defs_named(&cd.body, name, &mut defs);
         }
         if !declared {
             return None;
@@ -344,6 +338,51 @@ pub(super) fn method_defs<'a>(
         }
     }
     None
+}
+
+/// The defs named `name` in a class body, through its compound statements
+/// (`if FAST: def run…`, `try: … except: def run…`) but not into a nested
+/// `def` or `class`.
+fn defs_named<'a>(
+    body: &'a [Stmt],
+    name: &str,
+    out: &mut Vec<&'a ruff_python_ast::StmtFunctionDef>,
+) {
+    for stmt in body {
+        match stmt {
+            Stmt::FunctionDef(f) if f.name.as_str() == name => out.push(f),
+            Stmt::If(s) => {
+                defs_named(&s.body, name, out);
+                for clause in &s.elif_else_clauses {
+                    defs_named(&clause.body, name, out);
+                }
+            }
+            Stmt::Try(s) => {
+                defs_named(&s.body, name, out);
+                for handler in &s.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = handler;
+                    defs_named(&h.body, name, out);
+                }
+                defs_named(&s.orelse, name, out);
+                defs_named(&s.finalbody, name, out);
+            }
+            Stmt::With(s) => defs_named(&s.body, name, out),
+            Stmt::For(s) => {
+                defs_named(&s.body, name, out);
+                defs_named(&s.orelse, name, out);
+            }
+            Stmt::While(s) => {
+                defs_named(&s.body, name, out);
+                defs_named(&s.orelse, name, out);
+            }
+            Stmt::Match(s) => {
+                for case in &s.cases {
+                    defs_named(&case.body, name, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 pub(super) fn alias_value<'a>(c: &Checker<'a>, start: usize) -> Option<&'a Expr> {

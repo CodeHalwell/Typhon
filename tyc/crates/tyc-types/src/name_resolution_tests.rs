@@ -3501,3 +3501,46 @@ print(outer())
     );
     assert!(!errors.is_empty(), "accepted a str into a float shadow");
 }
+
+/// A redefinition of a method under a compound statement of the class body
+/// (`if FAST: @asyncify def run…`) counts when deciding whether the method may
+/// return an awaitable, so awaiting it is not reported.
+#[test]
+fn a_method_redefined_under_a_class_body_if_may_be_decorated() {
+    assert_clean(
+        r#"
+import asyncio
+from collections.abc import Callable, Coroutine
+from typing import Any
+
+def asyncify[**P, R](f: Callable[P, R]) -> Callable[P, Coroutine[Any, Any, R]]:
+    async def inner(*args: P.args, **kwargs: P.kwargs) -> R:
+        await asyncio.sleep(0)
+        return f(*args, **kwargs)
+    return inner
+
+FAST: bool = True
+
+class Worker:
+    n: int
+
+    def run(self) -> int:
+        return self.n
+
+    if FAST:
+        @asyncify
+        def run(self) -> int:
+            return self.n + 1
+
+async def go(w: Worker) -> int:
+    return await w.run()
+
+def main() -> None:
+    let w = Worker(n=3)
+    print(asyncio.run(go(w)))
+
+if __name__ == "__main__":
+    main()
+"#,
+    );
+}
