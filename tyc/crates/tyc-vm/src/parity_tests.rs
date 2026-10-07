@@ -737,6 +737,18 @@ plain class Gone:
         return 1
     del k
 show(hasattr(Gone, "f"), hasattr(Gone, "p"), hasattr(Gone, "k"), hasattr(Gone(), "p"))
+mut shadow = 99
+def del_then_read() -> None:
+    mut shadow = 1
+    del shadow
+    show(shadow)
+trap("deleted local", del_then_read)
+def del_then_rebind() -> None:
+    mut shadow = 1
+    del shadow
+    shadow = 5
+    show("rebound", shadow)
+del_then_rebind()
 def nested() -> object:
     x = 1
     def mid() -> object:
@@ -920,6 +932,15 @@ async def await_genexp() -> None:
     mut h = (x for x in [1] if await fetch(x))
     show(type(h).__name__)
 asyncio.run(await_genexp())
+async def coro_list() -> list[int]:
+    return [1, 2]
+trap("coroutine iterable", lambda: asyncio.run(over(coro_list())))
+async def lambda_default_genexp() -> None:
+    mut g = ((lambda x=await fetch(3): x)() for _ in [1])
+    show(type(g).__name__)
+    async for v in g:
+        show("lam", v)
+asyncio.run(lambda_default_genexp())
 plain class AwaitableIter:
     def __init__(self) -> None:
         self.n = 0

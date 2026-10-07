@@ -682,10 +682,12 @@ fn unmodelled_attribute_references(
             .metaclass_bare_names
             .iter()
             .any(|name| scan.abc_module_names.contains(name))
+        // A dotted metaclass is trusted only through a name `import abc`
+        // bound (`from abc import *` binds `ABCMeta`, not `abc`).
         || scan
             .metaclass_dotted_roots
             .iter()
-            .any(|root| scan.abc_meta_names.contains(root))
+            .any(|root| !scan.abc_module_names.contains(root))
         || (scan.star_imported && !scan.metaclass_bare_names.is_empty())
     {
         missing.insert("a custom metaclass".to_owned());
@@ -832,10 +834,6 @@ struct AttributeScan {
     /// Each bare-name metaclass spelling (`metaclass=ABCMeta`): not the real
     /// class when that name is the `abc` module.
     metaclass_bare_names: Vec<String>,
-    /// Names bound to `abc.ABCMeta` itself (`from abc import ABCMeta as
-    /// abc`): trusted as a bare metaclass, never as the root of a dotted one
-    /// (`metaclass=abc.ABCMeta` is then `ABCMeta.ABCMeta`).
-    abc_meta_names: std::collections::HashSet<String>,
     /// The root of each dotted metaclass spelling (`abc` for `abc.ABCMeta`).
     metaclass_dotted_roots: Vec<String>,
     /// Whether a `from m import *` (other than from `abc`) could rebind a
@@ -1102,8 +1100,6 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                     }
                     if !is_abc_meta {
                         self.program_bound.insert(bound.to_owned());
-                    } else {
-                        self.abc_meta_names.insert(bound.to_owned());
                     }
                     if let Some(module) = &modelled_source {
                         if alias.name.as_str() != "*" {
@@ -1593,6 +1589,12 @@ mod tests {
         let module_alias =
             "import abc as ABCMeta\nplain class W(metaclass=ABCMeta):\n    pass\nprint(W())\n";
         assert!(scan_source(module_alias)
+            .unwrap_or_default()
+            .contains(&"a custom metaclass".to_owned()));
+        // `from abc import *` binds `ABCMeta`, not the module name `abc`.
+        let unbound_root =
+            "from abc import *\nplain class W(metaclass=abc.ABCMeta):\n    pass\nprint(W)\n";
+        assert!(scan_source(unbound_root)
             .unwrap_or_default()
             .contains(&"a custom metaclass".to_owned()));
         // A star import could bind `ABCMeta` to anything; `abc`'s own is real.

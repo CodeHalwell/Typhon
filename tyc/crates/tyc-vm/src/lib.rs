@@ -6386,8 +6386,8 @@ main()
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
 
-    /// `del` on a slot local unbinds it; a later read falls through to the
-    /// module scope, matching the pre-slot behaviour.
+    /// `del` on a slot local unbinds it; a later read raises
+    /// `UnboundLocalError` as in CPython, never reading the module's `x`.
     #[test]
     fn slot_del_unbinds() {
         let src = r#"
@@ -6399,8 +6399,11 @@ def f() -> int:
     return x
 
 def main() -> None:
-    if f() != 7:
-        raise ValueError("del did not unbind the slot")
+    try:
+        f()
+    except UnboundLocalError:
+        return
+    raise ValueError("del did not unbind the slot")
 
 main()
 "#;

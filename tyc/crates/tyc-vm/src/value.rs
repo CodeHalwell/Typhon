@@ -1858,8 +1858,16 @@ pub fn genexpr_is_async(st: &GenExprState) -> bool {
             match expr {
                 _ if self.found => {}
                 ruff_python_ast::Expr::Await(_) => self.found = true,
-                // A lambda is its own scope.
-                ruff_python_ast::Expr::Lambda(_) => {}
+                // A lambda's body is its own scope; its defaults run here.
+                ruff_python_ast::Expr::Lambda(l) => {
+                    if let Some(params) = &l.parameters {
+                        for p in params.iter_non_variadic_params() {
+                            if let Some(d) = p.default() {
+                                self.visit_expr(d);
+                            }
+                        }
+                    }
+                }
                 _ => visitor::walk_expr(self, expr),
             }
         }

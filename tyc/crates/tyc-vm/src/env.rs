@@ -162,6 +162,11 @@ impl Env {
                 if let Some(v) = &self.slots.borrow()[k as usize] {
                     return Some(v.clone());
                 }
+                // A local unbound by `del` stays unbound: CPython raises
+                // `UnboundLocalError` rather than reading an outer name.
+                if self.deleted_local(name) {
+                    return None;
+                }
                 // Unbound slot (read-before-assign) → consult enclosing scopes,
                 // matching the VM's existing fall-through behaviour.
                 return self.parent.as_ref().and_then(|p| p.get(name));
@@ -172,10 +177,40 @@ impl Env {
         if let Some(v) = self.bindings.borrow().get(name) {
             return Some(v.clone());
         }
+        if self.deleted_local(name) {
+            return None;
+        }
         if let Some(parent) = &self.parent {
             return parent.get(name);
         }
         None
+    }
+
+    /// Whether `name` is a function local of this scope that a `del` has
+    /// unbound (and nothing has rebound since). A module or class scope's
+    /// deleted name still falls through to the builtins, as in CPython.
+    pub fn deleted_local(&self, name: &str) -> bool {
+        let deleted = self.deleted.borrow();
+        !deleted.is_empty()
+            && deleted.contains(name)
+            && !self.bindings.borrow().contains_key(name)
+            && matches!(self.delete_scope(name), DeleteScope::Local)
+    }
+
+    /// Whether reading `name` from this scope hits a local unbound by `del`
+    /// — the read raises `UnboundLocalError` instead of `NameError`.
+    pub fn reads_deleted_local(&self, name: &str) -> bool {
+        let mut cur: Option<&Env> = Some(self);
+        while let Some(env) = cur {
+            if env.get_own(name).is_some() {
+                return false;
+            }
+            if env.deleted_local(name) {
+                return true;
+            }
+            cur = env.parent.as_deref();
+        }
+        false
     }
 
     /// Read a `Name` node — the hot expression-lookup path. Uses the node-index
@@ -187,6 +222,9 @@ impl Env {
                 if let Some(v) = &self.slots.borrow()[k as usize] {
                     return Some(v.clone());
                 }
+                if self.deleted_local(n.id.as_str()) {
+                    return None;
+                }
                 return self.parent.as_ref().and_then(|p| p.get(n.id.as_str()));
             }
             let name = n.id.as_str();
@@ -194,6 +232,9 @@ impl Env {
                 if let Some(v) = self.bindings.borrow().get(name) {
                     return Some(v.clone());
                 }
+            }
+            if self.deleted_local(name) {
+                return None;
             }
             return self.parent.as_ref().and_then(|p| p.get(name));
         }
@@ -316,9 +357,17 @@ impl Env {
     fn delete_here(&self, name: &str) -> bool {
         if let Some(info) = &self.slot_info {
             if let Some(k) = info.slot_of_name(name) {
-                let mut slots = self.slots.borrow_mut();
-                let existed = slots[k as usize].is_some();
-                slots[k as usize] = None;
+                let existed = {
+                    let mut slots = self.slots.borrow_mut();
+                    let existed = slots[k as usize].is_some();
+                    slots[k as usize] = None;
+                    existed
+                };
+                // Remembered so a later read does not fall through to an
+                // enclosing scope's binding of the same name.
+                if existed {
+                    self.deleted.borrow_mut().insert(name.to_string());
+                }
                 return existed;
             }
         }

@@ -15,6 +15,13 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   CPython does (`A = -1; B = auto()` makes `B == 2`); and a
   `from m import *` sends a program with a bare `metaclass=ABCMeta` to
   CPython, since the star import could have rebound the name.
+- **A deleted local stays deleted.** Under `tyc run`, reading a function
+  local after `del` raises `UnboundLocalError` as CPython does, instead of
+  reading a module-level binding of the same name. `async for` over a plain
+  coroutine raises CPython's `TypeError`; a lambda default containing
+  `await` makes a generator expression async; and the pre-run scan trusts
+  a dotted `metaclass=abc.ABCMeta` only when `abc` was bound by
+  `import abc`.
 - **More async-iteration parity.** A generator expression with an `await`
   in its element or a filter (`(await f(x) for x in xs)`) is an async
   generator under `tyc run`, as in CPython, so `async for` iterates it; and

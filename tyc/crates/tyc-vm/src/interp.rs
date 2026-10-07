@@ -3493,9 +3493,20 @@ impl Interpreter {
             Expr::NoneLiteral(_) => Ok(Value::None),
             Expr::EllipsisLiteral(_) => Ok(crate::value::ellipsis_value()),
             Expr::FString(f) => self.eval_fstring(f, env),
-            Expr::Name(n) => env
-                .get_name_node(n)
-                .ok_or_else(|| name_error(format!("name '{}' is not defined", n.id.as_str()))),
+            Expr::Name(n) => env.get_name_node(n).ok_or_else(|| {
+                let name = n.id.as_str();
+                if env.reads_deleted_local(name) {
+                    Unwind::Exception(VmException::new(
+                        "UnboundLocalError",
+                        format!(
+                            "cannot access local variable '{name}' where it is not \
+                             associated with a value"
+                        ),
+                    ))
+                } else {
+                    name_error(format!("name '{name}' is not defined"))
+                }
+            }),
             Expr::BinOp(b) => {
                 let left = self.eval_expr(&b.left, env)?;
                 let right = self.eval_expr(&b.right, env)?;
@@ -12177,7 +12188,12 @@ fn reject_sync_only_async_iterable(v: &Value) -> Result<(), Unwind> {
         },
         _ => false,
     };
+    // A plain coroutine has no `__aiter__` either (an async generator
+    // call arrives as a coroutine thunk too, and is iterable).
+    let coroutine = matches!(v, Value::Coroutine(t)
+        if matches!(t.function.generator, crate::value::GeneratorKind::NotGenerator));
     if sync_iterator
+        || coroutine
         || matches!(
             v,
             Value::List(_)
