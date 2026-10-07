@@ -685,10 +685,18 @@ fn uv_sync_command(project_root: &Path, config: &TyphonConfig) -> Command {
     cmd
 }
 
-/// The `uv --python` request for a `[python] target`. uv understands the
-/// free-threaded spelling (`3.13t`) directly, so the target passes through.
+/// The `uv --python` request for a `[python] target`: its `major.minor`,
+/// keeping the free-threaded `t` (uv reads `3.13t` directly). A patch-level
+/// target such as `3.13.2` would make uv demand that exact patch, so it is
+/// trimmed to `3.13`, which any 3.13 security release satisfies.
 fn uv_python_request(config: &TyphonConfig) -> String {
-    default_str(&config.python.target, "3.13").to_owned()
+    let target = default_str(&config.python.target, "3.13");
+    let (version, threaded) = match target.strip_suffix('t') {
+        Some(v) => (v, "t"),
+        None => (target, ""),
+    };
+    let minor: Vec<&str> = version.splitn(3, '.').take(2).collect();
+    format!("{}{threaded}", minor.join("."))
 }
 
 fn has_uv() -> bool {
@@ -1212,6 +1220,7 @@ lint = [\"ruff\"]
             ("3.13", "3.13"),
             ("3.15", "3.15"),
             ("3.14t", "3.14t"),
+            ("3.13.2", "3.13"),
             ("", "3.13"),
         ] {
             let mut cfg = TyphonConfig::default();
