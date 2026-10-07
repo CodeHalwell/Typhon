@@ -689,6 +689,12 @@ fn unmodelled_attribute_references(
             .iter()
             .any(|root| !scan.abc_module_names.contains(root))
         || (scan.star_imported && !scan.metaclass_bare_names.is_empty())
+        // A bare `ABCMeta` has to have been imported from `abc` under that
+        // name; otherwise CPython raises `NameError`.
+        || scan
+            .metaclass_bare_names
+            .iter()
+            .any(|name| name == "ABCMeta" && !scan.abc_meta_names.contains(name))
     {
         missing.insert("a custom metaclass".to_owned());
     }
@@ -836,6 +842,9 @@ struct AttributeScan {
     metaclass_bare_names: Vec<String>,
     /// The root of each dotted metaclass spelling (`abc` for `abc.ABCMeta`).
     metaclass_dotted_roots: Vec<String>,
+    /// Names `from abc import ABCMeta` (or `from abc import *`) bound to
+    /// the real `ABCMeta`; a bare `metaclass=ABCMeta` must be one of them.
+    abc_meta_names: std::collections::HashSet<String>,
     /// Whether a `from m import *` (other than from `abc`) could rebind a
     /// bare metaclass name.
     star_imported: bool,
@@ -1106,7 +1115,11 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                     if alias.name.as_str() == "*" && !from_abc {
                         self.star_imported = true;
                     }
-                    if !is_abc_meta {
+                    if is_abc_meta {
+                        self.abc_meta_names.insert(bound.to_owned());
+                    } else if from_abc && alias.name.as_str() == "*" {
+                        self.abc_meta_names.insert("ABCMeta".to_owned());
+                    } else {
                         self.program_bound.insert(bound.to_owned());
                     }
                     if let Some(module) = &modelled_source {
@@ -1555,6 +1568,17 @@ mod tests {
         let from_abc =
             "from abc import ABCMeta\nplain class A(metaclass=ABCMeta):\n    pass\nprint(A)\n";
         assert_eq!(scan_source(from_abc), None);
+        let star_abc = "from abc import *\nplain class A(metaclass=ABCMeta):\n    pass\nprint(A)\n";
+        assert_eq!(scan_source(star_abc), None);
+        // A bare `ABCMeta` nothing bound is CPython's `NameError`.
+        for unbound in [
+            "import abc\nplain class W(metaclass=ABCMeta):\n    pass\nprint(W())\n",
+            "from abc import ABCMeta as AM\nplain class W(metaclass=ABCMeta):\n    pass\nprint(W())\n",
+        ] {
+            assert!(scan_source(unbound)
+                .unwrap_or_default()
+                .contains(&"a custom metaclass".to_owned()));
+        }
         // A program's own class spelt `ABCMeta` is not, nor one imported
         // from elsewhere.
         let foreign =

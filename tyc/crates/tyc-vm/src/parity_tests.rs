@@ -796,6 +796,7 @@ trap("int table", lambda: bytes.maketrans(97, 98))
 show(bytes.maketrans(bytearray(b"a"), bytearray(b"b"))[97], b"ab".translate(None, bytearray(b"b")))
 trap("int delete", lambda: b"x".translate(None, 120))
 trap("int translate", lambda: b"x".translate(5))
+show(b"a".maketrans(b"a", b"b")[97], "a".maketrans("a", "b"), {}.fromkeys("ab", 0), hasattr(b"", "maketrans"))
 "#,
     );
 }
@@ -1045,6 +1046,13 @@ async def over_class(c: object) -> None:
         show(x)
 trap("enum class", lambda: asyncio.run(over_class(Colour)))
 trap("plain class", lambda: asyncio.run(over_class(SubEnd)))
+from typing import Iterator
+def sync_gen() -> Iterator[int]:
+    yield 1
+plain class SyncGenAiter:
+    def __aiter__(self) -> object:
+        return sync_gen()
+trap("sync gen aiter", lambda: asyncio.run(over_class(SyncGenAiter())))
 "#,
     );
 }
@@ -1072,6 +1080,8 @@ ValueError = 3
 class Aliased(Alias):
     pass
 show(names(Aliased.__mro__), names(Aliased.__bases__), issubclass(Aliased, Exception))
+import asyncio
+show(names(asyncio.CancelledError.__mro__), names(asyncio.CancelledError.__bases__))
 ValueError = Alias
 class Deeper(AppError):
     pass

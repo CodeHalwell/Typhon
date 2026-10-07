@@ -8169,6 +8169,17 @@ impl Interpreter {
                         attr
                     )));
                 }
+                // Static methods (`b"".maketrans`, `{}.fromkeys`) reached
+                // through an instance take no receiver.
+                let static_owner = match (value, attr) {
+                    (Value::Str(_), "maketrans") => Some("str"),
+                    (Value::Bytes(_), "maketrans") => Some("bytes"),
+                    (Value::Dict(_), "fromkeys") => Some("dict"),
+                    _ => None,
+                };
+                if let Some(m) = static_owner.and_then(|ty| builtin_type_method(ty, attr)) {
+                    return Ok(m);
+                }
                 // Return a native fn whose first arg is the receiver — the
                 // method registry in `builtins` does the actual dispatch.
                 let r = value.clone();
@@ -8893,7 +8904,9 @@ impl Interpreter {
                     let async_genexpr = matches!(&aiter, Value::Iter(it)
                         if matches!(&*it.borrow(), IterState::GenExpr(g)
                             if crate::value::genexpr_is_async(&g.borrow())));
-                    if as_generator(&aiter).is_some() || async_genexpr {
+                    let async_gen =
+                        as_generator(&aiter).is_some_and(|g| g.borrow().function.is_async);
+                    if async_gen || async_genexpr {
                         return self.make_iter(aiter);
                     }
                     let has_anext = matches!(&aiter, Value::Instance(target)
@@ -11444,6 +11457,7 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                 | "strip"
                 | "swapcase"
                 | "title"
+                | "maketrans"
                 | "translate"
                 | "upper"
                 | "zfill"
@@ -11487,6 +11501,7 @@ fn builtin_has_attr(value: &Value, attr: &str) -> bool {
                 | "rjust"
                 | "rpartition"
                 | "swapcase"
+                | "maketrans"
                 | "translate"
                 | "title"
                 | "zfill"
@@ -13388,7 +13403,11 @@ fn c3_linearise(class: &Rc<Class>) -> Option<Vec<MroNode>> {
 pub(crate) fn builtin_exc_mro(name: &str) -> Option<Vec<&str>> {
     let base_only = matches!(
         name,
-        "KeyboardInterrupt" | "SystemExit" | "GeneratorExit" | "BaseExceptionGroup"
+        "KeyboardInterrupt"
+            | "SystemExit"
+            | "GeneratorExit"
+            | "BaseExceptionGroup"
+            | "CancelledError"
     );
     let is_exception = base_only
         || matches!(
@@ -13421,9 +13440,8 @@ pub(crate) fn builtin_exc_mro(name: &str) -> Option<Vec<&str>> {
         "BaseExceptionGroup" if name == "ExceptionGroup" => {
             out.extend(["Exception", "BaseException"])
         }
-        "BaseExceptionGroup" | "KeyboardInterrupt" | "SystemExit" | "GeneratorExit" => {
-            out.push("BaseException")
-        }
+        "BaseExceptionGroup" | "KeyboardInterrupt" | "SystemExit" | "GeneratorExit"
+        | "CancelledError" => out.push("BaseException"),
         "Exception" => out.push("BaseException"),
         _ => out.extend(["Exception", "BaseException"]),
     }

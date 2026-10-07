@@ -8,6 +8,14 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ### Fixed
 
+- **`maketrans` on instances, `CancelledError` and `__aiter__` results.**
+  Under `tyc run`, `b"".maketrans(...)`, `"".maketrans(...)` and
+  `{}.fromkeys(...)` work through an instance as well as the type;
+  `asyncio.CancelledError.__mro__` is `(CancelledError, BaseException,
+  object)`; and an `__aiter__` that returns a plain generator raises
+  CPython's `TypeError`. The pre-run scan sends a bare
+  `metaclass=ABCMeta` that was never imported from `abc` under that name
+  to CPython, which raises `NameError` for it.
 - **Flags wider than 64 bits.** `Flag` / `IntFlag` values are now big
   integers under `tyc run`, so a member such as `BIG = 1 << 70` combines,
   inverts, iterates, prints and numbers the next `auto()` as CPython does,
