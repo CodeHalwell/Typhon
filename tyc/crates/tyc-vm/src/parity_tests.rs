@@ -639,6 +639,13 @@ class BoolAuto(Flag):
     A = True
     B = auto()
 show(BoolAuto.B.value)
+class NegMember(Flag):
+    A = 1
+    B = -3
+class NegMemberI(IntFlag):
+    A = 1
+    B = -3
+show(NegMember(-3) is NegMember.B, NegMemberI(-3) is NegMemberI.B)
 class Big(IntFlag):
     LOW = 1
     BIG = 1 << 70
@@ -1028,6 +1035,9 @@ plain class StopSub:
 plain class AwSub:
     def __await__(self) -> StopSub:
         return StopSub()
+plain class AwWrapped:
+    def __await__(self) -> object:
+        return iter(StopWith())
 plain class SubEnd:
     def __aiter__(self) -> "SubEnd":
         return self
@@ -1036,7 +1046,7 @@ plain class SubEnd:
 async def sub_end() -> None:
     async for x in SubEnd():
         show("never", x)
-    show("sub end", await AwSub())
+    show("sub end", await AwSub(), await AwWrapped())
 asyncio.run(sub_end())
 from enum import Enum
 class Colour(Enum):

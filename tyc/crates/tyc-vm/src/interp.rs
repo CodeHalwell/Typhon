@@ -3095,11 +3095,8 @@ impl Interpreter {
                 return Ok(needle.clone());
             }
         }
-        if crate::value::is_flag_class(class) {
-            if let Some(found) = self.flag_lookup_by_value(class, needle) {
-                return found;
-            }
-        }
+        // A declared value is found before a flag's missing-value
+        // normalisation (`class N(Flag): B = -3` makes `N(-3)` be `N.B`).
         if let Some(members) = Self::enum_members(class) {
             for m in &members {
                 if let Value::Instance(i) = m {
@@ -3109,6 +3106,11 @@ impl Interpreter {
                         }
                     }
                 }
+            }
+        }
+        if crate::value::is_flag_class(class) {
+            if let Some(found) = self.flag_lookup_by_value(class, needle) {
+                return found;
             }
         }
         Err(value_error(format!(
@@ -6156,7 +6158,15 @@ impl Interpreter {
                     )));
                 }
                 // A user iterator finishes with `StopIteration(value)`; that
-                // value is the await's result.
+                // value is the await's result. `iter(user_iterator)` wraps
+                // the same object.
+                let it = match &it {
+                    Value::Iter(state) => match &*state.borrow() {
+                        IterState::UserIter(inner) => inner.clone(),
+                        _ => it.clone(),
+                    },
+                    _ => it,
+                };
                 if let Value::Instance(_) = &it {
                     loop {
                         match self.call_dunder0(&it, "__next__") {
@@ -12511,8 +12521,10 @@ fn first_effect(e: &Expr) -> FirstEffect {
         | Expr::BytesLiteral(_)
         | Expr::BooleanLiteral(_)
         | Expr::NoneLiteral(_)
-        | Expr::EllipsisLiteral(_)
-        | Expr::Lambda(_) => Pure,
+        | Expr::EllipsisLiteral(_) => Pure,
+        // Creating a lambda evaluates its parameter defaults, and nothing
+        // else.
+        Expr::Lambda(l) => first_effect_all(lambda_defaults(l)),
         Expr::Tuple(t) => first_effect_all(t.elts.iter()),
         Expr::List(l) => first_effect_all(l.elts.iter()),
         Expr::Starred(s) => first_effect(&s.value),
@@ -12617,11 +12629,19 @@ fn first_effect(e: &Expr) -> FirstEffect {
     }
 }
 
+/// A lambda's parameter defaults, which run when the lambda is created.
+fn lambda_defaults(l: &ast::ExprLambda) -> impl Iterator<Item = &Expr> {
+    l.parameters
+        .iter()
+        .flat_map(|p| p.iter_non_variadic_params())
+        .filter_map(|p| p.default())
+}
+
 fn count_yields(e: &Expr) -> usize {
     use ruff_python_ast::Expr::*;
     match e {
         Yield(_) | YieldFrom(_) => 1,
-        Lambda(_) => 0,
+        Lambda(l) => lambda_defaults(l).map(count_yields).sum(),
         BoolOp(x) => x.values.iter().map(count_yields).sum(),
         BinOp(x) => count_yields(&x.left) + count_yields(&x.right),
         UnaryOp(x) => count_yields(&x.operand),

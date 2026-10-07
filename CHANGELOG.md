@@ -8,6 +8,14 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ### Fixed
 
+- **Negative flag members, wrapped await iterators and more fallbacks.**
+  Under `tyc run`, a declared negative `Flag` member is found by value
+  (`N(-3) is N.B`), and an `__await__` returning `iter(user_iterator)`
+  gives that iterator's `StopIteration` value as the result. The pre-run
+  scan sends to CPython a program that installs `__del__` after the
+  class exists (`setattr(C, "__del__", f)`), a generator whose lambda
+  default runs before a `yield` in the same expression, and a module-level
+  `metaclass=ABCMeta` whose only import sits inside a function.
 - **`maketrans` on instances, `CancelledError` and `__aiter__` results.**
   Under `tyc run`, `b"".maketrans(...)`, `"".maketrans(...)` and
   `{}.fromkeys(...)` work through an instance as well as the type;

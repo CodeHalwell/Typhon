@@ -674,6 +674,11 @@ fn unmodelled_attribute_references(
         }
     }
     missing.extend(scan.class_features.iter().cloned());
+    // `C.__del__ = f` / `setattr(C, "__del__", f)` installs a finaliser
+    // after the class exists.
+    if scan.stored_attributes.contains("__del__") {
+        missing.insert("a `__del__` finaliser".to_owned());
+    }
     if scan
         .metaclass_roots
         .iter()
@@ -851,6 +856,10 @@ struct AttributeScan {
     /// Whether a `from m import *` (other than from `abc`) could rebind a
     /// bare metaclass name.
     star_imported: bool,
+    /// How many `def` / `class` bodies enclose the statement being visited.
+    /// Only a module-level `import abc` / `from abc import ABCMeta` binds a
+    /// name a module-level class header can see.
+    scope_depth: usize,
     /// Every attribute name the program stores or deletes, directly or by
     /// `setattr` / `delattr` (`*` when the name is not a literal).
     stored_attributes: std::collections::HashSet<String>,
@@ -1078,7 +1087,7 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                         Some(asname) => {
                             if module != "abc" {
                                 self.program_bound.insert(asname.as_str().to_owned());
-                            } else {
+                            } else if self.scope_depth == 0 {
                                 self.abc_module_names.insert(asname.as_str().to_owned());
                             }
                             self.bind_import(asname.as_str(), module)
@@ -1088,7 +1097,7 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                             let root = module.split('.').next().unwrap_or(module);
                             if root != "abc" {
                                 self.program_bound.insert(root.to_owned());
-                            } else {
+                            } else if self.scope_depth == 0 {
                                 self.abc_module_names.insert(root.to_owned());
                             }
                             self.bind_import(root, root);
@@ -1118,10 +1127,15 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                     if alias.name.as_str() == "*" && !from_abc {
                         self.star_imported = true;
                     }
+                    let module_level = self.scope_depth == 0;
                     if is_abc_meta {
-                        self.abc_meta_names.insert(bound.to_owned());
+                        if module_level {
+                            self.abc_meta_names.insert(bound.to_owned());
+                        }
                     } else if from_abc && alias.name.as_str() == "*" {
-                        self.abc_meta_names.insert("ABCMeta".to_owned());
+                        if module_level {
+                            self.abc_meta_names.insert("ABCMeta".to_owned());
+                        }
                     } else {
                         self.program_bound.insert(bound.to_owned());
                     }
@@ -1206,7 +1220,10 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
             }
             _ => {}
         }
+        let nested = matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_));
+        self.scope_depth += usize::from(nested);
         ruff_python_ast::visitor::walk_stmt(self, stmt);
+        self.scope_depth -= usize::from(nested);
     }
 
     fn visit_expr(&mut self, expr: &'a ruff_python_ast::Expr) {
@@ -1559,6 +1576,9 @@ mod tests {
             let src = format!("def g() -> object:\n{body}\nprint(list(g()))\n");
             assert!(scan_source(&src).is_some(), "{src}");
         }
+        // A lambda default runs before the yield in the same expression.
+        let lambda_default = "def side() -> int:\n    return 1\ndef g() -> object:\n    show = ((lambda y=side(): y), (yield 1))\nprint(list(g()))\n";
+        assert!(scan_source(lambda_default).is_some());
         // An ordinary generator runs lazily and stays on the VM.
         let lazy = "def g() -> object:\n    mut n = 0\n    while True:\n        yield n\n        n += 1\nprint(next(g()))\n";
         assert_eq!(scan_source(lazy), None);
@@ -1580,6 +1600,12 @@ mod tests {
         assert_eq!(scan_source(from_abc), None);
         let star_abc = "from abc import *\nplain class A(metaclass=ABCMeta):\n    pass\nprint(A)\n";
         assert_eq!(scan_source(star_abc), None);
+        // An import inside a function binds nothing a module-level header
+        // can see.
+        let nested_import = "def hidden() -> None:\n    from abc import ABCMeta\nplain class W(metaclass=ABCMeta):\n    pass\nprint(W())\n";
+        assert!(scan_source(nested_import)
+            .unwrap_or_default()
+            .contains(&"a custom metaclass".to_owned()));
         // A bare `ABCMeta` nothing bound is CPython's `NameError`.
         for unbound in [
             "import abc\nplain class W(metaclass=ABCMeta):\n    pass\nprint(W())\n",
@@ -1661,6 +1687,14 @@ mod tests {
         assert!(scan_source(header)
             .unwrap_or_default()
             .contains(&"a `__del__` finaliser".to_owned()));
+        for installed in [
+            "def cleanup(self: object) -> None:\n    print(\"bye\")\nplain class C:\n    pass\nsetattr(C, \"__del__\", cleanup)\nprint(C())\n",
+            "def cleanup(self: object) -> None:\n    print(\"bye\")\nplain class C:\n    pass\nC.__del__ = cleanup\nprint(C())\n",
+        ] {
+            assert!(scan_source(installed)
+                .unwrap_or_default()
+                .contains(&"a `__del__` finaliser".to_owned()));
+        }
         let lambda_default = "def cleanup(self: object) -> None:\n    print(\"bye\")\nplain class D:\n    f = lambda x=(__del__ := cleanup): None\nprint(D())\n";
         assert!(scan_source(lambda_default)
             .unwrap_or_default()
