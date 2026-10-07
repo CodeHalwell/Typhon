@@ -4741,11 +4741,18 @@ impl Interpreter {
             Value::Instance(i) => {
                 // `Style.BOLD in style` — a plain `Flag` member contains
                 // another when its bits are a superset (the empty flag is in every one).
-                if let (Some(cb), Some(ib)) = (
-                    crate::value::flag_member_bits(container),
-                    crate::value::flag_member_bits(item),
-                ) {
-                    return Ok(cb & ib == ib);
+                // Only a member of the same flag class may be tested.
+                if let Some(cb) = crate::value::flag_member_bits(container) {
+                    let same_class =
+                        matches!(item, Value::Instance(it) if Rc::ptr_eq(&it.class, &i.class));
+                    if let (true, Some(ib)) = (same_class, crate::value::flag_member_bits(item)) {
+                        return Ok(cb & ib == ib);
+                    }
+                    return Err(type_error(format!(
+                        "unsupported operand type(s) for 'in': '{}' and '{}'",
+                        item.type_display_name(),
+                        container.type_display_name()
+                    )));
                 }
                 // `x in obj` → obj.__contains__(x).
                 if let Some(m) = self.find_method(&i.class, "__contains__") {

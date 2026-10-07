@@ -606,6 +606,8 @@ class N(Flag):
 class Other(IntFlag):
     Y = 2
 show(list(N.A), list(N(7)), list(N), len(N.A), repr(Other.Y & Q.A), type(Q.A | Other.Y).__name__, int(Q.A ^ Other.Y))
+trap("foreign in", lambda: Q.A in Other.Y)
+trap("int in", lambda: 1 in Other.Y)
 trap("strict", lambda: C(8))
 "#,
     );

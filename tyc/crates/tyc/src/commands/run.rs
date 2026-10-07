@@ -679,9 +679,10 @@ fn unmodelled_attribute_references(
         missing.insert("a custom metaclass".to_owned());
     }
     for attr in UNMODELLED_ATTRIBUTES {
-        // Only a method the program defines can stand behind `x.attr`; a
-        // bare name bound elsewhere says nothing about the receiver.
-        if scan.attribute_names.contains(*attr) && !scan.function_names.contains(*attr) {
+        // Falling back is always safe, so no binding elsewhere in the
+        // program exempts the attribute: the scan cannot tell which
+        // receiver a same-named definition belongs to.
+        if scan.attribute_names.contains(*attr) {
             missing.insert(format!(".{attr}"));
         }
     }
@@ -802,8 +803,6 @@ struct AttributeScan {
     /// Class-level features the VM ignores: a custom `metaclass=` and a
     /// `__del__` finaliser.
     class_features: std::collections::BTreeSet<String>,
-    /// Names of every `def` in the program.
-    function_names: std::collections::HashSet<String>,
     /// Names bound to something other than the builtin `type`, the `abc`
     /// module or `abc.ABCMeta`: by `def`, `class`, assignment, or an import
     /// from anywhere else.
@@ -836,6 +835,49 @@ fn base_last_segment(expr: &ruff_python_ast::Expr) -> Option<&str> {
         ruff_python_ast::Expr::Name(n) => Some(n.id.as_str()),
         ruff_python_ast::Expr::Attribute(a) => Some(a.attr.as_str()),
         _ => None,
+    }
+}
+
+/// Finds any binding of `__del__` in one class body — `def`, assignment,
+/// loop or `with` target, import alias — without entering nested function
+/// or class scopes.
+#[derive(Default)]
+struct DelBinding {
+    found: bool,
+}
+
+impl<'a> ruff_python_ast::visitor::Visitor<'a> for DelBinding {
+    fn visit_stmt(&mut self, stmt: &'a ruff_python_ast::Stmt) {
+        use ruff_python_ast::Stmt;
+        match stmt {
+            Stmt::FunctionDef(f) => self.found |= f.name.as_str() == "__del__",
+            Stmt::ClassDef(c) => self.found |= c.name.as_str() == "__del__",
+            Stmt::Import(imp) => {
+                self.found |= imp
+                    .names
+                    .iter()
+                    .any(|a| a.asname.as_ref().map_or(a.name.as_str(), |n| n.as_str()) == "__del__")
+            }
+            Stmt::ImportFrom(imp) => {
+                self.found |= imp
+                    .names
+                    .iter()
+                    .any(|a| a.asname.as_ref().map_or(a.name.as_str(), |n| n.as_str()) == "__del__")
+            }
+            _ => ruff_python_ast::visitor::walk_stmt(self, stmt),
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &'a ruff_python_ast::Expr) {
+        use ruff_python_ast::{Expr, ExprContext};
+        match expr {
+            Expr::Name(n) if matches!(n.ctx, ExprContext::Store) => {
+                self.found |= n.id.as_str() == "__del__"
+            }
+            // A lambda body is its own scope.
+            Expr::Lambda(_) => {}
+            _ => ruff_python_ast::visitor::walk_expr(self, expr),
+        }
     }
 }
 
@@ -996,7 +1038,6 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
             Stmt::FunctionDef(f) => {
                 self.shadowed.insert(f.name.as_str().to_owned());
                 self.program_bound.insert(f.name.as_str().to_owned());
-                self.function_names.insert(f.name.as_str().to_owned());
             }
             Stmt::ClassDef(c) => {
                 self.shadowed.insert(c.name.as_str().to_owned());
@@ -1007,6 +1048,11 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                 // the whole module has been scanned.
                 let mut custom_metaclass = false;
                 for kw in c.keywords() {
+                    // `**kwargs` in a class header can carry `metaclass=`.
+                    if kw.arg.is_none() {
+                        custom_metaclass = true;
+                        continue;
+                    }
                     if kw.arg.as_ref().is_none_or(|a| a.as_str() != "metaclass") {
                         continue;
                     }
@@ -1021,25 +1067,13 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                 if custom_metaclass {
                     self.class_features.insert("a custom metaclass".to_owned());
                 }
-                // The VM never runs finalisers.
-                // `def __del__` or a class-level `__del__ = fn` binding.
-                fn is_del(e: &ruff_python_ast::Expr) -> bool {
-                    use ruff_python_ast::Expr;
-                    match e {
-                        Expr::Name(n) => n.id.as_str() == "__del__",
-                        Expr::Tuple(t) => t.elts.iter().any(is_del),
-                        Expr::List(l) => l.elts.iter().any(is_del),
-                        Expr::Starred(s) => is_del(&s.value),
-                        _ => false,
-                    }
+                // The VM never runs finalisers: any binding of `__del__` in
+                // the class body counts.
+                let mut del = DelBinding::default();
+                for st in &c.body {
+                    del.visit_stmt(st);
                 }
-                let has_del = c.body.iter().any(|st| match st {
-                    Stmt::FunctionDef(f) => f.name.as_str() == "__del__",
-                    Stmt::Assign(a) => a.targets.iter().any(is_del),
-                    Stmt::AnnAssign(a) => is_del(&a.target),
-                    _ => false,
-                });
-                if has_del {
+                if del.found {
                     self.class_features
                         .insert("a `__del__` finaliser".to_owned());
                 }
@@ -1422,6 +1456,19 @@ mod tests {
             scan_source(fin),
             Some(vec!["a `__del__` finaliser".to_owned()])
         );
+        let looped = "def bye(self: object) -> None:\n    print(\"bye\")\nplain class G:\n    for __del__ in [bye]:\n        pass\nprint(G())\n";
+        assert_eq!(
+            scan_source(looped),
+            Some(vec!["a `__del__` finaliser".to_owned()])
+        );
+        let imported = "plain class H:\n    from os import getcwd as __del__\nprint(H())\n";
+        assert!(scan_source(imported)
+            .unwrap_or_default()
+            .contains(&"a `__del__` finaliser".to_owned()));
+        let unpacked = "plain class M(type):\n    pass\nlet opts = {\"metaclass\": M}\nplain class W(**opts):\n    pass\nprint(W())\n";
+        assert!(scan_source(unpacked)
+            .unwrap_or_default()
+            .contains(&"a custom metaclass".to_owned()));
         let destructured = "def bye(self: object) -> None:\n    print(\"bye\")\nplain class F:\n    __del__, marker = (bye, 1)\nprint(F())\n";
         assert_eq!(
             scan_source(destructured),
