@@ -70,12 +70,13 @@ tyc run --compile --temp      # legacy with ephemeral build dir
   structurally under `isinstance`.
 - Imports: `import`, `from ... import`, `as` aliasing, dotted module
   access. The full list of modules the VM can resolve natively is below.
-- Comprehensions: list, set, dict, generator (eagerly materialised in v1).
-- Generators: `yield` / `yield from` work under `tyc run` since v0.10.0 via
-  eager materialisation — a yield-bearing function runs to completion with
-  each yielded value buffered, and the call returns an iterator over the
-  collected values (capped at `GENERATOR_CAP = 1_000_000` items). Lazy /
-  unbounded generators (`while True: yield`) still need `tyc build`.
+- Comprehensions: list, set, dict and generator expressions (a generator
+  expression is lazy).
+- Generators: `yield` / `yield from` run lazily, so an unbounded
+  `while True: yield` streams, and `send()` / `throw()` / `close()` and a
+  generator's `return` value (`StopIteration.value`) behave as in CPython.
+  A `yield` in a position the tree-walk cannot suspend falls back to eager
+  collection (see "What the VM does not support yet").
 
 ### Built-in functions
 
@@ -605,24 +606,15 @@ message:
   CPython would — and the body of a `TaskGroup` sees a failed task's
   exception at the `await` rather than the `CancelledError` a real
   cancellation would deliver.
-- **Lazy / unbounded generators.** Finite `yield` / `yield from` work
-  since v0.10.0 via eager materialisation, but the worst case
-  (`while True: yield`) hits the `GENERATOR_CAP = 1_000_000` ceiling and
-  raises a clear `RuntimeError` instead of streaming. Truly lazy /
-  unbounded generators still need `tyc build`.
-- **`generator.send()` / coroutine-style generators.** Because generators
-  are materialised eagerly (above), the VM has no live frame to resume, so
-  `gen.send(value)`, `gen.throw(...)`, and the `value = yield x` two-way
-  protocol are unsupported — the generator runs to its cap before the
-  first `send` could ever reach it. Bidirectional generators need
-  `tyc build`. (Plain forward iteration is unaffected.)
 - **A generator whose `yield` sits where the tree-walk cannot suspend.**
-  Most generator bodies run lazily (`@contextmanager` and
+  Generator bodies run lazily (`@contextmanager` and
   `@asynccontextmanager` factories included, since v1.0.0-beta.1, so the
   `with` body runs between setup and teardown). A `yield` in a loop test,
   a `with` item, a call argument after another call, or two yields in one
-  expression falls back to eager collection, where setup and teardown both
-  run at call time.
+  expression falls back to eager collection: the body runs to completion
+  at call time (capped at `GENERATOR_CAP = 1_000_000` items), so its side
+  effects happen early, an unbounded one hits the cap, and `send()` /
+  `throw()` cannot reach it.
 - Template strings (`t"…"`).
 - IPython escape commands.
 - A `with` / `async with` over anything that is neither `open()`, a
@@ -701,8 +693,7 @@ on the old behaviour will see different — correct — results):
   forms, rich comparisons, `__str__` / `__repr__` / `__len__` /
   `__getitem__` / `__contains__`, `@property` / `@classmethod`
   (inherited through bases).
-- Finite generators (`yield` / `yield from`) via eager materialisation,
-  capped at 1M items.
+- Lazy generators (`yield` / `yield from`, `send` / `throw` / `close`).
 - `type(x)` returns a real type object (`type(x).__name__`,
   `type(x) == int`, `str(type(x))` → `<class 'int'>`).
 - Pydantic `model_validate` / `model_dump` / `model_dump_json` for flat

@@ -721,7 +721,7 @@ fn await_on_stored_asyncio_task_unwraps_to_value() {
 
 #[test]
 fn vm_run_lowers_extension_calls_in_imported_package_modules() {
-    // docs/release-readiness-review-2026-09-30.md §5 follow-up: an
+    // docs/reviews/release-readiness-review-2026-09-30.md §5 follow-up: an
     // `extend str` declared in a package submodule (`catalogue/text.ty`)
     // must be lowered (1) in the entry module importing it by dotted name
     // and (2) inside a sibling module of the package that reaches it with

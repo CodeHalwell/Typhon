@@ -796,7 +796,7 @@ fn check_cross_module_extend_str_no_attribute_not_found() {
 
 #[test]
 fn build_rewrites_attribute_and_call_receivers_of_str_extension() {
-    // docs/release-readiness-review-2026-09-30.md §5: a call of an
+    // docs/reviews/release-readiness-review-2026-09-30.md §5: a call of an
     // `extend BUILTIN` method on an attribute or call receiver passed
     // `tyc check` but was never lowered, so CPython raised
     // `AttributeError: 'str' object has no attribute 'slug'`.

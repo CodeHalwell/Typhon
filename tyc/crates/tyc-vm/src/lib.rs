@@ -2933,7 +2933,7 @@ if log != ["cb", "exit a"]:
 
     #[test]
     fn extend_builtin_attribute_and_call_receivers_dispatch() {
-        // docs/release-readiness-review-2026-09-30.md §5: an extension
+        // docs/reviews/release-readiness-review-2026-09-30.md §5: an extension
         // method called on an attribute (`p.title.slug()`), a call
         // (`make().slug()`), an `impl` method call (`p.url().slug()`) or a
         // chained extension call (`make().slug().slug()`) was never

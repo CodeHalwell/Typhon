@@ -27,6 +27,20 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   missing, so a program using them failed with `AttributeError` in the VM
   but ran on CPython.
 
+### Documentation
+
+- The VM docs (`docs/vm.md`, `tyc run` page, bundled skill) no longer say
+  generators are eager and `send()` is unsupported. Generators have been
+  lazy for a while; only a `yield` the tree-walk cannot suspend still falls
+  back to eager collection.
+- `tyc check --help` describes what `--stubs` actually does (a surface diff
+  against the sibling implementation), not the old parse-only behaviour.
+- The docs site names the real stubtest command, `python -m mypy.stubtest`.
+- `tyc init` docs no longer claim the generated `typhon.toml` lists every
+  key. `TYPE_SYSTEM_FRONTIER.md` records that integer accumulator loops
+  already parallelise. Four comments pointing at moved review files are
+  fixed.
+
 ## 1.0.0-beta.2 — 2026-10-04 — first published beta: Windows build fix
 
 The first beta with published binaries: 1.0.0-beta.1 plus one build fix.

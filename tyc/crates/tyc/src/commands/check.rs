@@ -38,11 +38,11 @@ pub struct CheckArgs {
 
     /// Validate `.dty` stub files against the runtime modules they describe.
     ///
-    /// In v1 this flag only validates that every `.dty` file parses, resolves,
-    /// and type-checks cleanly — the full stubtest-style runtime comparison
-    /// (which would import the implementation module and diff its symbols) is
-    /// deferred. The flag is recognised today so CI configurations are
-    /// forward-compatible.
+    /// Every `.dty` under the checked paths is parsed and type-checked, then
+    /// its surface is diffed against its sibling `.ty` (preferred) or `.py`
+    /// implementation. Findings surface as `tyc::stub_mismatch` at the
+    /// `[strictness] stub-check` severity (default `"error"`). For a runtime
+    /// comparison against the emitted `.pyi`, use `tyc stubtest`.
     #[arg(long)]
     pub stubs: bool,
 

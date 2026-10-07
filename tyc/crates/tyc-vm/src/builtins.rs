@@ -9235,14 +9235,11 @@ fn async_generator_context_manager(gen: Value) -> Value {
 
 /// `functools` shim.
 ///
-/// Implemented: `cache` / `lru_cache` (memoising wrapper, identical
-/// semantics to the `@memo` decorator), `reduce`, `partial` (returns a
-/// callable that prepends the captured args), `cached_property`
-/// (identity wrapper — see FINDINGS #26: callers must invoke the
-/// resulting method as `obj.x()` rather than `obj.x` because the VM
-/// has no descriptor protocol).
-///
-/// `wraps`, `singledispatch`, and `total_ordering` are not implemented.
+/// Implemented natively: `cache` / `lru_cache` (memoising wrapper,
+/// identical semantics to the `@memo` decorator), `reduce`, `partial`
+/// (returns a callable that prepends the captured args) and
+/// `cached_property`. `wraps`, `total_ordering` and `singledispatch` come
+/// from the `functools_extra.py` shim.
 fn make_functools_module(interp: &mut Interpreter) -> Value {
     fn make_cache(_i: &mut Interpreter, args: Vec<Value>) -> Result<Value, Unwind> {
         let inner = args.into_iter().next().unwrap_or(Value::None);
