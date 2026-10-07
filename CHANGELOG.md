@@ -20,7 +20,8 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   CPython's `invalid value` error while an `IntFlag` keeps it; negative
   values (`Perm(-1)`, `Perm.R | -8`) follow CPython's boundary rules; and
   `auto()` after a multi-bit member picks the next free bit. `P.B | True`
-  keeps the `IntFlag` type.
+  keeps the `IntFlag` type, and a composite that also contains an alias
+  is named in CPython's order (`<P.A|C|AB|8: 15>`).
 - **`del` under `tyc run`.** `del (a, b)` and `del [xs[0], d["k"]]` work
   instead of raising `NotImplementedError`; `del` honours `global` and
   `nonlocal` declarations; `del` in a class body unbinds the class
@@ -42,8 +43,8 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   a class without `__aiter__`, or over
   an `async def __aiter__`, raises CPython's `TypeError` too, where the VM
   iterated it. Async comprehensions (`[x async for x in it]`) follow the
-  same protocol, and a plain value returned from a synchronous `__anext__`
-  is CPython's `TypeError`.
+  same protocol, and a plain value (or a non-awaitable instance) returned
+  from a synchronous `__anext__` is CPython's `TypeError`.
 - **`tyc run` no longer runs a generator early without saying so.** A
   generator (or generator lambda) whose `yield` the VM cannot suspend (in
   a loop test, a `with` item, or two in one expression) ran its whole body at the call, so its

@@ -3122,32 +3122,49 @@ impl Interpreter {
         if let Some(cached) = class.class_attrs.borrow().get(&cache_key) {
             return cached.clone();
         }
-        // CPython names a composite of known bits after its single-bit
-        // members only (`R|W|X`, never the multi-bit alias `RW`). When
-        // unknown bits are kept (`IntFlag`'s `KEEP` boundary) it lists every
-        // member contained in the value, aliases included, then the
-        // leftover bits as a number: `<Perm.R|8: 12>`.
-        let extra = bits & !Self::flag_mask(&members);
+        // CPython 3.13's `Flag._missing_`: name the single-bit members the
+        // value contains (definition order); if it also has bits outside
+        // them, add every other member it contains (aliases like `RW`), and
+        // finally any bits still unnamed as a number: `<P.A|C|AB|8: 15>`.
+        let member_name = |m: &Value| match m {
+            Value::Instance(i) => match i.fields.borrow().get("_name_") {
+                Some(Value::Str(n)) => Some((**n).clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let singles = Self::flag_canonical_members(class);
+        let singles_mask = Self::flag_mask(&singles);
         let mut names: Vec<String> = Vec::new();
-        for m in &members {
+        let mut combined = 0i64;
+        let mut taken: Vec<i64> = Vec::new();
+        for m in &singles {
             let Some(mb) = crate::value::flag_member_bits(m) else {
                 continue;
             };
-            let named = if extra == 0 {
-                mb.count_ones() == 1 && bits & mb == mb
-            } else {
-                mb != 0 && bits & mb == mb
-            };
-            if named {
-                if let Value::Instance(i) = m {
-                    if let Some(Value::Str(n)) = i.fields.borrow().get("_name_") {
-                        names.push((**n).clone());
-                    }
+            if bits & mb == mb {
+                names.extend(member_name(m));
+                combined |= mb;
+                taken.push(mb);
+            }
+        }
+        if bits & !singles_mask != 0 {
+            for m in &members {
+                let Some(mb) = crate::value::flag_member_bits(m) else {
+                    continue;
+                };
+                if mb != 0 && bits & mb == mb && !taken.contains(&mb) {
+                    names.extend(member_name(m));
+                    combined |= mb;
+                    taken.push(mb);
                 }
             }
         }
-        if extra != 0 && !names.is_empty() {
-            names.push(extra.to_string());
+        let unknown = bits ^ combined;
+        if combined == 0 {
+            names.clear();
+        } else if unknown != 0 {
+            names.push(unknown.to_string());
         }
         let name = if names.is_empty() {
             Value::None
@@ -9079,6 +9096,15 @@ impl Interpreter {
                         Err(type_error(format!(
                             "'async for' received an invalid object from __anext__: {}",
                             item.type_display_name()
+                        )))
+                    }
+                    // A user instance is awaitable only through `__await__`.
+                    Ok(Some(Value::Instance(inst)))
+                        if self.find_method(&inst.class, "__await__").is_none() =>
+                    {
+                        Err(type_error(format!(
+                            "'async for' received an invalid object from __anext__: {}",
+                            Value::Instance(inst).type_display_name()
                         )))
                     }
                     Ok(Some(coro)) => self.force_awaitable(coro),

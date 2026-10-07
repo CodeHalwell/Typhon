@@ -608,6 +608,15 @@ class Other(IntFlag):
 show(list(N.A), list(N(7)), list(N), len(N.A), repr(Other.Y & Q.A), type(Q.A | Other.Y).__name__, int(Q.A ^ Other.Y))
 trap("foreign in", lambda: Q.A in Other.Y)
 trap("int in", lambda: 1 in Other.Y)
+class PA(IntFlag):
+    A = 1
+    AB = 3
+    C = 4
+class FA(Flag):
+    A = 1
+    AB = 3
+    C = 4
+show(PA(15).name, repr(PA(15)), PA(7).name, PA(11).name, repr(PA(8)), FA(7).name, FA(5).name)
 show(repr(Q.B | True), repr(Q.B & True), repr(Q.B ^ True), repr(True | Q.B))
 trap("strict", lambda: C(8))
 class Neg(Flag):
@@ -809,6 +818,14 @@ plain class SyncAnext:
     def __anext__(self) -> int:
         return 1
 trap("sync anext", lambda: asyncio.run(over(SyncAnext())))
+plain class Token:
+    pass
+plain class TokenAnext:
+    def __aiter__(self) -> "TokenAnext":
+        return self
+    def __anext__(self) -> Token:
+        return Token()
+trap("instance anext", lambda: asyncio.run(over(TokenAnext())))
 async def comp() -> None:
     show("comp", [x async for x in Both()])
 asyncio.run(comp())
