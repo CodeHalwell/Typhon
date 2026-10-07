@@ -887,6 +887,8 @@ plain class WithObject(Mixin, object):
 plain class OnlyObject(object):
     pass
 show(names(WithObject.__bases__), names(WithObject.__mro__), names(OnlyObject.__bases__), names(OnlyObject.__mro__))
+list = 7
+show(ML.__bases__[0] == list, names(ML.__mro__))
 "#,
     );
 }

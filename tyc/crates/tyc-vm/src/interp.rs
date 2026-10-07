@@ -68,6 +68,9 @@ pub struct Interpreter {
     /// Set only while an `async for` builds its iterator: the one place a
     /// hand-written `__aiter__` / `__anext__` object is iterable.
     async_iteration: bool,
+    /// The builtins as installed, before the program can rebind any of
+    /// them: a class's `__bases__` keeps the real `list` after `list = 7`.
+    builtin_globals: HashMap<String, Value>,
     pub stack_depth: usize,
     pub max_stack_depth: usize,
     /// Byte offset (into the current source) of the statement being
@@ -273,6 +276,7 @@ impl Interpreter {
             stack_depth: 0,
             current_offset: 0,
             async_iteration: false,
+            builtin_globals: HashMap::new(),
             current_source: None,
             // Match CPython's default `sys.getrecursionlimit()` of 1000
             // (FINDINGS #31). The tree-walking interpreter still pays a
@@ -310,6 +314,7 @@ impl Interpreter {
                 .unwrap_or(0),
         };
         crate::builtins::install(&mut interp);
+        interp.builtin_globals = interp.root.snapshot().into_iter().collect();
         interp
     }
 
@@ -2853,8 +2858,9 @@ impl Interpreter {
     /// (`type(ValueError())`, `type(True)`).
     fn class_mro_or_bases(&self, class: &Rc<Class>, mro: bool) -> Value {
         let type_of = |name: &str| {
-            self.root
+            self.builtin_globals
                 .get(name)
+                .cloned()
                 .unwrap_or_else(|| crate::builtins::make_builtin_type(name))
         };
         let object = crate::builtins::make_builtin_type("object");
