@@ -5249,13 +5249,12 @@ mod tests {
                 "lazy import t = time\n\n@pure\ndef h(x: int) -> int:\n    print(x)\n    return x\n",
                 &[2],
             ),
-            // `tyc check` judges a lazily imported module through the helper
-            // call it lowers to, which it cannot see through; the editor
-            // must agree rather than report an error CI does not.
+            // A clock read through a lazily imported module is reported, in
+            // the editor as in `tyc check`.
             (
                 "file:///tmp/tyc_lsp_purity_e2e/lazy_clock.ty",
                 "lazy import t = time\n\n@pure\ndef m() -> float:\n    return t.time()\n",
-                &[],
+                &[2],
             ),
             // Control: a pure function publishes nothing.
             (
