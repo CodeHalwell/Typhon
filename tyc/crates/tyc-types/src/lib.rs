@@ -12161,17 +12161,70 @@ fn explicit_variance_override(decorators: &[ruff_python_ast::Decorator]) -> Opti
     }
 }
 
-/// A module's top-level `def`s by name: what a decorator named on a method
-/// may be.
-type ModuleDefs<'a> = HashMap<&'a str, &'a ruff_python_ast::StmtFunctionDef>;
+/// What a decorator named on a method may be: the module's top-level `def`s
+/// by name, and the other names the module binds to something of its own — a
+/// project import (`from mylib import cache`), an assignment (`cache = x`) —
+/// plus the project modules it imports whole (`@mylib.cache`).
+#[derive(Default)]
+struct ModuleDefs<'a> {
+    defs: HashMap<&'a str, &'a ruff_python_ast::StmtFunctionDef>,
+    user_bound: HashSet<&'a str>,
+    user_modules: HashSet<&'a str>,
+}
+
+impl<'a> ModuleDefs<'a> {
+    fn get(&self, name: &str) -> Option<&&'a ruff_python_ast::StmtFunctionDef> {
+        self.defs.get(name)
+    }
+
+    fn contains_key(&self, name: &str) -> bool {
+        self.defs.contains_key(name)
+    }
+}
 
 fn module_defs(body: &[Stmt]) -> ModuleDefs<'_> {
-    body.iter()
-        .filter_map(|stmt| match stmt {
-            Stmt::FunctionDef(f) => Some((f.name.as_str(), f)),
-            _ => None,
-        })
-        .collect()
+    let mut out = ModuleDefs::default();
+    for stmt in body {
+        match stmt {
+            Stmt::FunctionDef(f) => {
+                out.defs.insert(f.name.as_str(), f);
+            }
+            Stmt::ImportFrom(i) => {
+                let module = i.module.as_ref().map_or("", |m| m.as_str());
+                if i.level > 0 || !is_stdlib_dotted(module) {
+                    for alias in &i.names {
+                        let bound = alias.asname.as_ref().unwrap_or(&alias.name);
+                        out.user_bound.insert(bound.as_str());
+                    }
+                }
+            }
+            Stmt::Import(i) => {
+                for alias in &i.names {
+                    if !is_stdlib_dotted(alias.name.as_str()) {
+                        let bound = match &alias.asname {
+                            Some(asname) => asname.as_str(),
+                            None => alias.name.as_str().split('.').next().unwrap_or(""),
+                        };
+                        out.user_modules.insert(bound);
+                    }
+                }
+            }
+            Stmt::Assign(a) => {
+                for target in &a.targets {
+                    if let Expr::Name(n) = target {
+                        out.user_bound.insert(n.id.as_str());
+                    }
+                }
+            }
+            Stmt::AnnAssign(a) => {
+                if let Expr::Name(n) = a.target.as_ref() {
+                    out.user_bound.insert(n.id.as_str());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Whether the decorator `deco` keeps the signature of the method it wraps:
@@ -12190,8 +12243,18 @@ fn decorator_keeps_signature(deco: &Expr, defs: &ModuleDefs, classes: &[String])
         _ => return false,
     };
     // A module `def` is judged by its own types, whatever its name: a user
-    // `def cache(f: …) -> …` is not `functools.cache`.
-    let module_def = matches!(target, Expr::Name(_)) && defs.contains_key(name);
+    // `def cache(f: …) -> …` is not `functools.cache`. Neither is a name the
+    // module binds to something of its own (`from mylib import cache`,
+    // `cache = x`) or an attribute of a project module (`@mylib.cache`); the
+    // names below mean the stdlib and Typhon decorators only when unbound or
+    // imported from the standard library.
+    let module_def = match target {
+        Expr::Name(_) => defs.contains_key(name) || defs.user_bound.contains(name),
+        Expr::Attribute(a) => {
+            matches!(a.value.as_ref(), Expr::Name(m) if defs.user_modules.contains(m.id.as_str()))
+        }
+        _ => false,
+    };
     if !module_def
         && matches!(
             name,

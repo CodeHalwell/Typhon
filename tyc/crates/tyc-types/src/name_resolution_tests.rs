@@ -3565,3 +3565,46 @@ main()
 "#,
     );
 }
+
+/// A decorator the module binds itself under a stdlib-looking name
+/// (`cache = inject_store`) is judged as a user decorator, not as
+/// `functools.cache`: the methods it wraps are not held to the undecorated
+/// def's arity in the unbound, TypeVar-receiver and alias forms.
+#[test]
+fn a_module_alias_named_like_a_stdlib_decorator_is_a_user_decorator() {
+    assert_clean(
+        r#"
+from typing import Callable
+
+class Repo:
+    name: str
+
+def inject_store(f: Callable[[Repo, str, dict[str, str]], str]) -> Callable[[Repo, str], str]:
+    let store: dict[str, str] = {}
+    def wrapper(self: Repo, key: str) -> str:
+        return f(self, key, store)
+    return wrapper
+
+cache = inject_store
+
+impl Repo:
+    @cache
+    def find(self, key: str, store: dict[str, str]) -> str:
+        if key not in store:
+            store[key] = self.name + key
+        return store[key]
+
+def lookup[T: Repo](r: T) -> str:
+    return r.find("k2")
+
+def main() -> None:
+    let r: Repo = Repo(name="r")
+    print(Repo.find(r, "k"))
+    print(lookup(r))
+    let g = r.find
+    print(g("k3"))
+
+main()
+"#,
+    );
+}
