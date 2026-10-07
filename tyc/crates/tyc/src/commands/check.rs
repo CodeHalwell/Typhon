@@ -341,7 +341,8 @@ fn check_scope(args: &CheckArgs, scope: &CheckScope) -> Result<ScopeOutcome> {
     extra_modules.dedup();
     // Build the import-vetting HashSets exactly once; the per-file
     // unknown-module pass reuses them via `check_unknown_modules_with`.
-    let vetting_ctx = tyc_resolve::ImportVettingContext::new(&project_modules, &extra_modules);
+    let vetting_ctx = tyc_resolve::ImportVettingContext::new(&project_modules, &extra_modules)
+        .with_python_target(python_target_u8(&config.python.target).unwrap_or((3, 13)));
 
     // Project-wide shape registry: dotted module name → public class /
     // function shapes the module exports. Built once before the per-file
@@ -610,9 +611,20 @@ fn check_scope(args: &CheckArgs, scope: &CheckScope) -> Result<ScopeOutcome> {
                     auto_parallel,
                     auto_parallel_reductions: config.strictness.auto_parallel_reductions,
                     parallel_min_size: config.strictness.parallel_min_size,
+                    python_target: python_target_u8(&config.python.target),
                 },
             );
             diags.extend(analysis_diags);
+            // `lazy from` is stripped by the preprocessor, so its target
+            // gate reads the `.ty` text.
+            if let Some((major, minor)) = python_target_u8(&config.python.target) {
+                diags.extend(tyc_analyse::lazy_from_target_diagnostics(
+                    &path.to_string_lossy(),
+                    &source,
+                    major,
+                    minor,
+                ));
+            }
         }
 
         // `--stubs`: parse + type-check every `.dty` stub, then compare its
@@ -1166,6 +1178,34 @@ fn run_secondary_passes(
     // against the `.ty` text and line the user wrote.
     diags.remap_lines(&prep.python_source, &prep.line_map, path, source);
 
+    diags
+}
+
+/// `[python] target` as the `(major, minor)` pair the parser takes; `None`
+/// for a value config validation would reject anyway.
+pub(crate) fn python_target_u8(target: &str) -> Option<(u8, u8)> {
+    let (major, minor) = crate::config::parse_python_target(target)?;
+    Some((u8::try_from(major).ok()?, u8::try_from(minor).ok()?))
+}
+
+/// `tyc::requires_newer_python` for `tyc build`, which does not run
+/// the editor-lint pass `tyc check` reports it from. See
+/// [`tyc_analyse::target_version_diagnostics`].
+pub(crate) fn check_target_syntax(path: &str, source: &str, target: &str) -> Diagnostics {
+    let Some((major, minor)) = python_target_u8(target) else {
+        return Diagnostics::new();
+    };
+    let mut diags = tyc_analyse::lazy_from_target_diagnostics(path, source, major, minor);
+    if !tyc_analyse::target_version_check_may_fire(source, major, minor) {
+        return diags;
+    }
+    let (expanded, expanded_to_source) = expand_sugar_mapped(source, true);
+    let (mut prep, prep_to_expanded) = preprocess_mapped(&expanded);
+    prep.line_map = compose_line_maps(&prep_to_expanded, &expanded_to_source);
+    let mut syntax =
+        tyc_analyse::target_version_diagnostics(path, &prep.python_source, major, minor);
+    syntax.remap_lines(&prep.python_source, &prep.line_map, path, source);
+    diags.extend(syntax);
     diags
 }
 

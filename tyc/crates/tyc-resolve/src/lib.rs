@@ -245,24 +245,21 @@ pub struct ResolvedModule {
 /// `os.path` is covered by the `os` entry). Used by
 /// [`check_unknown_modules`] to vet `from X import Y` / `import X` at
 /// check time so a typoed or missing-dep module surfaces before `tyc
-/// build` runs the program. This list is intentionally a static snapshot
-/// of the CPython 3.13 stdlib root-names — the LSP autocomplete table
-/// covers the depth needed for member resolution, but we only need root
-/// matches here.
+/// build` runs the program. This list is the stdlib roots every supported
+/// target (3.13 and later) has; [`is_stdlib_module_for`] adds the ones only
+/// some targets have. The LSP autocomplete table covers the depth needed
+/// for member resolution, but we only need root matches here.
 pub fn python_stdlib_modules() -> &'static [&'static str] {
     &[
         "__future__",
         "_thread",
         "abc",
-        "aifc",
+        "antigravity",
         "argparse",
         "array",
         "ast",
-        "asynchat",
         "asyncio",
-        "asyncore",
         "atexit",
-        "audioop",
         "base64",
         "bdb",
         "binascii",
@@ -270,9 +267,6 @@ pub fn python_stdlib_modules() -> &'static [&'static str] {
         "builtins",
         "bz2",
         "calendar",
-        "cgi",
-        "cgitb",
-        "chunk",
         "cmath",
         "cmd",
         "code",
@@ -287,7 +281,7 @@ pub fn python_stdlib_modules() -> &'static [&'static str] {
         "contextvars",
         "copy",
         "copyreg",
-        "crypt",
+        "cProfile",
         "csv",
         "ctypes",
         "curses",
@@ -297,7 +291,6 @@ pub fn python_stdlib_modules() -> &'static [&'static str] {
         "decimal",
         "difflib",
         "dis",
-        "distutils",
         "doctest",
         "email",
         "encodings",
@@ -328,8 +321,6 @@ pub fn python_stdlib_modules() -> &'static [&'static str] {
         "http",
         "idlelib",
         "imaplib",
-        "imghdr",
-        "imp",
         "importlib",
         "inspect",
         "io",
@@ -337,37 +328,31 @@ pub fn python_stdlib_modules() -> &'static [&'static str] {
         "itertools",
         "json",
         "keyword",
-        "lib2to3",
         "linecache",
         "locale",
         "logging",
         "lzma",
         "mailbox",
-        "mailcap",
         "marshal",
         "math",
         "mimetypes",
         "mmap",
         "modulefinder",
-        "msilib",
         "msvcrt",
         "multiprocessing",
         "netrc",
-        "nis",
-        "nntplib",
+        "nt",
         "ntpath",
+        "nturl2path",
         "numbers",
         "opcode",
         "operator",
         "optparse",
         "os",
-        "ossaudiodev",
-        "parser",
         "pathlib",
         "pdb",
         "pickle",
         "pickletools",
-        "pipes",
         "pkgutil",
         "platform",
         "plistlib",
@@ -382,6 +367,8 @@ pub fn python_stdlib_modules() -> &'static [&'static str] {
         "py_compile",
         "pyclbr",
         "pydoc",
+        "pydoc_data",
+        "pyexpat",
         "queue",
         "quopri",
         "random",
@@ -400,16 +387,10 @@ pub fn python_stdlib_modules() -> &'static [&'static str] {
         "shutil",
         "signal",
         "site",
-        "smtpd",
         "smtplib",
-        "sndhdr",
         "socket",
         "socketserver",
-        "spwd",
         "sqlite3",
-        "sre_compile",
-        "sre_constants",
-        "sre_parse",
         "ssl",
         "stat",
         "statistics",
@@ -417,18 +398,17 @@ pub fn python_stdlib_modules() -> &'static [&'static str] {
         "stringprep",
         "struct",
         "subprocess",
-        "sunau",
         "symtable",
         "sys",
         "sysconfig",
         "syslog",
         "tabnanny",
         "tarfile",
-        "telnetlib",
         "tempfile",
         "termios",
         "test",
         "textwrap",
+        "this",
         "threading",
         "time",
         "timeit",
@@ -447,7 +427,6 @@ pub fn python_stdlib_modules() -> &'static [&'static str] {
         "unicodedata",
         "unittest",
         "urllib",
-        "uu",
         "uuid",
         "venv",
         "warnings",
@@ -457,7 +436,6 @@ pub fn python_stdlib_modules() -> &'static [&'static str] {
         "winreg",
         "winsound",
         "wsgiref",
-        "xdrlib",
         "xml",
         "xmlrpc",
         "zipapp",
@@ -468,6 +446,37 @@ pub fn python_stdlib_modules() -> &'static [&'static str] {
     ]
 }
 
+/// Stdlib roots that only some supported targets have, with the version
+/// that added them (`added`) or removed them (`removed`). Not in
+/// [`python_stdlib_modules`], which lists the roots every target from the
+/// 3.13 floor up has.
+/// A Python `(major, minor)` version.
+type PyVersion = (u8, u8);
+
+const VERSIONED_STDLIB_MODULES: &[(&str, Option<PyVersion>, Option<PyVersion>)] = &[
+    // (root, added, removed)
+    ("annotationlib", Some((3, 14)), None),
+    ("compression", Some((3, 14)), None),
+    ("profiling", Some((3, 15)), None),
+    ("sre_compile", None, Some((3, 15))),
+    ("sre_constants", None, Some((3, 15))),
+    ("sre_parse", None, Some((3, 15))),
+];
+
+/// Whether `root` is a stdlib module on Python `target` (`(major,
+/// minor)`): one every supported target has, or a versioned one the
+/// target falls inside.
+pub fn is_stdlib_module_for(root: &str, target: PyVersion) -> bool {
+    python_stdlib_modules().contains(&root)
+        || VERSIONED_STDLIB_MODULES
+            .iter()
+            .any(|(name, added, removed)| {
+                *name == root
+                    && added.is_none_or(|a| target >= a)
+                    && removed.is_none_or(|r| target < r)
+            })
+}
+
 /// Precomputed import-vetting context — built once per `tyc check`
 /// invocation and shared across every file. Hoisting the HashSet
 /// construction out of [`check_unknown_modules`] keeps per-file cost
@@ -476,6 +485,8 @@ pub fn python_stdlib_modules() -> &'static [&'static str] {
 pub struct ImportVettingContext {
     project_roots: std::collections::HashSet<String>,
     extra_roots: std::collections::HashSet<String>,
+    /// `[python] target`, which decides the version-dependent stdlib roots.
+    python_target: (u8, u8),
 }
 
 impl ImportVettingContext {
@@ -507,7 +518,16 @@ impl ImportVettingContext {
         Self {
             project_roots,
             extra_roots,
+            python_target: (3, 13),
         }
+    }
+
+    /// Vet stdlib imports against `[python] target` instead of the 3.13
+    /// default: `import sre_parse` is unknown on 3.15, `import
+    /// annotationlib` known from 3.14.
+    pub fn with_python_target(mut self, target: (u8, u8)) -> Self {
+        self.python_target = target;
+        self
     }
 }
 
@@ -642,7 +662,6 @@ pub fn check_unknown_modules_with(
     use ruff_python_ast::Stmt;
 
     let mut diags = Diagnostics::new();
-    let stdlib: std::collections::HashSet<&str> = python_stdlib_modules().iter().copied().collect();
     let project_roots = &ctx.project_roots;
     let extra_roots = &ctx.extra_roots;
     let is_resolvable = |module_name: &str| -> bool {
@@ -653,7 +672,7 @@ pub fn check_unknown_modules_with(
             return true;
         }
         root == "typhon_runtime"
-            || stdlib.contains(root)
+            || is_stdlib_module_for(root, ctx.python_target)
             || project_roots.contains(root)
             || extra_roots.contains(root)
     };
@@ -3568,6 +3587,10 @@ pub fn builtin_names() -> std::collections::HashSet<&'static str> {
         "classmethod",
         "staticmethod",
         "frozenset",
+        // New in Python 3.15 (PEP 814, PEP 661). Accepted on every target
+        // here; `tyc::requires_newer_python` rejects them on older ones.
+        "frozendict",
+        "sentinel",
         // Built-in types
         "int",
         "str",
@@ -4652,6 +4675,33 @@ def foo():
             "expected UnknownModule warning; got {:?}",
             diags.warnings()
         );
+    }
+
+    #[test]
+    fn stdlib_vetting_follows_the_python_target() {
+        let src = "import sre_parse\nimport annotationlib\nimport profiling\nimport imp\n";
+        let module = parse_module(src);
+        let warned = |target: (u8, u8)| -> Vec<String> {
+            let ctx = ImportVettingContext::new(&[], &[]).with_python_target(target);
+            check_unknown_modules_with("t.ty", src, &module, &ctx)
+                .warnings()
+                .iter()
+                .map(|w| w.to_string())
+                .collect()
+        };
+        let mention = |warnings: &[String], name: &str| {
+            warnings.iter().any(|w| w.contains(&format!("`{name}`")))
+        };
+        // `imp` left in 3.12, so no supported target has it.
+        let w313 = warned((3, 13));
+        assert!(!mention(&w313, "sre_parse"), "{w313:?}");
+        assert!(mention(&w313, "annotationlib") && mention(&w313, "profiling"));
+        assert!(mention(&w313, "imp"), "{w313:?}");
+        let w314 = warned((3, 14));
+        assert!(!mention(&w314, "annotationlib") && mention(&w314, "profiling"));
+        let w315 = warned((3, 15));
+        assert!(mention(&w315, "sre_parse"), "{w315:?}");
+        assert!(!mention(&w315, "annotationlib") && !mention(&w315, "profiling"));
     }
 
     #[test]

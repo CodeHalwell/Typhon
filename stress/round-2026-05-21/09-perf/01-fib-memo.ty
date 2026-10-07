@@ -11,8 +11,7 @@ def main() -> None:
     let v: int = fib(100)
     let t1: float = time.perf_counter()
     print(v)
-    # The duration itself is not comparable between `tyc run` and CPython.
-    print(f"measured={t1 >= t0}")
+    print(f"elapsed measured={(t1 - t0) >= 0.0}")
 
 if __name__ == "__main__":
     main()

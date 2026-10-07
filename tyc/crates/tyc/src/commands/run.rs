@@ -444,6 +444,9 @@ fn run_vm(args: RunArgs) -> Result<()> {
             with_ty: false,
         })?;
     }
+    if let Some((major, minor)) = vm_python_target(&entry) {
+        tyc_vm::set_python_target(major, minor);
+    }
     let code = tyc_vm::run_file(&entry, &args.script_args).map_err(|e| miette!("{e}"))?;
     std::process::exit(code);
 }
@@ -1383,6 +1386,13 @@ fn stage_package(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
 /// that whole tree (matching `tyc check src/`). For a bare single-file
 /// invocation with no surrounding project — or an entry outside the src
 /// tree — we keep checking just the entry file.
+/// The `[python] target` of the project `entry` belongs to, if any.
+fn vm_python_target(entry: &std::path::Path) -> Option<(u8, u8)> {
+    let dir = entry.canonicalize().ok()?.parent()?.to_path_buf();
+    let (_, cfg) = TyphonConfig::load(&dir).ok().flatten()?;
+    check::python_target_u8(&cfg.python.target)
+}
+
 fn vm_check_scope(path: &std::path::Path, entry: &std::path::Path) -> Vec<PathBuf> {
     let probe = if path.is_dir() {
         path.canonicalize().ok()

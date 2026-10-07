@@ -154,6 +154,10 @@ pub struct LintOptions {
     /// `[strictness] parallel-min-size` — matches the rewrite's threshold so
     /// the advice fires on exactly the shapes that would be rewritten.
     pub parallel_min_size: u64,
+    /// `[python] target` as `(major, minor)`. When set, syntax that target
+    /// cannot parse is reported as `tyc::requires_newer_python` (an
+    /// error). `None` skips the check.
+    pub python_target: Option<(u8, u8)>,
 }
 
 impl Default for LintOptions {
@@ -171,6 +175,7 @@ impl Default for LintOptions {
             auto_parallel: false,
             auto_parallel_reductions: false,
             parallel_min_size: 64,
+            python_target: None,
         }
     }
 }
@@ -195,6 +200,188 @@ pub fn gather_opportunity_diagnostics(module: &ModModule, path: &str, source: &s
         ));
     }
     diags
+}
+
+/// `tyc::requires_newer_python`: every construct in the preprocessed
+/// `source` that Python `major.minor` does not have.
+///
+/// The front end parses against the newest grammar and knows the newest
+/// builtins, so without this a 3.15-only construct (`[*xs for xs in
+/// lists]`, `frozendict(...)`) type-checks on a 3.13 target, `tyc build`
+/// copies it into the `.py`, and CPython 3.13 refuses to compile or run it.
+/// Every hit is code that already failed on its target, so the check
+/// narrows nothing that ran. Spans are offsets into `source`; callers remap
+/// them to the `.ty` text like their other diagnostics.
+///
+/// `source` must be preprocessed with Typhon's `lazy import` still in a
+/// form every target parses (either expansion does: the native PEP 810
+/// statement only appears in a 3.15 build's emitted Python).
+pub fn target_version_diagnostics(path: &str, source: &str, major: u8, minor: u8) -> Diagnostics {
+    let mut diags = Diagnostics::new();
+    for hit in tyc_syntax::unsupported_syntax(source, major, minor) {
+        diags.push_error(TycError::requires_newer_python(
+            hit.message,
+            path.to_owned(),
+            source.to_owned(),
+            usize::from(hit.range.start()),
+            usize::from(hit.range.len()),
+        ));
+    }
+    // Parse again only when a newer builtin's name appears in the text.
+    let may_use_newer_builtin = NEWER_BUILTINS
+        .iter()
+        .any(|(name, added)| (major, minor) < *added && source.contains(name));
+    if !may_use_newer_builtin {
+        return diags;
+    }
+    if let Ok(parsed) = tyc_syntax::parse_module(source) {
+        for (name, added, range) in newer_builtin_uses(&parsed.into_syntax(), (major, minor)) {
+            diags.push_error(TycError::requires_newer_python(
+                format!(
+                    "`{name}` is a builtin added in Python 3.{} and the project targets {major}.{minor}",
+                    added.1
+                ),
+                path.to_owned(),
+                source.to_owned(),
+                usize::from(range.start()),
+                usize::from(range.len()),
+            ));
+        }
+    }
+    diags
+}
+
+/// `tyc::requires_newer_python` for each module-level `lazy from … import …`
+/// (PEP 810) in the `.ty` `source` when the target is before 3.15. The
+/// preprocessor strips the `lazy`, so this reads the `.ty` text, not the
+/// preprocessed Python [`target_version_diagnostics`] takes.
+pub fn lazy_from_target_diagnostics(path: &str, source: &str, major: u8, minor: u8) -> Diagnostics {
+    let mut diags = Diagnostics::new();
+    if (major, minor) >= (3, 15) {
+        return diags;
+    }
+    for offset in tyc_syntax::preprocess::lazy_from_import_offsets(source) {
+        diags.push_error(TycError::requires_newer_python(
+            format!(
+                "`lazy from … import …` needs Python 3.15 (PEP 810) and the project targets {major}.{minor}; \
+                 use `lazy import ALIAS = MODULE` instead"
+            ),
+            path.to_owned(),
+            source.to_owned(),
+            offset,
+            "lazy from".len(),
+        ));
+    }
+    diags
+}
+
+/// Whether [`target_version_diagnostics`] could report anything for
+/// `source` on Python `major.minor`: a byte scan that lets callers skip
+/// preprocessing and parsing for the check on most files. Works on the
+/// `.ty` text as well as the preprocessed Python.
+pub fn target_version_check_may_fire(source: &str, major: u8, minor: u8) -> bool {
+    ((major, minor) < (3, 15) && tyc_syntax::may_hold_newer_syntax(source))
+        || NEWER_BUILTINS
+            .iter()
+            .any(|(name, added)| (major, minor) < *added && source.contains(name))
+}
+
+/// Builtins newer than the 3.13 floor, with the version that added them.
+const NEWER_BUILTINS: &[(&str, (u8, u8))] = &[
+    // PEP 814
+    ("frozendict", (3, 15)),
+    // PEP 661
+    ("sentinel", (3, 15)),
+];
+
+/// Every read of a [`NEWER_BUILTINS`] name `target` does not have. A module
+/// that binds the name anywhere (its own `frozendict` class, an import, a
+/// parameter) is left alone: that name may well not be the builtin.
+fn newer_builtin_uses(
+    module: &ModModule,
+    target: (u8, u8),
+) -> Vec<(&'static str, (u8, u8), TextRange)> {
+    use ruff_python_ast::visitor::source_order::{
+        walk_expr, walk_parameter, walk_pattern, walk_stmt, SourceOrderVisitor,
+    };
+    use ruff_python_ast::{ExprContext, Parameter, Pattern};
+    #[derive(Default)]
+    struct V {
+        bound: HashSet<String>,
+        reads: Vec<(String, TextRange)>,
+    }
+    impl<'ast> SourceOrderVisitor<'ast> for V {
+        fn visit_stmt(&mut self, stmt: &'ast Stmt) {
+            match stmt {
+                Stmt::FunctionDef(f) => {
+                    self.bound.insert(f.name.to_string());
+                }
+                Stmt::ClassDef(c) => {
+                    self.bound.insert(c.name.to_string());
+                }
+                Stmt::Import(i) => {
+                    for alias in &i.names {
+                        let name = alias.asname.as_ref().unwrap_or(&alias.name);
+                        let first = name.as_str().split('.').next().unwrap_or_default();
+                        self.bound.insert(first.to_owned());
+                    }
+                }
+                Stmt::ImportFrom(i) => {
+                    for alias in &i.names {
+                        let name = alias.asname.as_ref().unwrap_or(&alias.name);
+                        self.bound.insert(name.to_string());
+                    }
+                }
+                Stmt::Try(t) => {
+                    for handler in &t.handlers {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = handler;
+                        if let Some(name) = &h.name {
+                            self.bound.insert(name.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            walk_stmt(self, stmt);
+        }
+        fn visit_expr(&mut self, expr: &'ast Expr) {
+            if let Expr::Name(n) = expr {
+                match n.ctx {
+                    ExprContext::Load => self.reads.push((n.id.to_string(), n.range)),
+                    _ => {
+                        self.bound.insert(n.id.to_string());
+                    }
+                }
+            }
+            walk_expr(self, expr);
+        }
+        fn visit_parameter(&mut self, parameter: &'ast Parameter) {
+            self.bound.insert(parameter.name.to_string());
+            walk_parameter(self, parameter);
+        }
+        fn visit_pattern(&mut self, pattern: &'ast Pattern) {
+            let captured = match pattern {
+                Pattern::MatchAs(m) => m.name.as_ref(),
+                Pattern::MatchStar(m) => m.name.as_ref(),
+                Pattern::MatchMapping(m) => m.rest.as_ref(),
+                _ => None,
+            };
+            if let Some(name) = captured {
+                self.bound.insert(name.to_string());
+            }
+            walk_pattern(self, pattern);
+        }
+    }
+    let mut v = V::default();
+    v.visit_body(&module.body);
+    v.reads
+        .into_iter()
+        .filter(|(name, _)| !v.bound.contains(name))
+        .filter_map(|(name, range)| {
+            let &(builtin, added) = NEWER_BUILTINS.iter().find(|(b, _)| *b == name)?;
+            (target < added).then_some((builtin, added, range))
+        })
+        .collect()
 }
 
 /// Run the pure-AST advisory lints that should fire identically in
@@ -223,6 +410,14 @@ pub fn editor_lint_diagnostics(
     // here. It is an error, not a lint, so it runs on the shared check
     // pipeline in `tyc-db` — which `tyc build` also reaches, and this hook
     // does not. Calling it from both would double-report it in `tyc check`.
+    // The one error raised here rather than in `tyc-db`: the check needs
+    // `[python] target`, which the shared pipeline does not carry.
+    // `tyc build` calls `target_version_diagnostics` itself.
+    if let Some((major, minor)) = opts.python_target {
+        if target_version_check_may_fire(source, major, minor) {
+            diags.extend(target_version_diagnostics(path, source, major, minor));
+        }
+    }
     diags.extend(analyse_empty_collection_bindings(module, path, source));
     diags.extend(analyse_typing_alias_annotations(module, path, source));
     diags.extend(analyse_mutable_default_params(module, path, source));
@@ -7858,6 +8053,95 @@ mod lint_tests {
     }
 
     // ── Shared editor / CLI advisory aggregator ─────────────────────────────
+
+    fn error_codes(diags: &Diagnostics) -> Vec<String> {
+        diags
+            .errors()
+            .iter()
+            .filter_map(|e| e.code().map(|c| c.to_string()))
+            .collect()
+    }
+
+    fn target_errors(src: &str, target: (u8, u8)) -> Vec<String> {
+        let prep = tyc_syntax::preprocess::expand_and_preprocess_mapped(src, false);
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .expect("parse failed")
+            .into_syntax();
+        let opts = LintOptions {
+            python_target: Some(target),
+            ..LintOptions::default()
+        };
+        let diags = editor_lint_diagnostics(
+            &module,
+            "x.ty",
+            &prep.python_source,
+            opts,
+            &PerfLintContext::default(),
+        );
+        error_codes(&diags)
+    }
+
+    #[test]
+    fn target_syntax_flags_3_15_comprehension_unpacking_on_3_13() {
+        let src = "let lists = [[1], [2]]\nlet flat = [*xs for xs in lists]\n";
+        let on_313 = target_errors(src, (3, 13));
+        assert!(
+            on_313.iter().any(|c| c.contains("requires_newer_python")),
+            "expected requires_newer_python on 3.13; got {on_313:?}"
+        );
+        assert!(
+            target_errors(src, (3, 15)).is_empty(),
+            "3.15 has comprehension unpacking"
+        );
+    }
+
+    #[test]
+    fn newer_builtins_are_gated_on_the_target() {
+        let src = "let fd = frozendict(a=1)\nlet m = sentinel(\"M\")\nprint(fd, m)\n";
+        let on_313 = target_errors(src, (3, 13));
+        assert_eq!(on_313.len(), 2, "{on_313:?}");
+        assert!(target_errors(src, (3, 15)).is_empty());
+        // A module's own `frozendict` is not the builtin.
+        let own = "class frozendict:\n    x: int\ndef sentinel(n: str) -> str:\n    return n\nprint(frozendict(x=1), sentinel(\"a\"))\n";
+        assert!(target_errors(own, (3, 13)).is_empty());
+    }
+
+    #[test]
+    fn target_syntax_flags_3_14_forms_on_3_13() {
+        for src in [
+            "let name = \"x\"\nlet t = t\"hi {name}\"\n",
+            "try:\n    pass\nexcept ValueError, TypeError:\n    pass\n",
+        ] {
+            assert_eq!(target_errors(src, (3, 13)).len(), 1, "{src:?}");
+            assert!(target_errors(src, (3, 14)).is_empty(), "{src:?}");
+        }
+    }
+
+    #[test]
+    fn target_syntax_ignores_typhon_lazy_import() {
+        // Typhon's own `lazy import` predates PEP 810 and works on every
+        // target; it must not be judged against the target grammar.
+        let src = "lazy import json\nprint(json.dumps(1))\n";
+        assert!(
+            target_errors(src, (3, 13)).is_empty(),
+            "Typhon lazy import is valid on 3.13"
+        );
+    }
+
+    #[test]
+    fn target_syntax_check_is_off_without_a_target() {
+        let src = "let flat = [*xs for xs in [[1]]]\n";
+        let prep = preprocess(src);
+        let module = parse(src);
+        let diags = editor_lint_diagnostics(
+            &module,
+            "x.ty",
+            &prep.python_source,
+            LintOptions::default(),
+            &PerfLintContext::default(),
+        );
+        assert!(error_codes(&diags).is_empty());
+    }
 
     #[test]
     fn editor_lint_diagnostics_bundles_gather_and_lints() {

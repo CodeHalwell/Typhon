@@ -155,6 +155,121 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   already parallelise. Four comments pointing at moved review files are
   fixed.
 
+## Unreleased — Python 3.15 support
+
+CPython 3.15 joins 3.13 in CI as an interpreter for emitted code, and a
+`[python] target` of 3.15 now unlocks 3.15's new syntax and builtins. The
+minimum supported version and the default `[python] target` stay at 3.13,
+so no emitted program changes. The one new error,
+`tyc::requires_newer_python`, fires only on code its target could not have
+run.
+
+### Added
+
+- **`tyc::requires_newer_python` (error).** `tyc check`, `build`, `run` and
+  the editor now reject syntax and builtins newer than `[python] target`.
+  The front end parses against the newest grammar, so a 3.15 unpacking
+  comprehension on a 3.13 target used to type-check and then fail when
+  CPython 3.13 compiled the emitted `.py`. Covered: unparenthesised
+  `except A, B:` and t-strings (3.14), comprehension unpacking and the
+  `frozendict` / `sentinel` builtins (3.15). Typhon's own `lazy import`
+  is exempt, and a module that defines its own `frozendict` or `sentinel`
+  is left alone. On 3.13 targets `frozendict` and `sentinel` were already
+  `tyc::unknown_name` errors.
+- **PEP 798 unpacking comprehensions on 3.15 targets.**
+  `[*xs for xs in lists]`, `{*xs for xs in lists}`, `(*xs for xs in lists)`
+  and `{**d for d in ds}` run under `tyc run` (the VM raised `TypeError`)
+  and type-check with the spread element type (`list[int]` rather than an
+  unchecked element, and no false `type mismatch` on the dict form).
+- **`frozendict` (PEP 814) and `sentinel` (PEP 661) on 3.15 targets.** The
+  checker types `frozendict[K, V]` as a hashable, read-only mapping (typed
+  subscripts and `get` / `items` / `keys` / `values` / `copy` /
+  `fromkeys`, no mutators, item assignment rejected, assignable to
+  `Mapping[K, V]`), and `sentinel` as a class usable in annotations. The VM
+  implements both to match CPython 3.15, including `freeze let` over a
+  `frozendict`.
+- **Target-aware stdlib vetting.** `tyc::unknown_module` now judges stdlib
+  imports against `[python] target`: `sre_compile` / `sre_constants` /
+  `sre_parse` are unknown on 3.15, and `annotationlib` and `compression`
+  (3.14) and `profiling` (3.15) are known from their release. The 26 roots
+  removed by 3.13 or earlier (`imp`, `distutils`, `cgi`, `telnetlib`, …)
+  are no longer treated as stdlib on any target, and `cProfile`, `pyexpat`
+  and a few other present roots were missing and are added. The diagnostic
+  stays a warning.
+- **`lazy from M import …` on 3.15 targets (PEP 810).** A module-level
+  `lazy from json import dumps, loads as parse` now compiles to CPython
+  3.15's native lazy from-import, which defers loading until a name is
+  used. On 3.13 and 3.14 targets it stays an error, now
+  `tyc::requires_newer_python` rather than `tyc::lazy_usage`, since there
+  is no way to defer it there. `lazy from M import *`,
+  `lazy from __future__ import …` and a `lazy from` below module level
+  remain `tyc::lazy_usage` errors on every target; CPython 3.15 rejects
+  them too. `tyc check` and `tyc run` treat the import as an ordinary
+  from-import.
+- **`freeze let` makes a dict a `frozendict` on 3.15 targets.** With
+  `[python] target` 3.15 or later, a frozen `dict` is now CPython 3.15's
+  builtin `frozendict` (PEP 814) rather than a `MappingProxyType` view, so
+  it is genuinely immutable, hashable and picklable. This changes the
+  `repr` and `type` of frozen dicts in existing 3.15-target programs;
+  3.13 and 3.14 targets, and the generated runtime they get, are
+  unchanged. `tyc run` follows the target too.
+- **TypedDict `extra_items` (PEP 728).** A dict literal checked against
+  `class T(TypedDict, extra_items=V)` may carry undeclared keys whose
+  values are `V`s; other undeclared keys are still rejected.
+- **`TypeForm` and `disjoint_base` under `tyc run`.** The VM's `typing`
+  module now exposes 3.15's `TypeForm` (PEP 747) and `@disjoint_base`
+  (PEP 800), and 3.13's `ReadOnly`, so programs using them no longer fall
+  back to CPython.
+
+### Fixed
+
+- **`{**d for d in ds}` emitted a set comprehension.** The printer dropped
+  the `**` of a keyless dict comprehension, so the 3.15 build wrote
+  `{d for d in ds}` and failed at runtime with "unhashable type: 'dict'".
+- **`tyc run` follows `[python] target`.** The VM reported
+  `sys.version_info` as 3.13 whatever the target, so a
+  `sys.version_info >= (3, 15)` guard took a different branch under
+  `tyc run` than on the 3.15 interpreter a 3.15-target build runs on. It
+  now reports the target's version, and on a 3.15 target
+  `PurePath.is_reserved()` (removed in 3.15) raises `AttributeError` as it
+  does in CPython. 3.13-target programs see no change.
+- **The VM accepts `TypedDict` class keywords.** `class T(TypedDict,
+  total=False)`, and 3.15's `closed=` / `extra_items=`, raised
+  "`__init_subclass__()` takes no keyword arguments" under `tyc run`; the
+  keywords now go to `TypedDict` as they do in CPython.
+- **The VM's `**` unpacking accepts any mapping.** Dict displays, calls and
+  dict comprehensions took only a real `dict`; they now accept any object
+  with `keys()` and `__getitem__`, as CPython does.
+
+- **`deep_freeze` accepts a 3.15 `frozendict`.** `freeze let` over a value
+  holding PEP 814's builtin `frozendict` raised `TypeError` ("cannot freeze
+  frozendict") on CPython 3.15. The generated `typhon_runtime/freeze.py`
+  now treats it like `MappingProxyType`: it stays a `frozendict` and its
+  values are frozen. On 3.13 and 3.14 the runtime is unchanged in
+  behaviour.
+- **`tyc repl` finds `python3.14` and `python3.15`.** Interpreter discovery
+  tried only `python3.13`, `python3.12` and `python3`, so a machine with
+  only a newer versioned interpreter fell through to whatever `python3`
+  was.
+
+### Testing / CI
+
+- Two new jobs run existing gates under CPython 3.15:
+  `differential-py315` (the VM ↔ CPython differential over `examples/`,
+  `stress/` and `corpus/valid/`) and `knob-matrix-py315` (the opt-in knob
+  matrix). Every unit that ran on 3.13 still runs on 3.15. Eight stress
+  units print differently because CPython itself changed (3.14/3.15 error
+  message wording, compensated `sum` over mixed int/float, pathlib treating
+  a trailing `.` as a suffix); the VM keeps 3.13's behaviour and those units
+  are listed in the new `scripts/differential-baseline-py315.txt`, which
+  `scripts/vm-differential.sh --extra-baseline` unions with the main
+  baseline.
+- New `target-py315` knob fixture covering unpacking comprehensions,
+  `frozendict` and `sentinel` under CPython 3.15 and the VM.
+- The PEP 810 knob fixture now executes. `scripts/knob-matrix.sh` gains a
+  `min-python=3.N` fixture key: below that interpreter a fixture is
+  build-only by design, and the 3.15 leg runs it under CPython and the VM.
+
 ## 1.0.0-beta.2 — 2026-10-04 — first published beta: Windows build fix
 
 The first beta with published binaries: 1.0.0-beta.1 plus one build fix.

@@ -68,10 +68,15 @@ jobs:
       # indistinguishable from a pass, so this job was reporting green for a
       # tier that never ran. `TYC_REQUIRE_PYTHON` turns a missing interpreter
       # into a failure rather than a silent skip.
+      # 3.13 is listed last so it stays the default `python`; 3.15 is there
+      # for the tests that need a 3.15 interpreter (TYC_REQUIRE_PYTHON315).
       - name: Install Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.13"
+          python-version: |
+            3.15
+            3.13
+          allow-prereleases: true
 
       # The format-stage source-map tests (tests/source_map.rs) only exercise
       # the reflow/re-key logic when `ruff format` actually reflows — without
@@ -86,6 +91,7 @@ jobs:
         run: cargo test --workspace
         env:
           TYC_REQUIRE_PYTHON: "1"
+          TYC_REQUIRE_PYTHON315: "1"
           TYC_REQUIRE_RUFF: "1"
 
   test-macos:
@@ -362,6 +368,75 @@ jobs:
           path: differential-report.tsv
           if-no-files-found: warn
 
+  differential-py315:
+    name: VM ↔ CPython differential on Python 3.15
+    runs-on: ubuntu-latest
+    # The differential job above runs the emitted Python under 3.13, the
+    # minimum supported target. This leg runs the same corpus, built for the
+    # same 3.13 target, under CPython 3.15, so a stdlib or interpreter change
+    # in 3.15 that breaks emitted code fails CI. The VM reproduces 3.13, so the
+    # handful of units whose stdout changed in CPython 3.15 itself (error
+    # message wording, `sum` precision, pathlib suffixes) are listed in
+    # scripts/differential-baseline-py315.txt on top of the main baseline.
+    # Same resource notes as the differential job apply.
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch (toolchain pinned via `with:`)
+        with:
+          toolchain: "1.94"
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        # See the test job: cache failures must not fail CI.
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tyc/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('tyc/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build release tyc binary
+        working-directory: tyc
+        run: cargo build --release --bin tyc
+
+      - name: Install Python 3.15
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.15"
+          # Until 3.15.0 is on the runner image, resolve to the latest 3.15
+          # pre-release rather than failing.
+          allow-prereleases: true
+
+      # Same package set and pins as the 3.13 differential job, for the same
+      # reason: unit classification depends on what the interpreter can import.
+      - name: Install baseline runtime packages (pydantic, PyYAML)
+        run: python3.15 -m pip install --quiet pydantic==2.13.4 PyYAML==6.0.1
+
+      - name: Differential harness on 3.15 (examples + stress)
+        run: scripts/vm-differential.sh --jobs 2 --extra-baseline scripts/differential-baseline-py315.txt --report differential-py315-report.tsv
+        env:
+          PYTHON313: python3.15
+          TYC_REQUIRE_PYTHON: "1"
+
+      - name: Valid-corpus differential on 3.15
+        run: scripts/vm-differential.sh --scope valid --baseline scripts/valid-corpus-baseline.txt --jobs 2
+        env:
+          PYTHON313: python3.15
+          TYC_REQUIRE_PYTHON: "1"
+
+      - name: Upload per-unit differential report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: differential-py315-report
+          path: differential-py315-report.tsv
+          if-no-files-found: warn
+
   valid-corpus:
     name: Valid-programs corpus (W6-18)
     runs-on: ubuntu-latest
@@ -546,4 +621,53 @@ jobs:
       - name: Knob codegen matrix
         run: scripts/knob-matrix.sh
         env:
+          TYC_REQUIRE_PYTHON: "1"
+
+  knob-matrix-py315:
+    name: Opt-in knob codegen matrix on Python 3.15
+    runs-on: ubuntu-latest
+    # The knob matrix above runs under 3.13, where fixtures that declare
+    # `min-python=3.15` in meta.conf (the native PEP 810 lazy-import lowering)
+    # are build-only. This leg executes every fixture under CPython 3.15,
+    # including those, and checks the VM agrees.
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch (toolchain pinned via `with:`)
+        with:
+          toolchain: "1.94"
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        # See the test job: cache failures must not fail CI.
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tyc/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('tyc/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build release tyc binary
+        working-directory: tyc
+        run: cargo build --release --bin tyc
+
+      - name: Install Python 3.15
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.15"
+          allow-prereleases: true
+
+      # See the knob-matrix job: model-extra needs pydantic to execute, and a
+      # reduced fixture is fatal under TYC_REQUIRE_PYTHON.
+      - name: Install pydantic (model-extra fixture runtime)
+        run: python3.15 -m pip install --quiet pydantic
+
+      - name: Knob codegen matrix on 3.15
+        run: scripts/knob-matrix.sh
+        env:
+          PYTHON313: python3.15
           TYC_REQUIRE_PYTHON: "1"

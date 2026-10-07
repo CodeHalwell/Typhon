@@ -12,6 +12,8 @@ enum ResultRule {
     Slice,
     Container(&'static str),
     Dict,
+    FrozenDict,
+    Class(&'static str),
     Same,
     Round,
     Sum,
@@ -56,6 +58,10 @@ const CONTRACTS: &[Contract] = &[
     contract!("set", 0, 1, &[], ResultRule::Container("set")),
     contract!("frozenset", 0, 1, &[], ResultRule::Container("frozenset")),
     contract!("dict", 0, 1, &["*"], ResultRule::Dict),
+    // New in Python 3.15 (PEP 814 / PEP 661); `tyc::requires_newer_python`
+    // rejects them on older targets.
+    contract!("frozendict", 0, 1, &["*"], ResultRule::FrozenDict),
+    contract!("sentinel", 1, 1, &[], ResultRule::Class("sentinel")),
     contract!("abs", 1, 1, &[], ResultRule::Same),
     contract!("round", 1, 2, &["number", "ndigits"], ResultRule::Round),
     contract!("sum", 1, 2, &["start"], ResultRule::Sum),
@@ -153,9 +159,17 @@ pub(super) fn result(name: &str, args: &[Type], keywords: &[(&str, Type)]) -> Op
         ResultRule::Range => Type::Class("range".into()),
         ResultRule::Container(head) => generic(head, vec![elem()]),
         ResultRule::Iterator => generic("Iterator", vec![elem()]),
+        ResultRule::FrozenDict => match result("dict", args, keywords)? {
+            Type::Generic(_, params) => generic("frozendict", params),
+            other => other,
+        },
+        ResultRule::Class(name) => Type::Class(name.into()),
         ResultRule::Dict => {
             if let Type::Generic(head, params) = &first {
-                if matches!(head.as_str(), "dict" | "Mapping" | "MutableMapping") {
+                if matches!(
+                    head.as_str(),
+                    "dict" | "Mapping" | "MutableMapping" | "frozendict"
+                ) {
                     return Some(generic("dict", params.clone()));
                 }
             }
@@ -252,6 +266,7 @@ const BUILTIN_CLASSES: &[&str] = &[
     "enumerate",
     "filter",
     "float",
+    "frozendict",
     "frozenset",
     "int",
     "list",
@@ -261,6 +276,7 @@ const BUILTIN_CLASSES: &[&str] = &[
     "property",
     "range",
     "reversed",
+    "sentinel",
     "set",
     "slice",
     "staticmethod",
