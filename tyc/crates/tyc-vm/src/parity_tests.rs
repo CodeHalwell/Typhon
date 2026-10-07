@@ -572,6 +572,33 @@ show(Color.RED == 1, isinstance(Color.RED, int), list(Color), Color.CRIMSON is C
     );
 }
 
+// ── Flag / IntFlag composites ─────────────────────────────────────────────
+
+#[test]
+fn flag_and_int_flag_composites_match_cpython() {
+    assert_matches_cpython(
+        "flag_and_int_flag_composites_match_cpython",
+        r#"from enum import Flag, IntFlag, auto
+class P(IntFlag):
+    R = 4
+    W = 2
+    X = 1
+    RW = 6
+class C(Flag):
+    A = auto()
+    B = auto()
+    AB = 3
+    D = auto()
+show(repr(P.R | P.W), P.R | P.W, repr(P(7)), repr(P(6)), P(6) is P.RW, repr(P(15)), repr(P(8)), P(8).name)
+show(list(P), list(P(7)), len(P(7)), len(P), repr(P.R | 1), repr(1 | P.R), repr(P.R & 2), P.R + 0, repr(~P.R), repr(P(-1)))
+show(repr(C(7)), list(C), len(C), list(C(7)), repr(~C.A), repr(C.A ^ C.AB), C(3) is C.AB, (C.A | C.D) is (C.D | C.A))
+show(bool(C(0)), repr(C(0)), str(C(0)), str(P(0)), repr(~C(0)), C(0) in C.A, C.AB in C(7), list(C(0)), C["AB"])
+show(P(7) == 7, hash(P.R) == hash(4), {P.R: 1}[4], f"{C.A}", format(P.R))
+trap("strict", lambda: C(8))
+"#,
+    );
+}
+
 // ── W5-11: changing a dict or set while iterating it ──────────────────────
 
 #[test]

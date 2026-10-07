@@ -2161,6 +2161,10 @@ fn modular_inverse(a: &num_bigint::BigInt, m: &num_bigint::BigInt) -> Option<num
 }
 
 fn value_len(v: &Value) -> Result<usize, Unwind> {
+    // `len(Perm.R | Perm.W)` counts the flag members the value contains.
+    if let Some(members) = crate::interp::flag_decompose_pub(v) {
+        return Ok(members.len());
+    }
     // A `StrEnum` member *is* its string, so `len(StrE.X)` is the value's.
     if let Some(inner) = crate::value::enum_mixin_value(v) {
         return value_len(&inner);

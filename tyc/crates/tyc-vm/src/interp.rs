@@ -2823,6 +2823,11 @@ impl Interpreter {
                 return Ok(needle.clone());
             }
         }
+        if crate::value::is_flag_class(class) {
+            if let Some(found) = self.flag_lookup_by_value(class, needle) {
+                return found;
+            }
+        }
         if let Some(members) = Self::enum_members(class) {
             for m in &members {
                 if let Value::Instance(i) = m {
@@ -2903,6 +2908,8 @@ impl Interpreter {
     /// matches exactly, otherwise the composite pseudo-member CPython
     /// synthesises — `.name` is the set bits' names joined with `|`
     /// (`None` when no bit is set), and `repr` is `<Style.BOLD|UNDERLINE: 5>`.
+    /// Pseudo-members are cached on the class, so `(A | B) is (A | B)` holds
+    /// as it does in CPython.
     fn flag_member_for(class: &Rc<Class>, bits: i64) -> Value {
         let members = Self::enum_members(class).unwrap_or_default();
         for m in &members {
@@ -2910,18 +2917,36 @@ impl Interpreter {
                 return m.clone();
             }
         }
+        let cache_key = format!("__typhon_flag_pseudo_{bits}__");
+        if let Some(cached) = class.class_attrs.borrow().get(&cache_key) {
+            return cached.clone();
+        }
+        // CPython names a composite of known bits after its single-bit
+        // members only (`R|W|X`, never the multi-bit alias `RW`). When
+        // unknown bits are kept (`IntFlag`'s `KEEP` boundary) it lists every
+        // member contained in the value, aliases included, then the
+        // leftover bits as a number: `<Perm.R|8: 12>`.
+        let extra = bits & !Self::flag_mask(&members);
         let mut names: Vec<String> = Vec::new();
         for m in &members {
             let Some(mb) = crate::value::flag_member_bits(m) else {
                 continue;
             };
-            if mb != 0 && bits & mb == mb {
+            let named = if extra == 0 {
+                mb.count_ones() == 1 && bits & mb == mb
+            } else {
+                mb != 0 && bits & mb == mb
+            };
+            if named {
                 if let Value::Instance(i) = m {
                     if let Some(Value::Str(n)) = i.fields.borrow().get("_name_") {
                         names.push((**n).clone());
                     }
                 }
             }
+        }
+        if extra != 0 && !names.is_empty() {
+            names.push(extra.to_string());
         }
         let name = if names.is_empty() {
             Value::None
@@ -2934,11 +2959,91 @@ impl Interpreter {
         fields.insert("_name_".to_owned(), name);
         fields.insert("value".to_owned(), value.clone());
         fields.insert("_value_".to_owned(), value);
-        Value::Instance(Rc::new(Instance {
+        let member = Value::Instance(Rc::new(Instance {
             class: class.clone(),
             fields: RefCell::new(fields),
             chain: RefCell::new(None),
-        }))
+        }));
+        class
+            .class_attrs
+            .borrow_mut()
+            .insert(cache_key, member.clone());
+        member
+    }
+
+    /// Every bit some member of a `Flag` class sets (CPython's
+    /// `_flag_mask_`).
+    fn flag_mask(members: &[Value]) -> i64 {
+        members
+            .iter()
+            .filter_map(crate::value::flag_member_bits)
+            .filter(|b| *b > 0)
+            .fold(0, |acc, b| acc | b)
+    }
+
+    /// The canonical (single-bit) members of a `Flag` class, in definition
+    /// order — what iterating the class or one of its values yields. CPython
+    /// 3.11+ treats zero-valued and multi-bit members as aliases, absent from
+    /// iteration and from `len()`.
+    fn flag_canonical_members(class: &Rc<Class>) -> Vec<Value> {
+        Self::enum_members(class)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| crate::value::flag_member_bits(m).is_some_and(|b| b.count_ones() == 1))
+            .collect()
+    }
+
+    /// The canonical members whose bits a `Flag` value contains —
+    /// `list(Perm.R | Perm.W)` is `[Perm.R, Perm.W]`.
+    pub(crate) fn flag_decompose(v: &Value) -> Option<Vec<Value>> {
+        let bits = crate::value::flag_member_bits(v)?;
+        let Value::Instance(inst) = v else {
+            return None;
+        };
+        Some(
+            Self::flag_canonical_members(&inst.class)
+                .into_iter()
+                .filter(|m| crate::value::flag_member_bits(m).is_some_and(|b| bits & b == b))
+                .collect(),
+        )
+    }
+
+    /// `Perm(6)` on a `Flag` / `IntFlag` class: the member or composite
+    /// pseudo-member for those bits. A `Flag` (boundary `STRICT`) rejects
+    /// bits no member declares with CPython's message; an `IntFlag`
+    /// (boundary `KEEP`) keeps them, and reads a negative value as the
+    /// complement within its members' bits.
+    fn flag_lookup_by_value(
+        &self,
+        class: &Rc<Class>,
+        needle: &Value,
+    ) -> Option<Result<Value, Unwind>> {
+        let bits = match needle {
+            Value::Int(i) => i.to_i64()?,
+            Value::Bool(b) => i64::from(*b),
+            _ => return None,
+        };
+        let members = Self::enum_members(class).unwrap_or_default();
+        let mask = Self::flag_mask(&members);
+        if crate::value::is_int_flag_class(class) {
+            let bits = if bits < 0 { mask & bits } else { bits };
+            return Some(Ok(Self::flag_member_for(class, bits)));
+        }
+        if bits < 0 || bits & !mask != 0 {
+            if bits < 0 {
+                return None;
+            }
+            let max_bits = (64 - bits.leading_zeros()).max(64 - mask.leading_zeros()) as usize;
+            let enum_bin = |n: i64| format!("0b0 {:0>width$b}", n, width = max_bits);
+            return Some(Err(value_error(format!(
+                "<flag '{}'> invalid value {}\n    given {}\n  allowed {}",
+                class.name,
+                bits,
+                enum_bin(bits),
+                enum_bin(mask)
+            ))));
+        }
+        Some(Ok(Self::flag_member_for(class, bits)))
     }
 
     /// Whether `class` derives from the VM's enum base class `base`
@@ -2955,17 +3060,7 @@ impl Interpreter {
     /// Whether `class` is a `Flag` or `IntFlag` subclass — the two whose
     /// `auto()` members are numbered by bit rather than by increment.
     fn is_flag_class(class: &Rc<Class>) -> bool {
-        fn marker(class: &Rc<Class>) -> bool {
-            if class
-                .class_attrs
-                .borrow()
-                .contains_key("__typhon_enum_base__")
-            {
-                return matches!(class.name.as_str(), "Flag" | "IntFlag");
-            }
-            class.bases.iter().any(marker)
-        }
-        marker(class)
+        crate::value::is_flag_class(class)
     }
 
     pub(crate) fn is_enum_member(value: &Value) -> bool {
@@ -3006,6 +3101,7 @@ impl Interpreter {
             // continues from it (CPython: `A = 10; B = auto()` ⇒ `B == 11`).
             // Starts at 0 so a leading `auto()` yields 1.
             let mut last_value: i64 = 0;
+            let mut flag_high: i64 = 0;
             for name in &order {
                 let Some(raw) = attrs.get(name).cloned() else {
                     continue;
@@ -3022,11 +3118,13 @@ impl Interpreter {
                 let raw = if Self::is_enum_auto(&raw) && is_str_enum {
                     Value::Str(Rc::new(name.to_lowercase()))
                 } else if Self::is_enum_auto(&raw) {
+                    // A flag's `auto()` is the bit above the highest one any
+                    // earlier member sets (`AB = 3; D = auto()` ⇒ `D == 4`).
                     last_value = if is_flag {
-                        if last_value <= 0 {
+                        if flag_high <= 0 {
                             1
                         } else {
-                            last_value << 1
+                            1 << (64 - flag_high.leading_zeros())
                         }
                     } else {
                         last_value + 1
@@ -3040,6 +3138,9 @@ impl Interpreter {
                     }
                     raw
                 };
+                if let Value::Int(i) = &raw {
+                    flag_high = flag_high.max(i.to_i64().unwrap_or(0));
+                }
                 // A second name for an existing value is an *alias* of that
                 // member: the same object, not a new member, and absent
                 // from iteration (`Color.CRIMSON is Color.RED`).
@@ -4407,12 +4508,12 @@ impl Interpreter {
             },
             Value::Instance(i) => {
                 // `Style.BOLD in style` — a plain `Flag` member contains
-                // another when its bits are a superset.
+                // another when its bits are a superset (the empty flag is in every one).
                 if let (Some(cb), Some(ib)) = (
                     crate::value::flag_member_bits(container),
                     crate::value::flag_member_bits(item),
                 ) {
-                    return Ok(ib != 0 && cb & ib == ib);
+                    return Ok(cb & ib == ib);
                 }
                 // `x in obj` → obj.__contains__(x).
                 if let Some(m) = self.find_method(&i.class, "__contains__") {
@@ -5699,6 +5800,10 @@ impl Interpreter {
                     return Ok(r.to_int()? != 0);
                 }
             }
+            // A `Flag` value is falsy when no bit is set (`Perm(0)`).
+            if let Some(bits) = crate::value::flag_member_bits(v) {
+                return Ok(bits != 0);
+            }
         }
         Ok(v.truthy())
     }
@@ -5981,8 +6086,16 @@ impl Interpreter {
             }
         }
         if let Value::Instance(i) = v {
-            if let Some(Value::Str(name)) = i.fields.borrow().get("_name_") {
-                return Some(format!("{}.{}", i.class.name, name));
+            match i.fields.borrow().get("_name_") {
+                Some(Value::Str(name)) => return Some(format!("{}.{}", i.class.name, name)),
+                // A nameless `Flag` pseudo-member (no bits set) prints as
+                // `Perm(0)`.
+                Some(Value::None) => {
+                    if let Some(bits) = crate::value::flag_member_bits(v) {
+                        return Some(format!("{}({bits})", i.class.name));
+                    }
+                }
+                _ => {}
             }
         }
         None
@@ -6402,23 +6515,39 @@ impl Interpreter {
             }
         }
 
-        // A plain `enum.Flag` combines into composite pseudo-members —
-        // `Style.BOLD | Style.UNDERLINE` is a `Style`, not an int (which is
-        // what `IntFlag` gives, through the mixin path just below).
+        // `enum.Flag` / `enum.IntFlag` members combine into composite
+        // pseudo-members — `Style.BOLD | Style.UNDERLINE` is a `Style`, and
+        // so is `Perm.R | 1` for an `IntFlag` (CPython keeps the flag type
+        // whenever the other operand is a plain int).
         if matches!(op, BitOr | BitAnd | BitXor) {
-            if let (Value::Instance(li), Value::Instance(ri)) = (l, r) {
-                if Rc::ptr_eq(&li.class, &ri.class) {
-                    if let (Some(lb), Some(rb)) = (
-                        crate::value::flag_member_bits(l),
-                        crate::value::flag_member_bits(r),
-                    ) {
-                        let bits = match op {
-                            BitOr => lb | rb,
-                            BitAnd => lb & rb,
-                            _ => lb ^ rb,
-                        };
-                        return Ok(Self::flag_member_for(&li.class, bits));
-                    }
+            let flag_operands = match (l, r) {
+                (Value::Instance(li), Value::Instance(ri)) if Rc::ptr_eq(&li.class, &ri.class) => {
+                    crate::value::flag_member_bits(l)
+                        .zip(crate::value::flag_member_bits(r))
+                        .map(|bits| (li.class.clone(), bits))
+                }
+                (Value::Instance(fi), Value::Int(n)) | (Value::Int(n), Value::Instance(fi))
+                    if crate::value::is_int_flag_class(&fi.class) =>
+                {
+                    let flag = if matches!(l, Value::Instance(_)) {
+                        l
+                    } else {
+                        r
+                    };
+                    crate::value::flag_member_bits(flag)
+                        .zip(n.to_i64())
+                        .map(|bits| (fi.class.clone(), bits))
+                }
+                _ => Option::None,
+            };
+            if let Some((class, (lb, rb))) = flag_operands {
+                let bits = match op {
+                    BitOr => lb | rb,
+                    BitAnd => lb & rb,
+                    _ => lb ^ rb,
+                };
+                if bits >= 0 {
+                    return Ok(Self::flag_member_for(&class, bits));
                 }
             }
         }
@@ -6505,6 +6634,16 @@ impl Interpreter {
             if let Some(name) = dunder {
                 if let Some(r) = self.call_dunder0(v, name)? {
                     return Ok(r);
+                }
+            }
+            // `~Perm.R` complements within the bits the flag's members
+            // declare (CPython 3.11+), for `Flag` and `IntFlag` alike.
+            if op == UnaryOp::Invert {
+                if let (Some(bits), Value::Instance(inst)) = (crate::value::flag_member_bits(v), v)
+                {
+                    let mask =
+                        Self::flag_mask(&Self::enum_members(&inst.class).unwrap_or_default());
+                    return Ok(Self::flag_member_for(&inst.class, mask & !bits));
                 }
             }
             // A value-mixin enum member (`IntEnum` / `IntFlag` / `StrEnum`)
@@ -8213,12 +8352,22 @@ impl Interpreter {
             }
             Value::Iter(it) => return Ok(Value::Iter(it)),
             Value::DictView { kind, dict } => crate::value::IterState::dict_iter(&dict, kind),
-            // Iterating an enum class yields its members in definition order.
+            // Iterating an enum class yields its members in definition order
+            // (a `Flag`'s canonical, single-bit members only).
             Value::Class(ref c) if Self::is_enum_class(c) => {
-                let members = match c.class_attrs.borrow().get("__typhon_enum_members__") {
-                    Some(Value::List(l)) => l.borrow().clone(),
-                    _ => Vec::new(),
+                let members = if Self::is_flag_class(c) {
+                    Self::flag_canonical_members(c)
+                } else {
+                    Self::enum_members(c).unwrap_or_default()
                 };
+                IterState::List {
+                    items: Rc::new(RefCell::new(members)),
+                    index: 0,
+                }
+            }
+            // Iterating a `Flag` value yields the members it contains.
+            Value::Instance(_) if crate::value::flag_member_bits(&v).is_some() => {
+                let members = Self::flag_decompose(&v).unwrap_or_default();
                 IterState::List {
                     items: Rc::new(RefCell::new(members)),
                     index: 0,
@@ -12465,9 +12614,19 @@ pub(crate) fn format_cast_type(tp: &Expr) -> String {
     }
 }
 
-/// [`Interpreter::enum_members`] for the builtins agent.
+/// [`Interpreter::enum_members`] for the builtins agent — a `Flag` class's
+/// canonical members only, as `len()` counts them.
 pub(crate) fn enum_members_pub(class: &Rc<Class>) -> Option<Vec<Value>> {
+    if crate::value::is_flag_class(class) {
+        return Interpreter::enum_members(class)
+            .map(|_| Interpreter::flag_canonical_members(class));
+    }
     Interpreter::enum_members(class)
+}
+
+/// [`Interpreter::flag_decompose`] for the builtins agent.
+pub(crate) fn flag_decompose_pub(v: &Value) -> Option<Vec<Value>> {
+    Interpreter::flag_decompose(v)
 }
 
 /// The non-optional core of an annotation's source text: `Address?`,

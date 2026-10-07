@@ -333,6 +333,12 @@ encodes in `json` as its value, and it keeps its identity as a dict key.
 `StrEnum`'s `auto()` is the lower-cased member name, and a second name
 bound to an existing value is an alias of that member.
 
+`Flag` and `IntFlag` values follow CPython 3.13: `|`, `&`, `^` and `~`
+give a member of the flag class (an `IntFlag` also keeps its type with a
+plain int operand), `Perm(6)` returns the matching composite, and
+iteration, `len()` and `in` work on the single-bit members a value
+contains. A `Flag` rejects undeclared bits; an `IntFlag` keeps them.
+
 ### Checked casts (`as!`) follow the target table (beta)
 
 `EXPR as! TYPE` applies the table in `docs/language.md` ("Checked boundary

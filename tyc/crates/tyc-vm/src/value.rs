@@ -856,41 +856,42 @@ pub fn slice_repr(items: &[Value]) -> String {
     )
 }
 
-/// When `v` is a member of an enum class that mixes in a value type
-/// (`StrEnum`, `IntEnum`, `IntFlag` — detected by walking the base chain
-/// for the VM's `__typhon_enum_base__`-tagged marker classes of those
-/// names), return the member's underlying `value`. CPython makes such
-/// members genuine `str` / `int` subclasses, so equality, ordering,
-/// hashing, and `str()` all flow through the value; plain `Enum` members
-/// intentionally return `None` here (`Color.RED == 1` is False).
-/// Whether `class` is a plain `enum.Flag` subclass — one whose members
-/// combine into composite pseudo-members under `|` / `&` / `^` / `~` but,
-/// unlike `IntFlag`, are *not* ints. `IntFlag` deliberately answers `false`
-/// here: its members already flow through their int mixin.
-pub fn is_plain_flag_class(class: &Rc<Class>) -> bool {
-    fn marker(class: &Rc<Class>) -> Option<&'static str> {
-        if class
-            .class_attrs
-            .borrow()
-            .contains_key("__typhon_enum_base__")
-        {
-            return match class.name.as_str() {
-                "Flag" => Some("Flag"),
-                "IntFlag" => Some("IntFlag"),
-                _ => None,
-            };
-        }
-        class.bases.iter().find_map(marker)
+/// The VM enum marker base (`"Flag"` / `"IntFlag"`) a flag class derives
+/// from, or `None` for every other class.
+fn flag_marker(class: &Rc<Class>) -> Option<&'static str> {
+    if class
+        .class_attrs
+        .borrow()
+        .contains_key("__typhon_enum_base__")
+    {
+        return match class.name.as_str() {
+            "Flag" => Some("Flag"),
+            "IntFlag" => Some("IntFlag"),
+            _ => None,
+        };
     }
-    marker(class) == Some("Flag")
+    class.bases.iter().find_map(flag_marker)
 }
 
-/// The integer a `Flag` member carries, if it is one.
+/// Whether `class` is an `enum.Flag` or `enum.IntFlag` subclass — one whose
+/// members combine into composite pseudo-members under `|` / `&` / `^` /
+/// `~`. `IntFlag` members are additionally ints (through their mixin).
+pub fn is_flag_class(class: &Rc<Class>) -> bool {
+    flag_marker(class).is_some()
+}
+
+/// Whether `class` is an `enum.IntFlag` subclass, whose boundary is `KEEP`
+/// (unknown bits survive) and whose members are ints.
+pub fn is_int_flag_class(class: &Rc<Class>) -> bool {
+    flag_marker(class) == Some("IntFlag")
+}
+
+/// The integer a `Flag` / `IntFlag` member carries, if it is one.
 pub fn flag_member_bits(v: &Value) -> Option<i64> {
     let Value::Instance(inst) = v else {
         return None;
     };
-    if !is_plain_flag_class(&inst.class) {
+    if !is_flag_class(&inst.class) {
         return None;
     }
     match inst.fields.borrow().get("_value_") {
@@ -916,6 +917,13 @@ pub fn enum_str_is_value(v: &Value) -> bool {
     matches!(v, Value::Instance(inst) if marker(&inst.class))
 }
 
+/// When `v` is a member of an enum class that mixes in a value type
+/// (`StrEnum`, `IntEnum`, `IntFlag` — detected by walking the base chain
+/// for the VM's `__typhon_enum_base__`-tagged marker classes of those
+/// names), return the member's underlying `value`. CPython makes such
+/// members genuine `str` / `int` subclasses, so equality, ordering,
+/// hashing, and `str()` all flow through the value; plain `Enum` members
+/// intentionally return `None` here (`Color.RED == 1` is False).
 pub fn enum_mixin_value(v: &Value) -> Option<Value> {
     fn mixin_base(class: &Rc<Class>) -> bool {
         let is_marker = class
@@ -3307,6 +3315,10 @@ fn instance_repr_inner(inst: &Instance) -> String {
     if class_is_enum(&inst.class) {
         if let (Some(Value::Str(name)), Some(val)) = (fields.get("_name_"), fields.get("_value_")) {
             return format!("<{}.{}: {}>", inst.class.name, name, val.py_repr());
+        }
+        // A `Flag` pseudo-member with no bits set has no name: `<Perm: 0>`.
+        if let (Some(Value::None), Some(val)) = (fields.get("_name_"), fields.get("_value_")) {
+            return format!("<{}: {}>", inst.class.name, val.py_repr());
         }
     }
     // `@dataclass(repr=False)` generates no `__repr__`: the nearest

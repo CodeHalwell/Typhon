@@ -4,6 +4,21 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## Unreleased — gap fixes
+
+### Fixed
+
+- **`enum.Flag` / `enum.IntFlag` under `tyc run`.** The VM now matches
+  CPython 3.13 for flag values: `Perm(6)` returns the composite instead of
+  raising `ValueError`; `IntFlag` members combine into `<Perm.R|W: 6>`
+  (also with a plain int, as in `Perm.R | 1`) rather than a bare `int`;
+  `~member` complements within the declared bits; iterating or taking
+  `len()` of a flag value or class counts only its single-bit members;
+  `Perm(0)` is falsy and prints as `Perm(0)` / `<Perm: 0>`; composites are
+  cached so `(A | B) is (B | A)`; a `Flag` given an undeclared bit raises
+  CPython's `invalid value` error while an `IntFlag` keeps it; and
+  `auto()` after a multi-bit member picks the next free bit.
+
 ## 1.0.0-beta.2 — 2026-10-04 — first published beta: Windows build fix
 
 The first beta with published binaries: 1.0.0-beta.1 plus one build fix.
