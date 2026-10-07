@@ -15358,6 +15358,12 @@ fn method_effect(c: &Checker, cls: &str, m: &str) -> ArgEffect {
     }
     if writes.is_empty() {
         ArgEffect::Nothing
+    } else if matches!(union(), ArgEffect::Anything) {
+        // `Fields` drops those fields' narrowings on every object, while
+        // `Anything` only touches the call's own arguments; where the
+        // all-classes answer was `Anything`, keep it, so an unrelated
+        // object's narrowing survives as it did before per-class summaries.
+        ArgEffect::Anything
     } else {
         ArgEffect::Fields(writes)
     }

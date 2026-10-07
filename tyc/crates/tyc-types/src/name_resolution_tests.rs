@@ -3377,3 +3377,58 @@ print(outer())
 "#,
     );
 }
+
+/// A per-class `Fields` summary drops those fields' narrowings on every
+/// object, but the all-classes answer it refines was `Anything` here (another
+/// class's `reset` calls an opaque hook), which touches only the call's own
+/// arguments; the unrelated `h.conn` narrowing must survive `a.reset()`, as it
+/// did before per-class summaries.
+#[test]
+fn per_class_method_summary_keeps_an_unrelated_objects_narrowing() {
+    assert_clean(
+        r#"
+from typing import Callable
+
+class Conn:
+    n: int
+
+impl Conn:
+    def query(self) -> int:
+        return self.n
+
+class A:
+    conn: Conn?
+
+impl A:
+    def reset(self) -> None:
+        self.conn = None
+
+class Hooked:
+    hook: Callable[[], None]
+
+impl Hooked:
+    def reset(self) -> None:
+        let h = self.hook
+        h()
+
+class Holder:
+    conn: Conn?
+
+def noop() -> None:
+    pass
+
+def use(a: A, h: Holder) -> int:
+    if h.conn is not None:
+        a.reset()
+        return h.conn.query()
+    return 0
+
+def main() -> None:
+    let k = Hooked(hook=noop)
+    k.reset()
+    print(use(A(conn=None), Holder(conn=Conn(n=4))))
+
+main()
+"#,
+    );
+}
