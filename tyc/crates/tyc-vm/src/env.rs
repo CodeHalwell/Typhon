@@ -45,6 +45,10 @@ pub struct Env {
     globals: RefCell<HashSet<String>>,
     /// Names declared `nonlocal NAME` — assigns reach to the nearest enclosing function scope.
     nonlocals: RefCell<HashSet<String>>,
+    /// Plain-binding names `del` removed from this scope. They stay owned
+    /// here, so a later `nonlocal` write or `del` from an inner function
+    /// stops at this scope instead of reaching further out.
+    deleted: RefCell<HashSet<String>>,
     parent: Option<EnvRef>,
     /// The module-global scope. The root env points to itself.
     module: RefCell<Option<EnvRef>>,
@@ -61,6 +65,7 @@ impl Env {
             bindings: RefCell::new(HashMap::new()),
             globals: RefCell::new(HashSet::new()),
             nonlocals: RefCell::new(HashSet::new()),
+            deleted: RefCell::new(HashSet::new()),
             parent: None,
             module: RefCell::new(None),
             slot_info: None,
@@ -84,6 +89,7 @@ impl Env {
             bindings: RefCell::new(HashMap::new()),
             globals: RefCell::new(HashSet::new()),
             nonlocals: RefCell::new(HashSet::new()),
+            deleted: RefCell::new(HashSet::new()),
             parent: Some(parent.clone()),
             module: RefCell::new(parent.module.borrow().clone()),
             slot_info: None,
@@ -100,6 +106,7 @@ impl Env {
             bindings: RefCell::new(HashMap::new()),
             globals: RefCell::new(HashSet::new()),
             nonlocals: RefCell::new(HashSet::new()),
+            deleted: RefCell::new(HashSet::new()),
             parent: Some(closure.clone()),
             module: RefCell::new(closure.module.borrow().clone()),
             slot_info: Some(slot_info),
@@ -198,8 +205,8 @@ impl Env {
                         return;
                     }
                 }
-                if env.bindings.borrow().contains_key(name) {
-                    env.bindings.borrow_mut().insert(name.into(), value);
+                if env.owns_binding(name) {
+                    env.bind_here(name, value);
                     return;
                 }
                 cur = env.parent.clone();
@@ -212,7 +219,7 @@ impl Env {
                 return;
             }
         }
-        self.bindings.borrow_mut().insert(name.into(), value);
+        self.bind_here(name, value);
     }
 
     /// Set `name = value` rewriting in the nearest scope that already binds
@@ -231,7 +238,7 @@ impl Env {
                 return;
             }
         }
-        self.bindings.borrow_mut().insert(name.into(), value);
+        self.bind_here(name, value);
     }
 
     /// Store into a `Name` node target — the hot assignment path. Uses the
@@ -254,10 +261,17 @@ impl Env {
             return self.module_scope().delete_here(name);
         }
         if self.nonlocals.borrow().contains(name) {
+            // The enclosing scope `nonlocal` names is the nearest one that
+            // owns the name — as a slot even when it is currently unbound,
+            // so a second `del` fails there instead of reaching further out.
             let mut cur = self.parent.clone();
             while let Some(env) = cur {
-                if env.delete_here(name) {
-                    return true;
+                let owns_slot = env
+                    .slot_info
+                    .as_ref()
+                    .is_some_and(|info| info.slot_of_name(name).is_some());
+                if owns_slot || env.owns_binding(name) {
+                    return env.delete_here(name);
                 }
                 cur = env.parent.clone();
             }
@@ -291,7 +305,28 @@ impl Env {
                 return existed;
             }
         }
-        self.bindings.borrow_mut().remove(name).is_some()
+        let existed = self.bindings.borrow_mut().remove(name).is_some();
+        if existed {
+            self.deleted.borrow_mut().insert(name.to_string());
+        }
+        existed
+    }
+
+    /// Whether `name` is a plain binding of this scope — bound now, or
+    /// unbound by a `del` since.
+    fn owns_binding(&self, name: &str) -> bool {
+        self.bindings.borrow().contains_key(name) || self.deleted.borrow().contains(name)
+    }
+
+    /// Insert a plain binding, clearing any `del` tombstone for it.
+    fn bind_here(&self, name: &str, value: Value) {
+        {
+            let mut deleted = self.deleted.borrow_mut();
+            if !deleted.is_empty() {
+                deleted.remove(name);
+            }
+        }
+        self.bindings.borrow_mut().insert(name.into(), value);
     }
 
     /// Iterate over all (name, value) pairs in this scope only — both plain

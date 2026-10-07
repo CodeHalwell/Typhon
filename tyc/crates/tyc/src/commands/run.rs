@@ -671,6 +671,13 @@ fn unmodelled_attribute_references(
         }
     }
     missing.extend(scan.class_features.iter().cloned());
+    if scan
+        .metaclass_roots
+        .iter()
+        .any(|root| scan.program_bound.contains(root))
+    {
+        missing.insert("a custom metaclass".to_owned());
+    }
     for attr in UNMODELLED_ATTRIBUTES {
         if scan.attribute_names.contains(*attr) && !scan.shadowed.contains(*attr) {
             missing.insert(format!(".{attr}"));
@@ -793,6 +800,13 @@ struct AttributeScan {
     /// Class-level features the VM ignores: a custom `metaclass=` and a
     /// `__del__` finaliser.
     class_features: std::collections::BTreeSet<String>,
+    /// Names the program binds itself — by `def`, `class` or assignment,
+    /// not by import.
+    program_bound: std::collections::HashSet<String>,
+    /// The root name of each `metaclass=ABCMeta` / `metaclass=type`
+    /// spelling (`abc` for `abc.ABCMeta`): modelled only while the program
+    /// does not bind that name itself.
+    metaclass_roots: Vec<String>,
 }
 
 /// What a keyword-passing call calls, as far as the syntax tells.
@@ -816,6 +830,15 @@ fn base_last_segment(expr: &ruff_python_ast::Expr) -> Option<&str> {
     match expr {
         ruff_python_ast::Expr::Name(n) => Some(n.id.as_str()),
         ruff_python_ast::Expr::Attribute(a) => Some(a.attr.as_str()),
+        _ => None,
+    }
+}
+
+/// The leftmost name of a name or dotted attribute (`abc.ABCMeta` → `abc`).
+fn expr_root_name(expr: &ruff_python_ast::Expr) -> Option<&str> {
+    match expr {
+        ruff_python_ast::Expr::Name(n) => Some(n.id.as_str()),
+        ruff_python_ast::Expr::Attribute(a) => expr_root_name(&a.value),
         _ => None,
     }
 }
@@ -944,23 +967,40 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
             }
             Stmt::FunctionDef(f) => {
                 self.shadowed.insert(f.name.as_str().to_owned());
+                self.program_bound.insert(f.name.as_str().to_owned());
             }
             Stmt::ClassDef(c) => {
                 self.shadowed.insert(c.name.as_str().to_owned());
+                self.program_bound.insert(c.name.as_str().to_owned());
                 // The VM honours only `ABCMeta` (and the default `type`); any
                 // other metaclass's `__call__` / `__new__` is never consulted.
-                let custom_metaclass = c.keywords().iter().any(|kw| {
-                    kw.arg.as_ref().is_some_and(|a| a.as_str() == "metaclass")
-                        && !matches!(base_last_segment(&kw.value), Some("ABCMeta") | Some("type"))
-                });
+                // A program-defined class spelt `ABCMeta` is checked once
+                // the whole module has been scanned.
+                let mut custom_metaclass = false;
+                for kw in c.keywords() {
+                    if kw.arg.as_ref().is_none_or(|a| a.as_str() != "metaclass") {
+                        continue;
+                    }
+                    if matches!(base_last_segment(&kw.value), Some("ABCMeta") | Some("type")) {
+                        if let Some(root) = expr_root_name(&kw.value) {
+                            self.metaclass_roots.push(root.to_owned());
+                        }
+                    } else {
+                        custom_metaclass = true;
+                    }
+                }
                 if custom_metaclass {
                     self.class_features.insert("a custom metaclass".to_owned());
                 }
                 // The VM never runs finalisers.
-                let has_del = c
-                    .body
-                    .iter()
-                    .any(|st| matches!(st, Stmt::FunctionDef(f) if f.name.as_str() == "__del__"));
+                // `def __del__` or a class-level `__del__ = fn` binding.
+                let is_del = |e: &ruff_python_ast::Expr| matches!(e, ruff_python_ast::Expr::Name(n) if n.id.as_str() == "__del__");
+                let has_del = c.body.iter().any(|st| match st {
+                    Stmt::FunctionDef(f) => f.name.as_str() == "__del__",
+                    Stmt::Assign(a) => a.targets.iter().any(is_del),
+                    Stmt::AnnAssign(a) => is_del(&a.target),
+                    _ => false,
+                });
                 if has_del {
                     self.class_features
                         .insert("a `__del__` finaliser".to_owned());
@@ -982,6 +1022,7 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
             // A store or delete of the bare name rebinds it.
             Expr::Name(n) if !matches!(n.ctx, ExprContext::Load) => {
                 self.shadowed.insert(n.id.as_str().to_owned());
+                self.program_bound.insert(n.id.as_str().to_owned());
             }
             Expr::Attribute(a) => {
                 self.attribute_names.insert(a.attr.as_str().to_owned());
@@ -1309,10 +1350,24 @@ mod tests {
         // `ABCMeta` is modelled.
         let abc = "import abc\nplain class A(metaclass=abc.ABCMeta):\n    pass\nprint(A)\n";
         assert_eq!(scan_source(abc), None);
+        let from_abc =
+            "from abc import ABCMeta\nplain class A(metaclass=ABCMeta):\n    pass\nprint(A)\n";
+        assert_eq!(scan_source(from_abc), None);
+        // A program's own class spelt `ABCMeta` is not.
+        let own = "plain class ABCMeta(type):\n    pass\nplain class W(metaclass=ABCMeta):\n    pass\nprint(W())\n";
+        assert_eq!(
+            scan_source(own),
+            Some(vec!["a custom metaclass".to_owned()])
+        );
         let fin =
             "plain class D:\n    def __del__(self) -> None:\n        print(\"bye\")\nprint(D())\n";
         assert_eq!(
             scan_source(fin),
+            Some(vec!["a `__del__` finaliser".to_owned()])
+        );
+        let assigned = "def bye(self: object) -> None:\n    print(\"bye\")\nplain class E:\n    __del__ = bye\nprint(E())\n";
+        assert_eq!(
+            scan_source(assigned),
             Some(vec!["a `__del__` finaliser".to_owned()])
         );
         let tb = "try:\n    raise ValueError(\"x\")\nexcept ValueError as e:\n    print(e.__traceback__)\n";

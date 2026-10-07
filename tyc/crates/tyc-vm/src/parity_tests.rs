@@ -594,6 +594,7 @@ show(list(P), list(P(7)), len(P(7)), len(P), repr(P.R | 1), repr(1 | P.R), repr(
 show(repr(C(7)), list(C), len(C), list(C(7)), repr(~C.A), repr(C.A ^ C.AB), C(3) is C.AB, (C.A | C.D) is (C.D | C.A))
 show(bool(C(0)), repr(C(0)), str(C(0)), str(P(0)), repr(~C(0)), C(0) in C.A, C.AB in C(7), list(C(0)), C["AB"])
 show(P(7) == 7, hash(P.R) == hash(4), {P.R: 1}[4], f"{C.A}", format(P.R))
+show(len(P(8)), len(P(9)), len(P.RW), len(C.AB), len(C(0)))
 trap("strict", lambda: C(8))
 "#,
     );
@@ -630,6 +631,18 @@ show("g" in dir())
 trap("again", drop_global)
 trap("twice", drop_twice)
 trap("nonlocal", outer)
+def nested() -> object:
+    x = 1
+    def mid() -> object:
+        x = 2
+        def inner() -> None:
+            nonlocal x
+            del x
+            del x
+        trap("second del", inner)
+    mid()
+    return x
+trap("outer kept", nested)
 "#,
     );
 }
@@ -645,6 +658,7 @@ show(len(t), t[97], b"aabbc".translate(t), b"abc".translate(None, b"b"), b"abcab
 show(b"abc".translate(None), b"abc".translate(t, delete=b"a"))
 trap("short", lambda: b"x".translate(b"short"))
 trap("uneven", lambda: bytes.maketrans(b"ab", b"x"))
+trap("extra", lambda: b"x".translate(None, b"", b"extra"))
 "#,
     );
 }
@@ -716,7 +730,14 @@ show(names(type(ValueError("x")).__mro__), names(type(KeyError("k")).__bases__),
 show(names(bool.__mro__), names(int.__mro__), names(bool.__bases__), names(str.__bases__))
 show(names(Child.__mro__), names(Both.__mro__), names(Both.__bases__), names(Base.__bases__))
 show(names(type(True).__mro__), names(ExceptionGroup.__mro__), names(UnicodeDecodeError.__mro__))
-show(names(Sub.__bases__), names(Sub.__mro__), names(PlainErr.__bases__))
+show(names(Sub.__bases__), names(Sub.__mro__), names(PlainErr.__bases__), names(ExceptionGroup.__bases__))
+plain class ErrFirst(ValueError, Mixin):
+    pass
+plain class MixFirst(Mixin, KeyError):
+    pass
+plain class Join(ErrFirst, KeyError):
+    pass
+show(names(ErrFirst.__mro__), names(ErrFirst.__bases__), names(MixFirst.__mro__), names(Join.__mro__), names(Join.__bases__))
 "#,
     );
 }

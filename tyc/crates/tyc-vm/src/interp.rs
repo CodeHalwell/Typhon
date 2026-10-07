@@ -1689,17 +1689,32 @@ impl Interpreter {
         // are constructor natives, not `Class`es; remember their names so
         // `isinstance(x, dict)` still answers like CPython.
         let mut builtin_bases: Vec<Value> = Vec::new();
+        // The header's class bases and builtin exception bases, interleaved
+        // in declaration order, for the C3 `__mro__` / `__bases__`.
+        let mut header_bases: Vec<Value> = Vec::new();
+        let mut header_has_exc = false;
         if let Some(args) = &c.arguments {
             for arg in args.args.iter() {
                 let v = self.eval_expr(arg, env)?;
                 match v {
-                    Value::Class(c) => bases.push(c),
+                    Value::Class(c) => {
+                        header_bases.push(Value::Class(c.clone()));
+                        bases.push(c)
+                    }
                     // `class Named(Box[int])`: a generic alias's
                     // `__mro_entries__` is its origin class.
                     Value::Instance(inst) if inst.class.name == "_GenericAlias" => {
                         if let Some(Value::Class(origin)) = inst.fields.borrow().get("__origin__") {
+                            header_bases.push(Value::Class(origin.clone()));
                             bases.push(origin.clone());
                         }
+                    }
+                    Value::Native(n)
+                        if builtin_exc_mro(n.name).is_some()
+                            && matches!(self.root.get(n.name), Some(Value::Native(_))) =>
+                    {
+                        header_has_exc = true;
+                        header_bases.push(Value::Str(Rc::new(n.name.to_owned())));
                     }
                     Value::Module(_) => {
                         // e.g. `typing.Protocol` referenced as `Protocol` — ignored for v1.
@@ -2073,6 +2088,14 @@ impl Interpreter {
             })
             .unwrap_or_default();
         let is_exception = bases.iter().any(|b| b.is_exception) || !builtin_exc_bases.is_empty();
+        // Never inherited: a base's record describes the base's header.
+        class_attrs.remove("__typhon_header_bases__");
+        if header_has_exc {
+            class_attrs.insert(
+                "__typhon_header_bases__".to_owned(),
+                Value::Tuple(Rc::new(header_bases)),
+            );
+        }
         if !builtin_exc_bases.is_empty() {
             class_attrs.insert(
                 "__typhon_exc_bases__".to_owned(),
@@ -2794,74 +2817,54 @@ impl Interpreter {
             }
             return Value::Tuple(Rc::new(if mro {
                 chain
+            } else if class.name == "ExceptionGroup" {
+                // `class ExceptionGroup(BaseExceptionGroup, Exception)`.
+                vec![type_of("BaseExceptionGroup"), type_of("Exception")]
             } else {
                 chain.get(1).cloned().into_iter().collect()
             }));
         }
-        // The recorded names are syntactic (`*Error` bases); only those
-        // naming a builtin exception constructor are not already in
-        // `bases` / the MRO as user classes.
-        let exc_bases = |c: &Rc<Class>| -> Vec<String> {
-            match c.class_attrs.borrow().get("__typhon_exc_bases__") {
-                Some(Value::Tuple(t)) => t
-                    .iter()
-                    .map(|v| v.py_str())
-                    .filter(|n| matches!(self.root.get(n), Some(Value::Native(_))))
-                    .collect(),
-                _ => Vec::new(),
-            }
+        let to_value = |node: &MroNode| match node {
+            MroNode::User(c) => Value::Class(c.clone()),
+            MroNode::Builtin(n) => type_of(n),
         };
         if !mro {
-            let mut seen: Vec<Rc<Class>> = Vec::new();
-            for c in class.bases.iter() {
-                if !crate::value::is_builtin_object(c) && !seen.iter().any(|s| Rc::ptr_eq(s, c)) {
-                    seen.push(c.clone());
+            let mut bases: Vec<Value> = Vec::new();
+            let mut seen: Vec<MroNode> = Vec::new();
+            for node in header_mro_bases(class) {
+                if !seen.contains(&node) {
+                    bases.push(to_value(&node));
+                    seen.push(node);
                 }
             }
-            let mut bases: Vec<Value> = seen.into_iter().map(Value::Class).collect();
-            // A recorded name a base also records was inherited with the
-            // base's class attributes, not written in this class's header.
-            let inherited: Vec<String> = class.bases.iter().flat_map(exc_bases).collect();
-            bases.extend(
-                exc_bases(class)
-                    .iter()
-                    .filter(|n| !inherited.contains(n))
-                    .map(|n| type_of(n)),
-            );
             if bases.is_empty() {
                 bases.push(object);
             }
             return Value::Tuple(Rc::new(bases));
         }
-        let mut out: Vec<Value> = Vec::new();
-        let mut builtin: Vec<String> = Vec::new();
-        let mut names: Vec<String> = Vec::new();
-        let mut seen: Vec<Rc<Class>> = Vec::new();
-        for c in class_mro(class).filter(|c| !crate::value::is_builtin_object(c)) {
-            if seen.iter().any(|s| Rc::ptr_eq(s, c)) {
-                continue;
-            }
-            seen.push(c.clone());
-            out.push(Value::Class(c.clone()));
-            names.extend(exc_bases(c));
-        }
-        for n in &names {
-            if let Some(chain) = builtin_exc_mro(n) {
-                for link in chain {
-                    if !builtin.iter().any(|b| b == link) {
-                        builtin.push(link.to_owned());
+        let mut out: Vec<Value> = match c3_linearise(class) {
+            Some(lin) => lin.iter().map(to_value).collect(),
+            // An inconsistent hierarchy CPython would have rejected at
+            // class creation: list the user MRO then the builtin chains.
+            None => {
+                let mut out: Vec<Value> = Vec::new();
+                let mut builtin: Vec<String> = Vec::new();
+                for c in class_mro(class).filter(|c| !crate::value::is_builtin_object(c)) {
+                    out.push(Value::Class(c.clone()));
+                    for node in header_mro_bases(c) {
+                        if let MroNode::Builtin(n) = node {
+                            for link in builtin_exc_mro(&n).unwrap_or_default() {
+                                if !builtin.iter().any(|b| b == link) {
+                                    builtin.push(link.to_owned());
+                                }
+                            }
+                        }
                     }
                 }
+                out.extend(builtin.iter().map(|n| type_of(n)));
+                out
             }
-        }
-        // Keep the shared tail (`Exception`, `BaseException`) last when two
-        // builtin bases contribute it.
-        builtin.sort_by_key(|n| match n.as_str() {
-            "Exception" => 1,
-            "BaseException" => 2,
-            _ => 0,
-        });
-        out.extend(builtin.iter().map(|n| type_of(n)));
+        };
         out.push(object);
         Value::Tuple(Rc::new(out))
     }
@@ -12776,11 +12779,6 @@ pub(crate) fn enum_members_pub(class: &Rc<Class>) -> Option<Vec<Value>> {
     Interpreter::enum_members(class)
 }
 
-/// [`Interpreter::flag_decompose`] for the builtins agent.
-pub(crate) fn flag_decompose_pub(v: &Value) -> Option<Vec<Value>> {
-    Interpreter::flag_decompose(v)
-}
-
 /// The non-optional core of an annotation's source text: `Address?`,
 /// `Address | None`, `Optional[Address]` and `None | Address` all name
 /// `Address`.
@@ -12896,6 +12894,84 @@ fn builtin_exc_parent(name: &str) -> Option<&'static str> {
 /// `BaseException` (the caller appends `object`): `KeyError` gives
 /// `KeyError, LookupError, Exception, BaseException`. `None` when `name` is
 /// not a builtin exception.
+/// One entry of a class's full `__mro__`: a user class, or a builtin
+/// exception the VM models as a native constructor rather than a `Class`.
+#[derive(Clone)]
+enum MroNode {
+    User(Rc<Class>),
+    Builtin(String),
+}
+
+impl PartialEq for MroNode {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (MroNode::User(a), MroNode::User(b)) => Rc::ptr_eq(a, b),
+            (MroNode::Builtin(a), MroNode::Builtin(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// A class's direct bases in header order, builtin exceptions included —
+/// read from the `__typhon_header_bases__` record when the header named
+/// one, else just its user bases.
+fn header_mro_bases(class: &Rc<Class>) -> Vec<MroNode> {
+    if let Some(Value::Tuple(t)) = class.class_attrs.borrow().get("__typhon_header_bases__") {
+        return t
+            .iter()
+            .filter_map(|v| match v {
+                Value::Class(c) if !crate::value::is_builtin_object(c) => {
+                    Some(MroNode::User(c.clone()))
+                }
+                Value::Str(n) => Some(MroNode::Builtin(n.to_string())),
+                _ => None,
+            })
+            .collect();
+    }
+    class
+        .bases
+        .iter()
+        .filter(|c| !crate::value::is_builtin_object(c))
+        .map(|c| MroNode::User(c.clone()))
+        .collect()
+}
+
+/// The C3 linearisation of `class` over user classes and builtin exception
+/// chains, without the implicit `object`. `None` when the bases admit no
+/// consistent order.
+fn c3_linearise(class: &Rc<Class>) -> Option<Vec<MroNode>> {
+    let heads = header_mro_bases(class);
+    let mut seqs: Vec<Vec<MroNode>> = Vec::new();
+    for head in &heads {
+        seqs.push(match head {
+            MroNode::User(c) => c3_linearise(c)?,
+            MroNode::Builtin(n) => builtin_exc_mro(n)?
+                .into_iter()
+                .map(|l| MroNode::Builtin(l.to_owned()))
+                .collect(),
+        });
+    }
+    seqs.push(heads);
+    let mut out = vec![MroNode::User(class.clone())];
+    loop {
+        seqs.retain(|s| !s.is_empty());
+        if seqs.is_empty() {
+            return Some(out);
+        }
+        let next = seqs
+            .iter()
+            .map(|s| &s[0])
+            .find(|cand| !seqs.iter().any(|s| s[1..].contains(cand)))?
+            .clone();
+        for s in seqs.iter_mut() {
+            if s[0] == next {
+                s.remove(0);
+            }
+        }
+        out.push(next);
+    }
+}
+
 pub(crate) fn builtin_exc_mro(name: &str) -> Option<Vec<&str>> {
     let base_only = matches!(
         name,

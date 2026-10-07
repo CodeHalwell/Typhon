@@ -2161,9 +2161,10 @@ fn modular_inverse(a: &num_bigint::BigInt, m: &num_bigint::BigInt) -> Option<num
 }
 
 fn value_len(v: &Value) -> Result<usize, Unwind> {
-    // `len(Perm.R | Perm.W)` counts the flag members the value contains.
-    if let Some(members) = crate::interp::flag_decompose_pub(v) {
-        return Ok(members.len());
+    // `len(Perm.R | Perm.W)` is the value's set-bit count (`Flag.__len__`),
+    // unnamed `IntFlag` bits included.
+    if let Some(bits) = crate::value::flag_member_bits(v) {
+        return Ok(bits.count_ones() as usize);
     }
     // A `StrEnum` member *is* its string, so `len(StrE.X)` is the value's.
     if let Some(inner) = crate::value::enum_mixin_value(v) {
@@ -11201,6 +11202,12 @@ fn bytes_method(
         // `.translate(table, delete=b"")` — drop the `delete` bytes, then map
         // each remaining byte through the 256-byte `table` (`None` keeps it).
         "translate" => {
+            if args.len() > 2 {
+                return Err(type_error(format!(
+                    "translate() takes at most 2 arguments ({} given)",
+                    args.len()
+                )));
+            }
             let table = match args.first() {
                 None => {
                     return Err(type_error(

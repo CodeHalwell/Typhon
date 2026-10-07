@@ -12,8 +12,9 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   CPython 3.13 for flag values: `Perm(6)` returns the composite instead of
   raising `ValueError`; `IntFlag` members combine into `<Perm.R|W: 6>`
   (also with a plain int, as in `Perm.R | 1`) rather than a bare `int`;
-  `~member` complements within the declared bits; iterating or taking
-  `len()` of a flag value or class counts only its single-bit members;
+  `~member` complements within the declared bits; iterating a flag value
+  or class yields only its single-bit members, and `len()` of a value
+  counts its set bits;
   `Perm(0)` is falsy and prints as `Perm(0)` / `<Perm: 0>`; composites are
   cached so `(A | B) is (B | A)`; a `Flag` given an undeclared bit raises
   CPython's `invalid value` error while an `IntFlag` keeps it; and
@@ -42,10 +43,11 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   `AttributeError`, and a class deriving from a builtin exception listed
   only itself and `object`. They now give CPython's chain
   (`AppError, ValueError, Exception, BaseException, object`), and
-  `__bases__` works on every class.
+  `__bases__` works on every class, with the C3 order kept when a builtin
+  exception is mixed with other bases (`class E(ValueError, Mixin)`).
 - **`tyc run` sends more programs it cannot run faithfully to CPython.**
-  A class with a custom `metaclass=` (anything but `ABCMeta`), a class
-  defining `__del__`, and any use of `with_traceback` / `__traceback__`
+  A class with a custom `metaclass=` (anything but the real `ABCMeta` or
+  `type`), a class defining or assigning `__del__`, and any use of `with_traceback` / `__traceback__`
   now take the compiled path with a `note:`. Before, the VM silently
   skipped the metaclass and the finaliser, and raised `AttributeError` for
   the traceback attributes.
