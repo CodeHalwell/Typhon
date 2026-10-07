@@ -2453,9 +2453,21 @@ pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
 /// (`os.environ`'s `_Environ`, `UserDict`, `ChainMap`), or a user subclass of
 /// one.
 pub(crate) fn is_mapping_class(class: &Rc<crate::value::Class>) -> bool {
-    ["dict", "Mapping", "MutableMapping", "UserDict"]
-        .iter()
-        .any(|name| class_in_chain(class, name))
+    // Judged by the builtin / `collections.abc` bases the shims and user
+    // classes record, not by class names: a user class that merely calls
+    // itself `Mapping` or `UserDict` is no mapping.
+    fn records_mapping_base(c: &Rc<crate::value::Class>) -> bool {
+        if let Some(Value::Tuple(names)) = c.class_attrs.borrow().get("__typhon_builtin_bases__") {
+            if names
+                .iter()
+                .any(|n| matches!(n.py_str().as_str(), "dict" | "Mapping" | "MutableMapping"))
+            {
+                return true;
+            }
+        }
+        c.bases.iter().any(records_mapping_base)
+    }
+    records_mapping_base(class)
 }
 
 pub(crate) fn class_in_chain(c: &Rc<crate::value::Class>, name: &str) -> bool {

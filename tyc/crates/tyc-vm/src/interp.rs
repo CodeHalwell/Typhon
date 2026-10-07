@@ -13800,6 +13800,43 @@ keyed = {MISSING: 1}[MISSING]
         assert_eq!(get("keyed"), "1");
     }
 
+    /// A user class that merely calls itself `Mapping` (or `UserDict`) is no
+    /// mapping to a `match` mapping pattern; a dict and a real `UserDict`
+    /// subclass are. Expected values are CPython 3.13's.
+    #[test]
+    fn mapping_patterns_judge_bases_not_class_names() {
+        let src = r#"
+from collections import UserDict
+
+class Mapping:
+    def __init__(self, src, dst):
+        self.src = src
+        self.dst = dst
+    def get(self, key, default=None):
+        return self.dst if key == self.src else default
+
+class Store(UserDict):
+    pass
+
+def route(x):
+    match x:
+        case {"a": target}:
+            return "dict " + str(target)
+        case Mapping():
+            return "mapping"
+        case _:
+            return "other"
+
+r = [route(Mapping("a", "b")), route({"a": 1}), route(Store({"a": 2}))]
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        assert_eq!(
+            interp.root.get("r").unwrap().py_str(),
+            "['mapping', 'dict 1', 'dict 2']"
+        );
+    }
+
     /// An `except` target catches what its name is bound to: a user class
     /// catches its own instances and subclasses, never a distinct class that
     /// merely shares its `__name__`; `IOError` is `OSError`; an alias or a
