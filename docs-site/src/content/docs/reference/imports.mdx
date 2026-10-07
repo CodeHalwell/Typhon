@@ -5,7 +5,7 @@ sidebar:
   order: 19
 ---
 
-Imports follow Python's syntax, with one Typhon addition (`lazy import`) and one Typhon restriction (`lazy from` is rejected).
+Imports follow Python's syntax, with one Typhon addition (`lazy import`) and one target-dependent form (`lazy from`, which needs a 3.15 target).
 
 ## `import`
 
@@ -92,18 +92,19 @@ lazy import torch
 
 The first form gives the proxy an alias; the second uses the module name directly. See [`lazy`](/Typhon/reference/lazy/) for the full reference.
 
-## `lazy from` is rejected
+## `lazy from` needs Python 3.15
 
 ```python
-lazy from numpy import array        # ❌ rejected at check time
+lazy from numpy import array        # ✅ on a 3.15 target, ❌ on 3.13 / 3.14
 ```
 
 ```
-error[tyc::lazy_usage]: `lazy from … import` defeats deferred loading;
-                        use `lazy import numpy` plus `numpy.array(...)`
+error[tyc::requires_newer_python]: `lazy from … import …` needs Python 3.15 (PEP 810)
+                                   and the project targets 3.13; use
+                                   `lazy import ALIAS = MODULE` instead
 ```
 
-`from`-imports eagerly touch attributes on the source module — they cannot defer.
+Before PEP 810 a from-import has to load the module to bind the name, so it cannot defer. On a 3.15 target the native statement makes the name itself lazy, and `tyc build` emits it as written.
 
 ## Unused imports
 

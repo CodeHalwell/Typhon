@@ -32,7 +32,7 @@ def main() -> None:
         mut total: int = 0
         for i in range(1000):
             total += i
-    log.info(f"loop summed to {total} in {t.elapsed:.6f}s")
+    log.info(f"loop summed to {total}, timed={t.elapsed >= 0.0}")
 
 
 if __name__ == "__main__":

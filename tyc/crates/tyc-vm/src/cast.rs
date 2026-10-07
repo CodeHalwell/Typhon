@@ -636,9 +636,15 @@ impl Interpreter {
             }
             Kind::Mapping => {
                 matches!(value, Value::Dict(_))
-                    || ["Mapping", "MutableMapping", "dict", "UserDict"]
-                        .iter()
-                        .any(|n| abc(n))
+                    || [
+                        "Mapping",
+                        "MutableMapping",
+                        "dict",
+                        "UserDict",
+                        "frozendict",
+                    ]
+                    .iter()
+                    .any(|n| abc(n))
             }
             Kind::MutableMapping => {
                 builtin("dict") || ["MutableMapping", "UserDict"].iter().any(|n| abc(n))

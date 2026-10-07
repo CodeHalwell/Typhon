@@ -9,13 +9,15 @@ that passes vacuously is worse than no gate, because it reads as coverage.
 
 | Gate | Script | CI job | What it proves |
 |---|---|---|---|
-| VM ↔ CPython differential | `scripts/vm-differential.sh` | `differential`, `valid-corpus` | `tyc run` behaves identically to `tyc build` + CPython 3.13 over `examples/` + `stress/` (plus `corpus/valid/` under its own baseline — see below) |
-| Opt-in knob codegen matrix | `scripts/knob-matrix.sh` | `knob-matrix` | Every opt-in codegen knob actually fires, and does not change observable behaviour |
+| VM ↔ CPython differential | `scripts/vm-differential.sh` | `differential`, `valid-corpus`, `differential-py315` | `tyc run` behaves identically to `tyc build` + CPython 3.13 over `examples/` + `stress/` (plus `corpus/valid/` under its own baseline — see below), and the emitted Python still runs under CPython 3.15 |
+| Opt-in knob codegen matrix | `scripts/knob-matrix.sh` | `knob-matrix`, `knob-matrix-py315` | Every opt-in codegen knob actually fires, and does not change observable behaviour, under 3.13 and 3.15 |
 | De-formatted corpus `tyc fmt` gate | `scripts/emitted-ast.py fmt-gate` | `fmt-corpus` | `tyc fmt` never changes what a program means, over every unit of `examples/` + `stress/` + `corpus/valid/` |
 | Emitted-AST equivalence | `scripts/emitted-ast.py equiv` | — (run by hand) | Two compilers (binaries or git revisions) emit the same Python AST for every corpus unit, or exactly which units differ |
 
 All require a release binary and a CPython **3.13+** interpreter reachable as
-`python3.13`:
+`python3.13`. The differential and knob scripts take another interpreter
+through `PYTHON313` (the name predates the 3.15 legs); the `*-py315` CI jobs
+run them with `PYTHON313=python3.15`:
 
 ```bash
 cd tyc && cargo build --release && cd ..
@@ -183,7 +185,19 @@ scripts/vm-differential.sh --scope valid \       # corpus/valid/ against its own
 scripts/vm-differential.sh --jobs 16             # parallelism (default: nproc)
 scripts/vm-differential.sh --report r.tsv        # full per-unit TSV
 scripts/vm-differential.sh --update              # rewrite the baseline from this run
+PYTHON313=python3.15 scripts/vm-differential.sh \  # the CPython 3.15 leg
+    --extra-baseline scripts/differential-baseline-py315.txt
 ```
+
+**The CPython 3.15 leg.** The corpus is built for the default 3.13 target and
+run under CPython 3.15 as well, so a 3.15 interpreter or stdlib change that
+breaks emitted code fails CI (`differential-py315`). The VM reproduces 3.13,
+the minimum supported target, so units whose stdout changed in CPython itself
+(3.14/3.15 error-message wording, compensated `sum` over mixed int/float,
+pathlib treating a trailing `.` as a suffix) are listed in
+`scripts/differential-baseline-py315.txt`. `--extra-baseline` unions that file
+with the main baseline instead of copying it; the both-directions rule applies
+to its entries too, and `--update` refuses to run with it.
 
 Triaging one entry:
 
@@ -295,7 +309,7 @@ Each `tests/knobs/<name>/` is a complete miniature project:
 | `expect.txt` | exact expected CPython stdout |
 | `stderr-contains.txt` | substrings required in CPython stderr |
 | `typhon-profile.json` | committed profile data (`pgo-memoise` only) |
-| `meta.conf` | `run=both\|none`, `expect-exit=N`, `vm-diverges=yes`, `requires-module=NAME` |
+| `meta.conf` | `run=both\|none`, `expect-exit=N`, `vm-diverges=yes`, `requires-module=NAME`, `min-python=3.N` |
 
 In any marker file a literal `\n` expands to a real newline, so one marker can
 span source lines (e.g. a decorator plus the `def` it sits on).
@@ -332,7 +346,7 @@ span source lines (e.g. a decorator plus the `def` it sits on).
 | `free-threaded-parallel` | `[python] target = "3.13t"` + `free-threaded` | the emitted Python still runs on a stock GIL 3.13 |
 | `model-extra-allow` | `[emit] model-extra` | `ConfigDict(extra="allow")` |
 | `skip-decoration-bases` | `[emit] skip-decoration-bases` | `@dataclasses.dataclass` suppressed on the listed base's subclass |
-| `lazy-import-pep810` | `[python] target = "3.15"` | native `lazy import json as js` instead of the runtime proxy (build-only — python3.13 cannot parse PEP 810) |
+| `lazy-import-pep810` | `[python] target = "3.15"` | native `lazy import json as js` instead of the runtime proxy (`min-python=3.15`: build-only under python3.13, executed by `knob-matrix-py315`) |
 
 ### Running it
 
@@ -344,6 +358,16 @@ scripts/knob-matrix.sh --filter pgo --keep     # keep both builds for inspection
 
 Runtime is a few seconds. Adding a knob means adding a directory — no script
 change.
+
+A fixture whose emitted Python needs a newer interpreter declares it with
+`min-python=3.N` in `meta.conf`. Under an older `PYTHON313` its execution half
+is skipped by design and printed as `ok (build-only: needs Python 3.N+)`; unlike
+a missing `requires-module`, that is not a reduction and does not fail under
+`TYC_REQUIRE_PYTHON`, because `knob-matrix-py315` executes it:
+
+```bash
+PYTHON313=python3.15 scripts/knob-matrix.sh
+```
 
 ### Missing runtime dependencies
 

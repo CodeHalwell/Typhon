@@ -69,7 +69,10 @@
 ## 2024-08-23 - [Remove tabindex="0" from abbr tags]
 **Learning:** Adding `tabindex="0"` to non-interactive `<abbr>` elements makes them focusable for screen readers but fails WCAG 1.4.13 (Content on Hover or Focus) for sighted keyboard users. Standard browser tooltips (`title` attribute) do not display on keyboard focus, making this pattern inaccessible.
 **Action:** Removed `tabindex="0"` from `<abbr>` tags. If tooltips are needed for keyboard users, a custom tooltip component must be used instead of relying on the native `title` attribute on `<abbr>`.
-
 ## 2024-05-24 - Better Focus States for Composite Link Cards
 **Learning:** For composite interactive components like `<LinkCard>` where the semantic interactive element (an inner `<a>` tag) doesn't span the full physical bounds of the visual card, the default focus ring appears disconnected and ignores the component's border-radius.
 **Action:** Use `:has(:focus-visible)` on the parent card container to apply a matching focus ring (with outline, outline-offset, and border-radius matching the card's shape), and disable the default outline on the inner interactive element.
+
+## 2026-06-28 - [Equitable tactile feedback for Hero buttons]
+**Learning:** Found that primary CTA `.sl-link-button` components on the hero landing page lacked hover and active transitions, failing to provide tactile feedback while surrounding `.sl-link-card` elements did.
+**Action:** Added hover/focus/active transitions with `transform: translateY` and `box-shadow` directly to `.sl-link-button` and its `.minimal` variant. Crucially, updated the `@media (prefers-reduced-motion: reduce)` block to explicitly nullify these transforms and transitions for accessibility compliance.

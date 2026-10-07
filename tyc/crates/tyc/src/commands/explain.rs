@@ -141,6 +141,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "pub_star_outside_init",
         "python_semantic_drift",
         "raise_non_exception",
+        "requires_newer_python",
         "reserved_module_name",
         "resource_not_managed",
         "result_error_mismatch",
@@ -339,6 +340,9 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         }
         "resource_not_managed" => {
             include_str!("../../../../../docs/diagnostics/resource_not_managed.md")
+        }
+        "requires_newer_python" => {
+            include_str!("../../../../../docs/diagnostics/requires_newer_python.md")
         }
         "reserved_module_name" => {
             include_str!("../../../../../docs/diagnostics/reserved_module_name.md")

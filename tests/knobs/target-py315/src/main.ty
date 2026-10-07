@@ -1,0 +1,40 @@
+# `[python] target = "3.15"` unlocks 3.15-only syntax and builtins, which
+# `tyc::requires_newer_python` rejects on older targets: PEP 798 unpacking
+# comprehensions, `frozendict` (PEP 814), `sentinel` (PEP 661) and
+# `lazy from … import …` (PEP 810). The
+# emitted file is 3.15 Python, so meta.conf's `min-python=3.15` keeps it
+# build-only under python3.13; the CI 3.15 leg runs it and compares the VM.
+import sys
+
+lazy from textwrap import shorten
+
+let MISSING = sentinel("MISSING")
+# On a 3.15 target `freeze let` makes a dict a (hashable) `frozendict`.
+freeze let LIMITS: dict[str, list[int]] = {"a": [1, 2]}
+
+
+def lookup(table: frozendict[str, int], key: str, default: int | sentinel = MISSING) -> str:
+    if key in table:
+        return str(table[key])
+    if default is MISSING:
+        return "missing"
+    return f"default {default}"
+
+
+def main() -> None:
+    let rows: list[list[int]] = [[3, 1], [], [2]]
+    let flat: list[int] = [*row for row in rows]
+    let distinct: set[int] = {*row for row in rows}
+    let parts: list[dict[str, int]] = [{"a": 1}, {"b": 2}, {"a": 3}]
+    let merged: dict[str, int] = {**part for part in parts}
+    let table = frozendict(merged)
+    print(flat, sorted(distinct), merged)
+    print(table, table | {"c": 4}, hash(table) == hash(frozendict(b=2, a=3)))
+    print(lookup(table, "a"), lookup(table, "z"), lookup(table, "z", 0), MISSING)
+    print(LIMITS, hash(LIMITS) == hash(frozendict(a=(1, 2))))
+    print(sys.version_info >= (3, 15))
+    print(shorten("lazy from imports load on first use", width=20))
+
+
+if __name__ == "__main__":
+    main()

@@ -557,7 +557,7 @@ freeze let CONFIG = {"port": 8080, "hosts": ["a", "b"]}
 # CONFIG["hosts"].append("c")    # ❌ AttributeError at runtime — tuple, not list
 ```
 
-Module-level only in v1. Lowers to a `__typhon_freeze__(...)` call against `typhon_runtime.freeze.deep_freeze`, which recursively converts `list → tuple`, `dict → MappingProxyType`, `set → frozenset`, descends into nested values, and raises `TypeError` at startup on anything without a clean immutable equivalent (file handles, sockets, generators, non-frozen dataclasses). Frozen dataclasses pass through unchanged.
+Module-level only in v1. Lowers to a `__typhon_freeze__(...)` call against `typhon_runtime.freeze.deep_freeze`, which recursively converts `list → tuple`, `dict → MappingProxyType` (a hashable builtin `frozendict` on a 3.15+ target), `set → frozenset`, descends into nested values, and raises `TypeError` at startup on anything without a clean immutable equivalent (file handles, sockets, generators, non-frozen dataclasses). Frozen dataclasses pass through unchanged.
 
 Stacks with `pub` (v0.6.0): `pub freeze let X = …` parses.
 
@@ -794,7 +794,7 @@ Closes the dunder-dispatch and builtins-coverage gaps that stopped `tyc run` fro
 
 - **Operator overloading on instances** — every numeric / bitwise / matmul dunder plus reflected forms; **rich comparisons** (`__eq__` / `__ne__` / `__lt__` / …); `in` / `list.index` / `.count` / `.remove` use `__eq__`-aware comparison. **`__str__` / `__repr__`** honoured by `print` / `str` / `repr` / f-strings; `__len__` / `__getitem__` / `__contains__` dispatch.
 - **`@property` getters** fire on attribute read; **`@classmethod`** binds `cls`; both inherited (and the descriptor marker is cleared on override).
-- **VM generator support** — `yield` / `yield from` work, materialised **eagerly** (a tree-walk can't suspend a frame; `Rc` values aren't `Send`). `GENERATOR_CAP = 1_000_000` bounds `while True: yield` to a clear `RuntimeError`. Lazy / unbounded generators and `@contextmanager` generators inside `with` still need `tyc build`.
+- **VM generator support** — `yield` / `yield from` work. (Introduced eagerly in v0.10.0; generators now run **lazily**, so `while True: yield` streams, `send` / `throw` / `close` work, and `@contextmanager` bodies run around the `with` body. A `yield` the tree-walk cannot suspend — in a loop test, a `with` item, or two in one expression — still falls back to eager collection capped at `GENERATOR_CAP = 1_000_000`.)
 - **`type(x)` is a real type object** — `type(x).__name__`, `type(x) == int`, `str(type(x))` → `<class 'int'>` all work (previously `type(x)` returned a plain string).
 - **VM pydantic `model_validate` / `model_dump` / `model_dump_json`** make flat `model` classes usable under `tyc run` (nested-model validation still needs `tyc build`).
 - **Keyword args to builtin methods** via a kwargs sentinel — `max()` / `min()` take `key=` / `default=`; `list.sort()` takes `reverse=` / `key=`.
@@ -1249,10 +1249,10 @@ Default off until 3.14 is the default Python.
 
 ```python
 lazy import np = numpy           # ✅ deferred via bespoke `__TyphonLazy_np_` proxy class
-lazy from numpy import array     # ❌ rejected at parse time (PEP 690 reasoning)
+lazy from numpy import array     # ✅ only on a 3.15+ target (PEP 810); tyc::requires_newer_python before
 ```
 
-`lazy from ... import` defeats deferral (it eagerly touches attributes on the source module) and is a hard parse error. Redirect to `lazy import` + dotted access.
+Before PEP 810, `lazy from ... import` would defeat deferral (binding the name loads the module), so on 3.13 / 3.14 targets redirect to `lazy import` + dotted access. On 3.15+ it lowers to the native PEP 810 statement. `lazy from x import *`, `lazy from __future__ …` and non-module-level `lazy from` are `tyc::lazy_usage` on every target.
 
 On a **3.15+ target**, `lazy import ALIAS = MODULE` lowers to the native [PEP 810](https://peps.python.org/pep-0810/) `lazy import MODULE as ALIAS` statement instead of the `__TyphonLazy_*` proxy class — no `typhon_runtime` dependency, and a project whose only runtime-touching feature was `lazy import` ships no generated `typhon_runtime/` package at all on that target. 3.13 / 3.14 output is unchanged.
 
@@ -1674,7 +1674,7 @@ See [PITFALLS.md](PITFALLS.md) for the extended ranked list. The top tier:
 6. **`from typing import TypeVar`.** Use PEP 695: `def f[T](xs: list[T]) -> T?:`.
 7. **`isinstance(x, MyInterface)`.** Rejected — use static narrowing or a sealed union.
 8. **`asyncio.create_task(...)` for fire-and-forget.** Use `go f(x)`; the runtime registry holds a strong ref.
-9. **`lazy from numpy import array`.** Rejected. Use `lazy import np = numpy` + `np.array(...)`.
+9. **`lazy from numpy import array` on a pre-3.15 target.** `tyc::requires_newer_python`. Use `lazy import np = numpy` + `np.array(...)`.
 10. **`comptime let NOW: float = time.time()`.** Sandbox forbids `time.*`. Compute at runtime with `lazy let`.
 11. **`dict.get(k)` typed as `V`.** It's `V?`. Either narrow or use `d[k]`.
 12. **Empty list with no annotation.** `let xs: list = []` is a missing-annotation error. Write `list[int]` or similar.
@@ -1772,7 +1772,7 @@ When you edit `.ty` files in this repo or a downstream project:
 7. **`extend` for cross-module method addition**, `extend BUILTIN:` for static-only built-in extensions.
 8. **`gather:` only for genuinely independent awaits.** If one depends on another's value, leave them sequential.
 9. **`go` for fire-and-forget**, never `asyncio.create_task` directly.
-10. **`lazy import name = module`** for expensive optional deps; never `lazy from ... import ...`.
+10. **`lazy import name = module`** for expensive optional deps; `lazy from ... import ...` only on 3.15+ targets.
 11. **`comptime let` for build-time constants** (especially required env vars). Don't put secrets there — use `os.environ[...]` at runtime.
 12. **`@pure` only when the six conditions hold.** Mark `@memo` separately or use `@pure(memo=True)`. Never silently rely on `auto-memoise` for code others read.
 13. **`unsafe:` is a *lexical* region.** Re-assert types at the boundary, don't smuggle `Unsafe[T]` outward. Always end the block with a re-assertion or an unreachable raise. For a *single* one-off boundary value, prefer **`EXPR as! TYPE`** (v0.14.0) — it's one line, needs no block, and is runtime-checked (so it's sound, unlike a bare re-assertion). Reach for `model X:` when you validate the same shape repeatedly, a `.dty` stub for a long-lived dependency.

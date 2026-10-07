@@ -22,7 +22,10 @@ pub mod mro;
 pub mod preprocess;
 pub mod ruff;
 
-pub use ruff::{parse_expression, parse_module, ParseError, Parsed};
+pub use ruff::{
+    may_hold_newer_syntax, parse_expression, parse_module, unsupported_syntax, ParseError, Parsed,
+    UnsupportedSyntax,
+};
 pub use ruff_python_ast as ast;
 
 /// Names among `pure` / `memo` / `gatherable` that a module *defines or

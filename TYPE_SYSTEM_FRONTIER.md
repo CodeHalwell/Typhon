@@ -102,9 +102,10 @@ These are the items the language reference and skill point here for:
   for `.pyi`-only / C-extension packages (numpy/pandas public API) whose
   signatures venv introspection can't recover. Shares typeshed handling with the
   embedded-`ty` work.
-- **Accumulator-loop parallelisation** — comprehension parallelisation already
-  ships (`auto-parallel`); generalising it to accumulator loops is a non-goal
-  for the alpha.
+- **Accumulator-loop parallelisation beyond integers** — integer accumulator
+  loops ship as the opt-in `[strictness] auto-parallel-reductions`; float
+  accumulators stay sequential, because reordering IEEE-754 addition changes the
+  result.
 - **Function-level HKT params, non-class constructor application, constructor
   composition** — the deferred remainder of the HKT work above.
 ---

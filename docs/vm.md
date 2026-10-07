@@ -70,12 +70,13 @@ tyc run --compile --temp      # legacy with ephemeral build dir
   structurally under `isinstance`.
 - Imports: `import`, `from ... import`, `as` aliasing, dotted module
   access. The full list of modules the VM can resolve natively is below.
-- Comprehensions: list, set, dict, generator (eagerly materialised in v1).
-- Generators: `yield` / `yield from` work under `tyc run` since v0.10.0 via
-  eager materialisation — a yield-bearing function runs to completion with
-  each yielded value buffered, and the call returns an iterator over the
-  collected values (capped at `GENERATOR_CAP = 1_000_000` items). Lazy /
-  unbounded generators (`while True: yield`) still need `tyc build`.
+- Comprehensions: list, set, dict and generator expressions (a generator
+  expression is lazy).
+- Generators: `yield` / `yield from` run lazily, so an unbounded
+  `while True: yield` streams, and `send()` / `throw()` / `close()` and a
+  generator's `return` value (`StopIteration.value`) behave as in CPython.
+  A `yield` in a position the tree-walk cannot suspend falls back to eager
+  collection (see "What the VM does not support yet").
 
 ### Built-in functions
 
@@ -130,7 +131,7 @@ since v1.0.0-beta.1 — before that each built an opaque instance, so
 |---|---|
 | `math` | `pi`, `e`, `inf`, `nan`, `sqrt`, `floor`, `ceil`, `log` (with base), `log2`, `log10`, `exp`, `sin`, `cos`, `tan`, `pow`, `fabs`. v0.10.0: `gcd`, `lcm`, `factorial`, `isqrt`, `comb`, `perm` (all reject non-integer args). 2026-09-30 review: the module is now complete against CPython 3.13 — `isclose` (`rel_tol` / `abs_tol`), `gamma` / `lgamma` (a port of CPython's own Lanczos code), `erf`, `erfc`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `cbrt`, `exp2`, `fma`, `frexp`, `ldexp`, `modf`, `nextafter` (with `steps=`), `ulp`, `sumprod` (CPython's extended-precision accumulator); the libm-backed names call the host C library, so they agree bit for bit with the host CPython |
 | `os` / `os.path` (rebuilt v1.0.0-beta.1) | The process and filesystem surface: `getenv`, `environ`, `getcwd`, `chdir`, `listdir`, `scandir`, `walk`, `mkdir`, `makedirs`, `remove`, `rmdir`, `rename`, `replace`, `stat`, `access`, `getpid`, `cpu_count`, `system`, `strerror`, `urandom`, the `O_*` / `*_OK` / `SEEK_*` constants, `PathLike` / `fspath`, and a full `posixpath` (`join`, `split`, `splitext`, `basename`, `dirname`, `normpath`, `abspath`, `realpath`, `relpath`, `commonpath`, `commonprefix`, `expanduser`, `expandvars`, `isabs`, `exists`, `isfile`, `isdir`, `islink`, `getsize`, `getmtime`, `samefile`), which keeps a `bytes` path in bytes. Errors carry CPython's `errno` / `strerror` / `filename`. `import os.path` and `import posixpath` resolve to the same shim |
-| `sys` | `argv`, `platform`, `version`, `version_info`, `byteorder`, `maxsize`, `exit(code)`, `stdout`, `stderr`, `stdin`, `getrecursionlimit` / `setrecursionlimit`. v1.0.0-beta.1: `modules` (a live view of the import cache, always carrying `__main__`) and `exc_info()` (the exception being handled, with `None` for the traceback slot — the VM has no traceback object). Assigning `sys.stdout` redirects `print`, so `contextlib.redirect_stdout` works |
+| `sys` | `argv`, `platform`, `version`, `version_info` (the project's `[python] target`, e.g. `(3, 15, 0, 'final', 0)` on a 3.15 target), `byteorder`, `maxsize`, `exit(code)`, `stdout`, `stderr`, `stdin`, `getrecursionlimit` / `setrecursionlimit`. v1.0.0-beta.1: `modules` (a live view of the import cache, always carrying `__main__`) and `exc_info()` (the exception being handled, with `None` for the traceback slot — the VM has no traceback object). Assigning `sys.stdout` redirects `print`, so `contextlib.redirect_stdout` works |
 | `json` | `dumps`, `loads` (full JSON 7159 surface). v0.10.0: `dumps(indent=…)` pretty-prints |
 | `time` | `time()`, `sleep()`, `monotonic()`. v0.10.0: `perf_counter()`, `process_time()` |
 | `random` | `random()`, `seed(n)`, `getrandbits`, `randint`, `randrange`, `uniform`, `gauss`, `choice`, `shuffle`, `sample` — a **CPython-compatible MT19937**, following `random.py` / `_randommodule.c`, so `random.seed(n)` produces a **byte-identical sequence** under `tyc run` and under `tyc build` + CPython. An *unseeded* program seeds from OS-derived entropy, as CPython does at import, so it draws a different sequence on every run (v1.0.0-alpha.8 — before that the default was a fixed constant, making `tyc run` repeatable where CPython is not). `seed()` / `seed(None)` reseeds from entropy; string / bytes / float seeds are rejected (CPython hashes them through SHA-512) — use `tyc run --compile` for those. NOT cryptographic on either surface: use `secrets` |
@@ -150,7 +151,7 @@ since v1.0.0-beta.1 — before that each built an opaque instance, so
 | `heapq` (v0.9.0) | `heappush`, `heappop`, `heapify`, `heappushpop`, `heapreplace`, `nsmallest`, `nlargest` — plus, since the 2026-09-30 review, `merge(*iterables, key=, reverse=)` with CPython's tie order |
 | `contextlib` (v0.9.0) | `@contextmanager` identity decorator and `contextmanager`-decorated factories. `with` block honours the wrapped `__enter__` / `__exit__` shape. v1.0.0-beta.1: `@asynccontextmanager` really drives its generator (it was an identity decorator, so `async with` raised), plus `suppress`, `nullcontext`, `closing`, `redirect_stdout`, `redirect_stderr`, `ExitStack`. 2026-09-30 review: `AbstractContextManager`, `AbstractAsyncContextManager`, `ContextDecorator`, `AsyncContextDecorator`, `chdir`, `aclosing`, `AsyncExitStack` |
 | `pydantic` (v0.9.0, expanded v0.10.0 and v1.0.0-beta.1) | `BaseModel` is a placeholder so declaring a `model` doesn't `ImportError`. `Model.model_validate(mapping)` constructs an instance from a dict — annotated sub-models included, recursively, since v1.0.0-beta.1, alongside `model_validate_json` — `inst.model_dump()` returns a dict of the fields in declaration order (unwrapping nested models back to dicts, as pydantic's does), and `model_dump_json()` the JSON form. It does not *validate*: a field of the wrong type is stored as given rather than raising `ValidationError` |
-| `io` (v1.0.0-beta.1) | `open` and the file objects behind it (`TextIOWrapper`, `BufferedReader` / `BufferedWriter`, `FileIO`), `StringIO`, `BytesIO`, `SEEK_*`, `UnsupportedOperation`. Modes, encodings, newline translation, `seek` / `tell` / `truncate` / `flush`, iteration by line, and the CPython error messages for a closed or wrong-mode file. Residual: the default text encoding is reported as `utf-8`, where CPython spells the host locale encoding (`UTF-8` on macOS, `utf-8` under glibc) |
+| `io` (v1.0.0-beta.1) | `open` and the file objects behind it (`TextIOWrapper`, `BufferedReader` / `BufferedWriter`, `FileIO`), `StringIO`, `BytesIO`, `SEEK_*`, `UnsupportedOperation`. Modes, encodings, newline translation, `seek` / `tell` / `truncate` / `flush`, iteration by line, and the CPython error messages for a closed or wrong-mode file. Residual: `open()` without `encoding=` always uses UTF-8 and reports it as `utf-8`. That is CPython 3.15's default on every platform (PEP 686); CPython 3.13 and 3.14 use the host locale encoding instead, so on a non-UTF-8 locale (Windows' `cp1252`, for example) a 3.13-target program that omits `encoding=` reads and writes differently under `tyc run` |
 | `shutil` (v1.0.0-beta.1) | `copy`, `copy2`, `copyfile`, `copytree`, `move`, `rmtree`, `which`, `disk_usage`, `SameFileError` |
 | `tempfile` (v1.0.0-beta.1) | `mkdtemp`, `mkstemp`, `gettempdir`, `NamedTemporaryFile`, `TemporaryDirectory`, `TemporaryFile` |
 | `glob` (v1.0.0-beta.1) | `glob`, `iglob`, `escape`, `has_magic` — the same matcher `pathlib.Path.glob` uses, including `**` |
@@ -333,6 +334,12 @@ encodes in `json` as its value, and it keeps its identity as a dict key.
 `StrEnum`'s `auto()` is the lower-cased member name, and a second name
 bound to an existing value is an alias of that member.
 
+`Flag` and `IntFlag` values follow CPython 3.13: `|`, `&`, `^` and `~`
+give a member of the flag class (an `IntFlag` also keeps its type with a
+plain int operand), `Perm(6)` returns the matching composite, and
+iteration, `len()` and `in` work on the single-bit members a value
+contains. A `Flag` rejects undeclared bits; an `IntFlag` keeps them.
+
 ### Checked casts (`as!`) follow the target table (beta)
 
 `EXPR as! TYPE` applies the table in `docs/language.md` ("Checked boundary
@@ -454,6 +461,9 @@ consulted; `Named.__mro__` omits `typing.Generic`; a lone surrogate
 (`"\ud800"`) cannot be represented in a Rust `String` (`'%c' % 0xD800`
 yields U+FFFD); and a generator that falls back to eager collection (see
 "What the VM does not support yet") runs its side effects at call time.
+A plain `tyc run` sends a program with a `__del__`, a custom metaclass or
+an eagerly-collected generator to CPython, so these gaps show only under
+`--no-fallback`.
 
 ### Keyword arguments and the pre-run scan (beta)
 
@@ -599,24 +609,17 @@ message:
   CPython would — and the body of a `TaskGroup` sees a failed task's
   exception at the `await` rather than the `CancelledError` a real
   cancellation would deliver.
-- **Lazy / unbounded generators.** Finite `yield` / `yield from` work
-  since v0.10.0 via eager materialisation, but the worst case
-  (`while True: yield`) hits the `GENERATOR_CAP = 1_000_000` ceiling and
-  raises a clear `RuntimeError` instead of streaming. Truly lazy /
-  unbounded generators still need `tyc build`.
-- **`generator.send()` / coroutine-style generators.** Because generators
-  are materialised eagerly (above), the VM has no live frame to resume, so
-  `gen.send(value)`, `gen.throw(...)`, and the `value = yield x` two-way
-  protocol are unsupported — the generator runs to its cap before the
-  first `send` could ever reach it. Bidirectional generators need
-  `tyc build`. (Plain forward iteration is unaffected.)
 - **A generator whose `yield` sits where the tree-walk cannot suspend.**
-  Most generator bodies run lazily (`@contextmanager` and
+  Generator bodies run lazily (`@contextmanager` and
   `@asynccontextmanager` factories included, since v1.0.0-beta.1, so the
   `with` body runs between setup and teardown). A `yield` in a loop test,
   a `with` item, a call argument after another call, or two yields in one
-  expression falls back to eager collection, where setup and teardown both
-  run at call time.
+  expression falls back to eager collection: the body runs to completion
+  at call time (capped at `GENERATOR_CAP = 1_000_000` items), so its side
+  effects happen early, an unbounded one hits the cap, and `send()` /
+  `throw()` cannot reach it. A plain `tyc run` therefore sends a program
+  with such a generator to CPython with a `note:`; only `--no-fallback`
+  keeps it on the VM.
 - Template strings (`t"…"`).
 - IPython escape commands.
 - A `with` / `async with` over anything that is neither `open()`, a
@@ -695,8 +698,7 @@ on the old behaviour will see different — correct — results):
   forms, rich comparisons, `__str__` / `__repr__` / `__len__` /
   `__getitem__` / `__contains__`, `@property` / `@classmethod`
   (inherited through bases).
-- Finite generators (`yield` / `yield from`) via eager materialisation,
-  capped at 1M items.
+- Lazy generators (`yield` / `yield from`, `send` / `throw` / `close`).
 - `type(x)` returns a real type object (`type(x).__name__`,
   `type(x) == int`, `str(type(x))` → `<class 'int'>`).
 - Pydantic `model_validate` / `model_dump` / `model_dump_json` for flat
@@ -742,7 +744,8 @@ on the old behaviour will see different — correct — results):
   CPython. Since beta a frozen dict also *is* a `mappingproxy`:
   `type(D).__name__` names it and `isinstance(D, dict)` is `False`, and a
   frozen dataclass instance passes through unchanged (same object, fields
-  not rebuilt), as the generated runtime does.
+  not rebuilt), as the generated runtime does. On a 3.15+ `[python] target`
+  a frozen dict is a `frozendict` instead, as it is in the compiled output.
 - `comptime let X = ...` inlines via the substitution pass shared
   with `tyc build`.
 - `lazy import M = N` uses the simpler `import M as N` rewrite.
