@@ -3921,7 +3921,7 @@ struct ModuleScope {
 }
 
 impl ModuleScope {
-    fn collect(body: &[Stmt], frozen_classes: &HashSet<String>) -> Self {
+    fn collect<'a>(body: &'a [Stmt], frozen_classes: &HashSet<String>) -> Self {
         let mut s = Self::default();
         let shadowed_markers = user_bound_marker_names(body);
         // Imports and top-level names first: resolving a type name in an
@@ -3936,11 +3936,11 @@ impl ModuleScope {
         s.classify_classes(body, frozen_classes);
         // Rebinding evidence anywhere in the module: `global NAME` inside a
         // function, a module-level `+=`, a second assignment, a loop target.
-        let mut rebound: HashSet<String> = HashSet::new();
-        let mut assigned_once: HashSet<String> = HashSet::new();
-        let mut note_binding = |name: &str, rebound: &mut HashSet<String>| {
-            if !assigned_once.insert(name.to_owned()) {
-                rebound.insert(name.to_owned());
+        let mut rebound: HashSet<&'a str> = HashSet::new();
+        let mut assigned_once: HashSet<&'a str> = HashSet::new();
+        let mut note_binding = |name: &'a str, rebound: &mut HashSet<&'a str>| {
+            if !assigned_once.insert(name) {
+                rebound.insert(name);
             }
         };
         collect_global_declarations(body, &mut rebound);
@@ -3949,7 +3949,7 @@ impl ModuleScope {
                 Stmt::Assign(a) => {
                     for t in &a.targets {
                         for name in bound_names_in_target(t) {
-                            note_binding(&name, &mut rebound);
+                            note_binding(name, &mut rebound);
                             if a.mutability == Some(ruff_python_ast::Mutability::Mut) {
                                 rebound.insert(name);
                             }
@@ -3960,13 +3960,13 @@ impl ModuleScope {
                     if let Expr::Name(n) = a.target.as_ref() {
                         note_binding(n.id.as_str(), &mut rebound);
                         if a.mutability == Some(ruff_python_ast::Mutability::Mut) {
-                            rebound.insert(n.id.as_str().to_owned());
+                            rebound.insert(n.id.as_str());
                         }
                     }
                 }
                 Stmt::AugAssign(a) => {
                     if let Expr::Name(n) = a.target.as_ref() {
-                        rebound.insert(n.id.as_str().to_owned());
+                        rebound.insert(n.id.as_str());
                     }
                 }
                 Stmt::For(f) => {
@@ -4085,12 +4085,12 @@ impl ModuleScope {
                 }
                 Stmt::Assign(a) => {
                     for t in &a.targets {
-                        self.top_level_bound.extend(bound_names_in_target(t));
+                        self.top_level_bound.extend(bound_names_in_target(t).into_iter().map(|s| s.to_owned()));
                     }
                 }
                 Stmt::AnnAssign(a) => {
                     self.top_level_bound
-                        .extend(bound_names_in_target(&a.target));
+                        .extend(bound_names_in_target(&a.target).into_iter().map(|s| s.to_owned()));
                 }
                 _ => {}
             }
@@ -4589,15 +4589,15 @@ impl ModuleScope {
 }
 
 /// Every `global NAME` declaration anywhere in `body` (at any nesting depth).
-pub(crate) fn collect_global_declarations(body: &[Stmt], into: &mut HashSet<String>) {
-    struct V<'a> {
-        into: &'a mut HashSet<String>,
+pub(crate) fn collect_global_declarations<'a>(body: &'a [Stmt], into: &mut HashSet<&'a str>) {
+    struct V<'a, 'b> {
+        into: &'b mut HashSet<&'a str>,
     }
-    impl ruff_python_ast::visitor::Visitor<'_> for V<'_> {
-        fn visit_stmt(&mut self, s: &Stmt) {
+    impl<'a> ruff_python_ast::visitor::Visitor<'a> for V<'a, '_> {
+        fn visit_stmt(&mut self, s: &'a Stmt) {
             if let Stmt::Global(g) = s {
                 for n in &g.names {
-                    self.into.insert(n.as_str().to_owned());
+                    self.into.insert(n.as_str());
                 }
             }
             ruff_python_ast::visitor::walk_stmt(self, s);
@@ -4623,11 +4623,11 @@ fn bound_names_only(target: &Expr) -> bool {
 
 /// Bare names bound by an assignment / loop / `with` target, including
 /// tuple and list unpacking and starred elements.
-fn bound_names_in_target(target: &Expr) -> Vec<String> {
+fn bound_names_in_target(target: &Expr) -> Vec<&str> {
     let mut out = Vec::new();
-    fn go(e: &Expr, out: &mut Vec<String>) {
+    fn go<'a>(e: &'a Expr, out: &mut Vec<&'a str>) {
         match e {
-            Expr::Name(n) => out.push(n.id.as_str().to_owned()),
+            Expr::Name(n) => out.push(n.id.as_str()),
             Expr::Tuple(t) => t.elts.iter().for_each(|e| go(e, out)),
             Expr::List(l) => l.elts.iter().for_each(|e| go(e, out)),
             Expr::Starred(s) => go(&s.value, out),
@@ -5758,7 +5758,7 @@ fn walk_expr_purity(expr: &Expr, ctx: &mut PurityCtx) {
 fn bind_comprehension_targets(generators: &[ruff_python_ast::Comprehension], ctx: &mut PurityCtx) {
     for g in generators {
         for name in bound_names_in_target(&g.target) {
-            ctx.locals.insert(name);
+            ctx.locals.insert(name.to_owned());
         }
     }
 }

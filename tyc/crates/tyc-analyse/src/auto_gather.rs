@@ -881,7 +881,7 @@ pub fn collect_gatherable_async_fn_names(module: &ModModule) -> HashSet<String> 
     // (possibly not even a coroutine function). Drop such names.
     let mut globals = HashSet::new();
     crate::collect_global_declarations(&module.body, &mut globals);
-    out.retain(|name| !globals.contains(name) && !module_rebinds(&module.body, name));
+    out.retain(|name| !globals.contains(name.as_str()) && !module_rebinds(&module.body, name));
     out
 }
 
