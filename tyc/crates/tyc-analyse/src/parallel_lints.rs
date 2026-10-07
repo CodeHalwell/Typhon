@@ -269,21 +269,49 @@ struct GoSpawn<'a> {
 
 /// Find every `typhon_runtime.tasks.spawn(CALLEE(...))` in the module (the
 /// lowered form of `go CALLEE(...)`), returning the bare-name callee and the
-/// spawn call's range. Non-bare-name callees (`go obj.method()`) are skipped.
+/// spawn call's range. Non-bare-name callees (`go obj.method()`) are skipped,
+/// and so is a callee an enclosing function binds (`async def
+/// launch(worker): go worker()` spawns the argument, not the module-level
+/// `worker`) — the per-scope shadow rule auto-gather uses.
 fn collect_go_spawns<'a>(module: &'a ModModule) -> Vec<GoSpawn<'a>> {
+    use ruff_python_ast::visitor::source_order::walk_stmt;
+
     struct V<'a> {
         out: Vec<GoSpawn<'a>>,
+        /// Enclosing functions, innermost last. Class bodies are left out:
+        /// their bindings are not visible from the methods inside them.
+        scopes: Vec<&'a ruff_python_ast::StmtFunctionDef>,
+    }
+    impl V<'_> {
+        fn shadowed(&self, name: &str) -> bool {
+            self.scopes.iter().any(|f| {
+                crate::reductions::params_bind_name(&f.parameters, name)
+                    || crate::reductions::scope_binds_name(&f.body, name)
+            })
+        }
     }
     impl<'ast> SourceOrderVisitor<'ast> for V<'ast> {
+        fn visit_stmt(&mut self, s: &'ast Stmt) {
+            if let Stmt::FunctionDef(f) = s {
+                self.scopes.push(f);
+                walk_stmt(self, s);
+                self.scopes.pop();
+            } else {
+                walk_stmt(self, s);
+            }
+        }
+
         fn visit_expr(&mut self, e: &'ast Expr) {
             if let Expr::Call(call) = e {
                 if is_spawn_call(call) {
                     if let Some(Expr::Call(inner)) = call.arguments.args.first() {
                         if let Expr::Name(callee) = inner.func.as_ref() {
-                            self.out.push(GoSpawn {
-                                callee: callee.id.as_str(),
-                                range: call.range(),
-                            });
+                            if !self.shadowed(callee.id.as_str()) {
+                                self.out.push(GoSpawn {
+                                    callee: callee.id.as_str(),
+                                    range: call.range(),
+                                });
+                            }
                         }
                     }
                 }
@@ -291,7 +319,10 @@ fn collect_go_spawns<'a>(module: &'a ModModule) -> Vec<GoSpawn<'a>> {
             walk_expr(self, e);
         }
     }
-    let mut v = V { out: Vec::new() };
+    let mut v = V {
+        out: Vec::new(),
+        scopes: Vec::new(),
+    };
     for stmt in &module.body {
         v.visit_stmt(stmt);
     }
@@ -962,5 +993,66 @@ async def main() -> None:
             0,
             "a function-local `mut` is not module state"
         );
+    }
+
+    #[test]
+    fn shared_mut_silent_when_go_callee_is_a_parameter_or_local() {
+        // The spawned callable is whatever the enclosing scope bound to the
+        // name — here the argument (`quiet` at runtime), not the module-level
+        // writer of the same name.
+        let header = "\
+import asyncio
+
+mut HITS: int = 0
+
+async def worker() -> None:
+    global HITS
+    HITS = HITS + 1
+
+async def quiet() -> None:
+    await asyncio.sleep(0)
+";
+        for body in [
+            // parameter
+            "async def launch(worker: Callable[[], Awaitable[None]]) -> None:\n    go worker()\n",
+            // local assignment
+            "async def launch() -> None:\n    worker = quiet\n    go worker()\n",
+            // loop target
+            "async def launch(ws: list[Callable[[], Awaitable[None]]]) -> None:\n    for worker in ws:\n        go worker()\n",
+            // closure over an enclosing function's parameter
+            "def outer(worker: Callable[[], Awaitable[None]]) -> None:\n    async def inner() -> None:\n        go worker()\n",
+            // `with` target
+            "async def launch(cm: Any) -> None:\n    with cm as worker:\n        go worker()\n",
+        ] {
+            let src = format!("{header}\n{body}");
+            let m = parse(&src);
+            assert_eq!(
+                codes(&shared_mut_across_tasks_diagnostics(&m, "x.ty", &src)).len(),
+                0,
+                "a shadowed callee is not the module-level writer:\n{src}"
+            );
+        }
+        // The review repro verbatim.
+        let repro = "import asyncio\n\nmut HITS: int = 0\n\nasync def worker() -> None:\n    global HITS\n    HITS = HITS + 1\n\nasync def quiet() -> None:\n    await asyncio.sleep(0)\n\nasync def launch(worker: Callable[[], Awaitable[None]]) -> None:\n    go worker()\n    await asyncio.sleep(0.01)\n\nasync def main_async() -> None:\n    await launch(quiet)\n    await worker()\n\ndef main() -> None:\n    asyncio.run(main_async())\n    print(HITS)\n\nif __name__ == \"__main__\":\n    main()\n";
+        let m = parse(repro);
+        assert_eq!(
+            codes(&shared_mut_across_tasks_diagnostics(&m, "x.ty", repro)).len(),
+            0
+        );
+        // Controls: the unshadowed spawn still fires, also next to a
+        // same-named binding in another function or a class body.
+        for body in [
+            "async def launch(fn: Callable[[], Awaitable[None]]) -> None:\n    go worker()\n",
+            "async def other(worker: int) -> None:\n    pass\n\nasync def launch() -> None:\n    go worker()\n",
+            "class Pool:\n    worker = 1\n\n    async def launch(self) -> None:\n        go worker()\n",
+        ] {
+            let src = format!("{header}\n{body}");
+            let m = parse(&src);
+            assert_eq!(
+                codes(&shared_mut_across_tasks_diagnostics(&m, "x.ty", &src)).len(),
+                1,
+                "the module-level writer is spawned:\n{src}"
+            );
+        }
     }
 }

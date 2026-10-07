@@ -5013,6 +5013,7 @@ fn check_purity(f: &ruff_python_ast::StmtFunctionDef, module: &ModuleScope) -> P
         module,
         params: parameter_names(parameters),
         locals: bindings.names,
+        local_imports: bindings.imports,
         builtin_typed: bindings.types,
         fresh: bindings.fresh,
         callees: HashSet::new(),
@@ -5175,6 +5176,9 @@ fn annotation_unhashable_name(ann: &Expr) -> Option<String> {
 struct LocalBindings {
     /// Every name bound in this scope.
     names: HashSet<String>,
+    /// The subset bound by a function-local `import`: those still name a
+    /// module, so the stdlib call tables apply to them.
+    imports: HashSet<String>,
     /// Locals whose annotation or initialiser fixes a builtin type head.
     types: HashMap<String, String>,
     /// Locals whose every initialiser creates a fresh object.
@@ -5195,6 +5199,7 @@ fn collect_local_bindings(body: &[Stmt], module: &ModuleScope) -> LocalBindings 
     #[derive(Default)]
     struct V<'m> {
         names: HashSet<String>,
+        imports: HashSet<String>,
         types: HashMap<String, String>,
         fresh_candidates: HashSet<String>,
         not_fresh: HashSet<String>,
@@ -5216,6 +5221,7 @@ fn collect_local_bindings(body: &[Stmt], module: &ModuleScope) -> LocalBindings 
                             None => alias.name.as_str().split('.').next().unwrap_or(""),
                         };
                         self.names.insert(bound.to_owned());
+                        self.imports.insert(bound.to_owned());
                     }
                 }
                 Stmt::ImportFrom(i) => {
@@ -5225,6 +5231,7 @@ fn collect_local_bindings(body: &[Stmt], module: &ModuleScope) -> LocalBindings 
                             None => alias.name.as_str(),
                         };
                         self.names.insert(bound.to_owned());
+                        self.imports.insert(bound.to_owned());
                     }
                 }
                 Stmt::Assign(a) => {
@@ -5318,6 +5325,7 @@ fn collect_local_bindings(body: &[Stmt], module: &ModuleScope) -> LocalBindings 
         .collect();
     LocalBindings {
         names: v.names,
+        imports: v.imports,
         types: v.types,
         fresh,
     }
@@ -5356,6 +5364,8 @@ struct PurityCtx<'a> {
     /// Names bound in the function body (plus comprehension / lambda
     /// variables as the walk enters them).
     locals: HashSet<String>,
+    /// Locals bound by a function-local `import`.
+    local_imports: HashSet<String>,
     /// Parameters and locals provably of a builtin type: name → type head.
     builtin_typed: HashMap<String, String>,
     /// Locals whose every initialiser creates a fresh object (a display,
@@ -5399,6 +5409,22 @@ impl PurityCtx<'_> {
 
     fn is_local(&self, name: &str) -> bool {
         self.locals.contains(name)
+    }
+
+    /// Whether `name`, as the head of a call path, names a builtin or an
+    /// imported module rather than a value this program bound itself. A
+    /// parameter or local shadows the builtin / module for the whole body
+    /// (a function-local `import` still names a module), and so does a
+    /// module-level `def`, `class` or assignment; an unbound head can only
+    /// be the builtin.
+    fn names_builtin_or_import(&self, name: &str) -> bool {
+        if self.local_imports.contains(name) {
+            return true;
+        }
+        if self.is_param(name) || self.is_local(name) {
+            return false;
+        }
+        self.module.imports.contains_key(name) || !self.module.top_level_bound.contains(name)
     }
 
     /// The builtin type head of a parameter, local or module binding, when
@@ -5910,7 +5936,7 @@ enum CallVerdict {
 /// non-mutating methods, a module path is checked against the allow-list,
 /// and everything else is at best unproven.
 fn classify_call(c: &ExprCall, ctx: &PurityCtx) -> CallVerdict {
-    if let Some(reason) = forbidden_callee(&c.func, &c.arguments, ctx.module) {
+    if let Some(reason) = forbidden_callee(&c.func, &c.arguments, ctx) {
         return CallVerdict::Impure(reason);
     }
     match c.func.as_ref() {
@@ -6551,13 +6577,26 @@ fn is_pure_builtin(name: &str) -> bool {
 fn forbidden_callee(
     func: &Expr,
     args: &ruff_python_ast::Arguments,
-    module: &ModuleScope,
+    ctx: &PurityCtx,
 ) -> Option<String> {
     let raw = dotted_path(func)?;
-    let path = module.resolve_path(&raw);
+    let reason = forbidden_path(&ctx.module.resolve_path(&raw), args)?;
+    // The tables are keyed on builtin and stdlib names, so they only apply
+    // when the head of the path is one: `def f(time: str)` makes
+    // `time.strip()` a `str` method and a module-level `def eval` makes
+    // `eval(e)` a user call — `classify_call` decides those by what the
+    // head is bound to. A `random` attribute past the head
+    // (`self.random.expovariate()`) is evidence whatever the head is.
+    let head = raw.split('.').next().unwrap_or(&raw);
+    (ctx.names_builtin_or_import(head) || raw.split('.').skip(1).any(|seg| seg == "random"))
+        .then_some(reason)
+}
+
+/// [`forbidden_callee`] for a resolved dotted path.
+fn forbidden_path(path: &str, args: &ruff_python_ast::Arguments) -> Option<String> {
     // Bare-name builtins.
     if !path.contains('.') {
-        match path.as_str() {
+        match path {
             "print" | "open" | "input" | "exec" | "eval" | "compile" | "breakpoint" | "exit"
             | "quit" | "setattr" | "delattr" | "globals" | "locals" | "__import__" => {
                 return Some(format!(
@@ -6568,7 +6607,7 @@ fn forbidden_callee(
         }
     }
     // Pure carve-outs under otherwise impure prefixes.
-    if path_is_in_pure_module(&path) && !path.starts_with("datetime.") {
+    if path_is_in_pure_module(path) && !path.starts_with("datetime.") {
         return None;
     }
     let last = path.rsplit('.').next().unwrap_or("");
@@ -8923,6 +8962,132 @@ def f(xs: tuple[int, ...], s: str) -> str:
         // A fresh local heap is fine.
         let fresh = "import heapq\ndef f(x: int) -> int:\n    h: list[int] = []\n    heapq.heappush(h, x)\n    return h[0]\n";
         assert_eq!(auto_decision(fresh, "f", &[]), Some(CacheKind::Auto));
+    }
+
+    fn violation_of(src: &str, name: &str) -> Option<String> {
+        explicit_findings(src)
+            .into_iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("no finding for {name}"))
+            .violation
+    }
+
+    #[test]
+    fn stdlib_named_parameters_and_locals_are_not_the_stdlib_module() {
+        // A parameter or local named after `time` / `random` / `os` shadows
+        // the module for the whole body: `time.strip()` is a `str` method.
+        for (src, name) in [
+            (
+                "@pure\ndef hour_of(time: str) -> int:\n    return len(time.strip()) + time.count(\":\")\n",
+                "hour_of",
+            ),
+            (
+                "@pure\ndef norm(random: str) -> str:\n    return random.upper()\n",
+                "norm",
+            ),
+            (
+                "import os\n\n@pure\ndef low(os: str) -> str:\n    return os.lower()\n",
+                "low",
+            ),
+            (
+                "import time\n\n@pure\ndef f(x: int) -> int:\n    time = str(x)\n    return len(time.strip())\n",
+                "f",
+            ),
+            (
+                "@pure\ndef f(xs: tuple[str, ...]) -> list[str]:\n    return [random.upper() for random in xs]\n",
+                "f",
+            ),
+            (
+                // A module-level `str` named `time` is not the module either.
+                "time: str = \"12:30\"\n\n@pure\ndef f() -> int:\n    return time.count(\":\")\n",
+                "f",
+            ),
+        ] {
+            assert_eq!(violation_of(src, name), None, "{src}");
+        }
+    }
+
+    #[test]
+    fn stdlib_named_bindings_through_the_preprocessor() {
+        // The review repros verbatim, through the real preprocessor.
+        let t06 = "@pure\ndef hour_of(time: str) -> int:\n    return len(time.strip()) + time.count(\":\")\n\n@pure\ndef norm(random: str) -> str:\n    return random.upper()\n\ndef main() -> None:\n    print(hour_of(\" 12:30 \"), norm(\"ab\"))\n\nif __name__ == \"__main__\":\n    main()\n";
+        let t05 = "from dataclasses import dataclass\n\n@dataclass(frozen=True)\nclass Num:\n    v: int\n\n@dataclass(frozen=True)\nclass Add:\n    l: int\n    r: int\n\ntype Expr = Num | Add\n\n@pure\ndef eval(e: Expr) -> int:\n    match e:\n        case Num(v=v):\n            return v\n        case Add(l=l, r=r):\n            return l + r\n\n@pure\ndef total(a: Expr, b: Expr) -> int:\n    return eval(a) + eval(b)\n\ndef main() -> None:\n    print(total(Num(1), Add(2, 3)))\n\nif __name__ == \"__main__\":\n    main()\n";
+        for src in [t06, t05] {
+            let prep = tyc_syntax::preprocess::preprocess(src);
+            let module = tyc_syntax::parse_module(&prep.python_source)
+                .expect("parse failed")
+                .into_syntax();
+            let findings = analyse_purity(&module, false);
+            let diags = purity_diagnostics(&findings, "<test>", &prep.python_source);
+            assert!(!diags.has_errors(), "{src}\n{:?}", diags.errors());
+        }
+    }
+
+    #[test]
+    fn user_functions_named_like_forbidden_builtins_are_user_calls() {
+        let src = "class Num:\n    v: int\n\n@pure\ndef eval(e: Num) -> int:\n    return e.v\n\n@pure\ndef total(a: Num, b: Num) -> int:\n    return eval(a) + eval(b)\n";
+        assert_eq!(violation_of(src, "eval"), None);
+        assert_eq!(violation_of(src, "total"), None);
+        let print = "@pure\ndef print(x: int) -> int:\n    return x + 1\n\n@pure\ndef f(x: int) -> int:\n    return print(x)\n";
+        assert_eq!(violation_of(print, "f"), None);
+        // The user function is judged as a user function: an impure one is
+        // still rejected, as an impure helper rather than as builtin I/O.
+        let impure = "def open(name: str) -> str:\n    return name\n\n@pure\ndef f(x: str) -> str:\n    return open(x)\n";
+        let reason = violation_of(impure, "f").expect("impure helper is a violation");
+        assert!(reason.contains("impure helper `open`"), "{reason}");
+    }
+
+    #[test]
+    fn stdlib_and_builtin_callees_are_still_forbidden() {
+        for (src, needle) in [
+            (
+                "import time\n\n@pure\ndef f() -> float:\n    return time.time()\n",
+                "clock",
+            ),
+            (
+                "import time as t\n\n@pure\ndef f() -> float:\n    return t.monotonic()\n",
+                "clock",
+            ),
+            (
+                "import random as r\n\n@pure\ndef f() -> float:\n    return r.random()\n",
+                "entropy",
+            ),
+            (
+                "@pure\ndef f(x: int) -> int:\n    print(x)\n    return x\n",
+                "print",
+            ),
+            ("@pure\ndef f(x: str) -> int:\n    return eval(x)\n", "eval"),
+            (
+                "import os\n\n@pure\ndef f(p: str) -> bool:\n    return os.path.exists(p)\n",
+                "I/O",
+            ),
+            // A function-local import still names the module.
+            (
+                "@pure\ndef f() -> float:\n    import time\n    return time.time()\n",
+                "clock",
+            ),
+            // A `random` attribute past the head still reads entropy.
+            (
+                "@pure\ndef f(self: object) -> float:\n    return self.random.expovariate(1.0)\n",
+                "entropy",
+            ),
+            // An entropy method on a parameter named `random` is still I/O.
+            (
+                "@pure\ndef f(random: object) -> float:\n    return random.random()\n",
+                "random",
+            ),
+        ] {
+            let reason =
+                violation_of(src, "f").unwrap_or_else(|| panic!("expected violation: {src}"));
+            assert!(reason.contains(needle), "{src}: {reason}");
+        }
+        // A callable parameter named `print` is a callback of unknown purity.
+        let reason = violation_of(
+            "@pure\ndef f(print: int) -> int:\n    return print(1)\n",
+            "f",
+        )
+        .expect("callable parameter is a violation");
+        assert!(reason.contains("local callable"), "{reason}");
     }
 
     #[test]
