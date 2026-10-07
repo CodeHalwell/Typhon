@@ -609,6 +609,10 @@ show(list(N.A), list(N(7)), list(N), len(N.A), repr(Other.Y & Q.A), type(Q.A | O
 trap("foreign in", lambda: Q.A in Other.Y)
 trap("int in", lambda: 1 in Other.Y)
 trap("strict", lambda: C(8))
+class Neg(Flag):
+    A = 1
+    B = -3
+show(len(Neg.B), Neg.B.value)
 "#,
     );
 }
@@ -768,6 +772,20 @@ async def over(it: object) -> None:
         show(x)
 for it in ([1], (1,), "a", b"a", {1: 2}, {1}, range(1), frozenset({1})):
     trap("sync iterable", lambda: asyncio.run(over(it)))
+plain class SyncOnly:
+    def __iter__(self) -> object:
+        return iter([1])
+trap("sync instance", lambda: asyncio.run(over(SyncOnly())))
+plain class CoroAiter:
+    async def __aiter__(self) -> "CoroAiter":
+        return self
+    async def __anext__(self) -> int:
+        raise StopAsyncIteration
+trap("coroutine aiter", lambda: asyncio.run(over(CoroAiter())))
+plain class GenAiter:
+    async def __aiter__(self) -> object:
+        yield 7
+asyncio.run(over(GenAiter()))
 "#,
     );
 }

@@ -36,8 +36,9 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   `__anext__` now runs just before the body that consumes its item, and a
   plain `for` or `list()` over such an object raises CPython's
   `TypeError` instead of driving `__anext__`. `async for` over a list,
-  tuple, string, dict, set or range raises CPython's `TypeError` too,
-  where the VM iterated it.
+  tuple, string, dict, set, range or a class without `__aiter__`, or over
+  an `async def __aiter__`, raises CPython's `TypeError` too, where the VM
+  iterated it.
 - **`tyc run` no longer runs a generator early without saying so.** A
   generator (or generator lambda) whose `yield` the VM cannot suspend (in
   a loop test, a `with` item, or two in one expression) ran its whole body at the call, so its
@@ -54,7 +55,8 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   Mixin)`, `class ML(list)`, `class Meta(type)`).
 - **`tyc run` sends more programs it cannot run faithfully to CPython.**
   A class with a custom `metaclass=` (anything but the real `ABCMeta` or
-  `type`, including `abc.ABCMeta` after the program reassigns it), a class defining or assigning `__del__`, and any use of `with_traceback` / `__traceback__`
+  `type`, including `abc.ABCMeta` after the program reassigns it or
+  `setattr`s it), a class defining or assigning `__del__`, and any use of `with_traceback` / `__traceback__`
   now take the compiled path with a `note:`. Before, the VM silently
   skipped the metaclass and the finaliser, and raised `AttributeError` for
   the traceback attributes.

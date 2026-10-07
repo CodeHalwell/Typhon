@@ -2161,10 +2161,11 @@ fn modular_inverse(a: &num_bigint::BigInt, m: &num_bigint::BigInt) -> Option<num
 }
 
 fn value_len(v: &Value) -> Result<usize, Unwind> {
-    // `len(Perm.R | Perm.W)` is the value's set-bit count (`Flag.__len__`),
-    // unnamed `IntFlag` bits included.
+    // `len(Perm.R | Perm.W)` is the value's `int.bit_count()`
+    // (`Flag.__len__`): the set bits of its magnitude, unnamed `IntFlag`
+    // bits included.
     if let Some(bits) = crate::value::flag_member_bits(v) {
-        return Ok(bits.count_ones() as usize);
+        return Ok(bits.unsigned_abs().count_ones() as usize);
     }
     // A `StrEnum` member *is* its string, so `len(StrE.X)` is the value's.
     if let Some(inner) = crate::value::enum_mixin_value(v) {

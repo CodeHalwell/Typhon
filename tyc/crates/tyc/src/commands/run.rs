@@ -675,10 +675,9 @@ fn unmodelled_attribute_references(
         .metaclass_roots
         .iter()
         .any(|root| scan.program_bound.contains(root))
-        || scan
-            .metaclass_attrs
-            .iter()
-            .any(|attr| scan.stored_attributes.contains(attr))
+        || scan.metaclass_attrs.iter().any(|attr| {
+            scan.stored_attributes.contains(attr) || scan.stored_attributes.contains("*")
+        })
     {
         missing.insert("a custom metaclass".to_owned());
     }
@@ -819,7 +818,8 @@ struct AttributeScan {
     /// `abc.ABCMeta`): modelled only while no attribute of that name is
     /// ever stored or deleted (`abc.ABCMeta = Custom`).
     metaclass_attrs: Vec<String>,
-    /// Every attribute name the program stores or deletes.
+    /// Every attribute name the program stores or deletes, directly or by
+    /// `setattr` / `delattr` (`*` when the name is not a literal).
     stored_attributes: std::collections::HashSet<String>,
 }
 
@@ -888,6 +888,18 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for DelBinding {
             Expr::Lambda(_) => {}
             _ => ruff_python_ast::visitor::walk_expr(self, expr),
         }
+    }
+
+    fn visit_pattern(&mut self, pattern: &'a ruff_python_ast::Pattern) {
+        use ruff_python_ast::Pattern;
+        let captured = match pattern {
+            Pattern::MatchAs(p) => p.name.as_ref(),
+            Pattern::MatchStar(p) => p.name.as_ref(),
+            Pattern::MatchMapping(p) => p.rest.as_ref(),
+            _ => None,
+        };
+        self.found |= captured.is_some_and(|n| n.as_str() == "__del__");
+        ruff_python_ast::visitor::walk_pattern(self, pattern);
     }
 }
 
@@ -1158,6 +1170,14 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                 }
                 if let Expr::Name(func) = call.func.as_ref() {
                     if matches!(func.id.as_str(), "setattr" | "delattr") {
+                        // A dynamic name could be any attribute: `*` stands
+                        // for all of them.
+                        match call.arguments.args.get(1) {
+                            Some(Expr::StringLiteral(name)) => self
+                                .stored_attributes
+                                .insert(name.value.to_str().to_owned()),
+                            _ => self.stored_attributes.insert("*".to_owned()),
+                        };
                         if let [Expr::Name(target), Expr::StringLiteral(name), ..] =
                             call.arguments.args.as_ref()
                         {
@@ -1468,6 +1488,20 @@ mod tests {
         assert!(scan_source(patched)
             .unwrap_or_default()
             .contains(&"a custom metaclass".to_owned()));
+        for set in [
+            "setattr(abc, \"ABCMeta\", Custom)",
+            "setattr(abc, \"ABC\" + \"Meta\", Custom)",
+        ] {
+            let src = format!("import abc\nplain class Custom(type):\n    pass\n{set}\nplain class W(metaclass=abc.ABCMeta):\n    pass\nprint(W())\n");
+            assert!(scan_source(&src)
+                .unwrap_or_default()
+                .contains(&"a custom metaclass".to_owned()));
+        }
+        let captured =
+            "plain class D:\n    match 1:\n        case __del__:\n            pass\nprint(D())\n";
+        assert!(scan_source(captured)
+            .unwrap_or_default()
+            .contains(&"a `__del__` finaliser".to_owned()));
         let fin =
             "plain class D:\n    def __del__(self) -> None:\n        print(\"bye\")\nprint(D())\n";
         assert_eq!(

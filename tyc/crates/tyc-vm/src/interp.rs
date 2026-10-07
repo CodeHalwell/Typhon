@@ -8668,9 +8668,14 @@ impl Interpreter {
                 // Async generators share the sync loop's path, but a
                 // *hand-written* async iterator defines `__aiter__` /
                 // `__anext__`, which `async for` prefers over any `__iter__`.
-                if std::mem::take(&mut self.async_iteration)
-                    && self.find_method(&inst.class, "__aiter__").is_some()
-                {
+                let async_iteration = std::mem::take(&mut self.async_iteration);
+                if async_iteration && self.find_method(&inst.class, "__aiter__").is_none() {
+                    return Err(type_error(format!(
+                        "'async for' requires an object with __aiter__ method, got {}",
+                        v.type_display_name()
+                    )));
+                }
+                if async_iteration {
                     let aiter = match self.find_method(&inst.class, "__aiter__") {
                         Some(m) => self.call_value(
                             Value::BoundMethod {
@@ -8682,6 +8687,16 @@ impl Interpreter {
                         )?,
                         None => v.clone(),
                     };
+                    // CPython never awaits `__aiter__`'s result: a coroutine
+                    // (an `async def __aiter__`) has no `__anext__`. An
+                    // async generator arrives as a thunk too, and is fine.
+                    if let Value::Coroutine(thunk) = &aiter {
+                        if !body_is_generator(&thunk.function.body) {
+                            return Err(type_error(
+                                "'async for' received an object from __aiter__ that does not implement __anext__: coroutine",
+                            ));
+                        }
+                    }
                     let aiter = self.force_awaitable(aiter)?;
                     // An async generator returned from `__aiter__` runs on
                     // the shared generator path; anything else without
