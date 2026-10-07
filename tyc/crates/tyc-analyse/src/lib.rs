@@ -3929,6 +3929,12 @@ struct ModuleScope {
     /// Relative imports map to a `.`-prefixed path that no allow-list
     /// matches, so calls through them are never provably pure.
     imports: HashMap<String, String>,
+    /// `lazy import` bindings as `tyc check` and a pre-3.15 build lower them
+    /// (`NAME = __typhon_lazy_import("MODULE")`): binding → module path.
+    /// Kept apart from `imports` so only the clock / entropy / I/O tables
+    /// see through them (a 3.15 build parses the same line as an `import`);
+    /// every other verdict still sees an opaque module-level value.
+    lazy_imports: HashMap<String, String>,
 }
 
 impl ModuleScope {
@@ -4098,6 +4104,9 @@ impl ModuleScope {
                     for t in &a.targets {
                         self.top_level_bound.extend(bound_names_in_target(t));
                     }
+                    if let Some((name, module)) = self.lazy_import_binding(a) {
+                        self.lazy_imports.insert(name, module);
+                    }
                 }
                 Stmt::AnnAssign(a) => {
                     self.top_level_bound
@@ -4106,6 +4115,35 @@ impl ModuleScope {
                 _ => {}
             }
         }
+    }
+
+    /// `(NAME, MODULE)` when `a` is the lowering of `lazy import` —
+    /// `NAME = __typhon_lazy_import("MODULE")`, the helper bound by the
+    /// header import the preprocessor injects above it.
+    fn lazy_import_binding(&self, a: &ruff_python_ast::StmtAssign) -> Option<(String, String)> {
+        let [Expr::Name(target)] = a.targets.as_slice() else {
+            return None;
+        };
+        let Expr::Call(call) = a.value.as_ref() else {
+            return None;
+        };
+        let Expr::Name(func) = call.func.as_ref() else {
+            return None;
+        };
+        if func.id.as_str() != "__typhon_lazy_import"
+            || self.imports.get("__typhon_lazy_import").map(String::as_str)
+                != Some("typhon_runtime.lazy.lazy_import")
+            || !call.arguments.keywords.is_empty()
+        {
+            return None;
+        }
+        let [Expr::StringLiteral(module)] = &*call.arguments.args else {
+            return None;
+        };
+        Some((
+            target.id.as_str().to_owned(),
+            module.value.to_str().to_owned(),
+        ))
     }
 
     /// What a type expression's head names: a builtin, a resolved stdlib /
@@ -4596,6 +4634,34 @@ impl ModuleScope {
             (Some(full), None) => full.clone(),
             (None, _) => path.to_owned(),
         }
+    }
+
+    /// [`Self::resolve_path`], also seeing through a lowered `lazy import`
+    /// binding. Only for the clock / entropy / I/O tables (see
+    /// [`Self::lazy_imports`]).
+    fn resolve_effect_path(&self, path: &str) -> String {
+        let (head, rest) = match path.split_once('.') {
+            Some((h, r)) => (h, Some(r)),
+            None => (path, None),
+        };
+        match (
+            self.imports.contains_key(head),
+            self.lazy_imports.get(head),
+            rest,
+        ) {
+            (false, Some(module), Some(r)) => format!("{module}.{r}"),
+            (false, Some(module), None) => module.clone(),
+            _ => self.resolve_path(path),
+        }
+    }
+
+    /// Whether `name`, read at module scope, names a builtin or an imported
+    /// (possibly lazily imported) module rather than a value the module
+    /// bound itself.
+    fn names_builtin_or_import(&self, name: &str) -> bool {
+        self.imports.contains_key(name)
+            || self.lazy_imports.contains_key(name)
+            || !self.top_level_bound.contains(name)
     }
 }
 
@@ -5483,7 +5549,7 @@ impl PurityCtx<'_> {
         if self.is_param(name) || self.scope_locals.contains(name) {
             return false;
         }
-        self.module.imports.contains_key(name) || !self.module.top_level_bound.contains(name)
+        self.module.names_builtin_or_import(name)
     }
 
     /// The builtin type head of a parameter, local or module binding, when
@@ -6677,7 +6743,7 @@ fn forbidden_callee(
     ctx: &PurityCtx,
 ) -> Option<String> {
     let raw = dotted_path(func)?;
-    let reason = forbidden_path(&ctx.module.resolve_path(&raw), args)?;
+    let reason = forbidden_path(&ctx.module.resolve_effect_path(&raw), args)?;
     // The tables are keyed on builtin and stdlib names, so they only apply
     // when the head of the path is one: `def f(time: str)` makes
     // `time.strip()` a `str` method and a module-level `def eval` makes
@@ -9172,6 +9238,20 @@ def f(xs: tuple[int, ...], s: str) -> str:
             (
                 "@pure\ndef f(random: object) -> float:\n    return random.random()\n",
                 "random",
+            ),
+            // A `lazy import` as `tyc check` and a pre-3.15 build lower it
+            // still names the module.
+            (
+                "from typhon_runtime.lazy import lazy_import as __typhon_lazy_import\n\
+                 time = __typhon_lazy_import(\"time\")\n\n\
+                 @pure\ndef f() -> float:\n    return time.time()\n",
+                "clock",
+            ),
+            (
+                "from typhon_runtime.lazy import lazy_import as __typhon_lazy_import\n\
+                 secrets = __typhon_lazy_import(\"secrets\")\n\n\
+                 @pure\ndef f() -> str:\n    return secrets.token_hex(8)\n",
+                "entropy",
             ),
         ] {
             let reason =

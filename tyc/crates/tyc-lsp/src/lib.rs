@@ -4808,15 +4808,6 @@ fn first_label(err: &TycError) -> Option<LabeledSpan> {
     err.labels()?.next()
 }
 
-/// Pick the text that a diagnostic's byte offsets are anchored to.
-///
-/// `validate_question_ops` errors carry offsets into the **original** Typhon
-/// source. Every other diagnostic produced by `check_file` (parse, resolve,
-/// type-check, unused-import, etc.) is anchored to the **preprocessed**
-/// source because that's what the parser and resolver see after `let`/`mut`
-/// stripping and sugar expansion. Selecting the correct reference text per
-/// diagnostic variant keeps published LSP ranges aligned with the editor
-/// buffer instead of drifting by a column or two after `val` is removed.
 /// The `tyc::impure_pure_fn` diagnostics `tyc check` reports for the editor
 /// buffer `original`, relocated onto it. `module` was parsed from
 /// `preprocessed` (the shared pipeline's sugar chain, which keeps `lazy
@@ -4852,6 +4843,15 @@ fn editor_purity_diagnostics(
     diags
 }
 
+/// Pick the text that a diagnostic's byte offsets are anchored to.
+///
+/// `validate_question_ops` errors carry offsets into the **original** Typhon
+/// source. Every other diagnostic produced by `check_file` (parse, resolve,
+/// type-check, unused-import, etc.) is anchored to the **preprocessed**
+/// source because that's what the parser and resolver see after `let`/`mut`
+/// stripping and sugar expansion. Selecting the correct reference text per
+/// diagnostic variant keeps published LSP ranges aligned with the editor
+/// buffer instead of drifting by a column or two after `val` is removed.
 fn diagnostic_source<'a>(err: &TycError, original: &'a str, preprocessed: &'a str) -> &'a str {
     // A diagnostic already relocated onto the editor buffer
     // (`Diagnostics::remap_lines`, run by the shared check pipeline) carries
