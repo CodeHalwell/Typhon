@@ -743,6 +743,50 @@ def main() -> None:\n    print(Box(True).get(), Box(3).get2(), Box(1).get3(), Pe
     assert!(!check(bad).errors().is_empty(), "accepted:\n{bad}");
 }
 
+/// A union that merely holds an `Any` — the join `raw if c else fallback`,
+/// `json.loads(s) if c else fallback`, or an explicit `Mapping[...] | Any` —
+/// still narrows under `type(m) is dict`, so the annotated binding the old
+/// re-type rule let through stays accepted. A union holding a type variable,
+/// and a bare `Any`, are left alone.
+#[test]
+fn type_identity_narrows_a_union_holding_any() {
+    let src = "from collections.abc import Mapping, Sequence\nfrom typing import Any\nimport json\n\
+def load(raw: Any, fallback: Mapping[str, int], use_raw: bool) -> int:\n\
+\x20   let m = raw if use_raw else fallback\n    if type(m) is dict:\n        let d: dict[str, int] = m\n        return len(d)\n    return -1\n\
+def parse(s: str, fallback: Mapping[str, int], use_raw: bool) -> int:\n\
+\x20   let m = json.loads(s) if use_raw else fallback\n    if type(m) is dict:\n        let d: dict[str, int] = m\n        return len(d)\n    return 0\n\
+def branchy(raw: Any, fallback: Mapping[str, int], use_raw: bool) -> int:\n\
+\x20   mut m = fallback\n    if use_raw:\n        m = raw\n    if type(m) is dict:\n        let d: dict[str, int] = m\n        return len(d)\n    return 0\n\
+def guarded(m: Mapping[str, int] | Any) -> int:\n    if type(m) is dict:\n        let d: dict[str, int] = m\n        return len(d)\n    return 0\n\
+def guarded_eq(m: Mapping[str, int] | Any) -> int:\n    if type(m) == dict:\n        mut d: dict[str, int] = m\n        d[\"z\"] = 26\n        return len(d)\n    return 0\n\
+def seq(s: Sequence[int] | Any) -> int:\n    if type(s) is list:\n        let l: list[int] = s\n        return len(l)\n    return 0\n\
+def size(d: dict[str, int]) -> int:\n    return len(d)\n\
+def call(raw: Any, fallback: Mapping[str, int], use_raw: bool) -> int:\n\
+\x20   let m = raw if use_raw else fallback\n    if type(m) is dict:\n        return size(m)\n    return -1\n";
+    assert_clean(&check(src), src);
+    // The exact class still narrows such a union: a wrong use is caught.
+    let bad = "from typing import Any\n\
+def f(x: int | Any) -> str:\n    if type(x) is int:\n        return x.upper()\n    return \"?\"\n";
+    assert!(!check(bad).errors().is_empty(), "accepted:\n{bad}");
+    // Without a narrowing, the declared type is enforced (the annotated
+    // binding change), and a union holding a type variable is left as it was.
+    for rejected in [
+        "from collections.abc import Mapping\nfrom typing import Any\n\
+def plain(m: Mapping[str, int] | Any) -> int:\n    let d: dict[str, int] = m\n    return len(d)\n",
+        "from collections.abc import Mapping\n\
+def f[T](m: Mapping[str, int] | T) -> int:\n    if type(m) is dict:\n        let d: dict[str, int] = m\n        return len(d)\n    return 0\n",
+    ] {
+        assert!(!check(rejected).errors().is_empty(), "accepted:\n{rejected}");
+    }
+    // A type variable inside a union is never replaced by the class.
+    let tv = "class Box[T]:\n    item: T\n    maybe: T?\n    either: T | None\n\
+impl[T] Box[T]:\n    def opt_form(self) -> T?:\n        if type(self.maybe) is bool:\n            return self.maybe\n        return self.maybe\n\
+\x20   def union_form(self) -> T | None:\n        if type(self.either) is int:\n            return self.either\n        return self.either\n\
+def opt_tv[T](x: T?) -> T?:\n    if type(x) is bool:\n        return x\n    return x\n\
+def union_tv[T](x: T | int) -> T | int:\n    if type(x) is int:\n        return x\n    return x\n";
+    assert_clean(&check(tv), tv);
+}
+
 /// A name in `C`'s place that is bound to a value — a `let`, a parameter, a
 /// loop target — says nothing about the runtime class, even when the name is
 /// `int` or a class's; neither does a call to a rebound `type`.

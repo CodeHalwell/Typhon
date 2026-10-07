@@ -21064,13 +21064,18 @@ fn type_identity_narrowing(
         t => t,
     };
     let replace = |current: &Type| {
-        // A type variable, `Unknown` or `Any` subject (or a union holding
-        // one) may accept every replacement — a class type parameter read
-        // through `self` in an `impl[T]` method is not opaque there — so the
-        // guard below cannot tell a `T` from a `bool`, and there is no
-        // intersection to narrow to. Leave it as it was.
-        let open = |t: &Type| matches!(t, Type::Unknown | Type::Any | Type::TypeVar(_));
-        if open(current) || matches!(current, Type::Union(members) if members.iter().any(open)) {
+        // A type variable subject (or a union holding one) may accept every
+        // replacement — a class type parameter read through `self` in an
+        // `impl[T]` method is not opaque there — so the guard below cannot
+        // tell a `T` from a `bool`, and there is no intersection to narrow
+        // to. A bare `Unknown` / `Any` has none either. Leave those as they
+        // were. A union that merely holds an `Any` (`raw if c else fallback`)
+        // still narrows: the exact-class test makes the replacement sound,
+        // and the annotated binding under it relied on that.
+        let is_type_var = |t: &Type| matches!(t, Type::TypeVar(_));
+        if matches!(current, Type::Unknown | Type::Any | Type::TypeVar(_))
+            || matches!(current, Type::Union(members) if members.iter().any(is_type_var))
+        {
             return None;
         }
         let r = container_pattern_narrowing(c, current, head)
