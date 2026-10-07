@@ -6,6 +6,9 @@
 
 
 class property:
+    # `type(p) is property`: this class *is* the builtin type.
+    __typhon_builtin_type__ = True
+
     def __init__(self, fget=None, fset=None, fdel=None, doc=None):
         self.fget = fget
         self.fset = fset
@@ -157,6 +160,8 @@ class _GenericAlias:
 # object compared by identity, truthy, whose `repr` / `str` is its name (or
 # the `repr=` given). `copy` hands the object itself back.
 class sentinel:
+    __typhon_builtin_type__ = True
+
     def __init__(self, name, repr=None):
         self.__name__ = name
         self.__typhon_repr__ = name if repr is None else repr

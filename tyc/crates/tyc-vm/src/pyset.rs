@@ -77,7 +77,7 @@ pub fn key_hash(k: &HashKey) -> i64 {
         }
         HashKey::Identity(inst) => pyhash::pointer_hash(std::rc::Rc::as_ptr(inst) as usize),
         HashKey::Class(c) => pyhash::pointer_hash(std::rc::Rc::as_ptr(c) as usize),
-        HashKey::BuiltinType(name) => pyhash::str_hash(name),
+        HashKey::BuiltinType(t) => pyhash::str_hash(t.name),
         HashKey::Mixin { value, .. } => key_hash(value),
         HashKey::UserHashed { hash, .. } => {
             if *hash == -1 {

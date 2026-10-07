@@ -44,10 +44,18 @@ class _MappingBase:
     def items(self):
         return self._data.items()
 
-    def get(self, key, default=None):
-        if key in self._data:
-            return self._data[key]
-        return default
+    # Counter and OrderedDict inherit the C `dict.get`: positional-only, with
+    # dict's own arity errors. (ChainMap and UserDict define their own.)
+    def get(self, *args, **kwargs):
+        if kwargs:
+            raise TypeError("dict.get() takes no keyword arguments")
+        if not args:
+            raise TypeError("get expected at least 1 argument, got 0")
+        if len(args) > 2:
+            raise TypeError("get expected at most 2 arguments, got %d" % len(args))
+        if args[0] in self._data:
+            return self._data[args[0]]
+        return args[1] if len(args) == 2 else None
 
     def pop(self, key, *default):
         if key in self._data:

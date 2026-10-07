@@ -532,3 +532,137 @@ def _exit(code=0):
 
 def abort():
     raise SystemExit(134)
+
+
+# `os.environ` is CPython's `os._Environ`, a `MutableMapping` rather than a
+# dict: `get` / `pop` take `default=` by keyword, keys and values must be
+# `str`, and `copy()` / `|` hand back a plain dict. The entries stay in the
+# dict the VM seeded, which `posixpath.expandvars` reads too.
+_ENVIRON_MISSING = object()
+
+
+def _environ_str(value):
+    if not isinstance(value, str):
+        raise TypeError("str expected, not %s" % type(value).__name__)
+    return value
+
+
+class _Environ:
+    def __init__(self, data):
+        self._data = data
+
+    def __getitem__(self, key):
+        if _environ_str(key) in self._data:
+            return self._data[key]
+        raise KeyError(key)
+
+    def __setitem__(self, key, value):
+        self._data[_environ_str(key)] = _environ_str(value)
+
+    def __delitem__(self, key):
+        if _environ_str(key) not in self._data:
+            raise KeyError(key)
+        del self._data[key]
+
+    def __contains__(self, key):
+        return _environ_str(key) in self._data
+
+    def __iter__(self):
+        return iter(list(self._data))
+
+    def __len__(self):
+        return len(self._data)
+
+    def __repr__(self):
+        items = ", ".join(["%r: %r" % (k, v) for k, v in self._data.items()])
+        return "environ({" + items + "})"
+
+    def __eq__(self, other):
+        if isinstance(other, _Environ):
+            return self._data == other._data
+        if isinstance(other, dict):
+            return self._data == other
+        return NotImplemented
+
+    def __ne__(self, other):
+        result = self.__eq__(other)
+        if result is NotImplemented:
+            return result
+        return not result
+
+    def __hash__(self):
+        raise TypeError("unhashable type: '_Environ'")
+
+    def keys(self):
+        return self._data.keys()
+
+    def values(self):
+        return self._data.values()
+
+    def items(self):
+        return self._data.items()
+
+    def get(self, key, default=None):
+        return self._data.get(_environ_str(key), default)
+
+    def pop(self, key, default=_ENVIRON_MISSING):
+        if _environ_str(key) in self._data:
+            value = self._data[key]
+            del self._data[key]
+            return value
+        if default is _ENVIRON_MISSING:
+            raise KeyError(key)
+        return default
+
+    def popitem(self):
+        # `MutableMapping.popitem` takes the *first* key, unlike `dict`'s.
+        if not self._data:
+            raise KeyError()
+        key = next(iter(self._data))
+        value = self._data[key]
+        del self._data[key]
+        return (key, value)
+
+    def clear(self):
+        self._data.clear()
+
+    def update(self, *args, **kwargs):
+        if len(args) > 1:
+            raise TypeError("update expected at most 1 argument, got %d" % len(args))
+        if args:
+            other = args[0]
+            if hasattr(other, "keys"):
+                for k in list(other.keys()):
+                    self[k] = other[k]
+            else:
+                for k, v in other:
+                    self[k] = v
+        for k in kwargs:
+            self[k] = kwargs[k]
+
+    def setdefault(self, key, value):
+        if key not in self:
+            self[key] = value
+        return self[key]
+
+    def copy(self):
+        return dict(self._data)
+
+    def __or__(self, other):
+        if isinstance(other, _Environ):
+            return {**self._data, **other._data}
+        if isinstance(other, dict):
+            return {**self._data, **other}
+        return NotImplemented
+
+    def __ror__(self, other):
+        if isinstance(other, dict):
+            return {**other, **self._data}
+        return NotImplemented
+
+    def __ior__(self, other):
+        self.update(other)
+        return self
+
+
+environ = _Environ(environ)

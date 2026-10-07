@@ -663,7 +663,7 @@ pub enum HashKey {
     /// different keys. Builtin types reach the VM as native constructors
     /// rather than `Class` values, so they key on their name instead.
     Class(Rc<Class>),
-    BuiltinType(&'static str),
+    BuiltinType(Rc<BuiltinTypeKey>),
     /// An instance whose class defines `__hash__`. `hash` is what the user
     /// method returned; `__eq__` is consulted by `Interpreter::settle_key`
     /// *before* the key reaches a container, so inside the container two
@@ -681,6 +681,22 @@ pub enum HashKey {
         value: Box<HashKey>,
         member: Rc<Instance>,
     },
+}
+
+/// A builtin type (or another native) used as a key: it compares and hashes
+/// by `name`, so `int` and `type(1)` are one key, and keeps the `object` it
+/// was made from, so iterating the keys hands back `int` rather than the
+/// string `"int"`.
+#[derive(Debug)]
+pub struct BuiltinTypeKey {
+    pub name: &'static str,
+    pub object: Value,
+}
+
+impl HashKey {
+    fn builtin_type(name: &'static str, object: Value) -> HashKey {
+        HashKey::BuiltinType(Rc::new(BuiltinTypeKey { name, object }))
+    }
 }
 
 /// How instances of a class hash and compare as dict/set keys — CPython's
@@ -791,7 +807,20 @@ pub fn native_repr(name: &str) -> String {
     if name == "NotImplemented" {
         return name.to_owned();
     }
-    let is_type = matches!(
+    // Two prelude names the VM models as natives are *classes* in CPython,
+    // and print with the module that defines them.
+    match name {
+        "enum.auto" => "<class 'enum.auto'>".to_owned(),
+        "NewType" => "<class 'typing.NewType'>".to_owned(),
+        _ if native_is_type(name) => format!("<class '{name}'>"),
+        _ => format!("<built-in function {name}>"),
+    }
+}
+
+/// Whether the native `name` is a builtin *type*'s constructor — a class in
+/// CPython, so `type(int) is type` — rather than a function.
+pub fn native_is_type(name: &str) -> bool {
+    matches!(
         name,
         "int"
             | "float"
@@ -819,7 +848,21 @@ pub fn native_repr(name: &str) -> String {
             | "staticmethod"
             | "classmethod"
             | "super"
-            | "BaseException"
+            // Python 3.15 builtins.
+            | "frozendict"
+            | "sentinel"
+            | "enum.auto"
+            | "NewType"
+    ) || is_exception_type_name(name)
+}
+
+/// Whether `name` is a builtin exception type: the names
+/// `interp::builtin_exc_is_a` relates. That relation holds for any name
+/// against `BaseException`, so `int` must be filtered out first.
+pub fn is_exception_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "BaseException"
             | "KeyboardInterrupt"
             | "SystemExit"
             | "GeneratorExit"
@@ -827,19 +870,12 @@ pub fn native_repr(name: &str) -> String {
             | "StopAsyncIteration"
             | "ExceptionGroup"
             | "BaseExceptionGroup"
+            // `asyncio`'s.
+            | "QueueEmpty"
+            | "QueueFull"
     ) || name.ends_with("Error")
         || name.ends_with("Exception")
-        || name.ends_with("Warning");
-    if is_type {
-        return format!("<class '{name}'>");
-    }
-    // Two prelude names the VM models as natives are *classes* in CPython,
-    // and print with the module that defines them.
-    match name {
-        "enum.auto" => "<class 'enum.auto'>".to_owned(),
-        "NewType" => "<class 'typing.NewType'>".to_owned(),
-        _ => format!("<built-in function {name}>"),
-    }
+        || name.ends_with("Warning")
 }
 
 /// The VM models a `slice` as the tuple `("__slice__", start, stop, step)`
@@ -1153,10 +1189,10 @@ impl HashKey {
                 out.push(9);
                 out.extend_from_slice(&(Rc::as_ptr(c) as usize as u64).to_be_bytes());
             }
-            HashKey::BuiltinType(name) => {
+            HashKey::BuiltinType(t) => {
                 out.push(10);
-                out.extend_from_slice(&(name.len() as u32).to_be_bytes());
-                out.extend_from_slice(name.as_bytes());
+                out.extend_from_slice(&(t.name.len() as u32).to_be_bytes());
+                out.extend_from_slice(t.name.as_bytes());
             }
         }
         out
@@ -1193,7 +1229,7 @@ impl HashKey {
             HashKey::Instance { instance, .. } => Value::Instance(instance),
             HashKey::Identity(instance) => Value::Instance(instance),
             HashKey::Class(c) => Value::Class(c),
-            HashKey::BuiltinType(name) => Value::Str(Rc::new(name.to_owned())),
+            HashKey::BuiltinType(t) => t.object.clone(),
             HashKey::UserHashed { instance, .. } => Value::Instance(instance),
         }
     }
@@ -1254,7 +1290,7 @@ impl PartialEq for HashKey {
             (HashKey::Instance { key: a, .. }, HashKey::Instance { key: b, .. }) => a == b,
             (HashKey::Identity(a), HashKey::Identity(b)) => Rc::ptr_eq(a, b),
             (HashKey::Class(a), HashKey::Class(b)) => Rc::ptr_eq(a, b),
-            (HashKey::BuiltinType(a), HashKey::BuiltinType(b)) => a == b,
+            (HashKey::BuiltinType(a), HashKey::BuiltinType(b)) => a.name == b.name,
             // Equal-by-`__eq__` probes are settled onto the stored key's
             // instance before they get here (`Interpreter::settle_key`).
             (
@@ -1308,7 +1344,7 @@ impl std::hash::Hash for HashKey {
             HashKey::Instance { key, .. } => key.hash(state),
             HashKey::Identity(inst) => (Rc::as_ptr(inst) as usize).hash(state),
             HashKey::Class(c) => (Rc::as_ptr(c) as usize).hash(state),
-            HashKey::BuiltinType(name) => name.hash(state),
+            HashKey::BuiltinType(t) => t.name.hash(state),
             // Only the user hash feeds the hasher, so every probe with the
             // same `__hash__` lands in the same bucket chain and
             // `Interpreter::settle_key` can find its `__eq__` candidates.
@@ -2599,13 +2635,14 @@ impl Value {
                 // a type-keyed registry (`functools.singledispatch`) has to
                 // see a single key for the two.
                 if crate::builtins::is_builtin_type_class(c) {
-                    return Ok(HashKey::BuiltinType(crate::interp::intern_type_name(
-                        &c.name,
-                    )));
+                    return Ok(HashKey::builtin_type(
+                        crate::interp::intern_type_name(&c.name),
+                        self.clone(),
+                    ));
                 }
                 Ok(HashKey::Class(c.clone()))
             }
-            Value::Native(n) => Ok(HashKey::BuiltinType(n.name)),
+            Value::Native(n) => Ok(HashKey::builtin_type(n.name, self.clone())),
             // A `frozendict` is hashable when its values are; a
             // `mappingproxy` (or plain dict) is not.
             Value::Dict(d) if d.frozendict.get() => {

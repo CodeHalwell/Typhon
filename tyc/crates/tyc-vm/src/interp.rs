@@ -3240,7 +3240,16 @@ impl Interpreter {
                                         map.insert(k.clone(), v.clone());
                                     }
                                 }
-                                _ => return Err(type_error("** unpack expected a mapping")),
+                                other => match self.mapping_protocol_items(&other)? {
+                                    Some(pairs) => {
+                                        for (k, v) in pairs {
+                                            let key = self.hash_key(&k)?;
+                                            let key = self.settle_key_in_map(&map, key)?;
+                                            map.insert(key, v);
+                                        }
+                                    }
+                                    None => return Err(type_error("** unpack expected a mapping")),
+                                },
                             }
                         }
                     }
@@ -4047,7 +4056,11 @@ impl Interpreter {
                 let h = self.hash_value(inner)?;
                 pyhash::tuple_hash(&[h])
             }
-            Value::Class(c) => pyhash::pointer_hash(Rc::as_ptr(c) as usize),
+            // `hash(type(1)) == hash(int)`: one object in CPython.
+            Value::Class(c) => pyhash::pointer_hash(
+                crate::builtins::builtin_type_native_addr(self, v)
+                    .unwrap_or(Rc::as_ptr(c) as usize),
+            ),
             Value::Function(f) => pyhash::pointer_hash(Rc::as_ptr(f) as usize),
             Value::Native(n) => pyhash::pointer_hash(Rc::as_ptr(n) as usize),
             Value::Module(m) => pyhash::pointer_hash(Rc::as_ptr(m) as usize),
@@ -4632,12 +4645,48 @@ impl Interpreter {
                                 }
                             }
                         }
-                        _ => return Err(type_error("** argument must be a mapping")),
+                        other => match self.mapping_protocol_items(&other)? {
+                            Some(pairs) => {
+                                for (k, val) in pairs {
+                                    let Value::Str(s) = k else {
+                                        return Err(type_error("keywords must be strings"));
+                                    };
+                                    kwargs.push(((*s).clone(), val));
+                                }
+                            }
+                            None => return Err(type_error("** argument must be a mapping")),
+                        },
                     }
                 }
             }
         }
         Ok((args, kwargs))
+    }
+
+    /// The `(key, value)` pairs of a mapping that is not a dict
+    /// (`os.environ`, a `Counter`): `**` reads its `keys()` and subscripts
+    /// it, as `dict(mapping)` does. `None` when `v` has no mapping protocol.
+    pub(crate) fn mapping_protocol_items(
+        &mut self,
+        v: &Value,
+    ) -> Result<Option<Vec<(Value, Value)>>, Unwind> {
+        let Value::Instance(inst) = v else {
+            return Ok(None);
+        };
+        if self.find_method(&inst.class, "keys").is_none()
+            || self.find_method(&inst.class, "__getitem__").is_none()
+        {
+            return Ok(None);
+        }
+        let keys_fn = self.get_attr(v, "keys")?;
+        let keys = self.call_value(keys_fn, vec![], &[])?;
+        let it = self.make_iter(keys)?;
+        let mut pairs = Vec::new();
+        while let Some(k) = self.iter_next(&it)? {
+            let val = self.subscript(v, &k)?;
+            pairs.push((k, val));
+        }
+        Ok(Some(pairs))
     }
 
     /// `NewType(name, base)` called directly: the newtype object, with its
@@ -7305,6 +7354,9 @@ impl Interpreter {
                 }
                 // `Cls.__mro__` — the C3 linearisation, ending in `object`.
                 if attr == "__mro__" {
+                    if let Some(mro) = crate::builtins::builtin_stand_in_mro(class) {
+                        return Ok(Value::Tuple(Rc::new(mro)));
+                    }
                     let mut out: Vec<Value> = class_mro(class)
                         .filter(|c| !crate::value::is_builtin_object(c))
                         .map(|c| Value::Class(c.clone()))
@@ -10288,6 +10340,8 @@ fn is_uninherited_marker(name: &str) -> bool {
             | "__typhon_generated_init__"
             | "__typhon_doc__"
             | "__typhon_generic__"
+            // A user subclass of the `bytearray` shim is not `bytearray`.
+            | "__typhon_builtin_type__"
     ) || name.starts_with("__typhon_dc_")
 }
 
@@ -12715,51 +12769,53 @@ pub fn builtin_exc_is_a(kind: &str, target: &str) -> bool {
                 | "BaseExceptionGroup"
         );
     }
-    // Direct parent in the standard hierarchy (subset covering the common
-    // intermediate bases programs actually catch).
-    fn parent(name: &str) -> Option<&'static str> {
-        Some(match name {
-            "ExceptionGroup" => "BaseExceptionGroup",
-            "ZeroDivisionError" | "OverflowError" | "FloatingPointError" => "ArithmeticError",
-            "IndexError" | "KeyError" => "LookupError",
-            "ModuleNotFoundError" => "ImportError",
-            "RecursionError" | "NotImplementedError" => "RuntimeError",
-            "UnboundLocalError" => "NameError",
-            // `dataclasses.FrozenInstanceError` derives from AttributeError.
-            "FrozenInstanceError" => "AttributeError",
-            "UnicodeError" | "JSONDecodeError" => "ValueError",
-            "UnicodeDecodeError" | "UnicodeEncodeError" | "UnicodeTranslateError" => "UnicodeError",
-            "FileNotFoundError" | "FileExistsError" | "PermissionError" | "IsADirectoryError"
-            | "NotADirectoryError" | "InterruptedError" | "TimeoutError" | "BlockingIOError"
-            | "ChildProcessError" | "ProcessLookupError" | "ConnectionError" => "OSError",
-            "BrokenPipeError"
-            | "ConnectionResetError"
-            | "ConnectionRefusedError"
-            | "ConnectionAbortedError" => "ConnectionError",
-            "DeprecationWarning"
-            | "UserWarning"
-            | "RuntimeWarning"
-            | "FutureWarning"
-            | "PendingDeprecationWarning"
-            | "SyntaxWarning"
-            | "ImportWarning"
-            | "ResourceWarning"
-            | "EncodingWarning"
-            | "UnicodeWarning"
-            | "BytesWarning" => "Warning",
-            "IndentationError" => "SyntaxError",
-            "TabError" => "IndentationError",
-            _ => return None,
-        })
-    }
     let mut cur = kind;
-    while let Some(p) = parent(cur) {
+    while let Some(p) = builtin_exc_parent(cur) {
         if p == target {
             return true;
         }
         cur = p;
     }
     false
+}
+
+/// The direct parent of a builtin exception kind in the standard hierarchy
+/// (a subset covering the intermediate bases programs actually catch), up to
+/// but not including `Exception` / `BaseException`.
+pub(crate) fn builtin_exc_parent(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "ExceptionGroup" => "BaseExceptionGroup",
+        "ZeroDivisionError" | "OverflowError" | "FloatingPointError" => "ArithmeticError",
+        "IndexError" | "KeyError" => "LookupError",
+        "ModuleNotFoundError" => "ImportError",
+        "RecursionError" | "NotImplementedError" => "RuntimeError",
+        "UnboundLocalError" => "NameError",
+        // `dataclasses.FrozenInstanceError` derives from AttributeError.
+        "FrozenInstanceError" => "AttributeError",
+        "UnicodeError" | "JSONDecodeError" => "ValueError",
+        "UnicodeDecodeError" | "UnicodeEncodeError" | "UnicodeTranslateError" => "UnicodeError",
+        "FileNotFoundError" | "FileExistsError" | "PermissionError" | "IsADirectoryError"
+        | "NotADirectoryError" | "InterruptedError" | "TimeoutError" | "BlockingIOError"
+        | "ChildProcessError" | "ProcessLookupError" | "ConnectionError" => "OSError",
+        "BrokenPipeError"
+        | "ConnectionResetError"
+        | "ConnectionRefusedError"
+        | "ConnectionAbortedError" => "ConnectionError",
+        "DeprecationWarning"
+        | "UserWarning"
+        | "RuntimeWarning"
+        | "FutureWarning"
+        | "PendingDeprecationWarning"
+        | "SyntaxWarning"
+        | "ImportWarning"
+        | "ResourceWarning"
+        | "EncodingWarning"
+        | "UnicodeWarning"
+        | "BytesWarning" => "Warning",
+        "IndentationError" => "SyntaxError",
+        "TabError" => "IndentationError",
+        _ => return None,
+    })
 }
 
 /// Collect the names of walrus (`:=`) assignment targets appearing anywhere

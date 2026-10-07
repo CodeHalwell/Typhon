@@ -1555,7 +1555,7 @@ pub fn install(interp: &mut Interpreter) {
         Ok(Value::Int(VmInt::from(i.hash_value(v)?)))
     });
 
-    native!("id", |_i, args| {
+    native!("id", |i, args| {
         // Stable per-object identity for heap-allocated values: the address
         // of the underlying `Rc` payload. Immutable scalars (int, float,
         // bool, None) hash to the address of the temporary `&Value` instead,
@@ -1563,6 +1563,9 @@ pub fn install(interp: &mut Interpreter) {
         // identity — CPython behaves similarly (every freshly-boxed int gets
         // a different id).
         let v = single(&args, "id")?;
+        if let Some(addr) = builtin_type_native_addr(i, v) {
+            return Ok(Value::Int(VmInt::from(addr as i64)));
+        }
         let addr: usize = match v {
             Value::List(l) => Rc::as_ptr(l) as usize,
             Value::Tuple(t) => Rc::as_ptr(t) as usize,
@@ -1723,7 +1726,6 @@ pub fn install(interp: &mut Interpreter) {
         "StopIteration",
         "StopAsyncIteration",
         "OSError",
-        "IOError",
         "FileNotFoundError",
         "FileExistsError",
         "PermissionError",
@@ -1821,6 +1823,11 @@ pub fn install(interp: &mut Interpreter) {
         });
         root.set(name, Value::Native(Rc::new(ctor)));
     }
+    // Python 3 keeps `IOError` and `EnvironmentError` only as aliases of
+    // `OSError`: `IOError is OSError`, and `except OSError` catches one.
+    let os_error = root.get("OSError").expect("OSError just registered");
+    root.set("IOError", os_error.clone());
+    root.set("EnvironmentError", os_error);
 
     // PEP 654 exception groups. Two-argument constructors
     // (`ExceptionGroup(message, [sub, ...])`) whose value keeps CPython's own
@@ -2292,25 +2299,33 @@ pub(crate) fn is_subclass_of(sub: &Value, cls: &Value) -> bool {
                     return true;
                 }
             }
+            // `type(e)` / `e.__class__` for a builtin value is the cached
+            // stand-in, which has no bases: relate it by name through the
+            // builtin hierarchy, as the native constructor is below. A user
+            // class target is no builtin's base.
+            if is_builtin_stand_in(c) {
+                return !matches!(cls, Value::Class(t) if !is_builtin_type_class(t))
+                    && builtin_type_is_a(&c.name, &want);
+            }
             class_in_chain(c, &want)
         }
         // An exception *kind* reaches here as a bare native / string (the VM
         // models builtin exception types by name), so relate them through
         // the same hierarchy `except` uses.
-        Value::Native(n) => {
-            n.name == want
-                || want == "object"
-                // `bool` really is a subclass of `int` in CPython.
-                || (n.name == "bool" && want == "int")
-                || crate::interp::builtin_exc_is_a(n.name, &want)
-        }
-        Value::Str(s) => {
-            s.as_str() == want
-                || want == "object"
-                || crate::interp::builtin_exc_is_a(s.as_str(), &want)
-        }
+        Value::Native(n) => want == "object" || builtin_type_is_a(n.name, &want),
+        Value::Str(s) => want == "object" || builtin_type_is_a(s.as_str(), &want),
         _ => false,
     }
+}
+
+/// `issubclass` between two builtin types known only by name.
+fn builtin_type_is_a(name: &str, want: &str) -> bool {
+    name == want
+        // `bool` really is a subclass of `int` in CPython.
+        || (name == "bool" && want == "int")
+        // Only an exception type is below `Exception` / `BaseException`.
+        || (crate::value::is_exception_type_name(name)
+            && crate::interp::builtin_exc_is_a(name, want))
 }
 
 /// The Protocol classes among an `isinstance` target (which may be a tuple
@@ -2378,6 +2393,13 @@ pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
         ("complex", Value::Complex(..)) => true,
         ("Ok", Value::ResultOk(_)) => true,
         ("Err", Value::ResultErr(_)) => true,
+        // A class is an instance of `type` (and of its metaclass), and so is
+        // a builtin type, which the VM keeps as its constructor native.
+        ("type", Value::Class(_)) => true,
+        ("type", Value::Native(n)) => crate::value::native_is_type(n.name),
+        (meta, Value::Class(c)) if matches!(cls, Value::Class(m) if is_builtin_stand_in(m)) => {
+            metaclass_name(c) == meta
+        }
         // Exception kind match — exact, or through the builtin exception
         // hierarchy (`isinstance(e, Exception)` where e is a ValueError;
         // the same relation `except` clauses use).
@@ -3061,13 +3083,16 @@ fn cached_helper_class(
 
 /// Source for the `defaultdict` shim class. Backing store lives in `_data`;
 /// the missing-key path runs `__missing__`, which the foundation's subscript
-/// hook invokes when `__getitem__` raises `KeyError`.
+/// hook invokes when `__getitem__` raises `KeyError`. The class is named
+/// `defaultdict` and marked as the builtin type, so `type(d) is defaultdict`
+/// and `type(d).__name__` read as in CPython.
 const DEFAULTDICT_SRC: &str = r#"
-class _DefaultDict:
+class defaultdict:
     __typhon_builtin_bases__ = ("dict", "defaultdict")
+    __typhon_builtin_type__ = True
     def __init__(self, default_factory, initial):
         self._data = {}
-        self._factory = default_factory
+        self.default_factory = default_factory
         if initial is not None:
             for k in initial:
                 self._data[k] = initial[k]
@@ -3078,15 +3103,15 @@ class _DefaultDict:
     def __setitem__(self, key, value):
         self._data[key] = value
     def __missing__(self, key):
-        if self._factory is None:
+        if self.default_factory is None:
             raise KeyError(key)
-        value = self._factory()
+        value = self.default_factory()
         self._data[key] = value
         return value
     def __contains__(self, key):
         return key in self._data
     def __repr__(self):
-        return "defaultdict(%r, %r)" % (self._factory, self._data)
+        return "defaultdict(%r, %r)" % (self.default_factory, self._data)
     def __len__(self):
         return len(self._data)
     def __iter__(self):
@@ -3097,16 +3122,23 @@ class _DefaultDict:
         return self._data.values()
     def items(self):
         return self._data.items()
-    def get(self, key, default=None):
-        if key in self._data:
-            return self._data[key]
-        return default
+    # `dict.get`, inherited: positional-only, with dict's own arity errors.
+    def get(self, *args, **kwargs):
+        if kwargs:
+            raise TypeError("dict.get() takes no keyword arguments")
+        if not args:
+            raise TypeError("get expected at least 1 argument, got 0")
+        if len(args) > 2:
+            raise TypeError("get expected at most 2 arguments, got %d" % len(args))
+        if args[0] in self._data:
+            return self._data[args[0]]
+        return args[1] if len(args) == 2 else None
     def __eq__(self, other):
-        if isinstance(other, _DefaultDict):
+        if isinstance(other, defaultdict):
             return self._data == other._data
         return self._data == other
     def __ne__(self, other):
-        if isinstance(other, _DefaultDict):
+        if isinstance(other, defaultdict):
             return self._data != other._data
         return self._data != other
 "#;
@@ -3144,7 +3176,7 @@ fn defaultdict_class(interp: &mut Interpreter) -> Result<Value, Unwind> {
         interp,
         "__shim_defaultdict__",
         DEFAULTDICT_SRC,
-        "_DefaultDict",
+        "defaultdict",
     )
 }
 
@@ -9830,10 +9862,11 @@ fn method_arity(ty: &str, method: &str) -> Option<MethodArity> {
             max: 0,
             kw_only: true,
         },
-        // A `freeze let` dict is a `mappingproxy`, which has only the
-        // read-only methods; the rest stay the handler's AttributeError.
-        ("dict" | "mappingproxy", "copy" | "items" | "keys" | "values") => NoArgs,
-        ("dict" | "mappingproxy", "get") => Positional(1, 2),
+        // A `freeze let` dict is a `mappingproxy` (a `frozendict` under
+        // `freeze-dict = "frozendict"`); both have only the read-only
+        // methods, and the rest stay the handler's AttributeError.
+        ("dict" | "mappingproxy" | "frozendict", "copy" | "items" | "keys" | "values") => NoArgs,
+        ("dict" | "mappingproxy" | "frozendict", "get") => Positional(1, 2),
         ("dict", "clear" | "popitem") => NoArgs,
         ("dict", "pop" | "setdefault") => Positional(1, 2),
         ("dict", "update") => Positional(0, 1),
@@ -10786,20 +10819,32 @@ fn str_method(
         // never match a field name.
         "format_map" => {
             let mapping = single(args, "format_map")?;
-            let Value::Dict(d) = mapping else {
-                return Err(type_error(format!(
-                    "format_map() argument must be a mapping, not {}",
-                    mapping.type_name()
-                )));
+            let kwargs: Vec<(String, Value)> = match mapping {
+                Value::Dict(d) => d
+                    .borrow()
+                    .iter()
+                    .filter_map(|(k, v)| match k {
+                        HashKey::Str(name) => Some(((**name).clone(), v.clone())),
+                        _ => None,
+                    })
+                    .collect(),
+                // A mapping that is not a dict (`os.environ`).
+                other => match interp.mapping_protocol_items(other)? {
+                    Some(pairs) => pairs
+                        .into_iter()
+                        .filter_map(|(k, v)| match k {
+                            Value::Str(name) => Some(((*name).clone(), v)),
+                            _ => None,
+                        })
+                        .collect(),
+                    None => {
+                        return Err(type_error(format!(
+                            "format_map() argument must be a mapping, not {}",
+                            other.type_name()
+                        )))
+                    }
+                },
             };
-            let kwargs: Vec<(String, Value)> = d
-                .borrow()
-                .iter()
-                .filter_map(|(k, v)| match k {
-                    HashKey::Str(name) => Some(((**name).clone(), v.clone())),
-                    _ => None,
-                })
-                .collect();
             return str_format(interp, s, &[], &kwargs);
         }
         "encode" => {
@@ -11328,7 +11373,10 @@ fn bytes_method(
         }
         "rfind" | "rindex" if !args.is_empty() => {
             let needle = bytes_arg(&args[0])?;
-            match rfind_subslice(b, &needle) {
+            // Optional `start` / `end` bound the search like a slice.
+            let found = search_range(args, b.len())?
+                .and_then(|(s, e)| rfind_subslice(&b[s..e], &needle).map(|i| i + s));
+            match found {
                 Some(i) => Value::Int(VmInt::from(i as i64)),
                 None if name == "rfind" => Value::Int(VmInt::from(-1)),
                 None => return Err(value_error("subsection not found")),
@@ -11420,25 +11468,31 @@ fn bytes_method(
         }
         "upper" => Value::Bytes(Rc::new(b.iter().map(|c| c.to_ascii_uppercase()).collect())),
         "lower" => Value::Bytes(Rc::new(b.iter().map(|c| c.to_ascii_lowercase()).collect())),
-        // `.split(sep=None)` — on whitespace when no separator, else on the
-        // separator bytes. Returns a list of bytes.
+        // `.split(sep=None, maxsplit=-1)` — on whitespace when no separator,
+        // else on the separator bytes, at most `maxsplit` times (from the
+        // right for `rsplit`). Returns a list of bytes.
         "split" | "rsplit" => {
-            let parts: Vec<Vec<u8>> = match args.first() {
-                None | Some(Value::None) => {
-                    // Split on ASCII whitespace runs, dropping empties.
-                    b.split(|c| ascii_is_space(*c))
-                        .filter(|p| !p.is_empty())
-                        .map(|p| p.to_vec())
-                        .collect()
+            let maxsplit = match args.get(1) {
+                None => -1,
+                Some(v @ (Value::Int(_) | Value::Bool(_))) => crate::limits::ssize_arg(v)?,
+                Some(other) => {
+                    return Err(type_error(format!(
+                        "'{}' object cannot be interpreted as an integer",
+                        other.type_display_name()
+                    )))
                 }
+            };
+            let sep = match args.first() {
+                None | Some(Value::None) => None,
                 Some(sep) => {
                     let sep = bytes_arg(sep)?;
                     if sep.is_empty() {
                         return Err(value_error("empty separator"));
                     }
-                    split_bytes(b, &sep)
+                    Some(sep)
                 }
             };
+            let parts = split_bytes(b, sep.as_deref(), maxsplit, name == "rsplit");
             Value::List(Rc::new(RefCell::new(
                 parts
                     .into_iter()
@@ -11468,35 +11522,52 @@ fn bytes_method(
             }
             Value::Bytes(Rc::new(b[start..end].to_vec()))
         }
-        "startswith" => {
-            let pre = bytes_arg(single(args, "startswith")?)?;
-            Value::Bool(b.starts_with(&pre))
-        }
-        "endswith" => {
-            let suf = bytes_arg(single(args, "endswith")?)?;
-            Value::Bool(b.ends_with(&suf))
+        // `startswith(prefix[, start[, end]])`: a bytes-like prefix or a
+        // tuple of them, tested within the slice. Each prefix's type is
+        // checked in order (a match before a bad element still answers
+        // `True`), and before the range can rule the match out.
+        "startswith" | "endswith" => {
+            let arg = single(args, name)?;
+            let range = search_range(args, b.len())?;
+            let matches_one = |needle: &[u8]| match range {
+                Some((s, e)) if name == "startswith" => b[s..e].starts_with(needle),
+                Some((s, e)) => b[s..e].ends_with(needle),
+                None => false,
+            };
+            let result = match arg {
+                Value::Tuple(items) => {
+                    let mut matched = false;
+                    for it in items.iter() {
+                        let needle = bytes_like(it).ok_or_else(|| {
+                            type_error(format!(
+                                "a bytes-like object is required, not '{}'",
+                                it.type_display_name()
+                            ))
+                        })?;
+                        if matches_one(&needle) {
+                            matched = true;
+                            break;
+                        }
+                    }
+                    matched
+                }
+                other => match bytes_like(other) {
+                    Some(needle) => matches_one(&needle),
+                    None => {
+                        return Err(type_error(format!(
+                            "{name} first arg must be bytes or a tuple of bytes, not {}",
+                            other.type_display_name()
+                        )))
+                    }
+                },
+            };
+            Value::Bool(result)
         }
         "find" | "index" if !args.is_empty() => {
             let needle = bytes_arg(&args[0])?;
             // Optional `start` / `end` bound the search like a slice.
-            let len = b.len() as i64;
-            let clamp = |v: Option<&Value>, default: i64| -> Result<usize, Unwind> {
-                let mut i = match v {
-                    None | Some(Value::None) => default,
-                    Some(v) => v.to_int()?,
-                };
-                if i < 0 {
-                    i += len;
-                }
-                Ok(i.clamp(0, len) as usize)
-            };
-            let start = clamp(args.get(1), 0)?;
-            let end = clamp(args.get(2), len)?;
-            let found = if start <= end {
-                find_subslice(&b[start..end], &needle).map(|i| i + start)
-            } else {
-                None
-            };
+            let found = search_range(args, b.len())?
+                .and_then(|(s, e)| find_subslice(&b[s..e], &needle).map(|i| i + s));
             match found {
                 Some(i) => Value::Int(VmInt::from(i as i64)),
                 None if name == "find" => Value::Int(VmInt::from(-1)),
@@ -11506,22 +11577,9 @@ fn bytes_method(
         // `b.count(sub[, start[, end]])` — a bytes-like *subsequence* or a
         // single byte value, counted without overlaps, as in CPython.
         "count" if !args.is_empty() => {
-            let len = b.len() as i64;
-            let clamp = |v: Option<&Value>, default: i64| -> Result<usize, Unwind> {
-                let mut i = match v {
-                    None | Some(Value::None) => default,
-                    Some(v) => v.to_int()?,
-                };
-                if i < 0 {
-                    i += len;
-                }
-                Ok(i.clamp(0, len) as usize)
-            };
-            let start = clamp(args.get(1), 0)?;
-            let end = clamp(args.get(2), len)?;
-            if start > end {
+            let Some((start, end)) = search_range(args, b.len())? else {
                 return Ok(Value::Int(VmInt::from(0)));
-            }
+            };
             let window = &b[start..end];
             let needle = match &args[0] {
                 Value::Int(_) | Value::Bool(_) => {
@@ -11576,14 +11634,17 @@ fn bytes_method(
         "join" => {
             // b",".join([b"a", b"b"]) -> b"a,b"
             let it = single(args, "join")?;
+            let parts: Vec<Value> = match it {
+                Value::List(l) => l.borrow().clone(),
+                Value::Tuple(t) => t.to_vec(),
+                _ => Vec::new(),
+            };
             let mut out: Vec<u8> = Vec::new();
-            if let Value::List(l) = it {
-                for (i, part) in l.borrow().iter().enumerate() {
-                    if i > 0 {
-                        out.extend_from_slice(b);
-                    }
-                    out.extend_from_slice(&bytes_arg(part)?);
+            for (i, part) in parts.iter().enumerate() {
+                if i > 0 {
+                    out.extend_from_slice(b);
                 }
+                out.extend_from_slice(&bytes_arg(part)?);
             }
             Value::Bytes(Rc::new(out))
         }
@@ -11653,16 +11714,25 @@ fn is_attribute_error(u: &Unwind) -> bool {
 
 fn bytes_arg(v: &Value) -> Result<Vec<u8>, Unwind> {
     match v {
-        Value::Bytes(b) => Ok((**b).clone()),
         Value::Int(i) => {
             let n = i.to_u32().and_then(|n| u8::try_from(n).ok());
             n.map(|b| vec![b])
                 .ok_or_else(|| value_error("byte must be in range(0, 256)"))
         }
-        _ => Err(type_error(format!(
-            "a bytes-like object is required, not '{}'",
-            v.type_name()
-        ))),
+        _ => bytes_like(v).ok_or_else(|| {
+            type_error(format!(
+                "a bytes-like object is required, not '{}'",
+                v.type_display_name()
+            ))
+        }),
+    }
+}
+
+/// The bytes of a bytes-like value: `bytes` or a `bytearray` shim instance.
+fn bytes_like(v: &Value) -> Option<Vec<u8>> {
+    match v {
+        Value::Bytes(b) => Some((**b).clone()),
+        _ => bytearray_bytes(v),
     }
 }
 
@@ -11673,14 +11743,89 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-fn split_bytes(hay: &[u8], sep: &[u8]) -> Vec<Vec<u8>> {
+/// `bytes.split` / `bytes.rsplit` with CPython's algorithm: on runs of ASCII
+/// whitespace when `sep` is `None` (the pieces never include an empty one,
+/// but the unsplit remainder keeps its inner and far-end whitespace), else
+/// on the non-empty `sep`; at most `maxsplit` cuts (`< 0` is unlimited),
+/// taken from the right for `rsplit`.
+fn split_bytes(hay: &[u8], sep: Option<&[u8]>, maxsplit: i64, from_right: bool) -> Vec<Vec<u8>> {
+    let mut left = usize::try_from(maxsplit).unwrap_or(usize::MAX);
     let mut out = Vec::new();
-    let mut rest = hay;
-    while let Some(i) = find_subslice(rest, sep) {
-        out.push(rest[..i].to_vec());
-        rest = &rest[i + sep.len()..];
+    match (sep, from_right) {
+        (None, false) => {
+            let mut i = 0;
+            while left > 0 {
+                while i < hay.len() && ascii_is_space(hay[i]) {
+                    i += 1;
+                }
+                if i == hay.len() {
+                    break;
+                }
+                let start = i;
+                while i < hay.len() && !ascii_is_space(hay[i]) {
+                    i += 1;
+                }
+                out.push(hay[start..i].to_vec());
+                left -= 1;
+            }
+            while i < hay.len() && ascii_is_space(hay[i]) {
+                i += 1;
+            }
+            if i < hay.len() {
+                out.push(hay[i..].to_vec());
+            }
+        }
+        (None, true) => {
+            // `i` is the exclusive end of the part not yet split off.
+            let mut i = hay.len();
+            while left > 0 {
+                while i > 0 && ascii_is_space(hay[i - 1]) {
+                    i -= 1;
+                }
+                if i == 0 {
+                    break;
+                }
+                let end = i;
+                while i > 0 && !ascii_is_space(hay[i - 1]) {
+                    i -= 1;
+                }
+                out.push(hay[i..end].to_vec());
+                left -= 1;
+            }
+            while i > 0 && ascii_is_space(hay[i - 1]) {
+                i -= 1;
+            }
+            if i > 0 {
+                out.push(hay[..i].to_vec());
+            }
+            out.reverse();
+        }
+        (Some(sep), false) => {
+            let mut rest = hay;
+            while left > 0 {
+                let Some(i) = find_subslice(rest, sep) else {
+                    break;
+                };
+                out.push(rest[..i].to_vec());
+                rest = &rest[i + sep.len()..];
+                left -= 1;
+            }
+            out.push(rest.to_vec());
+        }
+        (Some(sep), true) => {
+            let mut end = hay.len();
+            while left > 0 {
+                let Some(i) = rfind_subslice(&hay[..end], sep) else {
+                    break;
+                };
+                out.push(hay[i + sep.len()..end].to_vec());
+                end = i;
+                left -= 1;
+            }
+            out.push(hay[..end].to_vec());
+            out.reverse();
+        }
     }
-    out.push(rest.to_vec());
     out
 }
 
@@ -11786,19 +11931,8 @@ fn list_method(
                 .ok_or_else(|| type_error("index expected at least 1 argument, got 0"))?
                 .clone();
             let items = l.borrow().clone();
-            let len = items.len() as i64;
-            let clamp = |raw: i64| -> usize {
-                let v = if raw < 0 { raw + len } else { raw };
-                v.clamp(0, len) as usize
-            };
-            let start = match args.get(1) {
-                Some(v) => clamp(v.to_int()?),
-                None => 0,
-            };
-            let stop = match args.get(2) {
-                Some(v) => clamp(v.to_int()?),
-                None => items.len(),
-            };
+            let start = seq_index_bound(args.get(1), 0, items.len())?;
+            let stop = seq_index_bound(args.get(2), items.len(), items.len())?;
             for (i, v) in items.iter().enumerate().take(stop).skip(start) {
                 if interp.values_equal(v, &target)? {
                     return Ok(Value::Int(VmInt::from(i as i64)));
@@ -12035,16 +12169,25 @@ fn dict_method(
                     }
                 }
                 Some(arg) => {
-                    let it = interp.make_iter(arg.clone())?;
-                    while let Some(pair) = interp.iter_next(&it)? {
-                        if let Value::Tuple(t) = pair {
-                            if t.len() == 2 {
-                                let key = interp.dict_probe_key(d, &t[0])?;
-                                d.borrow_mut().insert(key, t[1].clone());
-                                continue;
-                            }
+                    // A mapping that is not a dict (`os.environ`, a
+                    // `Counter`) is read through `keys()`, as in CPython.
+                    if let Some(pairs) = interp.mapping_protocol_items(arg)? {
+                        for (k, v) in pairs {
+                            let key = interp.dict_probe_key(d, &k)?;
+                            d.borrow_mut().insert(key, v);
                         }
-                        return Err(type_error("dict update needs pairs"));
+                    } else {
+                        let it = interp.make_iter(arg.clone())?;
+                        while let Some(pair) = interp.iter_next(&it)? {
+                            if let Value::Tuple(t) = pair {
+                                if t.len() == 2 {
+                                    let key = interp.dict_probe_key(d, &t[0])?;
+                                    d.borrow_mut().insert(key, t[1].clone());
+                                    continue;
+                                }
+                            }
+                            return Err(type_error("dict update needs pairs"));
+                        }
                     }
                 }
             }
@@ -12390,13 +12533,43 @@ fn tuple_method(t: &Rc<Vec<Value>>, name: &str, args: &[Value]) -> Result<Value,
         }
         "index" => {
             let target = single(args, "index")?;
+            let start = seq_index_bound(args.get(1), 0, t.len())?;
+            let stop = seq_index_bound(args.get(2), t.len(), t.len())?;
             t.iter()
-                .position(|v| v.identical_or_equal(target))
-                .map(|p| Value::Int(VmInt::from(p as i64)))
+                .enumerate()
+                .take(stop)
+                .skip(start)
+                .find(|(_, v)| v.identical_or_equal(target))
+                .map(|(p, _)| Value::Int(VmInt::from(p as i64)))
                 .ok_or_else(|| value_error("tuple.index(x): x not in tuple"))
         }
         _ => Err(attribute_error(format!("tuple has no method '{}'", name))),
     }
+}
+
+/// A `start` / `stop` argument of `list.index` / `tuple.index` over `len`
+/// items, normalised like a slice index. CPython takes only an int here (a
+/// huge one clamps), not even `None`.
+fn seq_index_bound(v: Option<&Value>, default: usize, len: usize) -> Result<usize, Unwind> {
+    let raw = match v {
+        None => return Ok(default),
+        Some(Value::Int(i)) => {
+            i.to_i64()
+                .unwrap_or(if i.is_negative() { i64::MIN } else { i64::MAX })
+        }
+        Some(Value::Bool(b)) => i64::from(*b),
+        Some(_) => {
+            return Err(type_error(
+                "slice indices must be integers or have an __index__ method",
+            ))
+        }
+    };
+    let len = len as i64;
+    Ok(if raw < 0 {
+        raw.saturating_add(len).max(0)
+    } else {
+        raw.min(len)
+    } as usize)
 }
 
 fn num_method(v: &Value, name: &str, args: &[Value]) -> Result<Value, Unwind> {
@@ -14085,17 +14258,81 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
-/// Whether `c` is the cached stand-in class `type(x)` hands back for a
-/// builtin — as opposed to a user class that happens to be named `int`.
-/// A type-keyed registry has to see the stand-in and the constructor native
-/// of the same name as one key.
+/// Whether `c` is the type object `type(x)` hands back for a builtin — the
+/// cached stand-in class, or the shim class the VM models a builtin with
+/// (`bytearray`, `property`, `sentinel`, `defaultdict`, marked
+/// `__typhon_builtin_type__`) — as opposed to a user class that happens to
+/// be named `int`. `is` and a type-keyed registry have to see it and the
+/// constructor native of the same name as one object.
 pub(crate) fn is_builtin_type_class(c: &Rc<crate::value::Class>) -> bool {
+    c.class_attrs
+        .borrow()
+        .contains_key("__typhon_builtin_type__")
+        || BUILTIN_TYPE_CACHE.with(|cache| {
+            cache
+                .borrow()
+                .get(&c.name)
+                .is_some_and(|cached| Rc::ptr_eq(cached, c))
+        })
+}
+
+/// The cached stand-in for a builtin type the VM models only by name: its
+/// instances are natives or `Value` variants, so it has no real bases.
+fn is_builtin_stand_in(c: &Rc<crate::value::Class>) -> bool {
     BUILTIN_TYPE_CACHE.with(|cache| {
         cache
             .borrow()
             .get(&c.name)
             .is_some_and(|cached| Rc::ptr_eq(cached, c))
     })
+}
+
+/// `__mro__` of a builtin type the VM knows only by name: the exception
+/// hierarchy above an exception kind (`KeyError`, `LookupError`,
+/// `Exception`, `BaseException`, `object`), `int` above `bool`.
+pub(crate) fn builtin_stand_in_mro(c: &Rc<crate::value::Class>) -> Option<Vec<Value>> {
+    if !is_builtin_stand_in(c) {
+        return None;
+    }
+    let name = c.name.as_str();
+    let mut names: Vec<&str> = vec![name];
+    if name == "bool" {
+        names.push("int");
+    } else if crate::value::is_exception_type_name(name) {
+        let mut cur = name;
+        while let Some(parent) = crate::interp::builtin_exc_parent(cur) {
+            names.push(parent);
+            cur = parent;
+        }
+        if !matches!(name, "Exception" | "BaseException")
+            && crate::interp::builtin_exc_is_a(name, "Exception")
+        {
+            names.push("Exception");
+        }
+        if name != "BaseException" {
+            names.push("BaseException");
+        }
+    }
+    if name != "object" {
+        names.push("object");
+    }
+    Some(names.into_iter().map(make_builtin_type).collect())
+}
+
+/// The address `id()` and `hash()` report for a builtin type object: the
+/// constructor native bound to its name, so `id(type(1)) == id(int)` agrees
+/// with `type(1) is int`. `None` for anything else.
+pub(crate) fn builtin_type_native_addr(interp: &Interpreter, v: &Value) -> Option<usize> {
+    let Value::Class(c) = v else {
+        return None;
+    };
+    if !is_builtin_type_class(c) {
+        return None;
+    }
+    match interp.root.get(&c.name) {
+        Some(Value::Native(n)) if n.name == c.name => Some(Rc::as_ptr(&n) as usize),
+        _ => None,
+    }
 }
 
 /// `type(v)` / `v.__class__`: a real type object, so `type(x).__name__`,
@@ -14105,11 +14342,44 @@ pub(crate) fn is_builtin_type_class(c: &Rc<crate::value::Class>) -> bool {
 pub(crate) fn type_of(v: &Value) -> Value {
     match v {
         Value::Instance(i) => Value::Class(i.class.clone()),
-        Value::Class(_) => make_builtin_type("type"),
+        Value::Class(c) => make_builtin_type(metaclass_name(c)),
         // `type(some_exception).__name__` should be the concrete kind
         // (e.g. `TypeError`), not the generic `Exception`.
         Value::Exception { kind, .. } => make_builtin_type(kind.as_str()),
+        // `int`, `ValueError`, … are classes, so their type is `type`.
+        Value::Native(n) if crate::value::native_is_type(n.name) => make_builtin_type("type"),
         other => make_builtin_type(other.type_name()),
+    }
+}
+
+/// The metaclass CPython gives a class the VM can tell apart: an enum's is
+/// `EnumType`, a `Protocol`'s `_ProtocolMeta`, a `TypedDict`'s
+/// `_TypedDictMeta` and an `ABC`'s `ABCMeta`, so `type(Color) is type` is
+/// `False` there. Every other class's is `type`.
+fn metaclass_name(c: &Rc<crate::value::Class>) -> &'static str {
+    fn any_base(c: &Rc<crate::value::Class>, marker: &str) -> bool {
+        c.class_attrs.borrow().contains_key(marker) || c.bases.iter().any(|b| any_base(b, marker))
+    }
+    if any_base(c, "__typhon_enum_base__") {
+        "EnumType"
+    } else if crate::interp::class_is_protocol_pub(c) {
+        "_ProtocolMeta"
+    } else if c.class_attrs.borrow().contains_key("__typhon_typed_dict__") {
+        "_TypedDictMeta"
+    } else if c.class_attrs.borrow().contains_key("__typhon_abc__") {
+        "ABCMeta"
+    } else {
+        "type"
+    }
+}
+
+/// The module a metaclass stand-in prints with: `<class 'enum.EnumType'>`.
+fn builtin_type_module(name: &str) -> Option<&'static str> {
+    match name {
+        "EnumType" => Some("enum"),
+        "ABCMeta" => Some("abc"),
+        "_ProtocolMeta" | "_TypedDictMeta" => Some("typing"),
+        _ => None,
     }
 }
 
@@ -14122,11 +14392,18 @@ pub fn make_builtin_type(name: &str) -> Value {
             .borrow_mut()
             .entry(name.to_owned())
             .or_insert_with(|| {
+                let mut class_attrs = HashMap::new();
+                if let Some(module) = builtin_type_module(name) {
+                    class_attrs.insert(
+                        "__typhon_module__".to_owned(),
+                        Value::Str(Rc::new(module.to_owned())),
+                    );
+                }
                 Rc::new(crate::value::Class {
                     name: name.to_owned(),
                     methods: std::cell::RefCell::new(HashMap::new()),
                     fields: vec![],
-                    class_attrs: std::cell::RefCell::new(HashMap::new()),
+                    class_attrs: std::cell::RefCell::new(class_attrs),
                     bases: vec![],
                     mro: vec![],
                     properties: std::cell::RefCell::new(std::collections::HashSet::new()),

@@ -7682,4 +7682,190 @@ assert hasattr(3, "is_integer") and getattr(3, "is_integer")()
 "#;
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
+
+    /// Type objects relate as in CPython 3.13 (values pinned from it). A
+    /// builtin exception's `__class__` is a stand-in with no bases, so
+    /// `issubclass(e.__class__, Exception)` was `False`; every class's type
+    /// was the one `type` stand-in, so `type(Color) is type` was `True` for
+    /// an enum; and `type(x) is T` stayed `False` for the builtins the VM
+    /// models as shim classes (`bytearray`, `property`, `defaultdict`) and
+    /// for `type(int)`.
+    #[test]
+    fn type_objects_relate_through_hierarchies_and_metaclasses() {
+        let src = r#"
+from collections import defaultdict
+from enum import Enum
+from abc import ABC, ABCMeta, abstractmethod
+
+class Color(Enum):
+    RED = 1
+
+plain class Shape(ABC):
+    @abstractmethod
+    def area(self) -> float: ...
+
+plain class Meta(metaclass=ABCMeta):
+    pass
+
+plain class Plain:
+    @property
+    def p(self) -> int:
+        return 1
+
+def is_error(e: object) -> bool:
+    return issubclass(e.__class__, Exception)
+
+def local_bytearray() -> object:
+    plain class bytearray:
+        pass
+    return bytearray()
+
+try:
+    let d: dict[str, int] = {}
+    print(d["missing"])
+except KeyError as err:
+    assert is_error(err) and issubclass(err.__class__, LookupError)
+    assert issubclass(type(err), BaseException) and issubclass(type(err), (ValueError, Exception))
+    assert not issubclass(type(err), ValueError)
+    assert [c.__name__ for c in type(err).__mro__] == ["KeyError", "LookupError", "Exception", "BaseException", "object"]
+assert is_error(ValueError("x")) and not is_error(3) and issubclass(type(True), int)
+assert not issubclass(type(KeyboardInterrupt()), Exception)
+# `int` is no exception: the `BaseException` shortcut used to say it was.
+assert not issubclass(int, Exception) and not issubclass(type(1), BaseException)
+
+assert type(Color) is not type and type(Shape) is not type and type(Meta) is not type
+assert type(Plain) is type and type(Color) != type
+assert type(Color).__name__ == "EnumType" and type(Shape).__name__ == "ABCMeta"
+assert repr(type(Color)) == "<class 'enum.EnumType'>" and type(type(Color)) is type
+assert isinstance(Color, type) and isinstance(int, type) and not isinstance(len, type)
+
+let ba = bytearray(b"x")
+assert type(ba) is bytearray and ba.__class__ is bytearray and type(ba) == bytearray
+assert type(Plain.p) is property and type(property(lambda s: 1)) is property
+let dd = defaultdict(int)
+assert type(dd) is defaultdict and type(dd).__name__ == "defaultdict" and dd.default_factory is int
+assert type(int) is type and int.__class__ is type and type(ValueError) is type and type(len) is not type
+assert type(int).__name__ == "type"
+assert IOError is OSError and EnvironmentError is OSError and type(IOError("x")) is OSError
+try:
+    raise IOError("disk")
+except OSError as e:
+    assert str(e) == "disk"
+# `is`, `id()`, `hash()` and dict keys agree.
+assert id(type(1)) == id(int) and id(type(ba)) == id(bytearray) and hash(type(1)) == hash(int)
+let reg = {int: "i", bytearray: "b"}
+assert reg[type(1)] == "i" and reg[type(ba)] == "b" and list(reg)[0] is int
+assert repr({str: 1}) == "{<class 'str'>: 1}"
+# A user class that merely shares a builtin's name is still not that type.
+let o = local_bytearray()
+assert type(o) is not bytearray and type(o).__name__ == "bytearray"
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// The optional arguments the arity table admits are read (values
+    /// pinned from CPython 3.13). The bytes and tuple handlers took only the
+    /// first argument, so `b.split(b" ", 1)` split at every space and
+    /// `t.index(x, 2)` searched from 0.
+    #[test]
+    fn bytes_and_tuple_methods_read_their_optional_args() {
+        let src = r#"
+from collections.abc import Callable
+
+def err(thunk: Callable[[], object]) -> str:
+    try:
+        thunk()
+    except Exception as e:
+        return type(e).__name__ + ": " + str(e)
+    return "no error"
+
+let b: bytes = b"a b c a"
+let tp: tuple[int, ...] = (1, 2, 3, 2)
+assert b.split(b" ", 1) == [b"a", b"b c a"] and b.split(maxsplit=1) == [b"a", b"b c a"]
+assert b.rsplit(b" ", 1) == [b"a b c", b"a"] and b.rsplit(maxsplit=1) == [b"a b c", b"a"]
+assert b"  a  b c  ".split(None, 1) == [b"a", b"b c  "]
+assert b"  a  b c  ".rsplit(None, 1) == [b"  a  b", b"c"]
+assert b"  a  b c  ".split(None, 0) == [b"a  b c  "] and b"   ".split(None, 1) == []
+assert b"a::b::c".split(b"::", 1) == [b"a", b"b::c"] and b"a::b::c".rsplit(b"::", 1) == [b"a::b", b"c"]
+assert b.split(b" ", 0) == [b"a b c a"] and b.split() == [b"a", b"b", b"c", b"a"]
+assert bytearray(b"a b c").split(None, 1) == [bytearray(b"a"), bytearray(b"b c")]
+assert b.rfind(b"a", 0, 3) == 0 and b.rfind(b"a", -3, -1) == -1 and b"xa ya za".rindex(b"a", 0, 4) == 1
+assert b.rfind(b"", 2, 4) == 4 and b.find(b"", 9) == -1 and b.count(b"", 9) == 0
+assert b.startswith(b"b", 2) and not b.startswith(b"b", 2, 2) and not b.startswith(b"", 8)
+assert b"xa ya".startswith((b"q", b"xa")) and b"xa ya".startswith((b"q", b"ya"), 3)
+assert b"xa ya za".endswith(b"xa", 0, 2) and b"xa ya za".endswith((b"q", b"za"))
+assert b.startswith(bytearray(b"a ")) and b",".join((b"a", b"b")) == b"a,b"
+assert tp.index(2, 2) == 3 and tp.index(2, 2, 4) == 3 and tp.index(2, -1) == 3
+assert tp.index(2, 0, 10 ** 30) == 1 and [1, 2, 3, 2].index(2, 2, 4) == 3
+assert err(lambda: (5, 6, 5, 6).index(5, 1, 2)) == "ValueError: tuple.index(x): x not in tuple"
+assert err(lambda: b"xa ya za".rindex(b"a", 2, 4)) == "ValueError: subsection not found"
+assert err(lambda: tp.index(2, None)) == "TypeError: slice indices must be integers or have an __index__ method"
+assert err(lambda: b.split(b" ", 1.0)) == "TypeError: 'float' object cannot be interpreted as an integer"
+assert err(lambda: b.startswith("a")) == "TypeError: startswith first arg must be bytes or a tuple of bytes, not str"
+assert err(lambda: b.startswith(("a",))) == "TypeError: a bytes-like object is required, not 'str'"
+assert b"xa".startswith((b"x", "s"))
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    /// `get(k, default=v)` follows the receiver (pinned from CPython 3.13 /
+    /// 3.15): `os.environ` is a `Mapping`, whose `get` takes the keyword —
+    /// the VM's plain dict refused it — while the dict subclasses inherit
+    /// the C `dict.get`, which refuses it, and the VM's shims accepted it.
+    /// `frozendict`'s read-only methods check their arity like `dict`'s.
+    #[test]
+    fn mapping_get_keywords_follow_the_receiver() {
+        let src = r#"
+import os
+from collections import Counter, OrderedDict, defaultdict, ChainMap, UserDict
+from collections.abc import Callable
+
+def err(thunk: Callable[[], object]) -> str:
+    try:
+        thunk()
+    except Exception as e:
+        return type(e).__name__ + ": " + str(e)
+    return "no error"
+
+def home() -> str:
+    return os.environ.get("TYC_ENV_PROBE_NOPE", default="/root")
+
+assert home() == "/root" and os.getenv("TYC_ENV_PROBE_NOPE", default="g") == "g"
+os.environ["TYC_ENV_PROBE"] = "1"
+assert os.environ.get("TYC_ENV_PROBE", default="d") == "1"
+assert os.environ.pop("TYC_ENV_PROBE_NOPE", default="p") == "p"
+assert type(os.environ).__name__ == "_Environ" and not isinstance(os.environ, dict)
+assert type(os.environ.copy()) is dict and {**os.environ}["TYC_ENV_PROBE"] == "1"
+assert dict(os.environ)["TYC_ENV_PROBE"] == "1" and "TYC_ENV_PROBE" in os.environ
+let merged: dict[str, str] = {}
+merged.update(os.environ)
+assert merged["TYC_ENV_PROBE"] == "1" and "{TYC_ENV_PROBE}".format_map(os.environ) == "1"
+assert err(lambda: os.environ.__setitem__("K", 1)) == "TypeError: str expected, not int"
+assert err(lambda: 1 in os.environ) == "TypeError: str expected, not int"
+assert err(lambda: os.environ["TYC_ENV_PROBE_NOPE"]) == "KeyError: 'TYC_ENV_PROBE_NOPE'"
+del os.environ["TYC_ENV_PROBE"]
+assert os.environ.get("TYC_ENV_PROBE") is None
+
+for m in [Counter("ab"), OrderedDict(a=1), defaultdict(int, {"a": 1})]:
+    assert err(lambda: m.get("z", default=0)) == "TypeError: dict.get() takes no keyword arguments"
+    assert err(lambda: m.get("z", 0, 1)) == "TypeError: get expected at most 2 arguments, got 3"
+    assert err(lambda: m.get()) == "TypeError: get expected at least 1 argument, got 0"
+    assert m.get("a") == 1 and m.get("z", 7) == 7 and m.get("z") is None
+# ChainMap and UserDict define a Python `get`, which takes the keyword.
+assert ChainMap({"a": 1}).get("z", default=0) == 0 and UserDict(a=1).get("z", default=0) == 0
+
+let fd = frozendict({"a": 1})
+assert err(lambda: fd.get("z", 0, 1)) == "TypeError: get expected at most 2 arguments, got 3"
+assert err(lambda: fd.get()) == "TypeError: get expected at least 1 argument, got 0"
+assert err(lambda: fd.keys(1)) == "TypeError: frozendict.keys() takes no arguments (1 given)"
+assert err(lambda: fd.items(1)) == "TypeError: frozendict.items() takes no arguments (1 given)"
+assert err(lambda: fd.values(1)) == "TypeError: frozendict.values() takes no arguments (1 given)"
+assert err(lambda: fd.copy(1)) == "TypeError: frozendict.copy() takes no arguments (1 given)"
+assert fd.get("a") == 1 and fd.get("z", 5) == 5 and fd.copy() == fd
+let s = sentinel("S")
+assert type(s) is sentinel and s.__class__ is sentinel and type(sentinel) is type
+assert repr(frozendict) == "<class 'frozendict'>" and type(fd) is frozendict
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
 }

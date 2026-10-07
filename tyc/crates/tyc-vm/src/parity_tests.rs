@@ -51,18 +51,52 @@ fn to_python(probe: &str) -> String {
     probe.replace("plain class ", "class ").replace("mut ", "")
 }
 
-fn python_missing(test: &str) {
-    if std::env::var_os("TYC_REQUIRE_PYTHON").is_some() {
-        panic!("python3.13 is required as the oracle (TYC_REQUIRE_PYTHON is set)");
+/// The CPython a probe is compared against: python3.13, or python3.15 for
+/// the 3.15 builtins (`frozendict`, `sentinel`). Each has its own
+/// "required" switch, as in the CLI tests.
+#[derive(Clone, Copy)]
+enum Oracle {
+    Py313,
+    Py315,
+}
+
+impl Oracle {
+    fn exe(self) -> &'static str {
+        match self {
+            Oracle::Py313 => "python3.13",
+            Oracle::Py315 => "python3.15",
+        }
     }
-    eprintln!("skipping {test}: no python3.13 on PATH");
+
+    fn required_var(self) -> &'static str {
+        match self {
+            Oracle::Py313 => "TYC_REQUIRE_PYTHON",
+            Oracle::Py315 => "TYC_REQUIRE_PYTHON315",
+        }
+    }
+}
+
+fn python_missing(test: &str) {
+    python_missing_for(test, Oracle::Py313);
+}
+
+fn python_missing_for(test: &str, oracle: Oracle) {
+    let (exe, var) = (oracle.exe(), oracle.required_var());
+    if std::env::var_os(var).is_some() {
+        panic!("{exe} is required as the oracle ({var} is set)");
+    }
+    eprintln!("skipping {test}: no {exe} on PATH");
 }
 
 /// Run `py` under python3.13 in `dir`; `(stdout, stderr, exit code)`.
 fn run_python(dir: &Path, py: &str) -> Option<(String, String, i32)> {
+    run_python_as(Oracle::Py313, dir, py)
+}
+
+fn run_python_as(oracle: Oracle, dir: &Path, py: &str) -> Option<(String, String, i32)> {
     let script = dir.join("probe.py");
     std::fs::write(&script, py).ok()?;
-    let out = std::process::Command::new("python3.13")
+    let out = std::process::Command::new(oracle.exe())
         .arg("-X")
         .arg("no_debug_ranges")
         .arg(&script)
@@ -88,6 +122,17 @@ pub(crate) fn assert_matches_cpython(test: &str, probe: &str) {
 /// [`assert_matches_cpython`] with `py_header` run first on the CPython side
 /// only — the generated runtime a compiled program would import.
 fn assert_matches_cpython_with(test: &str, probe: &str, py_header: &str) {
+    assert_matches_oracle(test, probe, py_header, Oracle::Py313);
+}
+
+/// [`assert_matches_cpython`] against python3.15, for the builtins only it
+/// has (`frozendict`, `sentinel`; the VM models them on every target).
+fn assert_matches_python315(test: &str, probe: &str) {
+    assert_matches_oracle(test, probe, "", Oracle::Py315);
+}
+
+fn assert_matches_oracle(test: &str, probe: &str, py_header: &str, oracle: Oracle) {
+    let exe = oracle.exe();
     let dir = tempfile::tempdir().unwrap();
     let dump = dir.path().join("transcript.txt");
     let tail = format!(
@@ -96,13 +141,10 @@ fn assert_matches_cpython_with(test: &str, probe: &str, py_header: &str) {
     );
     let body = format!("{PRELUDE}{probe}{tail}");
     let python = format!("{py_header}{}", to_python(&body));
-    let Some((_, py_err, code)) = run_python(dir.path(), &python) else {
-        return python_missing(test);
+    let Some((_, py_err, code)) = run_python_as(oracle, dir.path(), &python) else {
+        return python_missing_for(test, oracle);
     };
-    assert_eq!(
-        code, 0,
-        "{test}: the probe fails under python3.13:\n{py_err}"
-    );
+    assert_eq!(code, 0, "{test}: the probe fails under {exe}:\n{py_err}");
     let expected = std::fs::read_to_string(&dump).unwrap();
     std::fs::remove_file(&dump).unwrap();
     let vm = on_worker(|| crate::run_source(&body, None, &[]));
@@ -117,7 +159,7 @@ fn assert_matches_cpython_with(test: &str, probe: &str, py_header: &str) {
             .map(|(g, e)| format!("  vm:  {g}\n  cpy: {e}"))
             .collect();
         panic!(
-            "{test}: VM transcript differs from python3.13 ({} vs {} lines)\n{}",
+            "{test}: VM transcript differs from {exe} ({} vs {} lines)\n{}",
             got.lines().count(),
             expected.lines().count(),
             diff.join("\n")
@@ -1566,4 +1608,290 @@ trap("arg", lambda: (3).is_integer(1))
 trap("hasattr", lambda: hasattr(3, "is_integer"))
 "#,
     );
+}
+
+// ── 2026-10-07 review round 2: VM ↔ CPython parity ────────────────────────
+
+#[test]
+fn rc2_type_objects_relate_like_cpython() {
+    // `issubclass(e.__class__, Exception)` went False once `__class__` gave
+    // the concrete kind's stand-in (it has no bases); `type(Color) is type`
+    // went True for an enum / ABC class; and `type(x) is T` stayed False for
+    // the builtins the VM models as shim classes, and for `type(int)`.
+    assert_matches_cpython(
+        "rc2_type_objects_relate_like_cpython",
+        r#"from collections import defaultdict, Counter, OrderedDict
+from enum import Enum, IntEnum
+from abc import ABC, ABCMeta, abstractmethod
+from typing import Protocol
+def is_error(e):
+    return issubclass(e.__class__, Exception)
+try:
+    d = {}
+    d["missing"]
+except KeyError as err:
+    show(is_error(err), issubclass(err.__class__, LookupError), issubclass(type(err), BaseException))
+    show(issubclass(type(err), (ValueError, Exception)), issubclass(type(err), KeyError), issubclass(type(err), ValueError))
+    show([c.__name__ for c in type(err).__mro__], type(err).__mro__[1] is LookupError)
+show(is_error(ValueError("x")), is_error(3), issubclass(type(True), int), issubclass(type(1), object))
+show(issubclass(type(ZeroDivisionError()), ArithmeticError), issubclass(type(FileNotFoundError()), OSError))
+show(issubclass(type(KeyboardInterrupt()), Exception), issubclass(type(KeyboardInterrupt()), BaseException))
+show(issubclass(int, Exception), issubclass(type(1), BaseException), issubclass(str, ValueError), issubclass(bool, int))
+show([c.__name__ for c in type(True).__mro__], [c.__name__ for c in type(StopIteration()).__mro__])
+class Color(Enum):
+    RED = 1
+class N(IntEnum):
+    A = 1
+plain class Shape(ABC):
+    @abstractmethod
+    def area(self): ...
+plain class M(metaclass=ABCMeta):
+    pass
+plain class Sub(Shape):
+    def area(self):
+        return 1.0
+plain class Proto(Protocol):
+    def run(self) -> None: ...
+plain class Plain:
+    @property
+    def p(self):
+        return 1
+show(type(Color) is type, type(N) is type, type(Shape) is type, type(M) is type, type(Sub) is type, type(Proto) is type, type(Plain) is type)
+show(type(Color) == type, type(Shape) == type, type(Plain) == type, type(Color) is not type)
+show(type(Color).__name__, type(N).__name__, type(Shape).__name__, type(M).__name__, type(Proto).__name__, type(Plain).__name__)
+show(repr(type(Color)), repr(type(Shape)), type(type(Color)) is type)
+show(isinstance(Color, type), isinstance(Plain, type), isinstance(int, type), isinstance(len, type), isinstance(Color, type(Color)))
+ba = bytearray(b"x")
+show(type(1) is int, type({}) is dict, type(ba) is bytearray, type(ba) == bytearray, ba.__class__ is bytearray)
+show(type(Plain.p) is property, type(Plain.p) == property, type(property(lambda s: 1)) is property)
+dd = defaultdict(int)
+show(type(dd) is defaultdict, type(dd) == defaultdict, type(dd).__name__, dd.default_factory is int)
+show(type(int) is type, type(str) is type, type(int) == type, int.__class__ is type, type(int).__name__, type(ValueError) is type, type(len) is type)
+show(type(IOError("x")) is OSError, IOError is OSError, EnvironmentError is OSError, type(IOError("x")).__name__)
+try:
+    raise IOError("disk")
+except OSError as e:
+    show("caught", type(e).__name__, e)
+show(id(type(1)) == id(int), id(type(ba)) == id(bytearray), hash(type(1)) == hash(int))
+reg = {int: "i", bytearray: "b", str: "s"}
+show(reg.get(type(1)), reg.get(type(ba)), list(reg)[0] is int, repr(reg))
+show(type(Counter()) is Counter, type(OrderedDict()) is OrderedDict)
+def local_bytearray():
+    plain class bytearray:
+        pass
+    return bytearray()
+o = local_bytearray()
+show(type(o) is bytearray, type(o).__name__)
+"#,
+    );
+}
+
+#[test]
+fn rc2_builtin_method_optional_args_are_read() {
+    // The arity table admitted `start` / `stop` / `maxsplit` and tuple
+    // prefixes, but the bytes and tuple handlers read only the first
+    // argument: `b.split(b" ", 1)` split everywhere, `t.index(x, 2)` started
+    // from 0.
+    assert_matches_cpython(
+        "rc2_builtin_method_optional_args_are_read",
+        r#"b = b"a b c a"
+tp = (1, 2, 3, 2)
+xs = [1, 2, 3, 2]
+trap("t.index2", lambda: tp.index(2, 2))
+trap("t.index3", lambda: tp.index(2, 2, 4))
+trap("t.index3miss", lambda: (5, 6, 5, 6).index(5, 1, 2))
+trap("t.indexneg", lambda: tp.index(2, -1))
+trap("t.indexneg2", lambda: tp.index(2, -3, -1))
+trap("t.indexbig", lambda: tp.index(2, 0, 10 ** 30))
+trap("t.indexhuge", lambda: tp.index(2, 10 ** 30))
+trap("t.indexbool", lambda: tp.index(2, True))
+trap("t.indexfloat", lambda: tp.index(2, 1.5))
+trap("t.indexnone", lambda: tp.index(2, None))
+trap("l.index3", lambda: xs.index(2, 2, 4))
+trap("l.index3miss", lambda: [5, 6, 5, 6].index(5, 1, 2))
+trap("l.indexnone", lambda: xs.index(2, None))
+trap("b.split1", lambda: b.split(b" ", 1))
+trap("b.splitkw", lambda: b.split(maxsplit=1))
+trap("b.splitkw2", lambda: b.split(b" ", maxsplit=2))
+trap("b.splitnone1", lambda: b.split(None, 1))
+trap("b.split0", lambda: b.split(b" ", 0))
+trap("b.splitneg", lambda: b.split(b" ", -1))
+trap("b.rsplit1", lambda: b.rsplit(b" ", 1))
+trap("b.rsplitkw", lambda: b.rsplit(maxsplit=1))
+trap("b.rsplitnone2", lambda: b"  a  b c  ".rsplit(None, 2))
+trap("b.splitws1", lambda: b"  a  b c  ".split(None, 1))
+trap("b.splitws0", lambda: b"  a  b c  ".split(None, 0))
+trap("b.rsplitws0", lambda: b"  a  b c  ".rsplit(None, 0))
+trap("b.splitwsall", lambda: b"   ".split(None, 1))
+trap("b.splitempty", lambda: b"".split())
+trap("b.rsplitmulti", lambda: b"a::b::c".rsplit(b"::", 1))
+trap("b.splitmulti", lambda: b"a::b::c".split(b"::", 1))
+trap("b.splitfloat", lambda: b.split(b" ", 1.0))
+trap("b.splitbool", lambda: b.split(b" ", True))
+trap("b.splitbytearray", lambda: b.split(bytearray(b" "), 1))
+trap("ba.split", lambda: bytearray(b"a b c").split(None, 1))
+trap("b.rfind3", lambda: b.rfind(b"a", 0, 3))
+trap("b.rfind2", lambda: b.rfind(b"a", 1))
+trap("b.rfindneg", lambda: b.rfind(b"a", -3, -1))
+trap("b.rindex3", lambda: b"xa ya za".rindex(b"a", 0, 4))
+trap("b.rindexmiss", lambda: b"xa ya za".rindex(b"a", 2, 4))
+trap("b.rfindint", lambda: b.rfind(97, 0, 3))
+trap("b.rfindempty", lambda: b.rfind(b"", 2, 4))
+trap("b.rfindempty2", lambda: b.rfind(b"", 5, 2))
+trap("b.rfindnone", lambda: b.rfind(b"a", None, 3))
+trap("b.find3", lambda: b.find(b"a", 1, 7))
+trap("b.findempty", lambda: b.find(b"", 9))
+trap("b.countempty", lambda: b.count(b"", 9))
+trap("b.count3", lambda: b.count(b"a", 1))
+trap("b.sw2", lambda: b.startswith(b"b", 2))
+trap("b.sw3", lambda: b.startswith(b"b", 2, 2))
+trap("b.sw3b", lambda: b.startswith(b"b", 2, 3))
+trap("b.swtuple", lambda: b"xa ya".startswith((b"q", b"xa")))
+trap("b.swtuplemiss", lambda: b"xa ya".startswith((b"q", b"z")))
+trap("b.swtuple2", lambda: b"xa ya".startswith((b"q", b"ya"), 3))
+trap("b.swlazy", lambda: b"xa".startswith((b"x", "s")))
+trap("b.swlazybad", lambda: b"xa".startswith(("s", b"x")))
+trap("b.swbadrange", lambda: b"xa".startswith((b"q", "s"), 9))
+trap("b.swneg", lambda: b.startswith(b"a", -1))
+trap("b.swempty", lambda: b.startswith(b"", 7))
+trap("b.swempty2", lambda: b.startswith(b"", 8))
+trap("b.swbad", lambda: b.startswith("a"))
+trap("b.swint", lambda: b.startswith(97))
+trap("b.swbytearray", lambda: b.startswith(bytearray(b"a ")))
+trap("b.ew3", lambda: b"xa ya za".endswith(b"xa", 0, 2))
+trap("b.ew2", lambda: b"xa ya za".endswith(b"za", 3))
+trap("b.ewtuple", lambda: b"xa ya za".endswith((b"q", b"za")))
+trap("b.ewneg", lambda: b"xa ya za".endswith(b"ya", -5, -3))
+trap("b.ewempty", lambda: b.endswith(b"", 3, 2))
+trap("b.ewnone", lambda: b.endswith(b"a", None, None))
+trap("b.join_tuple", lambda: b",".join((b"a", b"b")))
+trap("b.join_bytearray", lambda: b",".join([b"a", bytearray(b"b")]))
+"#,
+    );
+}
+
+#[test]
+fn rc2_mapping_get_keywords_match_cpython() {
+    // `os.environ` is a `Mapping` (`os._Environ`), so `get` / `pop` take
+    // `default=`; the VM's plain dict refused it. The dict subclasses
+    // (`Counter`, `OrderedDict`, `defaultdict`) inherit the C `dict.get`,
+    // which refuses it — the VM's Python shims accepted it.
+    assert_matches_cpython(
+        "rc2_mapping_get_keywords_match_cpython",
+        r#"import os
+from collections import Counter, OrderedDict, defaultdict, ChainMap, UserDict
+env = os.environ
+env["TYC_PROBE_A"] = "1"
+trap("get kw", lambda: env.get("TYC_PROBE_NOPE", default="d"))
+trap("get kw hit", lambda: env.get("TYC_PROBE_A", default="d"))
+trap("get pos", lambda: env.get("TYC_PROBE_NOPE", "p"))
+trap("get1", lambda: env.get("TYC_PROBE_NOPE"))
+trap("get key=", lambda: env.get(key="TYC_PROBE_A"))
+trap("get int", lambda: env.get(1))
+trap("pop kw", lambda: env.pop("TYC_PROBE_NOPE", default="d"))
+trap("pop miss", lambda: env.pop("TYC_PROBE_NOPE"))
+trap("setdefault", lambda: env.setdefault("TYC_PROBE_B", "2"))
+trap("in", lambda: "TYC_PROBE_A" in env)
+trap("in int", lambda: 1 in env)
+trap("getitem miss", lambda: env["TYC_PROBE_NOPE"])
+trap("setitem int", lambda: env.__setitem__("TYC_PROBE_C", 3))
+trap("type", lambda: type(env).__name__)
+trap("isinstance dict", lambda: isinstance(env, dict))
+trap("copy type", lambda: type(env.copy()).__name__)
+trap("copy eq", lambda: (env.copy() == env, env == env.copy(), env != {}))
+trap("dict()", lambda: dict(env)["TYC_PROBE_A"])
+trap("star", lambda: {**env}["TYC_PROBE_A"])
+trap("or", lambda: (env | {"X_Y_Z": "1"})["X_Y_Z"])
+trap("or types", lambda: (type(env | {}).__name__, type({} | env).__name__))
+trap("len", lambda: len(env) == len(dict(env)))
+trap("iter", lambda: "TYC_PROBE_A" in list(env))
+trap("items", lambda: ("TYC_PROBE_A", "1") in env.items())
+trap("format_map", lambda: "{TYC_PROBE_A}".format_map(env))
+def kwf(**kw):
+    return kw["TYC_PROBE_A"]
+trap("call star", lambda: kwf(**env))
+trap("dict update", lambda: (lambda d: (d.update(env), d["TYC_PROBE_A"])[1])({}))
+del env["TYC_PROBE_A"]
+trap("del", lambda: env.get("TYC_PROBE_A"))
+trap("del miss", lambda: env.__delitem__("TYC_PROBE_A"))
+env.update({"TYC_PROBE_D": "4"}, TYC_PROBE_E="5")
+trap("update", lambda: (env["TYC_PROBE_D"], env["TYC_PROBE_E"]))
+trap("getenv kw", lambda: os.getenv("TYC_PROBE_NOPE", default="g"))
+trap("hash", lambda: hash(env))
+trap("repr", lambda: repr(env).startswith("environ({"))
+for name, m in [("Counter", Counter("ab")), ("OrderedDict", OrderedDict(a=1)), ("defaultdict", defaultdict(int, {"a": 1}))]:
+    trap(name + " get kw", lambda: m.get("z", default=0))
+    trap(name + " get key=", lambda: m.get(key="a"))
+    trap(name + " get3", lambda: m.get("z", 0, 1))
+    trap(name + " get0", lambda: m.get())
+    trap(name + " get", lambda: (m.get("a"), m.get("z", 7), m.get("z")))
+trap("star counter", lambda: {**Counter("aab")})
+trap("update counter", lambda: (lambda d: (d.update(Counter("ab")), d)[1])({}))
+for name, m in [("ChainMap", ChainMap({"a": 1})), ("UserDict", UserDict(a=1))]:
+    trap(name + " get kw", lambda: m.get("z", default=0))
+    trap(name + " get key=", lambda: m.get(key="a"))
+"#,
+    );
+}
+
+#[test]
+fn rc2_python315_builtins_match_cpython() {
+    // `frozendict` was missing from the arity table, so `fd.get(k, a, b)`
+    // and `fd.keys(1)` dropped the surplus argument; `type(s) is sentinel`
+    // was False because `sentinel` is a shim class in the VM.
+    assert_matches_python315(
+        "rc2_python315_builtins_match_cpython",
+        r#"fd = frozendict({"a": 1})
+show(type(fd) is frozendict, type(fd) == frozendict, fd.__class__ is frozendict, type(fd).__name__)
+trap("fd.get3", lambda: fd.get("z", 0, 1))
+trap("fd.get0", lambda: fd.get())
+trap("fd.getkw", lambda: fd.get("z", default=0))
+trap("fd.keys1", lambda: fd.keys(1))
+trap("fd.items1", lambda: fd.items(1))
+trap("fd.values1", lambda: fd.values(1))
+trap("fd.copy1", lambda: fd.copy(1))
+trap("fd.ok", lambda: (fd.get("a"), fd.get("z", 5), list(fd.keys()), fd.copy()))
+trap("fd.fromkeys0", lambda: fd.fromkeys())
+M = sentinel("M")
+show(type(M) is sentinel, type(M) == sentinel, isinstance(M, sentinel), M.__class__ is sentinel, type(M).__name__)
+show(repr(sentinel), repr(frozendict), type(sentinel) is type, type(frozendict) is type)
+show(id(type(fd)) == id(frozendict), {frozendict: 1}.get(type(fd)), {sentinel: 2}.get(type(M)))
+"#,
+    );
+}
+
+#[test]
+fn rc2_freeze_let_frozendict_checks_arity() {
+    // Under `[emit] freeze-dict = "frozendict"` a `freeze let` dict is a
+    // `frozendict`, whose read-only methods were not arity-checked (the
+    // default `mappingproxy` lowering was).
+    let src = r#"from collections.abc import Callable
+freeze let CFG: dict[str, int] = {"a": 1}
+def err(thunk: Callable[[], object]) -> str:
+    try:
+        thunk()
+    except TypeError as e:
+        return str(e)
+    return "no error"
+assert err(lambda: CFG.get("a", 1, 2)) == "get expected at most 2 arguments, got 3"
+assert err(lambda: CFG.get("a", default=0)) == TYPE + ".get() takes no keyword arguments"
+assert err(lambda: CFG.keys(1)) == TYPE + ".keys() takes no arguments (1 given)"
+assert err(lambda: CFG.copy(1)) == TYPE + ".copy() takes no arguments (1 given)"
+assert CFG.get("a") == 1 and CFG.get("z", 2) == 2 and type(CFG).__name__ == TYPE
+"#;
+    for (frozendict, ty) in [(true, "frozendict"), (false, "mappingproxy")] {
+        let program = format!("TYPE = {ty:?}\n{src}");
+        let code = on_worker(|| {
+            run_source_reporting(
+                &program,
+                None,
+                &[],
+                crate::VmOptions {
+                    freeze_to_frozendict: frozendict,
+                },
+                &mut |tb| panic!("{ty}: {tb}"),
+            )
+        });
+        assert_eq!(code.unwrap(), 0, "{ty}");
+    }
 }
