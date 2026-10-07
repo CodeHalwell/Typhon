@@ -975,6 +975,38 @@ fn build_external_shapes(
     let canon = |info: &tyc_resolve::ImportInfo| -> String {
         canonical_import_module(info, own_key.as_deref(), is_init)
     };
+    // Module-scope bindings live in scope 0.
+    let bindings = &resolved.scopes[0].bindings;
+    // A type an imported module declares under a name this module binds to
+    // something else — a class of its own, or another module's import —
+    // still means that module's type in its signatures. Those name it
+    // qualified (`geometry.Point`) in this module's copy of the registry,
+    // and its facts are seeded under that name, so neither side of the
+    // collision takes the other's frozen-ness, newtype base, alias or union.
+    let collisions = colliding_type_names(bindings, shapes_by_module, &canon);
+    let qualified_registry;
+    let shapes_by_module = if collisions.is_empty() {
+        shapes_by_module
+    } else {
+        let mut registry = (**shapes_by_module).clone();
+        for (module, names) in &collisions {
+            if let Some(shapes) = registry.get_mut(module) {
+                *shapes = shapes.qualified(module, names);
+            }
+        }
+        qualified_registry = std::sync::Arc::new(registry);
+        &qualified_registry
+    };
+    let fact_key = |module: &str, name: &str| -> String {
+        if collisions
+            .get(module)
+            .is_some_and(|names| names.contains(name))
+        {
+            format!("{module}.{name}")
+        } else {
+            name.to_owned()
+        }
+    };
     // Just bump the refcount — the caller (`tyc check` / `tyc
     // build` / the LSP) constructs the registry once per
     // invocation and the per-file `ExternalShapes` snapshots
@@ -983,8 +1015,6 @@ fn build_external_shapes(
         by_module: std::sync::Arc::clone(shapes_by_module),
         ..ExternalShapes::default()
     };
-    // Module-scope bindings live in scope 0.
-    let bindings = &resolved.scopes[0].bindings;
     // Per-source-module reverse map: original exported name → local
     // import name, so a `from foo import A as MyA` translates the
     // variants list of an imported sealed union into the same local
@@ -1128,11 +1158,13 @@ fn build_external_shapes(
         let Some(module_shapes) = shapes_by_module.get(&canon(info)) else {
             continue;
         };
-        let remap = local_by_module.get(&canon(info));
+        let module = canon(info);
+        let remap = local_by_module.get(&module);
         for (union_name, variants) in &module_shapes.sealed_unions {
+            let key = fact_key(&module, union_name);
             // Skip if already populated (handled above when the union
             // name itself was imported).
-            if external.sealed_unions.contains_key(union_name) {
+            if external.sealed_unions.contains_key(&key) {
                 continue;
             }
             // Only seed when at least one variant is imported here —
@@ -1153,7 +1185,7 @@ fn build_external_shapes(
                         .unwrap_or_else(|| v.clone())
                 })
                 .collect();
-            external.sealed_unions.insert(union_name.clone(), mapped);
+            external.sealed_unions.insert(key, mapped);
         }
         // Same shape of problem for newtypes: an imported class can
         // expose a field / parameter / return typed as a newtype whose
@@ -1168,7 +1200,7 @@ fn build_external_shapes(
         for (newtype_name, base) in &module_shapes.newtypes {
             external
                 .newtypes
-                .entry(newtype_name.clone())
+                .entry(fact_key(&module, newtype_name))
                 .or_insert_with(|| base.clone());
         }
         // Same reasoning for transparent type aliases, enums, and frozen
@@ -1180,17 +1212,19 @@ fn build_external_shapes(
         for (alias_name, alias) in &module_shapes.type_aliases {
             external
                 .type_aliases
-                .entry(alias_name.clone())
+                .entry(fact_key(&module, alias_name))
                 .or_insert_with(|| alias.clone());
         }
         for (enum_name, members) in &module_shapes.enums {
             external
                 .enums
-                .entry(enum_name.clone())
+                .entry(fact_key(&module, enum_name))
                 .or_insert_with(|| members.clone());
         }
         for frozen_name in &module_shapes.frozen_classes {
-            external.frozen_classes.insert(frozen_name.clone());
+            external
+                .frozen_classes
+                .insert(fact_key(&module, frozen_name));
         }
         // C1 cross-module: an imported class's higher-kinded constructor
         // variables (`F` in `class Functor[F[_]]`) are bare
@@ -1211,7 +1245,7 @@ fn build_external_shapes(
         for (cls_name, variances) in &module_shapes.class_param_variance {
             external
                 .class_param_variance
-                .entry(cls_name.clone())
+                .entry(fact_key(&module, cls_name))
                 .or_insert_with(|| variances.clone());
         }
         // Carry `__typhon_builtin_ext_*` sentinel class shapes from the
@@ -1256,29 +1290,32 @@ fn build_external_shapes(
         if info.member.is_some() {
             continue;
         }
-        let Some(module_shapes) = shapes_by_module.get(&canon(info)) else {
+        let module = canon(info);
+        let Some(module_shapes) = shapes_by_module.get(&module) else {
             continue;
         };
         for (newtype_name, base) in &module_shapes.newtypes {
             external
                 .newtypes
-                .entry(newtype_name.clone())
+                .entry(fact_key(&module, newtype_name))
                 .or_insert_with(|| base.clone());
         }
         for (alias_name, alias) in &module_shapes.type_aliases {
             external
                 .type_aliases
-                .entry(alias_name.clone())
+                .entry(fact_key(&module, alias_name))
                 .or_insert_with(|| alias.clone());
         }
         for (enum_name, members) in &module_shapes.enums {
             external
                 .enums
-                .entry(enum_name.clone())
+                .entry(fact_key(&module, enum_name))
                 .or_insert_with(|| members.clone());
         }
         for frozen_name in &module_shapes.frozen_classes {
-            external.frozen_classes.insert(frozen_name.clone());
+            external
+                .frozen_classes
+                .insert(fact_key(&module, frozen_name));
         }
         // Bare-imported module's HKT constructor variables (see the
         // member-import pass above for rationale).
@@ -1300,12 +1337,49 @@ fn build_external_shapes(
         for (cls_name, variances) in &module_shapes.class_param_variance {
             external
                 .class_param_variance
-                .entry(cls_name.clone())
+                .entry(fact_key(&module, cls_name))
                 .or_insert_with(|| variances.clone());
         }
     }
     apply_cross_module_extensions(&mut external, bindings, &canon, shapes_by_module);
     external
+}
+
+/// For each module this one imports from (or imports outright), the types it
+/// declares under a name this module binds to something other than that very
+/// type: a declaration of its own, or an import of another module's name.
+fn colliding_type_names(
+    bindings: &[tyc_resolve::Binding],
+    shapes_by_module: &std::collections::HashMap<String, ModuleShapes>,
+    canon: &impl Fn(&tyc_resolve::ImportInfo) -> String,
+) -> std::collections::HashMap<String, std::collections::HashSet<String>> {
+    let touched: std::collections::HashSet<String> = bindings
+        .iter()
+        .filter_map(|b| b.import_info.as_ref().map(canon))
+        .collect();
+    let mut out = std::collections::HashMap::new();
+    for module in touched {
+        let Some(shapes) = shapes_by_module.get(&module) else {
+            continue;
+        };
+        let names: std::collections::HashSet<String> = shapes
+            .declared_type_names()
+            .into_iter()
+            .filter(|name| {
+                bindings.iter().any(|b| {
+                    b.name == *name
+                        && !b.import_info.as_ref().is_some_and(|info| {
+                            info.member.as_deref() == Some(*name) && canon(info) == module
+                        })
+                })
+            })
+            .map(str::to_owned)
+            .collect();
+        if !names.is_empty() {
+            out.insert(module, names);
+        }
+    }
+    out
 }
 
 /// The key a `__typhon_extend_<Class>@<spec>` sentinel published by the
@@ -3066,5 +3140,298 @@ def main() -> None:
             "{:?}",
             diags.errors()
         );
+    }
+
+    // ── A type keeps meaning its own module's on either side of a clash ──
+
+    const ORIGIN_GEOMETRY: &str = "\
+pub class Point frozen:
+    x: int
+
+pub def origin() -> Point:
+    return Point(x=0)
+";
+
+    fn frozen_writes(diags: &Diagnostics) -> usize {
+        diags
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::FrozenAssign { .. }))
+            .count()
+    }
+
+    #[test]
+    fn an_imported_signature_keeps_its_class_beside_a_local_one() {
+        // `origin()` returns geometry's frozen `Point`, the local `Point` is
+        // mutable: one write crashes, the other does not.
+        let main = "\
+from geometry import origin
+
+class Point:
+    x: int
+
+def main() -> None:
+    let mine = Point(x=1)
+    mine.x = 5
+    let o = origin()
+    o.x = 7
+    print(mine.x, o.x)
+";
+        let diags = check_main(
+            main,
+            &[("geometry", ORIGIN_GEOMETRY)],
+            CheckOptions::default(),
+        );
+        assert_eq!(frozen_writes(&diags), 1, "{:?}", diags.errors());
+        assert_eq!(diags.errors().len(), 1, "{:?}", diags.errors());
+        // The module-qualified call, and the reverse: a local frozen class
+        // beside an imported function's mutable one.
+        let main = "\
+import geometry
+
+class Point:
+    x: int
+
+def main() -> None:
+    let mine = Point(x=1)
+    mine.x = 5
+    let o = geometry.origin()
+    o.x = 7
+";
+        let diags = check_main(
+            main,
+            &[("geometry", ORIGIN_GEOMETRY)],
+            CheckOptions::default(),
+        );
+        assert_eq!(frozen_writes(&diags), 1, "{:?}", diags.errors());
+        let mutable = "\
+pub class Point:
+    x: int
+
+pub def origin() -> Point:
+    return Point(x=0)
+";
+        let main = "\
+from geometry import origin
+
+class Point frozen:
+    x: int
+
+def main() -> None:
+    let o = origin()
+    o.x = 7
+    print(o.x, Point(x=1).x)
+";
+        let diags = check_main(main, &[("geometry", mutable)], CheckOptions::default());
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
+    fn an_imported_newtype_and_alias_keep_their_meaning_beside_local_classes() {
+        let ids = "\
+pub newtype UserId = int
+
+pub def next_id() -> UserId:
+    return UserId(7)
+
+pub type Pair = tuple[int, int]
+
+pub def pair() -> Pair:
+    return (1, 2)
+";
+        let main = "\
+import ids
+from ids import next_id, pair
+
+class UserId:
+    v: int
+
+class Pair:
+    a: int
+
+def make_user(v: int) -> UserId:
+    return UserId(v=v)
+
+def show(n: int) -> int:
+    return n + 1
+
+def first(p: tuple[int, int]) -> int:
+    return p[0]
+
+def main() -> None:
+    let a: int = next_id()
+    print(show(next_id()), show(ids.next_id()), first(pair()), make_user(3).v, a)
+";
+        let diags = check_main(main, &[("ids", ids)], CheckOptions::default());
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
+    fn a_touched_modules_type_does_not_take_over_another_modules_name() {
+        let point_a = "\
+class Point frozen:
+    x: int
+
+pub def helper() -> int:
+    return 1
+";
+        let point_b = "\
+class Point:
+    x: int
+";
+        for import_a in ["from a import helper", "import a"] {
+            let call = if import_a == "import a" {
+                "a.helper()"
+            } else {
+                "helper()"
+            };
+            let main = format!(
+                "{import_a}\nfrom b import Point\n\ndef main() -> None:\n    let p = Point(x=1)\n    p.x = 2\n    print(p.x + {call})\n"
+            );
+            let diags = check_main(
+                &main,
+                &[("a", point_a), ("b", point_b)],
+                CheckOptions::default(),
+            );
+            assert!(!diags.has_errors(), "{import_a}: {:?}", diags.errors());
+        }
+        // A newtype, an enum and a sealed union of `a` against `b`'s class.
+        let a = "\
+from enum import Enum
+
+pub newtype Token = str
+
+pub class Color(Enum):
+    RED = 1
+
+pub class Circle:
+    r: int
+
+pub class Square:
+    s: int
+
+pub type Shape = Circle | Square
+";
+        let b = "\
+pub class Token:
+    value: str
+
+pub class Color:
+    name: str
+
+pub class Shape:
+    w: int
+";
+        let main = "\
+from a import Circle
+from b import Token, Color, Shape
+
+def area(s: Shape) -> int:
+    match s:
+        case Shape(w=w):
+            return w
+
+def main() -> None:
+    let t: Token = Token(value=\"x\")
+    print(t.value, Color(name=\"red\").name, area(Shape(w=3)), Circle(r=1).r)
+";
+        let diags = check_main(main, &[("a", a), ("b", b)], CheckOptions::default());
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
+    fn a_local_class_is_not_a_touched_modules_sealed_union() {
+        let shapes = "\
+pub class Circle:
+    r: int
+
+pub class Square:
+    s: int
+
+pub type Shape = Circle | Square
+";
+        let main = "\
+from shapes import Circle
+
+class Shape:
+    w: int
+
+def area(s: Shape) -> int:
+    match s:
+        case Shape(w=w):
+            return w
+
+def main() -> None:
+    print(area(Shape(w=3)), Circle(r=1).r)
+";
+        let diags = check_main(main, &[("shapes", shapes)], CheckOptions::default());
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        // A `Circle` is not the local `Shape`: `s.w` would raise.
+        let main = "\
+from shapes import Circle
+
+class Shape:
+    w: int
+
+def width(s: Shape) -> int:
+    return s.w
+
+print(width(Circle(r=1)))
+";
+        let diags = check_main(main, &[("shapes", shapes)], CheckOptions::default());
+        assert!(
+            diags
+                .errors()
+                .iter()
+                .all(|e| matches!(e, TycError::TypeMismatch { .. }))
+                && diags.errors().len() == 1,
+            "{:?}",
+            diags.errors()
+        );
+    }
+
+    #[test]
+    fn a_module_qualified_class_reads_its_methods_unbound() {
+        let shapes = "\
+pub class Point:
+    x: int
+    y: int
+
+impl Point:
+    def norm(self) -> int:
+        return self.x * self.x + self.y * self.y
+
+    def shifted(self, dx: int) -> int:
+        return self.x + dx
+
+    def scaled(self, k: int = 1) -> int:
+        return self.x * k
+";
+        let main = "\
+import shapes
+import shapes as s
+
+def main() -> None:
+    let p: shapes.Point = shapes.Point(x=3, y=4)
+    print(shapes.Point.norm(p), shapes.Point.shifted(p, 2), shapes.Point.shifted(p, dx=2))
+    print(s.Point.scaled(p), s.Point.scaled(p, 2))
+";
+        let diags = check_main(main, &[("shapes", shapes)], CheckOptions::default());
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        // Control: the receiver and the method's own arguments are required.
+        let main = "\
+import shapes
+
+def main() -> None:
+    let p: shapes.Point = shapes.Point(x=3, y=4)
+    print(shapes.Point.norm(), shapes.Point.shifted(p))
+";
+        let diags = check_main(main, &[("shapes", shapes)], CheckOptions::default());
+        let missing = diags
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::MissingArgument { .. }))
+            .count();
+        assert_eq!(missing, 2, "{:?}", diags.errors());
     }
 }

@@ -1223,6 +1223,8 @@ fn method_sig_from_introspected(m: &IntrospectedMethod) -> Option<MethodSig> {
         arity_info: info,
         param_types,
         is_async: false,
+        // The introspected signature is the runtime one.
+        decorated: Default::default(),
     })
 }
 

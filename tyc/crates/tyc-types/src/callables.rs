@@ -54,12 +54,25 @@ pub(super) fn binds_module_function(c: &Checker, name: &str) -> bool {
 /// Whether the body of the function being checked binds `name` itself, which
 /// makes it a local there for the whole body — a walrus does so even where
 /// the env still narrows the module binding in place.
-fn binds_locally(c: &Checker, name: &str) -> bool {
+pub(super) fn binds_locally(c: &Checker, name: &str) -> bool {
     c.function_scope != 0
         && c.resolved
             .scopes
             .get(c.function_scope)
             .is_some_and(|s| s.lookup_local(name).is_some())
+}
+
+/// Whether an assignment to `name` in the function body being checked binds
+/// a new local although the env shows an enclosing binding of that name (a
+/// module-level `def`, import or global, or an outer function's local).
+/// Python makes every name a body assigns local to the whole body unless it
+/// is declared `global` / `nonlocal`, which the resolver does not record as
+/// a local binding.
+pub(super) fn assignment_binds_local(c: &Checker, name: &str) -> bool {
+    match (c.env.scope_of(name), c.env.function_frame()) {
+        (Some(found), Some(frame)) => found < frame && binds_locally(c, name),
+        _ => false,
+    }
 }
 
 /// Where `name`'s binding in scope was declared: the env's, or — when the
@@ -80,14 +93,15 @@ fn binding_start(c: &Checker, name: &str) -> Option<usize> {
 pub(super) fn origin(c: &Checker, expr: &Expr) -> Option<ArityInfo> {
     fn resolve(c: &Checker, expr: &Expr, seen: &mut HashSet<usize>) -> Option<ArityInfo> {
         // `let g = u.greet` / `let f = helpers.parse`: the alias calls what
-        // the attribute resolves to.
-        if let Expr::Attribute(a) = expr {
-            let recv = infer_expr_readonly(c, &a.value);
-            let receiver_is_class = matches!(
-                a.value.as_ref(),
-                Expr::Name(n) if c.classes.iter().any(|cn| cn == n.id.as_str())
-            );
-            return method_callee_arity(c, &recv, receiver_is_class, a.attr.as_str());
+        // the attribute resolved to where it was defined — `u` may name
+        // something else at the call. An alias not checked yet records
+        // nothing, and the call keeps its structural check.
+        if let Expr::Attribute(_) = expr {
+            return c
+                .attr_callee_arity
+                .get(&expr_span(expr))
+                .filter(|(_, known)| *known)
+                .map(|(info, _)| info.clone());
         }
         if let Expr::Lambda(lam) = expr {
             return lam
@@ -266,6 +280,72 @@ pub(super) fn decorated(c: &Checker, name: &str) -> bool {
         scan.visit_stmt(stmt);
     }
     scan.found
+}
+
+/// Whether a class named `name` carries a decorator, which may replace it.
+pub(super) fn class_decorated(c: &Checker, name: &str) -> bool {
+    struct Scan<'s> {
+        name: &'s str,
+        found: bool,
+    }
+    impl<'a> Visitor<'a> for Scan<'_> {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            if let Stmt::ClassDef(cd) = stmt {
+                if cd.name.as_str() == self.name && !cd.decorator_list.is_empty() {
+                    self.found = true;
+                }
+            }
+            visitor::walk_stmt(self, stmt);
+        }
+    }
+    let Some(module) = c.module else { return false };
+    let mut scan = Scan { name, found: false };
+    for stmt in &module.body {
+        scan.visit_stmt(stmt);
+    }
+    scan.found
+}
+
+/// The `def` that `cls.name` resolves to among this module's top-level class
+/// bodies and their `impl` blocks, walking `cls`'s bases first-to-last.
+/// `None` when the walk reaches a class whose body is not here before
+/// finding the method, or never finds it.
+pub(super) fn method_def<'a>(
+    c: &Checker<'a>,
+    cls: &str,
+    name: &str,
+) -> Option<&'a ruff_python_ast::StmtFunctionDef> {
+    let module = c.module?;
+    let mut stack = vec![cls.to_owned()];
+    let mut seen = HashSet::new();
+    while let Some(current) = stack.pop() {
+        if !seen.insert(current.clone()) {
+            continue;
+        }
+        let pseudo = format!("__typhon_impl_{current}");
+        let mut declared = false;
+        for stmt in &module.body {
+            let Stmt::ClassDef(cd) = stmt else { continue };
+            if cd.name.as_str() != current && cd.name.as_str() != pseudo {
+                continue;
+            }
+            declared = true;
+            for item in &cd.body {
+                if let Stmt::FunctionDef(f) = item {
+                    if f.name.as_str() == name {
+                        return Some(f);
+                    }
+                }
+            }
+        }
+        if !declared {
+            return None;
+        }
+        if let Some(parents) = c.class_parents.get(&current) {
+            stack.extend(parents.iter().rev().cloned());
+        }
+    }
+    None
 }
 
 pub(super) fn alias_value<'a>(c: &Checker<'a>, start: usize) -> Option<&'a Expr> {
