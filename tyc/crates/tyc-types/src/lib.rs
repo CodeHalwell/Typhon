@@ -24472,7 +24472,19 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                             if !missing.is_empty() {
                                 c.missing_argument(&name, missing, call_span);
                             } else {
-                                c.wrong_args(&name, params.len(), pos_args.len(), call_span);
+                                // Name the bound the call broke: `d.get(k, a, b)`
+                                // exceeds get's 2 positionals, not its 1 parameter
+                                // type.
+                                let supplied = pos_args.len();
+                                let expected = match arity_info.as_ref() {
+                                    Some(info) => match info.max_positional {
+                                        Some(max) if supplied > max => max,
+                                        _ if supplied < info.min_positional => info.min_positional,
+                                        _ => params.len(),
+                                    },
+                                    None => params.len(),
+                                };
+                                c.wrong_args(&name, expected, supplied, call_span);
                             }
                         }
                     }

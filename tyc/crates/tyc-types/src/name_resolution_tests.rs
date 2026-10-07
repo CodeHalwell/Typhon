@@ -1795,7 +1795,17 @@ def main() -> None:
 
 main()
 "#,
-        |e| matches!(e, TycError::WrongArgCount { .. }),
+        // The bound the call broke is get's two positionals.
+        |e| {
+            matches!(
+                e,
+                TycError::WrongArgCount {
+                    expected: 2,
+                    actual: 3,
+                    ..
+                }
+            )
+        },
     );
     assert_eq!(errors.len(), 1, "{errors:?}");
 }

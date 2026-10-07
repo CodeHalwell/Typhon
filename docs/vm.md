@@ -102,7 +102,11 @@ string. `type(x).__name__` resolves to the type name, `str(type(x))`
 renders `<class 'int'>`, and equality holds across the expected cases:
 `type(a) == type(b)`, `type(inst) == SomeClass`, `type(5) == int`,
 `type(5) == type(6)`. User instances map to their declaring class;
-builtins map to cached singleton type objects.
+builtins map to cached singleton type objects. Identity holds as well:
+`type(x) is dict`, `x.__class__ is ValueError` and `type(EnumCls) is
+EnumType` are what CPython gives, `issubclass(type(e), Exception)` follows
+the builtin hierarchy, and a type object is callable like the type
+(`raise type(e)(msg) from e`).
 
 Plus the result constructors `Ok` and `Err` (with the `.map` /
 `.map_err` / `.and_then` / `.or_else` combinators bound natively
@@ -241,8 +245,8 @@ package (`pydantic` has the placeholder above; `numpy`, `requests`,
   `bytearray.fromhex`. `repr` is CPython's `bytearray(b'…')`, and it is
   unhashable, as CPython's is. `x in b"…"` (a byte value or a
   subsequence) works too — the VM rejected both.
-- `int`: `bit_length`, `bit_count`, `to_bytes`, and the classmethod
-  `int.from_bytes`. `float`: `is_integer`. Both carry the `numbers`
+- `int`: `bit_length`, `bit_count`, `to_bytes`, `is_integer`, and the
+  classmethod `int.from_bytes`. `float`: `is_integer`. Both carry the `numbers`
   tower's read-only components since v1.0.0-beta.1 — `real`, `imag`,
   `conjugate()`, plus `numerator` / `denominator` on `int`.
 - Every builtin *type* also exposes its methods unbound, as CPython does:
@@ -461,7 +465,10 @@ A builtin-type method binds keyword arguments to its CPython 3.13
 signature: `s.replace("a", "b", count=2)`, `s.split(maxsplit=1)`,
 `n.to_bytes(2, byteorder="little")` and `b.hex(sep=":")` work, a method
 CPython gives no keywords (`d.get(k, default=0)`) raises CPython's
-`TypeError`, and an unknown or doubled keyword raises its message.
+`TypeError`, and an unknown or doubled keyword raises its message. The
+positional count is checked too, with CPython's wording:
+`xs.append(1, 2)` raises `list.append() takes exactly one argument (2
+given)` instead of appending `1`.
 `round(ndigits=)`, `int(base=)`, `math.prod(start=)`,
 `heapq.nlargest/nsmallest(key=)`, `json.loads/load(object_hook=,
 object_pairs_hook=)`, `asyncio.sleep(result=)`, `asyncio.wait_for(timeout=)`,
