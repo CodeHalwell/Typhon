@@ -1242,6 +1242,18 @@ mod tests {
         let got = scan_source("exec(\"x = 1\")\nprint(memoryview(b\"a\"))\n").unwrap_or_default();
         assert!(got.contains(&"builtin exec".to_owned()), "{got:?}");
         assert!(got.contains(&"builtin memoryview".to_owned()), "{got:?}");
+        // `EnvironmentError` is bound in the VM but still runs on CPython;
+        // `IOError` and `OSError` stay on the VM.
+        let got =
+            scan_source("try:\n    pass\nexcept EnvironmentError:\n    pass\n").unwrap_or_default();
+        assert!(
+            got.contains(&"builtin EnvironmentError".to_owned()),
+            "{got:?}"
+        );
+        assert_eq!(
+            scan_source("try:\n    pass\nexcept (IOError, OSError):\n    pass\n"),
+            None
+        );
         // A name the program binds itself is its own.
         assert_eq!(
             scan_source("def exec(s: str) -> None:\n    pass\nexec(\"x\")\n"),

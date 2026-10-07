@@ -1024,7 +1024,13 @@ const PYTHON_BUILTINS: &[&str] = &[
 /// `memoryview`, `globals`). `tyc run`'s pre-run scan sends a program that
 /// uses one down the compiled path rather than into a `NameError`.
 pub fn unmodelled_builtin(probe: &Interpreter, name: &str) -> bool {
-    PYTHON_BUILTINS.contains(&name) && probe.root.get(name).is_none()
+    // `EnvironmentError` is bound (as `OSError`) so handlers naming it work,
+    // but the programs that spell it are mostly errno-handling ones whose
+    // `OSError(errno, strerror)` subclass arguments and `ExceptionGroup.split`
+    // the VM does not model; they keep running on CPython, as they did while
+    // the name was unbound.
+    name == "EnvironmentError"
+        || (PYTHON_BUILTINS.contains(&name) && probe.root.get(name).is_none())
 }
 
 /// Whether the VM accepts keyword `kw` when calling `name` — a builtin when
