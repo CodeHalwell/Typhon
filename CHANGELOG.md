@@ -141,16 +141,26 @@ entries, and fire only on code that would fail on the configured target.
   rebound** — by a `for` target, walrus, `with … as`, `match` capture,
   augmented assignment, `del`, `except … as`, or a callee's `global` /
   `nonlocal` rebind — for `isinstance` narrowings as well as the new ones.
-- `self.x: T = v` checks `v` against `T` and against the field `x`
-  (previously neither); `lazy let NAME: T = E` checks `E` against `T`, and an
-  unannotated `lazy let` is typed from `E`.
+- `self.x: T = v` is checked against the field `x` as well as against `T`
+  (it was checked against `T` only), reading a literal or display under
+  whichever of the two the check needs; `lazy let NAME: T = E` checks `E`
+  against `T`, and an unannotated `lazy let` is typed from `E`.
+- A string literal is accepted where a nullable or unioned literal alias is
+  expected (`let m: Mode? = "slow"` with `type Mode = "fast" | "slow"`, a
+  `Mode?` field or parameter default) — it was rejected as a plain `str`.
 - `collections.abc.Set` and `typing.AbstractSet` are read-only set views that
   accept `set`, `frozenset` and dict key views; `Set` from `collections.abc`
   was treated as the mutable `typing.Set`.
 - Desugar: a dataclass default naming a function local is copied according to
-  that local, not to a module-level list/dict/set of the same name (a
-  shadowing tuple was wrapped in `list(…)`), and a local list/dict/set default
-  is copied instead of raising dataclass's mutable-default `ValueError`.
+  that local when its kind is evident (a shadowing tuple was wrapped in
+  `list(…)`; a local list raised dataclass's mutable-default `ValueError`);
+  `global` names read the module's binding, `nonlocal` rebinds join the
+  owner's kind, and a local of unevident kind keeps the module's answer, as
+  before.
+- Desugar: a field-less function-local subclass of a local or module
+  exception (or metaclass) is no longer given `@dataclass`, whose `__init__`
+  took no message, so `raise Timeout("slow")` raised `TypeError`. One that
+  declares fields keeps `@dataclass`, as before.
 - `examples/apps/04-event-sourced-banking` reads its frozen FX table as
   `Mapping[str, float]?`.
 
@@ -195,7 +205,28 @@ entries, and fire only on code that would fail on the configured target.
 - `dict.get(k, default=v)` and `d.get(k, a, b)` are reported: `get` is
   positional-only on `dict`, `frozendict`, `defaultdict`, `OrderedDict`,
   `Counter`, dict subclasses and `freeze let` dicts, and CPython raises
-  `TypeError`. A user `extend dict: def get(…)` uses its own signature.
+  `TypeError`. A user `extend dict: def get(…)` and a user class that merely
+  shares a collections class's name keep their own signatures. An arity
+  error names the bound the call broke ("expected 2, got 3", not the
+  parameter count).
+- A function-local class that shadows a module class is checked against a
+  shape both could satisfy; a `plain class` / `class!` keeps its kind in the
+  scope that declares it (function or class body); a facade or re-export
+  import (`from pkg import Rock` over a `pub *` `__init__`) is not taken for a
+  different class of that name.
+- Signature-changing decorators: the stdlib names that keep a signature
+  (`cache`, `wraps`, `memo`, …) count only when unbound or imported from the
+  standard library — a project decorator imported or aliased under such a
+  name is judged by its own type — and a method redefined under an `if` /
+  `try` in the class body is found when deciding whether it may be awaited.
+  Method resolution for these and for field-write summaries follows the C3
+  MRO.
+- A TypeVar bounded by a typing protocol (`Sized`, `Hashable`,
+  `SupportsInt`, …) no longer gives a false `tyc::typevar_bound`.
+- The purity check scopes comprehension and lambda names to their
+  expression and sees through `lazy import` (a `@pure` / `@memo` reading
+  `time.time()` through `lazy import time` is reported, as before), and the
+  language server now reports `tyc::impure_pure_fn` like `tyc check`.
 
 ### Fixed — VM ↔ CPython parity (`tyc run`)
 
@@ -214,9 +245,23 @@ entries, and fire only on code that would fail on the configured target.
   `rfind`, `rindex`, `startswith` and friends are honoured instead of
   ignored. `int.is_integer()` exists. `dict.update` takes keywords alongside a
   positional mapping, and `d.update(d)` no longer panics.
-- `os.environ` is a `Mapping` like CPython's, so `os.environ.get(k,
-  default=v)` works; `Counter` / `OrderedDict` / `defaultdict` / `frozendict`
-  `get` are positional-only.
+- `os.environ` is a `Mapping` like CPython's: `os.environ.get(k, default=v)`,
+  mapping patterns, `as! Mapping[str, str]`, `json.dumps`, `Counter(...)` and
+  `dict(...)` all work; `Counter` / `OrderedDict` / `defaultdict` /
+  `frozendict` `get` are positional-only, and the `defaultdict` shim has the
+  rest of dict's methods.
+- An `except` target catches what its name is bound to: `IOError` /
+  `EnvironmentError` catch `OSError`, an alias or tuple catches as its members
+  do, and a user class catches its own instances and subclasses — never a
+  different class that merely shares its `__name__`. A mapping pattern judges
+  recorded bases, not class names.
+- Augmented assignment calls `__iadd__` / `__ior__` / … and falls back to the
+  binary operator, so in-place updates keep identity (`Counter +=`,
+  `bytearray +=`, user classes); `global X` in a nested function reaches the
+  module's `X`; `type(e)(msg)` constructs; `bytes.join` matches CPython.
+- `tyc run` still sends programs that name `EnvironmentError` to CPython (as
+  while it was unmodelled), since their errno-style `OSError` subclass
+  arguments are not modelled by the VM.
 
 ### Compatibility
 
@@ -234,11 +279,26 @@ annotation that misstates the runtime value (categories 2 and 3 in
 - unbound-method, TypeVar-receiver and alias calls with the wrong arguments,
   `dict.get(k, default=…)`, and method calls a same-named function used to
   mask (category 2);
-- code relying on a narrowing that survived a rebinding of its root
-  (category 3).
+- code relying on a narrowing that survived a rebinding of its root, or on
+  a local callable that shadows a module function being taken for that
+  function when deciding which field narrowings a call keeps (category 3).
+
+One narrow false positive remains: when a module binds a name to one class
+and also reaches a *different* same-named class through both a `pub *`
+facade and its defining submodule, the facade's copy and the original are
+qualified separately (`pkg.Rock` vs `pkg.base.Rock`) and do not unify. Import
+that class through one path.
 
 The example, stress and valid-program corpora check identically before and
-after, apart from the banking example's annotation.
+after, apart from the banking example's annotation. Under `tyc run`, in-place
+operators on `Counter` / `bytearray` now mutate like CPython's, and a dict
+keyed by builtin types iterates back the type objects.
+
+Known, not fixed here: a `def f(time=time)` parameter or a comprehension
+over a module can hide a clock read from the purity check; a closure or
+`setattr` lambda that writes an attribute does not drop that attribute's
+narrowing; and the VM does not model `OSError(errno, strerror)` arguments
+on user subclasses, `ExceptionGroup.split`, or `type(staticmethod(f))`.
 
 ### Testing
 
