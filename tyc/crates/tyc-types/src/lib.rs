@@ -2891,6 +2891,10 @@ impl TypeEnv {
         self.scopes.pop();
         self.kinds.pop();
     }
+    /// The index of the innermost function-body frame, if any.
+    fn function_frame(&self) -> Option<usize> {
+        self.kinds.iter().rposition(|k| *k == FrameKind::Function)
+    }
     /// Whether frame `i` is invisible from the innermost frame: a class body
     /// seen from inside a function nested in it.
     fn hidden(&self, i: usize) -> bool {
@@ -3537,13 +3541,17 @@ struct Checker<'a> {
     /// call sites to type-check keyword arguments absorbed by
     /// `**kwargs: T` against `T`.
     function_kwarg_types: HashMap<String, Type>,
-    /// The [`ArityInfo`] of the attribute callee `infer_expr` resolved last
-    /// (see [`method_callee_arity`]), keyed by that attribute's span. A call
-    /// reads it for its own `func`: a method, a TypeVar bound's method or a
-    /// module function is arity-checked against what the receiver actually
-    /// resolves to, never against a same-named entry of the name-keyed
-    /// tables above.
-    attr_callee_arity: Option<((usize, usize), ArityInfo)>,
+    /// The [`ArityInfo`] of each attribute callee as `infer_expr` last
+    /// resolved it (see [`method_call`]), keyed by the attribute's span. A
+    /// call reads it for its own `func`: a method, a TypeVar bound's method
+    /// or a module function is arity-checked against what the receiver
+    /// actually resolves to, never against a same-named entry of the
+    /// name-keyed tables above. An alias of a bound method (`let g =
+    /// u.greet`) reads the entry its definition recorded, when the flag
+    /// says it is the call signature: `false` marks a `def`'s own arity
+    /// read through a decorator of unknown effect, which only a direct call
+    /// keeps checking.
+    attr_callee_arity: HashMap<(usize, usize), (ArityInfo, bool)>,
     /// Names of `async def` functions declared at module top level.
     /// Used by the call-site arm to emit `tyc::missing_await`
     /// (FINDINGS #49) when a sync context calls one without `await`.
@@ -3614,6 +3622,10 @@ struct Checker<'a> {
     /// `{"f": {"T": Class("Interface")}}`. Checked at call sites via
     /// `Checker::check_call_typevar_bounds`.
     function_type_bounds: HashMap<String, HashMap<String, Type>>,
+    /// Declared TypeVar bounds of every bounded `def` the walk has checked,
+    /// keyed by the offset of its name: a nested `def`'s call sites read
+    /// them through the binding the name resolves to.
+    def_type_bounds: HashMap<usize, HashMap<String, Type>>,
     /// Module-level PEP 661 sentinels (`MISSING = sentinel("MISSING")`,
     /// Python 3.15). Each has its own singleton type, `Type::Class(name)`,
     /// usable in annotations (`int | MISSING`) and narrowed by `is`.
@@ -3816,6 +3828,10 @@ struct Checker<'a> {
     /// metadata; queried by [`check_stmt`] when entering an `if` body to
     /// decide whether to bump `unsafe_depth`.
     unsafe_line_starts: Vec<u32>,
+    /// Byte offsets of the lines declaring a `class NAME frozen:` (the
+    /// preprocessor strips the modifier), for classes declared below the
+    /// module level.
+    frozen_line_starts: Vec<u32>,
     /// Yield types of functions decorated with `@contextmanager` or
     /// `@asynccontextmanager`. When `with cm() as r:` (or `async with`)
     /// is bound, the as-target's type is the wrapped function's first
@@ -3981,6 +3997,25 @@ pub struct MethodSig {
     /// no-ops into the source — so the warning is suppressed in that
     /// case. FINDINGS — async-impl conformance (Dead Reckoning report).
     pub is_async: bool,
+    /// What the method's decorators make of its call signature. Only call
+    /// sites read it: override and interface checks compare the `def`s.
+    pub decorated: DecoratedSignature,
+}
+
+/// How a method's decorators change its call signature.
+#[derive(Debug, Clone, Default)]
+pub enum DecoratedSignature {
+    /// Undecorated, or every decorator is known to keep the `def`'s
+    /// parameters: [`MethodSig::arity_info`] is the call signature.
+    #[default]
+    Def,
+    /// A decorator's declared result is a concrete `Callable[[…], R]`: its
+    /// parameters are the call signature, the receiver slot included for an
+    /// instance or class method. Parameter names are the `def`'s where the
+    /// positions line up — the wrapper's own are not known.
+    Callable(Box<ArityInfo>),
+    /// A decorator whose effect on the signature is not known.
+    Unknown,
 }
 
 /// Member shape recorded for an interface or class — methods are recorded as
@@ -4077,7 +4112,7 @@ impl<'a> Checker<'a> {
             function_signatures: HashMap::new(),
             function_arity_info: HashMap::new(),
             function_kwarg_types: HashMap::new(),
-            attr_callee_arity: None,
+            attr_callee_arity: HashMap::new(),
             async_functions: std::collections::HashSet::new(),
             sync_functions: std::collections::HashSet::new(),
             imported_sync_functions: std::collections::HashSet::new(),
@@ -4091,6 +4126,7 @@ impl<'a> Checker<'a> {
             python_minor: MIN_PYTHON_MINOR,
             freeze_to_frozendict: false,
             function_type_bounds: HashMap::new(),
+            def_type_bounds: HashMap::new(),
             sentinels: HashSet::new(),
             active_typevar_bounds: HashMap::new(),
             descriptor_uses: std::cell::OnceCell::new(),
@@ -4112,6 +4148,7 @@ impl<'a> Checker<'a> {
             unsafe_depth: 0,
             unsafe_origin_bindings: HashMap::new(),
             unsafe_line_starts: Vec::new(),
+            frozen_line_starts: Vec::new(),
             sealed_unions: HashMap::new(),
             enums: HashMap::new(),
             type_aliases: HashMap::new(),
@@ -6613,23 +6650,21 @@ impl<'a> Checker<'a> {
     /// Validate that each inferred TypeVar binding at a call site satisfies
     /// the bound declared on the function's type parameter.
     ///
-    /// `fn_name` is used to look up stored bounds — the caller passes it only
-    /// when the bare name still reads the module-level function; when no
-    /// bounds are recorded for that function this is a no-op. Violations are
-    /// emitted as `tyc::typevar_bound` diagnostics at `call_span`.
+    /// `bounds` are the declared bounds of the `def` the callee resolves to;
+    /// with none this is a no-op. Violations are emitted as
+    /// `tyc::typevar_bound` diagnostics at `call_span`.
     fn check_call_typevar_bounds(
         &mut self,
-        fn_name: &str,
+        bounds: &HashMap<String, Type>,
         formal_params: &[Type],
         actual_args: &[Type],
         return_type: &Type,
         expected_return: Option<&Type>,
         call_span: (usize, usize),
     ) {
-        let bounds = match self.function_type_bounds.get(fn_name).cloned() {
-            Some(b) if !b.is_empty() => b,
-            _ => return,
-        };
+        if bounds.is_empty() {
+            return;
+        }
         // Use the same bidirectional bindings the substitution will use,
         // so a TypeVar that's only pinned by the call-site expected type
         // (no informative args) still has its declared bound enforced.
@@ -6900,6 +6935,107 @@ pub struct ModuleShapes {
     pub hkt_param_names: std::collections::HashSet<String>,
 }
 
+impl ModuleShapes {
+    /// The names this module declares a type under — a class (an enum or an
+    /// interface included), a newtype, a type alias or a sealed union —
+    /// leaving out the compiler's own `__typhon_*` shapes.
+    pub fn declared_type_names(&self) -> HashSet<&str> {
+        self.class_shapes
+            .keys()
+            .chain(self.newtypes.keys())
+            .chain(self.type_aliases.keys())
+            .chain(self.sealed_unions.keys())
+            .map(String::as_str)
+            .filter(|name| !name.starts_with("__typhon_"))
+            .collect()
+    }
+
+    /// These shapes with every reference to a type they declare under one of
+    /// `names` qualified as `module.Name`, as `mod.Cls` resolves: how a
+    /// consumer that binds those names to something of its own still reads
+    /// this module's signatures as this module's types.
+    pub fn qualified(&self, module: &str, names: &HashSet<String>) -> ModuleShapes {
+        let q = |t: &Type| qualify_type(t, module, names);
+        let rename = |n: &String| {
+            if names.contains(n) {
+                format!("{module}.{n}")
+            } else {
+                n.clone()
+            }
+        };
+        let mut out = self.clone();
+        for shape in out.class_shapes.values_mut() {
+            for ty in shape.fields.values_mut() {
+                *ty = q(ty);
+            }
+            for sig in shape.methods.values_mut() {
+                sig.return_type = q(&sig.return_type);
+                sig.param_types = sig.param_types.iter().map(q).collect();
+                sig.arity_info = qualify_arity(&sig.arity_info, module, names);
+                if let DecoratedSignature::Callable(info) = &sig.decorated {
+                    sig.decorated =
+                        DecoratedSignature::Callable(Box::new(qualify_arity(info, module, names)));
+                }
+            }
+            shape.bases = shape.bases.iter().map(rename).collect();
+        }
+        for info in out.function_arities.values_mut() {
+            *info = qualify_arity(info, module, names);
+        }
+        for variants in out.sealed_unions.values_mut() {
+            *variants = variants.iter().map(rename).collect();
+        }
+        for base in out.newtypes.values_mut() {
+            *base = q(base);
+        }
+        for (_, rhs) in out.type_aliases.values_mut() {
+            *rhs = q(rhs);
+        }
+        out
+    }
+}
+
+/// `ty` with every class named in `names` — types the module keyed `module`
+/// declares — qualified as `module.Name`, the form a module-qualified
+/// reference (`mod.Cls`) resolves to.
+fn qualify_type(ty: &Type, module: &str, names: &HashSet<String>) -> Type {
+    let q = |t: &Type| qualify_type(t, module, names);
+    match ty {
+        Type::Class(n) if names.contains(n) => Type::Class(format!("{module}.{n}")),
+        Type::Generic(head, args) => Type::Generic(
+            if names.contains(head) {
+                format!("{module}.{head}")
+            } else {
+                head.clone()
+            },
+            args.iter().map(q).collect(),
+        ),
+        Type::Union(members) => Type::Union(members.iter().map(q).collect()),
+        Type::Function {
+            params,
+            ret,
+            variadic,
+            min_params,
+        } => Type::Function {
+            params: params.iter().map(q).collect(),
+            ret: Box::new(q(ret)),
+            variadic: *variadic,
+            min_params: *min_params,
+        },
+        other => other.clone(),
+    }
+}
+
+fn qualify_arity(info: &ArityInfo, module: &str, names: &HashSet<String>) -> ArityInfo {
+    let q = |t: &Type| qualify_type(t, module, names);
+    let mut out = info.clone();
+    out.param_types = info.param_types.iter().map(q).collect();
+    out.kwonly_types = info.kwonly_types.iter().map(q).collect();
+    out.vararg_type = info.vararg_type.as_ref().map(q);
+    out.return_type = q(&info.return_type);
+    out
+}
+
 /// Imports resolved to their source modules' [`ModuleShapes`], keyed
 /// by the *local* name the import binds in the consumer module. The
 /// CLI / LSP populates this before invoking [`check_module_with_imports`]
@@ -7030,6 +7166,7 @@ pub fn extract_module_shapes_with(
     module: &ModModule,
     frozen: &std::collections::HashSet<String>,
 ) -> ModuleShapes {
+    let defs = module_defs(&module.body);
     let mut classes: Vec<String> = Vec::new();
     for stmt in &module.body {
         match stmt {
@@ -7057,7 +7194,7 @@ pub fn extract_module_shapes_with(
     for stmt in &module.body {
         if let Stmt::ClassDef(cd) = stmt {
             let name = cd.name.as_str().to_owned();
-            let shape = collect_class_shape(cd, &classes);
+            let shape = collect_class_shape(cd, &classes, &defs);
             class_shapes.insert(name.clone(), shape);
             let tps = type_param_names_from(cd.type_params.as_deref());
             if !tps.is_empty() {
@@ -7116,14 +7253,14 @@ pub fn extract_module_shapes_with(
                     // consumer importing this module sees them on `User`
                     // (W3-03). Fields are not patched, so not published.
                     if let Some(sentinel) = from_imports.get(target) {
-                        let impl_shape = collect_class_shape(cd, &classes);
+                        let impl_shape = collect_class_shape(cd, &classes, &defs);
                         let entry = foreign_extensions.entry(sentinel.clone()).or_default();
                         for (m, sig) in impl_shape.methods {
                             entry.methods.entry(m).or_insert(sig);
                         }
                     }
                 } else {
-                    let impl_shape = collect_class_shape(cd, &classes);
+                    let impl_shape = collect_class_shape(cd, &classes, &defs);
                     let target_shape = class_shapes.get_mut(target).expect("checked above");
                     for (m, sig) in impl_shape.methods {
                         target_shape.methods.entry(m).or_insert(sig);
@@ -7547,6 +7684,7 @@ pub fn check_module_with_options(
     }
     c.unsafe_line_starts = unsafe_byte_starts(source, unsafe_lines);
     let frozen_starts = unsafe_byte_starts(source, frozen_class_lines);
+    c.frozen_line_starts = frozen_starts.clone();
     // Seed cross-module shapes BEFORE the in-module first pass so
     // local declarations win on name collisions (a `class Foo` in
     // this file shadows an imported `Foo` for the rest of the
@@ -7898,6 +8036,7 @@ fn drop_externally_seeded_local_names(c: &mut Checker, body: &[Stmt]) {
 fn drop_external_type_facts(c: &mut Checker, name: &str) {
     c.newtypes.remove(name);
     c.type_aliases.remove(name);
+    c.sealed_unions.remove(name);
     c.enums.remove(name);
     c.frozen_classes.remove(name);
     c.frozen_classes.remove(&format!("__typhon_impl_{name}"));
@@ -9474,6 +9613,9 @@ fn canonical_callee_path(c: &Checker, func: &Expr) -> Option<String> {
     };
     match c.env.scope_of(head) {
         None => return Some(path),
+        // The env can still show the module binding where the body binds
+        // `head` itself.
+        Some(0) if callables::binds_locally(c, head) => return None,
         Some(0) => {}
         Some(_) => return None,
     }
@@ -10284,6 +10426,7 @@ fn detect_cyclic_type_aliases(c: &mut Checker, body: &[Stmt]) {
 }
 
 fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
+    let defs = module_defs(body);
     // First pass: collect every class and type-alias *name* into `c.classes`
     // so the subsequent shape and signature passes can resolve nominal
     // references like `field: OtherClass`. Doing the shape collection in
@@ -10463,7 +10606,7 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
     for stmt in body {
         if let Stmt::ClassDef(cd) = stmt {
             let name = cd.name.as_str().to_owned();
-            let shape = collect_class_shape(cd, &classes);
+            let shape = collect_class_shape(cd, &classes, &defs);
             if class_inherits_protocol(cd) {
                 let runtime_checkable = has_runtime_checkable_decorator(&cd.decorator_list);
                 c.interfaces.insert(
@@ -10585,7 +10728,7 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
             let pseudo = cd.name.as_str();
             if let Some(target) = pseudo.strip_prefix("__typhon_impl_") {
                 if c.class_shapes.contains_key(target) {
-                    let impl_shape = collect_class_shape(cd, &classes);
+                    let impl_shape = collect_class_shape(cd, &classes, &defs);
                     // N8 (2026-05-22): an `impl ClassName:` and
                     // `extend ClassName:` (or two `impl`s, or two
                     // `extend`s) that both define the same method are
@@ -10653,7 +10796,7 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                     // pseudo-class itself isn't a real class — drop it
                     // from `class_shapes` after the fold so it doesn't
                     // pollute downstream lookups.
-                    let impl_shape = collect_class_shape(cd, &classes);
+                    let impl_shape = collect_class_shape(cd, &classes, &defs);
                     for variant in &variants {
                         if !c.class_shapes.contains_key(variant) {
                             continue;
@@ -11691,14 +11834,176 @@ fn explicit_variance_override(decorators: &[ruff_python_ast::Decorator]) -> Opti
     }
 }
 
+/// A module's top-level `def`s by name: what a decorator named on a method
+/// may be.
+type ModuleDefs<'a> = HashMap<&'a str, &'a ruff_python_ast::StmtFunctionDef>;
+
+fn module_defs(body: &[Stmt]) -> ModuleDefs<'_> {
+    body.iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::FunctionDef(f) => Some((f.name.as_str(), f)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether the decorator `deco` keeps the signature of the method it wraps:
+/// the binding decorators, the caching and context-manager ones, the typing
+/// markers, a property accessor, and a module `def` typed as returning
+/// exactly what it takes (`def logged[F](f: F) -> F`, or `Callable[P, R]`
+/// to `Callable[P, R]`).
+fn decorator_keeps_signature(deco: &Expr, defs: &ModuleDefs, classes: &[String]) -> bool {
+    let target = match deco {
+        Expr::Call(call) => call.func.as_ref(),
+        other => other,
+    };
+    let name = match target {
+        Expr::Name(n) => n.id.as_str(),
+        Expr::Attribute(a) => a.attr.as_str(),
+        _ => return false,
+    };
+    if matches!(
+        name,
+        "staticmethod"
+            | "classmethod"
+            | "property"
+            | "cached_property"
+            | "_typhon_cached_property"
+            | "setter"
+            | "getter"
+            | "deleter"
+            | "abstractmethod"
+            | "override"
+            | "final"
+            | "overload"
+            | "deprecated"
+            | "contextmanager"
+            | "asynccontextmanager"
+            | "cache"
+            | "lru_cache"
+            | "wraps"
+            | "memo"
+            | "pure"
+            | "gatherable"
+    ) {
+        return true;
+    }
+    let Expr::Name(n) = deco else {
+        return false;
+    };
+    let Some(f) = defs.get(n.id.as_str()) else {
+        return false;
+    };
+    let tps = type_param_names_from(f.type_params.as_deref());
+    let first = f
+        .parameters
+        .posonlyargs
+        .iter()
+        .chain(f.parameters.args.iter())
+        .next()
+        .and_then(|p| p.parameter.annotation.as_deref());
+    match (first, f.returns.as_deref()) {
+        (Some(takes), Some(gives)) => {
+            let takes = type_from_annotation_with_params(takes, classes, &tps);
+            // `Callable[..., R]` (or `Any`) in and out says nothing about
+            // the parameters: it is not the same signature.
+            let erased = match &takes {
+                Type::Unknown | Type::Any => true,
+                Type::Function {
+                    params,
+                    variadic: true,
+                    ..
+                } => callables::parameter_pack(params).is_none(),
+                _ => false,
+            };
+            !erased && takes == type_from_annotation_with_params(gives, classes, &tps)
+        }
+        _ => false,
+    }
+}
+
+/// What the decorators of the method `f` make of its call signature. A
+/// single signature-changing decorator that is a module `def` declaring a
+/// concrete `Callable[[…], R]` result gives that callable's signature.
+fn decorated_signature(
+    f: &ruff_python_ast::StmtFunctionDef,
+    classes: &[String],
+    defs: &ModuleDefs,
+) -> DecoratedSignature {
+    let mut changing = f
+        .decorator_list
+        .iter()
+        .filter(|d| !decorator_keeps_signature(&d.expression, defs, classes));
+    let Some(only) = changing.next() else {
+        return DecoratedSignature::Def;
+    };
+    if changing.next().is_some() {
+        return DecoratedSignature::Unknown;
+    }
+    let Expr::Name(n) = &only.expression else {
+        return DecoratedSignature::Unknown;
+    };
+    let Some(deco) = defs.get(n.id.as_str()) else {
+        return DecoratedSignature::Unknown;
+    };
+    let tps = type_param_names_from(deco.type_params.as_deref());
+    let Some(Type::Function {
+        params,
+        ret,
+        variadic: false,
+        ..
+    }) = deco
+        .returns
+        .as_deref()
+        .map(|r| type_from_annotation_with_params(r, classes, &tps))
+    else {
+        return DecoratedSignature::Unknown;
+    };
+    let def_names: Vec<&str> = f
+        .parameters
+        .posonlyargs
+        .iter()
+        .chain(f.parameters.args.iter())
+        .map(|p| p.parameter.name.as_str())
+        .collect();
+    let n = params.len();
+    DecoratedSignature::Callable(Box::new(ArityInfo {
+        param_names: (0..n)
+            .map(|i| {
+                def_names
+                    .get(i)
+                    .map_or_else(|| format!("arg{i}"), |n| (*n).to_owned())
+            })
+            .collect(),
+        min_positional: n,
+        required_positional: vec![true; n],
+        max_positional: Some(n),
+        posonly_count: 0,
+        kwonly_names: Vec::new(),
+        kwonly_required: Vec::new(),
+        has_kwarg: false,
+        vararg_type: None,
+        param_types: params,
+        kwonly_types: Vec::new(),
+        return_type: *ret,
+        is_async: false,
+        declared_sync: false,
+    }))
+}
+
 /// Walk a class body and record its methods and annotated fields into an
 /// [`InterfaceShape`]. The receiver parameter (first positional, conventionally
 /// `self` or `cls`) is excluded from the arity count.
 ///
 /// `classes` is the module-level class list, threaded through so nominal
 /// references in field annotations (`field: OtherClass`) resolve correctly
-/// rather than landing as `Type::Unknown`.
-fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -> InterfaceShape {
+/// rather than landing as `Type::Unknown`. `defs` are the module's own
+/// `def`s, which a decorator on a method may name.
+fn collect_class_shape(
+    cd: &ruff_python_ast::StmtClassDef,
+    classes: &[String],
+    defs: &ModuleDefs,
+) -> InterfaceShape {
     let mut shape = InterfaceShape::default();
     // R3-15 (2026-05-25): the enclosing class's PEP 695 type
     // parameters are in scope for every method body, so a method
@@ -11791,6 +12096,7 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
                         arity_info,
                         param_types,
                         is_async: f.is_async,
+                        decorated: decorated_signature(f, classes, defs),
                     },
                 );
             }
@@ -12512,55 +12818,114 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-/// The full [`ArityInfo`] of the callee `recv.attr` names, exactly as
-/// `infer_expr`'s `Expr::Attribute` arm records it for a call: the
-/// receiver's own [`MethodSig`] (a TypeVar receiver reads its bound's), or a
-/// module function's — so keyword names, defaults, `*args` and kw-only
-/// parameters are the callee's and never a same-named module-level
-/// function's. Used for an alias of a bound method (`let g = u.greet`).
-/// `receiver_is_class` is the unbound form `Cls.method(inst, …)`: an
-/// instance method then takes the receiver as its first positional, exactly
-/// where `infer_expr` inserts it into the callee's `Type::Function`. `None`
-/// for a property, a name with no known method, or any other receiver — a
-/// builtin value's method keeps its structural signature.
-fn method_callee_arity(
-    c: &Checker,
-    recv: &Type,
-    receiver_is_class: bool,
-    attr: &str,
-) -> Option<ArityInfo> {
-    let (class_name, may_be_unbound) = match recv {
-        Type::Class(n) => (n.as_str(), true),
-        Type::Generic(n, _) => (n.as_str(), false),
-        Type::TypeVar(tv) => match c.active_typevar_bounds.get(tv.as_str()) {
-            Some(Type::Class(bound)) => (bound.as_str(), false),
-            _ => return None,
-        },
-        Type::Module(m) => {
-            return c
-                .module_registry
-                .get(m)
-                .and_then(|shapes| shapes.function_arities.get(attr))
-                .cloned();
-        }
-        _ => return None,
-    };
-    let sig = c.find_method(class_name, attr)?;
-    if sig.is_property {
-        return None;
-    }
-    let unbound = may_be_unbound && receiver_is_class && takes_explicit_receiver(sig, attr);
-    Some(method_sig_arity(sig, class_name, unbound))
-}
-
-/// The callee `ArityInfo` of `class_name`'s method `sig`; `unbound` puts the
-/// receiver back as the first positional (see [`method_callee_arity`]).
+/// The callee `ArityInfo` of `class_name`'s method `sig`, exactly as a call
+/// through `recv.attr` sees it: the method's own keyword names, defaults,
+/// `*args` and kw-only parameters, never a same-named module function's.
+/// `unbound` is the form `Cls.method(inst, …)`, where an instance method
+/// takes the receiver as its first positional.
 fn method_sig_arity(sig: &MethodSig, class_name: &str, unbound: bool) -> ArityInfo {
     let info = sig.arity_info.clone();
     if unbound {
         with_receiver_slot(info, Type::Class(class_name.to_owned()))
     } else {
         info
+    }
+}
+
+/// How `recv.attr` reads a method: through an instance, through the class
+/// itself (`Cls.method(inst, …)`), or through a TypeVar bounded by the class.
+#[derive(Clone, Copy, PartialEq)]
+enum MethodAccess {
+    Bound,
+    Unbound,
+    TypeVar,
+}
+
+/// What a call through `recv.attr` sees of `class_name`'s method `sig`.
+struct MethodCall {
+    /// The positional parameter types put on the callee's `Type::Function`.
+    params: Vec<Type>,
+    ret: Type,
+    /// The callee's [`ArityInfo`] to record for the call, flagged as in
+    /// `Checker::attr_callee_arity`. `None` leaves the call to the
+    /// structural check.
+    arity: Option<(ArityInfo, bool)>,
+}
+
+fn method_call(sig: &MethodSig, class_name: &str, access: MethodAccess) -> MethodCall {
+    let unbound = access == MethodAccess::Unbound;
+    let mut params = match access {
+        MethodAccess::TypeVar => vec![Type::Unknown; sig.arity],
+        _ => sig.param_types.clone(),
+    };
+    if unbound {
+        params.insert(0, Type::Class(class_name.to_owned()));
+    }
+    // Pad with Unknowns if the recorded param_types is shorter than the
+    // recorded arity (defensive — both should be derived from the same
+    // source).
+    let arity = sig.arity + usize::from(unbound);
+    if params.len() < arity {
+        params.resize(arity, Type::Unknown);
+    }
+    let ret = if sig.is_async && access != MethodAccess::TypeVar {
+        Type::Generic("Coroutine".into(), vec![sig.return_type.clone()])
+    } else {
+        sig.return_type.clone()
+    };
+    match &sig.decorated {
+        DecoratedSignature::Def => MethodCall {
+            params,
+            ret,
+            arity: Some((method_sig_arity(sig, class_name, unbound), true)),
+        },
+        DecoratedSignature::Callable(info) => {
+            // The callable lists an instance or class method's receiver
+            // first; only an unbound instance-method call passes it.
+            let callee = if unbound || sig.is_static {
+                (**info).clone()
+            } else {
+                strip_receiver_from_arity((**info).clone())
+            };
+            MethodCall {
+                params: callee.param_types.clone(),
+                ret: callee.return_type.clone(),
+                arity: Some((callee, true)),
+            }
+        }
+        // The `def`'s parameters may not be the call's. A bound call keeps
+        // being checked against them, as it always was; the other forms
+        // keep their structural check.
+        DecoratedSignature::Unknown => MethodCall {
+            params,
+            ret,
+            arity: (access == MethodAccess::Bound)
+                .then(|| (method_sig_arity(sig, class_name, false), false)),
+        },
+    }
+}
+
+/// Whether the receiver expression `recv` names a class itself — `Cls`, or
+/// `mod.Cls` / `pkg.sub.Cls` through the module registry — rather than an
+/// instance of one: a method read through it is unbound.
+fn receiver_names_class(c: &Checker, recv: &Expr) -> bool {
+    match recv {
+        Expr::Name(n) => c.classes.iter().any(|cn| cn == n.id.as_str()),
+        Expr::Attribute(a) => {
+            let head = c
+                .expression_types
+                .get(&expr_span(&a.value))
+                .cloned()
+                .unwrap_or_else(|| infer_expr_readonly(c, &a.value));
+            matches!(
+                &head,
+                Type::Module(m) if c
+                    .module_registry
+                    .get(m)
+                    .is_some_and(|shapes| shapes.class_shapes.contains_key(a.attr.as_str()))
+            )
+        }
+        _ => false,
     }
 }
 
@@ -14138,6 +14503,8 @@ struct FieldWriteSummary {
     funcs: HashMap<String, Option<HashSet<String>>>,
     /// Method name → the union over every local class's method of that name.
     methods: HashMap<String, Option<HashSet<String>>>,
+    /// `(class, method)` → what that class's own definition may write.
+    class_methods: HashMap<(String, String), Option<HashSet<String>>>,
     /// Module-level import bindings: local name → dotted source module
     /// (a leading `.` for a relative import).
     imports: HashMap<String, String>,
@@ -14344,7 +14711,9 @@ impl FieldWriteSummary {
             into.funcs.extend(from.funcs);
             into.methods.extend(from.methods);
         }
-        // "f:<name>" for functions and constructors, "m:<name>" for methods.
+        // "f:<name>" for functions and constructors, "m:<name>" for methods,
+        // "c:<class>.<name>" for one class's own method (an `impl` block's
+        // included).
         let mut direct: HashMap<String, Direct> = HashMap::new();
         for s in body {
             match s {
@@ -14364,6 +14733,12 @@ impl FieldWriteSummary {
                                 let again = facts(&f.body, ctor);
                                 merge_direct(direct.entry(ctor_key.clone()).or_default(), again);
                             }
+                            let class = cd.name.strip_prefix("__typhon_impl_").unwrap_or(&cd.name);
+                            let own = facts(&f.body, ctor);
+                            merge_direct(
+                                direct.entry(format!("c:{class}.{name}")).or_default(),
+                                own,
+                            );
                             merge_direct(direct.entry(format!("m:{name}")).or_default(), d);
                         }
                     }
@@ -14418,6 +14793,11 @@ impl FieldWriteSummary {
                 out.funcs.insert(name.to_owned(), w);
             } else if let Some(name) = k.strip_prefix("m:") {
                 out.methods.insert(name.to_owned(), w);
+            } else if let Some((class, method)) =
+                k.strip_prefix("c:").and_then(|cm| cm.split_once('.'))
+            {
+                out.class_methods
+                    .insert((class.to_owned(), method.to_owned()), w);
             }
         }
         out
@@ -14451,20 +14831,28 @@ fn is_builtin_value_type(t: &Type) -> bool {
 /// `Some(Some("reset"))`; anything else → `Some(None)`). `None` for a
 /// module-level binding, a nested `def`, or no binding at all.
 fn local_value_binding<'a>(c: &Checker<'a>, name: &str) -> Option<Option<&'a str>> {
-    let binding = c.env.lookup(name)?;
-    if c.env.scope_of(name)? == 0 {
-        return None;
-    }
-    let resolved = c
-        .resolved
-        .scopes
-        .iter()
-        .flat_map(|s| &s.bindings)
-        .find(|b| b.name == name && b.span.0 == binding.span.0)?;
+    let resolved = if c.env.scope_of(name)? == 0 {
+        // The env can still show the module binding where the body binds
+        // `name` itself (read ahead of the local's assignment, say).
+        if !callables::binds_locally(c, name) {
+            return None;
+        }
+        c.resolved
+            .scopes
+            .get(c.function_scope)?
+            .lookup_local(name)?
+    } else {
+        let binding = c.env.lookup(name)?;
+        c.resolved
+            .scopes
+            .iter()
+            .flat_map(|s| &s.bindings)
+            .find(|b| b.name == name && b.span.0 == binding.span.0)?
+    };
     match resolved.kind {
         BindingKind::Parameter | BindingKind::Loop => Some(None),
         // Only a `let` alias is known to still hold its initial value.
-        BindingKind::Value => Some(match callables::alias_value(c, binding.span.0) {
+        BindingKind::Value => Some(match callables::alias_value(c, resolved.span.0) {
             Some(Expr::Name(target)) if resolved.mutability == tyc_resolve::Mutability::Let => {
                 Some(target.id.as_str())
             }
@@ -14528,16 +14916,84 @@ fn call_arg_effect(c: &Checker, call: &ruff_python_ast::ExprCall) -> ArgEffect {
                 Type::Module(m) if is_stdlib_dotted(m) => ArgEffect::Nothing,
                 t if is_builtin_value_type(t) => ArgEffect::Nothing,
                 Type::Class(name) if s.funcs.contains_key(name.as_str()) => {
-                    match s.methods.get(a.attr.as_str()) {
-                        Some(w) => ArgEffect::from_summary(w),
-                        None => ArgEffect::Anything,
-                    }
+                    method_effect(c, name, a.attr.as_str())
                 }
                 _ => ArgEffect::Anything,
             }
         }
         _ => ArgEffect::Anything,
     }
+}
+
+/// What `recv.m(…)` may write when `recv` is typed as the local class `cls`:
+/// the definition `cls` resolves `m` to, plus every override in a local
+/// subclass (the object may be one). An interface-typed receiver may be any
+/// conforming class, and a definition outside this module is not known, so
+/// those take the union over every local class's `m`.
+fn method_effect(c: &Checker, cls: &str, m: &str) -> ArgEffect {
+    let s = &c.field_writes;
+    let union = || {
+        s.methods
+            .get(m)
+            .map_or(ArgEffect::Anything, ArgEffect::from_summary)
+    };
+    if c.is_interface_name(cls) {
+        return union();
+    }
+    let Some(definer) = method_definer(c, cls, m) else {
+        return union();
+    };
+    let overrides = s
+        .class_methods
+        .keys()
+        .filter(|(owner, method)| {
+            method == m && owner != &definer && c.class_inherits_from(owner, cls)
+        })
+        .map(|(owner, _)| owner.clone());
+    let mut writes = HashSet::new();
+    for owner in std::iter::once(definer.clone()).chain(overrides) {
+        match s.class_methods.get(&(owner, m.to_owned())) {
+            Some(Some(fields)) => writes.extend(fields.iter().cloned()),
+            Some(None) => return ArgEffect::Anything,
+            None => return union(),
+        }
+    }
+    if writes.is_empty() {
+        ArgEffect::Nothing
+    } else {
+        ArgEffect::Fields(writes)
+    }
+}
+
+/// The local class whose own `m` a call on a `cls` resolves to, walking
+/// `cls`'s bases; `None` when the walk meets a class from elsewhere that may
+/// define `m`, or no class defines it.
+fn method_definer(c: &Checker, cls: &str, m: &str) -> Option<String> {
+    let s = &c.field_writes;
+    let mut stack = vec![cls.to_owned()];
+    let mut seen = HashSet::new();
+    while let Some(current) = stack.pop() {
+        if !seen.insert(current.clone()) {
+            continue;
+        }
+        if s.class_methods
+            .contains_key(&(current.clone(), m.to_owned()))
+        {
+            return Some(current);
+        }
+        if !s.funcs.contains_key(current.as_str()) {
+            // Not declared here: unknown unless its shape says it lacks `m`.
+            let shape = c.resolve_class_shape(&current)?;
+            if shape.methods.contains_key(m) {
+                return None;
+            }
+            stack.extend(shape.bases.iter().rev().cloned());
+        }
+        if let Some(parents) = c.class_parents.get(&current) {
+            stack.extend(parents.iter().rev().cloned());
+        }
+    }
+    None
 }
 
 /// Drop the narrowings a method call `recv.m(…)` may have made stale, where
@@ -15244,7 +15700,18 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         n.range.start().to_usize(),
                         n.range.start().to_usize() + n.id.as_str().len(),
                     );
-                    let existing = c.env.lookup(n.id.as_str()).cloned();
+                    // `let step = pick()` in a body whose module (or an
+                    // enclosing function) binds `step` declares a local of
+                    // this body: it is not a reassignment of that binding.
+                    let binds_local = callables::assignment_binds_local(c, n.id.as_str());
+                    if binds_local {
+                        c.reassigned_names.insert(n.id.as_str().to_owned());
+                    }
+                    let existing = c
+                        .env
+                        .lookup(n.id.as_str())
+                        .filter(|_| !binds_local)
+                        .cloned();
                     if let Some(b) = existing {
                         // A name rebound inside this function no longer
                         // resolves to the pre-scanned module-level `def`
@@ -15433,8 +15900,13 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // The body sees this def's own bounds. The name-keyed
             // `function_type_bounds` (call sites) holds module-level defs
             // only, from the signature pre-pass: a method or nested def of
-            // the same name must neither read nor overwrite it.
+            // the same name must neither read nor overwrite it. Its call
+            // sites find its bounds through the binding instead.
             let bounds = type_param_bounds_from(f.type_params.as_deref(), &c.classes.clone());
+            if !bounds.is_empty() {
+                c.def_type_bounds
+                    .insert(f.name.range.start().to_usize(), bounds.clone());
+            }
             check_function(
                 c,
                 (
@@ -16757,10 +17229,10 @@ fn check_function(
     }
 
     let saved_return = c.current_return.replace(ret_type.clone());
-    let saved_function_scope = std::mem::replace(
-        &mut c.function_scope,
-        c.resolved.scope_at_offset(name_span_offset),
-    );
+    // The body's resolver scope is installed only once the parameter
+    // defaults are checked: Python evaluates them in the enclosing scope,
+    // so a body-local rebinding of a name must not affect them.
+    let saved_function_scope = c.function_scope;
     // `unsafe_origin_bindings` survives the env-scope restore that
     // follows the `if True:` body, but it must NOT survive a function
     // boundary — otherwise an unsafe leak diagnosed in one function
@@ -16936,10 +17408,13 @@ fn check_function(
     }
     // From here on a class body around this `def` is out of sight.
     c.env.mark_function_frame();
+    c.function_scope = c.resolved.scope_at_offset(name_span_offset);
+    let shadowed_classes = shadow_outer_classes(c, body);
 
     for stmt in body {
         check_stmt(c, stmt);
     }
+    restore_outer_classes(c, shadowed_classes);
 
     // R3-8 definite-assignment analysis. Walk the function body once,
     // tracking the "definitely-assigned" set at every control-flow
@@ -17004,6 +17479,151 @@ fn check_function(
     }
     c.in_async_function = saved_in_async;
     c.in_generator = saved_in_generator;
+}
+
+/// What a function-local class replaced of a same-named outer class's
+/// facts while the body is checked: `(name, shape, frozen, parents)`.
+type ShadowedClass = (String, Option<InterfaceShape>, bool, Option<Vec<String>>);
+
+/// A class declared in a function body is what its name means in the whole
+/// body, even where the module (or an import) has a class of that name. Types
+/// are keyed by bare name, though, so a parameter or global typed as the
+/// outer class reads the same name there: until the body is checked the name
+/// stands for either class — what both say of a member, frozen only when both
+/// are, and with a base of unknown shape, so a member neither knows about and
+/// a constructor call are not judged.
+fn shadow_outer_classes(c: &mut Checker, body: &[Stmt]) -> Vec<ShadowedClass> {
+    fn collect<'a>(body: &'a [Stmt], out: &mut Vec<&'a ruff_python_ast::StmtClassDef>) {
+        for stmt in body {
+            match stmt {
+                Stmt::ClassDef(cd) => out.push(cd),
+                Stmt::If(s) => {
+                    collect(&s.body, out);
+                    for clause in &s.elif_else_clauses {
+                        collect(&clause.body, out);
+                    }
+                }
+                Stmt::For(s) => {
+                    collect(&s.body, out);
+                    collect(&s.orelse, out);
+                }
+                Stmt::While(s) => {
+                    collect(&s.body, out);
+                    collect(&s.orelse, out);
+                }
+                Stmt::With(s) => collect(&s.body, out),
+                Stmt::Try(s) => {
+                    collect(&s.body, out);
+                    for h in &s.handlers {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                        collect(&h.body, out);
+                    }
+                    collect(&s.orelse, out);
+                    collect(&s.finalbody, out);
+                }
+                Stmt::Match(s) => {
+                    for case in &s.cases {
+                        collect(&case.body, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut defs = Vec::new();
+    collect(body, &mut defs);
+    let shadowing: Vec<&ruff_python_ast::StmtClassDef> = defs
+        .iter()
+        .copied()
+        .filter(|cd| {
+            let name = cd.name.as_str();
+            !name.starts_with("__typhon_") && c.class_shapes.contains_key(name)
+        })
+        .collect();
+    if shadowing.is_empty() {
+        return Vec::new();
+    }
+    let classes = c.classes.clone();
+    let module_defs = c.module.map(|m| module_defs(&m.body)).unwrap_or_default();
+    let mut saved = Vec::new();
+    for cd in shadowing {
+        let name = cd.name.as_str();
+        let mut local = collect_class_shape(cd, &classes, &module_defs);
+        let pseudo = format!("__typhon_impl_{name}");
+        for block in defs.iter().filter(|d| d.name.as_str() == pseudo) {
+            let extra = collect_class_shape(block, &classes, &module_defs);
+            local.methods.extend(extra.methods);
+            local.fields.extend(extra.fields);
+        }
+        let outer = c.class_shapes.get(name).cloned().unwrap_or_default();
+        let mut either = InterfaceShape {
+            bases: vec!["__typhon_unknown_base__".to_owned()],
+            ..InterfaceShape::default()
+        };
+        for (field, ty) in local.fields.iter().chain(&outer.fields) {
+            let agreed = match (local.fields.get(field), outer.fields.get(field)) {
+                (Some(a), Some(b)) if a != b => Type::Unknown,
+                _ => ty.clone(),
+            };
+            if either.fields.insert(field.clone(), agreed).is_none() {
+                either.field_order.push(field.clone());
+            }
+            // Whichever class a call constructs, it is not judged.
+            either.field_defaults.insert(field.clone());
+        }
+        // A method both declare may be either signature.
+        for (method, sig) in local.methods.iter().chain(&outer.methods) {
+            if !(local.methods.contains_key(method) && outer.methods.contains_key(method)) {
+                either.methods.insert(method.clone(), sig.clone());
+            }
+        }
+        let start = u32::from(cd.range.start());
+        let name_start = u32::from(cd.name.range.start());
+        let local_frozen = c
+            .frozen_line_starts
+            .iter()
+            .any(|&m| m >= start && m <= name_start);
+        let old_shape = c.class_shapes.insert(name.to_owned(), either);
+        let old_frozen = c.frozen_classes.contains(name);
+        if !local_frozen {
+            c.frozen_classes.remove(name);
+            c.frozen_classes.remove(&pseudo);
+        }
+        let old_parents = c
+            .class_parents
+            .insert(name.to_owned(), vec!["__typhon_unknown_base__".to_owned()]);
+        saved.push((name.to_owned(), old_shape, old_frozen, old_parents));
+    }
+    saved
+}
+
+/// Put back what [`shadow_outer_classes`] replaced, innermost last-in first.
+fn restore_outer_classes(c: &mut Checker, saved: Vec<ShadowedClass>) {
+    for (name, shape, frozen, parents) in saved.into_iter().rev() {
+        match shape {
+            Some(shape) => {
+                c.class_shapes.insert(name.clone(), shape);
+            }
+            None => {
+                c.class_shapes.remove(&name);
+            }
+        }
+        for key in [name.clone(), format!("__typhon_impl_{name}")] {
+            if frozen {
+                c.frozen_classes.insert(key);
+            } else {
+                c.frozen_classes.remove(&key);
+            }
+        }
+        match parents {
+            Some(p) => {
+                c.class_parents.insert(name, p);
+            }
+            None => {
+                c.class_parents.remove(&name);
+            }
+        }
+    }
 }
 
 /// R3-8 definite-assignment pass. Walks a function body looking for
@@ -20486,6 +21106,42 @@ fn builtin_str_method(attr: &str) -> Option<Type> {
 /// arguments, positionally only — `d.get(k, default=0)` and `d.get(k, a, b)`
 /// raise `TypeError` (a `Mapping`'s Python-level `get` takes `default=`, so
 /// it keeps the permissive signature).
+/// Whether `recv` inherits `dict.get` without its type being modelled: a
+/// `defaultdict`, `OrderedDict` or `Counter`, or a local subclass of a
+/// `dict` that does not define its own `get`.
+fn inherits_dict_get(c: &Checker, recv: &Type) -> bool {
+    const DICTS: &[&str] = &["dict", "defaultdict", "OrderedDict", "Counter"];
+    match recv {
+        Type::Generic(head, _) => {
+            matches!(head.as_str(), "defaultdict" | "OrderedDict" | "Counter")
+                && !is_user_builtin_extension(c, head, "get")
+        }
+        Type::Class(name) => {
+            c.find_method(name, "get").is_none() && c.class_derives_from_builtin(name, DICTS)
+        }
+        _ => false,
+    }
+}
+
+/// Whether `expr` reads a module-level `freeze let` binding, or a value
+/// nested in one (`CFG["db"]`): deep-frozen, a dict there is a
+/// `mappingproxy` or a `frozendict`.
+fn reads_freeze_let(c: &Checker, expr: &Expr) -> bool {
+    match expr {
+        Expr::Subscript(s) => reads_freeze_let(c, &s.value),
+        Expr::Name(n) => {
+            let name = n.id.as_str();
+            c.env.scope_of(name) == Some(0)
+                && !callables::binds_locally(c, name)
+                && c.env.lookup(name).is_some_and(|b| {
+                    callables::alias_value(c, b.span.0)
+                        .is_some_and(|value| freeze_call_argument(value).is_some())
+                })
+        }
+        _ => false,
+    }
+}
+
 fn builtin_method_arity(recv: &Type, attr: &str, method: &Type) -> Option<ArityInfo> {
     let Type::Generic(head, _) = recv else {
         return None;
@@ -22698,14 +23354,11 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     }
                 }
             }
-            c.attr_callee_arity = None;
             let func_type_raw = infer_expr(c, &call.func);
-            let callee_span = expr_span(&call.func);
             let attr_callee_arity = c
                 .attr_callee_arity
-                .take()
-                .filter(|(span, _)| *span == callee_span)
-                .map(|(_, info)| info);
+                .get(&expr_span(&call.func))
+                .map(|(info, _)| info.clone());
             // Unwrap transparent type aliases (`type Handler = Callable[..., R]`)
             // so that calls through the alias resolve to the underlying
             // `Type::Function` rather than the alias name. Without this,
@@ -23157,9 +23810,22 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     // result instead of `Any`.
                     // Also check that each inferred binding satisfies the
                     // TypeVar's declared bound (e.g. `T: Interface`).
-                    if let Some(fn_name) = table_key {
+                    let bounds = match table_key {
+                        Some(fn_name) => c.function_type_bounds.get(fn_name).cloned(),
+                        // A nested `def`: its bounds by the binding the name
+                        // resolves to.
+                        None => match call.func.as_ref() {
+                            Expr::Name(n) => c
+                                .env
+                                .lookup(n.id.as_str())
+                                .and_then(|b| c.def_type_bounds.get(&b.span.0))
+                                .cloned(),
+                            _ => None,
+                        },
+                    };
+                    if let Some(bounds) = bounds {
                         c.check_call_typevar_bounds(
-                            fn_name, &params, &actuals, &ret, expected, call_span,
+                            &bounds, &params, &actuals, &ret, expected, call_span,
                         );
                     }
                     // Bidirectional pass: if any TypeVar in `ret` is still
@@ -23619,6 +24285,8 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             }
         }
         Expr::Attribute(a) => {
+            // Whatever an earlier inference of this node recorded is stale.
+            c.attr_callee_arity.remove(&expr_span(expr));
             // Flow-sensitive attribute narrowing: `if self.x is None: return …`
             // narrows `self.x` to non-`None` for the rest of the block.
             if let Some(narrowed) = expression_attr_narrowing(c, expr) {
@@ -23675,10 +24343,60 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             }
             // Resolve attribute access on known class instances and TypeVar-bounded parameters.
             if let Some(method_type) = builtin_generic_method(&recv, attr_name) {
-                if let Some(info) = builtin_method_arity(&recv, attr_name, &method_type) {
-                    c.attr_callee_arity = Some((expr_span(expr), info));
+                // A user `extend dict: def get(…)` replaces the builtin
+                // method at the calls the desugar rewrites (receivers typed
+                // as that builtin): the call sees the extension's signature.
+                if let Type::Generic(head, _) = &recv {
+                    let sentinel = format!("__typhon_builtin_ext_{head}");
+                    if let Some(sig) = c
+                        .class_shapes
+                        .get(&sentinel)
+                        .and_then(|shape| shape.methods.get(attr_name))
+                        .cloned()
+                    {
+                        let call = method_call(&sig, &sentinel, MethodAccess::Bound);
+                        if let Some(arity) = call.arity {
+                            c.attr_callee_arity.insert(expr_span(expr), arity);
+                        }
+                        return Type::Function {
+                            params: call.params,
+                            ret: Box::new(call.ret),
+                            variadic: false,
+                            min_params: None,
+                        };
+                    }
+                }
+                // A `freeze let` dict is a `mappingproxy` (or a `frozendict`),
+                // whose `get` is `dict.get`; any other `Mapping` keeps the
+                // permissive `collections.abc.Mapping.get`.
+                let as_dict = match &recv {
+                    Type::Generic(head, args)
+                        if head == "Mapping" && reads_freeze_let(c, &a.value) =>
+                    {
+                        Type::Generic("dict".into(), args.clone())
+                    }
+                    other => other.clone(),
+                };
+                if let Some(info) = builtin_method_arity(&as_dict, attr_name, &method_type) {
+                    c.attr_callee_arity.insert(expr_span(expr), (info, true));
                 }
                 return method_type;
+            }
+            // `defaultdict` / `OrderedDict` / `Counter` and a local `dict`
+            // subclass inherit `dict.get`, positional-only. Their method types
+            // are not modelled, so only the call's shape is.
+            if attr_name == "get" && inherits_dict_get(c, &recv) {
+                let method = Type::Function {
+                    params: vec![Type::Unknown, Type::Unknown],
+                    ret: Box::new(Type::Unknown),
+                    variadic: false,
+                    min_params: None,
+                };
+                let as_dict = Type::Generic("dict".into(), vec![Type::Unknown, Type::Unknown]);
+                if let Some(info) = builtin_method_arity(&as_dict, attr_name, &method) {
+                    c.attr_callee_arity.insert(expr_span(expr), (info, true));
+                }
+                return method;
             }
             // Builtin generic heads (list / dict / set / tuple / str / bytes /
             // frozenset) that hit `builtin_generic_method` and got `None` are a
@@ -23798,7 +24516,8 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         };
                         let ret = info.return_type.clone();
                         let variadic = info.max_positional.is_none();
-                        c.attr_callee_arity = Some((expr_span(expr), info.clone()));
+                        c.attr_callee_arity
+                            .insert(expr_span(expr), (info.clone(), true));
                         c.function_arity_info.entry(qualified).or_insert(info);
                         return Type::Function {
                             params,
@@ -23843,10 +24562,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             match &recv {
                 Type::Class(class_name) => {
                     let class_name = class_name.clone();
-                    let receiver_is_class_name = matches!(
-                        a.value.as_ref(),
-                        Expr::Name(n) if c.classes.iter().any(|cn| cn == n.id.as_str())
-                    );
+                    let receiver_is_class = receiver_names_class(c, &a.value);
                     if let Some(sig) = c.find_method(class_name.as_str(), attr_name) {
                         // `@property` methods are read as attributes — return
                         // the underlying type directly instead of a bound-
@@ -23854,30 +24570,19 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         if sig.is_property {
                             return sig.return_type.clone();
                         }
-                        let mut arity = sig.arity;
-                        let mut params = sig.param_types.clone();
-                        let unbound =
-                            receiver_is_class_name && takes_explicit_receiver(sig, attr_name);
-                        if unbound {
-                            arity = arity.saturating_add(1);
-                            params.insert(0, Type::Class(class_name.clone()));
-                        }
-                        let callee = method_sig_arity(sig, &class_name, unbound);
-                        // Pad with Unknowns if the recorded param_types is
-                        // shorter than the recorded arity (defensive — both
-                        // should be derived from the same source).
-                        if params.len() < arity {
-                            params.resize(arity, Type::Unknown);
-                        }
-                        let ret = if sig.is_async {
-                            Type::Generic("Coroutine".into(), vec![sig.return_type.clone()])
+                        let access = if receiver_is_class && takes_explicit_receiver(sig, attr_name)
+                        {
+                            MethodAccess::Unbound
                         } else {
-                            sig.return_type.clone()
+                            MethodAccess::Bound
                         };
-                        c.attr_callee_arity = Some((expr_span(expr), callee));
+                        let call = method_call(sig, &class_name, access);
+                        if let Some(arity) = call.arity {
+                            c.attr_callee_arity.insert(expr_span(expr), arity);
+                        }
                         return Type::Function {
-                            params,
-                            ret: Box::new(ret),
+                            params: call.params,
+                            ret: Box::new(call.ret),
                             variadic: false,
                             min_params: None,
                         };
@@ -23961,23 +24666,16 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         if sig.is_property {
                             return substitute_typevars(&sig.return_type, &bindings);
                         }
-                        let params: Vec<Type> = sig
-                            .param_types
+                        let call = method_call(&sig, &class_name, MethodAccess::Bound);
+                        let params: Vec<Type> = call
+                            .params
                             .iter()
                             .map(|p| substitute_typevars(p, &bindings))
                             .collect();
-                        let mut params = params;
-                        if params.len() < sig.arity {
-                            params.resize(sig.arity, Type::Unknown);
+                        let ret = substitute_typevars(&call.ret, &bindings);
+                        if let Some(arity) = call.arity {
+                            c.attr_callee_arity.insert(expr_span(expr), arity);
                         }
-                        let ret = substitute_typevars(&sig.return_type, &bindings);
-                        let ret = if sig.is_async {
-                            Type::Generic("Coroutine".into(), vec![ret])
-                        } else {
-                            ret
-                        };
-                        c.attr_callee_arity =
-                            Some((expr_span(expr), method_sig_arity(&sig, &class_name, false)));
                         return Type::Function {
                             params,
                             ret: Box::new(ret),
@@ -24044,13 +24742,13 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                             if sig.is_property {
                                 return sig.return_type.clone();
                             }
-                            let arity = sig.arity;
-                            let ret = sig.return_type.clone();
-                            let callee = method_sig_arity(sig, &bound_name, false);
-                            c.attr_callee_arity = Some((expr_span(expr), callee));
+                            let call = method_call(sig, &bound_name, MethodAccess::TypeVar);
+                            if let Some(arity) = call.arity {
+                                c.attr_callee_arity.insert(expr_span(expr), arity);
+                            }
                             return Type::Function {
-                                params: vec![Type::Unknown; arity],
-                                ret: Box::new(ret),
+                                params: call.params,
+                                ret: Box::new(call.ret),
                                 variadic: false,
                                 min_params: None,
                             };
@@ -25437,18 +26135,17 @@ fn await_operand_is_shape_checkable(c: &Checker, operand: &Expr) -> bool {
         Expr::Call(call) => match call.func.as_ref() {
             Expr::Name(n) => {
                 let name = n.id.as_str();
-                if callables::decorated(c, name) {
-                    return false;
-                }
                 // Only this module's own declarations: an imported
                 // function's shape carries no async flag, so `await
                 // other.run()` on an `async def` imported from a sibling
-                // module must stay permissive.
+                // module must stay permissive. `known_sync` judges the `def`
+                // the name resolves to, its decorators included.
                 let sync_def = callables::known_sync(c, &call.func);
                 let own_class = c.local_classes.contains(name)
                     && c.class_shapes.contains_key(name)
                     && !c.is_interface_name(name)
-                    && c.class_hierarchy_fully_known(name);
+                    && c.class_hierarchy_fully_known(name)
+                    && !callables::class_decorated(c, name);
                 sync_def || own_class
             }
             Expr::Attribute(a) => {
@@ -25473,7 +26170,16 @@ fn await_operand_is_shape_checkable(c: &Checker, operand: &Expr) -> bool {
 /// hierarchy, no `__getattr__`, and a method `name` whose signature is not
 /// `async`.
 fn class_method_is_known_sync(c: &Checker, cls: &str, name: &str) -> bool {
-    !callables::decorated(c, name)
+    // A decorator may make a sync method awaitable — the `def` this call
+    // resolves to; any `def` of that name when it is not one of this
+    // module's class bodies.
+    let undecorated = match callables::method_def(c, cls, name) {
+        Some(f) => f.decorator_list.iter().all(|d| {
+            matches!(&d.expression, Expr::Name(n) if matches!(n.id.as_str(), "staticmethod" | "classmethod"))
+        }),
+        None => !callables::decorated(c, name),
+    };
+    undecorated
         && !cls.contains('.')
         && c.local_classes.contains(cls)
         && c.class_shapes.contains_key(cls)

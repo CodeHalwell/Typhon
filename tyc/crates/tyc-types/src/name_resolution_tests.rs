@@ -1742,3 +1742,938 @@ main()
     );
     assert_eq!(errors.len(), 1, "{errors:?}");
 }
+
+// ── An assignment in a function body binds a local of that body ──────────
+
+#[test]
+fn a_local_named_like_a_module_binding_is_a_new_local() {
+    // An unannotated `let` / `mut` / plain assignment shadowing a module
+    // `def`, import or annotated global declares a local; it is not checked
+    // as a reassignment of the module binding.
+    assert_clean(
+        r#"
+from typing import Callable
+
+count: int = 0
+
+def step(a: int, b: int) -> int:
+    return a + b
+
+def inc(x: int) -> int:
+    return x + 1
+
+def pick() -> Callable[[int], int]:
+    return inc
+
+def run() -> int:
+    let step = pick()
+    return step(1)
+
+def label() -> str:
+    let count = "x"
+    return count
+
+def lam() -> int:
+    let step = lambda x: x + 1
+    return step(1)
+
+def rebound() -> int:
+    mut step = inc
+    step = inc
+    return step(1)
+
+def main() -> None:
+    print(run(), label(), lam(), rebound(), step(1, 2), count)
+
+main()
+"#,
+    );
+    // The local keeps its own type: misuse is still reported, against the
+    // local, and the module binding is unchanged in another body.
+    let errors = only_errors(
+        r#"
+def step(a: int, b: int) -> int:
+    return a + b
+
+def inc(x: int) -> int:
+    return x + 1
+
+def run() -> int:
+    mut step = inc
+    step = "no"
+    return step(1, 2)
+
+def later() -> int:
+    return step(1)
+
+run()
+"#,
+        |e| {
+            matches!(
+                e,
+                TycError::TypeReassignMismatch { .. }
+                    | TycError::NotCallable { .. }
+                    | TycError::MissingArgument { .. }
+            )
+        },
+    );
+    assert_eq!(errors.len(), 3, "{errors:?}");
+}
+
+#[test]
+fn a_global_declaration_still_reassigns_the_module_binding() {
+    let errors = only_errors(
+        r#"
+mut count: int = 0
+
+def bump() -> None:
+    global count
+    count = "x"
+
+bump()
+"#,
+        |e| matches!(e, TycError::TypeReassignMismatch { .. }),
+    );
+    assert_eq!(errors.len(), 1, "{errors:?}");
+}
+
+#[test]
+fn a_shadowing_local_alias_uses_its_target_field_write_summary() {
+    // `let reset = touch` inside the body: `reset(b)` calls `touch`, which
+    // never writes `conn`.
+    let d = check(
+        r#"
+class Conn:
+    n: int
+
+impl Conn:
+    def query(self) -> int:
+        return self.n
+
+class Box:
+    conn: Conn?
+    count: int
+
+def reset(b: Box) -> None:
+    b.conn = None
+
+def touch(b: Box) -> None:
+    b.count = 1
+
+def use_alias(b: Box) -> int:
+    let reset = touch
+    if b.conn is not None:
+        reset(b)
+        return b.conn.query()
+    return 0
+
+def main() -> None:
+    let b = Box(conn=Conn(n=5), count=0)
+    print(use_alias(b))
+    reset(b)
+
+main()
+"#,
+    );
+    assert!(
+        d.errors().is_empty() && d.warnings().is_empty(),
+        "{:?} / {:?}",
+        messages(&d),
+        d.warnings()
+    );
+    // The mirror image: a local alias of the writer, `let` or `mut`, drops
+    // the narrowing.
+    for binding in ["let touch = reset", "mut touch = reset"] {
+        let src = format!(
+            r#"
+class Conn:
+    n: int
+
+impl Conn:
+    def query(self) -> int:
+        return self.n
+
+class Box:
+    conn: Conn?
+    count: int
+
+def reset(b: Box) -> None:
+    b.conn = None
+
+def touch(b: Box) -> None:
+    b.count = 1
+
+def use_alias(b: Box) -> int:
+    {binding}
+    if b.conn is not None:
+        touch(b)
+        return b.conn.query()
+    return 0
+
+print(use_alias(Box(conn=Conn(n=5), count=0)), touch)
+"#
+        );
+        let d = check(&src);
+        let nullable = d
+            .errors()
+            .iter()
+            .chain(d.warnings())
+            .filter(|e| matches!(e, TycError::NullableUse { .. }))
+            .count();
+        assert_eq!(nullable, 1, "{binding}: {:?}", messages(&d));
+    }
+}
+
+#[test]
+fn a_local_shadowing_a_blocking_module_import_is_not_blocking() {
+    for binding in ["let time = Timer(total=0.0)", "mut time = Timer(total=0.0)"] {
+        let src = format!(
+            r#"
+import asyncio
+import time
+
+class Timer:
+    total: float
+
+impl Timer:
+    def sleep(self, n: float) -> None:
+        self.total = self.total + n
+
+async def run() -> float:
+    {binding}
+    time.sleep(1.5)
+    await asyncio.sleep(0)
+    return time.total
+
+def stamp() -> float:
+    return time.monotonic()
+
+print(asyncio.run(run()), stamp() > 0)
+"#
+        );
+        let d = check(&src);
+        assert!(d.errors().is_empty(), "{binding}: {:?}", messages(&d));
+        assert!(
+            !d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::BlockingInAsync { .. })),
+            "{binding}: {:?}",
+            d.warnings()
+        );
+    }
+    // `from time import sleep` shadowed by a local `let sleep = fake`.
+    let d = check(
+        r#"
+import asyncio
+from time import sleep
+
+def fake(n: float) -> float:
+    return n * 2
+
+async def run() -> float:
+    let sleep = fake
+    await asyncio.sleep(0)
+    return sleep(1.5)
+
+print(asyncio.run(run()), sleep)
+"#,
+    );
+    assert!(
+        !d.warnings()
+            .iter()
+            .any(|w| matches!(w, TycError::BlockingInAsync { .. })),
+        "{:?}",
+        d.warnings()
+    );
+}
+
+#[test]
+fn a_bound_method_alias_keeps_the_receiver_it_was_defined_with() {
+    // `client` names a `Recorder` at the call, but `fetch` was bound to the
+    // module-level `HttpClient`'s `get`.
+    assert_clean(
+        r#"
+class HttpClient:
+    base: str
+
+impl HttpClient:
+    def get(self, path: str, *, timeout: float = 1.0) -> str:
+        return self.base + path
+
+class Recorder:
+    calls: list[str]
+
+impl Recorder:
+    def get(self, key: str, default: str, extra: int) -> str:
+        return default
+
+let client: HttpClient = HttpClient(base="http://h")
+let fetch = client.get
+
+def report(client: Recorder) -> str:
+    client.calls.append("report")
+    return fetch("/status") + fetch("/x", timeout=2.0)
+
+def poll(recorders: list[Recorder]) -> list[str]:
+    return [fetch("/status") + str(len(client.calls)) for client in recorders]
+
+def main() -> None:
+    print(report(Recorder(calls=[])), poll([Recorder(calls=[])]))
+
+main()
+"#,
+    );
+    // Control: the alias still checks the method it was bound to.
+    let errors = only_errors(
+        r#"
+class HttpClient:
+    base: str
+
+impl HttpClient:
+    def get(self, path: str) -> str:
+        return self.base + path
+
+class Recorder:
+    calls: list[str]
+
+let client: HttpClient = HttpClient(base="http://h")
+let fetch = client.get
+
+def report(client: Recorder) -> str:
+    return fetch()
+
+print(report(Recorder(calls=[])))
+"#,
+        |e| is_missing(e, "fetch", "path"),
+    );
+    assert_eq!(errors.len(), 1, "{errors:?}");
+}
+
+#[test]
+fn parameter_defaults_see_the_enclosing_scope() {
+    // A default is evaluated where the `def` is, so the body's own
+    // `let parse` does not hide the module function there.
+    assert_clean(
+        r#"
+def parse(s: str, *, base: int = 10) -> int:
+    return int(s, base)
+
+def scaled(n: int = parse("11", base=2)) -> int:
+    let parse: int = n * 2
+    return parse
+
+class Cfg:
+    n: int
+
+impl Cfg:
+    def size(self, n: int = parse("7", base=8)) -> int:
+        let parse: int = n
+        return parse
+
+def main() -> None:
+    print(scaled(), Cfg(n=1).size())
+
+main()
+"#,
+    );
+    // Control: a real arity error in a default is still reported.
+    let errors = only_errors(
+        r#"
+def parse(s: str, *, base: int = 10) -> int:
+    return int(s, base)
+
+def scaled(n: int = parse("11", 2, base=2)) -> int:
+    let parse: int = n * 2
+    return parse
+
+print(scaled())
+"#,
+        |e| matches!(e, TycError::WrongArgCount { .. }),
+    );
+    assert_eq!(errors.len(), 1, "{errors:?}");
+}
+
+// ── A decorator may change a method's call signature ─────────────────────
+
+#[test]
+fn a_callable_typed_decorator_gives_the_method_its_signature() {
+    // `inject_db` maps `(Repo, str, Db)` to `(Repo, str)`: every call form
+    // takes the decorated signature.
+    assert_clean(
+        r#"
+from typing import Callable
+
+class Db:
+    url: str
+
+let DB: Db = Db(url="mem://")
+
+class Repo:
+    name: str
+
+def inject_db(f: Callable[[Repo, str, Db], str]) -> Callable[[Repo, str], str]:
+    def wrapper(self: Repo, key: str) -> str:
+        return f(self, key, DB)
+    return wrapper
+
+impl Repo:
+    @inject_db
+    def find(self, key: str, db: Db) -> str:
+        return self.name + ":" + key + "@" + db.url
+
+def lookup[T: Repo](r: T) -> str:
+    return r.find("k2")
+
+def main() -> None:
+    let r: Repo = Repo(name="r")
+    print(Repo.find(r, "k"), r.find("k1"), r.find(key="k4"))
+    print(lookup(r))
+    let g = r.find
+    print(g("k3"))
+
+main()
+"#,
+    );
+    // The decorated signature is checked: it takes no `db`, and needs `key`.
+    let errors = only_errors(
+        r#"
+from typing import Callable
+
+class Repo:
+    name: str
+
+def drop_n(f: Callable[[Repo, str, int], str]) -> Callable[[Repo, str], str]:
+    def wrapper(self: Repo, key: str) -> str:
+        return f(self, key, 7)
+    return wrapper
+
+impl Repo:
+    @drop_n
+    def find(self, key: str, n: int) -> str:
+        return self.name + key + str(n)
+
+def main() -> None:
+    let r: Repo = Repo(name="r")
+    print(Repo.find(r), r.find("k", 3))
+
+main()
+"#,
+        |e| {
+            matches!(
+                e,
+                TycError::MissingArgument { .. } | TycError::WrongArgCount { .. }
+            )
+        },
+    );
+    assert_eq!(errors.len(), 2, "{errors:?}");
+}
+
+#[test]
+fn a_decorator_of_unknown_effect_keeps_the_structural_check() {
+    // `with_default` is untyped: the unbound, TypeVar-receiver and alias
+    // forms are not checked against the undecorated `def` (CPython: "rk7").
+    assert_clean(
+        r#"
+import functools
+from typing import Callable
+
+class Repo:
+    name: str
+
+def with_default(f: Callable[..., str]) -> Callable[..., str]:
+    @functools.wraps(f)
+    def wrapper(self: Repo, key: str, n: int = 7) -> str:
+        return f(self, key, n)
+    return wrapper
+
+impl Repo:
+    @with_default
+    def find(self, key: str, n: int) -> str:
+        return self.name + key + str(n)
+
+def lookup[T: Repo](r: T) -> str:
+    return r.find("k")
+
+def main() -> None:
+    let r: Repo = Repo(name="r")
+    let g = r.find
+    print(Repo.find(r, "k"), lookup(r), g("k"))
+
+main()
+"#,
+    );
+    // A signature-keeping decorator leaves every form checked against the
+    // `def`, and an untyped one still checks a bound call, as before.
+    let errors = only_errors(
+        r#"
+import functools
+from typing import Callable
+
+class Repo:
+    name: str
+
+def logged(f: Callable[..., str]) -> Callable[..., str]:
+    return f
+
+impl Repo:
+    @functools.cache
+    def find(self, key: str) -> str:
+        return self.name + key
+
+    @logged
+    def peek(self, key: str) -> str:
+        return key
+
+def lookup[T: Repo](r: T) -> str:
+    return r.find()
+
+def main() -> None:
+    let r: Repo = Repo(name="r")
+    print(Repo.find(r), lookup(r), r.peek())
+
+main()
+"#,
+        |e| matches!(e, TycError::MissingArgument { .. }),
+    );
+    assert_eq!(errors.len(), 3, "{errors:?}");
+}
+
+#[test]
+fn an_identity_typed_decorator_keeps_the_signature() {
+    let errors = only_errors(
+        r#"
+class Repo:
+    name: str
+
+def traced[F](f: F) -> F:
+    return f
+
+impl Repo:
+    @traced
+    def find(self, key: str) -> str:
+        return self.name + key
+
+def main() -> None:
+    let r: Repo = Repo(name="r")
+    print(Repo.find(r))
+
+main()
+"#,
+        |e| is_missing(e, "find", "key"),
+    );
+    assert_eq!(errors.len(), 1, "{errors:?}");
+}
+
+// ── A user `extend` method replaces the builtin method it shadows ────────
+
+#[test]
+fn a_builtin_extension_method_is_checked_against_its_own_signature() {
+    assert_clean(
+        r#"
+extend dict:
+    def get(self, key: str, default: int = 0, strict: bool = False) -> int:
+        return 7
+
+extend list:
+    def append(self, a: int, b: int) -> None:
+        pass
+
+def main() -> None:
+    let d: dict[str, int] = {"a": 1}
+    let xs: list[int] = []
+    xs.append(2, 3)
+    print(d.get("a", default=5), d.get("z", 1, True), xs)
+
+main()
+"#,
+    );
+    let errors = only_errors(
+        r#"
+extend dict:
+    def get(self, key: str, default: int = 0) -> int:
+        return 7
+
+def main() -> None:
+    let d: dict[str, int] = {"a": 1}
+    print(d.get("a", 1, 2, 3))
+
+main()
+"#,
+        |e| matches!(e, TycError::WrongArgCount { .. }),
+    );
+    assert_eq!(errors.len(), 1, "{errors:?}");
+}
+
+// ── `dict.get` is positional-only on dict subclasses and frozen dicts ────
+
+#[test]
+fn dict_subclasses_and_frozen_dicts_have_a_positional_only_get() {
+    let errors = only_errors(
+        r#"
+from collections import defaultdict, Counter, OrderedDict
+
+class Bag(dict[str, int]):
+    pass
+
+freeze let CFG: dict[str, int] = {"a": 1}
+
+def main() -> None:
+    let dd: defaultdict[str, int] = defaultdict(int)
+    let c: Counter[str] = Counter("ab")
+    let od: OrderedDict[str, int] = OrderedDict()
+    print(dd.get("z", default=0), c.get("z", default=0), od.get("z", default=0))
+    print(Bag().get("z", default=0), CFG.get("z", default=0), dd.get("z", 0, 1))
+
+main()
+"#,
+        |e| {
+            matches!(
+                e,
+                TycError::UnknownKwarg { .. } | TycError::WrongArgCount { .. }
+            )
+        },
+    );
+    assert_eq!(errors.len(), 6, "{errors:?}");
+    // Controls: the positional forms, a subclass with its own `get`, and a
+    // plain `Mapping` (whose `get` takes `default=`).
+    assert_clean(
+        r#"
+from collections import defaultdict
+from collections.abc import Mapping
+
+class Lenient(dict[str, int]):
+    pass
+
+impl Lenient:
+    def get(self, key: str, default: int = 0) -> int:
+        return default
+
+freeze let CFG: dict[str, int] = {"a": 1}
+
+def main(m: Mapping[str, int]) -> None:
+    let dd: defaultdict[str, int] = defaultdict(int)
+    print(dd.get("z"), dd.get("z", 0), CFG.get("a"), CFG.get("z", 0))
+    print(Lenient().get("z", default=1), m.get("z", default=0))
+
+main({"b": 2})
+"#,
+    );
+}
+
+// ── await on a sync call: the decorators of the callee itself ────────────
+
+#[test]
+fn an_unrelated_decorated_namesake_does_not_hide_a_sync_await() {
+    // A decorated method named like the module function, and a decorated
+    // module function named like the method.
+    let errors = only_errors(
+        r#"
+import asyncio
+import functools
+
+class Tool:
+    n: int
+
+impl Tool:
+    @staticmethod
+    def compute() -> int:
+        return 2
+
+class Worker:
+    n: int
+
+impl Worker:
+    def run(self) -> int:
+        return self.n
+
+def compute() -> int:
+    return 1
+
+@functools.cache
+def run(x: int) -> int:
+    return x
+
+async def go_work(w: Worker) -> int:
+    return await compute() + await w.run()
+
+def main() -> None:
+    print(compute(), Tool.compute(), run(1))
+    asyncio.run(go_work(Worker(n=1)))
+
+main()
+"#,
+        |e| matches!(e, TycError::TypeMismatch { .. }),
+    );
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    // Control: a decorated callee itself stays permissive.
+    assert_clean(
+        r#"
+import asyncio
+from typing import Callable, Any
+
+def make_async(f: Callable[..., Any]) -> Callable[..., Any]:
+    return f
+
+class Worker:
+    n: int
+
+impl Worker:
+    @make_async
+    def run(self) -> int:
+        return self.n
+
+@make_async
+def compute() -> int:
+    return 1
+
+async def go_work(w: Worker) -> None:
+    await compute()
+    await w.run()
+
+asyncio.run(go_work(Worker(n=1)))
+"#,
+    );
+}
+
+// ── A nested generic `def` keeps its TypeVar bounds at its call sites ────
+
+#[test]
+fn a_nested_generic_def_checks_its_bounds() {
+    let errors = only_errors(
+        r#"
+interface Greeter:
+    def greet(self) -> str
+
+class En:
+    name: str
+
+impl En:
+    def greet(self) -> str:
+        return "hi " + self.name
+
+def top[T: Greeter](x: T) -> str:
+    return x.greet()
+
+def outer() -> None:
+    def inner[T: Greeter](x: T) -> str:
+        return x.greet()
+    print(inner(En(name="a")))
+    print(inner(5))
+
+def main() -> None:
+    print(top(En(name="b")))
+    outer()
+
+main()
+"#,
+        |e| matches!(e, TycError::TypeVarBoundViolation { .. }),
+    );
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    // A nested def shadowing a module def uses its own bounds, and the
+    // module def keeps its own elsewhere.
+    let errors = only_errors(
+        r#"
+interface Greeter:
+    def greet(self) -> str
+
+class En:
+    name: str
+
+impl En:
+    def greet(self) -> str:
+        return "hi " + self.name
+
+def pick[T: Greeter](x: T) -> str:
+    return x.greet()
+
+def outer() -> None:
+    def pick[T](x: T) -> str:
+        return str(x)
+    print(pick(5))
+
+def other() -> None:
+    print(pick(5))
+
+outer()
+other()
+"#,
+        |e| matches!(e, TycError::TypeVarBoundViolation { .. }),
+    );
+    assert_eq!(errors.len(), 1, "{errors:?}");
+}
+
+// ── A method call is judged by the receiver's own method ─────────────────
+
+fn nullable_uses(d: &Diagnostics) -> usize {
+    d.errors()
+        .iter()
+        .chain(d.warnings())
+        .filter(|e| matches!(e, TycError::NullableUse { .. }))
+        .count()
+}
+
+const CONN: &str = r#"
+class Conn:
+    n: int
+
+impl Conn:
+    def query(self) -> int:
+        return self.n
+"#;
+
+#[test]
+fn a_method_field_write_summary_is_the_receivers_own() {
+    // `b.reset()` on a `B` cannot run the unrelated `A.reset`.
+    let src = format!(
+        r#"{CONN}
+class A:
+    conn: Conn?
+
+impl A:
+    def reset(self) -> None:
+        self.conn = None
+
+class B:
+    conn: Conn?
+    count: int
+
+impl B:
+    def reset(self) -> None:
+        self.count = 0
+
+def use(b: B) -> int:
+    if b.conn is not None:
+        b.reset()
+        return b.conn.query()
+    return 0
+
+def main() -> None:
+    let a = A(conn=None)
+    a.reset()
+    print(use(B(conn=Conn(n=4), count=2)))
+
+main()
+"#
+    );
+    let d = check(&src);
+    assert_eq!(nullable_uses(&d), 0, "{:?}", messages(&d));
+    // A local subclass overriding `reset` may be what `b` is.
+    let src = format!(
+        r#"{CONN}
+class B:
+    conn: Conn?
+    count: int
+
+impl B:
+    def reset(self) -> None:
+        self.count = 0
+
+class C(B):
+    tag: str
+
+impl C:
+    def reset(self) -> None:
+        self.conn = None
+
+def use(b: B) -> int:
+    if b.conn is not None:
+        b.reset()
+        return b.conn.query()
+    return 0
+
+print(use(C(conn=Conn(n=4), count=2, tag="t")))
+"#
+    );
+    let d = check(&src);
+    assert_eq!(nullable_uses(&d), 1, "{:?}", messages(&d));
+    // An inherited writer is the receiver's own method.
+    let src = format!(
+        r#"{CONN}
+class Base:
+    conn: Conn?
+
+impl Base:
+    def reset(self) -> None:
+        self.conn = None
+
+class B(Base):
+    count: int
+
+class Other:
+    conn: Conn?
+
+impl Other:
+    def reset(self) -> None:
+        pass
+
+def use(b: B) -> int:
+    if b.conn is not None:
+        b.reset()
+        return b.conn.query()
+    return 0
+
+print(use(B(conn=Conn(n=4), count=2)), Other(conn=None).reset())
+"#
+    );
+    let d = check(&src);
+    assert_eq!(nullable_uses(&d), 1, "{:?}", messages(&d));
+}
+
+// ── A function-local class is what its name means in the body ───────────
+
+#[test]
+fn a_function_local_class_shadows_the_module_class() {
+    assert_clean(
+        r#"
+class Point frozen:
+    x: int
+
+def bump() -> int:
+    class Point:
+        x: int
+    let p = Point(x=1)
+    p.x = 5
+    return p.x
+
+def named() -> str:
+    class Point:
+        name: str
+    return Point(name="a").name
+
+def main() -> None:
+    print(bump(), named(), Point(x=2).x)
+
+main()
+"#,
+    );
+    // A value typed as the module class keeps its fields in the body, and
+    // the module class is unchanged outside it; a write is reported where
+    // both classes are frozen.
+    let errors = only_errors(
+        r#"
+class Point frozen:
+    x: int
+
+def read(p: Point) -> int:
+    class Point:
+        name: str
+    return p.x + len(Point(name="a").name)
+
+def later() -> None:
+    let p = Point(x=2)
+    p.x = 3
+
+def both() -> None:
+    class Point frozen:
+        x: int
+    let p = Point(x=1)
+    p.x = 4
+
+print(read(Point(x=1)))
+later()
+both()
+"#,
+        |e| matches!(e, TycError::FrozenAssign { .. }),
+    );
+    assert_eq!(errors.len(), 2, "{errors:?}");
+}
