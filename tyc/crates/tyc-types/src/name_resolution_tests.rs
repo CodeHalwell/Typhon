@@ -3432,3 +3432,24 @@ main()
 "#,
     );
 }
+
+/// A chain of shadowing locals that each need the shadowed module type takes
+/// one re-check pass per link; the body's own errors are reported however
+/// many passes that takes, and no link is left at its first value's type.
+#[test]
+fn a_long_shadowing_chain_keeps_the_bodys_diagnostics() {
+    let mut src = String::new();
+    for n in 1..=10 {
+        src.push_str(&format!("a{n}: float = 0.0\n"));
+    }
+    src.push_str("\ndef chain() -> float:\n    let bad: str = 5\n    mut a1 = 0\n    a1 = 0.5\n");
+    for n in 2..=10 {
+        src.push_str(&format!(
+            "    mut a{n} = 0\n    for _ in range(1):\n        a{n} = a{p}\n        a{p} = 0\n",
+            p = n - 1
+        ));
+    }
+    src.push_str("    let bad2: int = \"no\"\n    return a10\n\nprint(chain())\n");
+    let errors = only_errors(&src, |e| matches!(e, TycError::TypeMismatch { .. }));
+    assert_eq!(errors.len(), 2, "{errors:?}");
+}

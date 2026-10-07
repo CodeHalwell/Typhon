@@ -18027,9 +18027,12 @@ fn check_function_body(c: &mut Checker, body: &[Stmt]) {
         c.uninit_instances.clone(),
         c.unsafe_origin_bindings.clone(),
     );
-    // Each pass widens at least one more local, so this ends; the bound only
-    // guards against a pass that keeps finding the same ones.
-    for _ in 0..8 {
+    // Each pass widens at least one more of the body's finitely many locals,
+    // so this ends on its own; the bound only caps the passes a pathological
+    // chain of shadowing locals could take. The last pass allowed keeps its
+    // diagnostics: reaching the bound must never leave the body unchecked.
+    const MAX_PASSES: usize = 64;
+    for pass in 1..=MAX_PASSES {
         for stmt in body {
             check_stmt(c, stmt);
         }
@@ -18039,7 +18042,7 @@ fn check_function_body(c: &mut Checker, body: &[Stmt]) {
             .into_iter()
             .filter(|s| !c.shadow_widen.contains(s))
             .collect();
-        if fresh.is_empty() {
+        if fresh.is_empty() || pass == MAX_PASSES {
             break;
         }
         c.shadow_widen.extend(fresh);
