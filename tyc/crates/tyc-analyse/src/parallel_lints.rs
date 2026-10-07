@@ -272,7 +272,9 @@ struct GoSpawn<'a> {
 /// spawn call's range. Non-bare-name callees (`go obj.method()`) are skipped,
 /// and so is a callee an enclosing function binds (`async def
 /// launch(worker): go worker()` spawns the argument, not the module-level
-/// `worker`) — the per-scope shadow rule auto-gather uses.
+/// `worker`). Bindings are read with Python's scoping rules: a comprehension
+/// variable or lambda parameter named `worker` does not shadow it, and a
+/// `global worker` declaration makes it the module-level function.
 fn collect_go_spawns<'a>(module: &'a ModModule) -> Vec<GoSpawn<'a>> {
     use ruff_python_ast::visitor::source_order::walk_stmt;
 
@@ -284,10 +286,19 @@ fn collect_go_spawns<'a>(module: &'a ModModule) -> Vec<GoSpawn<'a>> {
     }
     impl V<'_> {
         fn shadowed(&self, name: &str) -> bool {
-            self.scopes.iter().any(|f| {
-                crate::reductions::params_bind_name(&f.parameters, name)
-                    || crate::reductions::scope_binds_name(&f.body, name)
-            })
+            use crate::reductions::ScopeBinding;
+            // The innermost enclosing binding decides.
+            for f in self.scopes.iter().rev() {
+                if crate::reductions::params_bind_name(&f.parameters, name) {
+                    return true;
+                }
+                match crate::reductions::scope_binding(&f.body, name) {
+                    ScopeBinding::Local => return true,
+                    ScopeBinding::Global => return false,
+                    ScopeBinding::Unbound => {}
+                }
+            }
+            false
         }
     }
     impl<'ast> SourceOrderVisitor<'ast> for V<'ast> {
@@ -1052,6 +1063,57 @@ async def quiet() -> None:
                 codes(&shared_mut_across_tasks_diagnostics(&m, "x.ty", &src)).len(),
                 1,
                 "the module-level writer is spawned:\n{src}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_mut_comprehension_lambda_and_global_names_do_not_shadow_the_callee() {
+        // A comprehension variable and a lambda parameter are scoped to their
+        // expression, and `global worker` names the module-level function, so
+        // `go worker()` still spawns the module-level writer.
+        let header = "\
+import asyncio
+
+mut HITS: int = 0
+
+async def worker() -> None:
+    global HITS
+    HITS = HITS + 1
+";
+        for body in [
+            // The review repros (list comprehension, generator, a dict
+            // comprehension in the enclosing function).
+            "async def launch(names: tuple[str, ...]) -> None:\n    let labels = [worker for worker in names]\n    for n in labels:\n        go worker()\n    await asyncio.sleep(0.01)\n",
+            "async def launch(names: tuple[str, ...]) -> None:\n    let k = sum(1 for worker in names)\n    go worker()\n",
+            "def outer(names: tuple[str, ...]) -> None:\n    let labels = {worker: 1 for worker in names}\n    async def inner() -> None:\n        go worker()\n",
+            "async def launch(names: tuple[str, ...]) -> None:\n    let s = {worker for worker in names}\n    go worker()\n",
+            "async def launch() -> None:\n    let f = lambda worker: worker\n    go worker()\n",
+            "async def launch() -> None:\n    global worker\n    go worker()\n",
+            // An inner `global` wins over the enclosing function's parameter.
+            "def outer(worker: int) -> None:\n    async def inner() -> None:\n        global worker\n        go worker()\n",
+        ] {
+            let src = format!("{header}\n{body}");
+            let m = parse(&src);
+            assert_eq!(
+                codes(&shared_mut_across_tasks_diagnostics(&m, "x.ty", &src)).len(),
+                1,
+                "the module-level writer is spawned:\n{src}"
+            );
+        }
+        // Controls: a walrus in a comprehension binds in the enclosing
+        // function (PEP 572), and a `nonlocal` names the enclosing function's
+        // binding, so both still shadow.
+        for body in [
+            "async def launch(fns: list[Callable[[], Awaitable[None]]]) -> None:\n    let firsts = [(worker := f) for f in fns]\n    go worker()\n",
+            "def outer(worker: Callable[[], Awaitable[None]]) -> None:\n    async def inner() -> None:\n        nonlocal worker\n        go worker()\n",
+        ] {
+            let src = format!("{header}\n{body}");
+            let m = parse(&src);
+            assert_eq!(
+                codes(&shared_mut_across_tasks_diagnostics(&m, "x.ty", &src)).len(),
+                0,
+                "a shadowed callee is not the module-level writer:\n{src}"
             );
         }
     }

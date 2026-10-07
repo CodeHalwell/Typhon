@@ -214,8 +214,8 @@ pub fn gather_opportunity_diagnostics(module: &ModModule, path: &str, source: &s
 /// was parsed from. This is the single source of truth for the advisory
 /// set, so a new lint added here lights up both surfaces at once
 /// (purity and the import-vetting / `pub *` checks stay in the `check`
-/// command — they need resolve / comptime context the LSP composes
-/// separately).
+/// command — they need resolve / comptime context, or, for purity, the
+/// `check` command's sugar lowering, which the LSP composes separately).
 ///
 /// `perf_ctx` carries the preprocess-derived facts the `tyc::perf_*`
 /// family (specifically `lazy_import_opportunity`) needs — which imports
@@ -5013,6 +5013,8 @@ fn check_purity(f: &ruff_python_ast::StmtFunctionDef, module: &ModuleScope) -> P
         module,
         params: parameter_names(parameters),
         locals: bindings.names,
+        scope_locals: bindings.scope_names,
+        inner_scope: Vec::new(),
         local_imports: bindings.imports,
         builtin_typed: bindings.types,
         fresh: bindings.fresh,
@@ -5174,8 +5176,15 @@ fn annotation_unhashable_name(ann: &Expr) -> Option<String> {
 /// What [`collect_local_bindings`] learns about a function body.
 #[derive(Default)]
 struct LocalBindings {
-    /// Every name bound in this scope.
+    /// Every name bound in this scope, plus — over-approximating — the
+    /// comprehension variables and lambda-body walrus targets of the
+    /// expressions inside it.
     names: HashSet<String>,
+    /// The names bound in the function's own scope: [`Self::names`] without
+    /// comprehension targets and lambda internals, which Python scopes to
+    /// their expression. A walrus inside a comprehension binds here (PEP
+    /// 572).
+    scope_names: HashSet<String>,
     /// The subset bound by a function-local `import`: those still name a
     /// module, so the stdlib call tables apply to them.
     imports: HashSet<String>,
@@ -5199,20 +5208,33 @@ fn collect_local_bindings(body: &[Stmt], module: &ModuleScope) -> LocalBindings 
     #[derive(Default)]
     struct V<'m> {
         names: HashSet<String>,
+        scope_names: HashSet<String>,
+        /// How many comprehension targets / lambda bodies enclose the
+        /// expression being visited: their bindings do not reach the
+        /// function's own scope.
+        inner_depth: usize,
         imports: HashSet<String>,
         types: HashMap<String, String>,
         fresh_candidates: HashSet<String>,
         not_fresh: HashSet<String>,
         class_names: &'m [String],
     }
+    impl V<'_> {
+        fn bind(&mut self, name: &str) {
+            self.names.insert(name.to_owned());
+            if self.inner_depth == 0 {
+                self.scope_names.insert(name.to_owned());
+            }
+        }
+    }
     impl<'ast> SourceOrderVisitor<'ast> for V<'_> {
         fn visit_stmt(&mut self, s: &'ast Stmt) {
             match s {
                 Stmt::FunctionDef(f) => {
-                    self.names.insert(f.name.as_str().to_owned());
+                    self.bind(f.name.as_str());
                 }
                 Stmt::ClassDef(c) => {
-                    self.names.insert(c.name.as_str().to_owned());
+                    self.bind(c.name.as_str());
                 }
                 Stmt::Import(i) => {
                     for alias in &i.names {
@@ -5220,7 +5242,7 @@ fn collect_local_bindings(body: &[Stmt], module: &ModuleScope) -> LocalBindings 
                             Some(asname) => asname.as_str(),
                             None => alias.name.as_str().split('.').next().unwrap_or(""),
                         };
-                        self.names.insert(bound.to_owned());
+                        self.bind(bound);
                         self.imports.insert(bound.to_owned());
                     }
                 }
@@ -5230,7 +5252,7 @@ fn collect_local_bindings(body: &[Stmt], module: &ModuleScope) -> LocalBindings 
                             Some(asname) => asname.as_str(),
                             None => alias.name.as_str(),
                         };
-                        self.names.insert(bound.to_owned());
+                        self.bind(bound);
                         self.imports.insert(bound.to_owned());
                     }
                 }
@@ -5245,7 +5267,7 @@ fn collect_local_bindings(body: &[Stmt], module: &ModuleScope) -> LocalBindings 
                         } else {
                             self.not_fresh.insert(name.clone());
                         }
-                        self.names.insert(name);
+                        self.bind(&name);
                         // Only the value is walked: the target is accounted
                         // for above (walking it would mark it not-fresh).
                         self.visit_expr(&a.value);
@@ -5256,7 +5278,7 @@ fn collect_local_bindings(body: &[Stmt], module: &ModuleScope) -> LocalBindings 
                 Stmt::AnnAssign(a) => {
                     if let Expr::Name(n) = a.target.as_ref() {
                         let name = n.id.as_str().to_owned();
-                        self.names.insert(name.clone());
+                        self.bind(&name);
                         if let Some(head) = annotation_builtin_head(&a.annotation) {
                             self.types.insert(name.clone(), head.to_owned());
                         }
@@ -5276,7 +5298,7 @@ fn collect_local_bindings(body: &[Stmt], module: &ModuleScope) -> LocalBindings 
                     for h in &t.handlers {
                         let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
                         if let Some(alias) = &h.name {
-                            self.names.insert(alias.id.as_str().to_owned());
+                            self.bind(alias.id.as_str());
                         }
                     }
                     walk_stmt(self, s);
@@ -5286,15 +5308,39 @@ fn collect_local_bindings(body: &[Stmt], module: &ModuleScope) -> LocalBindings 
         }
 
         fn visit_expr(&mut self, e: &'ast Expr) {
-            if let Expr::Name(n) = e {
-                if !n.ctx.is_load() {
+            match e {
+                Expr::Name(n) if !n.ctx.is_load() => {
                     // Loop / `with` / unpacking / walrus targets: bound
                     // here, but to an object of unknown provenance.
-                    self.names.insert(n.id.as_str().to_owned());
+                    self.bind(n.id.as_str());
                     self.not_fresh.insert(n.id.as_str().to_owned());
                 }
+                // A lambda's parameters and body bindings are its own; its
+                // defaults evaluate here.
+                Expr::Lambda(l) => {
+                    if let Some(params) = l.parameters.as_deref() {
+                        self.visit_parameters(params);
+                    }
+                    self.inner_depth += 1;
+                    self.visit_expr(&l.body);
+                    self.inner_depth -= 1;
+                    return;
+                }
+                _ => {}
             }
             walk_expr(self, e);
+        }
+
+        fn visit_comprehension(&mut self, c: &'ast ruff_python_ast::Comprehension) {
+            // The target binds in the comprehension's scope; the iterable and
+            // conditions may walrus-bind in this one.
+            self.inner_depth += 1;
+            self.visit_expr(&c.target);
+            self.inner_depth -= 1;
+            self.visit_expr(&c.iter);
+            for cond in &c.ifs {
+                self.visit_expr(cond);
+            }
         }
 
         fn visit_pattern(&mut self, p: &'ast Pattern) {
@@ -5305,7 +5351,7 @@ fn collect_local_bindings(body: &[Stmt], module: &ModuleScope) -> LocalBindings 
                 _ => None,
             };
             if let Some(id) = captured {
-                self.names.insert(id.as_str().to_owned());
+                self.bind(id.as_str());
             }
             walk_pattern(self, p);
         }
@@ -5325,6 +5371,7 @@ fn collect_local_bindings(body: &[Stmt], module: &ModuleScope) -> LocalBindings 
         .collect();
     LocalBindings {
         names: v.names,
+        scope_names: v.scope_names,
         imports: v.imports,
         types: v.types,
         fresh,
@@ -5362,8 +5409,15 @@ struct PurityCtx<'a> {
     /// The function's parameter names.
     params: HashSet<&'a str>,
     /// Names bound in the function body (plus comprehension / lambda
-    /// variables as the walk enters them).
+    /// variables as the walk enters them). Over-approximate: an inner
+    /// expression's variables stay here for the whole body.
     locals: HashSet<String>,
+    /// The names bound in the function's own scope only (see
+    /// [`LocalBindings::scope_names`]).
+    scope_locals: HashSet<String>,
+    /// Comprehension variables and lambda parameters (and lambda-body walrus
+    /// targets) of the expressions the walk is inside, innermost last.
+    inner_scope: Vec<String>,
     /// Locals bound by a function-local `import`.
     local_imports: HashSet<String>,
     /// Parameters and locals provably of a builtin type: name → type head.
@@ -5416,12 +5470,17 @@ impl PurityCtx<'_> {
     /// parameter or local shadows the builtin / module for the whole body
     /// (a function-local `import` still names a module), and so does a
     /// module-level `def`, `class` or assignment; an unbound head can only
-    /// be the builtin.
+    /// be the builtin. A comprehension variable or lambda parameter shadows
+    /// only inside its own expression: `[time for time in xs]` leaves
+    /// `time.time()` after it a clock read.
     fn names_builtin_or_import(&self, name: &str) -> bool {
+        if self.inner_scope.iter().any(|n| n == name) {
+            return false;
+        }
         if self.local_imports.contains(name) {
             return true;
         }
-        if self.is_param(name) || self.is_local(name) {
+        if self.is_param(name) || self.scope_locals.contains(name) {
             return false;
         }
         self.module.imports.contains_key(name) || !self.module.top_level_bound.contains(name)
@@ -5693,30 +5752,22 @@ fn walk_expr_purity(expr: &Expr, ctx: &mut PurityCtx) {
             }
         }
         Expr::ListComp(x) => {
-            bind_comprehension_targets(&x.generators, ctx);
-            walk_expr_purity(&x.elt, ctx);
-            walk_comprehension_clauses(&x.generators, ctx);
+            walk_comprehension_purity(&x.generators, ctx, |ctx| walk_expr_purity(&x.elt, ctx))
         }
         Expr::SetComp(x) => {
-            bind_comprehension_targets(&x.generators, ctx);
-            walk_expr_purity(&x.elt, ctx);
-            walk_comprehension_clauses(&x.generators, ctx);
+            walk_comprehension_purity(&x.generators, ctx, |ctx| walk_expr_purity(&x.elt, ctx))
         }
         Expr::Generator(x) => {
-            bind_comprehension_targets(&x.generators, ctx);
-            walk_expr_purity(&x.elt, ctx);
-            walk_comprehension_clauses(&x.generators, ctx);
+            walk_comprehension_purity(&x.generators, ctx, |ctx| walk_expr_purity(&x.elt, ctx))
         }
-        Expr::DictComp(x) => {
-            bind_comprehension_targets(&x.generators, ctx);
+        Expr::DictComp(x) => walk_comprehension_purity(&x.generators, ctx, |ctx| {
             // The vendored fork models the key as optional (it is absent for
             // a `**spread` entry in the equivalent display form).
             if let Some(k) = x.key.as_deref() {
                 walk_expr_purity(k, ctx);
             }
             walk_expr_purity(&x.value, ctx);
-            walk_comprehension_clauses(&x.generators, ctx);
-        }
+        }),
         Expr::Dict(x) => {
             for item in &x.items {
                 if let Some(k) = &item.key {
@@ -5730,7 +5781,10 @@ fn walk_expr_purity(expr: &Expr, ctx: &mut PurityCtx) {
                 ctx.locals
                     .extend(parameter_names(params).into_iter().map(String::from));
             }
-            walk_expr_purity(&x.body, ctx)
+            let mark = ctx.inner_scope.len();
+            ctx.inner_scope.extend(lambda_scope_names(x));
+            walk_expr_purity(&x.body, ctx);
+            ctx.inner_scope.truncate(mark);
         }
         Expr::FString(x) => {
             for part in x.value.iter() {
@@ -5790,25 +5844,68 @@ fn walk_expr_purity(expr: &Expr, ctx: &mut PurityCtx) {
     }
 }
 
-/// Comprehension variables are bound inside the expression; register them
-/// as locals so their reads are not mistaken for module-state reads.
-fn bind_comprehension_targets(generators: &[ruff_python_ast::Comprehension], ctx: &mut PurityCtx) {
+/// Walk a comprehension: the element (via `elt`), then the iterables and
+/// conditions of its `for … in … if …` clauses.
+///
+/// Its variables are registered as locals so their reads are not mistaken
+/// for module-state reads, and they shadow a builtin / module call head
+/// (`[time.strip() for time in xs]`) — but only inside the comprehension.
+/// The first iterable evaluates in the enclosing scope, so it is walked
+/// without them.
+fn walk_comprehension_purity(
+    generators: &[ruff_python_ast::Comprehension],
+    ctx: &mut PurityCtx,
+    elt: impl FnOnce(&mut PurityCtx),
+) {
+    let mark = ctx.inner_scope.len();
     for g in generators {
-        for name in bound_names_in_target(&g.target) {
-            ctx.locals.insert(name);
-        }
+        let names = bound_names_in_target(&g.target);
+        ctx.locals.extend(names.iter().cloned());
+        ctx.inner_scope.extend(names);
     }
-}
-
-/// Walk the iterables and conditions of a comprehension's `for … in … if …`
-/// clauses. The element expression is walked by the caller.
-fn walk_comprehension_clauses(generators: &[ruff_python_ast::Comprehension], ctx: &mut PurityCtx) {
-    for g in generators {
-        walk_expr_purity(&g.iter, ctx);
+    elt(ctx);
+    for (i, g) in generators.iter().enumerate() {
+        if i == 0 {
+            let inner = ctx.inner_scope.split_off(mark);
+            walk_expr_purity(&g.iter, ctx);
+            ctx.inner_scope.extend(inner);
+        } else {
+            walk_expr_purity(&g.iter, ctx);
+        }
         for cond in &g.ifs {
             walk_expr_purity(cond, ctx);
         }
     }
+    ctx.inner_scope.truncate(mark);
+}
+
+/// The names a lambda binds in its own scope: its parameters and the walrus
+/// targets of its body (a comprehension inside it walrus-binds in the
+/// lambda; a nested lambda keeps its own).
+fn lambda_scope_names(lambda: &ruff_python_ast::ExprLambda) -> Vec<String> {
+    use ruff_python_ast::visitor::source_order::{walk_expr, SourceOrderVisitor};
+    struct V(Vec<String>);
+    impl<'ast> SourceOrderVisitor<'ast> for V {
+        fn visit_expr(&mut self, e: &'ast Expr) {
+            match e {
+                Expr::Named(n) => {
+                    if let Expr::Name(t) = n.target.as_ref() {
+                        self.0.push(t.id.as_str().to_owned());
+                    }
+                }
+                Expr::Lambda(_) => return,
+                _ => {}
+            }
+            walk_expr(self, e);
+        }
+    }
+    let mut v = V(lambda
+        .parameters
+        .as_deref()
+        .map(|p| parameter_names(p).into_iter().map(String::from).collect())
+        .unwrap_or_default());
+    v.visit_expr(&lambda.body);
+    v.0
 }
 
 /// A bare-name read inside a pure body.
@@ -9088,6 +9185,93 @@ def f(xs: tuple[int, ...], s: str) -> str:
         )
         .expect("callable parameter is a violation");
         assert!(reason.contains("local callable"), "{reason}");
+    }
+
+    #[test]
+    fn comprehension_and_lambda_variables_shadow_a_module_only_inside_their_expression() {
+        // A comprehension variable or lambda parameter named `time` is scoped
+        // to its expression: outside it, `time` is still the module and
+        // `time.time()` a clock read (review N24).
+        for (src, needle) in [
+            (
+                "import time\n\n@pure\ndef f(xs: tuple[str, ...]) -> float:\n    n = len([time for time in xs])\n    return time.time() + n\n",
+                "`time.time`",
+            ),
+            // The comprehension after the call.
+            (
+                "import time\n\n@pure\ndef f(xs: tuple[str, ...]) -> float:\n    t = time.time()\n    n = len([time for time in xs])\n    return t + n\n",
+                "`time.time`",
+            ),
+            (
+                "import time\n\n@pure\ndef f(xs: tuple[str, ...]) -> float:\n    n = sum(1 for time in xs)\n    return time.time() + n\n",
+                "`time.time`",
+            ),
+            (
+                "import time\n\n@pure\ndef f(xs: tuple[str, ...]) -> float:\n    d = {time: 1 for time in xs}\n    return time.perf_counter() + len(d)\n",
+                "`time.perf_counter`",
+            ),
+            (
+                "import time\n\n@pure\ndef f(xs: tuple[str, ...]) -> float:\n    g = lambda time: time\n    return time.time()\n",
+                "`time.time`",
+            ),
+            // A walrus in a lambda body binds in the lambda.
+            (
+                "import time\n\n@pure\ndef f(xs: tuple[str, ...]) -> float:\n    g = lambda: (time := 1)\n    return time.time()\n",
+                "`time.time`",
+            ),
+            // The first iterable evaluates in the enclosing scope.
+            (
+                "import time\n\n@pure\ndef f() -> int:\n    return len([1 for time in range(int(time.time()))])\n",
+                "`time.time`",
+            ),
+            (
+                "import subprocess\n\n@pure\ndef f(xs: tuple[str, ...]) -> int:\n    n = len([subprocess for subprocess in xs])\n    return subprocess.run([\"true\"]).returncode + n\n",
+                "`subprocess.run`",
+            ),
+            (
+                "import os\n\n@pure\ndef f(xs: tuple[str, ...]) -> int:\n    ys = [os for os in xs]\n    return os.getpid() + len(ys)\n",
+                "`os.getpid`",
+            ),
+        ] {
+            let reason =
+                violation_of(src, "f").unwrap_or_else(|| panic!("expected violation: {src}"));
+            assert!(reason.contains(needle), "{src}: {reason}");
+        }
+        // Inside its own expression the variable is the value it names, and a
+        // walrus in a comprehension binds in the function (PEP 572).
+        for src in [
+            "@pure\ndef f(xs: tuple[str, ...]) -> list[str]:\n    return [time.strip() for time in xs]\n",
+            "import time\n\n@pure\ndef f(xs: tuple[tuple[str, ...], ...]) -> list[list[str]]:\n    return [[time.strip() for _ in ys] for time, ys in xs]\n",
+            "import time\n\n@pure\ndef f(xs: tuple[str, ...]) -> list[str]:\n    return sorted(xs, key=lambda time: time.count(\":\"))\n",
+            "import time\n\n@pure\ndef f(xs: tuple[str, ...]) -> int:\n    g = lambda x: [(time := x), time.strip()]\n    return len(xs)\n",
+            "import time\n\n@pure\ndef f(xs: tuple[str, ...]) -> int:\n    ys = [(time := x) for x in xs]\n    return len(ys) + len(time.strip())\n",
+        ] {
+            assert_eq!(violation_of(src, "f"), None, "{src}");
+        }
+    }
+
+    #[test]
+    fn comprehension_scoped_module_names_through_the_preprocessor() {
+        // Review N24 repros verbatim (q01, q04, q06 and the `@memo` q10, whose
+        // cache returned a stale clock read), through the real preprocessor.
+        let q01 = "import time\n\n@pure\ndef stamp(xs: tuple[str, ...]) -> float:\n    let n = len([time for time in xs])\n    return time.time() + n\n\ndef main() -> None:\n    print(stamp((\"a\", \"b\")) > 0)\n\nif __name__ == \"__main__\":\n    main()\n";
+        let q04 = "import subprocess\n\n@pure\ndef run_ls(xs: tuple[str, ...]) -> int:\n    let n = len([subprocess for subprocess in xs])\n    return subprocess.run([\"true\"]).returncode + n\n\ndef main() -> None:\n    print(run_ls((\"a\",)))\n\nif __name__ == \"__main__\":\n    main()\n";
+        let q06 = "import os\n\n@pure\ndef pid(xs: tuple[str, ...]) -> int:\n    let ys = [os for os in xs]\n    return os.getpid() + len(ys)\n\ndef main() -> None:\n    print(pid((\"a\",)) > 0)\n\nif __name__ == \"__main__\":\n    main()\n";
+        let q10 = "import time\n\n@memo\ndef stamp(xs: tuple[str, ...]) -> float:\n    let n = len([time for time in xs])\n    return time.time() + n\n\ndef main() -> None:\n    let a = stamp((\"a\",))\n    time.sleep(0.05)\n    let b = stamp((\"a\",))\n    print(a == b)\n\nif __name__ == \"__main__\":\n    main()\n";
+        for src in [q01, q04, q06, q10] {
+            let prep = tyc_syntax::preprocess::preprocess(src);
+            let module = tyc_syntax::parse_module(&prep.python_source)
+                .expect("parse failed")
+                .into_syntax();
+            let findings = analyse_purity(&module, false);
+            let diags = purity_diagnostics(&findings, "<test>", &prep.python_source);
+            assert_eq!(diags.error_count(), 1, "{src}");
+            // `@memo` must not cache the clock read.
+            assert!(
+                findings.iter().all(|f| f.cache_decision().is_none()),
+                "{src}"
+            );
+        }
     }
 
     #[test]

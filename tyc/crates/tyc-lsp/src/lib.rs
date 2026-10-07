@@ -985,13 +985,25 @@ impl Backend {
                     pub_names: prep_full.pub_names.clone(),
                     has_pub_star: !prep_full.pub_star_lines.is_empty(),
                 };
+                let module = parsed.into_syntax();
                 let mut lint_diags = tyc_analyse::editor_lint_diagnostics(
-                    &parsed.into_syntax(),
+                    &module,
                     &uri_str_for_check,
                     &mapping_source,
                     opts,
                     &perf_ctx,
                 );
+                // `@pure` / `@memo` verification, as `tyc check` runs it: the
+                // shared pipeline above does not, so without this an
+                // explicit `@pure` that `tyc check` rejects showed clean in
+                // the editor.
+                diags.extend(editor_purity_diagnostics(
+                    &module,
+                    &mapping_source,
+                    &prep_full,
+                    &uri_str_for_check,
+                    &text_for_check,
+                ));
                 // Same relocation the shared pipeline applies to its own
                 // diagnostics: report the editor's line, not the buffer's.
                 lint_diags.remap_lines(
@@ -4805,6 +4817,41 @@ fn first_label(err: &TycError) -> Option<LabeledSpan> {
 /// stripping and sugar expansion. Selecting the correct reference text per
 /// diagnostic variant keeps published LSP ranges aligned with the editor
 /// buffer instead of drifting by a column or two after `val` is removed.
+/// The `tyc::impure_pure_fn` diagnostics `tyc check` reports for the editor
+/// buffer `original`, relocated onto it. `module` was parsed from
+/// `preprocessed` (the shared pipeline's sugar chain, which keeps `lazy
+/// import`); `tyc check` verifies purity on the chain that rewrites a `lazy
+/// import` into a helper call instead, so a buffer with one is re-expanded
+/// that way rather than judged on a different program.
+fn editor_purity_diagnostics(
+    module: &ruff_python_ast::ModModule,
+    preprocessed: &str,
+    prep: &tyc_syntax::preprocess::PreprocessResult,
+    uri: &str,
+    original: &str,
+) -> tyc_diagnostics::Diagnostics {
+    let check_prep;
+    let check_module;
+    let (module, text, line_map) = if prep.lazy_imports.is_empty() {
+        (module, preprocessed, &prep.line_map)
+    } else {
+        check_prep = tyc_syntax::preprocess::expand_and_preprocess_mapped(original, true);
+        match tyc_syntax::parse_module(&check_prep.python_source) {
+            Ok(parsed) => check_module = parsed.into_syntax(),
+            Err(_) => return tyc_diagnostics::Diagnostics::new(),
+        }
+        (
+            &check_module,
+            check_prep.python_source.as_str(),
+            &check_prep.line_map,
+        )
+    };
+    let mut diags =
+        tyc_analyse::purity_diagnostics(&tyc_analyse::analyse_purity(module, false), uri, text);
+    diags.remap_lines(text, line_map, uri, original);
+    diags
+}
+
 fn diagnostic_source<'a>(err: &TycError, original: &'a str, preprocessed: &'a str) -> &'a str {
     // A diagnostic already relocated onto the editor buffer
     // (`Diagnostics::remap_lines`, run by the shared check pipeline) carries
@@ -5166,6 +5213,76 @@ mod tests {
             Some(4),
             "gather advice must publish as HINT (severity 4); got {diag}"
         );
+    }
+
+    fn purity_errors(diags: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+        diags
+            .iter()
+            .filter(|d| {
+                d["code"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("impure_pure_fn"))
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lsp_publishes_impure_pure_fn_like_tyc_check() {
+        // `tyc check` rejects an impure `@pure` / `@memo`; the editor used to
+        // stay clean (review N26). Each case: source, and the lines of the
+        // `@pure` / `@memo` decorators the errors anchor to (as in `tyc check`).
+        let cases: [(&str, &str, &[u64]); 5] = [
+            (
+                "file:///tmp/tyc_lsp_purity_e2e/print.ty",
+                "@pure\ndef f(x: int) -> int:\n    print(x)\n    return x\n\nprint(f(1))\n",
+                &[0],
+            ),
+            (
+                "file:///tmp/tyc_lsp_purity_e2e/memo.ty",
+                "import time\n\n@memo\ndef g(x: int) -> float:\n    return time.time() + x\n",
+                &[2],
+            ),
+            // A `lazy import` is checked on `tyc check`'s lowering, and the
+            // finding still lands on the line the user wrote.
+            (
+                "file:///tmp/tyc_lsp_purity_e2e/lazy.ty",
+                "lazy import t = time\n\n@pure\ndef h(x: int) -> int:\n    print(x)\n    return x\n",
+                &[2],
+            ),
+            // `tyc check` judges a lazily imported module through the helper
+            // call it lowers to, which it cannot see through; the editor
+            // must agree rather than report an error CI does not.
+            (
+                "file:///tmp/tyc_lsp_purity_e2e/lazy_clock.ty",
+                "lazy import t = time\n\n@pure\ndef m() -> float:\n    return t.time()\n",
+                &[],
+            ),
+            // Control: a pure function publishes nothing.
+            (
+                "file:///tmp/tyc_lsp_purity_e2e/clean.ty",
+                "@pure\ndef k(x: int) -> int:\n    return x + 1\n",
+                &[],
+            ),
+        ];
+        let (mut to, mut from) = spawn_backend();
+        handshake(&mut to, &mut from, None).await;
+        for (uri, src, lines) in cases {
+            did_open(&mut to, uri, src).await;
+            let diags = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                next_diagnostics(&mut from, uri),
+            )
+            .await
+            .expect("timed out waiting for diagnostics");
+            let found: Vec<u64> = purity_errors(&diags)
+                .iter()
+                .map(|d| {
+                    assert_eq!(d["severity"].as_i64(), Some(1), "an error: {d}");
+                    d["range"]["start"]["line"].as_u64().unwrap()
+                })
+                .collect();
+            assert_eq!(found, lines, "{src}\n{diags:?}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

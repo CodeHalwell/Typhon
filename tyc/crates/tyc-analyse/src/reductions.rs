@@ -1226,14 +1226,44 @@ pub(crate) fn params_bind_name(parameters: &ruff_python_ast::Parameters, name: &
 /// from emitting a bare `sum` call where user code rebinds `sum`; false
 /// positives merely skip an optimisation, so ambiguity resolves to `true`.
 pub(crate) fn scope_binds_name(body: &[Stmt], name: &str) -> bool {
+    scope_binding_with(body, name, false) != ScopeBinding::Unbound
+}
+
+/// How a single scope body binds a name (see [`scope_binding`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScopeBinding {
+    /// The scope does not bind the name: a read resolves outward.
+    Unbound,
+    /// The scope binds the name itself (or, through `nonlocal`, an enclosing
+    /// function's binding).
+    Local,
+    /// A `global NAME` declaration: the name is the module binding however
+    /// the scope assigns it.
+    Global,
+}
+
+/// [`scope_binds_name`] under Python's scoping rules instead of an
+/// over-approximation, for lints, where a false "bound" hides a real
+/// finding: a comprehension variable and a lambda's parameters and body
+/// bindings belong to their own scope (a walrus in a comprehension still
+/// binds here, PEP 572), and `global NAME` is reported as
+/// [`ScopeBinding::Global`] rather than as a local binding.
+pub(crate) fn scope_binding(body: &[Stmt], name: &str) -> ScopeBinding {
+    scope_binding_with(body, name, true)
+}
+
+fn scope_binding_with(body: &[Stmt], name: &str, exact: bool) -> ScopeBinding {
     use ruff_python_ast::visitor::source_order::{
-        walk_expr, walk_pattern, walk_stmt, SourceOrderVisitor,
+        walk_comprehension, walk_expr, walk_pattern, walk_stmt, SourceOrderVisitor,
     };
     use ruff_python_ast::Pattern;
 
     struct V<'a> {
         name: &'a str,
         found: bool,
+        /// Python's scoping rules (see [`scope_binding`]).
+        exact: bool,
+        global: bool,
     }
     impl<'ast, 'a> SourceOrderVisitor<'ast> for V<'a> {
         fn visit_stmt(&mut self, s: &'ast Stmt) {
@@ -1311,9 +1341,12 @@ pub(crate) fn scope_binds_name(body: &[Stmt], name: &str) -> bool {
                 }
                 // A `global` / `nonlocal` declaration makes assignments in
                 // this scope rebind the outer name — conservative evidence.
+                // Python requires `global` before any use of the name, so in
+                // exact mode nothing bound it locally before this point.
                 Stmt::Global(g) => {
                     if g.names.iter().any(|n| n.as_str() == self.name) {
                         self.found = true;
+                        self.global = self.exact;
                     }
                 }
                 Stmt::Nonlocal(nl) => {
@@ -1352,7 +1385,27 @@ pub(crate) fn scope_binds_name(body: &[Stmt], name: &str) -> bool {
                     return;
                 }
             }
+            // A lambda binds its parameters and body in its own scope; only
+            // its defaults evaluate (and can walrus-bind) here.
+            if let (true, Expr::Lambda(l)) = (self.exact, e) {
+                if let Some(params) = l.parameters.as_deref() {
+                    self.visit_parameters(params);
+                }
+                return;
+            }
             walk_expr(self, e);
+        }
+
+        fn visit_comprehension(&mut self, c: &'ast ruff_python_ast::Comprehension) {
+            if !self.exact {
+                walk_comprehension(self, c);
+                return;
+            }
+            // The target binds in the comprehension's own scope.
+            self.visit_expr(&c.iter);
+            for cond in &c.ifs {
+                self.visit_expr(cond);
+            }
         }
 
         fn visit_pattern(&mut self, p: &'ast Pattern) {
@@ -1373,14 +1426,23 @@ pub(crate) fn scope_binds_name(body: &[Stmt], name: &str) -> bool {
         }
     }
 
-    let mut v = V { name, found: false };
+    let mut v = V {
+        name,
+        found: false,
+        exact,
+        global: false,
+    };
     for stmt in body {
         v.visit_stmt(stmt);
         if v.found {
-            return true;
+            break;
         }
     }
-    false
+    match (v.found, v.global) {
+        (false, _) => ScopeBinding::Unbound,
+        (true, false) => ScopeBinding::Local,
+        (true, true) => ScopeBinding::Global,
+    }
 }
 
 // ── detection (for the `tyc::parallel_opportunity` advice lint) ───────────────
