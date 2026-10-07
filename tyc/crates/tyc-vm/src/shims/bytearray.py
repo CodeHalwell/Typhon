@@ -9,6 +9,8 @@
 
 class bytearray:
     __typhon_builtin_bases__ = ("bytearray",)
+    # `type(b) is bytearray`: this class *is* the builtin type.
+    __typhon_builtin_type__ = True
 
     def __init__(self, source=b"", encoding=None, errors="strict"):
         if isinstance(source, str):
