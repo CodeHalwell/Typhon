@@ -43,6 +43,12 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   only itself and `object`. They now give CPython's chain
   (`AppError, ValueError, Exception, BaseException, object`), and
   `__bases__` works on every class.
+- **`tyc run` sends more programs it cannot run faithfully to CPython.**
+  A class with a custom `metaclass=` (anything but `ABCMeta`), a class
+  defining `__del__`, and any use of `with_traceback` / `__traceback__`
+  now take the compiled path with a `note:`. Before, the VM silently
+  skipped the metaclass and the finaliser, and raised `AttributeError` for
+  the traceback attributes.
 
 ### Documentation
 

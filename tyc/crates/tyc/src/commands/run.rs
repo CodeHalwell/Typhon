@@ -670,6 +670,7 @@ fn unmodelled_attribute_references(
             }
         }
     }
+    missing.extend(scan.class_features.iter().cloned());
     for attr in UNMODELLED_ATTRIBUTES {
         if scan.attribute_names.contains(*attr) && !scan.shadowed.contains(*attr) {
             missing.insert(format!(".{attr}"));
@@ -789,6 +790,9 @@ struct AttributeScan {
     attribute_names: std::collections::BTreeSet<String>,
     /// Calls passing keyword arguments: the callee and the keyword names.
     keyword_calls: Vec<(KeywordCallee, Vec<String>)>,
+    /// Class-level features the VM ignores: a custom `metaclass=` and a
+    /// `__del__` finaliser.
+    class_features: std::collections::BTreeSet<String>,
 }
 
 /// What a keyword-passing call calls, as far as the syntax tells.
@@ -803,7 +807,18 @@ enum KeywordCallee {
 
 /// Attributes of builtin values the VM does not model, which a program
 /// reaches only by name (`e.add_note(…)`, `e.__notes__`).
-const UNMODELLED_ATTRIBUTES: &[&str] = &["add_note", "__notes__"];
+const UNMODELLED_ATTRIBUTES: &[&str] =
+    &["add_note", "__notes__", "with_traceback", "__traceback__"];
+
+/// The last segment of a name or dotted attribute (`abc.ABCMeta` →
+/// `ABCMeta`).
+fn base_last_segment(expr: &ruff_python_ast::Expr) -> Option<&str> {
+    match expr {
+        ruff_python_ast::Expr::Name(n) => Some(n.id.as_str()),
+        ruff_python_ast::Expr::Attribute(a) => Some(a.attr.as_str()),
+        _ => None,
+    }
+}
 
 /// `asyncio` members whose effect depends on CPython's event-loop
 /// scheduling. The VM runs a coroutine to completion as soon as it is
@@ -932,6 +947,24 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
             }
             Stmt::ClassDef(c) => {
                 self.shadowed.insert(c.name.as_str().to_owned());
+                // The VM honours only `ABCMeta` (and the default `type`); any
+                // other metaclass's `__call__` / `__new__` is never consulted.
+                let custom_metaclass = c.keywords().iter().any(|kw| {
+                    kw.arg.as_ref().is_some_and(|a| a.as_str() == "metaclass")
+                        && !matches!(base_last_segment(&kw.value), Some("ABCMeta") | Some("type"))
+                });
+                if custom_metaclass {
+                    self.class_features.insert("a custom metaclass".to_owned());
+                }
+                // The VM never runs finalisers.
+                let has_del = c
+                    .body
+                    .iter()
+                    .any(|st| matches!(st, Stmt::FunctionDef(f) if f.name.as_str() == "__del__"));
+                if has_del {
+                    self.class_features
+                        .insert("a `__del__` finaliser".to_owned());
+                }
             }
             Stmt::TypeAlias(t) => {
                 if let ruff_python_ast::Expr::Name(n) = t.name.as_ref() {
@@ -1263,6 +1296,27 @@ mod tests {
         // An ordinary generator runs lazily and stays on the VM.
         let lazy = "def g() -> object:\n    mut n = 0\n    while True:\n        yield n\n        n += 1\nprint(next(g()))\n";
         assert_eq!(scan_source(lazy), None);
+    }
+
+    #[test]
+    fn scan_routes_metaclasses_finalisers_and_tracebacks() {
+        let meta =
+            "plain class M(type):\n    pass\nplain class W(metaclass=M):\n    pass\nprint(W())\n";
+        assert_eq!(
+            scan_source(meta),
+            Some(vec!["a custom metaclass".to_owned()])
+        );
+        // `ABCMeta` is modelled.
+        let abc = "import abc\nplain class A(metaclass=abc.ABCMeta):\n    pass\nprint(A)\n";
+        assert_eq!(scan_source(abc), None);
+        let fin =
+            "plain class D:\n    def __del__(self) -> None:\n        print(\"bye\")\nprint(D())\n";
+        assert_eq!(
+            scan_source(fin),
+            Some(vec!["a `__del__` finaliser".to_owned()])
+        );
+        let tb = "try:\n    raise ValueError(\"x\")\nexcept ValueError as e:\n    print(e.__traceback__)\n";
+        assert_eq!(scan_source(tb), Some(vec![".__traceback__".to_owned()]));
     }
 
     #[test]

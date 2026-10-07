@@ -461,6 +461,9 @@ consulted; `Named.__mro__` omits `typing.Generic`; a lone surrogate
 (`"\ud800"`) cannot be represented in a Rust `String` (`'%c' % 0xD800`
 yields U+FFFD); and a generator that falls back to eager collection (see
 "What the VM does not support yet") runs its side effects at call time.
+A plain `tyc run` sends a program with a `__del__`, a custom metaclass or
+an eagerly-collected generator to CPython, so these gaps show only under
+`--no-fallback`.
 
 ### Keyword arguments and the pre-run scan (beta)
 
