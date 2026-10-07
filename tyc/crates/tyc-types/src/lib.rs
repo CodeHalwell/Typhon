@@ -448,10 +448,15 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
         // A `str` is an iterable (and a sequence) of one-character `str`s and
         // `bytes` one of `int`s, so each satisfies the read-only protocols
         // when the element type does (`"".join("abc")`, `set(b"ab")`).
-        (Type::Generic(an, aa), Type::Str) if is_read_view_abc(an) && aa.len() == 1 => {
+        // Neither is a set.
+        (Type::Generic(an, aa), Type::Str)
+            if is_read_view_abc(an) && an != "AbstractSet" && aa.len() == 1 =>
+        {
             assignable(&aa[0], &Type::Str)
         }
-        (Type::Generic(an, aa), Type::Bytes) if is_read_view_abc(an) && aa.len() == 1 => {
+        (Type::Generic(an, aa), Type::Bytes)
+            if is_read_view_abc(an) && an != "AbstractSet" && aa.len() == 1 =>
+        {
             assignable(&aa[0], &Type::Int)
         }
         // Bare (unparameterized) `Ok` or `Err` is assignable to `Result[T, E]`
@@ -1674,6 +1679,29 @@ pub fn generic_param_variance(head: &str, idx: usize) -> Variance {
     }
 }
 
+/// Entry on a module's class-name list recording that it imports `Set` from
+/// `collections.abc`, so a bare `Set[T]` there is the read-only set ABC
+/// (`AbstractSet[T]`, which a `frozenset` is) rather than the deprecated
+/// `typing.Set` alias of `set`. Never a valid class name.
+const ABC_SET_IMPORTED: &str = "<collections.abc.Set>";
+
+/// Whether `body` has `from collections.abc import Set` (unaliased).
+fn imports_abc_set(body: &[Stmt]) -> bool {
+    body.iter().any(|s| match s {
+        Stmt::ImportFrom(i) => {
+            i.level == 0
+                && i.module
+                    .as_ref()
+                    .is_some_and(|m| m.as_str() == "collections.abc")
+                && i.names.iter().any(|a| {
+                    a.name.as_str() == "Set"
+                        && a.asname.as_ref().is_none_or(|n| n.as_str() == "Set")
+                })
+        }
+        _ => false,
+    })
+}
+
 /// Translate an annotation expression into a [`Type`].
 ///
 /// `classes` is the set of class names declared in the enclosing module so
@@ -1940,6 +1968,20 @@ pub fn type_from_annotation_with_params(
                 Expr::Attribute(a) => a.attr.as_str().to_owned(),
                 _ => return Type::Unknown,
             };
+            // `collections.abc.Set` shares its name with `typing.Set` but is
+            // the read-only ABC, which `frozenset` satisfies too.
+            let abc_set = match s.value.as_ref() {
+                Expr::Name(n) => {
+                    n.id.as_str() == "Set" && classes.iter().any(|c| c == ABC_SET_IMPORTED)
+                }
+                Expr::Attribute(a) => {
+                    a.attr.as_str() == "Set"
+                        && matches!(a.value.as_ref(), Expr::Attribute(m)
+                            if m.attr.as_str() == "abc"
+                                && matches!(m.value.as_ref(), Expr::Name(c) if c.id.as_str() == "collections"))
+                }
+                _ => false,
+            };
             // The deprecated capitalised aliases are the *same types* as their
             // lowercase builtins. `tyc::typing_alias_deprecated` already tells
             // the user to stop writing them; leaving the head un-normalised on
@@ -1947,6 +1989,7 @@ pub fn type_from_annotation_with_params(
             // "expected `List[int]`, found `list[int]`" — nonsensical on its
             // face, and it blocks the build rather than nudging.
             let head = match head.as_str() {
+                "Set" if abc_set => "AbstractSet".to_owned(),
                 "List" => "list".to_owned(),
                 "Dict" => "dict".to_owned(),
                 "Set" => "set".to_owned(),
@@ -3403,6 +3446,12 @@ const READ_VIEW_LATTICE: &[(&str, &[&str])] = &[
     // No built-in *container* is an `Iterator`; only iterators and generators
     // are (`for` over a list calls `iter()` first, `next(xs)` does not).
     ("Iterator", &["Iterator", "Generator"]),
+    // `collections.abc.Set` / `typing.AbstractSet`: both set types and a
+    // dict's key view.
+    (
+        "AbstractSet",
+        &["set", "frozenset", "KeysView", "AbstractSet", "MutableSet"],
+    ),
 ];
 
 /// True when `abc` names one of the read-only iteration protocols above.
@@ -3747,12 +3796,19 @@ struct Checker<'a> {
     /// unannotated `self` parameter the enclosing class's type so writes
     /// to `self.field` participate in the frozen-class check.
     current_class: Option<String>,
-    /// True only while `check_stmt` runs an `AnnAssign` that is a direct
+    /// Set only while `check_stmt` runs an `AnnAssign` that is a direct
     /// child of a class body the desugar lowers to `@dataclass`, with a
     /// named default the class body does not bind: a field declaration whose
-    /// default may be copied per instance (W7-07). Unlike `current_class`, it
-    /// is never on inside a method body.
-    dataclass_field_decl: bool,
+    /// default may be copied per instance (W7-07). Holds the class name's
+    /// start offset, which keys [`Checker::class_default_scopes`]. Unlike
+    /// `current_class`, it is never on inside a method body.
+    dataclass_field_decl: Option<u32>,
+    /// The module's class kinds, for the W7-07 class gate; computed on first
+    /// use.
+    class_kinds: std::cell::OnceCell<tyc_syntax::field_defaults::ModuleClassKinds>,
+    /// Which classes the desugar reaches and the names their defaults read;
+    /// computed on first use.
+    class_default_scopes: std::cell::OnceCell<tyc_syntax::field_defaults::ClassDefaultScopes>,
     /// Bumped on entry to an `unsafe:` block, decremented on exit.  While
     /// positive, diagnostics produced by [`Checker::push_error`] /
     /// [`Checker::push_warning`] are dropped so the user can interface with
@@ -4121,7 +4177,9 @@ impl<'a> Checker<'a> {
             current_return: None,
             function_scope: 0,
             current_class: None,
-            dataclass_field_decl: false,
+            dataclass_field_decl: None,
+            class_kinds: std::cell::OnceCell::new(),
+            class_default_scopes: std::cell::OnceCell::new(),
             uninit_instances: HashMap::new(),
             reassigned_names: std::collections::HashSet::new(),
             partial_returning_fns: HashMap::new(),
@@ -7031,6 +7089,9 @@ pub fn extract_module_shapes_with(
     frozen: &std::collections::HashSet<String>,
 ) -> ModuleShapes {
     let mut classes: Vec<String> = Vec::new();
+    if imports_abc_set(&module.body) {
+        classes.push(ABC_SET_IMPORTED.to_owned());
+    }
     for stmt in &module.body {
         match stmt {
             Stmt::ClassDef(cd) => classes.push(cd.name.as_str().to_owned()),
@@ -9648,6 +9709,52 @@ fn lazy_let_factory_body(expr: &Expr) -> Option<&Expr> {
     }
 }
 
+/// The declared type of the field an attribute target writes (`self.mode` in
+/// `self.mode: str = …`), with the receiver's type arguments substituted, as
+/// [`check_attr_assign_type`] checks it; `None` when that check would not
+/// run against a concrete type.
+fn attr_target_field_type(c: &Checker, target: &Expr) -> Option<Type> {
+    let Expr::Attribute(attr) = target else {
+        return None;
+    };
+    let (class_name, targs) = match infer_expr_readonly(c, &attr.value).strip_none() {
+        Type::Class(name) => (name, Vec::new()),
+        Type::Generic(name, args) => (name, args),
+        _ => return None,
+    };
+    let real = class_name
+        .strip_prefix("__typhon_impl_")
+        .unwrap_or(&class_name);
+    let field = match class_contracts::property(c, real, attr.attr.as_str()) {
+        Some((_, setter)) => setter?,
+        None => c.find_field(real, attr.attr.as_str())?.clone(),
+    };
+    let mut bindings = std::collections::HashMap::new();
+    if let Some(tparams) = c.class_type_params.get(real) {
+        if tparams.len() == targs.len() {
+            bindings.extend(tparams.iter().cloned().zip(targs));
+        }
+    }
+    let field = substitute_typevars(&field, &bindings);
+    (!matches!(field, Type::Unknown) && !mentions_type_param(&field)).then_some(field)
+}
+
+/// Whether `target` (`h.x`) reads a `@property`, which may return a
+/// different object on every read: what one read was narrowed to says
+/// nothing about the next.
+fn attr_reads_property(c: &Checker, target: &Expr) -> bool {
+    let Expr::Attribute(attr) = target else {
+        return false;
+    };
+    match infer_expr_readonly(c, &attr.value).strip_none() {
+        Type::Class(name) | Type::Generic(name, _) => {
+            let real = name.strip_prefix("__typhon_impl_").unwrap_or(&name);
+            class_contracts::property(c, real, attr.attr.as_str()).is_some()
+        }
+        _ => false,
+    }
+}
+
 /// The root of a plain or dotted name (`BASE` → `BASE`, `cfg.DEFAULTS` →
 /// `cfg`); `None` for any other expression.
 fn dotted_name_root(e: &Expr) -> Option<&str> {
@@ -9659,68 +9766,31 @@ fn dotted_name_root(e: &Expr) -> Option<&str> {
 }
 
 /// Whether the desugar gives `cd` the `@dataclass` decorator, and with it the
-/// per-instance copy of named field defaults (W7-07). Mirrors
-/// `needs_decorator` in `tyc-desugar` for every class kind visible here:
-/// `plain class`, `class!`, `model`, `interface`, `TypedDict` / `NamedTuple`
-/// / `Enum`-family subclasses, an explicit `@dataclass`, and the `impl` /
-/// `lazy import` pseudo-classes are emitted as written. A kind the checker
-/// cannot see (an exception or metaclass rooted in a module class, a
-/// configured `skip-decoration-bases` entry) counts as decorated, which only
-/// keeps the checker permissive.
+/// per-instance copy of named field defaults (W7-07). The class kinds, the
+/// classes its walk reaches and the `plain class` / `class!` marker test are
+/// the desugar's own (`tyc_syntax::field_defaults`). Only a configured
+/// `skip-decoration-bases` entry is invisible here, so such a class counts
+/// as decorated — which only keeps the checker permissive.
 fn class_copies_named_defaults(c: &Checker, cd: &ruff_python_ast::StmtClassDef) -> bool {
-    fn last_segment(e: &Expr) -> Option<&str> {
-        match e {
-            Expr::Name(n) => Some(n.id.as_str()),
-            Expr::Attribute(a) => Some(a.attr.as_str()),
-            Expr::Subscript(s) => last_segment(&s.value),
-            _ => None,
-        }
-    }
-    fn is_dataclass_decorator(e: &Expr) -> bool {
-        match e {
-            Expr::Name(n) => n.id.as_str() == "dataclass",
-            Expr::Attribute(a) => {
-                a.attr.as_str() == "dataclass"
-                    && matches!(a.value.as_ref(), Expr::Name(n) if n.id.as_str() == "dataclasses")
-            }
-            Expr::Call(call) => is_dataclass_decorator(&call.func),
-            _ => false,
-        }
-    }
+    use tyc_syntax::field_defaults::{marker_covers, skips_dataclass_decoration};
     let name = cd.name.as_str();
-    if c.is_plain_class(name)
-        || c.is_raw_class(name)
-        || name.starts_with("__typhon_impl_")
-        || name.starts_with("__TyphonLazy_")
-        || cd
-            .decorator_list
-            .iter()
-            .any(|d| is_dataclass_decorator(&d.expression))
-    {
+    let class_start = u32::from(cd.range.start());
+    let name_start = u32::from(cd.name.range.start());
+    // Per declaration when the caller passed the markers; otherwise by name,
+    // which a same-named class in another scope can fool.
+    let marked = match &c.resolved.class_markers {
+        Some(m) => {
+            marker_covers(&m.plain, class_start, name_start)
+                || marker_covers(&m.raw, class_start, name_start)
+        }
+        None => c.is_plain_class(name) || c.is_raw_class(name),
+    };
+    if marked || skips_dataclass_decoration(cd, c.class_kinds(), &[]) {
         return false;
     }
-    !cd.bases().iter().any(|base| {
-        let typing_form = |form: &str| match base {
-            Expr::Name(n) => n.id.as_str() == form,
-            Expr::Attribute(a) => {
-                a.attr.as_str() == form
-                    && matches!(
-                        a.value.as_ref(),
-                        Expr::Name(n) if matches!(n.id.as_str(), "typing" | "typing_extensions")
-                    )
-            }
-            _ => false,
-        };
-        matches!(base, Expr::Name(n) if matches!(n.id.as_str(), "BaseModel" | "Protocol"))
-            || typing_form("TypedDict")
-            || typing_form("NamedTuple")
-            || last_segment(base).is_some_and(|seg| {
-                matches!(
-                    seg,
-                    "Enum" | "IntEnum" | "StrEnum" | "Flag" | "IntFlag" | "ABC" | "ABCMeta"
-                )
-            })
-    })
+    // A class the desugar's walk never reaches (one under an `if` / `for` /
+    // `with` / `try`) is emitted as written.
+    c.module.is_none() || c.class_default_scopes().mutable_names(name_start).is_some()
 }
 
 /// Whether a dataclass field's named default fits its annotation once the
@@ -9733,25 +9803,45 @@ fn class_copies_named_defaults(c: &Checker, cd: &ruff_python_ast::StmtClassDef) 
 /// ([`class_copies_named_defaults`]) and the class-body-name filter.
 fn copied_field_default_fits(
     c: &Checker,
+    class_name_start: u32,
     a: &ruff_python_ast::StmtAnnAssign,
     value: &Expr,
     ann_type: &Type,
     value_type: &Type,
 ) -> bool {
-    use tyc_syntax::field_defaults::{
-        collect_module_mutable_names, is_classvar_annotation, named_mutable_default_kind,
-    };
+    use tyc_syntax::field_defaults::{is_classvar_annotation, named_mutable_default_kind};
     if is_classvar_annotation(&a.annotation) {
         return false;
     }
-    let module_names = c
-        .module
-        .map(|m| collect_module_mutable_names(&m.body))
-        .unwrap_or_default();
-    let Some(kind) = named_mutable_default_kind(value, &a.annotation, &module_names) else {
+    // The names this class's defaults read: the module's, as enclosing
+    // functions shadow them.
+    let empty = HashMap::new();
+    let names = c
+        .class_default_scopes()
+        .mutable_names(class_name_start)
+        .unwrap_or(&empty);
+    let Some(kind) = named_mutable_default_kind(value, &a.annotation, names) else {
         return false;
     };
     builtin_copy_type(kind, value_type).is_some_and(|copy| c.is_assignable(ann_type, &copy))
+}
+
+impl Checker<'_> {
+    fn class_kinds(&self) -> &tyc_syntax::field_defaults::ModuleClassKinds {
+        self.class_kinds.get_or_init(|| {
+            self.module
+                .map(|m| tyc_syntax::field_defaults::ModuleClassKinds::collect(&m.body))
+                .unwrap_or_default()
+        })
+    }
+
+    fn class_default_scopes(&self) -> &tyc_syntax::field_defaults::ClassDefaultScopes {
+        self.class_default_scopes.get_or_init(|| {
+            self.module
+                .map(|m| tyc_syntax::field_defaults::ClassDefaultScopes::collect(&m.body))
+                .unwrap_or_default()
+        })
+    }
 }
 
 /// The type `list(v)` / `set(v)` / `dict(v)` builds from a value of type
@@ -10296,6 +10386,9 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
     // exempt: multiple `impl Foo:` blocks legitimately produce multiple
     // pseudo-classes, and the merge pass handles deduplication.
     let mut seen_class_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    if imports_abc_set(body) {
+        c.classes.push(ABC_SET_IMPORTED.to_owned());
+    }
     for stmt in body {
         match stmt {
             Stmt::ClassDef(cd) => {
@@ -13944,6 +14037,43 @@ fn collect_call_rebound_globals(stmts: &[Stmt], acc: &mut std::collections::Hash
 fn reset_globals_after_call(c: &mut Checker) {
     c.env.reset_global_narrowings(&c.globals_rebound_by_call);
     c.env.reset_local_narrowings(&c.nonlocals_rebound_by_call);
+    // A rebound name is a different object: what its attributes were
+    // narrowed to says nothing about the new one.
+    if !c.env.attr_narrowings.is_empty() {
+        let stale: Vec<String> = c
+            .globals_rebound_by_call
+            .iter()
+            .filter(|n| c.env.scope_of(n) == Some(0))
+            .chain(
+                c.nonlocals_rebound_by_call
+                    .iter()
+                    .filter(|n| c.env.scope_of(n).is_some_and(|i| i > 0)),
+            )
+            .cloned()
+            .collect();
+        for name in stale {
+            c.env.clear_attr_narrowing(&name);
+        }
+    }
+}
+
+/// Drop the attribute narrowings rooted at each name `target` (re)binds —
+/// `h` in `for h in …`, `with … as h`, `h += …`, `del h`: they describe the
+/// object the name held before, as for `h = …`.
+fn clear_attr_narrowings_rooted_in(c: &mut Checker, target: &Expr) {
+    match target {
+        Expr::Name(n) => c.env.clear_attr_narrowing(n.id.as_str()),
+        Expr::Tuple(t) => t
+            .elts
+            .iter()
+            .for_each(|e| clear_attr_narrowings_rooted_in(c, e)),
+        Expr::List(l) => l
+            .elts
+            .iter()
+            .for_each(|e| clear_attr_narrowings_rooted_in(c, e)),
+        Expr::Starred(st) => clear_attr_narrowings_rooted_in(c, &st.value),
+        _ => {}
+    }
 }
 
 impl Checker<'_> {
@@ -14948,6 +15078,7 @@ fn bind_except_name(c: &mut Checker, h: &ruff_python_ast::ExceptHandlerExceptHan
         span: (start, start + name.as_str().len()),
         from_unsafe: c.unsafe_depth > 0,
     });
+    c.env.clear_attr_narrowing(name.as_str());
 }
 
 /// Evaluate an expression appearing in statement position, invalidating global
@@ -15049,7 +15180,16 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 // A module-level `lazy let NAME: T = E` binds what `E`
                 // evaluates to on first use, so `E` is what `T` describes.
                 let value = lazy_let_factory_body(value).unwrap_or(value);
-                let value_type = infer_expr_ctx(c, value, Some(&ann_type));
+                // An attribute target also stores into its field, which may be
+                // narrower than the annotation (`self.mode: str = "slow"` with
+                // `mode: Mode`). Inferring under the field keeps a literal or a
+                // display at the precision the field check below needs; a
+                // value that fits the field then fits the annotation too.
+                let expected = match attr_target_field_type(c, &a.target) {
+                    Some(field) if !bare_final && c.is_assignable(&ann_type, &field) => field,
+                    _ => ann_type.clone(),
+                };
+                let value_type = infer_expr_ctx(c, value, Some(&expected));
                 init_type = Some(value_type.clone());
                 // A freeze annotation describes the input; the binding carries
                 // the runtime's recursively immutable output shape. Only a
@@ -15071,8 +15211,9 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 }
                 let value_fits = bare_final
                     || c.is_assignable(&ann_type, &value_type)
-                    || (dataclass_field
-                        && copied_field_default_fits(c, a, value, &ann_type, &value_type));
+                    || dataclass_field.is_some_and(|class| {
+                        copied_field_default_fits(c, class, a, value, &ann_type, &value_type)
+                    });
                 if bare_final {
                     ann_type = value_type.clone();
                 } else if !value_fits {
@@ -15833,17 +15974,19 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // (the factory lambda could not see it).
             let body_names = class_copies_named_defaults(c, cd)
                 .then(|| tyc_syntax::field_defaults::class_body_names(&cd.body));
+            let class_start = u32::from(cd.name.range.start());
             for s in &cd.body {
                 c.dataclass_field_decl = match (s, &body_names) {
                     (Stmt::AnnAssign(a), Some(names)) => a
                         .value
                         .as_deref()
                         .and_then(dotted_name_root)
-                        .is_some_and(|root| !names.contains(root)),
-                    _ => false,
+                        .is_some_and(|root| !names.contains(root))
+                        .then_some(class_start),
+                    _ => None,
                 };
                 check_stmt(c, s);
-                c.dataclass_field_decl = false;
+                c.dataclass_field_decl = None;
             }
             c.current_class = saved_class;
             c.env.leave();
@@ -16097,6 +16240,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // `Unknown`, so `for k, v in d.items(): let n: int = k` (k is str)
             // slipped through. Shares the comprehension binder.
             bind_unpacking_target(c, f.target.as_ref(), &elem_ty);
+            clear_attr_narrowings_rooted_in(c, &f.target);
             // Iteration-2 soundness (see the `While` arm): widen any name
             // reassigned in the body to its declared type before checking, so a
             // loop-carried narrowing read at the top of a later pass isn't
@@ -16166,6 +16310,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // global it rebinds.
             let r = eval_stmt_expr(c, &a.value);
             check_attr_assign_not_frozen(c, &a.target);
+            clear_attr_narrowings_rooted_in(c, &a.target);
             // Operator-compatibility check, mirroring `Expr::BinOp`. Restricted
             // to scalar targets (int/float/bool/str/bytes) where `x op= y` has
             // the same operand rules as `x = x op y`; mutable containers have
@@ -16270,6 +16415,9 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         span,
                         from_unsafe: c.unsafe_depth > 0,
                     });
+                }
+                if let Some(target) = item.optional_vars.as_deref() {
+                    clear_attr_narrowings_rooted_in(c, target);
                 }
             }
             for s in &w.body {
@@ -16427,8 +16575,11 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         .filter(|t| c.is_assignable(&subject_type, t))
                         .or_else(|| residual.clone()),
                     // `match h.m: case dict():` narrows the attribute path,
-                    // as `isinstance(h.m, dict)` does.
-                    subject @ Expr::Attribute(_) if attr_path_of(subject).is_some() => {
+                    // as `isinstance(h.m, dict)` does — unless `m` is a
+                    // property, which the arm's next read re-evaluates.
+                    subject @ Expr::Attribute(_)
+                        if attr_path_of(subject).is_some() && !attr_reads_property(c, subject) =>
+                    {
                         subject_pattern_narrowing(c, &subject_type, &case.pattern)
                             .filter(|t| c.is_assignable(&subject_type, t))
                     }
@@ -16437,11 +16588,22 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 let snap = narrow_to.as_ref().map(|_| c.env.snapshot());
                 c.env.enter();
                 bind_pattern_names(c, &case.pattern, &case_subject);
+                // A capture rebinds its name, so attribute narrowings rooted
+                // there — the subject's own included — are stale.
+                let mut captures = Vec::new();
+                collect_pattern_capture_names(&case.pattern, &mut captures);
+                for name in &captures {
+                    c.env.clear_attr_narrowing(name);
+                }
                 if let Some(t) = narrow_to {
                     match m.subject.as_ref() {
                         Expr::Name(subj) => c.env.narrow(subj.id.as_str(), t),
                         subject => {
-                            if let Some(path) = attr_path_of(subject) {
+                            if let Some(path) = attr_path_of(subject).filter(|p| {
+                                !captures
+                                    .iter()
+                                    .any(|n| p.split('.').next() == Some(n.as_str()))
+                            }) {
                                 c.env.narrow_attr(path, t);
                             }
                         }
@@ -16545,7 +16707,10 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // narrowing so a subsequent use is re-checked honestly.
             for target in &d.targets {
                 match target {
-                    Expr::Name(n) => c.env.widen_to_declared(n.id.as_str()),
+                    Expr::Name(n) => {
+                        c.env.widen_to_declared(n.id.as_str());
+                        c.env.clear_attr_narrowing(n.id.as_str());
+                    }
                     Expr::Attribute(_) => {
                         if let Some(path) = attr_path_of(target) {
                             c.env.clear_attr_narrowing(&path);
@@ -19671,7 +19836,14 @@ fn attr_expr_type_with_pending(c: &Checker, e: &Expr, pending: &[Narrowing]) -> 
 /// ([`container_pattern_narrowing`]); anything else is replaced as the
 /// `isinstance` positive branch replaces it. The other branch learns nothing,
 /// since an instance of a subclass fails the test. `C` must name a class the
-/// checker knows — `type(x) is cls` with `cls` a variable narrows nothing.
+/// checker knows — `type(x) is cls` with `cls` a variable narrows nothing,
+/// and neither does a local, parameter or loop target that happens to carry
+/// a class's name (`let int = cls`), nor a rebound `type`.
+///
+/// The replacement must still fit `x`'s current type, as a `match` class
+/// pattern's must: `T`, a newtype or a literal union is still that type when
+/// its runtime class is `bool` / `int` / `str`, so it keeps its declared type
+/// rather than becoming the bare class.
 fn type_identity_narrowing(
     c: &Checker,
     cmp: &ruff_python_ast::ExprCompare,
@@ -19692,7 +19864,8 @@ fn type_identity_narrowing(
     let target = match cmp.left.as_ref() {
         Expr::Call(call)
             if matches!(call.func.as_ref(), Expr::Name(n) if n.id.as_str() == "type")
-                && call.arguments.keywords.is_empty() =>
+                && call.arguments.keywords.is_empty()
+                && c.env.lookup("type").is_none() =>
         {
             match &*call.arguments.args {
                 [arg] => arg,
@@ -19703,6 +19876,15 @@ fn type_identity_narrowing(
         _ => return None,
     };
     let head = class.id.as_str();
+    // A class declaration or class import is seeded as `Class(head)`; a
+    // builtin is not in the env at all. Any other binding of the name is a
+    // value whose runtime class the checker does not know.
+    if c.env
+        .lookup(head)
+        .is_some_and(|b| !matches!(&b.declared, Type::Class(n) if n == head))
+    {
+        return None;
+    }
     let class_type = match type_from_annotation(&cmp.comparators[0], &c.classes) {
         Type::Class(name)
             if !is_builtin_container_head(&name)
@@ -19715,8 +19897,9 @@ fn type_identity_narrowing(
         t => t,
     };
     let replace = |current: &Type| {
-        container_pattern_narrowing(c, current, head)
-            .unwrap_or_else(|| refine_isinstance_target(current, &class_type))
+        let r = container_pattern_narrowing(c, current, head)
+            .unwrap_or_else(|| refine_isinstance_target(current, &class_type));
+        c.is_assignable(current, &r).then_some(r)
     };
     match target {
         Expr::Name(n) => {
@@ -19724,10 +19907,11 @@ fn type_identity_narrowing(
             Some(Narrowing {
                 name: n.id.as_str().to_owned(),
                 attr_path: None,
-                replacement: replace(&b.narrowed),
+                replacement: replace(&b.narrowed)?,
             })
         }
-        Expr::Attribute(_) => {
+        // A property is re-evaluated on the next read.
+        Expr::Attribute(_) if !attr_reads_property(c, target) => {
             let path = attr_path_of(target)?;
             let current = c
                 .env
@@ -19737,11 +19921,28 @@ fn type_identity_narrowing(
             Some(Narrowing {
                 name: String::new(),
                 attr_path: Some(path),
-                replacement: replace(&current),
+                replacement: replace(&current)?,
             })
         }
         _ => None,
     }
+}
+
+/// A walrus in a later operand of the same condition rebinds its target
+/// (`isinstance(h.m, dict) and (h := other) …`), so what the earlier
+/// operands said about it, or about its attributes, no longer holds.
+fn drop_narrowings_rebound_by(operand: &Expr, out: &mut Vec<Narrowing>) {
+    let rebound = walrus_targets_in(operand);
+    if rebound.is_empty() {
+        return;
+    }
+    out.retain(|n| {
+        let root = match &n.attr_path {
+            Some(path) => path.split('.').next().unwrap_or_default(),
+            None => n.name.as_str(),
+        };
+        !rebound.iter().any(|r| r == root)
+    });
 }
 
 fn collect_narrowings(c: &Checker, test: &Expr, negate: bool) -> Vec<Narrowing> {
@@ -19966,6 +20167,7 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                     // fail, so we can't safely narrow any single name.
                     if !negate {
                         for operand in &b.values {
+                            drop_narrowings_rebound_by(operand, out);
                             collect_narrowings_inner(c, operand, false, out);
                         }
                     }
@@ -19978,6 +20180,7 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                     // safely narrow any single name.
                     if negate {
                         for operand in &b.values {
+                            drop_narrowings_rebound_by(operand, out);
                             collect_narrowings_inner(c, operand, true, out);
                         }
                     }
@@ -21827,6 +22030,8 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                     target.range.start().to_usize(),
                     target.range.start().to_usize() + target.id.as_str().len(),
                 );
+                // Like `h = …`, the rebind stales `h.x` narrowings.
+                c.env.clear_attr_narrowing(target.id.as_str());
                 if c.env.lookup(target.id.as_str()).is_some() {
                     // Rebinding an existing outer binding — treat like an
                     // assignment narrow (the declared type is unchanged).
@@ -25613,16 +25818,25 @@ fn operator_operands_compatible(op: Operator, l: &Type, r: &Type) -> bool {
             // `dict.keys()` / `dict.items()` are set-like views that also
             // support set difference (`d1.keys() - d2.keys()`,
             // `d.keys() - some_set`), so `KeysView` / `ItemsView` count as
-            // set-like too (`ValuesView` does NOT — values aren't a set).
-            // The bitwise ops `&`, `|`, `^` already fall through to the
+            // set-like too (`ValuesView` does NOT — values aren't a set), as
+            // are the `AbstractSet` / `MutableSet` ABCs. The bitwise ops `&`, `|`, `^` already fall through to the
             // permissive `_ => true` arm; the `-` arm needs an explicit
             // carve-out because it shares this match with the
             // numeric-only operators above.
             if let (Type::Generic(ln, _), Type::Generic(rn, _)) = (l, r) {
                 let ls = ln.as_str();
                 let rs = rn.as_str();
-                let set_like =
-                    |n: &str| matches!(n, "set" | "frozenset" | "KeysView" | "ItemsView");
+                let set_like = |n: &str| {
+                    matches!(
+                        n,
+                        "set"
+                            | "frozenset"
+                            | "KeysView"
+                            | "ItemsView"
+                            | "AbstractSet"
+                            | "MutableSet"
+                    )
+                };
                 if matches!(op, Operator::Sub) && set_like(ls) && set_like(rs) {
                     return true;
                 }

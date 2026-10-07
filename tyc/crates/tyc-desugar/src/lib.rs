@@ -34,8 +34,9 @@ use tyc_syntax::impl_site::collect_sealed_union_aliases;
 // Shared with `tyc-types`, which must accept exactly the field defaults
 // copied here (W7-07).
 use tyc_syntax::field_defaults::{
-    class_body_names, collect_module_mutable_names, is_classvar_annotation,
-    named_mutable_default_kind,
+    base_last_segment, class_body_names, class_inherits_basemodel, is_classvar_annotation,
+    marker_covers, named_mutable_default_kind, skips_dataclass_decoration, ClassDefaultScopes,
+    ModuleClassKinds,
 };
 
 // ── public API ───────────────────────────────────────────────────────────────
@@ -1803,18 +1804,10 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
     // an impl block) need `__dict__` to back the property cache; treat them
     // as multi-base parents so the dataclass decorator drops `slots=True`.
     collect_cached_property_targets_into(&m.body, &mut multi_base_parents);
-    // Module-level classes and the transitive exception subset among them.
-    let mut module_level_classes: Vec<(String, Vec<String>)> = Vec::new();
-    collect_class_bases_into(&m.body, &mut module_level_classes);
-    let module_class_names: std::collections::HashSet<&str> = module_level_classes
-        .iter()
-        .map(|(n, _)| n.as_str())
-        .collect();
-    let exception_class_names =
-        exception_class_names_from(&module_level_classes, &module_class_names);
+    // Module-level classes and the exceptions / metaclasses among them.
+    let class_kinds = ModuleClassKinds::collect(&m.body);
     let raw_class_infos = collect_raw_class_infos(&m.body, &options.raw_class_line_starts);
-    let module_mutable_names = collect_module_mutable_names(&m.body);
-    let metaclass_names = metaclass_names_from(&module_level_classes, &module_class_names);
+    let default_scopes = ClassDefaultScopes::collect(&m.body);
     let markers = ClassMarkers {
         raw_starts: &options.raw_class_line_starts,
         frozen_starts: &options.frozen_class_line_starts,
@@ -1822,11 +1815,9 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
         multi_base_parents: &multi_base_parents,
         skip_decoration_bases: &options.skip_decoration_bases,
         model_extra: &options.model_extra,
-        exception_class_names: &exception_class_names,
-        module_class_names: &module_class_names,
+        class_kinds: &class_kinds,
         raw_class_infos: &raw_class_infos,
-        module_mutable_names: &module_mutable_names,
-        metaclass_names: &metaclass_names,
+        default_scopes: &default_scopes,
     };
     let (new_body, transformed_classes) = desugar_stmts(&m.body, markers);
 
@@ -2286,26 +2277,21 @@ struct ClassMarkers<'a> {
     /// classes. Sourced from `[emit] model-extra` in `typhon.toml` via
     /// [`DesugarOptions::model_extra`].
     model_extra: &'a str,
-    /// Names of every module-level class that is (transitively) an exception
-    /// subclass — so a subclass of a non-suffix-named user exception base
-    /// (`class Timeout(Failure)` where `Failure(Exception)`) is recognised.
-    exception_class_names: &'a std::collections::HashSet<&'a str>,
-    /// Names of every module-level class. Used to tell an *external*
-    /// (builtin/imported) exception base apart from a `*Error`-named module
-    /// dataclass when classifying a class as an exception per-class.
-    module_class_names: &'a std::collections::HashSet<&'a str>,
+    /// The module's classes and which are (transitively) exceptions or
+    /// metaclasses — so a subclass of a non-suffix-named user exception base
+    /// (`class Timeout(Failure)` where `Failure(Exception)`) is recognised,
+    /// and a `*Error`-named module dataclass base is not taken for one. A
+    /// metaclass is never a dataclass (W7-11).
+    class_kinds: &'a ModuleClassKinds,
     /// Constructor shape of every module-level `class!`, so a `class!`
     /// deriving from another in-module `class!` can thread the parent's
     /// fields through its own synthesised `__init__`.
     raw_class_infos: &'a HashMap<String, RawClassInfo>,
-    /// Module-level names evidently bound to a `list` / `dict` / `set`
-    /// (by annotation or by value), mapped to that builtin's name — so a
-    /// field defaulting to one gets a per-instance copy (W7-07).
-    module_mutable_names: &'a HashMap<String, &'static str>,
-    /// Names of every module-level class that is (transitively) a
-    /// metaclass — derived from `type` (or `ABCMeta` / `EnumMeta` /
-    /// `EnumType`). A metaclass is never a dataclass (W7-11).
-    metaclass_names: &'a std::collections::HashSet<&'a str>,
+    /// Per class, the names evidently bound to a `list` / `dict` / `set`
+    /// that its field defaults read (the module's, as shadowed by enclosing
+    /// functions), mapped to that builtin's name — so a field defaulting to
+    /// one gets a per-instance copy (W7-07).
+    default_scopes: &'a ClassDefaultScopes,
 }
 
 /// What a `class!` contributes to the constructors of `class!` subclasses.
@@ -2328,7 +2314,7 @@ fn collect_raw_class_infos(body: &[Stmt], raw_starts: &[u32]) -> HashMap<String,
         let Stmt::ClassDef(c) = stmt else { continue };
         let class_start = u32::from(c.range.start());
         let name_start = u32::from(c.name.range.start());
-        if !ClassMarkers::marker_covers(raw_starts, class_start, name_start) {
+        if !marker_covers(raw_starts, class_start, name_start) {
             continue;
         }
         let fields = c
@@ -2399,21 +2385,16 @@ fn raw_ctor_params(
 }
 
 impl ClassMarkers<'_> {
-    /// Return `true` if `starts` contains an offset in the half-open
-    /// range `[class_start, name_start)` — i.e. a marker that lives on
-    /// the same line as this class's `class` keyword.
-    fn marker_covers(starts: &[u32], class_start: u32, name_start: u32) -> bool {
-        starts.partition_point(|&off| off < class_start)
-            != starts.partition_point(|&off| off < name_start)
-    }
+    /// A marker on the same line as this class's `class` keyword
+    /// ([`marker_covers`]).
     fn is_raw(self, class_start: u32, name_start: u32) -> bool {
-        Self::marker_covers(self.raw_starts, class_start, name_start)
+        marker_covers(self.raw_starts, class_start, name_start)
     }
     fn is_frozen(self, class_start: u32, name_start: u32) -> bool {
-        Self::marker_covers(self.frozen_starts, class_start, name_start)
+        marker_covers(self.frozen_starts, class_start, name_start)
     }
     fn is_plain(self, class_start: u32, name_start: u32) -> bool {
-        Self::marker_covers(self.plain_starts, class_start, name_start)
+        marker_covers(self.plain_starts, class_start, name_start)
     }
 }
 
@@ -2434,9 +2415,11 @@ fn desugar_stmts(stmts: &[Stmt], markers: ClassMarkers<'_>) -> (Vec<Stmt>, bool)
     (new_stmts, any_transformed)
 }
 
-/// Desugar a single statement, recursing into any nested statement lists.
-/// Returns the (possibly modified) statement and whether any class was
-/// transformed at this level or deeper.  `markers` carries the per-class
+/// Desugar a single statement, recursing into the bodies of classes and
+/// functions (only — a class under an `if` / `for` / `with` / `try` is left
+/// as written; `field_defaults::ClassDefaultScopes` mirrors this walk for the
+/// type checker). Returns the (possibly modified) statement and whether any
+/// class was transformed at this level or deeper.  `markers` carries the per-class
 /// modifier offsets collected by the preprocessor (`class!` raw,
 /// `frozen`); classes whose source range covers a marker are emitted
 /// with the corresponding decorator (or no decorator, for `class!`).
@@ -2459,25 +2442,8 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             let is_plain = markers.is_plain(class_start, name_start);
             let is_pydantic = class_inherits_basemodel(c);
             // `impl` pseudo-classes (`__typhon_impl_*`) are temporary stubs
-            // that will be merged into their target class by `merge_impl_blocks`;
-            // they must not receive a dataclass decorator.
+            // that will be merged into their target class by `merge_impl_blocks`.
             let is_impl_stub = c.name.as_str().starts_with("__typhon_impl_");
-            // `lazy import` lowers to a `__TyphonLazy_*` proxy class with its
-            // own `__slots__` and `__init__`; decorating it as a dataclass
-            // would rewrite those and break the proxy.
-            let is_lazy_proxy = c.name.as_str().starts_with("__TyphonLazy_");
-            // `interface` lowers to `class X(Protocol):` — Protocols are not
-            // dataclasses (the runtime Protocol behaviour conflicts with
-            // dataclass field collection).
-            let is_protocol = class_inherits_protocol(c);
-            let is_typed_dict = class_inherits_typed_dict(c);
-            let is_named_tuple = class_inherits_named_tuple(c);
-            // Skip auto-decoration for subclasses of non-dataclass-friendly
-            // bases: stdlib `Enum`/`Flag`/`ABC` and any user-supplied names
-            // from `skip_decoration_bases`. This makes plain `class X(Enum):`
-            // do the right thing without requiring `plain class`/`class!`.
-            let is_skip_decoration_subclass =
-                class_inherits_skip_decoration_base(c, markers.skip_decoration_bases);
             // Exception subclasses must not get a dataclass `__init__` (it
             // would shadow `BaseException.__init__` and break
             // `raise FooError("msg")`). They lower like `class!`: no
@@ -2487,23 +2453,7 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             // scope including nested classes — OR is a module-level class
             // transitively rooted in one. A `*Error`-named module *dataclass*
             // base is NOT external, so it doesn't taint its subclasses.
-            let has_external_exception_base = c.bases().iter().any(|b| {
-                base_last_segment(b).is_some_and(|seg| {
-                    !markers.module_class_names.contains(seg) && name_is_exception_base(seg)
-                })
-            });
-            let is_exception_subclass = has_external_exception_base
-                || markers.exception_class_names.contains(c.name.as_str());
-            // A metaclass (`class Meta(type):`, or a subclass of one) is not
-            // a record type: `@dataclass` gave it an `__init__(self, …)` that
-            // replaced `type.__init__`, so the first class created with it
-            // raised `TypeError` (W7-11). Same rule as exceptions: an external
-            // metaclass base in any scope, or a module class rooted in one.
-            let is_metaclass = c.bases().iter().any(|b| {
-                base_last_segment(b).is_some_and(|seg| {
-                    !markers.module_class_names.contains(seg) && METACLASS_BASES.contains(&seg)
-                })
-            }) || markers.metaclass_names.contains(c.name.as_str());
+            let is_exception_subclass = markers.class_kinds.is_exception_class(c);
             // Multi-inheritance with concrete bases conflicts with
             // `slots=True`; emit the decorator without `slots=True` in
             // that case. FINDINGS #102. Also drop `slots=True` for any
@@ -2512,24 +2462,21 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             // load.
             let has_multi_bases = class_has_multiple_concrete_bases(c)
                 || markers.multi_base_parents.contains(c.name.as_str());
-            // Skip the dataclass decorator for Pydantic model classes,
-            // Protocol classes, TypedDict subclasses, NamedTuple subclasses,
-            // and lazy proxies; they already carry the right shape or are
-            // incompatible with dataclass. `class_copies_named_defaults` in
-            // `tyc-types` mirrors this gate (it decides which field defaults
-            // are checked as their W7-07 copy); keep the two in step.
+            // Skip the dataclass decorator for `plain class` / `class!` and
+            // for the class kinds that already carry the right shape or are
+            // incompatible with dataclass (models, Protocols, TypedDict /
+            // NamedTuple / Enum subclasses, exceptions, metaclasses, lazy
+            // proxies, ...). `tyc-types` decides which field defaults are
+            // checked as their W7-07 copy from the same
+            // `skips_dataclass_decoration` and the same markers, so the two
+            // cannot drift.
             let needs_decorator = !is_raw
                 && !is_plain
-                && !is_pydantic
-                && !is_protocol
-                && !is_typed_dict
-                && !is_named_tuple
-                && !is_impl_stub
-                && !is_lazy_proxy
-                && !is_skip_decoration_subclass
-                && !is_exception_subclass
-                && !is_metaclass
-                && !has_dataclass_decorator(&c.decorator_list);
+                && !skips_dataclass_decoration(
+                    c,
+                    markers.class_kinds,
+                    markers.skip_decoration_bases,
+                );
             // Pydantic `model` classes must have `model_config = ConfigDict(extra="forbid")`
             // as their first body statement unless the user already defined it.
             let needs_model_config =
@@ -2545,8 +2492,11 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             if needs_decorator
                 && rewrite_mutable_field_defaults(
                     &mut new_body,
-                    markers.module_class_names,
-                    markers.module_mutable_names,
+                    markers.class_kinds.module_classes(),
+                    markers
+                        .default_scopes
+                        .mutable_names(name_start)
+                        .unwrap_or(&HashMap::new()),
                 )
             {
                 body_transformed = true;
@@ -2725,7 +2675,7 @@ fn make_dataclasses_dot_dataclass_decorator_frozen() -> Decorator {
 /// triggered). FINDINGS #62.
 fn rewrite_mutable_field_defaults(
     body: &mut [Stmt],
-    module_class_names: &std::collections::HashSet<&str>,
+    module_class_names: &HashSet<String>,
     module_mutable_names: &HashMap<String, &'static str>,
 ) -> bool {
     let mut changed = false;
@@ -2805,7 +2755,7 @@ fn make_call(func: &str, arg: Expr) -> Expr {
 /// container display that is not purely constant (`[SIZE]`, `{k: f()}`).
 fn is_instance_or_nonconstant_display_default(
     value: &Expr,
-    module_class_names: &std::collections::HashSet<&str>,
+    module_class_names: &HashSet<String>,
 ) -> bool {
     match value {
         Expr::Call(call) => matches!(
@@ -3090,20 +3040,6 @@ fn stmts_use_basemodel(stmts: &[Stmt]) -> bool {
     })
 }
 
-/// Return `true` if `c` inherits directly from `BaseModel`.
-fn class_inherits_basemodel(c: &ruff_python_ast::StmtClassDef) -> bool {
-    c.bases()
-        .iter()
-        .any(|base| matches!(base, Expr::Name(n) if n.id.as_str() == "BaseModel"))
-}
-
-/// Return `true` if `c` inherits directly from `Protocol`.
-fn class_inherits_protocol(c: &ruff_python_ast::StmtClassDef) -> bool {
-    c.bases()
-        .iter()
-        .any(|base| matches!(base, Expr::Name(n) if n.id.as_str() == "Protocol"))
-}
-
 /// Pre-scan the module body and collect the names of every class that is
 /// referenced as a base in a multi-inheritance site (`class C(A, B):`).
 /// Those classes can't carry `slots=True` because two slotted bases
@@ -3225,30 +3161,6 @@ fn collect_multi_base_parents_into<'a>(
     }
 }
 
-/// Return `true` if `c` inherits directly from `NamedTuple`.
-///
-/// `NamedTuple` subclasses must not receive `@dataclasses.dataclass(slots=True)`
-/// — Python's `NamedTuple` metaclass already defines `__slots__` and adding
-/// the dataclass decorator triggers `TypeError: Point already specifies
-/// __slots__`. FINDINGS #101.
-///
-/// Handles bare-name (`NamedTuple`), `typing.NamedTuple`, and
-/// `typing_extensions.NamedTuple` forms.
-fn class_inherits_named_tuple(c: &ruff_python_ast::StmtClassDef) -> bool {
-    c.bases().iter().any(|base| match base {
-        Expr::Name(n) => n.id.as_str() == "NamedTuple",
-        Expr::Attribute(a) => {
-            a.attr.as_str() == "NamedTuple"
-                && matches!(
-                    &*a.value,
-                    Expr::Name(n)
-                    if n.id.as_str() == "typing" || n.id.as_str() == "typing_extensions"
-                )
-        }
-        _ => false,
-    })
-}
-
 /// Return `true` if `c` declares more than one concrete (non-`Protocol`,
 /// non-`Generic[T]`) base class. Adding `@dataclasses.dataclass(slots=True)`
 /// to a class with multiple slotted bases raises `TypeError: multiple
@@ -3280,228 +3192,6 @@ fn is_layout_neutral_base(base: &Expr) -> bool {
         last_name(base),
         Some("Protocol") | Some("Generic") | Some("object")
     )
-}
-
-/// Stdlib base names whose subclasses should NOT receive the auto
-/// `@dataclasses.dataclass(slots=True)` decoration. Adding the dataclass
-/// decorator to an `Enum`/`Flag`/`ABC` subclass either silently breaks
-/// semantics (enum members get rewritten into instance fields) or raises
-/// `TypeError` at class-definition time.
-const SKIP_DECORATION_BUILTIN_BASES: &[&str] = &[
-    "Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "ABC", "ABCMeta",
-];
-
-/// Walk a base expression and return its trailing identifier segment.
-///
-/// Handles:
-/// - `Expr::Name(n)` → `n.id`
-/// - `Expr::Attribute(a)` (e.g. `enum.Enum`) → `a.attr`
-/// - `Expr::Subscript(s)` (e.g. `Generic[T]`, `MyBase[int, str]`) →
-///   recurses into the value side
-///
-/// Anything else returns `None` (call expressions in base lists are rare
-/// outside of metaclass tricks and don't need to participate in the
-/// skip-decoration heuristic).
-fn base_last_segment(base: &Expr) -> Option<&str> {
-    match base {
-        Expr::Name(n) => Some(n.id.as_str()),
-        Expr::Attribute(a) => Some(a.attr.as_str()),
-        Expr::Subscript(s) => base_last_segment(&s.value),
-        _ => None,
-    }
-}
-
-/// Return `true` if any base of `c` matches a known non-dataclass-friendly
-/// stdlib parent (`Enum`/`Flag`/`ABC` family) or a user-supplied entry in
-/// `extra`. User-supplied names are matched by last identifier segment so
-/// `"App"` covers both `class T(App):` and `class T(textual.App):`.
-fn class_inherits_skip_decoration_base(
-    c: &ruff_python_ast::StmtClassDef,
-    extra: &[String],
-) -> bool {
-    c.bases().iter().any(|base| {
-        let Some(seg) = base_last_segment(base) else {
-            return false;
-        };
-        if SKIP_DECORATION_BUILTIN_BASES.contains(&seg) {
-            return true;
-        }
-        extra.iter().any(|name| {
-            // Allow either a bare last-segment name or a dotted path
-            // (last segment of the configured name is compared).
-            let configured_seg = name.rsplit('.').next().unwrap_or(name.as_str());
-            configured_seg == seg
-        })
-    })
-}
-
-/// Return `true` if `c` inherits directly from `TypedDict`.
-///
-/// `TypedDict` subclasses must not receive `@dataclasses.dataclass(slots=True)`
-/// — Python raises `TypeError: cannot inherit from both a TypedDict type and a
-/// non-TypedDict base class` at class-definition time. FINDINGS #67.
-///
-/// Handles bare-name (`TypedDict`), `typing.TypedDict`, and
-/// `typing_extensions.TypedDict` forms.
-fn class_inherits_typed_dict(c: &ruff_python_ast::StmtClassDef) -> bool {
-    c.bases().iter().any(|base| match base {
-        // `class X(TypedDict):`
-        Expr::Name(n) => n.id.as_str() == "TypedDict",
-        // `class X(typing.TypedDict):` or `class X(typing_extensions.TypedDict):`
-        Expr::Attribute(a) => {
-            a.attr.as_str() == "TypedDict"
-                && matches!(
-                    &*a.value,
-                    Expr::Name(n)
-                    if n.id.as_str() == "typing" || n.id.as_str() == "typing_extensions"
-                )
-        }
-        _ => false,
-    })
-}
-
-/// Exact base names — outside the `*Error`/`*Exception`/`*Warning` naming
-/// convention — that nonetheless make a class an exception subclass.
-const EXACT_EXCEPTION_BASES: &[&str] = &[
-    "BaseException",
-    "KeyboardInterrupt",
-    "SystemExit",
-    "GeneratorExit",
-    "StopIteration",
-    "StopAsyncIteration",
-];
-
-/// Whether `name` (a base's trailing segment) marks an exception by the
-/// builtin convention: a `*Error` / `*Exception` / `*Warning` suffix or an
-/// exact non-suffixed builtin (`BaseException`, `KeyboardInterrupt`, …).
-fn name_is_exception_base(name: &str) -> bool {
-    name.ends_with("Error")
-        || name.ends_with("Exception")
-        || name.ends_with("Warning")
-        || EXACT_EXCEPTION_BASES.contains(&name)
-}
-
-/// Names of every class in the module that is (transitively) an exception
-/// subclass. A class qualifies when a base is an *external* (builtin/imported)
-/// name matching the exception convention (`Exception`, `ValueError`, …) OR
-/// names another module class that itself qualifies (transitively). Crucially,
-/// a `*Error`-named base that is itself a *module* class is NOT assumed to be
-/// an exception: `class LexError: line: int` is a Result error-variant
-/// dataclass, so `class Detailed(LexError):` stays a dataclass too. But
-/// `class Failure(Exception): pass` then `class Timeout(Failure): pass` both
-/// qualify, since `Failure` is rooted in the builtin `Exception`.
-fn exception_class_names_from<'a>(
-    classes: &'a [(String, Vec<String>)],
-    module_classes: &std::collections::HashSet<&str>,
-) -> std::collections::HashSet<&'a str> {
-    let mut exc: std::collections::HashSet<&'a str> = std::collections::HashSet::new();
-    // Seed only from external exception bases — a `*Error`-named *module*
-    // class is left to the fixpoint (it qualifies only if rooted in a builtin
-    // exception), so a plain `*Error` dataclass base doesn't taint subclasses.
-    for (name, bases) in classes {
-        if bases
-            .iter()
-            .any(|b| !module_classes.contains(b.as_str()) && name_is_exception_base(b))
-        {
-            exc.insert(name.as_str());
-        }
-    }
-    loop {
-        let mut changed = false;
-        for (name, bases) in classes {
-            if !exc.contains(name.as_str()) && bases.iter().any(|b| exc.contains(b.as_str())) {
-                exc.insert(name.as_str());
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    exc
-}
-
-/// Builtin metaclasses: a class deriving from one is itself a metaclass.
-const METACLASS_BASES: &[&str] = &["type", "ABCMeta", "EnumMeta", "EnumType"];
-
-/// Names of every module-level class that is (transitively) a metaclass:
-/// seeded from an external (non-module) base in [`METACLASS_BASES`], then
-/// closed over module-class inheritance — a subclass of a metaclass is one.
-fn metaclass_names_from<'a>(
-    classes: &'a [(String, Vec<String>)],
-    module_classes: &std::collections::HashSet<&str>,
-) -> std::collections::HashSet<&'a str> {
-    let mut meta: std::collections::HashSet<&'a str> = classes
-        .iter()
-        .filter(|(_, bases)| {
-            bases.iter().any(|b| {
-                !module_classes.contains(b.as_str()) && METACLASS_BASES.contains(&b.as_str())
-            })
-        })
-        .map(|(name, _)| name.as_str())
-        .collect();
-    loop {
-        let before = meta.len();
-        for (name, bases) in classes {
-            if bases.iter().any(|b| meta.contains(b.as_str())) {
-                meta.insert(name.as_str());
-            }
-        }
-        if meta.len() == before {
-            return meta;
-        }
-    }
-}
-
-/// Collect `(class name, base trailing segments)` for every *module-level*
-/// class def in `body` — descending through module-level control flow
-/// (`if`/`try`/`for`/`while`/`with`) but NOT into function or nested-class
-/// bodies. Keeping the set module-scoped avoids a function-local
-/// `class Failure(Exception):` tainting an unrelated top-level
-/// `class Failure:` dataclass of the same name. Nested-scope exception
-/// classes are recognised per-class at decoration time via their *external*
-/// base (see `is_exception_subclass` in `desugar_stmts`).
-fn collect_class_bases_into(body: &[Stmt], out: &mut Vec<(String, Vec<String>)>) {
-    for stmt in body {
-        match stmt {
-            Stmt::ClassDef(c) => {
-                let bases: Vec<String> = c
-                    .bases()
-                    .iter()
-                    .filter_map(|b| base_last_segment(b).map(|s| s.to_owned()))
-                    .collect();
-                out.push((c.name.as_str().to_owned(), bases));
-                // Do NOT descend into the class body — a class nested inside a
-                // class is a different scope.
-            }
-            // Do NOT descend into function bodies (a different scope).
-            Stmt::If(i) => {
-                collect_class_bases_into(&i.body, out);
-                for clause in &i.elif_else_clauses {
-                    collect_class_bases_into(&clause.body, out);
-                }
-            }
-            Stmt::For(f) => {
-                collect_class_bases_into(&f.body, out);
-                collect_class_bases_into(&f.orelse, out);
-            }
-            Stmt::While(w) => {
-                collect_class_bases_into(&w.body, out);
-                collect_class_bases_into(&w.orelse, out);
-            }
-            Stmt::With(w) => collect_class_bases_into(&w.body, out),
-            Stmt::Try(t) => {
-                collect_class_bases_into(&t.body, out);
-                for h in &t.handlers {
-                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
-                    collect_class_bases_into(&h.body, out);
-                }
-                collect_class_bases_into(&t.orelse, out);
-                collect_class_bases_into(&t.finalbody, out);
-            }
-            _ => {}
-        }
-    }
 }
 
 /// Return `true` if the class body declares at least one top-level annotated
@@ -3651,33 +3341,6 @@ fn make_model_config_stmt(extra: &str) -> Stmt {
         value: Box::new(config_dict_call),
         mutability: None,
     })
-}
-
-/// Return `true` if the decorator list already contains any recognized form of
-/// the dataclass decorator:
-/// - `@dataclass`          (bare name, from-import style)
-/// - `@dataclass(...)`     (call, from-import style)
-/// - `@dataclasses.dataclass`
-/// - `@dataclasses.dataclass(...)`
-fn has_dataclass_decorator(decorators: &[Decorator]) -> bool {
-    decorators.iter().any(|d| is_dataclass_expr(&d.expression))
-}
-
-fn is_dataclass_expr(expr: &Expr) -> bool {
-    match expr {
-        // @dataclass
-        Expr::Name(n) => n.id.as_str() == "dataclass",
-        // @dataclasses.dataclass
-        Expr::Attribute(a) => {
-            a.attr.as_str() == "dataclass"
-                && matches!(a.value.as_ref(),
-                    Expr::Name(n) if n.id.as_str() == "dataclasses"
-                )
-        }
-        // @dataclass(...) or @dataclasses.dataclass(...)
-        Expr::Call(c) => is_dataclass_expr(c.func.as_ref()),
-        _ => false,
-    }
 }
 
 /// Return `true` if the body already contains `import dataclasses` or
@@ -4694,7 +4357,7 @@ fn inherit_parent_fields(body: Vec<Stmt>, plain_starts: &[u32]) -> Vec<Stmt> {
                     // the parent's attributes into it shadowed them —
                     // `Cfg.debug = True` no longer reached a subclass that
                     // never declared `debug` (W7-11).
-                    if ClassMarkers::marker_covers(
+                    if marker_covers(
                         plain_starts,
                         u32::from(c.range.start()),
                         u32::from(c.name.range.start()),
@@ -7246,6 +6909,98 @@ class __typhon_impl_C(object):
                 "must be left alone:\n{src}\n---\n{out}"
             );
         }
+    }
+
+    /// A default's factory lambda reads an enclosing function's local before
+    /// the module binding, so the local decides the copy: one evidently not a
+    /// `list` / `dict` / `set` is stored as written, one evidently a list is
+    /// copied, and one of unknown kind keeps the module binding's answer.
+    #[test]
+    fn a_function_local_shadowing_a_named_default_decides_its_copy() {
+        let out = parse_and_desugar(
+            "BASE: list[int] = [1, 2]
+
+def make():
+    BASE: tuple[int, ...] = (7, 8)
+    class Cfg:
+        items: tuple[int, ...] = BASE
+    return Cfg()
+",
+        );
+        assert!(!out.contains("default_factory=lambda:"), "{out}");
+        for src in [
+            "def make(BASE: tuple[int, ...]):
+    class Cfg:
+        items: Sequence[int] = BASE
+    return Cfg()
+",
+            "BASE = [1]
+
+def make():
+    BASE = (1,)
+    class Cfg:
+        items: Collection[int] = BASE
+    return Cfg()
+",
+        ] {
+            let out = parse_and_desugar(&format!(
+                "BASE = [1]
+
+{src}"
+            ));
+            assert!(
+                !out.contains("default_factory=lambda:"),
+                "{src}\n---\n{out}"
+            );
+        }
+        // A local list, or a local of unknown kind over a module list.
+        let out = parse_and_desugar(
+            "def make():
+    BASE = [1]
+    class Cfg:
+        items: Sequence[int] = BASE
+    return Cfg()
+",
+        );
+        assert!(out.contains("default_factory=lambda: list(BASE)"), "{out}");
+        let out = parse_and_desugar(
+            "BASE = [1]
+
+def make(BASE):
+    class Cfg:
+        items: Sequence[int] = BASE
+    return Cfg()
+",
+        );
+        assert!(out.contains("default_factory=lambda: list(BASE)"), "{out}");
+        // A `global` declaration reads the module binding.
+        let out = parse_and_desugar(
+            "BASE = [1]
+
+def make():
+    global BASE
+    BASE = (1,)
+    class Cfg:
+        items: Sequence[int] = BASE
+    return Cfg()
+",
+        );
+        assert!(out.contains("default_factory=lambda: list(BASE)"), "{out}");
+    }
+
+    /// A class under module-level control flow is emitted as written.
+    #[test]
+    fn a_class_under_control_flow_is_not_decorated() {
+        let out = parse_and_desugar(
+            "BASE = [1]
+
+if True:
+    class Cfg:
+        items: Sequence[int] = BASE
+",
+        );
+        assert!(!out.contains("@dataclasses.dataclass"), "{out}");
+        assert!(!out.contains("default_factory"), "{out}");
     }
 
     // ── W7-11: class emission ──────────────────────────────────────────────

@@ -303,6 +303,10 @@ pub fn resolved_module(db: &dyn salsa::Database, file: SourceFile) -> ArcResolve
         raw_class_byte_starts: line_byte_starts(&prep.python_source, &prep.raw_class_lines),
         lazy_import_remaps,
         original_source: Some(raw_text.clone()),
+        plain_class_byte_starts: Some(line_byte_starts(
+            &prep.python_source,
+            &prep.plain_class_lines,
+        )),
     };
     match parse_module(&prep.python_source) {
         Ok(parsed) => {

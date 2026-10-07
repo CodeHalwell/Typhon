@@ -55,20 +55,26 @@ fn check_315(src: &str, frozendict: bool) -> Diagnostics {
     )
 }
 
-/// `check`, with the resolver told which classes are `plain class` /
-/// `class!` (the CLI passes the original source for this).
+/// `check`, with the resolver told which declarations are `plain class` /
+/// `class!`, as `tyc-db` tells it.
 fn check_class_kinds(src: &str) -> Diagnostics {
+    check_class_kinds_with(src, true)
+}
+
+/// `markers: false` leaves the resolver only the original source, from which
+/// it knows the marked classes by name alone (some LSP paths).
+fn check_class_kinds_with(src: &str, markers: bool) -> Diagnostics {
     use tyc_resolve::{resolve_module_with, ResolveOptions};
+    use tyc_syntax::preprocess::line_byte_starts;
     let prep = preprocess(src);
     let module = tyc_syntax::parse_module(&prep.python_source)
         .unwrap()
         .into_syntax();
     let options = ResolveOptions {
-        raw_class_byte_starts: tyc_syntax::preprocess::line_byte_starts(
-            &prep.python_source,
-            &prep.raw_class_lines,
-        ),
+        raw_class_byte_starts: line_byte_starts(&prep.python_source, &prep.raw_class_lines),
         original_source: Some(src.to_owned()),
+        plain_class_byte_starts: markers
+            .then(|| line_byte_starts(&prep.python_source, &prep.plain_class_lines)),
         ..ResolveOptions::default()
     };
     let (resolved, _) =
@@ -316,6 +322,87 @@ fn a_dataclass_field_default_the_desugar_stores_as_written_is_checked() {
     }
 }
 
+/// A `plain class` / `class!` marker belongs to one declaration: a
+/// same-named class in another scope keeps (or lacks) the copy on its own.
+#[test]
+fn the_class_gate_reads_each_declarations_own_marker() {
+    for src in [
+        // Module dataclass, unrelated nested `plain class` / `class!`.
+        "freeze let BASE = [1, 2]\nclass Foo:\n    items: list[int] = BASE\n\
+def helper() -> int:\n    plain class Foo:\n        n: int\n    return 1\n",
+        "freeze let BASE = [1, 2]\nclass Foo:\n    items: list[int] = BASE\n\
+def helper() -> int:\n    class! Foo:\n        pass\n    return 1\n",
+        // Module `plain class`, local dataclass of the same name.
+        "T: tuple[int, ...] = (1, 2)\nplain class Bag:\n    items: list[int]\n\
+def make() -> list[int]:\n    class Bag:\n        items: list[int] = T\n\
+\x20   let b = Bag()\n    b.items.append(3)\n    return b.items\n",
+    ] {
+        assert_clean(&check_class_kinds(src), src);
+    }
+    // The marked class itself still stores its default as written.
+    let marked = "T: tuple[int, ...] = (1, 2)\nplain class Bag:\n    items: list[int] = T\n\
+def make() -> int:\n    class Bag:\n        n: int = 1\n    return Bag().n\n";
+    assert_mismatch(&check_class_kinds(marked), marked);
+    // Without per-declaration markers the name decides, as before.
+    let by_name = "T: tuple[int, ...] = (1, 2)\nplain class Bag:\n    items: list[int] = T\n";
+    assert_mismatch(&check_class_kinds_with(by_name, false), by_name);
+}
+
+/// Exceptions and metaclasses lower like `class!`, and a class under an `if`
+/// is never decorated: none of them copies its default.
+#[test]
+fn classes_the_desugar_does_not_decorate_keep_their_default_as_written() {
+    for class in [
+        "class AppError(Exception):\n    codes: list[int] = T\n",
+        "class AppWarning(UserWarning):\n    codes: list[int] = T\n",
+        "class Meta(type):\n    items: list[int] = T\n",
+        "class Failure(Exception):\n    pass\nclass Timeout(Failure):\n    codes: list[int] = T\n",
+        "class Meta(type):\n    pass\nclass Strict(Meta):\n    items: list[int] = T\n",
+        "def main() -> None:\n    class AppError(ValueError):\n        codes: list[int] = T\n\
+\x20   print(AppError().codes)\n",
+        "if True:\n    class Cfg:\n        items: list[int] = T\n",
+    ] {
+        let src = format!("{FIELD_PRELUDE}{class}");
+        assert_mismatch(&check_class_kinds(&src), &src);
+    }
+    // A `*Error`-named module dataclass is no exception, and a class nested
+    // in a function or another class is still reached.
+    for class in [
+        "class LexError:\n    line: int = 0\nclass Detailed(LexError):\n    codes: list[int] = T\n",
+        "class Outer:\n    n: int = 0\n    class Inner:\n        items: list[int] = T\n",
+    ] {
+        let src = format!("{FIELD_PRELUDE}{class}");
+        assert_clean(&check_class_kinds(&src), &src);
+    }
+}
+
+/// The default's factory reads an enclosing function's local before the
+/// module binding; the checker agrees with the desugar on which one.
+#[test]
+fn a_shadowed_named_default_is_checked_against_the_local_it_reads() {
+    // Desugared without a copy: the field holds the local tuple.
+    let src = "BASE: list[int] = [1, 2]\n\
+def make() -> tuple[int, ...]:\n    let BASE: tuple[int, ...] = (7, 8)\n\
+\x20   class Cfg:\n        items: tuple[int, ...] = BASE\n\
+\x20   let c = Cfg()\n    return c.items + (9,)\n";
+    assert_clean(&check_class_kinds(src), src);
+    // `more` is copied by its own `list` annotation; `items` is the tuple,
+    // which is a `Sequence` too.
+    let copied = "from collections.abc import Sequence\nBASE: list[int] = [1, 2]\n\
+def make() -> None:\n    let BASE: tuple[int, ...] = (7, 8)\n\
+\x20   class Cfg:\n        items: Sequence[int] = BASE\n        more: list[int] = BASE\n";
+    assert_clean(&check_class_kinds(copied), copied);
+    // The module list's kind no longer stands in for the local tuple.
+    let shadowed = "BASE: list[int] = [1, 2]\n\
+def make() -> None:\n    let BASE: tuple[int, ...] = (7, 8)\n\
+\x20   class Cfg:\n        items: list[int] | None = BASE\n";
+    assert_mismatch(&check_class_kinds(shadowed), shadowed);
+    let local_list = "from collections.abc import Sequence\n\
+def make() -> None:\n    let BASE: list[int] = [1]\n\
+\x20   class Cfg:\n        items: Sequence[int] = BASE\n    print(Cfg().items)\n";
+    assert_clean(&check_class_kinds(local_list), local_list);
+}
+
 /// The carve-out reads neither `[emit] freeze-dict` nor the annotation's
 /// frozen shape: a `Mapping` or `frozendict` name copies into a `dict` field
 /// under both settings.
@@ -354,6 +441,38 @@ fn an_annotated_attribute_target_is_checked_against_annotation_and_field() {
               impl C:\n    def reset(self) -> None:\n\
               \x20       self.items: list[int] = [1]\n        self.name: str = \"n\"\n";
     assert_clean(&check(ok), ok);
+}
+
+/// An annotation wider than the field: the value is inferred under the field
+/// it is stored into, so a literal or a display that fits the field is not
+/// widened past it first.
+#[test]
+fn an_annotated_attribute_target_wider_than_its_field_keeps_the_value_precise() {
+    let src = "from collections.abc import Mapping, Sequence\n\
+type Mode = \"fast\" | \"slow\"\n\
+class Job:\n    mode: Mode = \"fast\"\n    weights: list[float] = []\n    data: dict[str, float] = {}\n\
+impl Job:\n    def reset(self) -> None:\n\
+\x20       self.mode: str = \"slow\"\n\
+\x20       self.weights: Sequence[float] = [1, 2]\n\
+\x20       self.data: Mapping[str, float] = {\"a\": 1}\n\
+def main() -> None:\n    let j: Job = Job()\n    j.reset()\n    j.mode: str = \"fast\"\n    print(j)\n";
+    assert_clean(&check(src), src);
+    // A value that fits the annotation but not the field is still reported,
+    // once.
+    for body in [
+        "        self.mode: str = \"medium\"\n",
+        "        self.weights: Sequence[float] = (1.0,)\n",
+    ] {
+        let bad = format!(
+            "from collections.abc import Sequence\n\
+             type Mode = \"fast\" | \"slow\"\n\
+             class Job:\n    mode: Mode = \"fast\"\n    weights: list[float] = []\n\
+             impl Job:\n    def reset(self) -> None:\n{body}"
+        );
+        let d = check(&bad);
+        assert_mismatch(&d, &bad);
+        assert_eq!(d.errors().len(), 1, "{bad}: {:?}", messages(&d));
+    }
 }
 
 // ── `lazy let` ───────────────────────────────────────────────────────────
@@ -440,4 +559,150 @@ def g(v: A | B) -> int:\n    if type(v) is not A:\n        return 0\n    return 
     assert_clean(&check(positive), positive);
     let variable = "def f(x: int, cls: type) -> int:\n    if type(x) is cls:\n        return x + 1\n    return x\n";
     assert_clean(&check(variable), variable);
+}
+
+/// The narrowed class has to fit the current type, as a `match` class
+/// pattern's does: a `T` (bounded or not), a newtype and a literal union are
+/// still that type when their runtime class is `bool` / `int` / `str` / `Dog`.
+#[test]
+fn type_identity_keeps_a_typevar_newtype_or_literal_type() {
+    let src = "newtype UserId = int\ntype Mode = \"fast\" | \"slow\"\n\
+def label(uid: UserId) -> str:\n    return f\"user-{uid}\"\n\
+def run(m: Mode) -> str:\n    return m\n\
+def passthrough[T](x: T) -> T:\n    if type(x) is bool:\n        return x\n    return x\n\
+def same[T](x: T) -> T:\n    if type(x) == float:\n        return x\n    return x\n\
+def show(uid: UserId) -> str:\n    if type(uid) is int:\n        return label(uid)\n    return \"?\"\n\
+def pick(m: Mode) -> str:\n    if m.__class__ is str:\n        return run(m)\n    return \"?\"\n\
+class Animal:\n    name: str\nclass Dog(Animal):\n    pass\n\
+def keep[T: Animal](a: T) -> T:\n    if type(a) is Dog:\n        return a\n    return a\n\
+def main() -> None:\n    print(passthrough(True), same(1.5), show(UserId(7)), pick(\"slow\"), keep(Dog(\"d\")).name)\n";
+    assert_clean(&check(src), src);
+    // Class-hierarchy and union narrowings still apply.
+    let narrows = "class Animal:\n    name: str\nclass Dog(Animal):\n    def bark(self) -> str:\n        return \"w\"\n\
+def f(a: Animal, x: int | str) -> int:\n    if type(a) is Dog:\n        print(a.bark())\n\
+\x20   if type(x) is int:\n        return x + 1\n    return 0\n";
+    assert_clean(&check(narrows), narrows);
+}
+
+/// A name in `C`'s place that is bound to a value — a `let`, a parameter, a
+/// loop target — says nothing about the runtime class, even when the name is
+/// `int` or a class's; neither does a call to a rebound `type`.
+#[test]
+fn type_identity_does_not_trust_a_shadowed_class_name() {
+    for src in [
+        "def f(x: int | str, cls: type[object]) -> None:\n    let int = cls\n    if type(x) is int:\n        print(x + 1)\n",
+        "def f(x: int | str, int: type[object]) -> None:\n    if type(x) is int:\n        print(x + 1)\n",
+        "def f(x: int | str, int: type[object]) -> None:\n    if type(x) == int:\n        print(x + 1)\n",
+        "def f(x: int | str, int: type[object]) -> None:\n    if x.__class__ is int:\n        print(x + 1)\n",
+        "class Foo:\n    v: int = 1\nclass Bar:\n    w: int = 2\n\
+def f(x: Foo | Bar) -> None:\n    for Foo in (Bar,):\n        if type(x) is Foo:\n            print(x.v)\n",
+        "from collections.abc import Callable\n\
+def f(x: int | str, type: Callable[[object], object]) -> None:\n    if type(x) is int:\n        print(x + 1)\n",
+    ] {
+        assert!(!check(src).errors().is_empty(), "accepted:\n{src}");
+    }
+    // A class declared in the function itself is still a class.
+    let local =
+        "def f() -> int:\n    class Foo:\n        v: int = 1\n    class Bar:\n        w: int = 2\n\
+\x20   let x: Foo | Bar = Foo()\n    if type(x) is Foo:\n        return x.v\n    return 0\n";
+    assert_clean(&check(local), local);
+}
+
+/// `collections.abc.Set` is the read-only set ABC — a `frozenset` is one —
+/// not the deprecated `typing.Set` alias of `set`. `typing.AbstractSet` is
+/// the same ABC.
+#[test]
+fn an_abstract_set_annotation_accepts_frozen_and_mutable_sets() {
+    for src in [
+        "from collections.abc import Set\n\
+freeze let TAGS = {\"a\", \"b\"}\n\
+def main() -> None:\n    let tags: Set[str] = TAGS\n    let more: Set[str] = frozenset({\"c\"})\n\
+\x20   mut m: Set[str] = more\n    m = {\"d\"}\n\
+\x20   print(sorted(tags | more), \"a\" in tags, len(m))\n",
+        "import collections.abc\nS = frozenset({1, 2})\n\
+def main() -> None:\n    let s: collections.abc.Set[int] = S\n    print(len(s))\n",
+        "from collections.abc import Set\n\
+def size(s: Set[int]) -> int:\n    return len(s)\n\
+def main() -> None:\n    print(size(frozenset({1})), size({1, 2}), size({3: 4}.keys()))\n",
+        "from typing import AbstractSet\n\
+def size(s: AbstractSet[int]) -> int:\n    return len(s)\n\
+def main() -> None:\n    let a: AbstractSet[int] = frozenset({1})\n    print(size(a), size({1, 2}))\n",
+        "from collections.abc import Set\n\
+def total(s: Set[int]) -> int:\n    mut n = 0\n    for x in s:\n        n += x\n    return n\n",
+    ] {
+        assert_clean(&check(src), src);
+    }
+    for src in [
+        // `typing.Set` is still `set`.
+        "from typing import Set\ndef main() -> None:\n    let s: Set[int] = frozenset({1})\n",
+        "import typing\ndef main() -> None:\n    let s: typing.Set[int] = frozenset({1})\n",
+        // A string is not a set, and the element type still has to fit.
+        "from collections.abc import Set\ndef main() -> None:\n    let s: Set[str] = \"abc\"\n",
+        "from collections.abc import Set\ndef main() -> None:\n    let s: Set[int] = frozenset({\"a\"})\n",
+        "from collections.abc import Set\ndef main() -> None:\n    let s: Set[int] = [1, 2]\n",
+    ] {
+        assert_mismatch(&check(src), src);
+    }
+    let mutable = "from typing import Set\ndef main() -> None:\n    mut s: Set[int] = set()\n    s.add(1)\n    print(s)\n";
+    assert_clean(&check(mutable), mutable);
+}
+
+/// Rebinding the root of a narrowed attribute path — by a `for` target, a
+/// walrus (in the arm, a `case` guard, a later `and` operand or a
+/// comprehension), `with … as`, a pattern capture, `+=`, `del`, or a callee's
+/// `global` — stales the narrowing, as `h = …` already did. A property is
+/// re-read every time, so it is never narrowed by `match` / `type(…) is`.
+#[test]
+fn rebinding_the_root_of_a_narrowed_attribute_path_drops_the_narrowing() {
+    let decls = "from collections.abc import Mapping\n\
+class Holder:\n    items: Mapping[str, int]\n\
+def other() -> Holder:\n    return Holder(items={\"a\": 1})\n";
+    for body in [
+        "    match h.items:\n        case dict():\n            for h in others:\n                h.items[\"k\"] = 1\n        case _:\n            pass\n",
+        "    if type(h.items) is dict:\n        for h in others:\n            h.items[\"k\"] = 1\n",
+        "    if isinstance(h.items, dict):\n        for h in others:\n            h.items[\"k\"] = 1\n",
+        "    if type(h.items) is dict:\n        if (h := other()) is not None:\n            h.items[\"k\"] = 1\n",
+        "    match h.items:\n        case dict() if (h := other()) is not None:\n            h.items[\"k\"] = 1\n        case _:\n            pass\n",
+        "    if type(h.items) is dict and (h := other()) is not None:\n        h.items[\"k\"] = 1\n",
+        "    if isinstance(h.items, dict) and (h := other()) is not None:\n        h.items[\"k\"] = 1\n",
+        "    if type(h.items) is dict:\n        let hs = [h := o for o in others]\n        print(hs)\n        h.items[\"k\"] = 1\n",
+        "    match h.items:\n        case dict():\n            match others:\n                case [h, *_]:\n                    h.items[\"k\"] = 1\n                case _:\n                    pass\n        case _:\n            pass\n",
+        "    if type(h.items) is dict:\n        del h\n        h = other()\n        h.items[\"k\"] = 1\n",
+    ] {
+        let src = format!(
+            "{decls}def f(first: Holder, others: list[Holder]) -> None:\n    mut h: Holder = first\n{body}"
+        );
+        assert!(!check(&src).errors().is_empty(), "accepted:\n{src}");
+    }
+    let with_as = format!(
+        "{decls}class Ctx:\n    held: Holder\n\
+impl Ctx:\n    def __enter__(self) -> Holder:\n        return self.held\n\
+\x20   def __exit__(self, *args: object) -> None:\n        pass\n\
+def f(h: Holder) -> None:\n    if type(h.items) is dict:\n        with Ctx(held=other()) as h:\n            h.items[\"k\"] = 1\n"
+    );
+    assert!(!check(&with_as).errors().is_empty(), "accepted:\n{with_as}");
+    let global = format!(
+        "{decls}mut G: Holder = other()\n\
+def swap() -> None:\n    global G\n    G = other()\n\
+def f() -> None:\n    if type(G.items) is dict:\n        swap()\n        G.items[\"k\"] = 1\n"
+    );
+    assert!(!check(&global).errors().is_empty(), "accepted:\n{global}");
+    let property = "from collections.abc import Mapping\nclass Holder:\n    n: int\n\
+impl Holder:\n    @property\n    def items(self) -> Mapping[str, int]:\n        return {\"b\": 2}\n\
+def f(h: Holder) -> None:\n    match h.items:\n        case dict():\n            h.items[\"k\"] = 3\n        case _:\n            pass\n\
+\x20   if type(h.items) is dict:\n        h.items[\"k\"] = 3\n";
+    assert_eq!(
+        check(property).errors().len(),
+        2,
+        "{property}: {:?}",
+        messages(&check(property))
+    );
+    // Untouched roots keep the narrowing, and a comprehension's own `h` is
+    // not the function's.
+    let kept = format!(
+        "{decls}def f(h: Holder, others: list[Holder]) -> None:\n\
+\x20   if type(h.items) is dict:\n        let names = [h.items for h in others]\n        print(names)\n        h.items[\"k\"] = 1\n\
+\x20   match h.items:\n        case dict() as d:\n            d[\"j\"] = 2\n            h.items[\"k\"] = 1\n        case _:\n            pass\n"
+    );
+    assert_clean(&check(&kept), &kept);
 }

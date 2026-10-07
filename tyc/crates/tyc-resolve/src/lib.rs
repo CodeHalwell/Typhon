@@ -193,6 +193,13 @@ pub struct ResolveOptions {
     /// `lazy_import_remaps` is non-empty so the diagnostic can render
     /// the user-written line. Ignored when no remaps are present.
     pub original_source: Option<String>,
+    /// Sorted byte offsets (in the preprocessed source) at the start of
+    /// each `plain class` declaration line, as the desugar receives them.
+    /// `Some` tells the type checker that this list and
+    /// `raw_class_byte_starts` are complete, so it can tell `plain class` /
+    /// `class!` apart per declaration ([`ResolvedModule::class_markers`])
+    /// instead of by name.
+    pub plain_class_byte_starts: Option<Vec<u32>>,
 }
 
 /// One `lazy import ALIAS = MODULE` declaration's mapping back to the
@@ -239,6 +246,19 @@ pub struct ResolvedModule {
     /// (preserved verbatim) — so `tyc::manual_init` must not fire on
     /// them. Populated from the resolver's `ClassKind::Raw` tagging.
     pub raw_classes: std::collections::HashSet<String>,
+    /// The `plain class` / `class!` line offsets the desugar reads, when the
+    /// caller passed them ([`ResolveOptions::plain_class_byte_starts`]):
+    /// which declaration a marker belongs to, where the name sets above only
+    /// say that *some* class of that name carries one.
+    pub class_markers: Option<ClassMarkerStarts>,
+}
+
+/// Sorted byte offsets of the `plain class` and `class!` declaration lines
+/// in the preprocessed source.
+#[derive(Debug, Clone, Default)]
+pub struct ClassMarkerStarts {
+    pub plain: Vec<u32>,
+    pub raw: Vec<u32>,
 }
 
 /// Curated list of Python stdlib top-level module names (root names only;
@@ -934,6 +954,8 @@ struct Resolver<'a> {
     /// ALIAS = MODULE` line (FINDINGS #15).
     lazy_import_remaps: Vec<LazyImportRemap>,
     original_source: Option<String>,
+    /// [`ResolveOptions::plain_class_byte_starts`].
+    plain_class_byte_starts: Option<Vec<u32>>,
     /// Line starts (byte offsets) of the preprocessed source. Lazily
     /// computed the first time the unused-import emitter needs to
     /// translate a preprocessed byte offset to a line index.
@@ -1028,6 +1050,7 @@ impl<'a> Resolver<'a> {
             raw_class_byte_starts: options.raw_class_byte_starts,
             lazy_import_remaps: options.lazy_import_remaps,
             original_source: options.original_source,
+            plain_class_byte_starts: options.plain_class_byte_starts,
             preprocessed_line_starts: std::cell::OnceCell::new(),
             in_pattern: 0,
             uninit_let_spans: std::collections::HashSet::new(),
@@ -1731,11 +1754,19 @@ pub fn resolve_module_with(
         }
     }
 
+    let class_markers = r
+        .plain_class_byte_starts
+        .take()
+        .map(|plain| ClassMarkerStarts {
+            plain,
+            raw: r.raw_class_byte_starts.clone(),
+        });
     let resolved = ResolvedModule {
         scopes: std::mem::take(&mut r.scopes),
         references: std::mem::take(&mut r.references),
         plain_classes,
         raw_classes,
+        class_markers,
     };
     let mut diagnostics = r.diagnostics;
     diagnostics.dedup();

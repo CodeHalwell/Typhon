@@ -13,11 +13,17 @@
 //!
 //! If the two disagreed, the checker would either reject a correct program
 //! or accept a field whose default is stored as written and crashes. So the
-//! field-level rules live here, in the lowest crate both already depend on.
-//! The class-level gate (only classes that receive `@dataclass` are
-//! rewritten) stays with each consumer, since it reads per-crate markers.
+//! rules live here, in the lowest crate both already depend on: the
+//! field-level ones, the class kinds that never receive `@dataclass`
+//! ([`skips_dataclass_decoration`]), which classes the desugar reaches at
+//! all and which names their defaults see ([`ClassDefaultScopes`]). Only the
+//! `plain class` / `class!` markers come to each consumer its own way; both
+//! test them with [`marker_covers`].
 
-use ruff_python_ast::{Expr, Stmt};
+use ruff_python_ast::visitor::{walk_expr, walk_pattern, walk_stmt, Visitor};
+use ruff_python_ast::{
+    Decorator, ExceptHandler, Expr, Pattern, Stmt, StmtClassDef, StmtFunctionDef,
+};
 use std::collections::{HashMap, HashSet};
 
 /// `list` / `dict` / `set` when `annotation` is (a subscript of) one of
@@ -96,8 +102,9 @@ pub fn collect_module_mutable_names(body: &[Stmt]) -> HashMap<String, &'static s
 
 /// For a field default that is a plain or dotted name (`BASE`,
 /// `config.DEFAULTS`) whose value is evidently a `list` / `dict` / `set` —
-/// by the field's own annotation, or by a module-level binding of the name —
-/// the builtin to copy it with.
+/// by the field's own annotation, or by the binding of the name the default
+/// reads (`module_mutable_names` is [`ClassDefaultScopes::mutable_names`] for
+/// the class, or the module's own names) — the builtin to copy it with.
 pub fn named_mutable_default_kind(
     value: &Expr,
     annotation: &Expr,
@@ -152,4 +159,580 @@ pub fn is_classvar_annotation(ann: &Expr) -> bool {
         Expr::Attribute(a) => a.attr.as_str() == "ClassVar",
         _ => false,
     }
+}
+
+/// Return `true` if `starts` holds an offset in the half-open range
+/// `[class_start, name_start)`: a `plain` / `class!` marker on this class's
+/// own `class` line. Ruff starts a decorated class's range at its first `@`,
+/// and a nested class's `class` keyword lies past `name_start`, so the window
+/// picks out exactly this declaration.
+pub fn marker_covers(starts: &[u32], class_start: u32, name_start: u32) -> bool {
+    starts.partition_point(|&off| off < class_start)
+        != starts.partition_point(|&off| off < name_start)
+}
+
+// ── Class kinds the desugar never decorates ─────────────────────────────
+
+/// A base's trailing identifier: `Enum`, `enum.Enum` and `Generic[T]`'s
+/// `Generic`.
+pub fn base_last_segment(base: &Expr) -> Option<&str> {
+    match base {
+        Expr::Name(n) => Some(n.id.as_str()),
+        Expr::Attribute(a) => Some(a.attr.as_str()),
+        Expr::Subscript(s) => base_last_segment(&s.value),
+        _ => None,
+    }
+}
+
+/// `true` if `c` inherits directly from `BaseModel` (a `model`).
+pub fn class_inherits_basemodel(c: &StmtClassDef) -> bool {
+    c.bases()
+        .iter()
+        .any(|base| matches!(base, Expr::Name(n) if n.id.as_str() == "BaseModel"))
+}
+
+/// `true` if `c` inherits directly from `Protocol` (an `interface`).
+pub fn class_inherits_protocol(c: &StmtClassDef) -> bool {
+    c.bases()
+        .iter()
+        .any(|base| matches!(base, Expr::Name(n) if n.id.as_str() == "Protocol"))
+}
+
+/// A base spelled `form`, `typing.form` or `typing_extensions.form`.
+fn inherits_typing_form(c: &StmtClassDef, form: &str) -> bool {
+    c.bases().iter().any(|base| match base {
+        Expr::Name(n) => n.id.as_str() == form,
+        Expr::Attribute(a) => {
+            a.attr.as_str() == form
+                && matches!(
+                    &*a.value,
+                    Expr::Name(n)
+                    if n.id.as_str() == "typing" || n.id.as_str() == "typing_extensions"
+                )
+        }
+        _ => false,
+    })
+}
+
+/// `true` if `c` inherits directly from `TypedDict`. `@dataclass(slots=True)`
+/// on one raises `TypeError` at class-definition time (FINDINGS #67).
+pub fn class_inherits_typed_dict(c: &StmtClassDef) -> bool {
+    inherits_typing_form(c, "TypedDict")
+}
+
+/// `true` if `c` inherits directly from `NamedTuple`, whose metaclass
+/// already defines `__slots__` (FINDINGS #101).
+pub fn class_inherits_named_tuple(c: &StmtClassDef) -> bool {
+    inherits_typing_form(c, "NamedTuple")
+}
+
+/// Stdlib base names whose subclasses should NOT receive the auto
+/// `@dataclasses.dataclass(slots=True)` decoration. Adding the dataclass
+/// decorator to an `Enum`/`Flag`/`ABC` subclass either silently breaks
+/// semantics (enum members get rewritten into instance fields) or raises
+/// `TypeError` at class-definition time.
+const SKIP_DECORATION_BUILTIN_BASES: &[&str] = &[
+    "Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "ABC", "ABCMeta",
+];
+
+/// Return `true` if any base of `c` matches a known non-dataclass-friendly
+/// stdlib parent (`Enum`/`Flag`/`ABC` family) or a user-supplied entry in
+/// `extra` (`[emit] skip-decoration-bases`). User-supplied names are matched
+/// by last identifier segment so `"App"` covers both `class T(App):` and
+/// `class T(textual.App):`.
+pub fn class_inherits_skip_decoration_base(c: &StmtClassDef, extra: &[String]) -> bool {
+    c.bases().iter().any(|base| {
+        let Some(seg) = base_last_segment(base) else {
+            return false;
+        };
+        if SKIP_DECORATION_BUILTIN_BASES.contains(&seg) {
+            return true;
+        }
+        extra.iter().any(|name| {
+            // Allow either a bare last-segment name or a dotted path
+            // (last segment of the configured name is compared).
+            let configured_seg = name.rsplit('.').next().unwrap_or(name.as_str());
+            configured_seg == seg
+        })
+    })
+}
+
+/// Return `true` if the decorator list already contains any recognized form of
+/// the dataclass decorator: `@dataclass`, `@dataclass(...)`,
+/// `@dataclasses.dataclass` or `@dataclasses.dataclass(...)`.
+pub fn has_dataclass_decorator(decorators: &[Decorator]) -> bool {
+    fn is_dataclass_expr(expr: &Expr) -> bool {
+        match expr {
+            Expr::Name(n) => n.id.as_str() == "dataclass",
+            Expr::Attribute(a) => {
+                a.attr.as_str() == "dataclass"
+                    && matches!(a.value.as_ref(), Expr::Name(n) if n.id.as_str() == "dataclasses")
+            }
+            Expr::Call(c) => is_dataclass_expr(c.func.as_ref()),
+            _ => false,
+        }
+    }
+    decorators.iter().any(|d| is_dataclass_expr(&d.expression))
+}
+
+/// Exact base names — outside the `*Error`/`*Exception`/`*Warning` naming
+/// convention — that nonetheless make a class an exception subclass.
+const EXACT_EXCEPTION_BASES: &[&str] = &[
+    "BaseException",
+    "KeyboardInterrupt",
+    "SystemExit",
+    "GeneratorExit",
+    "StopIteration",
+    "StopAsyncIteration",
+];
+
+/// Whether `name` (a base's trailing segment) marks an exception by the
+/// builtin convention: a `*Error` / `*Exception` / `*Warning` suffix or an
+/// exact non-suffixed builtin (`BaseException`, `KeyboardInterrupt`, …).
+fn name_is_exception_base(name: &str) -> bool {
+    name.ends_with("Error")
+        || name.ends_with("Exception")
+        || name.ends_with("Warning")
+        || EXACT_EXCEPTION_BASES.contains(&name)
+}
+
+/// Builtin metaclasses: a class deriving from one is itself a metaclass.
+const METACLASS_BASES: &[&str] = &["type", "ABCMeta", "EnumMeta", "EnumType"];
+
+/// The module's classes, and which of them are exceptions or metaclasses.
+#[derive(Debug, Clone, Default)]
+pub struct ModuleClassKinds {
+    module_classes: HashSet<String>,
+    exception_classes: HashSet<String>,
+    metaclasses: HashSet<String>,
+}
+
+impl ModuleClassKinds {
+    /// Classify every *module-level* class — descending through module-level
+    /// control flow (`if`/`try`/`for`/`while`/`with`) but NOT into function or
+    /// class bodies, so a function-local `class Failure(Exception):` does not
+    /// taint an unrelated top-level `class Failure:` dataclass.
+    ///
+    /// A class is an exception when a base is an *external* (builtin or
+    /// imported) name matching the exception convention (`Exception`,
+    /// `ValueError`, …) or another module class that is one. A `*Error`-named
+    /// base that is itself a module class is NOT assumed to be an exception:
+    /// `class LexError: line: int` is a Result error-variant dataclass, so
+    /// `class Detailed(LexError):` stays a dataclass too. Metaclasses are
+    /// closed the same way from [`METACLASS_BASES`].
+    pub fn collect(body: &[Stmt]) -> Self {
+        let mut classes: Vec<(String, Vec<String>)> = Vec::new();
+        collect_class_bases_into(body, &mut classes);
+        let module_classes: HashSet<String> = classes.iter().map(|(n, _)| n.clone()).collect();
+        let close = |seed: &dyn Fn(&str) -> bool| {
+            let mut out: HashSet<String> = classes
+                .iter()
+                .filter(|(_, bases)| {
+                    bases
+                        .iter()
+                        .any(|b| !module_classes.contains(b.as_str()) && seed(b))
+                })
+                .map(|(name, _)| name.clone())
+                .collect();
+            loop {
+                let before = out.len();
+                for (name, bases) in &classes {
+                    if bases.iter().any(|b| out.contains(b.as_str())) {
+                        out.insert(name.clone());
+                    }
+                }
+                if out.len() == before {
+                    return out;
+                }
+            }
+        };
+        let exception_classes = close(&name_is_exception_base);
+        let metaclasses = close(&|b: &str| METACLASS_BASES.contains(&b));
+        Self {
+            module_classes,
+            exception_classes,
+            metaclasses,
+        }
+    }
+
+    /// Names of every module-level class.
+    pub fn module_classes(&self) -> &HashSet<String> {
+        &self.module_classes
+    }
+
+    /// `c` has an external exception base — in any scope, nested classes
+    /// included — or is a module class rooted in one.
+    pub fn is_exception_class(&self, c: &StmtClassDef) -> bool {
+        self.has_external_base(c, name_is_exception_base)
+            || self.exception_classes.contains(c.name.as_str())
+    }
+
+    /// `c` has an external metaclass base, or is a module class rooted in one.
+    pub fn is_metaclass(&self, c: &StmtClassDef) -> bool {
+        self.has_external_base(c, |b| METACLASS_BASES.contains(&b))
+            || self.metaclasses.contains(c.name.as_str())
+    }
+
+    fn has_external_base(&self, c: &StmtClassDef, pred: impl Fn(&str) -> bool) -> bool {
+        c.bases().iter().any(|b| {
+            base_last_segment(b).is_some_and(|seg| !self.module_classes.contains(seg) && pred(seg))
+        })
+    }
+}
+
+/// `(class name, base trailing segments)` for every module-level class def.
+fn collect_class_bases_into(body: &[Stmt], out: &mut Vec<(String, Vec<String>)>) {
+    for stmt in body {
+        match stmt {
+            Stmt::ClassDef(c) => {
+                let bases: Vec<String> = c
+                    .bases()
+                    .iter()
+                    .filter_map(|b| base_last_segment(b).map(|s| s.to_owned()))
+                    .collect();
+                out.push((c.name.as_str().to_owned(), bases));
+            }
+            Stmt::If(i) => {
+                collect_class_bases_into(&i.body, out);
+                for clause in &i.elif_else_clauses {
+                    collect_class_bases_into(&clause.body, out);
+                }
+            }
+            Stmt::For(f) => {
+                collect_class_bases_into(&f.body, out);
+                collect_class_bases_into(&f.orelse, out);
+            }
+            Stmt::While(w) => {
+                collect_class_bases_into(&w.body, out);
+                collect_class_bases_into(&w.orelse, out);
+            }
+            Stmt::With(w) => collect_class_bases_into(&w.body, out),
+            Stmt::Try(t) => {
+                collect_class_bases_into(&t.body, out);
+                for h in &t.handlers {
+                    let ExceptHandler::ExceptHandler(h) = h;
+                    collect_class_bases_into(&h.body, out);
+                }
+                collect_class_bases_into(&t.orelse, out);
+                collect_class_bases_into(&t.finalbody, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Whether a class of `c`'s kind is emitted without `@dataclass` whatever
+/// its `plain` / `class!` marker says: a `model`, an `interface`, a
+/// `TypedDict` / `NamedTuple`, an `Enum` / `ABC` (or configured
+/// `skip_decoration_bases`) subclass, an exception or a metaclass, an
+/// explicit `@dataclass`, and the `impl` / `lazy import` pseudo-classes.
+/// Exceptions and metaclasses lower like `class!` instead: the default is
+/// passed through a synthesised `__init__` as written.
+pub fn skips_dataclass_decoration(
+    c: &StmtClassDef,
+    kinds: &ModuleClassKinds,
+    skip_decoration_bases: &[String],
+) -> bool {
+    let name = c.name.as_str();
+    class_inherits_basemodel(c)
+        // `interface` lowers to `class X(Protocol):`; the runtime Protocol
+        // behaviour conflicts with dataclass field collection.
+        || class_inherits_protocol(c)
+        || class_inherits_typed_dict(c)
+        || class_inherits_named_tuple(c)
+        // `impl` stubs are merged into their target class later.
+        || name.starts_with("__typhon_impl_")
+        // A `lazy import` proxy has its own `__slots__` and `__init__`.
+        || name.starts_with("__TyphonLazy_")
+        || class_inherits_skip_decoration_base(c, skip_decoration_bases)
+        // A dataclass `__init__` would shadow `BaseException.__init__`.
+        || kinds.is_exception_class(c)
+        // One would replace `type.__init__` (W7-11).
+        || kinds.is_metaclass(c)
+        || has_dataclass_decorator(&c.decorator_list)
+}
+
+// ── Which classes the desugar reaches, and what their defaults read ──────
+
+/// Every class the desugar's class walk visits, with the `list` / `dict` /
+/// `set` names its field defaults read. The walk descends through `def` and
+/// `class` bodies only, so a class under an `if` / `for` / `with` / `try` /
+/// `match` is emitted exactly as written (no `@dataclass`, no copy).
+///
+/// A default's factory lambda resolves a name through the enclosing
+/// *functions* (class bodies are skipped) before the module, so a function
+/// local shadows the module binding: one evidently bound to a `list` / `dict`
+/// / `set` supplies that kind, one evidently bound to something else
+/// (`let BASE: tuple[int, ...] = …`) removes it, and one whose kind is not
+/// evident leaves the outer answer in place.
+#[derive(Debug, Clone, Default)]
+pub struct ClassDefaultScopes {
+    /// Index 0 is the module's own names; one more per function that
+    /// changes them.
+    scopes: Vec<HashMap<String, &'static str>>,
+    /// Class name start offset → its index in `scopes`.
+    classes: HashMap<u32, usize>,
+}
+
+impl ClassDefaultScopes {
+    pub fn collect(body: &[Stmt]) -> Self {
+        let mut out = Self {
+            scopes: vec![collect_module_mutable_names(body)],
+            classes: HashMap::new(),
+        };
+        out.walk(body, 0);
+        out
+    }
+
+    /// The names the field defaults of the class whose name starts at
+    /// `class_name_start` read; `None` when the desugar never reaches it.
+    pub fn mutable_names(&self, class_name_start: u32) -> Option<&HashMap<String, &'static str>> {
+        self.classes
+            .get(&class_name_start)
+            .map(|&i| &self.scopes[i])
+    }
+
+    fn walk(&mut self, body: &[Stmt], scope: usize) {
+        for stmt in body {
+            match stmt {
+                Stmt::ClassDef(c) => {
+                    self.classes.insert(u32::from(c.name.range.start()), scope);
+                    self.walk(&c.body, scope);
+                }
+                Stmt::FunctionDef(f) => {
+                    let mut names = self.scopes[scope].clone();
+                    for (name, kind) in function_local_kinds(f) {
+                        match kind {
+                            LocalKind::Mutable(k) => {
+                                names.insert(name, k);
+                            }
+                            LocalKind::Other => {
+                                names.remove(&name);
+                            }
+                            LocalKind::Unknown => {}
+                        }
+                    }
+                    let inner = if names == self.scopes[scope] {
+                        scope
+                    } else {
+                        self.scopes.push(names);
+                        self.scopes.len() - 1
+                    };
+                    self.walk(&f.body, inner);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// What a function-local binding evidently holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalKind {
+    Mutable(&'static str),
+    /// Evidently not a `list` / `dict` / `set`.
+    Other,
+    Unknown,
+}
+
+impl LocalKind {
+    fn join(self, other: Self) -> Self {
+        if self == other {
+            self
+        } else {
+            Self::Unknown
+        }
+    }
+}
+
+/// An annotation or value evidently of an immutable builtin.
+fn is_immutable_annotation(annotation: &Expr) -> bool {
+    let head = match annotation {
+        Expr::Subscript(s) => s.value.as_ref(),
+        other => other,
+    };
+    let name = match head {
+        Expr::Name(n) => n.id.as_str(),
+        Expr::Attribute(a) => a.attr.as_str(),
+        Expr::NoneLiteral(_) => return true,
+        _ => return false,
+    };
+    matches!(
+        name,
+        "tuple"
+            | "Tuple"
+            | "frozenset"
+            | "FrozenSet"
+            | "frozendict"
+            | "str"
+            | "bytes"
+            | "int"
+            | "float"
+            | "complex"
+            | "bool"
+    )
+}
+
+fn is_immutable_value(value: &Expr) -> bool {
+    match value {
+        Expr::Tuple(_)
+        | Expr::StringLiteral(_)
+        | Expr::BytesLiteral(_)
+        | Expr::NumberLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::NoneLiteral(_) => true,
+        Expr::Call(c) => matches!(
+            c.func.as_ref(),
+            Expr::Name(n) if matches!(n.id.as_str(), "tuple" | "frozenset" | "frozendict")
+        ),
+        _ => false,
+    }
+}
+
+fn binding_kind(annotation: Option<&Expr>, value: Option<&Expr>) -> LocalKind {
+    if let Some(k) = annotation.and_then(mutable_builtin_of_annotation) {
+        return LocalKind::Mutable(k);
+    }
+    if annotation.is_some_and(is_immutable_annotation) {
+        return LocalKind::Other;
+    }
+    match value {
+        Some(v) => match mutable_builtin_of_value(v) {
+            Some(k) => LocalKind::Mutable(k),
+            None if is_immutable_value(v) => LocalKind::Other,
+            None => LocalKind::Unknown,
+        },
+        None => LocalKind::Unknown,
+    }
+}
+
+/// Every name `f` binds in its own scope — parameters, assignment, `for`,
+/// `with`, `except`, import, `del`, pattern-capture and walrus targets,
+/// nested `def` / `class` names — with what each evidently holds across all
+/// its bindings. `global` / `nonlocal` names are not the function's own.
+fn function_local_kinds(f: &StmtFunctionDef) -> HashMap<String, LocalKind> {
+    struct Locals {
+        kinds: HashMap<String, LocalKind>,
+        foreign: HashSet<String>,
+    }
+    impl Locals {
+        fn bind(&mut self, name: &str, kind: LocalKind) {
+            self.kinds
+                .entry(name.to_owned())
+                .and_modify(|k| *k = k.join(kind))
+                .or_insert(kind);
+        }
+        fn bind_target(&mut self, target: &Expr) {
+            match target {
+                Expr::Name(n) => self.bind(n.id.as_str(), LocalKind::Unknown),
+                Expr::Tuple(t) => t.elts.iter().for_each(|e| self.bind_target(e)),
+                Expr::List(l) => l.elts.iter().for_each(|e| self.bind_target(e)),
+                Expr::Starred(s) => self.bind_target(&s.value),
+                _ => {}
+            }
+        }
+    }
+    impl<'a> Visitor<'a> for Locals {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            match stmt {
+                // A nested scope binds only its own name here.
+                Stmt::FunctionDef(d) => return self.bind(d.name.as_str(), LocalKind::Unknown),
+                Stmt::ClassDef(d) => return self.bind(d.name.as_str(), LocalKind::Unknown),
+                Stmt::Assign(a) => match a.targets.as_slice() {
+                    [Expr::Name(n)] => self.bind(n.id.as_str(), binding_kind(None, Some(&a.value))),
+                    targets => targets.iter().for_each(|t| self.bind_target(t)),
+                },
+                Stmt::AnnAssign(a) => {
+                    if let Expr::Name(n) = a.target.as_ref() {
+                        self.bind(
+                            n.id.as_str(),
+                            binding_kind(Some(&a.annotation), a.value.as_deref()),
+                        );
+                    }
+                }
+                // `+=` keeps the value's kind.
+                Stmt::AugAssign(_) => {}
+                Stmt::For(s) => self.bind_target(&s.target),
+                Stmt::With(w) => {
+                    for item in &w.items {
+                        if let Some(v) = &item.optional_vars {
+                            self.bind_target(v);
+                        }
+                    }
+                }
+                Stmt::Delete(d) => d.targets.iter().for_each(|t| self.bind_target(t)),
+                Stmt::Import(i) => {
+                    for a in &i.names {
+                        let bound = match &a.asname {
+                            Some(alias) => alias.as_str(),
+                            None => a.name.as_str().split('.').next().unwrap_or_default(),
+                        };
+                        self.bind(bound, LocalKind::Unknown);
+                    }
+                }
+                Stmt::ImportFrom(i) => {
+                    for a in &i.names {
+                        self.bind(
+                            a.asname.as_ref().unwrap_or(&a.name).as_str(),
+                            LocalKind::Unknown,
+                        );
+                    }
+                }
+                Stmt::Global(g) => self.foreign.extend(g.names.iter().map(|n| n.to_string())),
+                Stmt::Nonlocal(g) => self.foreign.extend(g.names.iter().map(|n| n.to_string())),
+                Stmt::TypeAlias(t) => self.bind_target(&t.name),
+                Stmt::Try(t) => {
+                    for h in &t.handlers {
+                        let ExceptHandler::ExceptHandler(h) = h;
+                        if let Some(name) = &h.name {
+                            self.bind(name.as_str(), LocalKind::Unknown);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            walk_stmt(self, stmt);
+        }
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            match expr {
+                // A lambda's walrus binds in the lambda.
+                Expr::Lambda(_) => {}
+                Expr::Named(n) => {
+                    self.bind_target(&n.target);
+                    walk_expr(self, expr);
+                }
+                _ => walk_expr(self, expr),
+            }
+        }
+        fn visit_pattern(&mut self, pattern: &'a Pattern) {
+            let name = match pattern {
+                Pattern::MatchAs(p) => p.name.as_ref(),
+                Pattern::MatchStar(p) => p.name.as_ref(),
+                Pattern::MatchMapping(p) => p.rest.as_ref(),
+                _ => None,
+            };
+            if let Some(name) = name {
+                self.bind(name.as_str(), LocalKind::Unknown);
+            }
+            walk_pattern(self, pattern);
+        }
+    }
+    let mut locals = Locals {
+        kinds: HashMap::new(),
+        foreign: HashSet::new(),
+    };
+    let params = &f.parameters;
+    for p in params.iter_non_variadic_params() {
+        let kind = binding_kind(p.parameter.annotation.as_deref(), None);
+        locals.bind(p.parameter.name.as_str(), kind);
+    }
+    for p in params.vararg.iter().chain(params.kwarg.iter()) {
+        locals.bind(p.name.as_str(), LocalKind::Unknown);
+    }
+    for s in &f.body {
+        locals.visit_stmt(s);
+    }
+    let Locals { mut kinds, foreign } = locals;
+    kinds.retain(|name, _| !foreign.contains(name));
+    kinds
 }

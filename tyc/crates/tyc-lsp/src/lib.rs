@@ -2188,6 +2188,7 @@ impl Backend {
             raw_class_byte_starts,
             lazy_import_remaps: Vec::new(),
             original_source: None,
+            plain_class_byte_starts: None,
         };
         let resolved = resolve_in_preprocessed(preprocessed, options)?;
         let arc = Arc::new(resolved);
@@ -2930,6 +2931,7 @@ fn project_module_members(src_dir: &std::path::Path, module: &str) -> Option<Vec
             raw_class_byte_starts,
             lazy_import_remaps: Vec::new(),
             original_source: None,
+            plain_class_byte_starts: None,
         },
     )?;
     let module_scope = resolved.scopes.first()?;
@@ -3130,6 +3132,7 @@ fn extract_top_level_publics(source: &str) -> Vec<(String, BindingKind)> {
             raw_class_byte_starts,
             lazy_import_remaps: Vec::new(),
             original_source: None,
+            plain_class_byte_starts: None,
         },
     ) else {
         return Vec::new();

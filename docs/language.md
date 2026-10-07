@@ -935,7 +935,9 @@ new binding without an annotation that receives a frozen value retains its
 frozen shape. An annotated binding stores the value as it is, so its
 annotation must describe the frozen value — `tuple[T, ...]`, `frozenset[T]`,
 `Mapping[K, V]` (or `frozendict[K, V]`), or a read-only view such as
-`Sequence[T]`; `let row: list[int] = CFG["a"]` is `tyc::type_mismatch`. Copy
+`Sequence[T]` or `collections.abc.Set[T]` (the set ABC, unlike the deprecated
+`typing.Set` alias of `set`); `let row: list[int] = CFG["a"]` is
+`tyc::type_mismatch`. Copy
 explicitly (`list(CFG["a"])`) when a mutable container is wanted. An
 immutable operation deliberately protected by its matching exception handler
 is reported as a warning, allowing runtime failure probes to remain
