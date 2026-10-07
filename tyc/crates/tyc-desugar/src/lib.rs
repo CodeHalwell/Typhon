@@ -7059,7 +7059,7 @@ def outer():
 
     /// A nested function that rebinds a local through `nonlocal` changes what
     /// the local may hold: its assignments join the owner's, and a mix of
-    /// kinds leaves the outer answer in place.
+    /// kinds takes the module's answer.
     #[test]
     fn a_nonlocal_rebind_joins_the_owning_functions_kind() {
         // `[1]` then `(2, 3)`: stored as written, as before the local was
@@ -7160,6 +7160,89 @@ def outer():
                 "{src}\n---\n{out}"
             );
         }
+    }
+
+    /// A local whose kind is not evident — a `nonlocal` rebind of another
+    /// kind, a value that says nothing — shadows an enclosing function's list
+    /// local or parameter of the same name, so it takes the module's answer,
+    /// as every class did before locals were looked at: a tuple is stored as
+    /// written, not copied into a list.
+    #[test]
+    fn an_unevident_local_takes_the_module_answer_past_an_enclosing_list() {
+        for (outer0, write) in [
+            // A tuple local rebound to a tuple built from it.
+            (
+                "def outer0():\n    LOC: list[int] = [1]\n",
+                "LOC = tuple(LOC) + (4,)",
+            ),
+            // A tuple local rebound to a list, read before the rebind.
+            ("def outer0():\n    LOC: list[int] = [1]\n", "LOC = [2, 3]"),
+            // The enclosing list is a parameter.
+            ("def outer0(LOC: list[int]):\n", "LOC = [2, 3]"),
+        ] {
+            let src = format!(
+                "{outer0}    def outer1():
+        LOC: Sequence[int] = (1,)
+        def inner():
+            nonlocal LOC
+            {write}
+        inner()
+        class C:
+            items: Sequence[int] = LOC
+        return C()
+    return outer1()
+"
+            );
+            let out = parse_and_desugar(&src);
+            assert!(!out.contains("default_factory"), "{src}\n---\n{out}");
+            assert!(
+                out.contains("items: Sequence[int] = LOC"),
+                "{src}\n---\n{out}"
+            );
+        }
+        // A local bound to a call's result says nothing either.
+        let out = parse_and_desugar(
+            "def outer0():
+    LOC: list[int] = [1]
+    def outer1():
+        LOC = make()
+        class C:
+            items: Sequence[int] = LOC
+        return C()
+    return outer1()
+",
+        );
+        assert!(!out.contains("default_factory"), "{out}");
+        // Over a module list the module's answer is a copy, as before.
+        let out = parse_and_desugar(
+            "LOC: list[int] = [1]
+
+def outer1():
+    LOC: Sequence[int] = (1,)
+    def inner():
+        nonlocal LOC
+        LOC = tuple(LOC) + (4,)
+    inner()
+    class C:
+        items: Sequence[int] = LOC
+    return C()
+",
+        );
+        assert!(out.contains("default_factory=lambda: list(LOC)"), "{out}");
+        // An evident list local in between still decides for the scopes it
+        // encloses.
+        let out = parse_and_desugar(
+            "def outer0():
+    LOC: Sequence[int] = (1,)
+    def outer1():
+        LOC: list[int] = [1]
+        class C:
+            items: Sequence[int] = LOC
+        return C()
+    return outer1()
+",
+        );
+        assert!(out.contains("default_factory=lambda: list(LOC)"), "{out}");
     }
 
     /// A class under module-level control flow is emitted as written.

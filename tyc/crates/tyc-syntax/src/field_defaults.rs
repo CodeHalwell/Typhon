@@ -694,9 +694,10 @@ pub fn skips_dataclass_decoration(
 /// local shadows the module binding: one evidently bound to a `list` / `dict`
 /// / `set` supplies that kind, one evidently bound to something else
 /// (`let BASE: tuple[int, ...] = …`) removes it, and one whose kind is not
-/// evident leaves the outer answer in place. A local's kind covers what nested
-/// functions assign to it through `nonlocal`; a name a function declares
-/// `global` reads the module's binding again.
+/// evident takes the module's answer, as before locals were looked at. A
+/// local's kind covers what nested functions assign to it through
+/// `nonlocal`; a name a function declares `global` reads the module's
+/// binding again.
 #[derive(Debug, Clone, Default)]
 pub struct ClassDefaultScopes {
     /// Index 0 is the module's own names; one more per function that
@@ -734,6 +735,14 @@ impl ClassDefaultScopes {
                 Stmt::FunctionDef(f) => {
                     let mut names = self.scopes[scope].clone();
                     let (locals, globals) = function_local_kinds(f);
+                    // A local whose kind is not evident (a mix of kinds, or a
+                    // value that says nothing) takes the module's answer, as
+                    // every class did before the locals were looked at — not
+                    // an enclosing function's list local of the same name,
+                    // which it shadows. A `global` name reads the module's
+                    // binding too, past any enclosing function's local — in
+                    // this function and in the scopes nested in it.
+                    let mut from_module = globals;
                     for (name, kind) in locals {
                         match kind {
                             LocalKind::Mutable(k) => {
@@ -742,13 +751,12 @@ impl ClassDefaultScopes {
                             LocalKind::Other => {
                                 names.remove(&name);
                             }
-                            LocalKind::Unknown => {}
+                            LocalKind::Unknown => {
+                                from_module.insert(name);
+                            }
                         }
                     }
-                    // A `global` name reads the module's binding, past any
-                    // enclosing function's local of the same name — in this
-                    // function and in the scopes nested in it.
-                    for name in globals {
+                    for name in from_module {
                         match self.scopes[0].get(&name) {
                             Some(&k) => names.insert(name, k),
                             None => names.remove(&name),
