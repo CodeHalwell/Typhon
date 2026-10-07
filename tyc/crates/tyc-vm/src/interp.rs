@@ -65,6 +65,9 @@ type MethodTableCache = HashMap<String, Option<Rc<Function>>>;
 
 pub struct Interpreter {
     pub root: EnvRef,
+    /// Set only while an `async for` builds its iterator: the one place a
+    /// hand-written `__aiter__` / `__anext__` object is iterable.
+    async_iteration: bool,
     pub stack_depth: usize,
     pub max_stack_depth: usize,
     /// Byte offset (into the current source) of the statement being
@@ -269,6 +272,7 @@ impl Interpreter {
             root: root.clone(),
             stack_depth: 0,
             current_offset: 0,
+            async_iteration: false,
             current_source: None,
             // Match CPython's default `sys.getrecursionlimit()` of 1000
             // (FINDINGS #31). The tree-walking interpreter still pays a
@@ -1207,7 +1211,10 @@ impl Interpreter {
             None => {
                 let iterable = self.eval_expr(&s.iter, env)?;
                 let generator = as_generator(&iterable);
-                (self.make_iter(iterable)?, generator, false)
+                self.async_iteration = s.is_async;
+                let iter = self.make_iter(iterable);
+                self.async_iteration = false;
+                (iter?, generator, false)
             }
             Some(ResumeFrame::ForBody { iter }) => (iter, None, true),
             Some(ResumeFrame::LoopElse) => return self.exec_loop_else(&s.orelse, env),
@@ -1709,6 +1716,12 @@ impl Interpreter {
                             header_bases.push(Value::Class(origin.clone()));
                             bases.push(origin.clone());
                         }
+                    }
+                    // Other subclassable builtins the VM does not model as
+                    // a base still belong in `__mro__` / `__bases__`.
+                    Value::Native(n) if matches!(n.name, "type" | "complex" | "bytearray") => {
+                        header_has_builtin = true;
+                        header_bases.push(Value::Str(Rc::new(n.name.to_owned())));
                     }
                     Value::Native(n)
                         if builtin_exc_mro(n.name).is_some()
@@ -8590,7 +8603,8 @@ impl Interpreter {
                 // *hand-written* async iterator defines `__aiter__` /
                 // `__anext__` and has no `__iter__` at all, so it has to be
                 // recognised here.
-                if self.find_method(&inst.class, "__iter__").is_none()
+                if std::mem::take(&mut self.async_iteration)
+                    && self.find_method(&inst.class, "__iter__").is_none()
                     && self.find_method(&inst.class, "__aiter__").is_some()
                 {
                     let aiter = match self.find_method(&inst.class, "__aiter__") {

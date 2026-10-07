@@ -927,6 +927,15 @@ fn attribute_chain(attr: &ruff_python_ast::ExprAttribute) -> Option<(String, Vec
     }
 }
 
+impl AttributeScan {
+    /// A parameter, `except … as`, or pattern capture: shadows the name and
+    /// rebinds it away from any builtin metaclass.
+    fn bind_local(&mut self, name: String) {
+        self.program_bound.insert(name.clone());
+        self.shadowed.insert(name);
+    }
+}
+
 impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
     fn visit_stmt(&mut self, stmt: &'a ruff_python_ast::Stmt) {
         use ruff_python_ast::Stmt;
@@ -1105,7 +1114,7 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
 
     fn visit_parameters(&mut self, parameters: &'a ruff_python_ast::Parameters) {
         for param in parameters.iter() {
-            self.shadowed.insert(param.name().as_str().to_owned());
+            self.bind_local(param.name().as_str().to_owned());
         }
         ruff_python_ast::visitor::walk_parameters(self, parameters);
     }
@@ -1113,7 +1122,7 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
     fn visit_except_handler(&mut self, handler: &'a ruff_python_ast::ExceptHandler) {
         let ruff_python_ast::ExceptHandler::ExceptHandler(h) = handler;
         if let Some(name) = &h.name {
-            self.shadowed.insert(name.as_str().to_owned());
+            self.bind_local(name.as_str().to_owned());
         }
         ruff_python_ast::visitor::walk_except_handler(self, handler);
     }
@@ -1123,17 +1132,17 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
         match pattern {
             Pattern::MatchAs(p) => {
                 if let Some(name) = &p.name {
-                    self.shadowed.insert(name.as_str().to_owned());
+                    self.bind_local(name.as_str().to_owned());
                 }
             }
             Pattern::MatchStar(p) => {
                 if let Some(name) = &p.name {
-                    self.shadowed.insert(name.as_str().to_owned());
+                    self.bind_local(name.as_str().to_owned());
                 }
             }
             Pattern::MatchMapping(p) => {
                 if let Some(rest) = &p.rest {
-                    self.shadowed.insert(rest.as_str().to_owned());
+                    self.bind_local(rest.as_str().to_owned());
                 }
             }
             _ => {}
@@ -1383,6 +1392,11 @@ mod tests {
         assert!(scan_source(aliased)
             .unwrap_or_default()
             .contains(&"a custom metaclass".to_owned()));
+        let param = "def make(ABCMeta: object) -> object:\n    plain class W(metaclass=ABCMeta):\n        pass\n    return W\nprint(make(type))\n";
+        assert_eq!(
+            scan_source(param),
+            Some(vec!["a custom metaclass".to_owned()])
+        );
         let own = "plain class ABCMeta(type):\n    pass\nplain class W(metaclass=ABCMeta):\n    pass\nprint(W())\n";
         assert_eq!(
             scan_source(own),

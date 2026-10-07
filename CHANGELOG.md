@@ -33,7 +33,9 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   VM used to call `__anext__` until exhaustion before the loop body ran
   once, so output interleaved differently from CPython and an endless
   source hit the 1,000,000-item cap even when the loop `break`s. Each
-  `__anext__` now runs just before the body that consumes its item.
+  `__anext__` now runs just before the body that consumes its item, and a
+  plain `for` or `list()` over such an object raises CPython's
+  `TypeError` instead of driving `__anext__`.
 - **`tyc run` no longer runs a generator early without saying so.** A
   generator (or generator lambda) whose `yield` the VM cannot suspend (in
   a loop test, a `with` item, or two in one expression) ran its whole body at the call, so its
@@ -47,7 +49,7 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   (`AppError, ValueError, Exception, BaseException, object`), and
   `__bases__` works on every class, with the C3 order kept when a builtin
   type or exception is mixed with other bases (`class E(ValueError,
-  Mixin)`, `class ML(list)`).
+  Mixin)`, `class ML(list)`, `class Meta(type)`).
 - **`tyc run` sends more programs it cannot run faithfully to CPython.**
   A class with a custom `metaclass=` (anything but the real `ABCMeta` or
   `type`), a class defining or assigning `__del__`, and any use of `with_traceback` / `__traceback__`

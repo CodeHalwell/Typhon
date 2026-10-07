@@ -711,6 +711,11 @@ async def main() -> None:
             break
     show("total", total)
 asyncio.run(main())
+def sync_for() -> None:
+    for x in Ticker(1):
+        show(x)
+trap("sync for", sync_for)
+trap("sync list", lambda: list(Ticker(1)))
 "#,
     );
 }
@@ -757,6 +762,9 @@ plain class ML(list):
 plain class MixList(Mixin, dict):
     pass
 show(names(ML.__bases__), names(ML.__mro__), names(MixList.__mro__), names(MixList.__bases__))
+plain class Meta(type):
+    pass
+show(names(Meta.__bases__), names(Meta.__mro__))
 "#,
     );
 }
