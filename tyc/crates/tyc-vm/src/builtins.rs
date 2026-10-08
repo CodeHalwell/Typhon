@@ -869,7 +869,14 @@ pub fn install(interp: &mut Interpreter) {
         };
         let expr = expr.value.clone();
         let env = i.root.clone();
-        i.eval_expr(&expr, &env)
+        // An `eval` is its own compilation unit (`File "<string>"`), so its
+        // literals are not the caller's constants.
+        let outer = i
+            .current_source
+            .replace(Rc::new(crate::interp::SourceInfo::new("<string>", &source)));
+        let result = i.eval_expr(&expr, &env);
+        i.current_source = outer;
+        result
     });
 
     native!("bytearray", |i, args| {
@@ -10369,7 +10376,7 @@ pub fn dispatch_method(
         // ── str methods ────────────────────────────────────────────────────
         (Value::Str(s), m) => {
             let out = str_method(interp, s, m, rest, &kwargs)?;
-            Ok(keep_unchanged_str(s, m, out))
+            Ok(keep_unchanged_str(s, m, rest, out))
         }
         // ── bytes methods ──────────────────────────────────────────────────
         (Value::Bytes(b), m) => bytes_method(b, m, rest, &kwargs),
@@ -10524,10 +10531,34 @@ pub fn str_maketrans(args: &[Value]) -> Result<Value, Unwind> {
     Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(map))))
 }
 
+/// The argument a `str.format` template made of a single bare replacement
+/// field selects, if that is all the template is.
+fn sole_format_field<'a>(
+    template: &str,
+    pos: &'a [Value],
+    kwargs: &'a [(String, Value)],
+) -> Option<&'a Value> {
+    let inner = template.strip_prefix('{')?.strip_suffix('}')?;
+    let name = inner
+        .strip_suffix("!s")
+        .or_else(|| inner.strip_suffix(':'))
+        .unwrap_or(inner);
+    if name.contains(['{', '}', '!', ':', '.', '[']) {
+        return None;
+    }
+    if name.is_empty() {
+        return pos.first();
+    }
+    if let Ok(i) = name.parse::<usize>() {
+        return pos.get(i);
+    }
+    kwargs.iter().find(|(k, _)| k == name).map(|(_, v)| v)
+}
+
 /// CPython's `str` methods hand back the receiver itself, not a copy, when
 /// they change nothing (`s.strip() is s` for an unpadded `s`), and a split
 /// that finds no separator returns the receiver as its only piece.
-fn keep_unchanged_str(s: &Rc<String>, name: &str, out: Value) -> Value {
+fn keep_unchanged_str(s: &Rc<String>, name: &str, args: &[Value], out: Value) -> Value {
     let same = |v: &Value| matches!(v, Value::Str(r) if !Rc::ptr_eq(r, s) && **r == **s);
     match name {
         "strip" | "lstrip" | "rstrip" | "replace" | "ljust" | "rjust" | "center" | "zfill"
@@ -10545,18 +10576,21 @@ fn keep_unchanged_str(s: &Rc<String>, name: &str, out: Value) -> Value {
             }
             out
         }
+        // Not found: the receiver is the whole piece (first for `partition`,
+        // last for `rpartition`). Found: the separator is the argument itself.
         "partition" | "rpartition" => match &out {
-            Value::Tuple(t) if t.iter().any(same) => Value::Tuple(Rc::new(
-                t.iter()
-                    .map(|v| {
-                        if same(v) {
-                            Value::Str(s.clone())
-                        } else {
-                            v.clone()
-                        }
-                    })
-                    .collect(),
-            )),
+            Value::Tuple(t) if t.len() == 3 => {
+                let mut parts = t.as_ref().clone();
+                let whole = if name == "partition" { 0 } else { 2 };
+                if same(&parts[whole]) {
+                    parts[whole] = Value::Str(s.clone());
+                } else if let (Some(Value::Str(sep)), Value::Str(got)) = (args.first(), &parts[1]) {
+                    if **sep == **got {
+                        parts[1] = Value::Str(sep.clone());
+                    }
+                }
+                Value::Tuple(Rc::new(parts))
+            }
             _ => out,
         },
         _ => out,
@@ -11049,14 +11083,17 @@ fn str_method(
             // via the trailing kwargs sentinel that `call_value` appends for
             // bound builtin methods (see make_kwargs_sentinel / split_kwargs).
             let (pos_args, kwargs) = split_kwargs(args);
-            return Ok(match str_format(interp, s, pos_args, &kwargs)? {
-                Value::Str(out) => {
-                    let mut all: Vec<Value> = pos_args.to_vec();
-                    all.extend(kwargs.iter().map(|(_, v)| v.clone()));
-                    Value::Str(crate::interp::reuse_whole_str((*out).clone(), &all))
+            let out = str_format(interp, s, pos_args, &kwargs)?;
+            // A template that is one bare field (`"{}"`, `"{0}"`, `"{name!s}"`)
+            // hands back that argument itself when it is a `str`.
+            if let (Value::Str(text), Some(Value::Str(arg))) =
+                (&out, sole_format_field(s, pos_args, &kwargs))
+            {
+                if **text == **arg {
+                    return Ok(Value::Str(arg.clone()));
                 }
-                other => other,
-            });
+            }
+            return Ok(out);
         }
         // `str.format_map(m)` is `format(**m)` without copying the mapping —
         // and, unlike `format`, it accepts non-string keys, which simply

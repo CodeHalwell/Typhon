@@ -75,9 +75,13 @@ pub struct Interpreter {
     /// per text, so `"ab" is "ab"` and `Box.__name__ is "Box"` hold while
     /// a freshly built equal string stays a distinct object.
     interned: HashMap<String, Rc<String>>,
-    /// The module's other string constants (not name-like, so CPython
-    /// shares them between equal literals but never interns them).
+    /// Non-name-like string constants when no source is attached (unit
+    /// harnesses); otherwise each unit's own [`SourceInfo::constants`].
     str_constants: HashMap<String, Rc<String>>,
+    /// `sys.intern` of a runtime string: held weakly, as CPython's mortal
+    /// interned strings are, so interning transient input doesn't keep it
+    /// alive for the whole run.
+    dyn_interned: HashMap<String, std::rc::Weak<String>>,
     pub stack_depth: usize,
     pub max_stack_depth: usize,
     /// Byte offset (into the current source) of the statement being
@@ -214,6 +218,10 @@ pub struct SourceInfo {
     /// Parsed-buffer line → user-source line (0-based); empty when the
     /// two coincide. See [`SourceInfo::mapped`].
     pub line_map: Vec<usize>,
+    /// This compilation unit's string constants that are not name-like:
+    /// CPython shares equal literals within one module (or one `eval`) but
+    /// never across them. Living here, the pool goes when the unit does.
+    pub constants: RefCell<HashMap<String, Rc<String>>>,
 }
 
 impl SourceInfo {
@@ -229,6 +237,7 @@ impl SourceInfo {
             line_starts,
             lines: source.lines().map(|l| l.to_owned()).collect(),
             line_map: Vec::new(),
+            constants: RefCell::new(HashMap::new()),
         }
     }
     /// A source whose AST offsets index `python_source` (the preprocessed,
@@ -286,6 +295,7 @@ impl Interpreter {
             builtin_globals: HashMap::new(),
             interned: HashMap::new(),
             str_constants: HashMap::new(),
+            dyn_interned: HashMap::new(),
             current_source: None,
             // Match CPython's default `sys.getrecursionlimit()` of 1000
             // (FINDINGS #31). The tree-walking interpreter still pays a
@@ -3586,12 +3596,18 @@ impl Interpreter {
         if text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return self.intern_str(text);
         }
-        if let Some(rc) = self.str_constants.get(text) {
-            return rc.clone();
+        let lookup = |pool: &mut HashMap<String, Rc<String>>| {
+            if let Some(rc) = pool.get(text) {
+                return rc.clone();
+            }
+            let rc = Rc::new(text.to_owned());
+            pool.insert(text.to_owned(), rc.clone());
+            rc
+        };
+        match &self.current_source {
+            Some(src) => lookup(&mut src.constants.borrow_mut()),
+            None => lookup(&mut self.str_constants),
         }
-        let rc = Rc::new(text.to_owned());
-        self.str_constants.insert(text.to_owned(), rc.clone());
-        rc
     }
 
     /// `sys.intern(s)`: the interned object equal to `s`, else `s` itself,
@@ -3600,7 +3616,14 @@ impl Interpreter {
         if let Some(rc) = self.interned.get(s.as_str()) {
             return rc.clone();
         }
-        self.interned.insert((**s).clone(), s.clone());
+        if let Some(rc) = self
+            .dyn_interned
+            .get(s.as_str())
+            .and_then(std::rc::Weak::upgrade)
+        {
+            return rc;
+        }
+        self.pool_weak(s);
         s.clone()
     }
 
@@ -3610,9 +3633,38 @@ impl Interpreter {
         if let Some(rc) = self.interned.get(text) {
             return rc.clone();
         }
-        let rc = Rc::new(text.to_owned());
+        // A string `sys.intern` (or a keyword name) already pooled weakly is
+        // the same object; it is pinned now that a constant refers to it.
+        let rc = self
+            .dyn_interned
+            .remove(text)
+            .and_then(|w| w.upgrade())
+            .unwrap_or_else(|| Rc::new(text.to_owned()));
         self.interned.insert(text.to_owned(), rc.clone());
         rc
+    }
+
+    /// The interned object for a runtime name (a `**kwargs` key): shared
+    /// with any constant or earlier use, but held weakly so data-derived
+    /// keys don't pile up for the whole run.
+    pub fn intern_weak(&mut self, text: &str) -> Rc<String> {
+        if let Some(rc) = self.interned.get(text) {
+            return rc.clone();
+        }
+        if let Some(rc) = self.dyn_interned.get(text).and_then(std::rc::Weak::upgrade) {
+            return rc;
+        }
+        let rc = Rc::new(text.to_owned());
+        self.pool_weak(&rc);
+        rc
+    }
+
+    fn pool_weak(&mut self, s: &Rc<String>) {
+        // Drop the entries nothing holds any more before the table grows.
+        if self.dyn_interned.len() >= 1024 && self.dyn_interned.len().is_power_of_two() {
+            self.dyn_interned.retain(|_, w| w.strong_count() > 0);
+        }
+        self.dyn_interned.insert((**s).clone(), Rc::downgrade(s));
     }
 
     pub fn eval_expr(&mut self, expr: &Expr, env: &EnvRef) -> Result<Value, Unwind> {
@@ -5848,7 +5900,7 @@ impl Interpreter {
             let mut map: DictMap = DictMap::new();
             // Keyword names are interned identifiers in CPython.
             for (k, v) in kwargs_left.drain(..) {
-                map.insert(HashKey::Str(self.intern_str(&k)), v);
+                map.insert(HashKey::Str(self.intern_weak(&k)), v);
             }
             env.set(
                 kw.name.as_str(),
@@ -6912,7 +6964,32 @@ impl Interpreter {
                 _ => Option::None,
             };
             let out = printf_format_with(self, fmt, &values, mapping.as_ref())?;
-            return Ok(Str(reuse_whole_str(out, &values)));
+            // `"%s" % s` (and `"%(k)s" % {"k": s}`, or a width / precision
+            // that changes nothing) hands back `s` itself.
+            let plain_s = |f: &str| {
+                f.strip_prefix('%')
+                    .and_then(|f| f.strip_suffix('s'))
+                    .is_some_and(|spec| {
+                        spec.chars()
+                            .all(|c| c.is_ascii_digit() || c == '-' || c == '.')
+                    })
+            };
+            let sole = match (fmt.as_str(), values.as_slice()) {
+                (f, [Str(v)]) if plain_s(f) => Some(v.clone()),
+                _ => match (fmt.strip_prefix("%(").and_then(|f| f.strip_suffix(")s")), r) {
+                    (Some(key), Dict(d)) if !key.contains(')') => {
+                        match d.borrow().get(&HashKey::Str(Rc::new(key.to_owned()))) {
+                            Some(Str(v)) => Some(v.clone()),
+                            _ => Option::None,
+                        }
+                    }
+                    _ => Option::None,
+                },
+            };
+            return Ok(Str(match sole {
+                Some(v) if *v == out => v,
+                _ => Rc::new(out),
+            }));
         }
 
         // PEP 461: bytes printf-style `%` formatting (`b"%d items" % 5`,
@@ -12588,19 +12665,6 @@ fn compute_slice(
         v => clamp_stop(slice_bound(v)?),
     };
     Ok((start, stop, step))
-}
-
-/// A formatted string that is exactly one of the `str` arguments: CPython's
-/// string writer hands back that argument itself (`"%s" % s is s`).
-pub(crate) fn reuse_whole_str(out: String, args: &[Value]) -> Rc<String> {
-    for a in args {
-        if let Value::Str(s) = a {
-            if **s == out {
-                return s.clone();
-            }
-        }
-    }
-    Rc::new(out)
 }
 
 /// The strings CPython caches as singletons: `""` and one Latin-1 character.
