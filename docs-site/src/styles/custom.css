@@ -192,7 +192,8 @@ table tbody tr:hover {
 }
 
 /* Make keyboard shortcuts (`<kbd>`) more distinct and resemble physical keys */
-.sl-markdown-content kbd:not(:where(.not-content *)) {
+.sl-markdown-content kbd:not(:where(.not-content *)),
+site-search kbd kbd {
   background-color: var(--sl-color-gray-6);
   border: 1px solid var(--sl-color-gray-4);
   border-bottom-width: 2px;
@@ -202,6 +203,14 @@ table tbody tr:hover {
   font-size: 0.85em;
   color: var(--sl-color-white);
   box-shadow: 0 1px 0 var(--sl-color-gray-5);
+}
+
+site-search > button > kbd {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 0;
+  gap: 0.25rem;
 }
 
 :focus-visible {
