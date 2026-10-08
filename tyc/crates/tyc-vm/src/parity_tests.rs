@@ -2111,6 +2111,17 @@ show(m.groupdict("z"), m.span("b"), m.groupdict(default="d"), m.groups(default="
 m = re.match(r"(a)(b)", "ab")
 show(m.expand(r"\0|\012|\101|\1\2|\08|\1x"), m.expand(template=r"\2"), re.sub("(a)", r"\101\0", "xa"))
 show(repr(re.match("a*", "a" * 100)))
+m = re.match("(a)(?P<n>b)?", "a")
+for t in [r"\9", r"\q", r"\g<x>", r"\g<9>", "\\a\\v", r"\-", r"\g<1", "x\\", r"\g<n>|\2", r"\g<-1>", r"\g<>", r"\gx"]:
+    try:
+        show(t, m.expand(t))
+    except Exception as e:
+        show(t, type(e).__name__, str(e))
+for f in [lambda: m.start(0, 1), lambda: m.groups(1, 2), lambda: m.expand("a", "b")]:
+    try:
+        show(f())
+    except TypeError as e:
+        show("TypeError", str(e))
 "#,
     );
 }

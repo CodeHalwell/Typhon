@@ -7222,97 +7222,130 @@ fn make_re_module() -> Value {
         }
         m
     }
-    // Expand a Python replacement template (`\1`, `\g<name>`, `\g<N>`, `\\`,
-    // `\n`/`\t`/`\r`) against a captures.
+    // Expand a Python replacement template (`\1`, `\g<name>`, `\g<N>`, octal
+    // and character escapes) against a match's groups, raising what
+    // CPython's template parser raises for a malformed one. `count` is the
+    // number of groups, group 0 included.
     fn expand_template<'g>(
         tpl: &str,
         group: &dyn Fn(usize) -> Option<&'g str>,
         names: &HashMap<String, usize>,
-    ) -> String {
+        count: usize,
+    ) -> Result<String, Unwind> {
+        let err = |msg: String, pos: usize| re_error(tpl, &format!("{msg} at position {pos}"));
         let ch: Vec<char> = tpl.chars().collect();
         let mut out = String::new();
+        let push_group = |out: &mut String, idx: usize| {
+            if let Some(m) = group(idx) {
+                out.push_str(m);
+            }
+        };
         let mut i = 0;
         while i < ch.len() {
-            if ch[i] == '\\' && i + 1 < ch.len() {
-                let n = ch[i + 1];
-                // Python's octal escapes: `\0` plus up to two more octal
-                // digits, or any three octal digits; otherwise one or two
-                // digits name a group.
-                let is_oct = |k: usize| ch.get(k).is_some_and(|c| ('0'..='7').contains(c));
-                let octal = if n == '0' {
-                    let mut j = i + 2;
-                    while j < i + 4 && is_oct(j) {
-                        j += 1;
-                    }
-                    Some(j)
-                } else if is_oct(i + 1) && is_oct(i + 2) && is_oct(i + 3) {
-                    Some(i + 4)
-                } else {
-                    None
-                };
-                if let Some(j) = octal {
-                    let digits: String = ch[i + 1..j].iter().collect();
-                    let code = u32::from_str_radix(&digits, 8).unwrap_or(0);
-                    if let Some(c) = char::from_u32(code) {
-                        out.push(c);
-                    }
-                    i = j;
-                    continue;
+            if ch[i] != '\\' {
+                out.push(ch[i]);
+                i += 1;
+                continue;
+            }
+            let Some(&n) = ch.get(i + 1) else {
+                return Err(err("bad escape (end of pattern)".into(), i));
+            };
+            // Python's octal escapes: `\0` plus up to two more octal digits,
+            // or any three octal digits; otherwise one or two digits name a
+            // group.
+            let is_oct = |k: usize| ch.get(k).is_some_and(|c| ('0'..='7').contains(c));
+            let octal = if n == '0' {
+                let mut j = i + 2;
+                while j < i + 4 && is_oct(j) {
+                    j += 1;
                 }
-                if n.is_ascii_digit() {
-                    let mut j = i + 1;
-                    let mut num = String::new();
-                    while j < ch.len() && ch[j].is_ascii_digit() && num.len() < 2 {
-                        num.push(ch[j]);
-                        j += 1;
+                Some(j)
+            } else if is_oct(i + 1) && is_oct(i + 2) && is_oct(i + 3) {
+                Some(i + 4)
+            } else {
+                None
+            };
+            if let Some(j) = octal {
+                let digits: String = ch[i + 1..j].iter().collect();
+                let code = u32::from_str_radix(&digits, 8).unwrap_or(0);
+                if let Some(c) = char::from_u32(code) {
+                    out.push(c);
+                }
+                i = j;
+                continue;
+            }
+            if n.is_ascii_digit() {
+                let mut j = i + 1;
+                while j < ch.len() && ch[j].is_ascii_digit() && j < i + 3 {
+                    j += 1;
+                }
+                let digits: String = ch[i + 1..j].iter().collect();
+                let idx: usize = digits.parse().unwrap_or(usize::MAX);
+                if idx >= count {
+                    return Err(err(format!("invalid group reference {digits}"), i + 1));
+                }
+                push_group(&mut out, idx);
+                i = j;
+                continue;
+            }
+            if n == 'g' {
+                if ch.get(i + 2) != Some(&'<') {
+                    return Err(err("missing <".into(), i + 2));
+                }
+                let start = i + 3;
+                let Some(close) = (start..ch.len()).find(|&k| ch[k] == '>') else {
+                    return Err(err("missing >, unterminated name".into(), start));
+                };
+                let name: String = ch[start..close].iter().collect();
+                if name.is_empty() {
+                    return Err(err("missing group name".into(), start));
+                }
+                let idx = if name.chars().all(|c| c.is_ascii_digit()) {
+                    let idx: usize = name.parse().unwrap_or(usize::MAX);
+                    if idx >= count {
+                        return Err(err(format!("invalid group reference {name}"), start));
                     }
-                    if let Ok(idx) = num.parse::<usize>() {
-                        if let Some(m) = group(idx) {
-                            out.push_str(m);
+                    idx
+                } else if name
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c == '_' || c.is_alphabetic())
+                    && name.chars().all(|c| c == '_' || c.is_alphanumeric())
+                {
+                    match names.get(&name) {
+                        Some(&idx) => idx,
+                        None => {
+                            return Err(index_error(format!("unknown group name '{name}'")));
                         }
                     }
-                    i = j;
-                    continue;
-                } else if n == 'g' && i + 2 < ch.len() && ch[i + 2] == '<' {
-                    let mut j = i + 3;
-                    let mut nm = String::new();
-                    while j < ch.len() && ch[j] != '>' {
-                        nm.push(ch[j]);
-                        j += 1;
-                    }
-                    if j < ch.len() {
-                        j += 1; // consume '>'
-                    }
-                    let idx = nm.parse::<usize>().ok().or_else(|| names.get(&nm).copied());
-                    if let Some(idx) = idx {
-                        if let Some(m) = group(idx) {
-                            out.push_str(m);
-                        }
-                    }
-                    i = j;
-                    continue;
-                } else if n == '\\' {
+                } else {
+                    return Err(err(format!("bad character in group name '{name}'"), start));
+                };
+                push_group(&mut out, idx);
+                i = close + 1;
+                continue;
+            }
+            match n {
+                'a' => out.push('\x07'),
+                'b' => out.push('\x08'),
+                'f' => out.push('\x0c'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'v' => out.push('\x0b'),
+                '\\' => out.push('\\'),
+                c if c.is_ascii_alphabetic() => {
+                    return Err(err(format!("bad escape \\{c}"), i));
+                }
+                // Any other escaped character stays as written.
+                c => {
                     out.push('\\');
-                    i += 2;
-                    continue;
-                } else if n == 'n' {
-                    out.push('\n');
-                    i += 2;
-                    continue;
-                } else if n == 't' {
-                    out.push('\t');
-                    i += 2;
-                    continue;
-                } else if n == 'r' {
-                    out.push('\r');
-                    i += 2;
-                    continue;
+                    out.push(c);
                 }
             }
-            out.push(ch[i]);
-            i += 1;
+            i += 2;
         }
-        out
+        Ok(out)
     }
     // `re.sub` honouring a callable replacement (called with each Match) or a
     // Python-syntax template string. `count == 0` means replace all.
@@ -7346,7 +7379,7 @@ fn make_re_module() -> Value {
             } else {
                 let tpl = repl.py_str();
                 let group = |i: usize| caps.get(i).map(|m| m.as_str());
-                out.push_str(&expand_template(&tpl, &group, &names));
+                out.push_str(&expand_template(&tpl, &group, &names, caps.len())?);
             }
             last = me;
             n += 1;
@@ -7697,6 +7730,12 @@ fn make_re_module() -> Value {
         attrs.insert(
             "groupdict".into(),
             Value::Native(Rc::new(NativeFn::new("groupdict", move |_i, args| {
+                if args.len() > 1 {
+                    return Err(type_error(format!(
+                        "groupdict() takes at most 1 argument ({} given)",
+                        args.len()
+                    )));
+                }
                 let default = args.first().cloned().unwrap_or(Value::None);
                 let mut by_index: Vec<(&String, &usize)> = names_d.iter().collect();
                 by_index.sort_by_key(|(_, idx)| **idx);
@@ -7716,6 +7755,12 @@ fn make_re_module() -> Value {
         attrs.insert(
             "groups".into(),
             Value::Native(Rc::new(NativeFn::new("groups", move |_i, args| {
+                if args.len() > 1 {
+                    return Err(type_error(format!(
+                        "groups() takes at most 1 argument ({} given)",
+                        args.len()
+                    )));
+                }
                 let default = args.first().cloned().unwrap_or(Value::None);
                 let out: Vec<Value> = gt2
                     .iter()
@@ -7736,6 +7781,12 @@ fn make_re_module() -> Value {
             attrs.insert(
                 which.into(),
                 Value::Native(Rc::new(NativeFn::new(name, move |_i, args| {
+                    if args.len() > 1 {
+                        return Err(type_error(format!(
+                            "{name} expected at most 1 argument, got {}",
+                            args.len()
+                        )));
+                    }
                     let g = match args.first() {
                         Some(a) => resolve(&names, sp.len(), a)?,
                         None => 0,
@@ -7761,8 +7812,19 @@ fn make_re_module() -> Value {
                     Some(Value::Str(s)) => s.clone(),
                     _ => return Err(type_error("expand() argument must be str")),
                 };
+                if args.len() > 1 {
+                    return Err(type_error(format!(
+                        "expand() takes at most 1 argument ({} given)",
+                        args.len()
+                    )));
+                }
                 let group = |i: usize| gt_e.get(i).and_then(|g| g.as_deref());
-                Ok(Value::Str(Rc::new(expand_template(&tpl, &group, &names_e))))
+                Ok(Value::Str(Rc::new(expand_template(
+                    &tpl,
+                    &group,
+                    &names_e,
+                    gt_e.len(),
+                )?)))
             }))),
         );
         attrs.insert("string".into(), ctx.string.clone());
