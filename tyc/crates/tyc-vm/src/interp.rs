@@ -71,6 +71,13 @@ pub struct Interpreter {
     /// The builtins as installed, before the program can rebind any of
     /// them: a class's `__bases__` keeps the real `list` after `list = 7`.
     builtin_globals: HashMap<String, Value>,
+    /// CPython's string constants and interned names: one shared object
+    /// per text, so `"ab" is "ab"` and `Box.__name__ is "Box"` hold while
+    /// a freshly built equal string stays a distinct object.
+    interned: HashMap<String, Rc<String>>,
+    /// The module's other string constants (not name-like, so CPython
+    /// shares them between equal literals but never interns them).
+    str_constants: HashMap<String, Rc<String>>,
     pub stack_depth: usize,
     pub max_stack_depth: usize,
     /// Byte offset (into the current source) of the statement being
@@ -277,6 +284,8 @@ impl Interpreter {
             current_offset: 0,
             async_iteration: false,
             builtin_globals: HashMap::new(),
+            interned: HashMap::new(),
+            str_constants: HashMap::new(),
             current_source: None,
             // Match CPython's default `sys.getrecursionlimit()` of 1000
             // (FINDINGS #31). The tree-walking interpreter still pays a
@@ -3528,8 +3537,10 @@ impl Interpreter {
                     continue;
                 }
                 let mut fields: crate::value::FieldMap = crate::value::FieldMap::new();
-                fields.insert("name".to_owned(), Value::Str(Rc::new(name.clone())));
-                fields.insert("_name_".to_owned(), Value::Str(Rc::new(name.clone())));
+                // The member's name is the interned identifier, one object.
+                let interned = Value::Str(self.intern_str(name));
+                fields.insert("name".to_owned(), interned.clone());
+                fields.insert("_name_".to_owned(), interned);
                 fields.insert("value".to_owned(), raw.clone());
                 fields.insert("_value_".to_owned(), raw.clone());
                 let member = Value::Instance(Rc::new(Instance {
@@ -3569,10 +3580,45 @@ impl Interpreter {
 
     // ── Expression evaluation ──────────────────────────────────────────────
 
+    /// A string literal's object: one per text, as CPython's compiler
+    /// shares equal constants. Name-like ones are interned as well.
+    pub fn str_constant(&mut self, text: &str) -> Rc<String> {
+        if text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return self.intern_str(text);
+        }
+        if let Some(rc) = self.str_constants.get(text) {
+            return rc.clone();
+        }
+        let rc = Rc::new(text.to_owned());
+        self.str_constants.insert(text.to_owned(), rc.clone());
+        rc
+    }
+
+    /// `sys.intern(s)`: the interned object equal to `s`, else `s` itself,
+    /// which becomes the interned one.
+    pub fn intern_rc(&mut self, s: &Rc<String>) -> Rc<String> {
+        if let Some(rc) = self.interned.get(s.as_str()) {
+            return rc.clone();
+        }
+        self.interned.insert((**s).clone(), s.clone());
+        s.clone()
+    }
+
+    /// The one shared object for `text`, as CPython's string constants and
+    /// `sys.intern` give.
+    pub fn intern_str(&mut self, text: &str) -> Rc<String> {
+        if let Some(rc) = self.interned.get(text) {
+            return rc.clone();
+        }
+        let rc = Rc::new(text.to_owned());
+        self.interned.insert(text.to_owned(), rc.clone());
+        rc
+    }
+
     pub fn eval_expr(&mut self, expr: &Expr, env: &EnvRef) -> Result<Value, Unwind> {
         match expr {
             Expr::NumberLiteral(n) => Ok(number_to_value(&n.value)),
-            Expr::StringLiteral(s) => Ok(Value::Str(Rc::new(s.value.to_str().to_owned()))),
+            Expr::StringLiteral(s) => Ok(Value::Str(self.str_constant(s.value.to_str()))),
             Expr::BytesLiteral(b) => {
                 let mut buf = Vec::new();
                 for part in b.value.iter() {
@@ -3923,6 +3969,18 @@ impl Interpreter {
     }
 
     fn eval_fstring(&mut self, f: &ast::ExprFString, env: &EnvRef) -> Result<Value, Unwind> {
+        // `f"{s}"` of a `str` is `s` itself, as CPython's `FORMAT_SIMPLE`
+        // gives: remember the lone interpolated `str`, if that is all there is.
+        let lone = match f.value.as_slice() {
+            [FStringPart::FString(fs)] => matches!(
+                &fs.elements[..],
+                [InterpolatedStringElement::Interpolation(one)]
+                    if one.debug_text.is_none()
+                        && matches!(one.conversion, ast::ConversionFlag::None | ast::ConversionFlag::Str)
+            ),
+            _ => false,
+        };
+        let mut lone_str: Option<Rc<String>> = None;
         let mut out = String::new();
         for part in f.value.iter() {
             match part {
@@ -3933,6 +3991,9 @@ impl Interpreter {
                             InterpolatedStringElement::Literal(lit) => out.push_str(&lit.value),
                             InterpolatedStringElement::Interpolation(interp) => {
                                 let v = self.eval_expr(&interp.expression, env)?;
+                                if let (true, Value::Str(sv)) = (lone, &v) {
+                                    lone_str = Some(sv.clone());
+                                }
                                 // PEP 501 self-documenting `=` debug
                                 // specifier: `f"{val=}"` emits the verbatim
                                 // source text (the expression, `=`, and any
@@ -4005,6 +4066,11 @@ impl Interpreter {
                         }
                     }
                 }
+            }
+        }
+        if let Some(sv) = lone_str {
+            if *sv == out {
+                return Ok(Value::Str(sv));
             }
         }
         Ok(Value::Str(Rc::new(out)))
@@ -5780,8 +5846,9 @@ impl Interpreter {
 
         if let Some(kw) = &params.kwarg {
             let mut map: DictMap = DictMap::new();
+            // Keyword names are interned identifiers in CPython.
             for (k, v) in kwargs_left.drain(..) {
-                map.insert(HashKey::Str(Rc::new(k)), v);
+                map.insert(HashKey::Str(self.intern_str(&k)), v);
             }
             env.set(
                 kw.name.as_str(),
@@ -6844,12 +6911,8 @@ impl Interpreter {
                 // absent case has to be spelled out.
                 _ => Option::None,
             };
-            return Ok(Str(Rc::new(printf_format_with(
-                self,
-                fmt,
-                &values,
-                mapping.as_ref(),
-            )?)));
+            let out = printf_format_with(self, fmt, &values, mapping.as_ref())?;
+            return Ok(Str(reuse_whole_str(out, &values)));
         }
 
         // PEP 461: bytes printf-style `%` formatting (`b"%d items" % 5`,
@@ -6882,6 +6945,13 @@ impl Interpreter {
 
         // Strings.
         if let (Str(a), Add, Str(b)) = (l, op, r) {
+            // Adding `""` hands back the other operand itself, as in CPython.
+            if b.is_empty() {
+                return Ok(Str(a.clone()));
+            }
+            if a.is_empty() {
+                return Ok(Str(b.clone()));
+            }
             return Ok(Str(Rc::new(format!("{}{}", a, b))));
         }
         // The length limit counts characters, as CPython's does; a result
@@ -6892,6 +6962,9 @@ impl Interpreter {
                 n,
                 repeated_too_long("repeated string is too long"),
             )?;
+            if n == 1 {
+                return Ok(Str(a.clone()));
+            }
             return Ok(Str(Rc::new(crate::limits::try_repeat_str(a, n)?)));
         }
 
@@ -7237,7 +7310,20 @@ impl Interpreter {
             if t.len() == 4 {
                 if let Value::Str(tag) = &t[0] {
                     if tag.as_str() == "__slice__" {
-                        return self.slice_target(target, &t[1], &t[2], &t[3]);
+                        let out = self.slice_target(target, &t[1], &t[2], &t[3])?;
+                        // A whole forward slice of a `str` is the string
+                        // itself (`s[:] is s`), as in CPython.
+                        if let (Value::Str(whole), Value::Str(part)) = (target, &out) {
+                            let unit_step = match &t[3] {
+                                Value::None => true,
+                                Value::Int(n) => *n == VmInt::from(1),
+                                _ => false,
+                            };
+                            if unit_step && part.len() == whole.len() {
+                                return Ok(Value::Str(whole.clone()));
+                            }
+                        }
+                        return Ok(out);
                     }
                 }
             }
@@ -7944,10 +8030,10 @@ impl Interpreter {
             Value::Class(class) => {
                 // `Cls.__name__` / `type(x).__name__`.
                 if attr == "__name__" {
-                    return Ok(Value::Str(Rc::new(class.name.clone())));
+                    return Ok(Value::Str(self.intern_str(&class.name)));
                 }
                 if attr == "__qualname__" {
-                    return Ok(Value::Str(Rc::new(class.effective_qualname())));
+                    return Ok(Value::Str(self.intern_str(&class.effective_qualname())));
                 }
                 // `Cls.__mro__` — the C3 linearisation, ending in `object`.
                 if attr == "__mro__" || attr == "__bases__" {
@@ -8208,9 +8294,9 @@ impl Interpreter {
                 .cloned()
                 .expect("checked by the guard")),
             // `func.__name__` / `func.__qualname__`.
-            Value::Function(f) if attr == "__name__" => Ok(Value::Str(Rc::new(f.name.clone()))),
+            Value::Function(f) if attr == "__name__" => Ok(Value::Str(self.intern_str(&f.name))),
             Value::Function(f) if attr == "__qualname__" => {
-                Ok(Value::Str(Rc::new(f.qualname.to_string())))
+                Ok(Value::Str(self.intern_str(&f.qualname)))
             }
             // `func.__doc__`: what a decorator (`functools.update_wrapper`)
             // set on it, else the body's docstring, else `None` — every
@@ -8240,7 +8326,7 @@ impl Interpreter {
                 Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(map))))
             }
             Value::Native(n) if attr == "__name__" || attr == "__qualname__" => {
-                Ok(Value::Str(Rc::new(n.name.to_string())))
+                Ok(Value::Str(self.intern_str(n.name)))
             }
             // `ValueError.__mro__` / `KeyError.__bases__` — a builtin
             // exception type's place in the standard hierarchy.
@@ -8284,10 +8370,10 @@ impl Interpreter {
                 Ok(builtin_type_method(n.name, attr).expect("checked by the guard"))
             }
             Value::BoundMethod { function, .. } if attr == "__name__" => {
-                Ok(Value::Str(Rc::new(function.name.clone())))
+                Ok(Value::Str(self.intern_str(&function.name)))
             }
             Value::BoundMethod { function, .. } if attr == "__qualname__" => {
-                Ok(Value::Str(Rc::new(function.effective_qualname())))
+                Ok(Value::Str(self.intern_str(&function.effective_qualname())))
             }
             Value::ResultOk(v) => match attr {
                 "value" => Ok((**v).clone()),
@@ -12504,6 +12590,29 @@ fn compute_slice(
     Ok((start, stop, step))
 }
 
+/// A formatted string that is exactly one of the `str` arguments: CPython's
+/// string writer hands back that argument itself (`"%s" % s is s`).
+pub(crate) fn reuse_whole_str(out: String, args: &[Value]) -> Rc<String> {
+    for a in args {
+        if let Value::Str(s) = a {
+            if **s == out {
+                return s.clone();
+            }
+        }
+    }
+    Rc::new(out)
+}
+
+/// The strings CPython caches as singletons: `""` and one Latin-1 character.
+fn is_str_singleton(s: &str) -> bool {
+    let mut chars = s.chars();
+    match (chars.next(), chars.next()) {
+        (None, _) => true,
+        (Some(c), None) => (c as u32) < 256,
+        _ => false,
+    }
+}
+
 fn values_identical(a: &Value, b: &Value) -> bool {
     use Value::*;
     match (a, b) {
@@ -12511,7 +12620,10 @@ fn values_identical(a: &Value, b: &Value) -> bool {
         (Bool(x), Bool(y)) => x == y,
         (FloatData(x), FloatData(y)) => x.identity != 0 && x.identity == y.identity,
         (Int(x), Int(y)) => x == y,
-        (Str(x), Str(y)) => Rc::ptr_eq(x, y) || x == y,
+        // CPython keeps one object per text only for constants, interned
+        // names and the empty / one-Latin-1-character singletons; any other
+        // freshly built string is its own object.
+        (Str(x), Str(y)) => Rc::ptr_eq(x, y) || (x == y && is_str_singleton(x)),
         (List(x), List(y)) => Rc::ptr_eq(x, y),
         (Tuple(x), Tuple(y)) => Rc::ptr_eq(x, y),
         (Dict(x), Dict(y)) => Rc::ptr_eq(x, y),

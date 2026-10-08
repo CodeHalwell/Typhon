@@ -305,6 +305,12 @@ pub fn install(interp: &mut Interpreter) {
                 )?)));
             }
         }
+        // `str(s)` of a `str` is `s` itself.
+        if let [Value::Str(s)] = pos {
+            if kw.is_empty() {
+                return Ok(Value::Str(s.clone()));
+            }
+        }
         Ok(Value::Str(Rc::new(match pos.first() {
             Some(v) => interp.str_of(v)?,
             None => String::new(),
@@ -544,6 +550,10 @@ pub fn install(interp: &mut Interpreter) {
         // A user `__format__(self, spec)` controls its own formatting.
         if let Some(formatted) = interp.try_user_format(v, &spec)? {
             return Ok(Value::Str(Rc::new(formatted)));
+        }
+        // `format(s)` / `format(s, "")` of a `str` is `s` itself.
+        if let (Value::Str(s), true) = (v, spec.is_empty()) {
+            return Ok(Value::Str(s.clone()));
         }
         let base = interp.format_default(v, &spec)?;
         Ok(Value::Str(Rc::new(crate::interp::format_with_spec_pub(
@@ -6161,6 +6171,16 @@ fn make_sys_module(interp: &Interpreter) -> Value {
                 }),
             ),
             (
+                "intern",
+                nf("intern", |i, args| match single(&args, "intern")? {
+                    Value::Str(s) => Ok(Value::Str(i.intern_rc(s))),
+                    other => Err(type_error(format!(
+                        "intern() argument must be str, not {}",
+                        other.type_name()
+                    ))),
+                }),
+            ),
+            (
                 "getrecursionlimit",
                 nf("getrecursionlimit", |i, _args| {
                     Ok(Value::Int(VmInt::from(i.max_stack_depth as i64)))
@@ -10347,7 +10367,10 @@ pub fn dispatch_method(
     }
     match (&receiver, name) {
         // ── str methods ────────────────────────────────────────────────────
-        (Value::Str(s), m) => str_method(interp, s, m, rest, &kwargs),
+        (Value::Str(s), m) => {
+            let out = str_method(interp, s, m, rest, &kwargs)?;
+            Ok(keep_unchanged_str(s, m, out))
+        }
         // ── bytes methods ──────────────────────────────────────────────────
         (Value::Bytes(b), m) => bytes_method(b, m, rest, &kwargs),
         // ── list methods ───────────────────────────────────────────────────
@@ -10501,6 +10524,45 @@ pub fn str_maketrans(args: &[Value]) -> Result<Value, Unwind> {
     Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(map))))
 }
 
+/// CPython's `str` methods hand back the receiver itself, not a copy, when
+/// they change nothing (`s.strip() is s` for an unpadded `s`), and a split
+/// that finds no separator returns the receiver as its only piece.
+fn keep_unchanged_str(s: &Rc<String>, name: &str, out: Value) -> Value {
+    let same = |v: &Value| matches!(v, Value::Str(r) if !Rc::ptr_eq(r, s) && **r == **s);
+    match name {
+        "strip" | "lstrip" | "rstrip" | "replace" | "ljust" | "rjust" | "center" | "zfill"
+        | "expandtabs" | "removeprefix" | "removesuffix"
+            if same(&out) =>
+        {
+            Value::Str(s.clone())
+        }
+        "split" | "rsplit" | "splitlines" => {
+            if let Value::List(l) = &out {
+                let mut items = l.borrow_mut();
+                if items.len() == 1 && same(&items[0]) {
+                    items[0] = Value::Str(s.clone());
+                }
+            }
+            out
+        }
+        "partition" | "rpartition" => match &out {
+            Value::Tuple(t) if t.iter().any(same) => Value::Tuple(Rc::new(
+                t.iter()
+                    .map(|v| {
+                        if same(v) {
+                            Value::Str(s.clone())
+                        } else {
+                            v.clone()
+                        }
+                    })
+                    .collect(),
+            )),
+            _ => out,
+        },
+        _ => out,
+    }
+}
+
 fn str_method(
     interp: &mut Interpreter,
     s: &Rc<String>,
@@ -10626,16 +10688,21 @@ fn str_method(
                 .first()
                 .ok_or_else(|| type_error("str.join requires an iterable"))?
                 .clone();
-            let mut parts: Vec<String> = Vec::new();
+            let mut parts: Vec<Rc<String>> = Vec::new();
+            // Whether every item was a plain `str` (not a `StrEnum` member).
+            let mut exact = true;
             let it = interp.make_iter(iterable)?;
             while let Some(v) = interp.iter_next(&it)? {
                 // A `StrEnum` member *is* its string, so it joins like one.
                 let v = match crate::value::enum_mixin_value(&v) {
-                    Some(inner @ Value::Str(_)) => inner,
+                    Some(inner @ Value::Str(_)) => {
+                        exact = false;
+                        inner
+                    }
                     _ => v,
                 };
                 match v {
-                    Value::Str(s) => parts.push((*s).clone()),
+                    Value::Str(s) => parts.push(s),
                     other => {
                         return Err(type_error(format!(
                             "sequence item: expected str instance, {} found",
@@ -10644,7 +10711,18 @@ fn str_method(
                     }
                 }
             }
-            Value::Str(Rc::new(parts.join(s)))
+            // CPython hands back a lone `str` item itself.
+            if parts.len() == 1 && exact {
+                return Ok(Value::Str(parts.pop().unwrap()));
+            }
+            let mut out = String::new();
+            for (i, p) in parts.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(s);
+                }
+                out.push_str(p);
+            }
+            Value::Str(Rc::new(out))
         }
         "replace" => {
             let from = args
@@ -10971,7 +11049,14 @@ fn str_method(
             // via the trailing kwargs sentinel that `call_value` appends for
             // bound builtin methods (see make_kwargs_sentinel / split_kwargs).
             let (pos_args, kwargs) = split_kwargs(args);
-            return str_format(interp, s, pos_args, &kwargs);
+            return Ok(match str_format(interp, s, pos_args, &kwargs)? {
+                Value::Str(out) => {
+                    let mut all: Vec<Value> = pos_args.to_vec();
+                    all.extend(kwargs.iter().map(|(_, v)| v.clone()));
+                    Value::Str(crate::interp::reuse_whole_str((*out).clone(), &all))
+                }
+                other => other,
+            });
         }
         // `str.format_map(m)` is `format(**m)` without copying the mapping —
         // and, unlike `format`, it accepts non-string keys, which simply

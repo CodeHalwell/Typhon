@@ -2139,3 +2139,39 @@ show(re.search("l", s).string is s, c.match(s, 2).string is s, re.sub("e", lambd
 "#,
     );
 }
+
+#[test]
+fn str_identity_follows_cpython_objects() {
+    assert_matches_cpython(
+        "str_identity_follows_cpython_objects",
+        r#"import sys
+from enum import Enum
+class Color(Enum):
+    RED = 1
+class Box:
+    pass
+def ident(x):
+    return x
+def kw(**k):
+    return list(k)
+c = "".join(["hello", " world"])
+w = "".join(["he", "llo"])
+lit = "hello world"
+name = "hello"
+show(lit is "hello world", c is lit, w is name, ident("hello world") is lit, c is c)
+show(str(c) is c, c[:] is c, c[0:] is c, c[::1] is c, c[::-1] is c, c[1:] is c)
+show((c + "") is c, ("" + c) is c, (c * 1) is c, f"{c}" is c, f"{c!s}" is c, f"{c!r}" is c, f"<{c}>" is c)
+show("".join([c]) is c, ", ".join([c]) is c, format(c) is c, format(c, "") is c, ("%s" % c) is c, "{}".format(c) is c)
+show(c.strip() is c, c.rstrip("z") is c, c.replace("zz", "y") is c, c.ljust(3) is c, c.zfill(1) is c, c.removeprefix("zz") is c)
+show(c.split("zz")[0] is c, w.split()[0] is w, c.partition("zz")[0] is c, c.rpartition("zz")[2] is c, c.splitlines()[0] is c)
+show(c.lower() is c, c.title() is c, c.strip("h") is c, c.replace("l", "L") is c)
+show(sys.intern(w) is name, sys.intern(c) is c, max([c]) is c, next(iter({c: 1})) is c, next(iter({c})) is c)
+show(Box.__name__ is "Box", Box.__name__ is Box.__name__, ident.__name__ is "ident", Color.RED.name is "RED", kw(alpha=1)[0] is "alpha")
+show(c[0] is "h", "".join([]) is "", c[0:0] is "", getattr(Box, "__name__") is "Box", repr(c) is repr(c))
+try:
+    sys.intern(1)
+except TypeError as e:
+    show(str(e))
+"#,
+    );
+}
