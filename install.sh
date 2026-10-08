@@ -216,7 +216,13 @@ tarball_url="$base_url/$tarball_name"
 checksums_url="$base_url/$checksums_name"
 
 tmpdir="$(mktemp -d)"
-trap 'rm -rf "$tmpdir"' EXIT INT HUP TERM
+# Clean up on every exit. A signal handler that only cleaned up would return
+# and let the script carry on without its temporary directory, so each signal
+# exits instead (128 + signal number), which runs the EXIT trap.
+trap 'rm -rf "$tmpdir"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 say "Downloading $tarball_name"
 say "  from $tarball_url"

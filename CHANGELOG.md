@@ -29,6 +29,11 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   `outer.<locals>.inc` / `Cls.meth` qualname instead of the bare name, and a
   local dataclass's repr and a local class's `repr()` use it too
   (`outer.<locals>.P(x=1)`, `<class '__main__.outer.<locals>.P'>`).
+- **`install.sh` stops when it is interrupted.** Its `INT`, `HUP` and `TERM`
+  traps removed the temporary download directory and then returned, so a
+  `TERM` sent to the installer let it carry on and fail later, or report
+  success, without its files. Cleanup stays on `EXIT`, and each signal now
+  exits with 128 plus the signal number.
 - **`lru_cache` helpers route to CPython.** The VM's `functools.cache`/`lru_cache` wrapper has no `cache_info()`, `cache_clear()` or `cache_parameters()`, so `tyc run` raised `AttributeError` where CPython answers; a program that names any of them now runs under CPython instead.
 - **`field(repr=False)` and friends route to CPython.** The VM ignores
   `dataclasses.field`'s `repr=` / `compare=` / `init=` / `hash=` /
