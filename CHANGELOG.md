@@ -25,7 +25,7 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   the same object too: `str(s)`, `s[:]`, `s + ""`, `s * 1`, `f"{s}"`,
   `"".join([s])`, `format(s)`, `"%s" % s`, and `strip` / `replace` /
   `ljust` / `split` and friends when they change nothing. `sys.intern` is
-  now available.
+  now available, and so is `x.__format__(spec)` on builtin values.
 - **`re.Match` offsets are in characters, and take a group.** Under `tyc
   run`, `start()`, `end()` and `span()` reported the regex engine's byte
   offsets, so any match after a non-ASCII character was off, and they

@@ -2175,7 +2175,13 @@ show(format(c, "1") is c, format(c, "20") is c, format(c, ".3") is c, "{:1}".for
 def _named() -> int:
     return 0
 _named.__qualname__ = c
-show(_named.__qualname__ is c)
+show(_named.__qualname__ is c, c.__str__() is c, c.__format__("") is c, c.__format__("5") is c, c.__format__("20") is c)
+show((5).__format__("03"), (2.5).__format__(".1f"), [1].__format__(""))
+for _bad in (lambda: c.__format__(1), lambda: (5).__format__(), lambda: c.__format__("a", "b")):
+    try:
+        _bad()
+    except TypeError as e:
+        show(str(e))
 show(("%(k)1s" % {"k": c}) is c, ("%(k)#s" % {"k": c}) is c, ("%(k).20s" % {"k": c}) is c, ("%(k).3s" % {"k": c}) is c)
 show(("%#s" % c) is c, ("%-#5s" % c) is c, ("%+s" % c) is c, ("% s" % c) is c, f"{c:3}" is c, f"{c:20}" is c, f"{c!r}" is c)
 show(c.partition(c2)[1] is c2, c.partition(c2)[1] is c, c.rpartition("zz")[0] is c, c.partition("zz")[2] is c)

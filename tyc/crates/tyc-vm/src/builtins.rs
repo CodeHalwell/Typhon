@@ -10364,8 +10364,38 @@ pub fn dispatch_method(
     // per-type tables below do not carry them.
     match name {
         "__repr__" => return Ok(Value::Str(Rc::new(interp.repr_of(&receiver)?))),
-        "__str__" | "__format__" if rest.is_empty() || name == "__str__" => {
-            return Ok(Value::Str(Rc::new(interp.str_of(&receiver)?)))
+        // `s.__str__()` of a `str` is `s` itself.
+        "__str__" => {
+            if let Value::Str(s) = &receiver {
+                return Ok(Value::Str(s.clone()));
+            }
+            return Ok(Value::Str(Rc::new(interp.str_of(&receiver)?)));
+        }
+        // `x.__format__(spec)` is `format(x, spec)` for a builtin value; a
+        // `str` that the spec leaves unchanged is handed back itself.
+        "__format__" => {
+            let spec = match rest {
+                [Value::Str(spec)] => spec,
+                [other] => {
+                    return Err(type_error(format!(
+                        "__format__() argument must be str, not {}",
+                        other.type_name()
+                    )))
+                }
+                _ => {
+                    return Err(type_error(format!(
+                        "{}.__format__() takes exactly one argument ({} given)",
+                        receiver.type_name(),
+                        rest.len()
+                    )))
+                }
+            };
+            let base = interp.format_default(&receiver, spec)?;
+            let out = crate::interp::format_with_spec_pub(&receiver, &base, spec)?;
+            return Ok(match &receiver {
+                Value::Str(s) if **s == out => Value::Str(s.clone()),
+                _ => Value::Str(Rc::new(out)),
+            });
         }
         "__len__" => {
             return Ok(Value::Int(VmInt::from(value_len(&receiver)? as i64)));
