@@ -719,10 +719,13 @@ fn unmodelled_attribute_references(
     for (callee, keywords) in &scan.keyword_calls {
         let (module, function): (Option<String>, &str) = match callee {
             KeywordCallee::Name(name) => {
-                if scan.shadowed.contains(name) {
+                if let Some((module, member)) = scan.from_bound.get(name) {
+                    (Some(module.clone()), member.as_str())
+                } else if scan.shadowed.contains(name) {
                     continue;
+                } else {
+                    (None, name.as_str())
                 }
-                (None, name.as_str())
             }
             KeywordCallee::Chain(root, chain) => {
                 let last = chain.last().map(String::as_str).unwrap_or_default();
@@ -821,6 +824,11 @@ struct AttributeScan {
     /// `(module, member)` for every `from module import member` where the
     /// module is one the VM models.
     from_imports: Vec<(String, String)>,
+    /// Bound name → `(module, member)` for those from-imports, so a keyword
+    /// call through the bare name (`field(repr=False)`) is checked against
+    /// the module function. A later rebinding is not tracked: a false match
+    /// only sends the program to CPython, which is always safe.
+    from_bound: std::collections::HashMap<String, (String, String)>,
     /// Every bare name read — checked against the CPython builtins the VM
     /// lacks.
     name_loads: std::collections::BTreeSet<String>,
@@ -876,9 +884,17 @@ enum KeywordCallee {
 }
 
 /// Attributes of builtin values the VM does not model, which a program
-/// reaches only by name (`e.add_note(…)`, `e.__notes__`).
-const UNMODELLED_ATTRIBUTES: &[&str] =
-    &["add_note", "__notes__", "with_traceback", "__traceback__"];
+/// reaches only by name (`e.add_note(…)`, `e.__notes__`, an
+/// `lru_cache` wrapper's `f.cache_info()`).
+const UNMODELLED_ATTRIBUTES: &[&str] = &[
+    "add_note",
+    "__notes__",
+    "with_traceback",
+    "__traceback__",
+    "cache_info",
+    "cache_clear",
+    "cache_parameters",
+];
 
 /// The last segment of a name or dotted attribute (`abc.ABCMeta` →
 /// `ABCMeta`).
@@ -1143,6 +1159,10 @@ impl<'a> ruff_python_ast::visitor::Visitor<'a> for AttributeScan {
                         if alias.name.as_str() != "*" {
                             self.from_imports
                                 .push((module.clone(), alias.name.as_str().to_owned()));
+                            self.from_bound.insert(
+                                bound.to_owned(),
+                                (module.clone(), alias.name.as_str().to_owned()),
+                            );
                         }
                     }
                 }
@@ -1537,8 +1557,23 @@ mod tests {
         let got =
             scan_source("import json\nprint(json.dumps({}, default=str))\n").unwrap_or_default();
         assert!(got.contains(&"json.dumps(default=…)".to_owned()), "{got:?}");
+        // The same check through a from-imported bare name.
+        let got = scan_source(
+            "from dataclasses import dataclass, field\n@dataclass\nclass C:\n    n: int = field(default=0, repr=False)\nprint(C())\n",
+        )
+        .unwrap_or_default();
+        assert_eq!(got, vec!["dataclasses.field(repr=…)".to_owned()]);
+        assert_eq!(
+            scan_source("from json import dumps as d\nprint(d({}, indent=2))\n"),
+            None
+        );
         let got = scan_source("e = ValueError(\"v\")\ne.add_note(\"n\")\n").unwrap_or_default();
         assert!(got.contains(&".add_note".to_owned()), "{got:?}");
+        let got = scan_source(
+            "from functools import lru_cache\n@lru_cache\ndef f(n: int) -> int:\n    return n\nf(1)\nprint(f.cache_info())\n",
+        )
+        .unwrap_or_default();
+        assert!(got.contains(&".cache_info".to_owned()), "{got:?}");
         // Keywords the VM binds stay on the VM.
         assert_eq!(
             scan_source("import json\nimport math\nprint(round(2.5, ndigits=0), int(\"ff\", base=16), math.prod([2], start=3), json.loads(\"{}\", object_hook=dict), \"a b\".split(maxsplit=1))\n"),

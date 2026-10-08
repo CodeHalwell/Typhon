@@ -90,7 +90,7 @@ def main() -> None:
     @functools.lru_cache(maxsize=None)
     def fib(n: int) -> int:
         return n if n < 2 else fib(n - 1) + fib(n - 2)
-    print("  lru", fib(50), fib.cache_info().hits > 0 if False else "skip")
+    print("  lru", fib(50), "skip")
     @functools.cache
     def sq(n: int) -> int:
         print("  compute", n)
