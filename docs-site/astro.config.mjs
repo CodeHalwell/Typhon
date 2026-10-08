@@ -48,7 +48,7 @@ export default defineConfig({
           tag: 'meta',
           attrs: {
             name: 'theme-color',
-            content: '#0f172a',
+            content: '#0b1112',
           },
         },
       ],
@@ -56,7 +56,7 @@ export default defineConfig({
       pagination: true,
       tableOfContents: { minHeadingLevel: 2, maxHeadingLevel: 4 },
       expressiveCode: {
-        themes: ['github-dark-default', 'github-light'],
+        themes: ['github-dark-default'],
         styleOverrides: {
           borderRadius: '0.5rem',
         },
