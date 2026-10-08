@@ -16,6 +16,14 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ### Fixed
 
+- **`lru_cache` helpers route to CPython.** The VM's `functools.cache`/`lru_cache` wrapper has no `cache_info()`, `cache_clear()` or `cache_parameters()`, so `tyc run` raised `AttributeError` where CPython answers; a program that names any of them now runs under CPython instead.
+- **`field(repr=False)` and friends route to CPython.** The VM ignores
+  `dataclasses.field`'s `repr=` / `compare=` / `init=` / `hash=` /
+  `kw_only=` options, and the pre-run scan only checked keyword calls made
+  through a module (`dataclasses.field(...)`). A call through a
+  from-imported name (`from dataclasses import field`) is now checked too,
+  so `tyc run` hands such programs to CPython instead of printing a field
+  the dataclass hides.
 - **String case with titlecase letters, uncased letters and final sigma.**
   Under `tyc run`, `str.istitle()`, `title()`, `islower()` and `isupper()`
   treat titlecase letters such as `ǅ` as cased but neither upper nor lower,
