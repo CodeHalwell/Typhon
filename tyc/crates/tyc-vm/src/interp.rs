@@ -3796,9 +3796,14 @@ impl Interpreter {
                 let slots = g.generators.len() + usize::from(g.elt.is_starred_expr());
                 let mut iters: Vec<Option<Value>> = (0..slots).map(|_| None).collect();
                 iters[0] = Some(it);
+                // A generator expression is its own scope (list, set and
+                // dict comprehensions are inlined since 3.12), so a lambda
+                // in it is `f.<locals>.<genexpr>.<lambda>`.
+                let genexpr_env = Env::new_child(env);
+                genexpr_env.set_qual_scope(Rc::from(env.qualname_for("<genexpr>")), false);
                 let state = GenExprState {
                     node: Rc::new(g.clone()),
-                    env: Env::new_child(env),
+                    env: genexpr_env,
                     iters,
                     finished: false,
                     running: false,

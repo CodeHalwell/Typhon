@@ -2083,6 +2083,11 @@ def f():
     pass
 f.__qualname__ = "g.h"
 show(R.__qualname__, repr(R(1)), repr(R), f.__qualname__)
+def lams():
+    a = next(lambda: 0 for _ in [1]).__qualname__
+    b = [lambda: 0 for _ in [1]][0].__qualname__
+    return a, b
+show(lams(), next(lambda: 0 for _ in [1]).__qualname__)
 "#,
     );
 }
