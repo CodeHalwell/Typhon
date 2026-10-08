@@ -2037,3 +2037,44 @@ for t in ["ΑΣ ΣΑΣ", "ΑΣ", "ΑΣ1", "όΣ", "ΣΑΣ. ΟΔΟΣ"]:
 "#,
     );
 }
+
+#[test]
+fn qualname_follows_lexical_nesting() {
+    assert_matches_cpython(
+        "qualname_follows_lexical_nesting",
+        r#"from dataclasses import dataclass
+def outer():
+    def inc(x):
+        return x + 1
+    @dataclass
+    class P:
+        x: int
+    class L:
+        def m(self):
+            def h():
+                pass
+            return h
+    show(inc.__qualname__, inc.__name__, (lambda: 0).__qualname__)
+    show(P.__qualname__, P.__name__, repr(P(1)), repr(P))
+    show(L.m.__qualname__, L().m.__qualname__, L().m().__qualname__)
+    return inc
+class Top:
+    def meth(self):
+        def h():
+            pass
+        return h
+    @staticmethod
+    def s():
+        return 0
+def gen():
+    def g():
+        pass
+    yield g.__qualname__
+    def g2():
+        pass
+    yield g2.__qualname__
+show(outer().__qualname__, Top.meth.__qualname__, Top().meth().__qualname__, Top.s.__qualname__)
+show(Top.__qualname__, list(gen()), (lambda: 0).__qualname__)
+"#,
+    );
+}

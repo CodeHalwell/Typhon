@@ -1664,6 +1664,7 @@ pub fn install(interp: &mut Interpreter) {
             name,
             Value::Class(Rc::new(crate::value::Class {
                 name: name.to_owned(),
+                qualname: name.to_owned(),
                 methods: std::cell::RefCell::new(HashMap::new()),
                 fields: vec![],
                 class_attrs: std::cell::RefCell::new(HashMap::new()),
@@ -2701,6 +2702,7 @@ fn make_collections_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
             Value::Dict(Rc::new(crate::value::FrozenCell::new(field_defaults))),
         );
         let cls = Rc::new(crate::value::Class {
+            qualname: typename.clone(),
             name: typename,
             // Inherited through the MRO, not copied: CPython names
             // `Point._make` as defined on the template's class.
@@ -2828,6 +2830,7 @@ fn type_new(interp: &Interpreter, args: &[Value]) -> Result<Value, Unwind> {
         ))
     })?;
     Ok(Value::Class(Rc::new(crate::value::Class {
+        qualname: name.clone(),
         name,
         methods: RefCell::new(methods),
         fields: vec![],
@@ -3006,6 +3009,7 @@ fn mark_function(v: &Value, classmethod: bool, staticmethod: bool) -> Value {
     };
     Value::Function(Rc::new(crate::value::Function {
         name: f.name.clone(),
+        qualname: f.qualname.clone(),
         params: f.params.clone(),
         body: f.body.clone(),
         defaults: f.defaults.clone(),
@@ -7856,6 +7860,7 @@ thread_local! {
 fn bare_shim_class(name: &str) -> crate::value::Class {
     crate::value::Class {
         name: name.to_owned(),
+        qualname: name.to_owned(),
         methods: RefCell::new(HashMap::new()),
         fields: vec![],
         class_attrs: RefCell::new(HashMap::new()),
@@ -9111,6 +9116,7 @@ fn make_pydantic_module() -> Value {
     )]);
     let base_model = Value::Class(Rc::new(crate::value::Class {
         name: "BaseModel".to_owned(),
+        qualname: "BaseModel".to_owned(),
         methods: std::cell::RefCell::new(HashMap::new()),
         fields: vec![],
         class_attrs: std::cell::RefCell::new(base_model_attrs),
@@ -9245,6 +9251,7 @@ fn intern_shim_name(name: String) -> &'static str {
 pub(crate) fn native_object(class_name: &str, fields: Vec<(&str, Value)>) -> Value {
     let cls = Rc::new(crate::value::Class {
         name: class_name.to_owned(),
+        qualname: class_name.to_owned(),
         methods: RefCell::new(HashMap::new()),
         fields: vec![],
         class_attrs: RefCell::new(HashMap::new()),
@@ -9737,6 +9744,7 @@ thread_local! {
     /// (annotation text) and `default`.
     static DATACLASS_FIELD_CLASS: Rc<crate::value::Class> = Rc::new(crate::value::Class {
         name: "Field".to_owned(),
+        qualname: "Field".to_owned(),
         methods: RefCell::new(HashMap::new()),
         fields: ["name", "type", "default"]
             .iter()
@@ -13018,6 +13026,7 @@ thread_local! {
         );
         Rc::new(crate::value::Class {
             name: "JSONDecodeError".to_owned(),
+            qualname: "JSONDecodeError".to_owned(),
             methods: RefCell::new(HashMap::new()),
             fields: vec![],
             class_attrs: RefCell::new(attrs),
@@ -14079,6 +14088,7 @@ pub fn make_builtin_type(name: &str) -> Value {
             .or_insert_with(|| {
                 Rc::new(crate::value::Class {
                     name: name.to_owned(),
+                    qualname: name.to_owned(),
                     methods: std::cell::RefCell::new(HashMap::new()),
                     fields: vec![],
                     class_attrs: std::cell::RefCell::new(HashMap::new()),

@@ -60,6 +60,10 @@ pub struct Env {
     slot_info: Option<Rc<SlotInfo>>,
     /// Slot storage, parallel to `slot_info.slots`. Empty when `slot_info` is `None`.
     slots: RefCell<Vec<Option<Value>>>,
+    /// The `__qualname__` of the function call or class body this scope
+    /// belongs to (`true` for a function, whose nested definitions sit
+    /// under `<locals>`). `None` for module and comprehension scopes.
+    qual_scope: RefCell<Option<(Rc<str>, bool)>>,
 }
 
 impl Env {
@@ -74,6 +78,7 @@ impl Env {
             module: RefCell::new(None),
             slot_info: None,
             slots: RefCell::new(Vec::new()),
+            qual_scope: RefCell::new(None),
         });
         *env.module.borrow_mut() = Some(env.clone());
         env
@@ -99,6 +104,7 @@ impl Env {
             module: RefCell::new(parent.module.borrow().clone()),
             slot_info: None,
             slots: RefCell::new(Vec::new()),
+            qual_scope: RefCell::new(None),
         })
     }
 
@@ -117,7 +123,32 @@ impl Env {
             module: RefCell::new(closure.module.borrow().clone()),
             slot_info: Some(slot_info),
             slots: RefCell::new(vec![None; n]),
+            qual_scope: RefCell::new(None),
         })
+    }
+
+    /// Record that this scope is a call of the function, or the body of the
+    /// class, whose `__qualname__` is `qualname`.
+    pub fn set_qual_scope(&self, qualname: Rc<str>, is_function: bool) {
+        *self.qual_scope.borrow_mut() = Some((qualname, is_function));
+    }
+
+    /// The `__qualname__` a function or class named `name` gets when it is
+    /// defined in this scope, as CPython's compiler derives it from the
+    /// lexical nesting: `outer.<locals>.inner`, `Outer.Inner.method`.
+    pub fn qualname_for(&self, name: &str) -> String {
+        let mut scope = Some(self);
+        while let Some(env) = scope {
+            if let Some((qual, is_function)) = env.qual_scope.borrow().as_ref() {
+                return if *is_function {
+                    format!("{qual}.<locals>.{name}")
+                } else {
+                    format!("{qual}.{name}")
+                };
+            }
+            scope = env.parent.as_deref();
+        }
+        name.to_owned()
     }
 
     /// Mark this env as a class body's namespace.

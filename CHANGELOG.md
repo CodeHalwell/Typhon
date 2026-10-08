@@ -16,6 +16,11 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ### Fixed
 
+- **`__qualname__` follows lexical nesting under `tyc run`.** Nested
+  functions, methods, lambdas and local classes now report CPython's
+  `outer.<locals>.inc` / `Cls.meth` qualname instead of the bare name, and a
+  local dataclass's repr and a local class's `repr()` use it too
+  (`outer.<locals>.P(x=1)`, `<class '__main__.outer.<locals>.P'>`).
 - **`lru_cache` helpers route to CPython.** The VM's `functools.cache`/`lru_cache` wrapper has no `cache_info()`, `cache_clear()` or `cache_parameters()`, so `tyc run` raised `AttributeError` where CPython answers; a program that names any of them now runs under CPython instead.
 - **`field(repr=False)` and friends route to CPython.** The VM ignores
   `dataclasses.field`'s `repr=` / `compare=` / `init=` / `hash=` /

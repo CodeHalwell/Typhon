@@ -1631,6 +1631,7 @@ impl Interpreter {
                 .iter()
                 .any(|d| decorator_simple_name(&d.expression).as_deref() == Some(want))
         };
+        let qualname: Rc<str> = Rc::from(env.qualname_for(f.name.as_str()));
         let body = Rc::new(f.body.clone());
         // Compute the slot layout on the exact `Rc`'d body clone the VM will
         // later walk (the analysis stamps node indices onto its `Name` nodes).
@@ -1643,6 +1644,7 @@ impl Interpreter {
         }
         Ok(Function {
             name: f.name.as_str().to_owned(),
+            qualname,
             params: f.parameters.clone(),
             body,
             defaults,
@@ -1830,6 +1832,12 @@ impl Interpreter {
         // shadow a module global inside one.
         let body_ns = Env::new_child(&body_env);
         body_ns.mark_class_namespace();
+        // Methods close over `body_env` and nested definitions run in
+        // `body_ns`; both name what they define under the class.
+        let class_qualname = env.qualname_for(c.name.as_str());
+        let class_scope: Rc<str> = Rc::from(class_qualname.as_str());
+        body_env.set_qual_scope(class_scope.clone(), false);
+        body_ns.set_qual_scope(class_scope, false);
 
         // A class is dataclass-shaped (annotated assigns are instance fields)
         // when it carries a `@dataclass` decorator. A `plain class` emits a
@@ -2372,6 +2380,7 @@ impl Interpreter {
         })?;
         let class = Rc::new(Class {
             name: c.name.as_str().to_owned(),
+            qualname: class_qualname,
             methods: RefCell::new(methods),
             fields,
             class_attrs: RefCell::new(class_attrs),
@@ -3015,6 +3024,7 @@ impl Interpreter {
             class_attrs.insert("__typhon_enum_base__".to_owned(), Value::Bool(true));
             let cls = Rc::new(Class {
                 name: base_name.to_owned(),
+                qualname: base_name.to_owned(),
                 methods: RefCell::new(HashMap::new()),
                 fields: vec![],
                 class_attrs: RefCell::new(class_attrs),
@@ -3746,6 +3756,7 @@ impl Interpreter {
                 }
                 let func = Function {
                     name: "<lambda>".into(),
+                    qualname: Rc::from(env.qualname_for("<lambda>")),
                     params,
                     body,
                     defaults,
@@ -5574,6 +5585,7 @@ impl Interpreter {
         } else {
             Env::new_child(&f.closure)
         };
+        call_env.set_qual_scope(f.qualname.clone(), true);
         let result = (|| -> Result<Value, Unwind> {
             self.bind_args(f, args, kwargs, receiver, &call_env)?;
             match f.generator {
@@ -7912,8 +7924,11 @@ impl Interpreter {
             }
             Value::Class(class) => {
                 // `Cls.__name__` / `type(x).__name__`.
-                if attr == "__name__" || attr == "__qualname__" {
+                if attr == "__name__" {
                     return Ok(Value::Str(Rc::new(class.name.clone())));
+                }
+                if attr == "__qualname__" {
+                    return Ok(Value::Str(Rc::new(class.qualname.clone())));
                 }
                 // `Cls.__mro__` — the C3 linearisation, ending in `object`.
                 if attr == "__mro__" || attr == "__bases__" {
@@ -8174,8 +8189,9 @@ impl Interpreter {
                 .cloned()
                 .expect("checked by the guard")),
             // `func.__name__` / `func.__qualname__`.
-            Value::Function(f) if attr == "__name__" || attr == "__qualname__" => {
-                Ok(Value::Str(Rc::new(f.name.clone())))
+            Value::Function(f) if attr == "__name__" => Ok(Value::Str(Rc::new(f.name.clone()))),
+            Value::Function(f) if attr == "__qualname__" => {
+                Ok(Value::Str(Rc::new(f.qualname.to_string())))
             }
             // `func.__doc__`: what a decorator (`functools.update_wrapper`)
             // set on it, else the body's docstring, else `None` — every
@@ -8248,8 +8264,11 @@ impl Interpreter {
             Value::Native(n) if builtin_type_method(n.name, attr).is_some() => {
                 Ok(builtin_type_method(n.name, attr).expect("checked by the guard"))
             }
-            Value::BoundMethod { function, .. } if attr == "__name__" || attr == "__qualname__" => {
+            Value::BoundMethod { function, .. } if attr == "__name__" => {
                 Ok(Value::Str(Rc::new(function.name.clone())))
+            }
+            Value::BoundMethod { function, .. } if attr == "__qualname__" => {
+                Ok(Value::Str(Rc::new(function.qualname.to_string())))
             }
             Value::ResultOk(v) => match attr {
                 "value" => Ok((**v).clone()),
@@ -10907,7 +10926,7 @@ fn mutable_default_type(default: &Value) -> Option<String> {
                     Some(Value::Str(s)) => (**s).clone(),
                     _ => "__main__".to_owned(),
                 };
-                Some(format!("<class '{}.{}'>", module, inst.class.name))
+                Some(format!("<class '{}.{}'>", module, inst.class.qualname))
             } else {
                 None
             }
