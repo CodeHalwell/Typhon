@@ -16,6 +16,12 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ### Fixed
 
+- **String case with titlecase letters, uncased letters and final sigma.**
+  Under `tyc run`, `str.istitle()`, `title()`, `islower()` and `isupper()`
+  treat titlecase letters such as `ǅ` as cased but neither upper nor lower,
+  and treat uncased letters such as `中` as word breaks, as CPython does
+  (`"中a".title()` is `中A`). `title()`, `capitalize()` and `swapcase()`
+  also apply the Greek final-sigma rule (`"ΑΣ".capitalize()` is `Ας`).
 - **Exception text and `ExceptionGroup` methods.** Under `tyc run`,
   `str()` and `repr()` of an exception follow its arguments as CPython
   does (`str(E([1, 2]))` is `[1, 2]`, `str(KeyError("k"))` is `'k'`,

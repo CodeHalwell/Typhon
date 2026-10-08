@@ -260,6 +260,15 @@ pub(crate) static SPACE_RANGES: &[(u32, u32)] = &[
     (0x2000, 0x200A), (0x2028, 0x2029), (0x202F, 0x202F), (0x205F, 0x205F), (0x3000, 0x3000),
 ];
 
+/// Titlecase letters (general category Lt), such as `ǅ`. Python counts
+/// them as cased but neither upper nor lower, which `istitle()`, `title()`,
+/// `islower()` and `isupper()` all depend on; Rust's std has no such query.
+#[rustfmt::skip]
+pub(crate) static TITLECASE_LETTER_RANGES: &[(u32, u32)] = &[
+    (0x01C5, 0x01C5), (0x01C8, 0x01C8), (0x01CB, 0x01CB), (0x01F2, 0x01F2), (0x1F88, 0x1F8F),
+    (0x1F98, 0x1F9F), (0x1FA8, 0x1FAF), (0x1FBC, 0x1FBC), (0x1FCC, 0x1FCC), (0x1FFC, 0x1FFC),
+];
+
 /// Titlecase mappings that differ from the uppercase one, sorted by key.
 /// Every other code point titlecases to its uppercase form.
 #[rustfmt::skip]

@@ -10542,13 +10542,20 @@ fn str_method(
         "isspace" => Value::Bool(!s.is_empty() && s.chars().all(unicode_is_space)),
         // CPython: true iff there is at least one cased character and no
         // character of the opposite case (uncased chars like ',', ' ', digits
-        // do not satisfy the predicate on their own).
-        "isupper" => {
-            Value::Bool(s.chars().any(|c| c.is_uppercase()) && !s.chars().any(|c| c.is_lowercase()))
-        }
-        "islower" => {
-            Value::Bool(s.chars().any(|c| c.is_lowercase()) && !s.chars().any(|c| c.is_uppercase()))
-        }
+        // do not satisfy the predicate on their own). A titlecase letter
+        // (`ǅ`) is cased but neither, so it fails both.
+        "isupper" => Value::Bool(
+            s.chars().any(|c| c.is_uppercase())
+                && !s
+                    .chars()
+                    .any(|c| c.is_lowercase() || is_titlecase_letter(c)),
+        ),
+        "islower" => Value::Bool(
+            s.chars().any(|c| c.is_lowercase())
+                && !s
+                    .chars()
+                    .any(|c| c.is_uppercase() || is_titlecase_letter(c)),
+        ),
         "title" => Value::Str(Rc::new(title_case(s))),
         "capitalize" => Value::Str(Rc::new(capitalize(s))),
         // Swapping case can change a string's *length*: `ß` upper-cases to
@@ -10556,12 +10563,15 @@ fn str_method(
         // mapping rather than its first character.
         "swapcase" => {
             let mut out = String::with_capacity(s.len());
+            let mut lower = ContextLower::new(s);
             for c in s.chars() {
                 if c.is_uppercase() {
-                    out.extend(c.to_lowercase());
+                    lower.push(&mut out, c);
                 } else if c.is_lowercase() {
+                    lower.skip(c);
                     out.extend(c.to_uppercase());
                 } else {
+                    lower.skip(c);
                     out.push(c);
                 }
             }
@@ -14111,17 +14121,31 @@ fn casefold_str(s: &str) -> String {
     out
 }
 
+/// A titlecase letter (general category Lt), such as `ǅ`.
+fn is_titlecase_letter(c: char) -> bool {
+    in_ranges(crate::unicode_data::TITLECASE_LETTER_RANGES, c)
+}
+
+/// Python's "cased": upper, lower or titlecase. An uncased letter such as
+/// `中` separates words for `title()` / `istitle()` just as `-` does.
+fn is_cased(c: char) -> bool {
+    c.is_uppercase() || c.is_lowercase() || is_titlecase_letter(c)
+}
+
+/// CPython's `unicode_istitle_impl`: every cased run opens with an upper or
+/// titlecase letter and continues in lowercase.
 fn is_title_case(s: &str) -> bool {
     let mut saw_cased = false;
     let mut prev_cased = false;
     for c in s.chars() {
-        if c.is_alphabetic() {
-            let upper = c.is_uppercase();
+        if c.is_uppercase() || is_titlecase_letter(c) {
             if prev_cased {
-                if upper {
-                    return false;
-                }
-            } else if !upper {
+                return false;
+            }
+            saw_cased = true;
+            prev_cased = true;
+        } else if c.is_lowercase() {
+            if !prev_cased {
                 return false;
             }
             saw_cased = true;
@@ -14135,30 +14159,67 @@ fn is_title_case(s: &str) -> bool {
 
 fn title_case(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut new_word = true;
+    // CPython's `do_title`: a character after a cased one lowercases, any
+    // other titlecases, and only a cased character continues a word.
+    let mut prev_cased = false;
+    let mut lower = ContextLower::new(s);
     for c in s.chars() {
-        if c.is_alphabetic() {
-            if new_word {
-                push_titlecase(&mut out, c);
-            } else {
-                out.extend(c.to_lowercase());
-            }
-            new_word = false;
+        if prev_cased {
+            lower.push(&mut out, c);
         } else {
-            out.push(c);
-            new_word = true;
+            lower.skip(c);
+            push_titlecase(&mut out, c);
         }
+        prev_cased = is_cased(c);
     }
     out
 }
 
+/// Per-character lowercasing that keeps the one context-sensitive rule,
+/// Greek final sigma: `Σ` lowers to `ς` at the end of a word and `σ`
+/// elsewhere. `str::to_lowercase` applies that rule over the whole string,
+/// and every other mapping is per character, so the right form of each `Σ`
+/// is read off the whole-string lowering at the matching offset.
+struct ContextLower {
+    lowered: String,
+    offset: usize,
+}
+
+impl ContextLower {
+    fn new(s: &str) -> Self {
+        ContextLower {
+            lowered: s.to_lowercase(),
+            offset: 0,
+        }
+    }
+
+    /// Push `c`'s lowercase form and move past it.
+    fn push(&mut self, out: &mut String, c: char) {
+        if c == '\u{03A3}' {
+            if let Some(l) = self.lowered[self.offset..].chars().next() {
+                out.push(l);
+            }
+        } else {
+            out.extend(c.to_lowercase());
+        }
+        self.skip(c);
+    }
+
+    /// Move past `c` without emitting it.
+    fn skip(&mut self, c: char) {
+        self.offset += c.to_lowercase().map(char::len_utf8).sum::<usize>();
+    }
+}
+
 fn capitalize(s: &str) -> String {
-    let mut it = s.chars();
-    match it.next() {
+    match s.chars().next() {
         Some(c) => {
             let mut out = String::with_capacity(s.len());
             push_titlecase(&mut out, c);
-            out.push_str(&it.as_str().to_lowercase());
+            // Lower the rest in the context of the first character, so a
+            // word-final `Σ` right after it still becomes `ς`.
+            let first: usize = c.to_lowercase().map(char::len_utf8).sum();
+            out.push_str(&s.to_lowercase()[first..]);
             out
         }
         None => String::new(),

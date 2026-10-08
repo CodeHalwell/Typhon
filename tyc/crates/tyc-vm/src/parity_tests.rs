@@ -2023,3 +2023,17 @@ except ExceptionGroup as caught:
 "#,
     );
 }
+
+// ── str case predicates: titlecase letters, uncased letters, final sigma ────
+
+#[test]
+fn str_case_follows_cased_titlecase_and_final_sigma() {
+    assert_matches_cpython(
+        "str_case_follows_cased_titlecase_and_final_sigma",
+        r#"for t in ["ǅungla", "中A", "中a", "Aǅ", "ᾈ", "ǈa Bc", "A中b", "ºA", "ⓐⓑ", "Ⓐⓑ", "ǆemal", "ß x", "they're bill's"]:
+    show(t, t.istitle(), t.title(), t.islower(), t.isupper(), t.capitalize(), t.swapcase())
+for t in ["ΑΣ ΣΑΣ", "ΑΣ", "ΑΣ1", "όΣ", "ΣΑΣ. ΟΔΟΣ"]:
+    show(t, t.title(), t.capitalize(), t.swapcase(), t.lower())
+"#,
+    );
+}

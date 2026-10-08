@@ -124,6 +124,17 @@ def main() -> None:
         )
     )
 
+    lt = ranges(lambda cp: unicodedata.category(chr(cp)) == "Lt")
+    parts.append(
+        range_table(
+            "TITLECASE_LETTER_RANGES",
+            "/// Titlecase letters (general category Lt), such as `ǅ`. Python counts\n"
+            "/// them as cased but neither upper nor lower, which `istitle()`, `title()`,\n"
+            "/// `islower()` and `isupper()` all depend on; Rust's std has no such query.",
+            lt,
+        )
+    )
+
     rows = "\n".join(f"    (0x{cp:04X}, {esc(t)})," for cp, t in title)
     parts.append(
         "/// Titlecase mappings that differ from the uppercase one, sorted by key.\n"
