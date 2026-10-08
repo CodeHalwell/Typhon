@@ -7360,6 +7360,7 @@ fn make_re_module() -> Value {
         re: &regex::Regex,
         repl: &Value,
         s: &str,
+        string: &Option<Value>,
         count: usize,
     ) -> Result<(String, usize), Unwind> {
         let names = name_indices(re);
@@ -7372,7 +7373,7 @@ fn make_re_module() -> Value {
         if let Value::Str(tpl) = repl {
             expand_template(tpl, &|_| None, &names, re.captures_len())?;
         }
-        let ctx = MatchCtx::new(s, s, 0);
+        let ctx = MatchCtx::new(s, string, 0);
         let mut out = String::new();
         let mut last = 0usize;
         let mut n = 0usize;
@@ -7440,7 +7441,7 @@ fn make_re_module() -> Value {
                 Ok(captures_to_value(
                     caps,
                     &name_indices(&p1),
-                    &MatchCtx::new(&hay, &s, pos),
+                    &MatchCtx::new(&hay, &a[0], pos),
                 ))
             }))),
         );
@@ -7454,7 +7455,7 @@ fn make_re_module() -> Value {
                 Ok(captures_to_value(
                     p2.captures_at(&hay, pos),
                     &name_indices(&p2),
-                    &MatchCtx::new(&hay, &s, pos),
+                    &MatchCtx::new(&hay, &a[0], pos),
                 ))
             }))),
         );
@@ -7471,7 +7472,7 @@ fn make_re_module() -> Value {
                 Ok(captures_to_value(
                     caps,
                     &name_indices(&p2m),
-                    &MatchCtx::new(&hay, &s, pos),
+                    &MatchCtx::new(&hay, &a[0], pos),
                 ))
             }))),
         );
@@ -7487,7 +7488,7 @@ fn make_re_module() -> Value {
                 // starting there, so every match reports its offsets in the
                 // original string (`span()` on a `finditer(s, 1)` hit was
                 // slice-relative) and `^` keeps meaning the real start.
-                let ctx = MatchCtx::new(&hay, &s, pos);
+                let ctx = MatchCtx::new(&hay, &a[0], pos);
                 let mut out: Vec<Value> = Vec::new();
                 let mut at = pos;
                 while at <= hay.len() {
@@ -7532,7 +7533,7 @@ fn make_re_module() -> Value {
                     .ok_or_else(|| type_error("sub() needs replacement"))?;
                 let s = re_str_arg(&a[1], "sub")?;
                 let count = re_count_arg(&a[2])?;
-                let (out, _) = re_sub_apply(i, &p4, &repl, &s, count)?;
+                let (out, _) = re_sub_apply(i, &p4, &repl, &s, &a[1], count)?;
                 Ok(Value::Str(Rc::new(out)))
             }))),
         );
@@ -7546,7 +7547,7 @@ fn make_re_module() -> Value {
                     .ok_or_else(|| type_error("subn() needs replacement"))?;
                 let s = re_str_arg(&a[1], "subn")?;
                 let count = re_count_arg(&a[2])?;
-                let (out, n) = re_sub_apply(i, &p4n, &repl, &s, count)?;
+                let (out, n) = re_sub_apply(i, &p4n, &repl, &s, &a[1], count)?;
                 Ok(Value::Tuple(Rc::new(vec![
                     Value::Str(Rc::new(out)),
                     Value::Int(VmInt::from(n as i64)),
@@ -7640,8 +7641,9 @@ fn make_re_module() -> Value {
 
     impl<'h> MatchCtx<'h> {
         /// `hay` is the searched window (the string cut at `endpos`), `string`
-        /// the full original and `pos` the byte offset searching began at.
-        fn new(hay: &'h str, string: &str, pos: usize) -> Self {
+        /// the caller's original argument (kept as is, so `m.string is s`) and
+        /// `pos` the byte offset searching began at.
+        fn new(hay: &'h str, string: &Option<Value>, pos: usize) -> Self {
             let ascii = hay.is_ascii();
             let chars = |b: usize| -> i64 {
                 if ascii {
@@ -7653,7 +7655,7 @@ fn make_re_module() -> Value {
             MatchCtx {
                 hay,
                 ascii,
-                string: Value::Str(Rc::new(string.to_owned())),
+                string: string.clone().unwrap_or(Value::None),
                 pos: chars(pos),
                 endpos: chars(hay.len()),
             }
@@ -7890,7 +7892,11 @@ fn make_re_module() -> Value {
                     // requiring `start() == 0`.
                     let caps = r.captures(&s).filter(|c| c.get(0).unwrap().start() == 0);
                     let names = name_indices(&r);
-                    Ok(captures_to_value(caps, &names, &MatchCtx::new(&s, &s, 0)))
+                    Ok(captures_to_value(
+                        caps,
+                        &names,
+                        &MatchCtx::new(&s, &a[1], 0),
+                    ))
                 }),
             ),
             (
@@ -7904,7 +7910,7 @@ fn make_re_module() -> Value {
                     Ok(captures_to_value(
                         r.captures(&s),
                         &names,
-                        &MatchCtx::new(&s, &s, 0),
+                        &MatchCtx::new(&s, &a[1], 0),
                     ))
                 }),
             ),
@@ -7920,7 +7926,7 @@ fn make_re_module() -> Value {
                     Ok(captures_to_value(
                         r.captures(&s),
                         &names,
-                        &MatchCtx::new(&s, &s, 0),
+                        &MatchCtx::new(&s, &a[1], 0),
                     ))
                 }),
             ),
@@ -7939,7 +7945,7 @@ fn make_re_module() -> Value {
                     let s = re_str_arg(&a[2], "sub")?;
                     let count = re_count_arg(&a[3])?;
                     let r = compile_one(&p, re_flags_arg(&a[4])?)?;
-                    let (out, _) = re_sub_apply(i, &r, &repl, &s, count)?;
+                    let (out, _) = re_sub_apply(i, &r, &repl, &s, &a[2], count)?;
                     Ok(Value::Str(Rc::new(out)))
                 }),
             ),
@@ -7958,7 +7964,7 @@ fn make_re_module() -> Value {
                     let s = re_str_arg(&a[2], "subn")?;
                     let count = re_count_arg(&a[3])?;
                     let r = compile_one(&p, re_flags_arg(&a[4])?)?;
-                    let (out, n) = re_sub_apply(i, &r, &repl, &s, count)?;
+                    let (out, n) = re_sub_apply(i, &r, &repl, &s, &a[2], count)?;
                     Ok(Value::Tuple(Rc::new(vec![
                         Value::Str(Rc::new(out)),
                         Value::Int(VmInt::from(n as i64)),
@@ -7973,7 +7979,7 @@ fn make_re_module() -> Value {
                     let s = re_str_arg(&a[1], "finditer")?;
                     let r = compile_one(&p, re_flags_arg(&a[2])?)?;
                     let names = name_indices(&r);
-                    let ctx = MatchCtx::new(&s, &s, 0);
+                    let ctx = MatchCtx::new(&s, &a[1], 0);
                     let out: Vec<Value> = r
                         .captures_iter(&s)
                         .map(|c| captures_to_value(Some(c), &names, &ctx))

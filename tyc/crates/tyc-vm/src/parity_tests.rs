@@ -2133,6 +2133,9 @@ for f in [lambda: re.sub("x", r"\q", "a"), lambda: re.subn("x", r"\9", "a")]:
 show(re.sub("(x)", r"\1", "a"))
 m = re.match(r"(a)(b)", "ab")
 show(m.group(G.ONE), m.start(G.ONE), m.span(G.ONE), m[G.ONE], m.group(G.ONE, 2))
+s = "".join(["he", "llo"])
+c = re.compile("l")
+show(re.search("l", s).string is s, c.match(s, 2).string is s, re.sub("e", lambda q: str(q.string is s), s))
 "#,
     );
 }
