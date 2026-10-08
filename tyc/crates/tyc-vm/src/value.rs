@@ -1936,7 +1936,7 @@ pub struct Class {
     pub name: String,
     /// `__qualname__`: the dotted path from the module (`Outer.Inner`,
     /// `make.<locals>.Local`); the bare name for a builtin or shim class.
-    pub qualname: String,
+    pub qualname: Rc<String>,
     /// Method table — looked up on instance attribute access.
     pub methods: RefCell<HashMap<String, Rc<Function>>>,
     /// Annotated field names, in source order. Used to synthesise `__init__`
@@ -1982,7 +1982,7 @@ thread_local! {
     /// `object` (`plain class object:`) by identity rather than by name.
     static BUILTIN_OBJECT: Rc<Class> = Rc::new(Class {
         name: "object".to_owned(),
-        qualname: "object".to_owned(),
+        qualname: Rc::new("object".to_owned()),
         methods: RefCell::new(HashMap::new()),
         fields: vec![],
         class_attrs: RefCell::new(HashMap::new()),
@@ -2080,9 +2080,9 @@ pub struct Instance {
 impl Class {
     /// The class's `__qualname__` as a program sees it: one the class body or
     /// a later `C.__qualname__ = …` assigned, else the lexical one.
-    pub fn effective_qualname(&self) -> String {
+    pub fn effective_qualname(&self) -> Rc<String> {
         match self.class_attrs.borrow().get("__qualname__") {
-            Some(Value::Str(q)) => (**q).clone(),
+            Some(Value::Str(q)) => q.clone(),
             _ => self.qualname.clone(),
         }
     }
@@ -3472,7 +3472,7 @@ fn instance_repr_inner(inst: &Instance) -> String {
     // A dataclass's generated `__repr__` names the class by `__qualname__`
     // (`make.<locals>.Point(x=1)`); a pydantic model by `__name__`.
     let class_name = if class_is_dataclass(&inst.class) {
-        inst.class.effective_qualname()
+        (*inst.class.effective_qualname()).clone()
     } else {
         inst.class.name.clone()
     };
@@ -4037,7 +4037,7 @@ mod tests {
         class_attrs.insert("__typhon_dc_frozen__".to_owned(), Value::Bool(true));
         Rc::new(Class {
             name: name.to_owned(),
-            qualname: name.to_owned(),
+            qualname: Rc::new(name.to_owned()),
             methods: RefCell::new(HashMap::new()),
             fields: field_names
                 .iter()

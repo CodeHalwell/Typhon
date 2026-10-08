@@ -2172,6 +2172,11 @@ c2 = "".join(["hello", " world"])
 show("{1}".format(c, c2) is c2, "{0}".format(c, c2) is c, "{k}".format(k=c2) is c2, "{!s}".format(c) is c, "hello world".format(c) is c, "{}{}".format(c, "") is c)
 show(("%s%s" % (c, "")) is c, ("%(k)s" % {"k": c}) is c, ("%r" % c) is c, ("%.20s" % c) is c)
 show(format(c, "1") is c, format(c, "20") is c, format(c, ".3") is c, "{:1}".format(c) is c, "{0!s:>5}".format(c) is c, "{:20}".format(c) is c, "{:{}}".format(c, 3) is c)
+def _named() -> int:
+    return 0
+_named.__qualname__ = c
+show(_named.__qualname__ is c)
+show(("%(k)1s" % {"k": c}) is c, ("%(k)#s" % {"k": c}) is c, ("%(k).20s" % {"k": c}) is c, ("%(k).3s" % {"k": c}) is c)
 show(("%#s" % c) is c, ("%-#5s" % c) is c, ("%+s" % c) is c, ("% s" % c) is c, f"{c:3}" is c, f"{c:20}" is c, f"{c!r}" is c)
 show(c.partition(c2)[1] is c2, c.partition(c2)[1] is c, c.rpartition("zz")[0] is c, c.partition("zz")[2] is c)
 show(eval("'hello world'") is eval("'hello world'"), eval("'hello world'") is lit, eval("'abc'") is "abc")
@@ -2180,5 +2185,45 @@ try:
 except TypeError as e:
     show(str(e))
 "#,
+    );
+}
+
+#[test]
+fn literal_and_qualname_objects_belong_to_their_module() {
+    // A non-name literal and a nested `__qualname__` are constants of the
+    // module that defines them: shared within it, distinct across modules.
+    let util = r#"def make() -> type:
+    class C:
+        pass
+    return C
+def inner():
+    def f() -> int:
+        return 1
+    return f
+VALUE = "hello world"
+NAME = "hello_world"
+"#;
+    let main = r#"import util
+def make() -> type:
+    class C:
+        pass
+    return C
+def inner():
+    def f() -> int:
+        return 1
+    return f
+VALUE = "hello world"
+NAME = "hello_world"
+assert util.VALUE is not VALUE
+assert util.NAME is NAME
+assert util.make().__qualname__ is not make().__qualname__
+assert make().__qualname__ is make().__qualname__
+assert util.inner().__qualname__ is not inner().__qualname__
+assert inner().__qualname__ is inner().__qualname__
+assert util.make().__name__ is make().__name__
+"#;
+    assert_eq!(
+        run_project(&[("util.ty", util), ("main.ty", main)], "main.ty").unwrap(),
+        0
     );
 }

@@ -2403,6 +2403,8 @@ impl Interpreter {
                 "Cannot create a consistent method resolution order (MRO) for bases {names}"
             ))
         })?;
+        // The qualname is a constant of the defining module, as in CPython.
+        let class_qualname = self.str_constant(&class_qualname);
         let class = Rc::new(Class {
             name: c.name.as_str().to_owned(),
             qualname: class_qualname,
@@ -3049,7 +3051,7 @@ impl Interpreter {
             class_attrs.insert("__typhon_enum_base__".to_owned(), Value::Bool(true));
             let cls = Rc::new(Class {
                 name: base_name.to_owned(),
-                qualname: base_name.to_owned(),
+                qualname: Rc::new(base_name.to_owned()),
                 methods: RefCell::new(HashMap::new()),
                 fields: vec![],
                 class_attrs: RefCell::new(class_attrs),
@@ -3608,6 +3610,18 @@ impl Interpreter {
             Some(src) => lookup(&mut src.constants.borrow_mut()),
             None => lookup(&mut self.str_constants),
         }
+    }
+
+    /// A function's `__qualname__`: an assigned one is that object, else the
+    /// lexical one is a constant of the module the function was defined in.
+    fn function_qualname(&mut self, f: &crate::value::Function) -> Rc<String> {
+        if let Some(Value::Str(q)) = f.attrs.borrow().get("__qualname__") {
+            return q.clone();
+        }
+        let outer = std::mem::replace(&mut self.current_source, f.source.clone());
+        let q = self.str_constant(&f.qualname);
+        self.current_source = outer;
+        q
     }
 
     /// `sys.intern(s)`: the interned object equal to `s`, else `s` itself,
@@ -6976,8 +6990,8 @@ impl Interpreter {
             };
             let sole = match (fmt.as_str(), values.as_slice()) {
                 (f, [Str(v)]) if plain_s(f) => Some(v.clone()),
-                _ => match (fmt.strip_prefix("%(").and_then(|f| f.strip_suffix(")s")), r) {
-                    (Some(key), Dict(d)) if !key.contains(')') => {
+                _ => match (fmt.strip_prefix("%(").and_then(|f| f.split_once(')')), r) {
+                    (Some((key, rest)), Dict(d)) if plain_s(&format!("%{rest}")) => {
                         match d.borrow().get(&HashKey::Str(Rc::new(key.to_owned()))) {
                             Some(Str(v)) => Some(v.clone()),
                             _ => Option::None,
@@ -8110,7 +8124,7 @@ impl Interpreter {
                     return Ok(Value::Str(self.intern_str(&class.name)));
                 }
                 if attr == "__qualname__" {
-                    return Ok(Value::Str(self.intern_str(&class.effective_qualname())));
+                    return Ok(Value::Str(class.effective_qualname()));
                 }
                 // `Cls.__mro__` — the C3 linearisation, ending in `object`.
                 if attr == "__mro__" || attr == "__bases__" {
@@ -8373,7 +8387,7 @@ impl Interpreter {
             // `func.__name__` / `func.__qualname__`.
             Value::Function(f) if attr == "__name__" => Ok(Value::Str(self.intern_str(&f.name))),
             Value::Function(f) if attr == "__qualname__" => {
-                Ok(Value::Str(self.intern_str(&f.qualname)))
+                Ok(Value::Str(self.function_qualname(f)))
             }
             // `func.__doc__`: what a decorator (`functools.update_wrapper`)
             // set on it, else the body's docstring, else `None` — every
@@ -8450,7 +8464,7 @@ impl Interpreter {
                 Ok(Value::Str(self.intern_str(&function.name)))
             }
             Value::BoundMethod { function, .. } if attr == "__qualname__" => {
-                Ok(Value::Str(self.intern_str(&function.effective_qualname())))
+                Ok(Value::Str(self.function_qualname(function)))
             }
             Value::ResultOk(v) => match attr {
                 "value" => Ok((**v).clone()),
