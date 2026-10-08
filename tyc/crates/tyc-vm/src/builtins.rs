@@ -551,14 +551,17 @@ pub fn install(interp: &mut Interpreter) {
         if let Some(formatted) = interp.try_user_format(v, &spec)? {
             return Ok(Value::Str(Rc::new(formatted)));
         }
-        // `format(s)` / `format(s, "")` of a `str` is `s` itself.
+        // `format(s)` of a `str` is `s` itself, and so is any spec that
+        // leaves it unchanged (`format(s, "1")`).
         if let (Value::Str(s), true) = (v, spec.is_empty()) {
             return Ok(Value::Str(s.clone()));
         }
         let base = interp.format_default(v, &spec)?;
-        Ok(Value::Str(Rc::new(crate::interp::format_with_spec_pub(
-            v, &base, &spec,
-        )?)))
+        let out = crate::interp::format_with_spec_pub(v, &base, &spec)?;
+        match v {
+            Value::Str(s) if **s == out => Ok(Value::Str(s.clone())),
+            _ => Ok(Value::Str(Rc::new(out))),
+        }
     });
 
     native!("ascii", |interp, args| {
@@ -10539,10 +10542,11 @@ fn sole_format_field<'a>(
     kwargs: &'a [(String, Value)],
 ) -> Option<&'a Value> {
     let inner = template.strip_prefix('{')?.strip_suffix('}')?;
-    let name = inner
-        .strip_suffix("!s")
-        .or_else(|| inner.strip_suffix(':'))
-        .unwrap_or(inner);
+    // `name[!s][:spec]`. The outer field is numbered before any nested one
+    // in its spec (`"{:{}}"`), and the caller only reuses the `str` when
+    // formatting changed nothing.
+    let field = inner.split_once(':').map_or(inner, |(f, _)| f);
+    let name = field.strip_suffix("!s").unwrap_or(field);
     if name.contains(['{', '}', '!', ':', '.', '[']) {
         return None;
     }
@@ -11084,8 +11088,9 @@ fn str_method(
             // bound builtin methods (see make_kwargs_sentinel / split_kwargs).
             let (pos_args, kwargs) = split_kwargs(args);
             let out = str_format(interp, s, pos_args, &kwargs)?;
-            // A template that is one bare field (`"{}"`, `"{0}"`, `"{name!s}"`)
-            // hands back that argument itself when it is a `str`.
+            // A template that is one field (`"{}"`, `"{0}"`, `"{name!s:5}"`)
+            // hands back that argument itself when it is a `str` and
+            // formatting changed nothing.
             if let (Value::Str(text), Some(Value::Str(arg))) =
                 (&out, sole_format_field(s, pos_args, &kwargs))
             {

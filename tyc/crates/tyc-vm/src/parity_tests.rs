@@ -2171,6 +2171,8 @@ show(c[0] is "h", "".join([]) is "", c[0:0] is "", getattr(Box, "__name__") is "
 c2 = "".join(["hello", " world"])
 show("{1}".format(c, c2) is c2, "{0}".format(c, c2) is c, "{k}".format(k=c2) is c2, "{!s}".format(c) is c, "hello world".format(c) is c, "{}{}".format(c, "") is c)
 show(("%s%s" % (c, "")) is c, ("%(k)s" % {"k": c}) is c, ("%r" % c) is c, ("%.20s" % c) is c)
+show(format(c, "1") is c, format(c, "20") is c, format(c, ".3") is c, "{:1}".format(c) is c, "{0!s:>5}".format(c) is c, "{:20}".format(c) is c, "{:{}}".format(c, 3) is c)
+show(("%#s" % c) is c, ("%-#5s" % c) is c, ("%+s" % c) is c, ("% s" % c) is c, f"{c:3}" is c, f"{c:20}" is c, f"{c!r}" is c)
 show(c.partition(c2)[1] is c2, c.partition(c2)[1] is c, c.rpartition("zz")[0] is c, c.partition("zz")[2] is c)
 show(eval("'hello world'") is eval("'hello world'"), eval("'hello world'") is lit, eval("'abc'") is "abc")
 try:

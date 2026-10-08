@@ -6964,14 +6964,14 @@ impl Interpreter {
                 _ => Option::None,
             };
             let out = printf_format_with(self, fmt, &values, mapping.as_ref())?;
-            // `"%s" % s` (and `"%(k)s" % {"k": s}`, or a width / precision
-            // that changes nothing) hands back `s` itself.
+            // `"%s" % s` (and `"%(k)s" % {"k": s}`, or a width / precision /
+            // ignored `#` that changes nothing) hands back `s` itself.
             let plain_s = |f: &str| {
                 f.strip_prefix('%')
                     .and_then(|f| f.strip_suffix('s'))
                     .is_some_and(|spec| {
                         spec.chars()
-                            .all(|c| c.is_ascii_digit() || c == '-' || c == '.')
+                            .all(|c| c.is_ascii_digit() || matches!(c, '-' | '.' | '#'))
                     })
             };
             let sole = match (fmt.as_str(), values.as_slice()) {
