@@ -2107,7 +2107,10 @@ m = p.search("éé x1 y", 2)
 show(repr(m), m.pos, m.endpos, m.groups("-"))
 show([(repr(q), q.span(2)) for q in p.finditer("ab1 é2", 1, 5)])
 m = re.fullmatch(r"(?P<a>x)(?P<b>y)?", "x")
-show(m.groupdict("z"), m.span("b"))
+show(m.groupdict("z"), m.span("b"), m.groupdict(default="d"), m.groups(default="g"))
+m = re.match(r"(a)(b)", "ab")
+show(m.expand(r"\0|\012|\101|\1\2|\08|\1x"), m.expand(template=r"\2"), re.sub("(a)", r"\101\0", "xa"))
+show(repr(re.match("a*", "a" * 100)))
 "#,
     );
 }

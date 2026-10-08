@@ -7235,6 +7235,30 @@ fn make_re_module() -> Value {
         while i < ch.len() {
             if ch[i] == '\\' && i + 1 < ch.len() {
                 let n = ch[i + 1];
+                // Python's octal escapes: `\0` plus up to two more octal
+                // digits, or any three octal digits; otherwise one or two
+                // digits name a group.
+                let is_oct = |k: usize| ch.get(k).is_some_and(|c| ('0'..='7').contains(c));
+                let octal = if n == '0' {
+                    let mut j = i + 2;
+                    while j < i + 4 && is_oct(j) {
+                        j += 1;
+                    }
+                    Some(j)
+                } else if is_oct(i + 1) && is_oct(i + 2) && is_oct(i + 3) {
+                    Some(i + 4)
+                } else {
+                    None
+                };
+                if let Some(j) = octal {
+                    let digits: String = ch[i + 1..j].iter().collect();
+                    let code = u32::from_str_radix(&digits, 8).unwrap_or(0);
+                    if let Some(c) = char::from_u32(code) {
+                        out.push(c);
+                    }
+                    i = j;
+                    continue;
+                }
                 if n.is_ascii_digit() {
                     let mut j = i + 1;
                     let mut num = String::new();
@@ -7751,7 +7775,13 @@ fn make_re_module() -> Value {
             "__typhon_match_repr__".into(),
             Value::Str(Rc::new(format!(
                 "<re.Match object; span=({s}, {e}), match={}>",
-                Value::Str(Rc::new(whole)).py_repr()
+                // CPython formats it with `%.50R`: the repr, cut at 50
+                // characters.
+                Value::Str(Rc::new(whole))
+                    .py_repr()
+                    .chars()
+                    .take(50)
+                    .collect::<String>()
             ))),
         );
         Value::Instance(Rc::new(crate::value::Instance {
@@ -10114,6 +10144,9 @@ pub(crate) fn native_keyword_params(name: &str) -> Option<KeywordParams> {
             &[],
         ),
         "load" => kp(1, LOADS, &[]),
+        // `re.Match` methods.
+        "groups" | "groupdict" => kp(0, &[("default", D::None)], &[]),
+        "expand" => kp(0, &[("template", D::Required)], &[]),
         _ => return None,
     })
 }
