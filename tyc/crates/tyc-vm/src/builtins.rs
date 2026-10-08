@@ -7268,6 +7268,12 @@ fn make_re_module() -> Value {
             if let Some(j) = octal {
                 let digits: String = ch[i + 1..j].iter().collect();
                 let code = u32::from_str_radix(&digits, 8).unwrap_or(0);
+                if code > 0o377 {
+                    return Err(err(
+                        format!("octal escape value \\{digits} outside of range 0-0o377"),
+                        i,
+                    ));
+                }
                 if let Some(c) = char::from_u32(code) {
                     out.push(c);
                 }
@@ -7361,6 +7367,11 @@ fn make_re_module() -> Value {
             repl,
             Value::Function(_) | Value::Native(_) | Value::BoundMethod { .. } | Value::Class(_)
         );
+        // CPython parses a template replacement up front, so a malformed one
+        // raises even when nothing matches.
+        if let Value::Str(tpl) = repl {
+            expand_template(tpl, &|_| None, &names, re.captures_len())?;
+        }
         let ctx = MatchCtx::new(s, s, 0);
         let mut out = String::new();
         let mut last = 0usize;
@@ -7691,8 +7702,9 @@ fn make_re_module() -> Value {
                     .get(s.as_str())
                     .copied()
                     .ok_or_else(|| index_error("no such group")),
-                Value::Int(_) | Value::Bool(_) => {
-                    let idx = a.to_int()?;
+                // An `IntEnum` member is an int to CPython here too.
+                Value::Int(_) | Value::Bool(_) | Value::Instance(_) => {
+                    let idx = a.to_int().map_err(|_| index_error("no such group"))?;
                     if idx < 0 || idx as usize >= count {
                         Err(index_error("no such group"))
                     } else {

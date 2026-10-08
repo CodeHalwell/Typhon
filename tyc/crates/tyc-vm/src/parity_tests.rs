@@ -2097,6 +2097,9 @@ fn re_match_reports_char_offsets_and_groups() {
     assert_matches_cpython(
         "re_match_reports_char_offsets_and_groups",
         r#"import re
+from enum import IntEnum
+class G(IntEnum):
+    ONE = 1
 m = re.search(r"(b)(x)?", "ééab")
 show(m.start(), m.end(), m.span(), m.start(1), m.span(2), m.end(2), m[0], m[1], m[2])
 show([q.span() for q in re.finditer(r"\w", "éa")], re.sub("(é)", lambda q: str(q.span()), "aéb"))
@@ -2112,7 +2115,7 @@ m = re.match(r"(a)(b)", "ab")
 show(m.expand(r"\0|\012|\101|\1\2|\08|\1x"), m.expand(template=r"\2"), re.sub("(a)", r"\101\0", "xa"))
 show(repr(re.match("a*", "a" * 100)))
 m = re.match("(a)(?P<n>b)?", "a")
-for t in [r"\9", r"\q", r"\g<x>", r"\g<9>", "\\a\\v", r"\-", r"\g<1", "x\\", r"\g<n>|\2", r"\g<-1>", r"\g<>", r"\gx"]:
+for t in [r"\9", r"\q", r"\g<x>", r"\g<9>", "\\a\\v", r"\-", r"\g<1", "x\\", r"\g<n>|\2", r"\g<-1>", r"\g<>", r"\gx", r"\400", r"x\777"]:
     try:
         show(t, m.expand(t))
     except Exception as e:
@@ -2122,6 +2125,14 @@ for f in [lambda: m.start(0, 1), lambda: m.groups(1, 2), lambda: m.expand("a", "
         show(f())
     except TypeError as e:
         show("TypeError", str(e))
+for f in [lambda: re.sub("x", r"\q", "a"), lambda: re.subn("x", r"\9", "a")]:
+    try:
+        show(f())
+    except re.error as e:
+        show("error", str(e))
+show(re.sub("(x)", r"\1", "a"))
+m = re.match(r"(a)(b)", "ab")
+show(m.group(G.ONE), m.start(G.ONE), m.span(G.ONE), m[G.ONE], m.group(G.ONE, 2))
 "#,
     );
 }
