@@ -1741,6 +1741,10 @@ impl NativeFn {
 
 pub struct Function {
     pub name: String,
+    /// `__qualname__`: the dotted path from the module, as CPython's
+    /// compiler derives it (`outer.<locals>.inner`, `Cls.method`). Shared,
+    /// since every call stamps it on the frame for nested definitions.
+    pub qualname: Rc<str>,
     pub params: Box<Parameters>,
     pub body: Rc<Vec<Stmt>>,
     /// Default values for non-variadic params, evaluated at def-time and
@@ -1930,6 +1934,9 @@ pub struct GenExprState {
 
 pub struct Class {
     pub name: String,
+    /// `__qualname__`: the dotted path from the module (`Outer.Inner`,
+    /// `make.<locals>.Local`); the bare name for a builtin or shim class.
+    pub qualname: String,
     /// Method table — looked up on instance attribute access.
     pub methods: RefCell<HashMap<String, Rc<Function>>>,
     /// Annotated field names, in source order. Used to synthesise `__init__`
@@ -1975,6 +1982,7 @@ thread_local! {
     /// `object` (`plain class object:`) by identity rather than by name.
     static BUILTIN_OBJECT: Rc<Class> = Rc::new(Class {
         name: "object".to_owned(),
+        qualname: "object".to_owned(),
         methods: RefCell::new(HashMap::new()),
         fields: vec![],
         class_attrs: RefCell::new(HashMap::new()),
@@ -2067,6 +2075,28 @@ pub struct Instance {
     /// out of `fields` because CPython holds `__cause__` / `__context__` in
     /// slots, not in `__dict__` — `vars(e)` must not show them.
     pub chain: RefCell<Option<Rc<ExcChain>>>,
+}
+
+impl Class {
+    /// The class's `__qualname__` as a program sees it: one the class body or
+    /// a later `C.__qualname__ = …` assigned, else the lexical one.
+    pub fn effective_qualname(&self) -> String {
+        match self.class_attrs.borrow().get("__qualname__") {
+            Some(Value::Str(q)) => (**q).clone(),
+            _ => self.qualname.clone(),
+        }
+    }
+}
+
+impl Function {
+    /// The function's `__qualname__` as a program sees it: one assigned to
+    /// it (`functools.wraps`, `f.__qualname__ = …`), else the lexical one.
+    pub fn effective_qualname(&self) -> String {
+        match self.attrs.borrow().get("__qualname__") {
+            Some(Value::Str(q)) => (**q).clone(),
+            _ => self.qualname.to_string(),
+        }
+    }
 }
 
 // Hand-written so `HashKey::Class` can `#[derive(Debug)]` without pulling
@@ -2285,7 +2315,7 @@ impl fmt::Debug for Value {
                 write!(f, "range({start}, {stop}, {step})")
             }
             Value::Native(n) => write!(f, "{}", native_repr(n.name)),
-            Value::Function(func) => write!(f, "<function {}>", func.name),
+            Value::Function(func) => write!(f, "<function {}>", func.effective_qualname()),
             Value::BoundMethod { function, .. } => {
                 write!(f, "<bound method {}>", function.name)
             }
@@ -3014,7 +3044,7 @@ impl Value {
                 }
             }
             Value::Native(n) => native_repr(n.name),
-            Value::Function(func) => format!("<function {}>", func.name),
+            Value::Function(func) => format!("<function {}>", func.effective_qualname()),
             // CPython names the class the method was found on and reprs
             // the receiver: `<bound method Path.iterdir of PosixPath('/t')>`.
             Value::BoundMethod { function, receiver } => {
@@ -3383,6 +3413,11 @@ fn instance_repr_inner(inst: &Instance) -> String {
     let fields = inst.fields.borrow();
     // A `__slots__` member descriptor (`Cls.field` on a slots dataclass)
     // reprs as CPython's `<member 'name' of 'Cls' objects>`.
+    if inst.class.name == "Match" {
+        if let Some(Value::Str(r)) = fields.get("__typhon_match_repr__") {
+            return (**r).clone();
+        }
+    }
     if inst.class.name == "member_descriptor" {
         if let (Some(Value::Str(name)), Some(Value::Str(owner))) =
             (fields.get("__name__"), fields.get("__objclass__"))
@@ -3434,7 +3469,14 @@ fn instance_repr_inner(inst: &Instance) -> String {
     {
         return object_default_repr(inst);
     }
-    format!("{}({})", inst.class.name, parts.join(", "))
+    // A dataclass's generated `__repr__` names the class by `__qualname__`
+    // (`make.<locals>.Point(x=1)`); a pydantic model by `__name__`.
+    let class_name = if class_is_dataclass(&inst.class) {
+        inst.class.effective_qualname()
+    } else {
+        inst.class.name.clone()
+    };
+    format!("{class_name}({})", parts.join(", "))
 }
 
 /// `repr()` of a class object. CPython qualifies it with the module the class
@@ -3443,8 +3485,10 @@ fn instance_repr_inner(inst: &Instance) -> String {
 /// (CPython's name for them is not the shim's), so those stay bare.
 pub fn class_repr(class: &Class) -> String {
     match class.class_attrs.borrow().get("__typhon_module__") {
-        Some(Value::Str(m)) if !m.is_empty() => format!("<class '{m}.{}'>", class.name),
-        _ => format!("<class '{}'>", class.name),
+        Some(Value::Str(m)) if !m.is_empty() => {
+            format!("<class '{m}.{}'>", class.effective_qualname())
+        }
+        _ => format!("<class '{}'>", class.effective_qualname()),
     }
 }
 
@@ -3458,7 +3502,9 @@ pub fn object_default_repr(inst: &Instance) -> String {
     };
     format!(
         "<{}.{} object at {:#x}>",
-        module, inst.class.name, inst as *const Instance as usize
+        module,
+        inst.class.effective_qualname(),
+        inst as *const Instance as usize
     )
 }
 
@@ -3991,6 +4037,7 @@ mod tests {
         class_attrs.insert("__typhon_dc_frozen__".to_owned(), Value::Bool(true));
         Rc::new(Class {
             name: name.to_owned(),
+            qualname: name.to_owned(),
             methods: RefCell::new(HashMap::new()),
             fields: field_names
                 .iter()

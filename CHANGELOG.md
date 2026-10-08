@@ -16,6 +16,19 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ### Fixed
 
+- **`re.Match` offsets are in characters, and take a group.** Under `tyc
+  run`, `start()`, `end()` and `span()` reported the regex engine's byte
+  offsets, so any match after a non-ASCII character was off, and they
+  ignored a group argument (`m.start(1)` gave the whole match's start). They
+  now report CPython's character offsets for any group, with -1 for one that
+  did not take part. `m[1]` / `m["name"]`, `m.string`, `m.pos`, `m.endpos`,
+  `m.expand()`, `groupdict(default)` and `repr(m)` work as in CPython, and
+  `m.lastindex` / `m.lastgroup` route to CPython.
+- **`__qualname__` follows lexical nesting under `tyc run`.** Nested
+  functions, methods, lambdas and local classes now report CPython's
+  `outer.<locals>.inc` / `Cls.meth` qualname instead of the bare name, and a
+  local dataclass's repr and a local class's `repr()` use it too
+  (`outer.<locals>.P(x=1)`, `<class '__main__.outer.<locals>.P'>`).
 - **`install.sh` stops when it is interrupted.** Its `INT`, `HUP` and `TERM`
   traps removed the temporary download directory and then returned, so a
   `TERM` sent to the installer let it carry on and fail later, or report
