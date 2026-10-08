@@ -2075,6 +2075,34 @@ def gen():
     yield g2.__qualname__
 show(outer().__qualname__, Top.meth.__qualname__, Top().meth().__qualname__, Top.s.__qualname__)
 show(Top.__qualname__, list(gen()), (lambda: 0).__qualname__)
+@dataclass
+class R:
+    x: int
+R.__qualname__ = "Alias"
+def f():
+    pass
+f.__qualname__ = "g.h"
+show(R.__qualname__, repr(R(1)), repr(R), f.__qualname__)
+"#,
+    );
+}
+
+#[test]
+fn re_match_reports_char_offsets_and_groups() {
+    assert_matches_cpython(
+        "re_match_reports_char_offsets_and_groups",
+        r#"import re
+m = re.search(r"(b)(x)?", "ééab")
+show(m.start(), m.end(), m.span(), m.start(1), m.span(2), m.end(2), m[0], m[1], m[2])
+show([q.span() for q in re.finditer(r"\w", "éa")], re.sub("(é)", lambda q: str(q.span()), "aéb"))
+m = re.match(r"(?P<k>a)(b)", "ab")
+show(m.start("k"), m.end(2), m["k"], m.string, m.pos, m.endpos, m.expand(r"\2\g<k>"), repr(m))
+p = re.compile(r"(\w)(\d)?")
+m = p.search("éé x1 y", 2)
+show(repr(m), m.pos, m.endpos, m.groups("-"))
+show([(repr(q), q.span(2)) for q in p.finditer("ab1 é2", 1, 5)])
+m = re.fullmatch(r"(?P<a>x)(?P<b>y)?", "x")
+show(m.groupdict("z"), m.span("b"))
 "#,
     );
 }

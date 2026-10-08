@@ -885,7 +885,7 @@ enum KeywordCallee {
 
 /// Attributes of builtin values the VM does not model, which a program
 /// reaches only by name (`e.add_note(…)`, `e.__notes__`, an
-/// `lru_cache` wrapper's `f.cache_info()`).
+/// `lru_cache` wrapper's `f.cache_info()`, an `re.Match`'s `m.lastindex`).
 const UNMODELLED_ATTRIBUTES: &[&str] = &[
     "add_note",
     "__notes__",
@@ -894,6 +894,8 @@ const UNMODELLED_ATTRIBUTES: &[&str] = &[
     "cache_info",
     "cache_clear",
     "cache_parameters",
+    "lastindex",
+    "lastgroup",
 ];
 
 /// The last segment of a name or dotted attribute (`abc.ABCMeta` →
@@ -1574,6 +1576,9 @@ mod tests {
         )
         .unwrap_or_default();
         assert!(got.contains(&".cache_info".to_owned()), "{got:?}");
+        let got = scan_source("import re\nm = re.match(\"(a)\", \"a\")\nprint(m.lastindex)\n")
+            .unwrap_or_default();
+        assert!(got.contains(&".lastindex".to_owned()), "{got:?}");
         // Keywords the VM binds stay on the VM.
         assert_eq!(
             scan_source("import json\nimport math\nprint(round(2.5, ndigits=0), int(\"ff\", base=16), math.prod([2], start=3), json.loads(\"{}\", object_hook=dict), \"a b\".split(maxsplit=1))\n"),

@@ -1834,7 +1834,13 @@ impl Interpreter {
         body_ns.mark_class_namespace();
         // Methods close over `body_env` and nested definitions run in
         // `body_ns`; both name what they define under the class.
-        let class_qualname = env.qualname_for(c.name.as_str());
+        // An `impl Foo:` block arrives as `class __typhon_impl_Foo`; its
+        // methods are `Foo`'s.
+        let lexical_name = c.name.as_str();
+        let lexical_name = lexical_name
+            .strip_prefix("__typhon_impl_")
+            .unwrap_or(lexical_name);
+        let class_qualname = env.qualname_for(lexical_name);
         let class_scope: Rc<str> = Rc::from(class_qualname.as_str());
         body_env.set_qual_scope(class_scope.clone(), false);
         body_ns.set_qual_scope(class_scope, false);
@@ -7375,6 +7381,14 @@ impl Interpreter {
                 if let Some(inner) = crate::value::enum_mixin_value(target) {
                     return self.subscript(&inner, key);
                 }
+                // `m[1]` / `m["name"]` on an `re.Match`, whose methods are
+                // natives on the instance.
+                if i.class.name == "Match" {
+                    let group = i.fields.borrow().get("__getitem__").cloned();
+                    if let Some(group @ Value::Native(_)) = group {
+                        return self.call_value(group, vec![key.clone()], &[]);
+                    }
+                }
                 Err(type_error(format!(
                     "'{}' object is not subscriptable",
                     target.type_display_name()
@@ -7928,7 +7942,7 @@ impl Interpreter {
                     return Ok(Value::Str(Rc::new(class.name.clone())));
                 }
                 if attr == "__qualname__" {
-                    return Ok(Value::Str(Rc::new(class.qualname.clone())));
+                    return Ok(Value::Str(Rc::new(class.effective_qualname())));
                 }
                 // `Cls.__mro__` — the C3 linearisation, ending in `object`.
                 if attr == "__mro__" || attr == "__bases__" {
@@ -8268,7 +8282,7 @@ impl Interpreter {
                 Ok(Value::Str(Rc::new(function.name.clone())))
             }
             Value::BoundMethod { function, .. } if attr == "__qualname__" => {
-                Ok(Value::Str(Rc::new(function.qualname.to_string())))
+                Ok(Value::Str(Rc::new(function.effective_qualname())))
             }
             Value::ResultOk(v) => match attr {
                 "value" => Ok((**v).clone()),
@@ -10926,7 +10940,11 @@ fn mutable_default_type(default: &Value) -> Option<String> {
                     Some(Value::Str(s)) => (**s).clone(),
                     _ => "__main__".to_owned(),
                 };
-                Some(format!("<class '{}.{}'>", module, inst.class.qualname))
+                Some(format!(
+                    "<class '{}.{}'>",
+                    module,
+                    inst.class.effective_qualname()
+                ))
             } else {
                 None
             }
