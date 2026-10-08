@@ -7631,41 +7631,39 @@ fn make_re_module() -> Value {
     /// What a match object needs to know about the string it was found in:
     /// the original `string` (for `m.string`), and how to turn the regex
     /// crate's byte offsets into the character offsets CPython reports.
-    struct MatchCtx<'h> {
-        hay: &'h str,
-        ascii: bool,
+    struct MatchCtx {
+        /// Byte offset of each character's start, or `None` for an ASCII
+        /// haystack (where bytes and characters coincide). Built once, so
+        /// mapping every span of a long `finditer` stays linear.
+        char_starts: Option<Vec<usize>>,
         string: Value,
         pos: i64,
         endpos: i64,
     }
 
-    impl<'h> MatchCtx<'h> {
+    impl MatchCtx {
         /// `hay` is the searched window (the string cut at `endpos`), `string`
         /// the caller's original argument (kept as is, so `m.string is s`) and
         /// `pos` the byte offset searching began at.
-        fn new(hay: &'h str, string: &Option<Value>, pos: usize) -> Self {
-            let ascii = hay.is_ascii();
-            let chars = |b: usize| -> i64 {
-                if ascii {
-                    b as i64
-                } else {
-                    hay[..b].chars().count() as i64
-                }
-            };
-            MatchCtx {
-                hay,
-                ascii,
+        fn new(hay: &str, string: &Option<Value>, pos: usize) -> Self {
+            let char_starts =
+                (!hay.is_ascii()).then(|| hay.char_indices().map(|(b, _)| b).collect());
+            let mut ctx = MatchCtx {
+                char_starts,
                 string: string.clone().unwrap_or(Value::None),
-                pos: chars(pos),
-                endpos: chars(hay.len()),
-            }
+                pos: 0,
+                endpos: 0,
+            };
+            ctx.pos = ctx.char_offset(pos);
+            ctx.endpos = ctx.char_offset(hay.len());
+            ctx
         }
 
+        /// The character index of byte offset `byte`, a char boundary.
         fn char_offset(&self, byte: usize) -> i64 {
-            if self.ascii {
-                byte as i64
-            } else {
-                self.hay[..byte].chars().count() as i64
+            match &self.char_starts {
+                None => byte as i64,
+                Some(starts) => starts.partition_point(|&b| b < byte) as i64,
             }
         }
     }
@@ -7673,7 +7671,7 @@ fn make_re_module() -> Value {
     fn captures_to_value(
         caps: Option<regex::Captures<'_>>,
         names: &HashMap<String, usize>,
-        ctx: &MatchCtx<'_>,
+        ctx: &MatchCtx,
     ) -> Value {
         let Some(caps) = caps else { return Value::None };
         // Each group's captured text and character span; `None` for a group
