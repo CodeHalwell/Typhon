@@ -2712,7 +2712,11 @@ impl Value {
             (Class(a), Class(b)) => Rc::ptr_eq(a, b),
             // `type(5) == int`: the RHS `int` is the builtin constructor
             // (a native named "int"); match it against the type object's name.
-            (Class(c), Native(n)) | (Native(n), Class(c)) => c.name == n.name,
+            // Only the cached builtin stand-in counts: a user class that
+            // happens to be called `int` is not the builtin.
+            (Class(c), Native(n)) | (Native(n), Class(c)) => {
+                c.name == n.name && crate::builtins::is_builtin_type_class(c)
+            }
             (Native(a), Native(b)) => Rc::ptr_eq(a, b),
             // A function object is equal only to itself.
             (Function(a), Function(b)) => Rc::ptr_eq(a, b),

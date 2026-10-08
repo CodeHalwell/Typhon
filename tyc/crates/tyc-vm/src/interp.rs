@@ -5944,6 +5944,13 @@ impl Interpreter {
         args: Vec<Value>,
         kwargs: &[(String, Value)],
     ) -> Result<Value, Unwind> {
+        // `type(x)(...)` for a builtin: the stand-in class `type()` returns
+        // constructs exactly as the builtin's own constructor does.
+        if crate::builtins::is_builtin_type_class(class) {
+            if let Some(ctor) = self.builtin_globals.get(&class.name).cloned() {
+                return self.call_value(ctor, args, kwargs);
+            }
+        }
         // Calling an enum class is value-lookup, not construction:
         // `Color(2)` → the member whose value is 2 (CPython semantics).
         if Self::is_enum_class(class) {
@@ -8201,6 +8208,39 @@ impl Interpreter {
                             })?;
                             i.set_attr_raw(&obj, &name.py_str(), val)?;
                             Ok(Value::None)
+                        },
+                    ))));
+                }
+                // `object.__new__(cls)` — a bare instance, no `__init__` run
+                // (how `copy` rebuilds an object).
+                if builtin_object && attr == "__new__" {
+                    return Ok(Value::Native(Rc::new(NativeFn::new(
+                        "object.__new__",
+                        |_i, args| match args.first() {
+                            Some(Value::Class(c)) if crate::builtins::is_builtin_type_class(c) => {
+                                Err(type_error(format!(
+                                    "object.__new__({0}) is not safe, use {0}.__new__()",
+                                    c.name
+                                )))
+                            }
+                            Some(Value::Native(n))
+                                if crate::builtins::is_builtin_type_name(n.name) =>
+                            {
+                                Err(type_error(format!(
+                                    "object.__new__({0}) is not safe, use {0}.__new__()",
+                                    n.name
+                                )))
+                            }
+                            Some(Value::Class(c)) => Ok(Value::Instance(Rc::new(Instance {
+                                class: c.clone(),
+                                fields: RefCell::new(crate::value::FieldMap::new()),
+                                chain: RefCell::new(None),
+                            }))),
+                            Some(other) => Err(type_error(format!(
+                                "object.__new__(X): X is not a type object ({})",
+                                other.type_name()
+                            ))),
+                            None => Err(type_error("object.__new__(): not enough arguments")),
                         },
                     ))));
                 }
@@ -12725,6 +12765,14 @@ fn values_identical(a: &Value, b: &Value) -> bool {
         (Instance(x), Instance(y)) => Rc::ptr_eq(x, y),
         (Module(x), Module(y)) => Rc::ptr_eq(x, y),
         (Class(x), Class(y)) => Rc::ptr_eq(x, y),
+        // `type([]) is list`: `type(x)` hands back the cached stand-in class
+        // for a builtin, while the name `list` is its constructor native —
+        // one type object in CPython.
+        (Class(c), Native(n)) | (Native(n), Class(c)) => {
+            c.name == n.name
+                && crate::builtins::is_builtin_type_name(n.name)
+                && crate::builtins::is_builtin_type_class(c)
+        }
         // A function object is one `Rc`, so `g is f` after `g = f` (and
         // `wrapper.__wrapped__ is f`) holds, as in CPython.
         (Function(x), Function(y)) => Rc::ptr_eq(x, y),

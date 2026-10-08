@@ -887,6 +887,8 @@ enum KeywordCallee {
 /// reaches only by name (`e.add_note(…)`, `e.__notes__`, an
 /// `lru_cache` wrapper's `f.cache_info()`, an `re.Match`'s `m.lastindex`).
 const UNMODELLED_ATTRIBUTES: &[&str] = &[
+    // An instance's live `__dict__`: the VM has only the `vars()` snapshot.
+    "__dict__",
     "add_note",
     "__notes__",
     "with_traceback",
@@ -1579,6 +1581,14 @@ mod tests {
         let got = scan_source("import re\nm = re.match(\"(a)\", \"a\")\nprint(m.lastindex)\n")
             .unwrap_or_default();
         assert!(got.contains(&".lastindex".to_owned()), "{got:?}");
+        let got =
+            scan_source("class P:\n    pass\np = P()\nprint(p.__dict__)\n").unwrap_or_default();
+        assert!(got.contains(&".__dict__".to_owned()), "{got:?}");
+        // `copy` is modelled, so importing it stays on the VM.
+        assert_eq!(
+            scan_source("import copy\nprint(copy.deepcopy([1]))\n"),
+            None
+        );
         // Keywords the VM binds stay on the VM.
         assert_eq!(
             scan_source("import json\nimport math\nprint(round(2.5, ndigits=0), int(\"ff\", base=16), math.prod([2], start=3), json.loads(\"{}\", object_hook=dict), \"a b\".split(maxsplit=1))\n"),

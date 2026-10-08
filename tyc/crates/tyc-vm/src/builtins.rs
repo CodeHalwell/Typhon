@@ -2383,6 +2383,12 @@ pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
         // which silently inverts any control flow written around it.
         ("object", _) => true,
         ("NoneType", Value::None) => true,
+        // Classes are `type` instances: user classes, the stand-ins
+        // `type(x)` returns, and the builtin types and exceptions.
+        ("type", Value::Class(_)) => true,
+        ("type", Value::Native(n)) => {
+            is_builtin_type_name(n.name) || crate::interp::builtin_exc_mro(n.name).is_some()
+        }
         ("int", Value::Int(_)) => true,
         // `bool` is a subclass of `int` in CPython, so `isinstance(True, int)`
         // is `True` there. The VM answered `False`, taking the opposite branch
@@ -2554,6 +2560,7 @@ mod shims {
     pub const STRING: &str = include_str!("shims/string.py");
     pub const OPERATOR: &str = include_str!("shims/operator.py");
     pub const BISECT: &str = include_str!("shims/bisect.py");
+    pub const COPY: &str = include_str!("shims/copy.py");
     pub const BASE64: &str = include_str!("shims/base64.py");
     pub const CSV: &str = include_str!("shims/csv.py");
     pub const FUNCTOOLS_EXTRA: &str = include_str!("shims/functools_extra.py");
@@ -2597,14 +2604,36 @@ fn compile_shim(
     for (name, value) in seed {
         env.set(name, value);
     }
+    // Frames inside the shim report the shim's own lines, under a
+    // `<frozen NAME>` file as CPython shows its frozen modules, rather than
+    // borrowing the caller's file and line numbers.
+    let shim_source = Some(Rc::new(crate::interp::SourceInfo::new(
+        format!("<frozen {}>", shim_name(source)),
+        source,
+    )));
+    let outer_source = std::mem::replace(&mut interp.current_source, shim_source);
     // A shim's classes must not be stamped with the *caller's* module: they
     // would then repr as `<class '__main__.Path'>`. An empty module name
     // leaves them bare, which is what the VM printed before shims had one.
     let outer_module = std::mem::take(&mut interp.current_module_name);
     let result = interp.exec_block(&module.body, &env);
     interp.current_module_name = outer_module;
+    interp.current_source = outer_source;
     result?;
     Ok((env.snapshot(), env))
+}
+
+/// The module a shim implements, from its leading "# `name` — …" comment.
+fn shim_name(source: &str) -> &str {
+    let first = source.lines().next().unwrap_or("");
+    first
+        .split('`')
+        .nth(1)
+        .filter(|n| {
+            n.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        })
+        .unwrap_or("stdlib")
 }
 
 /// A module whose members are the top-level bindings of a Python shim.
@@ -3210,6 +3239,7 @@ pub const MODELLED_MODULE_ROOTS: &[&str] = &[
     "bisect",
     "collections",
     "contextlib",
+    "copy",
     "csv",
     "dataclasses",
     "datetime",
@@ -3293,6 +3323,7 @@ pub fn resolve_module(interp: &mut Interpreter, name: &str) -> Result<Value, Unw
         "string" => module_from_shim(interp, "string", shims::STRING),
         "operator" => module_from_shim(interp, "operator", shims::OPERATOR),
         "bisect" => module_from_shim(interp, "bisect", shims::BISECT),
+        "copy" => module_from_shim_hiding(interp, "copy", shims::COPY, &["dataclasses", "enum"]),
         "base64" => module_from_shim_hiding(interp, "base64", shims::BASE64, &["Error"]),
         "csv" => module_from_shim(interp, "csv", shims::CSV),
         "pydantic" => Ok(make_pydantic_module()),

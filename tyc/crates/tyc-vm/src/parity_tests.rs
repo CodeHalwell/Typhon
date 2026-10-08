@@ -2240,3 +2240,105 @@ assert util.make().__name__ is make().__name__
         0
     );
 }
+
+#[test]
+fn copy_module_matches_cpython() {
+    assert_matches_cpython(
+        "copy_module_matches_cpython",
+        r#"import copy
+from dataclasses import dataclass, field
+from enum import Enum
+from collections import namedtuple
+class Color(Enum):
+    RED = 1
+@dataclass
+class P:
+    x: int
+    ys: list
+@dataclass(frozen=True)
+class F:
+    a: int
+    b: list = field(default_factory=list)
+class Plain:
+    n: int
+    items: list
+    def __init__(self, n):
+        self.n = n
+        self.items = [n]
+class Custom:
+    log: list
+    def __init__(self, log):
+        self.log = log
+    def __copy__(self):
+        return Custom(["copied"])
+    def __deepcopy__(self, memo):
+        return Custom(["deep", isinstance(memo, dict)])
+class Stateful:
+    a: int
+    def __init__(self, a):
+        self.a = a
+    def __getstate__(self):
+        return {"a": self.a * 10}
+    def __setstate__(self, st):
+        self.a = st["a"] + 1
+Pt = namedtuple("Pt", "x y")
+a = [[1, 2], {"k": [3]}, (4, [5]), {6}, frozenset({7}), "s", 8, None]
+s = copy.copy(a)
+d = copy.deepcopy(a)
+show(s == a, s is a, s[0] is a[0], d == a, d[0] is a[0], d[1]["k"] is a[1]["k"], d[2] is a[2], d[2][1] is a[2][1])
+t = (1, "x", (2, 3))
+show(copy.copy(t) is t, copy.deepcopy(t) is t, copy.deepcopy((1, [2]))[1] is (1, [2])[1])
+r = []
+r.append(r)
+rc = copy.deepcopy(r)
+show(rc[0] is rc, rc is not r)
+shared = [1]
+pair = [shared, shared]
+pc = copy.deepcopy(pair)
+show(pc[0] is pc[1], pc[0] is shared)
+p = P(1, [2])
+ps, pd = copy.copy(p), copy.deepcopy(p)
+show(ps, ps is p, ps.ys is p.ys, pd.ys is p.ys, pd == p)
+f = F(1, [2])
+fs, fd = copy.copy(f), copy.deepcopy(f)
+show(fs, fs.b is f.b, fd.b is f.b, fd == f)
+pl = Plain(5)
+pls, pld = copy.copy(pl), copy.deepcopy(pl)
+show(type(pls).__name__, pls.n, pls.items is pl.items, pld.items is pl.items, pld.items, vars(pld))
+show(copy.copy(Custom([])).log, copy.deepcopy(Custom([])).log)
+st = Stateful(1)
+show(copy.copy(st).a, copy.deepcopy(st).a)
+show(copy.copy(Color.RED) is Color.RED, copy.deepcopy(Color.RED) is Color.RED, copy.deepcopy(len) is len, copy.copy(P) is P)
+show(copy.replace(p, x=9), copy.replace(f, a=7), copy.replace(Pt(1, 2), y=5))
+try:
+    copy.replace([1], x=1)
+except TypeError as e:
+    show("TypeError", str(e))
+show(copy.Error is copy.error, issubclass(copy.Error, Exception))
+m = {}
+show(copy.deepcopy([1, [2]], m) == [1, [2]], len(m) > 0)
+"#,
+    );
+}
+
+#[test]
+fn builtin_type_objects_are_the_builtins() {
+    assert_matches_cpython(
+        "builtin_type_objects_are_the_builtins",
+        r#"class P:
+    x: int
+o0 = object()
+xs = [1]
+show(type(xs) is list, type({}) is dict, type({1}) is set, type((1,)) is tuple, type("s") is str, type(1) is int, type(True) is bool, type(1.5) is float)
+show(type(xs) is not list, type(xs) is tuple, type(xs) in (list, dict))
+show(type(xs)([1, 2]), type({1})([3, 3]), type("")(5), type(0)("7"), type(())(xs), type({})(a=1))
+show(isinstance(P, type), isinstance(int, type), isinstance(ValueError, type), isinstance(type(xs), type), isinstance(len, type), isinstance(xs, type), isinstance(o0, type))
+try:
+    object.__new__(list)
+except TypeError as e:
+    show(str(e))
+o = object.__new__(P)
+show(type(o) is P, isinstance(o, P))
+"#,
+    );
+}
