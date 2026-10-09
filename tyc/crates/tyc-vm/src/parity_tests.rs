@@ -2475,7 +2475,7 @@ show(repr(str.__init__), str.__init__.__qualname__, str.__init__.__objclass__ is
 show(True.bit_count.__qualname__, True.__add__.__qualname__, True.__and__.__qualname__, repr(list.__eq__))
 import json
 import functools
-show(type(json.dumps).__name__, type(functools.reduce).__name__, type(functools.wraps).__name__, type(functools.partial).__name__ != "function")
+show(type(json.dumps).__name__, type(functools.reduce).__name__, type(functools.wraps).__name__, type(functools.partial).__name__, repr(functools.partial), type(functools.cached_property).__name__, repr(functools.cached_property))
 sort = xs.sort
 sort()
 show(xs, list.append(xs, 4), xs, str.upper("a"))

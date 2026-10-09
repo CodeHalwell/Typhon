@@ -31,7 +31,9 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   a `function`, and `random`'s exports are
   methods of its hidden `Random()` as in CPython (`random.randint` is a
   `method` named `Random.randint`; `random.random` a builtin).
-  `@contextmanager` and `lru_cache(n)` return a `function`.
+  `@contextmanager` and `lru_cache(n)` return a `function`, and
+  `functools.partial` / `cached_property` are classes
+  (`<class 'functools.partial'>`).
   Slot methods are slot wrappers: `type(list.__len__)` is
   `wrapper_descriptor` (`<slot wrapper '__len__' of 'list' objects>`) and
   `[].__len__` a `method-wrapper`; an inherited slot names the type that

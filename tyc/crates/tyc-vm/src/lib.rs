@@ -1482,11 +1482,9 @@ fn runtime_bound_names(
             };
             let t = t.id.to_string();
             self.bind(&t);
-            let value = match value {
-                // `list[int]` is a generic alias of its origin.
-                Expr::Subscript(s) if matches!(s.value.as_ref(), Expr::Name(_)) => s.value.as_ref(),
-                other => other,
-            };
+            // A subscript (`bases[0]`, even `list[int]`) is a runtime
+            // value; the scan's own builtin check still names a builtin
+            // generic alias first.
             match value {
                 Expr::Name(v) => self.name_aliases.push((t, v.id.to_string())),
                 Expr::Attribute(a) => {

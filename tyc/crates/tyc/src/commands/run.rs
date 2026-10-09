@@ -1661,6 +1661,7 @@ mod tests {
             "plain class L(Base):\n    pass\nBase = list if True else dict\n",
             "plain class Holder:\n    def __init__(self, base: type) -> None:\n        self.base = base\nh = Holder(list)\nplain class L(h.base):\n    pass\nprint(L([1]))\n",
             "def make(cfg: object) -> None:\n    plain class L(cfg.base):\n        pass\n    print(L([1]))\n",
+            "def make(bases: list[type]) -> None:\n    let Base = bases[0]\n    plain class L(Base):\n        pass\n    print(L([1]))\nmake([list])\n",
         ] {
             let found = scan_source(src).expect(src);
             assert!(found[0].contains("computed at runtime"), "{src}: {found:?}");

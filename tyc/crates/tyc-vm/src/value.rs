@@ -775,7 +775,12 @@ pub fn native_repr(name: &str) -> String {
     if name == "NotImplemented" {
         return name.to_owned();
     }
-    if native_is_type(name) && !matches!(name, "enum.auto" | "NewType" | "defaultdict") {
+    if native_is_type(name)
+        && !matches!(
+            name,
+            "enum.auto" | "NewType" | "defaultdict" | "partial" | "cached_property"
+        )
+    {
         return format!("<class '{name}'>");
     }
     // Two prelude names the VM models as natives are *classes* in CPython,
@@ -784,6 +789,8 @@ pub fn native_repr(name: &str) -> String {
         "enum.auto" => "<class 'enum.auto'>".to_owned(),
         "NewType" => "<class 'typing.NewType'>".to_owned(),
         "defaultdict" => "<class 'collections.defaultdict'>".to_owned(),
+        "partial" => "<class 'functools.partial'>".to_owned(),
+        "cached_property" => "<class 'functools.cached_property'>".to_owned(),
         _ => format!("<built-in function {name}>"),
     }
 }
@@ -1072,6 +1079,9 @@ pub fn native_is_type(name: &str) -> bool {
                 | "StopAsyncIteration"
                 | "ExceptionGroup"
                 | "BaseExceptionGroup"
+                // `functools`' classes the VM builds as natives.
+                | "partial"
+                | "cached_property"
         )
         || name.ends_with("Error")
         || name.ends_with("Exception")
