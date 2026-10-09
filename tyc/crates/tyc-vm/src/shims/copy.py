@@ -29,6 +29,26 @@ class _Holder:
 # Functions, builtins and methods copy as themselves, as in CPython.
 _FUNCTION_TYPES = (type(_function), type(len), type(_Holder().method))
 
+# The builtin iterator types: each answers CPython's `__reduce__`, which is
+# how they are copied.
+_ITER_TYPES = (
+    type(iter([])),
+    type(iter(())),
+    type(iter("")),
+    type(iter(range(0))),
+    type(iter({})),
+    type(iter({}.values())),
+    type(iter({}.items())),
+    type(iter(set())),
+    type(reversed([])),
+    type(reversed({})),
+    type(enumerate([])),
+    type(zip()),
+    type(map(len, [])),
+    type(filter(None, [])),
+    type(_function() for _ in ()),
+)
+
 # The class of a real bytearray. Under the VM `bytearray` names the builtin
 # constructor, so `type(x) is bytearray` alone does not recognise one.
 _BYTEARRAY = type(bytearray())
@@ -104,6 +124,52 @@ def _rebuild(x, state, slots):
     return y
 
 
+def _reduction(x):
+    # The reduce value CPython's `copy` falls back on, when there is one to
+    # follow: a builtin iterator's, or a class's own `__reduce_ex__` /
+    # `__reduce__`. Anything else is rebuilt from its state.
+    cls = type(x)
+    if cls in _ITER_TYPES:
+        return x.__reduce__()
+    if _defines(cls, "__reduce_ex__"):
+        return x.__reduce_ex__(4)
+    if _defines(cls, "__reduce__"):
+        return x.__reduce__()
+    return None
+
+
+def _reconstruct(x, memo, rv, deep):
+    # `copy._reconstruct`: call the reduce value's callable on its
+    # arguments, then restore the state and any list or dict items.
+    func = rv[0]
+    args = rv[1]
+    state = rv[2] if len(rv) > 2 else None
+    listiter = rv[3] if len(rv) > 3 else None
+    dictiter = rv[4] if len(rv) > 4 else None
+    if deep and args:
+        args = deepcopy(args, memo)
+    y = func(*args)
+    if deep:
+        memo[id(x)] = y
+    if state is not None:
+        if deep:
+            state = deepcopy(state, memo)
+        if type(y) in _ITER_TYPES or hasattr(y, "__setstate__"):
+            y.__setstate__(state)
+        else:
+            _apply_state(y, type(y), state)
+    if listiter is not None:
+        for item in listiter:
+            y.append(deepcopy(item, memo) if deep else item)
+    if dictiter is not None:
+        for key, value in dictiter:
+            if deep:
+                key = deepcopy(key, memo)
+                value = deepcopy(value, memo)
+            y[key] = value
+    return y
+
+
 def _defines(cls, name):
     for c in cls.__mro__:
         if c is not object and name in getattr(c, "__dict__", ()):
@@ -145,6 +211,11 @@ def copy(x):
     copier = getattr(cls, "_typhon_copy", None)
     if copier is not None:
         return copier(x)
+    rv = _reduction(x)
+    if isinstance(rv, str):
+        return x
+    if rv is not None:
+        return _reconstruct(x, None, rv, False)
     if isinstance(x, BaseException):
         # `BaseException.__reduce__`: the class called on the same args.
         y = cls(*x.args)
@@ -204,6 +275,8 @@ def deepcopy(x, memo=None, _nil=[]):
             y = copier(memo)
         elif _atomic(x):
             y = x
+        elif (rv := _reduction(x)) is not None:
+            y = x if isinstance(rv, str) else _reconstruct(x, memo, rv, True)
         elif isinstance(x, BaseException):
             args = deepcopy(x.args, memo)
             y = cls(*args)

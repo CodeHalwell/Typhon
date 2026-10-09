@@ -32,9 +32,12 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   `copy` to CPython. The VM now has `copy.copy`, `copy.deepcopy` (memo,
   cycles and shared references included), `copy.replace` and `copy.Error`,
   honouring `__copy__`, `__deepcopy__`, `__getstate__` / `__setstate__` and
-  `__slots__`. Copies of `bytearray`, `defaultdict`, `Counter`,
-  `OrderedDict`, `ChainMap`, `UserDict` and `UserList` get their own
-  storage, `slice`s and exceptions copy as in CPython, and
+  `__slots__`, a class's own `__reduce__` / `__reduce_ex__` included.
+  Copies of `bytearray`, `defaultdict`, `Counter`, `OrderedDict`,
+  `ChainMap`, `deque`, `UserDict` and `UserList` get their own storage
+  (and keep their subclass), builtin iterators copy at their current
+  position, a deep-copied bound method is rebound to a copy of its
+  receiver, `slice`s and exceptions copy as in CPython, and
   `type(collections.defaultdict())` is `defaultdict`.
 - **Builtin type objects are the builtins.** Under `tyc run`,
   `type([]) is list` was `False` (`==` already held), `type(x)(...)` on a

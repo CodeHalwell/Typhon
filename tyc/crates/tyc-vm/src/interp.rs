@@ -8435,6 +8435,16 @@ impl Interpreter {
                         return Ok(default.clone());
                     }
                 }
+                // `type(xs)` is the cached stand-in for `list`; it is the
+                // same object as the builtin, so it answers what the
+                // builtin answers (`type(xs).append(xs, 2)`, `__module__`).
+                if crate::builtins::is_builtin_type_class(class) {
+                    if let Some(native @ Value::Native(_)) =
+                        self.builtin_globals.get(class.name.as_str()).cloned()
+                    {
+                        return self.get_attr(&native, attr);
+                    }
+                }
                 Err(attribute_error(format!(
                     "type object '{}' has no attribute '{}'",
                     class.name, attr
@@ -8732,6 +8742,23 @@ impl Interpreter {
             Value::Iter(_) => {
                 let generator = as_generator(value);
                 match (attr, generator) {
+                    ("__reduce__", _) => {
+                        let target = value.clone();
+                        Ok(Value::Native(Rc::new(NativeFn::new(
+                            "__reduce__",
+                            move |i, _a| iter_reduce(i, &target),
+                        ))))
+                    }
+                    ("__setstate__", _) => {
+                        let target = value.clone();
+                        Ok(Value::Native(Rc::new(NativeFn::new(
+                            "__setstate__",
+                            move |_i, args| {
+                                let state = args.into_iter().next().unwrap_or(Value::None);
+                                iter_setstate(&target, &state)
+                            },
+                        ))))
+                    }
                     ("__next__", _) => {
                         let target = value.clone();
                         Ok(Value::Native(Rc::new(NativeFn::new(
@@ -13022,6 +13049,191 @@ fn reject_sync_only_async_iterable(v: &Value) -> Result<(), Unwind> {
         )));
     }
     Ok(())
+}
+
+/// `it.__reduce__()` for a builtin iterator, shaped as CPython's: the
+/// callable that rebuilds it, its arguments and (for a positioned
+/// iterator) the index `__setstate__` restores. This is what lets `copy`
+/// copy an iterator: a list iterator's copy shares the list and resumes
+/// at the same place, a dict or set iterator's is a list iterator over
+/// the entries still to come, and a generator cannot be copied at all.
+fn iter_reduce(interp: &mut Interpreter, target: &Value) -> Result<Value, Unwind> {
+    let Value::Iter(it) = target else {
+        return Err(type_error("cannot pickle this object"));
+    };
+    enum Plan {
+        Seq(&'static str, Value, Option<i64>),
+        Remaining,
+        Wrap(&'static str, Vec<Value>),
+        Refuse(&'static str),
+    }
+    let plan = match &*it.borrow() {
+        IterState::List { items, index } => {
+            Plan::Seq("iter", Value::List(items.clone()), Some(*index as i64))
+        }
+        IterState::Tuple { items, index } => {
+            Plan::Seq("iter", Value::Tuple(items.clone()), Some(*index as i64))
+        }
+        IterState::Str { chars, index } => Plan::Seq(
+            "iter",
+            Value::Str(Rc::new(chars.iter().collect())),
+            Some(*index as i64),
+        ),
+        IterState::Range {
+            current,
+            stop,
+            step,
+        } => Plan::Seq(
+            "iter",
+            Value::Range {
+                start: *current,
+                stop: *stop,
+                step: *step,
+            },
+            None,
+        ),
+        // CPython's state is the index of the next item to yield.
+        IterState::ListRev { list, index } => Plan::Seq(
+            "reversed",
+            Value::List(list.clone()),
+            Some(*index as i64 - 1),
+        ),
+        IterState::SeqIter { obj, index } => Plan::Seq("iter", obj.clone(), Some(*index as i64)),
+        IterState::Dict { .. }
+        | IterState::DictRev { .. }
+        | IterState::Set { .. }
+        | IterState::Reversed { .. } => Plan::Remaining,
+        IterState::Enumerate { inner, index } => Plan::Wrap(
+            "enumerate",
+            vec![Value::Iter(inner.clone()), Value::Int(VmInt::from(*index))],
+        ),
+        IterState::Zip { inners } => {
+            Plan::Wrap("zip", inners.iter().cloned().map(Value::Iter).collect())
+        }
+        IterState::Map { func, inner, star } => {
+            let mut args = vec![func.clone()];
+            if *star {
+                match &*inner.borrow() {
+                    IterState::Zip { inners } => {
+                        args.extend(inners.iter().cloned().map(Value::Iter));
+                    }
+                    _ => args.push(Value::Iter(inner.clone())),
+                }
+            } else {
+                args.push(Value::Iter(inner.clone()));
+            }
+            Plan::Wrap("map", args)
+        }
+        IterState::Filter { func, inner } => {
+            Plan::Wrap("filter", vec![func.clone(), Value::Iter(inner.clone())])
+        }
+        IterState::Generator(_) | IterState::GenExpr(_) => Plan::Refuse("generator"),
+        IterState::UserIter(_) | IterState::AsyncUserIter(_) => Plan::Refuse("iterator"),
+    };
+    let builtin = |interp: &Interpreter, name: &str| {
+        interp
+            .builtin_globals
+            .get(name)
+            .cloned()
+            .ok_or_else(|| type_error(format!("cannot pickle '{name}' iterator")))
+    };
+    let parts = match plan {
+        Plan::Seq(ctor, seq, state) => {
+            let mut parts = vec![builtin(interp, ctor)?, Value::Tuple(Rc::new(vec![seq]))];
+            if let Some(state) = state {
+                parts.push(Value::Int(VmInt::from(state)));
+            }
+            parts
+        }
+        Plan::Remaining => {
+            // Step a twin of the iterator over the same live container, so
+            // the original keeps its place.
+            let twin = {
+                let state = it.borrow();
+                match &*state {
+                    IterState::Dict {
+                        dict,
+                        kind,
+                        index,
+                        used,
+                        remaining,
+                    } => IterState::Dict {
+                        dict: dict.clone(),
+                        kind: *kind,
+                        index: *index,
+                        used: *used,
+                        remaining: *remaining,
+                    },
+                    IterState::DictRev {
+                        dict,
+                        kind,
+                        index,
+                        used,
+                    } => IterState::DictRev {
+                        dict: dict.clone(),
+                        kind: *kind,
+                        index: *index,
+                        used: *used,
+                    },
+                    IterState::Set {
+                        set,
+                        pos,
+                        used,
+                        remaining,
+                    } => IterState::Set {
+                        set: set.clone(),
+                        pos: *pos,
+                        used: *used,
+                        remaining: *remaining,
+                    },
+                    IterState::Reversed { items, index } => IterState::Reversed {
+                        items: items.clone(),
+                        index: *index,
+                    },
+                    _ => unreachable!("only the snapshot shapes reach here"),
+                }
+            };
+            let twin = Value::Iter(Rc::new(RefCell::new(twin)));
+            let mut rest = Vec::new();
+            while let Some(v) = interp.iter_next(&twin)? {
+                rest.push(v);
+            }
+            vec![
+                builtin(interp, "iter")?,
+                Value::Tuple(Rc::new(vec![Value::List(Rc::new(RefCell::new(rest)))])),
+            ]
+        }
+        Plan::Wrap(ctor, args) => vec![builtin(interp, ctor)?, Value::Tuple(Rc::new(args))],
+        Plan::Refuse(kind) => {
+            return Err(type_error(format!("cannot pickle '{kind}' object")));
+        }
+    };
+    Ok(Value::Tuple(Rc::new(parts)))
+}
+
+/// `it.__setstate__(index)` for a positioned builtin iterator, clamped
+/// as CPython clamps it.
+fn iter_setstate(target: &Value, state: &Value) -> Result<Value, Unwind> {
+    let Value::Iter(it) = target else {
+        return Ok(Value::None);
+    };
+    let Value::Int(i) = state else {
+        return Err(type_error("an integer is required"));
+    };
+    let n = i.to_bigint().try_into().unwrap_or(i64::MAX).max(-1);
+    match &mut *it.borrow_mut() {
+        IterState::List { items, index } => {
+            *index = (n.max(0) as usize).min(items.borrow().len());
+        }
+        IterState::Tuple { items, index } => *index = (n.max(0) as usize).min(items.len()),
+        IterState::Str { chars, index } => *index = (n.max(0) as usize).min(chars.len()),
+        IterState::SeqIter { index, .. } => *index = n.max(0) as usize,
+        IterState::ListRev { list, index } => {
+            *index = ((n + 1) as usize).min(list.borrow().len());
+        }
+        _ => {}
+    }
+    Ok(Value::None)
 }
 
 pub(crate) fn as_generator(v: &Value) -> Option<Rc<RefCell<GeneratorState>>> {

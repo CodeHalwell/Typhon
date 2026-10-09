@@ -2506,6 +2506,42 @@ _cp.deepcopy(_l.append)(2)
 show(_l)
 _tk = {type(_dd(list)): 1, len: 2, property: 3}
 show(list(_tk)[1:], list(_tk)[0] is _dd, _tk.popitem()[0] is property, len in set(_tk))
+_x = iter([1, 2, 3])
+next(_x)
+_y = _cp.copy(_x)
+show(next(_y), next(_x), type(_y).__name__)
+_ll = [[1], [2]]
+_nb = next(_cp.deepcopy(iter(_ll)))
+_nb.append(9)
+show(_ll, _nb)
+_di = iter({"a": 1, "b": 2})
+next(_di)
+show(list(_cp.copy(_di)), list(_di))
+_en = enumerate("xyz")
+next(_en)
+show(next(_cp.copy(_en)), next(_en))
+_rv = reversed([1, 2, 3])
+next(_rv)
+show(list(_cp.copy(_rv)), list(_rv), list(_cp.copy(iter(range(3)))), list(_cp.copy(iter("ab"))))
+try:
+    _cp.copy(i for i in [1])
+except TypeError as _ex:
+    show("TypeError", _ex)
+class _Red:
+    v: int
+    def __init__(self, v):
+        self.v = v
+    def __reduce__(self):
+        return (_Red, (self.v + 1,))
+show(_cp.copy(_Red(1)).v, _cp.deepcopy(_Red(5)).v)
+from collections import ChainMap as _CM
+class _MyCM(_CM):
+    pass
+_cm = _MyCM({"a": 1}, {"b": 2})
+show(type(_cp.copy(_cm)).__name__, type(_cm.new_child()).__name__, type(_cm.parents).__name__, _cp.copy(_cm))
+_xs = [1]
+type(_xs).append(_xs, 2)
+show(_xs, type(_xs).__module__, type("a").upper("b"), type(1).bit_length(5), hasattr(type(_xs), "append"))
 "#,
     );
 }

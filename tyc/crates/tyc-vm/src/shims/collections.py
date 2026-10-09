@@ -424,14 +424,14 @@ class ChainMap(_MappingBase):
     def new_child(self, m=None):
         if m is None:
             m = {}
-        return ChainMap(m, *self.maps)
+        return self.__class__(m, *self.maps)
 
     @property
     def parents(self):
-        return ChainMap(*self.maps[1:])
+        return self.__class__(*self.maps[1:])
 
     def __repr__(self):
-        return "ChainMap(%s)" % ", ".join(repr(m) for m in self.maps)
+        return "%s(%s)" % (type(self).__name__, ", ".join(repr(m) for m in self.maps))
 
     def __eq__(self, other):
         if isinstance(other, ChainMap):
@@ -441,7 +441,8 @@ class ChainMap(_MappingBase):
         return False
 
     def copy(self):
-        return ChainMap(dict(self.maps[0]), *self.maps[1:])
+        # A subclass stays itself, as in CPython (`self.__class__`).
+        return self.__class__(self.maps[0].copy(), *self.maps[1:])
 
     def __copy__(self):
         return self.copy()
