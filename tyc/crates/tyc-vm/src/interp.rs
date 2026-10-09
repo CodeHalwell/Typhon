@@ -1763,6 +1763,30 @@ impl Interpreter {
                 // A computed builtin base (`class E(type(ValueError()))`)
                 // arrives as the `type(x)` stand-in; it means the builtin of
                 // that name, as if the header had spelt it.
+                // `class Stack(typing.List[int])` / `(Generic[T])`: a
+                // subscripted `typing` form's base is its origin (an inert
+                // form such as `Generic` is ignored below, as when bare).
+                // A special form (`Union[...]`, `Literal[...]`, `Final[...]`)
+                // has no class behind it and refuses, as CPython's do.
+                let v = match v {
+                    Value::Instance(inst) if inst.class.name == "_TypingAlias" => {
+                        let special = inst
+                            .fields
+                            .borrow()
+                            .get("_special")
+                            .is_some_and(Value::truthy);
+                        if special {
+                            let shown = self.repr_of(&Value::Instance(inst.clone()))?;
+                            return Err(type_error(format!("Cannot subclass {shown}")));
+                        }
+                        inst.fields
+                            .borrow()
+                            .get("__origin__")
+                            .cloned()
+                            .unwrap_or(Value::None)
+                    }
+                    other => other,
+                };
                 let v = match v {
                     Value::Class(c) if crate::builtins::is_builtin_type_class(&c) => self
                         .builtin_globals
@@ -2439,6 +2463,11 @@ impl Interpreter {
         {
             self.materialise_enum_members(&class, c);
         }
+        // `ABCMeta.__new__` fixes the abstract set when the class is made;
+        // `abc.update_abstractmethods` recomputes it.
+        if crate::builtins::is_abc_class(&class) {
+            update_abstract_set(&class);
+        }
 
         self.finish_class_creation(&class, c, env)?;
         Ok(class)
@@ -3079,6 +3108,31 @@ impl Interpreter {
             ))])))
         });
         members.insert("auto".to_owned(), Value::Native(Rc::new(auto)));
+        // `EnumType` (alias `EnumMeta`): what `type(Color)` is.
+        let mut meta_attrs: HashMap<String, Value> = HashMap::new();
+        meta_attrs.insert(
+            "__typhon_builtin_bases__".to_owned(),
+            Value::Tuple(Rc::new(vec![Value::Str(Rc::new("type".to_owned()))])),
+        );
+        meta_attrs.insert(
+            "__typhon_shim_module__".to_owned(),
+            Value::Str(Rc::new("enum".to_owned())),
+        );
+        let meta = Value::Class(Rc::new(Class {
+            name: "EnumType".to_owned(),
+            qualname: Rc::new("EnumType".to_owned()),
+            methods: RefCell::new(HashMap::new()),
+            fields: vec![],
+            class_attrs: RefCell::new(meta_attrs),
+            bases: vec![],
+            mro: vec![],
+            properties: RefCell::new(std::collections::HashSet::new()),
+            classmethods: RefCell::new(std::collections::HashSet::new()),
+            is_exception: false,
+            is_protocol: false,
+        }));
+        members.insert("EnumType".to_owned(), meta.clone());
+        members.insert("EnumMeta".to_owned(), meta);
         Value::Module(Rc::new(Module {
             name: "enum".to_owned(),
             members: RefCell::new(members),
@@ -3483,6 +3537,17 @@ impl Interpreter {
         let mut member_list: Vec<Value> = Vec::with_capacity(order.len());
         {
             let mut attrs = class.class_attrs.borrow_mut();
+            // Every member name in definition order, aliases included, for
+            // `__members__`.
+            attrs.insert(
+                "__typhon_enum_names__".to_owned(),
+                Value::Tuple(Rc::new(
+                    order
+                        .iter()
+                        .map(|n| Value::Str(Rc::new(n.clone())))
+                        .collect(),
+                )),
+            );
             // Tracks the last assigned integer value so a bare `auto()`
             // continues from it (CPython: `A = 10; B = auto()` ⇒ `B == 11`).
             // Starts at 0 so a leading `auto()` yields 1.
@@ -5927,11 +5992,23 @@ impl Interpreter {
         if let Some(va) = &params.vararg {
             env.set(va.name.as_str(), Value::Tuple(Rc::new(remaining)));
         } else if !remaining.is_empty() {
+            // CPython's wording: the qualified name, the accepted range
+            // when some parameters have defaults, and the grammar of 1.
+            let max = positional.len();
+            let min = f.defaults.iter().take(max).filter(|d| d.is_none()).count();
+            let given = max + remaining.len();
+            let was = if given == 1 { "was" } else { "were" };
+            let takes = if min == max {
+                format!(
+                    "{max} positional argument{}",
+                    if max == 1 { "" } else { "s" }
+                )
+            } else {
+                format!("from {min} to {max} positional arguments")
+            };
             return Err(type_error(format!(
-                "{}() takes {} positional arguments but {} were given",
-                f.name,
-                positional.len(),
-                positional.len() + remaining.len()
+                "{}() takes {takes} but {given} {was} given",
+                f.effective_qualname()
             )));
         }
 
@@ -6018,7 +6095,7 @@ impl Interpreter {
             return self.enum_lookup_by_value(class, args, kwargs);
         }
         if class.class_attrs.borrow().contains_key("__typhon_abc__") {
-            let missing = abstract_methods(class);
+            let missing = abstract_set(class);
             if !missing.is_empty() {
                 let quoted: Vec<String> = missing.iter().map(|m| format!("'{m}'")).collect();
                 return Err(type_error(format!(
@@ -6998,6 +7075,15 @@ impl Interpreter {
         if !Self::is_enum_member(v) {
             return None;
         }
+        // An enum class's own `__str__` wins (`re.RegexFlag`'s).
+        if let Value::Instance(i) = v {
+            if matches!(
+                lookup_class_member(&i.class, "__str__"),
+                Some((_, ClassMember::Method(_)))
+            ) {
+                return None;
+            }
+        }
         // Value-mixin members (`StrEnum` / `IntEnum` / `IntFlag`) stringify
         // through their value in CPython 3.11+ — `print(Status.ACTIVE)`
         // shows `active`, `print(Level.HIGH)` shows `2`.
@@ -7859,7 +7945,9 @@ impl Interpreter {
             // `Optional[int]`, `Generic[T]`, `Callable[[int], str]`: the
             // VM's `typing` forms are inert stand-ins, and so are their
             // subscriptions (annotations and bases only read them).
-            Value::Native(n) if crate::builtins::is_typing_form(n.name) => Ok(target.clone()),
+            Value::Native(n) if crate::builtins::is_typing_form(n.name) => {
+                crate::builtins::typing_subscript(self, target, n.name, key)
+            }
             // `Box[int]` on a generic class: CPython's `typing` generic
             // alias (callable, printed `__main__.Box[int]`, usable as a
             // base). A class's own `__class_getitem__` wins; any other
@@ -7872,8 +7960,14 @@ impl Interpreter {
                     }
                     return self.call_function(&m, args, &[], None);
                 }
+                // The `collections.abc` classes and their subclasses are
+                // generic (`Sequence[int]`, `class Stack(Sequence[int])`).
                 let generic = c.class_attrs.borrow().contains_key("__type_params__")
-                    || crate::value::class_flag(c, "__typhon_generic__", false);
+                    || crate::value::class_flag(c, "__typhon_generic__", false)
+                    || class_mro(c).any(|k| {
+                        matches!(k.class_attrs.borrow().get("__typhon_shim_module__"),
+                            Some(Value::Str(m)) if m.as_str() == "collections.abc")
+                    });
                 if !generic {
                     return Err(type_error(format!(
                         "type '{}' is not subscriptable",
@@ -8432,6 +8526,33 @@ impl Interpreter {
                     d.frozen.set(true);
                     return Ok(Value::Dict(d));
                 }
+                // `Abc.__abstractmethods__`: the names still abstract, as a
+                // frozenset (only an ABC class carries it).
+                if attr == "__abstractmethods__" && crate::builtins::is_abc_class(class) {
+                    let names: Vec<Value> = abstract_set(class)
+                        .into_iter()
+                        .map(|n| Value::Str(Rc::new(n)))
+                        .collect();
+                    let set = self.set_from_value(Value::List(Rc::new(RefCell::new(names))))?;
+                    return Ok(Value::Set(Rc::new(crate::value::FrozenCell::frozen(set))));
+                }
+                // `Color.__members__`: every member name, aliases included,
+                // in definition order (a read-only mapping).
+                if attr == "__members__" && Self::is_enum_class(class) {
+                    let mut map: DictMap = DictMap::new();
+                    let attrs = class.class_attrs.borrow();
+                    if let Some(Value::Tuple(names)) = attrs.get("__typhon_enum_names__") {
+                        for n in names.iter() {
+                            let key = n.py_str();
+                            if let Some(m @ Value::Instance(_)) = attrs.get(&key) {
+                                map.insert(HashKey::Str(Rc::new(key)), m.clone());
+                            }
+                        }
+                    }
+                    let d = Rc::new(crate::value::FrozenCell::new(map));
+                    d.frozen.set(true);
+                    return Ok(Value::Dict(d));
+                }
                 // `Cls.__type_params__` — the PEP 695 parameter objects, or
                 // the empty tuple for a class that has none.
                 if attr == "__type_params__" {
@@ -8674,6 +8795,11 @@ impl Interpreter {
                 }
                 if let Some(m) = self.generated_dunder(class, attr, None) {
                     return Ok(m);
+                }
+                // `Abc.register(Sub)`: `ABCMeta`'s method, on every class
+                // built over it.
+                if attr == "register" && crate::builtins::is_abc_class(class) {
+                    return Ok(crate::builtins::abc_register(class));
                 }
                 Err(attribute_error(format!(
                     "type object '{}' has no attribute '{}'",
@@ -11756,7 +11882,8 @@ fn abstract_methods(class: &Rc<Class>) -> Vec<String> {
                 continue;
             }
             let abstract_ = match lookup_class_member(class, &name) {
-                Some((_, ClassMember::Method(f))) => f
+                Some((_, ClassMember::Method(f)))
+                | Some((_, ClassMember::Attr(Value::Function(f)))) => f
                     .attrs
                     .borrow()
                     .get("__isabstractmethod__")
@@ -11775,6 +11902,28 @@ fn abstract_methods(class: &Rc<Class>) -> Vec<String> {
     }
     names.sort();
     names
+}
+
+/// The abstract-method names recorded on an ABC class when it was made
+/// (or by `update_abstractmethods`), computed afresh for a class that
+/// carries no record of its own.
+pub(crate) fn abstract_set(class: &Rc<Class>) -> Vec<String> {
+    match class.class_attrs.borrow().get("__typhon_abstract_set__") {
+        Some(Value::Tuple(names)) => names.iter().map(Value::py_str).collect(),
+        _ => abstract_methods(class),
+    }
+}
+
+/// Recompute and record `class`'s abstract-method set.
+pub(crate) fn update_abstract_set(class: &Rc<Class>) {
+    let names: Vec<Value> = abstract_methods(class)
+        .into_iter()
+        .map(|n| Value::Str(Rc::new(n)))
+        .collect();
+    class.class_attrs.borrow_mut().insert(
+        "__typhon_abstract_set__".to_owned(),
+        Value::Tuple(Rc::new(names)),
+    );
 }
 
 /// What a class namespace binds a name to: a `def` in the class body (or
@@ -11972,9 +12121,11 @@ fn is_uninherited_marker(name: &str) -> bool {
             | "__typhon_own_eq__"
             | "__typhon_hash_none__"
             | "__typhon_module__"
+            | "__typhon_shim_module__"
             | "__typhon_generated_init__"
             | "__typhon_doc__"
             | "__typhon_generic__"
+            | "__typhon_abstract_set__"
     ) || name.starts_with("__typhon_dc_")
 }
 

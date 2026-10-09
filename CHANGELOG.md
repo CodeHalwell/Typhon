@@ -16,6 +16,66 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ### Fixed
 
+- **`typing` forms look like CPython's under `tyc run`.** `repr(typing.List)`
+  is `typing.List` and `repr(Optional[int])` is `typing.Optional[int]`; both
+  had printed as `<built-in function …>`. `type()` of each form is CPython's
+  (`_SpecialForm`, `_SpecialGenericAlias`, …), `Generic` and `Protocol` print
+  as classes, and `TypeVar("T")` is a `TypeVar` printing `~T` instead of the
+  string `"T"`. `get_origin` and `get_args` read subscripted forms, builtin
+  generics and `X | Y` unions; they had always returned `None` and `()`.
+  `isinstance(x, typing.List)` and `typing.Sequence` check against the
+  origin type, and `class S(typing.Sequence[int])` subclasses
+  `collections.abc.Sequence`. `Literal` keeps arguments that are equal but of
+  different types (`Literal[0, False]`) and compares regardless of order.
+  Nested `Literal`s flatten. Calling `List[int]()` or a special form such as
+  `Union[...]()` or `Final[int]()`, or subclassing a special form, raises
+  CPython's `TypeError` instead of quietly succeeding. `isinstance(1,
+  Union[int, str])` and `Optional[...]` check their members; any other
+  subscripted alias raises "Subscripted generics cannot be used with class
+  and instance checks", as a bare special form (`isinstance(x, Union)`)
+  does. `Optional[int] == (int | None)` holds, with equal hashes.
+- **`re` flags are `re.RegexFlag` members under `tyc run`.** `re.I` printed
+  as `2`; it is now `re.IGNORECASE`, and `re.I | re.M` is
+  `re.IGNORECASE|re.MULTILINE`. `RegexFlag` is an `IntFlag` class, so
+  `isinstance(re.I, re.RegexFlag)`, iteration over its members and
+  `RegexFlag(2)` behave as in CPython. A compiled pattern's `.flags`
+  includes the implicit `re.UNICODE`, as CPython reports it.
+- **`itertools` iterators are classes under `tyc run`.** `count`, `cycle`,
+  `repeat`, `islice`, `product` and the rest were generator functions, so
+  `type(itertools.count())` was `generator` and `isinstance(it,
+  itertools.islice)` failed. Each is now a class named `itertools.…`;
+  `count` and `repeat` print as CPython's (`count(3)`, `repeat(1, 2)`).
+  Invalid arguments now raise when the iterator is built rather than on the
+  first `next()`, and the combinatoric iterators take their snapshot of the
+  input at that point too.
+- **`isinstance` works against ABCs under `tyc run`.** `abc.ABC`,
+  `abc.ABCMeta` and the `collections.abc` classes were inert stand-ins, so
+  `isinstance(obj, abc.ABC)`, `isinstance([], Sequence)` and
+  `isinstance(obj, Iterable)` for a class with `__iter__` were all `False`.
+  They are now real classes. A subclass gets CPython's mixin methods
+  (`Sequence.index` and `count`, `Mapping.get`, `keys` and `==`,
+  `MutableMapping.update`, `Set`'s operators), and an incomplete subclass
+  refuses to instantiate. `isinstance` and `issubclass` also answer for
+  the builtin types CPython registers, for the structural checks and for
+  classes added with `register`. As in CPython, a structural check accepts any
+  non-`None` binding of the method, descriptors included. `type()` of an ABC
+  is `ABCMeta`. A user ABC's own `__subclasshook__` now decides its checks,
+  and `Cls.__abstractmethods__` lists the names still
+  abstract, fixed when the class is made and recomputed by
+  `update_abstractmethods`. The legacy `abstractclassmethod`, `abstractstaticmethod` and
+  `abstractproperty` decorators now mark and wrap their targets; they had
+  been identity functions.
+- **Enum classes carry their metadata under `tyc run`.** `repr(Color)` is
+  `<enum 'Color'>` (a flag's is `<flag 'Perm'>`), `type(Color)` is
+  `enum.EnumType`, `Color.__members__` lists every name including aliases,
+  `issubclass` sees `IntEnum` / `IntFlag` as `int` subclasses and
+  `StrEnum` as a `str` subclass, and an enum class's own `__str__` is
+  used.
+- **Too many positional arguments raise CPython's message under `tyc run`.**
+  `MutableMapping.pop() takes from 2 to 3 positional arguments but 4 were
+  given`: the qualified name, the accepted range when some parameters have
+  defaults, and "1 was given". The VM had printed the unqualified name and
+  only the maximum. `callable(NotImplemented)` is also `False` now.
 - **Modules have a `__name__` under `tyc run`.** `json.__name__` raised
   `AttributeError`; every module now reports its import name, as in CPython.
 - **Shim functions that CPython writes in C report as builtins under `tyc run`.**

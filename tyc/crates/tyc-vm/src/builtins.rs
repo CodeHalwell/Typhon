@@ -814,7 +814,13 @@ pub fn install(interp: &mut Interpreter) {
                 &errors,
             )?)));
         }
-        let args = pos.to_vec();
+        let mut args = pos.to_vec();
+        // `bytes(re.I)`: an int-valued enum member counts as its int.
+        if let Some(first) = args.first_mut() {
+            if let Some(inner @ Value::Int(_)) = crate::value::enum_mixin_value(first) {
+                *first = inner;
+            }
+        }
         match args.into_iter().next() {
             None => Ok(Value::Bytes(Rc::new(Vec::new()))),
             Some(Value::Bytes(b)) => Ok(Value::Bytes(b)),
@@ -1029,6 +1035,16 @@ pub fn install(interp: &mut Interpreter) {
         // lightweight class object named after the type.
         Ok(match v {
             Value::Instance(i) => Value::Class(i.class.clone()),
+            // An enum class's metaclass is `enum.EnumType`.
+            Value::Class(c) if crate::value::class_is_enum(c) => {
+                let m = i.import_module("enum")?;
+                i.get_attr(&m, "EnumType")?
+            }
+            // A class built over `ABCMeta` reports it as its metaclass.
+            Value::Class(c) if is_abc_class(c) => {
+                let abc = i.import_module("abc")?;
+                i.get_attr(&abc, "ABCMeta")?
+            }
             Value::Class(_) => make_builtin_type("type"),
             // `type(some_exception).__name__` should be the concrete kind
             // (e.g. `TypeError`), not the generic `Exception`.
@@ -1049,7 +1065,16 @@ pub fn install(interp: &mut Interpreter) {
             return Err(type_error("issubclass() arg 1 must be a class"));
         }
         let cls = union_members(&i.force_alias(&args[1]));
-        Ok(Value::Bool(is_subclass_of(&sub, &cls)))
+        let mut unchecked = None;
+        let cls = typing_check_targets(i, cls, "issubclass", &mut unchecked)?;
+        let ok = match hooked_check(i, &cls, &sub, |t| is_subclass_of(&sub, t))? {
+            Some(ok) => ok,
+            None => is_subclass_of(&sub, &cls),
+        };
+        if let (false, Some(msg)) = (ok, unchecked) {
+            return Err(type_error(msg));
+        }
+        Ok(Value::Bool(ok))
     });
     native!("isinstance", |i, args| {
         if args.len() != 2 {
@@ -1061,6 +1086,20 @@ pub fn install(interp: &mut Interpreter) {
         // pass has run — otherwise it would still be its name-string
         // fallback and the test would silently return the wrong result.
         let cls = union_members(&i.force_alias(&args[1]));
+        let mut unchecked = None;
+        let cls = typing_check_targets(i, cls, "isinstance", &mut unchecked)?;
+        if any_subclass_hook(&cls) {
+            let ty = match i.root.get("type") {
+                Some(t) => i.call_value(t, vec![val.clone()], &[])?,
+                None => Value::None,
+            };
+            if let Some(ok) = hooked_check(i, &cls, &ty, |t| is_instance_of(val, t))? {
+                if let (false, Some(msg)) = (ok, unchecked) {
+                    return Err(type_error(msg));
+                }
+                return Ok(Value::Bool(ok));
+            }
+        }
         // A `@runtime_checkable` Protocol is matched *structurally* — the
         // value has to answer every member the protocol declares — and a
         // Protocol without the decorator is not usable here at all, both as
@@ -1078,7 +1117,11 @@ pub fn install(interp: &mut Interpreter) {
                 }
             }
         }
-        Ok(Value::Bool(is_instance_of(val, &cls)))
+        let ok = is_instance_of(val, &cls);
+        if let (false, Some(msg)) = (ok, unchecked) {
+            return Err(type_error(msg));
+        }
+        Ok(Value::Bool(ok))
     });
 
     native!("abs", |i, args| match single(&args, "abs")? {
@@ -1421,9 +1464,9 @@ pub fn install(interp: &mut Interpreter) {
         )
     });
 
-    native!("hex", |_i, args| based_int_repr(&args, "hex", 16, "0x"));
-    native!("bin", |_i, args| based_int_repr(&args, "bin", 2, "0b"));
-    native!("oct", |_i, args| based_int_repr(&args, "oct", 8, "0o"));
+    native!("hex", |i, args| based_int_repr(i, &args, "hex", 16, "0x"));
+    native!("bin", |i, args| based_int_repr(i, &args, "bin", 2, "0b"));
+    native!("oct", |i, args| based_int_repr(i, &args, "oct", 8, "0o"));
 
     native!("chr", |_i, args| {
         let n = single(&args, "chr")?.to_int()?;
@@ -1633,10 +1676,12 @@ pub fn install(interp: &mut Interpreter) {
 
     native!("callable", |_i, args| {
         let v = single(&args, "callable")?;
-        Ok(Value::Bool(matches!(
-            v,
-            Value::Function(_) | Value::Native(_) | Value::BoundMethod { .. } | Value::Class(_)
-        )))
+        Ok(Value::Bool(match v {
+            // `NotImplemented` is a native sentinel, not a callable.
+            Value::Native(n) => n.name != "NotImplemented",
+            Value::Function(_) | Value::BoundMethod { .. } | Value::Class(_) => true,
+            _ => false,
+        }))
     });
 
     // `open` is `io.open`: the file object model lives in the `io` shim.
@@ -2152,8 +2197,26 @@ fn single<'a>(args: &'a [Value], name: &str) -> Result<&'a Value, Unwind> {
 /// overflow). The previous implementation formatted a lossy `i64` with Rust's
 /// `{:x}`/`{:b}`/`{:o}`, which prints the two's-complement bit pattern for a
 /// negative and rejected any value outside `i64`.
-fn based_int_repr(args: &[Value], name: &str, radix: u32, prefix: &str) -> Result<Value, Unwind> {
-    let vi: VmInt = match single(args, name)? {
+fn based_int_repr(
+    interp: &mut Interpreter,
+    args: &[Value],
+    name: &str,
+    radix: u32,
+    prefix: &str,
+) -> Result<Value, Unwind> {
+    let arg = single(args, name)?;
+    // An `IntEnum` / `IntFlag` member is its int; any other instance
+    // answers through `__index__`, as CPython's `PyNumber_Index`.
+    let arg = match arg {
+        v @ Value::Instance(_) => match crate::value::enum_mixin_value(v) {
+            Some(inner @ Value::Int(_)) => inner,
+            _ => interp
+                .call_dunder0(v, "__index__")?
+                .unwrap_or_else(|| v.clone()),
+        },
+        other => other.clone(),
+    };
+    let vi: VmInt = match &arg {
         Value::Int(i) => i.clone(),
         Value::Bool(b) => VmInt::from(*b as i64),
         other => {
@@ -2321,6 +2384,11 @@ pub(crate) fn is_subclass_of(sub: &Value, cls: &Value) -> bool {
     if let Some(target) = user_class_named_object(cls) {
         return matches!(sub, Value::Class(c) if class_in_chain_rc(c, target));
     }
+    if let Value::Class(target) = cls {
+        if is_abc_class(target) && abc_subclass(sub, target) {
+            return true;
+        }
+    }
     let want = match cls {
         Value::Native(n) => n.name.to_owned(),
         Value::Class(c) => c.name.clone(),
@@ -2368,6 +2436,142 @@ fn protocol_targets(cls: &Value) -> Vec<Value> {
     }
 }
 
+/// `isinstance(x, typing.List)` / `typing.Iterable`: a bare `typing`
+/// alias form checks as its origin (`list`, `collections.abc.Iterable`),
+/// as CPython's `_SpecialGenericAlias.__instancecheck__` does.
+///
+/// A subscripted `Union[...]` / `Optional[...]` checks as its members, in
+/// order. Any other subscripted alias (`List[int]`, `Literal[1]`) cannot be
+/// checked: the targets stop there and `unchecked` is set, so the caller
+/// raises unless an earlier target already matched — CPython's
+/// `__subclasscheck__` walks a union's members and raises on the first such
+/// one it reaches.
+fn typing_check_targets(
+    i: &mut Interpreter,
+    cls: Value,
+    check: &str,
+    unchecked: &mut Option<String>,
+) -> Result<Value, Unwind> {
+    match cls {
+        Value::Tuple(t) => {
+            let mut out = Vec::with_capacity(t.len());
+            for c in t.iter() {
+                out.push(typing_check_targets(i, c.clone(), check, unchecked)?);
+                if unchecked.is_some() {
+                    break;
+                }
+            }
+            Ok(Value::Tuple(Rc::new(out)))
+        }
+        Value::Instance(inst) if inst.class.name == "_TypingAlias" => {
+            let fields = inst.fields.borrow();
+            let is_union =
+                matches!(fields.get("_name"), Some(Value::Str(n)) if n.as_str() == "Union");
+            match (is_union, fields.get("__args__")) {
+                (true, Some(args @ Value::Tuple(_))) => {
+                    let args = args.clone();
+                    drop(fields);
+                    typing_check_targets(i, args, check, unchecked)
+                }
+                _ => {
+                    *unchecked = Some(
+                        "Subscripted generics cannot be used with class and instance checks"
+                            .to_owned(),
+                    );
+                    Ok(Value::Tuple(Rc::new(Vec::new())))
+                }
+            }
+        }
+        // A bare special form (`Union`, `Literal`, `Final`) is no class:
+        // CPython refuses it as a check target. `Any` is a class whose
+        // metaclass refuses only `isinstance`.
+        Value::Native(n)
+            if match crate::value::typing_form_type(n.name) {
+                Some("_SpecialForm" | "_TypedCacheSpecialForm") => true,
+                Some("_AnyMeta") => check == "isinstance",
+                _ => false,
+            } =>
+        {
+            *unchecked = Some(format!("typing.{} cannot be used with {check}()", n.name));
+            Ok(Value::Tuple(Rc::new(Vec::new())))
+        }
+        Value::Native(n)
+            if crate::value::typing_form_type(n.name) == Some("_SpecialGenericAlias")
+                || matches!(n.name, "Callable" | "Tuple") =>
+        {
+            Ok(typing_origin(i, n.name)?.unwrap_or(Value::Native(n)))
+        }
+        other => Ok(other),
+    }
+}
+
+/// `isinstance` / `issubclass` against targets that include a user ABC
+/// defining its own `__subclasshook__`: each such target answers through
+/// its hook (`True` / `False` decide, `NotImplemented` falls back to the
+/// usual check), as `ABCMeta.__subclasscheck__` does. `None` when no target
+/// has a hook, so the ordinary path runs unchanged.
+fn hooked_check(
+    i: &mut Interpreter,
+    cls: &Value,
+    sub: &Value,
+    plain: impl Fn(&Value) -> bool,
+) -> Result<Option<bool>, Unwind> {
+    if !any_subclass_hook(cls) {
+        return Ok(None);
+    }
+    let mut targets = Vec::new();
+    flatten_targets(cls, &mut targets);
+    for t in &targets {
+        if has_subclass_hook(t) {
+            let hook = i.get_attr(t, "__subclasshook__")?;
+            match i.call_value(hook, vec![sub.clone()], &[])? {
+                Value::Native(n) if n.name == "NotImplemented" => {}
+                verdict => {
+                    if verdict.truthy() {
+                        return Ok(Some(true));
+                    }
+                    continue;
+                }
+            }
+        }
+        if plain(t) {
+            return Ok(Some(true));
+        }
+    }
+    Ok(Some(false))
+}
+
+fn flatten_targets(v: &Value, out: &mut Vec<Value>) {
+    match v {
+        Value::Tuple(t) => t.iter().for_each(|c| flatten_targets(c, out)),
+        other => out.push(other.clone()),
+    }
+}
+
+/// Whether any `isinstance` / `issubclass` target has a user
+/// `__subclasshook__` (checked before paying for `type(value)`).
+fn any_subclass_hook(cls: &Value) -> bool {
+    match cls {
+        Value::Tuple(t) => t.iter().any(any_subclass_hook),
+        other => has_subclass_hook(other),
+    }
+}
+
+/// Whether `v` is an ABC class whose MRO defines `__subclasshook__` in
+/// user code (the VM's own `collections.abc` hooks are native).
+fn has_subclass_hook(v: &Value) -> bool {
+    match v {
+        Value::Class(c) => {
+            is_abc_class(c)
+                && matches!(
+                    crate::interp::lookup_class_member(c, "__subclasshook__"),
+                    Some((_, crate::interp::ClassMember::Method(_)))
+                )
+        }
+        _ => false,
+    }
+}
+
 /// A user class that is merely *named* `object` (`plain class object:`):
 /// an ordinary class, related only to its own subclasses — not the root
 /// every value is an instance of.
@@ -2381,6 +2585,20 @@ fn user_class_named_object(cls: &Value) -> Option<&Rc<crate::value::Class>> {
 pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
     if let Some(target) = user_class_named_object(cls) {
         return matches!(val, Value::Instance(i) if class_in_chain_rc(&i.class, target));
+    }
+    if let Value::Class(target) = cls {
+        // `isinstance(Cls, ABCMeta)`: every class built over `ABCMeta`;
+        // `isinstance(Color, EnumType)`: every enum class.
+        if is_abcmeta(target) {
+            return matches!(val, Value::Class(c) if is_abc_class(c));
+        }
+        if target.name == "EnumType" && shim_module_of(target).is_some_and(|m| m.as_str() == "enum")
+        {
+            return matches!(val, Value::Class(c) if crate::value::class_is_enum(c));
+        }
+        if is_abc_class(target) && abc_instance(val, target) {
+            return true;
+        }
     }
     let want_name = match cls {
         Value::Native(n) => Some(n.name.to_owned()),
@@ -2416,6 +2634,11 @@ pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
                 || is_shim_constructor_name(n.name)
                 // `functools.partial`, `enum.auto`, …: what `type()` calls a type.
                 || crate::value::native_is_type(n.name)
+                // `typing.Any` / `Generic` / `Protocol` are classes.
+                || matches!(
+                    crate::value::typing_form_type(n.name),
+                    Some("type" | "_ProtocolMeta" | "_AnyMeta")
+                )
         }
         ("int", Value::Int(_)) => true,
         // `bool` is a subclass of `int` in CPython, so `isinstance(True, int)`
@@ -2467,6 +2690,15 @@ pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
 
 fn class_in_chain(c: &Rc<crate::value::Class>, name: &str) -> bool {
     if c.name == name {
+        return true;
+    }
+    // `IntEnum` / `IntFlag` subclass `int`, and `StrEnum` `str`.
+    if c.class_attrs.borrow().contains_key("__typhon_enum_base__")
+        && matches!(
+            (c.name.as_str(), name),
+            ("IntEnum" | "IntFlag", "int") | ("StrEnum", "str")
+        )
+    {
         return true;
     }
     // A builtin base (`class Counter(dict)`) is a native, not a `Class`, so
@@ -2575,6 +2807,7 @@ mod shims {
     pub const ARGPARSE: &str = include_str!("shims/argparse.py");
     pub const COLLECTIONS: &str = include_str!("shims/collections.py");
     pub const ITERTOOLS: &str = include_str!("shims/itertools.py");
+    pub const COLLECTIONS_ABC: &str = include_str!("shims/collections_abc.py");
     pub const RANDOM: &str = include_str!("shims/random.py");
     pub const HASHLIB: &str = include_str!("shims/hashlib.py");
     pub const IO: &str = include_str!("shims/io.py");
@@ -2696,8 +2929,31 @@ fn make_argparse_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
     module_from_shim(interp, "argparse", shims::ARGPARSE)
 }
 
+/// `itertools`: every iterator is a shim class (CPython's are classes too),
+/// qualified as `itertools.NAME` in reprs. The shim's private recipe
+/// generators are not exported.
 fn make_itertools_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
-    module_from_shim(interp, "itertools", shims::ITERTOOLS)
+    let (members, env) = compile_shim(interp, shims::ITERTOOLS, Vec::new())?;
+    let entries: Vec<(&str, Value)> = members
+        .iter()
+        .filter(|(k, _)| !k.starts_with('_'))
+        .map(|(k, v)| {
+            if let Value::Class(c) = v {
+                stamp_shim_module(c, "itertools");
+            }
+            (k.as_str(), v.clone())
+        })
+        .collect();
+    Ok(make_module_env("itertools", entries, env))
+}
+
+/// Mark a shim class as living in `module` for its repr (see
+/// `value::class_display_module`).
+fn stamp_shim_module(c: &Rc<crate::value::Class>, module: &str) {
+    c.class_attrs.borrow_mut().insert(
+        "__typhon_shim_module__".to_owned(),
+        Value::Str(Rc::new(module.to_owned())),
+    );
 }
 
 /// `collections`: the Python shim (Counter / deque / OrderedDict / ChainMap)
@@ -2796,7 +3052,7 @@ fn make_collections_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
         Ok(Value::Class(cls))
     });
     entries.push(("namedtuple", namedtuple));
-    entries.push(("abc", make_collections_abc_module()));
+    entries.push(("abc", collections_abc_module(interp)?));
     let defaultdict = nf("defaultdict", |i, mut args| {
         // `defaultdict(factory[, mapping])` constructs a synthesised mapping
         // instance whose `__missing__` calls `factory()` to materialise a
@@ -3379,19 +3635,19 @@ pub fn resolve_module(interp: &mut Interpreter, name: &str) -> Result<Value, Unw
         "argparse" => make_argparse_module(interp),
         "random" => make_random_module(interp),
         "hashlib" => make_hashlib_module(interp),
-        "typing" => Ok(make_typing_module()),
-        "re" => Ok(make_re_module()),
+        "typing" => make_typing_module(interp),
+        "re" => make_re_module_with_flags(interp),
         "collections" => make_collections_module(interp),
         // `from collections.abc import Callable / Iterator / ...` — the
         // canonical home for the abstract container types. Annotation-only
         // at runtime, so identity natives (mirroring the `typing` shim)
         // are all the VM needs.
-        "collections.abc" => Ok(make_collections_abc_module()),
+        "collections.abc" => collections_abc_module(interp),
         // `abc` — `ABC` / `ABCMeta` are annotation-/base-only at runtime in
         // the VM (a non-`Value::Class` base is ignored), and the abstract-*
         // decorators are identity wrappers, so identity natives suffice for
         // `class H(ABC): @abstractmethod def handle(...): ...`.
-        "abc" => Ok(make_abc_module()),
+        "abc" => make_abc_module(interp),
         // Cooperative (sequential) asyncio: coroutines are thunks forced at
         // await points, tasks complete at creation, and Queue.get on an
         // empty queue fails loudly instead of deadlocking. Programs whose
@@ -7515,7 +7771,7 @@ fn identity_native(name: &'static str) -> Value {
 /// indexed because the VM treats `name[x]` as a `__getitem__` call on
 /// the callable; the resulting value is an opaque marker that nobody
 /// reads at runtime — only its presence at parse-time matters.
-fn make_typing_module() -> Value {
+fn make_typing_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
     let mut entries: Vec<(&str, Value)> = Vec::new();
     for name in [
         "Callable",
@@ -7591,20 +7847,29 @@ fn make_typing_module() -> Value {
         "IO",
         "TextIO",
         "BinaryIO",
-        "AnyStr",
     ] {
         entries.push((name, identity_native(name)));
     }
     // `NewType("Foo", base)`, as the root-level builtin.
     entries.push(("NewType", newtype_native()));
-    // `TypeVar("T", ...)` — return a placeholder. The static type system
-    // is the only consumer; at runtime the value just needs to exist.
-    entries.push((
-        "TypeVar",
-        Value::Native(Rc::new(NativeFn::new("TypeVar", |_i, args| {
-            Ok(args.into_iter().next().unwrap_or(Value::None))
-        }))),
-    ));
+    // `TypeVar` / `ParamSpec` / `TypeVarTuple` / `NoDefault`: the PEP 695
+    // type-parameter objects, so `TypeVar("T")` prints `~T`.
+    for name in ["TypeVar", "ParamSpec", "TypeVarTuple", "NoDefault"] {
+        let v = type_param_class(interp, name)?;
+        if let Value::Class(c) = &v {
+            stamp_shim_module(c, "typing");
+        }
+        entries.push((name, v));
+    }
+    let type_var = type_param_class(interp, "TypeVar")?;
+    let bytes = interp.root.get("bytes").unwrap_or(Value::None);
+    let str_ = interp.root.get("str").unwrap_or(Value::None);
+    let any_str = interp.call_value(
+        type_var,
+        vec![Value::Str(Rc::new("AnyStr".to_owned())), bytes, str_],
+        &[],
+    )?;
+    entries.push(("AnyStr", any_str));
     // `cast(type, value)` — return the value unchanged.
     entries.push((
         "cast",
@@ -7645,21 +7910,110 @@ fn make_typing_module() -> Value {
             }))),
         ));
     }
-    // `get_args` / `get_origin` on an erased annotation have nothing to
-    // report, and `NoDefault` is a sentinel.
-    entries.push((
-        "get_args",
-        Value::Native(Rc::new(NativeFn::new("get_args", |_i, _args| {
-            Ok(Value::Tuple(Rc::new(Vec::new())))
-        }))),
-    ));
-    entries.push((
-        "get_origin",
-        Value::Native(Rc::new(NativeFn::new("get_origin", |_i, _args| {
-            Ok(Value::None)
-        }))),
-    ));
-    make_module("typing", entries)
+    // `get_origin` / `get_args`: read off a subscripted form (`List[int]`,
+    // `Optional[str]`), a builtin generic (`list[int]`) or a `X | Y` union;
+    // anything else has neither.
+    for (name, shim) in [
+        ("get_origin", "_typing_get_origin"),
+        ("get_args", "_typing_get_args"),
+    ] {
+        let f = descriptor_shim_class(interp, shim)?;
+        entries.push((
+            name,
+            nf(name, move |i, args| {
+                let tp = single(&args, name)?.clone();
+                i.call_value(f.clone(), vec![tp], &[])
+            }),
+        ));
+    }
+    // A subscripted `Optional` / `Union` reports `typing.Union` as its
+    // origin: the very form this module exports.
+    if let (Some((_, union)), Value::Class(alias)) = (
+        entries.iter().find(|(n, _)| *n == "Union"),
+        descriptor_shim_class(interp, "_TypingAlias")?,
+    ) {
+        alias.class_attrs.borrow_mut().insert(
+            "_union_form".to_owned(),
+            Value::Tuple(Rc::new(vec![union.clone()])),
+        );
+    }
+    Ok(make_module("typing", entries))
+}
+
+/// `typing.List[int]`, `typing.Optional[str]`: a subscripted `typing` form
+/// (`shims/descriptors.py`'s `_TypingAlias`), with the origin CPython
+/// reports for it — the builtin (`list`), the `collections.abc` /
+/// `collections` class (`Iterable`, `deque`), or the form itself.
+pub(crate) fn typing_subscript(
+    interp: &mut Interpreter,
+    form: &Value,
+    name: &'static str,
+    params: &Value,
+) -> Result<Value, Unwind> {
+    let origin = typing_origin(interp, name)?.unwrap_or_else(|| form.clone());
+    let subscript = descriptor_shim_class(interp, "_typing_subscript")?;
+    interp.call_value(
+        subscript,
+        vec![
+            Value::Str(Rc::new(name.to_owned())),
+            form.clone(),
+            origin,
+            params.clone(),
+        ],
+        &[],
+    )
+}
+
+/// The runtime class a `typing` alias form stands for (`List` → `list`,
+/// `Iterable` → `collections.abc.Iterable`), or `None` for a special form
+/// that is its own origin (`Union`, `Literal`, `Generic`).
+pub(crate) fn typing_origin(interp: &mut Interpreter, name: &str) -> Result<Option<Value>, Unwind> {
+    let builtin = match name {
+        "List" => Some("list"),
+        "Dict" => Some("dict"),
+        "Set" => Some("set"),
+        "FrozenSet" => Some("frozenset"),
+        "Tuple" => Some("tuple"),
+        "Type" => Some("type"),
+        _ => None,
+    };
+    if let Some(b) = builtin {
+        return Ok(interp.root.get(b));
+    }
+    let abc = match name {
+        "AbstractSet" => Some("Set"),
+        "Callable" | "Iterable" | "Iterator" | "Sequence" | "Mapping" | "MutableMapping"
+        | "MutableSequence" | "MutableSet" | "Hashable" | "Sized" | "Container" | "Awaitable"
+        | "Coroutine" | "AsyncIterable" | "AsyncIterator" | "Generator" | "AsyncGenerator"
+        | "Collection" | "Reversible" | "ItemsView" | "KeysView" | "ValuesView" => Some(name),
+        _ => None,
+    };
+    if let Some(a) = abc {
+        let m = collections_abc_module(interp)?;
+        return interp.get_attr(&m, a).map(Some);
+    }
+    let coll = match name {
+        "Deque" => Some("deque"),
+        "DefaultDict" => Some("defaultdict"),
+        "OrderedDict" => Some("OrderedDict"),
+        "Counter" => Some("Counter"),
+        "ChainMap" => Some("ChainMap"),
+        _ => None,
+    };
+    if let Some(c) = coll {
+        let m = interp.import_module("collections")?;
+        return interp.get_attr(&m, c).map(Some);
+    }
+    let ctx = match name {
+        "ContextManager" => Some("AbstractContextManager"),
+        "AsyncContextManager" => Some("AbstractAsyncContextManager"),
+        _ => None,
+    };
+    if let Some(c) = ctx {
+        let m = interp.import_module("contextlib")?;
+        return interp.get_attr(&m, c).map(Some);
+    }
+    Ok(None)
 }
 
 /// `re` shim.
@@ -7677,6 +8031,85 @@ fn make_typing_module() -> Value {
 /// `re.finditer`, `re.purge`, the `Pattern` / `Match` object protocol
 /// (only the named methods above work), and lookaheads/lookbehinds
 /// (Rust's `regex` is a finite-automaton engine that rejects them).
+/// `re.RegexFlag`: an `enum.IntFlag` whose members print as CPython's do
+/// (`re.IGNORECASE`, `re.ASCII|re.IGNORECASE`), in the VM's `enum`.
+const REGEXFLAG_SRC: &str = r#"# VM `re`
+import enum
+
+
+class RegexFlag(enum.IntFlag):
+    NOFLAG = 0
+    ASCII = A = 256
+    IGNORECASE = I = 2
+    LOCALE = L = 4
+    UNICODE = U = 32
+    MULTILINE = M = 8
+    DOTALL = S = 16
+    VERBOSE = X = 64
+    DEBUG = 128
+
+    def __repr__(self):
+        value = self._value_
+        if value == 0:
+            return "re.NOFLAG"
+        parts = []
+        rest = value
+        for m in RegexFlag:
+            mv = m._value_
+            if mv and rest & mv == mv:
+                parts.append("re." + m._name_)
+                rest &= ~mv
+        if rest:
+            if not parts:
+                return "re.RegexFlag(%d)" % value
+            parts.append(hex(rest))
+        return "|".join(parts)
+
+    def __str__(self):
+        return self.__repr__()
+
+    def __format__(self, spec):
+        if spec == "":
+            return self.__repr__()
+        return format(self._value_, spec)
+"#;
+
+/// `re`, with the flag constants as `RegexFlag` members.
+fn make_re_module_with_flags(interp: &mut Interpreter) -> Result<Value, Unwind> {
+    let module = make_re_module();
+    let (members, _) = compile_shim(interp, REGEXFLAG_SRC, Vec::new())?;
+    let Some((_, flag @ Value::Class(_))) = members.iter().find(|(k, _)| k == "RegexFlag") else {
+        return Ok(module);
+    };
+    if let Value::Module(m) = &module {
+        for name in [
+            "NOFLAG",
+            "ASCII",
+            "A",
+            "IGNORECASE",
+            "I",
+            "LOCALE",
+            "L",
+            "UNICODE",
+            "U",
+            "MULTILINE",
+            "M",
+            "DOTALL",
+            "S",
+            "VERBOSE",
+            "X",
+            "DEBUG",
+        ] {
+            let member = interp.get_attr(flag, name)?;
+            m.members.borrow_mut().insert(name.to_owned(), member);
+        }
+        m.members
+            .borrow_mut()
+            .insert("RegexFlag".to_owned(), flag.clone());
+    }
+    Ok(module)
+}
+
 fn make_re_module() -> Value {
     // Compile a Python-shaped pattern into a Rust regex by rewriting
     // `(?P<name>` to `(?<name>`. The `(?P=name)` back-reference form is
@@ -8067,6 +8500,9 @@ fn make_re_module() -> Value {
         );
         // The data attributes CPython's `Pattern` carries.
         attrs.insert("pattern".into(), Value::Str(Rc::new(source)));
+        // A `str` pattern is implicitly `UNICODE` unless `ASCII` was asked
+        // for, as CPython's `sre_compile` records it.
+        let flags = if flags & 256 == 0 { flags | 32 } else { flags };
         attrs.insert("flags".into(), Value::Int(VmInt::from(flags)));
         attrs.insert(
             "groups".into(),
@@ -8683,6 +9119,10 @@ fn re_flags_arg(v: &Option<Value>) -> Result<i64, Unwind> {
             ))
         }),
         Some(Value::Bool(b)) => Ok(*b as i64),
+        // A `RegexFlag` member is the int it carries.
+        Some(v @ Value::Instance(_)) if crate::value::enum_mixin_value(v).is_some() => {
+            re_flags_arg(&crate::value::enum_mixin_value(v))
+        }
         Some(other) => Err(type_error(format!(
             "'{}' object cannot be interpreted as an integer",
             other.type_name()
@@ -9299,48 +9739,60 @@ fn make_asyncio_queue(args: &[Value], kwargs: &[(String, Value)]) -> Value {
     q
 }
 
-/// `collections.abc` shim — every abstract base name maps to an identity
-/// native. These names appear in annotations (evaluated at def time) and
-/// occasionally as bases; nothing in the VM dispatches through them.
-fn make_collections_abc_module() -> Value {
-    let mut entries: Vec<(&str, Value)> = Vec::new();
-    for name in [
-        "Callable",
-        "Iterable",
-        "Iterator",
-        "Generator",
-        "AsyncIterable",
-        "AsyncIterator",
-        "AsyncGenerator",
-        "Awaitable",
-        "Coroutine",
-        "Sequence",
-        "MutableSequence",
-        "Mapping",
-        "MutableMapping",
-        "Set",
-        "MutableSet",
-        "Collection",
-        "Container",
-        "Reversible",
-        "Hashable",
-        "Sized",
-        "KeysView",
-        "ValuesView",
-        "ItemsView",
-        "MappingView",
-        "ByteString",
-        "Buffer",
-    ] {
-        entries.push((name, identity_native(name)));
+/// `collections.abc`: the abstract container classes as real VM classes
+/// (`shims/collections_abc.py`), with their abstract and mixin methods.
+/// Built once per run, so `collections.abc` and `collections`'s `abc`
+/// attribute are the same module and a subclass of one `Sequence` is an
+/// instance of every other spelling of it.
+fn collections_abc_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
+    const CACHE: &str = "__shim_collections_abc__";
+    if let Some(m) = interp.module_cache.get(CACHE) {
+        return Ok(m.clone());
     }
-    make_module("collections.abc", entries)
+    let abc = interp.import_module("abc")?;
+    let seed: Vec<(&str, Value)> = ["ABCMeta", "abstractmethod"]
+        .into_iter()
+        .map(|n| (n, interp.get_attr(&abc, n).unwrap_or(Value::None)))
+        .collect();
+    let (members, env) = compile_shim(interp, shims::COLLECTIONS_ABC, seed)?;
+    let entries: Vec<(&str, Value)> = members
+        .iter()
+        .filter(|(k, _)| !k.starts_with('_') && k != "ABCMeta" && k != "abstractmethod")
+        .map(|(k, v)| {
+            if let Value::Class(c) = v {
+                stamp_shim_module(c, "collections.abc");
+            }
+            (k.as_str(), v.clone())
+        })
+        .collect();
+    let module = make_module_env("collections.abc", entries, env);
+    interp.module_cache.insert(CACHE.to_owned(), module.clone());
+    Ok(module)
 }
 
-fn make_abc_module() -> Value {
+/// `abc`: `ABCMeta` and `ABC` are real classes (so `issubclass(B, ABC)`
+/// holds and `type(B)` is `ABCMeta`), and every class built over them
+/// carries `register` (see `abc_register`). `@abstractmethod` marks the
+/// function (`__isabstractmethod__`) and returns it; `instantiate` refuses
+/// an ABC with one still unimplemented.
+fn make_abc_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
+    const ABC_SRC: &str =
+        "# VM `abc`\nclass ABCMeta(type):\n    pass\n\n\nclass ABC(metaclass=ABCMeta):\n    pass\n\n\n\
+         def abstractclassmethod(callable):\n    callable.__isabstractmethod__ = True\n    return classmethod(callable)\n\n\n\
+         def abstractstaticmethod(callable):\n    callable.__isabstractmethod__ = True\n    return staticmethod(callable)\n\n\n\
+         class abstractproperty(property):\n\
+             \x20   def __init__(self, fget=None, fset=None, fdel=None, doc=None):\n\
+             \x20       property.__init__(self, fget, fset, fdel, doc)\n\
+             \x20       self.__isabstractmethod__ = True\n";
+    let property = descriptor_shim_class(interp, "property")?;
+    let (members, env) = compile_shim(interp, ABC_SRC, vec![("property", property)])?;
     let mut entries: Vec<(&str, Value)> = Vec::new();
-    // `@abstractmethod` marks the function (`__isabstractmethod__`) and
-    // returns it; `instantiate` refuses an ABC with one still unimplemented.
+    for (k, v) in &members {
+        if let Value::Class(c) = v {
+            stamp_shim_module(c, "abc");
+        }
+        entries.push((k.as_str(), v.clone()));
+    }
     entries.push((
         "abstractmethod",
         nf("abstractmethod", |i, args| {
@@ -9357,17 +9809,328 @@ fn make_abc_module() -> Value {
             Ok(f)
         }),
     ));
-    for name in [
-        "ABC",
-        "ABCMeta",
-        "abstractproperty",
-        "abstractclassmethod",
-        "abstractstaticmethod",
+    entries.push((
         "update_abstractmethods",
-    ] {
-        entries.push((name, identity_native(name)));
+        nf("update_abstractmethods", |_, args| {
+            let cls = single(&args, "update_abstractmethods")?.clone();
+            if let Value::Class(c) = &cls {
+                if is_abc_class(c) {
+                    crate::interp::update_abstract_set(c);
+                }
+            }
+            Ok(cls)
+        }),
+    ));
+    Ok(make_module_env("abc", entries, env))
+}
+
+thread_local! {
+    /// `Abc.register(Sub)` calls made this run: the ABC and the virtual
+    /// subclass (a class or a builtin type). Consulted by `isinstance` /
+    /// `issubclass` for the ABC and every ABC above it, as CPython's
+    /// `_abc_registry` is through `__subclasscheck__`.
+    static ABC_REGISTRY: RefCell<Vec<(Rc<crate::value::Class>, Value)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Whether `c` is built over `ABCMeta` (`class X(ABC)`, a `collections.abc`
+/// class, or `metaclass=ABCMeta`) — the classes `type()` calls `ABCMeta`
+/// and that answer `register`.
+pub(crate) fn is_abc_class(c: &Rc<crate::value::Class>) -> bool {
+    crate::interp::class_mro(c).any(|k| k.class_attrs.borrow().contains_key("__typhon_abc__"))
+}
+
+/// The module a shim stamped its class with (`itertools`, `abc`,
+/// `collections.abc`), if any.
+fn shim_module_of(c: &crate::value::Class) -> Option<Rc<String>> {
+    match c.class_attrs.borrow().get("__typhon_shim_module__") {
+        Some(Value::Str(m)) => Some(m.clone()),
+        _ => None,
     }
-    make_module("abc", entries)
+}
+
+/// Whether `c` is one of the `collections.abc` classes themselves.
+fn is_collections_abc_class(c: &crate::value::Class) -> bool {
+    shim_module_of(c).is_some_and(|m| m.as_str() == "collections.abc")
+}
+
+fn is_abcmeta(c: &crate::value::Class) -> bool {
+    c.name == "ABCMeta" && shim_module_of(c).is_some_and(|m| m.as_str() == "abc")
+}
+
+/// `Abc.register`: a native bound to `class` that records a virtual
+/// subclass and returns it, so it also works as a class decorator.
+pub(crate) fn abc_register(class: &Rc<crate::value::Class>) -> Value {
+    let owner = class.clone();
+    nf("register", move |_i, args| {
+        let sub = single(&args, "register")?.clone();
+        let is_type = match &sub {
+            Value::Class(_) => true,
+            Value::Native(n) => {
+                crate::value::native_is_type(n.name)
+                    || is_builtin_type_name(n.name)
+                    || crate::interp::builtin_exc_mro(n.name).is_some()
+            }
+            _ => false,
+        };
+        if !is_type {
+            return Err(type_error("Can only register classes"));
+        }
+        let target = Value::Class(owner.clone());
+        if is_subclass_of(&sub, &target) {
+            return Ok(sub);
+        }
+        if is_subclass_of(&target, &sub) {
+            return Err(Unwind::Exception(crate::error::VmException::new(
+                "RuntimeError",
+                "Refusing to create an inheritance cycle",
+            )));
+        }
+        ABC_REGISTRY.with(|r| r.borrow_mut().push((owner.clone(), sub.clone())));
+        Ok(sub)
+    })
+}
+
+/// The `collections.abc` classes above `name` (itself included).
+fn abc_closure(name: &str, out: &mut Vec<&'static str>) {
+    let (me, parents): (&'static str, &[&str]) = match name {
+        "Hashable" => ("Hashable", &[]),
+        "Awaitable" => ("Awaitable", &[]),
+        "Coroutine" => ("Coroutine", &["Awaitable"]),
+        "AsyncIterable" => ("AsyncIterable", &[]),
+        "AsyncIterator" => ("AsyncIterator", &["AsyncIterable"]),
+        "AsyncGenerator" => ("AsyncGenerator", &["AsyncIterator"]),
+        "Iterable" => ("Iterable", &[]),
+        "Iterator" => ("Iterator", &["Iterable"]),
+        "Reversible" => ("Reversible", &["Iterable"]),
+        "Generator" => ("Generator", &["Iterator"]),
+        "Sized" => ("Sized", &[]),
+        "Container" => ("Container", &[]),
+        "Collection" => ("Collection", &["Sized", "Iterable", "Container"]),
+        "Buffer" => ("Buffer", &[]),
+        "Callable" => ("Callable", &[]),
+        "Set" => ("Set", &["Collection"]),
+        "MutableSet" => ("MutableSet", &["Set"]),
+        "Mapping" => ("Mapping", &["Collection"]),
+        "MutableMapping" => ("MutableMapping", &["Mapping"]),
+        "MappingView" => ("MappingView", &["Sized"]),
+        "KeysView" => ("KeysView", &["MappingView", "Set"]),
+        "ItemsView" => ("ItemsView", &["MappingView", "Set"]),
+        "ValuesView" => ("ValuesView", &["MappingView", "Collection"]),
+        "Sequence" => ("Sequence", &["Reversible", "Collection"]),
+        "MutableSequence" => ("MutableSequence", &["Sequence"]),
+        "ByteString" => ("ByteString", &["Sequence"]),
+        _ => return,
+    };
+    if !out.contains(&me) {
+        out.push(me);
+    }
+    for p in parents {
+        abc_closure(p, out);
+    }
+}
+
+/// The `collections.abc` classes CPython registers a builtin type (or a
+/// type the VM models as a stdlib shim) with, before closing over the
+/// hierarchy.
+fn builtin_abc_registrations(type_name: &str) -> &'static [&'static str] {
+    match type_name {
+        "tuple" | "str" | "range" | "memoryview" | "UserString" => &["Sequence"],
+        "bytes" => &["ByteString", "Buffer"],
+        "list" | "deque" | "UserList" => &["MutableSequence"],
+        "bytearray" => &["MutableSequence", "ByteString", "Buffer"],
+        "frozenset" => &["Set"],
+        "set" => &["MutableSet"],
+        "dict" | "OrderedDict" | "Counter" | "defaultdict" | "ChainMap" | "UserDict" => {
+            &["MutableMapping"]
+        }
+        "mappingproxy" | "frozendict" => &["Mapping"],
+        "dict_keys" => &["KeysView"],
+        "dict_items" => &["ItemsView"],
+        "dict_values" => &["ValuesView"],
+        "generator" => &["Generator"],
+        "coroutine" => &["Coroutine"],
+        "async_generator" => &["AsyncGenerator"],
+        "range_iterator"
+        | "list_iterator"
+        | "tuple_iterator"
+        | "str_ascii_iterator"
+        | "dict_keyiterator"
+        | "dict_valueiterator"
+        | "dict_itemiterator"
+        | "set_iterator"
+        | "enumerate"
+        | "zip"
+        | "map"
+        | "filter"
+        | "reversed"
+        | "list_reverseiterator"
+        | "dict_reversekeyiterator"
+        | "dict_reversevalueiterator"
+        | "dict_reverseitemiterator"
+        | "iterator" => &["Iterator"],
+        _ => &[],
+    }
+}
+
+/// Builtin types whose instances are unhashable (`__hash__` is `None`).
+fn builtin_type_unhashable(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "list"
+            | "dict"
+            | "set"
+            | "bytearray"
+            | "mappingproxy"
+            | "dict_keys"
+            | "dict_items"
+            | "dict_values"
+            | "deque"
+            | "OrderedDict"
+            | "Counter"
+            | "defaultdict"
+            | "ChainMap"
+            | "UserDict"
+            | "UserList"
+    )
+}
+
+/// Whether the builtin type `type_name` is a (virtual) subclass of the
+/// `collections.abc` class `abc_name`, by CPython's registrations and its
+/// structural hooks on the builtin type's own methods.
+fn builtin_type_is_abc(type_name: &str, abc_name: &str) -> bool {
+    let mut names = Vec::new();
+    for r in builtin_abc_registrations(type_name) {
+        abc_closure(r, &mut names);
+    }
+    if names.contains(&abc_name) {
+        return true;
+    }
+    match abc_name {
+        "Hashable" => !builtin_type_unhashable(type_name),
+        // Every builtin type is callable; its instances are not (natives
+        // and functions answer through `value_is_abc`).
+        _ => false,
+    }
+}
+
+/// The structural `__subclasshook__` of the `collections.abc` class
+/// `abc_name`, asked of a class: every listed method is defined somewhere
+/// in its MRO and not set to `None`.
+fn class_matches_abc_hook(c: &Rc<crate::value::Class>, abc_name: &str) -> bool {
+    let methods: &[&str] = match abc_name {
+        "Hashable" => {
+            return !matches!(
+                crate::value::instance_hash_mode(c),
+                crate::value::HashMode::Unhashable
+            );
+        }
+        "Awaitable" => &["__await__"],
+        "Coroutine" => &["__await__", "send", "throw", "close"],
+        "AsyncIterable" => &["__aiter__"],
+        "AsyncIterator" => &["__anext__", "__aiter__"],
+        "AsyncGenerator" => &["__aiter__", "__anext__", "asend", "athrow", "aclose"],
+        "Iterable" => &["__iter__"],
+        "Iterator" => &["__iter__", "__next__"],
+        "Reversible" => &["__reversed__", "__iter__"],
+        "Generator" => &["__iter__", "__next__", "send", "throw", "close"],
+        "Sized" => &["__len__"],
+        "Container" => &["__contains__"],
+        "Collection" => &["__len__", "__iter__", "__contains__"],
+        "Buffer" => &["__buffer__"],
+        "Callable" => &["__call__"],
+        _ => return false,
+    };
+    // CPython's `_check_methods`: each name must be bound somewhere in the
+    // MRO to anything but `None`.
+    methods
+        .iter()
+        .all(|m| match crate::interp::lookup_class_member(c, m) {
+            Some((_, crate::interp::ClassMember::Method(_))) => true,
+            Some((_, crate::interp::ClassMember::Attr(v))) => !matches!(v, Value::None),
+            None => false,
+        })
+}
+
+/// `issubclass(sub, target)` beyond the nominal MRO when `target` is an
+/// ABC: a registered virtual subclass, and for a `collections.abc` class
+/// the builtin registrations and the structural hooks.
+fn abc_subclass(sub: &Value, target: &Rc<crate::value::Class>) -> bool {
+    let registered: Vec<Value> = ABC_REGISTRY.with(|r| {
+        r.borrow()
+            .iter()
+            .filter(|(abc, _)| class_in_chain_rc(abc, target))
+            .map(|(_, v)| v.clone())
+            .collect()
+    });
+    if registered.iter().any(|r| is_subclass_of(sub, r)) {
+        return true;
+    }
+    if !is_collections_abc_class(target) {
+        return false;
+    }
+    match sub {
+        Value::Native(n) => builtin_type_is_abc(n.name, &target.name),
+        Value::Class(c) => {
+            if is_builtin_type_class(c) {
+                return builtin_type_is_abc(&c.name, &target.name);
+            }
+            class_matches_abc_hook(c, &target.name)
+                || (target.name != "Hashable"
+                    && class_type_names(c)
+                        .iter()
+                        .any(|k| builtin_type_is_abc(k, &target.name)))
+        }
+        _ => false,
+    }
+}
+
+/// The names of a class's MRO and of the builtin types it subclasses
+/// (`class Stack(list)` records `list` by name, not in `bases`).
+fn class_type_names(c: &Rc<crate::value::Class>) -> Vec<String> {
+    let mut out = Vec::new();
+    for k in crate::interp::class_mro(c) {
+        out.push(k.name.clone());
+        if let Some(Value::Tuple(names)) = k.class_attrs.borrow().get("__typhon_builtin_bases__") {
+            out.extend(names.iter().map(Value::py_str));
+        }
+    }
+    out
+}
+
+/// `isinstance(val, target)` beyond the nominal MRO when `target` is an
+/// ABC (see `abc_subclass`).
+fn abc_instance(val: &Value, target: &Rc<crate::value::Class>) -> bool {
+    let registered: Vec<Value> = ABC_REGISTRY.with(|r| {
+        r.borrow()
+            .iter()
+            .filter(|(abc, _)| class_in_chain_rc(abc, target))
+            .map(|(_, v)| v.clone())
+            .collect()
+    });
+    if registered.iter().any(|r| is_instance_of(val, r)) {
+        return true;
+    }
+    if !is_collections_abc_class(target) {
+        return false;
+    }
+    let abc_name = target.name.as_str();
+    match val {
+        Value::Instance(inst) => {
+            class_matches_abc_hook(&inst.class, abc_name)
+                || (abc_name != "Hashable"
+                    && class_type_names(&inst.class)
+                        .iter()
+                        .any(|k| builtin_type_is_abc(k, abc_name)))
+        }
+        // `NotImplemented` is a native here, but not callable.
+        Value::Native(n) if n.name == "NotImplemented" => abc_name == "Hashable",
+        Value::Native(_) | Value::Function(_) | Value::BoundMethod { .. } | Value::Class(_) => {
+            matches!(abc_name, "Callable" | "Hashable")
+        }
+        Value::Exception { .. } => abc_name == "Hashable",
+        other => builtin_type_is_abc(other.type_name(), abc_name),
+    }
 }
 
 /// `heapq` shim — implements the small-but-essential surface for
