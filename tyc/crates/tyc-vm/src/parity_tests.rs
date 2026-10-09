@@ -2493,6 +2493,7 @@ import csv
 import time
 import itertools
 show(json.__name__, os.path.__name__, asyncio.__name__)
+show(vars(json).get("__name__"), "__name__" in vars(os))
 for f in [os.getcwd, operator.add, bisect.bisect, bisect.insort_left, csv.reader, time.strftime, itertools.tee]:
     show(type(f).__name__, f.__name__, f.__qualname__, repr(f))
 show(type(os.walk).__name__, type(os.makedirs).__name__, type(os.getenv).__name__)
@@ -2611,6 +2612,12 @@ Base2.__repr__ = _old_repr
 plain class D2(Base2):
     a: int = 1
 show(repr(Base2()), repr(D2()), getattr(D2(), "__repr__")(), D2.__repr__(D2()))
+show(D2.__repr__(self=D2()), D2.__eq__(self=D2(), other=D2(2)), D2().__eq__(other=D2()))
+for bad in (lambda: D2.__eq__(D2(), other=D2(), x=1), lambda: D2.__eq__(D2(), D2(), other=D2()), lambda: D2.__repr__(D2(), self=D2())):
+    try:
+        bad()
+    except TypeError as e:
+        show(str(e))
 plain class J2(H):
     def __post_init__(self):
         self.hooked = True

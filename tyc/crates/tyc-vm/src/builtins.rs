@@ -748,6 +748,11 @@ pub fn install(interp: &mut Interpreter) {
                 for (k, v) in md.members.borrow().iter() {
                     m.insert(HashKey::Str(Rc::new(k.clone())), v.clone());
                 }
+                // Every module namespace holds its `__name__`.
+                let key = HashKey::Str(Rc::new("__name__".to_owned()));
+                if !m.contains_key(&key) {
+                    m.insert(key, Value::Str(Rc::new(md.name.clone())));
+                }
                 Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(m))))
             }
             Some(other) => Err(type_error(format!(
@@ -14888,9 +14893,10 @@ pub fn call_with_kwargs(
         // `split_kwargs`): `math.isclose(rel_tol=, abs_tol=)`,
         // `math.nextafter(steps=)`, and the `re` functions and `Pattern`
         // methods (`flags=`, `count=`, `maxsplit=`, `pos=`, `endpos=`), and
-        // a dataclass's generated `__init__` read as an attribute.
+        // a dataclass's generated `__init__` / `__repr__` / `__eq__` read as
+        // an attribute.
         "isclose" | "nextafter" | "compile" | "match" | "search" | "fullmatch" | "findall"
-        | "finditer" | "sub" | "subn" | "split" | "__init__" => {
+        | "finditer" | "sub" | "subn" | "split" | "__init__" | "__repr__" | "__eq__" => {
             let mut args = args;
             args.push(make_kwargs_sentinel(kwargs));
             (n.func)(interp, args)

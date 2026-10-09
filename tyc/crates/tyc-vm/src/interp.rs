@@ -6380,25 +6380,50 @@ impl Interpreter {
                 return Ok(Value::None);
             }
             // `self` plus, for `__eq__`, `other`: the generated methods take
-            // exactly these.
-            let want = if name == "__eq__" { 2 } else { 1 };
-            let args: Vec<Value> = receiver.iter().cloned().chain(args).collect();
-            if args.len() != want {
-                return Err(type_error(if args.len() < want {
-                    let missing = if args.is_empty() { "self" } else { "other" };
-                    format!(
-                        "{}() missing 1 required positional argument: '{missing}'",
-                        qualname()
-                    )
-                } else {
-                    format!(
-                        "{}() takes {want} positional argument{} but {} were given",
-                        qualname(),
-                        if want == 1 { "" } else { "s" },
-                        args.len()
-                    )
-                }));
+            // exactly these, positionally or by name.
+            let params: &[&str] = if name == "__eq__" {
+                &["self", "other"]
+            } else {
+                &["self"]
+            };
+            let (positional, kwargs) = crate::builtins::split_kwargs_pub(&args);
+            let positional: Vec<Value> = receiver.iter().chain(positional).cloned().collect();
+            if positional.len() > params.len() {
+                return Err(type_error(format!(
+                    "{}() takes {} positional argument{} but {} were given",
+                    qualname(),
+                    params.len(),
+                    if params.len() == 1 { "" } else { "s" },
+                    positional.len()
+                )));
             }
+            let mut slots: Vec<Option<Value>> = vec![None; params.len()];
+            for (i, v) in positional.into_iter().enumerate() {
+                slots[i] = Some(v);
+            }
+            for (k, v) in kwargs {
+                let Some(i) = params.iter().position(|p| *p == k) else {
+                    return Err(type_error(format!(
+                        "{}() got an unexpected keyword argument '{k}'",
+                        qualname()
+                    )));
+                };
+                if slots[i].is_some() {
+                    return Err(type_error(format!(
+                        "{}() got multiple values for argument '{k}'",
+                        qualname()
+                    )));
+                }
+                slots[i] = Some(v);
+            }
+            if let Some(i) = slots.iter().position(Option::is_none) {
+                return Err(type_error(format!(
+                    "{}() missing 1 required positional argument: '{}'",
+                    qualname(),
+                    params[i]
+                )));
+            }
+            let args: Vec<Value> = slots.into_iter().flatten().collect();
             // This exact method, not whatever `repr()` / `==` would dispatch
             // to on a subclass: it reads `provider`'s declared fields only.
             let field = |inst: &crate::value::Instance,
