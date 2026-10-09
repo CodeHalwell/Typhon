@@ -1161,6 +1161,29 @@ mod tests {
     /// relative-path assertion in the suite nondeterministic. Serialise them.
     static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// `object.__new__(cls, *args)` takes extra arguments only when `cls`
+    /// has its own `__init__` and keeps `object.__new__`, as in CPython. A
+    /// Typhon `class` always has a generated `__init__`, so this needs a
+    /// `plain class` and cannot be a CPython parity probe.
+    #[test]
+    fn object_new_rejects_extra_args_without_an_init() {
+        assert_eq!(
+            run_capturing(
+                r###"plain class Bare:
+    pass
+try:
+    object.__new__(Bare, 1)
+    assert False
+except TypeError as e:
+    assert str(e) == "Bare() takes no arguments"
+assert type(object.__new__(Bare)) is Bare
+"###
+            )
+            .unwrap(),
+            0
+        );
+    }
+
     #[test]
     fn review_nan_identity_in_containers() {
         assert_eq!(

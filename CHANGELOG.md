@@ -20,13 +20,18 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   `copy` to CPython. The VM now has `copy.copy`, `copy.deepcopy` (memo,
   cycles and shared references included), `copy.replace` and `copy.Error`,
   honouring `__copy__`, `__deepcopy__`, `__getstate__` / `__setstate__` and
-  `__slots__`.
+  `__slots__`. Copies of `bytearray`, `defaultdict`, `Counter`,
+  `OrderedDict`, `ChainMap`, `UserDict` and `UserList` get their own
+  storage, `slice`s and exceptions copy as in CPython, and
+  `type(collections.defaultdict())` is `defaultdict`.
 - **Builtin type objects are the builtins.** Under `tyc run`,
   `type([]) is list` was `False` (`==` already held), `type(x)(...)` on a
   builtin's type failed instead of constructing one, and
   `isinstance(cls, type)` was `False` for every class. All three now match
   CPython, and `object.__new__(cls)` makes a bare instance without running
-  `__init__`.
+  `__init__` (rejecting extra arguments the way CPython does).
+  `type(bytearray()) is bytearray` holds, and `hasattr(list, "nope")` is
+  `False` rather than finding a made-up method.
 - **Tracebacks through the VM's stdlib modules.** A frame inside one of the
   VM's Python-written modules (`copy`, `datetime`, `pathlib` and friends)
   was reported under the caller's file with an unrelated line. It now

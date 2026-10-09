@@ -7,6 +7,11 @@
 
 
 class _MappingBase:
+    # `copy.copy` hook: CPython rebuilds these through `__reduce__`, which
+    # hands the copy its own storage rather than sharing `_data`.
+    def _typhon_copy(self):
+        return type(self)(self._data)
+
     def __getitem__(self, key):
         if key in self._data:
             return self._data[key]
@@ -428,6 +433,9 @@ class ChainMap(_MappingBase):
 
     def copy(self):
         return ChainMap(dict(self.maps[0]), *self.maps[1:])
+
+    def __copy__(self):
+        return self.copy()
 
     # `_MappingBase`'s mutators all reach for `self._data`, which a ChainMap
     # does not have: every one of them has to work on the first mapping.
@@ -916,6 +924,9 @@ class UserDict:
     def copy(self):
         return self.__class__(self.data.copy())
 
+    def __copy__(self):
+        return self.copy()
+
     @classmethod
     def fromkeys(cls, iterable, value=None):
         d = cls()
@@ -1025,6 +1036,9 @@ class UserList:
 
     def copy(self):
         return self.__class__(self)
+
+    def __copy__(self):
+        return self.copy()
 
     def count(self, item):
         return self.data.count(item)

@@ -8216,7 +8216,7 @@ impl Interpreter {
                 if builtin_object && attr == "__new__" {
                     return Ok(Value::Native(Rc::new(NativeFn::new(
                         "object.__new__",
-                        |_i, args| match args.first() {
+                        |i, args| match args.first() {
                             Some(Value::Class(c)) if crate::builtins::is_builtin_type_class(c) => {
                                 Err(type_error(format!(
                                     "object.__new__({0}) is not safe, use {0}.__new__()",
@@ -8231,6 +8231,25 @@ impl Interpreter {
                                     "object.__new__({0}) is not safe, use {0}.__new__()",
                                     n.name
                                 )))
+                            }
+                            // Extra arguments are an error unless the class
+                            // has its own `__init__` to take them and keeps
+                            // `object.__new__` (CPython's `excess_args` rule).
+                            Some(Value::Class(c))
+                                if args.len() > 1 && i.find_method(c, "__new__").is_some() =>
+                            {
+                                Err(type_error(
+                                    "object.__new__() takes exactly one argument \
+                                     (the type to instantiate)",
+                                ))
+                            }
+                            Some(Value::Class(c))
+                                if args.len() > 1
+                                    && !c.is_exception
+                                    && i.find_method(c, "__init__").is_none()
+                                    && !class_has_generated_init(c) =>
+                            {
+                                Err(type_error(format!("{}() takes no arguments", c.name)))
                             }
                             Some(Value::Class(c)) => Ok(Value::Instance(Rc::new(Instance {
                                 class: c.clone(),
@@ -8610,6 +8629,14 @@ impl Interpreter {
                     "str" | "list" | "dict" | "set" | "frozenset" | "tuple" | "bytes"
                 ) =>
             {
+                // Only a method the type actually has: `list.__deepcopy__`
+                // and `hasattr(list, "nope")` miss, as in CPython.
+                if !builtin_has_attr(&empty_builtin_value(nf.name), attr) {
+                    return Err(attribute_error(format!(
+                        "type object '{}' has no attribute '{}'",
+                        nf.name, attr
+                    )));
+                }
                 let attr_name: Rc<str> = Rc::from(attr);
                 let m = NativeFn::new("method", move |interp, args| {
                     if args.is_empty() {
@@ -11809,6 +11836,21 @@ fn builtin_type_method(ty: &'static str, attr: &str) -> Option<Value> {
 }
 
 /// [`builtin_has_attr`] for the method dispatcher in `builtins`.
+/// An empty value of the builtin container / text type `name`, for asking
+/// [`builtin_has_attr`] what the type itself offers.
+fn empty_builtin_value(name: &str) -> Value {
+    match name {
+        "str" => Value::Str(Rc::new(String::new())),
+        "bytes" => Value::Bytes(Rc::new(Vec::new())),
+        "list" => Value::List(Rc::new(RefCell::new(Vec::new()))),
+        "tuple" => Value::Tuple(Rc::new(Vec::new())),
+        "dict" => Value::Dict(Rc::new(crate::value::FrozenCell::new(DictMap::new()))),
+        _ => Value::Set(Rc::new(crate::value::FrozenCell::new(
+            crate::pyset::PySet::new(),
+        ))),
+    }
+}
+
 pub(crate) fn builtin_has_attr_pub(value: &Value, attr: &str) -> bool {
     builtin_has_attr(value, attr)
 }
@@ -12771,8 +12813,9 @@ fn values_identical(a: &Value, b: &Value) -> bool {
         // one type object in CPython.
         (Class(c), Native(n)) | (Native(n), Class(c)) => {
             c.name == n.name
-                && crate::builtins::is_builtin_type_name(n.name)
-                && crate::builtins::is_builtin_type_class(c)
+                && ((crate::builtins::is_builtin_type_name(n.name)
+                    && crate::builtins::is_builtin_type_class(c))
+                    || crate::builtins::is_builtin_shim_class(c))
         }
         // A function object is one `Rc`, so `g is f` after `g = f` (and
         // `wrapper.__wrapped__ is f`) holds, as in CPython.

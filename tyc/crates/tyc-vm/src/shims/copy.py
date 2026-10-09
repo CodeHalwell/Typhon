@@ -29,6 +29,10 @@ class _Holder:
 # Functions, builtins and methods copy as themselves, as in CPython.
 _FUNCTION_TYPES = (type(_function), type(len), type(_Holder().method))
 
+# The class of a real bytearray. Under the VM `bytearray` names the builtin
+# constructor, so `type(x) is bytearray` alone does not recognise one.
+_BYTEARRAY = type(bytearray())
+
 
 def _atomic(x):
     return (
@@ -37,6 +41,7 @@ def _atomic(x):
         or x is NotImplemented
         or isinstance(x, (int, float, bool, complex, str, bytes, range, type))
         or type(x) in _FUNCTION_TYPES
+        or type(x) is slice
         or callable(x) and not hasattr(x, "__dict__") and not hasattr(type(x), "__copy__")
     )
 
@@ -98,9 +103,18 @@ def _rebuild(x, state, slots):
 
 def _defines(cls, name):
     for c in cls.__mro__:
-        if c is not object and name in c.__dict__:
+        if c is not object and name in getattr(c, "__dict__", ()):
             return True
     return False
+
+
+def _exception_state(x):
+    # A builtin exception has no instance `__dict__` under the VM.
+    try:
+        d = vars(x)
+    except TypeError:
+        return None
+    return dict(d) if d else None
 
 
 def _get_state(x):
@@ -113,15 +127,28 @@ def copy(x):
     cls = type(x)
     if isinstance(x, enum.Enum):
         return x
-    if cls in (list, dict, set, bytearray):
-        return x.copy()
+    if cls in (list, dict, set) or cls is bytearray or cls is _BYTEARRAY:
+        return bytearray(x) if cls is _BYTEARRAY else x.copy()
     if cls in (tuple, frozenset):
+        return x
+    # Atomic objects first, as CPython's dispatch table does: a type or a
+    # function is never asked for its `__copy__`.
+    if _atomic(x):
         return x
     copier = getattr(cls, "__copy__", None)
     if copier is not None:
         return copier(x)
-    if _atomic(x):
-        return x
+    # A VM shim (`Counter`, `OrderedDict`) whose storage must not be shared.
+    copier = getattr(cls, "_typhon_copy", None)
+    if copier is not None:
+        return copier(x)
+    if isinstance(x, BaseException):
+        # `BaseException.__reduce__`: the class called on the same args.
+        y = cls(*x.args)
+        state = _exception_state(x)
+        if state is not None:
+            _apply_state(y, cls, state)
+        return y
     state, slots = _get_state(x)
     return _rebuild(x, state, slots)
 
@@ -159,14 +186,24 @@ def deepcopy(x, memo=None, _nil=[]):
         y = x if same else tuple(items)
     elif cls is set or cls is frozenset:
         y = cls(deepcopy(a, memo) for a in x)
-    elif cls is bytearray:
+    elif cls is bytearray or cls is _BYTEARRAY:
         y = bytearray(x)
+    elif cls is slice:
+        # Not atomic for a deep copy: CPython rebuilds it from its parts.
+        y = slice(deepcopy(x.start, memo), deepcopy(x.stop, memo), deepcopy(x.step, memo))
     else:
-        copier = getattr(x, "__deepcopy__", None)
+        copier = None if _atomic(x) else getattr(x, "__deepcopy__", None)
         if copier is not None:
             y = copier(memo)
         elif _atomic(x):
             y = x
+        elif isinstance(x, BaseException):
+            args = deepcopy(x.args, memo)
+            y = cls(*args)
+            memo[d] = y
+            state = _exception_state(x)
+            if state is not None:
+                _apply_state(y, cls, deepcopy(state, memo))
         else:
             state = _combined(*_get_state(x))
             y = object.__new__(cls)

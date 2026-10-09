@@ -2351,6 +2351,48 @@ class _EmptyState:
 copy.copy(_EmptyState())
 copy.deepcopy(_EmptyState())
 show(calls)
+ba = bytearray(b"ab")
+ba2 = copy.copy(ba)
+ba2.append(99)
+show(ba, ba2, type(ba2) is type(ba))
+ba3 = copy.deepcopy([ba, ba])
+ba3[0].append(100)
+show(ba, ba3, ba3[0] is ba3[1])
+sl = slice(1, [2], 3)
+sl2 = copy.deepcopy(sl)
+show(copy.copy(sl) is sl, sl2 == sl, sl2 is sl, sl2.stop is sl.stop)
+ex = ValueError("x", [2])
+ex2 = copy.copy(ex)
+ex3 = copy.deepcopy(ex)
+show(type(ex2).__name__, ex2.args, ex2 is ex, ex2.args[1] is ex.args[1])
+show(type(ex3).__name__, ex3.args, ex3.args[1] is ex.args[1])
+class CodedError(Exception):
+    code: int
+    def __init__(self, msg: str, code: int) -> None:
+        super().__init__(msg, code)
+        self.code = code
+ce = copy.deepcopy(CodedError("boom", 3))
+show(type(ce).__name__, ce.args, ce.code)
+from collections import defaultdict, Counter, OrderedDict, ChainMap, UserDict, UserList
+dd = defaultdict(list)
+dd["a"].append(1)
+dd2 = copy.copy(dd)
+dd2["b"].append(2)
+dd2["a"].append(5)
+dd3 = copy.deepcopy(dd)
+dd3["a"].append(9)
+show(sorted(dd.items()), sorted(dd2.items()), sorted(dd3.items()), type(dd2).__name__, type(dd2) is defaultdict)
+for cm in (Counter("aab"), OrderedDict(a=1), ChainMap({"a": 1}), UserDict(a=1)):
+    cm2 = copy.copy(cm)
+    cm2["z"] = 1
+    cm3 = copy.deepcopy(cm)
+    cm3["y"] = 2
+    show(type(cm2).__name__, cm, cm2, cm3)
+ul = UserList([1])
+ul2 = copy.copy(ul)
+ul2.append(2)
+show(ul, ul2, copy.deepcopy(ul))
+show(hasattr(list, "nope"), hasattr(list, "append"), hasattr(dict, "__deepcopy__"), hasattr(str, "lower"))
 "#,
     );
 }
@@ -2374,6 +2416,19 @@ for _t in (list, ValueError, KeyError):
         show(str(e))
 o = object.__new__(P)
 show(type(o) is P, isinstance(o, P))
+class WithInit:
+    a: int
+    def __init__(self, a: int) -> None:
+        self.a = a
+class WithNew:
+    def __new__(cls):
+        return object.__new__(cls)
+for _c in (WithInit, WithNew):
+    try:
+        show(type(object.__new__(_c, 1)).__name__)
+    except TypeError as e:
+        show(str(e))
+show(type(bytearray()) is bytearray, type(bytearray(b"a")) == bytearray, type(bytearray()) is bytes)
 "#,
     );
 }

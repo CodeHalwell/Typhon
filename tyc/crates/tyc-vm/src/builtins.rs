@@ -3130,7 +3130,7 @@ fn cached_helper_class(
 /// the missing-key path runs `__missing__`, which the foundation's subscript
 /// hook invokes when `__getitem__` raises `KeyError`.
 const DEFAULTDICT_SRC: &str = r#"
-class _DefaultDict:
+class defaultdict:
     __typhon_builtin_bases__ = ("dict", "defaultdict")
     def __init__(self, default_factory, initial):
         self._data = {}
@@ -3169,13 +3169,17 @@ class _DefaultDict:
             return self._data[key]
         return default
     def __eq__(self, other):
-        if isinstance(other, _DefaultDict):
+        if isinstance(other, defaultdict):
             return self._data == other._data
         return self._data == other
     def __ne__(self, other):
-        if isinstance(other, _DefaultDict):
+        if isinstance(other, defaultdict):
             return self._data != other._data
         return self._data != other
+    def copy(self):
+        return defaultdict(self._factory, self._data)
+    def __copy__(self):
+        return self.copy()
 "#;
 
 /// The `_NamedTupleBase` template from the `collections` shim, cached.
@@ -3203,7 +3207,34 @@ fn lazy_value_class(interp: &mut Interpreter) -> Result<Value, Unwind> {
 }
 
 pub(crate) fn bytearray_class(interp: &mut Interpreter) -> Result<Value, Unwind> {
-    cached_helper_class(interp, "__shim_bytearray__", shims::BYTEARRAY, "bytearray")
+    let cls = cached_helper_class(interp, "__shim_bytearray__", shims::BYTEARRAY, "bytearray")?;
+    register_builtin_shim_class(&cls);
+    Ok(cls)
+}
+
+thread_local! {
+    /// The shim classes standing behind a builtin constructor native
+    /// (`bytearray`, `collections.defaultdict`, `frozendict`, `sentinel`):
+    /// `type(bytearray())` is one of these, and it must be the builtin
+    /// `bytearray`, as in CPython.
+    static BUILTIN_SHIM_CLASSES: RefCell<Vec<Rc<crate::value::Class>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+fn register_builtin_shim_class(cls: &Value) {
+    if let Value::Class(c) = cls {
+        BUILTIN_SHIM_CLASSES.with(|shims| {
+            let mut shims = shims.borrow_mut();
+            if !shims.iter().any(|s| Rc::ptr_eq(s, c)) {
+                shims.push(c.clone());
+            }
+        });
+    }
+}
+
+/// `c` is the shim class behind a builtin constructor native of the same name.
+pub(crate) fn is_builtin_shim_class(c: &Rc<crate::value::Class>) -> bool {
+    BUILTIN_SHIM_CLASSES.with(|shims| shims.borrow().iter().any(|s| Rc::ptr_eq(s, c)))
 }
 
 /// The Python 3.15 builtin classes `frozendict` (PEP 814) and `sentinel`
@@ -3214,16 +3245,20 @@ pub(crate) fn py315_builtin_class(interp: &mut Interpreter, name: &str) -> Resul
         "frozendict" => "__shim_frozendict__",
         _ => "__shim_sentinel__",
     };
-    cached_helper_class(interp, cache, shims::PY315_BUILTINS, name)
+    let cls = cached_helper_class(interp, cache, shims::PY315_BUILTINS, name)?;
+    register_builtin_shim_class(&cls);
+    Ok(cls)
 }
 
 fn defaultdict_class(interp: &mut Interpreter) -> Result<Value, Unwind> {
-    cached_helper_class(
+    let cls = cached_helper_class(
         interp,
         "__shim_defaultdict__",
         DEFAULTDICT_SRC,
-        "_DefaultDict",
-    )
+        "defaultdict",
+    )?;
+    register_builtin_shim_class(&cls);
+    Ok(cls)
 }
 
 // ── Module resolution ──────────────────────────────────────────────────────
