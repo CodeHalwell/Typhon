@@ -1111,6 +1111,16 @@ fn scan_builtin_subclasses(
         "sentinel",
     ];
     const ENUM_TYPES: &[&str] = &["Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "ReprEnum"];
+    /// Standard-library classes the VM builds as natives, by module, so a
+    /// subclass of one discards its base.
+    const STDLIB_NATIVES: &[(&str, &str)] = &[
+        ("collections", "defaultdict"),
+        ("functools", "partial"),
+        ("functools", "cached_property"),
+    ];
+    fn stdlib_native(module: &str, name: &str) -> bool {
+        STDLIB_NATIVES.contains(&(module, name))
+    }
 
     /// One pass in source order, erring towards CPython either way. A name
     /// that stands for a builtin value type (`Alias = list`,
@@ -1130,8 +1140,9 @@ fn scan_builtin_subclasses(
         enum_bases: std::collections::HashSet<String>,
         /// `builtins` and its aliases (`import builtins as b`).
         builtins_modules: std::collections::HashSet<String>,
-        /// `collections` and its aliases, for `collections.defaultdict`.
-        collections_modules: std::collections::HashSet<String>,
+        /// The names bound to a [`STDLIB_NATIVES`] module, for
+        /// `collections.defaultdict` and `functools.partial`.
+        native_modules: std::collections::HashMap<String, String>,
         /// Function and class bodies around the statement.
         depth: usize,
         /// Compound statements (`if`, `for`, `try`, …) around it.
@@ -1184,9 +1195,10 @@ fn scan_builtin_subclasses(
                 if on_builtins && VALUE_TYPES.contains(&attr) {
                     return Some(attr.to_owned());
                 }
-                let on_collections = matches!(a.value.as_ref(), Expr::Name(m)
-                    if self.collections_modules.contains(m.id.as_str()));
-                if on_collections && attr == "defaultdict" {
+                let native = matches!(a.value.as_ref(), Expr::Name(m)
+                    if self.native_modules.get(m.id.as_str())
+                        .is_some_and(|module| stdlib_native(module, attr)));
+                if native {
                     return Some(attr.to_owned());
                 }
                 // `helper.Alias` for another module's `Alias = list`.
@@ -1289,8 +1301,9 @@ fn scan_builtin_subclasses(
                             "builtins" => {
                                 self.builtins_modules.insert(bound.to_owned());
                             }
-                            "collections" => {
-                                self.collections_modules.insert(bound.to_owned());
+                            _ if STDLIB_NATIVES.iter().any(|(m, _)| *m == name) => {
+                                self.native_modules
+                                    .insert(bound.to_owned(), name.to_owned());
                             }
                             _ => {}
                         }
@@ -1311,7 +1324,7 @@ fn scan_builtin_subclasses(
                                 self.builtin.insert(bound, name.to_owned());
                             }
                             // A native constructor too, not a class.
-                            Some("collections") if name == "defaultdict" => {
+                            Some(m) if stdlib_native(m, name) => {
                                 self.builtin.insert(bound, name.to_owned());
                             }
                             // `from helper import Alias as A` for a sibling's

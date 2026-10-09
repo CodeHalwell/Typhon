@@ -10182,10 +10182,18 @@ fn count_bindings(body: &[Stmt], module_only: bool) -> HashMap<String, usize> {
                     self.bump(n.id.as_str());
                 }
             }
-            let scope = matches!(expr, Expr::Lambda(_));
-            self.depth += usize::from(scope);
+            // A lambda's defaults run in the enclosing scope; only its
+            // body is its own.
+            if let Expr::Lambda(l) = expr {
+                if let Some(params) = &l.parameters {
+                    self.visit_parameters(params);
+                }
+                self.depth += 1;
+                self.visit_expr(&l.body);
+                self.depth -= 1;
+                return;
+            }
             visitor::walk_expr(self, expr);
-            self.depth -= usize::from(scope);
         }
         fn visit_comprehension(&mut self, comp: &'a ruff_python_ast::Comprehension) {
             // A comprehension's target is its own scope's
@@ -29699,6 +29707,15 @@ def main() -> None:
             "\
 def f(x: object = (object := Exception)) -> None:
     print(x)
+
+plain class Boom(object):
+    pass
+
+def main() -> None:
+    print(Boom(\"x\"))
+",
+            "\
+f = lambda x=(object := Exception): x
 
 plain class Boom(object):
     pass

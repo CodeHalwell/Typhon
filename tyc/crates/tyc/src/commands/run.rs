@@ -1755,17 +1755,28 @@ mod tests {
         );
         let local_alias = "def make(Base: type) -> type:\n    let Alias = Base\n    plain class L(Alias):\n        pass\n    return L\nprint(make(list))\n";
         assert!(scan_source(local_alias).is_some());
-        // `defaultdict` is a native constructor too.
-        for src in [
-            "from collections import defaultdict\nplain class D(defaultdict):\n    pass\nprint(D(list))\n",
-            "import collections\nplain class D(collections.defaultdict):\n    pass\nprint(D(list))\n",
+        // `defaultdict` is a native constructor too, and `functools`'
+        // classes natives, however they are spelt.
+        for (src, base) in [
+            ("from collections import defaultdict\nplain class D(defaultdict):\n    pass\nprint(D(list))\n", "defaultdict"),
+            ("import collections\nplain class D(collections.defaultdict):\n    pass\nprint(D(list))\n", "defaultdict"),
+            ("from functools import partial\nplain class P(partial):\n    pass\n", "partial"),
+            ("from functools import partial as Part\nplain class P(Part):\n    pass\n", "partial"),
+            ("import functools\nplain class P(functools.partial):\n    pass\n", "partial"),
+            ("import functools as ft\nplain class C(ft.cached_property):\n    pass\n", "cached_property"),
+            ("from functools import cached_property\nplain class C(cached_property):\n    pass\n", "cached_property"),
         ] {
             assert_eq!(
                 scan_source(src),
-                Some(vec!["a subclass of the builtin defaultdict".to_owned()]),
+                Some(vec![format!("a subclass of the builtin {base}")]),
                 "{src}"
             );
         }
+        // Another `functools` name is a plain function, not a base.
+        assert_eq!(
+            scan_source("import functools\nplain class W(functools.total_ordering):\n    pass\n"),
+            None
+        );
         // An alias a sibling module exports, imported or reached through it.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("helper.ty"), "Alias = list\n").unwrap();

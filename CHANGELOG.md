@@ -69,7 +69,8 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   binds anywhere other than by a `class`, an import or an alias of one,
   so `Base = choose()`, `for Base in …`, `case [Base]:`, a walrus and a
   sibling module's computed alias all count) and a `defaultdict`,
-  `frozendict` or `sentinel` base fall back too, as do `bool`, `range`,
+  `functools.partial`, `functools.cached_property`, `frozendict` or
+  `sentinel` base fall back too, as do `bool`, `range`,
   `slice` and `memoryview` bases, which CPython rejects. When two modules
   export one alias name for different builtins, the scan assumes the one
   that keeps the class off the VM.
