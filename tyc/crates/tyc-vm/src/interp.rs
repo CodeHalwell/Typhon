@@ -8829,6 +8829,12 @@ impl Interpreter {
                 }
                 let attr_name: Rc<str> = Rc::from(attr);
                 let tag = attr_name.clone();
+                // `list.__class_getitem__` is a class method: bound to `list`.
+                let binding = if class_only {
+                    crate::value::MethodBinding::OnType { classmethod: true }
+                } else {
+                    crate::value::MethodBinding::Unbound
+                };
                 let m = NativeFn::new("method", move |interp, args| {
                     if args.is_empty() {
                         return Err(type_error(format!(
@@ -8838,7 +8844,7 @@ impl Interpreter {
                     }
                     crate::builtins::dispatch_method(interp, &attr_name, args)
                 })
-                .with_method(nf.name, tag, crate::value::MethodBinding::Unbound);
+                .with_method(nf.name, tag, binding);
                 Ok(Value::Native(Rc::new(m)))
             }
             // Generator objects and other iterators: the iterator protocol

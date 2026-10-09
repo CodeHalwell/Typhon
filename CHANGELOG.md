@@ -36,11 +36,13 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   of the project.
 - **A subclass of a builtin value type runs on CPython.** The VM models
   `list`, `int`, `str` and the other value types as values, not classes
-  (and `enumerate`, `zip`, `property`, `classmethod` and the like as natives),
+  (and `enumerate`, `zip`, `property`, `classmethod`, `super`, `type` and
+  the like as natives),
   so `class L(list)` built an empty object (`L([1, 2])` raised
   `TypeError` and `class S(str)` printed as an object). `tyc run`'s
   pre-run scan now sends such a program down the compiled path, as it
-  does a custom metaclass, seeing through aliases (`Alias = list`).
+  does a custom metaclass, seeing through aliases (`Alias = list`,
+  `builtins.list`) and parameterised bases (`list[int]`).
   Value-mixin enums stay on the VM.
 - **A `plain class` is called with its own `__init__`'s arguments.** A
   `plain class` (or a `class!` with a hand-written `__init__`) that also

@@ -1043,6 +1043,10 @@ pub fn module_subclassed_builtin(module: &ruff_python_ast::ModModule) -> Option<
         "property",
         "staticmethod",
         "classmethod",
+        "super",
+        // A metaclass the program only calls (`M("X", (), {})`), which the
+        // `metaclass=` scan never sees.
+        "type",
     ];
     const ENUM_TYPES: &[&str] = &["Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "ReprEnum"];
 
@@ -1054,15 +1058,23 @@ pub fn module_subclassed_builtin(module: &ruff_python_ast::ModModule) -> Option<
         builtin: std::collections::HashMap<String, String>,
         enum_modules: std::collections::HashSet<String>,
         enum_bases: std::collections::HashSet<String>,
+        /// `builtins` and its aliases (`import builtins as b`).
+        builtins_modules: std::collections::HashSet<String>,
     }
     impl<'a> Visitor<'a> for Bindings {
         fn visit_stmt(&mut self, stmt: &'a Stmt) {
             match stmt {
                 Stmt::Import(i) => {
                     for alias in &i.names {
-                        if alias.name.as_str() == "enum" {
-                            let bound = alias.asname.as_ref().unwrap_or(&alias.name);
-                            self.enum_modules.insert(bound.to_string());
+                        let bound = alias.asname.as_ref().unwrap_or(&alias.name);
+                        match alias.name.as_str() {
+                            "enum" => {
+                                self.enum_modules.insert(bound.to_string());
+                            }
+                            "builtins" => {
+                                self.builtins_modules.insert(bound.to_string());
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -1132,6 +1144,13 @@ pub fn module_subclassed_builtin(module: &ruff_python_ast::ModModule) -> Option<
                 Expr::Subscript(s) => s.value.as_ref(),
                 other => other,
             };
+            // `builtins.list` / `b.list` after `import builtins as b`.
+            if let Expr::Attribute(a) = base {
+                let on_builtins = matches!(a.value.as_ref(), Expr::Name(m)
+                    if self.bindings.builtins_modules.contains(m.id.as_str()));
+                let attr = a.attr.as_str();
+                return (on_builtins && VALUE_TYPES.contains(&attr)).then(|| attr.to_owned());
+            }
             let Expr::Name(n) = base else { return None };
             let name = n.id.as_str();
             self.bindings

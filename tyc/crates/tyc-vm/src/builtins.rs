@@ -3468,13 +3468,16 @@ fn make_module(name: &str, entries: Vec<(&str, Value)>) -> Value {
     let mut map = HashMap::new();
     for (k, v) in entries {
         if let Value::Native(n) = &v {
-            // `functools.reduce` and `cmp_to_key` are C even in a Python module.
+            // `functools.reduce` and `cmp_to_key` are C even in a Python
+            // module, and `heapq.nsmallest` / `nlargest` / `merge` Python
+            // in a C one.
             let c_function = name == "functools" && matches!(k, "reduce" | "cmp_to_key");
+            let py_in_c = name == "heapq" && matches!(k, "nsmallest" | "nlargest" | "merge");
             // Only a native made for this module, not one it imported
             // (`random`'s shim binds `math.sqrt` as `_sqrt`), so a C
             // builtin it re-exports keeps its own type.
             let own = k == n.name && !k.starts_with('_');
-            if python_functions
+            if (python_functions || py_in_c)
                 && own
                 && !c_function
                 && n.method.is_none()

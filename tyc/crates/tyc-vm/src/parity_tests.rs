@@ -2456,6 +2456,8 @@ show(int.from_bytes.__qualname__, float.fromhex.__self__ is float, bytes.fromhex
 import json
 import functools
 import dataclasses
+import heapq
+show(type(heapq.nsmallest).__name__, type(heapq.heappush).__name__, type(list.__class_getitem__).__name__, list.__class_getitem__.__self__ is list)
 show(type(json.dumps).__name__, type(dataclasses.field).__name__, type(functools.reduce).__name__, type(functools.wraps).__name__, repr(json.dumps).startswith("<function dumps at 0x"))
 sort = xs.sort
 sort()

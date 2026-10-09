@@ -1648,6 +1648,14 @@ mod tests {
             scan_source(generic),
             Some(vec!["a subclass of the builtin list".to_owned()])
         );
+        // `builtins.list`, and through an alias of the module.
+        for src in [
+            "import builtins\nplain class L(builtins.list):\n    pass\nprint(L())\n",
+            "import builtins as b\nplain class L(b.list):\n    pass\nprint(L())\n",
+            "plain class S(super):\n    pass\nprint(S)\n",
+        ] {
+            assert!(scan_source(src).is_some(), "{src}");
+        }
         // An alias of a builtin is the builtin.
         let alias = "Alias = list\nplain class L(Alias):\n    pass\nprint(L())\n";
         assert_eq!(
@@ -1702,7 +1710,10 @@ mod tests {
             "plain class M(type):\n    pass\nplain class W(metaclass=M):\n    pass\nprint(W())\n";
         assert_eq!(
             scan_source(meta),
-            Some(vec!["a custom metaclass".to_owned()])
+            Some(vec![
+                "a custom metaclass".to_owned(),
+                "a subclass of the builtin type".to_owned()
+            ])
         );
         // `ABCMeta` is modelled.
         let abc = "import abc\nplain class A(metaclass=abc.ABCMeta):\n    pass\nprint(A)\n";
@@ -1747,7 +1758,10 @@ mod tests {
         let own = "plain class ABCMeta(type):\n    pass\nplain class W(metaclass=ABCMeta):\n    pass\nprint(W())\n";
         assert_eq!(
             scan_source(own),
-            Some(vec!["a custom metaclass".to_owned()])
+            Some(vec![
+                "a custom metaclass".to_owned(),
+                "a subclass of the builtin type".to_owned()
+            ])
         );
         let patched = "import abc\nplain class Custom(type):\n    pass\nabc.ABCMeta = Custom\nplain class W(metaclass=abc.ABCMeta):\n    pass\nprint(W())\n";
         assert!(scan_source(patched)
