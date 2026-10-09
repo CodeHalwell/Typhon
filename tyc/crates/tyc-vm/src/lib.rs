@@ -1068,6 +1068,28 @@ pub fn merge_builtin_aliases(
 /// The data-type mixins the VM models on an enum (`enum_mixin_value`).
 const ENUM_MIXINS: &[&str] = &["str", "int", "float", "bytes", "complex"];
 
+/// The root name of an attribute chain and the segments between it and
+/// the last (`Outer.Mid.Inner` is `Outer` and `[Mid]`), or `None` when
+/// the chain is not rooted at a name.
+fn attr_chain(a: &ruff_python_ast::ExprAttribute) -> Option<(&str, Vec<&str>)> {
+    use ruff_python_ast::Expr;
+    let mut mids = Vec::new();
+    let mut node = a.value.as_ref();
+    loop {
+        match node {
+            Expr::Attribute(inner) => {
+                mids.push(inner.attr.as_str());
+                node = inner.value.as_ref();
+            }
+            Expr::Name(n) => {
+                mids.reverse();
+                return Some((n.id.as_str(), mids));
+            }
+            _ => return None,
+        }
+    }
+}
+
 fn scan_builtin_subclasses(
     module: &ruff_python_ast::ModModule,
     project_aliases: &std::collections::HashMap<String, String>,
@@ -1161,6 +1183,8 @@ fn scan_builtin_subclasses(
         /// Receivers of an attribute store, whose attributes the scan
         /// cannot trust as bases.
         mutated: std::collections::HashSet<String>,
+        /// Classes the module defines, in any scope.
+        classes: std::collections::HashSet<String>,
         /// Module-scope names bound to a computed value, which a sibling
         /// may import.
         exported_computed: std::collections::HashSet<String>,
@@ -1255,25 +1279,23 @@ fn scan_builtin_subclasses(
                     Expr::Name(_) => None,
                     // `h.base` on an instance, a parameter or anything else
                     // not a module or class is a runtime value.
-                    Expr::Attribute(a) => {
-                        let mut root = a.value.as_ref();
-                        while let Expr::Attribute(inner) = root {
-                            root = inner.value.as_ref();
+                    Expr::Attribute(a) => match attr_chain(a) {
+                        // `enum ...` lowers to `enum.Enum` before the build
+                        // adds the import. Below a class only nested
+                        // classes are trusted (`Outer.Inner.Base`), not a
+                        // data attribute (`Holder.box.Base`).
+                        Some((root, mids))
+                            if (self.namespaces.contains(root) || root == "enum")
+                                && !self.computed.contains(root)
+                                && !self.mutated.contains(root)
+                                && !self.params.iter().any(|p| p.contains(root))
+                                && (!self.classes.contains(root)
+                                    || mids.iter().all(|m| self.classes.contains(*m))) =>
+                        {
+                            None
                         }
-                        match root {
-                            // `enum ...` lowers to `enum.Enum` before the
-                            // build adds the import.
-                            Expr::Name(n)
-                                if (self.namespaces.contains(n.id.as_str()) || n.id == "enum")
-                                    && !self.computed.contains(n.id.as_str())
-                                    && !self.mutated.contains(n.id.as_str())
-                                    && !self.params.iter().any(|p| p.contains(n.id.as_str())) =>
-                            {
-                                None
-                            }
-                            _ => Some("a class whose base is computed at runtime".to_owned()),
-                        }
-                    }
+                        _ => Some("a class whose base is computed at runtime".to_owned()),
+                    },
                     _ => Some("a class whose base is computed at runtime".to_owned()),
                 }
             })
@@ -1383,6 +1405,7 @@ fn scan_builtin_subclasses(
                     let is_enum = c.bases().iter().any(|b| self.is_enum_base(b));
                     self.unbind(c.name.as_str());
                     self.namespaces.insert(c.name.to_string());
+                    self.classes.insert(c.name.to_string());
                     if pinned && is_enum {
                         self.enum_bases.insert(c.name.to_string());
                     }
@@ -1483,8 +1506,11 @@ fn runtime_bound_names(
         mutated: HashSet<String>,
         /// `Alias = Other`: trusted unless `Other` is a runtime value.
         name_aliases: Vec<(String, String)>,
-        /// `Alias = root.attr`: trusted only for an import or class `root`.
-        attr_aliases: Vec<(String, String)>,
+        /// `Alias = root.mid.attr`: trusted only for an import or class
+        /// `root`, and below a class only through nested classes.
+        attr_aliases: Vec<(String, String, Vec<String>)>,
+        /// Classes the module defines, in any scope.
+        classes: HashSet<String>,
         module_scope: HashSet<String>,
         /// Function and class bodies around the binding.
         depth: usize,
@@ -1519,18 +1545,16 @@ fn runtime_bound_names(
             // generic alias first.
             match value {
                 Expr::Name(v) => self.name_aliases.push((t, v.id.to_string())),
-                Expr::Attribute(a) => {
-                    let mut root = a.value.as_ref();
-                    while let Expr::Attribute(inner) = root {
-                        root = inner.value.as_ref();
+                Expr::Attribute(a) => match attr_chain(a) {
+                    Some((root, mids)) => self.attr_aliases.push((
+                        t,
+                        root.to_owned(),
+                        mids.into_iter().map(str::to_owned).collect(),
+                    )),
+                    None => {
+                        self.runtime.insert(t);
                     }
-                    match root {
-                        Expr::Name(r) => self.attr_aliases.push((t, r.id.to_string())),
-                        _ => {
-                            self.runtime.insert(t);
-                        }
-                    }
-                }
+                },
                 _ => {
                     self.runtime.insert(t);
                 }
@@ -1577,6 +1601,7 @@ fn runtime_bound_names(
                 Stmt::ClassDef(c) => {
                     self.bind(c.name.as_str());
                     self.namespaces.insert(c.name.to_string());
+                    self.classes.insert(c.name.to_string());
                 }
                 // A function is no class, and a base naming one is CPython's
                 // error to report.
@@ -1663,13 +1688,21 @@ fn runtime_bound_names(
             if b.runtime.contains(v) && b.runtime.insert(t.clone()) {
                 changed = true;
             }
+            // `Alias = Holder` names one object: a store through either
+            // mutates both.
+            if b.mutated.contains(t) != b.mutated.contains(v) {
+                b.mutated.insert(t.clone());
+                b.mutated.insert(v.clone());
+                changed = true;
+            }
         }
-        for (t, root) in &b.attr_aliases {
+        for (t, root, mids) in &b.attr_aliases {
             // `enum.Enum` without an import names the module in a
             // Typhon-lowered `enum` declaration.
             let trusted = (b.namespaces.contains(root) || root == "enum")
                 && !b.runtime.contains(root)
-                && !b.mutated.contains(root);
+                && !b.mutated.contains(root)
+                && (!b.classes.contains(root) || mids.iter().all(|m| b.classes.contains(m)));
             if !trusted && b.runtime.insert(t.clone()) {
                 changed = true;
             }

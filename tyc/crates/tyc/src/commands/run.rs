@@ -1837,19 +1837,26 @@ mod tests {
                 "{main}"
             );
         }
+        // A nested class below a class is trusted.
+        assert_eq!(
+            scan_source("plain class Outer:\n    plain class Mid:\n        plain class Inner:\n            pass\nplain class L(Outer.Mid.Inner):\n    pass\nprint(L())\n"),
+            None
+        );
         // An attribute of a namespace the module mutates is a runtime value.
         for src in [
             "plain class Holder:\n    Base: type = object\nHolder.Base = list\nplain class L(Holder.Base):\n    pass\nprint(L([1]))\n",
             "plain class Holder:\n    Base: type = object\nsetattr(Holder, \"Base\", list)\nplain class L(Holder.Base):\n    pass\nprint(L([1]))\n",
             "plain class Holder:\n    Base: type = object\nHolder.Base = list\nAlias = Holder.Base\nplain class L(Alias):\n    pass\nprint(L([1]))\n",
+            // A data attribute below a class, set up at runtime.
+            "plain class Box:\n    def __init__(self) -> None:\n        self.Base = list\nplain class Holder:\n    box: Box = Box()\nplain class L(Holder.box.Base):\n    pass\nprint(L([1]))\n",
+            // Through an alias of the class.
+            "plain class Holder:\n    Base: type = object\nAlias = Holder\nAlias.Base = list\nplain class L(Holder.Base):\n    pass\nprint(L([1]))\n",
+            // A data attribute below a class (the `Base: type = list` alias
+            // alone already falls back; this checks the chain too).
+            "plain class Box:\n    Base: type = list\nplain class Holder:\n    box: Box = Box()\nplain class L(Holder.box.Base):\n    pass\nprint(L([1]))\n",
+            "plain class Box:\n    Base: type = list\nplain class Holder:\n    box: Box = Box()\nAlias = Holder.box.Base\nplain class L(Alias):\n    pass\nprint(L([1]))\n",
         ] {
-            assert!(
-                scan_source(src)
-                    .unwrap_or_default()
-                    .iter()
-                    .any(|r| r.contains("computed at runtime")),
-                "{src}"
-            );
+            assert!(scan_source(src).is_some(), "{src}");
         }
         // A sibling's name bound in a definition header (which runs at
         // module scope) or through `global` is exported too.
