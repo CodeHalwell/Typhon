@@ -3205,6 +3205,7 @@ t("before update", lambda: (type(Later()).__name__, sorted(Later.__abstractmetho
 abc.update_abstractmethods(Later)
 t("after update", lambda: (sorted(Later.__abstractmethods__), Later()))
 t("union isinstance", lambda: (isinstance(1, typing.Union[int, str]), isinstance(None, typing.Optional[int]), isinstance(1.5, typing.Union[int, str]), issubclass(bool, typing.Union[int, str]), isinstance(1, (str, typing.Union[bytes, int]))))
+t("no TEMPLATE", lambda: (hasattr(re, "TEMPLATE"), [m.name for m in re.RegexFlag], repr(re.RegexFlag(1))))
 t("union short-circuit", lambda: isinstance(1, typing.Union[int, typing.List[int]]))
 for chk in [lambda: isinstance([], typing.List[int]), lambda: isinstance(1, typing.Literal[1]), lambda: issubclass(list, typing.List[int]), lambda: isinstance("s", typing.Union[int, typing.List[int]]), lambda: isinstance(1, typing.Annotated[int, "x"])]:
     t("alias check", chk)
