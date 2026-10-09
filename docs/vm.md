@@ -464,7 +464,8 @@ yields U+FFFD); a generator that falls back to eager collection (see
 "What the VM does not support yet") runs its side effects at call time;
 and a subclass of a builtin value type (`class L(list)`, `class C(int)`,
 `class S(str)`, and likewise `class P(property)`, `class E(enumerate)` or
-`class F(functools.partial)`)
+`class F(functools.partial)`; also `class C(Counter)`, `class D(datetime.date)` or
+`class B(io.StringIO)`, whose Python shims keep their own constructor and `__eq__`)
 holds no builtin value, since the VM models those types as values or
 natives rather than classes (an enum with a `str`, `int`, `float`,
 `bytes` or `complex` mixin, such as `class Colour(str, Enum)`, is

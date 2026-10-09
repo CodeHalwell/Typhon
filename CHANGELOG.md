@@ -16,6 +16,25 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ### Fixed
 
+- **Modules have a `__name__` under `tyc run`.** `json.__name__` raised
+  `AttributeError`; every module now reports its import name, as in CPython.
+- **Shim functions that CPython writes in C report as builtins under `tyc run`.**
+  `os.getcwd`, `operator.add`, `bisect.bisect_left`, `csv.reader`,
+  `time.strftime`, `itertools.tee` and their siblings are
+  `builtin_function_or_method` and print as `<built-in function …>`. Each
+  had been a plain `function`. This follows a per-export table of CPython 3.13.
+  `os.walk`, `os.makedirs` and other exports that CPython writes in Python
+  stay `function`.
+- **A `class` over a plain base takes its generated dataclass methods under
+  `tyc run`.** `class K(Base)` with a `plain class Base` that defines
+  `__init__`, `__repr__` or `__eq__` now uses the `@dataclass` versions, as
+  CPython does: `repr(K())` is `K()`, and `K(5)` binds the dataclass's
+  fields. Before, the VM inherited the base's methods.
+- **Subclasses of `Counter`, `OrderedDict`, `deque`, `ChainMap`, the
+  `User*` collections, the `datetime` classes, `StringIO`, `BytesIO` and
+  `ArgumentParser` run on CPython under `tyc run`.** The VM models these with
+  Python shims, so their subclasses kept the shim's constructor and
+  equality, where CPython's generated dataclass methods replace them.
 - **Builtin callables introspect like CPython's under `tyc run`.**
   `type(len)` and `type([].append)` are `builtin_function_or_method`,
   `type(list.append)` is `method_descriptor`, a bound method is `method`

@@ -2486,6 +2486,51 @@ try:
     len[0]
 except TypeError as e:
     show(str(e))
+import os
+import operator
+import bisect
+import csv
+import time
+import itertools
+show(json.__name__, os.path.__name__, asyncio.__name__)
+for f in [os.getcwd, operator.add, bisect.bisect, bisect.insort_left, csv.reader, time.strftime, itertools.tee]:
+    show(type(f).__name__, f.__name__, f.__qualname__, repr(f))
+show(type(os.walk).__name__, type(os.makedirs).__name__, type(os.getenv).__name__)
+"#,
+    );
+}
+
+#[test]
+fn dataclass_methods_shadow_a_plain_base() {
+    // `@dataclass` writes `__init__` / `__repr__` / `__eq__` into the
+    // subclass, over the ones a non-dataclass base defines.
+    assert_matches_cpython(
+        "dataclass_methods_shadow_a_plain_base",
+        r#"from dataclasses import dataclass
+plain class Base:
+    def __init__(self):
+        self.x = 1
+    def __repr__(self):
+        return "Base!"
+    def __eq__(self, other):
+        return True
+@dataclass(slots=True)
+plain class K(Base):
+    pass
+@dataclass(slots=True)
+plain class P(Base):
+    y: int = 2
+@dataclass(slots=True, repr=False, eq=False)
+plain class R(Base):
+    y: int = 3
+@dataclass(init=False)
+plain class Q(Base):
+    y: int = 4
+k = K()
+p = P()
+show(repr(k), repr(p), k == 3, p == 3, k == K(), p == P(), p == P(5), P(5).y)
+show([k, p], {"k": p}, str(p), repr(R()), R() == R(4), R(5).y)
+show(hasattr(k, "x"), hasattr(Q(), "x"), repr(Base()))
 "#,
     );
 }
@@ -2548,7 +2593,7 @@ _d1 = _dq([1, [2]], maxlen=5)
 _d2 = _cp.copy(_d1)
 _d2.append(3)
 show(_d1, _d2, _d2.maxlen, _d2[1] is _d1[1])
-class _MyDq(_dq):
+plain class _MyDq(_dq):
     pass
 _d3 = _MyDq([1, 2])
 show(type(_cp.copy(_d3)).__name__, type(_d3.copy()).__name__, _cp.copy(_d3))
@@ -2595,7 +2640,7 @@ class _Red:
         return (_Red, (self.v + 1,))
 show(_cp.copy(_Red(1)).v, _cp.deepcopy(_Red(5)).v)
 from collections import ChainMap as _CM
-class _MyCM(_CM):
+plain class _MyCM(_CM):
     pass
 _cm = _MyCM({"a": 1}, {"b": 2})
 show(type(_cp.copy(_cm)).__name__, type(_cm.new_child()).__name__, type(_cm.parents).__name__, _cp.copy(_cm))
@@ -2605,7 +2650,7 @@ show(_xs, type(_xs).__module__, type("a").upper("b"), type(1).bit_length(5), has
 _dd2 = _dd(list)
 _dd2["a"].append(1)
 show(_dd.copy(_dd2), type(_dd2).copy(_dd2) == _dd.copy(_dd2), hasattr(_dd, "copy"), hasattr(property, "setter"))
-class _OD(_od):
+plain class _OD(_od):
     def __init__(self):
         super().__init__()
         self.tag = "t"

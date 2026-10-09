@@ -1675,6 +1675,7 @@ impl Interpreter {
             slot_info,
             generator,
             attrs: RefCell::new(attrs),
+            c_builtin: std::cell::Cell::new(false),
         })
     }
 
@@ -2287,6 +2288,7 @@ impl Interpreter {
                 ("slots", "__typhon_dc_slots__"),
                 ("order", "__typhon_dc_order__"),
                 ("repr", "__typhon_dc_repr__"),
+                ("init", "__typhon_dc_init__"),
             ] {
                 if let Some(flag) = dataclass_option(&c.decorator_list, option) {
                     class_attrs.insert(marker.to_owned(), Value::Bool(flag));
@@ -3893,6 +3895,7 @@ impl Interpreter {
                     slot_info,
                     generator,
                     attrs: RefCell::new(HashMap::new()),
+                    c_builtin: std::cell::Cell::new(false),
                 };
                 Ok(Value::Function(Rc::new(func)))
             }
@@ -6261,6 +6264,7 @@ impl Interpreter {
             }
         }
         let resolved = match lookup_class_member(class, name) {
+            Some((owner, _)) if dataclass_shadows(class, &owner, name) => None,
             Some((_, ClassMember::Method(m))) => Some(m),
             Some((_, ClassMember::Attr(Value::Function(f)))) => Some(f),
             _ => None,
@@ -8496,6 +8500,10 @@ impl Interpreter {
                     if let Some(v) = m.members.borrow().get(attr).cloned() {
                         return Ok(v);
                     }
+                }
+                // Every module carries its dotted import name, as in CPython.
+                if attr == "__name__" {
+                    return Ok(Value::Str(Rc::new(m.name.clone())));
                 }
                 Err(attribute_error(format!(
                     "module '{}' has no attribute '{}'",
@@ -11569,6 +11577,34 @@ pub(crate) fn class_mro(class: &Rc<Class>) -> impl Iterator<Item = &Rc<Class>> {
 /// whether as a method or as a plain attribute. Returns that class with the
 /// binding. The VM's internal `__typhon_*` records are never found on an
 /// ancestor here (they are copied per class where they are inherited).
+/// Whether a dataclass between `class` and `owner` in the MRO generates
+/// `name` itself, so the inherited definition on `owner` is hidden: CPython's
+/// `@dataclass` writes `__init__` / `__repr__` / `__eq__` into the class
+/// namespace, over
+/// whatever a non-dataclass base (`Counter`, a `plain class`) defines. The
+/// VM renders that generated method natively, so the lookup reports none.
+fn dataclass_shadows(class: &Rc<Class>, owner: &Rc<Class>, name: &str) -> bool {
+    // A stdlib shim keeps its contents in Python-level storage that a C
+    // base holds natively (`Counter._data`): skipping its constructor would
+    // break the instance, and the generated `__eq__` would compare that
+    // storage. Only its `__repr__` is hidden; `tyc run` sends such a
+    // subclass to CPython anyway.
+    let shim_owner = !matches!(
+        owner.class_attrs.borrow().get("__typhon_module__"),
+        Some(Value::Str(m)) if !m.is_empty()
+    );
+    let flag = match name {
+        "__init__" | "__eq__" if shim_owner => return false,
+        "__init__" => "__typhon_dc_init__",
+        "__repr__" => "__typhon_dc_repr__",
+        "__eq__" => "__typhon_dc_eq__",
+        _ => return false,
+    };
+    class_mro(class)
+        .take_while(|c| !Rc::ptr_eq(c, owner))
+        .any(|c| crate::value::class_is_dataclass(c) && crate::value::class_flag(c, flag, true))
+}
+
 pub(crate) fn lookup_class_member(
     class: &Rc<Class>,
     name: &str,

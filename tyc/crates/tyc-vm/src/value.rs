@@ -2108,6 +2108,10 @@ pub struct Function {
     /// the wrapper they return (`wrapper.register = …` in `singledispatch`,
     /// `fn.cache_clear`, a test framework's markers).
     pub attrs: RefCell<HashMap<String, Value>>,
+    /// A stdlib shim function that CPython implements in C (`os.getcwd`,
+    /// `operator.add`): it reports `builtin_function_or_method` and reprs
+    /// as `<built-in function …>`. Set when its shim module is built.
+    pub c_builtin: std::cell::Cell<bool>,
 }
 
 /// How a `yield`-bearing function body is executed.
@@ -2647,6 +2651,9 @@ impl fmt::Debug for Value {
                 write!(f, "range({start}, {stop}, {step})")
             }
             Value::Native(n) => write!(f, "{}", native_value_repr(n)),
+            Value::Function(func) if func.c_builtin.get() => {
+                write!(f, "<built-in function {}>", func.name)
+            }
             Value::Function(func) => write!(f, "<function {}>", func.effective_qualname()),
             Value::BoundMethod { function, .. } => {
                 write!(f, "<bound method {}>", function.name)
@@ -2808,6 +2815,7 @@ impl Value {
                 }) => "method_descriptor",
                 _ => "builtin_function_or_method",
             },
+            Value::Function(f) if f.c_builtin.get() => "builtin_function_or_method",
             Value::Function(_) => "function",
             Value::BoundMethod { .. } => "method",
             Value::Class(_) => "type",
@@ -3415,6 +3423,9 @@ impl Value {
                 }
             }
             Value::Native(n) => native_value_repr(n),
+            Value::Function(func) if func.c_builtin.get() => {
+                format!("<built-in function {}>", func.name)
+            }
             Value::Function(func) => format!("<function {}>", func.effective_qualname()),
             // CPython names the class the method was found on and reprs
             // the receiver: `<bound method Path.iterdir of PosixPath('/t')>`.
