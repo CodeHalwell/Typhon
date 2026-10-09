@@ -3454,6 +3454,8 @@ pub(crate) fn module_dir_names(m: &Module) -> std::collections::BTreeSet<String>
     if m.name == "sys" {
         names.insert("modules".to_owned());
     }
+    // Synthesised on read, like CPython's module `__name__`.
+    names.insert("__name__".to_owned());
     names
 }
 

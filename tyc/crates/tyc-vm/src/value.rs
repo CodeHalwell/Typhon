@@ -3821,7 +3821,10 @@ fn instance_repr_inner(inst: &Instance) -> String {
     // `@dataclass(repr=False)` generates no `__repr__`: the nearest
     // ancestor's applies — another dataclass's (its own fields), else
     // `object.__repr__`.
+    // Likewise a `class!` / `plain class` subclass of a dataclass inherits
+    // that dataclass's `__repr__`: its fields, under the subclass's name.
     let mut repr_fields = &inst.class.fields;
+    let mut inherited_repr = false;
     if class_is_dataclass(&inst.class) && !class_flag(&inst.class, "__typhon_dc_repr__", true) {
         match inst
             .class
@@ -3832,11 +3835,34 @@ fn instance_repr_inner(inst: &Instance) -> String {
             Some(provider) => repr_fields = &provider.fields,
             None => return object_default_repr(inst),
         }
+    } else if !class_is_dataclass(&inst.class) && !class_is_pydantic_model(&inst.class) {
+        if let Some(provider) = inst
+            .class
+            .mro
+            .iter()
+            .find(|c| generates_dataclass(c) && class_flag(c, "__typhon_dc_repr__", true))
+        {
+            repr_fields = &provider.fields;
+            inherited_repr = true;
+        }
     }
     let mut parts: Vec<String> = Vec::with_capacity(fields.len());
     for cf in repr_fields {
         if let Some(v) = fields.get(&cf.name) {
             parts.push(format!("{}={}", cf.name, v.py_repr()));
+        } else {
+            // The generated `__repr__` reads `self.name`, which a subclass
+            // that never ran the dataclass `__init__` (a `class!` with its
+            // own) serves from the class default.
+            let default = inst
+                .class
+                .mro
+                .iter()
+                .find_map(|c| c.class_attrs.borrow().get(&cf.name).cloned())
+                .or_else(|| cf.default.clone());
+            if let Some(v) = default {
+                parts.push(format!("{}={}", cf.name, v.py_repr()));
+            }
         }
     }
     // A dataclass (or pydantic model) repr shows its declared fields and
@@ -3846,6 +3872,7 @@ fn instance_repr_inner(inst: &Instance) -> String {
     // neither (a `plain class` / `class!` without a `__repr__`) gets
     // `object.__repr__`, exactly like CPython.
     if inst.class.fields.is_empty()
+        && !inherited_repr
         && !class_is_dataclass(&inst.class)
         && !class_is_pydantic_model(&inst.class)
     {
@@ -3853,7 +3880,7 @@ fn instance_repr_inner(inst: &Instance) -> String {
     }
     // A dataclass's generated `__repr__` names the class by `__qualname__`
     // (`make.<locals>.Point(x=1)`); a pydantic model by `__name__`.
-    let class_name = if class_is_dataclass(&inst.class) {
+    let class_name = if class_is_dataclass(&inst.class) || inherited_repr {
         (*inst.class.effective_qualname()).clone()
     } else {
         inst.class.name.clone()
@@ -3919,6 +3946,12 @@ pub fn class_is_pydantic_model(class: &Class) -> bool {
 
 /// Whether a class is a dataclass — Typhon's default `class` (and `class …
 /// frozen`) — as `dataclasses.is_dataclass` reports it.
+/// Whether `@dataclass` decorated `class` itself (not just an ancestor), so
+/// its generated methods live at this MRO level.
+pub fn generates_dataclass(class: &Class) -> bool {
+    class_flag(class, "__typhon_dc_own__", false)
+}
+
 pub fn class_is_dataclass(class: &Class) -> bool {
     class
         .class_attrs

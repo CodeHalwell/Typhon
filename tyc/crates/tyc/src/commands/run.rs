@@ -1775,6 +1775,7 @@ mod tests {
             ("import datetime\nclass Day(datetime.date):\n    pass\n", "date"),
             ("from datetime import tzinfo\nplain class Tz(tzinfo):\n    pass\n", "tzinfo"),
             ("from io import StringIO\nclass Buf(StringIO):\n    pass\n", "StringIO"),
+            ("from collections import *\nclass C(Counter):\n    pass\n", "Counter"),
         ] {
             assert_eq!(
                 scan_source(src),
@@ -2245,6 +2246,15 @@ mod tests {
         // A project module is the import scan's business, not this one's.
         assert_eq!(
             scan_source("from .sibling import thing\n\nprint(thing)\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn attribute_scan_knows_module_dunder_name() {
+        // Every module answers `__name__`, so reading it stays on the VM.
+        assert_eq!(
+            scan_source("import json\nimport os.path\nprint(json.__name__, os.path.__name__)\n"),
             None
         );
     }

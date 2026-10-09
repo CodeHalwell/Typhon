@@ -1466,6 +1466,13 @@ fn scan_builtin_subclasses(
                             Some(m) if stdlib_native(m, name) => {
                                 self.builtin.insert(bound, name.to_owned());
                             }
+                            // `from collections import *` binds every one.
+                            Some(m) if name == "*" => {
+                                for (_, n) in STDLIB_NATIVES.iter().filter(|(nm, _)| *nm == m) {
+                                    self.unbind(n);
+                                    self.builtin.insert((*n).to_owned(), (*n).to_owned());
+                                }
+                            }
                             // `from helper import Alias as A` for a sibling's
                             // `Alias = list`.
                             _ => {

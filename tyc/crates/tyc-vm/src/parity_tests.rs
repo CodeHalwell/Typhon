@@ -2531,6 +2531,20 @@ p = P()
 show(repr(k), repr(p), k == 3, p == 3, k == K(), p == P(), p == P(5), P(5).y)
 show([k, p], {"k": p}, str(p), repr(R()), R() == R(4), R(5).y)
 show(hasattr(k, "x"), hasattr(Q(), "x"), repr(Base()))
+show(k.__repr__(), K.__repr__(k), k.__eq__(3), K.__eq__(k, 3), k.__eq__(K()), p.__eq__(P(5)), P.__eq__(p, P()))
+plain class M(P):
+    def __init__(self):
+        super().__init__()
+        self.z = 3
+m = M()
+show(hasattr(m, "x"), m.y, m.z, repr(m), m.__repr__(), P.__repr__(m))
+@dataclass(init=False, repr=False, eq=False)
+plain class N(Base):
+    pass
+plain class L(N):
+    pass
+l = L()
+show(hasattr(l, "x"), repr(l), l == 3, l.__repr__(), L.__repr__(l))
 "#,
     );
 }
