@@ -1883,6 +1883,28 @@ mod tests {
                 "{helper}"
             );
         }
+        // A project module's data below its namespace is a runtime value.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("helper.ty"),
+            "plain class Box:\n    def __init__(self, base: type) -> None:\n        self.Base = base\n\nbox = Box(list)\n",
+        )
+        .unwrap();
+        for main in [
+            "import helper\nplain class L(helper.box.Base):\n    pass\nprint(L([1]))\n",
+            "import helper as h\nAlias = h.box.Base\nplain class L(Alias):\n    pass\nprint(L([1]))\n",
+            "from helper import box\nplain class L(box.Base):\n    pass\nprint(L([1]))\n",
+        ] {
+            let entry = dir.path().join("main.ty");
+            std::fs::write(&entry, main).unwrap();
+            assert!(
+                unmodelled_references(&entry, &entry)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|r| r.contains("computed at runtime")),
+                "{main}"
+            );
+        }
         // Two modules exporting one name for different builtins: the scan
         // keeps the one that is not an enum mixin.
         let dir = tempfile::tempdir().unwrap();

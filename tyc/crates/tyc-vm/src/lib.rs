@@ -1068,6 +1068,58 @@ pub fn merge_builtin_aliases(
 /// The data-type mixins the VM models on an enum (`enum_mixin_value`).
 const ENUM_MIXINS: &[&str] = &["str", "int", "float", "bytes", "complex"];
 
+/// What an import binds each name to: `import a.b` binds `a` to the module
+/// `a`, `import a.b as m` binds `m` to `a.b`, and `from a import b` binds
+/// `b` to a member of `a` (counted as one attribute deep, since it may be
+/// data rather than a module).
+fn imported_module(stmt: &ruff_python_ast::Stmt) -> Vec<(String, (String, usize))> {
+    use ruff_python_ast::Stmt;
+    match stmt {
+        Stmt::Import(i) => i
+            .names
+            .iter()
+            .map(|alias| {
+                let name = alias.name.as_str();
+                match &alias.asname {
+                    Some(a) => (a.to_string(), (name.to_owned(), 0)),
+                    None => {
+                        let root = name.split('.').next().unwrap_or(name);
+                        (root.to_owned(), (root.to_owned(), 0))
+                    }
+                }
+            })
+            .collect(),
+        Stmt::ImportFrom(i) => i
+            .names
+            .iter()
+            .map(|alias| {
+                let bound = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
+                let module = match (&i.module, i.level) {
+                    (Some(m), 0) => format!("{m}.{}", alias.name),
+                    // A relative import names a project module.
+                    _ => format!(".{}", alias.name),
+                };
+                (bound, (module, 1))
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether an attribute chain on an imported name stays trusted: a single
+/// attribute of any module (`helper.Base`, which the project-alias scan
+/// covers), or a deeper one only below a module the VM models itself
+/// (`collections.abc.Iterable`), never a project module's data
+/// (`helper.box.Base`).
+fn import_chain_trusted(import: Option<&(String, usize)>, segments: usize) -> bool {
+    let Some((module, depth)) = import else {
+        return true;
+    };
+    segments + depth <= 1
+        || models_module(module)
+        || models_module(module.split('.').next().unwrap_or(module))
+}
+
 /// The root name of an attribute chain and the segments between it and
 /// the last (`Outer.Mid.Inner` is `Outer` and `[Mid]`), or `None` when
 /// the chain is not rooted at a name.
@@ -1185,6 +1237,8 @@ fn scan_builtin_subclasses(
         mutated: std::collections::HashSet<String>,
         /// Classes the module defines, in any scope.
         classes: std::collections::HashSet<String>,
+        /// The module each imported name is bound to.
+        imports: std::collections::HashMap<String, (String, usize)>,
         /// Module-scope names bound to a computed value, which a sibling
         /// may import.
         exported_computed: std::collections::HashSet<String>,
@@ -1293,7 +1347,13 @@ fn scan_builtin_subclasses(
                                     || mids
                                         .iter()
                                         .chain([&a.attr.as_str()])
-                                        .all(|m| self.classes.contains(*m))) =>
+                                        .all(|m| self.classes.contains(*m)))
+                                && (self.classes.contains(root)
+                                    || !self.imports.contains_key(root)
+                                    || import_chain_trusted(
+                                        self.imports.get(root),
+                                        mids.len() + 1,
+                                    )) =>
                         {
                             None
                         }
@@ -1314,6 +1374,7 @@ fn scan_builtin_subclasses(
         }
         fn bind(&mut self, stmt: &Stmt) {
             let pinned = self.depth == 0 && self.branch == 0;
+            self.imports.extend(imported_module(stmt));
             match stmt {
                 Stmt::Import(i) => {
                     for alias in &i.names {
@@ -1515,6 +1576,8 @@ fn runtime_bound_names(
         attr_aliases: Vec<(String, String, Vec<String>)>,
         /// Classes the module defines, in any scope.
         classes: HashSet<String>,
+        /// The module each imported name is bound to.
+        imports: std::collections::HashMap<String, (String, usize)>,
         module_scope: HashSet<String>,
         /// Function and class bodies around the binding.
         depth: usize,
@@ -1572,6 +1635,7 @@ fn runtime_bound_names(
     }
     impl<'a> Visitor<'a> for Bindings {
         fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            self.imports.extend(imported_module(stmt));
             match stmt {
                 Stmt::Import(i) => {
                     for alias in &i.names {
@@ -1711,7 +1775,10 @@ fn runtime_bound_names(
             let trusted = (b.namespaces.contains(root) || root == "enum")
                 && !b.runtime.contains(root)
                 && !b.mutated.contains(root)
-                && (!b.classes.contains(root) || mids.iter().all(|m| b.classes.contains(m)));
+                && (!b.classes.contains(root) || mids.iter().all(|m| b.classes.contains(m)))
+                && (b.classes.contains(root)
+                    || !b.imports.contains_key(root)
+                    || import_chain_trusted(b.imports.get(root), mids.len()));
             if !trusted && b.runtime.insert(t.clone()) {
                 changed = true;
             }

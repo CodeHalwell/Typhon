@@ -78,7 +78,9 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   an attribute of a class or module the program assigns to
   (`Holder.Base = list`, `setattr`, also through `Alias = Holder`), a
   data attribute of a class (`Holder.Base`, `Holder.box.Base`; nested
-  classes such as `Outer.Mid.Inner` are trusted) and a
+  classes such as `Outer.Mid.Inner` are trusted), data below a project
+  module (`helper.box.Base`; `collections.abc.Iterable` and other modules
+  the VM models are trusted) and a
   sibling module's computed alias all count, including one it binds in a
   definition header or under `global`) and a `defaultdict`,
   `functools.partial`, `functools.cached_property`, `enum.auto`,
