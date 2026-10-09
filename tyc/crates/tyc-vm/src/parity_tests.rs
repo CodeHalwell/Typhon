@@ -2461,6 +2461,14 @@ import random
 show(type(random.random).__name__, type(random.getrandbits).__name__, type(random.randint).__name__, random.choice.__qualname__, repr(random.shuffle).startswith("<bound method Random.shuffle of <random.Random object at 0x"))
 show(type(heapq.nsmallest).__name__, type(heapq.heappush).__name__, type(list.__class_getitem__).__name__, list.__class_getitem__.__self__ is list)
 show(type(json.dumps).__name__, type(dataclasses.field).__name__, type(dataclasses.replace).__name__, type(functools.reduce).__name__, type(functools.wraps).__name__, repr(json.dumps).startswith("<function dumps at 0x"))
+import contextlib
+@contextlib.contextmanager
+def cm():
+    yield 1
+@functools.lru_cache(maxsize=4)
+def cached(x):
+    return x
+show(type(cm).__name__, type(functools.lru_cache(4)).__name__, cached(2))
 sort = xs.sort
 sort()
 show(xs, list.append(xs, 4), xs, str.upper("a"))

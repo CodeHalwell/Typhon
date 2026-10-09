@@ -1052,12 +1052,14 @@ pub fn module_subclassed_builtin(module: &ruff_python_ast::ModModule) -> Option<
     /// The data-type mixins the VM models on an enum (`enum_mixin_value`).
     const ENUM_MIXINS: &[&str] = &["str", "int", "float", "bytes", "complex"];
 
-    /// One pass in source order. Module-scope statements bind the names
-    /// that stand for a builtin value type (`Alias = list`,
-    /// `from builtins import list as L`), the `enum` module, an enum base
-    /// (`from enum import Enum as E`) or an enum class of this module; a
-    /// later rebinding of the name drops it. A function or class body binds
-    /// nothing at module scope, but its classes are still checked.
+    /// One pass in source order, erring towards CPython either way. A name
+    /// that stands for a builtin value type (`Alias = list`,
+    /// `from builtins import list as L`, `import builtins as b`) is bound
+    /// in any scope or branch and never dropped, so a class over it always
+    /// falls back. A name for the `enum` module, an enum base
+    /// (`from enum import Enum as E`) or an enum class of this module
+    /// exempts a class only when bound by an unconditional module-scope
+    /// statement, and any rebinding drops it.
     #[derive(Default)]
     struct Scan {
         builtin: std::collections::HashMap<String, String>,
@@ -1068,15 +1070,16 @@ pub fn module_subclassed_builtin(module: &ruff_python_ast::ModModule) -> Option<
         enum_bases: std::collections::HashSet<String>,
         /// `builtins` and its aliases (`import builtins as b`).
         builtins_modules: std::collections::HashSet<String>,
+        /// Function and class bodies around the statement.
         depth: usize,
+        /// Compound statements (`if`, `for`, `try`, …) around it.
+        branch: usize,
         found: Option<String>,
     }
     impl Scan {
         fn unbind(&mut self, name: &str) {
-            self.builtin.remove(name);
             self.enum_modules.remove(name);
             self.enum_bases.remove(name);
-            self.builtins_modules.remove(name);
         }
         fn is_enum_base(&self, base: &Expr) -> bool {
             match base {
@@ -1122,7 +1125,8 @@ pub fn module_subclassed_builtin(module: &ruff_python_ast::ModModule) -> Option<
                 .filter_map(|b| self.builtin_base(b))
                 .find(|b| !(is_enum && ENUM_MIXINS.contains(&b.as_str())))
         }
-        fn bind_module_scope(&mut self, stmt: &Stmt) {
+        fn bind(&mut self, stmt: &Stmt) {
+            let pinned = self.depth == 0 && self.branch == 0;
             match stmt {
                 Stmt::Import(i) => {
                     for alias in &i.names {
@@ -1134,7 +1138,7 @@ pub fn module_subclassed_builtin(module: &ruff_python_ast::ModModule) -> Option<
                         };
                         self.unbind(bound);
                         match name {
-                            "enum" => {
+                            "enum" if pinned => {
                                 self.enum_modules.insert(bound.to_owned());
                             }
                             "builtins" => {
@@ -1151,7 +1155,7 @@ pub fn module_subclassed_builtin(module: &ruff_python_ast::ModModule) -> Option<
                         let bound = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
                         self.unbind(&bound);
                         match module {
-                            Some("enum") if ENUM_TYPES.contains(&name) => {
+                            Some("enum") if pinned && ENUM_TYPES.contains(&name) => {
                                 self.enum_bases.insert(bound);
                             }
                             Some("builtins") if VALUE_TYPES.contains(&name) => {
@@ -1167,7 +1171,7 @@ pub fn module_subclassed_builtin(module: &ruff_python_ast::ModModule) -> Option<
                         _ => None,
                     };
                     let builtin = value.and_then(|v| self.name_builtin(v));
-                    let enum_base = value.is_some_and(|v| self.enum_bases.contains(v));
+                    let enum_base = pinned && value.is_some_and(|v| self.enum_bases.contains(v));
                     for target in &a.targets {
                         if let Expr::Name(t) = target {
                             let t = t.id.as_str();
@@ -1198,7 +1202,7 @@ pub fn module_subclassed_builtin(module: &ruff_python_ast::ModModule) -> Option<
                 Stmt::ClassDef(c) => {
                     let is_enum = c.bases().iter().any(|b| self.is_enum_base(b));
                     self.unbind(c.name.as_str());
-                    if is_enum {
+                    if pinned && is_enum {
                         self.enum_bases.insert(c.name.to_string());
                     }
                 }
@@ -1218,17 +1222,22 @@ pub fn module_subclassed_builtin(module: &ruff_python_ast::ModModule) -> Option<
                 }
             }
             let scope = matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_));
-            if scope {
-                self.depth += 1;
-            }
+            let branch = matches!(
+                stmt,
+                Stmt::If(_)
+                    | Stmt::For(_)
+                    | Stmt::While(_)
+                    | Stmt::Try(_)
+                    | Stmt::With(_)
+                    | Stmt::Match(_)
+            );
+            self.depth += usize::from(scope);
+            self.branch += usize::from(branch);
             visitor::walk_stmt(self, stmt);
-            if scope {
-                self.depth -= 1;
-            }
+            self.depth -= usize::from(scope);
+            self.branch -= usize::from(branch);
             // After the body, so a class's own bases see the names before it.
-            if self.depth == 0 {
-                self.bind_module_scope(stmt);
-            }
+            self.bind(stmt);
         }
     }
     let mut scan = Scan::default();

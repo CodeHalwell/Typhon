@@ -30,6 +30,7 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   `dataclasses.field`) stays a `function`, and `random`'s exports are
   methods of its hidden `Random()` as in CPython (`random.randint` is a
   `method` named `Random.randint`; `random.random` a builtin).
+  `@contextmanager` and `lru_cache(n)` return a `function`.
 - **A `plain class` with a builtin or imported base takes that base's
   constructor arguments.** `plain class Boom(Exception): pass` followed by
   `raise Boom("x")` was rejected with "expected 0, got 1", as were
@@ -46,8 +47,10 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   does a custom metaclass, seeing through aliases (`Alias = list`,
   `builtins.list`) and parameterised bases (`list[int]`).
   Enums with a `str`, `int`, `float`, `bytes` or `complex` mixin stay on
-  the VM; any other mixin (`class E(list, Enum)`) falls back too. Only
-  module-scope bindings count, and a rebinding drops them.
+  the VM; any other mixin (`class E(list, Enum)`) falls back too. The
+  scan errs towards CPython: a builtin alias counts in any scope or
+  branch, while an enum base exempts a class only when bound
+  unconditionally at module scope and not rebound since.
 - **A `plain class` is called with its own `__init__`'s arguments.** A
   `plain class` (or a `class!` with a hand-written `__init__`) that also
   declared annotated fields had its call arguments type-checked against

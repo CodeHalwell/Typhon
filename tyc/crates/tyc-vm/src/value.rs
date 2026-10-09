@@ -1842,6 +1842,13 @@ impl NativeFn {
         self
     }
 
+    /// Mark a native made at call time (a decorator's wrapper) as a
+    /// Python-level `function` — see [`NativeFn::py_function`].
+    pub fn python_function(self) -> Self {
+        self.py_function.set(true);
+        self
+    }
+
     /// A native whose CPython counterpart is `async def` — see
     /// [`NativeFn::awaitable`].
     pub fn new_awaitable<F>(name: &'static str, f: F) -> Self

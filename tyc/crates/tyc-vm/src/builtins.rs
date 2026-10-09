@@ -9587,20 +9587,19 @@ fn make_contextlib_module(interp: &mut Interpreter) -> Value {
     // exactly as under CPython's `contextlib._GeneratorContextManager`.
     let contextmanager = nf("contextmanager", |_i, args| {
         let func = args.into_iter().next().unwrap_or(Value::None);
-        Ok(Value::Native(Rc::new(NativeFn::new(
-            "contextmanager_factory",
-            move |i, call_args| {
+        Ok(Value::Native(Rc::new(
+            NativeFn::new("contextmanager_factory", move |i, call_args| {
                 let (pos, kw) = split_kwargs(&call_args);
                 let gen = i.call_value(func.clone(), pos.to_vec(), &kw)?;
                 Ok(generator_context_manager(gen))
-            },
-        ))))
+            })
+            .python_function(),
+        )))
     });
     let asynccontextmanager = nf("asynccontextmanager", |_i, args| {
         let func = args.into_iter().next().unwrap_or(Value::None);
-        Ok(Value::Native(Rc::new(NativeFn::new(
-            "asynccontextmanager_factory",
-            move |i, call_args| {
+        Ok(Value::Native(Rc::new(
+            NativeFn::new("asynccontextmanager_factory", move |i, call_args| {
                 let (pos, kw) = split_kwargs(&call_args);
                 let gen = i.call_value(func.clone(), pos.to_vec(), &kw)?;
                 // An `async def` *with* a `yield` is an async generator, and
@@ -9616,8 +9615,9 @@ fn make_contextlib_module(interp: &mut Interpreter) -> Value {
                     i.force_awaitable(gen)?
                 };
                 Ok(async_generator_context_manager(gen))
-            },
-        ))))
+            })
+            .python_function(),
+        )))
     });
     let mut entries = vec![
         ("contextmanager", contextmanager),
@@ -9825,10 +9825,9 @@ fn make_functools_module(interp: &mut Interpreter) -> Value {
             return make_cache(_i, vec![first]);
         }
         // Otherwise return a decorator that captures the configuration.
-        Ok(Value::Native(Rc::new(NativeFn::new(
-            "lru_cache_inner",
-            make_cache,
-        ))))
+        Ok(Value::Native(Rc::new(
+            NativeFn::new("lru_cache_inner", make_cache).python_function(),
+        )))
     });
     let reduce = nf("reduce", |i, mut args| {
         if args.len() < 2 {
@@ -9944,10 +9943,12 @@ fn make_dataclasses_module() -> Value {
                 return Ok(v.clone());
             }
         }
-        Ok(Value::Native(Rc::new(NativeFn::new(
-            "dataclass_inner",
-            |_i, args| Ok(args.into_iter().next().unwrap_or(Value::None)),
-        ))))
+        Ok(Value::Native(Rc::new(
+            NativeFn::new("dataclass_inner", |_i, args| {
+                Ok(args.into_iter().next().unwrap_or(Value::None))
+            })
+            .python_function(),
+        )))
     });
     let field = nf("field", |_i, args| {
         // Approximate signature: `field(default=…, default_factory=…)`.

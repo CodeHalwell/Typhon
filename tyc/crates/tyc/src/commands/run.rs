@@ -1664,6 +1664,15 @@ mod tests {
         );
         let annotated = "Alias: type = list\nplain class L(Alias):\n    pass\nprint(L())\n";
         assert!(scan_source(annotated).is_some());
+        // A builtin alias holds in any scope and through a branch that may
+        // not rebind it; a conditional enum import exempts nothing.
+        for src in [
+            "def f() -> None:\n    let Alias = list\n    plain class L(Alias):\n        pass\n    print(L())\nf()\n",
+            "mut Alias: object = list\nif False:\n    Alias = object\nplain class L(Alias):\n    pass\nprint(L())\n",
+            "import sys\nif sys.argv:\n    from enum import Enum\nplain class L(list, Enum):\n    pass\nprint(L())\n",
+        ] {
+            assert!(scan_source(src).is_some(), "{src}");
+        }
         let imported = "from builtins import dict as D\nplain class M(D):\n    pass\nprint(M())\n";
         assert!(scan_source(imported).is_some());
         // An enum mixin the VM does not model still falls back.
