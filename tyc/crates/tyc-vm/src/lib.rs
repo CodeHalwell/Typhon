@@ -1207,7 +1207,13 @@ fn scan_builtin_subclasses(
                             Some("builtins") if VALUE_TYPES.contains(&name) => {
                                 self.builtin.insert(bound, name.to_owned());
                             }
-                            _ => {}
+                            // `from helper import Alias as A` for a sibling's
+                            // `Alias = list`.
+                            _ => {
+                                if let Some(b) = self.project.get(name).cloned() {
+                                    self.builtin.insert(bound, b);
+                                }
+                            }
                         }
                     }
                 }
@@ -1216,7 +1222,8 @@ fn scan_builtin_subclasses(
                         Expr::Name(v) => Some(v.id.as_str()),
                         _ => None,
                     };
-                    let builtin = value.and_then(|v| self.name_builtin(v));
+                    // `Alias = list`, `list[int]`, `builtins.list`, `helper.Alias`.
+                    let builtin = self.builtin_base(&a.value);
                     let enum_base = pinned && value.is_some_and(|v| self.enum_bases.contains(v));
                     for target in &a.targets {
                         if let Expr::Name(t) = target {
@@ -1233,10 +1240,7 @@ fn scan_builtin_subclasses(
                 }
                 Stmt::AnnAssign(a) => {
                     if let Expr::Name(t) = a.target.as_ref() {
-                        let builtin = match a.value.as_deref() {
-                            Some(Expr::Name(v)) => self.name_builtin(v.id.as_str()),
-                            _ => None,
-                        };
+                        let builtin = a.value.as_deref().and_then(|v| self.builtin_base(v));
                         let t = t.id.as_str();
                         self.unbind(t);
                         if let Some(b) = builtin {

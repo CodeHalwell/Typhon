@@ -1672,6 +1672,8 @@ mod tests {
         );
         let annotated = "Alias: type = list\nplain class L(Alias):\n    pass\nprint(L())\n";
         assert!(scan_source(annotated).is_some());
+        let generic_alias = "Alias = list[int]\nplain class L(Alias):\n    pass\nprint(L())\n";
+        assert!(scan_source(generic_alias).is_some());
         // A builtin alias holds in any scope and through a branch that may
         // not rebind it; a conditional enum import exempts nothing.
         for src in [
@@ -1709,6 +1711,7 @@ mod tests {
             "from helper import Alias\nplain class L(Alias):\n    pass\nprint(L())\n",
             "import helper\nplain class L(helper.Alias):\n    pass\nprint(L())\n",
             "from helper import Alias\nAlias2 = Alias\nplain class L(Alias2):\n    pass\nprint(L())\n",
+            "from helper import Alias as Alias2\nplain class L(Alias2):\n    pass\nprint(L())\n",
         ] {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join("helper.ty"), "Alias = list\n").unwrap();
