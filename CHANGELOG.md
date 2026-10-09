@@ -44,7 +44,8 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   without an `__init__` now applies only when every ancestor is a class
   of the project or `object` (through a module alias such as
   `Alias = Parent` too, when the module binds that name nowhere else; an
-  `object` base counts unless the module's own namespace rebinds `object`).
+  `object` base counts unless the module's own namespace rebinds `object`,
+  and a module with a `from … import *` is never treated as local-only).
 - **A subclass of a builtin value type runs on CPython.** The VM models
   `list`, `int`, `str` and the other value types as values, not classes
   (and `enumerate`, `zip`, `property`, `classmethod`, `super`, `type` and
@@ -62,10 +63,10 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   An alias exported by a sibling module (`from helper import Alias`, even
   through a chain of re-exports), a class factory's parameter base
   (`def make(Base: type)` with `class L(Base)`), a base computed at
-  runtime (`class L(choose())`, `Base = choose()` or `Base = bases[0]`
-  then `class L(Base)`, a loop or unpacking target, an attribute of
-  anything but a module or class such as `h.base`, or a sibling module's
-  computed alias) and a `defaultdict`,
+  runtime (`class L(choose())`, `class L(h.base)`, or a name the module
+  binds anywhere other than by a `class`, an import or an alias of one,
+  so `Base = choose()`, `for Base in …`, `case [Base]:`, a walrus and a
+  sibling module's computed alias all count) and a `defaultdict`,
   `frozendict` or `sentinel` base fall back too, as do `bool`, `range`,
   `slice` and `memoryview` bases, which CPython rejects. When two modules
   export one alias name for different builtins, the scan assumes the one

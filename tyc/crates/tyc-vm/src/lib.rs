@@ -1260,41 +1260,6 @@ fn scan_builtin_subclasses(
                 }
             })
         }
-        /// Whether `value` computes a value at runtime that may be a type,
-        /// or holds types a subscript may pick (`bases = [list]`).
-        /// A `list[int]` alias is resolved by [`Self::builtin_base`] first.
-        fn is_computed(value: &Expr) -> bool {
-            matches!(
-                value,
-                Expr::Call(_)
-                    | Expr::If(_)
-                    | Expr::BoolOp(_)
-                    | Expr::Named(_)
-                    | Expr::Await(_)
-                    | Expr::Subscript(_)
-                    | Expr::List(_)
-                    | Expr::Tuple(_)
-                    | Expr::Set(_)
-                    | Expr::Dict(_)
-                    | Expr::ListComp(_)
-                    | Expr::SetComp(_)
-                    | Expr::DictComp(_)
-                    | Expr::Generator(_)
-            )
-        }
-        /// Every name an unpacking or loop target binds (`A, B = …`,
-        /// `for Base in (list, dict)`) holds a runtime value.
-        fn mark_computed(&mut self, target: &Expr) {
-            match target {
-                Expr::Name(n) => {
-                    self.computed.insert(n.id.to_string());
-                }
-                Expr::Tuple(t) => t.elts.iter().for_each(|e| self.mark_computed(e)),
-                Expr::List(l) => l.elts.iter().for_each(|e| self.mark_computed(e)),
-                Expr::Starred(s) => self.mark_computed(&s.value),
-                _ => {}
-            }
-        }
         /// `let Alias = Base` in a class factory: `Alias` may be the
         /// builtin `Base` is handed too.
         fn alias_param(&mut self, target: &str, value: Option<&str>) {
@@ -1367,21 +1332,10 @@ fn scan_builtin_subclasses(
                     // `Alias = list`, `list[int]`, `builtins.list`, `helper.Alias`.
                     let builtin = self.builtin_base(&a.value);
                     let enum_base = pinned && value.is_some_and(|v| self.enum_bases.contains(v));
-                    let computed = (builtin.is_none() && Self::is_computed(&a.value))
-                        || value.is_some_and(|v| self.computed.contains(v));
                     for target in &a.targets {
-                        if !matches!(target, Expr::Name(_)) {
-                            self.mark_computed(target);
-                        }
                         if let Expr::Name(t) = target {
                             let t = t.id.as_str();
                             self.alias_param(t, value);
-                            if computed {
-                                self.computed.insert(t.to_owned());
-                                if self.depth == 0 {
-                                    self.exported_computed.insert(t.to_owned());
-                                }
-                            }
                             self.unbind(t);
                             if let Some(b) = &builtin {
                                 self.builtin.insert(t.to_owned(), b.clone());
@@ -1398,15 +1352,6 @@ fn scan_builtin_subclasses(
                         let t = t.id.as_str();
                         if let Some(Expr::Name(v)) = a.value.as_deref() {
                             self.alias_param(t, Some(v.id.as_str()));
-                            if self.computed.contains(v.id.as_str()) {
-                                self.computed.insert(t.to_owned());
-                            }
-                        }
-                        if builtin.is_none() && a.value.as_deref().is_some_and(Self::is_computed) {
-                            self.computed.insert(t.to_owned());
-                        }
-                        if self.depth == 0 && self.computed.contains(t) {
-                            self.exported_computed.insert(t.to_owned());
                         }
                         self.unbind(t);
                         if let Some(b) = builtin {
@@ -1428,18 +1373,6 @@ fn scan_builtin_subclasses(
         }
     }
     impl<'a> Visitor<'a> for Scan {
-        fn visit_expr(&mut self, expr: &'a Expr) {
-            // `if (Base := choose()):` binds a runtime value.
-            if let Expr::Named(n) = expr {
-                self.mark_computed(&n.target);
-                if self.depth == 0 {
-                    if let Expr::Name(t) = n.target.as_ref() {
-                        self.exported_computed.insert(t.id.to_string());
-                    }
-                }
-            }
-            visitor::walk_expr(self, expr);
-        }
         fn visit_stmt(&mut self, stmt: &'a Stmt) {
             if self.found.is_some() {
                 return;
@@ -1449,18 +1382,6 @@ fn scan_builtin_subclasses(
                     self.found = Some(reason);
                     return;
                 }
-            }
-            // A loop or `with` target is bound before its body runs.
-            match stmt {
-                Stmt::For(f) => self.mark_computed(&f.target),
-                Stmt::With(w) => {
-                    for item in &w.items {
-                        if let Some(v) = &item.optional_vars {
-                            self.mark_computed(v);
-                        }
-                    }
-                }
-                _ => {}
             }
             if let Stmt::FunctionDef(f) = stmt {
                 self.params
@@ -1488,9 +1409,12 @@ fn scan_builtin_subclasses(
             self.bind(stmt);
         }
     }
+    let (computed, exported_computed) = runtime_bound_names(module);
     let mut scan = Scan {
         project: project_aliases.clone(),
         collect,
+        computed,
+        exported_computed,
         ..Default::default()
     };
     // `enum.Enum` without an import still names the module in a
@@ -1509,6 +1433,187 @@ fn scan_builtin_subclasses(
 /// The builtin an exported alias stands for when its value is computed at
 /// runtime (`Alias = choose()`).
 const COMPUTED: &str = "<computed>";
+
+/// The names `module` binds, in any scope, to a value only known at
+/// runtime, which a class base naming them may turn out to be a builtin
+/// (`Base = choose()`, `for Base in …`, `case [Base]:`, `(Base := …)`);
+/// and those of them bound at module scope, which a sibling may import.
+///
+/// Every binding counts except a `class`, an import, and `Alias = Other`
+/// where `Other` is itself trusted: a name, or an attribute of an import or
+/// a class (`Base = models.Model`). A name bound any other way anywhere is
+/// a runtime value, so a later or nested rebinding is never missed.
+fn runtime_bound_names(
+    module: &ruff_python_ast::ModModule,
+) -> (
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
+) {
+    use ruff_python_ast::visitor::{self, Visitor};
+    use ruff_python_ast::{Expr, Pattern, Stmt};
+    use std::collections::HashSet;
+
+    #[derive(Default)]
+    struct Bindings {
+        runtime: HashSet<String>,
+        namespaces: HashSet<String>,
+        /// `Alias = Other`: trusted unless `Other` is a runtime value.
+        name_aliases: Vec<(String, String)>,
+        /// `Alias = root.attr`: trusted only for an import or class `root`.
+        attr_aliases: Vec<(String, String)>,
+        module_scope: HashSet<String>,
+        depth: usize,
+    }
+    impl Bindings {
+        fn bind(&mut self, name: &str) {
+            if self.depth == 0 {
+                self.module_scope.insert(name.to_owned());
+            }
+        }
+        fn runtime(&mut self, name: &str) {
+            self.bind(name);
+            self.runtime.insert(name.to_owned());
+        }
+        fn assign(&mut self, target: &Expr, value: &Expr) {
+            let Expr::Name(t) = target else {
+                // `A, B = …`, `x.attr = …`, `xs[0] = …`.
+                self.visit_expr(target);
+                return;
+            };
+            let t = t.id.to_string();
+            self.bind(&t);
+            let value = match value {
+                // `list[int]` is a generic alias of its origin.
+                Expr::Subscript(s) if matches!(s.value.as_ref(), Expr::Name(_)) => s.value.as_ref(),
+                other => other,
+            };
+            match value {
+                Expr::Name(v) => self.name_aliases.push((t, v.id.to_string())),
+                Expr::Attribute(a) => {
+                    let mut root = a.value.as_ref();
+                    while let Expr::Attribute(inner) = root {
+                        root = inner.value.as_ref();
+                    }
+                    match root {
+                        Expr::Name(r) => self.attr_aliases.push((t, r.id.to_string())),
+                        _ => {
+                            self.runtime.insert(t);
+                        }
+                    }
+                }
+                _ => {
+                    self.runtime.insert(t);
+                }
+            }
+        }
+    }
+    impl<'a> Visitor<'a> for Bindings {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            match stmt {
+                Stmt::Import(i) => {
+                    for alias in &i.names {
+                        let name = alias.name.as_str();
+                        let bound = match &alias.asname {
+                            Some(a) => a.as_str(),
+                            None => name.split('.').next().unwrap_or(name),
+                        };
+                        self.bind(bound);
+                        self.namespaces.insert(bound.to_owned());
+                    }
+                    return;
+                }
+                Stmt::ImportFrom(i) => {
+                    for alias in &i.names {
+                        let bound = alias.asname.as_ref().unwrap_or(&alias.name).as_str();
+                        self.bind(bound);
+                        self.namespaces.insert(bound.to_owned());
+                    }
+                    return;
+                }
+                Stmt::Assign(a) => {
+                    for target in &a.targets {
+                        self.assign(target, &a.value);
+                    }
+                    self.visit_expr(&a.value);
+                    return;
+                }
+                Stmt::AnnAssign(a) => {
+                    if let Some(value) = &a.value {
+                        self.assign(&a.target, value);
+                        self.visit_expr(value);
+                    }
+                    return;
+                }
+                Stmt::ClassDef(c) => {
+                    self.bind(c.name.as_str());
+                    self.namespaces.insert(c.name.to_string());
+                }
+                // A function is no class, and a base naming one is CPython's
+                // error to report.
+                Stmt::FunctionDef(f) => self.runtime(f.name.as_str()),
+                _ => {}
+            }
+            let scope = matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_));
+            self.depth += usize::from(scope);
+            visitor::walk_stmt(self, stmt);
+            self.depth -= usize::from(scope);
+        }
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            // Every other binding: loop, `with`, walrus, unpacking and
+            // comprehension targets, `del`.
+            if let Expr::Name(n) = expr {
+                if !matches!(n.ctx, ruff_python_ast::ExprContext::Load) {
+                    self.runtime(n.id.as_str());
+                }
+            }
+            visitor::walk_expr(self, expr);
+        }
+        fn visit_pattern(&mut self, p: &'a Pattern) {
+            let name = match p {
+                Pattern::MatchAs(m) => m.name.as_ref(),
+                Pattern::MatchStar(m) => m.name.as_ref(),
+                Pattern::MatchMapping(m) => m.rest.as_ref(),
+                _ => None,
+            };
+            if let Some(n) = name {
+                self.runtime(n.as_str());
+            }
+            visitor::walk_pattern(self, p);
+        }
+        fn visit_except_handler(&mut self, h: &'a ruff_python_ast::ExceptHandler) {
+            let ruff_python_ast::ExceptHandler::ExceptHandler(e) = h;
+            if let Some(n) = &e.name {
+                self.runtime(n.as_str());
+            }
+            visitor::walk_except_handler(self, h);
+        }
+    }
+    let mut b = Bindings::default();
+    b.visit_body(&module.body);
+    // `Alias = Other` chains, to a fixed point.
+    loop {
+        let mut changed = false;
+        for (t, v) in &b.name_aliases {
+            if b.runtime.contains(v) && b.runtime.insert(t.clone()) {
+                changed = true;
+            }
+        }
+        for (t, root) in &b.attr_aliases {
+            // `enum.Enum` without an import names the module in a
+            // Typhon-lowered `enum` declaration.
+            let trusted =
+                (b.namespaces.contains(root) || root == "enum") && !b.runtime.contains(root);
+            if !trusted && b.runtime.insert(t.clone()) {
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let exported = b.runtime.intersection(&b.module_scope).cloned().collect();
+    (b.runtime, exported)
+}
 
 /// Whether `module` defines a generator whose `yield` sits where the
 /// tree-walk cannot suspend (a loop test, a `with` item, two yields in one

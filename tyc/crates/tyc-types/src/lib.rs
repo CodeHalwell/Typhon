@@ -3896,6 +3896,8 @@ struct Checker<'a> {
     class_value_aliases: HashMap<String, String>,
     /// The module binds the name `object` itself (`object = Exception`).
     object_rebound: bool,
+    /// The module has a `from … import *`, which may rebind any name.
+    star_import: bool,
     /// Per-class set of attribute names assigned through `self`
     /// (`self.NAME = ...`) inside a method body but NOT declared as a
     /// class-level annotated field. Consulted by `find_field` so reads of
@@ -4267,6 +4269,7 @@ impl<'a> Checker<'a> {
             local_classes: std::collections::HashSet::new(),
             class_value_aliases: HashMap::new(),
             object_rebound: false,
+            star_import: false,
             self_attrs: HashMap::new(),
             class_var_attrs: HashMap::new(),
             unsafe_depth: 0,
@@ -8034,6 +8037,9 @@ fn raise_non_exception_display(c: &Checker, ty: &Type) -> Option<String> {
 /// (a missing context-manager dunder) and stay permissive for any class whose
 /// methods might come from an unseen base.
 fn class_ancestry_fully_local(c: &Checker, name: &str) -> bool {
+    if c.star_import {
+        return false;
+    }
     let mut stack: Vec<&str> = vec![name];
     let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
     while let Some(n) = stack.pop() {
@@ -10251,7 +10257,11 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
         .collect();
     // Only a module-namespace binding shadows `object` in a module-level
     // class header; a function's local `object = …` does not.
-    c.object_rebound = count_module_bindings(body).contains_key("object");
+    let module_bindings = count_module_bindings(body);
+    c.object_rebound = module_bindings.contains_key("object");
+    // `from helper import *` may bind any name, `object` or a local
+    // class's included.
+    c.star_import = module_bindings.contains_key("*");
     for stmt in body {
         match stmt {
             Stmt::ClassDef(cd) => {
@@ -29689,6 +29699,15 @@ def main() -> None:
             "\
 def f(x: object = (object := Exception)) -> None:
     print(x)
+
+plain class Boom(object):
+    pass
+
+def main() -> None:
+    print(Boom(\"x\"))
+",
+            "\
+from helper import *
 
 plain class Boom(object):
     pass
