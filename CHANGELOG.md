@@ -29,7 +29,10 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   different types (`Literal[0, False]`) and compares regardless of order.
   Nested `Literal`s flatten. Calling `List[int]()` or a special form such as
   `Union[...]()` or `Final[int]()`, or subclassing a special form, raises
-  CPython's `TypeError` instead of quietly succeeding.
+  CPython's `TypeError` instead of quietly succeeding. `isinstance(1,
+  Union[int, str])` and `Optional[...]` check their members; any other
+  subscripted alias raises "Subscripted generics cannot be used with class
+  and instance checks".
 - **`re` flags are `re.RegexFlag` members under `tyc run`.** `re.I` printed
   as `2`; it is now `re.IGNORECASE`, and `re.I | re.M` is
   `re.IGNORECASE|re.MULTILINE`. `RegexFlag` is an `IntFlag` class, so
@@ -55,7 +58,8 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   the builtin types CPython registers, for the structural checks and for
   classes added with `register`. As in CPython, a structural check accepts any
   non-`None` binding of the method, descriptors included. `type()` of an ABC
-  is `ABCMeta`, and `Cls.__abstractmethods__` lists the names still
+  is `ABCMeta`. A user ABC's own `__subclasshook__` now decides its checks,
+  and `Cls.__abstractmethods__` lists the names still
   abstract, fixed when the class is made and recomputed by
   `update_abstractmethods`. The legacy `abstractclassmethod`, `abstractstaticmethod` and
   `abstractproperty` decorators now mark and wrap their targets; they had

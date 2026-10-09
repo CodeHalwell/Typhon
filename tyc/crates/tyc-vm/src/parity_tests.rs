@@ -3204,6 +3204,27 @@ Later.f = abc.abstractmethod(lambda self: 1)
 t("before update", lambda: (type(Later()).__name__, sorted(Later.__abstractmethods__)))
 abc.update_abstractmethods(Later)
 t("after update", lambda: (sorted(Later.__abstractmethods__), Later()))
+t("union isinstance", lambda: (isinstance(1, typing.Union[int, str]), isinstance(None, typing.Optional[int]), isinstance(1.5, typing.Union[int, str]), issubclass(bool, typing.Union[int, str]), isinstance(1, (str, typing.Union[bytes, int]))))
+t("union short-circuit", lambda: isinstance(1, typing.Union[int, typing.List[int]]))
+for chk in [lambda: isinstance([], typing.List[int]), lambda: isinstance(1, typing.Literal[1]), lambda: issubclass(list, typing.List[int]), lambda: isinstance("s", typing.Union[int, typing.List[int]]), lambda: isinstance(1, typing.Annotated[int, "x"])]:
+    t("alias check", chk)
+plain class Marked(abc.ABC):
+    @classmethod
+    def __subclasshook__(cls, C):
+        if hasattr(C, "marker"):
+            return True
+        return NotImplemented
+plain class HasMarker:
+    marker = 1
+plain class NoMarker:
+    pass
+plain class Refuse(abc.ABC):
+    @classmethod
+    def __subclasshook__(cls, C):
+        return False
+plain class Sub(Refuse):
+    pass
+t("subclasshook", lambda: (issubclass(HasMarker, Marked), isinstance(HasMarker(), Marked), issubclass(NoMarker, Marked), isinstance(NoMarker(), (int, Marked)), issubclass(Sub, Refuse)))
 for base in [typing.Union[int, str], typing.Literal[1], typing.Optional[int], typing.Final[int], typing.ClassVar[int]]:
     try:
         plain class U(base):

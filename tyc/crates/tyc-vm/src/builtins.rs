@@ -1065,8 +1065,16 @@ pub fn install(interp: &mut Interpreter) {
             return Err(type_error("issubclass() arg 1 must be a class"));
         }
         let cls = union_members(&i.force_alias(&args[1]));
-        let cls = typing_check_targets(i, cls)?;
-        Ok(Value::Bool(is_subclass_of(&sub, &cls)))
+        let mut unchecked = false;
+        let cls = typing_check_targets(i, cls, &mut unchecked)?;
+        let ok = match hooked_check(i, &cls, &sub, |t| is_subclass_of(&sub, t))? {
+            Some(ok) => ok,
+            None => is_subclass_of(&sub, &cls),
+        };
+        if !ok && unchecked {
+            return Err(subscripted_generic_check());
+        }
+        Ok(Value::Bool(ok))
     });
     native!("isinstance", |i, args| {
         if args.len() != 2 {
@@ -1078,7 +1086,20 @@ pub fn install(interp: &mut Interpreter) {
         // pass has run — otherwise it would still be its name-string
         // fallback and the test would silently return the wrong result.
         let cls = union_members(&i.force_alias(&args[1]));
-        let cls = typing_check_targets(i, cls)?;
+        let mut unchecked = false;
+        let cls = typing_check_targets(i, cls, &mut unchecked)?;
+        if any_subclass_hook(&cls) {
+            let ty = match i.root.get("type") {
+                Some(t) => i.call_value(t, vec![val.clone()], &[])?,
+                None => Value::None,
+            };
+            if let Some(ok) = hooked_check(i, &cls, &ty, |t| is_instance_of(val, t))? {
+                if !ok && unchecked {
+                    return Err(subscripted_generic_check());
+                }
+                return Ok(Value::Bool(ok));
+            }
+        }
         // A `@runtime_checkable` Protocol is matched *structurally* — the
         // value has to answer every member the protocol declares — and a
         // Protocol without the decorator is not usable here at all, both as
@@ -1096,7 +1117,11 @@ pub fn install(interp: &mut Interpreter) {
                 }
             }
         }
-        Ok(Value::Bool(is_instance_of(val, &cls)))
+        let ok = is_instance_of(val, &cls);
+        if !ok && unchecked {
+            return Err(subscripted_generic_check());
+        }
+        Ok(Value::Bool(ok))
     });
 
     native!("abs", |i, args| match single(&args, "abs")? {
@@ -2414,14 +2439,44 @@ fn protocol_targets(cls: &Value) -> Vec<Value> {
 /// `isinstance(x, typing.List)` / `typing.Iterable`: a bare `typing`
 /// alias form checks as its origin (`list`, `collections.abc.Iterable`),
 /// as CPython's `_SpecialGenericAlias.__instancecheck__` does.
-fn typing_check_targets(i: &mut Interpreter, cls: Value) -> Result<Value, Unwind> {
+///
+/// A subscripted `Union[...]` / `Optional[...]` checks as its members, in
+/// order. Any other subscripted alias (`List[int]`, `Literal[1]`) cannot be
+/// checked: the targets stop there and `unchecked` is set, so the caller
+/// raises unless an earlier target already matched — CPython's
+/// `__subclasscheck__` walks a union's members and raises on the first such
+/// one it reaches.
+fn typing_check_targets(
+    i: &mut Interpreter,
+    cls: Value,
+    unchecked: &mut bool,
+) -> Result<Value, Unwind> {
     match cls {
         Value::Tuple(t) => {
             let mut out = Vec::with_capacity(t.len());
             for c in t.iter() {
-                out.push(typing_check_targets(i, c.clone())?);
+                out.push(typing_check_targets(i, c.clone(), unchecked)?);
+                if *unchecked {
+                    break;
+                }
             }
             Ok(Value::Tuple(Rc::new(out)))
+        }
+        Value::Instance(inst) if inst.class.name == "_TypingAlias" => {
+            let fields = inst.fields.borrow();
+            let is_union =
+                matches!(fields.get("_name"), Some(Value::Str(n)) if n.as_str() == "Union");
+            match (is_union, fields.get("__args__")) {
+                (true, Some(args @ Value::Tuple(_))) => {
+                    let args = args.clone();
+                    drop(fields);
+                    typing_check_targets(i, args, unchecked)
+                }
+                _ => {
+                    *unchecked = true;
+                    Ok(Value::Tuple(Rc::new(Vec::new())))
+                }
+            }
         }
         Value::Native(n)
             if crate::value::typing_form_type(n.name) == Some("_SpecialGenericAlias")
@@ -2431,6 +2486,77 @@ fn typing_check_targets(i: &mut Interpreter, cls: Value) -> Result<Value, Unwind
         }
         other => Ok(other),
     }
+}
+
+/// `isinstance` / `issubclass` against targets that include a user ABC
+/// defining its own `__subclasshook__`: each such target answers through
+/// its hook (`True` / `False` decide, `NotImplemented` falls back to the
+/// usual check), as `ABCMeta.__subclasscheck__` does. `None` when no target
+/// has a hook, so the ordinary path runs unchanged.
+fn hooked_check(
+    i: &mut Interpreter,
+    cls: &Value,
+    sub: &Value,
+    plain: impl Fn(&Value) -> bool,
+) -> Result<Option<bool>, Unwind> {
+    if !any_subclass_hook(cls) {
+        return Ok(None);
+    }
+    let mut targets = Vec::new();
+    flatten_targets(cls, &mut targets);
+    for t in &targets {
+        if has_subclass_hook(t) {
+            let hook = i.get_attr(t, "__subclasshook__")?;
+            match i.call_value(hook, vec![sub.clone()], &[])? {
+                Value::Native(n) if n.name == "NotImplemented" => {}
+                verdict => {
+                    if verdict.truthy() {
+                        return Ok(Some(true));
+                    }
+                    continue;
+                }
+            }
+        }
+        if plain(t) {
+            return Ok(Some(true));
+        }
+    }
+    Ok(Some(false))
+}
+
+fn flatten_targets(v: &Value, out: &mut Vec<Value>) {
+    match v {
+        Value::Tuple(t) => t.iter().for_each(|c| flatten_targets(c, out)),
+        other => out.push(other.clone()),
+    }
+}
+
+/// Whether any `isinstance` / `issubclass` target has a user
+/// `__subclasshook__` (checked before paying for `type(value)`).
+fn any_subclass_hook(cls: &Value) -> bool {
+    match cls {
+        Value::Tuple(t) => t.iter().any(any_subclass_hook),
+        other => has_subclass_hook(other),
+    }
+}
+
+/// Whether `v` is an ABC class whose MRO defines `__subclasshook__` in
+/// user code (the VM's own `collections.abc` hooks are native).
+fn has_subclass_hook(v: &Value) -> bool {
+    match v {
+        Value::Class(c) => {
+            is_abc_class(c)
+                && matches!(
+                    crate::interp::lookup_class_member(c, "__subclasshook__"),
+                    Some((_, crate::interp::ClassMember::Method(_)))
+                )
+        }
+        _ => false,
+    }
+}
+
+fn subscripted_generic_check() -> Unwind {
+    type_error("Subscripted generics cannot be used with class and instance checks")
 }
 
 /// A user class that is merely *named* `object` (`plain class object:`):
