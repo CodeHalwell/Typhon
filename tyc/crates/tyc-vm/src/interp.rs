@@ -8438,6 +8438,14 @@ impl Interpreter {
                 // `type(xs)` is the cached stand-in for `list`; it is the
                 // same object as the builtin, so it answers what the
                 // builtin answers (`type(xs).append(xs, 2)`, `__module__`).
+                if crate::builtins::is_builtin_shim_class(class) && attr == "__module__" {
+                    let module = if class.name == "defaultdict" {
+                        "collections"
+                    } else {
+                        "builtins"
+                    };
+                    return Ok(Value::Str(self.intern_str(module)));
+                }
                 if crate::builtins::is_builtin_type_class(class) {
                     if let Some(native @ Value::Native(_)) =
                         self.builtin_globals.get(class.name.as_str()).cloned()
@@ -8547,6 +8555,18 @@ impl Interpreter {
             // `defaultdict` / `property` name the same type object as the
             // shim class behind them, so they answer its attributes
             // (`defaultdict.copy(d)`, `property.getter`).
+            // `collections.defaultdict.__module__` / `property.__module__`:
+            // where the type lives publicly, not the shim it is built from.
+            Value::Native(n)
+                if crate::builtins::is_shim_constructor_name(n.name) && attr == "__module__" =>
+            {
+                let module = if n.name == "defaultdict" {
+                    "collections"
+                } else {
+                    "builtins"
+                };
+                Ok(Value::Str(self.intern_str(module)))
+            }
             Value::Native(n)
                 if crate::builtins::is_shim_constructor_name(n.name)
                     && !matches!(attr, "__name__" | "__qualname__") =>
@@ -8759,7 +8779,7 @@ impl Interpreter {
                             move |i, _a| iter_reduce(i, &target),
                         ))))
                     }
-                    ("__setstate__", _) => {
+                    ("__setstate__", _) if iter_is_positioned(value) => {
                         let target = value.clone();
                         Ok(Value::Native(Rc::new(NativeFn::new(
                             "__setstate__",
@@ -13219,6 +13239,22 @@ fn iter_reduce(interp: &mut Interpreter, target: &Value) -> Result<Value, Unwind
         }
     };
     Ok(Value::Tuple(Rc::new(parts)))
+}
+
+/// The iterators CPython gives a `__setstate__`: the ones that resume at an
+/// index into a sequence. Dict, set and generator iterators have none.
+fn iter_is_positioned(target: &Value) -> bool {
+    let Value::Iter(it) = target else {
+        return false;
+    };
+    matches!(
+        &*it.borrow(),
+        IterState::List { .. }
+            | IterState::Tuple { .. }
+            | IterState::Str { .. }
+            | IterState::SeqIter { .. }
+            | IterState::ListRev { .. }
+    )
 }
 
 /// `it.__setstate__(index)` for a positioned builtin iterator, clamped

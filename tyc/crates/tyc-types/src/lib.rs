@@ -1329,7 +1329,8 @@ fn check_init_constructor_arity(
             if !has_star {
                 for (i, p) in info.param_names.iter().enumerate() {
                     let required = info.required_positional.get(i).copied().unwrap_or(false);
-                    if required && i >= pos_args.len() && !named.contains(&p.as_str()) {
+                    let by_keyword = i >= info.posonly_count && named.contains(&p.as_str());
+                    if required && i >= pos_args.len() && !by_keyword {
                         missing.push(p.clone());
                     }
                 }
@@ -12909,7 +12910,9 @@ fn check_arity_with_info(
                 if i < pos_args.len() {
                     continue;
                 }
-                if named_kwargs.iter().any(|kw| kw == p) {
+                // A keyword can fill it only past the `/`: a positional-only
+                // name passed by keyword lands in `**kwargs` instead.
+                if i >= info.posonly_count && named_kwargs.iter().any(|kw| kw == p) {
                     continue;
                 }
                 return ArityCheck::Other;
@@ -12924,7 +12927,9 @@ fn check_arity_with_info(
                 if i < pos_args.len() {
                     continue;
                 }
-                if named_kwargs.iter().any(|kw| kw == p) {
+                // A keyword can fill it only past the `/`: a positional-only
+                // name passed by keyword lands in `**kwargs` instead.
+                if i >= info.posonly_count && named_kwargs.iter().any(|kw| kw == p) {
                     continue;
                 }
                 return ArityCheck::Other;

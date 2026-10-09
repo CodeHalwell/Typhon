@@ -2558,6 +2558,8 @@ try:
     reversed([1]).__setstate__(10 ** 100)
 except OverflowError as _ex:
     show("OverflowError", _ex)
+show(property.__module__, _dd.__module__, type(_dd(list)).__module__)
+show(hasattr(iter({}), "__setstate__"), hasattr(iter(set()), "__setstate__"), hasattr((i for i in []), "__setstate__"), hasattr(iter([]), "__setstate__"))
 "#,
     );
 }

@@ -1840,6 +1840,20 @@ fn check_types_variadic_init_arguments() {
         "`x=` should reach `**kw`: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // ...which leaves the positional-only `x` itself unfilled.
+    for call in ["C(x=1)", "f(x=1)"] {
+        let tmp = tempfile::tempdir().unwrap();
+        scaffold(
+            tmp.path(),
+            &format!(
+                "plain class C:\n    def __init__(self, x: str, /, **kw: int) -> None:\n        pass\n\
+                 def f(x: str, /, **kw: int) -> None:\n    pass\n\
+                 print({call})\n"
+            ),
+        );
+        let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+        assert!(!out.status.success(), "`{call}` should not type-check");
+    }
 }
 
 #[test]
