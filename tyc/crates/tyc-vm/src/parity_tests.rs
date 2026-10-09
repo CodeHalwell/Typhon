@@ -3169,6 +3169,16 @@ t("sub reprs", lambda: (repr(C(3)), repr(R(1, 2))))
 import re
 t("flag ints", lambda: (hex(re.I), oct(re.I), bin(re.I), bytes(re.I), [1, 2, 3][re.I], "ab" * re.I))
 t("ctx origin", lambda: (typing.get_origin(typing.ContextManager[int]) is contextlib.AbstractContextManager, typing.get_origin(typing.AsyncContextManager[int]) is contextlib.AbstractAsyncContextManager))
+from typing import Literal
+t("literal types", lambda: (typing.get_args(Literal[0, False, 0]), Literal[0] == Literal[False], Literal[1, 2] == Literal[2, 1], hash(Literal[1, 2]) == hash(Literal[2, 1])))
+plain class IterFn:
+    def __call__(self, obj):
+        return iter([1])
+plain class ViaDescr:
+    __iter__ = IterFn()
+plain class NoIter:
+    __iter__ = None
+t("abc hook attrs", lambda: (issubclass(ViaDescr, cabc.Iterable), isinstance(ViaDescr(), cabc.Iterable), issubclass(NoIter, cabc.Iterable)))
 "#,
     );
 }

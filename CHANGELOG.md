@@ -25,7 +25,8 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   generics and `X | Y` unions; they had always returned `None` and `()`.
   `isinstance(x, typing.List)` and `typing.Sequence` check against the
   origin type, and `class S(typing.Sequence[int])` subclasses
-  `collections.abc.Sequence`.
+  `collections.abc.Sequence`. `Literal` keeps arguments that are equal but of
+  different types (`Literal[0, False]`) and compares regardless of order.
 - **`re` flags are `re.RegexFlag` members under `tyc run`.** `re.I` printed
   as `2`; it is now `re.IGNORECASE`, and `re.I | re.M` is
   `re.IGNORECASE|re.MULTILINE`. `RegexFlag` is an `IntFlag` class, so
@@ -49,7 +50,9 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   `MutableMapping.update`, `Set`'s operators), and an incomplete subclass
   refuses to instantiate. `isinstance` and `issubclass` also answer for
   the builtin types CPython registers, for the structural checks and for
-  classes added with `register`. `type()` of an ABC is `ABCMeta`.
+  classes added with `register`. As in CPython, a structural check accepts any
+  non-`None` binding of the method, descriptors included. `type()` of an ABC
+  is `ABCMeta`.
 - **Enum classes carry their metadata under `tyc run`.** `repr(Color)` is
   `<enum 'Color'>` (a flag's is `<flag 'Perm'>`), `type(Color)` is
   `enum.EnumType`, `Color.__members__` lists every name including aliases,

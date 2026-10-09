@@ -9891,13 +9891,12 @@ fn class_matches_abc_hook(c: &Rc<crate::value::Class>, abc_name: &str) -> bool {
         "Callable" => &["__call__"],
         _ => return false,
     };
-    methods.iter().all(|m| {
-        matches!(
-            crate::interp::lookup_class_member(c, m),
-            Some((_, crate::interp::ClassMember::Method(_)))
-                | Some((_, crate::interp::ClassMember::Attr(Value::Native(_))))
-                | Some((_, crate::interp::ClassMember::Attr(Value::Function(_))))
-        )
+    // CPython's `_check_methods`: each name must be bound somewhere in the
+    // MRO to anything but `None`.
+    methods.iter().all(|m| match crate::interp::lookup_class_member(c, m) {
+        Some((_, crate::interp::ClassMember::Method(_))) => true,
+        Some((_, crate::interp::ClassMember::Attr(v))) => !matches!(v, Value::None),
+        None => false,
     })
 }
 

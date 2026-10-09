@@ -164,6 +164,11 @@ class _GenericAlias:
 # CPython reports as the origin (`list` for `List`, the form itself for
 # `Union` / `Literal`), and `_union_form` (`typing.Union`) is set on the
 # class when the `typing` module is built.
+def _literal_keys(args):
+    # CPython compares `Literal` aliases by unordered (value, type) pairs.
+    return frozenset([(a, type(a)) for a in args])
+
+
 class _TypingAlias:
     def __init__(self, name, form, origin, args, callable_params=None):
         self._name = name
@@ -217,12 +222,16 @@ class _TypingAlias:
             return NotImplemented
         if self._name == "Union" and other._name == "Union":
             return set(self.__args__) == set(other.__args__)
+        if self._name == "Literal" and other._name == "Literal":
+            return _literal_keys(self.__args__) == _literal_keys(other.__args__)
         return (self._name == other._name and self.__origin__ == other.__origin__
                 and self.__args__ == other.__args__ and self.__metadata__ == other.__metadata__)
 
     def __hash__(self):
         if self._name == "Union":
             return hash(frozenset(self.__args__))
+        if self._name == "Literal":
+            return hash(_literal_keys(self.__args__))
         return hash((self._name, self.__args__))
 
     def __or__(self, other):
@@ -261,9 +270,13 @@ def _typing_subscript(name, form, origin, params):
         args = tuple(params[0]) + (params[1],)
         return _TypingAlias(name, form, origin, args, list(params[0]))
     if name == "Literal":
+        # Deduplicate by (value, type), so `Literal[0, False]` keeps both.
         args = []
+        seen = []
         for p in params:
-            if p not in args:
+            key = (p, type(p))
+            if key not in seen:
+                seen.append(key)
                 args.append(p)
         return _TypingAlias(name, form, origin, tuple(args))
     if name == "Tuple" and params == ((),):
