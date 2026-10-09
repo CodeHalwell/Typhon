@@ -2457,6 +2457,8 @@ import json
 import functools
 import dataclasses
 import heapq
+import random
+show(type(random.random).__name__, type(random.getrandbits).__name__, type(random.randint).__name__, random.choice.__qualname__, repr(random.shuffle).startswith("<bound method Random.shuffle of <random.Random object at 0x"))
 show(type(heapq.nsmallest).__name__, type(heapq.heappush).__name__, type(list.__class_getitem__).__name__, list.__class_getitem__.__self__ is list)
 show(type(json.dumps).__name__, type(dataclasses.field).__name__, type(functools.reduce).__name__, type(functools.wraps).__name__, repr(json.dumps).startswith("<function dumps at 0x"))
 sort = xs.sort

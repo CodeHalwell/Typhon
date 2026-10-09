@@ -27,7 +27,9 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   `dict.fromkeys.__self__` is `dict`).
   `repr(defaultdict)` is `<class 'collections.defaultdict'>`. A native
   standing in for a function CPython writes in Python (`json.dumps`,
-  `dataclasses.field`) stays a `function`.
+  `dataclasses.field`) stays a `function`, and `random`'s exports are
+  methods of its hidden `Random()` as in CPython (`random.randint` is a
+  `method` named `Random.randint`; `random.random` a builtin).
 - **A `plain class` with a builtin or imported base takes that base's
   constructor arguments.** `plain class Boom(Exception): pass` followed by
   `raise Boom("x")` was rejected with "expected 0, got 1", as were
@@ -43,7 +45,9 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   pre-run scan now sends such a program down the compiled path, as it
   does a custom metaclass, seeing through aliases (`Alias = list`,
   `builtins.list`) and parameterised bases (`list[int]`).
-  Value-mixin enums stay on the VM.
+  Enums with a `str`, `int`, `float`, `bytes` or `complex` mixin stay on
+  the VM; any other mixin (`class E(list, Enum)`) falls back too. Only
+  module-scope bindings count, and a rebinding drops them.
 - **A `plain class` is called with its own `__init__`'s arguments.** A
   `plain class` (or a `class!` with a hand-written `__init__`) that also
   declared annotated fields had its call arguments type-checked against

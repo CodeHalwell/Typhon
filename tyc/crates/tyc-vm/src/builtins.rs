@@ -3455,11 +3455,20 @@ pub(crate) fn module_dir_names(m: &Module) -> std::collections::BTreeSet<String>
 }
 
 /// Modules whose CPython functions are written in Python, so their natives
-/// are `function`s rather than builtins (`type(json.dumps)`).
+/// are `function`s rather than builtins (`type(json.dumps)`). `random`'s
+/// exports are methods of a hidden `Random` instance, never functions.
 fn module_defines_python_functions(name: &str) -> bool {
     !matches!(
         name.split('.').next().unwrap_or(name),
-        "builtins" | "math" | "time" | "sys" | "heapq" | "hashlib" | "__future__" | "__main__"
+        "builtins"
+            | "math"
+            | "time"
+            | "sys"
+            | "heapq"
+            | "hashlib"
+            | "random"
+            | "__future__"
+            | "__main__"
     )
 }
 
@@ -3484,6 +3493,16 @@ fn make_module(name: &str, entries: Vec<(&str, Value)>) -> Value {
                 && !crate::value::native_is_type(n.name)
             {
                 n.py_function.set(true);
+            }
+            // `random`'s exports are methods of its hidden `Random()`,
+            // bar the two C ones.
+            if name == "random"
+                && own
+                && n.method.is_none()
+                && !matches!(k, "random" | "getrandbits")
+                && !crate::value::native_is_type(n.name)
+            {
+                n.py_method_of.set(Some("Random"));
             }
         }
         map.insert(k.to_owned(), v);

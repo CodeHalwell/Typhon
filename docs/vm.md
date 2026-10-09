@@ -465,8 +465,9 @@ yields U+FFFD); a generator that falls back to eager collection (see
 and a subclass of a builtin value type (`class L(list)`, `class C(int)`,
 `class S(str)`, and likewise `class P(property)` or `class E(enumerate)`)
 holds no builtin value, since the VM models those types as values or
-natives rather than classes (a value-mixin enum such as
-`class Colour(str, Enum)` is modelled). A plain `tyc run` sends a program
+natives rather than classes (an enum with a `str`, `int`, `float`,
+`bytes` or `complex` mixin, such as `class Colour(str, Enum)`, is
+modelled; `class E(list, Enum)` is not). A plain `tyc run` sends a program
 with a `__del__`, a custom metaclass, an eagerly-collected generator or a
 builtin subclass to CPython, so these gaps show only under
 `--no-fallback`.

@@ -8617,6 +8617,10 @@ impl Interpreter {
                     _ => Value::None,
                 })
             }
+            Value::Native(n) if attr == "__qualname__" && n.py_method_of.get().is_some() => {
+                let class = n.py_method_of.get().unwrap_or_default();
+                Ok(Value::Str(Rc::from(format!("{class}.{}", n.name))))
+            }
             Value::Native(n) if attr == "__name__" || attr == "__qualname__" => {
                 Ok(Value::Str(self.intern_str(n.name)))
             }

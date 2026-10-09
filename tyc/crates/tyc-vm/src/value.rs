@@ -811,6 +811,15 @@ pub fn native_value_repr(n: &NativeFn) -> String {
                 addr(None)
             ),
         },
+        None if n.py_method_of.get().is_some() => {
+            let class = n.py_method_of.get().unwrap_or_default();
+            format!(
+                "<bound method {class}.{} of <{}.{class} object at {:#x}>>",
+                n.name,
+                class.to_lowercase(),
+                addr(None)
+            )
+        }
         None if n.py_function.get() => format!("<function {} at {:#x}>", n.name, addr(None)),
         None => native_repr(n.name),
     }
@@ -1787,6 +1796,10 @@ pub struct NativeFn {
     /// (`json.dumps`, `dataclasses.field`), so it is a `function`, not a
     /// `builtin_function_or_method`. Set when its module is built.
     pub py_function: std::cell::Cell<bool>,
+    /// The native stands in for a Python method bound to a hidden module
+    /// instance (`random.randint` is `Random.randint` bound to `random`'s
+    /// `Random()`), so it is a `method` named `<class>.<name>`.
+    pub py_method_of: std::cell::Cell<Option<&'static str>>,
     pub func: Box<NativeFnImpl>,
     /// The native stands in for a CPython *coroutine function*
     /// (`asyncio.sleep`, `Queue.get`, a `Lock.__aenter__`, …). The VM's
@@ -1808,6 +1821,7 @@ impl NativeFn {
             name,
             method: None,
             py_function: std::cell::Cell::new(false),
+            py_method_of: std::cell::Cell::new(None),
             func: Box::new(f),
             awaitable: false,
         }
@@ -1838,6 +1852,7 @@ impl NativeFn {
             name,
             method: None,
             py_function: std::cell::Cell::new(false),
+            py_method_of: std::cell::Cell::new(None),
             func: Box::new(f),
             awaitable: true,
         }
@@ -2568,6 +2583,7 @@ impl Value {
             // `[].append` and `len` builtin functions, and a builtin type
             // constructor (`int`) is a `type`.
             Value::Native(n) if native_is_type(n.name) => "type",
+            Value::Native(n) if n.py_method_of.get().is_some() => "method",
             Value::Native(n) if n.py_function.get() => "function",
             Value::Native(n) => match &n.method {
                 Some(NativeMethod {

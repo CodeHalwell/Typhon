@@ -1049,91 +1049,42 @@ pub fn module_subclassed_builtin(module: &ruff_python_ast::ModModule) -> Option<
         "type",
     ];
     const ENUM_TYPES: &[&str] = &["Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "ReprEnum"];
+    /// The data-type mixins the VM models on an enum (`enum_mixin_value`).
+    const ENUM_MIXINS: &[&str] = &["str", "int", "float", "bytes", "complex"];
 
-    /// The names that stand for a builtin value type (`Alias = list`,
-    /// `from builtins import list as L`) or for the `enum` module and its
-    /// enum bases (`import enum as e`, `from enum import Enum as E`).
+    /// One pass in source order. Module-scope statements bind the names
+    /// that stand for a builtin value type (`Alias = list`,
+    /// `from builtins import list as L`), the `enum` module, an enum base
+    /// (`from enum import Enum as E`) or an enum class of this module; a
+    /// later rebinding of the name drops it. A function or class body binds
+    /// nothing at module scope, but its classes are still checked.
     #[derive(Default)]
-    struct Bindings {
+    struct Scan {
         builtin: std::collections::HashMap<String, String>,
         enum_modules: std::collections::HashSet<String>,
+        /// `Enum`-like bases: imported from `enum`, or enum classes of
+        /// this module, so `class C(str, Base)` with `class Base(Enum)` is
+        /// one too.
         enum_bases: std::collections::HashSet<String>,
         /// `builtins` and its aliases (`import builtins as b`).
         builtins_modules: std::collections::HashSet<String>,
-    }
-    impl<'a> Visitor<'a> for Bindings {
-        fn visit_stmt(&mut self, stmt: &'a Stmt) {
-            match stmt {
-                Stmt::Import(i) => {
-                    for alias in &i.names {
-                        let bound = alias.asname.as_ref().unwrap_or(&alias.name);
-                        match alias.name.as_str() {
-                            "enum" => {
-                                self.enum_modules.insert(bound.to_string());
-                            }
-                            "builtins" => {
-                                self.builtins_modules.insert(bound.to_string());
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Stmt::ImportFrom(i) => {
-                    let module = i.module.as_ref().map(|m| m.as_str());
-                    for alias in &i.names {
-                        let name = alias.name.as_str();
-                        let bound = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
-                        match module {
-                            Some("enum") if ENUM_TYPES.contains(&name) => {
-                                self.enum_bases.insert(bound);
-                            }
-                            Some("builtins") if VALUE_TYPES.contains(&name) => {
-                                self.builtin.insert(bound, name.to_owned());
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Stmt::Assign(a) => {
-                    if let ([Expr::Name(target)], Expr::Name(value)) =
-                        (a.targets.as_slice(), a.value.as_ref())
-                    {
-                        let value = value.id.as_str();
-                        let resolved = self
-                            .builtin
-                            .get(value)
-                            .cloned()
-                            .or_else(|| VALUE_TYPES.contains(&value).then(|| value.to_owned()));
-                        if let Some(b) = resolved {
-                            self.builtin.insert(target.id.to_string(), b);
-                        }
-                    }
-                }
-                _ => {}
-            }
-            visitor::walk_stmt(self, stmt);
-        }
-    }
-
-    struct Scan<'b> {
-        bindings: &'b Bindings,
-        /// Classes of this module that are enums, so `class C(str, Base)`
-        /// with `class Base(Enum)` is one too.
-        local_enums: std::collections::HashSet<String>,
+        depth: usize,
         found: Option<String>,
     }
-    impl Scan<'_> {
+    impl Scan {
+        fn unbind(&mut self, name: &str) {
+            self.builtin.remove(name);
+            self.enum_modules.remove(name);
+            self.enum_bases.remove(name);
+            self.builtins_modules.remove(name);
+        }
         fn is_enum_base(&self, base: &Expr) -> bool {
             match base {
-                Expr::Name(n) => {
-                    self.bindings.enum_bases.contains(n.id.as_str())
-                        || self.local_enums.contains(n.id.as_str())
-                }
+                Expr::Name(n) => self.enum_bases.contains(n.id.as_str()),
                 Expr::Attribute(a) => {
                     ENUM_TYPES.contains(&a.attr.as_str())
                         && matches!(a.value.as_ref(), Expr::Name(m)
-                            if m.id.as_str() == "enum"
-                                || self.bindings.enum_modules.contains(m.id.as_str()))
+                            if self.enum_modules.contains(m.id.as_str()))
                 }
                 _ => false,
             }
@@ -1147,42 +1098,137 @@ pub fn module_subclassed_builtin(module: &ruff_python_ast::ModModule) -> Option<
             // `builtins.list` / `b.list` after `import builtins as b`.
             if let Expr::Attribute(a) = base {
                 let on_builtins = matches!(a.value.as_ref(), Expr::Name(m)
-                    if self.bindings.builtins_modules.contains(m.id.as_str()));
+                    if self.builtins_modules.contains(m.id.as_str()));
                 let attr = a.attr.as_str();
                 return (on_builtins && VALUE_TYPES.contains(&attr)).then(|| attr.to_owned());
             }
             let Expr::Name(n) = base else { return None };
             let name = n.id.as_str();
-            self.bindings
-                .builtin
+            self.builtin
                 .get(name)
                 .cloned()
                 .or_else(|| VALUE_TYPES.contains(&name).then(|| name.to_owned()))
         }
+        /// The builtin base that keeps `c` off the VM: any builtin base of a
+        /// plain class, or of an enum one a mixin the VM does not model
+        /// (`class E(list, Enum)`).
+        fn unmodelled_base(&self, c: &ruff_python_ast::StmtClassDef) -> Option<String> {
+            let is_enum = c.bases().iter().any(|b| self.is_enum_base(b));
+            c.bases()
+                .iter()
+                .filter_map(|b| self.builtin_base(b))
+                .find(|b| !(is_enum && ENUM_MIXINS.contains(&b.as_str())))
+        }
+        fn bind_module_scope(&mut self, stmt: &Stmt) {
+            match stmt {
+                Stmt::Import(i) => {
+                    for alias in &i.names {
+                        let name = alias.name.as_str();
+                        // `import a.b` binds `a`.
+                        let bound = match &alias.asname {
+                            Some(a) => a.as_str(),
+                            None => name.split('.').next().unwrap_or(name),
+                        };
+                        self.unbind(bound);
+                        match name {
+                            "enum" => {
+                                self.enum_modules.insert(bound.to_owned());
+                            }
+                            "builtins" => {
+                                self.builtins_modules.insert(bound.to_owned());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Stmt::ImportFrom(i) => {
+                    let module = i.module.as_ref().map(|m| m.as_str());
+                    for alias in &i.names {
+                        let name = alias.name.as_str();
+                        let bound = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
+                        self.unbind(&bound);
+                        match module {
+                            Some("enum") if ENUM_TYPES.contains(&name) => {
+                                self.enum_bases.insert(bound);
+                            }
+                            Some("builtins") if VALUE_TYPES.contains(&name) => {
+                                self.builtin.insert(bound, name.to_owned());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Stmt::Assign(a) => {
+                    let value = match a.value.as_ref() {
+                        Expr::Name(v) => Some(v.id.as_str()),
+                        _ => None,
+                    };
+                    let builtin = value.and_then(|v| {
+                        self.builtin
+                            .get(v)
+                            .cloned()
+                            .or_else(|| VALUE_TYPES.contains(&v).then(|| v.to_owned()))
+                    });
+                    let enum_base = value.is_some_and(|v| self.enum_bases.contains(v));
+                    for target in &a.targets {
+                        if let Expr::Name(t) = target {
+                            let t = t.id.as_str();
+                            self.unbind(t);
+                            if let Some(b) = &builtin {
+                                self.builtin.insert(t.to_owned(), b.clone());
+                            }
+                            if enum_base {
+                                self.enum_bases.insert(t.to_owned());
+                            }
+                        }
+                    }
+                }
+                Stmt::AnnAssign(a) => {
+                    if let Expr::Name(t) = a.target.as_ref() {
+                        self.unbind(t.id.as_str());
+                    }
+                }
+                Stmt::FunctionDef(f) => self.unbind(f.name.as_str()),
+                Stmt::ClassDef(c) => {
+                    let is_enum = c.bases().iter().any(|b| self.is_enum_base(b));
+                    self.unbind(c.name.as_str());
+                    if is_enum {
+                        self.enum_bases.insert(c.name.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
     }
-    impl<'a> Visitor<'a> for Scan<'_> {
+    impl<'a> Visitor<'a> for Scan {
         fn visit_stmt(&mut self, stmt: &'a Stmt) {
             if self.found.is_some() {
                 return;
             }
             if let Stmt::ClassDef(c) = stmt {
-                if c.bases().iter().any(|b| self.is_enum_base(b)) {
-                    self.local_enums.insert(c.name.to_string());
-                } else if let Some(b) = c.bases().iter().find_map(|b| self.builtin_base(b)) {
+                if let Some(b) = self.unmodelled_base(c) {
                     self.found = Some(b);
                     return;
                 }
             }
+            let scope = matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_));
+            if scope {
+                self.depth += 1;
+            }
             visitor::walk_stmt(self, stmt);
+            if scope {
+                self.depth -= 1;
+            }
+            // After the body, so a class's own bases see the names before it.
+            if self.depth == 0 {
+                self.bind_module_scope(stmt);
+            }
         }
     }
-    let mut bindings = Bindings::default();
-    bindings.visit_body(&module.body);
-    let mut scan = Scan {
-        bindings: &bindings,
-        local_enums: Default::default(),
-        found: None,
-    };
+    let mut scan = Scan::default();
+    // `enum.Enum` without an import still names the module in a
+    // Typhon-lowered `enum` declaration.
+    scan.enum_modules.insert("enum".to_owned());
     scan.visit_body(&module.body);
     scan.found
 }

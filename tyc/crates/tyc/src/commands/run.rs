@@ -1664,6 +1664,25 @@ mod tests {
         );
         let imported = "from builtins import dict as D\nplain class M(D):\n    pass\nprint(M())\n";
         assert!(scan_source(imported).is_some());
+        // An enum mixin the VM does not model still falls back.
+        let list_enum = "from enum import Enum\nclass E(list, Enum):\n    A = [1]\nprint(E.A)\n";
+        assert_eq!(
+            scan_source(list_enum),
+            Some(vec!["a subclass of the builtin list".to_owned()])
+        );
+        // Only a module-scope binding names an enum base, and a later
+        // rebinding drops it.
+        for src in [
+            "def f() -> None:\n    from enum import Enum\nplain class Enum:\n    pass\nplain class L(list, Enum):\n    pass\nprint(L())\n",
+            "from enum import Enum\nplain class Enum:\n    pass\nplain class L(list, Enum):\n    pass\nprint(L())\n",
+            "from enum import Enum\nEnum = object\nplain class L(list, Enum):\n    pass\nprint(L())\n",
+        ] {
+            assert!(scan_source(src).is_some(), "{src}");
+        }
+        // An alias of an enum base is one.
+        let enum_alias =
+            "from enum import Enum\nE = Enum\nclass C(str, E):\n    A = \"a\"\nprint(C.A)\n";
+        assert_eq!(scan_source(enum_alias), None);
     }
 
     #[test]
