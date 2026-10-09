@@ -58,3 +58,6 @@
 ## 2024-10-05 - Avoid AST Deep Cloning in Iteration
 **Learning:** Index-based lookahead loops over `Vec<Stmt>` (e.g. `body[i].clone()`) cause massive O(N) deep copying of large AST nodes (like `FunctionDef` and `ClassDef`) just to satisfy ownership rules.
 **Action:** Use `body.into_iter()` combined with `iter.as_slice()` to peek ahead without consuming elements, and `iter.nth()` to skip consumed items. This allows taking ownership of AST nodes (`iter.next().unwrap()`) with zero allocations and zero deep cloning.
+## 2024-11-29 - Zero-Allocation `bound_names` traversal
+**Learning:** Checking for bound names in `bound_names` inside `reserved.rs` required constructing a `HashSet<String>` and allocating strings for every single top-level variable, function, class, and imported name inside a python module. As this is used heavily to verify generated python dependencies in typhon_runtime packages, this created significant allocation overhead during compilation.
+**Action:** By bounding the lifetime of the `HashSet<&str>` to the incoming `&str` reference of the python source, we avoid String allocations entirely when building the `names` set and rely on dereferencing pointers for fast lookups.

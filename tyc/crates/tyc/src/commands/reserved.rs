@@ -75,15 +75,16 @@ pub(crate) fn user_runtime(src_dir: &Path) -> Option<UserRuntime> {
 /// Names a generated Python module binds at top level (what `from it import
 /// NAME` can import): `class`/`def` names, assignment targets, and names bound
 /// by imports. A line scan is enough for the templates `tyc` itself writes.
-fn bound_names(python: &str) -> HashSet<String> {
-    let ident = |s: &str| -> Option<String> {
-        let name: String = s
-            .trim_start()
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect();
-        (!name.is_empty()).then_some(name)
-    };
+fn bound_names(python: &str) -> HashSet<&str> {
+    fn extract_ident(s: &str) -> Option<&str> {
+        let s = s.trim_start();
+        let end = s.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(s.len());
+        if end > 0 {
+            Some(&s[..end])
+        } else {
+            None
+        }
+    }
     let mut names = HashSet::new();
     for line in python.lines() {
         if line.starts_with([' ', '\t', '#']) {
@@ -94,13 +95,13 @@ fn bound_names(python: &str) -> HashSet<String> {
             .or_else(|| line.strip_prefix("def "))
             .or_else(|| line.strip_prefix("async def "))
         {
-            names.extend(ident(rest));
+            names.extend(extract_ident(rest));
         } else if let Some(rest) = line.strip_prefix("from ") {
             if let Some((_, imported)) = rest.split_once(" import ") {
                 for item in imported.split('#').next().unwrap_or("").split(',') {
                     let item = item.trim().trim_matches(['(', ')']);
                     let bound = item.rsplit(" as ").next().unwrap_or(item);
-                    names.extend(ident(bound));
+                    names.extend(extract_ident(bound));
                 }
             }
         } else if let Some(rest) = line.strip_prefix("import ") {
@@ -110,9 +111,9 @@ fn bound_names(python: &str) -> HashSet<String> {
                     Some((_, alias)) => alias,
                     None => item.split('.').next().unwrap_or(item),
                 };
-                names.extend(ident(bound));
+                names.extend(extract_ident(bound));
             }
-        } else if let Some(name) = ident(line) {
+        } else if let Some(name) = extract_ident(line) {
             let after = line.trim_start()[name.len()..].trim_start();
             if (after.starts_with('=') && !after.starts_with("==")) || after.starts_with(':') {
                 names.insert(name);
@@ -170,13 +171,12 @@ pub(crate) fn broken_imports(
     user: &UserRuntime,
     files: &[(&str, String)],
 ) -> Vec<BrokenImport> {
-    let generated_modules: HashSet<String> = files
+    let generated_modules: HashSet<&str> = files
         .iter()
         .filter_map(|(name, _)| name.strip_suffix(".py"))
         .filter(|stem| *stem != "__init__")
-        .map(str::to_owned)
         .collect();
-    let module_names = |stem: &str| -> HashSet<String> {
+    let module_names = |stem: &str| -> HashSet<&str> {
         files
             .iter()
             .find(|(name, _)| name.strip_suffix(".py") == Some(stem))
@@ -185,15 +185,15 @@ pub(crate) fn broken_imports(
     };
     // User submodules whose files survive: the runtime only writes its own
     // file names.
-    let surviving: HashSet<String> = user
+    let surviving: HashSet<&str> = user
         .submodules
         .iter()
+        .map(|s| s.as_str())
         .filter(|s| !generated_modules.contains(*s))
-        .cloned()
         .collect();
     let mut package_names = module_names("__init__");
-    package_names.extend(generated_modules.iter().cloned());
-    package_names.extend(surviving.iter().cloned());
+    package_names.extend(generated_modules.iter().copied());
+    package_names.extend(surviving.iter().copied());
 
     let mut broken = Vec::new();
     for (file, source) in sources {
@@ -271,7 +271,7 @@ pub(crate) fn broken_imports(
                 sub_names = module_names(sub);
                 &sub_names
             };
-            if !available.contains(&read.attr) {
+            if !available.contains(read.attr.as_str()) {
                 broken.push(BrokenImport {
                     file: file.clone(),
                     line: read.line,
