@@ -2370,7 +2370,8 @@ impl Interpreter {
         }
         // `Cls.__doc__` — the class body's leading string literal.
         if let Some(doc) = class_docstring(c) {
-            class_attrs.insert("__typhon_doc__".to_owned(), Value::Str(Rc::new(doc)));
+            let doc = self.str_constant(&doc);
+            class_attrs.insert("__typhon_doc__".to_owned(), Value::Str(doc));
         }
         class_attrs.insert(
             "__typhon_module__".to_owned(),
@@ -2833,13 +2834,6 @@ impl Interpreter {
         // after `tyc build` — a drop-in violation, not just a missing name.
         module_env.set("__name__", Value::Str(Rc::new(name.to_owned())));
         module_env.set(
-            "__doc__",
-            match module_docstring(&module) {
-                Some(doc) => Value::Str(Rc::new(doc)),
-                None => Value::None,
-            },
-        );
-        module_env.set(
             "__file__",
             Value::Str(Rc::new(path.to_string_lossy().into_owned())),
         );
@@ -2850,6 +2844,12 @@ impl Interpreter {
             &source,
             &prep.line_map,
         )));
+        // The docstring is a constant of the module itself.
+        let doc = match module_docstring(&module) {
+            Some(doc) => Value::Str(self.str_constant(&doc)),
+            None => Value::None,
+        };
+        module_env.set("__doc__", doc);
         // Enter the loaded module's package so its own relative imports
         // resolve from where it lives, not from where the import chain
         // started. A package's `__init__.ty` *is* the package, so it keeps
@@ -8401,10 +8401,19 @@ impl Interpreter {
             // function has one in CPython.
             Value::Function(f) if attr == "__doc__" => {
                 let set = f.attrs.borrow().get("__doc__").cloned();
-                Ok(set.unwrap_or_else(|| match body_docstring(&f.body) {
-                    Some(doc) => Value::Str(Rc::new(doc)),
+                if let Some(v) = set {
+                    return Ok(v);
+                }
+                // The body's docstring is a constant of the defining module.
+                Ok(match body_docstring(&f.body) {
+                    Some(doc) => {
+                        let outer = std::mem::replace(&mut self.current_source, f.source.clone());
+                        let doc = self.str_constant(&doc);
+                        self.current_source = outer;
+                        Value::Str(doc)
+                    }
                     None => Value::None,
-                }))
+                })
             }
             // PEP 695: a function's own type parameters, stamped at def time
             // by `build_type_params`. A non-generic function reports the empty
@@ -14810,13 +14819,7 @@ fn folded_str(expr: &Expr) -> Option<String> {
             Some(left)
         }
         Expr::BinOp(b) if matches!(b.op, Operator::Mult) => {
-            let count = |e: &Expr| match e {
-                Expr::NumberLiteral(n) => match &n.value {
-                    Number::Int(i) => i.as_i64(),
-                    _ => None,
-                },
-                _ => None,
-            };
+            let count = folded_int;
             let (text, n) = match (folded_str(&b.left), count(&b.right)) {
                 (Some(t), Some(n)) => (t, n),
                 _ => (folded_str(&b.right)?, count(&b.left)?),
@@ -14831,12 +14834,35 @@ fn folded_str(expr: &Expr) -> Option<String> {
     }
 }
 
+/// The `int` a literal-only arithmetic expression folds to (`1 + 1`,
+/// `2 * 2`, `-3`), as CPython folds a repeat count before the repeat.
+fn folded_int(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::NumberLiteral(n) => match &n.value {
+            Number::Int(i) => i.as_i64(),
+            _ => None,
+        },
+        Expr::UnaryOp(u) if matches!(u.op, UnaryOp::USub) => folded_int(&u.operand)?.checked_neg(),
+        Expr::BinOp(b) => {
+            let (l, r) = (folded_int(&b.left)?, folded_int(&b.right)?);
+            match b.op {
+                Operator::Add => l.checked_add(r),
+                Operator::Sub => l.checked_sub(r),
+                Operator::Mult => l.checked_mul(r),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Whether `expr` is made only of literals and `+` / `*`, so that
 /// [`folded_str`] is worth trying (it allocates; this does not).
 fn literal_only(expr: &Expr) -> bool {
     match expr {
         Expr::StringLiteral(_) | Expr::NumberLiteral(_) => true,
-        Expr::BinOp(b) if matches!(b.op, Operator::Add | Operator::Mult) => {
+        Expr::UnaryOp(u) if matches!(u.op, UnaryOp::USub) => literal_only(&u.operand),
+        Expr::BinOp(b) if matches!(b.op, Operator::Add | Operator::Sub | Operator::Mult) => {
             literal_only(&b.left) && literal_only(&b.right)
         }
         _ => false,

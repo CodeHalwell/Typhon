@@ -176,13 +176,11 @@ fn run_source_reporting(
     );
     // …and `__doc__`, which CPython binds on every module: the leading
     // string literal, or `None`.
-    interp.root.set(
-        "__doc__",
-        match crate::interp::module_docstring(&module) {
-            Some(doc) => Value::Str(std::rc::Rc::new(doc)),
-            None => Value::None,
-        },
-    );
+    let doc = match crate::interp::module_docstring(&module) {
+        Some(doc) => Value::Str(interp.str_constant(&doc)),
+        None => Value::None,
+    };
+    interp.root.set("__doc__", doc);
     if let Some(p) = origin {
         interp.root.set(
             "__file__",
