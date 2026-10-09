@@ -1826,6 +1826,20 @@ fn check_types_variadic_init_arguments() {
         "well-typed variadic calls should type-check: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // A keyword spelling a positional-only parameter's name lands in
+    // `**kwargs`, so it takes the `**kwargs` type, not the parameter's.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "plain class C:\n    def __init__(self, x: str, /, **kw: int) -> None:\n        pass\n\
+         print(C(\"ok\", x=1))\n",
+    );
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(
+        out.status.success(),
+        "`x=` should reach `**kw`: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]

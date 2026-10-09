@@ -2542,6 +2542,22 @@ show(type(_cp.copy(_cm)).__name__, type(_cm.new_child()).__name__, type(_cm.pare
 _xs = [1]
 type(_xs).append(_xs, 2)
 show(_xs, type(_xs).__module__, type("a").upper("b"), type(1).bit_length(5), hasattr(type(_xs), "append"))
+_dd2 = _dd(list)
+_dd2["a"].append(1)
+show(_dd.copy(_dd2), type(_dd2).copy(_dd2) == _dd.copy(_dd2), hasattr(_dd, "copy"), hasattr(property, "setter"))
+class _OD(_od):
+    def __init__(self):
+        super().__init__()
+        self.tag = "t"
+_o = _OD()
+_o["k"] = 1
+_o.tag = "changed"
+_oc = _cp.copy(_o)
+show(type(_oc).__name__, _oc, _oc.tag)
+try:
+    reversed([1]).__setstate__(10 ** 100)
+except OverflowError as _ex:
+    show("OverflowError", _ex)
 "#,
     );
 }

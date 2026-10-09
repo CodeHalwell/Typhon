@@ -339,20 +339,24 @@ class OrderedDict(_MappingBase):
         return iter(list(self._data.keys())[::-1])
 
     def __repr__(self):
+        name = type(self).__name__
         if not self._data:
-            return "OrderedDict()"
-        return "OrderedDict(%r)" % self._data
+            return "%s()" % name
+        return "%s(%r)" % (name, self._data)
 
     def copy(self):
-        return OrderedDict(self._data)
+        return self.__class__(self)
 
     def _typhon_copy(self):
-        # CPython's `OrderedDict.__reduce__` carries the instance state too
-        # (unlike `Counter`'s), so extra attributes survive the copy.
-        inst = type(self)(self._data)
+        # CPython's `OrderedDict.__reduce__`: the class called with no
+        # arguments, then the instance state (unlike `Counter`'s, it is
+        # carried), then the items set one by one.
+        inst = type(self)()
         for k, v in vars(self).items():
             if k != "_data":
                 object.__setattr__(inst, k, v)
+        for k, v in self._data.items():
+            inst[k] = v
         return inst
 
     @classmethod

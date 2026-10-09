@@ -8544,6 +8544,16 @@ impl Interpreter {
                 }
                 Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(map))))
             }
+            // `defaultdict` / `property` name the same type object as the
+            // shim class behind them, so they answer its attributes
+            // (`defaultdict.copy(d)`, `property.getter`).
+            Value::Native(n)
+                if crate::builtins::is_shim_constructor_name(n.name)
+                    && !matches!(attr, "__name__" | "__qualname__") =>
+            {
+                let class = crate::builtins::shim_class_for_constructor(self, n.name)?;
+                self.get_attr(&class, attr)
+            }
             Value::Native(n) if attr == "__name__" || attr == "__qualname__" => {
                 Ok(Value::Str(self.intern_str(n.name)))
             }
@@ -13220,7 +13230,15 @@ fn iter_setstate(target: &Value, state: &Value) -> Result<Value, Unwind> {
     let Value::Int(i) = state else {
         return Err(type_error("an integer is required"));
     };
-    let n = i.to_bigint().try_into().unwrap_or(i64::MAX).max(-1);
+    // CPython takes a `Py_ssize_t` here: a state that does not fit is an
+    // `OverflowError`, never a wrapped or saturated index.
+    let n: i64 = i.to_bigint().try_into().map_err(|_| {
+        Unwind::Exception(VmException::new(
+            "OverflowError",
+            "Python int too large to convert to C ssize_t",
+        ))
+    })?;
+    let n = n.max(-1);
     match &mut *it.borrow_mut() {
         IterState::List { items, index } => {
             *index = (n.max(0) as usize).min(items.borrow().len());

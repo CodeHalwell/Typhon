@@ -3253,7 +3253,7 @@ fn register_builtin_shim_class(cls: &Value) {
 
 /// A constructor native that stands for a shim class (`collections.defaultdict`,
 /// `property` and the 3.15 builtins): a type object in CPython, so `isinstance(_, type)`.
-fn is_shim_constructor_name(name: &str) -> bool {
+pub(crate) fn is_shim_constructor_name(name: &str) -> bool {
     matches!(name, "defaultdict" | "frozendict" | "sentinel" | "property")
 }
 
@@ -3273,6 +3273,19 @@ pub(crate) fn py315_builtin_class(interp: &mut Interpreter, name: &str) -> Resul
     let cls = cached_helper_class(interp, cache, shims::PY315_BUILTINS, name)?;
     register_builtin_shim_class(&cls);
     Ok(cls)
+}
+
+/// The shim class behind a constructor native that stands for one
+/// (`defaultdict`, `property`, `frozendict`, `sentinel`).
+pub(crate) fn shim_class_for_constructor(
+    interp: &mut Interpreter,
+    name: &str,
+) -> Result<Value, Unwind> {
+    match name {
+        "defaultdict" => defaultdict_class(interp),
+        "property" => descriptor_shim_class(interp, "property"),
+        _ => py315_builtin_class(interp, name),
+    }
 }
 
 pub(crate) fn defaultdict_class(interp: &mut Interpreter) -> Result<Value, Unwind> {

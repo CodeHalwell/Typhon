@@ -1396,15 +1396,30 @@ fn init_param_shape(
     if names.len() != sig.param_types.len() {
         return None;
     }
+    // A positional-only parameter cannot be named by a keyword: it gets a
+    // slot no keyword can spell (`x/`), so `x=` reaches `**kwargs` instead.
+    let slot = |i: usize, n: &String| {
+        if i < info.posonly_count {
+            format!("{n}/")
+        } else {
+            n.clone()
+        }
+    };
     let mut params = InterfaceShape {
         fields: names
             .into_iter()
-            .cloned()
+            .enumerate()
+            .map(|(i, n)| slot(i, n))
             .zip(sig.param_types.iter().cloned())
             .collect(),
         ..InterfaceShape::default()
     };
-    let mut order = info.param_names.clone();
+    let mut order: Vec<String> = info
+        .param_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| slot(i, n))
+        .collect();
     if let Some(vararg) = &info.vararg_type {
         params.fields.insert(VARARG_SLOT.to_owned(), vararg.clone());
         while order.len() < pos_args.len() {
