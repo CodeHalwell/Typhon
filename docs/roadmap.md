@@ -10,6 +10,13 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Current release
 
+**[v1.0.0-beta.3](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-beta.3) — 2026-10-09.**
+Python 3.15 targets and VM ↔ CPython parity gap fixes. CPython 3.15 joins
+3.13 in CI, a `[python] target` of 3.15 unlocks its new syntax and builtins,
+and `tyc::requires_newer_python` rejects code newer than its target. The
+minimum and default target stay at 3.13. `tyc run` matches CPython on many
+more programs and hands more of the rest to CPython.
+
 **[v1.0.0-beta.2](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-beta.2) — 2026-10-04.**
 The first published beta: v1.0.0-beta.1 plus a Windows build fix. The
 beta.1 tag's release build failed on Windows, so no beta.1 binaries were
