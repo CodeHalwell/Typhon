@@ -8033,6 +8033,10 @@ fn class_ancestry_fully_local(c: &Checker, name: &str) -> bool {
         if !visited.insert(n) {
             continue;
         }
+        // `class A(object)` is still a project-only hierarchy.
+        if n == "object" && !c.local_classes.contains(n) {
+            continue;
+        }
         if !c.local_classes.contains(n) {
             return false;
         }
@@ -29441,6 +29445,19 @@ def main() -> None:
 ";
         let d = check_class_kinds(builtin_base);
         assert!(!d.has_errors(), "builtin bases: {d:?}");
+        // An explicit `object` base is still `object.__init__`.
+        let object_base = "\
+plain class A(object):
+    pass
+
+def main() -> None:
+    let a: A = A(1)
+    print(a)
+";
+        assert!(
+            check_class_kinds(object_base).has_errors(),
+            "object base takes no arguments"
+        );
     }
 
     #[test]

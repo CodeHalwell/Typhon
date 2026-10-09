@@ -36,7 +36,7 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   `raise Boom("x")` was rejected with "expected 0, got 1", as were
   `bytes` and `range` bases: the zero-argument rule for a `plain class`
   without an `__init__` now applies only when every ancestor is a class
-  of the project.
+  of the project or `object`.
 - **A subclass of a builtin value type runs on CPython.** The VM models
   `list`, `int`, `str` and the other value types as values, not classes
   (and `enumerate`, `zip`, `property`, `classmethod`, `super`, `type` and
@@ -51,6 +51,9 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   scan errs towards CPython: a builtin alias counts in any scope or
   branch, while an enum base exempts a class only when bound
   unconditionally at module scope and not rebound since.
+  An alias exported by a sibling module (`from helper import Alias`) and
+  a class factory's parameter base (`def make(Base: type)` with
+  `class L(Base)`) fall back too.
 - **A `plain class` is called with its own `__init__`'s arguments.** A
   `plain class` (or a `class!` with a hand-written `__init__`) that also
   declared annotated fields had its call arguments type-checked against

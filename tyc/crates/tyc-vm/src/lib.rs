@@ -1009,16 +1009,38 @@ const PYTHON_BUILTINS: &[&str] = &[
     "__debug__",
 ];
 
-/// The first builtin value type (`list`, `int`, `str`, …) or other
-/// native-backed builtin (`enumerate`, `property`) a class in `module`
-/// subclasses, or `None`.
+/// Why a class in `module` cannot run on the VM, or `None`: it subclasses
+/// a builtin value type (`list`, `int`, `str`, …) or another native-backed
+/// builtin (`enumerate`, `property`), or its base is a parameter of an
+/// enclosing function (a class factory) that could be one. A name in
+/// `project_aliases` (from [`module_builtin_aliases`] over the project's
+/// other modules) stands for its builtin here too, imported or not.
 ///
 /// The VM models those types as Rust values or natives, not classes, so an instance of
 /// `class L(list)` is a plain object that holds no list: `L([1, 2])` fails
 /// and `class S(str)` prints as `<__main__.S object …>`. `tyc run`'s pre-run
 /// scan sends such a program down the compiled path. A value-mixin enum
 /// (`class Colour(str, Enum)`) is modelled and stays in the VM.
-pub fn module_subclassed_builtin(module: &ruff_python_ast::ModModule) -> Option<String> {
+pub fn module_subclassed_builtin(
+    module: &ruff_python_ast::ModModule,
+    project_aliases: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    scan_builtin_subclasses(module, project_aliases, false).0
+}
+
+/// The names `module` binds to a builtin value type (`Alias = list`), for
+/// [`module_subclassed_builtin`] over the project's other modules.
+pub fn module_builtin_aliases(
+    module: &ruff_python_ast::ModModule,
+) -> std::collections::HashMap<String, String> {
+    scan_builtin_subclasses(module, &Default::default(), true).1
+}
+
+fn scan_builtin_subclasses(
+    module: &ruff_python_ast::ModModule,
+    project_aliases: &std::collections::HashMap<String, String>,
+    collect: bool,
+) -> (Option<String>, std::collections::HashMap<String, String>) {
     use ruff_python_ast::visitor::{self, Visitor};
     use ruff_python_ast::{Expr, Stmt};
 
@@ -1074,6 +1096,12 @@ pub fn module_subclassed_builtin(module: &ruff_python_ast::ModModule) -> Option<
         depth: usize,
         /// Compound statements (`if`, `for`, `try`, …) around it.
         branch: usize,
+        /// The parameters of each enclosing function.
+        params: Vec<std::collections::HashSet<String>>,
+        /// Builtin aliases the project's other modules export.
+        project: std::collections::HashMap<String, String>,
+        /// Only collect `builtin`; report nothing.
+        collect: bool,
         found: Option<String>,
     }
     impl Scan {
@@ -1103,10 +1131,15 @@ pub fn module_subclassed_builtin(module: &ruff_python_ast::ModModule) -> Option<
                 let on_builtins = matches!(a.value.as_ref(), Expr::Name(m)
                     if self.builtins_modules.contains(m.id.as_str()));
                 let attr = a.attr.as_str();
-                return (on_builtins && VALUE_TYPES.contains(&attr)).then(|| attr.to_owned());
+                if on_builtins && VALUE_TYPES.contains(&attr) {
+                    return Some(attr.to_owned());
+                }
+                // `helper.Alias` for another module's `Alias = list`.
+                return self.project.get(attr).cloned();
             }
             let Expr::Name(n) = base else { return None };
             self.name_builtin(n.id.as_str())
+                .or_else(|| self.project.get(n.id.as_str()).cloned())
         }
         /// The builtin value type `name` stands for, directly or as an alias.
         fn name_builtin(&self, name: &str) -> Option<String> {
@@ -1120,10 +1153,22 @@ pub fn module_subclassed_builtin(module: &ruff_python_ast::ModModule) -> Option<
         /// (`class E(list, Enum)`).
         fn unmodelled_base(&self, c: &ruff_python_ast::StmtClassDef) -> Option<String> {
             let is_enum = c.bases().iter().any(|b| self.is_enum_base(b));
-            c.bases()
+            let builtin = c
+                .bases()
                 .iter()
                 .filter_map(|b| self.builtin_base(b))
-                .find(|b| !(is_enum && ENUM_MIXINS.contains(&b.as_str())))
+                .find(|b| !(is_enum && ENUM_MIXINS.contains(&b.as_str())));
+            if let Some(b) = builtin {
+                return Some(format!("a subclass of the builtin {b}"));
+            }
+            // `def make(Base: type) -> type: class L(Base)` may be handed
+            // `list`.
+            c.bases().iter().find_map(|b| match b {
+                Expr::Name(n) if self.params.iter().any(|p| p.contains(n.id.as_str())) => {
+                    Some(format!("a class whose base is the parameter {}", n.id))
+                }
+                _ => None,
+            })
         }
         fn bind(&mut self, stmt: &Stmt) {
             let pinned = self.depth == 0 && self.branch == 0;
@@ -1216,10 +1261,14 @@ pub fn module_subclassed_builtin(module: &ruff_python_ast::ModModule) -> Option<
                 return;
             }
             if let Stmt::ClassDef(c) = stmt {
-                if let Some(b) = self.unmodelled_base(c) {
-                    self.found = Some(b);
+                if let Some(reason) = self.unmodelled_base(c).filter(|_| !self.collect) {
+                    self.found = Some(reason);
                     return;
                 }
+            }
+            if let Stmt::FunctionDef(f) = stmt {
+                self.params
+                    .push(f.parameters.iter().map(|p| p.name().to_string()).collect());
             }
             let scope = matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_));
             let branch = matches!(
@@ -1236,16 +1285,23 @@ pub fn module_subclassed_builtin(module: &ruff_python_ast::ModModule) -> Option<
             visitor::walk_stmt(self, stmt);
             self.depth -= usize::from(scope);
             self.branch -= usize::from(branch);
+            if matches!(stmt, Stmt::FunctionDef(_)) {
+                self.params.pop();
+            }
             // After the body, so a class's own bases see the names before it.
             self.bind(stmt);
         }
     }
-    let mut scan = Scan::default();
+    let mut scan = Scan {
+        project: project_aliases.clone(),
+        collect,
+        ..Default::default()
+    };
     // `enum.Enum` without an import still names the module in a
     // Typhon-lowered `enum` declaration.
     scan.enum_modules.insert("enum".to_owned());
     scan.visit_body(&module.body);
-    scan.found
+    (scan.found, scan.builtin)
 }
 
 /// Whether `module` defines a generator whose `yield` sits where the

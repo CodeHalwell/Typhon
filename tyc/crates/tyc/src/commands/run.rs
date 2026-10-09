@@ -500,6 +500,14 @@ fn unmodelled_references(path: &std::path::Path, entry: &std::path::Path) -> Opt
     }
     let mut missing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut exports = ModelledExports::default();
+    // Builtin aliases any project module binds (`Alias = list`), so a class
+    // over one imported from a sibling falls back too.
+    let mut project_aliases = std::collections::HashMap::new();
+    for file in &files {
+        if let Some(module) = parse_for_scan(file) {
+            project_aliases.extend(tyc_vm::module_builtin_aliases(&module));
+        }
+    }
     for file in &files {
         let Some(module) = parse_for_scan(file) else {
             // Falling back to the compiled path is the safe answer for a
@@ -509,8 +517,8 @@ fn unmodelled_references(path: &std::path::Path, entry: &std::path::Path) -> Opt
             continue;
         };
         missing.extend(unmodelled_attribute_references(&module, &mut exports));
-        if let Some(base) = tyc_vm::module_subclassed_builtin(&module) {
-            missing.insert(format!("a subclass of the builtin {base}"));
+        if let Some(reason) = tyc_vm::module_subclassed_builtin(&module, &project_aliases) {
+            missing.insert(reason);
         }
         if tyc_vm::module_has_eager_generator(&module) {
             missing.insert("a generator whose yield the VM cannot suspend".into());
@@ -1689,6 +1697,28 @@ mod tests {
             "from enum import Enum\nEnum = object\nplain class L(list, Enum):\n    pass\nprint(L())\n",
         ] {
             assert!(scan_source(src).is_some(), "{src}");
+        }
+        // A class factory's base may be handed a builtin.
+        let factory = "def make(Base: type) -> type:\n    plain class L(Base):\n        pass\n    return L\nprint(make(list))\n";
+        assert_eq!(
+            scan_source(factory),
+            Some(vec!["a class whose base is the parameter Base".to_owned()])
+        );
+        // An alias a sibling module exports, imported or reached through it.
+        for main in [
+            "from helper import Alias\nplain class L(Alias):\n    pass\nprint(L())\n",
+            "import helper\nplain class L(helper.Alias):\n    pass\nprint(L())\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("helper.ty"), "Alias = list\n").unwrap();
+            let entry = dir.path().join("main.ty");
+            std::fs::write(&entry, main).unwrap();
+            assert!(
+                unmodelled_references(&entry, &entry)
+                    .unwrap_or_default()
+                    .contains(&"a subclass of the builtin list".to_owned()),
+                "{main}"
+            );
         }
         // An alias of an enum base is one.
         let enum_alias =
