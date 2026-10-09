@@ -3485,7 +3485,10 @@ fn make_module(name: &str, entries: Vec<(&str, Value)>) -> Value {
             // Only a native made for this module, not one it imported
             // (`random`'s shim binds `math.sqrt` as `_sqrt`), so a C
             // builtin it re-exports keeps its own type.
-            let own = k == n.name && !k.starts_with('_');
+            // A native may carry its qualified name (`dataclasses.replace`).
+            let own = !k.starts_with('_')
+                && (k == n.name
+                    || n.name.strip_prefix(name).and_then(|r| r.strip_prefix('.')) == Some(k));
             if (python_functions || py_in_c)
                 && own
                 && !c_function

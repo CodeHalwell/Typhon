@@ -1103,7 +1103,10 @@ pub fn module_subclassed_builtin(module: &ruff_python_ast::ModModule) -> Option<
                 return (on_builtins && VALUE_TYPES.contains(&attr)).then(|| attr.to_owned());
             }
             let Expr::Name(n) = base else { return None };
-            let name = n.id.as_str();
+            self.name_builtin(n.id.as_str())
+        }
+        /// The builtin value type `name` stands for, directly or as an alias.
+        fn name_builtin(&self, name: &str) -> Option<String> {
             self.builtin
                 .get(name)
                 .cloned()
@@ -1163,12 +1166,7 @@ pub fn module_subclassed_builtin(module: &ruff_python_ast::ModModule) -> Option<
                         Expr::Name(v) => Some(v.id.as_str()),
                         _ => None,
                     };
-                    let builtin = value.and_then(|v| {
-                        self.builtin
-                            .get(v)
-                            .cloned()
-                            .or_else(|| VALUE_TYPES.contains(&v).then(|| v.to_owned()))
-                    });
+                    let builtin = value.and_then(|v| self.name_builtin(v));
                     let enum_base = value.is_some_and(|v| self.enum_bases.contains(v));
                     for target in &a.targets {
                         if let Expr::Name(t) = target {
@@ -1185,7 +1183,15 @@ pub fn module_subclassed_builtin(module: &ruff_python_ast::ModModule) -> Option<
                 }
                 Stmt::AnnAssign(a) => {
                     if let Expr::Name(t) = a.target.as_ref() {
-                        self.unbind(t.id.as_str());
+                        let builtin = match a.value.as_deref() {
+                            Some(Expr::Name(v)) => self.name_builtin(v.id.as_str()),
+                            _ => None,
+                        };
+                        let t = t.id.as_str();
+                        self.unbind(t);
+                        if let Some(b) = builtin {
+                            self.builtin.insert(t.to_owned(), b);
+                        }
                     }
                 }
                 Stmt::FunctionDef(f) => self.unbind(f.name.as_str()),

@@ -1662,6 +1662,8 @@ mod tests {
             scan_source(alias),
             Some(vec!["a subclass of the builtin list".to_owned()])
         );
+        let annotated = "Alias: type = list\nplain class L(Alias):\n    pass\nprint(L())\n";
+        assert!(scan_source(annotated).is_some());
         let imported = "from builtins import dict as D\nplain class M(D):\n    pass\nprint(M())\n";
         assert!(scan_source(imported).is_some());
         // An enum mixin the VM does not model still falls back.
