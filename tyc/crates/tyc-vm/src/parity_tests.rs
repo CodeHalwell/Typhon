@@ -2431,6 +2431,66 @@ show(hasattr(list, "nope"), hasattr(list, "append"), hasattr(dict, "__deepcopy__
 }
 
 #[test]
+fn builtin_callables_introspect_like_cpython() {
+    assert_matches_cpython(
+        "builtin_callables_introspect_like_cpython",
+        r#"from collections import defaultdict
+import math
+xs = [3, 1]
+def f():
+    pass
+class K:
+    def m(self):
+        pass
+show(type(len).__name__, type(math.sqrt).__name__, type(f).__name__, type(K().m).__name__)
+show(type(list.append).__name__, type(xs.append).__name__, type(int).__name__, type(ValueError).__name__)
+show(repr(len), repr(list.append), repr(str.upper), repr(dict.get))
+show(repr(xs.append).startswith("<built-in method append of list object at 0x"))
+show(list.append.__name__, list.append.__qualname__, xs.sort.__name__, xs.sort.__qualname__)
+show(xs.append.__self__ is xs, list.append.__objclass__ is list)
+show(repr(defaultdict), type(defaultdict).__name__, repr(int), repr(ValueError))
+show(type(bool.bit_count).__name__, bool.bit_count.__qualname__, repr(bool.bit_count), True.bit_count.__qualname__)
+show(type(str.maketrans).__name__, str.maketrans.__qualname__, str.maketrans.__self__)
+show(dict.fromkeys.__self__ is dict, type(dict.fromkeys).__name__, dict.fromkeys.__qualname__, repr(dict.fromkeys).startswith("<built-in method fromkeys of type object at 0x"))
+show(int.from_bytes.__qualname__, float.fromhex.__self__ is float, bytes.fromhex.__name__)
+import json
+import functools
+import dataclasses
+import heapq
+import random
+show(type(random.random).__name__, type(random.getrandbits).__name__, type(random.randint).__name__, random.choice.__qualname__, repr(random.shuffle).startswith("<bound method Random.shuffle of <random.Random object at 0x"))
+show(type(heapq.nsmallest).__name__, type(heapq.heappush).__name__, type(list.__class_getitem__).__name__, list.__class_getitem__.__self__ is list)
+show(type(json.dumps).__name__, type(dataclasses.field).__name__, type(dataclasses.replace).__name__, type(functools.reduce).__name__, type(functools.wraps).__name__, repr(json.dumps).startswith("<function dumps at 0x"))
+import contextlib
+@contextlib.contextmanager
+def cm():
+    yield 1
+@functools.lru_cache(maxsize=4)
+def cached(x):
+    return x
+show(type(cm).__name__, type(functools.lru_cache(4)).__name__, cached(2))
+show(type(list.__len__).__name__, repr(list.__len__), type(xs.__len__).__name__, type(list.__getitem__).__name__, type(dict.__contains__).__name__, repr(str.__add__))
+show(repr(xs.__len__).startswith("<method-wrapper '__len__' of list object at 0x"), repr(dataclasses.replace).startswith("<function replace at 0x"))
+show(repr(str.__init__), str.__init__.__qualname__, str.__init__.__objclass__ is object, repr(list.__str__), list.__format__.__qualname__, xs.__str__.__qualname__, xs.__init__.__qualname__, xs.__format__.__qualname__)
+show(True.bit_count.__qualname__, True.__add__.__qualname__, True.__and__.__qualname__, repr(list.__eq__))
+show(dataclasses.replace.__name__, dataclasses.replace.__qualname__, json.dumps.__name__, isinstance(functools.partial, type), isinstance(functools.cached_property, type), isinstance(len, type))
+import asyncio
+show(type(asyncio.Queue).__name__, isinstance(asyncio.Queue, type), repr(asyncio.Lock), repr(asyncio.TaskGroup), repr(asyncio.Event), repr(asyncio.Semaphore), repr(asyncio.BoundedSemaphore), repr(asyncio.Queue))
+import json
+import functools
+show(type(json.dumps).__name__, type(functools.reduce).__name__, type(functools.wraps).__name__, type(functools.partial).__name__, repr(functools.partial), type(functools.cached_property).__name__, repr(functools.cached_property))
+sort = xs.sort
+sort()
+show(xs, list.append(xs, 4), xs, str.upper("a"))
+try:
+    len[0]
+except TypeError as e:
+    show(str(e))
+"#,
+    );
+}
+
+#[test]
 fn builtin_type_objects_are_the_builtins() {
     assert_matches_cpython(
         "builtin_type_objects_are_the_builtins",

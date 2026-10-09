@@ -2409,6 +2409,8 @@ pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
             is_builtin_type_name(n.name)
                 || crate::interp::builtin_exc_mro(n.name).is_some()
                 || is_shim_constructor_name(n.name)
+                // `functools.partial`, `enum.auto`, …: what `type()` calls a type.
+                || crate::value::native_is_type(n.name)
         }
         ("int", Value::Int(_)) => true,
         // `bool` is a subclass of `int` in CPython, so `isinstance(True, int)`
@@ -3454,9 +3456,204 @@ pub(crate) fn module_dir_names(m: &Module) -> std::collections::BTreeSet<String>
     names
 }
 
+/// The exports of each modelled module that CPython 3.13 writes in Python
+/// (`type(json.dumps)` is `function`), so the natives standing in for them
+/// report `function` too. Anything else a module exports is a C builtin
+/// (`os.getcwd`, `functools.reduce`) or a class.
+const PY_FUNCTIONS: &[(&str, &[&str])] = &[
+    ("abc", &["abstractmethod", "update_abstractmethods"]),
+    (
+        "asyncio",
+        &[
+            "create_task",
+            "gather",
+            "run",
+            "sleep",
+            "timeout",
+            "to_thread",
+            "wait_for",
+        ],
+    ),
+    ("collections", &["namedtuple"]),
+    ("contextlib", &["asynccontextmanager", "contextmanager"]),
+    ("copy", &["copy", "deepcopy", "replace"]),
+    (
+        "dataclasses",
+        &[
+            "asdict",
+            "astuple",
+            "dataclass",
+            "field",
+            "fields",
+            "is_dataclass",
+            "replace",
+        ],
+    ),
+    (
+        "functools",
+        &[
+            "cache",
+            "lru_cache",
+            "singledispatch",
+            "total_ordering",
+            "update_wrapper",
+            "wraps",
+        ],
+    ),
+    ("glob", &["escape", "glob", "has_magic", "iglob"]),
+    ("hashlib", &["file_digest", "new"]),
+    ("heapq", &["merge", "nlargest", "nsmallest"]),
+    ("json", &["dump", "dumps", "load", "loads"]),
+    (
+        "os",
+        &[
+            "fdopen",
+            "fsdecode",
+            "fsencode",
+            "getenv",
+            "makedirs",
+            "process_cpu_count",
+            "removedirs",
+            "renames",
+            "walk",
+        ],
+    ),
+    (
+        "os.path",
+        &[
+            "abspath",
+            "basename",
+            "commonpath",
+            "commonprefix",
+            "dirname",
+            "exists",
+            "expanduser",
+            "expandvars",
+            "getatime",
+            "getctime",
+            "getmtime",
+            "getsize",
+            "isabs",
+            "isdevdrive",
+            "isdir",
+            "isfile",
+            "isjunction",
+            "islink",
+            "ismount",
+            "join",
+            "lexists",
+            "normcase",
+            "realpath",
+            "relpath",
+            "samefile",
+            "samestat",
+            "split",
+            "splitdrive",
+            "splitext",
+        ],
+    ),
+    (
+        "re",
+        &[
+            "compile",
+            "escape",
+            "findall",
+            "finditer",
+            "fullmatch",
+            "match",
+            "search",
+            "split",
+            "sub",
+            "subn",
+        ],
+    ),
+    (
+        "shutil",
+        &[
+            "chown",
+            "copy",
+            "copy2",
+            "copyfile",
+            "copyfileobj",
+            "copymode",
+            "copystat",
+            "copytree",
+            "disk_usage",
+            "get_terminal_size",
+            "ignore_patterns",
+            "move",
+            "rmtree",
+            "which",
+        ],
+    ),
+    ("string", &["capwords"]),
+    (
+        "tempfile",
+        &[
+            "NamedTemporaryFile",
+            "TemporaryFile",
+            "gettempdir",
+            "gettempdirb",
+            "gettempprefix",
+            "mkdtemp",
+            "mkstemp",
+            "mktemp",
+        ],
+    ),
+    (
+        "typing",
+        &[
+            "NamedTuple",
+            "TypedDict",
+            "cast",
+            "dataclass_transform",
+            "final",
+            "get_args",
+            "get_origin",
+            "no_type_check",
+            "overload",
+            "override",
+            "runtime_checkable",
+        ],
+    ),
+];
+
+/// Whether CPython writes `module.name` in Python, per [`PY_FUNCTIONS`].
+fn is_python_function(module: &str, name: &str) -> bool {
+    PY_FUNCTIONS
+        .iter()
+        .any(|(m, names)| *m == module && names.contains(&name))
+}
+
 fn make_module(name: &str, entries: Vec<(&str, Value)>) -> Value {
     let mut map = HashMap::new();
     for (k, v) in entries {
+        if let Value::Native(n) = &v {
+            // Only a native made for this module, not one it imported
+            // (`random`'s shim binds `math.sqrt` as `_sqrt`), so a C
+            // builtin it re-exports keeps its own type.
+            // A native may carry its qualified name (`dataclasses.replace`).
+            let own = !k.starts_with('_')
+                && (k == n.name
+                    || n.name.strip_prefix(name).and_then(|r| r.strip_prefix('.')) == Some(k));
+            if own
+                && is_python_function(name, k)
+                && n.method.is_none()
+                && !crate::value::native_is_type(n.name)
+            {
+                n.py_function.set(true);
+            }
+            // `random`'s exports are methods of its hidden `Random()`,
+            // bar the two C ones.
+            if name == "random"
+                && own
+                && n.method.is_none()
+                && !matches!(k, "random" | "getrandbits")
+                && !crate::value::native_is_type(n.name)
+            {
+                n.py_method_of.set(Some("Random"));
+            }
+        }
         map.insert(k.to_owned(), v);
     }
     Value::Module(Rc::new(Module {
@@ -9536,20 +9733,19 @@ fn make_contextlib_module(interp: &mut Interpreter) -> Value {
     // exactly as under CPython's `contextlib._GeneratorContextManager`.
     let contextmanager = nf("contextmanager", |_i, args| {
         let func = args.into_iter().next().unwrap_or(Value::None);
-        Ok(Value::Native(Rc::new(NativeFn::new(
-            "contextmanager_factory",
-            move |i, call_args| {
+        Ok(Value::Native(Rc::new(
+            NativeFn::new("contextmanager_factory", move |i, call_args| {
                 let (pos, kw) = split_kwargs(&call_args);
                 let gen = i.call_value(func.clone(), pos.to_vec(), &kw)?;
                 Ok(generator_context_manager(gen))
-            },
-        ))))
+            })
+            .python_function(),
+        )))
     });
     let asynccontextmanager = nf("asynccontextmanager", |_i, args| {
         let func = args.into_iter().next().unwrap_or(Value::None);
-        Ok(Value::Native(Rc::new(NativeFn::new(
-            "asynccontextmanager_factory",
-            move |i, call_args| {
+        Ok(Value::Native(Rc::new(
+            NativeFn::new("asynccontextmanager_factory", move |i, call_args| {
                 let (pos, kw) = split_kwargs(&call_args);
                 let gen = i.call_value(func.clone(), pos.to_vec(), &kw)?;
                 // An `async def` *with* a `yield` is an async generator, and
@@ -9565,8 +9761,9 @@ fn make_contextlib_module(interp: &mut Interpreter) -> Value {
                     i.force_awaitable(gen)?
                 };
                 Ok(async_generator_context_manager(gen))
-            },
-        ))))
+            })
+            .python_function(),
+        )))
     });
     let mut entries = vec![
         ("contextmanager", contextmanager),
@@ -9774,10 +9971,9 @@ fn make_functools_module(interp: &mut Interpreter) -> Value {
             return make_cache(_i, vec![first]);
         }
         // Otherwise return a decorator that captures the configuration.
-        Ok(Value::Native(Rc::new(NativeFn::new(
-            "lru_cache_inner",
-            make_cache,
-        ))))
+        Ok(Value::Native(Rc::new(
+            NativeFn::new("lru_cache_inner", make_cache).python_function(),
+        )))
     });
     let reduce = nf("reduce", |i, mut args| {
         if args.len() < 2 {
@@ -9893,10 +10089,12 @@ fn make_dataclasses_module() -> Value {
                 return Ok(v.clone());
             }
         }
-        Ok(Value::Native(Rc::new(NativeFn::new(
-            "dataclass_inner",
-            |_i, args| Ok(args.into_iter().next().unwrap_or(Value::None)),
-        ))))
+        Ok(Value::Native(Rc::new(
+            NativeFn::new("dataclass_inner", |_i, args| {
+                Ok(args.into_iter().next().unwrap_or(Value::None))
+            })
+            .python_function(),
+        )))
     });
     let field = nf("field", |_i, args| {
         // Approximate signature: `field(default=…, default_factory=…)`.

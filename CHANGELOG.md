@@ -16,6 +16,79 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ### Fixed
 
+- **Builtin callables introspect like CPython's under `tyc run`.**
+  `type(len)` and `type([].append)` are `builtin_function_or_method`,
+  `type(list.append)` is `method_descriptor`, a bound method is `method`
+  and `type(int)` is `type` (all were `function`). `repr(list.append)` is
+  `<method 'append' of 'list' objects>` and `repr([].append)`
+  `<built-in method append of list object at 0x…>`; builtin methods carry
+  their `__name__`, `__qualname__`, `__self__` and `__objclass__`
+  (`bool.bit_count` is `int`'s, `str.maketrans.__self__` is `None` and
+  `dict.fromkeys.__self__` is `dict`).
+  `repr(defaultdict)` is `<class 'collections.defaultdict'>`. A native
+  standing in for a function CPython writes in Python (`json.dumps`,
+  `dataclasses.field`, taken from a per-export table of CPython 3.13) stays
+  a `function` named without its module (`dataclasses.replace.__name__`
+  is `replace`), and `random`'s exports are
+  methods of its hidden `Random()` as in CPython (`random.randint` is a
+  `method` named `Random.randint`; `random.random` a builtin).
+  `@contextmanager` and `lru_cache(n)` return a `function`, and
+  `functools.partial` / `cached_property` and `asyncio`'s `Queue`,
+  `TaskGroup`, `Lock`, `Event`, `Semaphore` and `BoundedSemaphore` are
+  classes (and `type` instances to `isinstance`, printing as
+  `<class 'asyncio.locks.Lock'>`)
+  (`<class 'functools.partial'>`).
+  Slot methods are slot wrappers: `type(list.__len__)` is
+  `wrapper_descriptor` (`<slot wrapper '__len__' of 'list' objects>`) and
+  `[].__len__` a `method-wrapper`; an inherited slot names the type that
+  defines it (`str.__init__` is `<slot wrapper '__init__' of 'object'
+  objects>`, `True.__add__.__qualname__` is `int.__add__`).
+- **A `plain class` with a builtin or imported base takes that base's
+  constructor arguments.** `plain class Boom(Exception): pass` followed by
+  `raise Boom("x")` was rejected with "expected 0, got 1", as were
+  `bytes` and `range` bases: the zero-argument rule for a `plain class`
+  without an `__init__` now applies only when every ancestor is a class
+  of the project or `object` (through a module alias such as
+  `Alias = Parent` too, when the module binds neither name anywhere else,
+  and never for a local class whose name the module also rebinds; an
+  `object` base counts unless the module's own namespace rebinds `object`,
+  including from a definition header, a lambda default or a store under
+  `global object` (the bare declaration rebinds nothing),
+  and a module with a `from … import *` is never treated as local-only).
+- **A subclass of a builtin value type runs on CPython.** The VM models
+  `list`, `int`, `str` and the other value types as values, not classes
+  (and `enumerate`, `zip`, `property`, `classmethod`, `super`, `type` and
+  the like as natives),
+  so `class L(list)` built an empty object (`L([1, 2])` raised
+  `TypeError` and `class S(str)` printed as an object). `tyc run`'s
+  pre-run scan now sends such a program down the compiled path, as it
+  does a custom metaclass, seeing through aliases (`Alias = list`,
+  `builtins.list`) and parameterised bases (`list[int]`).
+  Enums with a `str`, `int`, `float`, `bytes` or `complex` mixin stay on
+  the VM; any other mixin (`class E(list, Enum)`) falls back too. The
+  scan errs towards CPython: a builtin alias counts in any scope or
+  branch, while an enum base exempts a class only when bound
+  unconditionally at module scope and not rebound since.
+  An alias exported by a sibling module (`from helper import Alias`, even
+  through a chain of re-exports), a class factory's parameter base
+  (`def make(Base: type)` with `class L(Base)`), a base computed at
+  runtime (`class L(choose())`, `class L(h.base)`, or a name the module
+  binds anywhere other than by a `class`, an import or an alias of one,
+  so `Base = choose()`, `for Base in …`, `case [Base]:`, a walrus,
+  an attribute of a class or module the program assigns to
+  (`Holder.Base = list`, `setattr`, also through `Alias = Holder`), a
+  data attribute of a class (`Holder.Base`, `Holder.box.Base`; nested
+  classes such as `Outer.Mid.Inner` are trusted), data below a project
+  module (`helper.box.Base`; `collections.abc.Iterable` and other modules
+  the VM models are trusted), a class with a decorator that may replace
+  it (`@dataclass`, `@total_ordering`, `@final` and the like keep it) and a
+  sibling module's computed alias all count, including one it binds in a
+  definition header or under `global`) and a `defaultdict`,
+  `functools.partial`, `functools.cached_property`, `enum.auto`,
+  `typing.NewType`, `frozendict` or `sentinel` base fall back too, as do `bool`, `range`,
+  `slice` and `memoryview` bases, which CPython rejects. When two modules
+  export one alias name for different builtins, the scan assumes the one
+  that keeps the class off the VM.
 - **A `plain class` is called with its own `__init__`'s arguments.** A
   `plain class` (or a `class!` with a hand-written `__init__`) that also
   declared annotated fields had its call arguments type-checked against

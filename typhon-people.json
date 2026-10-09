@@ -1,0 +1,37 @@
+{
+  "people": [
+    {
+      "name": "Ada Lovelace",
+      "age": 36,
+      "email": "ada@example.com",
+      "address": {
+        "street": "1 Babbage Ln",
+        "city": "London",
+        "country": "UK"
+      },
+      "tags": [
+        "pioneer",
+        "mathematician"
+      ]
+    },
+    {
+      "name": "Linus Torvalds",
+      "age": 55,
+      "email": "linus@kernel.org",
+      "address": {
+        "street": "2 Penguin Rd",
+        "city": "Portland",
+        "country": "US"
+      },
+      "tags": [
+        "kernel"
+      ]
+    },
+    {
+      "name": "Kid Genius",
+      "age": 12,
+      "email": "kid@example.com",
+      "address": null
+    }
+  ]
+}

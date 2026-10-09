@@ -8574,6 +8574,61 @@ impl Interpreter {
                 let class = crate::builtins::shim_class_for_constructor(self, n.name)?;
                 self.get_attr(&class, attr)
             }
+            // A builtin method: `list.append.__name__` is `append`, its
+            // `__qualname__` `list.append`, and `[].append.__self__` the list.
+            Value::Native(n) if n.method.is_some() && attr == "__name__" => {
+                let m = n.method.as_ref().expect("checked by the guard");
+                Ok(Value::Str(self.intern_str(&m.attr)))
+            }
+            Value::Native(n) if n.method.is_some() && attr == "__qualname__" => {
+                let m = n.method.as_ref().expect("checked by the guard");
+                Ok(Value::Str(Rc::new(format!("{}.{}", m.owner, m.attr))))
+            }
+            // `list.append.__objclass__` is `list`.
+            Value::Native(n)
+                if attr == "__objclass__"
+                    && matches!(
+                        &n.method,
+                        Some(m) if matches!(m.binding, crate::value::MethodBinding::Unbound)
+                    ) =>
+            {
+                let m = n.method.as_ref().expect("checked by the guard");
+                Ok(self
+                    .builtin_global(m.owner)
+                    .cloned()
+                    .unwrap_or_else(|| crate::builtins::make_builtin_type(m.owner)))
+            }
+            // `[].append.__self__` is the list, `dict.fromkeys.__self__`
+            // the type and `str.maketrans.__self__` `None`.
+            Value::Native(n)
+                if attr == "__self__"
+                    && matches!(
+                        &n.method,
+                        Some(m) if !matches!(m.binding, crate::value::MethodBinding::Unbound)
+                    ) =>
+            {
+                let m = n.method.as_ref().expect("checked by the guard");
+                Ok(match &m.binding {
+                    crate::value::MethodBinding::Bound(r) => r.clone(),
+                    crate::value::MethodBinding::OnType { classmethod: true } => self
+                        .builtin_global(m.owner)
+                        .cloned()
+                        .unwrap_or_else(|| crate::builtins::make_builtin_type(m.owner)),
+                    _ => Value::None,
+                })
+            }
+            Value::Native(n) if attr == "__qualname__" && n.py_method_of.get().is_some() => {
+                let class = n.py_method_of.get().unwrap_or_default();
+                Ok(Value::Str(Rc::from(format!("{class}.{}", n.name))))
+            }
+            // A Python function carries its qualified name
+            // (`dataclasses.replace`); CPython names it `replace`.
+            Value::Native(n)
+                if (attr == "__name__" || attr == "__qualname__") && n.py_function.get() =>
+            {
+                let name = n.name.rsplit('.').next().unwrap_or(n.name);
+                Ok(Value::Str(self.intern_str(name)))
+            }
             Value::Native(n) if attr == "__name__" || attr == "__qualname__" => {
                 Ok(Value::Str(self.intern_str(n.name)))
             }
@@ -8708,10 +8763,26 @@ impl Interpreter {
                 // method registry in `builtins` does the actual dispatch.
                 let r = value.clone();
                 let attr_name: Rc<str> = Rc::from(attr);
+                // A bound builtin method is named for its receiver's type
+                // (`True.bit_count.__qualname__` is `bool.bit_count`), a
+                // bound slot for the type defining it (`[].__str__` is
+                // `object.__str__`).
+                let defining = crate::value::builtin_attr_owner(value.type_name(), attr);
+                let owner = if crate::value::is_slot_attr(defining, attr) {
+                    defining
+                } else {
+                    value.type_name()
+                };
+                let (tag, receiver) = (attr_name.clone(), value.clone());
                 let nf = NativeFn::new("method", move |interp, mut args| {
                     args.insert(0, r.clone());
                     crate::builtins::dispatch_method(interp, &attr_name, args)
-                });
+                })
+                .with_method(
+                    owner,
+                    tag,
+                    crate::value::MethodBinding::Bound(receiver),
+                );
                 Ok(Value::Native(Rc::new(nf)))
             }
             // Static / class methods on builtin type objects. The generic
@@ -8719,21 +8790,42 @@ impl Interpreter {
             // which is wrong for these: `dict.fromkeys(iterable, v)` and
             // `str.maketrans(a, b)` take their arguments as data, not as the
             // value the method runs on. Intercept them before the fallthrough.
-            Value::Native(nf) if nf.name == "dict" && attr == "fromkeys" => Ok(Value::Native(
-                Rc::new(NativeFn::new("dict.fromkeys", |interp, args| {
-                    crate::builtins::dict_fromkeys(interp, args)
-                })),
-            )),
-            Value::Native(nf) if nf.name == "str" && attr == "maketrans" => Ok(Value::Native(
-                Rc::new(NativeFn::new("str.maketrans", |_interp, args| {
-                    crate::builtins::str_maketrans(&args)
-                })),
-            )),
-            Value::Native(nf) if nf.name == "bytes" && attr == "maketrans" => Ok(Value::Native(
-                Rc::new(NativeFn::new("bytes.maketrans", |_interp, args| {
-                    crate::builtins::bytes_maketrans(&args)
-                })),
-            )),
+            Value::Native(nf) if nf.name == "dict" && attr == "fromkeys" => {
+                Ok(Value::Native(Rc::new(
+                    NativeFn::new("dict.fromkeys", |interp, args| {
+                        crate::builtins::dict_fromkeys(interp, args)
+                    })
+                    .with_method(
+                        "dict",
+                        Rc::from("fromkeys"),
+                        crate::value::MethodBinding::OnType { classmethod: true },
+                    ),
+                )))
+            }
+            Value::Native(nf) if nf.name == "str" && attr == "maketrans" => {
+                Ok(Value::Native(Rc::new(
+                    NativeFn::new("str.maketrans", |_interp, args| {
+                        crate::builtins::str_maketrans(&args)
+                    })
+                    .with_method(
+                        "str",
+                        Rc::from("maketrans"),
+                        crate::value::MethodBinding::OnType { classmethod: false },
+                    ),
+                )))
+            }
+            Value::Native(nf) if nf.name == "bytes" && attr == "maketrans" => {
+                Ok(Value::Native(Rc::new(
+                    NativeFn::new("bytes.maketrans", |_interp, args| {
+                        crate::builtins::bytes_maketrans(&args)
+                    })
+                    .with_method(
+                        "bytes",
+                        Rc::from("maketrans"),
+                        crate::value::MethodBinding::OnType { classmethod: false },
+                    ),
+                )))
+            }
             // Unbound builtin-type methods: `str.strip(x)`, `list.append(xs, v)`,
             // `dict.get(d, k)`. The type constructors are registered as natives
             // named after the type; accessing a method on one yields a function
@@ -8756,6 +8848,13 @@ impl Interpreter {
                     )));
                 }
                 let attr_name: Rc<str> = Rc::from(attr);
+                let tag = attr_name.clone();
+                // `list.__class_getitem__` is a class method: bound to `list`.
+                let binding = if class_only {
+                    crate::value::MethodBinding::OnType { classmethod: true }
+                } else {
+                    crate::value::MethodBinding::Unbound
+                };
                 let m = NativeFn::new("method", move |interp, args| {
                     if args.is_empty() {
                         return Err(type_error(format!(
@@ -8765,6 +8864,13 @@ impl Interpreter {
                     }
                     crate::builtins::dispatch_method(interp, &attr_name, args)
                 });
+                // `str.__init__` is `object.__init__`.
+                let owner = if class_only {
+                    nf.name
+                } else {
+                    crate::value::builtin_attr_owner(nf.name, attr)
+                };
+                let m = m.with_method(owner, tag, binding);
                 Ok(Value::Native(Rc::new(m)))
             }
             // Generator objects and other iterators: the iterator protocol
@@ -11820,6 +11926,27 @@ fn scale_pow2(mut m: f64, mut k: i32) -> f64 {
 }
 
 fn builtin_type_method(ty: &'static str, attr: &str) -> Option<Value> {
+    let mut method = builtin_type_method_untagged(ty, attr)?;
+    // The static / class methods (`str.maketrans`, `dict.fromkeys`) come
+    // back untagged; they are bound to the type.
+    if let Value::Native(n) = &mut method {
+        if let Some(n) = Rc::get_mut(n) {
+            if n.method.is_none() {
+                let binding = crate::value::MethodBinding::OnType {
+                    classmethod: attr != "maketrans",
+                };
+                n.method = Some(crate::value::NativeMethod {
+                    owner: ty,
+                    attr: Rc::from(attr),
+                    binding,
+                });
+            }
+        }
+    }
+    Some(method)
+}
+
+fn builtin_type_method_untagged(ty: &'static str, attr: &str) -> Option<Value> {
     // Static / class methods take their arguments as data, not as the
     // receiver the unbound-method form below would make of the first one.
     match (ty, attr) {
@@ -11964,10 +12091,17 @@ fn builtin_type_method(ty: &'static str, attr: &str) -> Option<Value> {
         return None;
     }
     let method = intern_method_name(attr);
-    Some(Value::Native(Rc::new(NativeFn::new(
-        method,
-        move |i, args| crate::builtins::dispatch_method(i, method, args),
-    ))))
+    Some(Value::Native(Rc::new(
+        NativeFn::new(method, move |i, args| {
+            crate::builtins::dispatch_method(i, method, args)
+        })
+        // `bool.bit_count` is `int`'s descriptor.
+        .with_method(
+            if ty == "bool" { "int" } else { ty },
+            Rc::from(attr),
+            crate::value::MethodBinding::Unbound,
+        ),
+    )))
 }
 
 /// [`builtin_has_attr`] for the method dispatcher in `builtins`.

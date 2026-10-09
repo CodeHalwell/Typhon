@@ -775,55 +775,321 @@ pub fn native_repr(name: &str) -> String {
     if name == "NotImplemented" {
         return name.to_owned();
     }
-    let is_type = matches!(
-        name,
-        "int"
-            | "float"
-            | "str"
-            | "bool"
-            | "list"
-            | "dict"
-            | "set"
-            | "frozenset"
-            | "tuple"
-            | "bytes"
-            | "bytearray"
-            | "object"
-            | "type"
-            | "range"
-            | "complex"
-            | "slice"
-            | "memoryview"
-            | "enumerate"
-            | "zip"
-            | "map"
-            | "filter"
-            | "reversed"
-            | "property"
-            | "staticmethod"
-            | "classmethod"
-            | "super"
-            | "BaseException"
-            | "KeyboardInterrupt"
-            | "SystemExit"
-            | "GeneratorExit"
-            | "StopIteration"
-            | "StopAsyncIteration"
-            | "ExceptionGroup"
-            | "BaseExceptionGroup"
-    ) || name.ends_with("Error")
-        || name.ends_with("Exception")
-        || name.ends_with("Warning");
-    if is_type {
+    // Standard-library classes the VM models as natives print with the
+    // module that defines them.
+    if let Some((_, qualified)) = STDLIB_NATIVE_CLASSES.iter().find(|(n, _)| *n == name) {
+        return format!("<class '{qualified}'>");
+    }
+    if native_is_type(name) {
         return format!("<class '{name}'>");
     }
-    // Two prelude names the VM models as natives are *classes* in CPython,
-    // and print with the module that defines them.
-    match name {
-        "enum.auto" => "<class 'enum.auto'>".to_owned(),
-        "NewType" => "<class 'typing.NewType'>".to_owned(),
-        _ => format!("<built-in function {name}>"),
+    format!("<built-in function {name}>")
+}
+
+/// Standard-library classes the VM builds as natives, by native name, with
+/// the qualified name CPython prints.
+const STDLIB_NATIVE_CLASSES: &[(&str, &str)] = &[
+    ("enum.auto", "enum.auto"),
+    ("NewType", "typing.NewType"),
+    ("defaultdict", "collections.defaultdict"),
+    ("partial", "functools.partial"),
+    ("cached_property", "functools.cached_property"),
+    ("Queue", "asyncio.queues.Queue"),
+    ("TaskGroup", "asyncio.taskgroups.TaskGroup"),
+    ("Lock", "asyncio.locks.Lock"),
+    ("Event", "asyncio.locks.Event"),
+    ("Semaphore", "asyncio.locks.Semaphore"),
+    ("BoundedSemaphore", "asyncio.locks.BoundedSemaphore"),
+];
+
+/// `repr()` of any native: a builtin method (`list.append`, `[].append`)
+/// prints the way CPython's descriptors do, everything else as
+/// [`native_repr`].
+pub fn native_value_repr(n: &NativeFn) -> String {
+    let addr = |v: Option<&Value>| {
+        v.and_then(heap_addr)
+            .unwrap_or(n as *const NativeFn as usize)
+    };
+    match &n.method {
+        Some(m) if is_slot_wrapper(m) => match &m.binding {
+            MethodBinding::Unbound => {
+                format!("<slot wrapper '{}' of '{}' objects>", m.attr, m.owner)
+            }
+            MethodBinding::Bound(r) => format!(
+                "<method-wrapper '{}' of {} object at {:#x}>",
+                m.attr,
+                r.type_name(),
+                addr(Some(r))
+            ),
+            MethodBinding::OnType { .. } => format!(
+                "<method-wrapper '{}' of type object at {:#x}>",
+                m.attr,
+                addr(None)
+            ),
+        },
+        Some(m) => match &m.binding {
+            MethodBinding::Unbound => format!("<method '{}' of '{}' objects>", m.attr, m.owner),
+            MethodBinding::Bound(r) => format!(
+                "<built-in method {} of {} object at {:#x}>",
+                m.attr,
+                r.type_name(),
+                addr(Some(r))
+            ),
+            MethodBinding::OnType { .. } => format!(
+                "<built-in method {} of type object at {:#x}>",
+                m.attr,
+                addr(None)
+            ),
+        },
+        None if n.py_method_of.get().is_some() => {
+            let class = n.py_method_of.get().unwrap_or_default();
+            format!(
+                "<bound method {class}.{} of <{}.{class} object at {:#x}>>",
+                n.name,
+                class.to_lowercase(),
+                addr(None)
+            )
+        }
+        // `dataclasses.replace` is `<function replace at …>`.
+        None if n.py_function.get() => format!(
+            "<function {} at {:#x}>",
+            n.name.rsplit('.').next().unwrap_or(n.name),
+            addr(None)
+        ),
+        None => native_repr(n.name),
     }
+}
+
+/// Whether CPython implements builtin method `m` as a type slot, so it is a
+/// `wrapper_descriptor` (`list.__len__`) and, bound, a `method-wrapper`.
+fn is_slot_wrapper(m: &NativeMethod) -> bool {
+    const SLOTS: &[&str] = &[
+        "__abs__",
+        "__add__",
+        "__and__",
+        "__bool__",
+        "__buffer__",
+        "__call__",
+        "__contains__",
+        "__delattr__",
+        "__delitem__",
+        "__divmod__",
+        "__eq__",
+        "__float__",
+        "__floordiv__",
+        "__ge__",
+        "__getattribute__",
+        "__getitem__",
+        "__gt__",
+        "__hash__",
+        "__iadd__",
+        "__iand__",
+        "__imul__",
+        "__index__",
+        "__init__",
+        "__int__",
+        "__invert__",
+        "__ior__",
+        "__isub__",
+        "__iter__",
+        "__ixor__",
+        "__le__",
+        "__len__",
+        "__lshift__",
+        "__lt__",
+        "__mod__",
+        "__mul__",
+        "__ne__",
+        "__neg__",
+        "__or__",
+        "__pos__",
+        "__pow__",
+        "__radd__",
+        "__rand__",
+        "__rdivmod__",
+        "__release_buffer__",
+        "__repr__",
+        "__rfloordiv__",
+        "__rlshift__",
+        "__rmod__",
+        "__rmul__",
+        "__ror__",
+        "__rpow__",
+        "__rrshift__",
+        "__rshift__",
+        "__rsub__",
+        "__rtruediv__",
+        "__rxor__",
+        "__setattr__",
+        "__setitem__",
+        "__str__",
+        "__sub__",
+        "__truediv__",
+        "__xor__",
+    ];
+    let attr: &str = &m.attr;
+    // Containers that define these as ordinary methods.
+    let method = match attr {
+        "__getitem__" => matches!(m.owner, "list" | "dict" | "set" | "frozenset"),
+        "__contains__" => matches!(m.owner, "dict" | "set" | "frozenset"),
+        _ => false,
+    };
+    !method && SLOTS.contains(&attr)
+}
+
+/// Whether `owner.attr` is a slot wrapper, as [`is_slot_wrapper`].
+pub fn is_slot_attr(owner: &'static str, attr: &str) -> bool {
+    is_slot_wrapper(&NativeMethod {
+        owner,
+        attr: Rc::from(attr),
+        binding: MethodBinding::Unbound,
+    })
+}
+
+/// The builtin type that defines `attr` for type `ty`, walking its MRO as
+/// CPython 3.13 does: `str.__init__` is `object.__init__` and
+/// `bool.bit_count` is `int.bit_count`.
+pub fn builtin_attr_owner(ty: &'static str, attr: &str) -> &'static str {
+    // `object.__dict__`, less `__doc__` and `__new__`.
+    const OBJECT: &[&str] = &[
+        "__class__",
+        "__delattr__",
+        "__dir__",
+        "__eq__",
+        "__format__",
+        "__ge__",
+        "__getattribute__",
+        "__getstate__",
+        "__gt__",
+        "__hash__",
+        "__init__",
+        "__init_subclass__",
+        "__le__",
+        "__lt__",
+        "__ne__",
+        "__reduce__",
+        "__reduce_ex__",
+        "__repr__",
+        "__setattr__",
+        "__sizeof__",
+        "__str__",
+        "__subclasshook__",
+    ];
+    if ty == "bool" {
+        const OWN: &[&str] = &[
+            "__and__",
+            "__invert__",
+            "__or__",
+            "__rand__",
+            "__repr__",
+            "__ror__",
+            "__rxor__",
+            "__xor__",
+        ];
+        return if OWN.contains(&attr) {
+            "bool"
+        } else {
+            builtin_attr_owner("int", attr)
+        };
+    }
+    if !OBJECT.contains(&attr) {
+        return ty;
+    }
+    // Every builtin type overrides comparison, hashing and `repr`; these are
+    // the other `object` attributes each one overrides.
+    let overrides: &[&str] = match ty {
+        "int" => &["__format__", "__getattribute__", "__sizeof__"],
+        "float" => &["__format__"],
+        "complex" => &["__format__", "__getattribute__"],
+        "str" => &["__format__", "__sizeof__", "__str__"],
+        "bytes" => &["__getattribute__", "__str__"],
+        "bytearray" => &[
+            "__getattribute__",
+            "__init__",
+            "__reduce__",
+            "__reduce_ex__",
+            "__sizeof__",
+            "__str__",
+        ],
+        "list" | "dict" => &["__getattribute__", "__init__", "__sizeof__"],
+        "tuple" => &["__getattribute__"],
+        "set" => &["__getattribute__", "__init__", "__reduce__", "__sizeof__"],
+        "frozenset" => &["__reduce__", "__sizeof__"],
+        "range" | "slice" => &["__getattribute__", "__reduce__"],
+        "NoneType" => &[],
+        _ => return ty,
+    };
+    let common = matches!(
+        attr,
+        "__eq__" | "__ne__" | "__lt__" | "__le__" | "__gt__" | "__ge__" | "__hash__" | "__repr__"
+    );
+    if common || overrides.contains(&attr) {
+        ty
+    } else {
+        "object"
+    }
+}
+
+/// The allocation behind a heap value, the address `id()` reports for it.
+fn heap_addr(v: &Value) -> Option<usize> {
+    Some(match v {
+        Value::List(l) => Rc::as_ptr(l) as usize,
+        Value::Tuple(t) => Rc::as_ptr(t) as usize,
+        Value::Dict(d) => Rc::as_ptr(d) as usize,
+        Value::Set(s) => Rc::as_ptr(s) as usize,
+        Value::Str(s) => Rc::as_ptr(s) as usize,
+        Value::Bytes(b) => Rc::as_ptr(b) as usize,
+        Value::Instance(i) => Rc::as_ptr(i) as usize,
+        Value::Iter(it) => Rc::as_ptr(it) as usize,
+        _ => return None,
+    })
+}
+
+/// Whether a native stands in for a builtin *type* (`int`, `ValueError`,
+/// `property`) rather than a function.
+pub fn native_is_type(name: &str) -> bool {
+    STDLIB_NATIVE_CLASSES.iter().any(|(n, _)| *n == name)
+        || crate::builtins::is_shim_constructor_name(name)
+        || matches!(
+            name,
+            "int"
+                | "float"
+                | "str"
+                | "bool"
+                | "list"
+                | "dict"
+                | "set"
+                | "frozenset"
+                | "tuple"
+                | "bytes"
+                | "bytearray"
+                | "object"
+                | "type"
+                | "range"
+                | "complex"
+                | "slice"
+                | "memoryview"
+                | "enumerate"
+                | "zip"
+                | "map"
+                | "filter"
+                | "reversed"
+                | "property"
+                | "staticmethod"
+                | "classmethod"
+                | "super"
+                | "BaseException"
+                | "KeyboardInterrupt"
+                | "SystemExit"
+                | "GeneratorExit"
+                | "StopIteration"
+                | "StopAsyncIteration"
+                | "ExceptionGroup"
+                | "BaseExceptionGroup"
+        )
+        || name.ends_with("Error")
+        || name.ends_with("Exception")
+        || name.ends_with("Warning")
 }
 
 /// The VM models a `slice` as the tuple `("__slice__", start, stop, step)`
@@ -1706,8 +1972,39 @@ pub enum DictViewKind {
 pub type NativeFnImpl =
     dyn Fn(&mut crate::interp::Interpreter, Vec<Value>) -> Result<Value, Unwind>;
 
+/// What a builtin-method native stands for. It only drives introspection —
+/// `repr`, `type`, `__name__`, `__self__` — never the call itself.
+pub struct NativeMethod {
+    /// The builtin type that defines the method (`"int"` for
+    /// `bool.bit_count`, which is `int`'s descriptor).
+    pub owner: &'static str,
+    pub attr: Rc<str>,
+    pub binding: MethodBinding,
+}
+
+/// How a builtin method native is bound.
+pub enum MethodBinding {
+    /// `list.append`: the method descriptor, read off the type.
+    Unbound,
+    /// `[].append`: bound to its receiver.
+    Bound(Value),
+    /// `str.maketrans` (a static method, `__self__` is `None`) or
+    /// `dict.fromkeys` (a class method, `__self__` is the type).
+    OnType { classmethod: bool },
+}
+
 pub struct NativeFn {
     pub name: &'static str,
+    /// Set on builtin-method natives — see [`NativeMethod`].
+    pub method: Option<NativeMethod>,
+    /// The native stands in for a function CPython defines in Python
+    /// (`json.dumps`, `dataclasses.field`), so it is a `function`, not a
+    /// `builtin_function_or_method`. Set when its module is built.
+    pub py_function: std::cell::Cell<bool>,
+    /// The native stands in for a Python method bound to a hidden module
+    /// instance (`random.randint` is `Random.randint` bound to `random`'s
+    /// `Random()`), so it is a `method` named `<class>.<name>`.
+    pub py_method_of: std::cell::Cell<Option<&'static str>>,
     pub func: Box<NativeFnImpl>,
     /// The native stands in for a CPython *coroutine function*
     /// (`asyncio.sleep`, `Queue.get`, a `Lock.__aenter__`, …). The VM's
@@ -1727,9 +2024,34 @@ impl NativeFn {
     {
         NativeFn {
             name,
+            method: None,
+            py_function: std::cell::Cell::new(false),
+            py_method_of: std::cell::Cell::new(None),
             func: Box::new(f),
             awaitable: false,
         }
+    }
+
+    /// Tag a native as the builtin method `owner.attr`.
+    pub fn with_method(
+        mut self,
+        owner: &'static str,
+        attr: Rc<str>,
+        binding: MethodBinding,
+    ) -> Self {
+        self.method = Some(NativeMethod {
+            owner,
+            attr,
+            binding,
+        });
+        self
+    }
+
+    /// Mark a native made at call time (a decorator's wrapper) as a
+    /// Python-level `function` — see [`NativeFn::py_function`].
+    pub fn python_function(self) -> Self {
+        self.py_function.set(true);
+        self
     }
 
     /// A native whose CPython counterpart is `async def` — see
@@ -1740,6 +2062,9 @@ impl NativeFn {
     {
         NativeFn {
             name,
+            method: None,
+            py_function: std::cell::Cell::new(false),
+            py_method_of: std::cell::Cell::new(None),
             func: Box::new(f),
             awaitable: true,
         }
@@ -2321,7 +2646,7 @@ impl fmt::Debug for Value {
             Value::Range { start, stop, step } => {
                 write!(f, "range({start}, {stop}, {step})")
             }
-            Value::Native(n) => write!(f, "{}", native_repr(n.name)),
+            Value::Native(n) => write!(f, "{}", native_value_repr(n)),
             Value::Function(func) => write!(f, "<function {}>", func.effective_qualname()),
             Value::BoundMethod { function, .. } => {
                 write!(f, "<bound method {}>", function.name)
@@ -2466,7 +2791,25 @@ impl Value {
             Value::Set(_) => "set",
             Value::Range { .. } => "range",
             Value::Native(n) if n.name == "NotImplemented" => "NotImplementedType",
-            Value::Native(_) | Value::Function(_) | Value::BoundMethod { .. } => "function",
+            // CPython's own callables: `list.append` is a method descriptor,
+            // `[].append` and `len` builtin functions, and a builtin type
+            // constructor (`int`) is a `type`.
+            Value::Native(n) if native_is_type(n.name) => "type",
+            Value::Native(n) if n.py_method_of.get().is_some() => "method",
+            Value::Native(n) if n.py_function.get() => "function",
+            Value::Native(n) => match &n.method {
+                Some(m) if is_slot_wrapper(m) => match m.binding {
+                    MethodBinding::Unbound => "wrapper_descriptor",
+                    _ => "method-wrapper",
+                },
+                Some(NativeMethod {
+                    binding: MethodBinding::Unbound,
+                    ..
+                }) => "method_descriptor",
+                _ => "builtin_function_or_method",
+            },
+            Value::Function(_) => "function",
+            Value::BoundMethod { .. } => "method",
             Value::Class(_) => "type",
             // Don't leak the class name into a `'static str`. Callers that
             // need the specific class name read `instance.class.name`
@@ -3071,7 +3414,7 @@ impl Value {
                     format!("range({}, {}, {})", start, stop, step)
                 }
             }
-            Value::Native(n) => native_repr(n.name),
+            Value::Native(n) => native_value_repr(n),
             Value::Function(func) => format!("<function {}>", func.effective_qualname()),
             // CPython names the class the method was found on and reprs
             // the receiver: `<bound method Path.iterdir of PosixPath('/t')>`.

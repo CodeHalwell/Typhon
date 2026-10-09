@@ -1679,6 +1679,7 @@ fn check_explicit_typearg_constructor(
     } else if c.find_method(&name, "__init__").is_some() {
         check_init_constructor_arity(c, &name, pos_args, kw_args, call_span);
     } else if c.is_plain_class(&name)
+        && class_ancestry_fully_local(c, &name)
         && (!pos_args.is_empty() || kw_args.iter().any(|k| k.arg.is_some()))
     {
         c.wrong_args(&name, 0, pos_args.len() + kw_args.len(), call_span);
@@ -3890,6 +3891,16 @@ struct Checker<'a> {
     /// an imported `fastapi.HTTPException` (an exception with no locally-known
     /// bases) never false-positives.
     local_classes: std::collections::HashSet<String>,
+    /// Module names bound exactly once, to a bare name (`Alias = Parent`),
+    /// so a class over `Alias` can be traced to a local `Parent`.
+    class_value_aliases: HashMap<String, String>,
+    /// The module binds the name `object` itself (`object = Exception`).
+    object_rebound: bool,
+    /// The module has a `from … import *`, which may rebind any name.
+    star_import: bool,
+    /// The module's binding counts, so a local class whose name is also
+    /// bound by an import or assignment is not trusted as that class.
+    module_bindings: HashMap<String, usize>,
     /// Per-class set of attribute names assigned through `self`
     /// (`self.NAME = ...`) inside a method body but NOT declared as a
     /// class-level annotated field. Consulted by `find_field` so reads of
@@ -4259,6 +4270,10 @@ impl<'a> Checker<'a> {
             class_parents: HashMap::new(),
             class_base_tails: HashMap::new(),
             local_classes: std::collections::HashSet::new(),
+            class_value_aliases: HashMap::new(),
+            object_rebound: false,
+            star_import: false,
+            module_bindings: HashMap::new(),
             self_attrs: HashMap::new(),
             class_var_attrs: HashMap::new(),
             unsafe_depth: 0,
@@ -8026,13 +8041,30 @@ fn raise_non_exception_display(c: &Checker, ty: &Type) -> Option<String> {
 /// (a missing context-manager dunder) and stay permissive for any class whose
 /// methods might come from an unseen base.
 fn class_ancestry_fully_local(c: &Checker, name: &str) -> bool {
+    if c.star_import {
+        return false;
+    }
     let mut stack: Vec<&str> = vec![name];
     let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
     while let Some(n) = stack.pop() {
         if !visited.insert(n) {
             continue;
         }
+        // `class A(object)` is still a project-only hierarchy.
+        if n == "object" && !c.object_rebound && !c.local_classes.contains(n) {
+            continue;
+        }
+        // `class Parent` rebound by an import or assignment may be
+        // anything at runtime.
+        if c.local_classes.contains(n) && c.module_bindings.get(n).is_some_and(|&k| k > 1) {
+            return false;
+        }
         if !c.local_classes.contains(n) {
+            // `Alias = Parent` names the local `Parent`.
+            if let Some(target) = c.class_value_aliases.get(n) {
+                stack.push(target.as_str());
+                continue;
+            }
             return false;
         }
         if let Some(parents) = c.class_parents.get(n) {
@@ -10080,6 +10112,148 @@ fn detect_cyclic_type_aliases(c: &mut Checker, body: &[Stmt]) {
     }
 }
 
+/// How many times each name is bound anywhere in `body`: assignment and
+/// `for` / `with` / walrus targets, imports, `def` / `class`, `except … as`
+/// and match captures, in every scope.
+fn count_name_bindings(body: &[Stmt]) -> HashMap<String, usize> {
+    count_bindings(body, false)
+}
+
+/// As [`count_name_bindings`], but only the bindings of the module's own
+/// namespace: module-scope statements and names a function declares
+/// `global`, not a function's or class's locals.
+fn count_module_bindings(body: &[Stmt]) -> HashMap<String, usize> {
+    count_bindings(body, true)
+}
+
+fn count_bindings(body: &[Stmt], module_only: bool) -> HashMap<String, usize> {
+    use ruff_python_ast::visitor::{self, Visitor};
+    #[derive(Default)]
+    struct Count {
+        names: HashMap<String, usize>,
+        module_only: bool,
+        /// Function, class and lambda bodies around the binding.
+        depth: usize,
+        /// The next body walked is a `def` / `class` body. Its header
+        /// (decorators, defaults, annotations, bases) runs in the
+        /// enclosing scope, so the depth rises only for the body.
+        scope_body: bool,
+        /// The `global` names of each enclosing `def` / `class` body: a
+        /// store to one there binds the module's name.
+        globals: Vec<HashSet<String>>,
+        /// Walking a comprehension target, which is the comprehension's
+        /// own name even under `global`.
+        comp_target: bool,
+    }
+    impl Count {
+        fn bump(&mut self, name: &str) {
+            let global = !self.comp_target && self.globals.last().is_some_and(|g| g.contains(name));
+            if !self.module_only || self.depth == 0 || global {
+                *self.names.entry(name.to_owned()).or_default() += 1;
+            }
+        }
+    }
+    impl<'a> Visitor<'a> for Count {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            if let Stmt::Global(g) = stmt {
+                // `global object` makes a later store in the function the
+                // module's; the declaration alone binds nothing.
+                if let Some(scope) = self.globals.last_mut() {
+                    scope.extend(g.names.iter().map(|n| n.to_string()));
+                }
+            }
+            let scope = matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_));
+            match stmt {
+                Stmt::FunctionDef(f) => self.bump(f.name.as_str()),
+                Stmt::ClassDef(c) => self.bump(c.name.as_str()),
+                Stmt::Import(i) => {
+                    for a in &i.names {
+                        let n = a.name.as_str();
+                        self.bump(match &a.asname {
+                            Some(b) => b.as_str(),
+                            None => n.split('.').next().unwrap_or(n),
+                        });
+                    }
+                }
+                Stmt::ImportFrom(i) => {
+                    for a in &i.names {
+                        self.bump(a.asname.as_ref().unwrap_or(&a.name).as_str());
+                    }
+                }
+                _ => {}
+            }
+            self.scope_body = scope;
+            visitor::walk_stmt(self, stmt);
+        }
+        fn visit_body(&mut self, body: &'a [Stmt]) {
+            let scope = std::mem::take(&mut self.scope_body);
+            if scope {
+                self.depth += 1;
+                self.globals.push(HashSet::new());
+            }
+            visitor::walk_body(self, body);
+            if scope {
+                self.depth -= 1;
+                self.globals.pop();
+            }
+        }
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            if let Expr::Name(n) = expr {
+                if !matches!(n.ctx, ruff_python_ast::ExprContext::Load) {
+                    self.bump(n.id.as_str());
+                }
+            }
+            // A lambda's defaults run in the enclosing scope; only its
+            // body is its own.
+            if let Expr::Lambda(l) = expr {
+                if let Some(params) = &l.parameters {
+                    self.visit_parameters(params);
+                }
+                self.depth += 1;
+                self.visit_expr(&l.body);
+                self.depth -= 1;
+                return;
+            }
+            visitor::walk_expr(self, expr);
+        }
+        fn visit_comprehension(&mut self, comp: &'a ruff_python_ast::Comprehension) {
+            // A comprehension's target is its own scope's
+            // (`[object for object in xs]`); a walrus in it is not.
+            self.visit_expr(&comp.iter);
+            self.depth += 1;
+            let outer = std::mem::replace(&mut self.comp_target, true);
+            self.visit_expr(&comp.target);
+            self.comp_target = outer;
+            self.depth -= 1;
+            for e in &comp.ifs {
+                self.visit_expr(e);
+            }
+        }
+        fn visit_except_handler(&mut self, h: &'a ruff_python_ast::ExceptHandler) {
+            let ruff_python_ast::ExceptHandler::ExceptHandler(e) = h;
+            if let Some(name) = &e.name {
+                self.bump(name.as_str());
+            }
+            visitor::walk_except_handler(self, h);
+        }
+        fn visit_pattern(&mut self, p: &'a Pattern) {
+            match p {
+                Pattern::MatchAs(m) => m.name.iter().for_each(|n| self.bump(n.as_str())),
+                Pattern::MatchStar(m) => m.name.iter().for_each(|n| self.bump(n.as_str())),
+                Pattern::MatchMapping(m) => m.rest.iter().for_each(|n| self.bump(n.as_str())),
+                _ => {}
+            }
+            visitor::walk_pattern(self, p);
+        }
+    }
+    let mut count = Count {
+        module_only,
+        ..Count::default()
+    };
+    count.visit_body(body);
+    count.names
+}
+
 fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
     // First pass: collect every class and type-alias *name* into `c.classes`
     // so the subsequent shape and signature passes can resolve nominal
@@ -10093,6 +10267,36 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
     // exempt: multiple `impl Foo:` blocks legitimately produce multiple
     // pseudo-classes, and the merge pass handles deduplication.
     let mut seen_class_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    // `Alias = Parent`: kept only when the module binds each of the two
+    // names nowhere else, in any scope or statement, so a rebinding of
+    // either never leaves it stale.
+    let bindings = count_name_bindings(body);
+    c.class_value_aliases = body
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::Assign(a) => match (a.targets.as_slice(), a.value.as_ref()) {
+                ([Expr::Name(t)], Expr::Name(v)) => Some((t, v)),
+                _ => None,
+            },
+            Stmt::AnnAssign(a) => match (a.target.as_ref(), a.value.as_deref()) {
+                (Expr::Name(t), Some(Expr::Name(v))) => Some((t, v)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .filter(|(t, v)| {
+            bindings.get(t.id.as_str()) == Some(&1) && bindings.get(v.id.as_str()) == Some(&1)
+        })
+        .map(|(t, v)| (t.id.to_string(), v.id.to_string()))
+        .collect();
+    // Only a module-namespace binding shadows `object` in a module-level
+    // class header; a function's local `object = …` does not.
+    let module_bindings = count_module_bindings(body);
+    c.object_rebound = module_bindings.contains_key("object");
+    // `from helper import *` may bind any name, `object` or a local
+    // class's included.
+    c.star_import = module_bindings.contains_key("*");
+    c.module_bindings = module_bindings;
     for stmt in body {
         match stmt {
             Stmt::ClassDef(cd) => {
@@ -22851,9 +23055,13 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                                 check_init_constructor_arity(
                                     c, &name, pos_args, kw_args, call_span,
                                 );
-                            } else if !pos_args.is_empty()
-                                || kw_args.iter().any(|k| k.arg.is_some())
+                            } else if class_ancestry_fully_local(c, &name)
+                                && (!pos_args.is_empty() || kw_args.iter().any(|k| k.arg.is_some()))
                             {
+                                // Only `object.__init__` when no base is a
+                                // builtin or imported class: `Exception`,
+                                // `bytes` and a venv class bring their own
+                                // constructor.
                                 c.wrong_args(&name, 0, pos_args.len() + kw_args.len(), call_span);
                             }
                         } else if user_init && c.is_raw_class(&name) {
@@ -29419,6 +29627,199 @@ def main() -> None:
             check_class_kinds(bad).has_errors(),
             "object.__init__ takes no arguments"
         );
+        // A bare `global object`, or a comprehension target under it,
+        // binds nothing: the base is still the builtin `object`.
+        for src in [
+            "\
+def f() -> None:
+    global object
+
+plain class A(object):
+    pass
+
+def main() -> None:
+    print(A(1))
+",
+            "\
+def f() -> list[int]:
+    global object
+    return [object for object in [1]]
+
+plain class A(object):
+    pass
+
+def main() -> None:
+    print(A(1))
+",
+        ] {
+            assert!(check_class_kinds(src).has_errors(), "{src}");
+        }
+        // A builtin or imported base brings its own constructor:
+        // `Exception.__init__` takes the message, `bytes` its value.
+        let builtin_base = "\
+plain class Boom(Exception):
+    pass
+
+plain class Blob(bytes):
+    pass
+
+plain class Gen[T](Exception):
+    pass
+
+def main() -> None:
+    print(Boom(\"x\"), Blob(b\"ab\"), Gen[int](\"y\"))
+";
+        let d = check_class_kinds(builtin_base);
+        assert!(!d.has_errors(), "builtin bases: {d:?}");
+        // An explicit `object` base is still `object.__init__`.
+        let object_base = "\
+plain class A(object):
+    pass
+
+def main() -> None:
+    let a: A = A(1)
+    print(a)
+";
+        assert!(
+            check_class_kinds(object_base).has_errors(),
+            "object base takes no arguments"
+        );
+        // A function's local `object` does not shadow the module's.
+        let local_object = "\
+def f() -> None:
+    object = Exception
+    print(object)
+
+plain class A(object):
+    pass
+
+def main() -> None:
+    let a: A = A(1)
+    print(a)
+";
+        assert!(
+            check_class_kinds(local_object).has_errors(),
+            "a local object binding leaves the module's object"
+        );
+        let comprehension_object = "\
+let xs = [object for object in [Exception]]
+
+plain class A(object):
+    pass
+
+def main() -> None:
+    print(xs)
+    let a: A = A(1)
+    print(a)
+";
+        assert!(
+            check_class_kinds(comprehension_object).has_errors(),
+            "a comprehension target leaves the module's object"
+        );
+        // So is a local class reached through an alias.
+        let aliased = "\
+plain class Parent:
+    pass
+
+Alias = Parent
+
+plain class Child(Alias):
+    pass
+
+def main() -> None:
+    let a: Child = Child(1)
+    print(a)
+";
+        assert!(
+            check_class_kinds(aliased).has_errors(),
+            "aliased local base takes no arguments"
+        );
+        // A rebound alias, or a rebound `object`, is not traced.
+        for src in [
+            "\
+plain class Parent:
+    pass
+
+mut Alias: object = Parent
+from builtins import Exception as Alias
+
+plain class Boom(Alias):
+    pass
+
+def main() -> None:
+    print(Boom(\"x\"))
+",
+            "\
+object = Exception
+
+plain class Boom(object):
+    pass
+
+def main() -> None:
+    print(Boom(\"x\"))
+",
+            "\
+def f(x: object = (object := Exception)) -> None:
+    print(x)
+
+plain class Boom(object):
+    pass
+
+def main() -> None:
+    print(Boom(\"x\"))
+",
+            "\
+plain class Parent:
+    pass
+
+from builtins import Exception as Parent
+
+Alias = Parent
+
+plain class Boom(Alias):
+    pass
+
+plain class Bang(Parent):
+    pass
+
+def main() -> None:
+    print(Boom(\"x\"), Bang(\"y\"))
+",
+            "\
+f = lambda x=(object := Exception): x
+
+plain class Boom(object):
+    pass
+
+def main() -> None:
+    print(Boom(\"x\"))
+",
+            "\
+from helper import *
+
+plain class Boom(object):
+    pass
+
+def main() -> None:
+    print(Boom(\"x\"))
+",
+            "\
+def rebind() -> None:
+    global object
+    object = Exception
+
+rebind()
+
+plain class Boom(object):
+    pass
+
+def main() -> None:
+    print(Boom(\"x\"))
+",
+        ] {
+            let d = check_class_kinds(src);
+            assert!(!d.has_errors(), "{src}: {d:?}");
+        }
     }
 
     #[test]

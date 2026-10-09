@@ -1009,6 +1009,826 @@ const PYTHON_BUILTINS: &[&str] = &[
     "__debug__",
 ];
 
+/// Why a class in `module` cannot run on the VM, or `None`: it subclasses
+/// a builtin value type (`list`, `int`, `str`, …) or another native-backed
+/// builtin (`enumerate`, `property`), or its base is a parameter of an
+/// enclosing function (a class factory) that could be one. A name in
+/// `project_aliases` (from [`module_builtin_aliases`] over the project's
+/// other modules) stands for its builtin here too, imported or not.
+///
+/// The VM models those types as Rust values or natives, not classes, so an instance of
+/// `class L(list)` is a plain object that holds no list: `L([1, 2])` fails
+/// and `class S(str)` prints as `<__main__.S object …>`. `tyc run`'s pre-run
+/// scan sends such a program down the compiled path. A value-mixin enum
+/// (`class Colour(str, Enum)`) is modelled and stays in the VM.
+pub fn module_subclassed_builtin(
+    module: &ruff_python_ast::ModModule,
+    project_aliases: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    scan_builtin_subclasses(module, project_aliases, false).0
+}
+
+/// The names `module` binds to a builtin value type (`Alias = list`, or
+/// one of `project_aliases` re-exported), for [`module_subclassed_builtin`]
+/// over the project's other modules.
+pub fn module_builtin_aliases(
+    module: &ruff_python_ast::ModModule,
+    project_aliases: &std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    scan_builtin_subclasses(module, project_aliases, true).1
+}
+
+/// Merge `found` into `aliases`, erring towards CPython: when two modules
+/// export one name for different builtins, keep the one that is not an enum
+/// mixin, so `class E(Alias, Enum)` is never wrongly exempted. Whether
+/// anything changed.
+pub fn merge_builtin_aliases(
+    aliases: &mut std::collections::HashMap<String, String>,
+    found: std::collections::HashMap<String, String>,
+) -> bool {
+    let mut changed = false;
+    for (name, builtin) in found {
+        match aliases.get_mut(&name) {
+            None => {
+                aliases.insert(name, builtin);
+                changed = true;
+            }
+            Some(old) if ENUM_MIXINS.contains(&old.as_str()) && *old != builtin => {
+                if !ENUM_MIXINS.contains(&builtin.as_str()) {
+                    *old = builtin;
+                    changed = true;
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    changed
+}
+
+/// The data-type mixins the VM models on an enum (`enum_mixin_value`).
+const ENUM_MIXINS: &[&str] = &["str", "int", "float", "bytes", "complex"];
+
+/// What an import binds each name to: `import a.b` binds `a` to the module
+/// `a`, `import a.b as m` binds `m` to `a.b`, and `from a import b` binds
+/// `b` to a member of `a` (counted as one attribute deep, since it may be
+/// data rather than a module).
+fn imported_module(stmt: &ruff_python_ast::Stmt) -> Vec<(String, (String, usize))> {
+    use ruff_python_ast::Stmt;
+    match stmt {
+        Stmt::Import(i) => i
+            .names
+            .iter()
+            .map(|alias| {
+                let name = alias.name.as_str();
+                match &alias.asname {
+                    Some(a) => (a.to_string(), (name.to_owned(), 0)),
+                    None => {
+                        let root = name.split('.').next().unwrap_or(name);
+                        (root.to_owned(), (root.to_owned(), 0))
+                    }
+                }
+            })
+            .collect(),
+        Stmt::ImportFrom(i) => i
+            .names
+            .iter()
+            .map(|alias| {
+                let bound = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
+                let module = match (&i.module, i.level) {
+                    (Some(m), 0) => format!("{m}.{}", alias.name),
+                    // A relative import names a project module.
+                    _ => format!(".{}", alias.name),
+                };
+                (bound, (module, 1))
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether an attribute chain on an imported name stays trusted: a single
+/// attribute of any module (`helper.Base`, which the project-alias scan
+/// covers), or a deeper one only below a module the VM models itself
+/// (`collections.abc.Iterable`), never a project module's data
+/// (`helper.box.Base`).
+fn import_chain_trusted(import: Option<&(String, usize)>, segments: usize) -> bool {
+    let Some((module, depth)) = import else {
+        return true;
+    };
+    segments + depth <= 1
+        || models_module(module)
+        || models_module(module.split('.').next().unwrap_or(module))
+}
+
+/// Whether a class decorator returns the class it is given: the standard
+/// library's (`@dataclass(frozen=True)`, `@functools.total_ordering`,
+/// `@enum.unique`, `@typing.final`, …).
+fn preserves_class(decorator: &ruff_python_ast::Expr) -> bool {
+    use ruff_python_ast::Expr;
+    let target = match decorator {
+        Expr::Call(c) => c.func.as_ref(),
+        other => other,
+    };
+    let name = match target {
+        Expr::Name(n) => n.id.as_str(),
+        Expr::Attribute(a) => a.attr.as_str(),
+        _ => return false,
+    };
+    matches!(
+        name,
+        "dataclass"
+            | "total_ordering"
+            | "unique"
+            | "verify"
+            | "final"
+            | "runtime_checkable"
+            | "override"
+            | "dataclass_transform"
+            | "type_check_only"
+    )
+}
+
+/// The root name of an attribute chain and the segments between it and
+/// the last (`Outer.Mid.Inner` is `Outer` and `[Mid]`), or `None` when
+/// the chain is not rooted at a name.
+fn attr_chain(a: &ruff_python_ast::ExprAttribute) -> Option<(&str, Vec<&str>)> {
+    use ruff_python_ast::Expr;
+    let mut mids = Vec::new();
+    let mut node = a.value.as_ref();
+    loop {
+        match node {
+            Expr::Attribute(inner) => {
+                mids.push(inner.attr.as_str());
+                node = inner.value.as_ref();
+            }
+            Expr::Name(n) => {
+                mids.reverse();
+                return Some((n.id.as_str(), mids));
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn scan_builtin_subclasses(
+    module: &ruff_python_ast::ModModule,
+    project_aliases: &std::collections::HashMap<String, String>,
+    collect: bool,
+) -> (Option<String>, std::collections::HashMap<String, String>) {
+    use ruff_python_ast::visitor::{self, Visitor};
+    use ruff_python_ast::{Expr, Stmt};
+
+    const VALUE_TYPES: &[&str] = &[
+        "int",
+        "float",
+        "complex",
+        "str",
+        "bytes",
+        "bytearray",
+        "list",
+        "tuple",
+        "dict",
+        "set",
+        "frozenset",
+        // Natives too, so a subclass builds a plain object.
+        "enumerate",
+        "zip",
+        "map",
+        "filter",
+        "reversed",
+        "property",
+        "staticmethod",
+        "classmethod",
+        "super",
+        // A metaclass the program only calls (`M("X", (), {})`), which the
+        // `metaclass=` scan never sees.
+        "type",
+        // Final types: CPython rejects the class, the VM would build it.
+        "bool",
+        "range",
+        "slice",
+        "memoryview",
+        // Python 3.15 builtins the VM shims as constructor natives.
+        "frozendict",
+        "sentinel",
+    ];
+    const ENUM_TYPES: &[&str] = &["Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "ReprEnum"];
+    /// Standard-library classes the VM builds as natives, by module, so a
+    /// subclass of one discards its base.
+    const STDLIB_NATIVES: &[(&str, &str)] = &[
+        ("collections", "defaultdict"),
+        ("functools", "partial"),
+        ("functools", "cached_property"),
+        ("enum", "auto"),
+        ("typing", "NewType"),
+    ];
+    fn stdlib_native(module: &str, name: &str) -> bool {
+        STDLIB_NATIVES.contains(&(module, name))
+    }
+
+    /// One pass in source order, erring towards CPython either way. A name
+    /// that stands for a builtin value type (`Alias = list`,
+    /// `from builtins import list as L`, `import builtins as b`) is bound
+    /// in any scope or branch and never dropped, so a class over it always
+    /// falls back. A name for the `enum` module, an enum base
+    /// (`from enum import Enum as E`) or an enum class of this module
+    /// exempts a class only when bound by an unconditional module-scope
+    /// statement, and any rebinding drops it.
+    #[derive(Default)]
+    struct Scan {
+        builtin: std::collections::HashMap<String, String>,
+        enum_modules: std::collections::HashSet<String>,
+        /// `Enum`-like bases: imported from `enum`, or enum classes of
+        /// this module, so `class C(str, Base)` with `class Base(Enum)` is
+        /// one too.
+        enum_bases: std::collections::HashSet<String>,
+        /// `builtins` and its aliases (`import builtins as b`).
+        builtins_modules: std::collections::HashSet<String>,
+        /// The names bound to a [`STDLIB_NATIVES`] module, for
+        /// `collections.defaultdict` and `functools.partial`.
+        native_modules: std::collections::HashMap<String, String>,
+        /// Function and class bodies around the statement.
+        depth: usize,
+        /// Compound statements (`if`, `for`, `try`, …) around it.
+        branch: usize,
+        /// The parameters of each enclosing function.
+        params: Vec<std::collections::HashSet<String>>,
+        /// Names bound to a value computed at runtime (`Base = choose()`),
+        /// in any scope, which may be a builtin type.
+        computed: std::collections::HashSet<String>,
+        /// Names an import binds and classes the module defines, in any
+        /// scope: the receivers of an attribute base the scan trusts
+        /// (`models.Model`, `Outer.Inner`).
+        namespaces: std::collections::HashSet<String>,
+        /// Receivers of an attribute store, whose attributes the scan
+        /// cannot trust as bases.
+        mutated: std::collections::HashSet<String>,
+        /// Classes the module defines, in any scope.
+        classes: std::collections::HashSet<String>,
+        /// The module each imported name is bound to.
+        imports: std::collections::HashMap<String, (String, usize)>,
+        /// Module-scope names bound to a computed value, which a sibling
+        /// may import.
+        exported_computed: std::collections::HashSet<String>,
+        /// Builtin aliases the project's other modules export.
+        project: std::collections::HashMap<String, String>,
+        /// Only collect `builtin`; report nothing.
+        collect: bool,
+        found: Option<String>,
+    }
+    impl Scan {
+        fn unbind(&mut self, name: &str) {
+            self.enum_modules.remove(name);
+            self.enum_bases.remove(name);
+        }
+        fn is_enum_base(&self, base: &Expr) -> bool {
+            match base {
+                Expr::Name(n) => self.enum_bases.contains(n.id.as_str()),
+                Expr::Attribute(a) => {
+                    ENUM_TYPES.contains(&a.attr.as_str())
+                        && matches!(a.value.as_ref(), Expr::Name(m)
+                            if self.enum_modules.contains(m.id.as_str()))
+                }
+                _ => false,
+            }
+        }
+        fn builtin_base(&self, base: &Expr) -> Option<String> {
+            // `list[int]` is a generic alias of `list`.
+            let base = match base {
+                Expr::Subscript(s) => s.value.as_ref(),
+                other => other,
+            };
+            // `builtins.list` / `b.list` after `import builtins as b`.
+            if let Expr::Attribute(a) = base {
+                let on_builtins = matches!(a.value.as_ref(), Expr::Name(m)
+                    if self.builtins_modules.contains(m.id.as_str()));
+                let attr = a.attr.as_str();
+                if on_builtins && VALUE_TYPES.contains(&attr) {
+                    return Some(attr.to_owned());
+                }
+                let native = matches!(a.value.as_ref(), Expr::Name(m)
+                    if self.native_modules.get(m.id.as_str())
+                        .is_some_and(|module| stdlib_native(module, attr)));
+                if native {
+                    return Some(attr.to_owned());
+                }
+                // `helper.Alias` for another module's `Alias = list`.
+                return self.project.get(attr).cloned();
+            }
+            let Expr::Name(n) = base else { return None };
+            self.name_builtin(n.id.as_str())
+        }
+        /// The builtin value type `name` stands for, directly, as an alias
+        /// or as one a sibling module exports.
+        fn name_builtin(&self, name: &str) -> Option<String> {
+            self.builtin
+                .get(name)
+                .or_else(|| self.project.get(name))
+                .cloned()
+                .or_else(|| VALUE_TYPES.contains(&name).then(|| name.to_owned()))
+        }
+        /// The builtin base that keeps `c` off the VM: any builtin base of a
+        /// plain class, or of an enum one a mixin the VM does not model
+        /// (`class E(list, Enum)`).
+        fn unmodelled_base(&self, c: &ruff_python_ast::StmtClassDef) -> Option<String> {
+            let is_enum = c.bases().iter().any(|b| self.is_enum_base(b));
+            let builtin = c
+                .bases()
+                .iter()
+                .filter_map(|b| self.builtin_base(b))
+                .find(|b| !(is_enum && ENUM_MIXINS.contains(&b.as_str())));
+            if let Some(b) = builtin {
+                if b == COMPUTED {
+                    return Some("a class whose base is computed at runtime".to_owned());
+                }
+                return Some(format!("a subclass of the builtin {b}"));
+            }
+            // `def make(Base: type) -> type: class L(Base)` may be handed
+            // `list`, and `class L(choose())` may be `list` too.
+            c.bases().iter().find_map(|b| {
+                let origin = match b {
+                    Expr::Subscript(s) => s.value.as_ref(),
+                    other => other,
+                };
+                match origin {
+                    Expr::Name(n) if self.params.iter().any(|p| p.contains(n.id.as_str())) => {
+                        Some(format!("a class whose base is the parameter {}", n.id))
+                    }
+                    Expr::Name(n) if self.computed.contains(n.id.as_str()) => Some(format!(
+                        "a class whose base {} is computed at runtime",
+                        n.id
+                    )),
+                    Expr::Name(_) => None,
+                    // `h.base` on an instance, a parameter or anything else
+                    // not a module or class is a runtime value.
+                    Expr::Attribute(a) => match attr_chain(a) {
+                        // `enum ...` lowers to `enum.Enum` before the build
+                        // adds the import. Below a class only nested
+                        // classes are trusted (`Outer.Mid.Inner`), not a
+                        // data attribute (`Holder.Base`, `Holder.box.Base`).
+                        Some((root, mids))
+                            if (self.namespaces.contains(root) || root == "enum")
+                                && !self.computed.contains(root)
+                                && !self.mutated.contains(root)
+                                && !self.params.iter().any(|p| p.contains(root))
+                                && (!self.classes.contains(root)
+                                    || mids
+                                        .iter()
+                                        .chain([&a.attr.as_str()])
+                                        .all(|m| self.classes.contains(*m)))
+                                && (self.classes.contains(root)
+                                    || !self.imports.contains_key(root)
+                                    || import_chain_trusted(
+                                        self.imports.get(root),
+                                        mids.len() + 1,
+                                    )) =>
+                        {
+                            None
+                        }
+                        _ => Some("a class whose base is computed at runtime".to_owned()),
+                    },
+                    _ => Some("a class whose base is computed at runtime".to_owned()),
+                }
+            })
+        }
+        /// `let Alias = Base` in a class factory: `Alias` may be the
+        /// builtin `Base` is handed too.
+        fn alias_param(&mut self, target: &str, value: Option<&str>) {
+            if value.is_some_and(|v| self.params.iter().any(|p| p.contains(v))) {
+                if let Some(scope) = self.params.last_mut() {
+                    scope.insert(target.to_owned());
+                }
+            }
+        }
+        fn bind(&mut self, stmt: &Stmt) {
+            let pinned = self.depth == 0 && self.branch == 0;
+            self.imports.extend(imported_module(stmt));
+            match stmt {
+                Stmt::Import(i) => {
+                    for alias in &i.names {
+                        let name = alias.name.as_str();
+                        // `import a.b` binds `a`.
+                        let bound = match &alias.asname {
+                            Some(a) => a.as_str(),
+                            None => name.split('.').next().unwrap_or(name),
+                        };
+                        self.unbind(bound);
+                        self.namespaces.insert(bound.to_owned());
+                        if STDLIB_NATIVES.iter().any(|(m, _)| *m == name) {
+                            self.native_modules
+                                .insert(bound.to_owned(), name.to_owned());
+                        }
+                        match name {
+                            "enum" if pinned => {
+                                self.enum_modules.insert(bound.to_owned());
+                            }
+                            "builtins" => {
+                                self.builtins_modules.insert(bound.to_owned());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Stmt::ImportFrom(i) => {
+                    let module = i.module.as_ref().map(|m| m.as_str());
+                    for alias in &i.names {
+                        let name = alias.name.as_str();
+                        let bound = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
+                        self.unbind(&bound);
+                        self.namespaces.insert(bound.clone());
+                        match module {
+                            Some("enum") if pinned && ENUM_TYPES.contains(&name) => {
+                                self.enum_bases.insert(bound);
+                            }
+                            Some("builtins") if VALUE_TYPES.contains(&name) => {
+                                self.builtin.insert(bound, name.to_owned());
+                            }
+                            // A native constructor too, not a class.
+                            Some(m) if stdlib_native(m, name) => {
+                                self.builtin.insert(bound, name.to_owned());
+                            }
+                            // `from helper import Alias as A` for a sibling's
+                            // `Alias = list`.
+                            _ => {
+                                if let Some(b) = self.project.get(name).cloned() {
+                                    self.builtin.insert(bound, b);
+                                }
+                            }
+                        }
+                    }
+                }
+                Stmt::Assign(a) => {
+                    let value = match a.value.as_ref() {
+                        Expr::Name(v) => Some(v.id.as_str()),
+                        _ => None,
+                    };
+                    // `Alias = list`, `list[int]`, `builtins.list`, `helper.Alias`.
+                    let builtin = self.builtin_base(&a.value);
+                    let enum_base = pinned && value.is_some_and(|v| self.enum_bases.contains(v));
+                    for target in &a.targets {
+                        if let Expr::Name(t) = target {
+                            let t = t.id.as_str();
+                            self.alias_param(t, value);
+                            self.unbind(t);
+                            if let Some(b) = &builtin {
+                                self.builtin.insert(t.to_owned(), b.clone());
+                            }
+                            if enum_base {
+                                self.enum_bases.insert(t.to_owned());
+                            }
+                        }
+                    }
+                }
+                Stmt::AnnAssign(a) => {
+                    if let Expr::Name(t) = a.target.as_ref() {
+                        let builtin = a.value.as_deref().and_then(|v| self.builtin_base(v));
+                        let t = t.id.as_str();
+                        if let Some(Expr::Name(v)) = a.value.as_deref() {
+                            self.alias_param(t, Some(v.id.as_str()));
+                        }
+                        self.unbind(t);
+                        if let Some(b) = builtin {
+                            self.builtin.insert(t.to_owned(), b);
+                        }
+                    }
+                }
+                Stmt::FunctionDef(f) => self.unbind(f.name.as_str()),
+                Stmt::ClassDef(c) => {
+                    let is_enum = c.bases().iter().any(|b| self.is_enum_base(b));
+                    self.unbind(c.name.as_str());
+                    self.namespaces.insert(c.name.to_string());
+                    self.classes.insert(c.name.to_string());
+                    if pinned && is_enum {
+                        self.enum_bases.insert(c.name.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    impl<'a> Visitor<'a> for Scan {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            if self.found.is_some() {
+                return;
+            }
+            if let Stmt::ClassDef(c) = stmt {
+                if let Some(reason) = self.unmodelled_base(c).filter(|_| !self.collect) {
+                    self.found = Some(reason);
+                    return;
+                }
+            }
+            if let Stmt::FunctionDef(f) = stmt {
+                self.params
+                    .push(f.parameters.iter().map(|p| p.name().to_string()).collect());
+            }
+            let scope = matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_));
+            let branch = matches!(
+                stmt,
+                Stmt::If(_)
+                    | Stmt::For(_)
+                    | Stmt::While(_)
+                    | Stmt::Try(_)
+                    | Stmt::With(_)
+                    | Stmt::Match(_)
+            );
+            self.depth += usize::from(scope);
+            self.branch += usize::from(branch);
+            visitor::walk_stmt(self, stmt);
+            self.depth -= usize::from(scope);
+            self.branch -= usize::from(branch);
+            if matches!(stmt, Stmt::FunctionDef(_)) {
+                self.params.pop();
+            }
+            // After the body, so a class's own bases see the names before it.
+            self.bind(stmt);
+        }
+    }
+    let (computed, exported_computed, mutated) = runtime_bound_names(module);
+    let mut scan = Scan {
+        project: project_aliases.clone(),
+        collect,
+        computed,
+        exported_computed,
+        mutated,
+        ..Default::default()
+    };
+    // `enum.Enum` without an import still names the module in a
+    // Typhon-lowered `enum` declaration.
+    scan.enum_modules.insert("enum".to_owned());
+    scan.visit_body(&module.body);
+    // A module-scope `Alias = list if c else dict` is exported too, so
+    // `helper.Alias` in a sibling falls back.
+    let mut exported = scan.builtin;
+    for name in scan.exported_computed {
+        exported.entry(name).or_insert_with(|| COMPUTED.to_owned());
+    }
+    (scan.found, exported)
+}
+
+/// The builtin an exported alias stands for when its value is computed at
+/// runtime (`Alias = choose()`).
+const COMPUTED: &str = "<computed>";
+
+/// The names `module` binds, in any scope, to a value only known at
+/// runtime, which a class base naming them may turn out to be a builtin
+/// (`Base = choose()`, `for Base in …`, `case [Base]:`, `(Base := …)`);
+/// and those of them bound at module scope, which a sibling may import.
+///
+/// Every binding counts except a `class`, an import, and `Alias = Other`
+/// where `Other` is itself trusted: a name, or an attribute of an import or
+/// a class (`Base = models.Model`). A name bound any other way anywhere is
+/// a runtime value, so a later or nested rebinding is never missed.
+fn runtime_bound_names(
+    module: &ruff_python_ast::ModModule,
+) -> (
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
+) {
+    use ruff_python_ast::visitor::{self, Visitor};
+    use ruff_python_ast::{Expr, Pattern, Stmt};
+    use std::collections::HashSet;
+
+    #[derive(Default)]
+    struct Bindings {
+        runtime: HashSet<String>,
+        namespaces: HashSet<String>,
+        /// Receivers of an attribute store (`Holder.Base = list`,
+        /// `setattr(Holder, …)`), whose attributes are runtime values.
+        mutated: HashSet<String>,
+        /// `Alias = Other`: trusted unless `Other` is a runtime value.
+        name_aliases: Vec<(String, String)>,
+        /// `Alias = root.mid.attr` as the root and the segments after it:
+        /// trusted only for an import or class `root`, and below a class
+        /// only for nested classes.
+        attr_aliases: Vec<(String, String, Vec<String>)>,
+        /// Classes the module defines, in any scope.
+        classes: HashSet<String>,
+        /// The module each imported name is bound to.
+        imports: std::collections::HashMap<String, (String, usize)>,
+        module_scope: HashSet<String>,
+        /// Function and class bodies around the binding.
+        depth: usize,
+        /// The next body walked is a `def` / `class` body. Its header
+        /// (decorators, defaults, annotations, bases) runs in the
+        /// enclosing scope, so the depth rises only for the body.
+        scope_body: bool,
+        /// The `global` names of each enclosing body, which bind in the
+        /// module's namespace.
+        globals: Vec<HashSet<String>>,
+    }
+    impl Bindings {
+        fn bind(&mut self, name: &str) {
+            if self.depth == 0 || self.globals.last().is_some_and(|g| g.contains(name)) {
+                self.module_scope.insert(name.to_owned());
+            }
+        }
+        fn runtime(&mut self, name: &str) {
+            self.bind(name);
+            self.runtime.insert(name.to_owned());
+        }
+        fn assign(&mut self, target: &Expr, value: &Expr) {
+            let Expr::Name(t) = target else {
+                // `A, B = …`, `x.attr = …`, `xs[0] = …`.
+                self.visit_expr(target);
+                return;
+            };
+            let t = t.id.to_string();
+            self.bind(&t);
+            // A subscript (`bases[0]`, even `list[int]`) is a runtime
+            // value; the scan's own builtin check still names a builtin
+            // generic alias first.
+            match value {
+                Expr::Name(v) => self.name_aliases.push((t, v.id.to_string())),
+                Expr::Attribute(a) => match attr_chain(a) {
+                    // The last segment too: below a class only a nested
+                    // class is trusted.
+                    Some((root, mids)) => self.attr_aliases.push((
+                        t,
+                        root.to_owned(),
+                        mids.into_iter()
+                            .chain([a.attr.as_str()])
+                            .map(str::to_owned)
+                            .collect(),
+                    )),
+                    None => {
+                        self.runtime.insert(t);
+                    }
+                },
+                _ => {
+                    self.runtime.insert(t);
+                }
+            }
+        }
+    }
+    impl<'a> Visitor<'a> for Bindings {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            self.imports.extend(imported_module(stmt));
+            match stmt {
+                Stmt::Import(i) => {
+                    for alias in &i.names {
+                        let name = alias.name.as_str();
+                        let bound = match &alias.asname {
+                            Some(a) => a.as_str(),
+                            None => name.split('.').next().unwrap_or(name),
+                        };
+                        self.bind(bound);
+                        self.namespaces.insert(bound.to_owned());
+                    }
+                    return;
+                }
+                Stmt::ImportFrom(i) => {
+                    for alias in &i.names {
+                        let bound = alias.asname.as_ref().unwrap_or(&alias.name).as_str();
+                        self.bind(bound);
+                        self.namespaces.insert(bound.to_owned());
+                    }
+                    return;
+                }
+                Stmt::Assign(a) => {
+                    for target in &a.targets {
+                        self.assign(target, &a.value);
+                    }
+                    self.visit_expr(&a.value);
+                    return;
+                }
+                Stmt::AnnAssign(a) => {
+                    if let Some(value) = &a.value {
+                        self.assign(&a.target, value);
+                        self.visit_expr(value);
+                    }
+                    return;
+                }
+                Stmt::ClassDef(c) => {
+                    // A decorator may return something else entirely
+                    // (`@make_list class Holder`); only the standard
+                    // class-preserving ones keep the name a class.
+                    if c.decorator_list
+                        .iter()
+                        .all(|d| preserves_class(&d.expression))
+                    {
+                        self.bind(c.name.as_str());
+                        self.namespaces.insert(c.name.to_string());
+                        self.classes.insert(c.name.to_string());
+                    } else {
+                        self.runtime(c.name.as_str());
+                    }
+                }
+                // A function is no class, and a base naming one is CPython's
+                // error to report.
+                Stmt::FunctionDef(f) => self.runtime(f.name.as_str()),
+                Stmt::Global(g) => {
+                    if let Some(scope) = self.globals.last_mut() {
+                        scope.extend(g.names.iter().map(|n| n.to_string()));
+                    }
+                }
+                _ => {}
+            }
+            self.scope_body = matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_));
+            visitor::walk_stmt(self, stmt);
+        }
+        fn visit_body(&mut self, body: &'a [Stmt]) {
+            let scope = std::mem::take(&mut self.scope_body);
+            if scope {
+                self.depth += 1;
+                self.globals.push(HashSet::new());
+            }
+            visitor::walk_body(self, body);
+            if scope {
+                self.depth -= 1;
+                self.globals.pop();
+            }
+        }
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            // Every other binding: loop, `with`, walrus, unpacking and
+            // comprehension targets, `del`.
+            if let Expr::Name(n) = expr {
+                if !matches!(n.ctx, ruff_python_ast::ExprContext::Load) {
+                    self.runtime(n.id.as_str());
+                }
+            }
+            // `Holder.Base = list`, `del m.x`, `setattr(Holder, "Base", list)`.
+            let receiver = match expr {
+                Expr::Attribute(a) if !matches!(a.ctx, ruff_python_ast::ExprContext::Load) => {
+                    Some(a.value.as_ref())
+                }
+                Expr::Call(c)
+                    if matches!(c.func.as_ref(), Expr::Name(f)
+                        if matches!(f.id.as_str(), "setattr" | "delattr")) =>
+                {
+                    c.arguments.args.first()
+                }
+                _ => None,
+            };
+            if let Some(mut root) = receiver {
+                while let Expr::Attribute(inner) = root {
+                    root = inner.value.as_ref();
+                }
+                if let Expr::Name(r) = root {
+                    self.mutated.insert(r.id.to_string());
+                }
+            }
+            visitor::walk_expr(self, expr);
+        }
+        fn visit_pattern(&mut self, p: &'a Pattern) {
+            let name = match p {
+                Pattern::MatchAs(m) => m.name.as_ref(),
+                Pattern::MatchStar(m) => m.name.as_ref(),
+                Pattern::MatchMapping(m) => m.rest.as_ref(),
+                _ => None,
+            };
+            if let Some(n) = name {
+                self.runtime(n.as_str());
+            }
+            visitor::walk_pattern(self, p);
+        }
+        fn visit_except_handler(&mut self, h: &'a ruff_python_ast::ExceptHandler) {
+            let ruff_python_ast::ExceptHandler::ExceptHandler(e) = h;
+            if let Some(n) = &e.name {
+                self.runtime(n.as_str());
+            }
+            visitor::walk_except_handler(self, h);
+        }
+    }
+    let mut b = Bindings::default();
+    b.visit_body(&module.body);
+    // `Alias = Other` chains, to a fixed point.
+    loop {
+        let mut changed = false;
+        for (t, v) in &b.name_aliases {
+            if b.runtime.contains(v) && b.runtime.insert(t.clone()) {
+                changed = true;
+            }
+            // `Alias = Holder` names one object: a store through either
+            // mutates both.
+            if b.mutated.contains(t) != b.mutated.contains(v) {
+                b.mutated.insert(t.clone());
+                b.mutated.insert(v.clone());
+                changed = true;
+            }
+        }
+        for (t, root, mids) in &b.attr_aliases {
+            // `enum.Enum` without an import names the module in a
+            // Typhon-lowered `enum` declaration.
+            let trusted = (b.namespaces.contains(root) || root == "enum")
+                && !b.runtime.contains(root)
+                && !b.mutated.contains(root)
+                && (!b.classes.contains(root) || mids.iter().all(|m| b.classes.contains(m)))
+                && (b.classes.contains(root)
+                    || !b.imports.contains_key(root)
+                    || import_chain_trusted(b.imports.get(root), mids.len()));
+            if !trusted && b.runtime.insert(t.clone()) {
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let exported = b.runtime.intersection(&b.module_scope).cloned().collect();
+    (b.runtime, exported, b.mutated)
+}
+
 /// Whether `module` defines a generator whose `yield` sits where the
 /// tree-walk cannot suspend (a loop test, a `with` item, two yields in one
 /// expression, …). The VM runs such a generator eagerly — its whole body at

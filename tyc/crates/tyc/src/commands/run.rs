@@ -500,6 +500,23 @@ fn unmodelled_references(path: &std::path::Path, entry: &std::path::Path) -> Opt
     }
     let mut missing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut exports = ModelledExports::default();
+    // Builtin aliases any project module binds (`Alias = list`), so a class
+    // over one imported from a sibling falls back too.
+    // Re-exports chain (`Alias2 = Alias` over a third module's
+    // `Alias = list`), so collect until nothing new appears.
+    let modules: Vec<_> = files.iter().filter_map(|f| parse_for_scan(f)).collect();
+    let mut project_aliases: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    loop {
+        let mut changed = false;
+        for module in &modules {
+            let found = tyc_vm::module_builtin_aliases(module, &project_aliases);
+            changed |= tyc_vm::merge_builtin_aliases(&mut project_aliases, found);
+        }
+        if !changed {
+            break;
+        }
+    }
     for file in &files {
         let Some(module) = parse_for_scan(file) else {
             // Falling back to the compiled path is the safe answer for a
@@ -509,6 +526,9 @@ fn unmodelled_references(path: &std::path::Path, entry: &std::path::Path) -> Opt
             continue;
         };
         missing.extend(unmodelled_attribute_references(&module, &mut exports));
+        if let Some(reason) = tyc_vm::module_subclassed_builtin(&module, &project_aliases) {
+            missing.insert(reason);
+        }
         if tyc_vm::module_has_eager_generator(&module) {
             missing.insert("a generator whose yield the VM cannot suspend".into());
         }
@@ -1597,6 +1617,329 @@ mod tests {
     }
 
     #[test]
+    fn scan_routes_builtin_subclasses_to_cpython() {
+        // The VM models `list` / `int` / `str` as values, not classes, so a
+        // subclass of one runs on CPython.
+        for base in [
+            "list",
+            "int",
+            "str",
+            "dict",
+            "tuple",
+            "float",
+            "bytearray",
+            "enumerate",
+            "property",
+            // CPython rejects these as bases.
+            "bool",
+            "range",
+            "slice",
+            // Python 3.15 builtins the VM shims.
+            "frozendict",
+        ] {
+            let src = format!("plain class X({base}):\n    pass\nprint(X())\n");
+            assert_eq!(
+                scan_source(&src),
+                Some(vec![format!("a subclass of the builtin {base}")]),
+                "{src}"
+            );
+        }
+        // A base computed at runtime may be a builtin, directly or
+        // through a name.
+        for src in [
+            "def choose() -> type:\n    return list\nplain class L(choose()):\n    pass\nprint(L([1]))\n",
+            "def choose() -> type:\n    return list\nBase = choose()\nplain class L(Base):\n    pass\nprint(L([1]))\n",
+            "def choose() -> type:\n    return list\nBase = choose()\nAlias = Base\nplain class L(Alias):\n    pass\nprint(L([1]))\n",
+            "def choose() -> type:\n    return list\nlet Base: type = choose()\nplain class L(Base):\n    pass\nprint(L([1]))\n",
+            "bases: list[type] = [list]\nBase = bases[0]\nplain class L(Base):\n    pass\nprint(L([1]))\n",
+            "bases: list[type] = [list]\nplain class L(bases[0]):\n    pass\nprint(L([1]))\n",
+            "for Base in (list, dict):\n    plain class L(Base):\n        pass\n    print(L())\n",
+            "First, Second = list, dict\nplain class L(First):\n    pass\nprint(L())\n",
+            "def choose() -> type:\n    return list\nif (Base := choose()):\n    pass\nplain class L(Base):\n    pass\nprint(L([1]))\n",
+            "bases: list[type] = [list]\nmatch bases:\n    case [Base]:\n        plain class L(Base):\n            pass\n        print(L([1]))\n",
+            "plain class Holder:\n    def __init__(self, base: type) -> None:\n        self.base = base\nh = Holder(list)\nBase = h.base\nplain class L(Base):\n    pass\nprint(L([1]))\n",
+            "plain class L(Base):\n    pass\nBase = list if True else dict\n",
+            "plain class Holder:\n    def __init__(self, base: type) -> None:\n        self.base = base\nh = Holder(list)\nplain class L(h.base):\n    pass\nprint(L([1]))\n",
+            "def make(cfg: object) -> None:\n    plain class L(cfg.base):\n        pass\n    print(L([1]))\n",
+            "def make(bases: list[type]) -> None:\n    let Base = bases[0]\n    plain class L(Base):\n        pass\n    print(L([1]))\nmake([list])\n",
+        ] {
+            let found = scan_source(src).expect(src);
+            assert!(found[0].contains("computed at runtime"), "{src}: {found:?}");
+        }
+        // An attribute of a module or a class is trusted.
+        for src in [
+            "import enum\nclass Colour(enum.Enum):\n    RED = 1\nprint(Colour.RED)\n",
+            "plain class Outer:\n    plain class Inner:\n        pass\nplain class L(Outer.Inner):\n    pass\nprint(L())\n",
+            "import collections.abc\nplain class L(collections.abc.Iterable):\n    pass\nprint(L)\n",
+            "import enum\nE = enum.Enum\nclass Colour(E):\n    RED = 1\nprint(Colour.RED)\n",
+            "plain class Parent:\n    pass\nAlias = Parent\nplain class L(Alias):\n    pass\nprint(L())\n",
+        ] {
+            assert_eq!(scan_source(src), None, "{src}");
+        }
+        // Nested classes are found too.
+        let nested =
+            "def f() -> None:\n    plain class L(list):\n        pass\n    print(L())\nf()\n";
+        assert!(scan_source(nested).is_some());
+        // A value-mixin enum and an exception subclass are modelled.
+        let mixin =
+            "from enum import Enum\nclass Colour(str, Enum):\n    RED = \"r\"\nprint(Colour.RED)\n";
+        assert_eq!(scan_source(mixin), None);
+        let exc = "plain class E(ValueError):\n    pass\nprint(E())\n";
+        assert_eq!(scan_source(exc), None);
+        let typhon_enum = "enum Colour(str):\n    RED = \"r\"\nprint(Colour.RED)\n";
+        assert_eq!(scan_source(typhon_enum), None);
+        let enum_module =
+            "import enum as e\nclass Level(int, e.IntEnum):\n    LOW = 1\nprint(Level.LOW)\n";
+        assert_eq!(scan_source(enum_module), None);
+        let enum_base = "from enum import Enum\nclass Base(Enum):\n    pass\nclass Colour(str, Base):\n    RED = \"r\"\nprint(Colour.RED)\n";
+        assert_eq!(scan_source(enum_base), None);
+        // Only a real enum base exempts the class: a class merely named
+        // like one does not.
+        let not_enum = "plain class FakeEnum:\n    pass\nplain class L(list, FakeEnum):\n    pass\nprint(L())\n";
+        assert!(scan_source(not_enum).is_some());
+        // A parameterised base is its origin.
+        let generic = "plain class L(list[int]):\n    pass\nprint(L([1]))\n";
+        assert_eq!(
+            scan_source(generic),
+            Some(vec!["a subclass of the builtin list".to_owned()])
+        );
+        // `builtins.list`, and through an alias of the module.
+        for src in [
+            "import builtins\nplain class L(builtins.list):\n    pass\nprint(L())\n",
+            "import builtins as b\nplain class L(b.list):\n    pass\nprint(L())\n",
+            "plain class S(super):\n    pass\nprint(S)\n",
+        ] {
+            assert!(scan_source(src).is_some(), "{src}");
+        }
+        // An alias of a builtin is the builtin.
+        let alias = "Alias = list\nplain class L(Alias):\n    pass\nprint(L())\n";
+        assert_eq!(
+            scan_source(alias),
+            Some(vec!["a subclass of the builtin list".to_owned()])
+        );
+        let annotated = "Alias: type = list\nplain class L(Alias):\n    pass\nprint(L())\n";
+        assert!(scan_source(annotated).is_some());
+        let generic_alias = "Alias = list[int]\nplain class L(Alias):\n    pass\nprint(L())\n";
+        assert!(scan_source(generic_alias).is_some());
+        // A builtin alias holds in any scope and through a branch that may
+        // not rebind it; a conditional enum import exempts nothing.
+        for src in [
+            "def f() -> None:\n    let Alias = list\n    plain class L(Alias):\n        pass\n    print(L())\nf()\n",
+            "mut Alias: object = list\nif False:\n    Alias = object\nplain class L(Alias):\n    pass\nprint(L())\n",
+            "import sys\nif sys.argv:\n    from enum import Enum\nplain class L(list, Enum):\n    pass\nprint(L())\n",
+        ] {
+            assert!(scan_source(src).is_some(), "{src}");
+        }
+        let imported = "from builtins import dict as D\nplain class M(D):\n    pass\nprint(M())\n";
+        assert!(scan_source(imported).is_some());
+        // An enum mixin the VM does not model still falls back.
+        let list_enum = "from enum import Enum\nclass E(list, Enum):\n    A = [1]\nprint(E.A)\n";
+        assert_eq!(
+            scan_source(list_enum),
+            Some(vec!["a subclass of the builtin list".to_owned()])
+        );
+        // Only a module-scope binding names an enum base, and a later
+        // rebinding drops it.
+        for src in [
+            "def f() -> None:\n    from enum import Enum\nplain class Enum:\n    pass\nplain class L(list, Enum):\n    pass\nprint(L())\n",
+            "from enum import Enum\nplain class Enum:\n    pass\nplain class L(list, Enum):\n    pass\nprint(L())\n",
+            "from enum import Enum\nEnum = object\nplain class L(list, Enum):\n    pass\nprint(L())\n",
+        ] {
+            assert!(scan_source(src).is_some(), "{src}");
+        }
+        // A class factory's base may be handed a builtin.
+        let factory = "def make(Base: type) -> type:\n    plain class L(Base):\n        pass\n    return L\nprint(make(list))\n";
+        assert_eq!(
+            scan_source(factory),
+            Some(vec!["a class whose base is the parameter Base".to_owned()])
+        );
+        let local_alias = "def make(Base: type) -> type:\n    let Alias = Base\n    plain class L(Alias):\n        pass\n    return L\nprint(make(list))\n";
+        assert!(scan_source(local_alias).is_some());
+        // `defaultdict` is a native constructor too, and `functools`'
+        // classes natives, however they are spelt.
+        for (src, base) in [
+            ("from collections import defaultdict\nplain class D(defaultdict):\n    pass\nprint(D(list))\n", "defaultdict"),
+            ("import collections\nplain class D(collections.defaultdict):\n    pass\nprint(D(list))\n", "defaultdict"),
+            ("from functools import partial\nplain class P(partial):\n    pass\n", "partial"),
+            ("from functools import partial as Part\nplain class P(Part):\n    pass\n", "partial"),
+            ("import functools\nplain class P(functools.partial):\n    pass\n", "partial"),
+            ("import functools as ft\nplain class C(ft.cached_property):\n    pass\n", "cached_property"),
+            ("from functools import cached_property\nplain class C(cached_property):\n    pass\n", "cached_property"),
+            ("from enum import auto\nplain class X(auto):\n    pass\n", "auto"),
+            ("import enum\nplain class X(enum.auto):\n    pass\n", "auto"),
+            ("from typing import NewType\nplain class N(NewType):\n    pass\n", "NewType"),
+            ("import typing as t\nplain class N(t.NewType):\n    pass\n", "NewType"),
+        ] {
+            assert_eq!(
+                scan_source(src),
+                Some(vec![format!("a subclass of the builtin {base}")]),
+                "{src}"
+            );
+        }
+        // Another `functools` name is a plain function, not a base.
+        assert_eq!(
+            scan_source("import functools\nplain class W(functools.total_ordering):\n    pass\n"),
+            None
+        );
+        // An alias a sibling module exports, imported or reached through it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("helper.ty"), "Alias = list\n").unwrap();
+        std::fs::write(
+            dir.path().join("middle.ty"),
+            "from helper import Alias\nAlias2 = Alias\n",
+        )
+        .unwrap();
+        let entry = dir.path().join("main.ty");
+        std::fs::write(
+            &entry,
+            "from middle import Alias2\nplain class L(Alias2):\n    pass\nprint(L())\n",
+        )
+        .unwrap();
+        assert!(
+            unmodelled_references(&entry, &entry).is_some(),
+            "alias chain"
+        );
+        for main in [
+            "from helper import Alias\nplain class L(Alias):\n    pass\nprint(L())\n",
+            "import helper\nplain class L(helper.Alias):\n    pass\nprint(L())\n",
+            "from helper import Alias\nAlias2 = Alias\nplain class L(Alias2):\n    pass\nprint(L())\n",
+            "from helper import Alias as Alias2\nplain class L(Alias2):\n    pass\nprint(L())\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("helper.ty"), "Alias = list\n").unwrap();
+            let entry = dir.path().join("main.ty");
+            std::fs::write(&entry, main).unwrap();
+            assert!(
+                unmodelled_references(&entry, &entry)
+                    .unwrap_or_default()
+                    .contains(&"a subclass of the builtin list".to_owned()),
+                "{main}"
+            );
+        }
+        // A sibling's computed alias, reached through the module.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("helper.ty"),
+            "Alias = list if True else dict\n",
+        )
+        .unwrap();
+        for main in [
+            "import helper\nplain class L(helper.Alias):\n    pass\nprint(L([1]))\n",
+            "from helper import Alias\nplain class L(Alias):\n    pass\nprint(L([1]))\n",
+        ] {
+            let entry = dir.path().join("main.ty");
+            std::fs::write(&entry, main).unwrap();
+            assert!(
+                unmodelled_references(&entry, &entry)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|r| r.contains("computed at runtime")),
+                "{main}"
+            );
+        }
+        // A decorator may replace the class; the standard ones keep it.
+        assert!(scan_source(
+            "def make_list(c: type) -> type:\n    return list\n@make_list\nplain class Holder:\n    pass\nplain class L(Holder):\n    pass\nprint(L())\n"
+        )
+        .unwrap_or_default()
+        .iter()
+        .any(|r| r.contains("computed at runtime")));
+        assert_eq!(
+            scan_source("from dataclasses import dataclass\n@dataclass(frozen=True)\nplain class Base:\n    x: int = 0\nplain class L(Base):\n    pass\nprint(L())\n"),
+            None
+        );
+        // A nested class below a class is trusted.
+        assert_eq!(
+            scan_source("plain class Outer:\n    plain class Mid:\n        plain class Inner:\n            pass\nplain class L(Outer.Mid.Inner):\n    pass\nprint(L())\n"),
+            None
+        );
+        // An attribute of a namespace the module mutates is a runtime value.
+        for src in [
+            "plain class Holder:\n    Base: type = object\nHolder.Base = list\nplain class L(Holder.Base):\n    pass\nprint(L([1]))\n",
+            "plain class Holder:\n    Base: type = object\nsetattr(Holder, \"Base\", list)\nplain class L(Holder.Base):\n    pass\nprint(L([1]))\n",
+            "plain class Holder:\n    Base: type = object\nHolder.Base = list\nAlias = Holder.Base\nplain class L(Alias):\n    pass\nprint(L([1]))\n",
+            // A data attribute below a class, set up at runtime.
+            "plain class Box:\n    def __init__(self) -> None:\n        self.Base = list\nplain class Holder:\n    box: Box = Box()\nplain class L(Holder.box.Base):\n    pass\nprint(L([1]))\n",
+            // A class attribute computed at runtime.
+            "def choose() -> type:\n    return list\nplain class Holder:\n    Base: type = choose()\nplain class L(Holder.Base):\n    pass\nprint(L([1]))\n",
+            "def choose() -> type:\n    return list\nplain class Holder:\n    Base: type = choose()\nAlias = Holder.Base\nplain class L(Alias):\n    pass\nprint(L([1]))\n",
+            // Through an alias of the class.
+            "plain class Holder:\n    Base: type = object\nAlias = Holder\nAlias.Base = list\nplain class L(Holder.Base):\n    pass\nprint(L([1]))\n",
+            // A data attribute below a class (the `Base: type = list` alias
+            // alone already falls back; this checks the chain too).
+            "plain class Box:\n    Base: type = list\nplain class Holder:\n    box: Box = Box()\nplain class L(Holder.box.Base):\n    pass\nprint(L([1]))\n",
+            "plain class Box:\n    Base: type = list\nplain class Holder:\n    box: Box = Box()\nAlias = Holder.box.Base\nplain class L(Alias):\n    pass\nprint(L([1]))\n",
+        ] {
+            assert!(scan_source(src).is_some(), "{src}");
+        }
+        // A sibling's name bound in a definition header (which runs at
+        // module scope) or through `global` is exported too.
+        for helper in [
+            "def f(x: object = (Alias := list)) -> None:\n    pass\n",
+            "def g() -> None:\n    global Alias\n    Alias = list if True else dict\n\ng()\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("helper.ty"), helper).unwrap();
+            let entry = dir.path().join("main.ty");
+            std::fs::write(
+                &entry,
+                "from helper import Alias\nplain class L(Alias):\n    pass\nprint(L([1]))\n",
+            )
+            .unwrap();
+            assert!(
+                unmodelled_references(&entry, &entry)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|r| r.contains("computed at runtime")),
+                "{helper}"
+            );
+        }
+        // A project module's data below its namespace is a runtime value.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("helper.ty"),
+            "plain class Box:\n    def __init__(self, base: type) -> None:\n        self.Base = base\n\nbox = Box(list)\n",
+        )
+        .unwrap();
+        for main in [
+            "import helper\nplain class L(helper.box.Base):\n    pass\nprint(L([1]))\n",
+            "import helper as h\nAlias = h.box.Base\nplain class L(Alias):\n    pass\nprint(L([1]))\n",
+            "from helper import box\nplain class L(box.Base):\n    pass\nprint(L([1]))\n",
+        ] {
+            let entry = dir.path().join("main.ty");
+            std::fs::write(&entry, main).unwrap();
+            assert!(
+                unmodelled_references(&entry, &entry)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|r| r.contains("computed at runtime")),
+                "{main}"
+            );
+        }
+        // Two modules exporting one name for different builtins: the scan
+        // keeps the one that is not an enum mixin.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.ty"), "Alias = list\n").unwrap();
+        std::fs::write(dir.path().join("z.ty"), "Alias = str\n").unwrap();
+        let entry = dir.path().join("main.ty");
+        std::fs::write(
+            &entry,
+            "from a import Alias\nimport z\nfrom enum import Enum\nclass E(Alias, Enum):\n    A = 1\nprint(E.A)\n",
+        )
+        .unwrap();
+        assert!(
+            unmodelled_references(&entry, &entry)
+                .unwrap_or_default()
+                .contains(&"a subclass of the builtin list".to_owned()),
+            "conflicting exports"
+        );
+        // An alias of an enum base is one.
+        let enum_alias =
+            "from enum import Enum\nE = Enum\nclass C(str, E):\n    A = \"a\"\nprint(C.A)\n";
+        assert_eq!(scan_source(enum_alias), None);
+    }
+
+    #[test]
     fn scan_routes_eager_generators_to_cpython() {
         // Two yields in one expression: the VM would run the body eagerly.
         let eager =
@@ -1640,7 +1983,10 @@ mod tests {
             "plain class M(type):\n    pass\nplain class W(metaclass=M):\n    pass\nprint(W())\n";
         assert_eq!(
             scan_source(meta),
-            Some(vec!["a custom metaclass".to_owned()])
+            Some(vec![
+                "a custom metaclass".to_owned(),
+                "a subclass of the builtin type".to_owned()
+            ])
         );
         // `ABCMeta` is modelled.
         let abc = "import abc\nplain class A(metaclass=abc.ABCMeta):\n    pass\nprint(A)\n";
@@ -1685,7 +2031,10 @@ mod tests {
         let own = "plain class ABCMeta(type):\n    pass\nplain class W(metaclass=ABCMeta):\n    pass\nprint(W())\n";
         assert_eq!(
             scan_source(own),
-            Some(vec!["a custom metaclass".to_owned()])
+            Some(vec![
+                "a custom metaclass".to_owned(),
+                "a subclass of the builtin type".to_owned()
+            ])
         );
         let patched = "import abc\nplain class Custom(type):\n    pass\nabc.ABCMeta = Custom\nplain class W(metaclass=abc.ABCMeta):\n    pass\nprint(W())\n";
         assert!(scan_source(patched)

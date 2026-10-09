@@ -460,11 +460,20 @@ the VM where CPython raises `TypeError` and `Alias.__value__` is missing;
 `__del__` never runs; a metaclass's `__call__` / `__new__` are not
 consulted; `Named.__mro__` omits `typing.Generic`; a lone surrogate
 (`"\ud800"`) cannot be represented in a Rust `String` (`'%c' % 0xD800`
-yields U+FFFD); and a generator that falls back to eager collection (see
-"What the VM does not support yet") runs its side effects at call time.
-A plain `tyc run` sends a program with a `__del__`, a custom metaclass or
-an eagerly-collected generator to CPython, so these gaps show only under
-`--no-fallback`.
+yields U+FFFD); a generator that falls back to eager collection (see
+"What the VM does not support yet") runs its side effects at call time;
+and a subclass of a builtin value type (`class L(list)`, `class C(int)`,
+`class S(str)`, and likewise `class P(property)`, `class E(enumerate)` or
+`class F(functools.partial)`)
+holds no builtin value, since the VM models those types as values or
+natives rather than classes (an enum with a `str`, `int`, `float`,
+`bytes` or `complex` mixin, such as `class Colour(str, Enum)`, is
+modelled; `class E(list, Enum)` is not). A plain `tyc run` sends a program
+with a `__del__`, a custom metaclass, an eagerly-collected generator or a
+builtin subclass to CPython, so these gaps show only under
+`--no-fallback`; a class whose base is computed at runtime
+(`class L(choose())`) or is a type CPython refuses as a base (`bool`,
+`range`, `slice`, `memoryview`) is sent there too.
 
 ### Keyword arguments and the pre-run scan (beta)
 
