@@ -868,7 +868,7 @@ fn class_qualified(c: &Rc<crate::value::Class>) -> String {
         _ => "__main__".to_owned(),
     };
     if module == "builtins" {
-        c.effective_qualname()
+        (*c.effective_qualname()).clone()
     } else {
         format!("{module}.{}", c.effective_qualname())
     }

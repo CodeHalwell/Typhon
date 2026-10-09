@@ -16,6 +16,16 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ### Fixed
 
+- **`is` between strings follows CPython's objects.** Under `tyc run`, any
+  two equal strings compared `is`-identical. Now a freshly built string is
+  its own object, as in CPython (`"".join(["he", "llo"]) is "hello"` is
+  `False`). Equal literals in one module still share one object, and so do interned names
+  such as `Cls.__name__`, enum member names and `**kwargs` keys, plus `""`
+  and strings of one Latin-1 character. Operations CPython hands back unchanged keep
+  the same object too: `str(s)`, `s[:]`, `s + ""`, `s * 1`, `f"{s}"`,
+  `"".join([s])`, `format(s)`, `"%s" % s`, and `strip` / `replace` /
+  `ljust` / `split` and friends when they change nothing. `sys.intern` is
+  now available, and so is `x.__format__(spec)` on builtin values.
 - **`re.Match` offsets are in characters, and take a group.** Under `tyc
   run`, `start()`, `end()` and `span()` reported the regex engine's byte
   offsets, so any match after a non-ASCII character was off, and they

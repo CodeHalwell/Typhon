@@ -305,6 +305,12 @@ pub fn install(interp: &mut Interpreter) {
                 )?)));
             }
         }
+        // `str(s)` of a `str` is `s` itself.
+        if let [Value::Str(s)] = pos {
+            if kw.is_empty() {
+                return Ok(Value::Str(s.clone()));
+            }
+        }
         Ok(Value::Str(Rc::new(match pos.first() {
             Some(v) => interp.str_of(v)?,
             None => String::new(),
@@ -545,10 +551,17 @@ pub fn install(interp: &mut Interpreter) {
         if let Some(formatted) = interp.try_user_format(v, &spec)? {
             return Ok(Value::Str(Rc::new(formatted)));
         }
+        // `format(s)` of a `str` is `s` itself, and so is any spec that
+        // leaves it unchanged (`format(s, "1")`).
+        if let (Value::Str(s), true) = (v, spec.is_empty()) {
+            return Ok(Value::Str(s.clone()));
+        }
         let base = interp.format_default(v, &spec)?;
-        Ok(Value::Str(Rc::new(crate::interp::format_with_spec_pub(
-            v, &base, &spec,
-        )?)))
+        let out = crate::interp::format_with_spec_pub(v, &base, &spec)?;
+        match v {
+            Value::Str(s) if **s == out => Ok(Value::Str(s.clone())),
+            _ => Ok(Value::Str(Rc::new(out))),
+        }
     });
 
     native!("ascii", |interp, args| {
@@ -859,7 +872,14 @@ pub fn install(interp: &mut Interpreter) {
         };
         let expr = expr.value.clone();
         let env = i.root.clone();
-        i.eval_expr(&expr, &env)
+        // An `eval` is its own compilation unit (`File "<string>"`), so its
+        // literals are not the caller's constants.
+        let outer = i
+            .current_source
+            .replace(Rc::new(crate::interp::SourceInfo::new("<string>", &source)));
+        let result = i.eval_expr(&expr, &env);
+        i.current_source = outer;
+        result
     });
 
     native!("bytearray", |i, args| {
@@ -1664,7 +1684,7 @@ pub fn install(interp: &mut Interpreter) {
             name,
             Value::Class(Rc::new(crate::value::Class {
                 name: name.to_owned(),
-                qualname: name.to_owned(),
+                qualname: Rc::new(name.to_owned()),
                 methods: std::cell::RefCell::new(HashMap::new()),
                 fields: vec![],
                 class_attrs: std::cell::RefCell::new(HashMap::new()),
@@ -2702,7 +2722,7 @@ fn make_collections_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
             Value::Dict(Rc::new(crate::value::FrozenCell::new(field_defaults))),
         );
         let cls = Rc::new(crate::value::Class {
-            qualname: typename.clone(),
+            qualname: Rc::new(typename.clone()),
             name: typename,
             // Inherited through the MRO, not copied: CPython names
             // `Point._make` as defined on the template's class.
@@ -2830,7 +2850,7 @@ fn type_new(interp: &Interpreter, args: &[Value]) -> Result<Value, Unwind> {
         ))
     })?;
     Ok(Value::Class(Rc::new(crate::value::Class {
-        qualname: name.clone(),
+        qualname: Rc::new(name.clone()),
         name,
         methods: RefCell::new(methods),
         fields: vec![],
@@ -6161,6 +6181,16 @@ fn make_sys_module(interp: &Interpreter) -> Value {
                 }),
             ),
             (
+                "intern",
+                nf("intern", |i, args| match single(&args, "intern")? {
+                    Value::Str(s) => Ok(Value::Str(i.intern_rc(s))),
+                    other => Err(type_error(format!(
+                        "intern() argument must be str, not {}",
+                        other.type_name()
+                    ))),
+                }),
+            ),
+            (
                 "getrecursionlimit",
                 nf("getrecursionlimit", |i, _args| {
                     Ok(Value::Int(VmInt::from(i.max_stack_depth as i64)))
@@ -8078,7 +8108,7 @@ thread_local! {
 fn bare_shim_class(name: &str) -> crate::value::Class {
     crate::value::Class {
         name: name.to_owned(),
-        qualname: name.to_owned(),
+        qualname: Rc::new(name.to_owned()),
         methods: RefCell::new(HashMap::new()),
         fields: vec![],
         class_attrs: RefCell::new(HashMap::new()),
@@ -9334,7 +9364,7 @@ fn make_pydantic_module() -> Value {
     )]);
     let base_model = Value::Class(Rc::new(crate::value::Class {
         name: "BaseModel".to_owned(),
-        qualname: "BaseModel".to_owned(),
+        qualname: Rc::new("BaseModel".to_owned()),
         methods: std::cell::RefCell::new(HashMap::new()),
         fields: vec![],
         class_attrs: std::cell::RefCell::new(base_model_attrs),
@@ -9469,7 +9499,7 @@ fn intern_shim_name(name: String) -> &'static str {
 pub(crate) fn native_object(class_name: &str, fields: Vec<(&str, Value)>) -> Value {
     let cls = Rc::new(crate::value::Class {
         name: class_name.to_owned(),
-        qualname: class_name.to_owned(),
+        qualname: Rc::new(class_name.to_owned()),
         methods: RefCell::new(HashMap::new()),
         fields: vec![],
         class_attrs: RefCell::new(HashMap::new()),
@@ -9962,7 +9992,7 @@ thread_local! {
     /// (annotation text) and `default`.
     static DATACLASS_FIELD_CLASS: Rc<crate::value::Class> = Rc::new(crate::value::Class {
         name: "Field".to_owned(),
-        qualname: "Field".to_owned(),
+        qualname: Rc::new("Field".to_owned()),
         methods: RefCell::new(HashMap::new()),
         fields: ["name", "type", "default"]
             .iter()
@@ -10334,8 +10364,38 @@ pub fn dispatch_method(
     // per-type tables below do not carry them.
     match name {
         "__repr__" => return Ok(Value::Str(Rc::new(interp.repr_of(&receiver)?))),
-        "__str__" | "__format__" if rest.is_empty() || name == "__str__" => {
-            return Ok(Value::Str(Rc::new(interp.str_of(&receiver)?)))
+        // `s.__str__()` of a `str` is `s` itself.
+        "__str__" => {
+            if let Value::Str(s) = &receiver {
+                return Ok(Value::Str(s.clone()));
+            }
+            return Ok(Value::Str(Rc::new(interp.str_of(&receiver)?)));
+        }
+        // `x.__format__(spec)` is `format(x, spec)` for a builtin value; a
+        // `str` that the spec leaves unchanged is handed back itself.
+        "__format__" => {
+            let spec = match rest {
+                [Value::Str(spec)] => spec,
+                [other] => {
+                    return Err(type_error(format!(
+                        "__format__() argument must be str, not {}",
+                        other.type_name()
+                    )))
+                }
+                _ => {
+                    return Err(type_error(format!(
+                        "{}.__format__() takes exactly one argument ({} given)",
+                        receiver.type_name(),
+                        rest.len()
+                    )))
+                }
+            };
+            let base = interp.format_default(&receiver, spec)?;
+            let out = crate::interp::format_with_spec_pub(&receiver, &base, spec)?;
+            return Ok(match &receiver {
+                Value::Str(s) if **s == out => Value::Str(s.clone()),
+                _ => Value::Str(Rc::new(out)),
+            });
         }
         "__len__" => {
             return Ok(Value::Int(VmInt::from(value_len(&receiver)? as i64)));
@@ -10347,7 +10407,10 @@ pub fn dispatch_method(
     }
     match (&receiver, name) {
         // ── str methods ────────────────────────────────────────────────────
-        (Value::Str(s), m) => str_method(interp, s, m, rest, &kwargs),
+        (Value::Str(s), m) => {
+            let out = str_method(interp, s, m, rest, &kwargs)?;
+            Ok(keep_unchanged_str(s, m, rest, out))
+        }
         // ── bytes methods ──────────────────────────────────────────────────
         (Value::Bytes(b), m) => bytes_method(b, m, rest, &kwargs),
         // ── list methods ───────────────────────────────────────────────────
@@ -10501,6 +10564,73 @@ pub fn str_maketrans(args: &[Value]) -> Result<Value, Unwind> {
     Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(map))))
 }
 
+/// The argument a `str.format` template made of a single bare replacement
+/// field selects, if that is all the template is.
+fn sole_format_field<'a>(
+    template: &str,
+    pos: &'a [Value],
+    kwargs: &'a [(String, Value)],
+) -> Option<&'a Value> {
+    let inner = template.strip_prefix('{')?.strip_suffix('}')?;
+    // `name[!s][:spec]`. The outer field is numbered before any nested one
+    // in its spec (`"{:{}}"`), and the caller only reuses the `str` when
+    // formatting changed nothing.
+    let field = inner.split_once(':').map_or(inner, |(f, _)| f);
+    let name = field.strip_suffix("!s").unwrap_or(field);
+    if name.contains(['{', '}', '!', ':', '.', '[']) {
+        return None;
+    }
+    if name.is_empty() {
+        return pos.first();
+    }
+    if let Ok(i) = name.parse::<usize>() {
+        return pos.get(i);
+    }
+    kwargs.iter().find(|(k, _)| k == name).map(|(_, v)| v)
+}
+
+/// CPython's `str` methods hand back the receiver itself, not a copy, when
+/// they change nothing (`s.strip() is s` for an unpadded `s`), and a split
+/// that finds no separator returns the receiver as its only piece.
+fn keep_unchanged_str(s: &Rc<String>, name: &str, args: &[Value], out: Value) -> Value {
+    let same = |v: &Value| matches!(v, Value::Str(r) if !Rc::ptr_eq(r, s) && **r == **s);
+    match name {
+        "strip" | "lstrip" | "rstrip" | "replace" | "ljust" | "rjust" | "center" | "zfill"
+        | "expandtabs" | "removeprefix" | "removesuffix"
+            if same(&out) =>
+        {
+            Value::Str(s.clone())
+        }
+        "split" | "rsplit" | "splitlines" => {
+            if let Value::List(l) = &out {
+                let mut items = l.borrow_mut();
+                if items.len() == 1 && same(&items[0]) {
+                    items[0] = Value::Str(s.clone());
+                }
+            }
+            out
+        }
+        // Not found: the receiver is the whole piece (first for `partition`,
+        // last for `rpartition`). Found: the separator is the argument itself.
+        "partition" | "rpartition" => match &out {
+            Value::Tuple(t) if t.len() == 3 => {
+                let mut parts = t.as_ref().clone();
+                let whole = if name == "partition" { 0 } else { 2 };
+                if same(&parts[whole]) {
+                    parts[whole] = Value::Str(s.clone());
+                } else if let (Some(Value::Str(sep)), Value::Str(got)) = (args.first(), &parts[1]) {
+                    if **sep == **got {
+                        parts[1] = Value::Str(sep.clone());
+                    }
+                }
+                Value::Tuple(Rc::new(parts))
+            }
+            _ => out,
+        },
+        _ => out,
+    }
+}
+
 fn str_method(
     interp: &mut Interpreter,
     s: &Rc<String>,
@@ -10626,16 +10756,21 @@ fn str_method(
                 .first()
                 .ok_or_else(|| type_error("str.join requires an iterable"))?
                 .clone();
-            let mut parts: Vec<String> = Vec::new();
+            let mut parts: Vec<Rc<String>> = Vec::new();
+            // Whether every item was a plain `str` (not a `StrEnum` member).
+            let mut exact = true;
             let it = interp.make_iter(iterable)?;
             while let Some(v) = interp.iter_next(&it)? {
                 // A `StrEnum` member *is* its string, so it joins like one.
                 let v = match crate::value::enum_mixin_value(&v) {
-                    Some(inner @ Value::Str(_)) => inner,
+                    Some(inner @ Value::Str(_)) => {
+                        exact = false;
+                        inner
+                    }
                     _ => v,
                 };
                 match v {
-                    Value::Str(s) => parts.push((*s).clone()),
+                    Value::Str(s) => parts.push(s),
                     other => {
                         return Err(type_error(format!(
                             "sequence item: expected str instance, {} found",
@@ -10644,7 +10779,18 @@ fn str_method(
                     }
                 }
             }
-            Value::Str(Rc::new(parts.join(s)))
+            // CPython hands back a lone `str` item itself.
+            if parts.len() == 1 && exact {
+                return Ok(Value::Str(parts.pop().unwrap()));
+            }
+            let mut out = String::new();
+            for (i, p) in parts.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(s);
+                }
+                out.push_str(p);
+            }
+            Value::Str(Rc::new(out))
         }
         "replace" => {
             let from = args
@@ -10971,7 +11117,18 @@ fn str_method(
             // via the trailing kwargs sentinel that `call_value` appends for
             // bound builtin methods (see make_kwargs_sentinel / split_kwargs).
             let (pos_args, kwargs) = split_kwargs(args);
-            return str_format(interp, s, pos_args, &kwargs);
+            let out = str_format(interp, s, pos_args, &kwargs)?;
+            // A template that is one field (`"{}"`, `"{0}"`, `"{name!s:5}"`)
+            // hands back that argument itself when it is a `str` and
+            // formatting changed nothing.
+            if let (Value::Str(text), Some(Value::Str(arg))) =
+                (&out, sole_format_field(s, pos_args, &kwargs))
+            {
+                if **text == **arg {
+                    return Ok(Value::Str(arg.clone()));
+                }
+            }
+            return Ok(out);
         }
         // `str.format_map(m)` is `format(**m)` without copying the mapping —
         // and, unlike `format`, it accepts non-string keys, which simply
@@ -10992,7 +11149,16 @@ fn str_method(
                     _ => None,
                 })
                 .collect();
-            return str_format(interp, s, &[], &kwargs);
+            let out = str_format(interp, s, &[], &kwargs)?;
+            // As for `format`: a sole field hands back an unchanged `str`.
+            if let (Value::Str(text), Some(Value::Str(arg))) =
+                (&out, sole_format_field(s, &[], &kwargs))
+            {
+                if **text == **arg {
+                    return Ok(Value::Str(arg.clone()));
+                }
+            }
+            return Ok(out);
         }
         "encode" => {
             // Keywords arrive as a trailing sentinel (see `splitlines`).
@@ -13247,7 +13413,7 @@ thread_local! {
         );
         Rc::new(crate::value::Class {
             name: "JSONDecodeError".to_owned(),
-            qualname: "JSONDecodeError".to_owned(),
+            qualname: Rc::new("JSONDecodeError".to_owned()),
             methods: RefCell::new(HashMap::new()),
             fields: vec![],
             class_attrs: RefCell::new(attrs),
@@ -14309,7 +14475,7 @@ pub fn make_builtin_type(name: &str) -> Value {
             .or_insert_with(|| {
                 Rc::new(crate::value::Class {
                     name: name.to_owned(),
-                    qualname: name.to_owned(),
+                    qualname: Rc::new(name.to_owned()),
                     methods: std::cell::RefCell::new(HashMap::new()),
                     fields: vec![],
                     class_attrs: std::cell::RefCell::new(HashMap::new()),

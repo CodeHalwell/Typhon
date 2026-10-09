@@ -2139,3 +2139,104 @@ show(re.search("l", s).string is s, c.match(s, 2).string is s, re.sub("e", lambd
 "#,
     );
 }
+
+#[test]
+fn str_identity_follows_cpython_objects() {
+    assert_matches_cpython(
+        "str_identity_follows_cpython_objects",
+        r#"import sys
+from enum import Enum
+class Color(Enum):
+    RED = 1
+class Box:
+    pass
+def ident(x):
+    return x
+def kw(**k):
+    return list(k)
+c = "".join(["hello", " world"])
+w = "".join(["he", "llo"])
+lit = "hello world"
+name = "hello"
+show(lit is "hello world", c is lit, w is name, ident("hello world") is lit, c is c)
+show(str(c) is c, c[:] is c, c[0:] is c, c[::1] is c, c[::-1] is c, c[1:] is c)
+show((c + "") is c, ("" + c) is c, (c * 1) is c, f"{c}" is c, f"{c!s}" is c, f"{c!r}" is c, f"<{c}>" is c)
+show("".join([c]) is c, ", ".join([c]) is c, format(c) is c, format(c, "") is c, ("%s" % c) is c, "{}".format(c) is c)
+show(c.strip() is c, c.rstrip("z") is c, c.replace("zz", "y") is c, c.ljust(3) is c, c.zfill(1) is c, c.removeprefix("zz") is c)
+show(c.split("zz")[0] is c, w.split()[0] is w, c.partition("zz")[0] is c, c.rpartition("zz")[2] is c, c.splitlines()[0] is c)
+show(c.lower() is c, c.title() is c, c.strip("h") is c, c.replace("l", "L") is c)
+show(sys.intern(w) is name, sys.intern(c) is c, max([c]) is c, next(iter({c: 1})) is c, next(iter({c})) is c)
+show(Box.__name__ is "Box", Box.__name__ is Box.__name__, ident.__name__ is "ident", Color.RED.name is "RED", kw(alpha=1)[0] is "alpha")
+show(c[0] is "h", "".join([]) is "", c[0:0] is "", getattr(Box, "__name__") is "Box", repr(c) is repr(c))
+c2 = "".join(["hello", " world"])
+show("{1}".format(c, c2) is c2, "{0}".format(c, c2) is c, "{k}".format(k=c2) is c2, "{!s}".format(c) is c, "hello world".format(c) is c, "{}{}".format(c, "") is c)
+show(("%s%s" % (c, "")) is c, ("%(k)s" % {"k": c}) is c, ("%r" % c) is c, ("%.20s" % c) is c)
+show(format(c, "1") is c, format(c, "20") is c, format(c, ".3") is c, "{:1}".format(c) is c, "{0!s:>5}".format(c) is c, "{:20}".format(c) is c, "{:{}}".format(c, 3) is c)
+def _named() -> int:
+    return 0
+_named.__qualname__ = c
+show(_named.__qualname__ is c, c.__str__() is c, c.__format__("") is c, c.__format__("5") is c, c.__format__("20") is c)
+show("{k}".format_map({"k": c}) is c, "{k:3}".format_map({"k": c}) is c, "{k:30}".format_map({"k": c}) is c)
+_he = "he"
+show(("ab" * (1 + 1)) is "abab", ("ab" * (2 * 2)) is "abababab", ("ab" * (3 - 1)) is "abab", ("ab" * -1) is "")
+def _documented() -> None:
+    """the quick brown fox"""
+show(_documented.__doc__ is _documented.__doc__, _documented.__doc__ is "the quick brown fox")
+show(("he" + "llo") is "hello", ("a b" + " c") is "a b c", ("ab" * 3) is "ababab", (2 * "xy" + "!") is "xyxy!", ("x" * 4096) is ("x" * 4096), ("x" * 4097) is ("x" * 4097), (_he + "llo") is "hello")
+show((5).__format__("03"), (2.5).__format__(".1f"), [1].__format__(""))
+for _bad in (lambda: c.__format__(1), lambda: (5).__format__(), lambda: c.__format__("a", "b")):
+    try:
+        _bad()
+    except TypeError as e:
+        show(str(e))
+show(("%(k)1s" % {"k": c}) is c, ("%(k)#s" % {"k": c}) is c, ("%(k).20s" % {"k": c}) is c, ("%(k).3s" % {"k": c}) is c)
+show(("%#s" % c) is c, ("%-#5s" % c) is c, ("%+s" % c) is c, ("% s" % c) is c, f"{c:3}" is c, f"{c:20}" is c, f"{c!r}" is c)
+show(c.partition(c2)[1] is c2, c.partition(c2)[1] is c, c.rpartition("zz")[0] is c, c.partition("zz")[2] is c)
+show(eval("'hello world'") is eval("'hello world'"), eval("'hello world'") is lit, eval("'abc'") is "abc")
+try:
+    sys.intern(1)
+except TypeError as e:
+    show(str(e))
+"#,
+    );
+}
+
+#[test]
+fn literal_and_qualname_objects_belong_to_their_module() {
+    // A non-name literal and a nested `__qualname__` are constants of the
+    // module that defines them: shared within it, distinct across modules.
+    let util = r#"def make() -> type:
+    class C:
+        pass
+    return C
+def inner():
+    def f() -> int:
+        return 1
+    return f
+VALUE = "hello world"
+NAME = "hello_world"
+"#;
+    let main = r#"import util
+def make() -> type:
+    class C:
+        pass
+    return C
+def inner():
+    def f() -> int:
+        return 1
+    return f
+VALUE = "hello world"
+NAME = "hello_world"
+assert util.VALUE is not VALUE
+assert util.NAME is NAME
+assert util.make().__qualname__ is not make().__qualname__
+assert make().__qualname__ is make().__qualname__
+assert util.inner().__qualname__ is not inner().__qualname__
+assert inner().__qualname__ is inner().__qualname__
+assert util.make().__name__ is make().__name__
+"#;
+    assert_eq!(
+        run_project(&[("util.ty", util), ("main.ty", main)], "main.ty").unwrap(),
+        0
+    );
+}
