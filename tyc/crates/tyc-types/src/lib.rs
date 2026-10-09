@@ -10172,6 +10172,17 @@ fn count_bindings(body: &[Stmt], module_only: bool) -> HashMap<String, usize> {
             visitor::walk_expr(self, expr);
             self.depth -= usize::from(scope);
         }
+        fn visit_comprehension(&mut self, comp: &'a ruff_python_ast::Comprehension) {
+            // A comprehension's target is its own scope's
+            // (`[object for object in xs]`); a walrus in it is not.
+            self.visit_expr(&comp.iter);
+            self.depth += 1;
+            self.visit_expr(&comp.target);
+            self.depth -= 1;
+            for e in &comp.ifs {
+                self.visit_expr(e);
+            }
+        }
         fn visit_except_handler(&mut self, h: &'a ruff_python_ast::ExceptHandler) {
             let ruff_python_ast::ExceptHandler::ExceptHandler(e) = h;
             if let Some(name) = &e.name {
@@ -29608,6 +29619,21 @@ def main() -> None:
         assert!(
             check_class_kinds(local_object).has_errors(),
             "a local object binding leaves the module's object"
+        );
+        let comprehension_object = "\
+let xs = [object for object in [Exception]]
+
+plain class A(object):
+    pass
+
+def main() -> None:
+    print(xs)
+    let a: A = A(1)
+    print(a)
+";
+        assert!(
+            check_class_kinds(comprehension_object).has_errors(),
+            "a comprehension target leaves the module's object"
         );
         // So is a local class reached through an alias.
         let aliased = "\

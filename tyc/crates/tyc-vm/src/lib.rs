@@ -1141,6 +1141,10 @@ fn scan_builtin_subclasses(
         /// Names bound to a value computed at runtime (`Base = choose()`),
         /// in any scope, which may be a builtin type.
         computed: std::collections::HashSet<String>,
+        /// Names an import binds and classes the module defines, in any
+        /// scope: the receivers of an attribute base the scan trusts
+        /// (`models.Model`, `Outer.Inner`).
+        namespaces: std::collections::HashSet<String>,
         /// Builtin aliases the project's other modules export.
         project: std::collections::HashMap<String, String>,
         /// Only collect `builtin`; report nothing.
@@ -1225,7 +1229,27 @@ fn scan_builtin_subclasses(
                         "a class whose base {} is computed at runtime",
                         n.id
                     )),
-                    Expr::Name(_) | Expr::Attribute(_) => None,
+                    Expr::Name(_) => None,
+                    // `h.base` on an instance, a parameter or anything else
+                    // not a module or class is a runtime value.
+                    Expr::Attribute(a) => {
+                        let mut root = a.value.as_ref();
+                        while let Expr::Attribute(inner) = root {
+                            root = inner.value.as_ref();
+                        }
+                        match root {
+                            // `enum ...` lowers to `enum.Enum` before the
+                            // build adds the import.
+                            Expr::Name(n)
+                                if (self.namespaces.contains(n.id.as_str()) || n.id == "enum")
+                                    && !self.computed.contains(n.id.as_str())
+                                    && !self.params.iter().any(|p| p.contains(n.id.as_str())) =>
+                            {
+                                None
+                            }
+                            _ => Some("a class whose base is computed at runtime".to_owned()),
+                        }
+                    }
                     _ => Some("a class whose base is computed at runtime".to_owned()),
                 }
             })
@@ -1286,6 +1310,7 @@ fn scan_builtin_subclasses(
                             None => name.split('.').next().unwrap_or(name),
                         };
                         self.unbind(bound);
+                        self.namespaces.insert(bound.to_owned());
                         match name {
                             "enum" if pinned => {
                                 self.enum_modules.insert(bound.to_owned());
@@ -1306,6 +1331,7 @@ fn scan_builtin_subclasses(
                         let name = alias.name.as_str();
                         let bound = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
                         self.unbind(&bound);
+                        self.namespaces.insert(bound.clone());
                         match module {
                             Some("enum") if pinned && ENUM_TYPES.contains(&name) => {
                                 self.enum_bases.insert(bound);
@@ -1380,6 +1406,7 @@ fn scan_builtin_subclasses(
                 Stmt::ClassDef(c) => {
                     let is_enum = c.bases().iter().any(|b| self.is_enum_base(b));
                     self.unbind(c.name.as_str());
+                    self.namespaces.insert(c.name.to_string());
                     if pinned && is_enum {
                         self.enum_bases.insert(c.name.to_string());
                     }

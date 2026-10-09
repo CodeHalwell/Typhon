@@ -1655,9 +1655,19 @@ mod tests {
             "bases: list[type] = [list]\nplain class L(bases[0]):\n    pass\nprint(L([1]))\n",
             "for Base in (list, dict):\n    plain class L(Base):\n        pass\n    print(L())\n",
             "First, Second = list, dict\nplain class L(First):\n    pass\nprint(L())\n",
+            "plain class Holder:\n    def __init__(self, base: type) -> None:\n        self.base = base\nh = Holder(list)\nplain class L(h.base):\n    pass\nprint(L([1]))\n",
+            "def make(cfg: object) -> None:\n    plain class L(cfg.base):\n        pass\n    print(L([1]))\n",
         ] {
             let found = scan_source(src).expect(src);
             assert!(found[0].contains("computed at runtime"), "{src}: {found:?}");
+        }
+        // An attribute of a module or a class is trusted.
+        for src in [
+            "import enum\nclass Colour(enum.Enum):\n    RED = 1\nprint(Colour.RED)\n",
+            "plain class Outer:\n    plain class Inner:\n        pass\nplain class L(Outer.Inner):\n    pass\nprint(L())\n",
+            "import collections.abc\nplain class L(collections.abc.Iterable):\n    pass\nprint(L)\n",
+        ] {
+            assert_eq!(scan_source(src), None, "{src}");
         }
         // Nested classes are found too.
         let nested =

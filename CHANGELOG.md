@@ -27,7 +27,8 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   `dict.fromkeys.__self__` is `dict`).
   `repr(defaultdict)` is `<class 'collections.defaultdict'>`. A native
   standing in for a function CPython writes in Python (`json.dumps`,
-  `dataclasses.field`) stays a `function`, and `random`'s exports are
+  `dataclasses.field`, taken from a per-export table of CPython 3.13) stays
+  a `function`, and `random`'s exports are
   methods of its hidden `Random()` as in CPython (`random.randint` is a
   `method` named `Random.randint`; `random.random` a builtin).
   `@contextmanager` and `lru_cache(n)` return a `function`.
@@ -62,7 +63,8 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   through a chain of re-exports), a class factory's parameter base
   (`def make(Base: type)` with `class L(Base)`), a base computed at
   runtime (`class L(choose())`, `Base = choose()` or `Base = bases[0]`
-  then `class L(Base)`, a loop or unpacking target) and a `defaultdict`,
+  then `class L(Base)`, a loop or unpacking target, an attribute of
+  anything but a module or class such as `h.base`) and a `defaultdict`,
   `frozendict` or `sentinel` base fall back too, as do `bool`, `range`,
   `slice` and `memoryview` bases, which CPython rejects. When two modules
   export one alias name for different builtins, the scan assumes the one

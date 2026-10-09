@@ -3454,34 +3454,179 @@ pub(crate) fn module_dir_names(m: &Module) -> std::collections::BTreeSet<String>
     names
 }
 
-/// Modules whose CPython functions are written in Python, so their natives
-/// are `function`s rather than builtins (`type(json.dumps)`). `random`'s
-/// exports are methods of a hidden `Random` instance, never functions.
-fn module_defines_python_functions(name: &str) -> bool {
-    !matches!(
-        name.split('.').next().unwrap_or(name),
-        "builtins"
-            | "math"
-            | "time"
-            | "sys"
-            | "heapq"
-            | "hashlib"
-            | "random"
-            | "__future__"
-            | "__main__"
-    )
+/// The exports of each modelled module that CPython 3.13 writes in Python
+/// (`type(json.dumps)` is `function`), so the natives standing in for them
+/// report `function` too. Anything else a module exports is a C builtin
+/// (`os.getcwd`, `functools.reduce`) or a class.
+const PY_FUNCTIONS: &[(&str, &[&str])] = &[
+    ("abc", &["abstractmethod", "update_abstractmethods"]),
+    (
+        "asyncio",
+        &[
+            "create_task",
+            "gather",
+            "run",
+            "sleep",
+            "timeout",
+            "to_thread",
+            "wait_for",
+        ],
+    ),
+    ("collections", &["namedtuple"]),
+    ("contextlib", &["asynccontextmanager", "contextmanager"]),
+    ("copy", &["copy", "deepcopy", "replace"]),
+    (
+        "dataclasses",
+        &[
+            "asdict",
+            "astuple",
+            "dataclass",
+            "field",
+            "fields",
+            "is_dataclass",
+            "replace",
+        ],
+    ),
+    (
+        "functools",
+        &[
+            "cache",
+            "lru_cache",
+            "singledispatch",
+            "total_ordering",
+            "update_wrapper",
+            "wraps",
+        ],
+    ),
+    ("glob", &["escape", "glob", "has_magic", "iglob"]),
+    ("hashlib", &["file_digest", "new"]),
+    ("heapq", &["merge", "nlargest", "nsmallest"]),
+    ("json", &["dump", "dumps", "load", "loads"]),
+    (
+        "os",
+        &[
+            "fdopen",
+            "fsdecode",
+            "fsencode",
+            "getenv",
+            "makedirs",
+            "process_cpu_count",
+            "removedirs",
+            "renames",
+            "walk",
+        ],
+    ),
+    (
+        "os.path",
+        &[
+            "abspath",
+            "basename",
+            "commonpath",
+            "commonprefix",
+            "dirname",
+            "exists",
+            "expanduser",
+            "expandvars",
+            "getatime",
+            "getctime",
+            "getmtime",
+            "getsize",
+            "isabs",
+            "isdevdrive",
+            "isdir",
+            "isfile",
+            "isjunction",
+            "islink",
+            "ismount",
+            "join",
+            "lexists",
+            "normcase",
+            "realpath",
+            "relpath",
+            "samefile",
+            "samestat",
+            "split",
+            "splitdrive",
+            "splitext",
+        ],
+    ),
+    (
+        "re",
+        &[
+            "compile",
+            "escape",
+            "findall",
+            "finditer",
+            "fullmatch",
+            "match",
+            "search",
+            "split",
+            "sub",
+            "subn",
+        ],
+    ),
+    (
+        "shutil",
+        &[
+            "chown",
+            "copy",
+            "copy2",
+            "copyfile",
+            "copyfileobj",
+            "copymode",
+            "copystat",
+            "copytree",
+            "disk_usage",
+            "get_terminal_size",
+            "ignore_patterns",
+            "move",
+            "rmtree",
+            "which",
+        ],
+    ),
+    ("string", &["capwords"]),
+    (
+        "tempfile",
+        &[
+            "NamedTemporaryFile",
+            "TemporaryFile",
+            "gettempdir",
+            "gettempdirb",
+            "gettempprefix",
+            "mkdtemp",
+            "mkstemp",
+            "mktemp",
+        ],
+    ),
+    (
+        "typing",
+        &[
+            "NamedTuple",
+            "TypedDict",
+            "cast",
+            "dataclass_transform",
+            "final",
+            "get_args",
+            "get_origin",
+            "no_type_check",
+            "overload",
+            "override",
+            "runtime_checkable",
+        ],
+    ),
+];
+
+/// Whether CPython writes `module.name` in Python, per [`PY_FUNCTIONS`].
+fn is_python_function(module: &str, name: &str) -> bool {
+    PY_FUNCTIONS
+        .iter()
+        .any(|(m, names)| *m == module && names.contains(&name))
 }
 
 fn make_module(name: &str, entries: Vec<(&str, Value)>) -> Value {
-    let python_functions = module_defines_python_functions(name);
     let mut map = HashMap::new();
     for (k, v) in entries {
         if let Value::Native(n) = &v {
-            // `functools.reduce` and `cmp_to_key` are C even in a Python
-            // module, and `heapq.nsmallest` / `nlargest` / `merge` Python
-            // in a C one.
-            let c_function = name == "functools" && matches!(k, "reduce" | "cmp_to_key");
-            let py_in_c = name == "heapq" && matches!(k, "nsmallest" | "nlargest" | "merge");
             // Only a native made for this module, not one it imported
             // (`random`'s shim binds `math.sqrt` as `_sqrt`), so a C
             // builtin it re-exports keeps its own type.
@@ -3489,9 +3634,8 @@ fn make_module(name: &str, entries: Vec<(&str, Value)>) -> Value {
             let own = !k.starts_with('_')
                 && (k == n.name
                     || n.name.strip_prefix(name).and_then(|r| r.strip_prefix('.')) == Some(k));
-            if (python_functions || py_in_c)
-                && own
-                && !c_function
+            if own
+                && is_python_function(name, k)
                 && n.method.is_none()
                 && !crate::value::native_is_type(n.name)
             {
