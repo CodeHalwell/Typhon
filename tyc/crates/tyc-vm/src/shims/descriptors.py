@@ -241,6 +241,12 @@ class _TypingAlias:
         return _TypingAlias._union_of((other, self))
 
     def __call__(self, *args, **kwargs):
+        if self._name in ("Union", "Literal"):
+            raise TypeError("Cannot instantiate typing." + self._name)
+        if self._name in ("List", "Dict", "Set", "FrozenSet", "Tuple", "Type"):
+            raise TypeError(
+                "Type " + self._name + " cannot be instantiated; use " + self._name.lower() + "() instead"
+            )
         return self.__origin__(*args, **kwargs)
 
 

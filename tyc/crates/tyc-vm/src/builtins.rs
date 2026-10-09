@@ -9638,8 +9638,15 @@ fn collections_abc_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
 /// an ABC with one still unimplemented.
 fn make_abc_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
     const ABC_SRC: &str =
-        "# VM `abc`\nclass ABCMeta(type):\n    pass\n\n\nclass ABC(metaclass=ABCMeta):\n    pass\n";
-    let (members, env) = compile_shim(interp, ABC_SRC, Vec::new())?;
+        "# VM `abc`\nclass ABCMeta(type):\n    pass\n\n\nclass ABC(metaclass=ABCMeta):\n    pass\n\n\n\
+         def abstractclassmethod(callable):\n    callable.__isabstractmethod__ = True\n    return classmethod(callable)\n\n\n\
+         def abstractstaticmethod(callable):\n    callable.__isabstractmethod__ = True\n    return staticmethod(callable)\n\n\n\
+         class abstractproperty(property):\n\
+             \x20   def __init__(self, fget=None, fset=None, fdel=None, doc=None):\n\
+             \x20       property.__init__(self, fget, fset, fdel, doc)\n\
+             \x20       self.__isabstractmethod__ = True\n";
+    let property = descriptor_shim_class(interp, "property")?;
+    let (members, env) = compile_shim(interp, ABC_SRC, vec![("property", property)])?;
     let mut entries: Vec<(&str, Value)> = Vec::new();
     for (k, v) in &members {
         if let Value::Class(c) = v {
@@ -9663,14 +9670,10 @@ fn make_abc_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
             Ok(f)
         }),
     ));
-    for name in [
-        "abstractproperty",
-        "abstractclassmethod",
-        "abstractstaticmethod",
+    entries.push((
         "update_abstractmethods",
-    ] {
-        entries.push((name, identity_native(name)));
-    }
+        identity_native("update_abstractmethods"),
+    ));
     Ok(make_module_env("abc", entries, env))
 }
 

@@ -1766,13 +1766,21 @@ impl Interpreter {
                 // `class Stack(typing.List[int])` / `(Generic[T])`: a
                 // subscripted `typing` form's base is its origin (an inert
                 // form such as `Generic` is ignored below, as when bare).
+                // `Union[...]`, `Optional[...]` and `Literal[...]` have no
+                // class behind them and refuse, as CPython's do.
                 let v = match v {
-                    Value::Instance(inst) if inst.class.name == "_TypingAlias" => inst
-                        .fields
-                        .borrow()
-                        .get("__origin__")
-                        .cloned()
-                        .unwrap_or(Value::None),
+                    Value::Instance(inst) if inst.class.name == "_TypingAlias" => {
+                        let alias_name = inst.fields.borrow().get("_name").map(Value::py_str);
+                        if matches!(alias_name.as_deref(), Some("Union" | "Literal")) {
+                            let shown = self.repr_of(&Value::Instance(inst.clone()))?;
+                            return Err(type_error(format!("Cannot subclass {shown}")));
+                        }
+                        inst.fields
+                            .borrow()
+                            .get("__origin__")
+                            .cloned()
+                            .unwrap_or(Value::None)
+                    }
                     other => other,
                 };
                 let v = match v {
@@ -8508,6 +8516,16 @@ impl Interpreter {
                     let d = Rc::new(crate::value::FrozenCell::new(map));
                     d.frozen.set(true);
                     return Ok(Value::Dict(d));
+                }
+                // `Abc.__abstractmethods__`: the names still abstract, as a
+                // frozenset (only an ABC class carries it).
+                if attr == "__abstractmethods__" && crate::builtins::is_abc_class(class) {
+                    let names: Vec<Value> = abstract_methods(class)
+                        .into_iter()
+                        .map(|n| Value::Str(Rc::new(n)))
+                        .collect();
+                    let set = self.set_from_value(Value::List(Rc::new(RefCell::new(names))))?;
+                    return Ok(Value::Set(Rc::new(crate::value::FrozenCell::frozen(set))));
                 }
                 // `Color.__members__`: every member name, aliases included,
                 // in definition order (a read-only mapping).

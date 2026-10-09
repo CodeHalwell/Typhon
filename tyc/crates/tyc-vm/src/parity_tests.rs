@@ -3179,6 +3179,28 @@ plain class ViaDescr:
 plain class NoIter:
     __iter__ = None
 t("abc hook attrs", lambda: (issubclass(ViaDescr, cabc.Iterable), isinstance(ViaDescr(), cabc.Iterable), issubclass(NoIter, cabc.Iterable)))
+import abc
+plain class Legacy(abc.ABC):
+    @abc.abstractclassmethod
+    def f(cls):
+        return cls.__name__
+    @abc.abstractstaticmethod
+    def g():
+        return 1
+    @abc.abstractproperty
+    def p(self):
+        return 2
+t("legacy abstract", lambda: Legacy())
+t("legacy binding", lambda: (Legacy.f(), Legacy.g(), sorted(Legacy.__abstractmethods__)))
+for mk in [lambda: typing.List[int](), lambda: typing.Union[int, str](), lambda: typing.Literal[1](), lambda: typing.Optional[int](), lambda: typing.Dict[str, int](), lambda: typing.Tuple[int](), lambda: typing.Type[int](), lambda: typing.Annotated[int, "x"](), lambda: typing.Deque[int](), lambda: typing.DefaultDict[str, int](), lambda: typing.Sequence[int]()]:
+    t("alias call", mk)
+for base in [typing.Union[int, str], typing.Literal[1], typing.Optional[int]]:
+    try:
+        plain class U(base):
+            pass
+        show("subclass", "ok")
+    except TypeError as e:
+        show("subclass", e)
 "#,
     );
 }
