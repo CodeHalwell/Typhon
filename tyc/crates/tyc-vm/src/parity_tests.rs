@@ -2240,3 +2240,341 @@ assert util.make().__name__ is make().__name__
         0
     );
 }
+
+#[test]
+fn copy_module_matches_cpython() {
+    assert_matches_cpython(
+        "copy_module_matches_cpython",
+        r#"import copy
+from dataclasses import dataclass, field
+from enum import Enum
+from collections import namedtuple
+class Color(Enum):
+    RED = 1
+@dataclass
+class P:
+    x: int
+    ys: list
+@dataclass(frozen=True)
+class F:
+    a: int
+    b: list = field(default_factory=list)
+class Plain:
+    n: int
+    items: list
+    def __init__(self, n):
+        self.n = n
+        self.items = [n]
+class Custom:
+    log: list
+    def __init__(self, log):
+        self.log = log
+    def __copy__(self):
+        return Custom(["copied"])
+    def __deepcopy__(self, memo):
+        return Custom(["deep", isinstance(memo, dict)])
+class Stateful:
+    a: int
+    def __init__(self, a):
+        self.a = a
+    def __getstate__(self):
+        return {"a": self.a * 10}
+    def __setstate__(self, st):
+        self.a = st["a"] + 1
+Pt = namedtuple("Pt", "x y")
+a = [[1, 2], {"k": [3]}, (4, [5]), {6}, frozenset({7}), "s", 8, None]
+s = copy.copy(a)
+d = copy.deepcopy(a)
+show(s == a, s is a, s[0] is a[0], d == a, d[0] is a[0], d[1]["k"] is a[1]["k"], d[2] is a[2], d[2][1] is a[2][1])
+t = (1, "x", (2, 3))
+show(copy.copy(t) is t, copy.deepcopy(t) is t, copy.deepcopy((1, [2]))[1] is (1, [2])[1])
+r = []
+r.append(r)
+rc = copy.deepcopy(r)
+show(rc[0] is rc, rc is not r)
+shared = [1]
+pair = [shared, shared]
+pc = copy.deepcopy(pair)
+show(pc[0] is pc[1], pc[0] is shared)
+p = P(1, [2])
+ps, pd = copy.copy(p), copy.deepcopy(p)
+show(ps, ps is p, ps.ys is p.ys, pd.ys is p.ys, pd == p)
+f = F(1, [2])
+fs, fd = copy.copy(f), copy.deepcopy(f)
+show(fs, fs.b is f.b, fd.b is f.b, fd == f)
+pl = Plain(5)
+pls, pld = copy.copy(pl), copy.deepcopy(pl)
+show(type(pls).__name__, pls.n, pls.items is pl.items, pld.items is pl.items, pld.items, vars(pld))
+show(copy.copy(Custom([])).log, copy.deepcopy(Custom([])).log)
+st = Stateful(1)
+show(copy.copy(st).a, copy.deepcopy(st).a)
+show(copy.copy(Color.RED) is Color.RED, copy.deepcopy(Color.RED) is Color.RED, copy.deepcopy(len) is len, copy.copy(P) is P)
+show(copy.replace(p, x=9), copy.replace(f, a=7), copy.replace(Pt(1, 2), y=5))
+try:
+    copy.replace([1], x=1)
+except TypeError as e:
+    show("TypeError", str(e))
+show(copy.Error is copy.error, issubclass(copy.Error, Exception))
+m = {}
+show(copy.deepcopy([1, [2]], m) == [1, [2]], len(m) > 0)
+def _fn() -> int:
+    return 1
+class _Box:
+    v: int
+    def __init__(self) -> None:
+        self.v = 1
+    def meth(self) -> int:
+        return self.v
+_b = _Box()
+show(copy.copy(_fn) is _fn, copy.deepcopy(_fn) is _fn, copy.copy(len) is len, copy.deepcopy([_fn])[0] is _fn)
+show(copy.copy(_b.meth)() == 1)
+calls = []
+class _NoState:
+    v: int
+    def __init__(self) -> None:
+        self.v = 1
+    def __getstate__(self):
+        return None
+    def __setstate__(self, st) -> None:
+        calls.append(st)
+copy.copy(_NoState())
+copy.deepcopy(_NoState())
+show(calls)
+class _EmptyState:
+    v: int
+    def __init__(self) -> None:
+        self.v = 1
+    def __getstate__(self):
+        return {}
+    def __setstate__(self, st) -> None:
+        calls.append(st)
+copy.copy(_EmptyState())
+copy.deepcopy(_EmptyState())
+show(calls)
+ba = bytearray(b"ab")
+ba2 = copy.copy(ba)
+ba2.append(99)
+show(ba, ba2, type(ba2) is type(ba))
+ba3 = copy.deepcopy([ba, ba])
+ba3[0].append(100)
+show(ba, ba3, ba3[0] is ba3[1])
+sl = slice(1, [2], 3)
+sl2 = copy.deepcopy(sl)
+show(copy.copy(sl) is sl, sl2 == sl, sl2 is sl, sl2.stop is sl.stop)
+ex = ValueError("x", [2])
+ex2 = copy.copy(ex)
+ex3 = copy.deepcopy(ex)
+show(type(ex2).__name__, ex2.args, ex2 is ex, ex2.args[1] is ex.args[1])
+show(type(ex3).__name__, ex3.args, ex3.args[1] is ex.args[1])
+class CodedError(Exception):
+    code: int
+    def __init__(self, msg: str, code: int) -> None:
+        super().__init__(msg, code)
+        self.code = code
+ce = copy.deepcopy(CodedError("boom", 3))
+show(type(ce).__name__, ce.args, ce.code)
+from collections import defaultdict, Counter, OrderedDict, ChainMap, UserDict, UserList
+dd = defaultdict(list)
+dd["a"].append(1)
+dd2 = copy.copy(dd)
+dd2["b"].append(2)
+dd2["a"].append(5)
+dd3 = copy.deepcopy(dd)
+dd3["a"].append(9)
+show(sorted(dd.items()), sorted(dd2.items()), sorted(dd3.items()), type(dd2).__name__, type(dd2) is defaultdict)
+for cm in (Counter("aab"), OrderedDict(a=1), ChainMap({"a": 1}), UserDict(a=1)):
+    cm2 = copy.copy(cm)
+    cm2["z"] = 1
+    cm3 = copy.deepcopy(cm)
+    cm3["y"] = 2
+    show(type(cm2).__name__, cm, cm2, cm3)
+ul = UserList([1])
+ul2 = copy.copy(ul)
+ul2.append(2)
+show(ul, ul2, copy.deepcopy(ul))
+ud = UserDict(a=1)
+ud.extra = [1]
+ud2 = copy.copy(ud)
+ud2["b"] = 2
+ul.tag = "t"
+ul3 = copy.copy(ul)
+ul3.append(3)
+show(ud, ud2, ud2.extra is ud.extra, ul, ul3, ul3.tag)
+od = OrderedDict(a=1)
+od.extra = [1]
+od2 = copy.copy(od)
+od2["b"] = 2
+cn = Counter("ab")
+cn.extra = [1]
+show(od, od2, od2.extra is od.extra, hasattr(copy.copy(cn), "extra"))
+class _SlottedCallable:
+    __slots__ = ("items",)
+    def __init__(self) -> None:
+        self.items = [1]
+    def __call__(self) -> int:
+        return 1
+sc = _SlottedCallable()
+sc2 = copy.copy(sc)
+sc3 = copy.deepcopy(sc)
+show(sc2 is sc, sc2.items is sc.items, sc3.items is sc.items, sc3.items)
+import functools
+pf = functools.partial(max, 1)
+bm = [].append
+show(copy.copy(pf)(5), copy.deepcopy(pf)(0), copy.copy(bm) is bm, copy.deepcopy(print) is print)
+def _pget(self: object) -> int:
+    return 1
+pp = property(_pget)
+show(copy.copy(pp) is pp, copy.deepcopy(pp) is pp, copy.deepcopy([pp])[0] is pp)
+show(hasattr(list, "nope"), hasattr(list, "append"), hasattr(dict, "__deepcopy__"), hasattr(str, "lower"))
+"#,
+    );
+}
+
+#[test]
+fn builtin_type_objects_are_the_builtins() {
+    assert_matches_cpython(
+        "builtin_type_objects_are_the_builtins",
+        r#"class P:
+    x: int
+o0 = object()
+xs = [1]
+show(type(xs) is list, type({}) is dict, type({1}) is set, type((1,)) is tuple, type("s") is str, type(1) is int, type(True) is bool, type(1.5) is float)
+show(type(xs) is not list, type(xs) is tuple, type(xs) in (list, dict))
+show(type(xs)([1, 2]), type({1})([3, 3]), type("")(5), type(0)("7"), type(())(xs), type({})(a=1))
+show(isinstance(P, type), isinstance(int, type), isinstance(ValueError, type), isinstance(type(xs), type), isinstance(len, type), isinstance(xs, type), isinstance(o0, type))
+for _t in (list, ValueError, KeyError):
+    try:
+        object.__new__(_t)
+    except TypeError as e:
+        show(str(e))
+o = object.__new__(P)
+show(type(o) is P, isinstance(o, P))
+class WithInit:
+    a: int
+    def __init__(self, a: int) -> None:
+        self.a = a
+class WithNew:
+    def __new__(cls):
+        return object.__new__(cls)
+for _c in (WithInit, WithNew):
+    try:
+        show(type(object.__new__(_c, 1)).__name__)
+    except TypeError as e:
+        show(str(e))
+show(type(bytearray()) is bytearray, type(bytearray(b"a")) == bytearray, type(bytearray()) is bytes)
+show(type(None)() is None, type(Ellipsis)() is Ellipsis, type(NotImplemented)() is NotImplemented)
+try:
+    type(iter([]))()
+except TypeError as e:
+    show(str(e))
+show(id(type([])) == id(list), id(type("")) == id(str), id(type(bytearray())) == id(bytearray), id(type([])) == id(dict))
+tk = {int: 1, bytearray: 2, list: 3}
+show(list(tk), tk.get(type(bytearray())), tk.get(type(5)), tk[type([])])
+show(hash(type([])) == hash(list), hash(type(bytearray())) == hash(bytearray))
+from collections import defaultdict as _dd, OrderedDict as _od
+show(isinstance(_dd, type), isinstance(_od, type))
+_ddv = _dd(list)
+show(type(_ddv) is _dd, id(type(_ddv)) == id(_dd), hash(type(_ddv)) == hash(_dd))
+def _getter(self: object) -> int:
+    return 1
+_pr = property(_getter)
+show(type(_pr) is property, isinstance(property, type), id(type(_pr)) == id(property), hash(type(_pr)) == hash(property))
+show(type(ValueError("x")) is ValueError, type(KeyError()) == KeyError, id(type(ValueError())) == id(ValueError))
+show(hasattr(list, "__class_getitem__"), hasattr(str, "__class_getitem__"), hasattr(dict, "__class_getitem__"))
+show(list.__module__, hasattr(dict, "__module__"), str.__module__, ValueError.__module__, int.__module__)
+from collections import deque as _dq
+import copy as _cp
+_d1 = _dq([1, [2]], maxlen=5)
+_d2 = _cp.copy(_d1)
+_d2.append(3)
+show(_d1, _d2, _d2.maxlen, _d2[1] is _d1[1])
+class _MyDq(_dq):
+    pass
+_d3 = _MyDq([1, 2])
+show(type(_cp.copy(_d3)).__name__, type(_d3.copy()).__name__, _cp.copy(_d3))
+class _Ctr:
+    n: int = 0
+    def bump(self) -> None:
+        self.n += 1
+_c = _Ctr()
+_m = _cp.deepcopy(_c.bump)
+_m()
+show(_c.n, _m.__self__.n, _m.__self__ is _c, _m.__func__ is _c.bump.__func__)
+show(_c.bump == _c.bump, _c.bump == _Ctr().bump, _cp.copy(_c.bump) == _c.bump)
+_l = [1]
+_cp.deepcopy(_l.append)(2)
+show(_l)
+_tk = {type(_dd(list)): 1, len: 2, property: 3}
+show(list(_tk)[1:], list(_tk)[0] is _dd, _tk.popitem()[0] is property, len in set(_tk))
+_x = iter([1, 2, 3])
+next(_x)
+_y = _cp.copy(_x)
+show(next(_y), next(_x), type(_y).__name__)
+_ll = [[1], [2]]
+_nb = next(_cp.deepcopy(iter(_ll)))
+_nb.append(9)
+show(_ll, _nb)
+_di = iter({"a": 1, "b": 2})
+next(_di)
+show(list(_cp.copy(_di)), list(_di))
+_en = enumerate("xyz")
+next(_en)
+show(next(_cp.copy(_en)), next(_en))
+_rv = reversed([1, 2, 3])
+next(_rv)
+show(list(_cp.copy(_rv)), list(_rv), list(_cp.copy(iter(range(3)))), list(_cp.copy(iter("ab"))))
+try:
+    _cp.copy(i for i in [1])
+except TypeError as _ex:
+    show("TypeError", _ex)
+class _Red:
+    v: int
+    def __init__(self, v):
+        self.v = v
+    def __reduce__(self):
+        return (_Red, (self.v + 1,))
+show(_cp.copy(_Red(1)).v, _cp.deepcopy(_Red(5)).v)
+from collections import ChainMap as _CM
+class _MyCM(_CM):
+    pass
+_cm = _MyCM({"a": 1}, {"b": 2})
+show(type(_cp.copy(_cm)).__name__, type(_cm.new_child()).__name__, type(_cm.parents).__name__, _cp.copy(_cm))
+_xs = [1]
+type(_xs).append(_xs, 2)
+show(_xs, type(_xs).__module__, type("a").upper("b"), type(1).bit_length(5), hasattr(type(_xs), "append"))
+_dd2 = _dd(list)
+_dd2["a"].append(1)
+show(_dd.copy(_dd2), type(_dd2).copy(_dd2) == _dd.copy(_dd2), hasattr(_dd, "copy"), hasattr(property, "setter"))
+class _OD(_od):
+    def __init__(self):
+        super().__init__()
+        self.tag = "t"
+_o = _OD()
+_o["k"] = 1
+_o.tag = "changed"
+_oc = _cp.copy(_o)
+show(type(_oc).__name__, _oc, _oc.tag)
+try:
+    reversed([1]).__setstate__(10 ** 100)
+except OverflowError as _ex:
+    show("OverflowError", _ex)
+show(property.__module__, _dd.__module__, type(_dd(list)).__module__)
+show(hasattr(iter({}), "__setstate__"), hasattr(iter(set()), "__setstate__"), hasattr((i for i in []), "__setstate__"), hasattr(iter([]), "__setstate__"))
+"#,
+    );
+}
+
+#[test]
+fn a_user_class_named_type_is_not_the_metaclass() {
+    assert_matches_cpython(
+        "a_user_class_named_type_is_not_the_metaclass",
+        r#"class P:
+    x: int
+class type:
+    v: int
+    def __init__(self) -> None:
+        self.v = 1
+show(isinstance(P, type), isinstance(int, type), isinstance(type(), type))
+"#,
+    );
+}

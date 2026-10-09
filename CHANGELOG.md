@@ -16,6 +16,46 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ### Fixed
 
+- **A `plain class` is called with its own `__init__`'s arguments.** A
+  `plain class` (or a `class!` with a hand-written `__init__`) that also
+  declared annotated fields had its call arguments type-checked against
+  those fields, so `E("boom", 3)` with `__init__(self, msg: str, code: int)`
+  and a `code: int` field was rejected with "expected `int`". The field
+  check now applies only where the fields are the constructor; otherwise
+  the arguments are checked against the `__init__`'s own parameter types,
+  and against its arity: too few or too many arguments, an unknown
+  keyword, or a positional-only parameter passed by name (the `TypeError`
+  CPython raises at the call) is now reported, explicit `Box[int](...)`
+  calls included. Extra positional and keyword arguments are checked
+  against the `*args` / `**kwargs` annotations.
+- **`copy` runs in the VM.** `tyc run` handed any program that imported
+  `copy` to CPython. The VM now has `copy.copy`, `copy.deepcopy` (memo,
+  cycles and shared references included), `copy.replace` and `copy.Error`,
+  honouring `__copy__`, `__deepcopy__`, `__getstate__` / `__setstate__` and
+  `__slots__`, a class's own `__reduce__` / `__reduce_ex__` included.
+  Copies of `bytearray`, `defaultdict`, `Counter`, `OrderedDict`,
+  `ChainMap`, `deque`, `UserDict` and `UserList` get their own storage
+  (and keep their subclass), builtin iterators copy at their current
+  position, a deep-copied bound method is rebound to a copy of its
+  receiver, `slice`s and exceptions copy as in CPython, and
+  `type(collections.defaultdict())` is `defaultdict`.
+- **Builtin type objects are the builtins.** Under `tyc run`,
+  `type([]) is list` was `False` (`==` already held), `type(x)(...)` on a
+  builtin's type failed instead of constructing one, and
+  `isinstance(cls, type)` was `False` for every class. All three now match
+  CPython, and `object.__new__(cls)` makes a bare instance without running
+  `__init__` (rejecting extra arguments the way CPython does).
+  `type(bytearray()) is bytearray` holds, `id`, `hash` and dict keys agree
+  for the two spellings of a builtin type (`list({int: 1})` is
+  `[<class 'int'>]`, not `['int']`), and `hasattr(list, "nope")` is
+  `False` rather than finding a made-up method.
+- **Tracebacks through the VM's stdlib modules.** A frame inside one of the
+  VM's Python-written modules (`copy`, `datetime`, `pathlib` and friends)
+  was reported under the caller's file with an unrelated line. It now
+  reads `File "<frozen copy>", line N`, with the module's own line.
+- **A live instance `__dict__` routes to CPython.** The VM has only the
+  `vars()` snapshot, so `obj.__dict__` raised `AttributeError`. A program
+  that uses `.__dict__` now runs through the compiled path.
 - **`is` between strings follows CPython's objects.** Under `tyc run`, any
   two equal strings compared `is`-identical. Now a freshly built string is
   its own object, as in CPython (`"".join(["he", "llo"]) is "hello"` is

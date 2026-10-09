@@ -1716,6 +1716,190 @@ fn build_fails_on_type_error() {
     );
 }
 
+/// A `plain class` (or a `class!` with its own `__init__`) is called with
+/// that `__init__`'s arguments, not its annotated fields.
+#[test]
+fn check_accepts_init_arguments_that_differ_from_the_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "plain class E(Exception):\n    code: int\n    def __init__(self, msg: str, code: int) -> None:\n        super().__init__(msg)\n        self.code = code\n\
+         plain class Box[T]:\n    item: T\n    def __init__(self, label: str, item: T) -> None:\n        self.item = item\n\
+         class! R:\n    n: int\n    def __init__(self, s: str) -> None:\n        self.n = len(s)\n\
+         e = E(\"boom\", 3)\nb = Box(\"lbl\", 5)\nb2 = Box[int](\"lbl\", 5)\nr = R(\"abc\")\nprint(e.code, b.item, b2.item, r.n)\n",
+    );
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(
+        out.status.success(),
+        "constructor arguments were checked against the fields:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A type parameter pinned by the binding's annotation is checked against
+/// the `__init__` parameter it appears in.
+#[test]
+fn check_pins_init_type_parameters_from_the_annotation() {
+    for (call, ok) in [("Box(\"ok\", 1)", true), ("Box(\"ok\", \"bad\")", false)] {
+        let tmp = tempfile::tempdir().unwrap();
+        scaffold(
+            tmp.path(),
+            &format!(
+                "plain class Box[T]:\n    item: T\n    def __init__(self, label: str, item: T) -> None:\n        self.item = item\n\
+                 let b: Box[int] = {call}\nprint(b)\n"
+            ),
+        );
+        let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+        assert_eq!(
+            out.status.success(),
+            ok,
+            "`{call}`: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// ...and those arguments are checked against that `__init__`'s types.
+#[test]
+fn check_rejects_arguments_that_do_not_match_init() {
+    for call in [
+        "E(1, 3)",
+        "E(msg=\"a\", code=\"b\")",
+        "R(5)",
+        "R(\"a\", k=\"x\")",
+        "Box[int](\"lbl\", \"bad\")",
+        "Box[int](5, 1)",
+        "Box[int](label=5, item=1)",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        scaffold(
+            tmp.path(),
+            &format!(
+                "plain class E:\n    code: int\n    def __init__(self, msg: str, code: int) -> None:\n        self.code = code\n\
+                 class! R:\n    n: int\n    def __init__(self, s: str, *, k: int = 0) -> None:\n        self.n = len(s)\n\
+                 plain class Box[T]:\n    item: T\n    def __init__(self, label: str, item: T) -> None:\n        self.item = item\n\
+                 x = {call}\nprint(x)\n"
+            ),
+        );
+        let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+        assert!(!out.status.success(), "`{call}` should not type-check");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("type mismatch"),
+            "`{call}`: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn check_types_variadic_init_arguments() {
+    let header = "plain class Box[T]:\n    items: list[T]\n    def __init__(self, *items: T, **named: T) -> None:\n        self.items = list(items)\n\
+                  plain class Tag:\n    def __init__(self, label: str, *rest: int, **extra: str) -> None:\n        pass\n";
+    for call in [
+        "let x: Box[int] = Box(\"bad\")",
+        "let x: Box[int] = Box(1, named=\"bad\")",
+        "let x = Box[int](1, \"bad\")",
+        "let x = Box[int](k=\"bad\")",
+        "let x = Tag(\"a\", \"bad\")",
+        "let x = Tag(\"a\", x=1)",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        scaffold(tmp.path(), &format!("{header}{call}\nprint(x)\n"));
+        let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+        assert!(!out.status.success(), "`{call}` should not type-check");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("type mismatch"),
+            "`{call}`: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        &format!(
+            "{header}let a: Box[int] = Box(1, 2, named=3)\nlet b = Box[int](1, k=2)\nlet c = Tag(\"a\", 1, 2, x=\"s\")\nprint(a, b, c)\n"
+        ),
+    );
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(
+        out.status.success(),
+        "well-typed variadic calls should type-check: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // A keyword spelling a positional-only parameter's name lands in
+    // `**kwargs`, so it takes the `**kwargs` type, not the parameter's.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "plain class C:\n    def __init__(self, x: str, /, **kw: int) -> None:\n        pass\n\
+         print(C(\"ok\", x=1))\n",
+    );
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(
+        out.status.success(),
+        "`x=` should reach `**kw`: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // ...which leaves the positional-only `x` itself unfilled.
+    for call in ["C(x=1)", "f(x=1)"] {
+        let tmp = tempfile::tempdir().unwrap();
+        scaffold(
+            tmp.path(),
+            &format!(
+                "plain class C:\n    def __init__(self, x: str, /, **kw: int) -> None:\n        pass\n\
+                 def f(x: str, /, **kw: int) -> None:\n    pass\n\
+                 print({call})\n"
+            ),
+        );
+        let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+        assert!(!out.status.success(), "`{call}` should not type-check");
+    }
+}
+
+#[test]
+fn check_rejects_calls_that_do_not_fit_the_init_arity() {
+    for call in [
+        "E()",
+        "E(\"a\", 1, 2)",
+        "E(\"a\", 1, nope=3)",
+        "R()",
+        "R(\"a\", 1)",
+        "Box[int]()",
+        "Box[int](\"lbl\", 1, 2)",
+        "Box[int](label=\"lbl\", item=1)",
+        "Box(\"lbl\")",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        scaffold(
+            tmp.path(),
+            &format!(
+                "plain class E:\n    code: int\n    def __init__(self, msg: str, code: int) -> None:\n        self.code = code\n\
+                 class! R:\n    n: int\n    def __init__(self, s: str, *, k: int = 0) -> None:\n        self.n = len(s)\n\
+                 plain class Box[T]:\n    item: T\n    def __init__(self, label: str, item: T, /) -> None:\n        self.item = item\n\
+                 x = {call}\nprint(x)\n"
+            ),
+        );
+        let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+        assert!(!out.status.success(), "`{call}` should not type-check");
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "plain class E:\n    code: int\n    def __init__(self, msg: str, code: int = 0, *rest: int, **kw: int) -> None:\n        self.code = code\n\
+         class! R:\n    n: int\n    def __init__(self, s: str, *, k: int = 0) -> None:\n        self.n = len(s)\n\
+         plain class Box[T]:\n    item: T\n    def __init__(self, label: str, item: T, /) -> None:\n        self.item = item\n\
+         let args = [1, 2]\n\
+         print(E(\"a\"), E(\"a\", 1, 2, 3, z=4), E(msg=\"a\"), E(\"a\", *args))\n\
+         print(R(\"a\"), R(s=\"a\", k=2), Box[int](\"l\", 1), Box(\"l\", 1))\n",
+    );
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(
+        out.status.success(),
+        "calls that fit `__init__` should type-check: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn build_emits_dataclass_decorator_for_class() {
     let tmp = tempfile::tempdir().unwrap();

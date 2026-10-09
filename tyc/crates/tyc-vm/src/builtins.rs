@@ -1588,7 +1588,7 @@ pub fn install(interp: &mut Interpreter) {
         Ok(Value::Int(VmInt::from(i.hash_value(v)?)))
     });
 
-    native!("id", |_i, args| {
+    native!("id", |i, args| {
         // Stable per-object identity for heap-allocated values: the address
         // of the underlying `Rc` payload. Immutable scalars (int, float,
         // bool, None) hash to the address of the temporary `&Value` instead,
@@ -1603,10 +1603,22 @@ pub fn install(interp: &mut Interpreter) {
             Value::Set(s) => Rc::as_ptr(s) as usize,
             Value::Str(s) => Rc::as_ptr(s) as usize,
             Value::Bytes(b) => Rc::as_ptr(b) as usize,
-            Value::Class(c) => Rc::as_ptr(c) as usize,
-            Value::Instance(i) => Rc::as_ptr(i) as usize,
+            // `type([]) is list`, so the stand-in shares the constructor's id.
+            Value::Class(c) => match i.builtin_global(&c.name) {
+                Some(Value::Native(n)) if is_builtin_type_class(c) || is_builtin_shim_class(c) => {
+                    Rc::as_ptr(n) as usize
+                }
+                _ => Rc::as_ptr(c) as usize,
+            },
+            Value::Instance(inst) => Rc::as_ptr(inst) as usize,
             Value::Module(m) => Rc::as_ptr(m) as usize,
             Value::Function(f) => Rc::as_ptr(f) as usize,
+            // `collections.defaultdict` has no builtin global for its class
+            // to share an id with, so the constructor takes the class's.
+            Value::Native(n) if n.name == "defaultdict" => match defaultdict_class(i)? {
+                Value::Class(c) => Rc::as_ptr(&c) as usize,
+                _ => Rc::as_ptr(n) as usize,
+            },
             Value::Native(n) => Rc::as_ptr(n) as usize,
             Value::Iter(it) => Rc::as_ptr(it) as usize,
             other => other as *const _ as usize,
@@ -2377,12 +2389,27 @@ pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
     let Some(name) = want_name else {
         return false;
     };
+    // The metaclass arms below are the builtin `type`, not a user class that
+    // happens to be called `type`.
+    let builtin_target = match cls {
+        Value::Native(_) => true,
+        Value::Class(c) => is_builtin_type_class(c),
+        _ => false,
+    };
     match (name.as_str(), val) {
         // Every value is an `object` — the root of Python's type hierarchy.
         // Without this arm `isinstance(x, object)` was uniformly `False`,
         // which silently inverts any control flow written around it.
         ("object", _) => true,
         ("NoneType", Value::None) => true,
+        // Classes are `type` instances: user classes, the stand-ins
+        // `type(x)` returns, and the builtin types and exceptions.
+        ("type", Value::Class(_)) if builtin_target => true,
+        ("type", Value::Native(n)) if builtin_target => {
+            is_builtin_type_name(n.name)
+                || crate::interp::builtin_exc_mro(n.name).is_some()
+                || is_shim_constructor_name(n.name)
+        }
         ("int", Value::Int(_)) => true,
         // `bool` is a subclass of `int` in CPython, so `isinstance(True, int)`
         // is `True` there. The VM answered `False`, taking the opposite branch
@@ -2554,6 +2581,7 @@ mod shims {
     pub const STRING: &str = include_str!("shims/string.py");
     pub const OPERATOR: &str = include_str!("shims/operator.py");
     pub const BISECT: &str = include_str!("shims/bisect.py");
+    pub const COPY: &str = include_str!("shims/copy.py");
     pub const BASE64: &str = include_str!("shims/base64.py");
     pub const CSV: &str = include_str!("shims/csv.py");
     pub const FUNCTOOLS_EXTRA: &str = include_str!("shims/functools_extra.py");
@@ -2597,14 +2625,36 @@ fn compile_shim(
     for (name, value) in seed {
         env.set(name, value);
     }
+    // Frames inside the shim report the shim's own lines, under a
+    // `<frozen NAME>` file as CPython shows its frozen modules, rather than
+    // borrowing the caller's file and line numbers.
+    let shim_source = Some(Rc::new(crate::interp::SourceInfo::new(
+        format!("<frozen {}>", shim_name(source)),
+        source,
+    )));
+    let outer_source = std::mem::replace(&mut interp.current_source, shim_source);
     // A shim's classes must not be stamped with the *caller's* module: they
     // would then repr as `<class '__main__.Path'>`. An empty module name
     // leaves them bare, which is what the VM printed before shims had one.
     let outer_module = std::mem::take(&mut interp.current_module_name);
     let result = interp.exec_block(&module.body, &env);
     interp.current_module_name = outer_module;
+    interp.current_source = outer_source;
     result?;
     Ok((env.snapshot(), env))
+}
+
+/// The module a shim implements, from its leading "# `name` — …" comment.
+fn shim_name(source: &str) -> &str {
+    let first = source.lines().next().unwrap_or("");
+    first
+        .split('`')
+        .nth(1)
+        .filter(|n| {
+            n.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        })
+        .unwrap_or("stdlib")
 }
 
 /// A module whose members are the top-level bindings of a Python shim.
@@ -3009,15 +3059,20 @@ pub(crate) fn descriptor_shim_class(interp: &mut Interpreter, name: &str) -> Res
             m
         }
     };
-    match &module {
+    let class = match &module {
         Value::Module(m) => m
             .members
             .borrow()
             .get(name)
             .cloned()
-            .ok_or_else(|| type_error(format!("descriptor shim did not define '{name}'"))),
-        _ => Err(type_error("descriptor shim is not a module")),
+            .ok_or_else(|| type_error(format!("descriptor shim did not define '{name}'")))?,
+        _ => return Err(type_error("descriptor shim is not a module")),
+    };
+    // `type(property(f)) is property`, as for `bytearray`.
+    if name == "property" {
+        register_builtin_shim_class(&class);
     }
+    Ok(class)
 }
 
 /// `classmethod(f)` / `staticmethod(f)`: a copy of the user function `f`
@@ -3094,7 +3149,7 @@ fn cached_helper_class(
 /// the missing-key path runs `__missing__`, which the foundation's subscript
 /// hook invokes when `__getitem__` raises `KeyError`.
 const DEFAULTDICT_SRC: &str = r#"
-class _DefaultDict:
+class defaultdict:
     __typhon_builtin_bases__ = ("dict", "defaultdict")
     def __init__(self, default_factory, initial):
         self._data = {}
@@ -3133,13 +3188,17 @@ class _DefaultDict:
             return self._data[key]
         return default
     def __eq__(self, other):
-        if isinstance(other, _DefaultDict):
+        if isinstance(other, defaultdict):
             return self._data == other._data
         return self._data == other
     def __ne__(self, other):
-        if isinstance(other, _DefaultDict):
+        if isinstance(other, defaultdict):
             return self._data != other._data
         return self._data != other
+    def copy(self):
+        return defaultdict(self._factory, self._data)
+    def __copy__(self):
+        return self.copy()
 "#;
 
 /// The `_NamedTupleBase` template from the `collections` shim, cached.
@@ -3167,7 +3226,40 @@ fn lazy_value_class(interp: &mut Interpreter) -> Result<Value, Unwind> {
 }
 
 pub(crate) fn bytearray_class(interp: &mut Interpreter) -> Result<Value, Unwind> {
-    cached_helper_class(interp, "__shim_bytearray__", shims::BYTEARRAY, "bytearray")
+    let cls = cached_helper_class(interp, "__shim_bytearray__", shims::BYTEARRAY, "bytearray")?;
+    register_builtin_shim_class(&cls);
+    Ok(cls)
+}
+
+thread_local! {
+    /// The shim classes standing behind a builtin constructor native
+    /// (`bytearray`, `collections.defaultdict`, `frozendict`, `sentinel`):
+    /// `type(bytearray())` is one of these, and it must be the builtin
+    /// `bytearray`, as in CPython.
+    static BUILTIN_SHIM_CLASSES: RefCell<Vec<Rc<crate::value::Class>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+fn register_builtin_shim_class(cls: &Value) {
+    if let Value::Class(c) = cls {
+        BUILTIN_SHIM_CLASSES.with(|shims| {
+            let mut shims = shims.borrow_mut();
+            if !shims.iter().any(|s| Rc::ptr_eq(s, c)) {
+                shims.push(c.clone());
+            }
+        });
+    }
+}
+
+/// A constructor native that stands for a shim class (`collections.defaultdict`,
+/// `property` and the 3.15 builtins): a type object in CPython, so `isinstance(_, type)`.
+pub(crate) fn is_shim_constructor_name(name: &str) -> bool {
+    matches!(name, "defaultdict" | "frozendict" | "sentinel" | "property")
+}
+
+/// `c` is the shim class behind a builtin constructor native of the same name.
+pub(crate) fn is_builtin_shim_class(c: &Rc<crate::value::Class>) -> bool {
+    BUILTIN_SHIM_CLASSES.with(|shims| shims.borrow().iter().any(|s| Rc::ptr_eq(s, c)))
 }
 
 /// The Python 3.15 builtin classes `frozendict` (PEP 814) and `sentinel`
@@ -3178,16 +3270,33 @@ pub(crate) fn py315_builtin_class(interp: &mut Interpreter, name: &str) -> Resul
         "frozendict" => "__shim_frozendict__",
         _ => "__shim_sentinel__",
     };
-    cached_helper_class(interp, cache, shims::PY315_BUILTINS, name)
+    let cls = cached_helper_class(interp, cache, shims::PY315_BUILTINS, name)?;
+    register_builtin_shim_class(&cls);
+    Ok(cls)
 }
 
-fn defaultdict_class(interp: &mut Interpreter) -> Result<Value, Unwind> {
-    cached_helper_class(
+/// The shim class behind a constructor native that stands for one
+/// (`defaultdict`, `property`, `frozendict`, `sentinel`).
+pub(crate) fn shim_class_for_constructor(
+    interp: &mut Interpreter,
+    name: &str,
+) -> Result<Value, Unwind> {
+    match name {
+        "defaultdict" => defaultdict_class(interp),
+        "property" => descriptor_shim_class(interp, "property"),
+        _ => py315_builtin_class(interp, name),
+    }
+}
+
+pub(crate) fn defaultdict_class(interp: &mut Interpreter) -> Result<Value, Unwind> {
+    let cls = cached_helper_class(
         interp,
         "__shim_defaultdict__",
         DEFAULTDICT_SRC,
-        "_DefaultDict",
-    )
+        "defaultdict",
+    )?;
+    register_builtin_shim_class(&cls);
+    Ok(cls)
 }
 
 // ── Module resolution ──────────────────────────────────────────────────────
@@ -3210,6 +3319,7 @@ pub const MODELLED_MODULE_ROOTS: &[&str] = &[
     "bisect",
     "collections",
     "contextlib",
+    "copy",
     "csv",
     "dataclasses",
     "datetime",
@@ -3293,6 +3403,7 @@ pub fn resolve_module(interp: &mut Interpreter, name: &str) -> Result<Value, Unw
         "string" => module_from_shim(interp, "string", shims::STRING),
         "operator" => module_from_shim(interp, "operator", shims::OPERATOR),
         "bisect" => module_from_shim(interp, "bisect", shims::BISECT),
+        "copy" => module_from_shim_hiding(interp, "copy", shims::COPY, &["dataclasses", "enum"]),
         "base64" => module_from_shim_hiding(interp, "base64", shims::BASE64, &["Error"]),
         "csv" => module_from_shim(interp, "csv", shims::CSV),
         "pydantic" => Ok(make_pydantic_module()),

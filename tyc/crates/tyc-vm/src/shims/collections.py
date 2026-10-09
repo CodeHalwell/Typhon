@@ -7,6 +7,11 @@
 
 
 class _MappingBase:
+    # `copy.copy` hook: CPython rebuilds these through `__reduce__`, which
+    # hands the copy its own storage rather than sharing `_data`.
+    def _typhon_copy(self):
+        return type(self)(self._data)
+
     def __getitem__(self, key):
         if key in self._data:
             return self._data[key]
@@ -334,12 +339,25 @@ class OrderedDict(_MappingBase):
         return iter(list(self._data.keys())[::-1])
 
     def __repr__(self):
+        name = type(self).__name__
         if not self._data:
-            return "OrderedDict()"
-        return "OrderedDict(%r)" % self._data
+            return "%s()" % name
+        return "%s(%r)" % (name, self._data)
 
     def copy(self):
-        return OrderedDict(self._data)
+        return self.__class__(self)
+
+    def _typhon_copy(self):
+        # CPython's `OrderedDict.__reduce__`: the class called with no
+        # arguments, then the instance state (unlike `Counter`'s, it is
+        # carried), then the items set one by one.
+        inst = type(self)()
+        for k, v in vars(self).items():
+            if k != "_data":
+                object.__setattr__(inst, k, v)
+        for k, v in self._data.items():
+            inst[k] = v
+        return inst
 
     @classmethod
     def fromkeys(cls, iterable, value=None):
@@ -410,14 +428,14 @@ class ChainMap(_MappingBase):
     def new_child(self, m=None):
         if m is None:
             m = {}
-        return ChainMap(m, *self.maps)
+        return self.__class__(m, *self.maps)
 
     @property
     def parents(self):
-        return ChainMap(*self.maps[1:])
+        return self.__class__(*self.maps[1:])
 
     def __repr__(self):
-        return "ChainMap(%s)" % ", ".join(repr(m) for m in self.maps)
+        return "%s(%s)" % (type(self).__name__, ", ".join(repr(m) for m in self.maps))
 
     def __eq__(self, other):
         if isinstance(other, ChainMap):
@@ -427,7 +445,11 @@ class ChainMap(_MappingBase):
         return False
 
     def copy(self):
-        return ChainMap(dict(self.maps[0]), *self.maps[1:])
+        # A subclass stays itself, as in CPython (`self.__class__`).
+        return self.__class__(self.maps[0].copy(), *self.maps[1:])
+
+    def __copy__(self):
+        return self.copy()
 
     # `_MappingBase`'s mutators all reach for `self._data`, which a ChainMap
     # does not have: every one of them has to work on the first mapping.
@@ -562,7 +584,17 @@ class deque:
         self._head = 0
 
     def copy(self):
-        return deque(self._data[self._head:], self.maxlen)
+        # CPython's `deque_copy`: a subclass is called with the items, plus
+        # the bound only when there is one.
+        items = self._data[self._head:]
+        if type(self) is deque:
+            return deque(items, self.maxlen)
+        if self.maxlen is None:
+            return type(self)(items)
+        return type(self)(items, self.maxlen)
+
+    def __copy__(self):
+        return self.copy()
 
     def count(self, x):
         return self._items().count(x)
@@ -664,9 +696,10 @@ class deque:
         raise TypeError("unhashable type: 'collections.deque'")
 
     def __repr__(self):
+        name = type(self).__name__
         if self.maxlen is None:
-            return "deque(%r)" % self._data[self._head:]
-        return "deque(%r, maxlen=%d)" % (self._data[self._head:], self.maxlen)
+            return "%s(%r)" % (name, self._data[self._head:])
+        return "%s(%r, maxlen=%d)" % (name, self._data[self._head:], self.maxlen)
 
 
 class _NamedTupleBase:
@@ -916,6 +949,14 @@ class UserDict:
     def copy(self):
         return self.__class__(self.data.copy())
 
+    def __copy__(self):
+        # CPython: the whole instance state, with a copy of `data`.
+        inst = object.__new__(type(self))
+        for k, v in vars(self).items():
+            object.__setattr__(inst, k, v)
+        inst.data = self.data.copy()
+        return inst
+
     @classmethod
     def fromkeys(cls, iterable, value=None):
         d = cls()
@@ -1025,6 +1066,14 @@ class UserList:
 
     def copy(self):
         return self.__class__(self)
+
+    def __copy__(self):
+        # CPython: the whole instance state, with a copy of `data`.
+        inst = object.__new__(type(self))
+        for k, v in vars(self).items():
+            object.__setattr__(inst, k, v)
+        inst.data = self.data[:]
+        return inst
 
     def count(self, item):
         return self.data.count(item)

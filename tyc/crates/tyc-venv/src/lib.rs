@@ -1278,6 +1278,7 @@ fn arity_info_from_params(
         kwonly_required,
         has_kwarg,
         vararg_type: None,
+        kwarg_type: None,
         param_types,
         kwonly_types,
         return_type,

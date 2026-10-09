@@ -4672,8 +4672,24 @@ impl Interpreter {
                 let h = self.hash_value(inner)?;
                 pyhash::tuple_hash(&[h])
             }
-            Value::Class(c) => pyhash::pointer_hash(Rc::as_ptr(c) as usize),
+            // `type([]) is list`: the stand-in hashes as its constructor.
+            Value::Class(c) => match self.builtin_globals.get(&c.name) {
+                Some(Value::Native(n))
+                    if crate::builtins::is_builtin_type_class(c)
+                        || crate::builtins::is_builtin_shim_class(c) =>
+                {
+                    pyhash::pointer_hash(Rc::as_ptr(n) as usize)
+                }
+                _ => pyhash::pointer_hash(Rc::as_ptr(c) as usize),
+            },
             Value::Function(f) => pyhash::pointer_hash(Rc::as_ptr(f) as usize),
+            // As for `id`: `defaultdict` hashes as its class.
+            Value::Native(n) if n.name == "defaultdict" => {
+                match crate::builtins::defaultdict_class(self)? {
+                    Value::Class(c) => pyhash::pointer_hash(Rc::as_ptr(&c) as usize),
+                    _ => pyhash::pointer_hash(Rc::as_ptr(n) as usize),
+                }
+            }
             Value::Native(n) => pyhash::pointer_hash(Rc::as_ptr(n) as usize),
             Value::Module(m) => pyhash::pointer_hash(Rc::as_ptr(m) as usize),
             Value::Exception { args, .. } => pyhash::pointer_hash(Rc::as_ptr(args) as usize),
@@ -5938,12 +5954,45 @@ impl Interpreter {
         Ok(())
     }
 
+    /// The builtin global `name` (`list`, `print`, …), if there is one.
+    pub(crate) fn builtin_global(&self, name: &str) -> Option<&Value> {
+        self.builtin_globals.get(name)
+    }
+
     pub(crate) fn instantiate(
         &mut self,
         class: &Rc<Class>,
         args: Vec<Value>,
         kwargs: &[(String, Value)],
     ) -> Result<Value, Unwind> {
+        // `type(x)(...)` for a builtin: the stand-in class `type()` returns
+        // constructs exactly as the builtin's own constructor does.
+        if crate::builtins::is_builtin_type_class(class) {
+            if let Some(ctor) = self.builtin_globals.get(&class.name).cloned() {
+                return self.call_value(ctor, args, kwargs);
+            }
+            // No constructor of its own: the singletons' types hand back the
+            // singleton (`type(None)() is None`), and the rest cannot be
+            // instantiated at all.
+            let singleton = match class.name.as_str() {
+                "NoneType" => Some(Value::None),
+                "ellipsis" => Some(crate::value::ellipsis_value()),
+                "NotImplementedType" => self.builtin_globals.get("NotImplemented").cloned(),
+                _ => None,
+            };
+            if let Some(v) = singleton {
+                if !args.is_empty() || !kwargs.is_empty() {
+                    return Err(type_error(format!("{}() takes no arguments", class.name)));
+                }
+                return Ok(v);
+            }
+            if !crate::builtins::is_builtin_type_name(&class.name) {
+                return Err(type_error(format!(
+                    "cannot create '{}' instances",
+                    class.name
+                )));
+            }
+        }
         // Calling an enum class is value-lookup, not construction:
         // `Color(2)` → the member whose value is 2 (CPython semantics).
         if Self::is_enum_class(class) {
@@ -8204,6 +8253,59 @@ impl Interpreter {
                         },
                     ))));
                 }
+                // `object.__new__(cls)` — a bare instance, no `__init__` run
+                // (how `copy` rebuilds an object).
+                if builtin_object && attr == "__new__" {
+                    return Ok(Value::Native(Rc::new(NativeFn::new(
+                        "object.__new__",
+                        |i, args| match args.first() {
+                            Some(Value::Class(c)) if crate::builtins::is_builtin_type_class(c) => {
+                                Err(type_error(format!(
+                                    "object.__new__({0}) is not safe, use {0}.__new__()",
+                                    c.name
+                                )))
+                            }
+                            Some(Value::Native(n))
+                                if crate::builtins::is_builtin_type_name(n.name)
+                                    || builtin_exc_mro(n.name).is_some() =>
+                            {
+                                Err(type_error(format!(
+                                    "object.__new__({0}) is not safe, use {0}.__new__()",
+                                    n.name
+                                )))
+                            }
+                            // Extra arguments are an error unless the class
+                            // has its own `__init__` to take them and keeps
+                            // `object.__new__` (CPython's `excess_args` rule).
+                            Some(Value::Class(c))
+                                if args.len() > 1 && i.find_method(c, "__new__").is_some() =>
+                            {
+                                Err(type_error(
+                                    "object.__new__() takes exactly one argument \
+                                     (the type to instantiate)",
+                                ))
+                            }
+                            Some(Value::Class(c))
+                                if args.len() > 1
+                                    && !c.is_exception
+                                    && i.find_method(c, "__init__").is_none()
+                                    && !class_has_generated_init(c) =>
+                            {
+                                Err(type_error(format!("{}() takes no arguments", c.name)))
+                            }
+                            Some(Value::Class(c)) => Ok(Value::Instance(Rc::new(Instance {
+                                class: c.clone(),
+                                fields: RefCell::new(crate::value::FieldMap::new()),
+                                chain: RefCell::new(None),
+                            }))),
+                            Some(other) => Err(type_error(format!(
+                                "object.__new__(X): X is not a type object ({})",
+                                other.type_name()
+                            ))),
+                            None => Err(type_error("object.__new__(): not enough arguments")),
+                        },
+                    ))));
+                }
                 if builtin_object && attr == "__delattr__" {
                     return Ok(Value::Native(Rc::new(NativeFn::new(
                         "object.__delattr__",
@@ -8333,6 +8435,24 @@ impl Interpreter {
                         return Ok(default.clone());
                     }
                 }
+                // `type(xs)` is the cached stand-in for `list`; it is the
+                // same object as the builtin, so it answers what the
+                // builtin answers (`type(xs).append(xs, 2)`, `__module__`).
+                if crate::builtins::is_builtin_shim_class(class) && attr == "__module__" {
+                    let module = if class.name == "defaultdict" {
+                        "collections"
+                    } else {
+                        "builtins"
+                    };
+                    return Ok(Value::Str(self.intern_str(module)));
+                }
+                if crate::builtins::is_builtin_type_class(class) {
+                    if let Some(native @ Value::Native(_)) =
+                        self.builtin_globals.get(class.name.as_str()).cloned()
+                    {
+                        return self.get_attr(&native, attr);
+                    }
+                }
                 Err(attribute_error(format!(
                     "type object '{}' has no attribute '{}'",
                     class.name, attr
@@ -8432,8 +8552,39 @@ impl Interpreter {
                 }
                 Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(map))))
             }
+            // `defaultdict` / `property` name the same type object as the
+            // shim class behind them, so they answer its attributes
+            // (`defaultdict.copy(d)`, `property.getter`).
+            // `collections.defaultdict.__module__` / `property.__module__`:
+            // where the type lives publicly, not the shim it is built from.
+            Value::Native(n)
+                if crate::builtins::is_shim_constructor_name(n.name) && attr == "__module__" =>
+            {
+                let module = if n.name == "defaultdict" {
+                    "collections"
+                } else {
+                    "builtins"
+                };
+                Ok(Value::Str(self.intern_str(module)))
+            }
+            Value::Native(n)
+                if crate::builtins::is_shim_constructor_name(n.name)
+                    && !matches!(attr, "__name__" | "__qualname__") =>
+            {
+                let class = crate::builtins::shim_class_for_constructor(self, n.name)?;
+                self.get_attr(&class, attr)
+            }
             Value::Native(n) if attr == "__name__" || attr == "__qualname__" => {
                 Ok(Value::Str(self.intern_str(n.name)))
+            }
+            // `list.__module__` / `ValueError.__module__`: every builtin type
+            // and exception lives in `builtins`.
+            Value::Native(n)
+                if attr == "__module__"
+                    && (builtin_exc_mro(n.name).is_some()
+                        || crate::builtins::is_builtin_type_name(n.name)) =>
+            {
+                Ok(Value::Str(self.intern_str("builtins")))
             }
             // `ValueError.__mro__` / `KeyError.__bases__` — a builtin
             // exception type's place in the standard hierarchy.
@@ -8481,6 +8632,31 @@ impl Interpreter {
             }
             Value::BoundMethod { function, .. } if attr == "__qualname__" => {
                 Ok(Value::Str(self.function_qualname(function)))
+            }
+            // A bound method's parts: `m.__self__` is the receiver and
+            // `m.__func__` the plain function it wraps.
+            Value::BoundMethod { receiver, .. } if attr == "__self__" => Ok((**receiver).clone()),
+            Value::BoundMethod { function, .. } if attr == "__func__" => {
+                Ok(Value::Function(function.clone()))
+            }
+            // `f.__get__(obj)` binds a function to `obj`, as the descriptor
+            // protocol does on attribute access; `f.__get__(None, cls)` is
+            // the function itself.
+            Value::Function(f) if attr == "__get__" => {
+                let f = f.clone();
+                Ok(Value::Native(Rc::new(NativeFn::new(
+                    "__get__",
+                    move |_interp, args| match args.first() {
+                        None => Err(type_error(
+                            "__get__ expected at least 1 argument, got 0".to_owned(),
+                        )),
+                        Some(Value::None) => Ok(Value::Function(f.clone())),
+                        Some(obj) => Ok(Value::BoundMethod {
+                            receiver: Box::new(obj.clone()),
+                            function: f.clone(),
+                        }),
+                    },
+                ))))
             }
             Value::ResultOk(v) => match attr {
                 "value" => Ok((**v).clone()),
@@ -8569,6 +8745,16 @@ impl Interpreter {
                     "str" | "list" | "dict" | "set" | "frozenset" | "tuple" | "bytes"
                 ) =>
             {
+                // Only a method the type actually has: `list.__deepcopy__`
+                // and `hasattr(list, "nope")` miss, as in CPython.
+                // `__class_getitem__` is on the type only (`list[int]`).
+                let class_only = attr == "__class_getitem__" && !matches!(nf.name, "str" | "bytes");
+                if !class_only && !builtin_has_attr(&empty_builtin_value(nf.name), attr) {
+                    return Err(attribute_error(format!(
+                        "type object '{}' has no attribute '{}'",
+                        nf.name, attr
+                    )));
+                }
                 let attr_name: Rc<str> = Rc::from(attr);
                 let m = NativeFn::new("method", move |interp, args| {
                     if args.is_empty() {
@@ -8586,6 +8772,23 @@ impl Interpreter {
             Value::Iter(_) => {
                 let generator = as_generator(value);
                 match (attr, generator) {
+                    ("__reduce__", _) => {
+                        let target = value.clone();
+                        Ok(Value::Native(Rc::new(NativeFn::new(
+                            "__reduce__",
+                            move |i, _a| iter_reduce(i, &target),
+                        ))))
+                    }
+                    ("__setstate__", _) if iter_is_positioned(value) => {
+                        let target = value.clone();
+                        Ok(Value::Native(Rc::new(NativeFn::new(
+                            "__setstate__",
+                            move |_i, args| {
+                                let state = args.into_iter().next().unwrap_or(Value::None);
+                                iter_setstate(&target, &state)
+                            },
+                        ))))
+                    }
                     ("__next__", _) => {
                         let target = value.clone();
                         Ok(Value::Native(Rc::new(NativeFn::new(
@@ -11768,6 +11971,21 @@ fn builtin_type_method(ty: &'static str, attr: &str) -> Option<Value> {
 }
 
 /// [`builtin_has_attr`] for the method dispatcher in `builtins`.
+/// An empty value of the builtin container / text type `name`, for asking
+/// [`builtin_has_attr`] what the type itself offers.
+fn empty_builtin_value(name: &str) -> Value {
+    match name {
+        "str" => Value::Str(Rc::new(String::new())),
+        "bytes" => Value::Bytes(Rc::new(Vec::new())),
+        "list" => Value::List(Rc::new(RefCell::new(Vec::new()))),
+        "tuple" => Value::Tuple(Rc::new(Vec::new())),
+        "dict" => Value::Dict(Rc::new(crate::value::FrozenCell::new(DictMap::new()))),
+        _ => Value::Set(Rc::new(crate::value::FrozenCell::new(
+            crate::pyset::PySet::new(),
+        ))),
+    }
+}
+
 pub(crate) fn builtin_has_attr_pub(value: &Value, attr: &str) -> bool {
     builtin_has_attr(value, attr)
 }
@@ -12725,6 +12943,16 @@ fn values_identical(a: &Value, b: &Value) -> bool {
         (Instance(x), Instance(y)) => Rc::ptr_eq(x, y),
         (Module(x), Module(y)) => Rc::ptr_eq(x, y),
         (Class(x), Class(y)) => Rc::ptr_eq(x, y),
+        // `type([]) is list`: `type(x)` hands back the cached stand-in class
+        // for a builtin, while the name `list` is its constructor native —
+        // one type object in CPython.
+        (Class(c), Native(n)) | (Native(n), Class(c)) => {
+            c.name == n.name
+                && (((crate::builtins::is_builtin_type_name(n.name)
+                    || builtin_exc_mro(n.name).is_some())
+                    && crate::builtins::is_builtin_type_class(c))
+                    || crate::builtins::is_builtin_shim_class(c))
+        }
         // A function object is one `Rc`, so `g is f` after `g = f` (and
         // `wrapper.__wrapped__ is f`) holds, as in CPython.
         (Function(x), Function(y)) => Rc::ptr_eq(x, y),
@@ -12851,6 +13079,215 @@ fn reject_sync_only_async_iterable(v: &Value) -> Result<(), Unwind> {
         )));
     }
     Ok(())
+}
+
+/// `it.__reduce__()` for a builtin iterator, shaped as CPython's: the
+/// callable that rebuilds it, its arguments and (for a positioned
+/// iterator) the index `__setstate__` restores. This is what lets `copy`
+/// copy an iterator: a list iterator's copy shares the list and resumes
+/// at the same place, a dict or set iterator's is a list iterator over
+/// the entries still to come, and a generator cannot be copied at all.
+fn iter_reduce(interp: &mut Interpreter, target: &Value) -> Result<Value, Unwind> {
+    let Value::Iter(it) = target else {
+        return Err(type_error("cannot pickle this object"));
+    };
+    enum Plan {
+        Seq(&'static str, Value, Option<i64>),
+        Remaining,
+        Wrap(&'static str, Vec<Value>),
+        Refuse(&'static str),
+    }
+    let plan = match &*it.borrow() {
+        IterState::List { items, index } => {
+            Plan::Seq("iter", Value::List(items.clone()), Some(*index as i64))
+        }
+        IterState::Tuple { items, index } => {
+            Plan::Seq("iter", Value::Tuple(items.clone()), Some(*index as i64))
+        }
+        IterState::Str { chars, index } => Plan::Seq(
+            "iter",
+            Value::Str(Rc::new(chars.iter().collect())),
+            Some(*index as i64),
+        ),
+        IterState::Range {
+            current,
+            stop,
+            step,
+        } => Plan::Seq(
+            "iter",
+            Value::Range {
+                start: *current,
+                stop: *stop,
+                step: *step,
+            },
+            None,
+        ),
+        // CPython's state is the index of the next item to yield.
+        IterState::ListRev { list, index } => Plan::Seq(
+            "reversed",
+            Value::List(list.clone()),
+            Some(*index as i64 - 1),
+        ),
+        IterState::SeqIter { obj, index } => Plan::Seq("iter", obj.clone(), Some(*index as i64)),
+        IterState::Dict { .. }
+        | IterState::DictRev { .. }
+        | IterState::Set { .. }
+        | IterState::Reversed { .. } => Plan::Remaining,
+        IterState::Enumerate { inner, index } => Plan::Wrap(
+            "enumerate",
+            vec![Value::Iter(inner.clone()), Value::Int(VmInt::from(*index))],
+        ),
+        IterState::Zip { inners } => {
+            Plan::Wrap("zip", inners.iter().cloned().map(Value::Iter).collect())
+        }
+        IterState::Map { func, inner, star } => {
+            let mut args = vec![func.clone()];
+            if *star {
+                match &*inner.borrow() {
+                    IterState::Zip { inners } => {
+                        args.extend(inners.iter().cloned().map(Value::Iter));
+                    }
+                    _ => args.push(Value::Iter(inner.clone())),
+                }
+            } else {
+                args.push(Value::Iter(inner.clone()));
+            }
+            Plan::Wrap("map", args)
+        }
+        IterState::Filter { func, inner } => {
+            Plan::Wrap("filter", vec![func.clone(), Value::Iter(inner.clone())])
+        }
+        IterState::Generator(_) | IterState::GenExpr(_) => Plan::Refuse("generator"),
+        IterState::UserIter(_) | IterState::AsyncUserIter(_) => Plan::Refuse("iterator"),
+    };
+    let builtin = |interp: &Interpreter, name: &str| {
+        interp
+            .builtin_globals
+            .get(name)
+            .cloned()
+            .ok_or_else(|| type_error(format!("cannot pickle '{name}' iterator")))
+    };
+    let parts = match plan {
+        Plan::Seq(ctor, seq, state) => {
+            let mut parts = vec![builtin(interp, ctor)?, Value::Tuple(Rc::new(vec![seq]))];
+            if let Some(state) = state {
+                parts.push(Value::Int(VmInt::from(state)));
+            }
+            parts
+        }
+        Plan::Remaining => {
+            // Step a twin of the iterator over the same live container, so
+            // the original keeps its place.
+            let twin = {
+                let state = it.borrow();
+                match &*state {
+                    IterState::Dict {
+                        dict,
+                        kind,
+                        index,
+                        used,
+                        remaining,
+                    } => IterState::Dict {
+                        dict: dict.clone(),
+                        kind: *kind,
+                        index: *index,
+                        used: *used,
+                        remaining: *remaining,
+                    },
+                    IterState::DictRev {
+                        dict,
+                        kind,
+                        index,
+                        used,
+                    } => IterState::DictRev {
+                        dict: dict.clone(),
+                        kind: *kind,
+                        index: *index,
+                        used: *used,
+                    },
+                    IterState::Set {
+                        set,
+                        pos,
+                        used,
+                        remaining,
+                    } => IterState::Set {
+                        set: set.clone(),
+                        pos: *pos,
+                        used: *used,
+                        remaining: *remaining,
+                    },
+                    IterState::Reversed { items, index } => IterState::Reversed {
+                        items: items.clone(),
+                        index: *index,
+                    },
+                    _ => unreachable!("only the snapshot shapes reach here"),
+                }
+            };
+            let twin = Value::Iter(Rc::new(RefCell::new(twin)));
+            let mut rest = Vec::new();
+            while let Some(v) = interp.iter_next(&twin)? {
+                rest.push(v);
+            }
+            vec![
+                builtin(interp, "iter")?,
+                Value::Tuple(Rc::new(vec![Value::List(Rc::new(RefCell::new(rest)))])),
+            ]
+        }
+        Plan::Wrap(ctor, args) => vec![builtin(interp, ctor)?, Value::Tuple(Rc::new(args))],
+        Plan::Refuse(kind) => {
+            return Err(type_error(format!("cannot pickle '{kind}' object")));
+        }
+    };
+    Ok(Value::Tuple(Rc::new(parts)))
+}
+
+/// The iterators CPython gives a `__setstate__`: the ones that resume at an
+/// index into a sequence. Dict, set and generator iterators have none.
+fn iter_is_positioned(target: &Value) -> bool {
+    let Value::Iter(it) = target else {
+        return false;
+    };
+    matches!(
+        &*it.borrow(),
+        IterState::List { .. }
+            | IterState::Tuple { .. }
+            | IterState::Str { .. }
+            | IterState::SeqIter { .. }
+            | IterState::ListRev { .. }
+    )
+}
+
+/// `it.__setstate__(index)` for a positioned builtin iterator, clamped
+/// as CPython clamps it.
+fn iter_setstate(target: &Value, state: &Value) -> Result<Value, Unwind> {
+    let Value::Iter(it) = target else {
+        return Ok(Value::None);
+    };
+    let Value::Int(i) = state else {
+        return Err(type_error("an integer is required"));
+    };
+    // CPython takes a `Py_ssize_t` here: a state that does not fit is an
+    // `OverflowError`, never a wrapped or saturated index.
+    let n: i64 = i.to_bigint().try_into().map_err(|_| {
+        Unwind::Exception(VmException::new(
+            "OverflowError",
+            "Python int too large to convert to C ssize_t",
+        ))
+    })?;
+    let n = n.max(-1);
+    match &mut *it.borrow_mut() {
+        IterState::List { items, index } => {
+            *index = (n.max(0) as usize).min(items.borrow().len());
+        }
+        IterState::Tuple { items, index } => *index = (n.max(0) as usize).min(items.len()),
+        IterState::Str { chars, index } => *index = (n.max(0) as usize).min(chars.len()),
+        IterState::SeqIter { index, .. } => *index = n.max(0) as usize,
+        IterState::ListRev { list, index } => {
+            *index = ((n + 1) as usize).min(list.borrow().len());
+        }
+        _ => {}
+    }
+    Ok(Value::None)
 }
 
 pub(crate) fn as_generator(v: &Value) -> Option<Rc<RefCell<GeneratorState>>> {
