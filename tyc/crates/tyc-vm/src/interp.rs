@@ -4683,6 +4683,13 @@ impl Interpreter {
                 _ => pyhash::pointer_hash(Rc::as_ptr(c) as usize),
             },
             Value::Function(f) => pyhash::pointer_hash(Rc::as_ptr(f) as usize),
+            // As for `id`: `defaultdict` hashes as its class.
+            Value::Native(n) if n.name == "defaultdict" => {
+                match crate::builtins::defaultdict_class(self)? {
+                    Value::Class(c) => pyhash::pointer_hash(Rc::as_ptr(&c) as usize),
+                    _ => pyhash::pointer_hash(Rc::as_ptr(n) as usize),
+                }
+            }
             Value::Native(n) => pyhash::pointer_hash(Rc::as_ptr(n) as usize),
             Value::Module(m) => pyhash::pointer_hash(Rc::as_ptr(m) as usize),
             Value::Exception { args, .. } => pyhash::pointer_hash(Rc::as_ptr(args) as usize),

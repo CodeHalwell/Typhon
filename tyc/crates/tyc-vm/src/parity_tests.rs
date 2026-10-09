@@ -2421,6 +2421,10 @@ import functools
 pf = functools.partial(max, 1)
 bm = [].append
 show(copy.copy(pf)(5), copy.deepcopy(pf)(0), copy.copy(bm) is bm, copy.deepcopy(print) is print)
+def _pget(self: object) -> int:
+    return 1
+pp = property(_pget)
+show(copy.copy(pp) is pp, copy.deepcopy(pp) is pp, copy.deepcopy([pp])[0] is pp)
 show(hasattr(list, "nope"), hasattr(list, "append"), hasattr(dict, "__deepcopy__"), hasattr(str, "lower"))
 "#,
     );
@@ -2469,6 +2473,12 @@ show(list(tk), tk.get(type(bytearray())), tk.get(type(5)), tk[type([])])
 show(hash(type([])) == hash(list), hash(type(bytearray())) == hash(bytearray))
 from collections import defaultdict as _dd, OrderedDict as _od
 show(isinstance(_dd, type), isinstance(_od, type))
+_ddv = _dd(list)
+show(type(_ddv) is _dd, id(type(_ddv)) == id(_dd), hash(type(_ddv)) == hash(_dd))
+def _getter(self: object) -> int:
+    return 1
+_pr = property(_getter)
+show(type(_pr) is property, isinstance(property, type), id(type(_pr)) == id(property), hash(type(_pr)) == hash(property))
 show(type(ValueError("x")) is ValueError, type(KeyError()) == KeyError, id(type(ValueError())) == id(ValueError))
 show(hasattr(list, "__class_getitem__"), hasattr(str, "__class_getitem__"), hasattr(dict, "__class_getitem__"))
 "#,

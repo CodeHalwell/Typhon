@@ -1285,6 +1285,19 @@ fn check_init_constructor_args(
     }
 }
 
+/// What a call to class `name` binds its arguments to, as a field-like
+/// shape plus positional order: the fields for a generated constructor,
+/// the `__init__` parameters otherwise.
+fn constructor_arg_shape(c: &Checker, name: &str) -> Option<(InterfaceShape, Vec<String>)> {
+    if constructor_is_field_list(c, name) {
+        let shape = c.class_shapes.get(name)?.clone();
+        let order = constructor_positional_order(c, name, &shape);
+        Some((shape, order))
+    } else {
+        init_param_shape(c, name)
+    }
+}
+
 /// The `__init__` parameters of class `name` as a field-like shape (name ->
 /// declared type) plus their positional order, for the constructor checks.
 fn init_param_shape(c: &Checker, name: &str) -> Option<(InterfaceShape, Vec<String>)> {
@@ -1583,19 +1596,46 @@ fn check_explicit_typearg_constructor(
         pos_args,
         kw_args,
     );
+    // The remaining (concrete) parameters are checked as on a plain call;
+    // anything unmatched is still inferred so its own diagnostics surface.
     for (i, arg) in pos_args.iter().enumerate() {
-        if !typevar_field_idxs.contains(&i) {
-            let _ = infer_expr(c, arg);
+        if typevar_field_idxs.contains(&i) {
+            continue;
+        }
+        let param_ty = positional_order
+            .get(i)
+            .and_then(|p| arg_shape.fields.get(p))
+            .filter(|t| !matches!(arg, Expr::Starred(_)) && !is_dynamic_type(t))
+            .cloned();
+        match param_ty {
+            Some(ty) => {
+                let span = (arg.range().start().to_usize(), arg.range().end().to_usize());
+                check_one_concrete_ctor_arg(c, &ty, arg, span);
+            }
+            None => {
+                let _ = infer_expr(c, arg);
+            }
         }
     }
     for kw in kw_args {
-        let is_typevar_field = kw
+        let param_ty = kw
             .arg
             .as_ref()
-            .and_then(|id| arg_shape.fields.get(id.as_str()))
-            .is_some_and(contains_free_typevar);
-        if !is_typevar_field {
-            let _ = infer_expr(c, &kw.value);
+            .and_then(|id| arg_shape.fields.get(id.as_str()));
+        if param_ty.is_some_and(contains_free_typevar) {
+            continue;
+        }
+        match param_ty.filter(|t| !is_dynamic_type(t)).cloned() {
+            Some(ty) => {
+                let span = (
+                    kw.value.range().start().to_usize(),
+                    kw.value.range().end().to_usize(),
+                );
+                check_one_concrete_ctor_arg(c, &ty, &kw.value, span);
+            }
+            None => {
+                let _ = infer_expr(c, &kw.value);
+            }
         }
     }
 
@@ -22798,15 +22838,12 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         // the arg's inferred type. Annotation-pinned
                         // bindings (inserted above) win because
                         // `bind_field_typevars` only fills vacant slots.
-                        let class_shape = c
-                            .class_shapes
-                            .get(&name)
-                            .filter(|_| constructor_is_field_list(c, &name))
-                            .cloned();
-                        let positional_order: Vec<String> = class_shape
+                        let ctor = constructor_arg_shape(c, &name);
+                        let positional_order: Vec<String> = ctor
                             .as_ref()
-                            .map(|shape| constructor_positional_order(c, &name, shape))
+                            .map(|(_, order)| order.clone())
                             .unwrap_or_default();
+                        let class_shape = ctor.map(|(shape, _)| shape);
                         if let Some(shape) = class_shape.clone() {
                             for (idx, arg) in pos_args.iter().enumerate() {
                                 if matches!(arg, Expr::Starred(_)) {

@@ -1613,6 +1613,12 @@ pub fn install(interp: &mut Interpreter) {
             Value::Instance(inst) => Rc::as_ptr(inst) as usize,
             Value::Module(m) => Rc::as_ptr(m) as usize,
             Value::Function(f) => Rc::as_ptr(f) as usize,
+            // `collections.defaultdict` has no builtin global for its class
+            // to share an id with, so the constructor takes the class's.
+            Value::Native(n) if n.name == "defaultdict" => match defaultdict_class(i)? {
+                Value::Class(c) => Rc::as_ptr(&c) as usize,
+                _ => Rc::as_ptr(n) as usize,
+            },
             Value::Native(n) => Rc::as_ptr(n) as usize,
             Value::Iter(it) => Rc::as_ptr(it) as usize,
             other => other as *const _ as usize,
@@ -3053,15 +3059,20 @@ pub(crate) fn descriptor_shim_class(interp: &mut Interpreter, name: &str) -> Res
             m
         }
     };
-    match &module {
+    let class = match &module {
         Value::Module(m) => m
             .members
             .borrow()
             .get(name)
             .cloned()
-            .ok_or_else(|| type_error(format!("descriptor shim did not define '{name}'"))),
-        _ => Err(type_error("descriptor shim is not a module")),
+            .ok_or_else(|| type_error(format!("descriptor shim did not define '{name}'")))?,
+        _ => return Err(type_error("descriptor shim is not a module")),
+    };
+    // `type(property(f)) is property`, as for `bytearray`.
+    if name == "property" {
+        register_builtin_shim_class(&class);
     }
+    Ok(class)
 }
 
 /// `classmethod(f)` / `staticmethod(f)`: a copy of the user function `f`
@@ -3240,10 +3251,10 @@ fn register_builtin_shim_class(cls: &Value) {
     }
 }
 
-/// A constructor native that stands for a shim class (`collections.defaultdict`
-/// and the 3.15 builtins): a type object in CPython, so `isinstance(_, type)`.
+/// A constructor native that stands for a shim class (`collections.defaultdict`,
+/// `property` and the 3.15 builtins): a type object in CPython, so `isinstance(_, type)`.
 fn is_shim_constructor_name(name: &str) -> bool {
-    matches!(name, "defaultdict" | "frozendict" | "sentinel")
+    matches!(name, "defaultdict" | "frozendict" | "sentinel" | "property")
 }
 
 /// `c` is the shim class behind a builtin constructor native of the same name.
@@ -3264,7 +3275,7 @@ pub(crate) fn py315_builtin_class(interp: &mut Interpreter, name: &str) -> Resul
     Ok(cls)
 }
 
-fn defaultdict_class(interp: &mut Interpreter) -> Result<Value, Unwind> {
+pub(crate) fn defaultdict_class(interp: &mut Interpreter) -> Result<Value, Unwind> {
     let cls = cached_helper_class(
         interp,
         "__shim_defaultdict__",

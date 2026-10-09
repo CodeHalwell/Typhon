@@ -45,6 +45,7 @@ def _atomic(x):
         or isinstance(x, type)
         or type(x) in _FUNCTION_TYPES
         or type(x) is slice
+        or type(x) is property
     )
 
 

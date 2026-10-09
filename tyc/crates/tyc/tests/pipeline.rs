@@ -1736,6 +1736,29 @@ fn check_accepts_init_arguments_that_differ_from_the_fields() {
     );
 }
 
+/// A type parameter pinned by the binding's annotation is checked against
+/// the `__init__` parameter it appears in.
+#[test]
+fn check_pins_init_type_parameters_from_the_annotation() {
+    for (call, ok) in [("Box(\"ok\", 1)", true), ("Box(\"ok\", \"bad\")", false)] {
+        let tmp = tempfile::tempdir().unwrap();
+        scaffold(
+            tmp.path(),
+            &format!(
+                "plain class Box[T]:\n    item: T\n    def __init__(self, label: str, item: T) -> None:\n        self.item = item\n\
+                 let b: Box[int] = {call}\nprint(b)\n"
+            ),
+        );
+        let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+        assert_eq!(
+            out.status.success(),
+            ok,
+            "`{call}`: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 /// ...and those arguments are checked against that `__init__`'s types.
 #[test]
 fn check_rejects_arguments_that_do_not_match_init() {
@@ -1745,6 +1768,8 @@ fn check_rejects_arguments_that_do_not_match_init() {
         "R(5)",
         "R(\"a\", k=\"x\")",
         "Box[int](\"lbl\", \"bad\")",
+        "Box[int](5, 1)",
+        "Box[int](label=5, item=1)",
     ] {
         let tmp = tempfile::tempdir().unwrap();
         scaffold(
