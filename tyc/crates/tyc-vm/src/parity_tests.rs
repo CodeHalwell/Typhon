@@ -3206,6 +3206,14 @@ abc.update_abstractmethods(Later)
 t("after update", lambda: (sorted(Later.__abstractmethods__), Later()))
 t("union isinstance", lambda: (isinstance(1, typing.Union[int, str]), isinstance(None, typing.Optional[int]), isinstance(1.5, typing.Union[int, str]), issubclass(bool, typing.Union[int, str]), isinstance(1, (str, typing.Union[bytes, int]))))
 t("no TEMPLATE", lambda: (hasattr(re, "TEMPLATE"), [m.name for m in re.RegexFlag], repr(re.RegexFlag(1))))
+t("union eq 604", lambda: (typing.Optional[int] == (int | None), typing.Union[int, str] == (int | str), (int | str) == typing.Union[str, int], hash(typing.Union[int, str]) == hash(int | str), hash(typing.Optional[int]) == hash(int | None)))
+plain class Reader(typing.IO[str]):
+    pass
+t("IO generic", lambda: Reader.__name__)
+for form in [typing.Union, typing.Literal, typing.Any, typing.Final, typing.Optional, typing.Annotated]:
+    t("bare form", lambda: isinstance(1, form))
+    t("bare form sub", lambda: issubclass(int, form))
+t("bare form tuple", lambda: (isinstance(1, (int, typing.Union)), typing.Generic in (typing.Generic,)))
 t("union short-circuit", lambda: isinstance(1, typing.Union[int, typing.List[int]]))
 for chk in [lambda: isinstance([], typing.List[int]), lambda: isinstance(1, typing.Literal[1]), lambda: issubclass(list, typing.List[int]), lambda: isinstance("s", typing.Union[int, typing.List[int]]), lambda: isinstance(1, typing.Annotated[int, "x"])]:
     t("alias check", chk)

@@ -100,12 +100,18 @@ class UnionType:
         return _union(other, self)
 
     def __eq__(self, other):
-        if not isinstance(other, UnionType):
-            return NotImplemented
-        return set(self.__args__) == set(other.__args__)
+        if isinstance(other, UnionType) or (isinstance(other, _TypingAlias) and other._name == "Union"):
+            return _union_key(self.__args__) == _union_key(other.__args__)
+        return NotImplemented
 
     def __hash__(self):
-        return hash(frozenset(self.__args__))
+        return hash(_union_key(self.__args__))
+
+
+def _union_key(args):
+    # `int | None` and `Optional[int]` are one union: members compare
+    # unordered, with `None` spelt as `NoneType`.
+    return frozenset([type(None) if a is None else a for a in args])
 
 
 def _union(a, b):
@@ -179,7 +185,10 @@ class _TypingAlias:
         self.__metadata__ = ()
         # A special form (`Union`, `Literal`, `Final`, `ClassVar`, ...) is its
         # own origin: it can be neither instantiated nor subclassed.
-        self._special = origin is form and name not in ("Generic", "Protocol")
+        # `IO` / `TextIO` / `BinaryIO` are real generic classes, not forms.
+        self._special = origin is form and name not in (
+            "Generic", "Protocol", "IO", "TextIO", "BinaryIO"
+        )
 
     @classmethod
     def _union_of(cls, params):
@@ -221,10 +230,12 @@ class _TypingAlias:
         return name + "[" + ", ".join([_type_repr(a) for a in self.__args__]) + "]"
 
     def __eq__(self, other):
+        if self._name == "Union" and isinstance(other, UnionType):
+            return _union_key(self.__args__) == _union_key(other.__args__)
         if not isinstance(other, _TypingAlias):
             return NotImplemented
         if self._name == "Union" and other._name == "Union":
-            return set(self.__args__) == set(other.__args__)
+            return _union_key(self.__args__) == _union_key(other.__args__)
         if self._name == "Literal" and other._name == "Literal":
             return _literal_keys(self.__args__) == _literal_keys(other.__args__)
         return (self._name == other._name and self.__origin__ == other.__origin__
@@ -232,7 +243,7 @@ class _TypingAlias:
 
     def __hash__(self):
         if self._name == "Union":
-            return hash(frozenset(self.__args__))
+            return hash(_union_key(self.__args__))
         if self._name == "Literal":
             return hash(_literal_keys(self.__args__))
         return hash((self._name, self.__args__))

@@ -32,7 +32,8 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   CPython's `TypeError` instead of quietly succeeding. `isinstance(1,
   Union[int, str])` and `Optional[...]` check their members; any other
   subscripted alias raises "Subscripted generics cannot be used with class
-  and instance checks".
+  and instance checks", as a bare special form (`isinstance(x, Union)`)
+  does. `Optional[int] == (int | None)` holds, with equal hashes.
 - **`re` flags are `re.RegexFlag` members under `tyc run`.** `re.I` printed
   as `2`; it is now `re.IGNORECASE`, and `re.I | re.M` is
   `re.IGNORECASE|re.MULTILINE`. `RegexFlag` is an `IntFlag` class, so

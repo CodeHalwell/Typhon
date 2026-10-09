@@ -1065,14 +1065,14 @@ pub fn install(interp: &mut Interpreter) {
             return Err(type_error("issubclass() arg 1 must be a class"));
         }
         let cls = union_members(&i.force_alias(&args[1]));
-        let mut unchecked = false;
-        let cls = typing_check_targets(i, cls, &mut unchecked)?;
+        let mut unchecked = None;
+        let cls = typing_check_targets(i, cls, "issubclass", &mut unchecked)?;
         let ok = match hooked_check(i, &cls, &sub, |t| is_subclass_of(&sub, t))? {
             Some(ok) => ok,
             None => is_subclass_of(&sub, &cls),
         };
-        if !ok && unchecked {
-            return Err(subscripted_generic_check());
+        if let (false, Some(msg)) = (ok, unchecked) {
+            return Err(type_error(msg));
         }
         Ok(Value::Bool(ok))
     });
@@ -1086,16 +1086,16 @@ pub fn install(interp: &mut Interpreter) {
         // pass has run — otherwise it would still be its name-string
         // fallback and the test would silently return the wrong result.
         let cls = union_members(&i.force_alias(&args[1]));
-        let mut unchecked = false;
-        let cls = typing_check_targets(i, cls, &mut unchecked)?;
+        let mut unchecked = None;
+        let cls = typing_check_targets(i, cls, "isinstance", &mut unchecked)?;
         if any_subclass_hook(&cls) {
             let ty = match i.root.get("type") {
                 Some(t) => i.call_value(t, vec![val.clone()], &[])?,
                 None => Value::None,
             };
             if let Some(ok) = hooked_check(i, &cls, &ty, |t| is_instance_of(val, t))? {
-                if !ok && unchecked {
-                    return Err(subscripted_generic_check());
+                if let (false, Some(msg)) = (ok, unchecked) {
+                    return Err(type_error(msg));
                 }
                 return Ok(Value::Bool(ok));
             }
@@ -1118,8 +1118,8 @@ pub fn install(interp: &mut Interpreter) {
             }
         }
         let ok = is_instance_of(val, &cls);
-        if !ok && unchecked {
-            return Err(subscripted_generic_check());
+        if let (false, Some(msg)) = (ok, unchecked) {
+            return Err(type_error(msg));
         }
         Ok(Value::Bool(ok))
     });
@@ -2449,14 +2449,15 @@ fn protocol_targets(cls: &Value) -> Vec<Value> {
 fn typing_check_targets(
     i: &mut Interpreter,
     cls: Value,
-    unchecked: &mut bool,
+    check: &str,
+    unchecked: &mut Option<String>,
 ) -> Result<Value, Unwind> {
     match cls {
         Value::Tuple(t) => {
             let mut out = Vec::with_capacity(t.len());
             for c in t.iter() {
-                out.push(typing_check_targets(i, c.clone(), unchecked)?);
-                if *unchecked {
+                out.push(typing_check_targets(i, c.clone(), check, unchecked)?);
+                if unchecked.is_some() {
                     break;
                 }
             }
@@ -2470,13 +2471,29 @@ fn typing_check_targets(
                 (true, Some(args @ Value::Tuple(_))) => {
                     let args = args.clone();
                     drop(fields);
-                    typing_check_targets(i, args, unchecked)
+                    typing_check_targets(i, args, check, unchecked)
                 }
                 _ => {
-                    *unchecked = true;
+                    *unchecked = Some(
+                        "Subscripted generics cannot be used with class and instance checks"
+                            .to_owned(),
+                    );
                     Ok(Value::Tuple(Rc::new(Vec::new())))
                 }
             }
+        }
+        // A bare special form (`Union`, `Literal`, `Final`) is no class:
+        // CPython refuses it as a check target. `Any` is a class whose
+        // metaclass refuses only `isinstance`.
+        Value::Native(n)
+            if match crate::value::typing_form_type(n.name) {
+                Some("_SpecialForm" | "_TypedCacheSpecialForm") => true,
+                Some("_AnyMeta") => check == "isinstance",
+                _ => false,
+            } =>
+        {
+            *unchecked = Some(format!("typing.{} cannot be used with {check}()", n.name));
+            Ok(Value::Tuple(Rc::new(Vec::new())))
         }
         Value::Native(n)
             if crate::value::typing_form_type(n.name) == Some("_SpecialGenericAlias")
@@ -2553,10 +2570,6 @@ fn has_subclass_hook(v: &Value) -> bool {
         }
         _ => false,
     }
-}
-
-fn subscripted_generic_check() -> Unwind {
-    type_error("Subscripted generics cannot be used with class and instance checks")
 }
 
 /// A user class that is merely *named* `object` (`plain class object:`):
