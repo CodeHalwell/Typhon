@@ -8584,9 +8584,13 @@ impl Interpreter {
                 let m = n.method.as_ref().expect("checked by the guard");
                 Ok(Value::Str(Rc::new(format!("{}.{}", m.owner, m.attr))))
             }
+            // `list.append.__objclass__` is `list`.
             Value::Native(n)
                 if attr == "__objclass__"
-                    && matches!(&n.method, Some(m) if m.receiver.is_none()) =>
+                    && matches!(
+                        &n.method,
+                        Some(m) if matches!(m.binding, crate::value::MethodBinding::Unbound)
+                    ) =>
             {
                 let m = n.method.as_ref().expect("checked by the guard");
                 Ok(self
@@ -8594,11 +8598,24 @@ impl Interpreter {
                     .cloned()
                     .unwrap_or_else(|| crate::builtins::make_builtin_type(m.owner)))
             }
+            // `[].append.__self__` is the list, `dict.fromkeys.__self__`
+            // the type and `str.maketrans.__self__` `None`.
             Value::Native(n)
-                if attr == "__self__" && matches!(&n.method, Some(m) if m.receiver.is_some()) =>
+                if attr == "__self__"
+                    && matches!(
+                        &n.method,
+                        Some(m) if !matches!(m.binding, crate::value::MethodBinding::Unbound)
+                    ) =>
             {
                 let m = n.method.as_ref().expect("checked by the guard");
-                Ok(m.receiver.clone().expect("checked by the guard"))
+                Ok(match &m.binding {
+                    crate::value::MethodBinding::Bound(r) => r.clone(),
+                    crate::value::MethodBinding::OnType { classmethod: true } => self
+                        .builtin_global(m.owner)
+                        .cloned()
+                        .unwrap_or_else(|| crate::builtins::make_builtin_type(m.owner)),
+                    _ => Value::None,
+                })
             }
             Value::Native(n) if attr == "__name__" || attr == "__qualname__" => {
                 Ok(Value::Str(self.intern_str(n.name)))
@@ -8734,12 +8751,18 @@ impl Interpreter {
                 // method registry in `builtins` does the actual dispatch.
                 let r = value.clone();
                 let attr_name: Rc<str> = Rc::from(attr);
+                // A bound builtin method is named for its receiver's type:
+                // `True.bit_count.__qualname__` is `bool.bit_count`.
                 let (owner, tag, receiver) = (value.type_name(), attr_name.clone(), value.clone());
                 let nf = NativeFn::new("method", move |interp, mut args| {
                     args.insert(0, r.clone());
                     crate::builtins::dispatch_method(interp, &attr_name, args)
                 })
-                .with_method(owner, tag, Some(receiver));
+                .with_method(
+                    owner,
+                    tag,
+                    crate::value::MethodBinding::Bound(receiver),
+                );
                 Ok(Value::Native(Rc::new(nf)))
             }
             // Static / class methods on builtin type objects. The generic
@@ -8747,21 +8770,42 @@ impl Interpreter {
             // which is wrong for these: `dict.fromkeys(iterable, v)` and
             // `str.maketrans(a, b)` take their arguments as data, not as the
             // value the method runs on. Intercept them before the fallthrough.
-            Value::Native(nf) if nf.name == "dict" && attr == "fromkeys" => Ok(Value::Native(
-                Rc::new(NativeFn::new("dict.fromkeys", |interp, args| {
-                    crate::builtins::dict_fromkeys(interp, args)
-                })),
-            )),
-            Value::Native(nf) if nf.name == "str" && attr == "maketrans" => Ok(Value::Native(
-                Rc::new(NativeFn::new("str.maketrans", |_interp, args| {
-                    crate::builtins::str_maketrans(&args)
-                })),
-            )),
-            Value::Native(nf) if nf.name == "bytes" && attr == "maketrans" => Ok(Value::Native(
-                Rc::new(NativeFn::new("bytes.maketrans", |_interp, args| {
-                    crate::builtins::bytes_maketrans(&args)
-                })),
-            )),
+            Value::Native(nf) if nf.name == "dict" && attr == "fromkeys" => {
+                Ok(Value::Native(Rc::new(
+                    NativeFn::new("dict.fromkeys", |interp, args| {
+                        crate::builtins::dict_fromkeys(interp, args)
+                    })
+                    .with_method(
+                        "dict",
+                        Rc::from("fromkeys"),
+                        crate::value::MethodBinding::OnType { classmethod: true },
+                    ),
+                )))
+            }
+            Value::Native(nf) if nf.name == "str" && attr == "maketrans" => {
+                Ok(Value::Native(Rc::new(
+                    NativeFn::new("str.maketrans", |_interp, args| {
+                        crate::builtins::str_maketrans(&args)
+                    })
+                    .with_method(
+                        "str",
+                        Rc::from("maketrans"),
+                        crate::value::MethodBinding::OnType { classmethod: false },
+                    ),
+                )))
+            }
+            Value::Native(nf) if nf.name == "bytes" && attr == "maketrans" => {
+                Ok(Value::Native(Rc::new(
+                    NativeFn::new("bytes.maketrans", |_interp, args| {
+                        crate::builtins::bytes_maketrans(&args)
+                    })
+                    .with_method(
+                        "bytes",
+                        Rc::from("maketrans"),
+                        crate::value::MethodBinding::OnType { classmethod: false },
+                    ),
+                )))
+            }
             // Unbound builtin-type methods: `str.strip(x)`, `list.append(xs, v)`,
             // `dict.get(d, k)`. The type constructors are registered as natives
             // named after the type; accessing a method on one yields a function
@@ -8794,7 +8838,7 @@ impl Interpreter {
                     }
                     crate::builtins::dispatch_method(interp, &attr_name, args)
                 })
-                .with_method(nf.name, tag, None);
+                .with_method(nf.name, tag, crate::value::MethodBinding::Unbound);
                 Ok(Value::Native(Rc::new(m)))
             }
             // Generator objects and other iterators: the iterator protocol
@@ -11850,6 +11894,27 @@ fn scale_pow2(mut m: f64, mut k: i32) -> f64 {
 }
 
 fn builtin_type_method(ty: &'static str, attr: &str) -> Option<Value> {
+    let mut method = builtin_type_method_untagged(ty, attr)?;
+    // The static / class methods (`str.maketrans`, `dict.fromkeys`) come
+    // back untagged; they are bound to the type.
+    if let Value::Native(n) = &mut method {
+        if let Some(n) = Rc::get_mut(n) {
+            if n.method.is_none() {
+                let binding = crate::value::MethodBinding::OnType {
+                    classmethod: attr != "maketrans",
+                };
+                n.method = Some(crate::value::NativeMethod {
+                    owner: ty,
+                    attr: Rc::from(attr),
+                    binding,
+                });
+            }
+        }
+    }
+    Some(method)
+}
+
+fn builtin_type_method_untagged(ty: &'static str, attr: &str) -> Option<Value> {
     // Static / class methods take their arguments as data, not as the
     // receiver the unbound-method form below would make of the first one.
     match (ty, attr) {
@@ -11998,7 +12063,12 @@ fn builtin_type_method(ty: &'static str, attr: &str) -> Option<Value> {
         NativeFn::new(method, move |i, args| {
             crate::builtins::dispatch_method(i, method, args)
         })
-        .with_method(ty, Rc::from(attr), None),
+        // `bool.bit_count` is `int`'s descriptor.
+        .with_method(
+            if ty == "bool" { "int" } else { ty },
+            Rc::from(attr),
+            crate::value::MethodBinding::Unbound,
+        ),
     )))
 }
 

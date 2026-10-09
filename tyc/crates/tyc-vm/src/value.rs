@@ -792,14 +792,23 @@ pub fn native_repr(name: &str) -> String {
 /// prints the way CPython's descriptors do, everything else as
 /// [`native_repr`].
 pub fn native_value_repr(n: &NativeFn) -> String {
+    let addr = |v: Option<&Value>| {
+        v.and_then(heap_addr)
+            .unwrap_or(n as *const NativeFn as usize)
+    };
     match &n.method {
-        Some(m) => match &m.receiver {
-            None => format!("<method '{}' of '{}' objects>", m.attr, m.owner),
-            Some(r) => format!(
+        Some(m) => match &m.binding {
+            MethodBinding::Unbound => format!("<method '{}' of '{}' objects>", m.attr, m.owner),
+            MethodBinding::Bound(r) => format!(
                 "<built-in method {} of {} object at {:#x}>",
                 m.attr,
-                m.owner,
-                heap_addr(r).unwrap_or(n as *const NativeFn as usize)
+                r.type_name(),
+                addr(Some(r))
+            ),
+            MethodBinding::OnType { .. } => format!(
+                "<built-in method {} of type object at {:#x}>",
+                m.attr,
+                addr(None)
             ),
         },
         None => native_repr(n.name),
@@ -1748,14 +1757,25 @@ pub enum DictViewKind {
 pub type NativeFnImpl =
     dyn Fn(&mut crate::interp::Interpreter, Vec<Value>) -> Result<Value, Unwind>;
 
-/// What a builtin-method native stands for: `list.append` (no receiver)
-/// or `[].append` (bound to its receiver). It only drives introspection —
+/// What a builtin-method native stands for. It only drives introspection —
 /// `repr`, `type`, `__name__`, `__self__` — never the call itself.
 pub struct NativeMethod {
-    /// The builtin type the method belongs to (`"list"`).
+    /// The builtin type that defines the method (`"int"` for
+    /// `bool.bit_count`, which is `int`'s descriptor).
     pub owner: &'static str,
     pub attr: Rc<str>,
-    pub receiver: Option<Value>,
+    pub binding: MethodBinding,
+}
+
+/// How a builtin method native is bound.
+pub enum MethodBinding {
+    /// `list.append`: the method descriptor, read off the type.
+    Unbound,
+    /// `[].append`: bound to its receiver.
+    Bound(Value),
+    /// `str.maketrans` (a static method, `__self__` is `None`) or
+    /// `dict.fromkeys` (a class method, `__self__` is the type).
+    OnType { classmethod: bool },
 }
 
 pub struct NativeFn {
@@ -1787,18 +1807,17 @@ impl NativeFn {
         }
     }
 
-    /// Tag a native as the builtin method `owner.attr`, bound to `receiver`
-    /// when there is one.
+    /// Tag a native as the builtin method `owner.attr`.
     pub fn with_method(
         mut self,
         owner: &'static str,
         attr: Rc<str>,
-        receiver: Option<Value>,
+        binding: MethodBinding,
     ) -> Self {
         self.method = Some(NativeMethod {
             owner,
             attr,
-            receiver,
+            binding,
         });
         self
     }
@@ -2543,7 +2562,10 @@ impl Value {
             // constructor (`int`) is a `type`.
             Value::Native(n) if native_is_type(n.name) => "type",
             Value::Native(n) => match &n.method {
-                Some(m) if m.receiver.is_none() => "method_descriptor",
+                Some(NativeMethod {
+                    binding: MethodBinding::Unbound,
+                    ..
+                }) => "method_descriptor",
                 _ => "builtin_function_or_method",
             },
             Value::Function(_) => "function",

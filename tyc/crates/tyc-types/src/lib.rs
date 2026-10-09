@@ -1679,6 +1679,7 @@ fn check_explicit_typearg_constructor(
     } else if c.find_method(&name, "__init__").is_some() {
         check_init_constructor_arity(c, &name, pos_args, kw_args, call_span);
     } else if c.is_plain_class(&name)
+        && class_ancestry_fully_local(c, &name)
         && (!pos_args.is_empty() || kw_args.iter().any(|k| k.arg.is_some()))
     {
         c.wrong_args(&name, 0, pos_args.len() + kw_args.len(), call_span);
@@ -22851,9 +22852,13 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                                 check_init_constructor_arity(
                                     c, &name, pos_args, kw_args, call_span,
                                 );
-                            } else if !pos_args.is_empty()
-                                || kw_args.iter().any(|k| k.arg.is_some())
+                            } else if class_ancestry_fully_local(c, &name)
+                                && (!pos_args.is_empty() || kw_args.iter().any(|k| k.arg.is_some()))
                             {
+                                // Only `object.__init__` when no base is a
+                                // builtin or imported class: `Exception`,
+                                // `bytes` and a venv class bring their own
+                                // constructor.
                                 c.wrong_args(&name, 0, pos_args.len() + kw_args.len(), call_span);
                             }
                         } else if user_init && c.is_raw_class(&name) {
@@ -29419,6 +29424,23 @@ def main() -> None:
             check_class_kinds(bad).has_errors(),
             "object.__init__ takes no arguments"
         );
+        // A builtin or imported base brings its own constructor:
+        // `Exception.__init__` takes the message, `bytes` its value.
+        let builtin_base = "\
+plain class Boom(Exception):
+    pass
+
+plain class Blob(bytes):
+    pass
+
+plain class Gen[T](Exception):
+    pass
+
+def main() -> None:
+    print(Boom(\"x\"), Blob(b\"ab\"), Gen[int](\"y\"))
+";
+        let d = check_class_kinds(builtin_base);
+        assert!(!d.has_errors(), "builtin bases: {d:?}");
     }
 
     #[test]

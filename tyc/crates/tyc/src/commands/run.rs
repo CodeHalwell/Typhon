@@ -1603,7 +1603,7 @@ mod tests {
     fn scan_routes_builtin_subclasses_to_cpython() {
         // The VM models `list` / `int` / `str` as values, not classes, so a
         // subclass of one runs on CPython.
-        for base in ["list", "int", "str", "dict", "tuple", "float"] {
+        for base in ["list", "int", "str", "dict", "tuple", "float", "bytearray"] {
             let src = format!("plain class X({base}):\n    pass\nprint(X())\n");
             assert_eq!(
                 scan_source(&src),
@@ -1621,6 +1621,25 @@ mod tests {
         assert_eq!(scan_source(mixin), None);
         let exc = "plain class E(ValueError):\n    pass\nprint(E())\n";
         assert_eq!(scan_source(exc), None);
+        let typhon_enum = "enum Colour(str):\n    RED = \"r\"\nprint(Colour.RED)\n";
+        assert_eq!(scan_source(typhon_enum), None);
+        let enum_module =
+            "import enum as e\nclass Level(int, e.IntEnum):\n    LOW = 1\nprint(Level.LOW)\n";
+        assert_eq!(scan_source(enum_module), None);
+        let enum_base = "from enum import Enum\nclass Base(Enum):\n    pass\nclass Colour(str, Base):\n    RED = \"r\"\nprint(Colour.RED)\n";
+        assert_eq!(scan_source(enum_base), None);
+        // Only a real enum base exempts the class: a class merely named
+        // like one does not.
+        let not_enum = "plain class FakeEnum:\n    pass\nplain class L(list, FakeEnum):\n    pass\nprint(L())\n";
+        assert!(scan_source(not_enum).is_some());
+        // An alias of a builtin is the builtin.
+        let alias = "Alias = list\nplain class L(Alias):\n    pass\nprint(L())\n";
+        assert_eq!(
+            scan_source(alias),
+            Some(vec!["a subclass of the builtin list".to_owned()])
+        );
+        let imported = "from builtins import dict as D\nplain class M(D):\n    pass\nprint(M())\n";
+        assert!(scan_source(imported).is_some());
     }
 
     #[test]

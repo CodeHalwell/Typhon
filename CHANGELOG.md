@@ -22,14 +22,23 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   and `type(int)` is `type` (all were `function`). `repr(list.append)` is
   `<method 'append' of 'list' objects>` and `repr([].append)`
   `<built-in method append of list object at 0x…>`; builtin methods carry
-  their `__name__`, `__qualname__`, `__self__` and `__objclass__`.
+  their `__name__`, `__qualname__`, `__self__` and `__objclass__`
+  (`bool.bit_count` is `int`'s, `str.maketrans.__self__` is `None` and
+  `dict.fromkeys.__self__` is `dict`).
   `repr(defaultdict)` is `<class 'collections.defaultdict'>`.
+- **A `plain class` with a builtin or imported base takes that base's
+  constructor arguments.** `plain class Boom(Exception): pass` followed by
+  `raise Boom("x")` was rejected with "expected 0, got 1", as were
+  `bytes` and `range` bases: the zero-argument rule for a `plain class`
+  without an `__init__` now applies only when every ancestor is a class
+  of the project.
 - **A subclass of a builtin value type runs on CPython.** The VM models
   `list`, `int`, `str` and the other value types as values, not classes,
   so `class L(list)` built an empty object (`L([1, 2])` raised
   `TypeError` and `class S(str)` printed as an object). `tyc run`'s
   pre-run scan now sends such a program down the compiled path, as it
-  does a custom metaclass. Value-mixin enums stay on the VM.
+  does a custom metaclass, seeing through aliases (`Alias = list`).
+  Value-mixin enums stay on the VM.
 - **A `plain class` is called with its own `__init__`'s arguments.** A
   `plain class` (or a `class!` with a hand-written `__init__`) that also
   declared annotated fields had its call arguments type-checked against
