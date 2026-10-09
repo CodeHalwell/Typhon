@@ -1280,7 +1280,7 @@ fn check_init_constructor_args(
     pos_args: &[Expr],
     kw_args: &[ruff_python_ast::Keyword],
 ) {
-    if let Some((params, order)) = init_param_shape(c, name) {
+    if let Some((params, order)) = init_param_shape(c, name, pos_args, kw_args) {
         check_concrete_constructor_args(c, &params, &order, pos_args, kw_args);
     }
 }
@@ -1356,19 +1356,36 @@ fn check_init_constructor_arity(
 /// What a call to class `name` binds its arguments to, as a field-like
 /// shape plus positional order: the fields for a generated constructor,
 /// the `__init__` parameters otherwise.
-fn constructor_arg_shape(c: &Checker, name: &str) -> Option<(InterfaceShape, Vec<String>)> {
+fn constructor_arg_shape(
+    c: &Checker,
+    name: &str,
+    pos_args: &[Expr],
+    kw_args: &[ruff_python_ast::Keyword],
+) -> Option<(InterfaceShape, Vec<String>)> {
     if constructor_is_field_list(c, name) {
         let shape = c.class_shapes.get(name)?.clone();
         let order = constructor_positional_order(c, name, &shape);
         Some((shape, order))
     } else {
-        init_param_shape(c, name)
+        init_param_shape(c, name, pos_args, kw_args)
     }
 }
 
+/// The slot an extra positional argument fills in [`init_param_shape`]: no
+/// parameter can be named this, so it never collides with a real one.
+const VARARG_SLOT: &str = "*args";
+
 /// The `__init__` parameters of class `name` as a field-like shape (name ->
-/// declared type) plus their positional order, for the constructor checks.
-fn init_param_shape(c: &Checker, name: &str) -> Option<(InterfaceShape, Vec<String>)> {
+/// declared type) plus their positional order, for the constructor checks
+/// of one call: the positional arguments past the named parameters take
+/// the `*args` element type, and keywords no parameter names take the
+/// `**kwargs` value type.
+fn init_param_shape(
+    c: &Checker,
+    name: &str,
+    pos_args: &[Expr],
+    kw_args: &[ruff_python_ast::Keyword],
+) -> Option<(InterfaceShape, Vec<String>)> {
     let sig = c.find_method(name, "__init__")?;
     let info = &sig.arity_info;
     let names: Vec<&String> = info
@@ -1379,7 +1396,7 @@ fn init_param_shape(c: &Checker, name: &str) -> Option<(InterfaceShape, Vec<Stri
     if names.len() != sig.param_types.len() {
         return None;
     }
-    let params = InterfaceShape {
+    let mut params = InterfaceShape {
         fields: names
             .into_iter()
             .cloned()
@@ -1387,7 +1404,24 @@ fn init_param_shape(c: &Checker, name: &str) -> Option<(InterfaceShape, Vec<Stri
             .collect(),
         ..InterfaceShape::default()
     };
-    Some((params, info.param_names.clone()))
+    let mut order = info.param_names.clone();
+    if let Some(vararg) = &info.vararg_type {
+        params.fields.insert(VARARG_SLOT.to_owned(), vararg.clone());
+        while order.len() < pos_args.len() {
+            order.push(VARARG_SLOT.to_owned());
+        }
+    }
+    if let Some(kwarg) = &info.kwarg_type {
+        for kw in kw_args {
+            let Some(ident) = &kw.arg else { continue };
+            if !params.fields.contains_key(ident.as_str()) {
+                params
+                    .fields
+                    .insert(ident.as_str().to_owned(), kwarg.clone());
+            }
+        }
+    }
+    Some((params, order))
 }
 
 fn constructor_positional_order(c: &Checker, name: &str, shape: &InterfaceShape) -> Vec<String> {
@@ -1644,7 +1678,7 @@ fn check_explicit_typearg_constructor(
         let order = constructor_positional_order(c, &name, &shape);
         (shape, order)
     } else {
-        init_param_shape(c, &name).unwrap_or_default()
+        init_param_shape(c, &name, pos_args, kw_args).unwrap_or_default()
     };
     let typevar_field_idxs: std::collections::HashSet<usize> = positional_order
         .iter()
@@ -3997,6 +4031,9 @@ pub struct ArityInfo {
     /// excess positional args (FINDINGS #86). `Type::Unknown` when
     /// the vararg is unannotated.
     pub vararg_type: Option<Type>,
+    /// The value type of a `**kwargs` parameter (`Unknown` when it is
+    /// unannotated), `None` without one.
+    pub kwarg_type: Option<Type>,
     /// Declared types of the positional / pos-or-kw parameters, in
     /// source order parallel to `param_names`. `Type::Unknown` slots
     /// are emitted when a parameter is unannotated. Threaded across
@@ -12042,6 +12079,7 @@ fn class_constructor_arity_for(shape: &InterfaceShape, class_name: Option<&str>)
                 .collect(),
             has_kwarg: false,
             vararg_type: None,
+            kwarg_type: None,
             param_types: Vec::new(),
             kwonly_types: param_types,
             return_type,
@@ -12059,6 +12097,7 @@ fn class_constructor_arity_for(shape: &InterfaceShape, class_name: Option<&str>)
         kwonly_required: Vec::new(),
         has_kwarg: false,
         vararg_type: None,
+        kwarg_type: None,
         param_types,
         kwonly_types: Vec::new(),
         return_type,
@@ -12995,6 +13034,7 @@ fn arity_info_from_parameters_with_returns(
         kwonly_required,
         has_kwarg: parameters.kwarg.is_some(),
         vararg_type,
+        kwarg_type: kwarg_value_type_from_parameters(parameters, classes, type_params),
         param_types,
         kwonly_types,
         return_type,
@@ -22916,7 +22956,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         // the arg's inferred type. Annotation-pinned
                         // bindings (inserted above) win because
                         // `bind_field_typevars` only fills vacant slots.
-                        let ctor = constructor_arg_shape(c, &name);
+                        let ctor = constructor_arg_shape(c, &name, pos_args, kw_args);
                         let positional_order: Vec<String> = ctor
                             .as_ref()
                             .map(|(_, order)| order.clone())

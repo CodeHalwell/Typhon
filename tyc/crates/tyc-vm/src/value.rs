@@ -645,7 +645,9 @@ pub enum HashKey {
     /// different keys. Builtin types reach the VM as native constructors
     /// rather than `Class` values, so they key on their name instead.
     Class(Rc<Class>),
-    BuiltinType(&'static str),
+    /// The second field is the key object itself, handed back when the key
+    /// is materialised (`list({len: 1})`, a `defaultdict` type key).
+    BuiltinType(&'static str, Rc<Value>),
     /// An instance whose class defines `__hash__`. `hash` is what the user
     /// method returned; `__eq__` is consulted by `Interpreter::settle_key`
     /// *before* the key reaches a container, so inside the container two
@@ -1116,7 +1118,7 @@ impl HashKey {
                 out.push(9);
                 out.extend_from_slice(&(Rc::as_ptr(c) as usize as u64).to_be_bytes());
             }
-            HashKey::BuiltinType(name) => {
+            HashKey::BuiltinType(name, _) => {
                 out.push(10);
                 out.extend_from_slice(&(name.len() as u32).to_be_bytes());
                 out.extend_from_slice(name.as_bytes());
@@ -1151,10 +1153,10 @@ impl HashKey {
             HashKey::Class(c) => Value::Class(c),
             // A builtin type key comes back as that type (`list({int: 1})`
             // is `[<class 'int'>]`), not as its name.
-            HashKey::BuiltinType(name) if crate::builtins::is_builtin_type_name(name) => {
+            HashKey::BuiltinType(name, _) if crate::builtins::is_builtin_type_name(name) => {
                 crate::builtins::make_builtin_type(name)
             }
-            HashKey::BuiltinType(name) => Value::Str(Rc::new(name.to_owned())),
+            HashKey::BuiltinType(_, origin) => (*origin).clone(),
             HashKey::UserHashed { instance, .. } => Value::Instance(instance),
         }
     }
@@ -1212,7 +1214,7 @@ impl PartialEq for HashKey {
             (HashKey::Instance { key: a, .. }, HashKey::Instance { key: b, .. }) => a == b,
             (HashKey::Identity(a), HashKey::Identity(b)) => Rc::ptr_eq(a, b),
             (HashKey::Class(a), HashKey::Class(b)) => Rc::ptr_eq(a, b),
-            (HashKey::BuiltinType(a), HashKey::BuiltinType(b)) => a == b,
+            (HashKey::BuiltinType(a, _), HashKey::BuiltinType(b, _)) => a == b,
             // Equal-by-`__eq__` probes are settled onto the stored key's
             // instance before they get here (`Interpreter::settle_key`).
             (
@@ -1265,7 +1267,7 @@ impl std::hash::Hash for HashKey {
             HashKey::Instance { key, .. } => key.hash(state),
             HashKey::Identity(inst) => (Rc::as_ptr(inst) as usize).hash(state),
             HashKey::Class(c) => (Rc::as_ptr(c) as usize).hash(state),
-            HashKey::BuiltinType(name) => name.hash(state),
+            HashKey::BuiltinType(name, _) => name.hash(state),
             // Only the user hash feeds the hasher, so every probe with the
             // same `__hash__` lands in the same bucket chain and
             // `Interpreter::settle_key` can find its `__eq__` candidates.
@@ -2612,13 +2614,14 @@ impl Value {
                 if crate::builtins::is_builtin_type_class(c)
                     || crate::builtins::is_builtin_shim_class(c)
                 {
-                    return Ok(HashKey::BuiltinType(crate::interp::intern_type_name(
-                        &c.name,
-                    )));
+                    return Ok(HashKey::BuiltinType(
+                        crate::interp::intern_type_name(&c.name),
+                        Rc::new(self.clone()),
+                    ));
                 }
                 Ok(HashKey::Class(c.clone()))
             }
-            Value::Native(n) => Ok(HashKey::BuiltinType(n.name)),
+            Value::Native(n) => Ok(HashKey::BuiltinType(n.name, Rc::new(self.clone()))),
             other => Err(type_error(format!(
                 "unhashable type: '{}'",
                 other.type_name()
@@ -2729,6 +2732,18 @@ impl Value {
             (Native(a), Native(b)) => Rc::ptr_eq(a, b),
             // A function object is equal only to itself.
             (Function(a), Function(b)) => Rc::ptr_eq(a, b),
+            // Bound methods are equal when they wrap the same function on
+            // the same receiver (by identity, as CPython 3.8+ compares them).
+            (
+                BoundMethod {
+                    receiver: ra,
+                    function: fa,
+                },
+                BoundMethod {
+                    receiver: rb,
+                    function: fb,
+                },
+            ) => Rc::ptr_eq(fa, fb) && ra.same_identity(rb),
             // Dataclass instances compare by value: same class and all
             // fields equal (recursively). CPython's generated `__eq__`
             // compares the field tuple only when the two operands are of

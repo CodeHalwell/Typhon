@@ -8593,6 +8593,31 @@ impl Interpreter {
             Value::BoundMethod { function, .. } if attr == "__qualname__" => {
                 Ok(Value::Str(self.function_qualname(function)))
             }
+            // A bound method's parts: `m.__self__` is the receiver and
+            // `m.__func__` the plain function it wraps.
+            Value::BoundMethod { receiver, .. } if attr == "__self__" => Ok((**receiver).clone()),
+            Value::BoundMethod { function, .. } if attr == "__func__" => {
+                Ok(Value::Function(function.clone()))
+            }
+            // `f.__get__(obj)` binds a function to `obj`, as the descriptor
+            // protocol does on attribute access; `f.__get__(None, cls)` is
+            // the function itself.
+            Value::Function(f) if attr == "__get__" => {
+                let f = f.clone();
+                Ok(Value::Native(Rc::new(NativeFn::new(
+                    "__get__",
+                    move |_interp, args| match args.first() {
+                        None => Err(type_error(
+                            "__get__ expected at least 1 argument, got 0".to_owned(),
+                        )),
+                        Some(Value::None) => Ok(Value::Function(f.clone())),
+                        Some(obj) => Ok(Value::BoundMethod {
+                            receiver: Box::new(obj.clone()),
+                            function: f.clone(),
+                        }),
+                    },
+                ))))
+            }
             Value::ResultOk(v) => match attr {
                 "value" => Ok((**v).clone()),
                 "map" | "map_err" | "and_then" | "or_else" | "unwrap" | "expect" | "unwrap_or"

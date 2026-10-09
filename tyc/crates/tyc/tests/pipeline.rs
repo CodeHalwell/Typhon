@@ -1792,6 +1792,43 @@ fn check_rejects_arguments_that_do_not_match_init() {
 }
 
 #[test]
+fn check_types_variadic_init_arguments() {
+    let header = "plain class Box[T]:\n    items: list[T]\n    def __init__(self, *items: T, **named: T) -> None:\n        self.items = list(items)\n\
+                  plain class Tag:\n    def __init__(self, label: str, *rest: int, **extra: str) -> None:\n        pass\n";
+    for call in [
+        "let x: Box[int] = Box(\"bad\")",
+        "let x: Box[int] = Box(1, named=\"bad\")",
+        "let x = Box[int](1, \"bad\")",
+        "let x = Box[int](k=\"bad\")",
+        "let x = Tag(\"a\", \"bad\")",
+        "let x = Tag(\"a\", x=1)",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        scaffold(tmp.path(), &format!("{header}{call}\nprint(x)\n"));
+        let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+        assert!(!out.status.success(), "`{call}` should not type-check");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("type mismatch"),
+            "`{call}`: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        &format!(
+            "{header}let a: Box[int] = Box(1, 2, named=3)\nlet b = Box[int](1, k=2)\nlet c = Tag(\"a\", 1, 2, x=\"s\")\nprint(a, b, c)\n"
+        ),
+    );
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(
+        out.status.success(),
+        "well-typed variadic calls should type-check: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn check_rejects_calls_that_do_not_fit_the_init_arity() {
     for call in [
         "E()",

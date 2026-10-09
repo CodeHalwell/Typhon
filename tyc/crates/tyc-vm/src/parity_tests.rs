@@ -2492,6 +2492,20 @@ class _MyDq(_dq):
     pass
 _d3 = _MyDq([1, 2])
 show(type(_cp.copy(_d3)).__name__, type(_d3.copy()).__name__, _cp.copy(_d3))
+class _Ctr:
+    n: int = 0
+    def bump(self) -> None:
+        self.n += 1
+_c = _Ctr()
+_m = _cp.deepcopy(_c.bump)
+_m()
+show(_c.n, _m.__self__.n, _m.__self__ is _c, _m.__func__ is _c.bump.__func__)
+show(_c.bump == _c.bump, _c.bump == _Ctr().bump, _cp.copy(_c.bump) == _c.bump)
+_l = [1]
+_cp.deepcopy(_l.append)(2)
+show(_l)
+_tk = {type(_dd(list)): 1, len: 2, property: 3}
+show(list(_tk)[1:], list(_tk)[0] is _dd, _tk.popitem()[0] is property, len in set(_tk))
 "#,
     );
 }

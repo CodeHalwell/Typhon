@@ -191,6 +191,10 @@ def deepcopy(x, memo=None, _nil=[]):
         y = cls(deepcopy(a, memo) for a in x)
     elif cls is bytearray or cls is _BYTEARRAY:
         y = bytearray(x)
+    elif cls in _FUNCTION_TYPES and hasattr(x, "__func__") and hasattr(x, "__self__"):
+        # A bound user method: CPython's `_deepcopy_method` rebinds the
+        # function to a deep copy of the receiver.
+        y = x.__func__.__get__(deepcopy(x.__self__, memo))
     elif cls is slice:
         # Not atomic for a deep copy: CPython rebuilds it from its parts.
         y = slice(deepcopy(x.start, memo), deepcopy(x.stop, memo), deepcopy(x.step, memo))

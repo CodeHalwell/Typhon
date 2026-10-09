@@ -26,7 +26,8 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   and against its arity: too few or too many arguments, an unknown
   keyword, or a positional-only parameter passed by name (the `TypeError`
   CPython raises at the call) is now reported, explicit `Box[int](...)`
-  calls included.
+  calls included. Extra positional and keyword arguments are checked
+  against the `*args` / `**kwargs` annotations.
 - **`copy` runs in the VM.** `tyc run` handed any program that imported
   `copy` to CPython. The VM now has `copy.copy`, `copy.deepcopy` (memo,
   cycles and shared references included), `copy.replace` and `copy.Error`,
