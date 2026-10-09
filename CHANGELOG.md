@@ -33,8 +33,10 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   methods of its hidden `Random()` as in CPython (`random.randint` is a
   `method` named `Random.randint`; `random.random` a builtin).
   `@contextmanager` and `lru_cache(n)` return a `function`, and
-  `functools.partial` / `cached_property` are classes (and `type`
-  instances to `isinstance`)
+  `functools.partial` / `cached_property` and `asyncio`'s `Queue`,
+  `TaskGroup`, `Lock`, `Event`, `Semaphore` and `BoundedSemaphore` are
+  classes (and `type` instances to `isinstance`, printing as
+  `<class 'asyncio.locks.Lock'>`)
   (`<class 'functools.partial'>`).
   Slot methods are slot wrappers: `type(list.__len__)` is
   `wrapper_descriptor` (`<slot wrapper '__len__' of 'list' objects>`) and

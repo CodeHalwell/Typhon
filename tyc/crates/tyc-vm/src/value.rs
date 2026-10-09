@@ -775,25 +775,32 @@ pub fn native_repr(name: &str) -> String {
     if name == "NotImplemented" {
         return name.to_owned();
     }
-    if native_is_type(name)
-        && !matches!(
-            name,
-            "enum.auto" | "NewType" | "defaultdict" | "partial" | "cached_property"
-        )
-    {
+    // Standard-library classes the VM models as natives print with the
+    // module that defines them.
+    if let Some((_, qualified)) = STDLIB_NATIVE_CLASSES.iter().find(|(n, _)| *n == name) {
+        return format!("<class '{qualified}'>");
+    }
+    if native_is_type(name) {
         return format!("<class '{name}'>");
     }
-    // Two prelude names the VM models as natives are *classes* in CPython,
-    // and print with the module that defines them.
-    match name {
-        "enum.auto" => "<class 'enum.auto'>".to_owned(),
-        "NewType" => "<class 'typing.NewType'>".to_owned(),
-        "defaultdict" => "<class 'collections.defaultdict'>".to_owned(),
-        "partial" => "<class 'functools.partial'>".to_owned(),
-        "cached_property" => "<class 'functools.cached_property'>".to_owned(),
-        _ => format!("<built-in function {name}>"),
-    }
+    format!("<built-in function {name}>")
 }
+
+/// Standard-library classes the VM builds as natives, by native name, with
+/// the qualified name CPython prints.
+const STDLIB_NATIVE_CLASSES: &[(&str, &str)] = &[
+    ("enum.auto", "enum.auto"),
+    ("NewType", "typing.NewType"),
+    ("defaultdict", "collections.defaultdict"),
+    ("partial", "functools.partial"),
+    ("cached_property", "functools.cached_property"),
+    ("Queue", "asyncio.queues.Queue"),
+    ("TaskGroup", "asyncio.taskgroups.TaskGroup"),
+    ("Lock", "asyncio.locks.Lock"),
+    ("Event", "asyncio.locks.Event"),
+    ("Semaphore", "asyncio.locks.Semaphore"),
+    ("BoundedSemaphore", "asyncio.locks.BoundedSemaphore"),
+];
 
 /// `repr()` of any native: a builtin method (`list.append`, `[].append`)
 /// prints the way CPython's descriptors do, everything else as
@@ -1041,7 +1048,7 @@ fn heap_addr(v: &Value) -> Option<usize> {
 /// Whether a native stands in for a builtin *type* (`int`, `ValueError`,
 /// `property`) rather than a function.
 pub fn native_is_type(name: &str) -> bool {
-    matches!(name, "enum.auto" | "NewType")
+    STDLIB_NATIVE_CLASSES.iter().any(|(n, _)| *n == name)
         || crate::builtins::is_shim_constructor_name(name)
         || matches!(
             name,
@@ -1079,9 +1086,6 @@ pub fn native_is_type(name: &str) -> bool {
                 | "StopAsyncIteration"
                 | "ExceptionGroup"
                 | "BaseExceptionGroup"
-                // `functools`' classes the VM builds as natives.
-                | "partial"
-                | "cached_property"
         )
         || name.ends_with("Error")
         || name.ends_with("Exception")
