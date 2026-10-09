@@ -47,6 +47,8 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   of the project or `object` (through a module alias such as
   `Alias = Parent` too, when the module binds that name nowhere else; an
   `object` base counts unless the module's own namespace rebinds `object`,
+  including from a definition header, a lambda default or a store under
+  `global object` (the bare declaration rebinds nothing),
   and a module with a `from … import *` is never treated as local-only).
 - **A subclass of a builtin value type runs on CPython.** The VM models
   `list`, `int`, `str` and the other value types as values, not classes
@@ -68,9 +70,10 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   runtime (`class L(choose())`, `class L(h.base)`, or a name the module
   binds anywhere other than by a `class`, an import or an alias of one,
   so `Base = choose()`, `for Base in …`, `case [Base]:`, a walrus and a
-  sibling module's computed alias all count) and a `defaultdict`,
-  `functools.partial`, `functools.cached_property`, `frozendict` or
-  `sentinel` base fall back too, as do `bool`, `range`,
+  sibling module's computed alias all count, including one it binds in a
+  definition header or under `global`) and a `defaultdict`,
+  `functools.partial`, `functools.cached_property`, `enum.auto`,
+  `typing.NewType`, `frozendict` or `sentinel` base fall back too, as do `bool`, `range`,
   `slice` and `memoryview` bases, which CPython rejects. When two modules
   export one alias name for different builtins, the scan assumes the one
   that keeps the class off the VM.

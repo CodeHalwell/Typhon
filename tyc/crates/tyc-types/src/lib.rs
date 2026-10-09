@@ -10129,10 +10129,17 @@ fn count_bindings(body: &[Stmt], module_only: bool) -> HashMap<String, usize> {
         /// (decorators, defaults, annotations, bases) runs in the
         /// enclosing scope, so the depth rises only for the body.
         scope_body: bool,
+        /// The `global` names of each enclosing `def` / `class` body: a
+        /// store to one there binds the module's name.
+        globals: Vec<HashSet<String>>,
+        /// Walking a comprehension target, which is the comprehension's
+        /// own name even under `global`.
+        comp_target: bool,
     }
     impl Count {
         fn bump(&mut self, name: &str) {
-            if !self.module_only || self.depth == 0 {
+            let global = !self.comp_target && self.globals.last().is_some_and(|g| g.contains(name));
+            if !self.module_only || self.depth == 0 || global {
                 *self.names.entry(name.to_owned()).or_default() += 1;
             }
         }
@@ -10140,11 +10147,10 @@ fn count_bindings(body: &[Stmt], module_only: bool) -> HashMap<String, usize> {
     impl<'a> Visitor<'a> for Count {
         fn visit_stmt(&mut self, stmt: &'a Stmt) {
             if let Stmt::Global(g) = stmt {
-                // `global object` makes a function's binding the module's.
-                if self.module_only {
-                    for n in &g.names {
-                        *self.names.entry(n.to_string()).or_default() += 1;
-                    }
+                // `global object` makes a later store in the function the
+                // module's; the declaration alone binds nothing.
+                if let Some(scope) = self.globals.last_mut() {
+                    scope.extend(g.names.iter().map(|n| n.to_string()));
                 }
             }
             let scope = matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_));
@@ -10172,9 +10178,15 @@ fn count_bindings(body: &[Stmt], module_only: bool) -> HashMap<String, usize> {
         }
         fn visit_body(&mut self, body: &'a [Stmt]) {
             let scope = std::mem::take(&mut self.scope_body);
-            self.depth += usize::from(scope);
+            if scope {
+                self.depth += 1;
+                self.globals.push(HashSet::new());
+            }
             visitor::walk_body(self, body);
-            self.depth -= usize::from(scope);
+            if scope {
+                self.depth -= 1;
+                self.globals.pop();
+            }
         }
         fn visit_expr(&mut self, expr: &'a Expr) {
             if let Expr::Name(n) = expr {
@@ -10200,7 +10212,9 @@ fn count_bindings(body: &[Stmt], module_only: bool) -> HashMap<String, usize> {
             // (`[object for object in xs]`); a walrus in it is not.
             self.visit_expr(&comp.iter);
             self.depth += 1;
+            let outer = std::mem::replace(&mut self.comp_target, true);
             self.visit_expr(&comp.target);
+            self.comp_target = outer;
             self.depth -= 1;
             for e in &comp.ifs {
                 self.visit_expr(e);
@@ -29600,6 +29614,33 @@ def main() -> None:
             check_class_kinds(bad).has_errors(),
             "object.__init__ takes no arguments"
         );
+        // A bare `global object`, or a comprehension target under it,
+        // binds nothing: the base is still the builtin `object`.
+        for src in [
+            "\
+def f() -> None:
+    global object
+
+plain class A(object):
+    pass
+
+def main() -> None:
+    print(A(1))
+",
+            "\
+def f() -> list[int]:
+    global object
+    return [object for object in [1]]
+
+plain class A(object):
+    pass
+
+def main() -> None:
+    print(A(1))
+",
+        ] {
+            assert!(check_class_kinds(src).has_errors(), "{src}");
+        }
         // A builtin or imported base brings its own constructor:
         // `Exception.__init__` takes the message, `bytes` its value.
         let builtin_base = "\

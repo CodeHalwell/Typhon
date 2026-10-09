@@ -1765,6 +1765,10 @@ mod tests {
             ("import functools\nplain class P(functools.partial):\n    pass\n", "partial"),
             ("import functools as ft\nplain class C(ft.cached_property):\n    pass\n", "cached_property"),
             ("from functools import cached_property\nplain class C(cached_property):\n    pass\n", "cached_property"),
+            ("from enum import auto\nplain class X(auto):\n    pass\n", "auto"),
+            ("import enum\nplain class X(enum.auto):\n    pass\n", "auto"),
+            ("from typing import NewType\nplain class N(NewType):\n    pass\n", "NewType"),
+            ("import typing as t\nplain class N(t.NewType):\n    pass\n", "NewType"),
         ] {
             assert_eq!(
                 scan_source(src),
@@ -1831,6 +1835,28 @@ mod tests {
                     .iter()
                     .any(|r| r.contains("computed at runtime")),
                 "{main}"
+            );
+        }
+        // A sibling's name bound in a definition header (which runs at
+        // module scope) or through `global` is exported too.
+        for helper in [
+            "def f(x: object = (Alias := list)) -> None:\n    pass\n",
+            "def g() -> None:\n    global Alias\n    Alias = list if True else dict\n\ng()\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("helper.ty"), helper).unwrap();
+            let entry = dir.path().join("main.ty");
+            std::fs::write(
+                &entry,
+                "from helper import Alias\nplain class L(Alias):\n    pass\nprint(L([1]))\n",
+            )
+            .unwrap();
+            assert!(
+                unmodelled_references(&entry, &entry)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|r| r.contains("computed at runtime")),
+                "{helper}"
             );
         }
         // Two modules exporting one name for different builtins: the scan

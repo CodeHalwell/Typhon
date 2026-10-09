@@ -1117,6 +1117,8 @@ fn scan_builtin_subclasses(
         ("collections", "defaultdict"),
         ("functools", "partial"),
         ("functools", "cached_property"),
+        ("enum", "auto"),
+        ("typing", "NewType"),
     ];
     fn stdlib_native(module: &str, name: &str) -> bool {
         STDLIB_NATIVES.contains(&(module, name))
@@ -1294,16 +1296,16 @@ fn scan_builtin_subclasses(
                         };
                         self.unbind(bound);
                         self.namespaces.insert(bound.to_owned());
+                        if STDLIB_NATIVES.iter().any(|(m, _)| *m == name) {
+                            self.native_modules
+                                .insert(bound.to_owned(), name.to_owned());
+                        }
                         match name {
                             "enum" if pinned => {
                                 self.enum_modules.insert(bound.to_owned());
                             }
                             "builtins" => {
                                 self.builtins_modules.insert(bound.to_owned());
-                            }
-                            _ if STDLIB_NATIVES.iter().any(|(m, _)| *m == name) => {
-                                self.native_modules
-                                    .insert(bound.to_owned(), name.to_owned());
                             }
                             _ => {}
                         }
@@ -1475,11 +1477,19 @@ fn runtime_bound_names(
         /// `Alias = root.attr`: trusted only for an import or class `root`.
         attr_aliases: Vec<(String, String)>,
         module_scope: HashSet<String>,
+        /// Function and class bodies around the binding.
         depth: usize,
+        /// The next body walked is a `def` / `class` body. Its header
+        /// (decorators, defaults, annotations, bases) runs in the
+        /// enclosing scope, so the depth rises only for the body.
+        scope_body: bool,
+        /// The `global` names of each enclosing body, which bind in the
+        /// module's namespace.
+        globals: Vec<HashSet<String>>,
     }
     impl Bindings {
         fn bind(&mut self, name: &str) {
-            if self.depth == 0 {
+            if self.depth == 0 || self.globals.last().is_some_and(|g| g.contains(name)) {
                 self.module_scope.insert(name.to_owned());
             }
         }
@@ -1562,12 +1572,27 @@ fn runtime_bound_names(
                 // A function is no class, and a base naming one is CPython's
                 // error to report.
                 Stmt::FunctionDef(f) => self.runtime(f.name.as_str()),
+                Stmt::Global(g) => {
+                    if let Some(scope) = self.globals.last_mut() {
+                        scope.extend(g.names.iter().map(|n| n.to_string()));
+                    }
+                }
                 _ => {}
             }
-            let scope = matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_));
-            self.depth += usize::from(scope);
+            self.scope_body = matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_));
             visitor::walk_stmt(self, stmt);
-            self.depth -= usize::from(scope);
+        }
+        fn visit_body(&mut self, body: &'a [Stmt]) {
+            let scope = std::mem::take(&mut self.scope_body);
+            if scope {
+                self.depth += 1;
+                self.globals.push(HashSet::new());
+            }
+            visitor::walk_body(self, body);
+            if scope {
+                self.depth -= 1;
+                self.globals.pop();
+            }
         }
         fn visit_expr(&mut self, expr: &'a Expr) {
             // Every other binding: loop, `with`, walrus, unpacking and
