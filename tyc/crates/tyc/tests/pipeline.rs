@@ -1726,7 +1726,7 @@ fn check_accepts_init_arguments_that_differ_from_the_fields() {
         "plain class E(Exception):\n    code: int\n    def __init__(self, msg: str, code: int) -> None:\n        super().__init__(msg)\n        self.code = code\n\
          plain class Box[T]:\n    item: T\n    def __init__(self, label: str, item: T) -> None:\n        self.item = item\n\
          class! R:\n    n: int\n    def __init__(self, s: str) -> None:\n        self.n = len(s)\n\
-         e = E(\"boom\", 3)\nb = Box(\"lbl\", 5)\nr = R(\"abc\")\nprint(e.code, b.item, r.n)\n",
+         e = E(\"boom\", 3)\nb = Box(\"lbl\", 5)\nb2 = Box[int](\"lbl\", 5)\nr = R(\"abc\")\nprint(e.code, b.item, b2.item, r.n)\n",
     );
     let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
     assert!(
@@ -1744,6 +1744,7 @@ fn check_rejects_arguments_that_do_not_match_init() {
         "E(msg=\"a\", code=\"b\")",
         "R(5)",
         "R(\"a\", k=\"x\")",
+        "Box[int](\"lbl\", \"bad\")",
     ] {
         let tmp = tempfile::tempdir().unwrap();
         scaffold(
@@ -1751,6 +1752,7 @@ fn check_rejects_arguments_that_do_not_match_init() {
             &format!(
                 "plain class E:\n    code: int\n    def __init__(self, msg: str, code: int) -> None:\n        self.code = code\n\
                  class! R:\n    n: int\n    def __init__(self, s: str, *, k: int = 0) -> None:\n        self.n = len(s)\n\
+                 plain class Box[T]:\n    item: T\n    def __init__(self, label: str, item: T) -> None:\n        self.item = item\n\
                  x = {call}\nprint(x)\n"
             ),
         );

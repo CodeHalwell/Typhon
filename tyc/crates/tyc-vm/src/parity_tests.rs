@@ -2407,6 +2407,20 @@ od2["b"] = 2
 cn = Counter("ab")
 cn.extra = [1]
 show(od, od2, od2.extra is od.extra, hasattr(copy.copy(cn), "extra"))
+class _SlottedCallable:
+    __slots__ = ("items",)
+    def __init__(self) -> None:
+        self.items = [1]
+    def __call__(self) -> int:
+        return 1
+sc = _SlottedCallable()
+sc2 = copy.copy(sc)
+sc3 = copy.deepcopy(sc)
+show(sc2 is sc, sc2.items is sc.items, sc3.items is sc.items, sc3.items)
+import functools
+pf = functools.partial(max, 1)
+bm = [].append
+show(copy.copy(pf)(5), copy.deepcopy(pf)(0), copy.copy(bm) is bm, copy.deepcopy(print) is print)
 show(hasattr(list, "nope"), hasattr(list, "append"), hasattr(dict, "__deepcopy__"), hasattr(str, "lower"))
 "#,
     );
@@ -2455,6 +2469,8 @@ show(list(tk), tk.get(type(bytearray())), tk.get(type(5)), tk[type([])])
 show(hash(type([])) == hash(list), hash(type(bytearray())) == hash(bytearray))
 from collections import defaultdict as _dd, OrderedDict as _od
 show(isinstance(_dd, type), isinstance(_od, type))
+show(type(ValueError("x")) is ValueError, type(KeyError()) == KeyError, id(type(ValueError())) == id(ValueError))
+show(hasattr(list, "__class_getitem__"), hasattr(str, "__class_getitem__"), hasattr(dict, "__class_getitem__"))
 "#,
     );
 }

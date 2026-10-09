@@ -1280,9 +1280,15 @@ fn check_init_constructor_args(
     pos_args: &[Expr],
     kw_args: &[ruff_python_ast::Keyword],
 ) {
-    let Some(sig) = c.find_method(name, "__init__").cloned() else {
-        return;
-    };
+    if let Some((params, order)) = init_param_shape(c, name) {
+        check_concrete_constructor_args(c, &params, &order, pos_args, kw_args);
+    }
+}
+
+/// The `__init__` parameters of class `name` as a field-like shape (name ->
+/// declared type) plus their positional order, for the constructor checks.
+fn init_param_shape(c: &Checker, name: &str) -> Option<(InterfaceShape, Vec<String>)> {
+    let sig = c.find_method(name, "__init__")?;
     let info = &sig.arity_info;
     let names: Vec<&String> = info
         .param_names
@@ -1290,7 +1296,7 @@ fn check_init_constructor_args(
         .chain(info.kwonly_names.iter())
         .collect();
     if names.len() != sig.param_types.len() {
-        return;
+        return None;
     }
     let params = InterfaceShape {
         fields: names
@@ -1300,7 +1306,7 @@ fn check_init_constructor_args(
             .collect(),
         ..InterfaceShape::default()
     };
-    check_concrete_constructor_args(c, &params, &info.param_names, pos_args, kw_args);
+    Some((params, info.param_names.clone()))
 }
 
 fn constructor_positional_order(c: &Checker, name: &str, shape: &InterfaceShape) -> Vec<String> {
@@ -1500,62 +1506,83 @@ fn check_explicit_typearg_constructor(
 
     let call_span = (call.range.start().to_usize(), call.range.end().to_usize());
 
-    // Unknown-kwarg check (mirrors the `Type::Class` arm).
-    let candidates: Vec<String> = shape.fields.keys().cloned().collect();
-    for kw in kw_args {
-        let Some(ident) = &kw.arg else { continue };
-        let kw_name = ident.as_str();
-        if !shape.fields.contains_key(kw_name) {
-            let suggestion = suggest_candidate(kw_name, &candidates);
-            let span = (
-                ident.range.start().to_usize(),
-                ident.range.start().to_usize() + kw_name.len(),
-            );
-            c.unknown_kwarg(&name, kw_name, suggestion, span);
+    // The field-list checks (mirroring the `Type::Class` arm) apply only
+    // when the fields are the constructor; a `plain class` without an
+    // `__init__` of its own takes no arguments at all.
+    if constructor_is_field_list(c, &name) {
+        // Unknown-kwarg check (mirrors the `Type::Class` arm).
+        let candidates: Vec<String> = shape.fields.keys().cloned().collect();
+        for kw in kw_args {
+            let Some(ident) = &kw.arg else { continue };
+            let kw_name = ident.as_str();
+            if !shape.fields.contains_key(kw_name) {
+                let suggestion = suggest_candidate(kw_name, &candidates);
+                let span = (
+                    ident.range.start().to_usize(),
+                    ident.range.start().to_usize() + kw_name.len(),
+                );
+                c.unknown_kwarg(&name, kw_name, suggestion, span);
+            }
         }
-    }
-    // Constructor-arity check (mirrors the `Type::Class` arm).
-    let info = class_constructor_arity(&shape);
-    if !info.param_names.is_empty() {
-        match check_arity_with_info(&info, pos_args, kw_args) {
-            // A synthesised constructor has no positional-only parameters,
-            // so the `/`-by-keyword outcome cannot occur here.
-            ArityCheck::Ok
-            | ArityCheck::UnknownKwarg { .. }
-            | ArityCheck::PositionalOnlyByKeyword { .. } => {}
-            ArityCheck::Other => {
-                let missing = missing_required_fields(&shape, pos_args, kw_args);
-                if !missing.is_empty() {
-                    c.missing_argument(&name, missing, call_span);
-                } else {
-                    let supplied =
-                        pos_args.len() + kw_args.iter().filter(|k| k.arg.is_some()).count();
-                    c.wrong_args(&name, info.min_positional, supplied, call_span);
+        // Constructor-arity check (mirrors the `Type::Class` arm).
+        let info = class_constructor_arity(&shape);
+        if !info.param_names.is_empty() {
+            match check_arity_with_info(&info, pos_args, kw_args) {
+                // A synthesised constructor has no positional-only parameters,
+                // so the `/`-by-keyword outcome cannot occur here.
+                ArityCheck::Ok
+                | ArityCheck::UnknownKwarg { .. }
+                | ArityCheck::PositionalOnlyByKeyword { .. } => {}
+                ArityCheck::Other => {
+                    let missing = missing_required_fields(&shape, pos_args, kw_args);
+                    if !missing.is_empty() {
+                        c.missing_argument(&name, missing, call_span);
+                    } else {
+                        let supplied =
+                            pos_args.len() + kw_args.iter().filter(|k| k.arg.is_some()).count();
+                        c.wrong_args(&name, info.min_positional, supplied, call_span);
+                    }
                 }
             }
         }
+    } else if c.is_plain_class(&name)
+        && c.find_method(&name, "__init__").is_none()
+        && (!pos_args.is_empty() || kw_args.iter().any(|k| k.arg.is_some()))
+    {
+        c.wrong_args(&name, 0, pos_args.len() + kw_args.len(), call_span);
     }
 
     // SOUNDNESS: validate each argument against its substituted field
     // type. This also infers each typevar-bound arg; remaining
     // (non-typevar-field) args are inferred here so nested expressions
     // still surface their own diagnostics.
-    let typevar_field_idxs: std::collections::HashSet<usize> = shape
-        .field_order
+    // A hand-written `__init__` (a `plain class`, or a `class!` with its
+    // own) takes the arguments instead of the fields.
+    let (arg_shape, positional_order) = if constructor_is_field_list(c, &name) {
+        let order = constructor_positional_order(c, &name, &shape);
+        (shape, order)
+    } else {
+        init_param_shape(c, &name).unwrap_or_default()
+    };
+    let typevar_field_idxs: std::collections::HashSet<usize> = positional_order
         .iter()
         .enumerate()
         .filter(|(_, f)| {
-            shape
+            arg_shape
                 .fields
                 .get(f.as_str())
                 .is_some_and(contains_free_typevar)
         })
         .map(|(i, _)| i)
         .collect();
-    if constructor_is_field_list(c, &name) {
-        let positional_order = constructor_positional_order(c, &name, &shape);
-        check_generic_constructor_args(c, &shape, &positional_order, &bindings, pos_args, kw_args);
-    }
+    check_generic_constructor_args(
+        c,
+        &arg_shape,
+        &positional_order,
+        &bindings,
+        pos_args,
+        kw_args,
+    );
     for (i, arg) in pos_args.iter().enumerate() {
         if !typevar_field_idxs.contains(&i) {
             let _ = infer_expr(c, arg);
@@ -1565,7 +1592,7 @@ fn check_explicit_typearg_constructor(
         let is_typevar_field = kw
             .arg
             .as_ref()
-            .and_then(|id| shape.fields.get(id.as_str()))
+            .and_then(|id| arg_shape.fields.get(id.as_str()))
             .is_some_and(contains_free_typevar);
         if !is_typevar_field {
             let _ = infer_expr(c, &kw.value);

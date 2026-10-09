@@ -45,7 +45,6 @@ def _atomic(x):
         or isinstance(x, type)
         or type(x) in _FUNCTION_TYPES
         or type(x) is slice
-        or callable(x) and not hasattr(x, "__dict__") and not hasattr(type(x), "__copy__")
     )
 
 

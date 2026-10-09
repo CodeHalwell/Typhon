@@ -8666,7 +8666,9 @@ impl Interpreter {
             {
                 // Only a method the type actually has: `list.__deepcopy__`
                 // and `hasattr(list, "nope")` miss, as in CPython.
-                if !builtin_has_attr(&empty_builtin_value(nf.name), attr) {
+                // `__class_getitem__` is on the type only (`list[int]`).
+                let class_only = attr == "__class_getitem__" && !matches!(nf.name, "str" | "bytes");
+                if !class_only && !builtin_has_attr(&empty_builtin_value(nf.name), attr) {
                     return Err(attribute_error(format!(
                         "type object '{}' has no attribute '{}'",
                         nf.name, attr
@@ -12848,7 +12850,8 @@ fn values_identical(a: &Value, b: &Value) -> bool {
         // one type object in CPython.
         (Class(c), Native(n)) | (Native(n), Class(c)) => {
             c.name == n.name
-                && ((crate::builtins::is_builtin_type_name(n.name)
+                && (((crate::builtins::is_builtin_type_name(n.name)
+                    || builtin_exc_mro(n.name).is_some())
                     && crate::builtins::is_builtin_type_class(c))
                     || crate::builtins::is_builtin_shim_class(c))
         }
