@@ -1038,6 +1038,36 @@ pub fn module_builtin_aliases(
     scan_builtin_subclasses(module, project_aliases, true).1
 }
 
+/// Merge `found` into `aliases`, erring towards CPython: when two modules
+/// export one name for different builtins, keep the one that is not an enum
+/// mixin, so `class E(Alias, Enum)` is never wrongly exempted. Whether
+/// anything changed.
+pub fn merge_builtin_aliases(
+    aliases: &mut std::collections::HashMap<String, String>,
+    found: std::collections::HashMap<String, String>,
+) -> bool {
+    let mut changed = false;
+    for (name, builtin) in found {
+        match aliases.get_mut(&name) {
+            None => {
+                aliases.insert(name, builtin);
+                changed = true;
+            }
+            Some(old) if ENUM_MIXINS.contains(&old.as_str()) && *old != builtin => {
+                if !ENUM_MIXINS.contains(&builtin.as_str()) {
+                    *old = builtin;
+                    changed = true;
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    changed
+}
+
+/// The data-type mixins the VM models on an enum (`enum_mixin_value`).
+const ENUM_MIXINS: &[&str] = &["str", "int", "float", "bytes", "complex"];
+
 fn scan_builtin_subclasses(
     module: &ruff_python_ast::ModModule,
     project_aliases: &std::collections::HashMap<String, String>,
@@ -1076,10 +1106,11 @@ fn scan_builtin_subclasses(
         "range",
         "slice",
         "memoryview",
+        // Python 3.15 builtins the VM shims as constructor natives.
+        "frozendict",
+        "sentinel",
     ];
     const ENUM_TYPES: &[&str] = &["Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "ReprEnum"];
-    /// The data-type mixins the VM models on an enum (`enum_mixin_value`).
-    const ENUM_MIXINS: &[&str] = &["str", "int", "float", "bytes", "complex"];
 
     /// One pass in source order, erring towards CPython either way. A name
     /// that stands for a builtin value type (`Alias = list`,
@@ -1199,12 +1230,40 @@ fn scan_builtin_subclasses(
                 }
             })
         }
-        /// Whether `value` computes a value at runtime that may be a type.
+        /// Whether `value` computes a value at runtime that may be a type,
+        /// or holds types a subscript may pick (`bases = [list]`).
+        /// A `list[int]` alias is resolved by [`Self::builtin_base`] first.
         fn is_computed(value: &Expr) -> bool {
             matches!(
                 value,
-                Expr::Call(_) | Expr::If(_) | Expr::BoolOp(_) | Expr::Named(_) | Expr::Await(_)
+                Expr::Call(_)
+                    | Expr::If(_)
+                    | Expr::BoolOp(_)
+                    | Expr::Named(_)
+                    | Expr::Await(_)
+                    | Expr::Subscript(_)
+                    | Expr::List(_)
+                    | Expr::Tuple(_)
+                    | Expr::Set(_)
+                    | Expr::Dict(_)
+                    | Expr::ListComp(_)
+                    | Expr::SetComp(_)
+                    | Expr::DictComp(_)
+                    | Expr::Generator(_)
             )
+        }
+        /// Every name an unpacking or loop target binds (`A, B = …`,
+        /// `for Base in (list, dict)`) holds a runtime value.
+        fn mark_computed(&mut self, target: &Expr) {
+            match target {
+                Expr::Name(n) => {
+                    self.computed.insert(n.id.to_string());
+                }
+                Expr::Tuple(t) => t.elts.iter().for_each(|e| self.mark_computed(e)),
+                Expr::List(l) => l.elts.iter().for_each(|e| self.mark_computed(e)),
+                Expr::Starred(s) => self.mark_computed(&s.value),
+                _ => {}
+            }
         }
         /// `let Alias = Base` in a class factory: `Alias` may be the
         /// builtin `Base` is handed too.
@@ -1276,9 +1335,12 @@ fn scan_builtin_subclasses(
                     // `Alias = list`, `list[int]`, `builtins.list`, `helper.Alias`.
                     let builtin = self.builtin_base(&a.value);
                     let enum_base = pinned && value.is_some_and(|v| self.enum_bases.contains(v));
-                    let computed = Self::is_computed(&a.value)
+                    let computed = (builtin.is_none() && Self::is_computed(&a.value))
                         || value.is_some_and(|v| self.computed.contains(v));
                     for target in &a.targets {
+                        if !matches!(target, Expr::Name(_)) {
+                            self.mark_computed(target);
+                        }
                         if let Expr::Name(t) = target {
                             let t = t.id.as_str();
                             self.alias_param(t, value);
@@ -1305,7 +1367,7 @@ fn scan_builtin_subclasses(
                                 self.computed.insert(t.to_owned());
                             }
                         }
-                        if a.value.as_deref().is_some_and(Self::is_computed) {
+                        if builtin.is_none() && a.value.as_deref().is_some_and(Self::is_computed) {
                             self.computed.insert(t.to_owned());
                         }
                         self.unbind(t);
@@ -1336,6 +1398,18 @@ fn scan_builtin_subclasses(
                     self.found = Some(reason);
                     return;
                 }
+            }
+            // A loop or `with` target is bound before its body runs.
+            match stmt {
+                Stmt::For(f) => self.mark_computed(&f.target),
+                Stmt::With(w) => {
+                    for item in &w.items {
+                        if let Some(v) = &item.optional_vars {
+                            self.mark_computed(v);
+                        }
+                    }
+                }
+                _ => {}
             }
             if let Stmt::FunctionDef(f) = stmt {
                 self.params

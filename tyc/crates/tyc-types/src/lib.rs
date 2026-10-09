@@ -10101,16 +10101,43 @@ fn detect_cyclic_type_aliases(c: &mut Checker, body: &[Stmt]) {
 /// `for` / `with` / walrus targets, imports, `def` / `class`, `except … as`
 /// and match captures, in every scope.
 fn count_name_bindings(body: &[Stmt]) -> HashMap<String, usize> {
+    count_bindings(body, false)
+}
+
+/// As [`count_name_bindings`], but only the bindings of the module's own
+/// namespace: module-scope statements and names a function declares
+/// `global`, not a function's or class's locals.
+fn count_module_bindings(body: &[Stmt]) -> HashMap<String, usize> {
+    count_bindings(body, true)
+}
+
+fn count_bindings(body: &[Stmt], module_only: bool) -> HashMap<String, usize> {
     use ruff_python_ast::visitor::{self, Visitor};
     #[derive(Default)]
-    struct Count(HashMap<String, usize>);
+    struct Count {
+        names: HashMap<String, usize>,
+        module_only: bool,
+        /// Function, class and lambda bodies around the binding.
+        depth: usize,
+    }
     impl Count {
         fn bump(&mut self, name: &str) {
-            *self.0.entry(name.to_owned()).or_default() += 1;
+            if !self.module_only || self.depth == 0 {
+                *self.names.entry(name.to_owned()).or_default() += 1;
+            }
         }
     }
     impl<'a> Visitor<'a> for Count {
         fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            if let Stmt::Global(g) = stmt {
+                // `global object` makes a function's binding the module's.
+                if self.module_only {
+                    for n in &g.names {
+                        *self.names.entry(n.to_string()).or_default() += 1;
+                    }
+                }
+            }
+            let scope = matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_));
             match stmt {
                 Stmt::FunctionDef(f) => self.bump(f.name.as_str()),
                 Stmt::ClassDef(c) => self.bump(c.name.as_str()),
@@ -10130,7 +10157,9 @@ fn count_name_bindings(body: &[Stmt]) -> HashMap<String, usize> {
                 }
                 _ => {}
             }
+            self.depth += usize::from(scope);
             visitor::walk_stmt(self, stmt);
+            self.depth -= usize::from(scope);
         }
         fn visit_expr(&mut self, expr: &'a Expr) {
             if let Expr::Name(n) = expr {
@@ -10138,7 +10167,10 @@ fn count_name_bindings(body: &[Stmt]) -> HashMap<String, usize> {
                     self.bump(n.id.as_str());
                 }
             }
+            let scope = matches!(expr, Expr::Lambda(_));
+            self.depth += usize::from(scope);
             visitor::walk_expr(self, expr);
+            self.depth -= usize::from(scope);
         }
         fn visit_except_handler(&mut self, h: &'a ruff_python_ast::ExceptHandler) {
             let ruff_python_ast::ExceptHandler::ExceptHandler(e) = h;
@@ -10157,9 +10189,12 @@ fn count_name_bindings(body: &[Stmt]) -> HashMap<String, usize> {
             visitor::walk_pattern(self, p);
         }
     }
-    let mut count = Count::default();
+    let mut count = Count {
+        module_only,
+        ..Count::default()
+    };
     count.visit_body(body);
-    count.0
+    count.names
 }
 
 fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
@@ -10194,7 +10229,9 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
         .filter(|(t, _)| bindings.get(t.id.as_str()) == Some(&1))
         .map(|(t, v)| (t.id.to_string(), v.id.to_string()))
         .collect();
-    c.object_rebound = bindings.contains_key("object");
+    // Only a module-namespace binding shadows `object` in a module-level
+    // class header; a function's local `object = …` does not.
+    c.object_rebound = count_module_bindings(body).contains_key("object");
     for stmt in body {
         match stmt {
             Stmt::ClassDef(cd) => {
@@ -29555,6 +29592,23 @@ def main() -> None:
             check_class_kinds(object_base).has_errors(),
             "object base takes no arguments"
         );
+        // A function's local `object` does not shadow the module's.
+        let local_object = "\
+def f() -> None:
+    object = Exception
+    print(object)
+
+plain class A(object):
+    pass
+
+def main() -> None:
+    let a: A = A(1)
+    print(a)
+";
+        assert!(
+            check_class_kinds(local_object).has_errors(),
+            "a local object binding leaves the module's object"
+        );
         // So is a local class reached through an alias.
         let aliased = "\
 plain class Parent:
@@ -29590,6 +29644,19 @@ def main() -> None:
 ",
             "\
 object = Exception
+
+plain class Boom(object):
+    pass
+
+def main() -> None:
+    print(Boom(\"x\"))
+",
+            "\
+def rebind() -> None:
+    global object
+    object = Exception
+
+rebind()
 
 plain class Boom(object):
     pass

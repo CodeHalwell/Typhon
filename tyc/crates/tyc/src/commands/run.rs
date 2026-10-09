@@ -508,12 +508,12 @@ fn unmodelled_references(path: &std::path::Path, entry: &std::path::Path) -> Opt
     let mut project_aliases: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     loop {
-        let before = project_aliases.len();
+        let mut changed = false;
         for module in &modules {
             let found = tyc_vm::module_builtin_aliases(module, &project_aliases);
-            project_aliases.extend(found);
+            changed |= tyc_vm::merge_builtin_aliases(&mut project_aliases, found);
         }
-        if project_aliases.len() == before {
+        if !changed {
             break;
         }
     }
@@ -1634,6 +1634,8 @@ mod tests {
             "bool",
             "range",
             "slice",
+            // Python 3.15 builtins the VM shims.
+            "frozendict",
         ] {
             let src = format!("plain class X({base}):\n    pass\nprint(X())\n");
             assert_eq!(
@@ -1649,6 +1651,10 @@ mod tests {
             "def choose() -> type:\n    return list\nBase = choose()\nplain class L(Base):\n    pass\nprint(L([1]))\n",
             "def choose() -> type:\n    return list\nBase = choose()\nAlias = Base\nplain class L(Alias):\n    pass\nprint(L([1]))\n",
             "def choose() -> type:\n    return list\nlet Base: type = choose()\nplain class L(Base):\n    pass\nprint(L([1]))\n",
+            "bases: list[type] = [list]\nBase = bases[0]\nplain class L(Base):\n    pass\nprint(L([1]))\n",
+            "bases: list[type] = [list]\nplain class L(bases[0]):\n    pass\nprint(L([1]))\n",
+            "for Base in (list, dict):\n    plain class L(Base):\n        pass\n    print(L())\n",
+            "First, Second = list, dict\nplain class L(First):\n    pass\nprint(L())\n",
         ] {
             let found = scan_source(src).expect(src);
             assert!(found[0].contains("computed at runtime"), "{src}: {found:?}");
@@ -1778,6 +1784,23 @@ mod tests {
                 "{main}"
             );
         }
+        // Two modules exporting one name for different builtins: the scan
+        // keeps the one that is not an enum mixin.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.ty"), "Alias = list\n").unwrap();
+        std::fs::write(dir.path().join("z.ty"), "Alias = str\n").unwrap();
+        let entry = dir.path().join("main.ty");
+        std::fs::write(
+            &entry,
+            "from a import Alias\nimport z\nfrom enum import Enum\nclass E(Alias, Enum):\n    A = 1\nprint(E.A)\n",
+        )
+        .unwrap();
+        assert!(
+            unmodelled_references(&entry, &entry)
+                .unwrap_or_default()
+                .contains(&"a subclass of the builtin list".to_owned()),
+            "conflicting exports"
+        );
         // An alias of an enum base is one.
         let enum_alias =
             "from enum import Enum\nE = Enum\nclass C(str, E):\n    A = \"a\"\nprint(C.A)\n";
