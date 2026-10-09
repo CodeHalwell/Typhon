@@ -80,7 +80,8 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   data attribute of a class (`Holder.Base`, `Holder.box.Base`; nested
   classes such as `Outer.Mid.Inner` are trusted), data below a project
   module (`helper.box.Base`; `collections.abc.Iterable` and other modules
-  the VM models are trusted) and a
+  the VM models are trusted), a class with a decorator that may replace
+  it (`@dataclass`, `@total_ordering`, `@final` and the like keep it) and a
   sibling module's computed alias all count, including one it binds in a
   definition header or under `global`) and a `defaultdict`,
   `functools.partial`, `functools.cached_property`, `enum.auto`,

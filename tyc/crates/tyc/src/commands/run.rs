@@ -1837,6 +1837,17 @@ mod tests {
                 "{main}"
             );
         }
+        // A decorator may replace the class; the standard ones keep it.
+        assert!(scan_source(
+            "def make_list(c: type) -> type:\n    return list\n@make_list\nplain class Holder:\n    pass\nplain class L(Holder):\n    pass\nprint(L())\n"
+        )
+        .unwrap_or_default()
+        .iter()
+        .any(|r| r.contains("computed at runtime")));
+        assert_eq!(
+            scan_source("from dataclasses import dataclass\n@dataclass(frozen=True)\nplain class Base:\n    x: int = 0\nplain class L(Base):\n    pass\nprint(L())\n"),
+            None
+        );
         // A nested class below a class is trusted.
         assert_eq!(
             scan_source("plain class Outer:\n    plain class Mid:\n        plain class Inner:\n            pass\nplain class L(Outer.Mid.Inner):\n    pass\nprint(L())\n"),

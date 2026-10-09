@@ -1120,6 +1120,34 @@ fn import_chain_trusted(import: Option<&(String, usize)>, segments: usize) -> bo
         || models_module(module.split('.').next().unwrap_or(module))
 }
 
+/// Whether a class decorator returns the class it is given: the standard
+/// library's (`@dataclass(frozen=True)`, `@functools.total_ordering`,
+/// `@enum.unique`, `@typing.final`, …).
+fn preserves_class(decorator: &ruff_python_ast::Expr) -> bool {
+    use ruff_python_ast::Expr;
+    let target = match decorator {
+        Expr::Call(c) => c.func.as_ref(),
+        other => other,
+    };
+    let name = match target {
+        Expr::Name(n) => n.id.as_str(),
+        Expr::Attribute(a) => a.attr.as_str(),
+        _ => return false,
+    };
+    matches!(
+        name,
+        "dataclass"
+            | "total_ordering"
+            | "unique"
+            | "verify"
+            | "final"
+            | "runtime_checkable"
+            | "override"
+            | "dataclass_transform"
+            | "type_check_only"
+    )
+}
+
 /// The root name of an attribute chain and the segments between it and
 /// the last (`Outer.Mid.Inner` is `Outer` and `[Mid]`), or `None` when
 /// the chain is not rooted at a name.
@@ -1672,9 +1700,19 @@ fn runtime_bound_names(
                     return;
                 }
                 Stmt::ClassDef(c) => {
-                    self.bind(c.name.as_str());
-                    self.namespaces.insert(c.name.to_string());
-                    self.classes.insert(c.name.to_string());
+                    // A decorator may return something else entirely
+                    // (`@make_list class Holder`); only the standard
+                    // class-preserving ones keep the name a class.
+                    if c.decorator_list
+                        .iter()
+                        .all(|d| preserves_class(&d.expression))
+                    {
+                        self.bind(c.name.as_str());
+                        self.namespaces.insert(c.name.to_string());
+                        self.classes.insert(c.name.to_string());
+                    } else {
+                        self.runtime(c.name.as_str());
+                    }
                 }
                 // A function is no class, and a base naming one is CPython's
                 // error to report.
