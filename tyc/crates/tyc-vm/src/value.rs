@@ -775,46 +775,7 @@ pub fn native_repr(name: &str) -> String {
     if name == "NotImplemented" {
         return name.to_owned();
     }
-    let is_type = matches!(
-        name,
-        "int"
-            | "float"
-            | "str"
-            | "bool"
-            | "list"
-            | "dict"
-            | "set"
-            | "frozenset"
-            | "tuple"
-            | "bytes"
-            | "bytearray"
-            | "object"
-            | "type"
-            | "range"
-            | "complex"
-            | "slice"
-            | "memoryview"
-            | "enumerate"
-            | "zip"
-            | "map"
-            | "filter"
-            | "reversed"
-            | "property"
-            | "staticmethod"
-            | "classmethod"
-            | "super"
-            | "BaseException"
-            | "KeyboardInterrupt"
-            | "SystemExit"
-            | "GeneratorExit"
-            | "StopIteration"
-            | "StopAsyncIteration"
-            | "ExceptionGroup"
-            | "BaseExceptionGroup"
-    ) || name.ends_with("Error")
-        || name.ends_with("Exception")
-        || name.ends_with("Warning");
-    if is_type {
+    if native_is_type(name) && !matches!(name, "enum.auto" | "NewType" | "defaultdict") {
         return format!("<class '{name}'>");
     }
     // Two prelude names the VM models as natives are *classes* in CPython,
@@ -822,8 +783,89 @@ pub fn native_repr(name: &str) -> String {
     match name {
         "enum.auto" => "<class 'enum.auto'>".to_owned(),
         "NewType" => "<class 'typing.NewType'>".to_owned(),
+        "defaultdict" => "<class 'collections.defaultdict'>".to_owned(),
         _ => format!("<built-in function {name}>"),
     }
+}
+
+/// `repr()` of any native: a builtin method (`list.append`, `[].append`)
+/// prints the way CPython's descriptors do, everything else as
+/// [`native_repr`].
+pub fn native_value_repr(n: &NativeFn) -> String {
+    match &n.method {
+        Some(m) => match &m.receiver {
+            None => format!("<method '{}' of '{}' objects>", m.attr, m.owner),
+            Some(r) => format!(
+                "<built-in method {} of {} object at {:#x}>",
+                m.attr,
+                m.owner,
+                heap_addr(r).unwrap_or(n as *const NativeFn as usize)
+            ),
+        },
+        None => native_repr(n.name),
+    }
+}
+
+/// The allocation behind a heap value, the address `id()` reports for it.
+fn heap_addr(v: &Value) -> Option<usize> {
+    Some(match v {
+        Value::List(l) => Rc::as_ptr(l) as usize,
+        Value::Tuple(t) => Rc::as_ptr(t) as usize,
+        Value::Dict(d) => Rc::as_ptr(d) as usize,
+        Value::Set(s) => Rc::as_ptr(s) as usize,
+        Value::Str(s) => Rc::as_ptr(s) as usize,
+        Value::Bytes(b) => Rc::as_ptr(b) as usize,
+        Value::Instance(i) => Rc::as_ptr(i) as usize,
+        Value::Iter(it) => Rc::as_ptr(it) as usize,
+        _ => return None,
+    })
+}
+
+/// Whether a native stands in for a builtin *type* (`int`, `ValueError`,
+/// `property`) rather than a function.
+pub fn native_is_type(name: &str) -> bool {
+    matches!(name, "enum.auto" | "NewType")
+        || crate::builtins::is_shim_constructor_name(name)
+        || matches!(
+            name,
+            "int"
+                | "float"
+                | "str"
+                | "bool"
+                | "list"
+                | "dict"
+                | "set"
+                | "frozenset"
+                | "tuple"
+                | "bytes"
+                | "bytearray"
+                | "object"
+                | "type"
+                | "range"
+                | "complex"
+                | "slice"
+                | "memoryview"
+                | "enumerate"
+                | "zip"
+                | "map"
+                | "filter"
+                | "reversed"
+                | "property"
+                | "staticmethod"
+                | "classmethod"
+                | "super"
+                | "BaseException"
+                | "KeyboardInterrupt"
+                | "SystemExit"
+                | "GeneratorExit"
+                | "StopIteration"
+                | "StopAsyncIteration"
+                | "ExceptionGroup"
+                | "BaseExceptionGroup"
+        )
+        || name.ends_with("Error")
+        || name.ends_with("Exception")
+        || name.ends_with("Warning")
 }
 
 /// The VM models a `slice` as the tuple `("__slice__", start, stop, step)`
@@ -1706,8 +1748,20 @@ pub enum DictViewKind {
 pub type NativeFnImpl =
     dyn Fn(&mut crate::interp::Interpreter, Vec<Value>) -> Result<Value, Unwind>;
 
+/// What a builtin-method native stands for: `list.append` (no receiver)
+/// or `[].append` (bound to its receiver). It only drives introspection —
+/// `repr`, `type`, `__name__`, `__self__` — never the call itself.
+pub struct NativeMethod {
+    /// The builtin type the method belongs to (`"list"`).
+    pub owner: &'static str,
+    pub attr: Rc<str>,
+    pub receiver: Option<Value>,
+}
+
 pub struct NativeFn {
     pub name: &'static str,
+    /// Set on builtin-method natives — see [`NativeMethod`].
+    pub method: Option<NativeMethod>,
     pub func: Box<NativeFnImpl>,
     /// The native stands in for a CPython *coroutine function*
     /// (`asyncio.sleep`, `Queue.get`, a `Lock.__aenter__`, …). The VM's
@@ -1727,9 +1781,26 @@ impl NativeFn {
     {
         NativeFn {
             name,
+            method: None,
             func: Box::new(f),
             awaitable: false,
         }
+    }
+
+    /// Tag a native as the builtin method `owner.attr`, bound to `receiver`
+    /// when there is one.
+    pub fn with_method(
+        mut self,
+        owner: &'static str,
+        attr: Rc<str>,
+        receiver: Option<Value>,
+    ) -> Self {
+        self.method = Some(NativeMethod {
+            owner,
+            attr,
+            receiver,
+        });
+        self
     }
 
     /// A native whose CPython counterpart is `async def` — see
@@ -1740,6 +1811,7 @@ impl NativeFn {
     {
         NativeFn {
             name,
+            method: None,
             func: Box::new(f),
             awaitable: true,
         }
@@ -2321,7 +2393,7 @@ impl fmt::Debug for Value {
             Value::Range { start, stop, step } => {
                 write!(f, "range({start}, {stop}, {step})")
             }
-            Value::Native(n) => write!(f, "{}", native_repr(n.name)),
+            Value::Native(n) => write!(f, "{}", native_value_repr(n)),
             Value::Function(func) => write!(f, "<function {}>", func.effective_qualname()),
             Value::BoundMethod { function, .. } => {
                 write!(f, "<bound method {}>", function.name)
@@ -2466,7 +2538,16 @@ impl Value {
             Value::Set(_) => "set",
             Value::Range { .. } => "range",
             Value::Native(n) if n.name == "NotImplemented" => "NotImplementedType",
-            Value::Native(_) | Value::Function(_) | Value::BoundMethod { .. } => "function",
+            // CPython's own callables: `list.append` is a method descriptor,
+            // `[].append` and `len` builtin functions, and a builtin type
+            // constructor (`int`) is a `type`.
+            Value::Native(n) if native_is_type(n.name) => "type",
+            Value::Native(n) => match &n.method {
+                Some(m) if m.receiver.is_none() => "method_descriptor",
+                _ => "builtin_function_or_method",
+            },
+            Value::Function(_) => "function",
+            Value::BoundMethod { .. } => "method",
             Value::Class(_) => "type",
             // Don't leak the class name into a `'static str`. Callers that
             // need the specific class name read `instance.class.name`
@@ -3071,7 +3152,7 @@ impl Value {
                     format!("range({}, {}, {})", start, stop, step)
                 }
             }
-            Value::Native(n) => native_repr(n.name),
+            Value::Native(n) => native_value_repr(n),
             Value::Function(func) => format!("<function {}>", func.effective_qualname()),
             // CPython names the class the method was found on and reprs
             // the receiver: `<bound method Path.iterdir of PosixPath('/t')>`.

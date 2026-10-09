@@ -2431,6 +2431,36 @@ show(hasattr(list, "nope"), hasattr(list, "append"), hasattr(dict, "__deepcopy__
 }
 
 #[test]
+fn builtin_callables_introspect_like_cpython() {
+    assert_matches_cpython(
+        "builtin_callables_introspect_like_cpython",
+        r#"from collections import defaultdict
+import math
+xs = [3, 1]
+def f():
+    pass
+class K:
+    def m(self):
+        pass
+show(type(len).__name__, type(math.sqrt).__name__, type(f).__name__, type(K().m).__name__)
+show(type(list.append).__name__, type(xs.append).__name__, type(int).__name__, type(ValueError).__name__)
+show(repr(len), repr(list.append), repr(str.upper), repr(dict.get))
+show(repr(xs.append).startswith("<built-in method append of list object at 0x"))
+show(list.append.__name__, list.append.__qualname__, xs.sort.__name__, xs.sort.__qualname__)
+show(xs.append.__self__ is xs, list.append.__objclass__ is list)
+show(repr(defaultdict), type(defaultdict).__name__, repr(int), repr(ValueError))
+sort = xs.sort
+sort()
+show(xs, list.append(xs, 4), xs, str.upper("a"))
+try:
+    len[0]
+except TypeError as e:
+    show(str(e))
+"#,
+    );
+}
+
+#[test]
 fn builtin_type_objects_are_the_builtins() {
     assert_matches_cpython(
         "builtin_type_objects_are_the_builtins",

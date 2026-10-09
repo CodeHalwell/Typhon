@@ -509,6 +509,9 @@ fn unmodelled_references(path: &std::path::Path, entry: &std::path::Path) -> Opt
             continue;
         };
         missing.extend(unmodelled_attribute_references(&module, &mut exports));
+        if let Some(base) = tyc_vm::module_subclassed_builtin(&module) {
+            missing.insert(format!("a subclass of the builtin {base}"));
+        }
         if tyc_vm::module_has_eager_generator(&module) {
             missing.insert("a generator whose yield the VM cannot suspend".into());
         }
@@ -1594,6 +1597,30 @@ mod tests {
             scan_source("import json\nimport math\nprint(round(2.5, ndigits=0), int(\"ff\", base=16), math.prod([2], start=3), json.loads(\"{}\", object_hook=dict), \"a b\".split(maxsplit=1))\n"),
             None
         );
+    }
+
+    #[test]
+    fn scan_routes_builtin_subclasses_to_cpython() {
+        // The VM models `list` / `int` / `str` as values, not classes, so a
+        // subclass of one runs on CPython.
+        for base in ["list", "int", "str", "dict", "tuple", "float"] {
+            let src = format!("plain class X({base}):\n    pass\nprint(X())\n");
+            assert_eq!(
+                scan_source(&src),
+                Some(vec![format!("a subclass of the builtin {base}")]),
+                "{src}"
+            );
+        }
+        // Nested classes are found too.
+        let nested =
+            "def f() -> None:\n    plain class L(list):\n        pass\n    print(L())\nf()\n";
+        assert!(scan_source(nested).is_some());
+        // A value-mixin enum and an exception subclass are modelled.
+        let mixin =
+            "from enum import Enum\nclass Colour(str, Enum):\n    RED = \"r\"\nprint(Colour.RED)\n";
+        assert_eq!(scan_source(mixin), None);
+        let exc = "plain class E(ValueError):\n    pass\nprint(E())\n";
+        assert_eq!(scan_source(exc), None);
     }
 
     #[test]

@@ -8574,6 +8574,32 @@ impl Interpreter {
                 let class = crate::builtins::shim_class_for_constructor(self, n.name)?;
                 self.get_attr(&class, attr)
             }
+            // A builtin method: `list.append.__name__` is `append`, its
+            // `__qualname__` `list.append`, and `[].append.__self__` the list.
+            Value::Native(n) if n.method.is_some() && attr == "__name__" => {
+                let m = n.method.as_ref().expect("checked by the guard");
+                Ok(Value::Str(self.intern_str(&m.attr)))
+            }
+            Value::Native(n) if n.method.is_some() && attr == "__qualname__" => {
+                let m = n.method.as_ref().expect("checked by the guard");
+                Ok(Value::Str(Rc::new(format!("{}.{}", m.owner, m.attr))))
+            }
+            Value::Native(n)
+                if attr == "__objclass__"
+                    && matches!(&n.method, Some(m) if m.receiver.is_none()) =>
+            {
+                let m = n.method.as_ref().expect("checked by the guard");
+                Ok(self
+                    .builtin_global(m.owner)
+                    .cloned()
+                    .unwrap_or_else(|| crate::builtins::make_builtin_type(m.owner)))
+            }
+            Value::Native(n)
+                if attr == "__self__" && matches!(&n.method, Some(m) if m.receiver.is_some()) =>
+            {
+                let m = n.method.as_ref().expect("checked by the guard");
+                Ok(m.receiver.clone().expect("checked by the guard"))
+            }
             Value::Native(n) if attr == "__name__" || attr == "__qualname__" => {
                 Ok(Value::Str(self.intern_str(n.name)))
             }
@@ -8708,10 +8734,12 @@ impl Interpreter {
                 // method registry in `builtins` does the actual dispatch.
                 let r = value.clone();
                 let attr_name: Rc<str> = Rc::from(attr);
+                let (owner, tag, receiver) = (value.type_name(), attr_name.clone(), value.clone());
                 let nf = NativeFn::new("method", move |interp, mut args| {
                     args.insert(0, r.clone());
                     crate::builtins::dispatch_method(interp, &attr_name, args)
-                });
+                })
+                .with_method(owner, tag, Some(receiver));
                 Ok(Value::Native(Rc::new(nf)))
             }
             // Static / class methods on builtin type objects. The generic
@@ -8756,6 +8784,7 @@ impl Interpreter {
                     )));
                 }
                 let attr_name: Rc<str> = Rc::from(attr);
+                let tag = attr_name.clone();
                 let m = NativeFn::new("method", move |interp, args| {
                     if args.is_empty() {
                         return Err(type_error(format!(
@@ -8764,7 +8793,8 @@ impl Interpreter {
                         )));
                     }
                     crate::builtins::dispatch_method(interp, &attr_name, args)
-                });
+                })
+                .with_method(nf.name, tag, None);
                 Ok(Value::Native(Rc::new(m)))
             }
             // Generator objects and other iterators: the iterator protocol
@@ -11964,10 +11994,12 @@ fn builtin_type_method(ty: &'static str, attr: &str) -> Option<Value> {
         return None;
     }
     let method = intern_method_name(attr);
-    Some(Value::Native(Rc::new(NativeFn::new(
-        method,
-        move |i, args| crate::builtins::dispatch_method(i, method, args),
-    ))))
+    Some(Value::Native(Rc::new(
+        NativeFn::new(method, move |i, args| {
+            crate::builtins::dispatch_method(i, method, args)
+        })
+        .with_method(ty, Rc::from(attr), None),
+    )))
 }
 
 /// [`builtin_has_attr`] for the method dispatcher in `builtins`.

@@ -1009,6 +1009,67 @@ const PYTHON_BUILTINS: &[&str] = &[
     "__debug__",
 ];
 
+/// The first builtin value type (`list`, `int`, `str`, …) a class in
+/// `module` subclasses, or `None`.
+///
+/// The VM models those types as Rust values, not classes, so an instance of
+/// `class L(list)` is a plain object that holds no list: `L([1, 2])` fails
+/// and `class S(str)` prints as `<__main__.S object …>`. `tyc run`'s pre-run
+/// scan sends such a program down the compiled path. A value-mixin enum
+/// (`class Colour(str, Enum)`) is modelled and stays in the VM.
+pub fn module_subclassed_builtin(module: &ruff_python_ast::ModModule) -> Option<String> {
+    use ruff_python_ast::visitor::{self, Visitor};
+    use ruff_python_ast::{Expr, Stmt};
+
+    const VALUE_TYPES: &[&str] = &[
+        "int",
+        "float",
+        "complex",
+        "str",
+        "bytes",
+        "list",
+        "tuple",
+        "dict",
+        "set",
+        "frozenset",
+    ];
+    #[derive(Default)]
+    struct Scan {
+        found: Option<String>,
+    }
+    impl<'a> Visitor<'a> for Scan {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            if self.found.is_some() {
+                return;
+            }
+            if let Stmt::ClassDef(c) = stmt {
+                let bases: Vec<&str> = c
+                    .bases()
+                    .iter()
+                    .filter_map(|b| match b {
+                        Expr::Name(n) => Some(n.id.as_str()),
+                        Expr::Attribute(a) => Some(a.attr.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let is_enum = bases
+                    .iter()
+                    .any(|b| b.ends_with("Enum") || b.ends_with("Flag"));
+                if !is_enum {
+                    if let Some(b) = bases.iter().find(|b| VALUE_TYPES.contains(b)) {
+                        self.found = Some((*b).to_owned());
+                        return;
+                    }
+                }
+            }
+            visitor::walk_stmt(self, stmt);
+        }
+    }
+    let mut scan = Scan::default();
+    scan.visit_body(&module.body);
+    scan.found
+}
+
 /// Whether `module` defines a generator whose `yield` sits where the
 /// tree-walk cannot suspend (a loop test, a `with` item, two yields in one
 /// expression, …). The VM runs such a generator eagerly — its whole body at
