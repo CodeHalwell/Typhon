@@ -6249,9 +6249,12 @@ impl Interpreter {
         // The generated `__init__` calls `self.__post_init__()`, so it
         // resolves on the instance's own class — a subclass override wins
         // when a `super().__init__()` reaches a base's constructor.
+        // Only when the dataclass itself has a hook to call, as its
+        // generated `__init__` includes the call only then.
         if let Some(post) = self
             .find_method(&instance.class, "__post_init__")
             .filter(|_| crate::value::class_is_dataclass(class))
+            .filter(|_| self.find_method(class, "__post_init__").is_some())
         {
             let owner = self
                 .method_owner(&instance.class, &post)
@@ -6332,13 +6335,22 @@ impl Interpreter {
             };
             // This exact method, not whatever `repr()` / `==` would dispatch
             // to on a subclass: it reads `provider`'s declared fields only.
-            let field = |inst: &crate::value::Instance, name: &str| -> Result<Value, Unwind> {
-                inst.fields.borrow().get(name).cloned().ok_or_else(|| {
-                    attribute_error(format!(
-                        "'{}' object has no attribute '{}'",
-                        inst.class.name, name
-                    ))
-                })
+            // `self.name`: the instance's own value, else the class default.
+            let field = |inst: &crate::value::Instance,
+                         f: &crate::value::ClassField|
+             -> Result<Value, Unwind> {
+                if let Some(v) = inst.fields.borrow().get(&f.name) {
+                    return Ok(v.clone());
+                }
+                class_mro(&inst.class)
+                    .find_map(|c| c.class_attrs.borrow().get(&f.name).cloned())
+                    .or_else(|| f.default.clone())
+                    .ok_or_else(|| {
+                        attribute_error(format!(
+                            "'{}' object has no attribute '{}'",
+                            inst.class.name, f.name
+                        ))
+                    })
             };
             if name == "__repr__" {
                 let Value::Instance(inst) = &this else {
@@ -6346,7 +6358,7 @@ impl Interpreter {
                 };
                 let mut parts = Vec::with_capacity(provider.fields.len());
                 for f in &provider.fields {
-                    let v = field(inst, &f.name)?;
+                    let v = field(inst, f)?;
                     parts.push(format!("{}={}", f.name, interp.repr_of(&v)?));
                 }
                 return Ok(Value::Str(Rc::new(format!(
@@ -6364,7 +6376,7 @@ impl Interpreter {
             match (&this, &other) {
                 (Value::Instance(a), Value::Instance(b)) if Rc::ptr_eq(&a.class, &b.class) => {
                     for f in &provider.fields {
-                        let (x, y) = (field(a, &f.name)?, field(b, &f.name)?);
+                        let (x, y) = (field(a, f)?, field(b, f)?);
                         if !interp.values_equal(&x, &y)? {
                             return Ok(Value::Bool(false));
                         }

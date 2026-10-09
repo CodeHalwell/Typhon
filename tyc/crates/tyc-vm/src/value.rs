@@ -3116,6 +3116,22 @@ impl Value {
                 }
                 let fa = a.fields.borrow();
                 let fb = b.fields.borrow();
+                // A generated dataclass `__eq__` compares its declared field
+                // tuple only, not attributes assigned later.
+                if let Some(provider) = std::iter::once(&a.class)
+                    .chain(a.class.mro.iter())
+                    .find(|c| generates_dataclass(c) && class_flag(c, "__typhon_dc_eq__", true))
+                {
+                    if !class_flag(&a.class, "__typhon_own_eq__", false) {
+                        return provider.fields.iter().all(|f| {
+                            match (fa.get(&f.name), fb.get(&f.name)) {
+                                (Some(v), Some(w)) => v.identical_or_equal(w),
+                                (Option::None, Option::None) => true,
+                                _ => false,
+                            }
+                        });
+                    }
+                }
                 if fa.len() != fb.len() {
                     return false;
                 }

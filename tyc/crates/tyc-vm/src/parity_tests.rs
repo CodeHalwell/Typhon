@@ -2562,6 +2562,24 @@ plain class G(F):
 g, g2 = G(), G()
 g2.extra = 1
 show(g.a, g.tag, repr(g), g == g2, F.__eq__(g, g2), F(1) == F(1), F.__eq__(F(1), F(2)))
+@dataclass
+plain class H:
+    a: int = 1
+plain class J(H):
+    def __init__(self):
+        super().__init__()
+    def __post_init__(self):
+        self.hooked = True
+h1, h2 = H(), H()
+h1.extra = 1
+show(hasattr(J(), "hooked"), h1 == h2, H.__eq__(h1, h2), K() == K())
+@dataclass(init=False)
+plain class Q2:
+    y: int = 4
+    def __init__(self):
+        pass
+q2 = Q2()
+show(repr(q2), Q2.__repr__(q2), Q2.__eq__(q2, Q2()))
 "#,
     );
 }
