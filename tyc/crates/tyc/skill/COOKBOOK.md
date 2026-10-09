@@ -606,7 +606,7 @@ def demo_linalg() -> None:
     let x = np.linalg.solve(a, b)
 ```
 
-`lazy import np = numpy` defers + aliases. Use `lazy import torch = torch` for PyTorch, etc. NEVER `lazy from numpy import array` — that's a parse error.
+`lazy import np = numpy` defers + aliases. Use `lazy import torch = torch` for PyTorch, etc. `lazy from numpy import array` only works on a 3.15+ target (PEP 810).
 
 ---
 
