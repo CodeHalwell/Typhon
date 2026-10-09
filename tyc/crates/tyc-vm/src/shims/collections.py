@@ -925,7 +925,12 @@ class UserDict:
         return self.__class__(self.data.copy())
 
     def __copy__(self):
-        return self.copy()
+        # CPython: the whole instance state, with a copy of `data`.
+        inst = object.__new__(type(self))
+        for k, v in vars(self).items():
+            object.__setattr__(inst, k, v)
+        inst.data = self.data.copy()
+        return inst
 
     @classmethod
     def fromkeys(cls, iterable, value=None):
@@ -1038,7 +1043,12 @@ class UserList:
         return self.__class__(self)
 
     def __copy__(self):
-        return self.copy()
+        # CPython: the whole instance state, with a copy of `data`.
+        inst = object.__new__(type(self))
+        for k, v in vars(self).items():
+            object.__setattr__(inst, k, v)
+        inst.data = self.data[:]
+        return inst
 
     def count(self, item):
         return self.data.count(item)

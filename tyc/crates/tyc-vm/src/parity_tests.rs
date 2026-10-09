@@ -2392,6 +2392,14 @@ ul = UserList([1])
 ul2 = copy.copy(ul)
 ul2.append(2)
 show(ul, ul2, copy.deepcopy(ul))
+ud = UserDict(a=1)
+ud.extra = [1]
+ud2 = copy.copy(ud)
+ud2["b"] = 2
+ul.tag = "t"
+ul3 = copy.copy(ul)
+ul3.append(3)
+show(ud, ud2, ud2.extra is ud.extra, ul, ul3, ul3.tag)
 show(hasattr(list, "nope"), hasattr(list, "append"), hasattr(dict, "__deepcopy__"), hasattr(str, "lower"))
 "#,
     );
@@ -2429,6 +2437,12 @@ for _c in (WithInit, WithNew):
     except TypeError as e:
         show(str(e))
 show(type(bytearray()) is bytearray, type(bytearray(b"a")) == bytearray, type(bytearray()) is bytes)
+show(type(None)() is None, type(Ellipsis)() is Ellipsis, type(NotImplemented)() is NotImplemented)
+try:
+    type(iter([]))()
+except TypeError as e:
+    show(str(e))
+show(id(type([])) == id(list), id(type("")) == id(str), id(type(bytearray())) == id(bytearray), id(type([])) == id(dict))
 "#,
     );
 }

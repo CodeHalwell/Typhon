@@ -1588,7 +1588,7 @@ pub fn install(interp: &mut Interpreter) {
         Ok(Value::Int(VmInt::from(i.hash_value(v)?)))
     });
 
-    native!("id", |_i, args| {
+    native!("id", |i, args| {
         // Stable per-object identity for heap-allocated values: the address
         // of the underlying `Rc` payload. Immutable scalars (int, float,
         // bool, None) hash to the address of the temporary `&Value` instead,
@@ -1603,8 +1603,14 @@ pub fn install(interp: &mut Interpreter) {
             Value::Set(s) => Rc::as_ptr(s) as usize,
             Value::Str(s) => Rc::as_ptr(s) as usize,
             Value::Bytes(b) => Rc::as_ptr(b) as usize,
-            Value::Class(c) => Rc::as_ptr(c) as usize,
-            Value::Instance(i) => Rc::as_ptr(i) as usize,
+            // `type([]) is list`, so the stand-in shares the constructor's id.
+            Value::Class(c) => match i.builtin_global(&c.name) {
+                Some(Value::Native(n)) if is_builtin_type_class(c) || is_builtin_shim_class(c) => {
+                    Rc::as_ptr(n) as usize
+                }
+                _ => Rc::as_ptr(c) as usize,
+            },
+            Value::Instance(inst) => Rc::as_ptr(inst) as usize,
             Value::Module(m) => Rc::as_ptr(m) as usize,
             Value::Function(f) => Rc::as_ptr(f) as usize,
             Value::Native(n) => Rc::as_ptr(n) as usize,

@@ -5938,6 +5938,11 @@ impl Interpreter {
         Ok(())
     }
 
+    /// The builtin global `name` (`list`, `print`, …), if there is one.
+    pub(crate) fn builtin_global(&self, name: &str) -> Option<&Value> {
+        self.builtin_globals.get(name)
+    }
+
     pub(crate) fn instantiate(
         &mut self,
         class: &Rc<Class>,
@@ -5949,6 +5954,27 @@ impl Interpreter {
         if crate::builtins::is_builtin_type_class(class) {
             if let Some(ctor) = self.builtin_globals.get(&class.name).cloned() {
                 return self.call_value(ctor, args, kwargs);
+            }
+            // No constructor of its own: the singletons' types hand back the
+            // singleton (`type(None)() is None`), and the rest cannot be
+            // instantiated at all.
+            let singleton = match class.name.as_str() {
+                "NoneType" => Some(Value::None),
+                "ellipsis" => Some(crate::value::ellipsis_value()),
+                "NotImplementedType" => self.builtin_globals.get("NotImplemented").cloned(),
+                _ => None,
+            };
+            if let Some(v) = singleton {
+                if !args.is_empty() || !kwargs.is_empty() {
+                    return Err(type_error(format!("{}() takes no arguments", class.name)));
+                }
+                return Ok(v);
+            }
+            if !crate::builtins::is_builtin_type_name(&class.name) {
+                return Err(type_error(format!(
+                    "cannot create '{}' instances",
+                    class.name
+                )));
             }
         }
         // Calling an enum class is value-lookup, not construction:

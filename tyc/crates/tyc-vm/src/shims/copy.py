@@ -39,7 +39,10 @@ def _atomic(x):
         x is None
         or x is Ellipsis
         or x is NotImplemented
-        or isinstance(x, (int, float, bool, complex, str, bytes, range, type))
+        # The exact types, as CPython's dispatch table keys on `type(x)`: an
+        # instance of `class C(int)` with state of its own is not atomic.
+        or type(x) in (int, float, bool, complex, str, bytes, range)
+        or isinstance(x, type)
         or type(x) in _FUNCTION_TYPES
         or type(x) is slice
         or callable(x) and not hasattr(x, "__dict__") and not hasattr(type(x), "__copy__")
