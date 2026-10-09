@@ -2400,7 +2400,9 @@ pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
         // `type(x)` returns, and the builtin types and exceptions.
         ("type", Value::Class(_)) if builtin_target => true,
         ("type", Value::Native(n)) if builtin_target => {
-            is_builtin_type_name(n.name) || crate::interp::builtin_exc_mro(n.name).is_some()
+            is_builtin_type_name(n.name)
+                || crate::interp::builtin_exc_mro(n.name).is_some()
+                || is_shim_constructor_name(n.name)
         }
         ("int", Value::Int(_)) => true,
         // `bool` is a subclass of `int` in CPython, so `isinstance(True, int)`
@@ -3236,6 +3238,12 @@ fn register_builtin_shim_class(cls: &Value) {
             }
         });
     }
+}
+
+/// A constructor native that stands for a shim class (`collections.defaultdict`
+/// and the 3.15 builtins): a type object in CPython, so `isinstance(_, type)`.
+fn is_shim_constructor_name(name: &str) -> bool {
+    matches!(name, "defaultdict" | "frozendict" | "sentinel")
 }
 
 /// `c` is the shim class behind a builtin constructor native of the same name.

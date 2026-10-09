@@ -1736,6 +1736,34 @@ fn check_accepts_init_arguments_that_differ_from_the_fields() {
     );
 }
 
+/// ...and those arguments are checked against that `__init__`'s types.
+#[test]
+fn check_rejects_arguments_that_do_not_match_init() {
+    for call in [
+        "E(1, 3)",
+        "E(msg=\"a\", code=\"b\")",
+        "R(5)",
+        "R(\"a\", k=\"x\")",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        scaffold(
+            tmp.path(),
+            &format!(
+                "plain class E:\n    code: int\n    def __init__(self, msg: str, code: int) -> None:\n        self.code = code\n\
+                 class! R:\n    n: int\n    def __init__(self, s: str, *, k: int = 0) -> None:\n        self.n = len(s)\n\
+                 x = {call}\nprint(x)\n"
+            ),
+        );
+        let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+        assert!(!out.status.success(), "`{call}` should not type-check");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("type mismatch"),
+            "`{call}`: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 #[test]
 fn build_emits_dataclass_decorator_for_class() {
     let tmp = tempfile::tempdir().unwrap();

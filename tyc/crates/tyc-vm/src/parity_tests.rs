@@ -2400,6 +2400,13 @@ ul.tag = "t"
 ul3 = copy.copy(ul)
 ul3.append(3)
 show(ud, ud2, ud2.extra is ud.extra, ul, ul3, ul3.tag)
+od = OrderedDict(a=1)
+od.extra = [1]
+od2 = copy.copy(od)
+od2["b"] = 2
+cn = Counter("ab")
+cn.extra = [1]
+show(od, od2, od2.extra is od.extra, hasattr(copy.copy(cn), "extra"))
 show(hasattr(list, "nope"), hasattr(list, "append"), hasattr(dict, "__deepcopy__"), hasattr(str, "lower"))
 "#,
     );
@@ -2443,6 +2450,11 @@ try:
 except TypeError as e:
     show(str(e))
 show(id(type([])) == id(list), id(type("")) == id(str), id(type(bytearray())) == id(bytearray), id(type([])) == id(dict))
+tk = {int: 1, bytearray: 2, list: 3}
+show(list(tk), tk.get(type(bytearray())), tk.get(type(5)), tk[type([])])
+show(hash(type([])) == hash(list), hash(type(bytearray())) == hash(bytearray))
+from collections import defaultdict as _dd, OrderedDict as _od
+show(isinstance(_dd, type), isinstance(_od, type))
 "#,
     );
 }

@@ -1271,6 +1271,38 @@ fn constructor_is_field_list(c: &Checker, name: &str) -> bool {
     !(c.is_plain_class(name) || (c.is_raw_class(name) && own_init()))
 }
 
+/// Check a call to a class whose constructor is its hand-written
+/// `__init__` against that method's declared parameter types, the way the
+/// field-list check does for a generated constructor.
+fn check_init_constructor_args(
+    c: &mut Checker,
+    name: &str,
+    pos_args: &[Expr],
+    kw_args: &[ruff_python_ast::Keyword],
+) {
+    let Some(sig) = c.find_method(name, "__init__").cloned() else {
+        return;
+    };
+    let info = &sig.arity_info;
+    let names: Vec<&String> = info
+        .param_names
+        .iter()
+        .chain(info.kwonly_names.iter())
+        .collect();
+    if names.len() != sig.param_types.len() {
+        return;
+    }
+    let params = InterfaceShape {
+        fields: names
+            .into_iter()
+            .cloned()
+            .zip(sig.param_types.iter().cloned())
+            .collect(),
+        ..InterfaceShape::default()
+    };
+    check_concrete_constructor_args(c, &params, &info.param_names, pos_args, kw_args);
+}
+
 fn constructor_positional_order(c: &Checker, name: &str, shape: &InterfaceShape) -> Vec<String> {
     if !c.is_raw_class(name) {
         return shape.field_order.clone();
@@ -22694,6 +22726,8 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                                 pos_args,
                                 kw_args,
                             );
+                        } else {
+                            check_init_constructor_args(c, &name, pos_args, kw_args);
                         }
                     }
                     if let Some(tparams) = c.class_type_params.get(&name).cloned() {

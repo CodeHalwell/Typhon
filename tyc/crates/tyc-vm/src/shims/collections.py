@@ -346,6 +346,15 @@ class OrderedDict(_MappingBase):
     def copy(self):
         return OrderedDict(self._data)
 
+    def _typhon_copy(self):
+        # CPython's `OrderedDict.__reduce__` carries the instance state too
+        # (unlike `Counter`'s), so extra attributes survive the copy.
+        inst = type(self)(self._data)
+        for k, v in vars(self).items():
+            if k != "_data":
+                object.__setattr__(inst, k, v)
+        return inst
+
     @classmethod
     def fromkeys(cls, iterable, value=None):
         d = cls()

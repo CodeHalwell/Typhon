@@ -21,7 +21,8 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   declared annotated fields had its call arguments type-checked against
   those fields, so `E("boom", 3)` with `__init__(self, msg: str, code: int)`
   and a `code: int` field was rejected with "expected `int`". The field
-  check now applies only where the fields are the constructor.
+  check now applies only where the fields are the constructor; otherwise
+  the arguments are checked against the `__init__`'s own parameter types.
 - **`copy` runs in the VM.** `tyc run` handed any program that imported
   `copy` to CPython. The VM now has `copy.copy`, `copy.deepcopy` (memo,
   cycles and shared references included), `copy.replace` and `copy.Error`,
@@ -36,7 +37,9 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   `isinstance(cls, type)` was `False` for every class. All three now match
   CPython, and `object.__new__(cls)` makes a bare instance without running
   `__init__` (rejecting extra arguments the way CPython does).
-  `type(bytearray()) is bytearray` holds, and `hasattr(list, "nope")` is
+  `type(bytearray()) is bytearray` holds, `id`, `hash` and dict keys agree
+  for the two spellings of a builtin type (`list({int: 1})` is
+  `[<class 'int'>]`, not `['int']`), and `hasattr(list, "nope")` is
   `False` rather than finding a made-up method.
 - **Tracebacks through the VM's stdlib modules.** A frame inside one of the
   VM's Python-written modules (`copy`, `datetime`, `pathlib` and friends)

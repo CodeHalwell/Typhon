@@ -1149,6 +1149,11 @@ impl HashKey {
             HashKey::Instance { instance, .. } => Value::Instance(instance),
             HashKey::Identity(instance) => Value::Instance(instance),
             HashKey::Class(c) => Value::Class(c),
+            // A builtin type key comes back as that type (`list({int: 1})`
+            // is `[<class 'int'>]`), not as its name.
+            HashKey::BuiltinType(name) if crate::builtins::is_builtin_type_name(name) => {
+                crate::builtins::make_builtin_type(name)
+            }
             HashKey::BuiltinType(name) => Value::Str(Rc::new(name.to_owned())),
             HashKey::UserHashed { instance, .. } => Value::Instance(instance),
         }
@@ -2604,7 +2609,9 @@ impl Value {
                 // `int` while the global `int` is the constructor native —
                 // a type-keyed registry (`functools.singledispatch`) has to
                 // see a single key for the two.
-                if crate::builtins::is_builtin_type_class(c) {
+                if crate::builtins::is_builtin_type_class(c)
+                    || crate::builtins::is_builtin_shim_class(c)
+                {
                     return Ok(HashKey::BuiltinType(crate::interp::intern_type_name(
                         &c.name,
                     )));

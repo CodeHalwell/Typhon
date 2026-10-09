@@ -4672,7 +4672,16 @@ impl Interpreter {
                 let h = self.hash_value(inner)?;
                 pyhash::tuple_hash(&[h])
             }
-            Value::Class(c) => pyhash::pointer_hash(Rc::as_ptr(c) as usize),
+            // `type([]) is list`: the stand-in hashes as its constructor.
+            Value::Class(c) => match self.builtin_globals.get(&c.name) {
+                Some(Value::Native(n))
+                    if crate::builtins::is_builtin_type_class(c)
+                        || crate::builtins::is_builtin_shim_class(c) =>
+                {
+                    pyhash::pointer_hash(Rc::as_ptr(n) as usize)
+                }
+                _ => pyhash::pointer_hash(Rc::as_ptr(c) as usize),
+            },
             Value::Function(f) => pyhash::pointer_hash(Rc::as_ptr(f) as usize),
             Value::Native(n) => pyhash::pointer_hash(Rc::as_ptr(n) as usize),
             Value::Module(m) => pyhash::pointer_hash(Rc::as_ptr(m) as usize),
