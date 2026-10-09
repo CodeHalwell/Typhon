@@ -9893,11 +9893,13 @@ fn class_matches_abc_hook(c: &Rc<crate::value::Class>, abc_name: &str) -> bool {
     };
     // CPython's `_check_methods`: each name must be bound somewhere in the
     // MRO to anything but `None`.
-    methods.iter().all(|m| match crate::interp::lookup_class_member(c, m) {
-        Some((_, crate::interp::ClassMember::Method(_))) => true,
-        Some((_, crate::interp::ClassMember::Attr(v))) => !matches!(v, Value::None),
-        None => false,
-    })
+    methods
+        .iter()
+        .all(|m| match crate::interp::lookup_class_member(c, m) {
+            Some((_, crate::interp::ClassMember::Method(_))) => true,
+            Some((_, crate::interp::ClassMember::Attr(v))) => !matches!(v, Value::None),
+            None => false,
+        })
 }
 
 /// `issubclass(sub, target)` beyond the nominal MRO when `target` is an
