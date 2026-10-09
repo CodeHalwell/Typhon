@@ -440,6 +440,9 @@ class ValuesView(MappingView, Collection):
             yield self._mapping[key]
 
 
+_marker = object()
+
+
 class MutableMapping(Mapping):
 
     @abstractmethod
@@ -450,13 +453,13 @@ class MutableMapping(Mapping):
     def __delitem__(self, key):
         raise KeyError
 
-    def pop(self, key, *args):
+    def pop(self, key, default=_marker):
         try:
             value = self[key]
         except KeyError:
-            if args:
-                return args[0]
-            raise
+            if default is _marker:
+                raise
+            return default
         else:
             del self[key]
             return value

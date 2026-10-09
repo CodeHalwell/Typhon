@@ -56,6 +56,11 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   `issubclass` sees `IntEnum` / `IntFlag` as `int` subclasses and
   `StrEnum` as a `str` subclass, and an enum class's own `__str__` is
   used.
+- **Too many positional arguments raise CPython's message under `tyc run`.**
+  `MutableMapping.pop() takes from 2 to 3 positional arguments but 4 were
+  given`: the qualified name, the accepted range when some parameters have
+  defaults, and "1 was given". The VM had printed the unqualified name and
+  only the maximum. `callable(NotImplemented)` is also `False` now.
 - **Modules have a `__name__` under `tyc run`.** `json.__name__` raised
   `AttributeError`; every module now reports its import name, as in CPython.
 - **Shim functions that CPython writes in C report as builtins under `tyc run`.**

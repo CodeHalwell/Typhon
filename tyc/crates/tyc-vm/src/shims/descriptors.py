@@ -249,8 +249,13 @@ def _typing_subscript(name, form, origin, params):
     if name == "Annotated":
         if len(params) < 2:
             raise TypeError("Annotated[...] should be used with at least two arguments (a type and an annotation).")
-        alias = _TypingAlias(name, form, params[0], (params[0],))
-        alias.__metadata__ = tuple(params[1:])
+        origin, metadata = params[0], tuple(params[1:])
+        # `Annotated[Annotated[int, "a"], "b"]` flattens to one alias.
+        if isinstance(origin, _TypingAlias) and origin._name == "Annotated":
+            metadata = origin.__metadata__ + metadata
+            origin = origin.__origin__
+        alias = _TypingAlias(name, form, origin, (origin,))
+        alias.__metadata__ = metadata
         return alias
     if name == "Callable" and len(params) == 2 and isinstance(params[0], list):
         args = tuple(params[0]) + (params[1],)

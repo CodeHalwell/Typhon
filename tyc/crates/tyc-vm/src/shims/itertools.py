@@ -10,8 +10,28 @@
 # private names are not exported (see `make_itertools_module`).
 
 
+def _index(v):
+    # The integer-index protocol CPython's constructors apply to counts.
+    if isinstance(v, int):
+        return int(v)
+    if hasattr(type(v), "__index__"):
+        return v.__index__()
+    raise TypeError("'%s' object cannot be interpreted as an integer" % type(v).__name__)
+
+
+def _is_number(v):
+    # CPython's `PyNumber_Check`: an int, float or complex, or anything
+    # convertible through `__index__` / `__int__` / `__float__`.
+    if isinstance(v, (int, float, complex)):
+        return True
+    t = type(v)
+    return hasattr(t, "__index__") or hasattr(t, "__int__") or hasattr(t, "__float__")
+
+
 class count:
     def __init__(self, start=0, step=1):
+        if not _is_number(start) or not _is_number(step):
+            raise TypeError("a number is required")
         self._n = start
         self._step = step
 
@@ -24,9 +44,10 @@ class count:
         return n
 
     def __repr__(self):
+        name = type(self).__name__
         if type(self._step) is int and self._step == 1:
-            return "count(%r)" % (self._n,)
-        return "count(%r, %r)" % (self._n, self._step)
+            return "%s(%r)" % (name, self._n)
+        return "%s(%r, %r)" % (name, self._n, self._step)
 
 
 def _cycle(iterable):
@@ -53,8 +74,10 @@ class cycle:
 class repeat:
     def __init__(self, object, times=None):
         self._obj = object
-        if times is not None and times < 0:
-            times = 0
+        if times is not None:
+            times = _index(times)
+            if times < 0:
+                times = 0
         self._times = times
 
     def __iter__(self):
@@ -74,9 +97,10 @@ class repeat:
         return self._times
 
     def __repr__(self):
+        name = type(self).__name__
         if self._times is None:
-            return "repeat(%r)" % (self._obj,)
-        return "repeat(%r, %r)" % (self._obj, self._times)
+            return "%s(%r)" % (name, self._obj)
+        return "%s(%r, %r)" % (name, self._obj, self._times)
 
 
 def _accumulate(it, func, initial):
@@ -326,6 +350,7 @@ class takewhile:
 
 
 def tee(iterable, n=2):
+    n = _index(n)
     if n < 0:
         raise ValueError("n must be >= 0")
     it = iter(iterable)
@@ -384,6 +409,7 @@ def _product(pools):
 
 class product:
     def __init__(self, *iterables, repeat=1):
+        repeat = _index(repeat)
         if repeat < 0:
             raise ValueError("repeat argument cannot be negative")
         self._g = _product([tuple(pool) for pool in iterables] * repeat)
@@ -422,7 +448,9 @@ def _permutations(pool, r):
 class permutations:
     def __init__(self, iterable, r=None):
         pool = tuple(iterable)
-        r = len(pool) if r is None else r
+        if r is not None and not isinstance(r, int):
+            raise TypeError("Expected int as r")
+        r = len(pool) if r is None else int(r)
         if r < 0:
             raise ValueError("r must be non-negative")
         self._g = _permutations(pool, r)
@@ -457,6 +485,7 @@ def _combinations(pool, r):
 class combinations:
     def __init__(self, iterable, r):
         pool = tuple(iterable)
+        r = _index(r)
         if r < 0:
             raise ValueError("r must be non-negative")
         self._g = _combinations(pool, r)
@@ -489,6 +518,7 @@ def _combinations_with_replacement(pool, r):
 class combinations_with_replacement:
     def __init__(self, iterable, r):
         pool = tuple(iterable)
+        r = _index(r)
         if r < 0:
             raise ValueError("r must be non-negative")
         self._g = _combinations_with_replacement(pool, r)
@@ -512,6 +542,7 @@ def _batched(it, n, strict):
 
 class batched:
     def __init__(self, iterable, n, *, strict=False):
+        n = _index(n)
         if n < 1:
             raise ValueError("n must be at least one")
         self._g = _batched(iter(iterable), n, strict)

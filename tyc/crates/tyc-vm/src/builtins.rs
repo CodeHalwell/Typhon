@@ -814,7 +814,13 @@ pub fn install(interp: &mut Interpreter) {
                 &errors,
             )?)));
         }
-        let args = pos.to_vec();
+        let mut args = pos.to_vec();
+        // `bytes(re.I)`: an int-valued enum member counts as its int.
+        if let Some(first) = args.first_mut() {
+            if let Some(inner @ Value::Int(_)) = crate::value::enum_mixin_value(first) {
+                *first = inner;
+            }
+        }
         match args.into_iter().next() {
             None => Ok(Value::Bytes(Rc::new(Vec::new()))),
             Some(Value::Bytes(b)) => Ok(Value::Bytes(b)),
@@ -1433,9 +1439,9 @@ pub fn install(interp: &mut Interpreter) {
         )
     });
 
-    native!("hex", |_i, args| based_int_repr(&args, "hex", 16, "0x"));
-    native!("bin", |_i, args| based_int_repr(&args, "bin", 2, "0b"));
-    native!("oct", |_i, args| based_int_repr(&args, "oct", 8, "0o"));
+    native!("hex", |i, args| based_int_repr(i, &args, "hex", 16, "0x"));
+    native!("bin", |i, args| based_int_repr(i, &args, "bin", 2, "0b"));
+    native!("oct", |i, args| based_int_repr(i, &args, "oct", 8, "0o"));
 
     native!("chr", |_i, args| {
         let n = single(&args, "chr")?.to_int()?;
@@ -1645,10 +1651,12 @@ pub fn install(interp: &mut Interpreter) {
 
     native!("callable", |_i, args| {
         let v = single(&args, "callable")?;
-        Ok(Value::Bool(matches!(
-            v,
-            Value::Function(_) | Value::Native(_) | Value::BoundMethod { .. } | Value::Class(_)
-        )))
+        Ok(Value::Bool(match v {
+            // `NotImplemented` is a native sentinel, not a callable.
+            Value::Native(n) => n.name != "NotImplemented",
+            Value::Function(_) | Value::BoundMethod { .. } | Value::Class(_) => true,
+            _ => false,
+        }))
     });
 
     // `open` is `io.open`: the file object model lives in the `io` shim.
@@ -2164,8 +2172,26 @@ fn single<'a>(args: &'a [Value], name: &str) -> Result<&'a Value, Unwind> {
 /// overflow). The previous implementation formatted a lossy `i64` with Rust's
 /// `{:x}`/`{:b}`/`{:o}`, which prints the two's-complement bit pattern for a
 /// negative and rejected any value outside `i64`.
-fn based_int_repr(args: &[Value], name: &str, radix: u32, prefix: &str) -> Result<Value, Unwind> {
-    let vi: VmInt = match single(args, name)? {
+fn based_int_repr(
+    interp: &mut Interpreter,
+    args: &[Value],
+    name: &str,
+    radix: u32,
+    prefix: &str,
+) -> Result<Value, Unwind> {
+    let arg = single(args, name)?;
+    // An `IntEnum` / `IntFlag` member is its int; any other instance
+    // answers through `__index__`, as CPython's `PyNumber_Index`.
+    let arg = match arg {
+        v @ Value::Instance(_) => match crate::value::enum_mixin_value(v) {
+            Some(inner @ Value::Int(_)) => inner,
+            _ => interp
+                .call_dunder0(v, "__index__")?
+                .unwrap_or_else(|| v.clone()),
+        },
+        other => other.clone(),
+    };
+    let vi: VmInt = match &arg {
         Value::Int(i) => i.clone(),
         Value::Bool(b) => VmInt::from(*b as i64),
         other => {
@@ -7839,6 +7865,15 @@ pub(crate) fn typing_origin(interp: &mut Interpreter, name: &str) -> Result<Opti
         let m = interp.import_module("collections")?;
         return interp.get_attr(&m, c).map(Some);
     }
+    let ctx = match name {
+        "ContextManager" => Some("AbstractContextManager"),
+        "AsyncContextManager" => Some("AbstractAsyncContextManager"),
+        _ => None,
+    };
+    if let Some(c) = ctx {
+        let m = interp.import_module("contextlib")?;
+        return interp.get_attr(&m, c).map(Some);
+    }
     Ok(None)
 }
 
@@ -9679,7 +9714,16 @@ pub(crate) fn abc_register(class: &Rc<crate::value::Class>) -> Value {
     let owner = class.clone();
     nf("register", move |_i, args| {
         let sub = single(&args, "register")?.clone();
-        if !matches!(sub, Value::Class(_) | Value::Native(_)) {
+        let is_type = match &sub {
+            Value::Class(_) => true,
+            Value::Native(n) => {
+                crate::value::native_is_type(n.name)
+                    || is_builtin_type_name(n.name)
+                    || crate::interp::builtin_exc_mro(n.name).is_some()
+            }
+            _ => false,
+        };
+        if !is_type {
             return Err(type_error("Can only register classes"));
         }
         let target = Value::Class(owner.clone());
@@ -9928,6 +9972,8 @@ fn abc_instance(val: &Value, target: &Rc<crate::value::Class>) -> bool {
                         .iter()
                         .any(|k| builtin_type_is_abc(k, abc_name)))
         }
+        // `NotImplemented` is a native here, but not callable.
+        Value::Native(n) if n.name == "NotImplemented" => abc_name == "Hashable",
         Value::Native(_) | Value::Function(_) | Value::BoundMethod { .. } | Value::Class(_) => {
             matches!(abc_name, "Callable" | "Hashable")
         }

@@ -3115,3 +3115,60 @@ t("strenum", lambda: (issubclass(SE, str), repr(SE)))
 "#,
     );
 }
+
+/// Review follow-ups: integer coercion in the `itertools` constructors,
+/// `register` refusing non-classes, `NotImplemented` not being callable,
+/// `MutableMapping.pop` arity, nested `Annotated` and the context-manager
+/// origins.
+#[test]
+fn abc_typing_itertools_edge_cases() {
+    assert_matches_cpython(
+        "abc_typing_itertools_edge_cases",
+        r#"import itertools
+import typing
+import contextlib
+import collections.abc as cabc
+from typing import Annotated
+def t(label, f):
+    try:
+        show(label, f())
+    except Exception as e:
+        show(label, "EXC", type(e).__name__, str(e))
+t("repeat float", lambda: itertools.repeat("x", 1.5))
+t("perm float", lambda: itertools.permutations([1], 1.5))
+t("comb float", lambda: itertools.combinations([1], 1.5))
+t("batched float", lambda: itertools.batched([1], 1.5))
+t("register len", lambda: cabc.Sequence.register(len))
+t("register int", lambda: cabc.Hashable.register(int) is int)
+t("callable NotImplemented", lambda: (callable(NotImplemented), isinstance(NotImplemented, cabc.Callable)))
+plain class MM(cabc.MutableMapping):
+    def __init__(self):
+        self.d = {}
+    def __getitem__(self, k):
+        return self.d[k]
+    def __setitem__(self, k, v):
+        self.d[k] = v
+    def __delitem__(self, k):
+        del self.d[k]
+    def __iter__(self):
+        return iter(self.d)
+    def __len__(self):
+        return len(self.d)
+t("pop default", lambda: MM().pop("k", 1))
+t("pop missing", lambda: MM().pop("k"))
+t("pop arity", lambda: type(MM().pop("k", 1, 2)))
+a = Annotated[Annotated[int, "a"], "b"]
+t("nested Annotated", lambda: (repr(a), typing.get_args(a)))
+t("count bad", lambda: itertools.count("a", "b"))
+t("count list", lambda: itertools.count([], 1))
+plain class C(itertools.count):
+    pass
+plain class R(itertools.repeat):
+    pass
+t("sub reprs", lambda: (repr(C(3)), repr(R(1, 2))))
+import re
+t("flag ints", lambda: (hex(re.I), oct(re.I), bin(re.I), bytes(re.I), [1, 2, 3][re.I], "ab" * re.I))
+t("ctx origin", lambda: (typing.get_origin(typing.ContextManager[int]) is contextlib.AbstractContextManager, typing.get_origin(typing.AsyncContextManager[int]) is contextlib.AbstractAsyncContextManager))
+"#,
+    );
+}

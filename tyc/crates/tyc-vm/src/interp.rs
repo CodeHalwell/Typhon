@@ -5975,11 +5975,23 @@ impl Interpreter {
         if let Some(va) = &params.vararg {
             env.set(va.name.as_str(), Value::Tuple(Rc::new(remaining)));
         } else if !remaining.is_empty() {
+            // CPython's wording: the qualified name, the accepted range
+            // when some parameters have defaults, and the grammar of 1.
+            let max = positional.len();
+            let min = f.defaults.iter().take(max).filter(|d| d.is_none()).count();
+            let given = max + remaining.len();
+            let was = if given == 1 { "was" } else { "were" };
+            let takes = if min == max {
+                format!(
+                    "{max} positional argument{}",
+                    if max == 1 { "" } else { "s" }
+                )
+            } else {
+                format!("from {min} to {max} positional arguments")
+            };
             return Err(type_error(format!(
-                "{}() takes {} positional arguments but {} were given",
-                f.name,
-                positional.len(),
-                positional.len() + remaining.len()
+                "{}() takes {takes} but {given} {was} given",
+                f.effective_qualname()
             )));
         }
 
