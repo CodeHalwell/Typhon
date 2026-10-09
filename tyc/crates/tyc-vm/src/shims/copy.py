@@ -17,12 +17,26 @@ class Error(Exception):
 error = Error
 
 
+def _function():
+    pass
+
+
+class _Holder:
+    def method(self):
+        pass
+
+
+# Functions, builtins and methods copy as themselves, as in CPython.
+_FUNCTION_TYPES = (type(_function), type(len), type(_Holder().method))
+
+
 def _atomic(x):
     return (
         x is None
         or x is Ellipsis
         or x is NotImplemented
         or isinstance(x, (int, float, bool, complex, str, bytes, range, type))
+        or type(x) in _FUNCTION_TYPES
         or callable(x) and not hasattr(x, "__dict__") and not hasattr(type(x), "__copy__")
     )
 
@@ -51,17 +65,34 @@ def _state(x):
     return (dict(d) if d else None), slots
 
 
-def _rebuild(x, state, slots):
-    cls = type(x)
-    y = object.__new__(cls)
+def _combined(state, slots):
+    # The single state value CPython's reduce protocol hands over: the dict
+    # state, paired with the slot state when there is any. `None` means
+    # there is nothing to restore, and `__setstate__` is not called.
+    return (state, slots) if slots else state
+
+
+def _apply_state(y, cls, state):
     if _defines(cls, "__setstate__"):
-        y.__setstate__(state if not slots else (state, slots))
-        return y
+        y.__setstate__(state)
+        return
+    slotstate = None
+    if isinstance(state, tuple) and len(state) == 2:
+        state, slotstate = state
     if state:
         for k, v in state.items():
             object.__setattr__(y, k, v)
-    for k, v in slots.items():
-        object.__setattr__(y, k, v)
+    if slotstate:
+        for k, v in slotstate.items():
+            setattr(y, k, v)
+
+
+def _rebuild(x, state, slots):
+    cls = type(x)
+    y = object.__new__(cls)
+    state = _combined(state, slots)
+    if state is not None:
+        _apply_state(y, cls, state)
     return y
 
 
@@ -137,21 +168,11 @@ def deepcopy(x, memo=None, _nil=[]):
         elif _atomic(x):
             y = x
         else:
-            state, slots = _get_state(x)
+            state = _combined(*_get_state(x))
             y = object.__new__(cls)
             memo[d] = y
-            if state is not None and not isinstance(state, dict):
-                y.__setstate__(deepcopy(state, memo))
-            else:
-                if state:
-                    state = deepcopy(state, memo)
-                    if _defines(cls, "__setstate__"):
-                        y.__setstate__(state)
-                    else:
-                        for k, v in state.items():
-                            object.__setattr__(y, k, v)
-                for k, v in slots.items():
-                    object.__setattr__(y, k, deepcopy(v, memo))
+            if state is not None:
+                _apply_state(y, cls, deepcopy(state, memo))
     # Keep `x` alive alongside its copy, as CPython's memo does, so its id
     # cannot be reused by a later object while the memo is live.
     if y is not x:

@@ -2317,6 +2317,40 @@ except TypeError as e:
 show(copy.Error is copy.error, issubclass(copy.Error, Exception))
 m = {}
 show(copy.deepcopy([1, [2]], m) == [1, [2]], len(m) > 0)
+def _fn() -> int:
+    return 1
+class _Box:
+    v: int
+    def __init__(self) -> None:
+        self.v = 1
+    def meth(self) -> int:
+        return self.v
+_b = _Box()
+show(copy.copy(_fn) is _fn, copy.deepcopy(_fn) is _fn, copy.copy(len) is len, copy.deepcopy([_fn])[0] is _fn)
+show(copy.copy(_b.meth)() == 1)
+calls = []
+class _NoState:
+    v: int
+    def __init__(self) -> None:
+        self.v = 1
+    def __getstate__(self):
+        return None
+    def __setstate__(self, st) -> None:
+        calls.append(st)
+copy.copy(_NoState())
+copy.deepcopy(_NoState())
+show(calls)
+class _EmptyState:
+    v: int
+    def __init__(self) -> None:
+        self.v = 1
+    def __getstate__(self):
+        return {}
+    def __setstate__(self, st) -> None:
+        calls.append(st)
+copy.copy(_EmptyState())
+copy.deepcopy(_EmptyState())
+show(calls)
 "#,
     );
 }
@@ -2333,12 +2367,28 @@ show(type(xs) is list, type({}) is dict, type({1}) is set, type((1,)) is tuple, 
 show(type(xs) is not list, type(xs) is tuple, type(xs) in (list, dict))
 show(type(xs)([1, 2]), type({1})([3, 3]), type("")(5), type(0)("7"), type(())(xs), type({})(a=1))
 show(isinstance(P, type), isinstance(int, type), isinstance(ValueError, type), isinstance(type(xs), type), isinstance(len, type), isinstance(xs, type), isinstance(o0, type))
-try:
-    object.__new__(list)
-except TypeError as e:
-    show(str(e))
+for _t in (list, ValueError, KeyError):
+    try:
+        object.__new__(_t)
+    except TypeError as e:
+        show(str(e))
 o = object.__new__(P)
 show(type(o) is P, isinstance(o, P))
+"#,
+    );
+}
+
+#[test]
+fn a_user_class_named_type_is_not_the_metaclass() {
+    assert_matches_cpython(
+        "a_user_class_named_type_is_not_the_metaclass",
+        r#"class P:
+    x: int
+class type:
+    v: int
+    def __init__(self) -> None:
+        self.v = 1
+show(isinstance(P, type), isinstance(int, type), isinstance(type(), type))
 "#,
     );
 }

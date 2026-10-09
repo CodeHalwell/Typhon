@@ -8224,7 +8224,8 @@ impl Interpreter {
                                 )))
                             }
                             Some(Value::Native(n))
-                                if crate::builtins::is_builtin_type_name(n.name) =>
+                                if crate::builtins::is_builtin_type_name(n.name)
+                                    || builtin_exc_mro(n.name).is_some() =>
                             {
                                 Err(type_error(format!(
                                     "object.__new__({0}) is not safe, use {0}.__new__()",

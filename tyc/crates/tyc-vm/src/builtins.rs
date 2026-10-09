@@ -2377,6 +2377,13 @@ pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
     let Some(name) = want_name else {
         return false;
     };
+    // The metaclass arms below are the builtin `type`, not a user class that
+    // happens to be called `type`.
+    let builtin_target = match cls {
+        Value::Native(_) => true,
+        Value::Class(c) => is_builtin_type_class(c),
+        _ => false,
+    };
     match (name.as_str(), val) {
         // Every value is an `object` — the root of Python's type hierarchy.
         // Without this arm `isinstance(x, object)` was uniformly `False`,
@@ -2385,8 +2392,8 @@ pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
         ("NoneType", Value::None) => true,
         // Classes are `type` instances: user classes, the stand-ins
         // `type(x)` returns, and the builtin types and exceptions.
-        ("type", Value::Class(_)) => true,
-        ("type", Value::Native(n)) => {
+        ("type", Value::Class(_)) if builtin_target => true,
+        ("type", Value::Native(n)) if builtin_target => {
             is_builtin_type_name(n.name) || crate::interp::builtin_exc_mro(n.name).is_some()
         }
         ("int", Value::Int(_)) => true,
