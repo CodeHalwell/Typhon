@@ -470,7 +470,9 @@ natives rather than classes (an enum with a `str`, `int`, `float`,
 modelled; `class E(list, Enum)` is not). A plain `tyc run` sends a program
 with a `__del__`, a custom metaclass, an eagerly-collected generator or a
 builtin subclass to CPython, so these gaps show only under
-`--no-fallback`.
+`--no-fallback`; a class whose base is computed at runtime
+(`class L(choose())`) or is a type CPython refuses as a base (`bool`,
+`range`, `slice`, `memoryview`) is sent there too.
 
 ### Keyword arguments and the pre-run scan (beta)
 

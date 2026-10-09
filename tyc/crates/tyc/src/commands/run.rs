@@ -1630,6 +1630,10 @@ mod tests {
             "bytearray",
             "enumerate",
             "property",
+            // CPython rejects these as bases.
+            "bool",
+            "range",
+            "slice",
         ] {
             let src = format!("plain class X({base}):\n    pass\nprint(X())\n");
             assert_eq!(
@@ -1637,6 +1641,17 @@ mod tests {
                 Some(vec![format!("a subclass of the builtin {base}")]),
                 "{src}"
             );
+        }
+        // A base computed at runtime may be a builtin, directly or
+        // through a name.
+        for src in [
+            "def choose() -> type:\n    return list\nplain class L(choose()):\n    pass\nprint(L([1]))\n",
+            "def choose() -> type:\n    return list\nBase = choose()\nplain class L(Base):\n    pass\nprint(L([1]))\n",
+            "def choose() -> type:\n    return list\nBase = choose()\nAlias = Base\nplain class L(Alias):\n    pass\nprint(L([1]))\n",
+            "def choose() -> type:\n    return list\nlet Base: type = choose()\nplain class L(Base):\n    pass\nprint(L([1]))\n",
+        ] {
+            let found = scan_source(src).expect(src);
+            assert!(found[0].contains("computed at runtime"), "{src}: {found:?}");
         }
         // Nested classes are found too.
         let nested =

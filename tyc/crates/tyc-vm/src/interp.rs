@@ -8755,9 +8755,17 @@ impl Interpreter {
                 // method registry in `builtins` does the actual dispatch.
                 let r = value.clone();
                 let attr_name: Rc<str> = Rc::from(attr);
-                // A bound builtin method is named for its receiver's type:
-                // `True.bit_count.__qualname__` is `bool.bit_count`.
-                let (owner, tag, receiver) = (value.type_name(), attr_name.clone(), value.clone());
+                // A bound builtin method is named for its receiver's type
+                // (`True.bit_count.__qualname__` is `bool.bit_count`), a
+                // bound slot for the type defining it (`[].__str__` is
+                // `object.__str__`).
+                let defining = crate::value::builtin_attr_owner(value.type_name(), attr);
+                let owner = if crate::value::is_slot_attr(defining, attr) {
+                    defining
+                } else {
+                    value.type_name()
+                };
+                let (tag, receiver) = (attr_name.clone(), value.clone());
                 let nf = NativeFn::new("method", move |interp, mut args| {
                     args.insert(0, r.clone());
                     crate::builtins::dispatch_method(interp, &attr_name, args)
@@ -8847,8 +8855,14 @@ impl Interpreter {
                         )));
                     }
                     crate::builtins::dispatch_method(interp, &attr_name, args)
-                })
-                .with_method(nf.name, tag, binding);
+                });
+                // `str.__init__` is `object.__init__`.
+                let owner = if class_only {
+                    nf.name
+                } else {
+                    crate::value::builtin_attr_owner(nf.name, attr)
+                };
+                let m = m.with_method(owner, tag, binding);
                 Ok(Value::Native(Rc::new(m)))
             }
             // Generator objects and other iterators: the iterator protocol

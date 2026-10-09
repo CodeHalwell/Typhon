@@ -1071,6 +1071,11 @@ fn scan_builtin_subclasses(
         // A metaclass the program only calls (`M("X", (), {})`), which the
         // `metaclass=` scan never sees.
         "type",
+        // Final types: CPython rejects the class, the VM would build it.
+        "bool",
+        "range",
+        "slice",
+        "memoryview",
     ];
     const ENUM_TYPES: &[&str] = &["Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "ReprEnum"];
     /// The data-type mixins the VM models on an enum (`enum_mixin_value`).
@@ -1102,6 +1107,9 @@ fn scan_builtin_subclasses(
         branch: usize,
         /// The parameters of each enclosing function.
         params: Vec<std::collections::HashSet<String>>,
+        /// Names bound to a value computed at runtime (`Base = choose()`),
+        /// in any scope, which may be a builtin type.
+        computed: std::collections::HashSet<String>,
         /// Builtin aliases the project's other modules export.
         project: std::collections::HashMap<String, String>,
         /// Only collect `builtin`; report nothing.
@@ -1172,13 +1180,31 @@ fn scan_builtin_subclasses(
                 return Some(format!("a subclass of the builtin {b}"));
             }
             // `def make(Base: type) -> type: class L(Base)` may be handed
-            // `list`.
-            c.bases().iter().find_map(|b| match b {
-                Expr::Name(n) if self.params.iter().any(|p| p.contains(n.id.as_str())) => {
-                    Some(format!("a class whose base is the parameter {}", n.id))
+            // `list`, and `class L(choose())` may be `list` too.
+            c.bases().iter().find_map(|b| {
+                let origin = match b {
+                    Expr::Subscript(s) => s.value.as_ref(),
+                    other => other,
+                };
+                match origin {
+                    Expr::Name(n) if self.params.iter().any(|p| p.contains(n.id.as_str())) => {
+                        Some(format!("a class whose base is the parameter {}", n.id))
+                    }
+                    Expr::Name(n) if self.computed.contains(n.id.as_str()) => Some(format!(
+                        "a class whose base {} is computed at runtime",
+                        n.id
+                    )),
+                    Expr::Name(_) | Expr::Attribute(_) => None,
+                    _ => Some("a class whose base is computed at runtime".to_owned()),
                 }
-                _ => None,
             })
+        }
+        /// Whether `value` computes a value at runtime that may be a type.
+        fn is_computed(value: &Expr) -> bool {
+            matches!(
+                value,
+                Expr::Call(_) | Expr::If(_) | Expr::BoolOp(_) | Expr::Named(_) | Expr::Await(_)
+            )
         }
         /// `let Alias = Base` in a class factory: `Alias` may be the
         /// builtin `Base` is handed too.
@@ -1250,10 +1276,15 @@ fn scan_builtin_subclasses(
                     // `Alias = list`, `list[int]`, `builtins.list`, `helper.Alias`.
                     let builtin = self.builtin_base(&a.value);
                     let enum_base = pinned && value.is_some_and(|v| self.enum_bases.contains(v));
+                    let computed = Self::is_computed(&a.value)
+                        || value.is_some_and(|v| self.computed.contains(v));
                     for target in &a.targets {
                         if let Expr::Name(t) = target {
                             let t = t.id.as_str();
                             self.alias_param(t, value);
+                            if computed {
+                                self.computed.insert(t.to_owned());
+                            }
                             self.unbind(t);
                             if let Some(b) = &builtin {
                                 self.builtin.insert(t.to_owned(), b.clone());
@@ -1270,6 +1301,12 @@ fn scan_builtin_subclasses(
                         let t = t.id.as_str();
                         if let Some(Expr::Name(v)) = a.value.as_deref() {
                             self.alias_param(t, Some(v.id.as_str()));
+                            if self.computed.contains(v.id.as_str()) {
+                                self.computed.insert(t.to_owned());
+                            }
+                        }
+                        if a.value.as_deref().is_some_and(Self::is_computed) {
+                            self.computed.insert(t.to_owned());
                         }
                         self.unbind(t);
                         if let Some(b) = builtin {

@@ -2471,6 +2471,8 @@ def cached(x):
 show(type(cm).__name__, type(functools.lru_cache(4)).__name__, cached(2))
 show(type(list.__len__).__name__, repr(list.__len__), type(xs.__len__).__name__, type(list.__getitem__).__name__, type(dict.__contains__).__name__, repr(str.__add__))
 show(repr(xs.__len__).startswith("<method-wrapper '__len__' of list object at 0x"), repr(dataclasses.replace).startswith("<function replace at 0x"))
+show(repr(str.__init__), str.__init__.__qualname__, str.__init__.__objclass__ is object, repr(list.__str__), list.__format__.__qualname__, xs.__str__.__qualname__, xs.__init__.__qualname__, xs.__format__.__qualname__)
+show(True.bit_count.__qualname__, True.__add__.__qualname__, True.__and__.__qualname__, repr(list.__eq__))
 sort = xs.sort
 sort()
 show(xs, list.append(xs, 4), xs, str.upper("a"))

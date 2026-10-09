@@ -923,6 +923,99 @@ fn is_slot_wrapper(m: &NativeMethod) -> bool {
     !method && SLOTS.contains(&attr)
 }
 
+/// Whether `owner.attr` is a slot wrapper, as [`is_slot_wrapper`].
+pub fn is_slot_attr(owner: &'static str, attr: &str) -> bool {
+    is_slot_wrapper(&NativeMethod {
+        owner,
+        attr: Rc::from(attr),
+        binding: MethodBinding::Unbound,
+    })
+}
+
+/// The builtin type that defines `attr` for type `ty`, walking its MRO as
+/// CPython 3.13 does: `str.__init__` is `object.__init__` and
+/// `bool.bit_count` is `int.bit_count`.
+pub fn builtin_attr_owner(ty: &'static str, attr: &str) -> &'static str {
+    // `object.__dict__`, less `__doc__` and `__new__`.
+    const OBJECT: &[&str] = &[
+        "__class__",
+        "__delattr__",
+        "__dir__",
+        "__eq__",
+        "__format__",
+        "__ge__",
+        "__getattribute__",
+        "__getstate__",
+        "__gt__",
+        "__hash__",
+        "__init__",
+        "__init_subclass__",
+        "__le__",
+        "__lt__",
+        "__ne__",
+        "__reduce__",
+        "__reduce_ex__",
+        "__repr__",
+        "__setattr__",
+        "__sizeof__",
+        "__str__",
+        "__subclasshook__",
+    ];
+    if ty == "bool" {
+        const OWN: &[&str] = &[
+            "__and__",
+            "__invert__",
+            "__or__",
+            "__rand__",
+            "__repr__",
+            "__ror__",
+            "__rxor__",
+            "__xor__",
+        ];
+        return if OWN.contains(&attr) {
+            "bool"
+        } else {
+            builtin_attr_owner("int", attr)
+        };
+    }
+    if !OBJECT.contains(&attr) {
+        return ty;
+    }
+    // Every builtin type overrides comparison, hashing and `repr`; these are
+    // the other `object` attributes each one overrides.
+    let overrides: &[&str] = match ty {
+        "int" => &["__format__", "__getattribute__", "__sizeof__"],
+        "float" => &["__format__"],
+        "complex" => &["__format__", "__getattribute__"],
+        "str" => &["__format__", "__sizeof__", "__str__"],
+        "bytes" => &["__getattribute__", "__str__"],
+        "bytearray" => &[
+            "__getattribute__",
+            "__init__",
+            "__reduce__",
+            "__reduce_ex__",
+            "__sizeof__",
+            "__str__",
+        ],
+        "list" | "dict" => &["__getattribute__", "__init__", "__sizeof__"],
+        "tuple" => &["__getattribute__"],
+        "set" => &["__getattribute__", "__init__", "__reduce__", "__sizeof__"],
+        "frozenset" => &["__reduce__", "__sizeof__"],
+        "range" | "slice" => &["__getattribute__", "__reduce__"],
+        "NoneType" => &[],
+        _ => return ty,
+    };
+    let common = matches!(
+        attr,
+        "__eq__" | "__ne__" | "__lt__" | "__le__" | "__gt__" | "__ge__" | "__hash__" | "__repr__"
+    );
+    if common || overrides.contains(&attr) {
+        ty
+    } else {
+        "object"
+    }
+}
+
 /// The allocation behind a heap value, the address `id()` reports for it.
 fn heap_addr(v: &Value) -> Option<usize> {
     Some(match v {

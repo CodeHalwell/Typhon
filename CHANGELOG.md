@@ -33,7 +33,9 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   `@contextmanager` and `lru_cache(n)` return a `function`.
   Slot methods are slot wrappers: `type(list.__len__)` is
   `wrapper_descriptor` (`<slot wrapper '__len__' of 'list' objects>`) and
-  `[].__len__` a `method-wrapper`.
+  `[].__len__` a `method-wrapper`; an inherited slot names the type that
+  defines it (`str.__init__` is `<slot wrapper '__init__' of 'object'
+  objects>`, `True.__add__.__qualname__` is `int.__add__`).
 - **A `plain class` with a builtin or imported base takes that base's
   constructor arguments.** `plain class Boom(Exception): pass` followed by
   `raise Boom("x")` was rejected with "expected 0, got 1", as were
@@ -57,8 +59,10 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   unconditionally at module scope and not rebound since.
   An alias exported by a sibling module (`from helper import Alias`, even
   through a chain of re-exports), a class factory's parameter base
-  (`def make(Base: type)` with `class L(Base)`) and a `defaultdict` base
-  fall back too.
+  (`def make(Base: type)` with `class L(Base)`), a base computed at
+  runtime (`class L(choose())`, or `Base = choose()` then `class L(Base)`)
+  and a `defaultdict` base fall back too, as do `bool`, `range`, `slice`
+  and `memoryview` bases, which CPython rejects.
 - **A `plain class` is called with its own `__init__`'s arguments.** A
   `plain class` (or a `class!` with a hand-written `__init__`) that also
   declared annotated fields had its call arguments type-checked against
