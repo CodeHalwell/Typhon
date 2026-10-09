@@ -4,9 +4,22 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## Unreleased — gap fixes
+## 1.0.0-beta.3 — 2026-10-09 — Python 3.15 targets & VM parity gap fixes
 
-### Changed
+Two lines of work since beta.2. CPython 3.15 joins 3.13 in CI, and a
+`[python] target` of 3.15 unlocks its new syntax and builtins; the minimum
+supported version and the default target stay at 3.13. Alongside that, a
+long run of gap passes brings `tyc run` closer to CPython (typing forms,
+ABCs, `re` flags, `itertools`, enums, async iteration, `del`, tracebacks)
+and routes more programs the VM cannot run faithfully to CPython. The one
+new error, `tyc::requires_newer_python`, fires only on code its target
+could not have run, so no program that ran correctly under beta.2 is
+newly rejected. One build change: `uv sync` is now pinned to the
+`[python] target`.
+
+### Gap fixes
+
+#### Changed
 
 - **`uv sync` is pinned to the `[python] target`.** `tyc build`, `tyc sync`,
   `tyc add` and `tyc remove` now run `uv sync --python <target>`. Previously
@@ -14,7 +27,7 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   could run a newer Python than the one the code was checked against.
   Changing the target now recreates `.venv` on the next sync.
 
-### Fixed
+#### Fixed
 
 - **`typing` forms look like CPython's under `tyc run`.** `repr(typing.List)`
   is `typing.List` and `repr(Optional[int])` is `typing.Optional[int]`; both
@@ -409,7 +422,7 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   skipped the metaclass and the finaliser, and raised `AttributeError` for
   the traceback attributes.
 
-### Documentation
+#### Documentation
 
 - The VM docs (`docs/vm.md`, `tyc run` page, bundled skill) no longer say
   generators are eager and `send()` is unsupported. Generators have been
@@ -423,7 +436,7 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   already parallelise. Four comments pointing at moved review files are
   fixed.
 
-## Unreleased — Python 3.15 support
+### Python 3.15 support
 
 CPython 3.15 joins 3.13 in CI as an interpreter for emitted code, and a
 `[python] target` of 3.15 now unlocks 3.15's new syntax and builtins. The
@@ -432,7 +445,7 @@ so no emitted program changes. The one new error,
 `tyc::requires_newer_python`, fires only on code its target could not have
 run.
 
-### Added
+#### Added
 
 - **`tyc::requires_newer_python` (error).** `tyc check`, `build`, `run` and
   the editor now reject syntax and builtins newer than `[python] target`.
@@ -489,7 +502,7 @@ run.
   (PEP 800), and 3.13's `ReadOnly`, so programs using them no longer fall
   back to CPython.
 
-### Fixed
+#### Fixed
 
 - **`{**d for d in ds}` emitted a set comprehension.** The printer dropped
   the `**` of a keyless dict comprehension, so the 3.15 build wrote
@@ -520,7 +533,7 @@ run.
   only a newer versioned interpreter fell through to whatever `python3`
   was.
 
-### Testing / CI
+#### Testing / CI
 
 - Two new jobs run existing gates under CPython 3.15:
   `differential-py315` (the VM ↔ CPython differential over `examples/`,

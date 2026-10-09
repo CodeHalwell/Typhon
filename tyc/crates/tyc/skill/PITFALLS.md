@@ -4,7 +4,7 @@ The errors and surprises that bite people who try to write Typhon as if it were 
 
 For each entry: **trigger → diagnostic → fix**.
 
-Current release: **v1.0.0-beta.2**. Pitfalls tagged with a version annotation landed in that release. Pitfalls 61–75 are the v0.9.0 cleanup additions covering the daily-driver VM, type-checker covariance and narrowing gaps, and multi-file project support; pitfalls 76+ cover the v0.10.0–v0.12.0 VM-completeness, `enum`, and third-party-type-checking surface; pitfalls 81–82 cover the v0.14.0 `as!` checked boundary cast. Releases v1.0.0-alpha.3 → v1.0.0-alpha.5 add no new syntax (and so no new pitfall categories); alpha.5's `tyc::perf_*` / parallel advice lints are catalogued in [DIAGNOSTICS.md](DIAGNOSTICS.md) §15.
+Current release: **v1.0.0-beta.3**. Pitfalls tagged with a version annotation landed in that release. Pitfalls 61–75 are the v0.9.0 cleanup additions covering the daily-driver VM, type-checker covariance and narrowing gaps, and multi-file project support; pitfalls 76+ cover the v0.10.0–v0.12.0 VM-completeness, `enum`, and third-party-type-checking surface; pitfalls 81–82 cover the v0.14.0 `as!` checked boundary cast. Releases v1.0.0-alpha.3 → v1.0.0-alpha.5 add no new syntax (and so no new pitfall categories); alpha.5's `tyc::perf_*` / parallel advice lints are catalogued in [DIAGNOSTICS.md](DIAGNOSTICS.md) §15.
 
 ---
 
@@ -203,18 +203,18 @@ Python's event loop holds **weak** refs to tasks. A fire-and-forget task whose h
 
 ---
 
-## 10. `lazy from foo import bar`
+## 10. `lazy from foo import bar` before a 3.15 target
 
 ```python
 lazy from numpy import array
 ```
 
 ```
-error[tyc::lazy_usage]: `lazy from ... import ...` is rejected — `from` imports eagerly
-                       touch attributes on the source module and defeat deferral
+error[tyc::requires_newer_python]: `lazy from … import …` needs Python 3.15 (PEP 810)
+                                   and the project targets 3.13
 ```
 
-**Fix:** `lazy import np = numpy`, then `np.array(...)`.
+**Fix:** `lazy import np = numpy`, then `np.array(...)` — or set `[python] target = "3.15"`.
 
 ---
 
