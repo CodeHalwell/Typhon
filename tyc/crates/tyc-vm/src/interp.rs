@@ -6246,13 +6246,16 @@ impl Interpreter {
         // Dataclass `__post_init__` hook — invoked right after field
         // initialisation when the constructor is auto-generated (matching
         // dataclasses, where the generated `__init__` calls it).
+        // The generated `__init__` calls `self.__post_init__()`, so it
+        // resolves on the instance's own class — a subclass override wins
+        // when a `super().__init__()` reaches a base's constructor.
         if let Some(post) = self
-            .find_method(class, "__post_init__")
+            .find_method(&instance.class, "__post_init__")
             .filter(|_| crate::value::class_is_dataclass(class))
         {
             let owner = self
-                .method_owner(class, &post)
-                .unwrap_or_else(|| class.clone());
+                .method_owner(&instance.class, &post)
+                .unwrap_or_else(|| instance.class.clone());
             self.call_method_with_frame(
                 &post,
                 owner,
@@ -6310,14 +6313,15 @@ impl Interpreter {
             "__eq__" => ("__eq__", "__typhon_dc_eq__"),
             _ => return None,
         };
-        let generated = class_mro(class)
+        let provider = class_mro(class)
             .find(|c| {
                 c.methods.borrow().contains_key(attr)
                     || (crate::value::generates_dataclass(c)
                         && crate::value::class_flag(c, flag, true))
             })
-            .is_some_and(|c| !c.methods.borrow().contains_key(attr));
-        if !generated || self.find_method(class, attr).is_some() {
+            .filter(|c| !c.methods.borrow().contains_key(attr))?
+            .clone();
+        if self.find_method(class, attr).is_some() {
             return None;
         }
         let not_implemented = self.builtin_globals.get("NotImplemented").cloned();
@@ -6326,8 +6330,30 @@ impl Interpreter {
             let Some(this) = receiver.clone().or_else(|| args.next()) else {
                 return Err(type_error(format!("{name}() needs an argument")));
             };
+            // This exact method, not whatever `repr()` / `==` would dispatch
+            // to on a subclass: it reads `provider`'s declared fields only.
+            let field = |inst: &crate::value::Instance, name: &str| -> Result<Value, Unwind> {
+                inst.fields.borrow().get(name).cloned().ok_or_else(|| {
+                    attribute_error(format!(
+                        "'{}' object has no attribute '{}'",
+                        inst.class.name, name
+                    ))
+                })
+            };
             if name == "__repr__" {
-                return Ok(Value::Str(Rc::new(interp.repr_of(&this)?)));
+                let Value::Instance(inst) = &this else {
+                    return Ok(Value::Str(Rc::new(interp.repr_of(&this)?)));
+                };
+                let mut parts = Vec::with_capacity(provider.fields.len());
+                for f in &provider.fields {
+                    let v = field(inst, &f.name)?;
+                    parts.push(format!("{}={}", f.name, interp.repr_of(&v)?));
+                }
+                return Ok(Value::Str(Rc::new(format!(
+                    "{}({})",
+                    inst.class.effective_qualname(),
+                    parts.join(", ")
+                ))));
             }
             let Some(other) = args.next() else {
                 return Err(type_error("expected 1 argument, got 0".to_owned()));
@@ -6337,7 +6363,13 @@ impl Interpreter {
             // `NotImplemented`, so `==` tries the other side.
             match (&this, &other) {
                 (Value::Instance(a), Value::Instance(b)) if Rc::ptr_eq(&a.class, &b.class) => {
-                    Ok(Value::Bool(interp.values_equal(&this, &other)?))
+                    for f in &provider.fields {
+                        let (x, y) = (field(a, &f.name)?, field(b, &f.name)?);
+                        if !interp.values_equal(&x, &y)? {
+                            return Ok(Value::Bool(false));
+                        }
+                    }
+                    Ok(Value::Bool(true))
                 }
                 _ => Ok(not_implemented.clone().unwrap_or(Value::None)),
             }

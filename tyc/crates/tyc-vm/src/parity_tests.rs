@@ -2545,6 +2545,23 @@ plain class L(N):
     pass
 l = L()
 show(hasattr(l, "x"), repr(l), l == 3, l.__repr__(), L.__repr__(l))
+@dataclass
+plain class F:
+    a: int = 1
+    def __post_init__(self):
+        self.tag = "F"
+plain class G(F):
+    def __init__(self):
+        super().__init__(5)
+    def __post_init__(self):
+        self.tag = "G"
+    def __repr__(self):
+        return "G!" + F.__repr__(self)
+    def __eq__(self, other):
+        return F.__eq__(self, other)
+g, g2 = G(), G()
+g2.extra = 1
+show(g.a, g.tag, repr(g), g == g2, F.__eq__(g, g2), F(1) == F(1), F.__eq__(F(1), F(2)))
 "#,
     );
 }
