@@ -10119,6 +10119,10 @@ fn count_bindings(body: &[Stmt], module_only: bool) -> HashMap<String, usize> {
         module_only: bool,
         /// Function, class and lambda bodies around the binding.
         depth: usize,
+        /// The next body walked is a `def` / `class` body. Its header
+        /// (decorators, defaults, annotations, bases) runs in the
+        /// enclosing scope, so the depth rises only for the body.
+        scope_body: bool,
     }
     impl Count {
         fn bump(&mut self, name: &str) {
@@ -10157,8 +10161,13 @@ fn count_bindings(body: &[Stmt], module_only: bool) -> HashMap<String, usize> {
                 }
                 _ => {}
             }
-            self.depth += usize::from(scope);
+            self.scope_body = scope;
             visitor::walk_stmt(self, stmt);
+        }
+        fn visit_body(&mut self, body: &'a [Stmt]) {
+            let scope = std::mem::take(&mut self.scope_body);
+            self.depth += usize::from(scope);
+            visitor::walk_body(self, body);
             self.depth -= usize::from(scope);
         }
         fn visit_expr(&mut self, expr: &'a Expr) {
@@ -29670,6 +29679,16 @@ def main() -> None:
 ",
             "\
 object = Exception
+
+plain class Boom(object):
+    pass
+
+def main() -> None:
+    print(Boom(\"x\"))
+",
+            "\
+def f(x: object = (object := Exception)) -> None:
+    print(x)
 
 plain class Boom(object):
     pass

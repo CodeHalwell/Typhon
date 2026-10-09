@@ -64,7 +64,8 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   (`def make(Base: type)` with `class L(Base)`), a base computed at
   runtime (`class L(choose())`, `Base = choose()` or `Base = bases[0]`
   then `class L(Base)`, a loop or unpacking target, an attribute of
-  anything but a module or class such as `h.base`) and a `defaultdict`,
+  anything but a module or class such as `h.base`, or a sibling module's
+  computed alias) and a `defaultdict`,
   `frozendict` or `sentinel` base fall back too, as do `bool`, `range`,
   `slice` and `memoryview` bases, which CPython rejects. When two modules
   export one alias name for different builtins, the scan assumes the one

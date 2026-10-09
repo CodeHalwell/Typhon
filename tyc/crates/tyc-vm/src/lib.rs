@@ -1145,6 +1145,9 @@ fn scan_builtin_subclasses(
         /// scope: the receivers of an attribute base the scan trusts
         /// (`models.Model`, `Outer.Inner`).
         namespaces: std::collections::HashSet<String>,
+        /// Module-scope names bound to a computed value, which a sibling
+        /// may import.
+        exported_computed: std::collections::HashSet<String>,
         /// Builtin aliases the project's other modules export.
         project: std::collections::HashMap<String, String>,
         /// Only collect `builtin`; report nothing.
@@ -1212,6 +1215,9 @@ fn scan_builtin_subclasses(
                 .filter_map(|b| self.builtin_base(b))
                 .find(|b| !(is_enum && ENUM_MIXINS.contains(&b.as_str())));
             if let Some(b) = builtin {
+                if b == COMPUTED {
+                    return Some("a class whose base is computed at runtime".to_owned());
+                }
                 return Some(format!("a subclass of the builtin {b}"));
             }
             // `def make(Base: type) -> type: class L(Base)` may be handed
@@ -1372,6 +1378,9 @@ fn scan_builtin_subclasses(
                             self.alias_param(t, value);
                             if computed {
                                 self.computed.insert(t.to_owned());
+                                if self.depth == 0 {
+                                    self.exported_computed.insert(t.to_owned());
+                                }
                             }
                             self.unbind(t);
                             if let Some(b) = &builtin {
@@ -1395,6 +1404,9 @@ fn scan_builtin_subclasses(
                         }
                         if builtin.is_none() && a.value.as_deref().is_some_and(Self::is_computed) {
                             self.computed.insert(t.to_owned());
+                        }
+                        if self.depth == 0 && self.computed.contains(t) {
+                            self.exported_computed.insert(t.to_owned());
                         }
                         self.unbind(t);
                         if let Some(b) = builtin {
@@ -1473,8 +1485,18 @@ fn scan_builtin_subclasses(
     // Typhon-lowered `enum` declaration.
     scan.enum_modules.insert("enum".to_owned());
     scan.visit_body(&module.body);
-    (scan.found, scan.builtin)
+    // A module-scope `Alias = list if c else dict` is exported too, so
+    // `helper.Alias` in a sibling falls back.
+    let mut exported = scan.builtin;
+    for name in scan.exported_computed {
+        exported.entry(name).or_insert_with(|| COMPUTED.to_owned());
+    }
+    (scan.found, exported)
 }
+
+/// The builtin an exported alias stands for when its value is computed at
+/// runtime (`Alias = choose()`).
+const COMPUTED: &str = "<computed>";
 
 /// Whether `module` defines a generator whose `yield` sits where the
 /// tree-walk cannot suspend (a loop test, a `with` item, two yields in one
