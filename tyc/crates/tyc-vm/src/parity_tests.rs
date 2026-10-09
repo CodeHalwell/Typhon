@@ -2176,6 +2176,9 @@ def _named() -> int:
     return 0
 _named.__qualname__ = c
 show(_named.__qualname__ is c, c.__str__() is c, c.__format__("") is c, c.__format__("5") is c, c.__format__("20") is c)
+show("{k}".format_map({"k": c}) is c, "{k:3}".format_map({"k": c}) is c, "{k:30}".format_map({"k": c}) is c)
+_he = "he"
+show(("he" + "llo") is "hello", ("a b" + " c") is "a b c", ("ab" * 3) is "ababab", (2 * "xy" + "!") is "xyxy!", ("x" * 4096) is ("x" * 4096), ("x" * 4097) is ("x" * 4097), (_he + "llo") is "hello")
 show((5).__format__("03"), (2.5).__format__(".1f"), [1].__format__(""))
 for _bad in (lambda: c.__format__(1), lambda: (5).__format__(), lambda: c.__format__("a", "b")):
     try:

@@ -3711,6 +3711,13 @@ impl Interpreter {
                 }
             }),
             Expr::BinOp(b) => {
+                // CPython folds `"he" + "llo"` and `"ab" * 3` into one
+                // constant of the module, so the result is that constant.
+                if matches!(b.op, Operator::Add | Operator::Mult) && literal_only(expr) {
+                    if let Some(text) = folded_str(expr) {
+                        return Ok(Value::Str(self.str_constant(&text)));
+                    }
+                }
                 let left = self.eval_expr(&b.left, env)?;
                 let right = self.eval_expr(&b.right, env)?;
                 self.binop(&left, b.op, &right)
@@ -14789,6 +14796,51 @@ fn erange_message() -> String {
         }
     }
     "Result too large".to_owned()
+}
+
+/// The `str` CPython's AST optimiser folds `expr` into, when it is built
+/// only from string literals by `+` and by `*` with an int literal (a
+/// repeat whose result exceeds 4096 characters is left to run time).
+fn folded_str(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::StringLiteral(s) => Some(s.value.to_str().to_owned()),
+        Expr::BinOp(b) if matches!(b.op, Operator::Add) => {
+            let mut left = folded_str(&b.left)?;
+            left.push_str(&folded_str(&b.right)?);
+            Some(left)
+        }
+        Expr::BinOp(b) if matches!(b.op, Operator::Mult) => {
+            let count = |e: &Expr| match e {
+                Expr::NumberLiteral(n) => match &n.value {
+                    Number::Int(i) => i.as_i64(),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let (text, n) = match (folded_str(&b.left), count(&b.right)) {
+                (Some(t), Some(n)) => (t, n),
+                _ => (folded_str(&b.right)?, count(&b.left)?),
+            };
+            let n = usize::try_from(n.max(0)).ok()?;
+            if text.chars().count().checked_mul(n)? > 4096 {
+                return None;
+            }
+            Some(text.repeat(n))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `expr` is made only of literals and `+` / `*`, so that
+/// [`folded_str`] is worth trying (it allocates; this does not).
+fn literal_only(expr: &Expr) -> bool {
+    match expr {
+        Expr::StringLiteral(_) | Expr::NumberLiteral(_) => true,
+        Expr::BinOp(b) if matches!(b.op, Operator::Add | Operator::Mult) => {
+            literal_only(&b.left) && literal_only(&b.right)
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]

@@ -11149,7 +11149,16 @@ fn str_method(
                     _ => None,
                 })
                 .collect();
-            return str_format(interp, s, &[], &kwargs);
+            let out = str_format(interp, s, &[], &kwargs)?;
+            // As for `format`: a sole field hands back an unchanged `str`.
+            if let (Value::Str(text), Some(Value::Str(arg))) =
+                (&out, sole_format_field(s, &[], &kwargs))
+            {
+                if **text == **arg {
+                    return Ok(Value::Str(arg.clone()));
+                }
+            }
+            return Ok(out);
         }
         "encode" => {
             // Keywords arrive as a trailing sentinel (see `splitlines`).
