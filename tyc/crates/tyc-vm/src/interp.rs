@@ -5419,6 +5419,14 @@ impl Interpreter {
         env: &EnvRef,
     ) -> Result<Value, Unwind> {
         let (owner, self_val) = self.super_target(sup, env)?;
+        // A generated dataclass method the lookup would otherwise skip.
+        if matches!(self_val, Value::Instance(_)) {
+            if let Some(dc) = super_generated(&owner, &self_val, attr) {
+                if let Some(m) = self.generated_dunder(&dc, attr, Some(self_val.clone())) {
+                    return Ok(m);
+                }
+            }
+        }
         let Some((found_in, member)) = self.super_lookup(&owner, &self_val, attr) else {
             return Err(attribute_error(format!(
                 "'super' object has no attribute '{attr}'"
@@ -6302,7 +6310,7 @@ impl Interpreter {
             // A builtin function (`os.getcwd` stored on a class) is not a
             // descriptor, so it never binds as a method.
             Some((_, ClassMember::Method(f) | ClassMember::Attr(Value::Function(f))))
-                if f.c_builtin.get() =>
+                if f.c_builtin.get() && !f.is_classmethod =>
             {
                 None
             }
@@ -6335,13 +6343,16 @@ impl Interpreter {
             "__eq__" => ("__eq__", "__typhon_dc_eq__"),
             _ => return None,
         };
+        let defines = |c: &Rc<Class>| {
+            c.methods.borrow().contains_key(attr) || c.class_attrs.borrow().contains_key(attr)
+        };
         let provider = class_mro(class)
             .find(|c| {
-                c.methods.borrow().contains_key(attr)
+                defines(c)
                     || (crate::value::generates_dataclass(c)
                         && crate::value::class_flag(c, flag, true))
             })
-            .filter(|c| !c.methods.borrow().contains_key(attr))?
+            .filter(|c| !defines(c))?
             .clone();
         if self.find_method(class, attr).is_some() {
             return None;
@@ -8285,13 +8296,18 @@ impl Interpreter {
                 // CPython: reading it through an instance binds `self`. This
                 // is how cross-module `extend Foo:` methods (lowered to
                 // `Foo.m = __typhon_extend_Foo__m`) dispatch.
+                // A dataclass's generated method hides an inherited one,
+                // whether the base bound it with `def` or as an attribute.
+                if let Some(m) = self.generated_dunder(&inst.class, attr, Some(value.clone())) {
+                    return Ok(m);
+                }
                 let class_attr = class_attr_via_mro(&inst.class, attr);
                 if let Some(v) = class_attr {
                     if !is_enum_sentinel(attr) {
                         if let Value::Function(f) = &v {
                             // `@staticmethod` extension, or a builtin
                             // function (not a descriptor): no receiver bound.
-                            if f.is_static || f.c_builtin.get() {
+                            if f.is_static || (f.c_builtin.get() && !f.is_classmethod) {
                                 return Ok(Value::Function(f.clone()));
                             }
                             let receiver = if f.is_classmethod {
@@ -8311,9 +8327,6 @@ impl Interpreter {
                         }
                         return Ok(v);
                     }
-                }
-                if let Some(m) = self.generated_dunder(&inst.class, attr, Some(value.clone())) {
-                    return Ok(m);
                 }
                 // Last resort: a user `__getattr__(self, name)` resolves
                 // otherwise-missing attributes (CPython protocol).
@@ -11776,14 +11789,17 @@ fn super_generated(owner: &Rc<Class>, obj: &Value, name: &str) -> Option<Rc<Clas
         _ => return None,
     };
     let mro = super_mro(owner, obj);
+    let defines = |c: &Rc<Class>| {
+        c.methods.borrow().contains_key(name) || c.class_attrs.borrow().contains_key(name)
+    };
     let generated = mro.iter().find(|c| {
-        c.methods.borrow().contains_key(name)
+        defines(c)
             || (crate::value::generates_dataclass(c) && crate::value::class_flag(c, flag, true))
     })?;
-    if generated.methods.borrow().contains_key(name) {
+    if defines(generated) {
         return None;
     }
-    match mro.iter().find(|c| c.methods.borrow().contains_key(name)) {
+    match mro.iter().find(|c| defines(c)) {
         Some(defined) if !dataclass_shadows_in(mro.iter(), defined, name) => None,
         _ => Some(generated.clone()),
     }

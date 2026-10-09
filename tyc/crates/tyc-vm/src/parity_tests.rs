@@ -2594,6 +2594,23 @@ plain class S(P):
     def __eq__(self, other):
         return super().__eq__(other)
 show(repr(S()), S() == S(), S() == S(7), S() == 3)
+plain class S2(P):
+    def __repr__(self):
+        m = super().__repr__
+        return "S2:" + m()
+    def __init__(self):
+        init = super().__init__
+        init(6)
+show(repr(S2()), S2().y)
+def _old_repr(self):
+    return "OLD"
+plain class Base2:
+    pass
+Base2.__repr__ = _old_repr
+@dataclass
+plain class D2(Base2):
+    a: int = 1
+show(repr(Base2()), repr(D2()), getattr(D2(), "__repr__")(), D2.__repr__(D2()))
 plain class J2(H):
     def __post_init__(self):
         self.hooked = True
@@ -2625,6 +2642,14 @@ plain class Holder:
 h = Holder()
 show(h.get() == os.getcwd(), h.cwd() == os.getcwd(), h.add(1, 2), Holder.add(3, 4), h.find([1, 2, 3], 2))
 show(type(h.add).__name__, type(Holder.add).__name__)
+plain class C:
+    f = classmethod(os.getcwd)
+for call in (lambda: C.f(), lambda: C().f()):
+    try:
+        call()
+        show("ok")
+    except TypeError:
+        show("TypeError")
 "#,
     );
 }
