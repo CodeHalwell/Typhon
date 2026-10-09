@@ -16,6 +16,37 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ### Fixed
 
+- **Modules have a `__name__` under `tyc run`.** `json.__name__` raised
+  `AttributeError`; every module now reports its import name, as in CPython.
+- **Shim functions that CPython writes in C report as builtins under `tyc run`.**
+  `os.getcwd`, `operator.add`, `bisect.bisect_left`, `csv.reader`,
+  `time.strftime`, `itertools.tee` and their siblings are
+  `builtin_function_or_method` and print as `<built-in function …>`. Each
+  had been a plain `function`. This follows a per-export table of CPython 3.13.
+  `os.walk`, `os.makedirs` and other exports that CPython writes in Python
+  stay `function`. Like CPython's builtins, they no longer bind `self` when
+  stored on a class and read through an instance (`cwd = os.getcwd` makes
+  `self.cwd()` work).
+- **A `class` over a plain base takes its generated dataclass methods under
+  `tyc run`.** `class K(Base)` with a `plain class Base` that defines
+  `__init__`, `__repr__` or `__eq__` now uses the `@dataclass` versions, as
+  CPython does: `repr(K())` is `K()`, and `K(5)` binds the dataclass's
+  fields. Before, the VM inherited the base's methods. The generated
+  `__init__` / `__repr__` / `__eq__` are also readable as attributes
+  (`k.__repr__()`, `K.__eq__(k, other)`, `K.__init__(k, 5)`), `==` and
+  `__eq__` read a field's class default when the instance has no value of
+  its own, `super().__init__(...)` / `super().__repr__()` /
+  `super().__eq__(o)` reaching a dataclass run
+  its generated methods, a plain subclass's `__post_init__` is not called
+  by a hook-less inherited constructor, and a `class!` subclass of a dataclass reprs
+  with that dataclass's fields (`M(y=2)`, not `M()`).
+- **`module.__name__` no longer forces the CPython fallback.** The pre-run
+  scan now knows that every modelled module has a `__name__`.
+- **Subclasses of `Counter`, `OrderedDict`, `deque`, `ChainMap`, the
+  `User*` collections, the `datetime` classes, `StringIO`, `BytesIO` and
+  `ArgumentParser` run on CPython under `tyc run`.** The VM models these with
+  Python shims, so their subclasses kept the shim's constructor and
+  equality, where CPython's generated dataclass methods replace them.
 - **Builtin callables introspect like CPython's under `tyc run`.**
   `type(len)` and `type([].append)` are `builtin_function_or_method`,
   `type(list.append)` is `method_descriptor`, a bound method is `method`

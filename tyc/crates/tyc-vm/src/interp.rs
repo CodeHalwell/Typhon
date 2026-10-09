@@ -1675,6 +1675,7 @@ impl Interpreter {
             slot_info,
             generator,
             attrs: RefCell::new(attrs),
+            c_builtin: std::cell::Cell::new(false),
         })
     }
 
@@ -2258,6 +2259,10 @@ impl Interpreter {
         // other `__typhon_*` class attributes they never reach an instance.
         if is_dataclass {
             class_attrs.insert("__typhon_dataclass__".to_owned(), Value::Bool(true));
+            // Unlike `__typhon_dataclass__` (inherited, as CPython's
+            // `is_dataclass` is), this one marks the level that `@dataclass`
+            // itself decorated and so generated methods for.
+            class_attrs.insert("__typhon_dc_own__".to_owned(), Value::Bool(true));
         }
         if is_pydantic_model {
             class_attrs.insert("__typhon_pydantic_model__".to_owned(), Value::Bool(true));
@@ -2287,6 +2292,7 @@ impl Interpreter {
                 ("slots", "__typhon_dc_slots__"),
                 ("order", "__typhon_dc_order__"),
                 ("repr", "__typhon_dc_repr__"),
+                ("init", "__typhon_dc_init__"),
             ] {
                 if let Some(flag) = dataclass_option(&c.decorator_list, option) {
                     class_attrs.insert(marker.to_owned(), Value::Bool(flag));
@@ -3893,6 +3899,7 @@ impl Interpreter {
                     slot_info,
                     generator,
                     attrs: RefCell::new(HashMap::new()),
+                    c_builtin: std::cell::Cell::new(false),
                 };
                 Ok(Value::Function(Rc::new(func)))
             }
@@ -4651,14 +4658,14 @@ impl Interpreter {
                     // The generated dataclass `__hash__` is
                     // `hash((self.f1, self.f2, …))`.
                     crate::value::HashMode::Fields => {
-                        let vals: Vec<Value> = {
-                            let fields = inst.fields.borrow();
-                            inst.class
-                                .fields
-                                .iter()
-                                .filter_map(|f| fields.get(&f.name).cloned())
-                                .collect()
-                        };
+                        // `self.f` falls back to the class default, as in
+                        // the generated `__eq__`, so equal objects hash alike.
+                        let vals: Vec<Value> = inst
+                            .class
+                            .fields
+                            .iter()
+                            .filter_map(|f| crate::value::dataclass_field_value(inst, f))
+                            .collect();
                         let mut hs = Vec::with_capacity(vals.len());
                         for x in &vals {
                             hs.push(self.hash_value(x)?);
@@ -5388,20 +5395,7 @@ impl Interpreter {
         obj: &Value,
         attr: &str,
     ) -> Option<(Rc<Class>, ClassMember)> {
-        let ty = match obj {
-            Value::Instance(i) => i.class.clone(),
-            Value::Class(c) => c.clone(),
-            _ => owner.clone(),
-        };
-        let mro: Vec<Rc<Class>> = if class_mro(&ty).any(|c| Rc::ptr_eq(c, owner)) {
-            class_mro(&ty)
-                .skip_while(|c| !Rc::ptr_eq(c, owner))
-                .skip(1)
-                .cloned()
-                .collect()
-        } else {
-            owner.mro.clone()
-        };
+        let mro = super_mro(owner, obj);
         for c in &mro {
             if let Some(m) = c.methods.borrow().get(attr) {
                 return Some((c.clone(), ClassMember::Method(m.clone())));
@@ -5425,6 +5419,14 @@ impl Interpreter {
         env: &EnvRef,
     ) -> Result<Value, Unwind> {
         let (owner, self_val) = self.super_target(sup, env)?;
+        // A generated dataclass method the lookup would otherwise skip.
+        if matches!(self_val, Value::Instance(_)) {
+            if let Some(dc) = super_generated(&owner, &self_val, attr) {
+                if let Some(m) = self.generated_dunder(&dc, attr, Some(self_val.clone())) {
+                    return Ok(m);
+                }
+            }
+        }
         let Some((found_in, member)) = self.super_lookup(&owner, &self_val, attr) else {
             return Err(attribute_error(format!(
                 "'super' object has no attribute '{attr}'"
@@ -5474,6 +5476,23 @@ impl Interpreter {
         env: &EnvRef,
     ) -> Result<Value, Unwind> {
         let (start_class, self_val) = self.super_target(sup, env)?;
+        // `super().__init__(...)` reaching a dataclass's generated
+        // constructor binds that dataclass's fields on the instance;
+        // `super().__repr__()` / `super().__eq__(o)` reaching a generated
+        // method run that dataclass's version.
+        if let Value::Instance(inst) = &self_val {
+            if let Some(dc) = super_generated(&start_class, &self_val, attr) {
+                if attr == "__init__" {
+                    let (args, kwargs) = self.eval_call_args(outer, env)?;
+                    self.run_generated_init(&dc, inst, args, &kwargs)?;
+                    return Ok(Value::None);
+                }
+                if let Some(method) = self.generated_dunder(&dc, attr, Some(self_val.clone())) {
+                    let (args, kwargs) = self.eval_call_args(outer, env)?;
+                    return self.call_value(method, args, &kwargs);
+                }
+            }
+        }
         let found = self.super_lookup(&start_class, &self_val, attr);
         let (owner, method) = match found {
             Some((owner, ClassMember::Method(m))) => (owner, m),
@@ -6118,6 +6137,21 @@ impl Interpreter {
             }
             return Ok(Value::Instance(instance));
         }
+        self.run_generated_init(class, &instance, args, kwargs)?;
+        Ok(Value::Instance(instance))
+    }
+
+    /// The `__init__` a dataclass (or `NamedTuple` / pydantic model)
+    /// generates, run on `instance`: bind `args` / `kwargs` to `class`'s
+    /// fields, then call `__post_init__`. Shared by construction and by a
+    /// `super().__init__(...)` that reaches the generated constructor.
+    fn run_generated_init(
+        &mut self,
+        class: &Rc<Class>,
+        instance: &Rc<crate::value::Instance>,
+        args: Vec<Value>,
+        kwargs: &[(String, Value)],
+    ) -> Result<(), Unwind> {
         // Auto-generated __init__ from class fields (Typhon's dataclass
         // default). Binding errors carry the messages CPython's generated
         // `__init__` raises, in the order it checks: keyword binding, then
@@ -6226,13 +6260,24 @@ impl Interpreter {
         // Dataclass `__post_init__` hook — invoked right after field
         // initialisation when the constructor is auto-generated (matching
         // dataclasses, where the generated `__init__` calls it).
+        // The generated `__init__` calls `self.__post_init__()`, so it
+        // resolves on the instance's own class — a subclass override wins
+        // when a `super().__init__()` reaches a base's constructor.
+        // Only when the dataclass that generated this `__init__` (not a
+        // plain subclass inheriting it) has a hook to call, as the
+        // generated code includes the call only then.
+        let generator = class_mro(class)
+            .find(|c| crate::value::generates_dataclass(c))
+            .unwrap_or(class)
+            .clone();
         if let Some(post) = self
-            .find_method(class, "__post_init__")
+            .find_method(&instance.class, "__post_init__")
             .filter(|_| crate::value::class_is_dataclass(class))
+            .filter(|_| self.find_method(&generator, "__post_init__").is_some())
         {
             let owner = self
-                .method_owner(class, &post)
-                .unwrap_or_else(|| class.clone());
+                .method_owner(&instance.class, &post)
+                .unwrap_or_else(|| instance.class.clone());
             self.call_method_with_frame(
                 &post,
                 owner,
@@ -6241,7 +6286,7 @@ impl Interpreter {
                 &[],
             )?;
         }
-        Ok(Value::Instance(instance))
+        Ok(())
     }
 
     pub fn find_method(&self, class: &Rc<Class>, name: &str) -> Option<Rc<Function>> {
@@ -6261,6 +6306,14 @@ impl Interpreter {
             }
         }
         let resolved = match lookup_class_member(class, name) {
+            Some((owner, _)) if dataclass_shadows(class, &owner, name) => None,
+            // A builtin function (`os.getcwd` stored on a class) is not a
+            // descriptor, so it never binds as a method.
+            Some((_, ClassMember::Method(f) | ClassMember::Attr(Value::Function(f))))
+                if f.c_builtin.get() && !f.is_classmethod =>
+            {
+                None
+            }
             Some((_, ClassMember::Method(m))) => Some(m),
             Some((_, ClassMember::Attr(Value::Function(f)))) => Some(f),
             _ => None,
@@ -6271,6 +6324,162 @@ impl Interpreter {
             .or_default()
             .insert(name.to_owned(), resolved.clone());
         resolved
+    }
+
+    /// The `__repr__` / `__eq__` a dataclass generates, read as an attribute
+    /// (`k.__repr__()`, `K.__eq__(k, other)`). The VM renders both natively
+    /// rather than storing a function, so attribute access builds one: bound
+    /// to `receiver` when read through an instance, else taking `self`.
+    /// `None` when the class (or an ancestor's own definition) supplies it.
+    fn generated_dunder(
+        &self,
+        class: &Rc<Class>,
+        attr: &str,
+        receiver: Option<Value>,
+    ) -> Option<Value> {
+        let (name, flag): (&'static str, _) = match attr {
+            "__init__" => ("__init__", "__typhon_dc_init__"),
+            "__repr__" => ("__repr__", "__typhon_dc_repr__"),
+            "__eq__" => ("__eq__", "__typhon_dc_eq__"),
+            _ => return None,
+        };
+        let defines = |c: &Rc<Class>| {
+            c.methods.borrow().contains_key(attr) || c.class_attrs.borrow().contains_key(attr)
+        };
+        let provider = class_mro(class)
+            .find(|c| {
+                defines(c)
+                    || (crate::value::generates_dataclass(c)
+                        && crate::value::class_flag(c, flag, true))
+            })
+            .filter(|c| !defines(c))?
+            .clone();
+        if self.find_method(class, attr).is_some() {
+            return None;
+        }
+        let not_implemented = self.builtin_globals.get("NotImplemented").cloned();
+        let nf = NativeFn::new(name, move |interp, args| {
+            let qualname = || format!("{}.{name}", provider.effective_qualname());
+            if name == "__init__" {
+                let (args, kwargs) = crate::builtins::split_kwargs_pub(&args);
+                let mut args: Vec<Value> = receiver.iter().chain(args).cloned().collect();
+                if args.is_empty() {
+                    return Err(type_error(format!(
+                        "{}() missing 1 required positional argument: 'self'",
+                        qualname()
+                    )));
+                }
+                let Value::Instance(inst) = args.remove(0) else {
+                    return Err(type_error(format!(
+                        "{}() requires an instance of '{}'",
+                        qualname(),
+                        provider.name
+                    )));
+                };
+                interp.run_generated_init(&provider, &inst, args, &kwargs)?;
+                return Ok(Value::None);
+            }
+            // `self` plus, for `__eq__`, `other`: the generated methods take
+            // exactly these, positionally or by name.
+            let params: &[&str] = if name == "__eq__" {
+                &["self", "other"]
+            } else {
+                &["self"]
+            };
+            let (positional, kwargs) = crate::builtins::split_kwargs_pub(&args);
+            let positional: Vec<Value> = receiver.iter().chain(positional).cloned().collect();
+            if positional.len() > params.len() {
+                return Err(type_error(format!(
+                    "{}() takes {} positional argument{} but {} were given",
+                    qualname(),
+                    params.len(),
+                    if params.len() == 1 { "" } else { "s" },
+                    positional.len()
+                )));
+            }
+            let mut slots: Vec<Option<Value>> = vec![None; params.len()];
+            for (i, v) in positional.into_iter().enumerate() {
+                slots[i] = Some(v);
+            }
+            for (k, v) in kwargs {
+                let Some(i) = params.iter().position(|p| *p == k) else {
+                    return Err(type_error(format!(
+                        "{}() got an unexpected keyword argument '{k}'",
+                        qualname()
+                    )));
+                };
+                if slots[i].is_some() {
+                    return Err(type_error(format!(
+                        "{}() got multiple values for argument '{k}'",
+                        qualname()
+                    )));
+                }
+                slots[i] = Some(v);
+            }
+            if let Some(i) = slots.iter().position(Option::is_none) {
+                return Err(type_error(format!(
+                    "{}() missing 1 required positional argument: '{}'",
+                    qualname(),
+                    params[i]
+                )));
+            }
+            let args: Vec<Value> = slots.into_iter().flatten().collect();
+            // This exact method, not whatever `repr()` / `==` would dispatch
+            // to on a subclass: it reads `provider`'s declared fields only.
+            let field = |inst: &crate::value::Instance,
+                         f: &crate::value::ClassField|
+             -> Result<Value, Unwind> {
+                crate::value::dataclass_field_value(inst, f).ok_or_else(|| {
+                    attribute_error(format!(
+                        "'{}' object has no attribute '{}'",
+                        inst.class.name, f.name
+                    ))
+                })
+            };
+            let this = &args[0];
+            if name == "__repr__" {
+                let Value::Instance(inst) = this else {
+                    // The generated body runs on any receiver: it reads each
+                    // field as an attribute and names `type(self)`.
+                    let mut parts = Vec::with_capacity(provider.fields.len());
+                    for f in &provider.fields {
+                        let v = interp.get_attr(this, &f.name)?;
+                        parts.push(format!("{}={}", f.name, interp.repr_of(&v)?));
+                    }
+                    return Ok(Value::Str(Rc::new(format!(
+                        "{}({})",
+                        this.type_name(),
+                        parts.join(", ")
+                    ))));
+                };
+                let mut parts = Vec::with_capacity(provider.fields.len());
+                for f in &provider.fields {
+                    let v = field(inst, f)?;
+                    parts.push(format!("{}={}", f.name, interp.repr_of(&v)?));
+                }
+                return Ok(Value::Str(Rc::new(format!(
+                    "{}({})",
+                    inst.class.effective_qualname(),
+                    parts.join(", ")
+                ))));
+            }
+            // The generated `__eq__` compares field tuples, and only with an
+            // instance of the very same class; anything else is
+            // `NotImplemented`, so `==` tries the other side.
+            match (this, &args[1]) {
+                (Value::Instance(a), Value::Instance(b)) if Rc::ptr_eq(&a.class, &b.class) => {
+                    for f in &provider.fields {
+                        let (x, y) = (field(a, f)?, field(b, f)?);
+                        if !interp.values_equal(&x, &y)? {
+                            return Ok(Value::Bool(false));
+                        }
+                    }
+                    Ok(Value::Bool(true))
+                }
+                _ => Ok(not_implemented.clone().unwrap_or(Value::None)),
+            }
+        });
+        Some(Value::Native(Rc::new(nf)))
     }
 
     /// Forget every memoised method resolution — called when a class
@@ -8123,12 +8332,18 @@ impl Interpreter {
                 // CPython: reading it through an instance binds `self`. This
                 // is how cross-module `extend Foo:` methods (lowered to
                 // `Foo.m = __typhon_extend_Foo__m`) dispatch.
+                // A dataclass's generated method hides an inherited one,
+                // whether the base bound it with `def` or as an attribute.
+                if let Some(m) = self.generated_dunder(&inst.class, attr, Some(value.clone())) {
+                    return Ok(m);
+                }
                 let class_attr = class_attr_via_mro(&inst.class, attr);
                 if let Some(v) = class_attr {
                     if !is_enum_sentinel(attr) {
                         if let Value::Function(f) = &v {
-                            // `@staticmethod` extension: no receiver bound.
-                            if f.is_static {
+                            // `@staticmethod` extension, or a builtin
+                            // function (not a descriptor): no receiver bound.
+                            if f.is_static || (f.c_builtin.get() && !f.is_classmethod) {
                                 return Ok(Value::Function(f.clone()));
                             }
                             let receiver = if f.is_classmethod {
@@ -8329,7 +8544,11 @@ impl Interpreter {
                         },
                     ))));
                 }
-                match lookup_class_member(class, attr) {
+                let member = match lookup_class_member(class, attr) {
+                    Some((owner, _)) if dataclass_shadows(class, &owner, attr) => None,
+                    found => found,
+                };
+                match member {
                     Some((_, ClassMember::Attr(v))) => {
                         // A function stored as a class attribute with
                         // `@classmethod` binds the class it is read through.
@@ -8453,6 +8672,9 @@ impl Interpreter {
                         return self.get_attr(&native, attr);
                     }
                 }
+                if let Some(m) = self.generated_dunder(class, attr, None) {
+                    return Ok(m);
+                }
                 Err(attribute_error(format!(
                     "type object '{}' has no attribute '{}'",
                     class.name, attr
@@ -8496,6 +8718,10 @@ impl Interpreter {
                     if let Some(v) = m.members.borrow().get(attr).cloned() {
                         return Ok(v);
                     }
+                }
+                // Every module carries its dotted import name, as in CPython.
+                if attr == "__name__" {
+                    return Ok(Value::Str(Rc::new(m.name.clone())));
                 }
                 Err(attribute_error(format!(
                     "module '{}' has no attribute '{}'",
@@ -11569,6 +11795,88 @@ pub(crate) fn class_mro(class: &Rc<Class>) -> impl Iterator<Item = &Rc<Class>> {
 /// whether as a method or as a plain attribute. Returns that class with the
 /// binding. The VM's internal `__typhon_*` records are never found on an
 /// ancestor here (they are copied per class where they are inherited).
+/// The classes a `super()` in `owner`'s method searches for `obj`: the
+/// MRO of `obj`'s type after `owner`.
+fn super_mro(owner: &Rc<Class>, obj: &Value) -> Vec<Rc<Class>> {
+    let ty = match obj {
+        Value::Instance(i) => i.class.clone(),
+        Value::Class(c) => c.clone(),
+        _ => owner.clone(),
+    };
+    if class_mro(&ty).any(|c| Rc::ptr_eq(c, owner)) {
+        class_mro(&ty)
+            .skip_while(|c| !Rc::ptr_eq(c, owner))
+            .skip(1)
+            .cloned()
+            .collect()
+    } else {
+        owner.mro.clone()
+    }
+}
+
+/// The dataclass whose generated `__init__` a `super().__init__(...)` from
+/// `owner` reaches — one that sits before any hand-written `__init__` in
+/// the rest of the MRO (and does not hide a stdlib shim's constructor).
+fn super_generated(owner: &Rc<Class>, obj: &Value, name: &str) -> Option<Rc<Class>> {
+    let flag = match name {
+        "__init__" => "__typhon_dc_init__",
+        "__repr__" => "__typhon_dc_repr__",
+        "__eq__" => "__typhon_dc_eq__",
+        _ => return None,
+    };
+    let mro = super_mro(owner, obj);
+    let defines = |c: &Rc<Class>| {
+        c.methods.borrow().contains_key(name) || c.class_attrs.borrow().contains_key(name)
+    };
+    let generated = mro.iter().find(|c| {
+        defines(c)
+            || (crate::value::generates_dataclass(c) && crate::value::class_flag(c, flag, true))
+    })?;
+    if defines(generated) {
+        return None;
+    }
+    match mro.iter().find(|c| defines(c)) {
+        Some(defined) if !dataclass_shadows_in(mro.iter(), defined, name) => None,
+        _ => Some(generated.clone()),
+    }
+}
+
+/// Whether a dataclass between `class` and `owner` in the MRO generates
+/// `name` itself, so the inherited definition on `owner` is hidden: CPython's
+/// `@dataclass` writes `__init__` / `__repr__` / `__eq__` into the class
+/// namespace, over
+/// whatever a non-dataclass base (`Counter`, a `plain class`) defines. The
+/// VM renders that generated method natively, so the lookup reports none.
+fn dataclass_shadows(class: &Rc<Class>, owner: &Rc<Class>, name: &str) -> bool {
+    dataclass_shadows_in(class_mro(class), owner, name)
+}
+
+/// [`dataclass_shadows`] over an explicit MRO (a `super()` lookup's tail).
+fn dataclass_shadows_in<'a>(
+    mro: impl Iterator<Item = &'a Rc<Class>>,
+    owner: &Rc<Class>,
+    name: &str,
+) -> bool {
+    // A stdlib shim keeps its contents in Python-level storage that a C
+    // base holds natively (`Counter._data`): skipping its constructor would
+    // break the instance, and the generated `__eq__` would compare that
+    // storage. Only its `__repr__` is hidden; `tyc run` sends such a
+    // subclass to CPython anyway.
+    let shim_owner = !matches!(
+        owner.class_attrs.borrow().get("__typhon_module__"),
+        Some(Value::Str(m)) if !m.is_empty()
+    );
+    let flag = match name {
+        "__init__" | "__eq__" if shim_owner => return false,
+        "__init__" => "__typhon_dc_init__",
+        "__repr__" => "__typhon_dc_repr__",
+        "__eq__" => "__typhon_dc_eq__",
+        _ => return false,
+    };
+    mro.take_while(|c| !Rc::ptr_eq(c, owner))
+        .any(|c| crate::value::generates_dataclass(c) && crate::value::class_flag(c, flag, true))
+}
+
 pub(crate) fn lookup_class_member(
     class: &Rc<Class>,
     name: &str,

@@ -748,6 +748,11 @@ pub fn install(interp: &mut Interpreter) {
                 for (k, v) in md.members.borrow().iter() {
                     m.insert(HashKey::Str(Rc::new(k.clone())), v.clone());
                 }
+                // Every module namespace holds its `__name__`.
+                let key = HashKey::Str(Rc::new("__name__".to_owned()));
+                if !m.contains_key(&key) {
+                    m.insert(key, Value::Str(Rc::new(md.name.clone())));
+                }
                 Ok(Value::Dict(Rc::new(crate::value::FrozenCell::new(m))))
             }
             Some(other) => Err(type_error(format!(
@@ -3098,6 +3103,7 @@ fn mark_function(v: &Value, classmethod: bool, staticmethod: bool) -> Value {
         slot_info: f.slot_info.clone(),
         generator: f.generator,
         attrs: RefCell::new(f.attrs.borrow().clone()),
+        c_builtin: std::cell::Cell::new(f.c_builtin.get()),
     }))
 }
 
@@ -3453,6 +3459,8 @@ pub(crate) fn module_dir_names(m: &Module) -> std::collections::BTreeSet<String>
     if m.name == "sys" {
         names.insert("modules".to_owned());
     }
+    // Synthesised on read, like CPython's module `__name__`.
+    names.insert("__name__".to_owned());
     names
 }
 
@@ -3618,6 +3626,156 @@ const PY_FUNCTIONS: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// The shim-backed exports that CPython 3.13 implements in C, so the
+/// shim's Python function reports `builtin_function_or_method` (Linux
+/// `os`). `itertools`' iterators are classes in CPython and stay out.
+const C_FUNCTIONS: &[(&str, &[&str])] = &[
+    (
+        "bisect",
+        &["bisect_left", "bisect_right", "insort_left", "insort_right"],
+    ),
+    (
+        "csv",
+        &[
+            "get_dialect",
+            "list_dialects",
+            "reader",
+            "register_dialect",
+            "unregister_dialect",
+            "writer",
+        ],
+    ),
+    ("itertools", &["tee"]),
+    (
+        "operator",
+        &[
+            "abs",
+            "add",
+            "and_",
+            "call",
+            "concat",
+            "contains",
+            "countOf",
+            "delitem",
+            "eq",
+            "floordiv",
+            "ge",
+            "getitem",
+            "gt",
+            "iadd",
+            "iand",
+            "iconcat",
+            "ifloordiv",
+            "ilshift",
+            "imatmul",
+            "imod",
+            "imul",
+            "index",
+            "indexOf",
+            "inv",
+            "invert",
+            "ior",
+            "ipow",
+            "irshift",
+            "is_",
+            "is_not",
+            "isub",
+            "itruediv",
+            "ixor",
+            "le",
+            "length_hint",
+            "lshift",
+            "lt",
+            "matmul",
+            "mod",
+            "mul",
+            "ne",
+            "neg",
+            "not_",
+            "or_",
+            "pos",
+            "pow",
+            "rshift",
+            "setitem",
+            "sub",
+            "truediv",
+            "truth",
+            "xor",
+        ],
+    ),
+    (
+        "os",
+        &[
+            "_exit",
+            "abort",
+            "access",
+            "chdir",
+            "chmod",
+            "close",
+            "cpu_count",
+            "fspath",
+            "get_terminal_size",
+            "getcwd",
+            "getcwdb",
+            "getgid",
+            "getlogin",
+            "getpid",
+            "getppid",
+            "getuid",
+            "isatty",
+            "kill",
+            "listdir",
+            "lstat",
+            "mkdir",
+            "putenv",
+            "readlink",
+            "remove",
+            "rename",
+            "replace",
+            "rmdir",
+            "scandir",
+            "stat",
+            "strerror",
+            "symlink",
+            "system",
+            "truncate",
+            "umask",
+            "unlink",
+            "unsetenv",
+            "urandom",
+            "utime",
+        ],
+    ),
+    (
+        "time",
+        &[
+            "asctime",
+            "ctime",
+            "get_clock_info",
+            "gmtime",
+            "localtime",
+            "mktime",
+            "strftime",
+            "strptime",
+        ],
+    ),
+];
+
+/// Tag a shim function bound as `module.key` that CPython writes in C, per
+/// [`C_FUNCTIONS`]. Only the module's own definition (`f.name == key`), so
+/// an alias such as `bisect.bisect` follows its target.
+fn mark_c_function(module: &str, key: &str, value: &Value) {
+    if let Value::Function(f) = value {
+        if f.name == key
+            && C_FUNCTIONS
+                .iter()
+                .any(|(m, names)| *m == module && names.contains(&key))
+        {
+            f.c_builtin.set(true);
+        }
+    }
+}
+
 /// Whether CPython writes `module.name` in Python, per [`PY_FUNCTIONS`].
 fn is_python_function(module: &str, name: &str) -> bool {
     PY_FUNCTIONS
@@ -3628,6 +3786,7 @@ fn is_python_function(module: &str, name: &str) -> bool {
 fn make_module(name: &str, entries: Vec<(&str, Value)>) -> Value {
     let mut map = HashMap::new();
     for (k, v) in entries {
+        mark_c_function(name, k, &v);
         if let Value::Native(n) = &v {
             // Only a native made for this module, not one it imported
             // (`random`'s shim binds `math.sqrt` as `_sqrt`), so a C
@@ -3668,6 +3827,7 @@ fn make_module(name: &str, entries: Vec<(&str, Value)>) -> Value {
 fn make_module_env(name: &str, entries: Vec<(&str, Value)>, env: crate::env::EnvRef) -> Value {
     let mut map = HashMap::new();
     for (k, v) in entries {
+        mark_c_function(name, k, &v);
         map.insert(k.to_owned(), v);
     }
     Value::Module(Rc::new(Module {
@@ -6756,6 +6916,7 @@ fn make_time_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
     if let Value::Module(m) = &module {
         let mut members = m.members.borrow_mut();
         for (k, v) in entries {
+            mark_c_function("time", k, &v);
             members.insert(k.to_owned(), v);
         }
     }
@@ -14731,9 +14892,11 @@ pub fn call_with_kwargs(
         // Natives that unpack their keyword arguments themselves (through
         // `split_kwargs`): `math.isclose(rel_tol=, abs_tol=)`,
         // `math.nextafter(steps=)`, and the `re` functions and `Pattern`
-        // methods (`flags=`, `count=`, `maxsplit=`, `pos=`, `endpos=`).
+        // methods (`flags=`, `count=`, `maxsplit=`, `pos=`, `endpos=`), and
+        // a dataclass's generated `__init__` / `__repr__` / `__eq__` read as
+        // an attribute.
         "isclose" | "nextafter" | "compile" | "match" | "search" | "fullmatch" | "findall"
-        | "finditer" | "sub" | "subn" | "split" => {
+        | "finditer" | "sub" | "subn" | "split" | "__init__" | "__repr__" | "__eq__" => {
             let mut args = args;
             args.push(make_kwargs_sentinel(kwargs));
             (n.func)(interp, args)

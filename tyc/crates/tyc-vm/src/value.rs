@@ -2108,6 +2108,10 @@ pub struct Function {
     /// the wrapper they return (`wrapper.register = …` in `singledispatch`,
     /// `fn.cache_clear`, a test framework's markers).
     pub attrs: RefCell<HashMap<String, Value>>,
+    /// A stdlib shim function that CPython implements in C (`os.getcwd`,
+    /// `operator.add`): it reports `builtin_function_or_method` and reprs
+    /// as `<built-in function …>`. Set when its shim module is built.
+    pub c_builtin: std::cell::Cell<bool>,
 }
 
 /// How a `yield`-bearing function body is executed.
@@ -2647,6 +2651,9 @@ impl fmt::Debug for Value {
                 write!(f, "range({start}, {stop}, {step})")
             }
             Value::Native(n) => write!(f, "{}", native_value_repr(n)),
+            Value::Function(func) if func.c_builtin.get() => {
+                write!(f, "<built-in function {}>", func.name)
+            }
             Value::Function(func) => write!(f, "<function {}>", func.effective_qualname()),
             Value::BoundMethod { function, .. } => {
                 write!(f, "<bound method {}>", function.name)
@@ -2808,6 +2815,7 @@ impl Value {
                 }) => "method_descriptor",
                 _ => "builtin_function_or_method",
             },
+            Value::Function(f) if f.c_builtin.get() => "builtin_function_or_method",
             Value::Function(_) => "function",
             Value::BoundMethod { .. } => "method",
             Value::Class(_) => "type",
@@ -2913,7 +2921,8 @@ impl Value {
                         member: inst.clone(),
                     });
                 }
-                match instance_hash_mode(&inst.class) {
+                let mode = instance_hash_mode(&inst.class);
+                match mode {
                     HashMode::Unhashable => {
                         return Err(type_error(format!(
                             "unhashable type: '{}'",
@@ -2929,8 +2938,19 @@ impl Value {
                     HashMode::User(_) | HashMode::Fields => {}
                 }
                 let mut fields: Vec<(String, HashKey)> = Vec::new();
-                for (name, v) in inst.fields.borrow().iter() {
-                    fields.push((name.clone(), v.to_hash_key()?));
+                if matches!(mode, HashMode::Fields) {
+                    // The generated `__hash__` / `__eq__` read the declared
+                    // fields as `self.f` (class default included) and
+                    // ignore attributes assigned later.
+                    for f in &inst.class.fields {
+                        if let Some(v) = dataclass_field_value(inst, f) {
+                            fields.push((f.name.clone(), v.to_hash_key()?));
+                        }
+                    }
+                } else {
+                    for (name, v) in inst.fields.borrow().iter() {
+                        fields.push((name.clone(), v.to_hash_key()?));
+                    }
                 }
                 // Sort by field name so two instances with the same
                 // fields in different insertion order produce identical
@@ -3105,6 +3125,22 @@ impl Value {
                 // `__eq__`, no user `__eq__`) never equals another instance.
                 if !class_eq_by_fields(&a.class) {
                     return false;
+                }
+                // A generated dataclass `__eq__` compares its declared field
+                // tuple only, not attributes assigned later.
+                if let Some(provider) = std::iter::once(&a.class)
+                    .chain(a.class.mro.iter())
+                    .find(|c| generates_dataclass(c) && class_flag(c, "__typhon_dc_eq__", true))
+                {
+                    if !class_flag(&a.class, "__typhon_own_eq__", false) {
+                        return provider.fields.iter().all(|f| {
+                            match (dataclass_field_value(a, f), dataclass_field_value(b, f)) {
+                                (Some(v), Some(w)) => v.identical_or_equal(&w),
+                                (Option::None, Option::None) => true,
+                                _ => false,
+                            }
+                        });
+                    }
                 }
                 let fa = a.fields.borrow();
                 let fb = b.fields.borrow();
@@ -3415,6 +3451,9 @@ impl Value {
                 }
             }
             Value::Native(n) => native_value_repr(n),
+            Value::Function(func) if func.c_builtin.get() => {
+                format!("<built-in function {}>", func.name)
+            }
             Value::Function(func) => format!("<function {}>", func.effective_qualname()),
             // CPython names the class the method was found on and reprs
             // the receiver: `<bound method Path.iterdir of PosixPath('/t')>`.
@@ -3810,7 +3849,10 @@ fn instance_repr_inner(inst: &Instance) -> String {
     // `@dataclass(repr=False)` generates no `__repr__`: the nearest
     // ancestor's applies — another dataclass's (its own fields), else
     // `object.__repr__`.
+    // Likewise a `class!` / `plain class` subclass of a dataclass inherits
+    // that dataclass's `__repr__`: its fields, under the subclass's name.
     let mut repr_fields = &inst.class.fields;
+    let mut inherited_repr = false;
     if class_is_dataclass(&inst.class) && !class_flag(&inst.class, "__typhon_dc_repr__", true) {
         match inst
             .class
@@ -3821,10 +3863,25 @@ fn instance_repr_inner(inst: &Instance) -> String {
             Some(provider) => repr_fields = &provider.fields,
             None => return object_default_repr(inst),
         }
+    } else if !class_is_dataclass(&inst.class) && !class_is_pydantic_model(&inst.class) {
+        if let Some(provider) = inst
+            .class
+            .mro
+            .iter()
+            .find(|c| generates_dataclass(c) && class_flag(c, "__typhon_dc_repr__", true))
+        {
+            repr_fields = &provider.fields;
+            inherited_repr = true;
+        }
     }
     let mut parts: Vec<String> = Vec::with_capacity(fields.len());
     for cf in repr_fields {
         if let Some(v) = fields.get(&cf.name) {
+            parts.push(format!("{}={}", cf.name, v.py_repr()));
+        } else if let Some(v) = dataclass_field_value(inst, cf) {
+            // The generated `__repr__` reads `self.name`, which a subclass
+            // that never ran the dataclass `__init__` (a `class!` with its
+            // own) serves from the class default.
             parts.push(format!("{}={}", cf.name, v.py_repr()));
         }
     }
@@ -3835,6 +3892,7 @@ fn instance_repr_inner(inst: &Instance) -> String {
     // neither (a `plain class` / `class!` without a `__repr__`) gets
     // `object.__repr__`, exactly like CPython.
     if inst.class.fields.is_empty()
+        && !inherited_repr
         && !class_is_dataclass(&inst.class)
         && !class_is_pydantic_model(&inst.class)
     {
@@ -3842,7 +3900,7 @@ fn instance_repr_inner(inst: &Instance) -> String {
     }
     // A dataclass's generated `__repr__` names the class by `__qualname__`
     // (`make.<locals>.Point(x=1)`); a pydantic model by `__name__`.
-    let class_name = if class_is_dataclass(&inst.class) {
+    let class_name = if class_is_dataclass(&inst.class) || inherited_repr {
         (*inst.class.effective_qualname()).clone()
     } else {
         inst.class.name.clone()
@@ -3904,6 +3962,25 @@ pub fn class_is_pydantic_model(class: &Class) -> bool {
         .class_attrs
         .borrow()
         .contains_key("__typhon_pydantic_model__")
+}
+
+/// Whether `@dataclass` decorated `class` itself (not just an ancestor), so
+/// its generated methods live at this MRO level.
+pub fn generates_dataclass(class: &Class) -> bool {
+    class_flag(class, "__typhon_dc_own__", false)
+}
+
+/// A dataclass field read as the generated methods' `self.name` reads it:
+/// the instance's own value, else a class attribute along the MRO, else the
+/// field's declared default.
+pub fn dataclass_field_value(inst: &Instance, f: &ClassField) -> Option<Value> {
+    if let Some(v) = inst.fields.borrow().get(&f.name) {
+        return Some(v.clone());
+    }
+    std::iter::once(&inst.class)
+        .chain(inst.class.mro.iter())
+        .find_map(|c| c.class_attrs.borrow().get(&f.name).cloned())
+        .or_else(|| f.default.clone())
 }
 
 /// Whether a class is a dataclass — Typhon's default `class` (and `class …

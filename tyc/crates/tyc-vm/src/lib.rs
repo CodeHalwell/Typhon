@@ -1214,9 +1214,28 @@ fn scan_builtin_subclasses(
     ];
     const ENUM_TYPES: &[&str] = &["Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "ReprEnum"];
     /// Standard-library classes the VM builds as natives, by module, so a
-    /// subclass of one discards its base.
+    /// subclass of one discards its base; and the Python shims standing in
+    /// for stdlib classes (`Counter`, `datetime`, `StringIO`), whose
+    /// subclasses keep the shim's constructor and `__eq__` under the VM
+    /// where CPython's generated dataclass methods replace them.
     const STDLIB_NATIVES: &[(&str, &str)] = &[
         ("collections", "defaultdict"),
+        ("collections", "Counter"),
+        ("collections", "OrderedDict"),
+        ("collections", "deque"),
+        ("collections", "ChainMap"),
+        ("collections", "UserDict"),
+        ("collections", "UserList"),
+        ("collections", "UserString"),
+        ("datetime", "date"),
+        ("datetime", "datetime"),
+        ("datetime", "time"),
+        ("datetime", "timedelta"),
+        ("datetime", "timezone"),
+        ("datetime", "tzinfo"),
+        ("io", "StringIO"),
+        ("io", "BytesIO"),
+        ("argparse", "ArgumentParser"),
         ("functools", "partial"),
         ("functools", "cached_property"),
         ("enum", "auto"),
@@ -1446,6 +1465,13 @@ fn scan_builtin_subclasses(
                             // A native constructor too, not a class.
                             Some(m) if stdlib_native(m, name) => {
                                 self.builtin.insert(bound, name.to_owned());
+                            }
+                            // `from collections import *` binds every one.
+                            Some(m) if name == "*" => {
+                                for (_, n) in STDLIB_NATIVES.iter().filter(|(nm, _)| *nm == m) {
+                                    self.unbind(n);
+                                    self.builtin.insert((*n).to_owned(), (*n).to_owned());
+                                }
                             }
                             // `from helper import Alias as A` for a sibling's
                             // `Alias = list`.
@@ -5231,7 +5257,7 @@ class Derived(Base):
     pass
 
 def main() -> None:
-    if str(Derived(n=1).bump) != "<bound method Base.bump of Base<1>>":
+    if str(Derived(n=1).bump) != "<bound method Base.bump of Derived(n=1)>":
         raise ValueError(f"wrong: {Derived(n=1).bump}")
     let p: Path = Path("/tmp")
     if str(p.iterdir) != "<bound method Path.iterdir of PosixPath('/tmp')>":

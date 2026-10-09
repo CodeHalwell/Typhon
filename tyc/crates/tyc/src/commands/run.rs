@@ -1769,6 +1769,13 @@ mod tests {
             ("import enum\nplain class X(enum.auto):\n    pass\n", "auto"),
             ("from typing import NewType\nplain class N(NewType):\n    pass\n", "NewType"),
             ("import typing as t\nplain class N(t.NewType):\n    pass\n", "NewType"),
+            // Shim classes whose subclasses take CPython's dataclass methods.
+            ("from collections import Counter\nclass C(Counter):\n    pass\nprint(C())\n", "Counter"),
+            ("import collections\nclass D(collections.deque):\n    pass\nprint(D())\n", "deque"),
+            ("import datetime\nclass Day(datetime.date):\n    pass\n", "date"),
+            ("from datetime import tzinfo\nplain class Tz(tzinfo):\n    pass\n", "tzinfo"),
+            ("from io import StringIO\nclass Buf(StringIO):\n    pass\n", "StringIO"),
+            ("from collections import *\nclass C(Counter):\n    pass\n", "Counter"),
         ] {
             assert_eq!(
                 scan_source(src),
@@ -2239,6 +2246,15 @@ mod tests {
         // A project module is the import scan's business, not this one's.
         assert_eq!(
             scan_source("from .sibling import thing\n\nprint(thing)\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn attribute_scan_knows_module_dunder_name() {
+        // Every module answers `__name__`, so reading it stays on the VM.
+        assert_eq!(
+            scan_source("import json\nimport os.path\nprint(json.__name__, os.path.__name__)\n"),
             None
         );
     }

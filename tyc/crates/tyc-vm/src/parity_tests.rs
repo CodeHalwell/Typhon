@@ -2486,6 +2486,196 @@ try:
     len[0]
 except TypeError as e:
     show(str(e))
+import os
+import operator
+import bisect
+import csv
+import time
+import itertools
+show(json.__name__, os.path.__name__, asyncio.__name__)
+show(vars(json).get("__name__"), "__name__" in vars(os))
+for f in [os.getcwd, operator.add, bisect.bisect, bisect.insort_left, csv.reader, time.strftime, itertools.tee]:
+    show(type(f).__name__, f.__name__, f.__qualname__, repr(f))
+show(type(os.walk).__name__, type(os.makedirs).__name__, type(os.getenv).__name__)
+"#,
+    );
+}
+
+#[test]
+fn dataclass_methods_shadow_a_plain_base() {
+    // `@dataclass` writes `__init__` / `__repr__` / `__eq__` into the
+    // subclass, over the ones a non-dataclass base defines.
+    assert_matches_cpython(
+        "dataclass_methods_shadow_a_plain_base",
+        r#"from dataclasses import dataclass
+plain class Base:
+    def __init__(self):
+        self.x = 1
+    def __repr__(self):
+        return "Base!"
+    def __eq__(self, other):
+        return True
+@dataclass(slots=True)
+plain class K(Base):
+    pass
+@dataclass(slots=True)
+plain class P(Base):
+    y: int = 2
+@dataclass(slots=True, repr=False, eq=False)
+plain class R(Base):
+    y: int = 3
+@dataclass(init=False)
+plain class Q(Base):
+    y: int = 4
+k = K()
+p = P()
+show(repr(k), repr(p), k == 3, p == 3, k == K(), p == P(), p == P(5), P(5).y)
+show([k, p], {"k": p}, str(p), repr(R()), R() == R(4), R(5).y)
+show(hasattr(k, "x"), hasattr(Q(), "x"), repr(Base()))
+show(k.__repr__(), K.__repr__(k), k.__eq__(3), K.__eq__(k, 3), k.__eq__(K()), p.__eq__(P(5)), P.__eq__(p, P()))
+plain class M(P):
+    def __init__(self):
+        super().__init__()
+        self.z = 3
+m = M()
+show(hasattr(m, "x"), m.y, m.z, repr(m), m.__repr__(), P.__repr__(m))
+@dataclass(init=False, repr=False, eq=False)
+plain class N(Base):
+    pass
+plain class L(N):
+    pass
+l = L()
+show(hasattr(l, "x"), repr(l), l == 3, l.__repr__(), L.__repr__(l))
+@dataclass
+plain class F:
+    a: int = 1
+    def __post_init__(self):
+        self.tag = "F"
+plain class G(F):
+    def __init__(self):
+        super().__init__(5)
+    def __post_init__(self):
+        self.tag = "G"
+    def __repr__(self):
+        return "G!" + F.__repr__(self)
+    def __eq__(self, other):
+        return F.__eq__(self, other)
+g, g2 = G(), G()
+g2.extra = 1
+show(g.a, g.tag, repr(g), g == g2, F.__eq__(g, g2), F(1) == F(1), F.__eq__(F(1), F(2)))
+@dataclass
+plain class H:
+    a: int = 1
+plain class J(H):
+    def __init__(self):
+        super().__init__()
+    def __post_init__(self):
+        self.hooked = True
+h1, h2 = H(), H()
+h1.extra = 1
+show(hasattr(J(), "hooked"), h1 == h2, H.__eq__(h1, h2), K() == K())
+@dataclass(init=False)
+plain class Q2:
+    y: int = 4
+    def __init__(self):
+        pass
+q2 = Q2()
+show(repr(q2), Q2.__repr__(q2), Q2.__eq__(q2, Q2()))
+q3 = Q2()
+q3.y = 4
+show(q2 == q3, q3 == q2, Q2.__eq__(q2, q3))
+Q2.y = 5
+show(repr(Q2()), Q2.__repr__(Q2()))
+@dataclass(frozen=True, init=False)
+plain class FQ:
+    y: int = 4
+    def __init__(self):
+        pass
+fq1 = FQ()
+fq2 = FQ()
+object.__setattr__(fq2, "y", 4)
+show(fq1 == fq2, hash(fq1) == hash(fq2), len({fq1, fq2}))
+@dataclass
+plain class E:
+    pass
+show(E.__repr__(42), E.__repr__("s"))
+try:
+    Q2.__repr__(42)
+except AttributeError:
+    show("AttributeError")
+p3 = P()
+P.__init__(p3, 9)
+show(p3.y, hasattr(p3, "x"))
+p3.__init__(y=8)
+show(p3.y, k.__init__() is None)
+plain class S(P):
+    def __repr__(self):
+        return "S:" + super().__repr__()
+    def __eq__(self, other):
+        return super().__eq__(other)
+show(repr(S()), S() == S(), S() == S(7), S() == 3)
+plain class S2(P):
+    def __repr__(self):
+        m = super().__repr__
+        return "S2:" + m()
+    def __init__(self):
+        init = super().__init__
+        init(6)
+show(repr(S2()), S2().y)
+def _old_repr(self):
+    return "OLD"
+plain class Base2:
+    pass
+Base2.__repr__ = _old_repr
+@dataclass
+plain class D2(Base2):
+    a: int = 1
+show(repr(Base2()), repr(D2()), getattr(D2(), "__repr__")(), D2.__repr__(D2()))
+show(D2.__repr__(self=D2()), D2.__eq__(self=D2(), other=D2(2)), D2().__eq__(other=D2()))
+for bad in (lambda: D2.__eq__(D2(), other=D2(), x=1), lambda: D2.__eq__(D2(), D2(), other=D2()), lambda: D2.__repr__(D2(), self=D2())):
+    try:
+        bad()
+    except TypeError as e:
+        show(str(e))
+plain class J2(H):
+    def __post_init__(self):
+        self.hooked = True
+show(hasattr(J2(), "hooked"), J2().a)
+for bad in (lambda: K.__eq__(k, k, 1), lambda: k.__eq__(k, 1), lambda: k.__repr__(1), lambda: K.__eq__(k), lambda: K.__repr__()):
+    try:
+        bad()
+    except TypeError as e:
+        show(str(e))
+"#,
+    );
+}
+
+#[test]
+fn c_builtins_do_not_bind_as_methods() {
+    // A builtin function is not a descriptor: stored on a class and read
+    // through an instance, it is called without `self`.
+    assert_matches_cpython(
+        "c_builtins_do_not_bind_as_methods",
+        r#"import os
+import operator
+import bisect
+plain class Holder:
+    cwd = os.getcwd
+    add = operator.add
+    find = bisect.bisect_left
+    def get(self):
+        return self.cwd()
+h = Holder()
+show(h.get() == os.getcwd(), h.cwd() == os.getcwd(), h.add(1, 2), Holder.add(3, 4), h.find([1, 2, 3], 2))
+show(type(h.add).__name__, type(Holder.add).__name__)
+plain class C:
+    f = classmethod(os.getcwd)
+for call in (lambda: C.f(), lambda: C().f()):
+    try:
+        call()
+        show("ok")
+    except TypeError:
+        show("TypeError")
 "#,
     );
 }
@@ -2548,7 +2738,7 @@ _d1 = _dq([1, [2]], maxlen=5)
 _d2 = _cp.copy(_d1)
 _d2.append(3)
 show(_d1, _d2, _d2.maxlen, _d2[1] is _d1[1])
-class _MyDq(_dq):
+plain class _MyDq(_dq):
     pass
 _d3 = _MyDq([1, 2])
 show(type(_cp.copy(_d3)).__name__, type(_d3.copy()).__name__, _cp.copy(_d3))
@@ -2595,7 +2785,7 @@ class _Red:
         return (_Red, (self.v + 1,))
 show(_cp.copy(_Red(1)).v, _cp.deepcopy(_Red(5)).v)
 from collections import ChainMap as _CM
-class _MyCM(_CM):
+plain class _MyCM(_CM):
     pass
 _cm = _MyCM({"a": 1}, {"b": 2})
 show(type(_cp.copy(_cm)).__name__, type(_cm.new_child()).__name__, type(_cm.parents).__name__, _cp.copy(_cm))
@@ -2605,7 +2795,7 @@ show(_xs, type(_xs).__module__, type("a").upper("b"), type(1).bit_length(5), has
 _dd2 = _dd(list)
 _dd2["a"].append(1)
 show(_dd.copy(_dd2), type(_dd2).copy(_dd2) == _dd.copy(_dd2), hasattr(_dd, "copy"), hasattr(property, "setter"))
-class _OD(_od):
+plain class _OD(_od):
     def __init__(self):
         super().__init__()
         self.tag = "t"

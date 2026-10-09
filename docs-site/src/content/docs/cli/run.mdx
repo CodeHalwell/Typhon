@@ -65,7 +65,7 @@ For pure-Typhon work the VM is the default. A program that imports `numpy` (or a
 
 ## Automatic fallback to CPython
 
-Before executing anything, `tyc run` scans the program's imports. If one names a module the VM does not model (`numpy`, `sqlite3`, `subprocess`, any third-party package), or the program reads a `module.attr` the VM's model of a module does not export or defines a subclass of a builtin value type or a native stdlib class (`class L(list)`, `class C(int)`, `class P(functools.partial)`; enums with a `str`, `int`, `float`, `bytes` or `complex` mixin excepted) or one whose base is computed at runtime (`class L(choose())`), it prints a `note:` naming it, builds the project and runs it under CPython, exactly as `tyc run --compile` does. Nothing half-executes on the VM first, so output and exit code are the compiled path's.
+Before executing anything, `tyc run` scans the program's imports. If one names a module the VM does not model (`numpy`, `sqlite3`, `subprocess`, any third-party package), or the program reads a `module.attr` the VM's model of a module does not export or defines a subclass of a builtin value type or a native stdlib class (`class L(list)`, `class C(int)`, `class P(functools.partial)`, `class C(Counter)`, `class D(datetime.date)`; enums with a `str`, `int`, `float`, `bytes` or `complex` mixin excepted) or one whose base is computed at runtime (`class L(choose())`), it prints a `note:` naming it, builds the project and runs it under CPython, exactly as `tyc run --compile` does. Nothing half-executes on the VM first, so output and exit code are the compiled path's.
 
 ```
 $ tyc run main.ty
