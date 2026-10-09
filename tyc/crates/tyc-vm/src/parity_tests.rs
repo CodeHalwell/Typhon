@@ -2473,6 +2473,7 @@ show(type(list.__len__).__name__, repr(list.__len__), type(xs.__len__).__name__,
 show(repr(xs.__len__).startswith("<method-wrapper '__len__' of list object at 0x"), repr(dataclasses.replace).startswith("<function replace at 0x"))
 show(repr(str.__init__), str.__init__.__qualname__, str.__init__.__objclass__ is object, repr(list.__str__), list.__format__.__qualname__, xs.__str__.__qualname__, xs.__init__.__qualname__, xs.__format__.__qualname__)
 show(True.bit_count.__qualname__, True.__add__.__qualname__, True.__and__.__qualname__, repr(list.__eq__))
+show(dataclasses.replace.__name__, dataclasses.replace.__qualname__, json.dumps.__name__, isinstance(functools.partial, type), isinstance(functools.cached_property, type), isinstance(len, type))
 import json
 import functools
 show(type(json.dumps).__name__, type(functools.reduce).__name__, type(functools.wraps).__name__, type(functools.partial).__name__, repr(functools.partial), type(functools.cached_property).__name__, repr(functools.cached_property))

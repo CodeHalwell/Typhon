@@ -8621,6 +8621,14 @@ impl Interpreter {
                 let class = n.py_method_of.get().unwrap_or_default();
                 Ok(Value::Str(Rc::from(format!("{class}.{}", n.name))))
             }
+            // A Python function carries its qualified name
+            // (`dataclasses.replace`); CPython names it `replace`.
+            Value::Native(n)
+                if (attr == "__name__" || attr == "__qualname__") && n.py_function.get() =>
+            {
+                let name = n.name.rsplit('.').next().unwrap_or(n.name);
+                Ok(Value::Str(self.intern_str(name)))
+            }
             Value::Native(n) if attr == "__name__" || attr == "__qualname__" => {
                 Ok(Value::Str(self.intern_str(n.name)))
             }

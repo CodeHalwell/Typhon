@@ -2409,6 +2409,8 @@ pub(crate) fn is_instance_of(val: &Value, cls: &Value) -> bool {
             is_builtin_type_name(n.name)
                 || crate::interp::builtin_exc_mro(n.name).is_some()
                 || is_shim_constructor_name(n.name)
+                // `functools.partial`, `enum.auto`, …: what `type()` calls a type.
+                || crate::value::native_is_type(n.name)
         }
         ("int", Value::Int(_)) => true,
         // `bool` is a subclass of `int` in CPython, so `isinstance(True, int)`

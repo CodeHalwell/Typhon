@@ -28,11 +28,13 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   `repr(defaultdict)` is `<class 'collections.defaultdict'>`. A native
   standing in for a function CPython writes in Python (`json.dumps`,
   `dataclasses.field`, taken from a per-export table of CPython 3.13) stays
-  a `function`, and `random`'s exports are
+  a `function` named without its module (`dataclasses.replace.__name__`
+  is `replace`), and `random`'s exports are
   methods of its hidden `Random()` as in CPython (`random.randint` is a
   `method` named `Random.randint`; `random.random` a builtin).
   `@contextmanager` and `lru_cache(n)` return a `function`, and
-  `functools.partial` / `cached_property` are classes
+  `functools.partial` / `cached_property` are classes (and `type`
+  instances to `isinstance`)
   (`<class 'functools.partial'>`).
   Slot methods are slot wrappers: `type(list.__len__)` is
   `wrapper_descriptor` (`<slot wrapper '__len__' of 'list' objects>`) and
