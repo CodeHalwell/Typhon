@@ -1285,6 +1285,74 @@ fn check_init_constructor_args(
     }
 }
 
+/// Arity of a call to class `name` against its hand-written `__init__`
+/// (a `plain class`, or a `class!` with its own): too many or too few
+/// arguments, an unknown keyword, or a positional-only parameter passed by
+/// name is the `TypeError` CPython raises at the call.
+fn check_init_constructor_arity(
+    c: &mut Checker,
+    name: &str,
+    pos_args: &[Expr],
+    kw_args: &[ruff_python_ast::Keyword],
+    call_span: (usize, usize),
+) {
+    let Some(info) = c
+        .find_method(name, "__init__")
+        .map(|s| s.arity_info.clone())
+    else {
+        return;
+    };
+    match check_arity_with_info(&info, pos_args, kw_args) {
+        ArityCheck::Ok => {}
+        ArityCheck::UnknownKwarg {
+            name: kw,
+            candidates,
+            span,
+        } => {
+            let suggestion = suggest_candidate(&kw, &candidates);
+            c.unknown_kwarg(name, &kw, suggestion, span);
+        }
+        ArityCheck::PositionalOnlyByKeyword { name: kw, span } => {
+            let help = format!(
+                "`{kw}` is positional-only (it is declared before `/`) — pass it by position"
+            );
+            c.unknown_kwarg(name, &kw, help, span);
+        }
+        ArityCheck::Other => {
+            let has_star = pos_args.iter().any(|e| matches!(e, Expr::Starred(_)))
+                || kw_args.iter().any(|k| k.arg.is_none());
+            let named: Vec<&str> = kw_args
+                .iter()
+                .filter_map(|k| k.arg.as_ref().map(|i| i.as_str()))
+                .collect();
+            let mut missing: Vec<String> = Vec::new();
+            if !has_star {
+                for (i, p) in info.param_names.iter().enumerate() {
+                    let required = info.required_positional.get(i).copied().unwrap_or(false);
+                    if required && i >= pos_args.len() && !named.contains(&p.as_str()) {
+                        missing.push(p.clone());
+                    }
+                }
+                for p in &info.kwonly_required {
+                    if !named.contains(&p.as_str()) {
+                        missing.push(p.clone());
+                    }
+                }
+            }
+            if !missing.is_empty() {
+                c.missing_argument(name, missing, call_span);
+            } else {
+                c.wrong_args(
+                    name,
+                    info.min_positional,
+                    pos_args.len() + named.len(),
+                    call_span,
+                );
+            }
+        }
+    }
+}
+
 /// What a call to class `name` binds its arguments to, as a field-like
 /// shape plus positional order: the fields for a generated constructor,
 /// the `__init__` parameters otherwise.
@@ -1558,8 +1626,9 @@ fn check_explicit_typearg_constructor(
                 }
             }
         }
+    } else if c.find_method(&name, "__init__").is_some() {
+        check_init_constructor_arity(c, &name, pos_args, kw_args, call_span);
     } else if c.is_plain_class(&name)
-        && c.find_method(&name, "__init__").is_none()
         && (!pos_args.is_empty() || kw_args.iter().any(|k| k.arg.is_some()))
     {
         c.wrong_args(&name, 0, pos_args.len() + kw_args.len(), call_span);
@@ -22718,14 +22787,23 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         // `__init__` is synthesised from the fields.
                         let user_init = c.find_method(&name, "__init__").is_some();
                         if c.is_plain_class(&name) {
-                            if !user_init
-                                && (!pos_args.is_empty() || kw_args.iter().any(|k| k.arg.is_some()))
+                            if user_init {
+                                check_init_constructor_arity(
+                                    c, &name, pos_args, kw_args, call_span,
+                                );
+                            } else if !pos_args.is_empty()
+                                || kw_args.iter().any(|k| k.arg.is_some())
                             {
                                 c.wrong_args(&name, 0, pos_args.len() + kw_args.len(), call_span);
                             }
                         } else if user_init && c.is_raw_class(&name) {
                             // A hand-written `__init__` on a `class!` need not
-                            // mirror the fields; leave the arity to it.
+                            // mirror the fields: its own signature governs.
+                            if !constructor_is_field_list(c, &name) {
+                                check_init_constructor_arity(
+                                    c, &name, pos_args, kw_args, call_span,
+                                );
+                            }
                         } else if !info.param_names.is_empty()
                             || !info.kwonly_names.is_empty()
                             || shape_is_authoritative

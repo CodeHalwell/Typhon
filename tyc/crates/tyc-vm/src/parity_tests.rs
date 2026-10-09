@@ -2481,6 +2481,17 @@ _pr = property(_getter)
 show(type(_pr) is property, isinstance(property, type), id(type(_pr)) == id(property), hash(type(_pr)) == hash(property))
 show(type(ValueError("x")) is ValueError, type(KeyError()) == KeyError, id(type(ValueError())) == id(ValueError))
 show(hasattr(list, "__class_getitem__"), hasattr(str, "__class_getitem__"), hasattr(dict, "__class_getitem__"))
+show(list.__module__, hasattr(dict, "__module__"), str.__module__, ValueError.__module__, int.__module__)
+from collections import deque as _dq
+import copy as _cp
+_d1 = _dq([1, [2]], maxlen=5)
+_d2 = _cp.copy(_d1)
+_d2.append(3)
+show(_d1, _d2, _d2.maxlen, _d2[1] is _d1[1])
+class _MyDq(_dq):
+    pass
+_d3 = _MyDq([1, 2])
+show(type(_cp.copy(_d3)).__name__, type(_d3.copy()).__name__, _cp.copy(_d3))
 "#,
     );
 }

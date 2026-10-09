@@ -1792,6 +1792,50 @@ fn check_rejects_arguments_that_do_not_match_init() {
 }
 
 #[test]
+fn check_rejects_calls_that_do_not_fit_the_init_arity() {
+    for call in [
+        "E()",
+        "E(\"a\", 1, 2)",
+        "E(\"a\", 1, nope=3)",
+        "R()",
+        "R(\"a\", 1)",
+        "Box[int]()",
+        "Box[int](\"lbl\", 1, 2)",
+        "Box[int](label=\"lbl\", item=1)",
+        "Box(\"lbl\")",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        scaffold(
+            tmp.path(),
+            &format!(
+                "plain class E:\n    code: int\n    def __init__(self, msg: str, code: int) -> None:\n        self.code = code\n\
+                 class! R:\n    n: int\n    def __init__(self, s: str, *, k: int = 0) -> None:\n        self.n = len(s)\n\
+                 plain class Box[T]:\n    item: T\n    def __init__(self, label: str, item: T, /) -> None:\n        self.item = item\n\
+                 x = {call}\nprint(x)\n"
+            ),
+        );
+        let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+        assert!(!out.status.success(), "`{call}` should not type-check");
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "plain class E:\n    code: int\n    def __init__(self, msg: str, code: int = 0, *rest: int, **kw: int) -> None:\n        self.code = code\n\
+         class! R:\n    n: int\n    def __init__(self, s: str, *, k: int = 0) -> None:\n        self.n = len(s)\n\
+         plain class Box[T]:\n    item: T\n    def __init__(self, label: str, item: T, /) -> None:\n        self.item = item\n\
+         let args = [1, 2]\n\
+         print(E(\"a\"), E(\"a\", 1, 2, 3, z=4), E(msg=\"a\"), E(\"a\", *args))\n\
+         print(R(\"a\"), R(s=\"a\", k=2), Box[int](\"l\", 1), Box(\"l\", 1))\n",
+    );
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(
+        out.status.success(),
+        "calls that fit `__init__` should type-check: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn build_emits_dataclass_decorator_for_class() {
     let tmp = tempfile::tempdir().unwrap();
     scaffold(tmp.path(), "class Point:\n    x: int\n    y: int\n");

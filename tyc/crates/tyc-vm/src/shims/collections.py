@@ -579,7 +579,17 @@ class deque:
         self._head = 0
 
     def copy(self):
-        return deque(self._data[self._head:], self.maxlen)
+        # CPython's `deque_copy`: a subclass is called with the items, plus
+        # the bound only when there is one.
+        items = self._data[self._head:]
+        if type(self) is deque:
+            return deque(items, self.maxlen)
+        if self.maxlen is None:
+            return type(self)(items)
+        return type(self)(items, self.maxlen)
+
+    def __copy__(self):
+        return self.copy()
 
     def count(self, x):
         return self._items().count(x)
@@ -681,9 +691,10 @@ class deque:
         raise TypeError("unhashable type: 'collections.deque'")
 
     def __repr__(self):
+        name = type(self).__name__
         if self.maxlen is None:
-            return "deque(%r)" % self._data[self._head:]
-        return "deque(%r, maxlen=%d)" % (self._data[self._head:], self.maxlen)
+            return "%s(%r)" % (name, self._data[self._head:])
+        return "%s(%r, maxlen=%d)" % (name, self._data[self._head:], self.maxlen)
 
 
 class _NamedTupleBase:

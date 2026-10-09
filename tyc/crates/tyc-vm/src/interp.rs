@@ -8537,6 +8537,15 @@ impl Interpreter {
             Value::Native(n) if attr == "__name__" || attr == "__qualname__" => {
                 Ok(Value::Str(self.intern_str(n.name)))
             }
+            // `list.__module__` / `ValueError.__module__`: every builtin type
+            // and exception lives in `builtins`.
+            Value::Native(n)
+                if attr == "__module__"
+                    && (builtin_exc_mro(n.name).is_some()
+                        || crate::builtins::is_builtin_type_name(n.name)) =>
+            {
+                Ok(Value::Str(self.intern_str("builtins")))
+            }
             // `ValueError.__mro__` / `KeyError.__bases__` — a builtin
             // exception type's place in the standard hierarchy.
             Value::Native(n)

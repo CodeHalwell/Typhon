@@ -22,7 +22,11 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   those fields, so `E("boom", 3)` with `__init__(self, msg: str, code: int)`
   and a `code: int` field was rejected with "expected `int`". The field
   check now applies only where the fields are the constructor; otherwise
-  the arguments are checked against the `__init__`'s own parameter types.
+  the arguments are checked against the `__init__`'s own parameter types,
+  and against its arity: too few or too many arguments, an unknown
+  keyword, or a positional-only parameter passed by name (the `TypeError`
+  CPython raises at the call) is now reported, explicit `Box[int](...)`
+  calls included.
 - **`copy` runs in the VM.** `tyc run` handed any program that imported
   `copy` to CPython. The VM now has `copy.copy`, `copy.deepcopy` (memo,
   cycles and shared references included), `copy.replace` and `copy.Error`,
