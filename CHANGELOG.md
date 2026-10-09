@@ -27,9 +27,9 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   origin type, and `class S(typing.Sequence[int])` subclasses
   `collections.abc.Sequence`. `Literal` keeps arguments that are equal but of
   different types (`Literal[0, False]`) and compares regardless of order.
-  Calling `List[int]()` or `Union[...]()`, or subclassing a `Union`,
-  `Optional` or `Literal`, raises CPython's `TypeError` instead of quietly
-  succeeding.
+  Nested `Literal`s flatten. Calling `List[int]()` or a special form such as
+  `Union[...]()` or `Final[int]()`, or subclassing a special form, raises
+  CPython's `TypeError` instead of quietly succeeding.
 - **`re` flags are `re.RegexFlag` members under `tyc run`.** `re.I` printed
   as `2`; it is now `re.IGNORECASE`, and `re.I | re.M` is
   `re.IGNORECASE|re.MULTILINE`. `RegexFlag` is an `IntFlag` class, so
@@ -56,7 +56,8 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   classes added with `register`. As in CPython, a structural check accepts any
   non-`None` binding of the method, descriptors included. `type()` of an ABC
   is `ABCMeta`, and `Cls.__abstractmethods__` lists the names still
-  abstract. The legacy `abstractclassmethod`, `abstractstaticmethod` and
+  abstract, fixed when the class is made and recomputed by
+  `update_abstractmethods`. The legacy `abstractclassmethod`, `abstractstaticmethod` and
   `abstractproperty` decorators now mark and wrap their targets; they had
   been identity functions.
 - **Enum classes carry their metadata under `tyc run`.** `repr(Color)` is

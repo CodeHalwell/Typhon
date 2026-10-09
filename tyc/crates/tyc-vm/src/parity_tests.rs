@@ -3194,7 +3194,17 @@ t("legacy abstract", lambda: Legacy())
 t("legacy binding", lambda: (Legacy.f(), Legacy.g(), sorted(Legacy.__abstractmethods__)))
 for mk in [lambda: typing.List[int](), lambda: typing.Union[int, str](), lambda: typing.Literal[1](), lambda: typing.Optional[int](), lambda: typing.Dict[str, int](), lambda: typing.Tuple[int](), lambda: typing.Type[int](), lambda: typing.Annotated[int, "x"](), lambda: typing.Deque[int](), lambda: typing.DefaultDict[str, int](), lambda: typing.Sequence[int]()]:
     t("alias call", mk)
-for base in [typing.Union[int, str], typing.Literal[1], typing.Optional[int]]:
+for mk in [lambda: typing.Final[int](), lambda: typing.ClassVar[int](), lambda: typing.Required[int](), lambda: typing.TypeGuard[int]()]:
+    t("special call", mk)
+lit = Literal[Literal[1, 2], 3]
+t("nested Literal", lambda: (repr(lit), typing.get_args(lit), lit == Literal[1, 2, 3]))
+plain class Later(abc.ABC):
+    pass
+Later.f = abc.abstractmethod(lambda self: 1)
+t("before update", lambda: (type(Later()).__name__, sorted(Later.__abstractmethods__)))
+abc.update_abstractmethods(Later)
+t("after update", lambda: (sorted(Later.__abstractmethods__), Later()))
+for base in [typing.Union[int, str], typing.Literal[1], typing.Optional[int], typing.Final[int], typing.ClassVar[int]]:
     try:
         plain class U(base):
             pass

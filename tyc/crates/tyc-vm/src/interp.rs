@@ -1766,12 +1766,16 @@ impl Interpreter {
                 // `class Stack(typing.List[int])` / `(Generic[T])`: a
                 // subscripted `typing` form's base is its origin (an inert
                 // form such as `Generic` is ignored below, as when bare).
-                // `Union[...]`, `Optional[...]` and `Literal[...]` have no
-                // class behind them and refuse, as CPython's do.
+                // A special form (`Union[...]`, `Literal[...]`, `Final[...]`)
+                // has no class behind it and refuses, as CPython's do.
                 let v = match v {
                     Value::Instance(inst) if inst.class.name == "_TypingAlias" => {
-                        let alias_name = inst.fields.borrow().get("_name").map(Value::py_str);
-                        if matches!(alias_name.as_deref(), Some("Union" | "Literal")) {
+                        let special = inst
+                            .fields
+                            .borrow()
+                            .get("_special")
+                            .is_some_and(Value::truthy);
+                        if special {
                             let shown = self.repr_of(&Value::Instance(inst.clone()))?;
                             return Err(type_error(format!("Cannot subclass {shown}")));
                         }
@@ -2458,6 +2462,11 @@ impl Interpreter {
                 .contains_key("__typhon_enum_base__")
         {
             self.materialise_enum_members(&class, c);
+        }
+        // `ABCMeta.__new__` fixes the abstract set when the class is made;
+        // `abc.update_abstractmethods` recomputes it.
+        if crate::builtins::is_abc_class(&class) {
+            update_abstract_set(&class);
         }
 
         self.finish_class_creation(&class, c, env)?;
@@ -6086,7 +6095,7 @@ impl Interpreter {
             return self.enum_lookup_by_value(class, args, kwargs);
         }
         if class.class_attrs.borrow().contains_key("__typhon_abc__") {
-            let missing = abstract_methods(class);
+            let missing = abstract_set(class);
             if !missing.is_empty() {
                 let quoted: Vec<String> = missing.iter().map(|m| format!("'{m}'")).collect();
                 return Err(type_error(format!(
@@ -8520,7 +8529,7 @@ impl Interpreter {
                 // `Abc.__abstractmethods__`: the names still abstract, as a
                 // frozenset (only an ABC class carries it).
                 if attr == "__abstractmethods__" && crate::builtins::is_abc_class(class) {
-                    let names: Vec<Value> = abstract_methods(class)
+                    let names: Vec<Value> = abstract_set(class)
                         .into_iter()
                         .map(|n| Value::Str(Rc::new(n)))
                         .collect();
@@ -11873,7 +11882,8 @@ fn abstract_methods(class: &Rc<Class>) -> Vec<String> {
                 continue;
             }
             let abstract_ = match lookup_class_member(class, &name) {
-                Some((_, ClassMember::Method(f))) => f
+                Some((_, ClassMember::Method(f)))
+                | Some((_, ClassMember::Attr(Value::Function(f)))) => f
                     .attrs
                     .borrow()
                     .get("__isabstractmethod__")
@@ -11892,6 +11902,28 @@ fn abstract_methods(class: &Rc<Class>) -> Vec<String> {
     }
     names.sort();
     names
+}
+
+/// The abstract-method names recorded on an ABC class when it was made
+/// (or by `update_abstractmethods`), computed afresh for a class that
+/// carries no record of its own.
+pub(crate) fn abstract_set(class: &Rc<Class>) -> Vec<String> {
+    match class.class_attrs.borrow().get("__typhon_abstract_set__") {
+        Some(Value::Tuple(names)) => names.iter().map(Value::py_str).collect(),
+        _ => abstract_methods(class),
+    }
+}
+
+/// Recompute and record `class`'s abstract-method set.
+pub(crate) fn update_abstract_set(class: &Rc<Class>) {
+    let names: Vec<Value> = abstract_methods(class)
+        .into_iter()
+        .map(|n| Value::Str(Rc::new(n)))
+        .collect();
+    class.class_attrs.borrow_mut().insert(
+        "__typhon_abstract_set__".to_owned(),
+        Value::Tuple(Rc::new(names)),
+    );
 }
 
 /// What a class namespace binds a name to: a `def` in the class body (or
@@ -12093,6 +12125,7 @@ fn is_uninherited_marker(name: &str) -> bool {
             | "__typhon_generated_init__"
             | "__typhon_doc__"
             | "__typhon_generic__"
+            | "__typhon_abstract_set__"
     ) || name.starts_with("__typhon_dc_")
 }
 

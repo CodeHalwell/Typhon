@@ -177,6 +177,9 @@ class _TypingAlias:
         self.__args__ = args
         self._callable_params = callable_params
         self.__metadata__ = ()
+        # A special form (`Union`, `Literal`, `Final`, `ClassVar`, ...) is its
+        # own origin: it can be neither instantiated nor subclassed.
+        self._special = origin is form and name not in ("Generic", "Protocol")
 
     @classmethod
     def _union_of(cls, params):
@@ -241,7 +244,7 @@ class _TypingAlias:
         return _TypingAlias._union_of((other, self))
 
     def __call__(self, *args, **kwargs):
-        if self._name in ("Union", "Literal"):
+        if self._special:
             raise TypeError("Cannot instantiate typing." + self._name)
         if self._name in ("List", "Dict", "Set", "FrozenSet", "Tuple", "Type"):
             raise TypeError(
@@ -279,7 +282,14 @@ def _typing_subscript(name, form, origin, params):
         # Deduplicate by (value, type), so `Literal[0, False]` keeps both.
         args = []
         seen = []
+        flat = []
         for p in params:
+            # `Literal[Literal[1, 2], 3]` flattens to `Literal[1, 2, 3]`.
+            if isinstance(p, _TypingAlias) and p._name == "Literal":
+                flat.extend(p.__args__)
+            else:
+                flat.append(p)
+        for p in flat:
             key = (p, type(p))
             if key not in seen:
                 seen.append(key)

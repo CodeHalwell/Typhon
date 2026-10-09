@@ -9672,7 +9672,15 @@ fn make_abc_module(interp: &mut Interpreter) -> Result<Value, Unwind> {
     ));
     entries.push((
         "update_abstractmethods",
-        identity_native("update_abstractmethods"),
+        nf("update_abstractmethods", |_, args| {
+            let cls = single(&args, "update_abstractmethods")?.clone();
+            if let Value::Class(c) = &cls {
+                if is_abc_class(c) {
+                    crate::interp::update_abstract_set(c);
+                }
+            }
+            Ok(cls)
+        }),
     ));
     Ok(make_module_env("abc", entries, env))
 }
