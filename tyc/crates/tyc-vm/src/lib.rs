@@ -1282,15 +1282,18 @@ fn scan_builtin_subclasses(
                     Expr::Attribute(a) => match attr_chain(a) {
                         // `enum ...` lowers to `enum.Enum` before the build
                         // adds the import. Below a class only nested
-                        // classes are trusted (`Outer.Inner.Base`), not a
-                        // data attribute (`Holder.box.Base`).
+                        // classes are trusted (`Outer.Mid.Inner`), not a
+                        // data attribute (`Holder.Base`, `Holder.box.Base`).
                         Some((root, mids))
                             if (self.namespaces.contains(root) || root == "enum")
                                 && !self.computed.contains(root)
                                 && !self.mutated.contains(root)
                                 && !self.params.iter().any(|p| p.contains(root))
                                 && (!self.classes.contains(root)
-                                    || mids.iter().all(|m| self.classes.contains(*m))) =>
+                                    || mids
+                                        .iter()
+                                        .chain([&a.attr.as_str()])
+                                        .all(|m| self.classes.contains(*m))) =>
                         {
                             None
                         }
@@ -1506,8 +1509,9 @@ fn runtime_bound_names(
         mutated: HashSet<String>,
         /// `Alias = Other`: trusted unless `Other` is a runtime value.
         name_aliases: Vec<(String, String)>,
-        /// `Alias = root.mid.attr`: trusted only for an import or class
-        /// `root`, and below a class only through nested classes.
+        /// `Alias = root.mid.attr` as the root and the segments after it:
+        /// trusted only for an import or class `root`, and below a class
+        /// only for nested classes.
         attr_aliases: Vec<(String, String, Vec<String>)>,
         /// Classes the module defines, in any scope.
         classes: HashSet<String>,
@@ -1546,10 +1550,15 @@ fn runtime_bound_names(
             match value {
                 Expr::Name(v) => self.name_aliases.push((t, v.id.to_string())),
                 Expr::Attribute(a) => match attr_chain(a) {
+                    // The last segment too: below a class only a nested
+                    // class is trusted.
                     Some((root, mids)) => self.attr_aliases.push((
                         t,
                         root.to_owned(),
-                        mids.into_iter().map(str::to_owned).collect(),
+                        mids.into_iter()
+                            .chain([a.attr.as_str()])
+                            .map(str::to_owned)
+                            .collect(),
                     )),
                     None => {
                         self.runtime.insert(t);

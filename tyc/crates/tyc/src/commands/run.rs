@@ -1849,6 +1849,9 @@ mod tests {
             "plain class Holder:\n    Base: type = object\nHolder.Base = list\nAlias = Holder.Base\nplain class L(Alias):\n    pass\nprint(L([1]))\n",
             // A data attribute below a class, set up at runtime.
             "plain class Box:\n    def __init__(self) -> None:\n        self.Base = list\nplain class Holder:\n    box: Box = Box()\nplain class L(Holder.box.Base):\n    pass\nprint(L([1]))\n",
+            // A class attribute computed at runtime.
+            "def choose() -> type:\n    return list\nplain class Holder:\n    Base: type = choose()\nplain class L(Holder.Base):\n    pass\nprint(L([1]))\n",
+            "def choose() -> type:\n    return list\nplain class Holder:\n    Base: type = choose()\nAlias = Holder.Base\nplain class L(Alias):\n    pass\nprint(L([1]))\n",
             // Through an alias of the class.
             "plain class Holder:\n    Base: type = object\nAlias = Holder\nAlias.Base = list\nplain class L(Holder.Base):\n    pass\nprint(L([1]))\n",
             // A data attribute below a class (the `Base: type = list` alias
