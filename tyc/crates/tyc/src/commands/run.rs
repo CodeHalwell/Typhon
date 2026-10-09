@@ -1632,6 +1632,12 @@ mod tests {
         // like one does not.
         let not_enum = "plain class FakeEnum:\n    pass\nplain class L(list, FakeEnum):\n    pass\nprint(L())\n";
         assert!(scan_source(not_enum).is_some());
+        // A parameterised base is its origin.
+        let generic = "plain class L(list[int]):\n    pass\nprint(L([1]))\n";
+        assert_eq!(
+            scan_source(generic),
+            Some(vec!["a subclass of the builtin list".to_owned()])
+        );
         // An alias of a builtin is the builtin.
         let alias = "Alias = list\nplain class L(Alias):\n    pass\nprint(L())\n";
         assert_eq!(

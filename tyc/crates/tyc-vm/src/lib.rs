@@ -1117,6 +1117,11 @@ pub fn module_subclassed_builtin(module: &ruff_python_ast::ModModule) -> Option<
             }
         }
         fn builtin_base(&self, base: &Expr) -> Option<String> {
+            // `list[int]` is a generic alias of `list`.
+            let base = match base {
+                Expr::Subscript(s) => s.value.as_ref(),
+                other => other,
+            };
             let Expr::Name(n) = base else { return None };
             let name = n.id.as_str();
             self.bindings
