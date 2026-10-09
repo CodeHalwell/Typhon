@@ -1837,6 +1837,20 @@ mod tests {
                 "{main}"
             );
         }
+        // An attribute of a namespace the module mutates is a runtime value.
+        for src in [
+            "plain class Holder:\n    Base: type = object\nHolder.Base = list\nplain class L(Holder.Base):\n    pass\nprint(L([1]))\n",
+            "plain class Holder:\n    Base: type = object\nsetattr(Holder, \"Base\", list)\nplain class L(Holder.Base):\n    pass\nprint(L([1]))\n",
+            "plain class Holder:\n    Base: type = object\nHolder.Base = list\nAlias = Holder.Base\nplain class L(Alias):\n    pass\nprint(L([1]))\n",
+        ] {
+            assert!(
+                scan_source(src)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|r| r.contains("computed at runtime")),
+                "{src}"
+            );
+        }
         // A sibling's name bound in a definition header (which runs at
         // module scope) or through `global` is exported too.
         for helper in [

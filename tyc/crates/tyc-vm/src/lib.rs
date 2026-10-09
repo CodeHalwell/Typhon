@@ -1158,6 +1158,9 @@ fn scan_builtin_subclasses(
         /// scope: the receivers of an attribute base the scan trusts
         /// (`models.Model`, `Outer.Inner`).
         namespaces: std::collections::HashSet<String>,
+        /// Receivers of an attribute store, whose attributes the scan
+        /// cannot trust as bases.
+        mutated: std::collections::HashSet<String>,
         /// Module-scope names bound to a computed value, which a sibling
         /// may import.
         exported_computed: std::collections::HashSet<String>,
@@ -1263,6 +1266,7 @@ fn scan_builtin_subclasses(
                             Expr::Name(n)
                                 if (self.namespaces.contains(n.id.as_str()) || n.id == "enum")
                                     && !self.computed.contains(n.id.as_str())
+                                    && !self.mutated.contains(n.id.as_str())
                                     && !self.params.iter().any(|p| p.contains(n.id.as_str())) =>
                             {
                                 None
@@ -1424,12 +1428,13 @@ fn scan_builtin_subclasses(
             self.bind(stmt);
         }
     }
-    let (computed, exported_computed) = runtime_bound_names(module);
+    let (computed, exported_computed, mutated) = runtime_bound_names(module);
     let mut scan = Scan {
         project: project_aliases.clone(),
         collect,
         computed,
         exported_computed,
+        mutated,
         ..Default::default()
     };
     // `enum.Enum` without an import still names the module in a
@@ -1463,6 +1468,7 @@ fn runtime_bound_names(
 ) -> (
     std::collections::HashSet<String>,
     std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
 ) {
     use ruff_python_ast::visitor::{self, Visitor};
     use ruff_python_ast::{Expr, Pattern, Stmt};
@@ -1472,6 +1478,9 @@ fn runtime_bound_names(
     struct Bindings {
         runtime: HashSet<String>,
         namespaces: HashSet<String>,
+        /// Receivers of an attribute store (`Holder.Base = list`,
+        /// `setattr(Holder, …)`), whose attributes are runtime values.
+        mutated: HashSet<String>,
         /// `Alias = Other`: trusted unless `Other` is a runtime value.
         name_aliases: Vec<(String, String)>,
         /// `Alias = root.attr`: trusted only for an import or class `root`.
@@ -1602,6 +1611,27 @@ fn runtime_bound_names(
                     self.runtime(n.id.as_str());
                 }
             }
+            // `Holder.Base = list`, `del m.x`, `setattr(Holder, "Base", list)`.
+            let receiver = match expr {
+                Expr::Attribute(a) if !matches!(a.ctx, ruff_python_ast::ExprContext::Load) => {
+                    Some(a.value.as_ref())
+                }
+                Expr::Call(c)
+                    if matches!(c.func.as_ref(), Expr::Name(f)
+                        if matches!(f.id.as_str(), "setattr" | "delattr")) =>
+                {
+                    c.arguments.args.first()
+                }
+                _ => None,
+            };
+            if let Some(mut root) = receiver {
+                while let Expr::Attribute(inner) = root {
+                    root = inner.value.as_ref();
+                }
+                if let Expr::Name(r) = root {
+                    self.mutated.insert(r.id.to_string());
+                }
+            }
             visitor::walk_expr(self, expr);
         }
         fn visit_pattern(&mut self, p: &'a Pattern) {
@@ -1637,8 +1667,9 @@ fn runtime_bound_names(
         for (t, root) in &b.attr_aliases {
             // `enum.Enum` without an import names the module in a
             // Typhon-lowered `enum` declaration.
-            let trusted =
-                (b.namespaces.contains(root) || root == "enum") && !b.runtime.contains(root);
+            let trusted = (b.namespaces.contains(root) || root == "enum")
+                && !b.runtime.contains(root)
+                && !b.mutated.contains(root);
             if !trusted && b.runtime.insert(t.clone()) {
                 changed = true;
             }
@@ -1648,7 +1679,7 @@ fn runtime_bound_names(
         }
     }
     let exported = b.runtime.intersection(&b.module_scope).cloned().collect();
-    (b.runtime, exported)
+    (b.runtime, exported, b.mutated)
 }
 
 /// Whether `module` defines a generator whose `yield` sits where the

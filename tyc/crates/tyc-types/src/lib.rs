@@ -3898,6 +3898,9 @@ struct Checker<'a> {
     object_rebound: bool,
     /// The module has a `from … import *`, which may rebind any name.
     star_import: bool,
+    /// The module's binding counts, so a local class whose name is also
+    /// bound by an import or assignment is not trusted as that class.
+    module_bindings: HashMap<String, usize>,
     /// Per-class set of attribute names assigned through `self`
     /// (`self.NAME = ...`) inside a method body but NOT declared as a
     /// class-level annotated field. Consulted by `find_field` so reads of
@@ -4270,6 +4273,7 @@ impl<'a> Checker<'a> {
             class_value_aliases: HashMap::new(),
             object_rebound: false,
             star_import: false,
+            module_bindings: HashMap::new(),
             self_attrs: HashMap::new(),
             class_var_attrs: HashMap::new(),
             unsafe_depth: 0,
@@ -8050,6 +8054,11 @@ fn class_ancestry_fully_local(c: &Checker, name: &str) -> bool {
         if n == "object" && !c.object_rebound && !c.local_classes.contains(n) {
             continue;
         }
+        // `class Parent` rebound by an import or assignment may be
+        // anything at runtime.
+        if c.local_classes.contains(n) && c.module_bindings.get(n).is_some_and(|&k| k > 1) {
+            return false;
+        }
         if !c.local_classes.contains(n) {
             // `Alias = Parent` names the local `Parent`.
             if let Some(target) = c.class_value_aliases.get(n) {
@@ -10258,8 +10267,9 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
     // exempt: multiple `impl Foo:` blocks legitimately produce multiple
     // pseudo-classes, and the merge pass handles deduplication.
     let mut seen_class_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    // `Alias = Parent`: kept only for a name the module binds nowhere else,
-    // in any scope or statement, so a rebinding never leaves it stale.
+    // `Alias = Parent`: kept only when the module binds each of the two
+    // names nowhere else, in any scope or statement, so a rebinding of
+    // either never leaves it stale.
     let bindings = count_name_bindings(body);
     c.class_value_aliases = body
         .iter()
@@ -10274,7 +10284,9 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
             },
             _ => None,
         })
-        .filter(|(t, _)| bindings.get(t.id.as_str()) == Some(&1))
+        .filter(|(t, v)| {
+            bindings.get(t.id.as_str()) == Some(&1) && bindings.get(v.id.as_str()) == Some(&1)
+        })
         .map(|(t, v)| (t.id.to_string(), v.id.to_string()))
         .collect();
     // Only a module-namespace binding shadows `object` in a module-level
@@ -10284,6 +10296,7 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
     // `from helper import *` may bind any name, `object` or a local
     // class's included.
     c.star_import = module_bindings.contains_key("*");
+    c.module_bindings = module_bindings;
     for stmt in body {
         match stmt {
             Stmt::ClassDef(cd) => {
@@ -29754,6 +29767,23 @@ plain class Boom(object):
 
 def main() -> None:
     print(Boom(\"x\"))
+",
+            "\
+plain class Parent:
+    pass
+
+from builtins import Exception as Parent
+
+Alias = Parent
+
+plain class Boom(Alias):
+    pass
+
+plain class Bang(Parent):
+    pass
+
+def main() -> None:
+    print(Boom(\"x\"), Bang(\"y\"))
 ",
             "\
 f = lambda x=(object := Exception): x

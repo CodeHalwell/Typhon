@@ -45,7 +45,8 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   `bytes` and `range` bases: the zero-argument rule for a `plain class`
   without an `__init__` now applies only when every ancestor is a class
   of the project or `object` (through a module alias such as
-  `Alias = Parent` too, when the module binds that name nowhere else; an
+  `Alias = Parent` too, when the module binds neither name anywhere else,
+  and never for a local class whose name the module also rebinds; an
   `object` base counts unless the module's own namespace rebinds `object`,
   including from a definition header, a lambda default or a store under
   `global object` (the bare declaration rebinds nothing),
@@ -69,7 +70,9 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   (`def make(Base: type)` with `class L(Base)`), a base computed at
   runtime (`class L(choose())`, `class L(h.base)`, or a name the module
   binds anywhere other than by a `class`, an import or an alias of one,
-  so `Base = choose()`, `for Base in …`, `case [Base]:`, a walrus and a
+  so `Base = choose()`, `for Base in …`, `case [Base]:`, a walrus,
+  an attribute of a class or module the program assigns to
+  (`Holder.Base = list`, `setattr`) and a
   sibling module's computed alias all count, including one it binds in a
   definition header or under `global`) and a `defaultdict`,
   `functools.partial`, `functools.cached_property`, `enum.auto`,
