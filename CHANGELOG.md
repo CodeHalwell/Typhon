@@ -36,7 +36,8 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   `raise Boom("x")` was rejected with "expected 0, got 1", as were
   `bytes` and `range` bases: the zero-argument rule for a `plain class`
   without an `__init__` now applies only when every ancestor is a class
-  of the project or `object`.
+  of the project or `object` (through a module alias such as
+  `Alias = Parent` too).
 - **A subclass of a builtin value type runs on CPython.** The VM models
   `list`, `int`, `str` and the other value types as values, not classes
   (and `enumerate`, `zip`, `property`, `classmethod`, `super`, `type` and

@@ -1708,6 +1708,7 @@ mod tests {
         for main in [
             "from helper import Alias\nplain class L(Alias):\n    pass\nprint(L())\n",
             "import helper\nplain class L(helper.Alias):\n    pass\nprint(L())\n",
+            "from helper import Alias\nAlias2 = Alias\nplain class L(Alias2):\n    pass\nprint(L())\n",
         ] {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join("helper.ty"), "Alias = list\n").unwrap();

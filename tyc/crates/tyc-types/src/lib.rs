@@ -3891,6 +3891,9 @@ struct Checker<'a> {
     /// an imported `fastapi.HTTPException` (an exception with no locally-known
     /// bases) never false-positives.
     local_classes: std::collections::HashSet<String>,
+    /// Module names bound exactly once, to a bare name (`Alias = Parent`),
+    /// so a class over `Alias` can be traced to a local `Parent`.
+    class_value_aliases: HashMap<String, String>,
     /// Per-class set of attribute names assigned through `self`
     /// (`self.NAME = ...`) inside a method body but NOT declared as a
     /// class-level annotated field. Consulted by `find_field` so reads of
@@ -4260,6 +4263,7 @@ impl<'a> Checker<'a> {
             class_parents: HashMap::new(),
             class_base_tails: HashMap::new(),
             local_classes: std::collections::HashSet::new(),
+            class_value_aliases: HashMap::new(),
             self_attrs: HashMap::new(),
             class_var_attrs: HashMap::new(),
             unsafe_depth: 0,
@@ -8038,6 +8042,11 @@ fn class_ancestry_fully_local(c: &Checker, name: &str) -> bool {
             continue;
         }
         if !c.local_classes.contains(n) {
+            // `Alias = Parent` names the local `Parent`.
+            if let Some(target) = c.class_value_aliases.get(n) {
+                stack.push(target.as_str());
+                continue;
+            }
             return false;
         }
         if let Some(parents) = c.class_parents.get(n) {
@@ -10098,6 +10107,28 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
     // exempt: multiple `impl Foo:` blocks legitimately produce multiple
     // pseudo-classes, and the merge pass handles deduplication.
     let mut seen_class_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    // `Alias = Parent`: kept only for a name bound once at module scope.
+    let mut assigned: HashMap<&str, Option<&str>> = HashMap::new();
+    for stmt in body {
+        let (targets, value): (Vec<&Expr>, Option<&Expr>) = match stmt {
+            Stmt::Assign(a) => (a.targets.iter().collect(), Some(a.value.as_ref())),
+            Stmt::AnnAssign(a) => (vec![a.target.as_ref()], a.value.as_deref()),
+            _ => continue,
+        };
+        for t in targets {
+            if let Expr::Name(t) = t {
+                let rhs = match (value, assigned.contains_key(t.id.as_str())) {
+                    (Some(Expr::Name(v)), false) => Some(v.id.as_str()),
+                    _ => None,
+                };
+                assigned.insert(t.id.as_str(), rhs);
+            }
+        }
+    }
+    c.class_value_aliases = assigned
+        .into_iter()
+        .filter_map(|(k, v)| Some((k.to_owned(), v?.to_owned())))
+        .collect();
     for stmt in body {
         match stmt {
             Stmt::ClassDef(cd) => {
@@ -29457,6 +29488,24 @@ def main() -> None:
         assert!(
             check_class_kinds(object_base).has_errors(),
             "object base takes no arguments"
+        );
+        // So is a local class reached through an alias.
+        let aliased = "\
+plain class Parent:
+    pass
+
+Alias = Parent
+
+plain class Child(Alias):
+    pass
+
+def main() -> None:
+    let a: Child = Child(1)
+    print(a)
+";
+        assert!(
+            check_class_kinds(aliased).has_errors(),
+            "aliased local base takes no arguments"
         );
     }
 

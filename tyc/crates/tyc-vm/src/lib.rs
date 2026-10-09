@@ -1139,12 +1139,13 @@ fn scan_builtin_subclasses(
             }
             let Expr::Name(n) = base else { return None };
             self.name_builtin(n.id.as_str())
-                .or_else(|| self.project.get(n.id.as_str()).cloned())
         }
-        /// The builtin value type `name` stands for, directly or as an alias.
+        /// The builtin value type `name` stands for, directly, as an alias
+        /// or as one a sibling module exports.
         fn name_builtin(&self, name: &str) -> Option<String> {
             self.builtin
                 .get(name)
+                .or_else(|| self.project.get(name))
                 .cloned()
                 .or_else(|| VALUE_TYPES.contains(&name).then(|| name.to_owned()))
         }
