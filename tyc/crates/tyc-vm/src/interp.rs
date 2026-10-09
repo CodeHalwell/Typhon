@@ -6312,6 +6312,7 @@ impl Interpreter {
         receiver: Option<Value>,
     ) -> Option<Value> {
         let (name, flag): (&'static str, _) = match attr {
+            "__init__" => ("__init__", "__typhon_dc_init__"),
             "__repr__" => ("__repr__", "__typhon_dc_repr__"),
             "__eq__" => ("__eq__", "__typhon_dc_eq__"),
             _ => return None,
@@ -6329,32 +6330,62 @@ impl Interpreter {
         }
         let not_implemented = self.builtin_globals.get("NotImplemented").cloned();
         let nf = NativeFn::new(name, move |interp, args| {
-            let mut args = args.into_iter();
-            let Some(this) = receiver.clone().or_else(|| args.next()) else {
-                return Err(type_error(format!("{name}() needs an argument")));
-            };
+            let qualname = || format!("{}.{name}", provider.effective_qualname());
+            if name == "__init__" {
+                let (args, kwargs) = crate::builtins::split_kwargs_pub(&args);
+                let mut args: Vec<Value> = receiver.iter().chain(args).cloned().collect();
+                if args.is_empty() {
+                    return Err(type_error(format!(
+                        "{}() missing 1 required positional argument: 'self'",
+                        qualname()
+                    )));
+                }
+                let Value::Instance(inst) = args.remove(0) else {
+                    return Err(type_error(format!(
+                        "{}() requires an instance of '{}'",
+                        qualname(),
+                        provider.name
+                    )));
+                };
+                interp.run_generated_init(&provider, &inst, args, &kwargs)?;
+                return Ok(Value::None);
+            }
+            // `self` plus, for `__eq__`, `other`: the generated methods take
+            // exactly these.
+            let want = if name == "__eq__" { 2 } else { 1 };
+            let args: Vec<Value> = receiver.iter().cloned().chain(args).collect();
+            if args.len() != want {
+                return Err(type_error(if args.len() < want {
+                    let missing = if args.is_empty() { "self" } else { "other" };
+                    format!(
+                        "{}() missing 1 required positional argument: '{missing}'",
+                        qualname()
+                    )
+                } else {
+                    format!(
+                        "{}() takes {want} positional argument{} but {} were given",
+                        qualname(),
+                        if want == 1 { "" } else { "s" },
+                        args.len()
+                    )
+                }));
+            }
             // This exact method, not whatever `repr()` / `==` would dispatch
             // to on a subclass: it reads `provider`'s declared fields only.
-            // `self.name`: the instance's own value, else the class default.
             let field = |inst: &crate::value::Instance,
                          f: &crate::value::ClassField|
              -> Result<Value, Unwind> {
-                if let Some(v) = inst.fields.borrow().get(&f.name) {
-                    return Ok(v.clone());
-                }
-                class_mro(&inst.class)
-                    .find_map(|c| c.class_attrs.borrow().get(&f.name).cloned())
-                    .or_else(|| f.default.clone())
-                    .ok_or_else(|| {
-                        attribute_error(format!(
-                            "'{}' object has no attribute '{}'",
-                            inst.class.name, f.name
-                        ))
-                    })
+                crate::value::dataclass_field_value(inst, f).ok_or_else(|| {
+                    attribute_error(format!(
+                        "'{}' object has no attribute '{}'",
+                        inst.class.name, f.name
+                    ))
+                })
             };
+            let this = &args[0];
             if name == "__repr__" {
-                let Value::Instance(inst) = &this else {
-                    return Ok(Value::Str(Rc::new(interp.repr_of(&this)?)));
+                let Value::Instance(inst) = this else {
+                    return Ok(Value::Str(Rc::new(interp.repr_of(this)?)));
                 };
                 let mut parts = Vec::with_capacity(provider.fields.len());
                 for f in &provider.fields {
@@ -6367,13 +6398,10 @@ impl Interpreter {
                     parts.join(", ")
                 ))));
             }
-            let Some(other) = args.next() else {
-                return Err(type_error("expected 1 argument, got 0".to_owned()));
-            };
             // The generated `__eq__` compares field tuples, and only with an
             // instance of the very same class; anything else is
             // `NotImplemented`, so `==` tries the other side.
-            match (&this, &other) {
+            match (this, &args[1]) {
                 (Value::Instance(a), Value::Instance(b)) if Rc::ptr_eq(&a.class, &b.class) => {
                     for f in &provider.fields {
                         let (x, y) = (field(a, f)?, field(b, f)?);

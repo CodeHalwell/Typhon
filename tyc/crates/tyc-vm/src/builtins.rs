@@ -14887,9 +14887,10 @@ pub fn call_with_kwargs(
         // Natives that unpack their keyword arguments themselves (through
         // `split_kwargs`): `math.isclose(rel_tol=, abs_tol=)`,
         // `math.nextafter(steps=)`, and the `re` functions and `Pattern`
-        // methods (`flags=`, `count=`, `maxsplit=`, `pos=`, `endpos=`).
+        // methods (`flags=`, `count=`, `maxsplit=`, `pos=`, `endpos=`), and
+        // a dataclass's generated `__init__` read as an attribute.
         "isclose" | "nextafter" | "compile" | "match" | "search" | "fullmatch" | "findall"
-        | "finditer" | "sub" | "subn" | "split" => {
+        | "finditer" | "sub" | "subn" | "split" | "__init__" => {
             let mut args = args;
             args.push(make_kwargs_sentinel(kwargs));
             (n.func)(interp, args)

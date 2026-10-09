@@ -3114,8 +3114,6 @@ impl Value {
                 if !class_eq_by_fields(&a.class) {
                     return false;
                 }
-                let fa = a.fields.borrow();
-                let fb = b.fields.borrow();
                 // A generated dataclass `__eq__` compares its declared field
                 // tuple only, not attributes assigned later.
                 if let Some(provider) = std::iter::once(&a.class)
@@ -3124,14 +3122,16 @@ impl Value {
                 {
                     if !class_flag(&a.class, "__typhon_own_eq__", false) {
                         return provider.fields.iter().all(|f| {
-                            match (fa.get(&f.name), fb.get(&f.name)) {
-                                (Some(v), Some(w)) => v.identical_or_equal(w),
+                            match (dataclass_field_value(a, f), dataclass_field_value(b, f)) {
+                                (Some(v), Some(w)) => v.identical_or_equal(&w),
                                 (Option::None, Option::None) => true,
                                 _ => false,
                             }
                         });
                     }
                 }
+                let fa = a.fields.borrow();
+                let fb = b.fields.borrow();
                 if fa.len() != fb.len() {
                     return false;
                 }
@@ -3960,14 +3960,27 @@ pub fn class_is_pydantic_model(class: &Class) -> bool {
         .contains_key("__typhon_pydantic_model__")
 }
 
-/// Whether a class is a dataclass — Typhon's default `class` (and `class …
-/// frozen`) — as `dataclasses.is_dataclass` reports it.
 /// Whether `@dataclass` decorated `class` itself (not just an ancestor), so
 /// its generated methods live at this MRO level.
 pub fn generates_dataclass(class: &Class) -> bool {
     class_flag(class, "__typhon_dc_own__", false)
 }
 
+/// A dataclass field read as the generated methods' `self.name` reads it:
+/// the instance's own value, else a class attribute along the MRO, else the
+/// field's declared default.
+pub fn dataclass_field_value(inst: &Instance, f: &ClassField) -> Option<Value> {
+    if let Some(v) = inst.fields.borrow().get(&f.name) {
+        return Some(v.clone());
+    }
+    std::iter::once(&inst.class)
+        .chain(inst.class.mro.iter())
+        .find_map(|c| c.class_attrs.borrow().get(&f.name).cloned())
+        .or_else(|| f.default.clone())
+}
+
+/// Whether a class is a dataclass — Typhon's default `class` (and `class …
+/// frozen`) — as `dataclasses.is_dataclass` reports it.
 pub fn class_is_dataclass(class: &Class) -> bool {
     class
         .class_attrs

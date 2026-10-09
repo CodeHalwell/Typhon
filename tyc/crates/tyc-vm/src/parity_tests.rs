@@ -2580,6 +2580,19 @@ plain class Q2:
         pass
 q2 = Q2()
 show(repr(q2), Q2.__repr__(q2), Q2.__eq__(q2, Q2()))
+q3 = Q2()
+q3.y = 4
+show(q2 == q3, q3 == q2, Q2.__eq__(q2, q3))
+p3 = P()
+P.__init__(p3, 9)
+show(p3.y, hasattr(p3, "x"))
+p3.__init__(y=8)
+show(p3.y, k.__init__() is None)
+for bad in (lambda: K.__eq__(k, k, 1), lambda: k.__eq__(k, 1), lambda: k.__repr__(1), lambda: K.__eq__(k), lambda: K.__repr__()):
+    try:
+        bad()
+    except TypeError as e:
+        show(str(e))
 "#,
     );
 }

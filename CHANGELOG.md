@@ -30,8 +30,10 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   `__init__`, `__repr__` or `__eq__` now uses the `@dataclass` versions, as
   CPython does: `repr(K())` is `K()`, and `K(5)` binds the dataclass's
   fields. Before, the VM inherited the base's methods. The generated
-  `__repr__` / `__eq__` are also readable as attributes (`k.__repr__()`,
-  `K.__eq__(k, other)`), `super().__init__(...)` reaching a dataclass runs
+  `__init__` / `__repr__` / `__eq__` are also readable as attributes
+  (`k.__repr__()`, `K.__eq__(k, other)`, `K.__init__(k, 5)`), `==` and
+  `__eq__` read a field's class default when the instance has no value of
+  its own, `super().__init__(...)` reaching a dataclass runs
   its generated constructor, and a `class!` subclass of a dataclass reprs
   with that dataclass's fields (`M(y=2)`, not `M()`).
 - **`module.__name__` no longer forces the CPython fallback.** The pre-run
