@@ -16,6 +16,12 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 
 ### Fixed
 
+- **A `plain class` is called with its own `__init__`'s arguments.** A
+  `plain class` (or a `class!` with a hand-written `__init__`) that also
+  declared annotated fields had its call arguments type-checked against
+  those fields, so `E("boom", 3)` with `__init__(self, msg: str, code: int)`
+  and a `code: int` field was rejected with "expected `int`". The field
+  check now applies only where the fields are the constructor.
 - **`copy` runs in the VM.** `tyc run` handed any program that imported
   `copy` to CPython. The VM now has `copy.copy`, `copy.deepcopy` (memo,
   cycles and shared references included), `copy.replace` and `copy.Error`,

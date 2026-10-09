@@ -1716,6 +1716,26 @@ fn build_fails_on_type_error() {
     );
 }
 
+/// A `plain class` (or a `class!` with its own `__init__`) is called with
+/// that `__init__`'s arguments, not its annotated fields.
+#[test]
+fn check_accepts_init_arguments_that_differ_from_the_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "plain class E(Exception):\n    code: int\n    def __init__(self, msg: str, code: int) -> None:\n        super().__init__(msg)\n        self.code = code\n\
+         plain class Box[T]:\n    item: T\n    def __init__(self, label: str, item: T) -> None:\n        self.item = item\n\
+         class! R:\n    n: int\n    def __init__(self, s: str) -> None:\n        self.n = len(s)\n\
+         e = E(\"boom\", 3)\nb = Box(\"lbl\", 5)\nr = R(\"abc\")\nprint(e.code, b.item, r.n)\n",
+    );
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(
+        out.status.success(),
+        "constructor arguments were checked against the fields:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn build_emits_dataclass_decorator_for_class() {
     let tmp = tempfile::tempdir().unwrap();

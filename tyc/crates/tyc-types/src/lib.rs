@@ -1258,6 +1258,19 @@ fn contains_free_typevar(ty: &Type) -> bool {
 /// declared order for a dataclass, and — for a `class!`, whose `__init__`
 /// the desugarer synthesises — the required fields first, then the
 /// defaulted ones.
+/// Whether calling class `name` binds its arguments to the annotated fields
+/// (Typhon's generated constructor). A `plain class` has no generated
+/// `__init__`, and a `class!` with a hand-written one uses its own signature.
+/// An `__init__` a `class!` merely inherits does not count: the dataclass
+/// still generates one from the fields.
+fn constructor_is_field_list(c: &Checker, name: &str) -> bool {
+    let own_init = || {
+        c.resolve_class_shape(name)
+            .is_some_and(|shape| shape.methods.contains_key("__init__"))
+    };
+    !(c.is_plain_class(name) || (c.is_raw_class(name) && own_init()))
+}
+
 fn constructor_positional_order(c: &Checker, name: &str, shape: &InterfaceShape) -> Vec<String> {
     if !c.is_raw_class(name) {
         return shape.field_order.clone();
@@ -1507,8 +1520,10 @@ fn check_explicit_typearg_constructor(
         })
         .map(|(i, _)| i)
         .collect();
-    let positional_order = constructor_positional_order(c, &name, &shape);
-    check_generic_constructor_args(c, &shape, &positional_order, &bindings, pos_args, kw_args);
+    if constructor_is_field_list(c, &name) {
+        let positional_order = constructor_positional_order(c, &name, &shape);
+        check_generic_constructor_args(c, &shape, &positional_order, &bindings, pos_args, kw_args);
+    }
     for (i, arg) in pos_args.iter().enumerate() {
         if !typevar_field_idxs.contains(&i) {
             let _ = infer_expr(c, arg);
@@ -22667,14 +22682,19 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         // from a venv-introspected third-party `__init__`.
                         // Type-parameter fields on a generic class are handled
                         // separately below by `check_generic_constructor_args`.
-                        let positional_order = constructor_positional_order(c, &name, &shape);
-                        check_concrete_constructor_args(
-                            c,
-                            &shape,
-                            &positional_order,
-                            pos_args,
-                            kw_args,
-                        );
+                        // Only when the fields *are* the constructor: a
+                        // `plain class` (or a `class!` with its own
+                        // `__init__`) takes whatever that `__init__` takes.
+                        if constructor_is_field_list(c, &name) {
+                            let positional_order = constructor_positional_order(c, &name, &shape);
+                            check_concrete_constructor_args(
+                                c,
+                                &shape,
+                                &positional_order,
+                                pos_args,
+                                kw_args,
+                            );
+                        }
                     }
                     if let Some(tparams) = c.class_type_params.get(&name).cloned() {
                         let mut bindings: HashMap<String, Type> = HashMap::new();
@@ -22717,7 +22737,11 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                         // the arg's inferred type. Annotation-pinned
                         // bindings (inserted above) win because
                         // `bind_field_typevars` only fills vacant slots.
-                        let class_shape = c.class_shapes.get(&name).cloned();
+                        let class_shape = c
+                            .class_shapes
+                            .get(&name)
+                            .filter(|_| constructor_is_field_list(c, &name))
+                            .cloned();
                         let positional_order: Vec<String> = class_shape
                             .as_ref()
                             .map(|shape| constructor_positional_order(c, &name, shape))
