@@ -2648,7 +2648,7 @@ try:
     re.compile(\"(\")
 except Exception as e:
     check(\"error type\", type(e).__name__, \"PatternError\")
-check(\"flags\", [re.findall(\"a\", \"AaA\", re.I), re.compile(\"^b\", re.M).findall(\"a\\nb\"), re.compile(\"a.b\", re.S).match(\"a\\nb\") is not None, re.compile(\"a b # c\", re.X).match(\"ab\") is not None, re.sub(\"a\", \"x\", \"AaA\", flags=re.I), re.split(\"A\", \"aAa\", flags=re.I), re.compile(\"A\", re.I).sub(\"x\", \"aAa\", count=1), re.compile(\"a\", flags=re.I).pattern, re.compile(\"a\", flags=re.I).flags], [[\"A\", \"a\", \"A\"], [\"b\"], True, True, \"xxx\", [\"\", \"\", \"\", \"\"], \"xAa\", \"a\", 2])
+check(\"flags\", [re.findall(\"a\", \"AaA\", re.I), re.compile(\"^b\", re.M).findall(\"a\\nb\"), re.compile(\"a.b\", re.S).match(\"a\\nb\") is not None, re.compile(\"a b # c\", re.X).match(\"ab\") is not None, re.sub(\"a\", \"x\", \"AaA\", flags=re.I), re.split(\"A\", \"aAa\", flags=re.I), re.compile(\"A\", re.I).sub(\"x\", \"aAa\", count=1), re.compile(\"a\", flags=re.I).pattern, re.compile(\"a\", flags=re.I).flags], [[\"A\", \"a\", \"A\"], [\"b\"], True, True, \"xxx\", [\"\", \"\", \"\", \"\"], \"xAa\", \"a\", 34])
 check(\"pattern methods\", [re.compile(\"b\").fullmatch(\"b\") is not None, re.compile(\"b\").fullmatch(\"bb\") is None, re.compile(\"b\").search(\"abc\", 1).start(), re.compile(\"b\").match(\"abc\", pos=1) is not None, re.compile(\"c\").search(\"abc\", 0, 2) is None, re.compile(r\"(?P<w>\\w)\").groupindex, re.compile(\"(a)(b)\").groups], [True, True, 1, True, True, {{\"w\": 1}}, 2])
 "
         );

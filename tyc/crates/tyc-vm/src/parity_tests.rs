@@ -2828,3 +2828,290 @@ show(isinstance(P, type), isinstance(int, type), isinstance(type(), type))
 "#,
     );
 }
+
+/// `typing` forms print and introspect as CPython's, `re` flags are
+/// `RegexFlag` members, every `itertools` iterator is a class, and the `abc`
+/// / `collections.abc` classes answer `isinstance` for subclasses, builtins,
+/// registered and structural types.
+#[test]
+fn typing_forms_regexflag_itertools_and_abcs() {
+    assert_matches_cpython(
+        "typing_forms_regexflag_itertools_and_abcs",
+        r#"import typing
+import re
+import itertools
+import abc
+import collections.abc
+from typing import Any, Optional, Union, List, Dict, Callable, TypeVar, Generic, Protocol, Literal, Final, ClassVar
+def t(label, f):
+    try:
+        show(label, f())
+    except Exception as e:
+        show(label, "EXC", type(e).__name__)
+t("Any type", lambda: type(Any).__name__)
+t("Any repr", lambda: repr(Any))
+t("Optional repr", lambda: repr(Optional))
+t("Optional[int]", lambda: repr(Optional[int]))
+t("Union[int,str]", lambda: repr(Union[int, str]))
+t("type Union", lambda: type(Union).__name__)
+t("List repr", lambda: repr(List))
+t("List[int]", lambda: repr(List[int]))
+t("type List", lambda: type(List).__name__)
+t("Callable", lambda: repr(Callable))
+t("Literal[1]", lambda: repr(Literal[1]))
+t("TypeVar", lambda: repr(TypeVar("T")))
+t("type TypeVar", lambda: type(TypeVar("T")).__name__)
+t("Generic", lambda: repr(Generic))
+t("type Generic", lambda: type(Generic).__name__)
+t("Protocol", lambda: repr(Protocol))
+t("isinstance Any type", lambda: isinstance(Any, type))
+t("get_origin", lambda: typing.get_origin(List[int]))
+t("get_args", lambda: typing.get_args(Dict[str, int]))
+t("RegexFlag", lambda: repr(re.RegexFlag))
+t("type RegexFlag", lambda: type(re.RegexFlag).__name__)
+t("re.I", lambda: repr(re.I))
+t("type re.I", lambda: type(re.I).__name__)
+t("re.I|re.M", lambda: repr(re.I | re.M))
+t("isinstance re.I", lambda: isinstance(re.I, re.RegexFlag))
+t("re.I int", lambda: int(re.I))
+t("RegexFlag members", lambda: [m.name for m in re.RegexFlag][:4])
+t("RegexFlag(2)", lambda: repr(re.RegexFlag(2)))
+t("issub", lambda: issubclass(re.RegexFlag, int))
+for name in ["count", "cycle", "repeat", "chain", "islice", "accumulate", "product", "permutations", "combinations", "groupby", "zip_longest", "starmap", "takewhile", "dropwhile", "compress", "filterfalse", "pairwise", "batched", "tee", "combinations_with_replacement"]:
+    f = getattr(itertools, name)
+    t(name, lambda: (type(f).__name__, repr(f), isinstance(f, type)))
+t("chain.from_iterable", lambda: list(itertools.chain.from_iterable([[1], [2]])))
+t("type chain obj", lambda: type(itertools.chain([1])).__name__)
+t("isinstance chain", lambda: isinstance(itertools.chain([1]), itertools.chain))
+t("repr count", lambda: repr(itertools.count(3)))
+t("repr repeat", lambda: repr(itertools.repeat(1, 2)))
+t("type count obj", lambda: type(itertools.count()).__name__)
+t("type islice obj", lambda: type(itertools.islice([1], 1)).__name__)
+plain class MyChain(itertools.chain):
+    pass
+t("sub chain", lambda: list(MyChain([1], [2])))
+plain class A(abc.ABC):
+    @abc.abstractmethod
+    def f(self) -> int: ...
+plain class B(A):
+    def f(self):
+        return 1
+t("isinstance B A", lambda: isinstance(B(), A))
+t("isinstance B ABC", lambda: isinstance(B(), abc.ABC))
+t("issubclass B ABC", lambda: issubclass(B, abc.ABC))
+t("A()", lambda: A())
+t("type A", lambda: type(A).__name__)
+t("isinstance A ABCMeta", lambda: isinstance(A, abc.ABCMeta))
+plain class S(collections.abc.Sequence):
+    def __len__(self):
+        return 2
+    def __getitem__(self, i):
+        if i >= 2:
+            raise IndexError
+        return i
+t("isinstance S Seq", lambda: isinstance(S(), collections.abc.Sequence))
+t("isinstance list Seq", lambda: isinstance([], collections.abc.Sequence))
+t("S index", lambda: S().index(1))
+t("S contains", lambda: 1 in S())
+t("S reversed", lambda: list(reversed(S())))
+plain class R:
+    pass
+t("register", lambda: A.register(R) is R)
+t("registered", lambda: isinstance(R(), A))
+t("issub registered", lambda: issubclass(R, A))
+plain class It:
+    def __iter__(self):
+        return iter([1])
+t("structural Iterable", lambda: isinstance(It(), collections.abc.Iterable))
+t("hashable", lambda: isinstance(1, collections.abc.Hashable))
+t("Mapping dict", lambda: isinstance({}, collections.abc.Mapping))
+plain class M(collections.abc.Mapping):
+    def __getitem__(self, k):
+        return 1
+    def __len__(self):
+        return 1
+    def __iter__(self):
+        return iter(["a"])
+t("M isinstance", lambda: isinstance(M(), collections.abc.Mapping))
+t("M keys", lambda: list(M().keys()))
+t("M get", lambda: M().get("a"))
+t("M eq", lambda: M() == {"a": 1})
+"#,
+    );
+}
+
+/// An `IntFlag` class: its repr, metaclass, `int` base and `__members__`.
+#[test]
+fn intflag_class_metadata() {
+    assert_matches_cpython(
+        "intflag_class_metadata",
+        r#"import enum
+class RF(enum.IntFlag):
+    NOFLAG = 0
+    ASCII = A = 256
+    IGNORECASE = I = 2
+    MULTILINE = M = 8
+    DEBUG = 128
+def t(label, f):
+    try:
+        show(label, f())
+    except Exception as e:
+        show(label, "EXC", type(e).__name__, str(e))
+t("list", lambda: list(RF))
+t("repr I", lambda: repr(RF.I))
+t("str I", lambda: str(RF.I))
+t("fmt", lambda: f"{RF.I}")
+t("or", lambda: repr(RF.I | RF.M))
+t("or name", lambda: (RF.I | RF.M).name)
+t("int or", lambda: RF.I | 8)
+t("ror", lambda: 8 | RF.I)
+t("val", lambda: (RF.I.value, RF.I.name, int(RF.I), RF.I == 2, RF.I + 1))
+t("call", lambda: repr(RF(2)))
+t("call0", lambda: repr(RF(0)))
+t("call10", lambda: repr(RF(10)))
+t("cls repr", lambda: repr(RF))
+t("type", lambda: type(RF).__name__)
+t("isinst", lambda: isinstance(RF.I, RF))
+t("isint", lambda: isinstance(RF.I, int))
+t("issub", lambda: issubclass(RF, int))
+t("members", lambda: list(RF.__members__))
+t("and", lambda: repr(RF.I & RF.M))
+t("hash", lambda: hash(RF.I) == hash(2))
+t("in", lambda: RF.I in (RF.I | RF.M))
+t("bool", lambda: bool(RF.NOFLAG))
+"#,
+    );
+}
+
+/// The same models in use: flags passed to `re`, subscripted forms in
+/// bases, `get_origin` / `get_args`, ABC mixins and registration, and enum
+/// class metadata.
+#[test]
+fn typing_abc_enum_and_regexflag_runtime_use() {
+    assert_matches_cpython(
+        "typing_abc_enum_and_regexflag_runtime_use",
+        r#"import re
+import typing
+import abc
+import enum
+import itertools
+import collections
+import collections.abc as cabc
+from typing import Generic, TypeVar, Protocol, runtime_checkable, NamedTuple, TypedDict, Optional, Union, Callable, Annotated, Literal, Tuple, List, Dict
+def t(label, f):
+    try:
+        show(label, f())
+    except Exception as e:
+        show(label, "EXC", type(e).__name__, str(e))
+t("re flags", lambda: re.compile("a.b", re.I | re.S).flags)
+t("re match", lambda: bool(re.match("A", "a", re.I)))
+t("re search M", lambda: re.findall("^x", "x\nx", flags=re.M))
+t("fmt d", lambda: format(re.I, "d"))
+t("str flag", lambda: str(re.I | re.X))
+t("unknown", lambda: repr(re.RegexFlag(2 | 512)))
+t("flag eq", lambda: (re.I == 2, re.I | re.M == 10, hash(re.I) == 2))
+t("Union3", lambda: repr(Union[int, str, None]))
+t("Opt", lambda: repr(Optional[List[int]]))
+t("Call", lambda: repr(Callable[[int, str], bool]))
+t("Call...", lambda: repr(Callable[..., int]))
+t("Ann", lambda: (repr(Annotated[int, "x"]), typing.get_args(Annotated[int, "x"])))
+t("Lit", lambda: (repr(Literal[1, "a"]), typing.get_origin(Literal[1]) is Literal))
+t("TupE", lambda: (repr(Tuple[()]), repr(Tuple[int, ...])))
+t("origin union", lambda: typing.get_origin(Optional[int]) is Union)
+t("args call", lambda: typing.get_args(Callable[[int], str]))
+t("pep604", lambda: (typing.get_args(int | None), typing.get_origin(list[int])))
+t("eq", lambda: (List[int] == List[int], Optional[int] == Union[None, int], Union[int] is int))
+t("or", lambda: repr(Optional[int] | str))
+t("isinstance List", lambda: (isinstance([], List), isinstance({}, typing.Mapping), isinstance([], typing.Sequence), isinstance(len, typing.Callable)))
+t("issubclass", lambda: (issubclass(list, typing.Sequence), issubclass(dict, typing.Mapping)))
+T = TypeVar("T")
+plain class Box(Generic[T]):
+    def __init__(self, v: T) -> None:
+        self.v = v
+t("generic", lambda: (Box(3).v, repr(T), T.__name__))
+@runtime_checkable
+plain class HasLen(Protocol):
+    def __len__(self) -> int: ...
+t("proto", lambda: (isinstance([], HasLen), isinstance(3, HasLen)))
+plain class P(NamedTuple):
+    x: int
+    y: int
+t("nt", lambda: (P(1, 2), P(1, 2).x))
+plain class TD(TypedDict):
+    a: int
+t("td", lambda: TD(a=1))
+plain class SeqL(typing.Sequence[int]):
+    def __len__(self):
+        return 2
+    def __getitem__(self, i):
+        if i >= 2:
+            raise IndexError
+        return i
+t("typing seq base", lambda: (list(SeqL()), SeqL().index(1), isinstance(SeqL(), cabc.Sequence)))
+plain class Incomplete(cabc.Sequence):
+    pass
+t("abstract", lambda: Incomplete())
+@abc.ABC.register
+plain class Reg:
+    pass
+t("reg deco", lambda: (Reg.__name__, isinstance(Reg(), abc.ABC)))
+plain class Meta(metaclass=abc.ABCMeta):
+    @abc.abstractmethod
+    def f(self): ...
+t("metaclass", lambda: (type(Meta).__name__, isinstance(Meta, abc.ABCMeta)))
+t("meta abs", lambda: Meta())
+t("builtins abc", lambda: [issubclass(x, cabc.Sequence) for x in (list, tuple, str, bytes, dict, set, range)])
+t("views", lambda: (isinstance({}.keys(), cabc.Set), isinstance({}.values(), cabc.Set), isinstance({}.items(), cabc.ItemsView)))
+t("iters", lambda: (isinstance(iter([]), cabc.Iterator), isinstance((x for x in []), cabc.Generator), isinstance([], cabc.Iterator)))
+t("hashable", lambda: (isinstance([], cabc.Hashable), isinstance((), cabc.Hashable), isinstance("", cabc.Hashable)))
+t("callable", lambda: (isinstance(len, cabc.Callable), isinstance(1, cabc.Callable), isinstance(int, cabc.Callable)))
+t("deque", lambda: (isinstance(collections.deque(), cabc.MutableSequence), isinstance(collections.Counter(), cabc.Mapping), isinstance(collections.OrderedDict(), cabc.MutableMapping)))
+plain class MM(cabc.MutableMapping):
+    def __init__(self):
+        self.d = {}
+    def __getitem__(self, k):
+        return self.d[k]
+    def __setitem__(self, k, v):
+        self.d[k] = v
+    def __delitem__(self, k):
+        del self.d[k]
+    def __iter__(self):
+        return iter(self.d)
+    def __len__(self):
+        return len(self.d)
+def mm_ops():
+    m = MM()
+    m["a"] = 1
+    m.update({"b": 2}, c=3)
+    m.setdefault("d", 4)
+    p = m.pop("a")
+    return (p, sorted(m.items()), "b" in m, m.get("z", 9), len(m), m == {"b": 2, "c": 3, "d": 4})
+t("mm", mm_ops)
+plain class FS(cabc.Set):
+    def __init__(self, it=()):
+        self.items = list(dict.fromkeys(it))
+    def __contains__(self, x):
+        return x in self.items
+    def __iter__(self):
+        return iter(self.items)
+    def __len__(self):
+        return len(self.items)
+t("set ops", lambda: (sorted(FS([1, 2]) | FS([3])), sorted(FS([1, 2]) & FS([2])), FS([1]) <= FS([1, 2]), FS([1, 2]) == FS([2, 1]), FS([1]).isdisjoint([2])))
+plain class Cnt(itertools.count):
+    pass
+t("sub count", lambda: (next(Cnt(5)), type(Cnt(5)).__name__))
+t("isl err", lambda: itertools.islice([1], -1))
+t("isl iter", lambda: isinstance(itertools.islice([1], 1), cabc.Iterator))
+plain class Color(enum.Enum):
+    RED = 1
+    CRIMSON = 1
+t("enum", lambda: (repr(Color), type(Color).__name__, list(Color.__members__), isinstance(Color, enum.EnumMeta)))
+plain class Lvl(enum.IntEnum):
+    LOW = 1
+t("intenum", lambda: (issubclass(Lvl, int), repr(Lvl), isinstance(Lvl.LOW, int)))
+plain class SE(enum.StrEnum):
+    A = "a"
+t("strenum", lambda: (issubclass(SE, str), repr(SE)))
+"#,
+    );
+}

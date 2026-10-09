@@ -109,6 +109,9 @@ class UnionType:
 
 
 def _union(a, b):
+    # `X | typing.Optional[int]`: a `typing` form makes it `typing.Union`.
+    if isinstance(a, _TypingAlias) or isinstance(b, _TypingAlias):
+        return _TypingAlias._union_of((a, b))
     args = []
     typing_form = False
     for t in (a, b):
@@ -151,3 +154,142 @@ class _GenericAlias:
 
     def __ror__(self, other):
         return _union(other, self)
+
+
+# `typing.List[int]`, `typing.Optional[str]`, `typing.Callable[[int], str]`:
+# a subscripted `typing` form. The VM's bare forms are inert natives the
+# interpreter recognises by name; subscripting one builds this alias, which
+# prints, compares and answers `get_origin` / `get_args` as CPython's
+# `typing._GenericAlias` does. `_form` is the bare form, `__origin__` what
+# CPython reports as the origin (`list` for `List`, the form itself for
+# `Union` / `Literal`), and `_union_form` (`typing.Union`) is set on the
+# class when the `typing` module is built.
+class _TypingAlias:
+    def __init__(self, name, form, origin, args, callable_params=None):
+        self._name = name
+        self._form = form
+        self.__origin__ = origin
+        self.__args__ = args
+        self._callable_params = callable_params
+        self.__metadata__ = ()
+
+    @classmethod
+    def _union_of(cls, params):
+        flat = []
+        for p in params:
+            if isinstance(p, _TypingAlias) and p._name == "Union":
+                items = p.__args__
+            elif isinstance(p, UnionType):
+                items = p.__args__
+            else:
+                items = (p,)
+            for it in items:
+                if it is None:
+                    it = type(None)
+                if it not in flat:
+                    flat.append(it)
+        if len(flat) == 1:
+            return flat[0]
+        form = cls._union_form[0]
+        return cls("Union", form, form, tuple(flat))
+
+    def __repr__(self):
+        name = "typing." + self._name
+        if self._name == "Union":
+            nonetype = type(None)
+            if len(self.__args__) == 2 and nonetype in self.__args__:
+                other = [a for a in self.__args__ if a is not nonetype][0]
+                return "typing.Optional[" + _type_repr(other) + "]"
+            parts = ["NoneType" if a is nonetype else _type_repr(a) for a in self.__args__]
+            return name + "[" + ", ".join(parts) + "]"
+        if self._name == "Callable" and self._callable_params is not None:
+            params = "[" + ", ".join([_type_repr(a) for a in self._callable_params]) + "]"
+            return name + "[" + params + ", " + _type_repr(self.__args__[-1]) + "]"
+        if self._name == "Annotated":
+            parts = [_type_repr(self.__origin__)] + [repr(m) for m in self.__metadata__]
+            return name + "[" + ", ".join(parts) + "]"
+        if not self.__args__:
+            return name + "[()]"
+        return name + "[" + ", ".join([_type_repr(a) for a in self.__args__]) + "]"
+
+    def __eq__(self, other):
+        if not isinstance(other, _TypingAlias):
+            return NotImplemented
+        if self._name == "Union" and other._name == "Union":
+            return set(self.__args__) == set(other.__args__)
+        return (self._name == other._name and self.__origin__ == other.__origin__
+                and self.__args__ == other.__args__ and self.__metadata__ == other.__metadata__)
+
+    def __hash__(self):
+        if self._name == "Union":
+            return hash(frozenset(self.__args__))
+        return hash((self._name, self.__args__))
+
+    def __or__(self, other):
+        return _TypingAlias._union_of((self, other))
+
+    def __ror__(self, other):
+        return _TypingAlias._union_of((other, self))
+
+    def __call__(self, *args, **kwargs):
+        return self.__origin__(*args, **kwargs)
+
+
+def _typing_subscript(name, form, origin, params):
+    if not isinstance(params, tuple):
+        params = (params,)
+    if name == "Optional":
+        if len(params) != 1:
+            raise TypeError("typing.Optional requires a single type.")
+        return _TypingAlias._union_of((params[0], None))
+    if name == "Union":
+        if not params:
+            raise TypeError("Cannot take a Union of no types.")
+        return _TypingAlias._union_of(params)
+    if name == "Annotated":
+        if len(params) < 2:
+            raise TypeError("Annotated[...] should be used with at least two arguments (a type and an annotation).")
+        alias = _TypingAlias(name, form, params[0], (params[0],))
+        alias.__metadata__ = tuple(params[1:])
+        return alias
+    if name == "Callable" and len(params) == 2 and isinstance(params[0], list):
+        args = tuple(params[0]) + (params[1],)
+        return _TypingAlias(name, form, origin, args, list(params[0]))
+    if name == "Literal":
+        args = []
+        for p in params:
+            if p not in args:
+                args.append(p)
+        return _TypingAlias(name, form, origin, tuple(args))
+    if name == "Tuple" and params == ((),):
+        return _TypingAlias(name, form, origin, ())
+    args = tuple(type(None) if p is None else p for p in params)
+    return _TypingAlias(name, form, origin, args)
+
+
+def _typing_get_origin(tp):
+    if isinstance(tp, _TypingAlias):
+        if tp._name in ("Annotated", "Union"):
+            return tp._form
+        return tp.__origin__
+    if isinstance(tp, _GenericAlias):
+        return tp.__origin__
+    if isinstance(tp, UnionType):
+        return UnionType
+    return None
+
+
+def _typing_get_args(tp):
+    if isinstance(tp, _TypingAlias):
+        if tp._name == "Annotated":
+            return (tp.__origin__,) + tp.__metadata__
+        if tp._name == "Callable" and tp._callable_params is not None:
+            return (list(tp._callable_params), tp.__args__[-1])
+        return tp.__args__
+    if isinstance(tp, _GenericAlias):
+        if tp.__args__ == ((),):
+            return ()
+        return tp.__args__
+    if isinstance(tp, UnionType):
+        return tuple(type(None) if a is None else a for a in tp.__args__)
+    return ()

@@ -1,16 +1,35 @@
-# VM `itertools`: the module's iterator recipes as lazy generator functions /
-# iterator classes in the dialect the tree-walking VM interprets. Validated
-# against the real module (see validate_itertools.py).
+# VM `itertools`: the module's iterators in the dialect the tree-walking VM
+# interprets. Validated against the real module (see validate_itertools.py).
+#
+# Every public name is a class, as in CPython (`type(itertools.count)` is
+# `type`, `type(itertools.count())` is `itertools.count`), so `isinstance`
+# against them, subclassing them and their reprs all behave as there. Each
+# class validates its arguments and takes its snapshot of the input (`tuple`
+# for the combinatorics) at construction, as the C implementations do, and
+# then delegates `__next__` to a private generator holding the recipe. The
+# private names are not exported (see `make_itertools_module`).
 
 
-def count(start=0, step=1):
-    n = start
-    while True:
-        yield n
-        n = n + step
+class count:
+    def __init__(self, start=0, step=1):
+        self._n = start
+        self._step = step
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        n = self._n
+        self._n = n + self._step
+        return n
+
+    def __repr__(self):
+        if type(self._step) is int and self._step == 1:
+            return "count(%r)" % (self._n,)
+        return "count(%r, %r)" % (self._n, self._step)
 
 
-def cycle(iterable):
+def _cycle(iterable):
     saved = []
     for element in iterable:
         yield element
@@ -20,19 +39,47 @@ def cycle(iterable):
             yield element
 
 
-def repeat(obj, times=None):
-    if times is None:
-        while True:
-            yield obj
-    else:
-        i = 0
-        while i < times:
-            yield obj
-            i += 1
+class cycle:
+    def __init__(self, iterable):
+        self._g = _cycle(iter(iterable))
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._g)
 
 
-def accumulate(iterable, func=None, *, initial=None):
-    it = iter(iterable)
+class repeat:
+    def __init__(self, object, times=None):
+        self._obj = object
+        if times is not None and times < 0:
+            times = 0
+        self._times = times
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._times is None:
+            return self._obj
+        if self._times <= 0:
+            raise StopIteration
+        self._times -= 1
+        return self._obj
+
+    def __length_hint__(self):
+        if self._times is None:
+            raise TypeError("len() of unsized object")
+        return self._times
+
+    def __repr__(self):
+        if self._times is None:
+            return "repeat(%r)" % (self._obj,)
+        return "repeat(%r, %r)" % (self._obj, self._times)
+
+
+def _accumulate(it, func, initial):
     total = initial
     if initial is None:
         try:
@@ -46,6 +93,17 @@ def accumulate(iterable, func=None, *, initial=None):
         else:
             total = func(total, element)
         yield total
+
+
+class accumulate:
+    def __init__(self, iterable, func=None, *, initial=None):
+        self._g = _accumulate(iter(iterable), func, initial)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._g)
 
 
 class chain:
@@ -75,14 +133,24 @@ class chain:
                 self._current = None
 
 
-def compress(data, selectors):
+def _compress(data, selectors):
     for d, s in zip(data, selectors):
         if s:
             yield d
 
 
-def dropwhile(predicate, iterable):
-    it = iter(iterable)
+class compress:
+    def __init__(self, data, selectors):
+        self._g = _compress(iter(data), iter(selectors))
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._g)
+
+
+def _dropwhile(predicate, it):
     for x in it:
         if not predicate(x):
             yield x
@@ -91,12 +159,34 @@ def dropwhile(predicate, iterable):
         yield x
 
 
-def filterfalse(predicate, iterable):
+class dropwhile:
+    def __init__(self, predicate, iterable):
+        self._g = _dropwhile(predicate, iter(iterable))
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._g)
+
+
+def _filterfalse(predicate, it):
     if predicate is None:
         predicate = bool
-    for x in iterable:
+    for x in it:
         if not predicate(x):
             yield x
+
+
+class filterfalse:
+    def __init__(self, function, iterable):
+        self._g = _filterfalse(function, iter(iterable))
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._g)
 
 
 class groupby:
@@ -138,24 +228,7 @@ class groupby:
             self._currkey = self._keyfunc(self._currvalue)
 
 
-def islice(iterable, *args):
-    if not args:
-        raise TypeError("islice expected at least 2 arguments, got 1")
-    if len(args) > 3:
-        raise TypeError("islice expected at most 4 arguments, got %d" % (len(args) + 1))
-    if len(args) == 1:
-        start, stop, step = 0, args[0], 1
-    else:
-        start = args[0] if args[0] is not None else 0
-        stop = args[1]
-        step = args[2] if len(args) == 3 and args[2] is not None else 1
-    if not isinstance(start, int) or start < 0:
-        raise ValueError("Indices for islice() must be None or an integer: 0 <= x <= sys.maxsize.")
-    if stop is not None and (not isinstance(stop, int) or stop < 0):
-        raise ValueError("Stop argument for islice() must be None or an integer: 0 <= x <= sys.maxsize.")
-    if not isinstance(step, int) or step < 1:
-        raise ValueError("Step for islice() must be a positive integer or None.")
-    it = iter(iterable)
+def _islice(it, start, stop, step):
     i = 0
     nexti = start
     while stop is None or i < stop:
@@ -169,8 +242,34 @@ def islice(iterable, *args):
         i += 1
 
 
-def pairwise(iterable):
-    it = iter(iterable)
+class islice:
+    def __init__(self, iterable, *args):
+        if not args:
+            raise TypeError("islice expected at least 2 arguments, got 1")
+        if len(args) > 3:
+            raise TypeError("islice expected at most 4 arguments, got %d" % (len(args) + 1))
+        if len(args) == 1:
+            start, stop, step = 0, args[0], 1
+        else:
+            start = args[0] if args[0] is not None else 0
+            stop = args[1]
+            step = args[2] if len(args) == 3 and args[2] is not None else 1
+        if not isinstance(start, int) or start < 0:
+            raise ValueError("Indices for islice() must be None or an integer: 0 <= x <= sys.maxsize.")
+        if stop is not None and (not isinstance(stop, int) or stop < 0):
+            raise ValueError("Stop argument for islice() must be None or an integer: 0 <= x <= sys.maxsize.")
+        if not isinstance(step, int) or step < 1:
+            raise ValueError("Step for islice() must be a positive integer or None.")
+        self._g = _islice(iter(iterable), start, stop, step)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._g)
+
+
+def _pairwise(it):
     try:
         a = next(it)
     except StopIteration:
@@ -180,17 +279,50 @@ def pairwise(iterable):
         a = b
 
 
-def starmap(function, iterable):
-    for args in iterable:
+class pairwise:
+    def __init__(self, iterable):
+        self._g = _pairwise(iter(iterable))
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._g)
+
+
+def _starmap(function, it):
+    for args in it:
         yield function(*args)
 
 
-def takewhile(predicate, iterable):
-    for x in iterable:
+class starmap:
+    def __init__(self, function, iterable):
+        self._g = _starmap(function, iter(iterable))
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._g)
+
+
+def _takewhile(predicate, it):
+    for x in it:
         if predicate(x):
             yield x
         else:
             break
+
+
+class takewhile:
+    def __init__(self, predicate, iterable):
+        self._g = _takewhile(predicate, iter(iterable))
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._g)
 
 
 def tee(iterable, n=2):
@@ -212,8 +344,7 @@ def tee(iterable, n=2):
     return tuple(gen(b) for b in buffers)
 
 
-def zip_longest(*iterables, fillvalue=None):
-    iterators = [iter(it) for it in iterables]
+def _zip_longest(iterators, fillvalue):
     num_active = len(iterators)
     if not num_active:
         return
@@ -232,10 +363,18 @@ def zip_longest(*iterables, fillvalue=None):
         yield tuple(values)
 
 
-def product(*iterables, repeat=1):
-    if repeat < 0:
-        raise ValueError("repeat argument cannot be negative")
-    pools = [tuple(pool) for pool in iterables] * repeat
+class zip_longest:
+    def __init__(self, *iterables, fillvalue=None):
+        self._g = _zip_longest([iter(it) for it in iterables], fillvalue)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._g)
+
+
+def _product(pools):
     result = [[]]
     for pool in pools:
         result = [x + [y] for x in result for y in pool]
@@ -243,12 +382,21 @@ def product(*iterables, repeat=1):
         yield tuple(prod)
 
 
-def permutations(iterable, r=None):
-    pool = tuple(iterable)
+class product:
+    def __init__(self, *iterables, repeat=1):
+        if repeat < 0:
+            raise ValueError("repeat argument cannot be negative")
+        self._g = _product([tuple(pool) for pool in iterables] * repeat)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._g)
+
+
+def _permutations(pool, r):
     n = len(pool)
-    r = n if r is None else r
-    if r < 0:
-        raise ValueError("r must be non-negative")
     if r > n:
         return
     indices = list(range(n))
@@ -271,11 +419,23 @@ def permutations(iterable, r=None):
             return
 
 
-def combinations(iterable, r):
-    pool = tuple(iterable)
+class permutations:
+    def __init__(self, iterable, r=None):
+        pool = tuple(iterable)
+        r = len(pool) if r is None else r
+        if r < 0:
+            raise ValueError("r must be non-negative")
+        self._g = _permutations(pool, r)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._g)
+
+
+def _combinations(pool, r):
     n = len(pool)
-    if r < 0:
-        raise ValueError("r must be non-negative")
     if r > n:
         return
     indices = list(range(r))
@@ -294,11 +454,22 @@ def combinations(iterable, r):
         yield tuple(pool[i] for i in indices)
 
 
-def combinations_with_replacement(iterable, r):
-    pool = tuple(iterable)
+class combinations:
+    def __init__(self, iterable, r):
+        pool = tuple(iterable)
+        if r < 0:
+            raise ValueError("r must be non-negative")
+        self._g = _combinations(pool, r)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._g)
+
+
+def _combinations_with_replacement(pool, r):
     n = len(pool)
-    if r < 0:
-        raise ValueError("r must be non-negative")
     if not n and r:
         return
     indices = [0] * r
@@ -315,10 +486,21 @@ def combinations_with_replacement(iterable, r):
         yield tuple(pool[i] for i in indices)
 
 
-def batched(iterable, n, *, strict=False):
-    if n < 1:
-        raise ValueError("n must be at least one")
-    it = iter(iterable)
+class combinations_with_replacement:
+    def __init__(self, iterable, r):
+        pool = tuple(iterable)
+        if r < 0:
+            raise ValueError("r must be non-negative")
+        self._g = _combinations_with_replacement(pool, r)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._g)
+
+
+def _batched(it, n, strict):
     while True:
         batch = tuple(islice(it, n))
         if not batch:
@@ -326,3 +508,16 @@ def batched(iterable, n, *, strict=False):
         if strict and len(batch) != n:
             raise ValueError("batched(): incomplete batch")
         yield batch
+
+
+class batched:
+    def __init__(self, iterable, n, *, strict=False):
+        if n < 1:
+            raise ValueError("n must be at least one")
+        self._g = _batched(iter(iterable), n, strict)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._g)

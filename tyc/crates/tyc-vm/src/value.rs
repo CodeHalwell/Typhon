@@ -775,6 +775,15 @@ pub fn native_repr(name: &str) -> String {
     if name == "NotImplemented" {
         return name.to_owned();
     }
+    // The inert `typing` forms print as CPython's do: `typing.List`, and the
+    // ones that are classes there (`Generic`, `Protocol`) as classes.
+    if let Some(ty) = typing_form_type(name) {
+        return if matches!(ty, "type" | "_ProtocolMeta") {
+            format!("<class 'typing.{name}'>")
+        } else {
+            format!("typing.{name}")
+        };
+    }
     // Standard-library classes the VM models as natives print with the
     // module that defines them.
     if let Some((_, qualified)) = STDLIB_NATIVE_CLASSES.iter().find(|(n, _)| *n == name) {
@@ -784,6 +793,59 @@ pub fn native_repr(name: &str) -> String {
         return format!("<class '{name}'>");
     }
     format!("<built-in function {name}>")
+}
+
+/// The `typing` forms the VM keeps as inert natives (`make_typing_module`),
+/// with the name of the type CPython gives each (`type(typing.List)` is
+/// `_SpecialGenericAlias`). `None` for any other native.
+pub fn typing_form_type(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "Generic" | "IO" | "TextIO" | "BinaryIO" => "type",
+        "Protocol" | "SupportsIndex" | "SupportsInt" | "SupportsFloat" | "SupportsBytes"
+        | "SupportsAbs" | "SupportsRound" => "_ProtocolMeta",
+        "Any" => "_AnyMeta",
+        "Callable" => "_CallableType",
+        "Tuple" => "_TupleType",
+        "Literal" | "Annotated" => "_TypedCacheSpecialForm",
+        "Optional" | "Union" | "ClassVar" | "Final" | "Self" | "Never" | "NoReturn"
+        | "TypeGuard" | "TypeIs" | "TypeForm" | "TypeAlias" | "Required" | "ReadOnly"
+        | "NotRequired" | "Unpack" | "Concatenate" | "LiteralString" => "_SpecialForm",
+        "List"
+        | "Dict"
+        | "Set"
+        | "FrozenSet"
+        | "Type"
+        | "Iterable"
+        | "Iterator"
+        | "Sequence"
+        | "Mapping"
+        | "MutableMapping"
+        | "MutableSequence"
+        | "MutableSet"
+        | "Hashable"
+        | "Sized"
+        | "Container"
+        | "Awaitable"
+        | "Coroutine"
+        | "AsyncIterable"
+        | "AsyncIterator"
+        | "Generator"
+        | "AsyncGenerator"
+        | "ContextManager"
+        | "AsyncContextManager"
+        | "OrderedDict"
+        | "DefaultDict"
+        | "Counter"
+        | "Deque"
+        | "ChainMap"
+        | "AbstractSet"
+        | "Collection"
+        | "Reversible"
+        | "ItemsView"
+        | "KeysView"
+        | "ValuesView" => "_SpecialGenericAlias",
+        _ => return None,
+    })
 }
 
 /// Standard-library classes the VM builds as natives, by native name, with
@@ -2798,6 +2860,9 @@ impl Value {
             Value::Set(_) => "set",
             Value::Range { .. } => "range",
             Value::Native(n) if n.name == "NotImplemented" => "NotImplementedType",
+            Value::Native(n) if typing_form_type(n.name).is_some() => {
+                typing_form_type(n.name).unwrap_or("type")
+            }
             // CPython's own callables: `list.append` is a method descriptor,
             // `[].append` and `len` builtin functions, and a builtin type
             // constructor (`int`) is a `type`.
@@ -3752,7 +3817,16 @@ pub fn bigint_eq_f64(a: &BigInt, b: f64) -> bool {
 /// Whether `class` is an enum class — its own `class_attrs` carry the
 /// `__typhon_enum_base__` sentinel, or one of its bases does (the user's
 /// `Color(Enum)` inherits the flag from the synthetic `Enum` base).
-fn class_is_enum(class: &Class) -> bool {
+fn class_is_flag(class: &Class) -> bool {
+    (class
+        .class_attrs
+        .borrow()
+        .contains_key("__typhon_enum_base__")
+        && matches!(class.name.as_str(), "Flag" | "IntFlag"))
+        || class.bases.iter().any(|b| class_is_flag(b))
+}
+
+pub(crate) fn class_is_enum(class: &Class) -> bool {
     class
         .class_attrs
         .borrow()
@@ -3913,11 +3987,29 @@ fn instance_repr_inner(inst: &Instance) -> String {
 /// VM records as `__typhon_module__`. A stdlib shim's classes carry no module
 /// (CPython's name for them is not the shim's), so those stay bare.
 pub fn class_repr(class: &Class) -> String {
-    match class.class_attrs.borrow().get("__typhon_module__") {
-        Some(Value::Str(m)) if !m.is_empty() => {
-            format!("<class '{m}.{}'>", class.effective_qualname())
-        }
-        _ => format!("<class '{}'>", class.effective_qualname()),
+    // An enum class prints as `<enum 'Color'>`, a flag as `<flag 'Perm'>`.
+    if class_is_enum(class) {
+        let kind = if class_is_flag(class) { "flag" } else { "enum" };
+        return format!("<{kind} '{}'>", class.name);
+    }
+    match class_display_module(class) {
+        Some(m) => format!("<class '{m}.{}'>", class.effective_qualname()),
+        None => format!("<class '{}'>", class.effective_qualname()),
+    }
+}
+
+/// The module a class's repr names: the one its body ran in, or — for a
+/// stdlib shim whose classes CPython defines in the module itself
+/// (`itertools.count`) — the module the shim stands for
+/// (`__typhon_shim_module__`, stamped when the shim module is built).
+pub fn class_display_module(class: &Class) -> Option<Rc<String>> {
+    let attrs = class.class_attrs.borrow();
+    match attrs.get("__typhon_module__") {
+        Some(Value::Str(m)) if !m.is_empty() => Some(m.clone()),
+        _ => match attrs.get("__typhon_shim_module__") {
+            Some(Value::Str(m)) => Some(m.clone()),
+            _ => None,
+        },
     }
 }
 
@@ -3926,8 +4018,11 @@ pub fn class_repr(class: &Class) -> String {
 /// the address is the instance's allocation, stable for its lifetime.
 pub fn object_default_repr(inst: &Instance) -> String {
     let module = match inst.class.class_attrs.borrow().get("__typhon_module__") {
-        Some(Value::Str(s)) => (**s).clone(),
-        _ => "__main__".to_owned(),
+        Some(Value::Str(s)) if !s.is_empty() => (**s).clone(),
+        _ => match class_display_module(&inst.class) {
+            Some(m) => (*m).clone(),
+            None => "__main__".to_owned(),
+        },
     };
     format!(
         "<{}.{} object at {:#x}>",
