@@ -1,6 +1,6 @@
 ---
 title: Installation
-description: Build the tyc binary from source and put it on your PATH.
+description: Install a prebuilt Typhon compiler for macOS, Linux or Windows, verify it, or build from source.
 sidebar:
   order: 1
 ---
@@ -34,15 +34,25 @@ iwr -useb https://raw.githubusercontent.com/codehalwell/typhon/main/install.ps1 
 
 Download the archive for your platform from the newest entry on the [releases page](https://github.com/CodeHalwell/Typhon/releases) (GitHub's "latest release" link skips pre-releases, so use the full list while Typhon is pre-1.0), verify it against `SHA256SUMS`, extract it, and put `tyc` on your `PATH`.
 
+Follow the [manual installation steps](https://typhon.sh/install#manual) for macOS, Linux or Windows, including checksum comparison, extraction and PATH setup.
+
 </TabItem>
 </Tabs>
 
 If your platform isn't listed (FreeBSD, Linux MUSL, Windows ARM64), build from source below.
 
+## Verify the installation
+
+```bash
+tyc --version
+```
+
+The current prerelease prints `tyc 1.0.0-beta.3`. If the command is not found, open a new terminal and check that the install directory is on your `PATH`. See [troubleshooting](#troubleshooting) for compiler and editor setup issues.
+
 ## Prerequisites (build from source)
 
 - **A Rust toolchain** — the repo pins Rust **1.94** (`tyc/rust-toolchain.toml`); the vendored crates require **1.93+**, so an older `cargo` will refuse to build. Install via [rustup](https://rustup.rs/) if you don't already have it.
-- **A Python interpreter** — CPython 3.13 (or 3.14, or the free-threaded `t` variants). Typhon emits code targeting 3.13 by default; you can change the target in `typhon.toml`.
+- **A Python interpreter** — CPython 3.13, 3.14 or 3.15, including their free-threaded `t` variants. Typhon emits code targeting 3.13 by default; [configure the target](/Typhon/configuration/python/) in `typhon.toml` for newer syntax and builtins.
 - **(Optional) `uv`** — Astral's package manager. Used by `tyc add` / `tyc remove` / `tyc sync` for dependency installation. Install with `pipx install uv` or via [the uv install script](https://docs.astral.sh/uv/getting-started/installation/).
 - **(Optional) `ty`** — Astral's Python type checker. Used by `tyc ty` for a second-opinion typing pass against the emitted Python. Install with `pip install ty` or `uv tool install ty`.
 
@@ -101,7 +111,7 @@ If your platform isn't listed (FreeBSD, Linux MUSL, Windows ARM64), build from s
 
 ## Updating
 
-Pull the latest commits and rebuild:
+For a prebuilt installation, rerun the installer or download the new archive and verify its checksum. For a source checkout, pull the latest commits and rebuild:
 
 ```bash
 cd /path/to/Typhon
