@@ -5469,13 +5469,19 @@ impl Interpreter {
     ) -> Result<Value, Unwind> {
         let (start_class, self_val) = self.super_target(sup, env)?;
         // `super().__init__(...)` reaching a dataclass's generated
-        // constructor binds that dataclass's fields on the instance.
-        if attr == "__init__" {
-            if let Value::Instance(inst) = &self_val {
-                if let Some(dc) = super_generated_init(&start_class, &self_val) {
+        // constructor binds that dataclass's fields on the instance;
+        // `super().__repr__()` / `super().__eq__(o)` reaching a generated
+        // method run that dataclass's version.
+        if let Value::Instance(inst) = &self_val {
+            if let Some(dc) = super_generated(&start_class, &self_val, attr) {
+                if attr == "__init__" {
                     let (args, kwargs) = self.eval_call_args(outer, env)?;
                     self.run_generated_init(&dc, inst, args, &kwargs)?;
                     return Ok(Value::None);
+                }
+                if let Some(method) = self.generated_dunder(&dc, attr, Some(self_val.clone())) {
+                    let (args, kwargs) = self.eval_call_args(outer, env)?;
+                    return self.call_value(method, args, &kwargs);
                 }
             }
         }
@@ -6249,12 +6255,17 @@ impl Interpreter {
         // The generated `__init__` calls `self.__post_init__()`, so it
         // resolves on the instance's own class — a subclass override wins
         // when a `super().__init__()` reaches a base's constructor.
-        // Only when the dataclass itself has a hook to call, as its
-        // generated `__init__` includes the call only then.
+        // Only when the dataclass that generated this `__init__` (not a
+        // plain subclass inheriting it) has a hook to call, as the
+        // generated code includes the call only then.
+        let generator = class_mro(class)
+            .find(|c| crate::value::generates_dataclass(c))
+            .unwrap_or(class)
+            .clone();
         if let Some(post) = self
             .find_method(&instance.class, "__post_init__")
             .filter(|_| crate::value::class_is_dataclass(class))
-            .filter(|_| self.find_method(class, "__post_init__").is_some())
+            .filter(|_| self.find_method(&generator, "__post_init__").is_some())
         {
             let owner = self
                 .method_owner(&instance.class, &post)
@@ -6288,6 +6299,13 @@ impl Interpreter {
         }
         let resolved = match lookup_class_member(class, name) {
             Some((owner, _)) if dataclass_shadows(class, &owner, name) => None,
+            // A builtin function (`os.getcwd` stored on a class) is not a
+            // descriptor, so it never binds as a method.
+            Some((_, ClassMember::Method(f) | ClassMember::Attr(Value::Function(f))))
+                if f.c_builtin.get() =>
+            {
+                None
+            }
             Some((_, ClassMember::Method(m))) => Some(m),
             Some((_, ClassMember::Attr(Value::Function(f)))) => Some(f),
             _ => None,
@@ -8271,8 +8289,9 @@ impl Interpreter {
                 if let Some(v) = class_attr {
                     if !is_enum_sentinel(attr) {
                         if let Value::Function(f) = &v {
-                            // `@staticmethod` extension: no receiver bound.
-                            if f.is_static {
+                            // `@staticmethod` extension, or a builtin
+                            // function (not a descriptor): no receiver bound.
+                            if f.is_static || f.c_builtin.get() {
                                 return Ok(Value::Function(f.clone()));
                             }
                             let receiver = if f.is_classmethod {
@@ -11749,21 +11768,23 @@ fn super_mro(owner: &Rc<Class>, obj: &Value) -> Vec<Rc<Class>> {
 /// The dataclass whose generated `__init__` a `super().__init__(...)` from
 /// `owner` reaches — one that sits before any hand-written `__init__` in
 /// the rest of the MRO (and does not hide a stdlib shim's constructor).
-fn super_generated_init(owner: &Rc<Class>, obj: &Value) -> Option<Rc<Class>> {
+fn super_generated(owner: &Rc<Class>, obj: &Value, name: &str) -> Option<Rc<Class>> {
+    let flag = match name {
+        "__init__" => "__typhon_dc_init__",
+        "__repr__" => "__typhon_dc_repr__",
+        "__eq__" => "__typhon_dc_eq__",
+        _ => return None,
+    };
     let mro = super_mro(owner, obj);
     let generated = mro.iter().find(|c| {
-        c.methods.borrow().contains_key("__init__")
-            || (crate::value::generates_dataclass(c)
-                && crate::value::class_flag(c, "__typhon_dc_init__", true))
+        c.methods.borrow().contains_key(name)
+            || (crate::value::generates_dataclass(c) && crate::value::class_flag(c, flag, true))
     })?;
-    if generated.methods.borrow().contains_key("__init__") {
+    if generated.methods.borrow().contains_key(name) {
         return None;
     }
-    match mro
-        .iter()
-        .find(|c| c.methods.borrow().contains_key("__init__"))
-    {
-        Some(defined) if !dataclass_shadows_in(mro.iter(), defined, "__init__") => None,
+    match mro.iter().find(|c| c.methods.borrow().contains_key(name)) {
+        Some(defined) if !dataclass_shadows_in(mro.iter(), defined, name) => None,
         _ => Some(generated.clone()),
     }
 }

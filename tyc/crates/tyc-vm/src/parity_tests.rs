@@ -2588,11 +2588,43 @@ P.__init__(p3, 9)
 show(p3.y, hasattr(p3, "x"))
 p3.__init__(y=8)
 show(p3.y, k.__init__() is None)
+plain class S(P):
+    def __repr__(self):
+        return "S:" + super().__repr__()
+    def __eq__(self, other):
+        return super().__eq__(other)
+show(repr(S()), S() == S(), S() == S(7), S() == 3)
+plain class J2(H):
+    def __post_init__(self):
+        self.hooked = True
+show(hasattr(J2(), "hooked"), J2().a)
 for bad in (lambda: K.__eq__(k, k, 1), lambda: k.__eq__(k, 1), lambda: k.__repr__(1), lambda: K.__eq__(k), lambda: K.__repr__()):
     try:
         bad()
     except TypeError as e:
         show(str(e))
+"#,
+    );
+}
+
+#[test]
+fn c_builtins_do_not_bind_as_methods() {
+    // A builtin function is not a descriptor: stored on a class and read
+    // through an instance, it is called without `self`.
+    assert_matches_cpython(
+        "c_builtins_do_not_bind_as_methods",
+        r#"import os
+import operator
+import bisect
+plain class Holder:
+    cwd = os.getcwd
+    add = operator.add
+    find = bisect.bisect_left
+    def get(self):
+        return self.cwd()
+h = Holder()
+show(h.get() == os.getcwd(), h.cwd() == os.getcwd(), h.add(1, 2), Holder.add(3, 4), h.find([1, 2, 3], 2))
+show(type(h.add).__name__, type(Holder.add).__name__)
 "#,
     );
 }
