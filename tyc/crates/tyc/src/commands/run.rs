@@ -1655,6 +1655,7 @@ mod tests {
             "bases: list[type] = [list]\nplain class L(bases[0]):\n    pass\nprint(L([1]))\n",
             "for Base in (list, dict):\n    plain class L(Base):\n        pass\n    print(L())\n",
             "First, Second = list, dict\nplain class L(First):\n    pass\nprint(L())\n",
+            "def choose() -> type:\n    return list\nif (Base := choose()):\n    pass\nplain class L(Base):\n    pass\nprint(L([1]))\n",
             "plain class Holder:\n    def __init__(self, base: type) -> None:\n        self.base = base\nh = Holder(list)\nplain class L(h.base):\n    pass\nprint(L([1]))\n",
             "def make(cfg: object) -> None:\n    plain class L(cfg.base):\n        pass\n    print(L([1]))\n",
         ] {

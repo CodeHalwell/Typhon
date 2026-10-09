@@ -1428,6 +1428,18 @@ fn scan_builtin_subclasses(
         }
     }
     impl<'a> Visitor<'a> for Scan {
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            // `if (Base := choose()):` binds a runtime value.
+            if let Expr::Named(n) = expr {
+                self.mark_computed(&n.target);
+                if self.depth == 0 {
+                    if let Expr::Name(t) = n.target.as_ref() {
+                        self.exported_computed.insert(t.id.to_string());
+                    }
+                }
+            }
+            visitor::walk_expr(self, expr);
+        }
         fn visit_stmt(&mut self, stmt: &'a Stmt) {
             if self.found.is_some() {
                 return;
