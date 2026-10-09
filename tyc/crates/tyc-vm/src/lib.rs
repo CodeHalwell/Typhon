@@ -1009,10 +1009,11 @@ const PYTHON_BUILTINS: &[&str] = &[
     "__debug__",
 ];
 
-/// The first builtin value type (`list`, `int`, `str`, …) a class in
-/// `module` subclasses, or `None`.
+/// The first builtin value type (`list`, `int`, `str`, …) or other
+/// native-backed builtin (`enumerate`, `property`) a class in `module`
+/// subclasses, or `None`.
 ///
-/// The VM models those types as Rust values, not classes, so an instance of
+/// The VM models those types as Rust values or natives, not classes, so an instance of
 /// `class L(list)` is a plain object that holds no list: `L([1, 2])` fails
 /// and `class S(str)` prints as `<__main__.S object …>`. `tyc run`'s pre-run
 /// scan sends such a program down the compiled path. A value-mixin enum
@@ -1033,6 +1034,15 @@ pub fn module_subclassed_builtin(module: &ruff_python_ast::ModModule) -> Option<
         "dict",
         "set",
         "frozenset",
+        // Natives too, so a subclass builds a plain object.
+        "enumerate",
+        "zip",
+        "map",
+        "filter",
+        "reversed",
+        "property",
+        "staticmethod",
+        "classmethod",
     ];
     const ENUM_TYPES: &[&str] = &["Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "ReprEnum"];
 

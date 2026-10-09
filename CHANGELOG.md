@@ -25,7 +25,9 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   their `__name__`, `__qualname__`, `__self__` and `__objclass__`
   (`bool.bit_count` is `int`'s, `str.maketrans.__self__` is `None` and
   `dict.fromkeys.__self__` is `dict`).
-  `repr(defaultdict)` is `<class 'collections.defaultdict'>`.
+  `repr(defaultdict)` is `<class 'collections.defaultdict'>`. A native
+  standing in for a function CPython writes in Python (`json.dumps`,
+  `dataclasses.field`) stays a `function`.
 - **A `plain class` with a builtin or imported base takes that base's
   constructor arguments.** `plain class Boom(Exception): pass` followed by
   `raise Boom("x")` was rejected with "expected 0, got 1", as were
@@ -33,7 +35,8 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   without an `__init__` now applies only when every ancestor is a class
   of the project.
 - **A subclass of a builtin value type runs on CPython.** The VM models
-  `list`, `int`, `str` and the other value types as values, not classes,
+  `list`, `int`, `str` and the other value types as values, not classes
+  (and `enumerate`, `zip`, `property`, `classmethod` and the like as natives),
   so `class L(list)` built an empty object (`L([1, 2])` raised
   `TypeError` and `class S(str)` printed as an object). `tyc run`'s
   pre-run scan now sends such a program down the compiled path, as it

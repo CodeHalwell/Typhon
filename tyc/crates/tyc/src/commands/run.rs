@@ -1603,7 +1603,17 @@ mod tests {
     fn scan_routes_builtin_subclasses_to_cpython() {
         // The VM models `list` / `int` / `str` as values, not classes, so a
         // subclass of one runs on CPython.
-        for base in ["list", "int", "str", "dict", "tuple", "float", "bytearray"] {
+        for base in [
+            "list",
+            "int",
+            "str",
+            "dict",
+            "tuple",
+            "float",
+            "bytearray",
+            "enumerate",
+            "property",
+        ] {
             let src = format!("plain class X({base}):\n    pass\nprint(X())\n");
             assert_eq!(
                 scan_source(&src),

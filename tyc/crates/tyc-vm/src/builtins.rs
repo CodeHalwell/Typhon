@@ -3454,9 +3454,35 @@ pub(crate) fn module_dir_names(m: &Module) -> std::collections::BTreeSet<String>
     names
 }
 
+/// Modules whose CPython functions are written in Python, so their natives
+/// are `function`s rather than builtins (`type(json.dumps)`).
+fn module_defines_python_functions(name: &str) -> bool {
+    !matches!(
+        name.split('.').next().unwrap_or(name),
+        "builtins" | "math" | "time" | "sys" | "heapq" | "hashlib" | "__future__" | "__main__"
+    )
+}
+
 fn make_module(name: &str, entries: Vec<(&str, Value)>) -> Value {
+    let python_functions = module_defines_python_functions(name);
     let mut map = HashMap::new();
     for (k, v) in entries {
+        if let Value::Native(n) = &v {
+            // `functools.reduce` and `cmp_to_key` are C even in a Python module.
+            let c_function = name == "functools" && matches!(k, "reduce" | "cmp_to_key");
+            // Only a native made for this module, not one it imported
+            // (`random`'s shim binds `math.sqrt` as `_sqrt`), so a C
+            // builtin it re-exports keeps its own type.
+            let own = k == n.name && !k.starts_with('_');
+            if python_functions
+                && own
+                && !c_function
+                && n.method.is_none()
+                && !crate::value::native_is_type(n.name)
+            {
+                n.py_function.set(true);
+            }
+        }
         map.insert(k.to_owned(), v);
     }
     Value::Module(Rc::new(Module {

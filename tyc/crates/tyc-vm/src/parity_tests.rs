@@ -2453,6 +2453,10 @@ show(type(bool.bit_count).__name__, bool.bit_count.__qualname__, repr(bool.bit_c
 show(type(str.maketrans).__name__, str.maketrans.__qualname__, str.maketrans.__self__)
 show(dict.fromkeys.__self__ is dict, type(dict.fromkeys).__name__, dict.fromkeys.__qualname__, repr(dict.fromkeys).startswith("<built-in method fromkeys of type object at 0x"))
 show(int.from_bytes.__qualname__, float.fromhex.__self__ is float, bytes.fromhex.__name__)
+import json
+import functools
+import dataclasses
+show(type(json.dumps).__name__, type(dataclasses.field).__name__, type(functools.reduce).__name__, type(functools.wraps).__name__, repr(json.dumps).startswith("<function dumps at 0x"))
 sort = xs.sort
 sort()
 show(xs, list.append(xs, 4), xs, str.upper("a"))
