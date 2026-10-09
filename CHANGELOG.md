@@ -31,13 +31,16 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   methods of its hidden `Random()` as in CPython (`random.randint` is a
   `method` named `Random.randint`; `random.random` a builtin).
   `@contextmanager` and `lru_cache(n)` return a `function`.
+  Slot methods are slot wrappers: `type(list.__len__)` is
+  `wrapper_descriptor` (`<slot wrapper '__len__' of 'list' objects>`) and
+  `[].__len__` a `method-wrapper`.
 - **A `plain class` with a builtin or imported base takes that base's
   constructor arguments.** `plain class Boom(Exception): pass` followed by
   `raise Boom("x")` was rejected with "expected 0, got 1", as were
   `bytes` and `range` bases: the zero-argument rule for a `plain class`
   without an `__init__` now applies only when every ancestor is a class
   of the project or `object` (through a module alias such as
-  `Alias = Parent` too).
+  `Alias = Parent` too, when the module binds that name nowhere else).
 - **A subclass of a builtin value type runs on CPython.** The VM models
   `list`, `int`, `str` and the other value types as values, not classes
   (and `enumerate`, `zip`, `property`, `classmethod`, `super`, `type` and
@@ -52,9 +55,10 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
   scan errs towards CPython: a builtin alias counts in any scope or
   branch, while an enum base exempts a class only when bound
   unconditionally at module scope and not rebound since.
-  An alias exported by a sibling module (`from helper import Alias`) and
-  a class factory's parameter base (`def make(Base: type)` with
-  `class L(Base)`) fall back too.
+  An alias exported by a sibling module (`from helper import Alias`, even
+  through a chain of re-exports), a class factory's parameter base
+  (`def make(Base: type)` with `class L(Base)`) and a `defaultdict` base
+  fall back too.
 - **A `plain class` is called with its own `__init__`'s arguments.** A
   `plain class` (or a `class!` with a hand-written `__init__`) that also
   declared annotated fields had its call arguments type-checked against

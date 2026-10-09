@@ -2469,6 +2469,8 @@ def cm():
 def cached(x):
     return x
 show(type(cm).__name__, type(functools.lru_cache(4)).__name__, cached(2))
+show(type(list.__len__).__name__, repr(list.__len__), type(xs.__len__).__name__, type(list.__getitem__).__name__, type(dict.__contains__).__name__, repr(str.__add__))
+show(repr(xs.__len__).startswith("<method-wrapper '__len__' of list object at 0x"), repr(dataclasses.replace).startswith("<function replace at 0x"))
 sort = xs.sort
 sort()
 show(xs, list.append(xs, 4), xs, str.upper("a"))

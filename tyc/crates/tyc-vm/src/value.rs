@@ -797,6 +797,22 @@ pub fn native_value_repr(n: &NativeFn) -> String {
             .unwrap_or(n as *const NativeFn as usize)
     };
     match &n.method {
+        Some(m) if is_slot_wrapper(m) => match &m.binding {
+            MethodBinding::Unbound => {
+                format!("<slot wrapper '{}' of '{}' objects>", m.attr, m.owner)
+            }
+            MethodBinding::Bound(r) => format!(
+                "<method-wrapper '{}' of {} object at {:#x}>",
+                m.attr,
+                r.type_name(),
+                addr(Some(r))
+            ),
+            MethodBinding::OnType { .. } => format!(
+                "<method-wrapper '{}' of type object at {:#x}>",
+                m.attr,
+                addr(None)
+            ),
+        },
         Some(m) => match &m.binding {
             MethodBinding::Unbound => format!("<method '{}' of '{}' objects>", m.attr, m.owner),
             MethodBinding::Bound(r) => format!(
@@ -820,9 +836,91 @@ pub fn native_value_repr(n: &NativeFn) -> String {
                 addr(None)
             )
         }
-        None if n.py_function.get() => format!("<function {} at {:#x}>", n.name, addr(None)),
+        // `dataclasses.replace` is `<function replace at …>`.
+        None if n.py_function.get() => format!(
+            "<function {} at {:#x}>",
+            n.name.rsplit('.').next().unwrap_or(n.name),
+            addr(None)
+        ),
         None => native_repr(n.name),
     }
+}
+
+/// Whether CPython implements builtin method `m` as a type slot, so it is a
+/// `wrapper_descriptor` (`list.__len__`) and, bound, a `method-wrapper`.
+fn is_slot_wrapper(m: &NativeMethod) -> bool {
+    const SLOTS: &[&str] = &[
+        "__abs__",
+        "__add__",
+        "__and__",
+        "__bool__",
+        "__buffer__",
+        "__call__",
+        "__contains__",
+        "__delattr__",
+        "__delitem__",
+        "__divmod__",
+        "__eq__",
+        "__float__",
+        "__floordiv__",
+        "__ge__",
+        "__getattribute__",
+        "__getitem__",
+        "__gt__",
+        "__hash__",
+        "__iadd__",
+        "__iand__",
+        "__imul__",
+        "__index__",
+        "__init__",
+        "__int__",
+        "__invert__",
+        "__ior__",
+        "__isub__",
+        "__iter__",
+        "__ixor__",
+        "__le__",
+        "__len__",
+        "__lshift__",
+        "__lt__",
+        "__mod__",
+        "__mul__",
+        "__ne__",
+        "__neg__",
+        "__or__",
+        "__pos__",
+        "__pow__",
+        "__radd__",
+        "__rand__",
+        "__rdivmod__",
+        "__release_buffer__",
+        "__repr__",
+        "__rfloordiv__",
+        "__rlshift__",
+        "__rmod__",
+        "__rmul__",
+        "__ror__",
+        "__rpow__",
+        "__rrshift__",
+        "__rshift__",
+        "__rsub__",
+        "__rtruediv__",
+        "__rxor__",
+        "__setattr__",
+        "__setitem__",
+        "__str__",
+        "__sub__",
+        "__truediv__",
+        "__xor__",
+    ];
+    let attr: &str = &m.attr;
+    // Containers that define these as ordinary methods.
+    let method = match attr {
+        "__getitem__" => matches!(m.owner, "list" | "dict" | "set" | "frozenset"),
+        "__contains__" => matches!(m.owner, "dict" | "set" | "frozenset"),
+        _ => false,
+    };
+    !method && SLOTS.contains(&attr)
 }
 
 /// The allocation behind a heap value, the address `id()` reports for it.
@@ -2593,6 +2691,10 @@ impl Value {
             Value::Native(n) if n.py_method_of.get().is_some() => "method",
             Value::Native(n) if n.py_function.get() => "function",
             Value::Native(n) => match &n.method {
+                Some(m) if is_slot_wrapper(m) => match m.binding {
+                    MethodBinding::Unbound => "wrapper_descriptor",
+                    _ => "method-wrapper",
+                },
                 Some(NativeMethod {
                     binding: MethodBinding::Unbound,
                     ..

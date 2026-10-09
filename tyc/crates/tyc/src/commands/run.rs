@@ -502,10 +502,19 @@ fn unmodelled_references(path: &std::path::Path, entry: &std::path::Path) -> Opt
     let mut exports = ModelledExports::default();
     // Builtin aliases any project module binds (`Alias = list`), so a class
     // over one imported from a sibling falls back too.
-    let mut project_aliases = std::collections::HashMap::new();
-    for file in &files {
-        if let Some(module) = parse_for_scan(file) {
-            project_aliases.extend(tyc_vm::module_builtin_aliases(&module));
+    // Re-exports chain (`Alias2 = Alias` over a third module's
+    // `Alias = list`), so collect until nothing new appears.
+    let modules: Vec<_> = files.iter().filter_map(|f| parse_for_scan(f)).collect();
+    let mut project_aliases: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    loop {
+        let before = project_aliases.len();
+        for module in &modules {
+            let found = tyc_vm::module_builtin_aliases(module, &project_aliases);
+            project_aliases.extend(found);
+        }
+        if project_aliases.len() == before {
+            break;
         }
     }
     for file in &files {
@@ -1706,7 +1715,37 @@ mod tests {
             scan_source(factory),
             Some(vec!["a class whose base is the parameter Base".to_owned()])
         );
+        let local_alias = "def make(Base: type) -> type:\n    let Alias = Base\n    plain class L(Alias):\n        pass\n    return L\nprint(make(list))\n";
+        assert!(scan_source(local_alias).is_some());
+        // `defaultdict` is a native constructor too.
+        for src in [
+            "from collections import defaultdict\nplain class D(defaultdict):\n    pass\nprint(D(list))\n",
+            "import collections\nplain class D(collections.defaultdict):\n    pass\nprint(D(list))\n",
+        ] {
+            assert_eq!(
+                scan_source(src),
+                Some(vec!["a subclass of the builtin defaultdict".to_owned()]),
+                "{src}"
+            );
+        }
         // An alias a sibling module exports, imported or reached through it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("helper.ty"), "Alias = list\n").unwrap();
+        std::fs::write(
+            dir.path().join("middle.ty"),
+            "from helper import Alias\nAlias2 = Alias\n",
+        )
+        .unwrap();
+        let entry = dir.path().join("main.ty");
+        std::fs::write(
+            &entry,
+            "from middle import Alias2\nplain class L(Alias2):\n    pass\nprint(L())\n",
+        )
+        .unwrap();
+        assert!(
+            unmodelled_references(&entry, &entry).is_some(),
+            "alias chain"
+        );
         for main in [
             "from helper import Alias\nplain class L(Alias):\n    pass\nprint(L())\n",
             "import helper\nplain class L(helper.Alias):\n    pass\nprint(L())\n",

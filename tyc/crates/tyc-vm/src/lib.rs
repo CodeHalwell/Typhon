@@ -1028,12 +1028,14 @@ pub fn module_subclassed_builtin(
     scan_builtin_subclasses(module, project_aliases, false).0
 }
 
-/// The names `module` binds to a builtin value type (`Alias = list`), for
-/// [`module_subclassed_builtin`] over the project's other modules.
+/// The names `module` binds to a builtin value type (`Alias = list`, or
+/// one of `project_aliases` re-exported), for [`module_subclassed_builtin`]
+/// over the project's other modules.
 pub fn module_builtin_aliases(
     module: &ruff_python_ast::ModModule,
+    project_aliases: &std::collections::HashMap<String, String>,
 ) -> std::collections::HashMap<String, String> {
-    scan_builtin_subclasses(module, &Default::default(), true).1
+    scan_builtin_subclasses(module, project_aliases, true).1
 }
 
 fn scan_builtin_subclasses(
@@ -1092,6 +1094,8 @@ fn scan_builtin_subclasses(
         enum_bases: std::collections::HashSet<String>,
         /// `builtins` and its aliases (`import builtins as b`).
         builtins_modules: std::collections::HashSet<String>,
+        /// `collections` and its aliases, for `collections.defaultdict`.
+        collections_modules: std::collections::HashSet<String>,
         /// Function and class bodies around the statement.
         depth: usize,
         /// Compound statements (`if`, `for`, `try`, …) around it.
@@ -1134,6 +1138,11 @@ fn scan_builtin_subclasses(
                 if on_builtins && VALUE_TYPES.contains(&attr) {
                     return Some(attr.to_owned());
                 }
+                let on_collections = matches!(a.value.as_ref(), Expr::Name(m)
+                    if self.collections_modules.contains(m.id.as_str()));
+                if on_collections && attr == "defaultdict" {
+                    return Some(attr.to_owned());
+                }
                 // `helper.Alias` for another module's `Alias = list`.
                 return self.project.get(attr).cloned();
             }
@@ -1171,6 +1180,15 @@ fn scan_builtin_subclasses(
                 _ => None,
             })
         }
+        /// `let Alias = Base` in a class factory: `Alias` may be the
+        /// builtin `Base` is handed too.
+        fn alias_param(&mut self, target: &str, value: Option<&str>) {
+            if value.is_some_and(|v| self.params.iter().any(|p| p.contains(v))) {
+                if let Some(scope) = self.params.last_mut() {
+                    scope.insert(target.to_owned());
+                }
+            }
+        }
         fn bind(&mut self, stmt: &Stmt) {
             let pinned = self.depth == 0 && self.branch == 0;
             match stmt {
@@ -1190,6 +1208,9 @@ fn scan_builtin_subclasses(
                             "builtins" => {
                                 self.builtins_modules.insert(bound.to_owned());
                             }
+                            "collections" => {
+                                self.collections_modules.insert(bound.to_owned());
+                            }
                             _ => {}
                         }
                     }
@@ -1205,6 +1226,10 @@ fn scan_builtin_subclasses(
                                 self.enum_bases.insert(bound);
                             }
                             Some("builtins") if VALUE_TYPES.contains(&name) => {
+                                self.builtin.insert(bound, name.to_owned());
+                            }
+                            // A native constructor too, not a class.
+                            Some("collections") if name == "defaultdict" => {
                                 self.builtin.insert(bound, name.to_owned());
                             }
                             // `from helper import Alias as A` for a sibling's
@@ -1228,6 +1253,7 @@ fn scan_builtin_subclasses(
                     for target in &a.targets {
                         if let Expr::Name(t) = target {
                             let t = t.id.as_str();
+                            self.alias_param(t, value);
                             self.unbind(t);
                             if let Some(b) = &builtin {
                                 self.builtin.insert(t.to_owned(), b.clone());
@@ -1242,6 +1268,9 @@ fn scan_builtin_subclasses(
                     if let Expr::Name(t) = a.target.as_ref() {
                         let builtin = a.value.as_deref().and_then(|v| self.builtin_base(v));
                         let t = t.id.as_str();
+                        if let Some(Expr::Name(v)) = a.value.as_deref() {
+                            self.alias_param(t, Some(v.id.as_str()));
+                        }
                         self.unbind(t);
                         if let Some(b) = builtin {
                             self.builtin.insert(t.to_owned(), b);
