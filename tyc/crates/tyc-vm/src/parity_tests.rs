@@ -2584,6 +2584,25 @@ show(repr(q2), Q2.__repr__(q2), Q2.__eq__(q2, Q2()))
 q3 = Q2()
 q3.y = 4
 show(q2 == q3, q3 == q2, Q2.__eq__(q2, q3))
+Q2.y = 5
+show(repr(Q2()), Q2.__repr__(Q2()))
+@dataclass(frozen=True, init=False)
+plain class FQ:
+    y: int = 4
+    def __init__(self):
+        pass
+fq1 = FQ()
+fq2 = FQ()
+object.__setattr__(fq2, "y", 4)
+show(fq1 == fq2, hash(fq1) == hash(fq2), len({fq1, fq2}))
+@dataclass
+plain class E:
+    pass
+show(E.__repr__(42), E.__repr__("s"))
+try:
+    Q2.__repr__(42)
+except AttributeError:
+    show("AttributeError")
 p3 = P()
 P.__init__(p3, 9)
 show(p3.y, hasattr(p3, "x"))

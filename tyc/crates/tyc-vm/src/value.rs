@@ -2921,7 +2921,8 @@ impl Value {
                         member: inst.clone(),
                     });
                 }
-                match instance_hash_mode(&inst.class) {
+                let mode = instance_hash_mode(&inst.class);
+                match mode {
                     HashMode::Unhashable => {
                         return Err(type_error(format!(
                             "unhashable type: '{}'",
@@ -2937,8 +2938,19 @@ impl Value {
                     HashMode::User(_) | HashMode::Fields => {}
                 }
                 let mut fields: Vec<(String, HashKey)> = Vec::new();
-                for (name, v) in inst.fields.borrow().iter() {
-                    fields.push((name.clone(), v.to_hash_key()?));
+                if matches!(mode, HashMode::Fields) {
+                    // The generated `__hash__` / `__eq__` read the declared
+                    // fields as `self.f` (class default included) and
+                    // ignore attributes assigned later.
+                    for f in &inst.class.fields {
+                        if let Some(v) = dataclass_field_value(inst, f) {
+                            fields.push((f.name.clone(), v.to_hash_key()?));
+                        }
+                    }
+                } else {
+                    for (name, v) in inst.fields.borrow().iter() {
+                        fields.push((name.clone(), v.to_hash_key()?));
+                    }
                 }
                 // Sort by field name so two instances with the same
                 // fields in different insertion order produce identical
@@ -3866,19 +3878,11 @@ fn instance_repr_inner(inst: &Instance) -> String {
     for cf in repr_fields {
         if let Some(v) = fields.get(&cf.name) {
             parts.push(format!("{}={}", cf.name, v.py_repr()));
-        } else {
+        } else if let Some(v) = dataclass_field_value(inst, cf) {
             // The generated `__repr__` reads `self.name`, which a subclass
             // that never ran the dataclass `__init__` (a `class!` with its
             // own) serves from the class default.
-            let default = inst
-                .class
-                .mro
-                .iter()
-                .find_map(|c| c.class_attrs.borrow().get(&cf.name).cloned())
-                .or_else(|| cf.default.clone());
-            if let Some(v) = default {
-                parts.push(format!("{}={}", cf.name, v.py_repr()));
-            }
+            parts.push(format!("{}={}", cf.name, v.py_repr()));
         }
     }
     // A dataclass (or pydantic model) repr shows its declared fields and

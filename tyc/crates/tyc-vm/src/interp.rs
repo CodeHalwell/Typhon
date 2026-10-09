@@ -4658,14 +4658,14 @@ impl Interpreter {
                     // The generated dataclass `__hash__` is
                     // `hash((self.f1, self.f2, …))`.
                     crate::value::HashMode::Fields => {
-                        let vals: Vec<Value> = {
-                            let fields = inst.fields.borrow();
-                            inst.class
-                                .fields
-                                .iter()
-                                .filter_map(|f| fields.get(&f.name).cloned())
-                                .collect()
-                        };
+                        // `self.f` falls back to the class default, as in
+                        // the generated `__eq__`, so equal objects hash alike.
+                        let vals: Vec<Value> = inst
+                            .class
+                            .fields
+                            .iter()
+                            .filter_map(|f| crate::value::dataclass_field_value(inst, f))
+                            .collect();
                         let mut hs = Vec::with_capacity(vals.len());
                         for x in &vals {
                             hs.push(self.hash_value(x)?);
@@ -6439,7 +6439,18 @@ impl Interpreter {
             let this = &args[0];
             if name == "__repr__" {
                 let Value::Instance(inst) = this else {
-                    return Ok(Value::Str(Rc::new(interp.repr_of(this)?)));
+                    // The generated body runs on any receiver: it reads each
+                    // field as an attribute and names `type(self)`.
+                    let mut parts = Vec::with_capacity(provider.fields.len());
+                    for f in &provider.fields {
+                        let v = interp.get_attr(this, &f.name)?;
+                        parts.push(format!("{}={}", f.name, interp.repr_of(&v)?));
+                    }
+                    return Ok(Value::Str(Rc::new(format!(
+                        "{}({})",
+                        this.type_name(),
+                        parts.join(", ")
+                    ))));
                 };
                 let mut parts = Vec::with_capacity(provider.fields.len());
                 for f in &provider.fields {
