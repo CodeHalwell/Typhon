@@ -43,3 +43,8 @@
 **Vulnerability:** A hardcoded secrets check (`contains_secret_literal`) failed to detect `APPKEY` and `APP_KEY` as secrets.
 **Learning:** Case-boundary heuristics and substring matching logic may miss fully capitalized squashed acronyms like `APPKEY` and `APP_KEY` if they are not explicitly registered as standalone keywords, leading to potential false negatives for common secret variable names.
 **Prevention:** When updating or adding to the `tyc::contains_secret_literal` diagnostic, explicitly register all common permutations of high-risk security keywords (like `APP_KEY` and `APPKEY`), as boundary heuristics cannot be fully relied upon to catch all variations.
+
+## 2026-10-10 - Ensure all permutations of high-risk security keywords are explicitly registered
+**Vulnerability:** A hardcoded secrets check (`contains_secret_literal`) failed to detect `APITOKEN`, `API_TOKEN`, `APISECRET`, `API_SECRET`, `APIPASSWORD`, and `API_PASSWORD` as secrets, despite catching `API_KEY` and similar variations.
+**Learning:** Case-boundary heuristics and substring matching logic may miss fully capitalized squashed acronyms like `APITOKEN` if they are not explicitly registered as standalone keywords, leading to potential false negatives for common secret variable names. When scanning for secrets using keyword arrays, substrings (like `TOKEN`) must be placed after longer matches (like `API_TOKEN`) to prevent premature partial matches.
+**Prevention:** When updating or adding to the `tyc::contains_secret_literal` diagnostic (e.g., in `is_secret_name` or `secret_suffix`), explicitly register all common permutations of high-risk security keywords (like `API_TOKEN` and `APITOKEN`) in longest-first ordered matching order.
