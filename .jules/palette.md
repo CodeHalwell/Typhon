@@ -75,7 +75,10 @@
 
 ## 2026-06-28 - [Equitable tactile feedback for Hero buttons]
 **Learning:** Found that primary CTA `.sl-link-button` components on the hero landing page lacked hover and active transitions, failing to provide tactile feedback while surrounding `.sl-link-card` elements did.
-**Action:** Added hover/focus/active transitions with `transform: translateY` and `box-shadow` directly to `.sl-link-button` and its `.minimal` variant. Crucially, updated the `@media (prefers-reduced-motion: reduce)` block to explicitly nullify these transforms and transitions for accessibility compliance.
+**Action:** Added hover/focus/active transitions with `transform: translateY` and `box-shadow` directly to `.sl-link-button` and its `.minimal` variant. Crucially, realized that global `transition: none !important` already prevents the motion. Overriding `transform` globally breaks layout, so relying on the existing transition override is sufficient for accessibility compliance.
 ## 2026-06-29 - [Consistent tactile styling for UI keyboard shortcuts]
 **Learning:** Custom Starlight components like the site-search search box use nested `<kbd>` tags that bypass `.sl-markdown-content` styling, resulting in unstyled, inconsistent shortcut keys in the UI.
 **Action:** Extended the physical `<kbd>` styling to target `site-search kbd kbd` and removed the default wrapper background (`site-search > button > kbd`) to ensure consistent, tactile keyboard shortcut visuals across the entire UI.
+## 2026-06-28 - [Equitable tactile feedback for Hero buttons and Cards]
+**Learning:** Found that primary CTA `.sl-link-button` components on the hero landing page lacked hover and active transitions, failing to provide tactile feedback while surrounding `.sl-link-card` elements did.
+**Action:** Added hover/focus/active transitions with `transform: translateY` and `box-shadow` directly to `.sl-link-button` and its `.minimal` variant, as well as cards. Crucially, realized that global `transition: none !important` already prevents the motion. Overriding `transform` globally breaks layout, so relying on the existing transition override is sufficient for accessibility compliance.
