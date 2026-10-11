@@ -45,13 +45,20 @@ use crate::ComptimeValue;
 /// accepted. This and the other word sets below are the single source both
 /// consumers of the heuristic share.
 pub const SECRET_NAME_KEYWORDS: &[&str] = &[
+    "API_PASSWORD",
+    "APIPASSWORD",
     "PASSWORD",
     "PASSWD",
     "PASSPHRASE",
+    "API_SECRET",
+    "APISECRET",
     "SECRET",
+    "API_TOKEN",
+    "APITOKEN",
     "TOKEN",
     "CREDENTIAL",
     "PRIVKEY",
+    "API_KEY",
     "APIKEY",
 ];
 
