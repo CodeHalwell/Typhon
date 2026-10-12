@@ -48,10 +48,13 @@ pub const SECRET_NAME_KEYWORDS: &[&str] = &[
     "PASSWORD",
     "PASSWD",
     "PASSPHRASE",
+    "APISECRET",
     "SECRET",
+    "APITOKEN",
     "TOKEN",
     "CREDENTIAL",
     "PRIVKEY",
+    "APPKEY",
     "APIKEY",
 ];
 
@@ -672,6 +675,10 @@ mod tests {
             "OPENAI_API_KEY",
             "APIKEY",
             "APIKEYS",
+            "APITOKEN",
+            "APISECRET",
+            "APPKEY",
+            "APP_KEY",
             "api_keys",
             "apiKey",
             "KEY_APIKEY",
@@ -905,6 +912,9 @@ mod tests {
         assert_eq!(name_tokens("PASSPORT"), ["PASSPORT"]);
         assert_eq!(name_tokens("myTokenValue"), ["MY", "TOKEN", "VALUE"]);
         assert_eq!(name_tokens("APIKey"), ["API", "KEY"]);
+        assert_eq!(name_tokens("APITOKEN"), ["APITOKEN"]);
+        assert_eq!(name_tokens("APISECRET"), ["APISECRET"]);
+        assert_eq!(name_tokens("APPKEY"), ["APPKEY"]);
     }
 
     fn comptime_findings(src: &str) -> Vec<(String, String)> {
