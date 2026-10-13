@@ -79,3 +79,6 @@
 ## 2026-06-29 - [Consistent tactile styling for UI keyboard shortcuts]
 **Learning:** Custom Starlight components like the site-search search box use nested `<kbd>` tags that bypass `.sl-markdown-content` styling, resulting in unstyled, inconsistent shortcut keys in the UI.
 **Action:** Extended the physical `<kbd>` styling to target `site-search kbd kbd` and removed the default wrapper background (`site-search > button > kbd`) to ensure consistent, tactile keyboard shortcut visuals across the entire UI.
+## 2024-05-24 - Equitable Tactile Feedback on Cards
+**Learning:** Interactive cards (like `.sl-link-card` or custom `.card`) often have `:hover` borders but lack `:active` tactile feedback, making clicks feel unresponsive. Adding a subtle scale transform makes the interaction feel much more satisfying.
+**Action:** Added an `:active` state with `transform: scale(0.98)` and corresponding `transform 100ms ease` transition to base card styles.
