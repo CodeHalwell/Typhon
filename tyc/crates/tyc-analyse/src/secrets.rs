@@ -45,14 +45,17 @@ use crate::ComptimeValue;
 /// accepted. This and the other word sets below are the single source both
 /// consumers of the heuristic share.
 pub const SECRET_NAME_KEYWORDS: &[&str] = &[
-    "PASSWORD",
-    "PASSWD",
-    "PASSPHRASE",
-    "SECRET",
-    "TOKEN",
     "CREDENTIAL",
+    "PASSPHRASE",
+    "APISECRET",
+    "APITOKEN",
+    "PASSWORD",
     "PRIVKEY",
     "APIKEY",
+    "APPKEY",
+    "PASSWD",
+    "SECRET",
+    "TOKEN",
 ];
 
 /// Nouns that name a credential only when a [`SECRET_NAME_QUALIFIERS`] word
