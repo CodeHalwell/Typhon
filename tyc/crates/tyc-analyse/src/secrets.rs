@@ -45,6 +45,9 @@ use crate::ComptimeValue;
 /// accepted. This and the other word sets below are the single source both
 /// consumers of the heuristic share.
 pub const SECRET_NAME_KEYWORDS: &[&str] = &[
+    "APIPASSWORD",
+    "APISECRET",
+    "APITOKEN",
     "PASSWORD",
     "PASSWD",
     "PASSPHRASE",
@@ -53,6 +56,7 @@ pub const SECRET_NAME_KEYWORDS: &[&str] = &[
     "CREDENTIAL",
     "PRIVKEY",
     "APIKEY",
+    "APPKEY",
 ];
 
 /// Nouns that name a credential only when a [`SECRET_NAME_QUALIFIERS`] word
@@ -893,6 +897,7 @@ mod tests {
 
     #[test]
     fn segmentation_prefers_vocabulary_words() {
+        assert_eq!(name_tokens("APITOKEN"), ["APITOKEN"]);
         assert_eq!(name_tokens("DBPASSWORDS"), ["DB", "PASSWORDS"]);
         assert_eq!(name_tokens("SSHKEYS"), ["SSH", "KEYS"]);
         assert_eq!(name_tokens("TOKENs"), ["TOKENS"]);
