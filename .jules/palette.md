@@ -79,3 +79,6 @@
 ## 2026-06-29 - [Consistent tactile styling for UI keyboard shortcuts]
 **Learning:** Custom Starlight components like the site-search search box use nested `<kbd>` tags that bypass `.sl-markdown-content` styling, resulting in unstyled, inconsistent shortcut keys in the UI.
 **Action:** Extended the physical `<kbd>` styling to target `site-search kbd kbd` and removed the default wrapper background (`site-search > button > kbd`) to ensure consistent, tactile keyboard shortcut visuals across the entire UI.
+## 2024-05-18 - Tactile interactions on cards
+**Learning:** Adding active states to large interactive elements like cards greatly improves perceived responsiveness. Also, testing these states in Playwright requires careful mouse event handling (`page.mouse.down()`) without full clicks to avoid navigating away and causing test timeouts.
+**Action:** Ensure CSS `transition` rules explicitly include properties like `transform` when adding visual press states to avoid abrupt changes.
