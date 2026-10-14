@@ -79,3 +79,6 @@
 ## 2026-06-29 - [Consistent tactile styling for UI keyboard shortcuts]
 **Learning:** Custom Starlight components like the site-search search box use nested `<kbd>` tags that bypass `.sl-markdown-content` styling, resulting in unstyled, inconsistent shortcut keys in the UI.
 **Action:** Extended the physical `<kbd>` styling to target `site-search kbd kbd` and removed the default wrapper background (`site-search > button > kbd`) to ensure consistent, tactile keyboard shortcut visuals across the entire UI.
+## 2026-06-30 - [Equitable tactile feedback for Container Components]
+**Learning:** Container components (like Cards) lack native button-like affordances. Users expect tactile feedback when interacting with clickable surface areas.
+**Action:** Added `transform: translateY(1px)` and `transition` for the `:active` state on `.card` and `.sl-link-card` to mimic physical pressing, ensuring these interactions feel responsive and intuitive. Disabled `transform` under `@media (prefers-reduced-motion: reduce)`.
