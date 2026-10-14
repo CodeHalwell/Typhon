@@ -58,3 +58,6 @@
 ## 2024-10-05 - Avoid AST Deep Cloning in Iteration
 **Learning:** Index-based lookahead loops over `Vec<Stmt>` (e.g. `body[i].clone()`) cause massive O(N) deep copying of large AST nodes (like `FunctionDef` and `ClassDef`) just to satisfy ownership rules.
 **Action:** Use `body.into_iter()` combined with `iter.as_slice()` to peek ahead without consuming elements, and `iter.nth()` to skip consumed items. This allows taking ownership of AST nodes (`iter.next().unwrap()`) with zero allocations and zero deep cloning.
+## 2024-12-04 - Zero-Allocation `inherit_parent_fields` during AST lowering
+**Learning:** Building the `own_fields` map and `placed` tracking set during `inherit_parent_fields` in `tyc-desugar` using `HashMap<String, Stmt>` and `HashSet<String>` required cloning strings for every class field via `.to_owned()`. These temporary string allocations cause unnecessary memory pressure during the AST traversal phase.
+**Action:** Always borrow AST string identifiers as `&str` using `HashMap<&str, Stmt>` and `HashSet<&str>` bounded by the incoming statement vectors to avoid heap allocations.
