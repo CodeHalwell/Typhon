@@ -43,3 +43,7 @@
 **Vulnerability:** A hardcoded secrets check (`contains_secret_literal`) failed to detect `APPKEY` and `APP_KEY` as secrets.
 **Learning:** Case-boundary heuristics and substring matching logic may miss fully capitalized squashed acronyms like `APPKEY` and `APP_KEY` if they are not explicitly registered as standalone keywords, leading to potential false negatives for common secret variable names.
 **Prevention:** When updating or adding to the `tyc::contains_secret_literal` diagnostic, explicitly register all common permutations of high-risk security keywords (like `APP_KEY` and `APPKEY`), as boundary heuristics cannot be fully relied upon to catch all variations.
+## 2024-05-18 - [Security Enhancement: Expand secret detection keywords]
+**Vulnerability:** The secret detection scanner missed squashed acronyms like "APITOKEN", "APISECRET", and "APIPASSWORD" due to case-boundary heuristics not splitting them natively.
+**Learning:** Fully capitalized compound prefixes without explicit boundaries must be explicitly registered as standalone keywords in `SECRET_NAME_KEYWORDS` to be correctly identified as single vocabulary words. Strict longest-first ordering must be maintained.
+**Prevention:** Always register squashed acronym forms of high-value prefixes in `SECRET_NAME_KEYWORDS` ahead of their substrings. Avoid adding underscore-separated forms here as they are stripped before matching.
