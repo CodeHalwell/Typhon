@@ -79,3 +79,6 @@
 ## 2026-06-29 - [Consistent tactile styling for UI keyboard shortcuts]
 **Learning:** Custom Starlight components like the site-search search box use nested `<kbd>` tags that bypass `.sl-markdown-content` styling, resulting in unstyled, inconsistent shortcut keys in the UI.
 **Action:** Extended the physical `<kbd>` styling to target `site-search kbd kbd` and removed the default wrapper background (`site-search > button > kbd`) to ensure consistent, tactile keyboard shortcut visuals across the entire UI.
+## 2024-10-15 - Improve color contrast for secondary text
+**Learning:** Light mode secondary text colors (gray-3) layered on custom background colors can drop below WCAG 2 AA minimum contrast ratios (4.5:1), even if they appear legible.
+**Action:** Always verify custom theme text colors against their specific custom background colors rather than assuming standard contrasts apply.
