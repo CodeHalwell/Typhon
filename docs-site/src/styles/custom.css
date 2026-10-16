@@ -18,7 +18,9 @@ h1, h2, h3 { font-weight: 500; letter-spacing: -.035em; }
 .hero h1 { font-size: clamp(2.6rem, 5vw, 4.5rem); font-weight: 450; letter-spacing: -.055em; line-height: 1.04; }
 .hero .tagline { max-width: 38rem; font-size: 1.1rem; color: var(--sl-color-gray-2); }
 .hero img { max-width: 16rem; }
-.hero .sl-link-button { border-radius: 999px; font-weight: 500; font-size: .9rem; }
+.hero .sl-link-button { border-radius: 999px; font-weight: 500; font-size: .9rem; transition: transform 0.2s ease, box-shadow 0.2s ease; }
+.hero .sl-link-button:hover, .hero .sl-link-button:focus-visible { transform: translateY(-2px); box-shadow: 0 4px 12px var(--sl-color-accent-low); }
+.hero .sl-link-button:active { transform: translateY(0); box-shadow: none; }
 .hero .sl-link-button.primary { background: var(--sl-color-accent); border-color: var(--sl-color-accent); color: var(--sl-color-black); }
 :root[data-theme='light'] .hero .sl-link-button.primary { color: #ffffff; }
 .card-grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr)); margin: 1.5rem 0 2rem; }
@@ -45,4 +47,7 @@ abbr[title] { cursor: help; text-decoration: underline dotted; }
 starlight-tabs .tab > [role='tab']:hover { color: var(--sl-color-white); }
 @media (max-width: 50rem) { .hero { padding: 2rem 0; } .hero img { max-width: 10rem; } }
 @media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } }
-@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; } }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+  .hero .sl-link-button:hover, .hero .sl-link-button:focus-visible, .hero .sl-link-button:active { transform: none; box-shadow: none; }
+}
