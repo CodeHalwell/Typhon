@@ -1309,14 +1309,19 @@ pub fn collect_imported_modules(paths: &[PathBuf]) -> Vec<String> {
             let Ok(text) = std::fs::read_to_string(&file) else {
                 continue;
             };
-            let mut found: HashSet<&str> = HashSet::new();
             for line in text.lines() {
                 let trimmed = line.trim_start();
                 if let Some(rest) = trimmed.strip_prefix("import ") {
-                    extract_dotted_modules_from_import(rest, &mut found);
+                    for chunk in rest.split(',') {
+                        let chunk = chunk.trim();
+                        let token = chunk.split_whitespace().next().unwrap_or("");
+                        if !token.is_empty() && is_valid_dotted_name(token) {
+                            found_owned.insert(token.to_owned());
+                        }
+                    }
                 } else if let Some(rest) = trimmed.strip_prefix("from ") {
                     if let Some(name) = first_dotted_token(rest) {
-                        found.insert(name);
+                        found_owned.insert(name.to_owned());
                     }
                 } else if let Some(rest) = trimmed.strip_prefix("lazy import ") {
                     // `lazy import np = numpy` — the RHS after `=`
@@ -1324,31 +1329,15 @@ pub fn collect_imported_modules(paths: &[PathBuf]) -> Vec<String> {
                     // introspect. Strip the alias prefix when present.
                     let after_eq = rest.split_once('=').map(|(_, r)| r).unwrap_or(rest);
                     if let Some(name) = first_dotted_token(after_eq) {
-                        found.insert(name);
+                        found_owned.insert(name.to_owned());
                     }
                 }
-            }
-            for item in found {
-                found_owned.insert(item.to_owned());
             }
         }
     }
     let mut out: Vec<String> = found_owned.into_iter().collect();
     out.sort();
     out
-}
-
-/// Extract the leading dotted-name token from an `import` continuation
-/// like `"foo.bar as baz"` or `"foo.bar, qux.zap"`. All modules listed
-/// in a comma-separated import are collected.
-fn extract_dotted_modules_from_import<'a>(rest: &'a str, out: &mut HashSet<&'a str>) {
-    for chunk in rest.split(',') {
-        let chunk = chunk.trim();
-        let token = chunk.split_whitespace().next().unwrap_or("");
-        if !token.is_empty() && is_valid_dotted_name(token) {
-            out.insert(token);
-        }
-    }
 }
 
 /// Strip the leading dotted-name token off `s` and return it. Returns

@@ -58,3 +58,6 @@
 ## 2024-10-05 - Avoid AST Deep Cloning in Iteration
 **Learning:** Index-based lookahead loops over `Vec<Stmt>` (e.g. `body[i].clone()`) cause massive O(N) deep copying of large AST nodes (like `FunctionDef` and `ClassDef`) just to satisfy ownership rules.
 **Action:** Use `body.into_iter()` combined with `iter.as_slice()` to peek ahead without consuming elements, and `iter.nth()` to skip consumed items. This allows taking ownership of AST nodes (`iter.next().unwrap()`) with zero allocations and zero deep cloning.
+## 2024-10-16 - Optimize import collection by avoiding intermediate allocations
+**Learning:** In Rust, avoiding intermediate collections (like `HashSet<&str>`) when building up a larger, owned collection (like `HashSet<String>`) reduces double-hashing and allocations. While parsing dependencies, we can skip staging tokens into an intermediate `HashSet` by directly inserting owned tokens into the destination `HashSet`.
+**Action:** Always prefer direct insertion into the destination collection when the intermediate collection is just a temporary staging area that is iterated over right after.
