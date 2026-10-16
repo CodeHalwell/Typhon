@@ -48,10 +48,13 @@ pub const SECRET_NAME_KEYWORDS: &[&str] = &[
     "PASSWORD",
     "PASSWD",
     "PASSPHRASE",
+    "APISECRET",
     "SECRET",
+    "APITOKEN",
     "TOKEN",
     "CREDENTIAL",
     "PRIVKEY",
+    "APPKEY",
     "APIKEY",
 ];
 
@@ -901,6 +904,9 @@ mod tests {
             ["DB", "PASSWORD", "STRING"]
         );
         assert_eq!(name_tokens("OAUTHTOKEN"), ["OAUTH", "TOKEN"]);
+        assert_eq!(name_tokens("APITOKEN"), ["APITOKEN"]);
+        assert_eq!(name_tokens("APISECRET"), ["APISECRET"]);
+        assert_eq!(name_tokens("APPKEY"), ["APPKEY"]);
         assert_eq!(name_tokens("MONKEY"), ["MONKEY"]);
         assert_eq!(name_tokens("PASSPORT"), ["PASSPORT"]);
         assert_eq!(name_tokens("myTokenValue"), ["MY", "TOKEN", "VALUE"]);
