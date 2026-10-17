@@ -4856,7 +4856,7 @@ fn inherit_parent_fields(body: Vec<Stmt>, plain_starts: &[u32]) -> Vec<Stmt> {
                         tyc_syntax::mro::field_collection_order(c.name.as_str(), parents);
 
                     let mut inherited: Vec<Stmt> = Vec::new();
-                    let mut placed: std::collections::HashSet<String> =
+                    let mut placed: std::collections::HashSet<&str> =
                         std::collections::HashSet::new();
                     for ancestor in &ancestors {
                         let Some(parent_fields) = field_map.get(ancestor) else {
@@ -4868,7 +4868,7 @@ fn inherit_parent_fields(body: Vec<Stmt>, plain_starts: &[u32]) -> Vec<Stmt> {
                                 continue;
                             };
                             let fname = nf.id.as_str();
-                            if !placed.insert(fname.to_owned()) {
+                            if !placed.insert(fname) {
                                 continue;
                             }
                             // A child re-declaration overrides the type but

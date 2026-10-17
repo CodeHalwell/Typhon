@@ -58,3 +58,7 @@
 ## 2024-10-05 - Avoid AST Deep Cloning in Iteration
 **Learning:** Index-based lookahead loops over `Vec<Stmt>` (e.g. `body[i].clone()`) cause massive O(N) deep copying of large AST nodes (like `FunctionDef` and `ClassDef`) just to satisfy ownership rules.
 **Action:** Use `body.into_iter()` combined with `iter.as_slice()` to peek ahead without consuming elements, and `iter.nth()` to skip consumed items. This allows taking ownership of AST nodes (`iter.next().unwrap()`) with zero allocations and zero deep cloning.
+
+## 2024-11-28 - Zero-Allocation mutable field sets during AST transformation
+**Learning:** `placed` inside `rewrite_mutable_field_defaults` and `inherit_parent_fields` previously constructed a new `HashSet<String>` iteratively using `.to_owned()` on AST node string slice identifiers.
+**Action:** By borrowing `HashSet<&str>` via `n.id.as_str()` bounded by the underlying slice lifetime across AST transformations, significant heap allocations can be avoided.
