@@ -45,14 +45,17 @@ use crate::ComptimeValue;
 /// accepted. This and the other word sets below are the single source both
 /// consumers of the heuristic share.
 pub const SECRET_NAME_KEYWORDS: &[&str] = &[
-    "PASSWORD",
-    "PASSWD",
     "PASSPHRASE",
+    "APISECRET",
+    "CREDENTIAL",
+    "APITOKEN",
+    "PASSWORD",
+    "APIKEY",
+    "APPKEY",
+    "PASSWD",
+    "PRIVKEY",
     "SECRET",
     "TOKEN",
-    "CREDENTIAL",
-    "PRIVKEY",
-    "APIKEY",
 ];
 
 /// Nouns that name a credential only when a [`SECRET_NAME_QUALIFIERS`] word
@@ -905,6 +908,9 @@ mod tests {
         assert_eq!(name_tokens("PASSPORT"), ["PASSPORT"]);
         assert_eq!(name_tokens("myTokenValue"), ["MY", "TOKEN", "VALUE"]);
         assert_eq!(name_tokens("APIKey"), ["API", "KEY"]);
+        assert_eq!(name_tokens("APITOKEN"), ["APITOKEN"]);
+        assert_eq!(name_tokens("APPKEY"), ["APPKEY"]);
+        assert_eq!(name_tokens("APISECRET"), ["APISECRET"]);
     }
 
     fn comptime_findings(src: &str) -> Vec<(String, String)> {
