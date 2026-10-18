@@ -58,3 +58,7 @@
 ## 2024-10-05 - Avoid AST Deep Cloning in Iteration
 **Learning:** Index-based lookahead loops over `Vec<Stmt>` (e.g. `body[i].clone()`) cause massive O(N) deep copying of large AST nodes (like `FunctionDef` and `ClassDef`) just to satisfy ownership rules.
 **Action:** Use `body.into_iter()` combined with `iter.as_slice()` to peek ahead without consuming elements, and `iter.nth()` to skip consumed items. This allows taking ownership of AST nodes (`iter.next().unwrap()`) with zero allocations and zero deep cloning.
+
+## 2024-11-28 - Zero-Allocation `bound_names_in_target`
+**Learning:** `bound_names_in_target` in `tyc-analyse` originally returned a new `Vec<String>` by cloning string identifiers inside AST nodes. As this is used to populate variables from assignment, `for`, and `with` targets inside hot paths, the repeated allocation of strings negatively impacted performance.
+**Action:** By modifying `bound_names_in_target` to populate a mutable `Vec<&'a str>` bounded to the lifetime of the incoming `&'a Expr` reference, we avoid `String` allocations entirely.

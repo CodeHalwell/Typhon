@@ -4143,10 +4143,12 @@ impl ModuleScope {
             match stmt {
                 Stmt::Assign(a) => {
                     for t in &a.targets {
-                        for name in bound_names_in_target(t) {
-                            note_binding(&name, &mut rebound);
+                        let mut names = Vec::new();
+                        bound_names_in_target(t, &mut names);
+                        for name in names {
+                            note_binding(name, &mut rebound);
                             if a.mutability == Some(ruff_python_ast::Mutability::Mut) {
-                                rebound.insert(name);
+                                rebound.insert(name.to_owned());
                             }
                         }
                     }
@@ -4165,15 +4167,19 @@ impl ModuleScope {
                     }
                 }
                 Stmt::For(f) => {
-                    for name in bound_names_in_target(&f.target) {
-                        rebound.insert(name);
+                    let mut names = Vec::new();
+                    bound_names_in_target(&f.target, &mut names);
+                    for name in names {
+                        rebound.insert(name.to_owned());
                     }
                 }
                 Stmt::With(w) => {
                     for item in &w.items {
                         if let Some(v) = &item.optional_vars {
-                            for name in bound_names_in_target(v) {
-                                rebound.insert(name);
+                            let mut names = Vec::new();
+                            bound_names_in_target(v, &mut names);
+                            for name in names {
+                                rebound.insert(name.to_owned());
                             }
                         }
                     }
@@ -4280,12 +4286,15 @@ impl ModuleScope {
                 }
                 Stmt::Assign(a) => {
                     for t in &a.targets {
-                        self.top_level_bound.extend(bound_names_in_target(t));
+                        let mut names = Vec::new();
+                        bound_names_in_target(t, &mut names);
+                        self.top_level_bound.extend(names.into_iter().map(|s| s.to_owned()));
                     }
                 }
                 Stmt::AnnAssign(a) => {
-                    self.top_level_bound
-                        .extend(bound_names_in_target(&a.target));
+                    let mut names = Vec::new();
+                    bound_names_in_target(&a.target, &mut names);
+                    self.top_level_bound.extend(names.into_iter().map(|s| s.to_owned()));
                 }
                 _ => {}
             }
@@ -4818,19 +4827,14 @@ fn bound_names_only(target: &Expr) -> bool {
 
 /// Bare names bound by an assignment / loop / `with` target, including
 /// tuple and list unpacking and starred elements.
-fn bound_names_in_target(target: &Expr) -> Vec<String> {
-    let mut out = Vec::new();
-    fn go(e: &Expr, out: &mut Vec<String>) {
-        match e {
-            Expr::Name(n) => out.push(n.id.as_str().to_owned()),
-            Expr::Tuple(t) => t.elts.iter().for_each(|e| go(e, out)),
-            Expr::List(l) => l.elts.iter().for_each(|e| go(e, out)),
-            Expr::Starred(s) => go(&s.value, out),
-            _ => {}
-        }
+fn bound_names_in_target<'a>(target: &'a Expr, out: &mut Vec<&'a str>) {
+    match target {
+        Expr::Name(n) => out.push(n.id.as_str()),
+        Expr::Tuple(t) => t.elts.iter().for_each(|e| bound_names_in_target(e, out)),
+        Expr::List(l) => l.elts.iter().for_each(|e| bound_names_in_target(e, out)),
+        Expr::Starred(s) => bound_names_in_target(&s.value, out),
+        _ => {}
     }
-    go(target, &mut out);
-    out
 }
 
 /// What the head of a type expression denotes (see [`ModuleScope::type_ref`]).
@@ -5952,8 +5956,10 @@ fn walk_expr_purity(expr: &Expr, ctx: &mut PurityCtx) {
 /// as locals so their reads are not mistaken for module-state reads.
 fn bind_comprehension_targets(generators: &[ruff_python_ast::Comprehension], ctx: &mut PurityCtx) {
     for g in generators {
-        for name in bound_names_in_target(&g.target) {
-            ctx.locals.insert(name);
+        let mut names = Vec::new();
+        bound_names_in_target(&g.target, &mut names);
+        for name in names {
+            ctx.locals.insert(name.to_owned());
         }
     }
 }
