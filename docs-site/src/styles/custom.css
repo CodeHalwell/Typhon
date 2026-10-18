@@ -46,3 +46,15 @@ starlight-tabs .tab > [role='tab']:hover { color: var(--sl-color-white); }
 @media (max-width: 50rem) { .hero { padding: 2rem 0; } .hero img { max-width: 10rem; } }
 @media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; } }
+
+/* Better Focus States for Composite Link Cards */
+@supports selector(:has(*)) {
+  .sl-link-card:has(:focus-visible) {
+    outline: 2px solid var(--sl-color-accent);
+    outline-offset: 3px;
+    border-radius: .75rem;
+  }
+  .sl-link-card :focus-visible {
+    outline: none;
+  }
+}
