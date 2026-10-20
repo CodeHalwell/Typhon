@@ -264,7 +264,7 @@ jobs:
         # up/download pairing across majors is unverified, and this job is
         # the release pipeline. Bump BOTH halves together (with a
         # pre-release dry-run tag) when moving off v4.
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
 
