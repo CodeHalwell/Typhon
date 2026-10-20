@@ -539,7 +539,8 @@ fn move_methods_to_impl(source: &str) -> String {
             end += 1;
         }
         // Scan for method names and aliases defined in this class body.
-        let mut defined_methods: HashSet<String> = HashSet::new();
+        // PERF: using &str here rather than String avoids heap allocations when tracking defined methods.
+        let mut defined_methods: HashSet<&str> = HashSet::new();
         let mut scan_idx = i + 1;
         while scan_idx < end {
             let r = lines[scan_idx].trim_end_matches(['\n', '\r']);
@@ -552,7 +553,7 @@ fn move_methods_to_impl(source: &str) -> String {
                         .unwrap_or(rest.len());
                     let name = &rest[..name_end];
                     if !name.is_empty() {
-                        defined_methods.insert(name.to_owned());
+                        defined_methods.insert(name);
                     }
                 } else if let Some(rest) = t.strip_prefix("async def ") {
                     let name_end = rest
@@ -560,7 +561,7 @@ fn move_methods_to_impl(source: &str) -> String {
                         .unwrap_or(rest.len());
                     let name = &rest[..name_end];
                     if !name.is_empty() {
-                        defined_methods.insert(name.to_owned());
+                        defined_methods.insert(name);
                     }
                 }
             }
@@ -574,7 +575,7 @@ fn move_methods_to_impl(source: &str) -> String {
             if !in_string[scan_idx] && ind == 4 {
                 if let Some((alias, target)) = parse_method_alias(t) {
                     if defined_methods.contains(target) {
-                        defined_methods.insert(alias.to_owned());
+                        defined_methods.insert(alias);
                     }
                 }
             }

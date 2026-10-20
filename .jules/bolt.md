@@ -58,3 +58,6 @@
 ## 2024-10-05 - Avoid AST Deep Cloning in Iteration
 **Learning:** Index-based lookahead loops over `Vec<Stmt>` (e.g. `body[i].clone()`) cause massive O(N) deep copying of large AST nodes (like `FunctionDef` and `ClassDef`) just to satisfy ownership rules.
 **Action:** Use `body.into_iter()` combined with `iter.as_slice()` to peek ahead without consuming elements, and `iter.nth()` to skip consumed items. This allows taking ownership of AST nodes (`iter.next().unwrap()`) with zero allocations and zero deep cloning.
+## 2024-11-28 - Zero-Allocation class and method tracking in local AST passes
+**Learning:** Checking local class boundaries (`placed` and `conflicting`) and method definitions (`defined_methods`) during local AST refactoring paths previously used `HashSet<String>`, cloning `&str` nodes with `.to_owned()` for every identified name. These names are only checked locally against the immediate file context during desugaring and migrating, introducing significant avoidable heap allocation overhead for every processed AST.
+**Action:** Replace `HashSet<String>` with `HashSet<&str>` across bounded AST passes by bounding the set to the lifetime of the parsed file lines or AST nodes (e.g. `&[Stmt]`) to eliminate these temporary strings.
