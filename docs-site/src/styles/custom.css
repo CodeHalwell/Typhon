@@ -46,3 +46,23 @@ starlight-tabs .tab > [role='tab']:hover { color: var(--sl-color-white); }
 @media (max-width: 50rem) { .hero { padding: 2rem 0; } .hero img { max-width: 10rem; } }
 @media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; } }
+
+/* Tactile interaction for clickable components */
+.card, .sl-link-card {
+  transition: border-color 160ms ease, transform 100ms ease;
+}
+.sl-link-card:active {
+  transform: scale(0.98);
+}
+.hero .sl-link-button {
+  transition: transform 100ms ease, border-color 160ms ease, background-color 160ms ease, color 160ms ease;
+}
+.hero .sl-link-button:active {
+  transform: scale(0.98);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sl-link-card:active, .hero .sl-link-button:active {
+    transform: none;
+  }
+}
