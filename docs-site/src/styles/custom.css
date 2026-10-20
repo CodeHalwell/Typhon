@@ -43,6 +43,10 @@ abbr[title] { cursor: help; text-decoration: underline dotted; }
 ::selection { background: var(--sl-color-accent-low); color: inherit; }
 .sl-markdown-content blockquote { border-left: 3px solid var(--sl-color-accent); padding: 1rem 1.25rem; background: var(--sl-color-gray-6); color: var(--sl-color-gray-2); }
 starlight-tabs .tab > [role='tab']:hover { color: var(--sl-color-white); }
+
+.hero .sl-link-button { transition: transform 150ms ease, box-shadow 150ms ease; }
+.hero .sl-link-button:hover, .hero .sl-link-button:focus-visible { transform: translateY(-2px); box-shadow: 0 4px 12px var(--sl-color-accent-low); }
+.hero .sl-link-button:active { transform: translateY(0); box-shadow: 0 2px 6px var(--sl-color-accent-low); }
 @media (max-width: 50rem) { .hero { padding: 2rem 0; } .hero img { max-width: 10rem; } }
 @media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } }
-@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; } }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; } .hero .sl-link-button { transform: none !important; transition: none !important; box-shadow: none !important; } }
