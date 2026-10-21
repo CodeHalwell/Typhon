@@ -147,15 +147,15 @@ class bytearray:
 
     def take_bytes(self, n=None, /):
         # 3.15: remove and return the first `n` bytes without a copy in
-        # CPython. Class bodies can't branch on the target, so older
-        # targets get CPython's missing-attribute error at the call.
-        if sys.version_info < (3, 15):
-            raise AttributeError("'bytearray' object has no attribute 'take_bytes'")
+        # CPython. Deleted below on older targets.
         size = len(self._data)
         if n is None:
             n = size
         elif not isinstance(n, int):
-            raise TypeError("n must be an integer or None")
+            index = getattr(type(n), "__index__", None)
+            if index is None:
+                raise TypeError("n must be an integer or None")
+            n = index(n)
         if n < 0:
             n += size
         if n < 0 or n > size:
@@ -224,6 +224,11 @@ class bytearray:
     @classmethod
     def fromhex(cls, text):
         return cls(bytes.fromhex(text))
+
+
+
+if sys.version_info < (3, 15):
+    del bytearray.take_bytes
 
 
 def _coerce(value):
