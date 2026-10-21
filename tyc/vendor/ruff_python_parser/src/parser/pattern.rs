@@ -23,6 +23,7 @@ const LITERAL_PATTERN_START_SET: TokenSet = TokenSet::new([
     TokenKind::Float,
     TokenKind::Complex,
     TokenKind::Minus, // Unary minus
+    TokenKind::Plus,  // Unary plus (Python 3.15)
 ]);
 
 /// The set of tokens that can start a pattern.

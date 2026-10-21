@@ -1178,7 +1178,8 @@ impl RecoveryContextKind {
             | RecoveryContextKind::TupleElements(_) => p.at_expr(),
             RecoveryContextKind::DictElements => p.at(TokenKind::DoubleStar) || p.at_expr(),
             RecoveryContextKind::SequenceMatchPattern(_) => {
-                // `+` doesn't start any pattern but is here for better error recovery.
+                // `+` starts a literal pattern from Python 3.15 (and is in
+                // `at_pattern_start` for that); kept here for error recovery.
                 p.at(TokenKind::Plus) || p.at_pattern_start()
             }
             RecoveryContextKind::MatchPatternMapping => {

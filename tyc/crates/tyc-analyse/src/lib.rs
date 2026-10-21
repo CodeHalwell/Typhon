@@ -8271,6 +8271,22 @@ mod lint_tests {
             target_errors(src, (3, 15)).is_empty(),
             "3.15 allows `case +1:`"
         );
+        // Nested in sequence, mapping and class patterns too.
+        for case in ["[+1, _]", "{+1: _}", "complex(+1)", "(+1 | 2)"] {
+            let src = format!(
+                "def f(x: object) -> str:\n    match x:\n        case {case}:\n            return \"one\"\n        case _:\n            return \"other\"\n"
+            );
+            let on_313 = target_errors(&src, (3, 13));
+            assert!(
+                on_313.iter().any(|c| c.contains("requires_newer_python")),
+                "expected requires_newer_python on 3.13 for {case}; got {on_313:?}"
+            );
+            let on_315 = target_errors(&src, (3, 15));
+            assert!(
+                on_315.is_empty(),
+                "3.15 allows `case {case}:`; got {on_315:?}"
+            );
+        }
         // A `+` elsewhere on a case line is not a unary-plus pattern.
         let src = "def f(x: int) -> str:\n    match x:\n        case 1 if x + 1 > 0:\n            return \"one\"\n        case _:\n            return \"other\"\n";
         assert!(target_errors(src, (3, 13)).is_empty());
