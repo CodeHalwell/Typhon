@@ -1855,6 +1855,134 @@ fn runtime_bound_names(
     (b.runtime, exported, b.mutated)
 }
 
+/// Whether CPython, for the `[python] target` set by [`set_python_target`],
+/// opens a text file without `encoding=` as UTF-8 on this host, as the VM
+/// always does. Python 3.15 does on every host (PEP 686); 3.13 and 3.14 use
+/// the locale's encoding unless UTF-8 mode is on. `PYTHONUTF8` overrides
+/// both ways. The locale check errs towards "not UTF-8", since the caller
+/// uses a `false` to run the program on CPython instead.
+pub fn host_text_encoding_is_utf8() -> bool {
+    match std::env::var("PYTHONUTF8").ok().as_deref() {
+        Some("1") => true,
+        Some("0") => locale_is_utf8(),
+        _ => python_target() >= (3, 15) || locale_is_utf8(),
+    }
+}
+
+#[cfg(windows)]
+fn locale_is_utf8() -> bool {
+    // CPython before 3.15 uses the ANSI code page, which is rarely UTF-8.
+    false
+}
+
+#[cfg(not(windows))]
+fn locale_is_utf8() -> bool {
+    let value = ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .find(|v| !v.is_empty());
+    match value.as_deref() {
+        // The C locale is coerced to UTF-8 (PEP 538) or turns on UTF-8 mode
+        // (PEP 540); with both switched off it stays ASCII.
+        None | Some("C") | Some("POSIX") => {
+            let off = |k: &str| std::env::var(k).is_ok_and(|v| v == "0");
+            !(off("PYTHONUTF8") && off("PYTHONCOERCECLOCALE"))
+        }
+        Some(v) => {
+            let codeset = v.split_once('.').map(|(_, c)| c).unwrap_or("");
+            let codeset = codeset.split('@').next().unwrap_or("");
+            codeset.to_ascii_lowercase().replace('-', "") == "utf8"
+        }
+    }
+}
+
+/// Whether `module` opens a file in text mode without naming an encoding:
+/// `open(...)`, `io.open(...)`, or a `.open(...)` / `.read_text(...)` /
+/// `.write_text(...)` method call, with no string-literal encoding (keyword
+/// or positional) and no constant binary mode. A non-literal encoding may be
+/// `None`, so it counts as missing. Such a call depends on the host's default text encoding, so
+/// where that isn't UTF-8 (see [`host_text_encoding_is_utf8`]) `tyc run`
+/// runs the program on CPython. Any receiver counts for the method forms;
+/// a false positive only costs the fallback.
+pub fn module_opens_text_without_encoding(module: &ruff_python_ast::ModModule) -> bool {
+    use ruff_python_ast::visitor::{self, Visitor};
+    use ruff_python_ast::{Expr, ExprCall};
+
+    fn is_binary_mode(e: Option<&Expr>) -> bool {
+        matches!(e, Some(Expr::StringLiteral(s)) if {
+            let m = s.value.to_str();
+            m.contains('b') && m.chars().all(|c| "rwxabt+U".contains(c))
+        })
+    }
+    fn opens_text(call: &ExprCall) -> bool {
+        let args = &call.arguments;
+        // Only a string literal settles the encoding: `None` means the
+        // locale default again, and any other expression (a variable, a
+        // `**kwargs`) may be `None` at run time.
+        let settled = |e: &Expr| matches!(e, Expr::StringLiteral(_));
+        if args
+            .keywords
+            .iter()
+            .any(|k| k.arg.as_ref().is_some_and(|a| a.as_str() == "encoding") && settled(&k.value))
+        {
+            return false;
+        }
+        let mode_kw = args
+            .keywords
+            .iter()
+            .find(|k| k.arg.as_ref().is_some_and(|a| a.as_str() == "mode"))
+            .map(|k| &k.value);
+        let no_encoding_at = |i: usize| args.args.get(i).is_none_or(|e| !settled(e));
+        match call.func.as_ref() {
+            Expr::Name(n) if n.id.as_str() == "open" => {
+                // open(file, mode, buffering, encoding, ...)
+                !is_binary_mode(args.args.get(1).or(mode_kw)) && no_encoding_at(3)
+            }
+            Expr::Attribute(a) => match a.attr.as_str() {
+                // io.open has open's signature; Path.open(mode, buffering,
+                // encoding, ...). Any other receiver may be either (an
+                // `import io as i` alias), so both shapes are checked.
+                "open" => {
+                    if matches!(a.value.as_ref(), Expr::Name(n) if n.id.as_str() == "io") {
+                        !is_binary_mode(args.args.get(1).or(mode_kw)) && no_encoding_at(3)
+                    } else {
+                        let binary = is_binary_mode(mode_kw)
+                            || is_binary_mode(args.args.first())
+                            || is_binary_mode(args.args.get(1));
+                        !binary && no_encoding_at(2) && no_encoding_at(3)
+                    }
+                }
+                // Path.read_text(encoding, ...) / write_text(data, encoding, ...)
+                "read_text" => no_encoding_at(0),
+                "write_text" => no_encoding_at(1),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+    #[derive(Default)]
+    struct Scan {
+        found: bool,
+    }
+    impl<'a> Visitor<'a> for Scan {
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            if self.found {
+                return;
+            }
+            if let Expr::Call(call) = expr {
+                if opens_text(call) {
+                    self.found = true;
+                    return;
+                }
+            }
+            visitor::walk_expr(self, expr);
+        }
+    }
+    let mut scan = Scan::default();
+    scan.visit_body(&module.body);
+    scan.found
+}
+
 /// Whether `module` defines a generator whose `yield` sits where the
 /// tree-walk cannot suspend (a loop test, a `with` item, two yields in one
 /// expression, …). The VM runs such a generator eagerly — its whole body at
@@ -1966,6 +2094,39 @@ mod parity_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_opens_without_a_definite_encoding_are_detected() {
+        let scan = |src: &str| {
+            let parsed = tyc_syntax::parse_module(src).expect("parse failed");
+            module_opens_text_without_encoding(parsed.syntax())
+        };
+        for src in [
+            "open('f')\n",
+            "open('f', 'r')\n",
+            "open('f', encoding=None)\n",
+            "open('f', **opts)\n",
+            "open('f', 'r', -1, None)\n",
+            "p.read_text()\n",
+            "p.read_text(None)\n",
+            "open('f', encoding=enc)\n",
+            "import io as i\ni.open('f', 'r', -1, None)\n",
+        ] {
+            assert!(scan(src), "{src:?} should need the host encoding");
+        }
+        for src in [
+            "open('f', encoding='utf-8')\n",
+            "open('f', 'rb')\n",
+            "open('f', mode='wb')\n",
+            "p.read_text('utf-8')\n",
+            "open('f', 'r', -1, 'utf-8')\n",
+            "import io as i\ni.open('f', 'r', -1, 'utf-8')\n",
+            "i.open('data.bin', 'rb')\n",
+            "p.open('r', -1, 'utf-8')\n",
+        ] {
+            assert!(!scan(src), "{src:?} names its encoding");
+        }
+    }
 
     /// The CLI runs the interpreter on a dedicated 256 MiB worker stack
     /// (`tyc/src/main.rs`); libtest threads get 2 MiB, which a deep but

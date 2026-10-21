@@ -20,9 +20,11 @@ free-threaded = false
 
 - **`"3.13"`** — default. Supports PEP 695 generics natively. Most projects.
 - **`"3.14"`** — same, plus 3.14 syntax: t-strings and unparenthesised `except A, B:`.
-- **`"3.15"`** — same, plus native [PEP 810](https://peps.python.org/pep-0810/) lowering for `lazy import`: the emitter drops the `typhon_runtime` proxy-class helper entirely and emits the native `lazy import MODULE as ALIAS` statement instead. A project whose only runtime-touching feature was `lazy import` ships no generated `typhon_runtime/` package at all on this target. `3.13` / `3.14` output is unaffected — byte-for-byte unchanged. A 3.15 target also unlocks unpacking comprehensions (`[*xs for xs in lists]`, `{**d for d in ds}`) and the `frozendict` and `sentinel` builtins.
+- **`"3.15"`** — same, plus native [PEP 810](https://peps.python.org/pep-0810/) lowering for `lazy import`: the emitter drops the `typhon_runtime` proxy-class helper entirely and emits the native `lazy import MODULE as ALIAS` statement instead. A project whose only runtime-touching feature was `lazy import` ships no generated `typhon_runtime/` package at all on this target. `3.13` / `3.14` output is unaffected — byte-for-byte unchanged. A 3.15 target also unlocks unpacking comprehensions (`[*xs for xs in lists]`, `{**d for d in ds}`), unary `+` in literal patterns (`case +1:`), the `frozendict` and `sentinel` builtins, `re.prefixmatch`, the `math.integer` module and `bytearray.take_bytes`, plus [`tyc profile`](/Typhon/cli/profile/)'s sampling mode and [`[optimise] lazy-imports = "all"`](/Typhon/configuration/overview/#optimise).
 
-Syntax and builtins newer than the target are rejected with [`tyc::requires_newer_python`](/Typhon/diagnostics/compile-errors/), since the emitted `.py` could not compile or run there. Stdlib imports are vetted against the target as well: `import sre_parse` warns on 3.15, where the module was removed.
+New projects from [`tyc init`](/Typhon/cli/init/) target `"3.15"`; a `typhon.toml` without a `target` keeps the `"3.13"` minimum.
+
+Syntax, builtins and stdlib names newer than the target are rejected with [`tyc::requires_newer_python`](/Typhon/diagnostics/compile-errors/), since the emitted `.py` could not compile or run there. Stdlib imports are vetted against the target as well: `import sre_parse` warns on 3.15, where the module was removed.
 
 Older targets (`"3.12"`, `"3.11"`) are not supported in v1 — they would need a PEP 695 → `TypeVar` rewrite that we haven't built.
 

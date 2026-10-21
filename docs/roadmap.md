@@ -10,6 +10,14 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Current release
 
+**[v1.0.0-beta.4](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-beta.4) — 2026-10-21.**
+Making more of Python 3.15. `tyc init` scaffolds `target = "3.15"`,
+`tyc profile` samples with 3.15's Tachyon profiler and maps the stacks back
+to `.ty` lines, `re.prefixmatch`, `math.integer`, `bytearray.take_bytes` and
+`case +1:` work on 3.15 targets, and `[optimise] jit` / `lazy-imports =
+"all"` are opt-in. The default target for an existing project stays 3.13.
+A non-blocking CI job runs the 3.16 alphas.
+
 **[v1.0.0-beta.3](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-beta.3) — 2026-10-09.**
 Python 3.15 targets and VM ↔ CPython parity gap fixes. CPython 3.15 joins
 3.13 in CI, a `[python] target` of 3.15 unlocks its new syntax and builtins,

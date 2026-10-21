@@ -210,8 +210,8 @@ src = "src"
 out = "build"
 
 [python]
-target = "3.13"
-# free-threaded = true   # opt into Python 3.13t free-threaded build
+target = "3.15"          # newest CPython; "3.13" and "3.14" are also supported
+# free-threaded = true   # opt into the free-threaded build (target = "3.15t")
 
 # [optimise]
 # level = 1   # enable auto-memoise/auto-gather/auto-parallel/pgo-memoise (as `tyc build -O` does)
@@ -464,6 +464,17 @@ mod tests {
                 "sanitising {raw:?} produced an invalid name {out:?}"
             );
         }
+    }
+
+    /// New projects target the newest supported CPython. The config default
+    /// (a `typhon.toml` with no `target`) stays at the 3.13 minimum, so this
+    /// changes nothing for existing projects.
+    #[test]
+    fn scaffold_targets_python_3_15() {
+        let toml = render_typhon_toml("t");
+        let cfg: crate::config::TyphonConfig = toml::from_str(&toml).unwrap();
+        assert_eq!(cfg.python.target, "3.15");
+        assert_eq!(crate::config::TyphonConfig::default().python.target, "3.13");
     }
 
     /// W4-14: the scaffold must not pin the optimiser knobs to `false` — an

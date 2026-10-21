@@ -227,18 +227,35 @@ pub fn target_version_diagnostics(path: &str, source: &str, major: u8, minor: u8
             usize::from(hit.range.len()),
         ));
     }
-    // Parse again only when a newer builtin's name appears in the text.
+    // Parse again only when a newer builtin's or stdlib API's name appears
+    // in the text.
     let may_use_newer_builtin = NEWER_BUILTINS
         .iter()
         .any(|(name, added)| (major, minor) < *added && source.contains(name));
-    if !may_use_newer_builtin {
+    let may_use_newer_stdlib = NEWER_STDLIB
+        .iter()
+        .any(|(_, name, added)| (major, minor) < *added && source.contains(name));
+    if !may_use_newer_builtin && !may_use_newer_stdlib {
         return diags;
     }
     if let Ok(parsed) = tyc_syntax::parse_module(source) {
-        for (name, added, range) in newer_builtin_uses(&parsed.into_syntax(), (major, minor)) {
+        let module = parsed.into_syntax();
+        for (name, added, range) in newer_builtin_uses(&module, (major, minor)) {
             diags.push_error(TycError::requires_newer_python(
                 format!(
                     "`{name}` is a builtin added in Python 3.{} and the project targets {major}.{minor}",
+                    added.1
+                ),
+                path.to_owned(),
+                source.to_owned(),
+                usize::from(range.start()),
+                usize::from(range.len()),
+            ));
+        }
+        for (qualified, added, range) in newer_stdlib_uses(&module, (major, minor)) {
+            diags.push_error(TycError::requires_newer_python(
+                format!(
+                    "`{qualified}` was added in Python 3.{} and the project targets {major}.{minor}",
                     added.1
                 ),
                 path.to_owned(),
@@ -284,6 +301,9 @@ pub fn target_version_check_may_fire(source: &str, major: u8, minor: u8) -> bool
         || NEWER_BUILTINS
             .iter()
             .any(|(name, added)| (major, minor) < *added && source.contains(name))
+        || NEWER_STDLIB
+            .iter()
+            .any(|(_, name, added)| (major, minor) < *added && source.contains(name))
 }
 
 /// Builtins newer than the 3.13 floor, with the version that added them.
@@ -293,6 +313,196 @@ const NEWER_BUILTINS: &[(&str, (u8, u8))] = &[
     // PEP 661
     ("sentinel", (3, 15)),
 ];
+
+/// Module attributes newer than the 3.13 floor: `(module, name, added)`.
+/// A `module.name` that is itself a module (`math.integer`) is matched in
+/// `import` / `from` statements as well as attribute reads.
+const NEWER_STDLIB: &[(&str, &str, (u8, u8))] = &[
+    // re.prefixmatch, the explicit name for `re.match`
+    ("re", "prefixmatch", (3, 15)),
+    // PEP 791
+    ("math", "integer", (3, 15)),
+];
+
+/// Every use of a [`NEWER_STDLIB`] attribute `target` does not have:
+/// `module.name` where `module` is bound only by `import module` (or
+/// `import module as alias`), `from module import name`, and `import
+/// module.name` / `from module.name import …` for a submodule. Methods of
+/// instances (`Pattern.prefixmatch`, `bytearray.take_bytes`) need types and
+/// are not covered.
+fn newer_stdlib_uses(module: &ModModule, target: (u8, u8)) -> Vec<(String, (u8, u8), TextRange)> {
+    use ruff_python_ast::visitor::source_order::{
+        walk_expr, walk_parameter, walk_stmt, SourceOrderVisitor,
+    };
+    use ruff_python_ast::{ExprContext, Parameter};
+    let newer = |m: &str, n: &str| {
+        NEWER_STDLIB
+            .iter()
+            .find(|(mm, nn, added)| *mm == m && *nn == n && target < *added)
+            .map(|(_, _, added)| *added)
+    };
+    #[derive(Default)]
+    struct V {
+        /// Local name → the module an `import` bound it to.
+        imported: HashMap<String, String>,
+        /// Names also bound some other way, which may not be the module.
+        rebound: HashSet<String>,
+        attrs: Vec<(String, String, TextRange)>,
+        /// Uses found directly in import statements.
+        direct: Vec<(String, String, TextRange)>,
+        /// Inside a `try` with handlers, or an `if` / conditional expression
+        /// that tests `sys.version_info`, `hasattr` or `getattr`: a feature
+        /// probe that runs fine on an older target, so nothing is reported.
+        guarded: u32,
+    }
+    /// Whether `expr` reads `version_info` or calls `hasattr` / `getattr`.
+    fn is_feature_test(expr: &Expr) -> bool {
+        #[derive(Default)]
+        struct T(bool);
+        impl<'a> SourceOrderVisitor<'a> for T {
+            fn visit_expr(&mut self, expr: &'a Expr) {
+                match expr {
+                    Expr::Attribute(a) if a.attr.as_str() == "version_info" => self.0 = true,
+                    Expr::Name(n)
+                        if matches!(n.id.as_str(), "version_info" | "hasattr" | "getattr") =>
+                    {
+                        self.0 = true
+                    }
+                    _ => {}
+                }
+                walk_expr(self, expr);
+            }
+        }
+        let mut t = T::default();
+        t.visit_expr(expr);
+        t.0
+    }
+    impl<'ast> SourceOrderVisitor<'ast> for V {
+        fn visit_stmt(&mut self, stmt: &'ast Stmt) {
+            let guard = match stmt {
+                Stmt::Try(t) => !t.handlers.is_empty(),
+                Stmt::If(i) => {
+                    is_feature_test(&i.test)
+                        || i.elif_else_clauses
+                            .iter()
+                            .any(|c| c.test.as_ref().is_some_and(is_feature_test))
+                }
+                _ => false,
+            };
+            if guard {
+                self.guarded += 1;
+                walk_stmt(self, stmt);
+                self.guarded -= 1;
+                return;
+            }
+            match stmt {
+                Stmt::Import(i) => {
+                    for alias in &i.names {
+                        let dotted = alias.name.as_str();
+                        if let Some((parent, child)) =
+                            dotted.rsplit_once('.').filter(|_| self.guarded == 0)
+                        {
+                            self.direct.push((
+                                parent.to_owned(),
+                                child.to_owned(),
+                                alias.name.range,
+                            ));
+                        }
+                        match &alias.asname {
+                            Some(a) => {
+                                self.imported.insert(a.to_string(), dotted.to_owned());
+                            }
+                            None => {
+                                let root = dotted.split('.').next().unwrap_or_default();
+                                self.imported.insert(root.to_owned(), root.to_owned());
+                            }
+                        }
+                    }
+                }
+                Stmt::ImportFrom(i) if i.level == 0 => {
+                    if let Some(m) = &i.module {
+                        let m = m.as_str();
+                        let record = self.guarded == 0;
+                        if let Some((parent, child)) = m.rsplit_once('.').filter(|_| record) {
+                            self.direct
+                                .push((parent.to_owned(), child.to_owned(), i.range));
+                        }
+                        for alias in &i.names {
+                            if record {
+                                self.direct.push((
+                                    m.to_owned(),
+                                    alias.name.to_string(),
+                                    alias.name.range,
+                                ));
+                            }
+                            let bound = alias.asname.as_ref().unwrap_or(&alias.name);
+                            self.rebound.insert(bound.to_string());
+                        }
+                    }
+                }
+                Stmt::FunctionDef(f) => {
+                    self.rebound.insert(f.name.to_string());
+                }
+                Stmt::ClassDef(c) => {
+                    self.rebound.insert(c.name.to_string());
+                }
+                _ => {}
+            }
+            walk_stmt(self, stmt);
+        }
+        fn visit_expr(&mut self, expr: &'ast Expr) {
+            if let Expr::If(e) = expr {
+                if is_feature_test(&e.test) {
+                    self.guarded += 1;
+                    walk_expr(self, expr);
+                    self.guarded -= 1;
+                    return;
+                }
+            }
+            match expr {
+                Expr::Attribute(a) if self.guarded == 0 => {
+                    if let Expr::Name(n) = a.value.as_ref() {
+                        if n.ctx == ExprContext::Load {
+                            self.attrs
+                                .push((n.id.to_string(), a.attr.to_string(), a.attr.range));
+                        }
+                    }
+                }
+                Expr::Name(n) if n.ctx != ExprContext::Load => {
+                    self.rebound.insert(n.id.to_string());
+                }
+                _ => {}
+            }
+            walk_expr(self, expr);
+        }
+        fn visit_parameter(&mut self, parameter: &'ast Parameter) {
+            self.rebound.insert(parameter.name.to_string());
+            walk_parameter(self, parameter);
+        }
+    }
+    let mut v = V::default();
+    v.visit_body(&module.body);
+    let mut out = Vec::new();
+    for (m, n, range) in &v.direct {
+        if let Some(added) = newer(m, n) {
+            out.push((format!("{m}.{n}"), added, *range));
+        }
+    }
+    for (local, attr, range) in &v.attrs {
+        if v.rebound.contains(local) {
+            continue;
+        }
+        let Some(m) = v.imported.get(local) else {
+            continue;
+        };
+        if let Some(added) = newer(m, attr) {
+            out.push((format!("{m}.{attr}"), added, *range));
+        }
+    }
+    out.sort_by_key(|(_, _, r)| r.start());
+    out.dedup_by_key(|(_, _, r)| r.start());
+    out
+}
 
 /// Every read of a [`NEWER_BUILTINS`] name `target` does not have. A module
 /// that binds the name anywhere (its own `frozendict` class, an import, a
@@ -4397,6 +4607,7 @@ impl ModuleScope {
                             | "range"
                             | "tuple"
                             | "frozenset"
+                            | "frozendict"
                     ),
                     TypeRef::User(c) => immutable_classes.contains(&c),
                     TypeRef::Path(p) => {
@@ -4411,7 +4622,9 @@ impl ModuleScope {
                     other => vec![other],
                 };
                 match self.type_ref(&sub.value) {
-                    TypeRef::Builtin(b) if matches!(b.as_str(), "tuple" | "frozenset" | "type") => {
+                    TypeRef::Builtin(b)
+                        if matches!(b.as_str(), "tuple" | "frozenset" | "frozendict" | "type") =>
+                    {
                         args.iter().all(|a| rec(a))
                     }
                     TypeRef::Path(p) => match p.as_str() {
@@ -4477,7 +4690,11 @@ impl ModuleScope {
                 };
                 let all_nested = || args.iter().all(|a| self.cache_key_in(a, key_safe, true));
                 match self.type_ref(&sub.value) {
-                    TypeRef::Builtin(b) if matches!(b.as_str(), "tuple" | "frozenset") => {
+                    // A frozendict (PEP 814) hashes and compares by its
+                    // items, so its keys and values follow the tuple rule.
+                    TypeRef::Builtin(b)
+                        if matches!(b.as_str(), "tuple" | "frozenset" | "frozendict") =>
+                    {
                         all_nested()
                     }
                     TypeRef::Path(p) => match p.as_str() {
@@ -4860,6 +5077,8 @@ fn is_builtin_type_name(name: &str) -> bool {
             | "range"
             | "tuple"
             | "frozenset"
+            // PEP 814 (3.15); `tyc::requires_newer_python` rejects it earlier.
+            | "frozendict"
             | "type"
             | "object"
             | "list"
@@ -8096,6 +8315,86 @@ mod lint_tests {
     }
 
     #[test]
+    fn unary_plus_literal_patterns_need_3_15() {
+        let src = "def f(x: int) -> str:\n    match x:\n        case +1:\n            return \"one\"\n        case _:\n            return \"other\"\n";
+        let on_313 = target_errors(src, (3, 13));
+        assert!(
+            on_313.iter().any(|c| c.contains("requires_newer_python")),
+            "expected requires_newer_python on 3.13; got {on_313:?}"
+        );
+        assert!(
+            target_errors(src, (3, 15)).is_empty(),
+            "3.15 allows `case +1:`"
+        );
+        // Nested in sequence, mapping and class patterns too.
+        for case in [
+            "[+1, _]",
+            "{+1: _}",
+            "complex(+1)",
+            "(+1 | 2)",
+            "(\n            +1\n        )",
+        ] {
+            let src = format!(
+                "def f(x: object) -> str:\n    match x:\n        case {case}:\n            return \"one\"\n        case _:\n            return \"other\"\n"
+            );
+            let on_313 = target_errors(&src, (3, 13));
+            assert!(
+                on_313.iter().any(|c| c.contains("requires_newer_python")),
+                "expected requires_newer_python on 3.13 for {case}; got {on_313:?}"
+            );
+            let on_315 = target_errors(&src, (3, 15));
+            assert!(
+                on_315.is_empty(),
+                "3.15 allows `case {case}:`; got {on_315:?}"
+            );
+        }
+        // A `+` elsewhere on a case line is not a unary-plus pattern.
+        let src = "def f(x: int) -> str:\n    match x:\n        case 1 if x + 1 > 0:\n            return \"one\"\n        case _:\n            return \"other\"\n";
+        assert!(target_errors(src, (3, 13)).is_empty());
+    }
+
+    #[test]
+    fn newer_stdlib_apis_are_gated_on_the_target() {
+        for src in [
+            "import re\nlet m = re.prefixmatch(\"a\", \"abc\")\nprint(m)\n",
+            "import re as r\nprint(r.prefixmatch(\"a\", \"abc\"))\n",
+            "from re import prefixmatch\nprint(prefixmatch(\"a\", \"abc\"))\n",
+            "import math.integer\nprint(math.integer.isqrt(9))\n",
+            "from math.integer import isqrt\nprint(isqrt(9))\n",
+            "from math import integer\nprint(integer.isqrt(9))\n",
+            "import math\nprint(math.integer.isqrt(9))\n",
+        ] {
+            let on_313 = target_errors(src, (3, 13));
+            assert!(
+                on_313.iter().any(|c| c.contains("requires_newer_python")),
+                "expected requires_newer_python on 3.13 for {src:?}; got {on_313:?}"
+            );
+            assert!(
+                target_errors(src, (3, 15)).is_empty(),
+                "3.15 has it: {src:?}"
+            );
+        }
+        // Not the stdlib module: a parameter named `re`, a local `math`
+        // class, and an attribute of something else.
+        for src in [
+            "def f(re: str) -> None:\n    print(re.prefixmatch)\n",
+            "class math:\n    integer: int = 1\nprint(math.integer)\n",
+            "import re\nlet p = re.compile(\"a\")\nprint(p.match(\"a\"))\n",
+            // Feature probes run fine on 3.13.
+            "try:\n    from re import prefixmatch\nexcept ImportError:\n    prefixmatch = None\nprint(prefixmatch)\n",
+            "try:\n    import math.integer\nexcept ImportError:\n    pass\n",
+            "import re\nimport sys\nif sys.version_info >= (3, 15):\n    print(re.prefixmatch(\"a\", \"a\"))\n",
+            "import re\nif hasattr(re, \"prefixmatch\"):\n    print(re.prefixmatch(\"a\", \"a\"))\n",
+            "import re\nlet f = re.prefixmatch if hasattr(re, \"prefixmatch\") else re.match\nprint(f)\n",
+        ] {
+            assert!(
+                target_errors(src, (3, 13)).is_empty(),
+                "false positive on 3.13 for {src:?}"
+            );
+        }
+    }
+
+    #[test]
     fn newer_builtins_are_gated_on_the_target() {
         let src = "let fd = frozendict(a=1)\nlet m = sentinel(\"M\")\nprint(fd, m)\n";
         let on_313 = target_errors(src, (3, 13));
@@ -9079,6 +9378,19 @@ def f(xs: tuple[int, ...], s: str) -> str:
         // Top-level int / str / bytes / Optional are fine (typed=True).
         let ok = "def f(a: int, b: str, c: bytes, d: int | None) -> int:\n    return a\n";
         assert_eq!(auto_decision(ok, "f", &[]), Some(CacheKind::Auto));
+    }
+
+    #[test]
+    fn frozendict_params_are_cache_keys_under_the_tuple_rule() {
+        // PEP 814's frozendict hashes by its items: sound when its keys and
+        // values are (`frozendict(a=True) == frozendict(a=1)`, so no ints).
+        let ok = "def f(d: frozendict[bool, bool | None]) -> int:\n    return len(d)\n";
+        assert_eq!(auto_decision(ok, "f", &[]), Some(CacheKind::Auto));
+        let ints = "def f(d: frozendict[str, int]) -> int:\n    return len(d)\n";
+        assert_eq!(auto_decision(ints, "f", &[]), None);
+        // A plain dict never is.
+        let dict = "def f(d: dict[bool, bool]) -> int:\n    return len(d)\n";
+        assert_eq!(auto_decision(dict, "f", &[]), None);
     }
 
     #[test]

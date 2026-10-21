@@ -1,0 +1,17 @@
+# `[optimise] lazy-imports = "all"` (PEP 810's global mode, 3.15 targets):
+# the entry module switches every later import to lazy before its own
+# imports run. Laziness changes only *when* a module loads, so the output is
+# the same with the knob off; main() checks the mode itself.
+import json
+import sys
+
+import shapes
+
+
+def main() -> None:
+    print(json.dumps({"area": shapes.area(3, 4)}))
+    print(sys.get_lazy_imports() in ("all", "normal"))
+
+
+if __name__ == "__main__":
+    main()

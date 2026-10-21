@@ -24,6 +24,8 @@ free-threaded = false
 
 [optimise]
 level = 0
+jit = false
+lazy-imports = "normal"
 
 [emit]
 class-default = "dataclass"
@@ -94,7 +96,7 @@ One emit policy is no longer configurable and runs unconditionally:
 
 ## `[optimise]`
 
-A single project-wide dial that flips the *default* of four other opt-in [`[strictness]`](/Typhon/configuration/strictness/) knobs — `auto-memoise`, `auto-gather`, `auto-parallel`, `pgo-memoise` — without touching each one individually.
+A single project-wide dial that flips the *default* of four other opt-in [`[strictness]`](/Typhon/configuration/strictness/) knobs — `auto-memoise`, `auto-gather`, `auto-parallel`, `pgo-memoise` — without touching each one individually, plus two opt-in CPython runtime switches (`jit`, `lazy-imports`).
 
 ```toml
 [optimise]
@@ -104,6 +106,8 @@ level = 0
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `level` | `0` \| `1` | `0` | `0` leaves every optimisation knob at its own default. `1` flips the default of `auto-memoise` / `auto-gather` / `auto-parallel` / `pgo-memoise` to `true`. Any other integer is rejected at config load. |
+| `jit` | bool | `false` | Run the program with CPython's experimental JIT (`PYTHON_JIT=1`) whenever `tyc` starts the interpreter: `tyc run --compile`, `tyc run`'s automatic CPython fallback, and `tyc profile`. A `PYTHON_JIT` already in the environment wins. It does nothing on an interpreter built without the JIT, and `python build/main.py` run by hand needs `PYTHON_JIT=1` set itself. Python 3.15's JIT averages 7–12% faster depending on platform, but single programs vary, so measure. |
+| `lazy-imports` | `"normal"` \| `"all"` | `"normal"` | `"all"` switches on [PEP 810](https://peps.python.org/pep-0810/)'s global mode: each emitted module opens with `if __name__ == "__main__": __import__("sys").set_lazy_imports("all")`, so when it runs as the entry script every later import loads on first use. Needs a 3.15+ target. `tyc run` uses CPython for such a project, since the VM imports eagerly. |
 
 <Aside type="tip">
   An explicit `[strictness]` entry always wins over the level-derived default, so a project can opt into `level = 1` and still keep one knob off:

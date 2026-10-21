@@ -1994,7 +1994,7 @@ dependencies = [
 
 [[package]]
 name = "tyc"
-version = "1.0.0-beta.3"
+version = "1.0.0-beta.4"
 dependencies = [
  "clap",
  "itoa",
@@ -2026,7 +2026,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-analyse"
-version = "1.0.0-beta.3"
+version = "1.0.0-beta.4"
 dependencies = [
  "miette",
  "ruff_python_ast",
@@ -2040,7 +2040,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-db"
-version = "1.0.0-beta.3"
+version = "1.0.0-beta.4"
 dependencies = [
  "criterion",
  "salsa",
@@ -2053,7 +2053,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-desugar"
-version = "1.0.0-beta.3"
+version = "1.0.0-beta.4"
 dependencies = [
  "ruff_python_ast",
  "ruff_text_size",
@@ -2063,7 +2063,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-diagnostics"
-version = "1.0.0-beta.3"
+version = "1.0.0-beta.4"
 dependencies = [
  "miette",
  "thiserror",
@@ -2071,7 +2071,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-emit"
-version = "1.0.0-beta.3"
+version = "1.0.0-beta.4"
 dependencies = [
  "itoa",
  "ruff_python_ast",
@@ -2083,7 +2083,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-format"
-version = "1.0.0-beta.3"
+version = "1.0.0-beta.4"
 dependencies = [
  "thiserror",
  "tyc-diagnostics",
@@ -2092,7 +2092,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-lsp"
-version = "1.0.0-beta.3"
+version = "1.0.0-beta.4"
 dependencies = [
  "miette",
  "ruff_python_ast",
@@ -2115,7 +2115,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-resolve"
-version = "1.0.0-beta.3"
+version = "1.0.0-beta.4"
 dependencies = [
  "ruff_python_ast",
  "ruff_text_size",
@@ -2125,7 +2125,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-syntax"
-version = "1.0.0-beta.3"
+version = "1.0.0-beta.4"
 dependencies = [
  "criterion",
  "ruff_python_ast",
@@ -2136,7 +2136,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-types"
-version = "1.0.0-beta.3"
+version = "1.0.0-beta.4"
 dependencies = [
  "ruff_python_ast",
  "ruff_text_size",
@@ -2147,7 +2147,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-venv"
-version = "1.0.0-beta.3"
+version = "1.0.0-beta.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -2159,7 +2159,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-vm"
-version = "1.0.0-beta.3"
+version = "1.0.0-beta.4"
 dependencies = [
  "hashbrown 0.17.1",
  "indexmap",

@@ -84,7 +84,7 @@ pytest = "8.2"              # bare version → ==8.2
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `target` | `"3.13"` \| `"3.13t"` \| `"3.14"` \| `"3.14t"` \| `"3.15"` \| `"3.15t"` | Target CPython version. **Typhon requires 3.13+**; older targets are rejected at config load with `unsupported [python] target` and an actionable error. The `t` suffix selects free-threaded emission paths (PEP 703); see `free-threaded` below. A `3.15`+ target additionally unlocks native [PEP 810](https://peps.python.org/pep-0810/) lazy-import lowering — `lazy import` emits the native `lazy import MODULE as ALIAS` statement instead of the `typhon_runtime` helper call (see the lazy-loading section of `language.md`). Syntax and builtins newer than the target (3.15's unpacking comprehensions, `frozendict`, `sentinel`; 3.14's t-strings) are rejected with `tyc::requires_newer_python`, and stdlib imports are vetted against the target's module set. |
+| `target` | `"3.13"` \| `"3.13t"` \| `"3.14"` \| `"3.14t"` \| `"3.15"` \| `"3.15t"` | Target CPython version. **Typhon requires 3.13+**; older targets are rejected at config load with `unsupported [python] target` and an actionable error. The `t` suffix selects free-threaded emission paths (PEP 703); see `free-threaded` below. A `3.15`+ target additionally unlocks native [PEP 810](https://peps.python.org/pep-0810/) lazy-import lowering — `lazy import` emits the native `lazy import MODULE as ALIAS` statement instead of the `typhon_runtime` helper call (see the lazy-loading section of `language.md`). Syntax, builtins and stdlib names newer than the target (3.15's unpacking comprehensions, `case +1:` literal patterns, `frozendict`, `sentinel`, `re.prefixmatch` and `math.integer`; 3.14's t-strings) are rejected with `tyc::requires_newer_python`, and stdlib imports are vetted against the target's module set. With no `typhon.toml` value the default is `"3.13"`, the minimum; projects made by `tyc init` start at `"3.15"`. |
 | `free-threaded` | bool | Allow free-threaded emission paths. Default `false` until 3.14 is the default Python. Use a `t` suffix on `target` to attest at config time. `free-threaded = true` with a target lacking the `t` suffix is accepted — it only switches on advice lints — but `tyc check` / `tyc build` warn that a GIL build cannot benefit. |
 
 ### `[emit]`
@@ -110,11 +110,13 @@ pytest = "8.2"              # bare version → ==8.2
 
 ### `[optimise]`
 
-A single project-wide optimisation dial.
+A project-wide optimisation dial, plus two CPython runtime switches.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `level` | int (`0` \| `1`) | `0` | `0` leaves every optimisation knob at its own default. `1` flips the **default** of the four optimisation strictness knobs — `auto-memoise`, `auto-gather`, `auto-parallel`, `pgo-memoise` — to `true`. Any other integer is rejected at config load; a non-integer value is a parse error. |
+| `jit` | bool | `false` | Run the program with CPython's experimental JIT (`PYTHON_JIT=1`) when `tyc` starts the interpreter: `tyc run --compile` (and the automatic CPython fallback of `tyc run`) and `tyc profile`. A `PYTHON_JIT` already in the environment wins. It does nothing on an interpreter built without the JIT, and it can't reach `python build/main.py` run by hand, so set `PYTHON_JIT=1` in your deployment too. Python 3.15's JIT is about 7–8% faster on x86-64 Linux and 11–12% on macOS AArch64 (geometric mean); single programs range from slower to twice as fast, so measure. |
+| `lazy-imports` | `"normal"` \| `"all"` | `"normal"` | `"all"` turns on [PEP 810](https://peps.python.org/pep-0810/)'s global lazy-imports mode: every emitted module opens with `if __name__ == "__main__": __import__("sys").set_lazy_imports("all")`, after its docstring and `from __future__` imports, so when it runs as the entry script every later import, its own included, loads on first use. The `__main__` guard keeps a library import of the module from changing its host's import mode. Needs a 3.15+ `[python] target` (otherwise `tyc::invalid_config_value`). Import side effects then happen later, so `tyc run` takes its CPython path for such a project rather than the VM, which imports eagerly. CPython's third mode, `"none"`, is not offered. |
 
 **Explicit-wins rule.** `level = 1` only changes the *default* of the four knobs. An explicit `[strictness]` entry for any of them always overrides the level-derived default, so you can opt into level 1 while keeping one knob off:
 

@@ -1,0 +1,6 @@
+# Imported by main.ty. Under `[optimise] lazy-imports = "all"` this module
+# only loads when main first reads `shapes.area`.
+
+
+def area(w: int, h: int) -> int:
+    return w * h

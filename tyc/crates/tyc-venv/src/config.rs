@@ -165,11 +165,46 @@ fn default_stub_check() -> String {
 /// is rejected by [`TyphonConfig::validate`] with
 /// [`ConfigError::InvalidOptimiseLevel`], and a non-integer value is rejected
 /// at parse time.
-#[derive(Debug, Default, Serialize, Deserialize)]
+///
+/// Two CPython runtime switches live here too, both off by default:
+/// `jit = true` sets `PYTHON_JIT=1` for the interpreters `tyc` spawns
+/// (`tyc run --compile`, `tyc profile`), and `lazy-imports = "all"` makes the
+/// emitted entry module call `sys.set_lazy_imports("all")` (PEP 810, 3.15+
+/// targets only), so every later import is lazy.
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct OptimiseConfig {
     /// Optimisation level: `0` (default) or `1`.
     pub level: u8,
+    /// Turn on CPython's experimental JIT (`PYTHON_JIT=1`) for programs
+    /// `tyc` runs on CPython. Has no effect on an interpreter built without
+    /// the JIT.
+    pub jit: bool,
+    /// PEP 810's global lazy-imports mode: `"normal"` (default; only
+    /// `lazy` imports are lazy) or `"all"` (3.15+ targets).
+    pub lazy_imports: String,
+}
+
+impl Default for OptimiseConfig {
+    fn default() -> Self {
+        Self {
+            level: 0,
+            jit: false,
+            lazy_imports: "normal".into(),
+        }
+    }
+}
+
+/// Accepted values for `[optimise] lazy-imports`. CPython also has
+/// `"none"`, which turns off even explicit `lazy` imports; Typhon's own
+/// `lazy import` lowering doesn't follow that mode, so it is not offered.
+pub const ALLOWED_LAZY_IMPORT_MODES: &[&str] = &["normal", "all"];
+
+impl OptimiseConfig {
+    /// Whether the emitted entry module should switch every import to lazy.
+    pub fn lazy_imports_all(&self) -> bool {
+        self.lazy_imports.trim() == "all"
+    }
 }
 
 /// Accepted values for `[strictness] parallel-backend`. `"threads"` (the
@@ -579,6 +614,25 @@ impl TyphonConfig {
                 value: self.optimise.level,
             });
         }
+        // `[optimise] lazy-imports` takes "normal" / "all", and "all" lowers
+        // to a 3.15 API (`sys.set_lazy_imports`).
+        let lazy = self.optimise.lazy_imports.trim();
+        if !ALLOWED_LAZY_IMPORT_MODES.contains(&lazy) {
+            return Err(ConfigError::InvalidLazyImports {
+                path: source_path.to_string_lossy().into_owned(),
+                value: self.optimise.lazy_imports.clone(),
+                allowed: ALLOWED_LAZY_IMPORT_MODES.join(", "),
+            });
+        }
+        if lazy == "all" && (major, minor) < (3, 15) {
+            return Err(ConfigError::InvalidLazyImports {
+                path: source_path.to_string_lossy().into_owned(),
+                value: self.optimise.lazy_imports.clone(),
+                allowed: format!(
+                    "normal (`all` needs Python 3.15 for PEP 810, and `[python] target` is {major}.{minor})"
+                ),
+            });
+        }
         // Reject an unknown `[strictness] parallel-backend`. Only `"threads"`
         // and `"interpreters"` are wired; a typo used to silently fall back to
         // threads.
@@ -760,6 +814,14 @@ pub enum ConfigError {
         path: String,
         value: u8,
     },
+    /// `[optimise] lazy-imports` is outside [`ALLOWED_LAZY_IMPORT_MODES`],
+    /// or `"all"` on a target before 3.15. Emitted by
+    /// [`TyphonConfig::validate`].
+    InvalidLazyImports {
+        path: String,
+        value: String,
+        allowed: String,
+    },
     /// `[strictness] parallel-backend` is set to a value outside
     /// [`ALLOWED_PARALLEL_BACKENDS`]. Emitted by [`TyphonConfig::validate`].
     InvalidParallelBackend {
@@ -789,6 +851,7 @@ impl ConfigError {
             ConfigError::InvalidSeverity { key, .. } => Some(key),
             ConfigError::InvalidChecker { .. } => Some("external"),
             ConfigError::InvalidOptimiseLevel { .. } => Some("level"),
+            ConfigError::InvalidLazyImports { .. } => Some("lazy-imports"),
             ConfigError::InvalidParallelBackend { .. } => Some("parallel-backend"),
             ConfigError::ProjectPathEscapesRoot { key, .. } => Some(key),
         }
@@ -859,6 +922,16 @@ impl std::fmt::Display for ConfigError {
                 write!(
                     f,
                     "invalid `[optimise] level = {value}` in '{path}': allowed values are 0, 1",
+                )
+            }
+            ConfigError::InvalidLazyImports {
+                path,
+                value,
+                allowed,
+            } => {
+                write!(
+                    f,
+                    "invalid `[optimise] lazy-imports = \"{value}\"` in '{path}': allowed values are {allowed}",
                 )
             }
             ConfigError::InvalidParallelBackend {
@@ -988,6 +1061,38 @@ mod tests {
                 .validate(path)
                 .unwrap_or_else(|e| panic!("target {t} should be accepted, got {e}"));
         }
+    }
+
+    #[test]
+    fn optimise_runtime_knobs_default_off_and_validate() {
+        let path = Path::new("typhon.toml");
+        let cfg: TyphonConfig = toml::from_str("").unwrap();
+        assert!(!cfg.optimise.jit);
+        assert_eq!(cfg.optimise.lazy_imports, "normal");
+        assert!(!cfg.optimise.lazy_imports_all());
+
+        let on_315: TyphonConfig = toml::from_str(
+            "[python]\ntarget = \"3.15\"\n[optimise]\njit = true\nlazy-imports = \"all\"\n",
+        )
+        .unwrap();
+        on_315.validate(path).unwrap();
+        assert!(on_315.optimise.jit && on_315.optimise.lazy_imports_all());
+
+        let on_313: TyphonConfig =
+            toml::from_str("[python]\ntarget = \"3.13\"\n[optimise]\nlazy-imports = \"all\"\n")
+                .unwrap();
+        let err = on_313.validate(path).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidLazyImports { .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("3.15"), "{err}");
+
+        let typo: TyphonConfig =
+            toml::from_str("[python]\ntarget = \"3.15\"\n[optimise]\nlazy-imports = \"none\"\n")
+                .unwrap();
+        let err = typo.validate(path).unwrap_err();
+        assert_eq!(err.key(), Some("lazy-imports"));
     }
 
     #[test]

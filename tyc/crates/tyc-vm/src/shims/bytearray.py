@@ -6,6 +6,8 @@
 # existing (well-tested) `bytes` surface is the single implementation, and
 # only the mutations are written here.
 
+import sys
+
 
 class bytearray:
     __typhon_builtin_bases__ = ("bytearray",)
@@ -143,6 +145,25 @@ class bytearray:
     def copy(self):
         return bytearray(self._data)
 
+    def take_bytes(self, n=None, /):
+        # 3.15: remove and return the first `n` bytes without a copy in
+        # CPython. Deleted below on older targets.
+        size = len(self._data)
+        if n is None:
+            n = size
+        elif not isinstance(n, int):
+            index = getattr(type(n), "__index__", None)
+            if index is None:
+                raise TypeError("n must be an integer or None")
+            n = index(n)
+        if n < 0:
+            n += size
+        if n < 0 or n > size:
+            raise IndexError(f"can't take {n} bytes outside size {size}")
+        taken = bytes(self._data[:n])
+        self._data = self._data[n:]
+        return taken
+
     # ── read methods, delegated to `bytes` ──────────────────────────────
     def decode(self, encoding="utf-8", errors="strict"):
         return self._as_bytes().decode(encoding, errors)
@@ -203,6 +224,11 @@ class bytearray:
     @classmethod
     def fromhex(cls, text):
         return cls(bytes.fromhex(text))
+
+
+
+if sys.version_info < (3, 15):
+    del bytearray.take_bytes
 
 
 def _coerce(value):

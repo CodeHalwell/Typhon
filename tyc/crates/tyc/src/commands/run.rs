@@ -273,6 +273,7 @@ pub fn run(args: RunArgs) -> Result<()> {
     //    parent in `PYTHONPATH` for good measure.
     let interpreter = resolve_interpreter(&args, &project_root_for_python);
     let mut cmd = Command::new(&interpreter);
+    apply_runtime_env(&mut cmd, &project_root_for_python);
     // Decide between script mode (`python entry.py`) and module mode
     // (`python -m pkg.sub.entry`). We use module mode whenever the
     // entry's immediate parent directory has an `__init__.py` — i.e.
@@ -281,36 +282,7 @@ pub fn run(args: RunArgs) -> Result<()> {
     // an `__init__.py`) so `<out>/mypkg/__init__.py` works as well as
     // the flat `<out>/__init__.py` layout. Review thread copilot on
     // PR #147.
-    let module_invocation = entry
-        .parent()
-        .filter(|p| p.join("__init__.py").exists())
-        .map(|entry_parent| {
-            let mut segments: Vec<String> = vec![entry
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("main")
-                .to_owned()];
-            let mut current: Option<&std::path::Path> = Some(entry_parent);
-            while let Some(dir) = current {
-                if !dir.join("__init__.py").exists() {
-                    break;
-                }
-                let name = match dir.file_name().and_then(|s| s.to_str()) {
-                    Some(n) => n.to_owned(),
-                    None => break,
-                };
-                segments.push(name);
-                current = dir.parent();
-            }
-            // `segments` was built leaf → root; the cwd must sit
-            // immediately above the topmost package so `-m pkg.sub.x`
-            // resolves it.
-            let workdir = current
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-            segments.reverse();
-            (workdir, segments.join("."))
-        });
+    let module_invocation = module_invocation(&entry);
     if let Some((workdir, module_path)) = module_invocation {
         cmd.current_dir(&workdir);
         cmd.arg("-m");
@@ -345,8 +317,16 @@ pub fn run(args: RunArgs) -> Result<()> {
 /// project's own `.venv` (which `uv sync` provisions for the configured
 /// target), then `python3.<minor>` for that target, then `python3`.
 fn resolve_interpreter(args: &RunArgs, project_root: &std::path::Path) -> String {
-    if let Some(explicit) = &args.python {
-        return explicit.clone();
+    project_interpreter(args.python.as_deref(), project_root)
+}
+
+/// [`resolve_interpreter`] without the `RunArgs`, for `tyc profile`.
+pub(crate) fn project_interpreter(
+    explicit: Option<&str>,
+    project_root: &std::path::Path,
+) -> String {
+    if let Some(explicit) = explicit {
+        return explicit.to_owned();
     }
     // A Windows virtualenv puts its interpreter somewhere else entirely.
     let venv = if cfg!(windows) {
@@ -380,6 +360,42 @@ fn resolve_interpreter(args: &RunArgs, project_root: &std::path::Path) -> String
         }
     }
     DEFAULT_PYTHON.to_owned()
+}
+
+/// How to spawn the built entry point: `Some((cwd, "pkg.sub.main"))` for
+/// module mode (`python -m …`) when the entry sits inside a package, `None`
+/// for script mode (`python build/main.py`). Shared with `tyc profile`.
+pub(crate) fn module_invocation(entry: &std::path::Path) -> Option<(std::path::PathBuf, String)> {
+    entry
+        .parent()
+        .filter(|p| p.join("__init__.py").exists())
+        .map(|entry_parent| {
+            let mut segments: Vec<String> = vec![entry
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("main")
+                .to_owned()];
+            let mut current: Option<&std::path::Path> = Some(entry_parent);
+            while let Some(dir) = current {
+                if !dir.join("__init__.py").exists() {
+                    break;
+                }
+                let name = match dir.file_name().and_then(|s| s.to_str()) {
+                    Some(n) => n.to_owned(),
+                    None => break,
+                };
+                segments.push(name);
+                current = dir.parent();
+            }
+            // `segments` was built leaf → root; the cwd must sit
+            // immediately above the topmost package so `-m pkg.sub.x`
+            // resolves it.
+            let workdir = current
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            segments.reverse();
+            (workdir, segments.join("."))
+        })
 }
 
 /// Whether `name` resolves to an executable on `PATH`.
@@ -422,8 +438,21 @@ fn run_vm(args: RunArgs) -> Result<()> {
     // pre-run check and before any user code runs, so a program never
     // half-executes and then restarts, and its diagnostics are reported
     // once (by the build) rather than by both paths.
+    // Set the target first: the fallback scan below asks the VM which
+    // exports each module has, and some depend on it (`re.prefixmatch`).
+    if let Some((major, minor)) = vm_python_target(&entry) {
+        tyc_vm::set_python_target(major, minor);
+    }
     if !args.no_fallback {
-        if let Some(missing) = unmodelled_references(&args.path, &entry) {
+        let mut missing = unmodelled_references(&args.path, &entry);
+        // PEP 810's global mode changes *when* every import runs; the VM
+        // imports eagerly.
+        if vm_lazy_imports_all(&entry) {
+            missing
+                .get_or_insert_with(Vec::new)
+                .push("`[optimise] lazy-imports = \"all\"`".to_owned());
+        }
+        if let Some(missing) = missing {
             eprintln!(
                 "note: `{}` {} not modelled by the in-process VM — running via \
                  `--compile` (build + CPython) so the program behaves as it \
@@ -443,9 +472,6 @@ fn run_vm(args: RunArgs) -> Result<()> {
             quiet_success: true,
             with_ty: false,
         })?;
-    }
-    if let Some((major, minor)) = vm_python_target(&entry) {
-        tyc_vm::set_python_target(major, minor);
     }
     let code = tyc_vm::run_file(&entry, &args.script_args).map_err(|e| miette!("{e}"))?;
     std::process::exit(code);
@@ -531,6 +557,13 @@ fn unmodelled_references(path: &std::path::Path, entry: &std::path::Path) -> Opt
         }
         if tyc_vm::module_has_eager_generator(&module) {
             missing.insert("a generator whose yield the VM cannot suspend".into());
+        }
+        // The VM reads and writes text files as UTF-8. So does CPython 3.15
+        // everywhere, but 3.13 / 3.14 use the locale's encoding.
+        if tyc_vm::module_opens_text_without_encoding(&module)
+            && !tyc_vm::host_text_encoding_is_utf8()
+        {
+            missing.insert("open() without `encoding=` on a non-UTF-8 locale".into());
         }
         for root in tyc_resolve::collect_imported_roots(&module) {
             if root == "re" {
@@ -1452,6 +1485,29 @@ fn vm_python_target(entry: &std::path::Path) -> Option<(u8, u8)> {
     let dir = entry.canonicalize().ok()?.parent()?.to_path_buf();
     let (_, cfg) = TyphonConfig::load(&dir).ok().flatten()?;
     check::python_target_u8(&cfg.python.target)
+}
+
+fn vm_lazy_imports_all(entry: &std::path::Path) -> bool {
+    entry
+        .canonicalize()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.to_path_buf()))
+        .and_then(|dir| TyphonConfig::load(&dir).ok().flatten())
+        .is_some_and(|(_, cfg)| cfg.optimise.lazy_imports_all())
+}
+
+/// Environment for a CPython child that runs the built program: with
+/// `[optimise] jit = true`, `PYTHON_JIT=1` turns on CPython's JIT, unless the
+/// caller's environment already sets `PYTHON_JIT` either way. Shared with
+/// `tyc profile`.
+pub(crate) fn apply_runtime_env(cmd: &mut Command, project_root: &std::path::Path) {
+    let jit = TyphonConfig::load(project_root)
+        .ok()
+        .flatten()
+        .is_some_and(|(_, cfg)| cfg.optimise.jit);
+    if jit && std::env::var_os("PYTHON_JIT").is_none() {
+        cmd.env("PYTHON_JIT", "1");
+    }
 }
 
 fn vm_check_scope(path: &std::path::Path, entry: &std::path::Path) -> Vec<PathBuf> {

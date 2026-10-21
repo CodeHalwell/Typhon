@@ -1,26 +1,54 @@
 ---
 title: tyc profile
-description: Instrument top-level functions; write typhon-profile.json.
+description: Find hot functions — sample with CPython 3.15's Tachyon and map stacks to .ty, or instrument top-level functions.
 sidebar:
   order: 11
 ---
 
 ```
-tyc profile [PATH] [--out DIR]
+tyc profile [PATH] [--sample | --instrument] [--python PY] [--entry FILE]
+            [--rate RATE] [--mode wall|cpu|gil|exception] [--async-aware]
+            [--all-threads] [--top N] [--out DIR] [-- ARGS...]
 ```
 
-Runs the normal `tyc build` pipeline, then post-processes every emitted `.py` so each top-level function records its call count and cumulative wall-clock time. When the instrumented program exits, an `atexit` hook writes the counters to `typhon-profile.json`. That file feeds [`[strictness] pgo-memoise`](/Typhon/configuration/strictness/#pgo-memoise), which promotes hot pure functions to `@functools.cache` on the next build.
+`tyc profile` has two modes. **Sampling** is the default when `[python] target` is 3.15 or later; **instrumenting** is the default below that. `--sample` and `--instrument` choose one explicitly.
 
-`tyc profile` does **not** run the program — it only produces the instrumented build. You run the emitted entry point yourself with a representative workload.
+## Sampling (3.15+)
+
+Runs `tyc build`, then runs the built entry point under CPython 3.15's sampling profiler, Tachyon (`python -m profiling.sampling`, [PEP 799](https://peps.python.org/pep-0799/)). Nothing is rewritten, so methods, nested functions, lambdas and coroutines all show up, and the overhead is low. The collapsed stacks Tachyon writes are mapped back through the build's `.py.map` sidecars, so every frame from your project names its `.ty` file and line (`src/main.ty:fib:4`). Stdlib and third-party frames are left as they are.
+
+The result goes to `typhon-profile.collapsed` next to `typhon.toml` — the input format of [speedscope](https://www.speedscope.app/), inferno and `flamegraph.pl` — and the hottest functions are printed:
+
+```text
+1532 samples
+  self%   total%  function (hottest line)
+  71.2%    71.2%  fib (src/main.ty) @ src/main.ty:4
+   9.8%    81.0%  Runner.go (src/main.ty) @ src/main.ty:13
+```
+
+```bash
+tyc profile                          # build, sample, write typhon-profile.collapsed
+tyc profile -- --bench 10            # arguments after `--` go to the program
+tyc profile --mode cpu --rate 10khz  # CPU time only, sampled at 10 kHz
+tyc profile --async-aware            # rebuild stacks from asyncio tasks
+```
+
+The interpreter is the project's `.venv`, then `python3.<minor>` for the target; `--python` overrides it. It needs `profiling.sampling` (CPython 3.15+), and an older interpreter fails with a pointer to `--instrument`. With [`[optimise] jit = true`](/Typhon/configuration/overview/#optimise) the program runs with `PYTHON_JIT=1`. The profiler reads the target process's memory, so a container that forbids `ptrace` may lose samples; Tachyon reports its error rate.
+
+## Instrumenting
+
+Runs the normal `tyc build` pipeline, then post-processes every emitted `.py` so each top-level function records its call count and cumulative wall-clock time. When the instrumented program exits, an `atexit` hook writes the counters to `typhon-profile.json`. That file feeds [`[strictness] pgo-memoise`](/Typhon/configuration/strictness/#pgo-memoise), which promotes hot pure functions to `@functools.cache` on the next build. (The sampling mode doesn't write `typhon-profile.json`; use `--instrument` for the PGO round trip.)
+
+In this mode `tyc profile` does **not** run the program — it only produces the instrumented build. You run the emitted entry point yourself with a representative workload.
 
 ## Examples
 
 ```bash
-tyc profile                          # instrumented build → build/
+tyc profile --instrument             # instrumented build → build/
 python build/main.py --bench         # run it; typhon-profile.json is written on exit
 tyc build                            # with pgo-memoise = true, hot pure fns are now cached
 
-tyc profile --out dist/              # instrument into dist/ instead of the configured out dir
+tyc profile --instrument --out dist/ # instrument into dist/ instead of the configured out dir
 TYPHON_PROFILE_OUT=/tmp/p.json python build/main.py   # write the profile somewhere else
 ```
 
@@ -66,7 +94,7 @@ Not an error — and not a warning either; PGO is best-effort. With `pgo-memoise
 ## Recommended workflow
 
 1. Write a "representative" entry point (e.g. a benchmark or a CLI invocation that exercises hot paths).
-2. `tyc profile`, then run the instrumented program from the project root.
+2. `tyc profile --instrument`, then run the instrumented program from the project root.
 3. Commit `typhon-profile.json` (or generate it in CI).
 4. `tyc build` with `pgo-memoise = true`.
 
@@ -81,7 +109,16 @@ Every top-level `def` / `async def` in the project's emitted modules — not cla
 | Flag | Default | Effect |
 |------|---------|--------|
 | `PATH` | `.` | Project directory. |
-| `--out DIR` (`-o`) | `[project] out` | Output directory for the instrumented build, forwarded to `tyc build`. |
+| `--out DIR` (`-o`) | `[project] out` | Build directory, forwarded to `tyc build`. |
+| `--sample` / `--instrument` | by target | Pick the mode: sampling on 3.15+ targets, instrumenting below. |
+| `--python PY` | `.venv`, then `python3.<minor>` | Interpreter to sample under (CPython 3.15+). |
+| `--entry FILE` | `main.py` | Entry point inside the build directory; a package entry runs as `python -m`. |
+| `--rate RATE` | `1khz` | Sampling rate, e.g. `10khz`. |
+| `--mode MODE` | `wall` | `wall`, `cpu`, `gil` or `exception`. |
+| `--async-aware` | off | Rebuild stacks from asyncio tasks. |
+| `--all-threads` | off | Sample every thread. |
+| `--top N` | `15` | Rows in the printed summary. |
+| `-- ARGS...` | | Arguments for the profiled program. |
 
 Where the profile lands is controlled at run time by the `TYPHON_PROFILE_OUT` environment variable (default `typhon-profile.json` in the working directory), not by a `tyc profile` flag.
 
