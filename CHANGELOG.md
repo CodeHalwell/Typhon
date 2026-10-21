@@ -4,13 +4,18 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## Unreleased — making more of Python 3.15
+## 1.0.0-beta.4 — 2026-10-21 — making more of Python 3.15
 
-Python 3.15.0 shipped on 9 October. This round makes 3.15 the starting point
-for new projects and uses more of what it offers, while the minimum and the
-default `[python] target` for an existing `typhon.toml` stay at 3.13. The new
-errors fire only on code its target could not have run, and the two new
-runtime switches are off unless a project turns them on.
+Python 3.15.0 shipped on 9 October. This release makes 3.15 the starting
+point for new projects and uses more of what it offers: `tyc profile` samples
+with 3.15's Tachyon profiler and maps the stacks back to `.ty` lines,
+`case +1:` and three new stdlib names work on 3.15 targets, and two opt-in
+`[optimise]` switches turn on CPython's JIT and PEP 810's global lazy-import
+mode. The minimum and the default `[python] target` for an existing
+`typhon.toml` stay at 3.13. The only new errors are
+`tyc::requires_newer_python` on code its target could not have run, and an
+invalid `lazy-imports` value, so no program that ran correctly under beta.3
+is newly rejected.
 
 ### Added
 
@@ -23,7 +28,9 @@ runtime switches are off unless a project turns them on.
   `typhon-profile.collapsed` (speedscope, inferno and `flamegraph.pl` read
   it), and summarised as a self/total table. `--rate`, `--mode`,
   `--async-aware`, `--all-threads`, `--python`, `--entry` and `-- ARGS` pass
-  through. Below 3.15 the instrumenting profiler stays the default, and
+  through. Tachyon records only each file's basename, so a frame is matched
+  to the emitted module of that name; when two packages share one, the
+  module that defines the frame's function wins. Below 3.15 the instrumenting profiler stays the default, and
   `--instrument` / `--sample` choose explicitly.
 - **`[optimise] jit = true`.** `tyc run --compile`, `tyc run`'s automatic
   CPython fallback and `tyc profile` run the program with `PYTHON_JIT=1`,
@@ -35,13 +42,16 @@ runtime switches are off unless a project turns them on.
   rejects the setting with `tyc::invalid_config_value`. `tyc run` takes the
   CPython path for such a project, since the VM imports eagerly. New
   `lazy-imports-all` knob-matrix fixture.
-- **Unary `+` in literal patterns (`case +1:`) on 3.15 targets.** The
+- **Unary `+` in literal patterns (`case +1:`) on 3.15 targets**, at the top
+  level and nested in sequence, mapping, class and or-patterns. The
   vendored parser rejected it on every target; it now parses, and
   `tyc::requires_newer_python` rejects it below 3.15, where CPython does.
 - **`re.prefixmatch`, `math.integer` and `bytearray.take_bytes` under
   `tyc run`** on 3.15 targets, matching CPython 3.15: `re.match is
   re.prefixmatch`, `math.integer.gcd is math.gcd`, and `take_bytes`
-  follows CPython's negative-index and error rules.
+  follows CPython's signature (positional-only, `__index__` values),
+  negative-index and error rules. Below 3.15 `bytearray` has no
+  `take_bytes` attribute at all, as in CPython.
 - **`frozendict` parameters can be cache keys.** The silent memoisation
   paths (`auto-memoise`, `pgo-memoise`, `-O`) accept a `frozendict[K, V]`
   parameter under the same rule as `tuple`, and `frozendict` counts as
@@ -59,8 +69,10 @@ runtime switches are off unless a project turns them on.
   3.15, `open()` without `encoding=` uses the locale's encoding, while the VM
   always uses UTF-8. On a host whose locale isn't UTF-8 (and without
   `PYTHONUTF8=1`), a 3.13 or 3.14 program that opens text files that way now
-  runs on CPython. 3.15 targets, UTF-8 locales and the C locale are
-  unaffected.
+  runs on CPython. An explicit `encoding=None`, positional or keyword, and a
+  `**kwargs` call count as no encoding. 3.15 targets and UTF-8 locales are
+  unaffected, and so is the C locale unless both `PYTHONUTF8=0` and
+  `PYTHONCOERCECLOCALE=0` are set.
 
 ### Fixed
 
@@ -74,7 +86,9 @@ runtime switches are off unless a project turns them on.
   final.
 - New non-blocking `canary-py316` job runs the knob matrix and the
   differential harness under the newest CPython 3.16 pre-release (3.16.0a1
-  came out on 13 October; beta 1 is due 4 May 2027).
+  came out on 13 October; beta 1 is due 4 May 2027). It takes 3.16 from
+  `actions/setup-python`, falls back to the deadsnakes nightly PPA, and
+  skips with a notice when neither has a build yet.
 
 ## 1.0.0-beta.3 — 2026-10-09 — Python 3.15 targets & VM parity gap fixes
 
