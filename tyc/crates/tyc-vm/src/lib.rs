@@ -1926,10 +1926,16 @@ pub fn module_opens_text_without_encoding(module: &ruff_python_ast::ModModule) -
             .iter()
             .find(|k| k.arg.as_ref().is_some_and(|a| a.as_str() == "mode"))
             .map(|k| &k.value);
+        // A positional encoding slot that is absent or a literal `None`.
+        let no_encoding_at = |i: usize| {
+            args.args
+                .get(i)
+                .is_none_or(|e| matches!(e, Expr::NoneLiteral(_)))
+        };
         match call.func.as_ref() {
             Expr::Name(n) if n.id.as_str() == "open" => {
                 // open(file, mode, buffering, encoding, ...)
-                !is_binary_mode(args.args.get(1).or(mode_kw)) && args.args.len() < 4
+                !is_binary_mode(args.args.get(1).or(mode_kw)) && no_encoding_at(3)
             }
             Expr::Attribute(a) => match a.attr.as_str() {
                 // io.open has open's signature; Path.open(mode, buffering,
@@ -1941,11 +1947,11 @@ pub fn module_opens_text_without_encoding(module: &ruff_python_ast::ModModule) -
                     } else {
                         (args.args.first(), 2)
                     };
-                    !is_binary_mode(mode.or(mode_kw)) && args.args.len() <= enc_pos
+                    !is_binary_mode(mode.or(mode_kw)) && no_encoding_at(enc_pos)
                 }
                 // Path.read_text(encoding, ...) / write_text(data, encoding, ...)
-                "read_text" => args.args.is_empty(),
-                "write_text" => args.args.len() < 2,
+                "read_text" => no_encoding_at(0),
+                "write_text" => no_encoding_at(1),
                 _ => false,
             },
             _ => false,
@@ -2097,7 +2103,9 @@ mod tests {
             "open('f', 'r')\n",
             "open('f', encoding=None)\n",
             "open('f', **opts)\n",
+            "open('f', 'r', -1, None)\n",
             "p.read_text()\n",
+            "p.read_text(None)\n",
         ] {
             assert!(scan(src), "{src:?} should need the host encoding");
         }
@@ -2107,6 +2115,7 @@ mod tests {
             "open('f', mode='wb')\n",
             "p.read_text('utf-8')\n",
             "open('f', encoding=enc)\n",
+            "open('f', 'r', -1, 'utf-8')\n",
         ] {
             assert!(!scan(src), "{src:?} names its encoding");
         }
