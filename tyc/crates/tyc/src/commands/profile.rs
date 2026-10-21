@@ -69,8 +69,9 @@ pub struct ProfileArgs {
     pub mode: Option<String>,
 
     /// Rebuild stacks from asyncio tasks, so awaiting coroutines appear under
-    /// the task that awaits them.
-    #[arg(long)]
+    /// the task that awaits them. Wall-clock mode only, and not with
+    /// `--all-threads` (Tachyon's rule).
+    #[arg(long, conflicts_with = "all_threads")]
     pub async_aware: bool,
 
     /// Sample every thread, not only the main one.
@@ -180,6 +181,13 @@ pub fn run(args: ProfileArgs) -> Result<()> {
 /// Sampling mode: run the built entry point under `python -m
 /// profiling.sampling run --collapsed`, then remap the stacks to `.ty`.
 fn run_sampling(args: &ProfileArgs, project_root: &Path, out_dir: &Path) -> Result<()> {
+    if let (true, Some(mode)) = (args.async_aware, args.mode.as_deref()) {
+        if mode != "wall" {
+            return Err(miette!(
+                "--async-aware samples wall-clock time only; drop --mode {mode}"
+            ));
+        }
+    }
     let entry = out_dir.join(&args.entry);
     if !entry.exists() {
         return Err(miette!(

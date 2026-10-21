@@ -28,7 +28,8 @@ is newly rejected.
   `typhon-profile.collapsed` (speedscope, inferno and `flamegraph.pl` read
   it), and summarised as a self/total table. `--rate`, `--mode`,
   `--async-aware`, `--all-threads`, `--python`, `--entry` and `-- ARGS` pass
-  through. Tachyon records only each file's basename, so a frame is matched
+  through (`--async-aware` rejects `--all-threads` and a non-wall `--mode`,
+  as Tachyon does). Tachyon records only each file's basename, so a frame is matched
   to the emitted module of that name; when two packages share one, the
   module that defines the frame's function wins. Below 3.15 the instrumenting profiler stays the default, and
   `--instrument` / `--sample` choose explicitly.
@@ -64,7 +65,9 @@ is newly rejected.
 - **`tyc::requires_newer_python` covers newer stdlib names.**
   `re.prefixmatch` and `math.integer` (as `module.attr`, `from … import`, or
   `import math.integer`) are rejected below 3.15, where they raise
-  `AttributeError` / `ModuleNotFoundError`.
+  `AttributeError` / `ModuleNotFoundError`. A use inside a feature probe
+  (a `try` with handlers, or an `if` / conditional expression testing
+  `sys.version_info`, `hasattr` or `getattr`) is left alone.
 - **`tyc run` falls back to CPython for locale-encoded text files.** Before
   3.15, `open()` without `encoding=` uses the locale's encoding, while the VM
   always uses UTF-8. On a host whose locale isn't UTF-8 (and without

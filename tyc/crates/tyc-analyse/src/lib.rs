@@ -350,14 +350,58 @@ fn newer_stdlib_uses(module: &ModModule, target: (u8, u8)) -> Vec<(String, (u8, 
         attrs: Vec<(String, String, TextRange)>,
         /// Uses found directly in import statements.
         direct: Vec<(String, String, TextRange)>,
+        /// Inside a `try` with handlers, or an `if` / conditional expression
+        /// that tests `sys.version_info`, `hasattr` or `getattr`: a feature
+        /// probe that runs fine on an older target, so nothing is reported.
+        guarded: u32,
+    }
+    /// Whether `expr` reads `version_info` or calls `hasattr` / `getattr`.
+    fn is_feature_test(expr: &Expr) -> bool {
+        #[derive(Default)]
+        struct T(bool);
+        impl<'a> SourceOrderVisitor<'a> for T {
+            fn visit_expr(&mut self, expr: &'a Expr) {
+                match expr {
+                    Expr::Attribute(a) if a.attr.as_str() == "version_info" => self.0 = true,
+                    Expr::Name(n)
+                        if matches!(n.id.as_str(), "version_info" | "hasattr" | "getattr") =>
+                    {
+                        self.0 = true
+                    }
+                    _ => {}
+                }
+                walk_expr(self, expr);
+            }
+        }
+        let mut t = T::default();
+        t.visit_expr(expr);
+        t.0
     }
     impl<'ast> SourceOrderVisitor<'ast> for V {
         fn visit_stmt(&mut self, stmt: &'ast Stmt) {
+            let guard = match stmt {
+                Stmt::Try(t) => !t.handlers.is_empty(),
+                Stmt::If(i) => {
+                    is_feature_test(&i.test)
+                        || i.elif_else_clauses
+                            .iter()
+                            .any(|c| c.test.as_ref().is_some_and(is_feature_test))
+                }
+                _ => false,
+            };
+            if guard {
+                self.guarded += 1;
+                walk_stmt(self, stmt);
+                self.guarded -= 1;
+                return;
+            }
             match stmt {
                 Stmt::Import(i) => {
                     for alias in &i.names {
                         let dotted = alias.name.as_str();
-                        if let Some((parent, child)) = dotted.rsplit_once('.') {
+                        if let Some((parent, child)) =
+                            dotted.rsplit_once('.').filter(|_| self.guarded == 0)
+                        {
                             self.direct.push((
                                 parent.to_owned(),
                                 child.to_owned(),
@@ -378,16 +422,19 @@ fn newer_stdlib_uses(module: &ModModule, target: (u8, u8)) -> Vec<(String, (u8, 
                 Stmt::ImportFrom(i) if i.level == 0 => {
                     if let Some(m) = &i.module {
                         let m = m.as_str();
-                        if let Some((parent, child)) = m.rsplit_once('.') {
+                        let record = self.guarded == 0;
+                        if let Some((parent, child)) = m.rsplit_once('.').filter(|_| record) {
                             self.direct
                                 .push((parent.to_owned(), child.to_owned(), i.range));
                         }
                         for alias in &i.names {
-                            self.direct.push((
-                                m.to_owned(),
-                                alias.name.to_string(),
-                                alias.name.range,
-                            ));
+                            if record {
+                                self.direct.push((
+                                    m.to_owned(),
+                                    alias.name.to_string(),
+                                    alias.name.range,
+                                ));
+                            }
                             let bound = alias.asname.as_ref().unwrap_or(&alias.name);
                             self.rebound.insert(bound.to_string());
                         }
@@ -404,8 +451,16 @@ fn newer_stdlib_uses(module: &ModModule, target: (u8, u8)) -> Vec<(String, (u8, 
             walk_stmt(self, stmt);
         }
         fn visit_expr(&mut self, expr: &'ast Expr) {
+            if let Expr::If(e) = expr {
+                if is_feature_test(&e.test) {
+                    self.guarded += 1;
+                    walk_expr(self, expr);
+                    self.guarded -= 1;
+                    return;
+                }
+            }
             match expr {
-                Expr::Attribute(a) => {
+                Expr::Attribute(a) if self.guarded == 0 => {
                     if let Expr::Name(n) = a.value.as_ref() {
                         if n.ctx == ExprContext::Load {
                             self.attrs
@@ -8325,6 +8380,12 @@ mod lint_tests {
             "def f(re: str) -> None:\n    print(re.prefixmatch)\n",
             "class math:\n    integer: int = 1\nprint(math.integer)\n",
             "import re\nlet p = re.compile(\"a\")\nprint(p.match(\"a\"))\n",
+            // Feature probes run fine on 3.13.
+            "try:\n    from re import prefixmatch\nexcept ImportError:\n    prefixmatch = None\nprint(prefixmatch)\n",
+            "try:\n    import math.integer\nexcept ImportError:\n    pass\n",
+            "import re\nimport sys\nif sys.version_info >= (3, 15):\n    print(re.prefixmatch(\"a\", \"a\"))\n",
+            "import re\nif hasattr(re, \"prefixmatch\"):\n    print(re.prefixmatch(\"a\", \"a\"))\n",
+            "import re\nlet f = re.prefixmatch if hasattr(re, \"prefixmatch\") else re.match\nprint(f)\n",
         ] {
             assert!(
                 target_errors(src, (3, 13)).is_empty(),
