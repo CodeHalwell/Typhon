@@ -160,14 +160,16 @@ pub fn may_hold_newer_syntax(source: &str) -> bool {
             _ => {}
         }
     }
+    // `case +1:` — the pattern can span lines (`case (\n    +1\n):`), so any
+    // `case` line plus any `+` in the file is enough to look closer.
+    if source.contains('+')
+        && source
+            .lines()
+            .any(|line| line.trim_start().starts_with("case"))
+    {
+        return true;
+    }
     source.lines().any(|line| {
-        if line
-            .trim_start()
-            .strip_prefix("case")
-            .is_some_and(|rest| rest.contains('+'))
-        {
-            return true;
-        }
         let Some(clause) = line.trim_start().strip_prefix("except") else {
             return false;
         };

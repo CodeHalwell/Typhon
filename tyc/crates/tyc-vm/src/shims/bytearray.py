@@ -145,7 +145,7 @@ class bytearray:
     def copy(self):
         return bytearray(self._data)
 
-    def take_bytes(self, n=None):
+    def take_bytes(self, n=None, /):
         # 3.15: remove and return the first `n` bytes without a copy in
         # CPython. Class bodies can't branch on the target, so older
         # targets get CPython's missing-attribute error at the call.

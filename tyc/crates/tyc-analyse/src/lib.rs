@@ -8272,7 +8272,13 @@ mod lint_tests {
             "3.15 allows `case +1:`"
         );
         // Nested in sequence, mapping and class patterns too.
-        for case in ["[+1, _]", "{+1: _}", "complex(+1)", "(+1 | 2)"] {
+        for case in [
+            "[+1, _]",
+            "{+1: _}",
+            "complex(+1)",
+            "(+1 | 2)",
+            "(\n            +1\n        )",
+        ] {
             let src = format!(
                 "def f(x: object) -> str:\n    match x:\n        case {case}:\n            return \"one\"\n        case _:\n            return \"other\"\n"
             );

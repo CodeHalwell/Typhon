@@ -1883,8 +1883,11 @@ fn locale_is_utf8() -> bool {
         .find(|v| !v.is_empty());
     match value.as_deref() {
         // The C locale is coerced to UTF-8 (PEP 538) or turns on UTF-8 mode
-        // (PEP 540).
-        None | Some("C") | Some("POSIX") => true,
+        // (PEP 540); with both switched off it stays ASCII.
+        None | Some("C") | Some("POSIX") => {
+            let off = |k: &str| std::env::var(k).is_ok_and(|v| v == "0");
+            !(off("PYTHONUTF8") && off("PYTHONCOERCECLOCALE"))
+        }
         Some(v) => {
             let codeset = v.split_once('.').map(|(_, c)| c).unwrap_or("");
             let codeset = codeset.split('@').next().unwrap_or("");
@@ -1909,11 +1912,13 @@ pub fn module_opens_text_without_encoding(module: &ruff_python_ast::ModModule) -
     }
     fn opens_text(call: &ExprCall) -> bool {
         let args = &call.arguments;
-        if args
-            .keywords
-            .iter()
-            .any(|k| k.arg.as_ref().is_some_and(|a| a.as_str() == "encoding") || k.arg.is_none())
-        {
+        // An explicit `encoding=` settles it, unless it is `None` (the
+        // locale default again). `**kwargs` may or may not carry one, so it
+        // counts as no encoding.
+        if args.keywords.iter().any(|k| {
+            k.arg.as_ref().is_some_and(|a| a.as_str() == "encoding")
+                && !matches!(k.value, Expr::NoneLiteral(_))
+        }) {
             return false;
         }
         let mode_kw = args
@@ -2080,6 +2085,32 @@ mod parity_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_opens_without_a_definite_encoding_are_detected() {
+        let scan = |src: &str| {
+            let parsed = tyc_syntax::parse_module(src).expect("parse failed");
+            module_opens_text_without_encoding(parsed.syntax())
+        };
+        for src in [
+            "open('f')\n",
+            "open('f', 'r')\n",
+            "open('f', encoding=None)\n",
+            "open('f', **opts)\n",
+            "p.read_text()\n",
+        ] {
+            assert!(scan(src), "{src:?} should need the host encoding");
+        }
+        for src in [
+            "open('f', encoding='utf-8')\n",
+            "open('f', 'rb')\n",
+            "open('f', mode='wb')\n",
+            "p.read_text('utf-8')\n",
+            "open('f', encoding=enc)\n",
+        ] {
+            assert!(!scan(src), "{src:?} names its encoding");
+        }
+    }
 
     /// The CLI runs the interpreter on a dedicated 256 MiB worker stack
     /// (`tyc/src/main.rs`); libtest threads get 2 MiB, which a deep but
