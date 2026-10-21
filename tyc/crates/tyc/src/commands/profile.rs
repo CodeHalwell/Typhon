@@ -268,8 +268,23 @@ fn run_sampling(args: &ProfileArgs, project_root: &Path, out_dir: &Path) -> Resu
 /// `src/rel.ty:FUNC:TY_LINE`, relative to the project root; the
 /// interpreter's own leading `<frozen runpy>` frames are dropped. Anything
 /// that doesn't parse is kept verbatim.
+///
+/// Tachyon writes only the file's basename (`os.path.basename`), so a frame
+/// is matched against every emitted `.py` under `out_dir` with that name;
+/// when two packages share a basename, the one that defines `FUNC` wins,
+/// and a frame that stays ambiguous is left unmapped.
 fn remap_collapsed(raw: &str, out_dir: &Path, project_root: &Path) -> String {
-    let mut maps: HashMap<String, Option<(String, crate::commands::source_map::SourceMap)>> =
+    let mut by_name: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    let _ = walk_py_files(out_dir, &mut |path| {
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            by_name
+                .entry(name.to_owned())
+                .or_default()
+                .push(path.to_path_buf());
+        }
+        Ok(())
+    });
+    let mut maps: HashMap<PathBuf, Option<(String, crate::commands::source_map::SourceMap)>> =
         HashMap::new();
     let mut out = String::with_capacity(raw.len());
     for line in raw.lines() {
@@ -285,7 +300,13 @@ fn remap_collapsed(raw: &str, out_dir: &Path, project_root: &Path) -> String {
             if frame.starts_with("<frozen runpy>:") {
                 continue;
             }
-            frames.push(remap_frame(frame, out_dir, project_root, &mut maps));
+            frames.push(remap_frame(
+                frame,
+                out_dir,
+                project_root,
+                &by_name,
+                &mut maps,
+            ));
         }
         out.push_str(&frames.join(";"));
         out.push(' ');
@@ -299,7 +320,8 @@ fn remap_frame(
     frame: &str,
     out_dir: &Path,
     project_root: &Path,
-    maps: &mut HashMap<String, Option<(String, crate::commands::source_map::SourceMap)>>,
+    by_name: &HashMap<String, Vec<PathBuf>>,
+    maps: &mut HashMap<PathBuf, Option<(String, crate::commands::source_map::SourceMap)>>,
 ) -> String {
     use crate::commands::source_map::{load_map_for, map_py_line, parse_map};
     let mut parts = frame.rsplitn(3, ':');
@@ -312,13 +334,15 @@ fn remap_frame(
     if !file.ends_with(".py") {
         return frame.to_owned();
     }
-    let entry = maps.entry(file.to_owned()).or_insert_with(|| {
-        let py = Path::new(file);
-        let py = if py.is_absolute() {
-            py.to_path_buf()
-        } else {
-            out_dir.join(py)
-        };
+    let py = Path::new(file);
+    let py = if py.is_absolute() {
+        py.to_path_buf()
+    } else if let Some(found) = by_name.get(file).and_then(|c| pick_module(c, func)) {
+        found
+    } else {
+        return frame.to_owned();
+    };
+    let entry = maps.entry(py.clone()).or_insert_with(|| {
         let py_str = py.to_string_lossy();
         let map = load_map_for(&py_str, Some(out_dir)).and_then(|b| parse_map(&b))?;
         let ty = PathBuf::from(crate::commands::source_map::resolve_ty_path(
@@ -334,6 +358,36 @@ fn remap_frame(
     match entry {
         Some((ty, map)) => format!("{ty}:{func}:{}", map_py_line(map, py_line)),
         None => frame.to_owned(),
+    }
+}
+
+/// The emitted module a basename-only frame came from: the only candidate,
+/// or the only one that defines `func` (module-level frames match any).
+fn pick_module(candidates: &[PathBuf], func: &str) -> Option<PathBuf> {
+    if let [only] = candidates {
+        return Some(only.clone());
+    }
+    if func.starts_with('<') {
+        return None;
+    }
+    let defines = |path: &PathBuf| {
+        std::fs::read_to_string(path).is_ok_and(|src| {
+            src.lines().any(|l| {
+                let l = l.trim_start();
+                let l = l.strip_prefix("async ").unwrap_or(l);
+                l.strip_prefix("def ")
+                    .or_else(|| l.strip_prefix("class "))
+                    .is_some_and(|rest| {
+                        rest.strip_prefix(func)
+                            .is_some_and(|r| r.starts_with(['(', ':', '[']))
+                    })
+            })
+        })
+    };
+    let mut hits = candidates.iter().filter(|p| defines(p));
+    match (hits.next(), hits.next()) {
+        (Some(one), None) => Some(one.clone()),
+        _ => None,
     }
 }
 
@@ -557,28 +611,41 @@ mod tests {
             r#"{"version":2,"source":"main.ty","line_strategy":"table","lines":[1,1,2,7,7,9]}"#,
         )
         .unwrap();
-        let main_py = out.join("main.py");
-        let raw = format!(
-            "tid:1;<frozen runpy>:_run_module_as_main:201;<frozen runpy>:_run_code:87;\
-             {m}:<module>:6;{m}:fib:4;/usr/lib/python3.15/json/decoder.py:decode:345 3\n\
-             tid:1;{m}:<module>:6;{m}:fib:5 2\n",
-            m = main_py.display()
-        );
-        let mapped = remap_collapsed(&raw, &out, &root);
+        // Two packages with the same basename: Tachyon writes only `util.py`.
+        for (pkg, func) in [("pkg", "parse"), ("other", "render")] {
+            std::fs::create_dir_all(out.join(pkg)).unwrap();
+            std::fs::create_dir_all(out.join(".sourcemaps").join(pkg)).unwrap();
+            std::fs::write(
+                out.join(pkg).join("util.py"),
+                format!("def {func}(x):\n    return x\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                out.join(".sourcemaps").join(pkg).join("util.py.map"),
+                format!(
+                    r#"{{"version":2,"source":"{pkg}/util.ty","line_strategy":"table","lines":[3,4]}}"#
+                ),
+            )
+            .unwrap();
+        }
+        let raw = "tid:1;<frozen runpy>:_run_module_as_main:201;<frozen runpy>:_run_code:87;\
+                   main.py:<module>:6;main.py:fib:4;decoder.py:decode:345 3\n\
+                   tid:1;main.py:<module>:6;main.py:fib:5;util.py:render:2;util.py:<module>:1 2\n";
+        let mapped = remap_collapsed(raw, &out, &root);
         assert_eq!(
             mapped,
-            "tid:1;src/main.ty:<module>:9;src/main.ty:fib:7;\
-             /usr/lib/python3.15/json/decoder.py:decode:345 3\n\
-             tid:1;src/main.ty:<module>:9;src/main.ty:fib:7 2\n"
+            "tid:1;src/main.ty:<module>:9;src/main.ty:fib:7;decoder.py:decode:345 3\n\
+             tid:1;src/main.ty:<module>:9;src/main.ty:fib:7;src/other/util.ty:render:4;\
+             util.py:<module>:1 2\n"
         );
         let table = summarise(&mapped, 10);
         assert!(table.starts_with("5 samples\n"), "{table}");
         assert!(
-            table.contains("40.0%   100.0%  fib (src/main.ty) @ src/main.ty:7"),
+            table.contains("0.0%   100.0%  fib (src/main.ty)\n"),
             "{table}"
         );
         assert!(
-            table.contains("60.0%    60.0%  decode (/usr/lib/python3.15/json/decoder.py)"),
+            table.contains("60.0%    60.0%  decode (decoder.py)"),
             "{table}"
         );
     }

@@ -170,9 +170,6 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
     // typhon_runtime package for emission.
     let injected_traceback =
         options.traceback_remap && inject_traceback_install(&mut desugared_mod.body);
-    if options.global_lazy_imports {
-        inject_global_lazy_imports(&mut desugared_mod.body);
-    }
 
     let has_result_usage = stmts_use_result_names(&module.body);
     let has_any_runtime_import = has_any_typhon_runtime_import(&module.body);
@@ -335,6 +332,11 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
             insert_at + imports_inserted,
             make_dunder_all(&options.pub_names),
         );
+    }
+    // Last, so it lands ahead of every import above, synthesised ones
+    // included; otherwise those would run eagerly.
+    if options.global_lazy_imports {
+        inject_global_lazy_imports(&mut body);
     }
 
     DesugarOutput {
@@ -6411,6 +6413,21 @@ def helper() -> None:
         );
         let off = desugar_module_with(&parse(src), DesugarOptions::default());
         assert!(!emit(&off.module).contains("set_lazy_imports"));
+        // Compiler-synthesised imports (here `typhon_runtime` for `Ok`) are
+        // lazy too: the guard comes before them.
+        let src = "def f() -> Result[int, str]:\n    return Ok(1)\nprint(f())\n";
+        let out = desugar_module_with(
+            &parse(src),
+            DesugarOptions {
+                global_lazy_imports: true,
+                ..Default::default()
+            },
+        );
+        let py = emit(&out.module);
+        assert!(
+            py.find("set_lazy_imports").unwrap() < py.find("typhon_runtime").unwrap(),
+            "{py}"
+        );
     }
 
     #[test]
