@@ -3623,6 +3623,15 @@ pub fn resolve_module(interp: &mut Interpreter, name: &str) -> Result<Value, Unw
     match name {
         "typhon_runtime" => Ok(make_typhon_runtime_module(interp)),
         "math" => Ok(make_math_module()),
+        "math.integer" if crate::python_target() >= (3, 15) => match make_math_module() {
+            Value::Module(m) => Ok(m
+                .members
+                .borrow()
+                .get("integer")
+                .cloned()
+                .unwrap_or(Value::None)),
+            other => Ok(other),
+        },
         "os" => make_os_module(interp),
         "os.path" | "posixpath" => os_path_module(interp),
         "io" => make_io_module(interp),
@@ -3825,6 +3834,8 @@ const PY_FUNCTIONS: &[(&str, &[&str])] = &[
             "finditer",
             "fullmatch",
             "match",
+            // 3.15+; absent from the module on older targets.
+            "prefixmatch",
             "search",
             "split",
             "sub",
@@ -4279,7 +4290,25 @@ fn make_typhon_runtime_module(interp: &Interpreter) -> Value {
     )
 }
 
+/// `math`, plus on a 3.15+ target its `math.integer` submodule (PEP 791):
+/// the integer functions under a second name, the same objects as
+/// `math.gcd` and friends, as in CPython.
 fn make_math_module() -> Value {
+    let math = make_math_module_base();
+    if crate::python_target() >= (3, 15) {
+        if let Value::Module(m) = &math {
+            let entries: Vec<(&str, Value)> = ["comb", "factorial", "gcd", "isqrt", "lcm", "perm"]
+                .into_iter()
+                .filter_map(|k| m.members.borrow().get(k).cloned().map(|v| (k, v)))
+                .collect();
+            let integer = make_module("math.integer", entries);
+            m.members.borrow_mut().insert("integer".to_owned(), integer);
+        }
+    }
+    math
+}
+
+fn make_math_module_base() -> Value {
     /// Compute factorial of n as a BigInt. CPython raises ValueError for
     /// negative inputs and TypeError for non-integers.
     // Integer-domain math functions reject non-integers (CPython raises
@@ -8107,6 +8136,16 @@ fn make_re_module_with_flags(interp: &mut Interpreter) -> Result<Value, Unwind> 
             .borrow_mut()
             .insert("RegexFlag".to_owned(), flag.clone());
     }
+    if crate::python_target() >= (3, 15) {
+        if let Value::Module(m) = &module {
+            let matcher = m.members.borrow().get("match").cloned();
+            if let Some(matcher) = matcher {
+                m.members
+                    .borrow_mut()
+                    .insert("prefixmatch".to_owned(), matcher);
+            }
+        }
+    }
     Ok(module)
 }
 
@@ -8360,23 +8399,32 @@ fn make_re_module() -> Value {
     fn pattern_value(p: regex::Regex, source: String, flags: i64) -> Value {
         let p_rc = Rc::new(p);
         let mut attrs: crate::value::FieldMap = crate::value::FieldMap::new();
-        let p1 = p_rc.clone();
-        attrs.insert(
-            "match".into(),
-            Value::Native(Rc::new(NativeFn::new("match", move |_i, args| {
-                let a = re_args(args, &["string", "pos", "endpos"], "match")?;
-                let s = re_str_arg(&a[0], "match")?;
-                let (hay, pos) = re_window(&s, &a[1], &a[2])?;
-                let caps = p1
-                    .captures_at(&hay, pos)
-                    .filter(|c| c.get(0).unwrap().start() == pos);
-                Ok(captures_to_value(
-                    caps,
-                    &name_indices(&p1),
-                    &MatchCtx::new(&hay, &a[0], pos),
-                ))
-            }))),
-        );
+        // `Pattern.prefixmatch` (3.15) is a second method with the same
+        // behaviour as `match`, under its own name.
+        let match_names: &[&'static str] = if crate::python_target() >= (3, 15) {
+            &["match", "prefixmatch"]
+        } else {
+            &["match"]
+        };
+        for &name in match_names {
+            let p1 = p_rc.clone();
+            attrs.insert(
+                name.into(),
+                Value::Native(Rc::new(NativeFn::new(name, move |_i, args| {
+                    let a = re_args(args, &["string", "pos", "endpos"], name)?;
+                    let s = re_str_arg(&a[0], name)?;
+                    let (hay, pos) = re_window(&s, &a[1], &a[2])?;
+                    let caps = p1
+                        .captures_at(&hay, pos)
+                        .filter(|c| c.get(0).unwrap().start() == pos);
+                    Ok(captures_to_value(
+                        caps,
+                        &name_indices(&p1),
+                        &MatchCtx::new(&hay, &a[0], pos),
+                    ))
+                }))),
+            );
+        }
         let p2 = p_rc.clone();
         attrs.insert(
             "search".into(),
@@ -8799,6 +8847,30 @@ fn make_re_module() -> Value {
             chain: RefCell::new(None),
         }))
     }
+    fn module_match(name: &'static str) -> Value {
+        nf(name, move |_i, args| {
+            let a = re_args(args, &["pattern", "string", "flags"], name)?;
+            let p = re_str_arg(&a[0], name)?;
+            let s = re_str_arg(&a[1], name)?;
+            let r = compile_one(&p, re_flags_arg(&a[2])?)?;
+            // Python's `re.match` only matches at the start of the
+            // string (unlike `re.search`). The Rust `regex` crate
+            // returns the leftmost match anywhere, so anchor by
+            // requiring `start() == 0`.
+            let caps = r.captures(&s).filter(|c| c.get(0).unwrap().start() == 0);
+            let names = name_indices(&r);
+            Ok(captures_to_value(
+                caps,
+                &names,
+                &MatchCtx::new(&s, &a[1], 0),
+            ))
+        })
+    }
+    let match_name = if crate::python_target() >= (3, 15) {
+        "prefixmatch"
+    } else {
+        "match"
+    };
     make_module(
         "re",
         vec![
@@ -8812,26 +8884,9 @@ fn make_re_module() -> Value {
                     Ok(pattern_value(r, p, flags))
                 }),
             ),
-            (
-                "match",
-                nf("match", move |_i, args| {
-                    let a = re_args(args, &["pattern", "string", "flags"], "match")?;
-                    let p = re_str_arg(&a[0], "match")?;
-                    let s = re_str_arg(&a[1], "match")?;
-                    let r = compile_one(&p, re_flags_arg(&a[2])?)?;
-                    // Python's `re.match` only matches at the start of the
-                    // string (unlike `re.search`). The Rust `regex` crate
-                    // returns the leftmost match anywhere, so anchor by
-                    // requiring `start() == 0`.
-                    let caps = r.captures(&s).filter(|c| c.get(0).unwrap().start() == 0);
-                    let names = name_indices(&r);
-                    Ok(captures_to_value(
-                        caps,
-                        &names,
-                        &MatchCtx::new(&s, &a[1], 0),
-                    ))
-                }),
-            ),
+            // On 3.15 `re.match` is `re.prefixmatch` (one function named
+            // `prefixmatch`); before that only `match` exists.
+            ("match", module_match(match_name)),
             (
                 "search",
                 nf("search", move |_i, args| {

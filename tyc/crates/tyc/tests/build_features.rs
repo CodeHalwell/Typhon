@@ -2132,6 +2132,58 @@ fn check_rejects_3_15_syntax_on_older_targets() {
     }
 }
 
+const PY315_STDLIB_SRC: &str = "\
+import math.integer
+import re
+
+def main() -> None:
+    let m = re.prefixmatch(r\"\\d+\", \"123abc\")
+    if m is not None:
+        print(m.group(0))
+    print(re.compile(\"ab\").prefixmatch(\"xab\"), re.match is re.prefixmatch)
+    print(math.integer.isqrt(17), math.integer.lcm(4, 6))
+    let buf = bytearray(b\"header:body\")
+    print(buf.take_bytes(7), buf)
+
+if __name__ == \"__main__\":
+    main()
+";
+
+#[test]
+fn newer_stdlib_names_need_a_3_15_target() {
+    // `re.prefixmatch` and `math.integer` raise on CPython 3.13, so a 3.13
+    // target rejects them; a 3.15 target runs them on the VM itself.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(tmp.path(), "3.13", PY315_STDLIB_SRC);
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "3.13 check must fail:\n{text}");
+    for needle in ["`math.integer` was added", "`re.prefixmatch` was added"] {
+        assert!(text.contains(needle), "missing {needle:?}:\n{text}");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_target(tmp.path(), "3.15", PY315_STDLIB_SRC);
+    let out = tyc()
+        .args(["run", "--no-fallback"])
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "3.15 VM run failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "123\nNone True\n4 12\nb'header:' bytearray(b'body')\n"
+    );
+}
+
 #[test]
 fn check_accepts_3_15_syntax_on_a_3_15_target() {
     let tmp = tempfile::tempdir().unwrap();

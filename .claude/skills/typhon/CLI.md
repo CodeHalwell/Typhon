@@ -180,12 +180,14 @@ tyc trace err.log --map-dir dist/                # sidecars live somewhere else
 
 There is no `--no-color` flag; output is plain text. Use after a production / CI failure where you only have the traceback. Pair with `tyc debug` for live stepping. Paths with spaces use a longest-candidate walk-left lookup (v0.5.0). Cached per-line.
 
-### `tyc profile [PATH] [--out DIR]`
+### `tyc profile [PATH] [--sample|--instrument] [--out DIR] [-- ARGS]`
 
-Builds, then rewrites every emitted `.py` so each **top-level** `def` / `async def` (not methods, not nested functions, not the generated `typhon_runtime/` helpers) is wrapped in a call-count + wall-clock timing decorator, dropping a `typhon_profile.py` helper next to the emitted code. `tyc profile` does **not** run the program and takes no program arguments — you run the instrumented entry point yourself; on interpreter exit an `atexit` hook writes `typhon-profile.json`, a JSON object keyed `"<module>.<qualname>"` (`fn.__module__` + `fn.__qualname__`) with `{"calls": N, "total_seconds": F}` values. Feeds `[strictness] pgo-memoise`:
+Two modes. **Sampling** (default on a 3.15+ `[python] target`, or `--sample`): builds, runs the entry point under CPython 3.15's Tachyon sampler (`python -m profiling.sampling run --collapsed`, PEP 799), maps every project frame through the `.py.map` sidecars to `src/<file>.ty:<func>:<line>`, writes `typhon-profile.collapsed` next to `typhon.toml` (speedscope / inferno / `flamegraph.pl` format; Tachyon's raw file stays in `<out>/.profile/`), and prints a self%/total% table. No rewriting, so methods, closures and coroutines are covered. Flags: `--python` (default `.venv`, then `python3.<minor>`; must be 3.15+), `--entry FILE` (default `main.py`), `--rate`, `--mode wall|cpu|gil|exception`, `--async-aware`, `--all-threads`, `--top N`, `-- ARGS` for the program. It does **not** write `typhon-profile.json`, so it doesn't feed `pgo-memoise`.
+
+**Instrumenting** (default below 3.15, or `--instrument`): builds, then rewrites every emitted `.py` so each **top-level** `def` / `async def` (not methods, not nested functions, not the generated `typhon_runtime/` helpers) is wrapped in a call-count + wall-clock timing decorator, dropping a `typhon_profile.py` helper next to the emitted code. `tyc profile` does **not** run the program and takes no program arguments — you run the instrumented entry point yourself; on interpreter exit an `atexit` hook writes `typhon-profile.json`, a JSON object keyed `"<module>.<qualname>"` (`fn.__module__` + `fn.__qualname__`) with `{"calls": N, "total_seconds": F}` values. Feeds `[strictness] pgo-memoise`:
 
 ```bash
-tyc profile                          # instrumented build → build/ (or --out DIR)
+tyc profile --instrument             # instrumented build → build/ (or --out DIR)
 python build/main.py --bench         # run from the project root; typhon-profile.json written on exit
 tyc build                            # with [strictness] pgo-memoise = true (or [optimise] level = 1),
                                      # hot pure functions are promoted to @functools.cache

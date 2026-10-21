@@ -86,7 +86,8 @@ pub struct UnsupportedSyntax {
 /// already reports that.
 ///
 /// Only syntax newer than the 3.13 floor is reported (3.14's t-strings and
-/// unparenthesised `except A, B:`, 3.15's comprehension unpacking). A
+/// unparenthesised `except A, B:`, 3.15's comprehension unpacking and
+/// unary `+` in literal patterns). A
 /// `lazy` import is never reported: Typhon's own `lazy import` predates
 /// PEP 810 and lowers per target, and the forms it does not lower have
 /// their own diagnostic.
@@ -111,6 +112,7 @@ pub fn unsupported_syntax(source: &str, major: u8, minor: u8) -> Vec<Unsupported
             matches!(
                 e.kind,
                 K::UnpackingInComprehension(_)
+                    | K::UnaryPlusLiteralPattern
                     | K::UnparenthesizedExceptionTypes
                     | K::TemplateStrings
             )
@@ -131,7 +133,9 @@ pub fn unsupported_syntax(source: &str, major: u8, minor: u8) -> Vec<Unsupported
 /// - an unparenthesised `except A, B:` has a comma outside brackets
 ///   between `except` and its colon;
 /// - a t-string has a `t` / `T` prefix (optionally with `r`) that starts a
-///   token, right before a quote.
+///   token, right before a quote;
+/// - a `case +1:` pattern is on a line starting with `case` that holds a
+///   `+`.
 pub fn may_hold_newer_syntax(source: &str) -> bool {
     let bytes = source.as_bytes();
     let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
@@ -157,6 +161,13 @@ pub fn may_hold_newer_syntax(source: &str) -> bool {
         }
     }
     source.lines().any(|line| {
+        if line
+            .trim_start()
+            .strip_prefix("case")
+            .is_some_and(|rest| rest.contains('+'))
+        {
+            return true;
+        }
         let Some(clause) = line.trim_start().strip_prefix("except") else {
             return false;
         };

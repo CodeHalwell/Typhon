@@ -1855,6 +1855,120 @@ fn runtime_bound_names(
     (b.runtime, exported, b.mutated)
 }
 
+/// Whether CPython, for the `[python] target` set by [`set_python_target`],
+/// opens a text file without `encoding=` as UTF-8 on this host, as the VM
+/// always does. Python 3.15 does on every host (PEP 686); 3.13 and 3.14 use
+/// the locale's encoding unless UTF-8 mode is on. `PYTHONUTF8` overrides
+/// both ways. The locale check errs towards "not UTF-8", since the caller
+/// uses a `false` to run the program on CPython instead.
+pub fn host_text_encoding_is_utf8() -> bool {
+    match std::env::var("PYTHONUTF8").ok().as_deref() {
+        Some("1") => true,
+        Some("0") => locale_is_utf8(),
+        _ => python_target() >= (3, 15) || locale_is_utf8(),
+    }
+}
+
+#[cfg(windows)]
+fn locale_is_utf8() -> bool {
+    // CPython before 3.15 uses the ANSI code page, which is rarely UTF-8.
+    false
+}
+
+#[cfg(not(windows))]
+fn locale_is_utf8() -> bool {
+    let value = ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .find(|v| !v.is_empty());
+    match value.as_deref() {
+        // The C locale is coerced to UTF-8 (PEP 538) or turns on UTF-8 mode
+        // (PEP 540).
+        None | Some("C") | Some("POSIX") => true,
+        Some(v) => {
+            let codeset = v.split_once('.').map(|(_, c)| c).unwrap_or("");
+            let codeset = codeset.split('@').next().unwrap_or("");
+            codeset.to_ascii_lowercase().replace('-', "") == "utf8"
+        }
+    }
+}
+
+/// Whether `module` opens a file in text mode without naming an encoding:
+/// `open(...)`, `io.open(...)`, or a `.open(...)` / `.read_text(...)` /
+/// `.write_text(...)` method call, with no `encoding=` and no constant
+/// binary mode. Such a call depends on the host's default text encoding, so
+/// where that isn't UTF-8 (see [`host_text_encoding_is_utf8`]) `tyc run`
+/// runs the program on CPython. Any receiver counts for the method forms;
+/// a false positive only costs the fallback.
+pub fn module_opens_text_without_encoding(module: &ruff_python_ast::ModModule) -> bool {
+    use ruff_python_ast::visitor::{self, Visitor};
+    use ruff_python_ast::{Expr, ExprCall};
+
+    fn is_binary_mode(e: Option<&Expr>) -> bool {
+        matches!(e, Some(Expr::StringLiteral(s)) if s.value.to_str().contains('b'))
+    }
+    fn opens_text(call: &ExprCall) -> bool {
+        let args = &call.arguments;
+        if args
+            .keywords
+            .iter()
+            .any(|k| k.arg.as_ref().is_some_and(|a| a.as_str() == "encoding") || k.arg.is_none())
+        {
+            return false;
+        }
+        let mode_kw = args
+            .keywords
+            .iter()
+            .find(|k| k.arg.as_ref().is_some_and(|a| a.as_str() == "mode"))
+            .map(|k| &k.value);
+        match call.func.as_ref() {
+            Expr::Name(n) if n.id.as_str() == "open" => {
+                // open(file, mode, buffering, encoding, ...)
+                !is_binary_mode(args.args.get(1).or(mode_kw)) && args.args.len() < 4
+            }
+            Expr::Attribute(a) => match a.attr.as_str() {
+                // io.open has open's signature; Path.open(mode, buffering,
+                // encoding, ...).
+                "open" => {
+                    let is_io = matches!(a.value.as_ref(), Expr::Name(n) if n.id.as_str() == "io");
+                    let (mode, enc_pos) = if is_io {
+                        (args.args.get(1), 3)
+                    } else {
+                        (args.args.first(), 2)
+                    };
+                    !is_binary_mode(mode.or(mode_kw)) && args.args.len() <= enc_pos
+                }
+                // Path.read_text(encoding, ...) / write_text(data, encoding, ...)
+                "read_text" => args.args.is_empty(),
+                "write_text" => args.args.len() < 2,
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+    #[derive(Default)]
+    struct Scan {
+        found: bool,
+    }
+    impl<'a> Visitor<'a> for Scan {
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            if self.found {
+                return;
+            }
+            if let Expr::Call(call) = expr {
+                if opens_text(call) {
+                    self.found = true;
+                    return;
+                }
+            }
+            visitor::walk_expr(self, expr);
+        }
+    }
+    let mut scan = Scan::default();
+    scan.visit_body(&module.body);
+    scan.found
+}
+
 /// Whether `module` defines a generator whose `yield` sits where the
 /// tree-walk cannot suspend (a loop test, a `with` item, two yields in one
 /// expression, …). The VM runs such a generator eagerly — its whole body at

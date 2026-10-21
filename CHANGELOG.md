@@ -4,6 +4,78 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## Unreleased — making more of Python 3.15
+
+Python 3.15.0 shipped on 9 October. This round makes 3.15 the starting point
+for new projects and uses more of what it offers, while the minimum and the
+default `[python] target` for an existing `typhon.toml` stay at 3.13. The new
+errors fire only on code its target could not have run, and the two new
+runtime switches are off unless a project turns them on.
+
+### Added
+
+- **`tyc profile` samples with CPython 3.15's Tachyon profiler.** On a 3.15+
+  target, `tyc profile` builds the project and runs it under
+  `python -m profiling.sampling` (PEP 799), with no rewriting of the emitted
+  code, so methods, nested functions, lambdas and coroutines are all
+  covered. The collapsed stacks are mapped back through the `.py.map`
+  sidecars to `.ty` files and lines, written to
+  `typhon-profile.collapsed` (speedscope, inferno and `flamegraph.pl` read
+  it), and summarised as a self/total table. `--rate`, `--mode`,
+  `--async-aware`, `--all-threads`, `--python`, `--entry` and `-- ARGS` pass
+  through. Below 3.15 the instrumenting profiler stays the default, and
+  `--instrument` / `--sample` choose explicitly.
+- **`[optimise] jit = true`.** `tyc run --compile`, `tyc run`'s automatic
+  CPython fallback and `tyc profile` run the program with `PYTHON_JIT=1`,
+  unless `PYTHON_JIT` is already set.
+- **`[optimise] lazy-imports = "all"` (3.15+ targets).** Every emitted module
+  opens with `if __name__ == "__main__":
+  __import__("sys").set_lazy_imports("all")`, PEP 810's global mode, so an
+  entry script's later imports all load on first use. A 3.13 or 3.14 target
+  rejects the setting with `tyc::invalid_config_value`. `tyc run` takes the
+  CPython path for such a project, since the VM imports eagerly. New
+  `lazy-imports-all` knob-matrix fixture.
+- **Unary `+` in literal patterns (`case +1:`) on 3.15 targets.** The
+  vendored parser rejected it on every target; it now parses, and
+  `tyc::requires_newer_python` rejects it below 3.15, where CPython does.
+- **`re.prefixmatch`, `math.integer` and `bytearray.take_bytes` under
+  `tyc run`** on 3.15 targets, matching CPython 3.15: `re.match is
+  re.prefixmatch`, `math.integer.gcd is math.gcd`, and `take_bytes`
+  follows CPython's negative-index and error rules.
+- **`frozendict` parameters can be cache keys.** The silent memoisation
+  paths (`auto-memoise`, `pgo-memoise`, `-O`) accept a `frozendict[K, V]`
+  parameter under the same rule as `tuple`, and `frozendict` counts as
+  immutable.
+
+### Changed
+
+- **`tyc init` scaffolds `[python] target = "3.15"`.** Existing projects,
+  and a `typhon.toml` with no `target`, keep 3.13.
+- **`tyc::requires_newer_python` covers newer stdlib names.**
+  `re.prefixmatch` and `math.integer` (as `module.attr`, `from … import`, or
+  `import math.integer`) are rejected below 3.15, where they raise
+  `AttributeError` / `ModuleNotFoundError`.
+- **`tyc run` falls back to CPython for locale-encoded text files.** Before
+  3.15, `open()` without `encoding=` uses the locale's encoding, while the VM
+  always uses UTF-8. On a host whose locale isn't UTF-8 (and without
+  `PYTHONUTF8=1`), a 3.13 or 3.14 program that opens text files that way now
+  runs on CPython. 3.15 targets, UTF-8 locales and the C locale are
+  unaffected.
+
+### Fixed
+
+- **`tyc run`'s fallback scan follows `[python] target`.** The VM learned
+  its target only after the scan had judged which module exports it
+  models, so 3.15-only exports were always treated as missing.
+
+### Testing / CI
+
+- The three 3.15 CI steps no longer allow pre-releases, now that 3.15.0 is
+  final.
+- New non-blocking `canary-py316` job runs the knob matrix and the
+  differential harness under the newest CPython 3.16 pre-release (3.16.0a1
+  came out on 13 October; beta 1 is due 4 May 2027).
+
 ## 1.0.0-beta.3 — 2026-10-09 — Python 3.15 targets & VM parity gap fixes
 
 Two lines of work since beta.2. CPython 3.15 joins 3.13 in CI, and a

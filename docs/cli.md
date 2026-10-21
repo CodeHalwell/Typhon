@@ -15,7 +15,7 @@ Typhon ships a single binary, `tyc`, that handles every stage of the workflow. S
 | `tyc init` | Scaffold a new project: `typhon.toml`, `src/`, `tests/`. The generated `src/main.ty` includes a frozen dataclass, an `impl` block, a `mut` binding, and a `Result`/`?`/`match` example; the generated `typhon.toml` ships the commonly-tuned `[strictness]` / `[emit]` keys with a comment (the full list is in [configuration.md](configuration.md)). |
 | `tyc install skill` | Write the embedded `typhon` Claude skill (`SKILL.md` + sibling reference docs + the `references/` example programs) into `.claude/skills/typhon/` of the current project. The skill is bundled into the binary at build time, so it works offline. `--force` overwrites an existing copy, `--dir PATH` targets another root, `--list` previews the files without writing. |
 | `tyc trace` | Map a Python traceback (a file argument, or stdin when omitted) back to Typhon source via `.py.map` files. Every row is rewritten, not just the `File "…", line N` header: the source row under each frame becomes the real `.ty` row and the column anchors are dropped, so no emitted Python is shown under a `.ty` line. Frames inside an `ExceptionGroup` traceback (`  |   File "…"`, as every failed `gather:` prints) are rewritten too. `--map-dir DIR` adds a directory to search for sidecars; by default each frame's map is located from its own `.py` path (`<dir>/.sourcemaps/<rel>.py.map`, then a legacy adjacent `.py.map`). |
-| `tyc profile` | Build, then instrument every top-level function in the emitted code for hot-function detection (advanced, opt-in). `--out DIR` overrides the build directory. See [`tyc profile`](#tyc-profile) for the round trip into `[strictness] pgo-memoise`. |
+| `tyc profile` | Build, then find the hot functions: on a 3.15+ target, run the program under CPython's sampling profiler and map the stacks back to `.ty` lines; below 3.15 (or with `--instrument`), instrument every top-level function instead. See [`tyc profile`](#tyc-profile), including the round trip into `[strictness] pgo-memoise`. |
 | `tyc migrate` | Convert typed Python (`.py`) to Typhon (`.ty`): rewrites `Optional[T]`/`T \| None` → `T?`, adds `let`/`mut` to module-level annotated assigns *and* function-body plain assignments, strips `@dataclass` decorators. |
 | `tyc ty` | Build the project and run Astral's `ty` checker against the emitted Python. Requires `ty` on `PATH` (`pip install ty`). Supports `--watch` for continuous feedback. |
 | `tyc stubtest` | Build the project and run `python -m mypy.stubtest` against every emitted `.pyi` stub. Complements `tyc check --stubs` (which performs an AST diff) by catching dynamically-created attributes the AST cannot see. Requires `mypy` in the chosen interpreter (`pip install mypy`). |
@@ -103,7 +103,7 @@ The remaining daily-loop commands have small flag sets:
 | `tyc check [PATH]...` | `--stubs` | Also parse + type-check every `.dty` under the checked paths and diff each stub's surface against its sibling `.ty` (preferred) or `.py` implementation; findings surface as `tyc::stub_mismatch` at the `[strictness] stub-check` severity (default `"error"`). |
 | | `--with-ty` | Build to a throwaway directory and run Astral's `ty` over it (see [`tyc build`](#tyc-build)). |
 | `tyc fmt [PATH]...` | `--check` / `-c` | Exit non-zero if any file would change; write nothing. The only `fmt` flag — there is no `--diff` / `--quiet`. `tyc fmt` collects `.ty` files only (`.dty` stubs are not formatted). A file that does not parse is reported and skipped rather than aborting the walk; the command still exits non-zero, with a count of the files it could not format. The formatter accepts exactly what `tyc check` accepts — both run the same sugar-expansion chain — formatting converges in one pass, and `tyc build` emits byte-identical Python before and after it (bar a generated `__typhon_guard_N` temporary, numbered from the line it came from). A file that resolves outside the project (the nearest directory above the path with a `typhon.toml`) — through `src -> ../elsewhere` or a link inside the tree — is skipped with a warning, never written through. |
-| `tyc init [NAME]` | `--dir DIR` / `-d` | Directory to initialise (default `.`). With `NAME`, the scaffold lands in `<DIR>/<NAME>/`; without it, `DIR` itself is initialised and its basename becomes the project name. An existing `typhon.toml` or `src/main.ty` (or a symlink at either path) stops it before it writes anything. The generated `typhon.toml` leaves `auto-memoise` / `auto-gather` / `auto-parallel` / `pgo-memoise` unset, so `[optimise] level = 1` and `tyc build -O` turn them on. |
+| `tyc init [NAME]` | `--dir DIR` / `-d` | Directory to initialise (default `.`). With `NAME`, the scaffold lands in `<DIR>/<NAME>/`; without it, `DIR` itself is initialised and its basename becomes the project name. An existing `typhon.toml` or `src/main.ty` (or a symlink at either path) stops it before it writes anything. The generated `typhon.toml` targets Python 3.15 (`[python] target = "3.15"`; change it to `"3.13"` or `"3.14"` to support older interpreters), and leaves `auto-memoise` / `auto-gather` / `auto-parallel` / `pgo-memoise` unset, so `[optimise] level = 1` and `tyc build -O` turn them on. |
 | `tyc lsp` | `--log-level LEVEL` | `error` / `warn` / `info` (default) / `debug` — threshold for status messages forwarded over `window/logMessage`. `--stdio` is accepted as a no-op. |
 | `tyc trace [TRACEBACK]` | `--map-dir DIR` | Extra directory to search for `.py.map` sidecars (`<DIR>/.sourcemaps/<file>.py.map`, then `<DIR>/<file>.py.map`). Without a `TRACEBACK` argument the traceback is read from stdin. |
 
@@ -114,6 +114,41 @@ The remaining daily-loop commands have small flag sets:
 The binary has no global flags beyond `--help` / `--version`: no `--quiet`, `--verbose`, `--color`, or `--manifest` (every command discovers `typhon.toml` by walking up from the path it was given).
 
 ## `tyc profile`
+
+`tyc profile` has two modes. **Sampling** is the default when `[python] target` is 3.15 or later; **instrumenting** is the default below that, and `--instrument` / `--sample` pick one explicitly.
+
+### Sampling (3.15+)
+
+Runs the normal `tyc build`, then runs the built entry point under CPython 3.15's sampling profiler, Tachyon (`python -m profiling.sampling`, [PEP 799](https://peps.python.org/pep-0799/)). Nothing is rewritten, so methods, nested functions, lambdas and coroutines are all visible, and the overhead is low. Tachyon's collapsed stacks are mapped through the build's `.py.map` sidecars, so every frame from the project names its `.ty` file and line (`src/main.ty:fib:4`); frames from the stdlib and third-party packages are left as they are. The result is written to `typhon-profile.collapsed` next to `typhon.toml` (the input format of [speedscope](https://www.speedscope.app/), inferno and `flamegraph.pl`), and a summary of the hottest functions is printed:
+
+```text
+1532 samples
+  self%   total%  function (hottest line)
+  71.2%    71.2%  fib (src/main.ty) @ src/main.ty:4
+   9.8%    81.0%  Runner.go (src/main.ty) @ src/main.ty:13
+```
+
+```bash
+tyc profile                          # build, run under the sampler, write typhon-profile.collapsed
+tyc profile -- --bench 10            # arguments after `--` go to the program
+tyc profile --mode cpu --rate 10khz  # CPU time only, sampled at 10 kHz
+```
+
+| Flag | Effect |
+|------|--------|
+| `--sample` / `--instrument` | Pick the mode instead of following the target. |
+| `--python PYTHON` | Interpreter to sample under. Default: the project's `.venv`, then `python3.<minor>` for the target. It must have `profiling.sampling` (CPython 3.15+); an older one fails with a pointer to `--instrument`. |
+| `--entry FILE` | Entry point inside the build directory (default `main.py`). A package entry runs as `python -m`, as with `tyc run --compile`. |
+| `--rate RATE` | Sampling rate, e.g. `10khz` (Tachyon's default is 1 kHz). |
+| `--mode wall\|cpu\|gil\|exception` | What a sample counts (default `wall`). |
+| `--async-aware` | Rebuild stacks from asyncio tasks. |
+| `--all-threads` | Sample every thread, not only the main one. |
+| `--top N` | Rows in the printed summary (default 15). |
+| `--out DIR` / `-o` | Build directory, forwarded to `tyc build`. |
+
+Tachyon's raw output is kept in `<out>/.profile/tachyon.collapsed`. With `[optimise] jit = true` the program runs with `PYTHON_JIT=1`, as under `tyc run --compile`. The profiler reads the target process's memory, so a container or CI runner that forbids `ptrace` can reduce the sample count; Tachyon reports an error rate when that happens.
+
+### Instrumenting
 
 Runs the normal `tyc build`, then rewrites every emitted `.py` so each **top-level** `def` / `async def` (not methods, not nested functions, not the generated `typhon_runtime/` helpers) is wrapped in a lightweight timing decorator, and drops a `typhon_profile.py` helper next to the emitted code. `tyc profile` does **not** run the program: you run the instrumented entry point yourself with a representative workload, and on interpreter exit an `atexit` hook writes `typhon-profile.json` — a JSON object keyed `"<module>.<qualname>"` (`fn.__module__` + `fn.__qualname__`) with `{"calls": N, "total_seconds": F}` values.
 
@@ -127,7 +162,7 @@ tyc build                            # [strictness] pgo-memoise = true promotes 
 |------|--------|
 | `--out DIR` / `-o` | Output directory for the instrumented build, forwarded to `tyc build`. |
 
-Round-trip rules worth knowing:
+The `[strictness] pgo-memoise` round trip reads this mode's `typhon-profile.json`; the sampling mode doesn't produce one. Round-trip rules worth knowing:
 
 - **Run from the project root.** The profile is written to the process's working directory (override with the `TYPHON_PROFILE_OUT` environment variable), while `tyc build` reads `typhon-profile.json` from the directory that holds `typhon.toml`.
 - **Keys match per module.** A `users.find_user` sample only promotes `find_user` in `src/users.ty`. The entry module runs as `__main__`, so its functions are recorded as `__main__.<fn>`; both that spelling and `main.<fn>` are accepted for `src/main.ty`, so the default layout round-trips out of the box. A bare `<fn>` key (no module qualifier) matches by name as a fallback for profiles produced by other tools.

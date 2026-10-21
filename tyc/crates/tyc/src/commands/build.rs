@@ -171,6 +171,14 @@ pub fn run(args: BuildArgs) -> Result<()> {
             );
             return Err(miette::Report::new_boxed(Box::new(err)));
         }
+        Err(crate::config::ConfigError::InvalidLazyImports {
+            path,
+            value,
+            allowed,
+        }) => {
+            let err = TycError::invalid_config_value("optimise.lazy-imports", value, allowed, path);
+            return Err(miette::Report::new_boxed(Box::new(err)));
+        }
         Err(crate::config::ConfigError::InvalidParallelBackend {
             path,
             value,
@@ -1285,6 +1293,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 pub_names: prep.pub_names.clone(),
                 model_extra: config.emit.model_extra.clone(),
                 traceback_remap: config.emit.traceback_remap,
+                global_lazy_imports: native_lazy_imports && config.optimise.lazy_imports_all(),
             },
         );
         if desugar_output.needs_typhon_runtime {
@@ -1655,6 +1664,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 pub_names: prep.pub_names.clone(),
                 model_extra: config.emit.model_extra.clone(),
                 traceback_remap: config.emit.traceback_remap,
+                global_lazy_imports: false,
             },
         );
         let stub_text = emit_stub(&desugar.module);

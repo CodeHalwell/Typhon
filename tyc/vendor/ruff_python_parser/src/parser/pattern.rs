@@ -5,11 +5,11 @@ use ruff_python_ast::{
 };
 use ruff_text_size::{Ranged, TextSize};
 
-use crate::ParseErrorType;
 use crate::parser::progress::ParserProgress;
 use crate::parser::{Parser, RecoveryContextKind, SequenceMatchPatternParentheses, recovery};
 use crate::token::TokenValue;
 use crate::token_set::TokenSet;
+use crate::{ParseErrorType, UnsupportedSyntaxErrorKind};
 
 use super::expression::ExpressionContext;
 
@@ -478,12 +478,12 @@ impl Parser<'_> {
                             ExpressionContext::default(),
                         );
 
+                        // Python 3.15 allows a unary `+` here. (Typhon
+                        // addition, ahead of the upstream pin.)
                         if unary_expr.op.is_u_add() {
-                            self.add_error(
-                                ParseErrorType::OtherError(
-                                    "Unary '+' is not allowed as a literal pattern".to_string(),
-                                ),
-                                &unary_expr,
+                            self.add_unsupported_syntax_error(
+                                UnsupportedSyntaxErrorKind::UnaryPlusLiteralPattern,
+                                unary_expr.range,
                             );
                         }
 

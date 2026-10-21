@@ -6,6 +6,8 @@
 # existing (well-tested) `bytes` surface is the single implementation, and
 # only the mutations are written here.
 
+import sys
+
 
 class bytearray:
     __typhon_builtin_bases__ = ("bytearray",)
@@ -142,6 +144,25 @@ class bytearray:
 
     def copy(self):
         return bytearray(self._data)
+
+    def take_bytes(self, n=None):
+        # 3.15: remove and return the first `n` bytes without a copy in
+        # CPython. Class bodies can't branch on the target, so older
+        # targets get CPython's missing-attribute error at the call.
+        if sys.version_info < (3, 15):
+            raise AttributeError("'bytearray' object has no attribute 'take_bytes'")
+        size = len(self._data)
+        if n is None:
+            n = size
+        elif not isinstance(n, int):
+            raise TypeError("n must be an integer or None")
+        if n < 0:
+            n += size
+        if n < 0 or n > size:
+            raise IndexError(f"can't take {n} bytes outside size {size}")
+        taken = bytes(self._data[:n])
+        self._data = self._data[n:]
+        return taken
 
     # ── read methods, delegated to `bytes` ──────────────────────────────
     def decode(self, encoding="utf-8", errors="strict"):

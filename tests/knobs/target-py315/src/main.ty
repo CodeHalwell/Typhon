@@ -1,9 +1,11 @@
 # `[python] target = "3.15"` unlocks 3.15-only syntax and builtins, which
 # `tyc::requires_newer_python` rejects on older targets: PEP 798 unpacking
 # comprehensions, `frozendict` (PEP 814), `sentinel` (PEP 661) and
-# `lazy from … import …` (PEP 810). The
+# `lazy from … import …` (PEP 810), plus the newer stdlib names
+# (`math.integer`, `bytearray.take_bytes`). The
 # emitted file is 3.15 Python, so meta.conf's `min-python=3.15` keeps it
 # build-only under python3.13; the CI 3.15 leg runs it and compares the VM.
+import math.integer
 import sys
 
 lazy from textwrap import shorten
@@ -34,6 +36,11 @@ def main() -> None:
     print(LIMITS, hash(LIMITS) == hash(frozendict(a=(1, 2))))
     print(sys.version_info >= (3, 15))
     print(shorten("lazy from imports load on first use", width=20))
+    # 3.15 stdlib additions: `math.integer` (PEP 791) and
+    # `bytearray.take_bytes`.
+    print(math.integer.isqrt(17), math.integer.comb(5, 2), math.integer.gcd is math.gcd)
+    let buf = bytearray(b"header:body")
+    print(buf.take_bytes(7), buf)
 
 
 if __name__ == "__main__":

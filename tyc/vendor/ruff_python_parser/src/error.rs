@@ -880,6 +880,20 @@ pub enum UnsupportedSyntaxErrorKind {
     /// [PEP 798]: https://peps.python.org/pep-0798/
     UnpackingInComprehension(ComprehensionUnpackingKind),
 
+    /// Represents a unary `+` in a literal pattern before Python 3.15.
+    ///
+    /// Starting with Python 3.15, a literal pattern may carry a unary plus,
+    /// matching the unary minus it already allowed:
+    ///
+    /// ```python
+    /// match x:
+    ///     case +1: ...
+    ///     case +1.5 | -2: ...
+    /// ```
+    ///
+    /// (Typhon addition, ahead of the upstream pin.)
+    UnaryPlusLiteralPattern,
+
     /// Represents the use of tuple unpacking in a `for` statement iterator clause before Python
     /// 3.9.
     ///
@@ -1037,6 +1051,9 @@ impl Display for UnsupportedSyntaxError {
             UnsupportedSyntaxErrorKind::UnpackingInComprehension(
                 ComprehensionUnpackingKind::DictInDict,
             ) => "Cannot use dictionary unpacking in a dict comprehension",
+            UnsupportedSyntaxErrorKind::UnaryPlusLiteralPattern => {
+                "Cannot use unary `+` in a literal pattern"
+            }
             UnsupportedSyntaxErrorKind::UnparenthesizedUnpackInFor => {
                 "Cannot use iterable unpacking in `for` statements"
             }
@@ -1110,6 +1127,9 @@ impl UnsupportedSyntaxErrorKind {
             }
             UnsupportedSyntaxErrorKind::StarAnnotation => Change::Added(PythonVersion::PY311),
             UnsupportedSyntaxErrorKind::UnpackingInComprehension(_) => {
+                Change::Added(PythonVersion::PY315)
+            }
+            UnsupportedSyntaxErrorKind::UnaryPlusLiteralPattern => {
                 Change::Added(PythonVersion::PY315)
             }
             UnsupportedSyntaxErrorKind::UnparenthesizedUnpackInFor => {

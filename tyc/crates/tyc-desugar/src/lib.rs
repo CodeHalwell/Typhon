@@ -106,6 +106,14 @@ pub struct DesugarOptions {
     /// from `[emit] traceback-remap` in `typhon.toml`; default `false` so
     /// existing projects (and runtime-free entry points) are unaffected.
     pub traceback_remap: bool,
+    /// When `true`, open the module with
+    /// `if __name__ == "__main__": __import__("sys").set_lazy_imports("all")`
+    /// so that, once it runs as the entry script, every later import is
+    /// lazy (PEP 810's global mode). Plumbed from `[optimise] lazy-imports =
+    /// "all"`, which config validation allows only on 3.15+ targets. The
+    /// guard keeps a library import of the module from changing its host's
+    /// import mode.
+    pub global_lazy_imports: bool,
 }
 
 /// Desugar a Typhon module AST into a plain Python AST.
@@ -138,6 +146,7 @@ impl Default for DesugarOptions {
             pub_names: Vec::new(),
             model_extra: "forbid".into(),
             traceback_remap: false,
+            global_lazy_imports: false,
         }
     }
 }
@@ -161,6 +170,9 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
     // typhon_runtime package for emission.
     let injected_traceback =
         options.traceback_remap && inject_traceback_install(&mut desugared_mod.body);
+    if options.global_lazy_imports {
+        inject_global_lazy_imports(&mut desugared_mod.body);
+    }
 
     let has_result_usage = stmts_use_result_names(&module.body);
     let has_any_runtime_import = has_any_typhon_runtime_import(&module.body);
@@ -1322,6 +1334,75 @@ fn inject_traceback_install(body: &mut Vec<Stmt>) -> bool {
     });
     body.insert(at, guard);
     true
+}
+
+/// `[optimise] lazy-imports = "all"`: insert
+///
+/// ```python
+/// if __name__ == "__main__":
+///     __import__("sys").set_lazy_imports("all")
+/// ```
+///
+/// after the module docstring and any `from __future__` imports, ahead of
+/// every other import, so the entry script's own imports are lazy too.
+fn inject_global_lazy_imports(body: &mut Vec<Stmt>) {
+    let mut at = 0;
+    if let Some(Stmt::Expr(e)) = body.first() {
+        if matches!(e.value.as_ref(), Expr::StringLiteral(_)) {
+            at = 1;
+        }
+    }
+    while let Some(Stmt::ImportFrom(i)) = body.get(at) {
+        if i.module.as_ref().map(|m| m.as_str()) != Some("__future__") {
+            break;
+        }
+        at += 1;
+    }
+    let import_sys = Expr::Call(ExprCall {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        func: Box::new(Expr::Name(ExprName {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            id: Name::new("__import__"),
+            ctx: ExprContext::Load,
+        })),
+        arguments: Arguments {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            args: Box::new([make_string_literal_expr("sys")]),
+            keywords: Box::new([]),
+        },
+    });
+    let set_mode = Expr::Call(ExprCall {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        func: Box::new(Expr::Attribute(ast::ExprAttribute {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            value: Box::new(import_sys),
+            attr: make_identifier("set_lazy_imports"),
+            ctx: ExprContext::Load,
+        })),
+        arguments: Arguments {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            args: Box::new([make_string_literal_expr("all")]),
+            keywords: Box::new([]),
+        },
+    });
+    let guard = Stmt::If(ast::StmtIf {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        test: Box::new(make_main_guard_test()),
+        body: vec![Stmt::Expr(ast::StmtExpr {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            value: Box::new(set_mode),
+        })],
+        elif_else_clauses: vec![],
+    });
+    body.insert(at, guard);
 }
 
 /// A top-level statement that must stay above the injected guard: the module
@@ -6303,6 +6384,33 @@ def helper() -> None:
             1,
             "the existing guard should be reused:\n{emitted}"
         );
+    }
+
+    #[test]
+    fn global_lazy_imports_guard_follows_docstring_and_future_imports() {
+        let src = "\"\"\"Doc.\"\"\"\nfrom __future__ import annotations\nimport json\nprint(json.dumps(1))\n";
+        let parse = |s: &str| {
+            tyc_syntax::parse_module(s)
+                .expect("parse failed")
+                .into_syntax()
+        };
+        let module = parse(src);
+        let out = desugar_module_with(
+            &module,
+            DesugarOptions {
+                global_lazy_imports: true,
+                ..Default::default()
+            },
+        );
+        let py = emit(&out.module);
+        let expected = "if __name__ == \"__main__\":\n    __import__(\"sys\").set_lazy_imports(\"all\")\nimport json";
+        assert!(py.contains(expected), "{py}");
+        assert!(
+            py.find("from __future__").unwrap() < py.find("set_lazy_imports").unwrap(),
+            "{py}"
+        );
+        let off = desugar_module_with(&parse(src), DesugarOptions::default());
+        assert!(!emit(&off.module).contains("set_lazy_imports"));
     }
 
     #[test]
