@@ -1898,8 +1898,9 @@ fn locale_is_utf8() -> bool {
 
 /// Whether `module` opens a file in text mode without naming an encoding:
 /// `open(...)`, `io.open(...)`, or a `.open(...)` / `.read_text(...)` /
-/// `.write_text(...)` method call, with no `encoding=` and no constant
-/// binary mode. Such a call depends on the host's default text encoding, so
+/// `.write_text(...)` method call, with no string-literal encoding (keyword
+/// or positional) and no constant binary mode. A non-literal encoding may be
+/// `None`, so it counts as missing. Such a call depends on the host's default text encoding, so
 /// where that isn't UTF-8 (see [`host_text_encoding_is_utf8`]) `tyc run`
 /// runs the program on CPython. Any receiver counts for the method forms;
 /// a false positive only costs the fallback.
@@ -1908,17 +1909,22 @@ pub fn module_opens_text_without_encoding(module: &ruff_python_ast::ModModule) -
     use ruff_python_ast::{Expr, ExprCall};
 
     fn is_binary_mode(e: Option<&Expr>) -> bool {
-        matches!(e, Some(Expr::StringLiteral(s)) if s.value.to_str().contains('b'))
+        matches!(e, Some(Expr::StringLiteral(s)) if {
+            let m = s.value.to_str();
+            m.contains('b') && m.chars().all(|c| "rwxabt+U".contains(c))
+        })
     }
     fn opens_text(call: &ExprCall) -> bool {
         let args = &call.arguments;
-        // An explicit `encoding=` settles it, unless it is `None` (the
-        // locale default again). `**kwargs` may or may not carry one, so it
-        // counts as no encoding.
-        if args.keywords.iter().any(|k| {
-            k.arg.as_ref().is_some_and(|a| a.as_str() == "encoding")
-                && !matches!(k.value, Expr::NoneLiteral(_))
-        }) {
+        // Only a string literal settles the encoding: `None` means the
+        // locale default again, and any other expression (a variable, a
+        // `**kwargs`) may be `None` at run time.
+        let settled = |e: &Expr| matches!(e, Expr::StringLiteral(_));
+        if args
+            .keywords
+            .iter()
+            .any(|k| k.arg.as_ref().is_some_and(|a| a.as_str() == "encoding") && settled(&k.value))
+        {
             return false;
         }
         let mode_kw = args
@@ -1926,12 +1932,7 @@ pub fn module_opens_text_without_encoding(module: &ruff_python_ast::ModModule) -
             .iter()
             .find(|k| k.arg.as_ref().is_some_and(|a| a.as_str() == "mode"))
             .map(|k| &k.value);
-        // A positional encoding slot that is absent or a literal `None`.
-        let no_encoding_at = |i: usize| {
-            args.args
-                .get(i)
-                .is_none_or(|e| matches!(e, Expr::NoneLiteral(_)))
-        };
+        let no_encoding_at = |i: usize| args.args.get(i).is_none_or(|e| !settled(e));
         match call.func.as_ref() {
             Expr::Name(n) if n.id.as_str() == "open" => {
                 // open(file, mode, buffering, encoding, ...)
@@ -1939,15 +1940,17 @@ pub fn module_opens_text_without_encoding(module: &ruff_python_ast::ModModule) -
             }
             Expr::Attribute(a) => match a.attr.as_str() {
                 // io.open has open's signature; Path.open(mode, buffering,
-                // encoding, ...).
+                // encoding, ...). Any other receiver may be either (an
+                // `import io as i` alias), so both shapes are checked.
                 "open" => {
-                    let is_io = matches!(a.value.as_ref(), Expr::Name(n) if n.id.as_str() == "io");
-                    let (mode, enc_pos) = if is_io {
-                        (args.args.get(1), 3)
+                    if matches!(a.value.as_ref(), Expr::Name(n) if n.id.as_str() == "io") {
+                        !is_binary_mode(args.args.get(1).or(mode_kw)) && no_encoding_at(3)
                     } else {
-                        (args.args.first(), 2)
-                    };
-                    !is_binary_mode(mode.or(mode_kw)) && no_encoding_at(enc_pos)
+                        let binary = is_binary_mode(mode_kw)
+                            || is_binary_mode(args.args.first())
+                            || is_binary_mode(args.args.get(1));
+                        !binary && no_encoding_at(2) && no_encoding_at(3)
+                    }
                 }
                 // Path.read_text(encoding, ...) / write_text(data, encoding, ...)
                 "read_text" => no_encoding_at(0),
@@ -2106,6 +2109,8 @@ mod tests {
             "open('f', 'r', -1, None)\n",
             "p.read_text()\n",
             "p.read_text(None)\n",
+            "open('f', encoding=enc)\n",
+            "import io as i\ni.open('f', 'r', -1, None)\n",
         ] {
             assert!(scan(src), "{src:?} should need the host encoding");
         }
@@ -2114,8 +2119,10 @@ mod tests {
             "open('f', 'rb')\n",
             "open('f', mode='wb')\n",
             "p.read_text('utf-8')\n",
-            "open('f', encoding=enc)\n",
             "open('f', 'r', -1, 'utf-8')\n",
+            "import io as i\ni.open('f', 'r', -1, 'utf-8')\n",
+            "i.open('data.bin', 'rb')\n",
+            "p.open('r', -1, 'utf-8')\n",
         ] {
             assert!(!scan(src), "{src:?} names its encoding");
         }

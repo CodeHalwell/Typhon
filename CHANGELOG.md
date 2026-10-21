@@ -72,8 +72,9 @@ is newly rejected.
   3.15, `open()` without `encoding=` uses the locale's encoding, while the VM
   always uses UTF-8. On a host whose locale isn't UTF-8 (and without
   `PYTHONUTF8=1`), a 3.13 or 3.14 program that opens text files that way now
-  runs on CPython. An explicit `encoding=None`, positional or keyword, and a
-  `**kwargs` call count as no encoding. 3.15 targets and UTF-8 locales are
+  runs on CPython. Only a string-literal encoding, keyword or positional,
+  settles it: `encoding=None`, an encoding held in a variable, and a
+  `**kwargs` call all count as no encoding. 3.15 targets and UTF-8 locales are
   unaffected, and so is the C locale unless both `PYTHONUTF8=0` and
   `PYTHONCOERCECLOCALE=0` are set.
 
