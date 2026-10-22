@@ -38,7 +38,9 @@ table tbody tr:hover, table tbody tr:focus-within { background: var(--sl-color-g
 .sl-markdown-content kbd:not(:where(.not-content *)), site-search kbd kbd { background: var(--sl-color-gray-6); border: 1px solid var(--sl-color-gray-4); border-bottom-width: 2px; border-radius: .25rem; padding: .125rem .375rem; font: .85em var(--sl-font-mono); color: var(--sl-color-white); box-shadow: 0 1px 0 var(--sl-color-gray-5); }
 site-search > button > kbd { background: transparent; border: none; box-shadow: none; padding: 0; gap: .25rem; }
 :focus-visible { outline: 2px solid var(--sl-color-accent); outline-offset: 3px; }
-.sl-markdown-content a:not(:where(.not-content *)) { text-decoration: underline; text-underline-offset: 3px; }
+.sl-markdown-content a:not(:where(.not-content *)) { text-decoration: underline; text-underline-offset: 3px; transition: text-decoration-color 150ms ease, text-decoration-thickness 150ms ease, text-underline-offset 150ms ease, color 150ms ease; }
+.sl-markdown-content a:not(:where(.not-content *)):hover, .sl-markdown-content a:not(:where(.not-content *)):focus-visible { color: var(--sl-color-accent); text-decoration-color: var(--sl-color-accent); text-decoration-thickness: 2px; text-underline-offset: 5px; }
+.sl-markdown-content a:not(:where(.not-content *)):active { text-underline-offset: 3px; transition: none; }
 abbr[title] { cursor: help; text-decoration: underline dotted; }
 ::selection { background: var(--sl-color-accent-low); color: inherit; }
 .sl-markdown-content blockquote { border-left: 3px solid var(--sl-color-accent); padding: 1rem 1.25rem; background: var(--sl-color-gray-6); color: var(--sl-color-gray-2); }
@@ -65,4 +67,7 @@ starlight-tabs .tab > [role='tab']:hover { color: var(--sl-color-white); }
   .sl-link-card:active, .hero .sl-link-button:active {
     transform: none;
   }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sl-markdown-content a:not(:where(.not-content *)) { transition: none !important; }
 }

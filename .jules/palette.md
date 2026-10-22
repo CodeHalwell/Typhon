@@ -83,3 +83,6 @@
 ## 2026-06-30 - [Equitable tactile feedback for Hero buttons and Link Cards]
 **Learning:** Found that primary CTA `.sl-link-button` components on the hero landing page and `.sl-link-card` elements lacked active transitions (`:active`), failing to provide tactile feedback and physical affordance during clicks.
 **Action:** Added active state transitions (`transform: scale(0.98)`) and updated base transitions on `.sl-link-card` and `.sl-link-button`. Explicitly nullified these transforms in the `@media (prefers-reduced-motion: reduce)` block to ensure accessibility compliance.
+## 2024-10-27 - [Tactile states for inline markdown links]
+**Learning:** Default markdown links (`.sl-markdown-content a`) only offer a static underline. Users rely on visual changes to confirm interactivity before clicking. Expanding the underline offset and shifting colors on hover/focus significantly enhances the reading experience and improves accessibility for low-vision users by providing clear interactive feedback.
+**Action:** Added tactile `:hover`, `:focus-visible`, and `:active` CSS transitions to inline markdown links in `docs-site/src/styles/custom.css`, modifying `text-decoration-color`, `text-decoration-thickness`, and `text-underline-offset`.
