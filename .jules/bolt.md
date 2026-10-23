@@ -61,3 +61,7 @@
 ## 2024-11-28 - Zero-Allocation class and method tracking in local AST passes
 **Learning:** Checking local class boundaries (`placed` and `conflicting`) and method definitions (`defined_methods`) during local AST refactoring paths previously used `HashSet<String>`, cloning `&str` nodes with `.to_owned()` for every identified name. These names are only checked locally against the immediate file context during desugaring and migrating, introducing significant avoidable heap allocation overhead for every processed AST.
 **Action:** Replace `HashSet<String>` with `HashSet<&str>` across bounded AST passes by bounding the set to the lifetime of the parsed file lines or AST nodes (e.g. `&[Stmt]`) to eliminate these temporary strings.
+
+## 2024-11-28 - Zero-Allocation `classvar` hierarchy lookup
+**Learning:** Traversing the class hierarchy in `classvar` and `resolve` in `class_contracts.rs` used `HashSet<String>` for tracking visited classes and `Vec<String>` for the stack, creating new strings for every class in the inheritance chain. Because this runs frequently to resolve method contracts and check for class variable overrides, these allocations add up unnecessarily.
+**Action:** By borrowing `&str` instead via `HashSet<&str>` and `Vec<&str>` (mapping `shape.bases.iter().map(|s| s.as_str())`), we eliminate all string allocations during class hierarchy traversal in `classvar` and `resolve`.

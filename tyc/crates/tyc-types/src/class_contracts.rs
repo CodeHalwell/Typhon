@@ -190,13 +190,13 @@ pub(super) fn property(c: &Checker, class: &str, field: &str) -> Option<(Type, O
         }
         (scan.getter, scan.setter)
     }
-    fn resolve(
-        c: &Checker,
-        class: &str,
+    fn resolve<'a>(
+        c: &'a Checker,
+        class: &'a str,
         field: &str,
-        seen: &mut HashSet<String>,
+        seen: &mut HashSet<&'a str>,
     ) -> Option<(Type, Option<Type>)> {
-        if !seen.insert(class.into()) {
+        if !seen.insert(class) {
             return None;
         }
         let (getter, setter) = own(c, class, field);
@@ -205,7 +205,7 @@ pub(super) fn property(c: &Checker, class: &str, field: &str) -> Option<(Type, O
         }
         if let Some(shape) = c.class_shapes.get(class) {
             for base in &shape.bases {
-                if let Some((getter, inherited_setter)) = resolve(c, base, field, seen) {
+                if let Some((getter, inherited_setter)) = resolve(c, base.as_str(), field, seen) {
                     return Some((getter, setter.or(inherited_setter)));
                 }
             }
@@ -220,21 +220,21 @@ pub(super) fn class_object(c: &Checker, expr: &Expr) -> bool {
     callables::class_name(c, n.id.as_str()).is_some()
 }
 
-pub(super) fn classvar(c: &Checker, class: &str, field: &str) -> bool {
-    let mut stack = vec![class.to_owned()];
+pub(super) fn classvar<'a>(c: &'a Checker, class: &'a str, field: &str) -> bool {
+    let mut stack = vec![class];
     let mut seen = HashSet::new();
     while let Some(class) = stack.pop() {
-        if !seen.insert(class.clone()) {
+        if !seen.insert(class) {
             continue;
         }
         if c.class_var_attrs
-            .get(&class)
+            .get(class)
             .is_some_and(|fields| fields.contains(field))
         {
             return true;
         }
-        if let Some(shape) = c.class_shapes.get(&class) {
-            stack.extend(shape.bases.iter().cloned());
+        if let Some(shape) = c.class_shapes.get(class) {
+            stack.extend(shape.bases.iter().map(|s| s.as_str()));
         }
     }
     false
