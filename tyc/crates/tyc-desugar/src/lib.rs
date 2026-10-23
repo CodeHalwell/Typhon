@@ -1881,11 +1881,11 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
     // as multi-base parents so the dataclass decorator drops `slots=True`.
     collect_cached_property_targets_into(&m.body, &mut multi_base_parents);
     // Module-level classes and the transitive exception subset among them.
-    let mut module_level_classes: Vec<(String, Vec<String>)> = Vec::new();
+    let mut module_level_classes: Vec<(&str, Vec<&str>)> = Vec::new();
     collect_class_bases_into(&m.body, &mut module_level_classes);
     let module_class_names: std::collections::HashSet<&str> = module_level_classes
         .iter()
-        .map(|(n, _)| n.as_str())
+        .map(|(n, _)| *n)
         .collect();
     let exception_class_names =
         exception_class_names_from(&module_level_classes, &module_class_names);
@@ -3581,7 +3581,7 @@ fn name_is_exception_base(name: &str) -> bool {
 /// `class Failure(Exception): pass` then `class Timeout(Failure): pass` both
 /// qualify, since `Failure` is rooted in the builtin `Exception`.
 fn exception_class_names_from<'a>(
-    classes: &'a [(String, Vec<String>)],
+    classes: &'a [(&'a str, Vec<&'a str>)],
     module_classes: &std::collections::HashSet<&str>,
 ) -> std::collections::HashSet<&'a str> {
     let mut exc: std::collections::HashSet<&'a str> = std::collections::HashSet::new();
@@ -3591,16 +3591,16 @@ fn exception_class_names_from<'a>(
     for (name, bases) in classes {
         if bases
             .iter()
-            .any(|b| !module_classes.contains(b.as_str()) && name_is_exception_base(b))
+            .any(|b| !module_classes.contains(b) && name_is_exception_base(b))
         {
-            exc.insert(name.as_str());
+            exc.insert(*name);
         }
     }
     loop {
         let mut changed = false;
         for (name, bases) in classes {
-            if !exc.contains(name.as_str()) && bases.iter().any(|b| exc.contains(b.as_str())) {
-                exc.insert(name.as_str());
+            if !exc.contains(name) && bases.iter().any(|b| exc.contains(b)) {
+                exc.insert(*name);
                 changed = true;
             }
         }
@@ -3618,23 +3618,23 @@ const METACLASS_BASES: &[&str] = &["type", "ABCMeta", "EnumMeta", "EnumType"];
 /// seeded from an external (non-module) base in [`METACLASS_BASES`], then
 /// closed over module-class inheritance — a subclass of a metaclass is one.
 fn metaclass_names_from<'a>(
-    classes: &'a [(String, Vec<String>)],
+    classes: &'a [(&'a str, Vec<&'a str>)],
     module_classes: &std::collections::HashSet<&str>,
 ) -> std::collections::HashSet<&'a str> {
     let mut meta: std::collections::HashSet<&'a str> = classes
         .iter()
         .filter(|(_, bases)| {
             bases.iter().any(|b| {
-                !module_classes.contains(b.as_str()) && METACLASS_BASES.contains(&b.as_str())
+                !module_classes.contains(b) && METACLASS_BASES.contains(b)
             })
         })
-        .map(|(name, _)| name.as_str())
+        .map(|(name, _)| *name)
         .collect();
     loop {
         let before = meta.len();
         for (name, bases) in classes {
-            if bases.iter().any(|b| meta.contains(b.as_str())) {
-                meta.insert(name.as_str());
+            if bases.iter().any(|b| meta.contains(b)) {
+                meta.insert(*name);
             }
         }
         if meta.len() == before {
@@ -3651,16 +3651,16 @@ fn metaclass_names_from<'a>(
 /// `class Failure:` dataclass of the same name. Nested-scope exception
 /// classes are recognised per-class at decoration time via their *external*
 /// base (see `is_exception_subclass` in `desugar_stmts`).
-fn collect_class_bases_into(body: &[Stmt], out: &mut Vec<(String, Vec<String>)>) {
+fn collect_class_bases_into<'a>(body: &'a [Stmt], out: &mut Vec<(&'a str, Vec<&'a str>)>) {
     for stmt in body {
         match stmt {
             Stmt::ClassDef(c) => {
-                let bases: Vec<String> = c
+                let bases: Vec<&str> = c
                     .bases()
                     .iter()
-                    .filter_map(|b| base_last_segment(b).map(|s| s.to_owned()))
+                    .filter_map(|b| base_last_segment(b))
                     .collect();
-                out.push((c.name.as_str().to_owned(), bases));
+                out.push((c.name.as_str(), bases));
                 // Do NOT descend into the class body — a class nested inside a
                 // class is a different scope.
             }
