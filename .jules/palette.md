@@ -83,3 +83,6 @@
 ## 2026-06-30 - [Equitable tactile feedback for Hero buttons and Link Cards]
 **Learning:** Found that primary CTA `.sl-link-button` components on the hero landing page and `.sl-link-card` elements lacked active transitions (`:active`), failing to provide tactile feedback and physical affordance during clicks.
 **Action:** Added active state transitions (`transform: scale(0.98)`) and updated base transitions on `.sl-link-card` and `.sl-link-button`. Explicitly nullified these transforms in the `@media (prefers-reduced-motion: reduce)` block to ensure accessibility compliance.
+## 2025-02-18 - Light Theme Contrast on Link Cards
+**Learning:** The default Starlight light theme uses a gray text color (`--sl-color-gray-3`, #62736b) on a gray background (`--sl-color-gray-6`, #efefe8) for secondary text like link card descriptions, which fails WCAG AA minimum contrast ratio of 4.5:1 (it's 4.34:1).
+**Action:** Deepened `--sl-color-gray-3` to #5d6d66 in the light theme custom CSS override to push the contrast ratio to 4.73:1, achieving accessibility compliance without altering the overall visual hierarchy.
