@@ -83,3 +83,9 @@
 ## 2026-06-30 - [Equitable tactile feedback for Hero buttons and Link Cards]
 **Learning:** Found that primary CTA `.sl-link-button` components on the hero landing page and `.sl-link-card` elements lacked active transitions (`:active`), failing to provide tactile feedback and physical affordance during clicks.
 **Action:** Added active state transitions (`transform: scale(0.98)`) and updated base transitions on `.sl-link-card` and `.sl-link-button`. Explicitly nullified these transforms in the `@media (prefers-reduced-motion: reduce)` block to ensure accessibility compliance.
+## 2024-05-14 - Tactile interaction added to docs-site buttons and cards
+**Learning:** Adding active state transforms (`scale(0.98)`) to buttons and cards in Astro/Starlight documentation sites improves tactile feedback significantly. However, it's critical to ensure the base `transition` property includes `transform` to prevent abrupt jumps, and to explicitly handle `@media (prefers-reduced-motion: reduce)` to disable the transform.
+**Action:** Always include `transform` in the base `transition` property when adding scale/translate effects on `:active` or `:hover`. Always wrap these transforms in `@media (prefers-reduced-motion: reduce)` checks, or rely on global reduced motion rules if properly configured (but explicitly ensuring `transform: none` in reduced motion overrides is safest).
+## 2026-10-21 - [Improve card description contrast in light theme]
+**Learning:** The light theme's `--sl-color-gray-3` token (`#62736b`) used for card descriptions (like `LinkCard`) fails WCAG AA minimum contrast ratio against the card background (`--sl-color-gray-6`, `#efefe8`), coming in at 4.34:1.
+**Action:** Darkened `--sl-color-gray-3` slightly to `#5e6f67`, which achieves a 4.61:1 contrast ratio, passing accessibility checks while maintaining the intended visual hierarchy.

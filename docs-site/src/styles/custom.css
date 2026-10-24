@@ -8,7 +8,7 @@
 }
 :root[data-theme='light'] {
   --sl-color-accent-low: #dcece3; --sl-color-accent: #176958; --sl-color-accent-high: #164e40;
-  --sl-color-white: #182622; --sl-color-gray-1: #24382f; --sl-color-gray-2: #52635c; --sl-color-gray-3: #62736b;
+  --sl-color-white: #182622; --sl-color-gray-1: #24382f; --sl-color-gray-2: #52635c; --sl-color-gray-3: #5e6f67;
   --sl-color-gray-4: #93a398; --sl-color-gray-5: #dce2d9; --sl-color-gray-6: #efefe8; --sl-color-gray-7: #f6f5f0; --sl-color-black: #f6f5f0;
 }
 .site-title { font-weight: 550; letter-spacing: -.035em; }
