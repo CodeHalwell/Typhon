@@ -66,3 +66,8 @@ starlight-tabs .tab > [role='tab']:hover { color: var(--sl-color-white); }
     transform: none;
   }
 }
+
+/* Override LinkCard description color for accessibility */
+.sl-link-card .description {
+  color: var(--sl-color-gray-2) !important;
+}
