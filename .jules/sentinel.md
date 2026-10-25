@@ -43,3 +43,13 @@
 **Vulnerability:** A hardcoded secrets check (`contains_secret_literal`) failed to detect `APPKEY` and `APP_KEY` as secrets.
 **Learning:** Case-boundary heuristics and substring matching logic may miss fully capitalized squashed acronyms like `APPKEY` and `APP_KEY` if they are not explicitly registered as standalone keywords, leading to potential false negatives for common secret variable names.
 **Prevention:** When updating or adding to the `tyc::contains_secret_literal` diagnostic, explicitly register all common permutations of high-risk security keywords (like `APP_KEY` and `APPKEY`), as boundary heuristics cannot be fully relied upon to catch all variations.
+
+## 2026-10-25 - Keyword array longest-first mismatch in secrets.rs
+**Vulnerability:** Many secret heuristic keyword arrays (`SECRET_KEY_NOUNS`, `SECRET_VALUE_GATED_NOUNS`, `SECRET_NAME_QUALIFIERS`, etc.) in `tyc-analyse/src/secrets.rs` were not correctly ordered by longest-first matching.
+**Learning:** Due to how the boundary matching iterates through the keyword arrays, failing to order elements longest-first creates premature partial matches and missed vulnerabilities (e.g. evaluating `KEY` before `APIKEY` or `API` before `APPLICATION`). This breaks the intended heuristic mapping logic.
+**Prevention:** Always maintain hardcoded secret matching keywords in strictly longest-first (descending length) order across all configuration and heuristic arrays.
+
+## 2026-10-25 - Keyword array longest-first mismatch in secrets.rs
+**Vulnerability:** Many secret heuristic keyword arrays (`SECRET_KEY_NOUNS`, `SECRET_VALUE_GATED_NOUNS`, `SECRET_NAME_QUALIFIERS`, etc.) in `tyc-analyse/src/secrets.rs` were not correctly ordered by longest-first matching.
+**Learning:** Due to how the boundary matching iterates through the keyword arrays, failing to order elements longest-first creates premature partial matches and missed vulnerabilities (e.g. evaluating `KEY` before `APIKEY` or `API` before `APPLICATION`). This breaks the intended heuristic mapping logic.
+**Prevention:** Always maintain hardcoded secret matching keywords in strictly longest-first (descending length) order across all configuration and heuristic arrays.
