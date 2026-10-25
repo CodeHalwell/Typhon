@@ -565,11 +565,11 @@ fn dead_loop_targets(body: &[Stmt]) -> HashSet<TextRange> {
 
 /// `global` / `nonlocal` names declared anywhere in `body` (this scope's
 /// statements only — nested functions pin their own names on entry).
-fn collect_pinned_names(body: &[Stmt], into: &mut HashSet<String>) {
+fn collect_pinned_names<'a>(body: &'a [Stmt], into: &mut HashSet<&'a str>) {
     for stmt in body {
         match stmt {
-            Stmt::Global(g) => into.extend(g.names.iter().map(|n| n.as_str().to_owned())),
-            Stmt::Nonlocal(nl) => into.extend(nl.names.iter().map(|n| n.as_str().to_owned())),
+            Stmt::Global(g) => into.extend(g.names.iter().map(|n| n.as_str())),
+            Stmt::Nonlocal(nl) => into.extend(nl.names.iter().map(|n| n.as_str())),
             Stmt::If(s) => {
                 collect_pinned_names(&s.body, into);
                 for clause in &s.elif_else_clauses {
@@ -676,7 +676,7 @@ fn plain_assignment_kills(stmt: &Stmt) -> Vec<String> {
 fn collect_dead_targets(
     body: &[Stmt],
     live_after: &HashSet<String>,
-    pinned: &HashSet<String>,
+    pinned: &HashSet<&str>,
     out: &mut HashSet<TextRange>,
 ) {
     // Walk the block backwards, carrying the set of names that may still be
@@ -759,7 +759,7 @@ fn collect_dead_targets(
             _ => {}
         }
         for killed in plain_assignment_kills(stmt) {
-            if !pinned.contains(&killed) {
+            if !pinned.contains(killed.as_str()) {
                 live.remove(&killed);
             }
         }

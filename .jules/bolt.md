@@ -61,3 +61,6 @@
 ## 2024-11-28 - Zero-Allocation class and method tracking in local AST passes
 **Learning:** Checking local class boundaries (`placed` and `conflicting`) and method definitions (`defined_methods`) during local AST refactoring paths previously used `HashSet<String>`, cloning `&str` nodes with `.to_owned()` for every identified name. These names are only checked locally against the immediate file context during desugaring and migrating, introducing significant avoidable heap allocation overhead for every processed AST.
 **Action:** Replace `HashSet<String>` with `HashSet<&str>` across bounded AST passes by bounding the set to the lifetime of the parsed file lines or AST nodes (e.g. `&[Stmt]`) to eliminate these temporary strings.
+## 2024-10-25 - Zero-allocation refactoring string slices
+**Learning:** When refactoring Rust AST passes to use zero-allocation references (replacing `HashSet<String>` with `HashSet<&str>`), passing owned items via `.to_owned()` during extend is no longer needed. We must also ensure we use `.as_str()` during lookups (e.g., `pinned.contains(killed.as_str())`) to satisfy the trait bounds of `Borrow<str>`.
+**Action:** Use string slices `&'a str` for temporary AST collections bounded by the AST node's lifetime, avoiding string allocation. Always make sure to map the elements to `.as_str()` and do `.as_str()` on lookup bounds.
