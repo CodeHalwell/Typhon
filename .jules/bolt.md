@@ -61,3 +61,7 @@
 ## 2024-11-28 - Zero-Allocation class and method tracking in local AST passes
 **Learning:** Checking local class boundaries (`placed` and `conflicting`) and method definitions (`defined_methods`) during local AST refactoring paths previously used `HashSet<String>`, cloning `&str` nodes with `.to_owned()` for every identified name. These names are only checked locally against the immediate file context during desugaring and migrating, introducing significant avoidable heap allocation overhead for every processed AST.
 **Action:** Replace `HashSet<String>` with `HashSet<&str>` across bounded AST passes by bounding the set to the lifetime of the parsed file lines or AST nodes (e.g. `&[Stmt]`) to eliminate these temporary strings.
+
+## 2024-11-28 - Zero-Allocation name collections in analysis AST passes
+**Learning:** Functions like `bound_names_in_target`, `target_names`, and `plain_assignment_kills` within AST analysis passes previously used `Vec<String>`, cloning `&str` nodes with `.to_owned()` for every identified name. These names are only checked locally against the immediate file context during analysis, introducing significant avoidable heap allocation overhead for every processed AST.
+**Action:** Replace `Vec<String>` with `Vec<&str>` (e.g. `into: &mut Vec<&'a str>`) across bounded AST passes by bounding the collection to the lifetime of the AST nodes (e.g. `&'a Expr`) to eliminate these temporary strings.
