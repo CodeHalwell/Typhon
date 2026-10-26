@@ -648,14 +648,14 @@ fn collect_names_read_in(stmts: &[Stmt], into: &mut HashSet<String>) {
 /// it (`x = ...`, `x: int = ...`, `a = b = ...`). Anything else — unpacking,
 /// attribute or subscript targets, augmented assignment, loops — kills
 /// nothing.
-fn plain_assignment_kills(stmt: &Stmt) -> Vec<String> {
+fn plain_assignment_kills(stmt: &Stmt) -> Vec<&str> {
     match stmt {
         Stmt::Assign(a) => {
-            let names: Vec<String> = a
+            let names: Vec<&str> = a
                 .targets
                 .iter()
                 .filter_map(|t| match t {
-                    Expr::Name(n) => Some(n.id.as_str().to_owned()),
+                    Expr::Name(n) => Some(n.id.as_str()),
                     _ => None,
                 })
                 .collect();
@@ -666,7 +666,7 @@ fn plain_assignment_kills(stmt: &Stmt) -> Vec<String> {
             }
         }
         Stmt::AnnAssign(a) if a.value.is_some() => match a.target.as_ref() {
-            Expr::Name(n) => vec![n.id.as_str().to_owned()],
+            Expr::Name(n) => vec![n.id.as_str()],
             _ => Vec::new(),
         },
         _ => Vec::new(),
@@ -759,8 +759,8 @@ fn collect_dead_targets(
             _ => {}
         }
         for killed in plain_assignment_kills(stmt) {
-            if !pinned.contains(&killed) {
-                live.remove(&killed);
+            if !pinned.contains(killed) {
+                live.remove(killed);
             }
         }
         collect_names_read(stmt, &mut live);
