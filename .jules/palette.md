@@ -83,3 +83,6 @@
 ## 2026-06-30 - [Equitable tactile feedback for Hero buttons and Link Cards]
 **Learning:** Found that primary CTA `.sl-link-button` components on the hero landing page and `.sl-link-card` elements lacked active transitions (`:active`), failing to provide tactile feedback and physical affordance during clicks.
 **Action:** Added active state transitions (`transform: scale(0.98)`) and updated base transitions on `.sl-link-card` and `.sl-link-button`. Explicitly nullified these transforms in the `@media (prefers-reduced-motion: reduce)` block to ensure accessibility compliance.
+## 2024-10-27 - [Equitable tactile feedback via hover lift]
+**Learning:** While the primary CTA buttons and link cards have a tactile click-down active state (`transform: scale(0.98)`), they lack a visual hover state that indicates they are elevated and interactive *before* the click occurs. This mismatch between hover and active states creates a less fluid interaction model.
+**Action:** Added a subtle `transform: translateY(-2px)` on `:hover` and `:focus-within`/`:focus-visible` for interactive elements (`.sl-link-card` and `.hero .sl-link-button`) to provide physical affordance, ensuring it is disabled for reduced motion preferences. Explicitly avoided adding this to `.card`, which is a static display element, to avoid creating false affordances.
