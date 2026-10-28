@@ -2440,23 +2440,23 @@ pub fn type_from_annotation_with_params(
 /// Walk `ty` and collect every `(name, position)` pair where a typevar
 /// appears.  The resulting structure feeds [`bind_typevars`] which walks
 /// the same positions of an actual argument type to read off bindings.
-fn collect_typevar_positions(ty: &Type) -> Vec<String> {
+fn collect_typevar_positions(ty: &Type) -> Vec<&str> {
     let mut out = Vec::new();
     walk_typevars(ty, &mut out);
     out
 }
 
-fn walk_typevars(ty: &Type, out: &mut Vec<String>) {
+fn walk_typevars<'a>(ty: &'a Type, out: &mut Vec<&'a str>) {
     match ty {
         Type::TypeVar(name) => {
-            if !out.contains(name) {
-                out.push(name.clone());
+            if !out.contains(&name.as_str()) {
+                out.push(name.as_str());
             }
         }
         // Higher-kinded type constructors also need binding, just like TypeVars
         Type::TypeConstructor(name, _) => {
-            if !out.contains(name) {
-                out.push(name.clone());
+            if !out.contains(&name.as_str()) {
+                out.push(name.as_str());
             }
         }
         Type::Union(xs) | Type::Generic(_, xs) => {
@@ -2848,7 +2848,7 @@ pub fn compute_bidirectional_bindings(
     if let Some(expected) = expected_return {
         let mut return_tvs = Vec::new();
         walk_typevars(return_type, &mut return_tvs);
-        let any_unbound = return_tvs.iter().any(|n| !bindings.contains_key(n));
+        let any_unbound = return_tvs.iter().any(|n| !bindings.contains_key(*n));
         if any_unbound {
             let mut backward: std::collections::HashMap<String, Type> =
                 std::collections::HashMap::new();
@@ -2925,7 +2925,7 @@ pub fn compute_bidirectional_bindings_hkt(
     if let Some(expected) = expected_return {
         let mut return_tvs = Vec::new();
         walk_typevars(return_type, &mut return_tvs);
-        let any_unbound = return_tvs.iter().any(|n| !bindings.contains_key(n));
+        let any_unbound = return_tvs.iter().any(|n| !bindings.contains_key(*n));
         if any_unbound {
             let mut backward: std::collections::HashMap<String, Type> =
                 std::collections::HashMap::new();
@@ -2973,7 +2973,7 @@ fn type_mentions_ctor_head(ty: &Type, ctor_vars: &std::collections::HashSet<Stri
 /// internal walker directly.
 #[doc(hidden)]
 pub fn typevars_in(ty: &Type) -> Vec<String> {
-    collect_typevar_positions(ty)
+    collect_typevar_positions(ty).into_iter().map(|s| s.to_owned()).collect()
 }
 
 /// Collect the names of PEP 695 type parameters into a flat list.
