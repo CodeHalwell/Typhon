@@ -61,3 +61,7 @@
 ## 2024-11-28 - Zero-Allocation class and method tracking in local AST passes
 **Learning:** Checking local class boundaries (`placed` and `conflicting`) and method definitions (`defined_methods`) during local AST refactoring paths previously used `HashSet<String>`, cloning `&str` nodes with `.to_owned()` for every identified name. These names are only checked locally against the immediate file context during desugaring and migrating, introducing significant avoidable heap allocation overhead for every processed AST.
 **Action:** Replace `HashSet<String>` with `HashSet<&str>` across bounded AST passes by bounding the set to the lifetime of the parsed file lines or AST nodes (e.g. `&[Stmt]`) to eliminate these temporary strings.
+
+## 2024-12-07 - Avoid String allocation in TypeVar tree walking
+**Learning:** `collect_typevar_positions` and `walk_typevars` recursively searched Type trees, creating owned `String` instances and returning `Vec<String>`. In deep type constraints, this cloned many string variables.
+**Action:** Always borrow AST and Type string variables using `Vec<&str>` where possible instead of cloning string properties into vectors, minimizing heap allocations across recursive walks. Only map `.to_owned()` at the outermost boundary if the caller actually needs owned strings.
