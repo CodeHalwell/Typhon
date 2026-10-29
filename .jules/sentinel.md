@@ -43,3 +43,8 @@
 **Vulnerability:** A hardcoded secrets check (`contains_secret_literal`) failed to detect `APPKEY` and `APP_KEY` as secrets.
 **Learning:** Case-boundary heuristics and substring matching logic may miss fully capitalized squashed acronyms like `APPKEY` and `APP_KEY` if they are not explicitly registered as standalone keywords, leading to potential false negatives for common secret variable names.
 **Prevention:** When updating or adding to the `tyc::contains_secret_literal` diagnostic, explicitly register all common permutations of high-risk security keywords (like `APP_KEY` and `APPKEY`), as boundary heuristics cannot be fully relied upon to catch all variations.
+
+## 2025-02-14 - Explicitly register common key permutations to prevent false negatives
+**Vulnerability:** The hardcoded secrets heuristic in `tyc::contains_secret_literal` failed to detect squashed common key acronyms (`ACCESSKEY`, `SECRETKEY`, `PRIVATEKEY`) when embedded in strings without clear word boundaries (e.g. `MYACCESSKEY`).
+**Learning:** Because `KEY` is registered in `SECRET_KEY_NOUNS` (to avoid false positives like `MONKEY`), the suffix-fallback scanning logic does not attempt to match it. Only `SECRET_NAME_KEYWORDS` are checked by the fallback suffix scanner, meaning squashed acronyms combining a qualifier and a key noun completely evade detection if they lack a leading word boundary.
+**Prevention:** Explicitly added `PRIVATEKEY`, `SECRETKEY`, and `ACCESSKEY` to the `SECRET_NAME_KEYWORDS` array, ensuring strict longest-first matching order to correctly intercept these as standalone vocabulary words during suffix scanning.
