@@ -61,3 +61,6 @@
 ## 2024-11-28 - Zero-Allocation class and method tracking in local AST passes
 **Learning:** Checking local class boundaries (`placed` and `conflicting`) and method definitions (`defined_methods`) during local AST refactoring paths previously used `HashSet<String>`, cloning `&str` nodes with `.to_owned()` for every identified name. These names are only checked locally against the immediate file context during desugaring and migrating, introducing significant avoidable heap allocation overhead for every processed AST.
 **Action:** Replace `HashSet<String>` with `HashSet<&str>` across bounded AST passes by bounding the set to the lifetime of the parsed file lines or AST nodes (e.g. `&[Stmt]`) to eliminate these temporary strings.
+## 2024-11-28 - Replace O(N^2) Vec collection with O(N) HashSet in module collection
+**Learning:** Using `!modules.contains(&dotted)` before `modules.push(dotted)` on a `Vec<String>` inside loops (like `collect_project_modules`) scales poorly (O(N^2)) when aggregating large numbers of module paths.
+**Action:** Replace `Vec<String>` with `std::collections::HashSet` for intermediate uniqueness tracking during aggregation, then use `.into_iter().collect()` to produce the final `Vec<String>`.

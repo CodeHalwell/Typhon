@@ -1269,11 +1269,12 @@ fn collect_project_shapes(
 
 fn collect_project_modules(scope: &CheckScope, src_root: &str) -> Vec<String> {
     let mut modules: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for root in &scope.roots {
         if let Ok(files) = scope.ty_files(root) {
             for file in files {
                 let dotted = ty_path_to_dotted(&file, src_root);
-                if !modules.contains(&dotted) {
+                if seen.insert(dotted.clone()) {
                     modules.push(dotted);
                 }
             }
@@ -1284,7 +1285,7 @@ fn collect_project_modules(scope: &CheckScope, src_root: &str) -> Vec<String> {
         if let Ok(files) = scope.dty_files(root) {
             for file in files {
                 let dotted = ty_path_to_dotted(&file, src_root);
-                if !modules.contains(&dotted) {
+                if seen.insert(dotted.clone()) {
                     modules.push(dotted);
                 }
             }
