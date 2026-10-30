@@ -66,3 +66,10 @@ starlight-tabs .tab > [role='tab']:hover { color: var(--sl-color-white); }
     transform: none;
   }
 }
+
+/* Ensure keyboard accessibility for scrollable regions */
+[tabindex="0"]:focus-visible,
+.expressive-code pre:focus-visible {
+  outline: 2px solid var(--sl-color-accent);
+  outline-offset: -2px;
+}
