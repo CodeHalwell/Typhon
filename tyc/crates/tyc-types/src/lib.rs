@@ -915,13 +915,16 @@ fn close_sync_spawners(c: &mut Checker, body: &[Stmt]) {
             // nested `def` — shadows the module-level spawner of the same
             // name (review 2026-10-03 §4.6).
             let locals = function_local_names(f);
-            let known: std::collections::HashSet<String> = c
-                .sync_spawners
-                .keys()
-                .filter(|k| !locals.contains(k.as_str()))
-                .cloned()
-                .collect();
-            if let Some(callee) = body_calls_one_of(&f.body, &known) {
+            let callee = {
+                let known: std::collections::HashSet<&str> = c
+                    .sync_spawners
+                    .keys()
+                    .filter(|k| !locals.contains(k.as_str()))
+                    .map(|k| k.as_str())
+                    .collect();
+                body_calls_one_of(&f.body, &known)
+            };
+            if let Some(callee) = callee {
                 let spawned = c.sync_spawners.get(&callee).cloned().unwrap_or_default();
                 c.sync_spawners.insert(
                     f.name.as_str().to_owned(),
@@ -1006,9 +1009,9 @@ fn function_local_names(f: &ruff_python_ast::StmtFunctionDef) -> std::collection
 
 /// The first bare-name callee in `body` (nested `def` / `class` bodies
 /// excluded) that appears in `names`.
-fn body_calls_one_of(body: &[Stmt], names: &std::collections::HashSet<String>) -> Option<String> {
+fn body_calls_one_of(body: &[Stmt], names: &std::collections::HashSet<&str>) -> Option<String> {
     struct V<'n> {
-        names: &'n std::collections::HashSet<String>,
+        names: &'n std::collections::HashSet<&'n str>,
         found: Option<String>,
     }
     impl ruff_python_ast::visitor::Visitor<'_> for V<'_> {
@@ -1024,7 +1027,7 @@ fn body_calls_one_of(body: &[Stmt], names: &std::collections::HashSet<String>) -
             }
             if let Expr::Call(call) = e {
                 if let Expr::Name(n) = call.func.as_ref() {
-                    if self.names.contains(n.id.as_str()) {
+                    if self.names.contains(&n.id.as_str()) {
                         self.found = Some(n.id.as_str().to_owned());
                         return;
                     }
