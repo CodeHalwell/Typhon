@@ -2008,6 +2008,7 @@ fn inject_memoise_decorators(
     // Names this module binds for itself — a user or third-party `pure` /
     // `memo` / `gatherable` is not Typhon's marker and must survive.
     let shadowed = user_bound_marker_names(&body);
+    let shadowed: std::collections::HashSet<String> = shadowed.into_iter().map(|s| s.to_owned()).collect();
     let new_body: Vec<Stmt> = body
         .into_iter()
         .map(|stmt| match stmt {
