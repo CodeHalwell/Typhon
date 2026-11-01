@@ -5300,7 +5300,7 @@ fn analyse_stmts(
 ///     a hard error.
 fn decorator_intent(
     decorators: &[Decorator],
-    shadowed: &std::collections::HashSet<String>,
+    shadowed: &std::collections::HashSet<&str>,
 ) -> (bool, bool) {
     let mut declared = false;
     let mut memoise = false;
@@ -5310,7 +5310,7 @@ fn decorator_intent(
         // `@functools.cache` get injected on top of an unrelated third-party
         // decorator.
         if let Some(name) = decorator_head_name(&d.expression) {
-            if shadowed.contains(&name) {
+            if shadowed.contains(name.as_str()) {
                 continue;
             }
         }
