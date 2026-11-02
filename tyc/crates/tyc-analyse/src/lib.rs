@@ -359,6 +359,9 @@ fn newer_typed_dict_keywords(
         /// Which of `scopes` are class bodies. A class body's names are seen
         /// by the class body itself, never by the functions nested in it.
         class_scope: Vec<bool>,
+        /// Which of `scopes` are comprehensions, which a walrus target
+        /// skips: `[(x := v) for _ in xs]` binds `x` outside.
+        comprehension_scope: Vec<bool>,
         /// The scopes enclosing the current node, innermost last.
         stack: Vec<usize>,
         /// `(callee/base, keyword, range, enclosing scopes)` candidates.
@@ -403,6 +406,7 @@ fn newer_typed_dict_keywords(
         fn open_scope(&mut self, class: bool) {
             self.scopes.push(HashMap::new());
             self.class_scope.push(class);
+            self.comprehension_scope.push(false);
             self.stack.push(self.scopes.len() - 1);
         }
         /// The scopes a bare name read here resolves through: every
@@ -426,6 +430,9 @@ fn newer_typed_dict_keywords(
                 self.visit_expr(&first.iter);
             }
             self.open_scope(false);
+            if let Some(last) = self.comprehension_scope.last_mut() {
+                *last = true;
+            }
             for (i, g) in generators.iter().enumerate() {
                 if i > 0 {
                     self.visit_expr(&g.iter);
@@ -628,6 +635,20 @@ fn newer_typed_dict_keywords(
                     self.visit_comprehension(generators, &[elt]);
                     return;
                 }
+                Expr::Named(n) => {
+                    self.visit_expr(&n.value);
+                    if let Expr::Name(target) = n.target.as_ref() {
+                        let scope = self
+                            .stack
+                            .iter()
+                            .rev()
+                            .copied()
+                            .find(|&i| !self.comprehension_scope[i])
+                            .unwrap_or(0);
+                        self.scopes[scope].insert(target.id.to_string(), Bound::Other);
+                    }
+                    return;
+                }
                 Expr::DictComp(d) => {
                     let results: Vec<&Expr> = d
                         .key
@@ -658,6 +679,7 @@ fn newer_typed_dict_keywords(
     let mut v = V {
         scopes: vec![HashMap::new()],
         class_scope: vec![false],
+        comprehension_scope: vec![false],
         stack: vec![0],
         ..V::default()
     };
@@ -8833,6 +8855,7 @@ mod lint_tests {
             // A feature probe.
             "import sys\nfrom typing import TypedDict\nif sys.version_info >= (3, 15):\n    class M(TypedDict, closed=True):\n        name: str\n",
             // A parameter shadows the import.
+            "from typing import TypedDict\nfrom typing_extensions import TypedDict as Backport\nlet items = [(TypedDict := Backport) for _ in [1]]\nclass M(TypedDict, closed=True):\n    name: str\n",
             "from typing import TypedDict\nfrom typing_extensions import TypedDict as Backport\nmatch {\"factory\": Backport}:\n    case {\"factory\": TypedDict}:\n        print(TypedDict(\"M\", {}, closed=True))\n    case _:\n        pass\n",
             "from typing import TypedDict, Any\ndef build(TypedDict: Any) -> Any:\n    return TypedDict(\"M\", {}, closed=True)\n",
             "from typing import TypedDict\nlet build = lambda TypedDict: TypedDict(\"M\", {}, closed=True)\n",
