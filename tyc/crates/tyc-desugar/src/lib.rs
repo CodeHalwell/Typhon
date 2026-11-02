@@ -1524,7 +1524,9 @@ fn dunder_all_order(a: &str, b: &str) -> std::cmp::Ordering {
     fn group(name: &str) -> u8 {
         let has_cased = name.chars().any(|c| c.is_uppercase() || c.is_lowercase());
         let no_lower = !name.chars().any(char::is_lowercase);
-        if name.chars().count() > 1 && has_cased && no_lower {
+        // Byte length, like ruff: a lone non-ASCII capital (`É`) counts
+        // as a constant.
+        if name.len() > 1 && has_cased && no_lower {
             0
         } else if name.chars().next().is_some_and(char::is_uppercase) {
             1
@@ -5334,6 +5336,15 @@ fn insert_self_param(stmt: &Stmt) -> Stmt {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dunder_all_groups_a_lone_non_ascii_capital_as_a_constant() {
+        // Ruff measures the constant-group length in bytes, so `É` sorts
+        // with the constants, before `A`.
+        let mut names = vec!["a", "A", "É"];
+        names.sort_by(|a, b| super::dunder_all_order(a, b));
+        assert_eq!(names, vec!["É", "A", "a"]);
+    }
+
     #[test]
     fn dunder_all_orders_leading_zero_runs_like_ruff() {
         // Checked against `ruff check --select RUF022`: a digit run with a
