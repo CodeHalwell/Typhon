@@ -332,9 +332,20 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // emits an `__init__.py` and is run as a module (`python -m pkg.main`),
     // so its modules keep their relative imports; a flat root does not.
     let src_root_is_package = src_dir.join("__init__.ty").exists();
-    let mut ty_files = collect_ty_files(&src_dir)?;
-    if let Some(file) = &single_file {
-        ty_files.retain(|p| p.canonicalize().is_ok_and(|c| &c == file));
+    // A single-file build still reads (and checks) the whole unit, because
+    // the selected file's emission depends on its siblings — a `pub *`
+    // facade re-exports them, imports resolve against them. Only emission
+    // is restricted to the selected file (`is_selected` below).
+    let ty_files = collect_ty_files(&src_dir)?;
+    let is_selected = |p: &Path| match &single_file {
+        Some(file) => p.canonicalize().is_ok_and(|c| &c == file),
+        None => true,
+    };
+    if single_file.is_some() && !ty_files.iter().any(|p| is_selected(p)) {
+        return Err(miette!(
+            "'{}' is not a source file of this build",
+            args.path.display()
+        ));
     }
 
     if ty_files.is_empty() {
@@ -500,7 +511,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         let mut project_files: Vec<PathBuf> =
             crate::commands::util::collect_dty_files(&project_src_dir).unwrap_or_default();
         project_files.extend(collect_ty_files(&project_src_dir).unwrap_or_default());
-        for file in project_files {
+        for file in project_files.clone() {
             let dotted = crate::commands::util::path_to_dotted(&file, &project_src_root);
             if project_shapes.contains_key(&dotted) {
                 continue;
@@ -512,6 +523,13 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 project_facts.insert(dotted, facts);
             }
         }
+        // `pub *` facades of the project (`from pkg import add` through
+        // `pkg/__init__.ty`) aggregate under the project's own root name.
+        crate::commands::util::aggregate_pub_star_shapes(
+            &mut project_shapes,
+            &project_files,
+            &project_src_root,
+        );
     }
     // Aggregate `pub *` package facades into their __init__ shape so a
     // downstream `from <pkg> import X` resolves through the facade.
@@ -672,6 +690,9 @@ pub fn run(args: BuildArgs) -> Result<()> {
     let mut pub_star_collision_count: usize = 0;
 
     for (path, source) in &sources {
+        if !is_selected(path) {
+            continue;
+        }
         // Expand Typhon syntactic sugar in order:
         //   1. `gather:` blocks lower to `asyncio.TaskGroup` / `asyncio.gather`,
         //   2. `go f(x)` lowers to `typhon_runtime.tasks.spawn(...)`,
@@ -6711,6 +6732,11 @@ let pet: Animal = Dog(name=\"Rex\")
         )
         .unwrap();
         assert!(run(build_args(&tests)).is_err());
+        std::fs::write(
+            tests.join("test_calc.ty"),
+            "from calc import add\n\ndef test_add() -> None:\n    assert add(1, 2) == 3\n",
+        )
+        .unwrap();
         // A single file builds on its own.
         std::fs::write(
             tests.join("test_other.ty"),
@@ -6764,6 +6790,37 @@ let pet: Animal = Dog(name=\"Rex\")
         std::fs::remove_file(src.join("other.ty")).unwrap();
         run(build_args(tmp.path())).unwrap();
         assert!(!out.join("other.py").exists());
+    }
+
+    /// Separate units see the project's `pub *` facades, and a single-file
+    /// build of a facade keeps its re-exports (siblings are still read).
+    #[test]
+    fn facades_survive_partial_builds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, out) = scaffold(tmp.path(), "let x: int = 1\n");
+        let pkg = src.join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("__init__.ty"), "pub *\n").unwrap();
+        std::fs::write(
+            pkg.join("calc.ty"),
+            "pub def add(a: int, b: int) -> int:\n    return a + b\n",
+        )
+        .unwrap();
+        run(build_args(tmp.path())).unwrap();
+        run(build_args(&pkg.join("__init__.ty"))).unwrap();
+        let init = std::fs::read_to_string(out.join("pkg").join("__init__.py")).unwrap();
+        assert!(init.contains("add"), "re-export lost:\n{init}");
+        let tests = tmp.path().join("tests");
+        std::fs::create_dir_all(&tests).unwrap();
+        std::fs::write(
+            tests.join("test_pkg.ty"),
+            "from pkg import add\n\ndef test_add() -> None:\n    assert add(1) == 3\n",
+        )
+        .unwrap();
+        assert!(
+            run(build_args(&tests)).is_err(),
+            "a wrong call through the facade must fail"
+        );
     }
 
     /// A stale manifest entry under a symlinked directory must not delete
