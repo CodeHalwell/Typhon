@@ -337,7 +337,9 @@ fn newer_typed_dict_keywords(
     module: &ModModule,
     target: (u8, u8),
 ) -> Vec<(&'static str, (u8, u8), TextRange)> {
-    use ruff_python_ast::visitor::source_order::{walk_expr, walk_stmt, SourceOrderVisitor};
+    use ruff_python_ast::visitor::source_order::{
+        walk_expr, walk_pattern, walk_stmt, SourceOrderVisitor,
+    };
     /// What a name is bound to in one scope.
     #[derive(Clone, Copy, PartialEq)]
     enum Bound {
@@ -581,6 +583,29 @@ fn newer_typed_dict_keywords(
                 _ => {}
             }
             walk_stmt(self, stmt);
+        }
+        fn visit_pattern(&mut self, pattern: &'ast ruff_python_ast::Pattern) {
+            // `case {"factory": TypedDict}:` binds a name like an assignment.
+            use ruff_python_ast::Pattern;
+            match pattern {
+                Pattern::MatchAs(p) => {
+                    if let Some(name) = &p.name {
+                        self.bind(name.to_string());
+                    }
+                }
+                Pattern::MatchStar(p) => {
+                    if let Some(name) = &p.name {
+                        self.bind(name.to_string());
+                    }
+                }
+                Pattern::MatchMapping(p) => {
+                    if let Some(name) = &p.rest {
+                        self.bind(name.to_string());
+                    }
+                }
+                _ => {}
+            }
+            walk_pattern(self, pattern);
         }
         fn visit_expr(&mut self, expr: &'ast Expr) {
             match expr {
@@ -8808,6 +8833,7 @@ mod lint_tests {
             // A feature probe.
             "import sys\nfrom typing import TypedDict\nif sys.version_info >= (3, 15):\n    class M(TypedDict, closed=True):\n        name: str\n",
             // A parameter shadows the import.
+            "from typing import TypedDict\nfrom typing_extensions import TypedDict as Backport\nmatch {\"factory\": Backport}:\n    case {\"factory\": TypedDict}:\n        print(TypedDict(\"M\", {}, closed=True))\n    case _:\n        pass\n",
             "from typing import TypedDict, Any\ndef build(TypedDict: Any) -> Any:\n    return TypedDict(\"M\", {}, closed=True)\n",
             "from typing import TypedDict\nlet build = lambda TypedDict: TypedDict(\"M\", {}, closed=True)\n",
         ] {
