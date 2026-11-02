@@ -235,7 +235,11 @@ pub fn target_version_diagnostics(path: &str, source: &str, major: u8, minor: u8
     let may_use_newer_stdlib = NEWER_STDLIB
         .iter()
         .any(|(_, name, added)| (major, minor) < *added && source.contains(name));
-    if !may_use_newer_builtin && !may_use_newer_stdlib {
+    let may_use_newer_typed_dict = NEWER_TYPED_DICT_KEYWORDS
+        .iter()
+        .any(|(kw, added)| (major, minor) < *added && source.contains(kw))
+        && source.contains("TypedDict");
+    if !may_use_newer_builtin && !may_use_newer_stdlib && !may_use_newer_typed_dict {
         return diags;
     }
     if let Ok(parsed) = tyc_syntax::parse_module(source) {
@@ -244,6 +248,19 @@ pub fn target_version_diagnostics(path: &str, source: &str, major: u8, minor: u8
             diags.push_error(TycError::requires_newer_python(
                 format!(
                     "`{name}` is a builtin added in Python 3.{} and the project targets {major}.{minor}",
+                    added.1
+                ),
+                path.to_owned(),
+                source.to_owned(),
+                usize::from(range.start()),
+                usize::from(range.len()),
+            ));
+        }
+        for (keyword, added, range) in newer_typed_dict_keywords(&module, (major, minor)) {
+            diags.push_error(TycError::requires_newer_python(
+                format!(
+                    "`TypedDict(..., {keyword}=...)` needs Python 3.{} (PEP 728) and the project targets {major}.{minor}; \
+                     import `TypedDict` from `typing_extensions` to use it on {major}.{minor}",
                     added.1
                 ),
                 path.to_owned(),
@@ -304,6 +321,173 @@ pub fn target_version_check_may_fire(source: &str, major: u8, minor: u8) -> bool
         || NEWER_STDLIB
             .iter()
             .any(|(_, name, added)| (major, minor) < *added && source.contains(name))
+        || (source.contains("TypedDict")
+            && NEWER_TYPED_DICT_KEYWORDS
+                .iter()
+                .any(|(kw, added)| (major, minor) < *added && source.contains(kw)))
+}
+
+/// Every [`NEWER_TYPED_DICT_KEYWORDS`] keyword `target` does not have,
+/// passed to `typing.TypedDict`: as a class keyword (`class M(TypedDict,
+/// closed=True)`) or to the functional form (`TypedDict("M", {...},
+/// closed=True)`). `TypedDict` counts when it is bound only by `from typing
+/// import TypedDict [as X]`, or reached as `typing.TypedDict` /
+/// `t.TypedDict` through `import typing [as t]`.
+fn newer_typed_dict_keywords(
+    module: &ModModule,
+    target: (u8, u8),
+) -> Vec<(&'static str, (u8, u8), TextRange)> {
+    use ruff_python_ast::visitor::source_order::{walk_expr, walk_stmt, SourceOrderVisitor};
+    #[derive(Default)]
+    struct V {
+        /// Local names bound to `typing.TypedDict`.
+        typed_dict: HashSet<String>,
+        /// Local names bound to the `typing` module.
+        typing: HashSet<String>,
+        /// Every other binding of a name, which may shadow either.
+        rebound: HashSet<String>,
+        /// `(callee/base, keyword, range)` candidates.
+        uses: Vec<(Expr, String, TextRange)>,
+        /// Inside a feature probe (see [`newer_stdlib_uses`]).
+        guarded: u32,
+    }
+    fn reads_version(expr: &Expr) -> bool {
+        #[derive(Default)]
+        struct T(bool);
+        impl<'a> SourceOrderVisitor<'a> for T {
+            fn visit_expr(&mut self, expr: &'a Expr) {
+                match expr {
+                    Expr::Attribute(a) if a.attr.as_str() == "version_info" => self.0 = true,
+                    Expr::Name(n)
+                        if matches!(n.id.as_str(), "version_info" | "hasattr" | "getattr") =>
+                    {
+                        self.0 = true
+                    }
+                    _ => {}
+                }
+                walk_expr(self, expr);
+            }
+        }
+        let mut t = T::default();
+        t.visit_expr(expr);
+        t.0
+    }
+    impl V {
+        fn candidates(&mut self, head: &Expr, keywords: &[ruff_python_ast::Keyword]) {
+            if self.guarded > 0 {
+                return;
+            }
+            for kw in keywords {
+                if let Some(arg) = &kw.arg {
+                    self.uses
+                        .push((head.clone(), arg.as_str().to_owned(), kw.range));
+                }
+            }
+        }
+    }
+    impl<'ast> SourceOrderVisitor<'ast> for V {
+        fn visit_stmt(&mut self, stmt: &'ast Stmt) {
+            let guard = match stmt {
+                Stmt::Try(t) => !t.handlers.is_empty(),
+                Stmt::If(i) => {
+                    reads_version(&i.test)
+                        || i.elif_else_clauses
+                            .iter()
+                            .any(|c| c.test.as_ref().is_some_and(reads_version))
+                }
+                _ => false,
+            };
+            if guard {
+                self.guarded += 1;
+                walk_stmt(self, stmt);
+                self.guarded -= 1;
+                return;
+            }
+            match stmt {
+                Stmt::Import(i) => {
+                    for alias in &i.names {
+                        let bound =
+                            alias
+                                .asname
+                                .as_ref()
+                                .map(|a| a.to_string())
+                                .unwrap_or_else(|| {
+                                    alias.name.split('.').next().unwrap_or_default().to_owned()
+                                });
+                        if alias.name.as_str() == "typing" {
+                            self.typing.insert(bound);
+                        } else {
+                            self.rebound.insert(bound);
+                        }
+                    }
+                }
+                Stmt::ImportFrom(i) => {
+                    let from_typing =
+                        i.level == 0 && i.module.as_ref().is_some_and(|m| m.as_str() == "typing");
+                    for alias in &i.names {
+                        let bound = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
+                        if from_typing && alias.name.as_str() == "TypedDict" {
+                            self.typed_dict.insert(bound);
+                        } else {
+                            self.rebound.insert(bound);
+                        }
+                    }
+                }
+                Stmt::ClassDef(c) => {
+                    self.rebound.insert(c.name.to_string());
+                    if let Some(args) = c.arguments.as_deref() {
+                        for base in args.args.iter() {
+                            self.candidates(base, &args.keywords);
+                        }
+                    }
+                }
+                Stmt::FunctionDef(f) => {
+                    self.rebound.insert(f.name.to_string());
+                }
+                _ => {}
+            }
+            walk_stmt(self, stmt);
+        }
+        fn visit_expr(&mut self, expr: &'ast Expr) {
+            match expr {
+                Expr::Call(call) => {
+                    let head = call.func.as_ref().clone();
+                    self.candidates(&head, &call.arguments.keywords);
+                }
+                Expr::Name(n) if n.ctx != ruff_python_ast::ExprContext::Load => {
+                    self.rebound.insert(n.id.to_string());
+                }
+                _ => {}
+            }
+            walk_expr(self, expr);
+        }
+    }
+    let mut v = V::default();
+    v.visit_body(&module.body);
+    let is_typed_dict = |head: &Expr| match head {
+        Expr::Name(n) => v.typed_dict.contains(n.id.as_str()) && !v.rebound.contains(n.id.as_str()),
+        Expr::Attribute(a) => {
+            a.attr.as_str() == "TypedDict"
+                && matches!(a.value.as_ref(), Expr::Name(m)
+                    if v.typing.contains(m.id.as_str()) && !v.rebound.contains(m.id.as_str()))
+        }
+        _ => false,
+    };
+    let mut out = Vec::new();
+    for (head, keyword, range) in &v.uses {
+        let Some((kw, added)) = NEWER_TYPED_DICT_KEYWORDS
+            .iter()
+            .find(|(kw, added)| *kw == keyword && target < *added)
+        else {
+            continue;
+        };
+        if is_typed_dict(head) {
+            out.push((*kw, *added, *range));
+        }
+    }
+    out.sort_by_key(|(_, _, r)| r.start());
+    out.dedup_by_key(|(_, _, r)| r.start());
+    out
 }
 
 /// Builtins newer than the 3.13 floor, with the version that added them.
@@ -322,7 +506,17 @@ const NEWER_STDLIB: &[(&str, &str, (u8, u8))] = &[
     ("re", "prefixmatch", (3, 15)),
     // PEP 791
     ("math", "integer", (3, 15)),
+    // PEP 747
+    ("typing", "TypeForm", (3, 15)),
+    // PEP 800
+    ("typing", "disjoint_base", (3, 15)),
 ];
+
+/// `TypedDict` class keywords newer than the 3.13 floor (PEP 728). On an
+/// older `typing.TypedDict` they are a `TypeError` when the class is
+/// created; `typing_extensions.TypedDict` accepts them everywhere.
+const NEWER_TYPED_DICT_KEYWORDS: &[(&str, (u8, u8))] =
+    &[("closed", (3, 15)), ("extra_items", (3, 15))];
 
 /// Every use of a [`NEWER_STDLIB`] attribute `target` does not have:
 /// `module.name` where `module` is bound only by `import module` (or
@@ -8390,6 +8584,43 @@ mod lint_tests {
             assert!(
                 target_errors(src, (3, 13)).is_empty(),
                 "false positive on 3.13 for {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pep_728_typed_dict_keywords_and_3_15_typing_names_are_gated() {
+        for src in [
+            "from typing import TypedDict\nclass M(TypedDict, closed=True):\n    name: str\n",
+            "from typing import TypedDict as TD\nclass M(TD, extra_items=int):\n    name: str\n",
+            "import typing\nclass M(typing.TypedDict, closed=True):\n    name: str\n",
+            "from typing import TypedDict\nM = TypedDict(\"M\", {\"name\": str}, closed=True)\n",
+            "from typing import TypeForm\nlet t: TypeForm[int] = int\n",
+            "import typing\nprint(typing.disjoint_base)\n",
+        ] {
+            let on_313 = target_errors(src, (3, 13));
+            assert!(
+                on_313.iter().any(|c| c.contains("requires_newer_python")),
+                "expected requires_newer_python on 3.13 for {src:?}; got {on_313:?}"
+            );
+            assert!(
+                target_errors(src, (3, 15)).is_empty(),
+                "3.15 has it: {src:?}"
+            );
+        }
+        for src in [
+            // typing_extensions backports PEP 728 to every target.
+            "from typing_extensions import TypedDict\nclass M(TypedDict, closed=True):\n    name: str\n",
+            // Not a TypedDict keyword.
+            "from typing import TypedDict\nclass M(TypedDict, total=False):\n    name: str\n",
+            "class Base:\n    pass\nclass M(Base, closed=True):\n    pass\n",
+            // A feature probe.
+            "import sys\nfrom typing import TypedDict\nif sys.version_info >= (3, 15):\n    class M(TypedDict, closed=True):\n        name: str\n",
+        ] {
+            assert!(
+                target_errors(src, (3, 13)).is_empty(),
+                "false positive on 3.13 for {src:?}: {:?}",
+                target_errors(src, (3, 13))
             );
         }
     }

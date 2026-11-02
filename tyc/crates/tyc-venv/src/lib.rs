@@ -91,7 +91,7 @@ struct IntrospectedParam {
 
 /// One public symbol of an introspected module — what `dir(module)`
 /// surfaces, restricted to public names.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct IntrospectedMember {
     name: String,
     /// One of `"class"`, `"function"`, `"module"`, `"value"`.
@@ -112,13 +112,45 @@ struct IntrospectedMember {
     /// constructor (`params`) only covers `Cls(...)`.
     #[serde(default)]
     methods: Option<Vec<IntrospectedMethod>>,
+    /// Qualified name (`pkg.mod.Class`) of the class a `"function"` member's
+    /// return annotation names, when introspection followed it; described
+    /// in [`IntrospectedModule::classes`].
+    #[serde(default)]
+    returns_class: Option<String>,
+    /// PEP 702 `__deprecated__` message of a function or class.
+    #[serde(default)]
+    deprecated: Option<String>,
+    /// For a class: whether some class in its MRO defines `__call__`.
+    #[serde(default)]
+    callable: Option<bool>,
+    /// For a class: whether it is an ABC with abstract members, or a Protocol.
+    #[serde(default)]
+    r#abstract: Option<bool>,
+}
+
+/// A class reached by following return annotations (keyed by its qualified
+/// name in [`IntrospectedModule::classes`]).
+#[derive(Debug, Clone, Deserialize)]
+struct IntrospectedClass {
+    #[serde(default)]
+    methods: Option<Vec<IntrospectedMethod>>,
+    #[serde(default)]
+    deprecated: Option<String>,
+    #[serde(default = "default_true")]
+    callable: bool,
+    #[serde(default = "default_true")]
+    r#abstract: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// One public method recovered from an introspected class. The `params`
 /// list already has the implicit receiver (`self` / `cls`) stripped on the
 /// Python side, so it maps straight onto an [`ArityInfo`] via
 /// [`arity_info_from_params`].
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct IntrospectedMethod {
     name: String,
     /// `"method"` (instance), `"classmethod"`, or `"staticmethod"`.
@@ -127,11 +159,21 @@ struct IntrospectedMethod {
     params: Vec<IntrospectedParam>,
     #[serde(default)]
     returns: Option<String>,
+    /// See [`IntrospectedMember::returns_class`]; for a property, the class
+    /// its getter returns.
+    #[serde(default)]
+    returns_class: Option<String>,
+    #[serde(default)]
+    deprecated: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct IntrospectedModule {
     members: Vec<IntrospectedMember>,
+    /// Classes reached from this module's members by following return
+    /// annotations (functions, methods, properties), transitively.
+    #[serde(default)]
+    classes: HashMap<String, IntrospectedClass>,
 }
 
 /// Per-project introspection cache. Keyed by dotted module name; the
@@ -511,7 +553,7 @@ impl Drop for ScratchDir {
 ///
 /// Intentionally stdlib-only so it works against any Python on hand.
 const INTROSPECT_SCRIPT: &str = r#"
-import sys, json, importlib, inspect
+import sys, json, importlib, inspect, typing
 
 PARAM_KIND_MAP = {
     inspect.Parameter.POSITIONAL_ONLY: "positional_only",
@@ -585,6 +627,137 @@ def returns_of(obj):
         return None
     return ann_to_str(sig.return_annotation)
 
+def deprecation_of(obj):
+    # PEP 702: `warnings.deprecated` / `typing_extensions.deprecated` stamp the
+    # message on `__deprecated__`. Read it off the object's own namespace for
+    # classes, so a subclass of a deprecated class isn't reported as deprecated
+    # itself (CPython warns only for the decorated class).
+    try:
+        if inspect.isclass(obj):
+            msg = vars(obj).get("__deprecated__")
+        else:
+            msg = getattr(obj, "__deprecated__", None)
+    except BaseException:
+        return None
+    return msg if isinstance(msg, str) else None
+
+# Modules whose classes are never followed: builtins and typing constructs map
+# (or degrade) on the Rust side by name.
+_UNFOLLOWED = ("builtins", "typing", "typing_extensions", "collections.abc", "types", "abc")
+
+def class_of_annotation(ann, owner):
+    # The class a return annotation names, when it names exactly one concrete
+    # class: `Result`, `Result[int]`, `"mod.Result"`. A string annotation (PEP
+    # 563) is evaluated in the defining function's globals. Unions, `type[X]`,
+    # TypeVars and typing forms give None, so the caller keeps its old
+    # (permissive) mapping.
+    if ann is inspect.Parameter.empty or ann is None:
+        return None
+    if isinstance(ann, str):
+        try:
+            g = getattr(owner, "__globals__", None)
+            if g is None:
+                g = getattr(sys.modules.get(getattr(owner, "__module__", "") or ""), "__dict__", {})
+            ann = eval(ann, dict(g))
+        except BaseException:
+            return None
+    try:
+        origin = typing.get_origin(ann)
+    except BaseException:
+        return None
+    target = origin if origin is not None else ann
+    if not isinstance(target, type):
+        return None
+    if target is type:
+        return None
+    mod = getattr(target, "__module__", None)
+    qual = getattr(target, "__qualname__", None)
+    if not isinstance(mod, str) or not isinstance(qual, str) or "." in qual or "<" in qual:
+        return None
+    if mod in _UNFOLLOWED or mod.startswith("_"):
+        return None
+    return target
+
+def qualified(cls):
+    return cls.__module__ + "." + cls.__qualname__
+
+# Classes reached from return annotations. `_followed` / `_pending` are per
+# module (each module's payload lists every class reachable from it, so a
+# per-module cache entry is self-contained); `_described` memoises the
+# descriptions, and the classes each one refers to, across the batch.
+_FOLLOW_LIMIT = 400
+_followed = {}
+_pending = []
+_described = {}
+_refs = None
+
+def follow(ann, owner):
+    cls = class_of_annotation(ann, owner)
+    if cls is None:
+        return None
+    q = qualified(cls)
+    if _refs is not None:
+        _refs.append((q, cls))
+    if q not in _followed:
+        if len(_followed) >= _FOLLOW_LIMIT:
+            return None
+        _followed[q] = cls
+        _pending.append(q)
+    return q
+
+def return_class_of(obj):
+    try:
+        sig = inspect.signature(obj)
+    except Exception:
+        return None
+    # An `async def`'s annotation is what `await` produces; the checker keeps
+    # introspected callables synchronous, and foreign classes are permissive
+    # operands of `await`, so the awaited value gets the class.
+    return follow(sig.return_annotation, obj)
+
+def instances_callable(cls):
+    try:
+        return any("__call__" in vars(k) for k in cls.__mro__ if k is not object)
+    except BaseException:
+        return True
+
+def is_abstract(cls):
+    try:
+        return bool(inspect.isabstract(cls) or getattr(cls, "_is_protocol", False))
+    except BaseException:
+        return True
+
+def describe_class(cls):
+    return {
+        "methods": methods_of(cls),
+        "deprecated": deprecation_of(cls),
+        "callable": instances_callable(cls),
+        "abstract": is_abstract(cls),
+    }
+
+def drain_followed():
+    global _refs
+    out = {}
+    while _pending:
+        q = _pending.pop(0)
+        if q not in _described:
+            _refs = []
+            try:
+                desc = describe_class(_followed[q])
+            except Exception:
+                desc = None
+            _described[q] = (desc, _refs)
+            _refs = None
+        else:
+            for rq, rcls in _described[q][1]:
+                if rq not in _followed and len(_followed) < _FOLLOW_LIMIT:
+                    _followed[rq] = rcls
+                    _pending.append(rq)
+        desc = _described[q][0]
+        if desc is not None:
+            out[q] = desc
+    return out
+
 def methods_of(cls):
     # Public methods of `cls`, each with its receiver-stripped signature.
     # Only plain Python functions / classmethods / staticmethods are
@@ -598,11 +771,26 @@ def methods_of(cls):
     except BaseException:
         return out
     for mname in names:
-        if mname.startswith("_"):
+        if mname.startswith("_") and mname != "__call__":
             continue
         try:
             raw = inspect.getattr_static(cls, mname)
         except BaseException:
+            continue
+        if isinstance(raw, property):
+            # A property is read, not called: record its getter's return type
+            # (followed into its class) and deprecation, with no params.
+            fget = raw.fget
+            if fget is None:
+                continue
+            out.append({
+                "name": mname,
+                "kind": "property",
+                "params": [],
+                "returns": returns_of(fget),
+                "returns_class": return_class_of(fget),
+                "deprecated": deprecation_of(fget),
+            })
             continue
         if isinstance(raw, staticmethod):
             mkind, strip = "staticmethod", False
@@ -626,7 +814,14 @@ def methods_of(cls):
         # method's positional arity and false-positive every valid call.
         if strip and p and p[0]["kind"] in ("positional_only", "positional_or_keyword"):
             p = p[1:]
-        out.append({"name": mname, "kind": mkind, "params": p, "returns": returns_of(target)})
+        out.append({
+            "name": mname,
+            "kind": mkind,
+            "params": p,
+            "returns": returns_of(target),
+            "returns_class": return_class_of(target),
+            "deprecated": deprecation_of(target),
+        })
     return out
 
 def introspect_one(mod_name):
@@ -659,7 +854,11 @@ def introspect_one(mod_name):
                 "kind": kind,
                 "params": params_of(obj) if kind in ("class", "function") else None,
                 "returns": returns_of(obj) if kind == "function" else None,
+                "returns_class": return_class_of(obj) if kind == "function" else None,
                 "methods": methods_of(obj) if kind == "class" else None,
+                "deprecated": deprecation_of(obj) if kind in ("class", "function") else None,
+                "callable": instances_callable(obj) if kind == "class" else None,
+                "abstract": is_abstract(obj) if kind == "class" else None,
             })
         except Exception:
             # Defense in depth: never let one pathological member crash the
@@ -672,11 +871,13 @@ def introspect_one(mod_name):
             # crash-causer here (the werkzeug `LocalProxy` `RuntimeError`, a
             # Django `ImproperlyConfigured`) is an `Exception` subclass.
             continue
-    return {"members": members}
+    return {"members": members, "classes": drain_followed()}
 
 def main():
     result = {}
     for mod_name in sys.argv[1:]:
+        _followed.clear()
+        del _pending[:]
         result[mod_name] = introspect_one(mod_name)
     print(json.dumps(result))
 
@@ -783,6 +984,9 @@ fn introspect_batch_via_python(
 /// functions with `*args` populate the existing `max_positional =
 /// None` / variadic shape and stay checkable for keyword args.
 fn shapes_from_introspected(intro: &IntrospectedModule) -> ModuleShapes {
+    // Only a followed class that was actually described may appear as a
+    // return type: a name past the follow limit stays `Unknown`.
+    let known: HashSet<&str> = intro.classes.keys().map(String::as_str).collect();
     let mut class_shapes: HashMap<String, InterfaceShape> = HashMap::new();
     let mut function_arities: HashMap<String, ArityInfo> = HashMap::new();
     for member in &intro.members {
@@ -798,23 +1002,33 @@ fn shapes_from_introspected(intro: &IntrospectedModule) -> ModuleShapes {
                     // aren't present, and the shape stays `partial`, so missing
                     // ones remain lenient — no false `attribute_not_found`.
                     if let Some(methods) = &member.methods {
-                        for m in methods {
-                            if let Some(sig) = method_sig_from_introspected(m) {
-                                shape.methods.insert(m.name.clone(), sig);
-                            }
-                        }
+                        attach_methods(&mut shape, methods, &known);
                     }
+                    shape.deprecated = member.deprecated.clone();
+                    shape.instances_not_callable =
+                        member.callable == Some(false) && member.r#abstract == Some(false);
                     class_shapes.insert(member.name.clone(), shape);
                 }
             }
             "function" => {
-                if let Some(info) = arity_info_from_params(params, member.returns.as_deref()) {
+                if let Some(mut info) = arity_info_from_params(params, member.returns.as_deref()) {
+                    info.return_type = followed_return_type(
+                        info.return_type,
+                        member.returns_class.as_deref(),
+                        &known,
+                    );
+                    info.deprecated = member.deprecated.clone();
                     function_arities.insert(member.name.clone(), info);
                 }
             }
             _ => {}
         }
     }
+    let foreign_classes = intro
+        .classes
+        .iter()
+        .map(|(qualified, cls)| (qualified.clone(), foreign_class_shape(cls, &known)))
+        .collect();
     ModuleShapes {
         class_shapes,
         class_type_params: HashMap::new(),
@@ -832,6 +1046,69 @@ fn shapes_from_introspected(intro: &IntrospectedModule) -> ModuleShapes {
         // higher-kinded metadata — those are Typhon-source concepts.
         class_param_variance: HashMap::new(),
         hkt_param_names: std::collections::HashSet::new(),
+        foreign_classes,
+    }
+}
+
+/// Add introspected methods (and properties) to `shape`.
+fn attach_methods(
+    shape: &mut InterfaceShape,
+    methods: &[IntrospectedMethod],
+    known: &HashSet<&str>,
+) {
+    for m in methods {
+        if let Some(sig) = method_sig_from_introspected(m, known) {
+            shape.methods.insert(m.name.clone(), sig);
+        }
+    }
+}
+
+/// The shape of a class reached by following return annotations. It is
+/// only ever the type of a value (`agent.run_sync(...)`), never a
+/// constructor target, so it carries methods and properties but no
+/// constructor fields: `inspect.signature(Cls)` parameters are not
+/// necessarily attributes, and a field typed from one could reject a read
+/// of a same-named attribute that has another type.
+fn foreign_class_shape(cls: &IntrospectedClass, known: &HashSet<&str>) -> InterfaceShape {
+    let mut shape = InterfaceShape {
+        partial: true,
+        deprecated: cls.deprecated.clone(),
+        instances_not_callable: !cls.callable && !cls.r#abstract,
+        ..InterfaceShape::default()
+    };
+    if let Some(methods) = &cls.methods {
+        attach_methods(&mut shape, methods, known);
+    }
+    // Everything on a followed class was `Unknown` before return types were
+    // followed, so a nullable result stays `Unknown` here: `resp.encoding
+    // .upper()` (declared `str | None`, set in practice) ran, and rejecting
+    // it as `tyc::nullable_use` would narrow a working program.
+    for sig in shape.methods.values_mut() {
+        sig.return_type = without_nullable(std::mem::replace(&mut sig.return_type, Type::Unknown));
+        sig.arity_info.return_type = sig.return_type.clone();
+    }
+    shape
+}
+
+/// `Unknown` for a type that admits `None` (`X | None`); anything else as is.
+/// `None` itself is kept: using the result of a `-> None` call fails.
+fn without_nullable(t: Type) -> Type {
+    match &t {
+        Type::Union(members) if members.iter().any(|m| matches!(m, Type::None)) => Type::Unknown,
+        _ => t,
+    }
+}
+
+/// The return type of an introspected callable: the annotation's own
+/// mapping when it resolved to something concrete, else the followed class
+/// (when it was described), else `Unknown`.
+fn followed_return_type(mapped: Type, returns_class: Option<&str>, known: &HashSet<&str>) -> Type {
+    if !matches!(mapped, Type::Unknown) {
+        return mapped;
+    }
+    match returns_class {
+        Some(q) if known.contains(q) => Type::Class(q.to_owned()),
+        _ => Type::Unknown,
     }
 }
 
@@ -886,6 +1163,8 @@ fn class_shape_from_params(params: &[IntrospectedParam]) -> Option<InterfaceShap
         // the method surface, so we can't soundly claim a method is
         // missing.
         partial: true,
+        deprecated: None,
+        instances_not_callable: false,
     })
 }
 
@@ -1220,14 +1499,25 @@ fn union_from_members(members: &[&str]) -> Type {
 /// (permissive-max) shape via `arity_info_from_params`, so the *minimum*
 /// required positional count is still enforced — `model.fit()` with `fit(self,
 /// X, y=None, **kw)` still flags the missing `X`.
-fn method_sig_from_introspected(m: &IntrospectedMethod) -> Option<MethodSig> {
-    let info = arity_info_from_params(&m.params, m.returns.as_deref())?;
+fn method_sig_from_introspected(
+    m: &IntrospectedMethod,
+    known: &HashSet<&str>,
+) -> Option<MethodSig> {
+    let mut info = arity_info_from_params(&m.params, m.returns.as_deref())?;
+    info.return_type = followed_return_type(info.return_type, m.returns_class.as_deref(), known);
+    info.deprecated = m.deprecated.clone();
+    let is_property = m.kind == "property";
+    if is_property {
+        // Properties were never read before; see `foreign_class_shape`.
+        info.return_type =
+            without_nullable(std::mem::replace(&mut info.return_type, Type::Unknown));
+    }
     let param_types = info.param_types.clone();
     let return_type = info.return_type.clone();
     Some(MethodSig {
         arity: info.param_names.len(),
         return_type,
-        is_property: false,
+        is_property,
         is_static: m.kind == "staticmethod",
         is_classmethod: m.kind == "classmethod",
         arity_info: info,
@@ -1294,6 +1584,7 @@ fn arity_info_from_params(
         return_type,
         is_async: false,
         declared_sync: false,
+        deprecated: None,
     })
 }
 
@@ -1747,6 +2038,7 @@ mod tests {
                     params: None,
                     returns: None,
                     methods: None,
+                    ..Default::default()
                 },
                 IntrospectedMember {
                     name: "Agent".into(),
@@ -1754,8 +2046,10 @@ mod tests {
                     params: Some(vec![p("name", "keyword_only", false)]),
                     returns: None,
                     methods: None,
+                    ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         let shapes = shapes_from_introspected(&intro);
         assert!(shapes.class_shapes.contains_key("Agent"));
@@ -1782,15 +2076,19 @@ mod tests {
                             p("y", "positional_or_keyword", true),
                         ],
                         returns: None,
+                        ..Default::default()
                     },
                     IntrospectedMethod {
                         name: "set_params".into(),
                         kind: "method".into(),
                         params: vec![p("params", "var_keyword", false)],
                         returns: None,
+                        ..Default::default()
                     },
                 ]),
+                ..Default::default()
             }],
+            ..Default::default()
         };
         let shapes = shapes_from_introspected(&intro);
         let pca = shapes.class_shapes.get("PCA").expect("PCA shape");
@@ -2282,6 +2580,153 @@ lazy import np = numpy
     }
 
     #[test]
+    fn introspection_follows_return_types_into_classes() {
+        let _serial = serialise_subprocess_tests();
+        // `agent.run_sync(...)` → `AgentRunResult` → `.usage` → `RunUsage`,
+        // whose `__call__` is PEP 702-deprecated: the shape of pydantic-ai's
+        // `result.usage()` trap. The followed classes live in a submodule the
+        // program never imports, and the getter annotations are strings
+        // (`from __future__ import annotations`).
+        let Some(python) = which_python3() else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join("agentish");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("__init__.py"),
+            "from agentish._run import Agent, make\n__all__ = ['Agent', 'make']\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pkg.join("_run.py"),
+            "\
+from __future__ import annotations
+
+class RunUsage:
+    requests: int = 0
+    def __call__(self) -> RunUsage:
+        return self
+    __call__.__deprecated__ = 'use `.usage`, not `.usage()`'
+
+class Plain:
+    pass
+
+class Base:
+    def __call__(self):
+        return 1
+
+class Callable(Base):
+    pass
+
+class RunResult:
+    @property
+    def usage(self) -> RunUsage:
+        return RunUsage()
+    @property
+    def plain(self) -> Plain:
+        return Plain()
+    @property
+    def callable(self) -> Callable:
+        return Callable()
+    @property
+    def encoding(self) -> str | None:
+        return None
+    @property
+    def count(self) -> int:
+        return 1
+    def old(self) -> int:
+        return 1
+    old.__deprecated__ = 'use new()'
+
+class Agent:
+    def __init__(self, name: str) -> None:
+        self.name = name
+    def run_sync(self, prompt: str) -> RunResult:
+        return RunResult()
+
+def make() -> RunResult:
+    return RunResult()
+",
+        )
+        .unwrap();
+        let result = introspect_batch_via_python(
+            &python,
+            tmp.path(),
+            std::slice::from_ref(&"agentish".to_owned()),
+        )
+        .expect("introspection must succeed");
+        let shapes = shapes_from_introspected(&result["agentish"]);
+        let q = |name: &str| format!("agentish._run.{name}");
+        let class = |t: &Type| match t {
+            Type::Class(n) => n.clone(),
+            other => panic!("expected a class, got {other:?}"),
+        };
+        // Function and method returns name the followed class.
+        assert_eq!(
+            class(&shapes.function_arities["make"].return_type),
+            q("RunResult")
+        );
+        let agent = &shapes.class_shapes["Agent"];
+        assert_eq!(
+            class(&agent.methods["run_sync"].return_type),
+            q("RunResult")
+        );
+        let result_shape = &shapes.foreign_classes[&q("RunResult")];
+        assert!(result_shape.partial);
+        assert!(
+            result_shape.fields.is_empty(),
+            "a followed class carries no constructor fields"
+        );
+        let usage = &result_shape.methods["usage"];
+        assert!(usage.is_property);
+        assert_eq!(class(&usage.return_type), q("RunUsage"));
+        // Nullable property results stay `Unknown`; concrete ones are typed.
+        assert_eq!(result_shape.methods["encoding"].return_type, Type::Unknown);
+        assert_eq!(result_shape.methods["count"].return_type, Type::Int);
+        assert_eq!(
+            result_shape.methods["old"].arity_info.deprecated.as_deref(),
+            Some("use new()")
+        );
+        let run_usage = &shapes.foreign_classes[&q("RunUsage")];
+        assert_eq!(
+            run_usage.methods["__call__"]
+                .arity_info
+                .deprecated
+                .as_deref(),
+            Some("use `.usage`, not `.usage()`")
+        );
+        assert!(!run_usage.instances_not_callable);
+        assert!(shapes.foreign_classes[&q("Plain")].instances_not_callable);
+        // `__call__` inherited from a base still makes instances callable.
+        assert!(!shapes.foreign_classes[&q("Callable")].instances_not_callable);
+    }
+
+    #[test]
+    fn followed_return_type_only_names_described_classes() {
+        let known: HashSet<&str> = ["pkg.Known"].into_iter().collect();
+        assert_eq!(
+            followed_return_type(Type::Unknown, Some("pkg.Known"), &known),
+            Type::Class("pkg.Known".into())
+        );
+        // Past the follow limit: no description, so no class type.
+        assert_eq!(
+            followed_return_type(Type::Unknown, Some("pkg.Other"), &known),
+            Type::Unknown
+        );
+        // A concrete mapping of the annotation wins.
+        assert_eq!(
+            followed_return_type(Type::Int, Some("pkg.Known"), &known),
+            Type::Int
+        );
+        assert_eq!(
+            without_nullable(Type::Union(vec![Type::Str, Type::None])),
+            Type::Unknown
+        );
+        assert_eq!(without_nullable(Type::None), Type::None);
+    }
+
+    #[test]
     fn introspection_survives_a_member_that_raises_on_signature() {
         let _serial = serialise_subprocess_tests();
         // Regression: a module member that raises a NON-(TypeError|ValueError)
@@ -2427,7 +2872,9 @@ class App:
                 params: None,
                 returns: None,
                 methods: None,
+                ..Default::default()
             }],
+            ..Default::default()
         };
         let shapes = shapes_from_introspected(&intro);
         assert!(shapes.class_shapes.is_empty());

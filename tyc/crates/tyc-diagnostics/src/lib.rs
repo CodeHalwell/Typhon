@@ -197,6 +197,29 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A call to (or, for a property, a read of) an API marked deprecated
+    /// with PEP 702's `@deprecated("...")` — `warnings.deprecated` or
+    /// `typing_extensions.deprecated` — in a dependency (seen through venv
+    /// introspection) or in `.ty` source. Always a warning: the API still
+    /// works, and CPython only emits a `DeprecationWarning` at runtime.
+    #[error("`{what}` is deprecated: {message}")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::deprecated),
+        url("https://github.com/CodeHalwell/Typhon/blob/main/docs/diagnostics/deprecated.md"),
+        help(
+            "The API's own deprecation message is quoted above; it usually names the replacement."
+        )
+    )]
+    Deprecated {
+        what: String,
+        message: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("deprecated")]
+        span: SourceSpan,
+    },
+
     /// A call site passed a keyword argument whose name doesn't match
     /// any of the callee's parameters (positional or keyword-only) and
     /// the callee has no `**kwargs`. Distinct from `tyc::arg_count`
@@ -2149,6 +2172,7 @@ impl TycError {
             | Self::SelfOutsideImpl { src, span, .. }
             | Self::TypeVarImportRejected { src, span, .. }
             | Self::TypingAliasDeprecated { src, span, .. }
+            | Self::Deprecated { src, span, .. }
             | Self::UnknownKwarg { src, span, .. }
             | Self::MissingReturn { src, span, .. }
             | Self::MissingInitialiser { src, span, .. }
@@ -2297,6 +2321,7 @@ impl TycError {
             | Self::SelfOutsideImpl { src, span, .. }
             | Self::TypeVarImportRejected { src, span, .. }
             | Self::TypingAliasDeprecated { src, span, .. }
+            | Self::Deprecated { src, span, .. }
             | Self::UnknownKwarg { src, span, .. }
             | Self::MissingReturn { src, span, .. }
             | Self::MissingInitialiser { src, span, .. }
@@ -2487,6 +2512,24 @@ impl TycError {
         Self::TypingAliasDeprecated {
             name: name.into(),
             lower: lower.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::Deprecated`] diagnostic. `what` names the
+    /// API as written at the use site; `message` is its PEP 702 message.
+    pub fn deprecated(
+        what: impl Into<String>,
+        message: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::Deprecated {
+            what: what.into(),
+            message: message.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

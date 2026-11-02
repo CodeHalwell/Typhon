@@ -608,6 +608,25 @@ n()                   # error: `int` is not callable
 
 **Fix:** Drop the parentheses or call the right name.
 
+Also fires (beta.6) when a dependency's return value is called and
+introspection showed its class has no `__call__` anywhere in its MRO
+(`result.plain()` where `plain` is a property returning a plain object).
+
+### `tyc::deprecated` — warning
+
+A call to a PEP 702 `@deprecated("...")` API (function, class, method,
+`__call__`), or a read of a deprecated property. The marker comes from venv
+introspection of a dependency (including classes reached only by following
+return types: `agent.run_sync()` → `AgentRunResult` → `.usage` →
+`RunUsage`) or from `@deprecated` / `@warnings.deprecated` in `.ty` source.
+
+```ty
+let result = agent.run_sync("hi")
+let u = result.usage()   # warning: `AgentRunResult.usage()` is deprecated: `usage` is a property …
+```
+
+**Fix:** Follow the message (`result.usage`). Silenced inside `unsafe:`.
+
 ---
 
 ## 6. Error handling & `Result`
@@ -1217,7 +1236,7 @@ Standard values for severity keys are `"off"`, `"warn"`, `"error"`. The `suggest
 
 **Errors** (block the build by default): `arg_count`, `attribute_not_found`, `comptime`, `cyclic_type_alias`, `div_by_zero_literal`, `duplicate_class`, `duplicate_method`, `extend_builtin`, `field_default_ordering`, `frozen_assign`, `generator_return_type`, `generic`, `immutable_assign`, `impl_unknown_class`, `implicit_any`, `impure_pure_fn`, `interface_isinstance`, `interface_not_conforming`, `invalid_config_value`, `invalid_pattern`, `invalid_question_op`, `io`, `lazy_usage`, `manual_init`, `method_in_class_body` (default warn but commonly bumped), `missing_annotation`, `missing_argument`, `missing_await`, `missing_binding_kind`, `missing_field_init`, `missing_initialiser`, `missing_return`, `newtype_violation`, `no_block_shadow`, `non_exhaustive_match`, `not_callable`, `nullable_use`, `operator_type_mismatch`, `parse`, `pattern_shadows_outer`, `pub_name_collision`, `result_error_mismatch`, `return_in_except_star`, `self_outside_impl`, `stub_mismatch`, `tuple_index_out_of_range`, `type_mismatch`, `typevar_bound`, `typevar_import_rejected`, `typing_alias_deprecated`, `unknown_kwarg`, `unknown_module`, `unknown_name`, `unsafe_value_leak`, `unused_import`, `use_of_uninitialised`.
 
-**Warnings**: `async_without_await`, `class_attr_shadows_slot`, `blocking_in_async`, `contains_secret_literal`, `orphan_py_import`, `python_semantic_drift`, `resource_not_managed`, `stdlib_module_shadow`.
+**Warnings**: `async_without_await`, `class_attr_shadows_slot`, `blocking_in_async`, `contains_secret_literal`, `deprecated`, `orphan_py_import`, `python_semantic_drift`, `resource_not_managed`, `stdlib_module_shadow`.
 
 **Advice**: `auto_gather_missed`, `gather_opportunity`, `lazy_import_opportunity`, `main_not_called`, `parallel_opportunity`, `perf_keys_membership`, `perf_list_shift_in_loop`, `perf_membership_in_loop`, `perf_sort_in_loop`, `perf_sorted_first`, `perf_str_concat_in_loop`, `pub_star_outside_init`, `shared_mut_across_tasks`.
 

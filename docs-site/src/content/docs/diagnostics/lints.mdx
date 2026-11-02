@@ -36,6 +36,25 @@ def load_config(path: str) -> str:
 Severity: `[strictness] require-with` (`"warn"` by default; `"error"` or
 `"off"`).
 
+## `tyc::deprecated` (warning)
+
+A call to an API marked with PEP 702's `@deprecated("...")`, or a read of a
+deprecated property. The marker can sit on a dependency (seen through venv
+introspection, including classes reached only through return values) or on a
+function, class, method or property in your own `.ty` code. CPython only
+prints a `DeprecationWarning` at runtime, so this surfaces it at check time.
+
+```python
+from pydantic_ai import Agent
+
+def main(agent: Agent) -> None:
+    let result = agent.run_sync("hello")
+    let u = result.usage()   # ⚠ `AgentRunResult.usage()` is deprecated:
+                             #   `usage` is a property, not a method …
+```
+
+**Fix:** follow the message, here `result.usage`.
+
 ## `tyc::contains_secret_literal` (warning)
 
 A binding whose name looks like a credential (`API_KEY`, `DB_PASSWORD`,

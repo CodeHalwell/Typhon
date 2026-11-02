@@ -4,6 +4,62 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## Unreleased (1.0.0-beta.6)
+
+Third-party checking now reaches past the first call. The pydantic-ai bug
+from the beta.5 feedback session, `result.usage()` where `usage` had become
+a property, is reported at check time instead of as a runtime
+`DeprecationWarning`. Two new diagnostics: `tyc::deprecated` is a warning,
+and `tyc::not_callable` on a dependency's return value and the PEP 728
+`closed=True` + `extra_items` error fire only on code that raises
+`TypeError`. The new `tyc::requires_newer_python` cases fire only on code
+its target cannot run, so no program that ran correctly under beta.5 is
+newly rejected.
+
+### Added
+
+- **Venv introspection follows return types into their classes.** A
+  function, method or property annotated to return a class (`run_sync(...)
+  -> AgentRunResult[Any]`, string annotations included) now has that class
+  introspected as well, even from a submodule the program never imports,
+  and the walk continues from its own methods and properties (up to 400
+  classes per module). Calls and attribute reads on a dependency's return
+  values are checked against the real class: pydantic-ai's
+  `result.all_messages(1)` is `tyc::arg_count`, and calling a property
+  declared to return `int` is `tyc::not_callable`. Followed classes are permissive in assignability
+  (the program may spell the same class through a re-export, a subclass
+  or a Protocol), carry no constructor fields, and their `X | None`
+  results stay `Unknown`, so a working `resp.encoding.upper()` keeps
+  passing. Introspection now records properties as properties.
+- **`tyc::deprecated` (warning).** A call to an API marked with PEP 702's
+  `@deprecated("...")`, or a read of a deprecated property, is reported
+  with the API's own message. The marker is read from `__deprecated__` on a
+  dependency's functions, classes, methods, property getters and
+  `__call__`, and from `@deprecated` / `@warnings.deprecated` /
+  `@typing_extensions.deprecated` in `.ty` source. `result.usage()` on
+  pydantic-ai now warns "`AgentRunResult.usage()` is deprecated: `usage`
+  is a property, not a method: use `.usage` instead of `.usage()`."
+  Silenced inside `unsafe:`.
+- **`tyc::not_callable` on a dependency's return value** whose class has no
+  `__call__` anywhere in its MRO (and is not an ABC or Protocol), which is
+  CPython's `TypeError: 'X' object is not callable`.
+- **PEP 728 and PEP 747 / 800 below 3.15.** `class M(TypedDict,
+  closed=True)` / `extra_items=...` (and the functional form) on
+  `typing.TypedDict`, `typing.TypeForm` and `typing.disjoint_base` are
+  `tyc::requires_newer_python` on a 3.13 or 3.14 target, where they raise
+  `TypeError` / `ImportError`. `typing_extensions.TypedDict` and feature
+  probes (`if sys.version_info >= (3, 15):`) are left alone.
+- **`closed=True` with `extra_items` is rejected** on a `TypedDict`, as
+  CPython 3.15 does when the class is created.
+
+### Fixed
+
+- **`int | None` as a value was a false positive.** A PEP 604 union of
+  types evaluated at runtime (`let t = int | None`, `let u: type = list[str]
+  | None`, `TypeForm[str | None]`) reported its `None` as a possibly-None
+  operand (`tyc::nullable_use`). It is a `types.UnionType` on every
+  supported target.
+
 ## 1.0.0-beta.5 — 2026-11-02 — agent-feedback fixes
 
 Fixes from a coding agent's session building a pydantic-ai tool with

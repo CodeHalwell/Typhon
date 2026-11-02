@@ -23,6 +23,7 @@
 mod builtins;
 mod callables;
 mod class_contracts;
+mod deprecation;
 mod expression_calls;
 mod frozen_context;
 mod mutations;
@@ -2062,6 +2063,47 @@ fn expr_is_type_shaped(expr: &Expr, classes: &[String], type_params: &[String]) 
     }
 }
 
+/// `true` when `b` is a PEP 604 union of types evaluated as a value
+/// (`int | None`, `list[str] | None`, `mod.Class | None`): every leaf is a
+/// type reference or `None`, at least one leaf is not `None`, no leaf name
+/// is rebound to a non-class value in scope, and a dotted leaf hangs off a
+/// module.
+fn is_runtime_type_union(c: &Checker, b: &ruff_python_ast::ExprBinOp) -> bool {
+    fn leaf(c: &Checker, e: &Expr, saw_type: &mut bool) -> bool {
+        match e {
+            Expr::NoneLiteral(_) => true,
+            Expr::Name(n) => {
+                let shadowed = c.env.lookup(n.id.as_str()).is_some_and(|binding| {
+                    !matches!(binding.narrowed, Type::Class(_) | Type::Unknown | Type::Any)
+                });
+                let ok = !shadowed && expr_is_type_shaped(e, &c.classes, &c.active_type_params);
+                *saw_type |= ok;
+                ok
+            }
+            Expr::Subscript(sub) => {
+                let ok = matches!(sub.value.as_ref(), Expr::Name(_) | Expr::Attribute(_))
+                    && leaf(c, &sub.value, saw_type);
+                *saw_type |= ok;
+                ok
+            }
+            Expr::Attribute(a) => {
+                let ok = matches!(infer_expr_readonly(c, &a.value), Type::Module(_));
+                *saw_type |= ok;
+                ok
+            }
+            Expr::BinOp(inner) if matches!(inner.op, Operator::BitOr) => {
+                leaf(c, &inner.left, saw_type) && leaf(c, &inner.right, saw_type)
+            }
+            _ => false,
+        }
+    }
+    if !matches!(b.op, Operator::BitOr) {
+        return false;
+    }
+    let mut saw_type = false;
+    leaf(c, &b.left, &mut saw_type) && leaf(c, &b.right, &mut saw_type) && saw_type
+}
+
 /// Same as [`type_from_annotation`] but treats every name in `type_params`
 /// as `Type::Any` so that PEP 695 generic functions don't trip the
 /// assignability check before we have a real inference engine.
@@ -3979,6 +4021,13 @@ struct Checker<'a> {
     /// `foo`'s `ApiClient` class, returning a `Type::Class("ApiClient")`
     /// the constructor-call site can arity-check.
     module_registry: std::sync::Arc<HashMap<String, ModuleShapes>>,
+    /// `true` when some registry module carries followed third-party
+    /// classes ([`ModuleShapes::foreign_classes`]). Gates the (cheap but
+    /// not free) foreign-class erasure in [`Checker::is_assignable`].
+    has_foreign_classes: bool,
+    /// Spans already reported as `tyc::deprecated`, so re-inferring an
+    /// expression (which the checker does freely) reports a use once.
+    deprecation_reported: HashSet<(usize, usize)>,
     /// Byte offsets of the `if True:` statements that correspond to
     /// `unsafe:` blocks.  Computed from the preprocessor's `unsafe_lines`
     /// metadata; queried by [`check_stmt`] when entering an `if` body to
@@ -4086,6 +4135,12 @@ pub struct ArityInfo {
     /// checker cannot see. A consumer uses it to reject `go f()` / `await
     /// f()` on an imported synchronous function (W3, extending W2-11).
     pub declared_sync: bool,
+    /// The PEP 702 deprecation message when the callable is marked
+    /// `@deprecated("...")` (`warnings.deprecated` /
+    /// `typing_extensions.deprecated`), read from `__deprecated__` by venv
+    /// introspection or from the decorator in `.ty` source. A call (or, for
+    /// a property, a read) is reported as the warn-level `tyc::deprecated`.
+    pub deprecated: Option<String>,
 }
 
 /// Declared interface (`interface Name:` → `class Name(Protocol):`). Bundles
@@ -4191,6 +4246,14 @@ pub struct InterfaceShape {
     /// `uvicorn.Server.serve`, `httpx.AsyncClient.aclose`,
     /// `fastapi.Request.body`). v0.8.0 carry-over.
     pub partial: bool,
+    /// The PEP 702 deprecation message of a class marked `@deprecated`
+    /// (constructing it is reported as `tyc::deprecated`).
+    pub deprecated: Option<String>,
+    /// `true` only when venv introspection proved that no class in the
+    /// type's MRO defines `__call__` and the class is concrete (not an ABC
+    /// or a Protocol), so calling an instance is CPython's `TypeError: 'X'
+    /// object is not callable`. Typhon-source classes leave it `false`.
+    pub instances_not_callable: bool,
 }
 
 /// Tracking state for a binding constructed via `X.__new__(X)` or
@@ -4291,6 +4354,8 @@ impl<'a> Checker<'a> {
             reassigned_names: std::collections::HashSet::new(),
             partial_returning_fns: HashMap::new(),
             module_registry: std::sync::Arc::new(HashMap::new()),
+            has_foreign_classes: false,
+            deprecation_reported: HashSet::new(),
             contextmanager_yields: HashMap::new(),
         }
     }
@@ -4537,6 +4602,13 @@ impl<'a> Checker<'a> {
     }
 
     fn is_assignable_inner(&self, expected: &Type, actual: &Type) -> bool {
+        if self.has_foreign_classes
+            && (self.mentions_foreign_class(expected) || self.mentions_foreign_class(actual))
+        {
+            let e = self.erase_foreign_classes(expected);
+            let a = self.erase_foreign_classes(actual);
+            return self.is_assignable(&e, &a);
+        }
         if matches!(expected, Type::Generic(head, _) if head == "TypeGuard" || head == "TypeIs")
             && matches!(actual, Type::Bool)
         {
@@ -5808,6 +5880,9 @@ impl<'a> Checker<'a> {
         if let Some(shape) = self.class_shapes.get(name) {
             return Some(shape);
         }
+        if let Some(shape) = self.foreign_class(name) {
+            return Some(shape);
+        }
         if name.contains('.') {
             // Qualified `mod.Class` (possibly aliased). Canonicalise the
             // module prefix, then target that module directly. A dotted name
@@ -5833,6 +5908,74 @@ impl<'a> Checker<'a> {
                 .get(m)
                 .and_then(|ms| ms.class_shapes.get(name))
         })
+    }
+
+    /// The shape of a third-party class reached by following a dependency's
+    /// return types ([`ModuleShapes::foreign_classes`]), by its qualified
+    /// name. Every module that reaches the class carries the same
+    /// description (one introspection batch describes it once), so the
+    /// first hit is as good as any.
+    fn foreign_class(&self, name: &str) -> Option<&InterfaceShape> {
+        if !self.has_foreign_classes || !name.contains('.') || self.class_shapes.contains_key(name)
+        {
+            return None;
+        }
+        self.module_registry
+            .values()
+            .find_map(|ms| ms.foreign_classes.get(name))
+    }
+
+    /// `true` when `t` mentions a followed third-party class anywhere.
+    fn mentions_foreign_class(&self, t: &Type) -> bool {
+        match t {
+            Type::Class(n) => self.foreign_class(n).is_some(),
+            Type::Generic(n, args) => {
+                self.foreign_class(n).is_some()
+                    || args.iter().any(|a| self.mentions_foreign_class(a))
+            }
+            Type::Union(vs) => vs.iter().any(|v| self.mentions_foreign_class(v)),
+            Type::Function { params, ret, .. } => {
+                params.iter().any(|p| self.mentions_foreign_class(p))
+                    || self.mentions_foreign_class(ret)
+            }
+            _ => false,
+        }
+    }
+
+    /// `t` with every followed third-party class replaced by `Unknown`.
+    /// Assignability never fails on one: the checker knows such a class
+    /// only by its qualified name, while the program may name the same
+    /// class through a re-export (`pydantic_ai.AgentRunResult` vs
+    /// `pydantic_ai.run.AgentRunResult`), a subclass, or a Protocol, and
+    /// following return types must only ever add checks on the value's
+    /// own attributes, never reject a flow that ran.
+    fn erase_foreign_classes(&self, t: &Type) -> Type {
+        match t {
+            Type::Class(n) if self.foreign_class(n).is_some() => Type::Unknown,
+            Type::Generic(n, _) if self.foreign_class(n).is_some() => Type::Unknown,
+            Type::Generic(n, args) => Type::Generic(
+                n.clone(),
+                args.iter().map(|a| self.erase_foreign_classes(a)).collect(),
+            ),
+            Type::Union(vs) => {
+                Type::Union(vs.iter().map(|v| self.erase_foreign_classes(v)).collect())
+            }
+            Type::Function {
+                params,
+                ret,
+                variadic,
+                min_params,
+            } => Type::Function {
+                params: params
+                    .iter()
+                    .map(|p| self.erase_foreign_classes(p))
+                    .collect(),
+                ret: Box::new(self.erase_foreign_classes(ret)),
+                variadic: *variadic,
+                min_params: *min_params,
+            },
+            other => other.clone(),
+        }
     }
 
     /// Resolve the member shape of an *interface* by name, falling back to
@@ -7061,6 +7204,15 @@ pub struct ModuleShapes {
     /// source module. Absence simply means the consumer degrades to today's
     /// permissive handling for that imported class — never a false positive.
     pub hkt_param_names: std::collections::HashSet<String>,
+    /// Third-party classes reached by following the return types of this
+    /// module's functions, methods and properties (venv introspection only),
+    /// keyed by their qualified name (`pydantic_ai.run.AgentRunResult`).
+    /// A followed return type is `Type::Class(<qualified name>)`, which
+    /// [`Checker::resolve_class_shape`] finds here, so `obj.attr` and
+    /// `obj.method(...)` on a third-party return value are checked. These
+    /// shapes are never constructor targets (they are not `class_shapes`
+    /// entries), and they are permissive in assignability.
+    pub foreign_classes: HashMap<String, InterfaceShape>,
 }
 
 /// Imports resolved to their source modules' [`ModuleShapes`], keyed
@@ -7329,6 +7481,7 @@ pub fn extract_module_shapes_with(
             );
             info.is_async = f.is_async;
             info.declared_sync = !f.is_async && f.decorator_list.is_empty();
+            info.deprecated = deprecation::from_decorators(&f.decorator_list);
             function_arities.insert(f.name.as_str().to_owned(), info);
         }
     }
@@ -7479,6 +7632,7 @@ pub fn extract_module_shapes_with(
         gatherable_async_fns,
         class_param_variance,
         hkt_param_names,
+        foreign_classes: HashMap::new(),
     }
 }
 
@@ -7802,6 +7956,10 @@ pub fn check_module_with_imports_and_types(
         // to the wrapper in `ExternalShapes::by_module`, so this
         // doesn't pay an O(modules) cost per file.
         c.module_registry = std::sync::Arc::clone(&ext.by_module);
+        c.has_foreign_classes = ext
+            .by_module
+            .values()
+            .any(|ms| !ms.foreign_classes.is_empty());
         // Bare imports: `bare_imports[local_name] = dotted_module`.
         // Seed `class_shapes` is NOT done here — the binding will
         // resolve via `Type::Module(...)` at attribute-access time,
@@ -10465,13 +10623,43 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
         if let Stmt::ClassDef(cd) = stmt {
             let name = cd.name.as_str().to_owned();
             let shape = collect_class_shape(cd, &classes);
-            if let Some(extra) = cd.arguments.as_deref().and_then(|a| {
-                a.keywords
-                    .iter()
-                    .find(|k| k.arg.as_ref().is_some_and(|n| n.as_str() == "extra_items"))
-            }) {
+            let class_keyword = |kw: &str| {
+                cd.arguments.as_deref().and_then(|a| {
+                    a.keywords
+                        .iter()
+                        .find(|k| k.arg.as_ref().is_some_and(|n| n.as_str() == kw))
+                })
+            };
+            if let Some(extra) = class_keyword("extra_items") {
                 c.typed_dict_extra_items
                     .insert(name.clone(), type_from_annotation(&extra.value, &classes));
+                // PEP 728: `closed=True` means "no extra items", so CPython
+                // refuses the pair when the class is created (`TypeError:
+                // Cannot combine closed=True and extra_items`).
+                let is_typed_dict = cd.arguments.as_deref().is_some_and(|a| {
+                    a.args.iter().any(|base| match base {
+                        Expr::Name(n) => n.id.as_str() == "TypedDict",
+                        Expr::Attribute(at) => at.attr.as_str() == "TypedDict",
+                        _ => false,
+                    })
+                });
+                if let Some(closed) = class_keyword("closed").filter(|k| {
+                    is_typed_dict && matches!(k.value, Expr::BooleanLiteral(ref b) if b.value)
+                }) {
+                    let start = closed.range.start().to_usize();
+                    let len = closed.range.end().to_usize().saturating_sub(start);
+                    c.diagnostics.push_error(TycError::generic_at(
+                        format!(
+                            "TypedDict `{name}` cannot combine `closed=True` with `extra_items` \
+                             (CPython raises TypeError when the class is created)"
+                        ),
+                        "drop `closed=True`: `extra_items=T` already decides which extra keys are allowed",
+                        &c.path,
+                        c.source,
+                        start,
+                        len,
+                    ));
+                }
             }
             if class_inherits_protocol(cd) {
                 let runtime_checkable = has_runtime_checkable_decorator(&cd.decorator_list);
@@ -10773,10 +10961,10 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
             // Record per-function arity metadata so the call-site arity
             // check can accept keyword args, defaults, `*args`, and
             // `**kwargs` without false positives (FINDINGS #44).
-            c.function_arity_info.insert(
-                f.name.as_str().to_owned(),
-                arity_info_from_parameters(f.parameters.as_ref(), &classes, &tps),
-            );
+            let mut info = arity_info_from_parameters(f.parameters.as_ref(), &classes, &tps);
+            info.deprecated = deprecation::from_decorators(&f.decorator_list);
+            c.function_arity_info
+                .insert(f.name.as_str().to_owned(), info);
             // ITEM 1: stash the `**kwargs` value type alongside, so the
             // call site can type-check absorbed keyword-argument values.
             if let Some(kw_ty) =
@@ -11670,7 +11858,10 @@ fn explicit_variance_override(decorators: &[ruff_python_ast::Decorator]) -> Opti
 /// references in field annotations (`field: OtherClass`) resolve correctly
 /// rather than landing as `Type::Unknown`.
 fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -> InterfaceShape {
-    let mut shape = InterfaceShape::default();
+    let mut shape = InterfaceShape {
+        deprecated: deprecation::from_decorators(&cd.decorator_list),
+        ..InterfaceShape::default()
+    };
     // R3-15 (2026-05-25): the enclosing class's PEP 695 type
     // parameters are in scope for every method body, so a method
     // signature like `def map[U](self, f: Callable[[T], U])` needs
@@ -11727,11 +11918,12 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
                 // Drop the implicit receiver (`self` / `cls`) from the
                 // method's arity surface so call sites can match argument
                 // counts directly. Static methods take no receiver.
-                let arity_info = if is_static {
+                let mut arity_info = if is_static {
                     full_arity
                 } else {
                     strip_receiver_from_arity(full_arity)
                 };
+                arity_info.deprecated = deprecation::from_decorators(&f.decorator_list);
                 // Per-param types from annotations (used at call sites to
                 // enforce real argument types — FINDINGS E2). Mirrors the
                 // arity_info treatment: drop the leading `self` / `cls`
@@ -12305,6 +12497,7 @@ fn class_constructor_arity_for(shape: &InterfaceShape, class_name: Option<&str>)
             return_type,
             is_async: false,
             declared_sync: false,
+            deprecated: None,
         };
     }
     ArityInfo {
@@ -12323,6 +12516,7 @@ fn class_constructor_arity_for(shape: &InterfaceShape, class_name: Option<&str>)
         return_type,
         is_async: false,
         declared_sync: false,
+        deprecated: None,
     }
 }
 
@@ -13264,6 +13458,7 @@ fn arity_info_from_parameters_with_returns(
         return_type,
         is_async: false,
         declared_sync: false,
+        deprecated: None,
     }
 }
 
@@ -21523,6 +21718,13 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 builtins::value_type(n.id.as_str()).unwrap_or(Type::Unknown)
             }
         }
+        Expr::BinOp(b) if is_runtime_type_union(c, b) => {
+            // `int | None` as a *value* is a `types.UnionType` (PEP 604),
+            // valid on every supported target: `let t = int | None`,
+            // `TypeForm[str | None]` (PEP 747). `None` there is a type, not
+            // a possibly-None operand.
+            Type::Unknown
+        }
         Expr::BinOp(b) => {
             let l = infer_expr(c, &b.left);
             let r = infer_expr(c, &b.right);
@@ -21863,6 +22065,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
                 let input = infer_expr_ctx(c, argument, expected);
                 return frozen_type(&c.unwrap_alias(&input));
             }
+            deprecation::check_call(c, call);
             if matches!(call.func.as_ref(), Expr::Name(n) if n.id.as_str() == "super") {
                 let receiver_class = c.current_class.clone().or_else(|| {
                     c.env
@@ -23255,6 +23458,7 @@ fn infer_expr_ctx_inner(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -
             }
         }
         Expr::Attribute(a) => {
+            deprecation::check_attribute_read(c, a);
             // Flow-sensitive attribute narrowing: `if self.x is None: return …`
             // narrows `self.x` to non-`None` for the rest of the block.
             if let Some(narrowed) = expression_attr_narrowing(c, expr) {
@@ -27910,6 +28114,42 @@ def describe(m: Maybe[int]) -> str:
         ] {
             assert!(!check(src).errors().is_empty(), "must be rejected: {src:?}");
         }
+    }
+
+    #[test]
+    fn typed_dict_closed_with_extra_items_is_rejected() {
+        // PEP 728: CPython 3.15 raises `TypeError: Cannot combine
+        // closed=True and extra_items` when the class is created.
+        let bad = check(
+            "from typing import TypedDict\nclass M(TypedDict, closed=True, extra_items=int):\n    name: str\n",
+        );
+        assert!(
+            bad.errors()
+                .iter()
+                .any(|e| e.to_string().contains("cannot combine `closed=True`")),
+            "{:?}",
+            bad.errors()
+        );
+        for ok in [
+            "from typing import TypedDict\nclass M(TypedDict, closed=True):\n    name: str\n",
+            "from typing import TypedDict\nclass M(TypedDict, closed=False, extra_items=int):\n    name: str\n",
+        ] {
+            let d = check(ok);
+            assert!(d.errors().is_empty(), "{ok:?}: {:?}", d.errors());
+        }
+    }
+
+    #[test]
+    fn a_pep_604_union_of_types_is_a_value() {
+        // `int | None` evaluated as a value is a `types.UnionType`; its
+        // `None` is a type, not a possibly-None operand.
+        let d = check(
+            "def f(x: object) -> None:\n    let t = int | None\n    let u: type = list[str] | None\n    print(t, u, isinstance(x, int | str | None))\n",
+        );
+        assert!(d.errors().is_empty(), "{:?}", d.errors());
+        // A value that is really possibly-None is still reported.
+        let d = check("def f(x: int?) -> None:\n    print(x | 1)\n");
+        assert!(!d.errors().is_empty());
     }
 
     #[test]
@@ -38891,6 +39131,271 @@ def main(dogs: list[Dog]) -> None:
             &consumer_prep.impl_distributed_lines,
             Some(external),
         )
+    }
+
+    /// A method / property signature for the followed-class fixtures.
+    fn foreign_sig(ret: Type, is_property: bool, deprecated: Option<&str>) -> MethodSig {
+        let arity_info = ArityInfo {
+            param_names: Vec::new(),
+            min_positional: 0,
+            required_positional: Vec::new(),
+            max_positional: Some(0),
+            posonly_count: 0,
+            kwonly_names: Vec::new(),
+            kwonly_required: Vec::new(),
+            has_kwarg: false,
+            vararg_type: None,
+            kwarg_type: None,
+            param_types: Vec::new(),
+            kwonly_types: Vec::new(),
+            return_type: ret.clone(),
+            is_async: false,
+            declared_sync: false,
+            deprecated: deprecated.map(str::to_owned),
+        };
+        MethodSig {
+            arity: 0,
+            return_type: ret,
+            is_property,
+            is_static: false,
+            is_classmethod: false,
+            arity_info,
+            param_types: Vec::new(),
+            is_async: false,
+        }
+    }
+
+    /// `from agentish import Agent`, where `Agent.run_sync()` returns the
+    /// followed class `agentish._run.RunResult` (as venv introspection
+    /// publishes it): `.usage` is a property returning `RunUsage`, whose
+    /// `__call__` is deprecated; `.plain` returns an instance of a class
+    /// with no `__call__`; `.old()` is a deprecated method.
+    fn followed_external() -> ExternalShapes {
+        let q = |n: &str| format!("agentish._run.{n}");
+        let mut agent = InterfaceShape {
+            partial: true,
+            ..InterfaceShape::default()
+        };
+        agent.methods.insert(
+            "run_sync".into(),
+            foreign_sig(Type::Class(q("RunResult")), false, None),
+        );
+        let mut result = InterfaceShape {
+            partial: true,
+            ..InterfaceShape::default()
+        };
+        result.methods.insert(
+            "usage".into(),
+            foreign_sig(Type::Class(q("RunUsage")), true, None),
+        );
+        result.methods.insert(
+            "plain".into(),
+            foreign_sig(Type::Class(q("Plain")), true, None),
+        );
+        result.methods.insert(
+            "old".into(),
+            foreign_sig(Type::Int, false, Some("use new()")),
+        );
+        result.methods.insert(
+            "legacy".into(),
+            foreign_sig(Type::Int, true, Some("read `.count`")),
+        );
+        let mut usage = InterfaceShape {
+            partial: true,
+            ..InterfaceShape::default()
+        };
+        usage.methods.insert(
+            "__call__".into(),
+            foreign_sig(
+                Type::Class(q("RunUsage")),
+                false,
+                Some("`usage` is a property"),
+            ),
+        );
+        usage
+            .methods
+            .insert("requests".into(), foreign_sig(Type::Int, true, None));
+        let plain = InterfaceShape {
+            partial: true,
+            instances_not_callable: true,
+            ..InterfaceShape::default()
+        };
+        let mut module = ModuleShapes::default();
+        module.class_shapes.insert("Agent".into(), agent.clone());
+        module.foreign_classes.insert(q("RunResult"), result);
+        module.foreign_classes.insert(q("RunUsage"), usage);
+        module.foreign_classes.insert(q("Plain"), plain);
+        let mut external = ExternalShapes::default();
+        external.class_shapes.insert("Agent".into(), agent);
+        let mut by_module = HashMap::new();
+        by_module.insert("agentish".to_owned(), module);
+        external.by_module = std::sync::Arc::new(by_module);
+        external
+    }
+
+    fn deprecations(d: &Diagnostics) -> Vec<String> {
+        d.warnings()
+            .iter()
+            .filter(|w| matches!(w, TycError::Deprecated { .. }))
+            .map(|w| w.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn calling_a_property_whose_value_has_a_deprecated_call_warns() {
+        let d = check_consumer(
+            "\
+from agentish import Agent
+def main(agent: Agent) -> None:
+    let result = agent.run_sync()
+    let u = result.usage()
+    print(u)
+    print(result.usage.requests)
+",
+            &followed_external(),
+        );
+        assert_eq!(
+            deprecations(&d),
+            vec!["`RunResult.usage()` is deprecated: `usage` is a property".to_owned()],
+            "errors: {:?}",
+            d.errors()
+        );
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn deprecated_followed_methods_and_properties_warn_once() {
+        let d = check_consumer(
+            "\
+from agentish import Agent
+def main(agent: Agent) -> None:
+    let result = agent.run_sync()
+    let n: int = result.old()
+    let m: int = result.legacy
+    print(n + m)
+",
+            &followed_external(),
+        );
+        assert_eq!(
+            deprecations(&d),
+            vec![
+                "`RunResult.old()` is deprecated: use new()".to_owned(),
+                "`RunResult.legacy` is deprecated: read `.count`".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn calling_a_followed_instance_without_call_is_not_callable() {
+        let d = check_consumer(
+            "\
+from agentish import Agent
+def main(agent: Agent) -> None:
+    let result = agent.run_sync()
+    print(result.plain())
+    let p = result.plain
+    p()
+",
+            &followed_external(),
+        );
+        let n = d
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::NotCallable { .. }))
+            .count();
+        assert_eq!(n, 2, "{:?}", d.errors());
+    }
+
+    #[test]
+    fn followed_classes_never_fail_assignability() {
+        // The checker knows a followed class only by its qualified name; the
+        // program may spell the same class through a re-export, a subclass
+        // or a Protocol. Flows into and out of it stay permissive.
+        let d = check_consumer(
+            "\
+from agentish import Agent
+class Mine:
+    x: int
+def takes(m: Mine) -> None:
+    print(m.x)
+def main(agent: Agent) -> None:
+    let result = agent.run_sync()
+    takes(result)
+    let xs: list[Mine] = [result]
+    let o: object = result
+    let r: Mine? = result if o is not None else None
+    print(xs, r)
+",
+            &followed_external(),
+        );
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn source_deprecated_decorator_warns_on_use() {
+        let d = check(
+            "\
+from warnings import deprecated
+import warnings
+
+@deprecated(\"use add() instead\")
+def plus(a: int, b: int) -> int:
+    return a + b
+
+@warnings.deprecated(\"use Point\")
+class OldPoint:
+    x: int
+
+class Shape:
+    @deprecated(\"use area()\")
+    def size(self) -> int:
+        return 1
+
+    @property
+    @deprecated(\"use area()\")
+    def legacy(self) -> int:
+        return 1
+
+def main() -> None:
+    print(plus(1, 2))
+    print(OldPoint(x=1))
+    let s = Shape()
+    print(s.size())
+    print(s.legacy)
+",
+        );
+        let got = deprecations(&d);
+        assert_eq!(
+            got,
+            vec![
+                "`plus()` is deprecated: use add() instead".to_owned(),
+                "`OldPoint()` is deprecated: use Point".to_owned(),
+                "`Shape.size()` is deprecated: use area()".to_owned(),
+                "`Shape.legacy` is deprecated: use area()".to_owned(),
+            ],
+            "errors: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn deprecated_needs_the_pep_702_call_form() {
+        // A bare `@deprecated` (no message) is not PEP 702 and is not read;
+        // an `unsafe:` block silences the warning like any other.
+        let d = check(
+            "\
+from warnings import deprecated
+
+@deprecated(\"gone\")
+def old() -> int:
+    return 1
+
+def main() -> None:
+    unsafe:
+        print(old())
+",
+        );
+        assert!(deprecations(&d).is_empty(), "{:?}", deprecations(&d));
     }
 
     #[test]
