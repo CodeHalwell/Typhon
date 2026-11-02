@@ -11,7 +11,7 @@ publish = false
 ruff_source_file = { workspace = true }
 ruff_text_size = { workspace = true }
 
-itertools = "0.14.0"
+itertools = "0.15.0"
 unicode-ident = "1.0.12"
 
 [lints.clippy]
