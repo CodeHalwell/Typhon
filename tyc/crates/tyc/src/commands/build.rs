@@ -229,15 +229,15 @@ pub fn run(args: BuildArgs) -> Result<()> {
         if invocation_path == canon_root || invocation_path.starts_with(&canon_src) {
             None
         } else {
-            // A single file (`tests/pkg/test_app.ty`) belongs to the unit
-            // its top-level directory names (`tests/`), so it keeps the
-            // package context it has when that whole directory is built.
-            invocation_path.strip_prefix(&canon_root).ok().map(|rel| {
-                match (&single_file, rel.components().next()) {
-                    (Some(_), Some(first)) => PathBuf::from(first.as_os_str()),
-                    _ => rel.to_path_buf(),
-                }
-            })
+            // A file or subdirectory (`tests/pkg/test_app.ty`, `tests/pkg/`)
+            // belongs to the unit its top-level directory names (`tests/`),
+            // so it keeps the package context it has when that whole
+            // directory is built; emission is then limited to the selection.
+            invocation_path
+                .strip_prefix(&canon_root)
+                .ok()
+                .and_then(|rel| rel.components().next())
+                .map(|first| PathBuf::from(first.as_os_str()))
         }
     };
     if let Some(rel) = &unit_rel {
@@ -342,11 +342,22 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // facade re-exports them, imports resolve against them. Only emission
     // is restricted to the selected file (`is_selected` below).
     let ty_files = collect_ty_files(&src_dir)?;
-    let is_selected = |p: &Path| match &single_file {
-        Some(file) => p.canonicalize().is_ok_and(|c| &c == file),
+    // What this build emits: one file, a subdirectory of a separate unit,
+    // or (None) the whole unit. Anything narrower is a partial build.
+    let selection: Option<PathBuf> = match &single_file {
+        Some(file) => Some(file.clone()),
+        None => src_dir
+            .canonicalize()
+            .ok()
+            .filter(|unit| unit_rel.is_some() && *unit != invocation_path)
+            .map(|_| invocation_path.clone()),
+    };
+    let partial = selection.is_some();
+    let is_selected = |p: &Path| match &selection {
+        Some(sel) => p.canonicalize().is_ok_and(|c| c.starts_with(sel)),
         None => true,
     };
-    if single_file.is_some() && !ty_files.iter().any(|p| is_selected(p)) {
+    if partial && !ty_files.iter().any(|p| is_selected(p)) {
         return Err(miette!(
             "'{}' is not a source file of this build",
             args.path.display()
@@ -365,7 +376,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // are now stale like any other.
         // Hand-written `.py` / `.pyi` files still in the unit keep their
         // copied outputs: only what came from `.ty` sources is gone.
-        if !args.check && single_file.is_none() && out_dir.is_dir() {
+        if !args.check && !partial && out_dir.is_dir() {
             let mut live: Vec<PathBuf> = Vec::new();
             for ext in ["py", "pyi"] {
                 for file in crate::commands::util::walk_files(&src_dir, ext).unwrap_or_default() {
@@ -467,7 +478,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // environment bootstrap writes `pyproject.toml` and (without `--no-sync`)
     // runs `uv sync`, creating `.venv` and `uv.lock` — so it is skipped in
     // check mode and reported like every other write.
-    if unit_rel.is_some() || single_file.is_some() {
+    if unit_rel.is_some() || partial {
         // The manifest describes the whole project, and its dependencies
         // (pydantic for `model`, say) are derived from all of `src/`. A
         // partial build — another directory, or one file even inside
@@ -1951,12 +1962,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
 
     // Stale outputs: anything a previous build wrote that this one did not.
     if !check_mode {
-        remove_stale_outputs(
-            &out_dir,
-            &written_outputs,
-            &project_root,
-            single_file.is_some(),
-        );
+        remove_stale_outputs(&out_dir, &written_outputs, &project_root, partial);
     }
 
     // `tyc build` compiles the source tree; say so when tests sit beside it
@@ -6923,6 +6929,10 @@ let pet: Animal = Dog(name=\"Rex\")
             .unwrap()
             .contains("from .helper import f"));
         run(build_args(&pkg.join("test_app.ty"))).unwrap();
+        let text = std::fs::read_to_string(&emitted).unwrap();
+        assert!(text.contains("from .helper import f"), "{text}");
+        // So does the package directory on its own.
+        run(build_args(&pkg)).unwrap();
         let text = std::fs::read_to_string(&emitted).unwrap();
         assert!(text.contains("from .helper import f"), "{text}");
     }

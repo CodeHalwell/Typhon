@@ -343,7 +343,20 @@ fn installed_dists(site: &Path) -> Vec<InstalledDist> {
             if let Ok(inner) = std::fs::read_dir(&target) {
                 for e in inner.flatten() {
                     let p = e.path();
-                    if p.extension().is_some_and(|x| x == "egg-info") {
+                    // Only the linked distribution's own metadata: a
+                    // checkout can hold sibling `*.egg-info` directories
+                    // for packages the project never declared.
+                    let own = p
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .and_then(|n| n.strip_suffix(".egg-info"))
+                        .map(|n| {
+                            n.match_indices('-')
+                                .find(|(i, _)| n[i + 1..].starts_with(|c: char| c.is_ascii_digit()))
+                                .map_or(n, |(i, _)| &n[..i])
+                        })
+                        .is_some_and(|n| pep503_normalise(n) == pep503_normalise(stem));
+                    if own {
                         out.push(InstalledDist {
                             name: pep503_normalise(stem),
                             meta_dir: p,
@@ -847,5 +860,29 @@ mod tests {
         assert!(modules_in_dir(tmp.path()).is_empty());
         write(&pkg.join("core").join("mod.py"), "");
         assert_eq!(modules_in_dir(tmp.path()), vec!["loopy".to_owned()]);
+    }
+
+    #[test]
+    fn egg_link_uses_only_the_linked_distributions_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let site = venv(tmp.path());
+        let checkout = tmp.path().join("checkout");
+        write(
+            &checkout.join("declared.egg-info").join("top_level.txt"),
+            "declared\n",
+        );
+        write(
+            &checkout.join("undeclared.egg-info").join("top_level.txt"),
+            "undeclared\n",
+        );
+        write(&checkout.join("declared").join("__init__.py"), "");
+        write(&checkout.join("undeclared").join("__init__.py"), "");
+        write(
+            &site.join("declared.egg-link"),
+            &format!("{}\n.\n", checkout.display()),
+        );
+        let roots = resolve_import_roots(tmp.path(), ["declared"]);
+        assert!(roots.contains(&"declared".to_owned()), "{roots:?}");
+        assert!(!roots.contains(&"undeclared".to_owned()), "{roots:?}");
     }
 }
