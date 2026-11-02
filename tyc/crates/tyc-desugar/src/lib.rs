@@ -1535,8 +1535,9 @@ fn dunder_all_order(a: &str, b: &str) -> std::cmp::Ordering {
     group(a).cmp(&group(b)).then_with(|| natural_order(a, b))
 }
 
-/// Natural string order: runs of ASCII digits compare by numeric value,
-/// everything else by character.
+/// Natural string order, matching ruff's `natord`: runs of ASCII digits
+/// compare by numeric value (or digit by digit when either has a leading
+/// zero), everything else by character.
 fn natural_order(a: &str, b: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let (a, b) = (a.as_bytes(), b.as_bytes());
@@ -1551,13 +1552,15 @@ fn natural_order(a: &str, b: &str) -> std::cmp::Ordering {
             while j < b.len() && b[j].is_ascii_digit() {
                 j += 1;
             }
-            let na = std::str::from_utf8(&a[si..i])
-                .unwrap_or("")
-                .trim_start_matches('0');
-            let nb = std::str::from_utf8(&b[sj..j])
-                .unwrap_or("")
-                .trim_start_matches('0');
-            let ord = na.len().cmp(&nb.len()).then_with(|| na.cmp(nb));
+            let (ra, rb) = (&a[si..i], &b[sj..j]);
+            // Like ruff's `natord`: a run with a leading zero compares
+            // digit by digit (a shorter run first on a tie), otherwise
+            // the longer run is the bigger number.
+            let ord = if ra[0] == b'0' || rb[0] == b'0' {
+                ra.cmp(rb)
+            } else {
+                ra.len().cmp(&rb.len()).then_with(|| ra.cmp(rb))
+            };
             if ord != Ordering::Equal {
                 return ord;
             }
@@ -5331,6 +5334,20 @@ fn insert_self_param(stmt: &Stmt) -> Stmt {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dunder_all_orders_leading_zero_runs_like_ruff() {
+        // Checked against `ruff check --select RUF022`: a digit run with a
+        // leading zero compares digit by digit.
+        let mut names = vec![
+            "item1a", "a9", "a1", "a10", "a01a", "item01b", "a09", "a010",
+        ];
+        names.sort_by(|a, b| super::dunder_all_order(a, b));
+        assert_eq!(
+            names,
+            vec!["a01a", "a010", "a09", "a1", "a9", "a10", "item01b", "item1a"]
+        );
+    }
+
     #[test]
     fn dunder_all_is_in_ruff_isort_order() {
         // `ruff check --select RUF022` accepts exactly this order.
