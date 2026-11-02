@@ -372,6 +372,20 @@ pub fn run(args: BuildArgs) -> Result<()> {
                     }
                 }
             }
+            // `.dty` declarations keep their emitted `.pyi` stubs.
+            for file in collect_dty_files(&src_dir).unwrap_or_default() {
+                if let Ok(rel) = file.strip_prefix(&src_dir) {
+                    live.push(out_dir.join(rel).with_extension("pyi"));
+                }
+            }
+            // Python tests that remain still need the generated conftest
+            // to import the project's compiled modules.
+            if live
+                .iter()
+                .any(|p| p.extension().is_some_and(|e| e == "py"))
+            {
+                live.push(out_dir.join("conftest.py"));
+            }
             remove_stale_outputs(&out_dir, &live, &project_root, false);
         }
         return Ok(());
@@ -6821,6 +6835,10 @@ let pet: Animal = Dog(name=\"Rex\")
         assert!(!out.join("tests").join("test_calc.py").exists());
         assert!(!out.join("tests").join("test_other.py").exists());
         assert!(out.join("tests").join("test_live.py").is_file());
+        assert!(
+            out.join("tests").join("conftest.py").is_file(),
+            "the remaining Python tests still need the conftest"
+        );
     }
 
     /// Outputs an earlier build wrote that this one does not are removed:
@@ -6848,6 +6866,21 @@ let pet: Animal = Dog(name=\"Rex\")
         assert!(!out.join(".sourcemaps").join("old.py.map").exists());
         assert!(out.join("main.py").is_file());
         assert!(out.join("README.txt").is_file());
+    }
+
+    /// A unit that loses its last `.ty` keeps the `.pyi` stubs of the
+    /// `.dty` declarations still in it.
+    #[test]
+    fn empty_unit_keeps_declaration_stubs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, out) = scaffold(tmp.path(), "let x: int = 1\n");
+        std::fs::write(src.join("external.dty"), "def ping() -> int: ...\n").unwrap();
+        run(build_args(tmp.path())).unwrap();
+        assert!(out.join("external.pyi").is_file());
+        std::fs::remove_file(src.join("main.ty")).unwrap();
+        run(build_args(tmp.path())).unwrap();
+        assert!(!out.join("main.py").exists(), "stale output removed");
+        assert!(out.join("external.pyi").is_file(), "live stub kept");
     }
 
     /// A single-file build leaves its siblings' outputs (and the
