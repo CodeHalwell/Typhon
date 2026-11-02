@@ -4,6 +4,65 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 1.0.0-beta.5 — 2026-11-02 — agent-feedback fixes
+
+Fixes from a coding agent's session building a pydantic-ai tool with
+Typhon. No language change; the only new error is `tyc build <path>` on a
+path inside the build output, which previously rebuilt `src/` silently.
+
+### Fixed
+
+- **Third-party calls were unchecked when `tyc check` ran from the project
+  root.** The venv interpreter was found as `./.venv/bin/python` and then
+  spawned from a private scratch directory, so it failed to start and every
+  declared dependency was reported as un-introspectable. Interpreter paths
+  are now absolute; pydantic-ai, for one, is introspected and wrong
+  arguments to `Agent(...)` / `run_sync(...)` are reported.
+- **Distribution → import name mapping is general.** A shared resolver
+  (`tyc_venv::dists`) used by `tyc check`, `tyc build` and the LSP handles
+  extras and markers in dependency keys (`pydantic-ai-slim[anthropic]`),
+  `RECORD` / `top_level.txt` / egg-info manifests, C-extension modules,
+  PEP 420 namespace packages, stub-only distributions (`types-x`,
+  `x-stubs`), editable installs (`.pth` paths and setuptools finder
+  modules) and legacy `.egg-link`s. The venv is found at `.venv`,
+  `$UV_PROJECT_ENVIRONMENT`, an ancestor workspace `.venv`, or
+  `$VIRTUAL_ENV`. A distribution that is not installed falls back to a
+  table of well-known mismatches (`beautifulsoup4` → `bs4`, `pillow` →
+  `PIL`, …) and variant suffixes (`-slim`, `-core`, `-binary`, …).
+  Introspection also reads `__all__`, so lazy PEP 562 `__getattr__`
+  facades are seen.
+- **`tyc build tests/` rebuilt `src/` instead.** A directory (or single
+  `.ty` file) inside the project other than the source tree now builds as
+  its own unit, type-checked against the project's modules, into
+  `<out>/<path>` with a generated `conftest.py` that puts the build output
+  on `sys.path`. `tyc build` notes when `tests/` holds un-built `.ty` files.
+- **`pyproject.toml` changed silently, and `--no-sync` left `uv.lock`
+  stale.** The build prints what it added or removed, and with `--no-sync`
+  refreshes an existing `uv.lock` with `uv lock`. `pub model` now counts as
+  a model, so `pydantic` is no longer dropped once models are exported.
+- **`build/` kept stale files.** Each output directory records what the
+  build wrote (`.tyc-build-manifest`); files an earlier build wrote that
+  this one did not are removed, including a no-longer-needed
+  `typhon_runtime/`.
+- **Generated code failed `ruff check`.** Imports are sorted with the
+  project's own ruff settings, `__all__` goes after the import block, only
+  the `Ok` / `Err` / `Result` names a module uses are imported, a sole
+  generator argument is not double-parenthesised (`sum(x for x in xs)`), and
+  the generated runtime is lint-clean (duplicate `_LazyValue` dunders,
+  import placement).
+
+### Changed
+
+- **`pub` on a method or field now explains itself.** `pub` stays
+  module-level only, since it works by adding the name to `__all__` and
+  class members are always public in Python. Writing it on an indented
+  declaration (a method or field in `class`, `model` or `impl`, a nested
+  `def`, or a binding under a module-level `if`) is still a parse error,
+  but the error now says why and points at the leading-underscore
+  convention for internal helpers. `tyc explain pub` covers the same
+  ground, including why an underscore is a bad idea on `model` fields and
+  pydantic-ai tool functions.
+
 ## 1.0.0-beta.4 — 2026-10-21 — making more of Python 3.15
 
 Python 3.15.0 shipped on 9 October. This release makes 3.15 the starting

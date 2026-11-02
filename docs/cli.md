@@ -65,11 +65,46 @@ Python environment for the project:
    itself returns non-zero, the failure is downgraded to a warning so
    the `.py` artefacts still land — the codegen output is useful
    regardless of whether the install step resolved.
+   `tyc build` prints what the merge added to or removed from the
+   dependency lists. `typhon.toml` owns them, so a package added with
+   `uv add` rather than `tyc add` is dropped — the note says so. A
+   `model` declaration (`pub model` included) adds `pydantic`.
+   With `--no-sync` and an existing `uv.lock`, a changed manifest is
+   relocked with `uv lock` (resolution only, nothing is installed) so a
+   later `uv sync --locked` does not fail on a stale lockfile.
 3. **`.py` files in `src/` are copied verbatim** to the output dir
    (skipping `__pycache__/`, `tests/`, `.venv/`, and dotfiles), so a
    hand-written Python helper next to your `.ty` source is importable
    from the emitted code. A relative `.py` import that resolves outside
    `src/` fires `tyc::orphan_py_import`.
+
+4. **Stale outputs are removed.** Each output directory keeps a
+   `.tyc-build-manifest` of the files the build wrote; a file an earlier
+   build wrote that this one did not (a renamed or deleted module, a
+   `typhon_runtime/` the code no longer needs) is deleted. For a build
+   directory from before the manifest existed, compiled modules with a
+   leftover `.sourcemaps/` sidecar and the generated `typhon_runtime/`
+   are recognised the same way. Files `tyc` did not write are never
+   touched.
+5. **Emitted Python passes `ruff check`.** With `[emit] format = true`
+   and `ruff` on `PATH`, the import block is sorted with `ruff check
+   --fix --select I` using the project's own ruff settings, after
+   `ruff format`. The compiler also places `__all__` after the imports,
+   imports only the `Ok` / `Err` / `Result` names a module uses, and
+   keeps the generated `typhon_runtime/` lint-clean.
+
+**Building tests and other directories.** `tyc build` compiles the source
+tree (`[project] src`). Pass a directory inside the project to compile that
+instead — typically `tyc build tests/` — or a single file
+(`tyc build tests/test_calc.ty`). The unit is type-checked against the
+project's modules (so `from calc import add` with the wrong arguments fails
+the build) and written to `<out>/<path>` (`build/tests/`), or to `--out`.
+A generated `conftest.py` puts the project's build output on `sys.path`, so
+`pytest build/tests` imports the compiled modules; a `conftest.ty` /
+`conftest.py` of your own replaces it. A partial build leaves
+`pyproject.toml` and the project's own output alone. A path inside `src/`
+builds the whole project, as before; a path inside the build output is an
+error.
 
 The intent is that `tyc build` followed by `python build/main.py` works
 out of the box on a freshly cloned project, no separate `tyc sync`
@@ -86,7 +121,7 @@ module instead; see the multi-file note under `tyc run` below.
 | `--out DIR` / `-o` | Override the `[project] out` directory. Relative paths resolve against the project root. |
 | `--no-format` | Skip the `ruff format` post-process. |
 | `--check` | Dry-run: list every file that *would* be created or overwritten without touching disk. The full pipeline still runs, so type errors continue to surface. |
-| `--no-sync` | Skip the `uv sync` step; `pyproject.toml` is still merged so the next regular build picks the manifest up. Also honoured via `TYC_NO_SYNC=1`. |
+| `--no-sync` | Skip the `uv sync` step; `pyproject.toml` is still merged so the next regular build picks the manifest up, and an existing `uv.lock` is refreshed with `uv lock` when the dependency list changed. Also honoured via `TYC_NO_SYNC=1`. |
 | `--optimise` / `-O` (alias `--optimize`) | Apply `[optimise] level = 1` for this invocation — flip the default of `auto-memoise`, `auto-gather`, `auto-parallel`, and `pgo-memoise` to on. Overrides a config `level = 0`, but an explicit `[strictness]` entry for any of those knobs still wins (so `-O` never silently re-enables a knob you set to `false` by hand). See [`[optimise]`](configuration.md#optimise). |
 | `--with-ty` (v0.12.0) | After a successful emit, run Astral's `ty` over the emitted Python (typeshed-backed second-stage check) and re-attribute its diagnostics to the `.ty` source. `ty` errors fail the build. Equivalent to setting `[checker] external = "ty"` for one invocation; requires `ty` on `PATH`. |
 

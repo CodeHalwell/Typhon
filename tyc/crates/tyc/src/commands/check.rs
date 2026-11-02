@@ -305,36 +305,32 @@ fn check_scope(args: &CheckArgs, scope: &CheckScope) -> Result<ScopeOutcome> {
     // not be penalised for importing third-party packages that happen not to
     // be listed anywhere.
     let project_modules = collect_project_modules(scope, &config.project.src);
+    // Declared dependency names (extras / markers stripped), plus the
+    // top-level modules each declared distribution really provides.
+    //
+    // The shared resolver (`tyc_venv::resolve_import_roots`) reads installed
+    // metadata — `top_level.txt`, `RECORD`, egg-info manifests, editable
+    // `.pth` paths and finder modules, stub-only `-stubs` packages, PEP 420
+    // namespace packages — from the project's venv, and falls back to a
+    // table of well-known mismatches when a distribution is not installed.
+    // So `pydantic-ai-slim` → `pydantic_ai`, `beautifulsoup4` → `bs4`,
+    // `google-cloud-storage` → `google` all resolve, while an *undeclared*
+    // package that happens to be in a local venv still does not quietly pass
+    // `tyc check`: reproducibility wins over convenience.
     let mut extra_modules: Vec<String> = config
         .dependencies
         .keys()
         .chain(config.dev_dependencies.keys())
-        .cloned()
+        .map(|k| tyc_venv::dependency_name(k).to_owned())
         .collect();
-    // Venv-aware fallback: read top-level import names from each
-    // installed distribution's `.dist-info/top_level.txt` (and `RECORD`
-    // as a backup) and add ONLY the top-level packages that belong to a
-    // distribution declared in `[dependencies]` / `[dev-dependencies]`.
-    //
-    // This catches the dist/import mismatch case where hyphen->underscore
-    // normalisation isn't enough — e.g. the PyPI dist
-    // `agent-framework-core` exposes the top-level Python module
-    // `agent_framework`, `beautifulsoup4` exposes `bs4` — without
-    // letting any *undeclared* locally-installed package quietly pass
-    // `tyc check`. Reproducibility wins: if a colleague clones the
-    // repo, `tyc check` reports the same set of unknown_module
-    // diagnostics regardless of what extra packages happen to be in
-    // their venv.
     if has_project_config {
-        let declared: std::collections::HashSet<String> = config
-            .dependencies
-            .keys()
-            .chain(config.dev_dependencies.keys())
-            .map(|k| tyc_venv::pep503_normalise(k))
-            .collect();
-        extra_modules.extend(tyc_venv::top_level_imports_from_venv(
+        extra_modules.extend(tyc_venv::resolve_import_roots(
             &project_root,
-            &declared,
+            config
+                .dependencies
+                .keys()
+                .chain(config.dev_dependencies.keys())
+                .map(String::as_str),
         ));
     }
     extra_modules.sort();

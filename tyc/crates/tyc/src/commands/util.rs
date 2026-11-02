@@ -111,6 +111,17 @@ pub fn collect_dty_files(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(acc)
 }
 
+/// Every file with extension `ext` under `root`, by the same symlink-safe
+/// walk, with no directory filtering. `Ok(vec![])` when `root` is missing.
+pub fn walk_files(root: &Path, ext: &str) -> Result<Vec<PathBuf>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut acc = Vec::new();
+    walk_into(root, ext, DirFilter::None, false, &mut acc)?;
+    Ok(acc)
+}
+
 /// Recursively collect all `.py` files under `root` in sorted order.
 ///
 /// Mirrors [`collect_ty_files`] but matches the `.py` extension. Skips

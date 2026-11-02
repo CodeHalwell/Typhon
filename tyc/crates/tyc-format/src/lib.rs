@@ -1470,6 +1470,39 @@ fn run_ruff_format(ruff: &std::path::Path, source: &str, path: &str) -> Result<S
     String::from_utf8(output.stdout).map_err(|e| format!("utf-8: {e}"))
 }
 
+/// Sort the import blocks of generated Python with `ruff check --fix
+/// --select I` (ruff's isort), so emitted modules — whose imports mix
+/// compiler-injected lines with the user's own — pass a `ruff check` that
+/// enables import sorting. `path` is where the file will be written: ruff
+/// resolves the project's own `[tool.ruff]` settings (first-party modules,
+/// section order) from it, so the result agrees with the user's own lint
+/// run. `None` when ruff is unavailable or fails; the caller keeps the
+/// input unchanged.
+pub fn sort_imports(source: &str, path: &str) -> Option<String> {
+    let ruff = ruff_path()?;
+    let mut child = Command::new(ruff)
+        .args(["check", "--fix", "--select", "I", "--exit-zero", "--quiet"])
+        .arg("--stdin-filename")
+        .arg(path)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.as_mut()?.write_all(source.as_bytes()).ok()?;
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    // Never hand back an empty buffer for a non-empty module.
+    if text.trim().is_empty() && !source.trim().is_empty() {
+        return None;
+    }
+    Some(text)
+}
+
 /// Format the `.ty` file at `path` in place.
 ///
 /// Returns `true` if the file was changed.

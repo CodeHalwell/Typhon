@@ -61,6 +61,7 @@ pub class Foo frozen: ...
 pub class! Foo: ...
 pub plain class Foo: ...
 pub model Foo: ...
+pub enum Foo: ...
 pub interface Foo: ...
 pub newtype Foo = int
 pub type Foo = int | str
@@ -68,9 +69,24 @@ pub let X: int = 1
 pub mut Y: int = 0
 ```
 
-It is **not** valid inside a function body or class body —
-encapsulation of fields, locals, and inner classes is a separate
-concern and out of scope for the current MVP.
+It is **not** valid on an indented declaration: a method or field in a
+`class`, `model` or `impl` body, a nested `def`, or a binding under a
+module-level `if` / `try`. `pub` works by listing the name in the
+module's `__all__`, and only module-level names can go there. Methods
+and fields need no marker, because Python has no class-level `__all__`:
+every member is reachable as `obj.name` from any module, with or
+without `pub`. Writing `pub` there is a parse error, and its help text
+says so.
+
+To mark a method as internal, use the Python convention of a leading
+underscore (`def _resolve(self, path: str) -> Path:`). Avoid it on
+`model` fields: pydantic treats an underscored name as a private
+attribute rather than a field, so it drops out of validation and
+`model_dump()`. It also changes the function's `__name__`, which is the
+name pydantic-ai shows the model for a function registered as a tool.
+
+`pub` never touches a declaration's body, so docstrings, decorators and
+the emitted name are the same with or without it.
 
 ## Hand-written `__all__` wins
 
