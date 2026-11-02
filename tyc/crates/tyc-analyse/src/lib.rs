@@ -348,6 +348,9 @@ fn newer_typed_dict_keywords(
         /// module; each `def` and `lambda` opens one). A binding shadows
         /// either import only inside its own scope and the scopes it encloses.
         scopes: Vec<HashSet<String>>,
+        /// Which of `scopes` are class bodies. A class body's names are seen
+        /// by the class body itself, never by the functions nested in it.
+        class_scope: Vec<bool>,
         /// The scopes enclosing the current node, innermost last.
         stack: Vec<usize>,
         /// `(callee/base, keyword, range, enclosing scopes)` candidates.
@@ -381,9 +384,42 @@ fn newer_typed_dict_keywords(
             let top = self.stack.last().copied().unwrap_or(0);
             self.scopes[top].insert(name);
         }
-        fn open_scope(&mut self) {
+        fn open_scope(&mut self, class: bool) {
             self.scopes.push(HashSet::new());
+            self.class_scope.push(class);
             self.stack.push(self.scopes.len() - 1);
+        }
+        /// The scopes a bare name read here resolves through: every
+        /// enclosing scope except a class body that is not the innermost.
+        fn visible(&self) -> Vec<usize> {
+            let top = self.stack.last().copied();
+            self.stack
+                .iter()
+                .copied()
+                .filter(|&i| !self.class_scope[i] || Some(i) == top)
+                .collect()
+        }
+        /// A function's or lambda's defaults and annotations, which Python
+        /// evaluates in the enclosing scope.
+        fn visit_outer_parameter_parts(&mut self, params: &ruff_python_ast::Parameters) {
+            for p in params
+                .posonlyargs
+                .iter()
+                .chain(&params.args)
+                .chain(&params.kwonlyargs)
+            {
+                if let Some(default) = &p.default {
+                    self.visit_expr(default);
+                }
+                if let Some(ann) = &p.parameter.annotation {
+                    self.visit_expr(ann);
+                }
+            }
+            for p in params.vararg.iter().chain(&params.kwarg) {
+                if let Some(ann) = &p.annotation {
+                    self.visit_expr(ann);
+                }
+            }
         }
         fn candidates(&mut self, head: &Expr, keywords: &[ruff_python_ast::Keyword]) {
             if self.guarded > 0 {
@@ -395,7 +431,7 @@ fn newer_typed_dict_keywords(
                         head.clone(),
                         arg.as_str().to_owned(),
                         kw.range,
-                        self.stack.clone(),
+                        self.visible(),
                     ));
                 }
             }
@@ -451,28 +487,47 @@ fn newer_typed_dict_keywords(
                 }
                 Stmt::ClassDef(c) => {
                     self.bind(c.name.to_string());
+                    // Decorators, bases and keywords are read in the
+                    // enclosing scope; the body's bindings (`TypedDict: int
+                    // = 1`) are class attributes and shadow nothing outside
+                    // the class body, not even in its methods.
+                    for d in &c.decorator_list {
+                        self.visit_expr(&d.expression);
+                    }
                     if let Some(args) = c.arguments.as_deref() {
                         for base in args.args.iter() {
                             self.candidates(base, &args.keywords);
                         }
+                        for e in args.args.iter() {
+                            self.visit_expr(e);
+                        }
+                        for kw in args.keywords.iter() {
+                            self.visit_expr(&kw.value);
+                        }
                     }
-                    // The bases above are read in the enclosing scope; the
-                    // body's bindings (`TypedDict: int = 1`) are class
-                    // attributes and shadow nothing outside it.
-                    self.open_scope();
-                    walk_stmt(self, stmt);
+                    self.open_scope(true);
+                    self.visit_body(&c.body);
                     self.stack.pop();
                     return;
                 }
                 Stmt::FunctionDef(f) => {
                     self.bind(f.name.to_string());
-                    // The body, parameters included, is its own scope:
-                    // `def f(TypedDict: Any)` shadows the import only there.
-                    self.open_scope();
+                    // Decorators, defaults and annotations are evaluated in
+                    // the enclosing scope. The body, parameters included, is
+                    // its own: `def f(TypedDict: Any)` shadows the import
+                    // only there.
+                    for d in &f.decorator_list {
+                        self.visit_expr(&d.expression);
+                    }
+                    self.visit_outer_parameter_parts(&f.parameters);
+                    if let Some(ret) = &f.returns {
+                        self.visit_expr(ret);
+                    }
+                    self.open_scope(false);
                     for p in f.parameters.iter() {
                         self.bind(p.name().to_string());
                     }
-                    walk_stmt(self, stmt);
+                    self.visit_body(&f.body);
                     self.stack.pop();
                     return;
                 }
@@ -495,11 +550,14 @@ fn newer_typed_dict_keywords(
                     self.bind(n.id.to_string());
                 }
                 Expr::Lambda(l) => {
-                    self.open_scope();
+                    if let Some(params) = l.parameters.as_deref() {
+                        self.visit_outer_parameter_parts(params);
+                    }
+                    self.open_scope(false);
                     for p in l.parameters.iter().flat_map(|ps| ps.iter()) {
                         self.bind(p.name().to_string());
                     }
-                    walk_expr(self, expr);
+                    self.visit_expr(&l.body);
                     self.stack.pop();
                     return;
                 }
@@ -510,6 +568,7 @@ fn newer_typed_dict_keywords(
     }
     let mut v = V {
         scopes: vec![HashSet::new()],
+        class_scope: vec![false],
         stack: vec![0],
         ..V::default()
     };
@@ -8649,6 +8708,10 @@ mod lint_tests {
             "from typing import TypedDict\nM = TypedDict(\"M\", {\"name\": str}, closed=True)\n",
             "from typing import TypeForm\nlet t: TypeForm[int] = int\n",
             "import typing\nprint(typing.disjoint_base)\n",
+            // A class attribute is not visible from the class's methods.
+            "from typing import TypedDict\nclass Helper:\n    TypedDict: int = 1\n    def build(self) -> object:\n        return TypedDict(\"M\", {}, closed=True)\n",
+            // Defaults are evaluated in the enclosing scope.
+            "from typing import TypedDict\ndef build(TypedDict=TypedDict(\"M\", {}, closed=True)) -> None:\n    pass\n",
             // A parameter elsewhere does not shadow the module-level import.
             "from typing import TypedDict\nclass Helper:\n    TypedDict: int = 1\nclass M(TypedDict, closed=True):\n    name: str\n",
             "from typing import TypedDict, Any\ndef helper(TypedDict: Any) -> None:\n    pass\nclass M(TypedDict, closed=True):\n    name: str\n",
