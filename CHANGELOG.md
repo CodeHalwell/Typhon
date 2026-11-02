@@ -4,7 +4,7 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## Unreleased (1.0.0-beta.6)
+## 1.0.0-beta.6 — 2026-11-02 — following third-party return types
 
 Third-party checking now reaches past the first call. The pydantic-ai bug
 from the beta.5 feedback session, `result.usage()` where `usage` had become

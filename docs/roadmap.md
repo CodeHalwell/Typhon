@@ -10,6 +10,13 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Current release
 
+**[v1.0.0-beta.6](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-beta.6) — 2026-11-02.**
+Third-party checking reaches past the first call: venv introspection follows
+return types into their classes, so a property used as a method
+(`result.usage()`) or a wrong-arity call on a returned object is caught at
+check time. New `tyc::deprecated` warning for PEP 702 `@deprecated` APIs, and
+the Python 3.15 typing additions (PEP 728, 747, 800) are gated on the target.
+
 **[v1.0.0-beta.5](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-beta.5) — 2026-11-02.**
 Fixes from a coding agent's real-world session. Third-party dependencies are
 introspected again when `tyc check` runs from the project root, through a
