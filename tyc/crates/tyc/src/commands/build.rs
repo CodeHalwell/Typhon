@@ -419,10 +419,11 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // environment bootstrap writes `pyproject.toml` and (without `--no-sync`)
     // runs `uv sync`, creating `.venv` and `uv.lock` — so it is skipped in
     // check mode and reported like every other write.
-    if unit_rel.is_some() {
+    if unit_rel.is_some() || single_file.is_some() {
         // The manifest describes the whole project, and its dependencies
-        // (pydantic for `model`, say) are derived from `src/`. A partial
-        // build must not rewrite it from a partial view.
+        // (pydantic for `model`, say) are derived from all of `src/`. A
+        // partial build — another directory, or one file even inside
+        // `src/` — must not rewrite it from a partial view.
     } else if args.check {
         eprintln!(
             "would update {}",
@@ -1887,7 +1888,12 @@ pub fn run(args: BuildArgs) -> Result<()> {
 
     // Stale outputs: anything a previous build wrote that this one did not.
     if !check_mode {
-        remove_stale_outputs(&out_dir, &written_outputs, &project_root);
+        remove_stale_outputs(
+            &out_dir,
+            &written_outputs,
+            &project_root,
+            single_file.is_some(),
+        );
     }
 
     // `tyc build` compiles the source tree; say so when tests sit beside it
@@ -3031,13 +3037,17 @@ const BUILD_MANIFEST: &str = ".tyc-build-manifest";
 /// existed — compiled modules whose `.sourcemaps/<rel>.py.map` sidecar
 /// remains, and the generated `typhon_runtime/` package. Symlinks are never
 /// followed or removed; failures are warnings, never a failed build.
-fn remove_stale_outputs(out_dir: &Path, written: &[PathBuf], project_root: &Path) {
+///
+/// `partial` marks a single-file build: it says nothing about the other
+/// sources, so nothing is removed and the previous manifest entries are
+/// carried forward alongside what this build wrote.
+fn remove_stale_outputs(out_dir: &Path, written: &[PathBuf], project_root: &Path, partial: bool) {
     let rel_of = |p: &Path| -> Option<String> {
         p.strip_prefix(out_dir)
             .ok()
             .map(|r| r.to_string_lossy().replace('\\', "/"))
     };
-    let keep: std::collections::BTreeSet<String> =
+    let mut keep: std::collections::BTreeSet<String> =
         written.iter().filter_map(|p| rel_of(p)).collect();
     let manifest_path = out_dir.join(BUILD_MANIFEST);
     let mut candidates: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -3050,6 +3060,7 @@ fn remove_stale_outputs(out_dir: &Path, written: &[PathBuf], project_root: &Path
                     .map(str::to_owned),
             );
         }
+        Err(_) if partial => {}
         Err(_) => {
             // No manifest yet: fall back to outputs whose ownership is
             // evident from the layout.
@@ -3078,6 +3089,14 @@ fn remove_stale_outputs(out_dir: &Path, written: &[PathBuf], project_root: &Path
             }
         }
     }
+    if partial {
+        keep.extend(candidates.iter().cloned());
+        candidates.clear();
+    }
+    // Deletions are confined to the real output directory: a symlinked
+    // directory inside it (`build/old -> /elsewhere`) must not let a
+    // manifest entry such as `old/victim.py` remove a file outside.
+    let canon_out = out_dir.canonicalize().ok();
     let mut removed: Vec<String> = Vec::new();
     for rel in candidates.difference(&keep) {
         // Refuse anything that could escape the output directory.
@@ -3085,6 +3104,13 @@ fn remove_stale_outputs(out_dir: &Path, written: &[PathBuf], project_root: &Path
             continue;
         }
         let path = out_dir.join(rel);
+        let parent_inside = match (&canon_out, path.parent().map(Path::canonicalize)) {
+            (Some(out), Some(Ok(parent))) => parent.starts_with(out),
+            _ => false,
+        };
+        if !parent_inside {
+            continue;
+        }
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };
@@ -3097,7 +3123,10 @@ fn remove_stale_outputs(out_dir: &Path, written: &[PathBuf], project_root: &Path
                 // Tidy directories the removal emptied, up to `out_dir`.
                 let mut dir = path.parent();
                 while let Some(d) = dir {
-                    if d == out_dir || !d.starts_with(out_dir) {
+                    if d == out_dir
+                        || !d.starts_with(out_dir)
+                        || std::fs::symlink_metadata(d).is_ok_and(|m| m.file_type().is_symlink())
+                    {
                         break;
                     }
                     // A package directory left holding only its bytecode
@@ -6717,6 +6746,44 @@ let pet: Animal = Dog(name=\"Rex\")
         assert!(!out.join(".sourcemaps").join("old.py.map").exists());
         assert!(out.join("main.py").is_file());
         assert!(out.join("README.txt").is_file());
+    }
+
+    /// A single-file build leaves its siblings' outputs (and the
+    /// manifest's record of them) alone, and does not touch pyproject.toml.
+    #[test]
+    fn single_file_build_keeps_sibling_outputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, out) = scaffold(tmp.path(), "let x: int = 1\n");
+        std::fs::write(src.join("other.ty"), "let y: int = 2\n").unwrap();
+        run(build_args(tmp.path())).unwrap();
+        std::fs::remove_file(tmp.path().join("pyproject.toml")).unwrap();
+        run(build_args(&src.join("main.ty"))).unwrap();
+        assert!(out.join("other.py").is_file(), "sibling output kept");
+        assert!(!tmp.path().join("pyproject.toml").exists());
+        // The next full build still knows `other.py` is ours.
+        std::fs::remove_file(src.join("other.ty")).unwrap();
+        run(build_args(tmp.path())).unwrap();
+        assert!(!out.join("other.py").exists());
+    }
+
+    /// A stale manifest entry under a symlinked directory must not delete
+    /// a file outside the output directory.
+    #[cfg(unix)]
+    #[test]
+    fn stale_sweep_does_not_follow_symlinked_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim.py");
+        std::fs::write(&victim, "PRECIOUS").unwrap();
+        let (_, out) = scaffold(tmp.path(), "let x: int = 1\n");
+        run(build_args(tmp.path())).unwrap();
+        std::os::unix::fs::symlink(outside.path(), out.join("old")).unwrap();
+        let manifest = out.join(BUILD_MANIFEST);
+        let mut text = std::fs::read_to_string(&manifest).unwrap();
+        text.push_str("old/victim.py\n");
+        std::fs::write(&manifest, text).unwrap();
+        run(build_args(tmp.path())).unwrap();
+        assert!(victim.is_file(), "file outside the output dir must survive");
     }
 
     /// A symlink pre-planted at an artifact path must not redirect the
