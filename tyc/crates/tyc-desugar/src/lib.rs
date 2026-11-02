@@ -1489,9 +1489,13 @@ fn expr_uses_freeze_call(expr: &Expr) -> bool {
 
 /// Synthesise `__all__ = ["a", "b", ...]` from the list of `pub`
 /// names. Emitted as a regular module-level assignment so downstream
-/// tooling sees a plain Python `__all__` declaration.
+/// tooling sees a plain Python `__all__` declaration. The names are in
+/// the order ruff's `RUF022` expects (see [`dunder_all_order`]), so the
+/// generated module passes `ruff check`.
 fn make_dunder_all(names: &[String]) -> Stmt {
-    let elts: Vec<Expr> = names.iter().map(|n| make_string_literal_expr(n)).collect();
+    let mut sorted: Vec<&String> = names.iter().collect();
+    sorted.sort_by(|a, b| dunder_all_order(a, b));
+    let elts: Vec<Expr> = sorted.iter().map(|n| make_string_literal_expr(n)).collect();
     let list_expr = Expr::List(ruff_python_ast::ExprList {
         range: TextRange::default(),
         node_index: AtomicNodeIndex::NONE,
@@ -1510,6 +1514,63 @@ fn make_dunder_all(names: &[String]) -> Stmt {
         value: Box::new(list_expr),
         mutability: None,
     })
+}
+
+/// The "isort-style" order ruff's `RUF022` (unsorted `__all__`) checks:
+/// SCREAMING_CASE constants first, then names starting with an uppercase
+/// letter (classes), then everything else; within a group, natural order
+/// (digit runs compare as numbers).
+fn dunder_all_order(a: &str, b: &str) -> std::cmp::Ordering {
+    fn group(name: &str) -> u8 {
+        let has_cased = name.chars().any(|c| c.is_uppercase() || c.is_lowercase());
+        let no_lower = !name.chars().any(char::is_lowercase);
+        if name.chars().count() > 1 && has_cased && no_lower {
+            0
+        } else if name.chars().next().is_some_and(char::is_uppercase) {
+            1
+        } else {
+            2
+        }
+    }
+    group(a).cmp(&group(b)).then_with(|| natural_order(a, b))
+}
+
+/// Natural string order: runs of ASCII digits compare by numeric value,
+/// everything else by character.
+fn natural_order(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i].is_ascii_digit() && b[j].is_ascii_digit() {
+            let si = i;
+            while i < a.len() && a[i].is_ascii_digit() {
+                i += 1;
+            }
+            let sj = j;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            let na = std::str::from_utf8(&a[si..i])
+                .unwrap_or("")
+                .trim_start_matches('0');
+            let nb = std::str::from_utf8(&b[sj..j])
+                .unwrap_or("")
+                .trim_start_matches('0');
+            let ord = na.len().cmp(&nb.len()).then_with(|| na.cmp(nb));
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        } else {
+            let ord = a[i].cmp(&b[j]);
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            i += 1;
+            j += 1;
+        }
+    }
+    (a.len() - i).cmp(&(b.len() - j))
 }
 
 /// `true` when `stmt` is a hand-written `__all__ = ...` assignment.
@@ -5270,6 +5331,45 @@ fn insert_self_param(stmt: &Stmt) -> Stmt {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dunder_all_is_in_ruff_isort_order() {
+        // `ruff check --select RUF022` accepts exactly this order.
+        let mut names = vec![
+            "helper",
+            "SEVERITIES",
+            "Review",
+            "_private",
+            "item10",
+            "item2",
+            "MAX_2",
+            "A",
+            "Zeta",
+            "alpha",
+            "B10",
+            "B2",
+            "ok_",
+        ];
+        names.sort_by(|a, b| super::dunder_all_order(a, b));
+        assert_eq!(
+            names,
+            vec![
+                "B2",
+                "B10",
+                "MAX_2",
+                "SEVERITIES",
+                "A",
+                "Review",
+                "Zeta",
+                "_private",
+                "alpha",
+                "helper",
+                "item2",
+                "item10",
+                "ok_",
+            ]
+        );
+    }
+
     use super::*;
     use tyc_emit::emit;
 

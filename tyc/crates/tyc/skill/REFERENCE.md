@@ -916,6 +916,8 @@ The exact emission uses a small thread-safe proxy class so concurrent first acce
 
 `lazy from numpy import array` needs a 3.15+ target (PEP 810); before that it is `tyc::requires_newer_python`. Use `lazy import numpy` and dotted access there.
 
+The 3.15 typing additions follow the same rule (v1.0.0-beta.6): `typing.TypeForm`, `typing.disjoint_base` and `TypedDict(..., closed=..., extra_items=...)` need a 3.15 target, or come from `typing_extensions` on 3.13 / 3.14. A PEP 604 union used as a *value* (`isinstance(x, int | None)`, `cast(int | None, v)`) is an ordinary runtime object and is not a nullable use.
+
 On a **3.15+ `[python] target`**, the lowering above is skipped entirely: `lazy import np = numpy` instead emits the native PEP 810 `lazy import numpy as np` statement — no proxy class, no `typhon_runtime` involvement. 3.13 / 3.14 targets keep the proxy-class emission shown above, byte-for-byte.
 
 ### 7.2 Module-level `lazy let`

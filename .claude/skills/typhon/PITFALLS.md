@@ -1486,6 +1486,53 @@ pub lazy let CFG: dict[str, int] = load()   # ❌ tyc::parse
 
 ---
 
+## 85. Calling a dependency's property like a method (v1.0.0-beta.6)
+
+```python
+let result = agent.run_sync("hi")
+let used = result.usage()      # ❌ tyc::not_callable — `usage` is a property in current pydantic-ai
+```
+
+**Trigger:** a library turned a method into a property (or deprecated it) and the call site still uses the old form. **Why:** introspection now follows return types into the dependency's classes, so `result`'s attributes are known; before beta.6 this only showed up as a runtime `DeprecationWarning` or `TypeError`. A PEP 702 `@deprecated` API you still call warns as `tyc::deprecated`. **Fix:** read the property (`result.usage`) or move to the replacement the warning names.
+
+---
+
+## 86. `@deprecated` in `.ty` source needs the call form (v1.0.0-beta.6)
+
+```python
+@deprecated                      # ❌ not recognised — no message
+def old_api() -> int: ...
+
+@deprecated("use new_api()")     # ✅ callers get tyc::deprecated
+def old_api() -> int: ...
+```
+
+**Trigger:** a bare `@deprecated` or a message built at runtime. **Why:** the checker reads the message from a string literal, as PEP 702 requires. **Fix:** `from warnings import deprecated` (or `typing_extensions`) and pass a string literal.
+
+---
+
+## 87. `TypedDict(closed=..., extra_items=...)` on a 3.13 / 3.14 target (v1.0.0-beta.6)
+
+```python
+class Movie(TypedDict, extra_items=int):   # ❌ tyc::requires_newer_python on target 3.13
+    title: str
+```
+
+**Trigger:** PEP 728 keywords, `typing.TypeForm` or `typing.disjoint_base` below a 3.15 target. **Fix:** `from typing_extensions import TypedDict` (exempt), or raise `[python] target` to `"3.15"`. `closed=True` together with `extra_items=` is an error on every target, because CPython rejects the class.
+
+---
+
+## 88. `-> Agent[None, Review]` rejected for a bare constructor (fixed in v1.0.0-beta.7)
+
+```python
+def agent() -> Agent[None, Review]:
+    return Agent(model, output_type=Review)   # beta.6: tyc::type_mismatch; beta.7: accepted
+```
+
+**Trigger:** returning a dependency's generic class built without explicit type arguments into a parameterised annotation. **Why:** the checker doesn't infer type arguments from `output_type=`, and beta.6 treated the bare `Agent` as not fitting `Agent[None, Review]`, even though `AgentRunResult[Any]` already fitted `AgentRunResult[Review]`. **Fix:** upgrade; on beta.6, annotate `-> Agent`. A *different* class in the same position is still a mismatch.
+
+---
+
 ## Quick "which guide answers this" map
 
 | If you're stuck on… | Read |

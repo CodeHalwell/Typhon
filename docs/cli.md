@@ -85,7 +85,9 @@ Python environment for the project:
    directory from before the manifest existed, compiled modules with a
    leftover `.sourcemaps/` sidecar and the generated `typhon_runtime/`
    are recognised the same way. Files `tyc` did not write are never
-   touched.
+   touched. **If you commit `build/`, commit `.tyc-build-manifest` with
+   it** (and don't let a `.*` rule in `.gitignore` drop it): a build on
+   a fresh clone reads it to know which files it may remove.
 5. **Emitted Python passes `ruff check`.** With `[emit] format = true`
    and `ruff` on `PATH`, the import block is sorted with `ruff check
    --fix --select I` using the project's own ruff settings, after

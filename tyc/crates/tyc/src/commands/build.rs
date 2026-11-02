@@ -3109,6 +3109,13 @@ fn prune_unused_runtime_names(src: &str) -> String {
 /// find (and remove) what a later build no longer produces.
 const BUILD_MANIFEST: &str = ".tyc-build-manifest";
 
+/// The manifest's first lines, so whoever finds it in `build/` knows to
+/// keep it. `#` lines are skipped on read.
+const MANIFEST_HEADER: &str =
+    "# Written by `tyc build`: the files it generated in this directory.\n\
+# Commit it alongside build/ so the next build, on any machine, can remove\n\
+# files it no longer produces. Do not edit.\n";
+
 /// Delete files an earlier build wrote into `out_dir` that this build did
 /// not (a renamed or deleted `.ty`, a `typhon_runtime/` no longer needed),
 /// then record what this build wrote. Without it, `build/` kept dead
@@ -3138,7 +3145,7 @@ fn remove_stale_outputs(out_dir: &Path, written: &[PathBuf], project_root: &Path
             candidates.extend(
                 text.lines()
                     .map(str::trim)
-                    .filter(|l| !l.is_empty())
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
                     .map(str::to_owned),
             );
         }
@@ -3252,7 +3259,7 @@ fn remove_stale_outputs(out_dir: &Path, written: &[PathBuf], project_root: &Path
         let _ = std::fs::remove_file(&manifest_path);
         return;
     }
-    let mut body = String::new();
+    let mut body = String::from(MANIFEST_HEADER);
     for rel in &keep {
         body.push_str(rel);
         body.push('\n');
@@ -6890,6 +6897,12 @@ let pet: Animal = Dog(name=\"Rex\")
         assert!(!out.join(".sourcemaps").join("old.py.map").exists());
         assert!(out.join("main.py").is_file());
         assert!(out.join("README.txt").is_file());
+        // The manifest says to commit it, and its header is not an entry.
+        let manifest = std::fs::read_to_string(out.join(BUILD_MANIFEST)).unwrap();
+        assert!(manifest.starts_with("# Written by `tyc build`"));
+        assert!(manifest.contains("Commit it alongside build/"));
+        run(build_args(tmp.path())).unwrap();
+        assert!(out.join("main.py").is_file());
     }
 
     /// A unit that loses its last `.ty` keeps the `.pyi` stubs of the

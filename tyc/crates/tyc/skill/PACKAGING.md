@@ -173,10 +173,10 @@ from .ids import UserId, PostId
 from .user import User, make_user
 from .post import Post
 
-__all__ = ["UserId", "PostId", "User", "make_user", "Post"]
+__all__ = ["Post", "PostId", "User", "UserId", "make_user"]
 ```
 
-Sibling order is alphabetical by basename. Sub-packages are included **transitively** — when a direct sub-directory contains its own `__init__.ty`, the sub-package's effective public surface (its own `pub`-marked names, plus whatever its own `pub *` aggregates one level deeper) is re-exported. Recursion is cycle-safe via a `visited` set keyed on each package directory.
+Sibling order is alphabetical by basename. Every generated `__all__` is in the order ruff's `RUF022` expects (v1.0.0-beta.7): SCREAMING_CASE constants, then capitalised names, then the rest, each group in natural order — so `ruff check` passes on the output. Sub-packages are included **transitively** — when a direct sub-directory contains its own `__init__.ty`, the sub-package's effective public surface (its own `pub`-marked names, plus whatever its own `pub *` aggregates one level deeper) is re-exported. Recursion is cycle-safe via a `visited` set keyed on each package directory.
 
 The `pub *` marker is preserved on a single line so source maps stay byte-aligned.
 
@@ -393,16 +393,16 @@ build/
 
 The `build/` tree is the deployable artifact. **It contains zero Typhon-specific dependencies** — just CPython code plus the generated `typhon_runtime/` package (no PyPI release of that package; every project ships its own copy).
 
-### Don't commit `build/` to source control
+### Committing `build/` is optional — but commit its manifest with it
 
-Add to `.gitignore`:
+`tyc build` regenerates everything from `src/`, so most projects ignore it:
 
 ```
 build/
 typhon-profile.json
 ```
 
-`tyc build` regenerates everything from `src/`.
+If you do commit `build/` (to ship the generated Python, or to diff it in review), **commit `build/.tyc-build-manifest` too** and make sure no `.*` rule in `.gitignore` drops it. It lists the files the build generated; a later build — including one on a fresh clone or in CI — reads it to delete modules it no longer produces (a renamed `.ty`, a `typhon_runtime/` the code stopped needing) without touching files `tyc` did not write. The file starts with a `#` comment saying the same.
 
 ---
 

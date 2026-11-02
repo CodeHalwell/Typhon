@@ -775,14 +775,18 @@ lazy let X: T:                  # error — colon-block form does not parse
 
 ### `tyc::requires_newer_python` — error
 
-Syntax or a builtin newer than `[python] target`: `except A, B:` and `t"..."` (3.14); `[*xs for xs in lists]` / `{**d for d in ds}` (PEP 798), `frozendict`, `sentinel` and `lazy from M import …` (3.15). Fires in check, build, run and the editor.
+Syntax or a builtin newer than `[python] target`: `except A, B:` and `t"..."` (3.14); `[*xs for xs in lists]` / `{**d for d in ds}` (PEP 798), `frozendict`, `sentinel` and `lazy from M import …` (3.15). Since v1.0.0-beta.6 the 3.15 typing additions are gated too: `typing.TypeForm` (PEP 747), `typing.disjoint_base` (PEP 800) and the `closed=` / `extra_items=` class keywords on a `TypedDict` (PEP 728). The `typing_extensions` spellings are exempt, and so is code behind a feature probe (`if hasattr(typing, "TypeForm"):`, `sys.version_info >= (3, 15)`). Fires in check, build, run and the editor.
+
+Separately, a `TypedDict` with both `closed=True` and `extra_items=` is an error on **every** target (`tyc::generic`), because CPython raises `TypeError` at class creation.
 
 ```ty
 # [python] target = "3.13"
 let flat: list[int] = [*xs for xs in lists]   # error — needs 3.15
+class Movie(TypedDict, closed=True):         # error — needs 3.15
+    title: str
 ```
 
-**Fix:** raise `[python] target`, or rewrite in a form the target has.
+**Fix:** raise `[python] target`, rewrite in a form the target has, or import the typing form from `typing_extensions`.
 
 ---
 

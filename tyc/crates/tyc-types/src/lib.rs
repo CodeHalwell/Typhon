@@ -5077,6 +5077,16 @@ impl<'a> Checker<'a> {
                 {
                     return true;
                 }
+                // A constructor call on a dependency's generic class whose
+                // type parameters the checker does not know
+                // (`Agent(model, output_type=Review)`) yields the bare
+                // class: its arguments were never inferred, so they are
+                // unknown, not absent, and any instantiation of the same
+                // head fits — the mirror of the bare-annotation rule below.
+                // A class whose parameters are known keeps the strict check.
+                if exp_name == act_name && !self.class_type_params.contains_key(exp_name.as_str()) {
+                    return true;
+                }
             }
             // The mirror direction (generic class value into a bare interface
             // expectation) carries no interface type arguments to bind, so the
@@ -39313,6 +39323,36 @@ def main(dogs: list[Dog]) -> None:
             &consumer_prep.impl_distributed_lines,
             Some(external),
         )
+    }
+
+    #[test]
+    fn a_dependency_generic_constructed_bare_fits_a_parameterised_annotation() {
+        // `Agent(model, output_type=Review)` on a class whose type
+        // parameters the checker does not know: its arguments are unknown,
+        // so `-> Agent[None, Review]` must accept it.
+        let mut external = ExternalShapes::default();
+        let shape = InterfaceShape::default();
+        external.class_shapes.insert("Agent".to_owned(), shape);
+        let d = check_consumer(
+            "from producer import Agent\n\ndef make() -> Agent[None, int]:\n    return Agent()\n",
+            &external,
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "{:?}",
+            d.errors()
+        );
+        // A different class is still a mismatch.
+        let d = check_consumer(
+            "from producer import Agent\n\nclass Other:\n    x: int\n\ndef make() -> Agent[None, int]:\n    return Other(x=1)\n",
+            &external,
+        );
+        assert!(d
+            .errors()
+            .iter()
+            .any(|e| matches!(e, TycError::TypeMismatch { .. })));
     }
 
     #[test]
