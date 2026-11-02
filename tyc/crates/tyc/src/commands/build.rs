@@ -363,7 +363,6 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // imports for those. Without this the build artefact crashes at import
     // time with ModuleNotFoundError when the user hasn't declared pydantic
     // explicitly.
-    let mut config = config;
     // Resolve the optimise-gated strictness knobs to concrete bools now that
     // both the config's `[optimise] level` and the CLI `-O`/`--optimise` flag
     // are known. After this, `config.strictness.{auto_memoise,auto_gather,
@@ -6636,6 +6635,88 @@ let pet: Animal = Dog(name=\"Rex\")
             !tmp.path().join("pyproject.toml").exists(),
             "--check must not write pyproject.toml"
         );
+    }
+
+    fn build_args(path: &std::path::Path) -> BuildArgs {
+        BuildArgs {
+            path: path.to_path_buf(),
+            out: None,
+            no_format: true,
+            check: false,
+            no_sync: true,
+            with_ty: false,
+            optimise: false,
+            source_label: None,
+        }
+    }
+
+    /// `tyc build tests/` compiles the tests directory — type-checked
+    /// against the project's modules — into `<out>/tests`, with a conftest
+    /// that puts the project's build output on `sys.path`. It used to
+    /// ignore the path and rebuild `src/`.
+    #[test]
+    fn build_of_tests_dir_compiles_that_unit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, out) = scaffold(tmp.path(), "let x: int = 1\n");
+        std::fs::write(
+            src.join("calc.ty"),
+            "pub def add(a: int, b: int) -> int:\n    return a + b\n",
+        )
+        .unwrap();
+        let tests = tmp.path().join("tests");
+        std::fs::create_dir_all(&tests).unwrap();
+        std::fs::write(
+            tests.join("test_calc.ty"),
+            "from calc import add\n\ndef test_add() -> None:\n    assert add(1, 2) == 3\n",
+        )
+        .unwrap();
+        run(build_args(&tests)).unwrap();
+        assert!(out.join("tests").join("test_calc.py").is_file());
+        assert!(out.join("tests").join("conftest.py").is_file());
+        assert!(!out.join("main.py").exists(), "src/ must not be rebuilt");
+        assert!(!tmp.path().join("pyproject.toml").exists());
+        // The project's modules are checked: a wrong call fails the build.
+        std::fs::write(
+            tests.join("test_calc.ty"),
+            "from calc import add\n\ndef test_add() -> None:\n    assert add(1) == 3\n",
+        )
+        .unwrap();
+        assert!(run(build_args(&tests)).is_err());
+        // A single file builds on its own.
+        std::fs::write(
+            tests.join("test_other.ty"),
+            "def test_ok() -> None:\n    pass\n",
+        )
+        .unwrap();
+        run(build_args(&tests.join("test_other.ty"))).unwrap();
+        assert!(out.join("tests").join("test_other.py").is_file());
+    }
+
+    /// Outputs an earlier build wrote that this one does not are removed:
+    /// listed in the manifest, or (no manifest yet) evidently compiled
+    /// output or the generated runtime package.
+    #[test]
+    fn build_removes_stale_outputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, out) = scaffold(tmp.path(), "let x: int = 1\n");
+        std::fs::write(src.join("old.ty"), "let y: int = 2\n").unwrap();
+        // A pre-manifest leftover runtime package.
+        std::fs::create_dir_all(out.join("typhon_runtime")).unwrap();
+        std::fs::write(out.join("typhon_runtime").join("__init__.py"), "").unwrap();
+        // A file tyc never wrote must survive.
+        std::fs::write(out.join("README.txt"), "keep").unwrap();
+        run(build_args(tmp.path())).unwrap();
+        assert!(out.join("old.py").is_file());
+        assert!(
+            !out.join("typhon_runtime").exists(),
+            "unneeded runtime removed"
+        );
+        std::fs::remove_file(src.join("old.ty")).unwrap();
+        run(build_args(tmp.path())).unwrap();
+        assert!(!out.join("old.py").exists(), "stale module removed");
+        assert!(!out.join(".sourcemaps").join("old.py.map").exists());
+        assert!(out.join("main.py").is_file());
+        assert!(out.join("README.txt").is_file());
     }
 
     /// A symlink pre-planted at an artifact path must not redirect the

@@ -45,14 +45,16 @@ Full pipeline: parse → check → analyse → desugar → emit → format. Writ
 - `build/*.pyi` — companion stubs for every `.dty`.
 - `build/pyproject.toml` — merged with user-managed `[tool.*]` tables.
 
-`[emit] format = true` (the default) runs `ruff format` post-emit.
+`[emit] format = true` (the default) runs `ruff format` post-emit, then sorts imports with `ruff check --fix --select I` (project ruff settings), so the output passes `ruff check`.
+
+`tyc build tests/` (or `tyc build tests/test_x.ty`) compiles that directory/file instead of `src/`, type-checked against the project's modules, into `build/tests/` with a generated `conftest.py` that puts `build/` on `sys.path` — then `pytest build/tests`. Files an earlier build wrote that the current one does not are removed (tracked in `<out>/.tyc-build-manifest`). The build prints any change it makes to `pyproject.toml`'s dependency lists; `typhon.toml` owns them (`tyc add`, not `uv add`), and `--no-sync` refreshes an existing `uv.lock`.
 
 | Flag | Effect |
 |---|---|
 | `--out DIR` / `-o DIR` | Override `[project] out` |
 | `--no-format` | Skip `ruff format` post-process |
 | `--check` | Dry-run — list every file that *would* be created/overwritten without touching disk. Full pipeline still runs, so type errors surface |
-| `--no-sync` (env: `TYC_NO_SYNC=1`) | Skip `uv sync` but still merge `pyproject.toml` |
+| `--no-sync` (env: `TYC_NO_SYNC=1`) | Skip `uv sync` but still merge `pyproject.toml` (and relock an existing `uv.lock` if the dependencies changed) |
 | `--optimise` / `-O` (alias `--optimize`) | Apply `[optimise] level = 1` for this invocation — flips the default of `auto-memoise`, `auto-gather`, `auto-parallel`, and `pgo-memoise` to on. Overrides a config `level = 0`, but an explicit `[strictness]` entry for any of those knobs still wins |
 | `--with-ty` (v0.12.0) | After emit, run Astral's `ty` over the emitted Python (typeshed-backed second-stage check); errors fail the build. Equivalent to `[checker] external = "ty"` for one invocation |
 

@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 pub fn dependency_name(key: &str) -> &str {
     let key = key.trim();
     let end = key
-        .find(|c: char| matches!(c, '[' | ';' | '@' | '<' | '>' | '=' | '!' | '~' | ' ' | '('))
+        .find(['[', ';', '@', '<', '>', '=', '!', '~', ' ', '('])
         .unwrap_or(key.len());
     key[..end].trim()
 }
@@ -515,11 +515,10 @@ fn roots_of(dist: &InstalledDist) -> Vec<String> {
     };
     if let Some(manifest) = manifest {
         for line in manifest.lines() {
-            let raw = if line.starts_with('"') {
+            let raw = match line.strip_prefix('"') {
                 // PEP 376: a path containing a comma is double-quoted.
-                line[1..].split('"').next().unwrap_or("")
-            } else {
-                line.split(',').next().unwrap_or("")
+                Some(quoted) => quoted.split('"').next().unwrap_or(""),
+                None => line.split(',').next().unwrap_or(""),
             };
             let raw = raw.trim().replace('\\', "/");
             if raw.is_empty() || raw.starts_with('/') {

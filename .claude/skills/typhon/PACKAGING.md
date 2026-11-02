@@ -324,7 +324,8 @@ After `tyc build`, run pytest as usual against the emitted Python:
 
 ```bash
 tyc build
-pytest build/tests/    # or wherever your tests landed
+tyc build tests/       # compiles tests/ into build/tests/ (+ conftest.py)
+pytest build/tests/
 ```
 
 `examples/testing/` is the canonical pattern.

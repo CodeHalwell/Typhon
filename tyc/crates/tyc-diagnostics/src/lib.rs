@@ -4815,6 +4815,38 @@ pub(crate) fn parse_error_hint(message: &str, source: &str, offset: usize) -> Op
         }
     }
 
+    // `pub` on a method / nested declaration. `pub` feeds the module's
+    // `__all__`, which only lists module-level names; Python has no member
+    // visibility, so a method is public already and the parser just sees a
+    // stray `pub` before `def`.
+    if let Some(line) = source_line(source, &line_starts, line_idx) {
+        let trimmed = line.trim_start();
+        let indent_len = line.len() - trimmed.len();
+        let declares = [
+            "def ",
+            "async def ",
+            "class ",
+            "let ",
+            "mut ",
+            "model ",
+            "enum ",
+        ];
+        if indent_len > 0
+            && trimmed
+                .strip_prefix("pub ")
+                .is_some_and(|rest| declares.iter().any(|d| rest.trim_start().starts_with(d)))
+        {
+            return Some(
+                "`pub` is module-level only: it adds the name to the module's `__all__`. \
+                 Methods and other members are always public in Python, so drop `pub` \
+                 here; mark the class (or function) itself `pub` instead. For a helper \
+                 you mean to keep internal, a leading underscore (`def _helper(self)`) \
+                 is the Python convention."
+                    .to_owned(),
+            );
+        }
+    }
+
     // `?` error-propagation inside an f-string expression part. The
     // preprocessor's `?` expansion can't reach into string literals, so
     // the raw `?` hits the Python parser and dies with an opaque parse
@@ -5929,6 +5961,19 @@ mod tests {
             hint.contains("pipe chain") && hint.contains("parentheses"),
             "hint should mention pipe and parens, got: {hint}"
         );
+    }
+
+    #[test]
+    fn parse_error_hint_pub_on_method() {
+        let source = "impl W:\n    pub def inside(self) -> bool:\n        return True\n";
+        let offset = source.find("def inside").unwrap();
+        let hint = parse_error_hint(
+            "Compound statements are not allowed on the same line as simple statements",
+            source,
+            offset,
+        )
+        .expect("pub-on-method hint must fire");
+        assert!(hint.contains("module-level only"), "{hint}");
     }
 
     #[test]
