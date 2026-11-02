@@ -413,6 +413,31 @@ fn newer_typed_dict_keywords(
                 .filter(|&i| !self.class_scope[i] || Some(i) == top)
                 .collect()
         }
+        /// A comprehension is its own scope: its targets bind only inside
+        /// it, while the first iterable is evaluated in the enclosing scope.
+        fn visit_comprehension(
+            &mut self,
+            generators: &[ruff_python_ast::Comprehension],
+            results: &[&Expr],
+        ) {
+            if let Some(first) = generators.first() {
+                self.visit_expr(&first.iter);
+            }
+            self.open_scope(false);
+            for (i, g) in generators.iter().enumerate() {
+                if i > 0 {
+                    self.visit_expr(&g.iter);
+                }
+                self.visit_expr(&g.target);
+                for cond in &g.ifs {
+                    self.visit_expr(cond);
+                }
+            }
+            for e in results {
+                self.visit_expr(e);
+            }
+            self.stack.pop();
+        }
         /// A function's or lambda's defaults and annotations, which Python
         /// evaluates in the enclosing scope.
         fn visit_outer_parameter_parts(&mut self, params: &ruff_python_ast::Parameters) {
@@ -565,6 +590,28 @@ fn newer_typed_dict_keywords(
                 }
                 Expr::Name(n) if n.ctx != ruff_python_ast::ExprContext::Load => {
                     self.bind(n.id.to_string());
+                }
+                Expr::ListComp(ruff_python_ast::ExprListComp {
+                    elt, generators, ..
+                })
+                | Expr::SetComp(ruff_python_ast::ExprSetComp {
+                    elt, generators, ..
+                })
+                | Expr::Generator(ruff_python_ast::ExprGenerator {
+                    elt, generators, ..
+                }) => {
+                    self.visit_comprehension(generators, &[elt]);
+                    return;
+                }
+                Expr::DictComp(d) => {
+                    let results: Vec<&Expr> = d
+                        .key
+                        .as_deref()
+                        .into_iter()
+                        .chain([d.value.as_ref()])
+                        .collect();
+                    self.visit_comprehension(&d.generators, &results);
+                    return;
                 }
                 Expr::Lambda(l) => {
                     if let Some(params) = l.parameters.as_deref() {
@@ -8736,6 +8783,8 @@ mod lint_tests {
             "from typing import TypedDict\nclass Helper:\n    TypedDict: int = 1\n    def build(self) -> object:\n        return TypedDict(\"M\", {}, closed=True)\n",
             // Defaults are evaluated in the enclosing scope.
             "from typing import TypedDict\ndef build(TypedDict=TypedDict(\"M\", {}, closed=True)) -> None:\n    pass\n",
+            // A comprehension target binds only inside the comprehension.
+            "from typing import TypedDict\nlet items = [TypedDict for TypedDict in [1, 2]]\nclass M(TypedDict, closed=True):\n    name: str\n",
             // A parameter elsewhere does not shadow the module-level import.
             "from typing import TypedDict\nclass Helper:\n    TypedDict: int = 1\nclass M(TypedDict, closed=True):\n    name: str\n",
             "from typing import TypedDict, Any\ndef helper(TypedDict: Any) -> None:\n    pass\nclass M(TypedDict, closed=True):\n    name: str\n",
