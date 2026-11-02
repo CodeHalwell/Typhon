@@ -358,8 +358,21 @@ pub fn run(args: BuildArgs) -> Result<()> {
         eprintln!("no .ty files found in '{}'", src_dir.display());
         // The unit's last source may just have been deleted: its outputs
         // are now stale like any other.
+        // Hand-written `.py` / `.pyi` files still in the unit keep their
+        // copied outputs: only what came from `.ty` sources is gone.
         if !args.check && single_file.is_none() && out_dir.is_dir() {
-            remove_stale_outputs(&out_dir, &[], &project_root, false);
+            let mut live: Vec<PathBuf> = Vec::new();
+            for ext in ["py", "pyi"] {
+                for file in crate::commands::util::walk_files(&src_dir, ext).unwrap_or_default() {
+                    if file.starts_with(&out_dir) {
+                        continue;
+                    }
+                    if let Ok(rel) = file.strip_prefix(&src_dir) {
+                        live.push(out_dir.join(rel));
+                    }
+                }
+            }
+            remove_stale_outputs(&out_dir, &live, &project_root, false);
         }
         return Ok(());
     }
@@ -6797,12 +6810,17 @@ let pet: Animal = Dog(name=\"Rex\")
         .unwrap();
         let conftest = std::fs::read_to_string(elsewhere.join("conftest.py")).unwrap();
         assert!(conftest.contains("\"../build\""), "{conftest}");
-        // Deleting the unit's last sources leaves no stale tests behind.
+        // Deleting the unit's last `.ty` sources leaves no stale tests
+        // behind, but a hand-written test beside them keeps its copy.
+        std::fs::write(tests.join("test_live.py"), "def test_live():\n    pass\n").unwrap();
+        run(build_args(&tests)).unwrap();
+        assert!(out.join("tests").join("test_live.py").is_file());
         std::fs::remove_file(tests.join("test_calc.ty")).unwrap();
         std::fs::remove_file(tests.join("test_other.ty")).unwrap();
         run(build_args(&tests)).unwrap();
         assert!(!out.join("tests").join("test_calc.py").exists());
         assert!(!out.join("tests").join("test_other.py").exists());
+        assert!(out.join("tests").join("test_live.py").is_file());
     }
 
     /// Outputs an earlier build wrote that this one does not are removed:
