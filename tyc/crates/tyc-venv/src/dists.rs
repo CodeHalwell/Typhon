@@ -379,7 +379,7 @@ fn modules_in_dir(dir: &Path) -> Vec<String> {
             continue;
         };
         if path.is_dir() {
-            if is_module_name(name) && dir_has_python(&path) {
+            if is_module_name(name) && dir_has_python(&path, DIR_SCAN_DEPTH) {
                 out.push(name.to_owned());
             }
         } else if let Some(stem) = name
@@ -394,15 +394,29 @@ fn modules_in_dir(dir: &Path) -> Vec<String> {
     out
 }
 
-fn dir_has_python(dir: &Path) -> bool {
+/// How deep [`dir_has_python`] looks for a Python file under a candidate
+/// package directory. Real packages put an `__init__.py` or module at the
+/// top; the bound only exists so a pathological tree cannot stall `tyc`.
+const DIR_SCAN_DEPTH: usize = 8;
+
+/// Whether `dir` holds any Python (source, stub or extension module) within
+/// `depth` levels. Symlinked subdirectories are not followed, so a link
+/// cycle (`a -> .`) cannot recurse forever; the candidate directory itself
+/// may be a symlink, which the caller has already decided to look through.
+fn dir_has_python(dir: &Path, depth: usize) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
     entries.flatten().any(|e| {
         let p = e.path();
-        p.extension()
+        if p.extension()
             .is_some_and(|x| x == "py" || x == "pyi" || x == "so" || x == "pyd")
-            || (p.is_dir() && dir_has_python(&p))
+        {
+            return true;
+        }
+        depth > 0
+            && e.file_type().is_ok_and(|t| t.is_dir() && !t.is_symlink())
+            && dir_has_python(&p, depth - 1)
     })
 }
 
@@ -819,5 +833,19 @@ mod tests {
         assert!(found.is_absolute());
         let py = crate::discover_python(tmp.path()).unwrap();
         assert!(py.is_absolute() && py.starts_with(tmp.path()), "{py:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn module_scan_survives_symlink_cycles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join("loopy");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::os::unix::fs::symlink(".", pkg.join("a")).unwrap();
+        std::os::unix::fs::symlink(".", pkg.join("b")).unwrap();
+        // No Python anywhere: the scan must terminate and report nothing.
+        assert!(modules_in_dir(tmp.path()).is_empty());
+        write(&pkg.join("core").join("mod.py"), "");
+        assert_eq!(modules_in_dir(tmp.path()), vec!["loopy".to_owned()]);
     }
 }

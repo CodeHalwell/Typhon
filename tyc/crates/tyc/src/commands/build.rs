@@ -3118,6 +3118,10 @@ fn remove_stale_outputs(out_dir: &Path, written: &[PathBuf], project_root: &Path
     // directory inside it (`build/old -> /elsewhere`) must not let a
     // manifest entry such as `old/victim.py` remove a file outside.
     let canon_out = out_dir.canonicalize().ok();
+    let written_canon: std::collections::HashSet<PathBuf> = written
+        .iter()
+        .filter_map(|p| p.canonicalize().ok())
+        .collect();
     let mut removed: Vec<String> = Vec::new();
     for rel in candidates.difference(&keep) {
         // Refuse anything that could escape the output directory.
@@ -3129,7 +3133,15 @@ fn remove_stale_outputs(out_dir: &Path, written: &[PathBuf], project_root: &Path
             (Some(out), Some(Ok(parent))) => parent.starts_with(out),
             _ => false,
         };
-        if !parent_inside {
+        if !parent_inside || has_symlinked_ancestor(out_dir, rel) {
+            continue;
+        }
+        // Belt and braces: never remove a file this build just wrote, by
+        // whatever spelling the stale entry reaches it.
+        if path
+            .canonicalize()
+            .is_ok_and(|canon| written_canon.contains(&canon))
+        {
             continue;
         }
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
@@ -3185,6 +3197,25 @@ fn remove_stale_outputs(out_dir: &Path, written: &[PathBuf], project_root: &Path
     if let Err(e) = tyc_format::atomic_write(&manifest_path, body.as_bytes()) {
         eprintln!("warning: cannot write '{}': {e}", manifest_path.display());
     }
+}
+
+/// Whether any directory between `out_dir` and `out_dir/rel` is a symlink.
+/// A stale manifest entry that reaches its file through an internal link
+/// (`build/old -> new`) names something this build may own under its real
+/// path, so it is never deleted by the stale sweep.
+fn has_symlinked_ancestor(out_dir: &Path, rel: &str) -> bool {
+    let mut dir = out_dir.to_path_buf();
+    let mut parts = rel.split('/').peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            break;
+        }
+        dir.push(part);
+        if std::fs::symlink_metadata(&dir).map_or(true, |m| m.file_type().is_symlink()) {
+            return true;
+        }
+    }
+    false
 }
 
 /// First line of the `conftest.py` written for a separately built unit; a
@@ -6841,6 +6872,23 @@ let pet: Animal = Dog(name=\"Rex\")
         std::fs::write(&manifest, text).unwrap();
         run(build_args(tmp.path())).unwrap();
         assert!(victim.is_file(), "file outside the output dir must survive");
+    }
+
+    /// A stale entry that reaches a fresh output through an internal link
+    /// (`build/old -> build`) must not delete what this build just wrote.
+    #[cfg(unix)]
+    #[test]
+    fn stale_sweep_ignores_internal_symlink_aliases() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, out) = scaffold(tmp.path(), "let x: int = 1\n");
+        run(build_args(tmp.path())).unwrap();
+        std::os::unix::fs::symlink(".", out.join("old")).unwrap();
+        let manifest = out.join(BUILD_MANIFEST);
+        let mut text = std::fs::read_to_string(&manifest).unwrap();
+        text.push_str("old/main.py\n");
+        std::fs::write(&manifest, text).unwrap();
+        run(build_args(tmp.path())).unwrap();
+        assert!(out.join("main.py").is_file(), "fresh output must survive");
     }
 
     /// A symlink pre-planted at an artifact path must not redirect the
