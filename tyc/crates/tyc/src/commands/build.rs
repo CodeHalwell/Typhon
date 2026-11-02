@@ -229,10 +229,15 @@ pub fn run(args: BuildArgs) -> Result<()> {
         if invocation_path == canon_root || invocation_path.starts_with(&canon_src) {
             None
         } else {
-            invocation_path
-                .strip_prefix(&canon_root)
-                .ok()
-                .map(Path::to_path_buf)
+            // A single file (`tests/pkg/test_app.ty`) belongs to the unit
+            // its top-level directory names (`tests/`), so it keeps the
+            // package context it has when that whole directory is built.
+            invocation_path.strip_prefix(&canon_root).ok().map(|rel| {
+                match (&single_file, rel.components().next()) {
+                    (Some(_), Some(first)) => PathBuf::from(first.as_os_str()),
+                    _ => rel.to_path_buf(),
+                }
+            })
         }
     };
     if let Some(rel) = &unit_rel {
@@ -3040,12 +3045,25 @@ fn python_module_name_from_path(path: &std::path::Path, src_dir: &std::path::Pat
 /// one is used). The edit stays on its own line, so line numbers hold.
 fn prune_unused_runtime_names(src: &str) -> String {
     const INJECTED: &str = "from typhon_runtime import Ok, Err, Result";
-    let Some(start) = src
-        .match_indices(INJECTED)
-        .map(|(i, _)| i)
-        .find(|&i| i == 0 || src.as_bytes()[i - 1] == b'\n')
-    else {
-        return src.to_owned();
+    // Only a line of code counts: the same text inside a triple-quoted
+    // string is program data and must not be rewritten.
+    let start = {
+        use tyc_syntax::lexmask::{scan_line_kinds, ByteKind};
+        let mut in_string = None;
+        let mut offset = 0usize;
+        let mut found = None;
+        for line in src.split_inclusive('\n') {
+            let kinds = scan_line_kinds(line, &mut in_string);
+            if line.starts_with(INJECTED) && matches!(kinds.first(), Some(ByteKind::Code)) {
+                found = Some(offset);
+                break;
+            }
+            offset += line.len();
+        }
+        match found {
+            Some(i) => i,
+            None => return src.to_owned(),
+        }
     };
     let end = start + INJECTED.len();
     if !matches!(src.as_bytes().get(end), None | Some(b'\n') | Some(b'\r')) {
@@ -6883,6 +6901,32 @@ let pet: Animal = Dog(name=\"Rex\")
         assert!(out.join("external.pyi").is_file(), "live stub kept");
     }
 
+    /// A single file nested in a package of a separate unit builds with
+    /// the same package context as the whole unit: its relative imports
+    /// survive.
+    #[test]
+    fn nested_single_file_keeps_package_imports() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, out) = scaffold(tmp.path(), "let x: int = 1\n");
+        let pkg = tmp.path().join("tests").join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("__init__.py"), "").unwrap();
+        std::fs::write(pkg.join("helper.py"), "def f() -> int:\n    return 1\n").unwrap();
+        std::fs::write(
+            pkg.join("test_app.ty"),
+            "from .helper import f\n\ndef test_f() -> None:\n    assert f() == 1\n",
+        )
+        .unwrap();
+        run(build_args(&tmp.path().join("tests"))).unwrap();
+        let emitted = out.join("tests").join("pkg").join("test_app.py");
+        assert!(std::fs::read_to_string(&emitted)
+            .unwrap()
+            .contains("from .helper import f"));
+        run(build_args(&pkg.join("test_app.ty"))).unwrap();
+        let text = std::fs::read_to_string(&emitted).unwrap();
+        assert!(text.contains("from .helper import f"), "{text}");
+    }
+
     /// A single-file build leaves its siblings' outputs (and the
     /// manifest's record of them) alone, and does not touch pyproject.toml.
     #[test]
@@ -7397,6 +7441,9 @@ print('ok')
         assert!(
             prune_unused_runtime_names(src).starts_with("from typhon_runtime import Err, Result\n")
         );
+        // The import's text inside a string is data, not an import.
+        let src = "x = \"\"\"\nfrom typhon_runtime import Ok, Err, Result\n\"\"\"\ny = Ok(1)\n";
+        assert_eq!(prune_unused_runtime_names(src), src);
         // `OkThing` is not `Ok`.
         let src = "from typhon_runtime import Ok, Err, Result\nOkThing = Err(Result)\n";
         assert!(
