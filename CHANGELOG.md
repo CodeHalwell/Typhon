@@ -4,7 +4,7 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## Unreleased (1.0.0-beta.7)
+## 1.0.0-beta.7 — 2026-11-02 — beta.6 feedback fixes
 
 Fixes from the beta.6 feedback session. No language change.
 

@@ -140,7 +140,7 @@ The match on `LoadError` is statically exhaustive. Add a third variant to the un
 
 ## Status
 
-**The current release is [v1.0.0-beta.6](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-beta.6)**, which checks calls on what a third-party function returns, including `@deprecated` APIs and properties, on top of v1.0.0-beta.5's third-party checking and build fixes.
+**The current release is [v1.0.0-beta.7](https://github.com/CodeHalwell/Typhon/releases/tag/v1.0.0-beta.7)**, which fixes a generic-annotation false positive on dependency classes, orders the generated `__all__` for ruff, and documents committing the build manifest, on top of v1.0.0-beta.6 (checks on what a third-party function returns, including `@deprecated` APIs and properties) and v1.0.0-beta.5's third-party checking and build fixes.
 
 - **Build and deploy on CPython.** `tyc build` writes Python and any required generated helpers. Deploy it with your application's Python dependencies; the compiler is not needed in production.
 - **Review the beta compatibility policy.** The core forms listed in the [policy](/Typhon/project/compatibility/) keep their syntax and meaning during beta. New checks and deliberate exceptions follow that policy; review the changelog before upgrading.
