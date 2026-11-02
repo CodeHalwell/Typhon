@@ -135,9 +135,12 @@ If no `pub` exists in a module, no `__all__` is emitted — the module behaves l
 - `pub def`, `pub async def`
 - `pub class`, `pub class X frozen:`, `pub class!`, `pub plain class`
 - `pub model`
+- `pub enum`
 - `pub interface`
 - `pub newtype`
 - `pub type`
+
+`pub` is module-level only. On a method or field (inside `class`, `model` or `impl`), a nested `def`, or a binding under a module-level `if`/`try`, it is a parse error whose help text explains why: `pub` means "add to the module's `__all__`", and class members are always reachable as `obj.name` in Python, so they need no marker. Mark an internal method with a leading underscore (`def _helper(self)`); avoid that on `model` fields, where pydantic turns `_name` into a private attribute, and on pydantic-ai tool functions, whose `__name__` is the tool name the model sees.
 
 The Round-3 finding R2-1 closed in v0.6.0: `pub def f(...) -> Result[T, E]:` is now visible to the `?` operator validator.
 

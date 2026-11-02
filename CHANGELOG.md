@@ -50,8 +50,18 @@ path inside the build output, which previously rebuilt `src/` silently.
   generator argument is not double-parenthesised (`sum(x for x in xs)`), and
   the generated runtime is lint-clean (duplicate `_LazyValue` dunders,
   import placement).
-- **`pub` on a method gave an opaque parse error.** It now explains that
-  `pub` is module-level only and that methods are always public in Python.
+
+### Changed
+
+- **`pub` on a method or field now explains itself.** `pub` stays
+  module-level only, since it works by adding the name to `__all__` and
+  class members are always public in Python. Writing it on an indented
+  declaration (a method or field in `class`, `model` or `impl`, a nested
+  `def`, or a binding under a module-level `if`) is still a parse error,
+  but the error now says why and points at the leading-underscore
+  convention for internal helpers. `tyc explain pub` covers the same
+  ground, including why an underscore is a bad idea on `model` fields and
+  pydantic-ai tool functions.
 
 ## 1.0.0-beta.4 — 2026-10-21 — making more of Python 3.15
 
